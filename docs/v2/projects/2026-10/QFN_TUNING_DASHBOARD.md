@@ -1,49 +1,57 @@
 # QFN tuning dashboard
 
-Updated 2026-11-12. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
+Updated 2026-11-13. **Keep this file at or below 15,000 UTF-8 bytes.** Replace
 status entries in place; put experiment histories, commands, samples and failure
 analysis in the linked tuning notes, not in this dashboard.
 
 ## Current status
 
-**Next gate: accuracy panels and OpenCode for QFN PP(EP(4×MI50), EP(4×MI50))
-and TP4 MI50 with hybrid experts.** The PP target retains ngrams sharded in
-VRAM across all eight GPUs. Further tuning waits for this qualification.
+**Current milestone: CUDA2 continuation + CPU2 whole-expert EP, RAM ngrams,
+dynamic MTP1–15, 262,144 context.** Auto planning **3.046 s**.
+[Complete OpenCode (`q686`)](../2026-11/QFN_CUDA2_CPU2_EP_OPENCODE_20261113.md):
+**10/10 phases**, 112 requests, **1/105 tool errors (0.95%)**, 53 app tests pass.
+Stress/protocol/native-output/runtime/resource/driver/retirement gates green;
+strict zero-task-error flag remains false. **98.14% prefix reuse**, **4.73 s
+TTFT**, **37.82 decode tok/s** across the growing session. Short greedy 512/256
+benchmark: **389.86/59.66 P/D tok/s**. CPU diagnostic-retention and restored-prefix
+lifecycle repairs have focused regressions; original failures remain preserved.
+**Next:** Auto CUDA2 + MI50×4, RAM ngrams, dynamic MTP; not yet qualified.
+
+**Retained GPU milestones:** PP8 `q607` full ten-phase pass, 124 tools/zero errors,
+98.18% reuse. TP4 `q639` user-accepted **8/10 partial**, 1/131 errors, 92.34% reuse;
+engineering closure passes, full app/native audit incomplete. TP4 context 47,168,
+approved 16K reply reserve; PP8 context 262,144. Short P/D: TP4 **616.19/93.41**,
+PP8 **1082.63/58.41**. Both use GateUpOwnedDownColumns; PP8 ngrams GPU-sharded,
+TP4 RAM. [Auto placement](../2026-11/QFN_BOUNDED_INTERCONNECT_PLANNING_20261112.md)
+selects intact switches; 22.1/23.8 s planning remains above the 5 s target.
 **Prior checkpoint:** **5,256** selected Unit/preflight tests passed, zero skips;
-39 absent-hardware cases remain unqualified. Includes 24 formats per GPU
-backend and 32 EP4/EP4 preparation/lifecycle cases. Interruption prevented a
-whole-run receipt; the user accepted the checkpoint and waived repetition.
-**Current slice:** [affinity and loading repairs](../2026-11/QFN_HOST_THREAD_AFFINITY_AUDIT_20261112.md)
-pass 47 focused checks plus eight follow-ups. Stale decode-logit publication is
-fixed. The 16-history corpus has P/D mean KL **0.0260/0.0226**, passing unchanged
-numerical limits. Quantisation spikes are accepted; formal canary status remains
-`UNCALIBRATED`. Release reproduces all 112 observations byte for byte; accuracy
-and generation retire cleanly.
+39 absent-hardware cases unqualified. No whole-run receipt; the user accepted
+this checkpoint and waived repetition.
+**Current GateUp PP8 accuracy (`q587`):** 16 histories, prefill + six decode
+steps, mean KL **0.01851/0.02042**, top-1 **93.75/96.88%**, top-5 overlap
+**96.25/92.08%**. Reset byte-exact; native retirement/driver clean. Local
+absolute-pilot pass at context 1024, MTP off with capacity 15 retained.
+Campaign closed at the user's accepted TP4 stopping point; no rerun scheduled.
 [Post-checkpoint inference](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md).
 [Prerequisite repairs](../2026-11/QFN_PREREQUISITE_REPAIRS_20261111.md).
-**Prefill:** **734.87→817.65 P tok/s (+11.26%)**, matched512/1, M512,
-Static, MTP/prefix off. Latest [HC-up K-pair](../2026-11/QFN_EP4_EP4_PREFILL_HC_UP_KPAIR_20261112.md)
-adds **3.01%** over793.72; all six new byte/reset cells and model health pass.
-The broader ROCm arithmetic case passes but its driver-log cursor is lost under
-bursts; those health windows remain unqualified. Full preflight remains waived.
-Prior512/256 **732.92P/37.26D**; new decode unmeasured.
+Earlier [prefill tuning](../2026-11/QFN_EP4_EP4_PREFILL_HC_UP_KPAIR_20261112.md)
+reached **817.65 P tok/s**, +11.26% on its matched512/1 Static/MTP-off control.
+Six byte/reset cells and model health pass; the broader arithmetic case's
+lost driver-log cursor leaves those health windows unqualified.
 [Decode study](../2026-11/QFN_EP4_EP4_DECODE_SUBMISSION_TUNING_20261112.md): submission/HC fusion unpromoted.
 [Current repairs and evidence](QFN_CROSS_RANK_PREFLIGHT_2026-11-10.md),
 [fixed VRAM ngram plan](QFN_FIXED_VRAM_PIPELINE_PLAN_2026-11-10.md).
 
-Former hybrid target retained as a control: 2×MI50 +2×CPU TP achieved
-**339.306/40.566 P/D** with the nine-slot CPU-ILP slice. All 768 IDs/MTP matched,
-but movement differed, so no causal model speedup was claimed.
+Former hybrid control: 2×MI50 +2×CPU TP **339.306/40.566 P/D**. IDs/MTP
+matched, but movement differed; no causal model speedup was claimed.
 [Wave results](../2026-11/QFN_HYBRID_NINE_SLOT_MIGRATION_20261110.md),
 [SDK status](../2026-11/QFN_ROCM_101_SDK_UPGRADE_20261109.md).
 
-**Retained CPU:** [21-format scheduling](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md)
-and [ILP](../2026-11/QFN_CPU_PAIR_DOT_ILP_20261110.md) are byte-exact.
-GNU wait policy stays unchanged ([evidence](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md)).
-**Native Q8:** M448 measured tiles installed on gfx906/gfx1100;
-M64 remains unchanged. Original whole four-cell candidate stays unpromoted.
-Compact-route witness: MI50 exact; CUDA subnormal normalization differs.
-No transport change installed. [Boundary](../2026-11/QFN_NATIVE_ROUTE_COMPACTION_BOUNDARY_20261110.md).
+**Retained CPU:** byte-exact [21-format scheduling](../2026-11/QFN_CPU_ALL_FORMAT_JOB_OWNERSHIP_20261109.md)
+and [ILP](../2026-11/QFN_CPU_PAIR_DOT_ILP_20261110.md); unchanged
+[GNU wait policy](../2026-11/QFN_CPU_OPENMP_WAIT_ATTRIBUTION_20261109.md).
+**Native Q8:** measured M448 tiles installed on gfx906/gfx1100; M64 unchanged.
+No transport change installed: [compact-route boundary](../2026-11/QFN_NATIVE_ROUTE_COMPACTION_BOUNDARY_20261110.md).
 [Scope/results](../2026-11/QFN_ROCM_NATIVE_Q8_PREFILL_20261109.md).
 [Overlay scope](../2026-11/QFN_NATIVE_QUANTISED_EXACT_OVERLAY_20261108.md),
 [timeline](../2026-11/QFN_HYBRID_TIMELINE_AND_NUMA_20261108.md),
@@ -72,9 +80,9 @@ logits; component savings do not establish model gain.
 | Next action | State / decision |
 |---|---|
 | Admission / SDK10.1 | **Focused fixes pass; full rerun waived.** Release accuracy and cleanup match. No whole-run certificate. [Evidence](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md). |
-| Six-GPU moving MTP | Prior CUDA2 continuation + MI50×4 follower fixed1/fixed3/dynamic slices pass: 57 host +16 native, 40 cancellation lifetimes, 2,416 byte comparisons, four prefix histories and eight migrations. All contexts retire. This earlier slice is not a complete current SDK/model certificate. [Focused qualification](../2026-11/QFN_RECURRENT_SIX_GPU_MTP_FOCUSED_QUALIFICATION_20261106.md). |
-| Native lifetime | [Captured component proof](../2026-11/QFN_READ_AHEAD_NATIVE_CAPTURE_QUALIFICATION.md): CUDA/ROCm each pass 40 lifetimes and 800 replays. [Early-current RAM/SSD proof](../2026-11/QFN_EARLY_CURRENT_CAUSAL_FOCUSED_20261105.md) and [ROCm TP2 fixed1/shared-owner proof](../2026-11/QFN_POOLED_CURRENT_READAHEAD_FOCUSED_20261106.md) pass. These establish scoped correctness and causal progress; combined-cache/dynamic-MTP Release overlap remains unqualified. Current hybrid benchmarks use ConsumerScheduled and warm all-hit requests. [Policy/overlap audit](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |
-| Continuation / ngrams | Prior ROCm TP2 shared-owner RAM/fixed3 and SSD/fixed1 slices pass 2,416/1,208 byte comparisons, four prefix histories, public generation and retirement. Current hybrid uses ConsumerScheduled; combined-cache/dynamic-MTP Release overlap remains unqualified. [Shared-owner evidence](../2026-11/QFN_SHARED_OWNER_MTP_IDENTITY_FOCUSED_20261106.md), [policy/overlap](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |
+| Six-GPU moving MTP | CUDA2 continuation + MI50×4 follower fixed1/fixed3/dynamic [focused slices pass](../2026-11/QFN_RECURRENT_SIX_GPU_MTP_FOCUSED_QUALIFICATION_20261106.md), including migration, reset and retirement. Complete current SDK/model qualification remains open. |
+| Native lifetime | CUDA/ROCm [captured component](../2026-11/QFN_READ_AHEAD_NATIVE_CAPTURE_QUALIFICATION.md), [early-current RAM/SSD](../2026-11/QFN_EARLY_CURRENT_CAUSAL_FOCUSED_20261105.md), and [TP2 shared-owner](../2026-11/QFN_POOLED_CURRENT_READAHEAD_FOCUSED_20261106.md) proofs pass. Combined-cache/dynamic-MTP Release overlap remains unqualified. |
+| Continuation / ngrams | TP2 shared-owner RAM/fixed3 and SSD/fixed1 [focused slices pass](../2026-11/QFN_SHARED_OWNER_MTP_IDENTITY_FOCUSED_20261106.md). Hybrid timing uses ConsumerScheduled/warm hits; combined-cache overlap remains open. [Policy audit](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |
 
 QSA temporal/page certificates did not repay their costs through **64K/128K**;
 no pruning policy is installed. [Study][certificates]. CUDA hardware profiling
@@ -97,23 +105,24 @@ remain controls and do not qualify the new tier/ownership combinations.
 |---|---|---|---:|---:|---:|---:|---:|---:|
 | Q1 | 1× MI50 | ⚪ | — | — | — | — | — | — |
 | Q2 | 2× MI50 | 🟢 RAM/C0 + SSD/C64 Static/Off slices; rest ⚪ | — | — | — | — | — | — |
-| Q3 | 4× MI50 | ⚪ | — | — | — | — | — | — |
+| Q3 | 4× MI50; GateUpOwnedDownColumns, RAM ngrams | 🟢 short panel, accepted one-row limit; app partial 8/10 accepted | 616.19† | — | — | 93.41† | — | — |
 | Q4 | 1× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q5 | 2× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q6 | 2× RTX 3090 continuation + 4× MI50 followers | ⚪ | — | — | — | — | — | — |
-| Q7 | PP(EP(4×MI50), EP(4×MI50)); ngrams sharded across all8 | 🟢 short-corpus limits (diagnostic); P/D KL0.0260/0.0226 | 817.65† | — | — | 37.26‡ | — | — |
+| Q7 | PP(EP(4×MI50), EP(4×MI50)); ngrams sharded across all8 | 🟢 short panel; P/D KL0.01851/0.02042; full app green | 1082.63† | — | — | 58.41† | — | — |
 
-† Latest 512/1 prefill-only run. ‡ Prior 512/256 decode; not remeasured.
+† Current selected-Auto diagnostics: 512/256, greedy dynamic MTP, prefix off,
+one warmup + three samples; TP4 context 47,168, PP8 context 262,144. No matched
+external reference or general throughput claim. Accuracy uses short contexts
+with MTP off; full stochastic apps qualify the serving configuration separately.
 
 Functional coverage retains MTP off/1/3/dynamic and dynamic expert balancing.
-Small C0/C64 row-cache fixtures force movement; performance uses useful admitted
-capacities and reports exact tier bytes, hit rates and working set. Earlier pre-10.1
-native transfer floor: retained Release 22/28 green. Fresh original-owner
-Integration runs pass all six RCCL cases and all six CUDA cases after native
-stack provisioning; the original CUDA failure is reproduced by an isolated
-control. Release timing and complete lookup/inference remain unqualified; no
-transport default is promoted. Retained RCCL small-message event round trips
-are about 48 µs versus mapped 65–66 µs.
+Small C0/C64 fixtures force movement; performance reports useful admitted tier
+bytes, hit rates and working sets. Original-owner Integration passes all six
+RCCL and six CUDA transfer cases after native stack provisioning. Complete
+lookup/inference and Release transport timings remain unqualified; no transport
+default is promoted. Earlier retained RCCL event round trips were about48 µs
+versus mapped65–66 µs.
 [Timings, scope and failures](QFN_NGRAM_NATIVE_TRANSFER_FLOORS_2026-11-02.md).
 
 ### Earlier measured controls
@@ -203,9 +212,7 @@ owns full geometry, ownership and live-communication coverage.
 [column-grid]: QFN_SCOPED_QUERY_COLUMN_GRID.md
 [scaling]: QFN_TP_COMPUTE_SCALING.md
 [cases]: ../../../../tests/v2/integration/parity/qwen4exp/Qwen4ExpLocalPairedCases.h
-[a2]: ../../../../parity-results/qwen-flash-next/accuracy-checkpoint60/rocm-cpu-static8-adaptive-hc-up-two-term/report.json
-[a3]: ../../../../parity-results/qwen-flash-next/accuracy-checkpoint60/cuda-cpu-static8-adaptive-hc-up-two-term/report.json
-[a4]: ../../../../parity-results/qwen-flash-next/accuracy-checkpoint60/cpu-mmap-hc-up-two-term/report.json
-[a5]: ../../../../parity-results/qwen-flash-next/accuracy-checkpoint60/hybrid-cpu-tail-mmap-hc-up-two-term/report.json
+[a2]: QFN_TUNING_HISTORY_2026-10-25.md#accuracy-detail-for-checkpoint60-broad-panel-observations
+[a3]: QFN_TUNING_HISTORY_2026-10-25.md#accuracy-detail-for-checkpoint60-broad-panel-observations
 
 [target-matrix]: QFN_FUNCTIONAL_PERFORMANCE_TARGET_2026-11-02.md

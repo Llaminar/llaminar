@@ -11,6 +11,9 @@
  * QFN source-format and complete original GDN consumer declarations constrain
  * canonical head assignments before candidate publication. Expert output-column
  * integrality remains an independent topology requirement.
+ * Pipeline width constraints select complete ordered stage groups with one
+ * cardinal main-layer partition; routed stages use the shared typed authority
+ * normalizer rather than excluding MoE models from automatic PP discovery.
  */
 #include "planning/AutomaticOrchestrationCandidates.h"
 #include "config/GDNHeadAssignment.h"
@@ -25,9 +28,49 @@
 #include <optional>
 #include <set>
 #include <stdexcept>
+#include <cstdint>
+#include <limits>
 
 namespace llaminar2
 {
+    std::vector<int> automaticPipelineLayerCounts(int main_layers,std::span<const int> widths)
+    {
+        if(main_layers<=0 || widths.empty() || widths.size()>static_cast<size_t>(main_layers))
+            throw std::invalid_argument("Automatic PP requires positive main layers and nonempty stages");
+        std::uint64_t total=0;
+        for(const int width:widths) {
+            if(width<=0)throw std::invalid_argument("Automatic PP stage cardinality must be positive");
+            if(total>std::numeric_limits<std::uint64_t>::max()-static_cast<unsigned>(width))
+                throw std::overflow_error("Automatic PP stage cardinality sum overflow");
+            total+=static_cast<unsigned>(width);
+        }
+        std::vector<int> counts(widths.size()),floors(widths.size());
+        std::vector<std::uint64_t> remainders(widths.size());
+        std::int64_t assigned=0;
+        for(size_t stage=0;stage<widths.size();++stage) {
+            const auto numerator=std::uint64_t(main_layers)*static_cast<unsigned>(widths[stage]);
+            floors[stage]=static_cast<int>(numerator/total);remainders[stage]=numerator%total;
+            counts[stage]=std::max(1,floors[stage]);assigned+=counts[stage];
+        }
+        // Compare exact quota deficits as integer/fraction pairs. Products of
+        // count*total and floating rounding are unnecessary, even for wide groups.
+        while(assigned!=main_layers) {
+            size_t selected=widths.size();
+            std::pair<std::int64_t,std::uint64_t> best;
+            for(size_t stage=0;stage<widths.size();++stage) {
+                if(assigned>main_layers && counts[stage]==1)continue;
+                const auto score=assigned<main_layers
+                    ?std::pair{std::int64_t(floors[stage])-counts[stage],remainders[stage]}
+                    :std::pair{std::int64_t(counts[stage])-floors[stage],std::numeric_limits<std::uint64_t>::max()-remainders[stage]};
+                if(selected==widths.size() || score>best){selected=stage;best=score;}
+            }
+            if(selected==widths.size())throw std::logic_error("Automatic PP cannot satisfy its positive layer partition");
+            if(assigned<main_layers){++counts[selected];++assigned;}
+            else {--counts[selected];--assigned;}
+        }
+        return counts;
+    }
+
     namespace
     {
         /** @brief One observed endpoint and its owning discovery process. */
@@ -493,6 +536,10 @@ namespace llaminar2
         std::set<int> required_nodes;
         for (const auto &rank : inventory.ranks) required_nodes.insert(rank.node_id);
         const auto publish = [&](AutomaticOrchestrationCandidate proposal) {
+            // A positive stage-width request constrains topology, not merely a
+            // ranking hint; no single-device/TP/overlay proposal may replace it.
+            if (policy->options().pipeline_stage_widths &&
+                proposal.strategy != OrchestrationStrategy::PipelineParallel) return;
             if (policy->options().host_participation == AutomaticHostParticipation::AllDiscovered)
             {
                 std::set<int> nodes;
@@ -584,23 +631,73 @@ namespace llaminar2
             publish({strategy, std::move(membership), std::move(config)});
         }
         const bool routed_model = model.memoryProfile().expert_count > 0;
-        /*
-         * A routed model may only leave automatic discovery with one complete
-         * ExpertOverlay authority.  The ordinary PP candidate below describes
-         * dense layer ownership but has no routed-expert domains, tiers, or
-         * continuation role.  Publishing it would defer that missing topology
-         * until rank compilation, where normalization must (correctly) reject
-         * an implicit cross-rank/pipeline authority.  Do not advertise that
-         * incomplete execution form as an automatic candidate.  Authored MoE
-         * PP remains responsible for supplying its explicit overlay topology.
-         */
-        const bool pipelines =
-            !routed_model &&
-            policy->allows(OrchestrationStrategy::PipelineParallel);
+        // The installed resolver lowers each MoE PP stage into its own typed
+        // expert authority. Parent PP remains declarative and owns no overlay.
+        const bool pipelines = policy->allows(OrchestrationStrategy::PipelineParallel);
         const bool overlays =
             routed_model &&
             policy->allows(OrchestrationStrategy::ExpertOverlay);
         if (!pipelines && !overlays) return;
+        if (pipelines)
+        {
+            const auto& widths=policy->options().pipeline_stage_widths;
+            const std::size_t stage_count=widths?widths->size():2u;
+            // Main transformer layers are indivisible and every stage owns a
+            // positive interval. An impossible constraint emits no replacement.
+            if(stage_count<=static_cast<std::size_t>(model.mainLayerCount()))
+            {
+                std::vector<Pool> stages;
+                const auto emit=[&] {
+                    if(!permitsPools(*policy,OrchestrationStrategy::PipelineParallel,stages))return;
+                    auto membership=membershipFor(stages,inventory);
+                    auto config=explicitRequest(request);
+                    for(std::size_t index=0;index<stages.size();++index)
+                    {
+                        auto domain=domainFor(stages[index],membership,"stage_"+std::to_string(index));
+                        if(routed_model)
+                        {
+                            domain.routed_compute_policy=request.routed_expert_compute_policy;
+                            const auto compute=domain.resolveRoutedComputePolicy(1);
+                            // These are necessary physical-mode constraints,
+                            // not a backend/card-count capability advertisement.
+                            if(compute==RoutedExpertComputePolicy::GateUpOwnedDownColumns &&
+                               (domain.scope!=ExecutionDomainScope::RANK_LOCAL ||
+                                !std::all_of(domain.participants.begin(),domain.participants.end(),[&](const auto& device){
+                                    return device.isGPU() && device.device_type==domain.participants.front().device_type;
+                                }) || !MoEProjectionArenaGeometry::hasIntegralOutputPartition(
+                                    model.memoryProfile().d_model,static_cast<int>(domain.participants.size()))))return;
+                        }
+                        config.domain_definitions.push_back(DomainDefinition::fromExecutionDomainDefinition(domain));
+                    }
+                    // Automatic PP fixes one cardinal contiguous partition.
+                    // Predictors remain the final stage's separate model-owned
+                    // family; manual Apply ranges never enter this policy.
+                    std::vector<int> cardinalities;
+                    for(const auto &stage:stages)cardinalities.push_back(static_cast<int>(stage.size()));
+                    const auto counts=automaticPipelineLayerCounts(model.mainLayerCount(),cardinalities);
+                    int first=0;
+                    for(size_t stage=0;stage<stages.size();++stage) {
+                        config.pp_stage_definitions.push_back({static_cast<int>(stage),config.domain_definitions[stage].name,
+                            first,first+counts[stage]-1});
+                        first+=counts[stage];
+                    }
+                    publish({OrchestrationStrategy::PipelineParallel,std::move(membership),std::move(config)});
+                };
+                const auto groups=[&](const auto& self,std::size_t stage)->void {
+                    if(stage==stage_count){emit();return;}
+                    for(const auto& pool:pools)
+                    {
+                        if(widths && pool.size()!=static_cast<std::size_t>((*widths)[stage]))continue;
+                        if(std::any_of(stages.begin(),stages.end(),[&](const auto& existing){return overlaps(existing,pool);}))continue;
+                        if(!preservesModelShardOwnership(model.memoryProfile(),pool,request.mtp,
+                            DenseParallelPolicy::TensorParallel,false))continue;
+                        stages.push_back(pool);self(self,stage+1);stages.pop_back();
+                    }
+                };
+                groups(groups,0);
+            }
+        }
+        if(!overlays)return;
         using PoolKey = std::vector<std::pair<int, std::string>>;
         std::set<std::vector<PoolKey>> emitted_overlays;
         const auto projectRemoteCPU = [](std::vector<Pool> &domains)
@@ -644,32 +741,10 @@ namespace llaminar2
             {
                 if (overlaps(first, second)) continue;
                 const std::vector<Pool> domains{first, second};
-                if (pipelines && permitsPools(*policy, OrchestrationStrategy::PipelineParallel, domains) &&
-                    preservesModelShardOwnership(model.memoryProfile(), first, request.mtp) &&
-                    preservesModelShardOwnership(model.memoryProfile(), second, request.mtp))
-                {
-                    // Every legal split competes on complete BOM/cost evidence.
-                    // Equal layer counts are not a proxy for equal physical bytes.
-                    for (int split = 1; split < model.mainLayerCount(); ++split)
-                    {
-                        auto membership = membershipFor(domains, inventory);
-                        auto config = explicitRequest(request);
-                        for (size_t index = 0; index < domains.size(); ++index)
-                        {
-                            const auto domain = domainFor(domains[index], membership, "stage_" + std::to_string(index));
-                            config.domain_definitions.push_back(DomainDefinition::fromExecutionDomainDefinition(domain));
-                            config.pp_stage_definitions.push_back({static_cast<int>(index), domain.name,
-                                index == 0 ? 0 : split, index == 0 ? split - 1 : model.mainLayerCount() - 1});
-                        }
-                        publish({OrchestrationStrategy::PipelineParallel, std::move(membership), std::move(config)});
-                    }
-                }
-                if (!overlays ||
-                    first.front().address.device_type == DeviceType::CPU) continue;
+                if (first.front().address.device_type == DeviceType::CPU) continue;
                 if (!preservesModelShardOwnership(model.memoryProfile(), first,request.mtp)) continue;
                 emitOverlay(domains);
             }
-        if (!overlays) return;
 
         // Two-domain search above retains every existing subset and ordering.
         // For deeper overlays, extend disjoint observed pools recursively. The

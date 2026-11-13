@@ -1,12 +1,15 @@
 /**
  * @file PlanningHostDeviceMeasurement.cpp
- * @brief Exact-mechanism GPU/host sampling with rank-owned first touch and event-owned completion.
+ * @brief Exact-mechanism GPU/host sampling with rank-owned first touch and captured fixed-clock timing.
  *
  * The host role first-touches shared RAM on its setup thread; only the original
  * GPU owner imports those pages. All-rank agreement precedes registration and
  * follows native graph retirement. PMA host claims outlive both mappings.
  * Capture, host publication and byte verification are outside all timed native
- * intervals. No weight, KV, sampler or live inference state is constructed.
+ * intervals. Fresh host publication precedes every warmup/measured replay;
+ * captured markers exclude external event/submission delays. Clock readback belongs to the GPU executor's
+ * CPU authority, independently of the first-touch source role. No live model
+ * state or per-coordinate external timestamp interval is constructed.
  */
 #include "PlanningHostDeviceMeasurement.h"
 #include "PlanningPublication.h"
@@ -35,6 +38,8 @@
 #include <set>
 #include <stdexcept>
 #include <tuple>
+#include <chrono>
+#include <thread>
 
 namespace llaminar2
 {
@@ -95,6 +100,37 @@ namespace llaminar2
         return {text.begin(), text.end()};
     }
 
+    void PlanningHostDeviceMeasurement::replayByteProof(IWorkerGPUContext &worker,
+        const IGPUGraphCapture &graph)
+    {
+        require(worker.ownsCurrentThread() && !isGraphCaptureActive() && graph.hasExecutable() && graph.nodeCount() &&
+            graph.executionStream() && graph.executionStream()==worker.defaultStream(),
+            "byte proof requires its original worker and exact retained stream");
+        void *event=worker.createEvent(GPUEventPurpose::Ordering);
+        if(!event)throw std::runtime_error("Planning byte proof ordering event creation failed");
+        // The graph and payload remain caller-owned; this local event only
+        // authorizes CPU byte inspection after one complete retained readback.
+        struct EventOwner {
+            IWorkerGPUContext &worker;
+            void *event;
+            ~EventOwner(){worker.destroyEvent(event);}
+        } owner{worker,event};
+        if(!graph.launchOnStream(graph.executionStream()))
+            throw std::runtime_error("Planning byte proof graph submission failed");
+        if(!worker.recordEventChecked(event,graph.executionStream()))
+            throw std::runtime_error("Planning byte proof ordering publication failed");
+        const auto deadline=std::chrono::steady_clock::now()+std::chrono::seconds(30);
+        for(;;) {
+            bool ready=false;
+            if(!worker.queryEventChecked(event,ready))
+                throw std::runtime_error("Planning byte proof asynchronous completion query failed");
+            if(ready)return;
+            if(std::chrono::steady_clock::now()>=deadline)
+                throw std::runtime_error("Planning byte proof exceeded the 30-second setup timeout");
+            std::this_thread::yield();
+        }
+    }
+
     size_t PlanningHostDeviceMeasurement::hostAllocationBytes(const PlanningHostDeviceRequest &request)
     {
         const auto one = TransferEngine::mappedHostRegionAllocationBytes(request.bulkBytes());
@@ -112,13 +148,16 @@ namespace llaminar2
     }
 
     void PlanningHostDeviceMeasurement::contributeExecutionMemory(const PlanningHostDeviceRequest &request,
-        PhysicalMemoryResource execution, PhysicalMemoryPlanBuilder &builder)
+        PhysicalMemoryResource executor_host, PhysicalMemoryResource execution, PhysicalMemoryPlanBuilder &builder)
     {
+        require(executor_host.world_rank == request.gpuRank() && executor_host.device == DeviceId::cpu(),
+            "GPU executor clock host BOM resource identity mismatch");
         require(execution.world_rank == request.gpuRank() && execution.device == request.device(),
             "GPU executor BOM resource identity mismatch");
         builder.add(execution, PhysicalMemoryOwner::ActivationTransportStaging, request.bulkBytes());
+        PlanningExecutionMeasurement::contributeGPUObservationMemory(executor_host,execution,builder);
         builder.add(execution, PhysicalMemoryOwner::NativeGraphExecutable,
-            2 * GPUGraphMemoryContract::reservationBytesPerExecutable(request.device()));
+            GPUGraphMemoryContract::reservationBytesPerExecutable(request.device()));
     }
 
     namespace
@@ -240,11 +279,10 @@ namespace llaminar2
                         {
                             uint32_t salt = 7;
                             fill(input->mutableHostData(), payload, salt);
-                            // Initial upload precedes warmup on the exact same
-                            // stream; it is outside every timed interval.
-                            if (direction == MappedTransferDirection::DeviceToHost)
-                                transfer.enqueueMappedHostToDevice(*input, 0, *buffer, 0, payload, device, stream);
-                            auto claim = memory->reserveNewAllocations(device, PhysicalMemoryOwner::NativeGraphExecutable, graph_bytes);
+                            auto clock=std::make_unique<PlanningNativeGPUClockBuffer>(worker,device,
+                                ExplicitGPUStream(stream),2,memory);
+                            auto claim = memory->reserveNewAllocations(device, PhysicalMemoryOwner::NativeGraphExecutable,
+                                PlanningExecutionMeasurement::kPreparedGraphCount*graph_bytes);
                             auto graph = worker.createGraphCapture(stream);
                             require(bool(graph), "copy graph creation failed");
                             {
@@ -259,34 +297,39 @@ namespace llaminar2
                                 else transfer.enqueueDeviceToMappedHost(*buffer, 0, mapped, 0, payload, device, stream);
                                 capture.finish();
                             }
-                            require(graph->prepareRuntimeContextStorage(memory), "copy context storage preparation failed");
-                            require(graph->nodeCount() && graph->instantiate() &&
-                                GPUGraphMemoryContract::acceptsFamilyObservation(device, graph->residentMemoryBytes(), graph_bytes),
-                                "copy graph incomplete or outside admission");
                             const PlanningMeasurementWork work(PlanningWorkUnit::Bytes, payload,
                                 "GPU-host byte primitive; device=" + device.toString() +
                                 "; gpu-executor-rank=" + std::to_string(request.gpuRank()) +
                                 "; first-touch-rank=" + std::to_string(request.hostRank()) +
                                 "; host-numa=" + std::to_string(request.hostNumaNode()) +
                                 "; mechanism=" + std::to_string(int(mechanism)) + "; direction=" + std::to_string(int(direction)) +
-                                "; not-complete-activation-packet-service");
-                            auto observation = PlanningExecutionMeasurement::gpuPublished(work, *backend, device, *graph, [&] {
-                                if (direction == MappedTransferDirection::HostToDevice)
-                                    fill(input->mutableHostData(), payload, ++salt);
-                                else std::memset(output->mutableHostData(), 0, payload);
+                                "; fresh host publication before each invocation; not-complete-activation-packet-service");
+                            auto timing=PlanningExecutionMeasurement::recordPublishedGPU(work,worker,std::move(clock),std::move(graph),[&] {
+                                if(direction==MappedTransferDirection::HostToDevice)
+                                    fill(input->mutableHostData(),payload,++salt);
+                                else std::memset(output->mutableHostData(),0,payload);
                             });
+                            timing.prepare(memory);
+                            require(GPUGraphMemoryContract::acceptsFamilyObservation(device,timing.residentMemoryBytes(),
+                                PlanningExecutionMeasurement::kPreparedGraphCount*graph_bytes),
+                                "copy timer graph family exceeded admission");
+                            // Publish only after every captured/instantiated graph
+                            // exists. An eager capture-time copy cannot see this
+                            // fresh salt or repair the poisoned destination.
+                            fill(input->mutableHostData(),payload,++salt);
+                            if(direction==MappedTransferDirection::DeviceToHost)
+                                transfer.enqueueMappedHostToDevice(*input,0,*buffer,0,payload,device,stream);
+                            auto observation=timing.observe();
                             if (direction == MappedTransferDirection::HostToDevice)
                             {
                                 // Separate retained diagnostic readback, after the
-                                // measurement event. Its time is deliberately not
+                                // captured-clock interval. Its time is deliberately not
                                 // part of either direction's reported service.
-                                (void)PlanningExecutionMeasurement::gpu(
-                                    PlanningMeasurementWork(PlanningWorkUnit::Bytes, payload, "untimed sample byte proof"),
-                                    *backend, device, *readback);
+                                PlanningHostDeviceMeasurement::replayByteProof(worker,*readback);
                             }
                             require(std::memcmp(input->mutableHostData(), output->mutableHostData(), payload) == 0,
                                 "captured copy did not preserve exact source bytes");
-                            result.phases.push_back({mechanism, direction, payload, graph->nodeCount(), std::move(observation)});
+                            result.phases.push_back({mechanism, direction, payload, timing.graphNodeCount(), std::move(observation)});
                         }
                 }
             });

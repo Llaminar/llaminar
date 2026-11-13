@@ -29,9 +29,20 @@ namespace llaminar2
     enum class PlanningMainForwardPhase { Prefill, Decode };
 
     /** @brief Semantic work family, shared by operand compilation and representative sampling. */
-    enum class PlanningOrdinaryWeightKind { Projection, Router, Embedding, NonProjection, Unclassified };
+    enum class PlanningOrdinaryWeightKind { Projection, Router, Embedding, NonProjection, ExternalLookup, Unclassified };
     /** @return The one main-forward classification of a semantic role; unknown roles stay explicit. */
     PlanningOrdinaryWeightKind planningOrdinaryWeightKind(WeightRole role) noexcept;
+
+    /** @return Whether the operand belongs only to the final PP stage; HC remains replicated within that stage. */
+    bool planningTerminalWeight(WeightRole role, int layer) noexcept;
+    /**
+     * @brief Retain actual live projection rows independently from terminal stage placement.
+     * @param role Original semantic source role, not a source format or residency count.
+     * @param rows Positive live main-forward token rows.
+     * @return One compact ordinary norm/head row, or all live rows for other work including terminal HC.
+     * @throws std::invalid_argument for nonpositive live rows.
+     */
+    int planningWeightInvocationRows(WeightRole role, int rows);
 
     /** @brief A source operand and its canonical prepared scalar representation. */
     struct PlanningWeightOperand
@@ -183,6 +194,9 @@ namespace llaminar2
      * Attention/KV/GDN arithmetic, collectives, MTP acceptance, execution order and
      * fused overlap are deliberately not invented here. A complete cost evaluator
      * must additionally price those graph operations and its routing assumptions.
+     * Original roles and layer indices are retained by the immutable source;
+     * participant compilation visits globals and owned layers without reparsing
+     * tensor names or scanning unowned model layers.
      */
     std::vector<PlanningParticipantWeightWork> compilePlanningForwardWeightWork(
         const PlanningModelMetadata &model, const AdmittedOrchestrationCandidate &candidate,

@@ -7,6 +7,8 @@
  * optional replicas consume remaining capacity. No per-stage free-byte arithmetic
  * or temporary publication of a partially admitted topology is permitted here.
  * CPU serial storage declarations survive admission and runtime projection.
+ * Final immutable source placements reach both rank runtime and stage device
+ * inputs, so setup and automatic costing consume the same admitted authority.
  *
  * Local and global pipeline stages share the original rank-owned prepared
  * source and PMA handoff. Global topology remains immutable metadata; remote
@@ -21,6 +23,7 @@
 #include "backends/NativeContextPreparation.h"
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "planning/PlanningModelMetadata.h"
+#include "planning/PlanningAdmissionPreparation.h"
 #include "planning/PlanningHostServiceEvidence.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "loaders/ModelLoader.h"
@@ -93,6 +96,10 @@ namespace llaminar2
         for (int rank = 0; rank < inventory.world_size; ++rank)
             if (inventory.ranks[rank].rank != rank)
                 throw std::invalid_argument("MoE pipeline admission requires exact observed rank membership");
+        std::optional<PlanningAdmissionPreparation> local_preparation;
+        auto *preparation=policy.source_preparation;
+        if(!preparation){local_preparation.emplace(loader,model,policy.gpu_weight_load.policy);preparation=&*local_preparation;}
+        preparation->requireOriginal(loader,model,policy.gpu_weight_load.policy);
         // The immutable topology predates serving-context preparation. Carry
         // the actual already-created owner through runtime copies before the
         // existing shared fixed-BOM planner deduplicates it across all stages.
@@ -102,8 +109,7 @@ namespace llaminar2
         result.stages_.reserve(topology.pipelineStages().size());
         const auto &mtp = parent.runtime.mtp;
         const int decode_rows = retainsMTPGraphCapacity(mtp) ? resolveMTPRetainedTargetQueryRows(mtp) : 1;
-        const auto family = resolveMoEOverlayInferenceGraphFamilyIdentity(loader,
-            loader.architecture(), loader.blockCount(), retainsMTPGraphCapacity(mtp)
+        const auto &family = preparation->graphFamily(retainsMTPGraphCapacity(mtp)
                 ? MoEOverlayMTPGraphFamilyPolicy::RetainModelSidecars : MoEOverlayMTPGraphFamilyPolicy::MainOnly,
             1, std::max(decode_rows, parent.runtime.moe_routed_prefill.overlay_segment_rows),
             decode_rows, parent.runtime.batch_size, resolveMTPRetainedDraftCapacity(mtp));
@@ -116,7 +122,7 @@ namespace llaminar2
             const int routed_count = scope.has_lm_head
                 ? family.routedLayerCapacity() - scope.first_layer : scope.layerCount();
             stage.family_ = family.forRoutedLayerInterval(scope.first_layer, routed_count);
-            stage.manifest_ = buildMoEOverlayLayerWeightManifestFromLoader(loader, routed_count, profile.expert_count, scope.first_layer);
+            stage.manifest_ = preparation->manifest(scope.first_layer,routed_count,family.routedLayerCapacity());
             stage.storage_policy_ = resolveMoEOverlayCapacityAdmissionPolicy(
                 *child.config().moe_routed_expert_plan, child.config(), inventory.world_size,
                 routed_count, profile.expert_count);
@@ -235,6 +241,8 @@ namespace llaminar2
                     .native_pipeline_maintenance_budget=native_maintenance_budget,
                     .original_cpu_stage_program=original_cpu==cpu_programs.end()?nullptr:&*original_cpu}, rows);
                 input.local_capacity.original_cpu_pipeline_programs=cpu_programs;
+                input.local_capacity.native_context_budgets=policy.native_context_budgets;
+                input.local_capacity.require_native_context_budgets=policy.require_native_context_budgets;
                 input.local_capacity.native_ordering_events=policy.native_ordering_events;
                 input.local_capacity.retained_host_services=policy.retained_host_services;
                 inputs.push_back(std::move(input.local_capacity));
@@ -357,6 +365,15 @@ namespace llaminar2
             {
                 result.rank_plan_.runtime.ngram_table_placement=placement;
                 for(auto &stage:result.stages_)stage.rank_plan_.runtime.ngram_table_placement=placement;
+                // Device plans escape this owner for both runtime stage setup
+                // and automatic request costing. Publish the SAME final rank
+                // placement before moving those inputs into immutable stages;
+                // rebuilding a table choice in either consumer would lose the
+                // admitted cross-stage fixed-head source/owner projection.
+                for(auto &stage:selected_fixed)
+                    for(auto &device:stage.device_inputs)
+                        if(device.world_rank==placement->worldRank())
+                            device.ngram_table_placement=placement;
             }
         result.admission_ = capacities.front().physical_memory_admission;
         if (!result.admission_)

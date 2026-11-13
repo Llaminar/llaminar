@@ -42,9 +42,11 @@ namespace llaminar2
          * @param profile Canonical original model metadata, not a synthesized subset.
          * @param device Participant whose physical creator roots are being compiled.
          * @param components Actual graph-owned global components, shared with runtime selection.
+         * @param source_index Optional shared original source authority, retaining classifications and membership once.
          */
         PreparedWeightPhysicalUses(const ModelMemoryProfile &profile, DeviceId device,
-            WeightComponentScope components = WeightComponentScope::EmbeddingAndTerminal);
+            WeightComponentScope components = WeightComponentScope::EmbeddingAndTerminal,
+            std::shared_ptr<const PlanningTensorIndex> source_index = {});
         /**
          * @brief Publish a creator or retain an earlier proved complete GEMM root.
          * @param profile Must be the exact originally bound model metadata object.
@@ -86,6 +88,7 @@ namespace llaminar2
         WeightComponentScope components_;
         std::unordered_set<std::string> terminal_sources_;
         std::unordered_set<const TensorSizeInfo *> originals_;
+        std::shared_ptr<const PlanningTensorIndex> source_index_;
         std::unordered_map<const TensorSizeInfo *, std::vector<size_t>> roots_by_source_;
         std::vector<Root> roots_;
         std::vector<PreparedWeightPhysicalUse> edges_;

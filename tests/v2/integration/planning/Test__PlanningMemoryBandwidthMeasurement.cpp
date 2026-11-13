@@ -10,6 +10,9 @@
 #include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "planning/PlanningMemoryBandwidthMeasurement.h"
 #include "planning/PlanningHostDeviceMeasurement.h"
+#include "planning/PlanningExecutionMeasurement.h"
+#include "planning/PlanningGPUClockBuffer.h"
+#include "backends/GPUGraphMemoryContract.h"
 #include "planning/PlanningObservedResource.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -30,7 +33,7 @@ using namespace llaminar2;
 namespace
 {
     /** @brief Prove both copy mechanisms, both directions, failure retirement and exact public bounds. */
-    void proveHostDevice(DeviceId device)
+    void proveHostDevice(DeviceId device, bool require_captured_clock=false)
     {
         const auto mpi = MPIContextFactory::global();
         const auto inventory = mpi->clusterInventory();
@@ -47,9 +50,19 @@ namespace
         const auto request = PlanningHostDeviceRequest::fromInventory(*inventory, {rank.rank, device}, {rank.rank}, 4099);
         PhysicalMemoryPlanBuilder builder;
         PlanningHostDeviceMeasurement::contributeHostMemory(request, planningObservedResource(rank, DeviceId::cpu()), builder);
-        PlanningHostDeviceMeasurement::contributeExecutionMemory(request, planningObservedResource(rank, device), builder);
+        PlanningHostDeviceMeasurement::contributeExecutionMemory(request, planningObservedResource(rank, DeviceId::cpu()), planningObservedResource(rank, device), builder);
         auto memory = std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(builder.build()), rank.rank);
+        if(require_captured_clock){
+            EXPECT_EQ(memory->plannedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExecutionWorkspace),PlanningNativeGPUClockBuffer::hostAllocationBytes(2));
+            EXPECT_EQ(memory->plannedBytes(device,PhysicalMemoryOwner::ExecutionWorkspace),PlanningNativeGPUClockBuffer::deviceAllocationBytes(2));
+            EXPECT_EQ(memory->plannedBytes(device,PhysicalMemoryOwner::NativeGraphExecutable),
+                (PlanningExecutionMeasurement::kPreparedGraphCount+1)*GPUGraphMemoryContract::reservationBytesPerExecutable(device));
+            ::testing::Test::RecordProperty("host_device_original_gpu_uuid",local->uuid);
+            ::testing::Test::RecordProperty("host_device_executor_rank",rank.rank);
+            ::testing::Test::RecordProperty("host_device_first_touch_rank",request.hostRank());
+            ::testing::Test::RecordProperty("host_device_first_touch_numa",request.hostNumaNode());
+        }
         const auto run = [&] {
             const auto observed = PlanningHostDeviceMeasurement::collect(request, mpi, memory);
             ASSERT_TRUE(observed.has_value());
@@ -60,7 +73,17 @@ namespace
                 EXPECT_GT(phase.graph_nodes, 0u);
                 EXPECT_GT(phase.service.unitsPerSecond(), 0);
                 EXPECT_EQ(phase.service.completedWork(), 3.0 * phase.payload_bytes);
+                if(require_captured_clock){
+                    EXPECT_NE(phase.service.provenance().find("sum of captured fixed-device-clock intervals"),std::string::npos);
+                    EXPECT_NE(phase.service.provenance().find("fresh host publication before every invocation"),std::string::npos);
+                }
             }
+            for(const auto allocator:{DeviceId::cpu(),device})
+                for(const auto owner:{PhysicalMemoryOwner::ActivationTransportStaging,
+                    PhysicalMemoryOwner::ExecutionWorkspace,PhysicalMemoryOwner::NativeGraphExecutable}){
+                    EXPECT_EQ(memory->claimedBytes(allocator,owner,PhysicalMemoryMaterializationKind::NewAllocation),0u);
+                    EXPECT_EQ(memory->reservedBytes(allocator,owner),0u);
+                }
         };
         // Serial calibration reuses the original worker stream across complete
         // captures and byte-proof retirement, without an auxiliary pool lifetime.
@@ -212,4 +235,15 @@ TEST(PlanningExecutionMeasurementIntegration, CUDA_HostDeviceService) { proveHos
 #ifdef HAVE_ROCM
 TEST(PlanningExecutionMeasurementIntegration, ROCm_StreamingBandwidth) { prove(DeviceId::rocm(0)); }
 TEST(PlanningExecutionMeasurementIntegration, ROCm_HostDeviceService) { proveHostDevice(DeviceId::rocm(0)); }
+#endif
+
+#ifdef HAVE_CUDA
+/** @test Captured DMA/mapped service retains late byte publication and repeated original-worker retirement. */
+TEST(PlanningExecutionMeasurementIntegration, CUDA_HostDeviceCapturedClockReplay)
+{proveHostDevice(DeviceId::cuda(0),true);}
+#endif
+#ifdef HAVE_ROCM
+/** @test HIP host-device calibration uses compact device clocks rather than enqueue-spanning events. */
+TEST(PlanningExecutionMeasurementIntegration, ROCm_HostDeviceCapturedClockReplay)
+{proveHostDevice(DeviceId::rocm(0),true);}
 #endif

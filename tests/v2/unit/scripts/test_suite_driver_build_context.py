@@ -69,9 +69,12 @@ class SuiteDriverBuildContextTests(unittest.TestCase):
                         if not line.lstrip().startswith('COPY '):
                             continue
                         fields = shlex.split(line, comments=True)
+                        if fields[1].startswith('--from='):
+                            self.assertEqual(fields[1], '--from=opencode-builder')
+                            continue
                         self.assertEqual(len(fields), 3, 'Changed COPY contract requires parser review')
                         source = context / fields[1]
-                        self.assertTrue(source.is_file(), 'Missing pinned installer: ' + str(source))
+                        self.assertTrue(source.exists(), 'Missing pinned client build input: ' + str(source))
                         self.assertTrue(source.resolve().is_relative_to(context))
                         checked.append(source.resolve())
                 with tempfile.TemporaryDirectory() as temporary, \
@@ -83,7 +86,8 @@ class SuiteDriverBuildContextTests(unittest.TestCase):
                         result = suite.build_driver({'images': {'AVX2': runtime}}, Path(temporary))
                     self.assertEqual(result, tools['id'])
                 self.assertEqual(references, [reference, reference])
-                self.assertEqual(checked, [(suite.ROOT / 'scripts/ci/install_opencode_client.py').resolve()])
+                self.assertEqual(checked, [(suite.ROOT / 'scripts/ci/install_opencode_client.py').resolve(),
+                                           (suite.ROOT / 'scripts/ci/opencode-client').resolve()])
 
     def test_foreign_or_changed_from_reference_fails_before_certifying_tools(self):
         runtime = runtime_identity(local=True)

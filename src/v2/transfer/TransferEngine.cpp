@@ -13,6 +13,10 @@
  */
 
 #include "transfer/TransferEngine.h"
+#include "execution/moe/GPUExpertTransferBackend.h"
+#include "transfer/PreparedDevicePeerCopy.h"
+#include "backends/ComputeBackend.h"
+#include "backends/ExplicitGPUStream.h"
 #include "backends/NativeAuxiliaryStreamOwnership.h"
 #include "backends/NativeContextPreparation.h"
 #include "planning/PhysicalMemoryAuthority.h"
@@ -82,6 +86,31 @@ namespace llaminar2
         if(!backend->recordEvent(event,ordinal,stream)||!backend->waitForEvent(event,ordinal)) {
             LOG_ERROR("Immutable workspace metadata could not authenticate completion of its accepted setup copy");
             std::terminate();
+        }
+        backend->destroyEvent(event,ordinal);
+    }
+
+    void TransferEngine::initializeDeviceMetadata(DeviceTransferBuffer &destination,size_t offset,
+        std::span<const std::byte> source,void *stream) const
+    {
+        const auto device=destination.device();
+        if(isGraphCaptureActive() || !destination.isBound() || source.empty() || !source.data() ||
+           !destination.contains(offset,source.size()) || reinterpret_cast<std::uintptr_t>(stream)<=2)
+            throw std::invalid_argument("Cold device metadata requires its bounded original buffer and setup stream");
+        auto *backend=resolveBackend(device);
+        if(!backend || backend!=destination.backend_)
+            throw std::logic_error("Cold device metadata lost its original backend");
+        const auto ordinal=device.gpu_ordinal();
+        void *event=backend->createEvent(ordinal);
+        if(!event)throw std::runtime_error("Cold device metadata completion creation failed");
+        if(!backend->hostToDeviceOnStream(destination.mutableDeviceData(offset),source.data(),source.size(),ordinal,stream)) {
+            backend->destroyEvent(event,ordinal);
+            throw std::runtime_error("Cold device metadata upload failed");
+        }
+        // Like workspace initialization, accepted copies retain their setup
+        // source until exact-stream completion; failure cannot unwind that source.
+        if(!backend->recordEvent(event,ordinal,stream) || !backend->waitForEvent(event,ordinal)) {
+            LOG_ERROR("Cold device metadata accepted copy lost completion");std::terminate();
         }
         backend->destroyEvent(event,ordinal);
     }
@@ -4421,6 +4450,99 @@ namespace llaminar2
         }
 
         return result;
+    }
+
+    PreparedDevicePeerCopy TransferEngine::prepareDevicePeerCopy(std::shared_ptr<TensorBase> source,
+        std::shared_ptr<TensorBase> destination,DeviceId source_device,DeviceId destination_device,
+        ExplicitGPUStream destination_stream)const
+    {
+        if(isGraphCaptureActive())throw std::logic_error("Direct peer preparation must precede capture");
+        if(!source || !destination || source==destination || source->transferStorageOwner()!=source.get() || destination->transferStorageOwner()!=destination.get() ||
+            !source_device.is_gpu() || !destination_device.is_gpu() || source_device==destination_device || source_device.type!=destination_device.type)
+            throw std::invalid_argument("Direct peer preparation requires distinct original same-backend GPU tensor owners");
+        auto& pool=GPUDeviceContextPool::instance();
+        auto source_worker=pool.retainExistingContextProvenance(source_device);
+        auto destination_worker=pool.retainExistingContextProvenance(destination_device);
+        if(!destination_worker.worker()->ownsCurrentThread() || destination_worker.worker()->defaultStream()!=destination_stream.get())
+            throw std::invalid_argument("Direct peer preparation requires the destination original worker stream");
+        const auto observed_peer=DeviceManager::instance().peerAccessAvailable(destination_device,source_device);
+        if(!observed_peer)throw std::logic_error("Direct peer preparation has no original directed peer observation");
+        if(!*observed_peer)throw std::runtime_error("Original directed peer observation reports unavailable physical P2P");
+        bool peer=false;
+#ifdef HAVE_CUDA
+        if(source_device.is_cuda())peer=detail::prepareDirectPeerAccessCUDABackend(source_device,destination_device);
+#endif
+#ifdef HAVE_ROCM
+        if(source_device.is_rocm())peer=detail::prepareDirectPeerAccessROCmBackend(source_device,destination_device);
+#endif
+        if(!peer)throw std::runtime_error("Preparation of the observed direct peer edge failed; no transfer fallback is permitted");
+        // The receiving buffer already owns initialized admitted bytes. Joining
+        // its publication and republishing unchanged bytes creates any required
+        // terminal event before capture, never inside enqueue().
+        requireDeviceInput(destination.get(),destination_device,destination_stream.get());
+        publishDeviceWrite(destination.get(),destination_device,destination_stream.get());
+        std::scoped_lock lock(source->coherence_mutex_,destination->coherence_mutex_);
+        if(!source->gpu_data_ptr_ || source->gpu_device_!=source_device || !::llaminar2::isDeviceValid(source->coherence_state_) ||
+            !destination->gpu_data_ptr_ || destination->gpu_device_!=destination_device || !source->size_bytes() || !destination->size_bytes())
+            throw std::invalid_argument("Direct peer preparation requires existing valid physical tensor allocations");
+        if(!source->device_completion_event_ || !source->completionEventProtectsDeviceValue_())
+            throw std::logic_error("Direct peer input has no published producer event; preparation cannot invent completion");
+        {
+            if(source->event_device_!=source_device)throw std::logic_error("Direct peer source producer event has a foreign physical owner");
+            auto* backend=resolveBackend(destination_device);
+            if(!backend || !backend->streamWaitEvent(destination_stream.get(),source->device_completion_event_,destination_device.ordinal))
+                throw std::runtime_error("Direct peer source event could not join exact destination stream");
+            source->last_joined_completion_event_=source->device_completion_event_;
+            source->last_joined_consumer_stream_=destination_stream.get();
+        }
+        const auto source_pointer=source->gpu_data_ptr_;const auto destination_pointer=destination->gpu_data_ptr_;
+        const auto source_capacity=source->size_bytes();const auto destination_capacity=destination->size_bytes();
+        return {std::move(source),std::move(destination),source_device,destination_device,destination_stream.get(),
+            std::move(source_worker),std::move(destination_worker),source_pointer,destination_pointer,source_capacity,destination_capacity};
+    }
+
+    void TransferEngine::enqueuePreparedDevicePeerCopy(const PreparedDevicePeerCopy& copy,std::size_t source_offset,
+        std::size_t destination_offset,std::size_t live_bytes)
+    {
+        if(!copy.source_ || !copy.destination_ || !copy.source_worker_.worker() || !copy.destination_worker_.worker() || !copy.destination_worker_.worker()->ownsCurrentThread() ||
+            copy.destination_worker_.worker()->defaultStream()!=copy.stream_)
+            throw std::logic_error("Direct peer copy lost its original destination worker/stream");
+        if(source_offset>copy.source_capacity_ || live_bytes>copy.source_capacity_-source_offset ||
+            destination_offset>copy.destination_capacity_ || live_bytes>copy.destination_capacity_-destination_offset)
+            throw std::out_of_range("Direct peer live byte range exceeds frozen storage");
+        {
+            std::scoped_lock lock(copy.source_->coherence_mutex_,copy.destination_->coherence_mutex_);
+            if(copy.source_->gpu_data_ptr_!=copy.source_pointer_ || copy.destination_->gpu_data_ptr_!=copy.destination_pointer_ ||
+                copy.source_->gpu_device_!=copy.source_device_ || copy.destination_->gpu_device_!=copy.destination_device_ ||
+                copy.source_->size_bytes()!=copy.source_capacity_ || copy.destination_->size_bytes()!=copy.destination_capacity_ ||
+                !::llaminar2::isDeviceValid(copy.source_->coherence_state_))
+                throw std::logic_error("Direct peer tensor storage was rebound or invalidated after preparation");
+            if(!copy.source_->device_completion_event_ || !copy.source_->completionEventProtectsDeviceValue_() ||
+                copy.source_->last_joined_completion_event_!=copy.source_->device_completion_event_ || copy.source_->last_joined_consumer_stream_!=copy.stream_)
+                throw std::logic_error("Direct peer source publication changed after exact-stream preparation");
+            if(!copy.destination_->device_completion_event_ || !copy.destination_->completionEventProtectsDeviceValue_() ||
+                copy.destination_->event_device_!=copy.destination_device_)
+                throw std::logic_error("Direct peer output lost its pre-created destination publication event");
+        }
+        if(!live_bytes)return;
+        // Pool lookup authenticates only existing host metadata. It never creates
+        // a worker or re-queries native properties/provider identities in capture.
+        const auto source_current=GPUDeviceContextPool::instance().retainExistingContextProvenance(copy.source_device_);
+        const auto destination_current=GPUDeviceContextPool::instance().retainExistingContextProvenance(copy.destination_device_);
+        copy.source_worker_.requireWorker(source_current.worker());copy.destination_worker_.requireWorker(destination_current.worker());
+        if(source_current.generation()!=copy.source_worker_.generation() || destination_current.generation()!=copy.destination_worker_.generation())
+            throw std::logic_error("Direct peer copy has a stale original worker generation");
+        const auto* source=static_cast<const unsigned char*>(copy.source_pointer_)+source_offset;
+        auto* destination=static_cast<unsigned char*>(copy.destination_pointer_)+destination_offset;
+        bool submitted=false;
+#ifdef HAVE_CUDA
+        if(copy.source_device_.is_cuda())submitted=detail::copyPreparedDevicePeerBytesCUDABackend(destination,copy.destination_device_.ordinal,source,copy.source_device_.ordinal,live_bytes,copy.stream_);
+#endif
+#ifdef HAVE_ROCM
+        if(copy.source_device_.is_rocm())submitted=detail::copyPreparedDevicePeerBytesROCmBackend(destination,copy.destination_device_.ordinal,source,copy.source_device_.ordinal,live_bytes,copy.stream_);
+#endif
+        if(!submitted)throw std::runtime_error("Prepared direct physical peer byte submission failed");
+        publishDeviceWrite(copy.destination_.get(),copy.destination_device_,copy.stream_);
     }
 
     TransferResult TransferEngine::copyActivation(TensorBase *src, TensorBase *dst,

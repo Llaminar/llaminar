@@ -37,6 +37,11 @@ _PROOF_SPEC = importlib.util.spec_from_file_location(
 assert _PROOF_SPEC and _PROOF_SPEC.loader
 QUEUE_PROOF = importlib.util.module_from_spec(_PROOF_SPEC)
 _PROOF_SPEC.loader.exec_module(QUEUE_PROOF)
+_CAPTURE_SPEC = importlib.util.spec_from_file_location(
+    "hip_end_capture_proof", ROOT / "scripts/docker/hip-end-capture/proof.py")
+assert _CAPTURE_SPEC and _CAPTURE_SPEC.loader
+CAPTURE_PROOF = importlib.util.module_from_spec(_CAPTURE_SPEC)
+_CAPTURE_SPEC.loader.exec_module(CAPTURE_PROOF)
 
 
 
@@ -119,11 +124,13 @@ class HIPRuntimeAuthority:
             raise HIPRuntimeBindingError("Canonical installer omitted HIP proof contract")
         proof_files = []
         for line in proof_declaration[1].splitlines():
-            match = re.fullmatch(r'    "\$\{hip_script_dir\}/hip-preferred-queue/([^"/]+)"', line)
+            match = re.fullmatch(r'    "\$\{hip_script_dir\}/(hip-preferred-queue|hip-end-capture)/([^"/]+)"', line)
             if not match:
                 raise HIPRuntimeBindingError("Unknown canonical HIP proof declaration")
-            proof_files.append((match[1], file_digest(docker / "hip-preferred-queue" / match[1])))
-        if [name for name, _ in proof_files] != ["proof.py", "selector-contract.cpp.in"]:
+            relative = match[1] + "/" + match[2]
+            proof_files.append((relative, file_digest(docker / relative)))
+        if [name for name, _ in proof_files] != ["hip-preferred-queue/proof.py", "hip-preferred-queue/selector-contract.cpp.in",
+                "hip-end-capture/proof.py", "hip-end-capture/end-capture-contract.cpp.in"]:
             raise HIPRuntimeBindingError("Incomplete or reordered HIP proof contract")
         proof_contract = ":".join(digest for _, digest in proof_files)
         identity = ":".join([*(pins[key] for key in keys), *(digest for _, digest in patches), proof_contract])
@@ -176,9 +183,14 @@ def require_installed_receipt(runtime: Path, authority: HIPRuntimeAuthority) -> 
             raise HIPRuntimeBindingError("Loaded HIP installed repair differs from current source: " + name)
     try:
         QUEUE_PROOF.load_verified(prefix / "share/llaminar/hip-preferred-queue-proof.json",
-                                  authority.identity, declared, authority.proof_contract)
+                                  authority.identity, declared, ":".join(authority.proof_contract.split(":")[:2]))
     except (OSError, ValueError, KeyError, TypeError) as error:
         raise HIPRuntimeBindingError("Loaded HIP preferred-queue proof rejected: " + str(error)) from error
+    try:
+        CAPTURE_PROOF.load_verified(prefix / "share/llaminar/hip-end-capture-proof.json",
+            authority.identity, declared, ":".join(authority.proof_contract.split(":")[2:]))
+    except (OSError, ValueError, KeyError, TypeError) as error:
+        raise HIPRuntimeBindingError("Loaded HIP capture-retirement proof rejected: " + str(error)) from error
     if receipt.read_text().strip() != marker:
         raise HIPRuntimeBindingError("HIP installation receipt changed during authentication")
 
@@ -266,11 +278,17 @@ class HIPRuntimeBindingTests(unittest.TestCase):
         with (source / "install-hip-graph-runtime.sh").open("a") as stream:
             stream.write('hip_proof_files=(\n'
                 '    "${hip_script_dir}/hip-preferred-queue/proof.py"\n'
-                '    "${hip_script_dir}/hip-preferred-queue/selector-contract.cpp.in"\n)\n')
+                '    "${hip_script_dir}/hip-preferred-queue/selector-contract.cpp.in"\n'
+                '    "${hip_script_dir}/hip-end-capture/proof.py"\n'
+                '    "${hip_script_dir}/hip-end-capture/end-capture-contract.cpp.in"\n)\n')
         (source / "hip-preferred-queue").mkdir()
         for name in ("proof.py", "selector-contract.cpp.in"):
             shutil.copyfile(ROOT / "scripts/docker/hip-preferred-queue" / name,
                             source / "hip-preferred-queue" / name)
+        (source / "hip-end-capture").mkdir()
+        for name in ("proof.py", "end-capture-contract.cpp.in"):
+            shutil.copyfile(ROOT / "scripts/docker/hip-end-capture" / name,
+                            source / "hip-end-capture" / name)
         authority = HIPRuntimeAuthority.from_source(directory / "source")
         prefix = directory / "installed"
         (prefix / "lib").mkdir(parents=True)
@@ -289,7 +307,7 @@ class HIPRuntimeBindingTests(unittest.TestCase):
         names = ["shared preferred must not bypass eligible unshared queue"] + [
             "finite synthetic consumer control " + str(i) for i in range(1, QUEUE_PROOF.CHECKS)]
         document = {"schema": QUEUE_PROOF.SCHEMA, "source_identity": authority.identity,
-                    "library_sha256": file_digest(library), "contract_identity": authority.proof_contract,
+                    "library_sha256": file_digest(library), "contract_identity": ":".join(authority.proof_contract.split(":")[:2]),
                     "original_source_sha256": "1" * 64, "candidate_source_sha256": "2" * 64,
                     "header_sha256": "3" * 64}
         for variant, failures in (("original", QUEUE_PROOF.ORIGINAL_FAILURES), ("candidate", 0)):
@@ -298,6 +316,21 @@ class HIPRuntimeBindingTests(unittest.TestCase):
                 "cases": [{"ordinal": i + 1, "name": name, "passed": i >= failures}
                           for i, name in enumerate(names)]}
         (prefix / "share/llaminar/hip-preferred-queue-proof.json").write_text(json.dumps(document))
+        self.write_capture_proof(prefix,authority,library)
+        return document
+
+    def write_capture_proof(self,prefix:Path,authority:HIPRuntimeAuthority,library:Path)->dict:
+        """Synthetic consumer receipt only; actual source-body producer is builder-owned."""
+        names=["three-auxiliary-stream invalidated=0 generation=0"]+[
+            "synthetic capture consumer control "+str(i) for i in range(1,CAPTURE_PROOF.CHECKS)]
+        document={"schema":CAPTURE_PROOF.SCHEMA,"source_identity":authority.identity,
+            "library_sha256":file_digest(library),"contract_identity":":".join(authority.proof_contract.split(":")[2:]),
+            "original_source_sha256":"1"*64,"candidate_source_sha256":"2"*64,"header_sha256":"3"*64}
+        for variant,failures in (("original",CAPTURE_PROOF.ORIGINAL_FAILURES),("candidate",0)):
+            document[variant]={"compile_exit":0,"run_exit":int(failures!=0),"failures":failures,
+                "body_sha256":("4" if variant=="original" else "5")*64,
+                "cases":[{"ordinal":i+1,"name":name,"passed":i>=failures} for i,name in enumerate(names)]}
+        (prefix/"share/llaminar/hip-end-capture-proof.json").write_text(json.dumps(document))
         return document
 
     def test_preferred_queue_proof_rejects_missing_foreign_or_false_controls(self):
@@ -335,6 +368,41 @@ class HIPRuntimeBindingTests(unittest.TestCase):
                     with self.assertRaisesRegex(HIPRuntimeBindingError, "preferred-queue proof rejected"):
                         require_installed_receipt(library, authority)
 
+    def test_capture_retirement_proof_rejects_missing_foreign_or_false_controls(self):
+        """A current DSO cannot excuse absent, stale or weakened actual-body evidence."""
+        mutations = ("missing", "truncated", "schema", "source", "dso", "contract", "native_input",
+                     "same_original", "same_body", "missing_body", "compile", "original_exit", "candidate_exit", "old_green",
+                     "candidate_failed", "missing_case", "changed_matrix", "fractional_count")
+        for mutation in mutations:
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                authority, library = self.fixture(root)
+                proof = library.parent.parent / "share/llaminar/hip-end-capture-proof.json"
+                document = json.loads(proof.read_text())
+                if mutation == "missing": proof.unlink()
+                elif mutation == "truncated": proof.write_text('{"schema":')
+                else:
+                    if mutation == "schema": document["schema"] = True
+                    elif mutation == "source": document["source_identity"] += ":foreign"
+                    elif mutation == "dso": document["library_sha256"] = "f" * 64
+                    elif mutation == "contract": document["contract_identity"] = "stale"
+                    elif mutation == "native_input": del document["header_sha256"]
+                    elif mutation == "same_original": document["original_source_sha256"] = document["candidate_source_sha256"]
+                    elif mutation == "same_body": document["original"]["body_sha256"] = document["candidate"]["body_sha256"]
+                    elif mutation == "missing_body": del document["candidate"]["body_sha256"]
+                    elif mutation == "compile": document["candidate"]["compile_exit"] = 1
+                    elif mutation == "original_exit": document["original"]["run_exit"] = 0
+                    elif mutation == "candidate_exit": document["candidate"]["run_exit"] = 1
+                    elif mutation == "old_green": document["original"]["failures"] = 0
+                    elif mutation == "candidate_failed": document["candidate"]["cases"][0]["passed"] = False
+                    elif mutation == "missing_case": document["original"]["cases"].pop()
+                    elif mutation == "changed_matrix": document["candidate"]["cases"][0]["name"] = "different inputs"
+                    elif mutation == "fractional_count": document["candidate"]["failures"] = 0.0
+                    proof.write_text(json.dumps(document))
+                with patch.object(CAPTURE_PROOF.subprocess, "run", side_effect=AssertionError("runner must not compile/load")):
+                    with self.assertRaisesRegex(HIPRuntimeBindingError, "capture-retirement proof rejected"):
+                        require_installed_receipt(library, authority)
+
     def test_preferred_queue_reuse_and_staging_reject_stale_proof(self):
         """Real installer fails before source build or export on a matching but stale proof."""
         for mode in ("reuse", "stage"):
@@ -356,6 +424,31 @@ class HIPRuntimeBindingTests(unittest.TestCase):
                     env=env, text=True, capture_output=True, timeout=30)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("HIP preferred-queue proof", result.stderr)
+                self.assertNotIn("Building", result.stdout)
+                self.assertFalse(destination.exists())
+                self.assertEqual(file_digest(library), before)
+
+    def test_capture_retirement_reuse_and_staging_reject_stale_proof(self):
+        """Real installer fails before source build or export on a matching but stale proof."""
+        for mode in ("reuse", "stage"):
+            with self.subTest(mode=mode), tempfile.TemporaryDirectory() as name:
+                root = Path(name)
+                authority, _ = self.staged_component(root)
+                prefix = root / "builder-sdk"
+                library = prefix / "lib" / ("libamdhip64.so." + authority.identity.split(":")[3])
+                before = file_digest(library)
+                proof = prefix / "share/llaminar/hip-end-capture-proof.json"
+                document = json.loads(proof.read_text())
+                document["candidate"]["run_exit"] = 1
+                proof.write_text(json.dumps(document))
+                destination = root / "rejected-export"
+                env = dict(os.environ, ROCM_PATH=str(prefix), HIP_RUNTIME_INSTALL_PREFIX=str(prefix))
+                env.pop("HIP_RUNTIME_STAGE_PREFIX", None)
+                if mode == "stage": env["HIP_RUNTIME_STAGE_PREFIX"] = str(destination)
+                result = subprocess.run(["bash", str(ROOT / "scripts/docker/install-hip-graph-runtime.sh")],
+                    env=env, text=True, capture_output=True, timeout=30)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("HIP capture-retirement proof", result.stderr)
                 self.assertNotIn("Building", result.stdout)
                 self.assertFalse(destination.exists())
                 self.assertEqual(file_digest(library), before)
@@ -717,7 +810,17 @@ def main() -> int:
     parser.add_argument("--wrong-runtime-fixture", type=Path)
     parser.add_argument("--preferred-queue-contract", action="store_true",
                         help="run only focused device-free queue-proof consumer controls when no binary is given")
+    parser.add_argument("--capture-retirement-contract", action="store_true",
+                        help="run focused device-free EndCapture proof consumer controls before loader admission")
     args = parser.parse_args()
+    if args.capture_retirement_contract:
+        suite = unittest.TestSuite([
+            HIPRuntimeBindingTests("test_capture_retirement_proof_rejects_missing_foreign_or_false_controls"),
+            HIPRuntimeBindingTests("test_capture_retirement_reuse_and_staging_reject_stale_proof")])
+        if not unittest.TextTestRunner(verbosity=2).run(suite).wasSuccessful():
+            return 1
+        if not args.binary:
+            return 0
     if args.preferred_queue_contract:
         suite = unittest.TestSuite([
             HIPRuntimeBindingTests("test_preferred_queue_proof_rejects_missing_foreign_or_false_controls"),

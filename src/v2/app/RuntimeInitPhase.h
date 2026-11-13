@@ -179,7 +179,28 @@ namespace llaminar2
          */
         RuntimeInitResult execute(OrchestrationConfig &config, int &argc, char **&argv);
 
+        /**
+         * @brief Run the identical initializer inside an already-owned original process session.
+         * @param config Original parsed request, published as in execute().
+         * @param argc Original argument count. @param argv Original argument vector.
+         * @param original Live canonical process owner retained by the caller through context retirement.
+         * @return Same active/terminal result; returned AppContext does not own process finalization.
+         * @throws std::invalid_argument Before context access when original owns no MPI session.
+         * @note Caller declares original before all discovery/selected contexts. This is a borrow,
+         *       never a second MPI initialization or finalization authority.
+         */
+        RuntimeInitResult executeInSession(OrchestrationConfig& config,int& argc,char**& argv,
+            const MPIProcessSession& original);
+
     private:
+        /**
+         * @brief Share all discovery/admission/runner work between owned and borrowed entrypoints.
+         * @param config Original request. @param argc Original argc. @param argv Original argv.
+         * @param session Sole finalizer token, or empty when executeInSession retains its caller's owner.
+         * @return Same runtime result with the supplied finalizer ownership moved only on success.
+         */
+        RuntimeInitResult executeWithLifetime(OrchestrationConfig& config,int& argc,char**& argv,
+            MPIProcessSession session);
         AutomaticPlanningStartup::Prepare prepare_; ///< Shared evidence policy before discovery membership narrows.
     };
 

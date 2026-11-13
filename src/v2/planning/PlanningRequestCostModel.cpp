@@ -4,6 +4,8 @@
  *
  * Compute uses per-format source samples and independent streaming bandwidth.
  * State and scalar operations use explicitly qualified FP32 roofline proxies.
+ * Same-class GPU prediction pooling removes short-sample placement noise without
+ * rewriting raw endpoint evidence, physical admission or directed link costs.
  * Communication predictions retain physical endpoints and report when a native
  * group or host request/reply is a volume proxy rather than the exact production
  * protocol. Predictions never change that protocol, precision or placement.
@@ -11,19 +13,23 @@
 #include "PlanningRequestCostModel.h"
 #include "AutomaticPlanningStartup.h"
 #include "PlanningForwardStateWork.h"
+#include "PlanningImmutableLookupWork.h"
 #include "execution/moe/MoEOverlayActivationPacketABI.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEGroupedIntermediateExchangeABI.h"
-#include "transfer/CapturedTransferChannelProtocol.h"
 #include "collective/DeviceCountedAllGather.h"
+#include "interfaces/IMPIContext.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
+#include "utils/Logger.h"
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <limits>
 #include <set>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 
 namespace llaminar2
 {
@@ -63,19 +69,33 @@ namespace llaminar2
     std::optional<AutomaticOrchestrationPlanner::Evaluate> PlanningRequestCostModel::prepare(
         const AutomaticPlanningPreparation &context)
     {
+        auto phase_begin = std::chrono::steady_clock::now();
+        // Include preparation, publication and resource retirement in each
+        // evidence family. Native sample intervals alone hide startup costs.
+        const auto completed_phase = [&](const char *name) {
+            const auto now = std::chrono::steady_clock::now();
+            LOG_INFO("[PlanningEvidenceWall] discovery_rank=" << (context.mpi() ? context.mpi()->rank() : 0)
+                << " phase=" << name << " seconds="
+                << std::chrono::duration<double>(now - phase_begin).count());
+            phase_begin = now;
+        };
         auto weights = PlanningWeightServiceModel::collect(context);
+        completed_phase("weights_and_streaming");
         std::optional<AutomaticOrchestrationRequest> request;
         acceptPlanningCostPreparation(context.mpi(), [&] {
             request = std::get<AutomaticOrchestrationRequest>(resolveOrchestrationIntent(context.request()));
         });
         auto arithmetic = PlanningKernelServiceCatalog::collect(context.mpi(), context.inventory(), *request,
             PlanningFP32ArithmeticPlan{});
+        completed_phase("fp32_arithmetic");
         // This is a bounded FP32 link-service basis, not a precision override
         // for inference. The final evidence labels volume proxies explicitly.
         constexpr std::array precisions{PlanningAllreducePrecision::FP32};
         auto communication = PlanningCommunicationService::collect(context.mpi(), context.inventory(), *request,
             context.metadata().memoryProfile().d_model, 64, precisions,
-            context.request().routed_expert_compute_policy);
+            context.request().routed_expert_compute_policy,
+            PlanningLocalTPMeasurementMode::NativeCollective);
+        completed_phase("communication");
         if (!context.isRoot()) return std::nullopt;
         auto service = std::make_shared<const PlanningRequestCostModel>(context.metadata(), context.inventory(),
             std::move(*weights), std::move(*arithmetic), PlanningCommunicationCost(context.inventory(),
@@ -107,12 +127,85 @@ namespace llaminar2
                     fp32.cpu->execution != stream.request.cpuGeometry()))
                 throw std::invalid_argument("Request cost arithmetic and streaming observations have different CPU workshares");
         }
+        prepareComputeCohorts();
         for (const auto &tensor : model_.memoryProfile().tensors)
         {
             if (!tensor.elements || !tensor.native_bytes ||
                 !source_bytes_per_element_.emplace(tensor.name, double(tensor.native_bytes) / tensor.elements).second)
                 throw std::invalid_argument("Request cost requires a complete unique native tensor inventory");
         }
+    }
+
+    void PlanningRequestCostModel::prepareComputeCohorts()
+    {
+        // PCI location and measured speed are deliberately absent: they remain
+        // physical-link evidence, not compute-class identity. Unknown required
+        // hardware fields never authorize pooling with another unknown device.
+        using Class=std::tuple<int,int,int,DeviceType,std::string,std::string,int,int,int,size_t,size_t,float,float,float>;
+        std::map<Class,std::vector<const PlanningServiceObserver*>> classes;
+        for(const auto &record:weights_.streamingEvidence().records()) {
+            const auto &observer=record.observer;const auto device=observer.device();
+            if(!device.is_gpu())continue;
+            compute_cohorts_[{observer.discoveryRank(),device}]={device};
+            const auto rank=std::find_if(inventory_.ranks.begin(),inventory_.ranks.end(),
+                [&](const auto &r){return r.rank==observer.discoveryRank();});
+            if(rank==inventory_.ranks.end() || rank->node_id!=observer.physicalNode())
+                throw std::invalid_argument("Compute class lost its original discovery owner");
+            const auto found=std::find_if(rank->gpus.begin(),rank->gpus.end(),[&](const auto &g){
+                return g.type==device.type && g.local_device_id==device.ordinal;});
+            if(found==rank->gpus.end() || found->uuid!=observer.uuid() || found->numa_node!=observer.numaNode())
+                throw std::invalid_argument("Compute class differs from authenticated physical observer");
+            const auto &g=*found;
+            const bool isa=device.is_cuda() ? g.compute_capability_major>0 && g.compute_capability_minor>=0 :
+                device.is_rocm() && !g.native_isa.empty();
+            if(!isa || g.name.empty() || g.uuid.empty() || g.numa_node<0 || g.compute_units<=0 ||
+               !g.memory_bytes || !g.last_level_cache_bytes ||
+               !std::isfinite(g.tflops_fp16) || !std::isfinite(g.tflops_int8) || !std::isfinite(g.memory_bandwidth_gbps) ||
+               g.tflops_fp16<0 || g.tflops_int8<0 || g.memory_bandwidth_gbps<0)continue;
+            classes[{observer.discoveryRank(),observer.physicalNode(),observer.numaNode(),device.type,g.name,g.native_isa,
+                g.compute_units,g.compute_capability_major,g.compute_capability_minor,g.memory_bytes,g.last_level_cache_bytes,
+                g.tflops_fp16,g.tflops_int8,g.memory_bandwidth_gbps}].push_back(&observer);
+        }
+        std::ostringstream evidence;
+        for(const auto &[key,members]:classes) {
+            if(members.size()<2)continue;
+            std::vector<DeviceId> devices;devices.reserve(members.size());
+            for(const auto *member:members)devices.push_back(member->device());
+            evidence << "; original-rank=" << members.front()->discoveryRank()
+                << "/node=" << members.front()->physicalNode() << "/NUMA=" << members.front()->numaNode() << " UUIDs=[";
+            bool first=true;
+            for(const auto *member:members) {
+                compute_cohorts_.at({member->discoveryRank(),member->device()})=devices;
+                if(!first)evidence << ',';
+                first=false;evidence << member->uuid();
+            }
+            evidence << ']';
+        }
+        if(!evidence.str().empty())compute_cohort_evidence_=
+            "same-class GPU median complete compute predictions over original per-endpoint receipts; "
+            "same source family/precision/local geometry; physical admission and links unpooled; CPU exact"+evidence.str();
+    }
+
+    double PlanningRequestCostModel::medianSeconds(int rank,DeviceId device,
+        const std::function<double(int,DeviceId)> &estimate) const
+    {
+        if(!device.is_gpu())return estimate(rank,device);
+        // Catalog aliases authenticate physical identity. Resolve the original
+        // measured owner before choosing its class or interpreting any ordinal.
+        const auto &observer=weights_.streamingEvidence().serviceFor(rank,device).observer;
+        const int observed_rank=observer.discoveryRank();
+        const auto found=compute_cohorts_.find({observed_rank,observer.device()});
+        if(found==compute_cohorts_.end())throw std::invalid_argument("No authenticated GPU compute cohort");
+        if(found->second.size()==1)return estimate(observed_rank,observer.device());
+        std::vector<double> seconds;seconds.reserve(found->second.size());
+        for(const auto member:found->second) {
+            const auto value=estimate(observed_rank,member);
+            if(!std::isfinite(value) || value<0)throw std::invalid_argument("Invalid same-class compute prediction");
+            seconds.push_back(value);
+        }
+        std::sort(seconds.begin(),seconds.end());
+        const auto middle=seconds.size()/2;
+        return seconds.size()%2 ? seconds[middle] : seconds[middle-1]+(seconds[middle]-seconds[middle-1])/2;
     }
 
     double PlanningRequestCostModel::parameterBytes(const PlanningWeightOperand &weight) const
@@ -128,11 +221,12 @@ namespace llaminar2
     double PlanningRequestCostModel::scalarSeconds(int rank, DeviceId device, int rows,
         double operations, double bytes) const
     {
-        const auto &observation = std::get<PlanningFP32ArithmeticObservations>(arithmetic_.serviceFor(rank, device).observation);
-        const auto &decode = observation.phases.at(0);
-        const auto &prefill = observation.phases.at(1);
-        return std::max(planningArithmeticSeconds(decode.service, prefill.rows, prefill.service, rows, operations),
-            weights_.memorySeconds(rank, device, bytes));
+        return medianSeconds(rank,device,[&](int observed_rank,DeviceId observed) {
+            const auto &observation=std::get<PlanningFP32ArithmeticObservations>(arithmetic_.serviceFor(observed_rank,observed).observation);
+            const auto &decode=observation.phases.at(0);const auto &prefill=observation.phases.at(1);
+            return std::max(planningArithmeticSeconds(decode.service,prefill.rows,prefill.service,rows,operations),
+                weights_.memorySeconds(observed_rank,observed,bytes));
+        });
     }
 
     PlanningRequestCostModel::InvocationCost PlanningRequestCostModel::invocation(
@@ -145,6 +239,7 @@ namespace llaminar2
         const int layers = model_.mainLayerCount();
         InvocationCost result;
         result.qualifications.insert("same-format shape extrapolation; uniform distinct top-k; no future migration benefit");
+        if(!compute_cohort_evidence_.empty())result.qualifications.insert(compute_cohort_evidence_);
         result.qualifications.insert("FP32 scalar/attention/GDN roofline proxies with ideal invocation-local state reuse");
         result.qualifications.insert("coarse layer joins; dependent layers and communications; no transfer/compute overlap credit");
 
@@ -169,14 +264,16 @@ namespace llaminar2
                 std::visit([&](const auto &value) {
                     using Operation = std::decay_t<decltype(value)>;
                     const auto &weight = value.weight;
-                    const int count = weight.role == WeightRole::LMHead || weight.role == WeightRole::OutputNorm ? 1 : rows;
+                    const int count = planningWeightInvocationRows(weight.role, rows);
                     double seconds = 0;
                     if constexpr (std::is_same_v<Operation, PlanningUnclassifiedWeight>)
                         throw std::invalid_argument("Unclassified request work: " + weight.source_name);
                     else if constexpr (std::is_same_v<Operation, PlanningProjectionWeight> ||
                                        std::is_same_v<Operation, PlanningRouterWeight>)
                     {
-                        seconds = weights_.projectionSeconds(participant.discovery_rank, participant.device, weight, count);
+                        seconds = medianSeconds(participant.discovery_rank,participant.device,[&](int observed_rank,DeviceId observed) {
+                            return weights_.projectionSeconds(observed_rank,observed,weight,count);
+                        });
                         const auto &shape = *weight.geometry.matrix();
                         if constexpr (std::is_same_v<Operation, PlanningRouterWeight>)
                         {
@@ -207,15 +304,24 @@ namespace llaminar2
                     else
                     {
                         const double elements = weight.geometry.elements();
-                        const bool norm = weight.role == WeightRole::Norm || weight.role == WeightRole::OutputNorm;
-                        const double coordinates = norm ? std::max(elements, double(profile.d_model)) : elements;
+                        const bool extension_norm = weight.role == WeightRole::HyperConnectionNorm ||
+                            weight.role == WeightRole::SparseIndexerNorm || weight.role == WeightRole::PerLayerEmbeddingNorm;
+                        const bool norm = extension_norm || weight.role == WeightRole::Norm || weight.role == WeightRole::OutputNorm;
+                        // QSA gains are reused per head; their source extent is
+                        // not the transformer's hidden width. HC/PLE gains
+                        // already span their full branch or lexical vector.
+                        double coordinates = extension_norm ? elements : norm ? std::max(elements, double(profile.d_model)) : elements;
+                        if (weight.role == WeightRole::SparseIndexerNorm && profile.flash_next)
+                            coordinates *= weight.source_name.ends_with(".indexer.q_norm.weight")
+                                ? profile.flash_next->indexer_query_heads : profile.flash_next->indexer_key_heads;
                         const double operations = weight.role == WeightRole::GDNSsmParam ? 0 :
-                            count * coordinates * (norm ? 8.0 : weight.role == WeightRole::SharedExpertInputGate ? 2.0 : 1.0);
+                            count * coordinates * (norm ? 8.0 :
+                                weight.role == WeightRole::SharedExpertInputGate || weight.role == WeightRole::PerLayerEmbeddingConvolution ? 2.0 : 1.0);
                         seconds = scalarSeconds(participant.discovery_rank, participant.device, count, operations,
                             parameterBytes(weight) + 2.0 * sizeof(float) * count * coordinates);
                     }
                     if (weight.role == WeightRole::Embedding) cost.entry += seconds;
-                    else if (weight.role == WeightRole::LMHead || weight.role == WeightRole::OutputNorm) cost.terminal += seconds;
+                    else if (planningTerminalWeight(weight.role, weight.layer)) cost.terminal += seconds;
                     else
                     {
                         if (weight.layer < 0 || weight.layer >= layers)
@@ -224,13 +330,15 @@ namespace llaminar2
                     }
                 }, operation);
 
-            const auto &fp32 = std::get<PlanningFP32ArithmeticObservations>(
-                arithmetic_.serviceFor(participant.discovery_rank, participant.device).observation);
-            const auto &memory = std::get<PlanningMemoryBandwidthObservation>(
-                weights_.streamingEvidence().serviceFor(participant.discovery_rank, participant.device).observation);
             for (const auto &state : compilePlanningForwardStateWork(model_, devices[index], phase, {rows, context}))
             {
-                cost.ordinary[state.layer] += planningStateServiceSeconds(state, fp32, memory);
+                cost.ordinary[state.layer] += medianSeconds(participant.discovery_rank,participant.device,[&](int observed_rank,DeviceId observed) {
+                    const auto &fp32=std::get<PlanningFP32ArithmeticObservations>(
+                        arithmetic_.serviceFor(observed_rank,observed).observation);
+                    const auto &memory=std::get<PlanningMemoryBandwidthObservation>(
+                        weights_.streamingEvidence().serviceFor(observed_rank,observed).observation);
+                    return planningStateServiceSeconds(state,fp32,memory);
+                });
                 // Two residual additions per transformer block. Parameterized
                 // norms are already charged by their own semantic operands.
                 cost.ordinary[state.layer] += scalarSeconds(participant.discovery_rank, participant.device, rows,
@@ -238,34 +346,31 @@ namespace llaminar2
             }
             for (const auto &expert : participant.routed)
             {
-                cost.experts.at(expert.layer) = weights_.expertSeconds(participant.discovery_rank, participant.device, expert, rows);
+                cost.experts.at(expert.layer) = medianSeconds(participant.discovery_rank,participant.device,[&](int observed_rank,DeviceId observed) {
+                    return weights_.expertSeconds(observed_rank,observed,expert,rows);
+                });
                 cost.routed.at(expert.layer) = &expert;
             }
         }
 
         // A link estimate never changes physical host membership or the actual
         // selected transport. Same-node mapped epochs and remote host MPI stay
-        // distinct. Point-to-point native links use a clearly qualified group
-        // service proxy: we do not claim to have sampled every candidate pair.
+        // distinct. Native links use the original directed pair matrix, not
+        // another subgroup's allreduce timing or a reverse-direction estimate.
         const auto exchange = [&](size_t source, size_t target, size_t outgoing, size_t incoming, bool mapped) {
             const auto &a = work[source];
             const auto &b = work[target];
             if (a.discovery_rank == b.discovery_rank && a.device == b.device) return 0.0;
             const auto topology = inventory_.connectionBetweenRanks(a.discovery_rank, b.discovery_rank);
             const bool same_node = topology.locality() != RankConnectionLocality::CrossNode;
-            if (a.discovery_rank == b.discovery_rank && a.device.is_gpu() && b.device.type == a.device.type)
+            if (!mapped && a.discovery_rank == b.discovery_rank && a.device.is_gpu() && b.device.type == a.device.type)
             {
-                const std::array group{a.device, b.device};
-                result.qualifications.insert("same-process GPU point-to-point traffic uses a native FP32 group-service volume proxy");
-                const size_t row_bytes = size_t(profile.d_model) * sizeof(float);
-                const size_t bytes = std::max(outgoing, incoming);
-                const size_t equivalent_rows = bytes / row_bytes + (bytes % row_bytes != 0);
-                if (equivalent_rows > size_t(std::numeric_limits<int>::max()))
-                    throw std::overflow_error("Planning native traffic exceeds representable row geometry");
-                const auto prediction = communication_.nativeAllreduce(a.discovery_rank, group, profile.d_model,
-                    static_cast<int>(std::max(size_t{1}, equivalent_rows)), PlanningAllreducePrecision::FP32);
-                result.qualifications.insert(prediction.evidence);
-                return prediction.seconds;
+                result.qualifications.insert("same-process GPU point-to-point placement uses physical peer copies or measured host-leg composition; request and reply remain dependent; native collective protocol timing is separate");
+                const auto request = communication_.physicalPeerTransfer(a.discovery_rank, a.device, b.device, outgoing);
+                const auto reply = communication_.physicalPeerTransfer(a.discovery_rank, b.device, a.device, incoming);
+                result.qualifications.insert(request.evidence);
+                result.qualifications.insert(reply.evidence);
+                return request.seconds + reply.seconds;
             }
             double seconds = 0;
             const auto staging = [&](const auto &gpu, int pages, MappedTransferDirection direction, size_t bytes) {
@@ -322,9 +427,9 @@ namespace llaminar2
             {
                 std::vector<DeviceId> endpoints;
                 for (size_t index : group) endpoints.push_back(work[index].device);
-                result.qualifications.insert("TP reductions use measured native FP32 group service; schema precision and canonical-order kernels are volume proxies, not sampled model collectives");
-                const auto prediction = communication_.nativeAllreduce(root.discovery_rank, endpoints, profile.d_model, rows,
-                    PlanningAllreducePrecision::FP32);
+                result.qualifications.insert("TP reductions retain measured native allreduce fixed latency and topology-scaled live FP32 payload service, with shared PCIe cut bounds");
+                const auto prediction = communication_.calibratedNativeAllreduce(root.discovery_rank, endpoints,
+                    profile.d_model, rows, PlanningAllreducePrecision::FP32);
                 result.qualifications.insert(prediction.evidence);
                 return prediction.seconds;
             }
@@ -338,13 +443,12 @@ namespace llaminar2
         /**
          * @brief Price the declared projection exchange, not a complete-FFN output sum.
          *
-         * Counted channels send each owner's live records to its down consumers.
-         * Original topology selects per-edge counted channels, never timings.
-         * Peer/mixed performance still uses the qualified conservative native
-         * packet-capacity proxy, not an assertion of actual live traffic.
-         * Column publication is a lossless gather, not
-         * another floating reduction. The bounded native allreduce witness is
-         * explicitly a byte-volume proxy for those unmeasured gather protocols.
+         * The production counted gather broadcasts each owner's extent and
+         * live records through its original native communicator. Original
+         * physical peer/host service supplies a serial-broadcast proxy; shared
+         * PCIe cuts account for aggregate unique fragments. Column publication
+         * is a lossless gather, not another floating reduction. No inferred
+         * native forwarding schedule is presented as a measured algorithm.
          */
         const auto projectionCommunication = [&](const std::vector<size_t> &group, int layer) {
             if (group.size() < 2) throw std::logic_error("Projection cost has no complete GPU domain");
@@ -354,7 +458,6 @@ namespace llaminar2
                 throw std::logic_error("Projection cost has no admitted source ownership");
             const auto topology = devices[group.front()].projection_exchange_topology;
             if (!topology) throw std::logic_error("Projection cost is missing original counted topology");
-            const auto coverage = topology->coverage();
             std::vector<DeviceId> endpoints;
             std::vector<double> records;
             const auto geometry = first->projection_ownership->geometry();
@@ -378,54 +481,24 @@ namespace llaminar2
                 endpoints.push_back(work[index].device);
                 records.push_back(expert->uniformExpectation(rows).routed_rows);
             }
-            const auto nativeVolume = [&](double bytes) {
-                const auto byte_count = payload(bytes);
-                const size_t row_bytes = size_t(profile.d_model) * sizeof(float);
-                const auto equivalent = byte_count / row_bytes + (byte_count % row_bytes != 0);
-                if (equivalent > size_t(std::numeric_limits<int>::max()))
-                    throw std::overflow_error("Projection native volume exceeds its measured row basis");
-                const auto prediction = communication_.nativeAllreduce(root.discovery_rank, endpoints,
-                    profile.d_model, static_cast<int>(equivalent), PlanningAllreducePrecision::FP32);
+            const auto nativeVolume = [&](std::span<const size_t> owner_bytes) {
+                const auto prediction = communication_.calibratedNativeCountedAllgather(root.discovery_rank, endpoints, owner_bytes);
                 result.qualifications.insert(prediction.evidence);
                 return prediction.seconds;
             };
-            double intermediate = 0;
-            if (coverage == PeerAccessCoverage::None)
-            {
-                result.qualifications.insert("projection intermediate uses counted owner records and mapped byte primitives; ordered local sends/receives; protocol polling not separately fitted");
-                std::vector<double> participants;
-                for (size_t producer = 0; producer < group.size(); ++producer)
-                {
-                    double seconds = 0;
-                    for (size_t peer = 0; peer < group.size(); ++peer)
-                    {
-                        if (producer == peer) continue;
-                        // The cache-line-sized publication has three uint64
-                        // fields. Price those live fields, not its alignment
-                        // padding or the channel's reserved physical capacity.
-                        constexpr auto metadata = sizeof(CapturedTransferPublication::epoch) + sizeof(CapturedTransferMessage);
-                        const auto outgoing = payload(records[producer] * layout.compactRecordWords() * sizeof(uint32_t) + metadata);
-                        const auto incoming = payload(records[peer] * layout.compactRecordWords() * sizeof(uint32_t) + metadata);
-                        seconds += communication_.hostTransfer(root.discovery_rank, endpoints[producer], root.discovery_rank,
-                            PlanningHostTransferMechanism::MappedKernel, MappedTransferDirection::DeviceToHost, outgoing).seconds;
-                        seconds += communication_.hostTransfer(root.discovery_rank, endpoints[producer], root.discovery_rank,
-                            PlanningHostTransferMechanism::MappedKernel, MappedTransferDirection::HostToDevice, incoming).seconds;
-                    }
-                    participants.push_back(seconds);
-                }
-                // Domain participants execute concurrently, but each captured
-                // stream issues its own sends/receives in order. No invented
-                // overlap between those local channel operations is credited.
-                intermediate = planningIndependentSeconds(participants);
-            }
-            else
-            {
-                result.qualifications.insert("projection counted peer/mixed exchange retains a conservative packet-capacity FP32 allreduce proxy, not actual communicated bytes or measured counted-channel throughput");
-                intermediate = nativeVolume(layout.packetBytes());
-            }
+            std::vector<size_t> intermediate_bytes;
+            for (double count : records)
+                intermediate_bytes.push_back(count > 0 ? payload(count * layout.compactRecordWords() * sizeof(uint32_t)) : 0);
+            // The measured counted protocol already contains every root's
+            // extent, payload and completion. Charging an additional metadata
+            // gather would count that control twice, including empty owners.
+            result.qualifications.insert("projection intermediate uses measured native counted gather; live extents and completion charged once");
+            const double intermediate = nativeVolume(intermediate_bytes);
             result.qualifications.insert("projection per-role work extrapolates complete-FFN measured rate; gate/up quota and all-expert down slices remain distinct");
-            result.qualifications.insert("projection column gather uses a measured FP32 allreduce byte-volume proxy, not measured gather throughput");
-            return intermediate + nativeVolume(double(rows) * geometry.model_columns * sizeof(float) / group.size());
+            const size_t column_bytes = payload(double(rows) * geometry.model_columns * sizeof(float) / group.size());
+            const auto columns = communication_.calibratedNativeAllgather(root.discovery_rank, endpoints, column_bytes);
+            result.qualifications.insert(columns.evidence);
+            return intermediate + columns.seconds;
         };
 
         std::vector<double> entries, terminals;
@@ -464,8 +537,14 @@ namespace llaminar2
             }
             if (continuation.empty()) throw std::logic_error("Request layer has no compiled continuation owner");
             if (!previous.empty() && previous != continuation)
+            {
+                // PP carries the residual trunk between complete decoder stages.
+                // HC expands that trunk without expanding compute-H allreduces.
+                const auto width = profile.flash_next ? profile.flash_next->residual_width : profile.d_model;
+                if (!width) throw std::invalid_argument("Pipeline boundary has no residual-trunk width");
                 result.communication += exchange(previous.front(), continuation.front(),
-                    payload(double(rows) * profile.d_model * sizeof(float)), 1, false);
+                    payload(double(rows) * width * sizeof(float)), 1, false);
+            }
             if (layer == 0)
             {
                 const bool embedding_sharded = std::any_of(continuation.begin(), continuation.end(), [&](size_t i) {
@@ -507,6 +586,14 @@ namespace llaminar2
             }
             previous = std::move(continuation);
         }
+        // Ordinary operands deliberately exclude the immutable table's
+        // capacity. This mandatory typed pass accounts for each live native
+        // read, decoded output and admitted source/consumer channel before a
+        // request estimate can escape. Missing services remain fatal.
+        const auto lookup = pricePlanningImmutableLookupWork(model_, candidate, static_cast<size_t>(rows), weights_, communication_);
+        result.compute += lookup.compute_seconds;
+        result.communication += lookup.communication_seconds;
+        result.qualifications.insert(lookup.qualifications.begin(), lookup.qualifications.end());
         return result;
     }
 

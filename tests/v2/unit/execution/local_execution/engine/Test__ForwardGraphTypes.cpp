@@ -9,6 +9,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "execution/local_execution/orchestrators/MoEMaintenanceObservationContext.h"
 #include "execution/mtp/HostedDeviceGenerationFragment.h"
 #include "fixtures/execution/RetainedHostServiceFixture.h"
 #include "backends/GPUDeviceProcessLifetime.h"
@@ -4357,6 +4358,96 @@ TEST(Test__GraphSegmentCache, CapturePlanEvidenceIsUniquePerMaterialization)
     second = std::move(moved);
     EXPECT_EQ(second.evidence_family, rebuilt);
     EXPECT_EQ(moved.evidence_family, 0u);
+}
+
+/** @test The actual capture-plan family retains its authored maintenance context across repeated use and reset. */
+TEST(Test__GraphSegmentCache, MaintenanceReplayContextKeepsOriginalCaptureFamily)
+{
+    for (const auto *context : {"pipeline_original_stage_maintenance_source", "moe_rebalance_maintenance_atomic"})
+    {
+        ComputeGraph graph;
+        addFakeSegmentStage(graph, "maintenance", true);
+        DeviceGraphExecutor::GraphSegmentCache cache;
+        if (std::string(context) == "pipeline_original_stage_maintenance_source") cache.perf_context = context;
+        dgo_detail::bindMoEMaintenanceReplayContext(cache);
+        EXPECT_EQ(cache.perf_context, context);
+        ASSERT_TRUE(cache.replay_workload.valid());
+        EXPECT_TRUE(cache.replay_workload.decode);
+        EXPECT_EQ(cache.replay_workload.m, 1);
+        DeviceGraphCaptureController::buildCapturePlan(graph, cache, nullptr, false, false);
+        const auto family = cache.evidence_family;
+        ASSERT_NE(family, 0u);
+        for (int replay = 0; replay < 3; ++replay)
+        {
+            graph.reset();
+            dgo_detail::bindMoEMaintenanceReplayContext(cache);
+            EXPECT_EQ(cache.perf_context, context);
+            EXPECT_EQ(cache.evidence_family, family);
+            for (const auto &unit : cache.segments) EXPECT_EQ(unit.evidence_family, family);
+        }
+        auto moved = std::move(cache);
+        dgo_detail::bindMoEMaintenanceReplayContext(moved);
+        EXPECT_EQ(moved.perf_context, context);
+        EXPECT_EQ(moved.evidence_family, family);
+        moved.reset();
+        dgo_detail::bindMoEMaintenanceReplayContext(moved);
+        DeviceGraphCaptureController::buildCapturePlan(graph, moved, nullptr, false, false);
+        EXPECT_NE(moved.evidence_family, family);
+        EXPECT_EQ(moved.perf_context, context);
+    }
+}
+
+/** @test Missing or foreign context cannot relabel a sealed maintenance family as an atomic replay. */
+TEST(Test__GraphSegmentCache, MaintenanceReplayContextRejectsMissingOrForeignObservationOwner)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "maintenance", true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    cache.perf_context = "pipeline_original_stage_maintenance_source";
+    dgo_detail::bindMoEMaintenanceReplayContext(cache);
+    DeviceGraphCaptureController::buildCapturePlan(graph, cache, nullptr, false, false);
+    const auto family = cache.evidence_family;
+    cache.perf_context.clear();
+    EXPECT_THROW(dgo_detail::bindMoEMaintenanceReplayContext(cache), std::logic_error);
+    EXPECT_TRUE(cache.perf_context.empty());
+    EXPECT_EQ(cache.evidence_family, family);
+    cache.perf_context = "foreign_capture_owner";
+    EXPECT_THROW(dgo_detail::bindMoEMaintenanceReplayContext(cache), std::logic_error);
+    EXPECT_EQ(cache.perf_context, "foreign_capture_owner");
+    EXPECT_EQ(cache.evidence_family, family);
+    DeviceGraphExecutor::GraphSegmentCache initialized;
+    initialized.initialized = true;
+    EXPECT_THROW(dgo_detail::bindMoEMaintenanceReplayContext(initialized), std::logic_error);
+    EXPECT_TRUE(initialized.perf_context.empty());
+}
+
+/** @test Maintenance preparation authors transaction geometry before capture and rejects lost sealed identity. */
+TEST(Test__GraphSegmentCache, MaintenanceTransactionObservationPreparedBeforeCapture)
+{
+    ComputeGraph graph;
+    addFakeSegmentStage(graph, "maintenance", true);
+    DeviceGraphExecutor::GraphSegmentCache cache;
+    dgo_detail::bindMoEMaintenanceReplayContext(cache);
+    ASSERT_TRUE(cache.replay_workload.valid());
+    EXPECT_TRUE(cache.replay_workload.decode);
+    // Binding observation identity cannot claim a capture or initial submission.
+    EXPECT_EQ(cache.successful_capture_count, 0u);
+    EXPECT_EQ(cache.successful_submission_count, 0u);
+    DeviceGraphCaptureController::buildCapturePlan(graph, cache, nullptr, false, false);
+    const auto family = cache.evidence_family;
+    for (int replay = 0; replay < 3; ++replay)
+    {
+        graph.reset();
+        dgo_detail::bindMoEMaintenanceReplayContext(cache);
+        EXPECT_EQ(cache.evidence_family, family);
+        EXPECT_TRUE(cache.replay_workload.decode);
+    }
+    cache.replay_workload.m = 2;
+    EXPECT_THROW(dgo_detail::bindMoEMaintenanceReplayContext(cache), std::logic_error);
+    EXPECT_EQ(cache.replay_workload.m, 2);
+    cache.replay_workload = {};
+    EXPECT_THROW(dgo_detail::bindMoEMaintenanceReplayContext(cache), std::logic_error);
+    EXPECT_EQ(cache.evidence_family, family);
 }
 
 TEST(Test__GraphSegmentCache, CapturePlanIncludesLaunchPreparationDependentStages)

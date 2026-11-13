@@ -2,6 +2,9 @@
  * @file ParitySnapshotMemoryCapacity.h
  * @brief Metadata-only memory envelope for production parity graph snapshots.
  *
+ * An explicit diagnostic observation key set prices the same frozen capture
+ * topology; default callers retain the complete authenticated reference bank.
+ *
  * The authenticated reference directory owns header-backed checkpoint geometry.
  * Selected raw indexer queries have a separate native source payload/metadata
  * declaration and need no invented or borrowed reference header. This helper reads only each NPY
@@ -217,6 +220,7 @@ namespace llaminar2::test::parity
      *        captured beside its rank-local producer.
      * @param source_outputs Model-owned selection from the same frozen capture filter.
      *        Live state payload is excluded and replaced by metadata-native capacity in planning.
+     * @param observation_keys Exact optional noncertifying capture selection; empty retains full inventory.
      * @return Cached metadata evidence and per-accelerator ordinary-payload capacity.
      * @throws std::invalid_argument for missing geometry/inventory.
      * @throws std::runtime_error for malformed or unreadable NPY metadata.
@@ -228,7 +232,8 @@ namespace llaminar2::test::parity
         int retained_graph_rows,
         std::vector<std::string> collective_stage_names,
         std::vector<GraphSnapshotSourceOutput> source_outputs = {},
-        ParitySnapshotPayloadProjection projection = ParitySnapshotPayloadProjection::ObservationEnvelope)
+        ParitySnapshotPayloadProjection projection = ParitySnapshotPayloadProjection::ObservationEnvelope,
+        std::vector<std::string> observation_keys = {})
     {
         if (reference_rows <= 0 || retained_graph_rows <= 0 ||
             !std::filesystem::is_directory(snapshot_dir))
@@ -251,10 +256,17 @@ namespace llaminar2::test::parity
         if (std::adjacent_find(source_outputs.begin(), source_outputs.end()) != source_outputs.end())
             throw std::invalid_argument("Parity snapshot source inventory contains duplicate producers");
         std::set<std::string> observed_sources;
+        const std::set<std::string> selected(observation_keys.begin(),observation_keys.end());
+        if(selected.size()!=observation_keys.size())throw std::invalid_argument("Snapshot observation keys contain duplicates");
+        if(!selected.empty())for(const auto& source:source_outputs)
+            if(!selected.contains(source.semanticKey()))
+                throw std::invalid_argument("Native snapshot source conflicts with exact observation capture keys");
+        std::set<std::string> observed_selection;
         std::string cache_key = snapshot_dir.lexically_normal().string() +
                                 "|" + std::to_string(reference_rows) +
                                 "|" + std::to_string(retained_graph_rows) +
                                 "|projection=" + std::to_string(static_cast<int>(projection));
+        for(const auto& key:selected)cache_key+="|observation="+key;
         for (const auto &stage : collective_stage_names)
             cache_key += "|" + stage;
         for (const auto &source : source_outputs)
@@ -312,6 +324,8 @@ namespace llaminar2::test::parity
                     }
                 }
             }
+            if(!selected.empty() && !selected.contains(semantic_key))continue;
+            if(!selected.empty())observed_selection.insert(semantic_key);
             const auto source = std::find_if(source_outputs.begin(), source_outputs.end(),
                 [&](const auto &entry) { return entry.semanticKey() == semantic_key; });
             const bool native_state = source != source_outputs.end() && source->replacesReferencePayload();
@@ -442,6 +456,8 @@ namespace llaminar2::test::parity
             ++evidence.reference_file_count;
         }
 
+        if(observed_selection!=selected)
+            throw std::invalid_argument("Selected snapshot observation has no original gold checkpoint");
         for (const auto &source : source_outputs)
         {
             // Raw query has an exact source-owned native payload/metadata BOM.

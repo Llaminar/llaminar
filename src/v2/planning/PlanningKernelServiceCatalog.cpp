@@ -7,6 +7,8 @@
  * overlapping CPU visibility cannot manufacture contention. Samplers on separate
  * physical nodes may run concurrently. Setup storage is admitted once through
  * the canonical PMA envelope and completely retires before returning evidence.
+ * DEBUG publication logs retain the existing raw source-qualified receipt once
+ * per local family, outside measured intervals, for endpoint/cost diagnosis.
  */
 #include "PlanningKernelServiceCatalog.h"
 #include "PlanningObservedResource.h"
@@ -18,6 +20,9 @@
 #include "utils/CPUFeatures.h"
 #include "utils/MPIContext.h"
 #include <nlohmann/json.hpp>
+#include "utils/Logger.h"
+#include "collective/OriginalNativeGraphCaptureGroup.h"
+#include <chrono>
 #include <algorithm>
 #include <climits>
 #include <limits>
@@ -39,7 +44,7 @@ namespace llaminar2
     {
         using Json = nlohmann::json;
         using ExpertObservation = std::variant<PlanningCPUExpertObservations, PlanningGPUExpertObservations>;
-        constexpr const char *kSchema = "llaminar.planning-kernel-service.v4";
+        constexpr const char *kSchema = "llaminar.planning-kernel-service.v5";
 
         /** @brief Reject incomplete evidence rather than treating a failed endpoint as slow. */
         void require(bool condition, const char *message)
@@ -62,7 +67,8 @@ namespace llaminar2
         {
             return std::visit([](const auto &source) -> Json {
                 if constexpr (std::is_same_v<std::decay_t<decltype(source)>, PlanningExpertSamplePlan>)
-                    return {{"kind", "expert"}, {"source", source.serialize()}};
+                    return {{"kind", "expert"}, {"source", source.serialize()},
+                        {"startup_phases", {int(kPlanningExpertStartupPhases[0]),int(kPlanningExpertStartupPhases[1])}}};
                 else if constexpr (std::is_same_v<std::decay_t<decltype(source)>, PlanningProjectionServicePlan>)
                     return {{"kind", "projection"}, {"source", source.matrix().serialize()},
                     {"execution_format", source.matrix().executionFormat()},
@@ -72,6 +78,20 @@ namespace llaminar2
                         {"prefill_rows", source.kPrefillRows}};
                 else return {{"kind", "streaming-memory"}};
             }, plan);
+        }
+
+        /** @return Small lifecycle label; full authenticated source bytes belong in DEBUG/receipts. */
+        std::string serviceLabel(const PlanningKernelSamplePlan &plan)
+        {
+            return std::visit([](const auto &source) -> std::string {
+                using Source=std::decay_t<decltype(source)>;
+                if constexpr(std::is_same_v<Source,PlanningExpertSamplePlan>)
+                    return "expert:"+source.request().gate.tensor_name;
+                else if constexpr(std::is_same_v<Source,PlanningProjectionServicePlan>)
+                    return "projection:"+source.matrix().executionFormat()+":"+source.matrix().request().tensor_name;
+                else if constexpr(std::is_same_v<Source,PlanningFP32ArithmeticPlan>)return "fp32-arithmetic-proxy";
+                else return "streaming-memory";
+            },plan);
         }
 
         /** @return Complete topology-derived assignment; every rank checks this before allocating. */
@@ -114,7 +134,7 @@ namespace llaminar2
                     observation.intermediate_width == description.matrices[0].n &&
                     observation.formats == description.formats && sameSource(observation.source, plan.request()),
                     "observation does not match source geometry/format/selection");
-                require(observation.prepared_bytes > 0 && observation.phases.size() == 3, "incomplete prepared service");
+                require(observation.prepared_bytes > 0 && observation.phases.size() == kPlanningExpertStartupPhases.size(), "incomplete prepared service");
                 if constexpr (cpu)
                     require(observation.worker_threads > 0 &&
                         observation.isa >= ISALevel::Scalar && observation.isa <= ISALevel::AVX512 &&
@@ -123,7 +143,7 @@ namespace llaminar2
                 for (size_t i = 0; i < observation.phases.size(); ++i)
                 {
                     const auto &phase = observation.phases[i];
-                    require(expertHistogramProductionSourceIndex(phase.phase) == i &&
+                    require(phase.phase == kPlanningExpertStartupPhases[i] &&
                         phase.rows == MoEOverlayCPUServiceMeasurement::rowsForPhase(phase.phase), "wrong phase/row geometry");
                     if constexpr (!cpu) require(phase.graph_nodes > 0, "GPU observation did not execute a captured graph");
                     const int invocations = cpu ? MoEOverlayCPUServiceMeasurement::kMeasuredSamples :
@@ -200,7 +220,7 @@ namespace llaminar2
                     static_cast<ISALevel>(integer(scope.at("compiled_isa"), int(ISALevel::AVX512))),
                     description.matrices[0].k, description.matrices[0].n, prepared, description.formats, plan.request(), {}};
             }
-            require(wire.at("phases").is_array() && wire.at("phases").size() == 3, "missing service phases");
+            require(wire.at("phases").is_array() && wire.at("phases").size() == kPlanningExpertStartupPhases.size(), "missing service phases");
             for (const auto &phase : wire.at("phases"))
             {
                 require(phase.is_object() && phase.size() == (cpu ? 5 : 6), "unknown phase fields");
@@ -425,10 +445,12 @@ namespace llaminar2
                 }
                 else if constexpr (std::is_same_v<std::decay_t<decltype(sample)>, PlanningProjectionServicePlan>)
                 {
-                    source.add(host, PhysicalMemoryOwner::ModelSourcePayload, sample.matrix().geometry().physicalBytes());
+                    PlanningProjectionMeasurement::contributeSourceMemory(sample.matrix(),origin,host,source);
                 }
             }, plan);
             std::vector<PhysicalMemoryPlan> alternatives{source.build()};
+            PhysicalMemoryPlanBuilder concurrent_projection_gpu(source.build());
+
             for (const auto &observer : observers)
             {
                 if (observer.discoveryRank() != rank) continue;
@@ -458,8 +480,12 @@ namespace llaminar2
 #endif
                                 observed.cpu_execution};
                             if constexpr (std::is_same_v<std::decay_t<decltype(sample)>, PlanningProjectionServicePlan>)
-                                PlanningProjectionMeasurement::contributeMemory(sample.matrix(), origin,
-                                    host, planningObservedResource(observed, device), builder, sample.prefillRows(), cpu);
+                            {
+                                if(device.is_gpu())PlanningProjectionMeasurement::contributeGPUParticipantMemory(sample.matrix(),
+                                    host,planningObservedResource(observed,device),builder,sample.prefillRows());
+                                else PlanningProjectionMeasurement::contributeMemory(sample.matrix(),origin,
+                                    host,planningObservedResource(observed,device),builder,sample.prefillRows(),cpu);
+                            }
                             else PlanningProjectionMeasurement::contributeMemory(sample,
                                 host, planningObservedResource(observed, device), builder, cpu);
                         }
@@ -470,8 +496,16 @@ namespace llaminar2
                 };
                 if (device.is_cpu()) contribute();
                 else GPUDeviceContextPool::instance().getContext(device).submitAndWait(contribute);
-                alternatives.push_back(builder.build());
+                const auto participant=builder.build();
+                if(device.is_gpu() && (std::holds_alternative<PlanningFP32ArithmeticPlan>(plan) || std::holds_alternative<PlanningProjectionServicePlan>(plan))) {
+                    // The original published source is shared once. Every GPU
+                    // has a private conversion (when required), upload ring and
+                    // phase workspace, so those host allocator charges SUM.
+                    for(const auto &resource:participant.resources())concurrent_projection_gpu.add(resource);
+                }else alternatives.push_back(participant);
             }
+            if(std::holds_alternative<PlanningFP32ArithmeticPlan>(plan) || std::holds_alternative<PlanningProjectionServicePlan>(plan))
+                alternatives.push_back(concurrent_projection_gpu.build());
             PhysicalMemoryPlanBuilder complete;
             complete.addMutuallyExclusive(alternatives);
             const auto admitted = complete.build();
@@ -615,6 +649,8 @@ namespace llaminar2
         const AutomaticOrchestrationRequest &request, const PlanningKernelSamplePlan &plan,
         const std::function<PlanningLoadedKernelSample(const std::shared_ptr<PhysicalMemoryAuthority> &)> &root_load)
     {
+        const auto collection_begin = std::chrono::steady_clock::now();
+        LOG_DEBUG("[PlanningCalibrationIdentity] family=" << sourceIdentity(plan).dump());
         std::shared_ptr<PhysicalMemoryAuthority> memory;
         std::vector<PlanningServiceObserver> assigned;
         const int rank = mpi ? mpi->rank() : 0;
@@ -672,10 +708,13 @@ namespace llaminar2
             }, [&](auto envelope) {
                 require(std::string(envelope.begin(), envelope.end()) == std::to_string(round), "sampling schedule disagreement");
                 if (node_slot == round)
+                {
                     for (const auto &observer : assigned)
                     {
                         if (observer.discoveryRank() != rank) continue;
                         const auto device = observer.device();
+                        if(device.is_gpu() && (std::holds_alternative<PlanningFP32ArithmeticPlan>(plan) || std::holds_alternative<PlanningProjectionServicePlan>(plan)))continue;
+                        const auto measurement_begin = std::chrono::steady_clock::now();
                         const auto measure = [&] {
                             return std::visit([&](const auto &loaded) -> PlanningKernelObservation {
                                 if constexpr (std::is_same_v<std::decay_t<decltype(loaded)>, PlanningLoadedExpertSample>)
@@ -699,11 +738,101 @@ namespace llaminar2
                         else GPUDeviceContextPool::instance().getContext(device).submitAndWait([&] {
                             completed.emplace_back(measure());
                         });
+                        LOG_INFO("[PlanningCalibrationWall] discovery_rank=" << rank
+                            << " device=" << device.toString() << " family=" << serviceLabel(plan)
+                            << " phase=prepare_measure_retire seconds="
+                            << std::chrono::duration<double>(std::chrono::steady_clock::now()-measurement_begin).count());
                     }
-                return encode(plan, completed);
+                    if(std::holds_alternative<PlanningFP32ArithmeticPlan>(plan) || std::holds_alternative<PlanningProjectionServicePlan>(plan))
+                    {
+                        struct PreparedSlot {
+                            DeviceId device; std::shared_ptr<IWorkerGPUContext> worker;
+                            std::unique_ptr<PlanningPreparedGPUProjection> producer;
+                            std::optional<PlanningPreparedGPUProjectionObservations> observation;
+                        };
+                        std::vector<PreparedSlot> slots;slots.reserve(assigned.size());
+                        for(const auto &observer:assigned)
+                            if(observer.discoveryRank()==rank && observer.device().is_gpu()) {
+                                const auto original=GPUDeviceContextPool::instance().retainExistingContextProvenance(observer.device());
+                                slots.push_back({observer.device(),original.worker(),{}, {}});
+                            }
+                        std::exception_ptr failure;
+                        try {
+                            enum class ColdStage { Payload, Storage, Capture, Completion };
+                            for(int phase=0;phase<2;++phase) {
+                                for(const auto stage:{ColdStage::Payload,ColdStage::Storage,ColdStage::Capture,ColdStage::Completion}) {
+                                    if(phase!=0 && stage==ColdStage::Payload)continue;
+                                    const auto stage_begin=std::chrono::steady_clock::now();
+                                    std::vector<std::future<void>> pending;pending.reserve(slots.size());
+                                    std::exception_ptr preparation_error;
+                                    try {
+                                        for(auto &slot:slots) {
+                                            auto *owner=&slot;
+                                            pending.push_back(slot.worker->submitAsync([owner,memory,stage,&sample,&plan] {
+                                                switch(stage) {
+                                                case ColdStage::Payload:
+                                                    if(const auto *projection=std::get_if<PlanningProjectionServicePlan>(&plan))
+                                                        owner->producer=std::make_unique<PlanningPreparedGPUProjection>(std::get<PlanningLoadedMatrixSample>(sample),
+                                                            owner->device,memory,projection->prefillRows());
+                                                    else owner->producer=std::make_unique<PlanningPreparedGPUProjection>(PlanningFP32ArithmeticPlan{},owner->device,memory);
+                                                    break;
+                                                case ColdStage::Storage:owner->producer->prepareNextPhaseStorage();break;
+                                                case ColdStage::Capture:owner->producer->capturePreparedPhase();break;
+                                                case ColdStage::Completion:owner->producer->completePreparedPhase();break;
+                                                }
+                                            }));
+                                        }
+                                    }catch(...){preparation_error=std::current_exception();}
+                                    joinOriginalNativeWorkerSubmissions(pending,[&](std::exception_ptr error){
+                                        if(!preparation_error)preparation_error=error;
+                                    });
+                                    if(preparation_error)std::rethrow_exception(preparation_error);
+                                    // Cohort fences are CPU future completion edges,
+                                    // not capture-mode changes or suppressed native
+                                    // errors. All uploads finish before recording;
+                                    // all recording ends before allocation/instantiate.
+                                    const char *name=stage==ColdStage::Payload?"payload":stage==ColdStage::Storage?"storage":
+                                        stage==ColdStage::Capture?"capture":"instantiate_warmup";
+                                    LOG_INFO("[PlanningProjectionCohort] discovery_rank=" << rank << " rows=" << (phase==0?1:std::holds_alternative<PlanningFP32ArithmeticPlan>(plan)?PlanningFP32ArithmeticPlan::kPrefillRows:std::get<PlanningProjectionServicePlan>(plan).prefillRows())
+                                        << " stage=" << name << " completed_participants=" << slots.size() << " seconds="
+                                        << std::chrono::duration<double>(std::chrono::steady_clock::now()-stage_begin).count());
+                                }
+                                // Every capture and original warmup has retired
+                                // before any isolated measured interval begins.
+                                for(auto &slot:slots)slot.worker->submitAndWait([&slot]{slot.producer->observePreparedPhase();});
+                            }
+                        }catch(...){failure=std::current_exception();}
+                        // Always visit every original worker after all started
+                        // preparation futures retire, even if one cleanup fails.
+                        const bool complete=!failure;
+                        for(auto &slot:slots) {
+                            try {slot.worker->submitAndWait([&slot,complete]{
+                                std::exception_ptr result_error;
+                                try {if(complete)slot.observation=slot.producer->result();}
+                                catch(...){result_error=std::current_exception();}
+                                slot.producer.reset();
+                                if(result_error)std::rethrow_exception(result_error);
+                            });}catch(...){if(!failure)failure=std::current_exception();}
+                        }
+                        for(const auto &slot:slots)if(slot.producer)std::terminate();
+                        if(failure)std::rethrow_exception(failure);
+                        for(auto &slot:slots)std::visit([&](auto &observation){completed.emplace_back(std::move(observation));},*slot.observation);
+                    }
+                }
+                auto encoded = encode(plan, completed);
+                // Publication already needs this exact receipt. Emit it once after
+                // all local samples retire, never inside an isolated timed interval.
+                if (round + 1 == rounds)
+                    LOG_DEBUG("[PlanningCalibrationObservation] discovery_rank=" << rank
+                        << " family=" << serviceLabel(plan) << " receipt="
+                        << std::string(encoded.begin(), encoded.end()));
+                return encoded;
             }, [&](auto receipts) {
                 if (round + 1 == rounds) result = accept(inventory, request, plan, receipts);
             });
+        LOG_INFO("[PlanningCalibrationWall] discovery_rank=" << rank
+            << " family=" << serviceLabel(plan) << " phase=collect_total seconds="
+            << std::chrono::duration<double>(std::chrono::steady_clock::now()-collection_begin).count());
         return result;
     }
 }

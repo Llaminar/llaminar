@@ -53,6 +53,9 @@ struct Geometry
 {
     int degree = 0;
     GDNLinkedLiveStateGeometry state;
+
+    /** @return Whether every immutable handoff workspace input is identical. */
+    bool operator==(const Geometry &) const = default;
 };
 
 /**

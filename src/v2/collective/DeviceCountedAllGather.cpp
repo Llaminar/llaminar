@@ -109,6 +109,7 @@ std::shared_ptr<DeviceCountedAllGather> DeviceCountedAllGather::create(
     }
     auto fabric = std::shared_ptr<DeviceCountedAllGather>(new DeviceCountedAllGather);
     fabric->capacity_ = capacity;
+    fabric->streams_.assign(streams.begin(),streams.end());
     fabric->devices_.assign(devices.begin(), devices.end());
     fabric->original_=borrow;
     fabric->extents_.resize(devices.size());
@@ -132,6 +133,19 @@ std::shared_ptr<DeviceCountedAllGather> DeviceCountedAllGather::create(
         });
     }
     return fabric;
+}
+
+void DeviceCountedAllGather::initializeLocalExtent(std::size_t participant,std::uint64_t bytes,void *stream)
+{
+    if(isGraphCaptureActive() || participant>=devices_.size() || bytes>capacity_ || stream!=streams_.at(participant))
+        throw std::invalid_argument("Counted extent setup requires its original producer, stream and admitted bound");
+    auto &worker=GPUDeviceContextPool::instance().getContext(devices_[participant]);
+    if(!worker.ownsCurrentThread() || worker.isDeviceGraphCaptureActive())
+        throw std::invalid_argument("Counted extent setup requires its original uncaptured worker");
+    const auto original_use=original_.acquire();
+    const auto offset=NativeCountedAllGatherLayout(devices_.size()).extents()+participant*sizeof(std::uint64_t);
+    TransferEngine::instance().initializeDeviceMetadata(*extents_[participant].storage,offset,
+        std::as_bytes(std::span<const std::uint64_t>(&bytes,1)),stream);
 }
 
 DeviceCountedAllGatherTransport DeviceCountedAllGather::payloadStorage(

@@ -21,6 +21,7 @@
 namespace llaminar2
 {
     class ModelLoader;
+    class PlanningAdmissionPreparation;
     class PlanningModelMetadata;
     class NativeContextPreparation;
     class IMPIContext;
@@ -40,6 +41,11 @@ namespace llaminar2
         std::shared_ptr<NativeContextPreparation> native_context_preparation;
         /** Same original parent used for all-rank fixed contribution/candidate/final admission metadata. */
         std::shared_ptr<IMPIContext> original_parent;
+        /** Original immutable birth declarations projected before stage quotas. */
+        std::vector<PlanningNativeContextDeclaration> native_context_budgets;
+        bool require_native_context_budgets=false;
+        /** @brief Per-search original source declarations only; never shares physical admission or quotas. */
+        PlanningAdmissionPreparation *source_preparation=nullptr;
     };
 
     /**

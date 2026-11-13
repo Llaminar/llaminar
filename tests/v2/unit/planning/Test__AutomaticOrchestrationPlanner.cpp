@@ -8,9 +8,12 @@
  */
 #include "../../utils/PlanningHostServiceFixture.h"
 #include "planning/AutomaticOrchestrationPlanner.h"
+#include "planning/PlanningAdmissionPreparation.h"
+#include "planning/PlanningMemoryQuoteReuse.h"
 #include "planning/ObservedPeerGrouping.h"
 #include "planning/AutomaticOrchestrationCandidates.h"
 #include "planning/AutomaticPlanningStartup.h"
+#include "backends/PreparedGPUWorkerThread.h"
 #include "planning/PhysicalMemoryCapacityExhausted.h"
 #include "config/OrchestrationConfigDocument.h"
 #include "../../utils/PlanningGGUFFixture.h"
@@ -20,6 +23,8 @@
 #include <cmath>
 #include <limits>
 #include <set>
+#include <omp.h>
+#include <thread>
 
 using namespace llaminar2;
 
@@ -73,6 +78,19 @@ namespace
     {
         return {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
             .maximum_cached_prefill_buckets = 8, .retained_host_services = test::planningHostServiceBudgets(2)};
+    }
+
+    /** @return Explicit recorded declarations for synthetic hardware; never query native providers. */
+    PlanningNativeContextBudgets nativeBudgets(const ClusterInventory& observed)
+    {
+        PlanningNativeContextBudgets result;
+        const auto program=GPUWorkerStackProgram::originalDefaults();
+        for(const auto& rank:observed.ranks){
+            auto& declarations=result[rank.rank];
+            for(const auto& gpu:rank.gpus)declarations.push_back({{gpu.type,gpu.local_device_id},gpu.uuid,
+                program.stackBytes(),program.guardBytes(),program.pageBytes(),64,64});
+        }
+        return result;
     }
 
     /** @return Identity of the deliberately smaller, later-observed choice. */
@@ -175,7 +193,8 @@ TEST(AutomaticOrchestrationPlanner, StartupSearchSharesPolicyAndPreservesDiscove
             EXPECT_EQ(context.workload(), OrchestrationPlanningWorkload(64, 64));
             EXPECT_EQ(context.request().mpi_procs, observed.world_size);
             return evaluate;
-        });
+        },collectPlanningHostServiceBudgets,
+        [](const AutomaticPlanningPreparation& context){return nativeBudgets(context.inventory());});
     ASSERT_TRUE(startup.root_selection);
     const auto &winner = *startup.root_selection;
     EXPECT_EQ(preparations, 1u);
@@ -238,12 +257,14 @@ TEST(AutomaticOrchestrationPlanner, RequestHorizonCanMakeTensorParallelFasterTha
             const bool tp = candidate.strategy() == OrchestrationStrategy::TensorParallel;
             return OrchestrationCostEstimate(work, tp ? 1.0 : 0.8, tp ? 0.02 : 0.03, "synthetic phase costs");
         };
+        auto startup_memory=OrchestrationCandidateMemoryPolicy::fromStartup();
+        startup_memory.native_context_budgets=nativeBudgets(inventory(backend));
         config.automatic_planning.workload = OrchestrationPlanningWorkload(64, 1);
         const auto short_request = AutomaticOrchestrationPlanner::select(config, source, inventory(backend),
-            OrchestrationCandidateMemoryPolicy::fromStartup(), *config.automatic_planning.workload, cost);
+            startup_memory, *config.automatic_planning.workload, cost);
         config.automatic_planning.workload = OrchestrationPlanningWorkload(64, 128);
         const auto long_request = AutomaticOrchestrationPlanner::select(config, source, inventory(backend),
-            OrchestrationCandidateMemoryPolicy::fromStartup(), *config.automatic_planning.workload, cost);
+            startup_memory, *config.automatic_planning.workload, cost);
         EXPECT_EQ(short_request.cost().workload(), OrchestrationPlanningWorkload(64, 1));
         EXPECT_EQ(long_request.cost().workload(), *config.automatic_planning.workload);
         EXPECT_FALSE(long_request.candidate().config().automatic_planning.specified());
@@ -946,4 +967,133 @@ TEST(ObservedPeerGrouping, StageEligibilityKeepsTypedInfeasibilityAndExactLargeC
     const auto large_selected=exact.select(large_request);
     ASSERT_TRUE(large_selected);ASSERT_EQ(large_selected->size(),1u);EXPECT_EQ(large_selected->front().size(),65u);
     EXPECT_EQ(exact.select(eligible,std::array<std::size_t,1>{65}),*large_selected);
+}
+
+/** @test Pure source/quote reuse preserves the exhaustive oracle and cannot authorize a changed capacity. */
+TEST(AutomaticOrchestrationPlanner, PreparedAdmissionMatchesExhaustiveOracleAndFreshCapacity)
+{
+    test::PlanningGGUFFixture file(true,false);PlanningModelSource source(file.path());
+    const OrchestrationPlanningWorkload workload(32,16);
+    for(const size_t device_count:{4u,8u})
+    {
+        auto observed=inventory(DeviceType::ROCm);
+        auto &rank=observed.ranks.front();rank.gpus.clear();
+        for(size_t index=0;index<device_count;++index)
+            rank.gpus.push_back({.type=DeviceType::ROCm,.local_device_id=static_cast<int>(index*3+2),
+                .memory_bytes=128ull<<30,.free_memory_bytes=120ull<<30,.compute_units=64,
+                .uuid="recorded-peer-"+std::to_string(index),.numa_node=rank.cpu.numa_node});
+        rank.p2p_rocm_count=static_cast<int>(device_count);rank.p2p_rocm.assign(device_count*device_count,true);
+        observed.buildNodeAggregations();
+        auto config=request(source,DeviceType::ROCm);
+        config.automatic_planning.only_strategies=std::vector{OrchestrationStrategy::PipelineParallel};
+        config.automatic_planning.device_counts=std::vector{AutomaticBackendDeviceCount{DeviceType::ROCm,4}};
+        config.automatic_planning.pipeline_stage_widths=std::vector{2,2};
+        config.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+        config.routed_expert_compute_policy=RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+        auto policy=memory();
+        const auto evaluate=[&](const AdmittedOrchestrationCandidate &candidate,const OrchestrationPlanningWorkload &work) {
+            std::uint64_t score=1;
+            for(const auto &device:candidate.devicePlans())
+            {
+                const auto found=std::find_if(rank.gpus.begin(),rank.gpus.end(),[&](const auto &gpu){return gpu.local_device_id==device.device.ordinal;});
+                if(found==rank.gpus.end())throw std::logic_error("Oracle lost recorded original endpoint");
+                score+=std::uint64_t{1}<<(static_cast<size_t>(found-rank.gpus.begin())+device_count*device.first_layer);
+            }
+            return OrchestrationCostEstimate(work,double(score)*1e-6,double(score)*1e-9,"synthetic exhaustive decision oracle, not measured speed");
+        };
+        double oracle_cost=std::numeric_limits<double>::infinity();std::string oracle_config;size_t count=0;
+        visitAutomaticOrchestrationCandidates(config,source.metadata(),observed,[&](auto proposal) {
+            auto admitted=AdmittedOrchestrationCandidate::admit(std::move(proposal),source,policy);
+            ASSERT_EQ(admitted.config().pp_stage_definitions.size(),2u);
+            EXPECT_EQ(admitted.config().pp_stage_definitions[0].first_layer,0);
+            EXPECT_EQ(admitted.config().pp_stage_definitions[0].last_layer,0);
+            EXPECT_EQ(admitted.config().pp_stage_definitions[1].first_layer,1);
+            EXPECT_EQ(admitted.config().pp_stage_definitions[1].last_layer,1);
+            const auto cost=evaluate(admitted,workload);++count;
+            if(cost.requestSeconds()<oracle_cost){oracle_cost=cost.requestSeconds();oracle_config=serializeOrchestrationConfig(admitted.config());}
+        });
+        const auto selected=AutomaticOrchestrationPlanner::select(config,source,observed,policy,workload,evaluate);
+        EXPECT_DOUBLE_EQ(selected.cost().requestSeconds(),oracle_cost);
+        EXPECT_EQ(serializeOrchestrationConfig(selected.candidate().config()),oracle_config);
+        EXPECT_EQ(selected.counts().proposed,count);
+        EXPECT_EQ(count,device_count==4?6u:420u); // Physical rosters remain exhaustive; layer counts are fixed.
+        // All four endpoints are mandatory in this smaller search. Reusing
+        // source/shape quotes cannot reuse an earlier physical certificate.
+        if(device_count==4)
+        {
+            rank.gpus.front().free_memory_bytes=1;observed.buildNodeAggregations();
+            EXPECT_THROW(AutomaticOrchestrationPlanner::select(config,source,observed,policy,workload,evaluate),PhysicalMemoryCapacityExhausted);
+        }
+    }
+}
+
+/** @test Bounded parallel admission preserves serial winners, failure order and original callback ownership. */
+TEST(AutomaticOrchestrationPlanner, ParallelAdmissionPreservesSerialSelectionAndCallbackOrder)
+{
+    struct RestoreOMP {
+        int threads=omp_get_max_threads(),dynamic=omp_get_dynamic();
+        ~RestoreOMP(){omp_set_num_threads(threads);omp_set_dynamic(dynamic);}
+    } restore;
+    test::PlanningGGUFFixture file;PlanningModelSource source(file.path());
+    auto observed=inventory(DeviceType::ROCm);auto &rank=observed.ranks.front();
+    const auto original=rank.gpus.front();rank.gpus.clear();
+    for(int index=0;index<7;++index) {
+        auto gpu=original;gpu.local_device_id=2+3*index;gpu.uuid="parallel-original-"+std::to_string(index);
+        if(index%3==1)gpu.free_memory_bytes=1;
+        rank.gpus.push_back(std::move(gpu));
+    }
+    rank.p2p_rocm_count=7;rank.p2p_rocm.assign(49,true);observed.buildNodeAggregations();
+    const auto config=request(source,DeviceType::ROCm);const auto caller=std::this_thread::get_id();
+    struct Result {std::string winner;std::vector<std::string> callbacks;OrchestrationSelectionCounts counts;};
+    const auto run=[&](int budget,bool dynamic) {
+        omp_set_num_threads(budget);omp_set_dynamic(dynamic);
+        Result result;
+        const auto selected=AutomaticOrchestrationPlanner::select(config,source,observed,memory(),{64,128},
+            [&](const auto &candidate,const auto &work) {
+                EXPECT_EQ(std::this_thread::get_id(),caller);EXPECT_EQ(omp_get_thread_num(),0);
+                EXPECT_GE(omp_get_num_threads(),1);EXPECT_LE(omp_get_num_threads(),budget);
+                const int ordinal=candidate.devicePlans().front().device.ordinal;
+                result.callbacks.push_back("evaluate:"+std::to_string(ordinal));
+                return OrchestrationCostEstimate(work,1+ordinal*.001,.01,"serial callback decision oracle");
+            },[&](auto strategy,std::string_view why) {
+                EXPECT_EQ(std::this_thread::get_id(),caller);EXPECT_EQ(omp_get_thread_num(),0);
+                result.callbacks.push_back("reject:"+std::to_string(int(strategy))+":"+std::string(why));
+            });
+        result.winner=serializeOrchestrationConfig(selected.candidate().config());result.counts=selected.counts();return result;
+    };
+    const auto serial=run(1,false);const auto parallel=run(3,false);const auto dynamic=run(3,true);
+    ASSERT_EQ(serial.counts.proposed,7u);EXPECT_GT(serial.counts.capacity_rejected,0u);EXPECT_GT(serial.counts.evaluated,0u);
+    for(const auto *result:{&parallel,&dynamic}) {
+        EXPECT_EQ(result->winner,serial.winner);EXPECT_EQ(result->callbacks,serial.callbacks);
+        EXPECT_EQ(result->counts.proposed,serial.counts.proposed);
+        EXPECT_EQ(result->counts.capacity_rejected,serial.counts.capacity_rejected);
+        EXPECT_EQ(result->counts.evaluated,serial.counts.evaluated);
+    }
+}
+
+/** @test Task/callback exceptions retire worker-local quote owners before the next independent search. */
+TEST(AutomaticOrchestrationPlanner, ParallelAdmissionRetiresAfterCapacityAndCallbackFailures)
+{
+    struct RestoreOMP {
+        int threads=omp_get_max_threads(),dynamic=omp_get_dynamic();
+        ~RestoreOMP(){omp_set_num_threads(threads);omp_set_dynamic(dynamic);}
+    } restore;
+    omp_set_dynamic(false);omp_set_num_threads(3);
+    test::PlanningGGUFFixture file;PlanningModelSource source(file.path());const auto config=request(source,DeviceType::ROCm);
+    const auto observed=inventory(DeviceType::ROCm);
+    auto zero=memory();
+    auto no_capacity=config;no_capacity.max_gpu_memory_mb=0;
+    size_t evaluated=0,rejected=0;
+    EXPECT_THROW(AutomaticOrchestrationPlanner::select(no_capacity,source,observed,zero,{64,128},
+        [&](const auto&,const auto &work){++evaluated;return OrchestrationCostEstimate(work,1,.01,"must not evaluate rejected capacity");},
+        [&](auto,std::string_view){++rejected;}),PhysicalMemoryCapacityExhausted);
+    EXPECT_EQ(evaluated,0u);EXPECT_EQ(rejected,2u);
+    EXPECT_THROW(AutomaticOrchestrationPlanner::select(config,source,observed,memory(),{64,128},
+        [&](const auto&,const auto&)->OrchestrationCostEstimate {throw std::runtime_error("original evaluator failure");}),std::runtime_error);
+    EXPECT_THROW(AutomaticOrchestrationPlanner::select(no_capacity,source,observed,memory(),{64,128},
+        [](const auto&,const auto &work){return OrchestrationCostEstimate(work,1,.01,"capacity callback fixture");},
+        [](auto,std::string_view){throw std::runtime_error("original rejection callback failure");}),std::runtime_error);
+    const auto recovered=AutomaticOrchestrationPlanner::select(config,source,observed,memory(),{64,128},
+        [](const auto&,const auto &work){return OrchestrationCostEstimate(work,1,.01,"fresh original worker scopes");});
+    EXPECT_EQ(recovered.counts().evaluated,2u);
 }

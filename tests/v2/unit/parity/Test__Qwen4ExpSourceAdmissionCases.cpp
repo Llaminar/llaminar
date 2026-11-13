@@ -9,6 +9,8 @@
  * cannot be relabelled as a positive admission by these declaration tests.
  * Native proof expectations and public runtime projections must agree on an
  * explicitly smaller dynamic MTP ceiling, independent of retained capacity.
+ * All-GPU local-NUMA declarations keep socket identity independent of rank0
+ * and cannot acquire a CPU expert tier through RAM immutable-row storage.
  */
 #include "integration/parity/qwen4exp/Qwen4ExpSourceAdmissionCases.h"
 #include "integration/parity/qwen4exp/Qwen4ExpPooledCurrentDemandCases.h"
@@ -3146,4 +3148,107 @@ TEST(Qwen4ExpSourceAdmissionCases, FixedPipelineConsumerCoordinatesPreserveOrigi
     }
 }
 
+}
+
+namespace llaminar2::test::parity::qwen4exp
+{
+/** @test Ordered TP groups support non-power-of-two widths and physical NUMA distinct from MPI rank0. */
+TEST(Qwen4ExpSourceAdmissionCases, LocalNUMAAllGPUContinuationHasOneCompleteGPUSourceAuthority)
+{
+    for(const int width:{2,3,4,7})for(const int numa:{0,1,3}) {
+        SCOPED_TRACE(::testing::Message()<<"width="<<width<<" NUMA="<<numa);
+        std::vector<GlobalDeviceAddress> members;
+        for(int index=0;index<width;++index)members.push_back(GlobalDeviceAddress::rocm(width-index,numa));
+        const auto topology=qwen4ExpLocalNUMAAllGPUContinuationTopology(members);
+        EXPECT_EQ(topology.mpi_ranks,1);EXPECT_FALSE(topology.execution_rank_selection);
+        EXPECT_EQ(topology.executionRankCount(),1);
+        const auto& plan=*topology.expert_overlay_plan;
+        ASSERT_EQ(plan.domains.size(),1u);ASSERT_EQ(plan.routed_tiers.size(),1u);
+        ASSERT_EQ(plan.dense_domains.size(),1u);
+        EXPECT_EQ(plan.domains.front().participants,members);
+        EXPECT_EQ(plan.dense_domains.front().participants,members);
+        EXPECT_EQ(plan.domains.front().owner_rank,0);
+        EXPECT_EQ(plan.dense_domains.front().owner_rank,0);
+        EXPECT_EQ(plan.domains.front().routed_compute_policy,RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+        EXPECT_EQ(plan.continuation_domain_spec.effectiveDensePolicy(),DenseParallelPolicy::TensorParallel);
+        EXPECT_TRUE(plan.routed_tiers.front().fallback);
+        EXPECT_EQ(plan.routed_tiers.front().max_experts_per_layer,0);
+        EXPECT_EQ(plan.routed_tiers.front().domain,plan.domains.front().name);
+        for(int index=0;index<width;++index) {
+            EXPECT_EQ(topology.participants[index].world_rank,0);
+            EXPECT_EQ(topology.participants[index].address,members[index]);
+        }
+    }
+    const std::vector valid{GlobalDeviceAddress::rocm(1,1),GlobalDeviceAddress::rocm(2,1)};
+    for(int defect=0;defect<7;++defect) {
+        auto members=valid;
+        switch(defect) {
+        case 0:members.clear();break;
+        case 1:members.pop_back();break;
+        case 2:members.back()=members.front();break;
+        case 3:members.back()=GlobalDeviceAddress::cuda(2,1);break;
+        case 4:members.back()=GlobalDeviceAddress::rocm(2,0);break;
+        case 5:members.back()=GlobalDeviceAddress::rocm(2);break;
+        case 6:members.back()=GlobalDeviceAddress::rocm(2,1,"foreign-host");break;
+        }
+        EXPECT_THROW(qwen4ExpLocalNUMAAllGPUContinuationTopology(members),std::invalid_argument)<<defect;
+    }
+    EXPECT_EQ(qwen4ExpFullROCmTP4ProductionCases().size(),1u);
+    EXPECT_EQ(qwen4ExpFullROCmTP4ProductionCases().front().topology.test_id,"ROCm0123_TP4_AllGPUExperts");
+}
+
+/** @test All512 experts remain GPU-only through public serving projection and full15 dynamic MTP. */
+TEST(Qwen4ExpSourceAdmissionCases, LocalNUMATP4AllGPUFull15AndRAMCacheServingProjection)
+{
+    const auto definition=qwen4ExpLocalNUMATP4AllGPUDefinition();
+    // Validate actual discovery before the family's static-placement selection;
+    // inactive movement declarations still require a complete full15 envelope.
+    EXPECT_NO_THROW((void)expandModelParityDefinition(definition));
+    for(const bool speedup:{false,true}) {
+        auto incomplete=definition;
+        auto& movement=speedup?incomplete.dynamic_rebalance.economic_movement_and_observed_speedup:
+            incomplete.dynamic_rebalance.economic_movement;
+        EXPECT_EQ(movement.device_min_maintenance_period_tokens,16);
+        EXPECT_EQ(movement.device_initial_maintenance_period_tokens,16);
+        movement.device_min_maintenance_period_tokens=15;
+        EXPECT_THROW((void)expandModelParityDefinition(incomplete),std::invalid_argument);
+    }
+    const auto& cases=qwen4ExpLocalNUMATP4AllGPUCases();ASSERT_EQ(cases.size(),4u);
+    std::set<ModelParityMTP> policies;
+    for(const auto& cell:cases) {
+        SCOPED_TRACE(cell.testName());EXPECT_TRUE(policies.insert(cell.mtp).second);
+        ASSERT_TRUE(cell.expert_overlay);EXPECT_EQ(*cell.expert_overlay,ModelParityExpertOverlayPolicy{});
+        EXPECT_FALSE(cell.requiresPhysicalExpertMovement());
+        EXPECT_EQ(cell.inventory_role,ModelParityInventoryRole::NumericalDiagnostic);
+        EXPECT_EQ(cell.model.maximum_mtp_draft_depth,15);
+        const auto native=cell.makeOrchestrationConfig(cell.model.model_path,0);
+        const auto parsed=sourcePublicConfig(cell);
+        for(const auto* config:{&native,&parsed}) {
+            EXPECT_EQ(config->mpi_procs,1);EXPECT_FALSE(config->execution_rank_selection);
+            ASSERT_TRUE(config->moe_routed_expert_plan);
+            const auto& plan=*config->moe_routed_expert_plan;
+            ASSERT_EQ(plan.domains.size(),1u);ASSERT_EQ(plan.routed_tiers.size(),1u);
+            ASSERT_EQ(plan.domains.front().participants.size(),4u);
+            EXPECT_EQ(plan.domains.front().owner_rank,0);
+            for(const auto& member:plan.domains.front().participants) {
+                EXPECT_TRUE(member.isROCm());EXPECT_EQ(member.numa_node,1);
+                EXPECT_GE(member.device_ordinal,1);EXPECT_LE(member.device_ordinal,4);
+            }
+            EXPECT_EQ(plan.domains.front().routed_compute_policy,RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+            EXPECT_EQ(plan.routed_tiers.front().max_experts_per_layer,0);EXPECT_TRUE(plan.routed_tiers.front().fallback);
+            EXPECT_EQ(config->ngram_table_policy,*cell.ngram_table_policy);
+            EXPECT_EQ(config->ngram_table_policy.gpu_adaptive.source_backing,AdaptiveImmutableRowBacking::RAM);
+            EXPECT_EQ(config->ngram_table_policy.gpu_adaptive.gpu_cache_physical_byte_limit,std::size_t{256}<<20);
+            EXPECT_EQ(config->mtp.graph_capacity_draft_tokens,cell.mtp==ModelParityMTP::Off?0:15);
+            if(cell.mtp==ModelParityMTP::DynamicDepth) {
+                EXPECT_TRUE(config->mtp.enabled);EXPECT_EQ(config->mtp.depth_policy.mode,MTPDepthPolicyMode::Dynamic);
+                EXPECT_EQ(config->mtp.depth_policy.max_depth,15);
+            }
+        }
+        EXPECT_TRUE(ConfigValidator::createStandard().validateToStrings(parsed).empty());
+    }
+    EXPECT_EQ(policies,(std::set<ModelParityMTP>{ModelParityMTP::Off,ModelParityMTP::Depth1,ModelParityMTP::Depth3,ModelParityMTP::DynamicDepth}));
+    const auto exact=qwen4ExpLocalNUMATP4AllGPUExactCases();ASSERT_EQ(exact.size(),3u);
+    for(const auto& cell:exact)EXPECT_NE(cell.mtp,ModelParityMTP::Off);
+}
 }

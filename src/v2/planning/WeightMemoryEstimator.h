@@ -10,6 +10,8 @@
 #include "memory/CPUStorageRoot.h"
 #include "backends/DeviceId.h"
 #include "config/TensorParallelConfig.h"
+#include "config/GDNProjectionArithmeticPolicy.h"
+#include "config/MoERouterArithmeticPolicy.h"
 #include <cstddef>
 #include <memory>
 #include <optional>
@@ -24,6 +26,16 @@ namespace llaminar2
     class PreparedWeightPhysicalUses;
     enum class PreparedWeightUseIntent;
     class MoEExpertProjectionOwnership;
+    class PlanningTensorIndex;
+    /** @brief Complete source/arithmetic inputs consumed by canonical weight quoting. */
+    struct PlanningWeightSourcePolicy {
+        std::shared_ptr<const PlanningTensorIndex> source_tensor_index;
+        GDNProjectionArithmetic gdn_projection_arithmetic;
+        MoERouterArithmetic moe_router_arithmetic;
+        /** @return Current original arithmetic selectors, captured once per quote boundary. */
+        static PlanningWeightSourcePolicy current();
+        bool operator==(const PlanningWeightSourcePolicy &) const = default;
+    };
 
     /**
      * @brief Global weight uses retained beside a participant's layer interval.
@@ -229,7 +241,8 @@ namespace llaminar2
             const std::optional<DeviceShardingAssignment>
                 &tensor_parallel_assignment = std::nullopt,
             WeightComponentScope components = WeightComponentScope::EmbeddingAndTerminal,
-            CPUStoragePlacement native_source_placement = CPUStoragePlacement::local()
+            CPUStoragePlacement native_source_placement = CPUStoragePlacement::local(),
+            PlanningWeightSourcePolicy source_policy = PlanningWeightSourcePolicy::current()
         );
 
         /**
@@ -246,13 +259,15 @@ namespace llaminar2
          * @param tensor_parallel_assignment Actual local TP assignment when present.
          * @param components Exact global component uses.
          * @param native_source_placement Same original CPU placement used by the actual final root allocator.
+         * @param source_policy Original immutable source index and both explicit arithmetic selectors.
          * @return Canonical byte inventory of required creators; aliases add no physical bytes.
          */
         static WeightEstimate estimatePhysical(PreparedWeightPhysicalUses &uses, PreparedWeightUseIntent intent,
             const ModelMemoryProfile &profile, DeviceId device, int shard_index, int total_shards,
             int first_layer, int last_layer, const DeviceWeightResidency &residency,
             const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment,
-            WeightComponentScope components, CPUStoragePlacement native_source_placement = CPUStoragePlacement::local());
+            WeightComponentScope components, CPUStoragePlacement native_source_placement = CPUStoragePlacement::local(),
+            PlanningWeightSourcePolicy source_policy = PlanningWeightSourcePolicy::current());
 
         /// Bytes per weight element for native (GGUF on-disk) format.
         static float getNativeBytesPerWeight(const std::string &quant_type);
@@ -273,7 +288,7 @@ namespace llaminar2
             const DeviceWeightResidency &residency,
             const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment,
             WeightComponentScope components, PreparedWeightPhysicalUses *uses, PreparedWeightUseIntent intent,
-            CPUStoragePlacement native_source_placement);
+            CPUStoragePlacement native_source_placement,const PlanningWeightSourcePolicy &source_policy);
 
     };
 

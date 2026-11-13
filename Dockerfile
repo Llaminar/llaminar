@@ -137,6 +137,7 @@ COPY scripts/docker/patches/rocm-hip-graph-empty-segment-publication.patch \
      scripts/docker/patches/rocm-hip-graph-kernarg-metadata.patch \
      scripts/docker/patches/rocm-hip-preferred-queue-unshared.patch \
      scripts/docker/patches/rocm-hip-timed-sdma-marker.patch \
+     scripts/docker/patches/rocm-hip-capture-retirement-membership.patch \
      /tmp/install-scripts/patches/
 COPY scripts/docker/patches/rocm-rocr-helper-numa.patch /tmp/install-scripts/patches/rocm-rocr-helper-numa.patch
 COPY scripts/docker/rocr-helper-numa/ /tmp/install-scripts/rocr-helper-numa/
@@ -146,6 +147,9 @@ COPY scripts/docker/rocr-deferred-sdma/ /tmp/install-scripts/rocr-deferred-sdma/
 COPY scripts/docker/hip-preferred-queue/proof.py \
      scripts/docker/hip-preferred-queue/selector-contract.cpp.in \
      /tmp/install-scripts/hip-preferred-queue/
+COPY scripts/docker/hip-end-capture/proof.py \
+     scripts/docker/hip-end-capture/end-capture-contract.cpp.in \
+     /tmp/install-scripts/hip-end-capture/
 RUN NINJA_VERSION=${NINJA_VERSION} MODE=build \
     /tmp/install-scripts/install-system-deps.sh
 RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \

@@ -205,6 +205,15 @@ namespace llaminar2
             const DeviceCountedAllGatherTopology &topology,
             std::span<void *const> streams, std::size_t packet_capacity);
 
+        /** @brief Seed this producer's exact live extent during cold setup between retired graph families.
+         * @param participant Original local producer coordinate, never a GPU ordinal.
+         * @param bytes Live payload extent, including zero, bounded by the admitted packet capacity.
+         * @param stream Original exact setup stream retained at creation.
+         * @throws std::exception For foreign ownership, capture, bounds or failed upload completion.
+         * This initializes device input; replay still uses native DevicePrefix and completion validation.
+         */
+        void initializeLocalExtent(std::size_t participant,std::uint64_t bytes,void *stream);
+
         /** @brief Bind existing participant-local arena banks to one semantic message.
          * @param participant Exact communicator coordinate, not physical ordinal.
          * @param message Frozen semantic identity and maximum payload for this graph.
@@ -264,6 +273,7 @@ namespace llaminar2
             PhysicalMemoryAllocationLease claim;
             std::shared_ptr<DeviceTransferBuffer> storage;
         };
+        std::vector<void*> streams_; ///< Original setup streams; cold extent publication cannot substitute another stream.
         std::size_t capacity_ = 0;
         std::vector<DeviceId> devices_;
         std::vector<Extents> extents_;

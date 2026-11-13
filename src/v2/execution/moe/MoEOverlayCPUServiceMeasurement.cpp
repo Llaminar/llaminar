@@ -1,6 +1,6 @@
 /**
  * @file MoEOverlayCPUServiceMeasurement.cpp
- * @brief Measures prepared CPU/GPU expert FFNs without changing serving state.
+ * @brief Measures prepared CPU/GPU movable expert work without changing serving state.
  *
  * Preparation owns bounded inputs and the production backend workspace.
  * Every physical payload is claimed before construction and released after
@@ -8,7 +8,9 @@
  * serially. Only the measured service rows survive setup; no graph, weight
  * copy, inference counter, or alternate placement lifecycle is retained.
  * Original producer errors are diagnosed before fatal native abort wakes peers;
- * failure cleanup never substitutes a different domain or source.
+ * failure cleanup never substitutes a different domain or source. GateUp
+ * endpoints measure only movable projections; fixed columns remain invariant
+ * and their original bank is borrowed solely for exact arithmetic-policy metadata.
  */
 #include "MoEOverlayCPUServiceMeasurement.h"
 #include "planning/PlanningGPUExpertMeasurement.h"
@@ -18,6 +20,8 @@
 #include "backends/RetainedParticipantGraphExecutable.h"
 
 #include "MoEOverlayPreparedWeightSource.h"
+#include "MoEOverlayFixedDownProjectionBank.h"
+#include "MoEExpertOverlayPreparationPlan.h"
 #include "CPUExpertShardSourceSelection.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
@@ -42,6 +46,29 @@ namespace llaminar2
     namespace
     {
         using llaminar::v2::kernels::KernelFactory;
+        /**
+         * @brief Borrow original fixed-column policy descriptors for a movable service.
+         * @param registry Original source-bound participant registry.
+         * @param source Actual live source lease, retained by the caller through replay.
+         * @param participant Original endpoint ID, not a device ordinal alias.
+         * @param layer Original model layer.
+         * @return Fixed bank only for GateUp endpoints; complete experts need no extra metadata.
+         */
+        std::shared_ptr<const MoEOverlayFixedDownProjectionBank> fixedDownServiceMetadata(
+            const MoEOverlayParticipantResidencyRegistry& registry,
+            const MoEOverlayParticipantResidencyRegistry::PreparedSourceUse& source,
+            int participant, int layer)
+        {
+            const auto endpoint = registry.endpoint(participant);
+            if (!endpoint) throw std::invalid_argument("Prepared service endpoint is missing");
+            if (endpoint->movableProjections() == DeviceMoEProjectionSet::CompleteExpert) return {};
+            const auto* physical = registry.initialOwnerMap().participantForId(participant);
+            if (!physical || !source.preparation())
+                throw std::invalid_argument("Gate/up service lost original projection preparation");
+            const auto ownership = source.preparation()->requireProjectionOwnershipForParticipant(*physical, layer);
+            return MoEOverlayFixedDownProjectionBank::resolve(source.registry(), *physical, layer, ownership);
+        }
+
         // Small real-kernel observations, not full-model synthetic inference.
         constexpr int kPrefillRows = MoEOverlayCPUServiceMeasurement::kMaximumRows;
         constexpr int kVerifierRows = 4;
@@ -557,7 +584,8 @@ namespace llaminar2
         const MoEOverlayPreparedTargetServicePlan& plan,Geometry geometry,
         const std::shared_ptr<IGlobalTPContext>& domain,
         const std::shared_ptr<PhysicalMemoryAuthority>& memory,
-        const ModelMemoryProfile* profile,const RankInventory* inventory)
+        const ModelMemoryProfile* profile,const RankInventory* inventory,
+        const ILocalTPContext* owner_domain,int owner_top_k)
     {
         auto* native=domain?dynamic_cast<GlobalTPContext*>(domain.get()):nullptr;
         if(domain && (!native || !native->authenticatesOriginalCPUExpertBorrow(domain)))
@@ -605,6 +633,9 @@ namespace llaminar2
                 const auto bank=endpoint?endpoint->acquire(registry.initialEpoch()):MoEOverlayParticipantBankLease{};
                 if(!bank)throw std::invalid_argument("Prepared whole target initial bank is missing");
                 const auto& payload=bank->layerForModelLayer(entry.coordinate.layer).experts.at(expert);
+                if (!payload.readyFor(endpoint->movableProjections()) ||
+                    payload.projections() != endpoint->movableProjections())
+                    throw std::invalid_argument("Prepared target source differs from its immutable movable service family");
                 const auto device=bank->device;
                 if(device.is_cpu())duration=measurePrepared(payload,device,entry.coordinate.layer,source_phase,geometry,memory);
                 else {
@@ -623,7 +654,10 @@ namespace llaminar2
                     auto& calibration=gpu_calibrations[device];
                     if(!calibration)calibration=PlanningGPUExpertMeasurement::beginPreparedCalibration(device,memory);
                     duration=PlanningGPUExpertMeasurement::measurePrepared(payload,device,entry.coordinate.layer,source_phase,
-                        geometry.d_model,geometry.intermediate,memory,invocation,calibration);
+                        geometry.d_model,geometry.intermediate,memory,invocation,calibration,
+                        fixedDownServiceMetadata(registry,*source,participant,entry.coordinate.layer),
+                        payload.complete() ? -1 : expert,
+                        {.domain=owner_domain,.top_k=owner_top_k,.resident_sources=bank->layerForModelLayer(entry.coordinate.layer).experts});
                 }
             }
             auto [found,inserted]=samples.try_emplace(entry.coordinate);
@@ -658,7 +692,8 @@ namespace llaminar2
         const MoEOverlayEconomyCalibrationLayerCatalog &catalog,
         const ExpertHistogramProductionTopology &topology, Geometry geometry,
         const std::shared_ptr<PhysicalMemoryAuthority> &memory,
-        const ModelMemoryProfile *model_profile, const RankInventory *rank_inventory)
+        const ModelMemoryProfile *model_profile, const RankInventory *rank_inventory,
+        const ILocalTPContext* owner_domain,int owner_top_k)
     {
         if (!memory) throw std::invalid_argument("Prepared-service measurement requires physical admission");
         if (epoch != registry.initialEpoch())
@@ -694,7 +729,9 @@ namespace llaminar2
             {
                 const auto &entries = bank->layerForModelLayer(layer);
                 for (size_t expert = 0; expert < entries.experts.size(); ++expert)
-                    if (entries.resident_mask.at(expert) && entries.experts[expert].complete())
+                    if (entries.resident_mask.at(expert) &&
+                        entries.experts[expert].readyFor(endpoint->movableProjections()) &&
+                        entries.experts[expert].projections() == endpoint->movableProjections())
                     {
                         selected_layer = layer;
                         selected_expert = static_cast<int>(expert);
@@ -703,7 +740,7 @@ namespace llaminar2
                 if (selected_expert >= 0) break;
             }
             if (selected_expert < 0)
-                throw std::logic_error("Prepared service unsupported: priced class has no complete resident source; participant=" +
+                throw std::logic_error("Prepared service unsupported: priced class has no matching movable resident source; participant=" +
                     std::to_string(gap.participant_id) + " device=" + endpoint->device().toString() +
                     " representative_layer=" + std::to_string(gap.representative_layer) +
                     " phase=" + std::to_string(expertHistogramProductionSourceIndex(gap.source)));
@@ -727,9 +764,25 @@ namespace llaminar2
                      .apportioned_routed_experts = true});
                 auto& calibration=gpu_calibrations[bank->device];
                 if(!calibration)calibration=PlanningGPUExpertMeasurement::beginPreparedCalibration(bank->device,memory);
+                const auto& payload = bank->layerForModelLayer(selected_layer).experts[selected_expert];
+                // CompleteExpert already borrows its authentic resident engines.
+                // Only GateUp needs the additional model-bound fixed-column
+                // authority; keep that source lease alive through native replay.
+                std::optional<MoEOverlayParticipantResidencyRegistry::PreparedSourceUse> source;
+                std::shared_ptr<const MoEOverlayFixedDownProjectionBank> fixed_down;
+                if (!payload.complete())
+                {
+                    std::string source_error;
+                    source = registry.acquireOriginalPreparedSource(&source_error);
+                    if (!source) throw std::invalid_argument("Prepared GPU service lost original source: " + source_error);
+                    fixed_down = fixedDownServiceMetadata(registry,*source,gap.participant_id,selected_layer);
+                }
                 duration = PlanningGPUExpertMeasurement::measurePrepared(
-                    bank->layerForModelLayer(selected_layer).experts[selected_expert], bank->device,
-                    selected_layer, gap.source, geometry.d_model, geometry.intermediate, memory, invocation, calibration);
+                    payload, bank->device,
+                    selected_layer, gap.source, geometry.d_model, geometry.intermediate, memory, invocation, calibration,
+                    std::move(fixed_down),
+                    payload.complete() ? -1 : selected_expert,
+                    {.domain=owner_domain,.top_k=owner_top_k,.resident_sources=bank->layerForModelLayer(selected_layer).experts});
             }
             const auto participant_index = static_cast<size_t>(std::lower_bound(ids.begin(), ids.end(), gap.participant_id) - ids.begin());
             auto &row = result.at(participant_index * catalog.layerCount() +

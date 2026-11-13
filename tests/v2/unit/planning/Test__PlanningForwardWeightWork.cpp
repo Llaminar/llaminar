@@ -10,6 +10,7 @@
 #include "../../utils/ScopedGDNProjectionArithmetic.h"
 #include "planning/PlanningForwardWeightWork.h"
 #include "planning/OrchestrationCandidateAdmission.h"
+#include "planning/WorkspaceMemoryEstimator.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include "../../utils/PlanningHostServiceFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
@@ -66,10 +67,21 @@ namespace
         return result;
     }
 
-    /** @return Last complete proposal of one family, preserving sparse discovery identity. */
+    /**
+     * @brief Enumerate a real proposal without confusing visible capacity with requested degree.
+     * @param source Original model metadata used by the production candidate compiler.
+     * @param backend Backend of the fixture's observed devices.
+     * @param strategy Requested candidate family.
+     * @param gpu_count Number of physically distinct visible fixture GPUs.
+     * @param routed_policy Actual expert projection ownership policy.
+     * @param required_gpu_count Optional public cardinality constraint on selected compute.
+     * @return Last complete proposal of the requested family, preserving discovery identity.
+     * @throws std::logic_error When the declared inventory cannot produce that proposal.
+     */
     AutomaticOrchestrationCandidate proposal(const PlanningModelSource &source, DeviceType backend,
         OrchestrationStrategy strategy, int gpu_count = 1,
-        RoutedExpertComputePolicy routed_policy = RoutedExpertComputePolicy::Apportioned)
+        RoutedExpertComputePolicy routed_policy = RoutedExpertComputePolicy::Apportioned,
+        std::optional<int> required_gpu_count = std::nullopt)
     {
         OrchestrationConfig request;
         request.model_path = source.path();
@@ -81,6 +93,8 @@ namespace
         request.routed_expert_compute_policy = routed_policy;
         if (routed_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
             request.automatic_planning.device_counts = {{backend, gpu_count}};
+        if (required_gpu_count)
+            request.automatic_planning.device_counts = {{backend, *required_gpu_count}};
         request.automatic_planning.only_backends = strategy == OrchestrationStrategy::ExpertOverlay
             ? std::vector{backend, DeviceType::CPU} : std::vector{backend};
         request.automatic_planning.only_strategies = {strategy};
@@ -650,4 +664,252 @@ TEST(PlanningForwardWeightWork, ProjectionOwnershipCompilesBothPhasesAllFormats)
             EXPECT_DOUBLE_EQ(owned_routes, 66);
         }
     }
+}
+
+/**
+ * @brief Replay QFN source-directory HC/QSA/PLE roles through canonical work compilation.
+ *
+ * The compact dense GGUF supplies admitted CPU/CUDA/ROCm topology fixtures;
+ * appended metadata preserves actual QFN extension N/K/format observations
+ * without loading their payloads or advertising a synthetic model certificate.
+ */
+TEST(PlanningForwardWeightWork, QFNExtensionRolesPreserveGeometryRowsAndTerminalStage)
+{
+    test::PlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    auto profile = source.metadata().memoryProfile();
+    profile.architecture = "qwen4exp";
+    const auto add = [&](const std::string &name, size_t n, size_t k, const std::string &format, int layer) {
+        const size_t elements = n * k;
+        const size_t bytes = format == "Q8_0" ? (elements / 32u) * 34u : elements * (format == "BF16" ? 2u : 4u);
+        profile.tensors.push_back({name, bytes, format, elements, k, layer});
+    };
+    add("output_hc_down.weight", 320, 10240, "Q8_0", -1);
+    add("output_hc_up.weight", 10240, 320, "Q8_0", -1);
+    add("output_hc_norm.weight", 1, 10240, "F32", -1);
+    for (int layer = 0; layer < 2; ++layer)
+        for (const auto branch : {"attn", "ffn"})
+        {
+            const auto prefix = "blk." + std::to_string(layer) + ".hc_" + branch;
+            add(prefix + "_down.weight", 320, 10240, "Q8_0", layer);
+            add(prefix + "_up.weight", 10240, 320, "Q8_0", layer);
+            add(prefix + "_inject.weight", 4, 10240, "F32", layer);
+            add(prefix + "_norm.weight", 1, 10240, "F32", layer);
+        }
+    // Source indexer query gains are reused per head; no hidden-width shard
+    // may replace the actual N512/N128 projection or 128-element gain.
+    add("blk.1.indexer.q_proj.weight", 512, 2560, "BF16", 1);
+    add("blk.1.indexer.k_proj.weight", 128, 2560, "BF16", 1);
+    add("blk.1.indexer.q_norm.weight", 1, 128, "F32", 1);
+    add("blk.1.indexer.k_norm.weight", 1, 128, "F32", 1);
+    add("blk.1.ple_key.weight", 10240, 2560, "Q8_0", 1);
+    add("blk.1.ple_value.weight", 2560, 2560, "Q8_0", 1);
+    for (const auto suffix : {"key", "query", "conv"})
+        add(std::string("blk.1.ple_norm_") + suffix + ".weight", 1, 10240, "F32", 1);
+    add("blk.1.ple_conv1d.weight", 10240, 4, "F32", 1);
+    const PlanningModelMetadata model(profile, 2);
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+        for (const auto strategy : {OrchestrationStrategy::SingleDevice,
+                                   backend == DeviceType::CPU ? OrchestrationStrategy::PipelineParallel : OrchestrationStrategy::TensorParallel})
+        {
+            SCOPED_TRACE(std::string(deviceTypeToString(backend)) + "/" + std::to_string(int(strategy)));
+            // Four visible cards do not imply a four-card proposal: ordinary
+            // enumeration also emits smaller subsets. Declare the actual
+            // tested degree through the same public hint as production.
+            const auto candidate = admit(proposal(source, backend, strategy,
+                strategy == OrchestrationStrategy::TensorParallel ? 4 : 1,
+                RoutedExpertComputePolicy::Apportioned,
+                strategy == OrchestrationStrategy::TensorParallel ? std::optional<int>{4} : std::nullopt), source);
+            for (const auto phase : {PlanningMainForwardPhase::Prefill, PlanningMainForwardPhase::Decode})
+            {
+                const auto work = compilePlanningForwardWeightWork(model, candidate, phase);
+                std::size_t terminal_uses = 0;
+                for (const auto &participant : work)
+                {
+                    for (const auto &operation : participant.ordinary)
+                    {
+                        const auto &weight = operand(operation);
+                        EXPECT_FALSE(std::holds_alternative<PlanningUnclassifiedWeight>(operation)) << weight.source_name;
+                        if (weight.role == WeightRole::HyperConnectionProjection || weight.role == WeightRole::SparseIndexerProjection ||
+                            weight.role == WeightRole::PerLayerEmbeddingProjection)
+                            EXPECT_TRUE(std::holds_alternative<PlanningProjectionWeight>(operation)) << weight.source_name;
+                        if (weight.source_name.starts_with("output_hc_"))
+                        {
+                            ++terminal_uses;
+                            EXPECT_EQ(participant.last_layer, 1);
+                            EXPECT_TRUE(planningTerminalWeight(weight.role, weight.layer));
+                            EXPECT_EQ(planningWeightInvocationRows(weight.role, phase == PlanningMainForwardPhase::Prefill ? 512 : 1),
+                                      phase == PlanningMainForwardPhase::Prefill ? 512 : 1);
+                        }
+                    }
+                    if (participant.last_layer == 1)
+                    {
+                        EXPECT_EQ(find(participant, "output_hc_down.weight", WeightRole::HyperConnectionProjection).geometry.matrix(),
+                                  (WeightShardMatrix{320, 10240, 1}));
+                        EXPECT_EQ(find(participant, "output_hc_up.weight", WeightRole::HyperConnectionProjection).geometry.matrix(),
+                                  (WeightShardMatrix{10240, 320, 1}));
+                        EXPECT_EQ(find(participant, "output_hc_norm.weight", WeightRole::HyperConnectionNorm).geometry.elements(), 10240u);
+                    }
+                    if (participant.first_layer <= 1 && participant.last_layer >= 1)
+                    {
+                        EXPECT_EQ(find(participant, "blk.1.ple_key.weight", WeightRole::PerLayerEmbeddingProjection).geometry.matrix(),
+                                  (WeightShardMatrix{10240, 2560, 1}));
+                        EXPECT_EQ(find(participant, "blk.1.indexer.q_proj.weight", WeightRole::SparseIndexerProjection).geometry.matrix(),
+                                  (WeightShardMatrix{512, 2560, 1}));
+                        EXPECT_EQ(find(participant, "blk.1.ple_conv1d.weight", WeightRole::PerLayerEmbeddingConvolution).geometry.elements(), 40960u);
+                    }
+                }
+                EXPECT_EQ(terminal_uses, strategy == OrchestrationStrategy::TensorParallel ? 12u : 3u);
+            }
+        }
+    EXPECT_EQ(planningWeightInvocationRows(WeightRole::LMHead, 512), 1);
+    EXPECT_EQ(planningWeightInvocationRows(WeightRole::OutputNorm, 512), 1);
+    EXPECT_FALSE(planningTerminalWeight(WeightRole::HyperConnectionProjection, 0));
+    EXPECT_THROW((void)planningWeightInvocationRows(WeightRole::HyperConnectionProjection, 0), std::invalid_argument);
+}
+
+/** @test Immutable source indices preserve canonical roles through copies and wire reconstruction. */
+TEST(PlanningForwardWeightWork, RetainedClassificationIsSourceBoundAndIndexesOwnedLayers) {
+    test::PlanningGGUFFixture file(true,true,GGUFTensorType::Q4_0);
+    PlanningModelSource source(file.path());
+    const auto &model=source.metadata();
+    const auto check=[](const PlanningModelMetadata &metadata) {
+        const auto &profile=metadata.memoryProfile();std::vector<size_t> visits(profile.tensors.size(),0);
+        for(const size_t index:metadata.globalTensorIndices()) {
+            EXPECT_LT(index,profile.tensors.size());EXPECT_LT(profile.tensors[index].layer_index,0);++visits[index];
+        }
+        for(int layer=0;layer<profile.n_layers;++layer)
+            for(const size_t index:metadata.layerTensorIndices(layer)) {
+                EXPECT_LT(index,profile.tensors.size());EXPECT_EQ(profile.tensors[index].layer_index,layer);++visits[index];
+            }
+        for(size_t index=0;index<profile.tensors.size();++index) {
+            const auto view=metadata.classifiedTensor(index);
+            EXPECT_EQ(&view.profile(),&profile);EXPECT_EQ(&view.tensor(),&profile.tensors[index]);
+            EXPECT_EQ(view.index(),index);EXPECT_EQ(view.role(),inferWeightRole(profile.tensors[index].name));
+            EXPECT_EQ(visits[index],1u);
+        }
+        EXPECT_THROW(metadata.classifiedTensor(profile.tensors.size()),std::out_of_range);
+        EXPECT_THROW(metadata.layerTensorIndices(-1),std::invalid_argument);
+        EXPECT_THROW(metadata.layerTensorIndices(profile.n_layers),std::invalid_argument);
+    };
+    check(model);auto copy=model;check(copy);
+    EXPECT_EQ(copy.tensorIndex(),model.tensorIndex());
+    std::shared_ptr<const PlanningTensorIndex> retained;
+    { PlanningModelMetadata ephemeral(model.memoryProfile(),model.mainLayerCount());retained=ephemeral.tensorIndex(); }
+    EXPECT_EQ(retained->profile().tensors.size(),model.memoryProfile().tensors.size());
+    EXPECT_NE(retained->findTensor(model.memoryProfile().tensors.front().name),nullptr);
+    EXPECT_THROW(retained->requireProfile(model.memoryProfile()),std::invalid_argument);
+    const auto restored=PlanningModelMetadata::deserialize(model.serialize());check(restored);
+    ASSERT_TRUE(model.firstTensorWithRole(WeightRole::Embedding));
+    EXPECT_EQ(model.classifiedTensor(*model.firstTensorWithRole(WeightRole::Embedding)).role(),WeightRole::Embedding);
+    auto extended=model.memoryProfile();const auto original_layer_size=model.layerTensorIndices(0).size();
+    for(size_t index=0;index<1000;++index)extended.tensors.push_back({
+        .name="blk.1.additional_norm_"+std::to_string(index)+".weight",.native_bytes=4,.quant_type="F32",.elements=1,.K=1,.layer_index=1});
+    const PlanningModelMetadata larger(std::move(extended),model.mainLayerCount());
+    EXPECT_EQ(larger.layerTensorIndices(0).size(),original_layer_size);
+    EXPECT_EQ(larger.layerTensorIndices(1).size(),model.layerTensorIndices(1).size()+1000);
+    EXPECT_EQ(larger.globalTensorIndices().size(),model.globalTensorIndices().size());
+    EXPECT_EQ(model.memoryProfile().tensors.size()+1000,larger.memoryProfile().tensors.size());
+}
+
+/** @test Retained typed roles use the same sharding arithmetic and cannot cross source authorities. */
+TEST(PlanningForwardWeightWork, PreclassifiedGeometryMatchesCanonicalResolverAndRejectsForeignViews) {
+    test::PlanningGGUFFixture file(true,true,GGUFTensorType::Q4_0);
+    PlanningModelSource source(file.path());const auto &model=source.metadata();const PlanningModelMetadata foreign(model.memoryProfile(),model.mainLayerCount());
+    for(const auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm})
+    for(const int degree:{1,2})for(int shard=0;shard<degree;++shard) {
+        SCOPED_TRACE(::testing::Message()<<int(backend)<<"/"<<degree<<"/"<<shard);
+        const WeightShardGeometryResolver resolver(model.memoryProfile(),DeviceId(backend,0),shard,degree);
+        for(size_t index=0;index<model.memoryProfile().tensors.size();++index) {
+            const auto view=model.classifiedTensor(index);
+            const auto original=resolver.resolve(view.tensor());const auto retained=resolver.resolve(view);
+            EXPECT_EQ(retained.elements(),original.elements());EXPECT_EQ(retained.matrix(),original.matrix());
+            if(isRoutedExpertRole(view.role())) {
+                const auto expert=resolver.resolve(view.tensor(),1);const auto typed=resolver.resolve(view,1);
+                EXPECT_EQ(typed.elements(),expert.elements());EXPECT_EQ(typed.matrix(),expert.matrix());
+            }
+        }
+        EXPECT_THROW(resolver.resolve(foreign.classifiedTensor(0)),std::invalid_argument);
+    }
+}
+
+/** @test Retained source facts preserve every canonical byte quote and reject foreign profile/lifetime reuse. */
+TEST(PlanningForwardWeightWork, RetainedSourceWorkspaceAndWeightQuotesMatchCanonicalBytes) {
+    test::PlanningGGUFFixture file(true,true,GGUFTensorType::Q4_0);
+    PlanningModelSource source(file.path());const auto &model=source.metadata();const auto &profile=model.memoryProfile();
+    for(const auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm})
+    for(const int rows:{1,32}) {
+        SCOPED_TRACE(::testing::Message()<<int(backend)<<"/"<<rows);
+        WorkspaceMemoryGeometry plain;
+        plain.device=DeviceId(backend,0);plain.device_compute_units=backend==DeviceType::CPU?2:64;
+        plain.cpu_execution=test::kSyntheticCPUExecutionGeometry;plain.resident_graph_rows=rows;plain.max_context_rows=128;
+        plain.owns_embedding=true;plain.first_layer=0;plain.last_layer=profile.n_layers-1;
+        auto indexed=plain;indexed.source_tensor_index=model.tensorIndex();
+        EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile,plain),WorkspaceMemoryEstimator::estimate(profile,indexed));
+        auto policy=PlanningWeightSourcePolicy::current();policy.source_tensor_index=model.tensorIndex();
+        const auto original=WeightMemoryEstimator::estimate(profile,plain.device);
+        const auto retained=WeightMemoryEstimator::estimate(profile,plain.device,0,1,0,-1,{}, {},
+            WeightComponentScope::EmbeddingAndTerminal,CPUStoragePlacement::local(),policy);
+        EXPECT_EQ(original.native_bytes,retained.native_bytes);EXPECT_EQ(original.device_bytes,retained.device_bytes);
+        EXPECT_EQ(original.prepared_embedding_bytes,retained.prepared_embedding_bytes);
+        EXPECT_EQ(original.lm_head_bytes,retained.lm_head_bytes);EXPECT_EQ(original.tied_lm_head_bytes,retained.tied_lm_head_bytes);
+        const PlanningModelMetadata foreign(profile,model.mainLayerCount());
+        auto wrong=indexed;wrong.source_tensor_index=foreign.tensorIndex();
+        EXPECT_THROW(WorkspaceMemoryEstimator::estimate(profile,wrong),std::invalid_argument);
+        policy.source_tensor_index=foreign.tensorIndex();
+        EXPECT_THROW(WeightMemoryEstimator::estimate(profile,plain.device,0,1,0,-1,{}, {},
+            WeightComponentScope::EmbeddingAndTerminal,CPUStoragePlacement::local(),policy),std::invalid_argument);
+    }
+    // The handle, not a startup-local metadata address, retains the single source.
+    std::shared_ptr<const PlanningTensorIndex> retained;
+    { PlanningModelMetadata local(profile,model.mainLayerCount());retained=local.tensorIndex(); }
+    WorkspaceMemoryGeometry lifetime;lifetime.source_tensor_index=retained;lifetime.device=DeviceId::rocm(0);
+    lifetime.device_compute_units=64;lifetime.resident_graph_rows=1;lifetime.max_context_rows=128;
+    lifetime.first_layer=0;lifetime.last_layer=retained->profile().n_layers-1;
+    EXPECT_GT(WorkspaceMemoryEstimator::estimate(retained->profile(),lifetime),0u);
+    auto changed=profile;changed.tensors.front().name="different-source.weight";
+    EXPECT_THROW(retained->requireProfile(changed),std::invalid_argument);
+}
+
+/** @test Explicit appended predictor intervals remain present even beyond the nominal main-layer count. */
+TEST(PlanningForwardWeightWork, RetainedSourceWeightQuotesIncludeAppendedSidecarLayers)
+{
+    test::PlanningGGUFFixture file(true,true,GGUFTensorType::Q4_0);
+    PlanningModelSource source(file.path());
+    auto original=source.metadata().memoryProfile();
+    const int sidecar=source.metadata().mainLayerCount();
+    ASSERT_GT(original.n_layers,sidecar);
+    // Some bound runtime profiles retain the main count while their original
+    // directory also contains an explicitly requested appended predictor.
+    original.n_layers=sidecar;
+    const PlanningModelMetadata metadata(std::move(original),sidecar);
+    const auto &profile=metadata.memoryProfile();
+    ASSERT_FALSE(metadata.layerTensorIndices(sidecar).empty());
+    for(const size_t index:metadata.layerTensorIndices(sidecar))EXPECT_EQ(profile.tensors[index].layer_index,sidecar);
+    size_t visited=0;
+    metadata.tensorIndex()->forEachLayerTensor(sidecar,sidecar,[&](size_t){++visited;});
+    EXPECT_EQ(visited,metadata.layerTensorIndices(sidecar).size());
+    auto policy=PlanningWeightSourcePolicy::current();policy.source_tensor_index=metadata.tensorIndex();
+    for(const auto backend:{DeviceType::CPU,DeviceType::CUDA,DeviceType::ROCm})
+    for(const auto scope:{WeightComponentScope::LayersOnly,WeightComponentScope::Terminal,
+                         WeightComponentScope::EmbeddingAndTerminal})
+    for(const int first:{sidecar-1,sidecar})
+    {
+        SCOPED_TRACE(::testing::Message()<<int(backend)<<"/"<<int(scope)<<"/"<<first);
+        const auto canonical=WeightMemoryEstimator::estimate(profile,DeviceId(backend,0),0,1,first,sidecar,{}, {},scope);
+        const auto indexed=WeightMemoryEstimator::estimate(profile,DeviceId(backend,0),0,1,first,sidecar,{}, {},scope,
+            CPUStoragePlacement::local(),policy);
+        EXPECT_GT(canonical.device_bytes,0u);
+        EXPECT_EQ(indexed.native_bytes,canonical.native_bytes);
+        EXPECT_EQ(indexed.device_bytes,canonical.device_bytes);
+        EXPECT_EQ(indexed.prepared_embedding_bytes,canonical.prepared_embedding_bytes);
+        EXPECT_EQ(indexed.lm_head_bytes,canonical.lm_head_bytes);
+        EXPECT_EQ(indexed.tied_lm_head_bytes,canonical.tied_lm_head_bytes);
+    }
+    // An omitted upper bound keeps its original canonical nominal-layer rule.
+    const auto canonical=WeightMemoryEstimator::estimate(profile,DeviceId::rocm(0),0,1,0,-1,{}, {},WeightComponentScope::LayersOnly);
+    const auto indexed=WeightMemoryEstimator::estimate(profile,DeviceId::rocm(0),0,1,0,-1,{}, {},WeightComponentScope::LayersOnly,
+        CPUStoragePlacement::local(),policy);
+    EXPECT_EQ(indexed.native_bytes,canonical.native_bytes);
+    EXPECT_EQ(indexed.device_bytes,canonical.device_bytes);
 }

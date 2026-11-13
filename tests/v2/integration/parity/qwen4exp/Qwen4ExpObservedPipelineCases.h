@@ -6,6 +6,8 @@
  * must bind observed UUID/NUMA ownership before public configuration exists.
  * The existing retained3 source dimension supplies Off/fixed1/fixed3/dynamic;
  * independent native, numerical and source runs must qualify each candidate.
+ * A distinct GPU-only GateUpOwnedDownColumns sibling retains fixed-head-sharded
+ * VRAM rows and full15 MTP; it never inherits an Apportioned numerical result.
  */
 #pragma once
 #include "Qwen4ExpSourceAdmissionCases.h"
@@ -66,5 +68,55 @@ inline const std::vector<ModelParityCase>& qwen4ExpObservedMI50FixedVRAMExactCas
         return enabled;
     }();
     return cells;
+}
+/**
+ * @return Unbound original MI50 EP4+EP4 request with the explicit GPU hybrid expert policy and full15 cadence.
+ * @details Only the routed arithmetic policy changes from the existing observed
+ * blueprint. Production discovery still owns GPU order, UUID/NUMA and selected
+ * rank membership; no source address or previously observed pass is invented.
+ */
+inline ModelParityDefinition qwen4ExpObservedMI50GateUpFixedVRAMDefinition()
+{
+    auto definition=qwen4ExpObservedMI50PipelineDefinition();
+    definition.topology.test_id+="_GateUpOwnedDownColumns_Full15";
+    definition.topology.pipeline_routed_compute_policies.assign(
+        definition.topology.pipeline_stage_sizes.size(),RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+    definition.inventory_role=ModelParityInventoryRole::NumericalDiagnostic;
+    definition.features.ngram_storage={ImmutableRowTablePolicy{
+        .storage=ImmutableRowStoragePreference::VRAM,.distribution=ImmutableRowTableDistribution::FixedHeadSharded}};
+    definition.features.dynamic_speedup_witness=ModelParityDynamicSpeedupWitness::Disabled;
+    for(auto* movement:{&definition.dynamic_rebalance.economic_movement,
+                        &definition.dynamic_rebalance.economic_movement_and_observed_speedup}) {
+        movement->device_min_maintenance_period_tokens=kModelParityRequiredMaximumMTPDepth+1;
+        movement->device_initial_maintenance_period_tokens=kModelParityRequiredMaximumMTPDepth+1;
+    }
+    return definition;
+}
+
+/**
+ * @return Four StaticOrdinal Off/1/3/Dynamic full15 source/numerical/export candidates.
+ * @note Source expansion alone declares the original predictor for active MTP;
+ * Off retains the inactive paired source for frozen-history corpus closure.
+ */
+inline const std::vector<ModelParityCase>& qwen4ExpObservedMI50GateUpFixedVRAMCases()
+{
+    static const auto cases=[] {
+        std::vector<ModelParityCase> seeds;
+        for(auto cell:expandModelParityDefinition(qwen4ExpObservedMI50GateUpFixedVRAMDefinition()))
+            if(cell.expert_overlay==std::optional{ModelParityExpertOverlayPolicy{}}) {
+                cell.model.shared_predictor=SharedPredictorGGUFSource{std::string(kPredictorModelPath)};
+                seeds.push_back(std::move(cell));
+            }
+        if(seeds.size()!=1)throw std::logic_error("Observed GateUp PP lost its original StaticOrdinal seed");
+        return qwen4ExpExpandSourceAdmissionMTP(seeds,Qwen4ExpSourceMTPEnvelope::Full15);
+    }();return cases;
+}
+
+/** @return Active byte-exact proofs of the identical GPU hybrid/fixed-head/full15 declarations. */
+inline std::vector<ModelParityCase> qwen4ExpObservedMI50GateUpFixedVRAMExactCases()
+{
+    auto cases=qwen4ExpObservedMI50GateUpFixedVRAMCases();
+    std::erase_if(cases,[](const auto& cell){return !cell.mtpEnabled();});
+    return cases;
 }
 } // namespace llaminar2::test::parity::qwen4exp

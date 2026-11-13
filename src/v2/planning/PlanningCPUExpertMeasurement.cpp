@@ -144,8 +144,7 @@ namespace llaminar2
             description.matrices[0].k, description.matrices[0].n, description.prepared_bytes,
             description.formats, request, {}};
         const MoEOverlayPreparedExpertPayload payload{engines[0], engines[1], engines[2]};
-        for (const auto phase : {ExpertHistogramSource::DecodeToken, ExpertHistogramSource::PrefillChunk,
-                                ExpertHistogramSource::GroupedVerifier})
+        for (const auto phase : kPlanningExpertStartupPhases)
         {
             const int rows = MoEOverlayCPUServiceMeasurement::rowsForPhase(phase);
             const uint64_t elapsed = MoEOverlayCPUServiceMeasurement::measurePrepared(

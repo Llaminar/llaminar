@@ -61,6 +61,8 @@ struct ActivationGraphMemoryGeometry
     MTPShiftedKVHeadLayout mtp_shifted_kv_head_layout = MTPShiftedKVHeadLayout::PrimaryTensorParallelShard;
         ///< Existing predictor ownership also determines its retained Q/K/V and FFN arena widths.
     bool local_hot_terminal_observation = false; ///< Original combined policy admits one separate terminal-only arena root.
+    /** @return Exact complete declaration identity, including every policy and ownership field. */
+    bool operator==(const ActivationGraphMemoryGeometry &) const = default;
 };
 
 /** @brief Sizes stable activation owners used by captured inference graphs. */

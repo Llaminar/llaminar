@@ -4,8 +4,9 @@
  *
  * All arithmetic in this file is setup-time and fail-closed.  The implementation
  * mirrors the allocation layouts used by CpuExpertSlotPool and
- * GpuExpertSlotPool, then admits logical residents one at a time while charging
- * their actual physical copy multiplicity.  No runtime allocator or backend is
+ * GpuExpertSlotPool. Mandatory consecutive quotas use exact monotone prefix
+ * arithmetic; preferred multi-tier fill retains its one-at-a-time order. Both
+ * charge the actual physical copy multiplicity.  No runtime allocator or backend is
  * consulted, which keeps the same decision reproducible on every MPI rank.
  * Pipeline stages share the same typed physical BOM throughout admission;
  * compact stage quota/count metadata never becomes an independent byte budget.
@@ -366,6 +367,109 @@ namespace llaminar2
                 }
             }
             return true;
+        }
+
+        /**
+         * @brief Count one participant's visits in the unchanged cyclic logical-expert sequence.
+         * @param participant Original participant position, never a physical ordinal.
+         * @param participants Positive authored participant count.
+         * @param previous Existing logical quota, which fixes the next original owner.
+         * @param copies Consecutive logical additions from that exact cursor.
+         * @return Exact visits including a partial final cycle.
+         */
+        [[nodiscard]] std::size_t prefixVisits(std::size_t participant, std::size_t participants,
+            int previous, int copies)
+        {
+            const auto offset=static_cast<std::size_t>(previous)%participants;
+            const auto distance=participant>=offset?participant-offset:participants-(offset-participant);
+            return static_cast<std::size_t>(copies)/participants+
+                (distance<static_cast<std::size_t>(copies)%participants?1u:0u);
+        }
+
+        /**
+         * @brief Form exact charges for a consecutive prefix without changing any authority.
+         * @return Charges, or absence when their mathematical sum exceeds size_t and therefore cannot fit.
+         *
+         * A one-copy call is validated separately by nextLiveCharges, retaining
+         * its original overflow errors. Larger unrepresentable prefixes cannot
+         * fit any size_t physical budget; they are not committed or rounded.
+         */
+        [[nodiscard]] std::optional<std::map<std::string,std::size_t>> prefixLiveCharges(
+            const TierState &tier,int layer,int copies,
+            const std::unordered_map<std::string,std::size_t> &resource_index,
+            const std::vector<ResourceState> &resources)
+        {
+            std::map<std::string,std::size_t> charges;
+            const auto count=tier.request->participants.size();
+            const int previous=tier.output.live_experts_per_layer[static_cast<std::size_t>(layer)];
+            const bool replicated=tier.request->copy_policy==MoEOverlayTierCopyPolicy::Replicated ||
+                tier.request->copy_policy==MoEOverlayTierCopyPolicy::TensorSharded;
+            for(std::size_t participant=0;participant<count;++participant)
+            {
+                const auto visits=replicated?static_cast<std::size_t>(copies):prefixVisits(participant,count,previous,copies);
+                if(!visits)continue;
+                const auto &endpoint=tier.request->participants[participant];
+                const auto &footprint=tier.request->copy_policy==MoEOverlayTierCopyPolicy::TensorSharded
+                    ?tier.fragment_footprints.at(participant).at(static_cast<std::size_t>(layer))
+                    :tier.movable_footprints.at(static_cast<std::size_t>(layer));
+                const auto bytes=footprintFor(footprint,resources[resource_index.at(endpoint.resource_id)].memory.build().resource().device,false);
+                if(bytes && visits>std::numeric_limits<std::size_t>::max()/bytes)return std::nullopt;
+                const auto additional=bytes*visits;
+                auto &total=charges[endpoint.resource_id];
+                if(total>std::numeric_limits<std::size_t>::max()-additional)return std::nullopt;
+                total+=additional;
+            }
+            return charges;
+        }
+
+        /**
+         * @brief Admit the largest fitting consecutive prefix using the same canonical physical BOMs.
+         * @param requested Exact mandatory logical additions, not a capacity or whole-layer approximation.
+         * @return Number admitted before the same first failing next-copy operation as serial admission.
+         *
+         * All charges are nonnegative, so a prefix fits iff each preceding
+         * serial addition fits. Binary search changes only pure quotation work;
+         * one commit bills the exact same owners and participant counts. No
+         * certificate, free-byte balance or greedy tier order is cached.
+         */
+        [[nodiscard]] int addLiveExpertPrefix(TierState &tier,int layer,int requested,
+            const std::unordered_map<std::string,std::size_t> &resource_index,
+            std::vector<ResourceState> &resources)
+        {
+            const auto at=static_cast<std::size_t>(layer);
+            const int previous=tier.output.live_experts_per_layer[at];
+            if(requested<0 || previous<0 || requested>std::numeric_limits<int>::max()-previous)
+                throw std::overflow_error("ExpertOverlay logical quota prefix overflows");
+            int limit=requested;
+            if(!tier.request->max_live_experts_per_layer.empty())
+                limit=std::min(limit,std::max(0,tier.request->max_live_experts_per_layer[at]-previous));
+            if(!limit)return 0;
+            // Preserve source/one-copy arithmetic validation before considering
+            // larger mathematical prefixes that cannot fit a physical owner.
+            const auto first=nextLiveCharges(tier,layer,resource_index,resources);
+            if(!chargesFit(first,resource_index,resources))return 0;
+            int low=1,high=limit;
+            const auto complete=prefixLiveCharges(tier,layer,limit,resource_index,resources);
+            if(complete && chargesFit(*complete,resource_index,resources))low=limit;
+            else high=limit-1;
+            while(low<high)
+            {
+                const int middle=low+(high-low)/2+(high-low)%2;
+                const auto charges=prefixLiveCharges(tier,layer,middle,resource_index,resources);
+                if(charges && chargesFit(*charges,resource_index,resources))low=middle;
+                else high=middle-1;
+            }
+            const auto charges=prefixLiveCharges(tier,layer,low,resource_index,resources);
+            if(!charges)throw std::logic_error("Fitting expert prefix lost representable charges");
+            commitCharges(*charges,resource_index,resources,false);
+            tier.output.live_experts_per_layer[at]+=low;
+            tier.output.has_live_residency=true;
+            const bool replicated=tier.request->copy_policy==MoEOverlayTierCopyPolicy::Replicated ||
+                tier.request->copy_policy==MoEOverlayTierCopyPolicy::TensorSharded;
+            for(std::size_t participant=0;participant<tier.request->participants.size();++participant)
+                tier.output.participant_live_copies[participant][at]+=replicated?low:
+                    static_cast<int>(prefixVisits(participant,tier.request->participants.size(),previous,low));
+            return low;
         }
 
         /**
@@ -851,23 +955,9 @@ namespace llaminar2
                         throw std::invalid_argument(
                             "ExpertOverlay fixed tier quotas over-assign a model layer");
                     }
-                    for (int copy = 0; copy < quota; ++copy)
-                    {
-                        if (!addOneLiveExpert(
-                                tier,
-                                static_cast<int>(layer),
-                                resource_index,
-                                resources))
-                        {
-                            throwTierCapacityFailure(
-                                tier,
-                                static_cast<int>(layer),
-                                quota,
-                                "fixed live quota",
-                                resource_index,
-                                resources);
-                        }
-                    }
+                    if (addLiveExpertPrefix(tier,static_cast<int>(layer),quota,resource_index,resources)!=quota)
+                        throwTierCapacityFailure(tier,static_cast<int>(layer),quota,
+                            "fixed live quota",resource_index,resources);
                     unassigned[layer] -= quota;
                 }
             }
@@ -1055,23 +1145,9 @@ namespace llaminar2
                 for (std::size_t layer = 0; layer < layer_count; ++layer)
                 {
                     const int remainder = unassigned[layer];
-                    for (int copy = 0; copy < remainder; ++copy)
-                    {
-                        if (!addOneLiveExpert(
-                                *fallback,
-                                static_cast<int>(layer),
-                                resource_index,
-                                resources))
-                        {
-                            throwTierCapacityFailure(
-                                *fallback,
-                                static_cast<int>(layer),
-                                remainder,
-                                "fallback remainder",
-                                resource_index,
-                                resources);
-                        }
-                    }
+                    if (addLiveExpertPrefix(*fallback,static_cast<int>(layer),remainder,resource_index,resources)!=remainder)
+                        throwTierCapacityFailure(*fallback,static_cast<int>(layer),remainder,
+                            "fallback remainder",resource_index,resources);
                     unassigned[layer] = 0;
                 }
             }

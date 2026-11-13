@@ -26,6 +26,7 @@
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
+#include "execution/mtp/MTPCheckpointPolicy.h"
 #include "memory/BufferArena.h"
 #include "tensors/Tensors.h"
 #include "tensors/TensorFactory.h"
@@ -1472,7 +1473,7 @@ namespace
     TEST_F(CapturedTransferChannelBindingTest, PipelineGraphDomainsEncloseEveryForwardRole)
     {
         using Edges = PipelineForwardGraphEdges;
-        enum class Role { Prefill, Ordinary, AdmittedOrdinary, Condition, Verifier2, Verifier16 };
+        enum class Role { Prefill, Ordinary, AdmittedOrdinary, Condition, RestoredBridge, Verifier2, Verifier16 };
         MPIContext mpi(0, 1);
         TensorFactory factory(mpi);
         // Replace the ordinary channel-only doubles with one actual original
@@ -1560,7 +1561,7 @@ namespace
                         port.activation_fanout = PipelineActivationFanout::create(device, context, member,
                             activation, authority, consumer_stream, transfer);
                     Edges edges(device, port, arena, 32, domain ? std::nullopt : std::optional(follower), transfer);
-                    for (const auto role : {Role::Prefill, Role::Ordinary, Role::AdmittedOrdinary, Role::Condition, Role::Verifier2, Role::Verifier16})
+                    for (const auto role : {Role::Prefill, Role::Ordinary, Role::AdmittedOrdinary, Role::Condition, Role::RestoredBridge, Role::Verifier2, Role::Verifier16})
                     {
                         SCOPED_TRACE(::testing::Message() << "reverse=" << reverse << " width=" << width
                             << " domain=" << domain << " member=" << member << " role=" << int(role));
@@ -1570,7 +1571,7 @@ namespace
                         input.seq_len = role == Role::Prefill || role == Role::Verifier16 ? 16 : role == Role::Verifier2 ? 2 : 1;
                         input.execution_phase = role == Role::Prefill ? ForwardExecutionPhase::Prefill : ForwardExecutionPhase::Decode;
                         input.execution_role = verifier ? ForwardExecutionRole::GroupedMTPVerifier :
-                            role == Role::Condition ? ForwardExecutionRole::MTPCondition : ForwardExecutionRole::MainInference;
+                            (role == Role::Condition || role == Role::RestoredBridge) ? ForwardExecutionRole::MTPCondition : ForwardExecutionRole::MainInference;
                         input.external_hidden_state = domain ? arena.getSharedTensor(BufferId::HIDDEN_STATE).get() : nullptr;
                         input.kv_cache = domain ? nullptr : follower.checkpoint.cache;
                         input.token_ids_device = verifier ? arena.getSharedTensor(BufferId::MTP_VERIFIER_INPUT_TOKENS)->gpu_data_ptr() : logical;
@@ -1580,11 +1581,93 @@ namespace
                         if (role == Role::AdmittedOrdinary)
                             input.token_ids_device = arena.getSharedTensor(BufferId::REQUEST_TOKEN_IDS)->gpu_data_ptr();
                         if (role == Role::Ordinary || role == Role::AdmittedOrdinary)
+                        {
+                            // Off setup retains the same ordinary transaction;
+                            // no shifted sidecar binding enters its graph.
+                            input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
                             input.device_decode_position = DeviceDecodePositionBinding{resolve(device), logical + 2, logical + 1};
+                            EXPECT_FALSE(input.shifted_mtp_prefill);
+                        }
                         if (role == Role::Prefill) {
                             input.device_prefill_chunk.emplace();
                             input.device_prefill_chunk->chunk_real_rows_device = static_cast<int32_t *>(
                                 arena.getSharedTensor(BufferId::PREFILL_CHUNK_GEOMETRY)->gpu_data_ptr());
+                        }
+                        if (role == Role::RestoredBridge)
+                        {
+                            input.graph_submission_intent = ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch;
+                            input.state_transaction = ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;
+                            if (domain)
+                            {
+                                ShiftedMTPPrefillGraphBinding binding;
+                                binding.kv_cache = follower.checkpoint.cache;
+                                binding.terminal_hidden_archive = arena.getSharedTensor(BufferId::HIDDEN_STATE).get();
+                                binding.request_token_ids_device = logical;
+                                binding.request_position_ids_device = logical + 1;
+                                binding.request_segment_lengths_device = logical + 2;
+                                binding.shifted_token_ids_device = logical + 3;
+                                binding.shifted_position_ids_device = logical + 4;
+                                binding.append_lengths_device = logical + 5;
+                                binding.request_row_stride_device = logical + 6;
+                                binding.main_cached_tokens_device = {logical + 7};
+                                binding.shifted_cached_tokens_device = {logical + 8};
+                                binding.capture_identity = 1;
+                                // Feed the same retained-Off materialization decision
+                                // into the actual strict pipeline edge constructor.
+                                if (requiresMTPGraphTransactionBinding(false, true, input.graph_submission_intent))
+                                    input.shifted_mtp_prefill = binding;
+                                ASSERT_TRUE(input.shifted_mtp_prefill);
+                                const auto reject = [&](const ForwardInput &invalid) {
+                                    ComputeGraph invalid_graph;
+                                    invalid_graph.addNode("model", std::make_unique<llaminar2::testing::MockComputeStage>(), device);
+                                    EXPECT_THROW(edges.append(invalid_graph, invalid), std::invalid_argument);
+                                    EXPECT_EQ(invalid_graph.getRootNodes(), std::vector<std::string>{"model"});
+                                };
+                                auto invalid = input;
+                                invalid.graph_submission_intent = ForwardGraphSubmissionIntent::Execute;
+                                if (!requiresMTPGraphTransactionBinding(false, true, invalid.graph_submission_intent))
+                                    invalid.shifted_mtp_prefill.reset();
+                                reject(invalid); // Off runtime must choose ordinary decode instead.
+                                invalid = input;
+                                if (!requiresMTPGraphTransactionBinding(false, false, invalid.graph_submission_intent))
+                                    invalid.shifted_mtp_prefill.reset();
+                                reject(invalid); // Materialization cannot invent absent MTP capacity.
+                                invalid = input;
+                                invalid.graph_submission_intent = ForwardGraphSubmissionIntent::WorkspaceDeclaration;
+                                invalid.shifted_mtp_prefill->purpose = ShiftedMTPPrefillGraphBinding::Purpose::WorkspaceFamilyDeclaration;
+                                reject(invalid); // Geometry declaration is never an executable bridge.
+                            }
+                        }
+                        if (verifier && !domain)
+                        {
+                            // The original stage installer uses this retained
+                            // role even when the logical request is Off.
+                            for (const bool execution_enabled : {false, true})
+                                for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Dynamic})
+                                {
+                                    MTPRuntimeConfig mtp;
+                                    mtp.enabled = execution_enabled;
+                                    mtp.graph_capacity_draft_tokens = 15;
+                                    mtp.depth_policy.mode = mode;
+                                    const auto role = resolveMTPStateRole(retainsMTPGraphCapacity(mtp), false);
+                                    Edges retained(device, port, arena, 32,
+                                        role == MTPStateRole::MainModelFollower ? std::optional(follower) : std::nullopt, transfer);
+                                    ComputeGraph replay;
+                                    replay.addNode("model", std::make_unique<llaminar2::testing::MockComputeStage>(), device);
+                                    ASSERT_NO_THROW(retained.append(replay, input));
+                                }
+                            const auto rejectCheckpoint = [&](Edges &binding, ForwardInput invalid, const char *message) {
+                                ComputeGraph rejected;
+                                rejected.addNode("model", std::make_unique<llaminar2::testing::MockComputeStage>(), device);
+                                try { binding.append(rejected, invalid); FAIL() << "Expected checkpoint ownership rejection"; }
+                                catch (const std::invalid_argument &error) { EXPECT_NE(std::string(error.what()).find(message), std::string::npos); }
+                                EXPECT_EQ(rejected.getRootNodes(), std::vector<std::string>{"model"});
+                            };
+                            Edges missing(device, port, arena, 32, std::nullopt, transfer);
+                            rejectCheckpoint(missing, input, "retained follower checkpoint required");
+                            auto foreign = input;
+                            foreign.kv_cache = reinterpret_cast<IKVCache *>(logical + 1);
+                            rejectCheckpoint(edges, foreign, "original follower checkpoint cache");
                         }
                         EXPECT_TRUE(edges.encloses(input));
                         ComputeGraph graph;

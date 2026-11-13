@@ -1875,6 +1875,11 @@ add_v2_routed_expert_policy_unit(
     V2_Unit_MoEOverlayDistributedResidencyTransport
     unit/execution/moe/Test__MoEOverlayDistributedResidencyTransport.cpp
 )
+add_v2_test(V2_Integration_DistributedResidencySummaryIdentityLifecycle
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_transport>
+        --gtest_filter=Test__MoEOverlayDistributedResidencyTransport.LifecycleSummariesRetainBoundedKeysAndExactRetirementProof
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_routed_expert_policy_unit(
     v2_unit_moe_overlay_node_local_rank_batch_transport
     V2_Unit_MoEOverlayNodeLocalRankBatchTransport
@@ -2029,6 +2034,15 @@ add_v2_test(V2_Integration_MoEOverlayTransactionBoundedEvidence
         --gtest_filter=Test__MoEOverlayInferenceTransaction.LongSessionsKeepTransactionEvidenceBounded:Test__MoEOverlayInferenceTransaction.RankCoordinatorRollsBoundedSerialPrefillChunksWithoutDuplicateTickets:Test__MoEOverlayInferenceTransaction.CoordinatorGraphPlanMirrorsSetupAndExactSparseReturnRetirement
     LABELS "V2;Integration;ProductionTestPreflight;Execution;MoE;PerfStats;Regression"
     MPI_PROCS 1 NO_MODELS NO_MPI
+)
+
+# A prefix harvest may finish a prefill chunk immediately before a one-row
+# decode suffix. Prove its real coordinator retirement boundary without devices.
+add_v2_test(V2_Integration_MoEOverlayRestoredPrefixDecodeLifecycle
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_inference_transaction>
+        --gtest_filter=Test__MoEOverlayInferenceTransaction.RestoredPrefixDecode*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Execution;MoE;PrefixCache;MTP;Regression"
+    MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30
 )
 
 # Hosted ordinary generation shares the production ExpertOverlay transaction
@@ -3756,6 +3770,48 @@ set_tests_properties(V2_Integration_GraphInstantiationDiagnostics PROPERTIES
     TIMEOUT 30
 )
 
+# QFN artifacts retain the original discovery population through selected-rank
+# success and failure, including selection order independent of execution rank.
+add_v2_test(V2_Integration_QFNDiscoveryArtifactOwnershipReplay
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=ModelKLDQFNContract.DiscoveryArtifactOwnershipAndTerminalOutcome
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;QFN;MPI;Ownership;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+add_v2_test(V2_Integration_QFNOriginalDiscoveryFailureRetirementReplay
+    COMMAND $<TARGET_FILE:v2_integration_rank_initialization_lifecycle_mpi>
+        --gtest_filter=ExecutionRankAdmissionMPI.QFNOriginalDiscoveryArtifactsAndFailureRetirement
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;QFN;MPI;Ownership;Lifecycle;Regression"
+    MPI_PROCS 2 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+foreach(_qfn_discovery_test IN ITEMS V2_Integration_QFNDiscoveryArtifactOwnershipReplay V2_Integration_QFNOriginalDiscoveryFailureRetirementReplay)
+    if(TEST ${_qfn_discovery_test})
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_qfn_discovery_test})
+    endif()
+endforeach()
+
+# Start before MPI_Init so the observer cannot hide incorrect original-owner
+# initialization behind the already-initialized MPI GTest entrypoint.
+add_v2_test(V2_Integration_QFNDiscoveryFreshFrontendReplay
+    COMMAND $<TARGET_FILE:v2_integration_frontend_startup_failure> --qfn-discovery-owner-proof
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;QFN;MPI;Ownership;Lifecycle;Regression"
+    MPI_PROCS 2 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+if(TEST V2_Integration_QFNDiscoveryFreshFrontendReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNDiscoveryFreshFrontendReplay)
+endif()
+
+# Setup-only physical decode capture must certify its own original family
+# replay without inventing an executed capture or borrowing another owner.
+add_test(NAME V2_Integration_HTTPMaterializedDecodeReplayEvidence
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_server_graph_capture_perf_policy.py
+        TestServerGraphCapturePerfPolicy.test_materialized_decode_family_satisfies_strict_replay_without_executed_capture)
+set_tests_properties(V2_Integration_HTTPMaterializedDecodeReplayEvidence PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;E2E;GraphCapture;PerfStats;Regression"
+    TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HTTPMaterializedDecodeReplayEvidence)
+
 # A native composed parent is one executable, not a heterogeneous host service.
 # Keep physical capture/launch ownership and the negative segmentation checks
 # in preflight so evidence regressions do not require loading a real model.
@@ -3851,6 +3907,7 @@ add_test(NAME V2_Integration_HTTPHybridMTPBackendEvidence
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_server_graph_capture_perf_policy.py
             TestServerGraphCapturePerfPolicy.test_hybrid_cuda_terminal_mtp_accepts_authenticated_boundary
+            TestServerGraphCapturePerfPolicy.test_hosted_mtp_scopes_cross_domain_sidecar_parent_join_to_original_owner
             TestServerGraphCapturePerfPolicy.test_hybrid_hosted_mtp_preserves_backend_depth_and_rank_contracts
             TestServerGraphCapturePerfPolicy.test_hybrid_hosted_mtp_rejects_borrowed_or_incomplete_evidence)
 set_tests_properties(V2_Integration_HTTPHybridMTPBackendEvidence PROPERTIES
@@ -3969,6 +4026,14 @@ add_test(NAME V2_Integration_OpenCodeCellRuntime
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_opencode_cell_runtime.py)
 set_tests_properties(V2_Integration_OpenCodeCellRuntime PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;HTTP;OpenCode;CI;Lifecycle;Regression;DeviceFree" TIMEOUT 30)
+
+add_test(NAME V2_Integration_OpenCodeFixedHeadCapacityAdmission
+    COMMAND ${Python3_EXECUTABLE} -m unittest
+        test_opencode_cell_runtime.ContainerOwnershipTests.test_fixed_head_capacity_requires_a_complete_positive_bom_deficit
+        test_opencode_cell_runtime.ContainerOwnershipTests.test_unknown_admission_never_becomes_a_smaller_context)
+set_tests_properties(V2_Integration_OpenCodeFixedHeadCapacityAdmission PROPERTIES
+    WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts"
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;OpenCode;CI;Regression;DeviceFree" TIMEOUT 30)
 
 # Graceful RAM-to-disk shutdown is unbounded; cancellation still retires every owner.
 add_test(NAME V2_Integration_OpenCodeShutdownFlush
@@ -4140,6 +4205,25 @@ add_test(NAME V2_Integration_OpenCodePromptTransport
 set_tests_properties(V2_Integration_OpenCodePromptTransport PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;HTTP;ToolCalling;OpenCode;Regression"
     TIMEOUT 30)
+# Replay exact phase admission across the pinned client's leading summaries.
+add_test(NAME V2_Integration_OpenCodePhasePromptCompaction
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_opencode_tool_stress.py
+        OpenCodeStressTests.test_phase_prompt_authenticates_first_coding_request_after_leading_compaction
+        OpenCodeStressTests.test_phase_compaction_cannot_hide_missing_changed_or_late_prompts
+        OpenCodeStressTests.test_phase_prompt_authenticates_actual_wire_and_rejects_cli_escaping)
+set_tests_properties(V2_Integration_OpenCodePhasePromptCompaction PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;ToolCalling;OpenCode;Regression;DeviceFree"
+    TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenCodePhasePromptCompaction)
+add_test(NAME V2_Integration_OpenCodeReplyReservePolicy
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_opencode_tool_stress.py
+        OpenCodeStressTests.test_reply_reserve_configures_actual_client_without_reducing_output_limit
+        OpenCodeStressTests.test_reply_reserve_rejects_invalid_policy_before_client_or_network
+        OpenCodeStressTests.test_reply_reserve_is_explicit_in_campaign_report)
+set_tests_properties(V2_Integration_OpenCodeReplyReservePolicy PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;ToolCalling;OpenCode;Regression;DeviceFree"
+    TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenCodeReplyReservePolicy)
 add_test(NAME V2_Integration_OpenCodeClientDeadlines
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_opencode_tool_stress.py
         OpenCodeStressTests.test_client_deadlines_are_disabled_without_hiding_operator_limits
@@ -4208,6 +4292,22 @@ add_test(NAME V2_Integration_OpenCodeCompactionContinuation
 set_tests_properties(V2_Integration_OpenCodeCompactionContinuation PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;HTTP;ToolCalling;OpenCode;Regression;DeviceFree"
     TIMEOUT 30)
+# Full-head compaction may replace IDs only through an authenticated summary bridge.
+add_test(NAME V2_Integration_OpenCodeCompactionToolSummaryBridge
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_opencode_tool_stress.py
+        OpenCodeStressTests.test_full_head_compaction_authenticates_exact_native_tool_summary_bridge
+        OpenCodeStressTests.test_full_head_compaction_preserves_utf16_truncation_boundary
+        OpenCodeStressTests.test_full_head_compaction_rejects_incomplete_or_mutated_bridge
+        OpenCodeStressTests.test_full_head_compaction_requires_multiplicity_for_identical_pending_calls
+        OpenCodeStressTests.test_full_head_compaction_requires_unbroken_consecutive_summary_chain
+        OpenCodeStressTests.test_compaction_bridge_compares_numeric_json_values_and_nested_key_order
+        OpenCodeStressTests.test_compaction_bridge_authenticates_attachments_errors_and_quoted_delimiters
+        OpenCodeStressTests.test_compaction_cannot_erase_or_mutate_pending_tool_evidence
+        OpenCodeStressTests.test_compacted_history_keeps_the_immediate_tool_join_authoritative)
+set_tests_properties(V2_Integration_OpenCodeCompactionToolSummaryBridge PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;HTTP;ToolCalling;OpenCode;Regression;DeviceFree"
+    TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenCodeCompactionToolSummaryBridge)
 add_test(NAME V2_Integration_OpenCodeBashWorkdirEvidence
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_opencode_tool_stress.py
         OpenCodeStressTests.test_bash_missing_workdir_requires_exact_authenticated_directory
@@ -4438,6 +4538,20 @@ add_v2_test(V2_Integration_QFNCPUJointMTPSourcePolicies
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNCPUJointMTPSourcePolicies)
+add_v2_test(V2_Integration_ModelKLDOneRankAuthoredRankfileContract
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_model_kld_corpus_execution.py
+        CorpusExecutionTests.test_authored_one_rank_preserves_existing_guardian_protocol_and_pins
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;MPI;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ModelKLDOneRankAuthoredRankfileContract)
+add_v2_test(V2_Integration_QFNLocalNUMAAllGPUTopologyContract
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+        --gtest_filter=Qwen4ExpSourceAdmissionCases.LocalNUMAAllGPUContinuationHasOneCompleteGPUSourceAuthority:Qwen4ExpSourceAdmissionCases.LocalNUMATP4AllGPUFull15AndRAMCacheServingProjection
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;Qwen4Exp;MTP;Ownership;Contract"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNLocalNUMAAllGPUTopologyContract)
 add_v2_test(V2_Integration_ParityDynamicMTPDeclaredCeiling
     COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
         --gtest_filter=Qwen4ExpSourceAdmissionCases.DeclaredDynamicCeilingMatchesFixtureRuntimeAndPublicArguments
@@ -5406,6 +5520,17 @@ set_tests_properties(V2_Integration_MTPBenchmarkPolicyEvidence PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;MTP;Benchmark;Regression"
     TIMEOUT 30
 )
+
+# Gate/up ownership prices each movable pair once; fixed down-column banks
+# must not turn its initial placement into replicated whole-expert evidence.
+add_test(NAME V2_Integration_BenchmarkGateUpInitialBankEvidenceReplay
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_pipeline.py
+        BenchmarkPolicyTests.test_declared_passive_gateup_initial_banks_preserve_exact_movable_ownership)
+set_tests_properties(V2_Integration_BenchmarkGateUpInitialBankEvidenceReplay PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Benchmark;Ownership;Regression"
+    TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_BenchmarkGateUpInitialBankEvidenceReplay)
 
 add_test(NAME V2_Unit_ProductionParityCampaigns
     COMMAND ${Python3_EXECUTABLE}
@@ -13211,7 +13336,7 @@ if(ZLIB_FOUND)
         TEST_PREFIX V2_Integration_Parity_Qwen4Exp_Production
         # Each new original ProcessRuntime source owns a fresh numerical process;
         # existing aggregate families and their IDs remain unchanged.
-        PRODUCTION_ISOLATED_TESTS "Qwen4ExpCPUJointWorld2FullStage/Qwen4ExpCPUJointFullStageTest.ProductionParity/;Qwen4ExpCPUJointWorld2DynamicFullStage/Qwen4ExpCPUJointFullStageTest.ProductionParity/;Qwen4ExpCPUJointWorld2MTPExact/Qwen4ExpMTPExactReplayTest.MTPExactReplay/"
+        PRODUCTION_ISOLATED_TESTS "Qwen4ExpLocalNUMATP4AllGPU/Qwen4ExpMainParityTest.ProductionParity/;Qwen4ExpLocalNUMATP4AllGPUExact/Qwen4ExpMTPExactReplayTest.MTPExactReplay/;Qwen4ExpCPUJointWorld2FullStage/Qwen4ExpCPUJointFullStageTest.ProductionParity/;Qwen4ExpCPUJointWorld2DynamicFullStage/Qwen4ExpCPUJointFullStageTest.ProductionParity/;Qwen4ExpCPUJointWorld2MTPExact/Qwen4ExpMTPExactReplayTest.MTPExactReplay/"
             "Qwen4ExpConsumerLocalTP4MovementOrdinalRetained15/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpConsumerLocalTP4MovementRandomRetained15/Qwen4ExpMainParityTest.ProductionParity/"
             "Qwen4ExpConsumerLocalTP4StaticRetained15/Qwen4ExpMainParityTest.ProductionParity/"
@@ -13231,6 +13356,7 @@ if(ZLIB_FOUND)
             "Qwen4ExpCrossRankPipelineOrdinary/Qwen4ExpOrdinaryGenerationTest.NativeGeneration/"
             "Qwen4ExpCrossRankPipelineMTPExact/Qwen4ExpMTPExactReplayTest.MTPExactReplay/"
             "Qwen4ExpObservedMI50FixedVRAMFullStage/Qwen4ExpObservedPipelineMainParityTest.ProductionParity/"
+            "Qwen4ExpObservedMI50GateUpFixedVRAMFullStage/Qwen4ExpObservedPipelineMainParityTest.ProductionParity/"
         # Use the existing paired-source setup budget. Full original-source
         # preparation is bounded independently of numerical focused tests;
         # missing execution/collective evidence never extends this deadline.
@@ -14334,6 +14460,12 @@ add_v2_test(V2_Integration_AutomaticDeviceCountPolicy
     TIMEOUT 30
     NO_MODELS
 )
+add_v2_test(V2_Integration_AutomaticPipelineStageWidthPolicy
+    COMMAND $<TARGET_FILE:v2_test_orchestration_plan_config>
+        --gtest_filter=OrchestrationPlanningPolicy.PipelineStageWidths*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Config;Planning;Pipeline;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_AutomaticPipelineStageWidthPolicy)
 add_v2_test(V2_Integration_AutomaticLocalMpiDiscovery
     COMMAND $<TARGET_FILE:v2_test_orchestration_plan_config>
         --gtest_filter=OrchestrationPlanConfig.AutomaticLocalMpiWorldRetainsSocketDiscovery
@@ -15953,6 +16085,12 @@ add_v2_test(V2_Integration_AutomaticMixedVendorOverlayRankBoundary
         --gtest_filter=AutomaticOrchestrationCandidates.ExactDeviceCountsMixedVendorOverlayRequiresRealRankBoundary
     LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;CUDA;ROCm;MPI;GraphCapture;Regression"
     MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
+add_v2_test(V2_Integration_AutomaticMoEPipelineCandidates
+    COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+        --gtest_filter=AutomaticOrchestrationCandidates.DefaultMoESearchIncludesStageOwnedPipelineCandidates:AutomaticOrchestrationCandidates.PipelineWidths*:AutomaticOrchestrationCandidates.RoutedPipelineWidthsRetainGateUpStorageAndDynamicMTP:AutomaticOrchestrationCandidates.PipelineWidthInfeasibilityNeverPublishesAnotherTopology:AutomaticOrchestrationCandidates.CardinalPipelineLayerCountsCoverOddAndUnequalStages:AutomaticOrchestrationCandidates.PipelinesKeepCardinalContiguousLayersInBothDirections
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Pipeline;MoE;MTP;Ownership;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_AutomaticMoEPipelineCandidates)
 add_v2_test(V2_Integration_AutomaticMultiTierOverlayCandidates
     COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
         --gtest_filter=AutomaticOrchestrationCandidates.MultiTierOverlay*
@@ -17152,6 +17290,12 @@ add_v2_test(V2_Integration_ServerExecutionIdentity
     NO_MODELS
     TIMEOUT 30
 )
+add_v2_test(V2_Integration_ServerObservedGPUFabricContract
+    COMMAND $<TARGET_FILE:v2_test_server_mode>
+        --gtest_filter=ServerExecutionEvidence.GPUAncestryAndPeersRetainObservedIdentityForAnyDomainWidth
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Server;Planning;P2P;Topology;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServerObservedGPUFabricContract)
 
 # Completion and single-shot chat modes: MPI root/worker oneshot orchestration
 add_executable(v2_test_completion_single_shot_modes unit/app/modes/Test__CompletionAndSingleShotModes.cpp)
@@ -23824,6 +23968,7 @@ add_executable(v2_integration_planning_mpi_transfers
     integration/planning/Test__PlanningExpertSampleMPI.cpp
     integration/planning/Test__PlanningKernelServiceCatalogMPI.cpp
     integration/planning/Test__PlanningMemoryBandwidthMeasurement.cpp
+    integration/planning/Test__PlanningLocalTPMeasurement.cpp
     integration/execution/runner/MoEPipelinePreparationMain.cpp)
 v2_test_device_scope(v2_integration_planning_mpi_transfers FullInventory)
 target_link_libraries(v2_integration_planning_mpi_transfers llaminar2_core GTest::gtest MPI::MPI_CXX)
@@ -23862,7 +24007,8 @@ foreach(planning_sample_backend IN ITEMS CUDA ROCm)
         # coverage even though each completed transaction remained bounded.
         foreach(planning_service_contract IN ITEMS
             HostDeviceSameRankRolesWithIdlePeer CommunicationService
-            StreamingCollection SourceFreeStreaming SourceFreeArithmetic
+            StreamingCollection SourceFreeStreaming SourceFreeArithmetic PreparedArithmeticPhaseLifecycle
+            PreparedSourceCollectionReplay
             CompleteSourceAndExecutionEvidence BoundedRequestCostPreparation)
             set(planning_service_test V2_Integration_PlanningMPIService_${planning_sample_backend}_${planning_service_contract})
             add_v2_test(${planning_service_test}
@@ -23995,7 +24141,6 @@ endif()
 add_executable(v2_integration_planning_execution_measurement
     integration/planning/Test__PlanningExecutionMeasurement.cpp
     integration/planning/Test__PlanningProjectionMeasurement.cpp
-    integration/planning/Test__PlanningLocalTPMeasurement.cpp
     integration/planning/Test__PlanningCPUExpertMeasurement.cpp
     integration/planning/Test__PlanningGPUExpertMeasurement.cpp)
 target_link_libraries(v2_integration_planning_execution_measurement
@@ -24048,7 +24193,18 @@ foreach(measurement_backend IN ITEMS CPU CUDA ROCm)
         LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
         MPI_PROCS ${streaming_measurement_ranks} TIMEOUT 60 NO_MODELS)
     if(NOT measurement_backend STREQUAL "CPU")
+        add_v2_test(V2_Integration_PlanningPreparedClockInvocationReplay_${measurement_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_execution_measurement>
+                --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_PreparedClockInvocationReplay
+            LABELS "V2;Integration;Planning;${measurement_backend};Replay;Regression;ProductionTestPreflight"
+            MPI_PROCS 1 TIMEOUT 60 NO_MODELS)
         string(TOLOWER "${measurement_backend}" _planning_host_family)
+        add_v2_test(V2_Integration_PlanningHostDeviceCapturedClockReplay_${measurement_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+                --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=1
+                --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_HostDeviceCapturedClockReplay
+            LABELS "V2;Integration;Planning;${measurement_backend};Replay;Regression;ProductionTestPreflight"
+            MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
         add_v2_test(V2_Integration_PlanningHostDeviceService_${measurement_backend}
             COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
                 --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=1
@@ -24056,10 +24212,58 @@ foreach(measurement_backend IN ITEMS CPU CUDA ROCm)
             LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
             MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
         add_v2_test(V2_Integration_PlanningNativeLocalTP_${measurement_backend}
-            COMMAND $<TARGET_FILE:v2_integration_planning_execution_measurement>
+            COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+                --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
                 --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_NativeLocalTP
             LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
-            MPI_PROCS 1 TIMEOUT 60 NO_MODELS)
+            MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
+        add_v2_test(V2_Integration_PlanningDirectedPairMatrixReplay_${measurement_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+                --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
+                --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_DirectedPairMatrixReplay
+            LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
+            MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningDirectedPairMatrixReplay_${measurement_backend})
+        add_v2_test(V2_Integration_PlanningNativeGatherCapturedClockReplay_${measurement_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+                --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
+                --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_NativeGatherCapturedClockReplay
+            LABELS "V2;Integration;Planning;${measurement_backend};Replay;Regression;ProductionTestPreflight"
+            MPI_PROCS 1 NO_MPI TIMEOUT 120 NO_MODELS)
+        add_v2_test(V2_Integration_PlanningNativeCollectiveCapturedClockReplay_${measurement_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+                --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
+                --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_NativeCollectiveCapturedClockReplay
+            LABELS "V2;Integration;Planning;${measurement_backend};Replay;Regression;ProductionTestPreflight"
+            MPI_PROCS 1 NO_MPI TIMEOUT 120 NO_MODELS)
+        add_v2_test(V2_Integration_PlanningPhysicalPeerOnlyReplay_${measurement_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+                --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
+                --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_PhysicalPeerOnlyReplay
+            LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight;Economy"
+            MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningPhysicalPeerOnlyReplay_${measurement_backend})
+        add_v2_test(V2_Integration_PlanningPreparedDevicePeerCopy_${measurement_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+                --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
+                --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_PreparedDevicePeerCopyContract
+            LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
+            MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningPreparedDevicePeerCopy_${measurement_backend})
+        # Explicit, short startup timing diagnostic. Correctness replay above
+        # owns preflight; timing has no machine-dependent pass/fail threshold.
+        add_v2_test(V2_Performance_PlanningInterconnectStartup_${measurement_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+                --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
+                --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_DirectedPairStartupSample
+            LABELS "V2;Performance;Planning;${measurement_backend}"
+            MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
+        add_v2_test(V2_Performance_PlanningPhysicalPeerOnlyStartup_${measurement_backend}
+            COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+                --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
+                --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_PhysicalPeerOnlyStartupSample
+            LABELS "V2;Performance;Planning;${measurement_backend}"
+            MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
         add_v2_test(V2_Integration_GPUPreparedWeightBinding_${measurement_backend}
             COMMAND $<TARGET_FILE:v2_integration_planning_execution_measurement>
                 --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_CoalescedPool
@@ -24865,6 +25069,11 @@ if(HAVE_ROCM)
             --gtest_filter=Test__HIPGraphCapture.DependencyReductionPreservesCapturedForkJoin
         LABELS "V2;Integration;ProductionTestPreflight;Backends;GraphCapture;ROCm;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_HIPCaptureStreamReentryReplay
+        COMMAND $<TARGET_FILE:v2_integration_hip_graph_capture>
+            --gtest_filter=Test__HIPGraphCapture.StreamMembershipCycleRetiresAcyclicCapture
+        LABELS "V2;Integration;ProductionTestPreflight;Backends;GraphCapture;ROCm;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
     add_v2_test(V2_Integration_PipelineVerifierAdmissionStream_ROCm
         COMMAND $<TARGET_FILE:v2_integration_hip_graph_capture>
             --gtest_filter=Test__HIPGraphCapture.PipelineVerifierWaitsForAdmissionOnExecutionStream
@@ -25084,6 +25293,11 @@ if(HAVE_CUDA)
         COMMAND $<TARGET_FILE:v2_integration_cuda_graph_capture>
             --gtest_filter=Test__CUDAGraphCapture.DependencyReductionPreservesCapturedForkJoin
         LABELS "V2;Integration;ProductionTestPreflight;Backends;GraphCapture;CUDA;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_CUDACaptureStreamReentryReplay
+        COMMAND $<TARGET_FILE:v2_integration_cuda_graph_capture>
+            --gtest_filter=Test__CUDAGraphCapture.StreamMembershipCycleRetiresAcyclicCapture
+        LABELS "V2;Integration;ProductionTestPreflight;Backends;GraphCapture;CUDA;Lifecycle;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 30)
     add_v2_test(V2_Integration_PipelineVerifierAdmissionStream_CUDA
         COMMAND $<TARGET_FILE:v2_integration_cuda_graph_capture>
@@ -25537,6 +25751,22 @@ foreach(_cached_backend CUDA ROCm)
             MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
             ENVIRONMENT "LLAMINAR_VALIDATE_BUFFERS=0;LLAMINAR_VALIDATE_INPUTS=0;LLAMINAR_FAIL_ON_ZERO=0")
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${_cached_backend}OriginalRetainedExecutorTicketOwnership)
+        add_v2_test(V2_Integration_${_cached_backend}MoEMaintenanceObservationNativeReplay
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py
+                $<TARGET_FILE:${_cached_target}>
+                --gtest_filter=CachedGraphReplayExecutionTest.MoEMaintenanceObservationNativeReplay
+            LABELS "V2;Integration;ProductionTestPreflight;${_cached_backend};Execution;GraphCapture;MoE;Replay;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+            ENVIRONMENT "LLAMINAR_VALIDATE_BUFFERS=0;LLAMINAR_VALIDATE_INPUTS=0;LLAMINAR_FAIL_ON_ZERO=0")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${_cached_backend}MoEMaintenanceObservationNativeReplay)
+        add_v2_test(V2_Integration_${_cached_backend}RetainedParentMaterializationBoundaryReplay
+            COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py
+                $<TARGET_FILE:${_cached_target}>
+                --gtest_filter=CachedGraphReplayExecutionTest.RetainedParentMaterializationPublishesDeviceBoundaryAcrossReset
+            LABELS "V2;Integration;ProductionTestPreflight;${_cached_backend};Execution;GraphCapture;DeviceResident;Replay;Regression"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+            ENVIRONMENT "LLAMINAR_VALIDATE_BUFFERS=0;LLAMINAR_VALIDATE_INPUTS=0;LLAMINAR_FAIL_ON_ZERO=0")
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${_cached_backend}RetainedParentMaterializationBoundaryReplay)
     endif()
 endforeach()
 if(HAVE_CUDA)
@@ -27602,7 +27832,10 @@ add_v2_test(V2_Integration_CompactExpertContinuationWorkspace
 add_executable(v2_test_memory_planner
     unit/planning/Test__MemoryPlanner.cpp
     unit/planning/Test__OrchestrationCandidateAdmission.cpp
+    unit/planning/Test__PlanningAdmissionPreparation.cpp
+    unit/planning/Test__PlanningMemoryQuoteReuse.cpp
     unit/planning/Test__PlanningForwardWeightWork.cpp
+    unit/planning/Test__PlanningImmutableLookupWork.cpp
     unit/planning/Test__PlanningForwardStateWork.cpp
     unit/planning/Test__AutomaticOrchestrationPlanner.cpp
     unit/planning/Test__OrchestrationPerformanceEvidence.cpp
@@ -27610,6 +27843,11 @@ add_executable(v2_test_memory_planner
     unit/planning/Test__PlanningMemoryBandwidthMeasurement.cpp
     unit/planning/Test__PlanningHostDeviceMeasurement.cpp
     unit/planning/Test__PlanningLocalTPMeasurement.cpp
+    unit/planning/Test__PlanningInterconnectCostMatrix.cpp
+    unit/planning/Test__PlanningPeerCopyAccess.cpp
+    unit/planning/Test__PlanningCommunicationCost.cpp
+    unit/planning/Test__PlanningPCIeCommunicationCost.cpp
+    unit/planning/Test__PlanningNativeContextEvidence.cpp
     unit/planning/Test__PlanningMPITransferMeasurement.cpp
     unit/planning/Test__PlanningKernelServiceCatalog.cpp
     unit/planning/Test__PlanningModelSample.cpp
@@ -27681,6 +27919,76 @@ add_v2_test(V2_Integration_DisabledMTPGGUFAdmission
         --gtest_filter=PlanningForwardWeightWork.DisabledMTPGGUFAdmissionAllFormatsBackendsAndTopologies
     LABELS "V2;Integration;ProductionTestPreflight;MTP;Weights;Admission;Planning;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+# Replay the real QFN extension roles that previously failed request-cost admission.
+add_v2_test(V2_Integration_PlanningInterconnectMatrixReplay
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningInterconnectCostMatrix.*:PlanningPeerCopyAccess.*:PlanningCommunicationCost.PhysicalPeerDirectionAndHostCompositionRemainDistinct:PlanningCommunicationCost.EmptyPhysicalPeerMaskRequiresMeasuredHostService:PlanningLocalTPMeasurement.DirectedPairMatrixCoverageAndReplayAreExact:PlanningLocalTPMeasurement.DirectedPairPayloadRegionsAreDisjointAndPMAAdmitted:PlanningCommunicationService.DirectedPairWire*:PlanningCommunicationService.PhysicalOnly*:PlanningCommunicationCost.CommonNativePairBasisSeparatesPlacementFromCollectiveTiming:PlanningCommunicationCost.NativePairPacketizationRetainsExactLiveTailWithoutExtrapolatedRate:PlanningCommunicationCost.NativePairEvidenceCannotAliasAnotherDiscoveryRankOrTransport:PlanningCommunicationCost.PairMatricesAreBoundOnceAcrossPrecisionsAndRejectSubstitution:PlanningCommunicationCost.OriginalRankMatricesRetainSameNUMAAliasesAndContainedOwnerGroups:PlanningRequestCostModel.TPRequiresNativeEvidenceAndPricesTheTypedDecodePolicy:PlanningRequestCostModel.MeasuredPairsOverrideSwitchPreferenceAcrossWorkloads:PlanningRequestCostModel.MappedOverlayDoesNotSubstituteNativePeerMeasurements:PlanningExecutionMeasurement.RetainedPairClockFamily*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Communication;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningInterconnectMatrixReplay)
+add_v2_test(V2_Integration_PlanningNativeCommunicationComposition
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningCommunicationCost.CalibratedAllreduce*:PlanningCommunicationCost.NativeGather*:PlanningRequestCostModel.PipelineResidualTrunkPayloadIsIndependentOfComputeWidth:PlanningRequestCostModel.ProjectionPolicyRequiresActualFabricAndColumnPublication
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Communication;Regression;Economy"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningNativeCommunicationComposition)
+add_v2_test(V2_Integration_PlanningPCIeCutBounds
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningPCIeCommunicationCost.*:PlanningLocalTPMeasurement.ExactPayloadsAndCanonicalCollectiveBOMOnBothVendors
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Communication;Regression;Economy"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningPCIeCutBounds)
+add_v2_test(V2_Integration_PlanningSameClassComputeMedian
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningRequestCostModel.SameClassMedianComputeKeepsMeasuredFastestGroup:PlanningRequestCostModel.SameClassMedianComputeSupportsArbitraryCohortSizes:PlanningRequestCostModel.SameClassMedianComputePreservesHardwareDistinctions:PlanningRequestCostModel.SameClassMedianComputeResolvesOriginalObserverAliases:PlanningWeightServiceModel.GDNHalfOperandsKeepSeparateServiceFamilies
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Regression;Economy"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningSameClassComputeMedian)
+add_v2_test(V2_Integration_PlanningSourceClassification
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningForwardWeightWork.RetainedClassificationIsSourceBoundAndIndexesOwnedLayers:PlanningForwardWeightWork.PreclassifiedGeometryMatchesCanonicalResolverAndRejectsForeignViews:PlanningForwardWeightWork.RetainedSourceWorkspaceAndWeightQuotesMatchCanonicalBytes:PlanningForwardWeightWork.RetainedSourceWeightQuotesIncludeAppendedSidecarLayers
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Weights;Economy;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningSourceClassification)
+add_v2_test(V2_Integration_PlanningAdmissionPreparation
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningAdmissionPreparation.*:PlanningMemoryQuoteReuse.*:AutomaticOrchestrationPlanner.PreparedAdmissionMatchesExhaustiveOracleAndFreshCapacity:AutomaticOrchestrationPlanner.ParallelAdmissionPreservesSerialSelectionAndCallbackOrder:AutomaticOrchestrationPlanner.ParallelAdmissionRetiresAfterCapacityAndCallbackFailures
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Admission;Economy;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningAdmissionPreparation)
+add_v2_test(V2_Integration_PlanningWorkspacePolicySnapshot
+    COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
+        --gtest_filter=Test__WorkspaceMemoryEstimator.FrozenPlanningPolicyDoesNotFollowLaterGlobalMutation:Test__WorkspaceMemoryEstimator.HalfAlphaBetaAdmitsOnlyScopedOperandWorkspace:Qwen4ExpGDNQKVWorkspace.OwnedIntervalsRepresentationAndExactFitRemainCanonical
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Workspace;Policy;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningWorkspacePolicySnapshot)
+add_v2_test(V2_Integration_MoEMandatoryQuotaBulkAdmission
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_capacity_resolver>
+        --gtest_filter=MoEOverlayCapacityResolver.Bulk*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MoE;Admission;Economy;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEMandatoryQuotaBulkAdmission)
+add_v2_test(V2_Integration_PlanningNativeContextBudgetReplay
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningNativeContextEvidence.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Admission;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningNativeContextBudgetReplay)
+add_v2_test(V2_Integration_QFNImmutableLookupWorkReplay
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningImmutableLookupWork.*:PlanningWeightServiceModel.ImmutableHostSourceStreamingDoesNotAdmitCPUCompute
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;QFN;ImmutableLookup;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNImmutableLookupWorkReplay)
+add_v2_test(V2_Integration_QFNPlanningExtensionWorkReplay
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=PlanningForwardWeightWork.QFNExtensionRolesPreserveGeometryRowsAndTerminalStage:PlanningRequestCostModel.QFNHyperconnectionWorkIsPricedAndReplayStable
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;QFN;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNPlanningExtensionWorkReplay)
 add_v2_test(V2_Integration_AutomaticMoEProjectionWorkCost
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=PlanningForwardWeightWork.ProjectionOwnershipCompilesBothPhasesAllFormats:PlanningWeightServiceModel.ProjectionWorkChargesDownAtZeroOwnersAllNativeFormats:PlanningRequestCostModel.ProjectionPolicyRequiresActualFabricAndColumnPublication:PlanningCommunicationService.ProjectionOnlyTPSamplesItsActualHostScopes
@@ -27739,6 +28047,7 @@ endforeach()
 foreach(_source_case
         OriginalSourceReachesParentAllStagesAndFinalPMAOnce
         DiscoveryStaysSourceFreeAndCannotEraseServingSource
+        RetainedGraphInventoryMatchesSourceFreeAndOriginalApply
         PartialOriginalPreparationRejectsBeforePlanningAndRetiresEveryAttempt)
     add_v2_test(V2_Integration_MoEPipelineOriginalNativePreparation_${_source_case}
         COMMAND $<TARGET_FILE:v2_test_memory_planner>
@@ -27911,15 +28220,17 @@ add_v2_test(V2_Integration_NativeExecutionContextMemoryAdmission
     MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
 if(HAVE_CUDA)
     add_v2_test(V2_Integration_CUDA_NativeLocalTPContextStorageLifetime
-        COMMAND $<TARGET_FILE:v2_integration_planning_execution_measurement>
+        COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+            --pipeline-native-family=cuda --pipeline-native-degree=2
             --gtest_filter=PlanningExecutionMeasurementIntegration.CUDA_NativeLocalTPContextStorageLifetime
         LABELS "V2;Integration;ProductionTestPreflight;Planning;CUDA;NCCL;GraphCapture;PhysicalMemoryAuthority;Lifecycle;Regression"
-        MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
+        MPI_PROCS 1 NO_MPI TIMEOUT 30 NO_MODELS)
     add_v2_test(V2_Integration_CUDA_NativeLocalTPContextStoragePrefillBucket
-        COMMAND $<TARGET_FILE:v2_integration_planning_execution_measurement>
+        COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
+            --pipeline-native-family=cuda --pipeline-native-degree=2
             --gtest_filter=PlanningExecutionMeasurementIntegration.CUDA_NativeLocalTPContextStoragePrefillBucket
         LABELS "V2;Integration;ProductionTestPreflight;Planning;CUDA;NCCL;GraphCapture;PhysicalMemoryAuthority;Lifecycle;Regression"
-        MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
+        MPI_PROCS 1 NO_MPI TIMEOUT 30 NO_MODELS)
 endif()
 
 # Test: ClusterInventoryGatherer — pure projection from observed hardware fixtures.
@@ -29056,6 +29367,7 @@ add_v2_test(V2_Integration_GDNStateLayoutCliqueIdentity
 )
 
 set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_DistributedResidencySummaryIdentityLifecycle
     ${V2_ORIGINAL_EXPERT_PEER_PREFLIGHT_TESTS}
     ${V2_SHARED_RANK_BANK_PREFLIGHT_TESTS}
     V2_Integration_ParityDiagnosticCaptureKeys
@@ -29108,6 +29420,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_PrefixSparseCheckpointTierReuse
     V2_Integration_HTTPDriverLogContinuity
     V2_Integration_OpenCodeContextAdmission
+    V2_Integration_OpenCodeFixedHeadCapacityAdmission
     V2_Integration_OpenCodeShutdownFlush
     V2_Integration_ServerResourcePhysicalIdentity
     V2_Integration_PrefixSharedArchiveEviction
@@ -29374,6 +29687,7 @@ if(HAVE_CUDA)
     V2_Integration_CUDA_MoEOverlayEpoch
     V2_Integration_CUDAEventSynchronization
     V2_Integration_CUDAGraphCapture
+    V2_Integration_CUDACaptureStreamReentryReplay
     V2_Integration_CUDADriverAbsent_CPUStartup
     V2_Integration_CUDADriverApi
     V2_Integration_NCCLDeviceScope
@@ -29511,6 +29825,7 @@ if(HAVE_ROCM)
     V2_Integration_DeviceGenerationController_ROCm
     V2_Integration_OrdinaryExpertOverlayHostedMaintenance_ROCm
     V2_Integration_HIPGraphCapture
+    V2_Integration_HIPCaptureStreamReentryReplay
     V2_Integration_HIPMultiStreamGraphReplayLifetime
     V2_Integration_MTPVerifierPreparation_ROCm
     V2_Integration_MTPExactHostedVerifierFamily_ROCm
@@ -31489,6 +31804,14 @@ add_v2_test(V2_Integration_SnapshotPhasePayloadProjection
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Parity;Snapshots;PhysicalMemoryAuthority;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
+# One checked observation scope owns capture, comparison and the exact snapshot BOM.
+add_v2_test(V2_Integration_ParityObservationShardSnapshotBOM
+    COMMAND $<TARGET_FILE:v2_test_parity_snapshot_memory_capacity>
+        --gtest_filter=ParitySnapshotMemoryCapacity.ObservationShardCapacityMatchesExactCaptureKeys
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Parity;Snapshots;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ParityObservationShardSnapshotBOM)
 # Snapshot admission covers the effective serving family on every participant,
 # including CPU-first pipelines whose later stages retain GPU graphs.
 add_v2_test(V2_Integration_ParitySnapshotServingBucketEnvelope
@@ -32885,6 +33208,17 @@ add_v2_test(V2_Integration_TransferCapturedStorageReplay
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_TransferCapturedStorageReplay)
+
+# Cold transport metadata publishes only a bounded admitted region and drains
+# its source-owning setup event before returning; no execution wait is admitted.
+add_v2_test(V2_Integration_TransferColdDeviceMetadataReplay
+    COMMAND $<TARGET_FILE:v2_test_transfer_engine>
+        --gtest_filter=TransferColdDeviceMetadata.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Transfer;Ownership;ColdSetup;Replay;Regression"
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_TransferColdDeviceMetadataReplay)
+
 
 # Both prerequisite native families reuse their existing actual MPI-aware target.
 foreach(QFN_FIXED_GATHER_BACKEND IN ITEMS CUDA ROCm)
@@ -34905,6 +35239,13 @@ if(TARGET v2_test_model_parity_definition)
         LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Qwen4Exp;Parity;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    add_v2_test(V2_Integration_FrozenHistoryObservationShardContract
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=FrozenParityHistoryReplay.ObservationShardUsesOneExactCaptureAndComparisonAuthority:FrozenParityHistoryReplay.ObservationShardRejectsIncompatibleOrUnqualifiedCoverage:FrozenParityHistoryReplay.ObservationShardPresenceAndAuxiliaryTerminalsKeepOriginalScope
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Parity;Snapshots;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "OMP_NUM_THREADS=1;OMP_DYNAMIC=false;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_FrozenHistoryObservationShardContract)
     target_link_libraries(v2_test_model_parity_definition GTest::gmock)
     add_v2_test(V2_Integration_NativeExactFixtureOwnerReplay
         COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
@@ -35356,7 +35697,7 @@ if(NOT V2_PERF_TESTS_ONLY)
 # Definitions belong before inventory's selection-only span.
 add_v2_test(V2_Integration_PerfStatsBoundCounterIdentity
     COMMAND $<TARGET_FILE:v2_test_perf_stats_collector>
-        --gtest_filter=PerfStatsCollector.BoundCounterIdentityUsesCurrentEpochAndCollectionPolicy:PerfStatsCollector.OrdinaryCounterBatchesPreserveMultiplicityAndEpoch:Test__PerfStatsCollector.RecordFamilyGateAvoidsSiblingDiagnostics
+        --gtest_filter=PerfStatsCollector.BoundCounterIdentityUsesCurrentEpochAndCollectionPolicy:PerfStatsCollector.OrdinaryCounterBatchesPreserveMultiplicityAndEpoch:Test__PerfStatsCollector.RecordFamilyGateAvoidsSiblingDiagnostics:Test__PerfStatsCollector.QualifiedFamilyAdmissionKeepsRetainedMapBounded:Test__PerfStatsCollector.BoundFamilyAdmissionUsesReloadedPolicyWithoutHiddenRecords
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;PerfStats;Regression"
     MPI_PROCS 1 NO_MODELS NO_MPI TIMEOUT 30)
 # Append only after the main V2_PRODUCTION_TEST_PREFLIGHT_TESTS set.
@@ -40691,6 +41032,86 @@ endif()
 # GPU execution and same-machine host first touch are distinct original roles.
 # Register after the canonical inventory reset; labels alone do not select preflight.
 if(TARGET v2_test_memory_planner)
+    add_v2_test(V2_Integration_PlanningStartupExpertPhaseCoverage
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=PlanningWeightServiceModel.StartupExpertTwoPhaseCoverageRejectsObsoleteGroupedEvidence:PlanningWeightServiceModel.StartupExpertWorkspaceKeepsLiveVerifierContractSeparate
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MoE;MTP;Economy;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningStartupExpertPhaseCoverage)
+    add_v2_test(V2_Integration_PlanningProjectionSharedSourceAccounting
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=PlanningKernelServiceCatalog.ProjectionSharedSourceBOMIsSingleAndSeparateFromGPUPrivate
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;PhysicalMemoryAuthority;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningProjectionSharedSourceAccounting)
+    add_v2_test(V2_Integration_PlanningPreparedGPUObservationReplay
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=PlanningExecutionMeasurement.PreparedGPUObservationWarmupAndIsolationReplay:PlanningExecutionMeasurement.PreparedGPUObservationRejectsForeignMovedAndConsumed:PlanningExecutionMeasurement.PreparedGPUObservationRetiresOnPreparationAndTimingFailure:PlanningExecutionMeasurement.PreparedGPUPreparationJoinsAllOnFailure
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Replay;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningPreparedGPUObservationReplay)
+    add_v2_test(V2_Integration_PlanningPreparedGPUClockBatchReplay
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=PlanningExecutionMeasurement.PreparedGPUClockBatchExcludesHostGapsAndPreservesThreeBodies:PlanningExecutionMeasurement.PreparedGPUObservationWarmupAndIsolationReplay:PlanningExecutionMeasurement.PreparedGPUObservationRejectsForeignMovedAndConsumed:PlanningExecutionMeasurement.PreparedGPUObservationRetiresOnPreparationAndTimingFailure:PlanningExecutionMeasurement.PreparedGPUPreparationJoinsAllOnFailure
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Replay;Lifecycle;Economy;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningPreparedGPUClockBatchReplay)
+    add_v2_test(V2_Integration_PlanningPublishedGPUClockReplay
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=PlanningExecutionMeasurement.PublishedHostInputsChangeOnlyBetweenRetiredInvocations:PlanningExecutionMeasurement.PublishedObservationPropagatesNativeAndPublicationFailuresWithoutRetry
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Replay;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningPublishedGPUClockReplay)
+    add_v2_test(V2_Integration_PlanningHostDeviceCapturedClockContract
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=PlanningHostDeviceMeasurement.PageGeometryAndPMAUseTheAllocationAuthority:PlanningHostDeviceMeasurement.ByteProofReplaysOncePerOriginalInboundCoordinate:PlanningHostDeviceMeasurement.ByteProofRejectsInvalidOwnerStreamGraphAndEvents
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Replay;PhysicalMemoryAuthority;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningHostDeviceCapturedClockContract)
+    foreach(host_clock_backend IN ITEMS CUDA ROCm)
+        if(TEST V2_Integration_PlanningHostDeviceCapturedClockReplay_${host_clock_backend})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_PlanningHostDeviceCapturedClockReplay_${host_clock_backend})
+        endif()
+    endforeach()
+    add_v2_test(V2_Integration_PlanningNativeGatherContract
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=PlanningCommunicationService.NativeGatherWireRequiresBothProtocolsAndOriginalParticipants:PlanningLocalTPMeasurement.NativeGatherLatencyKeepsWholeGroupAndRejectsIncompleteEvidence:PlanningCommunicationCost.NativeGather*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Communication;Replay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningNativeGatherContract)
+    foreach(broadcast_backend IN ITEMS CUDA ROCm)
+        if(TEST V2_Integration_PlanningNativeGatherCapturedClockReplay_${broadcast_backend})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_PlanningNativeGatherCapturedClockReplay_${broadcast_backend})
+        endif()
+    endforeach()
+    foreach(native_clock_backend IN ITEMS CUDA ROCm)
+        if(TEST V2_Integration_PlanningNativeCollectiveCapturedClockReplay_${native_clock_backend})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_PlanningNativeCollectiveCapturedClockReplay_${native_clock_backend})
+        endif()
+    endforeach()
+    foreach(clock_backend IN ITEMS CUDA ROCm)
+        if(TEST V2_Integration_PlanningPreparedClockInvocationReplay_${clock_backend})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+                V2_Integration_PlanningPreparedClockInvocationReplay_${clock_backend})
+        endif()
+    endforeach()
+    add_v2_test(V2_Integration_PlanningHostDeviceByteProof
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=PlanningHostDeviceMeasurement.ByteProofReplaysOncePerOriginalInboundCoordinate:PlanningHostDeviceMeasurement.ByteProofRejectsInvalidOwnerStreamGraphAndEvents
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Replay;Economy;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningHostDeviceByteProof)
     add_v2_test(V2_Integration_PlanningGPUExecutorHostFirstTouchRoles
         COMMAND $<TARGET_FILE:v2_test_memory_planner>
             --gtest_filter=PlanningHostDeviceMeasurement.*:PlanningCommunicationService.ProjectionOnlyTPSamplesItsActualHostScopes:PlanningCommunicationService.MalformedHostDeviceReceiptsCannotEscapeTheSharedCollectionGate:PlanningCommunicationCost.HostPrimitivesRetainFirstTouchScopeDirectionAndMechanismAcrossGPUAliases
@@ -41054,9 +41475,16 @@ if(NOT V2_PERF_TESTS_ONLY)
             QFNSourceAdmissionCI.test_observed_pipeline_original_active_inactive_retirement
         LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Pipeline;SourceAdmission;Ownership;Replay;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    add_v2_test(V2_Integration_QFNObservedGateUpPipelinePolicyContract
+        COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
+            --gtest_filter=ModelParityDefinition.ObservedQFNGateUpFull15PreservesStaticSourceAndDeferredExport:ModelParityDefinition.ObservedQFNGateUpPolicyBindsOriginalNUMAWithoutEightDeviceEnginePath
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Pipeline;ExpertOverlay;NUMA;Ownership;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_ObservedParityPipelineBindingReplay
-        V2_Integration_QFNObservedPipelineSourceReceiptReplay)
+        V2_Integration_QFNObservedPipelineSourceReceiptReplay
+        V2_Integration_QFNObservedGateUpPipelinePolicyContract)
 endif()
 
 # Original-rank source-only query plus native storage-union component replay.
@@ -41774,4 +42202,78 @@ if(NOT V2_PERF_TESTS_ONLY)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_AutomaticPlanningDiagnostics_CompleteSelection)
+endif()
+
+# Native capture retirement must survive cyclic auxiliary-stream membership
+# without changing the acyclic operation DAG. Installed runners authenticate
+# the actual dependency-body regression without loading a GPU or compiler.
+if(HAVE_ROCM AND V2_HIP_ARGUMENT_OWNER_SELECTED)
+    add_test(NAME V2_Integration_HIPCaptureRetirementMembership
+        COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_hip_runtime_binding.py
+            --capture-retirement-contract
+            --source-root ${CMAKE_CURRENT_SOURCE_DIR}/../..
+            --binary $<TARGET_FILE:llaminar2>
+            --binary $<TARGET_FILE:v2_integration_hip_graph_argument_geometry>)
+    set_tests_properties(V2_Integration_HIPCaptureRetirementMembership PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;HIP;GraphCapture;Lifecycle;Replay;Regression"
+        TIMEOUT 60)
+    set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_V2_Integration_HIPCaptureRetirementMembership
+        "llaminar2;v2_integration_hip_graph_argument_geometry")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPCaptureRetirementMembership)
+endif()
+
+# Disabled execution may retain an executable MTP family for future requests;
+# declaration-only bindings must never masquerade as its prefix-restore bridge.
+add_v2_test(V2_Integration_MTPRetainedBridgeSubmissionLifecycle
+    COMMAND $<TARGET_FILE:v2_test_mtp_graph_construction>
+        --gtest_filter=Test__MTPGraphConstruction.RetainedPrefixBridgeBindingUsesExplicitSubmissionLifecycle:Test__MTPGraphConstruction.RetainedMTPCapacityDoesNotAuthorizeRuntimeShiftedPrefill
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;GraphCapture;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_PipelineRetainedMTPBridgeOwnership
+    COMMAND $<TARGET_FILE:v2_test_captured_transfer_channel_binding>
+        --gtest_filter=CapturedTransferChannelBindingTest.PipelineGraphDomainsEncloseEveryForwardRole
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;Pipeline;Ownership;GraphCapture;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_MTPRetainedBridgeSubmissionLifecycle
+    V2_Integration_PipelineRetainedMTPBridgeOwnership)
+
+# Retained verifier families need their original checkpoint owners even when
+# the current request disables speculative execution. Exercise the real cold
+# setup entry and pipeline edge validation without a model or accelerator.
+add_v2_test(V2_Integration_MTPRetainedCheckpointSetupLifecycle
+    COMMAND $<TARGET_FILE:v2_test_device_graph_orchestrator>
+        --gtest_filter=Test__DeviceGraphOrchestratorRetainedMTP.CheckpointSetupRequiresOriginalKVForOffAndEnabledCapacity
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;Ownership;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_PipelineRetainedVerifierCheckpointOwnership
+    COMMAND $<TARGET_FILE:v2_test_captured_transfer_channel_binding>
+        --gtest_filter=CapturedTransferChannelBindingTest.PipelineGraphDomainsEncloseEveryForwardRole
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;Pipeline;Ownership;GraphCapture;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_MTPRetainedCheckpointSetupLifecycle
+    V2_Integration_PipelineRetainedVerifierCheckpointOwnership)
+
+# Maintenance replay must retain the observation owner of the executable
+# prepared at startup, including original pipeline-stage source captures.
+add_v2_test(V2_Integration_MoEMaintenanceCaptureIdentityLifecycle
+    COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
+        --gtest_filter=Test__GraphSegmentCache.MaintenanceReplayContextKeepsOriginalCaptureFamily:Test__GraphSegmentCache.MaintenanceReplayContextRejectsMissingOrForeignObservationOwner:Test__GraphSegmentCache.MaintenanceTransactionObservationPreparedBeforeCapture
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;GraphCapture;Ownership;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_MoEMaintenanceCaptureIdentityLifecycle)
+
+# Real original MPI CPU completions must not retain per-epoch telemetry map keys.
+if(TARGET v2_integration_moe_overlay_residency_consensus_mpi)
+    add_v2_test(V2_Integration_MoERemoteProjectionBoundedTelemetry_MPI
+        COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+            --gtest_filter=Test__MoEOverlayMPIResidencyConsensus.RemoteProjectionTelemetryRetainsBoundedOrderedEpochWitness
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;MPI;MoE;Transfer;PerfStats;Lifecycle;Contract;Regression"
+        MPI_PROCS 2 NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_MoERemoteProjectionBoundedTelemetry_MPI)
 endif()

@@ -14,6 +14,8 @@
  * The process entry uses the production MPI session owner, so admitted CPU
  * collectives retain their original process pool until native finalization.
  * Terminal evidence follows both MPI and GPU retirement.
+ * Local-NUMA all-GPU TP cells keep every expert on the declared physical GPU
+ * group while RAM row storage and full15 MTP remain independent policies.
  */
 #include "app/MPIProcessSession.h"
 #include "backends/GPUDeviceProcessLifetime.h"
@@ -595,6 +597,15 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpFullROCmTP4, Qwen4ExpMainParityTest,
     ::testing::ValuesIn(qfnLocalPairedFamily("Qwen4ExpFullROCmTP4", qwen4ExpFullROCmTP4ProductionCases())),
     [](const ::testing::TestParamInfo<ModelParityCase> &info) { return info.param.testName(); });
 
+// One NUMA-local rank owns all512 GPU experts; RAM rows remain independent storage.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalNUMATP4AllGPU, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qwen4ExpLocalNUMATP4AllGPUCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpLocalNUMATP4AllGPUExact, Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpLocalNUMATP4AllGPUExactCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
 // Three exact controls preserve the original full-stage/partial-prefix/path
 // fixture and optional paired-document attachment. Original A1 remains separate.
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpROCm4OverlayPolicy, Qwen4ExpMainParityTest,
@@ -1169,4 +1180,15 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpObservedMI50FixedVRAMFullStage,Qwen4ExpObserved
     [](const auto& info){return info.param.testName();});
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpObservedMI50FixedVRAMExact,Qwen4ExpMTPExactReplayTest,
     ::testing::ValuesIn(qwen4ExpObservedMI50FixedVRAMExactCases()),
+    [](const auto& info){return info.param.testName();});
+
+// GPU hybrid expert arithmetic is a distinct original policy, never an inherited Apportioned pass.
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpObservedMI50GateUpFixedVRAMFullStage,Qwen4ExpObservedPipelineMainParityTest,
+    ::testing::ValuesIn(qwen4ExpObservedMI50GateUpFixedVRAMCases()),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpObservedMI50GateUpFixedVRAMSourceCandidate,Qwen4ExpObservedPipelineSourceAdmissionTest,
+    ::testing::ValuesIn(qwen4ExpSourceAdmissionParameters(qwen4ExpObservedMI50GateUpFixedVRAMCases())),
+    [](const auto& info){return info.param.testName();});
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpObservedMI50GateUpFixedVRAMExact,Qwen4ExpMTPExactReplayTest,
+    ::testing::ValuesIn(qwen4ExpObservedMI50GateUpFixedVRAMExactCases()),
     [](const auto& info){return info.param.testName();});

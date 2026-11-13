@@ -29,6 +29,7 @@
 #include "GPUGraphMemoryContractProof.h"
 #include "NativeTimelineImportProof.h"
 #include "NativeDependencyReductionProof.h"
+#include "NativeCaptureStreamReentryProof.h"
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
 
 #include <cuda_runtime.h>
@@ -66,6 +67,14 @@ protected:
         return GPUDeviceContextPool::instance().getNvidiaContext(0);
     }
 };
+
+/** @test A legal non-origin stream reentry survives native membership-cycle retirement. */
+TEST_F(Test__CUDAGraphCapture, StreamMembershipCycleRetiresAcyclicCapture)
+{
+    auto* backend=getCUDABackend();
+    ASSERT_NE(backend,nullptr);
+    ctx().submitAndWait([&]{test::proveNativeCaptureStreamReentry(ctx(),*backend,DeviceId::cuda(0));});
+}
 
 /** @test Complete retained imports coexist with in-place local recording fragments. */
 TEST_F(Test__CUDAGraphCapture, OrderedTimelineImportsRetainedNativeWork)

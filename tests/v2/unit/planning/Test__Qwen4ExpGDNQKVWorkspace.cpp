@@ -173,19 +173,12 @@ TEST(Qwen4ExpGDNQKVWorkspace, OwnedIntervalsRepresentationAndExactFitRemainCanon
     plan.qfn_gdn_qkv_activation = two;
     EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile, plan), absent);
     plan.first_layer = plan.last_layer = 0;
-    auto &setup = mutableDebugEnv().gemm;
-    struct Restore
-    {
-        GemmConfig &setup;
-        GDNProjectionArithmetic previous;
-        ~Restore() { setup.gdn_projection_arithmetic = previous; }
-    } restore{setup, setup.gdn_projection_arithmetic};
     for (const auto converted : {GDNProjectionArithmetic::FP16, GDNProjectionArithmetic::FP32})
     {
-        setup.gdn_projection_arithmetic = converted;
+        plan.planning_policy.gdn_projection_arithmetic = converted;
         EXPECT_THROW(WorkspaceMemoryEstimator::estimate(profile, plan), std::invalid_argument);
     }
-    setup.gdn_projection_arithmetic = GDNProjectionArithmetic::FP16MoEAlphaBeta;
+    plan.planning_policy.gdn_projection_arithmetic = GDNProjectionArithmetic::FP16MoEAlphaBeta;
     const auto bytes = WorkspaceMemoryEstimator::estimate(profile, plan);
     PhysicalMemoryPlanBuilder fit;
     fit.add({.world_rank=0, .device=DeviceId::cpu(), .total_bytes=bytes, .admission_available_bytes=bytes},

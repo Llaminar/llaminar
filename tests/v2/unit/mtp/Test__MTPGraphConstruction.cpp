@@ -8479,6 +8479,27 @@ TEST(Test__MTPGraphConstruction,
     EXPECT_LT(release, maintenance);
 }
 
+/** @test Retained setup binds future transactions without authorizing an Off request to execute them. */
+TEST(Test__MTPGraphConstruction, RetainedPrefixBridgeBindingUsesExplicitSubmissionLifecycle)
+{
+    for (const bool enabled : {false, true})
+        for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Dynamic})
+            for (const int capacity : {0, 15})
+            {
+                MTPRuntimeConfig mtp;
+                mtp.enabled = enabled;
+                mtp.depth_policy.mode = mode;
+                mtp.graph_capacity_draft_tokens = capacity;
+                const bool retained = retainsMTPGraphCapacity(mtp);
+                EXPECT_EQ(requiresMTPGraphTransactionBinding(enabled, retained,
+                    ForwardGraphSubmissionIntent::Execute), enabled);
+                EXPECT_EQ(requiresMTPGraphTransactionBinding(enabled, retained,
+                    ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch), retained);
+                EXPECT_EQ(requiresMTPGraphTransactionBinding(enabled, retained,
+                    ForwardGraphSubmissionIntent::WorkspaceDeclaration), retained);
+            }
+}
+
 /**
  * @brief Keep capacity-only MTP setup from becoming an executable sidecar transaction.
  *

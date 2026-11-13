@@ -16,6 +16,8 @@
 #include "config/OrchestrationConfigDocument.h"
 #include "config/OrchestrationStartupPolicy.h"
 #include "interfaces/IMPIContext.h"
+#include "utils/Logger.h"
+#include <chrono>
 #include <exception>
 #include <stdexcept>
 
@@ -36,8 +38,20 @@ namespace llaminar2
 
     AutomaticPlanningStartupResult AutomaticPlanningStartup::run(const OrchestrationConfig &request,
         const ClusterInventory &inventory, const std::shared_ptr<IMPIContext> &mpi, const Prepare &prepare,
-        const PrepareHostServices &prepare_host_services)
+        const PrepareHostServices &prepare_host_services,const PrepareNativeContexts &prepare_native_contexts)
     {
+        // Wall clocks include setup, publication and retirement, not just native
+        // timed samples. CLI discovery/bootstrap precedes this API and is reported
+        // separately by the launcher; this total must never be called CLI wall time.
+        const auto startup_begin = std::chrono::steady_clock::now();
+        auto phase_begin = startup_begin;
+        const auto phase = [&](const char *name) {
+            const auto now = std::chrono::steady_clock::now();
+            LOG_INFO("[AutomaticPlanningWall] discovery_rank=" << (mpi ? mpi->rank() : 0)
+                << " phase=" << name << " seconds="
+                << std::chrono::duration<double>(now-phase_begin).count());
+            phase_begin = now;
+        };
         OrchestrationConfig shared;
         std::optional<OrchestrationPlanningWorkload> workload;
         exchangePlanningArtifact(mpi, PlanningArtifact::AutomaticRequest, [&] {
@@ -60,6 +74,8 @@ namespace llaminar2
             workload->requireFitsContext(shared.max_seq_len);
         });
 
+        phase("request_publication");
+
         // The root-only producer creates the sole source owner. It survives all
         // samples and the complete search, avoiding model-directory rereads and
         // avoiding any requirement for peers to mount the launcher's model path.
@@ -77,6 +93,7 @@ namespace llaminar2
             return source->metadata();
         });
         resolveMTPStartupPolicy(shared, metadata.memoryProfile());
+        phase("model_read_and_metadata");
         const AutomaticPlanningPreparation context(shared, inventory, mpi, metadata,
             *workload, source ? &*source : nullptr);
         std::optional<AutomaticOrchestrationPlanner::Evaluate> evaluate;
@@ -91,6 +108,8 @@ namespace llaminar2
             if (context.isRoot() != evaluate.has_value() || (evaluate && !*evaluate))
                 throw std::invalid_argument("Automatic cost evidence must produce one nonempty root-only evaluator");
         });
+
+        phase("hardware_compute_memory_communication_evidence");
 
         // Every original process reports its own class before membership narrows.
         // As with cost preparation, the collector owns its internal collective
@@ -112,14 +131,22 @@ namespace llaminar2
             }
         });
 
+        auto native_budgets=prepare_native_contexts(context);
+        phase("host_and_native_budget_metadata");
         std::optional<SelectedAutomaticOrchestration> selected;
         auto applied = exchangeSelectedOrchestration(mpi, [&] {
             auto memory = OrchestrationCandidateMemoryPolicy::fromStartup();
             memory.retained_host_services = std::move(host_services);
+            memory.native_context_budgets=std::move(native_budgets);
+            memory.require_native_context_budgets=true;
             selected.emplace(AutomaticOrchestrationPlanner::select(shared, *source, inventory,
                 memory, *workload, *evaluate));
             return selected->candidate().config();
         });
+        phase("candidate_admission_selection_publication");
+        LOG_INFO("[AutomaticPlanningWall] discovery_rank=" << (mpi ? mpi->rank() : 0)
+            << " phase=startup_api_total seconds="
+            << std::chrono::duration<double>(std::chrono::steady_clock::now()-startup_begin).count());
         return {std::move(applied), std::move(selected)};
     }
 }

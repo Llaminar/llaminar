@@ -98,18 +98,28 @@ namespace llaminar2
     class PlanningHostDeviceMeasurement final
     {
     public:
+        /** @brief Replay one untimed byte-proof graph and await its exact-stream completion.
+         * @param worker Original GPU owner, called on its worker thread.
+         * @param graph Retained executable on that worker's non-null original stream.
+         * @throws std::invalid_argument For foreign ownership, stream or incomplete graph.
+         * @throws std::runtime_error For launch/event failure or the standard setup timeout.
+         * The caller retains graph, payload and PMA claims until this returns.
+         * This performs one launch and one Ordering publication, without timing,
+         * warmup, elapsed queries or stream-wide synchronization. */
+        static void replayByteProof(IWorkerGPUContext &worker, const IGPUGraphCapture &graph);
         /** @brief Quote the two shared host buffers on their first-touch owner.
          * @param request Same sealed identity used by collect.
          * @param host Original CPU resource on request.hostRank().
          * @param builder Canonical PMA BOM, never another rank's ledger. */
         static void contributeHostMemory(const PlanningHostDeviceRequest &request,
             PhysicalMemoryResource host, PhysicalMemoryPlanBuilder &builder);
-        /** @brief Quote GPU buffer and two graphs on the native executor.
+        /** @brief Quote GPU buffer, four timer graphs and one diagnostic graph on the native executor.
          * @param request Same sealed identity used by collect.
+         * @param executor_host Original executor CPU resource for its compact clock readback bank.
          * @param execution Original GPU resource on request.gpuRank().
          * @param builder Canonical PMA BOM; no duplicate host-page charge. */
         static void contributeExecutionMemory(const PlanningHostDeviceRequest &request,
-            PhysicalMemoryResource execution, PhysicalMemoryPlanBuilder &builder);
+            PhysicalMemoryResource executor_host, PhysicalMemoryResource execution, PhysicalMemoryPlanBuilder &builder);
         /** @return Exact page-rounded pair extent shared by admission and mmap. */
         static size_t hostAllocationBytes(const PlanningHostDeviceRequest &request);
         /** @brief Collect one original sample with both roles and all-rank retirement.
@@ -120,7 +130,10 @@ namespace llaminar2
          *
          * Host first touch precedes registration through existing all-rank
          * agreement. Native clocks retain the original warmup/three-invocation
-         * mechanism; source publication and byte checks remain outside timing.
+         * mechanism through captured fixed-clock parents. Fresh host input/output
+         * poison is published before every invocation, after its predecessor's
+         * compact clock readback/Ordering completion. Byte checks remain outside
+         * timing and prove late publication, not capture-time eager execution.
          * The final agreement proves GPU graphs/registrations have retired
          * before the host owner releases any shared page or PMA claim.
          */

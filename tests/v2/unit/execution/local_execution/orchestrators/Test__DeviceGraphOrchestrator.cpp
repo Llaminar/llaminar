@@ -309,6 +309,14 @@ struct DeviceGraphOrchestratorServingBuffersTestAccess
  */
 struct DeviceGraphOrchestratorPublicationProgramsTestAccess
 {
+    /** @brief Call the actual cold checkpoint authority with an intentionally absent original KV owner. */
+    static bool initializeCheckpointPoolWithoutKV(DeviceGraphOrchestrator &owner)
+    {
+        if (owner.state_.kv_cache)
+            throw std::logic_error("Checkpoint rejection fixture must not carry a substituted KV owner");
+        return owner.initializeLiveCheckpointStoragePool();
+    }
+
     /** @brief Actual no-launch rejection preserves the original mailbox; pending writes still block readers. */
     static void provePrelaunchFailure(DeviceGraphOrchestrator &owner, DeviceId device)
     {
@@ -6753,4 +6761,23 @@ TEST(DeviceGraphOrchestratorWorkspaceInput, GroupedVerifierUsesGenerationRequest
         std::invalid_argument);
     EXPECT_THROW((void)DeviceGraphOrchestratorLiveStateTestAccess::groupedWorkspaceInput(
         ordinary, MTPGraphOwnerPlan(MTPRuntimeConfig{}, MTPVerifierGraphFamily::BoundedBuckets, MTPGenerationParentRole::Controller)), std::logic_error);
+}
+
+/** @test Retained-Off setup cannot silently skip the real checkpoint owner's preconditions. */
+TEST(Test__DeviceGraphOrchestratorRetainedMTP, CheckpointSetupRequiresOriginalKVForOffAndEnabledCapacity)
+{
+    for (const bool enabled : {false, true})
+        for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Dynamic})
+            for (const int capacity : {0, 15})
+            {
+                GraphConfig config;
+                config.default_device = DeviceId::cpu();
+                config.mtp.enabled = enabled;
+                config.mtp.depth_policy.mode = mode;
+                config.mtp.graph_capacity_draft_tokens = capacity;
+                auto builder = std::make_shared<QwenStandardGraph>(config, nullptr);
+                DeviceGraphOrchestrator owner(builder, nullptr);
+                EXPECT_EQ(DeviceGraphOrchestratorPublicationProgramsTestAccess::initializeCheckpointPoolWithoutKV(owner),
+                    !retainsMTPGraphCapacity(config.mtp));
+            }
 }

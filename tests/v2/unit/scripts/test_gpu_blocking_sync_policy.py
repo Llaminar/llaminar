@@ -476,6 +476,31 @@ class TestGPUBlockingSyncPolicy(unittest.TestCase):
                 with temporary:
                     self.assertEqual(not validate(root, (fixture_allowance,)), accepted)
 
+    def test_device_metadata_setup_event_is_exact_and_never_authorizes_replay(self) -> None:
+        """One named cold transport publication cannot admit an execution wait."""
+        allowance, = (entry for entry in ALLOWANCES if entry.caller == "TransferEngine::initializeDeviceMetadata")
+        self.assertEqual((allowance.category, allowance.kind, allowance.count),
+                         ("setup_certification", "backend_event", 1))
+        fixture = dataclasses.replace(allowance, path="src/v2/example.cpp")
+        for caller, count, accepted in (("initializeDeviceMetadata", 1, True),
+                                       ("initializeDeviceMetadata", 2, False),
+                                       ("enqueue", 1, False), ("execute", 1, False),
+                                       ("initializeLocalExtent", 1, False), ("reset", 1, False)):
+            with self.subTest(caller=caller, count=count):
+                temporary, root = self.make_repo(f"void TransferEngine::{caller}() {{" +
+                    "backend->waitForEvent(event, ordinal);" * count + "}")
+                with temporary:
+                    self.assertEqual(not validate(root, (fixture,)), accepted)
+        root = pathlib.Path(__file__).resolve().parents[4]
+        source = strip_comments_and_literals((root / allowance.path).read_text(encoding="utf-8"))
+        bodies = [source[first + 1:last] for first, last, name in function_intervals(source)
+                  if name == allowance.caller]
+        self.assertEqual(len(bodies), 1)
+        compact = "".join(bodies[0].split())
+        for required in ("isGraphCaptureActive()", "!destination.isBound()", "!destination.contains(offset,source.size())",
+                         "reinterpret_cast<std::uintptr_t>(stream)<=2", "backend!=destination.backend_", "std::terminate()"):
+            self.assertIn(required, compact)
+
     def test_workspace_metadata_setup_event_cannot_escape_into_execution(self) -> None:
         """Each overload retires one immutable setup copy outside capture."""
         allowance, = (entry for entry in ALLOWANCES

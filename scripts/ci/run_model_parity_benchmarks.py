@@ -405,6 +405,18 @@ def _passive_device(value: str) -> str:
     return f'{match[1]}:{int(match[2])}'
 
 
+def _expert_member_device(member: dict) -> str:
+    """Project a topology member to the native expert publisher's DeviceId.
+
+    CPU topology ordinals select sockets, while their rank-local DeviceId is
+    CPU. The existing global participant identity preserves each distinct
+    expert bank; GPU ordinals remain physical device identities unchanged.
+    """
+    ordinal = _passive_uint(member['device_ordinal'], 'expert member ordinal')
+    return _passive_device('CPU' if member['device_type'] == 'CPU'
+                           else f"{member['device_type']}:{ordinal}")
+
+
 def _declared_continuation(config: dict) -> list[tuple[int,str]]:
     """Project original serialized continuation membership; do not create a topology registry."""
     plan = config.get('moe_routed_expert_plan') or {}
@@ -550,7 +562,7 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
                     _passive_uint(count,'resolved expert population')
                     actual_layer=_passive_uint(plan.get('first_model_layer'),'first model layer')+layer
                     for member_index,member in enumerate(domains[0].get('participants',[])):
-                        device=_passive_device(f"{member['device_type']}:{member['device_ordinal']}")
+                        device=_expert_member_device(member)
                         expected_selection.add((device,actual_layer,tier_index,first_participant+member_index))
                 first_participant+=len(domains[0].get('participants',[]))
             seen=set()
@@ -583,8 +595,12 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
                 # phase-aware replicated decode likewise requires full residents.
                 if phase=='PrefillApportionedDecodeReplicated' and compute in ('Apportioned','Replicated'):
                     replicated=True
-                elif phase=='Uniform' and compute in ('Apportioned','Replicated','TensorSharded'):
-                    replicated=compute!='Apportioned'
+                elif phase=='Uniform' and compute in ('Apportioned','Replicated','TensorSharded','GateUpOwnedDownColumns'):
+                    # Initial banks enumerate movable source expert IDs. Gate/up
+                    # follows one owner just like whole-expert apportionment;
+                    # separately retained fixed down slices do not replicate
+                    # these movable-bank IDs on every participant.
+                    replicated=compute not in ('Apportioned','GateUpOwnedDownColumns')
                 else:
                     raise ValueError('unsupported passive initial-bank compute/phase policy: '+str(compute)+'/'+str(phase))
                 if (replicated and any(value!=population for value in selected_banks[(tier_index,layer)])) or \
@@ -607,11 +623,11 @@ def _validate_declared_passive_evidence(data: dict) -> dict:
                 for layer,count in enumerate(counts):
                     if not _passive_uint(count,'resolved expert population'):continue
                     for participant,p in enumerate(participants):
-                        expected_selection.add((_passive_device(f"{p['device_type']}:{p['device_ordinal']}"),
+                        expected_selection.add((_expert_member_device(p),
                             _passive_uint(plan.get('first_model_layer'),'first model layer')+layer,participant))
             if not expected_selection.issubset({(r['device'],r['layer'],r['participant']) for r in expert}):
                 raise ValueError('passive expert physical selection coverage is partial')
-            declared_members={(_passive_device(f"{p['device_type']}:{p['device_ordinal']}"),index)
+            declared_members={(_expert_member_device(p),index)
                 for domain in plan.get('domains',[]) for index,p in enumerate(domain.get('participants',[]))}
             if any((r['device'],r['participant']) not in declared_members for r in expert):
                 raise ValueError('passive expert selection has a foreign original participant')

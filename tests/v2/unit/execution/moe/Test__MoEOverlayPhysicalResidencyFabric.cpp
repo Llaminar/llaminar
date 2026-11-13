@@ -1949,7 +1949,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric, PreparedGPUServiceMissingResidentC
         }
         catch (const std::logic_error &error)
         {
-            EXPECT_NE(std::string(error.what()).find("priced class has no complete resident source"), std::string::npos);
+            EXPECT_NE(std::string(error.what()).find("priced class has no matching movable resident source"), std::string::npos);
             EXPECT_NE(std::string(error.what()).find("participant=0"), std::string::npos);
         }
     }

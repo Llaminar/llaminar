@@ -1983,10 +1983,6 @@ TEST(Test__WorkspaceMemoryEstimator, FP16PrefillAdmissionCoversEnumeratedCapture
 /** @brief Selective alpha/beta admission covers the exact persistent half operand bank. */
 TEST(Test__WorkspaceMemoryEstimator, HalfAlphaBetaAdmitsOnlyScopedOperandWorkspace)
 {
-    struct Restore {
-        GDNProjectionArithmetic previous = debugEnv().gemm.gdn_projection_arithmetic;
-        ~Restore() { mutableDebugEnv().gemm.gdn_projection_arithmetic = previous; }
-    } restore;
     auto profile = qwen35MoEProfile(false);
     profile.tensors = {
         {"blk.0.ssm_alpha.weight", 0, "F32", size_t(32 * 2048), 2048, 0},
@@ -1997,9 +1993,9 @@ TEST(Test__WorkspaceMemoryEstimator, HalfAlphaBetaAdmitsOnlyScopedOperandWorkspa
         {
             auto geometry = graphGeometry(device);
             geometry.resident_graph_rows = rows;
-            mutableDebugEnv().gemm.gdn_projection_arithmetic = GDNProjectionArithmetic::Native;
+            geometry.planning_policy.gdn_projection_arithmetic = GDNProjectionArithmetic::Native;
             const auto native = WorkspaceMemoryEstimator::estimate(profile, geometry);
-            mutableDebugEnv().gemm.gdn_projection_arithmetic = GDNProjectionArithmetic::FP16MoEAlphaBeta;
+            geometry.planning_policy.gdn_projection_arithmetic = GDNProjectionArithmetic::FP16MoEAlphaBeta;
             const auto selective = WorkspaceMemoryEstimator::estimate(profile, geometry);
             auto before = device.is_cuda() ?
                 cuda::floating_gemm_workspace::projectionRequirements(rows, 32) :
@@ -2600,5 +2596,32 @@ TEST(Test__WorkspaceMemoryEstimator, QFNWorkspaceAdmissionPreservesConventionalD
         geometry.local_kv_heads = 1;
         EXPECT_GT(WorkspaceMemoryEstimator::estimate(profile, geometry),
             WorkspaceMemoryEstimator::estimate(withoutQFNMainQueryMarker(profile), geometry));
+    }
+}
+
+/** @test A source quote freezes all selectors; only fresh or explicitly refreshed geometry adopts a later policy. */
+TEST(Test__WorkspaceMemoryEstimator, FrozenPlanningPolicyDoesNotFollowLaterGlobalMutation)
+{
+    struct Restore {
+        GDNProjectionArithmetic previous=debugEnv().gemm.gdn_projection_arithmetic;
+        ~Restore(){mutableDebugEnv().gemm.gdn_projection_arithmetic=previous;}
+    } restore;
+    auto profile=qwen35MoEProfile(false);
+    profile.tensors={
+        {"blk.0.ssm_alpha.weight",0,"F32",size_t(32*2048),2048,0},
+        {"blk.0.ssm_beta.weight",0,"F32",size_t(32*2048),2048,0}};
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}) {
+        mutableDebugEnv().gemm.gdn_projection_arithmetic=GDNProjectionArithmetic::Native;
+        auto frozen=graphGeometry(device);frozen.resident_graph_rows=16;
+        const auto native=WorkspaceMemoryEstimator::estimate(profile,frozen);
+        mutableDebugEnv().gemm.gdn_projection_arithmetic=GDNProjectionArithmetic::FP16MoEAlphaBeta;
+        EXPECT_EQ(frozen.planning_policy.gdn_projection_arithmetic,GDNProjectionArithmetic::Native);
+        EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile,frozen),native);
+        auto fresh=graphGeometry(device);fresh.resident_graph_rows=16;
+        EXPECT_EQ(fresh.planning_policy.gdn_projection_arithmetic,GDNProjectionArithmetic::FP16MoEAlphaBeta);
+        const auto selected=WorkspaceMemoryEstimator::estimate(profile,fresh);
+        EXPECT_GT(selected,native);
+        frozen.planning_policy=WorkspacePlanningPolicy::current();
+        EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile,frozen),selected);
     }
 }

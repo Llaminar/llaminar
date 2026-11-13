@@ -468,6 +468,16 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
                  {"cases",json::array()},{"proofs",json::object()}};
     bool owns_output=false;
     bool distributed_joint=false;int observation_rank=-1;
+    // This owner outlives selected runtime teardown on every original rank.
+    // Excluded ranks wait in the same terminal outcome protocol, not in file polling.
+    std::optional<MPIProcessSession> original_process_session;
+    std::shared_ptr<MPIContext> original_discovery;
+    const auto finish_original = [&](bool local_complete) {
+        if (!original_discovery) return local_complete;
+        return accuracy::qfnCompleteDiscoveryObservation(local_complete,[&](auto identity,auto outcome){
+            return MPIRankInitializationConsensus::reach(original_discovery->communicator(),identity,outcome);
+        });
+    };
     try
     {
         using accuracy::requireQFN;
@@ -507,22 +517,35 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
         requireQFN(!launch.is_mpi_process || launch.detected_world_size==original_size,
                    "QFN observer rejects unresolved original MPI launch membership");
         const auto original_selection=config.execution_rank_selection;
-        auto startup=RuntimeInitPhase().execute(config,engine_argc,engine_argv);
+        if (observed_pipeline)
+        {
+            original_process_session.emplace(MPIProcessSession::initialize(engine_argc,engine_argv));
+            original_discovery=MPIContextFactory::global();
+            const auto prepared=RankInitializationLifecycle::execute({0,"qfn_original_observer_artifacts"},[&] {
+                requireQFN(original_discovery->rank()==launch.detected_rank &&
+                    original_discovery->world_size()==original_size,"QFN artifact owner lost original MPI membership");
+                return accuracy::qfnCreateDiscoveryArtifactRoot(output,original_discovery->rank());
+            },[&](auto identity,auto outcome){
+                return MPIRankInitializationConsensus::reach(original_discovery->communicator(),identity,outcome);
+            });
+            requireQFN(prepared.succeeded(),"QFN original discovery artifact initialization failed");
+        }
+        auto startup=original_process_session
+            ? RuntimeInitPhase().executeInSession(config,engine_argc,engine_argv,*original_process_session)
+            : RuntimeInitPhase().execute(config,engine_argc,engine_argv);
         if(observed_pipeline && !std::holds_alternative<AppContext>(startup)) {
-            // The production initializer already retired this excluded rank's
-            // original MPI session. It cannot publish numerical or model work.
+            // Selection admitted no model on this original rank. Retain its
+            // discovery owner until active runners retire, including failures.
             requireQFN(std::get<RuntimeInitExit>(startup)==RuntimeInitExit::Completed &&
                 original_selection && launch.detected_rank>=0 &&
                 launch.detected_rank<original_size && !original_selection->executionRank(launch.detected_rank),
                 "QFN selected pipeline lost its active original runtime");
-            requireQFN(std::filesystem::is_directory(output),
-                "QFN inactive discovery rank has no terminal artifact owner");
             publish(output/("rank-"+std::to_string(launch.detected_rank)+".json"),
                 {{"schema","llaminar.qfn-observed-pipeline-rank.v1"},{"discovery_rank",launch.detected_rank},
                  {"discovery_size",original_size},{"execution_rank",nullptr},{"active",false},
                  {"runtime_config_digest",request.topology().at("runtime_config_digest")},
                  {"corpus_manifest_digest",result.at("corpus_manifest_digest")},{"native_retired",true}});
-            return 0;
+            return finish_original(true) ? 0 : 1;
         }
         requireQFN(std::holds_alternative<AppContext>(startup),"QFN runtime did not return its original model owner");
         auto context=std::move(std::get<AppContext>(startup));
@@ -536,8 +559,8 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
             requireQFN(authority && original_selection &&
                 original_selection->executionRank(launch.detected_rank)==observation_rank,
                 "QFN fixed pipeline substituted its original selected request owner");
-            owns_output=std::filesystem::create_directories(output);
-            requireQFN(owns_output,"QFN observer cannot create its selected original output owner");
+            requireQFN(std::filesystem::is_directory(output),"QFN original discovery artifact root is missing");
+            owns_output=true; // Selected authority owns terminal numerical publication only.
             result["observed_pipeline_binding"]=observeFixedNativePipelineBinding(*context.runner,*context.mpi_ctx);
         }
         if(distributed_joint) {
@@ -672,6 +695,12 @@ int runQFNObserver(const json &workload, const std::filesystem::path &output,
     catch(const std::exception &error)
     {
         result["error"]=error.what(); std::cerr<<error.what()<<'\n';
+    }
+    const bool locally_complete=result.at("complete").get<bool>();
+    if (!finish_original(locally_complete))
+    {
+        result["complete"]=false;
+        result["error"]="QFN original discovery rank failed before native retirement";
     }
     if(owns_output) publish(output/"logits.json",result);
     return result.at("complete").get<bool>()?0:1;

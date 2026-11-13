@@ -3,6 +3,8 @@
  * @brief Source-backed, captured GPU expert service observations for planning.
  *
  * The production weight pool and MoE stage own preparation and execution. Only
+ * Startup source samplers observe only DecodeToken and PrefillChunk; live
+ * measurePrepared per-phase MTP calibration remains independent. Only
  * completed timings and exact source/device identity escape the transaction;
  * no runner, live routing histogram, sampler, KV cache or topology is created.
  */
@@ -12,11 +14,22 @@
 #include "PhysicalMemoryAuthority.h"
 #include "OrchestrationPerformanceEvidence.h"
 #include "execution/moe/ExpertHistogramSource.h"
+#include <span>
 
 namespace llaminar2
 {
     class MoEOverlayPreparedExpertPayload;
+    class MoEOverlayFixedDownProjectionBank;
     class RetainedParticipantGraphExecutable;
+    class ILocalTPContext;
+    /** @brief Borrow actual immutable owner-domain facts through one calibration transaction. */
+    struct PlanningPreparedOwnerDispatch
+    {
+        const ILocalTPContext* domain = nullptr; ///< Original physical communicator, never reconstructed membership.
+        int top_k = 0; ///< Original routed width, distinct from the singleton sample route.
+        std::span<const MoEOverlayPreparedExpertPayload> resident_sources; ///< Original complete local bank for source-policy resolution.
+        bool has_live_rows = false; ///< Actual graph row policy, not the sample capacity.
+    };
     /** @brief One complete captured FFN, including routing/activation work. */
     struct PlanningGPUExpertPhaseObservation final
     {
@@ -101,6 +114,9 @@ namespace llaminar2
          * @param memory Same original admitted PMA for scratch and General graph obligations.
          * @param declared_workspace_bytes Same original source estimator's admitted serial workspace envelope.
          * @param calibration Same original cold-only owner reused after each exact terminal/native reset.
+         * @param fixed_down Original fixed column bank, required only for GateUp policy metadata; never executed.
+         * @param source_expert Original expert ID selecting that bank's immutable descriptor.
+         * @param owner_dispatch Actual production domain/operation/source facts for owner launch-policy resolution.
          * @return One completed GPU-event interval spanning three invocations, in nanoseconds, excluding warmup.
          * @throws std::exception For stale source, geometry, admission, capture or timing failure.
          * @note Caller runs off-worker; this method records on the original worker,
@@ -109,10 +125,12 @@ namespace llaminar2
         static uint64_t measurePrepared(const MoEOverlayPreparedExpertPayload &payload,
             DeviceId device, int layer, ExpertHistogramSource phase, int width, int intermediate,
             const std::shared_ptr<PhysicalMemoryAuthority> &memory, size_t declared_workspace_bytes,
-            const std::shared_ptr<RetainedParticipantGraphExecutable> &calibration);
+            const std::shared_ptr<RetainedParticipantGraphExecutable> &calibration,
+            std::shared_ptr<const MoEOverlayFixedDownProjectionBank> fixed_down = {}, int source_expert = -1,
+            PlanningPreparedOwnerDispatch owner_dispatch = {});
 
         /**
-         * @brief Prepare once and measure retained decode, prefill and verifier graphs.
+         * @brief Prepare once and measure the retained decode and prefill graphs used by startup ranking.
          * @param source Same retained source used for admission.
          * @param request Exact triplet named in the sample BOM.
          * @param device CUDA or ROCm device whose worker invokes this operation.

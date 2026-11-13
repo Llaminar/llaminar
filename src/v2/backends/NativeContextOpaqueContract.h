@@ -67,10 +67,22 @@ private:
     const std::string evidence_;
     const NativePhysicalLifetime lifetime_;
 };
+/** @brief Installed opaque family limits usable for planning, never a birth authorization. */
+class NativeContextFamilyBudget final {
+public:
+    std::size_t hostUpperBytes()const noexcept{return host_;}
+    std::size_t deviceUpperBytes()const noexcept{return device_;}
+private:
+    friend class NativeContextOpaqueCatalog;
+    NativeContextFamilyBudget(std::size_t host,std::size_t device):host_(host),device_(device){}
+    std::size_t host_,device_;
+};
 /** @brief Only reviewed source/driver/runtime/architecture-bound certificates authorize birth. */
 class NativeContextOpaqueCatalog final {
 public:
     /** @brief Return the exact installed certificate or fail before context/runtime discovery. */
     static NativeContextOpaqueContract require(const NativeContextBirthKey&);
+    /** @brief Price the installed class without querying providers or granting native birth. */
+    static NativeContextFamilyBudget planningBudget(DeviceType,NativeContextBirthPopulation);
 };
 }

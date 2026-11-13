@@ -1180,6 +1180,109 @@ TEST(Test__PerfStatsCollector, RecordFamilyGateAvoidsSiblingDiagnostics)
     EXPECT_TRUE(PerfStatsCollector::isRecordFamilyEnabled("kernel","cpu_native_quantised_fused_job_ownership"));
 }
 
+/** @test Qualified filters reject sibling storage, even with distinct per-command tags. */
+TEST(Test__PerfStatsCollector, QualifiedFamilyAdmissionKeepsRetainedMapBounded)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv kernel_profiling("LLAMINAR_PROFILE_KERNELS", nullptr);
+    ScopedEnv cpu_timing("LLAMINAR_PERF_STATS_CPU_STAGE_TIMING", nullptr);
+    ScopedEnv gpu_timing("LLAMINAR_PERF_STATS_GPU_STAGE_TIMING", nullptr);
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "kernel.retained");
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    using Batch = PerfStatsCollector::CounterObservationBatch;
+    constexpr uint64_t observations = 64;
+    const auto emit = [](const std::string &domain, const std::string &family,
+                         uint64_t command, bool changing_tags)
+    {
+        // Rejected records deliberately have a fresh key on every iteration.
+        // Accepted records use one stable key per API, as production requires.
+        const PerfStatsCollector::Tags tags{
+            {"fixture", changing_tags ? std::to_string(command) : "stable"}};
+        const auto bound = PerfStatsCollector::bindCounter(
+            domain, family + ".bound", "fixture", "cpu", tags);
+        const auto bound_batch = PerfStatsCollector::bindCounter(
+            domain, family + ".bound_batch", "fixture", "cpu", tags);
+        const auto bound_sequence = PerfStatsCollector::bindCounter(
+            domain, family + ".bound_sequence", "fixture", "cpu", tags);
+        PerfStatsCollector::addCounter(domain, family + ".scalar", 2.0, "fixture", "cpu", tags);
+        PerfStatsCollector::addCounter(domain, family + ".batch",
+            Batch{.observations = 2u, .value = 3.0}, "fixture", "cpu", tags);
+        PerfStatsCollector::addCounter(bound, 4.0);
+        PerfStatsCollector::addCounter(bound_batch, Batch{.observations = 3u, .value = 5.0});
+        PerfStatsCollector::addCounterWithSequence(domain, family + ".sequence",
+            6.0, {command}, "fixture", "cpu", tags);
+        PerfStatsCollector::addCounterWithSequence(bound_sequence, 7.0, {command});
+        PerfStatsCollector::recordTimingNs(domain, family + ".timer", 8u, "fixture", "cpu", tags);
+        PerfStatsCollector::recordTimingNsWithSequence(domain, family + ".timer_sequence",
+            9u, {command}, "fixture", "cpu", tags);
+        PerfStatsCollector::recordOrderedSequenceStep(domain, family + ".ordered",
+            {command}, "fixture", "cpu", tags);
+        PerfStatsCollector::ScopedTimer timer(domain, family + ".scoped", "fixture", "cpu", tags);
+    };
+    for (uint64_t command = 0; command < observations; ++command)
+    {
+        emit("kernel", "retained", command, false);
+        emit("kernel", "retained_sibling", command, true);
+        emit("other_domain", "retained", command, true);
+    }
+
+    // No snapshot filter: an export-only fix would conceal the defect here.
+    const auto records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 10u);
+    for (const auto &record : records)
+    {
+        EXPECT_EQ(record.domain, "kernel");
+        EXPECT_EQ(record.tags.at("fixture"), "stable");
+        const auto expected_count = record.name == "retained.batch" ? observations * 2u
+            : record.name == "retained.bound_batch" ? observations * 3u : observations;
+        EXPECT_EQ(record.count, expected_count) << record.name;
+        if (record.name == "retained.sequence" || record.name == "retained.bound_sequence" ||
+            record.name == "retained.timer_sequence")
+        {
+            EXPECT_EQ(record.sequence_word_count, observations);
+            EXPECT_EQ(record.sequence_minimum_words, (std::vector<uint64_t>{0u}));
+            EXPECT_EQ(record.sequence_maximum_words, (std::vector<uint64_t>{observations - 1u}));
+        }
+        if (record.name == "retained.timer") EXPECT_EQ(record.total_ns, observations * 8u);
+        if (record.name == "retained.timer_sequence") EXPECT_EQ(record.total_ns, observations * 9u);
+        if (record.name == "retained.scalar") EXPECT_DOUBLE_EQ(record.value, observations * 2.0);
+        if (record.name == "retained.batch") EXPECT_DOUBLE_EQ(record.value, observations * 3.0);
+    }
+    PerfStatsCollector::reset();
+}
+
+/** @test A cold-bound identity follows current family policy without resurrecting rejected keys. */
+TEST(Test__PerfStatsCollector, BoundFamilyAdmissionUsesReloadedPolicyWithoutHiddenRecords)
+{
+    ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);
+    ScopedEnv kernel_profiling("LLAMINAR_PROFILE_KERNELS", nullptr);
+    ScopedEnv filter("LLAMINAR_PERF_STATS_FILTER", "kernel.selected");
+    ScopedEnv json("LLAMINAR_PERF_STATS_JSON", "1");
+    PerfStatsCollector::reset();
+    const auto selected = PerfStatsCollector::bindCounter("kernel", "selected");
+    const auto sibling = PerfStatsCollector::bindCounter("kernel", "sibling");
+    PerfStatsCollector::addCounter(selected, 1.0);
+    PerfStatsCollector::addCounter(sibling, 100.0);
+    ASSERT_EQ(PerfStatsCollector::snapshot().size(), 1u);
+    {
+        ScopedEnv broad("LLAMINAR_PERF_STATS_FILTER", "kernel");
+        // Reload is not reset: previously rejected observations must be absent.
+        ASSERT_EQ(PerfStatsCollector::snapshot().size(), 1u);
+        PerfStatsCollector::addCounter(sibling, 2.0);
+        ASSERT_EQ(PerfStatsCollector::snapshot().size(), 2u);
+    }
+    PerfStatsCollector::addCounter(sibling, 1000.0);
+    const auto records = PerfStatsCollector::snapshot();
+    ASSERT_EQ(records.size(), 2u);
+    const auto found = std::find_if(records.begin(), records.end(),
+        [](const auto &record) { return record.name == "sibling"; });
+    ASSERT_NE(found, records.end());
+    EXPECT_EQ(found->count, 1u);
+    EXPECT_DOUBLE_EQ(found->value, 2.0);
+    PerfStatsCollector::reset();
+}
+
 TEST(Test__PerfStatsCollector, CpuStageFilterEnablesCpuStageTiming)
 {
     ScopedEnv profiling("LLAMINAR_PROFILING", nullptr);

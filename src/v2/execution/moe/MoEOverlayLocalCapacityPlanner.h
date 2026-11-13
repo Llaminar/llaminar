@@ -15,6 +15,7 @@
  */
 
 #pragma once
+#include "planning/PlanningNativeContextEvidence.h"
 
 #include "MoEOverlayActivationBatchInventory.h"
 #include "MoEOverlayActivationChannelPlan.h"
@@ -116,6 +117,10 @@ namespace llaminar2
     /** @brief Complete immutable input for one rank's zero-routed-expert BOM. */
     struct MoEOverlayLocalCapacityPlannerInput
     {
+        /** Original selected-rank birth declarations; empty only without GPU evidence scope. */
+        std::vector<PlanningNativeContextDeclaration> native_context_budgets;
+        bool require_native_context_budgets=false;
+
         const ModelMemoryProfile *model_profile = nullptr;
         const RankExecutionPlan *rank_plan = nullptr;
         const MoERoutedExpertPlacementPlan *overlay_plan = nullptr;

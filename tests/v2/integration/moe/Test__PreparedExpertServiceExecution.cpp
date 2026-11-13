@@ -5,7 +5,7 @@
  * A retained serving stage executes before and after a short-lived probe over
  * the same prepared expert bytes. The probe owns independent execution handles,
  * routing, activations and workspace. GPU observations come from captured
- * complete expert FFNs on distinct explicit streams, never three stand-alone
+ * complete expert FFNs or declared gate/up projections, never three stand-alone
  * GEMM estimates. CPU uses the production transported-row grouped workspace.
  * Each native workspace is admitted from its real descriptor; the exact backing
  * and live PMA claim must agree. These are model-free ownership/capture
@@ -32,6 +32,11 @@
 #include "execution/moe/MoEOverlayParticipantResidency.h"
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "execution/moe/MoEOverlayPreparedWeightSource.h"
+#include "execution/moe/MoEOverlayFixedDownProjectionBank.h"
+#include "loaders/ExpertGemmRegistry.h"
+#include "execution/moe/MoEWorkspaceRequirements.h"
+#include "tensors/TensorFactory.h"
+#include "collective/LocalTPContext.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include "transfer/TransferEngine.h"
@@ -500,13 +505,40 @@ namespace llaminar2::test
         /**
          * @brief Exercise actual original-PMA GPU startup calibration before any routed observation.
          * @param device Explicit CUDA/ROCm device selected by this native registration.
+         * @param gate_up Also replay live gate/up calibration with authentic fixed down columns.
+         * @param native_gate_up Use differing original native codebooks for gate/up and fixed down.
          * @throws std::exception For admission, capture, measurement or retirement failure.
          * The original resident FP32 weights and retained serving bindings stay
          * alive while all three private measurement phases execute. Adjacent
          * all-format tests retain their independent codebook/binding coverage.
          */
-        void proveProductionGPUMeasurement(DeviceId device)
+        void proveProductionGPUMeasurement(DeviceId device, bool gate_up = false, bool native_gate_up = false)
         {
+            // Deterministic immutable fixture inputs are formed before native
+            // source admission; final runtime source storage is admitted below.
+            std::vector<std::unique_ptr<TensorBase>> native_fixture;
+            std::vector<CPUStorageRoot<uint8_t>> native_roots;
+            size_t native_host_bytes=0,native_device_bytes=0;
+            if(native_gate_up) {
+                // The current QFN first-layer pair is Q4_K/Q4_K/Q5_1.
+                // Keep native source bytes; no conversion aliases the mixed down codebook.
+                native_fixture.push_back(TestTensorFactory::createQ4_KRandom({kWidth,kWidth},171));
+                native_fixture.push_back(TestTensorFactory::createQ4_KRandom({kWidth,kWidth},172));
+                native_fixture.push_back(TestTensorFactory::createQ5_1Random({kWidth/2,kWidth},173));
+                for(const auto& tensor:native_fixture) {
+                    native_roots.emplace_back(tensor->size_bytes(),PhysicalMemoryOwner::ExecutionWorkspace,
+                        DeviceId::cpu(),CPUStoragePlacement::local(),CPUStorageInitialization::Uninitialized);
+                    native_host_bytes+=native_roots.back().physicalBytes();
+                    const auto* quant=dynamic_cast<const IINT8Unpackable*>(tensor.get());
+                    require(quant && quant->vnniFormatInfo(),"native fixture source format");
+                    const auto format=canonicalDeviceVnniFormat(*quant->vnniFormatInfo());
+                    native_device_bytes+=size_t(tensor->rows())*(tensor->cols()/32)*
+                        (format.payload_bytes_per_block+sizeof(uint16_t)+
+                         (format.is_asymmetric?sizeof(uint16_t):0)+(format.has_emins?sizeof(uint32_t):0));
+                }
+            }
+            const auto additional_device_bytes=native_gate_up?native_device_bytes:
+                (gate_up?size_t(kWidth)*kWidth/2*sizeof(float):0);
             auto* backend=getBackendFor(device);
             require(backend!=nullptr,"prepared GPU native backend");
             const auto host=observeSystemMemoryCapacity();
@@ -544,10 +576,22 @@ namespace llaminar2::test
                     .quant_type="F32",.elements=size_t(kExperts)*kWidth*kWidth,.K=kWidth,.layer_index=0});
             const WorkspaceMemoryGeometry geometry{.device=device,.device_compute_units=inventory.gpus.front().compute_units,
                 .resident_graph_rows=8,.first_layer=0,.last_layer=1,.apportioned_routed_experts=true};
-            const auto probe_workspace=WorkspaceMemoryEstimator::estimatePreparedExpertService(profile,geometry);
+            auto probe_workspace=WorkspaceMemoryEstimator::estimatePreparedExpertService(profile,geometry);
+            if(gate_up) {
+                const auto requirements=device.is_cuda()?MoEWorkspaceBuffers::cudaMoE(8,kWidth,kWidth,1,1):
+                    MoEWorkspaceBuffers::rocmMoE(8,kWidth,kWidth,1,1);
+                probe_workspace=std::max(probe_workspace,requirements.total_bytes_with_alignment());
+            }
             auto serving_geometry=geometry;serving_geometry.resident_graph_rows=1;
             const auto serving_workspace=WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(profile,serving_geometry);
-            const auto probe=MoEOverlayCPUServiceMeasurement::gpuAllocationBytes({kWidth,kWidth},probe_workspace);
+            auto probe=MoEOverlayCPUServiceMeasurement::gpuAllocationBytes({kWidth,kWidth},probe_workspace);
+            if(gate_up) {
+                // This admission has no private route/output GPU storage. A
+                // complete-FFN allocation cannot borrow the serving graph's
+                // already materialized bytes to masquerade as movable work.
+                const auto layout=MoEOverlayCPUServiceMeasurement::gpuStorageLayout({kWidth,kWidth},8);
+                probe.device_bytes=layout.input.capacity()*sizeof(float)+probe_workspace;
+            }
             const auto serving=MoEOverlayCPUServiceMeasurement::gpuAllocationBytes({kWidth,kWidth},serving_workspace);
             const auto weight_root=CPUStorageRoot<float>(size_t(kWidth)*kWidth,PhysicalMemoryOwner::ExecutionWorkspace,DeviceId::cpu(),
                 CPUStoragePlacement::local(),CPUStorageInitialization::Uninitialized);
@@ -558,15 +602,19 @@ namespace llaminar2::test
             for(const auto& row:graphs.resources())plan.add(row);
             for(const auto& row:calibration.resources())plan.add(row);
             plan.add(observations[0],PhysicalMemoryOwner::ExecutionWorkspace,
-                3*weight_root.physicalBytes()+probe.host_bytes+serving.host_bytes);
+                3*weight_root.physicalBytes()+native_host_bytes+probe.host_bytes+serving.host_bytes);
             plan.add(observations[1],PhysicalMemoryOwner::ExecutionWorkspace,
-                3*size_t(kWidth)*kWidth*sizeof(float)+probe.device_bytes+serving.device_bytes);
+                (3*size_t(kWidth)*kWidth*sizeof(float)+additional_device_bytes)+probe.device_bytes+serving.device_bytes);
             source->admitFinal(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(plan.build()));
             std::array<std::shared_ptr<TensorBase>,3> weights;
             std::array<std::vector<float>,3> original_bytes;
             std::array<const void*,3> original_device_pointers{};
             std::array<ITensorGemm*,3> original_engine_handles{};
             MoEOverlayPreparedExpertPayload resident;
+            std::shared_ptr<TensorBase> fixed_weight;
+            std::vector<std::shared_ptr<TensorBase>> native_weights;
+            MoEOverlayPreparedExpertPayload movable;
+            std::shared_ptr<const MoEOverlayFixedDownProjectionBank> fixed_bank;
             std::unique_ptr<ExpertExecution> serving_execution;
             std::shared_ptr<MoEOverlayParticipantResidencyRegistry> registry;
             PhysicalMemoryAllocationLease weight_gpu_claim;
@@ -575,7 +623,7 @@ namespace llaminar2::test
                 original->worker()->submitAndWait([&]{requireTerminal(*original->worker(),original->worker()->defaultStream());});
                 if(serving_execution)serving_execution->retireOriginalGraph();
                 original->worker()->submitAndWait([&]{
-                    serving_execution.reset();registry.reset();resident={};
+                    serving_execution.reset();registry.reset();fixed_bank.reset();fixed_weight.reset();movable={};native_weights.clear();resident={};
                     for(auto& weight:weights)weight.reset();
                     weight_gpu_claim={};
                 });
@@ -585,7 +633,7 @@ namespace llaminar2::test
             try{
                 original->worker()->submitAndWait([&]{
                     weight_gpu_claim=memory->claimNewAllocation(device,PhysicalMemoryOwner::ExecutionWorkspace,
-                        3*size_t(kWidth)*kWidth*sizeof(float));
+                        (3*size_t(kWidth)*kWidth*sizeof(float)+additional_device_bytes));
                     for(size_t projection=0;projection<weights.size();++projection){
                         auto tensor=std::make_shared<FP32Tensor>(std::vector<size_t>{kWidth,kWidth},weight_root.allocate(memory),DeviceId::cpu());
                         for(size_t i=0;i<size_t(kWidth)*kWidth;++i)tensor->mutable_typed_data()[i]=
@@ -595,6 +643,37 @@ namespace llaminar2::test
                     }
                     auto* stream=original->worker()->defaultStream();
                     resident={prepare(weights[0],device,stream),prepare(weights[1],device,stream),prepare(weights[2],device,stream)};
+                    if (gate_up) {
+                        // The real down slice has local N=H/2 and full K=F;
+                        // substituting the complete expert descriptor is invalid.
+                        std::shared_ptr<ITensorGemm> down;
+                        if(native_gate_up) {
+                            for(size_t index=0;index<native_fixture.size();++index) {
+                                auto storage=native_roots[index].allocate(memory);
+                                std::memcpy(storage.data(),native_fixture[index]->raw_data(),native_fixture[index]->size_bytes());
+                                native_weights.emplace_back(TensorFactory::adoptQuantizedFinalStorage(
+                                    native_fixture[index]->native_type(),native_fixture[index]->shape(),std::move(storage),DeviceId::cpu()));
+                            }
+                            movable=MoEOverlayPreparedExpertPayload::gateUp(prepare(native_weights[0],device,stream),
+                                prepare(native_weights[1],device,stream));
+                            down=prepare(native_weights[2],device,stream);
+                        } else {
+                            fixed_weight=weights[2]->create_view({kWidth/2,kWidth},0);
+                            require(bool(fixed_weight),"original fixed down column view");
+                            down=prepare(fixed_weight,device,stream);
+                            movable=MoEOverlayPreparedExpertPayload::gateUp(resident.gate(),resident.up());
+                        }
+                        const auto ownership=MoEExpertProjectionOwnership::gateUpOwnedDownColumns(
+                            {1,kWidth,kWidth},0,2);
+                        const MoEExpertOwnerParticipant participant{.participant_id=0,.domain_name="original_gpu_service",
+                            .domain_participant_index=0,.device=device,.world_rank=0,.world_rank_known=true};
+                        ExpertGemmRegistry bank_registry;
+                        for(int expert=0;expert<1;++expert)
+                            bank_registry.registerEngineForParticipant(participant.domain_name,device,0,0,0,expert,
+                                ExpertGemmRegistry::WeightRole::DOWN,down.get(),down,ownership);
+                        fixed_bank=MoEOverlayFixedDownProjectionBank::resolve(bank_registry,participant,0,ownership);
+                        (void)fixed_bank->exportDescriptorTable();
+                    }
                     const std::array engines{resident.gate(),resident.up(),resident.down()};
                     for(size_t i=0;i<engines.size();++i){
                         MoEOverlayPreparedWeightSource physical;
@@ -648,16 +727,56 @@ namespace llaminar2::test
                 EXPECT_THROW((void)memory->reserveNewAllocations(device,PhysicalMemoryOwner::NativeGraphExecutable,1),std::logic_error);
                 const auto preparation_host=memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativePreparationGraphExecutable);
                 const auto preparation_gpu=memory->reservedBytes(device,PhysicalMemoryOwner::NativePreparationGraphExecutable);
-                const auto measured=MoEOverlayCPUServiceMeasurement::measure(*registry,1,catalog,topology,{kWidth,kWidth},memory,&profile,&inventory);
-                require(measured.size()==1,"exact completed prepared service row");
-                for(size_t phase=0;phase<3;++phase){
-                    EXPECT_GT(measured.front().total_nanoseconds[phase],0u);
-                    EXPECT_EQ(measured.front().sample_count[phase],3u);
-                    const auto source_phase=phase==expertHistogramProductionSourceIndex(ExpertHistogramSource::DecodeToken)?ExpertHistogramSource::DecodeToken:
-                        phase==expertHistogramProductionSourceIndex(ExpertHistogramSource::PrefillChunk)?ExpertHistogramSource::PrefillChunk:ExpertHistogramSource::GroupedVerifier;
-                    EXPECT_EQ(measured.front().activation_count[phase],uint64_t(MoEOverlayCPUServiceMeasurement::rowsForPhase(source_phase))*3);
+                if (gate_up) {
+                    const auto pair=movable;
+                    // This component owns one original GPU and one real
+                    // prepared expert. It does not advertise a measured TP4
+                    // domain or duplicate sources to enter a model policy.
+                    LocalTPContext owner_domain({GlobalDeviceAddress::fromLocalDeviceId(device)},
+                        {1.0f},device.is_cuda()?CollectiveBackendType::NCCL:CollectiveBackendType::RCCL);
+                    const std::array original_sources{pair};
+                    const PlanningPreparedOwnerDispatch dispatch{.domain=&owner_domain,.top_k=1,
+                        .resident_sources=original_sources,.has_live_rows=false};
+                    auto calibration=PlanningGPUExpertMeasurement::beginPreparedCalibration(device,memory);
+                    const auto invoke=[&](const MoEOverlayPreparedExpertPayload& payload,
+                        std::shared_ptr<const MoEOverlayFixedDownProjectionBank> bank,int expert,
+                        int layer=0,int width=kWidth,int intermediate=kWidth) {
+                        return PlanningGPUExpertMeasurement::measurePrepared(payload,device,layer,
+                            ExpertHistogramSource::DecodeToken,width,intermediate,memory,probe_workspace,calibration,
+                            std::move(bank),expert,dispatch);
+                    };
+                    EXPECT_THROW((void)invoke(pair,{},0),std::invalid_argument);
+                    const auto foreign=device.is_cuda()?DeviceId::rocm(device.ordinal):DeviceId::cuda(device.ordinal);
+                    EXPECT_THROW((void)PlanningGPUExpertMeasurement::measurePrepared(pair,foreign,0,
+                        ExpertHistogramSource::DecodeToken,kWidth,kWidth,memory,probe_workspace,calibration,
+                        fixed_bank,0,dispatch),std::invalid_argument);
+                    EXPECT_THROW((void)invoke(pair,fixed_bank,-1),std::invalid_argument);
+                    EXPECT_THROW((void)invoke(pair,fixed_bank,1),std::invalid_argument);
+                    EXPECT_THROW((void)invoke(pair,fixed_bank,0,1),std::invalid_argument);
+                    EXPECT_THROW((void)invoke(pair,fixed_bank,0,0,kWidth/2),std::invalid_argument);
+                    EXPECT_THROW((void)invoke(pair,fixed_bank,0,0,kWidth,kWidth/2),std::invalid_argument);
+                    EXPECT_THROW((void)invoke(resident,fixed_bank,0),std::invalid_argument);
+                    // Same retained calibration definition is reset and reused,
+                    // including a large-to-small replay, without changing weights.
+                    for(int replay=0;replay<2;++replay)
+                        for(const auto phase:{ExpertHistogramSource::PrefillChunk,
+                            ExpertHistogramSource::GroupedVerifier,ExpertHistogramSource::DecodeToken})
+                            EXPECT_GT(PlanningGPUExpertMeasurement::measurePrepared(pair,device,0,phase,
+                                kWidth,kWidth,memory,probe_workspace,calibration,fixed_bank,0,dispatch),0u);
+                    calibration.reset();
                 }
-                EXPECT_TRUE(catalog.serviceEvidenceGaps(catalog.withPreparedServiceEvidence(live,measured,{0},topology),{0},topology).empty());
+                if(!gate_up) {
+                    const auto measured=MoEOverlayCPUServiceMeasurement::measure(*registry,1,catalog,topology,{kWidth,kWidth},memory,&profile,&inventory);
+                    require(measured.size()==1,"exact completed prepared service row");
+                    for(size_t phase=0;phase<3;++phase){
+                        EXPECT_GT(measured.front().total_nanoseconds[phase],0u);
+                        EXPECT_EQ(measured.front().sample_count[phase],3u);
+                        const auto source_phase=phase==expertHistogramProductionSourceIndex(ExpertHistogramSource::DecodeToken)?ExpertHistogramSource::DecodeToken:
+                            phase==expertHistogramProductionSourceIndex(ExpertHistogramSource::PrefillChunk)?ExpertHistogramSource::PrefillChunk:ExpertHistogramSource::GroupedVerifier;
+                        EXPECT_EQ(measured.front().activation_count[phase],uint64_t(MoEOverlayCPUServiceMeasurement::rowsForPhase(source_phase))*3);
+                    }
+                    EXPECT_TRUE(catalog.serviceEvidenceGaps(catalog.withPreparedServiceEvidence(live,measured,{0},topology),{0},topology).empty());
+                }
                 std::vector<MoEOverlayParticipantLayerServiceTotals> after_live;
                 require(registry->endpoint(0)->trySnapshotServiceMeasurements(&after_live),"unchanged live service snapshot");
                 require(after_live.size()==1,"unchanged live service geometry");
@@ -780,10 +899,14 @@ namespace llaminar2::test
     TEST(PreparedExpertServiceExecution, CPUAllFormats) { prove(DeviceId::cpu()); }
 #ifdef HAVE_CUDA
     TEST(PreparedExpertServiceExecution, CUDAOriginalMeasurement) { proveProductionGPUMeasurement(DeviceId::cuda(0)); }
+    TEST(PreparedExpertServiceExecution, CUDAGateUpOriginalMeasurement) { proveProductionGPUMeasurement(DeviceId::cuda(0),true); }
+    TEST(PreparedExpertServiceExecution, CUDANativeGateUpOriginalMeasurement) { proveProductionGPUMeasurement(DeviceId::cuda(0),true,true); }
     TEST(PreparedExpertServiceExecution, CUDAAllFormats) { prove(DeviceId::cuda(0)); }
 #endif
 #ifdef HAVE_ROCM
     TEST(PreparedExpertServiceExecution, ROCmOriginalMeasurement) { proveProductionGPUMeasurement(DeviceId::rocm(0)); }
+    TEST(PreparedExpertServiceExecution, ROCmGateUpOriginalMeasurement) { proveProductionGPUMeasurement(DeviceId::rocm(0),true); }
+    TEST(PreparedExpertServiceExecution, ROCmNativeGateUpOriginalMeasurement) { proveProductionGPUMeasurement(DeviceId::rocm(0),true,true); }
     TEST(PreparedExpertServiceExecution, ROCmAllFormats) { prove(DeviceId::rocm(0)); }
 #endif
 }

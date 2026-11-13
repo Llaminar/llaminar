@@ -12,6 +12,7 @@
  */
 
 #pragma once
+#include "planning/PlanningNativeContextEvidence.h"
 #include "loaders/NativeWeightLoadStaging.h"
 #include "backends/NativeOrderingEventBudgetProjection.h"
 #include "backends/CPUExecutionGeometry.h"
@@ -45,6 +46,7 @@
 
 namespace llaminar2
 {
+class PlanningTensorIndex;
 class IMPIContext;
 struct MoERoutedExpertPlacementPlan;
 
@@ -241,6 +243,8 @@ class NativeContextPreparation;
 
 struct DevicePlanConfig
 {
+    /** Pure original source index; never a physical capacity, quota or live weight authority. */
+    std::shared_ptr<const PlanningTensorIndex> source_tensor_index;
     /** Immutable event-program certificate source; production selects installed rows lazily.
      * Recorded bounds can only originate from the named closed replay fixture.
      * This is a BOM input, never a mutable catalog, allocation balance or mode flag.
@@ -504,6 +508,8 @@ struct DevicePlanConfig
 
     /** Native graph family whose opaque driver storage must be admitted. */
     CapturedServingGraphMemoryInventory captured_serving_graphs;
+    /** Metadata-only original birth; never present alongside a live source. */
+    std::optional<PlanningNativeContextDeclaration> planning_native_context_birth;
 
     /**
      * Diagnostic checkpoint storage retained beside captured executables.

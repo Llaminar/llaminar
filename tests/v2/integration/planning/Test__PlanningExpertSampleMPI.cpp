@@ -7,6 +7,8 @@
  * assertions cover every source format. Asymmetric failures must fail all
  * ranks before traffic, then allow a clean next transaction on the same MPI
  * context. Physical-node membership is checked independently of service time.
+ * Source-backed startup experts cover exactly decode and prefill; live grouped
+ * verifier service is certified separately through prepared runtime endpoints.
  */
 #include "planning/PlanningExpertSample.h"
 #include "planning/PlanningMatrixSample.h"
@@ -264,28 +266,40 @@ void proveFileIndependentService(DeviceId follower_device)
                 if (device.is_gpu())
                     GPUDeviceContextPool::instance().getContext(device).submitAndWait([&] {
                         const auto observation = PlanningGPUExpertMeasurement::measure(sample, device, memory);
-                        EXPECT_EQ(observation.phases.size(), 3u);
+                        EXPECT_EQ(observation.phases.size(), 2u);
+                        if(observation.phases.size()!=2)throw std::runtime_error("Startup expert phase coverage is incomplete");
+                        EXPECT_EQ(observation.phases[0].phase,ExpertHistogramSource::DecodeToken);
+                        EXPECT_EQ(observation.phases[1].phase,ExpertHistogramSource::PrefillChunk);
                         for (const auto &phase : observation.phases)
                         {
                             EXPECT_GT(phase.graph_nodes, 0u);
                             EXPECT_GT(phase.service.elapsedSeconds(), 0);
+                            EXPECT_DOUBLE_EQ(phase.service.completedWork(),3.0*6*phase.rows*
+                                observation.input_width*observation.intermediate_width);
                         }
                     });
                 else
                 {
                     const auto observation = PlanningCPUExpertMeasurement::measure(sample, device, memory);
-                    EXPECT_EQ(observation.phases.size(), 3u);
-                    for (const auto &phase : observation.phases) EXPECT_GT(phase.service.elapsedSeconds(), 0);
+                    EXPECT_EQ(observation.phases.size(), 2u);
+                        if(observation.phases.size()!=2)throw std::runtime_error("Startup expert phase coverage is incomplete");
+                    EXPECT_EQ(observation.phases[0].phase,ExpertHistogramSource::DecodeToken);
+                    EXPECT_EQ(observation.phases[1].phase,ExpertHistogramSource::PrefillChunk);
+                    for (const auto &phase : observation.phases) {
+                        EXPECT_GT(phase.service.elapsedSeconds(), 0);
+                        EXPECT_DOUBLE_EQ(phase.service.completedWork(),3.0*6*phase.rows*
+                            observation.input_width*observation.intermediate_width);
+                    }
                 }
                 // A functional completion receipt, not a fabricated cost or
                 // model benchmark. Local sampler failure reaches consensus.
-                return std::vector<uint8_t>{3};
+                return std::vector<uint8_t>{2};
             }, [&](auto completed) {
                 EXPECT_EQ(completed.size(), static_cast<size_t>(mpi->world_size()));
                 for (const auto &rank : completed)
                 {
                     EXPECT_EQ(rank.bytes.size(), 1u);
-                    EXPECT_EQ(rank.bytes.front(), 3u);
+                    EXPECT_EQ(rank.bytes.front(), 2u);
                     EXPECT_EQ(mpi->clusterInventory()->connectionBetweenRanks(0, rank.discovery_rank).destinationRank(),
                         rank.discovery_rank);
                 }

@@ -7,6 +7,8 @@
  * NUMA IDs, or an assumed rank-zero request authority. Attention obligations
  * follow actual stage/tensor ownership, including recurrent-only PP slices and
  * the separately owned MTP predictor, without removing compute participants.
+ * Selected GPU locality retains immutable PCI ancestry and directed peer
+ * observations; absent information never becomes an inferred switch or edge.
  */
 #include "app/modes/ServerRankMembership.h"
 #include "app/modes/ServerExecutionEvidence.h"
@@ -333,6 +335,65 @@ TEST(ServerExecutionEvidence, PhysicalParticipantsAreNotVisibilityOrRankCounts)
     EXPECT_THROW(serverExecutionParticipantTags(DeviceId::rocm(3), first, 0), std::invalid_argument);
     first.cpu.numa_node = 1;
     EXPECT_THROW(serverExecutionParticipantTags(DeviceId::cpu(), first, 0), std::invalid_argument);
+}
+
+/** @test Physical peer evidence uses original UUIDs, bridge order and complete directed observations. */
+TEST(ServerExecutionEvidence, GPUAncestryAndPeersRetainObservedIdentityForAnyDomainWidth)
+{
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    for (const int count : {1, 2, 3, 5, 8, 9})
+    {
+        RankInventory observed{.rank = 0, .node_id = 0};
+        observed.cpu.numa_node = 6;
+        for (int index = 0; index < count; ++index)
+        {
+            DeviceInfo gpu;
+            gpu.type = backend;
+            gpu.local_device_id = 7 + index * 3;
+            gpu.uuid = "original-" + std::to_string(index);
+            gpu.numa_node = 6;
+            gpu.native_isa = backend == DeviceType::CUDA ? "sm86" : "gfx906";
+            gpu.pci_bus_address = "0000:3" + std::to_string(index) + ":00.0";
+            gpu.pcie_upstream_bdfs = {"0000:80:01.0", "0000:80:00.0", "0000:00:01.0"};
+            observed.gpus.push_back(gpu);
+        }
+        auto &matrix = backend == DeviceType::CUDA ? observed.p2p_cuda : observed.p2p_rocm;
+        auto &extent = backend == DeviceType::CUDA ? observed.p2p_cuda_count : observed.p2p_rocm_count;
+        extent = count;
+        matrix.assign(count * count, true);
+        const DeviceId first{backend, 7};
+        const auto original = serverExecutionParticipantTags(first, observed, 6);
+        EXPECT_EQ(nlohmann::json::parse(original.at("pcie_upstream_bdfs")), observed.gpus[0].pcie_upstream_bdfs);
+        EXPECT_EQ(original.at("peer_access_matrix_observed"), "true");
+        EXPECT_EQ(original.at("numa_node"), "6");
+        const auto peers = nlohmann::json::parse(original.at("mutual_peer_physical_ids"));
+        ASSERT_EQ(peers.size(), static_cast<std::size_t>(count - 1));
+        EXPECT_EQ(original.at("native_isa"), observed.gpus[0].native_isa);
+        for (int index = 1; index < count; ++index)
+            EXPECT_NE(std::find(peers.begin(), peers.end(), "original-" + std::to_string(index)), peers.end());
+        std::reverse(observed.gpus.begin(), observed.gpus.end());
+        EXPECT_EQ(serverExecutionParticipantTags(first, observed, 6), original);
+        std::reverse(observed.gpus.begin(), observed.gpus.end());
+        if (count > 1)
+        {
+            matrix[1] = false;
+            const auto directed = serverExecutionParticipantTags(first, observed, 6);
+            const auto mutual = nlohmann::json::parse(directed.at("mutual_peer_physical_ids"));
+            EXPECT_EQ(mutual.size(), static_cast<std::size_t>(count - 2));
+            EXPECT_EQ(std::find(mutual.begin(), mutual.end(), "original-1"), mutual.end());
+        }
+        matrix.pop_back();
+        const auto incomplete = serverExecutionParticipantTags(first, observed, 6);
+        EXPECT_EQ(incomplete.at("peer_access_matrix_observed"), "false");
+        EXPECT_TRUE(nlohmann::json::parse(incomplete.at("mutual_peer_physical_ids")).empty());
+        observed.gpus[0].pcie_upstream_bdfs.clear();
+        EXPECT_TRUE(nlohmann::json::parse(serverExecutionParticipantTags(first, observed, 6)
+            .at("pcie_upstream_bdfs")).empty());
+        observed.gpus[0].pcie_upstream_bdfs = {"0000:80:00.0", "0000:80:00.0"};
+        EXPECT_THROW(serverExecutionParticipantTags(first, observed, 6), std::invalid_argument);
+        observed.gpus[0].pcie_upstream_bdfs = {observed.gpus[0].pci_bus_address};
+        EXPECT_THROW(serverExecutionParticipantTags(first, observed, 6), std::invalid_argument);
+    }
 }
 
 TEST(ServerExecutionEvidence, ReportsResolvedParallelismNotRequestedFlagSpelling)

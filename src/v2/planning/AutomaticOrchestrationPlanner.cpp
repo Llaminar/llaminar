@@ -2,16 +2,19 @@
  * @file AutomaticOrchestrationPlanner.cpp
  * @brief Cost selection without first-fit placement or duplicated memory admission.
  *
- * Proposals are admitted and discarded one at a time. Only the current winner
- * stays alive, so a large topology search does not retain a Cartesian product
- * of configurations/BOMs. A cost evaluator receives the compiled rank geometry
+ * Proposals are admitted in bounded worker-team batches. Pure preparation and
+ * quote owners remain worker-local; callbacks and winner selection drain in
+ * original order. No Cartesian product of configurations/BOMs is retained. A cost evaluator receives the compiled rank geometry
  * and resolved expert quotas, never the original unadmitted proposal.
  */
 #include "planning/AutomaticOrchestrationPlanner.h"
+#include "planning/PlanningAdmissionPreparation.h"
+#include "planning/PlanningMemoryQuoteReuse.h"
 #include "planning/PhysicalMemoryCapacityExhausted.h"
 #include "planning/ObservedPeerGrouping.h"
 #include "utils/Logger.h"
 #include <sstream>
+#include <iomanip>
 #include "config/OrchestrationConfigDocument.h"
 #include <algorithm>
 #include <cmath>
@@ -19,6 +22,8 @@
 #include <set>
 #include <stdexcept>
 #include <tuple>
+#include <omp.h>
+#include <exception>
 
 namespace llaminar2
 {
@@ -156,6 +161,47 @@ namespace llaminar2
             }
             return result;
         }
+        /**
+         * @brief Describe one admitted proposal and its exact cost on a single diagnostic line.
+         *
+         * Groups retain semantic visitor order and original discovery ownership;
+         * newline escaping keeps evaluator evidence from impersonating another
+         * record. Called only inside the DEBUG logging guard, never for ranking.
+         */
+        std::string candidateCostDiagnostic(const AdmittedOrchestrationCandidate &candidate,
+            const OrchestrationCostEstimate &cost, std::size_t ordinal)
+        {
+            std::ostringstream text;
+            text << std::setprecision(17) << "AutomaticCandidateCost candidate=" << ordinal
+                << " strategy=" << orchestrationStrategyName(candidate.strategy()) << " groups=[";
+            bool first_group = true;
+            for (const auto &group : peerGroups(candidate))
+            {
+                if (!first_group) text << ';';
+                first_group = false;
+                text << "discovery_rank=" << candidate.membership().discoveryRanks().at(group.rank) << ":devices=[";
+                for (std::size_t i = 0; i < group.devices.size(); ++i)
+                {
+                    if (i) text << ',';
+                    text << deviceTypeToString(group.devices[i].type) << ':' << group.devices[i].ordinal;
+                }
+                text << ']';
+            }
+            std::string evidence;
+            for (const char c : cost.evidence())
+                if (c == '\\') evidence += "\\\\";
+                else if (c == '\n') evidence += "\\n";
+                else if (c == '\r') evidence += "\\r";
+                else evidence += c;
+            text << "] prompt_tokens=" << cost.workload().promptTokens()
+                << " generation_tokens=" << cost.workload().generationTokens()
+                << " request_seconds=" << cost.requestSeconds()
+                << " prefill_seconds=" << cost.prefillSeconds()
+                << " decode_seconds_per_token=" << cost.decodeSecondsPerToken()
+                << " evidence=" << std::quoted(evidence);
+            return text.str();
+        }
+
         /** @brief Publish original chosen identities and pair facts through normal planning diagnostics. */
         void reportPeerGroups(const AdmittedOrchestrationCandidate& candidate)
         {
@@ -216,28 +262,36 @@ namespace llaminar2
         std::optional<PricedCandidate> best;
         OrchestrationSelectionCounts counts;
         std::string last_capacity_error;
-        visitAutomaticOrchestrationCandidates(request, source.metadata(), inventory, [&](auto proposal) {
-            ++counts.proposed;
-            const auto strategy = proposal.strategy;
-            std::optional<AdmittedOrchestrationCandidate> candidate;
-            try
-            {
-                candidate = AdmittedOrchestrationCandidate::admit(std::move(proposal), source, memory);
+        if(omp_in_parallel())
+            throw std::invalid_argument("Automatic planning cannot reenter an active OpenMP source/quote owner");
+        const int workers=omp_get_max_threads();
+        struct AdmissionSlot {
+            OrchestrationStrategy strategy;
+            std::optional<AutomaticOrchestrationCandidate> proposal;
+            std::optional<AdmittedOrchestrationCandidate> admitted;
+            std::exception_ptr error;
+        };
+        std::vector<AdmissionSlot> batch;
+        std::vector<PlanningAdmissionPreparation*> preparations;
+        std::vector<std::exception_ptr> initialization_errors;
+        std::exception_ptr failure;
+        const auto consider=[&](AdmissionSlot &slot) {
+            if(slot.error) {
+                try {std::rethrow_exception(slot.error);}
+                catch(const PhysicalMemoryCapacityExhausted &error) {
+                    ++counts.capacity_rejected;last_capacity_error=error.what();
+                    if(rejected)rejected(slot.strategy,last_capacity_error);
+                    return;
+                }
             }
-            catch (const PhysicalMemoryCapacityExhausted &error)
-            {
-                ++counts.capacity_rejected;
-                last_capacity_error = error.what();
-                if (rejected) rejected(strategy, last_capacity_error);
-                return;
-            }
-            // Evaluator errors are outside the admission catch. A missing
-            // measurement, including one mislabeled as exhaustion, is fatal;
-            // it cannot select a different execution path without explanation.
+            auto &candidate=slot.admitted;
+            // Evaluation and callbacks stay on the original caller, outside
+            // admission's capacity catch, with exactly serial source ordering.
             auto cost = evaluate(*candidate, workload);
             if (cost.workload() != workload)
                 throw std::invalid_argument("Automatic candidate cost describes a different workload");
             ++counts.evaluated;
+            LOG_DEBUG(candidateCostDiagnostic(*candidate, cost, counts.evaluated));
             bool prefer = !best || cost.requestSeconds() < best->cost.requestSeconds();
             if (best && cost.requestSeconds() == best->cost.requestSeconds())
             {
@@ -271,7 +325,75 @@ namespace llaminar2
             {
                 best = PricedCandidate{std::move(*candidate), std::move(cost)};
             }
-        });
+        };
+        const auto flush=[&] {
+            if(batch.empty())return;
+            auto **local_preparations=preparations.data();
+            const auto *original_source=&source;
+            const auto *original_memory=&memory;
+#pragma omp taskgroup
+            {
+                for(size_t index=0;index<batch.size();++index) {
+                    auto *slot=&batch[index];
+#pragma omp task firstprivate(slot,local_preparations,original_source,original_memory)
+                    {
+                        try {
+                            slot->admitted.emplace(AdmittedOrchestrationCandidate::admit(std::move(*slot->proposal),
+                                *original_source,*original_memory,local_preparations[omp_get_thread_num()]));
+                        } catch(...) {slot->error=std::current_exception();}
+                        slot->proposal.reset();
+                    }
+                }
+            }
+            try {for(auto &slot:batch)consider(slot);}
+            catch(...) {batch.clear();throw;}
+            batch.clear();
+        };
+#pragma omp parallel num_threads(workers)
+        {
+            // The configured budget is an upper bound. Dynamic/thread-limited
+            // runtimes may legitimately form a smaller actual team.
+#pragma omp master
+            {
+                try {
+                    const auto width=static_cast<size_t>(omp_get_num_threads());
+                    batch.reserve(width);preparations.resize(width,nullptr);initialization_errors.resize(width);
+                } catch(...) {failure=std::current_exception();}
+            }
+#pragma omp barrier
+            // These lexical owners are constructed and retired by the same
+            // persistent worker. TLS quotes never migrate across OMP teams.
+            const int worker=omp_get_thread_num();
+            std::unique_ptr<PlanningAdmissionPreparation> preparation;
+            std::unique_ptr<PlanningMemoryQuoteReuse> quotes;
+            try { if(!failure) {
+                preparation=std::make_unique<PlanningAdmissionPreparation>(source.loader(),source.metadata(),memory.weight_load);
+                quotes=std::make_unique<PlanningMemoryQuoteReuse>(source.metadata().tensorIndex());
+                preparations[static_cast<size_t>(worker)]=preparation.get();
+            }} catch(...) {initialization_errors[static_cast<size_t>(worker)]=std::current_exception();}
+#pragma omp barrier
+#pragma omp master
+            {
+                try { if(!failure) {
+                    for(const auto &error:initialization_errors)if(error)std::rethrow_exception(error);
+                    std::exception_ptr enumeration_failure;
+                    try {
+                        visitAutomaticOrchestrationCandidates(request,source.metadata(),inventory,[&](auto proposal) {
+                            ++counts.proposed;
+                            const auto strategy=proposal.strategy;
+                            batch.push_back({strategy,std::move(proposal),{}, {}});
+                            if(batch.size()==static_cast<size_t>(omp_get_num_threads()))flush();
+                        });
+                    } catch(...) {enumeration_failure=std::current_exception();}
+                    // If enumeration fails after emitting a partial batch, the
+                    // preceding callbacks still happen before that later error.
+                    flush();
+                    if(enumeration_failure)std::rethrow_exception(enumeration_failure);
+                }} catch(...) {failure=std::current_exception();}
+            }
+#pragma omp barrier
+        }
+        if(failure)std::rethrow_exception(failure);
         if (counts.proposed == 0)
             throw std::invalid_argument("No observed topology satisfies the automatic planning constraints");
         if (!best)

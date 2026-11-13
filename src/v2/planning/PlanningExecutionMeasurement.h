@@ -5,15 +5,23 @@
  * Prepared kernels, captured graphs and their admitted storage remain owned by
  * the caller. This boundary only measures execution: it never discovers a
  * device, loads a model, changes dispatch, or consults PerfStats. GPU samples
- * replay the existing executable on its exact stream and use native events;
- * CPU samples include the completed production workshare's wall time.
+ * retain exact-stream execution; prepared startup bodies use an owned fixed-clock
+ * ordered parent, while standalone graph APIs retain native-event timing;
+ * CPU samples include the completed production workshare's wall time. The
+ * split GPU owner retains its sealed graphs until creating-thread retirement.
+ * Compute uses contiguous warmup/timed work; explicitly published host links
+ * refresh host-owned bytes before each separately clock-bracketed invocation.
  */
 #pragma once
 
 #include "backends/DeviceId.h"
 #include "backends/ExplicitGPUStream.h"
 #include "planning/OrchestrationPerformanceEvidence.h"
+#include "planning/PlanningGPUClockBuffer.h"
 #include <functional>
+#include <memory>
+#include <vector>
+#include <span>
 #include <string>
 
 namespace llaminar2
@@ -21,6 +29,7 @@ namespace llaminar2
     class IBackend;
     class IGPUGraphCapture;
     class RetainedParticipantGraphExecutable;
+    class IWorkerGPUContext;
 
     /**
      * @brief Immutable work declaration for one bounded production sample.
@@ -52,10 +61,114 @@ namespace llaminar2
         std::string provenance_;
     };
 
+    /**
+     * @brief Worker-owned device-clock windows with one external ordering completion.
+     *
+     * Device stamp writes belong inside the retained graph, never around host
+     * submission. The caller retains the original PMA clock buffer through graph
+     * retirement. Only one Ordering event publishes compact readback completion.
+     */
+    class PlanningCapturedGPUClockSampler final
+    {
+    public:
+        /** @brief Bind positive even clock slots and one original-worker Ordering event. */
+        PlanningCapturedGPUClockSampler(IWorkerGPUContext &worker, ExplicitGPUStream stream, PlanningGPUClockBuffer &clock);
+        /** @brief Retire the original worker's Ordering event after captured graph borrowers retire. */
+        ~PlanningCapturedGPUClockSampler();
+        PlanningCapturedGPUClockSampler(const PlanningCapturedGPUClockSampler &) = delete;
+        PlanningCapturedGPUClockSampler &operator=(const PlanningCapturedGPUClockSampler &) = delete;
+        /** @brief Record the next exact window's device-clock start inside native capture. */
+        void recordStart(size_t window);
+        /** @brief Record the matching stop inside capture; skipped/overlapping windows are rejected. */
+        void recordStop(size_t window);
+        /** @brief Bind the fully recorded window family to this exact instantiated graph. */
+        void seal(const IGPUGraphCapture &graph);
+        /** @return Immutable number of captured timing windows; independent of launch repetitions. */
+        size_t windowCount() const noexcept;
+        /**
+         * @brief Warm up once, replay once, then read only the compact clock bank after completion.
+         * @param work One exact positive work declaration per sealed captured window.
+         * @param graph Original sealed executable with exact stream and captured timing bindings.
+         * @return Positive per-device tick deltas converted by the admitted fixed clock frequency.
+         * @throws std::exception for foreign/order/incomplete state, event errors or standard30s timeout.
+         */
+        std::vector<PlanningServiceObservation> samples(std::span<const PlanningMeasurementWork> work,
+            const IGPUGraphCapture &graph);
+    private:
+        friend class PlanningPreparedGPUObservation;
+        /** @brief Launch a sealed parent's clock-bracketed work once, then read its compact clock bank. */
+        std::vector<PlanningServiceObservation> samplesFromPreparedParent(
+            std::span<const PlanningMeasurementWork> work, const IGPUGraphCapture &graph);
+        struct Impl;
+        std::unique_ptr<Impl> impl_;
+    };
+
+    /** @brief One original-worker clock transaction; staged preparation seals an ordered warmup and timed transaction. */
+    class PlanningPreparedGPUObservation final
+    {
+    public:
+        ~PlanningPreparedGPUObservation();
+        PlanningPreparedGPUObservation(PlanningPreparedGPUObservation&&);
+        PlanningPreparedGPUObservation& operator=(PlanningPreparedGPUObservation&&);
+        PlanningPreparedGPUObservation(const PlanningPreparedGPUObservation&)=delete;
+        /** @brief Consume the sealed owner using its explicit contiguous or freshly published protocol.
+         * @return Three measured invocations; one warmup and every host publication are outside the clock interval.
+         * @throws std::logic_error For foreign-thread, consumed, moved or invalid executable state.
+         */
+        PlanningServiceObservation observe();
+        /** @brief Instantiate and seal the original four-graph family without executing its body.
+         * @param memory Canonical authority admitting every graph runtime context.
+         * @throws std::logic_error For repeated, foreign or incomplete preparation.
+         */
+        void prepare(const std::shared_ptr<PhysicalMemoryAuthority> &memory);
+        /** @return Resident bytes of the four live graphs, for the caller's family audit. */
+        size_t residentMemoryBytes() const;
+        /** @return Original production-body node count, excluding clock instrumentation. */
+        size_t graphNodeCount() const;
+    private:
+        friend class PlanningExecutionMeasurement;
+        struct Impl;
+        explicit PlanningPreparedGPUObservation(std::unique_ptr<Impl>);
+        std::unique_ptr<Impl> impl_;
+    };
+
     /** @brief One setup-only warmup followed by a fixed, short observation batch. */
     class PlanningExecutionMeasurement final
     {
     public:
+        /**
+         * @brief Own an ended production body and record two unique fixed-clock marker fragments.
+         * @param work Exact single-body completed-work geometry and immutable provenance.
+         * @param worker Original worker owning the body and every new graph on its exact stream.
+         * @param clock Exclusive two-slot clock bank, admitted/materialized before any cohort capture.
+         * @param body Ended original graph; the token owns its lifetime and all four ordered parent imports.
+         * @return Recorded token; prepare(memory) must complete after the cohort capture fence.
+         */
+        static PlanningPreparedGPUObservation recordGPU(const PlanningMeasurementWork &work,
+            IWorkerGPUContext &worker,std::unique_ptr<PlanningGPUClockBuffer> clock,
+            std::unique_ptr<IGPUGraphCapture> body);
+        /**
+         * @brief Record the same fixed-clock owner for fresh host publication before every invocation.
+         * @param work Exact single-body completed-work geometry and source/NUMA provenance.
+         * @param worker Original GPU worker for every lifecycle operation.
+         * @param clock Exclusive two-slot bank admitted before capture.
+         * @param body Ended, uninstantiated production copy body.
+         * @param publish Setup-only host write, invoked after the previous parent/readback retires.
+         * @return Token retaining a three-step [start,body,stop] parent. Observation
+         * performs one warmup and three measured replays, each after fresh publication;
+         * compact fixed-clock readback excludes all host publication/submission gaps.
+         */
+        static PlanningPreparedGPUObservation recordPublishedGPU(const PlanningMeasurementWork &work,
+            IWorkerGPUContext &worker,std::unique_ptr<PlanningGPUClockBuffer> clock,
+            std::unique_ptr<IGPUGraphCapture> body,std::function<void()> publish);
+        static constexpr size_t kPreparedGraphCount = 4; ///< Body, two unique markers and one ordered parent.
+        /** @brief Declare one simultaneously live timer family, excluding caller-owned body payloads.
+         * @param host Original same-rank CPU clock backing owner.
+         * @param execution Original GPU owner for clock slots and four native graph reservations.
+         * @param builder Canonical PMA declaration receiving exact concurrent storage.
+         */
+        static void contributeGPUObservationMemory(PhysicalMemoryResource host,PhysicalMemoryResource execution,
+            PhysicalMemoryPlanBuilder &builder);
         static constexpr int kTimedInvocations = 3; ///< No unbounded startup calibration loop.
         /**
          * @brief Measure a prepared CPU operation including all workshare completion.
@@ -98,22 +211,6 @@ namespace llaminar2
         static PlanningServiceObservation gpu(const PlanningMeasurementWork &work,
             IBackend &backend, DeviceId device, RetainedParticipantGraphExecutable &graph);
 
-        /**
-         * @brief Observe retained GPU work with a fresh host publication before every invocation.
-         * @param work Exact completed work and operation identity.
-         * @param backend Canonical exact-device backend.
-         * @param device GPU owning the executable and timing events.
-         * @param graph Prepared immutable graph, reused without recapture.
-         * @param publish Untimed setup-only host write; called only after the preceding invocation retires.
-         * @return Sum of three native event intervals, excluding publications and warmup.
-         *
-         * Mapped-input link samples must not repeatedly price unchanged cached
-         * bytes. This explicit publication boundary changes only host-owned
-         * sample storage, never inference state. It is not a host callback node,
-         * hot-path synchronization or permission to mutate a live graph input.
-         */
-        static PlanningServiceObservation gpuPublished(const PlanningMeasurementWork &work,
-            IBackend &backend, DeviceId device, const IGPUGraphCapture &graph,
-            const std::function<void()> &publish);
+
     };
 }

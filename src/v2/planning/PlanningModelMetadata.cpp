@@ -10,6 +10,8 @@
  * Native calibration samples use the same original-coordinate window reader as
  * model preparation. Reads populate the existing final sample owner directly;
  * there is no second matrix-sized reader allocation or retained source parent.
+ * Derived role/layer indices retain only source ordinals and canonical enums;
+ * tensor metadata and its wire format remain the original profile authority.
  */
 #include "planning/PlanningModelMetadata.h"
 #include "planning/PlanningPublication.h"
@@ -35,36 +37,103 @@ namespace llaminar2
 
     }
 
-    PlanningModelMetadata::PlanningModelMetadata(ModelMemoryProfile profile, int main_layer_count)
-        : profile_(std::move(profile)), main_layer_count_(main_layer_count)
+    PlanningTensorIndex::PlanningTensorIndex(ModelMemoryProfile profile):profile_(std::move(profile))
     {
-        if (main_layer_count <= 0 || main_layer_count > profile_.n_layers)
-            throw std::invalid_argument("Planning metadata has an invalid main-layer interval");
-        const auto errors = executionModelConfig().validate();
-        if (!errors.empty())
-            throw std::invalid_argument("Invalid planning model geometry: " + errors.front());
+        if(profile_.n_layers<=0)throw std::invalid_argument("Planning source has no positive layer geometry");
+        roles_.reserve(profile_.tensors.size());
+        for(size_t index=0;index<profile_.tensors.size();++index) {
+            const auto &tensor=profile_.tensors[index];roles_.push_back(inferWeightRole(tensor.name));
+            first_roles_.try_emplace(roles_.back(),index);names_.try_emplace(tensor.name,index);
+            for(size_t dot=tensor.name.find('.');dot!=std::string::npos;dot=tensor.name.find('.',dot+1))
+                layer_suffixes_.try_emplace(std::pair{tensor.layer_index,std::string_view(tensor.name).substr(dot)},index);
+            if(tensor.layer_index<0)globals_.push_back(index);
+            else layers_[tensor.layer_index].push_back(index);
+        }
     }
+
+    PlanningClassifiedTensor PlanningTensorIndex::classifiedTensor(size_t index) const
+    { return PlanningClassifiedTensor(profile_,index,roles_.at(index)); }
+
+    std::span<const size_t> PlanningTensorIndex::layerTensorIndices(int layer) const
+    {
+        if(layer<0)throw std::invalid_argument("Planning tensor layer is outside original source");
+        const auto found=layers_.find(layer);
+        if(found!=layers_.end())return found->second;
+        if(layer>=profile_.n_layers)throw std::invalid_argument("Planning tensor layer is outside original source");
+        return {};
+    }
+
+    std::optional<size_t> PlanningTensorIndex::firstTensorWithRole(WeightRole role) const noexcept
+    {
+        const auto found=first_roles_.find(role);if(found==first_roles_.end())return std::nullopt;return found->second;
+    }
+
+    const TensorSizeInfo *PlanningTensorIndex::findTensor(std::string_view name) const noexcept
+    {
+        const auto found=names_.find(name);return found==names_.end()?nullptr:&profile_.tensors[found->second];
+    }
+
+    void PlanningTensorIndex::requireProfile(const ModelMemoryProfile &profile) const
+    { if(&profile!=&profile_)throw std::invalid_argument("Planning source index belongs to another immutable profile"); }
+
+    std::optional<WeightRole> PlanningTensorIndex::roleForOriginal(const TensorSizeInfo &tensor) const noexcept
+    {
+        const auto view=classifyOriginal(tensor);return view?std::optional<WeightRole>(view->role()):std::nullopt;
+    }
+
+    std::optional<PlanningClassifiedTensor> PlanningTensorIndex::classifyOriginal(const TensorSizeInfo &tensor) const noexcept
+    {
+        const auto begin=reinterpret_cast<std::uintptr_t>(profile_.tensors.data());
+        const auto address=reinterpret_cast<std::uintptr_t>(&tensor);
+        if(address<begin || (address-begin)%sizeof(TensorSizeInfo)!=0)return std::nullopt;
+        const auto index=(address-begin)/sizeof(TensorSizeInfo);
+        return index<roles_.size()?std::optional<PlanningClassifiedTensor>(PlanningClassifiedTensor(profile_,index,roles_[index])):std::nullopt;
+    }
+
+    const TensorSizeInfo *PlanningTensorIndex::findLayerTensor(int layer,std::string_view suffix) const noexcept
+    {
+        const auto found=layer_suffixes_.find({layer,suffix});
+        return found==layer_suffixes_.end()?nullptr:&profile_.tensors[found->second];
+    }
+
+    PlanningModelMetadata::PlanningModelMetadata(ModelMemoryProfile profile,int main_layer_count)
+        :source_index_(std::make_shared<const PlanningTensorIndex>(std::move(profile))),main_layer_count_(main_layer_count)
+    {
+        if(main_layer_count<=0 || main_layer_count>memoryProfile().n_layers)
+            throw std::invalid_argument("Planning metadata has an invalid main-layer interval");
+        const auto errors=executionModelConfig().validate();
+        if(!errors.empty())throw std::invalid_argument("Invalid planning model geometry: "+errors.front());
+    }
+
+    PlanningClassifiedTensor PlanningModelMetadata::classifiedTensor(size_t index) const
+    { return source_index_->classifiedTensor(index); }
+
+    std::span<const size_t> PlanningModelMetadata::layerTensorIndices(int layer) const
+    { return source_index_->layerTensorIndices(layer); }
+
+    std::optional<size_t> PlanningModelMetadata::firstTensorWithRole(WeightRole role) const noexcept
+    { return source_index_->firstTensorWithRole(role); }
 
     ModelConfig PlanningModelMetadata::executionModelConfig() const
     {
         NativeQuantisedSourceIdentity terminal_head_source;
         // Tensor-directory provenance bounds measured defaults without loading
         // weights or inferring a quantizer from a model filename.
-        for (const auto &tensor : profile_.tensors)
+        for (const auto &tensor : memoryProfile().tensors)
             if (tensor.name == "output.weight")
                 if (const auto *format = native_quantised_formats::forQuantType(tensor.quant_type))
                     terminal_head_source = {.codebook_id = format->codebook_id,
                         .is_superblock = format->is_superblock, .present = true};
         return {
-            .name = profile_.architecture,
+            .name = memoryProfile().architecture,
             .n_layers = main_layer_count_,
-            .n_heads = profile_.n_heads,
-            .n_kv_heads = profile_.n_kv_heads,
-            .hidden_size = profile_.d_model,
-            .intermediate_size = profile_.d_ff,
-            .vocab_size = profile_.vocab_size,
-            .head_dim = profile_.head_dim,
-            .estimated_weight_bytes = profile_.total_native_bytes,
+            .n_heads = memoryProfile().n_heads,
+            .n_kv_heads = memoryProfile().n_kv_heads,
+            .hidden_size = memoryProfile().d_model,
+            .intermediate_size = memoryProfile().d_ff,
+            .vocab_size = memoryProfile().vocab_size,
+            .head_dim = memoryProfile().head_dim,
+            .estimated_weight_bytes = memoryProfile().total_native_bytes,
             .terminal_head_source = terminal_head_source,
         };
     }
@@ -78,7 +147,7 @@ namespace llaminar2
 
     std::vector<uint8_t> PlanningModelMetadata::serialize() const
     {
-        auto payload = profile_.serialize();
+        auto payload = memoryProfile().serialize();
         std::vector<uint8_t> bytes(kDescriptorHeaderBytes);
         std::copy(kDescriptorMagic.begin(), kDescriptorMagic.end(), bytes.begin());
         const auto layers = static_cast<uint32_t>(main_layer_count_);

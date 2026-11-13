@@ -22,6 +22,7 @@ namespace llaminar2
 {
     struct RankInventory;
     class IGlobalTPContext;
+    class ILocalTPContext;
     /**
      * @brief Setup producer on the same rank-affined OpenMP execution as CPU serving.
      *
@@ -179,6 +180,8 @@ namespace llaminar2
          * @param geometry Full original H/F. @param original_domain Existing CPU expert owner, null only on nonmembers.
          * @param memory Original PMA. @param model_profile Original workspace source for GPU targets.
          * @param rank_inventory Same rank's actual backend geometry for GPU targets.
+         * @param owner_domain Original local projection communicator for owner policy.
+         * @param owner_top_k Actual model routed width for that policy.
          * @return Only actual locally rooted samples; cohort contributors emit no rows.
          * @note This does not import live packet timing or install a service price.
          */
@@ -187,7 +190,8 @@ namespace llaminar2
             const MoEOverlayPreparedTargetServicePlan& plan,Geometry geometry,
             const std::shared_ptr<IGlobalTPContext>& original_domain,
             const std::shared_ptr<PhysicalMemoryAuthority>& memory,
-            const ModelMemoryProfile* model_profile=nullptr,const RankInventory* rank_inventory=nullptr);
+            const ModelMemoryProfile* model_profile=nullptr,const RankInventory* rank_inventory=nullptr,
+            const ILocalTPContext* owner_domain=nullptr,int owner_top_k=0);
 
         /**
          * @brief Measure missing priced CPU/GPU class/phase coordinates from the initial bank.
@@ -199,6 +203,8 @@ namespace llaminar2
          * @param memory Sole rank-local physical admission/claim authority.
          * @param model_profile Original source workspace metadata, mandatory for GPU participants.
          * @param rank_inventory Original same-rank physical SM/CU observations, mandatory for GPU participants.
+         * @param owner_domain Original local projection communicator for owner policy.
+         * @param owner_top_k Actual model routed width for that policy.
          * @return Complete local matrix with only genuine prepared observations populated.
          * @throws std::exception for a missing bank, priced class without resident weights, invalid source or failed FFN.
          *
@@ -215,6 +221,7 @@ namespace llaminar2
             Geometry geometry,
             const std::shared_ptr<PhysicalMemoryAuthority> &memory,
             const ModelMemoryProfile *model_profile = nullptr,
-            const RankInventory *rank_inventory = nullptr);
+            const RankInventory *rank_inventory = nullptr,
+            const ILocalTPContext* owner_domain=nullptr,int owner_top_k=0);
     };
 }

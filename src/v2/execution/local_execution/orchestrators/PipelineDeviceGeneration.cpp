@@ -22,6 +22,7 @@
 #include "PipelineMaintenanceAdmission.h"
 #include "execution/compute_stages/stages/MoEDeviceRebalanceStage.h"
 #include "PipelineForwardGraphEdges.h"
+#include "execution/mtp/MTPCheckpointPolicy.h"
 #include "Qwen4ExpFixedHeadPipelinePort.h"
 #include "execution/qwen4exp/FixedHeadPipelineTerminalEvidence.h"
 #include "models/qwen4exp/Qwen4ExpConfig.h"
@@ -205,7 +206,8 @@ std::vector<std::unique_ptr<PipelineForwardGraphEdges>> PipelineDeviceGeneration
         if (!stage.arena_->allocateDeviceStorage(BufferId::HIDDEN_STATE, stage.state_.device_id))
             throw std::logic_error("Rank generation activation bank could not materialize its admitted device storage");
         std::optional<PipelineForwardGraphEdges::FollowerState> follower;
-        if (!action.has_lm_head && stage.graph_builder_->config().mtp.enabled)
+        if (resolveMTPStateRole(retainsMTPGraphCapacity(stage.graph_builder_->config().mtp),
+                action.has_lm_head) == MTPStateRole::MainModelFollower)
         {
             if (stage.mtp_publication_main_kv_base_checkpoints_.empty())
                 throw std::logic_error("Rank pipeline verifier lacks its original admitted main-KV checkpoint");
@@ -1590,7 +1592,8 @@ bool PipelineDeviceGeneration::prepareServing(const ServingGraphFamilyMaterializ
             const auto &domain = domainFor(index);
             const auto domain_index = domain.global_stage;
             std::optional<PipelineForwardGraphEdges::FollowerState> follower;
-            if (!terminalParticipant(index) && stage.graph_builder_->config().mtp.enabled)
+            if (resolveMTPStateRole(retainsMTPGraphCapacity(stage.graph_builder_->config().mtp),
+                    terminalParticipant(index)) == MTPStateRole::MainModelFollower)
             {
                 if (stage.mtp_publication_main_kv_base_checkpoints_.empty())
                     throw std::logic_error("Pipeline verifier lacks its admitted local KV checkpoint");
@@ -1645,7 +1648,9 @@ bool PipelineDeviceGeneration::prepareServing(const ServingGraphFamilyMaterializ
     if (!collectPreparation(*workers_)) return false;
     workers_->dispatch([&, this](size_t index) {
         auto &stage = *stages_[index];
-        if (!stage.graph_builder_->config().mtp.enabled) return true;
+        // Publication graphs are retained topology; Off suppresses execution,
+        // not the original metadata owners needed for no-launch setup.
+        if (!retainsMTPGraphCapacity(stage.graph_builder_->config().mtp)) return true;
         auto metadata = stage.mtp_spec_decode_metadata_binding_.devicePointers();
         if (!stage.device_resident_logical_sequence_state_storage_.bindPublicationOutputs(&metadata, 1))
             return false;

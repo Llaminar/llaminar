@@ -104,6 +104,7 @@
 #include "MTPSidecarStreamBinding.h"
 #include "PipelineForwardGraphEdges.h"
 #include "PipelineMaintenanceAdmission.h"
+#include "MoEMaintenanceObservationContext.h"
 #include "execution/moe/DeviceMoERebalancePerfStats.h"
 #include "execution/mtp/DeviceGenerationGraphProgram.h"
 #include "execution/prefix_cache/BlockHash.h"
@@ -7877,7 +7878,7 @@ namespace llaminar2
          */
         if (state_.device_id.is_gpu() &&
             (!initializePersistentDeviceGenerationEvents() ||
-             (config.mtp.enabled && !initializeMTPPrefillTerminalArchiveReadyEvent())))
+             (retainsMTPGraphCapacity(config.mtp) && !initializeMTPPrefillTerminalArchiveReadyEvent())))
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize persistent generation stream-handoff events");
             return false;
@@ -13002,6 +13003,7 @@ namespace llaminar2
                 participant, capture_stream, collective_timeout_policy::effectiveCollectTimeoutMs(0));
         };
         cache.segment_cache.perf_context = "pipeline_original_stage_maintenance_source";
+        dgo_detail::bindMoEMaintenanceReplayContext(cache.segment_cache);
         cache.graph->reset();
         bool replay = false;
         if (!executor_.executeDecodeWithCapturePolicy(*cache.graph, context, &cache.segment_cache, stream,
@@ -14165,8 +14167,7 @@ namespace llaminar2
                 ctx);
         policy.defer_final_sync = true;
         policy.launch_dependency = maintenance_launch_dependency;
-        active_cache.segment_cache.perf_context =
-            "moe_rebalance_maintenance_atomic";
+        dgo_detail::bindMoEMaintenanceReplayContext(active_cache.segment_cache);
 
         bool used_graph_replay = false;
         bool used_cadence_parent = false;
@@ -16357,7 +16358,7 @@ namespace llaminar2
         state_.d_model = config.d_model;
         state_.vocab_size = config.vocab_size;
         state_.device_id = device;
-        if (config.mtp.enabled &&
+        if (retainsMTPGraphCapacity(config.mtp) &&
             !initializeLiveCheckpointStoragePool())
         {
             LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize transient MTP checkpoint storage");
@@ -16397,7 +16398,10 @@ namespace llaminar2
                 LOG_ERROR("[DeviceGraphOrchestrator] Failed to initialize device-owned sampling history");
                 return false;
             }
-            if (config.mtp.enabled &&
+            // Every retained participant owns these initial arena publications,
+            // including follower verifier-input banks and their ready events.
+            // Predictor-only graph ownership does not remove common setup roots.
+            if (retainsMTPGraphCapacity(config.mtp) &&
                 (!initializeAndPublishMTPTerminalHiddenArchiveOnStream(
                     initialization_stream,
                     "initial_inference_state") ||
@@ -20349,7 +20353,7 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::materializeMTPTerminalHiddenPublicationGraphs()
     {
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled ||
+        if (!graph_builder_ || !retainsMTPGraphCapacity(graph_builder_->config().mtp) ||
             !state_.device_id.is_gpu())
         {
             return true;
@@ -27162,10 +27166,18 @@ namespace llaminar2
         const bool declaration_only =
             purpose == ShiftedMTPPrefillGraphBinding::Purpose::
                            WorkspaceFamilyDeclaration;
+        // Retained setup of an explicitly speculative graph must bind its
+        // complete transaction. Ordinary Off prefill/decode stays ordinary;
+        // physical capacity alone cannot change those executable identities.
+        const bool mtp_role = input.execution_role == ForwardExecutionRole::MTPCondition ||
+            input.execution_role == ForwardExecutionRole::GroupedMTPVerifier;
+        const auto transaction_submission = declaration_only
+            ? ForwardGraphSubmissionIntent::WorkspaceDeclaration
+            : mtp_role ? input.graph_submission_intent : ForwardGraphSubmissionIntent::Execute;
         if (!graph_builder_ ||
-            (!graph_builder_->config().mtp.enabled &&
-             !(declaration_only &&
-               retainsMTPGraphCapacity(graph_builder_->config().mtp))))
+            !requiresMTPGraphTransactionBinding(
+                graph_builder_->config().mtp.enabled,
+                retainsMTPGraphCapacity(graph_builder_->config().mtp), transaction_submission))
             return true;
         /*
          * Logical execution-off and physical graph-capacity-off are different
@@ -27465,10 +27477,18 @@ namespace llaminar2
         const bool declaration_only =
             purpose == MTPMainTerminalHiddenGraphBinding::Purpose::
                            WorkspaceFamilyDeclaration;
+        // Retained setup of an explicitly speculative graph must bind its
+        // complete transaction. Ordinary Off prefill/decode stays ordinary;
+        // physical capacity alone cannot change those executable identities.
+        const bool mtp_role = input.execution_role == ForwardExecutionRole::MTPCondition ||
+            input.execution_role == ForwardExecutionRole::GroupedMTPVerifier;
+        const auto transaction_submission = declaration_only
+            ? ForwardGraphSubmissionIntent::WorkspaceDeclaration
+            : mtp_role ? input.graph_submission_intent : ForwardGraphSubmissionIntent::Execute;
         if (!graph_builder_ ||
-            (!graph_builder_->config().mtp.enabled &&
-             !(declaration_only &&
-               retainsMTPGraphCapacity(graph_builder_->config().mtp))))
+            !requiresMTPGraphTransactionBinding(
+                graph_builder_->config().mtp.enabled,
+                retainsMTPGraphCapacity(graph_builder_->config().mtp), transaction_submission))
             return true;
         if (input.execution_role != ForwardExecutionRole::MainInference &&
             input.execution_role != ForwardExecutionRole::MTPCondition)
@@ -49823,7 +49843,9 @@ namespace llaminar2
 
     bool DeviceGraphOrchestrator::initializeLiveCheckpointStoragePool()
     {
-        if (!graph_builder_ || !graph_builder_->config().mtp.enabled)
+        // Checkpoint roots belong to the retained model envelope, including
+        // no-launch verifier capture for an execution-Off request.
+        if (!graph_builder_ || !retainsMTPGraphCapacity(graph_builder_->config().mtp))
             return true;
         if (!state_.kv_cache || state_.d_model <= 0)
             return false;

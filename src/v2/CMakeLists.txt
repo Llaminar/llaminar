@@ -443,6 +443,7 @@ if(HAVE_CUDA)
         kernels/cuda/moe/CUDARouterQ8Prefill.cu       # Exact block32 INT8 tensor-core router prefill
         kernels/cuda/moe/CUDAMoEOverlayActivationPacketKernels.cu # Device-owned node-local sparse activation packets
         kernels/cuda/moe/CUDAMoEOverlayDeviceControllerKernels.cu # Node-local sole-controller lifecycle
+        backends/cuda/PlanningGPUClockMarker.cu # Bounded startup fixed-clock timing
         kernels/cuda/moe/CUDAMoEOverlayEpochKernels.cu # Captured ExpertOverlay placement-epoch RCU
         # GPU repack kernels (GGUF → VNNI layout on device)
         kernels/cuda/repack/CUDAVnniRepackKernels.cu   # VNNI repack for all 18 quantization formats
@@ -753,6 +754,7 @@ if(HAVE_ROCM)
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
         kernels/rocm/moe/ROCmMoEOverlayActivationPacketKernels.hip # Device-owned node-local sparse activation packets
         kernels/rocm/moe/ROCmMoEOverlayDeviceControllerKernels.hip # Node-local sole-controller lifecycle
+        backends/rocm/PlanningGPUClockMarker.hip # Bounded startup fixed-clock timing
         kernels/rocm/moe/ROCmMoEOverlayEpochKernels.hip       # Captured ExpertOverlay placement-epoch RCU
         # GPU weight loading pipeline repack kernels
         kernels/rocm/repack/VnniRepackKernels.hip            # VNNI repack: Q4_0, IQ4_NL, Q4_K on-device
@@ -1842,6 +1844,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/local_execution/device/WorkspaceAllocator.cpp
     # Unified transfer engine (explicit coherence state machine + centralized data movement)
     transfer/TransferEngine.cpp
+    transfer/PreparedDevicePeerCopy.cpp
     transfer/ImmutableNativeDeviceStorage.cpp
     transfer/CapturedTransferChannel.cpp
     transfer/MappedTransferProgressEpoch.cpp
@@ -1893,6 +1896,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/WeightMemoryEstimator.cpp
     planning/WeightShardGeometry.cpp
     planning/PlanningForwardWeightWork.cpp
+    planning/PlanningImmutableLookupWork.cpp
     planning/PlanningForwardStateWork.cpp
     planning/KVCacheMemoryEstimator.cpp
     planning/PersistentStateMemoryEstimator.cpp
@@ -1917,8 +1921,11 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/MoEPipelineMemoryAdmission.cpp
     planning/OriginalRankCapacityExchange.cpp
     planning/PlanningModelMetadata.cpp
+    planning/PlanningAdmissionPreparation.cpp
+    planning/PlanningMemoryQuoteReuse.cpp
     planning/PlanningPublication.cpp
     planning/PlanningHostServiceEvidence.cpp
+    planning/PlanningNativeContextEvidence.cpp
     planning/ResolvedRankOrchestration.cpp
     planning/AutomaticOrchestrationCandidates.cpp
     planning/OrchestrationCandidateAdmission.cpp
@@ -1926,9 +1933,12 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/AutomaticPlanningStartup.cpp
     planning/OrchestrationPerformanceEvidence.cpp
     planning/PlanningExecutionMeasurement.cpp
+    planning/PlanningGPUClockBuffer.cpp
     planning/PlanningMemoryBandwidthMeasurement.cpp
     planning/PlanningProjectionMeasurement.cpp
     planning/PlanningLocalTPMeasurement.cpp
+    planning/PlanningInterconnectCostMatrix.cpp
+    planning/PlanningPCIeCommunicationCost.cpp
     planning/PlanningCPUExpertMeasurement.cpp
     planning/PlanningGPUExpertMeasurement.cpp
     planning/PlanningModelSample.cpp

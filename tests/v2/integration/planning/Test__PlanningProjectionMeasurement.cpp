@@ -161,7 +161,7 @@ namespace
                             EXPECT_NE(phase.service.provenance().find("activations=FP32"), std::string::npos);
                             EXPECT_NE(phase.service.provenance().find("; activation-operand-policy=" +
                                 std::to_string(static_cast<int>(plan.operandPrecision())) + ";"), std::string::npos);
-                            if (device.is_gpu()) EXPECT_NE(phase.service.provenance().find("retained graph native events"), std::string::npos);
+                            if (device.is_gpu()) EXPECT_NE(phase.service.provenance().find("one contiguous original body warmup before clock start; timed_invocations=3; one ordered parent launch"), std::string::npos);
                         }
                         EXPECT_EQ(memory->claimedBytes(device, PhysicalMemoryOwner::PrimaryModelWeights,
                             PhysicalMemoryMaterializationKind::NewAllocation), 0u);

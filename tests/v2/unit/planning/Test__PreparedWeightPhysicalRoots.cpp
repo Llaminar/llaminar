@@ -14,6 +14,7 @@
 #include "planning/WeightShardGeometry.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/MemoryPlanner.h"
+#include "planning/PlanningModelMetadata.h"
 #include "tensors/TensorClasses.h"
 #include "../../utils/CPUPreparedStoreTestAdmission.h"
 #include <array>
@@ -280,5 +281,54 @@ TEST(PreparedWeightPhysicalRoots, FullCoordinateRangeUnderTPSlicingPolicyIsNotAn
         original.slice.inner_is_presliced = true;
         EXPECT_FALSE(PreparedWeightIdentityContract::fromBinding(original)->compatible(
             *PreparedWeightIdentityContract::fromBinding(replica)));
+    }
+}
+
+/** @test Retained classification changes neither per-candidate creator decisions nor their physical bytes. */
+TEST(PreparedWeightPhysicalRoots, RetainedSourceIndexPreservesCreatorsAliasesAndForeignRejection)
+{
+    const PlanningModelMetadata metadata(profile(),2);const auto &p=metadata.memoryProfile();
+    const PlanningModelMetadata foreign(p,2);
+    for(const auto device:{DeviceId::cpu(),DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        SCOPED_TRACE(device.toString());
+        PreparedWeightPhysicalUses legacy(p,device);
+        PreparedWeightPhysicalUses indexed(p,device,WeightComponentScope::EmbeddingAndTerminal,metadata.tensorIndex());
+        const WeightShardGeometryResolver full(p,device),tp(p,device,0,2);
+        const auto compare=[&](const TensorSizeInfo &tensor,const WeightShardGeometry &geometry,
+            WeightSourceStorageView view,PreparedWeightUseIntent intent) {
+            const auto old=legacy.record(p,device,tensor,geometry,view,intent);
+            const auto retained=indexed.record(p,device,tensor,geometry,view,intent);
+            EXPECT_EQ(old.index(),retained.index());
+            const auto old_root=std::visit([](const auto &edge){return edge.root;},old);
+            const auto new_root=std::visit([](const auto &edge){return edge.root;},retained);
+            EXPECT_EQ(old_root,new_root);EXPECT_EQ(legacy.creatorCount(),indexed.creatorCount());
+            EXPECT_EQ(legacy.originalSource(old_root),indexed.originalSource(new_root));
+            return retained;
+        };
+        for(const auto &tensor:p.tensors)compare(tensor,full.resolve(tensor),full.sourceStorageView(tensor),PreparedWeightUseIntent::PublishCreator);
+        for(const auto &tensor:p.tensors)compare(tensor,full.resolve(tensor),full.sourceStorageView(tensor),PreparedWeightUseIntent::ReuseExistingOrCreate);
+        auto copied=p.tensors.front();
+        const auto copied_use=compare(copied,full.resolve(copied),full.sourceStorageView(copied),PreparedWeightUseIntent::ReuseExistingOrCreate);
+        ASSERT_TRUE(std::holds_alternative<PreparedWeightPhysicalCreator>(copied_use));
+        EXPECT_EQ(indexed.originalSource(std::get<PreparedWeightPhysicalCreator>(copied_use).root),nullptr);
+        auto synthetic=copied;synthetic.name="blk.0.synthetic_projection.weight";
+        const auto synthetic_use=compare(synthetic,full.resolve(synthetic),full.sourceStorageView(synthetic),PreparedWeightUseIntent::ReuseExistingOrCreate);
+        EXPECT_TRUE(std::holds_alternative<PreparedWeightPhysicalCreator>(synthetic_use));
+        compare(p.tensors[1],tp.resolve(p.tensors[1]),tp.sourceStorageView(p.tensors[1]),PreparedWeightUseIntent::ReuseExistingOrCreate);
+        EXPECT_THROW((void)PreparedWeightPhysicalUses(p,device,WeightComponentScope::EmbeddingAndTerminal,foreign.tensorIndex()),std::invalid_argument);
+        // A fresh candidate owns a fresh creator graph even when source facts are shared.
+        PreparedWeightPhysicalUses independent(p,device,WeightComponentScope::EmbeddingAndTerminal,metadata.tensorIndex());
+        EXPECT_EQ(independent.creatorCount(),0u);EXPECT_TRUE(independent.edges().empty());
+        PreparedWeightPhysicalUses old_bytes(p,device),new_bytes(p,device,WeightComponentScope::EmbeddingAndTerminal,metadata.tensorIndex());
+        auto policy=PlanningWeightSourcePolicy::current();policy.source_tensor_index=metadata.tensorIndex();
+        for(const auto intent:{PreparedWeightUseIntent::PublishCreator,PreparedWeightUseIntent::ReuseExistingOrCreate}) {
+            const auto old=WeightMemoryEstimator::estimatePhysical(old_bytes,intent,p,device,0,1,0,2,{}, {},WeightComponentScope::EmbeddingAndTerminal);
+            const auto retained=WeightMemoryEstimator::estimatePhysical(new_bytes,intent,p,device,0,1,0,2,{}, {},
+                WeightComponentScope::EmbeddingAndTerminal,CPUStoragePlacement::local(),policy);
+            EXPECT_EQ(old.native_bytes,retained.native_bytes);EXPECT_EQ(old.device_bytes,retained.device_bytes);
+            EXPECT_EQ(old.prepared_embedding_bytes,retained.prepared_embedding_bytes);EXPECT_EQ(old.lm_head_bytes,retained.lm_head_bytes);
+            EXPECT_EQ(old.tied_lm_head_bytes,retained.tied_lm_head_bytes);
+        }
     }
 }

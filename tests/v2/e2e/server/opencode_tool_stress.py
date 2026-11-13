@@ -573,10 +573,137 @@ def is_compaction_request(request: dict) -> bool:
             and "\n<conversation>\n" in user["content"] and "\n</conversation>\n" in user["content"])
 
 
+def same_json_value(first, second) -> bool:
+    """Compare JSON values without Python's bool/number alias or JS formatting guesses.
+
+    JSON numbers share one type; 1, 1.0 and 1e0 denote the same value. Object
+    insertion order is irrelevant, including integer-index keys reordered by JS.
+    """
+    if isinstance(first, bool) or isinstance(second, bool):
+        return type(first) is bool and type(second) is bool and first == second
+    if isinstance(first, (int, float)) and isinstance(second, (int, float)):
+        return all(not isinstance(value, float) or math.isfinite(value) for value in (first, second)) and first == second
+    if type(first) is not type(second):
+        return False
+    if isinstance(first, dict):
+        return first.keys() == second.keys() and all(same_json_value(value, second[key])
+                                                   for key, value in first.items())
+    if isinstance(first, list):
+        return len(first) == len(second) and all(same_json_value(a, b) for a, b in zip(first, second))
+    return first == second
+
+
+def compacted_tool_outcome(emitted: dict, outcomes: list[dict]) -> tuple | None:
+    """Bind a unique native ID/name/input to the pinned serializer's exact outcome.
+
+    Input JSON is compared as typed values rather than inventing a Python version
+    of JSON.stringify. Output truncation counts JS UTF-16 units, including a
+    possible half-surrogate. Fresh results cannot use a cleared-output placeholder.
+    """
+    if len(outcomes) != 1:
+        return None
+    part = outcomes[0]
+    state = part.get("state", {})
+    function = emitted["function"]
+    arguments = json.loads(function["arguments"])
+    if (part.get("type") != "tool" or part.get("tool") != function["name"]
+            or not isinstance(state.get("input"), dict)
+            or not same_json_value(arguments, state["input"])):
+        return None
+    if state.get("status") == "error" and isinstance(state.get("error"), str):
+        return function["name"], state["input"], "[Tool error]: " + state["error"]
+    if state.get("status") != "completed" or not isinstance(state.get("output"), str):
+        return None
+    attachments = state.get("attachments", [])
+    if not isinstance(attachments, list) or any(not isinstance(item, dict) or
+            not isinstance(item.get("mime"), str) or
+            (item.get("filename") is not None and not isinstance(item["filename"], str))
+            for item in attachments):
+        return None
+    output = "\n".join([state["output"], *[
+        f"[Attached {item['mime']}: {item['filename'] if item.get('filename') is not None else 'file'}]"
+        for item in attachments]])
+    encoded = output.encode("utf-16-le", errors="surrogatepass")
+    if len(encoded) > 4000:
+        output = encoded[:4000].decode("utf-16-le", errors="surrogatepass") + "\n[truncated]"
+    return function["name"], state["input"], "[Tool result]: " + output
+
+
+def compaction_tool_bridge(request: dict, summary: str, pending: dict,
+                           outcomes: dict, previous: dict) -> dict:
+    """Prove native call/result content reached compaction and its summary continued.
+
+    The pinned buildPrompt wrapper separates conversation and prior summary;
+    quoted delimiter text inside content is not itself a malformed wrapper.
+    Upstream serialization does not escape role labels: this proves independently
+    authenticated content was supplied, not its original role provenance. Distinct
+    pending calls consume distinct occurrences, even when their values match.
+    """
+    content = request["messages"][1]["content"]
+    opening = "Here is the conversation so far:\n\n<conversation>\n"
+    anchored = ("Create a new anchored summary from the conversation history in the <conversation> "
+                "tags above so another coding agent can continue the work.")
+    prior_header = "Here is the summary of the conversation before the <conversation> above:\n\n<prior-summary>\n"
+    update = ("The <prior-summary> summarizes everything that happened before the <conversation>. "
+              "Construct a new summary that combines both. The <prior-summary> is discarded after "
+              "this: anything you do not carry into the new summary is lost.")
+    if not content.startswith(opening):
+        return {}
+    boundaries = ["\n</conversation>\n\n" + anchored,
+                  "\n</conversation>\n\n" + prior_header]
+    boundary = max(content.rfind(marker) for marker in boundaries)
+    if boundary < len(opening):
+        return {}
+    transcript = content[len(opening):boundary]
+    suffix = content[boundary + len("\n</conversation>\n\n"):]
+    consumed, result = set(), {}
+    decoder = json.JSONDecoder()
+    starts = list(re.finditer(r"(?m)^\[Assistant tool call\]: ", transcript))
+    for identity, emitted in pending.items():
+        outcome = compacted_tool_outcome(emitted, outcomes.get(identity, []))
+        if outcome is None:
+            continue
+        name, arguments, output = outcome
+        for candidate in starts:
+            start = candidate.end()
+            if candidate.start() in consumed or not transcript.startswith(name + "(", start):
+                continue
+            try:
+                observed, end = decoder.raw_decode(transcript, start + len(name) + 1)
+            except ValueError:
+                continue
+            if not same_json_value(observed, arguments) or not transcript.startswith(")\n" + output, end):
+                continue
+            end += len(")\n" + output)
+            if end < len(transcript) and transcript[end] != "\n":
+                continue
+            consumed.add(candidate.start())
+            result[identity] = summary
+            break
+        if identity not in result and identity in previous:
+            if suffix.startswith(prior_header + previous[identity] + "\n</prior-summary>\n\n" + update):
+                result[identity] = summary
+    return result
+
+
+def has_native_summary_pair(messages: list[dict], summary: str | None) -> bool:
+    """Authenticate the pinned compactor's leading summary pair, never arbitrary history."""
+    if not summary:
+        return False
+    offset = 1 if messages and messages[0].get("role") == "system" else 0
+    return (len(messages) >= offset + 2
+            and messages[offset].get("role") == "user"
+            and messages[offset].get("content") == "What did we do so far?"
+            and messages[offset + 1].get("role") == "assistant"
+            and messages[offset + 1].get("content") == summary
+            and not messages[offset + 1].get("tool_calls"))
+
+
 def check_session(directory: Path, exchanges: list[dict], returncode: int) -> dict:
     """Join wire/client identities, separating protocol defects from task results."""
     errors, task_errors, calls, execution_errors, usage_records = [], [], [], [], []
     previous_calls, pending_calls, invalid_calls = {}, {}, set()
+    compacted_calls, native_outcomes = {}, {}
     compaction_requests = 0
     events = []
     for line in (directory / "client.jsonl").read_text().splitlines():
@@ -588,6 +715,11 @@ def check_session(directory: Path, exchanges: list[dict], returncode: int) -> di
         except ValueError:
             errors.append("client emitted malformed JSON")
     for event in events:
+        part = event.get("part", {})
+        if (event.get("type") == "tool_use" and part.get("type") == "tool"
+                and isinstance(part.get("callID"), str)
+                and part.get("state", {}).get("status") in ("completed", "error")):
+            native_outcomes.setdefault(part["callID"], []).append(part)
         if event.get("type") == "error":
             errors.append(f"OpenCode error: {event.get('error')}")
     if not any(event.get("type") == "step_finish" and event.get("part", {}).get("reason") == "stop"
@@ -595,12 +727,16 @@ def check_session(directory: Path, exchanges: list[dict], returncode: int) -> di
         errors.append("OpenCode did not finish the conversation normally")
     for row in exchanges:
         if row.get("error"):
+            compacted_calls = {}
             errors.append(row["error"])
             continue
         if row["path"] != "/v1/chat/completions":
             continue
         try:
             compaction = is_compaction_request(row["request"])
+            prior_compacted = compacted_calls
+            if compaction:
+                compacted_calls = {}  # Failed summaries cannot leave a stale bridge.
             history_calls, history_results = {}, {}
             for message in row["request"].get("messages", []):
                 if message.get("role") == "assistant":
@@ -614,7 +750,10 @@ def check_session(directory: Path, exchanges: list[dict], returncode: int) -> di
                     if (joined is None or identity not in history_results
                             or joined.get("function", {}).get("name") != emitted["function"]["name"]
                             or json.loads(joined["function"]["arguments"]) != json.loads(emitted["function"]["arguments"])):
-                        errors.append(f"tool result/history did not preserve emitted call {identity}")
+                        if (joined is not None or identity in history_results or identity in invalid_calls
+                                or not has_native_summary_pair(row["request"].get("messages", []),
+                                                               compacted_calls.get(identity))):
+                            errors.append(f"tool result/history did not preserve emitted call {identity}")
             if "response" not in row:
                 raise ValueError("exchange has no completed response; conversation evidence is incomplete")
             message, finish = response_message(row["response"], row["request"].get("stream", False))
@@ -627,8 +766,13 @@ def check_session(directory: Path, exchanges: list[dict], returncode: int) -> di
                            for tool in row["request"].get("tools", [])}
             if compaction:
                 compaction_requests += 1
+                if finish != "stop" or message.get("tool_calls") or not isinstance(message.get("content"), str) or not message["content"].strip():
+                    raise ValueError("compaction requires a successful tool-free text summary")
+                compacted_calls = compaction_tool_bridge(row["request"], message["content"].strip(),
+                    pending_calls, native_outcomes, prior_compacted)
             else:
                 pending_calls = {}
+                compacted_calls = {}
             for call in message.get("tool_calls", []):
                 if (call.get("type") != "function" or not isinstance(call.get("id"), str)
                         or not call["id"] or call["id"] in previous_calls):
@@ -1095,31 +1239,55 @@ def run_client_with_prompt(command: list[str], *, prompt: Path, workspace: Path,
 
 
 def authenticate_phase_prompt(exchanges: list[dict], expected: str) -> dict:
-    """Authenticate the first request's latest user text against the intended phase.
+    """Bind the new phase to its first coding request across leading compaction.
 
-    Later requests may include genuine client compaction messages, so only the
-    initial request binds a new user turn. A plain text message or one text part
-    is admitted; missing, changed, reordered or non-text input fails explicitly.
+    The pinned client's auxiliary summaries may precede coding. Inspect only
+    their consecutive structural prefix and the first ordinary request. Normal
+    auto-compaction appends one exact synthetic user continuation; overflow may
+    replay the intended user directly. No later request or arbitrary history
+    search can repair a changed/missing phase prompt. Summary response/protocol
+    validity remains independently mandatory in the session audit.
     """
+    def text(message):
+        """Admit exactly plain text or one SDK text part, preserving every byte."""
+        if not isinstance(message, dict) or message.get("role") != "user":
+            return None
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+        if (isinstance(content, list) and len(content) == 1
+                and isinstance(content[0], dict) and content[0].get("type") == "text"
+                and isinstance(content[0].get("text"), str)):
+            return content[0]["text"]
+        return None
+
+    leading = 0
+    while leading < len(exchanges):
+        request = exchanges[leading].get("request")
+        if not isinstance(request, dict) or not is_compaction_request(request):
+            break
+        leading += 1
     observed = None
-    if exchanges:
-        request = exchanges[0].get("request")
+    if leading < len(exchanges):
+        request = exchanges[leading].get("request")
         messages = request.get("messages", []) if isinstance(request, dict) else []
         if isinstance(messages, list):
-            user = next((message for message in reversed(messages)
-                         if isinstance(message, dict) and message.get("role") == "user"), {})
-            content = user.get("content")
-            if isinstance(content, str):
-                observed = content
-            elif (isinstance(content, list) and len(content) == 1
-                  and isinstance(content[0], dict) and content[0].get("type") == "text"
-                  and isinstance(content[0].get("text"), str)):
-                observed = content[0]["text"]
+            if not leading:
+                # Keep direct transport authentication strict: no synthetic
+                # suffix exception without a leading native summary request.
+                observed = text(next((message for message in reversed(messages)
+                    if isinstance(message, dict) and message.get("role") == "user"), {}))
+            elif messages:
+                observed = text(messages[-1])
+                continuation = ("Continue if you have next steps, or stop and ask for clarification "
+                                "if you are unsure how to proceed.")
+                if observed == continuation and len(messages) >= 2:
+                    observed = text(messages[-2])
     passed = observed == expected
     return {"passed": passed,
             "expected_sha256": hashlib.sha256(expected.encode("utf-8")).hexdigest(),
             "observed_sha256": None if observed is None else hashlib.sha256(observed.encode("utf-8")).hexdigest(),
-            "error": None if passed else "intended user prompt differs from the first request's latest user text"}
+            "error": None if passed else "intended user prompt differs from the first coding request's latest phase user text"}
 
 
 def session_permissions(case: str) -> dict:
@@ -1146,10 +1314,33 @@ def client_provider_options(base_url: str) -> dict:
             "headerTimeout": False, "chunkTimeout": False}
 
 
+def client_context_policy(context_tokens: int, output_tokens: int, reply_reserve_tokens: int | None = None) -> dict:
+    """Publish an explicit optional reserve without changing the allowed reply limit.
+
+    A reserve is a client compaction threshold, not a model context-capability
+    change. With no override, leave input/reserved absent so the pinned client's
+    native policy remains authoritative. An explicit smaller reserve permits a
+    larger prompt, so the full reply limit is available only when context remains.
+    """
+    if reply_reserve_tokens is not None and (type(reply_reserve_tokens) is not int
+            or reply_reserve_tokens <= 0 or reply_reserve_tokens >= context_tokens
+            or reply_reserve_tokens > output_tokens):
+        raise ValueError("reply reserve tokens must be a positive integer below context length and no greater than max tokens")
+    limit = {"context": context_tokens, "output": output_tokens}
+    if reply_reserve_tokens is not None:
+        limit["input"] = context_tokens
+    return {"reply_reserve_tokens": reply_reserve_tokens, "model_limit": limit,
+            "compaction": None if reply_reserve_tokens is None else {"reserved": reply_reserve_tokens},
+            "input_budget_tokens": None if reply_reserve_tokens is None else context_tokens - reply_reserve_tokens}
+
+
 def run_session(args, ordinal: int, case: str, content: str) -> dict:
     """Run an isolated conversation, retaining live work until its evidence is copied."""
+    context_policy = client_context_policy(args.context_length, args.max_tokens,
+                                          getattr(args, "reply_reserve_tokens", None))
     directory = args.output / f"session-{ordinal:04d}-{case}"
     directory.mkdir(parents=True)
+    publish(directory / "client-context-policy.json", context_policy)
     # OpenCode discovers repository roots and ancestor AGENTS.md files. A
     # fixture nested in the Llaminar checkout would redirect file tools into
     # that checkout and append its engineering instructions to the real prompt.
@@ -1184,7 +1375,9 @@ def run_session(args, ordinal: int, case: str, content: str) -> dict:
                   "provider": {"llaminar": {"npm": "@ai-sdk/openai-compatible",
                       "name": "Llaminar tool stress", "options": client_provider_options(url),
                       "models": {args.model: {"name": args.model, "tool_call": True,
-                          "limit": {"context": args.context_length, "output": args.max_tokens}}}}}}
+                          "limit": context_policy["model_limit"]}}}}}
+        if context_policy["compaction"] is not None:
+            config["compaction"] = context_policy["compaction"]
         env = {**os.environ, "OPENCODE_CONFIG_CONTENT": json.dumps(config),
                "OPENCODE_CONFIG_DIR": str(directory / "config"),
                "XDG_CONFIG_HOME": str(directory / "config"),
@@ -1255,6 +1448,7 @@ def run_session(args, ordinal: int, case: str, content: str) -> dict:
                   directory=str(directory), prompt_sha256=hashlib.sha256(prompt.encode()).hexdigest())
     completed_phases = sum(row['finished'] and row['returncode'] == 0
         and not row['interrupted_by_harness'] and row['prompt']['passed'] for row in phases)
+    result['client_context_policy'] = context_policy
     result['phase_progress'] = {'expected': len(prompts), 'completed': completed_phases,
         'passed': completed_phases == len(prompts), 'phases': phases}
     publish(directory / "result.json", result)
@@ -1281,6 +1475,8 @@ def main() -> int:
                         help="Stress requires complete phases, protocol/coverage correctness and model tool errors below 5 percent")
     parser.add_argument("--request-timeout", type=float, default=None,
                         help="Optional upstream inactivity seconds; unset permits long prefill and buffered tool calls")
+    parser.add_argument("--reply-reserve-tokens", type=int, default=None,
+                        help="Explicit client reply-space reserve; leaves output limit unchanged, default uses native client policy")
     parser.add_argument("--session-timeout", type=float, default=None,
                         help="Optional elapsed seconds per turn; unset permits active turns of any duration")
     parser.add_argument("--case", action="append", choices=("webapp",))
@@ -1291,6 +1487,10 @@ def main() -> int:
             value is not None and (not math.isfinite(value) or value <= 0)
             for value in (args.request_timeout, args.session_timeout)):
         parser.error("counts, budgets and timeouts must be positive")
+    try:
+        client_context_policy(args.context_length, args.max_tokens, args.reply_reserve_tokens)
+    except ValueError as error:
+        parser.error(str(error))
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
     require_ready(args.base_url, args.request_timeout)
@@ -1299,6 +1499,7 @@ def main() -> int:
                 "model": args.model, "base_url": args.base_url, "concurrency": args.concurrency,
                 "measure_prefix_reuse": args.measure_prefix_reuse,
                 "context_length": args.context_length, "max_tokens": args.max_tokens,
+                "reply_reserve_tokens": args.reply_reserve_tokens,
                 "turn_wall_time_limit_seconds": args.session_timeout, "request_inactivity_timeout_seconds": args.request_timeout,
                 "iterations": args.iterations, "results": []}
     publish(args.output / "stress.json", document)

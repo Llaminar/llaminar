@@ -512,7 +512,12 @@ def _cuda_hosted_boundary_error(
     if graph.error or not (graph.has_pipeline_boundary_evidence or graph.has_overlay_boundary_evidence):
         return (f"CUDA hosted MTP has no authenticated heterogeneous boundary on {device}: "
                 + (graph.error or "no completed pipeline/overlay boundary"))
-    owner_records = tuple(row for row in records if row.get("domain") != "forward_graph"
+    # Sidecar lifecycle rows live in mtp, while their executable/replay proof
+    # lives in forward_graph. Scope both sides of that join to the same owner.
+    lifecycle_names = {"decode_capture_policy", "sidecar_decode_capture_policy",
+                       "decode_graph_phase", "sidecar_graph_capture_path"}
+    owner_records = tuple(row for row in records if (row.get("domain") != "forward_graph"
+                          and row.get("name") not in lifecycle_names)
                           or str(row.get("device", "")).lower() == device.lower()
                           or row.get("device") in {"pipeline_coordinator", "continuation_rank"})
     owner = validate_graph_capture_policy(

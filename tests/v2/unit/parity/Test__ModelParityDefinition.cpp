@@ -10,6 +10,8 @@
  * matching test names cannot hide contradictory dense/routed declarations.
  * Phase-specific numerical allowances must survive expansion without changing
  * the ordinary decode or recursively conditioned MTP logit budgets.
+ * Observed GPU pipeline policy siblings retain physical ownership while their
+ * full15/static placement/export contracts remain distinct from old evidence.
  * Setup-only diagnostic requests must freeze exact capture keys without
  * inventing reference tensors or changing numerical comparison obligations.
  */
@@ -3695,4 +3697,84 @@ TEST(ModelParityDefinition, ObservedQFNConfigurationExportRequiresOriginalRetire
     EXPECT_THROW((void)Evidence(std::span<const Outcome>{}),std::invalid_argument);
     ranks[1].work=static_cast<Work>(2);
     EXPECT_THROW((void)Evidence(ranks),std::invalid_argument);
+}
+
+namespace llaminar2::test::parity
+{
+/** @test GPU hybrid PP declares full15/static axes without inheriting physical or numerical observations. */
+TEST(ModelParityDefinition, ObservedQFNGateUpFull15PreservesStaticSourceAndDeferredExport)
+{
+    const auto& cases=qwen4exp::qwen4ExpObservedMI50GateUpFixedVRAMCases();ASSERT_EQ(cases.size(),4u);
+    std::set<ModelParityMTP> policies;
+    for(const auto& cell:cases) {
+        EXPECT_TRUE(policies.insert(cell.mtp).second);
+        ASSERT_TRUE(cell.expert_overlay);EXPECT_EQ(*cell.expert_overlay,ModelParityExpertOverlayPolicy{});
+        EXPECT_EQ(cell.inventory_role,ModelParityInventoryRole::NumericalDiagnostic);
+        EXPECT_TRUE(cell.topology.needsObservedPipelineBinding());EXPECT_TRUE(cell.topology.participants.empty());
+        EXPECT_EQ(cell.topology.pipeline_routed_compute_policies,(std::vector{
+            RoutedExpertComputePolicy::GateUpOwnedDownColumns,RoutedExpertComputePolicy::GateUpOwnedDownColumns}));
+        EXPECT_EQ(cell.retained_mtp_draft_capacity,cell.mtpEnabled()?15:0);
+        EXPECT_EQ(cell.model.maximum_mtp_draft_depth,cell.mtpEnabled()?15:0);
+        ASSERT_TRUE(cell.ngram_table_policy);EXPECT_TRUE(cell.ngram_table_policy->isFixedHeadSharded());
+        EXPECT_EQ(cell.ngram_table_policy->storage,ImmutableRowStoragePreference::VRAM);
+        EXPECT_THROW((void)cell.makeOrchestrationConfig(cell.model.model_path,0),std::logic_error);
+        std::ostringstream out;PrintTo(cell,&out);
+        const auto exported=nlohmann::json::parse(out.str());
+        EXPECT_EQ(exported.at("runtime").at("configuration_policy"),"observed_pipeline_binding_required_v1");
+        EXPECT_FALSE(exported.at("runtime").contains("configuration_document"));
+    }
+    EXPECT_EQ(policies,(std::set<ModelParityMTP>{ModelParityMTP::Off,ModelParityMTP::Depth1,
+        ModelParityMTP::Depth3,ModelParityMTP::DynamicDepth}));
+    EXPECT_EQ(qwen4exp::qwen4ExpObservedMI50GateUpFixedVRAMExactCases().size(),3u);
+    const auto definition=qwen4exp::qwen4ExpObservedMI50GateUpFixedVRAMDefinition();
+    EXPECT_NO_THROW((void)expandModelParityDefinition(definition));
+    for(const auto* movement:{&definition.dynamic_rebalance.economic_movement,
+                             &definition.dynamic_rebalance.economic_movement_and_observed_speedup}) {
+        EXPECT_EQ(movement->device_min_maintenance_period_tokens,16);
+        EXPECT_EQ(movement->device_initial_maintenance_period_tokens,16);
+    }
+    EXPECT_EQ(qwen4exp::qwen4ExpObservedMI50FixedVRAMCases().size(),4u);
+    for(const auto& historical:qwen4exp::qwen4ExpObservedMI50FixedVRAMSourceCases()) {
+        EXPECT_EQ(historical.retained_mtp_draft_capacity,historical.mtpEnabled()?3:0);
+        for(const auto policy:historical.topology.pipeline_routed_compute_policies)
+            EXPECT_EQ(policy,RoutedExpertComputePolicy::Apportioned);
+    }
+}
+
+/** @test The generic observed binder preserves GPU hybrid arithmetic across odd and unequal stage widths. */
+TEST(ModelParityDefinition, ObservedQFNGateUpPolicyBindsOriginalNUMAWithoutEightDeviceEnginePath)
+{
+    for(const auto widths:{std::vector<int>{2,3},std::vector<int>{3,2},std::vector<int>{4,4}}) {
+        SCOPED_TRACE(::testing::PrintToString(widths));
+        ClusterInventory observed;observed.world_size=2;
+        const int total=std::accumulate(widths.begin(),widths.end(),0);
+        for(int rank=0;rank<2;++rank) {
+            RankInventory owner;owner.rank=rank;owner.hostname="original-host";owner.node_id=0;
+            owner.cpu.numa_node=rank?11:7;
+            for(int ordinal=0;ordinal<total;++ordinal) {
+                DeviceInfo gpu;gpu.type=DeviceType::ROCm;gpu.local_device_id=ordinal+1;gpu.numa_node=11;
+                gpu.uuid="physical-"+std::to_string(ordinal);gpu.native_isa="gfx906";owner.gpus.push_back(gpu);
+            }
+            owner.p2p_rocm_count=total;owner.p2p_rocm.assign(total*total,true);observed.ranks.push_back(owner);
+        }
+        for(auto cell:qwen4exp::qwen4ExpObservedMI50GateUpFixedVRAMCases()) {
+            cell.topology.pipeline_stage_sizes=widths;
+            cell.topology=cell.topology.bindObservedPipeline(observed);
+            ASSERT_TRUE(cell.topology.execution_rank_selection);
+            EXPECT_EQ(cell.topology.execution_rank_selection->discoveryRanks(),std::vector<int>{1});
+            const auto config=cell.makeOrchestrationConfig(cell.model.model_path,0);
+            ASSERT_EQ(config.domain_definitions.size(),widths.size());
+            EXPECT_FALSE(config.moe_routed_expert_plan);
+            for(std::size_t stage=0;stage<widths.size();++stage) {
+                const auto& domain=config.domain_definitions[stage];
+                EXPECT_EQ(domain.devices.size(),std::size_t(widths[stage]));EXPECT_EQ(domain.owner_rank,0);
+                EXPECT_EQ(domain.routed_compute_policy,RoutedExpertComputePolicy::GateUpOwnedDownColumns);
+                EXPECT_EQ(domain.routed_phase_policy,RoutedExpertPhasePolicy::Uniform);
+                for(const auto& member:domain.devices) {EXPECT_TRUE(member.isROCm());EXPECT_EQ(member.numa_node,11);}
+            }
+            EXPECT_EQ(config.mtp.graph_capacity_draft_tokens,cell.mtpEnabled()?15:0);
+            if(cell.usesDynamicMTPDepth())EXPECT_EQ(config.mtp.depth_policy.max_depth,15);
+        }
+    }
+}
 }

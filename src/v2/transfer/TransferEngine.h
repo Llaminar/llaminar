@@ -46,6 +46,8 @@ namespace llaminar2
     class ReleasedWeightLoadStaging;
     class ImmutableNativeDeviceUpload;
     class ImmutableNativeUploadStaging;
+    class PreparedDevicePeerCopy;
+    class ExplicitGPUStream;
     class ImmutableNativeDeviceRegion;
     class ImmutableNativeDeviceRead;
 
@@ -1310,6 +1312,16 @@ namespace llaminar2
          */
         void initializeWorkspaceMetadata(const WorkspaceBufferLease &destination,
             std::span<const std::byte> source, void *stream) const;
+
+        /** @brief Initialize a bounded cold transport metadata region through its original allocation owner.
+         * @param destination Admitted native transport buffer, never an unowned pointer.
+         * @param offset Exact metadata byte offset within that buffer.
+         * @param source Setup-owned bytes; completion is proven before their lifetime may end.
+         * @param stream Exact original non-default setup stream, outside capture.
+         * @throws std::exception For foreign storage, capture, bounds or failed completion.
+         */
+        void initializeDeviceMetadata(DeviceTransferBuffer &destination,size_t offset,
+            std::span<const std::byte> source,void *stream) const;
 
         /** @brief Initialize immutable Batch metadata with its original context-owned cold event.
          * @param destination Exact original workspace lease; no allocation occurs here.
@@ -2654,6 +2666,19 @@ namespace llaminar2
         TransferResult copyActivation(TensorBase *src, TensorBase *dst,
                                       DeviceId dst_device, size_t bytes);
 
+        /** @brief Prepare a direct physical peer edge over existing admitted tensor storage.
+         * @param source Strong original source storage owner. @param destination Strong destination owner.
+         * @param source_device Exact physical source. @param destination_device Exact physical destination.
+         * @param destination_stream Destination original worker stream, never null.
+         * @return Frozen copy capability; retain it until every recording/replay graph retires.
+         * @throws std::exception For capture-time preparation, unavailable directed peer access,
+         * missing storage/publication, foreign stream or unsupported backend. No alternate path is tried.
+         */
+        [[nodiscard]] PreparedDevicePeerCopy prepareDevicePeerCopy(std::shared_ptr<TensorBase> source,
+            std::shared_ptr<TensorBase> destination,DeviceId source_device,DeviceId destination_device,
+            ExplicitGPUStream destination_stream) const;
+
+
         /** @brief Enqueue an exact diagnostic subrange without declaring the whole host mirror current.
          * @param source Published GPU tensor retaining allocation and producer event.
          * @param offset First source byte in that tensor.
@@ -3019,6 +3044,15 @@ namespace llaminar2
         static TransferEngine &instance();
 
     private:
+        friend class PreparedDevicePeerCopy;
+        /** @brief Validate frozen owners and submit exact live bytes; no native discovery or allocation.
+         * @param copy Original prepared capability retaining tensors and worker generations.
+         * @param source_offset First source byte. @param destination_offset First destination byte.
+         * @param live_bytes Logical byte count; zero still validates identity and bounds.
+         * @throws std::exception For changed storage/publication, foreign owner, stale generation or native failure.
+         */
+        static void enqueuePreparedDevicePeerCopy(const PreparedDevicePeerCopy&,std::size_t source_offset,
+            std::size_t destination_offset,std::size_t live_bytes);
         friend class PlanningHostDeviceMeasurement;
         /**
          * @brief Shared bounded copy body for admitted lanes and isolated planning calibration.

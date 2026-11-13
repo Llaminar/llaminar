@@ -478,6 +478,10 @@ ALLOWANCES: tuple[Allowance, ...] = (
         # The body regression proves capture exclusion/ownership for both;
         # this is not permission for two waits in either overload.
         ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::initializeWorkspaceMetadata", "backend_event", 2),
+        # Bounded counted-frame cold scalar publication has one accepted H2D
+        # whose temporary source cannot retire before its exact event completes.
+        # Capture rejection and source lifetime are replayed in TransferColdDeviceMetadata.
+        ("src/v2/transfer/TransferEngine.cpp", "TransferEngine::initializeDeviceMetadata", "backend_event", 1),
     ),
 )
 

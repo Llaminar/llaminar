@@ -9,6 +9,8 @@
  * No inferred transfer path, physical allocation or execution timing lives here.
  * Exact projection geometry carries both local N/K and the complete original
  * participant partition; it grants no executable topology or movement mode.
+ * Source-bound classifications and layer indices are retained once by planning
+ * metadata, independently of physical endpoint selection and arithmetic policy.
  */
 #include "utils/DebugEnv.h"
 #include "planning/PlanningForwardWeightWork.h"
@@ -28,18 +30,37 @@ namespace llaminar2
         switch (role)
         {
         case WeightRole::Embedding: return PlanningOrdinaryWeightKind::Embedding;
+        case WeightRole::ImmutableRowTable: return PlanningOrdinaryWeightKind::ExternalLookup;
         case WeightRole::MoERouter: return PlanningOrdinaryWeightKind::Router;
         case WeightRole::LMHead: case WeightRole::AttentionQ: case WeightRole::AttentionK:
         case WeightRole::AttentionV: case WeightRole::AttentionWO: case WeightRole::FusedQKV:
         case WeightRole::GDNProjection: case WeightRole::GDNAlphaBetaProjection:
+        case WeightRole::HyperConnectionProjection: case WeightRole::SparseIndexerProjection:
+        case WeightRole::PerLayerEmbeddingProjection: case WeightRole::PredictorProjection:
         case WeightRole::FFNGate: case WeightRole::FFNUp: case WeightRole::FFNDown:
         case WeightRole::SharedExpertGate: case WeightRole::SharedExpertUp: case WeightRole::SharedExpertDown:
             return PlanningOrdinaryWeightKind::Projection;
         case WeightRole::Norm: case WeightRole::OutputNorm: case WeightRole::Bias:
         case WeightRole::GDNSsmParam: case WeightRole::SharedExpertInputGate:
+        case WeightRole::HyperConnectionNorm: case WeightRole::SparseIndexerNorm:
+        case WeightRole::PerLayerEmbeddingNorm: case WeightRole::PerLayerEmbeddingConvolution:
             return PlanningOrdinaryWeightKind::NonProjection;
         default: return PlanningOrdinaryWeightKind::Unclassified;
         }
+    }
+
+    bool planningTerminalWeight(WeightRole role, int layer) noexcept
+    {
+        return role == WeightRole::LMHead || role == WeightRole::OutputNorm ||
+            (layer < 0 && (role == WeightRole::HyperConnectionProjection || role == WeightRole::HyperConnectionNorm));
+    }
+
+    int planningWeightInvocationRows(WeightRole role, int rows)
+    {
+        if (rows <= 0) throw std::invalid_argument("Planning weight work requires positive live rows");
+        // QFN's terminal HC read runs before maybeAddLMHeadRowSelect, over
+        // every live row. Only the ordinary output norm/head use compact rows.
+        return role == WeightRole::LMHead || role == WeightRole::OutputNorm ? 1 : rows;
     }
 
     PlanningExpertExecutionShare::PlanningExpertExecutionShare(
@@ -235,12 +256,8 @@ namespace llaminar2
         const int main_layers = model.mainLayerCount();
         const auto &ranks = candidate.rankPlans();
         const auto &membership = candidate.membership().discoveryRanks();
-        const bool explicit_head = std::any_of(profile.tensors.begin(), profile.tensors.end(), [](const auto &tensor) {
-            return inferWeightRole(tensor.name) == WeightRole::LMHead;
-        });
-        const auto embedding = std::find_if(profile.tensors.begin(), profile.tensors.end(), [](const auto &tensor) {
-            return inferWeightRole(tensor.name) == WeightRole::Embedding;
-        });
+        const bool explicit_head = model.firstTensorWithRole(WeightRole::LMHead).has_value();
+        const auto embedding = model.firstTensorWithRole(WeightRole::Embedding);
         std::vector<PlanningParticipantWeightWork> result;
         result.reserve(candidate.devicePlans().size());
         for (const auto &device : candidate.devicePlans())
@@ -279,11 +296,12 @@ namespace llaminar2
             // Materialized decode mirrors replace the primary invocation view;
             // they do not add a second execution of each projection. A tied
             // output head similarly reuses source bytes with different semantics.
-            const auto operand = [&](const TensorSizeInfo &tensor, WeightRole role, bool complete,
+            const auto operand = [&](const PlanningClassifiedTensor &view, WeightRole role, bool complete,
                                      std::optional<size_t> expert_instances = {}) {
+                const auto &tensor = view.tensor();
                 const auto &resolver = complete ? replicated : sharded;
                 auto geometry = [&] {
-                    if (role == WeightRole::LMHead && inferWeightRole(tensor.name) == WeightRole::Embedding)
+                    if (role == WeightRole::LMHead && view.role() == WeightRole::Embedding)
                     {
                         auto semantic = tensor;
                         // Ask the canonical schema for head, not embedding,
@@ -291,7 +309,7 @@ namespace llaminar2
                         semantic.name = "output.weight";
                         return resolver.resolve(semantic, expert_instances);
                     }
-                    return resolver.resolve(tensor, expert_instances);
+                    return resolver.resolve(view, expert_instances);
                 }();
                 return PlanningWeightOperand{tensor.name, role, tensor.layer_index, tensor.quant_type,
                     PreparedWeightRepresentationContract::resolve(role, tensor.quant_type, tensor.name, profile.architecture,
@@ -299,48 +317,58 @@ namespace llaminar2
                     std::move(geometry), PreparedWeightRepresentationContract::operandPrecision(
                         role, tensor.name, profile.architecture, debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic)};
             };
-            for (const auto &tensor : profile.tensors)
-            {
+            const auto appendTensor = [&](size_t tensor_index) {
+                const auto view = model.classifiedTensor(tensor_index);
+                const auto &tensor = view.tensor();
                 // Learned predictors are a separate transaction. Retaining depth
                 // fifteen does not execute fifteen extra main blocks per token.
                 if (tensor.layer_index >= main_layers ||
-                    (tensor.layer_index >= 0 && (tensor.layer_index < first || tensor.layer_index > last))) continue;
-                const auto role = inferWeightRole(tensor.name);
+                    (tensor.layer_index >= 0 && (tensor.layer_index < first || tensor.layer_index > last))) return;
+                const auto role = view.role();
+                // Capacity is not execution volume. The request compositor
+                // mandatorily prices this source through the admitted native
+                // lookup compiler, including actual storage/channel owners.
+                if (planningOrdinaryWeightKind(role) == PlanningOrdinaryWeightKind::ExternalLookup) return;
                 if (isRoutedExpertRole(role))
                 {
                     // A dense-only continuation domain owns router work, not
                     // an expert service endpoint. Zero initial quota is a
                     // different case: its bound endpoint still has this shape.
-                    if (!routed) continue;
+                    if (!routed) return;
                     if (tensor.layer_index < 0 || profile.expert_count <= 0 || profile.expert_used_count <= 0 ||
                         profile.expert_used_count > profile.expert_count)
                         throw std::invalid_argument("Routed work has invalid layer or top-k geometry");
                     const size_t slot = role == WeightRole::MoEExpertGate ? 0 : role == WeightRole::MoEExpertUp ? 1 : 2;
                     auto &entry = experts[tensor.layer_index][slot];
                     if (entry) throw std::invalid_argument("Duplicate routed projection: " + tensor.name);
-                    entry = operand(tensor, role, true, 1);
+                    entry = operand(view, role, true, 1);
                     requireMatrix(*entry);
                     if (!overlay)
                     {
-                        const auto local = sharded.resolve(tensor).matrix();
+                        const auto local = sharded.resolve(view).matrix();
                         if (!local) throw std::invalid_argument("Routed source has no participant geometry");
                         const auto [position, inserted] = ordinary_expert_counts.emplace(tensor.layer_index, local->instances);
                         if (!inserted && position->second != local->instances)
                             throw std::invalid_argument("Routed projections disagree on participant expert ownership");
                     }
-                    continue;
+                    return;
                 }
-                if (!continuation) continue;
-                if (role == WeightRole::Embedding && !device.owns_embedding) continue;
-                if ((role == WeightRole::LMHead || role == WeightRole::OutputNorm) && !head) continue;
+                if (!continuation) return;
+                if (role == WeightRole::Embedding && !device.owns_embedding) return;
+                if (planningTerminalWeight(role, tensor.layer_index) && !head) return;
                 const bool complete = role == WeightRole::Embedding ? full_embedding : role == WeightRole::LMHead ? full_head : full_decode;
-                work.ordinary.push_back(classify(operand(tensor, role, complete)));
-            }
+                work.ordinary.push_back(classify(operand(view, role, complete)));
+            };
+            // Global roles and each owned layer preserve their original local
+            // directory order. Unowned layers are never scanned or classified.
+            for(const size_t index:model.globalTensorIndices())appendTensor(index);
+            for(int layer=first;layer<=last;++layer)
+                for(const size_t index:model.layerTensorIndices(layer))appendTensor(index);
             if (head && !explicit_head)
             {
-                if (embedding == profile.tensors.end())
+                if (!embedding)
                     throw std::invalid_argument("Main-forward output has neither explicit nor tied source weights");
-                work.ordinary.push_back(classify(operand(*embedding, WeightRole::LMHead, full_head)));
+                work.ordinary.push_back(classify(operand(model.classifiedTensor(*embedding), WeightRole::LMHead, full_head)));
             }
             for (auto &[layer, triplet] : experts)
             {

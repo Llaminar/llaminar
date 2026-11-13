@@ -1,6 +1,11 @@
 /**
  * @file GPUExpertTransferROCm.cpp
- * @brief ROCm backend for same-backend GPU expert packed transfer.
+ * @brief ROCm expert migration and prepared capture-safe physical byte transport.
+ *
+ * Migration retains its original explicit peer API and ambient-device lifecycle.
+ * Prepared copies use UVA asynchronous D2D on the authenticated destination
+ * worker: the operation must become a native graph node, never eager setup work.
+ * Neither path retries or selects an alternate transport after a native failure.
  */
 
 #include "GPUExpertTransferBackend.h"
@@ -38,6 +43,27 @@ namespace llaminar2::detail
             }
             return true;
         }
+    }
+
+    /** @brief Prepared UVA device copy records a native memcpy node during capture.
+     * The explicit PeerAsync API is deliberately retained only by legacy
+     * migration below: CUDA rejects it in capture, while HIP may enqueue it
+     * eagerly without a graph node. This is a distinct prepared path, never a
+     * capture-state retry or an eager substitute.
+     */
+    bool copyPreparedDevicePeerBytesROCmBackend(void* destination,int destination_ordinal,const void* source,int source_ordinal,std::size_t bytes,void* destination_stream)
+    {
+        if(!destination || !source || !destination_stream)return false;
+        if(!bytes)return true;
+        // TransferEngine has authenticated the exact original destination
+        // worker/stream; capture must not mutate that native context binding.
+        auto status=hipMemcpyAsync(destination,source,bytes,hipMemcpyDeviceToDevice,static_cast<hipStream_t>(destination_stream));
+        if(status!=hipSuccess){
+            LOG_ERROR("[PreparedDevicePeerCopy] hipMemcpyAsync(D2D) failed: " << hipGetErrorString(status)
+                << " src=" << source_ordinal << " dst=" << destination_ordinal << " bytes=" << bytes);
+            return false;
+        }
+        return true;
     }
 
     int currentROCmDeviceOrdinal() noexcept

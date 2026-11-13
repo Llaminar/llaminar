@@ -3,8 +3,8 @@
  * @brief Bounded GGUF-backed CPU expert observations through production service.
  *
  * One full gate/up/down triplet is loaded and prepared once, then the same
- * grouped CPU stage used by ExpertOverlay measures decode, prefill and verifier
- * service. No model runner, router, histogram, prefix state or synthetic model
+ * grouped CPU stage used by ExpertOverlay measures main-forward decode and prefill
+ * service. Live per-phase MTP calibration remains separate. No model runner, router, histogram, prefix state or synthetic model
  * inference is constructed. The observation retains exact source geometry,
  * formats and worker/ISA identity; it is not a generic CPU bandwidth number.
  */

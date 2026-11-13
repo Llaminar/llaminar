@@ -10,10 +10,13 @@
  * absent hardware or a malformed rank placement is a failure, never a skip.
  * Source-free services also run separately across all discovered endpoints so
  * driver diagnostics can distinguish bandwidth setup from arithmetic setup.
+ * Source-backed startup experts cover exactly decode and prefill; live grouped
+ * verifier service is certified separately through prepared runtime endpoints.
  */
 #include "planning/PlanningKernelServiceCatalog.h"
 #include "planning/PlanningWeightServiceModel.h"
 #include "planning/PlanningForwardStateWork.h"
+#include "planning/PlanningProjectionMeasurement.h"
 #include "planning/PlanningCommunicationService.h"
 #include "planning/PlanningHostDeviceMeasurement.h"
 #include "planning/PlanningObservedResource.h"
@@ -23,6 +26,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
+#include "utils/DebugEnv.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -73,7 +77,7 @@ namespace
         if (mpi->rank() == selected->rank)
         {
             PlanningHostDeviceMeasurement::contributeHostMemory(request, host, builder);
-            PlanningHostDeviceMeasurement::contributeExecutionMemory(request,
+            PlanningHostDeviceMeasurement::contributeExecutionMemory(request, host,
                 planningObservedResource(original, selected->device), builder);
         }
         auto memory = std::make_shared<PhysicalMemoryAuthority>(
@@ -372,6 +376,8 @@ namespace
         const AutomaticOrchestrationRequest selection({.only_backends =
             std::vector{DeviceType::CPU, backend}});
         const auto expected = PlanningKernelServiceCatalog::observers(*inventory, selection);
+        constexpr int replays=std::is_same_v<Plan,PlanningFP32ArithmeticPlan>?2:1;
+        for(int replay=0;replay<replays;++replay) {
         const auto catalog = PlanningKernelServiceCatalog::collect(mpi, *inventory, selection, plan);
         acceptPlanningCostPreparation(mpi, [&] {
             ASSERT_EQ(catalog.has_value(), mpi->is_root());
@@ -392,15 +398,128 @@ namespace
                 {
                     const auto &value = std::get<PlanningFP32ArithmeticObservations>(record.observation);
                     EXPECT_EQ(value.device, record.observer.device());
+                    if(value.device.is_gpu())EXPECT_GT(value.prepared_bytes,0u);
+                    else EXPECT_EQ(value.prepared_bytes,0u) << "CPU FP32 borrows its original source";
                     ASSERT_EQ(value.phases.size(), 2u);
+                    EXPECT_EQ(value.phases[0].rows,1);
+                    EXPECT_EQ(value.phases[1].rows,PlanningFP32ArithmeticPlan::kPrefillRows);
                     for (const auto &phase : value.phases)
                     {
                         EXPECT_EQ(phase.graph_nodes != 0u, value.device.is_gpu());
                         EXPECT_GT(phase.service.unitsPerSecond(), 0);
+                        EXPECT_DOUBLE_EQ(phase.service.completedWork(),3.0*2*phase.rows*
+                            PlanningFP32ArithmeticPlan::kN*PlanningFP32ArithmeticPlan::kK);
                     }
                 }
             }
         });
+        }
+    }
+
+    /** @brief Replay the real prepared arithmetic owner under one reusable canonical admission.
+     * @param backend Native family; only an original NUMA/rank-owned endpoint may execute.
+     * Empty local reporters remain idle rather than adopting another rank's GPU.
+     */
+    void provePreparedArithmeticLifecycle(DeviceType backend)
+    {
+        const auto mpi=MPIContextFactory::global();
+        const auto inventory=mpi->clusterInventory();
+        ASSERT_NE(inventory,nullptr);
+        const bool present=std::any_of(inventory->ranks.begin(),inventory->ranks.end(),[&](const auto &rank) {
+            return std::any_of(rank.gpus.begin(),rank.gpus.end(),[&](const auto &gpu) {
+                return gpu.type==backend && rankOwnsGPUDevice(rank,gpu);
+            });
+        });
+        ASSERT_TRUE(present)<<"Required original NUMA-local backend executor is absent";
+        const auto &original=inventory->getRank(mpi->rank());
+        std::optional<DeviceId> selected;
+        for(const auto &gpu:original.gpus)
+            if(gpu.type==backend && rankOwnsGPUDevice(original,gpu)) {
+                selected=DeviceId(backend,gpu.local_device_id);break;
+            }
+        if(!selected)return; // This original rank has no role for this backend.
+        const auto device=*selected;
+        const auto host=planningObservedResource(original,DeviceId::cpu());
+        const auto execution=planningObservedResource(original,device);
+        auto &worker=GPUDeviceContextPool::instance().getContext(device);
+        PhysicalMemoryPlanBuilder builder;
+        worker.submitAndWait([&] {
+            PlanningProjectionMeasurement::contributeMemory(PlanningFP32ArithmeticPlan{},host,execution,builder);
+        });
+        auto memory=std::make_shared<PhysicalMemoryAuthority>(
+            std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(builder.build()),mpi->rank());
+        EXPECT_THROW(PlanningPreparedGPUProjection(PlanningFP32ArithmeticPlan{},device,memory),std::invalid_argument);
+        const auto requireRetired=[&] {
+            // Native process/context declarations intentionally survive setup;
+            // every private sample allocation and graph must retire instead.
+            for(const auto allocator:{DeviceId::cpu(),device})
+                for(const auto owner:{PhysicalMemoryOwner::ModelSourcePayload,
+                    PhysicalMemoryOwner::PrimaryModelWeights,PhysicalMemoryOwner::ActivationArena,
+                    PhysicalMemoryOwner::ExecutionWorkspace,PhysicalMemoryOwner::WeightLoadStaging,
+                    PhysicalMemoryOwner::NativeGraphExecutable,
+                    PhysicalMemoryOwner::NativePreparationGraphExecutable}) {
+                    EXPECT_EQ(memory->claimedBytes(allocator,owner,
+                        PhysicalMemoryMaterializationKind::NewAllocation),0u);
+                    EXPECT_EQ(memory->reservedBytes(allocator,owner),0u);
+                }
+        };
+        // A materialized phase does not oblige the caller to execute. Destroying
+        // that prepared phase must revoke its graph/tensor/workspace owners on
+        // the original worker before the next producer uses the same admission.
+        worker.submitAndWait([&] {
+            PlanningPreparedGPUProjection abandoned(PlanningFP32ArithmeticPlan{},device,memory);
+            abandoned.prepareNextPhase();
+        });
+        requireRetired();
+        for(int replay=0;replay<2;++replay) {
+            worker.submitAndWait([&] {
+                PlanningPreparedGPUProjection producer(PlanningFP32ArithmeticPlan{},device,memory);
+                EXPECT_THROW(producer.result(),std::logic_error);
+                EXPECT_THROW(producer.observePreparedPhase(),std::logic_error);
+                EXPECT_THROW(producer.capturePreparedPhase(),std::logic_error);
+                EXPECT_THROW(producer.completePreparedPhase(),std::logic_error);
+                for(int phase=0;phase<2;++phase) {
+                    if(replay==0) {
+                        producer.prepareNextPhaseStorage();
+                        EXPECT_THROW(producer.prepareNextPhaseStorage(),std::logic_error);
+                        EXPECT_THROW(producer.prepareNextPhase(),std::logic_error);
+                        EXPECT_THROW(producer.completePreparedPhase(),std::logic_error);
+                        EXPECT_THROW(producer.observePreparedPhase(),std::logic_error);
+                        EXPECT_THROW(producer.result(),std::logic_error);
+                        producer.capturePreparedPhase();
+                        EXPECT_THROW(producer.capturePreparedPhase(),std::logic_error);
+                        EXPECT_THROW(producer.prepareNextPhaseStorage(),std::logic_error);
+                        EXPECT_THROW(producer.observePreparedPhase(),std::logic_error);
+                        EXPECT_THROW(producer.result(),std::logic_error);
+                        producer.completePreparedPhase();
+                    } else producer.prepareNextPhase();
+                    EXPECT_THROW(producer.prepareNextPhase(),std::logic_error);
+                    EXPECT_THROW(producer.prepareNextPhaseStorage(),std::logic_error);
+                    EXPECT_THROW(producer.capturePreparedPhase(),std::logic_error);
+                    EXPECT_THROW(producer.completePreparedPhase(),std::logic_error);
+                    EXPECT_THROW(producer.result(),std::logic_error);
+                    producer.observePreparedPhase();
+                    EXPECT_THROW(producer.observePreparedPhase(),std::logic_error);
+                    EXPECT_THROW(producer.capturePreparedPhase(),std::logic_error);
+                    EXPECT_THROW(producer.completePreparedPhase(),std::logic_error);
+                }
+                const auto result=std::get<PlanningFP32ArithmeticObservations>(producer.result());
+                ASSERT_EQ(result.phases.size(),2u);
+                EXPECT_EQ(result.device,device);
+                EXPECT_GT(result.prepared_bytes,0u);
+                for(size_t phase=0;phase<2;++phase) {
+                    const auto &value=result.phases[phase];
+                    EXPECT_EQ(value.rows,phase==0?1:PlanningFP32ArithmeticPlan::kPrefillRows);
+                    EXPECT_GT(value.graph_nodes,0u);
+                    EXPECT_DOUBLE_EQ(value.service.completedWork(),3.0*2*value.rows*
+                        PlanningFP32ArithmeticPlan::kN*PlanningFP32ArithmeticPlan::kK);
+                }
+                EXPECT_EQ(std::get<PlanningFP32ArithmeticObservations>(producer.result()).prepared_bytes,result.prepared_bytes);
+                EXPECT_THROW(producer.prepareNextPhase(),std::logic_error);
+                EXPECT_THROW(producer.prepareNextPhaseStorage(),std::logic_error);
+            });
+            requireRetired();
+        }
     }
 
     /** @brief Join real FP32/streaming observations without another sample or model warmup. */
@@ -540,7 +659,9 @@ namespace
                 return observer.device().type == backend;
             }));
         for (auto format : {GGUFTensorType::Q8_0, GGUFTensorType::F16, GGUFTensorType::BF16, GGUFTensorType::F32})
+        for(int replay=0;replay<(format==GGUFTensorType::Q8_0?2:1);++replay)
         {
+            SCOPED_TRACE(replay);
             std::unique_ptr<PlanningGGUFFixture> fixture;
             std::unique_ptr<PlanningModelSource> source;
             const auto plan = PlanningExpertSamplePublication::describe(mpi, [&] {
@@ -576,11 +697,15 @@ namespace
                         FAIL() << "Expert receipt was replaced by another service kind";
                     else
                     {
-                    ASSERT_EQ(observation.phases.size(), 3u);
+                    ASSERT_EQ(observation.phases.size(), 2u);
+                    EXPECT_EQ(observation.phases[0].phase,ExpertHistogramSource::DecodeToken);
+                    EXPECT_EQ(observation.phases[1].phase,ExpertHistogramSource::PrefillChunk);
                     EXPECT_EQ(observation.formats, plan.description().formats);
                     for (const auto &phase : observation.phases)
                     {
                         EXPECT_GT(phase.service.elapsedSeconds(), 0);
+                        EXPECT_DOUBLE_EQ(phase.service.completedWork(),3.0*6*phase.rows*
+                            observation.input_width*observation.intermediate_width);
                         if constexpr (requires { phase.graph_nodes; }) EXPECT_GT(phase.graph_nodes, 0u);
                     }
                     std::cout << "EXPERT_SERVICE reporter=" << record.observer.discoveryRank()
@@ -594,6 +719,76 @@ namespace
     }
 
     /** @brief Collect a source-sharded ordinary projection through the same reporter/PMA lifecycle. */
+    /** @brief Replay native and promoted source collection after original readers and PMA owners retire.
+     * @param backend Native family; production discovery chooses every actual owned reporter.
+     * Small source cases cover native Q8_0/F16/BF16/F32 and F16 GDN promotion;
+     * no fixture substitutes synthetic arithmetic for the published source.
+     */
+    void provePreparedSourceCollectionReplay(DeviceType backend)
+    {
+        struct RestoreArithmetic {
+            GDNProjectionArithmetic previous=debugEnv().gemm.gdn_projection_arithmetic;
+            ~RestoreArithmetic(){mutableDebugEnv().gemm.gdn_projection_arithmetic=previous;}
+        } restore;
+        mutableDebugEnv().gemm.gdn_projection_arithmetic=GDNProjectionArithmetic::FP32;
+        const auto mpi=MPIContextFactory::global();
+        const auto inventory=mpi->clusterInventory();
+        const AutomaticOrchestrationRequest selection({.only_backends=std::vector{backend}});
+        const auto expected=PlanningKernelServiceCatalog::observers(*inventory,selection);
+        ASSERT_FALSE(expected.empty());
+        const std::array cases{
+            std::pair{GGUFTensorType::Q8_0,false},std::pair{GGUFTensorType::F16,false},
+            std::pair{GGUFTensorType::BF16,false},std::pair{GGUFTensorType::F32,false},
+            std::pair{GGUFTensorType::F16,true}};
+        for(const auto &[format,converted]:cases)
+        for(int replay=0;replay<2;++replay) {
+            SCOPED_TRACE(static_cast<int>(format));
+            SCOPED_TRACE(converted);
+            SCOPED_TRACE(replay);
+            std::unique_ptr<PlanningGGUFFixture> fixture;
+            std::unique_ptr<PlanningModelSource> source;
+            const auto matrix=PlanningMatrixSamplePublication::describe(mpi,[&] {
+                fixture=std::make_unique<PlanningGGUFFixture>(false,false,format,256,format);
+                source=std::make_unique<PlanningModelSource>(fixture->path());
+                return PlanningMatrixSamplePlan::resolve(*source,
+                    {converted?"blk.0.ssm_alpha.weight":"blk.0.ffn_gate.weight",PlanningMatrixRows{64,129}});
+            });
+            EXPECT_EQ(matrix.executionType()!=matrix.tensorType(),converted);
+            const PlanningProjectionServicePlan plan(matrix,7);
+            std::weak_ptr<PhysicalMemoryAuthority> original_memory;
+            int loads=0;
+            const auto catalog=PlanningKernelServiceCatalog::collect(mpi,*inventory,selection,plan,[&](const auto &memory) {
+                ++loads;original_memory=memory;
+                auto sample=matrix.load(*source,memory,DeviceId::cpu());
+                source.reset();fixture.reset();return sample;
+            });
+            EXPECT_EQ(loads,mpi->is_root()?1:0);
+            EXPECT_TRUE(original_memory.expired())<<"Source/preparation PMA survived completed collection";
+            acceptPlanningCostPreparation(mpi,[&] {
+                ASSERT_EQ(catalog.has_value(),mpi->is_root());
+                if(!catalog)return;
+                ASSERT_EQ(catalog->records().size(),expected.size());
+                for(size_t index=0;index<expected.size();++index) {
+                    const auto &record=catalog->records()[index];
+                    EXPECT_EQ(record.observer,expected[index]);
+                    const auto &value=std::get<PlanningProjectionObservations>(record.observation);
+                    EXPECT_EQ(value.source.serialize(),matrix.serialize());
+                    EXPECT_EQ(value.device,record.observer.device());
+                    EXPECT_GT(value.prepared_bytes,0u);
+                    ASSERT_EQ(value.phases.size(),2u);
+                    for(size_t phase=0;phase<2;++phase) {
+                        const auto &work=value.phases[phase];
+                        EXPECT_EQ(work.rows,phase==0?1:7);
+                        EXPECT_GT(work.graph_nodes,0u);
+                        EXPECT_GT(work.service.elapsedSeconds(),0);
+                        EXPECT_DOUBLE_EQ(work.service.completedWork(),3.0*2*work.rows*
+                            matrix.geometry().n*matrix.geometry().k);
+                    }
+                }
+            });
+        }
+    }
+
     void proveProjectionCollection(DeviceType backend)
     {
         const auto mpi = MPIContextFactory::global();
@@ -753,11 +948,23 @@ TEST(PlanningKernelServiceCatalogMPI, CPU_StreamingWorkerFailureIsCollective)
 #ifdef HAVE_CUDA
 TEST(PlanningKernelServiceCatalogMPI, CUDA_StreamingCollection) { proveStreamingCollection(DeviceType::CUDA); }
 TEST(PlanningKernelServiceCatalogMPI, CUDA_SourceFreeStreaming) { proveSourceFreeCollection(DeviceType::CUDA, PlanningStreamingServicePlan{}); }
+TEST(PlanningKernelServiceCatalogMPI, CUDA_PreparedSourceCollectionReplay) {
+    ensureNvidiaFactoryRegistered();provePreparedSourceCollectionReplay(DeviceType::CUDA);
+}
+TEST(PlanningKernelServiceCatalogMPI, CUDA_PreparedArithmeticPhaseLifecycle) {
+    ensureNvidiaFactoryRegistered();provePreparedArithmeticLifecycle(DeviceType::CUDA);
+}
 TEST(PlanningKernelServiceCatalogMPI, CUDA_SourceFreeArithmetic) { proveSourceFreeCollection(DeviceType::CUDA, PlanningFP32ArithmeticPlan{}); }
 #endif
 #ifdef HAVE_ROCM
 TEST(PlanningKernelServiceCatalogMPI, ROCm_StreamingCollection) { proveStreamingCollection(DeviceType::ROCm); }
 TEST(PlanningKernelServiceCatalogMPI, ROCm_SourceFreeStreaming) { proveSourceFreeCollection(DeviceType::ROCm, PlanningStreamingServicePlan{}); }
+TEST(PlanningKernelServiceCatalogMPI, ROCm_PreparedSourceCollectionReplay) {
+    ensureAMDFactoryRegistered();provePreparedSourceCollectionReplay(DeviceType::ROCm);
+}
+TEST(PlanningKernelServiceCatalogMPI, ROCm_PreparedArithmeticPhaseLifecycle) {
+    ensureAMDFactoryRegistered();provePreparedArithmeticLifecycle(DeviceType::ROCm);
+}
 TEST(PlanningKernelServiceCatalogMPI, ROCm_SourceFreeArithmetic) { proveSourceFreeCollection(DeviceType::ROCm, PlanningFP32ArithmeticPlan{}); }
 #endif
 

@@ -29,6 +29,7 @@
 #include "../../utils/TestTensorFactory.h"
 
 #include <array>
+#include <exception>
 #include <optional>
 #include <string>
 #include <cstdlib>
@@ -3301,4 +3302,125 @@ TEST(TransferCapturedStorageReplay, CUDAOneColdBorrowAndConstantRegistryFreeVali
 TEST(TransferCapturedStorageReplay, ROCmOneColdBorrowAndConstantRegistryFreeValidation)
 {
     proveCapturedStorageReplay(DeviceId::rocm(0));
+}
+
+namespace
+{
+    /** @brief Deferred fake DMA proves that cold metadata owns its source through exact completion. */
+    class ColdMetadataBackend final : public MockBackend
+    {
+    public:
+        explicit ColdMetadataBackend(DeviceType type):MockBackend(type) {}
+        inline static ColdMetadataBackend *selected=nullptr,*foreign_selected=nullptr;
+        inline static DeviceId expected=DeviceId::invalid();
+        std::vector<std::string> order;
+        bool fail_create=false,fail_upload=false,fail_record=false,fail_wait=false;
+        const void *source=nullptr;void *destination=nullptr;size_t bytes=0;
+        std::function<void()> before_completion;
+        void *createEvent(int device) override {
+            order.push_back("create");return fail_create?nullptr:MockBackend::createEvent(device);
+        }
+        bool hostToDeviceOnStream(void *dst,const void *src,size_t count,int,void *stream) override {
+            EXPECT_EQ(stream,mockProducerStream());order.push_back("upload");
+            destination=dst;source=src;bytes=count;return !fail_upload;
+        }
+        bool recordEvent(void *event,int device,void *stream) override {
+            EXPECT_EQ(stream,mockProducerStream());order.push_back("record");
+            return !fail_record && MockBackend::recordEvent(event,device,stream);
+        }
+        bool waitForEvent(void *event,int device) override {
+            order.push_back("wait");if(before_completion)before_completion();
+            if(fail_wait)return false;
+            std::memcpy(destination,source,bytes);return MockBackend::waitForEvent(event,device);
+        }
+        void destroyEvent(void *event,int device) override {
+            order.push_back("destroy");MockBackend::destroyEvent(event,device);
+        }
+        bool synchronize(int) override { ADD_FAILURE()<<"Cold metadata must use its exact completion event";return false; }
+    };
+    /** @brief Bound function-pointer resolvers retire even after a fatal test assertion. */
+    struct ColdMetadataSelection final
+    {
+        ColdMetadataBackend *prior,*prior_foreign;
+        DeviceId prior_device;
+        ColdMetadataSelection(ColdMetadataBackend &backend,DeviceId device,ColdMetadataBackend *foreign=nullptr)
+            :prior(ColdMetadataBackend::selected),prior_foreign(ColdMetadataBackend::foreign_selected),
+             prior_device(ColdMetadataBackend::expected)
+        {
+            ColdMetadataBackend::selected=&backend;ColdMetadataBackend::foreign_selected=foreign;
+            ColdMetadataBackend::expected=device;
+        }
+        ~ColdMetadataSelection() {
+            ColdMetadataBackend::selected=prior;ColdMetadataBackend::foreign_selected=prior_foreign;
+            ColdMetadataBackend::expected=prior_device;
+        }
+    };
+}
+
+/** @test Both native backend shapes copy only admitted metadata after capture exclusion and exact completion. */
+TEST(TransferColdDeviceMetadata, ExactOwnerBoundsAndSourceLifetimeReplay)
+{
+    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm}) {
+        ColdMetadataBackend backend(type),other(type);
+        const DeviceId device{type,7};
+        ColdMetadataSelection selection(backend,device,&other);
+        TransferEngine engine([](DeviceId actual)->IBackend*{
+            EXPECT_EQ(actual,ColdMetadataBackend::expected);return ColdMetadataBackend::selected;
+        });
+        auto destination=engine.allocateDeviceTransferBuffer(32,device);
+        std::memset(destination->mutableDeviceData(),0xa5,32);
+        std::array<std::byte,8> source{};source.fill(std::byte{0x39});
+        backend.before_completion=[&]{
+            EXPECT_EQ(source.front(),std::byte{0x39});
+            EXPECT_EQ(static_cast<const uint8_t*>(destination->deviceData())[8],0xa5);
+        };
+        engine.initializeDeviceMetadata(*destination,8,source,mockProducerStream());
+        EXPECT_EQ(backend.order,(std::vector<std::string>{"create","upload","record","wait","destroy"}));
+        source.fill(std::byte{0});
+        const auto *result=static_cast<const uint8_t*>(destination->deviceData());
+        for(size_t i=0;i<32;++i)EXPECT_EQ(result[i],i>=8 && i<16?0x39:0xa5);
+        backend.order.clear();
+        for(const auto stream:std::array<void*,3>{nullptr,reinterpret_cast<void*>(1),reinterpret_cast<void*>(2)})
+            EXPECT_THROW(engine.initializeDeviceMetadata(*destination,0,source,stream),std::invalid_argument);
+        EXPECT_THROW(engine.initializeDeviceMetadata(*destination,0,{},mockProducerStream()),std::invalid_argument);
+        EXPECT_THROW(engine.initializeDeviceMetadata(*destination,25,source,mockProducerStream()),std::invalid_argument);
+        EXPECT_THROW(engine.initializeDeviceMetadata(*destination,SIZE_MAX,source,mockProducerStream()),std::invalid_argument);
+        {GraphCaptureGuard capture;EXPECT_THROW(engine.initializeDeviceMetadata(*destination,0,source,mockProducerStream()),std::invalid_argument);}
+        TransferEngine foreign([](DeviceId actual)->IBackend*{
+            EXPECT_EQ(actual,ColdMetadataBackend::expected);return ColdMetadataBackend::foreign_selected;
+        });
+        EXPECT_THROW(foreign.initializeDeviceMetadata(*destination,0,source,mockProducerStream()),std::logic_error);
+        // Invalid/unbound device storage cannot be returned by the public factory.
+        EXPECT_THROW(engine.allocateDeviceTransferBuffer(8,DeviceId::cpu()),std::invalid_argument);
+        TransferEngine missing([](DeviceId)->IBackend*{return nullptr;});
+        EXPECT_THROW(missing.allocateDeviceTransferBuffer(8,device),std::runtime_error);
+        EXPECT_TRUE(backend.order.empty());EXPECT_TRUE(other.order.empty());
+    }
+}
+
+/** @test Rejected enqueue cleans up; accepted enqueue cannot unwind live source bytes after lost completion. */
+TEST(TransferColdDeviceMetadata, FailedCompletionCannotReleaseAcceptedSource)
+{
+    ColdMetadataBackend backend(DeviceType::CUDA);
+    ColdMetadataSelection selection(backend,DeviceId::cuda(7));
+    TransferEngine engine([](DeviceId actual)->IBackend*{
+        EXPECT_EQ(actual,ColdMetadataBackend::expected);return ColdMetadataBackend::selected;
+    });
+    auto destination=engine.allocateDeviceTransferBuffer(16,DeviceId::cuda(7));
+    const std::array<std::byte,8> source{};
+    backend.fail_create=true;
+    EXPECT_THROW(engine.initializeDeviceMetadata(*destination,0,source,mockProducerStream()),std::runtime_error);
+    EXPECT_EQ(backend.order,(std::vector<std::string>{"create"}));
+    backend.fail_create=false;backend.fail_upload=true;backend.order.clear();
+    EXPECT_THROW(engine.initializeDeviceMetadata(*destination,0,source,mockProducerStream()),std::runtime_error);
+    EXPECT_EQ(backend.order,(std::vector<std::string>{"create","upload","destroy"}));
+    for(bool fail_record:{false,true}) {
+        EXPECT_EXIT({
+            std::set_terminate([]{std::_Exit(77);});
+            struct SourceScope { ~SourceScope(){std::_Exit(88);} } retained_source;
+            backend.fail_upload=false;backend.fail_record=fail_record;backend.fail_wait=!fail_record;
+            engine.initializeDeviceMetadata(*destination,0,source,mockProducerStream());
+            std::_Exit(99);
+        },::testing::ExitedWithCode(77),"");
+    }
 }

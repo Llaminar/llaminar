@@ -120,6 +120,7 @@ namespace llaminar2
             if (key == "mode") config.planning_mode = parsePlanningMode(value);
             else if (key == "only_backends") config.automatic_planning.only_backends = parseOrchestrationBackendList(value);
             else if (key == "only_strategies") config.automatic_planning.only_strategies = parseOrchestrationStrategyList(value);
+            else if (key == "pipeline_stage_widths") config.automatic_planning.pipeline_stage_widths = parseAutomaticPipelineStageWidths(value);
             else if (key == "device_counts") config.automatic_planning.device_counts = parseAutomaticDeviceCounts(value);
             else if (key == "hosts") config.automatic_planning.host_participation = parseAutomaticHostParticipation(value);
             else if (key == "workload") config.automatic_planning.workload = parseOrchestrationPlanningWorkload(value);
@@ -1374,6 +1375,15 @@ namespace llaminar2
             .description = "Require exact physical compute-device counts in auto selection (e.g. cuda=2,cpu=2); identities and placement remain automatic",
             .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
                 c.automatic_planning.device_counts = parseAutomaticDeviceCounts(v);
+            }),
+        });
+        spec.add({
+            .long_name = "--auto-pipeline-stage-widths",
+            .category = "Automatic Planning",
+            .value_label = "<width,...>",
+            .description = "Require ordered positive PP stage device counts; identities and layer cuts remain automatic",
+            .setter = setters::custom<OrchestrationConfig>([](OrchestrationConfig &c, const std::string &v) {
+                c.automatic_planning.pipeline_stage_widths = parseAutomaticPipelineStageWidths(v);
             }),
         });
         spec.add({

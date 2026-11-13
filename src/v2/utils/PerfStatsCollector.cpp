@@ -10,10 +10,10 @@
  * reference-count increment, lock, environment lookup, or allocation in the
  * inference path.
  *
- * Actual enabled records remain protected by the collector mutex. Callers that
- * need expensive arguments or tags should still guard their construction with
- * @ref PerfStatsCollector::isDomainEnabled; the policy cache makes that guard
- * economical in both enabled and disabled configurations.
+ * Only admitted record families enter the mutex-protected retained map; an export
+ * filter must not hide accumulating sibling diagnostics. Callers constructing
+ * expensive arguments or tags should additionally use the same immutable
+ * @ref PerfStatsCollector::isRecordFamilyEnabled gate before construction.
  */
 
 #include "PerfStatsCollector.h"
@@ -708,7 +708,7 @@ namespace llaminar2
                     throw std::invalid_argument("An empty counter observation batch has a nonzero value");
                 return;
             }
-            if (!PerfStatsCollector::isDomainEnabled(key.domain))
+            if (!PerfStatsCollector::isRecordFamilyEnabled(key.domain, key.name))
                 return;
             auto &s = state();
             std::lock_guard<std::mutex> lock(s.mutex);
@@ -908,7 +908,7 @@ namespace llaminar2
         std::string domain,std::string name,double value,std::initializer_list<uint64_t> words,
         std::string phase,std::string device,Tags tags)
     {
-        if(!isDomainEnabled(domain))return;
+        if(!isRecordFamilyEnabled(domain,name))return;
         if(words.size()==0u)throw std::invalid_argument("PerfStats counter sequence requires lifecycle words");
         const PerfStatKey key{PerfStatRecord::Kind::Counter,std::move(domain),std::move(name),
             std::move(phase),std::move(device),std::move(tags)};
@@ -918,7 +918,7 @@ namespace llaminar2
         std::initializer_list<uint64_t> words)
     {
         if(!identity.impl_)throw std::invalid_argument("Counter identity has been moved from");
-        if(!isDomainEnabled(identity.impl_->key.domain))return;
+        if(!isRecordFamilyEnabled(identity.impl_->key.domain,identity.impl_->key.name))return;
         if(words.size()==0u)throw std::invalid_argument("PerfStats counter sequence requires lifecycle words");
         addCounterSequence(identity.impl_->key,value,words);
     }
@@ -953,7 +953,7 @@ namespace llaminar2
         std::string device,
         Tags tags)
     {
-        if (!isDomainEnabled(domain))
+        if (!isRecordFamilyEnabled(domain, name))
             return;
 
         PerfStatKey key;
@@ -982,7 +982,7 @@ namespace llaminar2
         std::initializer_list<uint64_t> words,
         std::string phase, std::string device, Tags tags)
     {
-        if (!isDomainEnabled(domain))
+        if (!isRecordFamilyEnabled(domain, name))
             return;
         if (words.size() == 0u)
             throw std::invalid_argument("PerfStats timer sequence requires lifecycle words");
@@ -1013,7 +1013,7 @@ namespace llaminar2
         std::string device,
         Tags tags)
     {
-        if (!isDomainEnabled(domain))
+        if (!isRecordFamilyEnabled(domain, name))
             return;
         if (words.size() == 0u)
         {
@@ -1474,7 +1474,7 @@ namespace llaminar2
           device_(std::move(device)),
           tags_(std::move(tags))
     {
-        enabled_ = PerfStatsCollector::isDomainEnabled(domain_);
+        enabled_ = PerfStatsCollector::isRecordFamilyEnabled(domain_, name_);
         if (device_.empty() && ProfilingContext::hasDeviceContext())
             device_ = ProfilingContext::getCurrentDeviceKey();
         if (enabled_)

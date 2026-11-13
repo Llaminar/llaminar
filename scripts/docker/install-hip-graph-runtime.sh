@@ -16,6 +16,8 @@
 # enabled; finite compute graphs retain the upstream single-queue optimization.
 # Retained events authenticate a live producer generation under the native
 # stream registry before inspecting capture state, including after retirement.
+# Capture retirement detaches stream membership before traversal, preserving
+# legal multi-stream event DAGs even when fork/rejoin revisits an earlier stream.
 # Final node-device argument metadata sizes retained graph pools, so large
 # by-value arguments do not roll over pools sized from stale constructor caches.
 #
@@ -42,12 +44,15 @@ hip_patches=(
     "${hip_script_dir}/patches/rocm-hip-graph-kernarg-metadata.patch"
     "${hip_script_dir}/patches/rocm-hip-preferred-queue-unshared.patch"
     "${hip_script_dir}/patches/rocm-hip-timed-sdma-marker.patch"
+    "${hip_script_dir}/patches/rocm-hip-capture-retirement-membership.patch"
 )
 # Builder implementation and host fixture are part of the immutable proof
 # identity, so fast reuse cannot silently retain an older contract.
 hip_proof_files=(
     "${hip_script_dir}/hip-preferred-queue/proof.py"
     "${hip_script_dir}/hip-preferred-queue/selector-contract.cpp.in"
+    "${hip_script_dir}/hip-end-capture/proof.py"
+    "${hip_script_dir}/hip-end-capture/end-capture-contract.cpp.in"
 )
 hip_library="${hip_prefix}/lib/libamdhip64.so.${LLAMINAR_HIP_LIBRARY_VERSION}"
 # ROCm's package uses a zero Git stamp. Preserve its filename as an alias, not
@@ -55,6 +60,7 @@ hip_library="${hip_prefix}/lib/libamdhip64.so.${LLAMINAR_HIP_LIBRARY_VERSION}"
 hip_package_library="${hip_library}-0000000"
 hip_marker="${hip_prefix}/share/llaminar/hip-graph-runtime.txt"
 hip_queue_proof="${hip_prefix}/share/llaminar/hip-preferred-queue-proof.json"
+hip_capture_proof="${hip_prefix}/share/llaminar/hip-end-capture-proof.json"
 
 # This source pin is an ABI dependency, not an independently upgradable plugin.
 # Reject a future SDK override until its source revision and repair are reviewed.
@@ -83,6 +89,9 @@ if [[ -f "${hip_library}" && -f "${hip_marker}" &&
     # Verification is device/compiler-free and precedes all reuse/export writes.
     python3 "${hip_script_dir}/hip-preferred-queue/proof.py" \
         --verify "${hip_queue_proof}" --library "${hip_library}" \
+        --source-identity "${hip_identity}"
+    python3 "${hip_script_dir}/hip-end-capture/proof.py" \
+        --verify "${hip_capture_proof}" --library "${hip_library}" \
         --source-identity "${hip_identity}"
     if [[ -n "${HIP_RUNTIME_STAGE_PREFIX:-}" ]]; then
         # Export only the installer-owned component, including the package name
@@ -123,7 +132,7 @@ if [[ -f "${hip_library}" && -f "${hip_marker}" &&
         install -d "${hip_stage}/lib" "${hip_stage}/share/llaminar" "${hip_stage}/share/licenses"
         cp -P "${hip_library}" "${hip_package_library}" \
             "${hip_prefix}/lib/libamdhip64.so.7" "${hip_prefix}/lib/libamdhip64.so" "${hip_stage}/lib/"
-        cp "${hip_marker}" "${hip_queue_proof}" "${hip_stage}/share/llaminar/"
+        cp "${hip_marker}" "${hip_queue_proof}" "${hip_capture_proof}" "${hip_stage}/share/llaminar/"
         cp -a "${hip_prefix}/share/licenses/llaminar-hip" "${hip_stage}/share/licenses/"
         echo "HIP graph runtime component staged: ${hip_stage}"
     else
@@ -203,5 +212,11 @@ python3 "${hip_script_dir}/hip-preferred-queue/proof.py" \
     --compiler "${hip_sdk_root}/lib/llvm/bin/clang++" \
     --library "${hip_library}" --source-identity "${hip_identity}" \
     --output "${hip_queue_proof}"
+python3 "${hip_script_dir}/hip-end-capture/proof.py" \
+    --source-root "${hip_build_dir}/systems/projects/clr" \
+    --patch "${hip_script_dir}/patches/rocm-hip-capture-retirement-membership.patch" \
+    --compiler "${hip_sdk_root}/lib/llvm/bin/clang++" \
+    --library "${hip_library}" --source-identity "${hip_identity}" \
+    --output "${hip_capture_proof}"
 printf '%s:%s\n' "${hip_identity}" "$(sha256sum "${hip_library}" | cut -d ' ' -f 1)" > "${hip_marker}"
 echo "HIP graph runtime installed: ${hip_library}"

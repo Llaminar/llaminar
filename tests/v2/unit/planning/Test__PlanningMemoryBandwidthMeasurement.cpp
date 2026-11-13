@@ -6,6 +6,8 @@
  * Actual streaming execution and native capture belong to the preflight tests.
  */
 #include "planning/PlanningMemoryBandwidthMeasurement.h"
+#include "planning/PlanningExecutionMeasurement.h"
+#include "planning/PlanningGPUClockBuffer.h"
 #include "backends/GPUGraphMemoryContract.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include <gtest/gtest.h>
@@ -116,10 +118,12 @@ TEST(PlanningMemoryBandwidthMeasurement, AdmissionOwnsExactOverlappingHostAndDev
         PhysicalMemoryPlanBuilder builder;
         PlanningMemoryBandwidthMeasurement::contributeMemory(request, host, execution, builder);
         const auto plan = builder.build();
-        EXPECT_EQ(plan.find({3, DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ExecutionWorkspace), request.usefulBytes());
-        EXPECT_EQ(plan.find({3, device})->bytes(PhysicalMemoryOwner::ExecutionWorkspace), request.usefulBytes());
+        EXPECT_EQ(plan.find({3, DeviceId::cpu()})->bytes(PhysicalMemoryOwner::ExecutionWorkspace),
+            request.usefulBytes() + (device.is_gpu() ? PlanningNativeGPUClockBuffer::hostAllocationBytes(2) : 0));
+        EXPECT_EQ(plan.find({3, device})->bytes(PhysicalMemoryOwner::ExecutionWorkspace),
+            request.usefulBytes() + (device.is_gpu() ? PlanningNativeGPUClockBuffer::deviceAllocationBytes(2) : 0));
         EXPECT_EQ(plan.find({3, device})->bytes(PhysicalMemoryOwner::NativeGraphExecutable),
-            device.is_gpu() ? GPUGraphMemoryContract::reservationBytesPerExecutable(device) : 0);
+            device.is_gpu() ? PlanningExecutionMeasurement::kPreparedGraphCount * GPUGraphMemoryContract::reservationBytesPerExecutable(device) : 0);
         auto wrong = execution;
         wrong.world_rank = 2;
         EXPECT_THROW(PlanningMemoryBandwidthMeasurement::contributeMemory(request, host, wrong, builder), std::invalid_argument);

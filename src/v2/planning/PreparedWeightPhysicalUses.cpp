@@ -9,6 +9,7 @@
  */
 #include "planning/PreparedWeightPhysicalUses.h"
 #include "planning/ModelMemoryProfile.h"
+#include "planning/PlanningModelMetadata.h"
 #include "planning/WeightShardGeometry.h"
 #include "loaders/PreparedWeightRepresentationContract.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
@@ -20,10 +21,11 @@
 namespace llaminar2
 {
     PreparedWeightPhysicalUses::PreparedWeightPhysicalUses(const ModelMemoryProfile &profile, DeviceId device,
-        WeightComponentScope components)
-        : profile_(profile), device_(device), components_(components)
+        WeightComponentScope components,std::shared_ptr<const PlanningTensorIndex> source_index)
+        : profile_(profile), device_(device), components_(components),source_index_(std::move(source_index))
     {
-        for (const auto &source : profile.tensors) originals_.insert(&source);
+        if(source_index_)source_index_->requireProfile(profile);
+        else for (const auto &source : profile.tensors) originals_.insert(&source);
         if (!weightScopeOwnsTerminal(components_))
         {
             const auto schema = SchemaFactoryRegistry::getFactory(profile.architecture);
@@ -43,8 +45,11 @@ namespace llaminar2
     {
         // Source identity is the original inventory object in this compiler's
         // model epoch. A copied entry, even with the same name, is not authority.
-        const bool original = originals_.find(&tensor) != originals_.end();
-        if (!original || source_view != WeightSourceStorageView::WholeOriginal || isRoutedExpertRole(inferWeightRole(tensor.name)) || tensor.K == 0 ||
+        const auto retained=source_index_?source_index_->classifyOriginal(tensor):std::nullopt;
+        const bool original = source_index_?retained.has_value():originals_.find(&tensor)!=originals_.end();
+        if(!original)return std::nullopt;
+        const auto role=retained?retained->role():inferWeightRole(tensor.name);
+        if (source_view != WeightSourceStorageView::WholeOriginal || isRoutedExpertRole(role) || tensor.K == 0 ||
             !geometry.matrix() || geometry.matrix()->instances != 1 || geometry.elements() != tensor.elements ||
             geometry.matrix()->columns != tensor.K || tensor.elements % tensor.K ||
             geometry.matrix()->rows != tensor.elements / tensor.K) return std::nullopt;
@@ -53,7 +58,6 @@ namespace llaminar2
         // authenticate an otherwise absent primary creator on an earlier stage.
         if (!weightScopeOwnsTerminal(components_) && terminal_sources_.find(tensor.name) != terminal_sources_.end())
             return std::nullopt;
-        const auto role = inferWeightRole(tensor.name);
         const auto classification = PreparedWeightIdentityContract::classifyOriginalMatrix(role, device_);
         if (classification == PreparedGemmClassification::Rejected) return std::nullopt;
         if (classification == PreparedGemmClassification::RequiresSchema)
@@ -95,7 +99,8 @@ namespace llaminar2
                     edges_.push_back(PreparedWeightPhysicalAlias{root});
                     return edges_.back();
                 }
-        const auto *original = originals_.find(&tensor) != originals_.end() ? &tensor : nullptr;
+        const bool original_source=source_index_?source_index_->classifyOriginal(tensor).has_value():originals_.find(&tensor)!=originals_.end();
+        const auto *original = original_source ? &tensor : nullptr;
         roots_.push_back({original, std::move(view)});
         if (roots_.back().identity) roots_by_source_[&tensor].push_back(roots_.size() - 1);
         edges_.push_back(PreparedWeightPhysicalCreator{roots_.size() - 1});

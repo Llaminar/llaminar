@@ -6,6 +6,8 @@
  * production sampler must load that triplet, use normal expert preparation and
  * complete the existing grouped FFN at all three phases. These are lifecycle
  * witnesses, not real-model throughput certificates or performance thresholds.
+ * Source-backed startup experts cover exactly decode and prefill; live grouped
+ * verifier service is certified separately through prepared runtime endpoints.
  */
 #include "planning/PlanningCPUExpertMeasurement.h"
 #include "backends/BackendManager.h"
@@ -112,7 +114,9 @@ TEST(PlanningExecutionMeasurementIntegration, CPU_PreparedExpertSamples)
             EXPECT_EQ(observed.source.gate.tensor_name, sample.gate.tensor_name);
             EXPECT_EQ(std::get<PlanningExpertMatrix>(observed.source.gate.selection).index, 7u);
             EXPECT_GT(observed.prepared_bytes, 0u);
-            ASSERT_EQ(observed.phases.size(), 3u);
+            ASSERT_EQ(observed.phases.size(), 2u);
+            EXPECT_EQ(observed.phases[0].phase,ExpertHistogramSource::DecodeToken);
+            EXPECT_EQ(observed.phases[1].phase,ExpertHistogramSource::PrefillChunk);
             for (const auto &phase : observed.phases)
             {
                 EXPECT_EQ(phase.rows, MoEOverlayCPUServiceMeasurement::rowsForPhase(phase.phase));

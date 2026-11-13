@@ -4215,17 +4215,21 @@ namespace llaminar2
                     cacheCapturedSegmentArenaWrites(graph, segment);
             }
             segment_cache.retained_parent_capture = std::move(parent);
+            // Setup is a physical lifecycle edge too: publish the same sealed
+            // child/service inventory as transaction zero and later replay.
+            // Missing service metadata must never look like implicit zero.
+            auto boundary_tags = retainedParentBoundaryTags(
+                segment_cache.perf_context, child_units->size(),
+                concurrent_service_segments);
+            boundary_tags.emplace("parent_nodes", std::to_string(
+                segment_cache.retained_parent_capture->nodeCount()));
             PerfStatsCollector::addCounter(
                 "forward_graph",
                 "retained_parent_materialized_without_launch",
                 1.0,
                 "setup",
                 ctx->deviceId().toString(),
-                {{"context", segment_cache.perf_context},
-                 {"child_units", std::to_string(child_units->size())},
-                 {"parent_nodes",
-                  std::to_string(
-                      segment_cache.retained_parent_capture->nodeCount())}});
+                std::move(boundary_tags));
             LOG_DEBUG(
                 "[DeviceGraphCaptureController] Retained parent composed and "
                 "instantiated without launch: "

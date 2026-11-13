@@ -11,6 +11,7 @@
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "planning/ResolvedRankOrchestration.h"
+#include "planning/PlanningAdmissionPreparation.h"
 #include "config/OrchestrationStartupPolicy.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
@@ -87,7 +88,8 @@ namespace llaminar2
         return {.prefill_bucket_rows = env.execution.prefill_graph_bucket_sizes,
             .minimum_prefill_sequence_rows = env.execution.prefill_graph_min_seq,
             .maximum_cached_prefill_buckets = env.execution.prefill_graph_max_cached_buckets,
-            .weight_load = configuredGPUWeightLoadMemoryPolicy()};
+            .weight_load = configuredGPUWeightLoadMemoryPolicy(),
+            .require_native_context_budgets=true};
     }
 
     AdmittedOrchestrationCandidate::AdmittedOrchestrationCandidate(
@@ -132,7 +134,7 @@ namespace llaminar2
 
     AdmittedOrchestrationCandidate AdmittedOrchestrationCandidate::admit(
         AutomaticOrchestrationCandidate candidate, const PlanningModelSource &source,
-        const OrchestrationCandidateMemoryPolicy &policy)
+        const OrchestrationCandidateMemoryPolicy &policy, PlanningAdmissionPreparation *preparation)
     {
         if (candidate.config.model_path != source.path() || candidate.config.shared_predictor != source.predictorSource())
             throw std::invalid_argument("Candidate model path does not name the retained planning source");
@@ -144,15 +146,16 @@ namespace llaminar2
         const auto &model = source.metadata();
         const auto &profile = model.memoryProfile();
         const auto &loader = source.loader();
+        std::optional<PlanningAdmissionPreparation> local_preparation;
+        if (!preparation) { local_preparation.emplace(loader,model,policy.weight_load); preparation=&*local_preparation; }
+        preparation->requireOriginal(loader,model,policy.weight_load);
         resolveMTPStartupPolicy(candidate.config, profile);
         // Direct callers of candidate admission must obey the same learned-
         // predictor contract as automatic startup, before publishing a BOM.
         if (retainsMTPGraphCapacity(candidate.config.mtp))
-            (void)requireMTPWeightManifest(loader, loader.architecture(),
-                                           static_cast<int>(loader.blockCount()));
+            preparation->requireMTP();
         const auto &inventory = candidate.membership.inventory();
-        const auto weight_load = resolveGPUWeightLoadMemoryGeometry(
-            maximumGGUFTensorPayloadBytes(loader.getModel()), policy.weight_load);
+        const auto &weight_load = preparation->weightLoadGeometry();
 
         ExecutionPlanBuilder builder;
         std::vector<ResolvedRankOrchestration> compiled;
@@ -186,7 +189,10 @@ namespace llaminar2
                         .maximum_cached_buckets = policy.maximum_cached_prefill_buckets},
                     .gpu_weight_load = {.policy = policy.weight_load, .maximum_source_bytes = weight_load.maximum_source_bytes},
                     .native_ordering_events=policy.native_ordering_events,
-                    .retained_host_services=projectPlanningHostServiceBudget(policy.retained_host_services, candidate.membership, 0)}));
+                    .retained_host_services=projectPlanningHostServiceBudget(policy.retained_host_services, candidate.membership, 0),
+                    .native_context_budgets=policy.native_context_budgets.contains(candidate.membership.discoveryRanks().at(0))?policy.native_context_budgets.at(candidate.membership.discoveryRanks().at(0)):std::vector<PlanningNativeContextDeclaration>{},
+                    .require_native_context_budgets=policy.require_native_context_budgets,
+                    .source_preparation=preparation}));
             std::vector<DevicePlanConfig> devices;
             for (const auto &stage : pipeline->stages())
                 devices.insert(devices.end(), stage.devicePlans().begin(), stage.devicePlans().end());
@@ -214,6 +220,13 @@ namespace llaminar2
                     .captured_prefill_buckets = policy.prefill_bucket_rows,
                     .max_gpu_memory_bytes = config.memoryLimitBytes(DeviceType::CUDA),
                     .max_cpu_memory_bytes = config.memoryLimitBytes(DeviceType::CPU)});
+                const auto found=policy.native_context_budgets.find(candidate.membership.discoveryRanks().at(rank.rank));
+                for(auto& cfg:local)if(cfg.device.is_gpu()){
+                    const auto* keys=found==policy.native_context_budgets.end()?nullptr:&found->second;
+                    const auto key=keys?std::find_if(keys->begin(),keys->end(),[&](const auto& k){return k.device==cfg.device;}):std::vector<PlanningNativeContextDeclaration>::const_iterator{};
+                    if(keys && key!=keys->end())cfg.planning_native_context_birth=*key;
+                    else if(policy.require_native_context_budgets)throw std::invalid_argument("Automatic dense admission omitted native birth evidence");
+                }
                 for(auto& cfg:local)cfg.native_ordering_events=policy.native_ordering_events;
                 rank.runtime.retained_host_services = MemoryPlanner::declareRetainedHostServices(
                     profile, local, rank.rank, nullptr, inventory,
@@ -264,7 +277,7 @@ namespace llaminar2
             retainsMTPGraphCapacity(mtp) ? MoEOverlayMTPGraphFamilyPolicy::RetainModelSidecars : MoEOverlayMTPGraphFamilyPolicy::MainOnly,
             1, std::max(decode_rows, std::max(1, runtime.moe_routed_prefill.overlay_segment_rows)),
             decode_rows, std::max(1, runtime.batch_size), resolveMTPRetainedDraftCapacity(mtp));
-        const auto manifest = buildMoEOverlayLayerWeightManifestFromLoader(loader, family.routedLayerCapacity(), profile.expert_count);
+        const auto &manifest = preparation->manifest(0,family.routedLayerCapacity(),family.routedLayerCapacity());
         const auto capacity_policy = resolveMoEOverlayCapacityAdmissionPolicy(
             overlay_plan, config, inventory.world_size, family.routedLayerCapacity(), profile.expert_count);
         const auto rows = segmentedPrefillGraphRowCandidates(policy.prefill_bucket_rows,
@@ -296,6 +309,16 @@ namespace llaminar2
                         .native_source_placement=ranks[index].numa_node>=0
                             ? CPUStoragePlacement::onNode(ranks[index].numa_node):CPUStoragePlacement::local()},
                         candidate_rows);
+                    inputs.local_capacity.require_native_context_budgets=policy.require_native_context_budgets;
+                    const int discovery=candidate.membership.discoveryRanks().at(index);
+                    const auto birth=policy.native_context_budgets.find(discovery);
+                    if(birth!=policy.native_context_budgets.end())inputs.local_capacity.native_context_budgets=birth->second;
+                    if(policy.require_native_context_budgets){
+                        const auto& local=ranks[index];
+                        for(const auto device:local.local_tp_devices)if(device.toLocalDeviceId().is_gpu() &&
+                            std::none_of(inputs.local_capacity.native_context_budgets.begin(),inputs.local_capacity.native_context_budgets.end(),[&](const auto& key){return key.device==device.toLocalDeviceId();}))
+                            throw std::invalid_argument("Automatic admission omitted selected GPU native birth evidence");
+                    }
                     inputs.local_capacity.native_ordering_events=policy.native_ordering_events;
                     inputs.local_capacity.retained_host_services = projectPlanningHostServiceBudget(
                         policy.retained_host_services, candidate.membership, ranks[index].rank);

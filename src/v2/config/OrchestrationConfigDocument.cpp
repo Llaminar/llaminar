@@ -6,7 +6,8 @@
  * adding a member to a configuration aggregate requires updating its document
  * contract. Reads and writes use the same member list, including explicitness
  * and optional policy state. A missing additive local-hot arm means the original
- * shared-only intent; explicit C0 remains losslessly distinct. Routed plans retain their compact stage's global
+ * shared-only intent; explicit C0 remains losslessly distinct. An absent additive
+ * pipeline-stage-width hint retains unconstrained automatic stage geometry. Routed plans retain their compact stage's global
  * layer origin, so saved configurations cannot rebase later PP stages to zero.
  * Resolved local route policy and its typed diagnostic remain lossless binding
  * values, not transferable hardware authority: the original inventory binder
@@ -106,7 +107,7 @@ namespace
 #define MEMBERS(X) X(count)
     RECORD(AutomaticBackendDeviceCount, backend, MEMBERS)
 #undef MEMBERS
-#define MEMBERS(X) X(only_strategies) X(prefer_backend) X(prefer_strategy) X(host_participation) X(workload) X(device_counts)
+#define MEMBERS(X) X(only_strategies) X(prefer_backend) X(prefer_strategy) X(host_participation) X(workload) X(device_counts) X(pipeline_stage_widths)
     RECORD(AutomaticOrchestrationOptions, only_backends, MEMBERS)
 #undef MEMBERS
 #define MEMBERS(X) X(devices) X(weights) X(backend) X(routed_compute_policy) \
@@ -270,6 +271,12 @@ namespace
             // documents. Every original field remains mandatory and lossless.
             if constexpr (std::same_as<T, std::optional<AdaptiveGPULocalHotCacheRequest>>)
                 if (json.is_object() && !json.contains(name) && std::string_view(name) == "local_hot_cache")
+                { value.reset(); return; }
+            // Older documents have no authored stage-shape hint. Keep this
+            // additive optional field absent while rejecting every other omission.
+            if constexpr (std::same_as<T, std::optional<std::vector<int>>>)
+                if (path == "$.configuration.automatic_planning" && json.is_object() &&
+                    !json.contains(name) && std::string_view(name) == "pipeline_stage_widths")
                 { value.reset(); return; }
             if (!json.is_object() || !json.contains(name)) invalid(field_path, "missing field");
             value = decode<T>(json.at(name), field_path);

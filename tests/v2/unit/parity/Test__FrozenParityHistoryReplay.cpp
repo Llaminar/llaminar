@@ -123,6 +123,25 @@ public:
         setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKETS", "1");
         setScopedParityEnvOverride("LLAMINAR_PREFILL_GRAPH_BUCKET_SIZES", "64,128,256,512");
     }
+    /** @brief Install a validated observation and expose its actual capture/reference selection without a runner. */
+    void observation(const FrozenParityHistoryReplay& replay)
+    { frozen_history_replay_=replay;config_.snapshot_dir=replay.referenceDirectory(); }
+    /** @return Actual frozen capture inventory including explicit collective completion edges. */
+    auto captureKeys() const { return paritySnapshotSetupCaptureFilter(); }
+    /** @brief Publish an original scoped environment value for campaign-rejection tests. */
+    void campaignMarker() { setScopedParityEnvOverride("LLAMINAR_PRODUCTION_PARITY", "true"); }
+    /** @return Actual fixture terminal coverage predicate, without inventing an export. */
+    auto terminalComplete() const { return hasCompleteObservationTerminals(); }
+    /** @return Actual scope-dependent generic snapshot presence requirement. */
+    bool requiresStage(const std::string& stage) const { return requiresObservationStagePresence(stage); }
+    /** @brief Exercise terminal-coordinate state transitions without creating native output evidence. */
+    void terminal(int step) { recordObservationTerminal(step); }
+    /** @return Original-coordinate state only, never auxiliary history coverage. */
+    auto originalTerminals() const { return observation_terminal_rows_; }
+    /** @return Explicitly separate auxiliary diagnostic coordinates. */
+    auto auxiliaryTerminals() const { return observation_auxiliary_terminal_rows_; }
+    /** @return Actual reference loader's exclusion decision before any NPY read. */
+    auto reference(const std::string& key) { return loadPyTorchSnapshot(key); }
     /** @brief Expose the production pre-admission transaction, not a mirrored resolver. */
     using ParityTestBase::beginProductionParitySnapshotAdmission;
     using ParityTestBase::configureExactProductionParityPrefillGraphBucket;
@@ -1112,4 +1131,89 @@ TEST(FrozenParityHistoryReplay, CPUJointDynamicFrozenWorkersPreserveOriginalPoli
         value["expected_config"] = json::parse(serializeOrchestrationConfig(foreign));
         EXPECT_THROW(checked(value).requestedCPUWorkers(), std::invalid_argument);
     }
+}
+
+namespace llaminar2::test::parity
+{
+/** @test Exact observation scope controls capture and comparison while full gold remains mandatory. */
+TEST(FrozenParityHistoryReplay, ObservationShardUsesOneExactCaptureAndComparisonAuthority)
+{
+    MetadataOwner owner;auto value=descriptor(owner);
+    const auto directory=std::filesystem::path(value.at("reference_directory").get<std::string>());
+    const std::vector<std::string> full{"EMBEDDING","LM_HEAD","layer0_FFN_NORM","layer0_FFN_RESIDUAL"};
+    const std::vector<std::string> selected{"EMBEDDING","LM_HEAD","layer0_FFN_NORM"};
+    for(int step=-1;step<2;++step)for(const auto& key:full) {
+        std::ofstream file(directory/((step<0?std::string{}:"decode_step"+std::to_string(step)+"_")+key+".npy"));file<<'x';
+    }
+    value["observation_shard"]={{"schema",1},{"scope","noncertifying"},{"full_keys",full},{"selected_keys",selected}};
+    const auto replay=checked(value);EXPECT_TRUE(replay.hasObservationShard());
+    EXPECT_NO_THROW(replay.requireObservationInventory());
+    EXPECT_TRUE(replay.observesReferenceKey("decode_step1_layer0_FFN_NORM"));
+    EXPECT_FALSE(replay.observesReferenceKey("decode_step1_layer0_FFN_RESIDUAL"));
+    SnapshotAdmissionGeometryProbe probe;probe.configure(2,replay);probe.observation(replay);
+    auto actual=probe.captureKeys();auto expected=selected;std::sort(expected.begin(),expected.end());
+    EXPECT_EQ(actual,expected);
+    EXPECT_FALSE(probe.terminalComplete());
+    EXPECT_TRUE(probe.reference("decode_step1_layer0_FFN_RESIDUAL").empty());
+    const auto path=owner.root/"history_replay_binding.json";
+    replay.publishBinding(path,replay.prompt(),replay.promptIds(),replay.referenceDirectory(),2);
+    std::ifstream stream(owner.root/"history_replay_observation_scope.json");json scope;stream>>scope;
+    EXPECT_FALSE(scope.at("certification_eligible").get<bool>());
+    EXPECT_EQ(scope.at("missing_coverage"),json::array({"layer0_FFN_RESIDUAL"}));
+    EXPECT_EQ(scope.at("terminal_rows_required"),3);
+    // Even an unselected original phase remains mandatory gold.
+    std::filesystem::remove(directory/"decode_step1_layer0_FFN_RESIDUAL.npy");
+    EXPECT_THROW(replay.requireObservationInventory(),std::invalid_argument);
+    {std::ofstream restore(directory/"decode_step1_layer0_FFN_RESIDUAL.npy");restore<<'x';}
+    std::filesystem::remove(directory/"decode_step1_layer0_FFN_NORM.npy");
+    EXPECT_THROW(replay.requireObservationInventory(),std::invalid_argument);
+    auto ordinary=value;ordinary.erase("observation_shard");
+    EXPECT_FALSE(checked(ordinary).hasObservationShard());
+    EXPECT_TRUE(checked(ordinary).observesReferenceKey("layer0_FFN_RESIDUAL"));
+    probe.campaignMarker();
+    EXPECT_THROW((void)checked(value),std::invalid_argument);
+}
+
+/** @test Duplicate, foreign, empty, whole-inventory and incompatible scope requests fail before capture. */
+TEST(FrozenParityHistoryReplay, ObservationShardRejectsIncompatibleOrUnqualifiedCoverage)
+{
+    MetadataOwner owner;auto value=descriptor(owner);
+    value["observation_shard"]={{"schema",1},{"scope","noncertifying"},
+        {"full_keys",{"EMBEDDING","LM_HEAD","layer0_FFN_NORM"}},{"selected_keys",{"EMBEDDING","LM_HEAD"}}};
+    for(int defect=0;defect<7;++defect) {
+        auto bad=value;auto& shard=bad["observation_shard"];
+        switch(defect) {
+        case 0:shard["selected_keys"].push_back("LM_HEAD");break;
+        case 1:shard["selected_keys"]={"EMBEDDING","foreign"};break;
+        case 2:shard["selected_keys"]=json::array();break;
+        case 3:shard["selected_keys"]=shard["full_keys"];break;
+        case 4:shard["scope"]="complete_campaign";break;
+        case 5:shard["schema"]=2;break;
+        case 6:shard["full_keys"].push_back("LM_HEAD");break;
+        }
+        EXPECT_THROW((void)checked(bad),std::invalid_argument)<<defect;
+    }
+    EXPECT_THROW(checked(value).requireObservationInventory(),std::invalid_argument);
+}
+}
+
+namespace llaminar2::test::parity
+{
+/** @test Generic presence guards follow shard ownership while negative probes never supply original terminal coverage. */
+TEST(FrozenParityHistoryReplay, ObservationShardPresenceAndAuxiliaryTerminalsKeepOriginalScope)
+{
+    MetadataOwner owner;auto value=descriptor(owner);
+    value["observation_shard"]={{"schema",1},{"scope","noncertifying"},
+        {"full_keys",{"EMBEDDING","LM_HEAD","layer0_FFN_NORM","layer0_FFN_RESIDUAL"}},
+        {"selected_keys",{"EMBEDDING","LM_HEAD","layer0_FFN_NORM"}}};
+    SnapshotAdmissionGeometryProbe probe;probe.configure(2,checked(value));
+    EXPECT_TRUE(probe.requiresStage("FFN_NORM"));EXPECT_FALSE(probe.requiresStage("FFN_RESIDUAL"));
+    probe.terminal(-2);EXPECT_FALSE(probe.terminalComplete());EXPECT_TRUE(probe.originalTerminals().empty());
+    EXPECT_EQ(probe.auxiliaryTerminals(),std::set<int>{-2});
+    for(const int step:{-1,0,1})probe.terminal(step);
+    EXPECT_TRUE(probe.terminalComplete());EXPECT_EQ(probe.originalTerminals(),(std::set<int>{-1,0,1}));
+    EXPECT_THROW(probe.terminal(2),std::invalid_argument);
+    value.erase("observation_shard");probe.observation(checked(value));
+    EXPECT_TRUE(probe.requiresStage("FFN_RESIDUAL"));EXPECT_TRUE(probe.terminalComplete());
+}
 }

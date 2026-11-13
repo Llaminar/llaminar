@@ -2,6 +2,9 @@
  * @file MoEOverlayDistributedResidencyTransport.cpp
  * @brief Non-blocking global agreement for heterogeneous residency waves.
  *
+ * Diagnostic lifecycle summaries aggregate stable rank/policy dimensions;
+ * ordered sequence evidence retains every epoch pair. Exact retirement proof
+ * remains separately keyed because movement admission consumes its epoch/rank.
  * The wrapper owns consensus and local wave lifetime. Passive measurement
  * metadata keeps its original owner across that boundary so calibration can
  * consume it after physical drain without retaining the physical wave itself.
@@ -1312,7 +1315,7 @@ namespace llaminar2
                 stats_->retirement_consensus_ready.fetch_add(
                     1,
                     std::memory_order_relaxed);
-                recordCounter("distributed_retirement_consensus_ready");
+                recordExactRetirementProof();
                 if (error)
                     error->clear();
                 return MoEOverlayRetirementFenceProgress::ReadyToRetire;
@@ -1371,12 +1374,26 @@ namespace llaminar2
                 terminal_error_ += diagnostic;
             }
 
-            /** @brief Export one rare wave lifecycle fact to PerfStats. */
+            /**
+             * @brief Aggregate summaries while folding every exact epoch into ordered evidence.
+             * @param name Stable non-authoritative lifecycle family; exact retirement uses its own helper.
+             */
             void recordCounter(const char *name) const
+            {
+                PerfStatsCollector::addCounterWithSequence(
+                    "moe_overlay_residency", name, 1.0,
+                    {expected_epoch_, candidate_epoch_}, "maintenance", perf_device_,
+                    {{"world_rank", std::to_string(consensus_->worldRank())},
+                     {"world_size", std::to_string(consensus_->worldSize())},
+                     {"background", "true"}, {"blocking", "false"}});
+            }
+
+            /** @brief Retain the exact epoch identity consumed by movement retirement validation. */
+            void recordExactRetirementProof() const
             {
                 PerfStatsCollector::addCounter(
                     "moe_overlay_residency",
-                    name,
+                    "distributed_retirement_consensus_ready",
                     1.0,
                     "maintenance",
                     perf_device_,

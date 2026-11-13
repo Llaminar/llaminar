@@ -984,4 +984,40 @@ TEST(ModelKLDQFNContract, ObserverDefaultPrefillCapPreservesCanonicalOverlayGeom
         }
     }
 }
+
+/** @test Discovery publication precedes selected initialization; failures remain collective. */
+TEST(ModelKLDQFNContract, DiscoveryArtifactOwnershipAndTerminalOutcome)
+{
+    char pattern[]="/tmp/qfn-discovery-artifact-unit-XXXXXX";
+    const auto* created=::mkdtemp(pattern);
+    ASSERT_NE(created,nullptr);
+    struct Owner {
+        std::filesystem::path path;
+        ~Owner(){std::error_code error;std::filesystem::remove_all(path,error);}
+    } owner{created};
+    const auto output=owner.path/"observations";
+    // A nonzero selected authority may not have initialized yet. An inactive
+    // discovery rank must not demand that authority's later artifact root.
+    EXPECT_TRUE(qfnCreateDiscoveryArtifactRoot(output,1));
+    EXPECT_FALSE(std::filesystem::exists(output));
+    EXPECT_TRUE(qfnCreateDiscoveryArtifactRoot(output,0));
+    EXPECT_TRUE(std::filesystem::is_directory(output));
+    EXPECT_THROW(qfnCreateDiscoveryArtifactRoot(output,0),std::invalid_argument);
+    EXPECT_THROW(qfnCreateDiscoveryArtifactRoot(output,-1),std::invalid_argument);
+    for (const bool local : {false,true}) for (const bool peers : {false,true})
+    {
+        int calls=0;
+        const bool complete=qfnCompleteDiscoveryObservation(local,[&](auto identity,auto outcome){
+            ++calls;
+            EXPECT_EQ(identity.ordinal,1u);
+            EXPECT_EQ(identity.name,"qfn_original_observer_retirement");
+            EXPECT_EQ(outcome,local?RankInitializationLocalOutcome::Succeeded:RankInitializationLocalOutcome::ReturnedFailure);
+            return RankInitializationConsensusResult{local&&peers?
+                RankInitializationConsensusOutcome::AllRanksSucceeded:
+                RankInitializationConsensusOutcome::AtLeastOneRankFailed,{}};
+        });
+        EXPECT_EQ(calls,1);
+        EXPECT_EQ(complete,local&&peers);
+    }
+}
 } // namespace llaminar2::accuracy

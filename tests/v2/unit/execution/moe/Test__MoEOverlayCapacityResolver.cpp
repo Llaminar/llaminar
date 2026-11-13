@@ -15,6 +15,7 @@
 #include "memory/CPUSerialExpertStorageLayout.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEOverlayCapacityResolver.h"
+#include "execution/moe/MoEExpertShardCohort.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "backends/RetainedParticipantGraphExecutable.h"
@@ -3580,6 +3581,268 @@ namespace llaminar2
             admitted.tier(1)->live_experts_per_layer,
             (std::vector<int>{3, 3}));
 
+    }
+
+    /** @brief Bulk mandatory quotas match an independent per-copy cyclic billing oracle. */
+    TEST(MoEOverlayCapacityResolver, BulkMandatoryPrefixMatchesSerialBillingOracle)
+    {
+        for (const int count : {1, 3, 5})
+        for (const auto policy : {MoEOverlayTierCopyPolicy::Apportioned,
+                                  MoEOverlayTierCopyPolicy::Replicated})
+        for (const auto mode : {MoEOverlayLiveQuotaMode::FixedPerLayer,
+                                MoEOverlayLiveQuotaMode::Automatic})
+        {
+            SCOPED_TRACE(count);
+            const auto source = manifest(2, native_quantised_formats::Q6_K, true);
+            const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(
+                source, moeOverlayMovableProjections(policy));
+            constexpr int experts = 17;
+            std::vector<std::vector<int>> serial(count, std::vector<int>(2));
+            std::vector<int> physical(2);
+            // This oracle deliberately executes each original logical addition.
+            for (int layer = 0; layer < 2; ++layer)
+                for (int expert = 0; expert < experts; ++expert)
+                    for (int owner = 0; owner < count; ++owner)
+                        if (policy == MoEOverlayTierCopyPolicy::Replicated ||
+                            owner == expert % count)
+                        {
+                            ++serial[owner][layer];
+                            ++physical[layer];
+                        }
+            std::vector<MoEOverlayTierCapacityParticipant> participants;
+            for (int owner = 0; owner < count; ++owner)
+                participants.push_back(participant(owner, "shared"));
+            MoEOverlayCapacityResolverInput input;
+            input.num_experts = experts;
+            input.layer_weight_manifest = source;
+            input.physical_budgets = {exactBudget("shared", DeviceId::cuda(0),
+                footprints, physical, count)};
+            input.tiers = {tier(0, "mandatory", 0, true, mode, participants,
+                mode == MoEOverlayLiveQuotaMode::FixedPerLayer
+                    ? std::vector<int>{experts, experts} : std::vector<int>{}, policy)};
+            const auto resolved = MoEOverlayCapacityResolver::resolve(input);
+            ASSERT_NE(resolved.tier(0), nullptr);
+            EXPECT_EQ(resolved.tier(0)->participant_live_copies, serial);
+            ASSERT_NE(resolved.resource("shared"), nullptr);
+            EXPECT_EQ(resolved.resource("shared")->live_copies_per_layer, physical);
+            EXPECT_EQ(resolved.resource("shared")->remainingBytes(), 0u);
+            // The last original addition now fails, rather than rounding down
+            // a quota, omitting a replica, or billing an entire cycle.
+            input.physical_budgets.front() = input.physical_budgets.front().withAvailableBytes(
+                input.physical_budgets.front().usableBudgetBytes() - 1);
+            EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(input), std::invalid_argument);
+        }
+    }
+
+    /** @brief Unequal original CPU fragments retain exact billing across shared tier resources. */
+    TEST(MoEOverlayCapacityResolver, BulkTensorShardedPrefixMatchesSerialFragmentBilling)
+    {
+        const auto &format = native_quantised_formats::Q4_0;
+        MoEOverlayLayerWeightManifest source;
+        source.layer_idx = 0;
+        source.projections = {{projection(ExpertTierWeightProjection::Gate,160,1024,format),
+            projection(ExpertTierWeightProjection::Up,160,1024,format),
+            projection(ExpertTierWeightProjection::Down,1024,160,format)}};
+        const auto cohort = std::make_shared<const MoEExpertShardCohort>(
+            MoEExpertShardCohort::checked(source,17,
+                {{7,0,GlobalDeviceAddress::cpu(0)}, {19,1,GlobalDeviceAddress::cpu(1)},
+                 {31,2,GlobalDeviceAddress::cpu(2)}}, {{0,32},{32,64},{96,64}}));
+        for (const bool seeded : {false,true})
+        {
+            MoEOverlayCapacityResolverInput input;
+            input.num_experts = 17;
+            input.layer_weight_manifest = {source};
+            if (seeded) input.initial_residency_policy =
+                MoEOverlayInitialResidencyPolicy::MigrationSourcePerParticipant;
+            std::vector<MoEOverlayTierCapacityParticipant> members;
+            for (size_t p = 0; p < 3; ++p)
+            {
+                const std::string name = "rank-" + std::to_string(p);
+                members.push_back(participant(cohort->participants()[p].participant_id,name,0));
+                // Independently reproduce each prepared projection's native
+                // block layout and unconditional page-sized allocation. The
+                // old generic fixture helper uses cache-line alignment for
+                // small projections and is not this storage contract.
+                size_t fragment_bytes=0;
+                for(const auto &projection:cohort->localManifest(p).projections) {
+                    const size_t units=(testAlignUp(static_cast<size_t>(projection.N),64)/64)*
+                        static_cast<size_t>(projection.K/32);
+                    fragment_bytes+=testAlignUp(units*expectedCpuStride(format),kCpuPage);
+                }
+                size_t serial_bytes = 0;
+                for (int expert = 0; expert < 17; ++expert)
+                    serial_bytes += fragment_bytes;
+                PhysicalMemoryBOMBuilder bom(PhysicalMemoryResource{
+                    static_cast<int>(p),DeviceId::cpu(),serial_bytes,serial_bytes});
+                input.physical_budgets.emplace_back(name,PhysicalMemoryAdmissionCertificate(bom.build()));
+            }
+            ASSERT_LT(input.physical_budgets[0].usableBudgetBytes(),
+                input.physical_budgets[1].usableBudgetBytes());
+            auto hot = tier(0,"fixed",0,false,MoEOverlayLiveQuotaMode::FixedPerLayer,
+                members,{3},MoEOverlayTierCopyPolicy::TensorSharded);
+            auto cold_members=members;
+            auto cold_originals=std::vector<MoEExpertShardCohort::Participant>(
+                cohort->participants().begin(),cohort->participants().end());
+            for(size_t p=0;p<cold_members.size();++p) {
+                cold_members[p].participant_id+=100;
+                cold_originals[p].participant_id+=100;
+            }
+            const auto cold_cohort=std::make_shared<const MoEExpertShardCohort>(
+                MoEExpertShardCohort::checked(source,17,cold_originals,{{0,32},{32,64},{96,64}}));
+            auto cold = tier(1,"fallback",1,true,MoEOverlayLiveQuotaMode::Automatic,
+                cold_members,{},MoEOverlayTierCopyPolicy::TensorSharded);
+            hot.shard_cohorts = {cohort}; cold.shard_cohorts = {cold_cohort};
+            input.tiers = {hot,cold};
+            const auto result = MoEOverlayCapacityResolver::resolve(input);
+            for (size_t p = 0; p < 3; ++p)
+            {
+                EXPECT_EQ(result.tier(0)->participant_live_copies[p],(std::vector<int>{3}));
+                EXPECT_EQ(result.tier(1)->participant_live_copies[p],(std::vector<int>{14}));
+                EXPECT_EQ(result.resource("rank-"+std::to_string(p))->remainingBytes(),0u);
+                auto rejected = input;
+                rejected.physical_budgets[p] = rejected.physical_budgets[p].withAvailableBytes(
+                    rejected.physical_budgets[p].usableBudgetBytes()-1);
+                EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(rejected),std::invalid_argument);
+            }
+            input.tiers[1].max_live_experts_per_layer = {13};
+            EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(input),std::invalid_argument);
+        }
+    }
+
+    /** @brief Seeded cyclic and replicated prefixes preserve the original quota cursor. */
+    TEST(MoEOverlayCapacityResolver, BulkSeededFallbackMatchesSerialCopies)
+    {
+        for (const auto policy : {MoEOverlayTierCopyPolicy::Apportioned,
+            MoEOverlayTierCopyPolicy::Replicated})
+        {
+            const auto source = manifest(1,native_quantised_formats::Q4_0);
+            const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(
+                source,moeOverlayMovableProjections(policy));
+            std::vector<std::vector<int>> serial(3,std::vector<int>(1));
+            int copies = 0;
+            for (int expert=0; expert<17; ++expert)
+                for (int p=0;p<3;++p)
+                    if (policy==MoEOverlayTierCopyPolicy::Replicated || p==expert%3)
+                    { ++serial[p][0]; ++copies; }
+            MoEOverlayCapacityResolverInput input;
+            input.num_experts=17; input.layer_weight_manifest=source;
+            input.initial_residency_policy=MoEOverlayInitialResidencyPolicy::MigrationSourcePerParticipant;
+            input.physical_budgets={exactBudget("shared",DeviceId::cuda(0),footprints,{copies},3)};
+            input.tiers={tier(0,"seeded",0,true,MoEOverlayLiveQuotaMode::Automatic,
+                {participant(0,"shared"),participant(1,"shared"),participant(2,"shared")},{},policy)};
+            const auto result=MoEOverlayCapacityResolver::resolve(input);
+            EXPECT_EQ(result.tier(0)->participant_live_copies,serial);
+            EXPECT_EQ(result.resource("shared")->remainingBytes(),0u);
+            input.tiers[0].max_live_experts_per_layer={16};
+            EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(input),std::invalid_argument);
+        }
+    }
+
+    /** @brief Gate/up prefixes bill native distinct GPU owners plus immutable down banks. */
+    TEST(MoEOverlayCapacityResolver, BulkGateUpPrefixMatchesSerialOwnerBilling)
+    {
+        const auto &format=native_quantised_formats::Q4_0;
+        MoEOverlayLayerWeightManifest source;
+        source.layer_idx=0;
+        source.projections={{projection(ExpertTierWeightProjection::Gate,64,96,format),
+            projection(ExpertTierWeightProjection::Up,64,96,format),
+            projection(ExpertTierWeightProjection::Down,96,64,format)}};
+        const auto movable=MoEOverlayCapacityResolver::preparedFootprints(
+            {source},DeviceMoEProjectionSet::GateUp).front();
+        const auto down=projection(ExpertTierWeightProjection::Down,32,64,format);
+        const auto down_bytes=expectedGpuProjectionBytes(down,
+            std::max(format.payload_bytes,expectedMigrationPayload(format)),
+            format.is_asymmetric || format.codebook_id==11 ||
+                (format.codebook_id==4 && format.is_superblock),format.has_emins);
+        for(const bool seeded:{false,true})
+        for(const auto mode:{MoEOverlayLiveQuotaMode::FixedPerLayer,MoEOverlayLiveQuotaMode::Automatic})
+        {
+            MoEOverlayCapacityResolverInput input;
+            input.num_experts=17; input.layer_weight_manifest={source};
+            if(seeded)input.initial_residency_policy=MoEOverlayInitialResidencyPolicy::MigrationSourcePerParticipant;
+            std::vector<MoEOverlayTierCapacityParticipant> members;
+            std::vector<std::vector<int>> serial(3,std::vector<int>(1));
+            for(int expert=0;expert<17;++expert)++serial[expert%3][0];
+            for(int p=0;p<3;++p) {
+                const auto name="gpu-"+std::to_string(p);
+                members.push_back(participant(p,name,0));
+                size_t bytes=0;
+                for(int expert=0;expert<17;++expert) {
+                    bytes+=down_bytes;
+                    if(expert%3==p)bytes+=movable.gpu_live_bytes;
+                }
+                input.physical_budgets.push_back(physicalBudget(name,DeviceId::cuda(p),bytes,0,0));
+            }
+            input.tiers={tier(0,"gateup",0,true,mode,members,
+                mode==MoEOverlayLiveQuotaMode::FixedPerLayer?std::vector<int>{17}:std::vector<int>{},
+                MoEOverlayTierCopyPolicy::GateUpOwnedDownColumns)};
+            const auto result=MoEOverlayCapacityResolver::resolve(input);
+            EXPECT_EQ(result.tier(0)->participant_live_copies,serial);
+            for(int p=0;p<3;++p) {
+                EXPECT_EQ(result.resource("gpu-"+std::to_string(p))->remainingBytes(),0u);
+                auto rejected=input;
+                rejected.physical_budgets[p]=rejected.physical_budgets[p].withAvailableBytes(
+                    rejected.physical_budgets[p].usableBudgetBytes()-1);
+                EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(rejected),std::invalid_argument);
+            }
+            input.tiers.front().max_live_experts_per_layer={16};
+            EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(input),std::invalid_argument);
+        }
+    }
+
+    /** @brief Unrepresentable multi-copy prefixes fail capacity; one-copy overflow remains arithmetic. */
+    TEST(MoEOverlayCapacityResolver, BulkPrefixOverflowPreservesFailureCategory)
+    {
+        auto source=manifest(1,native_quantised_formats::Q4_0);
+        for (auto &projection:source.front().projections)
+        {
+            projection.N=1<<29; projection.K=1<<29;
+            projection.format=ExpertWeightFormat::floating(TensorType::FP32);
+        }
+        const auto footprint=MoEOverlayCapacityResolver::preparedFootprints(source).front();
+        const size_t capacity=std::numeric_limits<size_t>::max();
+        ASSERT_GT(footprint.cpu_live_bytes,capacity/17);
+        MoEOverlayCapacityResolverInput input;
+        input.num_experts=17; input.layer_weight_manifest=source;
+        input.physical_budgets={physicalBudget("shared",DeviceId::cpu(),capacity,0,0)};
+        input.tiers={tier(0,"overflow",0,true,MoEOverlayLiveQuotaMode::FixedPerLayer,
+            {participant(0,"shared",0)},{17})};
+        size_t used=0;
+        while (footprint.cpu_live_bytes<=capacity-used) used+=footprint.cpu_live_bytes;
+        try { (void)MoEOverlayCapacityResolver::resolve(input); FAIL()<<"Prefix exceeded size_t capacity"; }
+        catch (const std::invalid_argument &error) {
+            EXPECT_NE(std::string(error.what()).find("remaining_bytes="+std::to_string(capacity-used)),std::string::npos);
+        }
+        input.tiers[0].copy_policy=MoEOverlayTierCopyPolicy::Replicated;
+        input.tiers[0].participants.clear();
+        // Seven replicas overflow one original logical addition, independently
+        // of the prefix search; no expert-count-sized loop is required.
+        for(int p=0;p<7;++p)input.tiers[0].participants.push_back(participant(p,"shared",0));
+        EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(input),std::overflow_error);
+    }
+
+    /** @brief A partial prefix preserves the serial first-failure physical balance. */
+    TEST(MoEOverlayCapacityResolver, BulkMandatoryPrefixReportsExactSerialFailureState)
+    {
+        const auto source = manifest(1, native_quantised_formats::Q5_1);
+        const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(source);
+        MoEOverlayCapacityResolverInput input;
+        input.num_experts = 23;
+        input.layer_weight_manifest = source;
+        input.physical_budgets = {exactBudget("shared", DeviceId::cuda(0), footprints, {11}, 3)};
+        input.tiers = {tier(0, "mandatory", 0, true, MoEOverlayLiveQuotaMode::FixedPerLayer,
+            {participant(0, "shared"), participant(1, "shared"), participant(2, "shared")}, {23})};
+        // Serially consume eleven copies: the twelfth must see exactly zero
+        // bytes, and must still name a single expert's actual prepared charge.
+        try {
+            (void)MoEOverlayCapacityResolver::resolve(input);
+            FAIL() << "An incomplete mandatory quota was accepted";
+        } catch (const std::invalid_argument &error) {
+            const std::string message = error.what();
+            EXPECT_NE(message.find("remaining_bytes=0"), std::string::npos);
+            EXPECT_NE(message.find("requires_additional_bytes=" +
+                std::to_string(footprints.front().gpu_live_bytes)), std::string::npos);
+        }
     }
 
     TEST(MoEOverlayCapacityResolver, SharedPhysicalResourceAggregatesEveryTierCopy)

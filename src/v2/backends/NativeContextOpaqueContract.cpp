@@ -36,15 +36,25 @@ void NativeContextBirthKey::requireComplete() const {
        (population!=NativeContextBirthPopulation::InitialBackendContext && population!=NativeContextBirthPopulation::AdditionalContext))
         throw std::invalid_argument("Original GPU context birth needs its complete physical/source/runtime/library/pthread/creator closure");
 }
+NativeContextFamilyBudget NativeContextOpaqueCatalog::planningBudget(DeviceType backend,NativeContextBirthPopulation population){
+    for(const auto& row:detail::kNativeContextQualifiedClasses){
+        if(row.backend!=backend || row.population!=population)continue;
+        if((row.physical_lifetime!=NativePhysicalLifetime::ContextGeneration && row.physical_lifetime!=NativePhysicalLifetime::ProcessRuntime) || !row.host_upper_bytes || !row.device_upper_bytes || !digest(std::string(row.evidence_sha256)))
+            throw std::logic_error("Installed native context class has incomplete qualified limits/evidence");
+        return {row.host_upper_bytes,row.device_upper_bytes};
+    }
+    throw std::runtime_error("Native planning context family is unqualified");
+}
 NativeContextOpaqueContract NativeContextOpaqueCatalog::require(const NativeContextBirthKey& key){
     key.requireComplete();
+    const auto budget=planningBudget(key.device.type,key.population);
     for(const auto& row:detail::kNativeContextQualifiedClasses){
         if(row.backend!=key.device.type || row.population!=key.population)continue;
         if((row.physical_lifetime!=NativePhysicalLifetime::ContextGeneration && row.physical_lifetime!=NativePhysicalLifetime::ProcessRuntime) || !row.host_upper_bytes || !row.device_upper_bytes || !digest(std::string(row.evidence_sha256)))
             throw std::logic_error("Installed native context class has incomplete qualified limits/evidence");
         // The live original physical identity is bound here, not matched to a
         // host UUID list. Bounds remain the tested class's immutable data.
-        return {key,row.host_upper_bytes,row.device_upper_bytes,std::string(row.evidence_sha256),row.physical_lifetime};
+        return {key,budget.hostUpperBytes(),budget.deviceUpperBytes(),std::string(row.evidence_sha256),row.physical_lifetime};
     }
     throw std::runtime_error("Original GPU context birth family is unqualified: no installed opaque upper-limit certificate for "+key.device.toString());
 }

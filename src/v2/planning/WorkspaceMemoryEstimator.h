@@ -16,6 +16,8 @@
 #include "planning/WeightMemoryEstimator.h"
 #include "kernels/attention/AttentionExecutionPolicy.h"
 #include "kernels/common/QuantizedActivationOperandPrecision.h"
+#include "config/GDNProjectionArithmeticPolicy.h"
+#include "config/MoERouterArithmeticPolicy.h"
 #include <cstddef>
 #include <optional>
 #include "execution/compute_stages/stages/GDNLiveStateWorkspaceContract.h"
@@ -24,6 +26,16 @@
 namespace llaminar2
 {
 class MoEExpertProjectionOwnership;
+class PlanningTensorIndex;
+/** @brief Every environment-selected arithmetic/attention input consumed by canonical workspace quoting. */
+struct WorkspacePlanningPolicy {
+    GDNProjectionArithmetic gdn_projection_arithmetic;
+    MoERouterArithmetic moe_router_arithmetic;
+    int cuda_fa2_q_warp_groups, cuda_fa2_hd256_pv_warps, cuda_fa2_tile_kv;
+    /** @return Current public policy snapshot; query bodies never reread global selectors. */
+    static WorkspacePlanningPolicy current();
+    bool operator==(const WorkspacePlanningPolicy &) const = default;
+};
 
 /**
  * @brief Immutable graph and device geometry used by workspace admission.
@@ -35,6 +47,7 @@ class MoEExpertProjectionOwnership;
  */
 struct WorkspaceMemoryGeometry
 {
+    std::shared_ptr<const PlanningTensorIndex> source_tensor_index; ///< Exact immutable source owner, never another ledger.
     DeviceId device = DeviceId::invalid(); ///< Participant being admitted.
     /**
      * CUDA SMs, ROCm CUs, or configured physical-core CPU workers.
@@ -139,6 +152,8 @@ struct WorkspaceMemoryGeometry
      * Standalone callers retain the historical complete-model scope explicitly. */
     WeightComponentScope weight_components = WeightComponentScope::EmbeddingAndTerminal;
 
+    WorkspacePlanningPolicy planning_policy = WorkspacePlanningPolicy::current();
+    bool operator==(const WorkspaceMemoryGeometry &) const = default;
 };
 
 class WorkspaceMemoryEstimator
@@ -206,7 +221,7 @@ public:
         const WorkspaceMemoryGeometry& geometry);
 
     /**
-     * @brief Serial startup envelope for one original resident GPU expert.
+     * @brief Live calibration envelope for one original resident GPU expert.
      * @param profile Original stacked expert metadata; its expert count is not rewritten.
      * @param geometry Exact physical device and owned model-layer interval.
      * @return Shared named workspace for the actual decode/prefill/verifier probe rows.
@@ -215,6 +230,15 @@ public:
     static size_t estimatePreparedExpertService(
         const ModelMemoryProfile& profile,
         const WorkspaceMemoryGeometry& geometry);
+
+    /**
+     * @brief Compile the fixed decode/prefill startup witness with the live kernel formulas.
+     * @param profile Original source expert projection metadata.
+     * @param geometry Exact GPU owner and owned source-layer interval.
+     * @return Stable-name workspace union for the two measured startup phases.
+     * @throws std::invalid_argument For missing expert metadata or a non-GPU owner.
+     */
+    static size_t estimateStartupExpertService(const ModelMemoryProfile &profile,const WorkspaceMemoryGeometry &geometry);
 
     /**
      * @brief Estimate one sparse ExpertOverlay endpoint's invocation workspace.

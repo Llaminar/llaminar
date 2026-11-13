@@ -1157,6 +1157,17 @@ namespace llaminar2
             }
 
             /**
+             * @brief Admit a restored-prefix suffix after any completed prefill.
+             * @param error Optional stable lifecycle rejection diagnostic.
+             * @return True for an inert local scope or an admitted decode bridge.
+             */
+            bool beginRestoredPrefixDecodeSequence(std::string *error)
+            {
+                return !coordinator_ ||
+                       (begun_ && coordinator_->beginRestoredPrefixDecodeSequence(error));
+            }
+
+            /**
              * @brief Retire one completed sequence before another row uses this command.
              * @param error Optional stable failure diagnostic.
              * @return True for an inert local scope or a retired graph sequence.
@@ -4300,8 +4311,7 @@ namespace llaminar2
                         const int suffix_token = prompt_tokens[
                             static_cast<size_t>(suffix_start)];
                         std::string sequence_error;
-                        if (!overlay_prefill_command.beginGraphSequence(
-                                /*draft_depth=*/0,
+                        if (!overlay_prefill_command.beginRestoredPrefixDecodeSequence(
                                 &sequence_error))
                         {
                             return setError(
@@ -19860,11 +19870,17 @@ namespace llaminar2
                     expertHistogramServingRegime(mtp), metadata.first_model_layer);
                 prepared_target_service_plan = MoEOverlayPreparedTargetServicePlan::checked(
                     initial_snapshot, catalog, topology);
+                // Graph construction transferred the original TP context to
+                // the rank runner. Borrow that live owner for dispatch policy;
+                // the setup member is now empty and cannot describe the domain.
+                const auto* rank_runner = dynamic_cast<const RankOrchestrator*>(runner_.get());
+                const auto& profile = planningModelMetadata().memoryProfile();
                 prepared_target_service_measurements = MoEOverlayCPUServiceMeasurement::measurePreparedTargets(
                     *moe_expert_overlay_participant_residency_, *prepared_target_service_plan,
                     {.d_model = metadata.d_model, .intermediate = metadata.routed_intermediate_size},
                     cpu_expert_shard_ctx_, physical_memory_authority_,
-                    &planningModelMetadata().memoryProfile(), &cluster_inventory_.ranks.at(plan_.rank));
+                    &profile, &cluster_inventory_.ranks.at(plan_.rank),
+                    rank_runner ? rank_runner->localTPContext() : nullptr, profile.expert_used_count);
                 return true;
             }))
             return false;

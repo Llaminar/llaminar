@@ -11,6 +11,8 @@
  * fields before admission, retaining the canonical topology, prefix/path policy,
  * all48 numerical stages and every original CSV writer. History publication
  * follows the original artifact-directory reset and precedes model admission.
+ * Noncertifying observation shards retain the original history and complete
+ * reference inventory before selecting bounded diagnostic snapshot storage.
  */
 #pragma once
 #include "utils/ScopedMoEParityCoordinatedSession.h"
@@ -269,6 +271,14 @@ protected:
         for (int step = 0; step < Base::config_.decode_steps; ++step)
             Base::frozen_history_replay_->requireSnapshotInventory(
                 Base::config_.graph_snapshot_policy.requiredSnapshotKeys(ParityForwardPhase::Decode), step);
+        Base::frozen_history_replay_->requireObservationInventory();
+        if(Base::frozen_history_replay_->hasObservationShard()) {
+            // Complete canonical gold was checked above. Runtime storage and
+            // comparisons now use one explicitly incomplete diagnostic scope.
+            const auto keys=Base::frozen_history_replay_->observationKeys();
+            Base::config_.graph_snapshot_policy.required_prefill_snapshot_keys=keys;
+            Base::config_.graph_snapshot_policy.required_decode_snapshot_keys=keys;
+        }
     }
     /**
      * @brief Publish the retained original history only after its output directory is fresh.
@@ -330,6 +340,10 @@ protected:
         const bool final_logits = Base::config_.final_logit_mean_kl.has_value();
         if(final_logits && Base::config_.uses_cross_rank_pipeline)
             return Base::acceptsFinalLogitSummaryRawEvidence(summary,Base::config_,ParityForwardPhase::Prefill);
+        if(Base::frozen_history_replay_ && Base::frozen_history_replay_->hasObservationShard())
+            return Base::acceptsRequiredRawParityStages(summary.layer_stats,
+                Base::parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill),
+                ParityForwardPhase::Prefill);
         const auto complete = acceptsQwen4ExpCompletePrefill(summary.layer_stats,
             final_logits ? summary.embedding_evidence_valid : summary.embedding_passed,
             final_logits ? summary.lm_head_evidence_valid : summary.lm_head_passed,
@@ -346,6 +360,10 @@ protected:
         if (static_cast<const Derived *>(this)->modelParityCase().model.transformer_layers != 48)
             return Base::acceptsAdditionalPrefillEvidence(summary);
         const bool final_logits = Base::config_.final_logit_mean_kl.has_value();
+        if(Base::frozen_history_replay_ && Base::frozen_history_replay_->hasObservationShard())
+            return Base::acceptsRequiredRawParityStages(summary.layer_stats,
+                Base::parityGraphSnapshotPolicy(ParityForwardPhase::Prefill).requiredSnapshotKeys(ParityForwardPhase::Prefill),
+                ParityForwardPhase::Prefill);
         const auto complete = acceptsQwen4ExpCompletePrefill(summary.layer_stats,
             final_logits ? summary.embedding_evidence_valid : summary.embedding_result.passed,
             final_logits ? summary.lm_head_evidence_valid : summary.lm_head_passed,
@@ -359,6 +377,8 @@ protected:
     /** @brief Every requested main decode step retains all original finite/exact decoder observations. */
     ::testing::AssertionResult acceptsAdditionalDecodeEvidence(const DecodeParitySummary &summary) const override
     {
+        if(!Base::hasCompleteObservationTerminals())
+            return ::testing::AssertionFailure()<<"Observation shard omitted an original terminal LM row";
         if (!Base::config_.final_logit_mean_kl ||
             static_cast<const Derived *>(this)->modelParityCase().model.transformer_layers != 48)
             return Base::acceptsAdditionalDecodeEvidence(summary);
@@ -370,6 +390,7 @@ protected:
                     return complete;
                 continue;
             }
+            if ((!Base::frozen_history_replay_ || !Base::frozen_history_replay_->hasObservationShard()))
             if (const auto evidence = acceptsQwen4ExpCompletePrefill(step.layer_stats, true, true,
                     Qwen4ExpMainEvidencePolicy::FiniteExactObservations, Qwen4ExpMainEvidencePhase::Decode); !evidence)
                 return ::testing::AssertionFailure() << "QFN decode step " << step.step_idx << ": " << evidence.message();

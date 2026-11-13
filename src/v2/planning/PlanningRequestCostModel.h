@@ -7,12 +7,15 @@
  * and topology-bound communication primitives. It is deliberately an estimate:
  * uniform routing, mean-context rooflines and conservative communication
  * composition are reported explicitly, not presented as model benchmarks.
+ * Like GPUs on one original rank/NUMA owner share median compute predictions
+ * over their retained raw observations; physical admission and links stay exact.
  */
 #pragma once
 #include "AutomaticOrchestrationPlanner.h"
 #include "PlanningWeightServiceModel.h"
 #include "PlanningCommunicationCost.h"
 #include <unordered_map>
+#include <map>
 
 namespace llaminar2
 {
@@ -72,6 +75,17 @@ namespace llaminar2
         double parameterBytes(const PlanningWeightOperand &weight) const;
         /** @return Qualified FP32/streaming roofline for explicitly supplied non-weight work. */
         double scalarSeconds(int rank, DeviceId device, int rows, double operations, double bytes) const;
+        /** @brief Evaluate identical local work against same-class measured services; CPU and unknown classes stay exact.
+         * @param rank Original authenticated discovery owner, never execution rank.
+         * @param device Actual admitted endpoint whose immutable cohort supplies compute evidence.
+         * @param estimate Complete same-family/precision/geometry prediction at its authenticated original rank/device.
+         * @return Median prediction, not a synthesized or aliased endpoint measurement.
+         */
+        double medianSeconds(int rank,DeviceId device,const std::function<double(int,DeviceId)> &estimate) const;
+        /** @brief Build immutable like-GPU classes from actual inventory and authenticated streaming observers. */
+        void prepareComputeCohorts();
+        std::map<std::pair<int,DeviceId>,std::vector<DeviceId>> compute_cohorts_;
+        std::string compute_cohort_evidence_;
         PlanningModelMetadata model_;
         ClusterInventory inventory_;
         PlanningWeightServiceModel weights_;

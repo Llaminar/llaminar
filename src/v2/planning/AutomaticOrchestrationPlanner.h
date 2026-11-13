@@ -113,6 +113,10 @@ namespace llaminar2
          * remaining tie independently of enumeration order. Endpoint count never
          * overrides a lower request cost or substitutes for measured link costs.
          * No candidate model is loaded.
+         * CPU admission uses bounded batches of the actual OpenMP team, with
+         * worker-local pure source preparation and quote scopes. Evaluation and
+         * rejection callbacks run serially on the original caller in proposal
+         * order inside that team; they must not reenter automatic planning.
          */
         static SelectedAutomaticOrchestration select(const OrchestrationConfig &request,
             const PlanningModelSource &source, const ClusterInventory &inventory,

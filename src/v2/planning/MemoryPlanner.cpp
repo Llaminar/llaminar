@@ -21,6 +21,7 @@
 #include "backends/NativeOrderingEventGroup.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "planning/MemoryPlanner.h"
+#include "planning/PlanningNativeContextEvidence.h"
 #include "execution/local_execution/orchestrators/PipelineMaintenanceAdmission.h"
 #include "execution/global/HostedPipelineActivationStorage.h"
 #include "kernels/qwen4exp/PooledImmutableLocalHotTerminal.h"
@@ -45,6 +46,7 @@
 #include "planning/ActivationMemoryEstimator.h"
 #include "planning/CollectiveMemoryEstimator.h"
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "planning/PlanningMemoryQuoteReuse.h"
 #include "execution/compute_stages/stages/GDNLiveStateWorkspaceContract.h"
 #include "kernels/HybridGDNStateGeometry.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
@@ -965,6 +967,7 @@ std::shared_ptr<const RetainedHostServiceDeclarations> MemoryPlanner::declareRet
 struct MemoryPlanner::SharedOwnerIdentities
 {
     std::set<std::tuple<int,std::string,RetainedHostServiceRole>> host_service_instances; ///< Typed physical instance identities, never capacity counters.
+    std::set<std::tuple<int,DeviceType,int>> planning_native_contexts; ///< Immutable original endpoint identity only.
     std::set<const PhysicalMemoryAuthority*> native_context_sources; ///< Immutable source identity deduplication, never another capacity ledger.
     std::map<std::pair<int,DeviceId>,size_t> native_weight_source_windows; ///< One immutable serialized source-window maximum per original CPU allocator.
     std::set<std::pair<int, std::string>> prefix_archives;
@@ -1003,6 +1006,15 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
     for (const auto& cfg : device_configs)
     {
         PhysicalMemoryPlan native_context_bom;
+        if(cfg.planning_native_context_birth){
+            if(cfg.native_context_preparation || !cfg.associated_host_memory)
+                throw std::invalid_argument("Planning native birth requires original host and no duplicate live source");
+            if(shared.planning_native_contexts.emplace(cfg.world_rank,cfg.device.type,cfg.device.ordinal).second){
+                const std::array keys{*cfg.planning_native_context_birth};
+                const std::array resources{PhysicalMemoryResource{cfg.world_rank,cfg.device,cfg.device_total_bytes,cfg.device_free_bytes}};
+                native_context_bom=planningNativeContextBOM(keys,*cfg.associated_host_memory,resources);
+            }
+        }
         if(cfg.native_context_preparation){
             const auto& source=cfg.native_context_preparation;
             if(source->memory()->worldRank()!=cfg.world_rank)
@@ -1380,7 +1392,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 cfg.execution_role != DeviceExecutionMemoryRole::ContinuationGraph || !cfg.local_tp_backend)
                 throw std::invalid_argument("Counted projection staging requires a rank-local GPU continuation domain");
             const auto rows = std::max(activation_seq, cfg.mtp_enabled ? std::max(1, cfg.mtp_target_query_rows) : 1);
-            const auto arena = MoEProjectionArenaGeometry::resolve(profile, cfg.total_shards);
+            const auto arena = PlanningMemoryQuoteReuse::projectionArena(profile, cfg.total_shards);
             const auto &topology = *cfg.projection_exchange_topology;
             if (topology.worldRank() != cfg.world_rank || topology.devices().size() != std::size_t(cfg.total_shards) ||
                 cfg.shard_index < 0 || std::size_t(cfg.shard_index) >= topology.devices().size() ||
@@ -1697,19 +1709,26 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 : (owns_terminal_main_layer ? WeightComponentScope::Terminal
                                             : WeightComponentScope::Intermediate);
 
+        auto weight_source_policy = PlanningWeightSourcePolicy::current();
+        weight_source_policy.source_tensor_index = cfg.source_tensor_index
+            ? cfg.source_tensor_index : PlanningMemoryQuoteReuse::sourceIndex(profile);
         // Weight estimation
         // Only the declared replicated set needs a cross-use compilation.
         // Ordinary single-view planning keeps its existing canonical pricing.
         std::optional<PreparedWeightPhysicalUses> physical_weight_uses;
-        if (replicated_dense_decode) physical_weight_uses.emplace(profile, cfg.device, weight_components);
+        if (replicated_dense_decode) physical_weight_uses.emplace(profile, cfg.device, weight_components,
+            weight_source_policy.source_tensor_index);
         auto weight_est = physical_weight_uses
             ? WeightMemoryEstimator::estimatePhysical(*physical_weight_uses, PreparedWeightUseIntent::PublishCreator,
                 profile, cfg.device, cfg.shard_index, cfg.total_shards, cfg.first_layer, weight_last_layer,
-                cfg.weight_residency, cfg.tensor_parallel_assignment, weight_components, cfg.native_source_placement)
+                cfg.weight_residency, cfg.tensor_parallel_assignment, weight_components, cfg.native_source_placement, weight_source_policy)
             : WeightMemoryEstimator::estimate(profile, cfg.device, cfg.shard_index, cfg.total_shards,
-                cfg.first_layer, weight_last_layer, cfg.weight_residency, cfg.tensor_parallel_assignment, weight_components, cfg.native_source_placement);
+                cfg.first_layer, weight_last_layer, cfg.weight_residency, cfg.tensor_parallel_assignment, weight_components, cfg.native_source_placement, weight_source_policy);
         primary_weight_bytes = weight_est.device_bytes;
 
+        // Both mirrored components use the identical pure quote. Their distinct
+        // physical byte contributions below remain independently accounted.
+        std::optional<WeightEstimate> mirrored_weight_estimate;
         for (std::size_t set_index = 0;
              set_index < cfg.additional_weight_sets.size();
              ++set_index)
@@ -1776,7 +1795,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         weight_last_layer,
                         sidecar_residency,
                         std::nullopt,
-                        weight_components, cfg.native_source_placement);
+                        weight_components, cfg.native_source_placement, weight_source_policy);
                 additional_weight_bytes = checkedAdd(
                     additional_weight_bytes,
                     sidecar_estimate.device_bytes,
@@ -1786,20 +1805,21 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             case AdditionalPersistentWeightSet::MirroredDecodeEmbedding:
             case AdditionalPersistentWeightSet::MirroredMTPTerminalHead:
             {
-                DeviceWeightResidency mirrored_residency;
-                if (profile.expert_count > 0)
+                if (!mirrored_weight_estimate)
                 {
-                    mirrored_residency =
-                        DeviceWeightResidency::
-                            continuationWithSelectedRoutedExperts(
-                                profile.expert_count,
-                                std::vector<int>(
-                                    static_cast<std::size_t>(
-                                        profile.totalLayerCount()),
-                                    0));
-                }
-                const auto mirrored_estimate =
-                    WeightMemoryEstimator::estimate(
+                    DeviceWeightResidency mirrored_residency;
+                    if (profile.expert_count > 0)
+                    {
+                        mirrored_residency =
+                            DeviceWeightResidency::
+                                continuationWithSelectedRoutedExperts(
+                                    profile.expert_count,
+                                    std::vector<int>(
+                                        static_cast<std::size_t>(
+                                            profile.totalLayerCount()),
+                                        0));
+                    }
+                    mirrored_weight_estimate = WeightMemoryEstimator::estimate(
                         profile,
                         cfg.device,
                         /*shard_index=*/0,
@@ -1808,13 +1828,14 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         weight_last_layer,
                         mirrored_residency,
                         std::nullopt,
-                        weight_components, cfg.native_source_placement);
+                        weight_components, cfg.native_source_placement, weight_source_policy);
+                }
                 const std::size_t component_bytes =
                     additional_set ==
                             AdditionalPersistentWeightSet::
                                 MirroredDecodeEmbedding
-                        ? mirrored_estimate.prepared_embedding_bytes
-                        : mirrored_estimate.lm_head_bytes;
+                        ? mirrored_weight_estimate->prepared_embedding_bytes
+                        : mirrored_weight_estimate->lm_head_bytes;
                 additional_weight_bytes = checkedAdd(
                     additional_weight_bytes,
                     component_bytes,
@@ -1862,7 +1883,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         profile.totalLayerCount() - 1,
                         sidecar_residency,
                         std::nullopt,
-                        WeightComponentScope::LayersOnly, cfg.native_source_placement);
+                        WeightComponentScope::LayersOnly, cfg.native_source_placement, weight_source_policy);
                 additional_weight_bytes = checkedAdd(
                     additional_weight_bytes,
                     sidecar.device_bytes,
@@ -2204,7 +2225,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
 
         if (cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph)
         {
-            activation_bytes = ActivationMemoryEstimator::estimate(
+            activation_bytes = PlanningMemoryQuoteReuse::activation(
                 profile,
                 continuationActivationGeometry(profile,cfg,ngram_lookup),
                 cfg.device);
@@ -2280,9 +2301,10 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     cfg.generation_request_capacity, state.local_value_heads, state.d_k, state.d_v);
             }
             // Workspace estimation
-            workspace_bytes = WorkspaceMemoryEstimator::estimate(
+            workspace_bytes = PlanningMemoryQuoteReuse::workspace(
                 profile,
                 WorkspaceMemoryGeometry{
+                    .source_tensor_index = cfg.source_tensor_index ? cfg.source_tensor_index : PlanningMemoryQuoteReuse::sourceIndex(profile),
                     .device = cfg.device,
                     .device_compute_units = cfg.device_compute_units,
                     .cpu_execution = cfg.cpu_execution,
@@ -3429,7 +3451,7 @@ std::shared_ptr<const ImmutableRowTableExecutionProvision> MemoryPlanner::restor
     PhysicalMemoryPlanBuilder mandatory_floor(derived);
     for(const auto &identity:consumers)
         mandatory_floor.add(identity.resource,PhysicalMemoryOwner::ActivationArena,
-            ActivationMemoryEstimator::estimate(profile,identity.activation,identity.resource.device));
+            PlanningMemoryQuoteReuse::activation(profile,identity.activation,identity.resource.device));
     if(required_base.requiredFootprintMismatch(mandatory_floor.build()))
         throw std::invalid_argument("Remote ngram provision fixed base omits common activation plus mandatory execution");
     auto result=std::shared_ptr<const ImmutableRowTableExecutionProvision>(new ImmutableRowTableExecutionProvision(

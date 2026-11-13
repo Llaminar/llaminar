@@ -146,6 +146,9 @@ namespace detail
 class GPURetainedRecurrenceWorkspace final
 {
   public:
+    /** @return Exact retained geometry and terminal contract equality for pure workspace quotes. */
+    bool operator==(const GPURetainedRecurrenceWorkspace &) const = default;
+
     /**
      * @brief Bind an already-checked original GPU retention and terminal contract.
      * @param geometry Exact participant heads, DK/DV, requests, physical rows and policy.

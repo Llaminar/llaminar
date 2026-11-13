@@ -5,6 +5,9 @@
  * Physical groups, process ownership and locality come from discovery. Actual
  * captured NCCL/RCCL observations and completed host-MPI exchanges keep separate
  * typed identities: neither substitutes for GPU DMA or mapped kernel access.
+ * Native allreduce, fixed allgather and counted allgather receipts remain
+ * separate. Gather times cover the whole original invocation, including counted
+ * extent/completion/validation work, never an inferred per-root pair-copy rate.
  * The GPU/host primitives bind distinct native-executor and host-first-touch ranks
  * plus mechanism/direction identity;
  * they are not complete activation-packet timings. No model warmup or per-candidate probe occurs.
@@ -27,14 +30,20 @@ namespace llaminar2
         int physical_node;
         std::vector<std::string> uuids; ///< Same order as request devices, never rank-local aliases.
         PlanningLocalTPRequest request;
+        /** Raw-byte pair service is sampled once per ordered physical group, independently of reduction precision. */
+        PlanningPairSampling pair_sampling = PlanningPairSampling::Disabled;
+        std::vector<std::uint8_t> direct_peer_access; ///< Original directed physical-copy eligibility, not communicator adjacency.
+        PlanningLocalTPMeasurementMode mode = PlanningLocalTPMeasurementMode::NativeCollective;
     };
 
     /**
      * @brief Immutable bounded sample basis, not the Cartesian product of candidate domains.
      *
-     * Native samples cover maximal homogeneous groups visible together to a
-     * rank, deduplicated by physical machine/backend/UUID set. Smaller candidate
-     * subsets are not advertised as measured. Host MPI samples cover directed
+     * Native samples cover maximal homogeneous groups visible together to one
+     * original rank, deduplicated within that observer by machine/backend/UUID
+     * set. Smaller candidate subsets are not advertised as measured collectives.
+     * Another eligible process cannot supply a missing native matrix even when
+     * its visible GPU set contains the requested set. Host MPI samples cover
      * eligible rank pairs with control, outbound-heavy and return-heavy exchanges.
      * The two directions share no assumed bandwidth or half-RTT latency. An
      * explicitly single-device search needs neither kind of communication.
@@ -52,6 +61,7 @@ namespace llaminar2
          * @param hidden_width Positive model activation width.
          * @param prefill_rows Positive bounded sample rows; not an inference context limit.
          * @param precisions Native wire precisions to measure; nonempty, distinct and valid.
+         * @param mode Physical-only samples one precision-independent copy matrix without a native communicator.
          * @param routed_compute_policy Explicit physical contract or Automatic
          *        request intent whose candidates can choose projection ownership.
          *        A TP label alone does not identify its intermediate fabric.
@@ -59,8 +69,9 @@ namespace llaminar2
         static PlanningCommunicationSamplePlan resolve(const ClusterInventory &inventory,
             const AutomaticOrchestrationRequest &request, int hidden_width, int prefill_rows,
             std::span<const PlanningAllreducePrecision> precisions,
-            RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned);
-        /** @return Native groups and their complete observing process ownership. */
+            RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned,
+            PlanningLocalTPMeasurementMode mode = PlanningLocalTPMeasurementMode::NativeCollective);
+        /** @return Typed collective or physical-copy groups and their complete observing process ownership. */
         const std::vector<PlanningNativeCollectiveSample> &native() const noexcept { return native_; }
         /** @return Directed exact host request/reply geometries, with no inferred reverse symmetry. */
         const std::vector<PlanningMPITransferRequest> &mpi() const noexcept { return mpi_; }
@@ -121,6 +132,7 @@ namespace llaminar2
          * @param hidden_width Model activation width, not a guessed allocation size.
          * @param prefill_rows Bounded physical rows to observe alongside M=1.
          * @param precisions Explicit native wire precision family to measure.
+         * @param mode Physical-only skips unused communicator preparation and native collective samples.
          * @param routed_compute_policy Requested routed-projection ownership;
          *        carried unchanged through all-rank sample-plan agreement.
          * @return Complete evidence at discovery root; absence on followers after consensus.
@@ -135,7 +147,8 @@ namespace llaminar2
         static std::optional<PlanningCommunicationService> collect(const std::shared_ptr<IMPIContext> &mpi,
             const ClusterInventory &inventory, const AutomaticOrchestrationRequest &request,
             int hidden_width, int prefill_rows, std::span<const PlanningAllreducePrecision> precisions,
-            RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned);
+            RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned,
+            PlanningLocalTPMeasurementMode mode = PlanningLocalTPMeasurementMode::NativeCollective);
         /** @return Exact measured native groups; no prediction for an unseen subset is implied. */
         const std::vector<PlanningNativeCollectiveService> &native() const noexcept { return native_; }
         /** @return Completed host-MPI exchanges carrying canonical physical locality. */

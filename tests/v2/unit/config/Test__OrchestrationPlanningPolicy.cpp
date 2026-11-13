@@ -15,6 +15,7 @@
 #include <array>
 #include <algorithm>
 #include <limits>
+#include <nlohmann/json.hpp>
 
 using namespace llaminar2;
 
@@ -252,7 +253,8 @@ TEST(OrchestrationPlanningPolicy, HelpComesFromTheSameSharedSpecification)
 {
     const auto help = OrchestrationConfigParser::getHelpText();
     for (const auto option : {"--auto", "--planning-mode", "--only-backends", "--only-strategies",
-                              "--prefer-backend", "--prefer-strategy", "--plan-workload", "--auto-device-counts"})
+                              "--prefer-backend", "--prefer-strategy", "--plan-workload", "--auto-device-counts",
+                              "--auto-pipeline-stage-widths"})
         EXPECT_NE(help.find(option), std::string::npos);
 }
 
@@ -297,4 +299,93 @@ TEST(OrchestrationPlanningPolicy, DeviceCountsRejectInvalidAndConflictingIntent)
     EXPECT_THROW((void)AutomaticOrchestrationRequest(options), std::invalid_argument);
     EXPECT_EQ(parseAutomaticDeviceCounts(" cuda = 2 , cpu = 1 "),
         (std::vector<AutomaticBackendDeviceCount>{{DeviceType::CUDA, 2}, {DeviceType::CPU, 1}}));
+}
+
+
+/** @brief CLI, YAML and saved documents retain one ordered, identity-free stage constraint. */
+TEST(OrchestrationPlanningPolicy, PipelineStageWidthsRoundTripAndConstrainOnlyPP)
+{
+    const auto cli = parsePlanning({"--only-backends", "rocm", "--auto-device-counts", "rocm=8",
+        "--auto-pipeline-stage-widths", "4,4"});
+    const auto yaml = OrchestrationConfigParser{}.parseYamlString(
+        "planning:\n  only_backends: rocm\n  device_counts: rocm=8\n  pipeline_stage_widths: 4,4\n");
+    EXPECT_EQ(cli.automatic_planning.pipeline_stage_widths, (std::vector<int>{4, 4}));
+    EXPECT_EQ(yaml.automatic_planning.pipeline_stage_widths, cli.automatic_planning.pipeline_stage_widths);
+    const auto copy = deserializeOrchestrationConfig(serializeOrchestrationConfig(cli));
+    EXPECT_EQ(copy.automatic_planning.pipeline_stage_widths, cli.automatic_planning.pipeline_stage_widths);
+    EXPECT_EQ(copy.automatic_planning.device_counts, cli.automatic_planning.device_counts);
+    ASSERT_TRUE(copy.automatic_planning.specified());
+    const auto resolved = resolveOrchestrationIntent(copy);
+    const auto &policy = std::get<AutomaticOrchestrationRequest>(resolved);
+    EXPECT_TRUE(policy.allows(OrchestrationStrategy::PipelineParallel));
+    EXPECT_FALSE(policy.allows(OrchestrationStrategy::TensorParallel));
+    EXPECT_FALSE(policy.allows(OrchestrationStrategy::ExpertOverlay));
+    const std::vector<DeviceType> devices(8u, DeviceType::ROCm);
+    EXPECT_TRUE(policy.allows(OrchestrationStrategy::PipelineParallel, devices));
+    EXPECT_FALSE(policy.allows(OrchestrationStrategy::PipelineParallel, std::span(devices).first(7u)));
+    EXPECT_EQ(parseAutomaticPipelineStageWidths(" 2 , 1 , 2 "), (std::vector<int>{2, 1, 2}));
+    EXPECT_EQ(parseAutomaticPipelineStageWidths("1"), (std::vector<int>{1}));
+}
+
+/** @brief Shape and count constraints reject contradictory intent before hardware discovery. */
+TEST(OrchestrationPlanningPolicy, PipelineStageWidthsRejectInvalidAndConflictingIntent)
+{
+    for (const auto text : {"", "0", "-1", "+1", "1.5", "1junk", "1,", ",1", "1,,2",
+                            "2147483648", "2147483647,1"})
+    {
+        SCOPED_TRACE(text);
+        EXPECT_THROW((void)parseAutomaticPipelineStageWidths(text), std::invalid_argument);
+    }
+    for (const auto &widths : {std::vector<int>{}, std::vector<int>{0}, std::vector<int>{-1, 2},
+                              std::vector<int>{std::numeric_limits<int>::max(), 1}})
+    {
+        AutomaticOrchestrationOptions options;
+        options.pipeline_stage_widths = widths;
+        EXPECT_THROW((void)AutomaticOrchestrationRequest(options), std::invalid_argument);
+    }
+    for (const auto &extra : {std::vector<std::string>{"--only-strategies", "tp"},
+                             std::vector<std::string>{"--prefer-strategy", "tp"},
+                             std::vector<std::string>{"--only-backends", "rocm", "--auto-device-counts", "rocm=7"},
+                             std::vector<std::string>{"--auto-device-counts", "rocm=9"},
+                             std::vector<std::string>{"--device", "rocm:0"}})
+    {
+        auto arguments = extra;
+        arguments.insert(arguments.end(), {"--auto-pipeline-stage-widths", "4,4"});
+        EXPECT_THROW((void)resolveOrchestrationIntent(parsePlanning(arguments)), std::invalid_argument);
+    }
+    // Unlisted permitted backends may supply the remaining slots. Their count
+    // cannot be inferred from an explicitly counted subset or silently zeroed.
+    EXPECT_NO_THROW((void)resolveOrchestrationIntent(parsePlanning({"--auto-device-counts", "rocm=4",
+        "--auto-pipeline-stage-widths", "4,4"})));
+    EXPECT_NO_THROW((void)resolveOrchestrationIntent(parsePlanning({"--only-backends", "cuda,rocm",
+        "--auto-device-counts", "rocm=4", "--auto-pipeline-stage-widths", "4,4"})));
+    const auto invalid = parsePlanning({"--only-strategies", "tp", "--auto-pipeline-stage-widths", "4,4"});
+    const auto errors = ConfigValidator::createStandard().validate(invalid);
+    EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &error) {
+        return error.rule_id == "orchestration-planning-intent";
+    })) << "ConfigValidator must retain its shared policy admission";
+}
+
+/** @brief Only the additive omitted shape field has backward-document absence semantics. */
+TEST(OrchestrationPlanningPolicy, PipelineStageWidthsDocumentRejectsMalformedAndPreservesLegacyOmission)
+{
+    const auto config = parsePlanning({});
+    auto document = nlohmann::json::parse(serializeOrchestrationConfig(config));
+    document["configuration"]["automatic_planning"].erase("pipeline_stage_widths");
+    const auto legacy = deserializeOrchestrationConfig(document.dump());
+    EXPECT_FALSE(legacy.automatic_planning.pipeline_stage_widths);
+    EXPECT_FALSE(legacy.automatic_planning.specified());
+    for (const auto &bad : {nlohmann::json(true), nlohmann::json(4), nlohmann::json("4,4"),
+                            nlohmann::json::array({4, false}), nlohmann::json::array({4, 1.5})})
+    {
+        auto malformed = document;
+        malformed["configuration"]["automatic_planning"]["pipeline_stage_widths"] = bad;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(malformed.dump()), std::invalid_argument);
+    }
+    auto missing_original = document;
+    missing_original["configuration"]["automatic_planning"].erase("device_counts");
+    EXPECT_THROW((void)deserializeOrchestrationConfig(missing_original.dump()), std::invalid_argument);
+    auto unknown = document;
+    unknown["configuration"]["automatic_planning"]["pipeline_stage_width"] = {4, 4};
+    EXPECT_THROW((void)deserializeOrchestrationConfig(unknown.dump()), std::invalid_argument);
 }

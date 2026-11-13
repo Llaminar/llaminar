@@ -9,8 +9,9 @@
  * CPU/GPU identities or allocating an execution communicator in the parser.
  * Compact routed stage plans preserve their global layer origin through the
  * same codec, including terminal MTP rows and nonzero pipeline offsets.
- * The additive local-hot-cache arm alone may be absent; omission must reproduce
- * the exact shared-only document, while every other field remains mandatory.
+ * Additive local-hot-cache and pipeline-width hints may be absent; omission
+ * must reproduce their exact null-intent document. All original fields remain
+ * mandatory, including the surrounding placement and automatic-search policy.
  */
 #include "config/OrchestrationConfigDocument.h"
 #include "config/OrchestrationConfigParser.h"
@@ -317,8 +318,9 @@ TEST(OrchestrationConfigDocument, EveryRequiredOrExtraObjectFieldIsRejected)
 {
     const Json document = Json::parse(serializeOrchestrationConfig(example(DeviceType::CUDA)));
     // Sweep the entire nested document, including every field in MTP, prefix,
-    // domains and movement. Only the explicitly additive, absent local-cache
-    // arm may normalize to null; it must preserve every other field exactly.
+    // domains and movement. Only the explicitly additive local-cache and
+    // pipeline-width hints may be absent and normalize to null; all other
+    // fields retain their strict required-field contract.
     const auto visit = [&](const auto &self, const Json &node, const Json::json_pointer &path) -> void
     {
         if (node.is_object())
@@ -330,12 +332,14 @@ TEST(OrchestrationConfigDocument, EveryRequiredOrExtraObjectFieldIsRejected)
             {
                 auto missing = document;
                 missing[path].erase(key);
-                if ((path / key).to_string() ==
-                    "/configuration/ngram_table_policy/gpu_adaptive/local_hot_cache")
+                const auto field = (path / key).to_string();
+                if (field == "/configuration/ngram_table_policy/gpu_adaptive/local_hot_cache" ||
+                    field == "/configuration/automatic_planning/pipeline_stage_widths")
                 {
                     ASSERT_TRUE(value.is_null());
                     const auto decoded = deserializeOrchestrationConfig(missing.dump());
                     EXPECT_FALSE(decoded.ngram_table_policy.gpu_adaptive.local_hot_cache);
+                    EXPECT_FALSE(decoded.automatic_planning.pipeline_stage_widths);
                     EXPECT_EQ(Json::parse(serializeOrchestrationConfig(decoded)), document);
                 }
                 else

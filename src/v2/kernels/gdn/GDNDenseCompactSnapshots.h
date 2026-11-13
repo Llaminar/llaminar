@@ -47,6 +47,9 @@ struct GDNDenseRetentionProgram final
 {
     GDNDenseRetentionMode mode = GDNDenseRetentionMode::ExactCorrections;
     unsigned compact_min_live_rows = 0; ///< Positive threshold only for LiveRowThreshold.
+
+    /** @return Exact immutable retention policy equality for planning and capture identity. */
+    bool operator==(const GDNDenseRetentionProgram &) const = default;
 };
 /** @brief Exact authored forward/update program; no unimplemented backend is advertised. */
 enum class GDNDenseCompactArithmetic : std::uint32_t
@@ -112,6 +115,8 @@ class GDNDenseCompactGeometry final
     static constexpr unsigned layout_word = 5, arithmetic_word = 6, live_header_words = 7;
     static constexpr unsigned retention_mode_word = 7, retention_program_word = 8;
     static constexpr unsigned compact_min_live_rows_word = 9, split_live_header_words = 10;
+    /** @return Exact checked geometry and retained policy equality, including all derived capacities. */
+    bool operator==(const GDNDenseCompactGeometry &) const = default;
     /** @brief Check all immutable shape/capacity products before storage exists.
      * @param heads Positive participant-local value heads.
      * @param dk Positive key width1..512; each native entry admits its own widths.

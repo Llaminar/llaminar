@@ -1689,6 +1689,42 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         self.assertIsNone(result.error)
         self.assertEqual(len(result.devices), 4)
 
+    def test_hosted_mtp_scopes_cross_domain_sidecar_parent_join_to_original_owner(self) -> None:
+        """A neighbor's MTP sidecar must not survive removal of its forward-graph proof."""
+        records = self.hybrid_hosted_mtp_records(rank=0)
+        for index in range(2):
+            device = f"CUDA:{index}"
+            context = "mtp_decode_sidecar"
+            parents = self.retained_parent_records(device, rank=0)
+            for row in parents:
+                row["tags"]["context"] = context
+                if row["name"].startswith("retained_parent_"):
+                    row["tags"]["boundary_authority"] = "captured_device_units"
+            records += parents
+            records.append(dict(counter("sidecar_graph_capture_path", value=4, device=device,
+                tags={"context": "mtp_decode_sidecar_device_target_token_live_position",
+                      "graph_context": context, "seq_len": "1", "path": "retained_parent"}),
+                domain="mtp", rank=0))
+        result = validate_host_scheduled_mtp_device_generation_policy(
+            records, device_kinds=frozenset({"cuda", "rocm"}),
+            expected_minimum_depth=3, expected_maximum_depth=3)
+        self.assertIsNone(result.error)
+        for mutation in ("missing_replay", "foreign_device_replay", "foreign_rank_replay"):
+            with self.subTest(mutation=mutation):
+                broken = copy.deepcopy(records)
+                selected = next(row for row in broken if row["name"] == "retained_parent_replays"
+                                and row["device"] == "CUDA:0")
+                if mutation == "missing_replay":
+                    broken.remove(selected)
+                elif mutation == "foreign_device_replay":
+                    selected["device"] = "CUDA:2"
+                else:
+                    selected["rank"] = 1
+                result = validate_host_scheduled_mtp_device_generation_policy(
+                    broken, device_kinds=frozenset({"cuda", "rocm"}),
+                    expected_minimum_depth=3, expected_maximum_depth=3)
+                self.assertIsNotNone(result.error)
+
     def test_hybrid_hosted_mtp_rejects_borrowed_or_incomplete_evidence(self) -> None:
         """A neighboring graph, rank, vendor or controller cannot fill a hole."""
         mutations = {
@@ -2390,6 +2426,39 @@ class TestServerGraphCapturePerfPolicy(unittest.TestCase):
         self.assertIsNone(validate_graph_capture_policy(records, frozenset({'rocm'})).error)
         records[2]["tags"]["context"] = "main_decode"
         self.assertIn("main_verifier", validate_graph_capture_policy(records, frozenset({'rocm'})).error)
+
+    def test_materialized_decode_family_satisfies_strict_replay_without_executed_capture(self) -> None:
+        """q547 setup captures no arithmetic; exact family launch proves its reuse."""
+        for device in ("cuda:1", "rocm:1"):
+            rows = [counter("full_graph_plan_graphs", device=device, tags={"type": "capturable"}),
+                    counter("full_graph_capture_executable_nodes", value=3463, device=device, tags={
+                        "context": "main_verifier", "source": "full_graph_capture",
+                        "type": "materialized_unlaunched_executable", "executable_family": "251"}),
+                    counter("full_graph_replay_calls", device=device, tags={
+                        "context": "main_verifier", "type": "capturable", "decode": "true",
+                        "executable_family": "251"}),
+                    counter("decode_graph_phase", device=device, tags={
+                        "context": "main_verifier", "phase": "replay"})]
+            rows = [dict(row, rank=0) for row in rows]
+            kinds = frozenset({device.split(":")[0]})
+            def validate(candidate):
+                return validate_graph_capture_policy(candidate, kinds,
+                    decode_requirement=DecodeGraphRequirement.REPLAY).error
+            with self.subTest(device=device):
+                self.assertIsNone(validate(rows))
+                for missing in (1, 2, 3):
+                    with self.subTest(missing=missing):
+                        self.assertIsNotNone(validate(rows[:missing] + rows[missing+1:]))
+                for target, field, value in ((1, "value", 0), (2, "value", 0),
+                                              (1, "rank", 1), (2, "device", "rocm:99")):
+                    changed = copy.deepcopy(rows); changed[target][field] = value
+                    self.assertIsNotNone(validate(changed))
+                for target, field, value in ((1, "context", "main_decode"),
+                        (1, "executable_family", "250"), (2, "executable_family", "252"),
+                        (1, "executable_family", ""), (1, "executable_family", "0"),
+                        (1, "source", "unbound"), (1, "type", "graph_only_child")):
+                    changed = copy.deepcopy(rows); changed[target]["tags"][field] = value
+                    self.assertIsNotNone(validate(changed))
 
     def test_helper_executable_cannot_mask_legacy_verifier_warmup(self) -> None:
         """Context attribution must expose a verifier using retired eager warmup."""
@@ -3757,6 +3826,46 @@ class TestNativeRetainedParentEvidence(unittest.TestCase):
                     self.assertIsNone(result.error)
                     self.assertFalse(result.has_segmented_execution)
                     self.assertTrue(result.has_nonempty_full_graph_executable)
+
+    def test_setup_only_decode_parent_keeps_capture_and_replay_distinct(self) -> None:
+        """Retained decode setup need not invent an executed capture counter.
+
+        The CUDA/CPU smoke executes its verifier once. Native and CPU-service
+        parents must both prove their own nodes, setup and original launch;
+        the app additionally needs a repeat submission of that same context.
+        This class is explicitly registered in production preflight.
+        """
+        for device in ("cuda:0", "rocm:0"):
+            for host_service in (False, True):
+                with self.subTest(device=device, host_service=host_service):
+                    kinds = frozenset({device.split(":")[0]} | ({"cpu"} if host_service else set()))
+                    rows = (TestServerGraphCapturePerfPolicy.local_ticket_boundary_records(device, 1)
+                            if host_service else self.records(device))
+                    rows = [row for row in rows if row["name"] != "decode_graph_phase"]
+                    if not any(row["name"] == "retained_parent_materialized_without_launch" for row in rows):
+                        setup = copy.deepcopy(next(row for row in rows if row["name"] == "retained_parent_executable_nodes"))
+                        setup.update(name="retained_parent_materialized_without_launch", value=1)
+                        rows.append(setup)
+
+                    def validate(candidate, requirement=DecodeGraphRequirement.REPLAY):
+                        return validate_graph_capture_policy(candidate, kinds, decode_requirement=requirement).error
+
+                    self.assertIsNone(validate(rows))
+                    first = copy.deepcopy([row for row in rows if row["name"] != "retained_parent_replays"])
+                    next(row for row in first if row["name"] == "decode_capture_policy")["value"] = 1
+                    self.assertIsNone(validate(first, DecodeGraphRequirement.CAPTURE))
+                    self.assertIsNotNone(validate(first))
+                    for name in ("retained_parent_executable_nodes", "retained_parent_materialized_without_launch",
+                                 "retained_parent_transaction_zero_launches", "retained_parent_replays"):
+                        with self.subTest(missing=name):
+                            self.assertIsNotNone(validate([row for row in rows if row["name"] != name]))
+                        for field, value in (("rank", 2), ("device", "cuda:7"), ("context", "mtp_decode_sidecar"),
+                                             ("value", 0)):
+                            with self.subTest(record=name, field=field):
+                                changed = copy.deepcopy(rows)
+                                target = next(row for row in changed if row["name"] == name)
+                                (target["tags"] if field == "context" else target)[field] = value
+                                self.assertIsNotNone(validate(changed))
 
     def test_native_parent_rejects_missing_or_foreign_lifecycle(self) -> None:
         """All lifecycle evidence belongs to the same rank/device/context."""

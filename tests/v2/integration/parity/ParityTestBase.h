@@ -49,6 +49,8 @@
  *
  * @author David Sanftenberg
  * @date 2026-01-11
+ * Explicit frozen observation shards retain complete gold/source validation while
+ * one immutable semantic selection controls diagnostic capture, BOM and scoring.
  */
 
 #pragma once
@@ -4326,6 +4328,8 @@ namespace llaminar2::test::parity
         ParityConfig config_;
         /** Explicit diagnostic metadata; no model/topology policy is stored here. */
         std::optional<FrozenParityHistoryReplay> frozen_history_replay_;
+        std::set<int> observation_terminal_rows_; ///< Original closed LM exports, -1=prefill; scoped to this fixture/history only.
+        std::set<int> observation_auxiliary_terminal_rows_; ///< Explicit negative-step diagnostic probes, never original history coverage.
         CoordinatedPassiveEvidenceObligation coordinated_passive_evidence_; ///< Session-owned deferred audit phase.
         std::shared_ptr<ModelContext> model_ctx_;
         std::unique_ptr<IInferenceRunner> runner_;
@@ -5347,6 +5351,7 @@ namespace llaminar2::test::parity
          */
         std::vector<float> loadPyTorchSnapshot(const std::string &name)
         {
+            if(frozen_history_replay_ && !frozen_history_replay_->observesReferenceKey(name))return {};
             if (pytorch_snapshots_.find(name) != pytorch_snapshots_.end())
             {
                 auto scope = profileParityScope("pytorch_snapshot.cache_copy");
@@ -6446,7 +6451,8 @@ namespace llaminar2::test::parity
                         static_cast<int>(config_.token_ids.size()),
                         retained_graph_rows,
                         config_.allreduce_stages,
-                        nativeSnapshotSourceOutputs(snapshot_filter), referenceSnapshotPayloadProjection());
+                        nativeSnapshotSourceOutputs(snapshot_filter), referenceSnapshotPayloadProjection(),
+                        frozen_history_replay_?frozen_history_replay_->observationKeys():std::vector<std::string>{});
                 if (!snapshot_memory.valid() ||
                     !orch_runner_->setSnapshotMemoryCapacity(
                         snapshot_memory.capacity))
@@ -6680,6 +6686,7 @@ namespace llaminar2::test::parity
             const std::string &reference_key, const std::string &production_key, const std::string &stage,
             std::optional<std::size_t> query_decode_step=std::nullopt)
         {
+            if(frozen_history_replay_ && !frozen_history_replay_->observesReferenceKey(reference_key))return std::nullopt;
             const auto path = config_.snapshot_dir + "/" + reference_key + ".npy";
             if (!std::filesystem::exists(path)) return std::nullopt;
             if(isQwenSparseQueryCheckpoint(stage))
@@ -7025,6 +7032,44 @@ namespace llaminar2::test::parity
             return escaped;
         }
 
+        /**
+         * @brief Retain generic presence guards only when the exact observation owns that stage.
+         * @param stage Canonical unqualified semantic stage suffix.
+         * @return True for ordinary full mode, or a selected matching observation key.
+         */
+        bool requiresObservationStagePresence(const std::string& stage) const
+        {
+            if(!frozen_history_replay_ || !frozen_history_replay_->hasObservationShard())return true;
+            const auto keys=frozen_history_replay_->observationKeys();
+            return std::any_of(keys.begin(),keys.end(),[&](const auto& key){return key==stage || key.ends_with("_"+stage);});
+        }
+
+        /**
+         * @brief Record one actually closed terminal export without counting auxiliary probes as history.
+         * @param step Original -1/prefill or decode offset; values below -1 are auxiliary probes.
+         * @throws std::invalid_argument For an out-of-range positive decode coordinate.
+         */
+        void recordObservationTerminal(int step)
+        {
+            if(!frozen_history_replay_ || !frozen_history_replay_->hasObservationShard())
+                throw std::invalid_argument("Terminal observation requires its explicit frozen shard");
+            if(step<-1)observation_auxiliary_terminal_rows_.insert(step);
+            else {
+                if(step>=frozen_history_replay_->decodeRows())
+                    throw std::invalid_argument("Observation terminal exceeds original frozen history");
+                observation_terminal_rows_.insert(step);
+            }
+        }
+
+        /** @return Whether every original frozen LM observation has an actual closed export; default full mode is unchanged. */
+        bool hasCompleteObservationTerminals() const
+        {
+            if(!frozen_history_replay_ || !frozen_history_replay_->hasObservationShard())return true;
+            for(int step=-1;step<frozen_history_replay_->decodeRows();++step)
+                if(!observation_terminal_rows_.contains(step))return false;
+            return true;
+        }
+
         void exportActiveSnapshotsForParityDiagnostics(
             ParityForwardPhase phase,
             int decode_step)
@@ -7032,12 +7077,13 @@ namespace llaminar2::test::parity
             if (!isRank0())
                 return;
 
-            const auto filters =
+            const bool observation_shard=frozen_history_replay_ && frozen_history_replay_->hasObservationShard();
+            const auto filters = observation_shard?frozen_history_replay_->observationKeys():
                 readParityEnvList("LLAMINAR_PARITY_EXPORT_SNAPSHOT_KEYS");
             if (filters.empty())
                 return;
 
-            if (phase == ParityForwardPhase::Decode)
+            if (!observation_shard && phase == ParityForwardPhase::Decode)
             {
                 const auto allowed_steps =
                     readParityEnvStepSet("LLAMINAR_PARITY_EXPORT_SNAPSHOT_STEPS");
@@ -7051,6 +7097,8 @@ namespace llaminar2::test::parity
             const size_t max_elements =
                 readParityEnvSize("LLAMINAR_PARITY_EXPORT_SNAPSHOT_MAX_ELEMENTS", 0);
 
+            if(observation_shard && max_elements!=0)
+                throw std::invalid_argument("Observation shard exports cannot truncate selected evidence");
             auto out_dir = ensureResultsDir() / "llaminar_snapshots";
             std::error_code ec;
             std::filesystem::create_directories(out_dir, ec);
@@ -7085,6 +7133,7 @@ namespace llaminar2::test::parity
                     ? ("step" + std::to_string(decode_step))
                     : "prefill";
 
+            bool terminal_exported=false;
             for (const auto &key : activeSnapshotKeys())
             {
                 if (!paritySnapshotKeyMatches(key, filters))
@@ -7120,6 +7169,9 @@ namespace llaminar2::test::parity
                     continue;
                 }
 
+                out.close();
+                if(observation_shard && !out)throw std::runtime_error("Observation shard snapshot output failed");
+                terminal_exported=terminal_exported || key=="LM_HEAD";
                 manifest << csvEscape(getBackendName()) << ","
                          << phase_name << ","
                          << decode_step << ","
@@ -7127,6 +7179,20 @@ namespace llaminar2::test::parity
                          << elements << ","
                          << exported_elements << ","
                          << csvEscape(file_path.string()) << "," << (integer ? "INT64" : "FP32") << "\n";
+            }
+            if(observation_shard) {
+                manifest.close();
+                if(!terminal_exported || !manifest)
+                    throw std::runtime_error("Observation shard omitted its actual complete terminal LM row");
+                recordObservationTerminal(phase==ParityForwardPhase::Prefill?-1:decode_step);
+                const nlohmann::json terminals={{"schema",1},{"scope","noncertifying_observation_shard"},
+                    {"descriptor_sha256",frozen_history_replay_->identity()},
+                    {"actual_terminal_rows",observation_terminal_rows_},
+                    {"auxiliary_terminal_rows",observation_auxiliary_terminal_rows_},
+                    {"complete",hasCompleteObservationTerminals()},{"payload_manifest",manifest_path.string()}};
+                std::ofstream progress(ensureResultsDir()/"history_replay_observation_terminals.json");
+                progress<<terminals.dump(2)<<'\n';progress.close();
+                if(!progress)throw std::runtime_error("Cannot close actual observation terminal inventory");
             }
         }
 
@@ -8184,6 +8250,7 @@ namespace llaminar2::test::parity
                     return key.rfind("layer", 0) == 0;
                 }))
                 << "Production forward published no per-layer snapshot";
+            if(requiresObservationStagePresence("FFN_RESIDUAL"))
             EXPECT_TRUE(std::any_of(
                 keys.begin(),
                 keys.end(),
@@ -11464,6 +11531,14 @@ namespace llaminar2::test::parity
                 return {};
             }
 
+            const bool scoped_observation=frozen_history_replay_ && frozen_history_replay_->hasObservationShard();
+            if(scoped_observation &&
+               (prefill.capture_inventory==ParitySnapshotCaptureInventory::EveryPublishedOutput ||
+                decode.capture_inventory==ParitySnapshotCaptureInventory::EveryPublishedOutput))
+                throw std::invalid_argument("Observation shard cannot capture every published output");
+            if(scoped_observation)for(const auto& key:diagnostic_keys)
+                if(!frozen_history_replay_->observesReferenceKey(key))
+                    throw std::invalid_argument("Additional diagnostic capture key conflicts with observation shard");
             if ((prefill.enabled &&
                  prefill.capture_inventory ==
                      ParitySnapshotCaptureInventory::EveryPublishedOutput) ||
@@ -11493,11 +11568,13 @@ namespace llaminar2::test::parity
                     decode.required_decode_snapshot_keys.begin(),
                     decode.required_decode_snapshot_keys.end());
             }
-            const auto reference_keys =
+            const bool observation_shard=frozen_history_replay_ && frozen_history_replay_->hasObservationShard();
+            const auto reference_keys = observation_shard?frozen_history_replay_->observationKeys():
                 mtpParityProofPurpose() == MTPParityProofPurpose::NativeExactReplay
                     ? std::vector<std::string>{}
                     : authenticatedReferenceSnapshotCaptureFilter();
-            union_keys.insert(union_keys.end(), reference_keys.begin(), reference_keys.end());
+            if(observation_shard)union_keys=reference_keys;
+            else union_keys.insert(union_keys.end(), reference_keys.begin(), reference_keys.end());
             if (mtpParityProofPurpose() == MTPParityProofPurpose::NativeExactReplay)
                 union_keys.push_back("FINAL_NORM");
 

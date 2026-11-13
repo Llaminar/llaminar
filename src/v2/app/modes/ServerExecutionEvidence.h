@@ -7,6 +7,8 @@
  * reparse command lines, rediscover hardware, or mistake an expert-only rank's
  * CPU control endpoint for its compute devices. These values never drive
  * execution, allocation, sampling or placement decisions.
+ * GPU identity includes the original PCI bridge ancestry and observed mutual
+ * peers so selected domain locality can be audited without probing live GPUs.
  */
 #pragma once
 
@@ -17,7 +19,9 @@
 #include "execution/mpi_orchestration/DeviceInventory.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/PersistentStateMemoryEstimator.h"
+#include "planning/ObservedPeerGrouping.h"
 #include "utils/PerfStatsCollector.h"
+#include <nlohmann/json.hpp>
 #include <algorithm>
 #include <map>
 #include <set>
@@ -256,7 +260,7 @@ namespace llaminar2
      * @param device Selected local participant, never an idle discoverable GPU.
      * @param inventory Exact execution-communicator rank inventory.
      * @param numa_node CPU binding from the admitted rank plan.
-     * @return Startup-only tags joining local ordinals to physical node/UUID/NUMA and GPU PCI endpoint.
+     * @return Startup-only physical identity, PCI ancestry and original mutual-peer facts.
      * @throws std::invalid_argument For incomplete or ambiguous observed identity.
      *
      * Distinct ranks may see the same GPU under different ordinals. UUIDs keep
@@ -270,6 +274,7 @@ namespace llaminar2
             !device.is_valid() || (!device.is_cpu() && !device.is_gpu()))
             throw std::invalid_argument("Server participant evidence requires physical rank/device identity");
         std::string physical_id, pci_bus_address;
+        PerfStatsCollector::Tags gpu_tags;
         if (device.is_cpu())
         {
             if (numa_node < 0 || (inventory.cpu.numa_node >= 0 && inventory.cpu.numa_node != numa_node))
@@ -288,12 +293,44 @@ namespace llaminar2
             pci_bus_address = DevicePCIAddress::parse(gpu.pci_bus_address).toString();
             if (physical_id.empty())
                 throw std::invalid_argument("Server GPU participant lacks a physical UUID");
+            // Preserve nearest-bridge-first order. Missing ancestry is unknown;
+            // an endpoint's bus prefix must never be interpreted as a switch.
+            std::vector<std::string> ancestry;
+            std::set<std::string> unique_bridges;
+            for (const auto &bridge : gpu.pcie_upstream_bdfs)
+            {
+                const auto address = DevicePCIAddress::parse(bridge).toString();
+                if (!unique_bridges.insert(address).second || address == pci_bus_address)
+                    throw std::invalid_argument("Server GPU participant has contradictory PCI ancestry");
+                ancestry.push_back(address);
+            }
+            const auto &matrix = device.type == DeviceType::CUDA ? inventory.p2p_cuda : inventory.p2p_rocm;
+            const int count = device.type == DeviceType::CUDA ? inventory.p2p_cuda_count : inventory.p2p_rocm_count;
+            const auto observed_count = std::count_if(inventory.gpus.begin(), inventory.gpus.end(),
+                [&](const auto &peer) { return peer.type == device.type; });
+            const bool observed = count > 0 && count == observed_count &&
+                matrix.size() == static_cast<std::size_t>(count) * static_cast<std::size_t>(count);
+            std::set<std::string> mutual;
+            if (observed)
+            {
+                const ObservedPeerGrouping facts(inventory);
+                for (const auto &peer : inventory.gpus)
+                    if (peer.type == device.type && facts.mutuallyAccessible(
+                            device, DeviceId{peer.type, peer.local_device_id}))
+                        mutual.insert(peer.uuid);
+            }
+            gpu_tags = {{"numa_node", std::to_string(gpu.numa_node)}, {"native_isa", gpu.native_isa},
+                {"pcie_upstream_bdfs", nlohmann::json(ancestry).dump()},
+                {"peer_access_matrix_observed", observed ? "true" : "false"},
+                {"mutual_peer_physical_ids", nlohmann::json(mutual).dump()}};
         }
-        return {{"schema", "1"}, {"source", "resolved_execution_plan"},
+        PerfStatsCollector::Tags tags{{"schema", "1"}, {"source", "resolved_execution_plan"},
                 {"identity_source", "communicator_cluster_inventory"},
                 {"node_id", std::to_string(inventory.node_id)},
                 {"backend", deviceTypeToString(device.type)}, {"physical_id", physical_id},
                 {"pci_bus_address", pci_bus_address}};
+        tags.insert(gpu_tags.begin(), gpu_tags.end());
+        return tags;
     }
 
     /**

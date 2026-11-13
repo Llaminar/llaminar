@@ -31,6 +31,7 @@
 #include "tensors/TensorClasses.h"
 #include <array>
 #include <stdexcept>
+#include <sstream>
 
 namespace llaminar2
 {
@@ -512,12 +513,33 @@ void PipelineForwardGraphEdges::validateInput(const ForwardInput &input) const
         (prefix_bridge && tail
             ? input.shifted_mtp_prefill && input.shifted_mtp_prefill->executableForRequestCount(1)
             : !input.shifted_mtp_prefill);
-    if (input.device != device_ || input.seq_len <= 0 || input.batch_size != 1 ||
-        (!prefill && !verifier && !condition && !ordinary) ||
-        (verifier && !tail && (!follower_ || input.kv_cache != follower_->checkpoint.cache)) ||
-        input.external_hidden_state != (receivesActivation() ? &hidden_ : nullptr) ||
-        size_t(input.seq_len) > hidden_.numel() / size_t(width_))
-        throw std::invalid_argument("Pipeline forward changed its exact participant, bank, semantic role or physical row geometry");
+    // Report the first violated original authority, before graph mutation or
+    // collective enqueue. A generic geometry error hides distinct lifecycle
+    // defects (for example an absent retained follower checkpoint).
+    const auto reject = [&](const char *invariant) {
+        std::ostringstream diagnostic;
+        diagnostic << "Pipeline forward invariant failed: " << invariant
+            << "; device=" << device_.toString() << "; input_device=" << input.device.toString()
+            << "; terminal=" << tail << "; role=" << static_cast<int>(input.execution_role)
+            << "; phase=" << static_cast<int>(input.execution_phase)
+            << "; state=" << static_cast<int>(input.state_transaction)
+            << "; rows=" << input.seq_len << "; batch=" << input.batch_size
+            << "; row_capacity=" << hidden_.numel() / size_t(width_)
+            << "; resident_mtp_rows=" << resident_mtp_rows
+            << "; shifted_binding=" << input.shifted_mtp_prefill.has_value()
+            << "; follower_checkpoint=" << follower_.has_value();
+        throw std::invalid_argument(diagnostic.str());
+    };
+    if (input.device != device_) reject("original participant device");
+    if (input.seq_len <= 0) reject("positive physical rows");
+    if (input.batch_size != 1) reject("single-request pipeline bank");
+    if (!prefill && !verifier && !condition && !ordinary) reject("complete semantic forward transaction");
+    if (verifier && !tail && !follower_) reject("retained follower checkpoint required");
+    if (verifier && !tail && input.kv_cache != follower_->checkpoint.cache)
+        reject("original follower checkpoint cache");
+    if (input.external_hidden_state != (receivesActivation() ? &hidden_ : nullptr))
+        reject("original external hidden-state bank");
+    if (size_t(input.seq_len) > hidden_.numel() / size_t(width_)) reject("physical rows exceed retained hidden bank");
 }
 
 void PipelineForwardGraphEdges::validateFollowerMTPInput(const ForwardInput &input) const

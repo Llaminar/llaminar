@@ -846,6 +846,23 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
+         * @brief Open the one-row decode bridge at a restored-prefix boundary.
+         *
+         * A prefix harvest schedule may end with a complete prefill chunk and
+         * then one real token. Retire that chunk through the ordinary publisher
+         * completion contract before opening the depth-zero decode sequence.
+         * A direct one-row suffix has no preceding chunk and opens from idle.
+         * Any declared finite prefill interval closes at its exact terminal
+         * ordinal before the suffix starts; decode is outside that interval.
+         * Live, incomplete, speculative and non-prefill sequences are rejected;
+         * this transition never discards slots or synchronizes a device.
+         *
+         * @param error Optional stable rejection or retirement diagnostic.
+         * @return True when the restored-prefix serial decode graph may enter.
+         */
+        bool beginRestoredPrefixDecodeSequence(std::string *error = nullptr);
+
+        /**
          * @brief Admit the current participant into a serial prefill sequence.
          *
          * Every continuation participant calls this immediately before its
@@ -1187,6 +1204,14 @@ namespace llaminar2
         bool allParticipantsMarked(const std::vector<std::uint8_t> &marks) const;
         /** @brief Validate and retire one completed sequence while mutex_ is held. */
         bool retireCompletedGraphSequenceLocked(std::string *error);
+        /**
+         * @brief Close a declared prefill interval at its exact retired frontier.
+         * @param error Optional cardinality or terminal-publication diagnostic.
+         * @return True for no declaration or a completely retired interval.
+         * @note Called with mutex_ held after graph retirement. Published device
+         * events retain their existing owners; this never waits on a device.
+         */
+        bool closeCompletedPrefillScheduleLocked(std::string *error);
         /** @brief Open one graph sequence while mutex_ is already held. */
         bool beginGraphSequenceLocked(int draft_depth, std::string *error);
         /** @brief Publish the probe terminal once every local boundary exists. */

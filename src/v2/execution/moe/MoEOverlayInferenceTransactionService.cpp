@@ -1674,6 +1674,48 @@ namespace llaminar2
     }
 
     bool MoEOverlayInferenceTransactionCoordinator::
+        beginRestoredPrefixDecodeSequence(std::string *error)
+    {
+        std::lock_guard lock(mutex_);
+        if (error)
+            error->clear();
+        if (state_ != MoEOverlayInferenceProtocolState::Active)
+            return failLocked(
+                "ExpertOverlay restored-prefix decode requires an active command",
+                error);
+
+        if (execution_sequence_.active())
+        {
+            const bool completed_prefill =
+                execution_sequence_.state == ExecutionSequenceState::Open &&
+                execution_sequence_.draft_depth == 0 &&
+                execution_sequence_.next_graph_ordinal == 1 &&
+                transaction_count_ == 1 &&
+                graph_group_slots_.front().descriptor.graph_role ==
+                    MoEOverlayInferenceGraphRole::MainPrefill;
+            if (!completed_prefill)
+                return failLocked(
+                    "ExpertOverlay restored-prefix decode cannot replace a live, "
+                    "incomplete or non-prefill graph sequence",
+                    error);
+
+            // The prefill chunk and its one-row suffix share one outer command.
+            // Reuse the authenticated sparse-return retirement before replacing
+            // its bounded slot; resetting bookkeeping alone would lose follower
+            // completion and count the prefill progress incorrectly.
+            if (!retireCompletedGraphSequenceLocked(error))
+                return false;
+        }
+        // The calibration declaration describes only its finite MainPrefill
+        // interval, not the whole outer command. Validate and close it here so
+        // the suffix cannot be mistaken for a missing/extra prefill chunk at
+        // command completion. A mere >= check would conceal oversubmission.
+        if (!closeCompletedPrefillScheduleLocked(error))
+            return false;
+        return beginGraphSequenceLocked(/*draft_depth=*/0, error);
+    }
+
+    bool MoEOverlayInferenceTransactionCoordinator::
         beginGraphSequenceLocked(
             int draft_depth,
             std::string *error)
@@ -2896,6 +2938,35 @@ namespace llaminar2
         return true;
     }
 
+    bool MoEOverlayInferenceTransactionCoordinator::
+        closeCompletedPrefillScheduleLocked(std::string *error)
+    {
+        if (!declared_prefill_schedule_)
+            return true;
+        if (execution_sequence_.active() || transaction_count_ != 0 ||
+            total_transaction_count_ != declared_prefill_schedule_end_ordinal_)
+        {
+            return failLocked(
+                "ExpertOverlay prefill interval did not retire its exact declared aggregate schedule cardinality",
+                error);
+        }
+        if (declared_prefill_probe_ticket_.valid() &&
+            (!declared_prefill_probe_released_ ||
+             !declared_prefill_terminal_published_))
+        {
+            return failLocked(
+                "ExpertOverlay prefill interval closed before publishing its exact final-device terminal",
+                error);
+        }
+        declared_prefill_schedule_.reset();
+        declared_prefill_schedule_begin_ordinal_ = 0;
+        declared_prefill_schedule_end_ordinal_ = 0;
+        declared_prefill_probe_ticket_ = {};
+        declared_prefill_probe_released_ = false;
+        declared_prefill_terminal_published_ = false;
+        return true;
+    }
+
     bool MoEOverlayInferenceTransactionCoordinator::completeCommand(
         std::uint64_t placement_epoch,
         std::string *error)
@@ -2921,24 +2992,8 @@ namespace llaminar2
             return false;
         }
 
-        if (declared_prefill_schedule_)
-        {
-            if (total_transaction_count_ !=
-                declared_prefill_schedule_end_ordinal_)
-            {
-                return failLocked(
-                    "ExpertOverlay command completed before its declared aggregate prefill schedule cardinality",
-                    error);
-            }
-            if (declared_prefill_probe_ticket_.valid() &&
-                (!declared_prefill_probe_released_ ||
-                 !declared_prefill_terminal_published_))
-            {
-                return failLocked(
-                    "ExpertOverlay command completed before the aggregate prefill probe owned its exact final-device terminal",
-                    error);
-            }
-        }
+        if (!closeCompletedPrefillScheduleLocked(error))
+            return false;
 
         for (const auto &publisher : config_.publishers)
         {
@@ -2964,12 +3019,6 @@ namespace llaminar2
             "inference",
             "continuation_rank",
             {{"action", "complete"}});
-        declared_prefill_schedule_.reset();
-        declared_prefill_schedule_begin_ordinal_ = 0;
-        declared_prefill_schedule_end_ordinal_ = 0;
-        declared_prefill_probe_ticket_ = {};
-        declared_prefill_probe_released_ = false;
-        declared_prefill_terminal_published_ = false;
         return true;
     }
 

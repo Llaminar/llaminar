@@ -1130,6 +1130,52 @@ TEST(MoEPipelineNativePreparation, DiscoveryStaysSourceFreeAndCannotEraseServing
         GPUDeviceProcessLifetime::retireActive();std::_Exit(::testing::Test::HasFailure()?1:0);
     }()),::testing::ExitedWithCode(0),"");
 }
+/** @test Source-backed Apply adds only original birth graphs to the identical retained pipeline envelope. */
+TEST(MoEPipelineNativePreparation, RetainedGraphInventoryMatchesSourceFreeAndOriginalApply)
+{
+    GTEST_FLAG_SET(death_test_style,"threadsafe");
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+        for (const int capacity : {0, 15}) ASSERT_EXIT(([&] {
+            {
+                PlanningGGUFFixture file(true, capacity > 0);
+                PlanningModelSource model(file.path());
+                auto context = metadataContext(file.path());
+                auto observed = inventory(2);
+                observed.ranks.front().cpu.numa_node = 0;
+                observed.ranks.front().numa_nodes = 1;
+                observed.buildNodeAggregations();
+                auto config = originalNativePipeline(model, backend);
+                config.mtp.graph_capacity_draft_tokens = capacity;
+                ExecutionPlanBuilder compiler;
+                const auto topology = ResolvedRankOrchestration::resolve(config, model.metadata(), observed, compiler, 0);
+                const std::array devices{DeviceId(backend, 0), DeviceId(backend, 1)};
+                const auto discovery = AdmittedMoEPipelineMemory::admit(topology, model.metadata(),
+                    context->concreteLoader(), observed, sourcePolicy(devices, context->concreteLoader()));
+                seedPipelineWorkers(devices);
+                auto source = NativeContextPreparationReplayAccess::source<PipelineSourceWorker>(
+                    devices, sourceResources(observed, devices));
+                PipelineSourceRetirement retirement{source, {devices.begin(), devices.end()}};
+                for (const auto device : devices) { auto permit = source->acquire(device); }
+                source->freezeForPlanning();
+                const auto applied = AdmittedMoEPipelineMemory::admit(topology, model.metadata(),
+                    context->concreteLoader(), observed, sourcePolicy(devices, context->concreteLoader(), source));
+                for (const auto device : devices)
+                {
+                    const auto *before = discovery.physicalAdmission()->plan().find({0, device});
+                    const auto *after = applied.physicalAdmission()->plan().find({0, device});
+                    const auto *birth = source->mandatoryBOM().find({0, device});
+                    ASSERT_NE(before, nullptr);
+                    ASSERT_NE(after, nullptr);
+                    ASSERT_NE(birth, nullptr);
+                    EXPECT_EQ(after->bytes(PhysicalMemoryOwner::NativeGraphExecutable),
+                        before->bytes(PhysicalMemoryOwner::NativeGraphExecutable) +
+                        birth->bytes(PhysicalMemoryOwner::NativeGraphExecutable));
+                }
+            }
+            GPUDeviceProcessLifetime::retireActive();
+            std::_Exit(::testing::Test::HasFailure() ? 1 : 0);
+        }()), ::testing::ExitedWithCode(0), "");
+}
 /** @test A failed original constructor prefix cannot be frozen/admitted and retains both reset obligations. */
 TEST(MoEPipelineNativePreparation, PartialOriginalPreparationRejectsBeforePlanningAndRetiresEveryAttempt){
     GTEST_FLAG_SET(death_test_style,"threadsafe");ASSERT_EXIT(([&]{

@@ -8,6 +8,9 @@
  * Immutable World-model environment limits are read from MPI_COMM_WORLD, where
  * MPI publishes them; splitting a communicator does not copy those attributes.
  * Reading that local metadata never sends payloads or collectives on WORLD.
+ * Completed operation telemetry aggregates by bounded lane/topology identity;
+ * changing epoch/expert coordinates use the collector's ordered fixed-width
+ * witness instead of retaining a new string-keyed record for every transfer.
  */
 
 #include "MoEOverlayMPIRemoteProjectionTransport.h"
@@ -28,6 +31,7 @@
 #include <climits>
 #include <cstring>
 #include <exception>
+#include <initializer_list>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -528,24 +532,35 @@ namespace llaminar2
             std::make_shared<
                 MoEOverlayMPIRemoteProjectionTransportSharedStats>();
 
-        /** @brief Export one low-frequency proof event. */
+        /**
+         * @brief Export one transport fact under its original rank authority.
+         * @param name Existing metric family; no transport semantics are inferred.
+         * @param value Unchanged completed count, byte or timing increment.
+         * @param extra_tags Stable topology/lane dimensions for completed operations.
+         * @param words Optional fixed-width changing coordinates in completion order.
+         *
+         * Sequence observations retain exact integer extrema and ordered digests
+         * without growing the map with epoch, migration, layer or expert keys.
+         */
         void recordCounter(
             const char *name,
             double value = 1.0,
-            PerfStatsCollector::Tags extra_tags = {}) const
+            PerfStatsCollector::Tags extra_tags = {},
+            std::initializer_list<std::uint64_t> words = {}) const
         {
             auto tags = extra_tags;
             tags.emplace("world_rank", std::to_string(world_rank));
             tags.emplace("world_size", std::to_string(world_size));
             tags.emplace("background", "true");
             tags.emplace("blocking", "false");
-            PerfStatsCollector::addCounter(
-                "moe_overlay_residency",
-                name,
-                value,
-                "maintenance",
-                perf_device,
-                tags);
+            if (words.size() != 0u)
+                PerfStatsCollector::addCounterWithSequence(
+                    "moe_overlay_residency", name, value, words,
+                    "maintenance", perf_device, std::move(tags));
+            else
+                PerfStatsCollector::addCounter(
+                    "moe_overlay_residency", name, value,
+                    "maintenance", perf_device, std::move(tags));
         }
 
         /** @brief Release exactly one reserved lane after MPI is quiescent. */
@@ -1290,58 +1305,61 @@ namespace llaminar2
                     {"role", role_ == Role::Source ? "source"
                                                     : "destination"},
                     {"purpose", transactionPurposeName(purpose_)},
-                    {"candidate_epoch",
-                     std::to_string(identity_.candidate_epoch)},
-                    {"migration_index",
-                     std::to_string(identity_.migration_index)},
-                    {"layer", std::to_string(identity_.layer_idx)},
-                    {"expert", std::to_string(identity_.expert_id)},
+                    {"projection", std::to_string(static_cast<unsigned>(identity_.projection))},
+                    {"source_world_rank", std::to_string(identity_.source_world_rank)},
+                    {"destination_world_rank", std::to_string(identity_.destination_world_rank)},
+                    {"source_device", identity_.source_device.to_string()},
+                    {"destination_device", identity_.destination_device.to_string()},
                     {"source_participant",
                      std::to_string(identity_.source_participant)},
                     {"destination_participant",
                      std::to_string(identity_.destination_participant)},
                 };
-                impl_->recordCounter(
+                // Completion order is lane-local observed order, not a claim
+                // that concurrently progressing peer endpoints finish together.
+                const auto record_completed = [&](const char *name, double value)
+                {
+                    impl_->recordCounter(name, value, tags,
+                        {identity_.expected_epoch, identity_.candidate_epoch,
+                         identity_.migration_index,
+                         static_cast<std::uint64_t>(identity_.layer_idx),
+                         static_cast<std::uint64_t>(identity_.expert_id),
+                         completed_payload_bytes_});
+                };
+                record_completed(
                     "remote_projection_operations_completed",
-                    1.0,
-                    tags);
+                    1.0);
                 /*
                  * Count final authenticated payload bytes, not MPI headers or
                  * manifests.  Both endpoints publish their own completion so
                  * a distributed report can prove send and receive progress;
                  * `role` keeps those quantities independently auditable.
                  */
-                impl_->recordCounter(
+                record_completed(
                     "remote_projection_payload_bytes_completed",
-                    static_cast<double>(completed_payload_bytes_),
-                    tags);
-                impl_->recordCounter(
+                    static_cast<double>(completed_payload_bytes_));
+                record_completed(
                     "remote_projection_wall_ns",
-                    static_cast<double>(wall_nanoseconds),
-                    tags);
-                impl_->recordCounter(
+                    static_cast<double>(wall_nanoseconds));
+                record_completed(
                     "remote_projection_admission_to_dispatch_ns",
                     static_cast<double>(
-                        admission_to_dispatch_nanoseconds_),
-                    tags);
-                impl_->recordCounter(
+                        admission_to_dispatch_nanoseconds_));
+                record_completed(
                     "remote_projection_host_work_ns",
-                    static_cast<double>(host_work_nanoseconds_),
-                    tags);
-                impl_->recordCounter(
+                    static_cast<double>(host_work_nanoseconds_));
+                record_completed(
                     "remote_projection_mpi_request_visible_ns",
-                    static_cast<double>(mpi_visible_nanoseconds_),
-                    tags);
+                    static_cast<double>(mpi_visible_nanoseconds_));
                 const std::uint64_t attributed_nanoseconds =
                     saturatingExpertTierMeasurementAdd(
                         host_work_nanoseconds_, mpi_visible_nanoseconds_);
-                impl_->recordCounter(
+                record_completed(
                     "remote_projection_unattributed_poll_ns",
                     static_cast<double>(
                         wall_nanoseconds > attributed_nanoseconds
                             ? wall_nanoseconds - attributed_nanoseconds
-                            : 0u),
-                    tags);
+                            : 0u));
                 if (error)
                     error->clear();
                 return MoEOverlayResidencyWaveProgress::Ready;

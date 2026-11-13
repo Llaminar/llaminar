@@ -13,6 +13,7 @@
 #include "config/MoERouterArithmeticPolicy.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include "execution/runner/ObservedFixedPipelineEvidence.h"
+#include "execution/runner/RankInitializationLifecycle.h"
 #include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
 #include "execution/local_execution/graph/IGraphExecutor.h"
@@ -31,6 +32,7 @@
 #include <set>
 #include <span>
 #include <vector>
+#include <utility>
 #include <sys/stat.h>
 #include <stdexcept>
 
@@ -43,6 +45,36 @@ enum class QFNObservationSurface { CPU, GPUCPUOverlay, CPUTailPipeline, Homogene
 inline void requireQFN(bool condition, const char *message)
 {
     if (!condition) throw std::invalid_argument(message);
+}
+
+/**
+ * @brief Create the original-discovery artifact root before execution selection.
+ * @param output Fresh observer artifact path shared by original ranks.
+ * @param discovery_rank Original MPI rank, never the selected execution ordinal.
+ * @return True on nonowners without requiring an active runner's later publication.
+ * @throws std::invalid_argument For invalid rank or a stale/uncreatable owner root.
+ * @note Caller must reach original-discovery initialization consensus before RuntimeInit.
+ */
+inline bool qfnCreateDiscoveryArtifactRoot(const std::filesystem::path& output,int discovery_rank)
+{
+    requireQFN(discovery_rank>=0,"QFN artifact root requires an original discovery rank");
+    if (discovery_rank != 0) return true;
+    requireQFN(std::filesystem::create_directories(output),"QFN observer output directory must be fresh");
+    return true;
+}
+
+/**
+ * @brief Join original discovery outcomes only after each local model owner retires.
+ * @param local_complete Actual local observation/retirement outcome, including caught failures.
+ * @param consensus Existing original-communicator initialization consensus callback.
+ * @return False on every original rank when any active or inactive rank failed.
+ * @note No file readiness or execution-rank alias can substitute this original-rank edge.
+ */
+template<class Consensus>
+bool qfnCompleteDiscoveryObservation(bool local_complete,Consensus&& consensus)
+{
+    return RankInitializationLifecycle::execute({1,"qfn_original_observer_retirement"},
+        [&]{return local_complete;},std::forward<Consensus>(consensus)).succeeded();
 }
 
 /**

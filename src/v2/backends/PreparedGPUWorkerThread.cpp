@@ -59,14 +59,19 @@ std::string GPUWorkerStackProgram::identity()const{
     if(signalResult==0)for(int signal=1;signal<NSIG;++signal)value<<sigismember(&mask,signal);
     const auto digest=sha256BytesHex(value.str());if(!digest)throw std::runtime_error("Cannot hash original source pthread policy");return *digest;
 }
-GPUWorkerStackProgram GPUWorkerStackProgram::withContextObject(std::size_t bytes,std::size_t alignment) const {
-    if(!bytes || !alignment || (alignment&(alignment-1)) || alignment>page_ || bytes>std::numeric_limits<std::size_t>::max()-(page_-1))
-        throw std::invalid_argument("Original context object has invalid compiled size/alignment");
-    const auto pages=((bytes+page_-1)/page_)*page_;
-    if(stack_>std::numeric_limits<std::size_t>::max()-pages || stack_+pages>std::numeric_limits<std::size_t>::max()-guard_)
+std::size_t GPUWorkerStackProgram::planningAllocationBytes(std::size_t stack,std::size_t guard,std::size_t page,std::size_t object,std::size_t alignment){
+    if(!page || (page&(page-1)) || !stack || stack%page || !object || !alignment || (alignment&(alignment-1)) || alignment>page || object>std::numeric_limits<std::size_t>::max()-(page-1))
+        throw std::invalid_argument("Original context object/stack has invalid compiled size/alignment");
+    const auto pages=((object+page-1)/page)*page;
+    if(stack>std::numeric_limits<std::size_t>::max()-pages || stack+pages>std::numeric_limits<std::size_t>::max()-guard)
         throw std::overflow_error("Original stack/context-object physical extent overflows");
-    auto result=*this;result.object_=bytes;result.object_alignment_=alignment;result.object_pages_=pages;return result;
+    return stack+pages;
 }
+GPUWorkerStackProgram GPUWorkerStackProgram::withContextObject(std::size_t bytes,std::size_t alignment) const {
+    const auto extent=planningAllocationBytes(stack_,guard_,page_,bytes,alignment);
+    auto result=*this;result.object_=bytes;result.object_alignment_=alignment;result.object_pages_=extent-stack_;return result;
+}
+
 /** @brief One actual allocation root; its callback token is the sole physical admission owner. */
 struct PreparedGPUWorkerStack::State {
     std::shared_ptr<NativeStoragePreparationPmaBinding> owner;

@@ -5,15 +5,23 @@
 # Inheriting the admitted runtime supplies both vendors' memory-telemetry libraries
 # on hosts whose ARC pod has neither a GPU SDK nor writable model-cache mounts.
 ARG RUNTIME_IMAGE
+FROM ${RUNTIME_IMAGE} AS opencode-builder
+USER root
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates build-essential python3 git patch pkg-config \
+ && rm -rf /var/lib/apt/lists/*
+COPY scripts/ci/install_opencode_client.py /tmp/install_opencode_client.py
+COPY scripts/ci/opencode-client/ /tmp/opencode-client/
+RUN mkdir -p /qualified \
+ && python3 /tmp/install_opencode_client.py --destination /usr/local/bin/opencode > /qualified/opencode-client.json
+
 FROM ${RUNTIME_IMAGE}
 USER root
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       docker.io curl jq pciutils procps util-linux python3-requests python3-yaml python3-numpy \
  && rm -rf /var/lib/apt/lists/*
-COPY scripts/ci/install_opencode_client.py /tmp/install_opencode_client.py
-RUN mkdir -p /usr/local/share/llaminar \
- && python3 /tmp/install_opencode_client.py > /usr/local/share/llaminar/opencode-client.json \
- && rm /tmp/install_opencode_client.py
+COPY --from=opencode-builder /usr/local/bin/opencode /usr/local/bin/opencode
+COPY --from=opencode-builder /qualified/opencode-client.json /usr/local/share/llaminar/opencode-client.json
 LABEL org.llaminar.image_role="suite-driver"
 ENTRYPOINT []

@@ -12,8 +12,8 @@ import math
 from pathlib import Path
 import sys
 
-from opencode_tool_stress import (assessment, campaign_assessment, fixture_cases,
-                                  session_prompts)
+from opencode_tool_stress import (assessment, campaign_assessment, client_context_policy,
+                                  fixture_cases, session_prompts)
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / 'scripts/ci'))
@@ -26,17 +26,24 @@ def positive_seconds(value: object) -> bool:
 
 
 def validate_app_report(report: dict, *, model: str, context_tokens: int,
-                        output_tokens: int = 32768) -> dict:
+                        output_tokens: int = 32768,
+                        reply_reserve_tokens: int | None = None) -> dict:
     """Recompute one complete ten-phase session's qualification and counts.
 
     Context must be the caller's proven PMA admission. No elapsed-time or
     inactivity limit participates in certification. The prompt sequence comes
     from the same authored workload as the actual client, not a second list.
+    An explicit compaction reserve must match the lifecycle owner's requested
+    policy. Default CI callers cannot silently admit a different input/reply split.
     """
+    context_policy = client_context_policy(context_tokens, output_tokens, reply_reserve_tokens)
+    observed_reserve = report.get('reply_reserve_tokens')
     if (report.get('schema') != 2 or report.get('complete') is not True
             or report.get('opencode_version') != VERSION or report.get('gate') != 'stress'
             or report.get('model') != model or report.get('context_length') != context_tokens
             or report.get('max_tokens') != output_tokens
+            or type(observed_reserve) is not type(reply_reserve_tokens)
+            or observed_reserve != reply_reserve_tokens
             or report.get('iterations') != 1 or report.get('concurrency') != 1
             or report.get('measure_prefix_reuse') is not True
             or 'turn_wall_time_limit_seconds' not in report
@@ -48,6 +55,12 @@ def validate_app_report(report: dict, *, model: str, context_tokens: int,
     if not isinstance(results, list) or len(results) != 1:
         raise ValueError('OpenCode certification requires one complete app session')
     result = results[0]
+    # Historical default-policy reports predate this explicit observation. A
+    # changed reserve must carry exact session evidence; it cannot inherit that
+    # historical omission or be authenticated solely by a top-level scalar.
+    if ((reply_reserve_tokens is not None or 'client_context_policy' in result)
+            and result.get('client_context_policy') != context_policy):
+        raise ValueError('OpenCode session context policy differs from the requested reply reserve')
     if (result.get('case') != 'webapp' or result.get('ordinal') != 0
             or result.get('timed_out') is not False
             or not positive_seconds(result.get('elapsed_seconds'))):
@@ -103,6 +116,7 @@ def validate_app_report(report: dict, *, model: str, context_tokens: int,
     return {**summary, 'request_count': exchanges, 'completed_phases': len(phases),
             'elapsed_seconds': result['elapsed_seconds'], 'model': model,
             'context_tokens': context_tokens, 'output_tokens': output_tokens,
+            'reply_reserve_tokens': reply_reserve_tokens,
             'opencode_version': VERSION}
 
 

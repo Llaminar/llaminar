@@ -29,6 +29,11 @@ public:
     static GPUWorkerStackProgram originalDefaults();
     /** @return Canonical digest of original native defaults, excluding later stack-address binding. */
     std::string identity()const;
+    /** @brief Shared checked original stack/object geometry, without mapping or spawning.
+     * @param stack Original stack bytes. @param guard Virtual guard bytes. @param page Native page bytes.
+     * @param object Compiled object size. @param alignment Compiled alignment. @return Physical stack/object extent. */
+    static std::size_t planningAllocationBytes(std::size_t stack,std::size_t guard,std::size_t page,std::size_t object,std::size_t alignment);
+
     std::size_t stackBytes() const noexcept { return stack_; }
     std::size_t guardBytes() const noexcept { return guard_; }
     std::size_t pageBytes() const noexcept { return page_; }

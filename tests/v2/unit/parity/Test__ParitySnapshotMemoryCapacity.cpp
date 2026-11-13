@@ -450,3 +450,25 @@ TEST(ParitySnapshotMemoryCapacity, RetainedServingPhasesPlannerBOMUsesResidentLa
         EXPECT_THROW((void)llaminar2::MemoryPlanner::plan(profile, {cfg}), std::invalid_argument);
     }
 }
+
+/** @test The explicit immutable observation key set prices only actual selected payloads and rejects invented/duplicate keys. */
+TEST(ParitySnapshotMemoryCapacity, ObservationShardCapacityMatchesExactCaptureKeys)
+{
+    TemporarySnapshotDirectory snapshots;
+    saveCheckpoint(snapshots.path()/"hidden.npy",{2u,3u});
+    saveCheckpoint(snapshots.path()/"decode_step0_hidden.npy",{1u,3u});
+    saveCheckpoint(snapshots.path()/"unselected.npy",{2u,64u});
+    const auto full=deriveParitySnapshotMemoryCapacity(snapshots.path(),2,8,{});
+    const auto selected=deriveParitySnapshotMemoryCapacity(snapshots.path(),2,8,{}, {},
+        ParitySnapshotPayloadProjection::ObservationEnvelope,{"hidden"});
+    EXPECT_EQ(selected.reference_file_count,2u);EXPECT_EQ(selected.capacity.per_accelerator_bytes,108u);
+    EXPECT_GT(full.capacity.per_accelerator_bytes,selected.capacity.per_accelerator_bytes);
+    EXPECT_EQ(deriveParitySnapshotMemoryCapacity(snapshots.path(),2,8,{}).capacity,full.capacity);
+    EXPECT_THROW((void)deriveParitySnapshotMemoryCapacity(snapshots.path(),2,8,{}, {},
+        ParitySnapshotPayloadProjection::ObservationEnvelope,{"hidden","hidden"}),std::invalid_argument);
+    EXPECT_THROW((void)deriveParitySnapshotMemoryCapacity(snapshots.path(),2,8,{}, {},
+        ParitySnapshotPayloadProjection::ObservationEnvelope,{"missing"}),std::invalid_argument);
+    EXPECT_THROW((void)deriveParitySnapshotMemoryCapacity(snapshots.path(),2,8,{},
+        {GraphSnapshotSourceOutput::qwenSparse(0,GraphSnapshotSourceRole::QwenSparseRawQuery)},
+        ParitySnapshotPayloadProjection::ObservationEnvelope,{"hidden"}),std::invalid_argument);
+}

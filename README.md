@@ -456,6 +456,7 @@ planner, add any of these options to `plan` or to an automatic `serve` command:
 |---|---|
 | Only ROCm compute | `--only-backends rocm` |
 | Exactly two ROCm devices, with automatic placement | `--only-backends rocm --auto-device-counts rocm=2` |
+| Two automatic PP stages with four devices each | `--only-strategies pp --auto-pipeline-stage-widths 4,4` |
 | Consider only tensor or pipeline parallelism | `--only-strategies tp,pp` |
 | Prefer AMD when two choices have similar estimated performance | `--prefer-backend rocm` |
 | Optimize for roughly 512 prompt tokens and 384 output tokens | `--plan-workload 512,384` |
@@ -463,8 +464,33 @@ planner, add any of these options to `plan` or to an automatic `serve` command:
 
 Auto may choose fewer devices if it expects them to be faster. Set
 `--auto-device-counts` when you want an exact count; otherwise leave it out.
+`--auto-pipeline-stage-widths` fixes the ordered stage participant counts and
+restricts selection to pipeline parallelism. Every width must be positive;
+repeated widths and other stage counts are supported. The planner selects physical
+devices and assigns one contiguous layer range per stage, proportional to its
+participant count. Integer remainders are assigned deterministically, with at
+least one layer per stage. Explicit applied plans retain their own layer ranges.
+Combine it with exact backend counts to constrain
+the whole pipeline, for example `--only-backends rocm --auto-device-counts rocm=8
+--auto-pipeline-stage-widths 4,4`. YAML uses `planning.pipeline_stage_widths: 4,4`.
+A width hint cannot be combined with applied placement or a strategy filter that
+excludes PP; incompatible complete device totals fail before discovery.
+Independent candidate admissions use the configured OpenMP worker budget in
+bounded batches. Capacity checks and final selection remain deterministic.
+
 For CPUs, a device count means NUMA nodes: groups of CPU cores with their own
 local memory, often one per socket. It does not mean a thread count.
+
+Automatic GPU placement samples directed physical transfers at startup using a
+small, fixed set of payload sizes and repeats. The same measurements serve every
+candidate; the planner does not benchmark every possible GPU group. Direct peer
+copies and measured host-staging legs remain distinct from native collective
+timings. Allreduce, equal allgather, and counted gathers have separate native
+measurements. Cost estimates include live payloads, required control traffic,
+and observed shared PCIe link limits; unmeasured subsets remain estimates.
+The resulting placement estimate can prefer faster measured links over
+switch locality. Equal-cost choices favor mutually accessible cards with shorter
+observed PCIe paths. Startup logs report calibration setup and sampling time.
 
 `--plan-workload` helps estimate performance for your expected request size;
 it does not send a prompt or limit the output. You can

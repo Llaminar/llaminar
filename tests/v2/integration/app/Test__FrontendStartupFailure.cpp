@@ -10,7 +10,10 @@
  * Saved subsets and reversed namespaces additionally exercise the public
  * --config parser: excluded peers finalize while selected ranks reach real
  * runner metadata admission. Asymmetric or absent selections fail before split.
- * No real model or accelerator is used, and the ordinary MPI timeout applies.
+ * The QFN borrow mode additionally rejects an unowned session before MPI_Init,
+ * then retains the original process owner across inactive/active failure and
+ * terminal discovery consensus. No real model or accelerator is used, and the
+ * ordinary MPI timeout applies.
  * Native MPI copy policy remains library/operator owned across initialization.
  *
  * The custom entry owns one lexical native GPU lifetime without probing a
@@ -19,6 +22,7 @@
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "utils/MPISessionOwner.h"
 #include "app/RuntimeInitPhase.h"
+#include "tools/ModelKLDQFNContract.h"
 #include "config/OrchestrationConfigDocument.h"
 #include "utils/MPIBootstrap.h"
 #include "utils/DebugEnv.h"
@@ -37,7 +41,7 @@ namespace
     enum class Scenario
     {
         RankParseFailure, DryRunFailure, SavedConfiguration,
-        SelectedFollower, ReversedSelection, AsymmetricSelection, AbsentSelection
+        SelectedFollower, ReversedSelection, AsymmetricSelection, AbsentSelection, QFNDiscoveryOwner
     };
 
     /** @return Original native MPI transport intent; absence remains a distinct policy. */
@@ -86,6 +90,7 @@ int main(int argc, char **argv)
     else if (argc == 2 && std::string(argv[1]) == "--reversed-selection-proof") scenario = Scenario::ReversedSelection;
     else if (argc == 2 && std::string(argv[1]) == "--asymmetric-selection-proof") scenario = Scenario::AsymmetricSelection;
     else if (argc == 2 && std::string(argv[1]) == "--absent-selection-proof") scenario = Scenario::AbsentSelection;
+    else if (argc == 2 && std::string(argv[1]) == "--qfn-discovery-owner-proof") scenario = Scenario::QFNDiscoveryOwner;
     else if (argc != 1) return 1;
     const auto launch = llaminar2::MPIBootstrap::detectMPIEnvironment();
     if (!launch.is_mpi_process || launch.detected_world_size != 2) return 1;
@@ -106,7 +111,7 @@ int main(int argc, char **argv)
         input.prefill_max_bucket_size = 1024;
         input.deterministic = true;
         input.temperature = 0.0f;
-        if (scenario == Scenario::SelectedFollower)
+        if (scenario == Scenario::SelectedFollower || scenario == Scenario::QFNDiscoveryOwner)
             input.execution_rank_selection = llaminar2::ExecutionRankSelection({1});
         else if (scenario == Scenario::ReversedSelection)
             input.execution_rank_selection = llaminar2::ExecutionRankSelection({1, 0});
@@ -126,7 +131,35 @@ int main(int argc, char **argv)
     llaminar2::OrchestrationConfig config;
     // The ordinary frontend must not insert a disabling override before MPI_Init.
     const auto original_transport_intent=nativeTransportIntent();
-    const auto result = llaminar2::RuntimeInitPhase{}.execute(config, count, arguments);
+    // The QFN mode starts before MPI_Init, unlike the MPI GTest fixture.
+    // Its sole canonical process owner outlives both discovery and startup.
+    std::optional<llaminar2::MPIProcessSession> original_process;
+    std::shared_ptr<llaminar2::MPIContext> original_discovery;
+    std::filesystem::path artifact_root;
+    if (scenario == Scenario::QFNDiscoveryOwner)
+    {
+        int initialized=-1;MPI_Initialized(&initialized);
+        if(initialized) return 1;
+        const llaminar2::MPIProcessSession unowned;
+        bool rejected=false;
+        try {(void)llaminar2::RuntimeInitPhase{}.executeInSession(config,count,arguments,unowned);}
+        catch(const std::invalid_argument&){rejected=true;}
+        MPI_Initialized(&initialized);
+        if(!rejected || initialized) return 1;
+        original_process.emplace(llaminar2::MPIProcessSession::initialize(count,arguments));
+        original_discovery=llaminar2::MPIContextFactory::global();
+        int owner_pid=original_discovery->is_root()?int(::getpid()):0;
+        if(MPI_Bcast(&owner_pid,1,MPI_INT,0,original_discovery->communicator())!=MPI_SUCCESS)return 1;
+        artifact_root=std::filesystem::path("/tmp")/("qfn-fresh-frontend-"+std::to_string(owner_pid));
+        const auto ready=llaminar2::RankInitializationLifecycle::execute({0,"qfn_original_observer_artifacts"},[&]{
+            return llaminar2::accuracy::qfnCreateDiscoveryArtifactRoot(artifact_root,original_discovery->rank());
+        },[&](auto identity,auto outcome){return llaminar2::MPIRankInitializationConsensus::reach(
+            original_discovery->communicator(),identity,outcome);});
+        if(!ready.succeeded())return 1;
+    }
+    const auto result = original_process
+        ? llaminar2::RuntimeInitPhase{}.executeInSession(config,count,arguments,*original_process)
+        : llaminar2::RuntimeInitPhase{}.execute(config, count, arguments);
     if(nativeTransportIntent()!=original_transport_intent)
     {
         std::fputs("FAIL: frontend replaced original native MPI transport intent\n",stderr);
@@ -135,6 +168,24 @@ int main(int argc, char **argv)
     const auto *terminal = std::get_if<llaminar2::RuntimeInitExit>(&result);
     int finalized = 0;
     MPI_Finalized(&finalized);
+    if(scenario==Scenario::QFNDiscoveryOwner)
+    {
+        const bool excluded=launch.detected_rank==0;
+        const auto expected=excluded?llaminar2::RuntimeInitExit::Completed:llaminar2::RuntimeInitExit::Failed;
+        const bool correct=terminal && *terminal==expected && !finalized && original_process->ownsMPI();
+        const auto consensus=[&](auto identity,auto outcome){return llaminar2::MPIRankInitializationConsensus::reach(
+            original_discovery->communicator(),identity,outcome);};
+        // Active rank1 genuinely failed model admission; inactive rank0 still
+        // participates after its successful no-model exit. Both see failure.
+        const bool admitted=llaminar2::accuracy::qfnCompleteDiscoveryObservation(excluded,consensus);
+        const bool checked=llaminar2::accuracy::qfnCompleteDiscoveryObservation(correct&&!admitted,consensus);
+        if(original_discovery->is_root())std::filesystem::remove_all(artifact_root);
+        original_discovery.reset();original_process.reset();
+        MPI_Finalized(&finalized);
+        if(!checked || !finalized)return 1;
+        std::puts("PASS: fresh QFN frontend initialized once, retained original discovery across selected failure, and finalized last");
+        return 0;
+    }
     const bool excluded = scenario == Scenario::SelectedFollower && launch.detected_rank == 0;
     const auto expected = excluded ? llaminar2::RuntimeInitExit::Completed : llaminar2::RuntimeInitExit::Failed;
     if (!terminal || *terminal != expected || !finalized ||

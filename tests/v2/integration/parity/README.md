@@ -912,6 +912,24 @@ mapping because it has no identity-bound tmpfs publication or cache lock. Use
 the driver command above (with `--campaign` for a narrow child selection), or
 run a non-campaign focused GTest diagnostic explicitly.
 
+A frozen-history diagnostic may declare `observation_shard` with `schema: 1`,
+`scope: "noncertifying"`, and duplicate-free `full_keys` / `selected_keys`
+semantic inventories. The full inventory must match the actual authenticated
+reference directory and every original phase; canonical required gold remains
+mandatory. Selection must be a proper subset containing `EMBEDDING` and
+`LM_HEAD`. The same immutable keys control captured nodes, snapshot memory
+admission and comparisons; complete original source, teachers, arithmetic and
+serving capture geometry are retained. Campaign-marked execution rejects this
+scope. It cannot certify complete checkpoint coverage even if GTest passes.
+
+Each shard publishes `history_replay_observation_scope.json` with full,
+selected and missing coverage, plus descriptor/source/reference identities.
+The existing snapshot export retains selected values and every actual terminal
+LM row without truncation. Join observations only when those identities and
+terminal rows agree; an absent row, incompatible shard or incomplete coverage
+must remain explicit. Ordinary histories without this field keep full capture
+and comparison behavior.
+
 Every child validates the typed model mapping and inexpensive reference-pack
 descriptor, then lets full checkpoint parity prove the weight contents. No
 child rereads the model merely to hash it. Qwen2/Qwen3 use

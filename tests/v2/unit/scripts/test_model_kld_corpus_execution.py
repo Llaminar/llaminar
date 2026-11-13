@@ -337,6 +337,40 @@ class CorpusExecutionTests(unittest.TestCase):
             self.assertEqual(runner.original_local_launch(args,one,None,root,original,{'PATH':str(root)}),(original,{},None))
             self.assertEqual(runner.original_local_launch(args,None,{'fixture_image':True},root,original,{'PATH':str(root)}),(original,{},None))
 
+    def test_authored_one_rank_preserves_existing_guardian_protocol_and_pins(self):
+        """One-rank affinity retains the same MPI guardian and strict ownership."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            rankfile=root/'rankfile';rankfile.write_text('rank 0=localhost slot=28-55\n')
+            for name in ('llaminar_mpi_session','mpirun'):
+                path=root/name;path.write_text('fixture-not-executed');path.chmod(0o700)
+            args=SimpleNamespace(binary=root/'observer',mpi_rankfile=rankfile)
+            native=[str(args.binary),'--workload','fixture','--','--mpi-procs','1']
+            for world in (1,2,3):
+                with self.subTest(world=world):
+                    output=root/str(world);output.mkdir()
+                    owner=SimpleNamespace(topology={'expected_config':{'configuration':{'mpi_procs':world}}})
+                    command,pins,proof=runner.original_local_launch(
+                        args,owner,None,output,native,{'PATH':str(root)},prepare_session=False)
+                    self.assertEqual(command,[str(root/'llaminar_mpi_session'),
+                        '--session-base',str(output/'mpi-session'),'--',str(root/'mpirun'),
+                        '-np',str(world),'--rankfile',str(rankfile),'--bind-to','core',
+                        '--report-bindings','--mca','mpi_leave_pinned','1',
+                        '--mca','orte_allowed_exit_without_sync','1','--',*native])
+                    self.assertFalse((output/'mpi-session').exists())
+                    self.assertEqual(proof['world_size'],world)
+                    self.assertEqual(proof['overlap_policy'],'strict')
+                    self.assertEqual(set(pins),{str(rankfile),str(root/'llaminar_mpi_session'),str(root/'mpirun')})
+                    runner.unchanged(pins)
+                    # Each authored input remains independently pinned through retirement.
+                    for name in ('rankfile','llaminar_mpi_session','mpirun'):
+                        path=root/name;before=path.read_text();path.write_text(before+'changed')
+                        with self.assertRaises(ValueError):runner.unchanged(pins)
+                        path.write_text(before)
+                        # Restoring bytes does not restore stat identity; refresh only
+                        # the fixture's next independent input check.
+                        pins={str(p):runner.identity(p) for p in (rankfile,root/'llaminar_mpi_session',root/'mpirun')}
+
     def test_rankfile_missing_scope_and_launcher_fail_before_native_execution(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);rankfile=root/'rankfile';rankfile.write_text('fixture')
@@ -346,8 +380,11 @@ class CorpusExecutionTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError,'requires an explicit'):call()
             args.mpi_rankfile=rankfile
             with self.assertRaisesRegex(ValueError,'local declared'):call({'fixture_image':True})
-            a.topology['expected_config']['configuration']['mpi_procs']=1
-            with self.assertRaisesRegex(ValueError,'local declared'):call()
+            a.topology['expected_config']['configuration']['mpi_procs']=0
+            with self.assertRaisesRegex(ValueError,'positive-world'):call()
+            for invalid in (-1, True, 1.5, '1', None):
+                a.topology['expected_config']['configuration']['mpi_procs']=invalid
+                with self.subTest(world=invalid), self.assertRaisesRegex(ValueError,'MPI population'):call()
             a.topology['expected_config']['configuration']['mpi_procs']=3
             with self.assertRaises(OSError):call() # No original session launcher; no alternate search.
             self.assertFalse((root/'mpi-session').exists())

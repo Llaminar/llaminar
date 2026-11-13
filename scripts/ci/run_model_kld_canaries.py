@@ -117,26 +117,29 @@ def retire(process,container):
 
 
 def original_local_launch(args, adapter, image, output, native_command, environment, *, prepare_session=True):
-    """Select only the existing direct launch or explicitly authored original MPI launch.
+    """Select the existing direct launch or an explicitly authored MPI rankfile launch.
 
     The typed corpus config owns MPI population. MPI and production inventory
     own rankfile/NUMA meaning; this function never parses or replans affinity.
+    An authored one-rank mapping uses the same MPI guardian as larger worlds;
+    only an implicit one-rank launch may bypass that mapping.
     Every launch input remains pinned through original process retirement.
     A caller with the existing benchmark guardian leaves directory creation
     to that guardian by passing prepare_session=False.
     """
     rankfile=getattr(args,'mpi_rankfile',None)
-    world=1
+    world=1;configured_world=0
     if adapter is not None:
         configuration=adapter.topology['expected_config']['configuration']
         world=configuration.get('mpi_procs',0)
         require(type(world) is int and world>=0,'Invalid original configured MPI population')
+        configured_world=world
         world=max(1,world)
     if rankfile is None:
         require(world==1,'Distributed observer requires an explicit --mpi-rankfile')
         return native_command,{},None
-    require(image is None and args.binary is not None and adapter is not None and world>1,
-            'Explicit MPI rankfile requires a local declared distributed corpus observer')
+    require(image is None and args.binary is not None and adapter is not None and configured_world>0,
+            'Explicit MPI rankfile requires a local declared positive-world corpus observer')
     rankfile=Path(rankfile).resolve(strict=True)
     require(rankfile.is_file(),'MPI rankfile is not a regular file')
     launcher=(args.binary.parent/'llaminar_mpi_session').resolve(strict=True)
@@ -488,7 +491,7 @@ def main(argv=None):
         help='Bind the exact paired cell to its completed original-rank numerical artifacts')
     parser.add_argument('--corpus-catalog',type=Path,help='Explicit approved schema2 corpus; local diagnostics only')
     parser.add_argument('--corpus-manifest',type=Path,help='Explicit catalog-bound v2 metadata; references remain inside --corpus-root')
-    parser.add_argument('--mpi-rankfile',type=Path,help='Original MPI rankfile for a declared local distributed observer')
+    parser.add_argument('--mpi-rankfile',type=Path,help='Authored MPI rankfile for a declared local observer, including one rank')
     parser.add_argument('--topology-id',action='append',help='Repeat declared corpus topology IDs; omission selects its complete inventory')
     parser.add_argument('--baseline-report',type=Path)
     parser.add_argument('--baseline-approval',type=Path)
@@ -508,7 +511,7 @@ def main(argv=None):
             'Observed pipeline artifacts require one exact local paired cell')
     require(args.mpi_rankfile is None or (args.binary is not None and
             (args.corpus_catalog is not None or args.paired_observed_pipeline_artifacts is not None)),
-            'MPI rankfile requires a local distributed corpus diagnostic')
+            'MPI rankfile requires a local authored-rankfile corpus diagnostic')
     require(args.paired_observed_pipeline_artifacts is None or args.mpi_rankfile is not None,
             'Observed pipeline pairing requires the original discovery MPI rankfile')
     if args.paired_cell is not None:

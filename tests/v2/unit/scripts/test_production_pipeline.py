@@ -2131,6 +2131,65 @@ class BenchmarkPolicyTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'unsupported passive initial-bank compute/phase'):
             benchmark.validate_declared_passive_evidence(bad)
 
+    def test_declared_passive_socket_ordinals_preserve_global_expert_owners(self):
+        """CPU socket ordinals are not native DeviceId ordinals; global owners distinguish banks."""
+        for sockets in (1,2,4,8):
+            for compute in ('Apportioned','TensorSharded'):
+                with self.subTest(sockets=sockets,compute=compute):
+                    data=self._initial_bank_fixture()
+                    domain=data['runtime_configuration']['configuration']['moe_routed_expert_plan']['domains'][1]
+                    domain.update(participants=[dict(device_type='CPU',device_ordinal=i,numa_node=i)
+                                                for i in range(sockets)],routed_compute_policy=compute)
+                    records=data['perf_stats']['records']
+                    templates=[row for row in records if row['domain']=='moe_placement' and row['tags']['tier']=='1']
+                    records[:]=[row for row in records if row not in templates]
+                    for template in templates:
+                        for socket in range(sockets):
+                            row=copy.deepcopy(template)
+                            row['tags'].update(participant=str(2+socket),tier_participant_count=str(sockets))
+                            row['value']=256 if compute=='TensorSharded' else 256//sockets
+                            records.append(row)
+                    self.assertTrue(benchmark.validate_declared_passive_evidence(data)['adaptive'])
+                    for mutation in ('missing','duplicate','foreign','population'):
+                        bad=copy.deepcopy(data);banks=bad['perf_stats']['records']
+                        row=next(x for x in banks if x['domain']=='moe_placement' and x['tags']['tier']=='1')
+                        if mutation=='missing':banks.remove(row)
+                        if mutation=='duplicate':banks.append(copy.deepcopy(row))
+                        if mutation=='foreign':row['tags']['participant']=str(sockets+2)
+                        if mutation=='population':row['value']+=1
+                        with self.subTest(mutation=mutation),self.assertRaises(ValueError):
+                            benchmark.validate_declared_passive_evidence(bad)
+
+    def test_declared_passive_gateup_initial_banks_preserve_exact_movable_ownership(self):
+        """Gate/up IDs partition once; fixed down columns are not resident duplicates."""
+        for population in (0, 128):
+            data=self._initial_bank_fixture()
+            plan=data['runtime_configuration']['configuration']['moe_routed_expert_plan']
+            plan['domains'][0].update(routed_compute_policy='GateUpOwnedDownColumns',routed_phase_policy='Uniform')
+            plan['routed_tiers'][0]['resolved_live_experts_per_layer']=[population,population]
+            banks=[x for x in data['perf_stats']['records'] if x['domain']=='moe_placement' and x['tags']['tier']=='0']
+            for bank in banks:bank['value']=population//2
+            with self.subTest(population=population):
+                self.assertTrue(benchmark.validate_declared_passive_evidence(data)['adaptive'])
+                for mutation in ('partial','duplicate','population','foreign_member','unfrozen','phase','unknown_policy'):
+                    bad=copy.deepcopy(data)
+                    bad_plan=bad['runtime_configuration']['configuration']['moe_routed_expert_plan']
+                    row=next(x for x in bad['perf_stats']['records'] if x['domain']=='moe_placement')
+                    if mutation=='partial':bad['perf_stats']['records'].remove(row)
+                    if mutation=='duplicate':bad['perf_stats']['records'].append(copy.deepcopy(row))
+                    if mutation=='population':row['value']+=1
+                    if mutation=='foreign_member':row['tags']['participant']='99'
+                    if mutation=='unfrozen':row['tags']['frozen_owner_map_match']='false'
+                    if mutation=='phase':bad_plan['domains'][0]['routed_phase_policy']='PrefillApportionedDecodeReplicated'
+                    if mutation=='unknown_policy':bad_plan['domains'][0]['routed_compute_policy']='UnknownGateUp'
+                    with self.subTest(mutation=mutation),self.assertRaises(ValueError):
+                        benchmark.validate_declared_passive_evidence(bad)
+                if population:
+                    bad=copy.deepcopy(data)
+                    for row in bad['perf_stats']['records']:
+                        if row['domain']=='moe_placement' and row['tags']['tier']=='0':row['value']=population
+                    with self.assertRaises(ValueError):benchmark.validate_declared_passive_evidence(bad)
+
     def test_declared_passive_noncoordinator_terminal_is_exact_original_zero_tuple(self):
         """An original non-source controller can publish no source work, never invented traffic."""
         data=self._passive_lookup_fixture(shared=True)
@@ -5162,6 +5221,9 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn("patches/rocm-hip-graph-kernarg-metadata.patch", toolchain)
         self.assertIn("patches/rocm-hip-preferred-queue-unshared.patch", toolchain)
         self.assertIn("patches/rocm-hip-timed-sdma-marker.patch", toolchain)
+        self.assertIn("patches/rocm-hip-capture-retirement-membership.patch", toolchain)
+        self.assertIn("scripts/docker/hip-end-capture/proof.py", toolchain)
+        self.assertIn("scripts/docker/hip-end-capture/end-capture-contract.cpp.in", toolchain)
         self.assertIn("scripts/docker/hip-preferred-queue/proof.py", toolchain)
         self.assertIn("scripts/docker/hip-preferred-queue/selector-contract.cpp.in", toolchain)
         # These graph backports and the native-stack/SDMA-sharing repairs are upstream.
@@ -5243,6 +5305,7 @@ class InfrastructureTests(unittest.TestCase):
                 ROOT / "scripts/docker/patches/rocm-hip-graph-kernarg-metadata.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-preferred-queue-unshared.patch",
                 ROOT / "scripts/docker/patches/rocm-hip-timed-sdma-marker.patch",
+                ROOT / "scripts/docker/patches/rocm-hip-capture-retirement-membership.patch",
             )
             parts = [pins[key] for key in ("LLAMINAR_ROCM_VERSION", "LLAMINAR_ROCM_DEB_VERSION",
                      "LLAMINAR_ROCM_SYSTEMS_REVISION", "LLAMINAR_HIP_LIBRARY_VERSION")]

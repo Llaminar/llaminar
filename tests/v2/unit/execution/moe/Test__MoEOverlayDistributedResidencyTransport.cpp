@@ -7,6 +7,8 @@
  * are exchanged, physical-stage failure aborts before a peer-dependent vote, and no peer is stranded in a
  * different phase, that a deferred transaction can be retried unchanged, and
  * that no local old bank retires before every rank reaches its lease fence.
+ * Lifecycle summaries retain bounded keys and ordered epoch evidence, while
+ * retirement validation keeps each exact original epoch/rank proof.
  * Recorded measurement metadata also survives wrapper drain by its original
  * owner; this lifecycle check grants no physical measurement or source permit.
  */
@@ -14,6 +16,8 @@
 #include "execution/moe/MoEOverlayDistributedResidencyTransport.h"
 #include "execution/moe/MoEOverlayMigrationEvidenceContext.h"
 #include "execution/moe/ExpertTierWeightStream.h"
+
+#include "utils/PerfStatsCollector.h"
 
 #include <gtest/gtest.h>
 
@@ -24,6 +28,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -799,6 +804,123 @@ namespace llaminar2::test
             }
         }
     } // namespace
+
+    /** @test Repeated original transport lifecycles keep summary keys bounded and retirement epochs exact. */
+    TEST(Test__MoEOverlayDistributedResidencyTransport,
+         LifecycleSummariesRetainBoundedKeysAndExactRetirementProof)
+    {
+        /** @brief Restore both collector controls even after a fatal assertion. */
+        struct RestoreEnvironment {
+            std::optional<std::string> json, filter;
+            /** @brief Observe the inherited collection policy before the test changes it. */
+            RestoreEnvironment() {
+                if (const char *v = std::getenv("LLAMINAR_PERF_STATS_JSON")) json = v;
+                if (const char *v = std::getenv("LLAMINAR_PERF_STATS_FILTER")) filter = v;
+            }
+            /** @brief Restore exact values and reject failed environment restoration. */
+            ~RestoreEnvironment() {
+                const auto restore = [](const char *name, const std::optional<std::string> &value) {
+                    EXPECT_EQ(value ? setenv(name, value->c_str(), 1) : unsetenv(name), 0);
+                };
+                restore("LLAMINAR_PERF_STATS_JSON", json);
+                restore("LLAMINAR_PERF_STATS_FILTER", filter);
+                PerfStatsCollector::reset();
+            }
+        } restore;
+        ASSERT_EQ(setenv("LLAMINAR_PERF_STATS_JSON", "1", 1), 0);
+        ASSERT_EQ(setenv("LLAMINAR_PERF_STATS_FILTER", "moe_overlay_residency", 1), 0);
+        PerfStatsCollector::reset();
+        std::vector<std::uint64_t> expected_words;
+        std::set<std::pair<std::string, std::string>> expected_retirements;
+        std::vector<TransactionFixture> authorities;
+        for (int rank = 0; rank < 3; ++rank)
+            authorities.push_back(makeTransaction());
+        DistributedTransportFixture distributed;
+        for (std::uint64_t epoch = 1; epoch <= 20; ++epoch)
+        {
+            // The original root authority authors every epoch. Drive demand
+            // toward its current cold tier so each next proposal really moves
+            // experts; followers adopt its unchanged authenticated document.
+            if (epoch > 1)
+            {
+                std::vector<std::uint64_t> counts(6, 1);
+                for (const auto &owner : authorities[0].authority->snapshot()->placementOwnerMap().owners())
+                    if (owner.tier_idx == 2)
+                        counts.at(static_cast<std::size_t>(owner.expert_id)) =
+                            std::uint64_t{1} << (epoch + 10);
+                authorities[0].histogram->mergeLayerCounts(0, counts.data(), 6, false);
+                authorities[0].transaction = authorities[0].authority->proposeFromHistogram();
+            }
+            const auto &original = authorities[0].transaction;
+            ASSERT_TRUE(original.valid());
+            ASSERT_FALSE(original.empty());
+            ASSERT_EQ(original.expected_epoch, epoch);
+            const auto plan = authorities[0].authority->exportAuthoritativeResidencyPlan(original);
+            for (int rank = 1; rank < 3; ++rank)
+                authorities[rank].transaction =
+                    authorities[rank].authority->adoptAuthoritativeResidencyPlan(plan);
+            expected_words.insert(expected_words.end(), {epoch, epoch + 1});
+            for (int rank = 0; rank < 3; ++rank)
+            {
+                expected_retirements.emplace(std::to_string(epoch + 1), std::to_string(rank));
+                ASSERT_EQ(authorities[rank].authority->beginApply(
+                    authorities[rank].transaction, *distributed.transports[rank]).status,
+                    MoEOverlayResidencyApplyStatus::Started);
+            }
+            // Original authorities own publication and old-bank retirement;
+            // polling only supplies independent rank progress to real wrappers.
+            bool idle = false;
+            for (int pass = 0; pass < 128 && !idle; ++pass)
+            {
+                idle = true;
+                for (auto &fixture : authorities)
+                {
+                    const auto result = fixture.authority->advanceBackground();
+                    idle = idle && result.status == MoEOverlayResidencyApplyStatus::Idle;
+                }
+            }
+            ASSERT_TRUE(idle);
+            for (const auto &fixture : authorities)
+            {
+                EXPECT_EQ(fixture.authority->snapshot()->epoch, epoch + 1);
+                EXPECT_EQ(fixture.authority->pendingRetirementCount(), 0u);
+            }
+        }
+        const auto records = PerfStatsCollector::snapshot({"moe_overlay_residency"});
+        std::size_t summaries = 0, exact = 0;
+        std::set<std::string> summary_ranks;
+        std::set<std::pair<std::string, std::string>> actual_retirements;
+        for (const auto &record : records)
+        {
+            if (record.name == "distributed_reservation_ready")
+            {
+                ++summaries;
+                EXPECT_EQ(record.count, 20u);
+                EXPECT_DOUBLE_EQ(record.value, 20.0);
+                EXPECT_TRUE(PerfStatsCollector::matchesCounterSequence(record, expected_words, 2));
+                EXPECT_TRUE(summary_ranks.insert(record.tags.at("world_rank")).second);
+                EXPECT_FALSE(record.tags.contains("expected_epoch"));
+                EXPECT_FALSE(record.tags.contains("candidate_epoch"));
+            }
+            if (record.name == "distributed_retirement_consensus_ready")
+            {
+                ++exact;
+                EXPECT_EQ(record.count, 1u);
+                ASSERT_TRUE(record.tags.contains("expected_epoch"));
+                ASSERT_TRUE(record.tags.contains("candidate_epoch"));
+                ASSERT_TRUE(record.tags.contains("world_rank"));
+                EXPECT_EQ(std::stoull(record.tags.at("candidate_epoch")),
+                          std::stoull(record.tags.at("expected_epoch")) + 1);
+                EXPECT_TRUE(actual_retirements.emplace(record.tags.at("candidate_epoch"),
+                                                       record.tags.at("world_rank")).second);
+                EXPECT_EQ(record.tags.at("world_size"), "3");
+            }
+        }
+        EXPECT_EQ(summaries, 3u);
+        EXPECT_EQ(exact, 60u);
+        EXPECT_EQ(summary_ranks, (std::set<std::string>{"0", "1", "2"}));
+        EXPECT_EQ(actual_retirements, expected_retirements);
+    }
 
     TEST(
         Test__MoEOverlayDistributedResidencyTransport,

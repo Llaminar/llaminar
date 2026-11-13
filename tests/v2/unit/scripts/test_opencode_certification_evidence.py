@@ -109,6 +109,49 @@ class OpenCodeCertificationEvidenceTests(unittest.TestCase):
             with self.subTest(field=field), self.assertRaises(ValueError):
                 validate(report)
 
+    def test_reply_reserve_requires_explicit_owner_and_exact_session_policy(self):
+        """A local reserve choice cannot silently weaken the unchanged CI workload."""
+        report = finished_report()
+        report['context_length'] = 47168
+        report['reply_reserve_tokens'] = 16384
+        policy = {'reply_reserve_tokens': 16384,
+                  'model_limit': {'context': 47168, 'input': 47168, 'output': 32768},
+                  'compaction': {'reserved': 16384}, 'input_budget_tokens': 30784}
+        report['results'][0]['client_context_policy'] = policy
+        kwargs = {'model': 'Qwen-fixture', 'context_tokens': 47168}
+        with self.assertRaises(ValueError):
+            validate_app_report(report, **kwargs)
+        accepted = validate_app_report(report, **kwargs, reply_reserve_tokens=16384)
+        self.assertTrue(accepted['gate_passed'])
+        self.assertEqual(accepted['output_tokens'], 32768)
+        self.assertEqual(accepted['reply_reserve_tokens'], 16384)
+        for replacement in (None, {}, {**policy, 'input_budget_tokens': 32000},
+                            {**policy, 'model_limit': {'context': 47168, 'output': 32768}},
+                            {**policy, 'compaction': {'reserved': 32000}},
+                            {**policy, 'model_limit': {**policy['model_limit'], 'output': 16384}}):
+            changed = deepcopy(report)
+            changed['results'][0]['client_context_policy'] = replacement
+            with self.subTest(policy=replacement), self.assertRaises(ValueError):
+                validate_app_report(changed, **kwargs, reply_reserve_tokens=16384)
+        for reserve in (None, 16384.0, True, 8192):
+            changed = deepcopy(report)
+            changed['reply_reserve_tokens'] = reserve
+            with self.subTest(reserve=reserve), self.assertRaises(ValueError):
+                validate_app_report(changed, **kwargs, reply_reserve_tokens=16384)
+
+    def test_reported_default_context_policy_cannot_change_budget(self):
+        """New default receipts prove exact policy while old default reports stay readable."""
+        report = finished_report()
+        self.assertTrue(validate(report)['gate_passed'])
+        policy = {'reply_reserve_tokens': None,
+                  'model_limit': {'context': 131072, 'output': 32768},
+                  'compaction': None, 'input_budget_tokens': None}
+        report['results'][0]['client_context_policy'] = policy
+        self.assertTrue(validate(report)['gate_passed'])
+        report['results'][0]['client_context_policy'] = {**policy, 'compaction': {'reserved': 16384}}
+        with self.assertRaises(ValueError):
+            validate(report)
+
     def test_tool_and_request_counts_require_actual_unique_identities(self):
         changes = [lambda r: r.update(request_count=r['request_count'] + 1),
                    lambda r: r.update(tool_attempts=1000),

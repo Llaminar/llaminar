@@ -92,6 +92,9 @@ namespace llaminar2
         GDNRecurrenceStateLayout recurrence_layout =
             GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Immutable clique format.
 
+        /** @return Exact source shape and physical layout equality for immutable planning inputs. */
+        bool operator==(const GDNLinkedLiveStateGeometry &) const = default;
+
         /**
          * @brief Participant-invariant cold clique identity, without rank-local names or pointers.
          * @param global_layer Common model layer owning this handoff.

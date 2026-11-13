@@ -42,9 +42,10 @@ struct NativeContextPreparationReplayAccess {
     static std::shared_ptr<NativeContextPreparation> source(DeviceId device,std::span<const PhysicalMemoryResource> observed,NativePhysicalLifetime lifetime=NativePhysicalLifetime::ContextGeneration){
         const std::array devices{device};return source<Worker>(std::span<const DeviceId>{devices},observed,lifetime);
     }
-    /** @brief Declare multiple recorded original workers in one canonical source without creating foreign authorities. */
+    /** @brief Declare recorded workers in one original source.
+     * @param installed_family_budget Use installed byte limits while retaining the explicit recorded test lifetime; no native qualification is claimed. */
     template<class Worker>
-    static std::shared_ptr<NativeContextPreparation> source(std::span<const DeviceId> devices,std::span<const PhysicalMemoryResource> observed,NativePhysicalLifetime lifetime=NativePhysicalLifetime::ContextGeneration){
+    static std::shared_ptr<NativeContextPreparation> source(std::span<const DeviceId> devices,std::span<const PhysicalMemoryResource> observed,NativePhysicalLifetime lifetime=NativePhysicalLifetime::ContextGeneration,bool installed_family_budget=false){
         if(devices.empty())throw std::invalid_argument("Recorded source population is empty");
         for(std::size_t i=0;i<devices.size();++i)if(!devices[i].is_gpu() || std::find(devices.begin(),devices.begin()+i,devices[i])!=devices.begin()+i)
             throw std::invalid_argument("Recorded source population has repeated or invalid workers");
@@ -58,7 +59,9 @@ struct NativeContextPreparationReplayAccess {
         key.visible_device_count=1;key.compute_units=80;key.native_wave_width=device.is_cuda()?32:64;key.runtime_policy_sha256=std::string(64,'a');key.hsa_sha256=device.is_rocm()?std::string(64,'b'):std::string{};key.worker_stack_bytes=program.stackBytes();key.worker_guard_bytes=program.guardBytes();
         key.context_object_bytes=sizeof(Worker);key.context_object_alignment=alignof(Worker);
         key.primary_streams=key.primary_blas_handles=key.secondary_blas_handles=1;key.dependency_events=32;
-        NativeContextOpaqueContract contract(key,4096,8192,std::string(64,'b'),lifetime);
+        if(installed_family_budget)key.population=NativeContextBirthPopulation::AdditionalContext;
+        const auto budget=installed_family_budget?std::optional{NativeContextOpaqueCatalog::planningBudget(device.type,key.population)}:std::nullopt;
+        NativeContextOpaqueContract contract(key,budget?budget->hostUpperBytes():4096,budget?budget->deviceUpperBytes():8192,std::string(64,'b'),lifetime);
         result->births_.push_back(std::shared_ptr<PreparedGPUContextBirth>(new PreparedGPUContextBirth(result->source_,contract,program)));
         }
         return result;

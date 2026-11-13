@@ -10,6 +10,7 @@
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/PreparedWeightPhysicalUses.h"
 #include "planning/ModelMemoryProfile.h"
+#include "planning/PlanningModelMetadata.h"
 #include "planning/WeightShardGeometry.h"
 #include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
 #include "loaders/PreparedWeightIdentityContract.h"
@@ -40,6 +41,10 @@
 
 namespace llaminar2
 {
+    PlanningWeightSourcePolicy PlanningWeightSourcePolicy::current() {
+        return {{},debugEnv().gemm.gdn_projection_arithmetic,debugEnv().gemm.moe_router_arithmetic};
+    }
+
     namespace
     {
         struct NativeBlockLayout
@@ -384,21 +389,21 @@ namespace llaminar2
         const DeviceWeightResidency &residency,
         const std::optional<DeviceShardingAssignment>
             &tensor_parallel_assignment,
-        WeightComponentScope components, CPUStoragePlacement native_source_placement)
+        WeightComponentScope components, CPUStoragePlacement native_source_placement,PlanningWeightSourcePolicy source_policy)
     {
         return estimateImpl(profile, device, shard_index, total_shards, first_layer, last_layer, residency,
-            tensor_parallel_assignment, components, nullptr, PreparedWeightUseIntent::PublishCreator, native_source_placement);
+            tensor_parallel_assignment, components, nullptr, PreparedWeightUseIntent::PublishCreator, native_source_placement,source_policy);
     }
 
     WeightEstimate WeightMemoryEstimator::estimatePhysical(PreparedWeightPhysicalUses &uses,
         PreparedWeightUseIntent intent, const ModelMemoryProfile &profile, DeviceId device,
         int shard_index, int total_shards, int first_layer, int last_layer,
         const DeviceWeightResidency &residency,
-        const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment, WeightComponentScope components, CPUStoragePlacement native_source_placement)
+        const std::optional<DeviceShardingAssignment> &tensor_parallel_assignment, WeightComponentScope components, CPUStoragePlacement native_source_placement,PlanningWeightSourcePolicy source_policy)
     {
         uses.requireScope(profile, device, components);
         return estimateImpl(profile, device, shard_index, total_shards, first_layer, last_layer, residency,
-            tensor_parallel_assignment, components, &uses, intent, native_source_placement);
+            tensor_parallel_assignment, components, &uses, intent, native_source_placement,source_policy);
     }
 
     WeightEstimate WeightMemoryEstimator::estimateImpl(
@@ -412,8 +417,14 @@ namespace llaminar2
         const std::optional<DeviceShardingAssignment>
             &tensor_parallel_assignment,
         WeightComponentScope components, PreparedWeightPhysicalUses *uses, PreparedWeightUseIntent intent,
-        CPUStoragePlacement native_source_placement)
+        CPUStoragePlacement native_source_placement,const PlanningWeightSourcePolicy &source_policy)
     {
+        if(source_policy.source_tensor_index)source_policy.source_tensor_index->requireProfile(profile);
+        const auto sourceRole=[&](const TensorSizeInfo &tensor) {
+            if(source_policy.source_tensor_index)
+                if(const auto role=source_policy.source_tensor_index->roleForOriginal(tensor))return *role;
+            return inferWeightRole(tensor.name);
+        };
         if (total_shards <= 0 || shard_index < 0 ||
             shard_index >= total_shards)
         {
@@ -454,7 +465,10 @@ namespace llaminar2
         WeightEstimate est;
         const WeightShardGeometryResolver geometry_resolver(
             profile, device, shard_index, total_shards, tensor_parallel_assignment);
-        const bool has_explicit_lm_head = std::any_of(
+        // A sealed canonical head proves presence without rescanning the source.
+        // Keep the legacy predicate for aliases not classified as LMHead.
+        const bool has_explicit_lm_head = (source_policy.source_tensor_index &&
+            source_policy.source_tensor_index->firstTensorWithRole(WeightRole::LMHead).has_value()) || std::any_of(
             profile.tensors.begin(),
             profile.tensors.end(),
             [](const TensorSizeInfo &tensor)
@@ -468,9 +482,10 @@ namespace llaminar2
         // head sharding when it differs from embedding sharding.
         const auto accumulate = [&](const TensorSizeInfo &t, bool count_native)
         {
+            const WeightRole role = sourceRole(t);
             // Native ngram capacity belongs to one CPU row-store owner, never
             // to each participant's prepared matrix/embedding representation.
-            if (inferWeightRole(t.name) == WeightRole::ImmutableRowTable) return;
+            if (role == WeightRole::ImmutableRowTable) return;
             // Filter by PP layer range
             if (t.layer_index >= 0)
             {
@@ -496,13 +511,22 @@ namespace llaminar2
                     return;
             }
 
-            const auto geometry = routed_expert_tensor && residency.projectionOwnership()
+            const auto geometry = [&] {
+                if(source_policy.source_tensor_index)
+                    if(const auto view=source_policy.source_tensor_index->classifyOriginal(t)) {
+                        if(routed_expert_tensor&&residency.projectionOwnership())return geometry_resolver.resolve(*view,*residency.projectionOwnership(),
+                            static_cast<size_t>(selected_routed_experts));
+                        return geometry_resolver.resolve(*view,routed_expert_tensor&&residency.selectsRoutedExperts()
+                            ?std::optional<size_t>(static_cast<size_t>(selected_routed_experts)):std::nullopt);
+                    }
+                return routed_expert_tensor && residency.projectionOwnership()
                 ? geometry_resolver.resolve(t, *residency.projectionOwnership(),
                     static_cast<size_t>(selected_routed_experts))
                 : geometry_resolver.resolve(t,
                     routed_expert_tensor && residency.selectsRoutedExperts()
                         ? std::optional<size_t>(static_cast<size_t>(selected_routed_experts))
                         : std::nullopt);
+            }();
             const size_t selected_elements = geometry.elements();
             if (selected_elements == 0)
                 return;
@@ -514,17 +538,16 @@ namespace llaminar2
 
             // Compute the exact runtime representation selected by loading.
             size_t device_size;
-            const WeightRole role = inferWeightRole(t.name);
             const auto prepared_representation =
                 PreparedWeightRepresentationContract::resolve(
                     role, std::string_view(t.quant_type), t.name, profile.architecture,
-                    debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic);
+                    source_policy.gdn_projection_arithmetic, source_policy.moe_router_arithmetic);
             if (device.is_cpu())
             {
                 const auto type = tensorTypeFromName(t.quant_type);
                 if (!type) throw std::invalid_argument("CPU final weight estimate has unknown original source format: " + t.quant_type);
                 const auto operand = PreparedWeightRepresentationContract::operandPrecision(role,t.name,profile.architecture,
-                    debugEnv().gemm.gdn_projection_arithmetic,debugEnv().gemm.moe_router_arithmetic);
+                    source_policy.gdn_projection_arithmetic,source_policy.moe_router_arithmetic);
                 const auto precision = PreparedWeightRepresentationContract::resolveCPUWeightPrecision(
                     role,*type,WeightPrecision::NATIVE,prepared_representation,operand);
                 TensorType final_type=*type;
@@ -658,10 +681,9 @@ namespace llaminar2
             est.device_bytes += device_size;
         };
 
-        for (const auto &t : profile.tensors)
-        {
+        const auto addTensor=[&](const TensorSizeInfo &t) {
             if (t.layer_index < 0 && components == WeightComponentScope::LayersOnly)
-                continue;
+                return;
             if (isEmbeddingTensor(t.name))
             {
                 if (owns_embedding)
@@ -683,13 +705,19 @@ namespace llaminar2
                         (*original_type==TensorType::FP32 || *original_type==TensorType::FP16 || *original_type==TensorType::BF16))
                         est.device_bytes = before;
                 }
-                continue;
+                return;
             }
             if (!owns_terminal &&
-                (isLMHeadTensor(t.name) || inferWeightRole(t.name) == WeightRole::OutputNorm))
-                continue;
+                (isLMHeadTensor(t.name) || sourceRole(t) == WeightRole::OutputNorm))
+                return;
             accumulate(t, true);
-        }
+        };
+
+        if(source_policy.source_tensor_index) {
+            for(const auto index:source_policy.source_tensor_index->globalTensorIndices())addTensor(profile.tensors[index]);
+            source_policy.source_tensor_index->forEachLayerTensor(std::max(0,first_layer),last_layer,
+                [&](size_t index){addTensor(profile.tensors[index]);});
+        } else for(const auto &tensor:profile.tensors)addTensor(tensor);
 
         return est;
     }

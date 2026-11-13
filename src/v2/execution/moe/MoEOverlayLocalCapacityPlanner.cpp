@@ -20,6 +20,7 @@
  * source and PMA handoff. Global topology remains immutable metadata; remote
  * execution, activation transport and model-context reuse are not impersonated.
  */
+#include "planning/PlanningMemoryQuoteReuse.h"
 #include "execution/local_execution/graph/PreparedFollowerCaptureTerminals.h"
 
 #include "MoEOverlayLocalCapacityPlanner.h"
@@ -1171,11 +1172,14 @@ namespace llaminar2
          * @param input Exact source policy retained during the common transaction.
          * @param prepared Validated stage device/channel ownership.
          * @param fixed_memory This stage's distinct MemoryPlanner contribution.
+         * @param quote_original_process_pool Whether this group first owns the original native CPU process pool.
+         * @param quoted_native_contexts Already contributed physical birth identities across this shared group.
          * @return Bound fixed contribution consumed by joint expert admission.
          */
         MoEOverlayLocalCapacityPlannerResult completeFixedOwners(
             const MoEOverlayLocalCapacityPlannerInput &input,
-            PreparedLocalCapacity prepared, MemoryPlan fixed_memory,bool quote_original_process_pool)
+            PreparedLocalCapacity prepared, MemoryPlan fixed_memory,bool quote_original_process_pool,
+            std::set<std::pair<int,DeviceId>>& quoted_native_contexts)
         {
             const auto &profile = *input.model_profile;
             const auto &rank_plan = *input.rank_plan;
@@ -1199,10 +1203,13 @@ namespace llaminar2
             for (const auto &device_plan : result.fixed_memory_plan.devices)
             {
                 resource_devices.insert(device_plan.device());
-                // Automatic admission revisits this geometry for many candidates.
-                // Keep participant details at TRACE; the selected orchestration
-                // reports lifecycle summaries through its owning runner.
-                LOG_TRACE(
+                // Admission can reject a row before a completed physical plan
+                // exists. Keep its original per-owner contribution available at
+                // DEBUG in optimized builds: TRACE is compiled out there, which
+                // otherwise hides Auto/Apply ownership differences behind one
+                // aggregate fixed-byte count. This cold diagnostic reads the
+                // canonical BOM only; it creates no parallel accounting ledger.
+                LOG_DEBUG(
                     "[MoEOverlayCapacity] fixed component BOM device="
                     << device_plan.device().toString()
                     << " weights=" << device_plan.weight_bytes()
@@ -1222,6 +1229,23 @@ namespace llaminar2
                     << device_plan.retained_workspace_bytes()
                     << " total=" << device_plan.total_bytes());
                 physical_plan_builder.add(device_plan.bom());
+            }
+
+            if(input.require_native_context_budgets && input.native_context_budgets.empty() &&
+                std::any_of(resource_devices.begin(),resource_devices.end(),[](DeviceId d){return d.is_gpu();}))
+                throw std::invalid_argument("Automatic admission omitted native GPU birth budget");
+            if (!input.native_context_budgets.empty()) {
+                if (rank_plan.runtime.native_context_preparation)
+                    throw std::logic_error("Native birth budget cannot duplicate its live source declaration");
+                const auto [host_total,host_available]=inventoryMemory(inventory,DeviceId::cpu());
+                const PhysicalMemoryResource host{rank_plan.rank,DeviceId::cpu(),host_total,usableMemory(host_available,DeviceId::cpu(),input)};
+                std::vector<PhysicalMemoryResource> devices;
+                for(const auto device:resource_devices)if(device.is_gpu() && quoted_native_contexts.emplace(rank_plan.rank,device).second){
+                    const auto [total,available]=inventoryMemory(inventory,device);
+                    devices.push_back({rank_plan.rank,device,total,usableMemory(available,device,input)});
+                }
+                const auto native_bom = planningNativeContextBOM(input.native_context_budgets, host, devices);
+                for (const auto& row : native_bom.resources()) physical_plan_builder.add(row);
             }
 
             const auto &overlay_plan=*input.overlay_plan;
@@ -1446,8 +1470,8 @@ namespace llaminar2
                 for (const auto device : endpoint_devices)
                 {
                     if (!device.is_gpu()) continue;
-                    const auto invocation = WorkspaceMemoryEstimator::estimatePreparedExpertService(profile,
-                        {.device = device, .device_compute_units = inventoryComputeUnits(inventory, device),
+                    const auto invocation = PlanningMemoryQuoteReuse::preparedExpertService(profile,
+                        {.source_tensor_index = PlanningMemoryQuoteReuse::sourceIndex(profile), .device = device, .device_compute_units = inventoryComputeUnits(inventory, device),
                          .resident_graph_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows,
                          .first_layer = family.first_model_layer,
                          .last_layer = family.first_model_layer + family.routedLayerCapacity() - 1,
@@ -1507,8 +1531,31 @@ namespace llaminar2
                         throw std::overflow_error("Finite epoch parent graph inventory overflows");
                     captured_inventory.auxiliary_executable_count += 2u;
                 }
-                const std::size_t captured_graph_bytes = device.is_gpu()
+                // An original source contributes birth rows for EVERY local
+                // pipeline stage. Those rows retain their source-owned bytes,
+                // but do not turn another stage's GPU into a consumer of this
+                // stage's captured model family. Only actual routed endpoints
+                // or continuation participants materialize these executables.
+                const bool owns_stage_graphs = device.is_gpu() &&
+                    (endpoint_devices.contains(device) || continuation != result.device_inputs.end());
+                const std::size_t captured_graph_bytes = owns_stage_graphs
                     ? estimateCapturedGraphExecutableBytes(device, captured_inventory) : 0u;
+                // Keep source births distinct from the retained model family:
+                // saved Apply must quote both through the same original BOM.
+                std::size_t source_graph_bytes = 0;
+                if (rank_plan.runtime.native_context_preparation)
+                    if (const auto *source = rank_plan.runtime.native_context_preparation->mandatoryBOM().find(
+                            {rank_plan.rank, device}))
+                        source_graph_bytes = source->bytes(PhysicalMemoryOwner::NativeGraphExecutable);
+                LOG_DEBUG("[MoEOverlayCapacity] captured inventory rank=" << rank_plan.rank
+                    << " device=" << device.toString()
+                    << " identities=" << captured_inventory.model_graph_identity_count
+                    << " variants=" << captured_inventory.model_graph_topology_variant_count
+                    << " auxiliary=" << captured_inventory.auxiliary_executable_count
+                    << " helpers=" << captured_inventory.bounded_helper_executable_count
+                    << " owns_stage_graphs=" << owns_stage_graphs
+                    << " overlay_graph_bytes=" << captured_graph_bytes
+                    << " source_mandatory_graph_bytes=" << source_graph_bytes);
                 if(device==DeviceId::cpu()) {
                     const auto* program=input.original_cpu_stage_program
                         ? &input.original_cpu_stage_program->nativeProgram()
@@ -1673,6 +1720,7 @@ namespace llaminar2
             std::vector<MoEOverlayLocalCapacityPlannerResult> result;
             result.reserve(inputs.size());
             bool original_process_pool_quoted=false;
+            std::set<std::pair<int,DeviceId>> quoted_native_contexts;
             for (size_t index = 0; index < inputs.size(); ++index)
             {
                 const bool has_original_program=prepared[index].cpu_joint.has_value() ||
@@ -1680,7 +1728,7 @@ namespace llaminar2
                 const bool quote_pool=has_original_program && !original_process_pool_quoted;
                 original_process_pool_quoted|=has_original_program;
                 prepared[index].device_inputs = std::move(configs[index]);
-                result.push_back(completeFixedOwners(inputs[index],std::move(prepared[index]),std::move(fixed[index]),quote_pool));
+                result.push_back(completeFixedOwners(inputs[index],std::move(prepared[index]),std::move(fixed[index]),quote_pool,quoted_native_contexts));
             }
             return result;
         }

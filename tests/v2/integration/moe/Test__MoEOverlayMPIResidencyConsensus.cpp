@@ -11,6 +11,8 @@
  * collective operations must stay inside the admitted execution membership.
  * A queued next proposal must not steal the maintenance worker from a pending
  * all-rank retirement fence; current-epoch inference remains admitted meanwhile.
+ * Completed remote telemetry must retain exact ordered changing coordinates
+ * without retaining a separate string-keyed metric for each lifetime epoch.
  */
 
 #include "../../utils/RecordedMigrationEvidence.h"
@@ -30,6 +32,8 @@
 #include "execution/moe/MoEOverlayTierMigrationTransport.h"
 #include "execution/moe/CpuExpertSlotPool.h"
 #include "utils/MPIContext.h"
+#include "utils/PerfStatsCollector.h"
+#include "execution/moe/ExpertTierTransferMeasurement.h"
 #include "../../utils/ObservedExpertDemandFixture.h"
 #include "../../utils/ActiveProgressContinuationReplayFixture.h"
 
@@ -46,6 +50,7 @@
 #include <cstdlib>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -2148,6 +2153,186 @@ namespace llaminar2::test
             EXPECT_EQ((*active)->rank(), order.front() == 0 ? discovery->rank() : 1 - discovery->rank());
             proveBidirectionalRemoteCpuProjection(*active);
         }
+    }
+
+    /**
+     * @test Real remote completions retain bounded telemetry across changing epochs.
+     *
+     * Every epoch moves the original packed CPU wire and checks its recipient
+     * image. Roles, projection and lane remain bounded topology dimensions;
+     * changing layer/expert/migration identities are verified in ordered words.
+     * This is a transport lifecycle/telemetry contract, not a model trace replay.
+     */
+    TEST(Test__MoEOverlayMPIResidencyConsensus,
+         RemoteProjectionTelemetryRetainsBoundedOrderedEpochWitness)
+    {
+        auto context = worldContext();
+        if (!requireTwoRanks(*context))
+            GTEST_SKIP() << "Remote telemetry contract requires the original two ranks";
+
+        /** Cold fixture scope; no transport operation survives its exit. */
+        struct CollectionScope final
+        {
+            std::optional<std::string> json;
+            std::optional<std::string> filter;
+            /** Enable only the original telemetry domain before creating lanes. */
+            CollectionScope()
+            {
+                if (const char *value = std::getenv("LLAMINAR_PERF_STATS_JSON")) json = value;
+                if (const char *value = std::getenv("LLAMINAR_PERF_STATS_FILTER")) filter = value;
+                if (::setenv("LLAMINAR_PERF_STATS_JSON", "1", 1) != 0 ||
+                    ::setenv("LLAMINAR_PERF_STATS_FILTER", "moe_overlay_residency", 1) != 0)
+                    throw std::runtime_error("Cannot enable original remote telemetry owner");
+                PerfStatsCollector::reset();
+            }
+            /** Clear only this isolated test epoch, then restore exact caller policy. */
+            ~CollectionScope()
+            {
+                const int json_status = json ? ::setenv("LLAMINAR_PERF_STATS_JSON", json->c_str(), 1)
+                                             : ::unsetenv("LLAMINAR_PERF_STATS_JSON");
+                const int filter_status = filter ? ::setenv("LLAMINAR_PERF_STATS_FILTER", filter->c_str(), 1)
+                                                 : ::unsetenv("LLAMINAR_PERF_STATS_FILTER");
+                if (json_status != 0 || filter_status != 0) std::terminate();
+                PerfStatsCollector::reset();
+            }
+        } collection;
+        constexpr std::size_t epochs = 64;
+        constexpr std::size_t words_per_step = 6;
+        constexpr std::size_t staging_bytes = 97;
+        constexpr std::array<const char *, 7> names{
+            "remote_projection_operations_completed",
+            "remote_projection_payload_bytes_completed",
+            "remote_projection_wall_ns",
+            "remote_projection_admission_to_dispatch_ns",
+            "remote_projection_host_work_ns",
+            "remote_projection_mpi_request_visible_ns",
+            "remote_projection_unattributed_poll_ns"};
+        // Six actual role/projection combinations, all using the original lane0.
+        std::array<std::vector<std::uint64_t>, 6> expected_words;
+        std::array<std::array<std::uint64_t, 7>, 6> expected_values{};
+        MoEOverlayMPIRemoteProjectionTransport transport({
+            .mpi_context = context,
+            .lane_budget = MoEOverlayRemoteProjectionLaneBudget::fromUniformCycles(1, 1, 1),
+            .staging_capacity_bytes = staging_bytes,
+            .perf_device = "mpi_remote_projection_bounded_telemetry_test",
+        });
+        for (std::size_t step = 0; step < epochs; ++step)
+        {
+            const auto projection = static_cast<ExpertTierWeightProjection>(step % 3u);
+            const int source_rank = static_cast<int>(step % 2u);
+            const bool source_role = context->rank() == source_rank;
+            const std::size_t group = (source_role ? 0u : 3u) + step % 3u;
+            auto identity = remoteProjectionIdentity(source_rank, 1 - source_rank, step, projection);
+            identity.expected_epoch = 100u + step;
+            identity.candidate_epoch = identity.expected_epoch + 1u;
+            identity.layer_idx = static_cast<int>(step % 4u);
+            identity.expert_id = static_cast<int>(step * 7u + 3u);
+            auto original = remoteCpuProjection(static_cast<std::uint8_t>(17u + step));
+            const auto wire = cpuLiveWireOracle(original);
+            const auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(
+                identity, original, static_cast<std::uint32_t>(staging_bytes));
+            std::vector<std::uint8_t> destination(original.native_interleaved.size(), 0xa5u);
+            const auto initial = destination;
+            const auto source_lifetime = std::make_shared<int>(19);
+            const auto destination_lifetime = std::make_shared<int>(23);
+            auto binding = localHostBinding(context->rank(), 0, identity, manifest, original,
+                destination, source_lifetime, destination_lifetime);
+            auto wave = transport.reserveWave({std::move(binding)});
+            ASSERT_EQ(wave.status, MoEOverlayResidencyStageStartStatus::Started) << wave.error;
+            ASSERT_EQ(wave.operations.size(), 1u);
+            bool ready = false;
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+            while (!ready && std::chrono::steady_clock::now() < deadline)
+            {
+                std::string error;
+                const auto progress = wave.operations.front()->poll(&error);
+                ASSERT_NE(progress, MoEOverlayResidencyWaveProgress::Failed) << error;
+                ready = progress == MoEOverlayResidencyWaveProgress::Ready;
+                std::this_thread::yield();
+            }
+            ASSERT_TRUE(ready);
+            const auto measurement = wave.operations.front()->completedMeasurement();
+            ASSERT_TRUE(measurement.has_value());
+            ASSERT_TRUE(measurement->valid());
+            ASSERT_EQ(measurement->bytes, wire.size());
+            EXPECT_EQ(destination, source_role ? initial : expectedCpuRecipientImage(original, initial));
+            auto &words = expected_words[group];
+            words.insert(words.end(), {identity.expected_epoch, identity.candidate_epoch,
+                identity.migration_index, static_cast<std::uint64_t>(identity.layer_idx),
+                static_cast<std::uint64_t>(identity.expert_id), measurement->bytes});
+            auto &values = expected_values[group];
+            ++values[0];
+            values[1] += measurement->bytes;
+            values[2] += measurement->wall_nanoseconds;
+            values[4] += measurement->host_nanoseconds;
+            values[5] += measurement->transport_nanoseconds;
+            const auto attributed = saturatingExpertTierMeasurementAdd(
+                measurement->host_nanoseconds, measurement->transport_nanoseconds);
+            values[6] += measurement->wall_nanoseconds > attributed
+                ? measurement->wall_nanoseconds - attributed : 0u;
+            // Every operation object retires before this lane is reused.
+        }
+        context->barrier();
+        const auto records = PerfStatsCollector::snapshot();
+        const auto metric_records = std::count_if(records.begin(), records.end(),
+            [&](const auto &record) { return std::find(names.begin(), names.end(), record.name) != names.end(); });
+        ASSERT_EQ(metric_records, names.size() * expected_words.size())
+            << "Epoch/expert identities must not become retained telemetry keys";
+        std::array<std::array<bool, 7>, 6> seen{};
+        std::size_t retained = 0;
+        for (const auto &record : records)
+        {
+            const auto name = std::find(names.begin(), names.end(), record.name);
+            if (name == names.end()) continue;
+            ++retained;
+            ASSERT_EQ(record.device, "mpi_remote_projection_bounded_telemetry_test");
+            EXPECT_EQ(record.kind, PerfStatRecord::Kind::Counter);
+            EXPECT_EQ(record.domain, "moe_overlay_residency");
+            EXPECT_EQ(record.phase, "maintenance");
+            EXPECT_EQ(record.tags.count("expected_epoch"), 0u);
+            EXPECT_EQ(record.tags.count("candidate_epoch"), 0u);
+            EXPECT_EQ(record.tags.count("migration_index"), 0u);
+            EXPECT_EQ(record.tags.count("layer"), 0u);
+            EXPECT_EQ(record.tags.count("expert"), 0u);
+            ASSERT_TRUE(record.tags.contains("projection"));
+            ASSERT_TRUE(record.tags.contains("role"));
+            const auto projection = static_cast<std::size_t>(std::stoul(record.tags.at("projection")));
+            ASSERT_LT(projection, 3u);
+            const bool source_role = record.tags.at("role") == "source";
+            EXPECT_TRUE(source_role || record.tags.at("role") == "destination");
+            const int source_rank = source_role ? context->rank() : 1 - context->rank();
+            EXPECT_EQ(record.tags.at("source_world_rank"), std::to_string(source_rank));
+            EXPECT_EQ(record.tags.at("destination_world_rank"), std::to_string(1 - source_rank));
+            EXPECT_EQ(record.tags.at("source_participant"), std::to_string(source_rank));
+            EXPECT_EQ(record.tags.at("destination_participant"), std::to_string(1 - source_rank));
+            EXPECT_EQ(record.tags.at("purpose"), "placement_change");
+            EXPECT_EQ(record.tags.at("background"), "true");
+            EXPECT_EQ(record.tags.at("blocking"), "false");
+            const std::size_t group = (source_role ? 0u : 3u) + projection;
+            const std::size_t metric = static_cast<std::size_t>(name - names.begin());
+            ASSERT_FALSE(seen[group][metric]);
+            seen[group][metric] = true;
+            EXPECT_EQ(record.count, expected_values[group][0]);
+            EXPECT_TRUE(PerfStatsCollector::matchesCounterSequence(
+                record, expected_words[group], words_per_step)) << record.name;
+            if (metric == 3u) EXPECT_GE(record.value, 0.0); // Admission clock is not the transfer measurement.
+            else EXPECT_DOUBLE_EQ(record.value, static_cast<double>(expected_values[group][metric]));
+            EXPECT_EQ(record.tags.at("lane"), "0");
+            EXPECT_EQ(record.tags.at("world_rank"), std::to_string(context->rank()));
+            EXPECT_EQ(record.tags.at("world_size"), "2");
+            EXPECT_EQ(record.tags.at("source_device"), "CPU");
+            EXPECT_EQ(record.tags.at("destination_device"), "CPU");
+        }
+        EXPECT_EQ(retained, names.size() * expected_words.size());
+        for (const auto &group : seen) for (const bool present : group) EXPECT_TRUE(present);
+        const auto stats = transport.stats();
+        EXPECT_EQ(stats.operations_completed, epochs);
+        EXPECT_EQ(stats.bytes_sent, epochs / 2u * 1280u);
+        EXPECT_EQ(stats.bytes_received, epochs / 2u * 1280u);
+        EXPECT_EQ(stats.protocol_failures, 0u);
+        EXPECT_EQ(stats.mpi_failures, 0u);
+        EXPECT_EQ(stats.inference_stream_waits, 0u);
+        EXPECT_EQ(stats.blocking_synchronizations, 0u);
     }
 
     TEST(

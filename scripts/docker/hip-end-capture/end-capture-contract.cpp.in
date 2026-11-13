@@ -1,0 +1,90 @@
+/**
+ * @file end-capture-contract.cpp.in
+ * @brief Replay the unmodified native EndCapture body against finite stream membership graphs.
+ *
+ * Physical locks/events are bounded host fixtures only. The complete dependency
+ * body is inserted verbatim; its child traversal and state reset are unchanged.
+ * Self/mutual controls are adversarial bookkeeping states, not public API claims.
+ * The three-auxiliary cycle retains a separate origin and its unchanged entry.
+ * The lock boundary detects repeated traversal before the original body exhausts
+ * the host stack. No GPU runtime is loaded and no capture/node DAG is rewritten.
+ */
+#include <array>
+#include <cassert>
+#include <cstdio>
+#include <mutex>
+#include <stdexcept>
+#include <unordered_set>
+#include <utility>
+#include <vector>
+using hipError_t=int;
+constexpr hipError_t hipSuccess=0;
+enum {hipStreamCaptureStatusNone,hipStreamCaptureStatusActive,hipStreamCaptureStatusInvalidated};
+struct RepeatedCaptureVisit final:std::runtime_error {RepeatedCaptureVisit():std::runtime_error("native traversal revisited cyclic membership"){} };
+struct VisitLock {
+  static inline int visits=0;
+  void lock(){if(++visits>64)throw RepeatedCaptureVisit{};}
+  void unlock()noexcept{}
+};
+namespace hip {
+class Stream;
+struct Event {
+  Stream* producer=nullptr;
+  int detachments=0;
+  void SetCaptureStream(Stream* value){producer=value;++detachments;}
+};
+class Stream {
+public:
+  VisitLock lock_;
+  std::unordered_set<Event*> captureEvents_;
+  std::vector<Stream*> parallelCaptureStreams_;
+  int captureStatus_=hipStreamCaptureStatusActive;
+  void* pCaptureGraph_=this;
+  bool originStream_=true;
+  Stream* parentStream_=this;
+  std::vector<int> lastCapturedNodes_{1};
+  hipError_t EndCapture(bool preserveInvalidated);
+};
+@@BODY@@
+}
+/** @brief Run all membership shapes with both original invalidation policies and real reentry. */
+int main(){
+  constexpr const char* names[]={"self","mutual","three-auxiliary-stream","diamond","chain"};
+  int ordinal=0,failures=0;
+  for(int shape=0;shape<5;++shape)for(bool invalidated:{false,true}){
+    std::array<hip::Stream,4> streams;
+    std::array<hip::Event,4> events;
+    const int count=shape==0?1:shape==1?2:4;
+    for(int generation=0;generation<2;++generation){
+      VisitLock::visits=0;
+      for(int i=0;i<count;++i){
+        auto& s=streams[i];
+        s.captureStatus_=hipStreamCaptureStatusActive;s.pCaptureGraph_=&events;
+        s.originStream_=i==0;s.parentStream_=&streams[0];s.lastCapturedNodes_={generation+1};
+        s.parallelCaptureStreams_.clear();s.captureEvents_.clear();
+        events[i].producer=&s;events[i].detachments=0;s.captureEvents_.insert(&events[i]);
+      }
+      auto& a=streams[0];auto& b=streams[1];auto& c=streams[2];auto& d=streams[3];
+      if(shape==0)a.parallelCaptureStreams_={&a};
+      if(shape==1){a.parallelCaptureStreams_={&b};b.parallelCaptureStreams_={&a};}
+      if(shape==2){a.parallelCaptureStreams_={&b};b.parallelCaptureStreams_={&c};c.parallelCaptureStreams_={&d};d.parallelCaptureStreams_={&b};}
+      if(shape==3){a.parallelCaptureStreams_={&b,&c};b.parallelCaptureStreams_={&d};c.parallelCaptureStreams_={&d};}
+      if(shape==4){a.parallelCaptureStreams_={&b};b.parallelCaptureStreams_={&c};c.parallelCaptureStreams_={&d};}
+      bool ok=true;
+      try{
+        ok=a.EndCapture(invalidated)==hipSuccess;
+        // Repeated cleanup must neither detach an event twice nor revive state.
+        ok=ok&&a.EndCapture(invalidated)==hipSuccess;
+        for(int i=0;i<count;++i){const auto& s=streams[i];
+          ok=ok&&s.captureStatus_==(invalidated?hipStreamCaptureStatusInvalidated:hipStreamCaptureStatusNone)&&
+            s.pCaptureGraph_==nullptr&&!s.originStream_&&s.parentStream_==nullptr&&
+            s.lastCapturedNodes_.empty()&&s.parallelCaptureStreams_.empty()&&s.captureEvents_.empty()&&
+            events[i].producer==nullptr&&events[i].detachments==1;
+        }
+      }catch(const RepeatedCaptureVisit&){ok=false;}
+      std::printf("CHECK,%d,%d,%s invalidated=%d generation=%d\n",++ordinal,ok?1:0,names[shape],invalidated,generation);
+      if(!ok)++failures;
+    }
+  }
+  return failures?1:0;
+}

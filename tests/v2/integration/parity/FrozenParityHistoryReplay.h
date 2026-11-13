@@ -8,13 +8,16 @@
  * replay also binds the public CPU worker request and verifies actual resource
  * observations; ordinary canonical launch resources remain unchanged. Source
  * stat and full reference metadata are checked before model admission. Existing
- * required checkpoint keys remain the canonical inventory authority.
+ * required checkpoint keys remain the canonical inventory authority. An explicit
+ * noncertifying observation shard may select diagnostic storage/comparisons only
+ * after the complete original gold inventory is authenticated.
  */
 #pragma once
 #include "tools/ModelKLDQFNContract.h"
 #include "execution/local_execution/engine/PrefillBucketUtils.h"
 #include "execution/mpi_orchestration/RankExecutionPlan.h"
 #include <map>
+#include <algorithm>
 #include "app/MPIBootstrapPhase.h"
 #include <omp.h>
 #include <sched.h>
@@ -24,6 +27,8 @@
 #include "utils/PerfStatsCollector.h"
 #include "FinalLogitMeanKLContract.h"
 #include <charconv>
+#include <cctype>
+#include <iterator>
 #include <cstdlib>
 #include <fstream>
 #include <optional>
@@ -131,6 +136,32 @@ public:
             for (const auto &id : *ids)
                 requireQFN(id.is_number_integer() && !id.is_boolean() && id.get<std::int64_t>() >= 0 &&
                            id.get<std::int64_t>() < 248320, "Frozen history has an invalid original token ID");
+        if(value.contains("observation_shard")) {
+            const auto& shard=value.at("observation_shard");
+            requireQFN(shard.is_object() && shard.size()==4 && shard.at("schema")==1 &&
+                shard.at("scope")=="noncertifying", "Frozen observation shard has incompatible scope/schema");
+            for(const char* marker:{"LLAMINAR_PRODUCTION_PARITY","LLAMINAR_PRODUCTION_PARITY_PROCESS_CAMPAIGN"})
+                requireQFN(!DebugEnv::isTruthyEnv(marker),
+                    "Observation shards cannot enter complete production campaigns");
+            const auto full=shard.at("full_keys").get<std::vector<std::string>>();
+            const auto selected=shard.at("selected_keys").get<std::vector<std::string>>();
+            const auto valid=[](const auto& keys) {
+                if(keys.empty())return false;
+                std::set<std::string> unique;
+                for(const auto& key:keys) {
+                    if(key.empty() || !unique.insert(key).second ||
+                       !std::all_of(key.begin(),key.end(),[](unsigned char c){return std::isalnum(c)||c=='_';}) ||
+                       key.starts_with("decode_step"))return false;
+                }
+                return true;
+            };
+            requireQFN(valid(full) && valid(selected) && selected.size()<full.size(),
+                "Observation shard requires duplicate-free exact keys and incomplete coverage");
+            const std::set<std::string> inventory(full.begin(),full.end()),selection(selected.begin(),selected.end());
+            requireQFN(std::includes(inventory.begin(),inventory.end(),selection.begin(),selection.end()) &&
+                selection.contains("EMBEDDING") && selection.contains("LM_HEAD"),
+                "Observation shard selected foreign keys or omitted terminal/global evidence");
+        }
         return FrozenParityHistoryReplay(value, digest);
     }
 
@@ -456,6 +487,54 @@ public:
                    "Frozen reference prompt or D+1 teacher IDs differ from the original history");
     }
 
+    /** @return Whether this explicitly incomplete observation is forbidden as a campaign certificate. */
+    bool hasObservationShard() const noexcept { return value_.contains("observation_shard"); }
+
+    /** @return Immutable exact semantic selection; empty preserves the ordinary full-inventory mode. */
+    std::vector<std::string> observationKeys() const
+    { return hasObservationShard()?value_.at("observation_shard").at("selected_keys").get<std::vector<std::string>>():std::vector<std::string>{}; }
+
+    /**
+     * @brief Check a reference key against the same capture/BOM selection, retaining original decode coordinates.
+     * @param key Original semantic key, optionally prefixed by its decode step.
+     * @return Whether this diagnostic owns the value; ordinary histories select all values.
+     * @throws std::invalid_argument For a malformed explicit decode key.
+     */
+    bool observesReferenceKey(std::string key) const
+    {
+        if(!hasObservationShard())return true;
+        if(key.starts_with("decode_step")) {
+            const auto separator=key.find('_',11);
+            accuracy::requireQFN(separator!=std::string::npos,"Invalid observation decode key");
+            key=key.substr(separator+1);
+        }
+        const auto selected=observationKeys();
+        return std::find(selected.begin(),selected.end(),key)!=selected.end();
+    }
+
+    /**
+     * @brief Authenticate complete semantic gold inventory and every selected original phase before setup.
+     * @throws std::invalid_argument For stale/partial inventory or missing selected gold, never synthesizing payloads.
+     */
+    void requireObservationInventory() const
+    {
+        if(!hasObservationShard())return;
+        std::set<std::string> actual;
+        for(const auto& entry:std::filesystem::directory_iterator(referenceDirectory())) {
+            if(entry.path().extension()!=".npy")continue;
+            std::string key=entry.path().stem().string();
+            if(key.starts_with("decode_step")) {
+                const auto separator=key.find('_',11);
+                accuracy::requireQFN(separator!=std::string::npos,"Invalid original gold phase key");
+                key=key.substr(separator+1);
+            }
+            actual.insert(std::move(key));
+        }
+        const auto full=value_.at("observation_shard").at("full_keys").get<std::vector<std::string>>();
+        accuracy::requireQFN(actual==std::set<std::string>(full.begin(),full.end()),"Observation shard full gold inventory is stale or incomplete");
+        for(int step=-1;step<decodeRows();++step)requireSnapshotInventory(full,step);
+    }
+
     /**
      * @brief Require the canonical case's complete stage inventory before admission.
      * @param keys Unmodified required snapshot keys from the actual typed case.
@@ -523,6 +602,20 @@ public:
             {"prompt", actual_prompt}, {"prompt_ids", actual_ids},
             {"continuation_ids", value_.at("continuation_ids")}, {"decode_rows", actual_depth},
             {"reference_directory", actual_reference}};
+        if(hasObservationShard()) {
+            const auto& shard=value_.at("observation_shard");
+            auto full=shard.at("full_keys").get<std::vector<std::string>>();
+            auto selected=observationKeys();std::sort(full.begin(),full.end());std::sort(selected.begin(),selected.end());
+            std::vector<std::string> missing;
+            std::set_difference(full.begin(),full.end(),selected.begin(),selected.end(),std::back_inserter(missing));
+            const nlohmann::json scope={{"schema",1},{"scope","noncertifying_observation_shard"},
+                {"certification_eligible",false},{"descriptor_sha256",digest_},{"canonical_cell",value_.at("canonical_cell")},
+                {"source_digest",value_.at("source_digest")},{"full_stage_metadata_digest",value_.at("full_stage_metadata_digest")},
+                {"full_keys",full},{"selected_keys",selected},{"missing_coverage",missing},
+                {"terminal_rows_required",decodeRows()+1},{"terminal_rows_authority","llaminar_snapshots/manifest.csv"}};
+            std::ofstream file(path.parent_path()/"history_replay_observation_scope.json");file<<scope.dump(2)<<'\n';file.close();
+            if(!file)throw std::runtime_error("Cannot publish observation shard coverage");
+        }
         std::ofstream output(path, std::ios::trunc);
         output << binding.dump(2) << '\n';
         output.close();
