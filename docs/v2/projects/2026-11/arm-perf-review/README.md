@@ -4755,3 +4755,25 @@ DOCS TIP = REVIEW TIP (Gate-A request covers it; pins/Gate-A on
 the docs tip; gate seals name 03480d07e — binding unchanged).
 STANDING RULE (Main): after ANY rebase, `git grep -n '^<<<<<<< \|
 ^>>>>>>> '` before every push — joins the RECORD-probe rule.
+
+### A2-R1 pin CLOSED @ 74104b6b6; docs HOLD pending closure @ bba1eafe5 (20:45Z)
+
+Reviewer bounded SOURCE ACK @ 74104b6b6 (exact invalid_argument
+catch encloses configureCpuFromGpu BEFORE prepared-payload
+allocation; caller CPU success-only; seal catch retained; Q4_0/Q8_0
+canonical + compact/0xFF preserving controls via existing
+RectangularCPUWire filter; sibling exception sites inspected — no
+further reachable escape for current tables; NOT blanket-noexcept).
+**WRONGING RULE (Main): A2-R1 scope = "rejection avoids prepared-
+payload allocation", NOT all heap allocation** (diagnostic/exception
+strings may allocate) — use that wording. NONBLOCKING HARDENING
+QUEUED (Main preference: LATER fixup, NOT in the docs commit):
+Test__ExpertTierWeightStream.cpp:194-196 — ASSERT_EQ size or 4-
+iterator equal (overread guard); if done, NOT docs-only -> gate
+binding tip changes + WSL/sparks incremental rerun of that one
+test. Docs repair bba1eafe5 accepted as-is (docs-only, verified:
+diff == design doc only, marker grep zero, chain/prime corrected).
+Reviewer to close the docs HOLD at bba1eafe5. A2 code closed;
+remaining: docs closure + gates (sparks sealed @ 03480d07e, WSL
+x86 incremental) -> pins A3-fixup/A4 @ 03480d07e -> Gate-A
+d5e04fdce..bba1eafe5 (docs named).
