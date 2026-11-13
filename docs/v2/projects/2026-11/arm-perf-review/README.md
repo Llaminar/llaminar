@@ -3384,3 +3384,28 @@ regardless — the A2-5 Q6 family lives in the same file, and the 3
 tests exercise the lane's touched surfaces with .80-campaign green
 baselines). .80 q1bw sealed/no containers; station CB lead-owned,
 no drift signal; A2 rider exports pending with the fixup (in scope).
+
+### A2 CONSOLIDATED FIXUP 433e84632 (04:59Z): coordinator-verified, Main review + boundary build dispatched
+
+19 files +616/-38 on 85ddd8572, ONE push, all five items + binding A3
+(verified: kHostPreparedLayout gone from Stream, no default arg).
+A2-1 Q6 low-plane quotient 16 (static_asserts ==16/!=24 both kernel
+files; CUDA :483/:668, ROCm :764/:950; copier+oracle = reference;
+device-free regression 5/5). A2-2 all 37 callers migrated (grep zero
+unpatched). A2-3 admission fail-closed: valid()s require EXACT
+metadata presence contract (comp iff !Q6/CMS; secondary iff asym or
+NLSS/IQ3S/Q6/CMS; emins iff CMS); canonical tautological; "every
+site plane-driven" corrected (doc §8 + commit msg). A2-4 reference
+takes required destination_layout (20 callers; 5 field-tamper
+controls; relabel). A2-5 per-backend V2_Integration_${backend}_
+ExpertTierPartialQ6PayloadPlane (12/37 + 64 control, dirty replays,
+0xa5 guards, live-row bytesMoved). A3 binding in doc §8; compact
+tables invalid until identity lands. Mac: 297/297 + 10/10 + 5/5;
+Mac can't compile CUDA/ROCm/perf/parity (known blockers); TUs
+syntax-swept; Q6 test bodies name-verified. DISPATCHED: sparks A1
+completion run (5 min, 9222e9c7a, 3 members + family, seal amended)
+then A2 boundary build at 433e84632 (cu13, HAVE_CUDA=ON sm_121,
+HAVE_ROCM=OFF, cnpy, EVERYTHING incl. distributed_residency binary;
+native GB10 test set incl. new Q6 registration + 3 members; JUnit
+--no-tests=error; K14-A2CUDAB-433E84632). A2 pin to reviewer waits
+on Main review + build. A1 qualification call pinged at 36m.
