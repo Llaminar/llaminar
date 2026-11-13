@@ -41911,6 +41911,17 @@ add_v2_test(V2_Integration_MappedBatchOriginalSourceInventoryContract
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MappedBatchOriginalSourceInventoryContract)
 
+# Serving and live restored-prefix conditions consume the separately admitted
+# bridge source with its original role, rows, layer and sparse-query identity.
+add_v2_test(V2_Integration_MappedBatchRestoredPrefixConditionAdmission
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.MappedBatchRestoredPrefix*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MoE;MTP;PrefixCache;GraphCapture;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_MappedBatchRestoredPrefixConditionAdmission)
+
 
 # Exact declared arena ownership complements the real original CPUJoint replays.
 add_v2_test(V2_Integration_MappedArenaOriginalAdmissionContract

@@ -12,6 +12,7 @@
  */
 
 #include "execution/moe/MoEOverlayActivationBatchInventory.h"
+#include "execution/local_execution/engine/ForwardGraphTypes.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/mtp/MTPForwardConstruction.h"
@@ -5224,6 +5225,12 @@ TEST(Test__MemoryPlanner, MappedBatchOriginalSourceInventoryContract)
         input.execution_phase = ForwardExecutionPhase::Decode;
         if (depth) EXPECT_NO_THROW(inventory->require(input, first, 1, 0));
         else EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        // Serving materializes this source as MTPCondition, not an ordinary
+        // MainInference decode. Retained-Off absence must still reject it.
+        input.state_transaction = ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;
+        if (depth) EXPECT_NO_THROW(inventory->require(input, first, 1, 0));
+        else EXPECT_THROW(inventory->require(input, first, 1, 0), std::invalid_argument);
+        input.state_transaction = ForwardStateTransaction::Ordinary;
         int token = 0;
         input.token_ids_device = &token;
         input.mtp_sidecar_capture_role = MTPSidecarCaptureRole::Full;
@@ -5271,6 +5278,81 @@ TEST(Test__MemoryPlanner, MappedBatchOriginalSourceInventoryContract)
         EXPECT_THROW(MoEOverlayActivationBatchInventory::declare(family, buckets, 33, 2, mtp, verifier, programs), std::invalid_argument);
         EXPECT_THROW(MoEOverlayActivationBatchInventory::declare(family, buckets, 33, 1, mtp,
             static_cast<MTPVerifierGraphFamily>(99), programs), std::invalid_argument);
+    }
+}
+
+/** @test Serving bridge admission preserves the declared owner across retained MTP policies. */
+TEST(Test__MemoryPlanner, MappedBatchRestoredPrefixServingRoleAdmission)
+{
+    using Inventory = MoEOverlayActivationBatchInventory;
+    for (const bool enabled : {false, true})
+    for (const auto mode : {MTPDepthPolicyMode::Fixed, MTPDepthPolicyMode::Dynamic})
+    for (const int depth : {1, 3, 15})
+    {
+        SCOPED_TRACE(::testing::Message() << "enabled=" << enabled
+            << " mode=" << int(mode) << " retained_depth=" << depth);
+        MTPRuntimeConfig mtp;
+        mtp.enabled = enabled;
+        mtp.graph_capacity_draft_tokens = depth;
+        mtp.draft_tokens = 1;
+        mtp.depth_policy.mode = mode;
+        mtp.depth_policy.min_depth = 1;
+        mtp.depth_policy.max_depth = depth;
+        const MoEOverlayInferenceGraphFamilyIdentity family{
+            .graph_family_generation = 41, .main_layer_count = 2, .mtp_source_layers = {9},
+            .max_graph_rows = 16, .max_decode_rows = depth + 1,
+            .max_request_count = 1, .max_mtp_draft_depth = depth, .first_model_layer = 5};
+        const std::array buckets{1, 16};
+        // Use the production declaration, including every neighboring condition
+        // and verifier source. The one-row bridge must not borrow their identity.
+        const auto inventory = Inventory::declare(family, buckets, 16, 1, mtp,
+            MTPVerifierGraphFamily::BoundedBuckets, 2);
+        for (const auto role : {ForwardExecutionRole::MTPCondition, ForwardExecutionRole::MainInference})
+        for (const auto intent : {ForwardGraphSubmissionIntent::Execute,
+                                 ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch})
+        for (const auto program : {SparseQueryExecutionProgram::RankingPossible,
+                                  SparseQueryExecutionProgram::ProvenNoRanking})
+        {
+            ForwardInput input;
+            input.batch_size = input.seq_len = 1;
+            input.execution_role = role;
+            input.execution_phase = ForwardExecutionPhase::Decode;
+            input.state_transaction = ForwardStateTransaction::RestoredPrefixMTPDecodeBridge;
+            input.graph_submission_intent = intent;
+            input.sparse_query_execution_program = program;
+            EXPECT_EQ(isGraphIntegratedShiftedMTPTransaction(role, input.execution_phase,
+                input.state_transaction, 1, 1), role == ForwardExecutionRole::MTPCondition);
+            for (int ordinal = 0; ordinal < 2; ++ordinal)
+            {
+                const auto layer = LayerGraphSourceIdentity::main(5 + ordinal, 7, 5, GraphCacheLayerIndex::CacheLocal);
+                EXPECT_NO_THROW(inventory->require(input, layer, 1, ordinal));
+                EXPECT_THROW(inventory->require(input, layer, 1, 1 - ordinal), std::invalid_argument);
+                auto invalid = input;
+                invalid.execution_role = ForwardExecutionRole::GroupedMTPVerifier;
+                EXPECT_THROW(inventory->require(invalid, layer, 1, ordinal), std::invalid_argument);
+                invalid = input;
+                invalid.execution_phase = ForwardExecutionPhase::Prefill;
+                EXPECT_THROW(inventory->require(invalid, layer, 1, ordinal), std::invalid_argument);
+                invalid = input;
+                invalid.seq_len = 2;
+                EXPECT_THROW(inventory->require(invalid, layer, 2, ordinal), std::invalid_argument);
+                EXPECT_THROW(inventory->require(input, layer, 2, ordinal), std::invalid_argument);
+                // Removing only this source proves a neighboring one-row
+                // condition/decode cannot accidentally authenticate the bridge.
+                std::vector<Inventory::Source> without_bridge;
+                for (const auto &source : inventory->sources())
+                    if (source.kind != Inventory::SourceKind::RestoredPrefixBridge)
+                        without_bridge.push_back(source);
+                const auto unadmitted = Inventory::declareSources(without_bridge);
+                EXPECT_THROW(unadmitted->require(input, layer, 1, ordinal), std::invalid_argument);
+            }
+            const auto foreign_layer = LayerGraphSourceIdentity::main(7, 8, 5, GraphCacheLayerIndex::CacheLocal);
+            EXPECT_THROW(inventory->require(input, foreign_layer, 1, 0), std::invalid_argument);
+            auto unadmitted_program = input;
+            unadmitted_program.sparse_query_execution_program = static_cast<SparseQueryExecutionProgram>(99);
+            EXPECT_THROW(inventory->require(unadmitted_program, LayerGraphSourceIdentity::main(
+                5, 7, 5, GraphCacheLayerIndex::CacheLocal), 1, 0), std::invalid_argument);
+        }
     }
 }
 

@@ -6,16 +6,19 @@ analysis in the linked tuning notes, not in this dashboard.
 
 ## Current status
 
-**Current milestone: CUDA2 continuation + CPU2 whole-expert EP, RAM ngrams,
-dynamic MTP1–15, 262,144 context.** Auto planning **3.046 s**.
-[Complete OpenCode (`q686`)](../2026-11/QFN_CUDA2_CPU2_EP_OPENCODE_20261113.md):
-**10/10 phases**, 112 requests, **1/105 tool errors (0.95%)**, 53 app tests pass.
-Stress/protocol/native-output/runtime/resource/driver/retirement gates green;
-strict zero-task-error flag remains false. **98.14% prefix reuse**, **4.73 s
-TTFT**, **37.82 decode tok/s** across the growing session. Short greedy 512/256
-benchmark: **389.86/59.66 P/D tok/s**. CPU diagnostic-retention and restored-prefix
-lifecycle repairs have focused regressions; original failures remain preserved.
-**Next:** Auto CUDA2 + MI50×4, RAM ngrams, dynamic MTP; not yet qualified.
+**Current milestone: Auto CUDA2 continuation + MI50×4 whole-expert EP, RAM
+ngrams, dynamic MTP1–15, 262,144 context.**
+[Complete OpenCode (`q702`)](../2026-11/QFN_CUDA2_MI50X4_RAM_OPENCODE_20261113.md):
+**10/10 phases**, 98 requests, **107 tools/zero errors**, 56 app tests pass.
+All app/runtime/resource/driver/retirement gates green. **98.04% prefix reuse**,
+**2.81 s TTFT**, **76.64 decode tok/s**; short greedy 512/256 **766.34/120.00 P/D**.
+Restored-prefix MTP role admission repaired; 571 MemoryPlanner tests and four
+focused aliases pass. Auto **30.41 s**; selected MI50s span switches, no optimal
+fabric claim. Full preflight not repeated.
+
+**Retained CPU EP:** [CUDA2+CPU2 `q686`](../2026-11/QFN_CUDA2_CPU2_EP_OPENCODE_20261113.md)
+10/10 phases, 1/105 tool errors, 53 tests; stress green, strict task flag false.
+98.14% reuse, 4.73 s TTFT, 37.82 decode tok/s; short **389.86/59.66 P/D**.
 
 **Retained GPU milestones:** PP8 `q607` full ten-phase pass, 124 tools/zero errors,
 98.18% reuse. TP4 `q639` user-accepted **8/10 partial**, 1/131 errors, 92.34% reuse;
@@ -80,7 +83,7 @@ logits; component savings do not establish model gain.
 | Next action | State / decision |
 |---|---|
 | Admission / SDK10.1 | **Focused fixes pass; full rerun waived.** Release accuracy and cleanup match. No whole-run certificate. [Evidence](../2026-11/QFN_EP4_EP4_POST_CHECKPOINT_INFERENCE_20261112.md). |
-| Six-GPU moving MTP | CUDA2 continuation + MI50×4 follower fixed1/fixed3/dynamic [focused slices pass](../2026-11/QFN_RECURRENT_SIX_GPU_MTP_FOCUSED_QUALIFICATION_20261106.md), including migration, reset and retirement. Complete current SDK/model qualification remains open. |
+| Six-GPU moving MTP | **Current RAM/dynamic OpenCode green (`q702`).** Prior fixed1/fixed3/dynamic [migration/reset slices](../2026-11/QFN_RECURRENT_SIX_GPU_MTP_FOCUSED_QUALIFICATION_20261106.md) remain scoped; broader numerical/topology matrix open. |
 | Native lifetime | CUDA/ROCm [captured component](../2026-11/QFN_READ_AHEAD_NATIVE_CAPTURE_QUALIFICATION.md), [early-current RAM/SSD](../2026-11/QFN_EARLY_CURRENT_CAUSAL_FOCUSED_20261105.md), and [TP2 shared-owner](../2026-11/QFN_POOLED_CURRENT_READAHEAD_FOCUSED_20261106.md) proofs pass. Combined-cache/dynamic-MTP Release overlap remains unqualified. |
 | Continuation / ngrams | TP2 shared-owner RAM/fixed3 and SSD/fixed1 [focused slices pass](../2026-11/QFN_SHARED_OWNER_MTP_IDENTITY_FOCUSED_20261106.md). Hybrid timing uses ConsumerScheduled/warm hits; combined-cache overlap remains open. [Policy audit](../2026-11/QFN_HYBRID_NGRAM_POLICY_AND_OVERLAP_20261109.md). |
 
@@ -108,11 +111,11 @@ remain controls and do not qualify the new tier/ownership combinations.
 | Q3 | 4× MI50; GateUpOwnedDownColumns, RAM ngrams | 🟢 short panel, accepted one-row limit; app partial 8/10 accepted | 616.19† | — | — | 93.41† | — | — |
 | Q4 | 1× RTX 3090 | ⚪ | — | — | — | — | — | — |
 | Q5 | 2× RTX 3090 | ⚪ | — | — | — | — | — | — |
-| Q6 | 2× RTX 3090 continuation + 4× MI50 followers | ⚪ | — | — | — | — | — | — |
+| Q6 | 2× RTX 3090 continuation + 4× MI50 followers | ⚪ parity; 🟢 RAM/dynamic app 10/10 | 766.34† | — | — | 120.00† | — | — |
 | Q7 | PP(EP(4×MI50), EP(4×MI50)); ngrams sharded across all8 | 🟢 short panel; P/D KL0.01851/0.02042; full app green | 1082.63† | — | — | 58.41† | — | — |
 
 † Current selected-Auto diagnostics: 512/256, greedy dynamic MTP, prefix off,
-one warmup + three samples; TP4 context 47,168, PP8 context 262,144. No matched
+one warmup + three samples; Q3 context 47,168, Q6/Q7 context 262,144. No matched
 external reference or general throughput claim. Accuracy uses short contexts
 with MTP off; full stochastic apps qualify the serving configuration separately.
 

@@ -7,6 +7,8 @@
  * segments do not truncate retained MTP capacity, and CPU histogram storage
  * follows the same distributed publication contract used by live maintenance.
  * Frozen execution and parent boundaries authenticate one shared GPU family.
+ * Restored-prefix MTP condition graphs retain their distinct bridge identity;
+ * ordinary speculative/committed conditions cannot borrow that admission.
  */
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "execution/moe/MoEOverlayActivationBatchInventory.h"
@@ -182,10 +184,17 @@ void MoEOverlayActivationBatchInventory::require(const ForwardInput& input,
             return input.state_transaction == ForwardStateTransaction::Ordinary &&
                 (source.kind == SourceKind::VerifierGreedy || source.kind == SourceKind::VerifierStochastic);
         if (input.execution_role == ForwardExecutionRole::MTPCondition)
+        {
+            // Native serving materialization and runtime execute the bridge as
+            // an MTP condition so shifted depth-zero KV and terminal hidden
+            // state publish together. Preserve its separately priced identity.
+            if (input.state_transaction == ForwardStateTransaction::RestoredPrefixMTPDecodeBridge)
+                return source.kind == SourceKind::RestoredPrefixBridge;
             return input.state_transaction == ForwardStateTransaction::CommittedMTPCondition
                 ? source.kind == SourceKind::CommittedCondition
                 : input.state_transaction == ForwardStateTransaction::Ordinary &&
                     source.kind == SourceKind::SpeculativeCondition;
+        }
         if (input.execution_role != ForwardExecutionRole::MainInference) return false;
         if (input.execution_phase == ForwardExecutionPhase::Prefill)
             return input.state_transaction == ForwardStateTransaction::Ordinary &&
