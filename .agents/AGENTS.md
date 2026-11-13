@@ -338,6 +338,10 @@ Conventional Commits: `<type>(<optional-scope>): <description>`, for example
 `feat(planning): add explicit topology selection` or
 `perf(cuda): improve prefill projection dispatch`.
 
+Use the current protected `develop` workflow definitions and live repository
+rulesets when preparing a PR or release from an older checkout. An old feature
+branch's workflow files do not define the current release policy.
+
 Push the feature branch and open a PR into `develop`. Draft PRs skip PR jobs;
 marking a PR ready for review starts its required checks. Same-repository,
 non-draft feature PRs enable native squash auto-merge, which must wait for every
@@ -360,24 +364,28 @@ replacement. If documentation/CI maintenance skipped publication, run
 `gh workflow run ci.yml --ref develop --repo Llaminar/llaminar` and wait for
 both source-pinned images before cutting the RC.
 
-The master PR gate admits the frozen develop source behind the RC and its
-published image pair. It runs complete Unit and production preflight for both
-ISAs, then multi-prompt frozen-history PyTorch KLD panels on blessed serial
+All RC certification jobs run on `llaminar-xeon-host`. The master PR gate
+admits the frozen develop source behind the RC and its published image pair.
+It runs complete Unit and production preflight for both ISAs, then multi-prompt
+frozen-history PyTorch KLD panels on blessed serial
 controls, six five-phase OpenCode sessions on AVX512, and finally benchmark
 gates on both images. The only blessed configurations are dense Qwen3.8 and
 QFN, each on 4×ROCm TP, 2×CUDA TP and 2×CUDA+4×ROCm+CPU TP-over-PP. The native
 model definitions own those selections. The RC workflow runs no standalone
-HTTP suite; OpenCode exercises the real HTTP/native serving lifecycle. All stages must
-pass before the independent RC release-eligibility check can pass. Retain the
-panel row/summary CSVs, original full-stage parity CSVs, prerequisite receipts,
+HTTP, token-regression or cross-host suite; OpenCode exercises the real
+HTTP/native serving lifecycle. Full model-free preflight stays complete;
+real-source admission runs inside the six cells' numerical fixtures. All stages
+must pass before the independent RC release-eligibility check can pass. Retain
+the panel row/summary CSVs, original full-stage parity CSVs, prerequisite receipts,
 OpenCode proof and benchmark evidence, bound to the same source and images.
 
 A certified RC squash merge into master tags a dated GitHub release, promotes
 the exact tested image digests and attaches the test-run identity, numerical
 accuracy CSVs and complete benchmark/stress evidence. No image is rebuilt on
-master. Post-release high-water publication preserves concurrent develop work
-and joins the certified master commit as its second parent. Never open or merge
-a master release merely because feature checks or develop image builds passed.
+master. Owner approval covers `develop`, `rc/*` and `master`; passing checks
+alone does not authorize a merge. Post-release high-water publication preserves
+concurrent develop work and joins the certified master commit as its second
+parent. Never open or merge a master release merely because feature checks or develop image builds passed.
 
 Documentation and CI/CD workflow changes may be committed and pushed directly
 to `develop` with `[skip ci]` and `git commit --no-verify`. Keep this shortcut
@@ -405,9 +413,9 @@ single-source.
   analysis, and ROCm kernel tuning.
 - `.agents/mtp-tuning/SKILL.md`: speculative decode, prefix-cache interaction,
   verifier parity, grouped MTP economics, and depth-controller work.
-- `.agents/llaminar-testing/SKILL.md`: Unit and production-preflight gates,
-  generation regressions, real-weight HF/CSV diagnostics, canonical matrix
-  extension, HTTP/remote-MPI E2E, and image/benchmark certification.
+- `.agents/llaminar-testing/SKILL.md`: Unit/host PR checks, full production
+  preflight, RC numerical panels, OpenCode stress and benchmark certification;
+  focused parity, generation and HTTP/remote-MPI diagnostics.
 - `.agents/nativequantised-gemm-tuning/SKILL.md`: cross-backend NativeQuantised
   GEMV/GEMM exact-overlay tuning, evidence collection, dispatch installation,
   and numerical/performance qualification. Generic fitting is retired; existing
@@ -1202,50 +1210,29 @@ The registered pre-commit hook builds only `v2_unit_gate` and
 `ProductionTestPreflight` label on every branch. It runs no model campaigns,
 E2E, broader integration selections, or benchmarks. Register the tracked hooks
 with `git config --local core.hooksPath .githooks`; see `.githooks/README.md`.
-The full shippable-image gate is `scripts/ci/run_production_pipeline.py`:
-independent AVX512 and AVX2 full CPU/CUDA/ROCm Docker builds, each running the
-canonical Unit/preflight gate, reviewed HTTP token regressions (MTP off and
-dynamic depth only), and all E2E-tagged cells. Mathematical HF parity is explicit
-diagnosis via `--diagnostic-mathematical-parity`, never a routine CI dependency.
-Prompts, seeds and cell/control mappings are canonical source definitions;
-expected token payloads are versioned in `Llaminar/corpora` and source-pinned.
-Never update expected tokens automatically. Both full
-E2E server suites must pass before either ISA's benchmarks run. Only complete
-per-image evidence may attach a certificate; official publication requires
-both images. Explicit one-off diagnostic benchmarks cannot certify images.
-An explicit protected full-certification invocation commits both compact ISA
-result JSONs and one combined upward-only high-water proposal; local runs never
-commit or publish implicitly. See `docs/production-ci.md`. Do not
-add a second benchmark topology/model list or reintroduce this pipeline into
+The [branch and release workflow](#branch-and-release-workflow) owns the CI
+sequence: Unit/host checks on feature PRs, build-only develop publication, then
+the RC gate on the Xeon runner. `.github/workflows/master-pr-certification.yml`
+uses `run_published_image_suite.py` for complete preflight, numerical panels,
+OpenCode and benchmarks. `certify_release_candidate.py` joins their evidence;
+`publish_master_release.py` authenticates it again after the RC merge. Only
+that certified release path promotes the images and publishes release
+high-water marks. Focused diagnostics and local image certificates cannot
+satisfy the required RC checks or authorize release publication.
+
+`scripts/ci/run_production_pipeline.py` remains an explicit standalone image
+qualification tool. Its broader generation/HTTP/cross-host sequence is not the
+RC release strategy. Mathematical campaigns through
+`--diagnostic-mathematical-parity` remain opt-in diagnostics; the blessed
+frozen-history numerical panels are mandatory in RC certification. Reviewed
+generation controls remain source-pinned in `Llaminar/corpora`; never regenerate
+expected tokens automatically. See `docs/production-ci.md` for local commands.
+Do not add a second benchmark topology/model list or move these workloads into
 pre-commit.
 
-Feature PRs targeting `develop` run `.github/workflows/develop-pr.yml` through
-`develop-pr-tests.yml@develop`. Dedicated labels route AVX2 to
-`llaminar-develop-avx2` and AVX512 to `llaminar-avx512`. Both full-backend
-model-free test companions build and test in parallel with fail-fast disabled.
-Complete device-free Unit and canonical host-preflight inventories must pass
-without skips; CPU admission rejects unsupported hardware before compilation.
-CUDA, ROCm and exclusive lanes remain production gates. The `unit-and-host`
-receipt cannot certify complete preflight or release images. No models, E2E
-or benchmarks run on this PR. PRs import public registry layers without
-credentials or registry cache export. Dependency-bound complete OCI toolchains
-are admitted before source compilation, and the persistent named BuildKit
-worker retains layers and compiler cache mounts between jobs. PR cache writes
-stay isolated to their merge ref. Each host retains its own persistent worker
-and serializes its own jobs; new commits cancel older checks on that same PR. Production hardware
-has its own independent queue. No GitHub cloud runner is used for this gate.
-
-The enabled develop push workflow invokes
-`scripts/ci/run_develop_image_gate.py --build-only --publish` on the AVX2 development host.
-It builds both AVX512 and AVX2 full-backend Release runtimes and publishes both
-develop and source-SHA tags. It compiles no Integration inventory and runs no
-tests. One publication concurrency group cancels superseded develop builds.
-PRs require both ISA Unit/host checks and approval from the owner-only repository
-approvers team. Model/generation/parity/E2E/benchmark certification remains
-separate. See `docs/production-ci.md` for host ownership and local invocation.
-
 The separate manual `production-e2e.yml` and `production-benchmarks.yml`
-workflows consume the branch's existing GHCR image pair. They use
+workflows are optional diagnostics that consume the branch's existing GHCR
+image pair. They use
 `run_published_image_suite.py`, canonical typed inventory discovery and the
 existing HTTP/benchmark runners. Both entire same-image E2E suites precede
 either benchmark. Only complete benchmark results may update the owned README
@@ -1307,13 +1294,15 @@ when a parity defect establishes a reusable backend lifecycle, graph,
 stream/event, collective, or movement invariant. Local reports and result
 directories are generated debris and must not be committed.
 
-HTTP needle and long-context certification also derives from the typed parity
-definitions: `ModelParityDefinition::e2e_certifiable` selects exact existing
+Optional HTTP needle and long-context diagnostics also derive from the typed
+parity definitions: `ModelParityDefinition::e2e_certifiable` selects exact existing
 cells and their context profiles. Build `v2_model_parity_matrices`, then use
 `scripts/ci/run_model_parity_e2e.py --list` to inspect eligibility. Its non-list
 run uses the Release server and the mature HTTP harness; scripts and container
-jobs must never maintain a second model/topology matrix. Numerical parity and
-HTTP behavioral certificates are complementary gates, not substitutes.
+jobs must never maintain a second model/topology matrix. The `e2e` metadata
+also selects the blessed serving cells for OpenCode and benchmarks; its name
+does not require a standalone HTTP suite in the RC gate. OpenCode owns release
+HTTP coverage, while frozen-history panels own numerical acceptance.
 
 For a debugger attached directly to `llaminar2`, pass
 `--no-mpi-bootstrap`; otherwise it may attach to the MPI wrapper. Record any

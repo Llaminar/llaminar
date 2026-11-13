@@ -282,7 +282,9 @@ sudo perf script --show-task-events -i "$LLAMINAR_USERPTR_TRACE"
 
 Check lost-sample reports and observation boundaries before counting events.
 Remove only this diagnostic's named probes, not the whole host probe namespace.
-Keep instrumented results separate from uninstrumented full-HTTP certification.
+Keep instrumented results separate from uninstrumented serving evidence.
+Focused HTTP stability loops diagnose this lifecycle; release certification
+uses the testing skill's RC gate, with OpenCode supplying HTTP coverage.
 
 If the repair changes RCCL storage, prove the concrete connection kind through
 `V2_Integration_RCCLHostTransportStorage`, not correct output alone. Same-process

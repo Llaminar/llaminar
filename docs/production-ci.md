@@ -1,13 +1,17 @@
 # Production image certification
 
-`scripts/ci/run_production_pipeline.py` is the explicit local/full-certification
-entry point. By default it independently certifies full CPU/CUDA/ROCm
-**Release** images for both AVX512 and AVX2, not a devcontainer or
-independently rebuilt executables. It remains deliberately broader than the
-develop-branch GitHub Actions job described below.
+The release path is **feature → develop → rc/* → master**. Feature PRs run
+Unit/host checks on both ISAs; develop publishes build-only images. A non-draft
+RC-to-master PR qualifies that frozen published pair through complete
+preflight, numerical panels, six five-phase OpenCode sessions and benchmarks.
+All RC jobs run on the Xeon runner. Only a certified RC merge publishes a
+GitHub release and its retained evidence.
 
 The shared [Llaminar testing workflow](../.agents/llaminar-testing/SKILL.md)
-routes local development checks, model diagnostics, and this full image gate.
+routes these gates and focused diagnostics. The standalone
+`scripts/ci/run_production_pipeline.py` retains its broader local image
+qualification sequence, including generation and HTTP/cross-host tests.
+Those optional tools do not add phases to RC certification.
 
 ## Feature PRs into develop
 
@@ -110,14 +114,12 @@ After merge, the ordinary develop push workflow below builds and publishes
 **both** shipping ISA runtime images without running tests. Master PR certification remains a
 separate, broader gate.
 
-Real-model QFN source admission belongs to the separate master PR gate. It
-uses the full compiled test inventory, typed CTest/GTest membership, exact
-native hardware eligibility and canonical read-only GGUF inputs. Every selected
-cell, including Candidates, must execute without skips; absent hardware remains
-explicitly unqualified. Its source/ISA/image-bound receipts are required before
-HTTP, benchmark and release admission. Ordinary cell failures are gathered
-across both ISAs; driver or infrastructure failure is terminal. PR Unit/host
-receipts do not satisfy this qualification.
+Real-model source admission in the RC gate runs inside the six blessed cells'
+numerical fixtures on both ISAs. There is no separate broad QFN admission
+matrix or standalone HTTP gate. Every selected native cell must execute with
+its complete source, stage and lifecycle obligations; missing required hardware
+fails qualification. PR Unit/host receipts do not satisfy full production
+preflight or numerical acceptance.
 
 ## Develop branch image publication
 
@@ -399,18 +401,15 @@ untouched for manual retirement, but no live runner consumes it.
 
 ```mermaid
 flowchart TD
-    S[One immutable source snapshot] --> B[AVX512 and AVX2 test-runner/runtime image pairs]
-    B --> U[Complete Unit gate in each ISA image]
-    U --> P[Complete ProductionTestPreflight in each ISA image]
-    P --> G[HTTP token regression: MTP off and dynamic, reviewed 384-token controls]
-    G --> E[Both full canonical E2E HTTP needle suites]
-    E --> X[Canonical cross-host MPI E2E; Azure lease retired]
-    X --> T[Same tagged cells: independent Release benchmarks per ISA]
-    T --> R{All gates and ratchet pass?}
-    R -- no --> F[Keep diagnostic evidence; no certificate or publication]
-    R -- yes --> C[Separate image-bound certificate layers]
-    C --> L[Two local pushable certified images]
-    C --> O[Explicit full-certification publication: both images and one combined result commit]
+    D[Protected develop source and published AVX512/AVX2 pair] --> RC[Frozen rc/candidate]
+    RC --> P[Complete Unit and production preflight on both ISAs]
+    P --> A[Six blessed numerical panels on both ISAs]
+    A --> O[Six five-phase OpenCode sessions on AVX512]
+    O --> B[Benchmark gates on both ISAs]
+    B --> E[Independent RC release eligibility]
+    E --> M[Owner-approved RC squash merge to master]
+    M --> R[Dated release: same image digests and retained evidence]
+    R --> H[Upward-only high-water evidence and ancestry join on develop]
 ```
 
 ## Master PR certification and release
@@ -577,8 +576,10 @@ not rerun certification or compare historical results against today's
 high-water marks. A missing, incomplete, or mismatched report fails the site
 build, leaving the previous deployment available.
 
-Each `releases/YYYY-MM-DD.N/` page includes release notes, E2E certificates,
-benchmark certificates, and the unchanged SVG/JSON downloads. Every rebuild
+Each `releases/YYYY-MM-DD.N/` page includes release notes, test evidence,
+numerical accuracy CSVs, OpenCode proof and benchmark SVG/JSON downloads.
+Historical releases retain their original E2E certificates; new RC releases
+use their actual preflight/numerical/serving evidence. Every rebuild
 includes the complete archive, so publishing a new release retains older
 pages. `releases/latest/` is a copy of the release selected by GitHub's latest
 pointer. Drafts, prereleases, and standalone benchmark runs cannot advance it.
@@ -606,7 +607,8 @@ checks and a strict MkDocs build, not another multi-hour image certification.
 
 Two separate **manual-dispatch-only** workflows consume the branch's existing
 GHCR runtime images. They never replace a missing published image with a local
-build and do not extend the ordinary develop push gate:
+build. They are optional diagnostics, separate from develop publication and
+the required RC checks:
 
 - **Published images — HTTP E2E** (`production-e2e.yml`) runs every canonical
   E2E-tagged cell through the full HTTP/long-context needle harness, first on
@@ -712,15 +714,16 @@ deadlines come from the canonical typed profiles, including explicitly approved
 ISA-specific budgets. For a
 failing cell, use the existing E2E/benchmark runner's explicit diagnostic
 selection, then rerun the complete suite on the corrected published pair.
-Unit/preflight are not rerun per model cell: published develop images already
-passed those gates.
+Unit/preflight are not rerun per model cell. Develop image publication itself
+is build-only; full prerequisite evidence comes from source/ISA-bound test
+companions, never from the existence of a develop tag.
 
 Local runs do not commit implicitly; `--publish` explicitly enables the same
 branch publication as Actions. Publication uses a private index and a normal
 fast-forward push, retaining concurrent source changes and leaving the user's
 checkout/index untouched. The bookkeeping commit also receives a develop
 source-pinned image pair through the ordinary CI gate; skipping CI would leave
-the next master PR without an image for its exact head SHA. Full logs stay in Actions
+the next RC without images for its frozen source SHA. Full logs stay in Actions
 artifacts; `benchmarks/production/published/results.json` and `benchmarks.svg`
 are the compact checked-in evidence. These workflows do **not** run saved-token
 or remote-MPI regression, mint a full production-image certificate, modify
@@ -734,6 +737,11 @@ remain comparable across cells; normalized bar lengths are not. The renderer
 only changes presentation and never alters samples or high-water marks.
 
 ## Run locally
+
+The following commands describe the explicit local
+`run_production_pipeline.py` workflow. Its broader HTTP and cross-host evidence
+does not replace the RC workflow's numerical/OpenCode proof or authorize a
+master merge. Use the master PR workflow for release certification.
 
 The node needs Docker/Buildx, Python 3, Git, `lscpu`, `lspci`, the complete
 canonical model inventory, and sufficient CPU/CUDA/ROCm hardware. Missing
@@ -1364,13 +1372,14 @@ production-default intent.
 An explicit image `--diagnostic` can retime an older immutable Release image
 against the current manifest; its report records the manifest's `source_revision`
 and the image's separate `runtime_source_revision`. That cross-revision run is
-non-certifying. Ordinary certification still requires matching source and full
-same-image E2E evidence.
+non-certifying. The standalone HTTP-based route requires matching source and
+full same-image E2E evidence. RC benchmark admission instead authenticates its
+preflight, numerical-panel and OpenCode predecessors for the exact image pair.
 
 ## Evidence, commits and image identity
 
-Each phase writes logs and JSON into the output directory. Numerical CSVs
-remain CI artifacts, not source blobs. The final image contains:
+Each standalone qualification phase writes logs and JSON into the output
+directory. Its optional certificate layer contains:
 
 ```text
 /usr/local/share/llaminar/certificates/
@@ -1387,18 +1396,13 @@ certificate. The certificate names the **tested candidate image ID**; the
 pipeline receipt additionally names the final certificate-bearing image ID.
 This avoids a circular claim that an image embeds its own digest.
 
-An explicit full-certification `--publish` invocation is permitted only in an
-authenticated protected-branch context, after both ISA variants certify. It
-uses a private Git index to commit both compact ISA result JSONs and one merged
-high-water file, without rerunning hooks or changing the runner checkout. ISA is part of
-the measurement identity, so neither ISA overwrites or ratchets against the
-other's scores. Both certified images are pushed first; a registry failure
-cannot advance Git or its high-water marks. A normal fast-forward Git
-push rejects branch races; a race may leave an unreferenced certified registry
-image, never a checked-in claim for an unpublished image.
-The result commit points back to the tested source SHA; it does not pretend
-that the bookkeeping commit produced another tested binary. A failure leaves
-reports available and never force-pushes or merges untested source.
+This local certificate format is separate from release evidence. The active
+release workflow promotes the already tested image digests without adding a
+layer or rebuilding; it retains test receipts, accuracy CSVs and benchmark/
+OpenCode proof as GitHub release assets. Its dependent high-water job owns the
+certified ancestry/evidence commit on develop. The standalone driver's retained
+`--publish` capability is not the repository release procedure and is not
+authorized by an ordinary local qualification request.
 
 The source pre-commit hook remains Unit + ProductionTestPreflight only.
 Performance is never part of that model-free hook.

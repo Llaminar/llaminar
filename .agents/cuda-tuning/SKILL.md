@@ -670,10 +670,12 @@ GEMM got faster. When the kernel is at the register ceiling, only **register-neu
 ## Step 6: Record the result
 
 - Production high-water marks live in `benchmarks/production/high_water.json`.
-  Only the official successful production pipeline commits those marks, after
-  both ISA images complete the canonical `llaminar-testing` certification
-  sequence, including generation regression, the full E2E suites and benchmarks.
-  Full mathematical HF parity is an explicit diagnostic, not a routine CI gate. Use
+  The certified RC release workflow publishes upward-only marks to `develop`
+  after the RC squash merge into `master`. Follow `llaminar-testing` for the
+  complete preflight, blessed frozen-history numerical panels, OpenCode stress
+  and benchmark gates. Standalone HTTP suites are optional diagnostics; the
+  release serving proof comes from OpenCode. Broader mathematical campaigns
+  remain explicit diagnostics. Use
   `scripts/ci/run_model_parity_benchmarks.py --diagnostic` for one-off experiments;
   these reports cannot certify images or advance marks. See `docs/production-ci.md`.
 - Note rejected experiments and *why* (regression cause) so they aren't retried blindly.

@@ -103,7 +103,9 @@ can include device call frames; static stack instructions alone do not prove
 executed spill traffic. Attribute resources to one exact loaded symbol and SM.
 Pinned SHM mappings absent from `/proc/PID/numa_maps` do not prove NUMA locality.
 Retain these limits alongside any isolated protocol or dispatch experiment;
-promote defaults only after matched unobserved Release/model and HTTP gates.
+promote defaults only after matched uninstrumented Release/model validation.
+Release certification follows the testing skill's RC numerical, OpenCode and
+benchmark gates; standalone HTTP probes remain focused diagnostics.
 
 Experimental GPU DSOs must match the production architecture, math flags and
 relocatable-device-code policy. Authenticate those options and loaded core

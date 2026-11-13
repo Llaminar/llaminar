@@ -1,6 +1,6 @@
 ---
 name: llaminar-testing
-description: Run, extend, maintain, and diagnose Llaminar's testing and certification workflow, including Unit and production-preflight gates, generation regressions, mathematical model parity, HTTP and remote-MPI E2E, and benchmark-certified Docker images. Use when selecting or running these gates, extending the canonical matrix, or investigating test failures. Kernel tuning and cross-engine performance comparisons have separate skills.
+description: Run, maintain, and diagnose Llaminar's Unit/host PR checks and RC release gates, including full production preflight, frozen-history numerical panels, OpenCode stress and benchmarks. Use for test selection, canonical matrix changes and focused parity or HTTP/MPI diagnostics. Kernel tuning and cross-engine comparisons have separate skills.
 ---
 
 # Llaminar Testing
@@ -17,7 +17,17 @@ independent CPU/FP32 reference pack generated from the same real GGUF. Preserve
 every stage comparison and canonical CSV while amortizing immutable model setup;
 numerical checkpoints, not an extra whole-model hash pass, prove weight equivalence.
 
-## Routine regression versus mathematical diagnosis
+**The default numerical acceptance regime for every model family is a
+multi-prompt, frozen-history final-logit panel**, with separate prefill and
+decode scoring, mean KL, top-1 agreement and top-5 overlap. This applies to
+dense and MoE models on every backend and topology, including non-QFN models.
+Before running a PyTorch parity test that has not migrated, convert it to the
+panel contract through the existing framework; do not run the legacy test as
+a substitute. Preserve full layer/stage replay of the panel's exact histories
+for diagnosis. Read [accuracy panels](references/accuracy-panels.md) for the
+measurement contract, migration requirements and implementation boundaries.
+
+## PR checks, RC releases and diagnostics
 
 The RC release gate is **complete Unit/production preflight → frozen-history
 numerical panels → six five-phase OpenCode sessions → benchmark gates →
@@ -28,13 +38,13 @@ scope is dense Qwen3.8 and QFN, each on 4×ROCm TP, 2×CUDA TP and
 The RC gate does not run a separate HTTP suite. Manual generation, HTTP and
 cross-host diagnostic tools below remain explicit independent workflows.
 
-Generation projects only **MTP off (serial controls) and dynamic-depth MTP**
-from the canonical model/topology definitions. Both compare against the saved
-serial control outputs, requiring at least 384 continuous committed tokens.
+Optional generation regression projects **MTP off (serial controls) and
+dynamic-depth MTP** from the canonical model/topology definitions. Both compare
+against the saved serial control outputs, requiring at least 384 continuous committed tokens.
 Prompts, seeds, and each cell's explicit serial-control mapping are versioned
 in the canonical definitions. Expected token payloads are versioned in
 `Llaminar/corpora`, pinned by the source gitlink and ISA approval catalog.
-Routine tests only read those baselines; acquisition/review/publication is a
+Regression runs only read those baselines; acquisition/review/publication is a
 separate explicit workflow. Never silently regenerate answers on drift.
 Keep the fresh/full/partial prefix probes, exact repeatability, actual dynamic
 MTP activity, movement obligations and captured production-path evidence.
@@ -69,9 +79,16 @@ OCI digests, inputs and ISA. PR cache entries remain scoped to that merge ref;
 registry cache access is import-only. See `docs/production-ci.md` for host
 provisioning and cache ownership. These jobs do not use GitHub cloud runners.
 
+Start ordinary work from current `develop` on `feat/<description>`; push and
+open a PR into `develop`. Use Conventional Commit messages and PR titles. See
+[AGENTS.md](../AGENTS.md#branch-and-release-workflow) for branch policy and the
+documentation/CI-only maintenance exception. Use the current protected
+workflow definitions when working from an older feature checkout.
+
 The develop ruleset requires both `Develop PR / Unit + host (AVX2)` and
-`Develop PR / Unit + host (AVX512)`, an up-to-date merge candidate and owner approval. The separate owner-approval ruleset uses
-only `@Llaminar/repository-approvers` on both protected branches. Native squash
+`Develop PR / Unit + host (AVX512)`, an up-to-date merge candidate and owner
+approval. The separate owner-approval ruleset uses only
+`@Llaminar/repository-approvers` on `develop`, `rc/*` and `master`. Native squash
 auto-merge waits for reviews and checks. The owner's PR-only approval override
 and dedicated release-evidence deploy key retain their existing exceptions.
 The develop CI ruleset also permits a PR-only repository-administrator bypass
@@ -87,8 +104,10 @@ tests and grants no certificate. Publication has one concurrency group and
 cancels a superseded build when a new develop merge arrives. Complete Unit and
 production preflight remain mandatory in the explicit production pipeline
 through `run_production_prerequisites.py`. Production hardware has its own queue.
-The release path is **develop → rc/* → master**. Cut an RC only from a
-protected-develop commit with both source-pinned images already published.
+The release path is **develop → rc/* → master**. Only explicit user direction
+starts a release candidate or master PR. Cut an RC only from a protected-develop
+commit with both source-pinned images already published. If maintenance skipped
+that publication, dispatch `ci.yml` on `develop` and wait for the pair first.
 Master rejects direct develop PRs. An RC may advance only through a develop PR
 whose resulting tree equals its develop source exactly; fixes remain ordinary
 develop work, and replacing a frozen candidate means cutting a fresh RC.
@@ -147,7 +166,8 @@ cache. Never point two Docker daemons at the same writable data root. Its
 workspace and model tmpfs mounts are explicit same-path roots declared through
 `LLAMINAR_DOCKER_SHARED_ROOTS`; consult `docs/production-ci.md` before changing
 the runner deployment.
-Do not run fixed-depth MTP cells or mathematical HF parity by default.
+Run broader mathematical or fixed-depth MTP campaigns only for an explicitly
+selected diagnostic. This does not waive the required RC numerical panels.
 
 For detailed debugging of a numerical inference failure (including token drift,
 high KL divergence, NaN/Inf, or unexpected MoE routing), use the **production
@@ -162,8 +182,9 @@ expected tokens or routinely launch the entire expensive mathematical matrix.
 Fixed-depth mathematical coverage remains available for focused diagnosis;
 the full mathematical suite is explicit opt-in only.
 For an image pipeline, `--diagnostic-mathematical-parity` is that explicit
-opt-in; `--through parity` alone is rejected. The normal piecewise boundaries
-are `--through prerequisites` and `--through generation` before HTTP E2E.
+opt-in; `--through parity` alone is rejected. That standalone diagnostic pipeline
+offers `--through prerequisites` and `--through generation` boundaries before
+its HTTP tests; it does not define the RC workflow's phases.
 The procedures below for numerical campaigns describe that diagnostic workflow,
 not an additional routine CI regression gate.
 
@@ -176,7 +197,7 @@ For model/generation/HTTP runs, read `tests/v2/integration/parity/README.md` and
 the applicable model definition or fixture. For image certification and remote
 infrastructure, also read `docs/production-ci.md`.
 
-A production parity cell must:
+A full-stage production parity cell must:
 
 - load real weights and execute the production runner, graph, kernels,
   collectives, streams, arenas, and KV policy;
@@ -207,13 +228,14 @@ substitute for the production path.
   `scripts/ci/run_production_prerequisites.py --build-dir BUILD --output NEW_DIR`
   or the direct CMake/CTest commands below. Refresh once after a build or test
   inventory change, not for every unchanged diagnostic cell.
-- For public-surface generation regression, use
+- For optional public-surface generation regression, use
   `scripts/ci/run_model_parity_generation.py --mode regression`; follow the parity README's
   control acquisition, exact-token, prefix-restore and movement contracts.
   Diagnostic controls do not automatically certify an image.
-- For HTTP needle/long-context tests, use `scripts/ci/run_model_parity_e2e.py`;
-  for remote MPI, follow **Cross-host E2E certification** below. Both derive
-  their eligible cells from the canonical definitions.
+- For focused HTTP needle/long-context diagnostics, use
+  `scripts/ci/run_model_parity_e2e.py`; for remote MPI, follow **Cross-host E2E
+  diagnostics** below. Both derive their eligible cells from canonical
+  definitions. Neither is a required RC phase.
 - For captured GPU stage-timing diagnostics, use the CUDA tuning skill's
   `references/native-graph-events.md` and its named-stage observer/report
   procedure. The current standalone observer consumes CUDA graphs. Canonical
@@ -247,9 +269,11 @@ substitute for the production path.
   cases when changing ownership; then run complete prerequisites and Release
   HTTP prefix/MTP cells. Allocation counters and a matched host-boundary trace
   must show setup materialization with no native pinned allocation in prefill.
-- For complete AVX512/AVX2 image and benchmark certification, use
-  `scripts/ci/run_production_pipeline.py` and `docs/production-ci.md`. Both full
-  E2E server suites precede benchmarks; one-off benchmarks cannot certify images.
+- For release certification, follow `master-pr-certification.yml` and
+  `docs/production-ci.md`: complete preflight → blessed numerical panels →
+  OpenCode → benchmarks → eligibility, on the frozen published image pair.
+  `run_published_image_suite.py` authenticates each phase's predecessors;
+  standalone local results cannot satisfy the required PR checks.
   Benchmarks consume the canonical `benchmark` production-default projection,
   not HTTP `server_args`: depth-15 initialization, forced movement and other
   correctness stress overrides must not enter timing. Preserve model/topology,
@@ -262,25 +286,36 @@ substitute for the production path.
   `run_model_parity_benchmarks.py --diagnostic --diagnostic-binary PATH` with
   the complete exported typed E2E manifest. This local Release run preserves
   the canonical 512-token prefill/256-token decode workload and all cells but
-  cannot mint an image certificate. Verify newly tagged HTTP cells locally as
-  well; only the published-image PR workflow can certify the image pair.
+  cannot mint a release certificate. Qualify the affected serving behavior
+  through the matching native/OpenCode cell; a new diagnostic topology is not
+  automatically an additional blessed release cell.
+- For explicitly requested standalone image qualification, use
+  `scripts/ci/run_production_pipeline.py`. Its generation, HTTP and cross-host
+  sequence is separate from the RC release gate. It cannot authorize an RC merge
+  or replace the release publisher's evidence admission.
 - To explicitly inventory or run diagnostic mathematical campaigns, follow **Run a campaign**.
+- For numerical acceptance, first follow
+  [accuracy panels](references/accuracy-panels.md), including migration before
+  running an older PyTorch parity test. Panel acceptance and full-stage replay
+  use the same model, configuration and frozen token histories.
 - For a numerical or path failure, also read
   [CSV evidence](references/csv-evidence.md).
 - To regenerate, authenticate, or change the Python oracle, also read
   [Hugging Face reference](references/huggingface-reference.md).
 - To add a backend, model, precision, topology, MoE policy, placement, or MTP
   depth, follow **Extend the matrix**; validate new math explicitly before
-  acquiring controls, then exercise the routine generation projection.
+  acquiring diagnostic controls. Extend numerical coverage without adding
+  blessed release cells unless the user explicitly changes the blessed scope.
 - For a discovered defect, add a focused regression before folding the
   invariant into its production cell.
 
-### Cross-host E2E certification
+### Cross-host E2E diagnostics
 
-Remote MPI cases are another typed E2E projection, not a second model matrix.
+Remote MPI is an optional diagnostic outside the RC gate. Its cases are another
+typed E2E projection, not a second model matrix.
 The builder writes `cross-host-manifest.json` from the full inventory; the
-production pipeline runs the HTTP long-needle suite first, then
-`scripts/ci/run_production_cross_host_e2e.py`, and only then benchmarks. The
+explicit standalone production pipeline runs the HTTP long-needle suite first,
+then `scripts/ci/run_production_cross_host_e2e.py`, and only then benchmarks. The
 runner uses the existing Azure CLI login (CI performs federated login), creates
 fresh owner-tagged CPU VMs through `azure_cross_host_resources.py`, stages the
 immutable controller image and every declared model shard, and invokes the public HTTP
@@ -663,8 +698,9 @@ proof. MoE MTP inherits the same policy and placement movement contract.
 1. Preserve the failing result directory and global report.
 2. Confirm model/reference identity and production path before changing any
    tolerance.
-3. Find the first failing phase, decode step, layer, and stage from the CSVs;
-   later divergence is usually propagation, not the cause.
+3. For a panel failure, replay its exact prompt and teacher continuation through
+   the full-stage framework. Find the first failing phase, decode step, layer,
+   and stage from the CSVs; later divergence is usually propagation, not the cause.
 4. Compare shape/count, NaN/Inf, routing identity, cosine, relative L2, maximum
    absolute error, RMSE, SNR, distribution drift, KL, and Top-K evidence.
 5. Map the first bad stage to graph wiring, tensor layout, kernel arithmetic,
@@ -690,7 +726,7 @@ an Integration test is model-free and guards campaign infrastructure or a
 production mechanism used by parity, add its existing CTest registration to
 `V2_PRODUCTION_TEST_PREFLIGHT_TESTS`; do not copy either inventory into the
 Python driver. Then rerun both prerequisite phases and the affected diagnostic
-cell before resuming routine generation regression. Run the full mathematical
+cell before resuming the interrupted gate or diagnostic. Run the full mathematical
 matrix only when explicitly requested.
 
 If only the full campaign fails, inspect reuse boundaries: `ModelContext` may
@@ -734,8 +770,10 @@ definition and registration source. Prefix restore is not a multiplicative
 axis: every generated production cell automatically proves fresh seed, full
 hit, and partial hit through the production tiered cache.
 
-After the affected slice is green, run framework checks and routine generation
-regression. The complete mathematical command below is explicit diagnosis only:
+After the affected slice is green, run framework checks and the affected
+diagnostic projection. Release eligibility remains limited to the six blessed
+cells; expanding a diagnostic matrix does not expand release scope. The complete
+mathematical command below is explicit diagnosis only:
 
 ```bash
 python3 tests/v2/unit/scripts/test_production_parity_campaigns.py
