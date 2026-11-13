@@ -5095,3 +5095,29 @@ check -> T' -j4 sole -> byte-identity serialized -> develop-control
 last). Nothing launched; all evidence sealed on disk. .79 seal dir
 complete (verified 22:24Z); .80 triage building (verified); sparks'
 formal reports pending.
+
+### .79 SEALED GATE DONE (03480d07e) + .80 triage BLOCKED at build (23:50Z)
+
+SPARKS .79: BUILD clean; DRIVER preflight = 4494 tests, 221 failed
+(56 host + 126 exclusive + 39 cuda-socket); bucket-b names present
+in the JUnit (MoEPipeline* x7, MoEOverlayHostDemandAdmission,
+MoEOverlayPhysicalBudgetIdentity, CPUExpertShardAccounting,
+CPUJoint{StaticResidency,SourceAuthority}Lifecycle, ExpertTier
+EndpointLayoutIdentity, CPUTensorTP1PreparedStaticReplay,
+AutomaticPlanningDiagnostics_CompleteSelection) = MAIN'S CHAIN-
+INTRODUCED CLASSIFICATION CONFIRMED at the sealed tip; FOCUS 16/19
+(3 known: whole-binary CUDA_ExpertTierWeightKernels skip-regex,
+V2_Perf_CUDA_ExpertTierWeightStreaming, ExpertTierEndpoint
+LayoutIdentity [bucket-b]); CUDA-filtered 26/26 PASS (UNQUALIFIED
+record holds). Seal K14-STAGEAGATE-03480D07E being written
+(discriminator + install3 narrative). .80 TRIAGE BLOCKED AT BUILD
+(verbatim): "reference to 'ClusterInventory' is ambiguous" —
+stale forward decl `struct ClusterInventory;`
+(MoEOverlayCapacityAdmission.h:29 via MoEPipelineMemoryAdmission.h
+-> OrchestrationCandidateAdmission.h) vs llaminar2::ClusterInventory
+(DeviceInventory.h:296); same in Test__OrchestrationCandidate
+Admission.cpp:23. Mac-coverage gap class (affected TUs Linux-only;
+.80 focused build = first real compile). LANE FIX DISPATCHED
+(remove/qualify the forward decl; extend the TU-compile probe rule
+to MoE/planning headers; fix SHA -> sparks re-pins .80 replacing
+the b660 pin... [note: sparks holds; earlier-SHA pin rejected]).
