@@ -3920,3 +3920,27 @@ gate evidence -> Gate-A reviewer pass on the full Stage-A range
 d5e04fdce..fixed tip. Sparks re-dispatched (a3b diagnostic + A3
 binding run superseded/skipped); WSL leg dispatches with the fixup
 SHA. Main routes the A3 pin now.
+
+### A3 REVIEWER INTERIM (12:59Z): R1+R2 identity gaps — pre-staged into the combined fixup
+
+Reviewer @ 17789eb05 (Main-confirmed): R1 = division-by-zero class
+(baseManifest derives strides from the sealed layout WITHOUT section
+checks -> compact-labelled 0/0; requireCanonicalCpuRoot accepts the
+matching zero-stride root; sealCpuWire :631 divides by
+cpu_block_stride/64==0 before seal/valid). FIX: baseManifest derives
+PreparedUnitSections once + throws on !isValid() BEFORE strides;
+sealCpuWire rejects <64/not-aligned as guard; regression = both
+CPU-root builders, zero-stride root rejected before arithmetic.
+R2 = identity not propagated (remote manifest valid() :492-496
+re-derives from ENCODING-ONLY canonical overloads, never consults
+identity.cpu_endpoint_layout -> compact-labelled canonical-stride
+manifest is VALID; the test even asserts it ~:546; remoteCpu-
+ProjectionStorageLayout :834-842 builds without cpu_layout ->
+valid CANONICAL storage layout). FIX: valid() uses layout-aware
+sections from the sealed identity (valid + strides equal); storage
+layout passes .cpu_layout; test flips to expect INVALID; grep
+remaining encoding-only stride-overload uses outside tables/
+pricing scalars, LIST same-class validators in the commit. HOLD:
+reviewer still finishing A3 — ONE combined fixup (F1+F2+R1+R2+
+final items) on 569de492b when the verdict lands; Stage-A gate runs
+once on that tip. A2 2-cell rerun stands; A3 pin routed on source.
