@@ -3809,3 +3809,16 @@ before allocation) as a KNOWN ITEM — A4 or a fixup must close it
 before compact tables are unlocked. Board: sparks on the two binding
 re-runs; lane on A4/A3-B1; reviewer loaded with pre-staged packages;
 PR 43 OPEN.
+
+### AUDIT 11:53Z EXCEPTION: a3b ctest phase never ran (missing results dir)
+
+A3 diagnostic run @ 848030067: full build CLEAN (BUILD=0, DONE_BUILD,
+1.48MB log — build evidence stands) but ctest never executed — the
+output redirect failed on the never-created /w/a3b-results/ (CT=1,
+zero tests). Second DONE-marker-class incident tonight. Corrective
+dispatched: mkdir + rerun the ctest phase only (2 shared-.inc cells
+expected red at this pre-fix tip, rest green = the diagnostic
+artifact set), then the binding sequence (A2 @ 1f92dca1c -> A3 @
+17789eb05; both pins armed). Runbook addition: post-phase artifact-
+existence checks in all run scripts. PR 43 OPEN; .80 idle; lane on
+A4/A3-B1 (in flight).
