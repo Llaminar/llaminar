@@ -3409,3 +3409,18 @@ HAVE_ROCM=OFF, cnpy, EVERYTHING incl. distributed_residency binary;
 native GB10 test set incl. new Q6 registration + 3 members; JUnit
 --no-tests=error; K14-A2CUDAB-433E84632). A2 pin to reviewer waits
 on Main review + build. A1 qualification call pinged at 36m.
+
+### WATCH 05:20Z: A1 completion GREEN; A2 boundary build running; A3 resumed
+
+A1 completion run @ 9222e9c7a GREEN (a1h-completion.log CT=0;
+junit-completion.xml tests=5 failures=0 @ 05:11Z) — the 3 previously-
+red members + family pass with the binary built. COMPLETE A1 artifact
+set now exists: reviewer ACK @ 9222e9c7a + named-scope green +
+completion green + amended honest seal + disclosure. Main's
+qualification call = acceptance (routed 05:21Z). A2 boundary build
+RUNNING on .79 (tip-a2b @ 433e84632, configure OK 05:16Z, build log
+growing; hardened pattern). Lane re-pinged to resume A3 on 433e84632
+(v8 promotion + carried identity offsets; v8-only constraint until
+A2 pin ACKs; A3 = the gate that unlocks compact tables). Main idle
+with A2 fixup review pending (21m) — within threshold after the
+04:59Z ping. PR 43 OPEN. .80 sealed/idle.
