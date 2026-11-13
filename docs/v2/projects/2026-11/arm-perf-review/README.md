@@ -3487,3 +3487,17 @@ sweep of the new Q6 bodies. Sparks holds; a2b logs = evidence;
 verbatim + corrected diagnosis go to the reviewer with the A2 pin.
 Relayed-diagnosis verification rule vindicated again (error text,
 not just test results).
+
+### WATCH 06:50Z: Main 90m silent — consolidated digest sent; morning flag set
+
+Branch tip 907717f0d (A3 rebased; .inc fix-back in flight — lane
+compacted to 28% ctx, working). Main idle 90m on A1 acceptance +
+A2 review routing (pings 04:59Z/05:53Z unanswered). Digest sent
+06:50Z: (1) A1 = one word, artifacts complete since 05:11Z; (2) A2
+review target MOVED to the corrected tip (compile fixes; verbatim +
+corrected diagnosis ready for the pin); (3) A3 source review can
+start anytime. PR 43 OPEN; sparks holds .79 (A1 completion sealed
+green); reviewer held for successor request. MORNING FLAG: if Main
+still silent, the operator report notes the 90m+ unresponsiveness
+(material work unblocked — all evidence produced and stable; only
+pin routing + the A1 word pending).
