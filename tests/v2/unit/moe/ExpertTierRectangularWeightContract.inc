@@ -36,6 +36,68 @@ TEST(ExpertTierWeightStream, OriginalProjectionIntersectionsRetainIndependentCoo
         EXPECT_EQ(ExpertTierWeightProjectionIntersection::between(whole,shard).rows(),256/population);
     }
 }
+/** @test The Q6 partial-unit window geometry pins live rows and exactly two whole K blocks.
+ *
+ * Device-free mirror of the CUDA/ROCm PartialQ6Units contract's window: the
+ * constructed target must intersect the 512-wide source in exactly the
+ * 64-column window [64,128) the contract's comment, unit counts, per-chunk
+ * accounting and guarded-extent checks all state. A target rectangle wider
+ * than the intended window silently doubles the intersection's block count
+ * and desynchronizes every derived quantity; this geometry pin fails on the
+ * host before a device lane can burn a boundary cycle on it. */
+TEST(ExpertTierWeightStream, PartialQ6WindowGeometryPinsLiveRowsAndTwoWholeBlocks)
+{
+    using P=MoEExpertProjectionOwnership::Projection;using R=MoEProjectionResidence;
+    for(const int live_rows:{12,37,64})
+    {
+        SCOPED_TRACE(live_rows);
+        const int from_rows=live_rows-13+72;
+        constexpr int K=512;
+        const auto forward=ExpertTierWeightProjectionIntersection::between(
+            P{R::ParticipantOutputSlice,256,1024,13,from_rows,32,K},
+            P{R::ParticipantInputSlice,256,1024,72,160,64,64});
+        ASSERT_EQ(forward.rows(),live_rows);
+        ASSERT_EQ(forward.columns(),64);
+        EXPECT_EQ(forward.sourceRowOrigin(),59);
+        EXPECT_EQ(forward.sourceColumnOrigin(),32);
+        EXPECT_EQ(forward.destinationRowOrigin(),0);
+        EXPECT_EQ(forward.destinationColumnOrigin(),0);
+        const auto demotion=makeGpuToCpuExpertTierWeightStreamManifest(
+            native_quantised_formats::Q6_K,
+            cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
+            from_rows,K,82,0,7,ExpertTierWeightProjection::Down,2).forIntersection(forward);
+        const auto down=demotion.deviceLayout();
+        ASSERT_TRUE(down.valid());
+        // One live 64-row chunk at most, exactly two whole 32-value blocks:
+        // the partial-row wire quotes live rows, never padded capacity.
+        EXPECT_EQ(down.unit_count,2u);
+        EXPECT_EQ(down.cpu_block_stride,1792u);
+        EXPECT_EQ(demotion.total_stream_bytes,
+            size_t(live_rows)*2u*(down.cpu_block_stride/64u));
+        // The promotion mirror is the 64-column destination root: three
+        // padded row chunks by two blocks, narrowed to the same two units.
+        const auto backward=ExpertTierWeightProjectionIntersection::between(
+            P{R::ParticipantInputSlice,256,1024,72,160,64,64},
+            P{R::ParticipantOutputSlice,256,1024,13,from_rows,32,K});
+        cpu::native_quantised::CPUNativeQuantisedPackedWeights destinationCPU;
+        destinationCPU.N=160;destinationCPU.K=64;destinationCPU.N_padded=192;destinationCPU.blocks_per_row=2;
+        destinationCPU.payload_bytes=native_quantised_formats::Q6_K.payload_bytes;
+        destinationCPU.codebook_id=native_quantised_formats::Q6_K.codebook_id;
+        destinationCPU.is_superblock=native_quantised_formats::Q6_K.is_superblock;
+        destinationCPU.is_asymmetric=native_quantised_formats::Q6_K.is_asymmetric;
+        destinationCPU.encoding=cpu::native_quantised::preparedEncodingForSource(
+            native_quantised_formats::Q6_K,false);
+        destinationCPU.data_stride=down.cpu_data_stride;
+        destinationCPU.interleaved_block_stride=down.cpu_block_stride;
+        destinationCPU.native_interleaved.resize_uninitialized(down.cpuStorageBytes());
+        const auto promotion=makeCpuToGpuExpertTierWeightStreamManifest(
+            destinationCPU,83,0,7,ExpertTierWeightProjection::Down,2).forIntersection(backward);
+        const auto up=promotion.deviceLayout();
+        ASSERT_TRUE(up.valid());
+        EXPECT_EQ(up.unit_count,2u);
+    }
+}
+
 TEST(ExpertTierWeightStream, RectangularEncodedColumnsAllFormatsPreserveNeighboursAndLiveBytes)
 {
     using P=MoEExpertProjectionOwnership::Projection;using R=MoEProjectionResidence;

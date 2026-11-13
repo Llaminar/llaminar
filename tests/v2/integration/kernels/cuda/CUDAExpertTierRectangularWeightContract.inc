@@ -114,7 +114,7 @@ TEST_F(CUDAExpertTierWeightKernelsTest, PartialQ6UnitsCarryTheHighPlaneInsideThe
         const int from_rows=live_rows-13+72;
         constexpr int K=512;
         const P originalSource{R::ParticipantOutputSlice,256,1024,13,from_rows,32,K};
-        const P originalTarget{R::ParticipantInputSlice,256,1024,72,160,64,128};
+        const P originalTarget{R::ParticipantInputSlice,256,1024,72,160,64,64};
         const auto forward=ExpertTierWeightProjectionIntersection::between(originalSource,originalTarget);
         const auto backward=ExpertTierWeightProjectionIntersection::between(originalTarget,originalSource);
         ASSERT_EQ(forward.rows(),live_rows);
@@ -134,7 +134,7 @@ TEST_F(CUDAExpertTierWeightKernelsTest, PartialQ6UnitsCarryTheHighPlaneInsideThe
         const ExpertTierGpuConstProjectionView in{input.data(),scales.data(),mins.data(),emins.data(),input.bytes(),scales.bytes(),mins.bytes(),emins.bytes()};
         ASSERT_TRUE(in.validFor(down));
         cpu::native_quantised::CPUNativeQuantisedPackedWeights destinationCPU;
-        destinationCPU.N=160;destinationCPU.K=128;destinationCPU.N_padded=192;destinationCPU.blocks_per_row=4;
+        destinationCPU.N=160;destinationCPU.K=64;destinationCPU.N_padded=192;destinationCPU.blocks_per_row=2;
         destinationCPU.payload_bytes=cpu.payload_bytes;destinationCPU.codebook_id=cpu.codebook_id;destinationCPU.is_superblock=cpu.is_superblock;destinationCPU.is_asymmetric=cpu.is_asymmetric;
         destinationCPU.encoding=cpu.encoding;destinationCPU.data_stride=cpu.data_stride;destinationCPU.interleaved_block_stride=cpu.interleaved_block_stride;
         destinationCPU.native_interleaved.resize_uninitialized(down.cpuStorageBytes());
