@@ -9,6 +9,7 @@
 #pragma once
 
 #include "../ModelParityDefinition.h"
+#include "../ModelParityReleaseTopologies.h"
 #include "../qwen36/Qwen36MTPCheckpointSurface.h"
 
 namespace llaminar2::test::parity::qwen38
@@ -48,29 +49,6 @@ namespace llaminar2::test::parity::qwen38
         definition.precisions.activation = {ActivationPrecision::FP32};
         definition.precisions.kv_cache = {KVCachePrecision::FP16};
         definition.features.mtp = ModelParityAxisProfile::Standard;
-        // Each declared GPU topology certifies adaptive MTP through automatic
-        // frontend selection; fixed-depth cases remain mathematical diagnostics.
-        if (!definition.topology.participants.empty() &&
-            std::all_of(definition.topology.participants.begin(), definition.topology.participants.end(),
-                [](const auto &participant) { return !participant.address.isCPU(); }))
-        {
-            // Exercise the selected admitted single-device context for each
-            // certification GPU. The 24-GiB CUDA configuration requires an
-            // 8K profile to leave space for this IQ4_XS model's complete
-            // captured physical BOM; the 32-GiB MI50 admits 32K. Keep this
-            // capability fact in the typed profile, not in the HTTP runner.
-            ModelParityE2EProfile profile;
-            if (definition.topology.kind == ModelParityTopologyKind::SingleDevice &&
-                definition.topology.participants.front().address.isROCm())
-            {
-                profile.context_length = 32768;
-                profile.minimum_prompt_tokens = 16384;
-            }
-            definition.e2e_certifiable = {{
-                .mtp = ModelParityMTP::DynamicDepth,
-                .profile = profile,
-            }};
-        }
         return definition;
     }
 
@@ -113,6 +91,13 @@ namespace llaminar2::test::parity::qwen38
             .tensor_parallel_collective = Collective::HETEROGENEOUS,
             .pipeline_tensor_parallel_collectives = {Collective::NCCL, Collective::RCCL},
         }, "pytorch_qwen38_dense_cuda2_rocm2_tppp_snapshots"));
+        for (auto topology : modelParityReleaseTopologies())
+        {
+            auto definition = qwen38DenseParityDefinition(std::move(topology),
+                "pytorch_qwen38_dense_release_snapshots");
+            definition.e2e_certifiable = {{.mtp=ModelParityMTP::DynamicDepth}};
+            definitions.push_back(std::move(definition));
+        }
         return definitions;
     }
 } // namespace llaminar2::test::parity::qwen38

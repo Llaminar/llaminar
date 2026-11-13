@@ -1,0 +1,13 @@
+name: Ensure GitHub CLI
+description: Provide the metadata/release client on the minimal Xeon ARC runner.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        if ! command -v gh >/dev/null; then
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends gh
+        fi
+        gh --version

@@ -362,32 +362,19 @@ namespace llaminar2::test::parity::qwen36
         definition.collective_evidence_source =
             ParityCollectiveEvidenceSource::PostCollectiveSnapshot;
         definition.tp_allreduce_precision_override = "schema";
-        if (definition.topology.kind == ModelParityTopologyKind::SingleDevice &&
-            definition.topology.participants.size() == 1 &&
-            !definition.topology.participants.front().address.isCPU())
-        {
-            definition.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth}};
-            // Remote certification is model-owned and provider-independent.
-            // The source cell keeps its existing single-device numerical test;
-            // the E2E exporter adds both public routes for each remote pool.
-            if (definition.topology.participants.front().address.isROCm())
-                definition.e2e_certifiable.front().remote_cpu_overlays = {
-                    ModelParityRemoteCPUHosts{1}, ModelParityRemoteCPUHosts{2}};
-        }
         return definition;
     }
 
     /**
-     * @brief Tag an existing ExpertOverlay matrix for public HTTP certification.
+     * @brief Build the existing ExpertOverlay numerical matrix without release eligibility.
      * @param topology Complete declared overlay, including its compute policy.
      * @param reference_directory Independent real-weight HF checkpoint pack.
-     * @return Unpruned standard matrix with one Dynamic/Ordinal/adaptive HTTP tag.
+     * @return Unpruned standard numerical matrix; release eligibility belongs to the six-cell matrix.
      * @throws std::invalid_argument When no ExpertOverlay plan is declared.
      *
-     * Whole-expert and projection-owned controls use the same profile so the
-     * canonical benchmark projection can compare them without a runner-side
-     * topology list. CPU callers may explicitly extend their ISA deadline;
-     * neither this tag nor that deadline changes mathematical cell geometry.
+     * Whole-expert and projection-owned controls retain the same numerical axes.
+     * The bounded release matrix owns runtime eligibility separately; these
+     * legacy model definitions cannot add blessed configurations.
      */
     inline ModelParityDefinition qwen36MoEExpertOverlayCertificationDefinition(
         ModelParityTopologyDefinition topology,
@@ -398,11 +385,6 @@ namespace llaminar2::test::parity::qwen36
         auto definition = qwen36MoEParityDefinition(
             std::move(topology), std::move(reference_directory),
             qwen36MoEExpertOverlayThresholds());
-        definition.e2e_certifiable = {{
-            .mtp = ModelParityMTP::DynamicDepth,
-            .owner_order = RoutedExpertOwnerOrder::Ordinal,
-            .movement = ModelParityExpertMovement::Dynamic,
-        }};
         return definition;
     }
 
@@ -425,17 +407,12 @@ namespace llaminar2::test::parity::qwen36
             std::move(reference_directory));
     }
 
-    /** @return Full CPU two-socket matrix with one Dynamic/adaptive HTTP tag. */
+    /** @return Full CPU two-socket numerical matrix without release eligibility. */
     inline ModelParityDefinition qwen36MoECPU2NodeTPParityDefinition()
     {
         auto definition = qwen36MoEExpertOverlayCertificationDefinition(
             qwen36MoECPU2NodeTPTopology(),
             "pytorch_qwen36_moe_singledevice_cpu_snapshots");
-        // The complete AVX2 CPU workload needs twenty minutes, including the
-        // final near-limit prefill after 2,048-token generation. This is a
-        // model/topology declaration, not a timeout inferred by either runner.
-        // AVX512 and every other topology retain the standard fifteen minutes.
-        definition.e2e_certifiable.front().profile.cell_timeout_seconds.avx2 = 1200;
         return definition;
     }
 } // namespace llaminar2::test::parity::qwen36

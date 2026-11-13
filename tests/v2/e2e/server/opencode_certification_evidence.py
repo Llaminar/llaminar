@@ -1,3 +1,5 @@
+## @file opencode_certification_evidence.py
+# @brief Authenticate the complete app workload before it enters a CI receipt.
 """Authenticate the complete app workload before it enters a CI receipt.
 
 The live harness retains raw client/native evidence. This compact boundary
@@ -28,7 +30,7 @@ def positive_seconds(value: object) -> bool:
 def validate_app_report(report: dict, *, model: str, context_tokens: int,
                         output_tokens: int = 32768,
                         reply_reserve_tokens: int | None = None) -> dict:
-    """Recompute one complete ten-phase session's qualification and counts.
+    """Recompute one complete five-phase session's qualification and counts.
 
     Context must be the caller's proven PMA admission. No elapsed-time or
     inactivity limit participates in certification. The prompt sequence comes

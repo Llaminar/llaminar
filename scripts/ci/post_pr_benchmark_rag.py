@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file post_pr_benchmark_rag.py
+# @brief Render the authenticated benchmark gate for its explicit evidence scope.
 """Post an idempotent red/amber/green benchmark receipt on a master PR.
 
 The authoritative pass/fail decision stays in the image-bound benchmark
@@ -38,7 +40,7 @@ def render(report: dict | None, revision: str, run_url: str) -> str:
         return "\n".join(lines + ["🔴 Benchmark evidence is unavailable; inspect the workflow logs.", ""])
     if (report.get("source", {}).get("revision") != revision
             or set(report.get("variants", {})) != set(ISAS)
-            or report.get("scope") != "full-http-e2e-and-benchmarks"
+            or report.get("scope") not in ("full-http-e2e-and-benchmarks", "release-preflight-and-benchmarks")
             or not isinstance(report.get("regression_threshold_pct"), (int, float))):
         raise ValueError("RAG report does not belong to this exact PR image pair")
     comparisons = [comparison for isa in ISAS

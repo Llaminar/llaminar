@@ -1,56 +1,72 @@
-name: Master PR — published-image certification
-run-name: "master PR #${{ github.event.pull_request.number }} — ${{ github.event.pull_request.head.sha }}"
-
-# Required PR checks are emitted by this pull_request workflow itself. A
-# workflow_dispatch/workflow_run check is not attached to the PR merge ref and
-# cannot satisfy master protection. The manual E2E/benchmark workflows remain
-# useful for diagnostics; both routes call the same canonical suite driver.
-on:
-  pull_request:
-    branches: [master]
-    types: [opened, synchronize, reopened, ready_for_review]
-
+# RC jobs share the Xeon host queue, including metadata checkouts.
+# Every model phase uses its authenticated frozen develop source.
+name: Master PR — release candidate certification
+run-name: 'master PR #${{ github.event.pull_request.number }} — ${{ github.event.pull_request.head.sha }}'
 permissions:
   contents: read
   packages: read
   actions: read
   pull-requests: read
-
 jobs:
   source:
     if: ${{ !github.event.pull_request.draft }}
-    name: Admit exact develop image source
-    runs-on: ubuntu-24.04
+    name: Admit frozen RC image source
+    runs-on:
+      - llaminar-xeon-host
     timeout-minutes: 300
     steps:
+      - name: Retire legacy checkout evidence before Actions cleans the worktree
+        shell: bash
+        run: |
+          set -euo pipefail
+          legacy="$GITHUB_WORKSPACE/parity-results"
+          if [[ -d "$legacy" ]]; then
+            docker run --rm --user 0:0 --entrypoint /bin/rm \
+              --mount "type=bind,src=$legacy,dst=/legacy" \
+              "ghcr.io/${GITHUB_REPOSITORY,,}:develop-avx2" \
+              -rf /legacy/published-preflight /legacy/published-benchmarks
+          fi
       - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.pull_request.head.sha }}
           fetch-depth: 0
           submodules: false
           lfs: false
-      - name: Require this repository's develop head
+          persist-credentials: false
+      - uses: ./.github/actions/ensure-github-cli
+      - name: Admit the frozen develop → RC source tree
+        id: admit
         env:
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          REPOSITORY: ${{ github.repository }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        shell: bash
-        run: |
-          set -euo pipefail
-          [[ "$HEAD_REPO" == "$REPOSITORY" && "$HEAD_BRANCH" == develop ]] || {
-            echo '::error::master certification requires a same-repository develop PR'
-            exit 1
-          }
-          python3 scripts/ci/wait_for_develop_image_gate.py \
-            --repository "$REPOSITORY" --revision "$HEAD_SHA"
-
-  e2e:
+        run: python3 scripts/ci/release_candidate.py --output "$RUNNER_TEMP/rc-source-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/source.json"
+          --github-output "$GITHUB_OUTPUT"
+      - name: Wait for the admitted source-pinned develop image pair
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SOURCE_SHA: ${{ steps.admit.outputs.source_revision }}
+          REPOSITORY: ${{ github.repository }}
+        run: python3 scripts/ci/wait_for_develop_image_gate.py --repository "$REPOSITORY" --revision "$SOURCE_SHA"
+          --frozen-rc
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-rc-source-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/rc-source-${{ github.run_id }}-${{ github.run_attempt }}/source.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+    outputs:
+      source_revision: ${{ steps.admit.outputs.source_revision }}
+    concurrency:
+      group: llaminar-develop-image-gate
+      cancel-in-progress: false
+      queue: max
+  preflight:
     if: ${{ !github.event.pull_request.draft }}
-    name: Published E2E (AVX512 and AVX2)
-    needs: source
-    runs-on: [llaminar-xeon-host]
+    name: Full production preflight (AVX512 and AVX2)
+    needs:
+      - source
+    runs-on:
+      - llaminar-xeon-host
     timeout-minutes: 720
     concurrency:
       group: llaminar-develop-image-gate
@@ -71,11 +87,11 @@ jobs:
             docker run --rm --user 0:0 --entrypoint /bin/rm \
               --mount "type=bind,src=$legacy,dst=/legacy" \
               "ghcr.io/${GITHUB_REPOSITORY,,}:develop-avx2" \
-              -rf /legacy/published-e2e /legacy/published-benchmarks
+              -rf /legacy/published-preflight /legacy/published-benchmarks
           fi
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.source.outputs.source_revision }}
           fetch-depth: 0
           submodules: false
           lfs: false
@@ -87,87 +103,149 @@ jobs:
           cleanup: false
           keep-state: true
           cache-binary: false
-      - name: Materialize only the reviewed KL reference corpus
+      - name: Run complete Unit, production preflight on both ISAs
         env:
-          GIT_LFS_SKIP_SMUDGE: '1'
-        run: |
-          git submodule update --init -- corpora
-          git -C corpora lfs pull --include 'model-kld/qwen-gdn-alpha-beta-v1/**' --exclude ''
-      - name: Run prerequisites, QFN source admission, HTTP E2E and GPU KL on both ISAs
-        env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ needs.source.outputs.source_revision }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          exec python3 scripts/ci/run_published_image_suite.py e2e --model-kld-canaries --qfn-source-admission \
+          exec python3 scripts/ci/run_published_image_suite.py preflight \
             --repository "$REPOSITORY" --branch develop \
             --image "ghcr.io/${REPOSITORY,,}:develop-$HEAD_SHA" \
             --expected-source-revision "$HEAD_SHA" \
-            --output "$RUNNER_TEMP/llaminar-pr-e2e-$GITHUB_RUN_ID" \
+            --output "$RUNNER_TEMP/llaminar-pr-preflight-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --run-url "$GITHUB_SERVER_URL/$REPOSITORY/actions/runs/$GITHUB_RUN_ID"
-      - name: Retain compact authenticated E2E evidence
+      - name: Retain compact authenticated preflight evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pr-e2e-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
-          path: |
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/images.json
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/all-cells.json
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/manifest.json
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/e2e-receipt.json
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/prerequisites/*/*.log
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/prerequisites/*/build-timeline.jsonl
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/prerequisites/*/prerequisites/**
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx512/e2e.json
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx2/e2e.json
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx512/kld/kld-canaries.json
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx2/kld/kld-canaries.json
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx512/source-admission/**
-            ${{ runner.temp }}/llaminar-pr-e2e-${{ github.run_id }}/avx2/source-admission/**
+          name: pr-preflight-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: |-
+            ${{ runner.temp }}/llaminar-pr-preflight-${{ github.run_id }}-${{ github.run_attempt }}/images.json
+            ${{ runner.temp }}/llaminar-pr-preflight-${{ github.run_id }}-${{ github.run_attempt }}/all-cells.json
+            ${{ runner.temp }}/llaminar-pr-preflight-${{ github.run_id }}-${{ github.run_attempt }}/manifest.json
+            ${{ runner.temp }}/llaminar-pr-preflight-${{ github.run_id }}-${{ github.run_attempt }}/preflight-receipt.json
+            ${{ runner.temp }}/llaminar-pr-preflight-${{ github.run_id }}-${{ github.run_attempt }}/prerequisites/*/*.log
+            ${{ runner.temp }}/llaminar-pr-preflight-${{ github.run_id }}-${{ github.run_attempt }}/prerequisites/*/build-timeline.jsonl
+            ${{ runner.temp }}/llaminar-pr-preflight-${{ github.run_id }}-${{ github.run_attempt }}/prerequisites/*/prerequisites/**
           if-no-files-found: warn
           retention-days: 90
-
+          overwrite: true
+  accuracy:
+    if: ${{ !github.event.pull_request.draft }}
+    name: PyTorch accuracy panels (AVX512 and AVX2)
+    needs:
+      - source
+      - preflight
+    runs-on:
+      - llaminar-xeon-host
+    # Platform ceiling only; native cell watchdogs and numerical work stay unchanged.
+    timeout-minutes: 7200
+    concurrency:
+      group: llaminar-develop-image-gate
+      cancel-in-progress: false
+      queue: max
+    steps:
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.source.outputs.source_revision }}
+          fetch-depth: 0
+          submodules: false
+          lfs: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-preflight-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/accuracy-preflight
+      - uses: docker/setup-buildx-action@v4
+        with:
+          driver: docker-container
+          name: llaminar-ci
+          driver-opts: network=host
+          cleanup: false
+          keep-state: true
+          cache-binary: false
+      - name: Run dense Qwen3.8 and QFN panels on the six blessed controls
+        env:
+          HEAD_SHA: ${{ needs.source.outputs.source_revision }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          exec python3 scripts/ci/run_published_image_suite.py accuracy \
+            --repository "$REPOSITORY" --branch develop \
+            --image "ghcr.io/${REPOSITORY,,}:develop-$HEAD_SHA" \
+            --expected-source-revision "$HEAD_SHA" \
+            --preflight-bundle "$RUNNER_TEMP/accuracy-preflight" \
+            --output "$RUNNER_TEMP/llaminar-pr-accuracy-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+      - name: Retain panel CSVs and original production fixture evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pr-accuracy-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: |-
+            ${{ runner.temp }}/llaminar-pr-accuracy-${{ github.run_id }}-${{ github.run_attempt }}/accuracy-receipt.json
+            ${{ runner.temp }}/llaminar-pr-accuracy-${{ github.run_id }}-${{ github.run_attempt }}/*/panel/**/*.json
+            ${{ runner.temp }}/llaminar-pr-accuracy-${{ github.run_id }}-${{ github.run_attempt }}/*/outer-cleanup.json
+            ${{ runner.temp }}/llaminar-pr-accuracy-${{ github.run_id }}-${{ github.run_attempt }}/*/panel/**/*.csv
+            ${{ runner.temp }}/llaminar-pr-accuracy-${{ github.run_id }}-${{ github.run_attempt }}/*/panel/**/*.log
+            !${{ runner.temp }}/llaminar-pr-accuracy-${{ github.run_id }}-${{ github.run_attempt }}/*/panel/native/**/run.json
+            ${{ runner.temp }}/llaminar-pr-accuracy-${{ github.run_id }}-${{ github.run_attempt }}/*/*.log
+            ${{ runner.temp }}/llaminar-pr-accuracy-${{ github.run_id }}-${{ github.run_attempt }}/*/panel/**/*.txt
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
   coding_matrix:
     if: ${{ !github.event.pull_request.draft }}
-    name: Admit post-benchmark coding matrix
-    needs: benchmarks
-    runs-on: ubuntu-24.04
+    name: Admit post-accuracy coding matrix
+    needs:
+      - source
+      - accuracy
+    runs-on:
+      - llaminar-xeon-host
     timeout-minutes: 30
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.source.outputs.source_revision }}
           submodules: false
           lfs: false
       - uses: actions/download-artifact@v4
         with:
-          name: pr-e2e-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
-          path: ${{ runner.temp }}/coding-e2e
+          name: pr-preflight-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/coding-preflight
       - uses: actions/download-artifact@v4
         with:
-          name: pr-benchmarks-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
-          path: ${{ runner.temp }}/coding-benchmarks
+          name: pr-accuracy-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/coding-accuracy
       - name: Derive every blessed cell on both shipping ISAs
         id: matrix
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ needs.source.outputs.source_revision }}
         run: |
           python3 scripts/ci/run_opencode_matrix.py prepare \
-            --e2e-bundle "$RUNNER_TEMP/coding-e2e" \
-            --benchmark-bundle "$RUNNER_TEMP/coding-benchmarks" \
+            --preflight-bundle "$RUNNER_TEMP/coding-preflight" \
+            --accuracy-bundle "$RUNNER_TEMP/coding-accuracy" \
             --expected-source-revision "$HEAD_SHA" \
             --output "$RUNNER_TEMP/coding-matrix.json" --github-output "$GITHUB_OUTPUT"
-
+    concurrency:
+      group: llaminar-develop-image-gate
+      cancel-in-progress: false
+      queue: max
   coding_cells:
     if: ${{ !github.event.pull_request.draft }}
     name: OpenCode ${{ matrix.cpu_isa }} — ${{ matrix.case }}
-    needs: coding_matrix
-    runs-on: [llaminar-xeon-host]
-    # This is the platform's self-hosted job ceiling, not a generation or
-    # session watchdog. The client and server impose no reasoning deadline.
+    needs:
+      - source
+      - coding_matrix
+    runs-on:
+      - llaminar-xeon-host
     timeout-minutes: 7200
     strategy:
       fail-fast: false
@@ -185,18 +263,18 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.source.outputs.source_revision }}
           fetch-depth: 0
           submodules: false
           lfs: false
       - uses: actions/download-artifact@v4
         with:
-          name: pr-e2e-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
-          path: ${{ runner.temp }}/coding-e2e
+          name: pr-preflight-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/coding-preflight
       - uses: actions/download-artifact@v4
         with:
-          name: pr-benchmarks-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
-          path: ${{ runner.temp }}/coding-benchmarks
+          name: pr-accuracy-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/coding-accuracy
       - uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
@@ -205,9 +283,9 @@ jobs:
           cleanup: false
           keep-state: true
           cache-binary: false
-      - name: Run one complete app session on the benchmarked image
+      - name: Run one complete stress session on the accuracy-qualified image
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ needs.source.outputs.source_revision }}
           REPOSITORY: ${{ github.repository }}
           CODING_CASE: ${{ matrix.case }}
           CODING_ISA: ${{ matrix.cpu_isa }}
@@ -217,8 +295,8 @@ jobs:
             --repository "$REPOSITORY" --branch develop \
             --image "ghcr.io/${REPOSITORY,,}:develop-$HEAD_SHA" \
             --expected-source-revision "$HEAD_SHA" \
-            --e2e-bundle "$RUNNER_TEMP/coding-e2e" \
-            --benchmark-bundle "$RUNNER_TEMP/coding-benchmarks" \
+            --preflight-bundle "$RUNNER_TEMP/coding-preflight" \
+            --accuracy-bundle "$RUNNER_TEMP/coding-accuracy" \
             --cpu-isa "$CODING_ISA" --cell "$CODING_CASE" \
             --output "$RUNNER_TEMP/coding-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT-$CODING_ARTIFACT"
       - name: Retain independently replayable coding evidence
@@ -226,43 +304,47 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: pr-coding-cell-${{ matrix.artifact_id }}
-          path: ${{ runner.temp }}/coding-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.artifact_id }}/cell-result.json
+          path: ${{ runner.temp }}/coding-${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.artifact_id
+            }}/cell-result.json
           if-no-files-found: error
           overwrite: true
           retention-days: 90
-
   coding:
-    name: Published OpenCode (AVX512 and AVX2)
-    needs: [coding_matrix, coding_cells]
+    name: OpenCode stress (six five-phase sessions)
+    needs:
+      - source
+      - coding_matrix
+      - coding_cells
     if: ${{ always() && !github.event.pull_request.draft }}
-    runs-on: ubuntu-24.04
+    runs-on:
+      - llaminar-xeon-host
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.source.outputs.source_revision }}
           submodules: false
           lfs: false
       - uses: actions/download-artifact@v4
         with:
-          name: pr-e2e-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
-          path: ${{ runner.temp }}/coding-e2e
+          name: pr-preflight-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/coding-preflight
       - uses: actions/download-artifact@v4
         with:
-          name: pr-benchmarks-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
-          path: ${{ runner.temp }}/coding-benchmarks
+          name: pr-accuracy-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/coding-accuracy
       - uses: actions/download-artifact@v4
         with:
           pattern: pr-coding-cell-*
           path: ${{ runner.temp }}/coding-jobs
       - name: Revalidate complete canonical coverage and every independent audit
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ needs.source.outputs.source_revision }}
           MATRIX_RESULT: ${{ needs.coding_cells.result }}
         run: |
           python3 scripts/ci/run_opencode_matrix.py aggregate \
-            --e2e-bundle "$RUNNER_TEMP/coding-e2e" \
-            --benchmark-bundle "$RUNNER_TEMP/coding-benchmarks" \
+            --preflight-bundle "$RUNNER_TEMP/coding-preflight" \
+            --accuracy-bundle "$RUNNER_TEMP/coding-accuracy" \
             --expected-source-revision "$HEAD_SHA" --jobs "$RUNNER_TEMP/coding-jobs" \
             --jobs-result "$MATRIX_RESULT" \
             --output "$RUNNER_TEMP/coding-proof/opencode.json"
@@ -275,12 +357,18 @@ jobs:
           if-no-files-found: error
           overwrite: true
           retention-days: 90
-
+    concurrency:
+      group: llaminar-develop-image-gate
+      cancel-in-progress: false
+      queue: max
   benchmarks:
     if: ${{ !github.event.pull_request.draft }}
     name: Published benchmarks (AVX512 and AVX2)
-    needs: e2e
-    runs-on: [llaminar-xeon-host]
+    needs:
+      - source
+      - coding
+    runs-on:
+      - llaminar-xeon-host
     timeout-minutes: 720
     permissions:
       contents: read
@@ -306,18 +394,26 @@ jobs:
             docker run --rm --user 0:0 --entrypoint /bin/rm \
               --mount "type=bind,src=$legacy,dst=/legacy" \
               "ghcr.io/${GITHUB_REPOSITORY,,}:develop-avx2" \
-              -rf /legacy/published-e2e /legacy/published-benchmarks
+              -rf /legacy/published-preflight /legacy/published-benchmarks
           fi
       - uses: actions/checkout@v6
         with:
-          ref: ${{ github.event.pull_request.head.sha }}
+          ref: ${{ needs.source.outputs.source_revision }}
           fetch-depth: 0
           submodules: false
           lfs: false
       - uses: actions/download-artifact@v4
         with:
-          name: pr-e2e-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
-          path: ${{ runner.temp }}/llaminar-pr-e2e-evidence
+          name: pr-preflight-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/llaminar-pr-preflight-evidence
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-accuracy-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/benchmark-accuracy
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-opencode-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/benchmark-coding
       - uses: docker/setup-buildx-action@v4
         with:
           driver: docker-container
@@ -326,19 +422,21 @@ jobs:
           cleanup: false
           keep-state: true
           cache-binary: false
-      - name: Benchmark only the exact pair proven by E2E
+      - name: Benchmark only the exact pair proven by preflight
         env:
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ needs.source.outputs.source_revision }}
           REPOSITORY: ${{ github.repository }}
         shell: bash
         run: |
           set -euo pipefail
-          exec python3 scripts/ci/run_published_image_suite.py benchmarks --qfn-source-admission \
+          exec python3 scripts/ci/run_published_image_suite.py benchmarks \
             --repository "$REPOSITORY" --branch develop \
             --image "ghcr.io/${REPOSITORY,,}:develop-$HEAD_SHA" \
             --expected-source-revision "$HEAD_SHA" \
-            --e2e-bundle "$RUNNER_TEMP/llaminar-pr-e2e-evidence" \
-            --output "$RUNNER_TEMP/llaminar-pr-benchmarks-$GITHUB_RUN_ID" \
+            --preflight-bundle "$RUNNER_TEMP/llaminar-pr-preflight-evidence" \
+            --accuracy-bundle "$RUNNER_TEMP/benchmark-accuracy" \
+            --opencode-bundle "$RUNNER_TEMP/benchmark-coding" \
+            --output "$RUNNER_TEMP/llaminar-pr-benchmarks-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" \
             --run-url "$GITHUB_SERVER_URL/$REPOSITORY/actions/runs/$GITHUB_RUN_ID"
       - name: Install GitHub CLI for PR measurement summary
         if: always()
@@ -353,7 +451,7 @@ jobs:
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          HEAD_SHA: ${{ needs.source.outputs.source_revision }}
           REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
         shell: bash
@@ -362,7 +460,7 @@ jobs:
           python3 scripts/ci/post_pr_benchmark_rag.py \
             --repository "$REPOSITORY" --pr "$PR_NUMBER" \
             --source-revision "$HEAD_SHA" \
-            --report "$RUNNER_TEMP/llaminar-pr-benchmarks-$GITHUB_RUN_ID/results.json" \
+            --report "$RUNNER_TEMP/llaminar-pr-benchmarks-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT/results.json" \
             --run-url "$GITHUB_SERVER_URL/$REPOSITORY/actions/runs/$GITHUB_RUN_ID"
       - name: Retain complete compact benchmark evidence
         if: always()
@@ -370,11 +468,92 @@ jobs:
         with:
           name: pr-benchmarks-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
           path: |
-            ${{ runner.temp }}/llaminar-pr-benchmarks-${{ github.run_id }}/images.json
-            ${{ runner.temp }}/llaminar-pr-benchmarks-${{ github.run_id }}/manifest.json
-            ${{ runner.temp }}/llaminar-pr-benchmarks-${{ github.run_id }}/results.json
-            ${{ runner.temp }}/llaminar-pr-benchmarks-${{ github.run_id }}/benchmarks.svg
-            ${{ runner.temp }}/llaminar-pr-benchmarks-${{ github.run_id }}/avx512/benchmarks.json
-            ${{ runner.temp }}/llaminar-pr-benchmarks-${{ github.run_id }}/avx2/benchmarks.json
+            ${{ runner.temp }}/llaminar-pr-benchmarks-${{ github.run_id }}-${{ github.run_attempt }}/images.json
+            ${{ runner.temp }}/llaminar-pr-benchmarks-${{ github.run_id }}-${{ github.run_attempt }}/manifest.json
+            ${{ runner.temp }}/llaminar-pr-benchmarks-${{ github.run_id }}-${{ github.run_attempt }}/results.json
+            ${{ runner.temp }}/llaminar-pr-benchmarks-${{ github.run_id }}-${{ github.run_attempt }}/benchmarks.svg
+            ${{ runner.temp }}/llaminar-pr-benchmarks-${{ github.run_id }}-${{ github.run_attempt }}/avx512/benchmarks.json
+            ${{ runner.temp }}/llaminar-pr-benchmarks-${{ github.run_id }}-${{ github.run_attempt }}/avx2/benchmarks.json
           if-no-files-found: warn
           retention-days: 90
+          overwrite: true
+  eligible:
+    name: RC release eligibility
+    needs:
+      - source
+      - preflight
+      - accuracy
+      - coding
+      - benchmarks
+    if: ${{ always() && !github.event.pull_request.draft }}
+    runs-on:
+      - llaminar-xeon-host
+    steps:
+      - name: Require every phase to succeed
+        env:
+          PHASES: ${{ toJSON(needs) }}
+        run: |-
+          python3 - <<'CHECK'
+          import json, os
+          phases = json.loads(os.environ['PHASES'])
+          assert phases and all(p['result'] == 'success' for p in phases.values()), phases
+          CHECK
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          submodules: false
+          lfs: false
+      - uses: ./.github/actions/ensure-github-cli
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-rc-source-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/release-proof/rc-source
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-preflight-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/release-proof/preflight
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-accuracy-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/release-proof/accuracy
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-opencode-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/release-proof/opencode
+      - uses: actions/download-artifact@v4
+        with:
+          name: pr-benchmarks-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha }}
+          path: ${{ runner.temp }}/release-proof/benchmarks
+      - name: Independently replay the complete release proof
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPOSITORY: ${{ github.repository }}
+          RC_BRANCH: ${{ github.event.pull_request.head.ref }}
+          RC_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 scripts/ci/certify_release_candidate.py --repository "$REPOSITORY" --rc-branch "$RC_BRANCH"
+          --rc-sha "$RC_SHA" --proof "$RUNNER_TEMP/release-proof" --output "$RUNNER_TEMP/release-candidate.json"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pr-release-eligibility-${{ github.event.pull_request.number }}-${{ github.event.pull_request.head.sha
+            }}
+          path: ${{ runner.temp }}/release-candidate.json
+          if-no-files-found: error
+          retention-days: 90
+          overwrite: true
+    concurrency:
+      group: llaminar-develop-image-gate
+      cancel-in-progress: false
+      queue: max
+concurrency:
+  group: llaminar-master-pr-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+on:
+  pull_request:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review

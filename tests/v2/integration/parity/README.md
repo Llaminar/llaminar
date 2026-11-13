@@ -959,6 +959,64 @@ and production CPU/CUDA/ROCm inference still overlap. Any new custom reference
 helper must join this lifecycle; spawning Python directly from a backend test
 creates an unbounded RAM race and is not a supported campaign path.
 
+## RC frozen-history accuracy panels
+
+The RC-to-master workflow runs `scripts/ci/release_accuracy_panels.py` through
+the existing installed test companions on `llaminar-xeon-host`, for AVX512 and
+AVX2. Dense Qwen3.8 and QFN use the six blessed configurations' exact MTP-off
+controls. `ModelParityReleaseTopologies.h` owns 4×ROCm TP, 2×CUDA TP and
+2×CUDA+4×ROCm+CPU TP-over-PP; the model definitions own exact arithmetic and
+storage. No other cells have release eligibility. Broader numerical matrices
+remain diagnostic. The RC workflow runs complete model-free preflight, these
+numerical panels, six five-phase OpenCode sessions on AVX512, and benchmarks on
+both ISAs. It launches no standalone HTTP suite.
+
+
+`release_accuracy_prompts.json` references the existing authored short prompts
+and declares additional logical context boundaries and continuation lengths.
+The registered CPU/FP32 reference reads the original quantized GGUF and freezes
+prompt IDs and D+1 teacher IDs before native execution. The existing cached
+incremental forward captures every stage. Reusable reference packs bind every
+GGUF split's stat identity, Python reference code, dependency preparation,
+package versions, CPU capability and thread policy. Completed histories survive
+an interrupted collection; no pack becomes complete before the original model
+owner retires. Both ISAs read the same retained histories.
+
+`AccuracyPanelHistory` changes only the request and its full-stage reference
+location in the existing production fixture. Stage, graph, precision, prefix/
+reset, movement and MTP-off obligations stay active. Typed observation purpose
+keeps auxiliary native prefix/reset oracles outside the scored teacher rows.
+The shared full-vocabulary FP64 scorer produces prompt-balanced mean KL, top-1
+agreement and top-5 overlap by model, topology, group, phase and decode offset.
+Initial acceptance retains canonical model-owned limits and explicitly records
+that it is uncalibrated. No candidate can approve its own paired baseline.
+
+The workflow retains `accuracy-rows.csv`, `accuracy-summary.csv`, the original
+six numerical CSVs, prefix/path proof, reference metadata and exact history
+bindings. Use the same source/ISA companion and retained `history.json` for an
+outlier's exact-cell replay; preserve the matching reference cache and both
+checked handoff fields. These artifacts support full-stage diagnosis of the
+same frozen inputs rather than a new greedy prompt. Native state oracles still
+run, but never inflate panel prompt counts. Missing, trimmed, reordered,
+nonfinite or stale observations fail release admission.
+
+The public image driver exposes the phase as:
+
+```bash
+python3 scripts/ci/run_published_image_suite.py accuracy \
+  --repository Llaminar/llaminar --branch develop \
+  --image ghcr.io/llaminar/llaminar:develop-SOURCE_SHA \
+  --expected-source-revision SOURCE_SHA \
+  --e2e-bundle EXACT_SOURCE_E2E_BUNDLE --output NEW_ACCURACY_DIRECTORY
+```
+
+This requires the complete source-bound preflight/E2E bundle first. OpenCode
+then authenticates the accuracy bundle, and release benchmarks authenticate
+both numerical and coding proof. The release publisher independently replays
+those joins and attaches the numerical CSVs and compact diagnostic archives to
+the GitHub release. Large reference tensors and raw logits remain local. See
+`docs/production-ci.md` for the complete develop → rc/* → master boundary.
+
 ## Process campaign and ownership
 
 `discover_v2_parity_tests()` runs `--gtest_list_tests` after each parity binary

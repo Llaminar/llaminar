@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file run_published_image_suite.py
+# @brief Run manual or PR HTTP E2E/benchmarks against a published image pair.
 """Run manual or PR HTTP E2E/benchmarks against a published image pair.
 
 This is a consumer of the production pipeline, not another test matrix or an
@@ -32,6 +34,7 @@ from production_artifacts import (digest, image_identity, positive, ratchet, val
                                   validate_manifest, validate_prerequisites, write_json)
 import run_production_pipeline as pipeline
 from run_develop_image_gate import runtime_tag
+from release_accuracy_evidence import admit_accuracy
 
 ROOT = Path(__file__).resolve().parents[2]
 ISAS = pipeline.SHIPPING_ISAS
@@ -376,11 +379,12 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
              (args.models, str(args.models), True),
              (args.model_ramdisk_root, str(args.model_ramdisk_root), False),
              (lane, str(lane), False), (socket, "/var/run/docker.sock", False)]
-    if args.e2e_bundle:
-        bundle = args.e2e_bundle.resolve(strict=True)
-        pairs.append((bundle, str(bundle), True))
-    if getattr(args, 'benchmark_bundle', None):
-        bundle = args.benchmark_bundle.resolve(strict=True)
+    for evidence_bundle in (args.e2e_bundle, getattr(args, "preflight_bundle", None)):
+        if evidence_bundle:
+            bundle = evidence_bundle.resolve(strict=True)
+            pairs.append((bundle, str(bundle), True))
+    if getattr(args, 'accuracy_bundle', None):
+        bundle = args.accuracy_bundle.resolve(strict=True)
         pairs.append((bundle, str(bundle), True))
     # The nested canonical HTTP harness launches the immutable runtime image
     # through the same host socket.  ARC's source/model/evidence roots are
@@ -393,7 +397,7 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
     coding = getattr(args, 'suite', None) == 'opencode'
     # Numerical observers also create sibling runtime containers. Reuse the
     # existing exact-owner retirement protocol, including driver cancellation.
-    owned = coding or (getattr(args, 'suite', None) == 'e2e' and getattr(args, 'model_kld_canaries', False))
+    owned = coding or getattr(args, 'suite', None) == 'accuracy'
     launch = ["docker", "run", "--rm", "--init", "--name", name,
         *docker_paths.device_args(driver, "CPU+CUDA+ROCm", user=f"{cache_uid}:{lane_stat.st_gid}"),
         # The cache-owning non-root driver delegates only kernel-log reads to
@@ -436,7 +440,7 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
             restore_lane_ownership(driver, lane, lane_owner_uid, lane_owner_gid)
 
 
-def run_source_pair(args, pair: dict, directory: Path, receipt: dict) -> None:
+def run_source_pair(args, pair: dict, directory: Path, receipt: dict, *, receipt_filename='e2e-receipt.json') -> None:
     """Gather complete ordinary red source results on both ISAs before any HTTP work."""
     failures = receipt.setdefault('failed_qfn_source_cells', {})
     for isa in ISAS:
@@ -455,7 +459,7 @@ def run_source_pair(args, pair: dict, directory: Path, receipt: dict) -> None:
             binding = red.binding
             failures[isa] = [exact for exact, row in red.report['results'].items() if not row['passed']]
         receipt['qfn_source_admission_reports'][isa] = digest(binding)
-        write_json(directory / 'e2e-receipt.json', receipt)
+        write_json(directory / receipt_filename, receipt)
     if failures:
         raise ValueError('QFN source-admission cell failures remain on the ISA pair')
 
@@ -516,9 +520,6 @@ def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
                "manifest_digest": digest(manifest), "reports": {}, "failed_cells": {}}
     receipt['qfn_source_admission_required'] = getattr(args, 'qfn_source_admission', False)
     receipt['qfn_source_admission_reports'] = {}
-    receipt['model_kld_required'] = getattr(args, 'model_kld_canaries', False)
-    receipt['model_kld_reports'] = {}
-    receipt['failed_model_kld_cells'] = {}
     write_json(directory / "e2e-receipt.json", receipt)
     receipt["prerequisites"] = run_e2e_prerequisites(args, pair, directory)
     validate_e2e_prerequisites(receipt["prerequisites"], pair)
@@ -548,27 +549,6 @@ def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
         validate_image_e2e_coverage(evidence, manifest, pair["images"][isa]["id"])
         if (cell_failure is None) != evidence["correctness_passed"]:
             raise ValueError(f"E2E {isa} exit status disagrees with complete cell evidence")
-        if receipt['model_kld_required']:
-            numerical = lane / 'kld'
-            numerical.mkdir()
-            numerical_failure = None
-            try:
-                run_in_driver(args, driver, [sys.executable, str(ROOT / 'scripts/ci/run_model_kld_canaries.py'),
-                    '--container-image', pair['images'][isa]['id'],
-                    '--source-revision', pair['source']['revision'], '--models', str(args.models),
-                    '--report', str(numerical / 'kld-canaries.json')], numerical, 'kld.log')
-            except subprocess.CalledProcessError as error:
-                numerical_failure = error
-            from model_kld_canary import validate_report as validate_kld
-            from model_kld_corpus import CATALOG
-            approval = json.loads(CATALOG.read_text())
-            numerical_report = json.loads((numerical / 'kld-canaries.json').read_text())
-            validate_kld(numerical_report, source_revision=pair['source']['revision'], cpu_isa=isa,
-                         image=pair['images'][isa]['id'], corpus_manifest_digest=approval['manifest_digest'], require_passed=False)
-            if (numerical_failure is None) != numerical_report['passed']:
-                raise ValueError('KL process status disagrees with complete numerical evidence')
-            receipt['model_kld_reports'][isa] = digest(numerical_report)
-            receipt['failed_model_kld_cells'][isa] = [c['model']+'-'+c['backend'] for c in numerical_report['cells'] if not c['passed']]
         receipt["reports"][isa] = digest(evidence)
         receipt["failed_cells"][isa] = [row["case"] for row in evidence["cells"]
                                         if row["outcome"] != "passed"]
@@ -577,9 +557,6 @@ def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
               f"{len(evidence['cells']) - len(receipt['failed_cells'][isa])} "
               f"failed={len(receipt['failed_cells'][isa])}", flush=True)
     failed = {isa: cells for isa, cells in receipt["failed_cells"].items() if cells}
-    numerical_failed = {isa: cells for isa, cells in receipt['failed_model_kld_cells'].items() if cells}
-    if numerical_failed:
-        raise ValueError(f'Published-image KL phase failures remain: {numerical_failed}')
     if failed:
         print(f"[published-images] E2E complete failure map: {failed}", flush=True)
         raise ValueError("published image E2E cell failures remain on one or both ISAs")
@@ -590,12 +567,108 @@ def run_e2e(args, pair: dict, manifest: dict, directory: Path) -> None:
     write_json(directory / "e2e-receipt.json", receipt)
 
 
+def validate_source_admission(bundle: Path, pair: dict, receipt: dict) -> None:
+    """Authenticate both exact-source QFN admission lifetimes without HTTP evidence."""
+    if receipt.get('qfn_source_admission_required') is not True or set(receipt.get('qfn_source_admission_reports', {})) != set(ISAS):
+        raise ValueError('RC preflight requires complete QFN source admission on both ISAs')
+    for isa in ISAS:
+        lane = bundle / isa.lower() / 'source-admission'
+        binding = json.loads((lane / 'image-binding.json').read_text())
+        report = json.loads((lane / 'admission/source-admission.json').read_text())
+        from qfn_source_admission_image import validate_driver_window
+        validate_driver_window(lane, binding)
+        validate_source_binding(binding, report, source=pair['source'], isa=isa, runtime=pair['images'][isa]['id'])
+        if digest(binding) != receipt['qfn_source_admission_reports'][isa]:
+            raise ValueError('QFN source admission changed after preflight')
+
+
+def run_preflight(args, pair: dict, manifest: dict, directory: Path) -> None:
+    """Run complete Unit/preflight without a separate model/topology matrix; launch no HTTP suite."""
+    receipt = dict(schema='llaminar.release-prerequisites.v1', complete=False, images_digest=digest(pair),
+                   manifest_digest=digest(manifest))
+    write_json(directory / 'preflight-receipt.json', receipt)
+    receipt['prerequisites'] = run_e2e_prerequisites(args, pair, directory)
+    validate_e2e_prerequisites(receipt['prerequisites'], pair)
+    receipt['complete'] = True
+    write_json(directory / 'preflight-receipt.json', receipt)
+    admit_preflight(directory, pair)
+
+
+def admit_preflight(bundle: Path, pair: dict) -> tuple[dict, dict]:
+    """Require real source/ISA-bound prerequisite receipts, never simulated HTTP passes."""
+    previous = json.loads((bundle / 'images.json').read_text())
+    validate_pair(previous)
+    manifest = json.loads((bundle / 'manifest.json').read_text())
+    inventory = json.loads((bundle / 'all-cells.json').read_text())
+    receipt = json.loads((bundle / 'preflight-receipt.json').read_text())
+    if (previous != pair or manifest != pipeline.e2e_projection(inventory, pair['source']['revision'])
+            or receipt.get('schema') != 'llaminar.release-prerequisites.v1' or receipt.get('complete') is not True
+            or receipt.get('images_digest') != digest(pair) or receipt.get('manifest_digest') != digest(manifest)):
+        raise ValueError('release prerequisite identity, completion or full matrix changed')
+    validate_e2e_prerequisites(receipt.get('prerequisites'), pair)
+    for isa in ISAS:
+        original = json.loads((bundle / 'prerequisites' / isa.lower() / 'prerequisites/prerequisites.json').read_text())
+        if original != receipt['prerequisites'][isa]['report']:
+            raise ValueError('installed preflight report differs from its sealed receipt')
+    return manifest, {isa: receipt['prerequisites'][isa]['report'] for isa in ISAS}
+
+
+def run_accuracy(args, pair: dict, directory: Path) -> None:
+    """Run the complete frozen-history projection in both full-source companions."""
+    bundle = args.preflight_bundle.resolve(strict=True)
+    manifest, correctness = admit_preflight(bundle, pair)
+    receipt = dict(schema=1, complete=False, images_digest=digest(pair), manifest_digest=digest(manifest),
+                   prerequisites_reports={isa: digest(correctness[isa]) for isa in ISAS},
+                   models_root=str(args.models), reports={}, test_companions={}, retirement_reports={})
+    write_json(directory / 'accuracy-receipt.json', receipt)
+    prior = json.loads((bundle / 'preflight-receipt.json').read_text())
+    driver = build_driver(pair, directory)
+    failures = {}
+    for isa in ISAS:
+        work = directory / isa.lower()
+        work.mkdir()
+        write_json(work / 'manifest.json', manifest)
+        shutil.copytree(bundle / 'prerequisites' / isa.lower() / 'prerequisites', work / 'prerequisites')
+        references = work / 'reference-cache'
+        references.mkdir()
+        build_args = SimpleNamespace(cpu_isa=isa, models=args.models, model_ramdisk_root=args.model_ramdisk_root,
+                                     reference_cache_root=references)
+        images = inventory_companion(build_args, pair['source'], work)
+        companion = images[pipeline.ImageRole.TEST_RUNNER.value]
+        if companion != prior['prerequisites'][isa]['test_runner_image']:
+            raise ValueError('accuracy companion differs from the complete preflight companion')
+        receipt['test_companions'][isa] = companion
+        write_json(work / 'companion.json', images)
+        write_json(work / 'images.json', pair)
+        try:
+            run_in_driver(args, driver, [sys.executable, str(ROOT / 'scripts/ci/release_accuracy_panels.py'),
+                'companion', '--images', str(work / 'companion.json'), '--work', str(work),
+                '--models', str(args.models), '--model-ramdisk-root', str(args.model_ramdisk_root),
+                '--cpu-isa', isa], work, 'accuracy.log')
+        except (OSError, ValueError, subprocess.SubprocessError) as error:
+            from driver_evidence import validate_retirement
+            validate_retirement(json.loads((work / 'outer-cleanup.json').read_text()))
+            failures[isa] = repr(error)
+        receipt['retirement_reports'][isa] = digest(json.loads((work / 'outer-cleanup.json').read_text()))
+        if (work / 'panel/panel.json').is_file():
+            report = json.loads((work / 'panel/panel.json').read_text())
+            receipt['reports'][isa] = digest(report)
+        write_json(directory / 'accuracy-receipt.json', receipt)
+    if failures:
+        receipt['failures'] = failures
+        write_json(directory / 'accuracy-receipt.json', receipt)
+        raise ValueError('release accuracy panel failures: ' + repr(failures))
+    receipt['complete'] = True
+    write_json(directory / 'accuracy-receipt.json', receipt)
+    admit_accuracy(directory, bundle, pair, manifest, correctness)
+
+
 def run_opencode(args, pair: dict, directory: Path) -> dict:
     """Admit both preceding suites, then own one exact canonical coding job."""
     from run_model_parity_opencode import admit_bundles, select_cell
-    prior, manifest, correctness, benchmarks = admit_bundles(args.e2e_bundle, args.benchmark_bundle)
+    prior, manifest, correctness, accuracy = admit_bundles(args.preflight_bundle, args.accuracy_bundle)
     if prior != pair:
-        raise ValueError('Coding image pair differs from the completed E2E/benchmark pair')
+        raise ValueError('Coding image pair differs from the completed E2E/accuracy pair')
     row = select_cell(manifest, pair['source']['revision'], args.cell)
     write_json(directory / 'manifest.json', manifest)
     driver = build_driver(pair, directory)
@@ -605,13 +678,13 @@ def run_opencode(args, pair: dict, directory: Path) -> dict:
               'case': row['case'], 'cpu_isa': args.cpu_isa, 'image': pair['images'][args.cpu_isa]['id'],
               'images_digest': digest(pair), 'manifest_digest': digest(manifest),
               'source_revision': pair['source']['revision'], 'errors': [],
-              'e2e_report_digest': digest(correctness[args.cpu_isa]),
-              'benchmark_report_digest': digest(benchmarks[args.cpu_isa])}
+              'prerequisites_digest': digest(correctness[args.cpu_isa]),
+              'accuracy_report_digest': digest(accuracy[args.cpu_isa])}
     write_json(directory / 'cell-result.json', result)
     try:
         run_in_driver(args, driver, [sys.executable, str(ROOT / 'scripts/ci/run_model_parity_opencode.py'),
-            '--e2e-bundle', str(args.e2e_bundle.resolve()),
-            '--benchmark-bundle', str(args.benchmark_bundle.resolve()),
+            '--preflight-bundle', str(args.preflight_bundle.resolve()),
+            '--accuracy-bundle', str(args.accuracy_bundle.resolve()),
             '--cpu-isa', args.cpu_isa, '--case', row['case'],
             '--model-ramdisk-root', str(args.model_ramdisk_root),
             '--output', str(lane / 'coding')], lane, 'opencode.log')
@@ -634,7 +707,7 @@ def run_opencode(args, pair: dict, directory: Path) -> dict:
         if result['passed']:
             try:
                 from opencode_evidence import validate_job
-                validate_job(result, pair, manifest, correctness, benchmarks)
+                validate_job(result, pair, manifest, correctness, accuracy)
             except Exception as error:
                 result['errors'].append('Independent job evidence: ' + repr(error))
                 result['passed'] = False
@@ -668,21 +741,8 @@ def admit_e2e(bundle: Path, pair: dict, *, require_model_kld: bool = False,
         if digest(report) != receipt["reports"][isa]:
             raise ValueError("E2E report differs from its completed receipt")
         reports[isa] = report
-    if require_qfn_source_admission and receipt.get('qfn_source_admission_required') is not True:
-        raise ValueError('Master release requires QFN source admission')
-    if receipt.get('qfn_source_admission_required'):
-        if set(receipt.get('qfn_source_admission_reports', {})) != set(ISAS):
-            raise ValueError('Incomplete QFN source-admission ISA pair')
-        for isa in ISAS:
-            lane = bundle / isa.lower() / 'source-admission'
-            binding = json.loads((lane / 'image-binding.json').read_text())
-            source_report = json.loads((lane / 'admission/source-admission.json').read_text())
-            from qfn_source_admission_image import validate_driver_window
-            validate_driver_window(lane, binding)
-            validate_source_binding(binding, source_report, source=pair['source'], isa=isa,
-                                    runtime=pair['images'][isa]['id'])
-            if digest(binding) != receipt['qfn_source_admission_reports'][isa]:
-                raise ValueError('QFN source-admission binding changed after E2E')
+    if require_qfn_source_admission or receipt.get('qfn_source_admission_required'):
+        validate_source_admission(bundle,pair,receipt)
     if require_model_kld and receipt.get('model_kld_required') is not True:
         raise ValueError('Master release requires GPU KL canaries')
     if receipt.get('model_kld_required'):
@@ -725,7 +785,7 @@ def download_e2e(args, destination: Path) -> tuple[Path, str]:
 
 
 def validate_benchmark(report: dict, pair: dict, manifest: dict, e2e: dict,
-                       isa: str, *, allow_regressions: bool = False) -> None:
+                       isa: str, *, allow_regressions: bool = False, release_preflight: bool = False) -> None:
     """Authenticate every measurement and recompute its high-water comparison.
 
     PR reporting admits a complete red report so the second ISA still runs and
@@ -739,7 +799,7 @@ def validate_benchmark(report: dict, pair: dict, manifest: dict, e2e: dict,
             or report.get("source_revision") != pair["source"]["revision"]
             or report.get("image") != pair["images"][isa]["id"]
             or report.get("manifest_digest") != digest(manifest)
-            or report.get("e2e_report_digest") != digest(e2e)
+            or report.get("prerequisites_digest" if release_preflight else "e2e_report_digest") != digest(e2e)
             or len(rows) != len(expected) or {row["case"] for row in rows} != set(expected)):
         raise ValueError(f"{isa} benchmark evidence is incomplete, stale or regressed")
     for row in rows:
@@ -762,7 +822,7 @@ def validate_benchmark(report: dict, pair: dict, manifest: dict, e2e: dict,
 
 
 def admit_benchmarks(benchmark_directory: Path, pair: dict, manifest: dict,
-                     e2e_reports: dict) -> tuple[dict, dict]:
+                     e2e_reports: dict, *, release_preflight: bool = False) -> tuple[dict, dict]:
     """Authenticate both completed benchmark lanes before dependent workloads.
 
     The caller first admits the complete E2E bundle. OpenCode certification and
@@ -779,7 +839,7 @@ def admit_benchmarks(benchmark_directory: Path, pair: dict, manifest: dict,
     if (result.get("source") != pair["source"] or result.get("images") != pair["images"]
             or result.get("repository", "").lower() != pair["repository"].lower()
             or result.get("branch") != "develop"
-            or result.get("scope") != "full-http-e2e-and-benchmarks"
+            or result.get("scope") != ("release-preflight-and-benchmarks" if release_preflight else "full-http-e2e-and-benchmarks")
             or result.get("passed") is not True
             or result.get("regression_threshold_pct") != baseline["regression_threshold_pct"]
             or result.get("full_image_certification") is not False
@@ -788,10 +848,10 @@ def admit_benchmarks(benchmark_directory: Path, pair: dict, manifest: dict,
     reports = {}
     for isa in ISAS:
         report = json.loads((benchmark_directory / isa.lower() / "benchmarks.json").read_text())
-        validate_benchmark(report, pair, manifest, e2e_reports[isa], isa)
+        validate_benchmark(report, pair, manifest, e2e_reports[isa], isa, release_preflight=release_preflight)
         variant = result["variants"][isa]
         if (variant.get("report_digest") != digest(report)
-                or variant.get("e2e_report_digest") != digest(e2e_reports[isa])
+                or variant.get("prerequisites_digest" if release_preflight else "e2e_report_digest") != digest(e2e_reports[isa])
                 or variant.get("comparisons") != report["comparisons"]
                 or variant.get("cells") != [{key: value for key, value in row.items()
                                               if key != "artifacts"} for row in report["cells"]]):
@@ -802,11 +862,25 @@ def admit_benchmarks(benchmark_directory: Path, pair: dict, manifest: dict,
 
 def run_benchmarks(args, pair: dict, directory: Path) -> dict:
     """Consume the full E2E pair and collect both ISA results before judgement."""
-    if args.e2e_bundle:
+    release_preflight = getattr(args, "preflight_bundle", None) is not None
+    if release_preflight:
+        bundle, evidence_url = args.preflight_bundle.resolve(strict=True), args.run_url
+    elif args.e2e_bundle:
         bundle, evidence_url = args.e2e_bundle.resolve(strict=True), "local"
     else:
         bundle, evidence_url = download_e2e(args, directory / "e2e-evidence")
-    manifest, e2e = admit_e2e(bundle, pair, require_qfn_source_admission=getattr(args, 'qfn_source_admission', False))
+    if release_preflight:
+        manifest, e2e = admit_preflight(bundle, pair)
+    else:
+        manifest, e2e = admit_e2e(bundle, pair, require_qfn_source_admission=getattr(args, 'qfn_source_admission', False))
+    predecessors = None
+    if getattr(args, 'opencode_bundle', None):
+        accuracy = admit_accuracy(args.accuracy_bundle, bundle, pair, manifest, e2e)
+        from opencode_evidence import validate_matrix
+        coding = validate_matrix(json.loads((args.opencode_bundle / 'opencode.json').read_text()),
+                                 pair, manifest, e2e, accuracy)
+        predecessors = {'accuracy_reports': {isa: digest(accuracy[isa]) for isa in ISAS},
+                        'opencode_digest': digest(coding)}
     write_json(directory / "manifest.json", manifest)
     reports = {}
     driver = build_driver(pair, directory)
@@ -821,14 +895,15 @@ def run_benchmarks(args, pair: dict, directory: Path) -> dict:
                 "--manifest", str(bundle / "manifest.json"),
                 "--source-revision", pair["source"]["revision"],
                 "--image", pair["images"][isa]["id"],
-                "--e2e-report", str(bundle / isa.lower() / "e2e.json"),
+                *(["--preflight-bundle", str(bundle)] if release_preflight else
+                  ["--e2e-report", str(bundle / isa.lower() / "e2e.json")]),
                 "--model-ramdisk-root", str(args.model_ramdisk_root),
                 "--report", str(report)], lane, "benchmarks.log")
         except subprocess.CalledProcessError as error:
             regression_failure = error
         reports[isa] = json.loads(report.read_text())
         validate_benchmark(reports[isa], pair, manifest, e2e[isa], isa,
-                           allow_regressions=True)
+                           allow_regressions=True, release_preflight=release_preflight)
         if (regression_failure is None) != reports[isa]["passed"]:
             raise ValueError(f"benchmark {isa} exit status disagrees with complete ratchet evidence")
     # Publish compact phase evidence, not raw logs or a full-image certificate.
@@ -840,12 +915,17 @@ def run_benchmarks(args, pair: dict, directory: Path) -> dict:
               "recorded_at_utc": datetime.now(timezone.utc).isoformat(),
               "passed": all(report["passed"] for report in reports.values()),
               "regression_threshold_pct": baseline["regression_threshold_pct"],
-              "scope": "full-http-e2e-and-benchmarks", "full_image_certification": False,
+              "scope": "release-preflight-and-benchmarks" if release_preflight else "full-http-e2e-and-benchmarks", "full_image_certification": False,
               "variants": {isa: {"hardware": report["hardware"], "workload": report["workload"],
-                  "report_digest": digest(report), "e2e_report_digest": digest(e2e[isa]),
+                  "report_digest": digest(report),
+                  ("prerequisites_digest" if release_preflight else "e2e_report_digest"): digest(e2e[isa]),
                   "comparisons": report["comparisons"],
                   "cells": [{key: value for key, value in row.items() if key != "artifacts"}
                             for row in report["cells"]]} for isa, report in reports.items()}}
+    if release_preflight:
+        result["preflight_run"] = result.pop("e2e_run")
+    if predecessors is not None:
+        result['release_predecessors'] = predecessors
     write_json(directory / "results.json", result)
     from published_benchmark_chart import render_chart
     (directory / "benchmarks.svg").write_text(render_chart(result))
@@ -860,12 +940,15 @@ def readme_with_results(text: str, result: dict) -> str:
     if stop < start:
         raise ValueError("README benchmark markers are reversed")
     revision = result["source"]["revision"]
+    provenance = ("Both AVX512 and AVX2 passed preflight and numerical panels; six OpenCode sessions then passed before measurement."
+                  if result.get("scope") == "release-preflight-and-benchmarks" else
+                  "Both AVX512 and AVX2 passed the full HTTP E2E suite before measurement.")
     body = (f"{README_BEGIN}\n\n"
             f"![Published-image prefill and decode benchmarks]({REPORT_DIRECTORY}/benchmarks.svg)\n\n"
             f"Tested image source: [`{revision[:12]}`](https://github.com/{result['repository']}/commit/{revision}). "
-            f"Both AVX512 and AVX2 passed the full HTTP E2E suite before measurement.\n"
+            f"{provenance}\n"
             f"[Exact configurations, image digests and samples]({REPORT_DIRECTORY}/results.json). "
-            "This is E2E/benchmark evidence, not full production-image certification.\n\n")
+            "This is benchmark evidence; the release page owns the complete qualification proof.\n\n")
     return text[:start] + body + text[stop:]
 
 
@@ -908,7 +991,7 @@ def publish_results(args, directory: Path, result: dict) -> None:
 def parse_arguments(argv=None):
     """Keep publication explicit and offer the same entry point locally and in CI."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("suite", choices=("e2e", "benchmarks", "opencode"))
+    parser.add_argument("suite", choices=("preflight", "e2e", "accuracy", "benchmarks", "opencode"))
     parser.add_argument("--repository", default=os.environ.get("GITHUB_REPOSITORY", "Llaminar/llaminar"))
     parser.add_argument("--branch", default=os.environ.get("GITHUB_REF_NAME") or git("branch", "--show-current"))
     parser.add_argument("--image", help="AVX512 branch tag; AVX2 uses the canonical -avx2 suffix")
@@ -919,31 +1002,34 @@ def parse_arguments(argv=None):
     parser.add_argument("--model-ramdisk-root", type=Path, default=Path("/mnt/llaminar-production-parity"))
     evidence = parser.add_mutually_exclusive_group()
     evidence.add_argument("--e2e-run", help="successful manual E2E Actions run ID; defaults to the latest")
+    evidence.add_argument("--preflight-bundle", type=Path, help="complete source-bound RC preflight evidence")
     evidence.add_argument("--e2e-bundle", type=Path, help="local completed E2E output directory")
-    parser.add_argument('--benchmark-bundle', type=Path, help='complete passing benchmark pair; required for coding')
-    parser.add_argument('--cpu-isa', choices=ISAS, help='one canonical coding job ISA')
+    parser.add_argument('--accuracy-bundle', type=Path, help='complete passing numerical panels before coding/benchmarks')
+    parser.add_argument('--opencode-bundle', type=Path, help='complete passing coding proof; required for RC benchmarks')
+    parser.add_argument('--cpu-isa', choices=('AVX512',), help='one canonical coding job ISA')
     parser.add_argument('--cell', help='one exact blessed coding cell; no regex selection')
     parser.add_argument("--qfn-source-admission", action="store_true",
                         help="master PR: real QFN source admission on both exact-source ISA companions")
-    parser.add_argument("--model-kld-canaries", action="store_true", help="master PR GPU numerical gate; requires the pinned corpus")
     parser.add_argument("--run-url", default="local")
     parser.add_argument("--publish", action="store_true", help="commit only successful complete benchmark results")
     args = parser.parse_args(argv)
     if args.expected_source_revision is not None and not re.fullmatch(
             r"[0-9a-f]{40}", args.expected_source_revision):
         parser.error("--expected-source-revision requires a full Git SHA")
-    if args.qfn_source_admission and args.suite not in ("e2e", "benchmarks"):
+    if args.qfn_source_admission and args.suite not in ("preflight", "e2e", "benchmarks"):
         parser.error("QFN source admission belongs to model/E2E execution or benchmark receipt admission")
-    if args.model_kld_canaries and args.suite != "e2e":
-        parser.error("KL canaries belong to the model/E2E gate")
     if args.suite == "e2e" and (args.publish or args.e2e_run or args.e2e_bundle):
         parser.error("E2E evidence inputs and publication apply only to benchmarks")
     if args.suite == 'opencode':
-        if (not args.e2e_bundle or not args.benchmark_bundle or not args.cpu_isa or not args.cell
+        if (not args.preflight_bundle or not args.accuracy_bundle or not args.cpu_isa or not args.cell
                 or not args.expected_source_revision or args.publish or args.e2e_run):
-            parser.error('Coding requires explicit E2E/benchmark bundles, source revision, ISA and exact cell')
-    elif args.benchmark_bundle or args.cpu_isa or args.cell:
-        parser.error('Benchmark admission and exact job selection apply only to coding')
+            parser.error('Coding requires explicit E2E/accuracy bundles, source revision, ISA and exact cell')
+    elif args.cpu_isa or args.cell or (args.accuracy_bundle and args.suite != 'benchmarks'):
+        parser.error('Accuracy admission and exact job selection apply only to coding/RC benchmarks')
+    if args.suite == 'accuracy' and (not args.preflight_bundle or args.e2e_run or args.publish or not args.expected_source_revision):
+        parser.error('Accuracy panels require a local exact-source E2E bundle')
+    if args.opencode_bundle and (args.suite != 'benchmarks' or not args.accuracy_bundle or not args.preflight_bundle):
+        parser.error('RC benchmarks require both accuracy and OpenCode evidence')
     subprocess.run(["git", "check-ref-format", f"refs/heads/{args.branch}"], check=True)
     return args
 
@@ -955,7 +1041,7 @@ def main(argv=None) -> int:
     # the inference image. Diagnose its absence before pulling images, taking
     # the accelerator lease or changing cache permissions. Local bundles do
     # not contact GitHub and deliberately have no such dependency.
-    if args.suite == "benchmarks" and args.e2e_bundle is None and shutil.which("gh") is None:
+    if args.suite == "benchmarks" and args.e2e_bundle is None and getattr(args, "preflight_bundle", None) is None and shutil.which("gh") is None:
         raise ValueError("GitHub CLI (gh) is required to download E2E evidence; "
                          "install it before starting the benchmark workflow")
     args.output = args.output.resolve()
@@ -965,9 +1051,14 @@ def main(argv=None) -> int:
     with pipeline.device_lease():
         pair = pull_pair(args, args.output)
         docker_paths.publish_model_cache(args.model_ramdisk_root)
-        if args.suite == "e2e":
+        if args.suite == "preflight":
+            manifest = discover_inventory(args, pair, args.output)
+            run_preflight(args, pair, manifest, args.output)
+        elif args.suite == "e2e":
             manifest = discover_inventory(args, pair, args.output)
             run_e2e(args, pair, manifest, args.output)
+        elif args.suite == 'accuracy':
+            run_accuracy(args, pair, args.output)
         elif args.suite == 'opencode':
             if not run_opencode(args, pair, args.output)['passed']:
                 raise ValueError('Canonical coding cell failed; see cell-result.json')

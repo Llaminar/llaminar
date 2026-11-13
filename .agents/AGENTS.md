@@ -350,20 +350,34 @@ builds and publishes both AVX512 and AVX2 runtime images on the AVX2 development
 without compiling or running test images.
 These images are development artifacts; this gate does not certify a release.
 
-Only upon explicit user direction, open a release PR from `develop` into
-`master`. First ensure the develop image gate has published both ISA images
-for the current develop HEAD. If documentation/CI maintenance skipped that
-head's push CI, run `gh workflow run ci.yml --ref develop --repo Llaminar/llaminar`
-and wait for the published pair before opening the PR.
-The master workflow admits the exact develop source and published
-image pair, runs complete Unit and production preflight in source-bound test
-companions for both ISAs, runs the separate QFN source-admission gate in
-source/ISA-bound full-matrix test companions, then the full canonical E2E suite and the published
-benchmark gates and then complete OpenCode app sessions on every blessed E2E
-cell and both ISAs. Merge only after all required checks pass. The merge cuts a
-release through the canonical release workflow, promoting the same tested
-images and publishing their evidence. Never start a master release merely
-because a feature PR or develop image gate succeeded.
+Only upon explicit user direction, cut a release candidate branch named
+`rc/<candidate>` from a develop commit whose AVX512 and AVX2 images have both
+published. Master accepts same-repository `rc/*` PRs exclusively; a direct
+`develop` → `master` PR is forbidden. RC updates may arrive only through a
+same-repository `develop` PR and must preserve that develop source tree exactly.
+Fixes belong on develop; cut a fresh candidate when a frozen candidate needs
+replacement. If documentation/CI maintenance skipped publication, run
+`gh workflow run ci.yml --ref develop --repo Llaminar/llaminar` and wait for
+both source-pinned images before cutting the RC.
+
+The master PR gate admits the frozen develop source behind the RC and its
+published image pair. It runs complete Unit and production preflight for both
+ISAs, then multi-prompt frozen-history PyTorch KLD panels on blessed serial
+controls, six five-phase OpenCode sessions on AVX512, and finally benchmark
+gates on both images. The only blessed configurations are dense Qwen3.8 and
+QFN, each on 4×ROCm TP, 2×CUDA TP and 2×CUDA+4×ROCm+CPU TP-over-PP. The native
+model definitions own those selections. The RC workflow runs no standalone
+HTTP suite; OpenCode exercises the real HTTP/native serving lifecycle. All stages must
+pass before the independent RC release-eligibility check can pass. Retain the
+panel row/summary CSVs, original full-stage parity CSVs, prerequisite receipts,
+OpenCode proof and benchmark evidence, bound to the same source and images.
+
+A certified RC squash merge into master tags a dated GitHub release, promotes
+the exact tested image digests and attaches the test-run identity, numerical
+accuracy CSVs and complete benchmark/stress evidence. No image is rebuilt on
+master. Post-release high-water publication preserves concurrent develop work
+and joins the certified master commit as its second parent. Never open or merge
+a master release merely because feature checks or develop image builds passed.
 
 Documentation and CI/CD workflow changes may be committed and pushed directly
 to `develop` with `[skip ci]` and `git commit --no-verify`. Keep this shortcut

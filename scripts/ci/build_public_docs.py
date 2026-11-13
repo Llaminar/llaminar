@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file build_public_docs.py
+# @brief Render archived release proofs without inventing or rerunning qualification.
 """Build public documentation from authored Markdown and published evidence.
 
 GitHub releases own the archive. Each build reads every published dated release,
@@ -42,6 +44,9 @@ class PublishedEvidence:
     e2e: dict
     benchmarks: dict
     result: dict
+    preflight: dict | None = None
+    accuracy: dict | None = None
+    coding: dict | None = None
 
     @property
     def tag(self) -> str:
@@ -78,8 +83,9 @@ def published_releases(repository: str) -> tuple[list[dict], str | None]:
 def download_assets(repository: str, metadata: dict, destination: Path) -> None:
     """Download the publisher's exact named public assets, without wildcards."""
     attached = [asset["name"] for asset in metadata["assets"]]
-    names = release.release_asset_sources(Path("e2e"), Path("benchmarks"),
-        model_kld=any(name in {'kld-avx2.json', 'kld-avx512.json'} for name in attached))
+    names = (release.release_candidate_asset_names() if "release-candidate.json" in attached else
+        release.release_asset_sources(Path("e2e"), Path("benchmarks"),
+            model_kld=any(name in {'kld-avx2.json', 'kld-avx512.json'} for name in attached)))
     if any(attached.count(name) != 1 for name in names):
         raise ValueError(f"{metadata['tag_name']}: missing or duplicate certificate assets")
     destination.mkdir(parents=True)
@@ -118,11 +124,12 @@ def load_evidence(repository: str, metadata: dict, assets: Path) -> PublishedEvi
     manifest = read_json(assets / "matrix.json")
     cells = suite.validate_manifest(manifest, pair["source"]["revision"])
     expected = {row["case"]: row for row in cells}
-    receipt = read_json(assets / "e2e-receipt.json")
-    if (receipt.get("schema") != 1 or receipt.get("complete") is not True
+    rc = any(asset['name']=='release-candidate.json' for asset in metadata['assets'])
+    receipt = read_json(assets / ("preflight-receipt.json" if rc else "e2e-receipt.json"))
+    if (receipt.get("schema") != ("llaminar.release-prerequisites.v1" if rc else 1) or receipt.get("complete") is not True
             or receipt.get("images_digest") != digest(pair)
             or receipt.get("manifest_digest") != digest(manifest)
-            or set(receipt.get("reports", {})) != set(suite.ISAS)):
+            or set(receipt.get("prerequisites" if rc else "reports", {})) != set(suite.ISAS)):
         raise ValueError("published E2E receipt is incomplete or mismatched")
     if receipt.get('model_kld_required'):
         # Historical displays authenticate the original accepted report; they
@@ -140,16 +147,28 @@ def load_evidence(repository: str, metadata: dict, assets: Path) -> PublishedEvi
     if (result.get("source") != pair["source"] or result.get("images") != pair["images"]
             or result.get("repository", "").lower() != repository.lower()
             or result.get("branch") != pair["branch"] or result.get("passed") is not True
-            or result.get("scope") != "full-http-e2e-and-benchmarks"
+            or result.get("scope") != ("release-preflight-and-benchmarks" if rc else "full-http-e2e-and-benchmarks")
             or result.get("full_image_certification") is not False
             or set(result.get("variants", {})) != set(suite.ISAS)):
         raise ValueError("published benchmark result has a different image pair or scope")
     e2e, benchmarks = {}, {}
+    preflight = {} if rc else None
+    accuracy = coding = None
+    if rc:
+        accuracy,coding = validate_rc_archive(assets,pair,manifest,receipt,result)
     for isa in suite.ISAS:
-        e2e[isa] = read_json(assets / f"e2e-{isa.lower()}.json")
-        suite.validate_image_e2e(e2e[isa], manifest, pair["images"][isa]["id"])
-        if digest(e2e[isa]) != receipt["reports"][isa]:
-            raise ValueError(f"{isa}: E2E certificate differs from its receipt")
+        if rc:
+            preflight[isa]=read_json(assets/f'production-preflight-{isa.lower()}.json')
+            suite.validate_prerequisites(preflight[isa])
+            if preflight[isa] != receipt['prerequisites'][isa]['report']:
+                raise ValueError('published native preflight differs from its receipt')
+            prior=preflight[isa]
+        else:
+            e2e[isa] = read_json(assets / f"e2e-{isa.lower()}.json")
+            suite.validate_image_e2e(e2e[isa], manifest, pair["images"][isa]["id"])
+            if digest(e2e[isa]) != receipt["reports"][isa]:
+                raise ValueError(f"{isa}: E2E certificate differs from its receipt")
+            prior=e2e[isa]
         report = read_json(assets / f"benchmark-{isa.lower()}.json")
         rows = report.get("cells", [])
         if (report.get("complete") is not True or report.get("passed") is not True
@@ -157,7 +176,7 @@ def load_evidence(repository: str, metadata: dict, assets: Path) -> PublishedEvi
                 or report.get("image") != pair["images"][isa]["id"]
                 or report.get("source_revision") != pair["source"]["revision"]
                 or report.get("manifest_digest") != digest(manifest)
-                or report.get("e2e_report_digest") != digest(e2e[isa])
+                or report.get("prerequisites_digest" if rc else "e2e_report_digest") != digest(prior)
                 or len(rows) != len(expected) or {row["case"] for row in rows} != set(expected)):
             raise ValueError(f"{isa}: incomplete or mismatched benchmark certificate")
         for row in rows:
@@ -169,7 +188,7 @@ def load_evidence(repository: str, metadata: dict, assets: Path) -> PublishedEvi
                 positive(row["tokens_per_second"][phase])
         variant = result["variants"][isa]
         if (variant.get("report_digest") != digest(report)
-                or variant.get("e2e_report_digest") != digest(e2e[isa])
+                or variant.get("prerequisites_digest" if rc else "e2e_report_digest") != digest(prior)
                 or variant.get("comparisons") != report.get("comparisons")
                 or variant.get("cells") != [{key: value for key, value in row.items()
                                              if key != "artifacts"} for row in rows]):
@@ -180,7 +199,50 @@ def load_evidence(repository: str, metadata: dict, assets: Path) -> PublishedEvi
     chart = ET.parse(assets / "benchmarks.svg").getroot()
     if chart.tag != "{http://www.w3.org/2000/svg}svg":
         raise ValueError("release chart is not SVG")
-    return PublishedEvidence(metadata, assets, pair, manifest, e2e, benchmarks, result)
+    return PublishedEvidence(metadata, assets, pair, manifest, e2e, benchmarks, result, preflight, accuracy, coding)
+
+
+def validate_rc_archive(assets: Path, pair: dict, manifest: dict, receipt: dict, result: dict) -> tuple[dict,dict]:
+    """Check archived RC phase digests without applying today's numerical budgets."""
+    from release_accuracy_panels import sha
+    certificate=read_json(assets/'release-candidate.json')
+    numerical=read_json(assets/'accuracy-receipt.json')
+    coding=read_json(assets/'opencode.json')
+    if (certificate.get('schema')!='llaminar.release-candidate.v1' or certificate.get('passed') is not True
+            or certificate.get('complete') is not True or certificate.get('images_digest')!=digest(pair)
+            or certificate.get('manifest_digest')!=digest(manifest)
+            or certificate.get('preflight_receipt_digest')!=digest(receipt)
+            or certificate.get('accuracy_receipt_digest')!=digest(numerical)
+            or certificate.get('opencode_digest')!=digest(coding)
+            or certificate.get('benchmark_result_digest')!=digest(result)
+            or certificate.get('rc_source')!=read_json(assets/'rc-source.json')):
+        raise ValueError('published RC phase certificate is incomplete or mixed')
+    run=read_json(assets/'test-run.json')
+    if run.get('source_sha')!=pair['source']['revision'] or run.get('rc_sha')!=certificate['rc_source']['rc_revision']:
+        raise ValueError('published test run differs from its RC source')
+    suite.validate_e2e_prerequisites(receipt['prerequisites'],pair)
+    if (numerical.get('complete') is not True or numerical.get('images_digest')!=digest(pair)
+            or numerical.get('manifest_digest')!=digest(manifest)
+            or coding.get('complete') is not True or coding.get('passed') is not True
+            or coding.get('expected_jobs')!=len(manifest['cells'])
+            or {(job['case'],job['cpu_isa']) for job in coding['jobs']} !=
+               {(row['case'],'AVX512') for row in manifest['cells']}):
+        raise ValueError('published numerical or five-phase coding coverage is incomplete')
+    panels={}
+    for isa in suite.ISAS:
+        panel=read_json(assets/f'accuracy-{isa.lower()}.json');panels[isa]=panel
+        if (panel.get('complete') is not True or panel.get('passed') is not True
+                or panel.get('runtime_image')!=pair['images'][isa]['id']
+                or panel.get('cpu_isa')!=isa or panel.get('source_revision')!=pair['source']['revision']
+                or panel.get('manifest_digest')!=digest(manifest) or len(panel.get('cells',[]))!=len(manifest['cells'])
+                or digest(panel)!=certificate['accuracy_reports'][isa]
+                or digest(panel)!=numerical['reports'][isa]
+                or digest(receipt['prerequisites'][isa]['report'])!=certificate['prerequisites_reports'][isa]):
+            raise ValueError('published accuracy report differs from its RC certificate')
+        for name in ('accuracy-rows','accuracy-summary'):
+            if sha(assets/f'{name}-{isa.lower()}.csv')!=panel['files'][name+'.csv']:
+                raise ValueError('published accuracy CSV changed after certification')
+    return panels,coding
 
 
 def table_text(value: object) -> str:
@@ -192,11 +254,13 @@ def release_navigation(prefix: str) -> list[dict[str, str]]:
     """Keep dated and latest views on the same four public pages."""
     return [{name: f"{prefix}/{file}.md"} for name, file in (
         ("Overview", "index"), ("Release notes", "release-notes"),
-        ("E2E certificate", "e2e"), ("Benchmark certificate", "benchmarks"))]
+        ("Test evidence", "e2e"), ("Benchmark certificate", "benchmarks"))]
 
 
 def render_release(evidence: PublishedEvidence, destination: Path) -> None:
     """Project all cells and both ISAs; preserve original report downloads."""
+    if evidence.preflight is not None:
+        return render_rc_release(evidence,destination)
     destination.mkdir(parents=True)
     shutil.copytree(evidence.assets, destination / "assets")
     tag = evidence.tag
@@ -260,6 +324,37 @@ def render_release(evidence: PublishedEvidence, destination: Path) -> None:
     (destination / "benchmarks.md").write_text("\n".join(benchmark_lines) + "\n")
 
 
+def render_rc_release(evidence: PublishedEvidence, destination: Path) -> None:
+    """Render actual preflight/numerical/coding evidence with no HTTP pass claim."""
+    destination.mkdir(parents=True)
+    shutil.copytree(evidence.assets,destination/'assets')
+    tag=evidence.tag
+    summary=[f'# Llaminar {tag}','',
+        f"All **{len(evidence.manifest['cells'])} blessed configurations** passed numerical panels and benchmarks on AVX512 and AVX2.",
+        'Complete Unit/production preflight passed on both images. Each configuration completed one five-phase OpenCode session on AVX512.','',
+        '- [Release notes](release-notes.md)','- [Test and accuracy evidence](e2e.md)',
+        '- [Benchmark evidence](benchmarks.md)','',
+        '[Frozen RC proof](assets/release-candidate.json) · [Test run](assets/test-run.json)',
+        '[Exact images](assets/image-pair.json) · [Blessed matrix](assets/matrix.json)','']
+    (destination/'index.md').write_text('\n'.join(summary))
+    (destination/'release-notes.md').write_text(escape(evidence.metadata.get('body') or '',quote=False)+'\n')
+    tests=[f'# Release test evidence · {tag}','','Full Unit and production preflight, frozen-history numerical panels, and six five-phase OpenCode sessions.','']
+    for isa in suite.ISAS:
+        suffix=isa.lower()
+        tests.append(f'- {isa}: [preflight](assets/production-preflight-{suffix}.json), '
+            f'[accuracy rows](assets/accuracy-rows-{suffix}.csv), [accuracy summaries](assets/accuracy-summary-{suffix}.csv), '
+            f'[full compact numerical proof](assets/accuracy-evidence-{suffix}.zip).')
+    tests.extend(['','[OpenCode proof](assets/opencode.json)',''])
+    (destination/'e2e.md').write_text('\n'.join(tests))
+    lines=[f'# Benchmark evidence · {tag}','','![Prefill and decode](assets/benchmarks.svg)','',
+           '| Configuration | AVX512 prefill | AVX512 decode | AVX2 prefill | AVX2 decode |','|---|---:|---:|---:|---:|']
+    measured={isa:{row['case']:row for row in evidence.benchmarks[isa]['cells']} for isa in suite.ISAS}
+    for row in evidence.manifest['cells']:
+        rates=[f"{measured[isa][row['case']]['tokens_per_second'][phase]:,.1f}" for isa in suite.ISAS for phase in ('prefill','decode')]
+        lines.append('| '+table_text(row['case'])+' | '+' | '.join(rates)+' |')
+    (destination/'benchmarks.md').write_text('\n'.join(lines)+'\n')
+
+
 def prepare_docs(repository: str, output: Path, source: Path = ROOT / "docs/public") -> list[dict]:
     """Stage authored pages plus the full archive, then select the latest view."""
     if (source / "releases").exists():
@@ -270,11 +365,11 @@ def prepare_docs(repository: str, output: Path, source: Path = ROOT / "docs/publ
     archive = content / "releases"
     archive.mkdir()
     listing = ["# Releases", "", "Each dated release retains its original notes, "
-        "HTTP E2E certificates, benchmark certificates, and image identities.", ""]
+        "Release test evidence, numerical accuracy panels, benchmark certificates, and image identities.", ""]
     navigation = [{"Archive": "releases/index.md"}]
     if latest:
         listing += [f"[Latest release: {latest}](latest/index.md)", "",
-                    "| Release | Published | E2E configurations per CPU build |",
+                    "| Release | Published | Configurations per CPU build |",
                     "|---|---|---:|"]
         navigation.insert(0, {"Latest": release_navigation("releases/latest")})
     else:

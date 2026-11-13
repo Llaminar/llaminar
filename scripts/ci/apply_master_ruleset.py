@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Install release-branch protection after PR checks have run once.
+## @file apply_master_ruleset.py
+# @brief Install exact release-branch protection from the source-owned PR gates.
+"""Install exact release-branch protection from the source-owned PR gates.
 
-The master rule requires five GitHub Actions checks. The develop rule requires
+The master rule requires seven GitHub Actions checks, including RC lineage. The develop rule requires
 both image-bound device-free Unit/host checks and blocks direct human pushes.
 Repository administrators may explicitly bypass develop checks through a PR;
 the dedicated release-evidence deploy key also publishes the certified
@@ -23,13 +25,17 @@ from wait_for_develop_image_gate import github_json
 
 MASTER_RULESET_ID = 15240606
 DEVELOP_RULESET_ID = 17989170
+OWNER_RULESET_ID = 26798917
+RC_RULESET_NAME = 'release candidates'
 GITHUB_ACTIONS_APP_ID = 15368
 REQUIRED_CHECKS = (
-    "Only develop may merge to master",
-    "Admit exact develop image source",
-    "Published E2E (AVX512 and AVX2)",
+    "Release branch lineage",
+    "Admit frozen RC image source",
+    "Full production preflight (AVX512 and AVX2)",
+    "PyTorch accuracy panels (AVX512 and AVX2)",
     "Published benchmarks (AVX512 and AVX2)",
-    "Published OpenCode (AVX512 and AVX2)",
+    "OpenCode stress (six five-phase sessions)",
+    "RC release eligibility",
 )
 DEVELOP_REQUIRED_CHECKS = (
     "Develop PR / Unit + host (AVX2)",
@@ -116,6 +122,38 @@ def proposed_develop_ruleset(current: dict) -> dict:
             "conditions": current["conditions"], "rules": rules}
 
 
+def proposed_rc_ruleset() -> dict:
+    """Protect RC updates while allowing an initial develop snapshot branch cut."""
+    return dict(name=RC_RULESET_NAME, target='branch', enforcement='active', bypass_actors=[],
+                conditions={'ref_name': {'include': ['refs/heads/rc/**'], 'exclude': []}}, rules=[
+                    {'type': 'non_fast_forward'},
+                    {'type': 'pull_request', 'parameters': {
+                        'required_approving_review_count': 0, 'dismiss_stale_reviews_on_push': True,
+                        'required_reviewers': [],
+                        'dismissal_restriction': {'enabled': False, 'allowed_actors': []},
+                        'require_extra_approval_for_unattributed_changes': True,
+                        'require_code_owner_review': False, 'require_last_push_approval': False,
+                        'required_review_thread_resolution': True, 'allowed_merge_methods': ['squash']}},
+                    {'type': 'required_status_checks', 'parameters': {
+                        'do_not_enforce_on_create': True, 'strict_required_status_checks_policy': False,
+                        'required_status_checks': [{'context': 'Release branch lineage',
+                                                    'integration_id': GITHUB_ACTIONS_APP_ID}]}}])
+
+
+def proposed_owner_ruleset(current: dict) -> dict:
+    """Extend the existing sole-owner approval policy to release candidates."""
+    if current.get('name') != 'Owner approval' or current.get('target') != 'branch':
+        raise ValueError('owner approval ruleset identity changed')
+    proposed = {key: current[key] for key in ('name', 'target', 'enforcement', 'bypass_actors', 'conditions', 'rules')}
+    proposed = json.loads(json.dumps(proposed))
+    include = proposed['conditions']['ref_name']['include']
+    if not {'refs/heads/master', 'refs/heads/develop'} <= set(include):
+        raise ValueError('owner approval must still protect master and develop')
+    if 'refs/heads/rc/**' not in include:
+        include.append('refs/heads/rc/**')
+    return proposed
+
+
 def require_dedicated_release_key(repository: str) -> None:
     """Reject broad deploy-key bypass if another writable key is installed."""
     keys = github_json(f"repos/{repository}/keys")
@@ -138,7 +176,10 @@ def main(argv: list[str] | None = None) -> int:
     develop_endpoint = f"repos/{args.repository}/rulesets/{DEVELOP_RULESET_ID}"
     master = proposed_ruleset(github_json(master_endpoint))
     develop = proposed_develop_ruleset(github_json(develop_endpoint))
-    print(json.dumps({"master": master, "develop": develop}, indent=2, sort_keys=True))
+    owner_endpoint = f'repos/{args.repository}/rulesets/{OWNER_RULESET_ID}'
+    owner = proposed_owner_ruleset(github_json(owner_endpoint))
+    rc = proposed_rc_ruleset()
+    print(json.dumps({"master": master, "develop": develop, 'owner': owner, 'rc': rc}, indent=2, sort_keys=True))
     if args.apply:
         require_dedicated_release_key(args.repository)
         for name, endpoint, planned, projector in (
@@ -151,6 +192,20 @@ def main(argv: list[str] | None = None) -> int:
             if projector(installed) != planned or installed["enforcement"] != "active":
                 raise ValueError(f"{name} ruleset verification did not match installed policy")
             print(f"[release-ruleset] active {name} policy verified", flush=True)
+        subprocess.run(['gh', 'api', '--method', 'PUT', owner_endpoint, '--input', '-'],
+                       input=json.dumps(owner), text=True, check=True, stdout=subprocess.DEVNULL)
+        if proposed_owner_ruleset(github_json(owner_endpoint)) != owner:
+            raise ValueError('owner ruleset verification failed')
+        endpoint = f'repos/{args.repository}/rulesets'
+        candidates = [r for r in github_json(endpoint) if r['name'] == RC_RULESET_NAME]
+        if len(candidates) > 1:
+            raise ValueError('duplicate RC rulesets require manual review')
+        method = 'PUT' if candidates else 'POST'
+        target = endpoint + '/' + str(candidates[0]['id']) if candidates else endpoint
+        installed = json.loads(subprocess.check_output(['gh', 'api', '--method', method, target,
+            '--input', '-'], input=json.dumps(rc), text=True))
+        if any(installed.get(key) != value for key, value in rc.items()):
+            raise ValueError('RC ruleset verification failed')
     return 0
 
 

@@ -4772,6 +4772,14 @@ foreach(_declared_benchmark_case
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Benchmark;Lifecycle;Regression"
         TIMEOUT 30)
 endforeach()
+add_test(NAME V2_Integration_InstalledCompanionCancellationOwner
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_pipeline.py
+        InfrastructureTests.test_installed_companion_is_bound_to_exact_outer_cancellation_owner)
+set_tests_properties(V2_Integration_InstalledCompanionCancellationOwner PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Container;Lifecycle;Regression"
+    TIMEOUT 30)
+
 add_test(NAME V2_Integration_DockerBindMountIdentity
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_pipeline.py
@@ -5152,6 +5160,21 @@ add_v2_test(V2_Integration_ModelKLDCanaryCLI
     COMMAND $<TARGET_FILE:llaminar_model_kld_canary> --help
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Numerics;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15)
+
+# RC release routing and panel scoring are device-free CI contracts. Keep
+# their focused regressions in preflight as well as ordinary Unit coverage.
+foreach(V2_RELEASE_SCRIPT IN ITEMS release_candidate release_accuracy_panels)
+    add_test(NAME V2_Unit_${V2_RELEASE_SCRIPT}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_${V2_RELEASE_SCRIPT}.py)
+    set_tests_properties(V2_Unit_${V2_RELEASE_SCRIPT} PROPERTIES
+        LABELS "V2;Unit;BuildSystem;Publication;Numerics;Regression" TIMEOUT 30
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1;OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+    add_test(NAME V2_Integration_${V2_RELEASE_SCRIPT}
+        COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_${V2_RELEASE_SCRIPT}.py)
+    set_tests_properties(V2_Integration_${V2_RELEASE_SCRIPT} PROPERTIES
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;Publication;Numerics;Regression" TIMEOUT 30
+        ENVIRONMENT "PYTHONDONTWRITEBYTECODE=1;OMP_NUM_THREADS=1;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+endforeach()
 
 add_test(NAME V2_Unit_PublishedImageSuites
     COMMAND ${Python3_EXECUTABLE}
@@ -5815,6 +5838,8 @@ add_v2_test(V2_Unit_ParityReferenceCache
 
 # Typed, device-free expansion contract shared by every canonical parity suite.
 add_executable(v2_test_model_parity_definition
+    unit/parity/Test__AccuracyPanelHistory.cpp
+    unit/parity/Test__Qwen4ExpReleaseGates.cpp
     unit/parity/Test__ModelParityDefinition.cpp
     unit/parity/Test__QwenSparseQueryParityEvidence.cpp
     unit/parity/Test__ModelParityCrossHostE2E.cpp
@@ -5836,6 +5861,18 @@ add_v2_test(V2_Unit_ModelParityDefinition
     LABELS "V2;Unit;Parity;ProductionPath;CampaignFramework;Regression"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_AccuracyPanelHistory
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition> --gtest_filter=AccuracyPanelHistory.*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Parity;Numerics;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+
+add_v2_test(V2_Integration_Qwen4ExpReleaseGates
+    COMMAND $<TARGET_FILE:v2_test_model_parity_definition> --gtest_filter=Qwen4ExpReleaseGates.*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Parity;Numerics;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+
 add_v2_test(V2_Integration_ParityDiagnosticCaptureKeys
     COMMAND $<TARGET_FILE:v2_test_model_parity_definition>
         --gtest_filter=ModelParityDefinition.DiagnosticCaptureKeys*
@@ -29367,6 +29404,11 @@ add_v2_test(V2_Integration_GDNStateLayoutCliqueIdentity
 )
 
 set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_InstalledCompanionCancellationOwner
+    V2_Integration_release_candidate
+    V2_Integration_release_accuracy_panels
+    V2_Integration_AccuracyPanelHistory
+    V2_Integration_Qwen4ExpReleaseGates
     V2_Integration_DistributedResidencySummaryIdentityLifecycle
     ${V2_ORIGINAL_EXPERT_PEER_PREFLIGHT_TESTS}
     ${V2_SHARED_RANK_BANK_PREFLIGHT_TESTS}

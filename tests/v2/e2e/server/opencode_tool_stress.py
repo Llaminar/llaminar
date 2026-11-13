@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file opencode_tool_stress.py
+# @brief Stress a live Llaminar endpoint with the real OpenCode coding agent.
 """Stress a live Llaminar endpoint with the real OpenCode coding agent.
 
 OpenCode owns its system prompt, tool descriptions, JSON schemas, argument
@@ -89,7 +91,7 @@ def coding_prompt(case: str, content: str) -> str:
 
 
 def session_prompts(case: str, content: str) -> list[str]:
-    """Keep one real agent conversation across ten independently verified changes."""
+    """Keep one real agent conversation across five independently verified changes."""
     if case != "webapp":
         return [coding_prompt(case, content)]
     common = ("Work only in the current directory. Use Python's standard library only. "
@@ -99,35 +101,25 @@ def session_prompts(case: str, content: str) -> list[str]:
               "failing tests; the next turn can continue the work. Do not repeat an unchanged failing test "
               "without a code or configuration change. Avoid redundant manual server probes. ")
     phases = [
-        "Start Taskboard, a Python web app using ThreadingHTTPServer and SQLite. Create the taskboard package, "
-        "a CLI runnable as `python3 -m taskboard --host 127.0.0.1 --port 8080 --database tasks.sqlite`, "
-        "and a README. Implement GET /health returning JSON {\"status\":\"ok\"}. "
-        "Keep this first increment small: add one HTTP unittest, run it and finish this turn. "
-        "The task API, HTML interface and database features will be requested in subsequent turns.",
-        "Add a JSON task API: GET /api/tasks returns a list ordered by id; POST /api/tasks accepts {title: string} "
-        "and returns 201 with {id, title, completed: false}. Add HTTP unittests for creating/listing tasks.",
-        "Extend the task API: GET /api/tasks/<id> returns that task. "
-        "PATCH updates title and/or completed and returns 200; DELETE returns 204. IDs are integers. Test it.",
-        "Add an HTML page at / with a task creation form and completion/deletion controls. Server-render "
-        "the initial task titles and safely escape them; JavaScript uses the JSON API. Add CSS and document usage.",
-        "Make Unicode and emoji round-trip exactly through HTTP, SQLite and HTML. Include tests with "
-        "🙂 👩🏽‍💻 🇬🇧 ❤️ 1️⃣ 🚀 中文 λ, and JSON encoded with both literal UTF-8 and escaped surrogate pairs. "
-        "Response Content-Length must count UTF-8 bytes. Test an HTML-injection title too.",
-        "Harden input validation: malformed JSON, non-object bodies, missing/empty/whitespace titles, "
-        "non-string titles and non-boolean completed values return JSON errors with status 400. "
-        "Unknown task IDs return 404. An invalid request must not corrupt persisted tasks. Test each case.",
-        "Add GET /api/tasks?completed=true or completed=false filtering plus limit and offset pagination. "
-        "Filtering happens before pagination; id ordering is stable. Invalid completed, negative/non-numeric "
-        "limits or offsets return 400. Add independent HTTP tests for all query variants.",
-        "Verify task persistence across app restarts. Add tests that creates, updates and deletes survive restart.",
-        "Add tests creating at least 12 tasks concurrently and checking unique IDs and all titles. "
-        "Use explicit per-request SQLite connection ownership and configure the HTTP listener to handle "
-        "that concurrent connection count. Distinguish HTTP connection failures from database errors.",
-        "Review the entire app and tests. Begin by calling the glob tool with pattern '**/*.py', "
-        "the grep tool with pattern 'def ' and include '*.py', and the read tool on a returned Python file. "
-        "These three tool calls are required parts of the review. Add missing edge-case tests, update README, "
-        "and run `python3 -m unittest discover -s tests -v`. Finish all todos. Finally use write to create "
-        "result.txt containing exactly 123 with no newline, then read it; this is a tool-string regression sentinel.",
+        "Start Taskboard using ThreadingHTTPServer and SQLite, Python standard library only. Create a taskboard "
+        "package and CLI `python3 -m taskboard --host 127.0.0.1 --port 8080 --database tasks.sqlite`. "
+        "Implement GET /health returning JSON {\"status\":\"ok\"}; GET /api/tasks listing tasks by id; "
+        "POST /api/tasks accepting {title: string} and returning 201 with {id,title,completed:false}. "
+        "Add HTTP unittests and a short README; run the tests.",
+        "Add GET /api/tasks/<id>, PATCH title/completed returning 200, and DELETE returning 204. "
+        "Add a server-rendered HTML page at / with escaped titles and task creation/completion/deletion controls. "
+        "Unicode and emoji must round-trip through HTTP, SQLite and HTML, including escaped JSON surrogate pairs. "
+        "Content-Length counts UTF-8 bytes. Test updates, deletion and HTML-injection titles.",
+        "Harden input validation: malformed JSON, non-object bodies, missing/empty/whitespace/non-string titles "
+        "and non-boolean completed values return JSON errors with status 400. Unknown task IDs return 404. "
+        "Invalid requests must preserve existing tasks. Add HTTP unittests and run them.",
+        "Test task creation, update and deletion persistence across process restarts. Test 12 concurrent creates "
+        "with unique IDs and exact titles, per-request SQLite connection ownership and an adequate listener queue. "
+        "Fix defects and run the tests. Filtering and pagination are outside this small app's scope.",
+        "Review the app and tests. First call glob with '**/*.py', grep with pattern 'def ' and include '*.py', "
+        "and read on a returned Python file; all three calls are required. Update README and run "
+        "`python3 -m unittest discover -s tests -v`. Finish all todos. Use write to create result.txt with exactly "
+        "123 and no newline, then read it as the tool-string sentinel.",
     ]
     return [common + phase for phase in phases]
 
@@ -243,8 +235,6 @@ def check_webapp(directory: Path) -> dict:
             identity = tasks[0]["id"]
             status, updated = exchange(base, "PATCH", f"/api/tasks/{identity}", {"completed": True, "title": "done " + emoji})
             expect(status == 200 and updated.get("completed") is True and updated.get("title") == "done " + emoji, "update round trip")
-            expect(exchange(base, "GET", "/api/tasks?completed=true")[1] == [updated], "completed filter")
-            expect(exchange(base, "GET", "/api/tasks?completed=false&limit=1&offset=0")[1] == [tasks[1]], "filter before pagination")
             status, injection = exchange(base, "POST", "/api/tasks", {"title": '<script>alert("x")</script>'})
             expect(status == 201, "HTML title creation")
             status, page = exchange(base, "GET", "/")
@@ -255,8 +245,6 @@ def check_webapp(directory: Path) -> dict:
             expect(exchange(base, "POST", "/api/tasks", raw=b"{broken")[0] == 400, "malformed JSON")
             expect(exchange(base, "PATCH", f"/api/tasks/{identity}", {"completed": "true"})[0] == 400, "boolean validation")
             expect(exchange(base, "GET", "/api/tasks/999999999")[0] == 404, "missing task")
-            for query in ("completed=maybe", "limit=-1", "limit=no", "offset=-1", "offset=no"):
-                expect(exchange(base, "GET", "/api/tasks?" + query)[0] == 400, f"invalid query {query}")
             with ThreadPoolExecutor(max_workers=12) as executor:
                 created = list(executor.map(lambda index: exchange(base, "POST", "/api/tasks", {"title": f"parallel-{index}"}), range(12)))
             expect(all(status == 201 for status, _ in created), "concurrent creates")
@@ -264,7 +252,6 @@ def check_webapp(directory: Path) -> dict:
             expect({task["title"] for _, task in created} == {f"parallel-{index}" for index in range(12)}, "all concurrent titles")
             status, inventory = exchange(base, "GET", "/api/tasks")
             expect(status == 200 and [task["id"] for task in inventory] == sorted(task["id"] for task in inventory), "stable ordering")
-            expect(exchange(base, "GET", "/api/tasks?limit=3&offset=2")[1] == inventory[2:5], "pagination")
             expect(exchange(base, "DELETE", f"/api/tasks/{tasks[1]['id']}")[0] == 204, "delete")
             expect(exchange(base, "GET", f"/api/tasks/{tasks[1]['id']}")[0] == 404, "deleted task absent")
         with app_process(workspace, database, directory / "app.stderr") as base:

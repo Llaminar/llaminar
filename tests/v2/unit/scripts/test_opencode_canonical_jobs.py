@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_opencode_canonical_jobs.py
+# @brief Prove exact canonical coding selection and isolated outer-driver retirement.
 """Prove exact canonical coding selection and isolated outer-driver retirement.
 
 The matrix fixtures contain future case names rather than a model allowlist.
@@ -26,7 +28,7 @@ from test_published_image_suite import full_inventory
 
 
 class CanonicalCodingJobsTests(unittest.TestCase):
-    """Every tagged row reaches both images without names becoming policy."""
+    """Every tagged row receives one AVX512 session without names becoming policy."""
 
     def manifest(self):
         """Use a producer-shaped tagged record and a second unrelated future name."""
@@ -40,11 +42,11 @@ class CanonicalCodingJobsTests(unittest.TestCase):
         value['cells'].append(second)
         return value
 
-    def test_all_rows_project_to_both_shipping_images(self):
+    def test_all_rows_project_to_one_avx512_session(self):
         manifest = self.manifest()
         jobs = coding.matrix_jobs(manifest, manifest['source_revision'])
         self.assertEqual({(row['case'], row['cpu_isa']) for row in jobs}, {
-            (row['case'], isa) for row in manifest['cells'] for isa in suite.ISAS})
+            (row['case'], isa) for row in manifest['cells'] for isa in ('AVX512',)})
         self.assertEqual(len({row['artifact_id'] for row in jobs}), len(jobs))
         self.assertEqual(coding.select_cell(manifest, manifest['source_revision'],
                                            manifest['cells'][1]['case']), manifest['cells'][1])

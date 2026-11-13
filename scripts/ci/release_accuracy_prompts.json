@@ -1,0 +1,14 @@
+{
+  "schema": "llaminar.release-accuracy-prompts.v1",
+  "base_panel": "qfn_accuracy_prompts.json",
+  "context_cases": [
+    {"name": "bucket-127", "group": "bucket-128", "context_tokens": 127, "decode_rows": 6},
+    {"name": "bucket-128", "group": "bucket-128", "context_tokens": 128, "decode_rows": 6},
+    {"name": "bucket-129", "group": "bucket-128", "context_tokens": 129, "decode_rows": 6},
+    {"name": "bucket-511", "group": "bucket-512", "context_tokens": 511, "decode_rows": 6},
+    {"name": "bucket-512", "group": "bucket-512", "context_tokens": 512, "decode_rows": 6},
+    {"name": "bucket-513", "group": "bucket-512", "context_tokens": 513, "decode_rows": 6}
+  ],
+  "context_text": "A field notebook records the measurements, checks the assumptions, and explains which observation supports each conclusion. ",
+  "context_repetitions": 128
+}

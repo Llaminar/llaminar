@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_opencode_cell_runtime.py
+# @brief Exercise coding-cell ownership and failure frontiers without devices or models.
 """Exercise coding-cell ownership and failure frontiers without devices or models.
 
 The daemon fixture can lose a successful create reply, reject a stop, or return
@@ -313,7 +315,7 @@ class CellLifetimeTests(unittest.TestCase):
             directory = self.output / 'native-audit'
             directory.mkdir()
             (directory / 'result.json').write_text(json.dumps({
-                'complete': True, 'passed': True, 'joined_responses': 30,
+                'complete': True, 'passed': True, 'joined_responses': 15,
                 'verified_native_calls': 21, 'changed_responses': 0, 'changes': []}))
         self.assertNotIn('timeout', kwargs)
         return SimpleNamespace(returncode=0)
@@ -339,7 +341,7 @@ class CellLifetimeTests(unittest.TestCase):
         result = runtime.run_app(self.cell)
         self.assertTrue(result['passed'], result['errors'])
         self.assertTrue(result['complete'])
-        self.assertEqual(result['app']['completed_phases'], 10)
+        self.assertEqual(result['app']['completed_phases'], 5)
         self.assertTrue(all(not state['Running'] for state in self.containers.values()))
         serving_commands = [args for args in result['command']
                             if isinstance(args, str) and args.startswith('LLAMINAR_PERF_STATS_FILTER=')]

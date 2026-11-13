@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file wait_for_develop_image_gate.py
+# @brief Wait for exact develop image publication from a push or explicit CI run.
 """Wait for exact develop image publication from a push or explicit CI run.
 
 The PR gate cannot use a mutable ``develop`` tag or assume GitHub scheduled
@@ -43,7 +45,7 @@ def matching_ci_runs(response: dict, revision: str) -> list[dict]:
 
 
 def wait_for_image_gate(repository: str, revision: str, timeout_seconds: int,
-                        poll_seconds: int = 20) -> int:
+                        poll_seconds: int = 20, *, frozen_rc: bool = False) -> int:
     """Wait for the same exact-source publication contract on either CI trigger.
 
     Args:
@@ -60,7 +62,11 @@ def wait_for_image_gate(repository: str, revision: str, timeout_seconds: int,
         TimeoutError: Publication did not finish within the admission budget.
     """
     branch = github_json(f"repos/{repository}/branches/develop")
-    if branch.get("commit", {}).get("sha") != revision:
+    if frozen_rc:
+        comparison = github_json(f"repos/{repository}/compare/{revision}...{branch['commit']['sha']}")
+        if comparison.get('status') not in ('ahead', 'identical'):
+            raise ValueError('frozen RC image source is outside protected develop history')
+    elif branch.get("commit", {}).get("sha") != revision:
         raise ValueError("PR head is no longer the current develop branch tip")
     deadline = time.monotonic() + timeout_seconds
     observed = None
@@ -69,6 +75,8 @@ def wait_for_image_gate(repository: str, revision: str, timeout_seconds: int,
             f"repos/{repository}/actions/workflows/ci.yml/runs",
             "branch=develop", f"head_sha={revision}", "per_page=20")
         runs = matching_ci_runs(response, revision)
+        if frozen_rc and branch['commit']['sha'] != revision and not runs:
+            raise ValueError('frozen RC source has no image publication; cut a fresh candidate from published develop')
         complete = [run for run in runs if run.get("status") == "completed"]
         passed = [run for run in complete if run.get("conclusion") == "success"]
         if passed:
@@ -96,6 +104,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--repository", required=True)
     parser.add_argument("--revision", required=True)
     parser.add_argument("--timeout-seconds", type=int, default=4 * 60 * 60)
+    parser.add_argument('--frozen-rc', action='store_true',
+                        help='admit a historical protected-develop source already frozen by RC lineage')
     args = parser.parse_args(argv)
     if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", args.repository):
         parser.error("--repository requires OWNER/REPO")
@@ -103,7 +113,7 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--revision requires a full Git SHA")
     if args.timeout_seconds <= 0:
         parser.error("--timeout-seconds must be positive")
-    wait_for_image_gate(args.repository, args.revision, args.timeout_seconds)
+    wait_for_image_gate(args.repository, args.revision, args.timeout_seconds, frozen_rc=args.frozen_rc)
     return 0
 
 

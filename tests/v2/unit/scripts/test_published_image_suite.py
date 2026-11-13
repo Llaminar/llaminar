@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_published_image_suite.py
+# @brief Device-free contracts for immutable-image E2E, PR, and release publication.
 """Device-free contracts for immutable-image E2E, PR, and release publication.
 
 Fixtures model metadata only. Real HTTP/math evidence remains the canonical
@@ -94,6 +96,23 @@ def full_inventory():
     untagged["configuration"]["id"] = "Tiny_Diagnostic"
     untagged["configuration"]["e2e"] = None
     return {"schema": 1, "source_revision": "a" * 40, "scope": "all", "cells": [row, untagged]}
+
+
+def write_preflight_bundle(root, pair=None):
+    """Synthetic prerequisite metadata, explicitly independent of HTTP outcomes."""
+    pair = pair or image_pair()
+    inventory = full_inventory()
+    manifest = suite.pipeline.e2e_projection(inventory, pair['source']['revision'])
+    write_json(root / 'images.json', pair)
+    write_json(root / 'all-cells.json', inventory)
+    write_json(root / 'manifest.json', manifest)
+    prerequisites = prerequisite_evidence(pair)
+    for isa in suite.ISAS:
+        write_json(root / 'prerequisites' / isa.lower() / 'prerequisites/prerequisites.json', prerequisites[isa]['report'])
+    write_json(root / 'preflight-receipt.json', dict(schema='llaminar.release-prerequisites.v1', complete=True,
+        images_digest=digest(pair), manifest_digest=digest(manifest), prerequisites=prerequisites,
+        qfn_source_admission_required=True, qfn_source_admission_reports={isa:'synthetic-source-boundary' for isa in suite.ISAS}))
+    return manifest
 
 
 def write_e2e_bundle(root, pair=None):
@@ -220,6 +239,82 @@ def public_release_bundle(root, tag="2026-09-24.1"):
 class PublicDocumentationTests(unittest.TestCase):
     """Published pages retain complete certificates and cannot invent a pass."""
 
+    def test_rc_release_assets_round_trip_and_reject_changed_accuracy_csv(self):
+        from test_release_accuracy_panels import write_panel
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);preflight=root/'preflight';accuracy=root/'accuracy'
+            pair,manifest,inventory,_=write_panel(accuracy/'avx512/panel','AVX512')
+            write_panel(accuracy/'avx2/panel','AVX2')
+            write_preflight_bundle(preflight,pair)
+            write_json(preflight/'all-cells.json',inventory);write_json(preflight/'manifest.json',manifest)
+            receipt=json.loads((preflight/'preflight-receipt.json').read_text())
+            receipt['manifest_digest']=digest(manifest);write_json(preflight/'preflight-receipt.json',receipt)
+            prerequisites={isa:receipt['prerequisites'][isa]['report'] for isa in suite.ISAS}
+            reports={isa:json.loads((accuracy/isa.lower()/'panel/panel.json').read_text()) for isa in suite.ISAS}
+            numerical={'complete':True,'images_digest':digest(pair),'manifest_digest':digest(manifest),
+                       'reports':{isa:digest(reports[isa]) for isa in suite.ISAS}}
+            write_json(accuracy/'accuracy-receipt.json',numerical)
+            coding={'complete':True,'passed':True,'expected_jobs':len(manifest['cells']),
+                    'jobs':[{'case':row['case'],'cpu_isa':'AVX512'} for row in manifest['cells']]}
+            write_json(root/'coding/opencode.json',coding)
+            source={'rc_revision':'c'*40,'source_revision':pair['source']['revision']}
+            write_json(root/'source/source.json',source)
+            result={'source':pair['source'],'images':pair['images'],'repository':pair['repository'],'branch':pair['branch'],
+                    'scope':'release-preflight-and-benchmarks','recorded_at_utc':'2026-11-13T00:00:00Z',
+                    'passed':True,'full_image_certification':False,'variants':{}}
+            benchmarks={}
+            for isa in suite.ISAS:
+                report=benchmark_report(pair,manifest,prerequisites[isa],isa)
+                report['prerequisites_digest']=report.pop('e2e_report_digest');benchmarks[isa]=report
+                for row in report['cells']:row['prefill_tokens']=512
+                write_json(root/'benchmarks'/isa.lower()/'benchmarks.json',report)
+                result['variants'][isa]={'report_digest':digest(report),'prerequisites_digest':digest(prerequisites[isa]),
+                                        'comparisons':report['comparisons'],'cells':report['cells'],'workload':{'decode_tokens':256}}
+                write_json(accuracy/isa.lower()/'outer-cleanup.json',{'synthetic_retirement_boundary':True})
+            write_json(root/'benchmarks/results.json',result)
+            (root/'benchmarks/benchmarks.svg').write_text(chart.render_chart(result))
+            proof={'rc_source':source,'pair':pair,'manifest':manifest,'prerequisites':prerequisites,
+                   'preflight_receipt':receipt,'accuracy_receipt':numerical,'accuracy':reports,'coding':coding,'result':result}
+            write_json(root/'eligible/release-candidate.json',master_release.candidate_certificate(proof))
+            (root/'release').mkdir()
+            paths=master_release.release_assets(preflight,root/'benchmarks',root/'coding',accuracy,
+                root/'source',root/'eligible',root/'release')
+            assets=root/'release/assets'
+            write_json(assets/'test-run.json',{'source_sha':pair['source']['revision'],'rc_sha':'c'*40})
+            self.assertEqual({p.name for p in paths}|{'test-run.json'},set(master_release.release_candidate_asset_names()))
+            metadata={'tag_name':'2026-11-13.1','draft':False,'prerelease':False,'published_at':'2026-11-13T00:00:00Z',
+                      'assets':[{'name':p.name} for p in assets.iterdir()]}
+            self.assertNotIn('Full HTTP E2E', (assets/'benchmarks.svg').read_text())
+            observed=public_docs.load_evidence(pair['repository'],metadata,assets)
+            self.assertEqual(observed.e2e,{})
+            self.assertEqual(observed.accuracy,reports)
+            public_docs.render_release(observed,root/'page')
+            self.assertIn('five-phase OpenCode',(root/'page/index.md').read_text())
+            (assets/'accuracy-rows-avx2.csv').write_text('changed numerical evidence')
+            with self.assertRaisesRegex(ValueError,'CSV changed'):
+                public_docs.load_evidence(pair['repository'],metadata,assets)
+
+    def test_rc_publication_assets_and_pages_do_not_claim_http_results(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);assets=root/'assets';assets.mkdir()
+            (assets/'accuracy-rows-avx512.csv').write_text('synthetic compact rows')
+            metadata={'tag_name':'2026-11-13.1','body':'RC accuracy evidence','published_at':'2026-11-13T00:00:00Z'}
+            pair=image_pair();manifest={'cells':[]}
+            evidence=public_docs.PublishedEvidence(metadata,assets,pair,manifest,{},
+                {isa:{'cells':[]} for isa in suite.ISAS},{},preflight={isa:{} for isa in suite.ISAS},
+                accuracy={isa:{} for isa in suite.ISAS},coding={'expected_jobs':0})
+            public_docs.render_release(evidence,root/'page')
+            text='\n'.join(path.read_text() for path in (root/'page').glob('*.md'))
+            self.assertIn('five-phase OpenCode',text)
+            self.assertIn('accuracy-rows-avx512.csv',text)
+            self.assertNotIn('HTTP end-to-end suite',text)
+            self.assertNotIn('e2e-avx512.json',text)
+            names=master_release.release_candidate_asset_names()
+            self.assertEqual(len(names),len(set(names)))
+            self.assertIn('preflight-receipt.json',names)
+            self.assertIn('accuracy-rows-avx2.csv',names)
+            self.assertNotIn('e2e-receipt.json',names)
+
     def test_release_reports_render_both_isas_and_keep_original_downloads(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -334,6 +429,32 @@ class PublicDocumentationTests(unittest.TestCase):
 
 
 class PublishedImageSuiteTests(unittest.TestCase):
+    def test_release_preflight_launches_no_standalone_http_suite(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);pair=image_pair();manifest=write_preflight_bundle(root,pair)
+            with patch.object(suite,'run_e2e_prerequisites',return_value=prerequisite_evidence(pair)) as prerequisites, \
+                 patch.object(suite,'run_source_pair') as source, \
+                 patch.object(suite,'validate_source_admission'), patch.object(suite,'run_in_driver') as http:
+                suite.run_preflight(SimpleNamespace(),pair,manifest,root)
+                self.assertEqual(suite.admit_preflight(root,pair)[0],manifest)
+            prerequisites.assert_called_once()
+            source.assert_not_called()
+            http.assert_not_called()
+            self.assertFalse((root/'e2e-receipt.json').exists())
+
+    def test_release_preflight_admission_rejects_partial_or_changed_native_receipts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);pair=image_pair();write_preflight_bundle(root,pair)
+            with patch.object(suite,'validate_source_admission'):
+                suite.admit_preflight(root,pair)
+                path=root/'prerequisites/avx2/prerequisites/prerequisites.json'
+                original=json.loads(path.read_text());write_json(path,{**original,'preflight_return_code':1})
+                with self.assertRaisesRegex(ValueError,'sealed receipt'):suite.admit_preflight(root,pair)
+                write_json(path,original)
+                receipt=json.loads((root/'preflight-receipt.json').read_text())
+                write_json(root/'preflight-receipt.json',{**receipt,'complete':False})
+                with self.assertRaisesRegex(ValueError,'completion'):suite.admit_preflight(root,pair)
+
     def test_release_prerequisites_execute_both_exact_companions_before_http(self):
         """Published runtimes must no longer inherit tests from develop builds."""
         pair = image_pair()
@@ -1083,25 +1204,25 @@ class PublishedImageSuiteTests(unittest.TestCase):
         self.assertIn("ready_for_review", workflow["on"]["pull_request"]["types"])
         jobs = workflow["jobs"]
         for name, job in jobs.items():
-            expected = ("${{ always() && !github.event.pull_request.draft }}" if name == "coding"
+            expected = ("${{ always() && !github.event.pull_request.draft }}" if name in ("coding", "eligible")
                         else "${{ !github.event.pull_request.draft }}")
             self.assertEqual(job["if"], expected, name)
-        self.assertEqual(jobs["e2e"]["needs"], "source")
-        self.assertEqual(jobs["benchmarks"]["needs"], "e2e")
-        for job, subcommand in (("e2e", "e2e"), ("benchmarks", "benchmarks")):
+        self.assertEqual(jobs["preflight"]["needs"], ["source"])
+        self.assertEqual(jobs["benchmarks"]["needs"], ["source", "coding"])
+        for job, subcommand in (("preflight", "preflight"), ("benchmarks", "benchmarks")):
             commands = [step["run"] for step in jobs[job]["steps"]
                         if f"run_published_image_suite.py {subcommand} " in step.get("run", "")]
             self.assertEqual(len(commands), 1)
             tokens = shlex.split(commands[0].split("exec ", 1)[1].replace("\\\n", ""))
-            self.assertEqual(tokens.count("--qfn-source-admission"), 1)
+            self.assertEqual(tokens.count("--qfn-source-admission"), 0)
 
-        self.assertEqual(jobs["e2e"]["concurrency"]["group"], "llaminar-develop-image-gate")
+        self.assertEqual(jobs["preflight"]["concurrency"]["group"], "llaminar-develop-image-gate")
         self.assertEqual(jobs["benchmarks"]["concurrency"]["group"], "llaminar-develop-image-gate")
         self.assertEqual(jobs["benchmarks"]["permissions"]["pull-requests"], "write")
         text = (ROOT / ".github/workflows/master-pr-certification.yml").read_text()
         self.assertIn("--expected-source-revision \"$HEAD_SHA\"", text)
         self.assertIn(":develop-$HEAD_SHA", text)
-        self.assertIn("--e2e-bundle", text)
+        self.assertIn("--preflight-bundle", text)
         self.assertIn("scripts/ci/post_pr_benchmark_rag.py", text)
         self.assertNotIn("--publish", text)
 
@@ -1189,19 +1310,19 @@ class PublishedImageSuiteTests(unittest.TestCase):
         master = "d" * 40
         pr = {"number": 9, "merged_at": "2026-09-24T08:03:08Z",
               "merge_commit_sha": master,
-              "head": {"ref": "develop", "repo": {"full_name": "Llaminar/llaminar"}},
+              "head": {"ref": "rc/v1", "repo": {"full_name": "Llaminar/llaminar"}},
               "base": {"ref": "master"}}
         unrelated = {**pr, "merge_commit_sha": "e" * 40}
         with patch.object(master_release, "github_json",
                           side_effect=[[], [unrelated, pr]]) as github:
-            self.assertEqual(master_release.merged_develop_pr("Llaminar/llaminar", master), pr)
+            self.assertEqual(master_release.merged_rc_pr("Llaminar/llaminar", master), pr)
         self.assertEqual(github.call_count, 2)
         self.assertEqual(github.call_args_list[1].args[0],
                          "repos/Llaminar/llaminar/pulls")
         with patch.object(master_release, "github_json",
                           side_effect=[[], [unrelated]]):
             with self.assertRaisesRegex(ValueError, "not one merged"):
-                master_release.merged_develop_pr("Llaminar/llaminar", master)
+                master_release.merged_rc_pr("Llaminar/llaminar", master)
 
     def test_master_release_never_rewrites_conflicting_immutable_image(self):
         image = {"id": "sha256:" + "a" * 64,
@@ -1242,45 +1363,53 @@ class PublishedImageSuiteTests(unittest.TestCase):
         self.assertTrue(all(not event[1] for event in events[upload + 1:] if event[0] == "tag"))
         self.assertEqual(events[-1], ("gh", ["gh", "release", "edit"]))
 
+    @patch.object(master_release, 'admit_accuracy', return_value={isa: {'synthetic_accuracy_boundary': isa} for isa in suite.ISAS})
+    @patch.object(master_release.release_candidate, 'validate', return_value='a' * 40)
     @patch.object(master_release, 'validate_coding_matrix', return_value={'expected_jobs': 2})
-    def test_release_revalidates_every_attached_e2e_and_benchmark_report(self, coding_validator):
+    @patch.object(suite, "validate_source_admission")
+    def test_release_revalidates_every_attached_e2e_and_benchmark_report(self, source_admission, coding_validator, source_validator, accuracy_validator):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             e2e_root, benchmark_root = root / "e2e", root / "benchmarks"
             e2e_root.mkdir()
             benchmark_root.mkdir()
             coding_root = root / 'opencode'
+            source_root = root / 'source'
+            write_json(source_root / 'source.json', {'synthetic_source_boundary': True})
+            write_json(root/'accuracy/accuracy-receipt.json', {'synthetic_accuracy_receipt_boundary': True})
             write_json(coding_root / 'opencode.json', {'scope': 'coding-boundary-fixture'})
             pair = image_pair()
             pair["workflow_revision"] = pair["source"]["revision"]
-            manifest = write_e2e_bundle(e2e_root, pair)
+            manifest = write_preflight_bundle(e2e_root, pair)
             write_json(benchmark_root / "images.json", pair)
             write_json(benchmark_root / "manifest.json", manifest)
             result = {"source": pair["source"], "images": pair["images"],
                       "repository": pair["repository"], "branch": "develop",
                       "passed": True,
                       "regression_threshold_pct": 10,
-                      "scope": "full-http-e2e-and-benchmarks",
-                      "full_image_certification": False, "variants": {}}
+                      "scope": "release-preflight-and-benchmarks",
+                      "full_image_certification": False, "variants": {},
+                      "release_predecessors": {"accuracy_reports": {isa: digest({"synthetic_accuracy_boundary":isa}) for isa in suite.ISAS}, "opencode_digest":digest({"expected_jobs":2})}}
             for isa in suite.ISAS:
-                e2e = json.loads((e2e_root / isa.lower() / "e2e.json").read_text())
+                e2e = prerequisite_evidence(pair)[isa]["report"]
                 report = benchmark_report(pair, manifest, e2e, isa)
+                report["prerequisites_digest"] = report.pop("e2e_report_digest")
                 write_json(benchmark_root / isa.lower() / "benchmarks.json", report)
                 result["variants"][isa] = {"report_digest": digest(report),
-                    "e2e_report_digest": digest(e2e),
+                    "prerequisites_digest": digest(e2e),
                     "comparisons": report["comparisons"], "cells": report["cells"]}
             write_json(benchmark_root / "results.json", result)
             admitted = master_release.validate_proof(
                 e2e_root, benchmark_root, pair["repository"],
-                pair["source"]["revision"], pair["source"]["tree"], coding_directory=coding_root)
+                pair["source"]["revision"], pair["source"]["tree"], coding_directory=coding_root, accuracy_directory=root/'accuracy', source_directory=source_root, rc_branch='rc/v1')
             self.assertEqual(admitted["pair"], pair)
             coding_validator.assert_called_once_with({'scope': 'coding-boundary-fixture'},
-                pair, manifest, admitted['e2e'], admitted['benchmarks'])
+                pair, manifest, admitted['prerequisites'], admitted['accuracy'])
             self.assertEqual(admitted['coding'], {'expected_jobs': 2})
             initial = master_release.release_notes("2026-09-23.1", None, [], admitted,
                 pair["repository"], "https://github.com/example/actions/runs/1", "d" * 40)
             self.assertIn("Initial dated release", initial)
-            self.assertIn("e2e-avx512.json", initial)
+            self.assertIn("production-preflight-avx512.json", initial)
             self.assertIn("benchmark-results.json", initial)
             self.assertIn('opencode.json', initial)
             self.assertNotIn("- 123abc", initial)
@@ -1290,18 +1419,18 @@ class PublishedImageSuiteTests(unittest.TestCase):
             self.assertIn("123abc fix: restore prefix", later)
             with self.assertRaisesRegex(ValueError, "master tree"):
                 master_release.validate_proof(e2e_root, benchmark_root, pair["repository"],
-                                              pair["source"]["revision"], "f" * 40, coding_directory=coding_root)
+                                              pair["source"]["revision"], "f" * 40, coding_directory=coding_root, accuracy_directory=root/'accuracy', source_directory=source_root, rc_branch='rc/v1')
             coding_validator.side_effect = ValueError('coding audit failed')
             with self.assertRaisesRegex(ValueError, 'coding audit failed'):
                 master_release.validate_proof(e2e_root, benchmark_root, pair['repository'],
-                    pair['source']['revision'], pair['source']['tree'], coding_directory=coding_root)
+                    pair['source']['revision'], pair['source']['tree'], coding_directory=coding_root, accuracy_directory=root/'accuracy', source_directory=source_root, rc_branch='rc/v1')
             coding_validator.side_effect = None
             result["variants"]["AVX2"]["report_digest"] = "wrong"
             write_json(benchmark_root / "results.json", result)
             with self.assertRaisesRegex(ValueError, "compact benchmark numbers"):
                 master_release.validate_proof(e2e_root, benchmark_root, pair["repository"],
                                               pair["source"]["revision"], pair["source"]["tree"],
-                                              coding_directory=coding_root)
+                                              coding_directory=coding_root, accuracy_directory=root/'accuracy', source_directory=source_root, rc_branch='rc/v1')
 
     def test_master_ruleset_requires_source_and_both_phase_checks(self):
         current = {"name": "master", "target": "branch", "enforcement": "disabled",
@@ -1429,12 +1558,12 @@ class PublishedImageSuiteTests(unittest.TestCase):
                         "benchmarks": {isa: {"baseline_digest": digest(baseline),
                                             "cells": rows[isa]} for isa in suite.ISAS}}
             with patch.object(high_water, "git_file", return_value=(ROOT / "README.md").read_bytes()):
-                payloads = high_water.proposed_payloads(evidence, baseline)
+                payloads = high_water.proposed_payloads(evidence, baseline, "a" * 40, baseline)
             self.assertEqual(len(json.loads(payloads[high_water.HIGH_WATER])["entries"]), 2)
             self.assertEqual(payloads[str(suite.REPORT_DIRECTORY / "benchmarks.svg")], b"<svg/>")
             evidence["benchmarks"]["AVX2"]["baseline_digest"] = "stale"
             with self.assertRaisesRegex(ValueError, "different source high-water"):
-                high_water.proposed_payloads(evidence, baseline)
+                high_water.proposed_payloads(evidence, baseline, "a" * 40, baseline)
 
     def test_high_water_commit_joins_identical_master_tree_without_other_changes(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1453,13 +1582,13 @@ class PublishedImageSuiteTests(unittest.TestCase):
                                              text=True).strip()
             with patch.object(high_water, "ROOT", root):
                 committed = high_water.commit_payloads(parent, master,
-                                                       {"high_water.json": b"new\n"}, 7)
+                                                       {"high_water.json": b"new\n"}, 7, parent)
                 self.assertEqual(high_water.git("rev-parse", f"{committed}^1"), parent)
                 self.assertEqual(high_water.git("rev-parse", f"{committed}^2"), master)
                 self.assertIn("[skip ci]", high_water.git("log", "-1", "--format=%s", committed))
                 self.assertEqual(high_water.git_file(committed, "high_water.json"), b"new\n")
                 unchanged = high_water.commit_payloads(parent, master,
-                                                       {"high_water.json": b"old\n"}, 7)
+                                                       {"high_water.json": b"old\n"}, 7, parent)
                 self.assertNotEqual(unchanged, parent)
                 self.assertEqual(high_water.git("rev-parse", f"{unchanged}^2"), master)
                 (root / "high_water.json").write_text("unrelated master tree\n")
@@ -1470,7 +1599,7 @@ class PublishedImageSuiteTests(unittest.TestCase):
                 different = high_water.git("rev-parse", "HEAD")
                 with self.assertRaisesRegex(ValueError, "trees differ"):
                     high_water.commit_payloads(parent, different,
-                                               {"high_water.json": b"new\n"}, 7)
+                                               {"high_water.json": b"new\n"}, 7, parent)
 
     def test_post_merge_publication_fast_forwards_develop_and_retries_idempotently(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -1513,12 +1642,15 @@ class PublishedImageSuiteTests(unittest.TestCase):
             benchmark_directory = root / "benchmarks"
             benchmark_directory.mkdir()
             (benchmark_directory / "benchmarks.svg").write_text("<svg/>")
-            with patch.object(high_water, "ROOT", checkout), \
-                 patch.object(master_release, "merged_develop_pr",
-                              return_value={"head": {"sha": source}, "number": 7}), \
+            write_json(root/'eligible/release-candidate.json', {'synthetic_certificate_boundary': True})
+            with patch.object(master_release, 'candidate_certificate', return_value={'synthetic_certificate_boundary': True}), \
+                 patch.object(master_release, 'fetch_rc_head'), \
+                 patch.object(high_water, "ROOT", checkout), \
+                 patch.object(master_release, "merged_rc_pr",
+                              return_value={"head": {"sha": source, "ref": "rc/v1"}, "number": 7}), \
                  patch.object(master_release, "certified_pr_run", return_value={"id": 99}), \
                  patch.object(master_release, "download_proof",
-                              return_value=(root / "e2e", benchmark_directory, root / 'opencode')), \
+                              return_value={'preflight': root/'preflight', 'benchmarks':benchmark_directory, 'opencode':root/'opencode', 'accuracy':root/'accuracy', 'rc-source':root/'source', 'release-eligibility':root/'eligible'}), \
                  patch.object(master_release, "validate_proof", return_value=evidence):
                 first = high_water.publish("Llaminar/llaminar", master, root / "proof",
                                            str(remote))
@@ -1550,7 +1682,7 @@ class PublishedImageSuiteTests(unittest.TestCase):
                                 text.index("actions/checkout@v6"))
                 self.assertIn("exec python3 scripts/ci/run_published_image_suite.py", text)
         pr = (ROOT / ".github/workflows/master-pr-certification.yml").read_text()
-        self.assertEqual(pr.count("exec python3 scripts/ci/run_published_image_suite.py"), 3)
+        self.assertEqual(pr.count("exec python3 scripts/ci/run_published_image_suite.py"), 4)
 
     def test_metadata_companion_does_not_build_a_replacement_runtime(self):
         from types import SimpleNamespace

@@ -1,17 +1,17 @@
 name: Master release — promote PR-certified images
 
-# Master accepts only a develop PR whose published-image E2E, benchmark and coding
+# Master accepts only an rc/* PR whose published-image E2E, benchmark and coding
 # checks passed. The merge is normally squashed, so the release validates the
 # resulting tree against the tested develop image rather than equating SHAs.
 on:
   # A squash message can contain GitHub's CI-skip marker in quoted prose.
   # The trusted post-merge event still fires in that case; publish only the
-  # already-merged, same-repository develop PR's master commit.
+  # already-merged, same-repository RC PR's master commit.
   pull_request_target:
     types: [closed]
     branches: [master]
   # Recovery for a missed merge event. The publisher independently proves the
-  # current master commit, its exact develop PR, both image IDs and artifacts.
+  # current master commit, its exact RC PR, both image IDs and artifacts.
   workflow_dispatch:
 
 permissions:
@@ -32,7 +32,7 @@ jobs:
         (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/master') ||
         (github.event_name == 'pull_request_target' &&
          github.event.pull_request.merged == true &&
-         github.event.pull_request.head.ref == 'develop' &&
+         startsWith(github.event.pull_request.head.ref, 'rc/') &&
          github.event.pull_request.head.repo.full_name == github.repository)
       }}
     runs-on: [llaminar-xeon-host]

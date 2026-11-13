@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_opencode_cell_evidence.py
+# @brief Reject missing or contradictory independent coding-cell evidence.
 """Reject missing or contradictory independent coding-cell evidence.
 
 The application and context validators run unchanged. Native runtime policy
@@ -36,6 +38,13 @@ class CodingEvidenceTests(unittest.TestCase):
         self.pair = image_pair()
         self.manifest = fixtures.CanonicalCodingJobsTests().manifest()
         self.row = self.manifest['cells'][0]
+        # Four independent metadata cells retain missing/duplicate/failed-job
+        # adversarial coverage with one shipping ISA per coding session.
+        for index in (2,3):
+            extra=deepcopy(self.manifest['cells'][0])
+            extra['case']=f'Future/Fixture.ProductionParity/variant{index}'
+            extra['configuration']['id']=f'FutureVariant{index}'
+            self.manifest['cells'].append(extra)
         self.correctness = {isa: {'phase': 'e2e', 'isa': isa} for isa in evidence.suites.ISAS}
         self.benchmarks = {isa: {'phase': 'benchmarks', 'isa': isa} for isa in evidence.suites.ISAS}
         isa = evidence.suites.ISAS[0]
@@ -43,13 +52,13 @@ class CodingEvidenceTests(unittest.TestCase):
         native = {'Running': False, 'Pid': 0, 'Status': 'exited', 'OOMKilled': False,
                   'ExitCode': 0, 'Error': ''}
         app = finished_report(errors=1, task_errors=['generated app has a failing test'])
-        group = {'requests': 30, 'prompt_tokens': 3000, 'restored_tokens': 2500,
+        group = {'requests': 15, 'prompt_tokens': 3000, 'restored_tokens': 2500,
                  'token_reuse_rate': 2500 / 3000, 'ttft_mean_seconds': 2,
                  'ttft_median_seconds': 1, 'ttft_p95_seconds': 4, 'prefill_seconds': 40}
         empty = {'requests': 0, 'prompt_tokens': 0, 'restored_tokens': 0,
                  'token_reuse_rate': None, 'ttft_mean_seconds': None,
                  'ttft_median_seconds': None, 'ttft_p95_seconds': None, 'prefill_seconds': 0}
-        app['results'][0]['prefix_reuse'] = {'schema': 1, 'complete': True, 'requests': 30,
+        app['results'][0]['prefix_reuse'] = {'schema': 1, 'complete': True, 'requests': 15,
             'scope': 'exclusive_sequential_workload_request_boundary_observations',
             'groups': {'all': dict(group), 'ordinary': dict(group),
                        'compaction': dict(empty), 'post_compaction': dict(empty)},
@@ -69,15 +78,15 @@ class CodingEvidenceTests(unittest.TestCase):
                        'errors': [], 'cpu_isa': isa, 'case': self.row['case'],
                        'source_revision': self.pair['source']['revision'], 'image': control['image'],
                        'images_digest': digest(self.pair), 'manifest_digest': digest(self.manifest),
-                       'e2e_report_digest': digest(self.correctness[isa]),
-                       'benchmark_report_digest': digest(self.benchmarks[isa]),
+                       'prerequisites_digest': digest(self.correctness[isa]),
+                       'accuracy_report_digest': digest(self.benchmarks[isa]),
                        'configuration': self.row['configuration'], 'controller': control,
                        'evidence': {'app': app, 'context': context,
                            'model_metadata': {'schema': 1, 'tool_format': 'qwen_3_xml',
                                               'context_tokens': 131072, 'context_alignment_tokens': 64},
                            'admission_probes': [{'context_tokens': 131072, 'outcome': 'accepted',
                                                  'retired_container': native}],
-                           'native': {'complete': True, 'passed': True, 'joined_responses': 30,
+                           'native': {'complete': True, 'passed': True, 'joined_responses': 15,
                                       'verified_native_calls': 21, 'changed_responses': 0, 'changes': []},
                            'perf': {'world_size': 1, 'records': [{'domain': 'server',
                                'name': 'execution_participant', 'rank': 0, 'device': 'CUDA:0'}]},
@@ -112,16 +121,16 @@ class CodingEvidenceTests(unittest.TestCase):
         """Build the complete canonical product with separately bound inner/outer proofs."""
         jobs = []
         for row in self.manifest['cells']:
-            for isa in evidence.suites.ISAS:
+            for isa in ('AVX512',):
                 cell = deepcopy(self.report)
                 cell.update(cpu_isa=isa, case=row['case'], configuration=row['configuration'],
                     image=self.pair['images'][isa]['id'],
-                    e2e_report_digest=digest(self.correctness[isa]),
-                    benchmark_report_digest=digest(self.benchmarks[isa]))
+                    prerequisites_digest=digest(self.correctness[isa]),
+                    accuracy_report_digest=digest(self.benchmarks[isa]))
                 cell['controller'].update(image=cell['image'], configuration=row['configuration'])
                 job = {key: cell[key] for key in ('schema', 'complete', 'passed', 'errors', 'case',
                     'cpu_isa', 'image', 'images_digest', 'manifest_digest', 'source_revision',
-                    'e2e_report_digest', 'benchmark_report_digest')}
+                    'prerequisites_digest', 'accuracy_report_digest')}
                 job.update(scope='canonical_opencode_job', cell=cell,
                     outer_cleanup={'complete': True, 'passed': True, 'errors': [], 'unexpected_live': [],
                         'owner': 'llaminar-suite-driver-' + 'b' * 32, 'retired': {},
@@ -149,7 +158,7 @@ class CodingEvidenceTests(unittest.TestCase):
 
     def test_stale_source_image_or_preceding_gate_cannot_be_relabelled_green(self):
         for key in ('source_revision', 'image', 'manifest_digest', 'images_digest',
-                    'e2e_report_digest', 'benchmark_report_digest', 'case', 'cpu_isa'):
+                    'prerequisites_digest', 'accuracy_report_digest', 'case', 'cpu_isa'):
             original = self.report[key]
             self.report[key] = 'stale'
             with self.subTest(key=key), self.assertRaises(ValueError):
@@ -203,7 +212,7 @@ class CodingEvidenceTests(unittest.TestCase):
     def test_complete_matrix_replays_every_job_and_publisher_validation(self):
         report = self.aggregate(self.jobs())
         self.assertTrue(report['passed'])
-        self.assertEqual(report['expected_jobs'], len(self.manifest['cells']) * len(evidence.suites.ISAS))
+        self.assertEqual(report['expected_jobs'], len(self.manifest['cells']))
         self.assertEqual(evidence.validate_matrix(report, self.pair, self.manifest,
                                                   self.correctness, self.benchmarks), report)
         report['jobs'][0]['cell']['evidence']['native']['changed_responses'] = 1
@@ -246,7 +255,7 @@ class CodingEvidenceTests(unittest.TestCase):
     def test_matrix_cli_preserves_selection_and_fails_missing_artifacts(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            args = ['--e2e-bundle', str(root / 'e2e'), '--benchmark-bundle', str(root / 'benchmarks'),
+            args = ['--preflight-bundle', str(root / 'e2e'), '--accuracy-bundle', str(root / 'benchmarks'),
                     '--expected-source-revision', self.pair['source']['revision'],
                     '--output', str(root / 'matrix.json')]
             with patch.object(matrix_cli, 'admit_bundles',
@@ -264,23 +273,23 @@ class CodingEvidenceTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     matrix_cli.main(['prepare', *wrong])
 
-    def test_workflow_runs_only_on_master_pr_after_benchmarks_and_keeps_all_failures(self):
+    def test_workflow_runs_only_on_master_pr_after_accuracy_and_keeps_all_failures(self):
         workflow = yaml.load((ROOT / '.github/workflows/master-pr-certification.yml').read_text(),
                              Loader=yaml.BaseLoader)
         self.assertEqual(set(workflow['on']), {'pull_request'})
         self.assertEqual(workflow['on']['pull_request']['branches'], ['master'])
         jobs = workflow['jobs']
-        self.assertEqual(jobs['coding_matrix']['needs'], 'benchmarks')
-        self.assertEqual(jobs['coding_cells']['needs'], 'coding_matrix')
+        self.assertEqual(jobs['coding_matrix']['needs'], ['source', 'accuracy'])
+        self.assertEqual(jobs['coding_cells']['needs'], ['source', 'coding_matrix'])
         self.assertEqual(jobs['coding_cells']['strategy']['fail-fast'], 'false')
         self.assertIn('needs.coding_matrix.outputs.matrix', jobs['coding_cells']['strategy']['matrix'])
         self.assertEqual(jobs['coding_cells']['concurrency'], jobs['benchmarks']['concurrency'])
-        self.assertEqual(set(jobs['coding']['needs']), {'coding_matrix', 'coding_cells'})
-        self.assertEqual(jobs['coding']['if'], 'always()')
+        self.assertEqual(set(jobs['coding']['needs']), {'source', 'coding_matrix', 'coding_cells'})
+        self.assertEqual(jobs['coding']['if'], '${{ always() && !github.event.pull_request.draft }}')
         from apply_master_ruleset import REQUIRED_CHECKS
         self.assertIn(jobs['coding']['name'], REQUIRED_CHECKS)
         command = '\n'.join(step.get('run', '') for step in jobs['coding_cells']['steps'])
-        self.assertIn('--benchmark-bundle', command)
+        self.assertIn('--accuracy-bundle', command)
         self.assertIn('--expected-source-revision', command)
         self.assertNotIn('--turn-wall-time-limit', command)
         self.assertNotIn('--request-inactivity-timeout', command)

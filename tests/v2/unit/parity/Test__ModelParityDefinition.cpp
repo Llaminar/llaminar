@@ -2160,7 +2160,7 @@ namespace llaminar2::test::parity
                     for (size_t stage = 0; stage < domains.size(); ++stage)
                     {
                         const auto &address = cell.topology.participants.at(participant).address;
-                        EXPECT_EQ(domains[stage].at("backend"), address.isCUDA() ? "cuda" : "rocm");
+                        EXPECT_EQ(domains[stage].at("backend"), address.isCUDA() ? "cuda" : address.isROCm() ? "rocm" : "cpu");
                         EXPECT_EQ(domains[stage].at("devices"), cell.topology.pipeline_stage_sizes[stage]);
                         participant += cell.topology.pipeline_stage_sizes[stage];
                     }
@@ -2195,39 +2195,48 @@ namespace llaminar2::test::parity
                 // changing HTTP admission must not silently rebaseline controls.
                 EXPECT_EQ(record.at("runtime").at("server_args"), modelParityServerArguments(cell));
             }
-        EXPECT_EQ(tags, 8);
+        EXPECT_EQ(tags, 3);
     }
 
-    TEST(ModelParityDefinition, DenseQwen38MultiDeviceMatrixHasFiveDistinctE2ETopologies)
+    /** @test Existing numerical topologies remain, with only three explicit release selections. */
+    TEST(ModelParityDefinition, DenseQwen38MultiDeviceMatrixHasThreeBlessedTopologies)
     {
-        const auto definitions = qwen38::qwen38DenseMultiDeviceDefinitions();
-        ASSERT_EQ(definitions.size(), 5u);
+        const auto definitions=qwen38::qwen38DenseMultiDeviceDefinitions();
+        ASSERT_EQ(definitions.size(),8u);
         std::set<std::string> names;
-        for (const auto &definition : definitions)
+        std::size_t selected=0;
+        for(const auto &definition:definitions)
         {
             EXPECT_TRUE(names.insert(definition.topology.test_id).second);
-            const auto cases = expandModelParityDefinition(definition);
-            EXPECT_EQ(cases.size(), 6u);
-            EXPECT_EQ(std::count_if(cases.begin(), cases.end(), [](const auto &cell) {
-                return cell.e2e_certification.has_value();
-            }), 1);
-            for (const auto &cell : cases)
-                if (cell.e2e_certification) EXPECT_EQ(cell.mtp, ModelParityMTP::DynamicDepth);
+            const auto cases=expandModelParityDefinition(definition);
+            ASSERT_EQ(cases.size(),6u);
+            for(const auto &cell:cases)if(cell.e2e_certification)
+            {
+                ++selected;
+                EXPECT_EQ(cell.mtp,ModelParityMTP::DynamicDepth);
+            }
         }
-        const auto mixed = expandModelParityDefinition(definitions.back()).front()
-            .makeOrchestrationConfig("/models/qwen.gguf", 0);
-        ASSERT_EQ(mixed.domain_definitions.size(), 2u);
-        EXPECT_EQ(mixed.domain_definitions[0].backend, CollectiveBackendType::NCCL);
-        EXPECT_EQ(mixed.domain_definitions[1].backend, CollectiveBackendType::RCCL);
-        for (const auto &domain : mixed.domain_definitions) EXPECT_EQ(domain.devices.size(), 2u);
-        auto malformed = definitions.back();
+        EXPECT_EQ(selected,3u);
+        const auto mixed=expandModelParityDefinition(definitions.back()).front()
+            .makeOrchestrationConfig("/models/qwen.gguf",0);
+        ASSERT_EQ(mixed.domain_definitions.size(),3u);
+        const std::array backends{CollectiveBackendType::NCCL,CollectiveBackendType::RCCL,CollectiveBackendType::AUTO};
+        const std::array widths{2u,4u,1u};
+        for(std::size_t i=0;i<3;++i)
+        {
+            EXPECT_EQ(mixed.domain_definitions[i].backend,backends[i]);
+            EXPECT_EQ(mixed.domain_definitions[i].devices.size(),widths[i]);
+        }
+        auto malformed=definitions.back();
         malformed.topology.pipeline_tensor_parallel_collectives.pop_back();
-        EXPECT_THROW(expandModelParityDefinition(malformed), std::invalid_argument);
+        EXPECT_THROW(expandModelParityDefinition(malformed),std::invalid_argument);
     }
 
     TEST(ModelParityDefinition, E2EThinkingModesAreTypedAndExportedWithoutFilenameInference)
     {
         auto definition = qwen36::qwen36MoECPU2NodeTPParityDefinition();
+        definition.e2e_certifiable = {{.mtp=ModelParityMTP::DynamicDepth,
+            .owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic}};
         for (const auto mode : {ModelParityE2EThinkingModes::NonThinkingOnly,
                                 ModelParityE2EThinkingModes::ThinkingAndNonThinking})
         {
@@ -2662,12 +2671,7 @@ namespace llaminar2::test::parity
             EXPECT_NE(variant.model.reference_directory, source->model.reference_directory);
             EXPECT_TRUE(references.insert(variant.model.reference_directory).second);
             auto expected_definition = *source;
-            if (source->topology.expert_overlay_plan && expected_definition.e2e_certifiable.empty())
-                expected_definition.e2e_certifiable = {{
-                    .mtp = ModelParityMTP::DynamicDepth,
-                    .owner_order = RoutedExpertOwnerOrder::Ordinal,
-                    .movement = ModelParityExpertMovement::Dynamic,
-                }};
+            expected_definition.e2e_certifiable.clear();
             const auto before = expandModelParityDefinition(expected_definition);
             const auto after = expandModelParityDefinition(variant);
             ASSERT_EQ(before.size(), after.size());
@@ -2695,7 +2699,7 @@ namespace llaminar2::test::parity
             }
         }
         EXPECT_EQ(added_cells, 78u);
-        EXPECT_EQ(added_tags, 4u);
+        EXPECT_EQ(added_tags, 0u);
     }
 
     /** The reported Q8 workload must stay distinct from the Q4 HTTP certificate. */
@@ -2786,8 +2790,8 @@ namespace llaminar2::test::parity
                 EXPECT_EQ(cell.e2e_certification->generation_tokens, 2048);
                 EXPECT_EQ(cell.e2e_certification->minimum_prompt_tokens, 4096);
             }
-        EXPECT_EQ(cpu_tags, 2u);
-        EXPECT_EQ(gpu_tags, 2u);
+        EXPECT_EQ(cpu_tags, 0u);
+        EXPECT_EQ(gpu_tags, 0u);
     }
 
     /** Both ownership modes expand the identical matrix without sharing mutable plans. */
@@ -2861,7 +2865,9 @@ namespace llaminar2::test::parity
         for (const auto &topology : {qwen36::qwen36MoECuda2ExpertOverlayTopology(),
                                     qwen36::qwen36MoERocm2ExpertOverlayTopology()})
         {
-            const auto definition = qwen36::qwen36MoEProjectionParityDefinition(topology, "/reference");
+            auto definition = qwen36::qwen36MoEProjectionParityDefinition(topology, "/reference");
+            definition.e2e_certifiable = {{.mtp=ModelParityMTP::DynamicDepth,
+                .owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic}};
             const auto cells = expandModelParityDefinition(definition);
             ASSERT_EQ(cells.size(), 24u);
             int tagged = 0;
@@ -2945,7 +2951,9 @@ namespace llaminar2::test::parity
 
     TEST(ModelParityDefinition, CPUNodeCertificationRetainsFullMatrixAndOneAuthority)
     {
-        const auto definition = qwen36::qwen36MoECPU2NodeTPParityDefinition();
+        auto definition = qwen36::qwen36MoECPU2NodeTPParityDefinition();
+        definition.e2e_certifiable = {{.mtp=ModelParityMTP::DynamicDepth,
+            .owner_order=RoutedExpertOwnerOrder::Ordinal,.movement=ModelParityExpertMovement::Dynamic}};
         const auto cells = expandModelParityDefinition(definition);
         ASSERT_EQ(cells.size(), 24u);
         std::size_t tagged = 0;
@@ -2994,7 +3002,7 @@ namespace llaminar2::test::parity
                     EXPECT_EQ(cell.retained_mtp_draft_capacity, 15);
                     EXPECT_FALSE(cell.expert_overlay.has_value());
                 }
-                EXPECT_EQ(tagged, address.isCPU() ? 0u : 1u);
+                EXPECT_EQ(tagged, 0u);
             }
         }
         for (const auto &topology : {qwen36::qwen36MoECuda2ExpertOverlayTopology(),
@@ -3028,7 +3036,7 @@ namespace llaminar2::test::parity
                 EXPECT_EQ(record.at("runtime").at("context_length"), 4096);
                 EXPECT_EQ(cell.mtp, ModelParityMTP::DynamicDepth);
             }
-            EXPECT_EQ(tagged, 1u);
+            EXPECT_EQ(tagged, 0u);
         }
     }
 

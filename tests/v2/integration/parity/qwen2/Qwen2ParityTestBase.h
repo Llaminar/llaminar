@@ -822,6 +822,7 @@ namespace llaminar2::test::parity::qwen2
 
             // Apply model path/snapshot dir overrides from TestConfig if available
             applyModelOverrides();
+            applyAccuracyPanelHistory();
 
             ParityTestBase::SetUp();
             if (this->HasFatalFailure() ||

@@ -15,7 +15,7 @@ Ordinary work starts from current `develop` on a branch named
 `feat/short-feature-description`. Commit messages and PR titles use
 Conventional Commits. After both required Unit/host checks and owner approval pass, the feature PR
 squash-merges into `develop`. Only explicit user direction starts the separate
-`develop`-to-`master` release PR and its full certification/release workflow.
+`rc/*`-to-`master` release PR and its full certification/release workflow.
 
 Documentation and CI/CD workflow maintenance may be committed and pushed
 directly to `develop` with `[skip ci]` and `git commit --no-verify`. Keep this
@@ -230,7 +230,7 @@ use it as an empty input. Workflow jobs do not change host kernel settings.
 
 ### Protected-branch approval
 
-The separate `Owner approval` repository ruleset covers `master` and `develop`.
+The separate `Owner approval` repository ruleset covers `master`, `develop` and `rc/*`.
 It requires one approval from `@Llaminar/repository-approvers` for every file;
 that team's sole member is `@dbsanfte`. New reviewable commits dismiss stale
 approvals, and only `@dbsanfte` may dismiss reviews. Ordinary write access does
@@ -239,7 +239,7 @@ owner-authored changes; the existing release-evidence deploy-key exception
 preserves post-release evidence publication. The separate develop CI ruleset
 also permits an explicitly authorized PR-only administrator override; master
 CI requirements remain independent. Keep approver-team membership restricted to the owner.
-The check installer leaves this independent approval ruleset intact.
+The check installer extends this independent approval ruleset to RC branches while preserving its reviewers and approval policy.
 
 ### ARC runner on the production host
 
@@ -415,132 +415,143 @@ flowchart TD
 
 ## Master PR certification and release
 
-Upon explicit user direction to release, first ensure both develop images
-exist for the current develop HEAD. If documentation or CI/CD maintenance
-used `[skip ci]`, explicitly run
+The release path is **develop → rc/* → master**. Master accepts only
+same-repository release candidate branches, for example `rc/2026-11-13.1`.
+Direct develop-to-master PRs fail the required branch-lineage check. Owner
+approval covers all three branch classes; ordinary write access cannot merge
+an RC or master PR without the owner's approval.
+
+Upon explicit direction to release, wait for both source-pinned develop images
+before cutting the RC. Documentation/CI maintenance may have used `[skip ci]`;
+in that case run
 `gh workflow run ci.yml --ref develop --repo Llaminar/llaminar` and wait for
-its published pair before opening the release PR. This executes the same
-complete image gate as a develop push; it does not replace any master PR check.
+publication first. An RC starts at that protected-develop source. Further RC
+changes must come through a same-repository develop PR and preserve its exact
+source tree. Fix code on develop and prefer a fresh candidate when replacing
+a frozen RC. Never add candidate-only code or conflict resolutions to an RC.
 
-A non-draft same-repository PR from `develop` to `master` triggers
-`.github/workflows/master-pr-certification.yml`. Its first job waits for the
-successful develop push or manual image gate at the PR's **exact head SHA**.
-It never substitutes the mutable `develop` tag. The required E2E check pulls that
-source-pinned AVX512/AVX2 pair and verifies image labels and source tree. It
-first runs complete Unit and `ProductionTestPreflight` in authenticated
-full-matrix test companions for both ISAs; only then does it run
-the full canonical HTTP suite and the frozen dense/MoE KL canaries on one CUDA
-and one ROCm device per ISA. The native observer ships in the runtime image and
-links that image's serving core. MoE uses the FP16 alpha/beta default; dense
-retains native arithmetic because the same half conversion regresses its decode
-KL on this frozen trajectory. Both backends follow this identical model policy.
-Each frozen history gates its prompt-end prefill
-row and all 128 forced decode rows independently against a same-GGUF FP32
-reference, using the full vocabulary. A short identical request before and after
-the long request must replay byte-identically. These are numerical gates, not
-throughput measurements or MTP certification.
+`release_candidate.py` admits either that initial develop snapshot or one exact
+merged develop-to-RC PR. Its immutable source receipt distinguishes the RC head
+from the develop image source, verifies their equal trees and retains ancestry
+in protected develop. Develop may advance while the RC is being certified.
+`wait_for_develop_image_gate.py --frozen-rc` accepts only successful publication
+of the admitted source on the canonical develop CI workflow. Mutable develop
+tags and manual diagnostic phase runs cannot satisfy release certification.
 
-Only this master PR job materializes the source-pinned `model-kld/` family from
-the optional corpus submodule. Unit and `ProductionTestPreflight` exercise the
-model-free policy, evidence, freshness, cleanup and CLI contracts without fetching
-models or corpus payloads. Raw candidate logits are removed after each cell;
-compact phase scores and all row metrics accompany the E2E receipt. Missing
-phases, altered histories, stale evidence and cleanup failures fail the gate.
-Complete numerical failures are collected across both ISA lanes.
+A non-draft RC-to-master PR runs these dependent phases in
+`.github/workflows/master-pr-certification.yml`:
 
-The required benchmark check then consumes the
-completed E2E pair receipt and runs every tagged benchmark cell on those same
-image digests. Both jobs retain compact per-ISA JSON evidence; benchmarks do
-not run after an E2E failure. A complete red benchmark report still lets the
-other ISA finish, so the PR receives a per-cell red/amber/green table of both
-prefill and decode numbers. A red phase fails the required benchmark check;
-amber is below the prior high-water mark but inside the configured tolerance.
-The E2E receipt embeds both canonical prerequisite reports and their
-source/ISA/test-image/runtime bindings. Benchmark and release admission reject
-missing or failed prerequisite evidence; they cannot assume that the develop
-build ran tests. CTest logs and JUnit evidence remain in the workflow artifact.
+1. **Source admission** pins the RC lineage and exact develop image source.
+2. **Production preflight** runs complete Unit and `ProductionTestPreflight`
+   in full-matrix source/ISA-bound test companions on AVX512 and AVX2.
+3. **PyTorch numerical panels** run the six blessed configurations' canonical
+   MTP-off controls on both images. Real-source admission and every native
+   full-stage, capture, precision and prefix/reset obligation remain active.
+4. **OpenCode stress** runs exactly six sessions, one five-phase AVX512 session
+   per blessed configuration, then independently replays their aggregate proof.
+5. **Benchmarks** consume the completed preflight, numerical and OpenCode proof.
+   Both ISA lanes finish and report prefill/decode numbers and red/amber/green
+   comparisons. Any red phase fails the gate.
+6. **RC release eligibility** independently revalidates every phase artifact,
+   source/image identity and complete coverage. Missing or skipped prerequisites
+   cannot become an eligible release.
 
-The branch-policy check admits only `develop`.
+The entire blessed scope is **dense Qwen3.8 and QFN**, each on **4×ROCm TP,
+2×CUDA TP, and 2×CUDA+4×ROCm+CPU TP-over-PP**. There are no additional blessed
+cells. `ModelParityReleaseTopologies.h` owns those three topology requests;
+the model definitions select their exact native policies. QFN uses MTP off and
+RAM ngram storage; dense Qwen3.8 serves with dynamic MTP. Numerical panels use
+the matching serial controls. Broader model/storage/placement matrices retain
+numerical diagnostic registration without release eligibility.
 
-After both benchmark lanes pass, `run_opencode_matrix.py prepare` authenticates
-their complete image-bound evidence and derives one coding job per blessed
-E2E cell and shipping ISA. It keeps the native inventory's model shards and
-production topology policy. Each job runs one pinned, real OpenCode ten-phase
-Python app session, with PMA-admitted maximum context, a 32,768-token reasoning
-and output budget, 16 GiB RAM cache per participant and 32 GiB shared disk cache.
-There is no request-inactivity, generation-turn or session deadline. The Actions
-self-hosted job ceiling is an infrastructure limit; cancellation remains a
-failed job and must retire every owned native process.
+The RC workflow launches no standalone HTTP, needle, token-regression or
+cross-host suite and requires no HTTP pass receipt. The six OpenCode sessions
+exercise the actual HTTP/native serving lifecycle. Model-free production
+preflight remains complete; it is not narrowed to these six real-model cells.
 
-Coding jobs retain the shared hardware lease and run with matrix fail-fast
-disabled. Engine/protocol correctness, all ten phases, native response/call
-coverage, captured runtime policy, continuous driver/resource observations and
-metadata-only cache ownership audits are mandatory. Model-authored application
-acceptance is reported independently; unique tool errors must remain strictly
-below 5%. Prefix reuse, TTFT and tier churn are measured for every request, with
-ordinary, compaction and resumed turns reported separately. Retired cache files
-are reclaimed only after native ownership is closed; payload bytes are never
-read or hashed for this audit. Per-cell artifacts exclude cache/model payloads.
+All RC workflow jobs run on `llaminar-xeon-host`, including metadata admission
+and final aggregation; they never select the AVX2/AVX512 development runners.
+All RC jobs share the host queue so metadata checkouts cannot race running
+production work. A superseded RC head cancels
+that PR's older certification run; other candidates retain separate workflow
+identities. Draft PRs allocate no test runners, and marking ready starts checks.
+The master ruleset requires each named phase and final eligibility, with strict
+up-to-date master semantics and squash-only merge. `apply_master_ruleset.py`
+projects those requirements, protects RC updates and extends the existing sole-
+owner approval ruleset without changing approver membership or exceptions.
+Develop keeps its existing two ISA Unit/host checks, deletion and force-push
+guards. The general GitHub Actions app receives no bypass.
 
-The `Published OpenCode (AVX512 and AVX2)` check replays every cell's independent
-evidence and requires the complete canonical product. Missing, duplicate, stale,
-failed or cancelled jobs cannot become a green matrix, including a failed rerun
-beside an older artifact. `pr-opencode-<PR>-<SHA>` retains the complete
-`opencode.json` proof. This gate belongs only to master PRs after benchmarks;
-feature PRs, develop pushes and manual benchmark workflows retain their scope.
+`release_accuracy_panels.py` reuses the canonical parity inventory and its
+registered CPU/FP32 PyTorch reference implementations. It reads the original
+GGUF, including its quantization, and uses the existing cached incremental
+reference forward. `release_accuracy_prompts.json` owns the multi-prompt text,
+continuation counts and both sides of the 128/512-token boundaries. Each model's
+original tokenizer freezes the exact prompt IDs and D+1 teacher history before
+native execution. The candidate never supplies replacement greedy tokens.
+Reference packs persist locally in a sibling of the staged models under the
+existing cache-owner lease;
+reference code, Torch version and every GGUF split's stat identity key reuse.
+No model payload is hashed for cache identity, and no corpus submodule is
+initialized by this panel gate.
 
-`scripts/ci/apply_master_ruleset.py` installs the five required GitHub Actions
-checks on the existing master ruleset with strict up-to-date PR semantics and
-squash-only merge. It also installs the `develop` PR and both ISA Unit/host
-check requirements, while retaining deletion and force-push protection.
-`develop` deliberately does not require linear history: after a certified
-master squash merge, the release publisher records that exact master commit as
-the second parent of its fast-forward evidence commit, making the next master
-PR up to date without rewriting either branch. The publisher's dedicated
-`llaminar-release-evidence` writable deploy key is the only direct-push bypass;
-develop also permits repository administrators to bypass through a PR. The
-installer retains these two exceptions and refuses unrelated actors, an
-unrestricted administrator bypass, or any other writable deploy key. The general GitHub
-Actions app must never bypass the `develop` ruleset, because the auto-merge
-workflow also runs under that app. Release automation supplies the private key
-through the `RELEASE_DEVELOP_DEPLOY_KEY` Actions secret only in the post-release
-evidence job; ordinary PRs cannot access it.
-Run the installer without `--apply` to inspect both proposals; only apply
-after the PR workflow has emitted its checks. A manual-dispatch workflow
-run cannot satisfy a required PR check, so the diagnostic workflows below are
-not substitutes for this gate.
+The shared `AccuracyPanelHistory` adapter changes only request inputs and the
+matching full-stage reference location. Existing model, topology, precision,
+capture, stage, movement and prefix/reset gates remain active. The complete
+vocabulary's original FP32 observations are scored in FP64 by
+`full_vocabulary_metrics.py`. CSVs retain every row identity and phase. Summaries
+give every prompt equal weight and separate model, topology, context group,
+prefill/decode phase and decode offset; they report mean KL in nats, top-1
+agreement and top-5 overlap. Initial absolute acceptance retains each canonical
+model's native numerical limits and is explicitly uncalibrated. It does not
+claim an approved paired baseline or coverage of unselected topologies.
+Missing, duplicated, reordered, trimmed or nonfinite observations fail.
+Original full-stage CSVs and reference metadata accompany the compact panel
+proof; large reference tensors and raw candidate logits remain local.
 
-After the certified PR is squash-merged, the trusted
-`pull_request_target: closed` event starts `.github/workflows/release.yml`
-only for a merged, same-repository `develop` PR into `master`. This event is
-not suppressed when a squash message happens to quote GitHub's CI-skip marker.
-The workflow also permits an explicit `workflow_dispatch` on `master` to
-recover a missed event; it is not a second certification route. Its publisher
-validates that the resulting **master tree** equals the tested develop image
-tree. GitHub's commit-to-PR association may lag a new squash commit, so the
-publisher also searches closed PR metadata for the exact
-`merge_commit_sha`; it never infers PR identity from a commit title. It
-revalidates both E2E reports, both complete benchmark reports, the full coding matrix, the exact
-image pair and the successful PR workflow before making any registry change.
-It creates a dated GitHub release such as `2026-09-23.1`,
-then `.2` if another merge releases that UTC day. The first release has concise
-bootstrap notes; later releases list commits since the previous release. The
-release attaches the E2E receipts/reports, benchmark JSON and SVG chart, and
-the complete `opencode.json` proof. It
-promotes the certified image digests to the dated tags,
-`master-<full master SHA>` / `master-avx2-<full master SHA>`, and finally the
-movable `master` / `master-avx2` tags. No image is rebuilt on master.
-After release publication, a separate dependent job advances the combined
-upward-only high-water marks and checked-in benchmark result/chart on `develop`
-with a two-parent `[skip ci]` evidence commit. Its first parent is the tested
-develop head; its second parent is the same-tree squash commit just certified
-on master. This must happen **after merge**: putting a
-skip-ci commit on the open PR head would leave required PR checks pending on an
-untested revision. The publication is fast-forward-only and refuses a
-concurrent develop change; a failed high-water job can be rerun independently
-of the successful release job. The evidence-only `[skip ci]` commit is not a
-new release candidate by itself: wait for the next ordinary develop source
-commit and its exact-ref image build before opening another master PR.
+OpenCode retains its existing PMA-admitted maximum context, full reasoning and
+output budget, cache contracts and absence of generation/session deadlines.
+All five phases, native response/call coverage, engine/protocol checks, captured
+runtime policies, continuous driver/resource observations and process/cache
+retirement must pass. Model-authored app quality is reported independently;
+unique tool errors remain strictly below 5%. Cancellation is a failed cell.
+The final coding aggregate requires every selected AVX512 cell, with matrix
+fail-fast disabled and no missing, duplicate or stale per-cell proof.
+
+After the certified RC squash merge, the trusted `pull_request_target: closed`
+event starts `.github/workflows/release.yml`. An explicit manual dispatch on
+master may recover a missed merge event; it still requires the same merged RC
+and successful PR evidence. The publisher finds the exact merged RC by
+`merge_commit_sha`, replays its source admission and all phase evidence, and
+requires the resulting master tree to equal the tested image source tree.
+It also compares the PR's saved eligibility certificate with its independently
+recomputed certificate before changing registry or release state.
+
+The publisher creates a dated GitHub release (`YYYY-MM-DD.N`) and attaches:
+
+- Test-run identity/link, RC source receipt, final eligibility certificate,
+  image pair, matrix and complete prerequisite receipts.
+- `accuracy-rows-<isa>.csv` and `accuracy-summary-<isa>.csv`, numerical JSON,
+  and compact full-stage parity/reference evidence archives for both ISAs.
+- Complete benchmark JSON, result numbers and SVG chart,
+  and the full `opencode.json` stress proof.
+
+Those attachments persist on the GitHub release page; the PR artifacts retain
+90 days of diagnostic evidence before publication. The publisher promotes the
+same tested image digests to dated tags, full master-SHA tags, and finally
+`master` / `master-avx2`. No image is rebuilt after merge. The first dated
+release has bootstrap notes; later notes list commits since the prior release
+and link directly to the test, accuracy, stress and benchmark evidence.
+
+Only after release publication does the dedicated release-evidence deploy key
+publish upward-only high-water marks, benchmark result/chart and the README
+block to develop with `[skip ci]`. Its first parent is the current develop head;
+its second parent is the certified master commit. Concurrent develop source and
+README changes survive, and higher marks never decrease. The ordinary push is
+fast-forward-only: a new concurrent push fails rather than rewriting history.
+Never put a skip-CI evidence commit on an open RC head. A maintenance/evidence
+commit itself needs exact-source image publication before it can seed another
+candidate.
 
 ## Public documentation and release archive
 

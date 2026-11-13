@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file run_model_parity_benchmarks.py
+# @brief Matched production measurements admitted by explicit prerequisite evidence.
 """Benchmark canonical E2E candidates on an image or local Release diagnostic.
 
 The canonical matrix exports a separate production-default benchmark policy
@@ -1095,6 +1097,7 @@ def main(argv: list[str] | None = None) -> int:
     execution.add_argument("--diagnostic-binary", type=Path,
                            help="local Release executable; diagnostic only, never an image certificate")
     admission = parser.add_mutually_exclusive_group()
+    admission.add_argument("--preflight-bundle", type=Path, help="complete source-bound RC prerequisites, without standalone HTTP")
     admission.add_argument("--e2e-report", type=Path,
                            help="passing full E2E report for this exact image and manifest")
     admission.add_argument("--diagnostic", action="store_true",
@@ -1122,7 +1125,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[production-benchmark] selected {row['case']}", flush=True)
     if args.list:
         return 0
-    if not args.diagnostic and args.e2e_report is None:
+    if not args.diagnostic and args.e2e_report is None and args.preflight_bundle is None:
         parser.error("benchmarks require --e2e-report from the full server suite; "
                      "use --diagnostic only for an explicit one-off experiment")
     if args.diagnostic_binary is not None:
@@ -1145,6 +1148,15 @@ def main(argv: list[str] | None = None) -> int:
                 runtime["labels"].get("org.opencontainers.image.revision") != args.source_revision):
             raise ValueError("benchmark image has the wrong source revision")
     e2e_digest = None
+    prerequisites_digest = None
+    if args.preflight_bundle is not None:
+        import run_published_image_suite as suites
+        pair = json.loads((args.preflight_bundle / "images.json").read_text())
+        admitted, reports = suites.admit_preflight(args.preflight_bundle, pair)
+        isa = runtime["labels"]["org.llaminar.cpu_isa"]
+        if admitted != manifest or pair["images"][isa]["id"] != runtime["id"]:
+            raise ValueError("benchmark differs from the source-bound release prerequisite matrix")
+        prerequisites_digest = digest(reports[isa])
     if args.e2e_report is not None:
         evidence = json.loads(args.e2e_report.read_text())
         validate_image_e2e(evidence, manifest, runtime["id"])
@@ -1158,6 +1170,9 @@ def main(argv: list[str] | None = None) -> int:
               "manifest_digest": digest(manifest), "hardware": hardware,
               "diagnostic": args.diagnostic, "e2e_report_digest": e2e_digest,
               "workload": workload, "complete": False, "passed": False, "cells": []}
+    if args.preflight_bundle is not None:
+        report.pop("e2e_report_digest")
+        report["prerequisites_digest"] = prerequisites_digest
     args.report = args.report.resolve()
     run_root = args.report.parent / ("benchmarks-" + str(time.time_ns()))
     run_root.mkdir(parents=True)

@@ -19,9 +19,15 @@ numerical checkpoints, not an extra whole-model hash pass, prove weight equivale
 
 ## Routine regression versus mathematical diagnosis
 
-The routine production gate is **Unit → production preflight → HTTP token
-generation regression → HTTP needle/long-context E2E → cross-host MPI E2E →
-benchmarks → image certification**, independently for AVX512 and AVX2.
+The RC release gate is **complete Unit/production preflight → frozen-history
+numerical panels → six five-phase OpenCode sessions → benchmark gates →
+independent release eligibility**. Preflight, panels and benchmarks cover
+AVX512 and AVX2; OpenCode runs once per blessed cell on AVX512. The sole blessed
+scope is dense Qwen3.8 and QFN, each on 4×ROCm TP, 2×CUDA TP and
+2×CUDA+4×ROCm+CPU TP-over-PP. The typed model definitions own eligibility.
+The RC gate does not run a separate HTTP suite. Manual generation, HTTP and
+cross-host diagnostic tools below remain explicit independent workflows.
+
 Generation projects only **MTP off (serial controls) and dynamic-depth MTP**
 from the canonical model/topology definitions. Both compare against the saved
 serial control outputs, requiring at least 384 continuous committed tokens.
@@ -81,40 +87,60 @@ tests and grants no certificate. Publication has one concurrency group and
 cancels a superseded build when a new develop merge arrives. Complete Unit and
 production preflight remain mandatory in the explicit production pipeline
 through `run_production_prerequisites.py`. Production hardware has its own queue.
-The `develop` → `master` PR gate is separate: its required pull-request E2E
-check waits for the exact develop-head image pair, runs complete Unit and
-production preflight in source/ISA-bound full-matrix test companions on both
-ISAs, runs separate QFN source admission on both exact-source test companions,
-then proves both runtimes on the full HTTP matrix, then its dependent benchmark check consumes that same image-bound
-E2E receipt. The benchmark check runs both ISAs even when the first has a
-complete red ratchet report, comments the per-cell red/amber/green numbers on
-the PR, and fails if any measured phase exceeds the high-water tolerance.
-Only after both benchmark lanes pass, the required OpenCode check runs one
-complete ten-phase app session for every blessed E2E cell and both ISAs. The
-canonical inventory owns selection; no client-specific engine policy or
-workflow-local model list is allowed. Use PMA-admitted maximum context, the
-full reasoning/output budget and no generation deadline. Require complete
-phase, protocol, native-output, runtime, resource, driver and retirement
-evidence; model-authored app quality stays separate and tool errors must be
-strictly below 5%. The aggregate and release publisher independently replay
-all evidence. The gate is scoped to master PRs after benchmarks.
-Manual-dispatch E2E or benchmark runs cannot satisfy these PR checks. Do not
-commit benchmark evidence to the open PR head: `[skip ci]` would strand its
-required checks. After a certified squash merge, the master release publisher compares
-the merge **tree** with the tested develop image tree, revalidates all three phase
-artifacts, and promotes those immutable image digests to dated and master/SHA
-tags. It attaches the per-ISA E2E and benchmark JSON, chart and complete coding proof to the GitHub
-release. The first dated release uses concise bootstrap notes; later notes
-cover commits since the preceding release. Its dependent job then commits the
-combined upward-only AVX512/AVX2 high-water marks, result JSON, chart, and
-README block to `develop` with `[skip ci]`. That fast-forward commit has the
-tested develop head and certified squash-merged master commit as its two
-parents, keeping the next strict PR up-to-date without rebuilding the image.
-It does not change the certified master tree. See `docs/production-ci.md` before
-editing the branch ruleset or release workflow. Keep the existing `develop`
-deletion/force-push guard active, but do not require linear history there:
-GitHub's auto-delete-on-merge setting must not remove that persistent branch
-before the post-merge evidence commit.
+The release path is **develop → rc/* → master**. Cut an RC only from a
+protected-develop commit with both source-pinned images already published.
+Master rejects direct develop PRs. An RC may advance only through a develop PR
+whose resulting tree equals its develop source exactly; fixes remain ordinary
+develop work, and replacing a frozen candidate means cutting a fresh RC.
+`release_candidate.py` distinguishes the RC head from its frozen image source,
+so new develop commits cannot move an in-flight candidate's evidence.
+
+Every RC workflow job uses `llaminar-xeon-host`; the development runners do not
+participate. The non-draft RC-to-master gate runs complete Unit/production preflight in
+source/ISA-bound full-matrix companions, then frozen-history PyTorch KLD panels
+for dense Qwen3.8 and QFN on the six blessed controls, then five-phase OpenCode
+stress, and finally benchmarks. Native numerical fixtures retain actual source
+admission; no separate real-model matrix or standalone HTTP gate is added.
+`release_accuracy_panels.py` projects the existing inventory's serial controls;
+it does not create a second topology matrix. The CPU/FP32 reference reads the
+same GGUF, including its quantization, through the registered reference model
+and cached incremental forward. Authored prompts and bucket-boundary counts
+belong to `release_accuracy_prompts.json`; token IDs and D+1 teacher histories
+freeze before native execution. Both ISAs reuse the same reference packs.
+
+The shared `AccuracyPanelHistory` request adapter preserves every canonical
+stage, capture, precision, prefix/reset and movement obligation. Keep the full
+stage CSVs and exact frozen-history references for diagnosis. Final-logit rows
+use `full_vocabulary_metrics.py` in FP64 over the complete vocabulary. Report
+prompt-balanced prefill/decode mean KL, top-1 agreement and top-5 overlap
+separately by model, topology, group and decode offset. Initial absolute gates
+retain the original model-owned native limits and explicitly report that they
+are uncalibrated; no candidate can become its own approved baseline. Missing,
+reordered, duplicate, nonfinite or stale observations fail. Large references
+and model payloads remain local; compact panel CSVs and fixture receipts become
+PR artifacts and release attachments.
+
+Only after both numerical lanes pass does the OpenCode matrix run one complete
+five-phase AVX512 app session per blessed cell. Require the existing full
+phase, protocol, native response/call, runtime, driver/resource and retirement
+proofs, PMA-admitted context and reasoning/output budgets, no generation deadline
+and tool errors strictly below 5%. Its independent aggregate must pass before
+benchmarking. Benchmark admission authenticates the same preflight, accuracy and
+coding proof and records their digests; both ISAs complete red/amber/green
+measurements even when one lane is red. An independent final eligibility check
+replays all phases. Manual diagnostic runs cannot satisfy this PR gate.
+
+After an explicitly authorized certified RC squash merge, the release publisher
+revalidates the exact RC lineage, master/image tree identity, all phase artifacts
+and eligibility certificate. It promotes the immutable image pair without a
+rebuild, tags a dated GitHub release, and attaches test-run identity, numerical
+row/summary CSVs and full compact accuracy, benchmark and coding evidence.
+Post-release upward-only high-water publication uses the current develop head
+as parent one and the certified master commit as parent two, preserving
+concurrent source and README changes. Keep develop deletion/force-push guards;
+its history must permit this certified ancestry join. Owner approval also
+covers rc/*, and the general Actions app receives no bypass. See
+`docs/production-ci.md` for exact workflow and publication boundaries.
 On the production ARC scale set, the runner uses the host Docker Unix socket
 rather than DIND so CI and local host work use one daemon and one safe Docker
 cache. Never point two Docker daemons at the same writable data root. Its

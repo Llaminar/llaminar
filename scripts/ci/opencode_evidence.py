@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Join complete coding lifetimes to the exact benchmarked canonical inventory.
+## @file opencode_evidence.py
+# @brief Join complete coding lifetimes to the exact accuracy-qualified canonical inventory.
+"""Join complete coding lifetimes to the exact accuracy-qualified canonical inventory.
 
 The publisher replays application counts, PMA context decisions and native
 runtime policy validators. Independent resource, driver and archive receipts
@@ -92,21 +94,21 @@ def validate_context(context: dict, model: dict, probes: list[dict]) -> None:
         raise ValueError('Coding context was not the maximum or adjacent PMA admission bound')
 
 
-def validate_cell(report: dict, pair: dict, manifest: dict, correctness: dict, benchmarks: dict) -> dict:
+def validate_cell(report: dict, pair: dict, manifest: dict, correctness: dict, accuracy: dict) -> dict:
     """Recompute a single canonical job's complete engine and lifecycle verdict."""
     isa = report.get('cpu_isa')
-    if isa not in suites.ISAS:
+    if isa != 'AVX512':
         raise ValueError('Coding report omitted its shipping ISA')
     row = select_cell(manifest, pair['source']['revision'], report.get('case'))
     expected = {'case': row['case'], 'cpu_isa': isa, 'source_revision': pair['source']['revision'],
                 'image': pair['images'][isa]['id'], 'images_digest': digest(pair),
-                'manifest_digest': digest(manifest), 'e2e_report_digest': digest(correctness[isa]),
-                'benchmark_report_digest': digest(benchmarks[isa])}
+                'manifest_digest': digest(manifest), 'prerequisites_digest': digest(correctness[isa]),
+                'accuracy_report_digest': digest(accuracy[isa])}
     if (report.get('schema') != 1 or report.get('scope') != 'canonical_opencode_cell'
             or report.get('complete') is not True or report.get('passed') is not True
             or report.get('errors') != [] or any(report.get(key) != value for key, value in expected.items())
             or report.get('configuration') != row['configuration']):
-        raise ValueError('Coding report is incomplete or differs from its benchmarked inventory')
+        raise ValueError('Coding report is incomplete or differs from its accuracy-qualified inventory')
     control, evidence = report['controller'], report['evidence']
     if (control.get('complete') is not True or control.get('passed') is not True
             or control.get('errors') != [] or control.get('normal_shutdown') is not True
@@ -192,35 +194,25 @@ def validate_cell(report: dict, pair: dict, manifest: dict, correctness: dict, b
             'resource_samples': growth['samples'], 'driver_snapshots': driver['snapshot_count']}
 
 
-def validate_job(job: dict, pair: dict, manifest: dict, correctness: dict, benchmarks: dict) -> dict:
+def validate_job(job: dict, pair: dict, manifest: dict, correctness: dict, accuracy: dict) -> dict:
     """Require both the inner lifetime and independent outer daemon retirement."""
     if (job.get('schema') != 1 or job.get('scope') != 'canonical_opencode_job'
             or job.get('complete') is not True or job.get('passed') is not True
             or job.get('errors') != []):
         raise ValueError('Coding job did not complete successfully')
     cell = job['cell']
-    summary = validate_cell(cell, pair, manifest, correctness, benchmarks)
+    summary = validate_cell(cell, pair, manifest, correctness, accuracy)
     for key in ('case', 'cpu_isa', 'image', 'images_digest', 'manifest_digest',
-                'source_revision', 'e2e_report_digest', 'benchmark_report_digest'):
+                'source_revision', 'prerequisites_digest', 'accuracy_report_digest'):
         if job.get(key) != summary[key]:
             raise ValueError('Coding job changed its independently validated cell identity: ' + key)
-    cleanup = job['outer_cleanup']
-    driver = cleanup['driver_retirement']
-    if (cleanup.get('complete') is not True or cleanup.get('passed') is not True
-            or cleanup.get('errors') != [] or cleanup.get('unexpected_live') != []
-            or not re.fullmatch(r'llaminar-suite-driver-[0-9a-f]{32}', cleanup.get('owner', ''))
-            or driver.get('Running') is not False or driver.get('Pid') != 0
-            or driver.get('Status') != 'absent'
-            or any(not re.fullmatch(r'[0-9a-f]{64}', identity)
-                   or state.get('Running') is not False or state.get('Pid') != 0
-                   or state.get('Status') not in {'exited', 'created'}
-                   for identity, state in cleanup['retired'].items())):
-        raise ValueError('Coding outer owner did not prove complete native retirement')
+    from driver_evidence import validate_retirement
+    validate_retirement(job['outer_cleanup'])
     return summary
 
 
 def aggregate_jobs(jobs: list[dict], pair: dict, manifest: dict,
-                   correctness: dict, benchmarks: dict, *, jobs_result: str = 'success') -> dict:
+                   correctness: dict, accuracy: dict, *, jobs_result: str = 'success') -> dict:
     """Retain every failure and require exactly the full canonical cell/ISA product.
 
     All supplied job bodies remain in the artifact so the release publisher
@@ -237,7 +229,7 @@ def aggregate_jobs(jobs: list[dict], pair: dict, manifest: dict,
             if key not in planned or key in seen:
                 raise ValueError('Unexpected or duplicate canonical coding job')
             seen.add(key)
-            summaries[label] = validate_job(job, pair, manifest, correctness, benchmarks)
+            summaries[label] = validate_job(job, pair, manifest, correctness, accuracy)
         except (KeyError, ValueError, TypeError) as error:
             failures.setdefault(label, []).append(str(error))
     for key in planned.keys() - seen:
@@ -249,15 +241,15 @@ def aggregate_jobs(jobs: list[dict], pair: dict, manifest: dict,
             'workflow_jobs_result': jobs_result,
             'source_revision': pair['source']['revision'], 'images_digest': digest(pair),
             'manifest_digest': digest(manifest), 'expected_jobs': len(planned),
-            'e2e_reports': {isa: digest(correctness[isa]) for isa in suites.ISAS},
-            'benchmark_reports': {isa: digest(benchmarks[isa]) for isa in suites.ISAS},
+            'prerequisites_reports': {isa: digest(correctness[isa]) for isa in suites.ISAS},
+            'accuracy_reports': {isa: digest(accuracy[isa]) for isa in suites.ISAS},
             'jobs': jobs, 'summaries': summaries, 'failures': failures}
 
 
 def validate_matrix(report: dict, pair: dict, manifest: dict,
-                    correctness: dict, benchmarks: dict) -> dict:
+                    correctness: dict, accuracy: dict) -> dict:
     """Recompute the complete release receipt, rejecting missing or edited evidence."""
-    expected = aggregate_jobs(report['jobs'], pair, manifest, correctness, benchmarks)
+    expected = aggregate_jobs(report['jobs'], pair, manifest, correctness, accuracy)
     if expected['passed'] is not True or expected['complete'] is not True or report != expected:
         raise ValueError('Coding matrix is incomplete, failed or differs from its independently replayed proof')
     return expected

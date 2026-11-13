@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""Run one canonical coding cell after the complete same-image benchmark gate.
+## @file run_model_parity_opencode.py
+# @brief Run one canonical coding cell after the complete same-image accuracy gate.
+"""Run one canonical coding cell after the complete same-image accuracy gate.
 
 The full E2E inventory owns eligibility and production placement. CI shards
 that inventory by exact case and shipping ISA; this runner cannot manufacture
@@ -25,13 +27,13 @@ sys.path.insert(0, str(ROOT / 'tests/v2/e2e/server'))
 from opencode_cell_runtime import CodingCell, run_app
 
 
-def admit_bundles(e2e_bundle: Path, benchmark_bundle: Path) -> tuple[dict, dict, dict, dict]:
+def admit_bundles(preflight_bundle: Path, accuracy_bundle: Path) -> tuple[dict, dict, dict, dict]:
     """Require both complete ISA lanes before admitting even one coding job."""
-    pair = json.loads((e2e_bundle / 'images.json').read_text())
+    pair = json.loads((preflight_bundle / 'images.json').read_text())
     suites.validate_pair(pair)
-    manifest, correctness = suites.admit_e2e(e2e_bundle, pair)
-    _, benchmarks = suites.admit_benchmarks(benchmark_bundle, pair, manifest, correctness)
-    return pair, manifest, correctness, benchmarks
+    manifest, correctness = suites.admit_preflight(preflight_bundle, pair)
+    accuracy = suites.admit_accuracy(accuracy_bundle, preflight_bundle, pair, manifest, correctness)
+    return pair, manifest, correctness, accuracy
 
 
 def select_cell(manifest: dict, source_revision: str, exact: str) -> dict:
@@ -46,11 +48,11 @@ def select_cell(manifest: dict, source_revision: str, exact: str) -> dict:
 
 
 def matrix_jobs(manifest: dict, source_revision: str) -> list[dict]:
-    """Project every blessed cell onto both shipping images, retaining full names."""
+    """Project one AVX512 session for each blessed cell, retaining full names."""
     result = []
     for row in validate_manifest(manifest, source_revision):
         select_cell(manifest, source_revision, row['case'])
-        for isa in suites.ISAS:
+        for isa in ('AVX512',):
             result.append({'case': row['case'], 'cpu_isa': isa,
                            'artifact_id': isa.lower() + '-' + digest(row['case'])})
     return result
@@ -74,27 +76,27 @@ def cell_evidence(directory: Path) -> dict:
 def main(argv: list[str] | None = None) -> int:
     """Retain partial evidence on cancellation; only a full native lifetime may pass."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--e2e-bundle', type=Path, required=True)
-    parser.add_argument('--benchmark-bundle', type=Path, required=True)
-    parser.add_argument('--cpu-isa', choices=suites.ISAS, required=True)
+    parser.add_argument('--preflight-bundle', type=Path, required=True)
+    parser.add_argument('--accuracy-bundle', type=Path, required=True)
+    parser.add_argument('--cpu-isa', choices=('AVX512',), required=True)
     parser.add_argument('--case', required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--model-ramdisk-root', type=Path, default=Path('/mnt/llaminar-production-parity'))
     args = parser.parse_args(argv)
-    pair, manifest, correctness, benchmarks = admit_bundles(args.e2e_bundle, args.benchmark_bundle)
+    pair, manifest, correctness, accuracy = admit_bundles(args.preflight_bundle, args.accuracy_bundle)
     row = select_cell(manifest, pair['source']['revision'], args.case)
     image = pair['images'][args.cpu_isa]
     identity = image_identity(image['id'])
     if identity['id'] != image['id'] or identity['labels'] != image['labels']:
-        raise ValueError('Coding runtime differs from the benchmarked immutable image')
+        raise ValueError('Coding runtime differs from the accuracy-qualified immutable image')
     args.output = args.output.resolve()
     args.output.mkdir(parents=True, exist_ok=False)
     report = {'schema': 1, 'scope': 'canonical_opencode_cell', 'complete': False, 'passed': False,
               'source_revision': pair['source']['revision'], 'image': image['id'],
               'cpu_isa': args.cpu_isa, 'manifest_digest': digest(manifest),
               'images_digest': digest(pair), 'case': row['case'], 'configuration': row['configuration'],
-              'e2e_report_digest': digest(correctness[args.cpu_isa]),
-              'benchmark_report_digest': digest(benchmarks[args.cpu_isa]), 'errors': [],
+              'prerequisites_digest': digest(correctness[args.cpu_isa]),
+              'accuracy_report_digest': digest(accuracy[args.cpu_isa]), 'errors': [],
               'started': time.time()}
     output = args.output / 'opencode.json'
     write_json(output, report)
@@ -121,7 +123,7 @@ def main(argv: list[str] | None = None) -> int:
             report['evidence'] = cell_evidence(args.output / 'app-cell')
             if report['passed']:
                 from opencode_evidence import validate_cell
-                validate_cell(report, pair, manifest, correctness, benchmarks)
+                validate_cell(report, pair, manifest, correctness, accuracy)
         except Exception as error:
             report['errors'].append('Independent evidence validation: ' + repr(error))
             report['passed'] = False

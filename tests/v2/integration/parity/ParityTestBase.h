@@ -59,6 +59,7 @@
 #include "execution/runner/OrchestrationRunner.h"
 #include "FinalLogitMeanKLContract.h"
 #include "FrozenParityHistoryReplay.h"
+#include "AccuracyPanelHistory.h"
 #include "ParityHardwareRequirements.h"
 #include "snapshots/SnapshotSelectedIds.h"
 #include "snapshots/SnapshotEmptyObservation.h"
@@ -3664,6 +3665,7 @@ namespace llaminar2::test::parity
          */
         void resolveSnapshotDirIfNeeded()
         {
+            if (accuracy_panel_history_) return;
             if (frozen_history_replay_)
             {
                 accuracy::requireQFN(config_.snapshot_dir == frozen_history_replay_->referenceDirectory(),
@@ -4327,6 +4329,8 @@ namespace llaminar2::test::parity
             production_parity_prefix_restore_evidence_;
         ParityConfig config_;
         /** Explicit diagnostic metadata; no model/topology policy is stored here. */
+        std::size_t accuracy_panel_snapshot_sequence_ = 0; ///< Distinct replay observations retain their original bytes.
+        std::optional<AccuracyPanelHistory> accuracy_panel_history_;
         std::optional<FrozenParityHistoryReplay> frozen_history_replay_;
         std::set<int> observation_terminal_rows_; ///< Original closed LM exports, -1=prefill; scoped to this fixture/history only.
         std::set<int> observation_auxiliary_terminal_rows_; ///< Explicit negative-step diagnostic probes, never original history coverage.
@@ -4818,7 +4822,32 @@ namespace llaminar2::test::parity
          * Derived fixtures retain their original validated metadata owner;
          * this hook must not reconstruct evidence from expected inference output.
          */
-        virtual void onParityArtifactDirectoryReady() {}
+        virtual void onParityArtifactDirectoryReady()
+        {
+            if (accuracy_panel_history_) accuracy_panel_history_->publish(getResultsDir(), config_);
+        }
+
+        /**
+         * @brief Bind explicit frozen request inputs before ordinary model admission.
+         * @throws std::invalid_argument For MTP or incomplete/foreign panel handoffs.
+         */
+        void applyAccuracyPanelHistory()
+        {
+            const auto *info = ::testing::UnitTest::GetInstance()->current_test_info();
+            const std::string cell = info ? std::string(info->test_suite_name()) + "." + info->name() : std::string{};
+            accuracy_panel_history_ = AccuracyPanelHistory::fromDriver(cell, config_.model_path);
+            if (!accuracy_panel_history_) return;
+            if (config_.mtp_expectation != ParityMTPExpectation::Disabled)
+                throw std::invalid_argument("Accuracy panels require the canonical MTP-off control cell");
+            accuracy_panel_history_->apply(config_);
+            const auto metadata = std::filesystem::path(config_.snapshot_dir) / "metadata.txt";
+            const auto prompt = readSnapshotTokenIdentity(metadata, "token_ids");
+            const auto teachers = readSnapshotTokenIdentity(metadata, "decode_tokens");
+            if (!prompt || !teachers) throw std::invalid_argument("Accuracy panel reference omitted frozen tokens");
+            accuracy_panel_history_->requireTokens(prompt->first, teachers->first);
+            const auto validation = validateReferenceSnapshotMetadata(metadata, true);
+            if (!validation.usable) throw std::invalid_argument("Accuracy panel full-stage reference: " + validation.reason);
+        }
 
         void SetUp() override
         {
@@ -7070,20 +7099,29 @@ namespace llaminar2::test::parity
             return true;
         }
 
+        /**
+         * @brief Retain diagnostic snapshots while keeping panel teachers distinct from native state oracles.
+         * @param phase Actual forward phase. @param decode_step Original phase-local observation position.
+         * @param purpose Producer-owned reference or auxiliary-control intent.
+         * @throws std::invalid_argument For a panel observation outside its declared teacher history.
+         */
         void exportActiveSnapshotsForParityDiagnostics(
             ParityForwardPhase phase,
-            int decode_step)
+            int decode_step,
+            AccuracyObservationPurpose purpose)
         {
-            if (!isRank0())
+            if (accuracy_panel_history_ && !accuracy_panel_history_->observes(decode_step, purpose)) return;
+            if (!isRank0() && !accuracy_panel_history_)
                 return;
 
             const bool observation_shard=frozen_history_replay_ && frozen_history_replay_->hasObservationShard();
-            const auto filters = observation_shard?frozen_history_replay_->observationKeys():
-                readParityEnvList("LLAMINAR_PARITY_EXPORT_SNAPSHOT_KEYS");
+            const auto filters = accuracy_panel_history_ ? std::vector<std::string>{"LM_HEAD"} :
+                (observation_shard ? frozen_history_replay_->observationKeys() :
+                 readParityEnvList("LLAMINAR_PARITY_EXPORT_SNAPSHOT_KEYS"));
             if (filters.empty())
                 return;
 
-            if (!observation_shard && phase == ParityForwardPhase::Decode)
+            if (!observation_shard && !accuracy_panel_history_ && phase == ParityForwardPhase::Decode)
             {
                 const auto allowed_steps =
                     readParityEnvStepSet("LLAMINAR_PARITY_EXPORT_SNAPSHOT_STEPS");
@@ -7094,12 +7132,14 @@ namespace llaminar2::test::parity
                 }
             }
 
-            const size_t max_elements =
+            const size_t max_elements = accuracy_panel_history_ ? 0 :
                 readParityEnvSize("LLAMINAR_PARITY_EXPORT_SNAPSHOT_MAX_ELEMENTS", 0);
 
             if(observation_shard && max_elements!=0)
                 throw std::invalid_argument("Observation shard exports cannot truncate selected evidence");
             auto out_dir = ensureResultsDir() / "llaminar_snapshots";
+            if (accuracy_panel_history_)
+                out_dir /= "rank-" + std::to_string(mpi_ctx_ ? mpi_ctx_->rank() : 0);
             std::error_code ec;
             std::filesystem::create_directories(out_dir, ec);
             if (ec)
@@ -7151,7 +7191,9 @@ namespace llaminar2::test::parity
                     (max_elements > 0) ? std::min(elements, max_elements) : elements;
                 const std::string safe_key = sanitizeSnapshotToken(key);
                 auto file_path = out_dir /
-                                 (phase_name + "_" + step_name + "_" + safe_key + (integer ? ".i64" : ".f32"));
+                                 (phase_name + "_" + step_name + "_" + safe_key +
+                                  (accuracy_panel_history_ ? "_observation" + std::to_string(accuracy_panel_snapshot_sequence_++) : "") +
+                                  (integer ? ".i64" : ".f32"));
 
                 std::ofstream out(file_path, std::ios::binary);
                 if (!out.is_open())
@@ -7936,7 +7978,8 @@ namespace llaminar2::test::parity
             constexpr int kPartialPrefixRestoreDiagnosticStep = -2;
             exportActiveSnapshotsForParityDiagnostics(
                 ParityForwardPhase::Decode,
-                kPartialPrefixRestoreDiagnosticStep);
+                kPartialPrefixRestoreDiagnosticStep,
+                AccuracyObservationPurpose::NativeStateOracle);
 
             if (oracle.pending_condition_token.has_value())
             {
@@ -13141,7 +13184,7 @@ namespace llaminar2::test::parity
             EXPECT_TRUE(success) << "Prefill forward pass failed";
             if (!success)
                 return summary;
-            exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1);
+            exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1, AccuracyObservationPurpose::ReferenceHistory);
             /* Production prefill retires its own exact prompt progress. The
              * parity harness must not manufacture a decode boundary merely to
              * wake ExpertOverlay after prefill. */
@@ -13702,7 +13745,7 @@ namespace llaminar2::test::parity
             EXPECT_TRUE(success) << "Prefill forward pass failed";
             if (!success)
                 return summary;
-            exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1);
+            exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1, AccuracyObservationPurpose::ReferenceHistory);
 
             int n_layers = parityLayerCount();
             size_t seq_len = config_.token_ids.size();
@@ -14105,7 +14148,7 @@ namespace llaminar2::test::parity
             EXPECT_TRUE(success) << "Prefill failed";
             if (!success)
                 return summary;
-            exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1);
+            exportActiveSnapshotsForParityDiagnostics(ParityForwardPhase::Prefill, -1, AccuracyObservationPurpose::ReferenceHistory);
             const uint64_t initial_moe_movement_epoch = activeMoERuntimeMovementEpoch();
             /* Production prefill owns its maintenance progress publication. */
 
@@ -14159,7 +14202,7 @@ namespace llaminar2::test::parity
                     continue;
                 exportActiveSnapshotsForParityDiagnostics(
                     ParityForwardPhase::Decode,
-                    static_cast<int>(step));
+                    static_cast<int>(step), AccuracyObservationPurpose::ReferenceHistory);
                 if (parityMoERebalanceMaintenanceDue(step + 1) &&
                     !driveParityMoERebalanceMaintenance(
                         "decode",
@@ -14714,7 +14757,7 @@ namespace llaminar2::test::parity
             {
                 exportActiveSnapshotsForParityDiagnostics(
                     ParityForwardPhase::Prefill,
-                    -1);
+                    -1, AccuracyObservationPurpose::ReferenceHistory);
             }
             auto continuation_probe_policy = PrefixProbeCapturePolicy::fromEnvironment();
             if (productionParityCampaignEnabled())
@@ -14790,7 +14833,7 @@ namespace llaminar2::test::parity
                     auto scope = profileParityScope("decode_parity.step.export_diagnostics");
                     exportActiveSnapshotsForParityDiagnostics(
                         ParityForwardPhase::Decode,
-                        static_cast<int>(step));
+                        static_cast<int>(step), AccuracyObservationPurpose::ReferenceHistory);
                 }
 
                 // Bind prediction to the row before maintenance can publish a

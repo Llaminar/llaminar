@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_production_pipeline.py
+# @brief Device-free adversarial production image policy and ownership regressions.
 """Device-free adversarial tests for benchmark and image certification policy.
 
 Mocked processes prove orchestration decisions, not inference performance.
@@ -4959,6 +4961,19 @@ class InfrastructureTests(unittest.TestCase):
             self.assertTrue(scratch.is_dir())
             self.assertIn((scratch, "/src/build_v2_integration/Testing/Temporary", False),
                           mounts.call_args.args[0])
+
+    def test_installed_companion_is_bound_to_exact_outer_cancellation_owner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            args = argparse.Namespace(models=root, model_ramdisk_root=root, reference_cache_root=root)
+            owner = 'llaminar-suite-driver-' + 'a' * 32
+            with patch.dict(os.environ, {docker_paths.CODING_DRIVER_ENV: owner}), \
+                 patch.object(pipeline.docker_paths, 'device_args', return_value=[]), \
+                 patch.object(pipeline.docker_paths, 'mounts', return_value=[]), \
+                 patch.object(pipeline, 'run') as execute, patch.object(pipeline.subprocess, 'run'):
+                pipeline.run_test_runner({'test-runner': {'id': 'image'}}, ['python3', 'gate.py'], args, root, 'gate.log')
+            launch = execute.call_args.args[0]
+            self.assertIn(docker_paths.CODING_OWNER_LABEL + '=' + owner, launch[:launch.index('image')])
 
     def test_runtime_and_direct_docker_builds_share_complete_collective_selection(self):
         pattern = (ROOT / "scripts/docker/rccl-functions.txt").read_text().strip()

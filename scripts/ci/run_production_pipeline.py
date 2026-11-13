@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file run_production_pipeline.py
+# @brief Source-bound production image gates and exact owned companion lifetimes.
 """Build, certify and optionally publish AVX512 and AVX2 full runtime images.
 
 Local and GitHub runs execute the same ordered pipeline. Unit and production
@@ -481,6 +483,8 @@ def run_test_runner(images: dict, command: list[str], args, directory: Path, log
     ctest_scratch = directory / "ctest-temporary"
     ctest_scratch.mkdir(exist_ok=True)
     launch = ["docker", "run", "--rm", "--name", name,
+              # Cancellation must retire this companion with its exact outer owner.
+              *docker_paths.coding_owner_arguments(),
               *docker_paths.device_args(image, "CPU+CUDA+ROCm", user=f"{os.getuid()}:{os.getgid()}"),
               *(part for group in os.getgroups() for part in ("--group-add", str(group))),
               *docker_paths.mounts([(args.models, "/src/models", False),

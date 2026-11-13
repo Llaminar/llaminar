@@ -145,8 +145,8 @@ What is 2+2?<|im_end|>
     }
 
     /**
-     * @brief Certify the reported Ornith Q8 four-ROCm deployment through HTTP.
-     * @return Existing exact-weight matrix with one Dynamic/Ordinal/adaptive tag.
+     * @brief Retain the reported Ornith Q8 four-ROCm numerical workload.
+     * @return Existing exact-weight numerical matrix without release eligibility.
      *
      * The 424-token/89-step HF diagnosis remains unchanged. Its standard HTTP
      * profile independently exercises long needles, prefix restore, stochastic
@@ -159,16 +159,11 @@ What is 2+2?<|im_end|>
         auto definition = ornith15MoEQ8AccuracyParityDefinition(
             ornith15MoERocm4ExpertOverlayTopology(),
             "pytorch_ornith15_q8_natural_decode_rocm4_snapshots");
-        definition.e2e_certifiable = {{
-            .mtp = ModelParityMTP::DynamicDepth,
-            .owner_order = RoutedExpertOwnerOrder::Ordinal,
-            .movement = ModelParityExpertMovement::Dynamic,
-        }};
         return definition;
     }
 
     /**
-     * @brief Certify the four-ROCm automatic projection default beside its control.
+     * @brief Retain the four-ROCm numerical projection beside its control.
      * @return The same model, HF oracle, matrix and HTTP profile with a distinct
      *         physical projection topology and artifact identity.
      *
@@ -184,14 +179,14 @@ What is 2+2?<|im_end|>
     }
 
     /**
-     * @brief Add Ornith's single-ROCm and overlay certification definitions.
+     * @brief Add Ornith's single-ROCm and overlay numerical definitions.
      * @param definitions Canonical Qwen3.6 topology/feature definitions.
      * @return Original definitions followed by independent Ornith identities.
      *
      * Copying the typed definition preserves budgets, topology, precision and
      * prefix obligations without another topology table. Overlay definitions
-     * select Dynamic/Ordinal/adaptive MTP, including the two-GPU topologies,
-     * while preserving any certification profile authored by the parent.
+     * retain the complete feature product, including the two-GPU topologies.
+     * Every inherited runtime eligibility profile is withdrawn.
      */
     inline std::vector<ModelParityDefinition> withOrnith15CertificationModels(
         std::span<const ModelParityDefinition> definitions)
@@ -206,23 +201,12 @@ What is 2+2?<|im_end|>
                 source.topology.participants.front().address.isROCm();
             if (!overlay && !single_rocm) continue;
             auto variant = source;
-            // Cloud certification is explicit model eligibility, not an
-            // inherited promise for a different set of fine-tuned weights.
-            for (auto &selection : variant.e2e_certifiable)
-                selection.remote_cpu_overlays.clear();
+            variant.e2e_certifiable.clear();
             variant.model.test_id = "Ornith15MoE_35B_Q4KM";
             variant.model.model_path = "/opt/llaminar-models/Ornith-1.5-35B-Q4_K_M.gguf";
             // Never authenticate the fine-tune against its parent's reference pack.
             variant.model.reference_directory =
                 "pytorch_ornith15_moe_" + source.topology.test_id + "_snapshots";
-            // Preserve already-authored CPU certification budgets and coverage;
-            // only previously untagged overlay topologies need a new selector.
-            if (overlay && variant.e2e_certifiable.empty())
-                variant.e2e_certifiable = {{
-                    .mtp = ModelParityMTP::DynamicDepth,
-                    .owner_order = RoutedExpertOwnerOrder::Ordinal,
-                    .movement = ModelParityExpertMovement::Dynamic,
-                }};
             result.push_back(std::move(variant));
         }
         return result;

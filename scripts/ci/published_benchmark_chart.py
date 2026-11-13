@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file published_benchmark_chart.py
+# @brief Render measured ISA comparisons with their actual qualification provenance.
 """Render exact published-image measurements as a dependency-free README SVG.
 
 No values are synthesized or fitted. Each cell/phase uses its own AVX512 median
@@ -107,15 +109,17 @@ def render_chart(result: dict) -> str:
     groups = [(key, list(rows)) for key, rows in groupby(cases, key=section)]
     height = 224 + len(cases) * 116 + len(groups) * 44
     revision = result["source"]["revision"]
+    qualification = ("Preflight, numerical panels and OpenCode passed"
+                     if result.get("scope") == "release-preflight-and-benchmarks" else "Full HTTP E2E passed")
     svg = [f'<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="{height}" viewBox="0 0 1280 {height}" role="img" aria-labelledby="title description">',
            '<title id="title">Llaminar published-image benchmarks</title>',
-           f'<desc id="description">Both ISA images passed full HTTP E2E. Source {escape(revision)}. Grouped by model size. Exact prefill and decode medians in tokens per second. Each cell and phase is normalized to its own AVX512 result at 100%; bar lengths do not compare different cells.</desc>',
+           f'<desc id="description">{escape(qualification)}. Source {escape(revision)}. Grouped by model size. Exact prefill and decode medians in tokens per second. Each cell and phase is normalized to its own AVX512 result at 100%; bar lengths do not compare different cells.</desc>',
            '<style>text{font-family:ui-sans-serif,system-ui,-apple-system,Segoe UI,sans-serif;fill:#17243b}.muted{fill:#52647b}.small{font-size:13px}.value{font-size:15px;font-weight:650}.label{font-size:17px;font-weight:650}</style>',
            f'<rect width="1280" height="{height}" rx="18" fill="#f8fafc"/>',
            '<path d="M18 0H1262Q1280 0 1280 18V126H0V18Q0 0 18 0" fill="#122238"/>',
            '<text x="28" y="39" style="fill:white;font-size:27px;font-weight:750">Llaminar · Published-image benchmarks</text>',
            f'<text x="28" y="66" style="fill:#cbd5e1;font-size:14px">Image source {escape(revision)} · {escape(result["recorded_at_utc"][:10])}</text>',
-           '<text x="28" y="94" style="fill:#cbd5e1;font-size:14px">Full HTTP E2E passed · warmed production inference · median of measured requests</text>',
+           f'<text x="28" y="94" style="fill:#cbd5e1;font-size:14px">{escape(qualification)} · warmed inference · measured medians</text>',
            '<rect x="1000" y="80" width="15" height="15" rx="3" fill="#078c86"/><text x="1022" y="93" style="fill:white;font-size:13px">AVX512</text>',
            '<rect x="1110" y="80" width="15" height="15" rx="3" fill="#5663da"/><text x="1132" y="93" style="fill:white;font-size:13px">AVX2</text>',
            '<text x="28" y="151" class="small muted">AVX512 = 100% within each cell and phase · Compare ISA lanes within a row, not bar lengths between rows.</text>',

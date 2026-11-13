@@ -22,6 +22,7 @@
 #include "integration/NativeLifetimeCompletion.h"
 #include "utils/MPISessionOwner.h"
 #include "Qwen4ExpParityTestBase.h"
+#include "Qwen4ExpReleaseCases.h"
 #include "Qwen4ExpNgramAdmissionCases.h"
 #include "Qwen4ExpSourceAdmission.h"
 #include "Qwen4ExpObservedPipelineCases.h"
@@ -522,6 +523,11 @@ INSTANTIATE_TEST_SUITE_P(Qwen4ExpCPUJointWorld2FullStage,Qwen4ExpCPUJointFullSta
 /** @test Actual declared host authority, calibrated movement and epoch publication on original GPU/CPU2. */
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpCPUJointWorld2DynamicFullStage,Qwen4ExpCPUJointFullStageTest,
     ::testing::ValuesIn(qwen4ExpCPUJointWorld2DynamicNumericalCases()),
+    [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
+
+/** @test The three bounded release configurations use the actual full-stage fixture. */
+INSTANTIATE_TEST_SUITE_P(Qwen4ExpRelease, Qwen4ExpMainParityTest,
+    ::testing::ValuesIn(qwen4ExpReleaseCases()),
     [](const ::testing::TestParamInfo<ModelParityCase>& info){return info.param.testName();});
 
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpMain, Qwen4ExpMainParityTest,

@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file publish_pr_high_water.py
+# @brief Commit a merged PR's certified benchmark marks to develop with skip-ci.
 """Commit a merged PR's certified benchmark marks to develop with skip-ci.
 
 This runs only *after* the PR has merged and the master image release was
@@ -37,18 +39,24 @@ def git_file(revision: str, path: str) -> bytes:
     return subprocess.check_output(["git", "show", f"{revision}:{path}"], cwd=ROOT)
 
 
-def proposed_payloads(evidence: dict, baseline: dict) -> dict[str, bytes]:
+def proposed_payloads(evidence: dict, baseline: dict, develop_revision: str, develop_baseline: dict) -> dict[str, bytes]:
     """Recompute one cross-ISA ratchet from the original source baseline."""
     if any(report["baseline_digest"] != digest(baseline)
            for report in evidence["benchmarks"].values()):
         raise ValueError("PR benchmarks used a different source high-water baseline")
     rows = [row for isa in suite.ISAS for row in evidence["benchmarks"][isa]["cells"]]
-    proposed, comparisons = ratchet(baseline, rows)
+    _, comparisons = ratchet(baseline, rows)
     if not all(comparison["passed"] for comparison in comparisons):
         raise ValueError("red PR benchmark cannot advance high water")
+    if develop_baseline['regression_threshold_pct'] != baseline['regression_threshold_pct']:
+        raise ValueError('develop changed benchmark policy while the RC was being certified')
+    # Later develop marks may exceed this frozen RC's admitted baseline. Keep
+    # those upward-only values; the source-bound PR gate already adjudicated
+    # this release against its own policy. Never overwrite a concurrent gain.
+    proposed, _ = ratchet(develop_baseline, rows)
     result = evidence["result"]
     readme = suite.readme_with_results(
-        git_file(evidence["pair"]["source"]["revision"], "README.md").decode(), result)
+        git_file(develop_revision, "README.md").decode(), result)
     return {
         HIGH_WATER: (json.dumps(proposed, indent=2, sort_keys=True) + "\n").encode(),
         str(suite.REPORT_DIRECTORY / "results.json"):
@@ -60,15 +68,17 @@ def proposed_payloads(evidence: dict, baseline: dict) -> dict[str, bytes]:
 
 
 def commit_payloads(parent: str, master_sha: str,
-                    payloads: dict[str, bytes], number: int) -> str:
+                    payloads: dict[str, bytes], number: int, certified_source: str) -> str:
     """Join the squash-merged master into develop with one evidence commit.
 
     A squash merge has the same tree as the certified develop head but is not
     its ancestor. Recording both parents makes the next strict master PR
     up-to-date without rewriting either branch or rebuilding an untested image.
     """
-    if git("rev-parse", f"{parent}^{{tree}}") != git("rev-parse", f"{master_sha}^{{tree}}"):
+    if git("rev-parse", f"{certified_source}^{{tree}}") != git("rev-parse", f"{master_sha}^{{tree}}"):
         raise ValueError("merged master and certified develop trees differ")
+    if subprocess.run(['git', 'merge-base', '--is-ancestor', certified_source, parent], cwd=ROOT).returncode != 0:
+        raise ValueError('current develop does not descend from the frozen RC source')
     with tempfile.TemporaryDirectory(prefix="llaminar-pr-benchmark-index-") as directory:
         env = {**os.environ, "GIT_INDEX_FILE": str(Path(directory) / "index"),
                "GIT_AUTHOR_NAME": "Llaminar benchmarks",
@@ -96,40 +106,29 @@ def publish(repository: str, master_sha: str, output: Path,
     if git("rev-parse", "HEAD") != master_sha:
         raise ValueError("high-water checkout is not the released master commit")
     master_tree = git("rev-parse", f"{master_sha}^{{tree}}")
-    pr = release.merged_develop_pr(repository, master_sha)
-    head = pr["head"]["sha"]
-    number = int(pr["number"])
-    run = release.certified_pr_run(repository, number, head)
-    e2e, benchmarks, coding = release.download_proof(repository, int(run["id"]), number,
-                                             head, output)
-    evidence = release.validate_proof(e2e, benchmarks, repository, head, master_tree,
-                                     coding_directory=coding)
-    evidence["benchmark_directory"] = benchmarks
-    git("fetch", "origin", "refs/heads/develop")
-    current = git("rev-parse", "FETCH_HEAD")
-    baseline = json.loads(git_file(head, HIGH_WATER))
-    payloads = proposed_payloads(evidence, baseline)
-    if current != head:
-        # A retry after our own successful push is safe; a concurrent source
-        # change is not. It must not acquire a stale evidence commit silently.
-        parent = git("rev-parse", f"{current}^1")
-        merged_master = git("rev-parse", f"{current}^2")
-        subject = git("log", "-1", "--format=%s", current)
-        changed = set(git("diff-tree", "--no-commit-id", "--name-only", "-r",
-                          parent, current).splitlines())
-        if (parent != head
-                or merged_master != master_sha
-                or subject != f"benchmarks: PR #{number} certified high water [skip ci]"
-                or not changed.issubset(payloads)
-                or any(git_file(current, path) != content
-                       for path, content in payloads.items())):
-            raise ValueError("develop advanced beyond the certified PR head")
-        return {"schema": 1, "pr": number, "master_sha": master_sha,
-                "develop_sha": current, "source_sha": head, "reused": True}
-    committed = commit_payloads(head, master_sha, payloads, number)
-    git("push", push_url, f"{committed}:refs/heads/develop")
-    return {"schema": 1, "pr": number, "master_sha": master_sha,
-            "develop_sha": committed, "source_sha": head, "reused": False}
+    pr = release.merged_rc_pr(repository, master_sha)
+    release.fetch_rc_head(pr)
+    head, branch, number = pr['head']['sha'], pr['head']['ref'], int(pr['number'])
+    run = release.certified_pr_run(repository, number, head, branch)
+    proof = release.download_proof(repository, int(run['id']), number, head, output)
+    evidence = release.validate_proof(proof['preflight'], proof['benchmarks'], repository, head, master_tree,
+        coding_directory=proof['opencode'], accuracy_directory=proof['accuracy'],
+        source_directory=proof['rc-source'], rc_branch=branch)
+    if json.loads((proof['release-eligibility'] / 'release-candidate.json').read_text()) != release.candidate_certificate(evidence):
+        raise ValueError('release eligibility certificate changed before high-water publication')
+    evidence['benchmark_directory'] = proof['benchmarks']
+    source = evidence['pair']['source']['revision']
+    git('fetch', 'origin', 'refs/heads/develop')
+    current = git('rev-parse', 'FETCH_HEAD')
+    baseline = json.loads(git_file(source, HIGH_WATER))
+    latest = json.loads(git_file(current, HIGH_WATER))
+    payloads = proposed_payloads(evidence, baseline, current, latest)
+    joined = subprocess.run(['git', 'merge-base', '--is-ancestor', master_sha, current], cwd=ROOT).returncode == 0
+    if joined and all(git_file(current, path) == content for path, content in payloads.items()):
+        return dict(schema=1, pr=number, master_sha=master_sha, develop_sha=current, source_sha=source, reused=True)
+    committed = commit_payloads(current, master_sha, payloads, number, source)
+    git('push', push_url, f'{committed}:refs/heads/develop')
+    return dict(schema=1, pr=number, master_sha=master_sha, develop_sha=committed, source_sha=source, reused=False)
 
 
 def main(argv: list[str] | None = None) -> int:

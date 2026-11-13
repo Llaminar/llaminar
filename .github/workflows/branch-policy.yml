@@ -1,15 +1,14 @@
-name: Branch policy — master merges only from develop
-
-# Acts as a required status check on PRs targeting master. Fails unless the
-# head branch is exactly `develop`. The master release is created from the
-# certified merge itself, without an untested follow-up release PR. Pair with
-# the active master ruleset that also requires source admission and both PR
-# phase checks.
+name: Release branch policy
 
 on:
   pull_request:
-    branches: [master]
-    types: [opened, synchronize, reopened, ready_for_review]
+    branches: [master, 'rc/**']
+    types: [opened, synchronize, reopened, ready_for_review, edited]
+
+concurrency:
+  group: llaminar-develop-image-gate
+  cancel-in-progress: false
+  queue: max
 
 permissions:
   contents: read
@@ -18,26 +17,13 @@ permissions:
 jobs:
   enforce-source-branch:
     if: ${{ !github.event.pull_request.draft }}
-    name: Only develop may merge to master
-    runs-on: ubuntu-24.04
+    name: Release branch lineage
+    runs-on: [llaminar-xeon-host]
     steps:
-      - name: Validate head_ref
-        env:
-          HEAD_REF: ${{ github.head_ref }}
-          BASE_REF: ${{ github.base_ref }}
-          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
-          BASE_REPO: ${{ github.event.pull_request.base.repo.full_name }}
-        run: |
-          echo "PR: ${HEAD_REPO}:${HEAD_REF} -> ${BASE_REPO}:${BASE_REF}"
-
-          # Forks are not allowed to target master at all.
-          if [ "${HEAD_REPO}" != "${BASE_REPO}" ]; then
-            echo "::error::PRs from forks may not target master. Open the PR against develop instead."
-            exit 1
-          fi
-
-          if [ "${HEAD_REF}" != develop ]; then
-            echo "::error::master only accepts PRs from develop (got: ${HEAD_REF}). Retarget your PR to develop."
-            exit 1
-          fi
-          echo "Source branch is develop — allowed."
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+          submodules: false
+          lfs: false
+      - name: Require develop → rc/* → master
+        run: python3 scripts/ci/release_candidate.py

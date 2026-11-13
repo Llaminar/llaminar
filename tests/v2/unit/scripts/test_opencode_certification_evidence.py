@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_opencode_certification_evidence.py
+# @brief Adversarial, device-free tests of complete coding-workload certification.
 """Adversarial, device-free tests of complete coding-workload certification.
 
 Fixtures represent a finished client session with independently named calls
@@ -61,7 +63,7 @@ class OpenCodeCertificationEvidenceTests(unittest.TestCase):
         self.assertTrue(result['gate_passed'])
         self.assertFalse(result['task_passed'])
         self.assertEqual(result['stress_policy']['tool_errors'], 1)
-        self.assertEqual(result['completed_phases'], 10)
+        self.assertEqual(result['completed_phases'], 5)
 
     def test_five_percent_or_more_cannot_be_repaired_by_green_flags(self):
         for attempts in (20, 19):

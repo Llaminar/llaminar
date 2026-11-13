@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Promote one PR-certified develop image pair after its merge to master.
+## @file publish_master_release.py
+# @brief Promote one PR-certified RC image pair after its merge to master.
+"""Promote one PR-certified RC image pair after its merge to master.
 
 The master merge may be a squash commit, so its commit ID need not equal the
-image's develop source ID. Its *tree* must match exactly. E2E, benchmarks and coding
+image's admitted develop source ID. Its *tree* must match exactly. Preflight, numerical panels, coding and benchmarks
 are revalidated from the successful PR run's compact artifacts before any
 image alias or GitHub release is written. Mutable master tags move last;
 date and full-master-SHA tags remain stable evidence of what was released.
@@ -23,6 +25,8 @@ import run_published_image_suite as suite
 from run_develop_image_gate import remote_image_id
 from wait_for_develop_image_gate import github_json
 from opencode_evidence import validate_matrix as validate_coding_matrix
+import release_candidate
+from release_accuracy_evidence import admit_accuracy
 
 ROOT = Path(__file__).resolve().parents[2]
 DATE_TAG = re.compile(r"(?P<day>\d{4}-\d{2}-\d{2})\.(?P<sequence>[1-9]\d*)")
@@ -33,8 +37,8 @@ def git(*arguments: str) -> str:
     return subprocess.check_output(["git", *arguments], cwd=ROOT, text=True).strip()
 
 
-def merged_develop_pr(repository: str, master_sha: str) -> dict:
-    """Find the merged develop PR by its exact master commit identity.
+def merged_rc_pr(repository: str, master_sha: str) -> dict:
+    """Find the merged RC PR by its exact master commit identity.
 
     GitHub's commit-to-PR index may omit a newly created squash commit even
     after the PR itself publishes ``merge_commit_sha``. The closed-PR listing
@@ -44,7 +48,7 @@ def merged_develop_pr(repository: str, master_sha: str) -> dict:
     def matches(pr: dict) -> bool:
         return (bool(pr.get("merged_at"))
                 and pr.get("merge_commit_sha") == master_sha
-                and pr.get("head", {}).get("ref") == "develop"
+                and release_candidate.is_rc(pr.get("head", {}).get("ref", ""))
                 and pr.get("base", {}).get("ref") == "master"
                 and pr.get("head", {}).get("repo", {}).get("full_name", "").lower()
                 == repository.lower())
@@ -62,62 +66,94 @@ def merged_develop_pr(repository: str, master_sha: str) -> dict:
             if matched or len(candidates) < 100:
                 break
     if len(matched) != 1:
-        raise ValueError("master commit is not one merged same-repository develop PR")
+        raise ValueError("master commit is not one merged same-repository rc/* PR")
     return matched[0]
 
 
-def certified_pr_run(repository: str, number: int, develop_sha: str) -> dict:
+def certified_pr_run(repository: str, number: int, rc_sha: str, rc_branch: str) -> dict:
     """Find the successful PR workflow whose run-name pins both PR and head."""
-    title = f"master PR #{number} — {develop_sha}"
+    title = f"master PR #{number} — {rc_sha}"
     for page in range(1, 21):
         response = github_json(
             f"repos/{repository}/actions/workflows/master-pr-certification.yml/runs",
-            "event=pull_request", "branch=develop", "per_page=100", f"page={page}")
+            "event=pull_request", f"branch={rc_branch}", "per_page=100", f"page={page}")
         runs = response.get("workflow_runs", [])
         matching = [run for run in runs if run.get("display_title") == title
                     and run.get("event") == "pull_request"
-                    and run.get("head_branch") == "develop"
+                    and run.get("head_branch") == rc_branch
                     and run.get("status") == "completed"
                     and run.get("conclusion") == "success"]
         if matching:
             return matching[0]
         if len(runs) < 100:
             break
-    raise ValueError("merged PR has no successful exact-head E2E/benchmark/coding gate")
+    raise ValueError("merged PR has no successful exact-RC preflight/accuracy/coding/benchmark gate")
+
+
+def fetch_rc_head(pr: dict) -> None:
+    """Fetch the immutable PR head even after GitHub auto-deletes its RC branch.
+
+    Squash merges do not retain the head commit in master ancestry. GitHub's
+    read-only pull ref preserves the original source; the exact PR metadata SHA
+    must still match before any tree or lineage validation uses that object.
+    """
+    number = int(pr['number'])
+    if number <= 0:
+        raise ValueError('invalid merged RC pull-request identity')
+    subprocess.run(['git', 'fetch', '--no-tags', 'origin', f'refs/pull/{number}/head'], cwd=ROOT, check=True)
+    if git('rev-parse', 'FETCH_HEAD') != pr['head']['sha']:
+        raise ValueError('saved RC pull ref differs from the merged PR head')
 
 
 def download_proof(repository: str, run_id: int, number: int,
-                   develop_sha: str, output: Path) -> tuple[Path, Path, Path]:
-    """Download all three independent phase artifacts from the admitted run."""
-    e2e = output / "e2e"
-    benchmarks = output / "benchmarks"
-    coding = output / 'opencode'
-    for lane, destination in (("e2e", e2e), ("benchmarks", benchmarks), ('opencode', coding)):
-        name = f"pr-{lane}-{number}-{develop_sha}"
+                   rc_sha: str, output: Path) -> dict[str, Path]:
+    """Download all independently authenticated phases from one exact RC run."""
+    result = {}
+    for lane in ('rc-source', 'preflight', 'accuracy', 'opencode', 'benchmarks', 'release-eligibility'):
+        destination = output / lane
         destination.mkdir()
-        subprocess.run(["gh", "run", "download", str(run_id), "--repo", repository,
-                        "--name", name, "--dir", str(destination)], check=True)
-    return e2e, benchmarks, coding
+        subprocess.run(['gh', 'run', 'download', str(run_id), '--repo', repository,
+                        '--name', f'pr-{lane}-{number}-{rc_sha}', '--dir', str(destination)], check=True)
+        result[lane] = destination
+    return result
 
 
-def validate_proof(e2e_directory: Path, benchmark_directory: Path,
-                   repository: str, develop_sha: str, master_tree: str, *, coding_directory: Path) -> dict:
-    """Join both ISA E2E/benchmark/coding reports to their exact image/source pair."""
-    pair = json.loads((e2e_directory / "images.json").read_text())
+def validate_proof(preflight_directory: Path, benchmark_directory: Path,
+                   repository: str, rc_sha: str, master_tree: str, *, coding_directory: Path,
+                   accuracy_directory: Path, source_directory: Path, rc_branch: str) -> dict:
+    """Replay frozen lineage and the preflight → accuracy → stress → benchmark chain."""
+    source = json.loads((source_directory / 'source.json').read_text())
+    develop_sha = release_candidate.validate(source, repository, rc_branch, rc_sha, master_tree)
+    pair = json.loads((preflight_directory / 'images.json').read_text())
     suite.validate_pair(pair)
-    if (pair.get("repository", "").lower() != repository.lower()
-            or pair.get("branch") != "develop"
-            or pair["source"]["revision"] != develop_sha
-            or pair["source"]["tree"] != master_tree
-            or pair.get("workflow_revision") != develop_sha):
-        raise ValueError("master tree or merged PR head differs from certified image source")
-    manifest, e2e_reports = suite.admit_e2e(e2e_directory, pair, require_model_kld=True,
-                                                   require_qfn_source_admission=True)
-    result, reports = suite.admit_benchmarks(benchmark_directory, pair, manifest, e2e_reports)
+    if (pair.get('repository', '').lower() != repository.lower() or pair.get('branch') != 'develop'
+            or pair['source']['revision'] != develop_sha or pair['source']['tree'] != master_tree
+            or pair.get('workflow_revision') != develop_sha):
+        raise ValueError('master tree or frozen RC source differs from certified image source')
+    manifest, prerequisites = suite.admit_preflight(preflight_directory, pair)
+    accuracy = admit_accuracy(accuracy_directory, preflight_directory, pair, manifest, prerequisites)
     coding = validate_coding_matrix(json.loads((coding_directory / 'opencode.json').read_text()),
-                                    pair, manifest, e2e_reports, reports)
-    return {"pair": pair, "manifest": manifest, "e2e": e2e_reports,
-            "benchmarks": reports, "result": result, 'coding': coding}
+                                    pair, manifest, prerequisites, accuracy)
+    result, reports = suite.admit_benchmarks(benchmark_directory, pair, manifest, prerequisites, release_preflight=True)
+    expected = {'accuracy_reports': {isa: digest(accuracy[isa]) for isa in suite.ISAS},
+                'opencode_digest': digest(coding)}
+    if result.get('release_predecessors') != expected:
+        raise ValueError('release benchmarks did not consume the completed accuracy and stress proof')
+    return {'rc_source': source, 'pair': pair, 'manifest': manifest, 'prerequisites': prerequisites,
+            'preflight_receipt': json.loads((preflight_directory / 'preflight-receipt.json').read_text()),
+            'accuracy': accuracy, 'benchmarks': reports, 'result': result, 'coding': coding,
+            'accuracy_receipt': json.loads((accuracy_directory / 'accuracy-receipt.json').read_text())}
+
+
+def candidate_certificate(evidence: dict) -> dict:
+    """Bind all release phases to the same immutable RC and runtime image pair."""
+    return dict(schema='llaminar.release-candidate.v1', complete=True, passed=True,
+                rc_source=evidence['rc_source'], images_digest=digest(evidence['pair']),
+                manifest_digest=digest(evidence['manifest']), preflight_receipt_digest=digest(evidence['preflight_receipt']),
+                accuracy_receipt_digest=digest(evidence['accuracy_receipt']),
+                prerequisites_reports={isa: digest(evidence['prerequisites'][isa]) for isa in suite.ISAS},
+                accuracy_reports={isa: digest(evidence['accuracy'][isa]) for isa in suite.ISAS},
+                opencode_digest=digest(evidence['coding']), benchmark_result_digest=digest(evidence['result']))
 
 
 def release_tag(day: str, releases: list[dict], master_sha: str) -> tuple[str, str | None]:
@@ -173,20 +209,25 @@ def release_notes(tag: str, previous_tag: str | None, changes: list[str],
     base = f"https://github.com/{repository}/releases/download/{tag}"
     lines = [f"# Llaminar {tag}", "", "## Changes", ""]
     if previous_tag is None:
-        lines.append("Initial dated release of the develop build proven on both shipping CPU ISAs.")
+        lines.append("Initial dated release of the RC snapshot proven on both shipping CPU ISAs.")
     elif changes:
         lines.extend(f"- {subject}" for subject in changes)
     else:
         lines.append("No source changes since the preceding release.")
     lines.extend(["", "## Certification evidence", "",
-                  f"The [master PR certification run]({run_url}) passed the full HTTP E2E, benchmark and OpenCode matrix.",
+                  f"The [master PR certification run]({run_url}) passed complete production preflight, frozen-history PyTorch panels, OpenCode stress and benchmark gates.",
                   "The attached reports contain per-cell outcomes, throughput samples and exact image digests.", ""])
     for isa in suite.ISAS:
-        count = len(evidence["e2e"][isa]["cells"])
         measured = len(evidence["benchmarks"][isa]["cells"])
-        lines.append(f"- {isa}: {count}/{count} HTTP E2E cells; {measured}/{measured} benchmark cells. "
-                     f"[E2E JSON]({base}/e2e-{isa.lower()}.json), "
+        lines.append(f"- {isa}: complete Unit/production preflight; {measured}/{measured} benchmark cells. "
+                     f"[Preflight JSON]({base}/production-preflight-{isa.lower()}.json), "
                      f"[benchmark JSON]({base}/benchmark-{isa.lower()}.json).")
+    for isa in suite.ISAS:
+        lines.append(f"- {isa} numerical accuracy: [panel rows]({base}/accuracy-rows-{isa.lower()}.csv), "
+                     f"[prompt-balanced prefill/decode summaries]({base}/accuracy-summary-{isa.lower()}.csv), "
+                     f"[complete accuracy evidence]({base}/accuracy-evidence-{isa.lower()}.zip).")
+    lines.append(f"- [Test run]({base}/test-run.json), [release eligibility]({base}/release-candidate.json), "
+                 f"[frozen RC source]({base}/rc-source.json).")
     lines.extend([f"- [Benchmark numbers]({base}/benchmark-results.json) and "
                   f"[chart]({base}/benchmarks.svg).",
                   f"- {evidence['coding']['expected_jobs']} complete OpenCode app sessions: "
@@ -220,19 +261,49 @@ def release_asset_sources(e2e: Path, benchmarks: Path, *, model_kld: bool = Fals
     return sources
 
 
-def release_assets(e2e: Path, benchmarks: Path, coding: Path, output: Path) -> list[Path]:
-    """Copy only compact authenticated receipts, reports and numbers."""
-    assets = output / "assets"
-    assets.mkdir()
-    sources = release_asset_sources(e2e, benchmarks, model_kld=True)
+def release_candidate_asset_names() -> list[str]:
+    """Own the compact RC publication/download contract, including numerical CSVs."""
+    names = ['image-pair.json','matrix.json','all-cells.json','preflight-receipt.json',
+             'benchmark-results.json','benchmarks.svg','opencode.json','rc-source.json',
+             'release-candidate.json','accuracy-receipt.json','test-run.json']
     for isa in suite.ISAS:
-        lane = e2e / isa.lower() / 'source-admission'
-        sources[f'qfn-source-admission-{isa.lower()}.json'] = lane / 'admission/source-admission.json'
-        sources[f'qfn-source-admission-binding-{isa.lower()}.json'] = lane / 'image-binding.json'
-    sources['opencode.json'] = coding / 'opencode.json'
-    for name, source in sources.items():
-        shutil.copyfile(source, assets / name)
-    return list(assets.iterdir())
+        suffix=isa.lower()
+        names.extend(f'{prefix}-{suffix}.{extension}' for prefix,extension in (
+            ('benchmark','json'),('production-preflight','json'),('accuracy-retirement','json'),
+            ('accuracy-rows','csv'),('accuracy-summary','csv'),('accuracy','json'),('accuracy-evidence','zip')))
+    return sorted(names)
+
+
+def release_assets(preflight: Path, benchmarks: Path, coding: Path, accuracy: Path,
+                   source: Path, certificate: Path, output: Path) -> list[Path]:
+    """Publish panel CSVs, test runs and complete compact proof with every release."""
+    import zipfile
+    assets = output / 'assets'
+    assets.mkdir()
+    sources = {'image-pair.json': preflight / 'images.json', 'matrix.json': preflight / 'manifest.json',
+               'all-cells.json': preflight / 'all-cells.json',
+               'preflight-receipt.json': preflight / 'preflight-receipt.json',
+               'benchmark-results.json': benchmarks / 'results.json', 'benchmarks.svg': benchmarks / 'benchmarks.svg'}
+    for isa in suite.ISAS:
+        sources[f'benchmark-{isa.lower()}.json'] = benchmarks / isa.lower() / 'benchmarks.json'
+    sources.update({'opencode.json': coding / 'opencode.json', 'rc-source.json': source / 'source.json',
+                    'release-candidate.json': certificate / 'release-candidate.json',
+                    'accuracy-receipt.json': accuracy / 'accuracy-receipt.json'})
+    for isa in suite.ISAS:
+        sources[f'production-preflight-{isa.lower()}.json'] = preflight / 'prerequisites' / isa.lower() / 'prerequisites/prerequisites.json'
+        sources[f'accuracy-retirement-{isa.lower()}.json'] = accuracy / isa.lower() / 'outer-cleanup.json'
+        panel = accuracy / isa.lower() / 'panel'
+        for name in ('accuracy-rows', 'accuracy-summary'):
+            sources[f'{name}-{isa.lower()}.csv'] = panel / (name + '.csv')
+        sources[f'accuracy-{isa.lower()}.json'] = panel / 'panel.json'
+        with zipfile.ZipFile(assets / f'accuracy-evidence-{isa.lower()}.zip', 'x', zipfile.ZIP_DEFLATED) as archive:
+            for path in sorted(panel.rglob('*')):
+                if path.is_file() and not path.is_symlink() and path.suffix in ('.csv', '.json', '.log', '.txt'):
+                    archive.write(path, path.relative_to(panel))
+    for name, path in sources.items():
+        shutil.copyfile(path, assets / name)
+    return sorted(assets.iterdir())
+
 
 
 def promote_tag(alias: str, image: dict, *, immutable: bool) -> None:
@@ -294,15 +365,19 @@ def main(argv: list[str] | None = None) -> int:
     if git("rev-parse", "HEAD") != args.master_sha:
         raise ValueError("release checkout is not the pushed master commit")
     master_tree = git("rev-parse", f"{args.master_sha}^{{tree}}")
-    pr = merged_develop_pr(args.repository, args.master_sha)
+    pr = merged_rc_pr(args.repository, args.master_sha)
+    fetch_rc_head(pr)
     head_sha = pr["head"]["sha"]
     if not re.fullmatch(r"[0-9a-f]{40}", head_sha):
-        raise ValueError("merged develop PR has no full head revision")
-    run = certified_pr_run(args.repository, int(pr["number"]), head_sha)
-    e2e, benchmarks, coding = download_proof(args.repository, int(run["id"]),
-                                     int(pr["number"]), head_sha, args.output)
-    evidence = validate_proof(e2e, benchmarks, args.repository, head_sha, master_tree,
-                               coding_directory=coding)
+        raise ValueError("merged RC PR has no full head revision")
+    run = certified_pr_run(args.repository, int(pr['number']), head_sha, pr['head']['ref'])
+    proof = download_proof(args.repository, int(run['id']), int(pr['number']), head_sha, args.output)
+    evidence = validate_proof(proof['preflight'], proof['benchmarks'], args.repository, head_sha, master_tree,
+                              coding_directory=proof['opencode'], accuracy_directory=proof['accuracy'],
+                              source_directory=proof['rc-source'], rc_branch=pr['head']['ref'])
+    certificate = json.loads((proof['release-eligibility'] / 'release-candidate.json').read_text())
+    if certificate != candidate_certificate(evidence):
+        raise ValueError('merged RC differs from its successful release eligibility certificate')
     releases = github_json(f"repos/{args.repository}/releases", "per_page=100")
     date = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     tag, previous = release_tag(date, releases, args.master_sha)
@@ -310,14 +385,23 @@ def main(argv: list[str] | None = None) -> int:
     notes = args.output / "release-notes.md"
     notes.write_text(release_notes(tag, previous, changes, evidence,
                                    args.repository, run["html_url"], args.master_sha))
-    assets = release_assets(e2e, benchmarks, coding, args.output)
+    assets = release_assets(proof['preflight'], proof['benchmarks'], proof['opencode'], proof['accuracy'],
+                            proof['rc-source'], proof['release-eligibility'], args.output)
     receipt = {"schema": 1, "master_sha": args.master_sha, "master_tree": master_tree,
-               "develop_sha": head_sha, "pr_number": pr["number"], "pr_run": run["id"],
+               "source_sha": evidence['pair']['source']['revision'], "rc_sha": head_sha,
+               "rc_branch": pr['head']['ref'], "pr_number": pr["number"], "pr_run": run["id"],
                "tag": tag, "previous_tag": previous, "image_pair_digest": digest(evidence["pair"]),
                "benchmark_result_digest": digest(evidence["result"]),
                "coding_result_digest": digest(evidence['coding']),
+               "accuracy_reports": certificate['accuracy_reports'],
+               "certification_run_url": run['html_url'],
                "published": False}
     write_json(args.output / "master-release.json", receipt)
+    test_run = args.output / 'assets/test-run.json'
+    write_json(test_run, {k: v for k, v in receipt.items() if k != 'published'})
+    assets.append(test_run)
+    if {path.name for path in assets} != set(release_candidate_asset_names()):
+        raise ValueError("release asset inventory differs from the RC publication contract")
     if not args.plan_only:
         draft_exists = any(release.get("tag_name") == tag and release.get("draft")
                            for release in releases)
