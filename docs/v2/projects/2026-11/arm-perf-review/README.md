@@ -4445,3 +4445,27 @@ file expected; I verify D1-D3 on-disk before Main's pass (Main: no
 relay needed unless deviation). Main recorded: A2 pin ready
 (K14-A2CUDAB-1F92DCA1C) + routed; discriminator MISMATCH proven;
 INST=0 green at 91e0437c6.
+
+### A2-R1 (reviewer interim, Main-confirmed); T' sequencing set (17:07Z)
+
+A2-R1: gpuToCpuExpertPackedReference (ExpertTierWeightStream.cpp:
+1604) is noexcept bool+error but calls configureCpuFromGpu which
+throws std::invalid_argument (:408-410) on invalid/unimplemented
+layout BEFORE the function's own isValid()/reject() check -> valid
+Q4_0/Q8_0 GPU fixture + compact/unknown layout = std::terminate.
+FIX SPEC (Main): honour bool/error contract — derive+validate
+receiving sections from (destination_layout, source tuple) BEFORE
+configureCpuFromGpu, or catch exactly std::invalid_argument and
+return reject(error,...); no allocation; no caller-visible cpu
+change on rejection; regressions in the EXISTING preflight suite
+(canonical positive + compact + unknown-byte negatives false+error
+set+pre-filled cpu byte-identical); grep other noexcept helpers in
+ExpertTierWeightStream/DeviceLayout calling throwing configure/
+derive paths. Lane: WAIT for reviewer A2 FINAL -> land ONE A2
+fixup on 91e0437c6 -> **T' = 91e0437c6 + A2 fixup (BINDING TIP)**.
+SEQUENCING (Main): sparks runs the 91e0437c6 gate NOW (after sa-
+gated.sh D1-D3 pass) = EARLY-SURFACE run (reds classified by
+Main); at T' sparks reruns incrementally (build + full Unit +
+preflight + CUDA expert-tier set) and WSL reruns x86 CPU-only
+incremental; Gate-A pins bind to T'. WSL order: aa842a1be leg ->
+develop-control (118930745) -> T' x86 incremental.
