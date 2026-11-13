@@ -4116,3 +4116,27 @@ base-side byte dump); block evidence seals as K14-STAGEAGATE-X86-
 partial tree + in-tree verification). Gate-A range becomes
 d5e04fdce..fixup-tip with the block record in it. WSL infra
 disclosures clean (receipt-dir relaunch, zero work lost).
+
+### Main's BINDING guidance for the RECORD fix (14:39Z) — routed to the lane
+
+Confirmed in source (MEMBERS :206-211 vs the member at
+MoERoutedExpertPlacementPlan.h:432). NOT a free choice:
+(1) OrchestrationConfigDocument = the LOSSLESS saved-plan/apply
+document — applied plans carry placement, never re-run search;
+resolved_cpu_prepared_layout = a RESOLVED planning observation
+(overlay-wide uniform CPU layout); apply re-gathers inventory and
+A4-2's uniformity refusal re-checks the LIVE inventory against it.
+(2) PREFERRED: include in the document as the layout NAME
+(optional; absent = no CPU participant) so a saved ARM plan
+replayed on x86 is refused with a typed diagnostic at apply, not
+silently re-resolved. (3) EXCEPTION only if the file's convention
+serializes no resolved/observed fields: explicit exclusion via the
+existing mechanism, test-pinned, apply-time uniformity check proven
+to run. (4) Either way: round-trip regression (JSON with and
+without the field; mismatched-layout apply refused). (5) Sweep
+extended to EVERY chain-extended struct (RankInventory, CPU
+storage layouts, manifests, MoEOverlayCapacityResolverInput,
+CpuExpertSlotPool::Config) vs ANY member-enumerating visitor incl.
+equality/hash/print; structured-binding arity static_assert where
+the pattern allows. Gate re-targets the fixup SHA both legs; the
+blocked record joins Gate-A evidence (agreed).
