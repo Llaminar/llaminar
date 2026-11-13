@@ -3822,3 +3822,15 @@ artifact set), then the binding sequence (A2 @ 1f92dca1c -> A3 @
 17789eb05; both pins armed). Runbook addition: post-phase artifact-
 existence checks in all run scripts. PR 43 OPEN; .80 idle; lane on
 A4/A3-B1 (in flight).
+
+### OPERATOR DIRECTIVE (12:00Z): "the main arm session should always push for transparency"
+
+Standing rule: Main pushes every checkpoint/review/rebase/merge/
+application state to the canonical remote — no Main-local-only
+states; reports reference pushed SHAs. Extends handback + push +
+handover-cleanup policies (the new explicit part: Main's
+INTERMEDIATE states are also always pushed, reported by pushed SHA).
+Relayed to Main; current compliance verified clean (PR branch
+d5e04fdce pushed; compaction chain lane-pushed through 0a80edd6a;
+today's reviews were report-based with the lane holding commits).
+Recorded in program memory (project.llaminar.arm.main_always_pushes).
