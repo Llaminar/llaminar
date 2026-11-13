@@ -4307,3 +4307,21 @@ ParallelCopyReplay + ShmemSpinAbsorbingAbortReplay): env/hardware-
 absent => UNQUALIFIED per the A2 precedent, real => in stabilization
 scope. Merge-window checklist retains: NCCL fleet-wide install-nccl
 refresh (beb2389d7 + progress fix) post-merge.
+
+### I08REPAIR LANE RETIRED (16:2xZ): handover accepted; tournament re-run QUEUED
+
+arm-i08repair (01a1d014) shut down; everything handed to arm-perf.
+ONLY artifact: codex/arm-idea16-tournament-repair @ 3b109793c
+(pushed; ls-remote re-verified at handover; coordinator re-verify =
+VERIFIED). Chain off adf8efc32 (sign fix untouched): e0f6506c9
+(findings 1-4) -> 74d228047 (fx1) -> c1a002b50 (fx2 accepted) ->
+3b109793c (fx3, awaiting reviewer ACK). One file per commit
+(Perf__CPUCompactIQ3SDecode.cpp); no production source, no CMake,
+PR #43 untouched. OPEN DEPENDENCY (queued, NOT stabilization):
+reviewer ACK on 3b109793c -> .79 tournament executable re-run
+(K14-I08A-TOURNEY seal refresh). Per operator FINAL-MERGE-PHASE
+direction: HELD until the merge-phase green matrix + Gate-A verdict;
+then sequenced post-merge (idea16 integration still coordinated).
+Standalone proofs (/tmp/i08_standalone_proof.py, i08_fixforward_
+proof.py, i08_fixforward2_proof.py) = all PASS, regenerable, live
+only on this host (worktree dies with the session; branch safe).
