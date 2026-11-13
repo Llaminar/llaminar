@@ -3319,3 +3319,33 @@ runtime = hardware-ineligible (stated in PR, not claimed); WSL = x86
 CPU qualification at Stage-A boundary (Integration CPU-only, Unit+
 preflight, x86 prepared-byte identity vs d5e04fdce); CUDA = .79 cu13
 at A2 fixup tip.
+
+### A2 REVIEWER FINAL (04:07Z): SOURCE HOLD — full consolidated fixup set dispatched
+
+A2-1 Q6 subplane origin (named quotient, static_assert-tied to
+packer, NOT total payload; Stream :779/:794 + CPU oracle reference).
+A2-2 repo-wide API migration (added callers: MappedTransferProgress-
+Epoch :1525-1527, MoEOverlayROCmRemoteProjection_MPI :548-556, ROCm
+rect .inc:27, three-tier integration; NO default, NO compatibility
+overload). A2-3 presence honesty (non-CMS secondary codebook-gated at
+10 cited sites + Q6 unconditional — plane-driven OR admission FAILS
+on missing endpoint plane, never silent skip; correct "every site
+plane-driven" claim). A2-4 reference + controls (configureCpuFromGpu
+:396-405 takes destination layout; 5 independent field-tamper
+controls; relabel mismatched = known-unimplemented). A2-5 Q6
+regression in V2ExpertTierRectangularWeightTests.cmake:39-59 (C=12/37
++ rectangular both directions, C=64 control, repeated/reset, guarded
+extents; CUDA native GB10, ROCm compiles PR CI). Reviewer precision:
+host-only six-family roundtrip does NOT execute partial GPU paths
+(all run reports unauthenticated); reserved byte rejects noncanonical
+only because tables unimplemented (not selector-canonical — no
+alternate-layout identity qualification). A3 BINDING: layout into
+EVERY versioned identity BEFORE compact tables valid (tier-stream v3
+bump; remote-projection manifest :709-727 drops layout +
+remoteCpuProjectionDeviceLayout :890-894 forces canonical; Packed-
+Weights v8). [Main] compact tables invalid/unadmitted until A3
+identity lands. [Main] lane builds CUDA/ROCm/perf/parity to syntax
+level before handback; next A2 pin routed only after sparks cu13
+HAVE_CUDA=ON compiles everything. A0/A1 ACK922 preserved; #212 in
+progress; #213 Main-owned. A3 dispatch folds the expanded identity
+scope; A3 rebases onto the A2 fixup.
