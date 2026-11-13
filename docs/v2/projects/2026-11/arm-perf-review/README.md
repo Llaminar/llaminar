@@ -4092,3 +4092,27 @@ MERGE-WINDOW CHECKLIST (Main + coordinator agreed; for the base
 owner): PR #43 changes the NCCL proof inputs (beb2389d7) -> every
 pre-PR NCCL install in the fleet needs install-nccl.sh re-run after
 the merge. Added to the post-merge cascade.
+
+### STAGE-A GATE: first genuine head-defect catch (14:34Z) — x86 leg, BUILD phase
+
+WSL K14-STAGEAGATE-X86-609638ABA blocked at BUILD (rc=1, 555.6s,
+440/2779 objects; tests never ran). VERBATIM g++ 14.2.0:
+"OrchestrationConfigDocument.cpp:99:15: error: only 19 names
+provided for structured binding / MoERoutedExpertPlacementPlan
+decomposes into 20 elements / RECORD(MoERoutedExpertPlacementPlan,
+enabled, MEMBERS)". ROOT CAUSE (in-tree verified): 569de492b added
+resolved_cpu_prepared_layout to MoERoutedExpertPlacementPlan without
+the RECORD visitor MEMBERS entry (19 vs 20). ISA/compiler-
+independent; Mac gates filtered the TU (the slip path); the head's
+CI would be red. LANE: fix-forward dispatched (visitor fix +
+encode/decode-vs-runtime-resolved determination + chain-wide
+RECORD-arity sweep + syntax-probe-gate extension closing the
+class). SPARKS: NCCL refresh continues (receipt stays valid — the
+fixup won't touch NCCL scripts); GATE RE-TARGETS to the fixup SHA
+(strict exact-tip; incremental rebuild). WSL: base control at
+d5e04fdce running (predates the defect: failed-set baseline +
+base-side byte dump); block evidence seals as K14-STAGEAGATE-X86-
+609638ABA-BLOCKED (verbatim diagnostic + retained 440-object
+partial tree + in-tree verification). Gate-A range becomes
+d5e04fdce..fixup-tip with the block record in it. WSL infra
+disclosures clean (receipt-dir relaunch, zero work lost).
