@@ -3006,3 +3006,20 @@ S1 fix pin with the #212 disposition + plan summary. RECORD NOTE:
 BOUNDARY gate supplies the Linux coverage (Main-run Linux Integration
 build + Unit + preflight on sparks ARM + WSL x86, byte identity both
 ISAs) — hook coverage supplied there, not skipped. Lane continues A1.
+
+### A0 REVIEWER SOURCE ACK (01:12Z): 12fa7b2dd — S1 CLOSED; 5 doc fixes ride with A1
+
+Reviewer ACK: rejection before division, regression drives real
+MetadataSeal::validate across 6 representatives, already in
+ProductionTestPreflight. Design remains qualified. Doc fixes routed to
+the lane: (1) wire versioning exact (v7 explicit, pre-v7 rejected;
+archive bump != cache-key change — keyed by binding/device); (2) remove
+nonexistent "commissioned" CPU<->CPU lane; separate A2 CPU<->GPU
+conversion (required) from CPU<->CPU repacker (not built/authorized);
+(3) codegen/miss-penalty overclaims -> gate-based; (4) Q8_0 correction
+(native int8+half, 2176B = source, NO grid — the 7-8.6x IQ3_S timing
+does not transfer across ExpandedInt8; IQ2_S "SLOW class" = unmeasured
+hypothesis); (5) Stage C L2 = new physical identity with geometry
+obligations, not flat 656B stride; capacity % = idealized predictions.
+Attribution: :261 fromPublished structural call, :551 validate call.
+A1 continues with the fixes folded in.
