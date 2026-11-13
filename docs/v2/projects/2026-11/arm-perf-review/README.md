@@ -4722,3 +4722,21 @@ then develop-control; (3) A2-fixup pin PRE-STAGED to the reviewer
 NOW (74104b6b6 source-bounded + c848e4061 prose; gate evidence
 follows). Pins A3-fixup + A4 at 03480d07e with the sealed gate
 evidence -> Gate-A over d5e04fdce..03480d07e.
+
+### Reviewer docs HOLD @ c848e4061: leftover conflict marker + stale T' name (20:42Z)
+
+Reviewer (bounded docs HOLD, not a code verdict): design §8:693 =
+literal unresolved conflict tail `>>>>>>> ed2dfdd9b (...)` (the
+rebase conflict resolution left a marker); §8:685 still names
+091e32db3 as T' instead of the prime 74104b6b6 and omits the docs
+ancestry. Chain inspected: 91e0437c6 -> ee66b1ed6 (docs-only) ->
+74104b6b6 (code+tests+prose) -> c848e4061 (docs-only); the
+substantive prose corrections are IN 74104b6b6, c848 changes only
+the chain paragraph. Reviewer: preserve both docs commits (KEEP/no
+rewrite) + repair via a NEW docs commit. DISPATCHED to lane: remove
+the marker tail, fix the chain bullet (actual ancestry + 74104b6b6
+prime), FULL-DOC conflict-marker grep proof (zero
+<<<<<<</=======/>>>>>>>), push + SHA. Gates NOT re-targeted
+(docs-only; no instruction to change running gates per reviewer);
+Gate-A request names the docs commits docs-only. Reviewer's exact
+catch/regression/source assessment continues.
