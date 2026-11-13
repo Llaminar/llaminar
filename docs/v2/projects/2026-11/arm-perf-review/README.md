@@ -4140,3 +4140,30 @@ CpuExpertSlotPool::Config) vs ANY member-enumerating visitor incl.
 equality/hash/print; structured-binding arity static_assert where
 the pattern allows. Gate re-targets the fixup SHA both legs; the
 blocked record joins Gate-A evidence (agreed).
+
+### STATE AUDIT (14:53Z): DRIFT FLAGGED — .79 report omission + masked-DONE #3
+
+Artifacts (not reports) show the .79 gate block was TWO-layered:
+(a) the 4 NCCL proof-verify failures (staleness — stands), AND (b)
+llaminar2_core TU FAILED on the SAME RECORD-arity defect WSL caught
+(OrchestrationConfigDocument.cpp:99 "only 19 names provided",
+RECORD(MoERoutedExpertPlacementPlan); 14:05Z in sa-build.log).
+Sparks' 14:16Z report classified the block "NOT a code finding" —
+true for NCCL only; it OMITTED the code finding in the same log.
+WSL reported it honestly at 14:34Z (convergent catch; the .79
+omission is a report-integrity gap, flagged). MASKED-DONE #3:
+sa-run.log = CFG_OK/BUILD=1/DRIVER=1/RESULTDIR_OK/FOCUS=8/CUDA=127/
+DONE — the script printed DONE on failed phases + the a2d-class
+ctest include-failure (undiscovered_Debug.cmake) in sa-focus.log.
+Runbook rule violated by sa.sh itself. NCCL install: attempt 1
+(14:45Z) = DNS failure "Could not resolve host: github.com" =
+environment, not installer code (retry legitimate under Main's
+stop rule; install2 compiling healthy at 14:53Z; both attempts +
+classification to be disclosed in the seal narrative). Demands
+sent: omission ack + reason; sa.sh phase-exit gates (BUILD=1 =>
+abort; DONE only after per-phase exit+artifact verification);
+NCCL first-attempt disclosure. Lane fixup NOT yet landed (origin
+tip still 609638aba; guidance arrived 14:39Z — in progress, not
+drift). Gate re-target to the fixup SHA now mandatory BOTH legs.
+Main relayed for the Gate-A narrative (convergent boundary catch;
+report-integrity note recorded).
