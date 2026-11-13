@@ -3362,3 +3362,25 @@ SEPARATE review/evidence scopes. No execution, scheduling,
 application or activation grant implied. (Consistent with prior
 bounded-ACK discipline: ACK is source-scope; runs are sealed
 separately.)
+
+### STATE AUDIT 04:23Z + DIAGNOSIS CORRECTED: the 3 reds = unbuilt binary, never ran
+
+Audit + sparks verbatim: the 3 still-red A1-binding tests invoke
+v2_unit_moe_overlay_distributed_residency_protocol — NOT BUILT in
+build-a1h (verb2 exec: No such file; gtest filters vs
+v2_test_expert_tier_weight_stream = 0 tests from 0 suites — names
+don't exist there). ProductionTestPreflight members from
+V2ExpertTierRectangularWeightTests.cmake:16/:23/:83 with
+FAIL_REGULAR_EXPRESSION "0 tests from 0 test suites" — the framework
+catches exactly this. They failed identically at 94679834d and
+9222e9c7a (missing-binary exec, content-free). MAIN'S NAMED SCOPE AT
+9222e9c7a = ALL GREEN. Sparks' "3 = exactly the fixup targets"
+inference WRONG (mine too — propagated as the cross-check
+expectation); the honest 7/10 + verbatim artifact discipline caught
+it. Qualification call with Main: (a) accept in-scope-green or
+(b) build the one missing target + run the 3 + family airtight
+(coordinator recommends (b); A2 boundary build needs the binary
+regardless — the A2-5 Q6 family lives in the same file, and the 3
+tests exercise the lane's touched surfaces with .80-campaign green
+baselines). .80 q1bw sealed/no containers; station CB lead-owned,
+no drift signal; A2 rider exports pending with the fixup (in scope).
