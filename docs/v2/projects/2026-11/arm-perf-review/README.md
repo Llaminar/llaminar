@@ -4496,3 +4496,30 @@ at T'. SEQUENCING LOCKED: sparks 91e0437c6 early-surface NOW (sa-
 gated.sh D1-D3 pending) -> T' incremental (build + Unit + preflight
 + CUDA set); WSL x86 incremental at T'; pins A2-fixup/A3-fixup/A4
 at T' with evidence -> reviewer Gate-A over d5e04fdce..T'.
+
+### Reviewer direct confirmation of A2 FINAL (17:10Z, seq 305)
+
+Reviewer's own message confirms the verdict relayed by Main:
+separate A2 exact-pin pass COMPLETE at 1f92dca1c; SOURCE HOLD only
+A2-R1 (ExpertTierWeightStream.cpp 1577-1603, configureCpuFromGpu
+1598, throws 408-410 before seal-only catch 1780-1787). Historical
+Q6 partial16C-vs-24C + incomplete destination_layout migration
+CLOSED at 1f92; CUDA 483/668 + ROCm 764/950 corrected; endpoint
+reference/callers, presence data-contract guards, 5-plane tamper
+negatives, canonical-only view-state rollback, 64-column Q6 window/
+device-free mirror/native focused preflight accepted boundedly.
+Main seq549 acknowledged; narrow fix + controls + sibling noexcept
+audit assigned; awaiting fresh exact pin (that pin = the A2-fixup
+pin at T'). CLARITIES recorded: native focused test = direct
+kernels, NOT capture; inactive GPU cells checked but no unused-
+staging sentinel; byte sums != production traffic counters; new
+device-free geometry/partial-Q6 = Unit-only; docs still stale
+(exact presence table, packer-bound static_assert claims, five
+fixup groups = owner grouping — all in the lane's doc-truthfulness
+charter). WHOLE-BINARY nuance: CUDA focused + 26 executable pass
+!= green whole-binary under no-skip — the two-device BASE stays
+UNQUALIFIED on single GB10 (matches Main's (b): filtered
+invocation + UNQUALIFIED record); ROCm compile-only not runtime.
+A3 HOLD 177 R1-R5 + B1; A4/StageA 91 / GateA / B / L2 / economy
+separate and unclosed. No reviewer execution/edit/authentication/
+scheduling/grant. #212 in_progress, #213 pending.
