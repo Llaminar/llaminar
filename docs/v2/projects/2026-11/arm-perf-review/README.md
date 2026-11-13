@@ -3854,3 +3854,42 @@ UNPUSHED SUPERSEDED (content in the PR): arm-b1-fused-fork-pooling,
 arm-b4-vocab-budget, arm-idea23-hc-classification. Repo's entire
 unpushed state = exactly the four dispositioned categories; nothing
 completed is local-only anymore.
+
+### BRANCH REMOVALS (operator directive, 12:50Z) + A4+A3-B1 CHECKPOINT ROUTED
+
+OPERATOR RULE (verbatim): "Anything that is obsolete should be
+removed. And any kind of evidence should be on the arm branch if
+really needed for it, if just interim for validation then it can be
+dumped." EXECUTED: the six branches I pushed earlier were REBASED
+lineages (verified: not ancestors of d5e04fdce; content in the PR)
+= obsolete/interim -> ALL SIX REMOVED from origin + locally
+(arm-addon, arm-b9-strengthening [B9 closed/benched, decision
+evidence in tracker], arm-s4-nibble-witness, arm-decode-team-
+placement [96], i8mm-typed-placement [94], arm-idea26-openmp-wakeup);
+their two lingering retired-lane worktrees removed (clean at tips);
+the three local-only superseded lineages deleted too (b1-fused-fork-
+pooling, b4-vocab-budget, idea23-hc-classification). REMAINING
+locals: KEEP items (witness-post-index, half-perf-cell — operator
+local-only decision), idea08 (ACTIVE), idea16-moe-decode +
+idea16-tournament-repair + idea23-hc-planning (all origin-durable),
+perf-review + qfn (origin), bundle1 (successor plan held). Earlier
+"origin-durability" pushes of retired lineages = over-preservation,
+corrected.
+
+A4+A3-B1 @ 569de492b (18 files +761/-24; A0-A4 COMPLETE, Stage A in
+review position): A3-B1 requireHostExecutablePreparedLayout gates
+BOTH receive paths pre-allocation (execution-bound by construction;
+no relay path exists); test hook + regression (compact Q4_0 with
+valid strides rejected by THE GATE on both paths + controls). A4-1
+inventory cpu_prepared_layout (build property, never probed, unknown
+FATAL, wire round-trip + tamper). A4-2 overlay binder uniformity
+refusal pre-allocation (typed; auto+authored; resolved layout on
+plan; 4 regression cases). A4-3 pricing through the same section
+authority + typed BOM input + slot config; documented §8 deferral
+(pool owners = CPU participants -> A4-2 uniformity suffices; Stage-B
+flips kHostPreparedLayout). Design note: planning defaults =
+ambient build truth (vs A2's explicit movement identity); receive
+gates = the bypass backstop. Gates: 12/12 + 297/297 + 4/4 + 5/5 +
+probes. ROUTED to Main: review request + Stage-A gate sequencing
+(strict-tip note: A2/A3 seals still fire at their tips + the gate at
+569de492b incl. the WSL x86 leg; cost call Main's).
