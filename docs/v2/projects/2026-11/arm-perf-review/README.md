@@ -3023,3 +3023,13 @@ hypothesis); (5) Stage C L2 = new physical identity with geometry
 obligations, not flat 656B stride; capacity % = idealized predictions.
 Attribution: :261 fromPublished structural call, :551 validate call.
 A1 continues with the fixes folded in.
+
+### STATE AUDIT 01:23Z (exceptions-only): NO exceptions
+
+arm-idea08 compacted (91%->42% ctx, harness-handled) and is WORKING on
+A1 (~50min in; branch tip still 12fa7b2dd — A1 in progress, expected
+given its scope). PR 43 OPEN. .79 idle (the "2 procs" probe was grep
+self-match; verified empty). .80 idle (old exited containers only).
+All sessions in expected states (reviewer/sparks/Main idle post-A0
+ACK; CB lead 90% ctx — their program). A2 rider exports landed
+(verified earlier). Next event: A1 checkpoint push.
