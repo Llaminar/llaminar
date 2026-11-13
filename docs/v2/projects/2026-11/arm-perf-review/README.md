@@ -4657,3 +4657,22 @@ A2 fixup; A2 fixup = CPU code => run, NOT proof-by-diff) ->
 develop-control -> base retry last. MERGE WINDOW: 6ceae8219 must
 be in the merged tree for any CUDA-enabled canonical gate (already
 on the PR branch).
+
+### idea08 3h22m HANG diagnosed + unstuck by coordinator (operator request, 19:55Z)
+
+Evidence: /tmp/llaminar-idea08-wt = the lane's worktree (coordinator
+reads it read-only); process tree: bash (99904, 3h22m, 0.0% CPU) ->
+git rebase --continue -> git commit -n -F COMMIT_EDITMSG ->
+**/usr/bin/vi COMMIT_EDITMSG waiting on stdin (invisible editor
+hang; rebase-merge interactive; onto=ee66b1ed6; started ~16:28Z —
+BEFORE the A2 FINAL + T' amendment, so the lane never processed
+either).** UNSTICK: killed vi -> rebase intact -> core.editor=true
+git rebase --continue -> CLEAN: c848e4061 (docs: T' seq-167) <-
+74104b6b6 (fix(moe): A2-R1 noexcept bool/error) <- ee66b1ed6 <-
+91e0437c6; tree clean. LANE HANDOFF: 74104b6b6+c848e4061 LOCAL-
+ONLY (origin ee66b1ed6); next = cherry-pick 6ceae8219 verbatim
+(T' amendment) + verify patch-identical + Mac gates + push + T'
+SHA. A2 FINAL scope = A2-R1 + docs list (the A2-R1 already coded;
+docs items to be confirmed in the push). LESSON: tool-bash with
+0.0% CPU for >15m = probe the process tree for pager/editor waits
+(same class as the earlier pipeline masks).
