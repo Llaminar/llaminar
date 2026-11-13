@@ -2923,3 +2923,49 @@ no encoding-only assumption survives. Entry list now 0 (zero-stride
 fail-closed), 1 (tier-stream copy), 2 (packer presence guards). Lane
 informed + holding. Final reviewer report pending (separates activation
 gaps from the Phase-0 division defect).
+
+### CONSOLIDATED PLAN CLEARED + IMPLEMENTATION STARTED (00:31Z): Stage A dispatched to the lane
+
+Main's consolidated plan (reviewer #212 folded in; SOURCE HOLD on S1 +
+design-not-ACKed-as-written -> items became the plan) CLEARED by
+coordinator with two amendments: (1) reviewer gates at stage boundaries
+(Gate A pass before Stage B activation; Gate B ACK before the
+fast-follow PR); (2) doc corrections sequenced into the A0 checkpoint.
+STRUCTURE: production selector stays canonical until the whole chain is
+layout-aware; activation = Stage B. STAGE A (zero byte change): A0 S1
+fail-closed (view admission + MetadataSeal::validate reject before any
+division; regression calls real admission) + doc corrections; A1
+section-presence authority from PreparedUnitSections everywhere
+(producers WindowPacking 178-183/208-210 + direct-int8/deferred/
+rotation; copiers ExpertTierWeightStream 755-762 + gather/scatter/
+direct; accessors WeightView 367-371 + PackedWeights 446-451 fail
+explicitly on absent emins; host reference conversion Stream 1344-
+1356/1554-1565); A2 GPU conversion from CPU ENDPOINT layout (never
+__aarch64__/compiler host; typed manifest contract; CUDA 267-274/376-
+385/502-506/557-585; ROCm 552-558/657-666/775-779/828-870 incl. IQ3_S
+absolute offset); A3 identity/transport (layout in transfer descriptor;
+MPI mismatch rejected before allocation ExpertWeightTransfer 374-377/
+509-544, DGO 64661-64694; remote-projection manifest/hash; storage
+descriptor equality — equal strides != layout identity Stream 818-825,
+ResidencyFabric 3259-3277; wire v8 with explicit v7); A4 planning
+(participant prepared-layout in typed inventory; remote pricing +
+slot geometry ExpertPreparedMemoryGeometry 181-193; workspace
+estimators CPUWeightPreparationMemory 45, CPUProjectionWorkspaceContract
+37, WeightMemoryEstimator 550-552; cross-ISA CPU<->CPU refused at
+topology time; PMA sole ledger). GATE A: Unit+preflight green Mac/ARM +
+x86; byte-identical prepared bytes both ISAs; compact unit coverage
+(mixed-stride tier copy, packer presence, endpoint-selected GPU
+conversion, transport mismatch rejection). STAGE B (activation:
+CompactA64 on AArch64, x86 canonical) GATE B: byte-identical outputs
+all formats/codebooks M1..15 serial+grouped on sparks + WSL; GB10
+CUDA<->ARM tier round-trip; ABBA 35B+27B nomtp+dynMTP + prefill cell;
+PMA BOM/RSS. ACCEPTANCE = latency same-or-better AND capacity better.
+STAGE C: L2 IQ2_S source-size as new physical identity (shared
+superblock base; byte-9 + u8 coefficient planes; geometry contract for
+K-origin/partial superblocks/tails/wire; RN32(RN32(base*(0.5+n))*0.25);
+register budget on compiler evidence; own paired bench). LATER: Q5_K-
+native; tiering only for expanded-baseline formats; mirror parked
+(corrected bound ~4-8%, evidence gate = measured expert-FFN stage
+share). ROLES: lane single writer from A0; Main supervises + validates
++ owns post-merge PR. A0+A1 DISPATCHED to arm-idea08 (00:35Z); Main
+reports the start to the operator.
