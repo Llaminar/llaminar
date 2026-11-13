@@ -52,7 +52,14 @@ namespace llaminar2
     {
         // Wire discriminator: receivers reject unknown layouts before parsing.
         static constexpr uint32_t kMagic = 0x45545753u; // "ETWS"
-        static constexpr uint16_t kVersion = 3;
+        // Version 4 seals the CPU endpoint layout into the manifest hash:
+        // the layout that produced `cpu_data_stride`/`cpu_block_stride`
+        // (destination layout for GPU-to-CPU, source layout for CPU-to-GPU)
+        // is a named, authenticated identity field. Version-4 receivers
+        // re-derive both strides from this layout's section tables; a
+        // stream sealed under any other version is rejected before any
+        // version-dependent field is interpreted.
+        static constexpr uint16_t kVersion = 4;
 
         // Direction is explicit so CPU bytes cannot be replayed as GPU bytes.
         uint32_t magic = kMagic;
@@ -68,13 +75,13 @@ namespace llaminar2
         int32_t expert_id = -1;
         ExpertTierWeightProjection projection =
             ExpertTierWeightProjection::Gate;
-        // Byte zero carries the CPU endpoint layout contract — the layout
-        // the sender derived `cpu_data_stride`/`cpu_block_stride` from
-        // (destination layout for GPU-to-CPU, source layout for CPU-to-GPU).
-        // Canonical is zero, so canonical streams are byte-identical to
-        // their pre-layout form; the byte sits outside the v3 seal and A3's
-        // versioned wire promotes it to a hashed, named field.
-        uint8_t reserved_identity[3]{};
+        // The CPU endpoint layout contract — the layout the sender derived
+        // `cpu_data_stride`/`cpu_block_stride` from (destination layout for
+        // GPU-to-CPU, source layout for CPU-to-GPU). Canonical is zero, so
+        // canonical streams are byte-identical to their pre-layout form;
+        // from version 4 the field is sealed in `manifest_hash`.
+        uint8_t cpu_endpoint_layout = 0;
+        uint8_t reserved_identity[2]{};
 
         // CPU pads N to 64; K must contain complete 32-value quant blocks.
         int32_t N = 0;

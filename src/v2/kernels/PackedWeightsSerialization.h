@@ -53,8 +53,14 @@ static constexpr uint32_t PACKED_WEIGHTS_MAGIC = 0x5457504C; // "LPWT" in little
 /// Version6 preserves IQ4_XS original half bases and encoded signed coefficients.
 /// Version5 and earlier archives are rejected before any section is adopted.
 /// Version7 retains IQ3_S original half bases and raw nibbles in CPU encoding5.
-/// Earlier archives are rejected before any payload is adopted.
-static constexpr uint32_t PACKED_WEIGHTS_VERSION = 7;
+/// Version8 carries the prepared CPU layout in the sealed header identity:
+/// receivers decode `prepared_layout` and re-derive both strides from that
+/// layout's section tables before adopting any payload. Exactly version 7
+/// remains admissible as an explicitly canonical archive — its implied layout
+/// is the canonical selector by statement, never a guess; version 6 and
+/// earlier are rejected globally, not per-format.
+static constexpr uint32_t PACKED_WEIGHTS_VERSION = 8;
+static constexpr uint32_t PACKED_WEIGHTS_CANONICAL_VERSION = 7;
 
 #pragma pack(push, 1)
 
@@ -77,7 +83,8 @@ struct PackedWeightsHeader
     int32_t  data_stride;              //  4B
     int32_t  interleaved_block_stride; //  4B
     int32_t  native_block_size;        //  4B
-    uint8_t  reserved[18];            // 18B  zero-padded
+    uint8_t  prepared_layout;          //  1B  v8: sealed CPU layout identity
+    uint8_t  reserved[17];            // 17B  zero-padded
 };
 
 static_assert(sizeof(PackedWeightsHeader) == 64,
@@ -131,6 +138,93 @@ inline cpu::native_quantised::CPUNativeQuantisedEncoding decodePreparedEncoding(
     default:
         throw std::invalid_argument(
             "Packed-weight transfer received an unknown prepared encoding");
+    }
+}
+
+/**
+ * @brief Decode and validate the prepared CPU layout stored on the wire.
+ *
+ * Version-8 headers name the layout in their sealed identity; receivers
+ * never trust the byte without confirming it names a known layout. Knowing
+ * a value is not the same as the build implementing it — section tables
+ * decide implementability and fail closed in the stride re-derivation.
+ */
+inline cpu::native_quantised::CPUNativeQuantisedLayout decodePreparedLayout(
+    uint8_t value)
+{
+    using Layout = cpu::native_quantised::CPUNativeQuantisedLayout;
+    switch (value)
+    {
+    case static_cast<uint8_t>(Layout::InterleavedCanonical):
+        return Layout::InterleavedCanonical;
+    case static_cast<uint8_t>(Layout::InterleavedCompactA64):
+        return Layout::InterleavedCompactA64;
+    default:
+        throw std::invalid_argument(
+            "Packed-weight transfer received an unknown prepared layout");
+    }
+}
+
+/**
+ * @brief Resolve the admitted layout for an archive or transfer header.
+ *
+ * Exactly version 8 decodes the sealed `prepared_layout` byte; exactly
+ * version 7 is admissible as an explicitly canonical archive (the implied
+ * layout is a versioned statement, never a guess about the sender); every
+ * earlier version is rejected globally, not per-format.
+ *
+ * @throws std::invalid_argument for any version outside {7, 8} or an
+ *         unknown version-8 layout byte.
+ */
+inline cpu::native_quantised::CPUNativeQuantisedLayout admittedPreparedLayout(
+    const PackedWeightsHeader &header)
+{
+    if (header.version == PACKED_WEIGHTS_VERSION)
+        return decodePreparedLayout(header.prepared_layout);
+    if (header.version == PACKED_WEIGHTS_CANONICAL_VERSION)
+        return cpu::native_quantised::CPUNativeQuantisedLayout::
+            InterleavedCanonical;
+    throw std::invalid_argument(
+        "Packed-weight transfer received an unsupported archive version " +
+        std::to_string(header.version));
+}
+
+/**
+ * @brief Re-derive both strides from the admitted layout before adoption.
+ *
+ * The receiver never trusts the header's strides alone: the section tables
+ * of the decoded layout (with the header's encoding, asymmetry and cataloged
+ * source identity) must reproduce them exactly. An unimplemented layout
+ * yields invalid sections and fails closed here, before any payload byte is
+ * adopted.
+ *
+ * @throws std::invalid_argument when the layout has no implemented section
+ *         tables, the source is uncataloged, or the derived strides
+ *         disagree with the header.
+ */
+inline void requirePreparedLayoutStrides(
+    const PackedWeightsHeader &header,
+    cpu::native_quantised::CPUNativeQuantisedLayout layout)
+{
+    const auto *const source = native_quantised_formats::forSourceIdentity(
+        header.codebook_id, header.is_superblock);
+    if (!source)
+        throw std::invalid_argument(
+            "Packed-weight transfer received an uncataloged source identity");
+    const auto sections = cpu::native_quantised::preparedUnitSections(
+        layout,
+        decodePreparedEncoding(header.prepared_encoding),
+        header.is_asymmetric != 0,
+        *source);
+    if (!sections.isValid() ||
+        header.data_stride !=
+            static_cast<int32_t>(sections.payload_stride) ||
+        header.interleaved_block_stride !=
+            static_cast<int32_t>(sections.block_stride))
+    {
+        throw std::invalid_argument(
+            "Packed-weight transfer strides disagree with the admitted "
+            "prepared layout's section tables");
     }
 }
 
@@ -263,6 +357,9 @@ inline bool describeTransfer(
     header.interleaved_block_stride = packed.interleaved_block_stride;
     header.native_block_size =
         static_cast<int32_t>(native_block_size);
+    // The sealed layout identity: receivers re-derive both strides from
+    // this byte's section tables before adopting any payload section.
+    header.prepared_layout = static_cast<uint8_t>(packed.layout);
     std::memset(header.reserved, 0, sizeof(header.reserved));
 
     auto &sections = descriptor.sections;
@@ -323,7 +420,6 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
     const auto &header = descriptor.header;
     const auto &sections = descriptor.sections;
     if (header.magic != PACKED_WEIGHTS_MAGIC ||
-        header.version != PACKED_WEIGHTS_VERSION ||
         !validNativeSourceScaleTupleHeader(header) ||
         header.format !=
             static_cast<uint32_t>(PackedWeightsFormat::CPU_NATIVE_QUANTISED))
@@ -331,6 +427,12 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
         throw std::invalid_argument(
             "Direct packed-weight transfer received invalid format metadata");
     }
+    // Versioned layout admission: v8 decodes the sealed byte, exactly v7 is
+    // explicitly canonical, anything earlier rejects globally. The decoded
+    // layout must reproduce the header's strides from its section tables
+    // before any receive buffer is adopted.
+    const auto admitted_layout = admittedPreparedLayout(header);
+    requirePreparedLayoutStrides(header, admitted_layout);
     if (header.N <= 0 || header.K <= 0 || header.N_padded < header.N ||
         header.blocks_per_row <= 0 || header.data_stride <= 0 ||
         header.interleaved_block_stride <= 0)
@@ -373,6 +475,7 @@ inline PackedWeightsReceiveTarget allocateTransferTarget(
     packed.is_superblock = header.is_superblock != 0;
     packed.data_stride = header.data_stride;
     packed.interleaved_block_stride = header.interleaved_block_stride;
+    packed.layout = admitted_layout;
     packed.workspace_data_ = nullptr;
 
     if (placement)
@@ -537,10 +640,19 @@ inline std::unique_ptr<IPackedWeights> deserialize(
         return nullptr;
     }
 
-    if (header.version != PACKED_WEIGHTS_VERSION)
+    cpu::native_quantised::CPUNativeQuantisedLayout admitted_layout =
+        cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical;
+    try
     {
-        LOG_WARN("[PackedWeightsSerialization] Unsupported version: "
-                 << header.version << " (expected " << PACKED_WEIGHTS_VERSION << ")");
+        // Exactly v8 decodes the sealed layout byte; exactly v7 is admitted
+        // as an explicitly canonical archive; earlier versions reject
+        // globally, never per-format.
+        admitted_layout = admittedPreparedLayout(header);
+        requirePreparedLayoutStrides(header, admitted_layout);
+    }
+    catch (const std::invalid_argument &error)
+    {
+        LOG_WARN("[PackedWeightsSerialization] " << error.what());
         return nullptr;
     }
 
@@ -592,6 +704,7 @@ inline std::unique_ptr<IPackedWeights> deserialize(
     packed.is_superblock            = header.is_superblock != 0;
     packed.data_stride              = header.data_stride;
     packed.interleaved_block_stride = header.interleaved_block_stride;
+    packed.layout                   = admitted_layout;
     packed.workspace_data_          = nullptr;
 
     const uint8_t* src = data + MIN_SIZE;

@@ -314,11 +314,14 @@ TEST(Test__ExpertWeightTransfer, RoundTrip_SerializeTransferDeserialize)
         /*interleaved_sz=*/2 * 8 * 1280, /*payload_sz=*/2 * 8 * 64 * 16, /*int8_flat_sz=*/0);
     CPUPackedWeights up_weights(std::move(up_packed));
 
+    // Canonical Q4_0 strides: v8 archive admission re-derives them from
+    // the sealed layout's section tables, so synthetic half-geometry
+    // strides are unrepresentable on this wire.
     auto down_packed = buildTestPacked(
         /*N=*/256, /*K=*/128, /*codebook_id=*/0, /*blocks_per_row=*/4,
         /*payload_bytes=*/16, /*is_nibble_lut=*/true, /*is_asymmetric=*/false,
-        /*is_superblock=*/false, /*data_stride=*/512, /*interleaved_block_stride=*/640,
-        /*interleaved_sz=*/4 * 4 * 640, /*payload_sz=*/4 * 4 * 64 * 16, /*int8_flat_sz=*/0);
+        /*is_superblock=*/false, /*data_stride=*/1024, /*interleaved_block_stride=*/1280,
+        /*interleaved_sz=*/4 * 4 * 1280, /*payload_sz=*/4 * 4 * 64 * 16, /*int8_flat_sz=*/0);
     CPUPackedWeights down_weights(std::move(down_packed));
 
     // Serialize into blobs (as the sender would)

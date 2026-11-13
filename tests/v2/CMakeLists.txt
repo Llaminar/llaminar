@@ -3050,6 +3050,23 @@ add_v2_test(V2_Unit_PackedWeightsSerialization
     MPI_PROCS 1
 )
 
+# Test: PackedWeightsArchiveLayoutIdentity - versioned archive layout identity (A3):
+# v8 seals the prepared layout and re-derives strides before adoption; exactly v7
+# is explicitly canonical; earlier versions reject globally; unknown bytes, tampered
+# strides and the compact byte reject before any payload section is adopted.
+add_executable(v2_unit_packed_weights_archive_layout_identity
+    unit/kernels/Test__PackedWeightsArchiveLayoutIdentity.cpp)
+target_link_libraries(v2_unit_packed_weights_archive_layout_identity
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_PackedWeightsArchiveLayoutIdentity
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_archive_layout_identity>
+    LABELS "V2;Unit;Kernels;Serialization;PackedWeights;LayoutIdentity"
+    MPI_PROCS 1
+)
+
 # Test: GPUPackedWeightsStubs - Phase 4 GPU packed weight stub IPackedWeights implementations
 # Tests: CUDA/ROCm construction, format, clone, convertTo, serialize, compatibility, empty data
 add_executable(v2_unit_gpu_packed_weights_stubs unit/kernels/Test__GPUPackedWeightsStubs.cpp)
@@ -29976,6 +29993,12 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CPUQ6SourceScalePreservation
     V2_Integration_Q6PackedArchiveGeneration
     V2_Integration_PrefixCacheQ6ScaleArithmeticGeneration)
+add_v2_test(V2_Integration_PackedWeightsArchiveLayoutIdentity
+    COMMAND $<TARGET_FILE:v2_unit_packed_weights_archive_layout_identity>
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;Serialization;PackedWeights;LayoutIdentity;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_PackedWeightsArchiveLayoutIdentity)
 if(HAVE_CUDA AND TARGET v2_integration_cuda_gemm_parity)
     add_v2_test(V2_Integration_CUDAQ6SourceScalePreservation
         COMMAND $<TARGET_FILE:v2_integration_cuda_gemm_parity>

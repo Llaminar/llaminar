@@ -479,6 +479,85 @@ namespace llaminar2::test
         EXPECT_TRUE(validator.complete());
     }
 
+    /**
+     * @test The remote transaction identity seals the endpoint layout (ABI 5).
+     *
+     * The manifest inherits the tier stream's sealed layout byte instead of
+     * dropping it, the device layout derives from that byte instead of
+     * assuming canonical, an unknown byte fails the identity's known-layout
+     * gate even with a correctly recomputed hash, and a compact byte with a
+     * correct hash still fails the device-layout re-derivation because its
+     * section tables are not implemented. The layout is transaction
+     * identity: no hash and no stride equality can substitute for it.
+     */
+    TEST(
+        Test__MoEOverlayDistributedResidencyProtocol,
+        RemoteProjectionIdentitySealsEndpointLayoutAndRejectsSubstitution)
+    {
+        auto fixture = makeTransaction();
+        const auto cpu_bytes = cpuAsymmetricProjectionBytes();
+        const auto identity = remoteProjectionIdentity(
+            fixture.transaction, DeviceId::cpu(), DeviceId::cuda(0));
+        const auto stream = makeCpuToGpuExpertTierWeightStreamManifest(
+            cpu_bytes,
+            identity.candidate_epoch,
+            identity.layer_idx,
+            identity.expert_id,
+            identity.projection,
+            /*maximum_units_per_chunk=*/1);
+        const auto manifest = makeMoEOverlayRemoteCpuProjectionManifest(
+            identity,
+            stream,
+            /*maximum_chunk_bytes=*/4096);
+        ASSERT_TRUE(manifest.valid());
+
+        // The transaction inherits the stream's sealed layout byte — the
+        // manifest never drops or rewrites it.
+        EXPECT_EQ(manifest.identity.cpu_endpoint_layout,
+            stream.cpu_endpoint_layout);
+        EXPECT_EQ(manifest.identity.cpu_endpoint_layout,
+            static_cast<std::uint8_t>(
+                cpu::native_quantised::CPUNativeQuantisedLayout::
+                    InterleavedCanonical));
+        // The device layout derives from the carried byte.
+        const auto layout = remoteCpuProjectionDeviceLayout(manifest);
+        EXPECT_EQ(layout.cpu_layout,
+            cpu::native_quantised::CPUNativeQuantisedLayout::
+                InterleavedCanonical);
+
+        // An unknown byte fails the identity's known-layout gate even when
+        // the hash is recomputed to match the tamper.
+        auto unknown = manifest;
+        unknown.identity.cpu_endpoint_layout = 7;
+        std::string error;
+        EXPECT_FALSE(unknown.valid(&error));
+        unknown.manifest_hash = unknown.computedHash();
+        EXPECT_FALSE(unknown.valid(&error));
+        EXPECT_THROW(
+            {
+                [[maybe_unused]] const auto rejected =
+                    remoteCpuProjectionDeviceLayout(unknown);
+            },
+            std::invalid_argument);
+
+        // A compact byte is a known layout, so the identity admits it once
+        // the hash matches — but the device-layout re-derivation still
+        // fails closed: compact section tables are not implemented, and no
+        // sealed hash can substitute for them.
+        auto compact = manifest;
+        compact.identity.cpu_endpoint_layout = static_cast<std::uint8_t>(
+            cpu::native_quantised::CPUNativeQuantisedLayout::
+                InterleavedCompactA64);
+        compact.manifest_hash = compact.computedHash();
+        EXPECT_TRUE(compact.valid(&error)) << error;
+        EXPECT_THROW(
+            {
+                [[maybe_unused]] const auto rejected =
+                    remoteCpuProjectionDeviceLayout(compact);
+            },
+            std::invalid_argument);
+    }
+
     TEST(
         Test__MoEOverlayDistributedResidencyProtocol,
         RemoteGpuBlobManifestCarriesCurrentExecutionFormatSeparatelyFromProvenance)

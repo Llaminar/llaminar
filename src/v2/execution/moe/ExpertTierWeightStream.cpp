@@ -529,6 +529,12 @@ namespace llaminar2
         hash = hashScalar(hash, layer_idx);
         hash = hashScalar(hash, expert_id);
         hash = hashScalar(hash, static_cast<uint8_t>(projection));
+        // The endpoint layout is sealed identity from version 4: two streams
+        // that differ only in layout never share one hash, so an equal-
+        // stride layout substitution cannot replay a sealed stream.
+        hash = hashScalar(hash, cpu_endpoint_layout);
+        for (const auto reserved_byte : reserved_identity)
+            hash = hashScalar(hash, reserved_byte);
         // Geometry and both physical layouts determine every byte address.
         hash = hashScalar(hash, N);
         hash = hashScalar(hash, K);
@@ -617,7 +623,7 @@ namespace llaminar2
             return reject(error, "Tier stream CPU source identity is not cataloged");
         const auto wire_layout = static_cast<
             cpu::native_quantised::CPUNativeQuantisedLayout>(
-            reserved_identity[0]);
+            cpu_endpoint_layout);
         if (!cpu::native_quantised::isKnownPreparedLayout(wire_layout))
             return reject(error, "Tier stream carries an unknown CPU layout");
         const auto wire_sections = cpu::native_quantised::preparedUnitSections(
@@ -696,11 +702,10 @@ namespace llaminar2
             // contract — the layout the sender derived the strides from
             // (destination for GPU-to-CPU demotion, source for CPU-to-GPU
             // promotion), never the projecting host or the compiler host.
-            // Canonical is zero and the byte sits outside the v3 seal;
-            // A3's versioned wire promotes it to a hashed, named field.
+            // From version 4 the layout is sealed in the manifest hash.
             .cpu_layout = static_cast<
                 cpu::native_quantised::CPUNativeQuantisedLayout>(
-                reserved_identity[0]),
+                cpu_endpoint_layout),
             .cpu_data_stride = cpu_data_stride,
             .cpu_block_stride = cpu_block_stride,
             .unit_count = unit_count,
@@ -745,6 +750,26 @@ namespace llaminar2
 
     namespace {
         /**
+         * @brief Q6 payload subplane geometry, shared by the packer, the
+         *        CPU copier/reference and the CUDA/ROCm conversion kernels.
+         *
+         * One 32-value block's payload is 24 bytes per column — the 32
+         * values' four low bits (16 bytes) followed by their two high bits
+         * (8 bytes). The high plane starts at the low-nibble payload end,
+         * INSIDE the payload; the payload end (24 column-bytes) is the
+         * scales section boundary and must never address the high plane. A
+         * full 64-column unit packs the high plane into the 1024-byte
+         * bitplane window (16 * 64) after the low-nibble region.
+         */
+        constexpr size_t kQ6LowPlaneBytesPerColumn = 32 * 4 / 8;
+        static_assert(
+            kQ6LowPlaneBytesPerColumn == 16,
+            "Q6 low plane is the 32-value block's four low bits");
+        static_assert(
+            kQ6LowPlaneBytesPerColumn != 24,
+            "the Q6 high plane is not at the payload section boundary");
+
+        /**
          * @brief Copy one encoded column through the shared native plane mapping.
          *
          * A root always has64 physical columns per unit. Compact wire units
@@ -771,17 +796,17 @@ namespace llaminar2
                     uint8_t value;
                     if (source_columns == 64)
                     {
-                        const size_t plane = source_base + 1024 + group * 64 + (source_column / 16) * 16;
+                        const size_t plane = source_base + kQ6LowPlaneBytesPerColumn * 64 + group * 64 + (source_column / 16) * 16;
                         const size_t bit = (source_column % 16) * 4;
                         uint64_t low, high;
                         std::memcpy(&low, source.data() + plane, 8);
                         std::memcpy(&high, source.data() + plane + 8, 8);
                         value = static_cast<uint8_t>(((low >> bit) & 15) | (((high >> bit) & 15) << 4));
                     }
-                    else value = source[source_base + 16 * source_columns + group * source_columns + source_column];
+                    else value = source[source_base + kQ6LowPlaneBytesPerColumn * source_columns + group * source_columns + source_column];
                     if (destination_columns == 64)
                     {
-                        const size_t plane = destination_base + 1024 + group * 64 + (destination_column / 16) * 16;
+                        const size_t plane = destination_base + kQ6LowPlaneBytesPerColumn * 64 + group * 64 + (destination_column / 16) * 16;
                         const size_t bit = (destination_column % 16) * 4;
                         std::unique_lock<std::mutex> lock;
                         if (write_mutex) lock = std::unique_lock<std::mutex>(*write_mutex);
@@ -793,7 +818,7 @@ namespace llaminar2
                         std::memcpy(destination.data() + plane, &low, 8);
                         std::memcpy(destination.data() + plane + 8, &high, 8);
                     }
-                    else destination[destination_base + 16 * destination_columns + group * destination_columns + destination_column] = value;
+                    else destination[destination_base + kQ6LowPlaneBytesPerColumn * destination_columns + group * destination_columns + destination_column] = value;
                 }
             // Section authority: which metadata planes follow the payload,
             // and whether packed effective minima exist, derive from the
@@ -1192,11 +1217,9 @@ namespace llaminar2
         manifest.cpu_data_stride = destination_sections.payload_stride;
         manifest.cpu_block_stride = destination_sections.block_stride;
         // The manifest carries the target-layout contract: reserved identity
-        // byte zero names the CPU endpoint layout that produced these
-        // strides. Canonical is zero, so today's wire bytes are unchanged;
-        // the byte sits outside the v3 seal, and A3's versioned wire
-        // promotes it to a hashed, named field.
-        manifest.reserved_identity[0] =
+        // The named endpoint layout that produced these strides is sealed
+        // in the manifest hash from version 4.
+        manifest.cpu_endpoint_layout =
             static_cast<uint8_t>(destination_layout);
         return sealManifest(manifest, maximum_units_per_chunk);
     }
@@ -1336,10 +1359,9 @@ namespace llaminar2
             static_cast<uint32_t>(cpu_weights.interleaved_block_stride);
         // CPU-to-GPU names the SOURCE layout: the packed weights carry
         // their own prepared layout, never the compiler host and never a
-        // receiver guess. Canonical is zero, so today's wire bytes are
-        // unchanged; A3's versioned wire promotes the byte to a hashed,
-        // named field.
-        manifest.reserved_identity[0] =
+        // receiver guess. The named source layout is sealed in the manifest
+        // hash from version 4.
+        manifest.cpu_endpoint_layout =
             static_cast<uint8_t>(cpu_weights.layout);
         return sealManifest(manifest, maximum_units_per_chunk);
     }
@@ -1524,7 +1546,8 @@ namespace llaminar2
                 for (int group = 0; group < 8; ++group)
                 {
                     const uint8_t *planes =
-                        cpu.native_interleaved.data() + unit + 1024u +
+                        cpu.native_interleaved.data() + unit +
+                        kQ6LowPlaneBytesPerColumn * 64u +
                         static_cast<size_t>(group) * 64u +
                         static_cast<size_t>(zmm) * 16u;
                     const uint64_t low = loadU64(planes);
@@ -1543,15 +1566,19 @@ namespace llaminar2
                     }
                     destination[16 + group] = packed_high;
                 }
-                // Q6's `mins` region carries two opaque signed coefficients.
+                // Q6's `mins` region carries two opaque signed
+                // coefficients; both words move through the layout's
+                // section tables, never fixed payload-end arithmetic.
                 std::memcpy(
                     &output.scales[linear],
-                    cpu.native_interleaved.data() + unit + 1536u +
+                    cpu.native_interleaved.data() + unit +
+                        cpu_sections.scales_offset +
                         static_cast<size_t>(local_column) * sizeof(uint16_t),
                     sizeof(uint16_t));
                 std::memcpy(
                     &output.mins[linear],
-                    cpu.native_interleaved.data() + unit + 1664u +
+                    cpu.native_interleaved.data() + unit +
+                        cpu_sections.mins_offset +
                         static_cast<size_t>(local_column) * sizeof(uint16_t),
                     sizeof(uint16_t));
             }
@@ -1633,12 +1660,25 @@ namespace llaminar2
                     if (gpu.has_emins && !output_sections.has_emins)
                         return reject(error,
                             "Receiving CPU layout cannot represent the source's effective minima");
-                    uint8_t *const metadata = interleaved.data() + unit + output.data_stride;
-                    std::memcpy(metadata + local_column * 2, &gpu.scales[linear], 2);
+                    // Metadata offsets are the receiving layout's absolute
+                    // section tables — compensation-free CMS puts scales at
+                    // the payload end, secondary words after scales, and
+                    // packed effective minima after the secondary plane.
+                    // Never relative arithmetic on the encoding family.
+                    std::memcpy(
+                        interleaved.data() + unit + output_sections.scales_offset +
+                            local_column * 2,
+                        &gpu.scales[linear], 2);
                     if (output_sections.has_secondary)
-                        std::memcpy(metadata + 128 + local_column * 2, &gpu.mins[linear], 2);
+                        std::memcpy(
+                            interleaved.data() + unit + output_sections.mins_offset +
+                                local_column * 2,
+                            &gpu.mins[linear], 2);
                     if (output_sections.has_emins && gpu.has_emins)
-                        std::memcpy(metadata + 256 + local_column * 4, &gpu.emins[linear], 4);
+                        std::memcpy(
+                            interleaved.data() + unit + output_sections.emins_offset +
+                                local_column * 4,
+                            &gpu.emins[linear], 4);
                     continue;
                 }
 
@@ -1742,9 +1782,11 @@ namespace llaminar2
                 // each logical column contributes disjoint bits.
                 for (int group = 0; group < 8; ++group)
                 {
-                    const uint8_t packed_high = source[16 + group];
+                    const uint8_t packed_high =
+                        source[kQ6LowPlaneBytesPerColumn + group];
                     uint8_t *planes =
-                        interleaved.data() + unit + 1024u +
+                        interleaved.data() + unit +
+                        kQ6LowPlaneBytesPerColumn * 64u +
                         static_cast<size_t>(group) * 64u +
                         static_cast<size_t>(zmm) * 16u;
                     uint64_t low = loadU64(planes);
@@ -1762,14 +1804,16 @@ namespace llaminar2
                     storeU64(planes, low);
                     storeU64(planes + sizeof(uint64_t), high);
                 }
-                // Preserve the original Q6 half base and signed coefficient pair.
+                // Preserve the original Q6 half base and signed coefficient
+                // pair through the receiving layout's section tables,
+                // never fixed payload-end arithmetic.
                 std::memcpy(
-                    interleaved.data() + unit + 1536u +
+                    interleaved.data() + unit + output_sections.scales_offset +
                         static_cast<size_t>(local_column) * sizeof(uint16_t),
                     &gpu.scales[linear],
                     sizeof(uint16_t));
                 std::memcpy(
-                    interleaved.data() + unit + 1664u +
+                    interleaved.data() + unit + output_sections.mins_offset +
                         static_cast<size_t>(local_column) * sizeof(uint16_t),
                     &gpu.mins[linear],
                     sizeof(uint16_t));

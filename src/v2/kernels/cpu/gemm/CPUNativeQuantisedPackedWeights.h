@@ -436,20 +436,33 @@ namespace llaminar2::cpu::native_quantised
         /// Scales pointer for N-chunk c, K-block kb (contiguous 64 FP16 values, inline in native_interleaved)
         inline const uint16_t *chunkScales(int c, int kb) const
         {
+            // The scales plane address derives from this owner's layout
+            // section tables — never from compensation-presence arithmetic
+            // on the encoding family. An unimplemented layout fails closed
+            // through the section validity gate.
+            const PreparedUnitSections sections = preparedSections();
+            if (!sections.isValid())
+                throw std::logic_error(
+                    "Primary scales require a prepared layout with implemented section tables");
             size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
-            const size_t compensation_bytes = usesInlineCompensation() ? 128u : 0u;
             return reinterpret_cast<const uint16_t *>(
-                interleavedBase() + block_offset + data_stride + compensation_bytes);
+                interleavedBase() + block_offset + sections.scales_offset);
         }
 
         /// Secondary words for one chunk: FP16 minimum/scale, or Q6_K/IQ2_S/IQ3_S/IQ4_XS raw coefficients.
+        /// @throws std::logic_error If this owner's layout has no secondary
+        ///         section (presence derives from the layout tuple, not the
+        ///         encoding family alone; an absent section is never read
+        ///         at a guessed offset).
         inline const uint16_t *chunkMins(int c, int kb) const
         {
+            const PreparedUnitSections sections = preparedSections();
+            if (!sections.isValid() || !sections.has_secondary)
+                throw std::logic_error(
+                    "Secondary metadata require a prepared layout with a secondary section");
             size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
-            const size_t metadata_offset =
-                usesInlineCompensation() ? 256u : 128u;
             return reinterpret_cast<const uint16_t *>(
-                interleavedBase() + block_offset + data_stride + metadata_offset);
+                interleavedBase() + block_offset + sections.mins_offset);
         }
 
         /**
@@ -488,9 +501,12 @@ namespace llaminar2::cpu::native_quantised
             if (!usesInlineCompensation())
                 throw std::logic_error(
                     "Q6_K native dual-scale weights do not carry compensation metadata");
+            // The compensation plane address derives from the layout's
+            // section tables like every other metadata plane.
+            const PreparedUnitSections sections = preparedSections();
             size_t block_offset = ((size_t)c * blocks_per_row + kb) * interleaved_block_stride;
             return reinterpret_cast<const int16_t *>(
-                interleavedBase() + block_offset + data_stride);
+                interleavedBase() + block_offset + sections.compensation_offset);
         }
 
         /**

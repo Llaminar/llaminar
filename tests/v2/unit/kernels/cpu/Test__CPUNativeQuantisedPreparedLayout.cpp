@@ -578,4 +578,107 @@ TEST(CPUNativeQuantisedPreparedLayout,
     EXPECT_TRUE(canonical.valid());
     EXPECT_TRUE(canonical.cpuStorage().valid());
 }
+/**
+ * @test Owner metadata accessors derive from the section tables and guard
+ *        absence explicitly.
+ *
+ * `chunkScales`/`chunkMins`/`chunkComp` address their planes through the
+ * owner's layout section tables (A3): the pointers land exactly at
+ * `preparedSections()` offsets, and a layout without the requested section
+ * is a typed rejection — never a read at a family-guessed offset. This is
+ * the owner-side statement of the one-section-authority invariant.
+ */
+TEST(CPUNativeQuantisedPreparedLayout,
+     OwnerMetadataAccessorsDeriveFromSectionsAndGuardAbsence)
+{
+    using native_quantised_formats::Q4_0;
+    using native_quantised_formats::Q4_1;
+    using native_quantised_formats::Q6_K;
+
+    const auto buildOwner = [](const NativeQuantisedFormatInfo &source) {
+        const auto encoding =
+            cpu::native_quantised::preparedEncodingForSource(source);
+        const auto sections = preparedUnitSections(
+            CPUNativeQuantisedLayout::InterleavedCanonical, encoding,
+            source.is_asymmetric, source);
+        EXPECT_TRUE(sections.isValid());
+        CPUNativeQuantisedPackedWeights packed;
+        packed.N = 64;
+        packed.K = 32;
+        packed.N_padded = 64;
+        packed.blocks_per_row = 1;
+        packed.codebook_id = source.codebook_id;
+        packed.payload_bytes = source.payload_bytes;
+        packed.is_asymmetric = source.is_asymmetric;
+        packed.encoding = encoding;
+        packed.is_superblock = source.is_superblock;
+        packed.data_stride = static_cast<int>(sections.payload_stride);
+        packed.interleaved_block_stride =
+            static_cast<int>(sections.block_stride);
+        packed.native_interleaved.resize_uninitialized(sections.block_stride);
+        auto bytes = packed.native_interleaved.unsealedGenerationBytes();
+        for (std::size_t index = 0; index < bytes.size(); ++index)
+            bytes[index] = static_cast<std::uint8_t>(index & 0xffu);
+        return packed;
+    };
+
+    // Q4_0 (symmetric nibble, compensation + scales, no secondary): the
+    // scales plane sits right after compensation, and secondary access is
+    // a typed rejection — the layout has no secondary section.
+    {
+        const auto packed = buildOwner(Q4_0);
+        const auto sections = packed.preparedSections();
+        ASSERT_TRUE(sections.isValid());
+        EXPECT_TRUE(sections.has_compensation);
+        EXPECT_FALSE(sections.has_secondary);
+        const auto *const base = packed.native_interleaved.data();
+        EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(packed.chunkComp(0, 0)),
+            base + sections.compensation_offset);
+        EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(
+                      reinterpret_cast<const void *>(packed.chunkScales(0, 0))),
+            base + sections.scales_offset);
+        EXPECT_THROW(static_cast<void>(packed.chunkMins(0, 0)),
+            std::logic_error);
+    }
+
+    // Q4_1 (asymmetric nibble, compensation + scales + secondary): all
+    // three planes address their exact section offsets.
+    {
+        const auto packed = buildOwner(Q4_1);
+        const auto sections = packed.preparedSections();
+        ASSERT_TRUE(sections.isValid());
+        ASSERT_TRUE(sections.has_compensation);
+        ASSERT_TRUE(sections.has_secondary);
+        const auto *const base = packed.native_interleaved.data();
+        EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(packed.chunkComp(0, 0)),
+            base + sections.compensation_offset);
+        EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(
+                      reinterpret_cast<const void *>(packed.chunkScales(0, 0))),
+            base + sections.scales_offset);
+        EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(
+                      reinterpret_cast<const void *>(packed.chunkMins(0, 0))),
+            base + sections.mins_offset);
+    }
+
+    // Q6_K (dual scale, no compensation plane): compensation access stays
+    // the family guard's typed rejection; scales and secondary address the
+    // payload-end and secondary section tables.
+    {
+        const auto packed = buildOwner(Q6_K);
+        const auto sections = packed.preparedSections();
+        ASSERT_TRUE(sections.isValid());
+        ASSERT_FALSE(sections.has_compensation);
+        ASSERT_TRUE(sections.has_secondary);
+        const auto *const base = packed.native_interleaved.data();
+        EXPECT_THROW(static_cast<void>(packed.chunkComp(0, 0)),
+            std::logic_error);
+        EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(
+                      reinterpret_cast<const void *>(packed.chunkScales(0, 0))),
+            base + sections.scales_offset);
+        EXPECT_EQ(reinterpret_cast<const std::uint8_t *>(
+                      reinterpret_cast<const void *>(packed.chunkMins(0, 0))),
+            base + sections.mins_offset);
+    }
+}
+
 } // namespace llaminar2::test

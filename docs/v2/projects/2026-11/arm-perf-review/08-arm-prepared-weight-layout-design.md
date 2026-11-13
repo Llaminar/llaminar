@@ -770,6 +770,51 @@ canonical arm is a lane defect and blocks landing.
     `V2_Integration_${backend}_ExpertTierPartialQ6PayloadPlane` in
     `V2ExpertTierRectangularWeightTests.cmake`. CUDA runs natively in the
     GB10 boundary build; the ROCm registration compiles in PR CI.
+  - **A3 landed (seq 94 dispatch, one push on top of `433e84632`): the
+    layout enters every versioned identity.** (1) **Tier stream v4**:
+    `cpu_endpoint_layout` is a named, hashed manifest field (canonical is
+    byte zero; the seal covers the byte and pins the reserved tail), and
+    receivers keep re-deriving both strides from the carried layout's
+    section tables; a re-sealed compact stream authenticates its hash and
+    still fails on the unimplemented tables — no hash and no stride
+    equality substitutes for layout identity. (2) **Remote projection
+    ABI 5**: the transaction identity carries the layout in the hash
+    (`hashIdentity`), the manifest inherits the tier stream's sealed byte
+    instead of dropping it, `remoteCpuProjectionDeviceLayout` derives the
+    CPU layout from the carried byte instead of forcing canonical,
+    `baseManifest` derives wire strides from the sealed identity layout
+    (unimplemented layouts yield zero strides that validity rejects), and
+    `requireCanonicalCpuRoot` requires the CPU root to BE the sealed
+    layout — no CPU↔CPU repacker, mismatch is a typed rejection. (3)
+    **PackedWeights archive v8**: the header's `prepared_layout`
+    (promoted from reserved) is sealed into the versioned identity;
+    receivers decode it and re-derive both strides from its section
+    tables before adopting any payload; exactly v7 remains admissible as
+    an explicitly canonical archive; v6 and earlier reject globally, not
+    per-format. (4) **Carried identity offsets landed**: the copier's Q6
+    payload subplane quotient is named and static_assert-tied
+    (`kQ6LowPlaneBytesPerColumn`, shared semantics with the CUDA/ROCm
+    kernels — 16 and the 1024 bitplane window derive from it); the CMS
+    host demotion addresses scales/secondary/emins through the receiving
+    layout's absolute section offsets (no `+0/+128/+256` family
+    arithmetic); the Q6 reference moves both dual-scale words and the
+    bitplane window through `cpu_sections`/`output_sections` (no
+    1536/1664/1024 literals); `chunkScales`/`chunkMins`/`chunkComp`
+    derive from `preparedSections()` with an explicit absence guard on
+    `chunkMins` (an absent secondary section is a typed rejection, never
+    a family-guessed offset); `requireCompatibleCpuWeights` includes the
+    prepared layout in the compatibility set. Focused regressions:
+    `V2_Unit_PackedWeightsArchiveLayoutIdentity` (v8 seal, exactly-v7
+    explicit, global pre-v7 reject, unknown byte, stride tamper, compact-
+    byte unadmitted, direct-descriptor path) registered Unit +
+    ProductionTestPreflight; `RemoteProjectionIdentitySealsEndpointLayout
+    AndRejectsSubstitution` in the distributed-residency protocol suite
+    (carry, derive, unknown-byte gate, re-sealed compact rejection);
+    `OwnerMetadataAccessorsDeriveFromSectionsAndGuardAbsence` in the
+    layout suite. Compact section tables remain INVALID and unadmitted:
+    their stride tables are the next step (pure-data entries + explicit
+    layout argument in tests), unlocked by this identity binding but
+    held for the A2 pin ACK per Main's constraint.
   - **BINDING FOR A3 (reviewer, seq 85 — precondition for any compact
     table to become valid).** The unhashed `reserved_identity[0]` carrier
     is safe today ONLY because no second valid layout exists; once compact
@@ -858,21 +903,17 @@ canonical arm is a lane defect and blocks landing.
   fabric layout identity; CUDA+ROCm conversion kernels layout-conditional
   comp write (CMS kernels already parameterized); cross-layout rejection
   regressions; estimator/BOM byte-equality per-ISA in preflight.
-- **Carried into A3/later (recorded by reviewer #212, not fixed in the A1
-  fixup):** the remaining non-authority offsets — copier payload group
-  ordinal offsets (`ExpertTierWeightStream.cpp:781-800`), the CMS host
-  demotion `data_stride+0/+128/+256` relative metadata arithmetic
-  (`:1582-1587`), the Q6 reference 1536/1664 constants (`:1496`, `:1501`),
-  and `PackedWeights` `chunkScales/chunkMins/chunkComp` arithmetic plus the
-  owner `chunkMins` accessor without an absence guard — become
-  section-offset-driven (or guarded) when the compact tables make them
-  layout-variant. `ResidencyFabric::requireCompatibleCpuWeights`
-  (`MoEOverlayPhysicalResidencyFabric.cpp:3264-3275`) omits the prepared
-  layout from its compatibility set; the layout joins that check in A3 when
-  the wire carries it. Also carried: the absent-emins trimmed-unit control
-  for the tier-copy regression, which becomes representable when Stage A
-  introduces explicit compact tables (test-only via the explicit layout
-  argument, before Gate A).
+- **Carried offsets — LANDED in A3 (seq 94):** the copier payload group
+  ordinal offsets, the CMS host demotion relative metadata arithmetic, the
+  Q6 reference 1536/1664 constants, and the `PackedWeights`
+  `chunkScales/chunkMins/chunkComp` arithmetic plus the owner `chunkMins`
+  absence guard are section-offset-driven (or guarded) now — see the A3
+  record above. `ResidencyFabric::requireCompatibleCpuWeights` includes
+  the prepared layout in its compatibility set. Still carried: the
+  absent-emins trimmed-unit control for the tier-copy regression, which
+  becomes representable when the compact stride tables exist as pure-data
+  entries (test-only via the explicit layout argument, after the A2 pin
+  ACK per Main's constraint).
 - **Gate-A evidence (former Phase 3) — bench + focused preflight
   regressions.** The §7 bench in the
   performance namespace (non-regression reading); focused regressions

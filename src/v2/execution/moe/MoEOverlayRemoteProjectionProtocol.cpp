@@ -64,6 +64,12 @@ namespace llaminar2
             hashScalar(hash, identity.layer_idx);
             hashScalar(hash, identity.expert_id);
             hashScalar(hash, identity.projection);
+            // The endpoint layout is sealed transaction identity from ABI
+            // version 5: two transactions that differ only in layout never
+            // share one hash.
+            hashScalar(hash, identity.cpu_endpoint_layout);
+            for (const auto reserved_byte : identity.reserved_identity)
+                hashScalar(hash, reserved_byte);
             hashScalar(hash, identity.source_participant);
             hashScalar(hash, identity.destination_participant);
             hashScalar(hash, identity.source_world_rank);
@@ -200,18 +206,22 @@ namespace llaminar2
                 source_identity.is_superblock ? 1u : 0u;
             manifest.cpu_encoding =
                 cpu::native_quantised::preparedEncodingForSource(*source);
-            // Wire strides derive from the CPU endpoint's canonical layout
-            // tuple (the protocol carries no prepared-layout field until its
-            // versioned A3 update, so the endpoint's layout is canonical by
-            // version statement); the section authority, not the encoding
-            // family, owns the arithmetic.
+            // Wire strides derive from the layout sealed in the
+            // transaction identity (ABI 5) — the section authority, not the
+            // encoding family, owns the arithmetic, and an unimplemented
+            // layout yields zero strides that manifest validity rejects
+            // before any byte moves. GPU-blob transactions carry zero
+            // (canonical) and derive the same canonical CPU-side strides.
+            const auto endpoint_layout = static_cast<
+                cpu::native_quantised::CPUNativeQuantisedLayout>(
+                identity.cpu_endpoint_layout);
             manifest.cpu_data_stride =
                 cpu::native_quantised::preparedDataStride(
-                    cpu::native_quantised::kHostPreparedLayout,
+                    endpoint_layout,
                     manifest.cpu_encoding, manifest.cpu_is_asymmetric != 0, *source);
             manifest.cpu_block_stride = static_cast<std::uint32_t>(
                 cpu::native_quantised::preparedInterleavedBlockStride(
-                    cpu::native_quantised::kHostPreparedLayout,
+                    endpoint_layout,
                     manifest.cpu_encoding,
                     manifest.cpu_is_asymmetric != 0, *source));
             manifest.maximum_chunk_bytes = maximum_chunk_bytes;
@@ -301,7 +311,11 @@ namespace llaminar2
                static_cast<std::uint8_t>(projection) <=
                    static_cast<std::uint8_t>(
                        ExpertTierWeightProjection::Down) &&
-               allZero(reserved_identity) && source_participant >= 0 &&
+               allZero(reserved_identity) &&
+               cpu::native_quantised::isKnownPreparedLayout(
+                   static_cast<cpu::native_quantised::
+                       CPUNativeQuantisedLayout>(cpu_endpoint_layout)) &&
+               source_participant >= 0 &&
                destination_participant >= 0 &&
                source_participant != destination_participant &&
                source_world_rank >= 0 && destination_world_rank >= 0 &&
@@ -594,7 +608,14 @@ namespace llaminar2
         void requireCanonicalCpuRoot(const cpu::native_quantised::CPUNativeQuantisedPackedWeights &root,
             const MoEOverlayRemoteProjectionManifest &format)
         {
-            if (root.N_padded != format.N_padded || root.blocks_per_row != format.blocks_per_row ||
+            // The root's prepared layout is part of the genuine-storage
+            // contract: the CPU root must BE the layout the transaction
+            // identity sealed, not merely agree on strides. There is no
+            // CPU-to-CPU repacker; a layout mismatch is a typed rejection.
+            if (root.layout != static_cast<
+                    cpu::native_quantised::CPUNativeQuantisedLayout>(
+                    format.identity.cpu_endpoint_layout) ||
+                root.N_padded != format.N_padded || root.blocks_per_row != format.blocks_per_row ||
                 root.encoding != format.cpu_encoding || root.data_stride != static_cast<int>(format.cpu_data_stride) ||
                 root.interleaved_block_stride != format.cpu_block_stride || root.native_interleaved.size() !=
                     uint64_t(format.N_padded / 64) * format.blocks_per_row * format.cpu_block_stride)
@@ -708,6 +729,10 @@ namespace llaminar2
 
         manifest.packing = MoEOverlayRemoteProjectionPacking::
             CpuNativeQuantisedInterleaved;
+        // The transaction inherits the stream's sealed endpoint layout —
+        // the remote manifest never drops or rewrites it.
+        manifest.identity.cpu_endpoint_layout =
+            stream.cpu_endpoint_layout;
         manifest.N_padded = stream.N_padded;
         manifest.blocks_per_row = stream.blocks_per_row;
         manifest.cpu_codebook_id = stream.cpu_codebook_id;
@@ -887,11 +912,13 @@ namespace llaminar2
             .gpu_is_asymmetric = manifest.gpu_is_asymmetric,
             .gpu_has_emins = manifest.gpu_has_emins,
             .cpu_encoding = manifest.cpu_encoding,
-            // Remote-manifest wire semantics: the protocol's CPU bytes are
-            // canonical (a versioned statement; the A3 protocol update
-            // carries the endpoint layout explicitly).
-            .cpu_layout =
-                cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical,
+            // Remote-manifest wire semantics from ABI version 5: the CPU
+            // bytes use the layout sealed in the transaction identity —
+            // never a receiver-side canonical assumption. An unknown byte
+            // is a typed rejection before any stride work.
+            .cpu_layout = static_cast<
+                cpu::native_quantised::CPUNativeQuantisedLayout>(
+                manifest.identity.cpu_endpoint_layout),
             .cpu_data_stride = manifest.cpu_data_stride,
             .cpu_block_stride = manifest.cpu_block_stride,
             .unit_count = static_cast<std::uint32_t>(units),
@@ -944,6 +971,8 @@ namespace llaminar2
         writeLittleEndian(destination, offset, identity.layer_idx);
         writeLittleEndian(destination, offset, identity.expert_id);
         writeLittleEndian(destination, offset, identity.projection);
+        writeLittleEndian(
+            destination, offset, identity.cpu_endpoint_layout);
         for (const auto byte : identity.reserved_identity)
             writeLittleEndian(destination, offset, byte);
         writeLittleEndian(destination, offset, identity.source_participant);
@@ -1028,6 +1057,8 @@ namespace llaminar2
         identity.expert_id = readLittleEndian<std::int32_t>(packet, offset);
         identity.projection =
             readLittleEndian<ExpertTierWeightProjection>(packet, offset);
+        identity.cpu_endpoint_layout =
+            readLittleEndian<std::uint8_t>(packet, offset);
         for (auto &byte : identity.reserved_identity)
             byte = readLittleEndian<std::uint8_t>(packet, offset);
         identity.source_participant =

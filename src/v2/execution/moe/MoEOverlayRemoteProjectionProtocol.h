@@ -59,7 +59,15 @@ namespace llaminar2
         std::int32_t expert_id = -1;
         ExpertTierWeightProjection projection =
             ExpertTierWeightProjection::Gate;
-        std::uint8_t reserved_identity[3]{};
+        /**
+         * The CPU endpoint layout contract this transaction's native wire
+         * bytes use (destination layout for GPU-to-CPU arrival, source
+         * layout for CPU-to-GPU departure). Canonical is zero. From ABI
+         * version 5 the byte is sealed in `manifest_hash`; receivers derive
+         * the device layout from it instead of assuming canonical.
+         */
+        std::uint8_t cpu_endpoint_layout = 0;
+        std::uint8_t reserved_identity[2]{};
         std::int32_t source_participant = -1;
         std::int32_t destination_participant = -1;
         std::int32_t source_world_rank = -1;
@@ -89,7 +97,10 @@ namespace llaminar2
     struct MoEOverlayRemoteProjectionManifest
     {
         static constexpr std::uint32_t kMagic = 0x50524F4Du; // "MORP"
-        static constexpr std::uint16_t kABIVersion = 4u;
+        // ABI 5 seals the CPU endpoint layout into the identity hash and
+        // derives receiver-side layouts from it; earlier manifests did not
+        // carry a layout and are rejected before any field is interpreted.
+        static constexpr std::uint16_t kABIVersion = 5u;
         static constexpr std::size_t kWireBytes = 244u;
 
         std::uint32_t magic = kMagic;

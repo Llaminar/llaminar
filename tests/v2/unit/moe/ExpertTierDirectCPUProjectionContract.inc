@@ -579,7 +579,7 @@ TEST(ExpertTierWeightStream, EndpointLayoutContractSelectsGpuConversionAndReject
             ExpertTierWeightProjection::Down, 2);
         std::string error;
         ASSERT_TRUE(stream.valid(&error)) << error;
-        EXPECT_EQ(stream.reserved_identity[0],
+        EXPECT_EQ(stream.cpu_endpoint_layout,
             static_cast<uint8_t>(canonical));
         EXPECT_EQ(stream.cpu_data_stride, sections.payload_stride);
         EXPECT_EQ(stream.cpu_block_stride, sections.block_stride);
@@ -642,14 +642,25 @@ TEST(ExpertTierWeightStream, EndpointLayoutContractSelectsGpuConversionAndReject
         // not admitted yet, so validity fails on the section-table lookup
         // itself, for the manifest and the device layout alike.
         auto unimplementedCarried = stream;
-        unimplementedCarried.reserved_identity[0] =
+        unimplementedCarried.cpu_endpoint_layout =
             static_cast<uint8_t>(compact);
         EXPECT_FALSE(unimplementedCarried.valid(&error));
         EXPECT_FALSE(unimplementedCarried.deviceLayout().valid());
         auto unknown = stream;
-        unknown.reserved_identity[0] = 7;
+        unknown.cpu_endpoint_layout = 7;
         EXPECT_FALSE(unknown.valid(&error));
         EXPECT_FALSE(unknown.deviceLayout().valid());
+
+        // Version-4 seal control: a compact byte carried with a correctly
+        // recomputed hash still rejects — the layout is sealed identity,
+        // and its unimplemented section tables fail closed. No hash can
+        // admit a layout whose sections do not exist; equally, no equal-
+        // stride layout substitution can replay a sealed stream.
+        auto resealedCompact = stream;
+        resealedCompact.cpu_endpoint_layout =
+            static_cast<uint8_t>(compact);
+        resealedCompact.manifest_hash = resealedCompact.computedHash();
+        EXPECT_FALSE(resealedCompact.valid(&error));
 
         // CPU-to-GPU names the source layout from the weights themselves,
         // and the reference round trip reproduces the same sections the
@@ -664,7 +675,7 @@ TEST(ExpertTierWeightStream, EndpointLayoutContractSelectsGpuConversionAndReject
         const auto promote = makeCpuToGpuExpertTierWeightStreamManifest(
             cpu, 5, 0, 1, ExpertTierWeightProjection::Down, 2);
         ASSERT_TRUE(promote.valid(&error)) << error;
-        EXPECT_EQ(promote.reserved_identity[0],
+        EXPECT_EQ(promote.cpu_endpoint_layout,
             static_cast<uint8_t>(cpu.layout));
         const auto promotion = promote.deviceLayout();
         ASSERT_TRUE(promotion.valid());

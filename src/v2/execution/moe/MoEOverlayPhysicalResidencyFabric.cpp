@@ -3268,6 +3268,11 @@ namespace llaminar2
                 source.is_asymmetric != destination.is_asymmetric ||
                 source.is_superblock != destination.is_superblock ||
                 source.encoding != destination.encoding ||
+                // The prepared layout is compatibility identity: two
+                // participants executing different layouts over equal
+                // strides are not byte-compatible, so the layout travels
+                // with the wire identity and joins this check.
+                source.layout != destination.layout ||
                 source.data_stride != destination.data_stride ||
                 source.interleaved_block_stride !=
                     destination.interleaved_block_stride ||
@@ -6120,14 +6125,14 @@ namespace llaminar2
                                     if (!source_format)
                                         throw std::runtime_error(
                                             "ExpertOverlay remote GPU source lost catalogued provenance");
-                                    // The CPU destination is remote: v3
-                                    // wire semantics keep the byte contract
-                                    // canonical until the A3 protocol
-                                    // version carries the recorded endpoint
-                                    // layout. This is a versioned protocol
-                                    // statement, never a compiler-host probe;
-                                    // the receiver's Exact manifest match
-                                    // rejects any disagreement.
+                                    // The CPU destination is remote: the
+                                    // v4 stream seals this endpoint layout
+                                    // and the ABI-5 remote manifest carries
+                                    // it in the transaction identity, so
+                                    // the receiver derives the layout from
+                                    // the sealed byte — never a compiler-
+                                    // host probe, and the Exact manifest
+                                    // match rejects any disagreement.
                                     const auto probe =
                                         makeGpuToCpuExpertTierWeightStreamManifest(
                                             *source_format,
