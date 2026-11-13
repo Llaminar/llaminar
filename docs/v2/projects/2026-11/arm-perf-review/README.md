@@ -4827,3 +4827,31 @@ Main's classification; discriminator+install3 in the narrative;
 the 6ceae8219 TIMEOUT fix is in this tree -> driver should pass
 inventory validation). Pending: sparks seal + WSL x86 03480D07E ->
 pins A3-fixup/A4 -> Gate-A.
+
+### WSL: byte-identity + aa842a1be seals; T' gate building (20:48Z)
+
+K14-STAGEAGATE-X86-PREPARED-BYTE-IDENTITY (9f1ed7d2…): base
+d5e04fdce vs aa842a1be, 21 formats x 2 geometries, production
+packer, seed-42 => ALL 42 native_interleaved prepared byte streams
+BYTE-IDENTICAL + 42/42 scalar fields identical; x86 selector stays
+canonical on every tested format/geometry; versioned wire excluded
+(A3 legit). BYTE IDENTITY RE-RUN AT T' REQUIRED (A2-R1 touches
+ExpertTierWeightStream.cpp packing path; head-side re-verify after
+the T' gate). K14-STAGEAGATE-X86-AA842A1BE (da7c3a5f…): BUILD OK,
+DRIVER_RC=8, failed-set=41 (12 unit + 25 host + 4 exclusive; 0
+cuda/0 rocm socket). Split: (a) known WSL baseline classes
+(CPUStartupAffinity, PrefixCacheShutdownMPI_8, CPURootedGather x2,
+ShmemSpinBackend_NP8, MemoryPlanner, OneDNNBuildLifecycle infra);
+(b) NEEDS-DELTA MoE/prepared-layout classes with verbatim
+diagnostics (MoEPipelineFixedMemory:510 = A4 cross-ISA refusal text
+vs expected PhysicalMemoryCapacityExhausted; OverlayCapacity
+Resolver:867 expected-throw-got-nothing; OverlayDistributed
+ResidencyProtocol:697 implemented-section-tables; OrcConfigDoc:342;
+AutomaticPlanningDiagnostics family = develop-control; ExpertTier
+EndpointLayoutIdentity / CPUTensorTP1PreparedStaticReplay /
+CPUExpertShardAccounting / CPUJoint* = base delta). ALL 41 exist at
+base => none newly added; inherited-vs-new = base control +
+develop-control (queued: base d5e04fdce retry, develop-control
+@118930745). T' head gate building (armq-a512-03480d07e, 411/2779,
+-j5). NOT pre-classified; verbatim diagnostics for the Gate-A
+review.
