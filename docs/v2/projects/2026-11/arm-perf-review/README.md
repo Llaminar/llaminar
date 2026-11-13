@@ -2904,3 +2904,22 @@ less: IQ2_S u64 grid 8 lanes/lookup cheaper than the measured IQ3_S
 grid), cost +10GB against the byte goal. Evidence gate: measured
 expert-FFN stage share at decode; dead if the share is small. NOT part
 of this plan. Awaiting the reviewer's six answers to fix the plan.
+
+### REVIEWER #212 PROGRESS (00:25Z): L1 read-set argument structurally sound; two ACTIVATION GAPS -> Phase-1 entry items 1-2
+
+(1) ExpertTierWeightStream.cpp ~:755-762 copyCPUEncodedColumn: CMS
+encoding-only logic copies 2x u16 planes + u32 emins at
+data_stride+4*columns — with IQ2_S compact (data 768, stride 1024) the
+emins access lands OUTSIDE the trimmed unit (partial/rectangular tier
+paths; full-unit memcpy hides it). Fix: derive planes from
+PreparedUnitSections (emins = has_emins/Q2_K only). (2)
+WindowPacking.inc :178-183 emins written unconditionally; :208-210
+compensation written unconditionally — safe under canonical Phase 0,
+must be presence-guarded before compact activation. Regressions: (a)
+mixed-stride partial/rectangular tier copy (IQ2_S + Q2_K side by side);
+(b) packer section-presence checks. GENERAL PHASE-1 RULE: every writer
+and copier derives section presence/offsets from PreparedUnitSections;
+no encoding-only assumption survives. Entry list now 0 (zero-stride
+fail-closed), 1 (tier-stream copy), 2 (packer presence guards). Lane
+informed + holding. Final reviewer report pending (separates activation
+gaps from the Phase-0 division defect).
