@@ -74,6 +74,8 @@ EXEMPT_SITES: dict[tuple[str, str], str] = {
         "one-time model load work",
     ("src/v2/planning/PlanningMemoryBandwidthMeasurement.cpp", "measure"):
         "planning-time bandwidth measurement outside execution",
+    ("src/v2/planning/AutomaticOrchestrationPlanner.cpp", "select"):
+        "planning-time candidate admission worker team outside execution",
     ("src/v2/execution/moe/MoEExpertWeightService.cpp", "prepareGemmEngines"):
         "expert GEMM engine preparation at graph build",
     ("src/v2/kernels/cpu/gemm/CPUNativeQuantisedWindowPacking.inc", "appendNativeWeightGroups"):
