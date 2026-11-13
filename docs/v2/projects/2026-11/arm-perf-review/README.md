@@ -4855,3 +4855,32 @@ develop-control (queued: base d5e04fdce retry, develop-control
 @118930745). T' head gate building (armq-a512-03480d07e, 411/2779,
 -j5). NOT pre-classified; verbatim diagnostics for the Gate-A
 review.
+
+### MAIN: bucket-(b) = CHAIN-INTRODUCED; TRIAGE TASK dispatched; T' not final (20:49Z)
+
+Main's classification: WSL aa842a1be bucket (b) = chain-introduced
+until proven otherwise; start NOW. Evidence: Main's canonical base
+d5e04fdce ARM run (.80, 3569 tests) had EXACTLY 6 reds (4 ROCm
+trainer + CPURootedGather + ShmemSpinAbsorbingAbort) — NONE of
+MoEPipelineFixedMemory / MoEOverlayCapacityResolver /
+MoEOverlayDistributedResidencyProtocol / OrchestrationConfigDocument
+/ ExpertTierEndpointLayoutIdentity / CPUTensorTP1PreparedStaticReplay
+/ CPUExpertShardAccounting / CPUJoint* failed at base; ISA-neutral
+=> A3/A4 chain broke them; lane's Mac gates never ran these suites
+= RECORD-arity slip class. CONCRETE LEAD (source-confirmed):
+MoEOverlayCapacityAdmission.cpp:579 throws uniform-layout refusal
+whenever a CPU-budget plan lacks resolved_cpu_prepared_layout; ONLY
+bindMoEExpertOverlayPlanToClusterInventory sets it; other producers
+(MoE PIPELINE :876 per-stage, authored/apply paths, fixtures) leave
+nullopt => **PP+CPU production refusal = functional regression**.
+Required: find EVERY plan producer; route through the binder's
+observation OR set from live inventory with the SAME uniformity
+refusal; DO NOT weaken to a silent default. LANE TASK: one triage
+commit-set on bba1eafe5 (root-cause each: production regression /
+legit fixture need / intentional contract change w/ justification);
+compile AND RUN affected suites on Linux (Mac probe insufficient;
+.80 free for the triage runs); pull WSL verbatim lines (requested);
+sparks' 03480d07e seal = confirmation. GATE CONSEQUENCE: T' NOT
+FINAL; 03480d07e seal = early surface; Gate-A binds to the TRIAGE
+tip. Dispatched: lane (full spec), WSL (verbatim lines), sparks
+(early-surface semantics + verbatim bucket-(b) lines).
