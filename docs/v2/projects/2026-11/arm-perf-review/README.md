@@ -3095,3 +3095,29 @@ symlink candidate / official option / hold]); sparks holds .79 at
 unaffected. BROADER FLAG: post-merge spark-side full-suite runs on
 develop hit this until fixed. Artifacts: .79 /home/factory/idea25/
 {a1h.sh, a1h-cfg.log}.
+
+### BASE-FINDING CORRECTION + A1 REVIEWER INTERIM FIX-FORWARD (02:22-02:24Z)
+
+CORRECTION (Main diagnosis accepted, supersedes coordinator prune
+suggestion): the .79 configure FATAL was ENVIRONMENT — absent
+external/cnpy, network-none configure clone fails with only a WARNING,
+silently skipping the Qwen35MoE parity block incl. EIGHT preflight
+members; the guard at :38323 then correctly FATALed (it worked as
+designed — caught a silent preflight-coverage drop). Real defect =
+cnpy-missing downgrades to WARNING when preflight members depend on it
+(fix: hard configure error, or vendor cnpy like onednn) — base/develop
+issue for the base owner, NOT the lane, NOT PR #43, NOT the guard.
+Sanctioned unblock: sparks copies cnpy into the tree (the .80 campaign
+copy), ZLIB check, re-configure at 94679834d — resumed. BASE-OWNER
+RECORD: any network-none full-suite configure on develop silently
+drops preflight coverage until fixed.
+A1 REVIEWER INTERIM (bounded, continuing): REAL fail-closed gap —
+DeviceLayout::valid() (:284-295) compares strides vs layout helpers but
+never requires valid/nonzero sections; attack = Q8_0 + CompactA64 +
+both strides 0 -> valid() TRUE while cpuStorage().valid() false
+(authorities disagree; CUDA validChunk ~:955-959 + ROCm ~:941 trust it
+-> zero chunk capacity accepted). FIX dispatched to lane: derive
+PreparedUnitSections once in valid(), require isValid() before any
+stride comparison (one authority); regression = device-free negative
+(zero-stride compact rejected; DeviceLayout/cpuStorage agreement across
+21 formats x 2 layouts); A2 rebases onto the fix.
