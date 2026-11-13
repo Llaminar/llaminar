@@ -3777,3 +3777,22 @@ same fix in the ROCm counterpart (CI-compile-only — correct by
 inspection); do NOT weaken the assertion to 128 (partial window
 with exact whole blocks is the point). Sparks re-runs the 2 CUDA
 cells (+full set if cheap) at the fixed tip; A2 pin waits on green.
+
+### A2-B2 FIXUP 1f92dca1c (11:47Z): reading (a) confirmed; re-runs dispatched
+
+Chain: d0b43d81b -> 1f92dca1c (A2-B2, 3 files +66/-4 test/inc) ->
+17789eb05 (A3 rebase) -> 0a80edd6a (§8 doc). Two stray fragments
+carried the 128 (target projection columns=128 + destination root
+K=128/blocks_per_row=4); fix per Main's spec (target 64,64; root
+K=64/bpr=2; assertion KEPT; derived quantities consistent: units=2,
+block_stride 1792; ROCm mirrored). Teeth demo: bad construction
+fails exactly as the boundary did. Blind-spot closure: device-free
+mirror PartialQ6WindowGeometryPinsLiveRowsAndTwoWholeBlocks (host
+contract .inc via production APIs; pins geometry incl. chunk totals
+{12,37,64}). Gates: 4/4 + 5/5 + probes 0 errors + 12/12 + 297/297 +
+full rebuild 0. RE-RUNS dispatched: in-flight 848030067 completes
+(diagnostic; 2 reds expected) -> A2 binding at 1f92dca1c (K14-
+A2CUDAB-1F92DCA1C) -> A3 binding at 17789eb05 (K14-A3CUDAB-
+17789EB05); strict-tip rule both. Pin asks to Main: spec-conformance
+OK on 1f92dca1c + mechanical-rebase confirm for 17789eb05; pins fire
+on green + OKs. A4/A3-B1 continues on the new tip.
