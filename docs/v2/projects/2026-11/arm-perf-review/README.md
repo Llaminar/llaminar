@@ -3056,3 +3056,17 @@ folded. Routed to Main (review + pin, parallel with A2). A2 DISPATCHED
 :502-506/:557-585; ROCm :552-558/:657-666/:775-779/:828-870 incl. IQ3_S
 absolute offset; manifest target-layout contract; typed conversion not
 fallback; CPU<->CPU mismatch rejects).
+
+### A1 MAIN REVIEW OK + HANDBACK RUN BOOKED (02:08Z)
+
+Main review: critical copier verified (copyCPUEncodedColumn walks
+comp/scales/secondary/emins from cpuSections(); canonical plane offsets
+unchanged incl. CMS emins at 4xcolumns; strides layout-derived;
+descriptor equality includes layout). Reviewer pin routed. STANDING
+RULE applied (Main): lanes compile AND RUN Linux-only test binaries
+natively before handback — sparks booked for the focused A1 handback
+run at 94679834d (~25min: GCC14 Integration NEON_I8MM, moe unit target
+with ExpertTierDirectCPUProjectionContract + prepared-layout +
+expert-tier stream tests, JUnit; seal K14-A1HB-94679834D). WSL x86
+takes the same set at the Stage-A gate. A2 parallel-approved on
+94679834d; rebase if A1 needs a fix.
