@@ -3288,3 +3288,34 @@ v8 hashed field + receiver stride re-derivation + carried identity
 offsets + ResidencyFabric layout) with Main's constraint: nothing
 hard-coded beyond the v8 promotion until the A2 pin ACKs; A3 rebases
 if the reserved-byte seam changes.
+
+### A2 STOP-AND-FIX + A1 BINDING 7/10 + WSL INVENTORY (03:50-03:53Z)
+
+A2 STOP-AND-FIX (reviewer, Main-confirmed): REAL current-canonical Q6_K
+partial-unit regression at 85ddd8572 — CUDA :468/:653 + ROCm :749/:935
+replaced literal 16*columns (Q6 high-bit tail start after the 16B/col
+LOW-nibble plane) with cpu_wire_payload_per_column*columns (=24 for
+Q6) -> high bits at 24C..32C instead of 16C..24C, overlapping scales
+(24C)/mins (26C), 4C past the 28C unit end; only PARTIAL/rectangular
+Q6 transfers hit (full units take the bitplane path — masked by
+full-unit tests). Fix: Q6 low/high split = payload-format property —
+dedicated Q6 high-plane quotient or literal 16 + static_assert; audit
+ALL other A2 literal replacements; mandatory partial/rect Q6_K round
+trip (cols 12+37) host-ref + plane-address equality both directions.
+A2 CUDA boundary run CANCELLED at 85ddd8572 (re-fires at fixup tip).
+A1 BINDING SEAL K14-A1HB-9222E9C7A-20261113 = HONEST 7/10: the
+fixup's core GREEN (DirectCPUProjection red->green across 946->9222;
+prepared-layout, stream unit, ProjectionPieces pass) but the SAME 3
+instant-RED (RectangularRemoteProtocol, GpuArrivalProjectionContract,
+NativeCPUCompactProtocol — same binary as passing cases, Linux-moe-
+tree cases never run on Mac, green in .80 canonical campaigns at PR-
+tip lineage). A1 NOT handed back until resolved. sparks capturing
+verbatim assertions (2 min); lane diagnoses (suspected A0/A1
+admission-strictness vs legacy fixtures — diagnose from verbatim).
+WSL INVENTORY: no ROCm SDK/GPU (distro nvcc 12.0 not a project
+toolchain); Ryzen 7800X3D 8C/16T AVX-512+VNNI+BF16 31GB; x86 gate
+image exists. ROCm compile/spill = fast-follow CI image build; ROCm
+runtime = hardware-ineligible (stated in PR, not claimed); WSL = x86
+CPU qualification at Stage-A boundary (Integration CPU-only, Unit+
+preflight, x86 prepared-byte identity vs d5e04fdce); CUDA = .79 cu13
+at A2 fixup tip.
