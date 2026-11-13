@@ -4185,3 +4185,27 @@ seals with the gate. Sparks' next report = omission ack + reason,
 the sa.sh diff, both verbatim diagnoses, install2 result +
 discriminator; then HOLD for Main's script pass -> resume at the
 lane's RECORD-fixup SHA. Gate-A range carries both block records.
+
+### RECORD-arity fixup aa842a1be (15:14Z): gate re-targets; both legs re-dispatched
+
+Verified on origin (6 files +181/-4). Option 2 per Main's guidance:
+MEMBERS 20/20; symbolic layout name (enumValues InterleavedCanonical/
+InterleavedCompactA64); Shape kind-1 optional recursion (null ->
+nullopt); additive-optional Reader arm = local_hot_cache precedent
+(absent = pre-A4 doc -> nullopt; schema 13 unchanged); foreigns
+typed-rejected; binder re-checks saved observation vs LIVE uniform
+inventory at apply, mismatch refused BEFORE allocation/weight wire
+(both names + "apply is refused" pinned; ARM plan on x86 = typed
+admission refusal; nullopt installs live observation). 3
+regressions: round-trip both values; absent/null/foreign +
+schema-12; saved-plan live-inventory recheck. Sweep: defaulted ==;
+computedHash :535; RankInventory F1-gated w/ tamper regression;
+R2 re-derivation; no other RECORD-visited struct gained a member;
+the binding itself = the arity check (fails closed; no duplicated
+count). Probe closure w/ teeth: syntax-only TU compile; scratch
+MEMBERS revert reproduces the exact diagnostic; root gap = TU was
+a header-edit DEPENDENT, not an edited TU; §8 rule = any fixup
+touching a RECORD-visited-struct header runs the probe. Mac gates
+green. BOTH LEGS at aa842a1be: WSL running (base control valid;
+dump tool links); sparks holds for Main's sa.sh pass. Range =
+d5e04fdce..aa842a1be; both block records in Gate-A evidence.
