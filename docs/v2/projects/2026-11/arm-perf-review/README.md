@@ -4209,3 +4209,66 @@ touching a RECORD-visited-struct header runs the probe. Mac gates
 green. BOTH LEGS at aa842a1be: WSL running (base control valid;
 dump tool links); sparks holds for Main's sa.sh pass. Range =
 d5e04fdce..aa842a1be; both block records in Gate-A evidence.
+
+### BASE MERGED; PR #43 REBASED+REPUSHED 1011d0578; NCCL beb2389d7 INCOMPLETE (16:30Z)
+
+OPERATOR (verbatim, 15:37Z): "rebase, base branch finally got
+merged". Base feat/qfn-ngram-continuation landed on develop as
+squash #46 (e6dc6fe37; tree identical to base tip d3d6958b5). PR #43
+auto-retargeted to develop, conflicted; Main rebased onto
+origin/develop 118930745: 235->232 commits, tip **1011d0578** (tree
+aa9b0cafa), pushed, MERGEABLE, body updated. Conflicts: (1) test-
+CMake tail (both endif kept); (2) Test__PlanningKernelServiceCatalog
+GPU guards (mechanical); (3) WorkspaceMemoryEstimator (CPU RoPE
+pricing + develop's expert-service refactor, both kept, ARM lines
+verified identical); (4) SEMANTIC: develop's 18accef1e implements
+Flash Next planning classification itself -> our parallel chain
+DROPPED (28b979ef1, 92a7d717b, code of b9a170357 (docs kept),
+1e731a4e4, Flash-Next parts of bcc43764d; duplicate test gone);
+kept 9c73bda39 ngram mandatory-capacity + numa_nodes fixture
+repair. Proof: per-file ARM delta ca9902d3f..d5e04fdce vs
+develop..candidate = identical except the dropped files. BASE-OWNER
+NOTE: develop prices OutputNorm at 1 compact row vs our b9a170357
+all pre-head rows (planning-cost heuristic, not ARM stability).
+
+.80 main-rb3 canonical at 1011d0578 (3619 tests, 0 skipped, 10
+failed; .80 free again): 6 INHERITED unchanged (4 ROCm trainer +
+CPURootedGatherParallelCopyReplay + ShmemSpinAbsorbingAbortReplay);
+4 NEW develop-interaction, fix-forward follows (1)
+V2_Integration_OpenMPForkNoteSourcePolicy (raw fork in develop's
+AutomaticOrchestrationPlanner.cpp:352); (2)+(3) V2_Unit_ +
+V2_Integration_AutomaticPlanningDiagnostics* (develop's test
+expects CUDA/ROCm planning log lines in CPU-only build); (4)
+V2_Unit_GpuWorkspaceAllocationPolicy RetainedMTPWorkspaceUsesThe-
+CanonicalCapacityAuthority (source pattern gone post-merge).
+
+STAGE-A: idea08 STAYS at aa842a1be on d5e04fdce (Main explicit:
+do NOT retarget; d5e04fdce byte-identity reference valid; lane
+rebases onto 1011d0578 only AFTER the gate verdict with range-diff
++ focused rerun).
+
+NCCL INSTALL2 = INSTALLER FAILED ON GB10 (STOP RULE FIRED; real PR
+#43 finding): install2 progressed DSO + GIN 220 + threads 200/20 +
+shared-file compile PASS, then native-completed-broadcast compile_
+report FAILED verbatim "progress_replay.py actual-body replay
+failed ... line 114 if r.returncode: raise RuntimeError(...)".
+COORDINATOR VERIFICATION (from source): beb2389d7 fixed exactly 5
+signal-expecting replays (addressed/cancellation/rccl_p2p_role/
+slice/work; its own message scoped the then-abort "at the slice
+replay"); **progress_replay.py = the 6th, MISSED** — comment "must
+terminate by SIGILL", probe WTERMSIG==SIGILL :89, :114 run+check;
+GB10 = SIGTRAP -> empty RuntimeError. Family audit: exactly 6
+scripts reference signals; progress = sole remainder; complete fix
+= extend kNativeTrapSignal into progress_replay.py + docstring, in
+PR #43 lineage (Main's ARM-port fix), NOT idea08. Receipt: install2
+wrote none; .79 still holds the stale receipt; progress_replay.py
+IS in the GIN INPUTS digest set -> receipt regenerates at the fixed
+tree. SEQUENCING CALL ROUTED TO MAIN: (A) progress fix into idea08
+as declared dependency-state fixup -> both legs re-target one tip
+(WSL aa842a1be run = partial control); (B) WSL x86 completes at
+aa842a1be (CPU-only, no NCCL proof) + .79 native leg at the post-
+rebase idea08 tip = two named tips. Lean: (A). Sparks holds; sa.sh
+final + CUDA=127 + focus-include verbatim diagnoses owed to Main.
+MERGE-WINDOW: land the progress fix with/before merge (else the
+fleet refresh re-fails on the merged tip); beb2389d7 + progress =
+fleet-wide install-nccl.sh re-run after merge.
