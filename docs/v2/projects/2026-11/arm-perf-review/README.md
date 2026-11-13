@@ -4348,3 +4348,25 @@ noted). Post-Gate-A plan (lane): rebase Stage-A onto 1011d0578 +
 fix-forward, range-diff + focused rerun; parked until verdict.
 Chain: d5e04fdce -> ... -> 609638aba -> aa842a1be -> 91e0437c6 (T);
 PR: 1011d0578 -> 31dd1f7ee.
+
+### Sparks diagnoses + sa.sh relay gap (16:39Z)
+
+Sparks submitted (c) first: final sa.sh description + VERBATIM
+diagnoses: CUDA=127 = binary never linked (BUILD failed at the
+RECORD-arity defect -> every test binary absent; absolute path, not
+PATH/binary-name; root = un-gated script continuing past BUILD=1);
+sa-focus include failure = fragment generated only at the END of a
+completed build (post-link) -> arity build failure -> missing ->
+ctest include list references it; same root + un-gated DONE. Coord
+checked .79: on-disk sa.sh = still the OLD 14:36Z version (set -u,
+echo BUILD=?, unconditional DONE) — the literal final script did not
+survive the relay (only the description arrived: set -euo pipefail,
+no tee, per-phase rc via set -e, test -s artifacts (llaminar2 +
+CUDA binary + prerequisites.json + focus JUnit + CUDA filtered
+JUnit), CUDA absolute path, DONE last). Sparks asked to write it
+to /home/factory/idea25/sa-gated.sh for verbatim relay to Main's
+gate-logic review. Diagnoses forwarded to Main as-is. T=91e0437c6:
+sparks CLEARED for (a) discriminator + (b) install3 at the exact
+SHA now (stop rule live); resume (d) still waits on Main's script
+pass. Sequence: a -> b -> c (script to Main) -> d resume -> seal
+K14-STAGEAGATE-91E0437C6-<ts>.
