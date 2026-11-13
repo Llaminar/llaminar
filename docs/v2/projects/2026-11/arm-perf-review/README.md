@@ -4957,3 +4957,22 @@ queue SERIALLY — ONE container at a time on that VM from now on
 (booking rule added to the runbook). DISPATCHED: sparks (.80 spec +
 cross-check confirm), lane (wait/poll/harvest plan + ledger
 continues).
+
+### WSL ROOT CAUSE = HOST CRASH (oversubscription); plan reset (21:55Z)
+
+Qual lane disclosure: T' gate container (armq-a512-03480d07e, -j5/
+28g) + byte-identity dump-tool g++ (same 8-core/31G VM)
+oversubscribed -> CRASHED the host (the 21:10-21:55 kex-stall
+outage = the VM dying, not thrashing). Lane's error, disclosed;
+recovery plan approved: T' rerun -j4 or lower, NOTHING concurrent;
+byte-identity head-side serialized AFTER the gate; reassess
+memfree/containers first. IMPLICATIONS: lane's triage container
+(armq-a512-ba2811e4c, 20:59Z) very likely LOST -> **.80 focused
+ARM triage (sparks @ ba2811e4c) = PRIMARY triage evidence** (ISA-
+neutral; x86 = confirmation via the qual T' rerun at -j4); lane:
+no WSL re-dispatch; poll armed/minimal; harvest-only on recovery;
+ledger continues. RUNBOOK RULE (recorded): WSL = ONE container at
+a time, NEVER concurrent compiles, -j4/28g cap. Bridge back (qual
+message arrived 21:55Z); shell status = unknown until their report.
+Qual queue after recovery: harvest survivors -> T' gate -j4 ->
+byte-identity T' serialized -> develop-control, serial.
