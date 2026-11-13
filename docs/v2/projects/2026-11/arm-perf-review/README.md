@@ -2969,3 +2969,13 @@ native; tiering only for expanded-baseline formats; mirror parked
 share). ROLES: lane single writer from A0; Main supervises + validates
 + owns post-merge PR. A0+A1 DISPATCHED to arm-idea08 (00:35Z); Main
 reports the start to the operator.
+
+### OVERNIGHT WATCH 00:50Z: nominal — Stage A underway, no exceptions
+
+arm-idea08 WORKING on A0 (thinking; ctx 91% — compaction will handle,
+branch+origin carry the state). PR 43 OPEN/MERGEABLE (no merge yet).
+Branch tip still 3b00c69d7 (A0 not yet pushed — 15min in, expected).
+Reviewer idle (#212 delivered+absorbed into the cleared plan). Sparks
+idle, hosts free (.79 0 perf procs; .80 0 containers/0 runs — Q1 seal
+verified+closed earlier). Main idle post-start-report. Next expected
+events: lane A0 checkpoint push -> Main review -> reviewer pin.
