@@ -3762,3 +3762,18 @@ regression = source fix. Fix on the A2 line; A3 (boundary running,
 will show the same 2 = expected) + A4/A3-B1 rebase. A2 pin waits on
 the green re-run; census/witness/full-build seal portions stand; pin
 packages pre-staged.
+
+### A2-B2 DIAGNOSIS (Main, 11:18Z): test-expectation bug; verbatim fix spec routed
+
+The 2 CUDA reds = TEST-EXPECTATION bug in the new Q6 contract (not
+live-extent): source P spans [32,544), target P{...,72,160,64,128}
+spans [64,192) -> intersection 128 = what production correctly
+returned; the comment intends [64,128) = 64-col window but the
+target was built with 128 cols. FIX (Main, verbatim): target
+P{R::ParticipantInputSlice,256,1024,72,160,64,64}; KEEP ASSERT_EQ(
+forward.columns(),64); re-check every derived quantity assuming 64
+cols (oracle cpu_first_column=32, block/guard extents, bytesMoved);
+same fix in the ROCm counterpart (CI-compile-only — correct by
+inspection); do NOT weaken the assertion to 128 (partial window
+with exact whole blocks is the point). Sparks re-runs the 2 CUDA
+cells (+full set if cheap) at the fixed tip; A2 pin waits on green.
