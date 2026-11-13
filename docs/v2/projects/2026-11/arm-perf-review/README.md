@@ -5010,3 +5010,14 @@ base control discriminates on x86). Root-cause ledger = in
 ba2811e4c's commit message (all classified). Lane poll-only; WSL
 harvest (fresh OUT/rc/JUnit) report pending. .80 runner spec
 unchanged (regex, --no-tests=error, JUnit, gated pattern, one job).
+
+### Lane at rest; .80 result = the only outstanding input on its side (21:57Z)
+
+Lane confirmed: no WSL re-dispatch; poll armed; no launches; VM =
+qual serial queue; its 20:59Z triage container written off; .80
+focused ARM triage (sparks @ ba2811e4c) = PRIMARY evidence; x86
+confirmation = qual T' rerun -j4 serialized. Mac baseline at
+ba2811e4c: worktree clean; 12/12; 297/297; RECORD probe PASS;
+A3-B1 DI probe green; 4/4; 5/5 (affected suites are Linux-only —
+standing rule; Linux evidence via .80 now). Ledger in the commit
+message. Lane idle pending the sparks/.80 result.
