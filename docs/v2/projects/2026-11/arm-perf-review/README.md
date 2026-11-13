@@ -3160,3 +3160,25 @@ cfg log), not the stale first-attempt file. Lane: A1 fixup in progress
 (tip still 94679834d, ~30min in, expected). PR 43 OPEN. Sessions
 nominal (reviewer mid-A1-final processing; Main idle; sparks on the
 build).
+
+### A1 FIXUP d8eff03bd (03:10Z): coordinator+Main verified, reviewer pin routed, binding handback GO
+
+Single fixup on 94679834d (6 files +300/-48). A1-1 sections-first
+validity both directions + manifest valid() fix; regression FAILS
+pre-fix (detects the zero-stride attack via both authorities, 21
+formats x 2 layouts; promotion sweep = 19 formats — CpuToGpu does not
+admit symmetric CMS sources IQ2_XXS/IQ3_XXS, documented). A1-2
+preflight via existing filter. A1-3 complete — periodic fill PROVEN
+vacuous (rebuilt with index*41+7, wrong-K-origin control fails);
+destination-sized + valid-copy-then-flip; canonical-preservation
+relabel; quoted_chunk_bytes. Docs: v7-exactly global, direction-
+precise contract, Q8_1 36B-block correction, overclaims dropped;
+carried A3 items in §8. Evidence: layout 10/10, portability 297/297,
+tier runner 3/3 vs REAL production stream source, tile-register 5/5.
+A2 reapplied cleanly on the fixup (10/10 combined; remaining: ROCm
+sites incl. IQ3_S absolute offset :828, CPU->GPU manifest contract,
+fabric callers, endpoint-conversion regression). Main review OK; pin
+with reviewer. Binding handback GO at d8eff03bd (JUnit scope per Main:
+V2_Integration_ExpertTierDirectCPUProjection 3 cases + prepared-layout
+10 + expert-tier stream unit, all --no-tests=error); 94679834d run =
+environment-only label.
