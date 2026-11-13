@@ -3960,3 +3960,37 @@ run. A3 diagnostic seal K14-A3CUDAB-DIAG-848030067 recorded (20/22,
 for the Stage-A gate at the combined tip (75G free). REMAINING:
 reviewer final A3 verdict -> ONE combined fixup (F1+F2+R1+R2+final
 +env-gate) -> Stage-A gate once.
+
+### A2 PIN = filtered invocation; A3 FINAL R1-R5 -> COMBINED FIXUP SCOPE ROUTED (13:04Z)
+
+A2 PIN (Main, option (b)): the skip is a BASE test (d5e04fdce,
+preflight member, GTEST_SKIPs on one CUDA device); no env-gate to a
+base registration (ROCm already splits per-gtest ~28950 = base
+policy). Sparks dispatched: rerun at 1f92dca1c with --gtest_filter
+excluding ONLY SecondaryDeviceRemoteProjectionRestoresOwningDevice-
+BeforeRepack; record verbatim "other 26 pass; secondary-device case
+hardware-ineligible = UNQUALIFIED"; pin on green. Base observation
+(single-GPU hosts trip the whole-binary CUDA registration) recorded
+for the base owner.
+
+A3 FINAL (reviewer, SOURCE HOLD): R1 confirmed (sections-before-
+strides both builders + canonical control); R2 expanded (storage
+layout carries .cpu_layout BOTH projections; drives chunk cursor
+:1238/:1271 + destination admission Transport:323-334; test flips
+EXPECT_FALSE, chain decode->storage->cursor->destination); R3
+archive scale-tuple helper: sections own strides, keep semantic
+checks, pre-v7 untouched; R4 chunkComp guards at admitted boundary
+(malformed source/encoding separate from valid-Q6 absence); R5(i)
+corrected remote test into EXISTING preflight selections (~1939,
+no new gate), (ii) hash controls discriminate hash-removal (same
+fixture layout-only change => hash differs; stale vs resealed-
+structural; real wire encode/decode), (iii) archive: direct
+allocateTransferTarget positive + v7/v6/v9 negatives (prefer adding
+vs truthful Q4_0-only scope). DOC TRUTHFULNESS: archive has NO hash/
+seal (versioned tag + stride validation — fix wording); v3->v4 wire
+bytes NOT identical (fix comment); copier offsets claim overstated
+(dense plane ordinals remain — L1-geometry-true + carried). CARRIED
+(not this fixup): fabric remote demotion canonical + zero-default
+transaction layout — check 569de492b coverage or list. Reviewer:
+A3-fixup pin + A4 pin then Stage-A gate on the combined tip; #212/
+#213 updated; bounded ACKs preserved; no grants.
