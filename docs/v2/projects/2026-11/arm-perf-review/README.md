@@ -3244,3 +3244,25 @@ A; remaining section-offset/owner contracts (A3 list); A2, A3
 NOT transfer to A2. HANDBACK FORMULA: this ACK + sparks' green binding
 Linux seal K14-A1HB-9222E9C7A = A1 handed back. Lane continues A2
 (pin to Main when ready).
+
+### STAGE-A A2 CHECKPOINT 85ddd8572 (03:46Z): coordinator-verified, routed to Main; A3 staged
+
+17 files +507/-82 on 9222e9c7a. Endpoint-layout GPU conversion chain
+complete: wire planes derived once from CPU endpoint section tables
+(fail-closed); valid() re-derives+compares, gpu_has_emins requires a
+representing plane (typed conversion); ABI: struct 88B,
+MappedTransferPackedWork 128/128 vs 16-word budget (compiled
+static_assert — no growth without ABI bump). Manifest reserved byte 0
+carries layout (GPU->CPU destination / CPU->GPU source-from-weights);
+canonical=0 => wire unchanged; byte outside v3 seal; A3 v8 = promotion
+seam. All cited CUDA+ROCm sites consume derived planes with presence
+guards (incl. IQ3_S absolute offset :828); residual offset scan clean;
+canonical values numerically identical. Regression: 6 kernel families,
+preflight-registered; manifest callers thread explicitly; host-ref
+round trip byte-exact. Mac: layout 10/10, tier runner 4/4 (real
+production sources), portability 297/297, tile 12/12, ABI compiled
+check. OPEN at Main: (1) A2 Linux boundary (CUDA compile .80; ROCm
+.hip location; integration suites), (2) A3 dispatch timing (held for
+A2 review — manifest-seam coupling). Lane stages A3 design (v8
+promotion + hash inputs + receiver stride re-derivation + carried
+identity items). A1 binding handback at 9222e9c7a running in parallel.
