@@ -3453,3 +3453,18 @@ residency; K14-A3CUDAB-C7AFB6EAE). Main unresponsive 48m re A1
 acceptance + A2 review (two pings) — momentum dispatch under
 standing authorization; pin routing stays Main's; morning flag if
 still silent.
+
+### A2 BOUNDARY BLOCKED (06:26Z): real g++-14 compile defect — fix-back to the lane
+
+A2 build at 433e84632 (cu13 CUDA sm_121) fails: NativeQuantisedFormat-
+Info.h:115 defaulted operator== ill-formed under g++-14 (member type
+non-comparable); 4 TUs. Evidence: .79 a2b-build.log (391/454). Mac
+clang syntax-pass vs Linux g++ reality again. DECISION: lane fix-
+forwards on the A2 line (fix the member comparability, not delete
+the ==) -> new A2 tip; A2 pin moves there (never routed — Main's
+build rule held it for exactly this). A3 rebases. Strict exact-tip
+runs: A2 boundary at fixed tip (K14-A2CUDAB-<fixed>), then A3
+boundary at rebased tip (ccache makes it cheap); queued c7afb6eae
+build SUPERSEDED (carries the same defect). A1 completion sealed
+green stands. Sparks holds, no source edits (correct); a2b logs =
+defect evidence for the reviewer.
