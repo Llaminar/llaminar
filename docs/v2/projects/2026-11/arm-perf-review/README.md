@@ -4370,3 +4370,35 @@ sparks CLEARED for (a) discriminator + (b) install3 at the exact
 SHA now (stop rule live); resume (d) still waits on Main's script
 pass. Sequence: a -> b -> c (script to Main) -> d resume -> seal
 K14-STAGEAGATE-91E0437C6-<ts>.
+
+### Main 16:40Z: diagnoses accepted; PR 873cf4f2b; develop-control dispatched to WSL
+
+SPARKS DIAGNOSES ACCEPTED (Main): CUDA=127 + sa-focus include both
+downstream of BUILD=1; no separate defect. sa.sh: Main waits for
+the literal sa-gated.sh text; resume waits on his pass; install3 at
+91e0437c6 cleared (already dispatched). PR #43 tip = 873cf4f2b
+(verified on origin), pushed: OpenMP fork-note NAMED EXEMPTION for
+develop's AutomaticOrchestrationPlanner::select — our checker
+meets develop's planning-time team; checker green + 13 negative
+controls pass. REMAINING 3 NEW REDS = develop-inherent (candidate):
+(a) V2_Unit_GpuWorkspaceAllocationPolicy RetainedMTPWorkspaceUsesThe
+CanonicalCapacityAuthority — PROVEN STATICALLY: source-text test;
+test file AND DeviceGraphOrchestrator::bindShiftedMTPPrefill-
+Transaction byte-identical between develop 118930745 and our tip;
+the required literal "declaration_only&&retainsMTPGraphCapacity(...)"
+occurs in NEITHER (develop passes requiresMTPGraphTransactionBinding
+as an argument) => fails on develop on every ISA. (b) Unit_ +
+Integration_AutomaticPlanningDiagnostics* — develop's test forbids
+"[MoEOverlayCapacity] fixed component BOM device=" at DEBUG, but
+develop's OWN MoEOverlayLocalCapacityPlanner.cpp:1213 emits exactly
+that at LOG_DEBUG (unchanged by us) => LIKELY develop-inherent,
+behaviour-dependent => control needed. NOTE: develop #46 merged with
+Unit+host (AVX2/AVX512) FAILED (admin bypass) — develop red today.
+.80 cleaned + free. WSL DEVELOP-CONTROL DISPATCHED (after its
+Stage-A leg): origin/develop 118930745, Integration CPU-only
+AVX512, build only v2_test_automatic_planning_diagnostics +
+v2_test_gpu_workspace_allocation_policy, ctest -R the three,
+JUnit + verbatim failures. Same reds => inherited -> base owner
+evidence; green => ours -> Main fixes in PR. (Main's note:
+develop can't configure NEON_I8MM — that's the PR's port; control
+is legitimate on AVX512 x86.)
