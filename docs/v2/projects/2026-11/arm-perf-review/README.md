@@ -3215,3 +3215,20 @@ JUnit+ctest artifacts: .79 /home/factory/idea25/a1h-results/. d8eff03bd
 build NOT started (correct hold); sparks waits for the FINAL tip after
 the reviewer's second narrow fixup, then runs the exact Main scope
 (--no-tests=error) and seals K14-A1HB-<tip>-<ts>.
+
+### A1 SECOND FIXUP 9222e9c7a (03:25Z): Main+coordinator verified; binding handback GO; A2 resumed
+
+Test-only 2 files +43/-43 on d8eff03bd. Wrong-section control rebound
+to the exact copied coordinate (n=76/col 12/K1) with real element
+widths (CMS 4B emins vs same-column 4B first payload-group word =
+1280/period-256 alias witness; Q8_0 2B at the same coordinate); :250-253
+claim corrected. Invented promotion exclusion removed (all 21 formats
+both directions; dead duplicated-demotion branch + promotion_admitted
+gate deleted; 42 canonical positives pass). Evidence: layout 10/10,
+tier runner 3/3 vs production sources, portability 297/297. Main diff
+check OK; reviewer pin routed. BINDING HANDBACK GO dispatched to
+sparks at 9222e9c7a (Main scope: DirectCPUProjection 3 + prepared-
+layout + expert-tier stream, --no-tests=error, JUnit; seal K14-A1HB-
+9222E9C7A-<ts>; cross-check: the 3 env-run failures must pass). A2
+resumed on the new tip (second stash popped; manifest endpoint-layout
+parameter settled; v3 wire canonical-bytes until A3 v8).
