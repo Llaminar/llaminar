@@ -4325,3 +4325,26 @@ then sequenced post-merge (idea16 integration still coordinated).
 Standalone proofs (/tmp/i08_standalone_proof.py, i08_fixforward_
 proof.py, i08_fixforward2_proof.py) = all PASS, regenerable, live
 only on this host (worktree dies with the session; branch safe).
+
+### T = 91e0437c6 LANDED + VERIFIED; ALL LEGS DISPATCHED (16:26Z)
+
+Lane reported T; coordinator verified from origin: aa842a1be..
+91e0437c6 == exactly scripts/docker/native-completed-broadcast/
+progress_replay.py; patch byte-identical to PR's 31dd1f7ee; ee66b1ed6
+= docs-only chain-record commit (NOT the gate target; branch tip =
+ee66b1ed6, gate target = 91e0437c6 exact SHA). Lane's own checks
+agree (py_compile PASS, RECORD probe, 12/12, 297/297; staged tree =
+one file). DISPATCHED: sparks (T=91e0437c6: discriminator ->
+install3 canonical cu13, green-verbatim/stop-rule -> sa.sh final +
+CUDA=127 + focus-include diagnoses to Main -> resume gate at T ->
+K14-STAGEAGATE-91E0437C6-<ts>); WSL (finish aa842a1be head gate +
+seal; produce the machine-checked acceptance record: diff == one
+file + CMake consumption proof V2NativeCompletedBroadcastProofTests
+.cmake:18-20 + GIN INPUTS; NO fresh rerun at T — accepted by proof;
+Gate-A names both SHAs); Main (T confirmed; pin set A3-fixup + A4
+at T; Gate-A range d5e04fdce..91e0437c6; merge-window checklist
+names beb2389d7 + 31dd1f7ee; four-failure fix-forward own commit
+noted). Post-Gate-A plan (lane): rebase Stage-A onto 1011d0578 +
+fix-forward, range-diff + focused rerun; parked until verdict.
+Chain: d5e04fdce -> ... -> 609638aba -> aa842a1be -> 91e0437c6 (T);
+PR: 1011d0578 -> 31dd1f7ee.
