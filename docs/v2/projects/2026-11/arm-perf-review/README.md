@@ -3121,3 +3121,28 @@ PreparedUnitSections once in valid(), require isValid() before any
 stride comparison (one authority); regression = device-free negative
 (zero-stride compact rejected; DeviceLayout/cpuStorage agreement across
 21 formats x 2 layouts); A2 rebases onto the fix.
+
+### A1 REVIEWER FINAL (02:30Z): SOURCE HOLD at 94679834d — correction set dispatched as ONE fixup
+
+A1-1 (HIGH) DeviceLayout sections-before-strides both directions +
+agreement regression (already interim-dispatched; lane working it);
+A1-2 tier-copy test into ProductionTestPreflight via existing filter
+(V2CPUFragmentResidencyTests.cmake:89-96, no new gate); A1-3 fixture
+strength (non-periodic content vs the 256-periodic uint8(i*41+7)
+pattern + wrong-K-origin/wrong-section negatives; destination-sized
+extents with succeed-then-flip-only-layout; canonical-preservation
+relabel — IQ2_S/Q2_K both carry emins canonically, absent-emins control
+lands with explicit compact tables pre-Gate-A; expected chunk-byte
+quotes not observed volume). DOC: v7-exactly global (not per-format);
+GPU->CPU destination-layout / CPU->GPU source-layout; Q4_1=NibbleLUT,
+2176B=source only for Q8_0 (Q8_1 36B blocks); drop resident-expert/
+migration overclaims. CARRIED A3/LATER (recorded, not now): copier
+ordinal offsets :781-800; CMS host demotion +0/+128/+256 :1582-1587;
+Q6 reference 1536/1664 :1496/:1501; PackedWeights chunkScales/Mins/Comp
++ owner chunkMins no absence guard; ResidencyFabric
+requireCompatibleCpuWeights :3264-3275 omits layout. Positives: storage
+layout fail-closed, copier canonical-equivalent, producers guarded,
+accessor presence, selector canonical. HANDBACK BINDING RULE (Main):
+JUnit binds to the reviewed fixup tip — sparks' current 94679834d run
+completes as environment/surface validation only (keep artifacts,
+labeled), re-run fires at the fixup SHA on coordinator GO.
