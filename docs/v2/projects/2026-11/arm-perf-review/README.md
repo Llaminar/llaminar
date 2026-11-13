@@ -3146,3 +3146,17 @@ accessor presence, selector canonical. HANDBACK BINDING RULE (Main):
 JUnit binds to the reviewed fixup tip — sparks' current 94679834d run
 completes as environment/surface validation only (keep artifacts,
 labeled), re-run fires at the fixup SHA on coordinator GO.
+
+### STATE AUDIT 02:53Z (exceptions-only): NO exceptions — one observation
+
+.79: handback build LIVE and correct — second configure SUCCEEDED
+(CMakeCache 02:44Z after the cnpy fix) and ninja is building exactly
+the handback targets (v2_test_expert_tier_weight_stream +
+v2_unit_moe_overlay_physical_*), 89 compile procs. OBSERVATION: the
+old a1h-run.log still ends with the FIRST failed attempt's
+"Configuring incomplete" — when sparks reports the seal, verify the
+referenced log/artifacts are the second-attempt set (build-a1h/, new
+cfg log), not the stale first-attempt file. Lane: A1 fixup in progress
+(tip still 94679834d, ~30min in, expected). PR 43 OPEN. Sessions
+nominal (reviewer mid-A1-final processing; Main idle; sparks on the
+build).
