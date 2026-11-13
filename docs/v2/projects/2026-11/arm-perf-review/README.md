@@ -3501,3 +3501,24 @@ green); reviewer held for successor request. MORNING FLAG: if Main
 still silent, the operator report notes the 90m+ unresponsiveness
 (material work unblocked — all evidence produced and stable; only
 pin routing + the A1 word pending).
+
+### A2/A3 COMPILE FIXES COMPLETE (06:59Z): b37537145 + c24673b2a; boundaries dispatched
+
+Corrected chain verified on origin: 433e84632 -> 40cfbaf3e (EQ) ->
+b37537145 (REAL A2 TIP; concrete QuantizedVerifierFormatCase* q6 at
+:103 in BOTH backend .inc files) -> c24673b2a (A3 rebased). Root
+cause class 2: auto*-from-nullptr ill-formed in every std mode; the
+'bytes' error = g++ error-recovery cascade (one root error, not two
+defects). Class 1 re-verified in container mode: the 3 gnu++17 TUs
+compile clean with the EQ fix; defaulted == was their only C++20
+dependency. Reviewer flag: whether prefill/trainer targets gain
+-std=gnu++23 = build-config question, outside the lane. New lane
+gate: host-only syntax probes of both real contract bodies under
+g++-14+clang gnu++20 (would have caught :103 pre-boundary); contract
+TUs are C++20+ by construction (ends_with). Gates at c24673b2a:
+297/297 + 11/11 + 5/5 + probes 0 errors. DISPATCHED: sparks A2
+boundary K14-A2CUDAB-B37537145 (full A2 set + distributed-residency
+binary) then A3 boundary K14-A3CUDAB-C24673B2A (adds full Unit gate +
+archive TU + A3 regressions); verbatim-first reporting enforced.
+Main routing: review targets = b37537145 (A2) + c24673b2a (A3);
+A1 acceptance still pending.
