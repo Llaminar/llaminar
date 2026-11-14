@@ -6337,3 +6337,21 @@ fix the Test__ prefix + add the cap regression name); sparks
 (current runs PROVISIONAL — the 2 registrations vacuous; re-run at
 the successor); WSL (x86 restart held for the fixup SHA). Reviewer
 continues the bounded source/docs check; Main informed.
+
+### Registration fixup 9ba1d4da2 verified; all hosts re-targeted (14:37Z)
+
+Lane: CMake-only fixup on 56829099c (verified: CMakeLists.txt
++2/-2) — (1) ResolvedCpuPreparedLayoutDocument filter = exact names
+(OrchestrationConfigDocument.ResolvedCpuPreparedLayoutRoundTrips
+LosslesslyAtCurrentSchema + ...ToleratesAbsentNullAndRejectsForeign
+— no Test__ prefix; both tests now selected); (2)
+MoEOverlayCapacityAdmission.TierLegacyCapAndFootprintsPriceThe
+AdmittedLayout added to the existing V2_Integration_MoEPipeline
+StageCapacity filter. No source behavior change. RE-TARGETED:
+sparks (.80 focused + .79 incremental @ 9ba1d4da2; the 56829099c
+runs provisional/superseded; 2 registrations now actually execute);
+WSL (x86 incremental @ 9ba1d4da2; same procedure; then develop
+discriminator). Pins A3+A4+A4-R @ 9ba1d4da2 after green.
+Reviewer informed (blockers closed). Board: one full green sweep
+at 9ba1d4da2 on 3 hosts -> evidence attach -> reviewer verdict ->
+Gate-A.
