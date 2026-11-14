@@ -8,6 +8,8 @@
  * Gate/up and down differ only in immutable descriptor and input-row bindings.
  * Nonzero floors share the same operand staging with a signed Dot4 consumer for
  * cold experts, avoiding a second projection family and directory overwrite.
+ * The wide candidate retains role-specific Dot4 column geometry and executes
+ * independent native column blocks under the same sealed device-owned row plan.
  * No kernel builds routing state, allocates memory or publishes weighted routes.
  */
 #include <hip/hip_runtime.h>
@@ -51,6 +53,7 @@ ScopedMoEGroupedPrefillEngine::ScopedMoEGroupedPrefillEngine(
     case MoEGroupedPrefillEngine::OrderedDot4:
     case MoEGroupedPrefillEngine::WmmaM16N32:
     case MoEGroupedPrefillEngine::WmmaM16N64:
+    case MoEGroupedPrefillEngine::WideDot4Wmma:
         recording_engine = engine; recording_floor = floor; return;
     }
     throw std::invalid_argument("unknown grouped MoE dot engine");
@@ -324,6 +327,7 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
     }
 #endif
 }
+#include "ROCmMoEGroupedWideWmma.hip.inc"
 #endif
 }
 
@@ -337,6 +341,7 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
         !args.directory || !args.descriptors || !args.output || args.directory_capacity <= 0 ||
         args.rows <= 0 || args.top_k <= 0 || args.n <= 0 || args.k <= 0 || args.k % 32 ||
         args.experts <= 0 || args.device < 0 || !nativeGroupedDevice(args.device) ||
+        ((engine == MoEGroupedPrefillEngine::WideDot4Wmma) != args.dot_admission.rowPlan().isWide()) ||
         (args.input != MoEGroupedWmmaInput::GroupedRows && !args.group_token_indices) ||
         ((args.second_descriptors == nullptr) != (args.second_output == nullptr)) ||
         !args.dot_admission.binds(args.second_descriptors ? MoEPrefillProjectionRole::GateUp
@@ -356,12 +361,23 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
             else grouped_wmma_detail::projection<FMT,BN,false,Adaptive><<<grid,BN*4,0,native_stream>>>(args);
             return hipGetLastError() == hipSuccess;
         };
+        auto wide = [&]<bool Adaptive>() {
+            const int threads = args.second_descriptors ? 256 : 128;
+            const int native_columns = threads / 4;
+            const dim3 grid((args.n + native_columns - 1) / native_columns,args.directory_capacity,args.second_descriptors ? 2 : 1);
+            if (args.second_descriptors)
+                grouped_wmma_detail::wideProjection<FMT,true,Adaptive><<<grid,threads,0,native_stream>>>(args);
+            else grouped_wmma_detail::wideProjection<FMT,false,Adaptive><<<grid,threads,0,native_stream>>>(args);
+            return hipGetLastError() == hipSuccess;
+        };
         switch (engine)
         {
         case MoEGroupedPrefillEngine::WmmaM16N32:
             return args.dot_admission.mayUseOrdered() ? tile.template operator()<32,true>() : tile.template operator()<32,false>();
         case MoEGroupedPrefillEngine::WmmaM16N64:
             return args.dot_admission.mayUseOrdered() ? tile.template operator()<64,true>() : tile.template operator()<64,false>();
+        case MoEGroupedPrefillEngine::WideDot4Wmma:
+            return args.dot_admission.mayUseOrdered() ? wide.template operator()<true>() : wide.template operator()<false>();
         default: return false;
         }
     };

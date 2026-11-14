@@ -36,8 +36,9 @@
  * SwiGLU/ordered publication. Its dot-engine policy is independent of live route
  * admission; sparse replay retains its existing route-owned family.
  * Native row-floor candidates select Dot4 or WMMA inside one consumer using the
- * whole-expert count. Both branches share directory16 and its operand producers;
- * the last partial tile cannot select a different engine for the same expert.
+ * whole-expert count. Microtiles share directory16; the wide candidate binds its
+ * role-specific row plan to both planner and consumer. The last partial tile
+ * cannot select a different engine for the same expert.
  *
  * The long-prefill Dot4 projection kernels expose 64/128/256 output-column lanes and
  * 4/8/12/16-row tiles. Production dispatch comes exclusively from the checked-in
@@ -58,6 +59,7 @@
 #include <hip/hip_fp16.h>
 #include <algorithm>
 #include <cstdint>
+#include <optional>
 #include <type_traits>
 #include <cstdio>
 
@@ -86,6 +88,7 @@ using llaminar2::rocm::ROCmMoEGroupedPrefillRouteStrategy;
 using llaminar2::rocm::MoEPrefillProjectionRole;
 using llaminar2::rocm::MoEGroupedDotAdmission;
 using llaminar2::rocm::MoEGroupedDotProducer;
+using llaminar2::rocm::MoEGroupedRowPlan;
 
 /**
  * @brief Bound publication scheduling independently of captured row capacity.
@@ -1350,9 +1353,9 @@ namespace
  * deterministic, contains no host synchronization, and is safe to capture and
  * replay as part of the full GPU graph.
  *
- * @tparam TILE_M Number of consecutive grouped rows consumed by one projection
- *                 workgroup.
+ * @tparam TILE_M Fixed rows per workgroup, or zero for the sealed wide row plan.
  * @param admission The exact live-family publication also borrowed by consumers.
+ * @param row_plan Complete immutable row policy; the wide consumer borrows the same value.
  */
 template <int TILE_M>
 __global__ __launch_bounds__(kMoEPrefillMaxExperts, 1)
@@ -1361,9 +1364,10 @@ void moe_grouped_build_prefill_tile_directory_kernel(
     uint32_t* __restrict__ directory,
     int num_experts,
     int max_directory_tiles,
-    ROCmMoEGroupedRouteAdmission admission)
+    ROCmMoEGroupedRouteAdmission admission,
+    MoEGroupedRowPlan row_plan)
 {
-    static_assert(TILE_M == 4 || TILE_M == 8 ||
+    static_assert(TILE_M == 0 || TILE_M == 4 || TILE_M == 8 ||
                   TILE_M == 12 || TILE_M == 16,
                   "grouped-prefill sweep supports row tiles 4/8/12/16");
     // A stale directory is deliberately unobservable to the inactive tiled
@@ -1371,6 +1375,8 @@ void moe_grouped_build_prefill_tile_directory_kernel(
     // both the capacity-wide tail stores and the scan's eighteen barriers.
     if (!admission.allows(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled))
         return;
+    if constexpr (TILE_M == 0)
+        if (!row_plan.isWide()) __builtin_trap();
     const int tid = threadIdx.x;
 
     if (num_experts <= 0 || num_experts > kMoEPrefillMaxExperts ||
@@ -1392,7 +1398,9 @@ void moe_grouped_build_prefill_tile_directory_kernel(
             moe_prefill_fail_fast_invalid_grouped_index();
         count = 0;
     }
-    inclusive_tile_counts[tid] = (count + TILE_M - 1) / TILE_M;
+    const int row_step = TILE_M ? TILE_M : row_plan.rows(count);
+    const int expert_tiles = count > 0 ? (count + row_step - 1) / row_step : 0;
+    inclusive_tile_counts[tid] = expert_tiles;
     __syncthreads();
 
     // Hillis-Steele is deliberately used for this tiny 256-element directory:
@@ -1419,10 +1427,9 @@ void moe_grouped_build_prefill_tile_directory_kernel(
     if (tid < num_experts)
     {
         const int first_tile = tid == 0 ? 0 : inclusive_tile_counts[tid - 1];
-        const int expert_tiles = (count + TILE_M - 1) / TILE_M;
         for (int tile = 0; tile < expert_tiles; ++tile)
         {
-            const uint32_t first_row = static_cast<uint32_t>(tile * TILE_M);
+            const uint32_t first_row = static_cast<uint32_t>(tile * row_step);
             directory[first_tile + tile] =
                 (first_row << kMoEPrefillExpertBits) |
                 static_cast<uint32_t>(tid);
@@ -4364,14 +4371,17 @@ bool rocmMoE_grouped_prefill_pipeline(
     const auto dot_policy = llaminar2::rocm::selectedMoEGroupedPrefillPolicy(device_id);
     const auto dot_engine = dot_policy.engine;
     const bool native_wmma = dot_engine != llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4;
-    const auto gateup_dot_admission = native_wmma
-        ? MoEGroupedDotAdmission::nativeCandidate(MoEPrefillProjectionRole::GateUp,
-              intermediate,intermediate,d_model,dot_policy.minimum_expert_rows)
-        : MoEGroupedDotAdmission{};
-    const auto down_dot_admission = native_wmma
-        ? MoEGroupedDotAdmission::nativeCandidate(MoEPrefillProjectionRole::Down,
-              d_model,down_columns,intermediate,dot_policy.minimum_expert_rows)
-        : MoEGroupedDotAdmission{};
+    const auto make_dot_admission = [&](MoEPrefillProjectionRole role, int source_n, int physical_n, int k)
+    {
+        if (!native_wmma) return MoEGroupedDotAdmission{};
+        return dot_engine == llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma
+            ? MoEGroupedDotAdmission::wideCandidate(role,source_n,physical_n,k,dot_policy.minimum_expert_rows)
+            : MoEGroupedDotAdmission::nativeCandidate(role,source_n,physical_n,k,dot_policy.minimum_expert_rows);
+    };
+    const auto gateup_dot_admission = make_dot_admission(MoEPrefillProjectionRole::GateUp,
+        intermediate,intermediate,d_model);
+    const auto down_dot_admission = make_dot_admission(MoEPrefillProjectionRole::Down,
+        d_model,down_columns,intermediate);
     (void)hipGetLastError(); // clear prior errors
     const bool has_prequantized_hidden =
         d_prequantized_hidden && d_prequantized_hidden_scales;
@@ -4380,16 +4390,17 @@ bool rocmMoE_grouped_prefill_pipeline(
         return false;
     const bool reuse_prequantized_hidden = has_prequantized_hidden;
 
-    int directory_tile_rows = 0;
+    std::optional<MoEGroupedRowPlan> directory_plan;
     int current_directory_capacity = 0;
     const auto ensure_work_directory = [&](int tile_rows) -> int
     {
         if (!moe_prefill_valid_tile_rows(tile_rows))
             return 0;
+        const auto plan = MoEGroupedRowPlan::fixed(tile_rows);
 
         const int capacity = moe_prefill_directory_capacity(
             total_slots, num_experts, tile_rows);
-        if (directory_tile_rows == tile_rows)
+        if (directory_plan && *directory_plan == plan)
             return current_directory_capacity;
 
         /*
@@ -4408,7 +4419,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                 d_group_counts,
                 reinterpret_cast<uint32_t*>(d_group_work_directory),
                 num_experts,
-                capacity, admission);
+                capacity, admission, plan);
             break;
         case 8:
             hipLaunchKernelGGL(
@@ -4417,7 +4428,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                 d_group_counts,
                 reinterpret_cast<uint32_t*>(d_group_work_directory),
                 num_experts,
-                capacity, admission);
+                capacity, admission, plan);
             break;
         case 12:
             hipLaunchKernelGGL(
@@ -4426,7 +4437,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                 d_group_counts,
                 reinterpret_cast<uint32_t*>(d_group_work_directory),
                 num_experts,
-                capacity, admission);
+                capacity, admission, plan);
             break;
         case 16:
             hipLaunchKernelGGL(
@@ -4435,13 +4446,30 @@ bool rocmMoE_grouped_prefill_pipeline(
                 d_group_counts,
                 reinterpret_cast<uint32_t*>(d_group_work_directory),
                 num_experts,
-                capacity, admission);
+                capacity, admission, plan);
             break;
         default:
             return 0;
         }
 
-        directory_tile_rows = tile_rows;
+        directory_plan = plan;
+        current_directory_capacity = capacity;
+        return capacity;
+    };
+
+    /** Borrow the consumer's complete count-only row plan for directory publication. */
+    const auto ensure_native_directory = [&](const MoEGroupedDotAdmission &dot) -> int
+    {
+        const auto plan = dot.rowPlan();
+        if (!plan.isWide()) return ensure_work_directory(16);
+        if (directory_plan && *directory_plan == plan) return current_directory_capacity;
+        const int capacity = moe_prefill_directory_capacity(total_slots,num_experts,plan.minimumRows());
+        if (capacity <= 0) return 0;
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(moe_grouped_build_prefill_tile_directory_kernel<0>),
+            dim3(1),dim3(llaminar2::moe_grouped_directory::directoryThreads(num_experts)),0,hip_stream,
+            d_group_counts,reinterpret_cast<uint32_t*>(d_group_work_directory),num_experts,
+            capacity,admission,plan);
+        directory_plan = plan;
         current_directory_capacity = capacity;
         return capacity;
     };
@@ -4515,7 +4543,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                 tile12_capacity,
                 tile16_capacity, admission);
         }
-        directory_tile_rows = 0;
+        directory_plan.reset();
         current_directory_capacity = 0;
         return view;
     };
@@ -4713,7 +4741,7 @@ bool rocmMoE_grouped_prefill_pipeline(
 
         if (use_expert_row_tiles && native_wmma)
         {
-            const int capacity = ensure_work_directory(16);
+            const int capacity = ensure_native_directory(gateup_dot_admission);
             if (capacity <= 0 || !llaminar2::rocm::submitMoEGroupedWmma(dot_engine,
                     gateup_codebook_mask, {
                         .activations = reuse_prequantized_hidden ? d_prequantized_hidden : d_scratch_A_int8,
@@ -4973,7 +5001,7 @@ bool rocmMoE_grouped_prefill_pipeline(
 
             if (native_wmma)
             {
-                const int capacity = ensure_work_directory(16);
+                const int capacity = ensure_native_directory(down_dot_admission);
                 if (capacity <= 0 || !llaminar2::rocm::submitMoEGroupedWmma(dot_engine,
                         down_codebook_mask, {
                             .activations = d_scratch_swiglu_int8,

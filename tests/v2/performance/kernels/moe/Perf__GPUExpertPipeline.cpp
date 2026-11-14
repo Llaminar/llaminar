@@ -200,7 +200,8 @@ namespace
     {
         Installed, WmmaReplay, WmmaTournament, Wmma32Profile, Wmma64Profile,
         WmmaHybridReplay, WmmaHybridTournament, WmmaHybrid32Profile, WmmaHybridTimingReplay,
-        OrderedProfile, OrderedColdProfile, WmmaAdaptive32ColdProfile
+        OrderedProfile, OrderedColdProfile, WmmaAdaptive32ColdProfile,
+        WmmaMacroReplay, WmmaMacroTournament, WmmaMacroTimingReplay, WmmaMacroProfile, WmmaMacroColdProfile
     };
 
 #ifdef HAVE_ROCM
@@ -213,15 +214,18 @@ namespace
     };
 
     /** @param hybrid Include all explicit whole-expert admission experiments.
+     * @param macro Use the separate wide-candidate roster without expanding old suites.
      * @return Ordered oracle, both pure native tiles and requested hybrid policies. */
-    std::vector<GroupedDotCandidate> groupedDotCandidates(bool hybrid)
+    std::vector<GroupedDotCandidate> groupedDotCandidates(bool hybrid, bool macro)
     {
         using enum rocm::MoEGroupedPrefillEngine;
         using enum rocm::MoEGroupedWmmaRowFloor;
         std::vector<GroupedDotCandidate> result{
             {OrderedDot4,EveryExpert,"Dot4"},
             {WmmaM16N32,EveryExpert,"N32"}, {WmmaM16N64,EveryExpert,"N64"}};
-        if (hybrid)
+        if (macro)
+            result.push_back({WideDot4Wmma,Sixteen,"WideFloor16"});
+        else if (hybrid)
             for (const auto floor : {Four,Eight,Twelve,Sixteen})
                 for (const auto engine : {WmmaM16N32,WmmaM16N64})
                     result.push_back({engine,floor,
@@ -296,17 +300,20 @@ namespace
     void runExpertPipeline(Case parameter, ExpertBenchmark mode = ExpertBenchmark::Installed)
     {
         const bool native = mode != ExpertBenchmark::Installed;
-        const bool timing_replay = mode == ExpertBenchmark::WmmaHybridTimingReplay;
+        const bool macro = mode == ExpertBenchmark::WmmaMacroReplay || mode == ExpertBenchmark::WmmaMacroTournament ||
+            mode == ExpertBenchmark::WmmaMacroTimingReplay || mode == ExpertBenchmark::WmmaMacroProfile ||
+            mode == ExpertBenchmark::WmmaMacroColdProfile;
+        const bool timing_replay = mode == ExpertBenchmark::WmmaHybridTimingReplay || mode == ExpertBenchmark::WmmaMacroTimingReplay;
         const bool cold_profile = mode == ExpertBenchmark::WmmaAdaptive32ColdProfile ||
-                                  mode == ExpertBenchmark::OrderedColdProfile;
+                                  mode == ExpertBenchmark::OrderedColdProfile || mode == ExpertBenchmark::WmmaMacroColdProfile;
         const bool profile = mode == ExpertBenchmark::Wmma32Profile || mode == ExpertBenchmark::Wmma64Profile ||
             mode == ExpertBenchmark::WmmaHybrid32Profile || mode == ExpertBenchmark::OrderedProfile ||
-            cold_profile;
+            mode == ExpertBenchmark::WmmaMacroProfile || cold_profile;
         if (profile && ::testing::UnitTest::GetInstance()->test_to_run_count() != 1)
             throw std::invalid_argument("grouped WMMA profiling requires one exact selected case");
         const bool hybrid = mode == ExpertBenchmark::WmmaHybridReplay ||
                             mode == ExpertBenchmark::WmmaHybridTournament ||
-                            mode == ExpertBenchmark::WmmaHybrid32Profile || mode == ExpertBenchmark::WmmaAdaptive32ColdProfile || timing_replay;
+                            mode == ExpertBenchmark::WmmaHybrid32Profile || mode == ExpertBenchmark::WmmaAdaptive32ColdProfile || timing_replay || macro;
         // One retained capacity spans every live threshold. The canonical case
         // still owns the matrix shapes, formats, ownership and route profile.
         if (hybrid || mode == ExpertBenchmark::OrderedProfile) parameter.live_rows = parameter.rows;
@@ -316,7 +323,7 @@ namespace
             parameter.live_rows = 64;
         }
 #ifdef HAVE_ROCM
-        const auto dot_candidates = groupedDotCandidates(hybrid);
+        const auto dot_candidates = groupedDotCandidates(hybrid,macro);
         if (native)
         {
             initializeROCmHardwareMetadata();
@@ -527,7 +534,7 @@ namespace
                     capture.finish();
                     std::vector<GPUGraphKernelNodeInfo> nodes;
                     ASSERT_TRUE(graphs[path]->inspectKernelNodes(nodes));
-                    int native_nodes = 0;
+                    int native_nodes = 0, gate_up_nodes = 0, down_nodes = 0;
                     std::set<std::tuple<uintptr_t,uint32_t,uint32_t,uint32_t,uint32_t>> seen;
                     for (const auto &node : nodes)
                     {
@@ -537,17 +544,41 @@ namespace
                         if (node.name.find("grouped_wmma_detail") == std::string::npos) continue;
                         const bool adaptive = dot_candidates[path].floor != rocm::MoEGroupedWmmaRowFloor::EveryExpert;
                         ASSERT_NE(node.name.find(adaptive ? "ELb1EE" : "ELb0EE"),std::string::npos) << node.name;
+                        if (dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::WideDot4Wmma)
+                        {
+                            ASSERT_NE(node.name.find("wideProjection"),std::string::npos);
+                            ASSERT_TRUE(node.grid_z == 1 || node.grid_z == 2);
+                            const unsigned columns = node.grid_z == 2 ? 256u : 128u;
+                            const unsigned n = node.grid_z == 2 ? intermediate : hidden;
+                            ASSERT_EQ(node.block_x,columns);
+                            const unsigned native_columns = columns / 4;
+                            ASSERT_EQ(node.grid_x,(n+native_columns-1)/native_columns);
+                        }
                         ++native_nodes;
+                        if (node.grid_z == 2) ++gate_up_nodes;
+                        else if (node.grid_z == 1) ++down_nodes;
+                        else FAIL() << "Unexpected grouped projection role";
                         if (seen.emplace(node.function_identity,node.grid_x,node.grid_y,node.grid_z,node.block_x).second)
                             std::printf("MOE_WMMA_RESOURCE,%s,%zu,%u,%zu,%u,%u,%u,%u,%u,%s\n",parameter.name.c_str(),path,
                                 node.registers_per_thread,node.static_shared_memory_bytes,node.max_active_blocks_per_sm,
                                 node.grid_x,node.grid_y,node.grid_z,node.block_x,node.name.c_str());
                     }
                     ASSERT_GE(native_nodes,2 * (profile ? 1 : repeats));
+                    ASSERT_EQ(gate_up_nodes,profile ? 1 : repeats);
+                    ASSERT_EQ(down_nodes,profile ? 1 : repeats);
                     ASSERT_TRUE(graphs[path]->instantiate());
+                    if (dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::WideDot4Wmma)
+                    {
+                        auto *captured = dynamic_cast<HIPGraphCapture *>(graphs[path]);
+                        ASSERT_NE(captured,nullptr);
+                        std::array<size_t,2> roles;
+                        ASSERT_NO_THROW(roles = inspectROCmGroupedWideCapture(*captured,
+                            static_cast<hipStream_t>(stream),dot_candidates[path].floor));
+                        EXPECT_EQ(roles,(std::array<size_t,2>{size_t(profile ? 1 : repeats),size_t(profile ? 1 : repeats)}));
+                    }
                 }
                 const bool internal_timing = timing_replay || mode == ExpertBenchmark::WmmaTournament ||
-                    mode == ExpertBenchmark::WmmaHybridTournament;
+                    mode == ExpertBenchmark::WmmaHybridTournament || mode == ExpertBenchmark::WmmaMacroTournament;
                 if (internal_timing)
                 {
                     for (size_t path = 0; path < graphs.size(); ++path)
@@ -579,6 +610,15 @@ namespace
                         for (const auto &node : parent_nodes) { ASSERT_TRUE(node.valid()); parent_inventory.insert(key(node)); }
                         ASSERT_EQ(source_inventory,parent_inventory);
                         ASSERT_TRUE(parent.instantiate());
+                        if (dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::WideDot4Wmma)
+                        {
+                            auto *captured = dynamic_cast<HIPGraphCapture *>(&parent);
+                            ASSERT_NE(captured,nullptr);
+                            std::array<size_t,2> roles;
+                            ASSERT_NO_THROW(roles = inspectROCmGroupedWideCapture(*captured,
+                                static_cast<hipStream_t>(stream),dot_candidates[path].floor));
+                            EXPECT_EQ(roles,(std::array<size_t,2>{repeats,repeats}));
+                        }
                         if (timing_replay && path == 0)
                         {
                             auto disabled = context.createGraphCapture(stream);
@@ -667,7 +707,7 @@ namespace
                     ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
                     const std::string profile_name = (mode == ExpertBenchmark::OrderedProfile || mode == ExpertBenchmark::OrderedColdProfile) ? "Dot4" :
                         (mode == ExpertBenchmark::WmmaHybrid32Profile || mode == ExpertBenchmark::WmmaAdaptive32ColdProfile) ? "N32Floor8" :
-                        mode == ExpertBenchmark::Wmma32Profile ? "N32" : "N64";
+                        macro ? "WideFloor16" : mode == ExpertBenchmark::Wmma32Profile ? "N32" : "N64";
                     const auto selected = std::find_if(dot_candidates.begin(),dot_candidates.end(),
                         [&](const auto &candidate) { return candidate.name == profile_name; });
                     ASSERT_NE(selected,dot_candidates.end());
@@ -767,7 +807,8 @@ namespace
                     // count. This separate partial-owner histogram keeps the
                     // tiled family active while straddling every native floor.
                     // Each row still contains at most one route to each expert.
-                    constexpr std::array counts{3,4,7,8,12,16,17,31};
+                    const std::array counts = macro ? std::array{3,4,7,13,15,16,17,31}
+                                                    : std::array{3,4,7,8,12,16,17,31};
                     for (size_t i = 0; i < route_ids.size(); ++i)
                         if (route_ids[i] >= 0 && i/top_k >= static_cast<size_t>(counts[static_cast<int>(route_ids[i])]))
                             route_ids[i] = -1.0f;
@@ -784,7 +825,8 @@ namespace
                     route_ids = original_ids;
                     expected = original_reference;
                 }
-                const bool replay_only = mode == ExpertBenchmark::WmmaReplay || mode == ExpertBenchmark::WmmaHybridReplay;
+                const bool replay_only = mode == ExpertBenchmark::WmmaReplay || mode == ExpertBenchmark::WmmaHybridReplay ||
+                    mode == ExpertBenchmark::WmmaMacroReplay;
                 std::vector<int> live_points{parameter.live_rows};
                 if (hybrid)
                 {
@@ -873,7 +915,7 @@ namespace
             // All candidates bind the same immutable source-prepared slice.
             // Repacking per policy would repeat setup work and obscure the
             // retained-buffer ownership this replay is intended to qualify.
-            const int columns = hidden / (parameter.ownership_degree ? parameter.ownership_degree : 2);
+            const int columns = macro ? 96 : hidden / (parameter.ownership_degree ? parameter.ownership_degree : 2);
             const int first_column = hidden - columns;
             std::vector<std::shared_ptr<TensorBase>> column_sources;
             std::vector<GpuPreparedGemm> column_prepared;
@@ -894,7 +936,7 @@ namespace
             ASSERT_GE(column_table, 0);
             auto column_routes = tensor(parameter.rows * top_k, columns);
             auto column_output = tensor(parameter.rows, columns);
-            const auto check_phases = [&](const char *engine_label) {
+            const auto check_phases = [&](const char *engine_label, bool wide_candidate) {
             route_ids = original_ids; route_weights = original_weights; expected = original_expected;
             ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(),route_ids.data(),route_ids.size()*sizeof(float),parameter.device.ordinal,stream));
             ASSERT_TRUE(backend->hostToDevice(probabilities->gpu_data_ptr(),route_weights.data(),route_weights.size()*sizeof(float),parameter.device.ordinal,stream));
@@ -1028,6 +1070,95 @@ namespace
                 ASSERT_EQ(std::memcmp(expected.data() + row * hidden + first_column,
                     actual_columns.data() + row * columns, columns * sizeof(float)), 0)
                     << "Column-owned down disagrees with full-width oracle at row " << row;
+#ifdef HAVE_ROCM
+            if (macro)
+            {
+                // Warm phase values cannot certify a retained writer. This
+                // transaction owns down projection, route publication and fold;
+                // its existing grouped SwiGLU inputs are deliberately preserved.
+                auto transaction = context.createGraphCapture(stream);
+                {
+                    ScopedBackendGraphCapture recording(context,*transaction,"dirty column-owned down and fold");
+                    ASSERT_TRUE(recording.begin());
+                    ASSERT_TRUE(column_down());
+                    ASSERT_TRUE(column_fold());
+                    recording.finish();
+                }
+                ASSERT_TRUE(transaction->instantiate());
+                auto *captured = dynamic_cast<HIPGraphCapture *>(transaction.get());
+                ASSERT_NE(captured,nullptr);
+                if (wide_candidate)
+                {
+                    std::array<size_t,2> roles;
+                    ASSERT_NO_THROW(roles = inspectROCmGroupedWideCapture(*captured,
+                        static_cast<hipStream_t>(stream),rocm::MoEGroupedWmmaRowFloor::Sixteen));
+                    EXPECT_EQ(roles,(std::array<size_t,2>{0,1}));
+                }
+                auto join = [&](void *) {
+                    if (!backend->synchronizeStream(stream,parameter.device.ordinal)) std::terminate();
+                };
+                std::unique_ptr<void,decltype(join)> completion(&context,join);
+                const auto poison_columns = [&] {
+                    void *scratch = workspace.getBuffer(MoEWorkspaceBuffers::PREFILL_GATE);
+                    const size_t bytes = workspace.getBufferSize(MoEWorkspaceBuffers::PREFILL_GATE);
+                    ASSERT_NE(scratch,nullptr); ASSERT_GT(bytes,0u);
+                    ASSERT_EQ(hipMemsetAsync(scratch,0xa5,bytes,static_cast<hipStream_t>(stream)),hipSuccess);
+                    ASSERT_EQ(hipMemsetAsync(column_routes->gpu_data_ptr(),0xa5,column_routes->numel()*sizeof(float),
+                        static_cast<hipStream_t>(stream)),hipSuccess);
+                    ASSERT_EQ(hipMemsetAsync(column_output->gpu_data_ptr(),0xa5,column_output->numel()*sizeof(float),
+                        static_cast<hipStream_t>(stream)),hipSuccess);
+                };
+                const auto replay_columns = [&] {
+                    ASSERT_TRUE(transaction->launch());
+                    ASSERT_TRUE(backend->deviceToHost(actual_columns.data(),column_output->gpu_data_ptr(),
+                        actual_columns.size()*sizeof(float),parameter.device.ordinal,stream));
+                    ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                };
+                const auto matching_columns = [&] {
+                    for (int row = 0; row < parameter.rows; ++row)
+                        if (std::memcmp(expected.data()+row*hidden+first_column,actual_columns.data()+row*columns,
+                            columns*sizeof(float)) != 0) return false;
+                    return true;
+                };
+                size_t count = 0;
+                ASSERT_EQ(hipGraphGetNodes(captured->graph(),nullptr,&count),hipSuccess);
+                std::vector<hipGraphNode_t> handles(count),down_writers,fold_writers;
+                ASSERT_EQ(hipGraphGetNodes(captured->graph(),handles.data(),&count),hipSuccess);
+                for (auto handle : handles)
+                {
+                    hipGraphNodeType type;
+                    ASSERT_EQ(hipGraphNodeGetType(handle,&type),hipSuccess);
+                    if (type != hipGraphNodeTypeKernel) continue;
+                    hipKernelNodeParams params{};
+                    ASSERT_EQ(hipGraphKernelNodeGetParams(handle,&params),hipSuccess);
+                    const char *name = hipKernelNameRefByPtr(params.func,static_cast<hipStream_t>(stream));
+                    ASSERT_NE(name,nullptr);
+                    const std::string_view symbol(name);
+                    if (symbol.find("grouped_wmma_detail") != std::string_view::npos)
+                    {
+                        ASSERT_EQ(params.gridDim.z,1u);
+                        down_writers.push_back(handle);
+                    }
+                    if (symbol.find("moe_reduce_canonical_route_contributions_kernel") != std::string_view::npos)
+                        fold_writers.push_back(handle);
+                }
+                ASSERT_EQ(down_writers.size(),1u); ASSERT_EQ(fold_writers.size(),1u);
+                for (auto omitted : {down_writers.front(),fold_writers.front()})
+                {
+                    ASSERT_EQ(hipGraphNodeSetEnabled(captured->executable(),omitted,0),hipSuccess);
+                    ASSERT_NO_FATAL_FAILURE(poison_columns());
+                    ASSERT_NO_FATAL_FAILURE(replay_columns());
+                    ASSERT_EQ(hipGraphNodeSetEnabled(captured->executable(),omitted,1),hipSuccess);
+                    ASSERT_FALSE(matching_columns()) << "Omitted captured slice writer was masked by old bytes";
+                    for (int replay = 0; replay < 2; ++replay)
+                    {
+                        ASSERT_NO_FATAL_FAILURE(poison_columns());
+                        ASSERT_NO_FATAL_FAILURE(replay_columns());
+                        ASSERT_TRUE(matching_columns()) << "Dirty retained slice changed source-exact bytes";
+                    }
+                }
+            }
+#endif
             };
 #ifdef HAVE_ROCM
             if (native)
@@ -1035,12 +1166,13 @@ namespace
                 for (size_t path = 1; path < dot_candidates.size(); ++path)
                 {
                     rocm::ScopedMoEGroupedPrefillEngine selected(dot_candidates[path].engine,dot_candidates[path].floor);
-                    ASSERT_NO_FATAL_FAILURE(check_phases((dot_candidates[path].name+"_").c_str()));
+                    ASSERT_NO_FATAL_FAILURE(check_phases((dot_candidates[path].name+"_").c_str(),
+                        dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::WideDot4Wmma));
                 }
             }
             else
 #endif
-                ASSERT_NO_FATAL_FAILURE(check_phases(""));
+                ASSERT_NO_FATAL_FAILURE(check_phases("",false));
         });
     }
 
@@ -1074,6 +1206,21 @@ namespace
     /** @test Replay all internal event owners through partial, empty and threshold resets. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_HybridCapturedTimingReplay)
     { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaHybridTimingReplay); }
+    /** @test Qualify role-specific wide rows, branch omission and a 96-column down slice. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_MacroCapturedSplitReplay)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaMacroReplay); }
+    /** @test Measure complete wide-candidate operations against both existing native tiles and Dot4. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_MacroCapturedTournament)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaMacroTournament); }
+    /** @test Authenticate actual imported wide timing nodes through dirty threshold replays. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_MacroCapturedTimingReplay)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaMacroTimingReplay); }
+    /** @test Isolate one complete full-capacity wide candidate for exact profiling. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedMacroProfile)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaMacroProfile); }
+    /** @test Isolate wide cold work in the original full-capacity retained graph. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedMacroColdProfile)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaMacroColdProfile); }
     /** @test Isolate one N32 complete projection transaction outside canonical timing. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedN32Profile)
     { runExpertPipeline(GetParam(),ExpertBenchmark::Wmma32Profile); }

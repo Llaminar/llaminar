@@ -25,6 +25,60 @@
 
 namespace llaminar2::test
 {
+/** @brief Authenticate immutable row plans in the actual retained wide projection nodes.
+ * @param capture Instantiated source or imported parent graph. @param stream Exact capture stream.
+ * @param floor Expected whole-expert cutoff. @return Gate/up and down node counts, in that order.
+ * @throws std::runtime_error For malformed captures or symbol/packet/geometry disagreement. */
+inline std::array<size_t,2> inspectROCmGroupedWideCapture(HIPGraphCapture &capture, hipStream_t stream,
+    rocm::MoEGroupedWmmaRowFloor floor)
+{
+    const auto require = [](hipError_t status) {
+        if (status != hipSuccess) throw std::runtime_error("Wide capture inspection failed");
+    };
+    if (!capture.graph() || !capture.executable() || !stream ||
+        stream == hipStreamLegacy || stream == hipStreamPerThread)
+        throw std::runtime_error("Wide inspection requires an instantiated graph and exact stream");
+    size_t count = 0;
+    require(hipGraphGetNodes(capture.graph(),nullptr,&count));
+    std::vector<hipGraphNode_t> nodes(count);
+    require(hipGraphGetNodes(capture.graph(),nodes.data(),&count));
+    std::array<size_t,2> roles{};
+    for (const auto node : nodes)
+    {
+        hipGraphNodeType type;
+        require(hipGraphNodeGetType(node,&type));
+        if (type != hipGraphNodeTypeKernel) continue;
+        hipKernelNodeParams params{};
+        require(hipGraphKernelNodeGetParams(node,&params));
+        const char *name = hipKernelNameRefByPtr(params.func,stream);
+        if (!name) throw std::runtime_error("Wide capture node has no symbol");
+        const std::string_view symbol(name);
+        if (symbol.find("grouped_wmma_detail") == std::string_view::npos) continue;
+        if (symbol.find("wideProjection") == std::string_view::npos ||
+            (params.gridDim.z != 1 && params.gridDim.z != 2) ||
+            !params.kernelParams || !params.kernelParams[0] || params.extra)
+            throw std::runtime_error("Wide capture has an incompatible native producer");
+        using Arguments = rocm::MoEGroupedWmmaArguments;
+        std::array<std::byte,sizeof(Arguments)> bytes;
+        std::memcpy(bytes.data(),params.kernelParams[0],bytes.size());
+        const auto args = std::bit_cast<Arguments>(bytes);
+        const bool gate_up = params.gridDim.z == 2;
+        const auto role = gate_up ? rocm::MoEPrefillProjectionRole::GateUp : rocm::MoEPrefillProjectionRole::Down;
+        const unsigned threads = gate_up ? 256u : 128u;
+        const unsigned native_columns = threads / 4;
+        if (args.dot_admission.rowPlan() != rocm::MoEGroupedRowPlan::wide(role,floor) ||
+            !args.dot_admission.binds(role,args.n,args.k) ||
+            (args.second_descriptors != nullptr) != gate_up || (args.second_output != nullptr) != gate_up ||
+            args.branch_suppression != rocm::MoEGroupedBranchSuppression::None ||
+            params.blockDim.x != threads || params.blockDim.y != 1 || params.blockDim.z != 1 ||
+            params.gridDim.x != (args.n+native_columns-1)/native_columns ||
+            params.gridDim.y != static_cast<unsigned>(args.directory_capacity))
+            throw std::runtime_error("Wide capture row plan or launch geometry changed");
+        ++roles[gate_up ? 0 : 1];
+    }
+    return roles;
+}
+
 /** @brief Own a temporary branch omission on every repeated adaptive down node. */
 class ROCmGroupedBranchMutation final
 {
@@ -86,6 +140,11 @@ public:
             std::array<std::byte,sizeof(Arguments)> bytes;
             std::memcpy(bytes.data(),params.kernelParams[0],bytes.size());
             const auto original = std::bit_cast<Arguments>(bytes);
+            const bool wide = symbol.find("wideProjection") != std::string_view::npos;
+            if ((!wide && symbol.find("10projection") == std::string_view::npos) ||
+                original.dot_admission.rowPlan().isWide() != wide ||
+                (wide && original.dot_admission.rowPlan().role() != rocm::MoEPrefillProjectionRole::Down))
+                throw std::runtime_error("Grouped symbol and captured row plan disagree");
             Patch patch{.node=node,.params=params,.original=original,.fault=original};
             if (patch.original.branch_suppression != rocm::MoEGroupedBranchSuppression::None ||
                 !patch.original.dot_admission.mayUseOrdered() || patch.original.second_descriptors ||

@@ -54,9 +54,11 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, ProjectionTransactionsKeepCanonicalGeo
 #include "kernels/rocm/gemm/ROCmMoEGroupedDotAdmission.h"
 
 #include <array>
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <utility>
+#include <vector>
 
 namespace
 {
@@ -582,4 +584,80 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionRejectsInvalidLiveMetadata
     }
     EXPECT_EQ(admission.select(valid,1),MoEGroupedDotProducer::OrderedDot4);
     EXPECT_EQ(admission.select(valid,16),MoEGroupedDotProducer::Wmma);
+}
+
+/** @test A sealed row plan gives cold second tiles and native tails exactly one writer. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, WideRowPlanCoversThresholdsAndAliasesExactlyOnce)
+{
+    using namespace llaminar2::rocm;
+    using Role = MoEPrefillProjectionRole;
+    using Floor = MoEGroupedWmmaRowFloor;
+    for (const auto role : {Role::GateUp,Role::Down})
+        for (const auto floor : {Floor::EveryExpert,Floor::Four,Floor::Eight,Floor::Twelve,Floor::Sixteen})
+        {
+            const auto admission = MoEGroupedDotAdmission::wideCandidate(role,96,96,256,floor);
+            const auto plan = admission.rowPlan();
+            ASSERT_TRUE(plan.isWide());
+            ASSERT_EQ(plan.role(),role);
+            ASSERT_EQ(plan.floor(),floor);
+            EXPECT_EQ(plan.rows(0),0);
+            EXPECT_EQ(plan.rows(-1),0);
+            for (int rows = 1; rows <= 257; ++rows)
+            {
+                const bool native = rows >= static_cast<int>(floor);
+                const int expected_step = native || role == Role::Down ? 16 : 12;
+                ASSERT_EQ(plan.rows(rows),expected_step);
+                ASSERT_LE(plan.minimumRows(),expected_step);
+                // Gate/up may use different prepared codebooks but must share
+                // one count-only directory. Include Q8 aliases and promotion.
+                for (uint8_t codebook : {uint8_t{0},uint8_t{4},uint8_t{7},uint8_t{19},uint8_t{20},uint8_t{21},uint8_t{24}})
+                    for (uint8_t physical : {codebook,uint8_t{23}})
+                        ASSERT_EQ(admission.select(dotAdmissionDescriptor(physical,codebook),rows),
+                            native ? MoEGroupedDotProducer::Wmma : MoEGroupedDotProducer::OrderedDot4);
+                std::vector<int> writers(rows);
+                for (int first = 0; first < rows; first += plan.rows(rows))
+                {
+                    const int live = std::min(plan.rows(rows),rows-first);
+                    for (int local = 0; local < live; ++local) ++writers[first+local];
+                }
+                for (int count : writers) ASSERT_EQ(count,1);
+            }
+            if (role == Role::GateUp && floor == Floor::Sixteen)
+            {
+                EXPECT_EQ(plan.rows(13),12);
+                EXPECT_EQ(plan.rows(15),12);
+                EXPECT_EQ(plan.rows(16),16);
+                EXPECT_EQ(plan.minimumRows(),12);
+            }
+            if (floor == Floor::EveryExpert) EXPECT_EQ(plan.minimumRows(),16);
+        }
+}
+
+/** @test Directory cache identity distinguishes equal-width but different role/floor plans. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, RowPlanRejectsInvalidGeometryAndSeparatesCaptureIdentity)
+{
+    using namespace llaminar2::rocm;
+    using Role = MoEPrefillProjectionRole;
+    using Floor = MoEGroupedWmmaRowFloor;
+    const auto wide = MoEGroupedRowPlan::wide(Role::Down,Floor::Sixteen);
+    EXPECT_EQ(wide,MoEGroupedRowPlan::wide(Role::Down,Floor::Sixteen));
+    EXPECT_NE(wide,MoEGroupedRowPlan::wide(Role::Down,Floor::Eight));
+    EXPECT_NE(wide,MoEGroupedRowPlan::wide(Role::GateUp,Floor::Sixteen));
+    EXPECT_NE(wide,MoEGroupedRowPlan::nativeMicro(Role::Down,Floor::Sixteen));
+    EXPECT_NE(wide,MoEGroupedRowPlan::fixed(16));
+    for (int step : {4,8,12,16})
+    {
+        const auto fixed = MoEGroupedRowPlan::fixed(step);
+        EXPECT_FALSE(fixed.isWide());
+        EXPECT_EQ(fixed.minimumRows(),step);
+        for (int count : {1,13,15,16,17,31,257}) EXPECT_EQ(fixed.rows(count),step);
+    }
+    for (int step : {-1,0,1,3,5,17,256})
+        EXPECT_THROW((void)MoEGroupedRowPlan::fixed(step),std::invalid_argument);
+    EXPECT_THROW((void)MoEGroupedRowPlan::wide(static_cast<Role>(255),Floor::Sixteen),std::invalid_argument);
+    EXPECT_THROW((void)MoEGroupedRowPlan::wide(Role::GateUp,static_cast<Floor>(15)),std::invalid_argument);
+    for (auto role : {Role::GateUp,Role::Down})
+        for (auto floor : {Floor::EveryExpert,Floor::Four,Floor::Eight,Floor::Twelve,Floor::Sixteen})
+            for (int count : {1,13,15,16,17,31,257})
+                EXPECT_EQ(MoEGroupedRowPlan::nativeMicro(role,floor).rows(count),16);
 }

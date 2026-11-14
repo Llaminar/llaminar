@@ -6,6 +6,9 @@
  * replaces only ExpertTiled gate/up and down leaves. Nonzero row floors select
  * Dot4 or WMMA inside one consumer with a shared directory; quantization, routing,
  * SwiGLU and ordered publication retain their existing owners and allocations.
+ * The explicit wide candidate keeps a column per Dot4 thread and computes one
+ * native column chunk per block, with cold experts using every fourth block. Its count-only row plan also owns directory
+ * generation, including the twelve-row gate/up versus sixteen-row native step.
  */
 #pragma once
 #include "ROCmMoEPrefillArithmetic.h"
@@ -15,7 +18,7 @@
 namespace llaminar2::rocm
 {
 /** @brief Explicit recording choices; Automatic retains installed measured policy. */
-enum class MoEGroupedPrefillEngine { Automatic, OrderedDot4, WmmaM16N32, WmmaM16N64 };
+enum class MoEGroupedPrefillEngine { Automatic, OrderedDot4, WmmaM16N32, WmmaM16N64, WideDot4Wmma };
 
 /** @brief Nestable worker-local selection, embedded in the captured native nodes. */
 class ScopedMoEGroupedPrefillEngine final

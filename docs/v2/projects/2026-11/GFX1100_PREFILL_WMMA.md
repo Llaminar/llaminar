@@ -34,16 +34,13 @@ production dispatch: GPU prepared quantized weights use NativeQuantised adapters
 
 | Area | Implementation | Functional/component evidence | Performance evidence |
 |---|---|---|---|
-| Broader dense dispatch | Bound installed-Auto/WMMA collector and selective publisher | Core-table ownership replay, eight binding and 16 decision regressions pass | 84 cells complete; 68 candidate keys gain1.25–2.04×; profile/install pending |
-| Grouped MoE | Wave64 M16N32/N64; fused Dot4/WMMA whole-expert floors4/8/12/16; all physical decoders | Serial, promoted, mixed-writer omission, threshold/reset and split/sliced-down replay pass | Full-live pure N32 gains1.05–1.30×; fused floor8 gains1.04–1.28×. Sparse uniform still regresses; Automatic remains Dot4 |
-| Attention | Automatic one-kernel Dot2/WMMA live-prefix selection in the measured FP16 M512 domain | Actual Auto, immutable exclusions, counters, all-format, threshold/ring/partial/reset and internal timing-owner replays pass | Actual Auto64K gains1.155×/1.138×; doubling1.998×/1.993×. Short prefixes near parity; dense1023 costs0.27% |
-| Q8 router | Automatic Sixteen-wave tile for exact whole-row M512/K2560/E512; explicit 4/8/16-wave candidates retained | 14 GPU feature cases, five pure policy cases and both timing owners pass; actual Auto template, ownership and submission counters authenticated | Actual Auto wins all 12 measured prefix/basis cells: full512 gains 2.744×/2.551×; fresh profile has zero spills |
+| Broader dense dispatch | Bound installed-Auto/WMMA collector and selective publisher | Core-table ownership replay, eight binding and 16 decision regressions pass | 84 timings/124 profiles unqualified for isolation; fresh collection running |
+| Grouped MoE | Wave64 M16N32/N64; fused Dot4/WMMA whole-expert floors4/8/12/16; all physical decoders | Serial, promoted, mixed-writer omission, threshold/reset and split/sliced-down replay pass | Fine adaptive full Qwen gains1.06–1.19×; sparse/compact gaps remain; Automatic stays Dot4 |
+| Attention | Automatic one-kernel Dot2/WMMA live-prefix selection in the measured FP16 M512 domain | Actual Auto, immutable exclusions, counters, all-format, threshold/ring/partial/reset and internal timing-owner replays pass | Historical64K gains1.155×/1.138× and doubling1.998×/1.993×; isolation refresh pending |
+| Q8 router | Automatic Sixteen-wave tile for exact whole-row M512/K2560/E512; explicit 4/8/16-wave candidates retained | 14 GPU feature cases, five pure policy cases and both timing owners pass; actual Auto template, ownership and submission counters authenticated | Historical full512 gains2.744×/2.551×;12 cells/seven counters need isolation refresh |
 | Floating half GEMM | Existing production hipBLAS path; sampled native matrix gap confirmed | Three retained graph replays pass, each containing cast and vendor GEMM | Loaded bytes/ISA authenticated; complete Release cast+GEMM timing pending |
 
 [Router qualification](GFX1100_ROUTER_LIVE_PREFILL.md) records admission, retained-prefix timing and profiles.
-
-Router timing covers quantization, logits and original Q8 restoration, with
-31 paired samples of16 complete captured operations. Profiling is separate.
 
 Grouped functional owners are `V2_Integration_ROCmGroupedWmmaReplay` and
 `V2_Integration_ROCmGroupedWmmaSplitReplay`, both explicitly registered in
@@ -55,27 +52,20 @@ Disabling each native projection independently makes that reference fail, provin
 the recorded kernels contribute. Split replay covers both tiles, all 21 source
 formats, whole-expert phases and compact column-owned down slices.
 
-The fused consumer shares operand staging and one directory between Dot4/WMMA.
-Expanded45 serial-byte cases pass in108.81s; four affected component suites pass
-in62.43s after parallel fixture setup. Seven profiler-owner checks pass. Internal
-events validate identical imported kernels, stale-observation rejection, poisoned
-storage and separate branch omission/survivor/restore against measured parents.
+The current wide adaptive candidate uses independent native column blocks and
+role-specific wide Dot4 tiles under one device-owned row plan. Both HIP targets
+build;19 pure tests, four Release smokes and162 native feature tests pass. Its
+10,540 canonical samples and35 counter passes qualify. Full Qwen uniform/hotset/
+power-law gains are1.189/1.120/1.061×; sparse uniform and compact regressions
+still prevent Automatic installation. Pure N32 remains faster at many dense
+sizes. A separately compiled cold-decode fence reduces IQ2_S VGPRs79→72 and
+87→81 without memory spills; runtime qualification is pending.
+[Investigation](GFX1100_GROUPED_WMMA_ADMISSION.md) owns the comparisons and archives.
 
-Five clean per-case runs contain17 live counts ×11 policies ×31 samples of eight
-complete operations:28,985 sample rows. Full-live N32 gains1.299/1.168/1.051× for
-Qwen uniform/hotset/power-law and1.054/1.073× for compact Q4_0/IQ2_S. Fused floor8
-now wins full power-law1.043×, but uniform live64/128/256 remains0.776/0.816/0.881×.
-Hotset live64 gains1.359×. Automatic remains Dot4. Next preserve economical Dot4
-tiles for sparse groups while retaining WMMA reuse for large groups.
-[Investigation](GFX1100_GROUPED_WMMA_ADMISSION.md) owns detailed comparisons.
-
-`grouped-fused-profile-timing-join.json` binds eight exact, spill-free profiles.
-
-The capped-directory experiment passed26,350 byte checks and28 profile checks
-but regressed full and sparse work; its code/tests are retired and evidence archived
-in the linked investigation. A candidate preserving legacy Dot4 widths with four
-WMMA chunks and one device-owned row plan is in development, not yet compiled
-or qualified. Automatic remains Dot4.
+The [isolation audit](GFX1100_PREFILL_ISOLATION_REQUALIFICATION.md) requires fresh
+dense/CUDA-reference, router and attention performance qualification. Numerical
+replay remains valid. Historical performance values below are provisional until
+recollected with complete healthy observations and current producer bindings.
 
 Attention Automatic resolves the measured immutable domain once at capture:
 FP16/B1/M512/HD256/capacity65536,Q/KV12/2 or8/1, full causal query scheduling and
@@ -143,10 +133,10 @@ Release producer. A loader replay reproduces and guards the repaired table
 interposition defect. Complete typed install/retain decisions preserve every
 unchanged row and generic absence; only per-alias profitable WMMA changes need
 new profiles. All-retain produces byte-identical policy and a no-change receipt.
-The broader slice completed84cells (two shapes, M512/M1024, all21formats).
-All68 runtime keys have profitable WMMA candidates, gaining1.25–2.04×. Six
-focused registered gates pass;87/168 profiles complete; remaining profiles and installed-Auto
-qualification remain. [Evidence and protocol](GFX1100_DENSE_PREFILL_CANDIDATE_SCOPE.md).
+Six focused gates pass. The broader84-cell slice is under isolation audit:
+the old monitor omitted `llaminar2`. Thirty of124 accepted profiles demonstrably
+overlap foreign inference; the other94 lack complete isolation proof. Raw records are preserved; timing receipts are also under audit.
+Requalification precedes installation. [Evidence and protocol](GFX1100_DENSE_PREFILL_CANDIDATE_SCOPE.md).
 
 The floating audit authenticates the dumped rocBLAS object and all17 traced
 symbols/offsets:

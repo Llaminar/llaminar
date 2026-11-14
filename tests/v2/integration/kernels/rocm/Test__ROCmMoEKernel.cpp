@@ -26561,7 +26561,8 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 canonical_route_contributions.get(), grouped_output.get(), seq_len, top_k, d_model));
             ASSERT_TRUE(graph.finishAndInstantiate());
             if (engine == llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N32 ||
-                engine == llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N64)
+                engine == llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N64 ||
+                engine == llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma)
             {
                 size_t count = 0;
                 ASSERT_EQ(hipGraphGetNodes(graph.nativeGraphForInspection(), nullptr, &count), hipSuccess);
@@ -26588,8 +26589,25 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                     hipFuncAttributes resources{};
                     ASSERT_EQ(hipFuncGetAttributes(&resources, params.func), hipSuccess);
                     EXPECT_EQ(resources.localSizeBytes, 0u) << name;
-                    EXPECT_EQ(params.blockDim.x,
-                        engine == llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N32 ? 128u : 256u);
+                    const bool wide = engine == llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma;
+                    const unsigned columns = wide ? (params.gridDim.z == 2 ? 256u : 128u) :
+                        engine == llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N32 ? 32u : 64u;
+                    EXPECT_EQ(params.blockDim.x,wide ? columns : columns*4);
+                    if (wide)
+                    {
+                        ASSERT_NE(std::string_view(name).find("wideProjection"),std::string_view::npos);
+                        ASSERT_NE(params.kernelParams,nullptr);
+                        ASSERT_NE(params.kernelParams[0],nullptr);
+                        using Arguments = llaminar2::rocm::MoEGroupedWmmaArguments;
+                        std::array<std::byte,sizeof(Arguments)> captured_bytes;
+                        std::memcpy(captured_bytes.data(),params.kernelParams[0],captured_bytes.size());
+                        const auto captured = std::bit_cast<Arguments>(captured_bytes);
+                        const auto role = params.gridDim.z == 2 ? llaminar2::rocm::MoEPrefillProjectionRole::GateUp
+                                                               : llaminar2::rocm::MoEPrefillProjectionRole::Down;
+                        EXPECT_EQ(captured.dot_admission.rowPlan(),llaminar2::rocm::MoEGroupedRowPlan::wide(role,row_floor));
+                        const unsigned native_columns = columns / 4;
+                        EXPECT_EQ(params.gridDim.x,(captured.n+native_columns-1)/native_columns);
+                    }
                 }
                 ASSERT_GE(native_gate_up, 1) << "Gate/up must record native WMMA";
                 ASSERT_GE(native_down, 1) << "Down must record native WMMA";
@@ -28058,6 +28076,84 @@ TEST(Test__ROCmMoEKernel, NativeWmmaTailPartitionsCapturedReplay)
                 format->name,format->make,format->make,format->make,true,false,rows,width,DeviceId::rocm(ordinal),
                 engine,llaminar2::rocm::MoEGroupedWmmaRowFloor::Sixteen,counts);
         }
+}
+
+/** @brief Independently filterable wide candidate covering every source codebook. */
+class ROCmMoEGroupedWideWmma : public ::testing::TestWithParam<MoEVerifierFormatCase> {};
+
+/** @test Cold second tiles and native tails preserve independent serial-row bytes. */
+TEST_P(ROCmMoEGroupedWideWmma, CapturedAllCodebookReplay)
+{
+    const int ordinal = nativeGroupedWmmaDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    constexpr std::array rows{33};
+    constexpr std::array counts{3,4,7,13,15,16,17,31};
+    const auto &format = GetParam();
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+        format.name,format.make,format.make,format.make,true,false,rows,512,DeviceId::rocm(ordinal),
+        llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma,
+        llaminar2::rocm::MoEGroupedWmmaRowFloor::Sixteen,counts);
+}
+INSTANTIATE_TEST_SUITE_P(NativeGfx1100,ROCmMoEGroupedWideWmma,::testing::ValuesIn(allMoEVerifierFormatCases()),
+    [](const ::testing::TestParamInfo<MoEVerifierFormatCase> &info) { return std::string(info.param.name); });
+
+/** @test Exercise the separately compiled pure-native wide specialization for every source format. */
+TEST_P(ROCmMoEGroupedWideWmma, CapturedPureAllCodebookReplay)
+{
+    const int ordinal = nativeGroupedWmmaDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    constexpr std::array rows{33};
+    const auto &format = GetParam();
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+        format.name,format.make,format.make,format.make,true,false,rows,512,DeviceId::rocm(ordinal),
+        llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma);
+}
+
+/** @test Gate/up share the same directory despite different physical IQ4 decoders. */
+TEST(Test__ROCmMoEKernel, WideWmmaMixedIQ4CapturedReplay)
+{
+    const int ordinal = nativeGroupedWmmaDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    constexpr std::array rows{33};
+    constexpr std::array counts{3,4,7,13,15,16,17,31};
+    const std::function<std::unique_ptr<TensorBase>(const std::vector<size_t>&,int)> mixed =
+        [](const std::vector<size_t> &shape,int seed) -> std::unique_ptr<TensorBase>
+    {
+        if (seed & 1) return TestTensorFactory::createIQ4_NLRandom(shape,seed);
+        return TestTensorFactory::createIQ4_XSRandom(shape,seed);
+    };
+    const std::function<std::unique_ptr<TensorBase>(const std::vector<size_t>&,int)> opposite =
+        [&](const std::vector<size_t> &shape,int seed) { return mixed(shape,seed ^ 1); };
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    using Floor = llaminar2::rocm::MoEGroupedWmmaRowFloor;
+    for (auto floor : {Floor::Four,Floor::Eight,Floor::Twelve,Floor::Sixteen})
+    {
+        const std::array limits = floor == Floor::Sixteen ? counts : std::array{3,4,7,8,11,12,13,31};
+        runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+            "WideMixedIQ4",mixed,opposite,mixed,true,false,rows,512,DeviceId::rocm(ordinal),
+            llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma,floor,limits);
+    }
+}
+
+/** @test Odd K32 partitions and incomplete macro/chunk columns retain serial arithmetic. */
+TEST(Test__ROCmMoEKernel, WideWmmaTailPartitionsCapturedReplay)
+{
+    const int ordinal = nativeGroupedWmmaDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    const auto formats = allMoEVerifierFormatCases();
+    const auto format = std::find_if(formats.begin(),formats.end(),[](const auto &f) { return std::string(f.name) == "Q8_0"; });
+    ASSERT_NE(format,formats.end());
+    constexpr std::array rows{33};
+    constexpr std::array counts{3,4,7,13,15,16,17,31};
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    for (int width : {96,288})
+        for (auto floor : {llaminar2::rocm::MoEGroupedWmmaRowFloor::EveryExpert,
+                           llaminar2::rocm::MoEGroupedWmmaRowFloor::Sixteen})
+            runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+                format->name,format->make,format->make,format->make,true,false,rows,width,DeviceId::rocm(ordinal),
+                llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma,floor,counts);
 }
 
 /** @brief Prove captured publication covers long physical route banks exactly. */

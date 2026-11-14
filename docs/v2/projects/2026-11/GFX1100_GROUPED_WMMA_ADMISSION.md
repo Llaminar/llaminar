@@ -384,3 +384,144 @@ shipping HIP targets pass the restored Release/Integration spill-guard builds.
 All 17 dispatch Unit cases and the two new full-capacity N32 controls (uniform
 and power-law) pass. `grouped-retired-checkpoint-receipt.json` binds those checks
 to the rebuilt artifacts and original native evidence.
+
+## Wide Dot4 and four-chunk WMMA candidate
+
+The follow-up candidate is implemented as an explicit `WideDot4Wmma` recording
+choice. Automatic remains OrderedDot4 while its full qualification runs. Gate/up
+retains TM12/TN256 for cold experts and down retains TM16/TN128. Hot experts use
+sixteen rows and four consecutive WMMA column chunks in the same workgroup.
+Each chunk retains only four FP32 outputs and the original serial partition order.
+One shared-memory union serves the mutually exclusive branches. Cooperative
+integer activation sums publish with operands at the first barrier; they do not
+add a third barrier per cold K32 block.
+
+`MoEGroupedRowPlan` seals role, floor and row-step kind into three bytes without
+expanding the 24-byte dot-admission packet. Both planner and consumer borrow it.
+The shared gate/up admission has no independently filtered codebook masks, so its
+two descriptors cannot disagree about directory offsets. The directory cache
+compares the complete plan. At floor16, counts13/15 produce two cold TM12 tiles;
+counts16/17/31 use native TM16 tiles. Down retains its own role-bound plan and
+source-width partition authority, including 96-column prepared slices.
+
+Release and Integration builds pass for gfx906 and gfx1100. The first Integration
+attempt found a test-only default-construction error for a required-admission
+argument packet; captured bytes now enter through `bit_cast`, and the final build
+passes. Release final allocation contains all18 physical formats ×2 roles ×2
+adaptive/pure variants:72 kernels,54–86 VGPRs,52–91 SGPRs,3536–6608 LDS bytes,
+wave64 and zero private memory, register spills or scratch instructions. gfx906
+emits no native WMMA body. These are compiler/ISA facts, not achieved occupancy.
+
+The device-free registration passes19 cases in0.46s, including row ownership,
+source aliases, malformed plans and capture-cache distinctions. Four Release
+smokes (Q4_0, Q2_K, IQ1_M and IQ4_XS) pass complete dirty replay, mixed counts,
+branch suppression and a captured96-column down/fold transaction. The latter
+poisons consumed down scratch and both publication banks; independently omitting
+down or fold must fail, followed by two successful dirty restored replays.
+Every native owner retired and the profiling hold was released. The source-bound
+receipt is `grouped-wide-smoke-receipt.json`; allocation and exact disassembly
+are bound by `grouped-wide-resource-review.json`.
+
+The focused feature gate contains nine registrations, preserving the old
+microtile inventories and adding MacroReplay, MacroPureReplay, MacroSplitReplay
+and MacroTimingReplay. New coverage includes all21 source formats, every floor
+through mixed IQ4 tables, physical23 promotion with13/31 and15/31 histograms,
+odd K32 tails, actual imported timing parents and exact role/row-plan assertions.
+Those registrations are explicitly listed in ProductionTestPreflight. The nine
+focused registrations pass in256.91s, containing162 actual GTests with no skips.
+The wrapper's exact stdout-summary assertion rejected CTest's optional spelling
+without the zero-failure clause. `grouped-wide-feature-authenticated.json` binds
+the original returncode0, nine successful registrations, all162 native outcomes,
+unchanged26-file producer and complete owner retirement; the original failed
+wrapper receipt is preserved and no tests were repeated.
+
+Canonical timing qualifies all five complete-operation cases: 17 live counts,
+four policies and 31 paired samples of eight operations, totaling 10,540 rows.
+Each accepted case has unchanged producer hashes and no observed competing work;
+five overlapped hotset attempts remain excluded. `grouped-wide-summary.json`
+and `grouped-wide-receipt.json` bind the results. Ratios below are Dot4 median
+latency divided by candidate median latency at full live work.
+
+| Case | Dot4 µs | N32 | N64 | Wide floor16 |
+|---|---:|---:|---:|---:|
+| Qwen uniform | 924.560 | 1.3070× | 1.2577× | 0.9161× |
+| Qwen hotset | 753.457 | 1.1690× | 1.1097× | 1.0206× |
+| Qwen power-law | 942.205 | 1.0511× | 1.0046× | 1.0593× |
+| Compact Q4_0 | 293.021 | 1.0489× | 0.9973× | 0.9018× |
+| Compact IQ2_S | 334.581 | 1.0687× | 0.9825× | 0.9088× |
+
+Wide floor16 retains near-Dot4 sparse uniform behavior (live64/128/256 ratios
+0.9856/0.9944/0.9889), but loses full uniform and both compact cases. It improves
+power-law live128/256/512 by 1.0416/1.0943/1.0593×. These results do not qualify
+an Automatic policy. All five exact profiles now qualify 35 independent counter
+passes. The timing/profile join is `grouped-wide-profile-timing-join.json`
+(SHA256 `720e84f19001e7712a5ccf580591c6cd2abadf8529264944fa92e2ebb88dee75`).
+IQ2_S gate/up uses 78 logical VGPRs, 5968 logical LDS bytes and zero scratch;
+hardware allocation is 80 VGPRs and 6144 LDS bytes. Its HIP resource query permits
+nine resident blocks per SM; this is not achieved occupancy. Hot/cold/mixed
+profiles report zero LDS bank conflicts. The down profile uses 86 logical VGPRs,
+3664 logical LDS bytes and 4096 allocated LDS bytes.
+
+The first reader rejected a valid native pass because it rounded LDS in bytes
+instead of DWORDs. GFX7–GFX11 allocation granularity is 128 DWORDs (512 bytes).
+A separately versioned reader and eleven regression controls authenticate the
+correction without modifying the frozen 38-file producer or recollecting valid
+raw observations. `grouped-wide-reader-v2-correction.json` retains the original
+failure and corrected proof.
+
+The next reviewed experiment uses a fine native-column grid: each hot block
+owns one N64 gate/up or N32 down chunk. Cold experts retain TM12/TN256 or
+TM16/TN128 using every fourth block; the other blocks return uniformly before
+any shared publication. This exposes hot column parallelism while preserving
+cold arithmetic and the sealed row plan, at the cost of extra inactive cold
+blocks. The fine grid is now applied after archiving the completed serial-chunk
+evidence, with pure-native 96/288 column-tail coverage. Normal guarded Release
+and Integration builds pass for gfx906/gfx1100. The actual Release object has
+72 variants: 51–87 VGPRs, 50–106 SGPRs, zero private memory, memory spills and
+scratch instructions. IQ1_M down/adaptive has two guard-authenticated scalar
+register moves; these do not spill to memory. All 19 device-free dispatch cases
+and four Release split-replay smoke tests pass.
+
+The promoted-storage capture test had one additional old-grid assertion outside
+the initial patch. It now checks N64/N32 native columns; the test owner was rebuilt,
+and all nine registrations/162 native tests pass in 262.65 seconds with no skips.
+The interrupted attempt and original binary remain in `grouped-fine-feature-repair/`. Release kernels and
+profile/timing producer identity did not change.
+
+The separate timing validator passes 13 negative controls; the profiler reader
+passes nine raw-record controls plus finite-scope CLI rejection checks. The
+serial-chunk producer is preserved in
+`grouped-wide-producer-snapshot/snapshot.json` (44 files plus the tracked patch);
+the completed join and corrected reader are also saved in
+`grouped-wide-final-qualification/`. The finer-grid candidate has its own complete
+producer, replay, timing and profile evidence:
+`grouped-fine-summary.json` authenticates all 10,540 samples, and all five profiles
+have seven independent accepted counters. `grouped-fine-profile-timing-join.json`
+binds them (SHA256 `092b468b226d748de40d711d317e07ceb297c0c7e83f91176e25ae27abd51983`).
+The 72-file archive is
+`grouped-fine-producer-snapshot/snapshot.json`, SHA256
+`c649d9f3064f4c26d8c2981970c0fa51cd4805eb57ee20c0ab8dad5bd499812e`.
+
+| Fine-grid case, full512 | Dot4 µs | N32 gain | Fine adaptive gain |
+|---|---:|---:|---:|
+| Qwen uniform | 911.225 | 1.3020× | 1.1890× |
+| Qwen hotset | 755.637 | 1.1747× | 1.1201× |
+| Qwen power-law | 942.160 | 1.0536× | 1.0606× |
+| Compact Q4_0 | 293.070 | 1.0486× | 0.9884× |
+| Compact IQ2_S | 334.621 | 1.0703× | 0.9723× |
+
+Sparse uniform live64/128/256 gives 0.9696/0.9651/0.9808×; power-law at those
+points gives 1.0887/1.0639/1.0704×. Live1 still regresses approximately 10% in
+Qwen shapes. These results improve the serial-chunk experiment but do not yet
+justify Automatic installation. The native-only N32 policy remains preferable
+at many dense work sizes.
+
+A separate cold-decoder scheduling experiment compiles for both HIP targets
+under the actual guard. An eight-register empty assembly constraint completes
+decoding before activation publication. IQ2_S gate/up drops 79→72 VGPRs and down
+87→81; 26 adaptive variants improve and ten are unchanged. All 36 pure variants
+retain identical resources; every variant has zero private memory, memory spills
+and scratch. ISA review confirms the sign operations now precede the barrier.
+This is isolated compile evidence only, in
+`grouped-fine-decode-fence-diagnostic/`; live replay and performance qualification
+remain required before applying a performance claim.
