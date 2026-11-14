@@ -5956,3 +5956,27 @@ prebuild, (3) full Unit+Preflight driver -j4. NOW in parity -j1
 phase (7.3G/28G safe). Will report DRIVER_RC + the failed-set diff
 vs the WSL d5e04fdce base when done. Sequence correct; nothing
 else pending on WSL.
+
+### WSL BINDING GATE SEALED (6ca2462cc) + PINS DISPATCHED (13:17Z)
+
+WSL: DRIVER_RC=8; test_count=3563 (unit 994, host 2457, cuda-socket
+3, rocm-socket 4, exclusive 105); 4263.9s. FAILED-SET = 10 (5 unit
++ 5 host; cuda/rocm-socket + exclusive ALL PASS) — ALL KNOWN WSL-
+BASELINE classes (ROCmNativeQuantisedTrainer x4 + ShmemSpinBackend
+_NP8 = no /proc/self/io; CPURootedGather x2 + CPUStartupAffinity +
+ShmemSpinAbsorbingAbortReplay = single-socket NUMA;
+PrefixCacheShutdownMPI_8 = MPI/hwloc). NO bucket-b / MoE /
+prepared-layout authority class on x86. SEAL K14-STAGEAGATE-X86-
+6CA2462CC (a235e364...). Procedure per Main (oneDNN authority re-
+verified, CONFIGURE_RC=0; parity TU explicit `ninja -j1`
+PARITY_RC=0; driver -j4). INFRA FIX: `cmake --build --parallel`
+(no number) does NOT pass -j to ninja (all cores -> OOM); explicit
+ninja -j1; parity peak 4.8GB. NOW RUNNING SERIAL: WSL d5e04fdce
+base control gate (same procedure) for the failed-set delta + no-
+bucket-b regression confirmation. **PINS DISPATCHED (Main's
+seq-572 rule: the x86 gate sealed): A3-fixup + A4 @ 6ca2462cc to
+the reviewer (range d5e04fdce..6ca2462cc; docs-only named; ARM
+seal + x86 byte identity + x86 binding seal; Gate-A range verdict
+request).** Developing: waiting = WSL base delta + the develop
+discriminator re-run (after the base, serially) -> Main's PR call
+on AutomaticPlanningDiagnostics; pins/backlogs = reviewer verdict.
