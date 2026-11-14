@@ -5593,3 +5593,33 @@ registration-set artifact (Main's hypothesis confirmed at source,
 modulo sparks' ctest -N). Relayed to sparks (A/B/C for the gate
 result); evidence on record. Gate-A requires (A) green + (B) all
 classified + WSL x86 binding gate at 1af9f6429.
+
+### .79 triage-tip gate COMPLETE: 16/17; ONE red (JointReplicaSearch); (B)/(C) classified (04:58Z)
+
+SPARKS: .79 gate @ 1af9f6429 DONE RC_DRIVER=8 RC_FOCUS=8 RC_CUDA=0;
+BUILD clean; preflight 4494 (rc 8); FOCUS 17/19 (2 known: whole-
+binary CUDA skip-regex + V2_Perf_CUDA_ExpertTierWeightStreaming
+0.06s); CUDA filtered 26/0. JUnit sa-results-1af9f6429/. (A) 16/17
+bucket-b GREEN; **1 RED (Gate-A blocked): V2_Integration_MoE
+PipelineAggregateCapacity -> MoEOverlayPipelineCapacity.
+JointReplicaSearchPreservesEveryStageAndRetainedGrant — verbatim:
+the uniform-layout throw "requires the inventory-bound uniform CPU
+prepared layout for every CPU resource" in the test body = the
+lane's Fixture::admit sweep is ONE CALL SITE SHORT.** (Sparks
+self-corrected: short-name check = invalid; full-name recheck =
+the correct red.) (B) 12 CUDA = **FULLY CLASSIFIED: registration-
+set artifacts + UNQUALIFIED** (registrations HAVE_NCCL-gated,
+absent from the base ctest -N; same registration files both SHAs:
+NativePipelineByte/+NativeCountedAllGather = CMakeLists.txt,
+CapturedNativePeerVisibility = V2NativePeerVisibilityTests.cmake,
+NativeCompleted_CUDA = test_production_parity_campaigns.py; 0
+chain commits; JUnit verbatim "Required native family/edge cohort
+is absent from every original NUMA-local rank"; NativeCounted
+AllGather.CUDA2 = MPI_PROCS 2 — ALL 12 = 2-rank/2-device => UNQUALIFIED
+single-GPU GB10 (SecondaryDevice rule), NOT chain defects). (C)
+CachedGraphReplayExecution_CUDA = FLAKY NOT ATTRIBUTABLE (red base
++ green 03480d07e + red tip; 1525-stage driver-memory boundary
+gtest, margin-level 679ms). BASE control sealed (193 fails; tip
+206 = 221 -16 +1). GATE-A: blocked ONLY on the one fix + .79 rerun
+@ successor; then WSL x86 binding gate @ successor. Lane dispatched
+(one call-site fix); Main informed.
