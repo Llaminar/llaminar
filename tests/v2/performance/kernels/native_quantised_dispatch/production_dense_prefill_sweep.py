@@ -24,6 +24,8 @@ to original source codebook. Current schema rejects old or relabeled IQ4_XS
 rows; source4 and physical24 are never collapsed into a synthetic measurement.
 A typed installed-versus-WMMA scope narrows only the candidate roster. Its cell,
 batch and plan identities remain distinct from exhaustive historical evidence.
+Optional v6 plans freeze the installed base against the actual linked selector
+table before collection, preserving unbound v4/v5 evidence without relabeling it.
 """
 
 from __future__ import annotations
@@ -42,7 +44,9 @@ import threading
 import uuid
 from dataclasses import dataclass
 from enum import Enum, IntEnum
+from functools import lru_cache
 from pathlib import Path
+from types import MappingProxyType
 from typing import Iterable, Mapping, Sequence
 
 from .gpu_architecture import GPUArchitecture
@@ -232,6 +236,7 @@ DEFAULT_BENCH_RUNS = 10
 SWEEP_PLAN_FILENAME = "production_dense_prefill.plan.json"
 SWEEP_PLAN_SCHEMA = "native-quantised-production-dense-prefill-sweep-v4"
 SCOPED_SWEEP_PLAN_SCHEMA = "native-quantised-production-dense-prefill-sweep-v5"
+BOUND_SWEEP_PLAN_SCHEMA = "native-quantised-production-dense-prefill-sweep-v6"
 DENSE_PREFILL_CAPTURED_OPERATIONS = 16
 CELL_MANIFEST_SCHEMA = "native-quantised-production-dense-prefill-cell-v1"
 _UINT64_MAX = (1 << 64) - 1
@@ -1128,6 +1133,7 @@ def _sweep_plan_payload(
     trainer: Mapping[str, object],
     warmup_runs: int,
     bench_runs: int,
+    installed_policy: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Construct the complete content-addressed sweep-plan payload."""
 
@@ -1149,8 +1155,15 @@ def _sweep_plan_payload(
     native_targets = {cell.gpu_architecture for cell in cells if cell.prepared_family is not None}
     if native_targets and (None in native_targets or len(native_targets) != 1):
         raise ValueError("native Q8 collection requires one explicit architecture")
+    if installed_policy is not None:
+        if candidate_scope is not DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA:
+            raise ValueError("installed policy binding requires the explicit native-WMMA candidate scope")
+        from .dense_prefill_policy_binding import validate_installed_policy
+        validate_installed_policy(installed_policy, trainer)
     body: dict[str, object] = {
-        "schema_version": SWEEP_PLAN_SCHEMA if candidate_scope is DenseCandidateScope.EXHAUSTIVE else SCOPED_SWEEP_PLAN_SCHEMA,
+        "schema_version": (BOUND_SWEEP_PLAN_SCHEMA if installed_policy is not None else
+                           SWEEP_PLAN_SCHEMA if candidate_scope is DenseCandidateScope.EXHAUSTIVE else SCOPED_SWEEP_PLAN_SCHEMA),
+        **({"installed_policy": dict(installed_policy)} if installed_policy is not None else {}),
         **({"candidate_scope": candidate_scope.value} if candidate_scope is not DenseCandidateScope.EXHAUSTIVE else {}),
         "backend": normalized,
         "format_registry_digest": registry_digest(),
@@ -1187,12 +1200,14 @@ def _read_sweep_plan(path: Path) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: sweep plan must be a JSON object")
     schema = payload.get("schema_version")
-    if schema not in (SWEEP_PLAN_SCHEMA, SCOPED_SWEEP_PLAN_SCHEMA):
+    if schema not in (SWEEP_PLAN_SCHEMA, SCOPED_SWEEP_PLAN_SCHEMA, BOUND_SWEEP_PLAN_SCHEMA):
         raise ValueError(f"{path}: unsupported sweep-plan schema")
     if ((schema == SWEEP_PLAN_SCHEMA and "candidate_scope" in payload) or
-            (schema == SCOPED_SWEEP_PLAN_SCHEMA and payload.get("candidate_scope") !=
+            (schema in (SCOPED_SWEEP_PLAN_SCHEMA, BOUND_SWEEP_PLAN_SCHEMA) and payload.get("candidate_scope") !=
              DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA.value)):
         raise ValueError(f"{path}: sweep-plan schema and candidate scope disagree")
+    if (schema == BOUND_SWEEP_PLAN_SCHEMA) != ("installed_policy" in payload):
+        raise ValueError(f"{path}: sweep schema and installed-policy binding disagree")
     recorded_digest = payload.get("plan_digest")
     unsigned = dict(payload)
     unsigned.pop("plan_digest", None)
@@ -1203,6 +1218,9 @@ def _read_sweep_plan(path: Path) -> dict[str, object]:
         payload.get("trainer_provenance_digest") != _mapping_digest(trainer)
     ):
         raise ValueError(f"{path}: trainer provenance digest mismatch")
+    if schema == BOUND_SWEEP_PLAN_SCHEMA:
+        from .dense_prefill_policy_binding import validate_installed_policy
+        validate_installed_policy(payload["installed_policy"], trainer)
     return payload
 
 
@@ -1214,12 +1232,13 @@ def write_sweep_plan(
     *,
     warmup_runs: int = DEFAULT_WARMUP_RUNS,
     bench_runs: int = DEFAULT_BENCH_RUNS,
+    installed_policy: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Create one immutable plan, or prove an existing plan is identical."""
 
     path = Path(path)
     expected = _sweep_plan_payload(
-        backend, cells, trainer, warmup_runs, bench_runs
+        backend, cells, trainer, warmup_runs, bench_runs, installed_policy
     )
     if path.exists():
         existing = _read_sweep_plan(path)
@@ -1248,7 +1267,7 @@ def load_sweep_plan(
     trainer = existing["trainer_provenance"]
     assert isinstance(trainer, dict)
     expected = _sweep_plan_payload(
-        backend, cells, trainer, warmup_runs, bench_runs
+        backend, cells, trainer, warmup_runs, bench_runs, existing.get("installed_policy")
     )
     if existing != expected:
         raise ValueError(
@@ -1256,6 +1275,24 @@ def load_sweep_plan(
             "the immutable sweep plan"
         )
     return existing
+
+
+@lru_cache(maxsize=32)
+def _canonical_cell_catalog(backend: str, prepared_family: DensePreparedWeightFamily | None = None,
+                            gpu_architecture: str | None = None,
+                            candidate_scope: DenseCandidateScope = DenseCandidateScope.EXHAUSTIVE
+                            ) -> Mapping[str, DensePrefillCell]:
+    """Share immutable source-owned inventory across repeated evidence validation.
+
+    The catalog contains only frozen declarations and never caches plan bytes,
+    completion markers, clocks or producer evidence. Every read below still
+    authenticates those mutable artifacts. Reconstructing and hashing thousands
+    of unrelated declarations for every profile request otherwise dominates the
+    device-free publication and regression loop.
+    """
+    return MappingProxyType({cell.cell_id: cell for cell in production_dense_prefill_cells(
+        backend, prepared_family=prepared_family, gpu_architecture=gpu_architecture,
+        all_native_formats=prepared_family is not None, candidate_scope=candidate_scope)})
 
 
 def load_planned_dense_prefill_cells(
@@ -1272,18 +1309,15 @@ def load_planned_dense_prefill_cells(
     if not isinstance(planned_rows, list) or not planned_rows:
         raise ValueError(f"{path}: sweep plan has no cells")
 
-    available = {
-        cell.cell_id: cell
-        for cell in production_dense_prefill_cells(normalized)
-    }
+    available = dict(_canonical_cell_catalog(normalized))
     if normalized == "rocm":
         targets = {(row.get("gpu_architecture"),DenseCandidateScope(row.get("candidate_scope","exhaustive")))
                    for row in planned_rows if isinstance(row, dict) and row.get("prepared_family") == "native_quantised"}
         for target, candidate_scope in targets:
             if target is None:
                 raise ValueError("native Q8 plan lacks its architecture; unqualified records cannot be relabeled")
-            available.update({cell.cell_id: cell for cell in production_dense_prefill_cells(
-                normalized, prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture=target, all_native_formats=True, candidate_scope=candidate_scope)})
+            available.update(_canonical_cell_catalog(
+                normalized, DensePreparedWeightFamily.NATIVE_QUANTISED, target, candidate_scope))
     selected = []
     seen: set[str] = set()
     for index, row in enumerate(planned_rows):
@@ -1815,6 +1849,7 @@ def run_missing_accelerator_cells(
     bench_runs: int = DEFAULT_BENCH_RUNS,
     maximum_new_cells: int | None = None,
     producer: Mapping[str, object] | None = None,
+    installed_policy: Mapping[str, object] | None = None,
 ) -> tuple[DensePrefillCell, ...]:
     """Run distinct missing cells concurrently, one worker per physical GPU."""
 
@@ -1838,6 +1873,8 @@ def run_missing_accelerator_cells(
         trainer_provenance(binary, backend)
         if producer is None else dict(producer)
     )
+    if installed_policy is None and (root / SWEEP_PLAN_FILENAME).exists():
+        installed_policy = _read_sweep_plan(root / SWEEP_PLAN_FILENAME).get("installed_policy")
     plan = write_sweep_plan(
         root / SWEEP_PLAN_FILENAME,
         backend,
@@ -1845,6 +1882,7 @@ def run_missing_accelerator_cells(
         producer,
         warmup_runs=warmup_runs,
         bench_runs=bench_runs,
+        installed_policy=installed_policy,
     )
     missing = [
         cell for cell in cells
@@ -2060,8 +2098,12 @@ def main() -> int:
         )
     plan_command = subparsers.choices["plan"]
     plan_command.add_argument("--binary", type=Path, required=True)
+    plan_command.add_argument("--installed-base-include", type=Path,
+                              help="freeze the actual compiled installed base before selective collection")
     run = subparsers.choices["run"]
     run.add_argument("--binary", type=Path, required=True)
+    run.add_argument("--installed-base-include", type=Path,
+                     help="freeze a new installed base or require exact bytes when resuming")
     run.add_argument("--devices", type=_parse_devices, required=True)
     run.add_argument("--maximum-new-cells", type=int)
 
@@ -2070,6 +2112,19 @@ def main() -> int:
         parser.error("timing cardinalities must be positive")
     cells = _filtered_cells(args)
     plan_path = args.output_dir / SWEEP_PLAN_FILENAME
+    installed_policy = None
+    if args.command in ("plan", "run"):
+        if plan_path.exists():
+            installed_policy = _read_sweep_plan(plan_path).get("installed_policy")
+        if args.installed_base_include is not None:
+            if installed_policy is not None:
+                if args.installed_base_include.read_bytes().decode("utf-8") != installed_policy["base_text"]:
+                    raise ValueError("resumed dense policy differs from its frozen original base")
+            else:
+                if plan_path.exists():
+                    raise ValueError("an existing unbound plan cannot acquire an installed-base witness")
+                from .dense_prefill_policy_binding import freeze_installed_policy
+                installed_policy = freeze_installed_policy(args.installed_base_include, args.binary)
     if args.command == "plan":
         producer = trainer_provenance(args.binary, args.backend)
         require_release_trainer(producer)
@@ -2080,6 +2135,7 @@ def main() -> int:
             producer,
             warmup_runs=args.warmup_runs,
             bench_runs=args.bench_runs,
+            installed_policy=installed_policy,
         )
         print(f"planned {len(cells)} cells in {plan_path}")
     elif args.command == "run":
@@ -2092,6 +2148,7 @@ def main() -> int:
             args.devices,
             warmup_runs=args.warmup_runs,
             bench_runs=args.bench_runs,
+            installed_policy=installed_policy,
             maximum_new_cells=args.maximum_new_cells,
             producer=producer,
         )

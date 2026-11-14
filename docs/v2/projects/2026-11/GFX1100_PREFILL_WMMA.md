@@ -32,7 +32,7 @@ production dispatch: GPU prepared quantized weights use NativeQuantised adapters
 
 | Area | Implementation | Functional/component evidence | Performance evidence |
 |---|---|---|---|
-| Broader dense dispatch | Existing native kernel; inventory audited | Prior two-anchor all-codebook proof remains valid for its original producer | Broader collection and generated installation pending |
+| Broader dense dispatch | Bound installed-Auto/WMMA collector and selective publisher | Core-table ownership replay, eight binding and 16 decision regressions pass | 84 cells complete; 68 candidate keys gain1.25–2.04×; profile/install pending |
 | Grouped MoE | Wave64 M16N32/N64 plus explicit whole-expert row floors4/8/12/16; all physical decoders | Serial, promoted, all-format mixed-writer, threshold/reset and split/sliced-down replay pass | Clean full-live N32 gains 1.04–1.30× across five anchors. Hybrid power-law and sparse replay regress; Automatic remains Dot4 |
 | Attention | Native four-plane QK candidate for HD256/tile16×16, all native KV formats and query/context schedules | Four new retained tests pass: all formats, B2/GQA/ring, 64K/partial/reset, half extrema and forced rejection. Existing lifecycle/reference gates pass | Fixed-M512 1K–64K scaling gate passes; 64K gains 1.15× dense / 1.13× MoE. Native direct/context profiles have zero spills; Automatic remains Dot2 |
 | Q8 router | Automatic Sixteen-wave tile for exact whole-row M512/K2560/E512; explicit 4/8/16-wave candidates retained | 14 GPU feature cases, five pure policy cases and both timing owners pass; actual Auto template, ownership and submission counters authenticated | Actual Auto wins all 12 measured prefix/basis cells: full512 gains 2.744×/2.551×; fresh profile has zero spills |
@@ -40,11 +40,8 @@ production dispatch: GPU prepared quantized weights use NativeQuantised adapters
 
 [Router qualification](GFX1100_ROUTER_LIVE_PREFILL.md) records admission, retained-prefix timing and profiles.
 
-Router timing includes input quantization, logits and, for Hadamard input,
-restoration of the original expert Q8 bank. The component harness alternates
-31 paired native-event samples over 16 serial captured operations, after ten
-warmups. Profiling uses a separate explicitly selected test and one ROCTx region;
-it cannot run accidentally as part of the ordinary MoE speedometer.
+Router timing covers quantization, logits and original Q8 restoration, with
+31 paired samples of16 complete captured operations. Profiling is separate.
 
 Grouped functional owners are `V2_Integration_ROCmGroupedWmmaReplay` and
 `V2_Integration_ROCmGroupedWmmaSplitReplay`, both explicitly registered in
@@ -126,12 +123,15 @@ zero scratch/spills/LDS conflicts. GPU busy 100%, memory busy 71.47%, L2 hit 95.
 AUTO power restored. [Qualification](GFX1100_ROUTER_LIVE_PREFILL.md) separates
 current Auto evidence from the prior 144-cell candidate tournament.
 
-Dense collection now has an explicit installed-Auto plus four-WMMA protocol,
-with separate cell/batch/v5-plan identity and unchanged exhaustive v4 evidence.
-All 80 collector tests and the registered evidence gate pass; the Release trainer
-builds for gfx906/gfx1100. This enables a declared finite broader-shape collection;
-no new dense rows are installed by that tooling slice. See
-[the scoped collector](GFX1100_DENSE_PREFILL_CANDIDATE_SCOPE.md).
+Dense v6 plans now bind original include bytes to the compiled core table and
+Release producer. A loader replay reproduces and guards the repaired table
+interposition defect. Complete typed install/retain decisions preserve every
+unchanged row and generic absence; only per-alias profitable WMMA changes need
+new profiles. All-retain produces byte-identical policy and a no-change receipt.
+The broader slice completed84cells (two shapes, M512/M1024, all21formats).
+All68 runtime keys have profitable WMMA candidates, gaining1.25–2.04×. Six
+focused registered gates pass;168 winner/baseline profiles and installed-Auto
+qualification remain. [Evidence and protocol](GFX1100_DENSE_PREFILL_CANDIDATE_SCOPE.md).
 
 The floating audit authenticates the runtime-dumped vendor code object against
 the installed rocBLAS image, including all 17 traced symbols/entry offsets:
@@ -170,17 +170,8 @@ The QK probe gathers four planes with dimension `8*(k/2)+2*plane+(k%2)`;
 four consecutive K16 WMMA updates per plane reproduce the existing fdot2
 chains and their final ordered FP32 fold. Keep FP32 probabilities and ascending
 conditional PV updates initially: FP16 PV would introduce a separate numerical
-change. The independent million-output probe is supplemented by four production captured
-replay tests registered as `V2_Integration_ROCmFlashAttentionWmmaQKReplay`
-(7.49 seconds), plus the existing register-score lifecycle and independent ring
-reference gates. Both shipping HIP architectures compile with zero spills.
-These correctness results do not establish performance.
-Scaling must hold fixed query rows, geometry, precision and retained capacity;
-measure 1K/2K/4K/8K/16K/32K/64K live KV including each selected graph’s work.
-The M512 default graph contains its count producer and direct attention; the
-separate canonical context oracle includes phase summaries and the reducer.
-Fit latency with an intercept: causal useful pairs are `512*(KV-255.5)`.
-Retain byte checks, partial queries and ring-wrap/reset coverage at the long end.
+change. The fixed-query results above include complete captured attention work,
+partial/reset checks and the canonical context-reduction oracle.
 
 Local raw evidence for this extension is under
 `/tmp/llaminar-gfx1100-wmma-prefill-evidence`; the earlier goal's evidence and

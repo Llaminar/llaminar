@@ -29,7 +29,10 @@
  * schedule authority. Candidate inspection proves the actual physical launch
  * before either CSV row can be published, never reinterpreting old measurements.
  *
- * @note Requires ROCm device. Run with build_v2_release for representative timing.
+ * Cold policy admission hashes the linked selector table independently of the
+ * trainer-local inventory; all timed paths still use the production selector.
+ *
+ * @note Kernel measurements require a ROCm device. Run with build_v2_release for representative timing.
  */
 
 #include <gtest/gtest.h>
@@ -61,7 +64,7 @@
 #include "kernels/rocm/gemm/ROCmDensePrefillPreparedWeightFamily.h"
 #include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"
 #include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.h"
-#include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlayGenerated.inc"
+#include "kernels/rocm/gemm/ROCmDensePrefillPolicyEvidence.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedWmmaPolicy.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
@@ -70,6 +73,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/Sha256.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/ScopedGPUStream.h"
@@ -2052,9 +2056,10 @@ namespace
 #else
         ASSERT_TRUE(has_device_);
         const auto actual_hardware = nativeQuantisedHardwareForDevice(0);
+        const auto installed_entries = densePrefillInstalledEntries();
         std::map<std::pair<int, int>, std::set<int>> geometries;
         std::size_t geometry_count = 0;
-        for (const auto &entry : generated::kROCmDensePrefillOverlayEntries)
+        for (const auto &entry : installed_entries)
             if (!entry.architecture.observed() &&
                 geometries[{entry.n, entry.k}].insert(entry.m).second) ++geometry_count;
         ASSERT_FALSE(geometries.empty());
@@ -2134,15 +2139,15 @@ namespace
                 // rows. Lookup and execution agreeing on a retained legacy
                 // producer must not conceal a missed WMMA installation.
                 expected_native_wmma_cases += std::count_if(
-                    std::begin(generated::kROCmDensePrefillOverlayEntries),
-                    std::end(generated::kROCmDensePrefillOverlayEntries), [&](const auto &row) {
+                    std::begin(installed_entries),
+                    std::end(installed_entries), [&](const auto &row) {
                         return row.codebook == codebook &&
                             row.family == DensePrefillWeightFamily::NativeQuantised &&
                             row.architecture == native_hardware.architecture &&
                             row.config.producer == VNNIPrefillProducer::NativeWmma;
                     });
                 std::set<std::tuple<int, int, int>> tested;
-                for (const auto &entry : generated::kROCmDensePrefillOverlayEntries)
+                for (const auto &entry : installed_entries)
                 {
                     if (entry.codebook != codebook || entry.family != DensePrefillWeightFamily::NativeQuantised ||
                         !entry.architecture.observed() || !tested.emplace(entry.m, entry.n, entry.k).second) continue;
@@ -2191,6 +2196,42 @@ namespace
 
     INSTANTIATE_TEST_SUITE_P(InstalledDensePrefill, InstalledDensePrefillOverlayTest,
                              ::testing::Range(0, kInstalledDensePrefillSourceGroups));
+
+    /** @test Authenticate the linked selector's complete table without opening a GPU.
+     * Canonical decimal rows retain every key/config/architecture field and end
+     * in a newline. Python independently parses the frozen generated include;
+     * matching hashes join those bytes to the measured executable/core closure.
+     * This cold query never supplies timing or recertifies retained observations.
+     */
+    TEST(ROCmDensePrefillPolicy, CompiledInventory)
+    {
+#ifdef HAVE_ROCM
+        const auto entries = densePrefillInstalledEntries();
+        ASSERT_FALSE(entries.empty());
+        std::string canonical = "rocm-dense-prefill-installed-rows-v1\n";
+        for (const auto &entry : entries)
+        {
+            const auto &config = entry.config;
+            const std::array<std::int64_t,15> fields{entry.codebook,entry.m,entry.n,entry.k,
+                static_cast<int>(entry.family),config.n_tile,config.m_tile,config.min_blocks,
+                config.unroll,int(config.full_tiles),static_cast<int>(config.producer),
+                static_cast<int>(entry.architecture.backend),entry.architecture.major,
+                entry.architecture.minor,entry.architecture.stepping};
+            for (std::size_t index = 0; index < fields.size(); ++index)
+            {
+                if (index) canonical += ',';
+                canonical += std::to_string(fields[index]);
+            }
+            canonical += '\n';
+        }
+        std::string error;
+        const auto digest = sha256BytesHex(canonical,&error);
+        ASSERT_TRUE(digest.has_value()) << error;
+        std::cout << "ROCM_DENSE_PREFILL_POLICY_V1," << entries.size() << ",sha256:" << *digest << '\n';
+#else
+        GTEST_SKIP() << "HAVE_ROCM not defined";
+#endif
+    }
 
     TEST_F(NativeQuantisedSweepTest, TrainerCsv_CodebookTagged)
     {

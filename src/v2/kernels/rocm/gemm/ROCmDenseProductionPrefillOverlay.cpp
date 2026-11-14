@@ -6,9 +6,17 @@
  * time admission proves its sorted unique keys and producer ABIs before a
  * binary can publish them. Lookup returns the measured value unchanged; the
  * caller's existing generic policy continues to own every unmeasured geometry.
+ * Cold evidence readers borrow this same compiled table; a trainer-local copy
+ * cannot authenticate the linked selector's installed policy generation.
  */
 #include "ROCmDenseProductionPrefillOverlay.h"
+#include "ROCmDensePrefillPolicyEvidence.h"
+// The generated inline object must remain private to this library. Otherwise
+// ELF executable interposition can substitute a stale trainer-local table for
+// both production lookup and its evidence view despite different core bytes.
+#pragma GCC visibility push(hidden)
 #include "ROCmDenseProductionPrefillOverlayGenerated.inc"
+#pragma GCC visibility pop
 #include <algorithm>
 #include <iterator>
 #include <stdexcept>
@@ -98,6 +106,8 @@ consteval bool completeInventory()
 static_assert(completeInventory(), "ROCm ordinary-prefill overlay violates key or producer admission");
 }
 bool densePrefillExactOverlayEnabled() noexcept { return exact_enabled; }
+std::span<const generated::ROCmDensePrefillOverlayEntry> densePrefillInstalledEntries() noexcept
+{ return generated::kROCmDensePrefillOverlayEntries; }
 void setDensePrefillExactOverlayEnabled(bool enabled) noexcept { exact_enabled = enabled; }
 std::optional<DensePrefillExactConfig> selectDensePrefillExactConfigFromEntries(
     std::span<const generated::ROCmDensePrefillOverlayEntry> entries,

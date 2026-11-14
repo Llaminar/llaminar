@@ -3,13 +3,14 @@
  * @brief Device-free ownership, totality and isolation of dense ROCm exact dispatch.
  *
  * These tests inspect immutable policy and construction-thread state only. No
- * HIP dependency or accelerator is linked. Captured execution and all source
+ * HIP dependency or accelerator is linked. Readers borrow the production
+ * table instead of defining another generated object. Captured execution and all source
  * formats are proved separately by the explicit backend integration gate.
  * Installed M512 HC-down observations retain architecture-specific physical
  * tiles; authored-only neighbor rows keep later measured additions admissible.
  */
 #include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.h"
-#include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlayGenerated.inc"
+#include "kernels/rocm/gemm/ROCmDensePrefillPolicyEvidence.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
@@ -147,7 +148,7 @@ TEST_F(ROCmDensePrefillOverlay, ExactRowsDoNotConsumeUnmeasuredGeometry)
     // every intervening M independently so nearest-bucket dispatch cannot
     // consume an unmeasured cell as that inventory grows.
     std::set<int> measured_rows;
-    for (const auto &entry : generated::kROCmDensePrefillOverlayEntries)
+    for (const auto &entry : densePrefillInstalledEntries())
         if (entry.codebook == 0 && entry.n == 512 && entry.k == 5120)
             measured_rows.insert(entry.m);
     ASSERT_FALSE(measured_rows.empty());
@@ -167,7 +168,7 @@ TEST_F(ROCmDensePrefillOverlay, ExactRowsDoNotConsumeUnmeasuredGeometry)
 /** @brief A prepared physical ABI cannot reinterpret a measured foreign producer. */
 TEST_F(ROCmDensePrefillOverlay, RejectsInvalidGeometryAndWeightAuthority)
 {
-    const auto &entries = generated::kROCmDensePrefillOverlayEntries;
+    const auto entries = densePrefillInstalledEntries();
     for (const auto &entry : entries)
     {
         const llaminar2::native_quantised::NativeQuantisedGPUHardware actual{
@@ -226,21 +227,24 @@ TEST_F(ROCmDensePrefillOverlay, NativeQ8AndExpandedInt8HaveDistinctKeys)
     EXPECT_EQ(expanded->m_tile, 16);
     EXPECT_EQ(expanded->unroll, 4);
 
-    // Exercise the actual generated ordering with two possible physical
+    // Exercise the actual production ordering with two possible physical
     // contracts at identical decoder and geometry; neither is an alias.
     const generated::ROCmDensePrefillOverlayEntry native{
         19, 64, 512, 5120, DensePrefillWeightFamily::NativeQuantised,
-        {64, 16, 1, 4, false, VNNIPrefillProducer::NativeCooperative}};
+        {64, 16, 1, 4, false, VNNIPrefillProducer::NativeCooperative},
+        llaminar2::native_quantised::NativeQuantisedArchitecture::rocm(9,0,6)};
     const generated::ROCmDensePrefillOverlayEntry int8{
         19, 64, 512, 5120, DensePrefillWeightFamily::Int8Blockwise, *expanded};
-    EXPECT_EQ(generated::compareROCmDensePrefillOverlayKey(native, 19, 64, 512, 5120,
-        DensePrefillWeightFamily::NativeQuantised), 0);
-    EXPECT_LT(generated::compareROCmDensePrefillOverlayKey(native, 19, 64, 512, 5120,
-        DensePrefillWeightFamily::Int8Blockwise), 0);
-    EXPECT_GT(generated::compareROCmDensePrefillOverlayKey(int8, 19, 64, 512, 5120,
-        DensePrefillWeightFamily::NativeQuantised), 0);
-    EXPECT_EQ(generated::compareROCmDensePrefillOverlayKey(int8, 19, 64, 512, 5120,
-        DensePrefillWeightFamily::Int8Blockwise), 0);
+    EXPECT_LT(native.orderingKey(),int8.orderingKey());
+    const std::array entries{native,int8};
+    const llaminar2::native_quantised::NativeQuantisedGPUHardware hardware{
+        native.architecture,0,60,64,1024,65536};
+    for (const auto &entry : entries)
+    {
+        const auto selected=selectDensePrefillExactConfigFromEntries(entries,19,64,512,5120,entry.family,&hardware);
+        ASSERT_TRUE(selected.has_value());
+        EXPECT_EQ(selected->producer,entry.config.producer);
+    }
 }
 /** @brief Author native-Q8 observations without installing measured policy rows. */
 generated::ROCmDensePrefillOverlayEntry nativeQ8Row(

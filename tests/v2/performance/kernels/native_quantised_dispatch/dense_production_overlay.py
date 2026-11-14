@@ -278,15 +278,15 @@ def _geometric_mean(values: Sequence[float]) -> float:
     return math.exp(statistics.fmean(math.log(value) for value in values))
 
 
-def collect_dense_overlay_entries(
+def collect_dense_observations(
     root: Path,
     backend: str,
     *,
     cells: Sequence[DensePrefillCell] | None = None,
     warmup_runs: int = DEFAULT_WARMUP_RUNS,
     bench_runs: int = DEFAULT_BENCH_RUNS,
-) -> tuple[DenseOverlayEntry, ...]:
-    """Validate cells and pool source aliases into runtime dispatch entries."""
+) -> tuple[tuple[DensePrefillCell, ...], dict, dict]:
+    """Authenticate complete original cells before any concrete or retained decision."""
 
     normalized = backend.strip().lower()
     if cells is None:
@@ -347,6 +347,21 @@ def collect_dense_overlay_entries(
         )
         grouped.setdefault(key, []).append((cell, aggregate, timing))
 
+    return tuple(selected_cells), plan, grouped
+
+
+def collect_dense_overlay_entries(
+    root: Path,
+    backend: str,
+    *,
+    cells: Sequence[DensePrefillCell] | None = None,
+    warmup_runs: int = DEFAULT_WARMUP_RUNS,
+    bench_runs: int = DEFAULT_BENCH_RUNS,
+) -> tuple[DenseOverlayEntry, ...]:
+    """Validate cells and pool source aliases into concrete runtime entries."""
+    normalized = backend.strip().lower()
+    selected_cells, _, grouped = collect_dense_observations(
+        root, normalized, cells=cells, warmup_runs=warmup_runs, bench_runs=bench_runs)
     result = []
     for key in sorted(grouped):
         observations = grouped[key]
@@ -732,7 +747,7 @@ def render_dense_overlay(entries: Sequence[DenseOverlayEntry]) -> str:
 
 
 def _split_generated_overlay(
-    encoded: str, backend: str,
+    encoded: str, backend: str, *, preserve_envelope: bool = False,
 ) -> tuple[str, dict[DenseOverlayKey, str], str]:
     """Authenticate the generated ABI and index exact rows without rewriting them.
 
@@ -821,6 +836,8 @@ def _split_generated_overlay(
         rows[key] = line
     if not rows or tuple(rows) != tuple(sorted(rows)):
         raise ValueError("retained dense overlay keys must be nonempty and sorted")
+    if preserve_envelope:
+        return prefix + marker, rows, suffix
     return expected_prefix + marker, rows, expected_suffix
 
 
@@ -967,6 +984,18 @@ def main() -> int:
     parser.add_argument("--profiler-requests", type=Path, help="Required for new architecture-qualified native publication")
     parser.add_argument("--profiler-evidence", type=Path, help="Separate complete winner/actual-Auto hardware-counter evidence")
     args = parser.parse_args()
+    _, plan = load_planned_dense_prefill_cells(args.work_dir / SWEEP_PLAN_FILENAME, args.backend)
+    if "installed_policy" in plan:
+        if args.retain_base_include is None or args.retention_receipt is None:
+            raise ValueError("bound selective publication requires the original base and a decision receipt")
+        from .dense_prefill_policy_decisions import write_policy
+        decisions = write_policy(args.work_dir, args.output, base_include=args.retain_base_include,
+                                 receipt_path=args.retention_receipt, warmups=args.warmup_runs,
+                                 samples=args.bench_runs, profiler_requests=args.profiler_requests,
+                                 profiler_evidence=args.profiler_evidence, summary_output=args.summary_csv)
+        print(f"installed {len(decisions.installations)} native WMMA keys; "
+              f"retained {len(decisions.decisions)-len(decisions.installations)} planned keys")
+        return 0
     entries = collect_dense_overlay_entries(
         args.work_dir,
         args.backend,

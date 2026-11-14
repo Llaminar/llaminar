@@ -12,6 +12,7 @@ import argparse
 import os
 import json
 from pathlib import Path
+import tempfile
 
 from .corpus_provenance import mapping_digest, sha256_file, trainer_provenance, require_release_trainer
 from .gpu_architecture import GPUArchitecture
@@ -83,13 +84,24 @@ def build_manifest(root: Path, *, warmups: int = 5, samples: int = 30) -> Profil
     cells, plan = sweep.load_planned_dense_prefill_cells(root / sweep.SWEEP_PLAN_FILENAME, "rocm")
     if any(cell.prepared_family != sweep.DensePreparedWeightFamily.NATIVE_QUANTISED or cell.gpu_architecture is None for cell in cells):
         raise ValueError("native-quantised profile owner cannot reinterpret a legacy or expanded corpus")
-    entries = owner.collect_dense_overlay_entries(root, "rocm", cells=cells, warmup_runs=warmups, bench_runs=samples)
+    decisions = None
+    if "installed_policy" in plan:
+        from .dense_prefill_policy_decisions import collect_policy_decisions
+        decisions = collect_policy_decisions(root, warmups=warmups, samples=samples)
+        entries = decisions.installations
+        if not entries:
+            raise ValueError("all-retain decisions have no profiler obligations; publish a no-change receipt")
+    else:
+        entries = owner.collect_dense_overlay_entries(root, "rocm", cells=cells, warmup_runs=warmups, bench_runs=samples)
     winners = {entry.key: entry for entry in entries}
+    decision_digest = decisions.digest if decisions is not None else None
     trainer = plan["trainer_provenance"]
     requests = []
     for cell in cells:
         key = owner.DenseOverlayKey(cell.source_format.runtime_codebook("rocm"), cell.m, cell.shape.n, cell.shape.k,
             cell.effective_prepared_family, GPUArchitecture.parse("rocm", cell.gpu_architecture))
+        if key not in winners:
+            continue
         winner = winners[key]
         paths = sweep.production_dense_prefill_cell_paths(root, cell)
         rows = sweep._read_aggregate_rows(paths.aggregate, cell)
@@ -108,6 +120,9 @@ def build_manifest(root: Path, *, warmups: int = 5, samples: int = 30) -> Profil
                 candidate_id=candidate, requested_candidate=requested, launch=list(launch),
                 native_participant=participant, timing_artifacts=artifacts,
                 visibility_ordinal=json.loads(paths.manifest.read_text())["native_process"]["device_ordinal"])
+            if "installed_policy" in plan:
+                config.update(installed_policy_digest=plan["installed_policy"]["binding_digest"],
+                              sweep_plan_digest=plan["plan_digest"], decision_digest=decision_digest)
             identity = mapping_digest(config)
             request = ProfilerRequest(
                 request_id="native-prefill-" + identity.removeprefix("sha256:"), observation_digest=identity,
@@ -186,7 +201,16 @@ def main() -> int:
     parser.add_argument("--warmup-runs", type=int, default=5)
     parser.add_argument("--bench-runs", type=int, default=30)
     args = parser.parse_args()
-    write_profiler_request_manifest(args.output, build_manifest(args.work_dir, warmups=args.warmup_runs, samples=args.bench_runs))
+    from . import production_dense_prefill_sweep as sweep
+    from .dense_prefill_policy_decisions import validate_publication_paths
+    cells, _ = sweep.load_planned_dense_prefill_cells(args.work_dir / sweep.SWEEP_PLAN_FILENAME, "rocm")
+    validate_publication_paths(args.work_dir, cells, (args.output,))
+    manifest = build_manifest(args.work_dir, warmups=args.warmup_runs, samples=args.bench_runs)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".native-prefill-requests-", dir=args.output.parent) as temporary:
+        staging = Path(temporary) / "requests.json"
+        write_profiler_request_manifest(staging, manifest)
+        os.replace(staging, args.output)
     return 0
 
 

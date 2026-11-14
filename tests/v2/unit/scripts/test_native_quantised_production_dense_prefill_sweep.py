@@ -390,6 +390,7 @@ def _commit_test_cells(
     warmup_runs: int = 2,
     bench_runs: int = 3,
     provenance: dict[str, object] | None = None,
+    installed_policy: dict[str, object] | None = None,
 ):
     """Publish real per-cell commit markers for already-written fixtures."""
 
@@ -402,6 +403,7 @@ def _commit_test_cells(
         producer,
         warmup_runs=warmup_runs,
         bench_runs=bench_runs,
+        installed_policy=installed_policy,
     )
     process = {
         "invocation_id": "test-native-process",

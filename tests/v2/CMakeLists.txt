@@ -5410,6 +5410,30 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_DenseInt8ComputePe
 add_executable(v2_unit_rocm_dense_prefill_overlay
     unit/kernels/Test__ROCmDensePrefillOverlay.cpp
     ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.cpp)
+
+# Replay the actual ELF ownership boundary with a deliberately preemptible control.
+add_library(v2_rocm_dense_policy_owner SHARED ${CMAKE_SOURCE_DIR}/kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.cpp)
+add_library(v2_rocm_dense_policy_interposition_control SHARED unit/kernels/fixtures/ROCmDensePolicyInterpositionControl.cpp)
+foreach(policy_owner IN ITEMS v2_rocm_dense_policy_owner v2_rocm_dense_policy_interposition_control)
+    target_include_directories(${policy_owner} PRIVATE ${CMAKE_SOURCE_DIR})
+    target_compile_features(${policy_owner} PRIVATE cxx_std_23)
+    set_target_properties(${policy_owner} PROPERTIES CXX_VISIBILITY_PRESET default VISIBILITY_INLINES_HIDDEN OFF)
+endforeach()
+add_executable(v2_unit_rocm_dense_policy_ownership unit/kernels/Test__ROCmDensePolicyOwnership.cpp)
+target_include_directories(v2_unit_rocm_dense_policy_ownership PRIVATE ${CMAKE_SOURCE_DIR})
+target_compile_features(v2_unit_rocm_dense_policy_ownership PRIVATE cxx_std_23)
+if(TARGET v2_unit_rocm_dense_policy_ownership)
+    target_link_options(v2_unit_rocm_dense_policy_ownership PRIVATE -Wl,--export-dynamic)
+endif()
+target_link_libraries(v2_unit_rocm_dense_policy_ownership PRIVATE GTest::gtest_main
+    v2_rocm_dense_policy_owner v2_rocm_dense_policy_interposition_control ${CMAKE_DL_LIBS})
+add_v2_test(V2_Unit_ROCmDensePolicyOwnership
+    COMMAND $<TARGET_FILE:v2_unit_rocm_dense_policy_ownership>
+    LABELS "V2;Unit;DeviceFree;NativeQuantised;Dense;Evidence;Regression" NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_ROCmDensePolicyOwnershipReplay
+    COMMAND $<TARGET_FILE:v2_unit_rocm_dense_policy_ownership>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;NativeQuantised;Dense;Evidence;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 target_include_directories(v2_unit_rocm_dense_prefill_overlay PRIVATE ${CMAKE_SOURCE_DIR})
 target_compile_features(v2_unit_rocm_dense_prefill_overlay PRIVATE cxx_std_23)
 target_link_libraries(v2_unit_rocm_dense_prefill_overlay PRIVATE GTest::gtest_main)
@@ -6338,6 +6362,24 @@ set_tests_properties(V2_Unit_Aime25HttpBenchmark PROPERTIES
 # Functional evidence-contract coverage only: no benchmark or device launch.
 # Auto's physical streaming family differs from the forced cooperative tiles;
 # accepting it must not permit forged launches, spills, or byte mismatches.
+add_test(NAME V2_Unit_NativeQuantisedDensePolicyBinding
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_dense_policy_binding.py)
+set_tests_properties(V2_Unit_NativeQuantisedDensePolicyBinding PROPERTIES
+    LABELS "V2;Unit;DeviceFree;NativeQuantised;Dense;Evidence;Regression" TIMEOUT 30)
+add_test(NAME V2_Integration_NativeQuantisedDensePolicyBindingReplay
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_dense_policy_binding.py)
+set_tests_properties(V2_Integration_NativeQuantisedDensePolicyBindingReplay PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;NativeQuantised;Dense;Evidence;Regression" TIMEOUT 30)
+
+add_test(NAME V2_Unit_NativeQuantisedDensePolicyDecisions
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_dense_policy_decisions.py)
+set_tests_properties(V2_Unit_NativeQuantisedDensePolicyDecisions PROPERTIES
+    LABELS "V2;Unit;DeviceFree;NativeQuantised;Dense;Evidence;Regression" TIMEOUT 30)
+add_test(NAME V2_Integration_NativeQuantisedDensePolicyDecisionsReplay
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_dense_policy_decisions.py)
+set_tests_properties(V2_Integration_NativeQuantisedDensePolicyDecisionsReplay PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;NativeQuantised;Dense;Evidence;Regression" TIMEOUT 30)
+
 add_test(NAME V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_production_dense_prefill_sweep.py
@@ -30629,6 +30671,16 @@ add_v2_test(V2_Integration_ROCmRouterQ8PolicyReplay
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmRouterQ8PolicyReplay)
 
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_ROCmDensePrefillCompiledPolicyReplay
+        COMMAND ${CMAKE_COMMAND} -E env LLAMINAR_FORCE_CPU_ONLY_STARTUP=1
+            LLAMINAR_SKIP_CUDA_STARTUP=1 LLAMINAR_SKIP_ROCM_STARTUP=1
+            $<TARGET_FILE:v2_perf_native_quantised_sweep> --gtest_filter=ROCmDensePrefillPolicy.CompiledInventory
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;NativeQuantised;Dense;Evidence;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmDensePrefillCompiledPolicyReplay)
+endif()
+
 # Actual native-ISA selection is inside the test; other visible AMD devices do not certify WMMA.
 if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmRouterQ8WmmaReplay
@@ -38580,6 +38632,9 @@ endif()
 
 # New native-Q8 evidence controls run in the existing exact evidence owner.
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_ROCmDensePolicyOwnershipReplay
+    V2_Integration_NativeQuantisedDensePolicyBindingReplay
+    V2_Integration_NativeQuantisedDensePolicyDecisionsReplay
     V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity)
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
