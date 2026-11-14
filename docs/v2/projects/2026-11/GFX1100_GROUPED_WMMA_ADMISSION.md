@@ -516,12 +516,44 @@ Qwen shapes. These results improve the serial-chunk experiment but do not yet
 justify Automatic installation. The native-only N32 policy remains preferable
 at many dense work sizes.
 
-A separate cold-decoder scheduling experiment compiles for both HIP targets
-under the actual guard. An eight-register empty assembly constraint completes
-decoding before activation publication. IQ2_S gate/up drops 79→72 VGPRs and down
-87→81; 26 adaptive variants improve and ten are unchanged. All 36 pure variants
-retain identical resources; every variant has zero private memory, memory spills
-and scratch. ISA review confirms the sign operations now precede the barrier.
-This is isolated compile evidence only, in
-`grouped-fine-decode-fence-diagnostic/`; live replay and performance qualification
-remain required before applying a performance claim.
+## Completed cold-decode fence qualification
+
+The cold-decoder scheduling fence is now qualified as an explicit candidate.
+Its eight-register empty assembly constraint completes decoding before
+activation publication. IQ2_S gate/up drops79→72 VGPRs and down87→81;
+26 adaptive variants improve and ten are unchanged. All36 pure variants retain
+identical resources. ISA review confirms the sign operations precede the barrier.
+Normal guarded Release and Integration builds pass for gfx906/gfx1100 with zero
+private memory, register-memory spills and scratch instructions. The remaining
+compiler-proven scalar-to-vector register moves are retained as register evidence.
+
+All19 device-free dispatch tests and four Release split-replay smokes pass.
+The nine focused registrations contain162 native tests and pass in274.80s.
+Five complete-operation cases retain17 live counts × four policies ×31 paired
+samples, for10,540 timing observations. All five exact profiles complete seven
+independent counter passes each, for35 passes.
+
+| Fence case, full512 | Dot4 µs | N32 gain | Fenced adaptive gain |
+|---|---:|---:|---:|
+| Qwen uniform | 913.618 | 1.3035× | 1.2174× |
+| Qwen hotset | 780.207 | 1.1645× | 1.1330× |
+| Qwen power-law | 944.209 | 1.0557× | 1.0685× |
+| Compact Q4_0 | 293.933 | 1.0483× | 0.9890× |
+| Compact IQ2_S | 324.078 | 1.0312× | 0.9448× |
+
+Sparse Qwen uniform live64/128/256 remains0.9561/0.9302/0.9630× Dot4.
+The compact regressions and sparse/empty costs still reject blanket Automatic
+installation. Pure N32 remains preferable at many dense work sizes. Production
+Automatic remains OrderedDot4; the fence has not changed its admission.
+
+`grouped-fence-summary.json` owns the timing rows.
+`grouped-fence-profile-timing-join.json` binds all10,540 samples and35 passes
+(SHA256 `43ca27b032e651af5e4e301f6a007800b51a6cebdafaab4aa35cd892507fea52`).
+The63-file producer archive is `grouped-fence-producer-snapshot/snapshot.json`,
+SHA256 `838520de0f33e8dd92be6bdb3e446baab23e2a23c1f5a6e92bddab01465da68d`.
+Build, source, loaded-code, profile and numerical evidence remain bound to this
+explicit fenced producer; profiler durations are not canonical latency labels.
+
+Bounded-workloop diagnostics under `/tmp` compile but increase register use.
+The separate local-thread-id variant is also diagnostic. Neither experiment
+changes production dispatch or supplies a measured performance claim.

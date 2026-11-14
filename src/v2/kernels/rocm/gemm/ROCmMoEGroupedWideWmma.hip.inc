@@ -175,6 +175,15 @@ __global__ __launch_bounds__(TwoRoles ? 256 : 128) void wideProjection(MoEGroupe
                     if constexpr (Traits::is_dual_scale_asym) minima = static_cast<const uint32_t *>(desc.emins)[linear];
                 }
                 int decoded[8]; decode_block<FMT>(raw,decoded);
+                // Complete packed-word decoding before activation publication.
+                // Keeping decoder intermediates live across that barrier raises
+                // VGPR pressure. This register-only compiler fence preserves all
+                // bits and arithmetic order and emits no hardware barrier.
+                asm volatile("" :
+                    "+v"(decoded[0]), "+v"(decoded[1]),
+                    "+v"(decoded[2]), "+v"(decoded[3]),
+                    "+v"(decoded[4]), "+v"(decoded[5]),
+                    "+v"(decoded[6]), "+v"(decoded[7]));
                 const auto weight = [&] {
                     if constexpr (Traits::is_dual_scale) return rocm_native_quantised_load_dual_weight_scales<FMT>(scale,aux);
                     else return ROCmNativeQuantisedDualWeightScales{rocm_native_quantised_load_single_weight_scale<FMT>(scale,aux),0.0f};

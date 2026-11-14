@@ -34,8 +34,8 @@ production dispatch: GPU prepared quantized weights use NativeQuantised adapters
 
 | Area | Implementation | Functional/component evidence | Performance evidence |
 |---|---|---|---|
-| Broader dense dispatch | Bound installed-Auto/WMMA collector and selective publisher | Core-table ownership replay, eight binding and 16 decision regressions pass | Original84 timings/124 profiles accepted;44 profiles and installed-Auto checks remain |
-| Grouped MoE | Wave64 M16N32/N64; fused Dot4/WMMA whole-expert floors4/8/12/16; all physical decoders | Serial, promoted, mixed-writer omission, threshold/reset and split/sliced-down replay pass | Fine adaptive full Qwen gains1.06–1.19×; sparse/compact gaps remain; Automatic stays Dot4 |
+| Broader dense dispatch | Bound installed-Auto/WMMA collector and selective publisher | Core-table ownership replay, eight binding and 16 decision regressions pass | Original84 timings/124 profiles accepted;44 profiles collecting, installed-Auto checks remain |
+| Grouped MoE | Wave64 M16N32/N64; fused Dot4/WMMA whole-expert floors4/8/12/16; all physical decoders | Serial, promoted, mixed-writer omission, threshold/reset and split/sliced-down replay pass | Fenced adaptive full Qwen gains1.068–1.217×; sparse/compact gaps remain; Automatic stays Dot4 |
 | Attention | Automatic one-kernel Dot2/WMMA live-prefix selection in the measured FP16 M512 domain | Actual Auto, immutable exclusions, counters, all-format, threshold/ring/partial/reset and internal timing-owner replays pass | Accepted64K gains1.155×/1.138× and doubling1.998×/1.993×;26 cells/14 counter passes |
 | Q8 router | Automatic Sixteen-wave tile for exact whole-row M512/K2560/E512; explicit 4/8/16-wave candidates retained | 14 GPU feature cases, five pure policy cases and both timing owners pass; actual Auto template, ownership and submission counters authenticated | Accepted full512 gains2.744×/2.551×;12 cells/seven counter passes |
 | Floating half GEMM | Existing production hipBLAS path; sampled native matrix gap confirmed | Three retained graph replays pass, each containing cast and vendor GEMM | Loaded bytes/ISA authenticated; complete Release cast+GEMM timing pending |
@@ -54,12 +54,13 @@ formats, whole-expert phases and compact column-owned down slices.
 
 The current wide adaptive candidate uses independent native column blocks and
 role-specific wide Dot4 tiles under one device-owned row plan. Both HIP targets
-build;19 pure tests, four Release smokes and162 native feature tests pass. Its
-10,540 canonical samples and35 counter passes qualify. Full Qwen uniform/hotset/
-power-law gains are1.189/1.120/1.061×; sparse uniform and compact regressions
-still prevent Automatic installation. Pure N32 remains faster at many dense
-sizes. A separately compiled cold-decode fence reduces IQ2_S VGPRs79→72 and
-87→81 without memory spills; runtime qualification is pending.
+build with zero private memory, memory spills and scratch. The cold-decode fence
+reduces IQ2_S VGPRs79→72 and87→81;19 Unit cases, four Release smokes and nine
+registrations/162 native tests pass (274.80s). All10,540 timings and35 counter
+passes complete. Full Qwen uniform/hotset/power-law gains are1.2174/1.1330/1.0685×;
+sparse uniform64/128/256 remains0.9561/0.9302/0.9630× and compact Q4_0/IQ2_S
+0.9890/0.9448×. Automatic stays Dot4. Bounded-workloop and local-thread-id
+experiments remain `/tmp` diagnostics; their register cost is not a production win.
 [Investigation](GFX1100_GROUPED_WMMA_ADMISSION.md) owns the comparisons and archives.
 
 The user accepts the existing dense/CUDA-reference, router and attention
