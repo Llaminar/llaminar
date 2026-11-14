@@ -5216,3 +5216,25 @@ WSL arm-qual = 01a1d782@wsl (01a1bd53 retired for WSL work).
 Sequencing reaffirmed (Main): T' = early-surface ONLY; byte-
 identity serial; develop-control; then binding gate at the triage
 tip. Acknowledged + registered.
+
+### .80 BUILD GREEN (a8beee811) + .79 base control launched (00:53Z)
+
+SPARKS: (1) .80 focused triage @ a8beee811 BUILD=0 GREEN — the
+ClusterInventory fix compiled on Linux (compile evidence =
+triage-build3.log; lane's handback requirement met) — bucket-(b)
+focused run NOW (lane's exact filters, JUnit per suite). (2) .79
+d5e04fdce CUDA-ON BASE CONTROL LAUNCHED (timeslot ~01:00-03:00Z;
+fresh base-d5e04fdce worktree, vendored onednn+cnpy, cu13/sm_121/
+NEON_I8MM, full build + DRIVER preflight + JUnit). DEVIATION
+DISCLOSED (correct + necessary): sa-gated-base.sh = verified script
+parameterized (D3 = d5e04fdce full SHA, OUT=/w/sa-results-d5e04fdce)
+WITH the 3 feature-only targets removed (v2_integration_cuda_
+expert_tier_weight_kernels, v2_unit_cpu_native_prepared_layout,
+v2_test_expert_tier_weight_stream DO NOT EXIST at base — first
+launch aborted on 'unknown target v2_unit_cpu_native_prepared_
+layout', re-patched); BUILD = llaminar2 + v2_unit_gate +
+v2_production_test_preflight_gate; FOCUS/CUDA run as scripted (rc
+recorded, JUnit asserts non-fatal at base — expected no-ops);
+PRIMARY artifact = the DRIVER preflight baseline (the 221
+attribution). Seal K14-STAGEAGATE-D5E04FDCE-CUDAON-BASELINE-<ts>.
+Main consolidated; WSL T' early-surface building (01a1d782).
