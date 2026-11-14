@@ -6477,3 +6477,16 @@ THEN: completed records -> FINAL source/docs pin request to the
 reviewer -> reviewer re-reads the tiny delta -> Gate-A over
 d5e04fdce..c8beed852. Stage-B carry list unchanged (calibration
 catalog + admission predicate).
+
+### WSL FINAL x86 gate @ c8beed852 RUNNING (14:59Z)
+
+WSL: final-pin x86 incremental at c8beed852 — verified delta vs
+8ccfa771c = docs + .inc comment only (behavior identical);
+worktree wt-armq-c8beed852, external staged (oneDNN 74d04752d);
+gate armq-a512-c8beed852 CONFIGURE_RC=0 (oneDNN authority, no
+forged markers); parity TU ninja -j1 prebuild started (mem safe).
+8ccfa771c run = predecessor record. Will report DRIVER_RC +
+failed-set delta vs the 6ca seal + the 2 new tests executing green
++ both cap tests green; then develop discriminator. Board: the
+final sweep at c8beed852 on all 3 hosts -> records -> final pin
+request -> reviewer re-read -> Gate-A d5e04fdce..c8beed852.
