@@ -5526,3 +5526,18 @@ precedent). AGENTS.md:1329 ASSERT/ASSERT_MSG/ASSERT_NOT_NULL naming
 fix (NOT on the PR — stabilization only). GREEN CLAIM HELD until
 the .80 Linux compile + focused run at 1af9f6429; sequence
 unchanged.
+
+### Docs nuance applied cf7ce841c; code tip 1af9f6429 (02:18Z)
+
+Lane: docs-only cf7ce841c on 1af9f6429 (verified on origin: design
+doc only; code tip = 1af9f6429 unchanged). §A4-3 now states the
+invariant precisely: LLAMINAR_ASSERT checked only where assertions
+compile in (Debug/Integration), ((void)0) in Release, NOT a
+release-mode guard; the always-compiled protections = the typed
+refusal (no inventory + no observation + CPU resource) + the
+pricing section authority (cpuProjectionBytes fail-closed);
+fallback scope preserved (dead for CPU byte pricing; not
+unreachable). Tip naming per precedent: gate/code = 1af9f6429;
+docs tip = cf7ce841c. Base-owner AGENTS.md ASSERT-drift item
+recorded (not on the PR). Green held until the .80 Linux compile +
+focused run at 1af9f6429.
