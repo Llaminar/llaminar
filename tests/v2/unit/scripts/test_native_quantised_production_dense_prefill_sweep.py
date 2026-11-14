@@ -9,6 +9,8 @@ Matrix cardinality follows the canonical capture, format and shape inventories,
 so adding a shared CUDA/ROCm bucket extends coverage without a second row list.
 ROCm synthetic measurements retain source and physical execution IDs separately;
 physical24 cannot be inferred from a historical source4-only packet.
+Narrowed candidate protocols retain exhaustive historical IDs and cannot share
+a batch, resume plan or profiler witness with a different roster.
 """
 
 from __future__ import annotations
@@ -50,6 +52,7 @@ from native_quantised_dispatch.prefill_matrix import (  # noqa: E402
     gpu_prefill_measurements,
 )
 from native_quantised_dispatch.production_dense_prefill_sweep import (  # noqa: E402
+    DenseCandidateScope,
     CUDA_AGGREGATE_COLUMNS,
     ROCM_NATIVE_Q8_CANDIDATE_IDS,
     ROCM_WMMA_CANDIDATE_IDS,
@@ -184,7 +187,7 @@ def _write_cell(
         backend,
         cell.source_format,
         canonical_kpart_available=canonical_kpart_available,
-        prepared_family=cell.prepared_family, gpu_architecture=cell.gpu_architecture,
+        prepared_family=cell.prepared_family, gpu_architecture=cell.gpu_architecture, candidate_scope=cell.candidate_scope,
     )
     samples_by_candidate = {
         candidate: tuple(
@@ -429,6 +432,174 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
         return next(cell for cell in _fixture_cells("rocm")
                     if cell.source_format.label == label
                     and cell.shape.name == "Qwen4Exp_320x10240" and cell.m == 64)
+
+    def _scoped_wmma_cell(self, label="Q4_0"):
+        """Use the canonical native shape with the explicit five-candidate protocol."""
+        return replace(self._native_q8_source(label),
+            prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED,gpu_architecture="gfx1100",
+            candidate_scope=DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA)
+
+    def test_candidate_scope_preserves_exhaustive_identity(self) -> None:
+        """Default protocols retain their historical field set and immutable plan bytes."""
+        for backend in ("cuda","rocm"):
+            legacy=next(cell for cell in _fixture_cells(backend) if cell.source_format.label=="Q4_0"
+                        and cell.shape.name=="Qwen4Exp_320x10240" and cell.m==64)
+            # Frozen from the original v4 owner before adding candidate scope.
+            self.assertEqual(legacy.cell_id,{"cuda":"cuda-q4_0-m64-e71f1f041dff0f26a111",
+                "rocm":"rocm-q4_0-m64-dfebf34f4acfa3615952"}[backend])
+            explicit=replace(legacy,candidate_scope=DenseCandidateScope.EXHAUSTIVE)
+            self.assertEqual(legacy.identity,explicit.identity)
+            self.assertEqual(legacy.cell_id,explicit.cell_id)
+            self.assertNotIn("candidate_scope",explicit.canonical_mapping())
+            with tempfile.TemporaryDirectory() as tmp:
+                path=Path(tmp)/SWEEP_PLAN_FILENAME
+                first=write_sweep_plan(path,backend,(legacy,),_test_provenance(backend))
+                before=path.read_bytes()
+                self.assertEqual(first,write_sweep_plan(path,backend,(explicit,),_test_provenance(backend)))
+                self.assertEqual(before,path.read_bytes())
+                self.assertTrue(first["schema_version"].endswith("-v4"))
+                self.assertNotIn("candidate_scope",first)
+
+    def test_candidate_scope_all_formats_require_exact_five_roster(self) -> None:
+        """All21 formats require Auto and every native candidate, with no extra rows."""
+        expected=("Auto",*ROCM_WMMA_CANDIDATE_IDS)
+        for source in FORMAT_SPECS:
+            cell=self._scoped_wmma_cell(source.label)
+            with self.subTest(source=source.label),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);_,paths=_write_cell(root,"rocm",cell=cell)
+                self.assertEqual(tuple(_read_aggregate_rows(paths.aggregate,cell)),expected)
+                self.assertEqual(validate_production_dense_prefill_cell(paths.aggregate,paths.timing,cell,bench_runs=3).candidate_count,5)
+                env=_cell_environment(cell,paths,5,2,3)
+                self.assertEqual(tuple(env["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS"].split(",")),expected)
+                with paths.aggregate.open() as handle:rows=list(csv.DictReader(handle))
+                for malformed in (rows[1:],rows+[dict(rows[0],variant=ROCM_CANDIDATE_IDS[0])]):
+                    with paths.aggregate.open("w",newline="") as handle:
+                        writer=csv.DictWriter(handle,fieldnames=rows[0].keys());writer.writeheader();writer.writerows(malformed)
+                    with self.assertRaises(ValueError):
+                        validate_production_dense_prefill_cell(paths.aggregate,paths.timing,cell,bench_runs=3)
+
+    def test_candidate_scope_rejects_incompatible_protocols(self) -> None:
+        """No foreign architecture, preparation, backend or untyped string can narrow."""
+        cell=self._scoped_wmma_cell()
+        for change in ({"gpu_architecture":"gfx906"},{"gpu_architecture":None},
+                       {"backend":"cuda"},{"prepared_family":None},
+                       {"prepared_family":DensePreparedWeightFamily.INT8_BLOCKWISE},
+                       {"candidate_scope":"installed-vs-native-wmma"}):
+            with self.subTest(change=change),self.assertRaises(ValueError):replace(cell,**change)
+        for backend,family,arch in (("rocm",None,"gfx1100"),("rocm",DensePreparedWeightFamily.NATIVE_QUANTISED,"gfx906"),
+                                   ("cuda",DensePreparedWeightFamily.NATIVE_QUANTISED,"gfx1100")):
+            with self.assertRaises(ValueError):
+                dense_prefill_candidate_ids(backend,cell.source_format,prepared_family=family,gpu_architecture=arch,
+                    candidate_scope=DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA)
+
+    def test_candidate_scope_plan_resume_and_batch_are_separate(self) -> None:
+        """A narrowed plan round-trips exactly and rejects exhaustive or mixed resumes."""
+        cell=self._scoped_wmma_cell();wide=replace(cell,candidate_scope=DenseCandidateScope.EXHAUSTIVE)
+        self.assertNotEqual(cell.cell_id,wide.cell_id)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);cells=(cell,replace(cell,m=128))
+            plan=write_sweep_plan(root/SWEEP_PLAN_FILENAME,"rocm",cells,_test_provenance("rocm"))
+            self.assertTrue(plan["schema_version"].endswith("-v5"))
+            loaded,roundtrip=load_planned_dense_prefill_cells(root/SWEEP_PLAN_FILENAME,"rocm")
+            self.assertEqual(loaded,cells);self.assertEqual(roundtrip,plan)
+            env=_batch_environment(cells,_batch_paths(root,cells),5,2,3)
+            self.assertEqual(env["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS"],",".join(("Auto",*ROCM_WMMA_CANDIDATE_IDS)))
+            with self.assertRaises(ValueError):
+                write_sweep_plan(root/SWEEP_PLAN_FILENAME,"rocm",(wide,),_test_provenance("rocm"))
+            with self.assertRaisesRegex(ValueError,"candidate-scope"):
+                write_sweep_plan(root/"mixed.json","rocm",(wide,cell),_test_provenance("rocm"))
+            with self.assertRaises(ValueError):_batch_paths(root,(wide,replace(cell,m=128)))
+
+    def test_candidate_scope_keeps_native_auto_first_tie_order(self) -> None:
+        """Equal clocks retain native filtered generator order: Auto precedes WMMA."""
+        cell=self._scoped_wmma_cell()
+        with tempfile.TemporaryDirectory() as tmp:
+            _,paths=_write_cell(Path(tmp),"rocm",cell=cell)
+            for path in (paths.aggregate,paths.timing):
+                with path.open() as handle:rows=list(csv.DictReader(handle))
+                if path==paths.aggregate:
+                    original=rows[0]
+                    for row in rows:
+                        for field in ("min_us","mean_us","stddev_us"):row[field]=original[field]
+                else:
+                    for row in rows:
+                        value=10.+int(row["sample_index"])*.125
+                        row.update(latency_us=f"{value:.9f}",latency_us_hex=value.hex())
+                with path.open("w",newline="") as handle:
+                    writer=csv.DictWriter(handle,fieldnames=rows[0].keys());writer.writeheader();writer.writerows(rows)
+            result=validate_production_dense_prefill_cell(paths.aggregate,paths.timing,cell,bench_runs=3)
+            self.assertEqual(result.winner_id,"Auto")
+
+    def test_candidate_scope_profiles_retain_actual_auto_and_aliases(self) -> None:
+        """Reduced rosters preserve every source alias and an unforced physical Auto witness."""
+        from native_quantised_dispatch.native_prefill_profiler import build_manifest,validate_request
+        from native_quantised_dispatch.corpus_provenance import mapping_digest
+        cells=tuple(self._scoped_wmma_cell(source.label) for source in FORMAT_SPECS)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            for cell in cells:_write_cell(root,"rocm",cell=cell,winning_candidate="WMMA/N64/MT32")
+            _commit_test_cells(root,"rocm",cells)
+            manifest=build_manifest(root,warmups=2,samples=3)
+            self.assertEqual(len(manifest.requests),2*len(FORMAT_SPECS))
+            for request in manifest.requests:
+                validate_request(request)
+                self.assertEqual(request.config_json["cell"]["candidate_scope"],DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA.value)
+                if request.config_json["purpose"]=="baseline":
+                    self.assertEqual(request.config_json["requested_candidate"],"Auto")
+                    self.assertTrue(request.effective_candidate_id.startswith("Auto:"))
+            request=manifest.requests[0]
+            config={**request.config_json,"cell":{**request.config_json["cell"],"candidate_scope":"unknown"}}
+            with self.assertRaises(ValueError):
+                validate_request(replace(request,config_json=config,candidate_policy_hash=mapping_digest(config)))
+
+    def test_candidate_scope_profiler_rejects_relabelled_forced_dot4(self) -> None:
+        """Standalone profiler admission cannot narrow a forced exhaustive Dot4 witness."""
+        from native_quantised_dispatch.native_prefill_profiler import build_manifest,validate_request
+        from native_quantised_dispatch.corpus_provenance import mapping_digest
+        cell=replace(self._scoped_wmma_cell(),candidate_scope=DenseCandidateScope.EXHAUSTIVE)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            _write_cell(root,"rocm",cell=cell,winning_candidate=ROCM_CANDIDATE_IDS[0])
+            _commit_test_cells(root,"rocm",(cell,))
+            request=next(r for r in build_manifest(root,warmups=2,samples=3).requests if r.config_json["purpose"]=="winner")
+            validate_request(request)
+            config={**request.config_json,"cell":{**request.config_json["cell"],
+                "candidate_scope":DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA.value}}
+            with self.assertRaisesRegex(ValueError,"outside the declared"):
+                validate_request(replace(request,config_json=config,candidate_policy_hash=mapping_digest(config)))
+
+    def test_candidate_scope_cli_preserves_complete_canonical_inventory(self) -> None:
+        """CLI narrowing changes only the roster, never source aliases, shapes or M."""
+        from argparse import Namespace
+        from native_quantised_dispatch.production_dense_prefill_sweep import _filtered_cells
+        args=Namespace(backend="rocm",prepared_family="native-quantised",gpu_architecture="gfx1100",
+            candidate_scope="installed-vs-native-wmma",format=None,shape=None,m=None)
+        scoped=_filtered_cells(args)
+        exhaustive=production_dense_prefill_cells("rocm",prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED,
+            gpu_architecture="gfx1100",all_native_formats=True)
+        key=lambda cell:(cell.source_format.label,cell.shape.name,cell.shape.n,cell.shape.k,cell.m)
+        self.assertEqual(tuple(map(key,scoped)),tuple(map(key,exhaustive)))
+        self.assertEqual({cell.source_format.label for cell in scoped},{source.label for source in FORMAT_SPECS})
+        self.assertTrue(all(cell.candidate_scope is DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA for cell in scoped))
+
+    def test_candidate_scope_plan_rejects_rehashed_schema_disagreement(self) -> None:
+        """A valid digest cannot authenticate conflicting schema/cell/top-level scope."""
+        from native_quantised_dispatch.corpus_provenance import mapping_digest
+        cell=self._scoped_wmma_cell()
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);path=root/SWEEP_PLAN_FILENAME
+            original=write_sweep_plan(path,"rocm",(cell,),_test_provenance("rocm"))
+            mutations=[]
+            legacy_schema=dict(original,schema_version="native-quantised-production-dense-prefill-sweep-v4")
+            mutations.append(legacy_schema)
+            legacy_no_top=dict(legacy_schema);legacy_no_top.pop("candidate_scope");mutations.append(legacy_no_top)
+            missing_scope=dict(original);missing_scope.pop("candidate_scope");mutations.append(missing_scope)
+            wrong_cell=dict(original,cells=[dict(original["cells"][0],candidate_scope="exhaustive")]);mutations.append(wrong_cell)
+            unknown_scope=dict(original,candidate_scope="unknown");mutations.append(unknown_scope)
+            for payload in mutations:
+                payload.pop("plan_digest",None);payload["plan_digest"]=mapping_digest(payload)
+                path.write_text(json.dumps(payload))
+                with self.assertRaises(ValueError):load_planned_dense_prefill_cells(path,"rocm")
 
     def test_wmma_all_formats_keep_architecture_and_native_family(self) -> None:
         """Every format has a gfx1100 matrix candidate; gfx906 never inherits it."""

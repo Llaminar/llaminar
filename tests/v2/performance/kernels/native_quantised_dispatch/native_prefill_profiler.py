@@ -3,6 +3,8 @@
 This is an additive operation of the existing profiler request/collector owner.
 The measured winner and the actual unforced Auto baseline retain independent
 requests on every original source alias. Profiling never supplies timing data.
+Declared candidate scope remains part of the original physical-operation witness;
+unknown or architecture-incompatible narrowed protocols cannot be relabeled.
 """
 from __future__ import annotations
 
@@ -43,6 +45,8 @@ def validate_binary(request: ProfilerRequest, binary: Path) -> dict[str, object]
 
 def validate_request(request: ProfilerRequest) -> None:
     """Reject relabeled decode, expanded-Q8 and forced-Auto profile requests."""
+    from .production_dense_prefill_sweep import DenseCandidateScope, ROCM_WMMA_CANDIDATE_IDS
+
     config = request.config_json
     cell = config.get("cell", {})
     launch = config.get("launch", ())
@@ -61,6 +65,12 @@ def validate_request(request: ProfilerRequest) -> None:
             or type(config.get("visibility_ordinal")) is not int or config["visibility_ordinal"] < 0
             or mapping_digest(config) != request.candidate_policy_hash):
         raise ValueError("native-quantised profiler requires its complete original physical-operation witness")
+    scope = DenseCandidateScope(cell.get("candidate_scope",DenseCandidateScope.EXHAUSTIVE.value))
+    if scope is DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA and request.architecture_class != "gfx1100":
+        raise ValueError("narrowed native-WMMA profiling requires its original gfx1100 scope")
+    if (scope is DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA and
+            config["requested_candidate"] not in ("Auto",*ROCM_WMMA_CANDIDATE_IDS)):
+        raise ValueError("requested candidate is outside the declared native-WMMA roster")
     GPUArchitecture.parse("rocm", request.architecture_class)
     if launch[5] == 4 and (request.architecture_class != "gfx1100" or
             tuple(launch[:5]) not in ((32, 32, 1, 0, 0), (64, 32, 1, 0, 0), (64, 64, 1, 0, 0), (128, 64, 1, 0, 0))):

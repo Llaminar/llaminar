@@ -6341,6 +6341,15 @@ set_tests_properties(V2_Unit_Aime25HttpBenchmark PROPERTIES
 add_test(NAME V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_production_dense_prefill_sweep.py
+            ProductionDensePrefillSweepTest.test_candidate_scope_preserves_exhaustive_identity
+            ProductionDensePrefillSweepTest.test_candidate_scope_all_formats_require_exact_five_roster
+            ProductionDensePrefillSweepTest.test_candidate_scope_rejects_incompatible_protocols
+            ProductionDensePrefillSweepTest.test_candidate_scope_plan_resume_and_batch_are_separate
+            ProductionDensePrefillSweepTest.test_candidate_scope_keeps_native_auto_first_tie_order
+            ProductionDensePrefillSweepTest.test_candidate_scope_profiles_retain_actual_auto_and_aliases
+            ProductionDensePrefillSweepTest.test_candidate_scope_profiler_rejects_relabelled_forced_dot4
+            ProductionDensePrefillSweepTest.test_candidate_scope_cli_preserves_complete_canonical_inventory
+            ProductionDensePrefillSweepTest.test_candidate_scope_plan_rejects_rehashed_schema_disagreement
             ProductionDensePrefillSweepTest.test_cuda_iq4_xs_staging_uses_physical_payload_identity
             ProductionDensePrefillSweepTest.test_low_bit_legacy_and_qualified_rows_keep_generator_order
             ProductionDensePrefillSweepTest.test_cuda_staging_inventory_rejects_unsupported_and_spilling_symbols
