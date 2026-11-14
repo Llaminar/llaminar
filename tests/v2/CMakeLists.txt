@@ -21068,6 +21068,7 @@ if(HAVE_ROCM)
         llaminar2_core
         GTest::gtest
         GTest::gtest_main
+        rocprofiler-sdk-roctx::rocprofiler-sdk-roctx
     )
     add_v2_test(V2_Perf_ROCmFlashAttentionDefaultPrefixScaling
         COMMAND $<TARGET_FILE:v2_perf_rocm_flash_attention_prefill>
@@ -21076,6 +21077,12 @@ if(HAVE_ROCM)
         MPI_PROCS 1
         NO_MODELS
         RESOURCE_LOCK rocm_gpu_0
+    )
+    add_v2_test(V2_Perf_ROCmFlashAttentionWmmaPrefixScaling
+        COMMAND $<TARGET_FILE:v2_perf_rocm_flash_attention_prefill>
+                --gtest_filter=ROCmFlashAttentionContextParallelPerf.NativeGfx1100QKWmmaFixedQueryPrefixScaling
+        LABELS "V2;Performance;ROCm;Attention;Prefill;GraphCapture;PrefixScaling;FP16;64K;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS RESOURCE_LOCK rocm_gpu_0
     )
     add_v2_test(V2_Perf_ROCmFlashAttentionPrefill
         COMMAND $<TARGET_FILE:v2_perf_rocm_flash_attention_prefill>
@@ -22162,6 +22169,13 @@ if(HAVE_ROCM)
         NO_MODELS
         RESOURCE_LOCK rocm_gpu_0
     )
+    add_v2_test(V2_Integration_ROCmFlashAttentionWmmaQKReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
+                --gtest_filter=ROCmFlashAttentionWmmaQK.*
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;Prefill;AllFormats;GraphCapture;ByteExact;NativeRing;64K;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
+    )
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmFlashAttentionWmmaQKReplay)
     add_v2_test(V2_Integration_ROCmFlashAttentionWideNativeRing
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
                 --gtest_filter=Test__ROCmFlashAttentionParity.FA2WideNativeRingMatchesIndependentProbabilityReference

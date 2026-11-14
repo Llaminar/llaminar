@@ -8,6 +8,10 @@
  * as retained history grows and shrinks without recapture. The FP16 fixtures
  * share CUDA's deterministic input bytes and verify every automatic output
  * outside timing against canonical bytes after poisoned retained replay.
+ * A native gfx1100 paired experiment retains the same fixed query bucket and
+ * complete device-count producer graph while comparing ordered Dot2 and
+ * four-plane WMMA QK through growing and reset K/V spans. Its context oracle
+ * independently exercises the guarded producer and ordered summary reducer.
  * Query-sequence
  * execution gives one workgroup a complete K/V scan. K/V-context execution
  * gives a bounded persistent grid canonical 256-key partitions and then merges
@@ -33,12 +37,14 @@
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
+#include <rocprofiler-sdk-roctx/roctx.h>
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #endif
 
 #include "kernels/attention/AttentionDeviceParams.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
+#include "kernels/rocm/attention/ROCmFlashAttentionQK.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "tensors/GpuTensorView.h"
@@ -389,19 +395,26 @@ namespace
             int maximum_query_rows,
             int kv_capacity,
             int compute_unit_count,
-            std::size_t lds_capacity_bytes)
+            std::size_t lds_capacity_bytes,
+            int device = 0)
             : geometry_(std::move(geometry)),
               format_(format),
               maximum_query_rows_(maximum_query_rows),
               kv_capacity_(kv_capacity),
               compute_unit_count_(compute_unit_count),
-              lds_capacity_bytes_(lds_capacity_bytes)
+              lds_capacity_bytes_(lds_capacity_bytes),
+              device_(device)
         {
             initialize();
         }
 
+        /** @brief Drain submitted work before retiring graph bindings on every test exit. */
         ~CapturedROCmFA2Benchmark()
         {
+            (void)hipSetDevice(device_);
+            // A failed terminal-event record may leave an earlier graph live.
+            // This test-only retirement boundary precedes all borrowed storage.
+            if (stream_) (void)hipStreamSynchronize(stream_);
             default_graph_.reset();
             default_kernel_.reset();
             default_workspace_.reset();
@@ -547,7 +560,7 @@ namespace
                 return false;
             }
             using namespace llaminar2;
-            const DeviceId device = DeviceId::rocm(0);
+            const DeviceId device = DeviceId::rocm(device_);
             WorkspaceRequirements requirements;
             requirements.buffers.push_back({rocm::AttentionWorkspaceBuffers::DEVICE_PARAMS,
                 sizeof(attention::AttentionDeviceParams), 256, true});
@@ -559,7 +572,7 @@ namespace
                 return false;
             }
             default_kernel_ = std::make_unique<
-                rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32>>(0);
+                rocm::ROCmFlashAttentionKernelT<ActivationPrecision::FP32>>(device_);
             default_kernel_->setGPUStream(stream_);
             default_kernel_->bindWorkspace(default_workspace_.get());
             if (!allocate(reinterpret_cast<void **>(&d_default_live_length_),
@@ -655,17 +668,75 @@ namespace
         }
 
         /**
+         * @brief Measure one complete retained producer/attention batch for paired sampling.
+         * @param live_kv_len Device input published before the start event.
+         * @return Per-operation microseconds, or zero after a native failure.
+         * No warmup or oracle enters this interval; callers alternate paired engines.
+         */
+        [[nodiscard]] double measureDefaultBatch(int live_kv_len)
+        {
+            if (!ready_ || !default_graph_.exec || !publishLiveLength(live_kv_len)) return 0.0;
+            return measureGraphBatch(default_graph_, replayBatchSize(live_kv_len));
+        }
+
+        /** @return Complete default graph transactions in one native-event sample. */
+        [[nodiscard]] int defaultBatchSize(int live_kv_len) const noexcept
+        {
+            return replayBatchSize(live_kv_len);
+        }
+
+        /**
+         * @brief Retain automatic bytes after dirty canonical and repeated-replay checks.
+         * @param live_kv_len Visible K/V rows for both retained schedules.
+         * @param output Receives the complete fixed-query output outside timing.
+         * @return Whether the context oracle, producer publication and copy succeeded.
+         */
+        bool validatedDefaultBytes(int live_kv_len, std::vector<float> &output)
+        {
+            if (!validateDefaultOutput(live_kv_len)) return false;
+            output.resize(static_cast<size_t>(current_query_rows_) * geometry_.n_heads * geometry_.head_dim);
+            return check(hipMemcpyAsync(output.data(), d_direct_output_, output.size() * sizeof(float),
+                                       hipMemcpyDeviceToHost, stream_), "paired output observation") &&
+                check(hipStreamSynchronize(stream_), "paired observation terminal completion");
+        }
+
+        /**
+         * @brief Inspect every retained context node, including the ordered reducer.
+         * @param nodes Receives the native kernel parameters outside replay.
+         * @return False unless the complete three-kernel context transaction exists.
+         */
+        bool contextKernelInventory(std::vector<hipKernelNodeParams> &nodes)
+        {
+            if (!context_graph_.graph || context_graph_.node_count != 3) return false;
+            std::array<hipGraphNode_t, 3> native_nodes{};
+            size_t count = native_nodes.size();
+            if (!check(hipGraphGetNodes(context_graph_.graph, native_nodes.data(), &count),
+                       "paired context inventory")) return false;
+            nodes.resize(count);
+            for (size_t index = 0; index < count; ++index)
+                if (!check(hipGraphKernelNodeGetParams(native_nodes[index], &nodes[index]),
+                           "paired context kernel inventory")) return false;
+            return count == native_nodes.size();
+        }
+
+        /** @brief Inspect the retained one-node direct graph before an exact profile. */
+        bool directKernelInventory(hipKernelNodeParams &native)
+        {
+            if (!direct_graph_.graph || direct_graph_.node_count != 1) return false;
+            hipGraphNode_t node = nullptr;
+            size_t count = 1;
+            return check(hipGraphGetNodes(direct_graph_.graph, &node, &count), "direct inventory") &&
+                count == 1 && check(hipGraphKernelNodeGetParams(node, &native), "direct kernel inventory");
+        }
+
+        /**
          * @brief Submit one complete automatic graph for isolated profiling.
          * @param live_kv_len Published device input before the measured submission.
          * @return False when capture, submission or terminal observation fails.
          */
         bool replayDefaultOnceForProfiler(int live_kv_len)
         {
-            if (!publishLiveLength(live_kv_len) || !default_graph_.exec)
-                return false;
-            return check(hipGraphLaunch(default_graph_.exec, stream_), "default profiler replay") &&
-                   check(hipEventRecord(stop_, stream_), "default profiler terminal event") &&
-                   check(hipEventSynchronize(stop_), "default profiler terminal completion");
+            return profileGraph(default_graph_, live_kv_len, "ROCmFA2DefaultExactCandidate");
         }
 
         /**
@@ -765,18 +836,60 @@ namespace
         bool replayOnceForProfiler(bool context, int live_kv_len)
         {
             CapturedHIPGraph &captured = context ? context_graph_ : direct_graph_;
-            if (!publishLiveLength(live_kv_len) || !captured.exec)
-                return false;
-            if (!check(hipGraphLaunch(captured.exec, stream_), "hipGraphLaunch") ||
-                !check(hipEventRecord(stop_, stream_), "hipEventRecord(stop)") ||
-                !check(hipEventSynchronize(stop_), "hipEventSynchronize(stop)"))
-            {
-                return false;
-            }
-            return true;
+            return profileGraph(captured, live_kv_len,
+                context ? "ROCmFA2ContextExactCandidate" : "ROCmFA2DirectExactCandidate");
         }
 
     private:
+        /**
+         * @brief Collect one exact retained graph after untimed publication/warmup.
+         * @param captured Complete production graph selected before profiling.
+         * @param live_kv_len Device-owned live input published outside the region.
+         * @param label Exact transaction named in the ROCTX trace.
+         * @return Successful replay, terminal completion and profiler cleanup.
+         */
+        bool profileGraph(CapturedHIPGraph &captured, int live_kv_len, const char *label)
+        {
+            if (!captured.exec || !publishLiveLength(live_kv_len)) return false;
+            for (int warmup = 0; warmup < 2; ++warmup)
+                if (!check(hipGraphLaunch(captured.exec, stream_), "profiler warmup replay")) return false;
+            if (!check(hipEventRecord(stop_, stream_), "profiler warmup terminal event") ||
+                !check(hipEventSynchronize(stop_), "profiler warmup completion")) return false;
+            if (roctxRangePushA(label) < 0)
+            {
+                setError("exact profiler range publication failed");
+                return false;
+            }
+            /** Retire profiler state even when a native error unwinds the observation. */
+            struct ProfileRegion
+            {
+                bool resumed = false, open = true;
+                /** @return Successful pause/pop while retiring the scope exactly once. */
+                bool finish()
+                {
+                    if (!open) return true;
+                    open = false;
+                    const int paused = resumed ? roctxProfilerPause(0) : 0;
+                    const int popped = roctxRangePop();
+                    return paused == 0 && popped >= 0;
+                }
+                /** Unconditionally restore paused profiling before leaving the helper. */
+                ~ProfileRegion() { (void)finish(); }
+            } region;
+            if (roctxProfilerResume(0) != 0)
+            {
+                setError("exact profiler resume failed");
+                return false;
+            }
+            region.resumed = true;
+            const bool launched = check(hipGraphLaunch(captured.exec, stream_), "exact profiler replay");
+            const bool recorded = check(hipEventRecord(stop_, stream_), "exact profiler terminal event");
+            const bool joined = recorded && check(hipEventSynchronize(stop_), "exact profiler completion");
+            const bool retired = region.finish();
+            if (!retired) setError("exact profiler pause/range cleanup failed");
+            return launched && joined && retired;
+        }
+
         /** Record the first failure so callers receive the original cause. */
         void setError(const std::string &message)
         {
@@ -895,7 +1008,7 @@ namespace
         /** Create stream/events and all maximum-capacity device buffers. */
         void initialize()
         {
-            if (geometry_.n_heads <= 0 || geometry_.n_kv_heads <= 0 ||
+            if (device_ < 0 || geometry_.n_heads <= 0 || geometry_.n_kv_heads <= 0 ||
                 geometry_.head_dim <= 0 || maximum_query_rows_ <= 0 ||
                 kv_capacity_ <= 0 || compute_unit_count_ <= 0 ||
                 lds_capacity_bytes_ == 0)
@@ -903,7 +1016,7 @@ namespace
                 setError("invalid persistent benchmark geometry");
                 return;
             }
-            if (!check(
+            if (!check(hipSetDevice(device_), "benchmark device binding") || !check(
                     hipStreamCreateWithFlags(&stream_, hipStreamNonBlocking),
                     "hipStreamCreateWithFlags") ||
                 !check(hipEventCreate(&start_), "hipEventCreate(start)") ||
@@ -1234,38 +1347,33 @@ namespace
             std::array<double, sample_count> samples{};
             for (int sample = 0; sample < sample_count; ++sample)
             {
-                if (!check(hipEventRecord(start_, stream_), "timing start event"))
-                    return result;
-                for (int replay = 0; replay < replay_count; ++replay)
-                {
-                    if (!check(
-                            hipGraphLaunch(captured.exec, stream_),
-                            "timed hipGraphLaunch"))
-                    {
-                        return result;
-                    }
-                }
-                if (!check(hipEventRecord(stop_, stream_), "timing stop event") ||
-                    !check(hipEventSynchronize(stop_), "timing completion"))
-                {
-                    return result;
-                }
-                float elapsed_ms = 0.0F;
-                if (!check(
-                        hipEventElapsedTime(&elapsed_ms, start_, stop_),
-                        "hipEventElapsedTime"))
-                {
-                    return result;
-                }
-                samples[sample] =
-                    static_cast<double>(elapsed_ms) * 1000.0 /
-                    static_cast<double>(replay_count);
+                samples[sample] = measureGraphBatch(captured, replay_count);
+                if (!(samples[sample] > 0.0)) return result;
             }
             result.samples_us = samples;
             std::sort(samples.begin(), samples.end());
             result.median_us = samples[sample_count / 2];
             result.replays_per_sample = replay_count;
             return result;
+        }
+
+        /**
+         * @brief Time one batch using the existing exact-stream terminal-event protocol.
+         * @param captured Prepared complete graph transaction.
+         * @param replays Positive number of transactions inside the event interval.
+         * @return Native-event microseconds per transaction, or zero on failure.
+         */
+        [[nodiscard]] double measureGraphBatch(CapturedHIPGraph &captured, int replays)
+        {
+            if (!captured.exec || replays <= 0 ||
+                !check(hipEventRecord(start_, stream_), "timing start event")) return 0.0;
+            for (int replay = 0; replay < replays; ++replay)
+                if (!check(hipGraphLaunch(captured.exec, stream_), "timed hipGraphLaunch")) return 0.0;
+            if (!check(hipEventRecord(stop_, stream_), "timing stop event") ||
+                !check(hipEventSynchronize(stop_), "timing completion")) return 0.0;
+            float milliseconds = 0.0f;
+            if (!check(hipEventElapsedTime(&milliseconds, start_, stop_), "hipEventElapsedTime")) return 0.0;
+            return static_cast<double>(milliseconds) * 1000.0 / replays;
         }
 
         CapturedHIPGraph default_graph_; ///< Complete production producer/attention transaction.
@@ -1279,6 +1387,7 @@ namespace
         int kv_capacity_ = 0;
         int compute_unit_count_ = 0;
         std::size_t lds_capacity_bytes_ = 0;
+        int device_ = 0; ///< Actual visible native owner, retained by all banks and graphs.
         int current_query_rows_ = 0;
         rocm_policy::ROCmFA2PrefillParallelPlan context_plan_{};
         CapturedHIPGraph direct_graph_{};
@@ -2251,6 +2360,213 @@ namespace
 #endif
     }
 
+    /**
+     * @brief Pair exact Dot2/WMMA production graphs at fixed M512 through 64K KV.
+     *
+     * Each engine retains its own identical deterministic operands, device-count
+     * producer and automatic query graph. Context graphs are untimed independent
+     * correctness oracles, including their guarded direct leg and ordered reducer.
+     * Alternating 31-sample event pairs report measured economics without assuming
+     * an improvement threshold. Returning to 512 keys proves dirty reset reuse.
+     */
+    TEST_F(ROCmFlashAttentionContextParallelPerf, NativeGfx1100QKWmmaFixedQueryPrefixScaling)
+    {
+#ifndef HAVE_ROCM
+        GTEST_SKIP() << "ROCm support is disabled";
+#else
+        if (!has_device_) GTEST_SKIP() << "No ROCm device is available";
+        const auto &inventory = llaminar2::rocmHardwareMetadata();
+        int ordinal = -1;
+        for (size_t index = 0; index < inventory.size(); ++index)
+        {
+            const auto &isa = inventory.at(static_cast<int>(index)).isa_target;
+            if (isa == "gfx1100" || isa.starts_with("gfx1100:"))
+            {
+                ordinal = static_cast<int>(index);
+                break;
+            }
+        }
+        if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+        const auto &hardware = inventory.at(ordinal);
+        ASSERT_EQ(hipSetDevice(ordinal), hipSuccess);
+        constexpr int rows = 512, capacity = 65536, sample_count = 31;
+        constexpr std::array<int, 10> live_lengths{{1024, 2048, 4096, 8192, 8193,
+                                                   16384, 32768, 65536, 512, 1024}};
+        const std::array<ParticipantAttentionGeometry, 2> geometries{{
+            {"dense", 12, 2, 256, 0, 0}, {"moe", 8, 1, 256, 0, 0}}};
+        using Engine = llaminar2::rocm::FlashAttentionQKEngine;
+        constexpr std::array<Engine, 2> engines{{Engine::OrderedDot2, Engine::WmmaFourPlane}};
+        constexpr std::array<const char *, 2> engine_names{{"ordered_dot2", "wmma_four_plane"}};
+        std::cout << "FA2_QK_DEVICE," << ordinal << ',' << hardware.isa_target << ','
+                  << hardware.pci_address << ',' << hardware.compute_units << '\n';
+        std::cout << "record,geometry,engine,M,live_kv,capacity,sample,replays_per_sample,"
+                     "latency_us,dot2_over_wmma,latency_over_1024,kv_over_1024,"
+                     "latency_per_key_over_1024\n";
+        for (const auto &geometry : geometries)
+        {
+            std::array<std::unique_ptr<CapturedROCmFA2Benchmark>, 2> benchmarks;
+            std::array<const void *, 2> attention_functions{};
+            for (size_t path = 0; path < engines.size(); ++path)
+            {
+                llaminar2::rocm::ScopedFlashAttentionQKEngine selected(engines[path]);
+                benchmarks[path] = std::make_unique<CapturedROCmFA2Benchmark>(geometry, NativeKVFormat::FP16,
+                    rows, capacity, hardware.compute_units, hardware.lds_per_block, ordinal);
+                auto &benchmark = *benchmarks[path];
+                ASSERT_TRUE(benchmark.ready()) << benchmark.error();
+                ASSERT_TRUE(benchmark.prepareQueryRows(rows)) << benchmark.error();
+                ASSERT_TRUE(benchmark.policyPlan().valid);
+                ASSERT_FALSE(benchmark.policyPlan().usesContextParallelism());
+                ASSERT_TRUE(benchmark.captureDefaultGraph()) << benchmark.error();
+                ASSERT_TRUE(benchmark.captureContextCandidate(0, 0)) << benchmark.error();
+                ASSERT_EQ(benchmark.contextPlan().device_direct_partition_limit, 1);
+                hipKernelNodeParams native{};
+                ASSERT_TRUE(benchmark.defaultKernelInventory(native)) << benchmark.error();
+                attention_functions[path] = native.func;
+                const auto inspect = [&](const std::vector<hipKernelNodeParams> &nodes, const char *scope)
+                {
+                    int attention_nodes = 0, reducer_nodes = 0;
+                    for (size_t index = 0; index < nodes.size(); ++index)
+                    {
+                        const auto &node = nodes[index];
+                        const char *name = benchmark.defaultKernelName(node);
+                        ASSERT_NE(name, nullptr);
+                        const std::string symbol(name);
+                        const bool attention = symbol.find("flash_attention_2_mi50_kernel") != std::string::npos;
+                        if (attention)
+                        {
+                            ++attention_nodes;
+                            // The final template bool names the compiled QK engine;
+                            // REGISTER_SCORE_TILE is a separate preceding bool.
+                            const bool matrix = symbol.find("Lb1EE") != std::string::npos ||
+                                symbol.find(", true>(") != std::string::npos;
+                            const bool ordered = symbol.find("Lb0EE") != std::string::npos ||
+                                symbol.find(", false>(") != std::string::npos;
+                            ASSERT_TRUE(path == 1 ? matrix : ordered) << symbol;
+                        }
+                        if (symbol.find("flash_attention_2_context_reduce_mi50_kernel") != std::string::npos)
+                            ++reducer_nodes;
+                        hipFuncAttributes attributes{};
+                        ASSERT_EQ(hipFuncGetAttributes(&attributes, node.func), hipSuccess);
+                        ASSERT_EQ(attributes.localSizeBytes, 0U) << symbol;
+                        const unsigned threads = node.blockDim.x * node.blockDim.y * node.blockDim.z;
+                        ASSERT_GT(threads, 0U);
+                        ASSERT_LE(threads, static_cast<unsigned>(attributes.maxThreadsPerBlock));
+                        int resident = 0;
+                        ASSERT_EQ(hipOccupancyMaxActiveBlocksPerMultiprocessor(
+                            &resident, node.func, threads, node.sharedMemBytes), hipSuccess);
+                        ASSERT_GT(resident, 0) << symbol;
+                        std::cout << "FA2_QK_RESOURCE," << geometry.sources << ',' << engine_names[path]
+                                  << ',' << scope << ',' << index << ',' << attributes.numRegs << ','
+                                  << node.sharedMemBytes << ',' << attributes.localSizeBytes << ',' << resident
+                                  << ',' << threads << ',' << node.gridDim.x << ',' << node.gridDim.y << ','
+                                  << node.gridDim.z << ',' << symbol << '\n';
+                    }
+                    ASSERT_EQ(attention_nodes, nodes.size() == 1 ? 1 : 2);
+                    ASSERT_EQ(reducer_nodes, nodes.size() == 1 ? 0 : 1);
+                };
+                ASSERT_NO_FATAL_FAILURE(inspect({native}, "default_attention"));
+                std::vector<hipKernelNodeParams> context_nodes;
+                ASSERT_TRUE(benchmark.contextKernelInventory(context_nodes)) << benchmark.error();
+                ASSERT_NO_FATAL_FAILURE(inspect(context_nodes, "untimed_context_oracle"));
+            }
+            ASSERT_NE(attention_functions[0], attention_functions[1]);
+            std::array<double, 2> reference_1024{};
+            std::array<std::vector<std::pair<double,double>>,2> scaling_points;
+            for (const int live : live_lengths)
+            {
+                SCOPED_TRACE(geometry.sources + " live_kv=" + std::to_string(live));
+                std::array<std::vector<float>, 2> bytes;
+                for (size_t path = 0; path < engines.size(); ++path)
+                    ASSERT_TRUE(benchmarks[path]->validatedDefaultBytes(live, bytes[path]))
+                        << engine_names[path] << ':' << benchmarks[path]->error();
+                ASSERT_EQ(bytes[0].size(), bytes[1].size());
+                ASSERT_EQ(std::memcmp(bytes[0].data(), bytes[1].data(), bytes[0].size() * sizeof(float)), 0);
+                // Warm both already captured graphs outside the paired sample set.
+                for (int warmup = 0; warmup < 2; ++warmup)
+                    for (auto &benchmark : benchmarks)
+                        ASSERT_GT(benchmark->measureDefaultBatch(live), 0.0) << benchmark->error();
+                std::array<std::array<double, sample_count>, 2> samples{};
+                for (int sample = 0; sample < sample_count; ++sample)
+                    for (int order = 0; order < 2; ++order)
+                    {
+                        const int path = (sample + order) % 2;
+                        samples[path][sample] = benchmarks[path]->measureDefaultBatch(live);
+                        ASSERT_TRUE(std::isfinite(samples[path][sample]) && samples[path][sample] > 0.0)
+                            << benchmarks[path]->error();
+                    }
+                std::array<double, 2> medians{};
+                for (size_t path = 0; path < engines.size(); ++path)
+                {
+                    auto sorted = samples[path];
+                    std::sort(sorted.begin(), sorted.end());
+                    medians[path] = sorted[sample_count / 2];
+                    if (live == 1024 && reference_1024[path] == 0.0) reference_1024[path] = medians[path];
+                    if (live >= 1024 && (live & (live - 1)) == 0 &&
+                        (scaling_points[path].empty() || live > scaling_points[path].back().first))
+                        scaling_points[path].emplace_back(live,medians[path]);
+                }
+                const double speedup = medians[0] / medians[1];
+                for (size_t path = 0; path < engines.size(); ++path)
+                {
+                    const double latency_scaling = reference_1024[path] > 0.0
+                        ? medians[path] / reference_1024[path] : 0.0;
+                    const double key_scaling = static_cast<double>(live) / 1024.0;
+                    for (int sample = 0; sample < sample_count; ++sample)
+                        std::cout << "FA2_QK_SAMPLE," << geometry.sources << ',' << engine_names[path]
+                                  << ',' << rows << ',' << live << ',' << capacity << ',' << sample << ','
+                                  << benchmarks[path]->defaultBatchSize(live) << ',' << std::setprecision(12)
+                                  << samples[path][sample] << ',' << speedup << ',' << latency_scaling << ','
+                                  << key_scaling << ',' << latency_scaling / key_scaling << '\n';
+                    std::cout << "FA2_QK_MEDIAN," << geometry.sources << ',' << engine_names[path]
+                              << ',' << rows << ',' << live << ',' << capacity << ",-1,"
+                              << benchmarks[path]->defaultBatchSize(live) << ',' << std::setprecision(12)
+                              << medians[path] << ',' << speedup << ',' << latency_scaling << ','
+                              << key_scaling << ',' << latency_scaling / key_scaling << '\n';
+                }
+                // Neither timing order nor the other engine may repair a dirty replay.
+                for (size_t path = 0; path < engines.size(); ++path)
+                {
+                    std::vector<float> replay;
+                    ASSERT_TRUE(benchmarks[path]->validatedDefaultBytes(live, replay)) << benchmarks[path]->error();
+                    ASSERT_EQ(std::memcmp(bytes[path].data(), replay.data(), replay.size() * sizeof(float)), 0);
+                }
+            }
+            for (size_t path = 0; path < engines.size(); ++path)
+            {
+                const auto &points = scaling_points[path];
+                ASSERT_EQ(points.size(),7u);
+                double mean_k = 0.0, mean_us = 0.0;
+                for (const auto &[k,us] : points) { mean_k += k; mean_us += us; }
+                mean_k /= points.size(); mean_us /= points.size();
+                double covariance = 0.0, variance_k = 0.0, variance_us = 0.0;
+                for (const auto &[k,us] : points)
+                {
+                    covariance += (k-mean_k)*(us-mean_us);
+                    variance_k += (k-mean_k)*(k-mean_k);
+                    variance_us += (us-mean_us)*(us-mean_us);
+                }
+                ASSERT_GT(variance_k,0.0); ASSERT_GT(variance_us,0.0);
+                const double slope = covariance/variance_k;
+                const double intercept = mean_us-slope*mean_k;
+                double residual = 0.0;
+                for (const auto &[k,us] : points)
+                    residual += (us-intercept-slope*k)*(us-intercept-slope*k);
+                const double r_squared = 1.0-residual/variance_us;
+                const double last_doubling = points.back().second/points[points.size()-2].second;
+                std::cout << "FA2_QK_LINEARITY," << geometry.sources << ',' << engine_names[path]
+                          << ',' << slope << ',' << intercept << ',' << r_squared << ',' << last_doubling << '\n';
+                // Fixed-M causal work is affine in KV, not proportional through
+                // the origin. The long-end bound admits 10% timing variation
+                // above ideal doubling while rejecting quadratic growth; the
+                // full-curve fit also guards an earlier capacity-dependent bend.
+                EXPECT_GT(slope,0.0);
+                EXPECT_GE(r_squared,0.995) << geometry.sources << ':' << engine_names[path];
+                EXPECT_LE(last_doubling,2.2) << geometry.sources << ':' << engine_names[path];
+            }
+        }
+#endif
+    }
+
     /** @brief Certify generic captured attention policy across the complete Qwen catalog. */
     TEST_F(
         ROCmFlashAttentionContextParallelPerf,
@@ -2498,6 +2814,10 @@ namespace
      * `..._PHASE_BLOCKS`, `..._REDUCER_WAVEFRONTS`, `..._REDUCER_BLOCKS`,
      * `..._FORMAT`, `..._MODE`, and `..._GEOMETRY`. Mode `default` resolves
      * the installed geometry policy; `direct` and `context` isolate a schedule.
+     * Prefix those modes with `wmma_` or `ordered_` to record one explicit QK
+     * engine on the actual visible gfx1100. No new runtime environment key is
+     * required. For the fixed-M512 pair, dense uses `qwen27_tp2` and MoE uses
+     * `qwen35_tp2`; the retained capacity can stay65536 as live KV grows.
      * Named geometries are
      * `qwen35_tp1`, `qwen35_tp2`, `qwen35_tp4`, `qwen35_tp8` (the default),
      * `qwen7_tp1`, and `qwen27_tp4`. The Qwen35 degrees reproduce the exact
@@ -2516,6 +2836,8 @@ namespace
         const int m = positiveEnvironmentValue("LLAMINAR_ROCM_FA2_PROFILE_M");
         if (m == 0)
             GTEST_SKIP() << "Set LLAMINAR_ROCM_FA2_PROFILE_M to profile a point";
+        ASSERT_EQ(::testing::UnitTest::GetInstance()->test_to_run_count(), 1)
+            << "Exact attention profiling requires one selected GTest";
         const int live_kv = std::max(
             m,
             positiveEnvironmentValue("LLAMINAR_ROCM_FA2_PROFILE_KV"));
@@ -2532,10 +2854,42 @@ namespace
             "LLAMINAR_ROCM_FA2_PROFILE_REDUCER_BLOCKS");
         const std::string requested_format =
             environmentString("LLAMINAR_ROCM_FA2_PROFILE_FORMAT");
-        const std::string requested_mode =
+        std::string requested_mode =
             environmentString("LLAMINAR_ROCM_FA2_PROFILE_MODE");
         const std::string requested_geometry =
             environmentString("LLAMINAR_ROCM_FA2_PROFILE_GEOMETRY");
+        using QKEngine = llaminar2::rocm::FlashAttentionQKEngine;
+        QKEngine qk_engine = QKEngine::Automatic;
+        if (requested_mode.starts_with("wmma_"))
+        {
+            qk_engine = QKEngine::WmmaFourPlane;
+            requested_mode.erase(0, 5);
+        }
+        else if (requested_mode.starts_with("ordered_"))
+        {
+            qk_engine = QKEngine::OrderedDot2;
+            requested_mode.erase(0, 8);
+        }
+        int ordinal = 0, compute_units = properties_.multiProcessorCount;
+        size_t lds_capacity = std::max<size_t>(properties_.sharedMemPerBlock,
+                                             rocm_policy::kROCmFA2LDSCapacityBytes);
+        if (qk_engine != QKEngine::Automatic)
+        {
+            const auto &inventory = llaminar2::rocmHardwareMetadata();
+            ordinal = -1;
+            for (size_t index = 0; index < inventory.size(); ++index)
+            {
+                const auto &candidate = inventory.at(static_cast<int>(index));
+                if (candidate.isa_target == "gfx1100" || candidate.isa_target.starts_with("gfx1100:"))
+                {
+                    ordinal = candidate.ordinal;
+                    compute_units = candidate.compute_units;
+                    lds_capacity = candidate.lds_per_block;
+                    break;
+                }
+            }
+            if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+        }
 
         NativeKVFormat format = NativeKVFormat::FP16;
         if (requested_format == "FP32")
@@ -2585,20 +2939,49 @@ namespace
             FAIL() << "Unknown LLAMINAR_ROCM_FA2_PROFILE_GEOMETRY="
                    << requested_geometry;
         }
+        llaminar2::rocm::ScopedFlashAttentionQKEngine selected_qk(qk_engine);
         CapturedROCmFA2Benchmark benchmark(
             geometry,
             format,
             m,
             capacity,
-            properties_.multiProcessorCount,
-            std::max<std::size_t>(
-                properties_.sharedMemPerBlock,
-                rocm_policy::kROCmFA2LDSCapacityBytes));
+            compute_units,
+            lds_capacity,
+            ordinal);
         ASSERT_TRUE(benchmark.ready()) << benchmark.error();
         ASSERT_TRUE(benchmark.prepareQueryRows(m)) << benchmark.error();
+        const auto authenticate_profile = [&](const std::vector<hipKernelNodeParams> &nodes)
+        {
+            int matrix_nodes = 0;
+            for (const auto &node : nodes)
+            {
+                const char *name = benchmark.defaultKernelName(node);
+                ASSERT_NE(name, nullptr);
+                const std::string symbol(name);
+                if (symbol.find("flash_attention_2_mi50_kernel") != std::string::npos)
+                {
+                    const bool wmma = symbol.find("Lb1EE") != std::string::npos ||
+                        symbol.find(", true>(") != std::string::npos;
+                    if (qk_engine != QKEngine::Automatic)
+                        ASSERT_EQ(wmma, qk_engine == QKEngine::WmmaFourPlane) << symbol;
+                    matrix_nodes += wmma;
+                }
+                hipFuncAttributes attributes{};
+                ASSERT_EQ(hipFuncGetAttributes(&attributes, node.func), hipSuccess);
+                ASSERT_EQ(attributes.localSizeBytes, 0U) << symbol;
+                std::cout << "FA2_QK_PROFILE_RESOURCE," << ordinal << ',' << requested_mode << ','
+                          << m << ',' << live_kv << ',' << attributes.numRegs << ',' << node.sharedMemBytes
+                          << ',' << attributes.localSizeBytes << ',' << node.blockDim.x << ','
+                          << node.gridDim.x << ',' << node.gridDim.y << ',' << node.gridDim.z << ',' << symbol << '\n';
+            }
+            if (qk_engine == QKEngine::WmmaFourPlane) ASSERT_GT(matrix_nodes, 0);
+        };
         if (requested_mode == "default")
         {
             ASSERT_TRUE(benchmark.captureDefaultGraph()) << benchmark.error();
+            hipKernelNodeParams node{};
+            ASSERT_TRUE(benchmark.defaultKernelInventory(node)) << benchmark.error();
+            ASSERT_NO_FATAL_FAILURE(authenticate_profile({node}));
             ASSERT_TRUE(benchmark.replayDefaultOnceForProfiler(live_kv)) << benchmark.error();
             return;
         }
@@ -2612,6 +2995,16 @@ namespace
                 phase_blocks))
                 << benchmark.error();
         }
+        std::vector<hipKernelNodeParams> nodes;
+        if (context)
+            ASSERT_TRUE(benchmark.contextKernelInventory(nodes)) << benchmark.error();
+        else
+        {
+            hipKernelNodeParams node{};
+            ASSERT_TRUE(benchmark.directKernelInventory(node)) << benchmark.error();
+            nodes.push_back(node);
+        }
+        ASSERT_NO_FATAL_FAILURE(authenticate_profile(nodes));
         ASSERT_TRUE(benchmark.replayOnceForProfiler(context, live_kv))
             << benchmark.error();
 #endif

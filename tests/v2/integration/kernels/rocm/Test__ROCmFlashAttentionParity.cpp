@@ -12,6 +12,8 @@
  * - Independent probability references, ring replay and native LDS residency
  * - Register-owned query scores preserve canonical FP32 bytes through poisoned
  *   long/short captures, larger buckets, GQA mappings and extreme native-half V
+ * - Native gfx1100 QK WMMA retains explicit Dot2 bytes through captured native
+ *   cache formats, context partitions, ring wrap and replacement query data
  * - GQA configurations (n_heads != n_kv_heads)
  * - Deterministic captured decode retains KV parallelism and grouped/serial bytes
  *
@@ -41,6 +43,7 @@
 #include "planning/PlanningModelMetadata.h"
 #include "loaders/WeightManager.h"
 #include "backends/BackendManager.h"
+#include "backends/GPUDeviceContextPool.h"
 #include <gtest/gtest.h>
 
 #include "tensors/Tensors.h"
@@ -70,6 +73,7 @@
 #include "kernels/attention/AttentionDeviceParams.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
+#include "kernels/rocm/attention/ROCmFlashAttentionQK.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #endif
@@ -84,6 +88,9 @@
 #include <limits>
 #include <cstring>
 #include <cstdlib>
+#include <memory>
+#include <span>
+#include <utility>
 
 using namespace llaminar2;
 
@@ -7597,5 +7604,363 @@ TEST_F(Test__ROCmFlashAttentionParity, Qwen4ExpTP8CapturedReplicatedHeadMapping)
                 mpi_ctx_,rows,5,3,2,256,"QFN TP8 Q3/fullKV2 original global mapping",ActivationPrecision::FP16,head_start,12);
             if(::testing::Test::HasFatalFailure())return;
         }
+}
+#endif
+
+#ifdef HAVE_ROCM
+namespace
+{
+/** @brief Immutable public attention geometry retained by the paired QK graphs. */
+struct NativeWmmaQKCase
+{
+    int rows;
+    int capacity;
+    int query_heads;
+    int kv_heads;
+    int batch = 1;
+    int head_start = 0;
+    int repetition = 0;
+    ROCmFA2KVFormat format = ROCmFA2KVFormat::FP16;
+};
+
+/** @return An admitted native gfx1100 ordinal, or -1 when this proof is unavailable. */
+int nativeWmmaQKDevice()
+{
+    initializeROCmHardwareMetadata();
+    for (int ordinal = 0; ordinal < static_cast<int>(rocmHardwareMetadata().size()); ++ordinal)
+    {
+        const auto &isa = rocmHardwareMetadata().at(ordinal).isa_target;
+        if (isa == "gfx1100" || isa.starts_with("gfx1100:")) return ordinal;
+    }
+    return -1;
+}
+
+/**
+ * @brief Compare retained native QK engines using the public production FA2 entries.
+ * @param ordinal Actual native gfx1100 endpoint, independent of visible-device order.
+ * @param c Complete immutable request/head/cache geometry.
+ * @param lifecycle Device-published pairs of live KV length and logical query rows.
+ * @param context_parallel Also retain the canonical context producer/reducer graphs.
+ * @param half_extrema Include both largest finite native-half value banks.
+ *
+ * Each graph owns a distinct output and context-summary bank. Explicit Dot2
+ * is the arithmetic authority even after Automatic installs measured WMMA.
+ * Ring repacking preserves the original logical K/V rows, and each wrapped
+ * result must equal the contiguous Dot2 witness. All setup and observations
+ * remain outside capture; only device-owned parameters change during replay.
+ */
+void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
+    std::span<const std::pair<int,int>> lifecycle, bool context_parallel, bool half_extrema)
+{
+    namespace policy = llaminar2::rocm::fa2_policy;
+    using Engine = llaminar2::rocm::FlashAttentionQKEngine;
+    constexpr int width = 256;
+    const auto device = DeviceId::rocm(ordinal);
+    auto &worker = GPUDeviceContextPool::instance().getContext(device);
+    worker.submitAndWait([&]
+    {
+        SCOPED_TRACE(::testing::Message() << "M=" << c.rows << " capacity=" << c.capacity
+            << " Q=" << c.query_heads << " KV=" << c.kv_heads << " batch=" << c.batch
+            << " format=" << rocmFA2KVFormatName(c.format));
+        auto *backend = getBackendFor(device);
+        void *const stream = worker.defaultStream();
+        const auto native_stream = static_cast<hipStream_t>(stream);
+        ASSERT_NE(backend,nullptr);
+        ASSERT_NE(stream,nullptr);
+        ASSERT_FALSE(lifecycle.empty());
+        const size_t output_elements = size_t(c.batch) * c.rows * c.query_heads * width;
+        const size_t kv_elements = size_t(c.batch) * c.capacity * c.kv_heads * width;
+        std::vector<float> query(output_elements), keys(kv_elements), values(kv_elements);
+        // Distinct request/head words expose batch and replicated-GQA addressing.
+        for (size_t i = 0; i < keys.size(); ++i)
+            keys[i] = std::sin(float(i % 32749) * .031f) * .23f;
+        const auto encoded_keys = encodeROCmFA2KV(keys,c.format,width);
+        ASSERT_FALSE(encoded_keys.empty());
+        const size_t request_bytes = encoded_keys.size() / c.batch;
+        const size_t row_bytes = request_bytes / c.capacity;
+        std::vector<uint8_t> physical_keys(encoded_keys.size()), physical_values(encoded_keys.size());
+        std::array<std::vector<float>,4> observed;
+        for (auto &bank : observed) bank.resize(output_elements);
+        std::vector<float> linear_reference(output_elements), repeated(output_elements);
+        ScopedHIPAllocation dq, dk, dv, parameters;
+        std::array<ScopedHIPAllocation,4> outputs;
+        std::array<ScopedHIPAllocation,2> partial, partial_m, partial_l;
+        ASSERT_TRUE(dq.allocate(query.size()*sizeof(float)));
+        ASSERT_TRUE(dk.allocate(encoded_keys.size()));
+        ASSERT_TRUE(dv.allocate(encoded_keys.size()));
+        ASSERT_TRUE(parameters.allocate(sizeof(attention::AttentionDeviceParams)));
+        const int graph_count = context_parallel ? 4 : 2;
+        for (int path = 0; path < graph_count; ++path)
+            ASSERT_TRUE(outputs[path].allocate(output_elements*sizeof(float)));
+        const auto physical = llaminar2::rocm::queryROCmFlashAttentionDeviceProperties(ordinal);
+        const TensorType cache_type = c.format == ROCmFA2KVFormat::FP32 ? TensorType::FP32 :
+            c.format == ROCmFA2KVFormat::FP16 ? TensorType::FP16 :
+            c.format == ROCmFA2KVFormat::BF16 ? TensorType::BF16 : TensorType::Q8_1;
+        const auto plan = policy::selectROCmFA2PrefillParallelPlan({
+            .batch_size = c.batch, .query_rows = c.rows, .local_query_heads = c.query_heads,
+            .head_dim = width, .kv_capacity = c.capacity,
+            .compute_unit_count = physical.compute_unit_count, .lds_capacity_bytes = physical.lds_capacity_bytes,
+            .requested_axis = attention::AttentionPrefillParallelAxis::KeyValueContext,
+            .kv_format = cache_type,
+            .visibility = policy::ROCmFA2VisibilityPolicy::CausalFullContext});
+        if (context_parallel)
+        {
+            ASSERT_TRUE(plan.valid);
+            ASSERT_TRUE(plan.usesContextParallelism());
+            for (int path = 0; path < 2; ++path)
+            {
+                ASSERT_TRUE(partial[path].allocate(plan.partial_output_bytes));
+                ASSERT_TRUE(partial_m[path].allocate(plan.partial_m_bytes));
+                ASSERT_TRUE(partial_l[path].allocate(plan.partial_l_bytes));
+            }
+        }
+        std::array<std::unique_ptr<IGPUGraphCapture>,4> graphs;
+        // The observation boundary precedes graph, buffer and source retirement
+        // on every assertion/exception exit, including a disabled-node control.
+        auto drain = [&](void *) { (void)backend->synchronizeStream(stream,ordinal); };
+        std::unique_ptr<void,decltype(drain)> completion(&worker,drain);
+        const auto launch = [&](int path)
+        {
+            const auto *params = parameters.as<attention::AttentionDeviceParams>();
+            if (path >= 2)
+            {
+                const int bank = path - 2;
+                const auto submit = [&](auto entry)
+                {
+                    return entry(dq.as<float>(),dk.get(),dv.get(),outputs[path].as<float>(),
+                        partial[bank].as<float>(),partial_m[bank].as<float>(),partial_l[bank].as<float>(),
+                        c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,true,-1,0,params,nullptr,
+                        policy::kROCmFA2CanonicalContextPartitionKeys,plan.max_context_partitions,
+                        plan.context_partition_slots,plan.context_phase_block_slots,1,
+                        plan.reducer_dimension_wavefronts,plan.reducer_block_slots,stream,c.head_start,c.repetition);
+                };
+                switch (c.format)
+                {
+                case ROCmFA2KVFormat::FP32: return submit(hipFlashAttn_prefill_fa2_context_parallel);
+                case ROCmFA2KVFormat::FP16: return submit(hipFlashAttn_prefill_fa2_fp16_context_parallel);
+                case ROCmFA2KVFormat::BF16: return submit(hipFlashAttn_prefill_fa2_bf16_context_parallel);
+                case ROCmFA2KVFormat::Q8_1: return submit(hipFlashAttn_prefill_fa2_q8_1_context_parallel);
+                }
+            }
+            switch (c.format)
+            {
+            case ROCmFA2KVFormat::FP32:
+                return hipFlashAttn_prefill_fa2(dq.as<float>(),dk.as<float>(),dv.as<float>(),outputs[path].as<float>(),
+                    c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,true,-1,0,params,nullptr,stream,c.head_start,c.repetition);
+            case ROCmFA2KVFormat::FP16:
+                return hipFlashAttn_prefill_fa2_fp16(dq.as<float>(),dk.get(),dv.get(),outputs[path].as<float>(),
+                    c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,true,-1,0,params,nullptr,stream,c.head_start,c.repetition);
+            case ROCmFA2KVFormat::BF16:
+                return hipFlashAttn_prefill_fa2_bf16(dq.as<float>(),dk.get(),dv.get(),outputs[path].as<float>(),
+                    c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,true,-1,0,params,nullptr,stream,c.head_start,c.repetition);
+            case ROCmFA2KVFormat::Q8_1:
+                return hipFlashAttn_prefill_fa2_q8_1(dq.as<float>(),dk.get(),dv.get(),outputs[path].as<float>(),
+                    c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,true,-1,0,params,nullptr,stream,c.head_start,c.repetition);
+            }
+            return -1;
+        };
+        const attention::AttentionDeviceParams initial{.kv_len = c.capacity, .kv_stride = c.capacity,
+            .position_offset = c.capacity-c.rows, .mask_stride = c.capacity};
+        ASSERT_TRUE(backend->hostToDevice(parameters.get(),&initial,sizeof(initial),ordinal,stream));
+        ASSERT_TRUE(backend->hostToDevice(dk.get(),encoded_keys.data(),encoded_keys.size(),ordinal,stream));
+        const auto initial_values = encodeROCmFA2KV(values,c.format,width);
+        ASSERT_TRUE(backend->hostToDevice(dv.get(),initial_values.data(),initial_values.size(),ordinal,stream));
+        ASSERT_TRUE(backend->hostToDevice(dq.get(),query.data(),query.size()*sizeof(float),ordinal,stream));
+        for (int path = 0; path < graph_count; ++path)
+        {
+            llaminar2::rocm::ScopedFlashAttentionQKEngine engine(path % 2 ? Engine::WmmaFourPlane : Engine::OrderedDot2);
+            ASSERT_EQ(launch(path),0);
+            ASSERT_TRUE(backend->synchronizeStream(stream,ordinal));
+            graphs[path] = worker.createGraphCapture(stream);
+            ASSERT_NE(graphs[path],nullptr);
+            ScopedBackendGraphCapture capture(worker,*graphs[path],"native QK engine byte replay");
+            ASSERT_TRUE(capture.begin());
+            const int status = launch(path);
+            capture.finish();
+            ASSERT_EQ(status,0);
+            std::vector<GPUGraphKernelNodeInfo> nodes;
+            ASSERT_TRUE(graphs[path]->inspectKernelNodes(nodes));
+            ASSERT_EQ(nodes.size(),path >= 2 ? 3u : 1u);
+            int producers = 0;
+            for (const auto &node : nodes)
+            {
+                ASSERT_EQ(node.local_memory_bytes_per_thread,0u) << node.name;
+                if (node.name.find("flash_attention_2_mi50_kernel") == std::string::npos) continue;
+                ++producers;
+                const bool wmma = node.name.find("Lb0ELb1ELb1EE") != std::string::npos ||
+                    node.name.find("Lb0ELb0ELb1EE") != std::string::npos ||
+                    node.name.find("Lb1ELb0ELb1EE") != std::string::npos;
+                ASSERT_EQ(wmma,path % 2 != 0) << node.name;
+                ASSERT_EQ(node.block_x,256u) << node.name;
+                ASSERT_GT(node.max_active_blocks_per_sm,0u) << node.name;
+            }
+            ASSERT_GE(producers,1);
+            ASSERT_TRUE(graphs[path]->instantiate());
+        }
+        const auto poison = [&](int path)
+        {
+            ASSERT_EQ(hipMemsetAsync(outputs[path].get(),0x7f,output_elements*sizeof(float),native_stream),hipSuccess);
+            if (path >= 2)
+            {
+                const int bank = path-2;
+                ASSERT_EQ(hipMemsetAsync(partial[bank].get(),0x7f,plan.partial_output_bytes,native_stream),hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(partial_m[bank].get(),0x7f,plan.partial_m_bytes,native_stream),hipSuccess);
+                ASSERT_EQ(hipMemsetAsync(partial_l[bank].get(),0x7f,plan.partial_l_bytes,native_stream),hipSuccess);
+            }
+        };
+        const int generations = half_extrema ? 3 : 2;
+        for (int generation = 0; generation < generations; ++generation)
+        {
+            SCOPED_TRACE("activation_generation="+std::to_string(generation));
+            for (size_t i = 0; i < query.size(); ++i)
+                query[i] = std::sin(float(i % 8191 + generation*37)*.017f)*.37f;
+            for (size_t i = 0; i < values.size(); ++i)
+                values[i] = half_extrema && generation ? (generation == 1 ? 65504.f : -65504.f) :
+                    std::cos(float(i % 32749 + generation*19)*.023f)*.31f;
+            const auto encoded_values = encodeROCmFA2KV(values,c.format,width);
+            ASSERT_EQ(encoded_values.size(),encoded_keys.size());
+            ASSERT_TRUE(backend->hostToDevice(dq.get(),query.data(),query.size()*sizeof(float),ordinal,stream));
+            for (const auto [length,logical_rows] : lifecycle)
+            {
+                SCOPED_TRACE("live_KV="+std::to_string(length)+" logical_queries="+std::to_string(logical_rows));
+                ASSERT_GT(length,0);
+                ASSERT_LE(length,c.capacity);
+                ASSERT_GT(logical_rows,0);
+                ASSERT_LE(logical_rows,std::min(length,c.rows));
+                for (const int origin : {0,c.capacity-13})
+                {
+                    SCOPED_TRACE("ring_origin="+std::to_string(origin));
+                    for (int request = 0; request < c.batch; ++request)
+                        for (int row = 0; row < c.capacity; ++row)
+                        {
+                            const size_t source = size_t(request)*request_bytes+size_t(row)*row_bytes;
+                            const size_t destination = size_t(request)*request_bytes+size_t((origin+row)%c.capacity)*row_bytes;
+                            std::memcpy(physical_keys.data()+destination,encoded_keys.data()+source,row_bytes);
+                            std::memcpy(physical_values.data()+destination,encoded_values.data()+source,row_bytes);
+                        }
+                    ASSERT_TRUE(backend->hostToDevice(dk.get(),physical_keys.data(),physical_keys.size(),ordinal,stream));
+                    ASSERT_TRUE(backend->hostToDevice(dv.get(),physical_values.data(),physical_values.size(),ordinal,stream));
+                    const attention::AttentionDeviceParams live{.kv_len=length,.kv_stride=c.capacity,
+                        .position_offset=length-logical_rows,.mask_stride=c.capacity,
+                        .ring_row_origin=origin,.ring_row_capacity=c.capacity};
+                    ASSERT_TRUE(backend->hostToDevice(parameters.get(),&live,sizeof(live),ordinal,stream));
+                    for (int path = 0; path < graph_count; ++path)
+                    {
+                        SCOPED_TRACE("graph_path="+std::to_string(path));
+                        ASSERT_NO_FATAL_FAILURE(poison(path));
+                        ASSERT_TRUE(graphs[path]->launch());
+                        ASSERT_TRUE(backend->deviceToHost(observed[path].data(),outputs[path].get(),
+                            output_elements*sizeof(float),ordinal,stream));
+                        ASSERT_TRUE(backend->synchronizeStream(stream,ordinal));
+                        ASSERT_FALSE(hasNaNOrInf(observed[path].data(),output_elements));
+                        if (path == 0 && origin == 0) linear_reference = observed[path];
+                        ASSERT_EQ(std::memcmp(observed[path].data(),linear_reference.data(),output_elements*sizeof(float)),0)
+                            << "native QK engine or ring addressing changed the explicit Dot2 bytes";
+                    }
+                    // Repeated dirty replay cannot depend on the previous candidate's output.
+                    ASSERT_NO_FATAL_FAILURE(poison(1));
+                    ASSERT_TRUE(graphs[1]->launch());
+                    ASSERT_TRUE(backend->deviceToHost(repeated.data(),outputs[1].get(),output_elements*sizeof(float),ordinal,stream));
+                    ASSERT_TRUE(backend->synchronizeStream(stream,ordinal));
+                    ASSERT_EQ(std::memcmp(repeated.data(),linear_reference.data(),output_elements*sizeof(float)),0);
+                }
+            }
+        }
+    });
+}
+} // namespace
+
+/** @test Every native cache format and request bank retains Dot2 bytes across wrapped tile tails. */
+TEST(ROCmFlashAttentionWmmaQK, CapturedAllNativeFormatsAndRingByteExact)
+{
+    const int ordinal = nativeWmmaQKDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    constexpr std::array<std::pair<int,int>,8> lifecycle{{{257,17},{1,1},{15,15},{16,16},
+        {17,17},{256,16},{257,1},{257,17}}};
+    for (const auto format : {ROCmFA2KVFormat::FP32,ROCmFA2KVFormat::FP16,ROCmFA2KVFormat::BF16,ROCmFA2KVFormat::Q8_1})
+    {
+        runNativeWmmaQKParity(ordinal,{17,257,4,1,1,0,0,format},lifecycle,true,false);
+        if (::testing::Test::HasFatalFailure()) return;
+    }
+    runNativeWmmaQKParity(ordinal,{17,257,3,2,2,11,12},lifecycle,true,false);
+}
+
+/** @test Direct and context-partitioned native QK preserve bytes through 64K/reset/partial replay. */
+TEST(ROCmFlashAttentionWmmaQK, CapturedContextLifecycleThrough64KByteExact)
+{
+    const int ordinal = nativeWmmaQKDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    constexpr std::array<std::pair<int,int>,11> long_lifecycle{{{65536,33},{8191,33},{8192,33},
+        {8193,33},{65535,33},{65536,17},{257,16},{17,1},{1,1},{65536,1},{65536,33}}};
+    runNativeWmmaQKParity(ordinal,{33,65536,4,1},long_lifecycle,true,false);
+    if (::testing::Test::HasFatalFailure()) return;
+    constexpr std::array<std::pair<int,int>,7> bucket_lifecycle{{{8193,512},{8192,512},{512,512},
+        {17,17},{8193,1},{8193,511},{8193,512}}};
+    runNativeWmmaQKParity(ordinal,{512,8193,3,2,1,11,12},bucket_lifecycle,true,false);
+}
+
+/** @test Short prefixes retain FP32 totals with both largest finite native-half value signs. */
+TEST(ROCmFlashAttentionWmmaQK, ShortPrefixHalfExtremaByteExact)
+{
+    const int ordinal = nativeWmmaQKDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    constexpr std::array<std::pair<int,int>,6> lifecycle{{{257,17},{1,1},{16,16},{17,17},{255,1},{257,17}}};
+    runNativeWmmaQKParity(ordinal,{17,257,4,1},lifecycle,false,true);
+}
+
+/** @test A forced unsupported native ISA or head width records no attention work. */
+TEST(ROCmFlashAttentionWmmaQK, ForcedEngineRejectsUnsupportedGeometry)
+{
+    initializeROCmHardwareMetadata();
+    const auto &hardware = rocmHardwareMetadata();
+    if (hardware.size() == 0) GTEST_SKIP() << "No native ROCm device is visible";
+    std::vector<std::pair<int,int>> rejected;
+    bool native_added = false, other_added = false;
+    for (int ordinal = 0; ordinal < static_cast<int>(hardware.size()); ++ordinal)
+    {
+        const auto &isa = hardware.at(ordinal).isa_target;
+        const bool native = isa == "gfx1100" || isa.starts_with("gfx1100:");
+        if (native && !native_added)
+        {
+            rejected.emplace_back(ordinal,128);
+            native_added = true;
+        }
+        if (!native && !other_added)
+        {
+            rejected.emplace_back(ordinal,256);
+            other_added = true;
+        }
+    }
+    for (const auto [ordinal,width] : rejected)
+    {
+        SCOPED_TRACE("rejected native ordinal="+std::to_string(ordinal)+" HD="+std::to_string(width));
+        auto &worker = GPUDeviceContextPool::instance().getContext(DeviceId::rocm(ordinal));
+        worker.submitAndWait([&]
+        {
+            constexpr int rows = 17;
+            void *const stream = worker.defaultStream();
+            ASSERT_NE(stream,nullptr);
+            ScopedHIPAllocation q,k,v,output;
+            ASSERT_TRUE(q.allocate(size_t(rows)*width*sizeof(float)));
+            ASSERT_TRUE(k.allocate(size_t(rows)*width*sizeof(uint16_t)));
+            ASSERT_TRUE(v.allocate(size_t(rows)*width*sizeof(uint16_t)));
+            ASSERT_TRUE(output.allocate(size_t(rows)*width*sizeof(float)));
+            auto graph = worker.createGraphCapture(stream);
+            ASSERT_NE(graph,nullptr);
+            llaminar2::rocm::ScopedFlashAttentionQKEngine engine(
+                llaminar2::rocm::FlashAttentionQKEngine::WmmaFourPlane);
+            ScopedBackendGraphCapture capture(worker,*graph,"rejected native QK geometry");
+            ASSERT_TRUE(capture.begin());
+            const int status = hipFlashAttn_prefill_fa2_fp16(q.as<float>(),k.get(),v.get(),output.as<float>(),
+                1,rows,rows,1,1,width,true,-1,0,nullptr,nullptr,stream,0,0);
+            capture.finish();
+            ASSERT_EQ(status,-1);
+            auto *native = dynamic_cast<HIPGraphCapture *>(graph.get());
+            ASSERT_NE(native,nullptr);
+            size_t nodes = 0;
+            ASSERT_EQ(hipGraphGetNodes(native->graph(),nullptr,&nodes),hipSuccess);
+            ASSERT_EQ(nodes,0u) << "Unsupported forced work must fail before recording a producer";
+        });
+    }
 }
 #endif

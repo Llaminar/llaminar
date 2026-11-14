@@ -896,6 +896,7 @@ if(HAVE_ROCM)
     set_property(SOURCE kernels/rocm/gemm/ROCmNativeQuantisedWmma.hip
         kernels/rocm/moe/ROCmRouterQ8Prefill.hip
         kernels/rocm/gemm/ROCmMoEGroupedWmma.hip
+        kernels/rocm/attention/ROCmFlashAttentionKernels.hip
         APPEND PROPERTY COMPILE_OPTIONS "-mwavefrontsize64")
     
     # NOTE: ROCm kernel ITensorGemm adapters (ROCmFloatingPointGemmKernel.cpp)
