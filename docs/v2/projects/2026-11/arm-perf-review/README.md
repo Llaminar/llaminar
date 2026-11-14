@@ -5165,3 +5165,25 @@ Linux compile evidence; PASS = triage tip; red = verbatim to lane);
 then Main's sequencing: .79 d5e04fdce CUDA-ON base control
 (budgeted) + .79 triage-tip rerun w/ failed-set diff; per-host
 serialization.
+
+### WSL INCIDENT CLOSED — host recovered; T' gate relaunched (00:43Z)
+
+Qual lane (artifact-backed): host up 1d15:47 (NEVER rebooted — the
+crash killed dockerd + the session shell binding, not the box; load
+0.49, 31.9G/7.1G/24.8G, disk 214G used/285G free). dockerd clean
+(29.9.2), NO orphaned build processes; survivors: aa842a1be
+Exited(8) [processed], d5e04fdce Exited(1) [OOM base], 609638aba
+Exited(1) [BLOCKED]; **03480d07e + lane's ba2811e4c triage container
+CONFIRMED LOST** (lane's = known-broken revision — harvest N/A; .80
+a8beee811 = primary). T' TREE SURVIVED (9.5G, CMakeCache +
+build.ninja, worktree 03480d07e + onednn, configure complete,
+~1022 objects) => relaunch as SOLE container:
+stagea-tprime-recovery.sh, CMAKE_BUILD_PARALLEL_LEVEL=4 (from 5
+per Main), cpuset 0-7/28g, CAP_SYS_NICE+seccomp, stale receipt dir
+-> receipt.pre-crash (preserved), incremental resume [2/1757],
+driver running; first relaunch attempt = quoting-mangled -u arg
+(fixed with literal uid). Nothing else on the host; after T':
+byte-identity SERIALIZED -> develop-control last. Qual's bash tool
+NOT re-registered (probe failures explained); shell via the monitor
+spawn watcher. All pre-crash evidence safe. Main + lane informed;
+incident closed.
