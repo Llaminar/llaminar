@@ -1046,6 +1046,23 @@ canonical arm is a lane defect and blocks landing.
     `CpuResourcesPriceOnlyTheBoundOverlayLayout` (unbound CPU resource
     refuses; compact-bound plan fails closed at the section authority;
     canonical-bound input threads and prices build-default bytes).
+
+  - **Admission inventory observation (triage, fc39fbe93..1af9f6429).** The
+    refusal above now derives the observation from the admission callers'
+    LIVE inventory (same uniformity refusal as the binder) instead of
+    refusing every unbound producer; callers with no live inventory must
+    say so explicitly (required parameter, no default). The
+    `kHostPreparedLayout` fallback is consumed only by host-only CPU
+    budgets whose plan declares NO CPU participant (the derive returns
+    absent exactly then) — **no CPU byte is ever priced with the ambient
+    build layout; it is dead for CPU byte PRICING.** The invariant (a
+    CPU-participant plan always carries a resolved observation) is an
+    internal `LLAMINAR_ASSERT` in `buildResolverInput`: **it is checked
+    only where assertions are compiled in (Debug/Integration) and is
+    `((void)0)` in Release — it is NOT a release-mode guard.** The
+    always-compiled protections are the typed refusal (no inventory, no
+    observation, CPU resource) and the pricing section authority
+    (`cpuProjectionBytes` fail-closed for an unimplemented layout).
 - **Record-visitor arity defect + document contract (seq 145/148, fixup on
   609638aba):** 569de492b added `resolved_cpu_prepared_layout` to
   `MoERoutedExpertPlacementPlan` without extending the MEMBERS list in
