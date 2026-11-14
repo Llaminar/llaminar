@@ -6316,3 +6316,24 @@ binding x86 evidence = 56829099c (restarting). Reviewer delivered
 record follows). Board: .80/.79 reruns @ 56829099c + WSL x86
 restart @ 56829099c -> evidence attach -> reviewer verdict ->
 Gate-A.
+
+### Reviewer new-pin @ 56829099c: 2 preflight registration blockers (14:36Z)
+
+(1) CMakeLists:33203 filters `Test__OrchestrationConfigDocument.
+ResolvedCpuPreparedLayout...` but the actual declarations
+(unit/config/Test__OrchestrationConfigDocument.cpp:766,787) = TEST
+(OrchestrationConfigDocument, ...) WITHOUT `Test__` prefix =>
+V2_Integration_ResolvedCpuPreparedLayoutDocument selects NEITHER =
+vacuous (CTest cannot certify unexecuted controls). (2)
+MoEOverlayCapacityAdmission.TierLegacyCapAndFootprintsPriceThe
+AdmittedLayout (capacity-test:912) has NO focused preflight
+selection — the MoEPipelineStageCapacity filter (CMakeLists:1445)
+selects the 2 OLDER pricing tests only; add the exact new name.
+OTHER CHECKS CORRECTED: observation-before-pricing + both layout
+arguments + the required API + the independent tier EXPECT_NE hash
+control. Not a cancellation/gate-retarget; Main owns the runs +
+fix-forward. LANE dispatched (CMake-only fixup on 56829099c:
+fix the Test__ prefix + add the cap regression name); sparks
+(current runs PROVISIONAL — the 2 registrations vacuous; re-run at
+the successor); WSL (x86 restart held for the fixup SHA). Reviewer
+continues the bounded source/docs check; Main informed.
