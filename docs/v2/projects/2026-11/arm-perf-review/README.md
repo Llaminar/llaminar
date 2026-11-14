@@ -6413,3 +6413,15 @@ script only; no test/CMake/production change). RE-TARGETED: sparks
 (.80 focused + .79 incremental + the 2 registration asserts),
 WSL (x86 incremental @ 8ccfa771c; 9ba1d4da2 run = predecessor
 record). TIPS: code/review = 8ccfa771c; pins after green.
+
+### WSL x86 @ 8ccfa771c RUNNING (14:46Z)
+
+WSL re-target accepted: wt-armq-8ccfa771c; external staged; gate
+armq-a512-8ccfa771c CONFIGURE_RC=0 (oneDNN authority, no forged
+markers); parity ninja -j1 prebuild started (mem safe); the 2
+registration fixes + 2 new tests + both cap tests present
+(src/tests identical to 9ba1d4da2; the fold-in = 1 CI script).
+9ba1d4da2 run kept as predecessor/partial (stopped ~[167/800]).
+Will report DRIVER_RC + failed-set delta + 2 new tests green + cap
+tests green; then develop discriminator. Board: 3 hosts at
+8ccfa771c (sparks .80/.79; WSL x86) — one sweep to the pins/Gate-A.
