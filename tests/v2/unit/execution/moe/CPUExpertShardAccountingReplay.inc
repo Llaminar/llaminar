@@ -123,7 +123,7 @@ TEST(CPUExpertShardAccounting, JointLogicalQuotaUsesExactOriginalPMAFragments){
  const auto cpuShardObserved=cpuShardInventory();
  const auto format=ExpertWeightFormat::floating(TensorType::FP32);const auto source=cpuShardSource(format);
  const auto cohort=MoEExpertShardCohort::checked(source,4,cpuShardMembers(),{{0,256},{256,256}});
- const auto per=MoEOverlayCapacityResolver::preparedFootprints({cohort.localManifest(0)}).front().cpu_live_bytes;
+ const auto per=MoEOverlayCapacityResolver::preparedFootprints({cohort.localManifest(0)}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front().cpu_live_bytes;
  const auto plan=cpuShardPlan();const MoEOverlayCapacityAdmissionPolicy policy{.overlay_world_size=2};
  auto input=MoEOverlayCapacityAdmission::buildResolverInput(plan,4,{source},cpuShardBudgets(4*per,4*per),policy,&cpuShardObserved);
  const auto admitted=MoEOverlayCapacityResolver::resolve(input);const auto* tier=admitted.tier(0);ASSERT_NE(tier,nullptr);
@@ -149,7 +149,7 @@ TEST(CPUExpertShardAccounting, SingleSocketKeepsOriginalWholeExpertAuthority){
  const auto source=cpuShardSource(ExpertWeightFormat::floating(TensorType::FP32));
  const auto map=MoEExpertOwnerMap::build(plan);
  for(int e=0;e<4;++e){ASSERT_NE(map.ownerFor(3,e),nullptr);EXPECT_FALSE(map.ownerFor(3,e)->shard_cohort);EXPECT_EQ(map.fragmentCountForExpert(3,e),1u);}
- const auto per=MoEOverlayCapacityResolver::preparedFootprints({source}).front().cpu_live_bytes;
+ const auto per=MoEOverlayCapacityResolver::preparedFootprints({source}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front().cpu_live_bytes;
  const auto budget=boundBudget(0,physicalBudget("cpu-single",DeviceId::cpu(),4*per,0,0));
  const auto result=MoEOverlayCapacityAdmission::resolveCapacity(plan,4,{source},{budget},{},&cpuShardObserved);
  EXPECT_EQ(result.resource("cpu-single")->usedBytes(),4*per);EXPECT_TRUE(result.tier(0)->shard_cohorts.empty());
@@ -161,8 +161,8 @@ TEST(CPUExpertShardAccounting, UnequalFragmentsCannotBorrowPeerCapacity){
  const auto source=cpuShardSource(format,3,768);const auto cuts=MoEExpertShardCohort::balancedIntervals(source,2);
  ASSERT_EQ(cuts,(std::vector<MoEExpertShardCohort::Interval>{{0,512},{512,256}}));
  const auto cohort=MoEExpertShardCohort::checked(source,4,cpuShardMembers(),cuts);
- const auto first=MoEOverlayCapacityResolver::preparedFootprints({cohort.localManifest(0)}).front().cpu_live_bytes;
- const auto second=MoEOverlayCapacityResolver::preparedFootprints({cohort.localManifest(1)}).front().cpu_live_bytes;
+ const auto first=MoEOverlayCapacityResolver::preparedFootprints({cohort.localManifest(0)}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front().cpu_live_bytes;
+ const auto second=MoEOverlayCapacityResolver::preparedFootprints({cohort.localManifest(1)}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front().cpu_live_bytes;
  ASSERT_GT(first,second);const auto plan=cpuShardPlan();const MoEOverlayCapacityAdmissionPolicy policy{.overlay_world_size=2};
  const auto result=MoEOverlayCapacityAdmission::resolveCapacity(plan,4,{source},cpuShardBudgets(4*first,4*second),policy,&cpuShardObserved);
  EXPECT_EQ(result.resource("cpu-socket0")->usedBytes(),4*first);EXPECT_EQ(result.resource("cpu-socket1")->usedBytes(),4*second);
@@ -177,7 +177,7 @@ TEST(CPUExpertShardAccounting, QFNOriginal512AxisAnd448JointTierStayDistinct){
  source.projections[0].K=source.projections[1].K=source.projections[2].N=2560;
  source.projections[2].format=ExpertWeightFormat::nativeQuantised({native_quantised_formats::Q5_1.codebook_id,false,true});
  const auto geometry=MoEExpertShardCohort::checked(source,512,cpuShardMembers(),{{0,320},{320,320}});
- const auto fragment=MoEOverlayCapacityResolver::preparedFootprints({geometry.localManifest(0)}).front().cpu_live_bytes;
+ const auto fragment=MoEOverlayCapacityResolver::preparedFootprints({geometry.localManifest(0)}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front().cpu_live_bytes;
  for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}){
   auto plan=cpuShardPlan(448);plan.domains[0].name="cpu_cold";plan.routed_tiers[0].domain="cpu_cold";plan.routed_tiers[0].priority=10;
   auto gpu=boundDomain("gpu_hot",0,device.is_cuda()?GlobalDeviceAddress::cuda(0):GlobalDeviceAddress::rocm(0));
@@ -186,7 +186,7 @@ TEST(CPUExpertShardAccounting, QFNOriginal512AxisAnd448JointTierStayDistinct){
   plan.routed_tiers.insert(plan.routed_tiers.begin(),{.name="hot",.domain=gpu.name,.priority=0,.max_experts_per_layer=64});
   plan.placements[0].routed_expert_tier.assign(512,1);std::fill_n(plan.placements[0].routed_expert_tier.begin(),64,0);
   auto budgets=cpuShardBudgets(448*fragment,448*fragment);
-  const auto gpu_per=MoEOverlayCapacityResolver::preparedFootprints({source}).front().gpu_live_bytes;
+  const auto gpu_per=MoEOverlayCapacityResolver::preparedFootprints({source}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front().gpu_live_bytes;
   budgets.push_back(boundBudget(0,physicalBudget("gpu",device,64*gpu_per,0,0)));
   const MoEOverlayCapacityAdmissionPolicy policy{.overlay_world_size=2};
   const auto cpuShardObserved=cpuShardInventory();

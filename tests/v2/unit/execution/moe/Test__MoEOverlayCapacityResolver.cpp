@@ -651,7 +651,7 @@ namespace llaminar2
             ASSERT_NE(source.metadata, nullptr);
             const auto model_manifest = manifest(1, *source.metadata);
             const auto actual =
-                MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+                MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
             ASSERT_EQ(actual.size(), 1u);
             const auto expected =
                 expectedFootprint(model_manifest.front(), *source.metadata);
@@ -816,7 +816,7 @@ namespace llaminar2
                     DeviceMoEProjectionSet::CompleteExpert,
                     CPUNativeQuantisedLayout::InterleavedCanonical);
             const auto build_default =
-                MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+                MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
             ASSERT_EQ(canonical.size(), 1u);
             ASSERT_EQ(build_default.size(), 1u);
             // The build default IS the canonical layout today; both routes
@@ -901,10 +901,64 @@ namespace llaminar2
             input.layer_weight_manifest,
             DeviceMoEProjectionSet::CompleteExpert, input.cpu_prepared_layout);
         const auto build_default = MoEOverlayCapacityResolver::preparedFootprints(
-            input.layer_weight_manifest);
+            input.layer_weight_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         ASSERT_EQ(priced.size(), 1u);
         ASSERT_EQ(build_default.size(), 1u);
         EXPECT_EQ(priced[0].cpu_live_bytes, build_default[0].cpu_live_bytes);
+    }
+
+    /** @test Every footprint/cap pricing consumes the ADMITTED layout, never host-default bytes. */
+    TEST(MoEOverlayCapacityAdmission, TierLegacyCapAndFootprintsPriceTheAdmittedLayout)
+    {
+        using cpu::native_quantised::CPUNativeQuantisedLayout;
+        constexpr int experts = 8;
+        const auto model_manifest = manifest(1, native_quantised_formats::Q4_0);
+        MoERoutedExpertPlacementPlan plan;
+        plan.enabled = true;
+        plan.authority_execution = MoEOverlayAuthorityExecutionKind::HostResident;
+        plan.continuation_domain = plan.base_model_domain = plan.shared_expert_domain = "cpu";
+        RoutedExpertDomain domain;
+        domain.name = "cpu";
+        domain.scope = ExecutionDomainScope::SINGLE;
+        domain.backend = CollectiveBackendType::UPI;
+        domain.participants = {GlobalDeviceAddress::cpu(0)};
+        domain.owner_rank = 0;
+        domain.routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        plan.domains = {domain};
+        plan.routed_tiers = {RoutedExpertTier{.name = "tier", .domain = "cpu",
+            .priority = 0, .memory_budget_bytes = 8u << 20, .fallback = true}};
+        const auto observed = test::cpuUniformCanonicalInventory({0});
+        const MoEOverlayCapacityAdmissionPolicy policy{
+            .migration_storage = MoEOverlayMigrationStorageKind::Disabled,
+            .overlay_world_size = 1};
+        const std::vector<MoEOverlayBoundPhysicalMemoryBudget> budgets{
+            boundBudget(0, physicalBudget("cpu", DeviceId::cpu(), 1u << 30, 4096, 0))};
+
+        plan.resolved_cpu_prepared_layout = CPUNativeQuantisedLayout::InterleavedCanonical;
+        const auto canonical = MoEOverlayCapacityAdmission::buildResolverInput(
+            plan, experts, model_manifest, budgets, policy, &observed);
+        EXPECT_EQ(canonical.cpu_prepared_layout,
+            CPUNativeQuantisedLayout::InterleavedCanonical);
+        EXPECT_EQ(canonical.tiers.front().copy_policy, MoEOverlayTierCopyPolicy::Apportioned);
+
+        // A NON-host-equal admitted layout is the typed recorder: compact is
+        // invalid, so the pricing path (the same footprint source the legacy
+        // tier cap consumes) must fail closed naming the ADMITTED layout —
+        // never silently cap against host-default bytes. Compact tables are
+        // NOT enabled; the diagnostic is the observable.
+        plan.resolved_cpu_prepared_layout = CPUNativeQuantisedLayout::InterleavedCompactA64;
+        try
+        {
+            static_cast<void>(MoEOverlayCapacityAdmission::buildResolverInput(
+                plan, experts, model_manifest, budgets, policy, &observed));
+            FAIL() << "compact-admitted pricing must fail closed, not price host bytes";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(std::string(error.what())
+                          .find("interleaved-compact-a64"),
+                      std::string::npos);
+        }
     }
 
     TEST(MoEOverlayCapacityAdmission, ReplicaGrantRejectsDisabledOrStalePolicy)
@@ -929,7 +983,7 @@ namespace llaminar2
         {
             SCOPED_TRACE(::testing::Message() << source.quant_type << '/' << static_cast<int>(backend));
             const auto model_manifest = manifest(layers, *source.metadata);
-            const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
             MoERoutedExpertPlacementPlan plan;
             plan.enabled = true;
             plan.authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
@@ -1203,7 +1257,7 @@ namespace llaminar2
         const auto model_manifest = manifest(
             2, native_quantised_formats::Q4_K, /*vary_geometry=*/true);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
 
         MoEOverlayCapacityResolverInput input;
         input.num_experts = kExperts;
@@ -1345,7 +1399,7 @@ namespace llaminar2
         const auto model_manifest = manifest(
             1, native_quantised_formats::Q4_K);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
 
         MoEOverlayCapacityResolverInput input;
         input.num_experts = kExperts;
@@ -1451,7 +1505,7 @@ namespace llaminar2
         const auto model_manifest = manifest(
             1, native_quantised_formats::Q4_0);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         const auto cuda_budget = exactBudget(
             "rank0-cuda0", DeviceId::cuda(0), footprints, {1}, 1);
         const auto cpu_budget = exactBudget(
@@ -1518,7 +1572,7 @@ namespace llaminar2
         const auto model_manifest = manifest(
             2, native_quantised_formats::Q4_K, /*vary_geometry=*/true);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
 
         const auto cuda_budget = exactBudget(
             "physical-rank7-cuda0",
@@ -1628,7 +1682,7 @@ namespace llaminar2
         constexpr int kExperts = 2;
         const auto model_manifest = manifest(1, native_quantised_formats::Q5_K);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         const auto shared_budget = exactBudget(
             "rank4-cuda1-shared-authority",
             DeviceId::cuda(1),
@@ -1697,7 +1751,7 @@ namespace llaminar2
     {
         const auto model_manifest = manifest(1, native_quantised_formats::Q4_0);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         const auto budget = exactBudget(
             "rank3-cuda0",
             DeviceId::cuda(0),
@@ -3459,7 +3513,7 @@ namespace llaminar2
         const auto model_manifest = manifest(
             /*layers=*/1, native_quantised_formats::Q4_0);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         ASSERT_EQ(footprints.size(), 1u);
         const std::size_t live_expert_bytes =
             footprints.front().gpu_live_bytes;
@@ -3636,7 +3690,7 @@ namespace llaminar2
         const auto model_manifest = manifest(
             profile.n_layers, native_quantised_formats::Q4_1);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         ASSERT_EQ(footprints.size(), 2u);
 
         const auto budgetFor = [](
@@ -3723,7 +3777,7 @@ namespace llaminar2
     {
         const auto model_manifest = manifest(1, native_quantised_formats::Q6_K);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         MoEOverlayCapacityResolverInput input;
         input.num_experts = 2;
         input.layer_weight_manifest = model_manifest;
@@ -3768,7 +3822,7 @@ namespace llaminar2
             native_quantised_formats::Q4_0,
             /*vary_geometry=*/false);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         ASSERT_EQ(footprints.size(), static_cast<std::size_t>(kLayerCount));
 
         constexpr std::size_t kFixedBytes = 113u;
@@ -3827,7 +3881,7 @@ namespace llaminar2
     {
         const auto model_manifest = manifest(1, native_quantised_formats::Q4_0);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         ASSERT_EQ(footprints.size(), 1u);
 
         MoEOverlayCapacityResolverInput input;
@@ -3888,7 +3942,7 @@ namespace llaminar2
     {
         const auto model_manifest = manifest(1, native_quantised_formats::Q5_1);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         MoEOverlayCapacityResolverInput input;
         input.num_experts = 3;
         input.layer_weight_manifest = model_manifest;
@@ -3937,7 +3991,7 @@ namespace llaminar2
     {
         const auto model_manifest = manifest(1, native_quantised_formats::IQ2_S);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         MoEOverlayCapacityResolverInput input;
         input.num_experts = 1;
         input.layer_weight_manifest = model_manifest;
@@ -3977,7 +4031,7 @@ namespace llaminar2
     {
         const auto model_manifest = manifest(1, native_quantised_formats::Q8_K);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         MoEOverlayCapacityResolverInput input;
         input.num_experts = 3;
         input.layer_weight_manifest = model_manifest;
@@ -3998,7 +4052,7 @@ namespace llaminar2
     {
         const auto model_manifest = manifest(2, native_quantised_formats::Q4_1);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         MoEOverlayCapacityResolverInput input;
         input.num_experts = 4;
         input.layer_weight_manifest = model_manifest;
@@ -4109,7 +4163,7 @@ namespace llaminar2
     {
         const auto model_manifest = manifest(1, native_quantised_formats::Q4_0);
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(model_manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(model_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         MoEOverlayCapacityResolverInput input;
         input.num_experts = 1;
         input.layer_weight_manifest = model_manifest;
@@ -4152,7 +4206,7 @@ namespace llaminar2
         for (const auto device : {DeviceId::cpu(), DeviceId::cuda(0), DeviceId::rocm(0)})
         {
             const auto base_manifest = manifest(2, *format.metadata, true);
-            const auto base_footprints = MoEOverlayCapacityResolver::preparedFootprints(base_manifest);
+            const auto base_footprints = MoEOverlayCapacityResolver::preparedFootprints(base_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
             const auto budget = exactBudget("stage", device, base_footprints, {2, 2}, 1);
             for (const int first : {0, 32, 40, std::numeric_limits<int>::max() - 2})
             {
@@ -4218,7 +4272,7 @@ namespace llaminar2
                                                           std::numeric_limits<int>::max()}})
         {
             const std::vector malformed{layer(ids[0], native_quantised_formats::Q4_K), layer(ids[1], native_quantised_formats::Q4_K)};
-            EXPECT_THROW((void)MoEOverlayCapacityResolver::preparedFootprints(malformed), std::invalid_argument);
+            EXPECT_THROW((void)MoEOverlayCapacityResolver::preparedFootprints(malformed, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout), std::invalid_argument);
             EXPECT_THROW((void)DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(malformed), std::invalid_argument);
         }
     }
@@ -4238,7 +4292,7 @@ namespace llaminar2
         const auto observed = test::cpuUniformCanonicalInventory({0});
         plan.routed_tiers = {{.name = "owned", .domain = "stage", .priority = 0, .fallback = true}};
         const std::vector owned{layer(32, native_quantised_formats::Q4_K), layer(33, native_quantised_formats::Q4_K)};
-        const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(owned);
+        const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(owned, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         const std::vector budgets{boundBudget(0, exactBudget("stage", DeviceId::cpu(), footprints, {2, 2}, 0))};
         const auto input = MoEOverlayCapacityAdmission::buildResolverInput(
             plan, 2, owned, budgets, {}, &observed);
@@ -4257,7 +4311,7 @@ namespace llaminar2
             MoEOverlayCapacityResolverInput input;
             input.num_experts=4;
             input.layer_weight_manifest=manifest(1,native_quantised_formats::Q4_K);
-            const auto footprints=MoEOverlayCapacityResolver::preparedFootprints(input.layer_weight_manifest);
+            const auto footprints=MoEOverlayCapacityResolver::preparedFootprints(input.layer_weight_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
             const auto bound=boundBudget(0,exactBudget("gpu",DeviceId::cuda(0),footprints,{4},1));
             input.physical_budgets.emplace_back("gpu",bound.certificate());
             input.tiers={tier(0,"gpu-only",0,true,MoEOverlayLiveQuotaMode::Automatic,{participant(0,"gpu")})};
@@ -4308,7 +4362,7 @@ namespace llaminar2
     TEST(MoEOverlayCapacityResolver, PipelineDraftFinalizesOneRankTableWithoutRecomputingStageQuotas)
     {
         auto manifests=manifest(2,native_quantised_formats::Q4_K);
-        const auto footprint=MoEOverlayCapacityResolver::preparedFootprints({manifests.front()});
+        const auto footprint=MoEOverlayCapacityResolver::preparedFootprints({manifests.front()}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
         const auto raw=exactBudget("gpu",DeviceId::cuda(0),footprint,{4},1);
         const auto capacity=raw.usableBudgetBytes()*2u;
         const auto bound=boundBudget(0,physicalBudget("gpu",DeviceId::cuda(0),capacity,113,257));

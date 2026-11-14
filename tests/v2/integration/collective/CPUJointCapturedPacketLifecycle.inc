@@ -1181,7 +1181,7 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
     requireOriginal(remote_id >= 0, "actual remote cohort participant");
     const auto manifest = selected->cohort()->localManifest(selected->participantIndex());
     const size_t prepared_bytes =
-        6 * MoEOverlayCapacityResolver::preparedFootprints({manifest}).front().cpu_live_bytes;
+        6 * MoEOverlayCapacityResolver::preparedFootprints({manifest}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front().cpu_live_bytes;
     CPUJointExpertRouteStorageLayout joint(selected->cohort(), selected->participantIndex(), rows,
                                            top_k);
     const bool is_root = joint.isRoot();

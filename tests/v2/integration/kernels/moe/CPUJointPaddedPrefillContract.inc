@@ -74,7 +74,7 @@ void rootedPaddedPrefillContract(DeviceId device) {
  const auto local=original->filteredForDevice(DeviceId::cpu());ASSERT_FALSE(local.requests().empty());
  const auto selected=local.requests().front().cpu_joint_source;ASSERT_TRUE(selected);
  const auto manifest=selected->cohort()->localManifest(selected->participantIndex());
- const auto prepared_bytes=6*MoEOverlayCapacityResolver::preparedFootprints({manifest}).front().cpu_live_bytes;
+ const auto prepared_bytes=6*MoEOverlayCapacityResolver::preparedFootprints({manifest}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front().cpu_live_bytes;
  size_t staging_bytes=0;
  for(const auto& projection:manifest.projections) {
   const auto type=projection.format.floatingTensorType();ASSERT_TRUE(type);

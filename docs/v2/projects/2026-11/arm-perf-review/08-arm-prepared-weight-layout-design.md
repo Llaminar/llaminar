@@ -1008,15 +1008,19 @@ canonical arm is a lane defect and blocks landing.
     Fix: `requireHostExecutablePreparedLayout` gates `deserialize` and
     `allocateTransferTarget` after stride re-derivation, BEFORE any
     allocation/adoption, with a typed diagnostic naming both layouts.
-    The regression proof required compact tables to be VALID in the test
-    only: `resolveArchivePreparedUnitSections` (cold archive path) resolves
-    through the sole section authority, and the typed RAII
-    `ExplicitPreparedSectionsForTest` installs an explicit resolver for one
-    scope (double-install refused, canonical passthrough pinned,
-    auto-restore asserted). `ExecutableReceiveRejectsTableValidForeignLayout
-    BeforeAllocation` proves a compact Q4_0 archive (payload 1024 / unit
-    1152, §2.1) whose strides DO validate under the hook is rejected on
-    both paths by the executability gate, plus an unhooked control.
+    The regression proof is DI-based — no process-global hook remains:
+    `detail::admitReceiveLayout(header, resolve_sections)` is the SHARED
+    admission boundary (versioned decode + stride re-derivation + host-
+    executability gate) parameterized by the section resolver; the public
+    `deserialize`/`allocateTransferTarget` pass ONLY the production
+    section-table authority, so a foreign layout is rejected by the gate
+    itself, before allocation. `ExecutableReceiveRejectsTableValidForeign
+    LayoutBeforeAllocation` drives the internal boundary with an injected
+    resolver whose compact tables are VALID in the test only (payload 1024
+    / unit 1152, §2.1): the compact-labelled archive is rejected on both
+    paths with the executability diagnostic, and the public entrypoints'
+    negatives reject unimplemented tables through the same authority — the
+    canonical control still round-trips. No RAII hook exists.
   - **A4-1 — typed inventory publication.** `RankInventory` gains
     `cpu_prepared_layout` (build property observed from `kHostPreparedLayout`
     at `makeRankInventory`, never probed); the byte crosses the inventory

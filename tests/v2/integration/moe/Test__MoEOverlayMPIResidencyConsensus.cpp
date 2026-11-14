@@ -1454,7 +1454,7 @@ namespace llaminar2::test
         {
             const auto footprints =
                 MoEOverlayCapacityResolver::preparedFootprints(
-                    distributedCpuLayerManifest());
+                    distributedCpuLayerManifest(), DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout);
             if (footprints.size() != 1u ||
                 footprints.front().cpu_shadow_bytes == 0u)
             {

@@ -572,11 +572,27 @@ namespace llaminar2::test
                     remoteCpuProjectionDeviceLayout(compact);
             },
             std::invalid_argument);
+        // The storage-layout path is exercised on a REAL CPU receiver
+        // (CPU→CPU root manifest, not the GPU-boundary stream): both storage
+        // endpoints refuse the substituted manifest through the CPU storage
+        // authority that drives the host chunk cursor and destination admission.
+        const auto cpu_source_root = cpuAsymmetricProjectionBytes();
+        const auto cpu_receiver = remoteProjectionIdentity(
+            fixture.transaction, DeviceId::cpu(), DeviceId::cpu());
+        const auto cpu_manifest = makeMoEOverlayRemoteCpuProjectionManifest(
+            cpu_receiver, cpu_source_root, /*maximum_chunk_bytes=*/4096);
+        ASSERT_TRUE(cpu_manifest.valid());
+        auto compact_cpu = cpu_manifest;
+        compact_cpu.identity.cpu_endpoint_layout = static_cast<std::uint8_t>(
+            cpu::native_quantised::CPUNativeQuantisedLayout::
+                InterleavedCompactA64);
+        compact_cpu.manifest_hash = compact_cpu.computedHash();
+        EXPECT_FALSE(compact_cpu.valid(&error)) << error;
         EXPECT_THROW(
             {
                 [[maybe_unused]] const auto rejected =
                     remoteCpuProjectionStorageLayout(
-                        compact,
+                        compact_cpu,
                         MoEOverlayRemoteCPUStorageEndpoint::Source);
             },
             std::invalid_argument);
@@ -584,7 +600,7 @@ namespace llaminar2::test
             {
                 [[maybe_unused]] const auto rejected =
                     remoteCpuProjectionStorageLayout(
-                        compact,
+                        compact_cpu,
                         MoEOverlayRemoteCPUStorageEndpoint::Destination);
             },
             std::invalid_argument);
@@ -670,12 +686,20 @@ namespace llaminar2::test
         zero_root.is_asymmetric = stream.cpu_is_asymmetric;
         zero_root.is_superblock = stream.cpu_is_superblock;
         zero_root.encoding = stream.cpu_encoding;
+        // The genuine original witness: zero data AND block strides under the
+        // compact label (the matching-zero-stride root the old equality check
+        // would have accepted) — never the struct defaults.
+        zero_root.data_stride = 0;
+        zero_root.interleaved_block_stride = 0;
 
         try
         {
+            // The source-root overload's contract is a CPU-end-to-CPU-end
+            // source root: it must reject at the section authority BEFORE the
+            // root-equality check could accept this matching zero-stride root.
             [[maybe_unused]] const auto rejected =
                 makeMoEOverlayRemoteCpuProjectionManifest(
-                    identity, zero_root, /*maximum_chunk_bytes=*/4096);
+                    cpu_identity, zero_root, /*maximum_chunk_bytes=*/4096);
             FAIL() << "compact-labelled wire must be refused before arithmetic";
         }
         catch (const std::invalid_argument &error)

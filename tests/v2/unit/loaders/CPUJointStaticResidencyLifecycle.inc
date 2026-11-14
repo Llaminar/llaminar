@@ -182,8 +182,8 @@ TEST(CPUJointStaticResidency, OriginalPhysicalAdmissionCreatesAllLocalTypedEndpo
  using namespace llaminar2;const auto original=staticJointOriginal();const auto source=jointManifest();
  const auto& map=*original.preparation->cpuJointOwnerMap();
  const auto local=map.placementFor(7,64)->shard_cohort->localManifest(0);
- const auto cpu=MoEOverlayCapacityResolver::preparedFootprints({local}).front().cpu_live_bytes;
- const auto gpu=MoEOverlayCapacityResolver::preparedFootprints({source}).front().gpu_live_bytes;
+ const auto cpu=MoEOverlayCapacityResolver::preparedFootprints({local}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front().cpu_live_bytes;
+ const auto gpu=MoEOverlayCapacityResolver::preparedFootprints({source}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front().gpu_live_bytes;
  const auto budget=[](const std::string& name,int rank,DeviceId device,size_t bytes) {
   PhysicalMemoryBOMBuilder builder({rank,device,bytes,bytes});
   return MoEOverlayBoundPhysicalMemoryBudget(name,PhysicalMemoryAdmissionCertificate(builder.build()));
@@ -318,8 +318,8 @@ TEST(CPUJointStaticResidency, ColdLoadGraphPreservesOriginalSourceAuthority) {
  const auto initial_selection=original.preparation->cpuShardSourceFor(7,
   *original.preparation->cpuJointOwnerMap()->participantForId(initial_member));
  const auto local=initial_selection->cohort()->localManifest(initial_selection->participantIndex());
- const auto cpu=MoEOverlayCapacityResolver::preparedFootprints({local}).front().cpu_live_bytes;
- const auto gpu=MoEOverlayCapacityResolver::preparedFootprints({source}).front().gpu_live_bytes;
+ const auto cpu=MoEOverlayCapacityResolver::preparedFootprints({local}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front().cpu_live_bytes;
+ const auto gpu=MoEOverlayCapacityResolver::preparedFootprints({source}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front().gpu_live_bytes;
  size_t staging_bytes=0;
  for(const auto& projection:local.projections) {
   const auto type=projection.format.floatingTensorType();

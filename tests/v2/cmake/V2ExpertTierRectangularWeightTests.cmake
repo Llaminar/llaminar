@@ -6,7 +6,7 @@
 if(TARGET v2_test_expert_tier_weight_stream)
     add_v2_test(V2_Integration_ExpertTierRectangularCPUWire
         COMMAND $<TARGET_FILE:v2_test_expert_tier_weight_stream>
-            --gtest_filter=ExpertTierWeightStream.OriginalProjectionIntersectionsRetainIndependentCoordinates:ExpertTierWeightStream.RectangularEncodedColumnsAllFormatsPreserveNeighboursAndLiveBytes:ExpertTierWeightStream.GpuToCpuReferenceRejectsUnimplementedLayoutsWithoutThrowing --gtest_repeat=20
+            --gtest_filter=ExpertTierWeightStream.OriginalProjectionIntersectionsRetainIndependentCoordinates:ExpertTierWeightStream.RectangularEncodedColumnsAllFormatsPreserveNeighboursAndLiveBytes:ExpertTierWeightStream.GpuToCpuReferenceRejectsUnimplementedLayoutsWithoutThrowing:ExpertTierWeightStream.EndpointLayoutContractSelectsGpuConversionAndRejectsMismatch --gtest_repeat=20
         LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;ExpertOverlay;ByteExact;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")

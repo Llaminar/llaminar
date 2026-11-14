@@ -591,9 +591,48 @@ namespace llaminar2
                 "Movement-disabled ExpertOverlay admission cannot retain migration storage");
         }
 
+        // CPU expert bytes price through the overlay's inventory-bound
+        // uniform layout (single authority for every footprint and cap below):
+        // a CPU resource without a resolved observation means the plan was
+        // never hardware-bound through the refusal gate; admit nothing rather
+        // than pricing an assumed layout.
+        const bool has_cpu_resource = std::any_of(
+            physical_budgets.begin(), physical_budgets.end(),
+            [](const MoEOverlayBoundPhysicalMemoryBudget &budget)
+            { return budget.device().is_cpu(); });
+        std::optional<cpu::native_quantised::CPUNativeQuantisedLayout>
+            resolved_observation = plan.resolved_cpu_prepared_layout;
+        if (has_cpu_resource && !resolved_observation)
+        {
+            if (inventory == nullptr)
+                throw std::invalid_argument(
+                    "ExpertOverlay capacity admission requires the inventory-bound "
+                    "uniform CPU prepared layout for every CPU resource");
+            // Producers that reach admission with live inventory (pipeline
+            // admission, candidate admission, the serving runner) derive the
+            // observation here with the SAME uniformity refusal the hardware
+            // binder applies; only API misuse without inventory keeps the
+            // hard refusal above. The throw is never silently defaulted.
+            resolved_observation =
+                resolveUniformCpuPreparedLayoutFromInventory(*inventory, plan);
+        }
+        // The kHostPreparedLayout fallback below is dead for CPU byte pricing:
+        // it is consumed only by host-only CPU budgets whose plan declares no
+        // CPU participant (the derive returns nullopt exactly then), so no CPU
+        // byte is ever priced with the ambient build layout. A CPU participant
+        // always yields a real observation, asserted here as the invariant.
+        if (has_cpu_resource && !resolved_observation)
+        {
+            LLAMINAR_ASSERT(
+                !planDeclaresCpuParticipant(plan),
+                "a CPU-participant plan must carry a resolved CPU layout "
+                "observation before pricing");
+        }
         const auto footprints =
             MoEOverlayCapacityResolver::preparedFootprints(
-                layer_weight_manifest);
+                layer_weight_manifest, DeviceMoEProjectionSet::CompleteExpert,
+                resolved_observation.value_or(
+                    cpu::native_quantised::kHostPreparedLayout));
         const std::size_t layer_count = footprints.size();
 
         const auto bound_participants = boundParticipants(plan);
@@ -682,42 +721,6 @@ namespace llaminar2
 
         std::map<PhysicalKey, std::size_t> budget_by_key;
         std::map<std::string, std::size_t> budget_by_id;
-        // CPU expert bytes price through the overlay's inventory-bound
-        // uniform layout. A CPU resource without a resolved observation means
-        // the plan was never hardware-bound through the refusal gate; admit
-        // nothing rather than pricing an assumed layout.
-        const bool has_cpu_resource = std::any_of(
-            physical_budgets.begin(), physical_budgets.end(),
-            [](const MoEOverlayBoundPhysicalMemoryBudget &budget)
-            { return budget.device().is_cpu(); });
-        std::optional<cpu::native_quantised::CPUNativeQuantisedLayout>
-            resolved_observation = plan.resolved_cpu_prepared_layout;
-        if (has_cpu_resource && !resolved_observation)
-        {
-            if (inventory == nullptr)
-                throw std::invalid_argument(
-                    "ExpertOverlay capacity admission requires the inventory-bound "
-                    "uniform CPU prepared layout for every CPU resource");
-            // Producers that reach admission with live inventory (pipeline
-            // admission, candidate admission, the serving runner) derive the
-            // observation here with the SAME uniformity refusal the hardware
-            // binder applies; only API misuse without inventory keeps the
-            // hard refusal above. The throw is never silently defaulted.
-            resolved_observation =
-                resolveUniformCpuPreparedLayoutFromInventory(*inventory, plan);
-        }
-        // The kHostPreparedLayout fallback below is dead for CPU byte pricing:
-        // it is consumed only by host-only CPU budgets whose plan declares no
-        // CPU participant (the derive returns nullopt exactly then), so no CPU
-        // byte is ever priced with the ambient build layout. A CPU participant
-        // always yields a real observation, asserted here as the invariant.
-        if (has_cpu_resource && !resolved_observation)
-        {
-            LLAMINAR_ASSERT(
-                !planDeclaresCpuParticipant(plan),
-                "a CPU-participant plan must carry a resolved CPU layout "
-                "observation before pricing");
-        }
         MoEOverlayCapacityResolverInput input;
         input.num_experts = num_experts;
         input.cpu_prepared_layout = resolved_observation.value_or(
@@ -893,9 +896,14 @@ namespace llaminar2
             }
             request.max_live_experts_per_layer.assign(
                 layer_count, num_experts);
+            // The tier cap prices the SAME admitted layout's CPU bytes the
+            // resolver will execute (the caller's observation), never the
+            // build-default host bytes: a compact-bound plan caps against
+            // compact CPU bytes.
             const auto tier_footprints =
                 MoEOverlayCapacityResolver::preparedFootprints(
-                    layer_weight_manifest, moeOverlayMovableProjections(request.copy_policy));
+                    layer_weight_manifest, moeOverlayMovableProjections(request.copy_policy),
+                    input.cpu_prepared_layout);
             for (std::size_t layer = 0; layer < layer_count; ++layer)
             {
                 int maximum = num_experts;

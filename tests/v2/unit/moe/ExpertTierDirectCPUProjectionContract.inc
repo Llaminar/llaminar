@@ -662,6 +662,19 @@ TEST(ExpertTierWeightStream, EndpointLayoutContractSelectsGpuConversionAndReject
         resealedCompact.manifest_hash = resealedCompact.computedHash();
         EXPECT_FALSE(resealedCompact.valid(&error));
 
+        // Tier-level v4 hash sensitivity: a same-scalar fixture whose ONLY
+        // change is the carried endpoint layout hashes differently, and a
+        // layout byte modified WITHOUT recomputing the hash fails tier-level
+        // validity — the :535 hash contribution is live. If it were deleted,
+        // this tampered manifest would match the stale hash and pass.
+        auto layoutOnly = stream;
+        layoutOnly.cpu_endpoint_layout =
+            stream.cpu_endpoint_layout == 0u ? 1u : 0u;
+        EXPECT_NE(layoutOnly.computedHash(), stream.computedHash());
+        auto staleHash = stream;
+        staleHash.cpu_endpoint_layout = layoutOnly.cpu_endpoint_layout;
+        EXPECT_FALSE(staleHash.valid(&error));
+
         // CPU-to-GPU names the source layout from the weights themselves,
         // and the reference round trip reproduces the same sections the
         // wire planes describe: one geometry for kernels and reference.

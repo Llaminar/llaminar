@@ -132,7 +132,7 @@ void proveCPUJointCalibrationController(DeviceId whole_device=DeviceId::cpu(),bo
 {
     FabricOriginal original(whole_device,joined_service);
     const auto initial=original.authority->snapshot();
-    const auto footprint=MoEOverlayCapacityResolver::preparedFootprints(original.manifests).front();
+    const auto footprint=MoEOverlayCapacityResolver::preparedFootprints(original.manifests, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front();
     auto planner=std::make_shared<MoEOverlayEconomyCalibrationPlanner>(
         MoEOverlayEconomyCalibrationPlanner::Config{.live_snapshot=initial,
             .complete_expert_bytes_per_layer={footprint.cpu_live_bytes},.calibration_layers={0}});

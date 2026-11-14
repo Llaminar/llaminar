@@ -1390,7 +1390,7 @@ add_v2_test(V2_Unit_MoEExpertOverlayRuntimePlan
 )
 add_v2_test(V2_Integration_MoELocalTPReplicatedDecodeDefault
     COMMAND $<TARGET_FILE:v2_unit_moe_expert_overlay_runtime_plan>
-        --gtest_filter=Test__MoEExpertOverlayRuntimePlan.HardwareBindingKeepsLocalTPRankLocal
+        --gtest_filter=Test__MoEExpertOverlayRuntimePlan.HardwareBindingKeepsLocalTPRankLocal:Test__MoEExpertOverlayRuntimePlan.CrossLayoutCpuPairingIsRefusedAtPlanningTime:Test__MoEExpertOverlayRuntimePlan.SavedPlanLayoutIsRecheckedAgainstLiveInventoryAtApply
         --gtest_brief=1
     LABELS "V2;Integration;ProductionTestPreflight;MoE;ExpertOverlay;LocalTP;Configuration;Performance;Regression"
     MPI_PROCS 1
@@ -1442,7 +1442,7 @@ target_link_libraries(v2_unit_moe_overlay_capacity_resolver
 )
 add_v2_test(V2_Integration_MoEPipelineStageCapacity
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_capacity_resolver>
-        --gtest_filter=MoEOverlayCapacityResolver.PipelineStage*
+        --gtest_filter=MoEOverlayCapacityResolver.PipelineStage*:MoEOverlayCapacityAdmission.CpuResourcesPriceOnlyTheBoundOverlayLayout:MoEOverlayCapacityResolver.PreparedLayoutIsTheSoleCpuFootprintAuthority
     LABELS "V2;Integration;ProductionTestPreflight;MoE;Pipeline;Capacity;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS
 )
@@ -18503,6 +18503,12 @@ add_v2_test(V2_Unit_MPITopologyCapabilityExchange
     MPI_PROCS 1
     LABELS "V2;Unit;MPI;Topology;Serialization;DeviceInventory;Heterogeneous"
 )
+add_v2_test(V2_Integration_MPITopologyCPUPreparedLayoutObservation
+    COMMAND $<TARGET_FILE:v2_test_mpi_topology_capability_exchange>
+        --gtest_filter=Test__MPITopologyCapabilityExchange.SerializeDeserialize_CPUPreparedLayoutObservation
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;Topology;Serialization;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+)
 
 # Test: NodeDetection pure membership validation (real MPI proof is preflight).
 add_executable(v2_test_node_detection
@@ -33191,6 +33197,11 @@ add_v2_test(V2_Integration_FixedHeadNgramConfigParser
     COMMAND $<TARGET_FILE:v2_test_orchestration_config_parser>
         --gtest_filter=Test__OrchestrationConfigParser.FixedHeadDistributionRequiresExplicitVRAM
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Config;Storage;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT ${QFN_FIXED_HEAD_DEVICEFREE_ENV})
+add_v2_test(V2_Integration_ResolvedCpuPreparedLayoutDocument
+    COMMAND $<TARGET_FILE:v2_test_orchestration_plan_config>
+        --gtest_filter=Test__OrchestrationConfigDocument.ResolvedCpuPreparedLayoutRoundTripsLosslesslyAtCurrentSchema:Test__OrchestrationConfigDocument.ResolvedCpuPreparedLayoutToleratesAbsentNullAndRejectsForeign
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Config;Planning;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT ${QFN_FIXED_HEAD_DEVICEFREE_ENV})
 add_v2_test(V2_Integration_FixedHeadNgramConfigDocument
     COMMAND $<TARGET_FILE:v2_test_orchestration_plan_config>

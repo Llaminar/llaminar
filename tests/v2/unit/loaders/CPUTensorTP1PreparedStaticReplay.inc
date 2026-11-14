@@ -31,7 +31,7 @@ TEST(CPUTensorTP1PreparedStatic, OriginalSourceAndStaticSetupRetainWholeMatrixPo
   EXPECT_EQ(requirement.slice.col_count,requirement.slice.source_cols);
  }
  const auto manifest=jointManifest();
- const auto footprint=MoEOverlayCapacityResolver::preparedFootprints({manifest}).front();
+ const auto footprint=MoEOverlayCapacityResolver::preparedFootprints({manifest}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front();
  const auto budget=[](const char* name,DeviceId device,size_t bytes){
   PhysicalMemoryBOMBuilder b({0,device,bytes,bytes});
   return MoEOverlayBoundPhysicalMemoryBudget(name,PhysicalMemoryAdmissionCertificate(b.build()));

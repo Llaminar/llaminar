@@ -163,8 +163,14 @@ namespace llaminar2
                 "ExpertOverlay calibration layer catalog requires a manifest");
         }
 
+        // Model-level calibration catalog: prices pre-placement geometry,
+        // so the explicit build host layout is the only authority available
+        // here. Per-layout precision is re-priced at admission with the
+        // observed plan layout (the tier cap consumes that observation).
         const auto footprints =
-            MoEOverlayCapacityResolver::preparedFootprints(manifest);
+            MoEOverlayCapacityResolver::preparedFootprints(
+                manifest, DeviceMoEProjectionSet::CompleteExpert,
+                cpu::native_quantised::kHostPreparedLayout);
         first_model_layer_ = manifest.front().layer_idx;
         complete_expert_bytes_per_layer_.resize(manifest.size());
         for (std::size_t layer = 0; layer < manifest.size(); ++layer)

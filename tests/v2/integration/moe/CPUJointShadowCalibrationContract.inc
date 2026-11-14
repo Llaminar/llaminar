@@ -16,7 +16,7 @@ void proveCPUJointShadowCalibration()
 {
     FabricOriginal original;
     const auto initial=original.authority->snapshot();
-    const auto footprint=MoEOverlayCapacityResolver::preparedFootprints(original.manifests).front();
+    const auto footprint=MoEOverlayCapacityResolver::preparedFootprints(original.manifests, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front();
     MoEOverlayEconomyCalibrationPlanner planner({.live_snapshot=initial,
         .complete_expert_bytes_per_layer={footprint.cpu_live_bytes},.calibration_layers={0}});
     const auto& coordinates=planner.requiredTargetCoordinates();

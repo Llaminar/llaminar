@@ -221,7 +221,7 @@ struct FabricOriginal {
             const auto* member=topology.participantForId(id);
             const auto selected=member->domain_name=="cohort"?preparation->cpuShardSourceFor(0,*member):nullptr;
             const auto local_manifest=selected?selected->cohort()->localManifest(selected->participantIndex()):manifests.front();
-            const auto footprint=MoEOverlayCapacityResolver::preparedFootprints({local_manifest}).front();
+            const auto footprint=MoEOverlayCapacityResolver::preparedFootprints({local_manifest}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front();
             if(member->device.is_gpu())gpu_shadow_bytes+=footprint.gpu_shadow_bytes;
             else shadow_bytes+=footprint.cpu_shadow_bytes;
         }
@@ -292,7 +292,7 @@ struct FabricOriginal {
         if(whole_device.is_gpu() && rank==whole_owner) {
             // The same preparation declares the genuine GPU source owners. GPU
             // upload rings coexist with CPU source/fabric staging and are additive.
-            const auto footprint=MoEOverlayCapacityResolver::preparedFootprints(manifests).front();
+            const auto footprint=MoEOverlayCapacityResolver::preparedFootprints(manifests, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front();
             auto gpu_loading=preparation->filteredForDevice(whole_device).sourceWeightPlan(loader,model);
             size_t maximum_source_bytes=0;
             for(const auto& request:gpu_loading.requirements()) {

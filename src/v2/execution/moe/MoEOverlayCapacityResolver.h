@@ -569,8 +569,7 @@ namespace llaminar2
         [[nodiscard]] static std::vector<MoEOverlayPreparedExpertFootprint>
         preparedFootprints(
             const std::vector<MoEOverlayLayerWeightManifest> &manifest,
-            DeviceMoEProjectionSet projections = DeviceMoEProjectionSet::CompleteExpert,
-            cpu::native_quantised::CPUNativeQuantisedLayout cpu_prepared_layout =
-                cpu::native_quantised::kHostPreparedLayout);
+            DeviceMoEProjectionSet projections,
+            cpu::native_quantised::CPUNativeQuantisedLayout cpu_prepared_layout);
     };
 } // namespace llaminar2

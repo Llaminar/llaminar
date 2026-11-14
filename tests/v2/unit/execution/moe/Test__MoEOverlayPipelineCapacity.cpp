@@ -279,7 +279,7 @@ namespace llaminar2
         early.tiers.push_back(std::move(cold));
         late.tiers[0].quota_mode = MoEOverlayLiveQuotaMode::FixedPerLayer;
         late.tiers[0].fixed_live_experts_per_layer = {4};
-        const auto footprint = MoEOverlayCapacityResolver::preparedFootprints(late.layer_weight_manifest).front();
+        const auto footprint = MoEOverlayCapacityResolver::preparedFootprints(late.layer_weight_manifest, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front();
         const auto gpu_bytes = 4u * footprint.gpu_live_bytes + 2u * footprint.gpu_shadow_bytes;
         setBudget(early, gpu, gpu_bytes); setBudget(late, gpu, gpu_bytes);
         const std::array inputs{early, late};

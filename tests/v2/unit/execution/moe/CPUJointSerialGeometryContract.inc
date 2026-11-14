@@ -365,7 +365,7 @@ TEST(CPUJointSerialGeometry, DynamicShadowBOMUsesOriginalMemberCutsForEveryForma
         {
             const auto resource = "joint_member_" + std::to_string(member);
             const auto local = request.shard_cohorts.front()->localManifest(member);
-            const auto footprint = MoEOverlayCapacityResolver::preparedFootprints({local}).front();
+            const auto footprint = MoEOverlayCapacityResolver::preparedFootprints({local}, DeviceMoEProjectionSet::CompleteExpert, cpu::native_quantised::kHostPreparedLayout).front();
             expected_live.push_back(2 * experts * footprint.cpu_live_bytes);
             expected_shadow.push_back(2 * footprint.cpu_shadow_bytes);
             const auto exact = expected_live.back() + expected_shadow.back();
