@@ -1442,7 +1442,7 @@ target_link_libraries(v2_unit_moe_overlay_capacity_resolver
 )
 add_v2_test(V2_Integration_MoEPipelineStageCapacity
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_capacity_resolver>
-        --gtest_filter=MoEOverlayCapacityResolver.PipelineStage*:MoEOverlayCapacityAdmission.CpuResourcesPriceOnlyTheBoundOverlayLayout:MoEOverlayCapacityResolver.PreparedLayoutIsTheSoleCpuFootprintAuthority
+        --gtest_filter=MoEOverlayCapacityResolver.PipelineStage*:MoEOverlayCapacityAdmission.CpuResourcesPriceOnlyTheBoundOverlayLayout:MoEOverlayCapacityResolver.PreparedLayoutIsTheSoleCpuFootprintAuthority:MoEOverlayCapacityAdmission.TierLegacyCapAndFootprintsPriceTheAdmittedLayout
     LABELS "V2;Integration;ProductionTestPreflight;MoE;Pipeline;Capacity;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS
 )
@@ -33200,7 +33200,7 @@ add_v2_test(V2_Integration_FixedHeadNgramConfigParser
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT ${QFN_FIXED_HEAD_DEVICEFREE_ENV})
 add_v2_test(V2_Integration_ResolvedCpuPreparedLayoutDocument
     COMMAND $<TARGET_FILE:v2_test_orchestration_plan_config>
-        --gtest_filter=Test__OrchestrationConfigDocument.ResolvedCpuPreparedLayoutRoundTripsLosslesslyAtCurrentSchema:Test__OrchestrationConfigDocument.ResolvedCpuPreparedLayoutToleratesAbsentNullAndRejectsForeign
+        --gtest_filter=OrchestrationConfigDocument.ResolvedCpuPreparedLayoutRoundTripsLosslesslyAtCurrentSchema:OrchestrationConfigDocument.ResolvedCpuPreparedLayoutToleratesAbsentNullAndRejectsForeign
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Config;Planning;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 ENVIRONMENT ${QFN_FIXED_HEAD_DEVICEFREE_ENV})
 add_v2_test(V2_Integration_FixedHeadNgramConfigDocument
