@@ -5432,3 +5432,27 @@ recorded. Mac gates green. COORDINATOR VERIFY: origin tip
 fc39fbe93; 5 files +74/-51; `inventory = nullptr` gone. RE-PIN
 SENT (.80 @ fc39fbe93 = binding; PASS => triage tip = fc39fbe93 =>
 .79 base control + triage-tip gate + diff => WSL binding gate).
+
+### Base-control NCCL resolved + NEW block routed to Main (01:44Z)
+
+SPARKS base-control NCCL (per Main's rule): pre-PR install in the
+separate prefix FAILED exactly as predicted (verbatim
+progress_replay.py actual-body replay failed = beb2389d7-era
+SIGILL/SIGTRAP); NOT patched. EQUIVALENT = -DHAVE_NCCL=OFF (guards
+on HAVE_CUDA AND HAVE_NCCL at V2NCCLGinSelectionTests.cmake:9)
+=> drops ONLY the 4 NCCL proof registrations, no source patch; CUDA
+build BUILD=0 green (NCCL dlopen'd at runtime). Base-vs-T' diff
+EXCLUDES the 4 on both sides (per Main's rule); install3 stays.
+NEW BLOCK: the base's run_production_prerequisites.py hits the
+SAME timeout validation (V2_Integration_CUDAResidualAdd
+InvocationContract 0.0) => the 889d59ccd no-TIMEOUT registrations
+ARE at d5e04fdce (PR tip — consistent with PR-lineage: 889d59ccd
+in d836a276f..d5e04fdce; NOT develop-inherent — the develop-control
+shows the base there). (a)/(b) ROUTED TO MAIN — coordinator
+recommendation (a): the same 2-line TIMEOUT-60 hunk on the base
+tree as a harness-equivalent (same class as HAVE_NCCL=OFF config
+delta; recorded explicitly in the seal), keeping the full
+registration set in the diff; (b) excludes 2 real tests from both
+sides (weaker). .80: 83a0351bd warm build green (non-binding),
+BINDING fc39fbe93 checked out + building (compile evidence =
+triage-build6.log); focused rerun follows.
