@@ -6013,3 +6013,20 @@ CachedGraph flaky/shared; NCCL fleet refresh post-merge
 policy, idea-25, compaction fast-follow, idea16-tournament,
 MXFP4 gated, 27B rider held, cnpy fix, .80 benchmark cycle
 deferred); STAGE B locked on this list + Gate-A.
+
+### Reviewer evidence paths supplied; local ARM diff generated (13:19Z)
+
+Reviewer: accepted the exactrange request; source review proceeds;
+x86 = CLASSIFIED/PENDING (not established inheritance). CORRECTION
+on the record: the reviewer's prior A3 verdict = HOLD@177 (R1-R5 +
+B1) and A4 = UNREVIEWED — the pin = the ACTUAL review now (not
+pre-existing ACKs). Reviewer needs actual local read-only paths
+(no fetch/execute; Arm SUMMARY local but dir had only the summary;
+guessed x86 paths don't exist). COORDINATOR ACTION: rsynced the
+.79 raw sets to the Mac (raw-arm/: 13 artifacts incl unit.xml
+25MB; raw-base/: 11 artifacts); GENERATED the local name-level
+diff from the raw JUnit XMLs: name-level-diff.txt — TIP 220 names,
+BASE 208, TIP-ONLY = 12 = exactly the 12 NCCL names, BASE-ONLY = 0,
+SHARED = 208 (incl. CachedGraph both-sides). Paths sent:
+K14-STAGEAGATE-6CA2462CC-20261114/{name-level-diff.txt, raw-arm/,
+raw-base/, SUMMARY.md}. X86 relay on the base-control diff landing.
