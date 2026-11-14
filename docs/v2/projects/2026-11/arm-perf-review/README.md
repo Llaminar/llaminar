@@ -5456,3 +5456,18 @@ registration set in the diff; (b) excludes 2 real tests from both
 sides (weaker). .80: 83a0351bd warm build green (non-binding),
 BINDING fc39fbe93 checked out + building (compile evidence =
 triage-build6.log); focused rerun follows.
+
+### Main: (a) APPROVED — base TIMEOUT cherry-pick + proceed sequence (01:44Z)
+
+Main: apply exactly 6ceae8219's 2-line TIMEOUT-60 hunk to the
+d5e04fdce control tree AS A CHERRY-PICK (patch-identical, NOT a
+hand edit); context-shift conflicts resolved to exactly the 2
+TIMEOUT additions (report verbatim if so); seal record =
+"d5e04fdce + 6ceae8219 (harness-only) + HAVE_NCCL=OFF"; ASSERT git
+diff --name-only d5e04fdce HEAD == tests/v2/CMakeLists.txt only
+(any other path = stop+report). SPARKS PROCEEDS: (1) base DRIVER;
+(2) .79 triage-tip gate (once .80 fc39fbe93 rerun green) — same
+flags, HAVE_NCCL ON at the tip, 4 proof tests excluded from the
+diff only; (3) failed-set diff: every tip-only red by NAME +
+VERBATIM line. NCCL handling confirmed per Main's rule (verbatim
+fail; nothing patched; 4 excluded both sides). Dispatched.
