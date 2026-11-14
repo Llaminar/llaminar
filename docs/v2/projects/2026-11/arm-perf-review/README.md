@@ -5541,3 +5541,31 @@ unreachable). Tip naming per precedent: gate/code = 1af9f6429;
 docs tip = cf7ce841c. Base-owner AGENTS.md ASSERT-drift item
 recorded (not on the PR). Green held until the .80 Linux compile +
 focused run at 1af9f6429.
+
+### TRIAGE TIP 1af9f6429 ARM-GREEN (binding) + name-level diff (03:56Z)
+
+SPARKS: .80 binding @ 1af9f6429 BUILD=0 (triage-build7.log; every
+transitive includer compiled); focused run triage-results2/ = R1-R7
+ALL rc=0, 0 failures — incl. the KEYSTONE MoEPipelineMultiDevice
+Memory.AggregateHostBudgetCannotBeReusedByEveryStage /Devices4 +
+/Devices8, plus the full set (OrcConfigDoc, MoEOverlayCapacity
+Admission, PipelineStageAdmission, CPUExpertShardAccounting 6/6,
+RemoteCpuWireBuilders, AutomaticPlanningDiagnostics, CPUTensorTP1
+PreparedStatic, CPUJointStaticResidency + RetainedExecutor/ColdLoad/
+FragmentPublication, ExpertTierEndpointLayoutIdentity,
+MoEPipelineNativePreparation x2 death) = **LANE FIX ARM-QUALIFIED;
+TRIAGE TIP = 1af9f6429.** NAME-LEVEL BASE-vs-TIP DIFF: BASE
+(d5e04fdce + harness TIMEOUT hunk + HAVE_NCCL=OFF) = 193 fails
+(39/115/39); TIP (03480d07e pre-triage) = 221 (56/126/39).
+TIP-ONLY = 29: **17 = bucket-b + planning** (the lane's admission
+target — green on ARM now) + **12 = CUDA/collective/transfer**
+(CUDANativeCompletedCollective x4, CapturedNativePeerVisibility_
+CUDA2_257Offset1, NativeCompleted_CUDA_Addressed2 x3,
+NativeCountedAllGather_CUDA2_RecordedReplay, NativePipelineByte_
+CUDA2 x3) = SEPARATE CLASS, Main's classification from the .79
+JUnit (several _CUDA2 = likely 2-GPU env). BASE-ONLY = 1
+(V2_Integration_CachedGraphReplayExecution_CUDA — chain improvement).
+Invocation-contract x2 + NCCL proofs x4 excluded both sides per the
+rule. NEXT: .79 triage-tip gate @ 1af9f6429 (HAVE_NCCL=ON; 4
+excluded from the diff only) — 17 should go green; 12 CUDA =
+classify. Main + lane informed.
