@@ -6147,3 +6147,23 @@ diff vs 6ca seal; expected 0 reds + new tests green); WSL (base ->
 x86 diff -> x86 incremental ef86de1c1 -j4 parity first -> develop
 discriminator). Pins A3+A4+A4-R at ef86de1c1 -> Gate-A after the
 re-verification + reviewer re-read.
+
+### X86 BINDING GATE DELTA = PASS (0 new, 1 fixed); evidence closed (14:26Z)
+
+WSL: base d5e04fdce gate DRIVER_RC=8, test_count=3558, PARITY_RC=0
+(corrected ninja -j1 + -j4; Nov-13 -j8 attempt OOM'd, NO receipt —
+the restated baseline is valid). BASE failed-set = 11 (6 unit + 5
+host): OneDNNBuildLifecycle, ROCmNativeQuantisedTrainer x4,
+ShmemSpinBackend_NP8, CPURootedGather x2, CPUStartupAffinity,
+PrefixCacheShutdownMPI_8, ShmemSpinAbsorbingAbortReplay. TIP
+6ca2462cc = 10. DELTA: TIP-ONLY = 0 (no new reds, NO bucket-b
+regression on x86); BASE-ONLY = 1 (OneDNNBuildLifecycle — tip FIXES
+it). VERDICT: BINDING GATE PASS. Seals K14-STAGEAGATE-X86-6CA2462CC
+(cf9f626e...) + K14-STAGEAGATE-X86-D5E04FDCE (5a435840...). WSL
+queue: (1) formal x86 name-level diff file, (2) x86 incremental @
+ef86de1c1 (-j4 parity first), (3) develop discriminator; finished
+containers removed. MAIN + REVIEWER relayed (x86 attribution
+EVIDENCED; the reviewer's CLASSIFIED/PENDING can close with the
+delta). Board: .80/.79 re-verification at ef86de1c1 running in
+parallel; pins A3+A4+A4-R at ef86de1c1 after the re-verification +
+reviewer re-read -> Gate-A.
