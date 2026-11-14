@@ -13,6 +13,9 @@
  * independent serial oracle in MoELiveRows; this fixture additionally requires
  * the timed replay sequence to leave the same finite output bits. No performance
  * threshold or benchmark case is added to the production-preflight gate.
+ * Opt-in gfx1100 tournaments use the same source/geometry owners, compare both
+ * native tiles against explicit ordered Dot4 after poisoned retained replay,
+ * and keep profiler launches separate from paired native-event samples.
  */
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -29,6 +32,12 @@
 #include "utils/QuantizedVerifierFormats.h"
 #include "performance/kernels/native_quantised_dispatch/NativeQuantisedMoERoutingProfiles.h"
 
+#ifdef HAVE_ROCM
+#include <hip/hip_runtime.h>
+#include <rocprofiler-sdk-roctx/roctx.h>
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "kernels/rocm/gemm/ROCmMoEGroupedWmma.h"
+#endif
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
@@ -128,9 +137,34 @@ namespace
     /** Captured, event-timed whole-operation fixture; supports one-case profiling. */
     class GPUExpertPipeline : public ::testing::TestWithParam<Case> {};
 
-    TEST_P(GPUExpertPipeline, CapturedPipeline)
+    /** @brief One complete benchmark operation, with profiler runs kept untimed. */
+    enum class ExpertBenchmark { Installed, WmmaReplay, WmmaTournament, Wmma32Profile, Wmma64Profile };
+
+    /** @brief Reuse production geometry and source preparation for native tournaments.
+     * @param parameter Exact existing model/control case. @param mode Timing or isolated profile owner. */
+    void runExpertPipeline(Case parameter, ExpertBenchmark mode = ExpertBenchmark::Installed)
     {
-        const auto parameter = GetParam();
+        const bool native = mode != ExpertBenchmark::Installed;
+#ifdef HAVE_ROCM
+        if (native)
+        {
+            initializeROCmHardwareMetadata();
+            int ordinal = -1;
+            for (int i = 0; i < int(rocmHardwareMetadata().size()); ++i)
+            {
+                const auto &isa = rocmHardwareMetadata().at(i).isa_target;
+                if (isa == "gfx1100" || isa.starts_with("gfx1100:")) { ordinal = i; break; }
+            }
+            if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+            parameter.device = DeviceId::rocm(ordinal);
+            const auto &h = rocmHardwareMetadata().at(ordinal);
+            std::printf("MOE_WMMA_DEVICE,%d,%s,%s,",ordinal,h.isa_target.c_str(),h.pci_address.c_str());
+            for (auto byte : h.uuid) std::printf("%02x",unsigned(byte));
+            std::printf("\n");
+        }
+#else
+        if (native) GTEST_SKIP() << "ROCm support is not compiled";
+#endif
         auto *backend = getBackendFor(parameter.device);
         if (!backend) GTEST_SKIP() << "Backend is not compiled into this build";
         if (backend->deviceCount() <= parameter.device.ordinal) GTEST_SKIP();
@@ -246,7 +280,13 @@ namespace
                         parameter.rows, hidden, intermediate, experts, top_k, routes.get()) &&
                     kernel->reduceCanonicalRouteContributions(routes.get(), output.get(), parameter.rows, top_k, hidden);
             };
-            ASSERT_TRUE(enqueue());
+            {
+#ifdef HAVE_ROCM
+                rocm::ScopedMoEGroupedPrefillEngine baseline(native ? rocm::MoEGroupedPrefillEngine::OrderedDot4
+                                                                   : rocm::MoEGroupedPrefillEngine::Automatic);
+#endif
+                ASSERT_TRUE(enqueue());
+            }
             std::vector<float> expected(parameter.rows * hidden), actual(expected.size());
             ASSERT_TRUE(backend->deviceToHost(expected.data(), output->gpu_data_ptr(), expected.size() * sizeof(float), parameter.device.ordinal, stream));
             ASSERT_TRUE(backend->synchronizeStream(stream, parameter.device.ordinal));
@@ -259,7 +299,11 @@ namespace
             {
                 ScopedBackendGraphCapture recording(context, *graph, "expert economy complete pipeline");
                 ASSERT_TRUE(recording.begin());
-                ASSERT_TRUE(enqueue());
+#ifdef HAVE_ROCM
+                rocm::ScopedMoEGroupedPrefillEngine baseline(native ? rocm::MoEGroupedPrefillEngine::OrderedDot4
+                                                                   : rocm::MoEGroupedPrefillEngine::Automatic);
+#endif
+                for (int repeat = 0; repeat < (native ? 8 : 1); ++repeat) ASSERT_TRUE(enqueue());
                 recording.finish();
             }
             ASSERT_TRUE(graph->instantiate());
@@ -273,8 +317,122 @@ namespace
                 context.destroyEvent(start);
             };
             std::unique_ptr<void, decltype(retire)> timing_owner(&context, retire);
+#ifdef HAVE_ROCM
+            if (native)
+            {
+                const bool profile = mode == ExpertBenchmark::Wmma32Profile || mode == ExpertBenchmark::Wmma64Profile;
+                if (profile && ::testing::UnitTest::GetInstance()->test_to_run_count() != 1)
+                    throw std::invalid_argument("grouped WMMA profiling requires one exact selected case");
+                constexpr int repeats = 8, sample_count = 31;
+                auto n32 = context.createGraphCapture(stream), n64 = context.createGraphCapture(stream);
+                std::array graphs{graph.get(),n32.get(),n64.get()};
+                for (int path = 1; path < 3; ++path)
+                {
+                    rocm::ScopedMoEGroupedPrefillEngine candidate(path == 1 ? rocm::MoEGroupedPrefillEngine::WmmaM16N32
+                                                                         : rocm::MoEGroupedPrefillEngine::WmmaM16N64);
+                    ScopedBackendGraphCapture capture(context,*graphs[path],"native grouped MoE component");
+                    ASSERT_TRUE(capture.begin());
+                    // Profiles isolate one complete operation, timing batches eight.
+                    for (int repeat = 0; repeat < (profile ? 1 : repeats); ++repeat) ASSERT_TRUE(enqueue());
+                    capture.finish();
+                    std::vector<GPUGraphKernelNodeInfo> nodes;
+                    ASSERT_TRUE(graphs[path]->inspectKernelNodes(nodes));
+                    int native_nodes = 0;
+                    std::set<std::tuple<uintptr_t,uint32_t,uint32_t,uint32_t,uint32_t>> seen;
+                    for (const auto &node : nodes)
+                    {
+                        ASSERT_EQ(node.local_memory_bytes_per_thread,0u) << node.name;
+                        if (node.name.find("grouped_wmma_detail") == std::string::npos) continue;
+                        ++native_nodes;
+                        if (seen.emplace(node.function_identity,node.grid_x,node.grid_y,node.grid_z,node.block_x).second)
+                            std::printf("MOE_WMMA_RESOURCE,%s,%d,%u,%zu,%u,%u,%u,%u,%u,%s\n",parameter.name.c_str(),path,
+                                node.registers_per_thread,node.static_shared_memory_bytes,node.max_active_blocks_per_sm,
+                                node.grid_x,node.grid_y,node.grid_z,node.block_x,node.name.c_str());
+                    }
+                    ASSERT_GE(native_nodes,2 * (profile ? 1 : repeats));
+                    ASSERT_TRUE(graphs[path]->instantiate());
+                }
+                const auto poison = [&] {
+                    for (const char *name : {MoEWorkspaceBuffers::PREFILL_A_INT8,MoEWorkspaceBuffers::PREFILL_A_SCALES,
+                            MoEWorkspaceBuffers::PREFILL_GATE,MoEWorkspaceBuffers::PREFILL_UP,
+                            MoEWorkspaceBuffers::PREFILL_SWIGLU_INT8,MoEWorkspaceBuffers::PREFILL_SWIGLU_SCALES,
+                            MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY})
+                    {
+                        void *bank = workspace.getBuffer(name);
+                        const size_t bytes = workspace.getBufferSize(name);
+                        if (!bank || !bytes || hipMemsetAsync(bank,0xa5,bytes,static_cast<hipStream_t>(stream)) != hipSuccess)
+                            throw std::runtime_error("grouped WMMA scratch poison failed");
+                    }
+                    if (hipMemsetAsync(output->gpu_data_ptr(),0xa5,output->numel()*sizeof(float),static_cast<hipStream_t>(stream)) != hipSuccess ||
+                        hipMemsetAsync(routes->gpu_data_ptr(),0xa5,routes->numel()*sizeof(float),static_cast<hipStream_t>(stream)) != hipSuccess)
+                        throw std::runtime_error("grouped WMMA publication poison failed");
+                };
+                const auto verify = [&](int live) {
+                    auto replay_ids = route_ids;
+                    for (size_t i = static_cast<size_t>(live)*top_k; i < replay_ids.size(); ++i) replay_ids[i] = -1.0f;
+                    ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(),replay_ids.data(),replay_ids.size()*sizeof(float),parameter.device.ordinal,stream));
+                    auto reference = expected;
+                    std::fill(reference.begin() + static_cast<size_t>(live)*hidden,reference.end(),0.0f);
+                    for (int path = 0; path < 3; ++path)
+                    {
+                        poison();
+                        // A missing replay must fail the independently established
+                        // full-row reference, including empty positive-zero output.
+                        ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),actual.size()*sizeof(float),parameter.device.ordinal,stream));
+                        ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                        ASSERT_NE(std::memcmp(reference.data(),actual.data(),actual.size()*sizeof(float)),0);
+                        ASSERT_TRUE(graphs[path]->launch());
+                        ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),actual.size()*sizeof(float),parameter.device.ordinal,stream));
+                        ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                        ASSERT_EQ(std::memcmp(reference.data(),actual.data(),actual.size()*sizeof(float)),0)
+                            << "path=" << path << " live=" << live;
+                    }
+                };
+                for (int live : {parameter.live_rows,0,1,std::min(8,parameter.live_rows),parameter.live_rows})
+                { ASSERT_NO_FATAL_FAILURE(verify(live)); }
+                for (int warmup = 0; warmup < 5; ++warmup)
+                    for (auto *candidate : graphs) ASSERT_TRUE(candidate->launch());
+                if (profile)
+                {
+                    ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                    ASSERT_GE(roctxRangePushA("ROCmGroupedMoEWmma"),0);
+                    ASSERT_EQ(roctxProfilerResume(0),0);
+                    const bool launched = graphs[mode == ExpertBenchmark::Wmma32Profile ? 1 : 2]->launch();
+                    const bool joined = backend->synchronizeStream(stream,parameter.device.ordinal);
+                    const int paused = roctxProfilerPause(0), popped = roctxRangePop();
+                    ASSERT_TRUE(launched && joined && paused == 0 && popped >= 0);
+                    return;
+                }
+                std::array<std::array<double,sample_count>,3> times{};
+                for (int sample = 0; mode != ExpertBenchmark::WmmaReplay && sample < sample_count; ++sample)
+                    for (int order = 0; order < 3; ++order)
+                    {
+                        const int path = (sample + (sample % 2 ? 2-order : order)) % 3;
+                        ASSERT_TRUE(context.recordEventChecked(start,stream));
+                        ASSERT_TRUE(graphs[path]->launch());
+                        ASSERT_TRUE(context.recordEventChecked(end,stream));
+                        ASSERT_TRUE(context.synchronizeEventChecked(end));
+                        const double us = context.eventElapsedTime(start,end)*1000.0/repeats;
+                        ASSERT_TRUE(std::isfinite(us) && us > 0);
+                        times[path][sample] = us;
+                        // Inspect this candidate before the next can repair its output.
+                        ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),actual.size()*sizeof(float),parameter.device.ordinal,stream));
+                        ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                        ASSERT_EQ(std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float)),0);
+                    }
+                for (int sample = 0; mode != ExpertBenchmark::WmmaReplay && sample < sample_count; ++sample)
+                    std::printf("MOE_WMMA_SAMPLE,%s,%d,%.9f,%.9f,%.9f\n",parameter.name.c_str(),sample,
+                        times[0][sample],times[1][sample],times[2][sample]);
+                for (auto &values : times) std::sort(values.begin(),values.end());
+                if (mode != ExpertBenchmark::WmmaReplay)
+                    std::printf("MOE_WMMA_MEDIAN,%s,%.9f,%.9f,%.9f,%.6f,%.6f\n",parameter.name.c_str(),
+                    times[0][15],times[1][15],times[2][15],times[0][15]/times[1][15],times[0][15]/times[2][15]);
+                ASSERT_NO_FATAL_FAILURE(verify(0));
+                ASSERT_NO_FATAL_FAILURE(verify(parameter.live_rows));
+            }
+#endif
             std::array<float, 9> samples{};
-            for (size_t sample = 0; sample < samples.size() + 3u; ++sample)
+            for (size_t sample = 0; !native && sample < samples.size() + 3u; ++sample)
             {
                 ASSERT_TRUE(context.recordEventChecked(start, stream));
                 ASSERT_TRUE(graph->launchOnStream(stream));
@@ -282,20 +440,26 @@ namespace
                 ASSERT_TRUE(context.synchronizeEventChecked(end));
                 if (sample >= 3u) samples[sample - 3u] = context.eventElapsedTime(start, end);
             }
-            if (parameter.ownership_degree > 0)
+            if (!native && parameter.ownership_degree > 0)
                 for (size_t sample = 0; sample < samples.size(); ++sample)
                     std::printf("moe_whole_shard_sample,%s,%d,%d,%d,%zu,%.9f\n",
                         parameter.device.is_cuda() ? "CUDA" : "ROCm", parameter.ownership_degree,
                         parameter.rows, parameter.live_rows, sample, samples[sample] * 1000.0);
             std::sort(samples.begin(), samples.end());
-            std::printf("MOE_EXPERT_ECONOMY,%s,%.3f\n", parameter.name.c_str(), samples[samples.size() / 2u] * 1000.0f);
+            if (!native) std::printf("MOE_EXPERT_ECONOMY,%s,%.3f\n", parameter.name.c_str(), samples[samples.size() / 2u] * 1000.0f);
             ASSERT_TRUE(backend->deviceToHost(actual.data(), output->gpu_data_ptr(), actual.size() * sizeof(float), parameter.device.ordinal, stream));
             ASSERT_TRUE(backend->synchronizeStream(stream, parameter.device.ordinal));
             EXPECT_EQ(std::memcmp(expected.data(), actual.data(), actual.size() * sizeof(float)), 0);
 
-            if (parameter.ownership_degree == 0)
+            if (parameter.ownership_degree == 0 && !native)
                 return;
-
+            const auto original_ids = route_ids, original_weights = route_weights;
+            const auto original_expected = expected;
+            const auto check_phases = [&](const char *engine_label) {
+            route_ids = original_ids; route_weights = original_weights; expected = original_expected;
+            ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(),route_ids.data(),route_ids.size()*sizeof(float),parameter.device.ordinal,stream));
+            ASSERT_TRUE(backend->hostToDevice(probabilities->gpu_data_ptr(),route_weights.data(),route_weights.size()*sizeof(float),parameter.device.ordinal,stream));
+            ASSERT_TRUE(enqueue());
             // Public projection boundaries preserve the same grouped route
             // plan and Q8 intermediates as the complete production operation.
             // Time a retained batch, never individual arbitrary graph nodes:
@@ -303,7 +467,7 @@ namespace
             const auto measure_phase = [&](const char *ownership, const char *phase, const auto &operation) {
                 // Preserve the historical uniform record identity, but never
                 // merge samples from different route distributions in a curve.
-                const std::string curve_ownership = std::string(ownership) +
+                const std::string curve_ownership = std::string(engine_label) + ownership +
                     (parameter.route_profile == MoERoutingProfile::Uniform ? "" :
                         "_" + std::string(native_quantised_dispatch::moeRoutingProfileName(parameter.route_profile)));
                 constexpr int repetitions = 8;
@@ -338,7 +502,7 @@ namespace
                             node.registers_per_thread, node.local_memory_bytes_per_thread,
                             node.max_active_blocks_per_sm, node.name.c_str());
                 }
-                for (int sample = -3; sample < 9; ++sample)
+                for (int sample = -3; sample < (native ? 0 : 9); ++sample)
                 {
                     ASSERT_TRUE(context.recordEventChecked(start, stream));
                     ASSERT_TRUE(phase_graph->launchOnStream(stream));
@@ -389,11 +553,17 @@ namespace
             }
             ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(), route_ids.data(), route_ids.size() * sizeof(float), parameter.device.ordinal, stream));
             ASSERT_TRUE(backend->hostToDevice(probabilities->gpu_data_ptr(), route_weights.data(), route_weights.size() * sizeof(float), parameter.device.ordinal, stream));
-            ASSERT_TRUE(enqueue());
+            {
+#ifdef HAVE_ROCM
+                rocm::ScopedMoEGroupedPrefillEngine oracle(native ? rocm::MoEGroupedPrefillEngine::OrderedDot4
+                                                                 : rocm::MoEGroupedPrefillEngine::Automatic);
+#endif
+                ASSERT_TRUE(enqueue());
+            }
             ASSERT_TRUE(backend->deviceToHost(expected.data(), output->gpu_data_ptr(), expected.size() * sizeof(float), parameter.device.ordinal, stream));
             ASSERT_TRUE(backend->synchronizeStream(stream, parameter.device.ordinal));
 
-            const int columns = hidden / parameter.ownership_degree;
+            const int columns = hidden / (parameter.ownership_degree ? parameter.ownership_degree : 2);
             const int first_column = hidden - columns;
             std::vector<std::shared_ptr<TensorBase>> column_sources;
             std::vector<GpuPreparedGemm> column_prepared;
@@ -440,8 +610,51 @@ namespace
                 ASSERT_EQ(std::memcmp(expected.data() + row * hidden + first_column,
                     actual_columns.data() + row * columns, columns * sizeof(float)), 0)
                     << "Column-owned down disagrees with full-width oracle at row " << row;
+            };
+#ifdef HAVE_ROCM
+            if (native)
+            {
+                for (const auto engine : {rocm::MoEGroupedPrefillEngine::WmmaM16N32,rocm::MoEGroupedPrefillEngine::WmmaM16N64})
+                {
+                    rocm::ScopedMoEGroupedPrefillEngine selected(engine);
+                    ASSERT_NO_FATAL_FAILURE(check_phases(engine == rocm::MoEGroupedPrefillEngine::WmmaM16N32 ? "wmma32_" : "wmma64_"));
+                }
+            }
+            else
+#endif
+                ASSERT_NO_FATAL_FAILURE(check_phases(""));
         });
     }
+
+    /** @test Preserve the existing installed-policy economy surface. */
+    TEST_P(GPUExpertPipeline, CapturedPipeline) { runExpertPipeline(GetParam()); }
+
+    /** @brief Opt-in native tournament reuses existing prefill shapes and source formats. */
+    class ROCmGroupedWmmaPerf : public ::testing::TestWithParam<Case> {};
+    /** @return Existing quantized ROCm prefill cases, without a private model inventory. */
+    std::vector<Case> groupedWmmaPerfCases()
+    {
+        auto result = cases();
+        std::erase_if(result,[](const Case &c) {
+            return !c.device.is_rocm() || c.rows < 64 || c.format == TensorType::FP16 ||
+                c.format == TensorType::BF16 || c.format == TensorType::FP32;
+        });
+        return result;
+    }
+    /** @test Replay both native engines through split phases and source-prepared down slices. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_CapturedSplitReplay)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaReplay); }
+    /** @test Pair whole-component native-event samples only after dirty replay passes. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_CapturedTournament)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaTournament); }
+    /** @test Isolate one N32 complete projection transaction outside canonical timing. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedN32Profile)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::Wmma32Profile); }
+    /** @test Isolate one N64 complete projection transaction outside canonical timing. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedN64Profile)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::Wmma64Profile); }
+    INSTANTIATE_TEST_SUITE_P(NativeGfx1100,ROCmGroupedWmmaPerf,::testing::ValuesIn(groupedWmmaPerfCases()),
+        [](const ::testing::TestParamInfo<Case> &info) { return info.param.name; });
 
     INSTANTIATE_TEST_SUITE_P(ProductionShape, GPUExpertPipeline, ::testing::ValuesIn(cases()),
         [](const ::testing::TestParamInfo<Case> &info) { return info.param.name; });

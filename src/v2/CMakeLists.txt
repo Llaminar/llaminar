@@ -718,6 +718,7 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmNativeQuantisedGemmShard5.hip
         kernels/rocm/gemm/ROCmNativeQuantisedGemmShard6.hip
         kernels/rocm/gemm/ROCmNativeQuantisedGemmShard7.hip
+        kernels/rocm/gemm/ROCmMoEGroupedWmma.hip # Source-exact grouped gfx1100 matrix leaves
         kernels/rocm/gemm/ROCmNativeQuantisedWmma.hip # Independent native gfx1100 WMMA compilation
         kernels/rocm/gemm/ROCmSmallNFP32ProjectionKernels.hip # Graph-capturable FP32 small-output projection kernels
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
@@ -894,6 +895,7 @@ if(HAVE_ROCM)
     # mode and emits no WMMA entry. Both targets retain the same spill guard.
     set_property(SOURCE kernels/rocm/gemm/ROCmNativeQuantisedWmma.hip
         kernels/rocm/moe/ROCmRouterQ8Prefill.hip
+        kernels/rocm/gemm/ROCmMoEGroupedWmma.hip
         APPEND PROPERTY COMPILE_OPTIONS "-mwavefrontsize64")
     
     # NOTE: ROCm kernel ITensorGemm adapters (ROCmFloatingPointGemmKernel.cpp)

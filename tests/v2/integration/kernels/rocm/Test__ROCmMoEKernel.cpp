@@ -19,7 +19,8 @@
  * - Expert preparation admits its native payload and upload-ring BOM through
  *   one model-owned PreparedWeightStore before materializing device storage.
  *
- * Target Hardware: AMD MI50 (gfx906 / Vega 20)
+ * Target Hardware: AMD MI50 (gfx906 / Vega 20), plus explicit native gfx1100
+ * grouped WMMA replay for every canonical source format and mixed IQ4 tables.
  * Retained original rank-bank publication guards all route/bank/guard bytes
  * at QFN prefill geometry, including nonfinite copies and dirty live prefixes.
  * Disabled paired events and event-free profile modes isolate one real bridge.
@@ -40,6 +41,8 @@
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
+#include "kernels/rocm/gemm/ROCmMoEGroupedWmma.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmWeightPacker.h"
 #include "backends/rocm/HIPGraphCapture.h"
@@ -26097,16 +26100,30 @@ TEST(Test__ROCmMoEKernel, SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XS
  * @param expert_width Expert intermediate width; narrow values exercise partial
  *        quantization workgroups independently of Qwen's usual width 512.
  */
-template <typename GateFactory, typename UpFactory, typename DownFactory>
+/**
+ * @brief Prove grouped projection, ownership and retained reset against serial rows.
+ * @param format_label Source-format evidence name.
+ * @param make_gate Gate source factory. @param make_up Up source factory.
+ * @param make_down Down source factory. @param masked_local_tp Exercise compact local ownership.
+ * @param exercise_router_q8_publication Reuse the production router Q8 publication.
+ * @param row_inventory Physical row capacities to replay. @param expert_width Intermediate width.
+ * @param device Native participant owning every allocation and stream.
+ * @param engine Explicit grouped recording engine, independent of the serial reference.
+ *
+ * Factories use one erased test interface so each new codebook/mixed-role fixture
+ * shares this substantial lifecycle proof instead of recompiling its full body.
+ */
 void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     const char *format_label,
-    GateFactory make_gate,
-    UpFactory make_up,
-    DownFactory make_down,
+    const std::function<std::unique_ptr<TensorBase>(const std::vector<size_t>&,int)> &make_gate,
+    const std::function<std::unique_ptr<TensorBase>(const std::vector<size_t>&,int)> &make_up,
+    const std::function<std::unique_ptr<TensorBase>(const std::vector<size_t>&,int)> &make_down,
     bool masked_local_tp = false,
     bool exercise_router_q8_publication = false,
     std::span<const int> row_inventory = kGroupedVerifierRuntimeRows,
-    int expert_width = 512)
+    int expert_width = 512,
+    DeviceId device = DeviceId::rocm(0),
+    llaminar2::rocm::MoEGroupedPrefillEngine engine = llaminar2::rocm::MoEGroupedPrefillEngine::Automatic)
 {
     SKIP_IF_NO_ROCM();
 
@@ -26114,7 +26131,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     const int max_row_count =
         *std::max_element(row_inventory.begin(), row_inventory.end());
 
-    const DeviceId device = DeviceId::rocm(0);
+    ASSERT_EQ(hipSetDevice(device.ordinal), hipSuccess);
     const std::string format_name = format_label ? format_label : "unknown_format";
     constexpr int d_model = 2048;
     const int intermediate = expert_width;
@@ -26143,7 +26160,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     hipStream_t stream = nullptr;
     ASSERT_EQ(hipStreamCreateWithFlags(&stream, hipStreamNonBlocking), hipSuccess);
 
-    ROCmMoEKernel moe_kernel(0);
+    ROCmMoEKernel moe_kernel(device.ordinal);
     static_cast<ITensorKernel &>(moe_kernel).setGPUStream(stream);
     auto moe_workspace = bindDefaultMoEWorkspace(
         moe_kernel,
@@ -26355,6 +26372,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             static_cast<size_t>(seq_len) * static_cast<size_t>(d_model));
         for (int row = 0; row < seq_len; ++row)
         {
+            llaminar2::rocm::ScopedMoEGroupedPrefillEngine oracle(llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4);
             auto hidden_row = TestTensorFactory::createFP32({1u, static_cast<size_t>(d_model)});
             std::copy(hidden->data() + static_cast<size_t>(row) * d_model,
                       hidden->data() + static_cast<size_t>(row + 1) * d_model,
@@ -26488,6 +26506,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsync(
                 routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
         }
+        llaminar2::rocm::ScopedMoEGroupedPrefillEngine candidate(engine);
         ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
             hidden.get(),
             grouped_output.get(),
@@ -26522,7 +26541,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             // The warm execution above establishes immutable scratch bindings.
             // Retain the complete grouping/projection/publication transaction
             // and compare replay, not just the eager numerical warmup.
-            ScopedHipTestGraph graph(0, stream, "canonical MoE route publication");
+            ScopedHipTestGraph graph(device.ordinal, stream, "canonical MoE route publication");
             ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsyncUsingPublishedMask(
                 routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
             ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
@@ -26532,6 +26551,36 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             ASSERT_TRUE(moe_kernel.reduceCanonicalRouteContributions(
                 canonical_route_contributions.get(), grouped_output.get(), seq_len, top_k, d_model));
             ASSERT_TRUE(graph.finishAndInstantiate());
+            if (engine == llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N32 ||
+                engine == llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N64)
+            {
+                size_t count = 0;
+                ASSERT_EQ(hipGraphGetNodes(graph.nativeGraphForInspection(), nullptr, &count), hipSuccess);
+                std::vector<hipGraphNode_t> nodes(count);
+                ASSERT_EQ(hipGraphGetNodes(graph.nativeGraphForInspection(), nodes.data(), &count), hipSuccess);
+                int native_gate_up = 0, native_down = 0;
+                for (const auto node : nodes)
+                {
+                    hipGraphNodeType type;
+                    ASSERT_EQ(hipGraphNodeGetType(node, &type), hipSuccess);
+                    if (type != hipGraphNodeTypeKernel) continue;
+                    hipKernelNodeParams params{};
+                    ASSERT_EQ(hipGraphKernelNodeGetParams(node, &params), hipSuccess);
+                    const char *name = hipKernelNameRefByPtr(params.func, stream);
+                    ASSERT_NE(name, nullptr);
+                    if (std::string_view(name).find("grouped_wmma_detail") == std::string_view::npos) continue;
+                    if (params.gridDim.z == 2) ++native_gate_up;
+                    else if (params.gridDim.z == 1) ++native_down;
+                    else FAIL() << "Unexpected grouped WMMA projection role";
+                    hipFuncAttributes resources{};
+                    ASSERT_EQ(hipFuncGetAttributes(&resources, params.func), hipSuccess);
+                    EXPECT_EQ(resources.localSizeBytes, 0u) << name;
+                    EXPECT_EQ(params.blockDim.x,
+                        engine == llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N32 ? 128u : 256u);
+                }
+                ASSERT_GE(native_gate_up, 1) << "Gate/up must record native WMMA";
+                ASSERT_GE(native_down, 1) << "Down must record native WMMA";
+            }
             ASSERT_TRUE(graph.launch());
             ASSERT_TRUE(graph.launch());
             // The tiled directory has no consumer when device admission picks
@@ -27893,6 +27942,94 @@ TEST(Test__ROCmMoEKernel, CanonicalPublicationBoundedGridAllCodebooksCapturedByt
             /*masked_local_tp=*/true,
             /*exercise_router_q8_publication=*/false, rows);
     }
+}
+
+/** @brief One independently filterable physical tile/source-codebook replay. */
+struct NativeGroupedWmmaCase
+{
+    llaminar2::rocm::MoEGroupedPrefillEngine engine;
+    MoEVerifierFormatCase format;
+};
+/** @brief Native gfx1100 production graph, including device route-family transitions. */
+class ROCmMoEGroupedWmma : public ::testing::TestWithParam<NativeGroupedWmmaCase> {};
+
+/** @return Every canonical source format for each implemented native tile. */
+std::vector<NativeGroupedWmmaCase> nativeGroupedWmmaCases()
+{
+    std::vector<NativeGroupedWmmaCase> cases;
+    for (const auto engine : {llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N32,
+                              llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N64})
+        for (const auto &format : allMoEVerifierFormatCases()) cases.push_back({engine,format});
+    return cases;
+}
+
+/** @return Actual gfx1100 ordinal, or -1 when this native proof is unavailable. */
+int nativeGroupedWmmaDevice()
+{
+    llaminar2::initializeROCmHardwareMetadata();
+    const auto &hardware = llaminar2::rocmHardwareMetadata();
+    for (int device = 0; device < static_cast<int>(hardware.size()); ++device)
+    {
+        const auto &isa = hardware.at(device).isa_target;
+        if (isa == "gfx1100" || isa.starts_with("gfx1100:")) return device;
+    }
+    return -1;
+}
+
+/** @test Compare complete captured native projections with independent serial rows. */
+TEST_P(ROCmMoEGroupedWmma, CapturedAllCodebookReplay)
+{
+    const int ordinal = nativeGroupedWmmaDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    constexpr std::array<int,1> rows{33};
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    const auto &c = GetParam();
+    runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+        c.format.name,c.format.make,c.format.make,c.format.make,true,false,rows,512,
+        DeviceId::rocm(ordinal),c.engine);
+}
+INSTANTIATE_TEST_SUITE_P(NativeGfx1100,ROCmMoEGroupedWmma,::testing::ValuesIn(nativeGroupedWmmaCases()),
+    [](const ::testing::TestParamInfo<NativeGroupedWmmaCase> &info)
+    {
+        return std::string(info.param.engine == llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N32 ? "N32" : "N64") +
+            info.param.format.name;
+    });
+
+/** @test Keep physical IQ4_NL and source-scaled IQ4_XS distinct in mixed descriptor tables. */
+TEST(Test__ROCmMoEKernel, NativeWmmaMixedIQ4CapturedReplay)
+{
+    const int ordinal = nativeGroupedWmmaDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    constexpr std::array<int,1> rows{33};
+    const std::function<std::unique_ptr<TensorBase>(const std::vector<size_t>&,int)> mixed =
+        [](const std::vector<size_t> &shape,int seed) -> std::unique_ptr<TensorBase>
+    {
+        if (seed & 1) return TestTensorFactory::createIQ4_NLRandom(shape,seed);
+        return TestTensorFactory::createIQ4_XSRandom(shape,seed);
+    };
+    const std::function<std::unique_ptr<TensorBase>(const std::vector<size_t>&,int)> opposite =
+        [&](const std::vector<size_t> &shape,int seed) { return mixed(shape,seed ^ 1); };
+    ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
+    for (const auto engine : {llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N32,
+                              llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N64})
+        runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+            "MixedIQ4",mixed,opposite,mixed,true,false,rows,512,DeviceId::rocm(ordinal),engine);
+}
+
+/** @test Exercise odd K32 counts and partial native output-column tiles. */
+TEST(Test__ROCmMoEKernel, NativeWmmaTailPartitionsCapturedReplay)
+{
+    const int ordinal = nativeGroupedWmmaDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    const auto formats = allMoEVerifierFormatCases();
+    const auto format = std::find_if(formats.begin(),formats.end(),[](const auto &f) { return std::string(f.name) == "Q8_0"; });
+    ASSERT_NE(format,formats.end());
+    constexpr std::array<int,1> rows{33};
+    for (const auto engine : {llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N32,
+                              llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N64})
+        for (int width : {96,288})
+            runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+                format->name,format->make,format->make,format->make,true,false,rows,width,DeviceId::rocm(ordinal),engine);
 }
 
 /** @brief Prove captured publication covers long physical route banks exactly. */

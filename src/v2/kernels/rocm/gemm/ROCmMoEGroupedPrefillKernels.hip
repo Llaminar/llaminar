@@ -31,7 +31,12 @@
  * the original full-width arithmetic key, so changing physical ownership
  * cannot silently change serial-M1 partition boundaries.
  *
- * The long-prefill projection kernels expose 64/128/256 output-column lanes and
+ * Native gfx1100 WMMA recording consumes the same directory16 publication and
+ * source partition policy, with separate physical IQ4 decoders and unchanged
+ * SwiGLU/ordered publication. Its dot-engine policy is independent of live route
+ * admission; sparse replay retains its existing route-owned family.
+ *
+ * The long-prefill Dot4 projection kernels expose 64/128/256 output-column lanes and
  * 4/8/12/16-row tiles. Production dispatch comes exclusively from the checked-in
  * all-format trainer output; a missing policy is a hard failure. No production
  * path uses floating-point atomics, row replay, replay-time host-authored work
@@ -60,6 +65,8 @@
 #include "../../common/DeviceNativeQuantisedMatrixDesc.h"
 #include "../../common/DeviceOrderedRouteFold.h"
 #include "ROCmMoEGroupedPrefillKernels.h"
+#include "ROCmMoEPrefillArithmetic.h"
+#include "ROCmMoEGroupedWmma.h"
 #include "ROCmMoERouteOwnedTuning.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include <exception>
@@ -265,46 +272,6 @@ enum NativeQuantisedFormatPrefill : uint8_t {
     NATIVE_QUANTISED_PF_Q8_0    = 19,
     NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN =
         llaminar2::kNativeQuantisedExpandedInt8MinCodebook,
-};
-
-/**
- * @brief Capture-time serial-M1 split-K policy carried into grouped prefill.
- *
- * A NativeQuantised codebook and matrix geometry select a generated serial-decode
- * K-partition count. That count changes FP32 arithmetic because each partition
- * starts from zero and an ordered reducer then adds the independently rounded
- * partials. Grouped prefill therefore carries the complete codebook-indexed
- * policy by value in its graph-captured kernel arguments. Mixed-codebook down
- * tables can select the correct entry on device without consulting the host.
- */
-struct MoEPrefillSerialM1KPartitionPolicy
-{
-    uint8_t by_codebook[32] = {};
-
-    /** Return the captured partition count, or zero for an invalid codebook. */
-    __host__ __device__ int forCodebook(uint8_t codebook_id) const
-    {
-        return codebook_id < 32 ? static_cast<int>(by_codebook[codebook_id]) : 0;
-    }
-
-    /**
-     * @brief Select the source-format reduction tree for one execution matrix.
-     *
-     * Promoted CPU-native weights use an expanded device decoder but must keep
-     * the compact source format's serial-M1 partition boundaries. Canonical
-     * device formats without explicit provenance retain their execution id.
-     */
-    __host__ __device__ int forDescriptor(
-        const DeviceNativeQuantisedMatrixDesc& desc) const
-    {
-        uint8_t policy_codebook = desc.source_identity_present
-                                      ? desc.source_codebook_id
-                                      : desc.codebook_id;
-        // Q8_1 and Q8_K prepare to the same signed-INT8 arithmetic as Q8_0.
-        if (policy_codebook == 20 || policy_codebook == 21)
-            policy_codebook = 19;
-        return forCodebook(policy_codebook);
-    }
 };
 
 extern "C" bool rocmGemv_native_quantised_query_serial_m1_config(
@@ -4362,8 +4329,11 @@ bool rocmMoE_grouped_prefill_pipeline(
             throw std::logic_error("route-owned raw preparation changed its sealed original N/K partition policy");
     }
 
-    llaminar2::HipDeviceGuard::setDevice(device_id);
+    if (llaminar2::HipDeviceGuard::setDevice(device_id) != hipSuccess) return false;
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
+    if (!hip_stream || hip_stream == hipStreamLegacy || hip_stream == hipStreamPerThread) return false;
+    const auto dot_engine = llaminar2::rocm::selectedMoEGroupedPrefillEngine(device_id);
+    const bool native_wmma = dot_engine != llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4;
     (void)hipGetLastError(); // clear prior errors
     const bool has_prequantized_hidden =
         d_prequantized_hidden && d_prequantized_hidden_scales;
@@ -4658,7 +4628,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     if (use_route_owned) { \
                         LAUNCH_GATEUP_ROUTE_OWNED(FMT); \
                     } \
-                    if (use_expert_row_tiles) { \
+                    if (use_expert_row_tiles && !native_wmma) { \
                         const MoEPrefillTileConfig candidate = has_uniform_codebook_pair \
                             ? pair_config.gateup \
                             : moe_prefill_select_tile_config( \
@@ -4702,6 +4672,26 @@ bool rocmMoE_grouped_prefill_pipeline(
         #undef LAUNCH_GATEUP_ADAPTIVE
         #undef LAUNCH_GATEUP_EXPERT_TILED
         #undef LAUNCH_GATEUP_ROUTE_OWNED
+
+        if (use_expert_row_tiles && native_wmma)
+        {
+            const int capacity = ensure_work_directory(16);
+            if (capacity <= 0 || !llaminar2::rocm::submitMoEGroupedWmma(dot_engine,
+                    gateup_codebook_mask, {
+                        .activations = reuse_prequantized_hidden ? d_prequantized_hidden : d_scratch_A_int8,
+                        .activation_scales = reuse_prequantized_hidden ? d_prequantized_hidden_scales : d_scratch_scales,
+                        .group_token_indices = d_group_token_indices,
+                        .group_counts = d_group_counts, .group_offsets = d_group_offsets,
+                        .directory = reinterpret_cast<const uint32_t *>(d_group_work_directory),
+                        .descriptors = gate_descs, .second_descriptors = up_descs,
+                        .output = d_scratch_gate, .second_output = d_scratch_up,
+                        .directory_capacity = capacity, .rows = seq_len, .top_k = top_k,
+                        .n = intermediate, .k = d_model, .experts = num_experts, .device = device_id,
+                        .input = grouped_indices_are_route_slots
+                            ? llaminar2::rocm::MoEGroupedWmmaInput::OriginalRouteSlots
+                            : llaminar2::rocm::MoEGroupedWmmaInput::OriginalTokens,
+                        .partitions = gateup_k_partition_policy, .admission = admission}, stream)) return false;
+        }
 
         constexpr int blocks_per_workgroup = kMoESwiGLUQuantizeThreads / 32;
         const size_t quant_blocks = static_cast<size_t>(total_slots) *
@@ -4920,24 +4910,43 @@ bool rocmMoE_grouped_prefill_pipeline(
                     } \
                 } while (0)
 
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q4_0);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ4_NL);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ4_XS_SOURCE);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q4_1);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q5_0);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q5_1);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q6_K);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q3_K);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q2_K);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ3_S);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ3_XXS);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ2_S);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ2_XS);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ2_XXS);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_S);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_M);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q8_0);
-            LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN);
+            if (native_wmma)
+            {
+                const int capacity = ensure_work_directory(16);
+                if (capacity <= 0 || !llaminar2::rocm::submitMoEGroupedWmma(dot_engine,
+                        down_codebook_mask, {
+                            .activations = d_scratch_swiglu_int8,
+                            .activation_scales = d_scratch_swiglu_scales,
+                            .group_counts = d_group_counts, .group_offsets = d_group_offsets,
+                            .directory = reinterpret_cast<const uint32_t *>(d_group_work_directory),
+                            .descriptors = down_descs, .output = d_scratch_gate,
+                            .directory_capacity = capacity, .rows = seq_len, .top_k = top_k,
+                            .n = down_columns, .k = intermediate, .experts = num_experts, .device = device_id,
+                            .input = llaminar2::rocm::MoEGroupedWmmaInput::GroupedRows,
+                            .partitions = down_k_partition_policy, .admission = admission}, stream)) return false;
+                launched_down = true;
+            }
+            else
+            {
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q4_0);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ4_NL);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ4_XS_SOURCE);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q4_1);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q5_0);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q5_1);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q6_K);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q3_K);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q2_K);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ3_S);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ3_XXS);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ2_S);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ2_XS);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ2_XXS);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_S);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_M);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q8_0);
+                LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN);
+            }
             #undef LAUNCH_DOWN_IF_PRESENT
             #undef DISPATCH_DOWN_CONFIG
             #undef DISPATCH_DOWN_TILE_N
@@ -5064,7 +5073,8 @@ bool rocmInitIQGridTables_moe_prefill(
     if (e != hipSuccess) { fprintf(stderr, "[rocmInitIQGridTables_moe_prefill] iq2xxs failed: %s\n", hipGetErrorString(e)); return false; }
     e = hipMemcpyToSymbol(d_pf_iq1s_grid, h_iq1s_grid, sizeof(d_pf_iq1s_grid));
     if (e != hipSuccess) { fprintf(stderr, "[rocmInitIQGridTables_moe_prefill] iq1s failed: %s\n", hipGetErrorString(e)); return false; }
-    return true;
+    return llaminar2::rocm::initializeMoEGroupedWmmaGrids(device_id,
+        h_iq3s_grid, h_iq3xxs_grid, h_iq2s_grid, h_iq2xs_grid, h_iq2xxs_grid, h_iq1s_grid);
 }
 
 } // extern "C"
