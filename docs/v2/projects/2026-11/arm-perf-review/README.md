@@ -5780,3 +5780,23 @@ sa-results-03480d07e) — caused the defective diff; future seals
 must include the DRIVER's full results set. .80 6ca2462cc BUILD=0
 + capacity/memory binaries running; .79 rerun next; any red =
 verbatim.
+
+### Main 05:56Z: attribution complete; seal rule + base-owner rows 3-9
+
+Per-name table accepted; attribution COMPLETE + consistent
+(corrected diff: NEW=1 flaky CachedGraph; GONE=20; ROCm suspicion =
+diff artifact, no flip). **RUNBOOK RULE (Main, accepted): EVERY
+seal carries the DRIVER's complete result set (unit + host +
+exclusive + cuda-socket JUnit + prerequisites.json); a PARTIAL seal
+is INVALID as a diff source** — added to the runbook (this is what
+created the defective 222/239 diff). **BASE-OWNER ITEM (rows 3-9,
+recorded with the base control evidence): on a HAVE_CUDA=ON GB10
+build, PhysicalMemoryAuthority ("Native graph object geometry
+requires an exact compiled GPU backend"), Pooled x5 ("Pooled source
+native backend was not compiled") and PrefillGraphCapturability fail
+at the BASE too = inherited — but they LOOK LIKE registration/
+backend-detection defects in a CUDA-on single-GPU ARM config; NOT
+ours to fix in the PR; record for the base owner.** GATE-A
+REMAINING: .80/.79 rerun @ 6ca2462cc shows rows 1-2 +
+AggregateCapacity green -> WSL x86 binding gate @ 6ca2462cc ->
+pins. All in flight.
