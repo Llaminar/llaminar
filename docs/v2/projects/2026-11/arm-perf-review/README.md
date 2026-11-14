@@ -6425,3 +6425,26 @@ registration fixes + 2 new tests + both cap tests present
 Will report DRIVER_RC + failed-set delta + 2 new tests green + cap
 tests green; then develop discriminator. Board: 3 hosts at
 8ccfa771c (sparks .80/.79; WSL x86) — one sweep to the pins/Gate-A.
+
+### Main 14:52Z: reviewer COMPLETE static verdict — HOLD = exactly B1+B2+docs; final commit set
+
+Reviewer COMPLETE verdict @ 6ca..56829099c: SOURCE HOLD on exactly
+B1 (:33203 prefix) + B2 (:1445 TierLegacyCap) + one docs precision
+item; EVERYTHING ELSE in A4-R = CLOSED (required-layout + caller
+migration; observation-before-pricing; legacy-cap uses
+input.cpu_prepared_layout; tier-v4 EXPECT_NE; zero-stride CPU->CPU;
+real CPU receiver; calibration-catalog + admission predicate =
+carried to Stage-B, not silently qualified). FINAL LANE COMMIT
+(Main) = B1+B2 (9ba1d4da2) + vacuous-filter guard/name-resolution
+(8ccfa771c) + the 2 text fixes (docs c30:1030-1031 precise helper/
+public-control statement; .inc:665-669 comment — EXPECT_NE :673 =
+discriminator) = the final tip. THEN: .80 (2 registrations tests>0
++ focused) -> .79 + WSL incremental at the final tip (failed-set
+diff vs the 6ca seals) -> reviewer re-reads the tiny delta ->
+Gate-A d5e04fdce..final tip. Reviewer boundary records also
+accepted: MPI exit1/fixture-missing = owner attribution (not
+verified causes); byte-identity compact = relayed matches +
+source-applicability bound (LOCAL FILE PATCHED to state
+CLASSIFICATION per the reviewer — not independent bytes, not later
+execution). Lane confirmed on the final commit; re-targets on the
+SHA.
