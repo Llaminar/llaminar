@@ -12,13 +12,17 @@
  * downloads are outside event timing. Numerical certification belongs to the
  * independent serial oracle in MoELiveRows; this fixture additionally requires
  * the timed replay sequence to leave the same finite output bits. No performance
- * threshold or benchmark case is added to the production-preflight gate.
+ * threshold is a correctness gate; focused event-owner replay is explicitly
+ * registered in production preflight.
  * Opt-in gfx1100 tournaments use the same source/geometry owners, compare both
  * native tiles against explicit ordered Dot4 after poisoned retained replay,
  * and keep profiler launches separate from paired native-event samples.
  * Hybrid experiments retain all row-floor graphs while route data crosses the
  * thresholds. Skewed replay independently removes each down writer family;
  * neither a matching symbol nor a repaired final result can certify ownership.
+ * Native tournaments wrap complete retained operation batches in internal
+ * timeline events. Each sample must overwrite poisoned state before another
+ * candidate can repair it; host submission gaps stay outside the interval.
  */
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -48,6 +52,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <exception>
 #include <initializer_list>
 #include <memory>
 #include <optional>
@@ -146,7 +151,7 @@ namespace
     enum class ExpertBenchmark
     {
         Installed, WmmaReplay, WmmaTournament, Wmma32Profile, Wmma64Profile,
-        WmmaHybridReplay, WmmaHybridTournament, WmmaHybrid32Profile
+        WmmaHybridReplay, WmmaHybridTournament, WmmaHybrid32Profile, WmmaHybridTimingReplay
     };
 
 #ifdef HAVE_ROCM
@@ -182,9 +187,10 @@ namespace
     void runExpertPipeline(Case parameter, ExpertBenchmark mode = ExpertBenchmark::Installed)
     {
         const bool native = mode != ExpertBenchmark::Installed;
+        const bool timing_replay = mode == ExpertBenchmark::WmmaHybridTimingReplay;
         const bool hybrid = mode == ExpertBenchmark::WmmaHybridReplay ||
                             mode == ExpertBenchmark::WmmaHybridTournament ||
-                            mode == ExpertBenchmark::WmmaHybrid32Profile;
+                            mode == ExpertBenchmark::WmmaHybrid32Profile || timing_replay;
         // One retained capacity spans every live threshold. The canonical case
         // still owns the matrix shapes, formats, ownership and route profile.
         if (hybrid) parameter.live_rows = parameter.rows;
@@ -370,10 +376,15 @@ namespace
                     throw std::invalid_argument("grouped WMMA profiling requires one exact selected case");
                 constexpr int repeats = 8, sample_count = 31;
                 std::vector<decltype(graph)> native_graphs;
+                // Parents import the existing source DAGs, preserving every
+                // operation and parameter. Retire parents before their sources.
+                std::vector<decltype(graph)> timed_graphs;
                 std::vector<decltype(graph.get())> graphs{graph.get()};
                 // Retire submissions before these local native graphs disappear,
                 // including fatal assertions after a launch or event failure.
-                const auto join_graphs = [&](void *) { (void)backend->synchronizeStream(stream,parameter.device.ordinal); };
+                const auto join_graphs = [&](void *) {
+                    if (!backend->synchronizeStream(stream,parameter.device.ordinal)) std::terminate();
+                };
                 std::unique_ptr<void,decltype(join_graphs)> graph_retirement(&context,join_graphs);
                 for (size_t path = 1; path < dot_candidates.size(); ++path)
                 {
@@ -403,6 +414,63 @@ namespace
                     ASSERT_GE(native_nodes,2 * (profile ? 1 : repeats));
                     ASSERT_TRUE(graphs[path]->instantiate());
                 }
+                const bool internal_timing = timing_replay || mode == ExpertBenchmark::WmmaTournament ||
+                    mode == ExpertBenchmark::WmmaHybridTournament;
+                if (internal_timing)
+                {
+                    for (size_t path = 0; path < graphs.size(); ++path)
+                    {
+                        timed_graphs.push_back(context.createGraphCapture(stream));
+                        auto &parent = *timed_graphs.back();
+                        const std::array<GPUOrderedTimelineStep,1> steps{{{
+                            .name = dot_candidates[path].name.c_str(),
+                            .kind = GPUOrderedTimelineStepKind::CapturedFragment,
+                            .capture = graphs[path]}}};
+                        ASSERT_TRUE(parent.buildOrderedTimelineTransaction(steps,GPUOrderedTimelineInstrumentation::PerStepEvents));
+                        ASSERT_EQ(parent.nodeCount(),graphs[path]->nodeCount()+2);
+                        ASSERT_EQ(parent.consumeOrderedTimelineTiming().state,GPUOrderedTimelineTimingState::AwaitingLaunch);
+                        std::vector<GPUGraphKernelNodeInfo> source_nodes, parent_nodes;
+                        ASSERT_TRUE(graphs[path]->inspectKernelNodes(source_nodes));
+                        ASSERT_TRUE(parent.inspectKernelNodes(parent_nodes));
+                        ASSERT_FALSE(source_nodes.empty());
+                        ASSERT_EQ(source_nodes.size(),parent_nodes.size());
+                        // Native enumeration order is not a semantic graph edge.
+                        // Compare the complete launch inventory as a multiset;
+                        // replay bytes additionally authenticate cloned arguments.
+                        const auto key = [](const GPUGraphKernelNodeInfo &node) {
+                            return std::tuple{node.name,node.function_identity,node.grid_x,node.grid_y,node.grid_z,
+                                node.block_x,node.block_y,node.block_z,node.static_shared_memory_bytes,
+                                node.dynamic_shared_memory_bytes,node.local_memory_bytes_per_thread};
+                        };
+                        std::multiset<decltype(key(source_nodes.front()))> source_inventory, parent_inventory;
+                        for (const auto &node : source_nodes) { ASSERT_TRUE(node.valid()); source_inventory.insert(key(node)); }
+                        for (const auto &node : parent_nodes) { ASSERT_TRUE(node.valid()); parent_inventory.insert(key(node)); }
+                        ASSERT_EQ(source_inventory,parent_inventory);
+                        ASSERT_TRUE(parent.instantiate());
+                        if (timing_replay && path == 0)
+                        {
+                            auto disabled = context.createGraphCapture(stream);
+                            ASSERT_TRUE(disabled->buildOrderedTimelineTransaction(steps,GPUOrderedTimelineInstrumentation::Disabled));
+                            const auto observation = disabled->consumeOrderedTimelineTiming();
+                            ASSERT_EQ(observation.state,GPUOrderedTimelineTimingState::Disabled);
+                            ASSERT_TRUE(observation.samples.empty());
+                        }
+                        // Dirty replay and omitted-writer controls must act on
+                        // the actual timed executable, whose imported nodes are
+                        // distinct from the source executable's nodes.
+                        graphs[path] = &parent;
+                    }
+                }
+                const auto consume_timing = [&](size_t path) {
+                    const auto observation = graphs[path]->consumeOrderedTimelineTiming();
+                    if (observation.state != GPUOrderedTimelineTimingState::Complete || observation.samples.size() != 1 ||
+                        observation.samples.front().name != dot_candidates[path].name ||
+                        observation.samples.front().kind != GPUOrderedTimelineStepKind::CapturedFragment ||
+                        !std::isfinite(observation.samples.front().elapsed_ms) || observation.samples.front().elapsed_ms <= 0 ||
+                        graphs[path]->consumeOrderedTimelineTiming().state != GPUOrderedTimelineTimingState::AwaitingLaunch)
+                        throw std::runtime_error("grouped timing sample is missing, stale or belongs to another policy");
+                    return observation.samples.front().elapsed_ms*1000.0/repeats;
+                };
                 const auto poison = [&] {
                     for (const char *name : {MoEWorkspaceBuffers::PREFILL_A_INT8,MoEWorkspaceBuffers::PREFILL_A_SCALES,
                             MoEWorkspaceBuffers::PREFILL_GATE,MoEWorkspaceBuffers::PREFILL_UP,
@@ -420,6 +488,10 @@ namespace
                 };
                 const auto verify = [&](int live) {
                     auto replay_ids = route_ids;
+                    const auto drain_publication = [&](void *) {
+                        if (!backend->synchronizeStream(stream,parameter.device.ordinal)) std::terminate();
+                    };
+                    std::unique_ptr<void,decltype(drain_publication)> publication_retirement(&context,drain_publication);
                     for (size_t i = static_cast<size_t>(live)*top_k; i < replay_ids.size(); ++i) replay_ids[i] = -1.0f;
                     ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(),replay_ids.data(),replay_ids.size()*sizeof(float),parameter.device.ordinal,stream));
                     auto reference = expected;
@@ -545,6 +617,12 @@ namespace
                     live_points = {0,1,4,8,12,16,17,31,32,48,64,68,124,128,256,384,512};
                     std::erase_if(live_points,[&](int n) { return n > parameter.live_rows; });
                 }
+                if (timing_replay)
+                {
+                    live_points = {parameter.live_rows,0,1,3,4,7,8,11,12,15,16,17,31,parameter.live_rows,
+                        0,1,16,17,31,parameter.live_rows};
+                    std::erase_if(live_points,[&](int n) { return n > parameter.live_rows; });
+                }
                 for (int live : live_points)
                 {
                     ASSERT_NO_FATAL_FAILURE(verify(live));
@@ -554,15 +632,15 @@ namespace
                     for (int warmup = 0; warmup < 3; ++warmup)
                         for (auto *candidate : graphs) ASSERT_TRUE(candidate->launch());
                     std::vector<std::array<double,sample_count>> times(graphs.size());
-                    for (int sample = 0; sample < sample_count; ++sample)
+                    for (int sample = 0; sample < (timing_replay ? 1 : sample_count); ++sample)
                     for (size_t order = 0; order < graphs.size(); ++order)
                     {
                         const size_t path = (sample + (sample % 2 ? graphs.size()-1-order : order)) % graphs.size();
-                        ASSERT_TRUE(context.recordEventChecked(start,stream));
+                        poison();
                         ASSERT_TRUE(graphs[path]->launch());
                         ASSERT_TRUE(context.recordEventChecked(end,stream));
                         ASSERT_TRUE(context.synchronizeEventChecked(end));
-                        const double us = context.eventElapsedTime(start,end)*1000.0/repeats;
+                        const double us = consume_timing(path);
                         ASSERT_TRUE(std::isfinite(us) && us > 0);
                         times[path][sample] = us;
                         // Inspect this candidate before the next can repair its output.
@@ -571,6 +649,7 @@ namespace
                         ASSERT_EQ(std::memcmp(reference.data(),actual.data(),actual.size()*sizeof(float)),0)
                             << dot_candidates[path].name << " live=" << live;
                     }
+                    if (timing_replay) continue;
                     for (int sample = 0; sample < sample_count; ++sample)
                         if (hybrid)
                             for (size_t path = 0; path < graphs.size(); ++path)
@@ -590,6 +669,7 @@ namespace
                 }
                 ASSERT_NO_FATAL_FAILURE(verify(0));
                 ASSERT_NO_FATAL_FAILURE(verify(parameter.live_rows));
+                if (timing_replay) return;
             }
 #endif
             std::array<float, 9> samples{};
@@ -817,6 +897,9 @@ namespace
     /** @test Time complete hybrid policies across device-published live work. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_HybridCapturedTournament)
     { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaHybridTournament); }
+    /** @test Replay all internal event owners through partial, empty and threshold resets. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_HybridCapturedTimingReplay)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaHybridTimingReplay); }
     /** @test Isolate one N32 complete projection transaction outside canonical timing. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedN32Profile)
     { runExpertPipeline(GetParam(),ExpertBenchmark::Wmma32Profile); }

@@ -19,7 +19,7 @@ The earlier two-anchor NativeQuantised objective is documented separately in
 |---|---|---|
 | Dense quantized prefill | Native prepared-weight adapters select INT8 matrix tiles and preserve source scale arithmetic. | `ROCmNativeQuantisedWmma.hip` already implements all physical decoders on actual gfx1100. The generated production WMMA entries cover only N8192/K2048 at M512 and M1024. Broaden measured exact dispatch for QKV, attention outputs, FFN, shared experts and declared TP participants. |
 | Routed quantized MoE | `CUDAMoEGroupedPrefillKernels.cu` uses `mma.sync.m16n8k32` for grouped projections. | `ROCmMoEGroupedWmma.hip` implements source-exact M16N32/N64 leaves under existing ExpertTiled device admission. Automatic remains ordered Dot4 while measured selection is qualified; RouteOwned retains its admitted sparse/empty domain. |
-| Attention prefill | `CUDAFlashAttentionKernels.cu:1109` uses WMMA half QK with FP32 score accumulation; its general PV is scalar FP32. The active bounded HD256 specialization additionally uses tensor-core PV at `CUDATensorPrefillKernels.cu:328`. | `ROCmFlashAttentionKernels.hip` now has an explicit native four-plane QK candidate preserving the existing half-dot chains and FP32 PV. Automatic remains Dot2 pending admission that avoids the measured short-context loss. |
+| Attention prefill | `CUDAFlashAttentionKernels.cu:1109` uses WMMA half QK with FP32 score accumulation; its general PV is scalar FP32. The active bounded HD256 specialization additionally uses tensor-core PV at `CUDATensorPrefillKernels.cu:328`. | `ROCmFlashAttentionKernels.hip` now has an explicit native four-plane QK candidate preserving the existing half-dot chains and FP32 PV. Automatic installs one-kernel Dot2/WMMA live-prefix selection in the measured FP16 M512 domain. |
 | Q8 router logits | `CUDARouterQ8PrefillDevice.cuh` uses exact INT8 MMA with the router's fixed FP32 tree. | Four/eight/sixteen-wave candidates preserve the ROCm adjacent-leaf tree. Automatic installs Sixteen for whole-row M512/K2560/E512 in both bases; compact-owned rows remain Dot4. |
 | Explicit half-operand floating projection | `CuBLASGemmKernel.cu:380` submits FP16 A/B and FP32 C through the tensor-operation library interface. | `HipBLASGemmKernel.cpp:291` submits half A/B and FP32 C through `hipblasGemmEx`, but the sampled M512/N8192/K2048 gfx1100 dispatch selects a vector FMA implementation. Library API admission does not establish matrix instruction use. |
 
@@ -34,7 +34,7 @@ production dispatch: GPU prepared quantized weights use NativeQuantised adapters
 |---|---|---|---|
 | Broader dense dispatch | Bound installed-Auto/WMMA collector and selective publisher | Core-table ownership replay, eight binding and 16 decision regressions pass | 84 cells complete; 68 candidate keys gain1.25–2.04×; profile/install pending |
 | Grouped MoE | Wave64 M16N32/N64 plus explicit whole-expert row floors4/8/12/16; all physical decoders | Serial, promoted, all-format mixed-writer, threshold/reset and split/sliced-down replay pass | Clean full-live N32 gains 1.04–1.30× across five anchors. Hybrid power-law and sparse replay regress; Automatic remains Dot4 |
-| Attention | Four-plane QK plus one-kernel live-prefix adaptive candidate | All-format, threshold/ring/partial/reset and internal timing-owner replays pass | Adaptive fixed-M51264K gains1.158×/1.138×; doubling1.989×/1.987×. Short dense loses0.2–0.4%; Automatic remains Dot2 |
+| Attention | Automatic one-kernel Dot2/WMMA live-prefix selection in the measured FP16 M512 domain | Actual Auto, immutable exclusions, counters, all-format, threshold/ring/partial/reset and internal timing-owner replays pass | Actual Auto64K gains1.155×/1.138×; doubling1.998×/1.993×. Short prefixes near parity; dense1023 costs0.27% |
 | Q8 router | Automatic Sixteen-wave tile for exact whole-row M512/K2560/E512; explicit 4/8/16-wave candidates retained | 14 GPU feature cases, five pure policy cases and both timing owners pass; actual Auto template, ownership and submission counters authenticated | Actual Auto wins all 12 measured prefix/basis cells: full512 gains 2.744×/2.551×; fresh profile has zero spills |
 | Floating half GEMM | Existing production hipBLAS path; sampled native matrix gap confirmed | Three retained graph replays pass, each containing cast and vendor GEMM | Loaded bytes/ISA authenticated; complete Release cast+GEMM timing pending |
 
@@ -53,55 +53,63 @@ Disabling each native projection independently makes that reference fail, provin
 the recorded kernels contribute. Split replay covers both tiles, all 21 source
 formats, whole-expert phases and compact column-owned down slices.
 
-The live-K producer avoids unused second-stage decoding/stores. All 91 focused
-GPU cases and the device-free admission owner pass. The final clean Release
-run spans five cases ×17 live counts ×11 policies ×31 samples of eight complete
-operations, with exact profile/timing producer hashes. At 512 live rows, pure
-N32 gains 1.295×/1.162×/1.043× for Qwen uniform/hotset/power-law, and
-1.068×/1.076× for compact Q4_0/IQ2_S. Hybrid floors add launch/work overhead:
-power-law N32/floor8 loses at 0.911×, and sparse uniform replay also regresses.
-Automatic stays Dot4. See [admission investigation](GFX1100_GROUPED_WMMA_ADMISSION.md)
-for ownership, omitted-writer controls, complete timings and remaining work.
+The live-K producer avoids unused second-stage decoding/stores. All91 focused
+GPU cases and device-free admission checks passed at the grouped checkpoint.
+The new internal-event timing replay also passes. It validates identical imported
+kernel inventory, two internal events, stale-observation rejection, poisoned
+storage and omitted-writer controls against the actual measured parent.
 
-Rebuilt native Q4_0 gate/up profiles each isolate one dispatch across seven
-counter passes. N32/N64 use 53/54 logical VGPRs (56 allocated), 54 logical SGPRs,
-3392/5568-byte static LDS and wave64; both have zero scratch/spills and two INT8
-WMMA instruction sites. Positive activity is authenticated against loaded code
-objects, and original AUTO power is restored. Current evidence is in
-`grouped-hybrid-{n32,n64}-profile/`, bound to
-`grouped-hybrid-producer-receipt.json`. Clean timing is in `grouped-hybrid-receipt.json`; profiles do not supply timing labels.
+Five clean per-case runs contain17 live counts ×11 policies ×31 samples of eight
+complete operations:28,985 sample rows. Full-live N32 gains1.302/1.160/1.045× for
+Qwen uniform/hotset/power-law and1.049/1.043× for compact Q4_0/IQ2_S. The two-family
+hybrid still loses: power-law floor8 is0.907× and sparse uniform floor16 is
+0.923–0.938×. Automatic remains Dot4. Next, replace that hybrid with one consumer
+that selects Dot4/WMMA from the device-owned whole-expert count, then qualify its
+work-size rule. [Investigation](GFX1100_GROUPED_WMMA_ADMISSION.md) retains the
+separate old external-event measurements and current internal-event evidence.
 
-Attention's adaptive candidate uses one retained query kernel and a device-uniform
-choice: WMMA for complete linear M512 prefixes with KV1024–65536, Dot2 otherwise.
-Its explicit immutable domain is FP16/B1/HD256/capacity65536 with Q/KV12/2 or8/1.
-Automatic stays Dot2. [Qualification](GFX1100_ATTENTION_ADAPTIVE_QK.md) records
-admission, arithmetic, timing ownership, resources and remaining work.
+Current grouped profiles match the internal timing producer. Seven isolated
+passes each authenticate native PCI/UUID, positive activity, zero scratch/spills
+and original AUTO restoration. N32/N64 use53/54 logical VGPRs,54 SGPRs,
+3392/5568-byte LDS,wave64 and two INT8 WMMA sites. The ordered IQ2_S leaf uses
+56VGPR/78SGPR/480-byte LDS and no matrix instructions. See
+`grouped-internal-{n32,n64,ordered}-profile/summary.json` and
+`grouped-internal-receipt.json`; overlapping attempts remain rejected.
 
-Final Q/K timings use internal singleton timeline events around complete retained
+Attention Automatic resolves the measured immutable domain once at capture:
+FP16/B1/M512/HD256/capacity65536,Q/KV12/2 or8/1, full causal query scheduling and
+register-owned scores. One retained kernel chooses WMMA for complete linear
+prefixes at KV1024–65536 and Dot2 for short, partial or ring work. Unmeasured
+immutable domains remain Dot2. Submission counters identify the actual captured
+engine/branch policy and stay unchanged during replay. Existing graph ownership
+and identity cover this deterministic selection; no host live-count cache is added.
+[Qualification](GFX1100_ATTENTION_ADAPTIVE_QK.md) separates actual Auto evidence
+from the earlier explicit candidate.
+
+Fresh actual-Auto timing uses internal events around complete retained
 producer/query batches:16 operations below2048 keys, one thereafter. Every
-sample poisons and independently observes parameter/output bytes outside timing.
-Twenty threshold/reset transitions plus64K/reset certify the event owner; stale
-samples are rejected. No compiler or competing GPU work overlaps collection.
+sample poisons and independently observes parameter/output bytes.26 lifecycle
+cells/806 pairs include threshold1023/1024/1025,8193,64K,reset512 and regrowth.
+No compiler/profiler/inference work overlaps collection; producer hashes match.
 
-| Heads | Dot2 at64K | Adaptive | Ratio |32K→64K growth| Affine R² |
+| Heads | Dot2 at64K | Automatic | Ratio |32K→64K growth| Affine R² |
 |---|---:|---:|---:|---:|---:|
-| Dense Q12/KV2 |46.216ms|39.908ms|1.158×|1.989×|0.999931|
-| MoE Q8/KV1 |34.855ms|30.641ms|1.138×|1.987×|0.999967|
+| Dense Q12/KV2 |47.073ms|40.747ms|1.155×|1.998×|0.999941|
+| MoE Q8/KV1 |35.571ms|31.269ms|1.138×|1.993×|0.999981|
 
-The registered fixed-query gate requires R²≥0.995 and last doubling≤2.2 across
-all seven ascending powers from1K to64K. Threshold1023/1025,8193,reset512 and
-regrowth1024 remain separate. Short dense ratios0.9960–0.9978 still show a small
-regression; MoE short cells are near parity. No universal or installed Auto win
-is claimed. Original launch-inclusive evidence is archived separately.
+The actual-Auto fixed-query gate passes R²≥0.995 and last doubling≤2.2 across
+1K–64K. Short prefixes remain near Dot2; dense1023 retains0.27% median overhead,
+so no universal per-size win is claimed. Three host policy registrations pass
+2.53s and six native feature registrations pass168.66s, including all immutable
+exclusions, independent engine expectations, reset/ring/partial bytes and counters.
 
-Both guarded HIP targets compile. Exact512/65536 profiles use96VGPR/50SGPR,
-16KiB dynamic LDS,256threads,wave64 and zero scratch/spills. Seven isolated
-counter passes have positive activity; both restore original AUTO power and
-match final timing files. Sixteen static WMMA sites do not claim that short
-replays take the matrix branch. `attention-adaptive-scaling-receipt.json` binds
-26 lifecycle cells/806 paired samples; `attention-adaptive-{512,65536}-profile/`
-holds loaded ISA/counters. Functional and timing regressions are explicit
-production-preflight entries; only focused/feature gates run for this task.
+Both guarded HIP targets compile in Release/Integration. Exact512/65536 Auto
+profiles use96VGPR/50SGPR,16KiB dynamic LDS,256threads,wave64 and zero scratch/spills.
+Seven isolated passes authenticate loaded code, PCI/UUID, positive activity and
+restored AUTO power. Sixteen static WMMA sites do not imply that512 executes WMMA.
+Current evidence is `attention-automatic-scaling-{receipt,summary}.json` and
+`attention-automatic-{512,65536}-profile/`. All focused replay registrations are
+explicit in production preflight; only focused/feature gates ran for this task.
 
 Router Automatic now resolves an immutable engine/tile from original capacity,
 K/E, basis, ownership and cached hardware. Only whole-row M512/K2560/E512 selects
@@ -139,8 +147,8 @@ All68 runtime keys have profitable WMMA candidates, gaining1.25–2.04×. Six
 focused registered gates pass;168 winner/baseline profiles and installed-Auto
 qualification remain. [Evidence and protocol](GFX1100_DENSE_PREFILL_CANDIDATE_SCOPE.md).
 
-The floating audit authenticates the runtime-dumped vendor code object against
-the installed rocBLAS image, including all 17 traced symbols/entry offsets:
+The floating audit authenticates the dumped rocBLAS object and all17 traced
+symbols/offsets:
 SHA256 `5dd5b5d0e473562279a87437587c5eb5adf32ab665796b242aaa8538ce11461b`.
 Its selected kernel is wave32 with 47 logical VGPRs, 38 SGPRs, 1536 bytes LDS,
 zero spills/private storage and no WMMA/MFMA instructions. The actual kernel
@@ -149,9 +157,6 @@ labels gfx906. Join graph correlations to kernel dispatches for device identity.
 See local `floating-half-authenticated-profile/derived/` for the dumped image,
 graph joins, ISA and resource evidence. This Integration trace is a correctness
 and ISA observation, not a Release timing qualification.
-
-The local qualification
-scope remains the user-authorized focused tests and feature suite.
 
 ## Remaining implementation constraints
 

@@ -106,9 +106,13 @@ Seven exact-dispatch passes report 9568 waves and positive GPU/memory activity.
 Its ISA contains no WMMA instructions, as expected for the ordered producer.
 See `grouped-hybrid-ordered-profile/summary.json`; AUTO power was restored.
 
-## Clean complete-operation tournament
+## Archived external-event tournament
 
-`grouped-hybrid-receipt.json` qualifies the final Release producer with no
+These older samples include the host submission boundary between the external
+start event and graph launch. They remain historical evidence; the internal-event
+tournament below owns current candidate comparisons.
+
+`grouped-hybrid-receipt.json` binds its Release producer with no
 compiler overlap, unchanged source/binary hashes, and exact equality to the
 profile producer receipt. The run took 202.228 s. It contains five cases,
 17 live-row points, eleven policies and 31 interleaved samples of eight complete
@@ -141,3 +145,61 @@ the full-live intervals and selected partial points. The next optimization must
 reduce cold-work and inactive-launch costs while retaining the demonstrated
 exclusive writers and exact arithmetic. Automatic stays Dot4 until that work
 has its own clean complete-operation evidence.
+
+## Internal-event timing and replay
+
+The timing owner now wraps each retained eight-operation source graph in one
+`GPUOrderedTimelineStep` with `PerStepEvents`. It verifies an identical complete
+kernel inventory and exactly two added event nodes. Both numerical replay and
+omitted-writer controls execute the imported nodes in that measured parent.
+Each sample poisons scratch, routing, directory and output storage, launches one
+parent, consumes one named internal interval, and observes bytes before another
+policy can repair the result. The terminal join and host observation remain
+outside the interval; a second consume must report no pending observation.
+Graph parents retire before their source fragments and failed observation drains
+terminate before any asynchronous host destination can retire.
+
+`V2_Integration_ROCmGroupedWmmaTimingReplay` explicitly joins production preflight.
+Its Q4_0 and Qwen power-law fixtures pass twenty empty/partial/threshold/reset
+transitions, stale-event rejection and independent omitted-writer controls.
+The focused registered run passed in25.15s. Both guarded HIP targets compile.
+
+The current clean corpus contains five individually qualified cases,17 live
+counts,11 policies and31 samples of eight complete operations:28,985 sample rows.
+Every case authenticates the same binary/core/source hashes and no overlapping
+build, profiler or inference process. The first whole-corpus attempt passed all
+native byte checks but overlapped external integration jobs; its measurements
+remain rejected in `grouped-internal-overlap-rejected/`.
+
+| Full-live workload | Dot4 µs | N32 µs | Pure N32 | N32/floor8 | N32/floor16 |
+|---|---:|---:|---:|---:|---:|
+| Qwen uniform shard2 | 926.970 | 712.057 | 1.3018 | 1.2626 | 1.2617 |
+| Qwen hotset shard2 | 752.857 | 648.761 | 1.1605 | 1.1275 | 1.1276 |
+| Qwen power-law shard2 | 945.109 | 904.754 | 1.0446 | 0.9074 | 0.9135 |
+| Compact Q4_0 | 295.553 | 281.808 | 1.0488 | 1.0171 | 1.0174 |
+| Compact IQ2_S | 329.498 | 315.773 | 1.0435 | 1.0053 | 1.0058 |
+
+The paired bootstrap intervals exclude parity for all five pure-N32 full-live
+wins. The same timing boundary confirms that the existing hybrid is unsuitable
+for installation: power-law floor8 is0.9074× and uniform live64/128/256 floor16 is
+0.9234/0.9239/0.9376×. Empty uniform native/hybrid replay is0.9125/0.8326×.
+
+`grouped-internal-receipt.json`, `grouped-internal-tournament.log` and
+`grouped-internal-summary.json` own these comparisons. Exact native/ordered
+profiles now match this unchanged producer. Each has seven isolated dispatch
+counter passes, positive activity, the authenticated gfx1100 PCI/UUID, zero
+scratch/spills and restored AUTO power. N32/N64 retain53/54 logical VGPRs,
+54 SGPRs and3392/5568 static LDS bytes. Their memory activity is68.25%/68.40%,
+L2 hit80.44%/75.89%, and both report8448 waves with no LDS conflicts. The ordered
+IQ2_S M12N256 leaf retains56 VGPRs,78 SGPRs and480 LDS bytes; it has no WMMA
+instructions. See `grouped-internal-{n32,n64,ordered}-profile/summary.json`.
+Overlapped attempts remain preserved in `grouped-internal-profile-rejected/`
+and are never promoted.
+
+The requested work-size-aware runtime policy therefore needs a cheaper grouped
+implementation. The next candidate shares one16-row directory and one projection
+consumer: it reads the authoritative whole-expert count once, then selects
+signed Dot4 or WMMA within that kernel. Both branches must feed the same existing
+scale/correction helpers and preserve source-owned K partitions. Its new Dot4
+layout and complete-operation economy require qualification before Automatic can
+select it. Automatic currently remains the established Dot4 implementation.

@@ -201,6 +201,51 @@ namespace
         std::string original_;
     };
 
+    /** @brief Scope only the existing collector policy; restore original optional environment values. */
+    class QKSubmissionObservation final {
+        std::optional<std::string> json_, filter_;
+        /**
+         * @param name One of the two collector environment keys owned by this scope.
+         * @return Exact prior value, distinguishing an empty value from absence.
+         */
+        static std::optional<std::string> prior(const char *name) {
+            const char *value = std::getenv(name);
+            return value ? std::optional<std::string>{value} : std::nullopt;
+        }
+        /**
+         * @brief Restore exactly the saved value or original absence; failed restoration is fatal.
+         * @param name Collector environment key being retired.
+         * @param value Original value, or absence to restore with unsetenv.
+         */
+        static void restore(const char *name, const std::optional<std::string> &value) {
+            const int result = value ? setenv(name,value->c_str(),1) : unsetenv(name);
+            if (result != 0) std::terminate();
+        }
+    public:
+        /** @brief Select accepted host submissions without enabling timers or another domain. */
+        QKSubmissionObservation()
+            : json_(prior("LLAMINAR_PERF_STATS_JSON")),
+              filter_(prior("LLAMINAR_PERF_STATS_FILTER")) {
+            if (setenv("LLAMINAR_PERF_STATS_JSON","1",1) != 0 ||
+                setenv("LLAMINAR_PERF_STATS_FILTER","gpu_graph_inventory.rocm_fa2_qk_kernel_submissions",1) != 0) {
+                restore("LLAMINAR_PERF_STATS_FILTER",filter_);
+                restore("LLAMINAR_PERF_STATS_JSON",json_);
+                throw std::runtime_error("Cannot select Q/K submission observation environment");
+            }
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
+            PerfStatsCollector::reset();
+        }
+        /** @brief Retire fixture evidence, restore exact environment absence/values and reload it. */
+        ~QKSubmissionObservation() {
+            PerfStatsCollector::reset();
+            restore("LLAMINAR_PERF_STATS_FILTER",filter_);
+            restore("LLAMINAR_PERF_STATS_JSON",json_);
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
+        }
+        QKSubmissionObservation(const QKSubmissionObservation&) = delete;
+        QKSubmissionObservation& operator=(const QKSubmissionObservation&) = delete;
+    };
+
     const std::string TEST_MODEL_PATH = "models/qwen2.5-0.5b-instruct-q4_0.gguf";
 
     // ============================================================================
@@ -7621,6 +7666,9 @@ struct NativeWmmaQKCase
     int head_start = 0;
     int repetition = 0;
     ROCmFA2KVFormat format = ROCmFA2KVFormat::FP16;
+    int window = -1; ///< Immutable window, independently excluding adaptive Auto.
+    bool masked = false; ///< Retain an explicit zero additive-mask operand.
+    bool causal = true; ///< Immutable visibility contract.
 };
 
 /** @return An admitted native gfx1100 ordinal, or -1 when this proof is unavailable. */
@@ -7642,7 +7690,8 @@ int nativeWmmaQKDevice()
  * @param lifecycle Device-published pairs of live KV length and logical query rows.
  * @param context_parallel Also retain the canonical context producer/reducer graphs.
  * @param half_extrema Include both largest finite native-half value banks.
- * @param candidate Explicit native or adaptive Q/K engine compared against Dot2.
+ * @param candidate Requested automatic/native/adaptive Q/K engine compared against Dot2.
+ * @param expected_automatic Independently authored automatic query-engine expectation; mandatory for Auto.
  *
  * Each graph owns a distinct output and context-summary bank. Explicit Dot2
  * is the arithmetic authority even after Automatic installs measured WMMA.
@@ -7652,10 +7701,13 @@ int nativeWmmaQKDevice()
  */
 void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
     std::span<const std::pair<int,int>> lifecycle, bool context_parallel, bool half_extrema,
-    llaminar2::rocm::FlashAttentionQKEngine candidate = llaminar2::rocm::FlashAttentionQKEngine::WmmaFourPlane)
+    llaminar2::rocm::FlashAttentionQKEngine candidate = llaminar2::rocm::FlashAttentionQKEngine::WmmaFourPlane,
+    llaminar2::rocm::FlashAttentionQKEngine expected_automatic = llaminar2::rocm::FlashAttentionQKEngine::Automatic)
 {
     namespace policy = llaminar2::rocm::fa2_policy;
     using Engine = llaminar2::rocm::FlashAttentionQKEngine;
+    const bool automatic = candidate == Engine::Automatic;
+    ASSERT_FALSE(automatic && expected_automatic == Engine::Automatic);
     constexpr int width = 256;
     const auto device = DeviceId::rocm(ordinal);
     auto &worker = GPUDeviceContextPool::instance().getContext(device);
@@ -7664,6 +7716,9 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
         SCOPED_TRACE(::testing::Message() << "M=" << c.rows << " capacity=" << c.capacity
             << " Q=" << c.query_heads << " KV=" << c.kv_heads << " batch=" << c.batch
             << " format=" << rocmFA2KVFormatName(c.format));
+        // Auto explicitly shadows this diagnostic request while recording.
+        // Existing captured graphs subsequently ignore every host TLS scope.
+        llaminar2::rocm::ScopedFlashAttentionQKEngine enclosing(Engine::WmmaFourPlane);
         auto *backend = getBackendFor(device);
         void *const stream = worker.defaultStream();
         const auto native_stream = static_cast<hipStream_t>(stream);
@@ -7684,13 +7739,19 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
         std::array<std::vector<float>,4> observed;
         for (auto &bank : observed) bank.resize(output_elements);
         std::vector<float> linear_reference(output_elements), repeated(output_elements);
-        ScopedHIPAllocation dq, dk, dv, parameters;
+        ScopedHIPAllocation dq, dk, dv, parameters, mask;
         std::array<ScopedHIPAllocation,4> outputs;
         std::array<ScopedHIPAllocation,2> partial, partial_m, partial_l;
         ASSERT_TRUE(dq.allocate(query.size()*sizeof(float)));
         ASSERT_TRUE(dk.allocate(encoded_keys.size()));
         ASSERT_TRUE(dv.allocate(encoded_keys.size()));
         ASSERT_TRUE(parameters.allocate(sizeof(attention::AttentionDeviceParams)));
+        if (c.masked)
+        {
+            const size_t mask_bytes = size_t(c.rows)*c.capacity*sizeof(float);
+            ASSERT_TRUE(mask.allocate(mask_bytes));
+            ASSERT_EQ(hipMemsetAsync(mask.get(),0,mask_bytes,native_stream),hipSuccess);
+        }
         const int graph_count = context_parallel ? 4 : 2;
         for (int path = 0; path < graph_count; ++path)
             ASSERT_TRUE(outputs[path].allocate(output_elements*sizeof(float)));
@@ -7731,7 +7792,7 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
                 {
                     return entry(dq.as<float>(),dk.get(),dv.get(),outputs[path].as<float>(),
                         partial[bank].as<float>(),partial_m[bank].as<float>(),partial_l[bank].as<float>(),
-                        c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,true,-1,0,params,nullptr,
+                        c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,c.causal,c.window,0,params,mask.as<float>(),
                         policy::kROCmFA2CanonicalContextPartitionKeys,plan.max_context_partitions,
                         plan.context_partition_slots,plan.context_phase_block_slots,1,
                         plan.reducer_dimension_wavefronts,plan.reducer_block_slots,stream,c.head_start,c.repetition);
@@ -7748,16 +7809,16 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
             {
             case ROCmFA2KVFormat::FP32:
                 return hipFlashAttn_prefill_fa2(dq.as<float>(),dk.as<float>(),dv.as<float>(),outputs[path].as<float>(),
-                    c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,true,-1,0,params,nullptr,stream,c.head_start,c.repetition);
+                    c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,c.causal,c.window,0,params,mask.as<float>(),stream,c.head_start,c.repetition);
             case ROCmFA2KVFormat::FP16:
                 return hipFlashAttn_prefill_fa2_fp16(dq.as<float>(),dk.get(),dv.get(),outputs[path].as<float>(),
-                    c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,true,-1,0,params,nullptr,stream,c.head_start,c.repetition);
+                    c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,c.causal,c.window,0,params,mask.as<float>(),stream,c.head_start,c.repetition);
             case ROCmFA2KVFormat::BF16:
                 return hipFlashAttn_prefill_fa2_bf16(dq.as<float>(),dk.get(),dv.get(),outputs[path].as<float>(),
-                    c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,true,-1,0,params,nullptr,stream,c.head_start,c.repetition);
+                    c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,c.causal,c.window,0,params,mask.as<float>(),stream,c.head_start,c.repetition);
             case ROCmFA2KVFormat::Q8_1:
                 return hipFlashAttn_prefill_fa2_q8_1(dq.as<float>(),dk.get(),dv.get(),outputs[path].as<float>(),
-                    c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,true,-1,0,params,nullptr,stream,c.head_start,c.repetition);
+                    c.batch,c.rows,c.capacity,c.query_heads,c.kv_heads,width,c.causal,c.window,0,params,mask.as<float>(),stream,c.head_start,c.repetition);
             }
             return -1;
         };
@@ -7768,6 +7829,13 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
         const auto initial_values = encodeROCmFA2KV(values,c.format,width);
         ASSERT_TRUE(backend->hostToDevice(dv.get(),initial_values.data(),initial_values.size(),ordinal,stream));
         ASSERT_TRUE(backend->hostToDevice(dq.get(),query.data(),query.size()*sizeof(float),ordinal,stream));
+        const auto submissions = [&](const char *engine_name = nullptr) {
+            double total = 0;
+            for (const auto &record : PerfStatsCollector::snapshot({"gpu_graph_inventory"}))
+                if (record.name == "rocm_fa2_qk_kernel_submissions" &&
+                    (!engine_name || record.tags.at("qk_engine") == engine_name)) total += record.value;
+            return total;
+        };
         for (int path = 0; path < graph_count; ++path)
         {
             llaminar2::rocm::ScopedFlashAttentionQKEngine engine(path % 2 ? candidate : Engine::OrderedDot2);
@@ -7775,11 +7843,16 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
             ASSERT_TRUE(backend->synchronizeStream(stream,ordinal));
             graphs[path] = worker.createGraphCapture(stream);
             ASSERT_NE(graphs[path],nullptr);
+            const Engine expected_engine = path % 2 == 0 ? Engine::OrderedDot2 : automatic
+                ? (path >= 2 ? Engine::OrderedDot2 : expected_automatic) : candidate;
+            const char *expected_name = llaminar2::rocm::flashAttentionQKEngineName(expected_engine);
+            const double before = automatic ? submissions(expected_name) : 0;
             ScopedBackendGraphCapture capture(worker,*graphs[path],"native QK engine byte replay");
             ASSERT_TRUE(capture.begin());
             const int status = launch(path);
             capture.finish();
             ASSERT_EQ(status,0);
+            if (automatic) ASSERT_EQ(submissions(expected_name)-before,path >= 2 ? 2.0 : 1.0);
             std::vector<GPUGraphKernelNodeInfo> nodes;
             ASSERT_TRUE(graphs[path]->inspectKernelNodes(nodes));
             ASSERT_EQ(nodes.size(),path >= 2 ? 3u : 1u);
@@ -7791,15 +7864,34 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
                 ++producers;
                 const bool wmma = node.name.find("Lb1EE") != std::string::npos ||
                     node.name.find(", true>(") != std::string::npos;
-                ASSERT_EQ(wmma,path % 2 != 0) << node.name;
+                ASSERT_EQ(wmma,expected_engine != Engine::OrderedDot2) << node.name;
                 const bool adaptive = node.name.find("FlashAttentionQKBranchPolicyE1ELb1EE") != std::string::npos ||
                     node.name.find("FlashAttentionQKBranchPolicy)1, true>(") != std::string::npos;
-                ASSERT_EQ(adaptive,path % 2 != 0 && candidate == Engine::ContextAdaptive) << node.name;
+                ASSERT_EQ(adaptive,expected_engine == Engine::ContextAdaptive) << node.name;
                 ASSERT_EQ(node.block_x,256u) << node.name;
                 ASSERT_GT(node.max_active_blocks_per_sm,0u) << node.name;
             }
             ASSERT_GE(producers,1);
             ASSERT_TRUE(graphs[path]->instantiate());
+        }
+        const double captured_submissions = automatic ? submissions() : 0;
+        if (automatic)
+        {
+            bool found = false;
+            for (const auto &record : PerfStatsCollector::snapshot({"gpu_graph_inventory"}))
+                if (record.name == "rocm_fa2_qk_kernel_submissions" &&
+                    record.tags.at("qk_engine") == llaminar2::rocm::flashAttentionQKEngineName(expected_automatic))
+                {
+                    found = true;
+                    EXPECT_EQ(record.tags.at("visible_kv_heads"),std::to_string(c.kv_heads));
+                    EXPECT_EQ(record.tags.at("head_start"),std::to_string(c.head_start));
+                    EXPECT_EQ(record.tags.at("replicated_gqa_n_rep"),std::to_string(c.repetition));
+                    EXPECT_EQ(record.tags.at("query_rows"),std::to_string(c.rows));
+                    EXPECT_EQ(record.tags.at("kv_capacity"),std::to_string(c.capacity));
+                    EXPECT_EQ(record.tags.at("qk_branch_policy"),expected_automatic == Engine::ContextAdaptive
+                        ? "device_live_prefix" : "unconditional");
+                }
+            ASSERT_TRUE(found);
         }
         const auto poison = [&](int path)
         {
@@ -7871,9 +7963,60 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
                 }
             }
         }
+        if (automatic) EXPECT_EQ(submissions(),captured_submissions)
+            << "retained replay must not fabricate host kernel submissions";
     });
 }
 } // namespace
+
+/** @test Automatic records one adaptive kernel and crosses its live threshold without recapture. */
+TEST(ROCmFlashAttentionAutomaticQK, CapturedThresholdResetCountersAndStorageByteExact)
+{
+    const int ordinal = nativeWmmaQKDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    QKSubmissionObservation evidence;
+    ASSERT_TRUE(PerfStatsCollector::isRecordFamilyEnabled(
+        "gpu_graph_inventory", "rocm_fa2_qk_kernel_submissions"));
+    constexpr std::array<std::pair<int,int>,11> lifecycle{{{512,512},{1023,512},{1024,512},
+        {1025,512},{8192,512},{8193,512},{65536,512},{65536,17},{512,1},{512,512},{1024,512}}};
+    for (const auto [query_heads,kv_heads] : std::array<std::pair<int,int>,2>{{{12,2},{8,1}}})
+    {
+        PerfStatsCollector::reset();
+        runNativeWmmaQKParity(ordinal,{512,65536,query_heads,kv_heads},lifecycle,true,false,
+            llaminar2::rocm::FlashAttentionQKEngine::Automatic,
+            llaminar2::rocm::FlashAttentionQKEngine::ContextAdaptive);
+        if (::testing::Test::HasFatalFailure()) return;
+    }
+    PerfStatsCollector::reset();
+}
+
+/** @test Every neighboring immutable Auto exclusion records ordered arithmetic and preserves replay bytes. */
+TEST(ROCmFlashAttentionAutomaticQK, CapturedImmutableExclusionsByteExact)
+{
+    const int ordinal = nativeWmmaQKDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    QKSubmissionObservation evidence;
+    ASSERT_TRUE(PerfStatsCollector::isRecordFamilyEnabled(
+        "gpu_graph_inventory", "rocm_fa2_qk_kernel_submissions"));
+    std::vector<NativeWmmaQKCase> cases{{511,65536,12,2},{513,65536,12,2},
+        {512,65535,12,2},{512,65537,12,2},{512,65536,12,2,2},
+        {512,65536,6,1},{512,65536,12,4,1,12,6},{512,65536,12,2,1,0,6}};
+    for (auto format : {ROCmFA2KVFormat::FP32,ROCmFA2KVFormat::BF16,ROCmFA2KVFormat::Q8_1})
+        cases.push_back({512,65536,12,2,1,0,0,format});
+    cases.push_back({512,65536,12,2,1,0,0,ROCmFA2KVFormat::FP16,31});
+    cases.push_back({512,65536,12,2,1,0,0,ROCmFA2KVFormat::FP16,-1,true});
+    cases.push_back({512,65536,12,2,1,0,0,ROCmFA2KVFormat::FP16,-1,false,false});
+    for (const auto &c : cases)
+    {
+        PerfStatsCollector::reset();
+        const std::array<std::pair<int,int>,3> lifecycle{{{1024,c.rows},{1025,17},{1024,c.rows}}};
+        runNativeWmmaQKParity(ordinal,c,lifecycle,false,false,
+            llaminar2::rocm::FlashAttentionQKEngine::Automatic,
+            llaminar2::rocm::FlashAttentionQKEngine::OrderedDot2);
+        if (::testing::Test::HasFatalFailure()) return;
+    }
+    PerfStatsCollector::reset();
+}
 
 /** @test One adaptive graph preserves bytes through threshold, partial, ring and reset changes. */
 TEST(ROCmFlashAttentionAdaptiveQK, CapturedThresholdResetAndStorageByteExact)

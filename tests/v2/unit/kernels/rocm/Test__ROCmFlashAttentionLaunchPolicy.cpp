@@ -7,6 +7,7 @@
  * 256K context regime. Register-score admission also proves exact native-format,
  * visibility, LDS and workspace identity. No HIP runtime or accelerator is used.
  * Adaptive Q/K replay covers published threshold, reset and storage boundaries.
+ * Automatic admission independently excludes every unmeasured immutable field.
  */
 
 #include <gtest/gtest.h>
@@ -19,6 +20,7 @@
 #include <limits>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace
 {
@@ -35,6 +37,67 @@ namespace
     using llaminar2::rocm::fa2_policy::selectROCmFA2PrefillParallelPlan;
     using llaminar2::rocm::fa2_policy::selectROCmFA2ReducerWavefronts;
     using llaminar2::rocm::fa2_policy::selectROCmFA2Tile;
+
+    /** @brief Automatic Q/K selection depends only on the measured immutable domain. */
+    TEST(ROCmFlashAttentionLaunchPolicy, AutomaticQKImmutableDomainTotality)
+    {
+        using namespace llaminar2;
+        using namespace llaminar2::rocm;
+        const auto tile = selectROCmFA2Tile(256,16384,0,ROCmFA2PrefillPhysicalMode::QuerySequence,
+            policy::ROCmFA2ScoreStorage::RegisterOwnedXorTile);
+        ASSERT_TRUE(tile.valid);
+        const attention::AttentionPrefillCaptureGeometry measured{
+            .batch_size=1,.query_rows=512,.local_query_heads=12,.head_dim=256,.kv_capacity=65536,
+            .native_kv_format=TensorType::FP16,.visibility=attention::AttentionVisibilityPolicy::CausalFullContext,
+            .visible_kv_heads=2};
+        const auto select = [&](FlashAttentionQKEngine engine, const auto &geometry, const auto &physical_tile,
+                                std::string_view isa="gfx1100",
+                                FlashAttentionQKParameterSource source=FlashAttentionQKParameterSource::DevicePublication,
+                                int direct_limit=0) {
+            return resolveFlashAttentionQKEngine(engine,isa,geometry,physical_tile,source,direct_limit);
+        };
+        for (const auto [heads,kv_heads] : std::array<std::pair<int,int>,2>{{{12,2},{8,1}}})
+        for (int rows=1; rows<=2048; ++rows)
+        {
+            auto geometry=measured;geometry.local_query_heads=heads;geometry.visible_kv_heads=kv_heads;geometry.query_rows=rows;
+            const auto actual=select(FlashAttentionQKEngine::Automatic,geometry,tile);
+            ASSERT_TRUE(actual);
+            EXPECT_EQ(*actual,rows==512 ? FlashAttentionQKEngine::ContextAdaptive : FlashAttentionQKEngine::OrderedDot2);
+        }
+        const auto excluded = [&](auto geometry, auto physical_tile, std::string_view isa="gfx1100",
+                                  FlashAttentionQKParameterSource source=FlashAttentionQKParameterSource::DevicePublication,
+                                  int direct_limit=0) {
+            EXPECT_EQ(select(FlashAttentionQKEngine::Automatic,geometry,physical_tile,isa,source,direct_limit),
+                FlashAttentionQKEngine::OrderedDot2);
+            EXPECT_FALSE(select(FlashAttentionQKEngine::ContextAdaptive,geometry,physical_tile,isa,source,direct_limit));
+            EXPECT_EQ(select(FlashAttentionQKEngine::OrderedDot2,geometry,physical_tile,isa,source,direct_limit),
+                FlashAttentionQKEngine::OrderedDot2);
+        };
+        for (int batch : {2,3,4}) { auto g=measured;g.batch_size=batch;excluded(g,tile); }
+        for (int capacity : {512,1024,65535,65537,131072}) { auto g=measured;g.kv_capacity=capacity;excluded(g,tile); }
+        for (int width : {32,64,128,192,255,257}) { auto g=measured;g.head_dim=width;excluded(g,tile); }
+        for (auto format : {TensorType::FP32,TensorType::BF16,TensorType::Q8_1})
+        { auto g=measured;g.native_kv_format=format;excluded(g,tile); }
+        for (const auto [heads,kv_heads] : std::array<std::pair<int,int>,4>{{{12,1},{8,2},{6,1},{24,4}}})
+        { auto g=measured;g.local_query_heads=heads;g.visible_kv_heads=kv_heads;excluded(g,tile); }
+        { auto g=measured;g.head_start=12;excluded(g,tile); }
+        { auto g=measured;g.replicated_gqa_n_rep=6;excluded(g,tile); }
+        { auto g=measured;g.visibility=attention::AttentionVisibilityPolicy::General;excluded(g,tile); }
+        { auto t=tile;t.schedule=ROCmFA2PrefillPhysicalMode::KeyValueContext;excluded(measured,t); }
+        { auto t=tile;t.score_storage=policy::ROCmFA2ScoreStorage::SharedMatrix;excluded(measured,t); }
+        { auto t=tile;t.query_rows=32;excluded(measured,t); }
+        { auto t=tile;t.kv_rows=32;excluded(measured,t); }
+        { auto t=tile;t.threads_per_row=4;excluded(measured,t); }
+        excluded(measured,tile,"gfx906");excluded(measured,tile,"gfx1101");
+        excluded(measured,tile,"gfx1100",FlashAttentionQKParameterSource::StaticArguments);
+        excluded(measured,tile,"gfx1100",FlashAttentionQKParameterSource::DevicePublication,1);
+        EXPECT_EQ(select(FlashAttentionQKEngine::Automatic,measured,tile,"gfx1100:xnack-"),FlashAttentionQKEngine::ContextAdaptive);
+        EXPECT_FALSE(select(static_cast<FlashAttentionQKEngine>(255),measured,tile));
+        EXPECT_FALSE(select(FlashAttentionQKEngine::WmmaFourPlane,measured,tile,"gfx906"));
+        { auto g=measured;g.query_rows=0;EXPECT_FALSE(select(FlashAttentionQKEngine::Automatic,g,tile)); }
+        { auto g=measured;g.visible_kv_heads=0;EXPECT_FALSE(select(FlashAttentionQKEngine::Automatic,g,tile)); }
+        { auto t=tile;t.valid=false;EXPECT_FALSE(select(FlashAttentionQKEngine::Automatic,measured,t)); }
+    }
 
     /** Exact score ownership depends on admitted geometry, never live KV length. */
     TEST(ROCmFlashAttentionLaunchPolicy, RegisterScoreNativeFormatAndVisibilityTotality)

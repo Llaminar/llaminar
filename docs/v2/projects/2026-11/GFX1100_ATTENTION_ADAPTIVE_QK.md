@@ -1,9 +1,11 @@
 # gfx1100 adaptive attention Q/K qualification
 
-This investigation records the explicit adaptive candidate and its measurement
-boundary. Automatic production selection remains ordered Dot2. The fixed-query
-64K scaling objective passes for the measured FP16 M512 geometries; that result
-does not imply linear total-prefill work when query length also grows.
+Automatic production selection now installs the measured adaptive query kernel
+for the immutable domain below. The device selects Dot2 for short or ineligible
+live work and WMMA for eligible prefixes from1K through64K. Fresh actual-Automatic
+measurements pass the fixed-query linear-scaling objective. This does not imply
+linear total-prefill work when query length also grows. The earlier explicit
+candidate evidence remains separately identified below.
 
 ## Implementation and admission
 
@@ -65,7 +67,7 @@ cannot establish a small short-context regression. The first internal epoch is
 retained separately in `attention-adaptive-internal-epoch0/`; its trainer predates
 the final error-cleanup change and is never rebound to the final receipt.
 
-## Final Release measurements
+## Earlier explicit-candidate Release measurements
 
 Actual gfx1100 is PCI `0000:b5:00.0`, physical HIP5, visible0. The final run keeps
 M512, HD256, FP16, capacity65536 and head mapping fixed. It has26 lifecycle cells
@@ -89,7 +91,8 @@ win**. Dense512/1023 median ratios are0.99784/0.99782, and reset512 is0.99599;
 their paired intervals lie below parity. MoE short ratios span0.99962–1.00095,
 with intervals crossing parity. The adaptive candidate removes the earlier
 several-percent short-context loss, but a small dense regression remains.
-Automatic therefore stays Dot2; no installed-production speedup is claimed.
+At that explicit-candidate checkpoint, Automatic remained Dot2. These archived
+measurements do not certify the later installed producer.
 
 ## Resources and isolated profiles
 
@@ -116,7 +119,7 @@ Raw counter definitions and units belong to the selected ROCm SDK. Profile
 durations do not supply the unprofiled latency labels above. Both profiler
 receipts prove original AUTO→STABLE_STD→AUTO and no competing work.
 
-## Evidence and remaining work
+## Explicit-candidate evidence
 
 Local evidence root: `/tmp/llaminar-gfx1100-wmma-prefill-evidence/`.
 
@@ -138,8 +141,82 @@ Loaded core SHA256:
 `9d6ade3488cccbe1da190f5d7c21d70949b4fe428f35db0e8b1ba98f1a569444`.
 The receipt additionally binds kernel, policy and performance-owner source bytes.
 
-Before automatic admission, resolve or explicitly qualify the remaining short
-regression, test every immutable exclusion, bind the resolved engine to capture
-identity, and expose engine-specific capture-submission counters. A submission
-counter must not pretend every adaptive replay executed WMMA. Broader M, formats,
-capacities and head mappings require their own measured admission evidence.
+## Installed Automatic selection
+
+`resolveFlashAttentionQKEngine` receives the actual immutable launch geometry,
+resolved tile, native ISA, device-parameter authority and guarded-context limit.
+Automatic selects ContextAdaptive only for the measured domain above, including
+query/register-score ownership and an unguarded device publication. Other valid
+geometries select ordered Dot2. Explicit unsupported native requests fail.
+
+The resolved native function is embedded in the retained graph. Existing
+engine-local graph ownership scopes model heads, native KV representation,
+capacity, visibility and placement; bucket/device/domain/participant and workspace
+generation complete the cache identity. No new host live-count cache is created.
+A reset changes device parameters, not the topology or captured function.
+
+`gpu_graph_inventory.rocm_fa2_qk_kernel_submissions` records successful host
+submissions with resolved engine, branch policy, native ISA, head mapping and
+immutable geometry. It does not claim that every adaptive execution uses WMMA.
+Retained replay does not increment this host counter or download a live count.
+Collection is gated by the exact record family; the test observation scope
+restores both environment values and reloads the collector policy on every exit.
+
+New focused preflight registrations are:
+
+- `V2_Integration_ROCmAutomaticQKPolicyReplay`: M1–2048 totality for both head
+  layouts plus independent immutable geometry, ISA, format, tile, parameter and
+  guarded-context exclusions; malformed requests fail closed.
+- `V2_Integration_ROCmFlashAttentionAutomaticQKReplay`: actual Automatic capture,
+  independently expected adaptive query and ordered context kernels, nested
+  diagnostic-policy isolation, threshold/reset/ring/partial replay, neighboring
+  immutable exclusions and truthful counters that remain frozen during replay.
+- `V2_Integration_ROCmFlashAttentionAutomaticTimingReplay`: actual Automatic
+  parent timing, dirty replay and stale-observation rejection.
+
+The full launch-policy Unit test and both predicate replays passed in2.53s.
+Six focused native registrations passed in168.66s: Automatic native76.60s,
+Automatic timing6.06s, original WMMA8.20s, explicit adaptive16.29s, wide-ring5.03s
+and register-score lifecycle55.60s. Release and Integration both compile gfx906
+and gfx1100 with the mandatory spill guard. Full preflight was not run, as
+requested; these are component and feature gates.
+
+## Actual Automatic Release qualification
+
+A new producer-bound run repeats26 lifecycle cells and806 paired samples using
+actual Automatic selection, an explicit Dot2 reference, internal native events,
+poison-before-sample and independent byte observation. No build, profiler or
+inference work overlaps collection; source and binary hashes remain unchanged.
+
+| Geometry | Dot2 at64K | Automatic at64K | Median ratio | Paired median95% interval | Automatic32K→64K | Affine R² |
+|---|---:|---:|---:|---:|---:|---:|
+| Dense Q12/KV2 |47.073ms|40.747ms|1.1553×|1.1464–1.1607|1.9982×|0.999941|
+| MoE Q8/KV1 |35.571ms|31.269ms|1.1376×|1.1297–1.1422|1.9934×|0.999981|
+
+`V2_Perf_ROCmFlashAttentionAutomaticPrefixScaling` enforces the same R²≥0.995
+and final-doubling≤2.2 requirements. All measured eligible long-prefix cells
+win. The device rule preserves near-Dot2 short-context cost, rather than proving
+zero dispatch overhead: dense512/reset ratios are0.99962/0.99986 with intervals
+crossing parity; dense1023 is0.99728 with its paired interval below parity.
+MoE short cells span0.99936–1.00124 with intervals crossing parity. This small
+short-prefix cost is explicit; no universal per-size speedup is claimed.
+
+Fresh actual-Automatic512 and65536 profiles each isolate one dispatch across
+seven counter passes and authenticate the same loaded gfx1100 object and PCI/UUID.
+Resources remain96VGPR/50SGPR,16KiB dynamic LDS,wave64,256threads,zero private
+storage/spills/scratch,16 static WMMA sites and the ordered Dot2 branch. Both have
+positive activity and1536 waves. Memory activity is25.40%/33.29%, L2 hit86.65%/79.19%,
+and LDS conflicts1.6491/19.8901. Both restore AUTO and have no competing work.
+The512 kernel selects Dot2; static WMMA sites are not executed-branch counters.
+
+Current local evidence is `attention-automatic-scaling-{receipt,summary}.json`,
+`attention-automatic-fixed-query-scaling.log`,
+`attention-automatic-{512,65536}-profile/summary.json` and matching power receipts.
+`attention-automatic-policy-replay.log`, `attention-automatic-feature-suite.log`
+and `attention-automatic-{integration-build2,release-build}.log` hold the gates.
+Trainer SHA256 is
+`7b6879f18d69746665312e1afb79698bb62e181170e541b3e8bbddbc621ec0e2`;
+core SHA256 is
+`80cb76b9fc7e6cca1f377391b457089e1ddab1b3faa9b42fe657da6745c79ffe`.
+Broader M, formats, capacities and head mappings require their own measured
+admission evidence; the current selector explicitly retains Dot2 there.

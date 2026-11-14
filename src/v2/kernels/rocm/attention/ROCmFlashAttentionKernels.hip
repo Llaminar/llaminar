@@ -3193,30 +3193,32 @@ static int launch_device_resident_prefill(
     const int tile_q = tile_plan.query_rows;
     const int tile_kv = tile_plan.kv_rows;
     const int threads_per_row = tile_plan.threads_per_row;
-    // Recording policy becomes a distinct native function pointer in the graph.
-    // Automatic remains the installed Dot2 policy until complete-operation
-    // timing and replay qualify the candidate; forced unsupported work fails.
-    const bool adaptive_qk = llaminar2::rocm::recording_qk_engine ==
-        llaminar2::rocm::FlashAttentionQKEngine::ContextAdaptive;
-    const bool use_wmma = adaptive_qk || llaminar2::rocm::recording_qk_engine ==
-        llaminar2::rocm::FlashAttentionQKEngine::WmmaFourPlane;
-    if (use_wmma &&
-        (!(hardware.isa_target == "gfx1100" || hardware.isa_target.starts_with("gfx1100:")) ||
-         head_dim != 256 || tile_q != 16 || tile_kv != 16 || threads_per_row != 16))
+    // Capture binds this deterministic selection to the native function pointer.
+    // Only the retained adaptive body observes live work; no host prefix readback
+    // or topology change occurs as the context grows or resets.
+    const llaminar2::attention::AttentionPrefillCaptureGeometry qk_geometry{
+        .batch_size = batch_size, .query_rows = seq_len, .local_query_heads = n_heads,
+        .head_dim = head_dim, .kv_capacity = kv_len,
+        .native_kv_format = KV_TYPE == KVTypeTag::FP16 ? llaminar2::TensorType::FP16 :
+            KV_TYPE == KVTypeTag::BF16 ? llaminar2::TensorType::BF16 :
+            KV_TYPE == KVTypeTag::Q8_1 ? llaminar2::TensorType::Q8_1 : llaminar2::TensorType::FP32,
+        .visibility = causal && window_size <= 0 && !mask
+            ? llaminar2::attention::AttentionVisibilityPolicy::CausalFullContext
+            : llaminar2::attention::AttentionVisibilityPolicy::General,
+        .visible_kv_heads = n_kv_heads, .head_start = head_start, .replicated_gqa_n_rep = gqa_n_rep};
+    const auto qk_selection = llaminar2::rocm::resolveFlashAttentionQKEngine(
+        llaminar2::rocm::recording_qk_engine, hardware.isa_target, qk_geometry, tile_plan,
+        device_params ? llaminar2::rocm::FlashAttentionQKParameterSource::DevicePublication
+                      : llaminar2::rocm::FlashAttentionQKParameterSource::StaticArguments,
+        device_direct_partition_limit);
+    if (!qk_selection)
     {
-        printf("[launch_device_resident_prefill] Four-plane WMMA requires native gfx1100 and HD256/tile16x16\n");
+        printf("[launch_device_resident_prefill] Requested Q/K engine %s is unsupported for the admitted native geometry\n",
+            llaminar2::rocm::flashAttentionQKEngineName(llaminar2::rocm::recording_qk_engine));
         return -1;
     }
-    if (adaptive_qk &&
-        (KV_TYPE != KVTypeTag::FP16 || WRITE_CONTEXT_PARTIAL || device_direct_partition_limit != 0 ||
-         batch_size != 1 || seq_len != 512 || kv_len != 65536 || !device_params ||
-         !((n_heads == 12 && n_kv_heads == 2) || (n_heads == 8 && n_kv_heads == 1)) ||
-         head_start != 0 || gqa_n_rep != 0 || !causal || window_size > 0 || mask ||
-         score_storage != policy::ROCmFA2ScoreStorage::RegisterOwnedXorTile))
-    {
-        printf("[launch_device_resident_prefill] Adaptive Q/K requires the measured FP16 M512/HD256/capacity65536 causal query geometry\n");
-        return -1;
-    }
+    const bool adaptive_qk = *qk_selection == llaminar2::rocm::FlashAttentionQKEngine::ContextAdaptive;
+    const bool use_wmma = adaptive_qk || *qk_selection == llaminar2::rocm::FlashAttentionQKEngine::WmmaFourPlane;
     if constexpr (KV_TYPE == KVTypeTag::FP16)
     {
         if (head_dim == 256 && tile_q == 16 && tile_kv == 16 &&
@@ -3338,6 +3340,8 @@ static int launch_device_resident_prefill(
                 printf("[register_score_prefill] Native launch failed: %s\n",hipGetErrorString(status));
                 return -1;
             }
+            llaminar2::rocm::recordFlashAttentionQKSubmission(*qk_selection,qk_geometry,tile_plan,
+                hardware.isa_target,hardware.ordinal);
             return 0;
         }
     }
@@ -3451,6 +3455,9 @@ static int launch_device_resident_prefill(
                hipGetErrorString(error));
         return -1;
     }
+
+    llaminar2::rocm::recordFlashAttentionQKSubmission(*qk_selection,qk_geometry,tile_plan,
+        hardware.isa_target,hardware.ordinal);
 
     if constexpr (WRITE_CONTEXT_PARTIAL)
     {

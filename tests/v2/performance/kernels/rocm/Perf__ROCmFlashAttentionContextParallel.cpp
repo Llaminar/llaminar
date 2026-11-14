@@ -1506,7 +1506,9 @@ namespace
                 .local_query_heads = geometry_.n_heads, .head_dim = geometry_.head_dim,
                 .kv_capacity = kv_capacity_, .execution_policy = automatic,
                 .native_kv_format = TensorType::FP16,
-                .visibility = attention::AttentionVisibilityPolicy::CausalFullContext};
+                .visibility = attention::AttentionVisibilityPolicy::CausalFullContext,
+                .visible_kv_heads = geometry_.n_kv_heads, .head_start = geometry_.head_start,
+                .replicated_gqa_n_rep = geometry_.replicated_gqa_n_rep};
             return default_kernel_->prepareDynamicAttnParamsFromDeviceSequenceState(
                     d_default_live_length_, current_query_rows_, 1, stream_, kv_capacity_, nullptr, capture) &&
                     default_kernel_->compute_tensor(&query, &keys, &values, &output,
@@ -2540,6 +2542,8 @@ namespace
         const auto &hardware = inventory.at(ordinal);
         ASSERT_EQ(hipSetDevice(ordinal), hipSuccess);
         constexpr int rows = 512, capacity = 65536, sample_count = 31;
+        const bool adaptive_family = candidate == llaminar2::rocm::FlashAttentionQKEngine::ContextAdaptive ||
+            candidate == llaminar2::rocm::FlashAttentionQKEngine::Automatic;
         constexpr std::array<int, 10> native_lengths{{1024, 2048, 4096, 8192, 8193,
                                                    16384, 32768, 65536, 512, 1024}};
         constexpr std::array<int, 13> adaptive_lengths{{512,1023,1024,1025,2048,4096,
@@ -2548,13 +2552,14 @@ namespace
             512,1023,1024,1025,512,512,1023,1024,1025,512,512,1023,1024,1025,512,65536,512}};
         const std::span<const int> live_lengths = mode == QKMeasurement::TimingReplay
             ? std::span<const int>(replay_lengths) :
-            candidate == llaminar2::rocm::FlashAttentionQKEngine::ContextAdaptive
+            adaptive_family
                 ? std::span<const int>(adaptive_lengths) : std::span<const int>(native_lengths);
         const std::array<ParticipantAttentionGeometry, 2> geometries{{
             {"dense", 12, 2, 256, 0, 0}, {"moe", 8, 1, 256, 0, 0}}};
         using Engine = llaminar2::rocm::FlashAttentionQKEngine;
         const std::array<Engine, 2> engines{{Engine::OrderedDot2, candidate}};
         const std::array<const char *, 2> engine_names{{"ordered_dot2",
+            candidate == Engine::Automatic ? "automatic" :
             candidate == Engine::ContextAdaptive ? "context_adaptive" : "wmma_four_plane"}};
         std::cout << "FA2_QK_DEVICE," << ordinal << ',' << hardware.isa_target << ','
                   << hardware.pci_address << ',' << hardware.compute_units << '\n';
@@ -2581,7 +2586,7 @@ namespace
                     // The adaptive candidate owns only the measured direct graph.
                     // Its independent context oracle retains explicit Dot2.
                     llaminar2::rocm::ScopedFlashAttentionQKEngine oracle(
-                        candidate == Engine::ContextAdaptive ? Engine::OrderedDot2 : engines[path]);
+                        adaptive_family ? Engine::OrderedDot2 : engines[path]);
                     ASSERT_TRUE(benchmark.captureContextCandidate(0, 0)) << benchmark.error();
                 }
                 ASSERT_EQ(benchmark.contextPlan().device_direct_partition_limit, 1);
@@ -2634,10 +2639,10 @@ namespace
                     ASSERT_EQ(attention_nodes, nodes.size() == 1 ? 1 : 2);
                     ASSERT_EQ(reducer_nodes, nodes.size() == 1 ? 0 : 1);
                 };
-                ASSERT_NO_FATAL_FAILURE(inspect({native}, "default_attention", engines[path]));
+                ASSERT_NO_FATAL_FAILURE(inspect({native}, "default_attention", engines[path] == Engine::Automatic ? Engine::ContextAdaptive : engines[path]));
                 std::vector<hipKernelNodeParams> context_nodes;
                 ASSERT_TRUE(benchmark.contextKernelInventory(context_nodes)) << benchmark.error();
-                ASSERT_NO_FATAL_FAILURE(inspect(context_nodes, "untimed_context_oracle", candidate == Engine::ContextAdaptive ? Engine::OrderedDot2 : engines[path]));
+                ASSERT_NO_FATAL_FAILURE(inspect(context_nodes, "untimed_context_oracle", adaptive_family ? Engine::OrderedDot2 : engines[path]));
             }
             ASSERT_NE(attention_functions[0], attention_functions[1]);
             std::array<double, 2> reference_1024{};
@@ -2773,6 +2778,19 @@ namespace
     {
         runNativeGfx1100QKPrefixScaling(has_device_,
             llaminar2::rocm::FlashAttentionQKEngine::ContextAdaptive, QKMeasurement::TimingReplay);
+    }
+
+    /** @test Automatic retains internal event ownership across its device live-prefix rule. */
+    TEST_F(ROCmFlashAttentionContextParallelPerf, AutomaticCapturedBatchEventBoundaryReplay)
+    {
+        runNativeGfx1100QKPrefixScaling(has_device_,
+            llaminar2::rocm::FlashAttentionQKEngine::Automatic, QKMeasurement::TimingReplay);
+    }
+
+    /** @test Measure the installed automatic work-size rule through64K and reset. */
+    TEST_F(ROCmFlashAttentionContextParallelPerf, NativeGfx1100QKAutomaticFixedQueryPrefixScaling)
+    {
+        runNativeGfx1100QKPrefixScaling(has_device_, llaminar2::rocm::FlashAttentionQKEngine::Automatic);
     }
 
     /** @test Preserve the original unconditional matrix candidate scaling owner. */
@@ -3080,7 +3098,9 @@ namespace
             environmentString("LLAMINAR_ROCM_FA2_PROFILE_GEOMETRY");
         using QKEngine = llaminar2::rocm::FlashAttentionQKEngine;
         QKEngine qk_engine = QKEngine::Automatic;
-        if (requested_mode.starts_with("wmma_"))
+        const bool automatic_native_profile = requested_mode.starts_with("auto_");
+        if (automatic_native_profile) requested_mode.erase(0,5);
+        else if (requested_mode.starts_with("wmma_"))
         {
             qk_engine = QKEngine::WmmaFourPlane;
             requested_mode.erase(0, 5);
@@ -3098,7 +3118,7 @@ namespace
         int ordinal = 0, compute_units = properties_.multiProcessorCount;
         size_t lds_capacity = std::max<size_t>(properties_.sharedMemPerBlock,
                                              rocm_policy::kROCmFA2LDSCapacityBytes);
-        if (qk_engine != QKEngine::Automatic)
+        if (qk_engine != QKEngine::Automatic || automatic_native_profile)
         {
             const auto &inventory = llaminar2::rocmHardwareMetadata();
             ordinal = -1;
@@ -3164,6 +3184,13 @@ namespace
             FAIL() << "Unknown LLAMINAR_ROCM_FA2_PROFILE_GEOMETRY="
                    << requested_geometry;
         }
+        const auto &profile_hardware = llaminar2::rocmHardwareMetadata().at(ordinal);
+        const bool expected_automatic_adaptive = qk_engine == QKEngine::Automatic &&
+            (profile_hardware.isa_target == "gfx1100" || profile_hardware.isa_target.starts_with("gfx1100:")) &&
+            m == 512 && capacity == 65536 && format == NativeKVFormat::FP16 && geometry.head_dim == 256 &&
+            ((geometry.n_heads == 12 && geometry.n_kv_heads == 2) || (geometry.n_heads == 8 && geometry.n_kv_heads == 1)) &&
+            geometry.head_start == 0 && geometry.replicated_gqa_n_rep == 0 &&
+            (requested_mode == "default" || requested_mode == "direct");
         llaminar2::rocm::ScopedFlashAttentionQKEngine selected_qk(qk_engine);
         CapturedROCmFA2Benchmark benchmark(
             geometry,
@@ -3187,11 +3214,11 @@ namespace
                 {
                     const bool wmma = symbol.find("Lb1EE") != std::string::npos ||
                         symbol.find(", true>(") != std::string::npos;
-                    if (qk_engine != QKEngine::Automatic)
-                        ASSERT_EQ(wmma, qk_engine == QKEngine::WmmaFourPlane || qk_engine == QKEngine::ContextAdaptive) << symbol;
+                    ASSERT_EQ(wmma, qk_engine == QKEngine::WmmaFourPlane || qk_engine == QKEngine::ContextAdaptive ||
+                        expected_automatic_adaptive) << symbol;
                     const bool adaptive = symbol.find("FlashAttentionQKBranchPolicyE1ELb1EE") != std::string::npos ||
                         symbol.find("FlashAttentionQKBranchPolicy)1, true>(") != std::string::npos;
-                    ASSERT_EQ(adaptive, qk_engine == QKEngine::ContextAdaptive) << symbol;
+                    ASSERT_EQ(adaptive, qk_engine == QKEngine::ContextAdaptive || expected_automatic_adaptive) << symbol;
                     matrix_nodes += wmma;
                 }
                 hipFuncAttributes attributes{};
@@ -3202,7 +3229,8 @@ namespace
                           << ',' << attributes.localSizeBytes << ',' << node.blockDim.x << ','
                           << node.gridDim.x << ',' << node.gridDim.y << ',' << node.gridDim.z << ',' << symbol << '\n';
             }
-            if (qk_engine == QKEngine::WmmaFourPlane || qk_engine == QKEngine::ContextAdaptive) ASSERT_GT(matrix_nodes, 0);
+            if (qk_engine == QKEngine::WmmaFourPlane || qk_engine == QKEngine::ContextAdaptive || expected_automatic_adaptive)
+                ASSERT_GT(matrix_nodes, 0);
         };
         if (requested_mode == "default")
         {
