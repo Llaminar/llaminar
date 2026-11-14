@@ -34,7 +34,7 @@ production dispatch: GPU prepared quantized weights use NativeQuantised adapters
 |---|---|---|---|
 | Broader dense dispatch | Bound installed-Auto/WMMA collector and selective publisher | Core-table ownership replay, eight binding and 16 decision regressions pass | 84 cells complete; 68 candidate keys gain1.25–2.04×; profile/install pending |
 | Grouped MoE | Wave64 M16N32/N64 plus explicit whole-expert row floors4/8/12/16; all physical decoders | Serial, promoted, all-format mixed-writer, threshold/reset and split/sliced-down replay pass | Clean full-live N32 gains 1.04–1.30× across five anchors. Hybrid power-law and sparse replay regress; Automatic remains Dot4 |
-| Attention | Native four-plane QK candidate for HD256/tile16×16, all native KV formats and query/context schedules | Four new retained tests pass: all formats, B2/GQA/ring, 64K/partial/reset, half extrema and forced rejection. Existing lifecycle/reference gates pass | Fixed-M512 1K–64K scaling gate passes; 64K gains 1.15× dense / 1.13× MoE. Native direct/context profiles have zero spills; Automatic remains Dot2 |
+| Attention | Four-plane QK plus one-kernel live-prefix adaptive candidate | All-format, threshold/ring/partial/reset and internal timing-owner replays pass | Adaptive fixed-M51264K gains1.158×/1.138×; doubling1.989×/1.987×. Short dense loses0.2–0.4%; Automatic remains Dot2 |
 | Q8 router | Automatic Sixteen-wave tile for exact whole-row M512/K2560/E512; explicit 4/8/16-wave candidates retained | 14 GPU feature cases, five pure policy cases and both timing owners pass; actual Auto template, ownership and submission counters authenticated | Actual Auto wins all 12 measured prefix/basis cells: full512 gains 2.744×/2.551×; fresh profile has zero spills |
 | Floating half GEMM | Existing production hipBLAS path; sampled native matrix gap confirmed | Three retained graph replays pass, each containing cast and vendor GEMM | Loaded bytes/ISA authenticated; complete Release cast+GEMM timing pending |
 
@@ -71,31 +71,37 @@ objects, and original AUTO power is restored. Current evidence is in
 `grouped-hybrid-{n32,n64}-profile/`, bound to
 `grouped-hybrid-producer-receipt.json`. Clean timing is in `grouped-hybrid-receipt.json`; profiles do not supply timing labels.
 
-Attention's final fixed-query Release run holds M512, HD256, FP16 and capacity
-65536 constant, with dense Q12/KV2 and MoE Q8/KV1 heads. Each point uses 31 paired,
-alternating native-event samples over complete count-producer/query graphs.
-Canonical context graphs independently check summaries/reduction bytes before
-and after timing. All boundary/reset/regrowth checks pass, with no compiler
-work overlapping collection. Current complete-query medians at 64K are:
+Attention's adaptive candidate uses one retained query kernel and a device-uniform
+choice: WMMA for complete linear M512 prefixes with KV1024–65536, Dot2 otherwise.
+Its explicit immutable domain is FP16/B1/HD256/capacity65536 with Q/KV12/2 or8/1.
+Automatic stays Dot2. [Qualification](GFX1100_ATTENTION_ADAPTIVE_QK.md) records
+admission, arithmetic, timing ownership, resources and remaining work.
 
-| Heads | Dot2 | Native WMMA | Ratio | WMMA 32K→64K growth | Affine R² |
+Final Q/K timings use internal singleton timeline events around complete retained
+producer/query batches:16 operations below2048 keys, one thereafter. Every
+sample poisons and independently observes parameter/output bytes outside timing.
+Twenty threshold/reset transitions plus64K/reset certify the event owner; stale
+samples are rejected. No compiler or competing GPU work overlaps collection.
+
+| Heads | Dot2 at64K | Adaptive | Ratio |32K→64K growth| Affine R² |
 |---|---:|---:|---:|---:|---:|
-| Dense Q12/KV2 | 44.855 ms | 38.969 ms | 1.151× | 1.947× | 0.999754 |
-| MoE Q8/KV1 | 33.801 ms | 29.914 ms | 1.130× | 1.960× | 0.999854 |
+| Dense Q12/KV2 |46.216ms|39.908ms|1.158×|1.989×|0.999931|
+| MoE Q8/KV1 |34.855ms|30.641ms|1.138×|1.987×|0.999967|
 
-`V2_Perf_ROCmFlashAttentionWmmaPrefixScaling` gates affine R²≥0.995 and long-end
-doubling≤2.2, allowing 10% timing variation above ideal doubling. It preserves
-all seven ascending powers of two; 8193, reset512 and regrowth1024 stay separate.
-The short MoE512 reset remains slower (0.966×), so blanket automatic selection
-is not qualified. Both isolated native profiles authenticate 16 WMMA instruction
-sites, wave64, 92 logical/allocated VGPRs and zero scratch/spills. Query/context
-use 50/102 logical SGPRs and 16384/17984 dynamic LDS bytes respectively. Each of
-seven counter passes selects exactly one native dispatch, with positive activity;
-original AUTO power is restored. Evidence is bound by
-`attention-wmma-scaling-receipt.json`, with curve/gate summary in
-`attention-wmma-scaling-summary.json` and loaded ISA/counters in
-`attention-qk-{default,context}-profile/`. Occupancy queries report limits, not
-achieved occupancy; profile durations are not timing labels.
+The registered fixed-query gate requires R²≥0.995 and last doubling≤2.2 across
+all seven ascending powers from1K to64K. Threshold1023/1025,8193,reset512 and
+regrowth1024 remain separate. Short dense ratios0.9960–0.9978 still show a small
+regression; MoE short cells are near parity. No universal or installed Auto win
+is claimed. Original launch-inclusive evidence is archived separately.
+
+Both guarded HIP targets compile. Exact512/65536 profiles use96VGPR/50SGPR,
+16KiB dynamic LDS,256threads,wave64 and zero scratch/spills. Seven isolated
+counter passes have positive activity; both restore original AUTO power and
+match final timing files. Sixteen static WMMA sites do not claim that short
+replays take the matrix branch. `attention-adaptive-scaling-receipt.json` binds
+26 lifecycle cells/806 paired samples; `attention-adaptive-{512,65536}-profile/`
+holds loaded ISA/counters. Functional and timing regressions are explicit
+production-preflight entries; only focused/feature gates run for this task.
 
 Router Automatic now resolves an immutable engine/tile from original capacity,
 K/E, basis, ownership and cached hardware. Only whole-row M512/K2560/E512 selects

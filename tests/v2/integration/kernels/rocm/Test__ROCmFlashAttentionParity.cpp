@@ -7642,6 +7642,7 @@ int nativeWmmaQKDevice()
  * @param lifecycle Device-published pairs of live KV length and logical query rows.
  * @param context_parallel Also retain the canonical context producer/reducer graphs.
  * @param half_extrema Include both largest finite native-half value banks.
+ * @param candidate Explicit native or adaptive Q/K engine compared against Dot2.
  *
  * Each graph owns a distinct output and context-summary bank. Explicit Dot2
  * is the arithmetic authority even after Automatic installs measured WMMA.
@@ -7650,7 +7651,8 @@ int nativeWmmaQKDevice()
  * remain outside capture; only device-owned parameters change during replay.
  */
 void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
-    std::span<const std::pair<int,int>> lifecycle, bool context_parallel, bool half_extrema)
+    std::span<const std::pair<int,int>> lifecycle, bool context_parallel, bool half_extrema,
+    llaminar2::rocm::FlashAttentionQKEngine candidate = llaminar2::rocm::FlashAttentionQKEngine::WmmaFourPlane)
 {
     namespace policy = llaminar2::rocm::fa2_policy;
     using Engine = llaminar2::rocm::FlashAttentionQKEngine;
@@ -7768,7 +7770,7 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
         ASSERT_TRUE(backend->hostToDevice(dq.get(),query.data(),query.size()*sizeof(float),ordinal,stream));
         for (int path = 0; path < graph_count; ++path)
         {
-            llaminar2::rocm::ScopedFlashAttentionQKEngine engine(path % 2 ? Engine::WmmaFourPlane : Engine::OrderedDot2);
+            llaminar2::rocm::ScopedFlashAttentionQKEngine engine(path % 2 ? candidate : Engine::OrderedDot2);
             ASSERT_EQ(launch(path),0);
             ASSERT_TRUE(backend->synchronizeStream(stream,ordinal));
             graphs[path] = worker.createGraphCapture(stream);
@@ -7787,10 +7789,12 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
                 ASSERT_EQ(node.local_memory_bytes_per_thread,0u) << node.name;
                 if (node.name.find("flash_attention_2_mi50_kernel") == std::string::npos) continue;
                 ++producers;
-                const bool wmma = node.name.find("Lb0ELb1ELb1EE") != std::string::npos ||
-                    node.name.find("Lb0ELb0ELb1EE") != std::string::npos ||
-                    node.name.find("Lb1ELb0ELb1EE") != std::string::npos;
+                const bool wmma = node.name.find("Lb1EE") != std::string::npos ||
+                    node.name.find(", true>(") != std::string::npos;
                 ASSERT_EQ(wmma,path % 2 != 0) << node.name;
+                const bool adaptive = node.name.find("FlashAttentionQKBranchPolicyE1ELb1EE") != std::string::npos ||
+                    node.name.find("FlashAttentionQKBranchPolicy)1, true>(") != std::string::npos;
+                ASSERT_EQ(adaptive,path % 2 != 0 && candidate == Engine::ContextAdaptive) << node.name;
                 ASSERT_EQ(node.block_x,256u) << node.name;
                 ASSERT_GT(node.max_active_blocks_per_sm,0u) << node.name;
             }
@@ -7827,7 +7831,8 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
                 ASSERT_LE(length,c.capacity);
                 ASSERT_GT(logical_rows,0);
                 ASSERT_LE(logical_rows,std::min(length,c.rows));
-                for (const int origin : {0,c.capacity-13})
+                for (const auto [origin, ring_capacity] : std::array<std::pair<int,int>,3>{{
+                    {0,0}, {0,c.capacity}, {c.capacity-13,c.capacity}}})
                 {
                     SCOPED_TRACE("ring_origin="+std::to_string(origin));
                     for (int request = 0; request < c.batch; ++request)
@@ -7842,7 +7847,7 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
                     ASSERT_TRUE(backend->hostToDevice(dv.get(),physical_values.data(),physical_values.size(),ordinal,stream));
                     const attention::AttentionDeviceParams live{.kv_len=length,.kv_stride=c.capacity,
                         .position_offset=length-logical_rows,.mask_stride=c.capacity,
-                        .ring_row_origin=origin,.ring_row_capacity=c.capacity};
+                        .ring_row_origin=origin,.ring_row_capacity=ring_capacity};
                     ASSERT_TRUE(backend->hostToDevice(parameters.get(),&live,sizeof(live),ordinal,stream));
                     for (int path = 0; path < graph_count; ++path)
                     {
@@ -7869,6 +7874,21 @@ void runNativeWmmaQKParity(int ordinal, const NativeWmmaQKCase &c,
     });
 }
 } // namespace
+
+/** @test One adaptive graph preserves bytes through threshold, partial, ring and reset changes. */
+TEST(ROCmFlashAttentionAdaptiveQK, CapturedThresholdResetAndStorageByteExact)
+{
+    const int ordinal = nativeWmmaQKDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    constexpr std::array<std::pair<int,int>,11> lifecycle{{{512,512},{1023,512},{1024,512},
+        {1025,512},{8192,512},{8193,512},{65536,512},{65536,17},{512,1},{512,512},{1024,512}}};
+    for (const auto [query_heads,kv_heads] : std::array<std::pair<int,int>,2>{{{12,2},{8,1}}})
+    {
+        runNativeWmmaQKParity(ordinal,{512,65536,query_heads,kv_heads},lifecycle,false,false,
+            llaminar2::rocm::FlashAttentionQKEngine::ContextAdaptive);
+        if (::testing::Test::HasFatalFailure()) return;
+    }
+}
 
 /** @test Every native cache format and request bank retains Dot2 bytes across wrapped tile tails. */
 TEST(ROCmFlashAttentionWmmaQK, CapturedAllNativeFormatsAndRingByteExact)

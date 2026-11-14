@@ -10584,6 +10584,12 @@ add_v2_test(V2_Integration_ROCmRegisterScoreAdmission
     NO_MODELS
 )
 
+add_v2_test(V2_Integration_ROCmAdaptiveQKPolicyReplay
+    COMMAND $<TARGET_FILE:v2_unit_rocm_flash_attention_launch_policy>
+            --gtest_filter=ROCmFlashAttentionLaunchPolicy.AdaptiveQKLivePrefixReplay
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;Attention;LaunchPolicy;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+
 # Test: CUDA Quantized GEMM workspace declarations
 # Host-only structural regressions for workspace-owned CUDA GEMM scratch.
 add_executable(v2_unit_cuda_quantised_gemm_workspace unit/kernels/cuda/Test__CUDAQuantisedGemmKernel_Workspace.cpp)
@@ -21143,6 +21149,16 @@ if(HAVE_ROCM)
         LABELS "V2;Performance;ROCm;Attention;Prefill;GraphCapture;PrefixScaling;FP16;64K;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS RESOURCE_LOCK rocm_gpu_0
     )
+    add_v2_test(V2_Integration_ROCmFlashAttentionTimingReplay
+        COMMAND $<TARGET_FILE:v2_perf_rocm_flash_attention_prefill>
+                --gtest_filter=ROCmFlashAttentionContextParallelPerf.CapturedBatchEventBoundaryReplay
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;Prefill;GraphCapture;Replay;FP16;64K;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+    add_v2_test(V2_Perf_ROCmFlashAttentionAdaptivePrefixScaling
+        COMMAND $<TARGET_FILE:v2_perf_rocm_flash_attention_prefill>
+                --gtest_filter=ROCmFlashAttentionContextParallelPerf.NativeGfx1100QKAdaptiveFixedQueryPrefixScaling
+        LABELS "V2;Performance;ROCm;Attention;Prefill;GraphCapture;PrefixScaling;FP16;64K;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS RESOURCE_LOCK rocm_gpu_0)
     add_v2_test(V2_Perf_ROCmFlashAttentionPrefill
         COMMAND $<TARGET_FILE:v2_perf_rocm_flash_attention_prefill>
         LABELS "V2;Performance;ROCm;Attention;FlashAttention;Prefill;TP;Scaling;ContextParallel;AllFormats;GraphCapture;Benchmark"
@@ -22235,6 +22251,11 @@ if(HAVE_ROCM)
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
     )
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmFlashAttentionWmmaQKReplay)
+    add_v2_test(V2_Integration_ROCmFlashAttentionAdaptiveQKReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
+                --gtest_filter=ROCmFlashAttentionAdaptiveQK.*
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;Prefill;GraphCapture;ByteExact;NativeRing;64K;Replay;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
     add_v2_test(V2_Integration_ROCmFlashAttentionWideNativeRing
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
                 --gtest_filter=Test__ROCmFlashAttentionParity.FA2WideNativeRingMatchesIndependentProbabilityReference
@@ -38632,10 +38653,16 @@ endif()
 
 # New native-Q8 evidence controls run in the existing exact evidence owner.
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_ROCmAdaptiveQKPolicyReplay
     V2_Integration_ROCmDensePolicyOwnershipReplay
     V2_Integration_NativeQuantisedDensePolicyBindingReplay
     V2_Integration_NativeQuantisedDensePolicyDecisionsReplay
     V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity)
+if(HAVE_ROCM)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCmFlashAttentionAdaptiveQKReplay
+        V2_Integration_ROCmFlashAttentionTimingReplay)
+endif()
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})

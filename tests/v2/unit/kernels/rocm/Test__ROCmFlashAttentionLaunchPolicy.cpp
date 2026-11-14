@@ -6,11 +6,13 @@
  * shards through TP8, unseen positive M values, and K/V capacities through the
  * 256K context regime. Register-score admission also proves exact native-format,
  * visibility, LDS and workspace identity. No HIP runtime or accelerator is used.
+ * Adaptive Q/K replay covers published threshold, reset and storage boundaries.
  */
 
 #include <gtest/gtest.h>
 
 #include "kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
+#include "kernels/rocm/attention/ROCmFlashAttentionQK.h"
 
 #include <array>
 #include <cstddef>
@@ -873,3 +875,23 @@ namespace
     }
 
 } // namespace
+
+/** @test Replay the device-owned adaptive threshold without inferring live work from capacity. */
+TEST(ROCmFlashAttentionLaunchPolicy, AdaptiveQKLivePrefixReplay)
+{
+    using llaminar2::rocm::useContextAdaptiveAttentionWmma;
+    constexpr std::array<std::pair<int,bool>,12> lifecycle{{{0,false},{1,false},{512,false},
+        {1023,false},{1024,true},{1025,true},{8193,true},{65536,true},{65537,false},
+        {512,false},{1024,true},{1,false}}};
+    for (const auto [live,expected] : lifecycle)
+    {
+        SCOPED_TRACE(live);
+        EXPECT_EQ(useContextAdaptiveAttentionWmma(live,65536,live-512,0,0),expected);
+        EXPECT_FALSE(useContextAdaptiveAttentionWmma(live,65536,live-511,0,0));
+        EXPECT_FALSE(useContextAdaptiveAttentionWmma(live,65536,live-512,0,65536));
+        EXPECT_FALSE(useContextAdaptiveAttentionWmma(live,65536,live-512,7,65536));
+        EXPECT_FALSE(useContextAdaptiveAttentionWmma(live,65536,live-512,7,0));
+        for (const int other_capacity : {0,1024,65535,65537,131072})
+            EXPECT_FALSE(useContextAdaptiveAttentionWmma(live,other_capacity,live-512,0,0));
+    }
+}

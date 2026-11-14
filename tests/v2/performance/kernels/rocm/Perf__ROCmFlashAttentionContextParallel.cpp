@@ -12,6 +12,8 @@
  * complete device-count producer graph while comparing ordered Dot2 and
  * four-plane WMMA QK through growing and reset K/V spans. Its context oracle
  * independently exercises the guarded producer and ordered summary reducer.
+ * Q/K pairs use retained singleton timeline events inside complete transaction
+ * batches; host graph submission gaps do not enter those intervals.
  * Query-sequence
  * execution gives one workgroup a complete K/V scan. K/V-context execution
  * gives a bounded persistent grid canonical 256-key partitions and then merges
@@ -39,6 +41,7 @@
 #include <hip/hip_runtime.h>
 #include <rocprofiler-sdk-roctx/roctx.h>
 #include "backends/rocm/ROCmHardwareMetadata.h"
+#include "backends/rocm/HIPGraphCapture.h"
 #endif
 
 #include "kernels/attention/AttentionDeviceParams.h"
@@ -56,11 +59,13 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <iomanip>
 #include <iostream>
 #include <limits>
 #include <memory>
 #include <sstream>
+#include <span>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -415,6 +420,8 @@ namespace
             // A failed terminal-event record may leave an earlier graph live.
             // This test-only retirement boundary precedes all borrowed storage.
             if (stream_) (void)hipStreamSynchronize(stream_);
+            for (auto &owner : default_timing_) owner.reset();
+            for (auto &fragment : default_timing_fragments_) fragment.reset();
             default_graph_.reset();
             default_kernel_.reset();
             default_workspace_.reset();
@@ -580,35 +587,13 @@ namespace
                 !publishLiveLength(current_query_rows_) ||
                 !check(hipStreamSynchronize(stream_), "default capture preparation"))
                 return false;
-            GpuTensorView query(d_q_, current_query_rows_, geometry_.n_heads * geometry_.head_dim,
-                                TensorType::FP32, device);
-            GpuTensorView keys(d_k_, kv_capacity_, geometry_.n_kv_heads * geometry_.head_dim,
-                               TensorType::FP16, device);
-            GpuTensorView values(d_v_, kv_capacity_, geometry_.n_kv_heads * geometry_.head_dim,
-                                 TensorType::FP16, device);
-            GpuTensorView output(d_direct_output_, current_query_rows_,
-                                 geometry_.n_heads * geometry_.head_dim, TensorType::FP32, device);
-            const attention::AttentionExecutionPolicy automatic{
-                .prefill_parallel_axis = attention::AttentionPrefillParallelAxis::GeometrySelected};
-            const attention::AttentionPrefillCaptureGeometry capture{
-                .batch_size = 1, .query_rows = current_query_rows_,
-                .local_query_heads = geometry_.n_heads, .head_dim = geometry_.head_dim,
-                .kv_capacity = kv_capacity_, .execution_policy = automatic,
-                .native_kv_format = TensorType::FP16,
-                .visibility = attention::AttentionVisibilityPolicy::CausalFullContext};
             bool submitted = false;
             hipError_t end_status = hipSuccess;
             {
                 GraphCaptureGuard guard;
                 if (!check(hipStreamBeginCapture(stream_, hipStreamCaptureModeGlobal),
                            "default begin capture")) return false;
-                submitted = default_kernel_->prepareDynamicAttnParamsFromDeviceSequenceState(
-                    d_default_live_length_, current_query_rows_, 1, stream_, kv_capacity_, nullptr, capture) &&
-                    default_kernel_->compute_tensor(&query, &keys, &values, &output,
-                        1, current_query_rows_, kv_capacity_, geometry_.n_heads,
-                        geometry_.n_kv_heads, geometry_.head_dim, true, -1, nullptr, nullptr,
-                        nullptr, 0, geometry_.head_start, geometry_.n_heads, geometry_.n_kv_heads,
-                        geometry_.replicated_gqa_n_rep, automatic);
+                submitted = enqueueDefaultTransaction();
                 end_status = hipStreamEndCapture(stream_, &default_graph_.graph);
             }
             if (!submitted || !check(end_status, "default end capture") ||
@@ -620,6 +605,113 @@ namespace
                 setError("default attention must capture one device producer and one query body");
                 return false;
             }
+            return true;
+        }
+
+        /** @brief Prepare immutable one/sixteen-operation timing graphs.
+         * @return Whether actual production kernels and internal event owners match.
+         * Both batch sizes are captured once, before any live-prefix sample.
+         */
+        bool prepareDefaultTiming()
+        {
+            using namespace llaminar2;
+            if (!default_graph_.exec || default_timing_[0] || default_timing_[1])
+            {
+                setError("default timing requires one fresh prepared production graph");
+                return false;
+            }
+            hipKernelNodeParams attention{};
+            if (!defaultKernelInventory(attention)) return false;
+            const char *symbol = defaultKernelName(attention);
+            if (!symbol) { setError("production attention symbol is unavailable"); return false; }
+            const std::string attention_name(symbol);
+            for (size_t index = 0; index < default_timing_.size(); ++index)
+            {
+                const int replays = index == 0 ? 1 : 16;
+                auto &owner = default_timing_[index];
+                auto &fragment = default_timing_fragments_[index];
+                owner = std::make_unique<HIPGraphCapture>(stream_, device_);
+                fragment = owner->createOrderedTimelineFragment();
+                if (!fragment) { setError("default timing fragment creation failed"); return false; }
+                bool submitted = true;
+                {
+                    GraphCaptureGuard guard;
+                    if (!fragment->beginCapture()) { setError("default timing capture begin failed"); return false; }
+                    for (int replay = 0; replay < replays && submitted; ++replay)
+                        submitted = enqueueDefaultTransaction();
+                    if (!fragment->endCapture()) submitted = false;
+                }
+                const std::array<GPUOrderedTimelineStep,1> steps{{{
+                    .name = "complete_attention_batch", .kind = GPUOrderedTimelineStepKind::CapturedFragment,
+                    .capture = fragment.get()}}};
+                if (!submitted || fragment->nodeCount() != size_t(2 * replays) ||
+                    !owner->buildOrderedTimelineTransaction(steps, GPUOrderedTimelineInstrumentation::PerStepEvents) ||
+                    owner->nodeCount() != size_t(2 * replays + 2) ||
+                    owner->consumeOrderedTimelineTiming().state != GPUOrderedTimelineTimingState::AwaitingLaunch)
+                { setError("default timing must retain each producer/body and exactly two internal events"); return false; }
+                std::vector<GPUGraphKernelNodeInfo> kernels;
+                if (!owner->inspectKernelNodes(kernels) || kernels.size() != size_t(2 * replays))
+                { setError("default timing production inventory is incomplete"); return false; }
+                int attention_nodes = 0;
+                for (const auto &kernel : kernels)
+                {
+                    if (kernel.local_memory_bytes_per_thread != 0)
+                    { setError("default timing kernel uses scratch"); return false; }
+                    if (kernel.name.find("flash_attention_2_mi50_kernel") == std::string::npos) continue;
+                    ++attention_nodes;
+                    if (kernel.name != attention_name || kernel.block_x != attention.blockDim.x ||
+                        kernel.grid_x != attention.gridDim.x || kernel.grid_y != attention.gridDim.y ||
+                        kernel.dynamic_shared_memory_bytes != attention.sharedMemBytes)
+                    { setError("timing attention differs from the production graph"); return false; }
+                }
+                if (attention_nodes != replays || !owner->instantiate())
+                { setError("default timing graph instantiation/inventory failed"); return false; }
+            }
+            return true;
+        }
+
+        /** @brief Poison both consumers before a timing-owner replay.
+         * @return Whether poison was ordered on the exact stream outside timing.
+         */
+        bool poisonDefaultTimingState()
+        {
+            const size_t bytes = size_t(current_query_rows_) * geometry_.n_heads * geometry_.head_dim * sizeof(float);
+            return default_workspace_ &&
+                check(hipMemsetAsync(d_direct_output_, 0xff, bytes, stream_), "poison timed output") &&
+                check(hipMemsetAsync(default_workspace_->getBuffer(llaminar2::rocm::AttentionWorkspaceBuffers::DEVICE_PARAMS),
+                    0xff, sizeof(AttentionDeviceParams), stream_), "poison timed parameters");
+        }
+
+        /** @brief Observe the timing graph's result without replaying a repairing oracle.
+         * @param live_kv_len Expected device-published key extent.
+         * @param output Receives bytes from the last timed transaction.
+         * @return Whether publication and terminal observation are complete.
+         */
+        bool observeDefaultTimingBytes(int live_kv_len, std::vector<float> &output)
+        {
+            output.resize(size_t(current_query_rows_) * geometry_.n_heads * geometry_.head_dim);
+            AttentionDeviceParams published{};
+            /** @brief Retire partial observations before either borrowed host owner. */
+            struct ObservationRetirement
+            {
+                hipStream_t stream;
+                bool joined = false;
+                /** @brief Error returns also drain earlier successful asynchronous copies. */
+                ~ObservationRetirement()
+                {
+                    if (!joined && hipStreamSynchronize(stream) != hipSuccess) std::terminate();
+                }
+            } retirement{stream_};
+            if (!check(hipMemcpyAsync(output.data(), d_direct_output_, output.size()*sizeof(float),
+                    hipMemcpyDeviceToHost, stream_), "observe timed output") ||
+                !check(hipMemcpyAsync(&published, default_workspace_->getBuffer(llaminar2::rocm::AttentionWorkspaceBuffers::DEVICE_PARAMS),
+                    sizeof(published), hipMemcpyDeviceToHost, stream_), "observe timed publication") ||
+                !check(hipStreamSynchronize(stream_), "timed observation terminal completion")) return false;
+            retirement.joined = true;
+            if (published.kv_len != live_kv_len || published.kv_stride != kv_capacity_ ||
+                published.position_offset != live_kv_len - current_query_rows_ ||
+                published.mask_stride != live_kv_len || published.ring_row_origin != 0 || published.ring_row_capacity != 0)
+            { setError("timing graph did not overwrite the complete parameter publication"); return false; }
             return true;
         }
 
@@ -675,14 +767,29 @@ namespace
          */
         [[nodiscard]] double measureDefaultBatch(int live_kv_len)
         {
-            if (!ready_ || !default_graph_.exec || !publishLiveLength(live_kv_len)) return 0.0;
-            return measureGraphBatch(default_graph_, replayBatchSize(live_kv_len));
+            using namespace llaminar2;
+            auto &owner = default_timing_[live_kv_len < 2048 ? 1 : 0];
+            if (!ready_ || !owner || !publishLiveLength(live_kv_len) || !owner->launch() ||
+                !check(hipEventRecord(stop_, stream_), "internal timing terminal event") ||
+                !check(hipEventSynchronize(stop_), "internal timing completion")) return 0.0;
+            const auto observed = owner->consumeOrderedTimelineTiming();
+            if (observed.state != GPUOrderedTimelineTimingState::Complete || observed.samples.size() != 1 ||
+                observed.samples.front().name != "complete_attention_batch" ||
+                observed.samples.front().kind != GPUOrderedTimelineStepKind::CapturedFragment ||
+                !std::isfinite(observed.samples.front().elapsed_ms) || observed.samples.front().elapsed_ms <= 0 ||
+                owner->consumeOrderedTimelineTiming().state != GPUOrderedTimelineTimingState::AwaitingLaunch)
+            { setError("internal timing interval is missing, stale or has the wrong owner"); return 0.0; }
+            return observed.samples.front().elapsed_ms * 1000.0 / defaultBatchSize(live_kv_len);
         }
 
-        /** @return Complete default graph transactions in one native-event sample. */
+        /** @return Complete default graph transactions in one native-event sample.
+         * Short-prefix samples retain sixteen operations so submillisecond graph
+         * intervals do not make paired comparisons depend on clock transitions.
+         * Long prefixes retain the bounded workload budget used by other panels.
+         */
         [[nodiscard]] int defaultBatchSize(int live_kv_len) const noexcept
         {
-            return replayBatchSize(live_kv_len);
+            return live_kv_len < 2048 ? 16 : 1;
         }
 
         /**
@@ -1376,6 +1483,41 @@ namespace
             return static_cast<double>(milliseconds) * 1000.0 / replays;
         }
 
+        /** @brief Submit the complete production parameter producer and query body.
+         * @return Whether both exact-stream operations were accepted.
+         * This shared source prevents timing from omitting production work.
+         */
+        bool enqueueDefaultTransaction()
+        {
+            using namespace llaminar2;
+            const DeviceId device = DeviceId::rocm(device_);
+            GpuTensorView query(d_q_, current_query_rows_, geometry_.n_heads * geometry_.head_dim,
+                                TensorType::FP32, device);
+            GpuTensorView keys(d_k_, kv_capacity_, geometry_.n_kv_heads * geometry_.head_dim,
+                               TensorType::FP16, device);
+            GpuTensorView values(d_v_, kv_capacity_, geometry_.n_kv_heads * geometry_.head_dim,
+                                 TensorType::FP16, device);
+            GpuTensorView output(d_direct_output_, current_query_rows_,
+                                 geometry_.n_heads * geometry_.head_dim, TensorType::FP32, device);
+            const attention::AttentionExecutionPolicy automatic{
+                .prefill_parallel_axis = attention::AttentionPrefillParallelAxis::GeometrySelected};
+            const attention::AttentionPrefillCaptureGeometry capture{
+                .batch_size = 1, .query_rows = current_query_rows_,
+                .local_query_heads = geometry_.n_heads, .head_dim = geometry_.head_dim,
+                .kv_capacity = kv_capacity_, .execution_policy = automatic,
+                .native_kv_format = TensorType::FP16,
+                .visibility = attention::AttentionVisibilityPolicy::CausalFullContext};
+            return default_kernel_->prepareDynamicAttnParamsFromDeviceSequenceState(
+                    d_default_live_length_, current_query_rows_, 1, stream_, kv_capacity_, nullptr, capture) &&
+                    default_kernel_->compute_tensor(&query, &keys, &values, &output,
+                        1, current_query_rows_, kv_capacity_, geometry_.n_heads,
+                        geometry_.n_kv_heads, geometry_.head_dim, true, -1, nullptr, nullptr,
+                        nullptr, 0, geometry_.head_start, geometry_.n_heads, geometry_.n_kv_heads,
+                        geometry_.replicated_gqa_n_rep, automatic);
+        }
+
+        std::array<std::unique_ptr<llaminar2::HIPGraphCapture>,2> default_timing_; ///< Internal event parents, retired first.
+        std::array<std::unique_ptr<llaminar2::IGPUGraphCapture>,2> default_timing_fragments_; ///< Complete production batches.
         CapturedHIPGraph default_graph_; ///< Complete production producer/attention transaction.
         std::unique_ptr<llaminar2::DeviceWorkspaceManager> default_workspace_; ///< Exact parameter owner.
         std::unique_ptr<llaminar2::rocm::ROCmFlashAttentionKernelT<
@@ -2360,6 +2502,9 @@ namespace
 #endif
     }
 
+    /** @brief Separate numerical timing-owner replay from sampled economics. */
+    enum class QKMeasurement { Scaling, TimingReplay };
+
     /**
      * @brief Pair exact Dot2/WMMA production graphs at fixed M512 through 64K KV.
      *
@@ -2368,8 +2513,13 @@ namespace
      * correctness oracles, including their guarded direct leg and ordered reducer.
      * Alternating 31-sample event pairs report measured economics without assuming
      * an improvement threshold. Returning to 512 keys proves dirty reset reuse.
+     * @param has_device_ Whether the fixture admitted a native runtime.
+     * @param candidate Concrete matrix or adaptive query arithmetic to qualify.
+     * @param mode Functional event-owner replay or complete fixed-query timing.
      */
-    TEST_F(ROCmFlashAttentionContextParallelPerf, NativeGfx1100QKWmmaFixedQueryPrefixScaling)
+    void runNativeGfx1100QKPrefixScaling(bool has_device_,
+        llaminar2::rocm::FlashAttentionQKEngine candidate,
+        QKMeasurement mode = QKMeasurement::Scaling)
     {
 #ifndef HAVE_ROCM
         GTEST_SKIP() << "ROCm support is disabled";
@@ -2390,13 +2540,22 @@ namespace
         const auto &hardware = inventory.at(ordinal);
         ASSERT_EQ(hipSetDevice(ordinal), hipSuccess);
         constexpr int rows = 512, capacity = 65536, sample_count = 31;
-        constexpr std::array<int, 10> live_lengths{{1024, 2048, 4096, 8192, 8193,
+        constexpr std::array<int, 10> native_lengths{{1024, 2048, 4096, 8192, 8193,
                                                    16384, 32768, 65536, 512, 1024}};
+        constexpr std::array<int, 13> adaptive_lengths{{512,1023,1024,1025,2048,4096,
+            8192,8193,16384,32768,65536,512,1024}};
+        constexpr std::array<int,22> replay_lengths{{512,1023,1024,1025,512,
+            512,1023,1024,1025,512,512,1023,1024,1025,512,512,1023,1024,1025,512,65536,512}};
+        const std::span<const int> live_lengths = mode == QKMeasurement::TimingReplay
+            ? std::span<const int>(replay_lengths) :
+            candidate == llaminar2::rocm::FlashAttentionQKEngine::ContextAdaptive
+                ? std::span<const int>(adaptive_lengths) : std::span<const int>(native_lengths);
         const std::array<ParticipantAttentionGeometry, 2> geometries{{
             {"dense", 12, 2, 256, 0, 0}, {"moe", 8, 1, 256, 0, 0}}};
         using Engine = llaminar2::rocm::FlashAttentionQKEngine;
-        constexpr std::array<Engine, 2> engines{{Engine::OrderedDot2, Engine::WmmaFourPlane}};
-        constexpr std::array<const char *, 2> engine_names{{"ordered_dot2", "wmma_four_plane"}};
+        const std::array<Engine, 2> engines{{Engine::OrderedDot2, candidate}};
+        const std::array<const char *, 2> engine_names{{"ordered_dot2",
+            candidate == Engine::ContextAdaptive ? "context_adaptive" : "wmma_four_plane"}};
         std::cout << "FA2_QK_DEVICE," << ordinal << ',' << hardware.isa_target << ','
                   << hardware.pci_address << ',' << hardware.compute_units << '\n';
         std::cout << "record,geometry,engine,M,live_kv,capacity,sample,replays_per_sample,"
@@ -2417,12 +2576,19 @@ namespace
                 ASSERT_TRUE(benchmark.policyPlan().valid);
                 ASSERT_FALSE(benchmark.policyPlan().usesContextParallelism());
                 ASSERT_TRUE(benchmark.captureDefaultGraph()) << benchmark.error();
-                ASSERT_TRUE(benchmark.captureContextCandidate(0, 0)) << benchmark.error();
+                ASSERT_TRUE(benchmark.prepareDefaultTiming()) << benchmark.error();
+                {
+                    // The adaptive candidate owns only the measured direct graph.
+                    // Its independent context oracle retains explicit Dot2.
+                    llaminar2::rocm::ScopedFlashAttentionQKEngine oracle(
+                        candidate == Engine::ContextAdaptive ? Engine::OrderedDot2 : engines[path]);
+                    ASSERT_TRUE(benchmark.captureContextCandidate(0, 0)) << benchmark.error();
+                }
                 ASSERT_EQ(benchmark.contextPlan().device_direct_partition_limit, 1);
                 hipKernelNodeParams native{};
                 ASSERT_TRUE(benchmark.defaultKernelInventory(native)) << benchmark.error();
                 attention_functions[path] = native.func;
-                const auto inspect = [&](const std::vector<hipKernelNodeParams> &nodes, const char *scope)
+                const auto inspect = [&](const std::vector<hipKernelNodeParams> &nodes, const char *scope, Engine expected_engine)
                 {
                     int attention_nodes = 0, reducer_nodes = 0;
                     for (size_t index = 0; index < nodes.size(); ++index)
@@ -2441,7 +2607,11 @@ namespace
                                 symbol.find(", true>(") != std::string::npos;
                             const bool ordered = symbol.find("Lb0EE") != std::string::npos ||
                                 symbol.find(", false>(") != std::string::npos;
-                            ASSERT_TRUE(path == 1 ? matrix : ordered) << symbol;
+                            const bool matrix_expected = expected_engine != Engine::OrderedDot2;
+                            ASSERT_TRUE(matrix_expected ? matrix : ordered) << symbol;
+                            const bool adaptive = symbol.find("FlashAttentionQKBranchPolicyE1ELb1EE") != std::string::npos ||
+                                symbol.find("FlashAttentionQKBranchPolicy)1, true>(") != std::string::npos;
+                            ASSERT_EQ(adaptive, expected_engine == Engine::ContextAdaptive) << symbol;
                         }
                         if (symbol.find("flash_attention_2_context_reduce_mi50_kernel") != std::string::npos)
                             ++reducer_nodes;
@@ -2464,14 +2634,15 @@ namespace
                     ASSERT_EQ(attention_nodes, nodes.size() == 1 ? 1 : 2);
                     ASSERT_EQ(reducer_nodes, nodes.size() == 1 ? 0 : 1);
                 };
-                ASSERT_NO_FATAL_FAILURE(inspect({native}, "default_attention"));
+                ASSERT_NO_FATAL_FAILURE(inspect({native}, "default_attention", engines[path]));
                 std::vector<hipKernelNodeParams> context_nodes;
                 ASSERT_TRUE(benchmark.contextKernelInventory(context_nodes)) << benchmark.error();
-                ASSERT_NO_FATAL_FAILURE(inspect(context_nodes, "untimed_context_oracle"));
+                ASSERT_NO_FATAL_FAILURE(inspect(context_nodes, "untimed_context_oracle", candidate == Engine::ContextAdaptive ? Engine::OrderedDot2 : engines[path]));
             }
             ASSERT_NE(attention_functions[0], attention_functions[1]);
             std::array<double, 2> reference_1024{};
             std::array<std::vector<std::pair<double,double>>,2> scaling_points;
+            int replay_epoch = 0;
             for (const int live : live_lengths)
             {
                 SCOPED_TRACE(geometry.sources + " live_kv=" + std::to_string(live));
@@ -2481,6 +2652,24 @@ namespace
                         << engine_names[path] << ':' << benchmarks[path]->error();
                 ASSERT_EQ(bytes[0].size(), bytes[1].size());
                 ASSERT_EQ(std::memcmp(bytes[0].data(), bytes[1].data(), bytes[0].size() * sizeof(float)), 0);
+                if (mode == QKMeasurement::TimingReplay)
+                {
+                    for (int order = 0; order < 2; ++order)
+                    {
+                        const int path = (replay_epoch + order) % 2;
+                        auto &benchmark = *benchmarks[path];
+                        ASSERT_TRUE(benchmark.poisonDefaultTimingState()) << benchmark.error();
+                        ASSERT_GT(benchmark.measureDefaultBatch(live),0.0) << benchmark.error();
+                        std::vector<float> observed;
+                        ASSERT_TRUE(benchmark.observeDefaultTimingBytes(live,observed)) << benchmark.error();
+                        ASSERT_EQ(observed.size(),bytes[path].size());
+                        ASSERT_EQ(std::memcmp(observed.data(),bytes[path].data(),observed.size()*sizeof(float)),0);
+                    }
+                    ++replay_epoch;
+                    continue;
+                }
+                for (auto &benchmark : benchmarks)
+                    ASSERT_TRUE(benchmark->poisonDefaultTimingState()) << benchmark->error();
                 // Warm both already captured graphs outside the paired sample set.
                 for (int warmup = 0; warmup < 2; ++warmup)
                     for (auto &benchmark : benchmarks)
@@ -2490,9 +2679,18 @@ namespace
                     for (int order = 0; order < 2; ++order)
                     {
                         const int path = (sample + order) % 2;
+                        ASSERT_TRUE(benchmarks[path]->poisonDefaultTimingState()) << benchmarks[path]->error();
                         samples[path][sample] = benchmarks[path]->measureDefaultBatch(live);
                         ASSERT_TRUE(std::isfinite(samples[path][sample]) && samples[path][sample] > 0.0)
                             << benchmarks[path]->error();
+                        // Poison and observation stay outside the internal events.
+                        // Each measured batch must publish its own complete bytes;
+                        // warmups or another sample cannot repair a missing writer.
+                        std::vector<float> observed;
+                        ASSERT_TRUE(benchmarks[path]->observeDefaultTimingBytes(live,observed))
+                            << benchmarks[path]->error();
+                        ASSERT_EQ(observed.size(),bytes[path].size());
+                        ASSERT_EQ(std::memcmp(observed.data(),bytes[path].data(),observed.size()*sizeof(float)),0);
                     }
                 std::array<double, 2> medians{};
                 for (size_t path = 0; path < engines.size(); ++path)
@@ -2523,14 +2721,17 @@ namespace
                               << medians[path] << ',' << speedup << ',' << latency_scaling << ','
                               << key_scaling << ',' << latency_scaling / key_scaling << '\n';
                 }
-                // Neither timing order nor the other engine may repair a dirty replay.
+                // Observe the timed owner before any oracle can repair its bytes.
                 for (size_t path = 0; path < engines.size(); ++path)
                 {
                     std::vector<float> replay;
+                    ASSERT_TRUE(benchmarks[path]->observeDefaultTimingBytes(live, replay)) << benchmarks[path]->error();
+                    ASSERT_EQ(std::memcmp(bytes[path].data(), replay.data(), replay.size() * sizeof(float)), 0);
                     ASSERT_TRUE(benchmarks[path]->validatedDefaultBytes(live, replay)) << benchmarks[path]->error();
                     ASSERT_EQ(std::memcmp(bytes[path].data(), replay.data(), replay.size() * sizeof(float)), 0);
                 }
             }
+            if (mode == QKMeasurement::TimingReplay) continue;
             for (size_t path = 0; path < engines.size(); ++path)
             {
                 const auto &points = scaling_points[path];
@@ -2565,6 +2766,25 @@ namespace
             }
         }
 #endif
+    }
+
+    /** @test Replay actual internal timing parents through threshold, poison and reset. */
+    TEST_F(ROCmFlashAttentionContextParallelPerf, CapturedBatchEventBoundaryReplay)
+    {
+        runNativeGfx1100QKPrefixScaling(has_device_,
+            llaminar2::rocm::FlashAttentionQKEngine::ContextAdaptive, QKMeasurement::TimingReplay);
+    }
+
+    /** @test Preserve the original unconditional matrix candidate scaling owner. */
+    TEST_F(ROCmFlashAttentionContextParallelPerf, NativeGfx1100QKWmmaFixedQueryPrefixScaling)
+    {
+        runNativeGfx1100QKPrefixScaling(has_device_, llaminar2::rocm::FlashAttentionQKEngine::WmmaFourPlane);
+    }
+
+    /** @test Measure one retained adaptive query kernel across threshold/reset and 64K. */
+    TEST_F(ROCmFlashAttentionContextParallelPerf, NativeGfx1100QKAdaptiveFixedQueryPrefixScaling)
+    {
+        runNativeGfx1100QKPrefixScaling(has_device_, llaminar2::rocm::FlashAttentionQKEngine::ContextAdaptive);
     }
 
     /** @brief Certify generic captured attention policy across the complete Qwen catalog. */
@@ -2865,6 +3085,11 @@ namespace
             qk_engine = QKEngine::WmmaFourPlane;
             requested_mode.erase(0, 5);
         }
+        else if (requested_mode.starts_with("adaptive_"))
+        {
+            qk_engine = QKEngine::ContextAdaptive;
+            requested_mode.erase(0, 9);
+        }
         else if (requested_mode.starts_with("ordered_"))
         {
             qk_engine = QKEngine::OrderedDot2;
@@ -2963,7 +3188,10 @@ namespace
                     const bool wmma = symbol.find("Lb1EE") != std::string::npos ||
                         symbol.find(", true>(") != std::string::npos;
                     if (qk_engine != QKEngine::Automatic)
-                        ASSERT_EQ(wmma, qk_engine == QKEngine::WmmaFourPlane) << symbol;
+                        ASSERT_EQ(wmma, qk_engine == QKEngine::WmmaFourPlane || qk_engine == QKEngine::ContextAdaptive) << symbol;
+                    const bool adaptive = symbol.find("FlashAttentionQKBranchPolicyE1ELb1EE") != std::string::npos ||
+                        symbol.find("FlashAttentionQKBranchPolicy)1, true>(") != std::string::npos;
+                    ASSERT_EQ(adaptive, qk_engine == QKEngine::ContextAdaptive) << symbol;
                     matrix_nodes += wmma;
                 }
                 hipFuncAttributes attributes{};
@@ -2974,7 +3202,7 @@ namespace
                           << ',' << attributes.localSizeBytes << ',' << node.blockDim.x << ','
                           << node.gridDim.x << ',' << node.gridDim.y << ',' << node.gridDim.z << ',' << symbol << '\n';
             }
-            if (qk_engine == QKEngine::WmmaFourPlane) ASSERT_GT(matrix_nodes, 0);
+            if (qk_engine == QKEngine::WmmaFourPlane || qk_engine == QKEngine::ContextAdaptive) ASSERT_GT(matrix_nodes, 0);
         };
         if (requested_mode == "default")
         {
