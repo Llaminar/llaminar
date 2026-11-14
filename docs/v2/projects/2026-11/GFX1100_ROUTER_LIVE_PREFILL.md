@@ -44,11 +44,15 @@ integration reviews are clear. Full preflight and model E2E are outside this sli
 
 ## Actual Automatic performance and profile
 
+The existing12-cell measurements and seven counter passes remain accepted under
+the user's scope; isolation-only refresh is canceled. Original raw observations
+remain unchanged.
+
 Fresh Release measurements use ordinary Automatic recording against the explicit
 Dot4 graph, with the same graph-owned event boundaries, frozen references and
-per-sample poisoned banks described below. Both exact cases are clean: 12 cells,
+per-sample poisoned banks described below. The two exact cases contain12 cells,
 31 paired samples per cell, 16 complete operations per sample, 372 sample pairs,
-unchanged producer hashes and no overlapping compilation. The profile and timing
+unchanged producer hashes and receipts reporting no overlapping compilation. The profile and timing
 receipts bind the same executable, core and policy/launch/fixture source files.
 
 | Live rows | Original Auto gain | Hadamard32 Auto gain |

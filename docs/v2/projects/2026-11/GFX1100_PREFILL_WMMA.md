@@ -5,7 +5,7 @@ and qualification; backend procedures remain in the ROCm tuning skill.
 
 The active objective covers four areas: broader dense dispatch, grouped routed
 experts, attention, and Q8 router logits. Each requires production-path component
-correctness, captured replay, unprofiled Release timing and isolated profiling.
+correctness, captured replay, unprofiled Release timing and kernel profiling.
 Attention additionally requires linear complete-operation scaling through 64K
 KV tokens with the query bucket held fixed, as explicitly confirmed by the user.
 The added [MTP grouped-decode work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md) covers
@@ -34,10 +34,10 @@ production dispatch: GPU prepared quantized weights use NativeQuantised adapters
 
 | Area | Implementation | Functional/component evidence | Performance evidence |
 |---|---|---|---|
-| Broader dense dispatch | Bound installed-Auto/WMMA collector and selective publisher | Core-table ownership replay, eight binding and 16 decision regressions pass | 84 timings/124 profiles unqualified for isolation; fresh collection running |
+| Broader dense dispatch | Bound installed-Auto/WMMA collector and selective publisher | Core-table ownership replay, eight binding and 16 decision regressions pass | Original84 timings/124 profiles accepted;44 profiles and installed-Auto checks remain |
 | Grouped MoE | Wave64 M16N32/N64; fused Dot4/WMMA whole-expert floors4/8/12/16; all physical decoders | Serial, promoted, mixed-writer omission, threshold/reset and split/sliced-down replay pass | Fine adaptive full Qwen gains1.06–1.19×; sparse/compact gaps remain; Automatic stays Dot4 |
-| Attention | Automatic one-kernel Dot2/WMMA live-prefix selection in the measured FP16 M512 domain | Actual Auto, immutable exclusions, counters, all-format, threshold/ring/partial/reset and internal timing-owner replays pass | Historical64K gains1.155×/1.138× and doubling1.998×/1.993×; isolation refresh pending |
-| Q8 router | Automatic Sixteen-wave tile for exact whole-row M512/K2560/E512; explicit 4/8/16-wave candidates retained | 14 GPU feature cases, five pure policy cases and both timing owners pass; actual Auto template, ownership and submission counters authenticated | Historical full512 gains2.744×/2.551×;12 cells/seven counters need isolation refresh |
+| Attention | Automatic one-kernel Dot2/WMMA live-prefix selection in the measured FP16 M512 domain | Actual Auto, immutable exclusions, counters, all-format, threshold/ring/partial/reset and internal timing-owner replays pass | Accepted64K gains1.155×/1.138× and doubling1.998×/1.993×;26 cells/14 counter passes |
+| Q8 router | Automatic Sixteen-wave tile for exact whole-row M512/K2560/E512; explicit 4/8/16-wave candidates retained | 14 GPU feature cases, five pure policy cases and both timing owners pass; actual Auto template, ownership and submission counters authenticated | Accepted full512 gains2.744×/2.551×;12 cells/seven counter passes |
 | Floating half GEMM | Existing production hipBLAS path; sampled native matrix gap confirmed | Three retained graph replays pass, each containing cast and vendor GEMM | Loaded bytes/ISA authenticated; complete Release cast+GEMM timing pending |
 
 [Router qualification](GFX1100_ROUTER_LIVE_PREFILL.md) records admission, retained-prefix timing and profiles.
@@ -62,10 +62,11 @@ sizes. A separately compiled cold-decode fence reduces IQ2_S VGPRs79→72 and
 87→81 without memory spills; runtime qualification is pending.
 [Investigation](GFX1100_GROUPED_WMMA_ADMISSION.md) owns the comparisons and archives.
 
-The [isolation audit](GFX1100_PREFILL_ISOLATION_REQUALIFICATION.md) requires fresh
-dense/CUDA-reference, router and attention performance qualification. Numerical
-replay remains valid. Historical performance values below are provisional until
-recollected with complete healthy observations and current producer bindings.
+The user accepts the existing dense/CUDA-reference, router and attention
+performance evidence without an isolation-receipt requirement. Isolation-only
+recollection is canceled; the [audit](GFX1100_PREFILL_ISOLATION_REQUALIFICATION.md)
+is superseded as a work requirement. Raw observations remain unchanged. This
+scope decision does not assert that collection had no competing workloads.
 
 Attention Automatic resolves the measured immutable domain once at capture:
 FP16/B1/M512/HD256/capacity65536,Q/KV12/2 or8/1, full causal query scheduling and
@@ -81,7 +82,7 @@ Fresh actual-Auto timing uses internal events around complete retained
 producer/query batches:16 operations below2048 keys, one thereafter. Every
 sample poisons and independently observes parameter/output bytes.26 lifecycle
 cells/806 pairs include threshold1023/1024/1025,8193,64K,reset512 and regrowth.
-No compiler/profiler/inference work overlaps collection; producer hashes match.
+Producer hashes match the recorded runs.
 
 | Heads | Dot2 at64K | Automatic | Ratio |32K→64K growth| Affine R² |
 |---|---:|---:|---:|---:|---:|
@@ -96,7 +97,7 @@ exclusions, independent engine expectations, reset/ring/partial bytes and counte
 
 Both guarded HIP targets compile in Release/Integration. Exact512/65536 Auto
 profiles use96VGPR/50SGPR,16KiB dynamic LDS,256threads,wave64 and zero scratch/spills.
-Seven isolated passes authenticate loaded code, PCI/UUID, positive activity and
+Each profile's seven passes authenticate loaded code, PCI/UUID, positive activity and
 restored AUTO power. Sixteen static WMMA sites do not imply that512 executes WMMA.
 Current evidence is `attention-automatic-scaling-{receipt,summary}.json` and
 `attention-automatic-{512,65536}-profile/`. All focused replay registrations are
@@ -133,10 +134,11 @@ Release producer. A loader replay reproduces and guards the repaired table
 interposition defect. Complete typed install/retain decisions preserve every
 unchanged row and generic absence; only per-alias profitable WMMA changes need
 new profiles. All-retain produces byte-identical policy and a no-change receipt.
-Six focused gates pass. The broader84-cell slice is under isolation audit:
-the old monitor omitted `llaminar2`. Thirty of124 accepted profiles demonstrably
-overlap foreign inference; the other94 lack complete isolation proof. Raw records are preserved; timing receipts are also under audit.
-Requalification precedes installation. [Evidence and protocol](GFX1100_DENSE_PREFILL_CANDIDATE_SCOPE.md).
+Six focused gates pass. The original broader84-cell timing inventory and124
+completed profiles are accepted for this task. Complete the remaining44 profile
+obligations, emit the selected additions and verify actual installed Auto on the
+rebuilt Release producer. Earlier dense anchors and matched CUDA comparisons
+remain usable. [Evidence and protocol](GFX1100_DENSE_PREFILL_CANDIDATE_SCOPE.md).
 
 The floating audit authenticates the dumped rocBLAS object and all17 traced
 symbols/offsets:

@@ -143,14 +143,15 @@ mandatory spill guard. Both Release and Integration builds pass.
 
 Collection uses actual gfx1100 HIP5/PCI0000:b5:00.0, two M cells per retained
 weight batch. Per-batch receipts bind original producer/artifact hashes and
-monitor competing compiler/profiler/inference work. Overlapped batches are
-archived and recollected; uncontaminated cells survive resume. Collection,
-isolated profiling, generated installation and rebuilt Auto qualification are
+retain the observer's activity reports. Rejected attempts remain archived;
+isolation receipts are no longer an acceptance gate under the user's scope.
+Collection, kernel profiling, generated installation and rebuilt Auto qualification are
 distinct gates. No broader exact rows are installed at this tooling checkpoint.
 
-The historical run completed all 84 cells in 42 accepted batches; three
-observed-overlap batches were rejected and recollected. The isolation audit below
-supersedes the historical clean-run classification. All byte/resource gates pass. The inventory collapses
+The original run completed all 84 cells in 42 accepted batches; three
+observed-overlap batches were rejected and recollected. The user accepts this
+original performance evidence without requiring isolation receipts or another
+timing collection. All byte/resource gates pass. The inventory collapses
 to 68 runtime keys (17 per shape/bucket), and every key has an eligible changed
 WMMA launch. Per-key pooled gains range from 1.2493 to 2.0426. The geometric
 means across each 17-key group are:
@@ -167,8 +168,9 @@ There are 168 original-alias winner/baseline profile obligations. The initial
 Q4_0/M512/QKV winner pilot passes eight trace/counter passes, authenticates
 activation quantization plus native WMMA, reports zero scratch and positive
 activity, and restores AUTO power after STABLE_STD. This pilot does not certify
-the remaining requests. Full isolated profiling and rebuilt Auto qualification
-remain pending; no broader rows have been installed.
+the remaining requests. The original124 completed profile obligations are
+accepted;44 of168 remain. Complete those profiles and rebuilt Auto qualification
+before claiming the broader installed policy; no broader rows have been installed.
 
 The six focused registered integration checks all pass in 12.94s, including the
 compiled policy query, actual loader ownership replay, overlay admission,
@@ -176,28 +178,29 @@ original evidence contracts, binding replay and selective-decision replay.
 This is the authorized focused suite, not full preflight execution.
 
 
-## Isolation audit and replacement generation
+## Superseded isolation-only recollection
 
 The local timing and profiling monitors recognized `llaminar` but omitted the
 actual `llaminar2` executable. Their sparse match logs cannot establish absence
 of that work. Independent foreign process records prove overlap for 30 of the
 124 accepted counter records. The other 94 retain valid native artifacts but
 lack complete isolation evidence. No overlap was demonstrated for the 84 timing
-cells; their isolation is likewise unproven. None of these observations qualifies
-a broader policy installation.
+cells. These audit observations remain recorded; the user has explicitly removed
+isolation proof as an acceptance condition for this task. The original timing
+and completed profile evidence is usable without isolation-only recollection.
 
 `dense-broader-llaminar2-isolation-audit.json` binds exact own receipt intervals,
 request IDs, foreign process ancestry, PID/start ticks and original file hashes
 (SHA256 `c6537d48b394d766d85a9b414a269e0fefec1a07684caa4773bf1f0133d4d7d7`).
-The original corpus and its proposed 68 additions/684-row composed policy remain
-historical evidence. The timing/counter defect is in local qualification tooling;
-the production dispatch and frozen native Release producer are unchanged.
+The original corpus, its68 selected additions and proposed684-row composed policy
+remain the active evidence and publication inputs. The monitor defect is in local
+tooling; the production dispatch and frozen native Release producer are unchanged.
 
-The fresh generation is `dense-broader-qkv-isolated-v2/`. It copies the original
-bound v6 declaration and reuses its exact Release executable/core. All 84 timing
-cells must be recollected before recomputing decisions, generated policy bytes
-and profile obligations. No historical winner or request digest is assumed to
-survive. Fresh installed-Auto observations follow the new qualified policy.
+The isolation-only replacement generation `dense-broader-qkv-isolated-v2/` is
+canceled as a task requirement. Preserve any observations already collected;
+they do not replace the original plan, decisions or requests automatically.
+Finish the original44 remaining profile obligations, publish the selected policy
+and collect actual installed-Auto observations with the rebuilt producer.
 
 The replacement collector retains complete compressed process snapshots and
 synchronous start/end observations. It rejects malformed or empty observations,
@@ -206,4 +209,6 @@ changed producers and incomplete retirement. Six focused device-free monitor
 regressions pass. Each two-M batch runs under the canonical native guardian;
 immutable raw attempts survive, and the common CSV/manifest validators own cell
 promotion. A Sol 6.1 review found no remaining launch blocker after the parser
-and exact resume-batch joins were corrected. Initial fresh collection is running.
+and exact resume-batch joins were corrected. These tooling improvements and
+retained artifacts do not create an isolation requalification work item. The
+[superseded audit](GFX1100_PREFILL_ISOLATION_REQUALIFICATION.md) records the scope decision.

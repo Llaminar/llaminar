@@ -72,8 +72,8 @@ the final error-cleanup change and is never rebound to the final receipt.
 Actual gfx1100 is PCI `0000:b5:00.0`, physical HIP5, visible0. The final run keeps
 M512, HD256, FP16, capacity65536 and head mapping fixed. It has26 lifecycle cells
 (two geometries ×13 prefixes),31 alternating paired samples per cell, byte checks
-on every measured sample, no overlapping compiler/profiler/inference work, and
-unchanged producer hashes. Counter collection is separate and restores AUTO.
+on every measured sample and unchanged producer hashes. Counter collection is
+separate and restores AUTO.
 
 | Geometry | Dot2 at64K | Adaptive at64K | Median ratio | Paired median95% interval | Adaptive32K→64K | Affine R² |
 |---|---:|---:|---:|---:|---:|---:|
@@ -117,7 +117,7 @@ Dot2 there. No achieved WMMA utilization claim is inferred from static ISA.
 
 Raw counter definitions and units belong to the selected ROCm SDK. Profile
 durations do not supply the unprofiled latency labels above. Both profiler
-receipts prove original AUTO→STABLE_STD→AUTO and no competing work.
+receipts record original AUTO→STABLE_STD→AUTO.
 
 ## Explicit-candidate evidence
 
@@ -183,10 +183,13 @@ requested; these are component and feature gates.
 
 ## Actual Automatic Release qualification
 
+The existing measurements and profiles remain accepted under the user's scope;
+isolation-only refresh is canceled. Original raw observations remain unchanged.
+
 A new producer-bound run repeats26 lifecycle cells and806 paired samples using
 actual Automatic selection, an explicit Dot2 reference, internal native events,
-poison-before-sample and independent byte observation. No build, profiler or
-inference work overlaps collection; source and binary hashes remain unchanged.
+poison-before-sample and independent byte observation. Source and binary hashes
+match the recorded producer.
 
 | Geometry | Dot2 at64K | Automatic at64K | Median ratio | Paired median95% interval | Automatic32K→64K | Affine R² |
 |---|---:|---:|---:|---:|---:|---:|
@@ -206,7 +209,7 @@ seven counter passes and authenticate the same loaded gfx1100 object and PCI/UUI
 Resources remain96VGPR/50SGPR,16KiB dynamic LDS,wave64,256threads,zero private
 storage/spills/scratch,16 static WMMA sites and the ordered Dot2 branch. Both have
 positive activity and1536 waves. Memory activity is25.40%/33.29%, L2 hit86.65%/79.19%,
-and LDS conflicts1.6491/19.8901. Both restore AUTO and have no competing work.
+and LDS conflicts1.6491/19.8901. Both restore AUTO.
 The512 kernel selects Dot2; static WMMA sites are not executed-branch counters.
 
 Current local evidence is `attention-automatic-scaling-{receipt,summary}.json`,
