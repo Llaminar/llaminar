@@ -5471,3 +5471,23 @@ flags, HAVE_NCCL ON at the tip, 4 proof tests excluded from the
 diff only; (3) failed-set diff: every tip-only red by NAME +
 VERBATIM line. NCCL handling confirmed per Main's rule (verbatim
 fail; nothing patched; 4 excluded both sides). Dispatched.
+
+### BASE DRIVER RUNNING + .80 binding compile ERROR @ fc39fbe93 (02:16Z)
+
+SPARKS base control (per (a)): 6ceae8219 SHA NOT fetchable by SHA
+(GitHub rejects) -> extracted the EXACT 2-line hunk from content-
+identical 03480d07e (verified 6 diff lines = the 2 TIMEOUT
+additions) + git apply ONLY that hunk; ASSERT PASSES (diff --name-
+only d5e04fdce HEAD == tests/v2/CMakeLists.txt only); reconfigure
+HAVE_NCCL=OFF + rebuild = BUILD=0 0 FAILED; BASE DRIVER3 RUNNING
+(preflight 857/1081; fresh OUT). SEAL = "d5e04fdce + (03480d07e
+CMakeLists hunk, = 6ceae8219 content) + HAVE_NCCL=OFF" — Main's
+record naming (6ceae8219 harness-only) flagged for his acceptance
+(provenance truthfully recorded). .80 BINDING @ fc39fbe93 =
+COMPILE ERROR (verbatim): MoEOverlayCapacityAdmission.cpp:715:13
+'ASSERT' was not declared in this scope — the lane's :699 invariant
+assert lacks the Assertions.h include (verified: no include in
+.cpp/.h at fc39fbe93). LANE FIX DISPATCHED (add the include per
+sibling convention; 4th instance of Mac-gate gap — the ONLY
+verification = Linux compile at the successor; .80 re-pin then).
+a8beee811 + 83a0351bd(warm) = last fully-compiling evidence.
