@@ -8,6 +8,8 @@ experts, attention, and Q8 router logits. Each requires production-path componen
 correctness, captured replay, unprofiled Release timing and isolated profiling.
 Attention additionally requires linear complete-operation scaling through 64K
 KV tokens with the query bucket held fixed, as explicitly confirmed by the user.
+The added [MTP grouped-decode work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md) covers
+missing dense WMMA producers and verifier qualification of routed/router/attention paths.
 Floating half-operand GEMM is an additional confirmed gap in the sampled vendor
 path: its actual loaded gfx1100 code object uses vector mixed-FP16 FMA, not WMMA.
 The earlier two-anchor NativeQuantised objective is documented separately in
@@ -69,13 +71,11 @@ tiles for sparse groups while retaining WMMA reuse for large groups.
 
 `grouped-fused-profile-timing-join.json` binds eight exact, spill-free profiles.
 
-A subsequent capped-directory experiment passed26,350 byte-checked timing
-samples but regressed full power-law/compact IQ2_S and sparse uniform work.
-Four profiles passed28 counter checks. Register pressure rose; fewer waves did
-not materially reduce cold fetches. Its code and cap-only tests are retired;
-the producer, patch and evidence are archived. Next preserve legacy Dot4 widths
-with four WMMA chunks per block and one device-owned row plan. That candidate
-is not implemented; Automatic remains Dot4.
+The capped-directory experiment passed26,350 byte checks and28 profile checks
+but regressed full and sparse work; its code/tests are retired and evidence archived
+in the linked investigation. A candidate preserving legacy Dot4 widths with four
+WMMA chunks and one device-owned row plan is in development, not yet compiled
+or qualified. Automatic remains Dot4.
 
 Attention Automatic resolves the measured immutable domain once at capture:
 FP16/B1/M512/HD256/capacity65536,Q/KV12/2 or8/1, full causal query scheduling and
@@ -145,7 +145,7 @@ unchanged row and generic absence; only per-alias profitable WMMA changes need
 new profiles. All-retain produces byte-identical policy and a no-change receipt.
 The broader slice completed84cells (two shapes, M512/M1024, all21formats).
 All68 runtime keys have profitable WMMA candidates, gaining1.25–2.04×. Six
-focused registered gates pass;65/168 profiles complete; remaining profiles and installed-Auto
+focused registered gates pass;87/168 profiles complete; remaining profiles and installed-Auto
 qualification remain. [Evidence and protocol](GFX1100_DENSE_PREFILL_CANDIDATE_SCOPE.md).
 
 The floating audit authenticates the dumped rocBLAS object and all17 traced

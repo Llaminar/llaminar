@@ -1,5 +1,19 @@
 # vLLM-Style MTP Project Plan
 
+## 2026-11-14: gfx1100 grouped-decode WMMA work item
+
+The user added grouped MTP decode to the active ROCm WMMA campaign. Grouped
+execution already exists: dense verifier projections use ordered dot products,
+and routed experts reuse the grouped transaction whose Automatic policy remains
+Dot4. CUDA has an installed INT8 tensor-core grouped verifier candidate. Add
+ROCm native producers and measured selection across dense/fused/shared
+projections, routed experts, router and attention, with explicit floating-format
+arithmetic admission. The [implementation work list](../2026-11/GFX1100_MTP_GROUPED_WMMA_PLAN.md)
+owns source findings, all-format/runtime-row byte gates, captured replay and
+profiling requirements. This is pending implementation/qualification; existing
+prefill wins do not establish MTP speedups. Component work uses the user's
+focused/feature-suite scope and does not claim full production certification.
+
 ## Current branch integration and backend port
 
 The October 25 CPU results below originated on the incoming GDN harness branch
