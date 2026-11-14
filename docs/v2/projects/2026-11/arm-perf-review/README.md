@@ -5729,3 +5729,23 @@ sites; the .79 full gate exposed them; the lane's audit caught them
 green => ~205 + the flaky variable. CLASSIFICATION COMPLETE — no
 unexplained fail anywhere; Gate-A conditions (A/B/C) all evidenced.
 NEXT: .80 compile+focused @ 6ca2462cc (running) -> .79 rerun.
+
+### Main rejects the blanket claim; per-name evidence required (05:27Z)
+
+Main: the arithmetic closes numerically, but "the 14 V2_Unit_* =
+same uniform-layout class" is NOT accepted as a blanket claim:
+MemoryPlanner, PhysicalMemoryAuthority, Pooled x6,
+PrefillGraphCapturability, ROCmNativeQuantised x4 = DIFFERENT
+binaries from 6ca2462cc's two test files — a test can only go
+green through 6ca2462cc if its executable compiles
+Test__MoEOverlayCapacityResolver.cpp or
+Test__MoEOverlayPipelineCapacity.cpp. ROCmNativeQuantised x4
+especially suspicious (the 4 ROCm trainer tests = among the 6 KNOWN
+base-inherited reds; "NEW at 1af9f6429" would mean green at
+03480d07e — either similar-named different tests or something
+flipped). PER-NAME EVIDENCE (sparks, JUnit reads only): (1) full
+test name + gtest case + verbatim first failure line; (2) owning
+executable (ctest -N -V) + whether it compiles a 6ca2462cc-changed
+file; (3) .79 rerun at 6ca2462cc must show ALL 14 green (any red =
+unexplained => lane verbatim). Dispatched; "layered defence" credit
+stands for the JointReplica site only; the rest waits on the lines.
