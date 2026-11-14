@@ -6030,3 +6030,38 @@ BASE 208, TIP-ONLY = 12 = exactly the 12 NCCL names, BASE-ONLY = 0,
 SHARED = 208 (incl. CachedGraph both-sides). Paths sent:
 K14-STAGEAGATE-6CA2462CC-20261114/{name-level-diff.txt, raw-arm/,
 raw-base/, SUMMARY.md}. X86 relay on the base-control diff landing.
+
+### REVIEWER STAGE-A UPDATE: NOT READY — 4 residuals + regression precision (13:38Z)
+
+Not ready for SOURCE/Gate-A ACK. VERIFIED: A3 R1-R4 + B1 present
+(sections-before-division; remote storage carries layout; archive
+tuple strides use admitted layout; chunkComp guard; pure shared
+receive/executability admission). R5 PARTLY closed. RESIDUALS:
+(1) A4 pricing — preparedFootprints(manifest, projections) @
+:896-915 (and :594-596 initial) WITHOUT input.cpu_prepared_layout
+-> exactLegacyLayerCap uses HOST-DEFAULT CPU bytes for
+max_live_experts_per_layer (separate observable quota cap from the
+layout-aware PMA resolver; all-canonical hides it; PRE-ACTIVATION
+COMPLETENESS; NOT the deferred has_cpu_resource refinement).
+(2) Tier-stream R5 — ExpertTierDirectCPUProjectionContract.inc
+:644-663 tests only rejection of unsupported/stale/resealed; the
+:535 layout hash deletion leaves them unchanged; protocol test:566
+EXPECT_NE not this v4 hash => NEED tier-level hash-sensitivity
+discriminator in the EXISTING focused preflight. (3) A4 focused
+regressions = Unit-only, NOT in the ProductionTestPreflight
+selections (inventory v8, CrossLayoutCpuPairing, SavedPlan
+LayoutIsRechecked, both ResolvedCpuPreparedLayout docs tests,
+explicit-layout footprint/admission) — register them (no new gate).
+(4) Docs :1011-1019 stale (resolveArchivePreparedUnitSections +
+RAII ExplicitPreparedSectionsForTest + public-path hook) — actual
+= parameterized detail::admitReceiveLayout; no RAII hook remains.
+REGRESSION PRECISION: remote R1 zero_root :661-672 does NOT zero
+data_stride/interleaved_block_stride (owner defaults 1024/1280);
+source-root call = CPU->GPU identity (overload requires CPU->CPU);
+destination-storage rejection :583-590 uses a GPU destination (not
+a real CPU receiver). EVIDENCE-READ: ARM name-level diff agrees
+(220/208, 12 tip-only, 0 base-only; prereqs 8); base = BOUNDED
+COMPARISON not exact-config baseline (harness hunk + HAVE_NCCL=OFF
+disclosed); native 2-device UNQUALIFIED; x86 pending. LANE TASK
+dispatched (the 4 + precision; successor on 6ca2462cc; reruns ->
+reviewer re-read -> Gate-A). Main informed.
