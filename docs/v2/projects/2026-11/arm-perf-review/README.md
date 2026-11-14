@@ -5491,3 +5491,23 @@ assert lacks the Assertions.h include (verified: no include in
 sibling convention; 4th instance of Mac-gate gap — the ONLY
 verification = Linux compile at the successor; .80 re-pin then).
 a8beee811 + 83a0351bd(warm) = last fully-compiling evidence.
+
+### Successor 1af9f6429 (LLAMINAR_ASSERT + include) landed; .80 re-pinned (02:17Z)
+
+Lane: the real root was deeper than the missing include — NO bare
+ASSERT alias exists anywhere in src/v2 (header defines LLAMINAR_
+ASSERT/LLAMINAR_ASSERTF/LLAMINAR_ASSERT_NOT_NULL; adjacent TUs use
+LLAMINAR_ASSERTF; AGENTS.md "Use ASSERT..." = aspirational).
+FIX: LLAMINAR_ASSERT(cond,msg) + #include "utils/Assertions.h"
+(placed first); invariant unchanged (CPU-participant plan carries
+a resolved observation; kHostPreparedLayout fallback dead for CPU
+byte pricing). 4TH STANDING-RULE BITE, owned in the commit: the Mac
+check of MoEOverlayCapacityAdmission.cpp died on omp.h (syntax
+invocation missing the OpenMP include path) and the failure got
+LOST IN FILTERING — exactly the slip class; ONLY acceptable
+verification = the Linux compile at the successor. COORDINATOR
+VERIFY: origin tip 1af9f6429 (1 file +2/-1; the include +
+LLAMINAR_ASSERT). RE-PIN SENT (.80 @ 1af9f6429 binding; no green
+claim until it lands; sequence: green => triage tip = 1af9f6429
+=> .79 base control+diff => WSL binding gate). AGENTS.md ASSERT-
+vs-LLAMINAR_ASSERT doc mismatch flagged to Main for the base owner.
