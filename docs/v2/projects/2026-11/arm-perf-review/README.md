@@ -5912,3 +5912,30 @@ staged + 74d04752d;isa=AVX512 marker written. **BINDING GATE @
 6ca2462cc MUST REPLICATE THE ONEDNN MARKER FIX.** WSL 9h-silence
 watch CLOSED (session working = the develop-control + thrash,
 disclosed).
+
+### Main 11:24Z: develop-control scope correction + oneDNN firm rules + marker verified
+
+(1) SCOPE CORRECTION: the develop control = the PR-level reds on
+1011d0578 (GpuWorkspace + AutomaticPlanningDiagnostics Unit+
+preflight), NOT idea08 bucket-b (closed by the base diff).
+GpuWorkspace = STATICALLY PROVEN develop-inherent (byte-identical
+test+source). **AutomaticPlanningDiagnostics = OPEN (green at
+6ca2462cc on the old base lineage; fails after the develop rebase)**
+-> discriminator re-run dispatched (ONE harness delta: wrap :31590
+in if(TARGET v2_integration_qwen35moe_original_lowering); build only
+the 2 targets; run the 3; serially after the binding gate; red =
+inherited/base owner, green = ours/Main fixes on PR). Base-owner
+items (1)(2) recorded; REQUIRES_BACKEND mechanism = our 20f6dbc09
+(recorded). (2) oneDNN MARKER, FIRM: develop control ONLY —
+acceptable ONLY if the reused library was built from the pinned
+v3.11.3 ref; Main VERIFIED upstream: refs/tags/v3.11.3 =
+74d04752d9eaefff6a9ff62466c4d20b155e5bca => the marker names the
+correct ref (admissible) provided the reused build-avx512 was
+compiled FROM that checkout — PROVENANCE to be recorded. **At
+6ca2462cc: DO NOT replicate the marker — hand-writing would FORGE
+the build authority's proof (SHA256 identity marker + installed-
+artifact digest; no fallbacks/bypasses). Instead: oneDNN ALONE as
+its own serial step (-j2) or copy the earlier authority-produced
+aa842a1be/a8beee811 WSL build dir (same identity; authority re-
+verifies the digest).** My earlier "replicate the marker" relay =
+CORRECTED (unvetted propagation); lane correction dispatched.
