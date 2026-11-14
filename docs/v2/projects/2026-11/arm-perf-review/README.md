@@ -5800,3 +5800,29 @@ ours to fix in the PR; record for the base owner.** GATE-A
 REMAINING: .80/.79 rerun @ 6ca2462cc shows rows 1-2 +
 AggregateCapacity green -> WSL x86 binding gate @ 6ca2462cc ->
 pins. All in flight.
+
+### .79 rerun @ 6ca2462cc DONE — (A) MET; per-name closure complete (06:56Z)
+
+DONE RC_DRIVER=8 RC_FOCUS=8 RC_CUDA=0. **(A) MET: ALL 17 bucket-b
+GREEN (incl. MoEPipelineAggregateCapacity).** PER-NAME closure:
+rows 1-2 uniform-layout sites ALL GREEN; remaining unit-reds = a
+DIFFERENT class — verbatim "Native graph object geometry requires
+an exact compiled GPU backend" (OrchestrationCandidateAdmission
+.RemoteOverlayAdmitsEveryRankAndRetainsDepthFifteen,
+AutomaticOrchestrationPlanner.RemoteOverlaySelectionPreserves
+DynamicMTPAndPrecisionPolicies, MoEOverlayLocalCapacityPlanner.
+ReplicatedDenseContinuationPricesFullPrimaryWeightsOnEvery
+LocalParticipant) = the SAME GPU-native-companion family as rows
+3-8 (PhysicalMemoryAuthority, Pooled x5 "Pooled source native
+backend was not compiled") — present base+03480d07e+1af9f6429+
+6ca2462cc = inherited/not-compiled, NOT a residual; .80 = same
+binaries FULLY GREEN (456 + 90 = 0 failures — CPU-only vs the .79
+CUDA-on companion class). Row 9 PrefillGraph :2789/2908/2911/2914
+= capture/GPU-shape inherited; rows 10-13 ROCm x4 FileNotFoundError
+= inherited. CONFIRMATION REQUESTED FROM MAIN: the GPU-native-obj-
+geometry + Pooled + PrefillGraph + ROCm-4 = the CUDA-ON BASE
+CONTROL's inherited set (the CPU-only base's known-6 = a different
+lane). Lane fix FULLY verified on ARM: 90/90 + 456/456 + 17/17.
+Evidence: sa-results-6ca2462cc/ + logs; seal candidate K14-STAGE
+AGATE-6CA2462CC (per the full-result-set rule) on Main's word.
+Then: WSL x86 binding gate @ 6ca2462cc -> pins -> Gate-A.
