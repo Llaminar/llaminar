@@ -6093,3 +6093,21 @@ on .80 before handback. RE-VERIFY: .80 focused -> .79 incremental
 incremental (Admission.cpp changed => yes; -j4 parity first).
 Pins: A3-fixup+A4+A4-R at the NEW tip -> Gate-A. Lane dispatched.
 x86 base diff pending independently.
+
+### Reviewer seq316: HOLD maintained; #214 = Main's A4-R; evidence confirmed (13:40Z)
+
+Reviewer: Main's seq-577 accepted all four residuals + fixture
+precision as ONE consolidated fixup; SOURCE REMAINS HOLD@6ca (docs
+residual cccb); **#214 tracks the Main-owned fix-forward (A4-R)**;
+no new execution/gate/activation authorization from review; the
+FRESH EXACT TIP will be reviewed separately. EVIDENCE CONFIRMED:
+ARM raw-name comparison 220/208 (208 shared/12 tip-only/0 base-
+only); headers sum 4443 vs 4413 tests; driver=8 both; all 12 tip-
+only have absent-native-cohort diagnostics. **CachedGraph shared
+red verified, but its XML output is capped at 307200B => the exact
+margin/flaky cause remains OWNER ATTRIBUTION** (base-owner issue on
+record). Base + harness-hunk/NCCL-off bounds stay explicit (bounded
+comparison); x86 record/diff pending. Board: lane = A4-R package;
+re-verify (.80/.79/.WSL) per Main's plan; reviewer re-read at the
+fresh tip -> Gate-A. WSL base diff + develop discriminator pending
+independently.
