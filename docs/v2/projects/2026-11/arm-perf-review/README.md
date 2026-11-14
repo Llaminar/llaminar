@@ -5623,3 +5623,22 @@ gtest, margin-level 679ms). BASE control sealed (193 fails; tip
 206 = 221 -16 +1). GATE-A: blocked ONLY on the one fix + .79 rerun
 @ successor; then WSL x86 binding gate @ successor. Lane dispatched
 (one call-site fix); Main informed.
+
+### Main 04:58Z: classification accepted; nullptr sweep + arithmetic diff
+
+(A) 16/17 + the one JointReplica red -> lane. (B) 12 = 2-rank/2-
+device UNQUALIFIED, no chain involvement (accepted). (C)
+CachedGraphReplay = flaky NOT ATTRIBUTABLE; RECORD FOR THE BASE
+OWNER: margin-level timing flakiness (1525-stage driver-memory
+boundary), red at base. LANE AMPLIFICATION (Main): since fc39fbe93
+every caller passes inventory EXPLICITLY -> the JointReplica caller
+wrote nullptr DELIBERATELY -> check EVERY explicit-nullptr call
+site (`git grep -n 'nullptr)' -- <admission callers>`) and list in
+the commit; justify each remaining (genuinely no CPU resource =>
+can't throw); fix any with a CPU budget (fixture like production,
+production live inventory; contract unchanged). ARITHMETIC: 221 ->
+206 = -16 +1 doesn't add up (should be 205) -> SPARKS: explicit
+tip(1af9f6429)-vs-03480d07e NAME DIFF (new reds at the tip not red
+at 03480d07e) — CachedGraph green->red likely the one; else
+classify. Then: successor -> .80 compile+focused (cheap) -> .79
+rerun -> WSL x86 binding gate -> pins -> Gate-A. Both dispatched.
