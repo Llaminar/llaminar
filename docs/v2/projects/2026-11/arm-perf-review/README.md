@@ -5668,3 +5668,25 @@ green. COORDINATOR VERIFY: tip 6ca2462cc; 2 test files +35/-18; no
 src/. RE-PIN SENT (.80 compile+focused -> .79 rerun -> WSL binding
 -> pins -> Gate-A). Still owed: arithmetic name-diff (sparks),
 WSL develop-control report.
+
+### Main 05:02Z: 6ca2462cc OK; Stage-B carry item recorded
+
+Main: 6ca2462cc source review OK (test-only); the 23-nullptr audit
++ justification = exactly as asked; proceed .80 -> .79 -> WSL.
+CARRY ITEM (Stage-B entry, NOT Gate-A blocking; deliberately not
+done now — no production behavior change, would cost another
+cycle): the refusal predicate :689/:695 is BROADER than the
+invariant — throws on has_cpu_resource (ANY CPU budget incl. the
+host-prefix every GPU pipeline stage carries) when inventory absent;
+the pricing invariant only needs a layout when
+planDeclaresCpuParticipant(plan) — a GPU-only plan with a host-prefix
+budget prices no CPU expert bytes (knowable from the plan alone —
+why 4 test files had to be taught an inventory they don't
+semantically need). REFINEMENT (Stage B, before compact activation):
+gate on planDeclaresCpuParticipant(plan) && !observation, derive
+only then; the CPU-participant ASSERT becomes the throw ITSELF —
+removes the assertion-only guard (cf7ce841c) and makes it a REAL
+release-mode check. Production correct today (every production
+caller passes live inventory). §8 record dispatched to the lane.
+WAITING: .80/.79 results @ 6ca2462cc, the 1af9f6429-vs-03480d07e
+name diff (206 arithmetic), WSL develop-control.
