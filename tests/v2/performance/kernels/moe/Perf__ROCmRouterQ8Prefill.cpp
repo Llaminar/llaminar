@@ -6,6 +6,9 @@
  * restoration. Poisoned retained replay authenticates outputs and side products
  * before and after timing. Setup, preparation and observations stay outside the
  * measured graph. Parameter names isolate one geometry and basis for profiling.
+ * Live-prefix tournaments change only the device count between samples. Both
+ * retained graphs keep their captured capacity, and every timed pair must leave
+ * matching logits/Q8 side banks and untouched inactive/guard rows.
  */
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -61,10 +64,14 @@ struct RouterEvents
 /** @brief Production router component fixture, independently filterable by shape. */
 class ROCmRouterQ8Prefill : public ::testing::TestWithParam<RouterCase> {};
 
+/** @brief Separate full-capacity timing, retained live-prefix timing and profiling. */
+enum class RouterBenchmark { FullCapacity, LivePrefix, Profile };
+
 /** @brief Verify one production component and either measure it or profile one native replay.
- * @param c Complete immutable geometry and source basis. @param profile Collect one selected region. */
-void benchmarkRouter(const RouterCase &c, bool profile)
+ * @param c Complete immutable geometry and source basis. @param mode Explicit evidence scope. */
+void benchmarkRouter(const RouterCase &c, RouterBenchmark mode)
 {
+    const bool profile = mode == RouterBenchmark::Profile;
     if (profile && ::testing::UnitTest::GetInstance()->test_to_run_count() != 1)
         throw std::invalid_argument("isolated router profiling requires exactly one selected test case");
     initializeROCmHardwareMetadata();
@@ -108,6 +115,14 @@ void benchmarkRouter(const RouterCase &c, bool profile)
         std::array<std::unique_ptr<TensorBase>,2> q, scales, out;
         auto baseline = context.createGraphCapture(stream), candidate = context.createGraphCapture(stream);
         std::array graphs{baseline.get(),candidate.get()};
+        // Staging must outlive the event owner's terminal drain, including
+        // a failure part-way through a group of asynchronous observations.
+        std::vector<float> poison(outputs,-12345.f), a(outputs), b(outputs);
+        std::vector<int8_t> poison_q(inputs,23), aq(inputs), bq(inputs);
+        std::vector<float> poison_s(inputs/32,-17.f), as(inputs/32), bs(inputs/32);
+        std::vector<float> reference_logits(outputs), reference_scales(inputs/32);
+        std::vector<int8_t> reference_codes(inputs);
+        std::array<int,1> published_count{c.rows};
         RouterEvents events{backend,device,stream,backend->createTimingEvent(ordinal),backend->createTimingEvent(ordinal)};
         routerRequire(events.start && events.stop, "router benchmark native events");
         const int replays = profile ? 1 : 16;
@@ -155,19 +170,25 @@ void benchmarkRouter(const RouterCase &c, bool profile)
             ASSERT_EQ(matrix_nodes, path ? replays : 0);
             routerRequire(graphs[path]->instantiate(), "router benchmark instantiate");
         }
-        std::vector<float> poison(outputs,-12345.f), a(outputs), b(outputs);
-        std::vector<int8_t> poison_q(inputs,23), aq(inputs), bq(inputs);
-        std::vector<float> poison_s(inputs/32,-17.f), as(inputs/32), bs(inputs/32);
-        const auto verify = [&](int count)
+        // The explicit ordered producer ran with all rows before capture.
+        // Freeze its independent banks before any dirty replay can replace them.
+        routerRequire(backend->deviceToHost(reference_logits.data(),fp(out[0]),outputs*4,ordinal,stream) &&
+            backend->deviceToHost(reference_codes.data(),codes(q[0]),inputs,ordinal,stream) &&
+            backend->deviceToHost(reference_scales.data(),fp(scales[0]),reference_scales.size()*4,ordinal,stream) &&
+            backend->synchronizeStream(stream,ordinal), "router full-live ordered reference");
+        ASSERT_TRUE(std::all_of(reference_logits.begin(),reference_logits.begin()+size_t(c.rows)*c.experts,
+            [](float value) { return std::isfinite(value); }));
+        ASSERT_TRUE(std::any_of(reference_logits.begin(),reference_logits.begin()+size_t(c.rows)*c.experts,
+            [](float value) { return value != 0.f; }));
+        const auto poison_path = [&](int path)
         {
-            routerRequire(backend->hostToDevice(live->gpu_data_ptr(),&count,sizeof(count),ordinal,stream), "router benchmark live publication");
-            for (int path = 0; path < 2; ++path)
-            {
-                routerRequire(backend->hostToDevice(fp(out[path]),poison.data(),outputs*4,ordinal,stream) &&
-                    backend->hostToDevice(codes(q[path]),poison_q.data(),inputs,ordinal,stream) &&
-                    backend->hostToDevice(fp(scales[path]),poison_s.data(),poison_s.size()*4,ordinal,stream) &&
-                    graphs[path]->launch(), "router benchmark poisoned replay");
-            }
+            routerRequire(backend->hostToDevice(fp(out[path]),poison.data(),outputs*4,ordinal,stream) &&
+                backend->hostToDevice(codes(q[path]),poison_q.data(),inputs,ordinal,stream) &&
+                backend->hostToDevice(fp(scales[path]),poison_s.data(),poison_s.size()*4,ordinal,stream),
+                "router benchmark poison publication");
+        };
+        const auto observe = [&](int count)
+        {
             routerRequire(backend->deviceToHost(a.data(),fp(out[0]),outputs*4,ordinal,stream) &&
                 backend->deviceToHost(b.data(),fp(out[1]),outputs*4,ordinal,stream) &&
                 backend->deviceToHost(aq.data(),codes(q[0]),inputs,ordinal,stream) &&
@@ -178,15 +199,29 @@ void benchmarkRouter(const RouterCase &c, bool profile)
             ASSERT_EQ(std::memcmp(a.data(),b.data(),outputs*4),0) << "live=" << count;
             ASSERT_EQ(aq,bq);
             ASSERT_EQ(std::memcmp(as.data(),bs.data(),as.size()*4),0);
+            ASSERT_EQ(std::memcmp(reference_logits.data(),b.data(),size_t(count)*c.experts*4),0);
+            ASSERT_EQ(std::memcmp(reference_codes.data(),bq.data(),size_t(count)*c.width),0);
+            ASSERT_EQ(std::memcmp(reference_scales.data(),bs.data(),size_t(count)*c.width/32*4),0);
             for (size_t i = size_t(count)*c.experts; i < outputs; ++i) ASSERT_EQ(b[i],poison[i]);
             for (size_t i = size_t(count)*c.width; i < inputs; ++i) ASSERT_EQ(bq[i],poison_q[i]);
             for (size_t i = size_t(count)*c.width/32; i < bs.size(); ++i) ASSERT_EQ(bs[i],poison_s[i]);
         };
+        const auto verify = [&](int count)
+        {
+            published_count[0] = count;
+            routerRequire(backend->hostToDevice(live->gpu_data_ptr(),published_count.data(),sizeof(int),ordinal,stream), "router benchmark live publication");
+            for (int path = 0; path < 2; ++path)
+            {
+                poison_path(path);
+                routerRequire(graphs[path]->launch(), "router benchmark poisoned replay");
+            }
+            observe(count);
+        };
         for (int count : {c.rows,0,1,c.rows/2,c.rows}) { verify(count); if (::testing::Test::HasFatalFailure()) return; }
-        for (int iteration = 0; iteration < warmups; ++iteration)
-            for (auto *graph : graphs) routerRequire(graph->launch(), "router benchmark warmup");
         if (profile)
         {
+            for (int iteration = 0; iteration < warmups; ++iteration)
+                for (auto *graph : graphs) routerRequire(graph->launch(), "router profile warmup");
             routerRequire(backend->synchronizeStream(stream,ordinal), "router profile preconditioning");
             routerRequire(roctxRangePushA("ROCmRouterQ8NativeWmma") >= 0, "router profile range");
             if (roctxProfilerResume(0) != 0)
@@ -201,45 +236,63 @@ void benchmarkRouter(const RouterCase &c, bool profile)
             std::cout << "ROCM_ROUTER_PROFILE," << c.rows << ',' << c.width << ',' << c.experts << ',' << int(c.basis) << ",1\n";
             return;
         }
-        std::array<std::array<double,samples>,2> timings{};
-        for (int sample = 0; sample < samples; ++sample)
-            for (int order = 0; order < 2; ++order)
+        std::vector<int> live_points{c.rows};
+        if (mode == RouterBenchmark::LivePrefix)
+        {
+            live_points = {0,1,std::min(16,c.rows),c.rows/2,c.rows-1,c.rows};
+            std::sort(live_points.begin(),live_points.end());
+            live_points.erase(std::unique(live_points.begin(),live_points.end()),live_points.end());
+        }
+        for (const int count : live_points)
+        {
+            verify(count); if (::testing::Test::HasFatalFailure()) return;
+            for (int iteration = 0; iteration < warmups; ++iteration)
+                for (auto *graph : graphs) routerRequire(graph->launch(), "router prefix warmup");
+            std::array<std::array<double,samples>,2> timings{};
+            for (int sample = 0; sample < samples; ++sample)
             {
-                const int path = order ^ (sample & 1);
-                routerRequire(backend->recordEvent(events.start,ordinal,stream) && graphs[path]->launch() &&
-                    backend->recordEvent(events.stop,ordinal,stream) && backend->waitForEvent(events.stop,ordinal), "router benchmark timing");
-                float ms = 0;
-                routerRequire(backend->eventElapsedTimeMs(events.start,events.stop,ordinal,&ms), "router benchmark elapsed events");
-                routerRequire(std::isfinite(ms) && ms > 0, "router benchmark requires positive finite elapsed time");
-                timings[path][sample] = ms * 1000.0 / replays;
+                for (int order = 0; order < 2; ++order)
+                {
+                    const int path = order ^ (sample & 1);
+                    // Publish poison on the exact stream before the start event;
+                    // no timed replay can borrow a warmup or earlier sample's output.
+                    poison_path(path);
+                    routerRequire(backend->recordEvent(events.start,ordinal,stream) && graphs[path]->launch() &&
+                        backend->recordEvent(events.stop,ordinal,stream) && backend->waitForEvent(events.stop,ordinal), "router benchmark timing");
+                    float ms = 0;
+                    routerRequire(backend->eventElapsedTimeMs(events.start,events.stop,ordinal,&ms), "router benchmark elapsed events");
+                    routerRequire(std::isfinite(ms) && ms > 0, "router benchmark requires positive finite elapsed time");
+                    timings[path][sample] = ms * 1000.0 / replays;
+                }
+                // The two candidates own separate banks: inspect this timed pair
+                // before a later replay of either producer could repair its state.
+                observe(count); if (::testing::Test::HasFatalFailure()) return;
             }
-        // Observe timed outputs before another producer could repair an error.
-        routerRequire(backend->deviceToHost(a.data(),fp(out[0]),outputs*4,ordinal,stream) &&
-            backend->deviceToHost(b.data(),fp(out[1]),outputs*4,ordinal,stream) &&
-            backend->deviceToHost(aq.data(),codes(q[0]),inputs,ordinal,stream) &&
-            backend->deviceToHost(bq.data(),codes(q[1]),inputs,ordinal,stream) &&
-            backend->deviceToHost(as.data(),fp(scales[0]),as.size()*4,ordinal,stream) &&
-            backend->deviceToHost(bs.data(),fp(scales[1]),bs.size()*4,ordinal,stream) &&
-            backend->synchronizeStream(stream,ordinal), "router timed-output observation");
-        ASSERT_EQ(std::memcmp(a.data(),b.data(),outputs*4),0);
-        ASSERT_EQ(aq,bq);
-        ASSERT_EQ(std::memcmp(as.data(),bs.data(),as.size()*4),0);
+            std::cout << std::setprecision(9);
+            for (int sample = 0; sample < samples; ++sample)
+            {
+                std::cout << (mode == RouterBenchmark::LivePrefix ? "ROCM_ROUTER_LIVE_SAMPLE," : "ROCM_ROUTER_SAMPLE,") << c.rows << ',';
+                if (mode == RouterBenchmark::LivePrefix) std::cout << count << ',';
+                std::cout << c.width << ',' << c.experts << ','
+                    << int(c.basis) << ',' << sample << ',' << timings[0][sample] << ',' << timings[1][sample] << '\n';
+            }
+            for (auto &values : timings) std::sort(values.begin(),values.end());
+            std::cout << (mode == RouterBenchmark::LivePrefix ? "ROCM_ROUTER_LIVE_MEDIAN," : "ROCM_ROUTER_MEDIAN,") << c.rows << ',';
+            if (mode == RouterBenchmark::LivePrefix) std::cout << count << ',';
+            std::cout << c.width << ',' << c.experts << ',' << int(c.basis)
+                << ',' << timings[0][samples/2] << ',' << timings[1][samples/2] << ','
+                << timings[0][samples/2]/timings[1][samples/2] << '\n';
+        }
         for (int count : {0,1,c.rows}) { verify(count); if (::testing::Test::HasFatalFailure()) return; }
-        std::cout << std::setprecision(9);
-        for (int sample = 0; sample < samples; ++sample)
-            std::cout << "ROCM_ROUTER_SAMPLE," << c.rows << ',' << c.width << ',' << c.experts << ','
-                << int(c.basis) << ',' << sample << ',' << timings[0][sample] << ',' << timings[1][sample] << '\n';
-        for (auto &values : timings) std::sort(values.begin(),values.end());
-        std::cout << "ROCM_ROUTER_MEDIAN," << c.rows << ',' << c.width << ',' << c.experts << ',' << int(c.basis)
-            << ',' << timings[0][samples/2] << ',' << timings[1][samples/2] << ','
-            << timings[0][samples/2]/timings[1][samples/2] << '\n';
     });
 }
 
 /** @test Publish paired timing only after captured bytes and resource identity agree. */
-TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedProductionTournament) { benchmarkRouter(GetParam(),false); }
+TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedProductionTournament) { benchmarkRouter(GetParam(),RouterBenchmark::FullCapacity); }
+/** @test Measure partial work through retained capacity, including empty and one-row publication. */
+TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedLivePrefixTournament) { benchmarkRouter(GetParam(),RouterBenchmark::LivePrefix); }
 /** @test Select one native production replay while setup and numerical oracles stay paused. */
-TEST_P(ROCmRouterQ8Prefill, DISABLED_IsolatedNativeProfile) { benchmarkRouter(GetParam(),true); }
+TEST_P(ROCmRouterQ8Prefill, DISABLED_IsolatedNativeProfile) { benchmarkRouter(GetParam(),RouterBenchmark::Profile); }
 
 /** @return Canonical row buckets, authenticated model routers and explicit boundary controls. */
 std::vector<RouterCase> routerCases()

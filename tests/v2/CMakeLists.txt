@@ -30619,6 +30619,11 @@ if(HAVE_ROCM)
             --gtest_filter=NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedProductionTournament/M512K2048E256*:NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedProductionTournament/M512K3072E256*:NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedProductionTournament/M512K2560E512*:NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedProductionTournament/M512K8192E512*
         LABELS "V2;Performance;ROCm;MoE;Q8;WMMA;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+    add_v2_test(V2_Perf_ROCmRouterQ8LivePrefix
+        COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill> --gtest_also_run_disabled_tests
+            --gtest_filter=NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedLivePrefixTournament/M512K2048E256*:NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedLivePrefixTournament/M512K3072E256*:NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedLivePrefixTournament/M512K2560E512*:NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedLivePrefixTournament/M512K8192E512*
+        LABELS "V2;Performance;ROCm;MoE;Q8;WMMA;LiveRows;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
 endif()
 
 # Explicit half-operand policy, identity, and verifier lifecycle regressions.
