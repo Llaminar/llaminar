@@ -5847,3 +5847,21 @@ the base fails "Native graph object geometry requires an exact
 compiled GPU backend" in planner/admission Unit tests = a
 BACKEND-DETECTION DEFECT CLASS worth one issue. Dispatched to
 sparks (diff -> seal gate).
+
+### SEAL K14-STAGEAGATE-6CA2462CC-20261114 WRITTEN; diff EXACT (07:24Z)
+
+DIFF (base FULL vs 6ca2462cc FULL): base 208 fails; tip 220;
+TIP-ONLY = 12 = {the 12 NCCL-gated 2-rank/2-device names} NOTHING
+ELSE; BASE-ONLY = 0. CachedGraph = red at BOTH (shared) => NOT in
+tip-only = inherited flaky BY EVIDENCE (even cleaner than required).
+=> GPU-native-obj-geometry/Pooled/PrefillGraph/ROCm-4 = in the
+base's set too = CUDA-on base inherited BY EVIDENCE => (A)
+SATISFIED, (B) 12 UNQUALIFIED, (C) CachedGraph flaky shared/
+inherited — ALL THREE Gate-A conditions closed on the record.
+SEAL: K14-STAGEAGATE-6CA2462CC-20261114 (SUMMARY
+/Users/floriankinder/llaminar-spark-results/.../SUMMARY.md; raw
+FULL set incl unit.xml: .79 stagea-seal-6ca2462cc/ 25MB 13
+artifacts + sa-results-6ca2462cc/). Main notified (sequence
+continuation = WSL x86 binding gate @ 6ca2462cc -> pins -> Gate-A;
+his call/standing spec). WSL probe out (develop-control status +
+binding-gate readiness).
