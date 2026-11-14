@@ -6375,3 +6375,20 @@ registrations + assert tests>0 from the JUnit/XML (not rc 0).
 Test-registration only — the .79/WSL reruns @ 9ba1d4da2 do NOT
 wait (Main); pins after the fold-in. Dispatched: lane (3 + script),
 sparks (4: the two registrations' tests>0 assert in the .80 run).
+
+### WSL x86 @ 9ba1d4da2 RUNNING (14:38Z)
+
+WSL re-target acknowledged: worktree wt-armq-9ba1d4da2, external
+staged (oneDNN 74d04752d/v3.11.3); fixups confirmed (StageCapacity
+filter incl. TierLegacyCap...; ResolvedCpuPreparedLayoutDocument
+filter = OrchestrationConfigDocument.* corrected). GATE RUNNING:
+armq-a512-9ba1d4da2, CONFIGURE_RC=0 (oneDNN authority re-verified
+golden build-avx512 — no forged markers), parity TU ninja -j1
+prebuild [60/800] (mem safe). Will report DRIVER_RC + failed-set
+delta vs the 6ca seal + the 2 new tests green + the cap tests
+(TierLegacyCap... + CpuResourcesPriceOnlyTheBoundOverlayLayout)
+green; then the develop discriminator. 56829099c restart stopped/
+superseded; ef86de1c1 partial kept as its own superseded record.
+Board: sparks .80 focused + .79 incremental @ 9ba1d4da2 (in
+flight); WSL x86 @ 9ba1d4da2 (in flight); lane = vacuous-filter
+robustness commit (pending); reviewer = waiting for the evidence.
