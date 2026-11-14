@@ -6461,3 +6461,19 @@ besides the standing board: lane final commit (in progress) ->
 SHA -> re-targets (sparks .80/.79 + WSL x86 @ the final tip;
 behavior-identical to 8ccfa771c) -> completed records -> FINAL PIN
 REQUEST -> reviewer re-read -> Gate-A d5e04fdce..final tip.
+
+### FINAL SHA c8beed852 verified; all hosts re-targeted (14:53Z)
+
+Lane: c8beed852 on 8ccfa771c (verified: design doc +
+ExpertTierDirectCPUProjectionContract.inc comment only, +14/-10 =
+behavior identical to 8ccfa771c) — final commit per Main's seq-278:
+complete set = B1+B2 (9ba1d4da2) -> guard + 10/10 (8ccfa771c) ->
+docs/comment precision (c8beed852); reviewer HOLD items all closed;
+everything else in A4-R CLOSED. TIPS: gate/review = c8beed852
+(docs tip = same this time). RE-TARGETED: sparks (.80
+registrations tests>0 + focused; .79 incremental + diff vs the 6ca
+seal), WSL (x86 incremental @ c8beed852 -> develop discriminator).
+THEN: completed records -> FINAL source/docs pin request to the
+reviewer -> reviewer re-reads the tiny delta -> Gate-A over
+d5e04fdce..c8beed852. Stage-B carry list unchanged (calibration
+catalog + admission predicate).
