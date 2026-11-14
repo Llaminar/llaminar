@@ -7,9 +7,13 @@
  * rounded scales are applied before the original 128-owner tree. Register-local
  * subtrees join once through LDS in the same arithmetic order. No global partial
  * storage or atomics are needed. Only actual gfx1100 code objects contain WMMA.
+ * Explicit four/eight/sixteen-wave experiments repartition adjacent subtrees
+ * without changing their leaves or binary parent order. Host selection is frozen
+ * during capture; live row counts remain exclusively device-owned.
  */
 #include <hip/hip_runtime.h>
 #include "ROCmRouterQ8Prefill.h"
+#include "ROCmRouterQ8WaveTuning.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #include <algorithm>
 #include <stdexcept>
@@ -19,14 +23,16 @@ namespace llaminar2::rocm
 namespace
 {
 thread_local RouterQ8PrefillMode recording_mode = RouterQ8PrefillMode::Automatic;
+thread_local RouterQ8WaveTile recording_wave_tile = RouterQ8WaveTile::Four;
 
 /** @return Whether the admitted native target owns this exact wave64 instruction. */
 bool nativeRouterDevice(int device)
 {
     const auto &hardware = rocmHardwareMetadata().at(device);
     const auto &isa = hardware.isa_target;
+    const int waves = routerQ8WaveCount(recording_wave_tile);
     return (isa == "gfx1100" || isa.starts_with("gfx1100:")) &&
-        hardware.maximum_threads_per_block >= 256 && hardware.lds_per_block >= 4096;
+        hardware.maximum_threads_per_block >= 64 * waves && hardware.lds_per_block >= 1024 * waves;
 }
 }
 
@@ -39,6 +45,16 @@ ScopedRouterQ8PrefillMode::ScopedRouterQ8PrefillMode(RouterQ8PrefillMode mode)
     recording_mode = mode;
 }
 ScopedRouterQ8PrefillMode::~ScopedRouterQ8PrefillMode() { recording_mode = previous_; }
+
+ScopedRouterQ8WaveTile::ScopedRouterQ8WaveTile(RouterQ8WaveTile tile)
+    : previous_(recording_wave_tile)
+{
+    if (!routerQ8WaveCount(tile) || (tile != RouterQ8WaveTile::Four &&
+        recording_mode != RouterQ8PrefillMode::NativeWmma))
+        throw std::invalid_argument("router K-wave experiments require explicit NativeWmma recording");
+    recording_wave_tile = tile;
+}
+ScopedRouterQ8WaveTile::~ScopedRouterQ8WaveTile() { recording_wave_tile = previous_; }
 
 bool selectRouterQ8Wmma(int device, int rows, int width, int experts)
 {
@@ -64,20 +80,36 @@ __device__ __forceinline__ F32x4 add(F32x4 left, F32x4 right)
     return result;
 }
 
+/** @brief Join adjacent complete K subtrees in their original binary order.
+ * @tparam First First participating wave. @tparam Count Power-of-two wave span.
+ * @tparam Waves Complete shared publication extent.
+ * @param subtrees Fully published wave-owned partials. @param lane Fragment owner.
+ * @return Exact parent of the specified adjacent subtrees. */
+template<int First, int Count, int Waves>
+__device__ __forceinline__ F32x4 foldSubtrees(const F32x4 (&subtrees)[Waves][64], int lane)
+{
+    static_assert(Count > 0 && (Count & (Count-1)) == 0 && First+Count <= Waves);
+    if constexpr (Count == 1) return subtrees[First][lane];
+    else return add(foldSubtrees<First,Count/2>(subtrees,lane),
+                    foldSubtrees<First+Count/2,Count/2>(subtrees,lane));
+}
+
 /**
  * @brief Compute one output tile with the same leaf order as serial wave64 decode.
  * @tparam LogLeaves Smallest power-of-two extent covering nonempty serial owners.
  * @tparam Partitioned Whether to publish the compact participant-owned interval.
  * @tparam FixedWidth Compile-time contraction width, or zero for arbitrary admitted widths.
+ * @tparam WaveLogLimit Log2 of the maximum cooperating K-wave count.
  * @param view Captured banks, physical capacity and optional device live count.
  */
-template<int LogLeaves, bool Partitioned, int FixedWidth = 0>
-__global__ __launch_bounds__(64 * (1 << (LogLeaves < 2 ? LogLeaves : 2)))
+template<int LogLeaves, bool Partitioned, int FixedWidth = 0, int WaveLogLimit = 2>
+__global__ __launch_bounds__(64 * (1 << (LogLeaves < WaveLogLimit ? LogLeaves : WaveLogLimit)))
 void kernel(RouterQ8PrefillView view)
 {
 #if defined(__gfx1100__)
     static_assert(__builtin_amdgcn_is_invocable(__builtin_amdgcn_wmma_i32_16x16x16_iu8_w64));
     static_assert(LogLeaves >= 0 && LogLeaves <= 7);
+    static_assert(WaveLogLimit >= 2 && WaveLogLimit <= 4);
     const int width = FixedWidth ? FixedWidth : view.width;
     const int experts = view.experts, blocks = width / 32;
     int rows = view.live_rows ? max(0, min(view.capacity, *view.live_rows)) : view.capacity;
@@ -90,7 +122,7 @@ void kernel(RouterQ8PrefillView view)
     }
     const int row_base = blockIdx.y * 16, expert_base = blockIdx.x * 16;
     if (row_base >= rows || expert_base >= experts) return;
-    constexpr int LogKWaves = LogLeaves < 2 ? LogLeaves : 2;
+    constexpr int LogKWaves = LogLeaves < WaveLogLimit ? LogLeaves : WaveLogLimit;
     constexpr int LocalLogLeaves = LogLeaves - LogKWaves;
     const int lane = threadIdx.x % 64, k_wave = threadIdx.x / 64;
     const int operand_row = row_base + lane % 16;
@@ -154,9 +186,7 @@ void kernel(RouterQ8PrefillView view)
         subtrees[k_wave][lane] = total;
         __syncthreads();
         if (k_wave != 0) return;
-        total = add(subtrees[0][lane], subtrees[1][lane]);
-        if constexpr (LogKWaves == 2)
-            total = add(total, add(subtrees[2][lane], subtrees[3][lane]));
+        total = foldSubtrees<0,(1 << LogKWaves)>(subtrees,lane);
     }
     #pragma unroll
     for (int e = 0; e < 4; ++e)
@@ -190,13 +220,23 @@ bool routerQ8Prefill(const RouterQ8PrefillView &view, void *stream)
     while ((1 << log_leaves) < std::min(128, view.width / 32)) ++log_leaves;
     auto submit = [&]<int LogLeaves, int FixedWidth = 0>()
     {
-        const dim3 grid((view.experts + 15) / 16, (rows + 15) / 16);
-        constexpr int threads = 64 * (1 << (LogLeaves < 2 ? LogLeaves : 2));
-        if (view.partition.participants() > 1)
-            router_q8_prefill_detail::kernel<LogLeaves, true, FixedWidth><<<grid, threads, 0, native_stream>>>(view);
-        else
-            router_q8_prefill_detail::kernel<LogLeaves, false, FixedWidth><<<grid, threads, 0, native_stream>>>(view);
-        return hipGetLastError() == hipSuccess;
+        const auto submit_tile = [&]<int WaveLogLimit>()
+        {
+            const dim3 grid((view.experts + 15) / 16, (rows + 15) / 16);
+            constexpr int threads = 64 * (1 << (LogLeaves < WaveLogLimit ? LogLeaves : WaveLogLimit));
+            if (view.partition.participants() > 1)
+                router_q8_prefill_detail::kernel<LogLeaves, true, FixedWidth, WaveLogLimit><<<grid, threads, 0, native_stream>>>(view);
+            else
+                router_q8_prefill_detail::kernel<LogLeaves, false, FixedWidth, WaveLogLimit><<<grid, threads, 0, native_stream>>>(view);
+            return hipGetLastError() == hipSuccess;
+        };
+        switch (recording_wave_tile)
+        {
+        case RouterQ8WaveTile::Four: return submit_tile.template operator()<2>();
+        case RouterQ8WaveTile::Eight: return submit_tile.template operator()<3>();
+        case RouterQ8WaveTile::Sixteen: return submit_tile.template operator()<4>();
+        }
+        return false;
     };
     // Width specialization removes dynamic row strides and redundant inner K
     // loop tests. It retains the same 128-owner arithmetic and K-subtree fold.

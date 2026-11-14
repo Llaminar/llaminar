@@ -30623,6 +30623,18 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Q8;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmRouterQ8WmmaReplay)
+    add_v2_test(V2_Integration_ROCmRouterQ8WaveTilesReplay
+        COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+            --gtest_filter=RouterHadamardQ8.ROCmWmmaWaveTilesCapturedReplay:MoERouterOwnedRows.ROCmWmmaWaveTilesCapturedReplay
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Q8;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmRouterQ8WaveTilesReplay)
+    add_v2_test(V2_Integration_ROCmRouterQ8TimingReplay
+        COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
+            --gtest_filter=ROCmRouterQ8Timing.CapturedEventBoundaryReplay
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Q8;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK rocm_gpu_0)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmRouterQ8TimingReplay)
     add_v2_test(V2_Perf_ROCmRouterQ8Wmma
         COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill> --gtest_also_run_disabled_tests
             --gtest_filter=NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedProductionTournament/M512K2048E256*:NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedProductionTournament/M512K3072E256*:NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedProductionTournament/M512K2560E512*:NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedProductionTournament/M512K8192E512*

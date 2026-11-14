@@ -20,7 +20,7 @@ The earlier two-anchor NativeQuantised objective is documented separately in
 | Dense quantized prefill | Native prepared-weight adapters select INT8 matrix tiles and preserve source scale arithmetic. | `ROCmNativeQuantisedWmma.hip` already implements all physical decoders on actual gfx1100. The generated production WMMA entries cover only N8192/K2048 at M512 and M1024. Broaden measured exact dispatch for QKV, attention outputs, FFN, shared experts and declared TP participants. |
 | Routed quantized MoE | `CUDAMoEGroupedPrefillKernels.cu` uses `mma.sync.m16n8k32` for grouped projections. | `ROCmMoEGroupedWmma.hip` implements source-exact M16N32/N64 leaves under existing ExpertTiled device admission. Automatic remains ordered Dot4 while measured selection is qualified; RouteOwned retains its admitted sparse/empty domain. |
 | Attention prefill | `CUDAFlashAttentionKernels.cu:1109` uses WMMA half QK with FP32 score accumulation; its general PV is scalar FP32. The active bounded HD256 specialization additionally uses tensor-core PV at `CUDATensorPrefillKernels.cu:328`. | `ROCmFlashAttentionKernels.hip` now has an explicit native four-plane QK candidate preserving the existing half-dot chains and FP32 PV. Automatic remains Dot2 pending full-path timing and isolated profiling. |
-| Q8 router logits | `CUDARouterQ8PrefillDevice.cuh` uses exact INT8 MMA with the router's fixed FP32 tree. | Initial `ROCmRouterQ8Prefill.hip` candidate is implemented and under qualification. The ROCm tree combines adjacent leaves first; copying CUDA's leaf permutation would change bytes. Automatic dispatch remains ordered dot products until measured admission is installed. |
+| Q8 router logits | `CUDARouterQ8PrefillDevice.cuh` uses exact INT8 MMA with the router's fixed FP32 tree. | Four/eight/sixteen-wave candidates preserve the ROCm adjacent-leaf tree and pass retained byte replay. Exact automatic admission remains pending. |
 | Explicit half-operand floating projection | `CuBLASGemmKernel.cu:380` submits FP16 A/B and FP32 C through the tensor-operation library interface. | `HipBLASGemmKernel.cpp:291` submits half A/B and FP32 C through `hipblasGemmEx`, but the sampled M512/N8192/K2048 gfx1100 dispatch selects a vector FMA implementation. Library API admission does not establish matrix instruction use. |
 
 Native FP16/BF16 storage alone does not imply the half-operand arithmetic policy.
@@ -35,7 +35,7 @@ production dispatch: GPU prepared quantized weights use NativeQuantised adapters
 | Broader dense dispatch | Existing native kernel; inventory audited | Prior two-anchor all-codebook proof remains valid for its original producer | Broader collection and generated installation pending |
 | Grouped MoE | Wave64 M16N32/N64 plus explicit whole-expert row floors4/8/12/16; all physical decoders | Serial, promoted, all-format mixed-writer, threshold/reset and split/sliced-down replay pass | Clean full-live N32 gains 1.04–1.30× across five anchors. Hybrid power-law and sparse replay regress; Automatic remains Dot4 |
 | Attention | Native four-plane QK candidate for HD256/tile16×16, all native KV formats and query/context schedules | Four new retained tests pass: all formats, B2/GQA/ring, 64K/partial/reset, half extrema and forced rejection. Existing lifecycle/reference gates pass | Fixed-M512 1K–64K scaling gate passes; 64K gains 1.15× dense / 1.13× MoE. Native direct/context profiles have zero spills; Automatic remains Dot2 |
-| Q8 router | Typed forced recording; normal and compact owned-row bridges; cooperative K subtrees, fixed-width variants and local scale shuffles | Ten focused ROCm tests pass, including normal/owned capture, finite-scale extremes, raw compact logits and poisoned tails | Clean retained-prefix48-cell run confirms full-live gains1.37–2.52× at three widths, but live1 regresses on most bases. Custom512-only buckets admit those tails; Automatic remains Dot4 |
+| Q8 router | Exact four/eight/sixteen-wave K subtrees; normal and compact owned-row bridges | Existing native replay, two new wave suites and retained timing replay pass | Clean 144-cell in-graph run: sixteen waves gives 1.42–2.74× at full 512. K2560/E512 also wins all measured prefixes; other widths retain live1 losses. Automatic remains Dot4 pending narrow admission |
 | Floating half GEMM | Existing production hipBLAS path; sampled native matrix gap confirmed | Three retained graph replays pass, each containing cast and vendor GEMM | Loaded bytes/ISA authenticated; complete Release cast+GEMM timing pending |
 
 [Router live-prefix qualification](GFX1100_ROUTER_LIVE_PREFILL.md) records the small-tail admission gap.
@@ -100,34 +100,40 @@ original AUTO power is restored. Evidence is bound by
 `attention-qk-{default,context}-profile/`. Occupancy queries report limits, not
 achieved occupancy; profile durations are not timing labels.
 
-Router functional owners are `RouterHadamardQ8.ROCmWmmaCapturedReplay`,
-`MoERouterOwnedRows.ROCmWmmaCapturedReplay` and
-`MoERouterHiddenQ8ScaleRange.ROCmWmmaCapturedReplay`, explicitly registered together as
-`V2_Integration_ROCmRouterQ8WmmaReplay` in production preflight. They authenticate
-the selected native symbol, zero private storage, normal/rotated bases, partial
-tiles, K-owner boundaries, live empty/shrink/grow transitions, compact logits,
-top-k and publication of all original expert-input rows. The current candidate's
-isolated native profile reports 67 logical VGPRs (68 allocated), 19 logical
-SGPRs, 4096 bytes LDS, zero scratch/spills, 2048 waves, zero LDS bank conflicts
-and 96.20% L2 hit rate for M512/K2048/E256. The exact wave64 kernel uses 256
-threads and a 16×32 block grid. Profiler launches run inside `mpirun -np 1` so the
-MPI singleton helper is not instrumented; wrapping the singleton directly hung
-in profiler child finalization. The original AUTO power mode was restored.
-The exact linked-core identity matches the unprofiled timing receipt. The source
-16-lane scale shuffle still lowers to cross-half-wave instructions in current
-ISA; no shuffle-elimination claim is made. Measured automatic admission and
-production engine-specific PerfStats remain open.
+Router replay is explicitly registered as `V2_Integration_ROCmRouterQ8WmmaReplay`,
+`V2_Integration_ROCmRouterQ8WaveTilesReplay` and
+`V2_Integration_ROCmRouterQ8TimingReplay`. Normal/owned tests authenticate both
+bases, tiny/ragged/wide K, actual wave-cap symbols, launch resources, live reset,
+compact raw logits/top-k and complete original Q8 publication. The existing and
+new wave suites pass in 29.33/39.30s; the timing owner passes in 4.95s.
 
-At M512, current complete-component median ratios for Original / Hadamard bases
-are 1.46× / 1.38× (K2048/E256), 2.52× / 2.31× (K2560/E512),
-1.85× / 1.68× (K3072/E256), and 0.90× / 0.92× (K8192/E512). The width8192
-regression prevents blanket WMMA selection. These are component improvements,
-not end-to-end model throughput or the earlier CUDA percentage-of-peak objective.
-All eight benchmark cases and ten focused router tests pass. Runtime parameter
-registration now borrows build-embedded canonical geometry; the device-free
-bootstrap passes with zero source-manifest opens under syscall tracing. Both
-normal and compact reference submissions explicitly pin ordered Dot4 so later
-automatic WMMA installation cannot turn the numerical oracle into a self-check.
+Current router timing uses parent-owned events inside each retained 16-operation
+graph; external events only join completion. All 24 cases/144 cells have 31 paired
+samples, immutable Dot4 references, per-sample poison, clean overlap receipts and
+unchanged producers. Sixteen-wave full 512 ratios are 1.522/1.418 (K2048/E256),
+2.742/2.474 (K2560/E512),2.210/1.951 (K3072/E256) and1.649/1.559 (K8192/E512),
+Original/Hadamard respectively. At K2560/E512 all measured live counts 0/1/16/256/
+511/512 win; live1 paired 95% intervals are 1.0075–1.0137 and1.0089–1.0140.
+Other widths retain live1 ratios 0.876–0.956. Supported 512-only buckets admit
+small tails, and compact ownership can also produce local 512 capacity from a
+larger unmeasured matrix. Automatic therefore remains Dot4 until exact
+ownership-aware engine/tile admission and actual-Auto counters/replay are installed.
+
+Six isolated router profiles match the final timing producer files: 4/8/16 waves
+at K2048, 8/16 at K8192 and 16 at K2560. All are wave64, have 2 INT8 WMMA instruction
+sites, positive counters and zero scratch/spills/LDS conflicts. VGPRs range 63–83;
+LDS is 4/8/16KiB and blocks use 256/512/1024 threads. Logical versus allocated
+registers, potential residency limits and raw ISA remain explicit in the
+[router qualification](GFX1100_ROUTER_LIVE_PREFILL.md). Every profile restores
+AUTO power. Old external-bracket clocks remain historical; in-graph samples own
+current admission conclusions.
+
+Dense collection now has an explicit installed-Auto plus four-WMMA protocol,
+with separate cell/batch/v5-plan identity and unchanged exhaustive v4 evidence.
+All 80 collector tests and the registered evidence gate pass; the Release trainer
+builds for gfx906/gfx1100. This enables a declared finite broader-shape collection;
+no new dense rows are installed by that tooling slice. See
+[the scoped collector](GFX1100_DENSE_PREFILL_CANDIDATE_SCOPE.md).
 
 The floating audit authenticates the runtime-dumped vendor code object against
 the installed rocBLAS image, including all 17 traced symbols/entry offsets:

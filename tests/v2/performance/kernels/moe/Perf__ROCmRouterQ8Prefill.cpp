@@ -8,7 +8,9 @@
  * measured graph. Parameter names isolate one geometry and basis for profiling.
  * Live-prefix tournaments change only the device count between samples. Both
  * retained graphs keep their captured capacity, and every timed pair must leave
- * matching logits/Q8 side banks and untouched inactive/guard rows.
+ * matching logits/Q8 side banks and untouched inactive/guard rows. Internal
+ * ordered-timeline events bracket the complete captured operation chain, excluding
+ * host submission gaps; an external event only joins completed timing samples.
  */
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -22,6 +24,7 @@
 #include <rocprofiler-sdk-roctx/roctx.h>
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/rocm/moe/ROCmRouterQ8Prefill.h"
+#include "kernels/rocm/moe/ROCmRouterQ8WaveTuning.h"
 #endif
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -46,30 +49,30 @@ struct RouterCase { int rows, width, experts; RouterQ8Basis basis; };
 void routerRequire(bool success, const char *edge)
 { if (!success) throw std::runtime_error(edge); }
 /** @brief Own native timing events and drain only at the test observation boundary. */
-struct RouterEvents
+struct RouterCompletion
 {
     IBackend *backend;
     DeviceId device;
     void *stream;
-    void *start;
-    void *stop;
+    void *event;
     /** @brief Release events after every outstanding test observation completes. */
-    ~RouterEvents()
+    ~RouterCompletion()
     {
         (void)backend->synchronizeStream(stream, device.ordinal);
-        if (start) backend->destroyEvent(start, device.ordinal);
-        if (stop) backend->destroyEvent(stop, device.ordinal);
+        if (event) backend->destroyEvent(event, device.ordinal);
     }
 };
 /** @brief Production router component fixture, independently filterable by shape. */
 class ROCmRouterQ8Prefill : public ::testing::TestWithParam<RouterCase> {};
 
 /** @brief Separate full-capacity timing, retained live-prefix timing and profiling. */
-enum class RouterBenchmark { FullCapacity, LivePrefix, Profile };
+enum class RouterBenchmark { FullCapacity, LivePrefix, Profile, TimingReplay };
 
 /** @brief Verify one production component and either measure it or profile one native replay.
- * @param c Complete immutable geometry and source basis. @param mode Explicit evidence scope. */
-void benchmarkRouter(const RouterCase &c, RouterBenchmark mode)
+ * @param c Complete immutable geometry and source basis. @param mode Explicit evidence scope.
+ * @param wave_tile Captured maximum K-wave count; small K retains only nonempty subtrees. */
+void benchmarkRouter(const RouterCase &c, RouterBenchmark mode,
+    rocm::RouterQ8WaveTile wave_tile = rocm::RouterQ8WaveTile::Four)
 {
     const bool profile = mode == RouterBenchmark::Profile;
     if (profile && ::testing::UnitTest::GetInstance()->test_to_run_count() != 1)
@@ -115,6 +118,7 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode)
         std::array<std::unique_ptr<TensorBase>,2> q, scales, out;
         auto baseline = context.createGraphCapture(stream), candidate = context.createGraphCapture(stream);
         std::array graphs{baseline.get(),candidate.get()};
+        std::array<std::unique_ptr<IGPUGraphCapture>,2> fragments;
         // Staging must outlive the event owner's terminal drain, including
         // a failure part-way through a group of asynchronous observations.
         std::vector<float> poison(outputs,-12345.f), a(outputs), b(outputs);
@@ -123,8 +127,8 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode)
         std::vector<float> reference_logits(outputs), reference_scales(inputs/32);
         std::vector<int8_t> reference_codes(inputs);
         std::array<int,1> published_count{c.rows};
-        RouterEvents events{backend,device,stream,backend->createTimingEvent(ordinal),backend->createTimingEvent(ordinal)};
-        routerRequire(events.start && events.stop, "router benchmark native events");
+        RouterCompletion completion{backend,device,stream,backend->createEvent(ordinal)};
+        routerRequire(completion.event, "router benchmark completion event");
         const int replays = profile ? 1 : 16;
         constexpr int samples = 31, warmups = 10;
         for (int path = 0; path < 2; ++path)
@@ -135,6 +139,7 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode)
             for (auto *t : {q[path].get(),scales[path].get(),out[path].get()})
                 routerRequire(t->ensureOnDevice(device,stream), "router benchmark destination storage");
             rocm::ScopedRouterQ8PrefillMode policy(path ? rocm::RouterQ8PrefillMode::NativeWmma : rocm::RouterQ8PrefillMode::OrderedDot4);
+            rocm::ScopedRouterQ8WaveTile tile(path ? wave_tile : rocm::RouterQ8WaveTile::Four);
             const auto produce = [&]
             {
                 return hipMoE_gate_logits_q8_weights_decode_equivalent_rows(fp(hidden),codes(q[path]),fp(scales[path]),
@@ -142,11 +147,24 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode)
                     static_cast<const int *>(live->gpu_data_ptr()),c.basis);
             };
             routerRequire(produce() && backend->synchronizeStream(stream,ordinal), "router benchmark preparation");
-            ScopedBackendGraphCapture capture(context,*graphs[path],"router Q8 production component");
+            fragments[path] = graphs[path]->createOrderedTimelineFragment();
+            routerRequire(bool(fragments[path]), "router benchmark graph fragment");
+            ScopedBackendGraphCapture capture(context,*fragments[path],"router Q8 production component");
             routerRequire(capture.begin(), "router benchmark capture begin");
             for (int iteration = 0; iteration < replays; ++iteration)
                 routerRequire(produce(), "router benchmark captured producer");
             capture.finish();
+            const std::array<GPUOrderedTimelineStep,1> steps{{{
+                .name = path ? "router_native" : "router_ordered",
+                .kind = GPUOrderedTimelineStepKind::CapturedFragment,
+                .capture = fragments[path].get(),
+            }}};
+            routerRequire(graphs[path]->buildOrderedTimelineTransaction(steps,profile ?
+                GPUOrderedTimelineInstrumentation::Disabled : GPUOrderedTimelineInstrumentation::PerStepEvents),
+                "router benchmark internal timing owner");
+            ASSERT_EQ(graphs[path]->nodeCount(),fragments[path]->nodeCount()+(profile ? 0u : 2u));
+            ASSERT_EQ(graphs[path]->consumeOrderedTimelineTiming().state,profile ?
+                GPUOrderedTimelineTimingState::Disabled : GPUOrderedTimelineTimingState::AwaitingLaunch);
             std::vector<GPUGraphKernelNodeInfo> nodes;
             ASSERT_TRUE(graphs[path]->inspectKernelNodes(nodes));
             ASSERT_EQ(nodes.size(), size_t(replays * (c.basis == RouterQ8Basis::Original ? 2 : 3)));
@@ -155,7 +173,16 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode)
             for (const auto &node : nodes)
             {
                 ASSERT_EQ(node.local_memory_bytes_per_thread,0u) << node.name;
-                if (node.name.find("router_q8_prefill_detail") != std::string::npos) ++matrix_nodes;
+                if (node.name.find("router_q8_prefill_detail") != std::string::npos)
+                {
+                    ++matrix_nodes;
+                    unsigned waves = 1;
+                    while (waves < unsigned(c.width/32) && waves < unsigned(rocm::routerQ8WaveCount(wave_tile))) waves *= 2;
+                    const int wave_log = wave_tile == rocm::RouterQ8WaveTile::Four ? 2 : wave_tile == rocm::RouterQ8WaveTile::Eight ? 3 : 4;
+                    ASSERT_NE(node.name.find("ELi" + std::to_string(wave_log) + "EEEv"),std::string::npos) << node.name;
+                    ASSERT_EQ(node.block_x,64u*waves);
+                    ASSERT_EQ(node.static_shared_memory_bytes,waves == 1 ? 0u : waves*1024u);
+                }
                 if (!reported && (node.name.find("router_q8_prefill_detail") != std::string::npos ||
                     node.name.find("gate_logits_q8_grouped_verifier_kernel") != std::string::npos))
                 {
@@ -206,18 +233,55 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode)
             for (size_t i = size_t(count)*c.width; i < inputs; ++i) ASSERT_EQ(bq[i],poison_q[i]);
             for (size_t i = size_t(count)*c.width/32; i < bs.size(); ++i) ASSERT_EQ(bs[i],poison_s[i]);
         };
-        const auto verify = [&](int count)
+        const auto verify = [&](int count, int first = 0)
         {
             published_count[0] = count;
             routerRequire(backend->hostToDevice(live->gpu_data_ptr(),published_count.data(),sizeof(int),ordinal,stream), "router benchmark live publication");
-            for (int path = 0; path < 2; ++path)
+            for (int order = 0; order < 2; ++order)
             {
+                const int path = order ^ first;
                 poison_path(path);
                 routerRequire(graphs[path]->launch(), "router benchmark poisoned replay");
             }
             observe(count);
         };
         for (int count : {c.rows,0,1,c.rows/2,c.rows}) { verify(count); if (::testing::Test::HasFatalFailure()) return; }
+        const auto elapsed = [&](IGPUGraphCapture &owner, int path)
+        {
+            const auto value = owner.consumeOrderedTimelineTiming();
+            routerRequire(value.state == GPUOrderedTimelineTimingState::Complete && value.samples.size() == 1,
+                "router benchmark timing is missing, stale or incomplete");
+            const auto &sample = value.samples.front();
+            routerRequire(sample.name == (path ? "router_native" : "router_ordered") &&
+                sample.kind == GPUOrderedTimelineStepKind::CapturedFragment &&
+                std::isfinite(sample.elapsed_ms) && sample.elapsed_ms > 0,
+                "router benchmark timing identity or interval is invalid");
+            return sample.elapsed_ms * 1000.0 / replays;
+        };
+        if (mode == RouterBenchmark::TimingReplay)
+        {
+            constexpr std::array counts{512,0,1,256,512};
+            for (int replay = 0; replay < 20; ++replay)
+            {
+                verify(std::min(c.rows,counts[replay%counts.size()]),replay&1);
+                if (::testing::Test::HasFatalFailure()) return;
+                for (int order = 0; order < 2; ++order)
+                {
+                    const int path = order ^ (replay&1);
+                    EXPECT_GT(elapsed(*graphs[path],path),0.0);
+                    EXPECT_THROW((void)elapsed(*graphs[path],path),std::runtime_error);
+                }
+            }
+            auto disabled = context.createGraphCapture(stream);
+            const std::array<GPUOrderedTimelineStep,1> steps{{{
+                .name = "router_ordered", .kind = GPUOrderedTimelineStepKind::CapturedFragment,
+                .capture = fragments[0].get(),
+            }}};
+            ASSERT_TRUE(disabled->buildOrderedTimelineTransaction(steps,GPUOrderedTimelineInstrumentation::Disabled));
+            EXPECT_EQ(disabled->consumeOrderedTimelineTiming().state,GPUOrderedTimelineTimingState::Disabled);
+            EXPECT_THROW((void)elapsed(*disabled,0),std::runtime_error);
+            return;
+        }
         if (profile)
         {
             for (int iteration = 0; iteration < warmups; ++iteration)
@@ -254,15 +318,12 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode)
                 for (int order = 0; order < 2; ++order)
                 {
                     const int path = order ^ (sample & 1);
-                    // Publish poison on the exact stream before the start event;
+                    // Publish poison before the graph-owned start node;
                     // no timed replay can borrow a warmup or earlier sample's output.
                     poison_path(path);
-                    routerRequire(backend->recordEvent(events.start,ordinal,stream) && graphs[path]->launch() &&
-                        backend->recordEvent(events.stop,ordinal,stream) && backend->waitForEvent(events.stop,ordinal), "router benchmark timing");
-                    float ms = 0;
-                    routerRequire(backend->eventElapsedTimeMs(events.start,events.stop,ordinal,&ms), "router benchmark elapsed events");
-                    routerRequire(std::isfinite(ms) && ms > 0, "router benchmark requires positive finite elapsed time");
-                    timings[path][sample] = ms * 1000.0 / replays;
+                    routerRequire(graphs[path]->launch() && backend->recordEvent(completion.event,ordinal,stream) &&
+                        backend->waitForEvent(completion.event,ordinal), "router benchmark timing completion");
+                    timings[path][sample] = elapsed(*graphs[path],path);
                 }
                 // The two candidates own separate banks: inspect this timed pair
                 // before a later replay of either producer could repair its state.
@@ -271,13 +332,19 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode)
             std::cout << std::setprecision(9);
             for (int sample = 0; sample < samples; ++sample)
             {
-                std::cout << (mode == RouterBenchmark::LivePrefix ? "ROCM_ROUTER_LIVE_SAMPLE," : "ROCM_ROUTER_SAMPLE,") << c.rows << ',';
+                if (wave_tile != rocm::RouterQ8WaveTile::Four)
+                    std::cout << "ROCM_ROUTER_WAVE_LIVE_SAMPLE," << rocm::routerQ8WaveCount(wave_tile) << ',';
+                else std::cout << (mode == RouterBenchmark::LivePrefix ? "ROCM_ROUTER_LIVE_SAMPLE," : "ROCM_ROUTER_SAMPLE,");
+                std::cout << c.rows << ',';
                 if (mode == RouterBenchmark::LivePrefix) std::cout << count << ',';
                 std::cout << c.width << ',' << c.experts << ','
                     << int(c.basis) << ',' << sample << ',' << timings[0][sample] << ',' << timings[1][sample] << '\n';
             }
             for (auto &values : timings) std::sort(values.begin(),values.end());
-            std::cout << (mode == RouterBenchmark::LivePrefix ? "ROCM_ROUTER_LIVE_MEDIAN," : "ROCM_ROUTER_MEDIAN,") << c.rows << ',';
+            if (wave_tile != rocm::RouterQ8WaveTile::Four)
+                std::cout << "ROCM_ROUTER_WAVE_LIVE_MEDIAN," << rocm::routerQ8WaveCount(wave_tile) << ',';
+            else std::cout << (mode == RouterBenchmark::LivePrefix ? "ROCM_ROUTER_LIVE_MEDIAN," : "ROCM_ROUTER_MEDIAN,");
+            std::cout << c.rows << ',';
             if (mode == RouterBenchmark::LivePrefix) std::cout << count << ',';
             std::cout << c.width << ',' << c.experts << ',' << int(c.basis)
                 << ',' << timings[0][samples/2] << ',' << timings[1][samples/2] << ','
@@ -287,12 +354,34 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode)
     });
 }
 
+/** @test Each retained timing owner publishes one fresh named sample and rejects absent/stale samples. */
+TEST(ROCmRouterQ8Timing, CapturedEventBoundaryReplay)
+{
+    for (auto tile : {rocm::RouterQ8WaveTile::Four,rocm::RouterQ8WaveTile::Eight,rocm::RouterQ8WaveTile::Sixteen})
+    {
+        benchmarkRouter({512,2048,256,RouterQ8Basis::Original},RouterBenchmark::TimingReplay,tile);
+        if (::testing::Test::HasFatalFailure()) return;
+    }
+}
+
 /** @test Publish paired timing only after captured bytes and resource identity agree. */
 TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedProductionTournament) { benchmarkRouter(GetParam(),RouterBenchmark::FullCapacity); }
 /** @test Measure partial work through retained capacity, including empty and one-row publication. */
 TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedLivePrefixTournament) { benchmarkRouter(GetParam(),RouterBenchmark::LivePrefix); }
+/** @test Eight cooperating K waves retain the same ordered oracle and poisoned live prefixes. */
+TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedEightWaveLivePrefixTournament)
+{ benchmarkRouter(GetParam(),RouterBenchmark::LivePrefix,rocm::RouterQ8WaveTile::Eight); }
+/** @test Sixteen cooperating K waves retain the same ordered oracle and poisoned live prefixes. */
+TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedSixteenWaveLivePrefixTournament)
+{ benchmarkRouter(GetParam(),RouterBenchmark::LivePrefix,rocm::RouterQ8WaveTile::Sixteen); }
 /** @test Select one native production replay while setup and numerical oracles stay paused. */
 TEST_P(ROCmRouterQ8Prefill, DISABLED_IsolatedNativeProfile) { benchmarkRouter(GetParam(),RouterBenchmark::Profile); }
+/** @test Profile exactly one eight-wave native producer with collection paused during setup. */
+TEST_P(ROCmRouterQ8Prefill, DISABLED_IsolatedEightWaveProfile)
+{ benchmarkRouter(GetParam(),RouterBenchmark::Profile,rocm::RouterQ8WaveTile::Eight); }
+/** @test Profile exactly one sixteen-wave native producer with collection paused during setup. */
+TEST_P(ROCmRouterQ8Prefill, DISABLED_IsolatedSixteenWaveProfile)
+{ benchmarkRouter(GetParam(),RouterBenchmark::Profile,rocm::RouterQ8WaveTile::Sixteen); }
 
 /** @return Canonical row buckets, authenticated model routers and explicit boundary controls. */
 std::vector<RouterCase> routerCases()
