@@ -358,6 +358,14 @@ namespace llaminar2
         }
 
         /** @return Rank/device-qualified production-admission form of a test budget. */
+        /** @return Uniform-canonical fixture inventory covering the CPU endpoints used here. */
+        const ClusterInventory &admissionTestObserved()
+        {
+            static const ClusterInventory observed =
+                test::cpuUniformCanonicalInventory({0, 11});
+            return observed;
+        }
+
         [[nodiscard]] MoEOverlayBoundPhysicalMemoryBudget boundBudget(
             int world_rank,
             const MoEOverlayPhysicalMemoryBudget &budget)
@@ -1479,7 +1487,7 @@ namespace llaminar2
 
         const auto immutable =
             MoEOverlayCapacityAdmission::buildResolverInput(
-                plan, 2, model_manifest, budgets, {}, nullptr);
+                plan, 2, model_manifest, budgets, {}, &admissionTestObserved());
         EXPECT_EQ(
             immutable.initial_residency_policy,
             MoEOverlayInitialResidencyPolicy::PriorityFillOnly);
@@ -1496,7 +1504,7 @@ namespace llaminar2
         };
         const auto movable =
             MoEOverlayCapacityAdmission::buildResolverInput(
-                plan, 2, model_manifest, budgets, migration, nullptr);
+                plan, 2, model_manifest, budgets, migration, &admissionTestObserved());
         EXPECT_EQ(
             movable.initial_residency_policy,
             MoEOverlayInitialResidencyPolicy::
@@ -1572,7 +1580,7 @@ namespace llaminar2
             boundBudget(7, cuda_budget),
         };
         const auto input = MoEOverlayCapacityAdmission::buildResolverInput(
-            plan, kExperts, model_manifest, budgets, {}, nullptr);
+            plan, kExperts, model_manifest, budgets, {}, &admissionTestObserved());
         ASSERT_EQ(input.tiers.size(), 3u);
         EXPECT_EQ(input.tiers[0].tier_name, "violet");
         EXPECT_EQ(input.tiers[0].priority, 91);
@@ -1596,7 +1604,7 @@ namespace llaminar2
 
         const auto capacity_bound =
             MoEOverlayCapacityAdmission::resolveAndInstall(
-                plan, kExperts, model_manifest, budgets, {}, nullptr);
+                plan, kExperts, model_manifest, budgets, {}, &admissionTestObserved());
         MoERoutedExpertModelMetadata metadata;
         metadata.num_layers = 2;
         metadata.num_experts = kExperts;
@@ -3696,7 +3704,7 @@ namespace llaminar2
                 profile.expert_count,
                 model_manifest,
                 small.physical_budgets,
-                no_migration, nullptr);
+                no_migration, &admissionTestObserved());
         const auto admitted =
             MoEOverlayCapacityResolver::resolve(small_input);
         ASSERT_NE(admitted.tier(0), nullptr);
