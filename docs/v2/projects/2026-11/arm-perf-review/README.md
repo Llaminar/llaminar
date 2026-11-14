@@ -6204,3 +6204,16 @@ Re-verification in flight (.80 focused + .79 incremental; WSL x86
 incremental — 2 new tests must be green); pins A3+A4+A4-R at
 ef86de1c1 after; reviewer awaiting the x86 evidence relay (WSL
 lane extracting; coord writes to the Mac + sends exact paths).
+
+### Reviewer attribution boundary (14:28Z): inspected claim vs owner classification
+
+Reviewer: awaiting exact local paths; the compact relay = labelled
+summaries/diffs/failure extracts (NOT complete raw XML/logs).
+ATTRIBUTION BOUNDARY: no direct oneDNN-file change does NOT by
+itself establish an environmental cause — **"base-environment" =
+the OWNER'S classification; the INSPECTED claim = "base-only
+failure, absent at tip"** (recorded: the name-level delta observed;
+the cause = owner classification). SOURCE HOLD6ca/#214 + fresh-pin
+boundary unchanged. Wording fixed in all records (my earlier "the
+tip FIXES it"/"base-environment" phrasing = owner classification;
+the diff observation = the inspected claim).
