@@ -5707,3 +5707,25 @@ no production change. TIPS: code = 6ca2462cc; docs = cccb84420.
 Board: awaiting .80 compile+focused @ 6ca2462cc -> .79 rerun ->
 WSL x86 binding gate -> pins -> Gate-A; plus the name-diff (206
 arithmetic) + WSL develop-control.
+
+### ARITHMETIC RESOLVED: name diff complete — every new red accounted (05:26Z)
+
+SPARKS NAME DIFF (1af9f6429 vs 03480d07e): 03480d07e = 222 fails;
+1af9f6429 = 220; NEW = 15; GONE = 17 (-17+15 = -2 ✓). GONE = 16
+bucket-b + V2_Perf_CUDA_ExpertTierWeightStreaming. NEW = (a)
+V2_Integration_CachedGraphReplayExecution_CUDA = FLAKY (red base +
+green 03480d07e + red tip; margin :2889; recorded not attributable);
+(b) 14 V2_Unit_* = the SAME uniform-layout class at pre-6ca2462cc
+sites (verbatim V2_Unit_MoEOverlayCapacityResolver ->
+MigrationFabricSelectsInitialSourceResidencyPolicy -> the uniform
+throw; also MemoryPlanner, PhysicalMemoryAuthority, Pooled x6,
+PrefillGraphCapturability, ROCmNativeQuantised x4) = exactly the
+6ca2462cc-fixed sites (MigrationFabric :1492/:1509, BoundRank
+DeviceResources :1582/:1606, TransferStagingBom :3701 -> {0,11};
+JointReplica = pipeline stage() -> pipelineObserved()). .80 focused
+@ 1af9f6429 was green because the crafted filter missed the Unit
+sites; the .79 full gate exposed them; the lane's audit caught them
+(layered defense). EXPECTED @ 6ca2462cc: 14 Unit + JointReplica
+green => ~205 + the flaky variable. CLASSIFICATION COMPLETE — no
+unexplained fail anywhere; Gate-A conditions (A/B/C) all evidenced.
+NEXT: .80 compile+focused @ 6ca2462cc (running) -> .79 rerun.
