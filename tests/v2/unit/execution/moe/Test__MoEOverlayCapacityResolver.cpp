@@ -869,25 +869,26 @@ namespace llaminar2
             std::invalid_argument);
 
         // The bound overlay's layout is the sole pricing input; compact
-        // tables are not implemented. The observation itself is admitted
-        // (buildResolverInput validates presence, not executability); the
-        // section authority fails closed at PRICING rather than
-        // under-admitting foreign bytes.
+        // tables are not implemented. With R-1 the ADMITTED observation
+        // reaches the pricing boundary itself (the same footprint source the
+        // tier legacy cap consumes), so an unimplemented layout FAILS CLOSED
+        // at buildResolverInput — naming the admitted layout, never a
+        // host-default cap. (The old shape — presence admitted, pricing threw
+        // later — was the pre-R-1 split; the R-1 contract is fail-closed for
+        // unimplemented layouts, so the rejection at the boundary is correct.)
         plan.resolved_cpu_prepared_layout =
             CPUNativeQuantisedLayout::InterleavedCompactA64;
+        try
         {
-            const auto compact_input =
-                MoEOverlayCapacityAdmission::buildResolverInput(
-                    plan, experts, model_manifest, budgets, policy, nullptr);
-            EXPECT_EQ(compact_input.cpu_prepared_layout,
-                CPUNativeQuantisedLayout::InterleavedCompactA64);
-            EXPECT_THROW(
-                static_cast<void>(
-                    MoEOverlayCapacityResolver::preparedFootprints(
-                        compact_input.layer_weight_manifest,
-                        DeviceMoEProjectionSet::CompleteExpert,
-                        compact_input.cpu_prepared_layout)),
-                std::invalid_argument);
+            static_cast<void>(MoEOverlayCapacityAdmission::buildResolverInput(
+                plan, experts, model_manifest, budgets, policy, nullptr));
+            FAIL() << "compact-admitted pricing must fail closed at the admission boundary";
+        }
+        catch (const std::invalid_argument &error)
+        {
+            EXPECT_NE(std::string(error.what())
+                          .find("interleaved-compact-a64"),
+                      std::string::npos);
         }
 
         // The canonical bound layout prices exactly the build-default bytes.
@@ -942,10 +943,10 @@ namespace llaminar2
         EXPECT_EQ(canonical.tiers.front().copy_policy, MoEOverlayTierCopyPolicy::Apportioned);
 
         // A NON-host-equal admitted layout is the typed recorder: compact is
-        // invalid, so the pricing path (the same footprint source the legacy
-        // tier cap consumes) must fail closed naming the ADMITTED layout —
-        // never silently cap against host-default bytes. Compact tables are
-        // NOT enabled; the diagnostic is the observable.
+        // invalid, so the admission pricing boundary (the SAME footprint
+        // source the legacy tier cap consumes) fails closed naming the
+        // ADMITTED layout — never a host-default cap or quota. Compact tables
+        // are NOT enabled; the diagnostic is the observable.
         plan.resolved_cpu_prepared_layout = CPUNativeQuantisedLayout::InterleavedCompactA64;
         try
         {
