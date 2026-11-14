@@ -140,6 +140,17 @@ namespace llaminar2
             return uniform;
         }
 
+        /** @return Whether the plan declares any CPU routed participant. */
+        [[nodiscard]] bool planDeclaresCpuParticipant(
+            const MoERoutedExpertPlacementPlan &plan)
+        {
+            for (const auto &domain : plan.domains)
+                for (const auto &participant : domain.participants)
+                    if (participant.device_type == DeviceType::CPU)
+                        return true;
+            return false;
+        }
+
         [[nodiscard]] const RoutedExpertDomain &requireDomain(
             const MoERoutedExpertPlacementPlan &plan,
             const RoutedExpertTier &tier)
@@ -693,6 +704,18 @@ namespace llaminar2
             // hard refusal above. The throw is never silently defaulted.
             resolved_observation =
                 resolveUniformCpuPreparedLayoutFromInventory(*inventory, plan);
+        }
+        // The kHostPreparedLayout fallback below is dead for CPU byte pricing:
+        // it is consumed only by host-only CPU budgets whose plan declares no
+        // CPU participant (the derive returns nullopt exactly then), so no CPU
+        // byte is ever priced with the ambient build layout. A CPU participant
+        // always yields a real observation, asserted here as the invariant.
+        if (has_cpu_resource && !resolved_observation)
+        {
+            ASSERT(
+                !planDeclaresCpuParticipant(plan),
+                "a CPU-participant plan must carry a resolved CPU layout "
+                "observation before pricing");
         }
         MoEOverlayCapacityResolverInput input;
         input.num_experts = num_experts;

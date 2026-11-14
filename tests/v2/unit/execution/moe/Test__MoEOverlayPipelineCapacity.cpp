@@ -356,7 +356,7 @@ namespace llaminar2
             std::array stages{NativeStage(stage(0, 2, devices(reverse), format), 3),
                               NativeStage(stage(32, 3, devices(!reverse), format), 2)};
             const std::array requests{stages[0].request(), stages[1].request()};
-            const auto exact = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests);
+            const auto exact = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests, nullptr);
             // Set real byte boundaries from exact smaller policies, then request
             // larger caches. Each stage must retain its own largest fitting grant.
             for (std::size_t index = 0; index < stages.size(); ++index)
@@ -368,7 +368,7 @@ namespace llaminar2
                             budget(physical.device(), exact[index].resource(physical.resourceId())->usedBytes()).certificate());
                 value.setReplicaPolicy(4);
             }
-            const auto bounded = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests);
+            const auto bounded = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests, nullptr);
             ASSERT_EQ(bounded.size(), 2u);
             EXPECT_EQ(bounded[0].physical_memory_admission, bounded[1].physical_memory_admission);
             for (std::size_t index = 0; index < stages.size(); ++index)
@@ -381,11 +381,11 @@ namespace llaminar2
                 stages[index].plan = MoEOverlayCapacityResolver::installResolvedQuotas(stages[index].plan, bounded[index]);
                 stages[index].setReplicaPolicy(index == 0 ? 3 : 2);
             }
-            const auto retained = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests);
+            const auto retained = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests, nullptr);
             EXPECT_EQ(retained[0].replica_cache_capacity, bounded[0].replica_cache_capacity);
             EXPECT_EQ(retained[1].replica_cache_capacity, bounded[1].replica_cache_capacity);
             stages[1].setReplicaPolicy(4);
-            EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests), std::logic_error);
+            EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests, nullptr), std::logic_error);
         }
     }
 
@@ -394,14 +394,14 @@ namespace llaminar2
         std::array stages{NativeStage(stage(0, 2, {DeviceId::rocm(0), DeviceId::rocm(1)}), 1),
                           NativeStage(stage(32, 2, {DeviceId::cuda(0), DeviceId::cuda(1)}), 1)};
         const std::array requests{stages[0].request(), stages[1].request()};
-        const auto exact = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests);
+        const auto exact = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests, nullptr);
         auto &limiting = stages[1].budgets.front();
         limiting = MoEOverlayBoundPhysicalMemoryBudget(limiting.resourceId(),
             budget(limiting.device(), exact[1].resource(limiting.resourceId())->usedBytes() - 1).certificate());
         for (auto &value : stages) value.setReplicaPolicy(4);
-        EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests), MoEOverlayCapacityExhausted);
+        EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests, nullptr), MoEOverlayCapacityExhausted);
         stages[1].policy.device_rebalance_workspace_capacity.reset();
-        EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests), std::invalid_argument);
+        EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests, nullptr), std::invalid_argument);
     }
 
     TEST(MoEOverlayPipelineCapacity, SharedGpuReplicaBudgetPreservesLaterMinimumAndRetainedGrant)
@@ -414,7 +414,7 @@ namespace llaminar2
             std::array stages{NativeStage(stage(0, 2, devices, format), 3),
                               NativeStage(stage(32, 2, devices, format), 1)};
             const std::array requests{stages[0].request(), stages[1].request()};
-            const auto exact = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests);
+            const auto exact = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests, nullptr);
             for (auto &value : stages)
             {
                 for (auto &physical : value.budgets)
@@ -423,10 +423,10 @@ namespace llaminar2
                             budget(physical.device(), exact[0].resource(physical.resourceId())->usedBytes()).certificate());
                 value.setReplicaPolicy(4);
                 const auto isolated = MoEOverlayCapacityAdmission::resolveCapacity(value.plan, value.geometry.num_experts,
-                    value.geometry.layer_weight_manifest, value.budgets, value.policy);
+                    value.geometry.layer_weight_manifest, value.budgets, value.policy, nullptr);
                 EXPECT_EQ(isolated.replica_cache_capacity->admitted(), 4);
             }
-            const auto jointly = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests);
+            const auto jointly = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests, nullptr);
             EXPECT_EQ(jointly[0].replica_cache_capacity->admitted(), 3);
             EXPECT_EQ(jointly[1].replica_cache_capacity->admitted(), 1);
             EXPECT_EQ(jointly[0].resource(name(devices[0]))->remainingBytes(), 0u);
@@ -434,7 +434,7 @@ namespace llaminar2
             // replicas in the earlier stage, regardless of declaration order.
             stages[1].plan.replica_cache_capacity.emplace(4, 3);
             stages[1].setReplicaPolicy(3);
-            const auto retained = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests);
+            const auto retained = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests, nullptr);
             EXPECT_EQ(retained[0].replica_cache_capacity->admitted(), 1);
             EXPECT_EQ(retained[1].replica_cache_capacity->admitted(), 3);
         }
@@ -445,12 +445,12 @@ namespace llaminar2
         std::array stages{NativeStage(stage(0, 2, {DeviceId::rocm(0), DeviceId::rocm(1)}), 0),
                           NativeStage(stage(32, 2, {DeviceId::cuda(0), DeviceId::cuda(1)}), 4)};
         const std::array requests{stages[0].request(), stages[1].request()};
-        const auto cache_off = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests);
+        const auto cache_off = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests, nullptr);
         EXPECT_EQ(cache_off[0].replica_cache_capacity->admitted(), 0);
         EXPECT_EQ(cache_off[1].replica_cache_capacity->admitted(), 4);
         EXPECT_GT(cache_off[0].resource(name(DeviceId::rocm(0)))->transferStagingBytes(), 0u);
         stages[0].policy = {};
-        const auto movement_off = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests);
+        const auto movement_off = MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests, nullptr);
         EXPECT_FALSE(movement_off[0].replica_cache_capacity);
         EXPECT_EQ(movement_off[0].resource(name(DeviceId::rocm(0)))->transferStagingBytes(), 0u);
         EXPECT_EQ(movement_off[1].replica_cache_capacity->admitted(), 4);

@@ -456,8 +456,8 @@ namespace llaminar2
             int num_experts,
             const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
             const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
-            const MoEOverlayCapacityAdmissionPolicy &policy = {},
-            const ClusterInventory *inventory = nullptr);
+            const MoEOverlayCapacityAdmissionPolicy &policy,
+            const ClusterInventory *inventory);
 
         /**
          * @brief Admit complete expert coverage and the largest bounded cache.
@@ -481,8 +481,8 @@ namespace llaminar2
             int num_experts,
             const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
             const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
-            const MoEOverlayCapacityAdmissionPolicy &policy = {},
-            const ClusterInventory *inventory = nullptr);
+            const MoEOverlayCapacityAdmissionPolicy &policy,
+            const ClusterInventory *inventory);
 
         /**
          * @brief Admit a complete pipeline and its bounded replica caches together.
@@ -501,7 +501,7 @@ namespace llaminar2
          */
         [[nodiscard]] static std::vector<MoEOverlayResolvedCapacityPlan>
         resolvePipelineCapacity(std::span<const MoEOverlayStageCapacityRequest> stages,
-            const ClusterInventory *inventory = nullptr);
+            const ClusterInventory *inventory);
         /**
          * @brief Freeze replica/quota decisions without granting materialization.
          * @param stages Complete authored requests for the higher-priority search.
@@ -510,7 +510,7 @@ namespace llaminar2
          */
         static MoEOverlayCapacityDraft resolvePipelineCapacityDraft(
             std::span<const MoEOverlayStageCapacityRequest> stages,
-            const ClusterInventory *inventory = nullptr);
+            const ClusterInventory *inventory);
         /**
          * @brief Freeze a standalone overlay's higher-priority quotas and replica grant.
          * @param plan Exact hardware-bound overlay topology.
@@ -524,8 +524,8 @@ namespace llaminar2
             const MoERoutedExpertPlacementPlan &plan,int num_experts,
             const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
             const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
-            const MoEOverlayCapacityAdmissionPolicy &policy = {},
-            const ClusterInventory *inventory = nullptr);
+            const MoEOverlayCapacityAdmissionPolicy &policy,
+            const ClusterInventory *inventory);
 
         /**
          * @brief Resolve capacity and install its exact quotas into a plan copy.
@@ -544,7 +544,7 @@ namespace llaminar2
             int num_experts,
             const std::vector<MoEOverlayLayerWeightManifest> &layer_weight_manifest,
             const std::vector<MoEOverlayBoundPhysicalMemoryBudget> &physical_budgets,
-            const MoEOverlayCapacityAdmissionPolicy &policy = {},
-            const ClusterInventory *inventory = nullptr);
+            const MoEOverlayCapacityAdmissionPolicy &policy,
+            const ClusterInventory *inventory);
     };
 } // namespace llaminar2

@@ -857,7 +857,7 @@ namespace llaminar2
         // layout observation: admission refuses to price an assumed layout.
         EXPECT_THROW(
             static_cast<void>(MoEOverlayCapacityAdmission::buildResolverInput(
-                plan, experts, model_manifest, budgets, policy)),
+                plan, experts, model_manifest, budgets, policy, nullptr)),
             std::invalid_argument);
 
         // The bound overlay's layout is the sole pricing input; compact
@@ -870,7 +870,7 @@ namespace llaminar2
         {
             const auto compact_input =
                 MoEOverlayCapacityAdmission::buildResolverInput(
-                    plan, experts, model_manifest, budgets, policy);
+                    plan, experts, model_manifest, budgets, policy, nullptr);
             EXPECT_EQ(compact_input.cpu_prepared_layout,
                 CPUNativeQuantisedLayout::InterleavedCompactA64);
             EXPECT_THROW(
@@ -886,7 +886,7 @@ namespace llaminar2
         plan.resolved_cpu_prepared_layout =
             CPUNativeQuantisedLayout::InterleavedCanonical;
         const auto input = MoEOverlayCapacityAdmission::buildResolverInput(
-            plan, experts, model_manifest, budgets, policy);
+            plan, experts, model_manifest, budgets, policy, nullptr);
         EXPECT_EQ(input.cpu_prepared_layout,
             CPUNativeQuantisedLayout::InterleavedCanonical);
         const auto priced = MoEOverlayCapacityResolver::preparedFootprints(
@@ -964,19 +964,19 @@ namespace llaminar2
             };
             const auto ample = budgets_for(1u << 28, 1u << 28);
             const auto full = MoEOverlayCapacityAdmission::resolveCapacity(
-                plan, experts, model_manifest, ample, policy_for(8));
+                plan, experts, model_manifest, ample, policy_for(8), nullptr);
             ASSERT_TRUE(full.replica_cache_capacity);
             EXPECT_EQ(full.replica_cache_capacity->admitted(), 8);
             const auto off = MoEOverlayCapacityAdmission::resolveCapacity(
-                plan, experts, model_manifest, ample, policy_for(0));
+                plan, experts, model_manifest, ample, policy_for(0), nullptr);
             ASSERT_TRUE(off.replica_cache_capacity);
             EXPECT_EQ(off.replica_cache_capacity->admitted(), 0);
             const auto exact = MoEOverlayCapacityResolver::resolve(
-                MoEOverlayCapacityAdmission::buildResolverInput(plan, experts, model_manifest, ample, policy_for(3)));
+                MoEOverlayCapacityAdmission::buildResolverInput(plan, experts, model_manifest, ample, policy_for(3), nullptr));
             const auto exact_bytes = exact.resource("right")->usedBytes();
             const auto bounded = budgets_for(1u << 28, exact_bytes);
             const auto result = MoEOverlayCapacityAdmission::resolveCapacity(
-                plan, experts, model_manifest, bounded, policy_for(8));
+                plan, experts, model_manifest, bounded, policy_for(8), nullptr);
             ASSERT_TRUE(result.replica_cache_capacity);
             EXPECT_EQ(result.replica_cache_capacity->requested(), 8);
             EXPECT_EQ(result.replica_cache_capacity->admitted(), 3);
@@ -989,29 +989,29 @@ namespace llaminar2
             ASSERT_TRUE(installed.replica_cache_capacity);
             EXPECT_EQ(installed.replica_cache_capacity->resolve(8), 3);
             const auto retained = MoEOverlayCapacityAdmission::resolveCapacity(
-                installed, experts, model_manifest, bounded, policy_for(3));
+                installed, experts, model_manifest, bounded, policy_for(3), nullptr);
             EXPECT_EQ(retained.replica_cache_capacity, result.replica_cache_capacity);
             EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolveCapacity(
-                installed, experts, model_manifest, bounded, policy_for(8)), std::logic_error);
+                installed, experts, model_manifest, bounded, policy_for(8), nullptr), std::logic_error);
 
             // One byte less crosses a real physical boundary; the largest
             // remaining cache is selected without removing any model expert.
             const auto one_less = MoEOverlayCapacityAdmission::resolveCapacity(
-                plan, experts, model_manifest, budgets_for(1u << 28, exact_bytes - 1), policy_for(8));
+                plan, experts, model_manifest, budgets_for(1u << 28, exact_bytes - 1), policy_for(8), nullptr);
             EXPECT_EQ(one_less.replica_cache_capacity->admitted(), 2);
             const auto minimum = MoEOverlayCapacityResolver::resolve(
-                MoEOverlayCapacityAdmission::buildResolverInput(plan, experts, model_manifest, ample, policy_for(1)));
+                MoEOverlayCapacityAdmission::buildResolverInput(plan, experts, model_manifest, ample, policy_for(1), nullptr));
             EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolveCapacity(
-                plan, experts, model_manifest, budgets_for(1u << 28, minimum.resource("right")->usedBytes() - 1), policy_for(8)),
+                plan, experts, model_manifest, budgets_for(1u << 28, minimum.resource("right")->usedBytes() - 1), policy_for(8), nullptr),
                 MoEOverlayCapacityExhausted);
             auto invalid = policy_for(8);
             invalid.device_rebalance_workspace_capacity->num_experts = 0;
             EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolveCapacity(
-                plan, experts, model_manifest, bounded, invalid), std::invalid_argument);
+                plan, experts, model_manifest, bounded, invalid, nullptr), std::invalid_argument);
             invalid = policy_for(8);
             --invalid.device_transfer_directory_capacity.active_slots;
             EXPECT_THROW((void)MoEOverlayCapacityAdmission::resolveCapacity(
-                plan, experts, model_manifest, bounded, invalid), std::invalid_argument);
+                plan, experts, model_manifest, bounded, invalid, nullptr), std::invalid_argument);
         }
     }
 
@@ -1151,7 +1151,7 @@ namespace llaminar2
                 kExperts,
                 model_manifest,
                 {boundBudget(0, first), boundBudget(0, second)},
-                policy);
+                policy, nullptr);
         ASSERT_EQ(input.physical_budgets.size(), 2u);
         for (const auto &budget : input.physical_budgets)
         {
@@ -1184,7 +1184,7 @@ namespace llaminar2
                 kExperts,
                 model_manifest,
                 {boundBudget(0, first), boundBudget(0, second)},
-                incomplete_policy),
+                incomplete_policy, nullptr),
             std::invalid_argument)
             << "A graph-owned transfer directory without its maintenance workspace must fail admission.";
     }
@@ -1479,7 +1479,7 @@ namespace llaminar2
 
         const auto immutable =
             MoEOverlayCapacityAdmission::buildResolverInput(
-                plan, 2, model_manifest, budgets);
+                plan, 2, model_manifest, budgets, {}, nullptr);
         EXPECT_EQ(
             immutable.initial_residency_policy,
             MoEOverlayInitialResidencyPolicy::PriorityFillOnly);
@@ -1496,7 +1496,7 @@ namespace llaminar2
         };
         const auto movable =
             MoEOverlayCapacityAdmission::buildResolverInput(
-                plan, 2, model_manifest, budgets, migration);
+                plan, 2, model_manifest, budgets, migration, nullptr);
         EXPECT_EQ(
             movable.initial_residency_policy,
             MoEOverlayInitialResidencyPolicy::
@@ -1572,7 +1572,7 @@ namespace llaminar2
             boundBudget(7, cuda_budget),
         };
         const auto input = MoEOverlayCapacityAdmission::buildResolverInput(
-            plan, kExperts, model_manifest, budgets);
+            plan, kExperts, model_manifest, budgets, {}, nullptr);
         ASSERT_EQ(input.tiers.size(), 3u);
         EXPECT_EQ(input.tiers[0].tier_name, "violet");
         EXPECT_EQ(input.tiers[0].priority, 91);
@@ -1596,7 +1596,7 @@ namespace llaminar2
 
         const auto capacity_bound =
             MoEOverlayCapacityAdmission::resolveAndInstall(
-                plan, kExperts, model_manifest, budgets);
+                plan, kExperts, model_manifest, budgets, {}, nullptr);
         MoERoutedExpertModelMetadata metadata;
         metadata.num_layers = 2;
         metadata.num_experts = kExperts;
@@ -1660,7 +1660,7 @@ namespace llaminar2
             plan,
             kExperts,
             model_manifest,
-            {boundBudget(4, shared_budget)});
+            {boundBudget(4, shared_budget)}, {}, nullptr);
         ASSERT_EQ(input.physical_budgets.size(), 1u);
         ASSERT_EQ(input.tiers.size(), 2u);
         EXPECT_EQ(input.tiers[0].participants[0].resource_id,
@@ -1717,7 +1717,7 @@ namespace llaminar2
                 plan,
                 /*num_experts=*/1,
                 model_manifest,
-                {boundBudget(9, budget)}),
+                {boundBudget(9, budget)}, {}, nullptr),
             std::invalid_argument);
 
         plan.domains[0].routed_compute_policy =
@@ -1727,7 +1727,7 @@ namespace llaminar2
                 plan,
                 /*num_experts=*/1,
                 model_manifest,
-                {boundBudget(3, budget)}),
+                {boundBudget(3, budget)}, {}, nullptr),
             std::invalid_argument);
     }
 
@@ -3696,7 +3696,7 @@ namespace llaminar2
                 profile.expert_count,
                 model_manifest,
                 small.physical_budgets,
-                no_migration);
+                no_migration, nullptr);
         const auto admitted =
             MoEOverlayCapacityResolver::resolve(small_input);
         ASSERT_NE(admitted.tier(0), nullptr);

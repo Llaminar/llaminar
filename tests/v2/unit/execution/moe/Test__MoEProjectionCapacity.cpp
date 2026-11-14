@@ -117,12 +117,12 @@ namespace llaminar2
                 << '/' << static_cast<int>(format.kind) << '/' << format.native_quantised.codebook_id);
             const auto source = manifest(format);
             const auto split_plan = plan(type, degree, RoutedExpertComputePolicy::GateUpOwnedDownColumns);
-            auto input = MoEOverlayCapacityAdmission::buildResolverInput(split_plan, experts, source, budgets(split_plan), {});
+            auto input = MoEOverlayCapacityAdmission::buildResolverInput(split_plan, experts, source, budgets(split_plan), {}, nullptr);
             ASSERT_EQ(input.tiers.front().copy_policy, MoEOverlayTierCopyPolicy::GateUpOwnedDownColumns);
             const auto split = MoEOverlayCapacityResolver::resolve(input);
             const auto control_plan = plan(type, degree, RoutedExpertComputePolicy::Apportioned);
             const auto control = MoEOverlayCapacityAdmission::resolveCapacity(
-                control_plan, experts, source, budgets(control_plan), {});
+                control_plan, experts, source, budgets(control_plan), {}, nullptr);
             for (int index = 0; index < degree; ++index)
             {
                 const auto *resource = split.resource(std::to_string(index));
@@ -170,7 +170,7 @@ namespace llaminar2
                     .local_transfer_slot_count = slots.total_slots, .collective_payload_slot_capacity = 1,
                     .phase = DeviceMoERebalanceStagePhase::PlanCopyApply,
                     .transfer_mode = DeviceMoERebalanceTransferMode::CompactTransferSlots}};
-            const auto input = MoEOverlayCapacityAdmission::buildResolverInput(p, 24, source, budgets(p), policy);
+            const auto input = MoEOverlayCapacityAdmission::buildResolverInput(p, 24, source, budgets(p), policy, nullptr);
             const auto profile = DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(source, DeviceMoEProjectionSet::GateUp);
             const auto whole = DeviceMoETransferSlotDirectory::profileForLayerWeightManifest(source);
             ASSERT_EQ(profile.allocation_specs.size(), 2u);
@@ -196,7 +196,7 @@ namespace llaminar2
     {
         const auto source = manifest(ExpertWeightFormat::floating(TensorType::FP32));
         const auto p = plan(DeviceType::ROCm, 2, RoutedExpertComputePolicy::GateUpOwnedDownColumns);
-        const auto valid = MoEOverlayCapacityAdmission::buildResolverInput(p, 24, source, budgets(p), {});
+        const auto valid = MoEOverlayCapacityAdmission::buildResolverInput(p, 24, source, budgets(p), {}, nullptr);
         auto bad = valid;
         bad.tiers.front().copy_policy = static_cast<MoEOverlayTierCopyPolicy>(255);
         EXPECT_THROW((void)MoEOverlayCapacityResolver::resolve(bad), std::invalid_argument);
