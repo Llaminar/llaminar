@@ -5939,3 +5939,20 @@ its own serial step (-j2) or copy the earlier authority-produced
 aa842a1be/a8beee811 WSL build dir (same identity; authority re-
 verifies the digest).** My earlier "replicate the marker" relay =
 CORRECTED (unvetted propagation); lane correction dispatched.
+
+### WSL binding gate @ 6ca2462cc LAUNCHED (11:28Z) — authority path, no forged markers
+
+WSL: worktree wt-armq-6ca2462cc; external staged. NO hand-written
+markers — the staged golden build-avx512 carries SCHEMA-3 AUTHORITY
+markers (.llaminar-onednn-configured/-commit/-installed-artifacts +
+install_manifest.txt) and 6ca2462cc's cmake/OneDNNBuild.cmake
+RE-VERIFIED the digest -> "Reusing authenticated oneDNN
+installation" (CONFIGURE_RC=0, no rebuild/thrash, 5.1G/28G) — the
+AUTHORIZED path (authority-produced markers + authority re-verify,
+per Main's rule). BINDING GATE LAUNCHED: container
+armq-a512-6ca2462cc, stagea-binding-6ca.sh = (1) configure
+CMAKE_BUILD_PARALLEL_LEVEL=2, (2) heavy parity TU serial -j1
+prebuild, (3) full Unit+Preflight driver -j4. NOW in parity -j1
+phase (7.3G/28G safe). Will report DRIVER_RC + the failed-set diff
+vs the WSL d5e04fdce base when done. Sequence correct; nothing
+else pending on WSL.
