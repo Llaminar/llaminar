@@ -6252,3 +6252,25 @@ wrongly rejected => code fix. Lane to show the test's layout
 record inline. SPARKS STEP 2 (.79 incremental) RUNNING (BUILD
 clean; preflight CUDA 43/383) — hold the diff for the lane's
 response (correct). Main informed.
+
+### R-1 red resolved (option a, evidence) + 56829099c; all legs re-targeted (14:31Z)
+
+Lane: the test's layout record = InterleavedCompactA64 (NON-host-
+equal, UNIMPLEMENTED admitted layout). Old shape (green 6ca) = pre-
+R-1 split (buildResolverInput admitted presence-only; throw later
+via the test's explicit preparedFootprints 3-arg call). R-1 threads
+the ADMITTED observation into the admission pricing boundary itself
+(the same footprint source the tier legacy cap consumes) -> for an
+unimplemented admitted layout the fail-closed rejection now
+correctly fires AT buildResolverInput (never a host-default cap).
+PER THE R-1 CONTRACT: fail-closed for unimplemented = the DESIGN;
+legitimate-admitted rejection = bug — this = the former => TEST
+updated (not code): compact arm asserts buildResolverInput throws
+naming interleaved-compact-a64 (FAILs if it succeeds); TierLegacy
+Cap comment aligned; NO production code; no behavior change beyond
+R-1. COORDINATOR VERIFY: 56829099c (origin tip; 1 test file
++21/-20; NO src/). RE-TARGETED: sparks (.80 focused + .79
+incremental @ 56829099c; cap test now green expectation); WSL (x86
+incremental RE-TARGET to 56829099c — the ef86 run superseded
+[updated test must be the version running]; same procedure; then
+develop discriminator). Pins A3+A4+A4-R @ 56829099c after green.
