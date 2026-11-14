@@ -26100,6 +26100,18 @@ if(HAVE_CUDA OR HAVE_ROCM)
             LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Prefill;AllCodebooks;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
             MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedWmmaSplitReplay)
+        add_v2_test(V2_Integration_ROCmGroupedWmmaHybridReplay
+            COMMAND $<TARGET_FILE:v2_perf_gpu_expert_pipeline> --gtest_also_run_disabled_tests
+                --gtest_filter=NativeGfx1100/ROCmGroupedWmmaPerf.DISABLED_HybridCapturedReplay/ROCm_Qwen36WholeExpertShard2Rows512*
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Prefill;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+        add_v2_test(V2_Integration_ROCmGroupedWmmaHybridAllCodebooksReplay
+            COMMAND $<TARGET_FILE:v2_perf_gpu_expert_pipeline> --gtest_also_run_disabled_tests
+                --gtest_filter=NativeGfx1100/ROCmGroupedWmmaPerf.DISABLED_HybridCapturedReplay/ROCm_AllCodebookPrefill_*Rows65
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Prefill;AllCodebooks;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+            V2_Integration_ROCmGroupedWmmaHybridReplay V2_Integration_ROCmGroupedWmmaHybridAllCodebooksReplay)
         add_v2_test(V2_Perf_ROCmGroupedWmma
             COMMAND $<TARGET_FILE:v2_perf_gpu_expert_pipeline> --gtest_also_run_disabled_tests
                 --gtest_filter=NativeGfx1100/ROCmGroupedWmmaPerf.DISABLED_CapturedTournament/ROCm_AllCodebookPrefill_Q4_0Rows512:NativeGfx1100/ROCmGroupedWmmaPerf.DISABLED_CapturedTournament/ROCm_AllCodebookPrefill_IQ2_SRows512:NativeGfx1100/ROCmGroupedWmmaPerf.DISABLED_CapturedTournament/ROCm_Qwen36WholeExpertShard2Rows512

@@ -33,7 +33,7 @@ production dispatch: GPU prepared quantized weights use NativeQuantised adapters
 | Area | Implementation | Functional/component evidence | Performance evidence |
 |---|---|---|---|
 | Broader dense dispatch | Existing native kernel; inventory audited | Prior two-anchor all-codebook proof remains valid for its original producer | Broader collection and generated installation pending |
-| Grouped MoE | Native wave64 M16N32/N64 candidates, all physical decoders including promoted23 | All 21 source formats on both tiles, mixed IQ4, tails, split/sliced-down and promoted dirty replay pass | Initial complete-pipeline Qwen shard2 M512 gains 1.19×; compact Q4_0/IQ2_S regress. Isolated native profile complete; broader timing/automatic selection pending |
+| Grouped MoE | Wave64 M16N32/N64 plus explicit whole-expert row floors4/8/12/16; all physical decoders | Serial, promoted, all-format mixed-writer, threshold/reset and split/sliced-down replay pass | Clean full-live N32 gains 1.04–1.30× across five anchors. Hybrid power-law and sparse replay regress; Automatic remains Dot4 |
 | Attention | Native four-plane QK candidate for HD256/tile16×16, all native KV formats and query/context schedules | Four new retained tests pass: all formats, B2/GQA/ring, 64K/partial/reset, half extrema and forced rejection. Existing lifecycle/reference gates pass | Fixed-M512 1K–64K scaling gate passes; 64K gains 1.15× dense / 1.13× MoE. Native direct/context profiles have zero spills; Automatic remains Dot2 |
 | Q8 router | Typed forced recording; normal and compact owned-row bridges; cooperative K subtrees, fixed-width variants and local scale shuffles | Ten focused ROCm tests pass, including normal/owned capture, finite-scale extremes, raw compact logits and poisoned tails | Expanded 384-cell and fixed-width 192-cell exploratory sweeps pass. Latest M512 anchors improve three model widths; K8192/E512 regresses and remains excluded. Automatic installation pending |
 | Floating half GEMM | Existing production hipBLAS path; sampled native matrix gap confirmed | Three retained graph replays pass, each containing cast and vendor GEMM | Loaded bytes/ISA authenticated; complete Release cast+GEMM timing pending |
@@ -54,23 +54,23 @@ Disabling each native projection independently makes that reference fail, provin
 the recorded kernels contribute. Split replay covers both tiles, all 21 source
 formats, whole-expert phases and compact column-owned down slices.
 
-The first unprofiled Release anchor comparison includes eight complete captured
-operations per sample and 31 interleaved samples. M512 Qwen whole-expert shard2
-improves from 912.61 to 764.06 microseconds with N32 (1.19×). Compact H512/I256/E8
-Q4_0 and IQ2_S regress to 0.99× and 0.93× respectively; these are not blanket
-installation candidates. A subsequent broad tournament overlapped an unrelated
-compiler build: all 60 cases pass correctness, but those timings remain exploratory.
-The final registered 45-case replay passes in 92.26 seconds. Canonical timing
-must be recollected without that overlap before selecting additional entries.
+The live-K producer avoids unused second-stage decoding/stores. All 91 focused
+GPU cases and the device-free admission owner pass. The final clean Release
+run spans five cases ×17 live counts ×11 policies ×31 samples of eight complete
+operations, with exact profile/timing producer hashes. At 512 live rows, pure
+N32 gains 1.295×/1.162×/1.043× for Qwen uniform/hotset/power-law, and
+1.068×/1.076× for compact Q4_0/IQ2_S. Hybrid floors add launch/work overhead:
+power-law N32/floor8 loses at 0.911×, and sparse uniform replay also regresses.
+Automatic stays Dot4. See [admission investigation](GFX1100_GROUPED_WMMA_ADMISSION.md)
+for ownership, omitted-writer controls, complete timings and remaining work.
 
-The isolated Q4_0/N64 gate-up profile selects exactly one live dispatch per
-counter pass. Its loaded gfx1100 code object has wave64, 53 logical/56 allocated
-VGPRs, 58 logical SGPRs, 5568-byte static LDS and zero private storage/spills.
-The 256-thread block has two INT8 WMMA instruction sites; seven counter passes
-report positive activity, 8448 waves, 76.02% L2 hits and 3.54 LDSBankConflict.
-The original AUTO power state was restored. Raw profile and loaded ISA are in
-`grouped-q4-n64-gate-profile-anchor-mpi/`; timing identity is retained in
-`grouped-wmma-current-receipt.json`. Profiling is not canonical timing.
+Rebuilt native Q4_0 gate/up profiles each isolate one dispatch across seven
+counter passes. N32/N64 use 53/54 logical VGPRs (56 allocated), 54 logical SGPRs,
+3392/5568-byte static LDS and wave64; both have zero scratch/spills and two INT8
+WMMA instruction sites. Positive activity is authenticated against loaded code
+objects, and original AUTO power is restored. Current evidence is in
+`grouped-hybrid-{n32,n64}-profile/`, bound to
+`grouped-hybrid-producer-receipt.json`. Clean timing is in `grouped-hybrid-receipt.json`; profiles do not supply timing labels.
 
 Attention's final fixed-query Release run holds M512, HD256, FP16 and capacity
 65536 constant, with dense Q12/KV2 and MoE Q8/KV1 heads. Each point uses 31 paired,

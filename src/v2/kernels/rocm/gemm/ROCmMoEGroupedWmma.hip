@@ -2,7 +2,7 @@
  * @file ROCmMoEGroupedWmma.hip
  * @brief Exact wave64 WMMA leaves borrowing the production MoE group directory.
  *
- * Each workgroup decodes two K32 blocks for sixteen grouped rows and 32/64
+ * Each workgroup decodes up to two live K32 blocks for sixteen grouped rows and 32/64
  * columns. Integer WMMA shares those operands; canonical contribution helpers
  * and the original source-format partition loop own every FP32 rounding point.
  * Gate/up and down differ only in immutable descriptor and input-row bindings.
@@ -23,6 +23,7 @@ namespace llaminar2::rocm
 namespace
 {
 thread_local MoEGroupedPrefillEngine recording_engine = MoEGroupedPrefillEngine::Automatic;
+thread_local MoEGroupedWmmaRowFloor recording_floor = MoEGroupedWmmaRowFloor::EveryExpert;
 
 /** @brief Authenticate the compiled native instruction and maximum tile resources.
  * @param device Admitted visible HIP ordinal. @return Whether WMMA can execute. */
@@ -34,28 +35,35 @@ bool nativeGroupedDevice(int device)
 }
 }
 
-ScopedMoEGroupedPrefillEngine::ScopedMoEGroupedPrefillEngine(MoEGroupedPrefillEngine engine)
-    : previous_(recording_engine)
+ScopedMoEGroupedPrefillEngine::ScopedMoEGroupedPrefillEngine(
+    MoEGroupedPrefillEngine engine, MoEGroupedWmmaRowFloor floor)
+    : previous_(recording_engine), previous_floor_(recording_floor)
 {
+    if (!validMoEGroupedWmmaRowFloor(floor) ||
+        ((engine == MoEGroupedPrefillEngine::Automatic || engine == MoEGroupedPrefillEngine::OrderedDot4) &&
+         floor != MoEGroupedWmmaRowFloor::EveryExpert))
+        throw std::invalid_argument("grouped WMMA row floor requires an explicit native candidate");
     switch (engine)
     {
     case MoEGroupedPrefillEngine::Automatic:
     case MoEGroupedPrefillEngine::OrderedDot4:
     case MoEGroupedPrefillEngine::WmmaM16N32:
-    case MoEGroupedPrefillEngine::WmmaM16N64: recording_engine = engine; return;
+    case MoEGroupedPrefillEngine::WmmaM16N64:
+        recording_engine = engine; recording_floor = floor; return;
     }
     throw std::invalid_argument("unknown grouped MoE dot engine");
 }
-ScopedMoEGroupedPrefillEngine::~ScopedMoEGroupedPrefillEngine() { recording_engine = previous_; }
+ScopedMoEGroupedPrefillEngine::~ScopedMoEGroupedPrefillEngine()
+{ recording_engine = previous_; recording_floor = previous_floor_; }
 
-MoEGroupedPrefillEngine selectedMoEGroupedPrefillEngine(int device)
+MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device)
 {
     if (recording_engine == MoEGroupedPrefillEngine::Automatic ||
         recording_engine == MoEGroupedPrefillEngine::OrderedDot4)
-        return MoEGroupedPrefillEngine::OrderedDot4;
+        return {MoEGroupedPrefillEngine::OrderedDot4,MoEGroupedWmmaRowFloor::EveryExpert};
     if (!nativeGroupedDevice(device))
         throw std::invalid_argument("grouped MoE WMMA requires actual gfx1100 and native tile resources");
-    return recording_engine;
+    return {recording_engine,recording_floor};
 }
 
 namespace grouped_wmma_detail
@@ -98,6 +106,9 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
         desc.blocks_per_row != static_cast<uint32_t>(v.k / 32) ||
         (Traits::needs_aux_compute && !desc.mins) ||
         (Traits::is_dual_scale_asym && !desc.emins)) __builtin_trap();
+    const auto producer = v.dot_admission.select(desc,count);
+    if (producer == MoEGroupedDotProducer::Invalid) __builtin_trap();
+    if (producer != MoEGroupedDotProducer::Wmma) return;
     const int blocks = v.k / 32, partitions = v.partitions.forDescriptor(desc);
     if (partitions <= 0 || partitions > blocks ||
         partitions > NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) __builtin_trap();
@@ -131,7 +142,11 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
         const int end = min((p + 1) * span, blocks);
         for (int first = p * span; first < end; first += KB)
         {
-            for (int item = tid; item < KB * BN; item += Threads)
+            // A short serial partition must not decode or publish an unused
+            // second stage. Both producers share this live bound, while the
+            // consumer and ordered partition fold retain their original work.
+            const int stages = min(KB,end-first);
+            for (int item = tid; item < stages * BN; item += Threads)
             {
                 const int stage = item / BN, col = item % BN, kb = first + stage;
                 const size_t linear = static_cast<size_t>(kb) * v.n + n0 + col;
@@ -155,9 +170,11 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
                 if constexpr (Traits::is_dual_scale_asym) minima[stage][col] = emin;
                 if constexpr (FMT == NATIVE_QUANTISED_GEMM_IQ1_M) qh[stage][col] = static_cast<uint16_t>(raw[1]);
             }
-            for (int item = tid; item < KB * BM * 2; item += Threads)
+            for (int item = tid; item < stages * BM * 2; item += Threads)
             {
-                const int row = item / (KB * 2), stage = item % (KB * 2) / 2, half = item % 2;
+                // Adjacent half-block owners remain in one 32-lane subgroup
+                // for exact activation sums, including a single live stage.
+                const int stage = item / (BM * 2), row = item % (BM * 2) / 2, half = item % 2;
                 const int kb = first + stage;
                 I32x4 values = {};
                 if (row < live && kb < end)
@@ -266,7 +283,9 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
         args.rows <= 0 || args.top_k <= 0 || args.n <= 0 || args.k <= 0 || args.k % 32 ||
         args.experts <= 0 || args.device < 0 || !nativeGroupedDevice(args.device) ||
         (args.input != MoEGroupedWmmaInput::GroupedRows && !args.group_token_indices) ||
-        ((args.second_descriptors == nullptr) != (args.second_output == nullptr))) return false;
+        ((args.second_descriptors == nullptr) != (args.second_output == nullptr)) ||
+        !args.dot_admission.binds(args.second_descriptors ? MoEPrefillProjectionRole::GateUp
+                                                        : MoEPrefillProjectionRole::Down,args.n,args.k)) return false;
     int stream_device = -1;
     if (hipStreamGetDevice(native_stream,&stream_device) != hipSuccess || stream_device != args.device) return false;
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1100__)

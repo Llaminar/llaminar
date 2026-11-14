@@ -9,6 +9,7 @@
 #pragma once
 #include "ROCmMoEPrefillArithmetic.h"
 #include "ROCmMoEGroupedPrefillRoutePolicy.h"
+#include "ROCmMoEGroupedDotAdmission.h"
 
 namespace llaminar2::rocm
 {
@@ -19,21 +20,32 @@ enum class MoEGroupedPrefillEngine { Automatic, OrderedDot4, WmmaM16N32, WmmaM16
 class ScopedMoEGroupedPrefillEngine final
 {
 public:
-    /** @brief Set the recording engine. @param engine Explicit candidate or installed policy. */
-    explicit ScopedMoEGroupedPrefillEngine(MoEGroupedPrefillEngine engine);
+    /** @brief Set the recording engine and its explicit whole-expert row floor.
+     * @param engine Explicit candidate or installed policy.
+     * @param floor Native eligibility threshold; only native candidates accept a nonzero floor. */
+    explicit ScopedMoEGroupedPrefillEngine(MoEGroupedPrefillEngine engine,
+        MoEGroupedWmmaRowFloor floor = MoEGroupedWmmaRowFloor::EveryExpert);
     /** @brief Restore the enclosing recording policy without changing retained graphs. */
     ~ScopedMoEGroupedPrefillEngine();
     ScopedMoEGroupedPrefillEngine(const ScopedMoEGroupedPrefillEngine &) = delete;
     ScopedMoEGroupedPrefillEngine &operator=(const ScopedMoEGroupedPrefillEngine &) = delete;
 private:
     MoEGroupedPrefillEngine previous_;
+    MoEGroupedWmmaRowFloor previous_floor_;
+};
+
+/** @brief Resolved recording policy; Automatic never survives native admission. */
+struct MoEGroupedPrefillPolicy
+{
+    MoEGroupedPrefillEngine engine;
+    MoEGroupedWmmaRowFloor minimum_expert_rows;
 };
 
 /** @brief Resolve recording against immutable native hardware metadata.
  * @param device Visible HIP ordinal owning the complete transaction.
- * @return Concrete Dot4 or native WMMA engine; never Automatic.
+ * @return Concrete Dot4 or native WMMA engine and whole-expert row floor.
  * @throws std::invalid_argument When an explicit native candidate is unsupported. */
-MoEGroupedPrefillEngine selectedMoEGroupedPrefillEngine(int device);
+MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device);
 
 /** @brief Which authoritative row index addresses the quantized activation bank. */
 enum class MoEGroupedWmmaInput { OriginalTokens, OriginalRouteSlots, GroupedRows };
@@ -61,6 +73,7 @@ struct MoEGroupedWmmaArguments
     MoEGroupedWmmaInput input = MoEGroupedWmmaInput::GroupedRows;
     MoEPrefillSerialM1KPartitionPolicy partitions;
     ROCmMoEGroupedRouteAdmission admission; ///< Required existing group-plan authority.
+    MoEGroupedDotAdmission dot_admission; ///< Same per-expert writer choice as ordered leaves.
 };
 
 /** @brief Record all physical-codebook leaves for one gate/up or down projection.

@@ -1,6 +1,6 @@
 /**
  * @file ROCmMoEGroupedPrefillKernels.hip
- * @brief Grouped MoE prefill kernels for AMD MI50/MI60 (gfx906)
+ * @brief Captured, byte-exact grouped MoE prefill for gfx906 and gfx1100.
  *
  * The pipeline is entirely device-owned and graph-capturable. It consumes the
  * route groups and descriptor tables already resident on the GPU; no launch
@@ -35,6 +35,10 @@
  * source partition policy, with separate physical IQ4 decoders and unchanged
  * SwiGLU/ordered publication. Its dot-engine policy is independent of live route
  * admission; sparse replay retains its existing route-owned family.
+ * Explicit hybrid candidates share one whole-expert predicate between Dot4 and
+ * WMMA. Each expert projection has exactly one writer family even when its last
+ * tile is partial. Ordered consumers finish before native directory16 replaces
+ * the shared directory; no adaptive span survives that overwrite.
  *
  * The long-prefill Dot4 projection kernels expose 64/128/256 output-column lanes and
  * 4/8/12/16-row tiles. Production dispatch comes exclusively from the checked-in
@@ -80,6 +84,9 @@
 
 using llaminar2::rocm::ROCmMoEGroupedRouteAdmission;
 using llaminar2::rocm::ROCmMoEGroupedPrefillRouteStrategy;
+using llaminar2::rocm::MoEPrefillProjectionRole;
+using llaminar2::rocm::MoEGroupedDotAdmission;
+using llaminar2::rocm::MoEGroupedDotProducer;
 
 /**
  * @brief Bound publication scheduling independently of captured row capacity.
@@ -1424,12 +1431,6 @@ void moe_grouped_build_prefill_tile_directory_kernel(
     }
 }
 
-/** Projection role used by the device-owned adaptive tile planner. */
-enum class MoEPrefillAdaptiveProjectionRole : int
-{
-    GateUp = 0,
-    Down = 1,
-};
 
 /**
  * @brief Choose TM12 or TM16 from one expert's live grouped-row count.
@@ -1453,12 +1454,12 @@ enum class MoEPrefillAdaptiveProjectionRole : int
  *        predicate. It is ignored for the down projection.
  * @return The exact fixed specialization that owns this expert's rows.
  */
-template <MoEPrefillAdaptiveProjectionRole ROLE>
+template <MoEPrefillProjectionRole ROLE>
 __device__ __forceinline__ int moe_prefill_adaptive_tile_rows(
     int count,
     bool gateup_all_active_counts_are_16)
 {
-    if constexpr (ROLE == MoEPrefillAdaptiveProjectionRole::GateUp)
+    if constexpr (ROLE == MoEPrefillProjectionRole::GateUp)
         return gateup_all_active_counts_are_16 ? 16 : 12;
 
     const int padded_12 = ((count + 11) / 12) * 12;
@@ -1479,7 +1480,7 @@ __device__ __forceinline__ int moe_prefill_adaptive_tile_rows(
  * @tparam ROLE Gate/up or down projection selection policy.
  * @param admission Shared device-owned family selection, never a host row count.
  */
-template <MoEPrefillAdaptiveProjectionRole ROLE>
+template <MoEPrefillProjectionRole ROLE>
 __global__ __launch_bounds__(kMoEPrefillMaxExperts, 1)
 void moe_grouped_build_adaptive_prefill_tile_directory_kernel(
     const int* __restrict__ group_counts,
@@ -1515,7 +1516,7 @@ void moe_grouped_build_adaptive_prefill_tile_directory_kernel(
     }
 
     bool gateup_all_active_counts_are_16 = false;
-    if constexpr (ROLE == MoEPrefillAdaptiveProjectionRole::GateUp)
+    if constexpr (ROLE == MoEPrefillProjectionRole::GateUp)
     {
         /*
          * Reuse the TM12 prefix array for an exact projection-wide predicate
@@ -1651,6 +1652,28 @@ __device__ __forceinline__ void moe_prefill_visit_live_rows(
  * @tparam FMT NativeQuantised codebook for experts handled by this launch.
  * @tparam TILE_M Trained expert-row tile (4, 8, 12, or 16 rows).
  * @tparam TILE_N Trained output-column tile (64, 128, or 256 lanes).
+ * @param A_int8 Quantized original token or route-slot activation rows.
+ * @param scales_A_blockwise FP32 scale for each activation K32 block.
+ * @param group_token_indices Device-owned original row identities.
+ * @param group_counts Complete live row count for each expert.
+ * @param group_offsets Exclusive offsets into grouped row banks.
+ * @param work_directory Current fixed or adaptive packed expert tiles.
+ * @param gate_descs Prepared gate descriptor table.
+ * @param up_descs Prepared up descriptor table.
+ * @param gate_out Unweighted grouped gate projection bank.
+ * @param up_out Unweighted grouped up projection bank.
+ * @param max_directory_tiles Captured directory capacity.
+ * @param seq_len Original captured token capacity.
+ * @param top_k Route slots per token.
+ * @param grouped_indices_are_route_slots Whether indices address route slots.
+ * @param input_is_original_rows Whether activation rows retain token indexing.
+ * @param N Prepared projection output columns.
+ * @param K Projection contraction width.
+ * @param k_partition_policy Original source-owned arithmetic partition policy.
+ * @param num_experts Descriptor and group-plan cardinality.
+ * @param adaptive_tile_count Optional device-owned current directory extent.
+ * @param admission Shared device selection of the ExpertTiled route family.
+ * @param dot_admission Whole-expert writer selection shared with native leaves.
  */
 template <NativeQuantisedFormatPrefill FMT, int TILE_M, int TILE_N>
 __global__ __launch_bounds__(TILE_N, 2)
@@ -1675,7 +1698,8 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
     MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
     int num_experts,
     const uint32_t* __restrict__ adaptive_tile_count,
-    ROCmMoEGroupedRouteAdmission admission)
+    ROCmMoEGroupedRouteAdmission admission,
+    MoEGroupedDotAdmission dot_admission)
 {
     // Uniform device-owned admission precedes all barriers and weight reads.
     if (!admission.allows(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled))
@@ -1724,6 +1748,14 @@ void moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel(
         projection_role == 0 ? gate_descs[expert_id] : up_descs[expert_id];
     if (!prefill_native_quantised_desc_shape_ok<FMT>(desc, N, K))
         return;
+
+#if defined(__gfx1100__)
+    // The whole-expert choice is identical across every Dot4 and WMMA tile.
+    // Shape/descriptor validation above remains the sole descriptor authority.
+    const auto producer = dot_admission.select(desc,count);
+    if (producer == MoEGroupedDotProducer::Invalid) __builtin_trap();
+    if (producer != MoEGroupedDotProducer::OrderedDot4) return;
+#endif
 
     const int k_partitions = k_partition_policy.forDescriptor(desc);
 
@@ -2497,6 +2529,21 @@ void moe_grouped_swiglu_quantize_prefill_kernel(
  * @tparam FMT NativeQuantised codebook for experts handled by this launch.
  * @tparam TILE_M Trained expert-row tile (4, 8, 12, or 16 rows).
  * @tparam TILE_N Trained output-column tile (64, 128, or 256 lanes).
+ * @param A_int8 Quantized grouped SwiGLU rows.
+ * @param scales_A_blockwise FP32 scales for the grouped K32 activation blocks.
+ * @param down_descs Prepared full or column-sliced down descriptors.
+ * @param group_counts Complete live row count for each expert.
+ * @param group_offsets Exclusive offsets into grouped activation rows.
+ * @param work_directory Current fixed or adaptive packed expert tiles.
+ * @param down_partials Unweighted FP32 grouped projection bank.
+ * @param max_directory_tiles Captured directory capacity.
+ * @param N Prepared physical output columns.
+ * @param K Projection contraction width.
+ * @param k_partition_policy Original unsliced source arithmetic partitions.
+ * @param num_experts Descriptor and group-plan cardinality.
+ * @param adaptive_tile_count Optional device-owned current directory extent.
+ * @param admission Shared device selection of the ExpertTiled route family.
+ * @param dot_admission Whole-expert writer selection shared with native leaves.
  */
 template <NativeQuantisedFormatPrefill FMT, int TILE_M, int TILE_N>
 __global__ __launch_bounds__(TILE_N, 2)
@@ -2514,7 +2561,8 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
     MoEPrefillSerialM1KPartitionPolicy k_partition_policy,
     int num_experts,
     const uint32_t* __restrict__ adaptive_tile_count,
-    ROCmMoEGroupedRouteAdmission admission)
+    ROCmMoEGroupedRouteAdmission admission,
+    MoEGroupedDotAdmission dot_admission)
 {
     if (!admission.allows(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled))
         return;
@@ -2560,6 +2608,14 @@ void moe_grouped_down_batch_invariant_tiled_prefill_kernel(
     const DeviceNativeQuantisedMatrixDesc desc = down_descs[expert_id];
     if (!prefill_native_quantised_desc_shape_ok<FMT>(desc, N, K))
         return;
+
+#if defined(__gfx1100__)
+    // The whole-expert choice is identical across every Dot4 and WMMA tile.
+    // Shape/descriptor validation above remains the sole descriptor authority.
+    const auto producer = dot_admission.select(desc,count);
+    if (producer == MoEGroupedDotProducer::Invalid) __builtin_trap();
+    if (producer != MoEGroupedDotProducer::OrderedDot4) return;
+#endif
 
     const int k_partitions = k_partition_policy.forDescriptor(desc);
 
@@ -3193,12 +3249,6 @@ void moe_reduce_canonical_route_contributions_kernel(
 
 namespace
 {
-    /** Projection role with an independently trained grouped-prefill policy. */
-    enum class MoEPrefillProjectionRole : uint8_t
-    {
-        GateUp,
-        Down,
-    };
 
     /** Compile-time candidate selected for one graph-captured projection. */
     struct MoEPrefillTileConfig
@@ -3602,10 +3652,10 @@ namespace
             role == MoEPrefillProjectionRole::GateUp
                 ? reinterpret_cast<const void*>(HIP_KERNEL_NAME(
                       moe_grouped_build_adaptive_prefill_tile_directory_kernel<
-                          MoEPrefillAdaptiveProjectionRole::GateUp>))
+                          MoEPrefillProjectionRole::GateUp>))
                 : reinterpret_cast<const void*>(HIP_KERNEL_NAME(
                       moe_grouped_build_adaptive_prefill_tile_directory_kernel<
-                          MoEPrefillAdaptiveProjectionRole::Down>));
+                          MoEPrefillProjectionRole::Down>));
         if (!moe_prefill_query_function_resources(
                 planner,
                 kMoEPrefillMaxExperts,
@@ -4332,8 +4382,17 @@ bool rocmMoE_grouped_prefill_pipeline(
     if (llaminar2::HipDeviceGuard::setDevice(device_id) != hipSuccess) return false;
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     if (!hip_stream || hip_stream == hipStreamLegacy || hip_stream == hipStreamPerThread) return false;
-    const auto dot_engine = llaminar2::rocm::selectedMoEGroupedPrefillEngine(device_id);
+    const auto dot_policy = llaminar2::rocm::selectedMoEGroupedPrefillPolicy(device_id);
+    const auto dot_engine = dot_policy.engine;
     const bool native_wmma = dot_engine != llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4;
+    const auto gateup_dot_admission = native_wmma
+        ? MoEGroupedDotAdmission::nativeCandidate(MoEPrefillProjectionRole::GateUp,
+              intermediate,intermediate,d_model,dot_policy.minimum_expert_rows)
+        : MoEGroupedDotAdmission{};
+    const auto down_dot_admission = native_wmma
+        ? MoEGroupedDotAdmission::nativeCandidate(MoEPrefillProjectionRole::Down,
+              d_model,down_columns,intermediate,dot_policy.minimum_expert_rows)
+        : MoEGroupedDotAdmission{};
     (void)hipGetLastError(); // clear prior errors
     const bool has_prequantized_hidden =
         d_prequantized_hidden && d_prequantized_hidden_scales;
@@ -4456,7 +4515,7 @@ bool rocmMoE_grouped_prefill_pipeline(
             hipLaunchKernelGGL(
                 HIP_KERNEL_NAME(
                     moe_grouped_build_adaptive_prefill_tile_directory_kernel<
-                        MoEPrefillAdaptiveProjectionRole::GateUp>),
+                        MoEPrefillProjectionRole::GateUp>),
                 dim3(1), directory_block, 0, hip_stream,
                 d_group_counts,
                 header,
@@ -4469,7 +4528,7 @@ bool rocmMoE_grouped_prefill_pipeline(
             hipLaunchKernelGGL(
                 HIP_KERNEL_NAME(
                     moe_grouped_build_adaptive_prefill_tile_directory_kernel<
-                        MoEPrefillAdaptiveProjectionRole::Down>),
+                        MoEPrefillProjectionRole::Down>),
                 dim3(1), directory_block, 0, hip_stream,
                 d_group_counts,
                 header,
@@ -4557,7 +4616,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     1, intermediate, d_model, \
                     gateup_k_partition_policy, num_experts, \
                     adaptive_directory.header + \
-                        kMoEPrefillAdaptiveTile12CountWord, admission); \
+                        kMoEPrefillAdaptiveTile12CountWord, admission, gateup_dot_admission); \
                 hipLaunchKernelGGL( \
                     HIP_KERNEL_NAME(moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel<FMT, 16, TN>), \
                     tile16_grid, expert_block, 0, hip_stream, \
@@ -4570,7 +4629,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     1, intermediate, d_model, \
                     gateup_k_partition_policy, num_experts, \
                     adaptive_directory.header + \
-                        kMoEPrefillAdaptiveTile16CountWord, admission); \
+                        kMoEPrefillAdaptiveTile16CountWord, admission, gateup_dot_admission); \
             } while (0)
         #define LAUNCH_GATEUP_EXPERT_TILED(FMT, TM, TN) \
             do { \
@@ -4589,7 +4648,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     gate_descs, up_descs, d_scratch_gate, d_scratch_up, \
                     candidate_directory_capacity, seq_len, top_k, grouped_indices_are_route_slots, \
                     1, intermediate, d_model, \
-                    gateup_k_partition_policy, num_experts, nullptr, admission); \
+                    gateup_k_partition_policy, num_experts, nullptr, admission, gateup_dot_admission); \
             } while (0)
 
         #define DISPATCH_GATEUP_TILE_N(FMT, TM, CONFIG) \
@@ -4628,7 +4687,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     if (use_route_owned) { \
                         LAUNCH_GATEUP_ROUTE_OWNED(FMT); \
                     } \
-                    if (use_expert_row_tiles && !native_wmma) { \
+                    if (use_expert_row_tiles && gateup_dot_admission.mayUseOrdered()) { \
                         const MoEPrefillTileConfig candidate = has_uniform_codebook_pair \
                             ? pair_config.gateup \
                             : moe_prefill_select_tile_config( \
@@ -4690,7 +4749,8 @@ bool rocmMoE_grouped_prefill_pipeline(
                         .input = grouped_indices_are_route_slots
                             ? llaminar2::rocm::MoEGroupedWmmaInput::OriginalRouteSlots
                             : llaminar2::rocm::MoEGroupedWmmaInput::OriginalTokens,
-                        .partitions = gateup_k_partition_policy, .admission = admission}, stream)) return false;
+                        .partitions = gateup_k_partition_policy, .admission = admission,
+                        .dot_admission = gateup_dot_admission}, stream)) return false;
         }
 
         constexpr int blocks_per_workgroup = kMoESwiGLUQuantizeThreads / 32;
@@ -4831,7 +4891,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                         d_group_counts, d_group_offsets, \
                             reinterpret_cast<const uint32_t*>(d_group_work_directory), \
                             d_scratch_gate, candidate_directory_capacity, down_columns, intermediate, \
-                            down_k_partition_policy, num_experts, nullptr, admission); \
+                            down_k_partition_policy, num_experts, nullptr, admission, down_dot_admission); \
                 } while (0)
             #define LAUNCH_DOWN_ADAPTIVE(FMT, TN) \
                 do { \
@@ -4854,7 +4914,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                         d_scratch_gate, adaptive_directory.tile12_capacity, down_columns, intermediate, \
                         down_k_partition_policy, num_experts, \
                         adaptive_directory.header + \
-                            kMoEPrefillAdaptiveTile12CountWord, admission); \
+                            kMoEPrefillAdaptiveTile12CountWord, admission, down_dot_admission); \
                     hipLaunchKernelGGL( \
                         HIP_KERNEL_NAME(moe_grouped_down_batch_invariant_tiled_prefill_kernel<FMT, 16, TN>), \
                         tile16_grid, expert_block, 0, hip_stream, \
@@ -4864,7 +4924,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                         d_scratch_gate, adaptive_directory.tile16_capacity, down_columns, intermediate, \
                         down_k_partition_policy, num_experts, \
                         adaptive_directory.header + \
-                            kMoEPrefillAdaptiveTile16CountWord, admission); \
+                            kMoEPrefillAdaptiveTile16CountWord, admission, down_dot_admission); \
                 } while (0)
 
             #define DISPATCH_DOWN_TILE_N(FMT, TM, CONFIG) \
@@ -4910,23 +4970,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     } \
                 } while (0)
 
-            if (native_wmma)
-            {
-                const int capacity = ensure_work_directory(16);
-                if (capacity <= 0 || !llaminar2::rocm::submitMoEGroupedWmma(dot_engine,
-                        down_codebook_mask, {
-                            .activations = d_scratch_swiglu_int8,
-                            .activation_scales = d_scratch_swiglu_scales,
-                            .group_counts = d_group_counts, .group_offsets = d_group_offsets,
-                            .directory = reinterpret_cast<const uint32_t *>(d_group_work_directory),
-                            .descriptors = down_descs, .output = d_scratch_gate,
-                            .directory_capacity = capacity, .rows = seq_len, .top_k = top_k,
-                            .n = down_columns, .k = intermediate, .experts = num_experts, .device = device_id,
-                            .input = llaminar2::rocm::MoEGroupedWmmaInput::GroupedRows,
-                            .partitions = down_k_partition_policy, .admission = admission}, stream)) return false;
-                launched_down = true;
-            }
-            else
+            if (down_dot_admission.mayUseOrdered())
             {
                 LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q4_0);
                 LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ4_NL);
@@ -4946,6 +4990,24 @@ bool rocmMoE_grouped_prefill_pipeline(
                 LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_IQ1_M);
                 LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_Q8_0);
                 LAUNCH_DOWN_IF_PRESENT(NATIVE_QUANTISED_PF_EXPANDED_INT8_MIN);
+            }
+
+            if (native_wmma)
+            {
+                const int capacity = ensure_work_directory(16);
+                if (capacity <= 0 || !llaminar2::rocm::submitMoEGroupedWmma(dot_engine,
+                        down_codebook_mask, {
+                            .activations = d_scratch_swiglu_int8,
+                            .activation_scales = d_scratch_swiglu_scales,
+                            .group_counts = d_group_counts, .group_offsets = d_group_offsets,
+                            .directory = reinterpret_cast<const uint32_t *>(d_group_work_directory),
+                            .descriptors = down_descs, .output = d_scratch_gate,
+                            .directory_capacity = capacity, .rows = seq_len, .top_k = top_k,
+                            .n = down_columns, .k = intermediate, .experts = num_experts, .device = device_id,
+                            .input = llaminar2::rocm::MoEGroupedWmmaInput::GroupedRows,
+                            .partitions = down_k_partition_policy, .admission = admission,
+                            .dot_admission = down_dot_admission}, stream)) return false;
+                launched_down = true;
             }
             #undef LAUNCH_DOWN_IF_PRESENT
             #undef DISPATCH_DOWN_CONFIG

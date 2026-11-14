@@ -16,6 +16,9 @@
  * Opt-in gfx1100 tournaments use the same source/geometry owners, compare both
  * native tiles against explicit ordered Dot4 after poisoned retained replay,
  * and keep profiler launches separate from paired native-event samples.
+ * Hybrid experiments retain all row-floor graphs while route data crosses the
+ * thresholds. Skewed replay independently removes each down writer family;
+ * neither a matching symbol nor a repaired final result can certify ownership.
  */
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -35,6 +38,7 @@
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
 #include <rocprofiler-sdk-roctx/roctx.h>
+#include "backends/rocm/HIPGraphCapture.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/rocm/gemm/ROCmMoEGroupedWmma.h"
 #endif
@@ -50,6 +54,7 @@
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <tuple>
 #include <vector>
 
@@ -138,14 +143,53 @@ namespace
     class GPUExpertPipeline : public ::testing::TestWithParam<Case> {};
 
     /** @brief One complete benchmark operation, with profiler runs kept untimed. */
-    enum class ExpertBenchmark { Installed, WmmaReplay, WmmaTournament, Wmma32Profile, Wmma64Profile };
+    enum class ExpertBenchmark
+    {
+        Installed, WmmaReplay, WmmaTournament, Wmma32Profile, Wmma64Profile,
+        WmmaHybridReplay, WmmaHybridTournament, WmmaHybrid32Profile
+    };
+
+#ifdef HAVE_ROCM
+    /** @brief One retained dot policy; names bind every sample to its row floor. */
+    struct GroupedDotCandidate
+    {
+        rocm::MoEGroupedPrefillEngine engine;
+        rocm::MoEGroupedWmmaRowFloor floor;
+        std::string name;
+    };
+
+    /** @param hybrid Include all explicit whole-expert admission experiments.
+     * @return Ordered oracle, both pure native tiles and requested hybrid policies. */
+    std::vector<GroupedDotCandidate> groupedDotCandidates(bool hybrid)
+    {
+        using enum rocm::MoEGroupedPrefillEngine;
+        using enum rocm::MoEGroupedWmmaRowFloor;
+        std::vector<GroupedDotCandidate> result{
+            {OrderedDot4,EveryExpert,"Dot4"},
+            {WmmaM16N32,EveryExpert,"N32"}, {WmmaM16N64,EveryExpert,"N64"}};
+        if (hybrid)
+            for (const auto floor : {Four,Eight,Twelve,Sixteen})
+                for (const auto engine : {WmmaM16N32,WmmaM16N64})
+                    result.push_back({engine,floor,
+                        std::string(engine == WmmaM16N32 ? "N32" : "N64") +
+                        "Floor" + std::to_string(static_cast<int>(floor))});
+        return result;
+    }
+#endif
 
     /** @brief Reuse production geometry and source preparation for native tournaments.
      * @param parameter Exact existing model/control case. @param mode Timing or isolated profile owner. */
     void runExpertPipeline(Case parameter, ExpertBenchmark mode = ExpertBenchmark::Installed)
     {
         const bool native = mode != ExpertBenchmark::Installed;
+        const bool hybrid = mode == ExpertBenchmark::WmmaHybridReplay ||
+                            mode == ExpertBenchmark::WmmaHybridTournament ||
+                            mode == ExpertBenchmark::WmmaHybrid32Profile;
+        // One retained capacity spans every live threshold. The canonical case
+        // still owns the matrix shapes, formats, ownership and route profile.
+        if (hybrid) parameter.live_rows = parameter.rows;
 #ifdef HAVE_ROCM
+        const auto dot_candidates = groupedDotCandidates(hybrid);
         if (native)
         {
             initializeROCmHardwareMetadata();
@@ -320,16 +364,23 @@ namespace
 #ifdef HAVE_ROCM
             if (native)
             {
-                const bool profile = mode == ExpertBenchmark::Wmma32Profile || mode == ExpertBenchmark::Wmma64Profile;
+                const bool profile = mode == ExpertBenchmark::Wmma32Profile || mode == ExpertBenchmark::Wmma64Profile ||
+                                     mode == ExpertBenchmark::WmmaHybrid32Profile;
                 if (profile && ::testing::UnitTest::GetInstance()->test_to_run_count() != 1)
                     throw std::invalid_argument("grouped WMMA profiling requires one exact selected case");
                 constexpr int repeats = 8, sample_count = 31;
-                auto n32 = context.createGraphCapture(stream), n64 = context.createGraphCapture(stream);
-                std::array graphs{graph.get(),n32.get(),n64.get()};
-                for (int path = 1; path < 3; ++path)
+                std::vector<decltype(graph)> native_graphs;
+                std::vector<decltype(graph.get())> graphs{graph.get()};
+                // Retire submissions before these local native graphs disappear,
+                // including fatal assertions after a launch or event failure.
+                const auto join_graphs = [&](void *) { (void)backend->synchronizeStream(stream,parameter.device.ordinal); };
+                std::unique_ptr<void,decltype(join_graphs)> graph_retirement(&context,join_graphs);
+                for (size_t path = 1; path < dot_candidates.size(); ++path)
                 {
-                    rocm::ScopedMoEGroupedPrefillEngine candidate(path == 1 ? rocm::MoEGroupedPrefillEngine::WmmaM16N32
-                                                                         : rocm::MoEGroupedPrefillEngine::WmmaM16N64);
+                    native_graphs.push_back(context.createGraphCapture(stream));
+                    graphs.push_back(native_graphs.back().get());
+                    rocm::ScopedMoEGroupedPrefillEngine candidate(
+                        dot_candidates[path].engine,dot_candidates[path].floor);
                     ScopedBackendGraphCapture capture(context,*graphs[path],"native grouped MoE component");
                     ASSERT_TRUE(capture.begin());
                     // Profiles isolate one complete operation, timing batches eight.
@@ -345,7 +396,7 @@ namespace
                         if (node.name.find("grouped_wmma_detail") == std::string::npos) continue;
                         ++native_nodes;
                         if (seen.emplace(node.function_identity,node.grid_x,node.grid_y,node.grid_z,node.block_x).second)
-                            std::printf("MOE_WMMA_RESOURCE,%s,%d,%u,%zu,%u,%u,%u,%u,%u,%s\n",parameter.name.c_str(),path,
+                            std::printf("MOE_WMMA_RESOURCE,%s,%zu,%u,%zu,%u,%u,%u,%u,%u,%s\n",parameter.name.c_str(),path,
                                 node.registers_per_thread,node.static_shared_memory_bytes,node.max_active_blocks_per_sm,
                                 node.grid_x,node.grid_y,node.grid_z,node.block_x,node.name.c_str());
                     }
@@ -373,7 +424,7 @@ namespace
                     ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(),replay_ids.data(),replay_ids.size()*sizeof(float),parameter.device.ordinal,stream));
                     auto reference = expected;
                     std::fill(reference.begin() + static_cast<size_t>(live)*hidden,reference.end(),0.0f);
-                    for (int path = 0; path < 3; ++path)
+                    for (size_t path = 0; path < graphs.size(); ++path)
                     {
                         poison();
                         // A missing replay must fail the independently established
@@ -397,17 +448,116 @@ namespace
                     ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
                     ASSERT_GE(roctxRangePushA("ROCmGroupedMoEWmma"),0);
                     ASSERT_EQ(roctxProfilerResume(0),0);
-                    const bool launched = graphs[mode == ExpertBenchmark::Wmma32Profile ? 1 : 2]->launch();
+                    const std::string profile_name = mode == ExpertBenchmark::WmmaHybrid32Profile ? "N32Floor8" :
+                        mode == ExpertBenchmark::Wmma32Profile ? "N32" : "N64";
+                    const auto selected = std::find_if(dot_candidates.begin(),dot_candidates.end(),
+                        [&](const auto &candidate) { return candidate.name == profile_name; });
+                    ASSERT_NE(selected,dot_candidates.end());
+                    const bool launched = graphs[selected-dot_candidates.begin()]->launch();
                     const bool joined = backend->synchronizeStream(stream,parameter.device.ordinal);
                     const int paused = roctxProfilerPause(0), popped = roctxRangePop();
                     ASSERT_TRUE(launched && joined && paused == 0 && popped >= 0);
                     return;
                 }
-                std::array<std::array<double,sample_count>,3> times{};
-                for (int sample = 0; mode != ExpertBenchmark::WmmaReplay && sample < sample_count; ++sample)
-                    for (int order = 0; order < 3; ++order)
+                const auto verify_both_writers = [&] {
+                    std::vector<int> counts(experts);
+                    for (float id : route_ids) if (id >= 0) ++counts[static_cast<int>(id)];
+                    int mixed_policies = 0;
+                    for (size_t path = 3; path < graphs.size(); ++path)
                     {
-                        const int path = (sample + (sample % 2 ? 2-order : order)) % 3;
+                        const int floor = static_cast<int>(dot_candidates[path].floor);
+                        if (!std::any_of(counts.begin(),counts.end(),[&](int n) { return n >= floor; }) ||
+                            !std::any_of(counts.begin(),counts.end(),[&](int n) { return n > 0 && n < floor; }))
+                            continue;
+                        ++mixed_policies;
+                        auto *capture = dynamic_cast<HIPGraphCapture *>(graphs[path]);
+                        ASSERT_NE(capture,nullptr);
+                        size_t count = 0;
+                        ASSERT_EQ(hipGraphGetNodes(capture->graph(),nullptr,&count),hipSuccess);
+                        std::vector<hipGraphNode_t> handles(count);
+                        ASSERT_EQ(hipGraphGetNodes(capture->graph(),handles.data(),&count),hipSuccess);
+                        std::array<std::vector<hipGraphNode_t>,2> down_nodes;
+                        for (auto handle : handles)
+                        {
+                            hipGraphNodeType type;
+                            ASSERT_EQ(hipGraphNodeGetType(handle,&type),hipSuccess);
+                            if (type != hipGraphNodeTypeKernel) continue;
+                            hipKernelNodeParams params{};
+                            ASSERT_EQ(hipGraphKernelNodeGetParams(handle,&params),hipSuccess);
+                            const char *name = hipKernelNameRefByPtr(params.func,static_cast<hipStream_t>(stream));
+                            ASSERT_NE(name,nullptr);
+                            const std::string_view symbol(name);
+                            if (symbol.find("moe_grouped_down_batch_invariant_tiled_prefill_kernel") != std::string_view::npos)
+                                down_nodes[0].push_back(handle);
+                            if (symbol.find("grouped_wmma_detail") != std::string_view::npos && params.gridDim.z == 1)
+                                down_nodes[1].push_back(handle);
+                        }
+                        // Independently remove each writer from every repeated
+                        // operation. The other family must not repair its rows.
+                        for (const auto &family : down_nodes)
+                        {
+                            ASSERT_FALSE(family.empty());
+                            for (auto node : family)
+                                ASSERT_EQ(hipGraphNodeSetEnabled(capture->executable(),node,0),hipSuccess);
+                            poison();
+                            ASSERT_TRUE(graphs[path]->launch());
+                            ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),actual.size()*sizeof(float),parameter.device.ordinal,stream));
+                            ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                            for (auto node : family)
+                                ASSERT_EQ(hipGraphNodeSetEnabled(capture->executable(),node,1),hipSuccess);
+                            ASSERT_NE(std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float)),0)
+                                << "missing writer was repaired: " << dot_candidates[path].name;
+                        }
+                    }
+                    ASSERT_GT(mixed_policies,0);
+                };
+                if (hybrid && parameter.route_profile == MoERoutingProfile::PowerLaw)
+                    ASSERT_NO_FATAL_FAILURE(verify_both_writers());
+                if (hybrid && parameter.ownership_degree == 0 && experts == top_k)
+                {
+                    const auto original_ids = route_ids;
+                    const auto original_reference = expected;
+                    // E8/top-k8 uniform routing gives every expert the same
+                    // count. This separate partial-owner histogram keeps the
+                    // tiled family active while straddling every native floor.
+                    // Each row still contains at most one route to each expert.
+                    constexpr std::array counts{3,4,7,8,12,16,17,31};
+                    for (size_t i = 0; i < route_ids.size(); ++i)
+                        if (route_ids[i] >= 0 && i/top_k >= static_cast<size_t>(counts[static_cast<int>(route_ids[i])]))
+                            route_ids[i] = -1.0f;
+                    ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(),route_ids.data(),route_ids.size()*sizeof(float),parameter.device.ordinal,stream));
+                    ASSERT_TRUE(graphs[0]->launch());
+                    ASSERT_TRUE(backend->deviceToHost(expected.data(),output->gpu_data_ptr(),expected.size()*sizeof(float),parameter.device.ordinal,stream));
+                    ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                    ASSERT_TRUE(std::all_of(expected.begin(),expected.end(),[](float n) { return std::isfinite(n); }));
+                    ASSERT_TRUE(std::any_of(expected.begin(),expected.end(),[](float n) { return n != 0; }));
+                    ASSERT_NO_FATAL_FAILURE(verify(parameter.live_rows));
+                    ASSERT_NO_FATAL_FAILURE(verify_both_writers());
+                    for (int live : {0,1,17,31,parameter.live_rows})
+                        ASSERT_NO_FATAL_FAILURE(verify(live));
+                    route_ids = original_ids;
+                    expected = original_reference;
+                }
+                const bool replay_only = mode == ExpertBenchmark::WmmaReplay || mode == ExpertBenchmark::WmmaHybridReplay;
+                std::vector<int> live_points{parameter.live_rows};
+                if (hybrid)
+                {
+                    live_points = {0,1,4,8,12,16,17,31,32,48,64,68,124,128,256,384,512};
+                    std::erase_if(live_points,[&](int n) { return n > parameter.live_rows; });
+                }
+                for (int live : live_points)
+                {
+                    ASSERT_NO_FATAL_FAILURE(verify(live));
+                    if (replay_only) continue;
+                    auto reference = expected;
+                    std::fill(reference.begin()+static_cast<size_t>(live)*hidden,reference.end(),0.0f);
+                    for (int warmup = 0; warmup < 3; ++warmup)
+                        for (auto *candidate : graphs) ASSERT_TRUE(candidate->launch());
+                    std::vector<std::array<double,sample_count>> times(graphs.size());
+                    for (int sample = 0; sample < sample_count; ++sample)
+                    for (size_t order = 0; order < graphs.size(); ++order)
+                    {
+                        const size_t path = (sample + (sample % 2 ? graphs.size()-1-order : order)) % graphs.size();
                         ASSERT_TRUE(context.recordEventChecked(start,stream));
                         ASSERT_TRUE(graphs[path]->launch());
                         ASSERT_TRUE(context.recordEventChecked(end,stream));
@@ -418,15 +568,26 @@ namespace
                         // Inspect this candidate before the next can repair its output.
                         ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),actual.size()*sizeof(float),parameter.device.ordinal,stream));
                         ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
-                        ASSERT_EQ(std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float)),0);
+                        ASSERT_EQ(std::memcmp(reference.data(),actual.data(),actual.size()*sizeof(float)),0)
+                            << dot_candidates[path].name << " live=" << live;
                     }
-                for (int sample = 0; mode != ExpertBenchmark::WmmaReplay && sample < sample_count; ++sample)
-                    std::printf("MOE_WMMA_SAMPLE,%s,%d,%.9f,%.9f,%.9f\n",parameter.name.c_str(),sample,
-                        times[0][sample],times[1][sample],times[2][sample]);
-                for (auto &values : times) std::sort(values.begin(),values.end());
-                if (mode != ExpertBenchmark::WmmaReplay)
-                    std::printf("MOE_WMMA_MEDIAN,%s,%.9f,%.9f,%.9f,%.6f,%.6f\n",parameter.name.c_str(),
-                    times[0][15],times[1][15],times[2][15],times[0][15]/times[1][15],times[0][15]/times[2][15]);
+                    for (int sample = 0; sample < sample_count; ++sample)
+                        if (hybrid)
+                            for (size_t path = 0; path < graphs.size(); ++path)
+                                std::printf("MOE_WMMA_HYBRID_SAMPLE,%s,%d,%s,%d,%.9f\n",parameter.name.c_str(),live,
+                                    dot_candidates[path].name.c_str(),sample,times[path][sample]);
+                        else
+                            std::printf("MOE_WMMA_SAMPLE,%s,%d,%.9f,%.9f,%.9f\n",parameter.name.c_str(),sample,
+                                times[0][sample],times[1][sample],times[2][sample]);
+                    for (auto &values : times) std::sort(values.begin(),values.end());
+                    if (hybrid)
+                        for (size_t path = 0; path < graphs.size(); ++path)
+                            std::printf("MOE_WMMA_HYBRID_MEDIAN,%s,%d,%s,%.9f,%.6f\n",parameter.name.c_str(),live,
+                                dot_candidates[path].name.c_str(),times[path][15],times[0][15]/times[path][15]);
+                    else
+                        std::printf("MOE_WMMA_MEDIAN,%s,%.9f,%.9f,%.9f,%.6f,%.6f\n",parameter.name.c_str(),
+                            times[0][15],times[1][15],times[2][15],times[0][15]/times[1][15],times[0][15]/times[2][15]);
+                }
                 ASSERT_NO_FATAL_FAILURE(verify(0));
                 ASSERT_NO_FATAL_FAILURE(verify(parameter.live_rows));
             }
@@ -455,6 +616,30 @@ namespace
                 return;
             const auto original_ids = route_ids, original_weights = route_weights;
             const auto original_expected = expected;
+            // All candidates bind the same immutable source-prepared slice.
+            // Repacking per policy would repeat setup work and obscure the
+            // retained-buffer ownership this replay is intended to qualify.
+            const int columns = hidden / (parameter.ownership_degree ? parameter.ownership_degree : 2);
+            const int first_column = hidden - columns;
+            std::vector<std::shared_ptr<TensorBase>> column_sources;
+            std::vector<GpuPreparedGemm> column_prepared;
+            std::vector<DeviceNativeQuantisedMatrixDesc> column_descriptors(experts);
+            for (int expert = 0; expert < experts; ++expert)
+            {
+                // Slice SOURCE rows before packing. Reinterpreting a complete
+                // packed matrix with a smaller N would use the wrong layout.
+                column_sources.push_back(sources[expert * 3 + 2]->create_view(
+                    {static_cast<size_t>(columns), static_cast<size_t>(intermediate)},
+                    static_cast<size_t>(first_column) * intermediate));
+                column_prepared.push_back(makeGpuPreparedGemm(column_sources.back().get(), parameter.device,
+                    "expert.economy.fixed_down." + std::to_string(expert)));
+                ASSERT_TRUE(column_prepared.back().kernel->exportNativeQuantisedMatrixDesc(column_descriptors[expert]));
+            }
+            const int column_table = kernel->uploadGroupedExpertDownDescriptorTable(
+                column_descriptors.data(), experts, columns, intermediate);
+            ASSERT_GE(column_table, 0);
+            auto column_routes = tensor(parameter.rows * top_k, columns);
+            auto column_output = tensor(parameter.rows, columns);
             const auto check_phases = [&](const char *engine_label) {
             route_ids = original_ids; route_weights = original_weights; expected = original_expected;
             ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(),route_ids.data(),route_ids.size()*sizeof(float),parameter.device.ordinal,stream));
@@ -563,27 +748,6 @@ namespace
             ASSERT_TRUE(backend->deviceToHost(expected.data(), output->gpu_data_ptr(), expected.size() * sizeof(float), parameter.device.ordinal, stream));
             ASSERT_TRUE(backend->synchronizeStream(stream, parameter.device.ordinal));
 
-            const int columns = hidden / (parameter.ownership_degree ? parameter.ownership_degree : 2);
-            const int first_column = hidden - columns;
-            std::vector<std::shared_ptr<TensorBase>> column_sources;
-            std::vector<GpuPreparedGemm> column_prepared;
-            std::vector<DeviceNativeQuantisedMatrixDesc> column_descriptors(experts);
-            for (int expert = 0; expert < experts; ++expert)
-            {
-                // Slice SOURCE rows before packing. Reinterpreting a complete
-                // packed matrix with a smaller N would use the wrong layout.
-                column_sources.push_back(sources[expert * 3 + 2]->create_view(
-                    {static_cast<size_t>(columns), static_cast<size_t>(intermediate)},
-                    static_cast<size_t>(first_column) * intermediate));
-                column_prepared.push_back(makeGpuPreparedGemm(column_sources.back().get(), parameter.device,
-                    "expert.economy.fixed_down." + std::to_string(expert)));
-                ASSERT_TRUE(column_prepared.back().kernel->exportNativeQuantisedMatrixDesc(column_descriptors[expert]));
-            }
-            const int column_table = kernel->uploadGroupedExpertDownDescriptorTable(
-                column_descriptors.data(), experts, columns, intermediate);
-            ASSERT_GE(column_table, 0);
-            auto column_routes = tensor(parameter.rows * top_k, columns);
-            auto column_output = tensor(parameter.rows, columns);
             const auto column_down = [&] {
                 return kernel->executeGroupedPrefillProjection(nullptr, nullptr, gate_table, column_table,
                     parameter.rows, hidden, intermediate, experts, top_k,
@@ -614,10 +778,10 @@ namespace
 #ifdef HAVE_ROCM
             if (native)
             {
-                for (const auto engine : {rocm::MoEGroupedPrefillEngine::WmmaM16N32,rocm::MoEGroupedPrefillEngine::WmmaM16N64})
+                for (size_t path = 1; path < dot_candidates.size(); ++path)
                 {
-                    rocm::ScopedMoEGroupedPrefillEngine selected(engine);
-                    ASSERT_NO_FATAL_FAILURE(check_phases(engine == rocm::MoEGroupedPrefillEngine::WmmaM16N32 ? "wmma32_" : "wmma64_"));
+                    rocm::ScopedMoEGroupedPrefillEngine selected(dot_candidates[path].engine,dot_candidates[path].floor);
+                    ASSERT_NO_FATAL_FAILURE(check_phases((dot_candidates[path].name+"_").c_str()));
                 }
             }
             else
@@ -647,12 +811,21 @@ namespace
     /** @test Pair whole-component native-event samples only after dirty replay passes. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_CapturedTournament)
     { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaTournament); }
+    /** @test Cross whole-expert thresholds in retained graphs and prove both writers contribute. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_HybridCapturedReplay)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaHybridReplay); }
+    /** @test Time complete hybrid policies across device-published live work. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_HybridCapturedTournament)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaHybridTournament); }
     /** @test Isolate one N32 complete projection transaction outside canonical timing. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedN32Profile)
     { runExpertPipeline(GetParam(),ExpertBenchmark::Wmma32Profile); }
     /** @test Isolate one N64 complete projection transaction outside canonical timing. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedN64Profile)
     { runExpertPipeline(GetParam(),ExpertBenchmark::Wmma64Profile); }
+    /** @test Profile one complete mixed-writer transaction, independently of event timing. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedHybridN32Floor8Profile)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaHybrid32Profile); }
     INSTANTIATE_TEST_SUITE_P(NativeGfx1100,ROCmGroupedWmmaPerf,::testing::ValuesIn(groupedWmmaPerfCases()),
         [](const ::testing::TestParamInfo<Case> &info) { return info.param.name; });
 
