@@ -6217,3 +6217,22 @@ the cause = owner classification). SOURCE HOLD6ca/#214 + fresh-pin
 boundary unchanged. Wording fixed in all records (my earlier "the
 tip FIXES it"/"base-environment" phrasing = owner classification;
 the diff observation = the inspected claim).
+
+### x86 evidence relayed locally; reviewer has exact Mac paths (14:30Z)
+
+WSL relay 1-4 delivered (seals+failed-name diffs; 6ca->ef86 name-
+level + per-gate config sums; per-failed-test verbatim; a8beee811
+byte-identity seal). COORD wrote to the Mac evidence dir
+(K14-STAGEAGATE-X86-6CA2462CC-20261114/): x86-summaries-and-diff.txt
+(9.2KB; relays 1-3) + x86-byte-identity-a8beee811.txt (2.8KB;
+relay 4 + packer-coverage note) — exact paths sent to the reviewer
+with the ARM paths (name-level-diff.txt + raw-arm/ + raw-base/ +
+SUMMARY.md) and the WSL full-text seals/raw XML paths. Labels =
+summaries/diffs/failure extracts (per reviewer; raw full XMLs stay
+WSL). KEY confirmed: base-vs-6ca TIP-ONLY=0 / BASE-ONLY=OneDNN
+BuildLifecycle (inspected claim = "base-only failure, absent at
+tip"; cause = owner classification); 6ca->ef86 = 20 files +240/-102
++ 2 new tests; ef86 x86 incremental gate RUNNING (parity ~[134/800],
+oneDNN reused auth). Reviewer: independent read now possible;
+fresh exact-pin request after Main's re-verification plan. Board:
+.80/.79 re-verification + WSL ef86 gate in flight -> pins -> Gate-A.
