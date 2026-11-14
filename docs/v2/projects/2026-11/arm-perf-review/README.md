@@ -5409,3 +5409,26 @@ assert). SEQUENCE UNCHANGED: .80 focused rerun at the successor
 binding gate at the triage tip (-j4, parity TU pre-built serially).
 Dispatched: lane (design item), sparks (hold/re-target successor;
 83a0351bd run = warm only if started).
+
+### Successor fc39fbe93 landed + verified; .80 binding re-pin sent (01:35Z)
+
+Lane closed Main's seq-220 design item: (1) REQUIRED inventory —
+all six admission entry points (buildResolverInput, resolveCapacity,
+resolvePipelineCapacity, resolveCapacityDraft,
+resolvePipelineCapacityDraft, resolveAndInstall) take `const
+ClusterInventory *inventory` REQUIRED (no default); the `policy =
+{}` defaults also removed (C++ rule) — every call site names
+policy explicitly; production &inventory (unchanged semantics),
+device-free explicit nullptr, fixtures &observed. (2) SWEEP:
+tree-wide arg-count audit across all six entry points x every call
+site (src + tests) = CLEAN; caught + fixed six test call sites
+relying on the policy default (now explicit); compiler enumerates
+future forgets. (3) FALLBACK TRUTHFULNESS: value_or(kHostPrepared
+Layout) = DEAD FOR CPU BYTE PRICING (only consumed with NO CPU
+participant); ASSERTED (planDeclaresCpuParticipant) + docs; lane's
+correctness note (MultiDeviceMemory has_cpu_resource=true because
+no CPU participant exists — dead for pricing, not unreachable)
+recorded. Mac gates green. COORDINATOR VERIFY: origin tip
+fc39fbe93; 5 files +74/-51; `inventory = nullptr` gone. RE-PIN
+SENT (.80 @ fc39fbe93 = binding; PASS => triage tip = fc39fbe93 =>
+.79 base control + triage-tip gate + diff => WSL binding gate).
