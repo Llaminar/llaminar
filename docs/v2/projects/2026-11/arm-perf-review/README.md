@@ -5238,3 +5238,19 @@ recorded, JUnit asserts non-fatal at base — expected no-ops);
 PRIMARY artifact = the DRIVER preflight baseline (the 221
 attribution). Seal K14-STAGEAGATE-D5E04FDCE-CUDAON-BASELINE-<ts>.
 Main consolidated; WSL T' early-surface building (01a1d782).
+
+### WSL T' early-surface = infra OOM (parity TU); retry -j2/serial (00:54Z)
+
+01a1bd53 (retiring session) handover: T' recovery gate (03480d07e)
+FAILED AT BUILD — infra: cc1plus killed on
+Test__QwenSparseQueryParityEvidence.cpp.o (driver.log:26) after
+455s, DRIVER_RC=1, test_count=0; SAME heavy parity TU OOM'd the
+d5e04fdce base gate; aa842a1be -j5 fresh compiled it fine => 
+marginal-memory timing at -j4/28g (+concurrent TUs). NOT a source
+finding. Artifacts retained (armq/a512-03480d07e/{logs/progress,
+logs/driver.log, receipt rc=1, receipt.pre-crash}); handover brief
+/home/fank/llaminar-work/armq/HANDOVER-arm-qual.md. RETRY TO
+01a1d782: -j2 OR serial pre-build of the parity target (+ the rest),
+then T' early-surface; sequence (byte-identity serial ->
+develop-control -> binding at triage tip) unchanged; reduced -j
+does NOT change evidence status (early-surface only).
