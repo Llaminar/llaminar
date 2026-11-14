@@ -5980,3 +5980,36 @@ seal + x86 byte identity + x86 binding seal; Gate-A range verdict
 request).** Developing: waiting = WSL base delta + the develop
 discriminator re-run (after the base, serially) -> Main's PR call
 on AutomaticPlanningDiagnostics; pins/backlogs = reviewer verdict.
+
+### Main 13:17Z: x86 classified-not-diffed; WSL -j cap; Stage-A open items drafted
+
+(1) x86 6ca2462cc ACCEPTED (3563 tests, 10 reds, no chain class,
+oneDNN authority genuine); pin dispatch = right. (2) X86 =
+CLASSIFIED NOT DIFFED: the failed-set attribution becomes EVIDENCE
+when the WSL d5e04fdce base control yields the NAME-LEVEL DIFF
+(tip-only = empty or explained); reviewer caveat dispatched (x86
+diff follows; ARM diff exact; Gate-A final verdict lands with the
+x86 diff attached). (3) INFRA LESSON: `cmake --build --parallel`
+no-N = Ninja defaults to all cores -> OOM on memory-constrained
+hosts; ALWAYS `--parallel N` / `-- -jN` — RECORDED AS HOST-SPECIFIC
+WSL CAP (project's canonical "unrestricted --parallel" unchanged).
+(4) STAGE-A OPEN-ITEMS STATUS DRAFTED (sent to Main + recorded
+here): §8 carried (Stage-B-entry admission-predicate refinement
+[cccb84420 — planDeclaresCpuParticipant && !observation gate; the
+CPI assert becomes the throw = real release-mode check; 4 test
+files relax]; nonblocking test hardening
+[Test__ExpertTierWeightStream.cpp:193-196 ASSERT_EQ/4-iterator;
+later fixup; binding-tip change + 1-test rerun] + the "allocates
+nothing" wording correction [same later touch]); AGENTS.md
+ASSERT/ASSERT_MSG/ASSERT_NOT_NULL drift (:1329 — Assertions.h =
+LLAMINAR_ASSERT* only; base-owner docs fix); develop-sided (develop
+CPU-only configure broken [Qwen35MoEP2PNativeRouteTransport
+:31590 unguarded]; REQUIRES_BACKEND absent [0 vs our 30 — ours
+from 20f6dbc09]; discriminator re-run after the WSL base;
+AutomaticPlanningDiagnostics OPEN = Main's PR fix on the verdict);
+BASE-OWNER (rows 3-9 backend-detection defect class — one issue;
+CachedGraph flaky/shared; NCCL fleet refresh post-merge
+[beb2389d7 + 31dd1f7ee]); POST-MERGE CASCADE (B1 re-measure, MTP
+policy, idea-25, compaction fast-follow, idea16-tournament,
+MXFP4 gated, 27B rider held, cnpy fix, .80 benchmark cycle
+deferred); STAGE B locked on this list + Gate-A.
