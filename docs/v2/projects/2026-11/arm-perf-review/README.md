@@ -5749,3 +5749,34 @@ executable (ctest -N -V) + whether it compiles a 6ca2462cc-changed
 file; (3) .79 rerun at 6ca2462cc must show ALL 14 green (any red =
 unexplained => lane verbatim). Dispatched; "layered defence" credit
 stands for the JointReplica site only; the rest waits on the lines.
+
+### CORRECTION: the 14 were NOT new — sealed-diff artifact (05:56Z)
+
+SPARKS CORRECTION (per-name table = Main's requirement fully met):
+the earlier diff compared vs the SEAL DIR, which LACKED unit.xml.
+CORRECTED (FULL 03480d07e results incl. unit.xml): 03480d07e =
+239 fails; 1af9f6429 = 220; NEW = 1 (CachedGraph = flaky); GONE =
+20 (16 bucket-b + V2_Unit_AutomaticPlanningDiagnostics +
+V2_Unit_ExpertGemmRegistry + V2_Unit_MoEOverlayDistributed
+ResidencyProtocol + V2_Unit_OrchestrationPlanConfig). "14 new Unit"
+= NOT NEW (red at 03480d07e + in the base set); MoEPipeline
+AggregateCapacity = red at BOTH (6ca2462cc-fixed). TABLE: 1
+V2_Unit_MoEOverlayCapacityResolver (MigrationFabric/BoundRank/
+ReplicatedDense — uniform exception; binary compiles BOTH fixed
+files => 6ca2462cc-class). 2 V2_Unit_MemoryPlanner (29 fails incl.
+MultiTierOverlay + MoEPipelineMemoryAdmission AggregatePressure
+Devices{4,8}; compiles Test__MoEOverlayPipelineCapacity.cpp =>
+6ca2462cc-class). 3 PhysicalMemoryAuthority ("Native graph object
+geometry requires an exact compiled GPU backend" — env). 4-8 Pooled
+x5 ("Pooled source native backend was not compiled" — env). 9
+PrefillGraphCapturability (:2789/2908/2911/2914 — capture/GPU-shape).
+10-13 ROCmNativeQuantised x4 (path.open FileNotFoundError; ROCm CSV
+absent HAVE_ROCM=OFF — the KNOWN INHERITED 4 confirmed; red at base
++ 03480d07e + tip; NO flip). CONCLUSION: pre-6ca2462cc reds = rows
+1-2 + AggregateCapacity (all 6ca2462cc-class); rows 3-13 = env/
+not-compiled/inherited (NOT chain). SEAL-COMPLETENESS LESSON: the
+K14-STAGEAGATE-03480D07E seal dir LACKED unit.xml (full results in
+sa-results-03480d07e) — caused the defective diff; future seals
+must include the DRIVER's full results set. .80 6ca2462cc BUILD=0
++ capacity/memory binaries running; .79 rerun next; any red =
+verbatim.
