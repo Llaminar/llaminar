@@ -5385,3 +5385,27 @@ src/ production change. RE-PIN SENT (.80 focused set @ 83a0351bd;
 whole set if cheap — conversions touch the same TUs). PASS =>
 triage tip = 83a0351bd => .79 base control + triage-tip rerun w/
 diff.
+
+### Main review OK @ 83a0351bd; ONE design item -> same triage set (01:27Z)
+
+Main: approach OK (admission derives from live inventory + same
+uniformity refusal; hard throw stays when inventory absent;
+fixtures go through that path). DESIGN ITEM (violates the "no
+default" rule): resolvePipelineCapacity / Draft take `const
+ClusterInventory *inventory = nullptr` (MoEOverlayCapacityAdmission
+.h:503/511) — a defaulted nullptr is exactly how the original
+regression shipped. **MAKE REQUIRED** (reference or explicit
+pointer no-default; genuinely-inventory-less callers say so via a
+typed MoEOverlayInventoryAbsent{} tag or an explicit nullptr) —
+the compiler then lists every producer. SIBLING SWEEP: any
+admission entry points that gained a defaulted inventory parameter
+in ba2811e4c..83a0351bd. DOC NOTE: "GPU-only plans fall back to
+the build's host layout" = value_or(kHostPreparedLayout) at :699,
+reached ONLY when has_cpu_resource=false => no CPU bytes priced
+with it; STATE the fallback is dead for CPU pricing (+ cheap
+assert). SEQUENCE UNCHANGED: .80 focused rerun at the successor
+(Linux compile+run) -> green => triage tip -> .79 base control
+(NCCL per rule) + .79 triage-tip gate + failed-set diff -> WSL
+binding gate at the triage tip (-j4, parity TU pre-built serially).
+Dispatched: lane (design item), sparks (hold/re-target successor;
+83a0351bd run = warm only if started).
