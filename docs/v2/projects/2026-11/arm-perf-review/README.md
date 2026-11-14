@@ -5187,3 +5187,18 @@ byte-identity SERIALIZED -> develop-control last. Qual's bash tool
 NOT re-registered (probe failures explained); shell via the monitor
 spawn watcher. All pre-crash evidence safe. Main + lane informed;
 incident closed.
+
+### Main 00:43Z: WSL T' = early-surface only; binding at the triage tip
+
+WSL recovery accepted (clean daemon, no orphans, one container;
+incremental T' resume fine — configure unchanged, SHA pinned). (1)
+WSL T' x86 gate (03480d07e) = EARLY-SURFACE ONLY (same as .79)
+— predates the A4 admission triage; its bucket-b reds EXPECTED,
+not new findings. (2) Then byte-identity head-side serial ->
+develop-control. (3) THEN the WSL x86 BINDING gate at the TRIAGE
+TIP (a8beee811 or successor) once the .80 focused ARM triage is
+green — -j4, alone, failed-set diff vs the d5e04fdce CUDA-ON base
+(.79 side = the base control + triage-tip rerun in parallel on its
+own host). Relayed to the qual lane; statuses: .79 = seal done +
+base control queued; .80 = a8beee811 build running; WSL = T' gate
+resumed (-j4 incremental); lane poll-only.
