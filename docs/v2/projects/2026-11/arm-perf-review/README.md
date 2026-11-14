@@ -6236,3 +6236,19 @@ tip"; cause = owner classification); 6ca->ef86 = 20 files +240/-102
 oneDNN reused auth). Reviewer: independent read now possible;
 fresh exact-pin request after Main's re-verification plan. Board:
 .80/.79 re-verification + WSL ef86 gate in flight -> pins -> Gate-A.
+
+### .80 focused @ ef86de1c1: 1 NEW RED from R-1 (cap 91/1) (14:30Z)
+
+SPARKS STEP 1: BUILD=0 (triage-build9.log). Runs green except cap
+91/1: MoEOverlayCapacityAdmission.CpuResourcesPriceOnlyTheBound
+OverlayLayout -> verbatim "CPU expert projection pricing requires
+an implemented prepared layout 'interleaved-compact-a64'" — GREEN
+at 6ca2462cc, RED at ef86de1c1 = R-1-introduced. Question routed
+to the lane (R-1 contract = tie-breaker): (a) if the test passes a
+non-host-equal/unimplemented (compact) layout => CORRECT = the
+fail-closed rejection => update the test's expectation (per the
+R-1 regression contract); (b) if a legitimate admitted layout is
+wrongly rejected => code fix. Lane to show the test's layout
+record inline. SPARKS STEP 2 (.79 incremental) RUNNING (BUILD
+clean; preflight CUDA 43/383) — hold the diff for the lane's
+response (correct). Main informed.
