@@ -5281,3 +5281,14 @@ the core lib => no OOM risk — correct analysis), watcher armed;
 byte-identity compare vs the base-run manifest after the core
 build. Then develop-control -> binding gate at the triage tip.
 Acknowledged; no other action.
+
+### PERF CHECKPOINT DEFERRED (00:58Z, 3d cycle)
+
+Both GB10s verified busy with qualification (artifacts, not
+reports): .79 = d5e04fdce CUDA-ON base control BUILDING
+(base-d5e04fdce + build-base, sa-BUILD.log 234KB @ 01:58Z host);
+.80 = focused ARM triage @ a8beee811 executing (triage-run.log +
+triage-results @ 01:53Z host). No free window -> canonical 35B/
+27B benchmark set deferred; next cycle (or at first free window
+post-qualification) runs it at the current tip. No benchmark
+claim made; tracker only.
