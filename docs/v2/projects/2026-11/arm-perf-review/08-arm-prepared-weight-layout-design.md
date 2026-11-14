@@ -871,6 +871,25 @@ canonical arm is a lane defect and blocks landing.
   side; the `CpuExpertSlotPool` root payload_bytes switch is canonical
   data keyed by encoding and must move to section-derived values when
   compact tables become real).
+  - **Stage-B-ENTRY item (Main, seq 241; carried, NOT a Gate-A
+    blocker — deliberately deferred: it would cost another
+    .80/.79/WSL cycle for NO production behavior change):** the
+    admission refusal predicate is broader than the pricing invariant.
+    `buildResolverInput` throws on `has_cpu_resource` (ANY CPU budget,
+    including the host-prefix budget every GPU pipeline stage carries)
+    when the observation is absent; the invariant only needs a layout
+    when `planDeclaresCpuParticipant(plan)` — a GPU-only plan with a
+    host-prefix budget prices NO CPU expert bytes, knowable from the
+    plan alone (which is why four device-free test files had to be
+    taught to pass an inventory they semantically don't need).
+    **Refinement (Stage B, before compact activation): gate on
+    `planDeclaresCpuParticipant(plan) && !observation`, deriving from
+    the live inventory only then; the CPU-participant ASSERT becomes
+    the throw ITSELF — a real release-mode check rather than the
+    assertions-only guard (which supersedes the cf7ce841c wording).**
+    Production is correct today: every production caller passes live
+    inventory; the Gate-A path is unaffected (the test-file inventory
+    advice above can be relaxed in the same change).
 - **Phase 1 — entry item 0 (reviewer spine finding, Main-confirmed
   2026-11-13, seq 45): fail-closed admission before any division.** At
   `d3e936fbd`, `admitStructure` (`CPUNativeQuantisedWeightView.h:456-459`)
