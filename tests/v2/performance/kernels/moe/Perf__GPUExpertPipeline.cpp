@@ -1077,6 +1077,13 @@ namespace
     /** @test Isolate one N32 complete projection transaction outside canonical timing. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedN32Profile)
     { runExpertPipeline(GetParam(),ExpertBenchmark::Wmma32Profile); }
+    /** @test Isolate full-capacity N32 without changing existing partial profile cases. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedFullN32Profile)
+    {
+        auto parameter = GetParam();
+        parameter.live_rows = parameter.rows;
+        runExpertPipeline(parameter,ExpertBenchmark::Wmma32Profile);
+    }
     /** @test Isolate one N64 complete projection transaction outside canonical timing. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedN64Profile)
     { runExpertPipeline(GetParam(),ExpertBenchmark::Wmma64Profile); }

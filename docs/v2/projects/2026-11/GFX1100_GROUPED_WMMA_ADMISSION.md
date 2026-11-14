@@ -285,3 +285,102 @@ Cold fused/ordered profiles fetch approximately 106875/106765 KiB while issuing
 KiB. These observations motivate preserving sparse Dot4 geometry while retaining
 WMMA's greater reuse on dense groups. See `grouped-fused-summary.json` and
 `grouped-fused-{n32,n64,cold,hot,mixed,ordered_cold,ordered_hot,ordered_mixed}-profile/summary.json`.
+
+## Capped directory experiment
+
+The next candidate caps the directory dimension of the captured grid at 16,
+32 or 64 blocks. Each block visits directory entries at a fixed `gridDim.y`
+stride; the original All policy retains one block per possible tile. A cap of
+one is reserved for adversarial replay. Global route admission happens before
+any directory read because an inactive planner leaves that storage unspecified.
+A sentinel ends the valid prefix, while a different codebook or a diagnostic
+branch suppression skips only the current entry. Each iteration resets its
+partition accumulators and retains the original source-specific FP32 order.
+The cap is part of the recorded grid, with no host live-count observation or
+new replay-time policy lookup.
+
+An initial extracted device helper caused 232–336 bytes of private storage
+despite zero register-memory spills. The existing captured replay resource
+assertions rejected it. The final arithmetic body is directly inside the
+directory loop; the helper is removed. Both Release and Integration compile
+gfx906 and gfx1100 under the unchanged spill guard. All 144 gfx1100 native
+specializations now have zero private storage and zero scratch instructions.
+SGPR spill metadata records proven transfers into VGPR lanes, which are distinct
+from memory spills. The N32 gate/up Q4_0 pure/adaptive entries use 66/70 VGPRs;
+IQ2_S uses 72/71. Their static LDS remains 3392/3520 bytes respectively. The
+additional register pressure still requires timing qualification.
+
+The 45 serial-byte, mixed-codebook, partial-tile and promoted-storage replays
+force cap one and check the actual captured grid. They pass in 98.24 s. Seven
+focused Integration registrations pass in 196.55 s, including the new explicit
+preflight entries `V2_Integration_ROCmGroupedWmmaDirectoryReplay` and
+`V2_Integration_ROCmGroupedWmmaDirectoryTimingReplay`. A direct Release run
+executes and passes all 26 selected directory cases; a prior zero-test Release
+CTest invocation is explicitly rejected as evidence. Device-free cap totality
+also passes. The full preflight suite is not run.
+
+The additional profiler owners pass 14 separate one-case smoke checks. Full
+uncapped Qwen N32 has an explicit 512-live-row owner; the older 448-row probe
+keeps its original meaning. Compiler/source proof is retained in
+`grouped-directory-full-profile-resource-review.json`, with the earlier proof
+preserved. `grouped-directory-additive-smokes-receipt.json` distinguishes these
+new harness checks from the original 26/7 gate evidence and binds the unchanged
+core libraries.
+
+All five canonical cases now qualify 26,350 samples: 17 live counts, ten
+policies and 31 samples of eight complete operations. Each case binds the same
+20-file producer and proves no observed compiler/profiler/inference overlap.
+An overlapped compact-Q4 attempt is retained and excluded; its replacement
+passes. `grouped-directory-summary.json` and `grouped-directory-receipt.json`
+own the results below. Values are Dot4 median latency divided by candidate
+median latency at full live work.
+
+| Case | Dot4 µs | Pure N32, All | Cap16 | Cap32 | Cap64 |
+|---|---:|---:|---:|---:|---:|
+| Qwen uniform | 925.446 | 1.1894× | 0.9723× | 1.0753× | 1.1885× |
+| Qwen hotset | 758.493 | 1.0944× | 0.8926× | 0.9999× | 1.0948× |
+| Qwen power-law | 946.926 | 0.9689× | 0.7608× | 0.8817× | 0.9599× |
+| Compact Q4_0 | 293.582 | 1.0081× | 0.6602× | 0.8559× | 0.8815× |
+| Compact IQ2_S | 324.018 | 0.9747× | 0.6488× | 0.8204× | 0.8536× |
+
+Cap16 helps small concentrated work: hotset live64 reaches 1.4071×. However,
+uniform live64 floor8 reaches only 0.7013× with All and 0.6954× with cap64.
+The capped loop also reduces the earlier pure-N32 full-work gains. These
+results reject installing this family as an Automatic policy; a fixed cap and
+row floor cannot retain both geometries' advantages.
+
+Four exact diagnostic profiles now qualify all 28 separate counter invocations
+for cap64 floor8 cold/hot, full uncapped N32 and the cold ordered control. They
+bind the same timing producer and restore AUTO after every invocation. All
+selected entries have zero private storage, VGPR memory spills and scratch
+instructions. The native entries retain 23 or 34 proven SGPR-to-VGPR lane moves.
+
+| IQ2_S gate/up profile | VGPRs | Static LDS bytes | Waves | Fetch KiB |
+|---|---:|---:|---:|---:|
+| Cap64 floor8, live64 | 71 | 3520 | 4096 | 107056.875 |
+| Cap64 floor8, live512 | 71 | 3520 | 4096 | 109338.875 |
+| Uncapped pure N32, live512 | 72 | 3520 | 32768 | 109020.625 |
+| Ordered TM12/TN256, live64 | 56 | 480 | 9568 | 106767.938 |
+
+Fewer launched waves do not remove the sparse branch's work or weight traffic.
+The exact summaries are `grouped-directory-<mode>-profile/summary.json`. They
+provide allocation and activity evidence, without an achieved-occupancy
+measurement. These profiler observations are not canonical timing labels.
+`grouped-directory-profile-timing-join.json` binds these observations to their
+matching canonical cells. The failed directory-loop implementation, cap API
+and cap-only registrations have been retired; the source patch, binaries,
+native objects and provenance are retained in
+`grouped-directory-producer-snapshot/snapshot.json`. The full-capacity N32
+profiler owner remains useful independently of that experiment. The next candidate
+keeps the legacy Dot4 column width and uses four sequential WMMA column chunks
+inside the same block, with one device-owned whole-expert predicate controlling
+both directory row steps and the arithmetic branch. This is a design to test,
+not an installed or qualified policy. Automatic remains OrderedDot4.
+
+The restored Release core is byte-identical to the qualified fused core
+(`9b378b06625749bf808be5602f7e233665a59aab167e66959b5d8bbb1de333dd`),
+and its nine native source/header inputs match the retained snapshot. Both
+shipping HIP targets pass the restored Release/Integration spill-guard builds.
+All 17 dispatch Unit cases and the two new full-capacity N32 controls (uniform
+and power-law) pass. `grouped-retired-checkpoint-receipt.json` binds those checks
+to the rebuilt artifacts and original native evidence.
