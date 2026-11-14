@@ -5690,3 +5690,20 @@ release-mode check. Production correct today (every production
 caller passes live inventory). §8 record dispatched to the lane.
 WAITING: .80/.79 results @ 6ca2462cc, the 1af9f6429-vs-03480d07e
 name diff (206 arithmetic), WSL develop-control.
+
+### Carry item recorded cccb84420 (verified: docs-only; code tip 6ca2462cc unchanged)
+
+Lane: §8 Stage-B-entry design observation recorded in cccb84420
+(design doc only; verified on origin): refusal predicate broader
+than the pricing invariant (has_cpu_resource throw vs
+planDeclaresCpuParticipant-gated need; GPU-only + host-prefix plans
+price no CPU expert bytes — knowable from the plan alone);
+refinement = gate on planDeclaresCpuParticipant(plan) &&
+!observation, derive only then, CPU-participant invariant as the
+throw itself (real release-mode check superseding the cf7ce841c
+assertion-only wording); the four device-free test files' inventory
+advice can relax in that same Stage-B change. NOT a Gate-A blocker;
+no production change. TIPS: code = 6ca2462cc; docs = cccb84420.
+Board: awaiting .80 compile+focused @ 6ca2462cc -> .79 rerun ->
+WSL x86 binding gate -> pins -> Gate-A; plus the name-diff (206
+arithmetic) + WSL develop-control.
