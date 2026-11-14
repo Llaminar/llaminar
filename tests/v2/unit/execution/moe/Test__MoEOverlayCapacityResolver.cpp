@@ -15,6 +15,7 @@
 #include "memory/CPUSerialExpertStorageLayout.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEOverlayCapacityResolver.h"
+#include "../../../utils/TestCPUPreparedLayoutInventory.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
 #include "backends/RetainedParticipantGraphExecutable.h"
@@ -4224,20 +4225,22 @@ namespace llaminar2
         plan.first_model_layer = 32;
         plan.continuation_domain = plan.shared_expert_domain = "stage";
         plan.domains = {boundDomain("stage", 0, GlobalDeviceAddress::cpu(0))};
-        // Device-free fixture: admission requires the inventory-bound
-        // observation; the single-ISA fixture truth is canonical.
-        plan.resolved_cpu_prepared_layout = CPUNativeQuantisedLayout::InterleavedCanonical;
+        // The fixture observes the uniform CPU layout from its live
+        // inventory like production (never a hand-set field).
+        const auto observed = test::cpuUniformCanonicalInventory({0});
         plan.routed_tiers = {{.name = "owned", .domain = "stage", .priority = 0, .fallback = true}};
         const std::vector owned{layer(32, native_quantised_formats::Q4_K), layer(33, native_quantised_formats::Q4_K)};
         const auto footprints = MoEOverlayCapacityResolver::preparedFootprints(owned);
         const std::vector budgets{boundBudget(0, exactBudget("stage", DeviceId::cpu(), footprints, {2, 2}, 0))};
-        const auto input = MoEOverlayCapacityAdmission::buildResolverInput(plan, 2, owned, budgets, {});
+        const auto input = MoEOverlayCapacityAdmission::buildResolverInput(
+            plan, 2, owned, budgets, {}, &observed);
         const auto admitted = MoEOverlayCapacityResolver::resolve(input);
         EXPECT_EQ(admitted.layer_footprints.size(), 2u);
         EXPECT_EQ(admitted.resource("stage")->remainingBytes(), 0u);
         auto foreign = owned;
         for (auto &entry : foreign) entry.layer_idx -= 32;
-        EXPECT_THROW((void)MoEOverlayCapacityAdmission::buildResolverInput(plan, 2, foreign, budgets, {}), std::invalid_argument);
+        EXPECT_THROW((void)MoEOverlayCapacityAdmission::buildResolverInput(
+            plan, 2, foreign, budgets, {}, &observed), std::invalid_argument);
     }
     /** @test A frozen quota draft owns metadata and cannot retry fewer experts after a table rejection. */
     TEST(MoEOverlayCapacityResolver, FinalNgramAdmissionCannotReopenFrozenQuotaSearch)

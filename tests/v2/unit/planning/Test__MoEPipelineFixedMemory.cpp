@@ -213,7 +213,11 @@ namespace
             for (size_t stage = 0; stage < ranks.size(); ++stage)
                 requests.push_back({*configs[stage].moe_routed_expert_plan, model.expert_count,
                     manifests[stage], fixed.at(stage).physical_budgets, policies[stage]});
-            return MoEOverlayCapacityAdmission::resolvePipelineCapacity(requests);
+            // The fixture's live inventory drives admission exactly like the
+            // production pipeline path: the uniform CPU prepared layout is
+            // observed from it (same refusal), never hand-set on the plan.
+            return MoEOverlayCapacityAdmission::resolvePipelineCapacity(
+                requests, &inventory);
         }
     };
 }

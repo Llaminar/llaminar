@@ -11,6 +11,7 @@
 #include "loaders/MoEExpertSourceView.h"
 #include "kernels/common/NativeEmbeddingLayout.h"
 #include "utils/QuantizedVerifierFormats.h"
+#include "../../../utils/TestCPUPreparedLayoutInventory.h"
 namespace llaminar2 {
 namespace {
 /** @return Original compatible gate/up/down source, with an explicit PP layer offset. */
@@ -30,10 +31,11 @@ MoERoutedExpertPlacementPlan cpuShardPlan(int experts=4){
  d.routed_decode_assignment_policy=d.routed_prefill_assignment_policy=RoutedExpertAssignmentPolicy::StaticOwner;p.domains={d};
  p.routed_tiers={{.name="joint",.domain=d.name,.priority=0,.max_experts_per_layer=experts,.fallback=true}};
  p.placements={{.layer=3,.routed_expert_tier=std::vector<int>(experts,0)}};
- // Device-free fixture: admission requires the inventory-bound observation;
- // the single-ISA fixture truth is canonical.
- p.resolved_cpu_prepared_layout=cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical;
  return p;
+}
+/** @return Device-free live inventory for this plan's two CPU sockets. */
+ClusterInventory cpuShardInventory(){
+ return test::cpuUniformCanonicalInventory({0,1});
 }
 /** @return Original PMA resource views with an exact requested capacity, no anonymous reserve. */
 std::vector<MoEOverlayBoundPhysicalMemoryBudget> cpuShardBudgets(std::size_t first,std::size_t second){
@@ -118,17 +120,18 @@ TEST(CPUExpertShardAccounting, CanonicalPlacementNeverAliasesOneWholeOwner){
 }
 /** @test Actual admission charges four jointly resident experts, not two apportionments or eight full copies. */
 TEST(CPUExpertShardAccounting, JointLogicalQuotaUsesExactOriginalPMAFragments){
+ const auto cpuShardObserved=cpuShardInventory();
  const auto format=ExpertWeightFormat::floating(TensorType::FP32);const auto source=cpuShardSource(format);
  const auto cohort=MoEExpertShardCohort::checked(source,4,cpuShardMembers(),{{0,256},{256,256}});
  const auto per=MoEOverlayCapacityResolver::preparedFootprints({cohort.localManifest(0)}).front().cpu_live_bytes;
  const auto plan=cpuShardPlan();const MoEOverlayCapacityAdmissionPolicy policy{.overlay_world_size=2};
- auto input=MoEOverlayCapacityAdmission::buildResolverInput(plan,4,{source},cpuShardBudgets(4*per,4*per),policy);
+ auto input=MoEOverlayCapacityAdmission::buildResolverInput(plan,4,{source},cpuShardBudgets(4*per,4*per),policy,&cpuShardObserved);
  const auto admitted=MoEOverlayCapacityResolver::resolve(input);const auto* tier=admitted.tier(0);ASSERT_NE(tier,nullptr);
  EXPECT_EQ(tier->live_experts_per_layer,(std::vector<int>{4}));ASSERT_EQ(tier->participant_live_copies.size(),2u);
  EXPECT_EQ(tier->participant_live_copies[0],(std::vector<int>{4}));EXPECT_EQ(tier->participant_live_copies[1],(std::vector<int>{4}));
  ASSERT_EQ(tier->shard_cohorts.size(),1u);EXPECT_EQ(*tier->shard_cohorts[0],cohort);
  EXPECT_EQ(admitted.resource("cpu-socket0")->usedBytes(),4*per);EXPECT_EQ(admitted.resource("cpu-socket1")->usedBytes(),4*per);
- EXPECT_THROW(MoEOverlayCapacityResolver::resolve(MoEOverlayCapacityAdmission::buildResolverInput(plan,4,{source},cpuShardBudgets(4*per,4*per-1),policy)),std::invalid_argument);
+ EXPECT_THROW(MoEOverlayCapacityResolver::resolve(MoEOverlayCapacityAdmission::buildResolverInput(plan,4,{source},cpuShardBudgets(4*per,4*per-1),policy,&cpuShardObserved)),std::invalid_argument);
  auto partial=input;partial.tiers[0].shard_cohorts.clear();EXPECT_THROW(MoEOverlayCapacityResolver::resolve(partial),std::invalid_argument);
  auto foreign=input;foreign.tiers[0].participants[0].participant_id=99;EXPECT_THROW(MoEOverlayCapacityResolver::resolve(foreign),std::invalid_argument);
  auto wrong=input;wrong.tiers[0].copy_policy=MoEOverlayTierCopyPolicy::Replicated;EXPECT_THROW(MoEOverlayCapacityResolver::resolve(wrong),std::invalid_argument);
@@ -139,6 +142,7 @@ TEST(CPUExpertShardAccounting, JointLogicalQuotaUsesExactOriginalPMAFragments){
 namespace llaminar2 {
 /** @test New joint placement does not change the ordinary one-socket authority or PMA bytes. */
 TEST(CPUExpertShardAccounting, SingleSocketKeepsOriginalWholeExpertAuthority){
+ const auto cpuShardObserved=cpuShardInventory();
  auto plan=cpuShardPlan();auto& domain=plan.domains.front();domain.scope=ExecutionDomainScope::SINGLE;
  domain.backend=CollectiveBackendType::HOST;domain.participants.resize(1);domain.world_ranks={0};domain.owner_rank=0;
  domain.routed_compute_policy=RoutedExpertComputePolicy::Apportioned;
@@ -147,11 +151,12 @@ TEST(CPUExpertShardAccounting, SingleSocketKeepsOriginalWholeExpertAuthority){
  for(int e=0;e<4;++e){ASSERT_NE(map.ownerFor(3,e),nullptr);EXPECT_FALSE(map.ownerFor(3,e)->shard_cohort);EXPECT_EQ(map.fragmentCountForExpert(3,e),1u);}
  const auto per=MoEOverlayCapacityResolver::preparedFootprints({source}).front().cpu_live_bytes;
  const auto budget=boundBudget(0,physicalBudget("cpu-single",DeviceId::cpu(),4*per,0,0));
- const auto result=MoEOverlayCapacityAdmission::resolveCapacity(plan,4,{source},{budget},{});
+ const auto result=MoEOverlayCapacityAdmission::resolveCapacity(plan,4,{source},{budget},{},&cpuShardObserved);
  EXPECT_EQ(result.resource("cpu-single")->usedBytes(),4*per);EXPECT_TRUE(result.tier(0)->shard_cohorts.empty());
 }
 /** @test Original native superblock cuts may be unequal, and every actual fragment limits admission. */
 TEST(CPUExpertShardAccounting, UnequalFragmentsCannotBorrowPeerCapacity){
+ const auto cpuShardObserved=cpuShardInventory();
  const auto format=ExpertWeightFormat::nativeQuantised({native_quantised_formats::Q4_K.codebook_id,true,true});
  const auto source=cpuShardSource(format,3,768);const auto cuts=MoEExpertShardCohort::balancedIntervals(source,2);
  ASSERT_EQ(cuts,(std::vector<MoEExpertShardCohort::Interval>{{0,512},{512,256}}));
@@ -159,9 +164,9 @@ TEST(CPUExpertShardAccounting, UnequalFragmentsCannotBorrowPeerCapacity){
  const auto first=MoEOverlayCapacityResolver::preparedFootprints({cohort.localManifest(0)}).front().cpu_live_bytes;
  const auto second=MoEOverlayCapacityResolver::preparedFootprints({cohort.localManifest(1)}).front().cpu_live_bytes;
  ASSERT_GT(first,second);const auto plan=cpuShardPlan();const MoEOverlayCapacityAdmissionPolicy policy{.overlay_world_size=2};
- const auto result=MoEOverlayCapacityAdmission::resolveCapacity(plan,4,{source},cpuShardBudgets(4*first,4*second),policy);
+ const auto result=MoEOverlayCapacityAdmission::resolveCapacity(plan,4,{source},cpuShardBudgets(4*first,4*second),policy,&cpuShardObserved);
  EXPECT_EQ(result.resource("cpu-socket0")->usedBytes(),4*first);EXPECT_EQ(result.resource("cpu-socket1")->usedBytes(),4*second);
- EXPECT_THROW(MoEOverlayCapacityAdmission::resolveCapacity(plan,4,{source},cpuShardBudgets(4*second,4*first),policy),std::invalid_argument);
+ EXPECT_THROW(MoEOverlayCapacityAdmission::resolveCapacity(plan,4,{source},cpuShardBudgets(4*second,4*first),policy,&cpuShardObserved),std::invalid_argument);
 }
 } // namespace llaminar2
 
@@ -184,7 +189,8 @@ TEST(CPUExpertShardAccounting, QFNOriginal512AxisAnd448JointTierStayDistinct){
   const auto gpu_per=MoEOverlayCapacityResolver::preparedFootprints({source}).front().gpu_live_bytes;
   budgets.push_back(boundBudget(0,physicalBudget("gpu",device,64*gpu_per,0,0)));
   const MoEOverlayCapacityAdmissionPolicy policy{.overlay_world_size=2};
-  const auto result=MoEOverlayCapacityAdmission::resolveCapacity(plan,512,{source},budgets,policy);
+  const auto cpuShardObserved=cpuShardInventory();
+  const auto result=MoEOverlayCapacityAdmission::resolveCapacity(plan,512,{source},budgets,policy,&cpuShardObserved);
   EXPECT_EQ(result.tier(0)->live_experts_per_layer,(std::vector<int>{64}));EXPECT_EQ(result.tier(1)->live_experts_per_layer,(std::vector<int>{448}));
   ASSERT_EQ(result.tier(1)->shard_cohorts.size(),1u);EXPECT_EQ(result.tier(1)->shard_cohorts[0]->ownership(0).geometry().experts,512);
   EXPECT_EQ(result.resource("cpu-socket0")->usedBytes(),448*fragment);EXPECT_EQ(result.resource("cpu-socket1")->usedBytes(),448*fragment);

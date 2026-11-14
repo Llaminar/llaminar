@@ -19,6 +19,7 @@
 #include "execution/moe/MoEOverlayPreparedGraphBank.h"
 #include "execution/moe/MoECPUExpertWorkspaceSource.h"
 #include "kernels/cpu/gemm/CPUWeightPreparationGeometry.h"
+#include "../../utils/TestCPUPreparedLayoutInventory.h"
 namespace {
 /** @brief Retain both original declared plan and its single source-authenticated preparation. */
 struct StaticJointOriginal {
@@ -70,10 +71,6 @@ StaticJointOriginal staticJointOriginal(int rank=0,int members=2,bool serial_lay
  for(auto& domain:plan.domains)if(domain.name=="cpu_joint")
   for(size_t p=0;p<domain.participants.size();++p)
    domain.participants[p]=GlobalDeviceAddress::cpu(test::localNativeSourceTestNUMANode()+int((p+domain.participants.size()-size_t(rank))%domain.participants.size()));
- // Device-free fixture: admission requires the inventory-bound observation;
- // the single-ISA fixture truth is canonical.
- plan.resolved_cpu_prepared_layout=
-  cpu::native_quantised::CPUNativeQuantisedLayout::InterleavedCanonical;
  plan.residency_policy=RoutedExpertResidencyPolicy::StaticById;
  plan.authority_execution=resolveMoEOverlayAuthorityExecutionKind(plan);
  auto original=std::make_shared<const MoERoutedExpertPlacementPlan>(std::move(plan));
@@ -192,9 +189,10 @@ TEST(CPUJointStaticResidency, OriginalPhysicalAdmissionCreatesAllLocalTypedEndpo
   return MoEOverlayBoundPhysicalMemoryBudget(name,PhysicalMemoryAdmissionCertificate(builder.build()));
  };
  const MoEOverlayCapacityAdmissionPolicy storage{.overlay_world_size=2};
+ const auto observed=test::cpuUniformCanonicalInventory({0,1});
  const auto capacity=MoEOverlayCapacityAdmission::resolveCapacity(*original.plan,512,{source},
   {budget("gpu",0,DeviceId::cuda(0),64*gpu),budget("cpu0",0,DeviceId::cpu(),448*cpu),
-   budget("cpu1",1,DeviceId::cpu(),448*cpu)},storage);
+   budget("cpu1",1,DeviceId::cpu(),448*cpu)},storage,&observed);
  const auto frozen=MoEOverlayCapacityResolver::installResolvedQuotas(*original.plan,capacity);
  const auto memory=std::make_shared<PhysicalMemoryAuthority>(capacity.physical_memory_admission,0);
  const auto metadata=staticJointConfig(original).model_metadata;
@@ -342,9 +340,10 @@ TEST(CPUJointStaticResidency, ColdLoadGraphPreservesOriginalSourceAuthority) {
   return MoEOverlayBoundPhysicalMemoryBudget(name,PhysicalMemoryAdmissionCertificate(builder.build()));
  };
  const MoEOverlayCapacityAdmissionPolicy storage{.overlay_world_size=2};
+ const auto observed=test::cpuUniformCanonicalInventory({0,1});
  auto capacity=MoEOverlayCapacityAdmission::resolveCapacity(*original.plan,512,{source},
   {budget("gpu",0,DeviceId::cuda(0),64*gpu),budget("cpu0",0,DeviceId::cpu(),cpu_total),
-   budget("cpu1",1,DeviceId::cpu(),cpu_total)},storage);
+   budget("cpu1",1,DeviceId::cpu(),cpu_total)},storage,&observed);
  const auto frozen=MoEOverlayCapacityResolver::installResolvedQuotas(*original.plan,capacity);
  const auto memory=std::make_shared<PhysicalMemoryAuthority>(capacity.physical_memory_admission,0);
  const auto metadata=staticJointConfig(original).model_metadata;

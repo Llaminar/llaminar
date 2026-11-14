@@ -1,3 +1,4 @@
+#include "../../utils/TestCPUPreparedLayoutInventory.h"
 /**
  * @file CPUTensorTP1PreparedStaticReplay.inc
  * @brief Replay explicit CPU TensorShardedTP1 through real source preparation and Static setup.
@@ -36,8 +37,9 @@ TEST(CPUTensorTP1PreparedStatic, OriginalSourceAndStaticSetupRetainWholeMatrixPo
   return MoEOverlayBoundPhysicalMemoryBudget(name,PhysicalMemoryAdmissionCertificate(b.build()));
  };
  const MoEOverlayCapacityAdmissionPolicy storage{.overlay_world_size=1};
+ const auto observed=test::cpuUniformCanonicalInventory({0});
  const auto capacity=MoEOverlayCapacityAdmission::resolveCapacity(plan,512,{manifest},
-  {budget("gpu",DeviceId::cuda(0),64*footprint.gpu_live_bytes),budget("cpu",DeviceId::cpu(),448*footprint.cpu_live_bytes)},storage);
+  {budget("gpu",DeviceId::cuda(0),64*footprint.gpu_live_bytes),budget("cpu",DeviceId::cpu(),448*footprint.cpu_live_bytes)},storage,&observed);
  const auto frozen=MoEOverlayCapacityResolver::installResolvedQuotas(plan,capacity);
  const auto memory=std::make_shared<PhysicalMemoryAuthority>(capacity.physical_memory_admission,0);
  const MoERebalanceRuntimeConfig maintenance{.mode=MoERebalanceRuntimeMode::Off};
