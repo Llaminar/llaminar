@@ -6193,3 +6193,14 @@ x86 INCREMENTAL GATE @ ef86de1c1 running (-j4, parity -j1 first,
 fresh OUT, full seal; expected 0 reds + 2 new tests green). Board:
 .80/.79 re-verification running; WSL x86 incremental in flight; ->
 pins -> Gate-A.
+
+### Carry #2 recorded c30af990d (verified docs-only; code tip ef86de1c1) (14:31Z)
+
+Lane: seq-263 calibration-catalog layout item added to §8 Stage-B-
+ENTRY list (next to the admission-predicate refinement) in
+c30af990d (design doc only; verified on origin; ef86de1c1
+unchanged). TIPS: code/review = ef86de1c1; docs = c30af990d.
+Re-verification in flight (.80 focused + .79 incremental; WSL x86
+incremental — 2 new tests must be green); pins A3+A4+A4-R at
+ef86de1c1 after; reviewer awaiting the x86 evidence relay (WSL
+lane extracting; coord writes to the Mac + sends exact paths).
