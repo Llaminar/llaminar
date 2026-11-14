@@ -6274,3 +6274,24 @@ incremental @ 56829099c; cap test now green expectation); WSL (x86
 incremental RE-TARGET to 56829099c — the ef86 run superseded
 [updated test must be the version running]; same procedure; then
 develop discriminator). Pins A3+A4+A4-R @ 56829099c after green.
+
+### Main 14:33Z: wording + pin request; boundaries recorded
+
+Main confirmed the reviewer's read: sets consistent (10 shared/0
+tip-only/1 base-only) but the verbatim section incomplete for
+causal checking -> qual lane relaying the ACTUAL failing
+assertions/context for CPUStartupAffinity, CPURootedGather
+ParallelCopyReplay + ShmemSpinAbsorbingAbortReplay (filters only),
+the 3 trainer-generator entries (terminal exceptions) — from
+EXISTING artifacts, no new runs (extraction request already out).
+WORDING FIXED (record + pin package): "BINDING GATE PASS" =>
+**"RELATIVE NO-NEW-FAILURES vs base (owner classification)"** —
+not canonical Unit/preflight PASS, not Gate-A ACK (local record
+updated: line 42). OneDNNBuildLifecycle base-only = cause
+UNESTABLISHED, not attributable (reviewer confirmed OneDNNBuild
+.cmake unchanged). ef86de1c1 x86 row = PENDING (parity -j1=0 +
+'in progress' mixed state) until the completed 56829099c record.
+EXPLICIT NEW-PIN REQUEST SENT to the reviewer @ 56829099c (A4-R
+range + the cap-test fix + docs; boundaries per the verdict; the
+.80/.79/WSL reruns in flight attach on completion). Reviewer:
+SOURCE HOLD6ca/#214 until the fresh verdict.
