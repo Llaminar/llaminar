@@ -11,6 +11,7 @@
  */
 
 #include "MoEOverlayCapacityAdmission.h"
+#include "utils/Assertions.h"
 #include "MoEOverlayNoPeerResidency.h"
 #include "MoEOverlayPhysicalLaneDemand.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
@@ -712,7 +713,7 @@ namespace llaminar2
         // always yields a real observation, asserted here as the invariant.
         if (has_cpu_resource && !resolved_observation)
         {
-            ASSERT(
+            LLAMINAR_ASSERT(
                 !planDeclaresCpuParticipant(plan),
                 "a CPU-participant plan must carry a resolved CPU layout "
                 "observation before pricing");
