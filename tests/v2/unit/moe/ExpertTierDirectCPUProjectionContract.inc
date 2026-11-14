@@ -663,10 +663,10 @@ TEST(ExpertTierWeightStream, EndpointLayoutContractSelectsGpuConversionAndReject
         EXPECT_FALSE(resealedCompact.valid(&error));
 
         // Tier-level v4 hash sensitivity: a same-scalar fixture whose ONLY
-        // change is the carried endpoint layout hashes differently, and a
-        // layout byte modified WITHOUT recomputing the hash fails tier-level
-        // validity — the :535 hash contribution is live. If it were deleted,
-        // this tampered manifest would match the stale hash and pass.
+        // change is the carried endpoint layout hashes differently — the
+        // EXPECT_NE below is the discriminator. (The byte-tampered manifest
+        // would ALSO fail validity for the unsupported layout's sections,
+        // so it is not the hash proof; the differing hash is.)
         auto layoutOnly = stream;
         layoutOnly.cpu_endpoint_layout =
             stream.cpu_endpoint_layout == 0u ? 1u : 0u;

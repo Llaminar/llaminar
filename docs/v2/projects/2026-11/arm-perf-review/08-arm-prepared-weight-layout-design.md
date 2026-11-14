@@ -1025,12 +1025,16 @@ canonical arm is a lane defect and blocks landing.
     `deserialize`/`allocateTransferTarget` pass ONLY the production
     section-table authority, so a foreign layout is rejected by the gate
     itself, before allocation. `ExecutableReceiveRejectsTableValidForeign
-    LayoutBeforeAllocation` drives the internal boundary with an injected
-    resolver whose compact tables are VALID in the test only (payload 1024
-    / unit 1152, §2.1): the compact-labelled archive is rejected on both
-    paths with the executability diagnostic, and the public entrypoints'
-    negatives reject unimplemented tables through the same authority — the
-    canonical control still round-trips. No RAII hook exists.
+    LayoutBeforeAllocation` invokes `detail::admitReceiveLayout` DIRECTLY
+    ONCE with an injected resolver whose compact tables are VALID in the
+    test only (payload 1024 / unit 1152, §2.1): the compact-labelled header
+    is rejected by the executability gate. The PUBLIC controls are
+    SEPARATE: `deserialize`/`allocateTransferTarget` pass only the
+    production section-table authority, and their negatives reject
+    unimplemented sections through that authority (a compact archive
+    resolves no strides and is refused before adoption) — every public API
+    calls the shared helper, but this is NOT DI execution of both public
+    paths; the canonical control round-trips. No RAII hook exists.
   - **A4-1 — typed inventory publication.** `RankInventory` gains
     `cpu_prepared_layout` (build property observed from `kHostPreparedLayout`
     at `makeRankInventory`, never probed); the byte crosses the inventory
