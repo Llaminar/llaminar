@@ -3,13 +3,14 @@
  * @brief Device-free ownership, totality and isolation of dense ROCm exact dispatch.
  *
  * These tests inspect immutable policy and construction-thread state only. No
- * HIP dependency or accelerator is linked. Captured execution and all source
+ * HIP dependency or accelerator is linked. Readers borrow the production
+ * table instead of defining another generated object. Captured execution and all source
  * formats are proved separately by the explicit backend integration gate.
  * Installed M512 HC-down observations retain architecture-specific physical
  * tiles; authored-only neighbor rows keep later measured additions admissible.
  */
 #include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.h"
-#include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlayGenerated.inc"
+#include "kernels/rocm/gemm/ROCmDensePrefillPolicyEvidence.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
@@ -36,6 +37,110 @@ protected:
 private:
     bool previous_ = true;
 };
+/** @brief A WMMA exact row never borrows instruction support from its tuning ISA. */
+TEST_F(ROCmDensePrefillOverlay, WmmaRequiresActualGfx1100AndExactNativeStorage)
+{
+    using Arch = llaminar2::native_quantised::NativeQuantisedArchitecture;
+    for (const auto codebook : {0, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 19, 24})
+    {
+        const generated::ROCmDensePrefillOverlayEntry measured{
+            static_cast<uint8_t>(codebook), 64, 128, 256, DensePrefillWeightFamily::NativeQuantised,
+            {64, 64, 1, 0, false, VNNIPrefillProducer::NativeWmma}, Arch::rocm(11, 0, 0)};
+        const std::array entries{measured};
+        llaminar2::native_quantised::NativeQuantisedGPUHardware actual{
+            Arch::rocm(11, 0, 0), 0, 96, 32, 1024, 65536};
+        const auto select = [&] { return selectDensePrefillExactConfigFromEntries(entries,
+            codebook, 64, 128, 256, DensePrefillWeightFamily::NativeQuantised, &actual); };
+        ASSERT_TRUE(select());
+        EXPECT_EQ(select()->producer, VNNIPrefillProducer::NativeWmma);
+        actual.maximum_threads_per_block = 256;
+        EXPECT_TRUE(select());
+        actual.maximum_threads_per_block = 255;
+        EXPECT_FALSE(select());
+        actual.maximum_threads_per_block = 1024;
+        actual.architecture = Arch::rocm(9, 0, 6);
+        EXPECT_FALSE(select());
+        actual.architecture = Arch::rocm(11, 0, 1);
+        EXPECT_FALSE(select());
+        actual.architecture = Arch::rocm(11, 0, 0);
+        actual.shared_memory_per_block = 1024;
+        EXPECT_FALSE(select());
+        EXPECT_FALSE(selectDensePrefillExactConfigFromEntries(entries,
+            codebook, 64, 128, 256, DensePrefillWeightFamily::NativeQuantised));
+        auto invalid = measured;
+        invalid.architecture = Arch{};
+        const std::array bad{invalid};
+        EXPECT_THROW((void)selectDensePrefillExactConfigFromEntries(bad,
+            codebook, 64, 128, 256, DensePrefillWeightFamily::NativeQuantised, &actual), std::logic_error);
+    }
+}
+/** @brief Retained legacy rows coexist in generator order with qualified target rows. */
+TEST_F(ROCmDensePrefillOverlay, LegacyAndQualifiedRowsShareOneOrderedGeometry)
+{
+    using Arch = llaminar2::native_quantised::NativeQuantisedArchitecture;
+    constexpr auto family = DensePrefillWeightFamily::NativeQuantised;
+    constexpr generated::ROCmDensePrefillOverlayEntry legacy{
+        0, 64, 128, 256, family, {64, 16, 1, 2, false, VNNIPrefillProducer::NativeCooperative}};
+    constexpr generated::ROCmDensePrefillOverlayEntry gfx906{
+        0, 64, 128, 256, family, {64, 32, 1, 2, false, VNNIPrefillProducer::NativeCooperative},
+        Arch::rocm(9, 0, 6)};
+    constexpr generated::ROCmDensePrefillOverlayEntry gfx1100{
+        0, 64, 128, 256, family, {64, 64, 1, 0, false, VNNIPrefillProducer::NativeWmma},
+        Arch::rocm(11, 0, 0)};
+    // This is the same key authority used by completeInventory's static proof.
+    EXPECT_LT(legacy.orderingKey(), gfx906.orderingKey());
+    EXPECT_LT(gfx906.orderingKey(), gfx1100.orderingKey());
+    const std::array entries{legacy, gfx906, gfx1100};
+    const auto unobserved = selectDensePrefillExactConfigFromEntries(entries, 0, 64, 128, 256, family);
+    ASSERT_TRUE(unobserved);
+    EXPECT_EQ(unobserved->m_tile, 16);
+    for (const auto [architecture, expected_m] : {
+        std::pair{Arch::rocm(9, 0, 6), 32}, std::pair{Arch::rocm(11, 0, 0), 64},
+        std::pair{Arch::rocm(11, 0, 1), 32}})
+    {
+        llaminar2::native_quantised::NativeQuantisedGPUHardware actual{
+            architecture, 0, 96, 64, 1024, 65536};
+        const auto selected = selectDensePrefillExactConfigFromEntries(entries, 0, 64, 128, 256, family, &actual);
+        ASSERT_TRUE(selected);
+        EXPECT_EQ(selected->m_tile, expected_m);
+        EXPECT_EQ(actual.architecture, architecture);
+        EXPECT_FALSE(selectDensePrefillExactConfigFromEntries(entries, 0, 65, 128, 256, family, &actual));
+    }
+    const std::array retained{legacy, gfx1100};
+    llaminar2::native_quantised::NativeQuantisedGPUHardware older{
+        Arch::rocm(9, 0, 6), 0, 60, 64, 1024, 65536};
+    const auto selected = selectDensePrefillExactConfigFromEntries(retained, 0, 64, 128, 256, family, &older);
+    ASSERT_TRUE(selected);
+    EXPECT_EQ(selected->m_tile, 16);
+}
+
+/** @brief Streaming admission uses physical decoder and K-dependent correction storage. */
+TEST_F(ROCmDensePrefillOverlay, NativeStreamingPhysical24AndLiveCorrectionCapacity)
+{
+    using Arch = llaminar2::native_quantised::NativeQuantisedArchitecture;
+    for (const auto [codebook, m_tile, k, lds] : {
+        std::tuple{24, 16, 65536, 0}, std::tuple{5, 16, 8192, 16384},
+        std::tuple{16, 16, 65536, 131072}, std::tuple{11, 16, 65536, 0},
+        std::tuple{17, 8, 8192, 32768}})
+    {
+        const generated::ROCmDensePrefillOverlayEntry measured{
+            static_cast<uint8_t>(codebook), 64, 256, k, DensePrefillWeightFamily::NativeQuantised,
+            {256, m_tile, 3, 0, false, VNNIPrefillProducer::NativeStreaming}, Arch::rocm(11, 0, 0)};
+        const std::array entries{measured};
+        llaminar2::native_quantised::NativeQuantisedGPUHardware actual{
+            Arch::rocm(11, 0, 0), 0, 96, 32, 1024, 65536};
+        const auto select = [&] { return selectDensePrefillExactConfigFromEntries(entries,
+            codebook, 64, 256, k, DensePrefillWeightFamily::NativeQuantised, &actual); };
+        EXPECT_EQ(select().has_value(), lds <= 65536);
+        if (lds > 0 && lds <= 65536)
+        {
+            actual.shared_memory_per_block = lds;
+            EXPECT_TRUE(select());
+            --actual.shared_memory_per_block;
+            EXPECT_FALSE(select());
+        }
+    }
+}
 /** @brief Every ordinary row count remains dispatchable through exact or generic ownership. */
 TEST_F(ROCmDensePrefillOverlay, ExactRowsDoNotConsumeUnmeasuredGeometry)
 {
@@ -43,7 +148,7 @@ TEST_F(ROCmDensePrefillOverlay, ExactRowsDoNotConsumeUnmeasuredGeometry)
     // every intervening M independently so nearest-bucket dispatch cannot
     // consume an unmeasured cell as that inventory grows.
     std::set<int> measured_rows;
-    for (const auto &entry : generated::kROCmDensePrefillOverlayEntries)
+    for (const auto &entry : densePrefillInstalledEntries())
         if (entry.codebook == 0 && entry.n == 512 && entry.k == 5120)
             measured_rows.insert(entry.m);
     ASSERT_FALSE(measured_rows.empty());
@@ -63,7 +168,7 @@ TEST_F(ROCmDensePrefillOverlay, ExactRowsDoNotConsumeUnmeasuredGeometry)
 /** @brief A prepared physical ABI cannot reinterpret a measured foreign producer. */
 TEST_F(ROCmDensePrefillOverlay, RejectsInvalidGeometryAndWeightAuthority)
 {
-    const auto &entries = generated::kROCmDensePrefillOverlayEntries;
+    const auto entries = densePrefillInstalledEntries();
     for (const auto &entry : entries)
     {
         const llaminar2::native_quantised::NativeQuantisedGPUHardware actual{
@@ -122,21 +227,24 @@ TEST_F(ROCmDensePrefillOverlay, NativeQ8AndExpandedInt8HaveDistinctKeys)
     EXPECT_EQ(expanded->m_tile, 16);
     EXPECT_EQ(expanded->unroll, 4);
 
-    // Exercise the actual generated ordering with two possible physical
+    // Exercise the actual production ordering with two possible physical
     // contracts at identical decoder and geometry; neither is an alias.
     const generated::ROCmDensePrefillOverlayEntry native{
         19, 64, 512, 5120, DensePrefillWeightFamily::NativeQuantised,
-        {64, 16, 1, 4, false, VNNIPrefillProducer::NativeCooperative}};
+        {64, 16, 1, 4, false, VNNIPrefillProducer::NativeCooperative},
+        llaminar2::native_quantised::NativeQuantisedArchitecture::rocm(9,0,6)};
     const generated::ROCmDensePrefillOverlayEntry int8{
         19, 64, 512, 5120, DensePrefillWeightFamily::Int8Blockwise, *expanded};
-    EXPECT_EQ(generated::compareROCmDensePrefillOverlayKey(native, 19, 64, 512, 5120,
-        DensePrefillWeightFamily::NativeQuantised), 0);
-    EXPECT_LT(generated::compareROCmDensePrefillOverlayKey(native, 19, 64, 512, 5120,
-        DensePrefillWeightFamily::Int8Blockwise), 0);
-    EXPECT_GT(generated::compareROCmDensePrefillOverlayKey(int8, 19, 64, 512, 5120,
-        DensePrefillWeightFamily::NativeQuantised), 0);
-    EXPECT_EQ(generated::compareROCmDensePrefillOverlayKey(int8, 19, 64, 512, 5120,
-        DensePrefillWeightFamily::Int8Blockwise), 0);
+    EXPECT_LT(native.orderingKey(),int8.orderingKey());
+    const std::array entries{native,int8};
+    const llaminar2::native_quantised::NativeQuantisedGPUHardware hardware{
+        native.architecture,0,60,64,1024,65536};
+    for (const auto &entry : entries)
+    {
+        const auto selected=selectDensePrefillExactConfigFromEntries(entries,19,64,512,5120,entry.family,&hardware);
+        ASSERT_TRUE(selected.has_value());
+        EXPECT_EQ(selected->producer,entry.config.producer);
+    }
 }
 /** @brief Author native-Q8 observations without installing measured policy rows. */
 generated::ROCmDensePrefillOverlayEntry nativeQ8Row(
@@ -289,7 +397,7 @@ TEST_F(ROCmDensePrefillOverlay, NativeQ8NearestCompatibleUsesActualResources)
     EXPECT_FALSE(selectDensePrefillExactConfigFromEntries(empty,
         19, 448, 320, 2560, DensePrefillWeightFamily::NativeQuantised, &absent));
 }
-/** @brief Architecture ties are deterministic and legacy rows remain unobserved. */
+/** @brief Architecture ties are deterministic and malformed observations are rejected. */
 TEST_F(ROCmDensePrefillOverlay, NativeQ8ArchitectureAdmissionAndTieBreak)
 {
     using Arch = llaminar2::native_quantised::NativeQuantisedArchitecture;
@@ -306,9 +414,6 @@ TEST_F(ROCmDensePrefillOverlay, NativeQ8ArchitectureAdmissionAndTieBreak)
     const std::array foreign{nativeQ8Row(Arch::cuda(8, 6), 16)};
     EXPECT_THROW((void)selectDensePrefillExactConfigFromEntries(foreign,
         19, 448, 320, 2560, DensePrefillWeightFamily::NativeQuantised, &actual), std::logic_error);
-    for (const auto &entry : generated::kROCmDensePrefillOverlayEntries)
-        if (entry.codebook != 19 || entry.family != DensePrefillWeightFamily::NativeQuantised)
-            EXPECT_FALSE(entry.architecture.observed());
 }
 
 /** @brief Parse actual cached ISA spellings and isolate backend namespaces on ties. */

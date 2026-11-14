@@ -8,17 +8,29 @@
  * zero private memory, and leave source weights/inputs and inactive tails intact.
  * Tensor-core prefill additionally authenticates the exact captured kernel family
  * and both router bases across the supported M range and wider K partitions.
+ * Explicit K-wave replay also authenticates the captured template and launch
+ * geometry while preserving tiny-K and multi-block-per-leaf arithmetic.
+ * Automatic replay checks the installed geometry boundary and exact submission
+ * counters while independent ordered references retain the numerical authority.
  */
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/common/RouterQ8Launch.h"
+#include "kernels/rocm/moe/ROCmRouterQ8WaveTuning.h"
 #ifdef HAVE_CUDA
 #include "kernels/cuda/moe/CUDARouterQ8Prefill.h"
 #endif
+#ifdef HAVE_ROCM
+#include <hip/hip_runtime.h>
+#include "kernels/rocm/moe/ROCmRouterQ8Prefill.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#endif
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/ROCmRouterQ8SubmissionProof.h"
 #include <gtest/gtest.h>
+#include <optional>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -33,7 +45,7 @@ namespace
 using namespace llaminar2;
 using namespace llaminar2::test;
 /** @brief Explicit test path; both must retain identical Q8 arithmetic. */
-enum class HRoute { DecodeEquivalent, TensorCorePrefill };
+enum class HRoute { DecodeEquivalent, TensorCorePrefill, AutomaticNative, AutomaticOrdered };
 /** @brief Preserve a failed native edge across the device worker boundary. */
 void requireH(bool value, const char *edge) { if (!value) throw std::runtime_error(edge); }
 /** @brief Complete test observations before borrowed graph addresses retire. */
@@ -85,9 +97,13 @@ bool logitsH(DeviceId d, const float *h, int8_t *q, float *s, const int8_t *w, c
 #endif
     throw std::invalid_argument("Hadamard logits require compiled backend");
 }
-/** @brief Check a captured shape, independent source preservation and large/small/empty replay. */
+/** @brief Check captured geometry, source preservation and large/small/empty replay.
+ * @param device Explicit backend. @param m Physical rows. @param k Contraction width.
+ * @param experts Router output columns. @param route Captured engine.
+ * @param basis Paired operand basis. @param wave_tile Explicit ROCm K-wave cap. */
 void proveH(DeviceId device, int m, int k, int experts,
-    HRoute route = HRoute::DecodeEquivalent, RouterQ8Basis basis = RouterQ8Basis::SignedHadamard32)
+    HRoute route = HRoute::DecodeEquivalent, RouterQ8Basis basis = RouterQ8Basis::SignedHadamard32,
+    rocm::RouterQ8WaveTile wave_tile = rocm::RouterQ8WaveTile::Four)
 {
     auto &context=GPUDeviceContextPool::instance().getContext(device);
     context.submitAndWait([&]
@@ -97,7 +113,7 @@ void proveH(DeviceId device, int m, int k, int experts,
         requireH(backend && stream,"H32 backend stream");
 #ifdef HAVE_CUDA
         cuda::RouterQ8PrefillHardware hardware;
-        if (route == HRoute::TensorCorePrefill)
+        if (device.is_cuda() && route == HRoute::TensorCorePrefill)
         {
             EXPECT_FALSE(cuda::prepareRouterQ8PrefillHardware(device.ordinal, nullptr, hardware));
             requireH(cuda::prepareRouterQ8PrefillHardware(device.ordinal, stream, hardware), "router hardware preparation");
@@ -142,23 +158,73 @@ void proveH(DeviceId device, int m, int k, int experts,
             backend->deviceToHost(expected_scales.data(),fp(gsr),expected_scales.size()*4,device.ordinal,stream) &&
             backend->synchronizeStream(stream,device.ordinal),"H32 independent gate observation");
         ASSERT_EQ(actual_gate,expected_gate); ASSERT_EQ(std::memcmp(actual_scales.data(),expected_scales.data(),actual_scales.size()*4),0);
+        const bool automatic_proof = route == HRoute::AutomaticNative || route == HRoute::AutomaticOrdered;
+#ifdef HAVE_ROCM
+        // Deliberately leave a different diagnostic tile active on this worker.
+        // Automatic must freeze its own measured tile, not inherit this scope.
+        std::optional<rocm::ScopedRouterQ8PrefillMode> enclosing_native;
+        std::optional<rocm::ScopedRouterQ8WaveTile> enclosing_tile;
+        if (automatic_proof)
+        {
+            enclosing_native.emplace(rocm::RouterQ8PrefillMode::NativeWmma);
+            enclosing_tile.emplace(rocm::RouterQ8WaveTile::Eight);
+        }
+        if (route == HRoute::AutomaticNative)
+        {
+            const auto &hw = rocmHardwareMetadata().at(device.ordinal);
+            rocm::RouterQ8PrefillShape shape{m,k,experts,basis,rocm::RouterQ8RowOwnership::WholeRows};
+            auto resolve = [&](const auto &candidate_shape, rocm::RouterQ8PrefillMode mode = rocm::RouterQ8PrefillMode::NativeWmma)
+            { return rocm::RouterQ8PrefillSelection::resolve(mode,rocm::RouterQ8WaveTile::Sixteen,hw,candidate_shape); };
+            rocm::RouterQ8PrefillView view{.hidden_codes=qp(q),.hidden_scales=fp(s),.gate_codes=qp(g),
+                .gate_scales=fp(gs),.logits=fp(out),.capacity=m,.width=k,.experts=experts,.device=device.ordinal,
+                .live_rows=live,.basis=basis};
+            const ROCmRouterQ8SubmissionSnapshot rejected;
+            EXPECT_FALSE(rocm::routerQ8Prefill(view,resolve(shape,rocm::RouterQ8PrefillMode::OrderedDot4),stream));
+            auto mismatch=shape; ++mismatch.capacity;
+            EXPECT_FALSE(rocm::routerQ8Prefill(view,resolve(mismatch),stream));
+            mismatch=shape; mismatch.basis=basis==RouterQ8Basis::Original?RouterQ8Basis::SignedHadamard32:RouterQ8Basis::Original;
+            EXPECT_FALSE(rocm::routerQ8Prefill(view,resolve(mismatch),stream));
+            mismatch=shape; mismatch.ownership=rocm::RouterQ8RowOwnership::CompactOwned;
+            EXPECT_FALSE(rocm::routerQ8Prefill(view,resolve(mismatch),stream));
+            view.partition=DeviceRowPartition::balanced(0,2);
+            EXPECT_FALSE(rocm::routerQ8Prefill(view,resolve(shape),stream));
+            rejected.expectUnchanged();
+        }
+#endif
         const auto capturedLogits = [&](void *producer)
         {
 #ifdef HAVE_CUDA
-            if (route == HRoute::TensorCorePrefill)
+            if (device.is_cuda() && route == HRoute::TensorCorePrefill)
             {
                 requireH(device.is_cuda(), "tensor-core test requires CUDA");
                 return cudaMoE_gate_logits_q8_weights_prefill_rows(fp(h), qp(q), fp(s),
                     qp(g), fp(gs), fp(out), m, k, experts, device.ordinal, producer, live, rotated, hardware);
             }
 #endif
+#ifdef HAVE_ROCM
+            if (device.is_rocm() && (route == HRoute::TensorCorePrefill || automatic_proof))
+            {
+                rocm::ScopedRouterQ8PrefillMode candidate(automatic_proof ? rocm::RouterQ8PrefillMode::Automatic : rocm::RouterQ8PrefillMode::NativeWmma);
+                std::optional<rocm::ScopedRouterQ8WaveTile> tile;
+                if (!automatic_proof) tile.emplace(wave_tile);
+                return logitsH(device,fp(h),qp(q),fp(s),qp(g),fp(gs),fp(out),m,k,experts,producer,live,rotated);
+            }
+#endif
             return logitsH(device,fp(h),qp(q),fp(s),qp(g),fp(gs),fp(out),m,k,experts,producer,live,rotated,m==1);
         };
         EXPECT_FALSE(capturedLogits(nullptr));
+#ifdef HAVE_ROCM
+        if (device.is_rocm() && route == HRoute::TensorCorePrefill)
+        {
+            EXPECT_FALSE(capturedLogits(hipStreamLegacy));
+            EXPECT_FALSE(capturedLogits(hipStreamPerThread));
+        }
+#endif
+        const ROCmRouterQ8SubmissionSnapshot before_capture;
         {
             ScopedBackendGraphCapture capture(context,*graph,"signed router H32"); requireH(capture.begin(),"H32 capture begin");
 #ifdef HAVE_CUDA
-            if (route == HRoute::TensorCorePrefill)
+            if (device.is_cuda() && route == HRoute::TensorCorePrefill)
             {
                 cuda::RouterQ8PrefillHardware unavailable;
                 EXPECT_FALSE(cuda::prepareRouterQ8PrefillHardware(device.ordinal, stream, unavailable));
@@ -168,6 +234,10 @@ void proveH(DeviceId device, int m, int k, int experts,
             requireH(capturedLogits(stream),"H32 captured logits");
             capture.finish();
         }
+        if (automatic_proof)
+            before_capture.expectAdded(device.ordinal,m,k,experts,
+                basis == RouterQ8Basis::Original ? "original" : "signed_hadamard32", "whole_rows",
+                route == HRoute::AutomaticNative ? 16 : 0,1);
         std::vector<GPUGraphKernelNodeInfo> nodes; ASSERT_TRUE(graph->inspectKernelNodes(nodes));
         ASSERT_EQ(nodes.size(), basis==RouterQ8Basis::SignedHadamard32 ? 3u : 2u);
         bool found=false, tensor_core=false;
@@ -177,7 +247,7 @@ void proveH(DeviceId device, int m, int k, int experts,
             found |= node.name.find("quantize_signed_hadamard32")!=std::string::npos;
             tensor_core |= node.name.find("router_q8_prefill_detail")!=std::string::npos;
 #ifdef HAVE_CUDA
-            if (node.name.find("router_q8_prefill_detail")!=std::string::npos)
+            if (device.is_cuda() && node.name.find("router_q8_prefill_detail")!=std::string::npos)
             {
                 const auto tile = cuda::routerQ8PrefillGeometry(m,k,experts,hardware);
                 EXPECT_EQ(node.block_x, 32u * tile.warps);
@@ -186,9 +256,23 @@ void proveH(DeviceId device, int m, int k, int experts,
                 EXPECT_EQ(node.static_shared_memory_bytes, tile.k_warps>1 ? 512u*tile.k_warps : 0u);
             }
 #endif
+#ifdef HAVE_ROCM
+            if (device.is_rocm() && node.name.find("router_q8_prefill_detail")!=std::string::npos)
+            {
+                const auto expected_tile = route == HRoute::AutomaticNative ? rocm::RouterQ8WaveTile::Sixteen : wave_tile;
+                unsigned k_waves = 1;
+                while (k_waves < unsigned(k/32) && k_waves < unsigned(rocm::routerQ8WaveCount(expected_tile))) k_waves *= 2;
+                const int wave_log = expected_tile == rocm::RouterQ8WaveTile::Four ? 2 : expected_tile == rocm::RouterQ8WaveTile::Eight ? 3 : 4;
+                EXPECT_NE(node.name.find("ELi" + std::to_string(wave_log) + "EEEv"),std::string::npos) << node.name;
+                EXPECT_EQ(node.block_x, 64u * k_waves);
+                EXPECT_EQ(node.grid_x, unsigned((experts+15)/16));
+                EXPECT_EQ(node.grid_y, unsigned((m+15)/16));
+                EXPECT_EQ(node.static_shared_memory_bytes, k_waves == 1 ? 0u : k_waves * 1024u);
+            }
+#endif
         }
         ASSERT_EQ(found,basis==RouterQ8Basis::SignedHadamard32);
-        ASSERT_EQ(tensor_core,route==HRoute::TensorCorePrefill);
+        ASSERT_EQ(tensor_core,route==HRoute::TensorCorePrefill || route==HRoute::AutomaticNative);
         requireH(graph->instantiate(),"H32 instantiate");
         std::vector<float> actual(out->numel()),expected(out->numel()),poison(out->numel(),-12345.f),scales(extent/32);
         std::vector<int8_t> bytes(extent),poison_bytes(extent,23);
@@ -202,12 +286,20 @@ void proveH(DeviceId device, int m, int k, int experts,
                 backend->hostToDevice(fp(s),poison_scales.data(),poison_scales.size()*4,device.ordinal,stream),"H32 poisoned replay inputs");
             if(active>0)
             {
+#ifdef HAVE_ROCM
+                // Keep the reference independent when automatic dispatch later
+                // admits a measured WMMA tile for this geometry.
+                std::optional<rocm::ScopedRouterQ8PrefillMode> oracle;
+                if (device.is_rocm()) oracle.emplace(rocm::RouterQ8PrefillMode::OrderedDot4);
+#endif
                 if(m<=31) for(int row=0;row<active;++row)
                     requireH(logitsH(device,fp(hr)+size_t(row)*k,qp(qr)+size_t(row)*k,fp(sr)+size_t(row)*k/32,
                         qp(gr),fp(gsr),fp(ref)+size_t(row)*experts,1,k,experts,stream,nullptr,original,true),"H32 serial row oracle");
                 else requireH(logitsH(device,fp(hr),qp(qr),fp(sr),qp(gr),fp(gsr),fp(ref),active,k,experts,stream,nullptr,original),"H32 grouped native oracle");
             }
+            const ROCmRouterQ8SubmissionSnapshot before_replay;
             requireH(graph->launch(),"H32 retained replay");
+            if (automatic_proof) before_replay.expectUnchanged();
             requireH(backend->deviceToHost(actual.data(),fp(out),actual.size()*4,device.ordinal,stream) &&
                 backend->deviceToHost(expected.data(),fp(ref),expected.size()*4,device.ordinal,stream) &&
                 backend->deviceToHost(bytes.data(),qp(q),extent,device.ordinal,stream) &&
@@ -262,5 +354,73 @@ TEST(RouterHadamardQ8, CUDATensorCorePrefill)
 #ifdef HAVE_ROCM
 /** @test ROCm wave64 grouping, live counts and original expert publication. */
 TEST(RouterHadamardQ8, ROCm) { proveHBackend(DeviceId::rocm(0)); }
+/** @test Native WMMA retains serial bytes, source banks and large/empty/partial replay. */
+TEST(RouterHadamardQ8, ROCmWmmaCapturedReplay)
+{
+    initializeROCmHardwareMetadata();
+    int ordinal = -1;
+    for (int i = 0; i < int(rocmHardwareMetadata().size()); ++i)
+    {
+        const auto &isa = rocmHardwareMetadata().at(i).isa_target;
+        if (isa == "gfx1100" || isa.starts_with("gfx1100:")) { ordinal = i; break; }
+    }
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    const auto device = DeviceId::rocm(ordinal);
+    for (auto basis : {RouterQ8Basis::Original, RouterQ8Basis::SignedHadamard32})
+    {
+        for (int m = 1; m <= 65; ++m) proveH(device,m,96,17,HRoute::TensorCorePrefill,basis);
+        for (int k : {32,64,96,128,256,384,768,1024,1536,2048,2080,2560,3072,4160,6144,8192,12288})
+            proveH(device,17,k,17,HRoute::TensorCorePrefill,basis);
+        for (int m : {128,256,448,511,512,513,768,1024,1536,2048,4096})
+            proveH(device,m,96,17,HRoute::TensorCorePrefill,basis);
+        for (int m : {512,1024,2048}) proveH(device,m,2048,256,HRoute::TensorCorePrefill,basis);
+        for (int experts : {32,64,128,257,512,1024})
+            proveH(device,513,2048,experts,HRoute::TensorCorePrefill,basis);
+    }
+}
+/** @test Automatic records the qualified tile and rejects neighboring geometry across dirty replay. */
+TEST(RouterHadamardQ8, ROCmAutomaticCapturedReplay)
+{
+    initializeROCmHardwareMetadata();
+    int ordinal = -1;
+    for (int i = 0; i < int(rocmHardwareMetadata().size()); ++i)
+        if (rocmHardwareMetadata().at(i).isa_target == "gfx1100" || rocmHardwareMetadata().at(i).isa_target.starts_with("gfx1100:")) { ordinal = i; break; }
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    ROCmRouterQ8SubmissionCollection collection;
+    for (auto basis : {RouterQ8Basis::Original,RouterQ8Basis::SignedHadamard32})
+    {
+        proveH(DeviceId::rocm(ordinal),512,2560,512,HRoute::AutomaticNative,basis);
+        for (int m : {511,513}) proveH(DeviceId::rocm(ordinal),m,2560,512,HRoute::AutomaticOrdered,basis);
+        for (int k : {2528,2592}) proveH(DeviceId::rocm(ordinal),512,k,512,HRoute::AutomaticOrdered,basis);
+        for (int e : {511,513}) proveH(DeviceId::rocm(ordinal),512,2560,e,HRoute::AutomaticOrdered,basis);
+        if (::testing::Test::HasFatalFailure()) return;
+    }
+}
+/** @test Larger K-wave caps preserve all binary-tree boundaries through retained replay. */
+TEST(RouterHadamardQ8, ROCmWmmaWaveTilesCapturedReplay)
+{
+    initializeROCmHardwareMetadata();
+    int ordinal = -1;
+    for (int i = 0; i < int(rocmHardwareMetadata().size()); ++i)
+    {
+        const auto &isa = rocmHardwareMetadata().at(i).isa_target;
+        if (isa == "gfx1100" || isa.starts_with("gfx1100:")) { ordinal = i; break; }
+    }
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    for (auto tile : {rocm::RouterQ8WaveTile::Eight,rocm::RouterQ8WaveTile::Sixteen})
+        for (auto basis : {RouterQ8Basis::Original,RouterQ8Basis::SignedHadamard32})
+        {
+            for (int k : {32,64,96,128,224,256,288,480,512,544,2048,2080,2560,3072,4096,4160,6144,8192,12288})
+            {
+                proveH(DeviceId::rocm(ordinal),17,k,17,HRoute::TensorCorePrefill,basis,tile);
+                if (::testing::Test::HasFatalFailure()) return;
+            }
+            for (int m : {1,15,16,31,65,511,512,513})
+            {
+                proveH(DeviceId::rocm(ordinal),m,2048,257,HRoute::TensorCorePrefill,basis,tile);
+                if (::testing::Test::HasFatalFailure()) return;
+            }
+        }
+}
 #endif
 }

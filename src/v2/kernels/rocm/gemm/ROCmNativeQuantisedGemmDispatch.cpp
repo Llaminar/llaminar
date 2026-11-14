@@ -11,6 +11,7 @@
 
 #include "ROCmNativeQuantisedGemmShard.h"
 #include "ROCmVNNIPrefillLaunch.h"
+#include "ROCmNativeQuantisedWmmaLaunch.h"
 #include "../../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../../utils/PerfStatsCollector.h"
 
@@ -31,6 +32,7 @@ namespace
  */
 thread_local std::optional<llaminar2::rocm::VNNIPrefillLaunch>
     g_last_prefill_launch_selection;
+thread_local std::optional<llaminar2::rocm::NativeQuantisedWmmaTile> g_wmma_override;
 
 constexpr ROCmNativeQuantisedGemmShardFn shardForCodebook(uint8_t codebook_id)
 {
@@ -76,7 +78,7 @@ constexpr uint8_t defaultArithmeticPolicyCodebook(uint8_t codebook_id)
                : codebook_id;
 }
 
-constexpr std::array<ROCmNativeQuantisedGridInitShardFn, 8> kGridInitializers = {
+constexpr std::array<ROCmNativeQuantisedGridInitShardFn, 9> kGridInitializers = {
     rocmInitIQGridTables_gemm_shard_0,
     rocmInitIQGridTables_gemm_shard_1,
     rocmInitIQGridTables_gemm_shard_2,
@@ -85,8 +87,15 @@ constexpr std::array<ROCmNativeQuantisedGridInitShardFn, 8> kGridInitializers = 
     rocmInitIQGridTables_gemm_shard_5,
     rocmInitIQGridTables_gemm_shard_6,
     rocmInitIQGridTables_gemm_shard_7,
+    llaminar2::rocm::initializeNativeQuantisedWmmaGrids,
 };
 } // namespace
+
+std::optional<llaminar2::rocm::NativeQuantisedWmmaTile>
+llaminar2::rocm::nativeQuantisedWmmaOverride() noexcept { return g_wmma_override; }
+
+void llaminar2::rocm::setNativeQuantisedWmmaOverride(
+    std::optional<NativeQuantisedWmmaTile> tile) noexcept { g_wmma_override = tile; }
 
 void llaminar2::rocm::publishVNNIPrefillLaunch(
     const VNNIPrefillLaunch &launch)
@@ -175,6 +184,9 @@ extern "C" bool rocmGemm_native_quantised_fp32_with_policy(
         return false;
     }
 
+    // The successful producer must publish this invocation's physical launch.
+    // Retaining an older same-codebook observation would forge capture evidence.
+    llaminar2::rocm::clearVNNIPrefillLaunch();
     const bool launched = shard(
         d_A_int8,
         d_payload,
@@ -195,6 +207,9 @@ extern "C" bool rocmGemm_native_quantised_fp32_with_policy(
     if (launched &&
         llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
     {
+        const auto observed = llaminar2::rocm::lastVNNIPrefillLaunch();
+        if (!observed || observed->execution_codebook != codebook_id)
+            throw std::logic_error("ROCm native prefill omitted its physical launch observation");
         llaminar2::PerfStatsCollector::addCounter(
             "kernel",
             "rocm_native_quantised_prefill_launch",
@@ -208,7 +223,15 @@ extern "C" bool rocmGemm_native_quantised_fp32_with_policy(
                      static_cast<int>(arithmetic_policy_codebook_id))},
                 {"m", std::to_string(M)},
                 {"n", std::to_string(N)},
-                {"k", std::to_string(K)}});
+                {"k", std::to_string(K)},
+                {"producer", llaminar2::rocm::vnniPrefillProducerName(observed->producer)},
+                {"n_tile", std::to_string(observed->n_tile)},
+                {"m_tile", std::to_string(observed->m_tile)},
+                {"min_blocks", std::to_string(observed->min_blocks)},
+                {"unroll", std::to_string(observed->unroll)},
+                {"full_tiles", observed->full_tiles ? "1" : "0"},
+                {"block_threads", std::to_string(observed->block_threads)},
+                {"dynamic_shared_memory_bytes", std::to_string(observed->dynamic_shared_memory_bytes)}});
     }
     return launched;
 }

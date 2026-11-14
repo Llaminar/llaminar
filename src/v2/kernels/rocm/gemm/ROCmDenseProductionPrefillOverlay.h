@@ -26,8 +26,8 @@ using DensePrefillExactConfig = generated::ROCmDensePrefillOverlayConfig;
  * @param k Actual contraction geometry, independent of full-model dimensions.
  * @param family Explicit prepared ABI, independent of the source codebook.
  *         A matching key with an incompatible configured producer is fatal.
- * @param actual_hardware Original participant metadata, required only for new
- *        native-Q8 architecture-qualified rows. No device query is performed.
+ * @param actual_hardware Original participant metadata, required for every new
+ *        architecture-qualified native row. No device query is performed.
  *        Missing actual metadata cannot consume qualified rows.
  * @return The immutable exact/nearest-compatible launch. Unmeasured keys,
  *         absent actual facts, incompatible resources, and a deliberately

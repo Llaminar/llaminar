@@ -19,7 +19,7 @@
  *   - Fully valid context P/V tiles unroll four ordered keys without changing
  *     FP32 accumulation, masked-tile semantics or three-workgroup residency
  *   - Explicit wavefront reductions via DPP
- *   - NO WMMA/Matrix Cores - pure VALU implementation
+ *   - Native gfx1100 four-plane WMMA retains the ordered half-dot Q/K contract
  * - Flash Decoding: Split-K parallelism for single-token decode
  *   - Compile immutable 256-dimension geometry into the decode body.
  *   - Retain FP16 query operands in registers and advance native ring rows
@@ -46,6 +46,7 @@
 #include <cstdint>
 #include "../../attention/AttentionDeviceParams.h"
 #include "ROCmFlashAttentionLaunchPolicy.h"
+#include "ROCmFlashAttentionQK.h"
 #include "../../../tensors/BlockStructures.h"
 #include <cmath>
 #include <cfloat>
@@ -56,6 +57,27 @@
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "../../../utils/DebugEnv.h"
+
+namespace llaminar2::rocm
+{
+namespace
+{
+thread_local FlashAttentionQKEngine recording_qk_engine = FlashAttentionQKEngine::Automatic;
+}
+ScopedFlashAttentionQKEngine::ScopedFlashAttentionQKEngine(FlashAttentionQKEngine engine)
+    : previous_(recording_qk_engine)
+{
+    switch (engine)
+    {
+    case FlashAttentionQKEngine::Automatic:
+    case FlashAttentionQKEngine::OrderedDot2:
+    case FlashAttentionQKEngine::WmmaFourPlane:
+    case FlashAttentionQKEngine::ContextAdaptive: recording_qk_engine = engine; return;
+    }
+    throw std::invalid_argument("unknown ROCm attention Q/K engine");
+}
+ScopedFlashAttentionQKEngine::~ScopedFlashAttentionQKEngine() { recording_qk_engine = previous_; }
+}
 
 namespace
 {
@@ -573,8 +595,9 @@ namespace
     // Flash Attention 2 - Prefill Kernel for MI50
     // =========================================================================
     //
-    // This implementation uses vectorized FP16 operations since MI50 lacks
-    // Matrix Cores. Key optimizations:
+    // The ordered vector implementation serves gfx906; the explicitly selected
+    // gfx1100 matrix implementation preserves its four-chain Q/K arithmetic.
+    // Shared optimizations:
     //   1. Vectorized FP16 dot products (2 elements at a time)
     //   2. LDS buffering selected jointly with physical workgroup residency
     //   3. Online softmax to avoid materializing full attention matrix
@@ -601,9 +624,10 @@ namespace
         /**
          * @brief Bind the exact register-score XOR Q/K storage lifetime.
          *
-         * K retires before V overwrites the same 8KB plane. Every score is
-         * consumed by its producing lane, so no score matrix is materialized.
-         * The host bridge validates these bytes against its typed tile plan.
+         * K retires before V overwrites the same 8KB plane. Vector Q/K retains
+         * each score in its consumer lane. Native matrix Q/K briefly borrows
+         * the retired K plane to transpose scores into those same lanes; it
+         * needs no additional storage. The host validates this typed tile plan.
          */
         __host__ __device__ void computeRegisterScores()
         {
@@ -941,6 +965,86 @@ namespace
     }
 
     /**
+     * @brief Compute the canonical four half-dot chains with native wave64 WMMA.
+     *
+     * Plane c gathers dimension 8*(k/2)+2*c+(k%2). Each K16 update therefore
+     * appends eight adjacent pairs to one original fdot2 chain. Folding completed
+     * planes in ascending order preserves every FP32 rounding point. One wave
+     * produces the 16x16 score tile. Register-score readers borrow the retired
+     * K plane for a short transpose; its barriers precede the existing V loader.
+     *
+     * @tparam REGISTER_SCORE_TILE Q/K use XOR pairs and scores return to owners.
+     * @param query Persistent half query tile.
+     * @param key Current half key tile; may be reused only after its last read.
+     * @param scores Existing padded score matrix for the shared-score schedule.
+     * @param layout Admitted Q/K/score strides.
+     * @param query_rows Live rows in this query tile.
+     * @param key_rows Live keys in this tile.
+     * @param scale Canonical final FP32 score scale.
+     * @param tid Workgroup lane, with exactly 256 threads participating.
+     * @return Register-owned score, or zero for shared-score schedules.
+     */
+    template<bool REGISTER_SCORE_TILE>
+    __device__ __forceinline__ float fa2_wmma_four_plane_qk(
+        const __half *query, __half *key, float *scores,
+        const FA2LDSLayout &layout, int query_rows, int key_rows, float scale, int tid)
+    {
+#if defined(__gfx1100__)
+        static_assert(__builtin_amdgcn_is_invocable(__builtin_amdgcn_wmma_f32_16x16x16_f16_w64));
+        using Half16 = _Float16 __attribute__((ext_vector_type(16)));
+        using Float4 = float __attribute__((ext_vector_type(4)));
+        float *destination = REGISTER_SCORE_TILE ? reinterpret_cast<float *>(key) : scores;
+        const int score_stride = REGISTER_SCORE_TILE ? 16 : layout.scores_stride;
+        if (tid < 64)
+        {
+            const int row = tid % 16;
+            const auto *q = reinterpret_cast<const unsigned *>(query + row * layout.q_stride);
+            const auto *k = reinterpret_cast<const unsigned *>(key + row * layout.kv_stride);
+            Float4 folded{};
+            #pragma unroll
+            for (int plane = 0; plane < 4; ++plane)
+            {
+                Float4 accumulator{};
+                #pragma unroll
+                for (int chunk = 0; chunk < 4; ++chunk)
+                {
+                    Half16 a{}, b{};
+                    #pragma unroll
+                    for (int pair = 0; pair < 8; ++pair)
+                    {
+                        const int logical_pair = chunk * 32 + pair * 4 + plane;
+                        const int physical_pair = REGISTER_SCORE_TILE
+                            ? logical_pair ^ ((row & 7) << 2) : logical_pair;
+                        const _Float16_2 x = __builtin_bit_cast(_Float16_2,
+                            row < query_rows ? q[physical_pair] : 0U);
+                        const _Float16_2 y = __builtin_bit_cast(_Float16_2,
+                            row < key_rows ? k[physical_pair] : 0U);
+                        a[2 * pair] = x[0]; a[2 * pair + 1] = x[1];
+                        b[2 * pair] = y[0]; b[2 * pair + 1] = y[1];
+                    }
+                    accumulator = __builtin_amdgcn_wmma_f32_16x16x16_f16_w64(a, b, accumulator);
+                }
+                // Assignment for plane zero preserves the original signed-zero
+                // behavior; adding an artificial initial zero is not equivalent.
+                if (plane == 0) folded = accumulator;
+                else folded += accumulator;
+            }
+            #pragma unroll
+            for (int element = 0; element < 4; ++element)
+                destination[(element * 4 + tid / 16) * score_stride + row] = folded[element] * scale;
+        }
+        if constexpr (REGISTER_SCORE_TILE)
+        {
+            __syncthreads();
+            // The caller's following barrier retires all transpose readers
+            // before V overwrites the borrowed K plane.
+            return destination[tid];
+        }
+#endif
+        return 0.0f;
+    }
+
+    /**
      * @brief Evaluate a direct attention scan or canonical context summaries.
      *
      * The launch authority admits one 256-thread workgroup geometry. Context
@@ -956,6 +1060,9 @@ namespace
      * @tparam STATIC_TILE_Q Static query tile, or zero for the supplied tile.
      * @tparam STATIC_TILE_KV Static key tile, or zero for the supplied tile.
      * @tparam WRITE_CONTEXT_PARTIAL Publish summaries instead of normalized output.
+     * @tparam REGISTER_SCORE_TILE Retain scores in their P/V consumer lanes.
+     * @tparam WMMA_FOUR_PLANE Use native matrix instructions with identical Q/K chains.
+     * @tparam QK_POLICY Unconditional arithmetic or one uniform live-prefix choice.
      * @param Q FP32 query rows in batch/row/head/dimension order.
      * @param K Physical key-cache storage in KV_TYPE's layout.
      * @param V Physical value-cache storage in KV_TYPE's layout.
@@ -988,7 +1095,10 @@ namespace
               int STATIC_HEAD_DIM = 0,
               int STATIC_TILE_Q = 0,
               int STATIC_TILE_KV = 0,
-              bool WRITE_CONTEXT_PARTIAL = false, bool REGISTER_SCORE_TILE = false>
+              bool WRITE_CONTEXT_PARTIAL = false, bool REGISTER_SCORE_TILE = false,
+              llaminar2::rocm::FlashAttentionQKBranchPolicy QK_POLICY =
+                  llaminar2::rocm::FlashAttentionQKBranchPolicy::Unconditional,
+              bool WMMA_FOUR_PLANE = false>
     __global__ __launch_bounds__(256, REGISTER_SCORE_TILE ? 4 : 2) void flash_attention_2_mi50_kernel(
         const float *__restrict__ Q,
         const void *__restrict__ K,
@@ -1017,6 +1127,9 @@ namespace
         int context_partition_slots = 0,
         int device_direct_partition_limit = 0)
     {
+        static_assert(QK_POLICY == llaminar2::rocm::FlashAttentionQKBranchPolicy::Unconditional ||
+            (WMMA_FOUR_PLANE && REGISTER_SCORE_TILE && !WRITE_CONTEXT_PARTIAL && KV_TYPE == KVTypeTag::FP16),
+            "Adaptive Q/K requires its native FP16 register-score query specialization");
         constexpr auto schedule = WRITE_CONTEXT_PARTIAL
             ? llaminar2::rocm::fa2_policy::ROCmFA2PrefillPhysicalMode::KeyValueContext
             : llaminar2::rocm::fa2_policy::ROCmFA2PrefillPhysicalMode::QuerySequence;
@@ -1059,6 +1172,15 @@ namespace
             ring_row_origin = device_params->ring_row_origin;
             ring_row_capacity = device_params->ring_row_capacity;
         }
+
+        // This decision is uniform for the complete workgroup and independent
+        // of key partitions or query tiles. Branch-local dot temporaries die
+        // before the shared softmax/PV body, allowing register reuse. The two
+        // unconditional specializations fold this expression and branch away.
+        const bool use_wmma_qk =
+            QK_POLICY == llaminar2::rocm::FlashAttentionQKBranchPolicy::Unconditional ||
+            llaminar2::rocm::useContextAdaptiveAttentionWmma(kv_len_runtime, kv_stride,
+                position_offset_runtime, ring_row_origin, ring_row_capacity);
 
         const int logical_query_tiles =
             (seq_len + kernel_tile_q - 1) / kernel_tile_q;
@@ -1417,7 +1539,16 @@ namespace
             // the score here removes its LDS round trip without changing any
             // QK operand, four-chain FP32 accumulation, or softmax operation.
             float owned_score = 0.0f;
-            if constexpr (REGISTER_SCORE_TILE)
+            if (WMMA_FOUR_PLANE && use_wmma_qk)
+            {
+                if constexpr (WMMA_FOUR_PLANE)
+                {
+                static_assert(STATIC_HEAD_DIM == 256 && STATIC_TILE_Q == 16 && STATIC_TILE_KV == 16);
+                owned_score = fa2_wmma_four_plane_qk<REGISTER_SCORE_TILE>(
+                    Q_tile, K_tile, scores, lds_layout, q_tile_rows, actual_kv_len, softmax_scale, tid);
+                }
+            }
+            else if constexpr (REGISTER_SCORE_TILE)
             {
                 static_assert(KV_TYPE == KVTypeTag::FP16 && STATIC_HEAD_DIM == 256 &&
                               STATIC_TILE_Q == 16 && STATIC_TILE_KV == 16 && !WRITE_CONTEXT_PARTIAL);
@@ -3062,6 +3193,30 @@ static int launch_device_resident_prefill(
     const int tile_q = tile_plan.query_rows;
     const int tile_kv = tile_plan.kv_rows;
     const int threads_per_row = tile_plan.threads_per_row;
+    // Recording policy becomes a distinct native function pointer in the graph.
+    // Automatic remains the installed Dot2 policy until complete-operation
+    // timing and replay qualify the candidate; forced unsupported work fails.
+    const bool adaptive_qk = llaminar2::rocm::recording_qk_engine ==
+        llaminar2::rocm::FlashAttentionQKEngine::ContextAdaptive;
+    const bool use_wmma = adaptive_qk || llaminar2::rocm::recording_qk_engine ==
+        llaminar2::rocm::FlashAttentionQKEngine::WmmaFourPlane;
+    if (use_wmma &&
+        (!(hardware.isa_target == "gfx1100" || hardware.isa_target.starts_with("gfx1100:")) ||
+         head_dim != 256 || tile_q != 16 || tile_kv != 16 || threads_per_row != 16))
+    {
+        printf("[launch_device_resident_prefill] Four-plane WMMA requires native gfx1100 and HD256/tile16x16\n");
+        return -1;
+    }
+    if (adaptive_qk &&
+        (KV_TYPE != KVTypeTag::FP16 || WRITE_CONTEXT_PARTIAL || device_direct_partition_limit != 0 ||
+         batch_size != 1 || seq_len != 512 || kv_len != 65536 || !device_params ||
+         !((n_heads == 12 && n_kv_heads == 2) || (n_heads == 8 && n_kv_heads == 1)) ||
+         head_start != 0 || gqa_n_rep != 0 || !causal || window_size > 0 || mask ||
+         score_storage != policy::ROCmFA2ScoreStorage::RegisterOwnedXorTile))
+    {
+        printf("[launch_device_resident_prefill] Adaptive Q/K requires the measured FP16 M512/HD256/capacity65536 causal query geometry\n");
+        return -1;
+    }
     if constexpr (KV_TYPE == KVTypeTag::FP16)
     {
         if (head_dim == 256 && tile_q == 16 && tile_kv == 16 &&
@@ -3146,6 +3301,31 @@ static int launch_device_resident_prefill(
     {
         if (tile_plan.score_storage == policy::ROCmFA2ScoreStorage::RegisterOwnedXorTile)
         {
+            if (adaptive_qk)
+            {
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1100__)
+                hipLaunchKernelGGL(
+                    (flash_attention_2_mi50_kernel<KVTypeTag::FP16,16,256,16,16,false,true,
+                        llaminar2::rocm::FlashAttentionQKBranchPolicy::ContextAdaptive,true>),
+                    grid,block,lds_layout.total_size,hip_stream,
+                    Q,K,V,O,batch_size,seq_len,kv_len,n_heads,n_kv_heads,head_dim,softmax_scale,
+                    causal,window_size,position_offset,device_params,mask,tile_q,tile_kv,head_start,gqa_n_rep,
+                    O_partial,m_partial,l_partial,max_context_partitions,context_partition_slots,device_direct_partition_limit);
+#endif
+            }
+            else if (use_wmma)
+            {
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1100__)
+                hipLaunchKernelGGL(
+                    (flash_attention_2_mi50_kernel<KVTypeTag::FP16,16,256,16,16,false,true,
+                        llaminar2::rocm::FlashAttentionQKBranchPolicy::Unconditional,true>),
+                    grid,block,lds_layout.total_size,hip_stream,
+                    Q,K,V,O,batch_size,seq_len,kv_len,n_heads,n_kv_heads,head_dim,softmax_scale,
+                    causal,window_size,position_offset,device_params,mask,tile_q,tile_kv,head_start,gqa_n_rep,
+                    O_partial,m_partial,l_partial,max_context_partitions,context_partition_slots,device_direct_partition_limit);
+#endif
+            }
+            else
             hipLaunchKernelGGL(
                 (flash_attention_2_mi50_kernel<KVTypeTag::FP16,16,256,16,16,false,true>),
                 grid,block,lds_layout.total_size,hip_stream,
@@ -3161,7 +3341,19 @@ static int launch_device_resident_prefill(
             return 0;
         }
     }
-    if (head_dim == 64 && tile_q == 64 && tile_kv == 64)
+    if (use_wmma)
+    {
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1100__)
+        hipLaunchKernelGGL(
+            (flash_attention_2_mi50_kernel<KV_TYPE,16,256,16,16,WRITE_CONTEXT_PARTIAL,false,
+                llaminar2::rocm::FlashAttentionQKBranchPolicy::Unconditional,true>),
+            grid,block,lds_layout.total_size,hip_stream,
+            Q,K,V,O,batch_size,seq_len,kv_len,n_heads,n_kv_heads,head_dim,softmax_scale,
+            causal,window_size,position_offset,device_params,mask,tile_q,tile_kv,head_start,gqa_n_rep,
+            O_partial,m_partial,l_partial,max_context_partitions,context_partition_slots,device_direct_partition_limit);
+#endif
+    }
+    else if (head_dim == 64 && tile_q == 64 && tile_kv == 64)
     {
         hipLaunchKernelGGL(
             (flash_attention_2_mi50_kernel<

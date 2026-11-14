@@ -741,7 +741,7 @@ class QFNSourceAdmissionCI(unittest.TestCase):
             (root / 'e2e-receipt.json').write_text(json.dumps(receipt))
             args = SimpleNamespace(e2e_bundle=root, qfn_source_admission=True)
             with patch.object(suite, 'build_driver') as native:
-                with self.assertRaisesRegex(ValueError, 'requires QFN source admission'):
+                with self.assertRaisesRegex(ValueError, 'requires complete QFN source admission on both ISAs'):
                     suite.run_benchmarks(args, pair, root)
             native.assert_not_called()
 

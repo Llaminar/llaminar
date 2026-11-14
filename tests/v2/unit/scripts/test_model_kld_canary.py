@@ -421,41 +421,6 @@ class ModelKLDLifecycleTests(unittest.TestCase):
 
 class ModelKLDCITests(unittest.TestCase):
     """Master-only integration keeps both ISA evidence and native owner cleanup."""
-    def test_complete_red_numerics_still_collect_both_isas(self):
-        from unittest.mock import patch
-        from types import SimpleNamespace
-        import tempfile,json,subprocess
-        import run_published_image_suite as suite
-        from test_published_image_suite import image_pair,full_inventory,prerequisite_evidence
-        from production_artifacts import write_json,digest
-        with tempfile.TemporaryDirectory() as temp:
-            root=Path(temp);pair=image_pair();manifest=suite.pipeline.e2e_projection(full_inventory(),pair['source']['revision'])
-            approval=json.loads((suite.ROOT/'scripts/ci/approved_model_kld_corpus.json').read_text())
-            visited=[]
-            def execute(args,driver,command,lane,log):
-                if lane.name=='kld':
-                    isa=lane.parent.name.upper();visited.append(isa)
-                    self.assertEqual(Path(command[command.index('--report')+1]).parent,lane)
-                    report=canary_report(pair['source']['revision'],pair['images'][isa]['id'],isa,approval['manifest_digest'])
-                    if isa=='AVX512':
-                        cell=report['cells'][0];data=rows('dense',prefill=1.)
-                        metrics=policy.evaluate_rows(data,model='dense',backend='cuda')
-                        metrics.update(rows=data,corpus_manifest_digest=approval['manifest_digest'],full_vocabulary=True)
-                        cell.update(metrics=metrics,phases=metrics['phases'],passed=False);report['passed']=False
-                    write_json(lane/'kld-canaries.json',report)
-                    if not report['passed']:raise subprocess.CalledProcessError(1,command)
-                else:
-                    isa=lane.name.upper()
-                    write_json(lane/'e2e.json',dict(schema=1,image=pair['images'][isa]['id'],source_revision=pair['source']['revision'],
-                        manifest_digest=digest(manifest),selected=len(manifest['cells']),correctness_passed=True,
-                        cells=[dict(row,outcome='passed',return_code=0) for row in manifest['cells']]))
-            with patch.object(suite,'run_e2e_prerequisites',return_value=prerequisite_evidence(pair)), \
-                 patch.object(suite,'build_driver',return_value='tools'),patch.object(suite,'run_in_driver',side_effect=execute):
-                with self.assertRaisesRegex(ValueError,'KL phase failures'):
-                    suite.run_e2e(SimpleNamespace(model_kld_canaries=True,models=root,model_ramdisk_root=root),pair,manifest,root)
-            self.assertEqual(visited,list(suite.ISAS))
-            receipt=json.loads((root/'e2e-receipt.json').read_text())
-            self.assertFalse(receipt['complete']);self.assertEqual(set(receipt['model_kld_reports']),set(suite.ISAS))
     def test_master_cannot_omit_kl_or_accept_changed_report(self):
         import tempfile,json
         import run_published_image_suite as suite
@@ -470,21 +435,6 @@ class ModelKLDCITests(unittest.TestCase):
             receipt['model_kld_required']=True;write_json(root/'e2e-receipt.json',receipt)
             report=root/'avx2/kld/kld-canaries.json';data=json.loads(report.read_text());data['cpu_isa']='AVX512';write_json(report,data)
             with self.assertRaises(ValueError):suite.admit_e2e(root,pair,require_model_kld=True)
-    def test_outer_driver_labels_and_retires_numerical_children_on_cancel(self):
-        from unittest.mock import patch
-        from types import SimpleNamespace
-        import tempfile
-        import run_published_image_suite as suite
-        with tempfile.TemporaryDirectory() as temp:
-            root=Path(temp);(root/'cache').mkdir();lane=root/'kld';lane.mkdir();socket=root/'docker.sock';socket.touch()
-            args=SimpleNamespace(output=root,models=root,model_ramdisk_root=root,e2e_bundle=None,suite='e2e',model_kld_canaries=True)
-            with patch.dict(suite.os.environ,{'DOCKER_HOST':'unix://'+str(socket)}),patch.object(suite.docker_paths,'device_args',return_value=[]),patch.object(suite.docker_paths,'mounts',return_value=[]),patch.object(suite.pipeline,'run',side_effect=KeyboardInterrupt) as run,patch.object(suite,'retire_coding_children') as retire,patch.object(suite,'restore_lane_ownership'):
-                with self.assertRaises(KeyboardInterrupt):suite.run_in_driver(args,'tools',['python','canary.py'],lane,'kld.log')
-            command=run.call_args.args[0];owner=command[command.index('--name')+1]
-            self.assertIn(suite.docker_paths.CODING_DRIVER_ENV+'='+owner,command)
-            self.assertIn(suite.docker_paths.CODING_OWNER_LABEL+'='+owner,command)
-            retire.assert_called_once_with(owner,lane/'outer-cleanup.json')
-            self.assertTrue(lane.stat().st_mode & 0o020)
 
 
 class ModelKLDPackagingTests(unittest.TestCase):

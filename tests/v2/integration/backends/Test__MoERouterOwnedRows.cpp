@@ -6,15 +6,26 @@
  * The unchanged complete-row router is the oracle, including its prepared gate
  * representation. Every owned selection bit must match; compact tails remain
  * poisoned, and ROCm's Q8 side product must still contain all live input rows.
+ * Explicit K-wave experiments additionally prove compact native launches retain
+ * the requested reduction partition across empty and partial participants.
+ * Automatic exclusion proves whole-capacity admission cannot leak into compact
+ * outputs; empty static owners must not report projection submissions.
  * This proves a local kernel boundary, not inter-device transport or model wiring.
  */
 #include "kernels/common/RouterQ8Launch.h"
+#include "kernels/rocm/moe/ROCmRouterQ8WaveTuning.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "kernels/common/MoERouterOwnedRows.h"
 #include "kernels/cuda/moe/CUDARouterQ8Prefill.h"
 #include "utils/TestTensorFactory.h"
+#include "utils/ROCmRouterQ8SubmissionProof.h"
+#ifdef HAVE_ROCM
+#include <hip/hip_runtime.h>
+#include "kernels/rocm/moe/ROCmRouterQ8Prefill.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#endif
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <bit>
@@ -63,13 +74,20 @@ namespace
 
     /** @brief Invoke only the explicitly requested native backend. */
     bool enqueueOwned(DeviceId device, const MoERouterOwnedRowsLaunch &launch, void *stream,
-                      const cuda::RouterQ8PrefillHardware &hardware)
+                      const cuda::RouterQ8PrefillHardware &hardware, bool native_wmma = false,
+                      rocm::RouterQ8WaveTile wave_tile = rocm::RouterQ8WaveTile::Four)
     {
 #ifdef HAVE_CUDA
         if (device.is_cuda()) return llaminar2::cuda::routeOwnedRows(launch, stream, hardware);
 #endif
 #ifdef HAVE_ROCM
-        if (device.is_rocm()) return llaminar2::rocm::routeOwnedRows(launch, stream);
+        if (device.is_rocm())
+        {
+            rocm::ScopedRouterQ8PrefillMode policy(native_wmma ? rocm::RouterQ8PrefillMode::NativeWmma :
+                rocm::RouterQ8PrefillMode::Automatic);
+            rocm::ScopedRouterQ8WaveTile tile(wave_tile);
+            return llaminar2::rocm::routeOwnedRows(launch, stream);
+        }
 #endif
         throw std::invalid_argument("Owned router fixture requires its compiled backend");
     }
@@ -100,6 +118,7 @@ namespace
 #ifdef HAVE_ROCM
         if (device.is_rocm())
         {
+            rocm::ScopedRouterQ8PrefillMode oracle(rocm::RouterQ8PrefillMode::OrderedDot4);
             bool logits = false;
             switch (p.format)
             {
@@ -132,9 +151,13 @@ namespace
      * @param capacity Retained whole-matrix row capacity.
      * @param width Hidden columns, including ragged and Q8 serial-partition boundaries.
      * @param experts Router columns.
-     * @param degrees Logical domain sizes, including more participants than live rows. */
+     * @param degrees Logical domain sizes, including more participants than live rows.
+     * @param basis Paired Q8 gate/input coordinates.
+     * @param native_wmma Require actual gfx1100 matrix instructions in the captured owner.
+     * @param wave_tile Native K-wave cap embedded in the retained graph. */
     void prove(DeviceId device, MoERouterPreparedFormat format, int capacity, int width,
-               int experts, const std::vector<int> &degrees, RouterQ8Basis basis = RouterQ8Basis::Original)
+               int experts, const std::vector<int> &degrees, RouterQ8Basis basis = RouterQ8Basis::Original, bool native_wmma = false,
+               rocm::RouterQ8WaveTile wave_tile = rocm::RouterQ8WaveTile::Four)
     {
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         context.submitAndWait([&]
@@ -215,7 +238,14 @@ namespace
             if (device.is_cuda())
                 require(cuda::prepareRouterQ8PrefillHardware(device.ordinal, stream, hardware), "Owned router hardware preparation");
 #endif
-            EXPECT_FALSE(enqueueOwned(device, launch, nullptr, hardware));
+            EXPECT_FALSE(enqueueOwned(device, launch, nullptr, hardware, native_wmma, wave_tile));
+#ifdef HAVE_ROCM
+            if (device.is_rocm())
+            {
+                EXPECT_FALSE(enqueueOwned(device, launch, hipStreamLegacy, hardware, native_wmma, wave_tile));
+                EXPECT_FALSE(enqueueOwned(device, launch, hipStreamPerThread, hardware, native_wmma, wave_tile));
+            }
+#endif
             auto invalid = launch;
             invalid.live_rows = nullptr;
             EXPECT_FALSE(enqueueOwned(device, invalid, stream, hardware));
@@ -237,6 +267,10 @@ namespace
             std::vector<MoERouterSelectedRoute> actual(route_elements);
             constexpr uint32_t poison = 0x7fc01234u;
             const std::vector<float> poisoned(route_elements * 2, std::bit_cast<float>(poison));
+            const std::vector<float> poisoned_logits(logits->numel(), std::bit_cast<float>(poison));
+            std::vector<float> actual_logits(logits->numel()), expected_logits(reference_logits->numel());
+            const std::vector<int8_t> poisoned_q8(input_elements + 4, 23);
+            const std::vector<float> poisoned_scales(input_elements / 32 + 1, -17.f);
             for (int degree : degrees)
                 for (int participant = 0; participant < degree; ++participant)
                 {
@@ -249,12 +283,13 @@ namespace
                     auto graph = context.createGraphCapture(stream);
                     require(bool(graph), "Owned router graph owner");
                     ObservationJoin join{backend, device, stream};
-                    require(enqueueOwned(device, launch, stream, hardware) && backend->synchronizeStream(stream, device.ordinal),
+                    require(enqueueOwned(device, launch, stream, hardware, native_wmma, wave_tile) && backend->synchronizeStream(stream, device.ordinal),
                         "Owned router preparation");
+                    const ROCmRouterQ8SubmissionSnapshot before_capture;
                     {
                         ScopedBackendGraphCapture recording(context, *graph, "Owned router live rows");
                         require(recording.begin(), "Owned router capture begin");
-                        require(enqueueOwned(device, launch, stream, hardware), "Owned router captured body");
+                        require(enqueueOwned(device, launch, stream, hardware, native_wmma, wave_tile), "Owned router captured body");
                         recording.finish();
                     }
                     std::vector<GPUGraphKernelNodeInfo> nodes;
@@ -262,7 +297,35 @@ namespace
                     const bool owns_capacity = launch.partition.capacityFor(capacity) > 0;
                     ASSERT_EQ(nodes.size(), 1u + owns_capacity + (format == MoERouterPreparedFormat::BlockQ8) +
                         (owns_capacity && basis == RouterQ8Basis::SignedHadamard32));
-                    for (const auto &node : nodes) EXPECT_EQ(node.local_memory_bytes_per_thread, 0u) << node.name;
+                    bool has_wmma = false;
+                    for (const auto &node : nodes)
+                    {
+                        EXPECT_EQ(node.local_memory_bytes_per_thread, 0u) << node.name;
+                        has_wmma |= node.name.find("router_q8_prefill_detail") != std::string::npos;
+#ifdef HAVE_ROCM
+                        if (device.is_rocm() && native_wmma && node.name.find("router_q8_prefill_detail") != std::string::npos)
+                        {
+                            unsigned waves = 1;
+                            while (waves < unsigned(width/32) && waves < unsigned(rocm::routerQ8WaveCount(wave_tile))) waves *= 2;
+                            const int wave_log = wave_tile == rocm::RouterQ8WaveTile::Four ? 2 : wave_tile == rocm::RouterQ8WaveTile::Eight ? 3 : 4;
+                            EXPECT_NE(node.name.find("ELi" + std::to_string(wave_log) + "EEEv"),std::string::npos) << node.name;
+                            EXPECT_EQ(node.block_x,64u*waves);
+                            EXPECT_EQ(node.static_shared_memory_bytes,waves == 1 ? 0u : waves*1024u);
+                        }
+#endif
+                    }
+                    if (device.is_rocm() && format == MoERouterPreparedFormat::BlockQ8)
+                    {
+                        ASSERT_EQ(has_wmma, native_wmma && owns_capacity);
+                        if (PerfStatsCollector::isRecordFamilyEnabled("kernel","rocm_router_q8_dot4_projection_submissions"))
+                        {
+                            if (!owns_capacity) before_capture.expectUnchanged();
+                            else before_capture.expectAdded(device.ordinal,capacity,width,experts,
+                                basis == RouterQ8Basis::Original ? "original" : "signed_hadamard32", "compact_owned",
+                                native_wmma ? rocm::routerQ8WaveCount(wave_tile) : 0,1);
+                        }
+                    }
+                    else if (native_wmma) ASSERT_EQ(has_wmma, owns_capacity);
                     require(graph->instantiate(), "Owned router instantiate");
                     int generation = 0;
                     for (int count : counts)
@@ -274,17 +337,34 @@ namespace
                                 : std::sin(float(i + generation * 17) * .031f) * .25f;
                         require(backend->hostToDevice(hidden->gpu_data_ptr(), input.data(), input.size() * sizeof(float), device.ordinal, stream) &&
                             backend->hostToDevice(length->gpu_data_ptr(), &count, sizeof(count), device.ordinal, stream) &&
-                            backend->hostToDevice(selected->gpu_data_ptr(), poisoned.data(), poisoned.size() * sizeof(float), device.ordinal, stream),
+                            backend->hostToDevice(selected->gpu_data_ptr(), poisoned.data(), poisoned.size() * sizeof(float), device.ordinal, stream) &&
+                            backend->hostToDevice(launch.logits, poisoned_logits.data(), poisoned_logits.size() * sizeof(float), device.ordinal, stream),
                             "Owned router replay inputs");
-                        require(enqueueOracle(device, oracle, oracle_indices, oracle_weights, stream) && graph->launch(), "Owned router and independent oracle");
+                        if (format == MoERouterPreparedFormat::BlockQ8)
+                            require(backend->hostToDevice(launch.hidden_q8, poisoned_q8.data(), poisoned_q8.size(), device.ordinal, stream) &&
+                                backend->hostToDevice(launch.hidden_scales, poisoned_scales.data(), poisoned_scales.size() * 4, device.ordinal, stream),
+                                "Owned router side-product poison");
+                        require(enqueueOracle(device, oracle, oracle_indices, oracle_weights, stream), "Owned router independent oracle");
+                        const ROCmRouterQ8SubmissionSnapshot before_replay;
+                        require(graph->launch(), "Owned router retained replay");
+                        before_replay.expectUnchanged();
                         uint64_t bytes = UINT64_MAX;
                         require(backend->deviceToHost(expected_ids.data(), oracle_indices, route_elements * sizeof(float), device.ordinal, stream) &&
                             backend->deviceToHost(expected_weights.data(), oracle_weights, route_elements * sizeof(float), device.ordinal, stream) &&
                             backend->deviceToHost(actual.data(), launch.selected, actual.size() * sizeof(actual[0]), device.ordinal, stream) &&
                             backend->deviceToHost(&bytes, launch.selected_bytes, sizeof(bytes), device.ordinal, stream) &&
+                            backend->deviceToHost(actual_logits.data(), launch.logits, actual_logits.size() * sizeof(float), device.ordinal, stream) &&
+                            backend->deviceToHost(expected_logits.data(), oracle.logits, expected_logits.size() * sizeof(float), device.ordinal, stream) &&
                             backend->synchronizeStream(stream, device.ordinal), "Owned router terminal observation");
                         const auto span = launch.partition.resolveFor(capacity, count);
                         ASSERT_EQ(bytes, uint64_t(span.count) * top_k * sizeof(MoERouterSelectedRoute));
+                        for (size_t i = 0; i < actual_logits.size(); ++i)
+                        {
+                            const bool live = i < size_t(span.count) * experts;
+                            ASSERT_EQ(std::bit_cast<uint32_t>(actual_logits[i]), live ?
+                                std::bit_cast<uint32_t>(expected_logits[size_t(span.first) * experts + i]) : poison)
+                                << "raw logit=" << i;
+                        }
                         for (size_t i = 0; i < route_elements; ++i)
                         {
                             const bool live = i < size_t(span.count) * top_k;
@@ -292,18 +372,21 @@ namespace
                             ASSERT_EQ(std::bit_cast<uint32_t>(actual[i].expert), live ? std::bit_cast<uint32_t>(expected_ids[source]) : poison) << "ID=" << i;
                             ASSERT_EQ(std::bit_cast<uint32_t>(actual[i].weight), live ? std::bit_cast<uint32_t>(expected_weights[source]) : poison) << "weight=" << i;
                         }
-                        if (format == MoERouterPreparedFormat::BlockQ8 && count > 0)
+                        if (format == MoERouterPreparedFormat::BlockQ8)
                         {
-                            const size_t bytes = size_t(count) * width;
+                            const size_t bytes = input_elements + 4;
                             std::vector<int8_t> actual(bytes), expected(bytes);
-                            std::vector<uint32_t> actual_scales(bytes / 32), expected_scales(bytes / 32);
+                            std::vector<uint32_t> actual_scales(input_elements / 32 + 1), expected_scales(input_elements / 32 + 1);
                             require(backend->deviceToHost(actual.data(), launch.hidden_q8, bytes, device.ordinal, stream) &&
                                 backend->deviceToHost(expected.data(), oracle.hidden_q8, bytes, device.ordinal, stream) &&
                                 backend->deviceToHost(actual_scales.data(), launch.hidden_scales, actual_scales.size() * 4, device.ordinal, stream) &&
                                 backend->deviceToHost(expected_scales.data(), oracle.hidden_scales, expected_scales.size() * 4, device.ordinal, stream) &&
                                 backend->synchronizeStream(stream, device.ordinal), "Owned router complete Q8 side product");
-                            ASSERT_EQ(actual, expected);
-                            ASSERT_EQ(actual_scales, expected_scales);
+                            for (size_t i = 0; i < actual.size(); ++i)
+                                ASSERT_EQ(actual[i], i < size_t(count) * width ? expected[i] : int8_t(23));
+                            for (size_t i = 0; i < actual_scales.size(); ++i)
+                                ASSERT_EQ(actual_scales[i], i < size_t(count) * width / 32 ? expected_scales[i] :
+                                    std::bit_cast<uint32_t>(-17.f));
                         }
                     }
                 }
@@ -352,6 +435,63 @@ namespace
 #ifdef HAVE_ROCM
     /** @test Every ROCm prepared router format retains exact rows and input publication. */
     TEST(MoERouterOwnedRows, ROCm) { proveBackend(DeviceId::rocm(0)); }
+    /** @test Native WMMA preserves compact ownership and all expert input rows. */
+    TEST(MoERouterOwnedRows, ROCmWmmaCapturedReplay)
+    {
+        initializeROCmHardwareMetadata();
+        int ordinal = -1;
+        for (int i = 0; i < int(rocmHardwareMetadata().size()); ++i)
+        {
+            const auto &isa = rocmHardwareMetadata().at(i).isa_target;
+            if (isa == "gfx1100" || isa.starts_with("gfx1100:")) { ordinal = i; break; }
+        }
+        if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+        for (auto basis : {RouterQ8Basis::Original, RouterQ8Basis::SignedHadamard32})
+        {
+            prove(DeviceId::rocm(ordinal), MoERouterPreparedFormat::BlockQ8, 2, 96, 17, {2, 8}, basis, true);
+            prove(DeviceId::rocm(ordinal), MoERouterPreparedFormat::BlockQ8, 65, 96, 17, {2, 3, 4, 8}, basis, true);
+            prove(DeviceId::rocm(ordinal), MoERouterPreparedFormat::BlockQ8, 512, 2048, 256, {2, 4}, basis, true);
+            prove(DeviceId::rocm(ordinal), MoERouterPreparedFormat::BlockQ8, 33, 2080, 17, {2, 3}, basis, true);
+        }
+    }
+    /** @test Compact capacity512 never borrows whole-row admission; empty owners report no projection. */
+    TEST(MoERouterOwnedRows, ROCmAutomaticCapturedReplay)
+    {
+        initializeROCmHardwareMetadata();
+        int ordinal = -1;
+        for (int i = 0; i < int(rocmHardwareMetadata().size()); ++i)
+            if (rocmHardwareMetadata().at(i).isa_target == "gfx1100" || rocmHardwareMetadata().at(i).isa_target.starts_with("gfx1100:")) { ordinal = i; break; }
+        if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+        ROCmRouterQ8SubmissionCollection collection;
+        for (auto basis : {RouterQ8Basis::Original,RouterQ8Basis::SignedHadamard32})
+        {
+            prove(DeviceId::rocm(ordinal),MoERouterPreparedFormat::BlockQ8,1024,2560,512,{2},basis);
+            prove(DeviceId::rocm(ordinal),MoERouterPreparedFormat::BlockQ8,512,2560,512,{2},basis);
+            prove(DeviceId::rocm(ordinal),MoERouterPreparedFormat::BlockQ8,2,96,17,{8},basis);
+            if (::testing::Test::HasFatalFailure()) return;
+        }
+    }
+    /** @test Larger native K-wave caps preserve partial/empty ownership and complete Q8 publication. */
+    TEST(MoERouterOwnedRows, ROCmWmmaWaveTilesCapturedReplay)
+    {
+        initializeROCmHardwareMetadata();
+        int ordinal = -1;
+        for (int i = 0; i < int(rocmHardwareMetadata().size()); ++i)
+        {
+            const auto &isa = rocmHardwareMetadata().at(i).isa_target;
+            if (isa == "gfx1100" || isa.starts_with("gfx1100:")) { ordinal = i; break; }
+        }
+        if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+        for (auto tile : {rocm::RouterQ8WaveTile::Eight,rocm::RouterQ8WaveTile::Sixteen})
+            for (auto basis : {RouterQ8Basis::Original,RouterQ8Basis::SignedHadamard32})
+            {
+                prove(DeviceId::rocm(ordinal),MoERouterPreparedFormat::BlockQ8,2,96,17,{2,8},basis,true,tile);
+                prove(DeviceId::rocm(ordinal),MoERouterPreparedFormat::BlockQ8,33,2080,17,{2,3},basis,true,tile);
+                prove(DeviceId::rocm(ordinal),MoERouterPreparedFormat::BlockQ8,65,4160,17,{2,3},basis,true,tile);
+                prove(DeviceId::rocm(ordinal),MoERouterPreparedFormat::BlockQ8,512,2048,256,{2,4},basis,true,tile);
+                if (::testing::Test::HasFatalFailure()) return;
+            }
+    }
     /** @test Rotated router coordinates never escape the compact local routing phase. */
     TEST(MoERouterOwnedRows, ROCmHadamard)
     {

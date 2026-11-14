@@ -8,6 +8,8 @@
  * endpoint must fail without stranding its peer or retaining physical owners.
  * Separate startup sample cases retain raw clock receipts and wall times in
  * GTest XML, without a performance threshold or per-edge logging overhead.
+ * Context-storage replay uses the production four-graph timing-family bound;
+ * context leases survive that family's retirement until explicit device reset.
  */
 #include "planning/PlanningLocalTPMeasurement.h"
 #include "collective/DeviceCountedAllGather.h"
@@ -423,7 +425,7 @@ TEST(PlanningExecutionMeasurementIntegration, CUDA_NativeLocalTP)
 }
 
 /**
- * @test Cold production-size native kernels retain context bytes after both graphs retire.
+ * @test Cold production-size native kernels retain context bytes after the four-graph timing family retires.
  *
  * The original small odd-tail sample selected a lower-stack native algorithm
  * and did not expose the second growth event. Start this case in its own cold
@@ -465,7 +467,8 @@ void proveContextStorageLifetime(int columns, int rows)
             EXPECT_GT(bytes, 0u);
             retained.push_back(bytes);
             EXPECT_EQ(memory->plannedBytes(device, PhysicalMemoryOwner::NativeGraphExecutable),
-                2 * GPUGraphMemoryContract::reservationBytesPerExecutable(device));
+                PlanningExecutionMeasurement::kPreparedGraphCount *
+                    GPUGraphMemoryContract::reservationBytesPerExecutable(device));
         }
     }
     EXPECT_TRUE(setup_lifetime.expired());

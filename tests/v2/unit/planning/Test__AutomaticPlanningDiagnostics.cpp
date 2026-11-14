@@ -190,7 +190,7 @@ namespace
     }
 }
 
-/** @test Complete planner work and decisions survive DEBUG policy without per-proposal geometry I/O. */
+/** @test DEBUG retains cold owner BOM diagnostics without graph-construction geometry I/O. */
 TEST(AutomaticPlanningDiagnostics, CompleteAdmissionAndSelectionRetainAllWorkWithoutDebugGeometryFlood)
 {
     test::PlanningGGUFFixture fixture(true, false, GGUFTensorType::F32, 512);
@@ -212,12 +212,17 @@ TEST(AutomaticPlanningDiagnostics, CompleteAdmissionAndSelectionRetainAllWorkWit
             OrchestrationStrategy::SingleDevice,
             OrchestrationStrategy::TensorParallel,
             OrchestrationStrategy::ExpertOverlay}));
+        // Rejected admission may have no final PhysicalMemoryPlan to inspect.
+        // The cold per-owner BOM remains available in optimized DEBUG logs;
+        // it does not permit graph wiring or per-layer geometry to flood DEBUG.
+        constexpr auto fixed_bom = "[MoEOverlayCapacity] fixed component BOM device=";
+        EXPECT_EQ(info.diagnostics.find(fixed_bom), std::string::npos);
+        EXPECT_NE(debug.diagnostics.find(fixed_bom), std::string::npos);
         for (const auto phrase : {
             "Building execution plans for ",
             "Using named domains mode",
             "Resolved domain '",
             "[TensorParallelConfig] GQA replication:",
-            "[MoEOverlayCapacity] fixed component BOM device=",
             "[MoEExpertOverlayRuntimePlan] Resolved overlay topology:",
             "MoE expert overlay runtime plan:"})
         {

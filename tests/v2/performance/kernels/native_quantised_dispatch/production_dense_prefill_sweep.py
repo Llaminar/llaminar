@@ -22,6 +22,10 @@ legacy clocks cannot be relabeled as that producer.
 ROCm aggregate and timing rows explicitly bind physical execution identity next
 to original source codebook. Current schema rejects old or relabeled IQ4_XS
 rows; source4 and physical24 are never collapsed into a synthetic measurement.
+A typed installed-versus-WMMA scope narrows only the candidate roster. Its cell,
+batch and plan identities remain distinct from exhaustive historical evidence.
+Optional v6 plans freeze the installed base against the actual linked selector
+table before collection, preserving unbound v4/v5 evidence without relabeling it.
 """
 
 from __future__ import annotations
@@ -39,12 +43,14 @@ import subprocess
 import threading
 import uuid
 from dataclasses import dataclass
-from enum import IntEnum
+from enum import Enum, IntEnum
+from functools import lru_cache
 from pathlib import Path
+from types import MappingProxyType
 from typing import Iterable, Mapping, Sequence
 
 from .gpu_architecture import GPUArchitecture
-from .format_registry import CODEBOOK_PAYLOAD_BYTES, FORMAT_SPECS, NativeQuantisedFormatSpec, registry_digest
+from .format_registry import GPU_EXECUTION_CODEBOOK_PAYLOAD_BYTES, FORMAT_SPECS, NativeQuantisedFormatSpec, registry_digest
 from .corpus_provenance import (
     TRAINER_PROVENANCE_SCHEMA,
     mapping_digest as _mapping_digest,
@@ -146,7 +152,7 @@ def _cuda_candidate_is_spill_free(
         staging = int(candidate.rsplit(":stage", 1)[1])
         if staging not in (1, 2, 3):
             return False
-        if CODEBOOK_PAYLOAD_BYTES.get(execution_codebook) not in (16, 20) or tile_id == 1:
+        if GPU_EXECUTION_CODEBOOK_PAYLOAD_BYTES.get(execution_codebook) not in (16, 20) or tile_id == 1:
             return False
         # Exact production-module resource inventory: these asymmetric direct
         # symbols spill eight bytes; canonical publication and other tiles do not.
@@ -208,7 +214,7 @@ ROCM_INT8_CANDIDATE_IDS = (
 # overlay's generated producer discriminator. Unknown identities fail closed.
 ROCM_PRODUCER_IDS = {
     "native_cooperative": 0, "native_streaming": 1,
-    "int8_blockwise_v3": 2, "int8_blockwise_v7": 3,
+    "int8_blockwise_v3": 2, "int8_blockwise_v7": 3, "native_wmma": 4,
 }
 
 # gfx906 resource queries prove that these checked-edge Q6_K instantiations
@@ -223,10 +229,14 @@ ROCM_Q6_SPILLING_CHECKED_CANDIDATE_IDS = frozenset((
     *(f"N128/MT32/MB2/U{unroll}" for unroll in (0, 1, 2, 4)),
 ))
 
+ROCM_WMMA_CANDIDATE_IDS = ("WMMA/N32/MT32", "WMMA/N64/MT32", "WMMA/N64/MT64", "WMMA/N128/MT64")
+
 DEFAULT_WARMUP_RUNS = 3
 DEFAULT_BENCH_RUNS = 10
 SWEEP_PLAN_FILENAME = "production_dense_prefill.plan.json"
 SWEEP_PLAN_SCHEMA = "native-quantised-production-dense-prefill-sweep-v4"
+SCOPED_SWEEP_PLAN_SCHEMA = "native-quantised-production-dense-prefill-sweep-v5"
+BOUND_SWEEP_PLAN_SCHEMA = "native-quantised-production-dense-prefill-sweep-v6"
 DENSE_PREFILL_CAPTURED_OPERATIONS = 16
 CELL_MANIFEST_SCHEMA = "native-quantised-production-dense-prefill-cell-v1"
 _UINT64_MAX = (1 << 64) - 1
@@ -244,6 +254,27 @@ ROCM_NATIVE_Q8_CANDIDATE_IDS = (
 )
 
 
+class DenseCandidateScope(str, Enum):
+    """Finite candidate protocol, independent of the selected physical shape surface."""
+
+    EXHAUSTIVE = "exhaustive"
+    INSTALLED_VS_NATIVE_WMMA = "installed-vs-native-wmma"
+
+
+def _validate_candidate_scope(
+    scope: DenseCandidateScope, backend: str,
+    family: DensePreparedWeightFamily | None, architecture: str | None,
+) -> None:
+    """Reject unsupported narrowing before creating files or launching a trainer."""
+    if not isinstance(scope, DenseCandidateScope):
+        raise ValueError("dense candidate scope must be typed")
+    if scope is DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA and not (
+            backend.strip().lower() == "rocm"
+            and family is DensePreparedWeightFamily.NATIVE_QUANTISED
+            and architecture == "gfx1100"):
+        raise ValueError("installed-vs-native-wmma requires explicit ROCm NativeQuantised gfx1100")
+
+
 @dataclass(frozen=True)
 class DensePrefillCell:
     """One independently resumable source-format/geometry/M tournament."""
@@ -254,9 +285,11 @@ class DensePrefillCell:
     m: int
     prepared_family: DensePreparedWeightFamily | None = None
     gpu_architecture: str | None = None
+    candidate_scope: DenseCandidateScope = DenseCandidateScope.EXHAUSTIVE
 
     def __post_init__(self) -> None:
-        """Preserve legacy IDs when an explicit family names the old contract."""
+        """Preserve legacy IDs while rejecting incompatible candidate protocols."""
+        _validate_candidate_scope(self.candidate_scope,self.backend,self.prepared_family,self.gpu_architecture)
         if self.prepared_family is None:
             if self.gpu_architecture is not None:
                 raise ValueError("architecture scope is only supported by explicit native Q8")
@@ -266,9 +299,9 @@ class DensePrefillCell:
         legacy = (DensePreparedWeightFamily.INT8_BLOCKWISE
                   if self.backend == "rocm" and self.source_format.runtime_codebook("rocm") == 19
                   else DensePreparedWeightFamily.NATIVE_QUANTISED)
-        if self.prepared_family == legacy:
+        if self.prepared_family == legacy and self.gpu_architecture is None:
             object.__setattr__(self, "prepared_family", None)
-        elif not (self.backend == "rocm" and self.source_format.runtime_codebook("rocm") == 19
+        elif not (self.backend == "rocm"
                   and self.prepared_family == DensePreparedWeightFamily.NATIVE_QUANTISED):
             raise ValueError("unsupported explicit dense prepared family")
         if self.gpu_architecture is not None:
@@ -298,7 +331,7 @@ class DensePrefillCell:
             self.shape.n,
             self.shape.k,
             self.m,
-        ) + (("prepared_family", int(self.prepared_family)) if self.prepared_family is not None else ()) + (("gpu_architecture", self.gpu_architecture) if self.gpu_architecture is not None else ())
+        ) + (("prepared_family", int(self.prepared_family)) if self.prepared_family is not None else ()) + (("gpu_architecture", self.gpu_architecture) if self.gpu_architecture is not None else ()) + (("candidate_scope", self.candidate_scope.value) if self.candidate_scope is not DenseCandidateScope.EXHAUSTIVE else ())
 
     @property
     def cell_id(self) -> str:
@@ -332,6 +365,7 @@ class DensePrefillCell:
             "k": self.shape.k,
             **({"prepared_family": "native_quantised"} if self.prepared_family is not None else {}),
             **({"gpu_architecture": self.gpu_architecture} if self.gpu_architecture is not None else {}),
+            **({"candidate_scope": self.candidate_scope.value} if self.candidate_scope is not DenseCandidateScope.EXHAUSTIVE else {}),
         }
 
 
@@ -374,16 +408,23 @@ def dense_prefill_candidate_ids(
     *,
     canonical_kpart_available: bool = True,
     prepared_family: DensePreparedWeightFamily | None = None,
+    gpu_architecture: str | None = None,
+    candidate_scope: DenseCandidateScope = DenseCandidateScope.EXHAUSTIVE,
 ) -> tuple[str, ...]:
     """Return the complete byte-eligible inventory for one prepared family."""
 
     normalized = backend.strip().lower()
+    wmma = (ROCM_WMMA_CANDIDATE_IDS if normalized == "rocm" and gpu_architecture == "gfx1100"
+            and prepared_family == DensePreparedWeightFamily.NATIVE_QUANTISED else ())
     if prepared_family is not None and not isinstance(prepared_family, DensePreparedWeightFamily):
         raise ValueError("candidate inventory requires a typed prepared family")
+    _validate_candidate_scope(candidate_scope,normalized,prepared_family,gpu_architecture)
+    if candidate_scope is DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA:
+        return ("Auto", *ROCM_WMMA_CANDIDATE_IDS)
     if (normalized == "rocm" and source_format is not None
             and source_format.runtime_codebook("rocm") == 19
             and prepared_family == DensePreparedWeightFamily.NATIVE_QUANTISED):
-        return ROCM_NATIVE_Q8_CANDIDATE_IDS
+        return ROCM_NATIVE_Q8_CANDIDATE_IDS + wmma
     if prepared_family == DensePreparedWeightFamily.INT8_BLOCKWISE and not (
             normalized == "rocm" and source_format is not None and source_format.runtime_codebook("rocm") == 19):
         raise ValueError("expanded INT8 inventory requires an original ROCm Q8 source")
@@ -422,9 +463,9 @@ def dense_prefill_candidate_ids(
             return (
                 checked
                 + ROCM_Q6_FULL_TILE_CANDIDATE_IDS
-                + ROCM_CANDIDATE_IDS[-1:]
+                + ROCM_CANDIDATE_IDS[-1:] + wmma
             )
-        return ROCM_CANDIDATE_IDS
+        return ROCM_CANDIDATE_IDS + wmma
     raise ValueError(f"dense GPU prefill sweep does not support {backend!r}")
 
 
@@ -432,17 +473,20 @@ def production_dense_prefill_cells(
     backend: str,
     *, prepared_family: DensePreparedWeightFamily | None = None,
     gpu_architecture: str | None = None,
+    all_native_formats: bool = False,
+    candidate_scope: DenseCandidateScope = DenseCandidateScope.EXHAUSTIVE,
 ) -> tuple[DensePrefillCell, ...]:
     """Expand all formats, exact Qwen prefill geometries, and GPU M buckets."""
 
     normalized = backend.strip().lower()
     dense_prefill_candidate_ids(normalized)
+    _validate_candidate_scope(candidate_scope,normalized,prepared_family,gpu_architecture)
     if prepared_family is not None and (normalized != "rocm" or prepared_family != DensePreparedWeightFamily.NATIVE_QUANTISED):
         raise ValueError("explicit preparation scope supports only ROCm native Q8")
     return tuple(
-        DensePrefillCell(normalized, source_format, measurement.shape, m, prepared_family, gpu_architecture)
+        DensePrefillCell(normalized, source_format, measurement.shape, m, prepared_family, gpu_architecture, candidate_scope)
         for source_format in FORMAT_SPECS
-        if prepared_family is None or source_format.runtime_codebook("rocm") == 19
+        if prepared_family is None or all_native_formats or source_format.runtime_codebook("rocm") == 19
         for measurement in gpu_prefill_measurements()
         for m in measurement.m_values
     )
@@ -483,7 +527,7 @@ def _batch_group_key(cell: DensePrefillCell) -> tuple[object, ...]:
         cell.shape.name,
         cell.shape.n,
         cell.shape.k,
-    ) + (("prepared_family", int(cell.prepared_family)) if cell.prepared_family is not None else ()) + (("gpu_architecture", cell.gpu_architecture) if cell.gpu_architecture is not None else ())
+    ) + (("prepared_family", int(cell.prepared_family)) if cell.prepared_family is not None else ()) + (("gpu_architecture", cell.gpu_architecture) if cell.gpu_architecture is not None else ()) + (("candidate_scope", cell.candidate_scope.value) if cell.candidate_scope is not DenseCandidateScope.EXHAUSTIVE else ())
 
 
 def _validated_batch_cells(
@@ -662,7 +706,7 @@ def _read_aggregate_rows(
 
     allowed = set(dense_prefill_candidate_ids(
         cell.backend, cell.source_format,
-        canonical_kpart_available=True, prepared_family=cell.prepared_family,
+        canonical_kpart_available=True, prepared_family=cell.prepared_family, gpu_architecture=cell.gpu_architecture, candidate_scope=cell.candidate_scope,
     ))
     indexed: dict[str, dict[str, str]] = {}
     canonical_kpart_availability: set[bool] = set()
@@ -869,7 +913,9 @@ def _read_aggregate_rows(
                     and observed[2] == 1 and observed[3] in {0, 1, 2, 4}
                     and observed[4] == 0
                 )
-                if not (streaming_auto or cooperative or int8_blockwise):
+                wmma = (not int8 and producer == "native_wmma" and cell.gpu_architecture == "gfx1100"
+                        and observed in {(32, 32, 1, 0, 0), (64, 32, 1, 0, 0), (64, 64, 1, 0, 0), (128, 64, 1, 0, 0)})
+                if not (streaming_auto or cooperative or int8_blockwise or wmma):
                     raise ValueError(
                         f"{context}: invalid observed ROCm launch tuple {producer} {observed}"
                     )
@@ -886,7 +932,12 @@ def _read_aggregate_rows(
                     )
                 if candidate != "Auto":
                     components = candidate.split("/")
-                    if int8:
+                    if candidate.startswith("WMMA/"):
+                        if not wmma:
+                            raise ValueError(f"{context}: forced WMMA producer did not execute")
+                        expected_observed = (int(components[1].removeprefix("N")),
+                                             int(components[2].removeprefix("MT")), 1, 0, 0)
+                    elif int8:
                         expected_producer = {"INT8V3": "int8_blockwise_v3",
                                              "INT8V7": "int8_blockwise_v7"}.get(components[0])
                         if producer != expected_producer:
@@ -926,7 +977,7 @@ def _read_aggregate_rows(
     expected = set(dense_prefill_candidate_ids(
         cell.backend,
         cell.source_format,
-        canonical_kpart_available=canonical_kpart_available, prepared_family=cell.prepared_family,
+        canonical_kpart_available=canonical_kpart_available, prepared_family=cell.prepared_family, gpu_architecture=cell.gpu_architecture, candidate_scope=cell.candidate_scope,
     ))
     if set(indexed) != expected:
         raise ValueError(
@@ -946,7 +997,7 @@ def _read_timing_rows(
     """Authenticate contiguous native-event samples for every candidate."""
 
     expected = set(
-        dense_prefill_candidate_ids(cell.backend, cell.source_format, prepared_family=cell.prepared_family)
+        dense_prefill_candidate_ids(cell.backend, cell.source_format, prepared_family=cell.prepared_family, gpu_architecture=cell.gpu_architecture, candidate_scope=cell.candidate_scope)
         if expected_candidates is None else expected_candidates
     )
     samples: dict[str, list[float]] = {}
@@ -1042,7 +1093,7 @@ def validate_production_dense_prefill_cell(
     # names must not manufacture a different winner when HIP event ticks tie.
     candidate_order = {
         candidate: index for index, candidate in enumerate(
-            dense_prefill_candidate_ids(cell.backend, cell.source_format, prepared_family=cell.prepared_family))
+            dense_prefill_candidate_ids(cell.backend, cell.source_format, prepared_family=cell.prepared_family, gpu_architecture=cell.gpu_architecture, candidate_scope=cell.candidate_scope))
     }
     winners = sorted(aggregate,
         key=lambda candidate: (min(timing[candidate]), candidate_order[candidate]))
@@ -1082,6 +1133,7 @@ def _sweep_plan_payload(
     trainer: Mapping[str, object],
     warmup_runs: int,
     bench_runs: int,
+    installed_policy: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Construct the complete content-addressed sweep-plan payload."""
 
@@ -1095,12 +1147,24 @@ def _sweep_plan_payload(
     scopes = {cell.prepared_family for cell in cells}
     if len(scopes) != 1:
         raise ValueError("one dense corpus must retain one prepared-family protocol")
+    candidate_scopes = {cell.candidate_scope for cell in cells}
+    if len(candidate_scopes) != 1:
+        raise ValueError("one dense corpus must retain one candidate-scope protocol")
+    candidate_scope = next(iter(candidate_scopes))
     native_labels = {cell.source_format.label for cell in cells if cell.prepared_family is not None}
     native_targets = {cell.gpu_architecture for cell in cells if cell.prepared_family is not None}
     if native_targets and (None in native_targets or len(native_targets) != 1):
         raise ValueError("native Q8 collection requires one explicit architecture")
+    if installed_policy is not None:
+        if candidate_scope is not DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA:
+            raise ValueError("installed policy binding requires the explicit native-WMMA candidate scope")
+        from .dense_prefill_policy_binding import validate_installed_policy
+        validate_installed_policy(installed_policy, trainer)
     body: dict[str, object] = {
-        "schema_version": SWEEP_PLAN_SCHEMA,
+        "schema_version": (BOUND_SWEEP_PLAN_SCHEMA if installed_policy is not None else
+                           SWEEP_PLAN_SCHEMA if candidate_scope is DenseCandidateScope.EXHAUSTIVE else SCOPED_SWEEP_PLAN_SCHEMA),
+        **({"installed_policy": dict(installed_policy)} if installed_policy is not None else {}),
+        **({"candidate_scope": candidate_scope.value} if candidate_scope is not DenseCandidateScope.EXHAUSTIVE else {}),
         "backend": normalized,
         "format_registry_digest": registry_digest(),
         "shape_manifest_digest": load_shape_manifest().digest(),
@@ -1108,7 +1172,9 @@ def _sweep_plan_payload(
         "candidate_ids_by_source_format": {
             source_format.label: list(dense_prefill_candidate_ids(
                 normalized, source_format,
-                prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED if source_format.label in native_labels else None
+                prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED if source_format.label in native_labels else None,
+                gpu_architecture=next(iter(native_targets)) if source_format.label in native_labels else None,
+                candidate_scope=candidate_scope if source_format.label in native_labels else DenseCandidateScope.EXHAUSTIVE,
             ))
             for source_format in FORMAT_SPECS
         },
@@ -1133,8 +1199,15 @@ def _read_sweep_plan(path: Path) -> dict[str, object]:
         payload = json.load(handle)
     if not isinstance(payload, dict):
         raise ValueError(f"{path}: sweep plan must be a JSON object")
-    if payload.get("schema_version") != SWEEP_PLAN_SCHEMA:
+    schema = payload.get("schema_version")
+    if schema not in (SWEEP_PLAN_SCHEMA, SCOPED_SWEEP_PLAN_SCHEMA, BOUND_SWEEP_PLAN_SCHEMA):
         raise ValueError(f"{path}: unsupported sweep-plan schema")
+    if ((schema == SWEEP_PLAN_SCHEMA and "candidate_scope" in payload) or
+            (schema in (SCOPED_SWEEP_PLAN_SCHEMA, BOUND_SWEEP_PLAN_SCHEMA) and payload.get("candidate_scope") !=
+             DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA.value)):
+        raise ValueError(f"{path}: sweep-plan schema and candidate scope disagree")
+    if (schema == BOUND_SWEEP_PLAN_SCHEMA) != ("installed_policy" in payload):
+        raise ValueError(f"{path}: sweep schema and installed-policy binding disagree")
     recorded_digest = payload.get("plan_digest")
     unsigned = dict(payload)
     unsigned.pop("plan_digest", None)
@@ -1145,6 +1218,9 @@ def _read_sweep_plan(path: Path) -> dict[str, object]:
         payload.get("trainer_provenance_digest") != _mapping_digest(trainer)
     ):
         raise ValueError(f"{path}: trainer provenance digest mismatch")
+    if schema == BOUND_SWEEP_PLAN_SCHEMA:
+        from .dense_prefill_policy_binding import validate_installed_policy
+        validate_installed_policy(payload["installed_policy"], trainer)
     return payload
 
 
@@ -1156,12 +1232,13 @@ def write_sweep_plan(
     *,
     warmup_runs: int = DEFAULT_WARMUP_RUNS,
     bench_runs: int = DEFAULT_BENCH_RUNS,
+    installed_policy: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     """Create one immutable plan, or prove an existing plan is identical."""
 
     path = Path(path)
     expected = _sweep_plan_payload(
-        backend, cells, trainer, warmup_runs, bench_runs
+        backend, cells, trainer, warmup_runs, bench_runs, installed_policy
     )
     if path.exists():
         existing = _read_sweep_plan(path)
@@ -1190,7 +1267,7 @@ def load_sweep_plan(
     trainer = existing["trainer_provenance"]
     assert isinstance(trainer, dict)
     expected = _sweep_plan_payload(
-        backend, cells, trainer, warmup_runs, bench_runs
+        backend, cells, trainer, warmup_runs, bench_runs, existing.get("installed_policy")
     )
     if existing != expected:
         raise ValueError(
@@ -1198,6 +1275,24 @@ def load_sweep_plan(
             "the immutable sweep plan"
         )
     return existing
+
+
+@lru_cache(maxsize=32)
+def _canonical_cell_catalog(backend: str, prepared_family: DensePreparedWeightFamily | None = None,
+                            gpu_architecture: str | None = None,
+                            candidate_scope: DenseCandidateScope = DenseCandidateScope.EXHAUSTIVE
+                            ) -> Mapping[str, DensePrefillCell]:
+    """Share immutable source-owned inventory across repeated evidence validation.
+
+    The catalog contains only frozen declarations and never caches plan bytes,
+    completion markers, clocks or producer evidence. Every read below still
+    authenticates those mutable artifacts. Reconstructing and hashing thousands
+    of unrelated declarations for every profile request otherwise dominates the
+    device-free publication and regression loop.
+    """
+    return MappingProxyType({cell.cell_id: cell for cell in production_dense_prefill_cells(
+        backend, prepared_family=prepared_family, gpu_architecture=gpu_architecture,
+        all_native_formats=prepared_family is not None, candidate_scope=candidate_scope)})
 
 
 def load_planned_dense_prefill_cells(
@@ -1214,17 +1309,15 @@ def load_planned_dense_prefill_cells(
     if not isinstance(planned_rows, list) or not planned_rows:
         raise ValueError(f"{path}: sweep plan has no cells")
 
-    available = {
-        cell.cell_id: cell
-        for cell in production_dense_prefill_cells(normalized)
-    }
+    available = dict(_canonical_cell_catalog(normalized))
     if normalized == "rocm":
-        targets = {row.get("gpu_architecture") for row in planned_rows if isinstance(row, dict) and row.get("prepared_family") == "native_quantised"}
-        for target in targets:
+        targets = {(row.get("gpu_architecture"),DenseCandidateScope(row.get("candidate_scope","exhaustive")))
+                   for row in planned_rows if isinstance(row, dict) and row.get("prepared_family") == "native_quantised"}
+        for target, candidate_scope in targets:
             if target is None:
                 raise ValueError("native Q8 plan lacks its architecture; unqualified records cannot be relabeled")
-            available.update({cell.cell_id: cell for cell in production_dense_prefill_cells(
-                normalized, prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture=target)})
+            available.update(_canonical_cell_catalog(
+                normalized, DensePreparedWeightFamily.NATIVE_QUANTISED, target, candidate_scope))
     selected = []
     seen: set[str] = set()
     for index, row in enumerate(planned_rows):
@@ -1419,6 +1512,10 @@ def _cell_environment(
     if cell.backend == "cuda":
         environment.pop("ROCR_VISIBLE_DEVICES", None)
         environment.pop("HIP_VISIBLE_DEVICES", None)
+        # Canonical collection owns both the complete tile inventory and the
+        # native peak denominator; inherited diagnostic overrides cannot qualify it.
+        environment.pop("LLAMINAR_CUDA_NATIVE_GEMM_PEAK_TC_TOPS", None)
+        environment.pop("LLAMINAR_TILE_SWEEP_TILES", None)
         environment.update({
             "CUDA_VISIBLE_DEVICES": str(device),
             "LLAMINAR_TILE_SWEEP_FORMAT": cell.source_format.label,
@@ -1453,10 +1550,17 @@ def _cell_environment(
         })
     if cell.prepared_family is not None:
         if cell.gpu_architecture is None:
-            raise ValueError("native Q8 execution requires its expected architecture")
+            raise ValueError("native execution requires its expected architecture")
         environment["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_PREPARED_FAMILY"] = "native_quantised"
         environment["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_ARCHITECTURE"] = cell.gpu_architecture
-        environment["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS"] = ",".join(ROCM_NATIVE_Q8_CANDIDATE_IDS)
+        environment["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS"] = ",".join(
+            dense_prefill_candidate_ids(
+                cell.backend, cell.source_format,
+                prepared_family=cell.prepared_family,
+                gpu_architecture=cell.gpu_architecture,
+                candidate_scope=cell.candidate_scope,
+            )
+        )
     return environment
 
 
@@ -1745,6 +1849,7 @@ def run_missing_accelerator_cells(
     bench_runs: int = DEFAULT_BENCH_RUNS,
     maximum_new_cells: int | None = None,
     producer: Mapping[str, object] | None = None,
+    installed_policy: Mapping[str, object] | None = None,
 ) -> tuple[DensePrefillCell, ...]:
     """Run distinct missing cells concurrently, one worker per physical GPU."""
 
@@ -1768,6 +1873,8 @@ def run_missing_accelerator_cells(
         trainer_provenance(binary, backend)
         if producer is None else dict(producer)
     )
+    if installed_policy is None and (root / SWEEP_PLAN_FILENAME).exists():
+        installed_policy = _read_sweep_plan(root / SWEEP_PLAN_FILENAME).get("installed_policy")
     plan = write_sweep_plan(
         root / SWEEP_PLAN_FILENAME,
         backend,
@@ -1775,6 +1882,7 @@ def run_missing_accelerator_cells(
         producer,
         warmup_runs=warmup_runs,
         bench_runs=bench_runs,
+        installed_policy=installed_policy,
     )
     missing = [
         cell for cell in cells
@@ -1941,11 +2049,13 @@ def _parse_positive_ints(raw: str) -> tuple[int, ...]:
 
 def _filtered_cells(args: argparse.Namespace) -> tuple[DensePrefillCell, ...]:
     family = (DensePreparedWeightFamily.NATIVE_QUANTISED
-              if getattr(args, "prepared_family", "source-default") == "native-quantised-q8" else None)
+              if getattr(args, "prepared_family", "source-default") in ("native-quantised-q8", "native-quantised") else None)
     target = getattr(args, "gpu_architecture", None)
     if (family is not None) != (target is not None):
-        raise ValueError("--gpu-architecture is required only for native-quantised-q8")
-    cells = production_dense_prefill_cells(args.backend, prepared_family=family, gpu_architecture=target)
+        raise ValueError("--gpu-architecture is required for explicit native-quantised preparation")
+    cells = production_dense_prefill_cells(args.backend, prepared_family=family, gpu_architecture=target,
+        all_native_formats=getattr(args, "prepared_family", "source-default") == "native-quantised",
+        candidate_scope=DenseCandidateScope(getattr(args,"candidate_scope","exhaustive")))
     if args.format:
         selected = {value.upper() for value in args.format}
         cells = tuple(
@@ -1972,9 +2082,12 @@ def main() -> int:
         subparser.add_argument("--backend", choices=("cuda", "rocm"), required=True)
         subparser.add_argument("--output-dir", type=Path, required=True)
         subparser.add_argument("--format", action="append")
-        subparser.add_argument("--prepared-family", choices=("source-default", "native-quantised-q8"),
-                               default="source-default", help="Explicit ROCm native-Q8 ABI; source-default preserves old corpus identities")
+        subparser.add_argument("--prepared-family", choices=("source-default", "native-quantised-q8", "native-quantised"),
+                               default="source-default", help="Original ROCm native payloads: all formats or Q8-only; source-default preserves historical identities")
         subparser.add_argument("--gpu-architecture", help="Expected native target; independently authenticated by native CSV metadata")
+        subparser.add_argument("--candidate-scope", choices=tuple(scope.value for scope in DenseCandidateScope),
+                               default=DenseCandidateScope.EXHAUSTIVE.value,
+                               help="Exact candidate protocol; narrowing requires native-quantised gfx1100 and a fresh plan")
         subparser.add_argument("--shape", action="append")
         subparser.add_argument("--m", type=_parse_positive_ints)
         subparser.add_argument(
@@ -1985,8 +2098,12 @@ def main() -> int:
         )
     plan_command = subparsers.choices["plan"]
     plan_command.add_argument("--binary", type=Path, required=True)
+    plan_command.add_argument("--installed-base-include", type=Path,
+                              help="freeze the actual compiled installed base before selective collection")
     run = subparsers.choices["run"]
     run.add_argument("--binary", type=Path, required=True)
+    run.add_argument("--installed-base-include", type=Path,
+                     help="freeze a new installed base or require exact bytes when resuming")
     run.add_argument("--devices", type=_parse_devices, required=True)
     run.add_argument("--maximum-new-cells", type=int)
 
@@ -1995,6 +2112,19 @@ def main() -> int:
         parser.error("timing cardinalities must be positive")
     cells = _filtered_cells(args)
     plan_path = args.output_dir / SWEEP_PLAN_FILENAME
+    installed_policy = None
+    if args.command in ("plan", "run"):
+        if plan_path.exists():
+            installed_policy = _read_sweep_plan(plan_path).get("installed_policy")
+        if args.installed_base_include is not None:
+            if installed_policy is not None:
+                if args.installed_base_include.read_bytes().decode("utf-8") != installed_policy["base_text"]:
+                    raise ValueError("resumed dense policy differs from its frozen original base")
+            else:
+                if plan_path.exists():
+                    raise ValueError("an existing unbound plan cannot acquire an installed-base witness")
+                from .dense_prefill_policy_binding import freeze_installed_policy
+                installed_policy = freeze_installed_policy(args.installed_base_include, args.binary)
     if args.command == "plan":
         producer = trainer_provenance(args.binary, args.backend)
         require_release_trainer(producer)
@@ -2005,6 +2135,7 @@ def main() -> int:
             producer,
             warmup_runs=args.warmup_runs,
             bench_runs=args.bench_runs,
+            installed_policy=installed_policy,
         )
         print(f"planned {len(cells)} cells in {plan_path}")
     elif args.command == "run":
@@ -2017,6 +2148,7 @@ def main() -> int:
             args.devices,
             warmup_runs=args.warmup_runs,
             bench_runs=args.bench_runs,
+            installed_policy=installed_policy,
             maximum_new_cells=args.maximum_new_cells,
             producer=producer,
         )

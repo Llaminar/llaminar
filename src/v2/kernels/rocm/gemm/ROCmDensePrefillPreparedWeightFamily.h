@@ -42,6 +42,7 @@ enum class DensePrefillWeightFamily : std::uint8_t
     {
     case VNNIPrefillProducer::NativeCooperative:
     case VNNIPrefillProducer::NativeStreaming:
+    case VNNIPrefillProducer::NativeWmma:
         return family == DensePrefillWeightFamily::NativeQuantised;
     case VNNIPrefillProducer::Int8BlockwiseV3:
     case VNNIPrefillProducer::Int8BlockwiseV7:

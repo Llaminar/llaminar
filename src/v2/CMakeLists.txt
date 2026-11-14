@@ -718,6 +718,8 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmNativeQuantisedGemmShard5.hip
         kernels/rocm/gemm/ROCmNativeQuantisedGemmShard6.hip
         kernels/rocm/gemm/ROCmNativeQuantisedGemmShard7.hip
+        kernels/rocm/gemm/ROCmMoEGroupedWmma.hip # Source-exact grouped gfx1100 matrix leaves
+        kernels/rocm/gemm/ROCmNativeQuantisedWmma.hip # Independent native gfx1100 WMMA compilation
         kernels/rocm/gemm/ROCmSmallNFP32ProjectionKernels.hip # Graph-capturable FP32 small-output projection kernels
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
         kernels/rocm/moe/ROCmMoEGroupedIntermediateExchange.hip # lossless SwiGLU/scales exchange boundary
@@ -751,6 +753,7 @@ if(HAVE_ROCM)
         kernels/rocm/attention/ROCmQwen4ExpBranchConcat.hip
         kernels/rocm/ops/ROCmTPRankOrderedReductionKernels.hip # Batch-invariant rank-ordered TP sums
         # MoE (Mixture of Experts) kernels
+        kernels/rocm/moe/ROCmRouterQ8Prefill.hip             # Native gfx1100 exact router tiles
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
         kernels/rocm/moe/ROCmMoEOverlayActivationPacketKernels.hip # Device-owned node-local sparse activation packets
         kernels/rocm/moe/ROCmMoEOverlayDeviceControllerKernels.hip # Node-local sole-controller lifecycle
@@ -887,6 +890,14 @@ if(HAVE_ROCM)
         ${ROCM_KERNEL_SOURCES}
         PROPERTIES COMPILE_FLAGS "-O3 -DNDEBUG"
     )
+    # WMMA owns an explicit wave64 fragment layout on gfx1100. Source options follow the
+    # ordered backend's wave64 default; gfx906 retains its only native wave64
+    # mode and emits no WMMA entry. Both targets retain the same spill guard.
+    set_property(SOURCE kernels/rocm/gemm/ROCmNativeQuantisedWmma.hip
+        kernels/rocm/moe/ROCmRouterQ8Prefill.hip
+        kernels/rocm/gemm/ROCmMoEGroupedWmma.hip
+        kernels/rocm/attention/ROCmFlashAttentionKernels.hip
+        APPEND PROPERTY COMPILE_OPTIONS "-mwavefrontsize64")
     
     # NOTE: ROCm kernel ITensorGemm adapters (ROCmFloatingPointGemmKernel.cpp)
     # are added to llaminar2_core with target_sources() below, compiled with regular C++ compiler (NOT hipcc)

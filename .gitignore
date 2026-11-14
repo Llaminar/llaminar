@@ -57,6 +57,8 @@ Thumbs.db
 !tests/v2/performance/kernels/fixtures/*.csv
 !tests/v2/performance/kernels/cuda/gemm/fixtures/
 !tests/v2/performance/kernels/cuda/gemm/fixtures/*.csv
+!tests/v2/performance/kernels/rocm/fixtures/
+!tests/v2/performance/kernels/rocm/fixtures/*.csv
 
 # Temporary files
 *.backup

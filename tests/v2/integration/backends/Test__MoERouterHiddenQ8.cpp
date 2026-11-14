@@ -22,6 +22,10 @@
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
 #include "utils/TestTensorFactory.h"
 #include "utils/DebugEnv.h"
+#ifdef HAVE_ROCM
+#include "kernels/rocm/moe/ROCmRouterQ8Prefill.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#endif
 
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -32,6 +36,7 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -97,12 +102,17 @@ namespace
      * @param width Hidden columns; 96 exercises a partially populated wave64.
      * @param kind Production prefill or grouped serial-equivalent verification.
      * @param scale_range Include finite half-scale limits and the captured tiny block.
+     * @param native_wmma Require actual gfx1100 WMMA for multi-row publication.
      */
-    void prove(DeviceId device, int width, MoERouteLaunchKind kind, bool scale_range = false)
+    void prove(DeviceId device, int width, MoERouteLaunchKind kind, bool scale_range = false, bool native_wmma = false)
     {
         auto &context = GPUDeviceContextPool::instance().getContext(device);
         context.submitAndWait([&]
         {
+#ifdef HAVE_ROCM
+            std::optional<rocm::ScopedRouterQ8PrefillMode> native_scope;
+            if (native_wmma) native_scope.emplace(rocm::RouterQ8PrefillMode::NativeWmma);
+#endif
             constexpr int capacity = 512, experts = 256, top_k = 8;
             auto *backend = getBackendFor(device);
             void *stream = context.defaultStream();
@@ -176,6 +186,14 @@ namespace
                     require(graph->beginCapture(), "router Q8 capture begin");
                     require(enqueue(), "router Q8 capture body");
                     require(graph->endCapture(), "router Q8 capture end");
+                }
+                if (native_wmma && rows > 1)
+                {
+                    std::vector<GPUGraphKernelNodeInfo> nodes;
+                    ASSERT_TRUE(graph->inspectKernelNodes(nodes));
+                    ASSERT_TRUE(std::any_of(nodes.begin(),nodes.end(),[](const auto &node) {
+                        return node.name.find("router_q8_prefill_detail") != std::string::npos;
+                    }));
                 }
                 require(graph->instantiate(), "router Q8 graph instantiation");
                 ASSERT_NE(publication->quantized_rows, nullptr);
@@ -331,6 +349,20 @@ namespace
     }
 #endif
 #ifdef HAVE_ROCM
+    /** @test Native matrix publication retains finite scales at half underflow/overflow boundaries. */
+    TEST(MoERouterHiddenQ8ScaleRange, ROCmWmmaCapturedReplay)
+    {
+        initializeROCmHardwareMetadata();
+        int ordinal = -1;
+        for (int i = 0; i < int(rocmHardwareMetadata().size()); ++i)
+        {
+            const auto &isa = rocmHardwareMetadata().at(i).isa_target;
+            if (isa == "gfx1100" || isa.starts_with("gfx1100:")) { ordinal = i; break; }
+        }
+        if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+        for (int width : {96,2048,2560,8192})
+            prove(DeviceId::rocm(ordinal),width,MoERouteLaunchKind::GroupedPrefill,true,true);
+    }
     /** @test ROCm verifier and grouped-prefill router publication share half limits. */
     TEST(MoERouterHiddenQ8ScaleRange, ROCm) {
         prove(DeviceId::rocm(0),96,MoERouteLaunchKind::DecodeEquivalentVerifier,true);

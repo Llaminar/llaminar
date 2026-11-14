@@ -13,7 +13,9 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 from dataclasses import dataclass, field
+import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import shlex
@@ -45,10 +47,23 @@ def parse_metadata(metadata: str) -> list[KernelSpills]:
     fields fail closed. This is deliberately not a general YAML configuration
     parser and needs no build-time Python package beyond the standard library.
     """
-    if "amdhsa.kernels: []" in metadata.splitlines():
-        return []
-    if metadata.splitlines().count("amdhsa.kernels:") != 1:
+    lines = metadata.splitlines()
+    inventory = [line for line in lines if line.startswith("amdhsa.kernels:")]
+    if len(inventory) != 1:
         raise SpillGuardError("missing or repeated amdhsa.kernels metadata")
+    header = inventory[0]
+    match = re.fullmatch(r"amdhsa\.kernels:[ \t]*(\[\])?[ \t]*", header)
+    if match is None:
+        raise SpillGuardError("malformed amdhsa.kernels inventory")
+    if match[1] is not None:
+        # LLVM aligns an empty inventory with two spaces on some targets.
+        # It is valid only as the sole inventory, with no nested kernel rows.
+        for line in lines[lines.index(header) + 1:]:
+            if line and not line[0].isspace():
+                break
+            if line.strip():
+                raise SpillGuardError("empty kernel inventory contains nested records")
+        return []
     records: list[KernelSpills] = []
     current: dict[str, str] | None = None
     names: set[str] = set()
@@ -76,8 +91,8 @@ def parse_metadata(metadata: str) -> list[KernelSpills]:
                                    current["uses_dynamic_stack"] == "true"))
 
     inside = False
-    for line in metadata.splitlines():
-        if line == "amdhsa.kernels:":
+    for line in lines:
+        if line == header:
             inside = True
             continue
         if not inside:
@@ -301,6 +316,115 @@ def preserve_device_diagnostics(command: list[str]) -> list[str]:
     return result
 
 
+def merged_device_dependencies(host: str, devices: list[str]) -> str:
+    """Join compiler-owned Make prerequisites onto the original object rule.
+
+    Keep escaped path tokens verbatim, including spaces, dollars and colons.
+    Additional host phony rules remain intact. One object rule retains the
+    caller's original -MT/-MQ spelling without reconstructing escaped targets.
+    """
+    def first_rule(text: str) -> tuple[str, str, str]:
+        line, _, rest = text.replace("\\\n", "").partition("\n")
+        escaped = False
+        for index, character in enumerate(line):
+            if character == ":" and not escaped:
+                if not line[:index].strip() or not line[index + 1:].strip():
+                    break
+                return line[:index + 1], line[index + 1:], rest
+            escaped = character == "\\" and not escaped
+        raise SpillGuardError("incomplete HIP compiler dependency rule")
+
+    target, prerequisites, rest = first_rule(host)
+    for device in devices:
+        _, additional, _ = first_rule(device)
+        prerequisites += " " + additional.strip()
+    return target + prerequisites + "\n" + rest
+
+
+def compile_hip(command: list[str], output: Path) -> subprocess.CompletedProcess:
+    """Authenticate every device preprocessor input before a compiler-cache hit.
+
+    Clang's ordinary HIP preprocessing and depfile describe only the host pass.
+    Device-conditional bodies can therefore reuse a stale preprocessed cache
+    entry; device-only includes can evade both ccache and Ninja entirely. Each
+    selected architecture contributes its actual preprocessed bytes to ccache
+    identity and its compiler-owned prerequisites to the final Ninja depfile.
+    Private temporary files permit unrestricted parallel builds. Cache hits still
+    pass the final spill audit, and unchanged inputs retain ordinary cache hits.
+    """
+    expanded: list[str] = []
+    for argument in command:
+        expanded.extend(shlex.split(Path(argument[1:]).read_text())
+                        if argument.startswith("@") else [argument])
+    cached = Path(expanded[0]).name == "ccache"
+    native = expanded[1:] if cached else expanded
+    if not native:
+        raise SpillGuardError("missing HIP compiler executable")
+    base, targets, depfiles = [native[0]], [], []
+    index = 1
+    while index < len(native):
+        argument = native[index]
+        if argument in ("-o", "--output-file", "-MF", "-MT", "-MQ", "--offload-arch"):
+            if index + 1 == len(native):
+                raise SpillGuardError(f"missing HIP compiler operand after {argument}")
+            value = native[index + 1]
+            if argument == "-MF":
+                depfiles.append(Path(value))
+            elif argument == "--offload-arch":
+                targets.extend(value.split(","))
+            index += 2
+            continue
+        if argument.startswith("--offload-arch="):
+            targets.extend(argument.partition("=")[2].split(","))
+        elif argument.startswith("-MF"):
+            depfiles.append(Path(argument[3:]))
+        elif argument not in ("-c", "-MD", "-MMD", "-MP") and not argument.startswith("--output-file="):
+            base.append(argument)
+        index += 1
+    if len(depfiles) != 1 or not targets or any(not target for target in targets) or len(set(targets)) != len(targets):
+        raise SpillGuardError("HIP compilation needs one depfile and explicit unique device targets")
+    with tempfile.TemporaryDirectory(prefix="llaminar-hip-inputs-") as directory:
+        root = Path(directory)
+        identities, dependencies = [], []
+        for number, target in enumerate(targets):
+            preprocessed, dependency = root / f"device-{number}.i", root / f"device-{number}.d"
+            # The HIP driver ignores -MD/-MF in device-only -E mode. Forward
+            # dependency ownership to its cc1 frontend explicitly instead.
+            preprocess = subprocess.run([
+                *base, "--offload-device-only", f"--offload-arch={target}", "-E",
+                "-Xclang", "-sys-header-deps",
+                "-Xclang", "-dependency-file", "-Xclang", str(dependency),
+                "-Xclang", "-MT", "-Xclang", "hip-device-input",
+                "-o", str(preprocessed)], capture_output=True, text=True, check=False)
+            if preprocess.returncode:
+                raise SpillGuardError(f"{target}: device input preprocessing failed:\n{preprocess.stderr}")
+            if not preprocessed.is_file() or not preprocessed.stat().st_size or not dependency.is_file():
+                raise SpillGuardError(f"{target}: missing preprocessed device input or dependencies")
+            with preprocessed.open("rb") as stream:
+                digest = hashlib.file_digest(stream, "sha256").hexdigest()
+            identities.append({"target": target, "preprocessed_sha256": digest,
+                               "diagnostic_sha256": hashlib.sha256(preprocess.stderr.encode()).hexdigest()})
+            dependencies.append(dependency.read_text())
+        environment = dict(os.environ)
+        if cached:
+            identity = root / "device-input-identity.json"
+            identity.write_text(json.dumps({"contract": "llaminar-hip-device-input-v1",
+                                           "devices": identities}, sort_keys=True) + "\n")
+            configured = subprocess.run([expanded[0], "--get-config", "extra_files_to_hash"],
+                                        capture_output=True, text=True, check=False)
+            if configured.returncode:
+                raise SpillGuardError(f"cannot authenticate existing ccache extra inputs: {configured.stderr}")
+            if os.pathsep in str(identity):
+                raise SpillGuardError("HIP identity temporary directory contains the ccache path separator")
+            environment["CCACHE_EXTRAFILES"] = os.pathsep.join(
+                value for value in (configured.stdout.strip(), str(identity)) if value)
+        result = subprocess.run(preserve_device_diagnostics(expanded), text=True,
+                                capture_output=True, check=False, env=environment)
+        if result.returncode == 0:
+            depfiles[0].write_text(merged_device_dependencies(depfiles[0].read_text(), dependencies))
+        return result
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the canonical compiler/cache chain, then certify its optimized output."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -317,11 +441,11 @@ def main(argv: list[str] | None = None) -> int:
         if not command or args.config not in ("Debug", "Release", "Integration"):
             raise SpillGuardError("missing compiler command or unsupported build configuration")
         output = output_path(command)
-        result = subprocess.run(preserve_device_diagnostics(command), text=True,
-                                capture_output=True, check=False)
+        result = compile_hip(command, output)
         if result.returncode:
             sys.stdout.write(result.stdout or "")
             sys.stderr.write(result.stderr or "")
+            output.unlink(missing_ok=True)
             return result.returncode
         if args.config != "Debug":
             functions, diagnostic = allocation_evidence(result.stdout or "")

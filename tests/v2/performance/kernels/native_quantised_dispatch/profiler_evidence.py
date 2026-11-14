@@ -32,7 +32,7 @@ import os
 import shutil
 import tempfile
 from concurrent.futures import ProcessPoolExecutor
-from dataclasses import asdict, dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields, replace
 from enum import Enum
 from functools import cached_property
 from pathlib import Path
@@ -86,7 +86,7 @@ PROFILER_TIMING_STRATUM_FRACTION = 0.05
 PROFILER_EVIDENCE_SCHEMA_VERSION = "native-quantised-profiler-evidence-v1"
 PROFILER_METRIC_SET_VERSION = "native-quantised-profiler-metrics-v1"
 PROFILER_COLLECTOR_VERSION = (
-    "native-quantised-isolated-profiler-v8-ncu-si-byte-units"
+    "native-quantised-isolated-profiler-v10-native-rocm-device-closure"
 )
 SUPPORTED_PROFILER_COLLECTOR_VERSIONS = frozenset({
     "native-quantised-isolated-profiler-v1",
@@ -96,6 +96,8 @@ SUPPORTED_PROFILER_COLLECTOR_VERSIONS = frozenset({
     "native-quantised-isolated-profiler-v5-direct-per-tid-gpu-stream-batched",
     "native-quantised-isolated-profiler-v6-rocm-instruction-work",
     "native-quantised-isolated-profiler-v7-rocm-exact-process-batches",
+    "native-quantised-isolated-profiler-v8-ncu-si-byte-units",
+    "native-quantised-isolated-profiler-v9-native-rocm-counter-policy",
     PROFILER_COLLECTOR_VERSION,
 })
 PROFILE_PROTOCOL = "isolated-production-candidate-launch-v1"
@@ -2415,14 +2417,24 @@ ROCM_METRIC_DEFINITIONS = (
 )
 
 
-def metric_definitions(backend: Backend) -> tuple[MetricDefinition, ...]:
-    """Return the exact v1 metric inventory for one backend."""
+def metric_definitions(backend: Backend, architecture_class: str | None = None) -> tuple[MetricDefinition, ...]:
+    """Retain metric identities while enforcing the measured architecture's counter contract.
+
+    gfx1100 has no VALUBusy metric. Its first-class policy requires positive
+    GPU activity and wave counts instead; unavailable VALU utilization is
+    explicit and cannot be relabeled as compute throughput. Legacy records
+    retain their original required fields.
+    """
 
     if backend == Backend.CPU:
         return CPU_METRIC_DEFINITIONS
     if backend == Backend.CUDA:
         return CUDA_METRIC_DEFINITIONS
     if backend == Backend.ROCM:
+        if architecture_class == "gfx1100":
+            return tuple(replace(item, required=False) if item.metric_id == "gpu.valu_busy_pct" else
+                         replace(item, required=True) if item.metric_id == "gpu.wavefront_count" else item
+                         for item in ROCM_METRIC_DEFINITIONS)
         return ROCM_METRIC_DEFINITIONS
     raise ValueError(f"unsupported profiler backend {backend}")
 
@@ -2518,8 +2530,8 @@ class ProfiledDispatch:
             "metrics": [metric.canonical_mapping() for metric in self.metrics],
         }
 
-    def validate(self, backend: Backend) -> None:
-        """Require complete metric coverage and valid physical geometry."""
+    def validate(self, backend: Backend, architecture_class: str | None = None) -> None:
+        """Require architecture-owned metric coverage and valid physical geometry."""
 
         if self.dispatch_index < 0:
             raise ValueError("dispatch_index must be non-negative")
@@ -2541,7 +2553,7 @@ class ProfiledDispatch:
                 if geometry is None or len(geometry) != 3 or any(value <= 0 for value in geometry):
                     raise ValueError(f"GPU {name} must contain three positive dimensions")
 
-        definitions = {item.metric_id: item for item in metric_definitions(backend)}
+        definitions = {item.metric_id: item for item in metric_definitions(backend, architecture_class)}
         observed = {metric.metric_id: metric for metric in self.metrics}
         if len(observed) != len(self.metrics):
             raise ValueError("profiled dispatch contains duplicate metric IDs")
@@ -2553,6 +2565,10 @@ class ProfiledDispatch:
             )
         for metric_id, definition in definitions.items():
             observed[metric_id].validate(definition)
+        if backend == Backend.ROCM and architecture_class == "gfx1100":
+            for metric_id in ("gpu.gpu_busy_pct", "gpu.wavefront_count"):
+                if observed[metric_id].value is None or observed[metric_id].value <= 0:
+                    raise ValueError(f"{metric_id}: gfx1100 counters lack positive dispatch activity; check stable power state")
 
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> "ProfiledDispatch":
@@ -2673,8 +2689,15 @@ class ProfilerEvidence:
                 range(len(self.dispatches))
             ):
                 raise ValueError("profiled dispatches must have contiguous launch order")
+            current_policy = self.collector_version in {
+                PROFILER_COLLECTOR_VERSION, "native-quantised-isolated-profiler-v9-native-rocm-counter-policy"}
+            if (request.operation_kind == "ROCmNativeQuantisedDensePrefill" and
+                    self.collector_version != PROFILER_COLLECTOR_VERSION):
+                raise ValueError("native prefill requires the authenticated native counter policy and exact executable/core closure")
             for dispatch in self.dispatches:
-                dispatch.validate(request.backend)
+                # Retained evidence keeps the requirements under which it was
+                # collected. Only the new collector owns native RDNA policy.
+                dispatch.validate(request.backend, request.architecture_class if current_policy else None)
             return
 
         _required_text("status_reason", self.status_reason)

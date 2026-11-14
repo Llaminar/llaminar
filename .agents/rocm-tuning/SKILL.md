@@ -63,6 +63,14 @@ available architecture. Hardware that is absent stays explicitly unqualified.
 New wave policies or MMA prefill require their own implemented precision,
 layout, shape, resource, capture and numerical contracts before installation.
 
+The HIP compiler launcher also authenticates each target's device-preprocessed
+inputs in ccache identity and publishes the complete device dependency closure
+to Ninja. Host-only HIP preprocessing cannot qualify device-conditional edits.
+Keep this authority enabled during tuning, including response-file builds and
+cache hits. The compiler-owned `HIPDeviceInputIdentityCompilation` preflight
+proof covers changed headers, warm cache reuse, native resource changes and
+failed-input retirement without requiring an accelerator.
+
 ## Production hot-path invariants
 
 ROCm kernel tuning must preserve the production execution architecture, not
@@ -150,6 +158,81 @@ and retain unprofiled Release timing as the throughput authority.
 ---
 
 ## Profiler attachment and evidence rules
+
+### gfx1100 counter collection
+
+gfx1100 (RDNA 3) needs a stable profiling power state to collect meaningful
+hardware counters. In AUTO mode, perfmon clocks can be gated off: rocprofv3 may
+exit successfully and emit real dispatch timestamps while reporting zero
+activity. A successful tool exit is therefore insufficient qualification. See
+the SDK's [stable-power requirement](https://rocm.docs.amd.com/projects/rocprofiler-sdk/en/docs-10.1.0/what-is-rocprofiler-sdk.html)
+and the procedure below.
+
+1. Resolve the actual gfx1100 participant by native ISA and UUID/PCI identity.
+   Select that physical card in both HIP visibility and AMD SMI; their integer
+   ordinals are not interchangeable. Verify the card has no competing work.
+2. Use `amd-smi` from the same `ROCM_PATH` as the profiler. Record the current
+   mode with `amd-smi metric --gpu <PCI-BDF> --perf-level --json`. Use the API/CLI
+   for state queries; a direct idle-device sysfs read can return `EBUSY`.
+3. Enter `amd-smi set --gpu <PCI-BDF> --perf-level STABLE_STD` with the required
+   privilege, and query the state again to prove it took effect. Scope this
+   change with unconditional cleanup. Restore the recorded mode on success,
+   failure or interruption, and verify restoration. Preserve pre-existing
+   manual clock policy; do not replace an unknown policy with a guessed default.
+4. Profile one exact candidate through its retained production graph using
+   `--selected-regions --kernel-trace --marker-trace`, with ROCTx resume/pause
+   around the collected replay. Keep setup, oracle, warmups and dirty checks
+   outside the selected region. Set `HSA_TOOLS_ROCPROFILER_V1_TOOLS=0` before
+   launch, as required by the immutable runtime-environment contract below.
+   Native dense-prefill requests require the exact executable and loaded core
+   from their original timing corpus before and after collection. A stable tile
+   name does not authenticate changed wave policy or code generation; recollect
+   unprofiled timings after a rebuild before generating new profile requests.
+5. Start with separate `--pmc` passes for `GPUBusy`, `MemUnitBusy`, `L2CacheHit`,
+   `FETCH_SIZE`, `Wavefronts`, `LDSBankConflict` and `VALUInsts`. These spellings
+   are declared by the selected SDK's gfx1100 → gfx11 → common metric closure.
+   Revalidate that closure when changing SDK versions; do not transplant gfx906
+   groups. In this closure, `VALUBusy`, `SALUBusy`, `MemUnitStalled`,
+   `VALUUtilization`, `FlatVMemInsts` and `WriteSize` are unavailable.
+6. Require positive GPU activity and wave counts for each nonempty collected
+   dispatch. Zero LDS conflicts can be valid; all-zero activity counters are
+   unusable evidence. Preserve raw diagnostics and report unavailable metrics
+   explicitly. Never relabel `GPU_UTIL`, dependency waits or issue waits as
+   VALU utilization or compute throughput.
+7. Restore the original power state before canonical unprofiled timings. A
+   counter run's stable clock and profiler serialization must not supply a
+   timing label. Retain the before/during/after power-state receipt beside the
+   exact binary, source, device and counter evidence.
+
+The common NativeQuantised collector owns this scope for authenticated gfx1100
+requests. Use `--sudo-rocm-power-control` when only AMD SMI mutations require
+privilege; rocprof and the trainer keep their original user environment.
+`--sudo-tool` separately elevates the profiler. PAM can inject variables from
+`/etc/environment` after an outer `env -u`, so elevated ROCm launches must clear
+`HSA_OVERRIDE_GFX_VERSION` after sudo as the common collector does. Authenticate
+the loaded SDK/runtime and native participant in the launched process. A skipped
+trainer or empty selected region is failed evidence, even with a zero exit code.
+Power restoration failure stops collection; do not launch another request under
+an unverified power state.
+
+Inspect the final gfx1100 kernel descriptor as well as resource metadata.
+Logical `.vgpr_count` / HIP function register usage can be smaller than the
+physical allocation encoded by `COMPUTE_PGM_RSRC1`; rocprofiler can report the
+latter. Record both instead of treating the difference as instrumentation or
+silently choosing the smaller value. Interpret the descriptor using its actual
+compiled wave32/wave64 contract, and use the loaded function's occupancy query
+and spill audit. Native wave64 WMMA is supported, even though some WMMA builtin
+guides describe only wave32; [AMD's WMMA reference](https://gpuopen.com/learn/wmma_on_rdna3/)
+documents both wave sizes and the dense INT8 rate of 512 operations/CU/clock.
+Use actual CU count and the declared clock denominator for peak comparisons,
+with useful `2*M*N*K` work and complete projection costs kept visible.
+Authenticate the compute-unit granularity as well as the count. HIP's
+`hipDeviceAttributeMultiprocessorCount` reports CUs in CU mode and WGPs in
+WGP mode; one WGP contains two CUs. Retain the raw HIP count and the physical
+CU count from same-SDK AMD SMI ASIC metadata, then apply a per-CU or per-WGP
+operation rate consistently. Mixing a WGP count with a per-CU rate halves the
+denominator and falsely doubles utilization. Record the native peak-clock
+authority separately from instantaneous clocks and profiling power policy.
 
 For a captured-graph or collective stall, use
 [passive HIP/HSA stall inspection](references/hip-captured-stall-inspection.md).

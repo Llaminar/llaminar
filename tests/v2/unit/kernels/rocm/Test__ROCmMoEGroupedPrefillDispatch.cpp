@@ -7,6 +7,9 @@
  * execution codebook, projection role, aspect-ratio bucket, and M anchor must
  * resolve to a compiled tile, while unknown inputs must fail instead of falling
  * back to a legacy default.
+ * Whole-expert dot admission additionally proves exclusive Dot4/WMMA writers
+ * across unequal physical tiles, source aliases, CPU-promoted payloads and
+ * sliced down projections without dereferencing device storage.
  */
 
 #include <gtest/gtest.h>
@@ -48,6 +51,7 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, ProjectionTransactionsKeepCanonicalGeo
 
 #include "kernels/rocm/gemm/ROCmMoEGroupedPrefillDispatchGenerated.inc"
 #include "kernels/rocm/gemm/ROCmMoEGroupedPrefillRoutePolicy.h"
+#include "kernels/rocm/gemm/ROCmMoEGroupedDotAdmission.h"
 
 #include <array>
 #include <cstddef>
@@ -328,4 +332,254 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, LiveAdmissionPreservesExactKeysAndReje
     EXPECT_THROW((ROCmMoEGroupedRouteAdmission(key, &storage, &storage)), std::invalid_argument);
     key.rows = 0;
     EXPECT_THROW((ROCmMoEGroupedRouteAdmission(key, &storage, &storage)), std::invalid_argument);
+}
+
+namespace
+{
+    /**
+     * @brief Author metadata-only projection identity; admission must not read payload storage.
+     * @param physical Actual prepared decoder, independent of arithmetic provenance.
+     * @param source Original source codebook, authoritative when present is true.
+     * @param n Physical output columns. @param k Contraction width.
+     * @param present Whether source provenance belongs to this live descriptor.
+     * @return A descriptor containing only the fields owned by dot admission.
+     */
+    constexpr llaminar2::DeviceNativeQuantisedMatrixDesc dotAdmissionDescriptor(
+        uint8_t physical = 19, uint8_t source = 19, int n = 96, int k = 256, bool present = true)
+    {
+        return {.n = n, .k = k, .blocks_per_row = static_cast<uint32_t>(k / 32),
+            .codebook_id = physical, .source_codebook_id = source,
+            .source_identity_present = static_cast<uint8_t>(present)};
+    }
+
+    /** @param codebook Reviewed mask coordinate. @return Its exact unsigned mask bit. */
+    constexpr uint32_t dotAdmissionBit(uint8_t codebook) { return uint32_t{1} << codebook; }
+}
+
+/** @test Default, forced-native and format-restricted envelopes retain every reachable producer. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionRetainsExactlyTheReachableFamilies)
+{
+    using namespace llaminar2::rocm;
+    const auto desc = dotAdmissionDescriptor();
+    const MoEGroupedDotAdmission ordered;
+    EXPECT_FALSE(ordered.mayUseNative());
+    EXPECT_TRUE(ordered.mayUseOrdered());
+    EXPECT_FALSE(ordered.binds(MoEPrefillProjectionRole::GateUp,96,256));
+    EXPECT_EQ(ordered.select(desc,31),MoEGroupedDotProducer::OrderedDot4);
+
+    const auto native = MoEGroupedDotAdmission::nativeCandidate(
+        MoEPrefillProjectionRole::GateUp,96,96,256,MoEGroupedWmmaRowFloor::EveryExpert);
+    EXPECT_TRUE(native.mayUseNative());
+    EXPECT_FALSE(native.mayUseOrdered()) << "Canonical Q8 alias normalization must preserve a total source mask";
+    for (const int rows : {1,4,8,12,16,17,31})
+        EXPECT_EQ(native.select(desc,rows),MoEGroupedDotProducer::Wmma);
+
+    const auto physical_only = MoEGroupedDotAdmission::nativeCandidate(
+        MoEPrefillProjectionRole::GateUp,96,96,256,MoEGroupedWmmaRowFloor::EveryExpert,dotAdmissionBit(19));
+    const auto source_only = MoEGroupedDotAdmission::nativeCandidate(
+        MoEPrefillProjectionRole::GateUp,96,96,256,MoEGroupedWmmaRowFloor::EveryExpert,UINT32_MAX,dotAdmissionBit(19));
+    EXPECT_TRUE(physical_only.mayUseOrdered());
+    EXPECT_TRUE(source_only.mayUseOrdered());
+    EXPECT_EQ(physical_only.select(desc,31),MoEGroupedDotProducer::Wmma);
+    EXPECT_EQ(source_only.select(desc,31),MoEGroupedDotProducer::Wmma);
+    EXPECT_EQ(physical_only.select(dotAdmissionDescriptor(7,19),31),MoEGroupedDotProducer::OrderedDot4);
+    EXPECT_EQ(source_only.select(dotAdmissionDescriptor(19,7),31),MoEGroupedDotProducer::OrderedDot4);
+}
+
+/** @test Whole-count boundaries give unequal Dot4/WMMA tiles one writer for every output cell. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, WholeExpertFloorsHaveNoTileBoundaryHolesOrDoubleWriters)
+{
+    using namespace llaminar2::rocm;
+    struct FloorCase { MoEGroupedWmmaRowFloor floor; int threshold; };
+    constexpr std::array<FloorCase,4> floors{{
+        {MoEGroupedWmmaRowFloor::Four,4}, {MoEGroupedWmmaRowFloor::Eight,8},
+        {MoEGroupedWmmaRowFloor::Twelve,12}, {MoEGroupedWmmaRowFloor::Sixteen,16}}};
+    constexpr int columns = 96, maximum_rows = 31;
+    const auto desc = dotAdmissionDescriptor();
+    for (const auto [floor,threshold] : floors)
+    {
+        const auto admission = MoEGroupedDotAdmission::nativeCandidate(
+            MoEPrefillProjectionRole::GateUp,columns,columns,256,floor);
+        ASSERT_TRUE(admission.mayUseNative());
+        ASSERT_TRUE(admission.mayUseOrdered());
+        for (const int rows : {1,threshold-1,threshold,threshold+1,17,31})
+            for (const int ordered_m : {4,8,12,16})
+                for (const int ordered_n : {64,128,256})
+                    for (const int native_n : {32,64})
+                    {
+                        SCOPED_TRACE(::testing::Message() << "floor=" << threshold << " whole_rows=" << rows
+                            << " Dot4=" << ordered_m << 'x' << ordered_n << " WMMA=16x" << native_n);
+                        const auto expected = rows >= threshold ? MoEGroupedDotProducer::Wmma : MoEGroupedDotProducer::OrderedDot4;
+                        ASSERT_EQ(admission.select(desc,rows),expected);
+                        std::array<uint8_t,maximum_rows*columns> writers{};
+                        for (const bool native : {false,true})
+                        {
+                            // Both independently tiled families borrow the captured value
+                            // and the SAME whole-expert count, including their final tail.
+                            const auto captured = admission;
+                            const int tile_m = native ? 16 : ordered_m;
+                            const int tile_n = native ? native_n : ordered_n;
+                            for (int first_row = 0; first_row < rows; first_row += tile_m)
+                                for (int first_column = 0; first_column < columns; first_column += tile_n)
+                                {
+                                    const auto producer = captured.select(desc,rows);
+                                    ASSERT_EQ(producer,expected);
+                                    if ((producer == MoEGroupedDotProducer::Wmma) != native) continue;
+                                    for (int row = first_row; row < rows && row < first_row+tile_m; ++row)
+                                        for (int column = first_column; column < columns && column < first_column+tile_n; ++column)
+                                            ++writers[row*columns+column];
+                                }
+                        }
+                        for (int row = 0; row < maximum_rows; ++row)
+                            for (int column = 0; column < columns; ++column)
+                                ASSERT_EQ(writers[row*columns+column],row < rows ? 1u : 0u)
+                                    << "row=" << row << " column=" << column;
+                    }
+        // Empty/corrupt live counts are rejected before either writer is selected;
+        // restoring the complete count must recover the same immutable decision.
+        EXPECT_EQ(admission.select(desc,0),MoEGroupedDotProducer::Invalid);
+        EXPECT_EQ(admission.select(desc,-1),MoEGroupedDotProducer::Invalid);
+        EXPECT_EQ(admission.select(desc,31),MoEGroupedDotProducer::Wmma);
+    }
+}
+
+/** @test Q8 source aliases share arithmetic eligibility without changing the physical mask. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionNormalizesOnlyQ8SourceAliases)
+{
+    using namespace llaminar2::rocm;
+    for (const uint8_t source_mask : {uint8_t{19},uint8_t{20},uint8_t{21}})
+    {
+        const auto admission = MoEGroupedDotAdmission::nativeCandidate(
+            MoEPrefillProjectionRole::GateUp,96,96,256,MoEGroupedWmmaRowFloor::EveryExpert,
+            dotAdmissionBit(19),dotAdmissionBit(source_mask));
+        EXPECT_TRUE(admission.mayUseOrdered());
+        for (const uint8_t source : {uint8_t{19},uint8_t{20},uint8_t{21}})
+            EXPECT_EQ(admission.select(dotAdmissionDescriptor(19,source),17),MoEGroupedDotProducer::Wmma);
+        // An absent provenance flag uses the actual canonical physical codebook.
+        EXPECT_EQ(admission.select(dotAdmissionDescriptor(19,255,96,256,false),17),MoEGroupedDotProducer::Wmma);
+        EXPECT_EQ(admission.select(dotAdmissionDescriptor(20,20),17),MoEGroupedDotProducer::OrderedDot4);
+        EXPECT_EQ(admission.select(dotAdmissionDescriptor(21,21),17),MoEGroupedDotProducer::OrderedDot4);
+        EXPECT_EQ(admission.select(dotAdmissionDescriptor(19,7),17),MoEGroupedDotProducer::OrderedDot4);
+    }
+    const auto mixed = MoEGroupedDotAdmission::nativeCandidate(
+        MoEPrefillProjectionRole::GateUp,96,96,256,MoEGroupedWmmaRowFloor::EveryExpert,
+        dotAdmissionBit(19)|dotAdmissionBit(23),dotAdmissionBit(20)|dotAdmissionBit(21)|dotAdmissionBit(7));
+    EXPECT_EQ(mixed.select(dotAdmissionDescriptor(19,21),31),MoEGroupedDotProducer::Wmma);
+    EXPECT_EQ(mixed.select(dotAdmissionDescriptor(23,7),31),MoEGroupedDotProducer::Wmma);
+}
+
+/** @test CPU-promoted physical23 eligibility requires both decoder and compact source provenance. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionKeepsPromotedPhysicalAndSourceMasksSeparate)
+{
+    using namespace llaminar2::rocm;
+    const auto admission = MoEGroupedDotAdmission::nativeCandidate(
+        MoEPrefillProjectionRole::Down,2048,512,512,MoEGroupedWmmaRowFloor::Eight,
+        dotAdmissionBit(23),dotAdmissionBit(7));
+    const auto promoted = dotAdmissionDescriptor(23,7,512,512);
+    EXPECT_EQ(admission.select(promoted,7),MoEGroupedDotProducer::OrderedDot4);
+    EXPECT_EQ(admission.select(promoted,8),MoEGroupedDotProducer::Wmma);
+    EXPECT_EQ(admission.select(promoted,31),MoEGroupedDotProducer::Wmma);
+    EXPECT_EQ(admission.select(dotAdmissionDescriptor(7,7,512,512),31),MoEGroupedDotProducer::OrderedDot4);
+    EXPECT_EQ(admission.select(dotAdmissionDescriptor(23,5,512,512),31),MoEGroupedDotProducer::OrderedDot4);
+    EXPECT_EQ(admission.select(dotAdmissionDescriptor(23,7,512,512,false),31),MoEGroupedDotProducer::OrderedDot4);
+    EXPECT_EQ(admission.select(dotAdmissionDescriptor(23,23,512,512),31),MoEGroupedDotProducer::OrderedDot4);
+}
+
+/** @test IQ4_NL and source-scaled IQ4_XS keep distinct physical writers despite shared source4. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionNeverAliasesPhysicalIQ4Decoders)
+{
+    using namespace llaminar2::rocm;
+    const auto nl = dotAdmissionDescriptor(4,4);
+    const auto xs = dotAdmissionDescriptor(24,4);
+    for (const uint8_t physical : {uint8_t{4},uint8_t{24}})
+    {
+        const auto admission = MoEGroupedDotAdmission::nativeCandidate(
+            MoEPrefillProjectionRole::GateUp,96,96,256,MoEGroupedWmmaRowFloor::EveryExpert,
+            dotAdmissionBit(physical),dotAdmissionBit(4));
+        EXPECT_EQ(admission.select(nl,17),physical == 4 ? MoEGroupedDotProducer::Wmma : MoEGroupedDotProducer::OrderedDot4);
+        EXPECT_EQ(admission.select(xs,17),physical == 24 ? MoEGroupedDotProducer::Wmma : MoEGroupedDotProducer::OrderedDot4);
+        EXPECT_EQ(admission.select(dotAdmissionDescriptor(24,4,96,256,false),17),MoEGroupedDotProducer::OrderedDot4);
+    }
+    const auto both = MoEGroupedDotAdmission::nativeCandidate(
+        MoEPrefillProjectionRole::GateUp,96,96,256,MoEGroupedWmmaRowFloor::EveryExpert,
+        dotAdmissionBit(4)|dotAdmissionBit(24),dotAdmissionBit(4));
+    EXPECT_EQ(both.select(nl,17),MoEGroupedDotProducer::Wmma);
+    EXPECT_EQ(both.select(xs,17),MoEGroupedDotProducer::Wmma);
+}
+
+/** @test Gate/up and sliced down bind exact physical N/K while retaining the original full width. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionBindsExactRoleAndSlicedDownGeometry)
+{
+    using namespace llaminar2::rocm;
+    using Execution = llaminar2::MoEPrefillProjectionExecution;
+    const auto gate_up = MoEGroupedDotAdmission::nativeCandidate(
+        MoEPrefillProjectionRole::GateUp,512,512,2048,MoEGroupedWmmaRowFloor::Four);
+    EXPECT_TRUE(gate_up.binds(MoEPrefillProjectionRole::GateUp,512,2048));
+    EXPECT_FALSE(gate_up.binds(MoEPrefillProjectionRole::Down,512,2048));
+    EXPECT_FALSE(gate_up.binds(MoEPrefillProjectionRole::GateUp,256,2048));
+    EXPECT_FALSE(gate_up.binds(MoEPrefillProjectionRole::GateUp,512,512));
+    EXPECT_EQ(gate_up.sourceOutputColumns(),512);
+    for (const int first_column : {0,512,1024,1536})
+    {
+        const auto execution = Execution::down(2048,first_column,512);
+        const auto down = MoEGroupedDotAdmission::nativeCandidate(
+            MoEPrefillProjectionRole::Down,execution.modelColumns(),execution.columnCount(),512,
+            MoEGroupedWmmaRowFloor::Four);
+        EXPECT_EQ(down.sourceOutputColumns(),2048);
+        EXPECT_TRUE(down.binds(MoEPrefillProjectionRole::Down,512,512));
+        EXPECT_FALSE(down.binds(MoEPrefillProjectionRole::GateUp,512,512));
+        EXPECT_FALSE(down.binds(MoEPrefillProjectionRole::Down,2048,512));
+        EXPECT_FALSE(down.binds(MoEPrefillProjectionRole::Down,512,2048));
+        EXPECT_EQ(down.select(dotAdmissionDescriptor(19,19,512,512),17),MoEGroupedDotProducer::Wmma);
+        EXPECT_EQ(down.select(dotAdmissionDescriptor(19,19,2048,512),17),MoEGroupedDotProducer::Invalid);
+    }
+}
+
+/** @test Incomplete capture bindings fail before they can advertise either native producer. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionRejectsMalformedCaptureGeometryMasksAndFloors)
+{
+    using namespace llaminar2::rocm;
+    using Role = MoEPrefillProjectionRole;
+    using Floor = MoEGroupedWmmaRowFloor;
+    for (const auto role : {Role::GateUp,Role::Down})
+    {
+        for (const int source_n : {0,-1})
+            EXPECT_THROW((void)MoEGroupedDotAdmission::nativeCandidate(role,source_n,96,256,Floor::Four),std::invalid_argument);
+        for (const int physical_n : {0,-1,97})
+            EXPECT_THROW((void)MoEGroupedDotAdmission::nativeCandidate(role,96,physical_n,256,Floor::Four),std::invalid_argument);
+        for (const int k : {0,-32,1,31,33,255})
+            EXPECT_THROW((void)MoEGroupedDotAdmission::nativeCandidate(role,96,96,k,Floor::Four),std::invalid_argument);
+        EXPECT_THROW((void)MoEGroupedDotAdmission::nativeCandidate(role,96,96,256,Floor::Four,0),std::invalid_argument);
+        EXPECT_THROW((void)MoEGroupedDotAdmission::nativeCandidate(role,96,96,256,Floor::Four,UINT32_MAX,0),std::invalid_argument);
+        for (const uint8_t floor : {uint8_t{1},uint8_t{3},uint8_t{5},uint8_t{17},uint8_t{255}})
+        {
+            EXPECT_FALSE(validMoEGroupedWmmaRowFloor(static_cast<Floor>(floor)));
+            EXPECT_THROW((void)MoEGroupedDotAdmission::nativeCandidate(role,96,96,256,static_cast<Floor>(floor)),std::invalid_argument);
+        }
+    }
+    EXPECT_THROW((void)MoEGroupedDotAdmission::nativeCandidate(static_cast<Role>(255),96,96,256,Floor::Four),std::invalid_argument);
+    EXPECT_THROW((void)MoEGroupedDotAdmission::nativeCandidate(Role::GateUp,2048,512,256,Floor::Four),std::invalid_argument);
+}
+
+/** @test Corrupt live metadata is Invalid even when a floor or mask would otherwise choose Dot4. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, DotAdmissionRejectsInvalidLiveMetadataBeforeChoosingAWriter)
+{
+    using namespace llaminar2::rocm;
+    const auto admission = MoEGroupedDotAdmission::nativeCandidate(
+        MoEPrefillProjectionRole::GateUp,96,96,256,MoEGroupedWmmaRowFloor::Sixteen,
+        dotAdmissionBit(19),dotAdmissionBit(19));
+    const auto valid = dotAdmissionDescriptor();
+    for (const int rows : {0,-1,-2147483647})
+        EXPECT_EQ(admission.select(valid,rows),MoEGroupedDotProducer::Invalid);
+    for (const int n : {0,-1,95,97})
+        EXPECT_EQ(admission.select(dotAdmissionDescriptor(19,19,n),1),MoEGroupedDotProducer::Invalid);
+    for (const int k : {0,-32,224,288})
+        EXPECT_EQ(admission.select(dotAdmissionDescriptor(19,19,96,k),1),MoEGroupedDotProducer::Invalid);
+    for (const uint8_t invalid : {uint8_t{32},uint8_t{255}})
+    {
+        EXPECT_EQ(admission.select(dotAdmissionDescriptor(invalid,19),1),MoEGroupedDotProducer::Invalid);
+        EXPECT_EQ(admission.select(dotAdmissionDescriptor(19,invalid),1),MoEGroupedDotProducer::Invalid);
+    }
+    EXPECT_EQ(admission.select(valid,1),MoEGroupedDotProducer::OrderedDot4);
+    EXPECT_EQ(admission.select(valid,16),MoEGroupedDotProducer::Wmma);
 }

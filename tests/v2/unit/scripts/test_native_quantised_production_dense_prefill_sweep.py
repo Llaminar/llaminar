@@ -9,6 +9,8 @@ Matrix cardinality follows the canonical capture, format and shape inventories,
 so adding a shared CUDA/ROCm bucket extends coverage without a second row list.
 ROCm synthetic measurements retain source and physical execution IDs separately;
 physical24 cannot be inferred from a historical source4-only packet.
+Narrowed candidate protocols retain exhaustive historical IDs and cannot share
+a batch, resume plan or profiler witness with a different roster.
 """
 
 from __future__ import annotations
@@ -19,9 +21,11 @@ import math
 import os
 import shutil
 import statistics
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
+from functools import cache
 from pathlib import Path
 from unittest import mock
 
@@ -48,8 +52,10 @@ from native_quantised_dispatch.prefill_matrix import (  # noqa: E402
     gpu_prefill_measurements,
 )
 from native_quantised_dispatch.production_dense_prefill_sweep import (  # noqa: E402
+    DenseCandidateScope,
     CUDA_AGGREGATE_COLUMNS,
     ROCM_NATIVE_Q8_CANDIDATE_IDS,
+    ROCM_WMMA_CANDIDATE_IDS,
     CUDA_CANDIDATE_IDS,
     CUDA_GENERIC_CANDIDATE_IDS,
     CUDA_TILE_NAMES,
@@ -84,6 +90,19 @@ from native_quantised_dispatch.production_dense_prefill_sweep import (  # noqa: 
 
 
 _UINT64_MAX = (1 << 64) - 1
+
+
+@cache
+def _fixture_cells(backend: str):
+    """Reuse immutable canonical cells when selecting synthetic row fixtures.
+
+    Each backend's inventory contains tens of thousands of frozen declarations.
+    Selecting one fixture must not rebuild that whole matrix for every malformed
+    CSV or source alias. The exhaustive inventory test still calls the production
+    expansion directly, and plan readers keep their real authentication path.
+    Tests derive changed cells with dataclasses.replace; no shared cell is edited.
+    """
+    return production_dense_prefill_cells(backend)
 
 
 def _test_provenance(
@@ -159,19 +178,20 @@ def _write_cell(
     bench_runs: int = 3,
     cell=None,
     canonical_kpart_available: bool = True,
+    winning_candidate: str | None = None,
 ):
-    cell = cell or production_dense_prefill_cells(backend)[0]
+    cell = cell or _fixture_cells(backend)[0]
     paths = production_dense_prefill_cell_paths(root, cell)
     paths.aggregate.parent.mkdir(parents=True, exist_ok=True)
     candidates = dense_prefill_candidate_ids(
         backend,
         cell.source_format,
         canonical_kpart_available=canonical_kpart_available,
-        prepared_family=cell.prepared_family,
+        prepared_family=cell.prepared_family, gpu_architecture=cell.gpu_architecture, candidate_scope=cell.candidate_scope,
     )
     samples_by_candidate = {
         candidate: tuple(
-            10.0 + candidate_index + sample_index * 0.125
+            (1.0 if candidate == winning_candidate else 10.0 + candidate_index) + sample_index * 0.125
             for sample_index in range(bench_runs)
         )
         for candidate_index, candidate in enumerate(candidates)
@@ -261,6 +281,7 @@ def _write_cell(
                 components = candidate.split("/")
                 int8 = cell.effective_prepared_family == DensePreparedWeightFamily.INT8_BLOCKWISE
                 int8_v3 = candidate.startswith("INT8V3/")
+                wmma = candidate.startswith("WMMA/")
                 explicit_unroll = (
                     int(components[3].removeprefix("U"))
                     if len(components) >= 4 and components[3].startswith("U")
@@ -289,22 +310,24 @@ def _write_cell(
                     "correctness_pass": 1,
                     "byte_mismatches_vs_auto": 0,
                     "first_byte_mismatch_vs_auto": _UINT64_MAX,
-                    "is_best": int(candidate_index == 0),
+                    "is_best": int(candidate == winning_candidate if winning_candidate else candidate_index == 0),
                     "observed_n_tile": (
+                        int(components[1].removeprefix("N")) if wmma else
                         (64 if int8_v3 else 128) if int8
                         else 128 if candidate == "Auto"
                         else int(candidate.split("/")[0].removeprefix("N"))
                     ),
                     "observed_m_tile": (
+                        int(components[2].removeprefix("MT")) if wmma else
                         32 if candidate == "Auto"
                         else int(candidate.split("/")[1].removeprefix("MT"))
                     ),
                     "observed_min_blocks": (
-                        1 if int8 or candidate == "Auto"
+                        1 if wmma or int8 or candidate == "Auto"
                         else int(candidate.split("/")[2].removeprefix("MB"))
                     ),
                     "observed_unroll": (
-                        2 if candidate == "Auto"
+                        0 if wmma else 2 if candidate == "Auto"
                         else int(components[2].removeprefix("U")) if int8
                         else explicit_unroll
                     ),
@@ -317,6 +340,7 @@ def _write_cell(
                     "max_threads_per_block": 256,
                     "max_active_blocks_per_sm": 2,
                     "observed_producer": (
+                        "native_wmma" if wmma else
                         ("int8_blockwise_v3" if int8_v3 else "int8_blockwise_v7")
                         if int8 else "native_cooperative"
                     ),
@@ -366,6 +390,7 @@ def _commit_test_cells(
     warmup_runs: int = 2,
     bench_runs: int = 3,
     provenance: dict[str, object] | None = None,
+    installed_policy: dict[str, object] | None = None,
 ):
     """Publish real per-cell commit markers for already-written fixtures."""
 
@@ -378,6 +403,7 @@ def _commit_test_cells(
         producer,
         warmup_runs=warmup_runs,
         bench_runs=bench_runs,
+        installed_policy=installed_policy,
     )
     process = {
         "invocation_id": "test-native-process",
@@ -405,9 +431,284 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
     @staticmethod
     def _native_q8_source(label="Q8_0"):
         """Bind the existing HC production shape; synthetic clocks remain test-only."""
-        return next(cell for cell in production_dense_prefill_cells("rocm")
+        return next(cell for cell in _fixture_cells("rocm")
                     if cell.source_format.label == label
                     and cell.shape.name == "Qwen4Exp_320x10240" and cell.m == 64)
+
+    def _scoped_wmma_cell(self, label="Q4_0"):
+        """Use the canonical native shape with the explicit five-candidate protocol."""
+        return replace(self._native_q8_source(label),
+            prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED,gpu_architecture="gfx1100",
+            candidate_scope=DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA)
+
+    def test_candidate_scope_preserves_exhaustive_identity(self) -> None:
+        """Default protocols retain their historical field set and immutable plan bytes."""
+        for backend in ("cuda","rocm"):
+            legacy=next(cell for cell in _fixture_cells(backend) if cell.source_format.label=="Q4_0"
+                        and cell.shape.name=="Qwen4Exp_320x10240" and cell.m==64)
+            # Frozen from the original v4 owner before adding candidate scope.
+            self.assertEqual(legacy.cell_id,{"cuda":"cuda-q4_0-m64-e71f1f041dff0f26a111",
+                "rocm":"rocm-q4_0-m64-dfebf34f4acfa3615952"}[backend])
+            explicit=replace(legacy,candidate_scope=DenseCandidateScope.EXHAUSTIVE)
+            self.assertEqual(legacy.identity,explicit.identity)
+            self.assertEqual(legacy.cell_id,explicit.cell_id)
+            self.assertNotIn("candidate_scope",explicit.canonical_mapping())
+            with tempfile.TemporaryDirectory() as tmp:
+                path=Path(tmp)/SWEEP_PLAN_FILENAME
+                first=write_sweep_plan(path,backend,(legacy,),_test_provenance(backend))
+                before=path.read_bytes()
+                self.assertEqual(first,write_sweep_plan(path,backend,(explicit,),_test_provenance(backend)))
+                self.assertEqual(before,path.read_bytes())
+                self.assertTrue(first["schema_version"].endswith("-v4"))
+                self.assertNotIn("candidate_scope",first)
+
+    def test_candidate_scope_all_formats_require_exact_five_roster(self) -> None:
+        """All21 formats require Auto and every native candidate, with no extra rows."""
+        expected=("Auto",*ROCM_WMMA_CANDIDATE_IDS)
+        for source in FORMAT_SPECS:
+            cell=self._scoped_wmma_cell(source.label)
+            with self.subTest(source=source.label),tempfile.TemporaryDirectory() as tmp:
+                root=Path(tmp);_,paths=_write_cell(root,"rocm",cell=cell)
+                self.assertEqual(tuple(_read_aggregate_rows(paths.aggregate,cell)),expected)
+                self.assertEqual(validate_production_dense_prefill_cell(paths.aggregate,paths.timing,cell,bench_runs=3).candidate_count,5)
+                env=_cell_environment(cell,paths,5,2,3)
+                self.assertEqual(tuple(env["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS"].split(",")),expected)
+                with paths.aggregate.open() as handle:rows=list(csv.DictReader(handle))
+                for malformed in (rows[1:],rows+[dict(rows[0],variant=ROCM_CANDIDATE_IDS[0])]):
+                    with paths.aggregate.open("w",newline="") as handle:
+                        writer=csv.DictWriter(handle,fieldnames=rows[0].keys());writer.writeheader();writer.writerows(malformed)
+                    with self.assertRaises(ValueError):
+                        validate_production_dense_prefill_cell(paths.aggregate,paths.timing,cell,bench_runs=3)
+
+    def test_candidate_scope_rejects_incompatible_protocols(self) -> None:
+        """No foreign architecture, preparation, backend or untyped string can narrow."""
+        cell=self._scoped_wmma_cell()
+        for change in ({"gpu_architecture":"gfx906"},{"gpu_architecture":None},
+                       {"backend":"cuda"},{"prepared_family":None},
+                       {"prepared_family":DensePreparedWeightFamily.INT8_BLOCKWISE},
+                       {"candidate_scope":"installed-vs-native-wmma"}):
+            with self.subTest(change=change),self.assertRaises(ValueError):replace(cell,**change)
+        for backend,family,arch in (("rocm",None,"gfx1100"),("rocm",DensePreparedWeightFamily.NATIVE_QUANTISED,"gfx906"),
+                                   ("cuda",DensePreparedWeightFamily.NATIVE_QUANTISED,"gfx1100")):
+            with self.assertRaises(ValueError):
+                dense_prefill_candidate_ids(backend,cell.source_format,prepared_family=family,gpu_architecture=arch,
+                    candidate_scope=DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA)
+
+    def test_candidate_scope_plan_resume_and_batch_are_separate(self) -> None:
+        """A narrowed plan round-trips exactly and rejects exhaustive or mixed resumes."""
+        cell=self._scoped_wmma_cell();wide=replace(cell,candidate_scope=DenseCandidateScope.EXHAUSTIVE)
+        self.assertNotEqual(cell.cell_id,wide.cell_id)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);cells=(cell,replace(cell,m=128))
+            plan=write_sweep_plan(root/SWEEP_PLAN_FILENAME,"rocm",cells,_test_provenance("rocm"))
+            self.assertTrue(plan["schema_version"].endswith("-v5"))
+            loaded,roundtrip=load_planned_dense_prefill_cells(root/SWEEP_PLAN_FILENAME,"rocm")
+            self.assertEqual(loaded,cells);self.assertEqual(roundtrip,plan)
+            env=_batch_environment(cells,_batch_paths(root,cells),5,2,3)
+            self.assertEqual(env["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS"],",".join(("Auto",*ROCM_WMMA_CANDIDATE_IDS)))
+            with self.assertRaises(ValueError):
+                write_sweep_plan(root/SWEEP_PLAN_FILENAME,"rocm",(wide,),_test_provenance("rocm"))
+            with self.assertRaisesRegex(ValueError,"candidate-scope"):
+                write_sweep_plan(root/"mixed.json","rocm",(wide,cell),_test_provenance("rocm"))
+            with self.assertRaises(ValueError):_batch_paths(root,(wide,replace(cell,m=128)))
+
+    def test_candidate_scope_keeps_native_auto_first_tie_order(self) -> None:
+        """Equal clocks retain native filtered generator order: Auto precedes WMMA."""
+        cell=self._scoped_wmma_cell()
+        with tempfile.TemporaryDirectory() as tmp:
+            _,paths=_write_cell(Path(tmp),"rocm",cell=cell)
+            for path in (paths.aggregate,paths.timing):
+                with path.open() as handle:rows=list(csv.DictReader(handle))
+                if path==paths.aggregate:
+                    original=rows[0]
+                    for row in rows:
+                        for field in ("min_us","mean_us","stddev_us"):row[field]=original[field]
+                else:
+                    for row in rows:
+                        value=10.+int(row["sample_index"])*.125
+                        row.update(latency_us=f"{value:.9f}",latency_us_hex=value.hex())
+                with path.open("w",newline="") as handle:
+                    writer=csv.DictWriter(handle,fieldnames=rows[0].keys());writer.writeheader();writer.writerows(rows)
+            result=validate_production_dense_prefill_cell(paths.aggregate,paths.timing,cell,bench_runs=3)
+            self.assertEqual(result.winner_id,"Auto")
+
+    def test_candidate_scope_profiles_retain_actual_auto_and_aliases(self) -> None:
+        """Reduced rosters preserve every source alias and an unforced physical Auto witness."""
+        from native_quantised_dispatch.native_prefill_profiler import build_manifest,validate_request
+        from native_quantised_dispatch.corpus_provenance import mapping_digest
+        cells=tuple(self._scoped_wmma_cell(source.label) for source in FORMAT_SPECS)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            for cell in cells:_write_cell(root,"rocm",cell=cell,winning_candidate="WMMA/N64/MT32")
+            _commit_test_cells(root,"rocm",cells)
+            manifest=build_manifest(root,warmups=2,samples=3)
+            self.assertEqual(len(manifest.requests),2*len(FORMAT_SPECS))
+            for request in manifest.requests:
+                validate_request(request)
+                self.assertEqual(request.config_json["cell"]["candidate_scope"],DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA.value)
+                if request.config_json["purpose"]=="baseline":
+                    self.assertEqual(request.config_json["requested_candidate"],"Auto")
+                    self.assertTrue(request.effective_candidate_id.startswith("Auto:"))
+            request=manifest.requests[0]
+            config={**request.config_json,"cell":{**request.config_json["cell"],"candidate_scope":"unknown"}}
+            with self.assertRaises(ValueError):
+                validate_request(replace(request,config_json=config,candidate_policy_hash=mapping_digest(config)))
+
+    def test_candidate_scope_profiler_rejects_relabelled_forced_dot4(self) -> None:
+        """Standalone profiler admission cannot narrow a forced exhaustive Dot4 witness."""
+        from native_quantised_dispatch.native_prefill_profiler import build_manifest,validate_request
+        from native_quantised_dispatch.corpus_provenance import mapping_digest
+        cell=replace(self._scoped_wmma_cell(),candidate_scope=DenseCandidateScope.EXHAUSTIVE)
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp)
+            _write_cell(root,"rocm",cell=cell,winning_candidate=ROCM_CANDIDATE_IDS[0])
+            _commit_test_cells(root,"rocm",(cell,))
+            request=next(r for r in build_manifest(root,warmups=2,samples=3).requests if r.config_json["purpose"]=="winner")
+            validate_request(request)
+            config={**request.config_json,"cell":{**request.config_json["cell"],
+                "candidate_scope":DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA.value}}
+            with self.assertRaisesRegex(ValueError,"outside the declared"):
+                validate_request(replace(request,config_json=config,candidate_policy_hash=mapping_digest(config)))
+
+    def test_candidate_scope_cli_preserves_complete_canonical_inventory(self) -> None:
+        """CLI narrowing changes only the roster, never source aliases, shapes or M."""
+        from argparse import Namespace
+        from native_quantised_dispatch.production_dense_prefill_sweep import _filtered_cells
+        args=Namespace(backend="rocm",prepared_family="native-quantised",gpu_architecture="gfx1100",
+            candidate_scope="installed-vs-native-wmma",format=None,shape=None,m=None)
+        scoped=_filtered_cells(args)
+        exhaustive=production_dense_prefill_cells("rocm",prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED,
+            gpu_architecture="gfx1100",all_native_formats=True)
+        key=lambda cell:(cell.source_format.label,cell.shape.name,cell.shape.n,cell.shape.k,cell.m)
+        self.assertEqual(tuple(map(key,scoped)),tuple(map(key,exhaustive)))
+        self.assertEqual({cell.source_format.label for cell in scoped},{source.label for source in FORMAT_SPECS})
+        self.assertTrue(all(cell.candidate_scope is DenseCandidateScope.INSTALLED_VS_NATIVE_WMMA for cell in scoped))
+
+    def test_candidate_scope_plan_rejects_rehashed_schema_disagreement(self) -> None:
+        """A valid digest cannot authenticate conflicting schema/cell/top-level scope."""
+        from native_quantised_dispatch.corpus_provenance import mapping_digest
+        cell=self._scoped_wmma_cell()
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);path=root/SWEEP_PLAN_FILENAME
+            original=write_sweep_plan(path,"rocm",(cell,),_test_provenance("rocm"))
+            mutations=[]
+            legacy_schema=dict(original,schema_version="native-quantised-production-dense-prefill-sweep-v4")
+            mutations.append(legacy_schema)
+            legacy_no_top=dict(legacy_schema);legacy_no_top.pop("candidate_scope");mutations.append(legacy_no_top)
+            missing_scope=dict(original);missing_scope.pop("candidate_scope");mutations.append(missing_scope)
+            wrong_cell=dict(original,cells=[dict(original["cells"][0],candidate_scope="exhaustive")]);mutations.append(wrong_cell)
+            unknown_scope=dict(original,candidate_scope="unknown");mutations.append(unknown_scope)
+            for payload in mutations:
+                payload.pop("plan_digest",None);payload["plan_digest"]=mapping_digest(payload)
+                path.write_text(json.dumps(payload))
+                with self.assertRaises(ValueError):load_planned_dense_prefill_cells(path,"rocm")
+
+    def test_wmma_all_formats_keep_architecture_and_native_family(self) -> None:
+        """Every format has a gfx1100 matrix candidate; gfx906 never inherits it."""
+        base = production_dense_prefill_cells("rocm")[0]
+        for source in FORMAT_SPECS:
+            native = replace(base, source_format=source,
+                prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture="gfx1100")
+            candidates = dense_prefill_candidate_ids("rocm", source,
+                prepared_family=native.prepared_family, gpu_architecture=native.gpu_architecture)
+            self.assertTrue(set(ROCM_WMMA_CANDIDATE_IDS).issubset(candidates))
+            self.assertFalse(set(ROCM_WMMA_CANDIDATE_IDS).intersection(dense_prefill_candidate_ids(
+                "rocm", source, prepared_family=native.prepared_family, gpu_architecture="gfx906")))
+            with tempfile.TemporaryDirectory() as tmp:
+                _, paths = _write_cell(Path(tmp), "rocm", cell=native)
+                result = validate_production_dense_prefill_cell(paths.aggregate, paths.timing, native, bench_runs=3)
+                self.assertEqual(result.candidate_count, len(candidates))
+                with paths.aggregate.open() as handle:
+                    rows = list(csv.DictReader(handle))
+                row = next(row for row in rows if row["variant"].startswith("WMMA/"))
+                row["observed_producer"] = "native_cooperative"
+                with paths.aggregate.open("w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+                    writer.writeheader(); writer.writerows(rows)
+                with self.assertRaises(ValueError):
+                    validate_production_dense_prefill_cell(paths.aggregate, paths.timing, native, bench_runs=3)
+
+    def test_wmma_resource_admission_keeps_compiled_thread_extent(self) -> None:
+        """WMMA and cooperative kernels each require their compiled 256-thread launch."""
+        base = production_dense_prefill_cells("rocm")[0]
+        native = replace(base, prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED,
+            gpu_architecture="gfx1100")
+        with tempfile.TemporaryDirectory() as tmp:
+            _, paths = _write_cell(Path(tmp), "rocm", cell=native)
+            with paths.aggregate.open(newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            for row in rows:
+                if row["observed_producer"] == "native_wmma":
+                    row["max_threads_per_block"] = "256"
+            def write_rows():
+                """Keep the full exact candidate matrix while changing one resource witness."""
+                with paths.aggregate.open("w", newline="") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=rows[0].keys())
+                    writer.writeheader(); writer.writerows(rows)
+            write_rows()
+            validate_production_dense_prefill_cell(paths.aggregate, paths.timing, native, bench_runs=3)
+            for producer, rejected_threads, admitted_threads in (
+                    ("native_wmma", "255", "256"), ("native_cooperative", "255", "256")):
+                row = next(row for row in rows if row["observed_producer"] == producer)
+                row["max_threads_per_block"] = rejected_threads
+                write_rows()
+                with self.assertRaisesRegex(ValueError, "ineligible ROCm compiler resources"):
+                    validate_production_dense_prefill_cell(paths.aggregate, paths.timing, native, bench_runs=3)
+                row["max_threads_per_block"] = admitted_threads
+                write_rows()
+                validate_production_dense_prefill_cell(paths.aggregate, paths.timing, native, bench_runs=3)
+
+    def test_wmma_all_format_profile_witnesses_retain_actual_baseline(self) -> None:
+        """Profiling consumes sealed winners for every original source format."""
+        from native_quantised_dispatch.native_prefill_profiler import build_manifest, validate_request
+        base = production_dense_prefill_cells("rocm")[0]
+        cells = tuple(replace(base, source_format=source,
+            prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture="gfx1100")
+            for source in FORMAT_SPECS)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for cell in cells:
+                _write_cell(root, "rocm", cell=cell, winning_candidate="WMMA/N64/MT32")
+            _commit_test_cells(root, "rocm", cells)
+            manifest = build_manifest(root, warmups=2, samples=3)
+            self.assertEqual(len(manifest.requests), len(FORMAT_SPECS) * 2)
+            for request in manifest.requests:
+                validate_request(request)
+                source = next(source for source in FORMAT_SPECS if source.label == request.source_format)
+                self.assertEqual(request.runtime_codebook_id, source.runtime_codebook("rocm"))
+                if request.config_json["purpose"] == "winner":
+                    self.assertEqual(request.candidate_family, "NativeWmma")
+                    self.assertEqual(request.config_json["requested_candidate"], "WMMA/N64/MT32")
+                else:
+                    self.assertEqual(request.config_json["requested_candidate"], "Auto")
+
+    def test_wmma_emitter_requires_native_gfx1100_evidence(self) -> None:
+        """A synthetic exact row tests emission only, never native qualification."""
+        entry = DenseOverlayEntry("rocm", DenseOverlayKey(0, 64, 128, 256,
+            DensePreparedWeightFamily.NATIVE_QUANTISED, GPUArchitecture.parse("rocm", "gfx1100")),
+            ("Q4_0",), ("test",), "WMMA/N64/MT32", (64, 32, 1, 0, 0, 4), 0.0, 0.0, 0.0)
+        self.assertIn("VNNIPrefillProducer::NativeWmma", render_dense_overlay((entry,)))
+        legacy = replace(entry, key=replace(entry.key, architecture=None),
+                         candidate_id="N64/MT32/MB1/U2", launch=(64, 32, 1, 2, 0, 0))
+        base = render_dense_overlay((legacy, entry))
+        retained, receipt = retain_dense_overlay_base(base, (entry,))
+        self.assertEqual(receipt["retained_keys"], 1)
+        self.assertEqual(receipt["replaced_keys"], 1)
+        self.assertEqual(retained, base)
+        for architecture in (None, GPUArchitecture.parse("rocm", "gfx906")):
+            with self.assertRaisesRegex(ValueError, "gfx1100"):
+                render_dense_overlay((replace(entry, key=replace(entry.key, architecture=architecture)),))
+
+    def test_native_low_bit_publication_requires_every_shared_codebook_alias(self) -> None:
+        """An installed physical row applies to both block32 and superblock sources."""
+        for codebook, aliases in ((5, ("Q4_1", "Q4_K")), (7, ("Q5_1", "Q5_K"))):
+            entry = DenseOverlayEntry("rocm", DenseOverlayKey(codebook, 64, 128, 256,
+                DensePreparedWeightFamily.NATIVE_QUANTISED, GPUArchitecture.parse("rocm", "gfx1100")),
+                aliases, ("test",), "WMMA/N64/MT32", (64, 32, 1, 0, 0, 4), 0.0, 0.0, 0.0)
+            self.assertIn("VNNIPrefillProducer::NativeWmma", render_dense_overlay((entry,)))
+            for alias in aliases:
+                with self.assertRaisesRegex(ValueError, "complete source-alias evidence"):
+                    render_dense_overlay((replace(entry, source_formats=(alias,)),))
 
     def test_native_q8_family_identity_preserves_old_keys(self) -> None:
         old = self._native_q8_source()
@@ -531,6 +832,268 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "one prepared-family protocol"):
                 write_sweep_plan(root / SWEEP_PLAN_FILENAME, "rocm", (old, native), _test_provenance("rocm"))
 
+    def test_native_all_format_runner_executes_the_planned_candidate_inventory(self) -> None:
+        """Single and batched processes cannot silently prune planned WMMA candidates."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            for architecture in ("gfx906", "gfx1100"):
+                for source_format in FORMAT_SPECS:
+                    with self.subTest(architecture=architecture, source=source_format.label):
+                        cell = replace(self._native_q8_source(), source_format=source_format,
+                            prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED,
+                            gpu_architecture=architecture)
+                        expected = dense_prefill_candidate_ids("rocm", source_format,
+                            prepared_family=cell.prepared_family, gpu_architecture=architecture)
+                        environment = _cell_environment(cell,
+                            production_dense_prefill_cell_paths(root, cell), 5, 2, 3)
+                        selected = tuple(environment["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS"].split(","))
+                        self.assertEqual(selected, expected)
+                        self.assertEqual(set(selected) & set(ROCM_WMMA_CANDIDATE_IDS),
+                            set(ROCM_WMMA_CANDIDATE_IDS) if architecture == "gfx1100" else set())
+                        cells = (cell, replace(cell, m=cell.m + 64))
+                        batched = _batch_environment(cells, _batch_paths(root, cells), 5, 2, 3)
+                        self.assertEqual(batched["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS"],
+                            environment["LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS"])
+
+    def test_gfx1100_counter_policy_requires_measured_dispatch_activity(self) -> None:
+        """Missing VALUBusy stays explicit; gated-off perfmon clocks cannot certify a kernel."""
+        from native_quantised_dispatch.profiler_collectors import (
+            _complete_metric_inventory, _kernel_fingerprint, _rocm_counter_groups)
+        from native_quantised_dispatch.profiler_evidence import (
+            Backend, ProfiledDispatch, ProfiledDispatchKind)
+        counters = {name for group in _rocm_counter_groups("gfx1100") for name in group}
+        self.assertEqual(counters, {"GPUBusy", "MemUnitBusy", "L2CacheHit", "FETCH_SIZE",
+                                   "Wavefronts", "LDSBankConflict", "VALUInsts"})
+        self.assertIn("VALUBusy", {name for group in _rocm_counter_groups("gfx906") for name in group})
+        with self.assertRaisesRegex(ValueError, "no reviewed counter policy"):
+            _rocm_counter_groups("gfx1101")
+        values = {name: (value, name) for name, value in {
+            "gpu.duration_ns": 1000, "gpu.vgpr_count": 100, "gpu.sgpr_count": 128,
+            "gpu.lds_bytes": 17920, "gpu.scratch_bytes": 0, "gpu.gpu_busy_pct": 100,
+            "gpu.memory_unit_busy_pct": 59, "gpu.wavefront_count": 8192}.items()}
+        def dispatch(measured):
+            """Construct the physical record through the same strict metric completer."""
+            return ProfiledDispatch(0, ProfiledDispatchKind.GPU_KERNEL, "native_wmma",
+                _kernel_fingerprint("native_wmma", (256, 1, 1), (256, 1, 1)),
+                (256, 1, 1), (256, 1, 1), _complete_metric_inventory(Backend.ROCM, measured,
+                    unavailable_reason="SDK has no counter", architecture_class="gfx1100"))
+        dispatch(values).validate(Backend.ROCM, "gfx1100")
+        with self.assertRaisesRegex(ValueError, "valu_busy_pct"):
+            dispatch(values).validate(Backend.ROCM, "gfx906")
+        for name in ("gpu.gpu_busy_pct", "gpu.memory_unit_busy_pct", "gpu.wavefront_count"):
+            with self.assertRaisesRegex(ValueError, "required profiler metric"):
+                dispatch({key: value for key, value in values.items() if key != name}).validate(Backend.ROCM, "gfx1100")
+        for name in ("gpu.gpu_busy_pct", "gpu.wavefront_count"):
+            with self.assertRaisesRegex(ValueError, "positive dispatch activity"):
+                dispatch({**values, name: (0, name)}).validate(Backend.ROCM, "gfx1100")
+
+    def test_gfx1100_counter_policy_retains_legacy_collector_requirements(self) -> None:
+        """Retained v8 records keep optional waves; new native evidence requires v9."""
+        from types import SimpleNamespace
+        from native_quantised_dispatch.profiler_collectors import _complete_metric_inventory
+        from native_quantised_dispatch.profiler_evidence import (
+            Backend, EXPECTED_PROFILER_TOOL, PROFILER_COLLECTOR_VERSION,
+            PROFILER_METRIC_SET_VERSION, ProfiledDispatch, ProfiledDispatchKind,
+            ProfilerEvidence, ProfilerEvidenceStatus, metric_definitions)
+        values = {definition.metric_id: (0 if definition.metric_id == "gpu.scratch_bytes" else 1,
+                  definition.metric_id)
+                  for definition in metric_definitions(Backend.ROCM) if definition.required}
+        dispatch = ProfiledDispatch(0, ProfiledDispatchKind.GPU_KERNEL, "retained_kernel",
+            "sha256:" + "1" * 64, (1, 1, 1), (256, 1, 1),
+            _complete_metric_inventory(Backend.ROCM, values,
+                unavailable_reason="optional in the original v8 collection"))
+        request = SimpleNamespace(request_id="retained-v8", observation_digest="sha256:" + "2" * 64,
+            backend=Backend.ROCM, profile_required=True, architecture_class="gfx1100",
+            operation_kind="NativeQuantisedDecodeProjection")
+        evidence = ProfilerEvidence(request.request_id, request.observation_digest, Backend.ROCM,
+            ProfilerEvidenceStatus.COMPLETE, None, EXPECTED_PROFILER_TOOL[Backend.ROCM], "fixture-v8",
+            PROFILER_METRIC_SET_VERSION, "native-quantised-isolated-profiler-v8-ncu-si-byte-units",
+            "sha256:" + "3" * 64, "sha256:" + "4" * 64, 1, 1, (dispatch,))
+        evidence.validate(request)
+        # A new collector cannot inherit the historical absence of wave counts.
+        with self.assertRaisesRegex(ValueError, "wavefront_count.*required"):
+            replace(evidence, collector_version=PROFILER_COLLECTOR_VERSION).validate(request)
+        native_request = SimpleNamespace(**{**vars(request),
+            "operation_kind": "ROCmNativeQuantisedDensePrefill"})
+        with self.assertRaisesRegex(ValueError, "authenticated native counter policy"):
+            evidence.validate(native_request)
+
+    def test_gfx1100_profile_batch_rejects_before_launch(self) -> None:
+        """A batch cannot bypass the isolated native power-state authority."""
+        from types import SimpleNamespace
+        from native_quantised_dispatch.profiler_collectors import (
+            CollectorOptions, GPUProfilerProcessBatch, _collect_rocm_batch)
+        from native_quantised_dispatch.profiler_evidence import Backend
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            options = CollectorOptions(Backend.ROCM, root / "trainer", root / "rocprofv3", root)
+            batch = GPUProfilerProcessBatch((SimpleNamespace(
+                backend=Backend.ROCM, architecture_class="gfx1100"),))
+            with mock.patch("native_quantised_dispatch.profiler_collectors._run_command") as launch, \
+                 mock.patch("native_quantised_dispatch.profiler_collectors._binary_for_request") as binary:
+                with self.assertRaisesRegex(ValueError, "power-state ownership.*batching is not admitted"):
+                    _collect_rocm_batch(batch, options)
+                launch.assert_not_called()
+                binary.assert_not_called()
+            self.assertEqual(tuple(root.iterdir()), ())
+
+    def test_native_prefill_profile_rejects_rebuilt_executable_or_core_before_power_changes(self) -> None:
+        """Identical tile dimensions cannot relabel another wave/code-generation policy."""
+        from types import SimpleNamespace
+        from native_quantised_dispatch import native_prefill_profiler as owner
+        from native_quantised_dispatch.corpus_provenance import mapping_digest
+        from native_quantised_dispatch.profiler_collectors import CollectorOptions, _collect_rocm
+        from native_quantised_dispatch.profiler_evidence import Backend
+        original = _test_provenance("rocm")
+        request = SimpleNamespace(operation_kind=owner.OPERATION, architecture_class="gfx906",
+            build_id=mapping_digest(original), validate=lambda: None)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            options = CollectorOptions(Backend.ROCM, root / "trainer", root / "rocprofv3", root)
+            for changed in ("binary_sha256", "core_library_sha256"):
+                with self.subTest(changed=changed), \
+                        mock.patch.object(owner, "trainer_provenance", return_value={**original, changed: "sha256:" + "9" * 64}), \
+                        mock.patch("native_quantised_dispatch.profiler_collectors._rocm_native_power_scope") as power, \
+                        mock.patch("native_quantised_dispatch.profiler_collectors._collect_rocm_admitted") as collect:
+                    with self.assertRaisesRegex(ValueError, "exact timing executable/core closure"):
+                        _collect_rocm(request, options, root)
+                    power.assert_not_called()
+                    collect.assert_not_called()
+            self.assertEqual(tuple(root.iterdir()), ())
+            with mock.patch.object(owner, "trainer_provenance", return_value=original):
+                self.assertEqual(owner.validate_binary(request, options.binary), original)
+
+    def test_native_prefill_profile_rechecks_closure_before_restoring_power_and_sealing(self) -> None:
+        """A mutation during counter collection fails after guaranteed power cleanup."""
+        from contextlib import contextmanager
+        from types import SimpleNamespace
+        from native_quantised_dispatch import native_prefill_profiler as owner
+        from native_quantised_dispatch.corpus_provenance import mapping_digest
+        from native_quantised_dispatch.profiler_collectors import CollectorOptions, _collect_rocm
+        from native_quantised_dispatch.profiler_evidence import Backend
+        original = _test_provenance("rocm")
+        request = SimpleNamespace(operation_kind=owner.OPERATION, architecture_class="gfx906",
+            build_id=mapping_digest(original), validate=lambda: None)
+        restored = []
+        @contextmanager
+        def power(*args):
+            try:
+                yield
+            finally:
+                restored.append(True)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            options = CollectorOptions(Backend.ROCM, root / "trainer", root / "rocprofv3", root)
+            with mock.patch.object(owner, "trainer_provenance", side_effect=[original,
+                    {**original, "core_library_sha256": "sha256:" + "9" * 64}]), \
+                    mock.patch("native_quantised_dispatch.profiler_collectors._rocm_native_power_scope", side_effect=power), \
+                    mock.patch("native_quantised_dispatch.profiler_collectors._collect_rocm_admitted") as collect:
+                with self.assertRaisesRegex(ValueError, "exact timing executable/core closure"):
+                    _collect_rocm(request, options, root)
+                collect.assert_called_once()
+            self.assertEqual(restored, [True])
+            receipt = json.loads((root / "native-executable-closure.json").read_text())
+            self.assertEqual(receipt["profiler_closure"], original)
+
+    def test_gfx1100_profile_power_scope_preserves_existing_stable_policy(self) -> None:
+        """An already stable participant retains its caller-owned policy without writes."""
+        from types import SimpleNamespace
+        from native_quantised_dispatch.profiler_collectors import CollectorOptions, _rocm_native_power_scope
+        from native_quantised_dispatch.profiler_evidence import Backend
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "rocprofv3"; tool.write_text("profiler fixture")
+            (root / "amd-smi").write_text("same-SDK management fixture")
+            options = CollectorOptions(Backend.ROCM, root / "trainer", tool, root)
+            request = SimpleNamespace(architecture_class="gfx1100",
+                config_json={"native_participant": {"gpu_pci": "0000:b5:00.0"}})
+            stable = "AMDSMI_DEV_PERF_LEVEL_STABLE_STD"
+            def query(command, environment, log_path, timeout_seconds):
+                """Reject every management write while answering the three state queries."""
+                self.assertIn("metric", command)
+                self.assertNotIn("set", command)
+                return subprocess.CompletedProcess(command, 0,
+                    json.dumps({"gpu_data": [{"perf_level": stable}]}), "")
+            with mock.patch("native_quantised_dispatch.profiler_collectors._run_command", side_effect=query) as run, \
+                 mock.patch("native_quantised_dispatch.profiler_collectors.tempfile.gettempdir", return_value=tmp):
+                with _rocm_native_power_scope(request, options, root):
+                    pass
+            self.assertEqual(run.call_count, 3)
+            receipt = json.loads((root / "native-power-state.json").read_text())
+            self.assertEqual((receipt["before"], receipt["during"], receipt["after"]), (stable,) * 3)
+            self.assertEqual(receipt["restoration_errors"], [])
+
+    def test_gfx1100_profile_power_scope_restores_after_failed_collection(self) -> None:
+        """A failed counter pass still restores and authenticates the original policy."""
+        from types import SimpleNamespace
+        from native_quantised_dispatch.profiler_collectors import (
+            CollectorOptions, ROCmProfilerPowerRestorationError, _rocm_native_power_scope,
+            _tool_command, collect_request)
+        from native_quantised_dispatch.profiler_evidence import Backend
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tool = root / "rocprofv3"; tool.write_text("profiler fixture")
+            (root / "amd-smi").write_text("same-SDK management fixture")
+            options = CollectorOptions(Backend.ROCM, root / "trainer", tool, root,
+                rocm_power_command_prefix=("sudo", "-n"))
+            self.assertEqual(_tool_command(options, "--version"), [str(tool), "--version"])
+            request = SimpleNamespace(architecture_class="gfx1100",
+                config_json={"native_participant": {"gpu_pci": "0000:b5:00.0"}})
+            mode = "AUTO"
+            failure = None
+            changes = []
+            def run(command, environment, log_path, timeout_seconds):
+                """Model the native CLI state transition without touching a device."""
+                nonlocal mode
+                if "set" in command:
+                    self.assertEqual(command[:2], ["sudo", "-n"])
+                    if command[-1] == "AUTO" and failure == "command":
+                        return subprocess.CompletedProcess(command, 1, "", "restore rejected")
+                    if not (command[-1] == "AUTO" and failure == "wrong-state"):
+                        mode = command[-1]
+                    changes.append(command[-1])
+                if log_path.name == "power-after.log" and failure == "query":
+                    return subprocess.CompletedProcess(command, 1, "", "state unavailable")
+                payload = {"gpu_data": [{"perf_level": "AMDSMI_DEV_PERF_LEVEL_" + mode}]}
+                return subprocess.CompletedProcess(command, 0, json.dumps(payload), "")
+            with mock.patch("native_quantised_dispatch.profiler_collectors._run_command", side_effect=run), \
+                 mock.patch("native_quantised_dispatch.profiler_collectors.tempfile.gettempdir", return_value=tmp):
+                with self.assertRaisesRegex(RuntimeError, "counter failure"):
+                    with _rocm_native_power_scope(request, options, root):
+                        self.assertEqual(mode, "STABLE_STD")
+                        raise RuntimeError("counter failure")
+                self.assertEqual(mode, "AUTO")
+                self.assertEqual(changes, ["STABLE_STD", "AUTO"])
+                receipt = json.loads((root / "native-power-state.json").read_text())
+                self.assertEqual(receipt["before"], receipt["after"])
+                self.assertEqual(receipt["during"], "AMDSMI_DEV_PERF_LEVEL_STABLE_STD")
+                mode = "MANUAL"; changes.clear()
+                with self.assertRaisesRegex(ValueError, "state left unchanged"):
+                    with _rocm_native_power_scope(request, options, root):
+                        self.fail("unsupported power policy entered collection")
+                self.assertEqual(mode, "MANUAL")
+                self.assertEqual(changes, [])
+                for failure in ("command", "wrong-state", "query"):
+                    with self.subTest(failure=failure):
+                        mode = "AUTO"
+                        with self.assertRaises(ROCmProfilerPowerRestorationError):
+                            with _rocm_native_power_scope(request, options, root):
+                                pass
+                        receipt = json.loads((root / "native-power-state.json").read_text())
+                        self.assertTrue(receipt["restoration_errors"])
+                        self.assertNotEqual(receipt["after"], receipt["before"])
+            # Restoration failure escapes per-request failure conversion, so a
+            # collection loop cannot launch its next request in a leaked mode.
+            options.binary.write_text("test executable"); options.binary.chmod(0o755); tool.chmod(0o755)
+            routed = SimpleNamespace(backend=Backend.ROCM, profile_required=True, request_id="fatal-policy")
+            with mock.patch("native_quantised_dispatch.profiler_collectors._write_binary_provenance"), \
+                 mock.patch("native_quantised_dispatch.profiler_collectors._collect_rocm",
+                    side_effect=ROCmProfilerPowerRestorationError("unrestored")) as collect:
+                with self.assertRaises(ROCmProfilerPowerRestorationError):
+                    for _ in range(2):
+                        collect_request(routed, options)
+                self.assertEqual(collect.call_count, 1)
+
     def test_native_q8_architecture_identity_and_receipt_are_strict(self) -> None:
         """Authored metadata cannot relabel a different architecture or participant."""
         cell = replace(self._native_q8_source(), prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED, gpu_architecture="gfx906")
@@ -567,9 +1130,31 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "architecture"):
             render_dense_overlay((replace(first, key=replace(first.key, architecture=None)),))
 
+    def test_low_bit_legacy_and_qualified_rows_keep_generator_order(self) -> None:
+        """Additive WMMA publication preserves legacy and other-target rows at one key."""
+        legacy = DenseOverlayEntry("rocm", DenseOverlayKey(0, 64, 128, 256),
+            ("Q4_0",), ("authored",), "N64/MT16/MB1/U2", (64, 16, 1, 2, 0, 0), 0., 0., 1.)
+        older = replace(legacy, key=replace(legacy.key, architecture=GPUArchitecture.parse("rocm", "gfx906")),
+                        launch=(64, 32, 1, 2, 0, 0))
+        wmma = replace(legacy, key=replace(legacy.key, architecture=GPUArchitecture.parse("rocm", "gfx1100")),
+                       candidate_id="WMMA/N64/MT64", launch=(64, 64, 1, 0, 0, 4))
+        base = render_dense_overlay((legacy, older))
+        output, receipt = retain_dense_overlay_base(base, (wmma,))
+        self.assertEqual((receipt["retained_keys"], receipt["replaced_keys"], receipt["output_keys"]), (2, 0, 3))
+        rows = [line for line in output.splitlines() if line.startswith("        {0,")]
+        self.assertEqual(len(rows), 3)
+        base_rows = [line for line in base.splitlines() if line.startswith("        {0,")]
+        self.assertEqual(rows[:2], base_rows)
+        self.assertIn(wmma.key.architecture.cpp_literal(), rows[2])
+        self.assertEqual(retain_dense_overlay_base(output, (wmma,))[0], output)
+        changed, receipt = retain_dense_overlay_base(output, (replace(wmma, launch=(128, 64, 1, 0, 0, 4)),))
+        self.assertEqual(receipt["replaced_keys"], 1)
+        for row in base_rows:
+            self.assertIn(row, changed)
+
     def test_native_q8_profile_requests_preserve_unforced_auto(self) -> None:
         """Original common profiling lowers the physical baseline to actual Auto."""
-        from native_quantised_dispatch.native_q8_prefill_profiler import build_manifest, environment, validate_request
+        from native_quantised_dispatch.native_prefill_profiler import build_manifest, environment, validate_request
         from native_quantised_dispatch.profiler_collectors import _profile_environment, _apply_device_placement, CollectorOptions
         cells = tuple(replace(self._native_q8_source(label), prepared_family=DensePreparedWeightFamily.NATIVE_QUANTISED,
                               gpu_architecture="gfx906") for label in ("Q8_0", "Q8_1", "Q8_K"))
@@ -595,7 +1180,7 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
 
     def test_native_q8_publication_authenticates_profiler_schema(self) -> None:
         """Publish typed evidence through the real readers and reject stale versions."""
-        from native_quantised_dispatch.native_q8_prefill_profiler import build_manifest, require_profile
+        from native_quantised_dispatch.native_prefill_profiler import build_manifest, require_profile
         from native_quantised_dispatch.profiler_evidence import (
             EXPECTED_PROFILER_TOOL, PROFILER_COLLECTOR_VERSION,
             PROFILER_METRIC_SET_VERSION, MetricAvailability, ProfiledDispatch,
@@ -992,9 +1577,9 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
 
     def test_cuda_staging_inventory_rejects_unsupported_and_spilling_symbols(self) -> None:
         """All formats get their physical copy-width and exact-resource gate."""
-        from native_quantised_dispatch.format_registry import CODEBOOK_PAYLOAD_BYTES
+        from native_quantised_dispatch.format_registry import GPU_EXECUTION_CODEBOOK_PAYLOAD_BYTES
 
-        for codebook, payload_bytes in CODEBOOK_PAYLOAD_BYTES.items():
+        for codebook, payload_bytes in GPU_EXECUTION_CODEBOOK_PAYLOAD_BYTES.items():
             for tile in range(6):
                 for staging in (1, 2, 3):
                     for canonical in (False, True):
@@ -1005,6 +1590,28 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
                             expected = False
                         with self.subTest(codebook=codebook, candidate=candidate):
                             self.assertEqual(_cuda_candidate_is_spill_free(codebook, candidate), expected)
+
+    def test_cuda_iq4_xs_staging_uses_physical_payload_identity(self) -> None:
+        """Physical24 retains all staged launches even though its source ID is4."""
+        cell = next(cell for cell in production_dense_prefill_cells("cuda")
+                    if cell.source_format.label == "IQ4_XS")
+        candidates = dense_prefill_candidate_ids("cuda", cell.source_format)
+        self.assertEqual(len(candidates), 43)
+        self.assertEqual(sum(":stage" in candidate for candidate in candidates), 30)
+        with tempfile.TemporaryDirectory() as tmp:
+            cell, paths = _write_cell(Path(tmp), "cuda", cell=cell,
+                                      winning_candidate="KPART:t2:stage3")
+            validate_production_dense_prefill_cell(paths.aggregate, paths.timing, cell, bench_runs=3)
+
+    def test_cuda_collection_clears_inherited_tile_and_peak_overrides(self) -> None:
+        """A user's diagnostic environment cannot shrink or relabel a tournament."""
+        cell = production_dense_prefill_cells("cuda")[0]
+        paths = production_dense_prefill_cell_paths(Path("/tmp/unused-dense-cell"), cell)
+        with mock.patch.dict(os.environ, {"LLAMINAR_TILE_SWEEP_TILES": "2",
+                                        "LLAMINAR_CUDA_NATIVE_GEMM_PEAK_TC_TOPS": "1"}):
+            environment = _cell_environment(cell, paths, 0, 10, 31)
+        self.assertNotIn("LLAMINAR_TILE_SWEEP_TILES", environment)
+        self.assertNotIn("LLAMINAR_CUDA_NATIVE_GEMM_PEAK_TC_TOPS", environment)
 
     def test_cuda_observed_staging_must_equal_the_forced_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1730,7 +2337,7 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
         self.assertEqual(receipt["replaced_keys"], 1)
         self.assertEqual(receipt["retained_keys"], 1)
         self.assertEqual(receipt["output_keys"], 2)
-        self.assertEqual(receipt["key_schema"], "codebook-m-n-k-prepared-family-native-q8-architecture")
+        self.assertEqual(receipt["key_schema"], "codebook-m-n-k-prepared-family-native-architecture")
         self.assertEqual(retain_dense_overlay_base(output, (changed,))[0], output)
         for malformed in (replace(native, launch=expanded.launch),
                           replace(expanded, launch=native.launch)):
@@ -1866,6 +2473,39 @@ class ProductionDensePrefillSweepTest(unittest.TestCase):
         spilling = tuple(entry_for(cell, tile_id=1) for cell in selected)
         with self.assertRaisesRegex(ValueError, "compiler-proven to spill"):
             validate_dense_overlay_totality(spilling, selected, "cuda")
+
+
+def load_tests(loader, tests, pattern):
+    """Partition CTest's complete module deterministically; direct runs stay whole.
+
+    Match the existing profiler-evidence shard protocol. Sorting complete test
+    IDs gives disjoint, exhaustive membership independent of suite nesting.
+    Explicit named integration selectors do not invoke this module discovery.
+    """
+    del loader, pattern
+    index_text = os.environ.get("LLAMINAR_UNIT_SHARD_INDEX")
+    count_text = os.environ.get("LLAMINAR_UNIT_SHARD_COUNT")
+    if index_text is None and count_text is None:
+        return tests
+    if index_text is None or count_text is None:
+        raise ValueError("both unit-test shard values must be set together")
+    index, count = int(index_text), int(count_text)
+    if count <= 0 or not 0 <= index < count:
+        raise ValueError("unit-test shard index must be in [0, positive count)")
+
+    def leaves(suite):
+        """Yield each original test exactly once, without running it."""
+        for test in suite:
+            if isinstance(test, unittest.TestSuite):
+                yield from leaves(test)
+            else:
+                yield test
+
+    ordered = sorted(leaves(tests), key=lambda test: test.id())
+    selected = ordered[index::count]
+    if not selected:
+        raise ValueError("unit-test shard must not be empty")
+    return unittest.TestSuite(selected)
 
 
 if __name__ == "__main__":
