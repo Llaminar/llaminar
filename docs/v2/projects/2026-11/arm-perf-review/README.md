@@ -6111,3 +6111,39 @@ comparison); x86 record/diff pending. Board: lane = A4-R package;
 re-verify (.80/.79/.WSL) per Main's plan; reviewer re-read at the
 fresh tip -> Gate-A. WSL base diff + develop discriminator pending
 independently.
+
+### A4-R successor ef86de1c1 verified; re-verification dispatched (13:44Z)
+
+Lane: A4-R on cccb84420 (20 files +221/-102; production =
+Admission.cpp + Resolver.h + Calibration.cpp = R-1 set; rest =
+tests/docs/registrations). Ledger: R-1 preparedFootprints default
+REMOVED (compiler lists every caller; 16 test/integration sites
+explicit kHostPreparedLayout; production passes observations);
+Calibration classified (consumes cpu_live_bytes max(cpu,gpu) =
+NOT GPU-only -> explicitly prices the build host layout pre-
+placement; per-layout re-priced at admission — stated in code);
+buildResolverInput threads the ADMITTED observation into BOTH
+footprint sites (one authority); regression
+TierLegacyCapAndFootprintsPriceTheAdmittedLayout (canonical +
+non-host-equal compact = TYPED RECORDER, fails closed naming the
+admitted layout; compact tables NOT enabled — no resolver seam
+exists, constraint recorded). R-2 EndpointLayoutContractSelects
+GpuConversionAndRejectsMismatch (computedHash differs + layout byte
+tamper w/o recompute FAILS; :535 live) in the EXISTING
+RectangularCPUWire filter. R-3 A4 focused regressions registered
+(MPITopologyCPUPreparedLayoutObservation, CrossLayoutCpuPairing +
+SavedPlanLayoutIsRechecked in the runtime-plan filter, both
+ResolvedCpuPreparedLayoutDoc tests, CpuResourcesPriceOnly +
+PreparedLayoutIsTheSoleCpuFootprintAuthority in the MoEPipeline
+StageCapacity filter) — no new gate. R-4 docs :1011-1019 =
+detail::admitReceiveLayout parameterized boundary (RAII gone).
+R-5 zero_root ZEROES data_stride + interleaved_block_stride (old
+witness was NOT actually zero = the genuine matching-zero-stride
+root); CPU-CPU ROOT overload; destination rejection = real CPU
+receiver manifest. Mac gates green; 20 TUs syntax-verified.
+COORDINATOR VERIFY: origin tip ef86de1c1 (+221/-102, src set as
+expected). DISPATCHED: sparks (.80 focused + .79 incremental w/
+diff vs 6ca seal; expected 0 reds + new tests green); WSL (base ->
+x86 diff -> x86 incremental ef86de1c1 -j4 parity first -> develop
+discriminator). Pins A3+A4+A4-R at ef86de1c1 -> Gate-A after the
+re-verification + reviewer re-read.
