@@ -20,8 +20,8 @@
  * oracle, but records the installed Auto route for isolated shard economics.
  * Its raw sample CSV is diagnostic evidence, never an installable tournament.
  * Q8 source-default records use their blockwise INT8 producer inventory. An
- * explicit native_quantised preparation scope instead packs original K32 Q8
- * payload/scales and measures its bounded cooperative family. These distinct
+ * explicit native_quantised preparation scope retains every format's original
+ * compact payload/scales and admits native gfx1100 WMMA candidates. These distinct
  * prepared ABIs retain separate plan/CSV identity and byte oracles; neither
  * family can reuse or reinterpret the other family's clocks.
  * Aggregate and event CSVs retain source codebook and physical execution ID
@@ -35,10 +35,12 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <functional>
 #include <iterator>
 #include <limits>
@@ -61,11 +63,13 @@
 #include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.h"
 #include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlayGenerated.inc"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedWmmaPolicy.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "tensors/Tensors.h"
 #include "utils/DebugEnv.h"
 #include "utils/Logger.h"
+#include "utils/PerfStatsCollector.h"
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/ScopedGPUStream.h"
@@ -310,6 +314,29 @@ namespace
                 << "M=" << m << " belongs to grouped verifier training";
     }
 
+    /** @brief Direct native preparation publishes complete geometry for every source format. */
+    TEST(NativeQuantisedSweepOffline, NativePreparationPublishesCompleteGeometry)
+    {
+        for (const auto &format : NATIVE_QUANTISED_FORMATS)
+        {
+            SCOPED_TRACE(format.name);
+            for (const auto [n, k] : {std::pair{65, 256}, std::pair{3, 512}})
+            {
+                auto weights = format.create(n, k);
+                ROCmPackedWeights packed;
+                packed.N = 17;
+                packed.K = 32;
+                ASSERT_TRUE(packNativeQuantised(weights.get(), packed));
+                EXPECT_EQ(packed.N, n);
+                EXPECT_EQ(packed.K, k);
+                EXPECT_EQ(packed.native_quantised_blocks_per_row, k / 32);
+                EXPECT_TRUE(packed.native_source_identity.present);
+                EXPECT_EQ(packed.native_quantised_codebook_id,
+                    canonicalDeviceVnniCodebookId(requireNativeQuantisedInfo(weights.get(), format.name)));
+            }
+        }
+    }
+
     // =========================================================================
     // Variant definitions
     // =========================================================================
@@ -405,12 +432,27 @@ namespace
         return result;
     }
 
-    /** Return the exact candidate inventory launchable for one source format. */
+    /**
+     * @brief Return the exact candidate inventory launchable for one source format.
+     * @param format_name Original source format, including independent prepared aliases.
+     * @param prepared_family Explicit native preparation or the source-default contract.
+     * @param device_ordinal Admitted visible participant whose native ISA owns candidate admission.
+     * @return Concrete launch candidates and the existing Auto control for that contract.
+     */
     static std::vector<VariantConfig> trainerVariantsForFormat(
         const std::string &format_name,
-        std::optional<DensePrefillWeightFamily> prepared_family = std::nullopt)
+        std::optional<DensePrefillWeightFamily> prepared_family = std::nullopt,
+        int device_ordinal = 0)
     {
         std::vector<VariantConfig> result;
+        const auto append_wmma = [prepared_family, device_ordinal](std::vector<VariantConfig> &variants) {
+            if (prepared_family != DensePrefillWeightFamily::NativeQuantised) return;
+            if (nativeQuantisedHardwareForDevice(device_ordinal).architecture !=
+                native_quantised::NativeQuantisedArchitecture::rocm(11, 0, 0)) return;
+            for (const auto [mt, nt] : {std::pair{32, 32}, std::pair{32, 64}, std::pair{64, 64}, std::pair{64, 128}})
+                variants.push_back({"WMMA/N" + std::to_string(nt) + "/MT" + std::to_string(mt),
+                    nt, mt, 1, 0, 0, VNNIPrefillProducer::NativeWmma});
+        };
         result.reserve(NATIVE_QUANTISED_VARIANTS.size() + 32);
         const auto auto_iterator = std::find_if(
             NATIVE_QUANTISED_VARIANTS.begin(),
@@ -424,10 +466,12 @@ namespace
                 // Explicit original native K32 payload/scales. These three
                 // existing physical configurations are the bounded prepared-Q8
                 // comparison, not aliases for the expanded INT8 producers.
-                return {{"N64/MT16/MB1/U2",64,16,1,2,0,VNNIPrefillProducer::NativeCooperative},
+                result = {{"N64/MT16/MB1/U2",64,16,1,2,0,VNNIPrefillProducer::NativeCooperative},
                         {"N64/MT32/MB1/U2",64,32,1,2,0,VNNIPrefillProducer::NativeCooperative},
                         {"N128/MT32/MB1/U2",128,32,1,2,0,VNNIPrefillProducer::NativeCooperative},
                         *auto_iterator};
+                append_wmma(result);
+                return result;
             }
             // These controls belong to the actual INT8 blockwise producer.
             // NativeQuantised overrides have no effect on Q8 and must not create
@@ -471,6 +515,7 @@ namespace
         }
         if (auto_iterator != NATIVE_QUANTISED_VARIANTS.end())
             result.push_back(*auto_iterator);
+        append_wmma(result);
         return result;
     }
 
@@ -526,7 +571,9 @@ namespace
     public:
         ScopedROCmNativeQuantisedTrainerOverride()
         {
+            saved_wmma_ = nativeQuantisedWmmaOverride();
             const auto &config = debugEnv().rocm;
+            saved_gemv_kb_ = config.native_quantised_gemv_kb;
             saved_mt_ = config.native_quantised_mt;
             saved_unroll_ = config.native_quantised_unroll;
             saved_min_blocks_ = config.native_quantised_min_blocks;
@@ -543,7 +590,9 @@ namespace
 
         ~ScopedROCmNativeQuantisedTrainerOverride()
         {
+            setNativeQuantisedWmmaOverride(saved_wmma_);
             auto &config = mutableDebugEnv().rocm;
+            config.native_quantised_gemv_kb = saved_gemv_kb_;
             config.native_quantised_mt = saved_mt_;
             config.native_quantised_unroll = saved_unroll_;
             config.native_quantised_min_blocks = saved_min_blocks_;
@@ -566,6 +615,12 @@ namespace
         /** Select one exact compile-time candidate for subsequent launches. */
         void apply(const VariantConfig &variant)
         {
+            std::optional<NativeQuantisedWmmaTile> wmma;
+            if (variant.producer == VNNIPrefillProducer::NativeWmma)
+                wmma = variant.force_n == 128 ? NativeQuantisedWmmaTile::M64N128 :
+                    variant.force_n == 32 ? NativeQuantisedWmmaTile::M32N32 :
+                    variant.mt == 32 ? NativeQuantisedWmmaTile::M32N64 : NativeQuantisedWmmaTile::M64N64;
+            setNativeQuantisedWmmaOverride(wmma);
             auto &config = mutableDebugEnv().rocm;
             const bool native = variant.producer == VNNIPrefillProducer::NativeCooperative;
             const bool int8_v3 = variant.producer == VNNIPrefillProducer::Int8BlockwiseV3;
@@ -585,6 +640,8 @@ namespace
         }
 
     private:
+        std::optional<NativeQuantisedWmmaTile> saved_wmma_;
+        int saved_gemv_kb_ = -1;
         int saved_mt_ = -1;
         int saved_unroll_ = -1;
         int saved_min_blocks_ = -1;
@@ -707,9 +764,18 @@ namespace
     public:
         /**
          * @brief Prepare one original source ABI and its retained exact-M oracle.
+         * @param shape Immutable N/K geometry retained throughout this execution object's lifetime.
+         * @param m Positive live row count, shared by every candidate and its oracle.
+         * @param weights Original host-owned source weights, packed once during construction.
+         * @param variants Complete candidate set whose workspace requirements are admitted together.
+         * @param maximum_bench_runs Positive capacity for persistent timing events and samples.
+         * @param dispatch Explicit generic tournament or installed production lookup policy.
          * @param prepared_family Null preserves source-default preparation; the
-         * explicit NativeQuantised value admits original native Q8 only.
+         * explicit NativeQuantised value preserves each source format's native payload.
          * The choice is immutable throughout this invocation and capture.
+         * @param device_ordinal Original visible ordinal owning every retained operand and graph.
+         * @throws std::invalid_argument On incomplete geometry or unsupported preparation policy.
+         * @throws std::runtime_error On failed device preparation, allocation or oracle publication.
          */
         PreparedROCmSweepExecution(
             const GEMMShape &shape,
@@ -718,8 +784,9 @@ namespace
             const std::vector<VariantConfig> &variants,
             int maximum_bench_runs,
             SweepDispatch dispatch = SweepDispatch::GenericTournament,
-            std::optional<DensePrefillWeightFamily> prepared_family = std::nullopt)
-            : overlay_lookup_(dispatch), shape_(shape), m_(m)
+            std::optional<DensePrefillWeightFamily> prepared_family = std::nullopt,
+            int device_ordinal = 0)
+            : device_ordinal_(device_ordinal), overlay_lookup_(dispatch), shape_(shape), m_(m)
         {
             if (!weights || m_ <= 0 || shape_.N <= 0 || shape_.K <= 0 ||
                 maximum_bench_runs <= 0)
@@ -727,12 +794,11 @@ namespace
                 throw std::invalid_argument(
                     "invalid ROCm NativeQuantised tournament geometry");
             }
-            requireHip(hipSetDevice(kDeviceOrdinal), "select device");
+            requireHip(hipSetDevice(device_ordinal_), "select device");
             expected_codebook_ = canonicalDeviceVnniCodebookId(
                 requireNativeQuantisedInfo(weights, "ROCm tournament source weights"));
-            if (prepared_family && (expected_codebook_ != 19 ||
-                *prepared_family != DensePrefillWeightFamily::NativeQuantised))
-                throw std::invalid_argument("Explicit sweep preparation requires original native Q8");
+            if (prepared_family && *prepared_family != DensePrefillWeightFamily::NativeQuantised)
+                throw std::invalid_argument("Explicit sweep preparation requires original native payloads");
             const bool packed = prepared_family
                 ? packNativeQuantised(weights, packed_)
                 : packWeightsToROCm(weights, packed_);
@@ -741,9 +807,9 @@ namespace
                     "failed to pack persistent ROCm NativeQuantised weights");
 
             kernel_ = std::make_unique<ROCmQuantisedGemmKernel>(
-                &packed_, kDeviceOrdinal);
+                &packed_, device_ordinal_);
             stream_owner_ = std::make_unique<ScopedGPUStream>(
-                DeviceId::rocm(kDeviceOrdinal));
+                DeviceId::rocm(device_ordinal_));
             stream_ = static_cast<hipStream_t>(stream_owner_->get());
             kernel_->setGPUStream(static_cast<void *>(stream_));
 
@@ -763,7 +829,7 @@ namespace
                 required + required / 10,
                 size_t{64} * 1024 * 1024);
             workspace_ = std::make_unique<DeviceWorkspaceManager>(
-                DeviceId::rocm(kDeviceOrdinal), budget);
+                DeviceId::rocm(device_ordinal_), budget);
             if (!workspace_->allocate(requirements))
                 throw std::runtime_error(
                     "failed to allocate persistent ROCm sweep workspace");
@@ -783,7 +849,7 @@ namespace
                 throw std::runtime_error(
                     "failed to construct persistent ROCm sweep tensors");
 
-            const DeviceId device = DeviceId::rocm(kDeviceOrdinal);
+            const DeviceId device = DeviceId::rocm(device_ordinal_);
             if (!input_->ensureOnDevice(device, stream_) ||
                 !output_->allocateOnDevice(device, stream_) ||
                 !oracle_output_->allocateOnDevice(device, stream_) ||
@@ -849,7 +915,7 @@ namespace
                         "Producer-only NativeQuantised probe requires a NativeQuantised matrix; "
                         "This prepared family uses the separate expanded INT8 producer");
             }
-            BenchResult result = inspectCandidate(variant);
+            BenchResult result = inspectCandidate(variant, submission);
 
             // Capture after all persistent resources and launch metadata exist.
             // Production tournaments and scaling probes measure the retained
@@ -860,7 +926,7 @@ namespace
             std::unique_ptr<HIPGraphCapture> graph;
             if (submission != SweepSubmission::Direct)
             {
-                graph = std::make_unique<HIPGraphCapture>(stream_, kDeviceOrdinal);
+                graph = std::make_unique<HIPGraphCapture>(stream_, device_ordinal_);
                 ScopedBackendGraphCapture capture(*graph, "NativeQuantised captured shape probe");
                 if (!capture.begin())
                     throw std::runtime_error("cannot begin captured shape probe");
@@ -887,6 +953,8 @@ namespace
             for (int iteration = 0; iteration < warmup_runs; ++iteration)
                 submit();
             checkStream("candidate warmup");
+            if (graph)
+                proveDirtyReplay(*graph, submission, result.observed_producer);
 
             for (int iteration = 0; iteration < bench_runs; ++iteration)
             {
@@ -965,25 +1033,31 @@ namespace
         /**
          * @brief Functional captured-replay proof, without a benchmark loop.
          * @param variant Exact producer to authenticate and byte-compare.
+         * @param submission Complete projection or explicit production GEMM leaf.
          * @return Physical launch and complete-output byte-certificate evidence.
          * Poisoning the destination prevents the resource probe's prior output
          * from disguising a missing captured write. No timing threshold or
          * performance measurement belongs in this preflight operation.
          */
-        BenchResult verifyCaptured(const VariantConfig &variant)
+        BenchResult verifyCaptured(const VariantConfig &variant,
+            SweepSubmission submission = SweepSubmission::Captured)
         {
-            BenchResult result = inspectCandidate(variant);
+            if (submission == SweepSubmission::Direct)
+                throw std::invalid_argument("captured replay requires an explicit captured surface");
+            BenchResult result = inspectCandidate(variant, submission);
             requireHip(hipMemsetAsync(output_->gpu_data_ptr(), 0xff,
                 static_cast<size_t>(m_) * shape_.N * sizeof(float), stream_),
                 "poison captured proof destination");
-            HIPGraphCapture graph(stream_, kDeviceOrdinal);
+            HIPGraphCapture graph(stream_, device_ordinal_);
             ScopedBackendGraphCapture capture(graph, "VNNI producer identity proof");
             if (!capture.begin())
                 throw std::runtime_error("cannot capture VNNI producer identity proof");
-            launch(output_.get());
+            if (submission == SweepSubmission::CapturedProducer) launchProducer();
+            else launch(output_.get());
             capture.finish();
-            if (!graph.instantiate() || !graph.launch())
-                throw std::runtime_error("cannot replay VNNI producer identity proof");
+            if (!graph.instantiate())
+                throw std::runtime_error("cannot instantiate VNNI producer identity proof");
+            proveDirtyReplay(graph, submission, result.observed_producer);
             const auto certificate = certify();
             result.byte_mismatches_vs_auto = certificate[0];
             result.first_byte_mismatch_vs_auto = certificate[1];
@@ -1009,8 +1083,8 @@ namespace
                 std::to_string(observed.observed_unroll) + "," + (observed.observed_full_tiles ? "1" : "0") + "," +
                 std::to_string(static_cast<int>(observed.observed_producer));
             if (physical != getEnvString("LLAMINAR_ROCM_DENSE_PRODUCTION_PROFILE_EXPECTED_LAUNCH"))
-                throw std::runtime_error("native Q8 profiler physical launch differs from sealed timing");
-            HIPGraphCapture graph(stream_, kDeviceOrdinal);
+                throw std::runtime_error("native prefill profiler physical launch differs from sealed timing");
+            HIPGraphCapture graph(stream_, device_ordinal_);
             ScopedBackendGraphCapture capture(graph, "ROCm dense exact-candidate profiler");
             if (!capture.begin()) throw std::runtime_error("cannot capture ROCm dense profiler projection");
             launch(output_.get());
@@ -1046,27 +1120,132 @@ namespace
                 request_id.c_str(), variant.name.c_str(), m_);
         }
 
+        /**
+         * @brief Prove the shared certificate rejects missing native graph work.
+         * @param variant Exact launch whose actual quantizer and projection nodes are disabled.
+         * Re-enable the same executable and require complete dirty replay after each fault.
+         */
+        void verifyDirtyReplayNegativeControls(const VariantConfig &variant)
+        {
+            const auto observed = inspectCandidate(variant);
+            HIPGraphCapture graph(stream_, device_ordinal_);
+            ScopedBackendGraphCapture capture(graph, "ROCm dirty replay controls");
+            ASSERT_TRUE(capture.begin());
+            launch(output_.get());
+            capture.finish();
+            ASSERT_TRUE(graph.instantiate());
+            size_t count = 0;
+            ASSERT_EQ(hipGraphGetNodes(graph.graph(), nullptr, &count), hipSuccess);
+            std::vector<hipGraphNode_t> nodes(count);
+            ASSERT_EQ(hipGraphGetNodes(graph.graph(), nodes.data(), &count), hipSuccess);
+            for (const bool omit_quantizer : {false, true})
+            {
+                proveDirtyReplay(graph, SweepSubmission::Captured, observed.observed_producer);
+                std::vector<hipGraphNode_t> disabled;
+                int quantizers = 0, primaries = 0;
+                for (const auto node : nodes)
+                {
+                    hipGraphNodeType type;
+                    ASSERT_EQ(hipGraphNodeGetType(node, &type), hipSuccess);
+                    if (type != hipGraphNodeTypeKernel) continue;
+                    hipKernelNodeParams parameters{};
+                    ASSERT_EQ(hipGraphKernelNodeGetParams(node, &parameters), hipSuccess);
+                    ASSERT_NE(parameters.kernelParams, nullptr);
+                    ASSERT_NE(parameters.kernelParams[0], nullptr);
+                    const void *first_argument = *static_cast<void **>(parameters.kernelParams[0]);
+                    const bool quantizer = first_argument == input_->gpu_data_ptr();
+                    const bool primary = first_argument == workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A);
+                    ASSERT_TRUE(quantizer || primary) << "unrecognized captured kernel role";
+                    quantizers += quantizer; primaries += primary;
+                    if (quantizer != omit_quantizer) continue;
+                    ASSERT_EQ(hipGraphNodeSetEnabled(graph.executable(), node, 0), hipSuccess);
+                    disabled.push_back(node);
+                }
+                ASSERT_EQ(quantizers, 1);
+                ASSERT_EQ(primaries, 1);
+                ASSERT_FALSE(disabled.empty());
+                EXPECT_THROW(proveDirtyReplay(graph, SweepSubmission::Captured,
+                    observed.observed_producer), std::runtime_error);
+                for (const auto node : disabled)
+                    ASSERT_EQ(hipGraphNodeSetEnabled(graph.executable(), node, 1), hipSuccess);
+                EXPECT_NO_THROW(proveDirtyReplay(graph, SweepSubmission::Captured,
+                    observed.observed_producer));
+            }
+        }
+
     private:
-        static constexpr int kDeviceOrdinal = 0;
+        const int device_ordinal_;
+
+        /**
+         * @brief Poison the exact live banks consumed by this retained projection.
+         * @param poison Reset byte pattern, outside timing and capture.
+         * @param submission Producer-only probes preserve their authenticated quantized inputs.
+         * @param producer Observed native or expanded-INT8 physical producer.
+         */
+        void poisonProjection(int poison, SweepSubmission submission, VNNIPrefillProducer producer)
+        {
+            const auto bank = [&](const char *name, size_t bytes) {
+                if (!workspace_->getBuffer(name) || workspace_->getBufferSize(name) < bytes)
+                    throw std::runtime_error("ROCm dirty replay scratch extent exceeds admission");
+                requireHip(hipMemsetAsync(workspace_->getBuffer(name), poison, bytes, stream_),
+                    "poison consumed projection scratch");
+            };
+            const size_t output_bytes = static_cast<size_t>(m_) * shape_.N * sizeof(float);
+            requireHip(hipMemsetAsync(output_->gpu_data_ptr(), poison, output_bytes, stream_),
+                "poison projection destination");
+            if (submission != SweepSubmission::CapturedProducer)
+            {
+                bank(GemmWorkspaceBuffers::QUANT_A, static_cast<size_t>(m_) * shape_.K);
+                bank(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE,
+                    static_cast<size_t>(m_) * (shape_.K / 32) * sizeof(float));
+            }
+            if (producer == VNNIPrefillProducer::Int8BlockwiseV3 ||
+                producer == VNNIPrefillProducer::Int8BlockwiseV7)
+                bank(GemmWorkspaceBuffers::ACC_INT32, output_bytes);
+        }
+
+        /**
+         * @brief Certify three dirty resets of the actual retained executable.
+         * @param graph Executable whose nodes will also supply the timing samples.
+         * @param submission Complete projection or authenticated producer-only surface.
+         * @param producer Exact producer observed before recording.
+         * @throws std::runtime_error On omitted work or any changed output byte.
+         */
+        void proveDirtyReplay(HIPGraphCapture &graph, SweepSubmission submission,
+                              VNNIPrefillProducer producer)
+        {
+            for (const int poison : {0xff, 0x55, 0x00})
+            {
+                poisonProjection(poison, submission, producer);
+                if (!graph.launch()) throw std::runtime_error("ROCm dirty replay launch failed");
+                if (certify()[0] != 0)
+                    throw std::runtime_error("ROCm dirty replay changed exact-M output bytes");
+            }
+        }
 
         /**
          * @brief Resolve physical identity and compiler resources before timing.
          * @param variant Requested controls, or installed Auto.
+         * @param submission Physical projection or explicitly isolated GEMM leaf.
          * @return Complete physical observation; stale/foreign/spilling launches
          *         throw before any timing or artifact can be published.
          */
-        BenchResult inspectCandidate(const VariantConfig &variant)
+        BenchResult inspectCandidate(const VariantConfig &variant,
+            SweepSubmission submission = SweepSubmission::Direct)
         {
             override_.apply(variant);
             clearVNNIPrefillLaunch();
-            launch(output_.get());
+            if (submission == SweepSubmission::CapturedProducer) launchProducer();
+            else launch(output_.get());
             checkStream("candidate resource probe");
             const auto observed = lastVNNIPrefillLaunch();
             VNNIPrefillLaunchResources resources;
             if (!observed || observed->execution_codebook != expected_codebook_ ||
                 (variant.producer && observed->producer != *variant.producer) ||
                 !inspectVNNIPrefillLaunch(*observed, resources))
-                throw std::runtime_error("ROCm VNNI trainer could not inspect its launch");
+                throw std::runtime_error("ROCm VNNI trainer could not inspect " + variant.name +
+                    " M=" + std::to_string(m_) + " N=" + std::to_string(shape_.N) +
+                    " K=" + std::to_string(shape_.K));
             BenchResult result;
             result.variant_name = variant.name;
             result.shape_name = shape_.name;
@@ -1143,9 +1322,14 @@ namespace
         void launchProducer()
         {
             DeviceNativeQuantisedMatrixDesc weights;
-            if (!kernel_->exportNativeQuantisedMatrixDesc(weights) || !weights.valid() ||
+            const bool exported = kernel_->exportNativeQuantisedMatrixDesc(weights);
+            if (!exported || !weights.valid() ||
                 !weights.source_identity_present)
-                throw std::runtime_error("captured producer requires prepared source-aware weights");
+                throw std::runtime_error("captured producer requires prepared source-aware weights: M=" +
+                    std::to_string(m_) + " expected_codebook=" + std::to_string(expected_codebook_) +
+                    " exported=" + std::to_string(exported) + " n=" + std::to_string(weights.n) +
+                    " k=" + std::to_string(weights.k) + " blocks=" + std::to_string(weights.blocks_per_row) +
+                    " source_present=" + std::to_string(weights.source_identity_present));
             const auto *activations = static_cast<const int8_t *>(
                 workspace_->getBuffer(GemmWorkspaceBuffers::QUANT_A));
             const auto *row_scales = static_cast<const float *>(
@@ -1157,7 +1341,7 @@ namespace
                     activations, weights.payload, weights.scales, weights.mins, weights.emins,
                     static_cast<float *>(output_->gpu_data_ptr()), row_scales, block_scales,
                     m_, shape_.N, shape_.K, weights.codebook_id,
-                    weights.arithmeticPolicyCodebookId(), kDeviceOrdinal, stream_))
+                    canonicalDeviceVnniCodebookId(weights.source_codebook_id), device_ordinal_, stream_))
                 throw std::runtime_error("captured NativeQuantised producer launch failed");
         }
 
@@ -1246,6 +1430,16 @@ namespace
                 const auto &facts = inventory.at(0);
                 device_name_ = facts.name + " (" + facts.isa_target + ")";
             }
+            for (size_t index = 0; index < inventory.size(); ++index)
+            {
+                const auto &facts = inventory.at(index);
+                if (native_quantised::NativeQuantisedArchitecture::fromROCmISATarget(facts.isa_target) ==
+                    native_quantised::NativeQuantisedArchitecture::rocm(11, 0, 0))
+                {
+                    wmma_device_ordinal_ = facts.ordinal;
+                    break;
+                }
+            }
 #else
             has_device_ = false;
 #endif
@@ -1253,6 +1447,23 @@ namespace
 
         bool has_device_ = false;
         std::string device_name_;
+        std::optional<int> wmma_device_ordinal_;
+
+        /** @brief Bind replay evidence to the admitted native participant, without rediscovery. */
+        void recordWmmaDevice() const
+        {
+            const auto &facts = rocmHardwareMetadata().at(wmma_device_ordinal_.value());
+            std::string uuid;
+            constexpr char digits[] = "0123456789abcdef";
+            for (const auto byte : facts.uuid)
+            {
+                uuid += digits[byte >> 4];
+                uuid += digits[byte & 15];
+            }
+            RecordProperty("wmma_device_ordinal", facts.ordinal);
+            RecordProperty("wmma_device_uuid", uuid);
+            RecordProperty("wmma_device_isa", facts.isa_target);
+        }
     };
 
     /** @brief A fresh filtered trainer publishes actual identity before preparing any tensor. */
@@ -1304,6 +1515,267 @@ namespace
             }
         }
 #endif
+    }
+
+    /** @test PerfStats names the physical producer bound into each retained graph. */
+    TEST_F(NativeQuantisedSweepTest, CapturedPrefillPerfStatsAuthenticatesPhysicalProducer)
+    {
+        ASSERT_TRUE(has_device_);
+        const int device_ordinal = wmma_device_ordinal_.value_or(0);
+        if (wmma_device_ordinal_) recordWmmaDevice();
+        /** @brief Restore the caller's observation policy even after an assertion. */
+        struct ObservationScope
+        {
+            std::array<const char *, 2> names{"LLAMINAR_PERF_STATS_SUMMARY", "LLAMINAR_PERF_STATS_FILTER"};
+            std::array<std::optional<std::string>, 2> previous;
+            /** @brief Enable only the capture-time producer family at a quiescent test boundary. */
+            ObservationScope()
+            {
+                for (size_t index = 0; index < names.size(); ++index)
+                    if (const char *value = std::getenv(names[index])) previous[index] = value;
+                setenv(names[0], "1", 1);
+                setenv(names[1], "kernel.rocm_native_quantised_prefill_launch", 1);
+                PerfStatsCollector::reset();
+            }
+            /** @brief Restore original filters and retire test observations. */
+            ~ObservationScope()
+            {
+                for (size_t index = 0; index < names.size(); ++index)
+                    if (previous[index]) setenv(names[index], previous[index]->c_str(), 1);
+                    else unsetenv(names[index]);
+                PerfStatsCollector::reset();
+            }
+        } observation;
+        // Native replays do not manufacture additional host launch counts.
+        ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("kernel"));
+        const GEMMShape shape{"producer_stats", "regression", 65, 256};
+        for (const auto &format : NATIVE_QUANTISED_FORMATS)
+        {
+            SCOPED_TRACE(format.name);
+            auto weights = format.create(shape.N, shape.K);
+            const auto physical = canonicalDeviceVnniCodebookId(requireNativeQuantisedInfo(weights.get(), format.name));
+            const auto family = DensePrefillWeightFamily::NativeQuantised;
+            const auto inventory = trainerVariantsForFormat(format.name, family, device_ordinal);
+            std::vector<VariantConfig> variants;
+            const auto cooperative = std::find_if(inventory.begin(), inventory.end(), [](const auto &variant) {
+                return variant.producer == VNNIPrefillProducer::NativeCooperative;
+            });
+            ASSERT_NE(cooperative, inventory.end());
+            variants.push_back(*cooperative);
+            for (const auto &variant : inventory)
+                if (variant.producer == VNNIPrefillProducer::NativeWmma &&
+                    (variant.force_n == 32 || variant.force_n == 128)) variants.push_back(variant);
+            const bool wmma_hardware = nativeQuantisedHardwareForDevice(device_ordinal).architecture ==
+                native_quantised::NativeQuantisedArchitecture::rocm(11, 0, 0);
+            ASSERT_EQ(variants.size(), wmma_hardware ? 3u : 1u);
+            PreparedROCmSweepExecution execution(shape, 33, weights.get(), variants, 1,
+                SweepDispatch::GenericTournament, family, device_ordinal);
+            for (const auto &variant : variants)
+            {
+                SCOPED_TRACE(variant.name);
+                PerfStatsCollector::reset();
+                const auto result = execution.verifyCaptured(variant);
+                ASSERT_TRUE(result.correctness_pass);
+                ASSERT_EQ(result.local_memory_bytes_per_thread, 0u);
+                ASSERT_EQ(result.observed_producer, *variant.producer);
+                const auto launch = lastVNNIPrefillLaunch();
+                ASSERT_TRUE(launch);
+                const auto records = PerfStatsCollector::snapshot({"kernel.rocm_native_quantised_prefill_launch"});
+                ASSERT_EQ(records.size(), 1u);
+                const auto &record = records.front();
+                EXPECT_EQ(record.kind, PerfStatRecord::Kind::Counter);
+                EXPECT_EQ(record.domain, "kernel");
+                EXPECT_EQ(record.phase, "gemm");
+                EXPECT_EQ(record.device, "rocm:" + std::to_string(device_ordinal));
+                EXPECT_EQ(record.count, 2u);
+                EXPECT_EQ(record.value, 2.0);
+                const PerfStatsCollector::Tags expected{
+                    {"codebook", std::to_string(physical)},
+                    {"arithmetic_policy_codebook", std::to_string(physical == 24 ? 4 : physical)},
+                    {"m", "33"}, {"n", "65"}, {"k", "256"},
+                    {"producer", vnniPrefillProducerName(*variant.producer)},
+                    {"n_tile", std::to_string(variant.force_n)}, {"m_tile", std::to_string(variant.mt)},
+                    {"min_blocks", std::to_string(variant.min_blocks)},
+                    {"unroll", std::to_string(variant.unroll < 0 ? 4 : variant.unroll)},
+                    {"full_tiles", "0"}, {"block_threads", std::to_string(launch->block_threads)},
+                    {"dynamic_shared_memory_bytes", std::to_string(launch->dynamic_shared_memory_bytes)}};
+                EXPECT_EQ(record.tags, expected);
+            }
+        }
+    }
+
+    /** @test Real retained projections reject omitted quantizers and output producers. */
+    TEST_F(NativeQuantisedSweepTest, DirtyCapturedReplayRejectsMissingWork)
+    {
+        ASSERT_TRUE(has_device_);
+        const GEMMShape shape{"dirty_replay", "regression", 512, 2048};
+        for (const auto &format : NATIVE_QUANTISED_FORMATS)
+        {
+            SCOPED_TRACE(format.name);
+            auto weights = format.create(shape.N, shape.K);
+            const auto variants = trainerVariantsForFormat(format.name);
+            const auto auto_variant = std::find_if(variants.begin(), variants.end(),
+                [](const auto &variant) { return variant.name == "Auto"; });
+            ASSERT_NE(auto_variant, variants.end());
+            PreparedROCmSweepExecution execution(shape, 64, weights.get(), {*auto_variant}, 1,
+                SweepDispatch::GenericTournament, DensePrefillWeightFamily::NativeQuantised);
+            execution.verifyDirtyReplayNegativeControls(*auto_variant);
+        }
+    }
+
+    /** @brief Replay every source decoder through native WMMA, including both output tails. */
+    TEST_F(NativeQuantisedSweepTest, WmmaCapturedReplayAllFormats)
+    {
+        ASSERT_TRUE(has_device_);
+        if (!wmma_device_ordinal_)
+            GTEST_SKIP() << "Native WMMA replay requires gfx1100";
+        const int device_ordinal = *wmma_device_ordinal_;
+        recordWmmaDevice();
+        ScopedROCmNativeQuantisedTrainerOverride partition_guard;
+        const int original_partitions = debugEnv().rocm.native_quantised_gemv_kb;
+        for (const auto &format : NATIVE_QUANTISED_FORMATS)
+        {
+            SCOPED_TRACE(format.name);
+            const auto family = std::optional{DensePrefillWeightFamily::NativeQuantised};
+            auto variants = trainerVariantsForFormat(format.name, family, device_ordinal);
+            std::erase_if(variants, [](const auto &variant) {
+                return variant.producer != VNNIPrefillProducer::NativeWmma;
+            });
+            ASSERT_EQ(variants.size(), 4u);
+            std::vector<std::tuple<int, int, int>> geometries{
+                {32, 64, 256}, {33, 65, 512}, {65, 65, 1280}, {64, 96, 768}, {127, 63, 256}, {65, 129, 256}};
+            // Exhaust the small/grouped row surface rather than sampling only
+            // tile boundaries, then exercise every larger prefill anchor.
+            for (int m = 1; m <= 129; ++m) geometries.emplace_back(m, 65, 256);
+            for (const int m : {256, 512, 1024}) geometries.emplace_back(m, 129, 256);
+            for (const int n : {1, 3, 15, 16, 17, 31, 32, 33, 63, 64, 127, 128})
+                geometries.emplace_back(33, n, 256);
+            const auto source = std::find_if(native_quantised_formats::kAllSourceFormats.begin(),
+                native_quantised_formats::kAllSourceFormats.end(),
+                [&](const auto &candidate) { return candidate.quant_type == format.name; });
+            ASSERT_NE(source, native_quantised_formats::kAllSourceFormats.end());
+            if (!source->metadata->is_superblock)
+                for (const int k : {32, 96, 160}) geometries.emplace_back(33, 65, k);
+            for (const auto [m, n, k] : geometries)
+            {
+                mutableDebugEnv().rocm.native_quantised_gemv_kb =
+                    k == 768 ? 5 : k == 1280 ? 3 : original_partitions;
+                SCOPED_TRACE(::testing::Message() << "M=" << m << " N=" << n << " K=" << k);
+                const GEMMShape shape{"wmma-replay", "tail", n, k};
+                auto weights = format.create(shape.N, shape.K);
+                PreparedROCmSweepExecution execution(shape, m, weights.get(), variants, 1,
+                    SweepDispatch::GenericTournament, family, device_ordinal);
+                for (const auto &variant : variants)
+                {
+                    SCOPED_TRACE(variant.name);
+                    // Ordinary M1 routes through GEMV. Prove the WMMA leaf
+                    // explicitly against that complete serial oracle; larger
+                    // rows replay the complete production projection pipeline.
+                    const auto result = execution.verifyCaptured(variant, m == 1
+                        ? SweepSubmission::CapturedProducer : SweepSubmission::Captured);
+                    EXPECT_EQ(result.observed_producer, VNNIPrefillProducer::NativeWmma);
+                    EXPECT_EQ(result.byte_mismatches_vs_auto, 0u);
+                    EXPECT_EQ(result.local_memory_bytes_per_thread, 0u);
+                    EXPECT_GT(result.max_active_blocks_per_sm, 0);
+                }
+            }
+        }
+    }
+
+    /** @brief Prequantized replay preserves signed zero, K tails and partition boundaries. */
+    TEST_F(NativeQuantisedSweepTest, WmmaWholeRowScaleAndPartialKReplay)
+    {
+        ASSERT_TRUE(has_device_);
+        if (!wmma_device_ordinal_)
+            GTEST_SKIP() << "Native WMMA replay requires gfx1100";
+        const int device_ordinal = *wmma_device_ordinal_;
+        recordWmmaDevice();
+        ScopedROCmNativeQuantisedTrainerOverride override;
+        ScopedDensePrefillLookup lookup(SweepDispatch::GenericTournament);
+        const auto check = [](hipError_t error) {
+            if (error != hipSuccess) throw std::runtime_error(hipGetErrorString(error));
+        };
+        check(hipSetDevice(device_ordinal));
+        ScopedGPUStream stream_owner(DeviceId::rocm(device_ordinal));
+        const auto stream = static_cast<hipStream_t>(stream_owner.get());
+        constexpr int m = 33, n = 65;
+        auto variants = trainerVariantsForFormat("Q4_0", DensePrefillWeightFamily::NativeQuantised, device_ordinal);
+        std::erase_if(variants, [](const auto &variant) {
+            return variant.producer != VNNIPrefillProducer::NativeWmma;
+        });
+        for (const uint8_t codebook : {uint8_t{0}, kNativeQuantisedExpandedInt8MinCodebook})
+        for (const int k : {32, 96, 160, 256})
+        for (const int partitions : {1, 3, 5})
+        for (const float row_scale : {1.0f, 0x1p-126f})
+        {
+            SCOPED_TRACE(::testing::Message() << "codebook=" << int(codebook) << " K=" << k << " partitions=" << partitions
+                << " row_scale=" << row_scale);
+            mutableDebugEnv().rocm.native_quantised_gemv_kb = partitions;
+            const int blocks = k / 32;
+            // These tensor-owned byte banks retain admission/allocation ownership.
+            // The test intentionally supplies prequantized source bytes so the
+            // whole-row scale ABI is exercised without activation requantization.
+            auto a = TestTensorFactory::createFP32Zeros({size_t(m * k / 4)});
+            const int payload_bytes = codebook == 0 ? 16 : 32;
+            auto payload = TestTensorFactory::createFP32({size_t(blocks * n * payload_bytes / 4)});
+            auto scales = TestTensorFactory::createFP32Zeros({size_t((blocks * n + 1) / 2)});
+            auto minima = TestTensorFactory::createFP32Zeros({size_t((blocks * n + 1) / 2)});
+            auto rows = TestTensorFactory::createFP32({m});
+            auto output = TestTensorFactory::createFP32({m, n});
+            auto oracle = TestTensorFactory::createFP32({m, n});
+            auto *ab = reinterpret_cast<int8_t *>(a->mutable_data());
+            auto *pb = reinterpret_cast<uint8_t *>(payload->mutable_data());
+            std::fill_n(pb, blocks * n * payload_bytes, codebook == 0 ? uint8_t{0x88} : uint8_t{0});
+            const std::vector<uint16_t> scale_bits(blocks * n, uint16_t{1}); // exact half 2^-24
+            std::memcpy(scales->mutable_data(), scale_bits.data(), scale_bits.size() * sizeof(uint16_t));
+            std::fill_n(rows->mutable_data(), m, row_scale);
+            for (int row = 0; row < m; ++row) ab[row * k] = 1;
+            for (int column = 0; column < n; ++column)
+                pb[column * payload_bytes] = codebook == 0 ? 0x87 : 0xff;
+            for (auto *tensor : {a.get(), payload.get(), scales.get(), minima.get(), rows.get()})
+                ASSERT_TRUE(tensor->ensureOnDevice(DeviceId::rocm(device_ordinal), stream));
+            ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(device_ordinal), stream));
+            ASSERT_TRUE(oracle->allocateOnDevice(DeviceId::rocm(device_ordinal), stream));
+            const auto launch = [&](FP32Tensor *destination) {
+                return rocmGemm_native_quantised_fp32_with_policy(
+                    static_cast<const int8_t *>(a->gpu_data_ptr()),
+                    static_cast<const uint8_t *>(payload->gpu_data_ptr()), scales->gpu_data_ptr(),
+                    codebook == kNativeQuantisedExpandedInt8MinCodebook ? minima->gpu_data_ptr() : nullptr, nullptr,
+                    static_cast<float *>(destination->gpu_data_ptr()),
+                    static_cast<const float *>(rows->gpu_data_ptr()), nullptr, m, n, k,
+                    codebook, codebook == kNativeQuantisedExpandedInt8MinCodebook ? 5 : 0, device_ordinal, stream);
+            };
+            override.apply(VariantConfig{"Auto", -1, -1, -1, -1, -1, std::nullopt});
+            ASSERT_TRUE(launch(oracle.get()));
+            std::vector<uint32_t> reference(m * n), observed(m * n);
+            check(hipMemcpyAsync(reference.data(), oracle->gpu_data_ptr(), reference.size() * sizeof(uint32_t),
+                hipMemcpyDeviceToHost, stream));
+            check(hipStreamSynchronize(stream));
+            const uint32_t expected = row_scale == 1.0f ? std::bit_cast<uint32_t>(-0x1p-24f) :
+                std::min(partitions, blocks) == 1 ? 0x80000000u : 0u;
+            ASSERT_TRUE(std::all_of(reference.begin(), reference.end(),
+                [&](uint32_t bits) { return bits == expected; }));
+            for (const auto &variant : variants)
+            {
+                SCOPED_TRACE(variant.name);
+                override.apply(variant);
+                HIPGraphCapture graph(stream, device_ordinal);
+                ScopedBackendGraphCapture capture(graph, "WMMA whole-row arithmetic replay");
+                ASSERT_TRUE(capture.begin());
+                ASSERT_TRUE(launch(output.get()));
+                capture.finish();
+                ASSERT_TRUE(graph.instantiate());
+                for (const int poison : {0xff, 0x55, 0})
+                {
+                    check(hipMemsetAsync(output->gpu_data_ptr(), poison, observed.size() * sizeof(uint32_t), stream));
+                    ASSERT_TRUE(graph.launch());
+                    check(hipMemcpyAsync(observed.data(), output->gpu_data_ptr(), observed.size() * sizeof(uint32_t),
+                        hipMemcpyDeviceToHost, stream));
+                    check(hipStreamSynchronize(stream));
+                    EXPECT_EQ(observed, reference);
+                }
+            }
+        }
     }
 
     // =========================================================================
@@ -1579,10 +2051,11 @@ namespace
         GTEST_SKIP() << "HAVE_ROCM not defined";
 #else
         ASSERT_TRUE(has_device_);
+        const auto actual_hardware = nativeQuantisedHardwareForDevice(0);
         std::map<std::pair<int, int>, std::set<int>> geometries;
         std::size_t geometry_count = 0;
         for (const auto &entry : generated::kROCmDensePrefillOverlayEntries)
-            if (!(entry.codebook == 19 && entry.family == DensePrefillWeightFamily::NativeQuantised) &&
+            if (!entry.architecture.observed() &&
                 geometries[{entry.n, entry.k}].insert(entry.m).second) ++geometry_count;
         ASSERT_FALSE(geometries.empty());
         ASSERT_GE(GetParam(), 0);
@@ -1605,7 +2078,7 @@ namespace
                 // its own arena, independent oracle and captured producer.
                 auto weights = format.create(n, k);
                 const auto codebook = canonicalDeviceVnniCodebookId(
-                    requireNativeQuantisedInfo(weights.get(), "installed overlay source weights").codebook_id);
+                    requireNativeQuantisedInfo(weights.get(), "installed overlay source weights"));
                 // This canonical fixture uses the ordinary packer: Q8 is
                 // expanded INT8, while low-bit formats retain native payloads.
                 // Native-Q8 is a separate physical contract covered by the
@@ -1615,7 +2088,9 @@ namespace
                 for (const int m : row_buckets)
                 {
                     SCOPED_TRACE(::testing::Message() << "M=" << m << " N=" << n << " K=" << k);
-                    const auto exact = selectDensePrefillExactConfig(codebook, m, n, k, family);
+                    auto exact = selectDensePrefillExactConfig(codebook, m, n, k, family, &actual_hardware);
+                    if (!exact && codebook == kNativeQuantisedIQ4XSSourceScaleCodebook)
+                        exact = selectDensePrefillExactConfig(4, m, n, k, family);
                     ASSERT_TRUE(exact);
                     PreparedROCmSweepExecution execution(shape, m, weights.get(), {*selected}, 1,
                         SweepDispatch::InstalledProduction);
@@ -1633,42 +2108,80 @@ namespace
                 }
             }
         }
-        const auto actual_hardware = nativeQuantisedHardwareForDevice(0);
+        std::size_t unavailable_native_cases = 0;
         std::size_t native_cases = 0;
-        for (std::size_t format_index = static_cast<std::size_t>(GetParam());
-             format_index < NATIVE_QUANTISED_FORMATS.size(); format_index += kInstalledDensePrefillSourceGroups)
+        std::size_t native_wmma_cases = 0;
+        std::size_t expected_native_wmma_cases = 0;
+        std::set<std::array<uint32_t, 4>> tested_architectures;
+        // Qualified rows must reach every visible native ISA, even when the
+        // first card belongs to a different cohort. Equivalent cards share
+        // this functional obligation; no visibility mask or inventory changes.
+        for (size_t ordinal = 0; ordinal < rocmHardwareMetadata().size(); ++ordinal)
         {
-            const auto &format = NATIVE_QUANTISED_FORMATS[format_index];
-            for (const auto &entry : generated::kROCmDensePrefillOverlayEntries)
+            const auto native_hardware = nativeQuantisedHardwareForDevice(static_cast<int>(ordinal));
+            if (!tested_architectures.insert(native_hardware.architecture.scalars()).second) continue;
+            SCOPED_TRACE(::testing::Message() << "device=" << ordinal);
+            for (std::size_t format_index = static_cast<std::size_t>(GetParam());
+                 format_index < NATIVE_QUANTISED_FORMATS.size(); format_index += kInstalledDensePrefillSourceGroups)
             {
-                if (entry.codebook != 19 || entry.family != DensePrefillWeightFamily::NativeQuantised ||
-                    !entry.architecture.observed()) continue;
-                auto weights = format.create(entry.n, entry.k);
-                const auto codebook = canonicalDeviceVnniCodebookId(
-                    requireNativeQuantisedInfo(weights.get(), "installed native Q8 source"));
-                if (codebook != 19) break;
-                const auto exact = selectDensePrefillExactConfig(codebook, entry.m, entry.n, entry.k,
-                    DensePrefillWeightFamily::NativeQuantised, &actual_hardware);
-                ASSERT_TRUE(exact);
-                const GEMMShape shape{"installed_native_q8", "measured", entry.n, entry.k};
-                PreparedROCmSweepExecution execution(shape, entry.m, weights.get(), {*selected}, 1,
-                    SweepDispatch::InstalledProduction, DensePrefillWeightFamily::NativeQuantised);
-                const auto result = execution.verifyCaptured(*selected);
-                EXPECT_EQ(result.observed_producer, exact->producer);
-                EXPECT_EQ(result.observed_n_tile, exact->n_tile);
-                EXPECT_EQ(result.observed_m_tile, exact->m_tile);
-                EXPECT_EQ(result.observed_min_blocks, exact->min_blocks);
-                EXPECT_EQ(result.observed_unroll, exact->unroll);
-                EXPECT_EQ(result.observed_full_tiles, exact->full_tiles);
-                EXPECT_EQ(result.local_memory_bytes_per_thread, 0u);
-                EXPECT_GT(result.max_active_blocks_per_sm, 0);
-                ASSERT_EQ(result.byte_mismatches_vs_auto, 0u);
-                ++native_cases;
+                const auto &format = NATIVE_QUANTISED_FORMATS[format_index];
+                const auto source = std::find_if(native_quantised_formats::kAllSourceFormats.begin(),
+                    native_quantised_formats::kAllSourceFormats.end(),
+                    [&](const auto &candidate) { return candidate.quant_type == format.name; });
+                ASSERT_NE(source, native_quantised_formats::kAllSourceFormats.end());
+                const auto codebook = canonicalDeviceVnniCodebookId(*source->metadata);
+                // Derive this obligation directly from installed exact-ISA
+                // rows. Lookup and execution agreeing on a retained legacy
+                // producer must not conceal a missed WMMA installation.
+                expected_native_wmma_cases += std::count_if(
+                    std::begin(generated::kROCmDensePrefillOverlayEntries),
+                    std::end(generated::kROCmDensePrefillOverlayEntries), [&](const auto &row) {
+                        return row.codebook == codebook &&
+                            row.family == DensePrefillWeightFamily::NativeQuantised &&
+                            row.architecture == native_hardware.architecture &&
+                            row.config.producer == VNNIPrefillProducer::NativeWmma;
+                    });
+                std::set<std::tuple<int, int, int>> tested;
+                for (const auto &entry : generated::kROCmDensePrefillOverlayEntries)
+                {
+                    if (entry.codebook != codebook || entry.family != DensePrefillWeightFamily::NativeQuantised ||
+                        !entry.architecture.observed() || !tested.emplace(entry.m, entry.n, entry.k).second) continue;
+                    const auto exact = selectDensePrefillExactConfig(codebook, entry.m, entry.n, entry.k,
+                        DensePrefillWeightFamily::NativeQuantised, &native_hardware);
+                    if (!exact)
+                    {
+                        // A native-ISA-only entry cannot execute on another card;
+                        // retain the unsupported count rather than certify a substitute.
+                        ++unavailable_native_cases;
+                        continue;
+                    }
+                    auto weights = format.create(entry.n, entry.k);
+                    const GEMMShape shape{"installed_native_prepared", "measured", entry.n, entry.k};
+                    PreparedROCmSweepExecution execution(shape, entry.m, weights.get(), {*selected}, 1,
+                        SweepDispatch::InstalledProduction, DensePrefillWeightFamily::NativeQuantised,
+                        static_cast<int>(ordinal));
+                    const auto result = execution.verifyCaptured(*selected);
+                    EXPECT_EQ(result.observed_producer, exact->producer);
+                    EXPECT_EQ(result.observed_n_tile, exact->n_tile);
+                    EXPECT_EQ(result.observed_m_tile, exact->m_tile);
+                    EXPECT_EQ(result.observed_min_blocks, exact->min_blocks);
+                    EXPECT_EQ(result.observed_unroll, exact->unroll);
+                    EXPECT_EQ(result.observed_full_tiles, exact->full_tiles);
+                    EXPECT_EQ(result.local_memory_bytes_per_thread, 0u);
+                    EXPECT_GT(result.max_active_blocks_per_sm, 0);
+                    ASSERT_EQ(result.byte_mismatches_vs_auto, 0u);
+                    ++native_cases;
+                    if (result.observed_producer == VNNIPrefillProducer::NativeWmma) ++native_wmma_cases;
+                }
             }
         }
         // The existing source-group gate exercises each independently prepared
         // alias. Absence of new native rows leaves the original gate unchanged.
-        RecordProperty("installed_native_q8_cases", native_cases);
+        RecordProperty("installed_native_prepared_cases", native_cases);
+        RecordProperty("installed_native_wmma_cases", native_wmma_cases);
+        RecordProperty("expected_native_wmma_cases", expected_native_wmma_cases);
+        EXPECT_EQ(native_wmma_cases, expected_native_wmma_cases);
+        RecordProperty("unavailable_native_prepared_cases", unavailable_native_cases);
         const std::size_t source_count =
             (NATIVE_QUANTISED_FORMATS.size() + kInstalledDensePrefillSourceGroups - 1u -
                 static_cast<std::size_t>(GetParam())) / kInstalledDensePrefillSourceGroups;
@@ -1690,20 +2203,20 @@ namespace
         const auto preparation = getEnvString("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_PREPARED_FAMILY");
         ASSERT_TRUE(preparation.empty() || preparation == "native_quantised")
             << "Unknown explicit ROCm sweep prepared family";
-        const bool native_q8 = !preparation.empty();
-        const auto prepared_family = native_q8
+        const bool native_prepared = !preparation.empty();
+        const auto prepared_family = native_prepared
             ? std::optional{DensePrefillWeightFamily::NativeQuantised} : std::nullopt;
         // These are immutable discovery facts, not a new runtime query or a
         // marketing-name target. The child sees one HIP-selected ordinal zero.
         std::string native_csv_suffix;
-        if (native_q8)
+        if (native_prepared)
         {
             const auto &facts = rocmHardwareMetadata().at(0);
             const auto actual = nativeQuantisedHardwareForDevice(0);
             const auto target = native_quantised::nativeQuantisedArchitectureName(actual.architecture);
             const auto expected = getEnvString("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_ARCHITECTURE");
             if (expected.empty() || expected != target)
-                throw std::invalid_argument("native Q8 sweep architecture differs from its immutable plan");
+                throw std::invalid_argument("native sweep architecture differs from its immutable plan");
             std::string uuid;
             constexpr char hex[] = "0123456789abcdef";
             for (const auto byte : facts.uuid)
@@ -1713,13 +2226,13 @@ namespace
             }
             const auto expected_uuid = getEnvString("LLAMINAR_ROCM_DENSE_PRODUCTION_PROFILE_EXPECTED_UUID");
             if (!expected_uuid.empty() && expected_uuid != uuid)
-                throw std::invalid_argument("native Q8 profiler selected a different physical participant");
+                throw std::invalid_argument("native prefill profiler selected a different physical participant");
             native_csv_suffix = ",native_quantised," + target + "," + uuid + "," +
                 facts.pci_address + "," + std::to_string(facts.ordinal);
         }
         std::set<std::string> format_filters = getEnvCsvSet("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_FORMATS");
         if (format_filters.empty())
-            format_filters.insert(native_q8 ? "q8_0" : "q4_0");
+            format_filters.insert(native_prepared ? "q8_0" : "q4_0");
         const std::set<std::string> shape_filters = getEnvCsvSet("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_SHAPES");
         const std::set<std::string> variant_filters = getEnvCsvSet("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_VARIANTS");
         const std::vector<int> m_values = getEnvCsvInts(
@@ -1745,8 +2258,8 @@ namespace
             throw std::invalid_argument("ROCm dense profiling requires both request ID and exact candidate");
         if (!profiler_request.empty())
         {
-            if (!native_q8)
-                throw std::invalid_argument("this dense profiling extension owns native prepared Q8 only");
+            if (!native_prepared)
+                throw std::invalid_argument("dense profiling requires explicit architecture-qualified native preparation");
             if (format_filters.size() != 1 || shape_filters.size() != 1 || m_values.size() != 1 ||
                 max_cases != 1 || getEnvString("LLAMINAR_ROCM_NATIVE_QUANTISED_SWEEP_FORMATS").empty())
                 throw std::invalid_argument("ROCm dense profiling requires one explicit format, shape, M and MAX_CASES=1");
@@ -1763,7 +2276,7 @@ namespace
                 throw std::invalid_argument("ROCm dense profiler candidate is absent or incompatible with its prepared format");
             auto weights = format->create(static_cast<size_t>(shape->N), static_cast<size_t>(shape->K));
             PreparedROCmSweepExecution execution(*shape, m_values.front(), weights.get(), {*candidate}, 1,
-                native_q8 ? SweepDispatch::InstalledProduction : SweepDispatch::GenericTournament, prepared_family);
+                native_prepared ? SweepDispatch::InstalledProduction : SweepDispatch::GenericTournament, prepared_family);
             execution.profileExactCandidate(*candidate, profiler_request, warmup_runs);
             return;
         }
@@ -1774,7 +2287,7 @@ namespace
             csv = std::fopen(csv_path.c_str(), "w");
             ASSERT_NE(csv, nullptr) << "Failed to open ROCm NativeQuantised sweep CSV: " << csv_path;
             std::fprintf(csv,
-                         "backend,phase,format,codebook,execution_codebook,shape,category,m,n,k,variant,min_us,mean_us,stddev_us,gflops,cosine,correctness_pass,byte_mismatches_vs_auto,first_byte_mismatch_vs_auto,is_best,observed_n_tile,observed_m_tile,observed_min_blocks,observed_unroll,observed_full_tiles,registers_per_thread,local_memory_bytes_per_thread,static_shared_memory_bytes,max_threads_per_block,max_active_blocks_per_sm,observed_producer,dynamic_shared_memory_bytes%s\n", native_q8 ? ",prepared_family,gpu_architecture,gpu_uuid,gpu_pci,native_ordinal" : "");
+                         "backend,phase,format,codebook,execution_codebook,shape,category,m,n,k,variant,min_us,mean_us,stddev_us,gflops,cosine,correctness_pass,byte_mismatches_vs_auto,first_byte_mismatch_vs_auto,is_best,observed_n_tile,observed_m_tile,observed_min_blocks,observed_unroll,observed_full_tiles,registers_per_thread,local_memory_bytes_per_thread,static_shared_memory_bytes,max_threads_per_block,max_active_blocks_per_sm,observed_producer,dynamic_shared_memory_bytes%s\n", native_prepared ? ",prepared_family,gpu_architecture,gpu_uuid,gpu_pci,native_ordinal" : "");
         }
 
         std::FILE *timing_csv = nullptr;
@@ -1787,7 +2300,7 @@ namespace
             std::fprintf(
                 timing_csv,
                 "backend,phase,format,codebook,execution_codebook,shape,m,n,k,variant,"
-                "sample_index,timed_replays,latency_us,latency_us_hex,captured_operations%s\n", native_q8 ? ",prepared_family,gpu_architecture,gpu_uuid,gpu_pci,native_ordinal" : "");
+                "sample_index,timed_replays,latency_us,latency_us_hex,captured_operations%s\n", native_prepared ? ",prepared_family,gpu_architecture,gpu_uuid,gpu_pci,native_ordinal" : "");
         }
 
         int executed_cases = 0;
@@ -1798,8 +2311,6 @@ namespace
             if (!shouldRunName(format_filters, format.name))
                 continue;
 
-            ASSERT_TRUE(!native_q8 || format.name == "Q8_0" || format.name == "Q8_1" || format.name == "Q8_K")
-                << "Native Q8 preparation requires an original Q8 source";
             const std::vector<VariantConfig> launchable_variants =
                 trainerVariantsForFormat(format.name, prepared_family);
             std::vector<VariantConfig> selected_variants;
@@ -1834,7 +2345,7 @@ namespace
                         M,
                         weights.get(),
                         selected_variants,
-                        bench_runs, native_q8 ? SweepDispatch::InstalledProduction : SweepDispatch::GenericTournament, prepared_family);
+                        bench_runs, native_prepared ? SweepDispatch::InstalledProduction : SweepDispatch::GenericTournament, prepared_family);
 
                     std::vector<BenchResult> rows;
                     rows.reserve(selected_variants.size());

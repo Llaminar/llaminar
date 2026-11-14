@@ -590,6 +590,40 @@ endif()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn(target, result.stderr)
 
+    def test_cuda_device_helper_sources_follow_original_owner_selection(self):
+        """Execute the actual owner declaration when Release omits or admits it."""
+        declaration = CMAKE_LISTS.read_text(encoding="utf-8")
+        start = declaration.index("    add_executable(v2_test_qwen4exp_device_primitives\n")
+        end = declaration.index("    if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)", start)
+        native_owner = declaration[start:end]
+        owner = "v2_test_qwen4exp_device_primitives"
+        for performance_only, selected in ((True, ()), (True, (owner,)), (False, ())):
+            with self.subTest(release=performance_only, selected=selected):
+                result = self.configure(performance_only, native_targets=selected, extra=f"""
+set(HAVE_CUDA ON)
+add_library(llaminar2_core INTERFACE)
+add_library(GTest::gtest_main INTERFACE IMPORTED)
+{native_owner}
+if(TARGET {owner})
+    get_target_property(native_sources {owner} SOURCES)
+    get_target_property(native_standard {owner} CUDA_STANDARD)
+    if(NOT native_standard EQUAL 20)
+        message(FATAL_ERROR "Selected helper owner lost its CUDA language contract")
+    endif()
+    set(native_count 0)
+    foreach(source IN LISTS native_sources)
+        if(source MATCHES "[.]cu$")
+            math(EXPR native_count "${{native_count}} + 1")
+            set_source_files_properties("${{source}}" PROPERTIES HEADER_FILE_ONLY TRUE)
+        endif()
+    endforeach()
+    if(NOT native_count EQUAL 2)
+        message(FATAL_ERROR "Selected helper owner lost original native sources")
+    endif()
+endif()
+""")
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+
     def test_qfn_performance_targets_survive_release_selection(self):
         """Native timing targets retain the same backend inventory in both builds."""
         for performance_only in (False, True):

@@ -20,12 +20,18 @@ namespace llaminar2::test::parity
 {
     namespace
     {
-        /** @return Model-owned canonical definition, without reading its GGUF. */
+        /** @return An explicitly tagged unit fixture, without changing model eligibility. */
         ModelParityDefinition remoteSource(GlobalDeviceAddress device = GlobalDeviceAddress::rocm(0))
         {
-            return qwen36::qwen36MoEParityDefinition(
+            auto definition = qwen36::qwen36MoEParityDefinition(
                 qwen36::qwen36SingleDeviceTopology("SourceGPU", std::move(device)),
                 "/reference", qwen36::qwen36MoESingleDeviceThresholds());
+            // This mathematical model is deliberately outside the current RC
+            // selection. The unit fixture authors the remote expansion input.
+            EXPECT_TRUE(definition.e2e_certifiable.empty());
+            definition.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth,
+                .remote_cpu_overlays = {ModelParityRemoteCPUHosts{1}, ModelParityRemoteCPUHosts{2}}}};
+            return definition;
         }
 
         /** @return The real GoogleTest JSON boundary consumed by inventory discovery. */
@@ -175,7 +181,9 @@ namespace llaminar2::test::parity
             ModelParityRemoteCPUHosts{1}, ModelParityRemoteCPUHosts{1}};
         EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
         auto cpu = qwen36::qwen36MoECPU2NodeTPParityDefinition();
-        cpu.e2e_certifiable.front().remote_cpu_overlays = {ModelParityRemoteCPUHosts{1}};
+        EXPECT_TRUE(cpu.e2e_certifiable.empty());
+        cpu.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth,
+            .remote_cpu_overlays = {ModelParityRemoteCPUHosts{1}}}};
         EXPECT_THROW((void)expandModelParityDefinition(cpu), std::invalid_argument);
         auto local_cpu = remoteSource(GlobalDeviceAddress::cpu());
         local_cpu.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth,
@@ -189,7 +197,7 @@ namespace llaminar2::test::parity
         const auto variants = qwen36::withOrnith15CertificationModels(definitions);
         ASSERT_EQ(variants.size(), 2u);
         EXPECT_EQ(variants.front().e2e_certifiable.front().remote_cpu_overlays.size(), 2u);
-        EXPECT_TRUE(variants.back().e2e_certifiable.front().remote_cpu_overlays.empty());
+        EXPECT_TRUE(variants.back().e2e_certifiable.empty());
         for (const auto &cell : expandModelParityDefinition(variants.back()))
             EXPECT_TRUE(record(cell).at("cross_host_e2e").empty());
     }

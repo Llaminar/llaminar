@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Build the canonical NCCL dependency with resumed CUDA graph capture support.
+# @file install-nccl.sh
+# @brief Build the canonical NCCL dependency with resumed CUDA graph capture support.
 #
 # The capture repair fixes strong-stream membership; the live-row extension
 # clips native payloads without changing transport or reduction order. A distinct SONAME prevents a system
@@ -87,17 +88,19 @@ python3 "${nccl_thread_probe}" compile --source "${nccl_build_dir}/source" \
     --sdk "${CUDA_HOME:-/usr/local/cuda}" --compiler "${CXX:-g++}" \
     --report "${nccl_build_dir}/thread-lifetime.json"
 
+# Bind architecture as one option/value token: a single -gencode value otherwise
+# looks like another option to the proof parser. Preserve spaces for multi-SM builds.
 python3 "${nccl_shm_probe}" compile --backend nccl --source "${nccl_build_dir}/source" \
     --library "${nccl_build_dir}/source/build/lib/libllaminar_nccl.so.${nccl_version}" \
     --receipt "${nccl_build_dir}/build-receipt.txt" \
     --sdk "${CUDA_HOME:-/usr/local/cuda}" --compiler "${CXX:-g++}" \
-    --architecture "${NVCC_GENCODE:-toolkit-default}" \
+    "--architecture=${NVCC_GENCODE:-toolkit-default}" \
     --report "${nccl_build_dir}/shared-file-lifecycle.json"
 
 python3 "${nccl_completed_probe}" compile --backend nccl \
     --source "${nccl_build_dir}/source" --build-dir "${nccl_build_dir}/source/build" --library "${nccl_build_dir}/source/build/lib/libllaminar_nccl.so.${nccl_version}" \
     --receipt "${nccl_build_dir}/build-receipt.txt" --compiler "${CXX:-g++}" --sdk "${CUDA_HOME:-/usr/local/cuda}" \
-    --architecture "${NVCC_GENCODE:-toolkit-default}" --report "${nccl_build_dir}/completed-broadcast.json"
+    "--architecture=${NVCC_GENCODE:-toolkit-default}" --report "${nccl_build_dir}/completed-broadcast.json"
 
 install -d "${nccl_prefix}/lib" "${nccl_prefix}/include/llaminar-nccl" \
     "${nccl_prefix}/share/licenses/llaminar-nccl" "${nccl_prefix}/share/llaminar-nccl"

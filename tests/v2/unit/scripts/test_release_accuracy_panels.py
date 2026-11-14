@@ -109,6 +109,91 @@ def write_panel(root: Path, isa='AVX2'):
 class ReleaseAccuracyTests(unittest.TestCase):
     """Coverage cannot be inferred from one prompt, one model or one green summary."""
 
+    def test_complete_red_numerics_still_collect_both_isas(self):
+        """A rejected panel retains both ISA observations and retired owner receipts."""
+        self._check_complete_red_numerics(safe_retirement=True)
+
+    def test_red_numerics_cannot_admit_another_isa_with_live_children(self):
+        """Numerical failure may continue only after its actual owner has retired."""
+        self._check_complete_red_numerics(safe_retirement=False)
+
+    def _check_complete_red_numerics(self, *, safe_retirement):
+        """Replay identical failed panels with valid and invalid cleanup evidence."""
+        import subprocess
+        import run_published_image_suite as suite
+        from test_published_image_suite import write_preflight_bundle, prerequisite_evidence
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pair = image_pair()
+            bundle, output = root / 'preflight', root / 'accuracy'
+            write_preflight_bundle(bundle, pair)
+            output.mkdir()
+            companions = prerequisite_evidence(pair)
+            visited = []
+
+            def execute(args, driver, command, lane, log):
+                """Publish synthetic panel metadata through the current child boundary."""
+                isa = lane.name.upper()
+                visited.append(isa)
+                self.assertEqual(command[command.index('--cpu-isa') + 1], isa)
+                _, _, _, report = write_panel(lane / 'panel', isa)
+                cleanup = dict(complete=True, passed=True, errors=[], unexpected_live=[],
+                               owner='llaminar-suite-driver-' + '0' * 32, retired={},
+                               driver_retirement=dict(Running=False, Pid=0, Status='absent'))
+                if isa == 'AVX512' and not safe_retirement:
+                    cleanup['driver_retirement'] = dict(Running=True, Pid=123, Status='running')
+                write_json(lane / 'outer-cleanup.json', cleanup)
+                if isa == 'AVX512':
+                    report.update(passed=False, failures={'synthetic_history': 'numerical rejection'})
+                    write_json(lane / 'panel/panel.json', report)
+                    raise subprocess.CalledProcessError(1, command)
+
+            def companion(args, source, lane):
+                """Preserve the prerequisite test image identity for each ISA."""
+                return {pipeline.ImageRole.TEST_RUNNER.value: companions[args.cpu_isa]['test_runner_image']}
+
+            with patch.object(suite, 'build_driver', return_value='tools'), \
+                 patch.object(suite, 'inventory_companion', side_effect=companion), \
+                 patch.object(suite, 'run_in_driver', side_effect=execute):
+                expected = 'release accuracy panel failures' if safe_retirement else 'complete native retirement'
+                with self.assertRaisesRegex(ValueError, expected):
+                    suite.run_accuracy(SimpleNamespace(preflight_bundle=bundle, models=root,
+                        model_ramdisk_root=root, suite='accuracy'), pair, output)
+            self.assertEqual(visited, list(suite.ISAS) if safe_retirement else ['AVX512'])
+            receipt = json.loads((output / 'accuracy-receipt.json').read_text())
+            self.assertFalse(receipt['complete'])
+            self.assertEqual(set(receipt['reports']), set(suite.ISAS) if safe_retirement else set())
+            self.assertEqual(set(receipt['retirement_reports']), set(suite.ISAS) if safe_retirement else set())
+            if safe_retirement:
+                self.assertEqual(set(receipt['failures']), {'AVX512'})
+
+    def test_outer_driver_labels_and_retires_numerical_children_on_cancel(self):
+        """Accuracy uses the shared exact-owner cleanup contract on interruption."""
+        import run_published_image_suite as suite
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / 'cache').mkdir()
+            lane = root / 'accuracy'
+            lane.mkdir()
+            socket = root / 'docker.sock'
+            socket.touch()
+            args = SimpleNamespace(output=root, models=root, model_ramdisk_root=root,
+                                   e2e_bundle=None, suite='accuracy')
+            with patch.dict(suite.os.environ, {'DOCKER_HOST': 'unix://' + str(socket)}), \
+                 patch.object(suite.docker_paths, 'device_args', return_value=[]), \
+                 patch.object(suite.docker_paths, 'mounts', return_value=[]), \
+                 patch.object(suite.pipeline, 'run', side_effect=KeyboardInterrupt) as run, \
+                 patch.object(suite, 'retire_coding_children') as retire, \
+                 patch.object(suite, 'restore_lane_ownership'):
+                with self.assertRaises(KeyboardInterrupt):
+                    suite.run_in_driver(args, 'tools', ['python', 'release_accuracy_panels.py'], lane, 'accuracy.log')
+            command = run.call_args.args[0]
+            owner = command[command.index('--name') + 1]
+            self.assertIn(suite.docker_paths.CODING_DRIVER_ENV + '=' + owner, command)
+            self.assertIn(suite.docker_paths.CODING_OWNER_LABEL + '=' + owner, command)
+            retire.assert_called_once_with(owner, lane / 'outer-cleanup.json')
+            self.assertTrue(lane.stat().st_mode & 0o020)
+
     def test_projection_uses_blessed_serial_controls_and_requires_both_blessed_models(self):
         original = inventory()
         blessed = pipeline.e2e_projection(original, 'a'*40)

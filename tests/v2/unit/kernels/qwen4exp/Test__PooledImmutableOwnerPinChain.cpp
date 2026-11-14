@@ -4,6 +4,8 @@
  *
  * The shared fixture owns actual prepared worker provenance, immutable IO case
  * identities, and same-PMA reservations. Canonical runners isolate process roots.
+ * Setup evidence selects its complete collection domain so reset replay proves
+ * both retained owner records and removal of independently collected warmup data.
  */
 #include "fixtures/qwen4exp/PooledImmutableOriginalProgramReplay.h"
 #include "loaders/ImmutableLookupSetupObservation.h"
@@ -513,18 +515,24 @@ namespace llaminar2::test {
 TEST(PooledImmutableOwnerPinChain, ImmutableSetupCapacityUsesOriginalDisjointRootsAndRejectsPartialSources) {
     struct CollectorScope {
         std::optional<std::string> enabled,filter;
+        /** @brief Collect the whole setup domain, including the disposable warmup control. */
         CollectorScope() {
             if(const auto* old=std::getenv("LLAMINAR_PERF_STATS_JSON"))enabled=old;
             if(const auto* old=std::getenv("LLAMINAR_PERF_STATS_FILTER"))filter=old;
-            ::setenv("LLAMINAR_PERF_STATS_JSON","1",1);::setenv("LLAMINAR_PERF_STATS_FILTER","immutable_lookup_setup.*",1);
+            // Filters select a domain or a literal qualified name prefix.
+            // A trailing wildcard is not part of the name-prefix grammar.
+            ::setenv("LLAMINAR_PERF_STATS_JSON","1",1);::setenv("LLAMINAR_PERF_STATS_FILTER","immutable_lookup_setup",1);
             PerfStatsCollector::reloadConfigurationFromEnvironment();PerfStatsCollector::reset();
         }
+        /** @brief Restore the original collection policy after all fixture owners retire. */
         ~CollectorScope() {
             if(enabled)::setenv("LLAMINAR_PERF_STATS_JSON",enabled->c_str(),1);else ::unsetenv("LLAMINAR_PERF_STATS_JSON");
             if(filter)::setenv("LLAMINAR_PERF_STATS_FILTER",filter->c_str(),1);else ::unsetenv("LLAMINAR_PERF_STATS_FILTER");
             PerfStatsCollector::reloadConfigurationFromEnvironment();PerfStatsCollector::reset();
         }
     } collector;
+    ASSERT_TRUE(PerfStatsCollector::isRecordFamilyEnabled("immutable_lookup_setup","admitted_owner"));
+    ASSERT_TRUE(PerfStatsCollector::isRecordFamilyEnabled("immutable_lookup_setup","unrelated_warmup"));
     const std::vector<PooledOriginalRecipe> recipes{{{0},false},{{2,0},true},{{2,1,0,3},false,0}};
     PooledImmutableOriginalPrograms programs(recipes);
     for(const auto& recipe:recipes) {
@@ -538,8 +546,13 @@ TEST(PooledImmutableOwnerPinChain, ImmutableSetupCapacityUsesOriginalDisjointRoo
         const auto records=PerfStatsCollector::snapshot({"immutable_lookup_setup"});ASSERT_EQ(records.size(),observed.owners().size());
         for(const auto& record:records){EXPECT_EQ(record.name,"admitted_owner");EXPECT_EQ(record.count,1u);EXPECT_EQ(record.value,1);EXPECT_EQ(record.tags.at("source_row_bytes"),std::to_string(c.file.descriptor().rowBytes()));}
         PerfStatsCollector::addCounter("immutable_lookup_setup","unrelated_warmup",7,"warmup","CPU");
+        ASSERT_EQ(PerfStatsCollector::snapshot({"immutable_lookup_setup"}).size(),records.size()+1u);
         PerfStatsCollector::resetPreserving({},{{"immutable_lookup_setup","admitted_owner"}});
-        const auto retained=PerfStatsCollector::snapshot({"immutable_lookup_setup"});EXPECT_EQ(retained.size(),records.size());
+        const auto retained=PerfStatsCollector::snapshot({"immutable_lookup_setup"});ASSERT_EQ(retained.size(),records.size());
+        for(std::size_t i=0;i<records.size();++i) {
+            EXPECT_EQ(retained[i].name,"admitted_owner");EXPECT_EQ(retained[i].tags,records[i].tags);
+            EXPECT_EQ(retained[i].count,records[i].count);EXPECT_EQ(retained[i].value,records[i].value);
+        }
         std::size_t hostRows=0,cacheRows=0,tableBytes=0,stagingBytes=0;
         for(const auto& row:observed.owners()) {
             EXPECT_EQ(row.table_storage_bytes,row.source_storage_bytes+row.payload_bytes+row.metadata_bytes);

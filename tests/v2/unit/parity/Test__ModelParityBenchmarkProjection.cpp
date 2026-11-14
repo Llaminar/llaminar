@@ -8,12 +8,14 @@
  * a model, initializing an accelerator or enforcing noisy timing thresholds.
  */
 #include "integration/parity/ModelParityDefinition.h"
+#include "integration/parity/ModelParityReleaseTopologies.h"
 #include "integration/parity/qwen36/Qwen36ModelParityDefinitions.h"
 #include "integration/parity/qwen38/Qwen38ModelParityDefinitions.h"
 #include "config/OrchestrationConfigParser.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
+#include <set>
 
 namespace llaminar2::test::parity
 {
@@ -43,13 +45,22 @@ namespace llaminar2::test::parity
     TEST(ModelParityBenchmarkProjection, PreservesIntentButUsesProductionDefaults)
     {
         const auto defaults = parseBenchmarkIntent({"--mtp", "--mtp-depth-policy", "dynamic"});
-        int tags = 0;
+        std::set<std::string> expected_topologies;
+        for (const auto &topology : modelParityReleaseTopologies())
+            expected_topologies.insert(topology.test_id);
+        ASSERT_FALSE(expected_topologies.empty());
+        std::set<std::string> tagged_topologies;
         for (const auto &definition : benchmarkDefinitions())
             for (const auto &cell : expandModelParityDefinition(definition))
             {
-                if (!cell.e2e_certification) continue;
+                if (!cell.e2e_certification)
+                {
+                    EXPECT_FALSE(expected_topologies.contains(cell.topology.test_id) &&
+                                 cell.mtp == ModelParityMTP::DynamicDepth);
+                    continue;
+                }
                 SCOPED_TRACE(cell.testName());
-                ++tags;
+                EXPECT_TRUE(tagged_topologies.insert(cell.topology.test_id).second);
                 const auto args = modelParityBenchmarkArguments(cell);
                 const auto config = parseBenchmarkIntent(args);
                 const auto intent = resolveOrchestrationIntent(config);
@@ -95,25 +106,34 @@ namespace llaminar2::test::parity
                     cell, ModelParityRuntimePlacementProjection::AutomaticCell));
                 EXPECT_NE(exported["benchmark"]["args"], exported["e2e"]["server_args"]);
             }
-        EXPECT_EQ(tags, 8);
+        EXPECT_EQ(tagged_topologies, expected_topologies);
     }
 
     TEST(ModelParityBenchmarkProjection, StressEconomicsCannotChangeTimingPolicy)
     {
+        std::size_t checked = 0;
         for (auto cell : expandModelParityDefinition(qwen36::qwen36MoECPU2NodeTPParityDefinition()))
         {
-            if (!cell.e2e_certification) continue;
-            const auto expected = modelParityBenchmarkArguments(cell);
+            SCOPED_TRACE(cell.testName());
+            ASSERT_FALSE(cell.e2e_certification);
+            const auto expected = modelParityDiagnosticBenchmarkArguments(cell);
             const auto stress = modelParityServerArguments(cell);
             cell.dynamic_rebalance.window_size = 123;
             cell.dynamic_rebalance.migration_transfer_slots = 49;
             cell.dynamic_rebalance.dynamic_max_swaps_per_layer = 31;
             cell.dynamic_rebalance.device_min_maintenance_period_tokens = 1024;
             cell.moe_routed_prefill.overlay_segment_rows = 64;
-            cell.tp_allreduce_precision_override = "fp32";
             EXPECT_NE(modelParityServerArguments(cell), stress);
-            EXPECT_EQ(modelParityBenchmarkArguments(cell), expected);
+            EXPECT_EQ(modelParityDiagnosticBenchmarkArguments(cell), expected);
+            // Collective precision is declared arithmetic intent, not a stress
+            // scheduling knob; the diagnostic projection must retain it.
+            cell.tp_allreduce_precision_override = "fp32";
+            EXPECT_NE(modelParityDiagnosticBenchmarkArguments(cell), expected);
+            EXPECT_EQ(parseBenchmarkIntent(modelParityDiagnosticBenchmarkArguments(cell))
+                          .tp_allreduce_precision_override, "fp32");
+            ++checked;
         }
+        EXPECT_EQ(checked, 24u);
     }
 
     TEST(ModelParityBenchmarkProjection, OffFixedRandomAndStaticIntentIsNotRelabeled)

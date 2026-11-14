@@ -108,6 +108,9 @@ CODEBOOK_TO_FORMAT = {
 CODEBOOK_PAYLOAD_BYTES = {
     spec.source_codebook_id: spec.payload_bytes for spec in FORMAT_SPECS
 }
+GPU_EXECUTION_CODEBOOK_PAYLOAD_BYTES = {
+    spec.gpu_execution_codebook_id: spec.payload_bytes for spec in FORMAT_SPECS
+}
 GPU_FORMAT_TO_EXECUTION_CODEBOOK = OrderedDict(
     (spec.label, spec.gpu_execution_codebook_id) for spec in FORMAT_SPECS
 )

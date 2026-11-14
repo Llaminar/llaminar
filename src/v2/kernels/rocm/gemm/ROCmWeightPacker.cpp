@@ -197,8 +197,14 @@ namespace llaminar2
             // vectors. GPU constant tables are a separate destination resource.
             const int N = static_cast<int>(tensor->rows());
             const int K = static_cast<int>(tensor->cols());
-            if ((K % 32) != 0)
+            if (N <= 0 || K <= 0 || (K % 32) != 0)
                 return false;
+
+            // The direct native entry owns a complete prepared matrix, just
+            // like the source-default wrapper. Descriptor publication must not
+            // depend on a caller pre-populating these physical dimensions.
+            out.N = N;
+            out.K = K;
 
             const int blocks_per_row = K / 32;
             const int payload_bytes = info->payload_bytes;

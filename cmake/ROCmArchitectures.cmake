@@ -25,8 +25,9 @@ endif()
 # on both CDNA and RDNA. Apply that existing-kernel contract to current HIP
 # targets, including standalone tests; RDNA wave32 compilation would silently
 # change their reductions. This is not a permanent backend restriction: a future
-# separately registered MMA/wave32 target needs its own explicit target wave
+# separately compiled MMA/wave32 entry needs its own explicit target wave
 # contract and correctness/economy gates before this default can be overridden.
+# ROCmNativeQuantisedWmma.hip owns that source-local gfx1100 wave64 contract.
 # Vendor RCCL and rocBLAS builds retain their independent upstream wave policy.
 if("${CMAKE_HIP_FLAGS} ${CMAKE_HIP_FLAGS_INIT}" MATCHES "(^| )-mwavefrontsize32( |$)")
     message(FATAL_ERROR "Llaminar HIP kernels require wave64; remove -mwavefrontsize32")

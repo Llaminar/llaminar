@@ -233,6 +233,14 @@ Use each module's `status` and `combine` before its existing
 base and retention receipts for additive refreshes. Do not erase unrelated
 installed rows. Dense timings do not certify the routed MoE bundle.
 
+ROCm dense collection accepts `--prepared-family native-quantised` with
+`--gpu-architecture <actual-native-target>` for all original native codebooks,
+including architecture-specific WMMA candidates. `native-quantised-q8` narrows
+that preparation scope to the three Q8 source aliases; `source-default` retains
+historical preparation identities. Use `native_quantised_dispatch.native_prefill_profiler`
+to derive isolated winner and actual-Auto requests from the authenticated
+complete-projection timing corpus before emitting qualified exact entries.
+
 ## Regressions and model evidence
 
 Register every discovered defect explicitly in ProductionTestPreflight and

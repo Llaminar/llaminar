@@ -5812,6 +5812,25 @@ class NativeQuantisedProfilerEvidenceTest(unittest.TestCase):
             ["sudo", "-n", "-E", "/usr/local/cuda/bin/ncu", "--version"],
         )
 
+    def test_rocm_profiler_privilege_rejects_pam_injected_isa_override(self) -> None:
+        """The ISA guard executes after sudo; power privilege does not elevate rocprof."""
+        from dataclasses import replace
+        options = CollectorOptions(Backend.ROCM, Path("/tmp/trainer"),
+            Path("/opt/rocm-sdk/bin/rocprofv3"), Path("/tmp/raw"),
+            tool_command_prefix=("sudo", "-n", "-E"))
+        self.assertEqual(_tool_command(options, "--version"), [
+            "sudo", "-n", "-E", "env", "-u", "HSA_OVERRIDE_GFX_VERSION",
+            "/opt/rocm-sdk/bin/rocprofv3", "--version"])
+        power_only = replace(options, tool_command_prefix=(),
+            rocm_power_command_prefix=("sudo", "-n"))
+        self.assertEqual(_tool_command(power_only, "--version"),
+            ["/opt/rocm-sdk/bin/rocprofv3", "--version"])
+        args = build_profiler_collector_argument_parser().parse_args([
+            "--requests", "requests.json", "--output", "evidence.json",
+            "--raw-directory", "raw", "--backend", "rocm", "--sudo-rocm-power-control"])
+        self.assertTrue(args.sudo_rocm_power_control)
+        self.assertFalse(args.sudo_tool)
+
     def test_gpu_profiler_lane_placement_is_backend_specific(self) -> None:
         """Concurrent CUDA and ROCm workers bind only their own device API."""
 

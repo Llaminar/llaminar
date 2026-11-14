@@ -24,6 +24,7 @@
 #include "../../../../utils/PreparedWeightTestHarness.h"
 #include "../../../../utils/TestTensorFactory.h"
 #include "../../native_quantised_dispatch/NativeQuantisedShapeManifest.h"
+#include "../../native_quantised_dispatch/DenseInt8ComputePeak.h"
 
 #include <algorithm>
 #include <cctype>
@@ -319,6 +320,10 @@ namespace llaminar2::test::native_quantised_gemm_perf
         return filters.empty() || filters.count(toLower(name)) > 0;
     }
 
+    /**
+     * @brief Resolve dense tensor capacity from the actual CUDA device and native clock.
+     * @return Peak dense INT8 TOPS, or zero when the architecture is unqualified.
+     */
     inline double estimatePeakInt8TensorCoreTops()
     {
         if (const auto value = getEnvDouble("LLAMINAR_CUDA_NATIVE_GEMM_PEAK_TC_TOPS"))
@@ -335,26 +340,8 @@ namespace llaminar2::test::native_quantised_gemm_perf
         if (clock_khz <= 0 || sm_count <= 0)
             return 0.0;
 
-        double int8_ops_per_sm_per_cycle = 0.0;
-        switch (props.major * 10 + props.minor)
-        {
-        case 75: // Turing
-        case 80: // A100 / Ampere datacenter
-        case 89: // Ada Lovelace
-            int8_ops_per_sm_per_cycle = 2048.0;
-            break;
-        case 86: // GA10x Ampere, e.g. RTX 3090
-            int8_ops_per_sm_per_cycle = 2304.0;
-            break;
-        case 90: // Hopper
-            int8_ops_per_sm_per_cycle = 4096.0;
-            break;
-        default:
-            return 0.0;
-        }
-
-        const double clock_ghz = static_cast<double>(clock_khz) / 1e6;
-        return static_cast<double>(sm_count) * int8_ops_per_sm_per_cycle * clock_ghz / 1e3;
+        return compute_peak::denseInt8Tops(sm_count, clock_khz,
+            compute_peak::cudaDenseInt8OpsPerSmClock(props.major * 10 + props.minor));
     }
 
     struct GemmThroughputMetrics
