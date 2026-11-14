@@ -890,6 +890,16 @@ canonical arm is a lane defect and blocks landing.
     Production is correct today: every production caller passes live
     inventory; the Gate-A path is unaffected (the test-file inventory
     advice above can be relaxed in the same change).
+  - **Stage-B-ENTRY item (Main, seq 263; carried, not a blocker — recorded
+    next to the predicate refinement):**
+    `MoEOverlayEconomyCalibrationLayerCatalog` prices with
+    `kHostPreparedLayout` EXPLICITLY, but
+    `complete_expert_bytes_per_layer_ = max(cpu, gpu)` means a CPU-heavy
+    layout can still steer CALIBRATION GROUPING AND ECONOMY with
+    host-layout bytes. Identical to the observed layout today
+    (all-canonical), but for Stage B: EITHER pass the plan's observation
+    into the catalog, OR prove the catalog is layout-invariant for its use
+    (grouping by projection identity only).
 - **Phase 1 — entry item 0 (reviewer spine finding, Main-confirmed
   2026-11-13, seq 45): fail-closed admission before any division.** At
   `d3e936fbd`, `admitStructure` (`CPUNativeQuantisedWeightView.h:456-459`)
