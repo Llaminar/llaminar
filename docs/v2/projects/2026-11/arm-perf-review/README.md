@@ -6392,3 +6392,24 @@ superseded; ef86de1c1 partial kept as its own superseded record.
 Board: sparks .80 focused + .79 incremental @ 9ba1d4da2 (in
 flight); WSL x86 @ 9ba1d4da2 (in flight); lane = vacuous-filter
 robustness commit (pending); reviewer = waiting for the evidence.
+
+### 8ccfa771c: standing filter-resolution guard + re-targets (14:39Z)
+
+Lane (seq-273 items 3+4): (3) installed GTest does NOT support
+--gtest_fail_if_no_test_selected (verified absent from brew+gate
+headers); no repo-wide name-resolution check -> guard = STANDING
+SCRIPT scripts/ci/verify_chain_preflight_filters.py (enumerates the
+chain's focused registrations -> parses --gtest_filter= -> resolves
+each vs the test sources; URL-style wildcards; exit!=0 on any miss).
+RUN AT THIS COMMIT = 10/10 chain filter names resolve (full table in
+the commit message; incl. B1 both OrcConfigDoc.ResolvedCpuPrepared
+Layout exact decls + B2 TierLegacyCap...; runtime-plan pair; MPI
+inventory; memory-planner trio; ExpertTier weight-stream additions).
+LANE RULE ADDED: re-run the script after any chain-registration edit
+(alongside the RECORD probe + rebase-marker grep). (4) .80 tests>0
+evidence dispatched (ctest -R the two registrations + XML tests>0
+assert). COORDINATOR VERIFY: 8ccfa771c (origin tip; 1 file +79 = the
+script only; no test/CMake/production change). RE-TARGETED: sparks
+(.80 focused + .79 incremental + the 2 registration asserts),
+WSL (x86 incremental @ 8ccfa771c; 9ba1d4da2 run = predecessor
+record). TIPS: code/review = 8ccfa771c; pins after green.
