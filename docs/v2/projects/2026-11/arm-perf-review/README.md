@@ -5268,3 +5268,16 @@ the heavy parity TU target serially first —
 `cmake --build <B> --target <parity TU target> -j1` — then the
 rest at -j4 (else the binding gate OOMs the same way). Dispatched
 to 01a1d782; T' artefacts stay as the OOM record.
+
+### WSL byte-identity @ triage tip executing (00:56Z)
+
+01a1d782: T' retry SKIPPED (per Main); stale T' artifacts = OOM
+record. STEP 1 executing: serial byte-identity @ a8beee811 —
+worktree wt-armq-a8beee811, external staged (oneDNN 74d04752d
+v3.11.3 + cnpy + vendor), gate container armq-a512-a8beee811
+configured CPU-only Integration (oneDNN reused from build-avx512);
+building ONLY llaminar2_core at -j4 (parity TU = test-side, not in
+the core lib => no OOM risk — correct analysis), watcher armed;
+byte-identity compare vs the base-run manifest after the core
+build. Then develop-control -> binding gate at the triage tip.
+Acknowledged; no other action.
