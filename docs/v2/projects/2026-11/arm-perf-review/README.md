@@ -6295,3 +6295,24 @@ EXPLICIT NEW-PIN REQUEST SENT to the reviewer @ 56829099c (A4-R
 range + the cap-test fix + docs; boundaries per the verdict; the
 .80/.79/WSL reruns in flight attach on completion). Reviewer:
 SOURCE HOLD6ca/#214 until the fresh verdict.
+
+### Complete causal lines relayed; ef86 = superseded; local record updated (14:35Z)
+
+WSL relayed the 6 records' ACTUAL assertions (extracted from the
+existing receipts, no new runs): CPUStartupAffinity = workers=4
+expected=8 (single-socket 8-logical/4-worker default; 2x then
+aborted); 2 replays = mpirun child Exit code: 1 (socket-gather on
+single-socket); trainer generators + CsvValidator = FileNotFoundError
+for the rocm fixtures CSVs (tests/v2/performance/kernels/rocm/
+fixtures/*smoke.csv NOT git-tracked; no fixtures/ dir) + the
+subprocess.CalledProcessError. Owner causal-root observation =
+environment/fixture-absence (NOT verified defect absence — the
+reviewer reads the lines). LOCAL RECORD appended (x86-summaries-
+and-diff.txt now 12KB; complete causal lines + the ef86 note).
+ef86de1c1 x86 = SUPERSEDED/partial (configure + parity prebuild
+[134/800]; removed at the re-target; NO DRIVER_RC/test_count) —
+binding x86 evidence = 56829099c (restarting). Reviewer delivered
+(pin request complete + causal lines; the 56829099c x86 completed
+record follows). Board: .80/.79 reruns @ 56829099c + WSL x86
+restart @ 56829099c -> evidence attach -> reviewer verdict ->
+Gate-A.
