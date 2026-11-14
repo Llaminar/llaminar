@@ -5569,3 +5569,27 @@ Invocation-contract x2 + NCCL proofs x4 excluded both sides per the
 rule. NEXT: .79 triage-tip gate @ 1af9f6429 (HAVE_NCCL=ON; 4
 excluded from the diff only) — 17 should go green; 12 CUDA =
 classify. Main + lane informed.
+
+### Main's classification rules relayed; pre-check evidence complete (03:57Z)
+
+Main rules for the .79 gate @ 1af9f6429: (A) 17 admission names
+MUST all be green (any red => verbatim + Gate-A blocked); (B) the 12
+CUDA/collective/transfer: per-name ctest -N at the base control
+(not registered => "NCCL-only, no base reference" registration-set
+artifact) + JUnit verbatim class (_CUDA2/2-device => UNQUALIFIED on
+single-GPU GB10 = SecondaryDevice rule; real 1-device failure =>
+chain suspect => lane); (C) CachedGraph base-only => check ran-at-
+tip / base-flaky => "flaky, not attributable" (NOT an improvement
+until understood). COORDINATOR PRE-CHECK: (1) diff grep
+nccl/collective/transfer/ = exactly src/v2/transfer/MappedTransfer
+ProgressEpoch.cpp (+test) — added by A2 85ddd8572, registered as
+V2_Integration_MappedTransferProgressEpoch, NOT among the 12, NO
+NCCL/collective code touched; (2) the 12 names' registrations EXIST
+at base (generated per-device names in the same 4 files; git log -S
+EMPTY = chain did not add them); guard confirmed
+V2NativePeerVisibilityTests.cmake:11 = (... AND HAVE_CUDA AND
+HAVE_NCCL) => absent at the HAVE_NCCL=OFF base control =
+registration-set artifact (Main's hypothesis confirmed at source,
+modulo sparks' ctest -N). Relayed to sparks (A/B/C for the gate
+result); evidence on record. Gate-A requires (A) green + (B) all
+classified + WSL x86 binding gate at 1af9f6429.
