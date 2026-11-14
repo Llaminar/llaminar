@@ -5308,3 +5308,33 @@ armq/stagea-byteidentity/tip-run/{progress,report.txt,*.bin}; tree
 armq/a512-a8beee811/tree. HEAD-SIDE PROOF: Stage-A chain at the
 triage tip changes NO prepared byte on x86 (proven at aa842a1be +
 a8beee811). NEXT: develop-control @118930745.
+
+### .80 FOCUSED TRIAGE COMPLETE @ a8beee811 (01:23Z) — 2 remaining = behavior gap
+
+Build GREEN (ClusterInventory compile fix; Linux compile evidence
+incl. every transitive includer). FOCUSED RESULT: PASS —
+OrcConfigDoc.EveryRequiredOrExtraObjectFieldIsRejected;
+MoEOverlayCapacityAdmission.CpuResourcesPriceOnlyTheBoundOverlay
+Layout; PipelineStageAdmissionAuthenticatesManifestOrigin;
+RemoteCpuWireBuildersRejectUnimplementedLayoutsBeforeArithmetic;
+AutomaticPlanningDiagnostics.CompleteAdmission...; CSSource*
+(fixed-depth/StrictArm); CPUTensorTP1PreparedStatic.OriginalSource...;
+CPUExpertShardAccounting 6/6; CPUJointStaticResidency.
+OriginalPhysicalAdmission...; Reservoir (RetainedExecutor...,
+ColdLoadGraph..., FragmentPublicationEpochIdentity...) — PASS w/
+seccomp unconfined + SYS_NICE + SYS_ADMIN (plain-container "CPU
+root first-touch placement failed" = ENV, not defect);
+MoEPipelineNativePreparation x2. **FAIL (2, verbatim @
+Test__MoEPipelineFixedMemory.cpp:510): DeviceCounts/MoEPipeline
+MultiDeviceMemory.AggregateHostBudgetCannotBeReusedByEveryStage
+/Devices4 + /Devices8 — expected PhysicalMemoryCapacityExhausted,
+actual std::invalid_argument "ExpertOverlay capacity admission
+requires the inventory-bound uniform CPU prepared layout for every
+CPU resource" = the chain-introduced bucket-b REPRODUCED ON ARM at
+the triage tip; a8beee811 = COMPILE FIX ONLY; LANE BEHAVIOR FIX
+STILL PENDING (MultiDeviceMemory producer at 4/8 devices). Note:
+the FixedMemoryOwners integration names ≠ gtest in the memory-
+planner visible set (ride the .79 preflight JUnit). BASE CAVEAT:
+.79 base control = pre-PR proof scripts vs the T'-receipted
+ncclout => base needs its OWN pre-PR NCCL install (separate
+prefix) — sparks handling; base control pending.
