@@ -5511,3 +5511,18 @@ LLAMINAR_ASSERT). RE-PIN SENT (.80 @ 1af9f6429 binding; no green
 claim until it lands; sequence: green => triage tip = 1af9f6429
 => .79 base control+diff => WSL binding gate). AGENTS.md ASSERT-
 vs-LLAMINAR_ASSERT doc mismatch flagged to Main for the base owner.
+
+### Main 02:18Z: 1af9f6429 confirmed + doc nuance (no release-mode guard claim)
+
+Main: Assertions.h defines ONLY LLAMINAR_ASSERT* (:114/:207); no
+bare ASSERT/ASSERT_MSG in src/v2 — lane right to follow the code.
+NUANCE: LLAMINAR_ASSERT = ((void)0) in some build types (:207) =>
+the "dead for CPU pricing" invariant is checked only where
+assertions are compiled in — acceptable for an internal invariant,
+BUT the doc must NOT call it a RELEASE-MODE GUARD. Lane dispatched
+(docs-only wording fix; gate binds at 1af9f6429; docs tip named per
+precedent). AGENTS.md:1329 ASSERT/ASSERT_MSG/ASSERT_NOT_NULL naming
+= real doc-vs-code drift -> recorded for the base owner as a docs
+fix (NOT on the PR — stabilization only). GREEN CLAIM HELD until
+the .80 Linux compile + focused run at 1af9f6429; sequence
+unchanged.
