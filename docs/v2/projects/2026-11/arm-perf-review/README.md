@@ -5642,3 +5642,29 @@ tip(1af9f6429)-vs-03480d07e NAME DIFF (new reds at the tip not red
 at 03480d07e) — CachedGraph green->red likely the one; else
 classify. Then: successor -> .80 compile+focused (cheap) -> .79
 rerun -> WSL x86 binding gate -> pins -> Gate-A. Both dispatched.
+
+### Successor 6ca2462cc landed + verified (05:01Z) — nullptr audit exceeded
+
+Lane: root = the pipeline-capacity file's stage() helper adds a CPU
+host-prefix budget to EVERY GPU stage => every admission call in
+Test__MoEOverlayPipelineCapacity.cpp carries a CPU resource with a
+GPU-only plan; 83a0351bd converted FixedMemory but left these
+explicit nullptr; fc39fbe93 made them deliberate ->
+JointReplicaSearch hit the refusal with a real CPU budget. FIX:
+pipelineObserved() (device-free uniform-canonical rank {0}) at
+every call; GPU-only plan + host-prefix derives to absent (no CPU
+participant); capacity result real (retained-grant logic_error
+still fires). AUDIT (Main's amplification): 28 explicit-nullptr ->
+23 remain, all justified in the commit (ProjectionCapacity x4 no
+DeviceId::cpu; resolver :867 refusal-under-test, :880/:896
+observation-present, :974-:1021 x9 cuda/rocm-only, :1157/:1190
+rocm-only, :1667 cuda, :1724/:1734 cuda). EXTRA FIND from the same
+grep (same class, fixed): MigrationFabricSelectsInitialSource
+ResidencyPolicy :1492/:1509, BoundRankDeviceResourcesDriveScrambled
+ThreeTierPriorityQuotas :1582/:1606, TransferStagingBomPrices
+LocalHeterogeneousAndRelayResourcesExactly :3701 -> switched to
+admissionTestObserved() ({0,11}). No production change; Mac gates
+green. COORDINATOR VERIFY: tip 6ca2462cc; 2 test files +35/-18; no
+src/. RE-PIN SENT (.80 compile+focused -> .79 rerun -> WSL binding
+-> pins -> Gate-A). Still owed: arithmetic name-diff (sparks),
+WSL develop-control report.
