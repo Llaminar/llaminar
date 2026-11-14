@@ -5292,3 +5292,19 @@ triage-results @ 01:53Z host). No free window -> canonical 35B/
 27B benchmark set deferred; next cycle (or at first free window
 post-qualification) runs it at the current tip. No benchmark
 claim made; tracker only.
+
+### WSL byte identity @ a8beee811 = BYTE-IDENTICAL (01:12Z)
+
+01a1d782 STEP 1 DONE: tip tree (wt-armq-a8beee811, oneDNN
+74d04752d), CPU-only Integration, built ONLY libllaminar2_core.so
+(CORE_RC=0; parity TU = test-side -> avoided, no OOM); dump tool
+vs tip flags + core (RUN_RC=0): ALL 42 native_interleaved streams
+(21 formats x 2 geometries) sha256-identical to the base-run
+manifest; 42/42 scalar fields identical (geometry/stride/encoding/
+asym/superblock/payload/codebook/ilv). SEALED K14-STAGEAGATE-X86-
+PREPARED-BYTE-IDENTITY-A8BEEE811 (sha256 80aaa51151e201720ce7e6768
+2876533e9dc41f61b82df3de12b852ca8d194fb); artifacts
+armq/stagea-byteidentity/tip-run/{progress,report.txt,*.bin}; tree
+armq/a512-a8beee811/tree. HEAD-SIDE PROOF: Stage-A chain at the
+triage tip changes NO prepared byte on x86 (proven at aa842a1be +
+a8beee811). NEXT: develop-control @118930745.
