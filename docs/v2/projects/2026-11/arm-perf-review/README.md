@@ -6167,3 +6167,29 @@ EVIDENCED; the reviewer's CLASSIFIED/PENDING can close with the
 delta). Board: .80/.79 re-verification at ef86de1c1 running in
 parallel; pins A3+A4+A4-R at ef86de1c1 after the re-verification +
 reviewer re-read -> Gate-A.
+
+### Main 14:27Z: x86 delta accepted; base-only re-recorded; A4-R OK; §8 carry #2
+
+x86 delta ACCEPTED (tip-only 0, base-only 1); seals = the x86
+record; reviewer x86 "pending" closes. **BASE-ONLY RERECORD: "the
+tip FIXES it" = WRONG — `git diff --name-only d5e04fdce 6ca2462cc
+-- cmake tests/v2/unit/cmake` = EMPTY (coordinator-verified) => the
+chain does NOT touch cmake/OneDNNBuild.cmake or its test => the
+OneDNNBuildLifecycle base-only = ENVIRONMENTAL (likely the Nov-13
+OOM'd build dir/markers left behind), NOT a fix — RECORD AS
+"BASE-ENVIRONMENT, NOT ATTRIBUTABLE".** A4-R @ ef86de1c1 source
+review OK (preparedFootprints REQUIRES layout; :632 + :904 pass
+the observation). §8 CARRY #2 (Stage-B-entry, next to the
+admission-predicate refinement): EconomyCalibrationLayerCatalog
+:170-173 prices with kHostPreparedLayout; complete_expert_bytes_
+per_layer_ = max(cpu,gpu) => for CPU-heavy layouts it can still
+STEER CALIBRATION GROUPING + ECONOMY with host-layout bytes
+(identical today — all-canonical); Stage B = EITHER pass the plan's
+observation into the catalog OR prove the catalog is layout-
+invariant for its use (grouping by projection identity only).
+WSL: name-level diff 6ca->ef86de1c1 sealed
+(K14-STAGEAGATE-X86-NAMELVL-6CA-TO-EF86DE1C1, e8f98ca...);
+x86 INCREMENTAL GATE @ ef86de1c1 running (-j4, parity -j1 first,
+fresh OUT, full seal; expected 0 reds + 2 new tests green). Board:
+.80/.79 re-verification running; WSL x86 incremental in flight; ->
+pins -> Gate-A.
