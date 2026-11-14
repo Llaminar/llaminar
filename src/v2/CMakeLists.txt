@@ -752,6 +752,7 @@ if(HAVE_ROCM)
         kernels/rocm/attention/ROCmQwen4ExpBranchConcat.hip
         kernels/rocm/ops/ROCmTPRankOrderedReductionKernels.hip # Batch-invariant rank-ordered TP sums
         # MoE (Mixture of Experts) kernels
+        kernels/rocm/moe/ROCmRouterQ8Prefill.hip             # Native gfx1100 exact router tiles
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
         kernels/rocm/moe/ROCmMoEOverlayActivationPacketKernels.hip # Device-owned node-local sparse activation packets
         kernels/rocm/moe/ROCmMoEOverlayDeviceControllerKernels.hip # Node-local sole-controller lifecycle
@@ -892,6 +893,7 @@ if(HAVE_ROCM)
     # ordered backend's wave64 default; gfx906 retains its only native wave64
     # mode and emits no WMMA entry. Both targets retain the same spill guard.
     set_property(SOURCE kernels/rocm/gemm/ROCmNativeQuantisedWmma.hip
+        kernels/rocm/moe/ROCmRouterQ8Prefill.hip
         APPEND PROPERTY COMPILE_OPTIONS "-mwavefrontsize64")
     
     # NOTE: ROCm kernel ITensorGemm adapters (ROCmFloatingPointGemmKernel.cpp)

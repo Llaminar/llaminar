@@ -10748,11 +10748,37 @@ set(LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG
     "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_quantised_dispatch/manifests/qwen35_qwen36_release_models_v1.json")
 set(LLAMINAR_NATIVE_QUANTISED_MOE_GGUF_PATTERN_MANIFEST
     "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/native_quantised_dispatch/manifests/qwen_moe_gguf_codebook_patterns_v1.json")
+# Parameter generators execute during every GTest initialization, including
+# unrelated installed-runner tests. Embed canonical router geometry at build
+# time rather than reopening absolute source paths from the generator.
+set(_router_inventory_root "${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels")
+set(_router_inventory_package "${_router_inventory_root}/native_quantised_dispatch")
+set(_router_inventory_header "${CMAKE_CURRENT_BINARY_DIR}/generated/ROCmRouterModelInventoryGenerated.h")
+add_custom_command(OUTPUT "${_router_inventory_header}"
+    COMMAND ${CMAKE_COMMAND} -E env "PYTHONPATH=${_router_inventory_root}"
+        ${Python3_EXECUTABLE} -m native_quantised_dispatch.generate_router_inventory
+        --output "${_router_inventory_header}"
+    DEPENDS
+        "${_router_inventory_package}/__init__.py"
+        "${_router_inventory_package}/schema.py"
+        "${_router_inventory_package}/candidate_registry.py"
+        "${_router_inventory_package}/generate_router_inventory.py"
+        "${_router_inventory_package}/qwen_moe_gguf_patterns.py"
+        "${_router_inventory_package}/qwen_release_geometry.py"
+        "${_router_inventory_package}/hf_gguf_moe_inventory.py"
+        "${_router_inventory_package}/format_registry.py"
+        "${LLAMINAR_NATIVE_QUANTISED_MOE_GGUF_PATTERN_MANIFEST}"
+        "${LLAMINAR_NATIVE_QUANTISED_QWEN_RELEASE_CATALOG}"
+    COMMENT "Embedding validated MoE router geometry"
+    VERBATIM
+)
 add_executable(v2_perf_moe_verifier_prefill
+    "${_router_inventory_header}"
     performance/kernels/moe/Perf__MoEVerifierPrefill.cpp
     performance/kernels/moe/Perf__ROCmMoEVerifierPrefill.cpp
     performance/kernels/moe/Perf__CUDAMoERouterSoftmaxTopK.cpp
     performance/kernels/moe/Perf__ROCmMoERouterSoftmaxTopK.cpp
+    performance/kernels/moe/Perf__ROCmRouterQ8Prefill.cpp
     performance/kernels/moe/Test__MoETrainerBootstrap.cpp
     integration/mpi_gtest_main.cpp
 )
@@ -10780,6 +10806,7 @@ target_link_libraries(v2_perf_moe_verifier_prefill
 )
 target_include_directories(v2_perf_moe_verifier_prefill PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor
+    "${CMAKE_CURRENT_BINARY_DIR}/generated"
 )
 target_compile_definitions(v2_perf_moe_verifier_prefill PRIVATE
     LLAMINAR_NATIVE_QUANTISED_MOE_GGUF_PATTERN_MANIFEST_PATH="${LLAMINAR_NATIVE_QUANTISED_MOE_GGUF_PATTERN_MANIFEST}"
@@ -30530,6 +30557,21 @@ if(HAVE_CUDA)
         LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;Q8;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK cuda_gpu_0)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDARouterQ8Prefill)
+endif()
+
+# Actual native-ISA selection is inside the test; other visible AMD devices do not certify WMMA.
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_ROCmRouterQ8WmmaReplay
+        COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+            --gtest_filter=RouterHadamardQ8.ROCmWmmaCapturedReplay:MoERouterOwnedRows.ROCmWmmaCapturedReplay:MoERouterHiddenQ8ScaleRange.ROCmWmmaCapturedReplay
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Q8;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmRouterQ8WmmaReplay)
+    add_v2_test(V2_Perf_ROCmRouterQ8Wmma
+        COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill> --gtest_also_run_disabled_tests
+            --gtest_filter=NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedProductionTournament/M512K2048E256*:NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedProductionTournament/M512K3072E256*:NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedProductionTournament/M512K2560E512*:NativeGfx1100/ROCmRouterQ8Prefill.DISABLED_CapturedProductionTournament/M512K8192E512*
+        LABELS "V2;Performance;ROCm;MoE;Q8;WMMA;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
 endif()
 
 # Explicit half-operand policy, identity, and verifier lifecycle regressions.

@@ -16,9 +16,15 @@
 #ifdef HAVE_CUDA
 #include "kernels/cuda/moe/CUDARouterQ8Prefill.h"
 #endif
+#ifdef HAVE_ROCM
+#include <hip/hip_runtime.h>
+#include "kernels/rocm/moe/ROCmRouterQ8Prefill.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#endif
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
 #include "utils/TestTensorFactory.h"
 #include <gtest/gtest.h>
+#include <optional>
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -97,7 +103,7 @@ void proveH(DeviceId device, int m, int k, int experts,
         requireH(backend && stream,"H32 backend stream");
 #ifdef HAVE_CUDA
         cuda::RouterQ8PrefillHardware hardware;
-        if (route == HRoute::TensorCorePrefill)
+        if (device.is_cuda() && route == HRoute::TensorCorePrefill)
         {
             EXPECT_FALSE(cuda::prepareRouterQ8PrefillHardware(device.ordinal, nullptr, hardware));
             requireH(cuda::prepareRouterQ8PrefillHardware(device.ordinal, stream, hardware), "router hardware preparation");
@@ -145,20 +151,34 @@ void proveH(DeviceId device, int m, int k, int experts,
         const auto capturedLogits = [&](void *producer)
         {
 #ifdef HAVE_CUDA
-            if (route == HRoute::TensorCorePrefill)
+            if (device.is_cuda() && route == HRoute::TensorCorePrefill)
             {
                 requireH(device.is_cuda(), "tensor-core test requires CUDA");
                 return cudaMoE_gate_logits_q8_weights_prefill_rows(fp(h), qp(q), fp(s),
                     qp(g), fp(gs), fp(out), m, k, experts, device.ordinal, producer, live, rotated, hardware);
             }
 #endif
+#ifdef HAVE_ROCM
+            if (device.is_rocm() && route == HRoute::TensorCorePrefill)
+            {
+                rocm::ScopedRouterQ8PrefillMode candidate(rocm::RouterQ8PrefillMode::NativeWmma);
+                return logitsH(device,fp(h),qp(q),fp(s),qp(g),fp(gs),fp(out),m,k,experts,producer,live,rotated);
+            }
+#endif
             return logitsH(device,fp(h),qp(q),fp(s),qp(g),fp(gs),fp(out),m,k,experts,producer,live,rotated,m==1);
         };
         EXPECT_FALSE(capturedLogits(nullptr));
+#ifdef HAVE_ROCM
+        if (device.is_rocm() && route == HRoute::TensorCorePrefill)
+        {
+            EXPECT_FALSE(capturedLogits(hipStreamLegacy));
+            EXPECT_FALSE(capturedLogits(hipStreamPerThread));
+        }
+#endif
         {
             ScopedBackendGraphCapture capture(context,*graph,"signed router H32"); requireH(capture.begin(),"H32 capture begin");
 #ifdef HAVE_CUDA
-            if (route == HRoute::TensorCorePrefill)
+            if (device.is_cuda() && route == HRoute::TensorCorePrefill)
             {
                 cuda::RouterQ8PrefillHardware unavailable;
                 EXPECT_FALSE(cuda::prepareRouterQ8PrefillHardware(device.ordinal, stream, unavailable));
@@ -177,13 +197,23 @@ void proveH(DeviceId device, int m, int k, int experts,
             found |= node.name.find("quantize_signed_hadamard32")!=std::string::npos;
             tensor_core |= node.name.find("router_q8_prefill_detail")!=std::string::npos;
 #ifdef HAVE_CUDA
-            if (node.name.find("router_q8_prefill_detail")!=std::string::npos)
+            if (device.is_cuda() && node.name.find("router_q8_prefill_detail")!=std::string::npos)
             {
                 const auto tile = cuda::routerQ8PrefillGeometry(m,k,experts,hardware);
                 EXPECT_EQ(node.block_x, 32u * tile.warps);
                 EXPECT_EQ(node.grid_x, unsigned((experts+tile.experts-1)/tile.experts));
                 EXPECT_EQ(node.grid_y, unsigned((m+tile.rows-1)/tile.rows));
                 EXPECT_EQ(node.static_shared_memory_bytes, tile.k_warps>1 ? 512u*tile.k_warps : 0u);
+            }
+#endif
+#ifdef HAVE_ROCM
+            if (device.is_rocm() && node.name.find("router_q8_prefill_detail")!=std::string::npos)
+            {
+                const unsigned k_waves = k <= 32 ? 1u : k <= 64 ? 2u : 4u;
+                EXPECT_EQ(node.block_x, 64u * k_waves);
+                EXPECT_EQ(node.grid_x, unsigned((experts+15)/16));
+                EXPECT_EQ(node.grid_y, unsigned((m+15)/16));
+                EXPECT_EQ(node.static_shared_memory_bytes, k_waves == 1 ? 0u : k_waves * 1024u);
             }
 #endif
         }
@@ -202,6 +232,12 @@ void proveH(DeviceId device, int m, int k, int experts,
                 backend->hostToDevice(fp(s),poison_scales.data(),poison_scales.size()*4,device.ordinal,stream),"H32 poisoned replay inputs");
             if(active>0)
             {
+#ifdef HAVE_ROCM
+                // Keep the reference independent when automatic dispatch later
+                // admits a measured WMMA tile for this geometry.
+                std::optional<rocm::ScopedRouterQ8PrefillMode> oracle;
+                if (device.is_rocm()) oracle.emplace(rocm::RouterQ8PrefillMode::OrderedDot4);
+#endif
                 if(m<=31) for(int row=0;row<active;++row)
                     requireH(logitsH(device,fp(hr)+size_t(row)*k,qp(qr)+size_t(row)*k,fp(sr)+size_t(row)*k/32,
                         qp(gr),fp(gsr),fp(ref)+size_t(row)*experts,1,k,experts,stream,nullptr,original,true),"H32 serial row oracle");
@@ -262,5 +298,29 @@ TEST(RouterHadamardQ8, CUDATensorCorePrefill)
 #ifdef HAVE_ROCM
 /** @test ROCm wave64 grouping, live counts and original expert publication. */
 TEST(RouterHadamardQ8, ROCm) { proveHBackend(DeviceId::rocm(0)); }
+/** @test Native WMMA retains serial bytes, source banks and large/empty/partial replay. */
+TEST(RouterHadamardQ8, ROCmWmmaCapturedReplay)
+{
+    initializeROCmHardwareMetadata();
+    int ordinal = -1;
+    for (int i = 0; i < int(rocmHardwareMetadata().size()); ++i)
+    {
+        const auto &isa = rocmHardwareMetadata().at(i).isa_target;
+        if (isa == "gfx1100" || isa.starts_with("gfx1100:")) { ordinal = i; break; }
+    }
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    const auto device = DeviceId::rocm(ordinal);
+    for (auto basis : {RouterQ8Basis::Original, RouterQ8Basis::SignedHadamard32})
+    {
+        for (int m = 1; m <= 65; ++m) proveH(device,m,96,17,HRoute::TensorCorePrefill,basis);
+        for (int k : {32,64,96,128,256,384,768,1024,1536,2048,2080,2560,3072,4160,6144,8192,12288})
+            proveH(device,17,k,17,HRoute::TensorCorePrefill,basis);
+        for (int m : {128,256,448,511,512,513,768,1024,1536,2048,4096})
+            proveH(device,m,96,17,HRoute::TensorCorePrefill,basis);
+        for (int m : {512,1024,2048}) proveH(device,m,2048,256,HRoute::TensorCorePrefill,basis);
+        for (int experts : {32,64,128,257,512,1024})
+            proveH(device,513,2048,experts,HRoute::TensorCorePrefill,basis);
+    }
+}
 #endif
 }
