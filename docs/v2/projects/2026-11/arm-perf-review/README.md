@@ -5360,3 +5360,28 @@ drop only the NCCL proof registrations) + record the delta
 explicitly; the attribution diff excludes the NCCL proof tests on
 both sides (covered by install3's green at T').** Sparks decides on
 the actual result; report verbatim. Dispatched to lane + sparks.
+
+### Remaining-2 fixup 83a0351bd landed + verified; .80 re-pinned (01:26Z)
+
+Lane: production COVERED (MoEPipelineMemoryAdmission :290,
+OrchestrationCandidateAdmission :309, OrchestrationRunner :18813
+pass live inventory — no missed producer); gap = FIXTURE-side
+(Main's case b): Fixture::admit fed authored plans into
+resolvePipelineCapacity WITHOUT the inventory. FIX (per binding —
+live-inventory derivation, NO hand-set, contract unchanged):
+Fixture::admit passes the fixture inventory; Devices4/8 GPU-only
+plans fall back to the build's host layout => PhysicalMemory
+CapacityExhausted reached unchanged. CONSISTENCY SWEEP: ALL
+previously hand-set sites converted (PipelineStageAdmission
+AuthenticatesManifestOrigin, CPUExpertShardAccountingReplay.inc,
+CPUJointStaticResidencyLifecycle.inc, CPUTensorTP1PreparedStatic
+Replay.inc — hand-sets removed; each admission call passes the
+fixture inventory). NEW shared device-free
+tests/v2/utils/TestCPUPreparedLayoutInventory.h
+(cpuUniformCanonicalInventory). NO production code in this fixup
+(behavior fix = ba2811e4c); 6 files +70/-22. COORDINATOR VERIFY:
+origin tip 83a0351bd; 6 files +70/-22 (5 tests + the header); no
+src/ production change. RE-PIN SENT (.80 focused set @ 83a0351bd;
+whole set if cheap — conversions touch the same TUs). PASS =>
+triage tip = 83a0351bd => .79 base control + triage-tip rerun w/
+diff.
