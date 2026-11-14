@@ -8,13 +8,11 @@
  */
 #pragma once
 #include "kernels/common/DeviceRowPartition.h"
+#include "ROCmRouterQ8Policy.h"
 #include <cstdint>
 
 namespace llaminar2::rocm
 {
-/** @brief Explicit recording choice for production-path component tournaments. */
-enum class RouterQ8PrefillMode { Automatic, OrderedDot4, NativeWmma };
-
 /** @brief Thread-local, nestable recording policy; does not alter retained graphs. */
 class ScopedRouterQ8PrefillMode final
 {
@@ -31,11 +29,10 @@ private:
 };
 
 /** @brief Resolve the native entry from the admitted device and captured shape.
- * @param device Owning visible HIP ordinal. @param rows Local captured capacity.
- * @param width Block32 contraction width. @param experts Router output columns.
- * @return Whether this recording selects native WMMA.
+ * @param device Owning visible HIP ordinal. @param shape Original geometry and ownership.
+ * @return Immutable engine and tile selection bound to this device and shape.
  * @throws std::invalid_argument For a forced unsupported architecture or geometry. */
-bool selectRouterQ8Wmma(int device, int rows, int width, int experts);
+RouterQ8PrefillSelection selectRouterQ8Prefill(int device, RouterQ8PrefillShape shape);
 
 /** @brief Borrowed immutable bindings; device live rows remain the sole row authority. */
 struct RouterQ8PrefillView
@@ -51,11 +48,13 @@ struct RouterQ8PrefillView
     int device = -1;
     const int *live_rows = nullptr;
     DeviceRowPartition partition;
+    RouterQ8Basis basis = RouterQ8Basis::Original;
 };
 
 /** @brief Enqueue one exact WMMA projection without allocation or synchronization.
  * @param view Frozen operands, ownership and device identity.
+ * @param selection Resolved native engine; must match the submitted view.
  * @param stream Exact non-null stream owned by view.device.
  * @return False for invalid bindings or a native submission error. */
-bool routerQ8Prefill(const RouterQ8PrefillView &view, void *stream);
+bool routerQ8Prefill(const RouterQ8PrefillView &view, const RouterQ8PrefillSelection &selection, void *stream);
 }

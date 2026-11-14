@@ -11,6 +11,8 @@
  * matching logits/Q8 side banks and untouched inactive/guard rows. Internal
  * ordered-timeline events bracket the complete captured operation chain, excluding
  * host submission gaps; an external event only joins completed timing samples.
+ * Installed Automatic tournaments retain an explicit Dot4 oracle and authenticate
+ * the same sixteen-wave kernel selected by ordinary production recording.
  */
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -70,10 +72,16 @@ enum class RouterBenchmark { FullCapacity, LivePrefix, Profile, TimingReplay };
 
 /** @brief Verify one production component and either measure it or profile one native replay.
  * @param c Complete immutable geometry and source basis. @param mode Explicit evidence scope.
- * @param wave_tile Captured maximum K-wave count; small K retains only nonempty subtrees. */
+ * @param wave_tile Captured maximum K-wave count; small K retains only nonempty subtrees.
+ * @param candidate_mode Explicit experiment or installed Automatic recording. */
 void benchmarkRouter(const RouterCase &c, RouterBenchmark mode,
-    rocm::RouterQ8WaveTile wave_tile = rocm::RouterQ8WaveTile::Four)
+    rocm::RouterQ8WaveTile wave_tile = rocm::RouterQ8WaveTile::Four,
+    rocm::RouterQ8PrefillMode candidate_mode = rocm::RouterQ8PrefillMode::NativeWmma)
 {
+    const bool automatic = candidate_mode == rocm::RouterQ8PrefillMode::Automatic;
+    if (automatic && (c.rows != 512 || c.width != 2560 || c.experts != 512))
+        throw std::invalid_argument("Automatic router tournament requires the installed whole-row key");
+    const auto expected_tile = automatic ? rocm::RouterQ8WaveTile::Sixteen : wave_tile;
     const bool profile = mode == RouterBenchmark::Profile;
     if (profile && ::testing::UnitTest::GetInstance()->test_to_run_count() != 1)
         throw std::invalid_argument("isolated router profiling requires exactly one selected test case");
@@ -138,7 +146,7 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode,
             out[path] = TestTensorFactory::createFP32({outputs});
             for (auto *t : {q[path].get(),scales[path].get(),out[path].get()})
                 routerRequire(t->ensureOnDevice(device,stream), "router benchmark destination storage");
-            rocm::ScopedRouterQ8PrefillMode policy(path ? rocm::RouterQ8PrefillMode::NativeWmma : rocm::RouterQ8PrefillMode::OrderedDot4);
+            rocm::ScopedRouterQ8PrefillMode policy(path ? candidate_mode : rocm::RouterQ8PrefillMode::OrderedDot4);
             rocm::ScopedRouterQ8WaveTile tile(path ? wave_tile : rocm::RouterQ8WaveTile::Four);
             const auto produce = [&]
             {
@@ -177,8 +185,8 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode,
                 {
                     ++matrix_nodes;
                     unsigned waves = 1;
-                    while (waves < unsigned(c.width/32) && waves < unsigned(rocm::routerQ8WaveCount(wave_tile))) waves *= 2;
-                    const int wave_log = wave_tile == rocm::RouterQ8WaveTile::Four ? 2 : wave_tile == rocm::RouterQ8WaveTile::Eight ? 3 : 4;
+                    while (waves < unsigned(c.width/32) && waves < unsigned(rocm::routerQ8WaveCount(expected_tile))) waves *= 2;
+                    const int wave_log = expected_tile == rocm::RouterQ8WaveTile::Four ? 2 : expected_tile == rocm::RouterQ8WaveTile::Eight ? 3 : 4;
                     ASSERT_NE(node.name.find("ELi" + std::to_string(wave_log) + "EEEv"),std::string::npos) << node.name;
                     ASSERT_EQ(node.block_x,64u*waves);
                     ASSERT_EQ(node.static_shared_memory_bytes,waves == 1 ? 0u : waves*1024u);
@@ -332,7 +340,8 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode,
             std::cout << std::setprecision(9);
             for (int sample = 0; sample < samples; ++sample)
             {
-                if (wave_tile != rocm::RouterQ8WaveTile::Four)
+                if (automatic) std::cout << "ROCM_ROUTER_AUTO_LIVE_SAMPLE,";
+                else if (wave_tile != rocm::RouterQ8WaveTile::Four)
                     std::cout << "ROCM_ROUTER_WAVE_LIVE_SAMPLE," << rocm::routerQ8WaveCount(wave_tile) << ',';
                 else std::cout << (mode == RouterBenchmark::LivePrefix ? "ROCM_ROUTER_LIVE_SAMPLE," : "ROCM_ROUTER_SAMPLE,");
                 std::cout << c.rows << ',';
@@ -341,7 +350,8 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode,
                     << int(c.basis) << ',' << sample << ',' << timings[0][sample] << ',' << timings[1][sample] << '\n';
             }
             for (auto &values : timings) std::sort(values.begin(),values.end());
-            if (wave_tile != rocm::RouterQ8WaveTile::Four)
+            if (automatic) std::cout << "ROCM_ROUTER_AUTO_LIVE_MEDIAN,";
+            else if (wave_tile != rocm::RouterQ8WaveTile::Four)
                 std::cout << "ROCM_ROUTER_WAVE_LIVE_MEDIAN," << rocm::routerQ8WaveCount(wave_tile) << ',';
             else std::cout << (mode == RouterBenchmark::LivePrefix ? "ROCM_ROUTER_LIVE_MEDIAN," : "ROCM_ROUTER_MEDIAN,");
             std::cout << c.rows << ',';
@@ -352,6 +362,17 @@ void benchmarkRouter(const RouterCase &c, RouterBenchmark mode,
         }
         for (int count : {0,1,c.rows}) { verify(count); if (::testing::Test::HasFatalFailure()) return; }
     });
+}
+
+/** @test Actual Automatic recording retains exact bytes and fresh internal timing through reset. */
+TEST(ROCmRouterQ8Automatic, CapturedTimingReplay)
+{
+    for (auto basis : {RouterQ8Basis::Original,RouterQ8Basis::SignedHadamard32})
+    {
+        benchmarkRouter({512,2560,512,basis},RouterBenchmark::TimingReplay,
+            rocm::RouterQ8WaveTile::Four,rocm::RouterQ8PrefillMode::Automatic);
+        if (::testing::Test::HasFatalFailure()) return;
+    }
 }
 
 /** @test Each retained timing owner publishes one fresh named sample and rejects absent/stale samples. */
@@ -374,6 +395,12 @@ TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedEightWaveLivePrefixTournament)
 /** @test Sixteen cooperating K waves retain the same ordered oracle and poisoned live prefixes. */
 TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedSixteenWaveLivePrefixTournament)
 { benchmarkRouter(GetParam(),RouterBenchmark::LivePrefix,rocm::RouterQ8WaveTile::Sixteen); }
+/** @test Paired installed Automatic versus explicit Dot4 over every retained live-prefix point. */
+TEST_P(ROCmRouterQ8Prefill, DISABLED_AutomaticLivePrefixTournament)
+{ benchmarkRouter(GetParam(),RouterBenchmark::LivePrefix,rocm::RouterQ8WaveTile::Four,rocm::RouterQ8PrefillMode::Automatic); }
+/** @test Isolate the exact kernel emitted by ordinary Automatic recording. */
+TEST_P(ROCmRouterQ8Prefill, DISABLED_IsolatedAutomaticProfile)
+{ benchmarkRouter(GetParam(),RouterBenchmark::Profile,rocm::RouterQ8WaveTile::Four,rocm::RouterQ8PrefillMode::Automatic); }
 /** @test Select one native production replay while setup and numerical oracles stay paused. */
 TEST_P(ROCmRouterQ8Prefill, DISABLED_IsolatedNativeProfile) { benchmarkRouter(GetParam(),RouterBenchmark::Profile); }
 /** @test Profile exactly one eight-wave native producer with collection paused during setup. */

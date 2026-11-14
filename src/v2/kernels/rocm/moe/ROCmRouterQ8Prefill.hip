@@ -25,15 +25,6 @@ namespace
 thread_local RouterQ8PrefillMode recording_mode = RouterQ8PrefillMode::Automatic;
 thread_local RouterQ8WaveTile recording_wave_tile = RouterQ8WaveTile::Four;
 
-/** @return Whether the admitted native target owns this exact wave64 instruction. */
-bool nativeRouterDevice(int device)
-{
-    const auto &hardware = rocmHardwareMetadata().at(device);
-    const auto &isa = hardware.isa_target;
-    const int waves = routerQ8WaveCount(recording_wave_tile);
-    return (isa == "gfx1100" || isa.starts_with("gfx1100:")) &&
-        hardware.maximum_threads_per_block >= 64 * waves && hardware.lds_per_block >= 1024 * waves;
-}
 }
 
 ScopedRouterQ8PrefillMode::ScopedRouterQ8PrefillMode(RouterQ8PrefillMode mode)
@@ -56,12 +47,9 @@ ScopedRouterQ8WaveTile::ScopedRouterQ8WaveTile(RouterQ8WaveTile tile)
 }
 ScopedRouterQ8WaveTile::~ScopedRouterQ8WaveTile() { recording_wave_tile = previous_; }
 
-bool selectRouterQ8Wmma(int device, int rows, int width, int experts)
+RouterQ8PrefillSelection selectRouterQ8Prefill(int device, RouterQ8PrefillShape shape)
 {
-    if (recording_mode != RouterQ8PrefillMode::NativeWmma) return false;
-    if (rows < 0 || width <= 0 || width % 32 || experts <= 0 || !nativeRouterDevice(device))
-        throw std::invalid_argument("native Q8 router WMMA requires gfx1100 and complete block32 geometry");
-    return true;
+    return RouterQ8PrefillSelection::resolve(recording_mode,recording_wave_tile,rocmHardwareMetadata().at(device),shape);
 }
 
 namespace router_q8_prefill_detail
@@ -202,13 +190,18 @@ void kernel(RouterQ8PrefillView view)
 #endif
 }
 
-bool routerQ8Prefill(const RouterQ8PrefillView &view, void *stream)
+bool routerQ8Prefill(const RouterQ8PrefillView &view, const RouterQ8PrefillSelection &selection, void *stream)
 {
+    const auto &shape = selection.shape();
     const auto native_stream = static_cast<hipStream_t>(stream);
     if (!native_stream || native_stream == hipStreamLegacy || native_stream == hipStreamPerThread ||
         !view.hidden_codes || !view.hidden_scales || !view.gate_codes || !view.gate_scales ||
         !view.logits || view.device < 0 || view.capacity <= 0 || view.width <= 0 || view.width % 32 || view.experts <= 0 ||
-        (view.partition.participants() > 1 && !view.live_rows) || !nativeRouterDevice(view.device))
+        (view.partition.participants() > 1 && !view.live_rows) || !selection.usesWmma() ||
+        selection.device() != view.device || shape.capacity != view.capacity || shape.width != view.width ||
+        shape.experts != view.experts || shape.basis != view.basis ||
+        ((shape.ownership == RouterQ8RowOwnership::CompactOwned) != (view.partition.participants() > 1)) ||
+        !supportsRouterQ8Tile(rocmHardwareMetadata().at(view.device),selection.nativeTile()))
         return false;
     int stream_device = -1;
     if (hipStreamGetDevice(native_stream, &stream_device) != hipSuccess || stream_device != view.device)
@@ -230,7 +223,7 @@ bool routerQ8Prefill(const RouterQ8PrefillView &view, void *stream)
                 router_q8_prefill_detail::kernel<LogLeaves, false, FixedWidth, WaveLogLimit><<<grid, threads, 0, native_stream>>>(view);
             return hipGetLastError() == hipSuccess;
         };
-        switch (recording_wave_tile)
+        switch (selection.nativeTile())
         {
         case RouterQ8WaveTile::Four: return submit_tile.template operator()<2>();
         case RouterQ8WaveTile::Eight: return submit_tile.template operator()<3>();
