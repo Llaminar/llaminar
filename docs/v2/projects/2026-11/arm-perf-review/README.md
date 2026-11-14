@@ -5885,3 +5885,30 @@ d5e04fdce..6ca2462cc (docs-only named: dcebc7ed8, 0a80edd6a,
 ee66b1ed6, c848e4061, bba1eafe5, cf7ce841c, 3b00c69d7), ARM seal
 K14-STAGEAGATE-6CA2462CC-20261114, byte identity @ a8beee811 — pins
 go out when the x86 gate is sealed. Both dispatched.
+
+### DEVELOP-CONTROL VERDICT: develop CPU-only configure BROKEN (develop-side) (11:23Z)
+
+WSL: develop #46 tip CANNOT configure CPU-only — verbatim
+"CMakeError at tests/v2/CMakeLists.txt:425 ($<TARGET_FILE:
+v2_integration_qwen35moe_original_lowering> No target); call stack
+:31590": add_v2_test(V2_Integration_Qwen35MoEP2PNativeRoute
+Transport) UNGUARDED, references a target defined only inside
+if(HAVE_CUDA OR HAVE_ROCM) at :42018 => absent in CPU-only.
+DEVELOP REQUIRES_BACKEND = 0 (mechanism ABSENT); a8beee811 = 30 and
+guards this exact test (CPU-only configures cleanly). VERDICT: the
+3 bucket-b reds at aa842a1be CANNOT be discriminated from a
+runnable develop baseline — develop-side missing-guard DEFECT, not
+an arm finding; BASE-OWNER ITEMS: (1) develop #46 CPU-only
+configure broken (unguarded Qwen35MoEP2PNativeRouteTransport); (2)
+develop LACKS the REQUIRES_BACKEND mechanism (0 vs our 30) — our
+guard approach validated; (3) the 3 "likely develop-inherent" reds
+stay under Main's static proof + the arm-side classification.
+SEAL K14-STAGEAGATE-X86-DEV-CONTROL-118930745 (4d723099...);
+artifacts armq/a512-dev-118930745/logs. INFRA NOTE (disclosed):
+first attempt ~10h at 99.97% mem = develop's CMake oneDNN
+.llaminar-onednn-commit marker; STALE marker (a6fd8048...) ->
+from-source oneDNN rebuild thrash; fixed = golden build-avx512
+staged + 74d04752d;isa=AVX512 marker written. **BINDING GATE @
+6ca2462cc MUST REPLICATE THE ONEDNN MARKER FIX.** WSL 9h-silence
+watch CLOSED (session working = the develop-control + thrash,
+disclosed).
