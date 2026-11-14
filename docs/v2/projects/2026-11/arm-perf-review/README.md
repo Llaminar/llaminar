@@ -5254,3 +5254,17 @@ logs/driver.log, receipt rc=1, receipt.pre-crash}); handover brief
 then T' early-surface; sequence (byte-identity serial ->
 develop-control -> binding at triage tip) unchanged; reduced -j
 does NOT change evidence status (early-surface only).
+
+### Main 00:54Z: skip T' retry; byte identity @ triage tip; parity pre-build rule
+
+WSL OOM accepted as infra (known heavy TU; nothing in source
+implicated). (1) 03480d07e run = early-surface only; triage tip
+supersedes it -> SKIP the T' retry (no second WSL cycle). (2) GO
+STRAIGHT to the SERIAL BYTE IDENTITY at the TRIAGE TIP (a8beee811
+or successor) — the head side that matters (same packer); THEN
+develop-control; THEN the binding gate at the triage tip (-j4
+alone). (3) STANDING WSL BUILD RULE (all WSL builds): pre-build
+the heavy parity TU target serially first —
+`cmake --build <B> --target <parity TU target> -j1` — then the
+rest at -j4 (else the binding gate OOMs the same way). Dispatched
+to 01a1d782; T' artefacts stay as the OOM record.
