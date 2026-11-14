@@ -21,6 +21,14 @@ It combines four evidence sources:
    objects, read VGPR/SGPR/LDS metadata, disassemble, and census instructions.
 4. **The dispatch-comparison perf test + parity** — A/B variants and validate correctness.
 
+Keep canonical collection free of observed competing inference, profiler and
+compiler work. Process observers must recognize the actual executable names
+(including `llaminar2`), retain enough original observations to audit their
+classification, and reject observer failures or incomplete snapshots. An empty
+match list from an incomplete classifier is not isolation evidence. Preserve
+invalidated observations separately and recollect affected qualifications before
+installing a policy; do not relabel historical records as uncontested.
+
 Keep timing scopes explicit. Unprofiled production request times establish the
 user-visible result; captured native-event microbenchmarks isolate kernel
 economics; rocprof attributes work and resource use. Host launch-loop timing
@@ -221,7 +229,15 @@ physical allocation encoded by `COMPUTE_PGM_RSRC1`; rocprofiler can report the
 latter. Record both instead of treating the difference as instrumentation or
 silently choosing the smaller value. Interpret the descriptor using its actual
 compiled wave32/wave64 contract, and use the loaded function's occupancy query
-and spill audit. Native wave64 WMMA is supported, even though some WMMA builtin
+and spill audit. Keep logical LDS bytes distinct from physical allocation:
+gfx1100 rounds the dispatch's group-segment bytes to 512-byte units. The
+`GRANULATED_LDS_SIZE` unit is 128 **DWORDs**, not 128 bytes; see the
+[LLVM kernel-descriptor definition](https://rocm.docs.amd.com/projects/llvm-project/en/docs-6.2.4/LLVM/llvm/html/AMDGPUUsage.html#amdgpu-amdhsa-compute-pgm-rsrc2-gfx6-gfx11).
+Match compiler and symbol metadata exactly, include any dynamic LDS from the
+dispatch, then check the profiler's allocated size using that granularity.
+Use a non-aligned size in reader regressions: 5968 logical bytes allocate 6144,
+while 3664 allocate 4096. Aligned examples can conceal a DWORD/byte error.
+Native wave64 WMMA is supported, even though some WMMA builtin
 guides describe only wave32; [AMD's WMMA reference](https://gpuopen.com/learn/wmma_on_rdna3/)
 documents both wave sizes and the dense INT8 rate of 512 operations/CU/clock.
 Use actual CU count and the declared clock denominator for peak comparisons,
