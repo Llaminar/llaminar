@@ -16,9 +16,10 @@ partial tile. Malformed live admission metadata traps.
 
 The experimental floors are 4, 8, 12 and 16 rows for both M16N32 and M16N64.
 Global RouteOwned/ExpertTiled admission is unchanged. No host reads live counts,
-and all candidate graphs retain their original pointers and policies. Ordered
-leaves finish before directory16 overwrites the shared directory for native
-leaves; an adaptive directory never survives that overwrite.
+and all candidate graphs retain their original pointers and policies. The
+original two-family experiment sequenced ordered leaves before directory16
+overwrote their shared directory. The fused candidate below replaces that
+experiment with one directory and one consumer per projection/codebook.
 
 The native operand producer now visits only live K32 stages in the current
 canonical partition. This removes decoding and LDS stores for a nonexistent
@@ -196,10 +197,91 @@ instructions. See `grouped-internal-{n32,n64,ordered}-profile/summary.json`.
 Overlapped attempts remain preserved in `grouped-internal-profile-rejected/`
 and are never promoted.
 
-The requested work-size-aware runtime policy therefore needs a cheaper grouped
-implementation. The next candidate shares one16-row directory and one projection
-consumer: it reads the authoritative whole-expert count once, then selects
-signed Dot4 or WMMA within that kernel. Both branches must feed the same existing
-scale/correction helpers and preserve source-owned K partitions. Its new Dot4
-layout and complete-operation economy require qualification before Automatic can
-select it. Automatic currently remains the established Dot4 implementation.
+## Fused candidate
+
+The fused candidate shares one 16-row directory and one projection consumer.
+It reads the authoritative whole-expert count once, then selects signed Dot4 or
+WMMA uniformly across the block. Both branches feed the existing source-specific
+FP32 scale/correction helpers and retain canonical K partitions, ascending block
+order, empty-partition positive-zero folds and the partition-one assignment.
+The ordered branch maps its output row to `4*element + lane/16`; it does not
+reuse the WMMA operand-row mapping. Both branches consume the same swizzled LDS
+producers. Pure native candidates compile a separate specialization without
+the ordered arithmetic. Native recording no longer emits obsolete tiled Dot4
+leaves or their extra directory changes; RouteOwned remains a separate complete
+implementation selected by the existing device route policy.
+
+`ROCmGroupedBranchMutation` proves branch ownership in actual retained native
+down nodes, including every repetition in the measured timing parent. Normal
+production submission rejects branch suppression. The test temporarily changes
+only that captured argument, retains both packets, and restores them after an
+exact-stream drain on every exit. It checks canonical routes against an explicit
+Dot4 oracle: suppressing one branch must remove a contribution for each affected
+expert while leaving every surviving expert's bytes intact. Restoring the packet
+must independently recover all routes after poisoning.
+
+The fixture retains the all-codebook mixed histogram and extends physical4/24,
+physical23 promotion and odd K/N tails through nonzero floors. Cold profiling
+uses capacity512/live64 for both Dot4 and the adaptive kernel. Before opening a
+profiler region, it copies each selected graph's immutable down admission object
+and applies `strategyForSlots` to the fixture's known route count. This applies
+the complete captured geometry/codebook policy, without reading device counts,
+and rejects a tiled profile whose actual route strategy would return early.
+
+The expanded 45-case serial-byte suite passed in 108.81 s, including physical4/24,
+promoted physical23 and tail partitions. The timing replay additionally proves
+that every actual parent admits the full input count, rejects empty tiled work,
+and rejects a count beyond the captured integer ABI. It passed in 29.39 s before
+the setup improvement below. Both gfx906 and gfx1100 pass the Release/Integration
+spill guards; these native runtime checks execute on gfx1100.
+
+The component fixture now synthesizes each original seeded tensor independently
+on the canonical physical-core/OpenMP budget, then uses the existing production
+batch loader for quantized weights. Source ordering, seeds and per-weight packing
+rules are retained. Shared source ownership outlives the device worker's prepared
+handles and down-column views. Floating preparation and source-before-pack down
+slicing retain their existing paths. A selected Qwen profiler check takes 1.391 s
+versus 18.467 s with the previous setup: 768 source tensors take 0.321 s on 56 physical
+workers and batch preparation takes 0.327 s. These are fixture setup measurements.
+After this ownership change, all four affected registered component suites pass
+in 62.43 s total, including all codebooks, split phases, routing and timing replay.
+Seven individually selected profiler-owner cases also pass. Evidence is in
+`grouped-fused-original-replay.log`, `grouped-fused-batched-feature-suite.log` and
+the `grouped-fused-profile-owner-*` logs.
+
+Five fresh isolated runs now contain 17 live counts × 11 policies × 31 paired
+samples of eight complete operations, with output bytes checked after each
+sample. All 28,985 sample rows pass. The timing and eight separate exact-dispatch
+profiles bind the same executable, loaded core and source closure through
+`grouped-fused-profile-timing-join.json`. Interrupted attempts are retained and
+excluded; profiler timings do not contribute to these latency results.
+
+| Full-live case | Dot4 µs | Pure N32 µs | Pure N32 gain | Fused N32 floor8 gain |
+|---|---:|---:|---:|---:|
+| Qwen uniform shard2 | 915.776 | 704.933 | 1.2991× | 1.2767× |
+| Qwen hotset shard2 | 752.719 | 644.517 | 1.1679× | 1.1605× |
+| Qwen power-law shard2 | 948.046 | 901.715 | 1.0514× | 1.0435× |
+| Compact Q4_0 | 293.518 | 278.423 | 1.0542× | 1.0386× |
+| Compact IQ2_S | 334.839 | 312.178 | 1.0726× | 1.0669× |
+
+The paired bootstrap intervals exclude parity for these full-live wins. Fusion
+removes the earlier power-law floor8 regression, but its ordered branch still
+uses the native tile geometry. Uniform live64/128/256 floor8 gains are only
+0.7757/0.8165/0.8815×. The same live64 bucket with hotset routing gains 1.3585×.
+Neither capacity nor total live count alone identifies every winning path.
+Automatic therefore remains the established Dot4 implementation. The next
+candidate must preserve economical ordered tiles for sparse experts and retain
+WMMA reuse for larger groups; a row-floor rule alone is insufficient.
+
+All eight profiles authenticate the native gfx1100 PCI/UUID, loaded code object,
+seven finite counters with positive activity, and restored AUTO power. Pure
+Q4_0 N32/N64 retain 53 VGPRs, 54 SGPRs and 3392/5568 static LDS bytes. The fused
+IQ2_S N32 entry uses 57 VGPRs, 73 SGPRs and 3520 LDS bytes; its static ISA contains
+two WMMA and 32 signed Dot4 sites. The ordered IQ2_S M12N256 entry uses 56 VGPRs,
+78 SGPRs and 480 LDS bytes. All have zero scratch, private storage and spills;
+resource counts describe allocation, not achieved occupancy or branch counts.
+Cold fused/ordered profiles fetch approximately 106875/106765 KiB while issuing
+32768/9568 waves. Full uniform fused/ordered fetches approximately 109064/204222
+KiB. These observations motivate preserving sparse Dot4 geometry while retaining
+WMMA's greater reuse on dense groups. See `grouped-fused-summary.json` and
+`grouped-fused-{n32,n64,cold,hot,mixed,ordered_cold,ordered_hot,ordered_mixed}-profile/summary.json`.

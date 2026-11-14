@@ -6,6 +6,8 @@
  * columns. Integer WMMA shares those operands; canonical contribution helpers
  * and the original source-format partition loop own every FP32 rounding point.
  * Gate/up and down differ only in immutable descriptor and input-row bindings.
+ * Nonzero floors share the same operand staging with a signed Dot4 consumer for
+ * cold experts, avoiding a second projection family and directory overwrite.
  * No kernel builds routing state, allocates memory or publishes weighted routes.
  */
 #include <hip/hip_runtime.h>
@@ -75,8 +77,9 @@ using I32x4 = int __attribute__((ext_vector_type(4)));
  * @tparam FMT Actual physical descriptor decoder; IQ4 ids remain distinct.
  * @tparam BN Number of output columns, with one wave64 per sixteen columns.
  * @tparam TwoRoles Whether grid.z selects gate/up instead of one down descriptor.
+ * @tparam Adaptive Whether a whole-expert policy selects Dot4 inside this consumer.
  * @param v Frozen bindings and the existing device live-route admission. */
-template<NativeQuantisedGemmFormat FMT, int BN, bool TwoRoles>
+template<NativeQuantisedGemmFormat FMT, int BN, bool TwoRoles, bool Adaptive>
 __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
 {
 #if defined(__gfx1100__)
@@ -108,7 +111,26 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
         (Traits::is_dual_scale_asym && !desc.emins)) __builtin_trap();
     const auto producer = v.dot_admission.select(desc,count);
     if (producer == MoEGroupedDotProducer::Invalid) __builtin_trap();
-    if (producer != MoEGroupedDotProducer::Wmma) return;
+    if constexpr (!Adaptive)
+    {
+        if (producer != MoEGroupedDotProducer::Wmma) __builtin_trap();
+    }
+    else
+    {
+        // Tests alter only this captured argument after normal production
+        // admission. The choice precedes every barrier and is block-uniform.
+        switch (v.branch_suppression)
+        {
+        case MoEGroupedBranchSuppression::None: break;
+        case MoEGroupedBranchSuppression::Ordered:
+            if (producer == MoEGroupedDotProducer::OrderedDot4) return;
+            break;
+        case MoEGroupedBranchSuppression::Wmma:
+            if (producer == MoEGroupedDotProducer::Wmma) return;
+            break;
+        default: __builtin_trap();
+        }
+    }
     const int blocks = v.k / 32, partitions = v.partitions.forDescriptor(desc);
     if (partitions <= 0 || partitions > blocks ||
         partitions > NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) __builtin_trap();
@@ -208,14 +230,9 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
             #pragma unroll 1
             for (int stage = 0; stage < KB && first + stage < end; ++stage)
             {
-                const int ar = lane % 16, col = wave * 16 + lane % 16;
-                const I32x4 al = a[stage][ar ^ stage][(ar >> 2) & 1];
-                const I32x4 ah = a[stage][ar ^ stage][((ar >> 2) & 1) ^ 1];
+                const int col = wave * 16 + lane % 16;
                 const I32x4 bl = b[stage][col ^ stage][(col >> 2) & 1];
                 const I32x4 bh = b[stage][col ^ stage][((col >> 2) & 1) ^ 1];
-                const I32x4 zero = {};
-                const auto lo = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w64(true,al,true,bl,zero,false);
-                const auto hi = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w64(true,ah,true,bh,Traits::is_dual_scale ? zero : lo,false);
                 const uint16_t scale = primary[stage][col];
                 const uint16_t aux = Traits::needs_aux_compute ? secondary[stage][col] : uint16_t{0};
                 const auto ws = [&] {
@@ -224,9 +241,10 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
                     else return ROCmNativeQuantisedDualWeightScales{
                         rocm_native_quantised_load_single_weight_scale<FMT>(scale,aux),0.0f};
                 }();
-                #pragma unroll
-                for (int e = 0; e < 4; ++e)
-                {
+                // Both integer engines enter the same format-owned FP32
+                // commit. Static output indices keep the four accumulators in
+                // registers; no branch duplicates a scale/correction contract.
+                const auto commit = [&](int e, int low, int high) {
                     const int row = e * 4 + lane / 16;
                     const float sa = scales[stage][row];
                     float &acc = partial[e];
@@ -234,7 +252,7 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
                     {
                         const uint32_t pair = minima[stage][col];
                         const uint16_t ml = pair, mh = pair >> 16;
-                        acc = rocm_native_quantised_commit_corrected_dual_scale_block(acc,lo[e],hi[e],
+                        acc = rocm_native_quantised_commit_corrected_dual_scale_block(acc,low,high,
                             ws.low,ws.high,sums[stage][0][row],sums[stage][1][row],
                             __half2float(*reinterpret_cast<const __half *>(&ml)),
                             __half2float(*reinterpret_cast<const __half *>(&mh)),sa);
@@ -242,17 +260,53 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
                     else if constexpr (FMT == NATIVE_QUANTISED_GEMM_IQ1_M)
                     {
                         const uint16_t bits = qh[stage][col];
-                        acc = rocm_native_quantised_commit_iq1_m_block(acc,lo[e],hi[e],
+                        acc = rocm_native_quantised_commit_iq1_m_block(acc,low,high,
                             sums[stage][0][row],sums[stage][1][row],sums[stage][2][row],sums[stage][3][row],
                             bits & 0x0008 ? -0.125f : 0.125f,bits & 0x0080 ? -0.125f : 0.125f,
                             bits & 0x0800 ? -0.125f : 0.125f,bits & 0x8000 ? -0.125f : 0.125f,ws.low,ws.high,sa);
                     }
                     else if constexpr (Traits::is_dual_scale)
-                        acc = rocm_native_quantised_commit_dual_scale_block(acc,lo[e],hi[e],ws.low,ws.high,sa);
+                        acc = rocm_native_quantised_commit_dual_scale_block(acc,low,high,ws.low,ws.high,sa);
                     else if constexpr (Traits::is_asymmetric)
-                        acc = rocm_native_quantised_commit_corrected_single_scale_block(acc,hi[e],ws.low,
+                        acc = rocm_native_quantised_commit_corrected_single_scale_block(acc,high,ws.low,
                             sums[stage][0][row],__half2float(*reinterpret_cast<const __half *>(&aux)),sa);
-                    else acc = rocm_native_quantised_commit_single_scale_block(acc,hi[e],ws.low,sa);
+                    else acc = rocm_native_quantised_commit_single_scale_block(acc,high,ws.low,sa);
+                };
+                if (Adaptive && producer == MoEGroupedDotProducer::OrderedDot4)
+                {
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e)
+                    {
+                        const int row = e * 4 + lane / 16;
+                        if (row < live && n0 + col < v.n)
+                        {
+                            // A scalar output owns a different row from the
+                            // replicated WMMA operand lane. Undo the same LDS
+                            // swizzle using that output row, not lane % 16.
+                            const I32x4 al = a[stage][row ^ stage][(row >> 2) & 1];
+                            const I32x4 ah = a[stage][row ^ stage][((row >> 2) & 1) ^ 1];
+                            int low = 0;
+                            #pragma unroll
+                            for (int g = 0; g < 4; ++g)
+                                low = rocm_integer_contract::signedDot4(al[g],bl[g],low);
+                            int high = Traits::is_dual_scale ? 0 : low;
+                            #pragma unroll
+                            for (int g = 0; g < 4; ++g)
+                                high = rocm_integer_contract::signedDot4(ah[g],bh[g],high);
+                            commit(e,low,high);
+                        }
+                    }
+                }
+                else
+                {
+                    const int ar = lane % 16;
+                    const I32x4 al = a[stage][ar ^ stage][(ar >> 2) & 1];
+                    const I32x4 ah = a[stage][ar ^ stage][((ar >> 2) & 1) ^ 1];
+                    const I32x4 zero = {};
+                    const auto low = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w64(true,al,true,bl,zero,false);
+                    const auto high = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w64(true,ah,true,bh,Traits::is_dual_scale ? zero : low,false);
+                    #pragma unroll
+                    for (int e = 0; e < 4; ++e) commit(e,low[e],high[e]);
                 }
             }
             __syncthreads();
@@ -278,6 +332,7 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
 {
     const auto native_stream = static_cast<hipStream_t>(stream);
     if (!native_stream || native_stream == hipStreamLegacy || native_stream == hipStreamPerThread ||
+        args.branch_suppression != MoEGroupedBranchSuppression::None ||
         !args.activations || !args.activation_scales || !args.group_counts || !args.group_offsets ||
         !args.directory || !args.descriptors || !args.output || args.directory_capacity <= 0 ||
         args.rows <= 0 || args.top_k <= 0 || args.n <= 0 || args.k <= 0 || args.k % 32 ||
@@ -294,17 +349,19 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
         constexpr uint32_t bit = uint32_t{1} << FMT;
         if (!(remaining & bit)) return true;
         remaining &= ~bit;
-        auto tile = [&]<int BN>() {
+        auto tile = [&]<int BN, bool Adaptive>() {
             const dim3 grid((args.n + BN - 1) / BN,args.directory_capacity,args.second_descriptors ? 2 : 1);
             if (args.second_descriptors)
-                grouped_wmma_detail::projection<FMT,BN,true><<<grid,BN*4,0,native_stream>>>(args);
-            else grouped_wmma_detail::projection<FMT,BN,false><<<grid,BN*4,0,native_stream>>>(args);
+                grouped_wmma_detail::projection<FMT,BN,true,Adaptive><<<grid,BN*4,0,native_stream>>>(args);
+            else grouped_wmma_detail::projection<FMT,BN,false,Adaptive><<<grid,BN*4,0,native_stream>>>(args);
             return hipGetLastError() == hipSuccess;
         };
         switch (engine)
         {
-        case MoEGroupedPrefillEngine::WmmaM16N32: return tile.template operator()<32>();
-        case MoEGroupedPrefillEngine::WmmaM16N64: return tile.template operator()<64>();
+        case MoEGroupedPrefillEngine::WmmaM16N32:
+            return args.dot_admission.mayUseOrdered() ? tile.template operator()<32,true>() : tile.template operator()<32,false>();
+        case MoEGroupedPrefillEngine::WmmaM16N64:
+            return args.dot_admission.mayUseOrdered() ? tile.template operator()<64,true>() : tile.template operator()<64,false>();
         default: return false;
         }
     };

@@ -4,8 +4,8 @@
  *
  * Route admission still selects RouteOwned versus ExpertTiled. This separate
  * captured value chooses the dot producer for each complete expert projection.
- * Both tile families read the same published whole-expert count, so different
- * row-tile boundaries cannot create overlapping writers or leave output holes.
+ * The adaptive native consumer reads the published whole-expert count once,
+ * so its final partial row tile cannot select a different arithmetic branch.
  */
 #pragma once
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
@@ -44,7 +44,7 @@ enum class MoEGroupedWmmaRowFloor : uint8_t
     return false;
 }
 
-/** @brief One writer family, or a malformed descriptor rejected by both families. */
+/** @brief One arithmetic branch, or a malformed descriptor rejected before consumption. */
 enum class MoEGroupedDotProducer : uint8_t { OrderedDot4, Wmma, Invalid };
 
 /** @brief Immutable projection identity and one shared device admission predicate. */
@@ -56,11 +56,11 @@ public:
 
     /**
      * @brief Bind a native candidate to its complete projection and source identity.
-     * @param role Gate/up or down; both native and vector leaves borrow this value.
+     * @param role Gate/up or down; both arithmetic branches borrow this value.
      * @param source_n Original unsliced output width owning arithmetic policy.
      * @param physical_n Prepared projection width, including compact down slices.
      * @param k Shared contraction width, divisible by 32.
-     * @param floor Whole-expert count needed for the candidate; zero forces native.
+     * @param floor Whole-expert count needed for the candidate; zero removes the row cutoff.
      * @param physical_codebooks Physical decoder identities eligible for native work.
      * @param source_codebooks Source identities eligible for native work.
      * @return A trivially copyable, capture-stable admission value.
@@ -104,7 +104,7 @@ public:
     /** @return Original unsliced width retained for admission/evidence identity. */
     [[nodiscard]] constexpr int sourceOutputColumns() const noexcept { return source_n_; }
 
-    /** @return Whether recording must retain ordered leaves for some experts. */
+    /** @return Whether the ordered branch is reachable and needs an adaptive consumer. */
     [[nodiscard]] constexpr bool mayUseOrdered() const noexcept
     {
         constexpr uint32_t all_sources = UINT32_MAX & ~((uint32_t{1} << 20) | (uint32_t{1} << 21));

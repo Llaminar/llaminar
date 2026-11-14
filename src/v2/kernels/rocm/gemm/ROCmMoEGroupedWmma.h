@@ -3,7 +3,8 @@
  * @brief Native matrix leaves for the retained grouped MoE projection transaction.
  *
  * Dot-engine recording is independent of the device-owned route strategy. WMMA
- * replaces only ExpertTiled gate/up and down leaves; quantization, routing,
+ * replaces only ExpertTiled gate/up and down leaves. Nonzero row floors select
+ * Dot4 or WMMA inside one consumer with a shared directory; quantization, routing,
  * SwiGLU and ordered publication retain their existing owners and allocations.
  */
 #pragma once
@@ -50,6 +51,11 @@ MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device);
 /** @brief Which authoritative row index addresses the quantized activation bank. */
 enum class MoEGroupedWmmaInput { OriginalTokens, OriginalRouteSlots, GroupedRows };
 
+/** @brief Fault injection accepted only by direct test mutation of a retained native node.
+ * Production submission requires None. A test may suppress one selected branch
+ * to prove its actual writer ownership while checking that the other survives. */
+enum class MoEGroupedBranchSuppression : uint8_t { None, Ordered, Wmma };
+
 /** @brief Frozen projection bindings; live extents come only from the group plan. */
 struct MoEGroupedWmmaArguments
 {
@@ -73,7 +79,8 @@ struct MoEGroupedWmmaArguments
     MoEGroupedWmmaInput input = MoEGroupedWmmaInput::GroupedRows;
     MoEPrefillSerialM1KPartitionPolicy partitions;
     ROCmMoEGroupedRouteAdmission admission; ///< Required existing group-plan authority.
-    MoEGroupedDotAdmission dot_admission; ///< Same per-expert writer choice as ordered leaves.
+    MoEGroupedDotAdmission dot_admission; ///< One whole-expert choice shared by both arithmetic branches.
+    MoEGroupedBranchSuppression branch_suppression = MoEGroupedBranchSuppression::None; ///< Rejected by production when non-None.
 };
 
 /** @brief Record all physical-codebook leaves for one gate/up or down projection.

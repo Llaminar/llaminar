@@ -6,11 +6,14 @@
  * Production CPU packing and tier transfer supply the expanded candidate bytes;
  * retained WMMA graphs must reproduce both canonical routes and final outputs
  * across dirty full/partial/empty replays and replacement activation data.
+ * Mixed3/31 expert counts exercise both adaptive branches for genuine physical23
+ * storage; suppressing either selected down branch must preserve the other.
  */
 #include "../moe/NativeQuantisedExpertTransferParityTest.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #include "backends/rocm/HIPGraphCapture.h"
 #include "kernels/rocm/gemm/ROCmMoEGroupedWmma.h"
+#include "../../../utils/ROCmGroupedBranchMutation.h"
 #include <hip/hip_runtime.h>
 
 namespace llaminar2::test
@@ -98,9 +101,17 @@ TEST(ROCmMoEGroupedWmmaPromotion, CapturedExpandedReplay)
         std::copy(route_weights.begin(),route_weights.end(),weights->mutable_data());
         for (auto *tensor : std::array<TensorBase *,5>{hidden.get(),ids.get(),weights.get(),output.get(),canonical.get()})
             ASSERT_TRUE(tensor->ensureOnDevice(device,stream));
-        std::array graphs{context.createGraphCapture(stream),context.createGraphCapture(stream),context.createGraphCapture(stream)};
+        using Engine = rocm::MoEGroupedPrefillEngine;
+        using Floor = rocm::MoEGroupedWmmaRowFloor;
+        std::vector<rocm::MoEGroupedPrefillPolicy> policies{
+            {Engine::OrderedDot4,Floor::EveryExpert},{Engine::WmmaM16N32,Floor::EveryExpert},
+            {Engine::WmmaM16N64,Floor::EveryExpert}};
+        for (auto floor : {Floor::Four,Floor::Eight,Floor::Twelve,Floor::Sixteen})
+            for (auto engine : {Engine::WmmaM16N32,Engine::WmmaM16N64}) policies.push_back({engine,floor});
+        std::vector<decltype(context.createGraphCapture(stream))> graphs;
+        for (size_t path = 0; path < policies.size(); ++path) graphs.push_back(context.createGraphCapture(stream));
         // Retire work before graph, tensor, workspace and promoted-byte owners.
-        auto drain = [&](void *) { (void)backend->synchronizeStream(stream,ordinal); };
+        auto drain = [&](void *) { if (!backend->synchronizeStream(stream,ordinal)) std::terminate(); };
         std::unique_ptr<void,decltype(drain)> completion(&context,drain);
         const auto enqueue = [&](int storage) {
             return kernel->prepareExpertGroupsAsync(ids.get(),weights.get(),rows,experts,top_k) &&
@@ -108,12 +119,10 @@ TEST(ROCmMoEGroupedWmmaPromotion, CapturedExpandedReplay)
                     rows,hidden_width,intermediate,experts,top_k,canonical.get()) &&
                 kernel->reduceCanonicalRouteContributions(canonical.get(),output.get(),rows,top_k,hidden_width);
         };
-        constexpr std::array engines{rocm::MoEGroupedPrefillEngine::OrderedDot4,
-            rocm::MoEGroupedPrefillEngine::WmmaM16N32,rocm::MoEGroupedPrefillEngine::WmmaM16N64};
-        std::array<std::vector<hipGraphNode_t>,3> native_nodes;
-        for (int path = 0; path < 3; ++path)
+        std::vector<std::vector<hipGraphNode_t>> native_nodes(policies.size());
+        for (size_t path = 0; path < policies.size(); ++path)
         {
-            rocm::ScopedMoEGroupedPrefillEngine engine(engines[path]);
+            rocm::ScopedMoEGroupedPrefillEngine engine(policies[path].engine,policies[path].minimum_expert_rows);
             ASSERT_TRUE(enqueue(path != 0));
             ScopedBackendGraphCapture recording(context,*graphs[path],"promoted physical23 grouped WMMA");
             ASSERT_TRUE(recording.begin());
@@ -123,15 +132,24 @@ TEST(ROCmMoEGroupedWmmaPromotion, CapturedExpandedReplay)
             ASSERT_TRUE(graphs[path]->inspectKernelNodes(nodes));
             int native_count = 0, gate_up_count = 0, down_count = 0;
             for (const auto &node : nodes)
+            {
+                if (path > 0)
+                {
+                    ASSERT_EQ(node.name.find("moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel"),std::string::npos);
+                    ASSERT_EQ(node.name.find("moe_grouped_down_batch_invariant_tiled_prefill_kernel"),std::string::npos);
+                }
                 if (node.name.find("grouped_wmma_detail") != std::string::npos)
                 {
                     ++native_count;
                     ASSERT_NE(node.name.find("NativeQuantisedGemmFormat23E"),std::string::npos) << node.name;
-                    ASSERT_EQ(node.block_x,path == 1 ? 128u : 256u);
+                    ASSERT_EQ(node.block_x,policies[path].engine == Engine::WmmaM16N32 ? 128u : 256u);
+                    ASSERT_NE(node.name.find(policies[path].minimum_expert_rows == Floor::EveryExpert
+                        ? "ELb0EE" : "ELb1EE"),std::string::npos) << node.name;
                     ASSERT_EQ(node.local_memory_bytes_per_thread,0u);
                     if (node.grid_z == 2) ++gate_up_count;
                     else if (node.grid_z == 1) ++down_count;
                 }
+            }
             ASSERT_EQ(native_count,path ? 2 : 0);
             ASSERT_EQ(gate_up_count,path ? 1 : 0);
             ASSERT_EQ(down_count,path ? 1 : 0);
@@ -158,6 +176,7 @@ TEST(ROCmMoEGroupedWmmaPromotion, CapturedExpandedReplay)
         }
         std::vector<float> expected(rows*hidden_width),expected_routes(rows*top_k*hidden_width);
         std::vector<float> actual(expected.size()),actual_routes(expected_routes.size());
+        std::unique_ptr<void,decltype(drain)> observation_completion(&context,drain);
         const auto observe = [&](std::vector<float> &result,std::vector<float> &routes) {
             ASSERT_TRUE(backend->deviceToHost(result.data(),output->gpu_data_ptr(),result.size()*sizeof(float),ordinal,stream));
             ASSERT_TRUE(backend->deviceToHost(routes.data(),canonical->gpu_data_ptr(),routes.size()*sizeof(float),ordinal,stream));
@@ -180,6 +199,7 @@ TEST(ROCmMoEGroupedWmmaPromotion, CapturedExpandedReplay)
         for (int generation = 0; generation < 2; ++generation)
         {
             auto next_hidden = makeHidden(rows,hidden_width,77u+generation,ExpertInputPattern::Scrambled);
+            std::unique_ptr<void,decltype(drain)> generation_completion(&context,drain);
             ASSERT_TRUE(backend->hostToDevice(hidden->gpu_data_ptr(),next_hidden->data(),hidden->numel()*sizeof(float),ordinal,stream));
             ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(),full_ids.data(),full_ids.size()*sizeof(float),ordinal,stream));
             ASSERT_TRUE(graphs[0]->launch());
@@ -188,7 +208,7 @@ TEST(ROCmMoEGroupedWmmaPromotion, CapturedExpandedReplay)
             // A recorded symbol is not proof of work. Independently omit each
             // native role, require failure against Dot4, then restore the node.
             if (generation == 0)
-                for (int path = 1; path < 3; ++path)
+                for (size_t path = 1; path < policies.size(); ++path)
                     for (const auto node : native_nodes[path])
                     {
                         auto *native = static_cast<HIPGraphCapture *>(graphs[path].get());
@@ -203,11 +223,12 @@ TEST(ROCmMoEGroupedWmmaPromotion, CapturedExpandedReplay)
             for (int live : {rows,16,1,0,rows})
             {
                 auto replay_ids = full_ids,reference = expected,reference_routes = expected_routes;
+                std::unique_ptr<void,decltype(drain)> replay_publication_completion(&context,drain);
                 std::fill(replay_ids.begin()+live*top_k,replay_ids.end(),-1.0f);
                 std::fill(reference.begin()+live*hidden_width,reference.end(),0.0f);
                 std::fill(reference_routes.begin()+live*top_k*hidden_width,reference_routes.end(),0.0f);
                 ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(),replay_ids.data(),replay_ids.size()*sizeof(float),ordinal,stream));
-                for (int path = 0; path < 3; ++path)
+                for (size_t path = 0; path < policies.size(); ++path)
                 {
                     SCOPED_TRACE("generation="+std::to_string(generation)+" live="+std::to_string(live)+" path="+std::to_string(path));
                     ASSERT_NO_FATAL_FAILURE(poison());
@@ -217,6 +238,57 @@ TEST(ROCmMoEGroupedWmmaPromotion, CapturedExpandedReplay)
                     ASSERT_NO_FATAL_FAILURE(observe(actual,actual_routes));
                     ASSERT_NO_FATAL_FAILURE(expectByteEqual("expanded WMMA output",actual,reference,hidden_width));
                     ASSERT_NO_FATAL_FAILURE(expectByteEqual("expanded WMMA canonical",actual_routes,reference_routes,hidden_width));
+                }
+            }
+            constexpr std::array counts{3,31};
+            auto mixed_ids = full_ids;
+            for (size_t slot = 0; slot < mixed_ids.size(); ++slot)
+                if (slot/top_k >= static_cast<size_t>(counts[static_cast<int>(mixed_ids[slot])])) mixed_ids[slot] = -1.0f;
+            // 34 routes retain the expert-tiled family (17 effective rows),
+            // while the entire three-row expert selects Dot4 for every floor.
+            ASSERT_EQ(std::count_if(mixed_ids.begin(),mixed_ids.end(),[](float id) { return id >= 0; }),34);
+            std::unique_ptr<void,decltype(drain)> mixed_publication_completion(&context,drain);
+            ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(),mixed_ids.data(),mixed_ids.size()*sizeof(float),ordinal,stream));
+            ASSERT_TRUE(graphs[0]->launch());
+            ASSERT_NO_FATAL_FAILURE(observe(expected,expected_routes));
+            for (size_t path = 1; path < policies.size(); ++path)
+            {
+                ASSERT_NO_FATAL_FAILURE(poison());
+                ASSERT_TRUE(graphs[path]->launch());
+                ASSERT_NO_FATAL_FAILURE(observe(actual,actual_routes));
+                ASSERT_NO_FATAL_FAILURE(expectByteEqual("mixed expanded output",actual,expected,hidden_width));
+                ASSERT_NO_FATAL_FAILURE(expectByteEqual("mixed expanded routes",actual_routes,expected_routes,hidden_width));
+                if (policies[path].minimum_expert_rows == Floor::EveryExpert) continue;
+                auto *capture = dynamic_cast<HIPGraphCapture *>(graphs[path].get());
+                ASSERT_NE(capture,nullptr);
+                ROCmGroupedBranchMutation mutation(*capture,static_cast<hipStream_t>(stream));
+                ASSERT_EQ(mutation.nodeCount(),1u);
+                for (auto branch : {rocm::MoEGroupedBranchSuppression::Ordered,rocm::MoEGroupedBranchSuppression::Wmma})
+                {
+                    mutation.suppress(branch);
+                    ASSERT_NO_FATAL_FAILURE(poison());
+                    ASSERT_TRUE(graphs[path]->launch());
+                    ASSERT_NO_FATAL_FAILURE(observe(actual,actual_routes));
+                    mutation.restore();
+                    const int omitted_expert = branch == rocm::MoEGroupedBranchSuppression::Ordered ? 0 : 1;
+                    int changed = 0, surviving = 0;
+                    for (size_t slot = 0; slot < mixed_ids.size(); ++slot)
+                    {
+                        const int comparison = std::memcmp(actual_routes.data()+slot*hidden_width,
+                            expected_routes.data()+slot*hidden_width,hidden_width*sizeof(float));
+                        if (mixed_ids[slot] == omitted_expert) changed += comparison != 0;
+                        else
+                        {
+                            ASSERT_EQ(comparison,0) << "surviving expanded route=" << slot;
+                            surviving += mixed_ids[slot] >= 0;
+                        }
+                    }
+                    ASSERT_GT(changed,0); ASSERT_GT(surviving,0);
+                    ASSERT_NO_FATAL_FAILURE(poison());
+                    ASSERT_TRUE(graphs[path]->launch());
+                    ASSERT_NO_FATAL_FAILURE(observe(actual,actual_routes));
+                    ASSERT_NO_FATAL_FAILURE(expectByteEqual("restored expanded output",actual,expected,hidden_width));
+                    ASSERT_NO_FATAL_FAILURE(expectByteEqual("restored expanded routes",actual_routes,expected_routes,hidden_width));
                 }
             }
         }

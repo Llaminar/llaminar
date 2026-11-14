@@ -21,6 +21,8 @@
  *
  * Target Hardware: AMD MI50 (gfx906 / Vega 20), plus explicit native gfx1100
  * grouped WMMA replay for every canonical source format and mixed IQ4 tables.
+ * Adaptive replay includes mixed whole-expert row counts and odd K/N tails
+ * against independent serial decode, retaining the original source partitions.
  * Retained original rank-bank publication guards all route/bank/guard bytes
  * at QFN prefill geometry, including nonfinite copies and dirty live prefixes.
  * Disabled paired events and event-free profile modes isolate one real bridge.
@@ -26109,6 +26111,8 @@ TEST(Test__ROCmMoEKernel, SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XS
  * @param row_inventory Physical row capacities to replay. @param expert_width Intermediate width.
  * @param device Native participant owning every allocation and stream.
  * @param engine Explicit grouped recording engine, independent of the serial reference.
+ * @param row_floor Whole-expert threshold selecting the adaptive arithmetic branch.
+ * @param expert_row_limits Optional per-slot expert counts for a mixed threshold histogram.
  *
  * Factories use one erased test interface so each new codebook/mixed-role fixture
  * shares this substantial lifecycle proof instead of recompiling its full body.
@@ -26123,7 +26127,9 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     std::span<const int> row_inventory = kGroupedVerifierRuntimeRows,
     int expert_width = 512,
     DeviceId device = DeviceId::rocm(0),
-    llaminar2::rocm::MoEGroupedPrefillEngine engine = llaminar2::rocm::MoEGroupedPrefillEngine::Automatic)
+    llaminar2::rocm::MoEGroupedPrefillEngine engine = llaminar2::rocm::MoEGroupedPrefillEngine::Automatic,
+    llaminar2::rocm::MoEGroupedWmmaRowFloor row_floor = llaminar2::rocm::MoEGroupedWmmaRowFloor::EveryExpert,
+    std::span<const int> expert_row_limits = {})
 {
     SKIP_IF_NO_ROCM();
 
@@ -26140,6 +26146,8 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
     constexpr int num_experts = 256;
     constexpr int top_k = 8;
     constexpr int routed_variants = 16;
+    ASSERT_TRUE(expert_row_limits.empty() || expert_row_limits.size() == top_k);
+    for (int limit : expert_row_limits) ASSERT_GE(limit,0);
     ScopedEnvOverride perf_stats("LLAMINAR_PERF_STATS_SUMMARY", "1");
     PerfStatsCollector::reset();
     std::array<uint8_t, num_experts> local_expert_mask{};
@@ -26310,7 +26318,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
         return hidden;
     };
 
-    auto make_routes = [](int seq_len,
+    auto make_routes = [&](int seq_len,
                           std::vector<float> &indices,
                           std::vector<float> &weights)
     {
@@ -26328,8 +26336,9 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             {
                 const int slot = row * top_k + route;
                 const int pattern_slot = (row % 4) * top_k + route;
-                indices[static_cast<size_t>(slot)] =
-                    static_cast<float>(kExperts[static_cast<size_t>(pattern_slot)]);
+                indices[static_cast<size_t>(slot)] = expert_row_limits.empty()
+                    ? static_cast<float>(kExperts[static_cast<size_t>(pattern_slot)])
+                    : row < expert_row_limits[route] ? static_cast<float>(route) : -1.0f;
                 weights[static_cast<size_t>(slot)] =
                     0.09f + 0.013f * static_cast<float>((slot * 5 + 3) % 11);
                 sum += weights[static_cast<size_t>(slot)];
@@ -26506,7 +26515,7 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             ASSERT_TRUE(moe_kernel.prepareExpertGroupsAsync(
                 routing_indices.get(), routing_weights.get(), seq_len, num_experts, top_k));
         }
-        llaminar2::rocm::ScopedMoEGroupedPrefillEngine candidate(engine);
+        llaminar2::rocm::ScopedMoEGroupedPrefillEngine candidate(engine,row_floor);
         ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipeline(
             hidden.get(),
             grouped_output.get(),
@@ -26568,7 +26577,11 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                     ASSERT_EQ(hipGraphKernelNodeGetParams(node, &params), hipSuccess);
                     const char *name = hipKernelNameRefByPtr(params.func, stream);
                     ASSERT_NE(name, nullptr);
+                    ASSERT_EQ(std::string_view(name).find("moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel"),std::string_view::npos);
+                    ASSERT_EQ(std::string_view(name).find("moe_grouped_down_batch_invariant_tiled_prefill_kernel"),std::string_view::npos);
                     if (std::string_view(name).find("grouped_wmma_detail") == std::string_view::npos) continue;
+                    ASSERT_NE(std::string_view(name).find(row_floor == llaminar2::rocm::MoEGroupedWmmaRowFloor::EveryExpert
+                        ? "ELb0EE" : "ELb1EE"),std::string_view::npos) << name;
                     if (params.gridDim.z == 2) ++native_gate_up;
                     else if (params.gridDim.z == 1) ++native_down;
                     else FAIL() << "Unexpected grouped WMMA projection role";
@@ -28012,8 +28025,17 @@ TEST(Test__ROCmMoEKernel, NativeWmmaMixedIQ4CapturedReplay)
     ScopedROCmEnvOverride production_mode("LLAMINAR_DETERMINISTIC", "0");
     for (const auto engine : {llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N32,
                               llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N64})
+    {
         runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
             "MixedIQ4",mixed,opposite,mixed,true,false,rows,512,DeviceId::rocm(ordinal),engine);
+        constexpr std::array counts{3,4,7,8,12,16,17,31};
+        for (auto floor : {llaminar2::rocm::MoEGroupedWmmaRowFloor::Four,
+                           llaminar2::rocm::MoEGroupedWmmaRowFloor::Eight,
+                           llaminar2::rocm::MoEGroupedWmmaRowFloor::Twelve,
+                           llaminar2::rocm::MoEGroupedWmmaRowFloor::Sixteen})
+            runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+                "MixedIQ4Adaptive",mixed,opposite,mixed,true,false,rows,512,DeviceId::rocm(ordinal),engine,floor,counts);
+    }
 }
 
 /** @test Exercise odd K32 counts and partial native output-column tiles. */
@@ -28028,8 +28050,14 @@ TEST(Test__ROCmMoEKernel, NativeWmmaTailPartitionsCapturedReplay)
     for (const auto engine : {llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N32,
                               llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N64})
         for (int width : {96,288})
+        {
             runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                 format->name,format->make,format->make,format->make,true,false,rows,width,DeviceId::rocm(ordinal),engine);
+            constexpr std::array counts{3,4,7,8,12,16,17,31};
+            runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
+                format->name,format->make,format->make,format->make,true,false,rows,width,DeviceId::rocm(ordinal),
+                engine,llaminar2::rocm::MoEGroupedWmmaRowFloor::Sixteen,counts);
+        }
 }
 
 /** @brief Prove captured publication covers long physical route banks exactly. */
