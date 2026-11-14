@@ -5202,3 +5202,17 @@ green — -j4, alone, failed-set diff vs the d5e04fdce CUDA-ON base
 own host). Relayed to the qual lane; statuses: .79 = seal done +
 base control queued; .80 = a8beee811 build running; WSL = T' gate
 resumed (-j4 incremental); lane poll-only.
+
+### WSL session handover: 01a1bd53 -> 01a1d782@wsl (00:47Z)
+
+New WSL session (01a1d782) reports T' gate recovery continuation:
+container armq-a512-03480d07e (834ae58d298f) UP; incremental -j4
+build (driver.log [21/1757]; libllaminar2_core.so relinked [12/
+1757]); host healthy; watcher re-armed (old task_mwfon1r8_4ja0q1
+did not carry over — disclosed). Handover note (01a1bd53's bash
+tool broken post-restart; they execute via monitor spawn watcher —
+now the new session owns the WSL execution). Routing updated:
+WSL arm-qual = 01a1d782@wsl (01a1bd53 retired for WSL work).
+Sequencing reaffirmed (Main): T' = early-surface ONLY; byte-
+identity serial; develop-control; then binding gate at the triage
+tip. Acknowledged + registered.
