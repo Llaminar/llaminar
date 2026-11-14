@@ -5338,3 +5338,25 @@ planner visible set (ride the .79 preflight JUnit). BASE CAVEAT:
 .79 base control = pre-PR proof scripts vs the T'-receipted
 ncclout => base needs its OWN pre-PR NCCL install (separate
 prefix) — sparks handling; base control pending.
+
+### Main 01:23Z: behavior-fix expectation + base NCCL protocol
+
+(1) Remaining 2 reds -> lane's behaviour fix. EXPECTED: the
+fixture's CPU host pool reaches admission via a producer that
+still doesn't set the observation — (a) MISSED PRODUCTION PRODUCER
+(fix it) or (b) the fixture's own plan construction (the fixture
+must build its plan the way production does — through the binder
+or live-inventory derivation; NEVER hand-set the field to pass).
+The test's contract (PhysicalMemoryCapacityExhausted from the
+aggregate host budget) must be reached UNCHANGED. Runner notes
+(seccomp/SYS_NICE/SYS_ADMIN) = env/canonical, accepted. (2) BASE
+CONTROL NCCL: sparks' catch correct — d5e04fdce's proof scripts
+predate 31dd1f7ee -> base needs its OWN canonical install at the
+base SHA into a SEPARATE prefix; configure LLAMINAR_NCCL_LIBRARY
+at it. **MAIN'S EXPECTATION: the d5e04fdce install itself will FAIL
+on GB10 at progress_replay (the exact defect 31dd1f7ee fixed) ->
+if it fails: do NOT patch the base; configure -DHAVE_NCCL=OFF (or
+drop only the NCCL proof registrations) + record the delta
+explicitly; the attribution diff excludes the NCCL proof tests on
+both sides (covered by install3's green at T').** Sparks decides on
+the actual result; report verbatim. Dispatched to lane + sparks.
