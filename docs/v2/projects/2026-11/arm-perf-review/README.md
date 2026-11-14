@@ -5826,3 +5826,24 @@ lane). Lane fix FULLY verified on ARM: 90/90 + 456/456 + 17/17.
 Evidence: sa-results-6ca2462cc/ + logs; seal candidate K14-STAGE
 AGATE-6CA2462CC (per the full-result-set rule) on Main's word.
 Then: WSL x86 binding gate @ 6ca2462cc -> pins -> Gate-A.
+
+### Main conditional confirmation — the seal's mechanical check (06:56Z)
+
+Main: CONFIRMED CONDITIONALLY on ONE mechanical check the seal must
+contain: NAME-LEVEL failed-set diff base control (d5e04fdce +
+harness hunk + HAVE_NCCL=OFF) vs 6ca2462cc, BOTH from the FULL
+result sets (unit+host+exclusive+cuda-socket). REQUIRED: tip-only =
+{ CachedGraphReplayExecution_CUDA (flaky) } ∪ { the 12 NCCL-gated
+2-rank/2-device names (UNQUALIFIED, not registered at base) } and
+NOTHING ELSE; base-only listed with a reason. IF exactly that =>
+the GPU-native-obj-geometry + Pooled + PrefillGraph + ROCm-4
+families = the CUDA-on base's inherited set BY EVIDENCE (not family
+resemblance): (A) satisfied, (B) 12 UNQUALIFIED, (C) CachedGraph
+flaky. ANY other tip-only name => verbatim to Main BEFORE the seal.
+THEN: seal K14-STAGEAGATE-6CA2462CC with the full result set + the
+diff => WSL x86 binding gate @ 6ca2462cc (-j4, parity TU pre-built
+serially, alone) => pins => Gate-A. BASE-OWNER ADD: on CUDA-on GB10
+the base fails "Native graph object geometry requires an exact
+compiled GPU backend" in planner/admission Unit tests = a
+BACKEND-DETECTION DEFECT CLASS worth one issue. Dispatched to
+sparks (diff -> seal gate).
