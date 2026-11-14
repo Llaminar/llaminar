@@ -5865,3 +5865,23 @@ artifacts + sa-results-6ca2462cc/). Main notified (sequence
 continuation = WSL x86 binding gate @ 6ca2462cc -> pins -> Gate-A;
 his call/standing spec). WSL probe out (develop-control status +
 binding-gate readiness).
+
+### Main GO: WSL x86 binding gate dispatched; packer check verified; pins prepared (07:25Z)
+
+Main: ARM boundary evidence ACCEPTED (tip-only = exactly the 12
+UNQUALIFIED; base-only = 0; CachedGraph shared/inherited); seal
+K14-STAGEAGATE-6CA2462CC-20261114 = the record. GO: qual lane =
+WSL x86 binding gate @ 6ca2462cc (standing spec: -j4, parity TU -j1
+serial pre-build, ALONE, gated script, fresh OUT, full result-set
+seal; PLUS x86 failed-set diff vs WSL's own d5e04fdce base
+reference — the earlier WSL base OOM'd (parity TU) => base
+reference AFTER the tip gate serially, parity-first; tip-only =>
+verbatim to Main). PACKER CHECK VERIFIED (coordinator): a8beee811..
+6ca2462cc = docs + MoEOverlayCapacityAdmission.cpp/.h + 6 tests +
+TestCPUPreparedLayoutInventory.h — NO packer/layout source => the
+x86 byte identity @ a8beee811 COVERS 6ca2462cc (no re-run).
+REVIEWER PIN PACKAGE PREPARED (per Main's contents): range
+d5e04fdce..6ca2462cc (docs-only named: dcebc7ed8, 0a80edd6a,
+ee66b1ed6, c848e4061, bba1eafe5, cf7ce841c, 3b00c69d7), ARM seal
+K14-STAGEAGATE-6CA2462CC-20261114, byte identity @ a8beee811 — pins
+go out when the x86 gate is sealed. Both dispatched.
