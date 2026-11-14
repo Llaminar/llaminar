@@ -6065,3 +6065,31 @@ COMPARISON not exact-config baseline (harness hunk + HAVE_NCCL=OFF
 disclosed); native 2-device UNQUALIFIED; x86 pending. LANE TASK
 dispatched (the 4 + precision; successor on 6ca2462cc; reruns ->
 reviewer re-read -> Gate-A). Main informed.
+
+### Main 13:38Z: A4-R fixup package + cheap re-verification plan
+
+Main: NOT ready for Gate-A (reviewer); residual 1 CONFIRMED in
+source. ONE lane fixup ("A4-R") + cheap re-verification. R-1
+(pricing completeness): :895-898 + :594-596 preparedFootprints
+without input.cpu_prepared_layout -> layout-blind quota authority
+(exactLegacyLayerCap/max_live_experts_per_layer); EconomyCalibration
+Planner.cpp:167 classify (CPU bytes => pass layout; GPU-only =>
+say so); BEST = remove the defaulted layout param (compiler lists
+every caller); regression = explicit-layout footprint/quota test
+(non-host-equal layout changes the cap) via the explicit-sections
+seam or a typed recorder — NEVER enabling compact tables. R-2
+tier-stream v4 hash-sensitivity discriminator (same fixture only
+cpu_endpoint_layout changed => hash differs; deleting :535 must
+fail it; existing ExpertTierDirectCPUProjectionContract focused
+preflight). R-3 A4 focused regressions -> EXISTING preflight
+registrations (inventory v8/layout+tamper, CrossLayoutCpuPairing,
+SavedPlanLayoutIsRechecked, ResolvedCpuPreparedLayout x2 docs,
+explicit-layout footprint/admission). R-4 docs :1011-1019 =
+detail::admitReceiveLayout (no RAII hook). R-5 regression
+precision (zero_root zeros strides + CPU->CPU identity; destination
+rejection = real CPU receiver). LINUX: compile+run touched suites
+on .80 before handback. RE-VERIFY: .80 focused -> .79 incremental
+(diff vs 6ca seal; expected 0 reds + new tests green) -> WSL x86
+incremental (Admission.cpp changed => yes; -j4 parity first).
+Pins: A3-fixup+A4+A4-R at the NEW tip -> Gate-A. Lane dispatched.
+x86 base diff pending independently.
