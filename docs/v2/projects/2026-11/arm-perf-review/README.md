@@ -6355,3 +6355,23 @@ discriminator). Pins A3+A4+A4-R @ 9ba1d4da2 after green.
 Reviewer informed (blockers closed). Board: one full green sweep
 at 9ba1d4da2 on 3 hosts -> evidence attach -> reviewer verdict ->
 Gate-A.
+
+### Main 14:37Z: vacuous-filter impossibility required; items 1+2 = 9ba1d4da2 already
+
+Main: reviewer's 2 blockers CONFIRMED (B1 :33203 Test__ prefix
+mismatch — selects nothing; B2 TierLegacyCap... not in any focused
+filter). Main's fix items 1+2 = the lane's ALREADY-LANDED 9ba1d4da2
+(+2/-2 CMakeLists; verified). ADDITIONAL REQUIREMENTS (lane, one
+test-registration commit, fold in before the pins): (3) MAKE
+VACUOUS FILTERS IMPOSSIBLE — every chain-added focused registration
+must FAIL if it matches zero tests (GTest exits 0 on empty filter):
+--gtest_fail_if_no_test_selected where the bundled GTest supports
+it (CHECK version/feature) OR the repo's existing name-resolution
+check; AT MINIMUM a one-shot script in the commit message
+resolving EVERY chain-added filter name to its TEST() declaration
+with the result (Main: 10/12 resolved mechanically; after B1/B2
+all 12 must resolve). (4) .80 ctest -R on the two corrected
+registrations + assert tests>0 from the JUnit/XML (not rc 0).
+Test-registration only — the .79/WSL reruns @ 9ba1d4da2 do NOT
+wait (Main); pins after the fold-in. Dispatched: lane (3 + script),
+sparks (4: the two registrations' tests>0 assert in the .80 run).
