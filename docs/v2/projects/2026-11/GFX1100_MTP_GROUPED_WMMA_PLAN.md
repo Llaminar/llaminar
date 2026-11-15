@@ -10,14 +10,14 @@ with zero memory spills. Router Automatic qualifies85/120 exact-hosted keys
 (1.00291–1.28437×, geometric mean1.10438×); seven focused registrations pass.
 All80 router profiles pass without spills. A forced FP16/HD256 grouped-attention
 candidate passes captured serial-byte replay, real append/RoPE replay and
-special values under all four original wave counts. The two-row/four-head layout improves
-the candidate but still wins0/90 complete-operation timing cells; Automatic
-therefore remains Dot2. Fixed-query32K→64K scaling passes, and eight exact
-producer profiles complete without spills. A traversal experiment cuts fetch
-traffic83% without an aggregate latency gain and is rejected. The next bounded
-layout uses one row/four heads with cooperative keys to remove differing row
-policies from each CTA. The restored eight-query source reproduces its exact
-Release binary hashes and all28 affected feature GTests pass. See the
+special values under all four original wave counts. The single-row/four-head
+layout improves native latency in83/90 cells over the eight-query candidate
+(geometric mean1.09488×), but still loses all90 comparisons with Dot2. Automatic
+therefore remains Dot2. Fixed-query32K→64K scaling passes. Both shipped targets
+compile without spills; the native producer uses49 VGPRs and27,152 LDS bytes.
+All29 affected feature GTests and eight exact producer profiles pass, including
+explicit finite/special TPB192 multi-tile replay. Grouped-attention economy remains open; the next implementation
+slice qualifies actual routed/shared MTP transactions. See the
 [attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Broader bundles and
 routed/shared operations remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
 not claim model-level MTP speedups or full production certification.
@@ -38,7 +38,7 @@ serial-row byte contract. Ordinary prefill evidence does not qualify MTP.
 | Routed expert gate/up and down | Multi-row MTP enters the fixed-topology grouped transaction in `MoEExpertComputeStage::executeDecodeEquivalentVerifierPrefill`. Native projection candidates and M512 population policies exist; those policies do not admit ordinary verifier capacities. Sparse RouteOwned execution remains a distinct Dot4 producer. | Reuse and qualify native leaves for actual verifier routes, including sparse groups; install measured selection. The prefill-named interface alone does not prove MTP coverage. |
 | Floating grouped projections | `ROCmFloatingPointGemmKernel.cpp` selects `rocmFp16_batched_projection`, `rocmFp32_small_n_batched_projection`, or `rocmFp32x16_batched_projection`, preserving the serial fixed reduction tree. | Direct half/BF16 substitution changes native FP32 operands; a real half-input WMMA witness also changes the explicit FP16RNE reduction. Retain the existing exact producers; no ordinary rocBLAS replacement. |
 | Q8 router | The real verifier API already reaches the forced-capable byte-exact WMMA leaf. Automatic admits the original M512 key and85 exact-hosted M2–16 keys across four measured K/E shapes and both bases. | Actual Automatic component timing, seven focused registrations and80 source-bound profiles pass. Full routing/top-k remains a separate transaction boundary. |
-| Verifier attention | Explicit FP16/HD256 `WmmaLaneExact` preserves lane-owned dot2/XOR, softmax/PV and original split reduction. Captured ring/sentinel/special-value and append/RoPE replay pass. Fixed-query scaling through64K passes; current eight-query timing loses all90 cells. Automatic remains ordered. | Qualify a profitable measured domain with a single-row/head layout, retaining exact feature and resource gates. See the [proof](GFX1100_MTP_ATTENTION_WMMA.md). |
+| Verifier attention | Explicit FP16/HD256 `WmmaLaneExact` preserves lane-owned dot2/XOR, softmax/PV and original split reduction. Captured ring/sentinel/special-value and append/RoPE replay pass. Fixed-query scaling through64K passes; current single-row timing loses all90 cells. Automatic remains ordered. | Qualify a profitable measured domain, retaining exact feature and resource gates; current native layouts remain slower than Dot2. See the [proof](GFX1100_MTP_ATTENTION_WMMA.md). |
 
 The dense native decoder switch currently contains 18 physical cases. Qualification
 must enumerate the repository's full source-format inventory, including normalized
@@ -542,13 +542,34 @@ remain enabled. For the verifier router boundary, use the existing
 expert routes remain explicitly injected into separate buffers. This does not
 claim that the real router selected the synthetic distribution.
 
-Shared experts need their actual `SharedExpertFFNStage` grouped path separately:
-`force_grouped_verifier_prefill_for_decode=true` and
-`force_decode_equivalent_verifier_prefill=false` reach the device-counted shared
-group and existing pipeline. Reuse the current shared-stage fixture and final
-gate/add serial regression. A synthetic one-expert route alone does not qualify
-the stage's gate/add and router-Q8 handoff semantics. No MoE selection change is
-installed by this audit.
+Shared experts need their actual `SharedExpertFFNStage` grouped path separately.
+Extend `Perf__ROCmMoEVerifierPrefill.cpp::runROCmSharedExpertStageCase` with one
+persistent INT32 count and retained capacity16. Bind
+`active_row_count_device`, `force_grouped_verifier_prefill_for_decode=true` and
+`force_decode_equivalent_verifier_prefill=false`. Preserve the two kernel
+objects and shared Q8 publication: router ProducerAndConsumer, shared
+RequiredConsumer. Prepare the router as DecodeEquivalentVerifier, prepare the
+stage before capture, and record `routeVerifierRowsDecodeEquivalent(..., count)`
+immediately before `grouped_stage.execute()`. Retain16→8→9→0→16→16, including
+reset without rewriting an unpublished count.
+
+Append the real `SharedExpertGateStage` with the same count, a separate gate
+vector and an explicitly injected routed residual. This qualifies the complete
+router→shared FFN→gate/add operation; it does not claim routed-expert execution.
+Compare raw FFN, gated shared output and combined output in native bytes against
+independent M1 table-based gate/up/down plus the public serial gate/add. Preserve
+zero suffixes. Existing effective-length gate/add tests use active tolerances,
+so they do not replace this serial-byte check.
+
+Record Dot4/N32/N64 EveryExpert graphs under the worker-local selector. Retained
+native topology at capacity16 is distinct from active RouteOwned work at live8
+or0. Authenticate the active family before omission controls. Poison consumed
+banks and outputs; prove the private input-Q8 bank stays untouched while the
+router publication is borrowed. Use internal retained event nodes for paired
+complete transactions and keep every staging allocation alive behind a fatal
+drain that outlives the graph owners. Add a dedicated shared replay preflight
+registration. A synthetic one-expert route alone does not qualify these handoff
+and final-gate semantics. No MoE selection change is installed by this audit.
 
 ## Remaining bundle inventory
 

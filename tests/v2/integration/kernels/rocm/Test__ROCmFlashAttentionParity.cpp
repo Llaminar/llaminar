@@ -3972,8 +3972,8 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
             });
             ASSERT_NE(producer, nodes.end());
             EXPECT_EQ(producer->block_x, 1024u);
-            EXPECT_EQ(producer->grid_z, unsigned((seq_len + 1) / 2));
-            EXPECT_EQ(producer->static_shared_memory_bytes, 32768u);
+            EXPECT_EQ(producer->grid_z, unsigned(seq_len));
+            EXPECT_EQ(producer->static_shared_memory_bytes, 27152u);
             EXPECT_EQ(producer->local_memory_bytes_per_thread, 0u);
             EXPECT_EQ(std::count_if(nodes.begin(), nodes.end(), [](const auto &node) {
                 return node.name.find("flash_decoding_reduce_mi50_kernel") != std::string::npos;

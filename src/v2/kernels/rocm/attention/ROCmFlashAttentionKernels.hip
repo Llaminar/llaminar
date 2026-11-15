@@ -3775,7 +3775,7 @@ static int launch_grouped_decode(
     {
         const int native_ratio = gqa_n_rep > 0 ? gqa_n_rep : n_heads / n_kv_heads;
         const dim3 native_grid(n_kv_heads * ((native_ratio - 1) / 4 + 1),
-            max_num_splits, (row_count + 1) / 2);
+            max_num_splits, row_count);
         hipLaunchKernelGGL(verifier_attention_wmma_detail::flash_decode_verifier_wmma_fp16_hd256_kernel,
             native_grid, dim3(1024), 0, hip_stream, Q,
             static_cast<const __half *>(K_cache), static_cast<const __half *>(V_cache),

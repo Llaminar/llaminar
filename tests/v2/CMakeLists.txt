@@ -22326,7 +22326,7 @@ if(HAVE_ROCM)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierAttentionWmmaReplay)
     add_v2_test(V2_Integration_ROCmVerifierAttentionControlAndPayloadReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
-                --gtest_filter=ROCmVerifierAttentionWmma.ThreadOverrideOwnsArithmeticWithoutSplitOverride:ROCmVerifierAttentionWmma.AllWaveSpecialValuesDirtyReplay
+                --gtest_filter=ROCmVerifierAttentionWmma.ThreadOverrideOwnsArithmeticWithoutSplitOverride:ROCmVerifierAttentionWmma.AllWaveSpecialValuesDirtyReplay:ROCmVerifierAttentionWmma.ThreeWaveTileOrderDirtyReplay
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;MTP;WMMA;GraphCapture;Replay;ByteExact;FP16;ExceptionalValues;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierAttentionControlAndPayloadReplay)

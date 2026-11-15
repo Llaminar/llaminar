@@ -240,8 +240,8 @@ void runVerifierWmmaRingReplay(
             EXPECT_EQ(producer->grid_x, path ? unsigned(kv_heads * ((ratio - 1) / 4 + 1)) : unsigned(heads));
             EXPECT_GT(producer->grid_y, 0u);
             EXPECT_EQ(producer->block_x, path ? 1024u : 256u);
-            EXPECT_EQ(producer->grid_z, path ? unsigned((rows + 1) / 2) : unsigned(rows));
-            if (path) EXPECT_EQ(producer->static_shared_memory_bytes, 32768u);
+            EXPECT_EQ(producer->grid_z, unsigned(rows));
+            if (path) EXPECT_EQ(producer->static_shared_memory_bytes, 27152u);
             EXPECT_EQ(producer->local_memory_bytes_per_thread, 0u);
             EXPECT_GT(producer->max_active_blocks_per_sm, 0u);
             const auto reducer = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
@@ -413,6 +413,30 @@ TEST(ROCmVerifierAttentionWmma, HeadGroupsAndTailsDirtyReplay)
         for (const int rows : {3, 16})
             ASSERT_NO_FATAL_FAILURE(runVerifierWmmaRingReplay(ordinal, rows, 513, false, true,
                 c.heads, c.kv_heads, std::nullopt, c.mapping));
+}
+
+/**
+ * @brief Preserve finite and exceptional three-wave key order across matrix tiles.
+ *
+ * Explicit one/two-split policies guarantee more than sixteen keys per split
+ * and nonzero split beginnings. Default splitting can hide a wrong three-wave
+ * phase by leaving fewer keys in each tile; NaN-only observations can also
+ * mask a finite ordering defect. Retained dirty-ring replay covers both.
+ */
+TEST(ROCmVerifierAttentionWmma, ThreeWaveTileOrderDirtyReplay)
+{
+    const int ordinal = verifierWmmaDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    DecodeControls controls;
+    for (const int splits : {1, 2})
+    {
+        const auto value = std::to_string(splits);
+        controls.select(value.c_str(), "192");
+        SCOPED_TRACE(::testing::Message() << "original splits=" << splits);
+        for (const int capacity : {64, 513})
+            for (const bool specials : {false, true})
+                ASSERT_NO_FATAL_FAILURE(runVerifierWmmaRingReplay(ordinal, 3, capacity, false, specials, 10, 2));
+    }
 }
 
 /** @brief A TPB-only override must select its real arithmetic without a split variable. */

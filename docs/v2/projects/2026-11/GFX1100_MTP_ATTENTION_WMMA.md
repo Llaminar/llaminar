@@ -4,12 +4,12 @@ This is an implementation and proof record, not a tuning dashboard. The current
 candidate is explicit-only: Automatic still selects the ordered decode producer.
 The ordinary M512 prefill attention result does not qualify grouped MTP decode.
 The four-query candidate from3dd802ba2 is the baseline below. The retained
-eight-query candidate and rejected experiments follow it; none has yet qualified
+single-row/head candidate and earlier experiments follow it; none has yet qualified
 an Automatic domain.
 
-## Arithmetic and ownership
+## Four-row baseline arithmetic and ownership
 
-The FP16/HD256 candidate groups four physical queries in a 1024-thread CTA. It
+The original FP16/HD256 candidate groups four physical queries in a 1024-thread CTA. It
 retains each row's original device-selected split range, ring mapping and one to
 four logical wavefronts. Sparse matrix products reproduce both half-dot updates
 for each of the original 64 lanes. All lane partials enter the unchanged XOR
@@ -283,3 +283,58 @@ GTests with no skips in
 all-format grouped attention, dimension/ring cursor, native replay, independent
 thread-control/exceptional-value replay and the captured timing owner. Binary
 identity is recorded in `mtp-attention-wmma-restored-eight-binary-identity.json`.
+
+## Single-row, four-head candidate
+
+Each CTA now owns one query row and four heads sharing a KV head. Its original
+split/ring/wave policy is uniform; all sixteen physical waves cooperatively
+stage a contiguous16-key tile. Original one/two/four-wave consumers start at
+their wave index. Three-wave consumers rotate the first column by `step % 3`,
+then advance by three, preserving `begin + wave + j*waves` across tile and ring
+boundaries. Padded Q/K and score banks retain the earlier cooperative layout;
+one lane-owned PV state replaces the eight-query candidate's two states.
+
+The new `ThreeWaveTileOrderDirtyReplay` explicitly forces TPB192 and one/two
+splits with64/513 keys, finite and exceptional inputs, and dirty ring reuse.
+This guarantees multi-tile work and nonzero split beginnings. It is included
+in the explicit control/payload production-preflight registration. The first
+focused run had no numerical failures; its append case retained the old32KiB
+resource expectation and correctly rejected the new27,152-byte allocation.
+That assertion was corrected rather than weakened. Original failure evidence:
+`mtp-attention-wmma-focused-1794769683441359520/receipt.json`.
+
+Release and Integration compile gfx906/gfx1100 without memory spills. The native
+producer uses49 VGPRs,46 SGPRs and27,152 shared bytes with zero private storage;
+the unavailable gfx906 producer remains an unselected stub. Static allocation
+and ISA are retained in `mtp-attention-wmma-one-row-{release,integration}-allocation`.
+Captured timing-boundary replay passes all nine observations in
+`mtp-attention-wmma-replay-1794769663553750591/receipt.json`.
+
+The paired Release panel passes90 cells/2,790 samples but still yields no WMMA
+win. Dot2/WMMA geometric mean is0.702861, range0.622839–0.894187. Against the
+previous eight-query candidate, native latency improves in83/90 cells with
+geometric mean1.094880× and range0.980072–1.388036×. The largest M16/H16/KV2/64K
+case takes14.208ms versus9.278ms for Dot2. Fixed-query32K→64K growth is
+1.93418–1.98868 for WMMA and1.95468–1.98850 for Dot2. Timing evidence is
+`mtp-attention-wmma-timing-1794769730015468342/receipt.json`.
+
+The simpler single-row layout is retained as the explicit candidate. Automatic
+continues selecting Dot2. Correctness, reduced register pressure and linear
+scaling do not establish a profitable WMMA domain; grouped-attention economy
+remains open while the next implementation slice qualifies routed/shared MTP.
+
+After correcting the resource assertion, all five affected feature registrations
+pass all29 GTests without skips in
+`mtp-attention-wmma-feature-1794769825691146301/receipt.json`. The actual captured
+append/RoPE operation, grouped all-format attention, ring/dimension cursors,
+thread controls, exceptional values and timing-owner replay are green together.
+
+All eight exact producer counter passes complete with positive activity and
+source/binary bindings to the unprofiled timing panel. At M16/H16/KV2/64K,
+occupancy is66.69%, memory-unit busy67.72%, L2 hit rate50.25%, fetch2,100,962KB,
+wavefront count32,768, VALU instructions73,344.28 and LDS bank conflicts0.
+The single-row grid doubles the CTA/wave count versus the eight-query grid;
+these resource improvements therefore do not imply less total work. Native
+private storage and reported memory spills remain zero. The complete source,
+Release core/executable, raw timing and eight profiles are frozen in
+`mtp-attention-wmma-one-row-snapshot/snapshot.json` (nine bound records).
