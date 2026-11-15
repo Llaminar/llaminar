@@ -16744,7 +16744,9 @@ bool hipMoE_gate_logits_q8_weights_decode_equivalent_rows(
     (void)hipGetLastError();
 
     const auto selection = llaminar2::rocm::selectRouterQ8Prefill(device_idx,
-        {seq_len,d_model,num_experts,basis,llaminar2::rocm::RouterQ8RowOwnership::WholeRows});
+        {seq_len,d_model,num_experts,basis,llaminar2::rocm::RouterQ8RowOwnership::WholeRows},
+        device_effective_seq_len ? llaminar2::DeviceRowRange::deviceCounted(seq_len,device_effective_seq_len) :
+            llaminar2::DeviceRowRange::fullyActive(seq_len));
     const int blocks_per_row = d_model / 32;
     // Pack independent scales only when there is prefill-sized work. This is
     // launch geometry, not a different quantizer or a changed router K tree.
@@ -23811,7 +23813,9 @@ namespace llaminar2::rocm
             if (hipStreamGetDevice(native_stream, &stream_device) != hipSuccess || stream_device != hardware.ordinal)
                 return false;
             const auto selection = selectRouterQ8Prefill(hardware.ordinal,
-                {launch.capacity,launch.width,launch.experts,launch.q8_basis,RouterQ8RowOwnership::CompactOwned});
+                {launch.capacity,launch.width,launch.experts,launch.q8_basis,RouterQ8RowOwnership::CompactOwned},
+                launch.live_rows ? DeviceRowRange::deviceCounted(launch.capacity,launch.live_rows) :
+                    DeviceRowRange::fullyActive(launch.capacity));
             // Expert consumers still borrow ALL local hidden-Q8 rows. Row
             // ownership removes only logits/top-k duplication, not that input.
             const int groups = launch.capacity > 16 ? 8 : 1;

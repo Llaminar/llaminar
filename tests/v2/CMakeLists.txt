@@ -6810,7 +6810,9 @@ add_v2_test(V2_Integration_BenchmarkGeometrySelection
     LABELS "V2;Integration;ProductionTestPreflight;Benchmark;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
-add_executable(v2_test_rocm_router_q8_policy unit/kernels/rocm/Test__ROCmRouterQ8Policy.cpp)
+add_executable(v2_test_rocm_router_q8_policy
+    unit/kernels/rocm/Test__ROCmRouterQ8Policy.cpp
+    ${CMAKE_SOURCE_DIR}/kernels/common/CapturedVerifierExtent.cpp)
 target_compile_features(v2_test_rocm_router_q8_policy PRIVATE cxx_std_20)
 target_include_directories(v2_test_rocm_router_q8_policy PRIVATE ${CMAKE_SOURCE_DIR})
 target_link_libraries(v2_test_rocm_router_q8_policy PRIVATE GTest::gtest_main)
@@ -30846,13 +30848,13 @@ if(HAVE_ROCM)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmRouterQ8WaveTilesReplay)
     add_v2_test(V2_Integration_ROCmRouterQ8AutomaticReplay
         COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
-            --gtest_filter=RouterHadamardQ8.ROCmAutomaticCapturedReplay:MoERouterOwnedRows.ROCmAutomaticCapturedReplay
+            --gtest_filter=RouterHadamardQ8.ROCmAutomaticCapturedReplay:RouterHadamardQ8.ROCmExactHostedAutomaticReplay:MoERouterOwnedRows.ROCmAutomaticCapturedReplay
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Q8;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmRouterQ8AutomaticReplay)
     add_v2_test(V2_Integration_ROCmRouterQ8AutomaticTimingReplay
         COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
-            --gtest_filter=ROCmRouterQ8Automatic.CapturedTimingReplay
+            --gtest_filter=ROCmRouterQ8Automatic.CapturedTimingReplay:ROCmRouterQ8Automatic.ExactHostedTimingReplay
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Q8;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK rocm_gpu_0)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmRouterQ8AutomaticTimingReplay)

@@ -24,8 +24,13 @@ graph identity. The all21-source actual Automatic sweep passes1,890 complete
 projection/SwiGLU cells across three N/K anchors and M2–16. All1,264 selected
 native cells win1.00198–2.00465× (geometric mean1.28647×);626 keys retain Dot4.
 All168 per-source profiles pass with zero memory spills. Other geometries, multi-output/routed/shared
-operations, router admission and grouped attention/floating arithmetic remain
-open. These are component results, not model-level MTP performance claims.
+operations and production grouped attention remain open. Router actual Automatic
+qualifies85/120 exact-width keys (geometric mean1.10438×), with seven focused
+registrations and80 separate counter profiles green with zero memory spills. All-lane attention diagnostics
+preserve score and final-output bytes atS1/S2; real row metadata, capture and
+economy are pending. Direct floating WMMA substitutions change existing native
+input or explicit-half reduction contracts; the three current byte gates pass.
+These are component results, not model-level MTP performance claims.
 
 ## Current branch integration and backend port
 

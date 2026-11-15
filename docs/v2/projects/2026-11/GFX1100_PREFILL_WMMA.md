@@ -10,7 +10,8 @@ KV tokens with the query bucket held fixed, as explicitly confirmed by the user.
 The added [MTP work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md) has all21-source exact-hosted
 Auto timing:1,264 native wins/1,890 cells (1.002–2.005×);626 keys keep Dot4.
 Release171 native cases, five focused ROCm registrations and all168 per-source
-profiles pass with zero memory spills. Broader verifier operations/router admission remain open.
+profiles pass with zero memory spills. MTP router Auto now wins85/120 keys
+(geo1.104×), with seven focused registrations and80 spill-free profiles green.
 rocBLAS remains the half-operand implementation: three custom WMMA variants lost
 every measured cell. [Investigation and deferral](GFX1100_HALF_OPERAND_PREFILL_INVESTIGATION.md).
 The earlier two-anchor NativeQuantised objective is documented separately in
@@ -145,16 +146,14 @@ Auto by1.22653–2.05860×, geometric mean1.39951×, with authenticated684-row t
 and restored AUTO power (`dense-installed-auto-accepted/campaign.json`). Earlier
 anchors/CUDA comparisons remain usable. [Evidence](GFX1100_DENSE_PREFILL_CANDIDATE_SCOPE.md).
 
-The floating audit authenticates the dumped rocBLAS object and all17 traced
-symbols/offsets:
-SHA256 `5dd5b5d0e473562279a87437587c5eb5adf32ab665796b242aaa8538ce11461b`.
-Its selected kernel is wave32 with 47 logical VGPRs, 38 SGPRs, 1536 bytes LDS,
-zero spills/private storage and no WMMA/MFMA instructions. The actual kernel
-dispatches identify gfx1100; the profiler's graph-level agent field incorrectly
-labels gfx906. Join graph correlations to kernel dispatches for device identity.
-See local `floating-half-authenticated-profile/derived/` for the dumped image,
-graph joins, ISA and resource evidence. This Integration trace is a correctness
-and ISA observation, not a Release timing qualification.
+The floating audit authenticates the actual gfx1100 rocBLAS vector-FMA dispatch
+with zero spills; its Integration trace is not Release timing qualification.
+See `floating-half-authenticated-profile/derived/` for the loaded object/ISA.
+Grouped floating direct-WMMA witnesses change native input precision and the
+explicit-half reduction result. The existing three byte gates pass; retain their
+fixed-order producers. Grouped attention's all-lane LDS diagnostic now preserves
+NaN payloads through final output atS1/S2, with zero scratch. Production row
+metadata/capture/economy remain open; see the [MTP work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md).
 
 ## Remaining implementation constraints
 

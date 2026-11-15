@@ -5,7 +5,7 @@ history: [October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md
 
 gfx1100 MTP, 2026-11-15:171 native Release cases and five focused ROCm registrations pass.
 [WMMA work list](../2026-11/GFX1100_MTP_GROUPED_WMMA_PLAN.md): all21-source Auto sweep passes1,890 cells; all1,264 WMMA keys win1.002–2.005× (geo1.286×),626 keep Dot4.
-All168 per-source profiles pass with zero memory spills. Router admission and broader verifier operations/arithmetic remain open; no model-level speedup claim.
+All168 dense profiles pass without spills. Router Auto wins85/120 keys (geo1.104×), seven focused gates and80 spill-free profiles pass. Attention all-lane arithmetic passes diagnostics; routed/shared/production attention remain open.
 
 GDN integration, 2026-10-26: `e2c971301` pushed; full prerequisites2841pass/29skip, post-packaging Unit782/782 and five loader checks pass.
 Matched Qwen3.6 ROCm decode improves10–15%; CUDA is flat with683MiB less workspace. CPU counter batching gains5.91%. [Limits and evidence](../2026-10/GDN_FIXED_EPOCH_BACKEND_PORT_PLAN.md).

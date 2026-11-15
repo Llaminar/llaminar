@@ -6,8 +6,10 @@ The actual Automatic sweep passes1,890 cells: all1,264 native-selected cells win
 1.00198–2.00465×, geometric mean1.28647×;626 keys retain Dot4. Current Release
 replay passes171 native cases and five focused ROCm registrations pass. Prior
 seven epilogue and six host checks remain green. All168 per-source profiles pass
-with zero memory spills; broader bundles/routed/shared operations, router admission and
-grouped attention/floating arithmetic remain open. These component results do
+with zero memory spills. Router Automatic qualifies85/120 exact-hosted keys
+(1.00291–1.28437×, geometric mean1.10438×); seven focused registrations pass.
+All80 router profiles pass without spills. Broader bundles/routed/shared
+operations and production grouped attention remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
 not claim model-level MTP speedups or full production certification.
 This implementation plan extends the [prefill campaign](GFX1100_PREFILL_WMMA.md)
 and the [MTP project plan](../2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md).
@@ -22,10 +24,10 @@ serial-row byte contract. Ordinary prefill evidence does not qualify MTP.
 
 | Operation | Current ROCm execution | WMMA work required |
 |---|---|---|
-| Dense quantized projections | Dedicated M16/N64 native leaves preserve serial arithmetic through standalone, homogeneous and mixed APIs. Automatic uses source/operation/shape-specific masks for all21 source formats at M2–16; Dot4 owns other keys. | Finish per-source profiling; qualify other geometries, multi-output bundles and real grouped transactions. |
+| Dense quantized projections | Dedicated M16/N64 native leaves preserve serial arithmetic through standalone, homogeneous and mixed APIs. Automatic uses source/operation/shape-specific masks for all21 source formats at M2–16; Dot4 owns other keys. | Per-source profiling passes; qualify other geometries, multi-output bundles and real grouped transactions. |
 | Routed expert gate/up and down | Multi-row MTP enters the fixed-topology grouped transaction in `MoEExpertComputeStage::executeDecodeEquivalentVerifierPrefill`. Native projection candidates and M512 population policies exist; those policies do not admit ordinary verifier capacities. Sparse RouteOwned execution remains a distinct Dot4 producer. | Reuse and qualify native leaves for actual verifier routes, including sparse groups; install measured selection. The prefill-named interface alone does not prove MTP coverage. |
-| Floating grouped projections | `ROCmFloatingPointGemmKernel.cpp` selects `rocmFp16_batched_projection`, `rocmFp32_small_n_batched_projection`, or `rocmFp32x16_batched_projection`, preserving the serial fixed reduction tree. | Evaluate matrix candidates under each declared arithmetic contract. Half storage does not authorize changing FP32 operands or reduction order. |
-| Q8 router | The real verifier API already reaches the forced-capable byte-exact WMMA leaf. Automatic admits only whole-row capacity512/K2560/E512; forced replay covers M1–65 and both bases. | Measure verifier geometry economy, then qualify full-router Automatic selection and reuse of the original Q8 publication. No new arithmetic leaf is initially required. |
+| Floating grouped projections | `ROCmFloatingPointGemmKernel.cpp` selects `rocmFp16_batched_projection`, `rocmFp32_small_n_batched_projection`, or `rocmFp32x16_batched_projection`, preserving the serial fixed reduction tree. | Direct half/BF16 substitution changes native FP32 operands; a real half-input WMMA witness also changes the explicit FP16RNE reduction. Retain the existing exact producers; no ordinary rocBLAS replacement. |
+| Q8 router | The real verifier API already reaches the forced-capable byte-exact WMMA leaf. Automatic admits the original M512 key and85 exact-hosted M2–16 keys across four measured K/E shapes and both bases. | Actual Automatic component timing, seven focused registrations and80 source-bound profiles pass. Full routing/top-k remains a separate transaction boundary. |
 | Verifier attention | Typed grouped decode uses `flash_decoding_mi50_kernel` plus its reducer, with no WMMA choice. The M512 prefill helper has a different arithmetic tree. | Implement a decode-specific candidate preserving lane-owned dot2 chains, wave64 reduction, online softmax and split merge; qualify captured append-plus-attention and fixed-query scaling through64K KV. |
 
 The dense native decoder switch currently contains 18 physical cases. Qualification
@@ -532,33 +534,57 @@ installed by this audit.
 ## Verifier router economy and attention arithmetic
 
 The complete Q8 router tournament covers every M2–16 at K/E2048/256,
-2560/512,3072/256 and8192/512 in both bases. All three wave-tile variants pass
-120 cells each with31 paired internal-event samples, poisoned logits/original
-expert-Q8 banks and exact native geometry. Sixteen waves beats both four and
-eight at every measured key; it beats Dot4 by median at90/120 keys. Requiring
-22/31 paired wins qualifies87 keys:
+2560/512,3072/256 and8192/512 in both bases. Sixteen waves beats four and eight
+at all120 measured keys. Initial forced timing qualifies87 keys using median
+speedup plus at least22/31 paired wins. Actual Automatic narrows that to85:
+Original M5/K2048 and Original M5/K3072 win their medians by only0.22/0.24%,
+but win17/31 and21/31 pairs, respectively. They retain Dot4.
 
 | K/E | Original basis WMMA widths | Hadamard basis WMMA widths |
 |---|---|---|
-|2048/256|5–16|5–16|
+|2048/256|6–16|5–16|
 |2560/512|5–16|5–16|
-|3072/256|5–16|6–16|
+|3072/256|6–16|6–16|
 |8192/512|9–16|9–16|
 
-The M4/K2560 near ties and Hadamard M5/K3072 remain Dot4. This component includes
-hidden quantization, logits and original expert-Q8 restoration; it does not
-certify full routing/top-k. The exact-hosted selection/rebinding and native/timing
-replay patch is staged separately while dense profiling freezes the main core.
-Seven device-free policy cases and all three fixture syntax checks pass. Both
-changed HIP producers compile for gfx906/gfx1100 using the configured Integration
-flags and enabled spill guard in the staging directory. Linked native replay
-and actual Automatic timing remain pending. Installed production
-router Automatic still has only the established M512 rule.
+The final actual-Automatic panel covers all120 keys and3,720 paired records,
+31 AB/BA pairs of16 complete captured component operations per key. All85
+native selections qualify:1.002909–1.284372×, geometric mean1.104376×, minimum
+22/31 paired wins. The35 retained-Dot4 controls vary0.997557–1.006385×. The
+smallest native margin is0.29%; this is not a claim of large gains at every key.
+Each operation includes hidden quantization, logits and original expert-Q8
+restoration. Full routing/top-k and model-level MTP are not certified here.
 
-Receipts: `mtp-router-4wave-sweep-1794753501313488585/receipt.json`,
-`mtp-router-8wave-sweep-1794753251349606578/receipt.json`,
-`mtp-router-16wave-sweep-1794753292288995241/receipt.json`;
-`mtp-router-verifier-selection-preview.json` holds the87-key selection.
+Selection binds the original exact-hosted device/count/width authority and
+rejects rebinding at native submission. Compact-owned rows, transformed rows,
+guarded capacities and unmeasured geometries retain their measured first-class
+policies. The original M512 rule is unchanged. Both optimized builds compile
+changed HIP producers for gfx906/gfx1100 with spill guards enabled. Seven focused
+policy/native/timing registrations pass on the final85-key selection. Exact
+native-boundary profiles and Dot4 controls pass80 separate counter launches,
+bound to the same unprofiled timing producer. Native kernels use74/79 logical
+VGPRs (76/80 allocated),19/20 SGPRs,1,024 threads and16KiB LDS; Dot4 controls
+use55/56 VGPRs,29 SGPRs,128 threads and512B LDS. Both have zero private
+storage/VGPR memory spills and zero measured LDS bank conflicts. Native measured
+occupancy is1.886–7.922% across these short boundary keys; these are small grids,
+not evidence of whole-device saturation. Memory busy is14.875–45.381%,
+L2 hit10.299–72.594%, and GPUBusy100%. Complete-operation timing owns the wins.
+
+Evidence root: `/tmp/llaminar-gfx1100-wmma-prefill-evidence`.
+- Accepted timing: `mtp-router-automatic-exact-widths-1794759414664455953/receipt.json`.
+- Final focused checks: `mtp-router-exact-focused-1794760956133415385/receipt.json`; verbose output
+  proves25 individual executions and no skips across the seven registrations.
+- Rejected first admission: `mtp-router-initial-automatic-snapshot/snapshot.json`,
+  preserving source, binaries and the first actual-Automatic record.
+- Measured selection: `mtp-router-verifier-selection-qualified-preview.json`.
+- Complete profiles: `mtp-router-exact-profile-batch-1794759835343054515/progress.json`.
+- Joined summary: `mtp-router-exact-automatic-profile-summary.json`, SHA256
+  `cde1edacd2f2c5c09f21f87c8b7ed9bd57995c19cbb08bddafc452c2b525df82`.
+- Qualified code/evidence snapshot: `mtp-router-exact-qualified-snapshot/snapshot.json`,
+  SHA256 `3db4d0e4c17afcb7da9a5302157ab81e031c7177d44f866098cf8a8745417907`.
+  Its879 file records deduplicate into719 objects; the rejected first snapshot
+  remains an explicit hash-pinned external reference. Project docs belong to
+  the feature commit rather than this code/evidence archive.
 
 A standalone FP16/HD256 attention arithmetic probe compares each original
 lane's two ordered dot2 updates against one sparse native matrix plane. Both
@@ -618,6 +644,87 @@ relaxing special-value equality cannot qualify it. These are diagnostic copies,
 not production capture or economy evidence. No attention dispatch change is
 installed.
 
+The subsequent all-lane candidate stores all64 original partials in LDS, then
+uses each consuming wave's original XOR32..1 reduction. The bounded common-KV
+probe passes524,288 score-word comparisons, including finite edges and NaN
+payloads. Feeding these matrix-generated scores to the unchanged downstream
+consumer also passes all m/l/partial-O and131,840 final words for each ofS1/S2,
+including special scores placed first/middle/last. The same consumer previously
+rejected shared-root scores. Score resources are32 VGPRs,16KiB LDS and zero
+private storage at1,024 threads. This is arithmetic evidence only: independent
+row split/ring metadata, live tails, production capture and complete-operation
+economy remain unqualified. Do not infer16KiB for a fused attention kernel;
+wave-output merge storage needs another16KiB unless safely aliased after the
+last score-consumer barrier.
+
+Evidence: `mtp-attention-lds-score-probe-{build,run}.json` and
+`mtp-attention-lds-output-probe-{build,run}.json`, with source/binary/log hashes.
+A read-only review confirms independent Q/K production, unchanged downstream
+machine source, every lane's matrix-generated witness payload and failure on
+any score/m/l/partial-O/final-O difference. A next candidate must preserve each
+row's split starts, key sequence, ring address and ascending wave/split merges.
+
+A separate union-tile score probe gives each query/wave its own matrix column
+and physical key address. It passes150,976 active score words and preserves
+897,600 poisoned inactive words across independent per-row lengths, S1/S2,
+ring origins/capacities and clamped diagnostic live-query counts. It uses45
+VGPRs,16KiB LDS and zero private storage at1,024 threads. Evidence:
+`mtp-attention-union-score-probe-{build,run}.json`. This test does not qualify
+unequal-row softmax/PV or performance. Its explicit count is a diagnostic input:
+production AttentionDeviceParams has no active-row field and instead publishes
+kv_len=1 for padded rows. Production integration must preserve that owner's
+sentinel-row semantics rather than importing the diagnostic count contract.
+
+The production integration seam is
+`compute_verifier_rows_decode_equivalent` →
+`hipFlashAttn_decode_fp16_grouped_verifier_rows` →
+`launch_grouped_decode<FP16,SharedKVVerifier>`. Reuse the existing persistent
+PARTIAL_OUTPUT/M/L allocation and reducer. m/l indexing is
+`(row*heads+head)*max_splits+split`; O indexing is
+`((row*heads+head)*256+dimension)*max_splits+split`. Preserve each row's
+`selectDecodeRowConfig`, including its original1/2/4-wave stride and ascending
+merges. A separate grouped candidate is needed; ordinary-prefill
+`FlashAttentionQKEngine` has a different arithmetic tree.
+
+A two-producer candidate can use one pure device predicate over
+`(head,split,row/4)` to give complementary ownership to the current partial
+producer and a4-query WMMA producer, followed by the unchanged reducer. No
+extra live selection state or host readback is needed. This may lose to a single
+producer because of dormant grids and another launch; measure complete graphs
+before Automatic admission. Any production-selectable engine belongs in immutable
+owner/cache identity. Check the existing TPB-only override behavior before using
+it as a control: the grouped bridge currently also requires the NUM_SPLITS
+presence flag, although DebugEnv parses TPB independently. Any correction needs
+its own focused replay/preflight regression and identical effective controls in
+both producers and the reducer.
+
+## Floating grouped arithmetic disposition
+
+Direct gfx1100 WMMA replacement is incompatible with the existing native
+FP16/BF16/FP32 grouped contracts. Activations remain full FP32 even when weights
+are stored in half/BF16; the instruction's FP32 accumulator does not preserve
+an activation rounded to its supported half/BF16 input. The finite witness
+A=1+2^-11,B=1 produces serial `0x3f801000`, versus half-input WMMA `0x3f800000`.
+
+Explicit FP16RNE is a separate contract with actual half operands. It still
+preserves256 independent FP32 chains and their fixed reduction tree. A real
+K512 gfx1100 witness has nonzero products at0,1,256: +2^24,+1,-2^24, realized
+by exact-half operands4096*4096,1*1,-4096*4096. The original chain/tree yields
+`0x3f800000` (+1), while this direct contiguous-K WMMA candidate yields
+`0xbf800000` (-1), uniformly across256 replicated matrix outputs. An earlier
+assumed matrix result of zero was wrong; the recorded hardware result owns the
+disposition. This rejects this direct substitution, not every possible emulation.
+No expensive decomposition or ordinary rocBLAS replacement is proposed.
+
+`ROCmSmallNFP32ProjectionKernels.hip` and the existing fixed-order dispatch are
+unchanged. `V2_Integration_ROCmHalfProjectionPackedReduction` passes all three
+cases: packed-half capture plus all-format native floating projection and
+SwiGLU/down serial-row gates. Evidence:
+`mtp-floating-direct-wmma-witness-v3-{build,run}.json` and
+`mtp-floating-contract-focused-1794759706330185082/receipt.json`.
+The witness kernel uses22 VGPRs with zero private/shared storage; it is a
+standalone diagnostic, not production-path or performance qualification.
+
 ## Required acceptance evidence
 
 1. **Rows and formats.** Use production M=1 as the independent serial oracle;
@@ -657,5 +764,5 @@ installed.
 
 Current result: native verifier replay, narrow exact-hosted Automatic selection
 and profiling pass the focused component gates and are frozen for the feature
-checkpoint. Broader operation/codebook and model qualification follow. This
+checkpoint. Broader operation/geometry and model qualification follow. This
 does not close the full prefill/MTP goal or claim all-codebook MTP economy.

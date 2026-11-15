@@ -47,9 +47,11 @@ ScopedRouterQ8WaveTile::ScopedRouterQ8WaveTile(RouterQ8WaveTile tile)
 }
 ScopedRouterQ8WaveTile::~ScopedRouterQ8WaveTile() { recording_wave_tile = previous_; }
 
-RouterQ8PrefillSelection selectRouterQ8Prefill(int device, RouterQ8PrefillShape shape)
+RouterQ8PrefillSelection selectRouterQ8Prefill(int device, RouterQ8PrefillShape shape,
+    const DeviceRowRange &rows)
 {
-    return RouterQ8PrefillSelection::resolve(recording_mode,recording_wave_tile,rocmHardwareMetadata().at(device),shape);
+    return RouterQ8PrefillSelection::resolve(recording_mode,recording_wave_tile,
+        rocmHardwareMetadata().at(device),shape,rows,ScopedCapturedVerifierExtent::current());
 }
 
 namespace router_q8_prefill_detail
@@ -201,6 +203,8 @@ bool routerQ8Prefill(const RouterQ8PrefillView &view, const RouterQ8PrefillSelec
         selection.device() != view.device || shape.capacity != view.capacity || shape.width != view.width ||
         shape.experts != view.experts || shape.basis != view.basis ||
         ((shape.ownership == RouterQ8RowOwnership::CompactOwned) != (view.partition.participants() > 1)) ||
+        !selection.matchesRows(view.live_rows ? DeviceRowRange::deviceCounted(view.capacity,view.live_rows) :
+            DeviceRowRange::fullyActive(view.capacity)) ||
         !supportsRouterQ8Tile(rocmHardwareMetadata().at(view.device),selection.nativeTile()))
         return false;
     int stream_device = -1;

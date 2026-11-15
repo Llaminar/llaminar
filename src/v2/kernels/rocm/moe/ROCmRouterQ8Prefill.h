@@ -30,9 +30,11 @@ private:
 
 /** @brief Resolve the native entry from the admitted device and captured shape.
  * @param device Owning visible HIP ordinal. @param shape Original geometry and ownership.
+ * @param rows Original whole-matrix row authority before any compact partition.
  * @return Immutable engine and tile selection bound to this device and shape.
  * @throws std::invalid_argument For a forced unsupported architecture or geometry. */
-RouterQ8PrefillSelection selectRouterQ8Prefill(int device, RouterQ8PrefillShape shape);
+RouterQ8PrefillSelection selectRouterQ8Prefill(int device, RouterQ8PrefillShape shape,
+    const DeviceRowRange &rows);
 
 /** @brief Borrowed immutable bindings; device live rows remain the sole row authority. */
 struct RouterQ8PrefillView
