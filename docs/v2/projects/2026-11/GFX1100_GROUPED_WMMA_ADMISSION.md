@@ -588,7 +588,98 @@ the previously profiled fence. The rejected candidate's70-file archive is
 `grouped-persistent-rejection.json` and `grouped-persistent-summary.json` retain
 its decision and samples. No runtime-counter qualification is claimed for it.
 
-The next qualification measures the actual ordinary router-Q8/direct-token
-operation with all-local routes. See the
-[operation proof](GFX1100_GROUPED_PREFILL_OPERATION_PROOF.md). Canonical route
-publication with half the experts local remains a separate component control.
+The ordinary router-Q8/direct-token qualification is complete with all-local
+routes; see the [operation proof](GFX1100_GROUPED_PREFILL_OPERATION_PROOF.md).
+Canonical route publication with half the experts local remains a separate
+component control.
+
+## Completed, unpromoted GU128 experiment
+
+The narrower candidate changed the wide gate/up producer from256 to128 columns
+and threads, retaining down TM16/TN128, source arithmetic, whole-expert floor16
+and ordinary TokenRows publication. It therefore doubled the gate/up column
+workgroup count without removing a dot family. Both normal Release and Integration
+builds pass for the complete gfx906/gfx1100 target set. ISA/resource inspection
+covers all72 native variants with clean private-memory, spill and scratch
+results. All186 native cases pass:162 grouped cases and24 ordinary serving
+replays. These are compile/ISA and functional observations, not hardware-counter
+measurements.
+
+`grouped-gu128-timings/campaign.json` retains all15,810 qualified timing rows:
+five cases ×17 device-live points ×six policies ×31 samples. Every sample measures
+eight complete captured transactions, including the actual router Q8 producer,
+explicit injected expert-route grouping and direct token publication. The three
+Qwen cases use all-local shard1 uniform/hotset/power-law; compact Q4_0 and IQ2_S
+retain E8. The ordinary GU256 corpus is `grouped-serving-timings/campaign.json`.
+
+The normalized comparison is the geometric mean across17 live points of
+`(Dot4 / GU128 WideFloor16) / (Dot4 / GU256 WideFloor16)`, using each campaign's
+own Dot4 baseline. It is not a ratio of absolute cross-run kernel durations.
+
+| Case | GU128 full512 Wide gain | Normalized GU128/GU256 mean | Full512 fastest family |
+|---|---:|---:|---|
+| Qwen uniform |1.158726×|0.998864×|Pure N32|
+| Qwen hotset |1.118014×|1.003792×|Pure N32|
+| Qwen power-law |1.068405×|0.998778×|WideFloor16|
+| Compact Q4_0 |1.023640×|1.009728×|Pure N32|
+| Compact IQ2_S |1.002099×|1.013773×|Pure N32|
+
+The change is not promoted. Full-live winners remain unchanged: pure N32 wins
+uniform/hotset/compact work, wide wins the mixed Qwen population, and Dot4 wins
+empty and several sparse points. GU128's small normalized changes do not remove
+the need for three families. Its larger inactive gate/up grid is an additional
+risk for a retained Automatic graph, not a measured Automatic result. The
+previous profiled GU256 fence remains the baseline for subsequent work.
+
+No runtime hardware-counter qualification is claimed for GU128. Counter tooling
+is prepared and preserved but was not run to qualify this unpromoted candidate;
+ISA resource evidence must not be described as occupancy, utilization or memory
+counter measurements. No additional counter collection is required to retire it.
+
+The timing producer SHA256 is
+`c31ea597ba796826162f4bd2fe20efb53d2f56f9c7c3526f70be5582b01c75db`.
+The88-file source/build/replay/timing archive, including the tracked patch, is
+`grouped-gu128-producer-snapshot/snapshot.json`, SHA256
+`c6ad5eefbbe6eb4ad1cd921cc6bf724acf3e744cf6aa2e7b631cfb11943df4b5`.
+The two resource reviews and grouped/serving replay receipts remain separate
+artifacts in that archive. All seven experimental kernel/helper/test files are
+now restored exactly to HEAD `f6e727942`; no experimental production delta
+remains. The working Release/Integration binaries still contain GU128 and must
+not be used as restored-baseline evidence before normal rebuild. The original
+archived fence benchmark producer remains valid under its own binding.
+
+## Forthcoming device-population Automatic selection
+
+Automatic remains OrderedDot4; the three-family selector is unimplemented.
+Its proposed exact ordinary-operation key retains complete full-width TokenRows,
+AllRoutes, OriginalTokens, published Q8, physical capacity and H/I/E/top-k,
+original physical/source codebook masks and cached actual gfx1100 resources.
+It must not widen to selected/runtime routes, internal quantization, split
+projection or column slices merely because geometry agrees.
+
+Existing route-family admission takes precedence: for the qualified top-k8 key,
+active slots0/1/63/64 use RouteOwned and65 uses ExpertTiled. Ordinary full-route
+live rows0/1/7/8/9 cover that boundary. Only ExpertTiled then classifies positive
+expert counts: all cold1–15 proposes Dot4, all hot≥16 proposes pure N32, and a
+mixed population proposes WideFloor16 on the Qwen key. Ignore zero-count experts
+and handle empty work explicitly. Compact mixed populations retain Dot4 pending
+measured evidence; current all-valid E8/top-k8 ordinary profiles have equal
+expert counts and do not measure that mixed case.
+
+The17-point corpus does not directly measure every transition population.
+Focused cases must cover uniform live480/481/496/511/512 (mixed481–511), hotset
+57/58/60/63/64/68 (mixed58–63, then tail utilization at68), and power-law
+39/40/41/48 (first hot expert at40), plus whole-expert counts15/16/17. Reuse one
+captured parent through hot→empty→cold→mixed→hot, changed activations, poisoned
+banks and complete decision-publication reset. Conditional directory producers
+may share a cached directory only when the row plan and producer admission
+agree, or a shared unconditional producer establishes it for every consumer.
+
+A device choice does not remove inactive captured workgroups. Actual Automatic
+empty/live1 and transition timing must include every retained family and the
+classifier; selecting separately measured winners is not a measurement of this
+new topology. Submitted-node counters describe successfully recorded families,
+including inactive leaves, and remain unchanged during replay. Selected-family
+omission must break exact output, inactive-family omission must preserve it, and
+restored dirty replay must recover without serial row replay, duplicate
+quantization or another candidate repairing the output.

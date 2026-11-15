@@ -1,7 +1,6 @@
 # ROCm prefill matrix-instruction coverage
 
-Dashboard byte limit: **15,000 UTF-8 bytes**. This file records current coverage
-and qualification; backend procedures remain in the ROCm tuning skill.
+Dashboard limit: **15,000 UTF-8 bytes**. Current coverage and qualification; backend procedures remain in the ROCm tuning skill.
 
 The active objective covers four areas: broader dense dispatch, grouped routed
 experts, attention, and Q8 router logits. Each requires production-path component
@@ -52,10 +51,7 @@ Disabling each native projection independently makes that reference fail, provin
 the recorded kernels contribute. Split replay covers both tiles, all 21 source
 formats, whole-expert phases and compact column-owned down slices.
 
-The bounded511-worker experiment is rejected:10,540 samples showed full Qwen
-ratios0.9809/0.8650/0.8569× and compact0.8231/0.7912× despite passing functional
-and allocation gates. Its70-file archive is retained; the profiled fine-grid
-fence kernel is restored, with byte-identical loaded Release HIP object.
+Bounded511 was rejected; its70-file archive remains in the investigation.
 
 [Operation proof](GFX1100_GROUPED_PREFILL_OPERATION_PROOF.md) records completed
 ordinary prefill timing: five cases ×17 live points ×six policies ×31 samples,
@@ -64,9 +60,11 @@ publication. Qwen uses all-local shard1 uniform/hotset/power-law; two compact
 controls retain E8. Both builds and24 focused native replays pass (51.87s).
 `grouped-serving-timings/campaign.json` binds all15,810 qualified rows. N32 wins
 full uniform/hotset; WideFloor16 wins full power-law. Sparse work still favors
-Dot4. Grouped Auto remains Dot4; narrower128-column GU is the next unimplemented
-experiment, not an installed policy.
-[Investigation](GFX1100_GROUPED_WMMA_ADMISSION.md) owns the historical comparisons.
+Dot4. GU128 passed186 native cases/15,810 timings but is unpromoted: normalized
+wide changes0.9988–1.0138× leave three families necessary. No hardware counters
+are claimed. Source is restored to f6e727942; binaries still contain GU128 until
+rebuilt. Auto stays Dot4; device-population selection is next, unimplemented.
+[Investigation](GFX1100_GROUPED_WMMA_ADMISSION.md) owns the comparisons/archive.
 
 The user accepts the existing dense/CUDA-reference, router and attention
 performance evidence without an isolation-receipt requirement. Isolation-only

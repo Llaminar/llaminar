@@ -108,5 +108,14 @@ The campaign records complete canonical timing and restored AUTO power. This
 ordinary-operation corpus is separate from the canonical-route shard2 controls.
 The rejected bounded511-worker experiment is archived and the previously
 profiled fine-grid fence kernel is restored. Grouped Automatic remains Dot4.
-The next narrower128-column gate/up experiment is unimplemented; no new kernel,
-admission row or Automatic installation is claimed.
+The narrower128-column gate/up experiment is complete but unpromoted: both
+full-target builds,72-variant ISA/resource inspection,186 native cases and15,810
+timing rows pass. Normalized wide gains change only0.9988–1.0138× across the five
+cases and leave the three-family requirement intact. No runtime hardware-counter
+qualification is claimed; tooling and the88-file archive are retained in the
+[detailed investigation](GFX1100_GROUPED_WMMA_ADMISSION.md).
+The seven experimental source files are restored exactly to `f6e727942`; the
+profiled GU256 fence remains the baseline. Working binaries still contain GU128
+until rebuilt and cannot certify that restored source. Device-population
+Automatic selection and its route-owned/count-threshold lifecycle gates are
+next, still unimplemented; no admission row or Automatic installation is claimed.
