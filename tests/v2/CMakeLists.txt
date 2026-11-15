@@ -22902,12 +22902,25 @@ add_v2_test(V2_Integration_ROCmIQ2SFusedMoEOriginalEquation
             --gtest_filter=Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36AllNativeQuantisedFormats_RuntimeMMatchesRowByRowDecode:Test__ROCmMoEKernel.SharedExpertVerifierPrefill_Qwen36ShapeIQ2SGateUpIQ4XSDown_RuntimeMMatchesRowByRowDecode
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MTP;MoE;AllFormats;NativeQuantised;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120)
-    add_v2_test(V2_Integration_ROCmGroupedWmmaReplay
+    # Each tile owns a disjoint all-format replay under the normal timeout.
+    add_v2_test(V2_Integration_ROCmGroupedWmmaN32Replay
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
-            --gtest_filter=NativeGfx1100/ROCmMoEGroupedWmma.CapturedAllCodebookReplay/*:Test__ROCmMoEKernel.NativeWmmaMixedIQ4CapturedReplay:Test__ROCmMoEKernel.NativeWmmaTailPartitionsCapturedReplay:ROCmMoEGroupedWmmaPromotion.CapturedExpandedReplay
+            --gtest_filter=NativeGfx1100/ROCmMoEGroupedWmma.CapturedAllCodebookReplay/N32*
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Prefill;AllCodebooks;LocalTP;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedWmmaReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedWmmaN32Replay)
+    add_v2_test(V2_Integration_ROCmGroupedWmmaN64Replay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+            --gtest_filter=NativeGfx1100/ROCmMoEGroupedWmma.CapturedAllCodebookReplay/N64*
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Prefill;AllCodebooks;LocalTP;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedWmmaN64Replay)
+    add_v2_test(V2_Integration_ROCmGroupedWmmaBoundaryReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
+            --gtest_filter=Test__ROCmMoEKernel.NativeWmmaMixedIQ4CapturedReplay:Test__ROCmMoEKernel.NativeWmmaTailPartitionsCapturedReplay:ROCmMoEGroupedWmmaPromotion.CapturedExpandedReplay
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Prefill;AllCodebooks;LocalTP;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedWmmaBoundaryReplay)
     add_v2_test(V2_Integration_ROCmGroupedWmmaMacroReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_moe_kernel>
             --gtest_filter=NativeGfx1100/ROCmMoEGroupedWideWmma.CapturedAllCodebookReplay/*:Test__ROCmMoEKernel.WideWmmaMixedIQ4CapturedReplay:Test__ROCmMoEKernel.WideWmmaTailPartitionsCapturedReplay:ROCmMoEGroupedWmmaPromotion.CapturedWideExpandedReplay
@@ -26224,6 +26237,19 @@ if(HAVE_CUDA OR HAVE_ROCM)
             MPI_PROCS 1 NO_MODELS TIMEOUT 180 RESOURCE_LOCK rocm_gpu_0)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
             V2_Integration_ROCmGroupedWmmaMacroSplitReplay V2_Integration_ROCmGroupedWmmaMacroTimingReplay)
+        add_v2_test(V2_Integration_ROCmGroupedWmmaRouterQ8AllCodebooksReplay
+            COMMAND $<TARGET_FILE:v2_perf_gpu_expert_pipeline> --gtest_also_run_disabled_tests
+                --gtest_filter=NativeGfx1100/ROCmGroupedWmmaPerf.DISABLED_RouterQ8TokenReplay/ROCm_AllCodebookPrefill_*Rows65
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Prefill;AllCodebooks;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 180 RESOURCE_LOCK rocm_gpu_0)
+        add_v2_test(V2_Integration_ROCmGroupedWmmaRouterQ8QwenReplay
+            COMMAND $<TARGET_FILE:v2_perf_gpu_expert_pipeline> --gtest_also_run_disabled_tests
+                --gtest_filter=NativeGfx1100/ROCmGroupedWmmaPerf.DISABLED_RouterQ8TokenReplay/ROCm_Qwen36WholeExpertShard1Rows512*
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Prefill;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 180 RESOURCE_LOCK rocm_gpu_0)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+            V2_Integration_ROCmGroupedWmmaRouterQ8AllCodebooksReplay
+            V2_Integration_ROCmGroupedWmmaRouterQ8QwenReplay)
         add_v2_test(V2_Integration_ROCmGroupedWmmaTimingReplay
             COMMAND $<TARGET_FILE:v2_perf_gpu_expert_pipeline> --gtest_also_run_disabled_tests
                 --gtest_filter=NativeGfx1100/ROCmGroupedWmmaPerf.DISABLED_HybridCapturedTimingReplay/ROCm_AllCodebookPrefill_Q4_0Rows65:NativeGfx1100/ROCmGroupedWmmaPerf.DISABLED_HybridCapturedTimingReplay/ROCm_Qwen36WholeExpertShard2Rows512_Route_power_law

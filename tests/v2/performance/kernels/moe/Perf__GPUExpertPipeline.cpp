@@ -7,6 +7,9 @@
  * the fixed-down column bank, under shared uniform/hotset/power-law profiles;
  * these are communication-free local costs, not multi-GPU speedups. Every
  * downstream phase receives valid producer data prepared outside its timer.
+ * Ordinary-prefill probes retain the real router Q8 producer and direct token
+ * publication, with explicit injected expert routes for controlled histograms.
+ * Those timings include router work; they are not complete model measurements.
  * Timing includes device grouping, gate/up/SwiGLU, canonical down
  * publication and reduction. Weight preparation, graph construction and result
  * downloads are outside event timing. Numerical certification belongs to the
@@ -41,6 +44,7 @@
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/TestTensorFactory.h"
 #include "utils/QuantizedVerifierFormats.h"
+#include "utils/PerfStatsCollector.h"
 #include "performance/kernels/native_quantised_dispatch/NativeQuantisedMoERoutingProfiles.h"
 
 #ifdef HAVE_ROCM
@@ -59,6 +63,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <initializer_list>
@@ -195,6 +200,54 @@ namespace
     /** Captured, event-timed whole-operation fixture; supports one-case profiling. */
     class GPUExpertPipeline : public ::testing::TestWithParam<Case> {};
 
+    /** @brief Scope only the existing collector policy; restore original optional environment values. */
+    class RouterQ8SubmissionObservation final {
+        std::optional<std::string> json_, filter_;
+        /**
+         * @param name One of the two collector environment keys owned by this scope.
+         * @return Exact prior value, distinguishing an empty value from absence.
+         */
+        static std::optional<std::string> prior(const char *name) {
+            const char *value = std::getenv(name);
+            return value ? std::optional<std::string>{value} : std::nullopt;
+        }
+        /**
+         * @brief Restore exactly the saved value or original absence; failed restoration is fatal.
+         * @param name Collector environment key being retired.
+         * @param value Original value, or absence to restore with unsetenv.
+         */
+        static void restore(const char *name, const std::optional<std::string> &value) {
+            const int result = value ? setenv(name,value->c_str(),1) : unsetenv(name);
+            if (result != 0) std::terminate();
+        }
+    public:
+        /** @brief Select accepted host submissions without enabling timers or another domain. */
+        RouterQ8SubmissionObservation()
+            : json_(prior("LLAMINAR_PERF_STATS_JSON")),
+              filter_(prior("LLAMINAR_PERF_STATS_FILTER")) {
+            if (setenv("LLAMINAR_PERF_STATS_JSON","1",1) != 0 ||
+                setenv("LLAMINAR_PERF_STATS_FILTER","kernel.rocm_moe_grouped_prefill_router_q8_reuse_calls",1) != 0) {
+                restore("LLAMINAR_PERF_STATS_FILTER",filter_);
+                restore("LLAMINAR_PERF_STATS_JSON",json_);
+                throw std::runtime_error("Cannot select router Q8 submission observation environment");
+            }
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
+            PerfStatsCollector::reset();
+        }
+        /** @brief Retire fixture evidence, restore exact environment absence/values and reload it. */
+        ~RouterQ8SubmissionObservation() {
+            PerfStatsCollector::reset();
+            restore("LLAMINAR_PERF_STATS_FILTER",filter_);
+            restore("LLAMINAR_PERF_STATS_JSON",json_);
+            PerfStatsCollector::reloadConfigurationFromEnvironment();
+        }
+        RouterQ8SubmissionObservation(const RouterQ8SubmissionObservation&) = delete;
+        RouterQ8SubmissionObservation& operator=(const RouterQ8SubmissionObservation&) = delete;
+    };
+
+    /** @brief Public operation boundary whose immutable publication shape is timed. */
+    enum class ExpertPublication { CanonicalRoutesThenFold, RouterQ8TokenRows };
+
     /** @brief One complete benchmark operation, with profiler runs kept untimed. */
     enum class ExpertBenchmark
     {
@@ -205,6 +258,112 @@ namespace
     };
 
 #ifdef HAVE_ROCM
+    /** @brief Inspect and temporarily omit every real router-Q8 producer in a retained graph.
+     * The lease borrows its graph and stream; both outlive restoration. Publication
+     * metadata authenticates capture arguments, never device values or live counts. */
+    class RouterQ8CaptureProof final
+    {
+        HIPGraphCapture &graph_;
+        hipStream_t stream_;
+        std::vector<hipGraphNode_t> producers_;
+        bool omitted_ = false;
+        /** @param status Native inspection outcome. @throws std::runtime_error On failure. */
+        static void require(hipError_t status)
+        {
+            if (status != hipSuccess) throw std::runtime_error("Router Q8 capture inspection failed");
+        }
+        /** @param params Captured kernel ABI. @param index Argument ordinal.
+         * @return Copied immutable argument. @throws std::runtime_error For unsupported ABI. */
+        template<class T> static T argument(const hipKernelNodeParams &params,size_t index)
+        {
+            static_assert(std::is_trivially_copyable_v<T>);
+            if (!params.kernelParams || !params.kernelParams[index] || params.extra)
+                throw std::runtime_error("Router Q8 capture argument ABI is missing");
+            std::array<std::byte,sizeof(T)> bytes;
+            std::memcpy(bytes.data(),params.kernelParams[index],bytes.size());
+            return std::bit_cast<T>(bytes);
+        }
+    public:
+        /** @param graph Actual instantiated parent, including imported timing nodes.
+         * @param stream Exact execution stream. @param publication Real router metadata.
+         * @param live Device-owned live count. @param grouped_ids Grouping authority.
+         * @param rows Physical bucket. @param width Hidden width. @param intermediate GU width.
+         * @param repeats Expected complete operation count. @param native Native GU is selected.
+         * @throws std::runtime_error For missing producers, duplicate quantization or wrong bindings. */
+        RouterQ8CaptureProof(HIPGraphCapture &graph,hipStream_t stream,
+            const MoERouterQ8HiddenPublication &publication,const int *live,const int *grouped_ids,
+            int rows,int width,int intermediate,int repeats,bool native)
+            : graph_(graph),stream_(stream)
+        {
+            if (!graph.graph() || !graph.executable() || !stream ||
+                stream == hipStreamLegacy || stream == hipStreamPerThread ||
+                !publication.capture_recorded || !publication.source_rows || !live ||
+                publication.published_rows != rows || publication.d_model_capacity < width)
+                throw std::runtime_error("Router Q8 proof requires a complete retained publication");
+            size_t count = 0;
+            require(hipGraphGetNodes(graph.graph(),nullptr,&count));
+            std::vector<hipGraphNode_t> nodes(count);
+            require(hipGraphGetNodes(graph.graph(),nodes.data(),&count));
+            int consumers = 0;
+            for (auto node : nodes)
+            {
+                hipGraphNodeType type;
+                require(hipGraphNodeGetType(node,&type));
+                if (type != hipGraphNodeTypeKernel) continue;
+                hipKernelNodeParams params{};
+                require(hipGraphKernelNodeGetParams(node,&params));
+                const char *name = hipKernelNameRefByPtr(params.func,stream);
+                if (!name) throw std::runtime_error("Router Q8 proof has an unnamed kernel");
+                const std::string_view symbol(name);
+                if (symbol.find("moe_prefill_hidden_quantize_rows_kernel") != std::string_view::npos)
+                    throw std::runtime_error("Expert duplicated the router Q8 producer");
+                if (symbol.find("rocm_moe_router_hidden_quantize_q8_rows_kernel") != std::string_view::npos)
+                {
+                    if (argument<const float *>(params,0) != publication.source_rows ||
+                        argument<int8_t *>(params,1) != publication.quantized_rows ||
+                        argument<float *>(params,2) != publication.row_scales ||
+                        argument<int>(params,3) != rows || argument<int>(params,4) != width ||
+                        argument<const int *>(params,5) != live)
+                        throw std::runtime_error("Router Q8 producer bindings changed");
+                    producers_.push_back(node);
+                }
+                if (symbol.find("grouped_wmma_detail") != std::string_view::npos && params.gridDim.z == 2)
+                {
+                    const auto args = argument<rocm::MoEGroupedWmmaArguments>(params,0);
+                    if (args.input != rocm::MoEGroupedWmmaInput::OriginalTokens ||
+                        args.activations != publication.quantized_rows ||
+                        args.activation_scales != publication.row_scales ||
+                        args.group_token_indices != grouped_ids || args.rows != rows ||
+                        args.k != width || args.n != intermediate)
+                        throw std::runtime_error("Native GU does not consume the real router publication");
+                    ++consumers;
+                }
+            }
+            if (producers_.size() != static_cast<size_t>(repeats) || consumers != (native ? repeats : 0))
+                throw std::runtime_error("Router Q8 producer/consumer inventory is incomplete");
+        }
+        /** @brief Restore all producer nodes before the borrowed graph retires. */
+        ~RouterQ8CaptureProof() { restore(); }
+        RouterQ8CaptureProof(const RouterQ8CaptureProof &) = delete;
+        RouterQ8CaptureProof &operator=(const RouterQ8CaptureProof &) = delete;
+        /** @brief Omit every repeated producer; partial mutation is restored by the live lease. */
+        void omit()
+        {
+            if (omitted_) throw std::runtime_error("Router Q8 producer is already omitted");
+            omitted_ = true;
+            for (auto node : producers_) require(hipGraphNodeSetEnabled(graph_.executable(),node,0));
+        }
+        /** @brief Drain the exact stream and restore all producer nodes, including on assertion exit. */
+        void restore() noexcept
+        {
+            if (!omitted_) return;
+            if (hipStreamSynchronize(stream_) != hipSuccess) std::terminate();
+            for (auto node : producers_)
+                if (hipGraphNodeSetEnabled(graph_.executable(),node,1) != hipSuccess) std::terminate();
+            omitted_ = false;
+        }
+    };
+
     /** @brief One retained dot policy; names bind every sample to its row floor. */
     struct GroupedDotCandidate
     {
@@ -215,8 +374,9 @@ namespace
 
     /** @param hybrid Include all explicit whole-expert admission experiments.
      * @param macro Use the separate wide-candidate roster without expanding old suites.
+     * @param router_q8 Include both adaptive native tiles for ordinary-operation comparison.
      * @return Ordered oracle, both pure native tiles and requested hybrid policies. */
-    std::vector<GroupedDotCandidate> groupedDotCandidates(bool hybrid, bool macro)
+    std::vector<GroupedDotCandidate> groupedDotCandidates(bool hybrid, bool macro, bool router_q8)
     {
         using enum rocm::MoEGroupedPrefillEngine;
         using enum rocm::MoEGroupedWmmaRowFloor;
@@ -231,6 +391,11 @@ namespace
                     result.push_back({engine,floor,
                         std::string(engine == WmmaM16N32 ? "N32" : "N64") +
                         "Floor" + std::to_string(static_cast<int>(floor))});
+        if (router_q8)
+        {
+            result.push_back({WmmaM16N32,Sixteen,"N32Floor16"});
+            result.push_back({WmmaM16N64,Sixteen,"N64Floor16"});
+        }
         return result;
     }
 
@@ -296,10 +461,17 @@ namespace
 #endif
 
     /** @brief Reuse production geometry and source preparation for native tournaments.
-     * @param parameter Exact existing model/control case. @param mode Timing or isolated profile owner. */
-    void runExpertPipeline(Case parameter, ExpertBenchmark mode = ExpertBenchmark::Installed)
+     * @param parameter Exact existing model/control case. @param mode Timing or isolated profile owner.
+     * @param publication_mode Complete public operation boundary retained by every candidate. */
+    void runExpertPipeline(Case parameter, ExpertBenchmark mode = ExpertBenchmark::Installed,
+        ExpertPublication publication_mode = ExpertPublication::CanonicalRoutesThenFold)
     {
+        const bool token_publication = publication_mode == ExpertPublication::RouterQ8TokenRows;
+        std::optional<RouterQ8SubmissionObservation> observation;
+        if (token_publication) observation.emplace();
         const bool native = mode != ExpertBenchmark::Installed;
+        if (token_publication && !native)
+            throw std::invalid_argument("Router Q8 token probes require a native tournament mode");
         const bool macro = mode == ExpertBenchmark::WmmaMacroReplay || mode == ExpertBenchmark::WmmaMacroTournament ||
             mode == ExpertBenchmark::WmmaMacroTimingReplay || mode == ExpertBenchmark::WmmaMacroProfile ||
             mode == ExpertBenchmark::WmmaMacroColdProfile;
@@ -323,7 +495,7 @@ namespace
             parameter.live_rows = 64;
         }
 #ifdef HAVE_ROCM
-        const auto dot_candidates = groupedDotCandidates(hybrid,macro);
+        const auto dot_candidates = groupedDotCandidates(hybrid,macro,token_publication);
         if (native)
         {
             initializeROCmHardwareMetadata();
@@ -427,6 +599,29 @@ namespace
             auto input = tensor(parameter.rows, hidden);
             auto ids = tensor(parameter.rows, top_k), probabilities = tensor(parameter.rows, top_k);
             auto output = tensor(parameter.rows, hidden), routes = tensor(parameter.rows * top_k, hidden);
+            // The real router produces original-basis Q8 rows on this exact
+            // stream. Separate router outputs leave the controlled expert route
+            // distribution explicit rather than pretending the router chose it.
+            std::shared_ptr<MoERouterQ8HiddenPublication> router_publication;
+            std::unique_ptr<TensorBase> router_gate, router_ids, router_weights;
+            std::unique_ptr<INT32Tensor> device_live;
+            MoERoutingResult unused_router_result;
+            if (token_publication)
+            {
+                router_gate = tensor(experts,hidden);
+                router_ids = tensor(parameter.rows,top_k);
+                router_weights = tensor(parameter.rows,top_k);
+                device_live = TestTensorFactory::createINT32({1});
+                device_live->mutable_int32_data()[0] = parameter.live_rows;
+                ASSERT_TRUE(device_live->ensureOnDevice(parameter.device,stream));
+                router_publication = std::make_shared<MoERouterQ8HiddenPublication>();
+                ASSERT_TRUE(kernel->bindRouterQ8HiddenPublication(router_publication,
+                    MoERouterQ8PublicationAccess::ProducerAndConsumer));
+                ASSERT_TRUE(kernel->prepareRouteLaunch(router_gate.get(),{
+                    .kind=MoERouteLaunchKind::GroupedPrefill,.physical_rows=parameter.rows,
+                    .d_model=hidden,.num_experts=experts,.top_k=top_k}));
+                std::printf("MOE_OPERATION,router_q8_token_rows,injected_expert_routes,%s\n",parameter.name.c_str());
+            }
             // Retain the complete route matrix: after timing owner-local
             // producers, column-owned down needs these SAME global routes.
             // Inventing new routes there would no longer test the same input.
@@ -463,7 +658,26 @@ namespace
             }
             ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(), route_ids.data(), route_ids.size() * sizeof(float), parameter.device.ordinal, stream));
             ASSERT_TRUE(backend->hostToDevice(probabilities->gpu_data_ptr(), route_weights.data(), route_weights.size() * sizeof(float), parameter.device.ordinal, stream));
+            const auto reuse_count = [&] {
+                double count = 0;
+                for (const auto &record : PerfStatsCollector::snapshot(
+                         {"kernel.rocm_moe_grouped_prefill_router_q8_reuse_calls"}))
+                    if (record.tags.contains("seq_len") && record.tags.at("seq_len") == std::to_string(parameter.rows) &&
+                        record.tags.contains("top_k") && record.tags.at("top_k") == std::to_string(top_k) &&
+                        record.tags.contains("descriptor_source") && record.tags.at("descriptor_source") == "static_table")
+                        count += record.value;
+                return count;
+            };
+            if (token_publication) ASSERT_TRUE(PerfStatsCollector::isDomainEnabled("kernel"));
             auto enqueue = [&] {
+                if (token_publication && !kernel->routeWithTensorsEffectiveSeqLen(
+                        input.get(),router_gate.get(),parameter.rows,hidden,experts,top_k,true,
+                        router_ids.get(),router_weights.get(),unused_router_result,
+                        static_cast<const int *>(device_live->gpu_data_ptr()))) return false;
+                if (token_publication)
+                    return kernel->prepareExpertGroupsAsync(ids.get(),probabilities.get(),parameter.rows,experts,top_k) &&
+                        kernel->executeGroupedPrefillPipeline(input.get(),output.get(),gate_table,down_table,
+                            parameter.rows,hidden,intermediate,experts,top_k,nullptr);
                 return kernel->prepareExpertGroupsAsync(ids.get(), probabilities.get(), parameter.rows, experts, top_k) &&
                     kernel->executeGroupedPrefillPipeline(input.get(), output.get(), gate_table, down_table,
                         parameter.rows, hidden, intermediate, experts, top_k, routes.get()) &&
@@ -484,6 +698,21 @@ namespace
                 ASSERT_TRUE(std::any_of(expected.begin(), expected.end(), [](float value) { return value != 0.0f; }));
             else
                 ASSERT_TRUE(std::all_of(expected.begin(), expected.end(), [](float value) { return value == 0.0f; }));
+            std::vector<unsigned char> expected_q8, expected_scales;
+            if (token_publication)
+            {
+                ASSERT_EQ(router_publication->source_rows,input->gpu_data_ptr());
+                ASSERT_EQ(router_publication->backend,DeviceType::ROCm);
+                ASSERT_EQ(router_publication->device_ordinal,parameter.device.ordinal);
+                expected_q8.resize(static_cast<size_t>(parameter.rows)*hidden);
+                expected_scales.resize(static_cast<size_t>(parameter.rows)*(hidden/32)*sizeof(float));
+                ASSERT_TRUE(backend->deviceToHost(expected_q8.data(),router_publication->quantized_rows,
+                    expected_q8.size(),parameter.device.ordinal,stream));
+                ASSERT_TRUE(backend->deviceToHost(expected_scales.data(),router_publication->row_scales,
+                    expected_scales.size(),parameter.device.ordinal,stream));
+                ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+            }
+            const double reuse_before_capture = token_publication ? reuse_count() : 0;
             auto graph = context.createGraphCapture(stream);
             {
                 ScopedBackendGraphCapture recording(context, *graph, "expert economy complete pipeline");
@@ -633,6 +862,25 @@ namespace
                         graphs[path] = &parent;
                     }
                 }
+                std::vector<std::unique_ptr<RouterQ8CaptureProof>> router_proofs;
+                const double reuse_after_capture = token_publication ? reuse_count() : 0;
+                if (token_publication)
+                {
+                    ASSERT_EQ(router_publication->source_rows,input->gpu_data_ptr());
+                    ASSERT_EQ(router_publication->backend,DeviceType::ROCm);
+                    ASSERT_EQ(router_publication->device_ordinal,parameter.device.ordinal);
+                    ASSERT_EQ(reuse_after_capture-reuse_before_capture,graphs.size()*(profile ? 1 : repeats));
+                    for (size_t path = 0; path < graphs.size(); ++path)
+                    {
+                        auto *captured = dynamic_cast<HIPGraphCapture *>(graphs[path]);
+                        ASSERT_NE(captured,nullptr);
+                        router_proofs.push_back(std::make_unique<RouterQ8CaptureProof>(*captured,
+                            static_cast<hipStream_t>(stream),*router_publication,
+                            static_cast<const int *>(device_live->gpu_data_ptr()),
+                            static_cast<const int *>(workspace.getBuffer(MoEWorkspaceBuffers::GROUP_TOKEN_INDICES)),
+                            parameter.rows,hidden,intermediate,profile ? 1 : repeats,path != 0));
+                    }
+                }
                 if (timing_replay)
                     for (auto *candidate : graphs)
                     {
@@ -669,9 +917,36 @@ namespace
                         if (!bank || !bytes || hipMemsetAsync(bank,0xa5,bytes,static_cast<hipStream_t>(stream)) != hipSuccess)
                             throw std::runtime_error("grouped WMMA scratch poison failed");
                     }
+                    if (token_publication)
+                        for (const char *name : {MoEWorkspaceBuffers::ROCM_ROUTER_Q8_HIDDEN,
+                                                MoEWorkspaceBuffers::ROCM_ROUTER_Q8_SCALES})
+                            if (!workspace.getBuffer(name) || !workspace.getBufferSize(name) ||
+                                hipMemsetAsync(workspace.getBuffer(name),0xa5,workspace.getBufferSize(name),
+                                    static_cast<hipStream_t>(stream)) != hipSuccess)
+                                throw std::runtime_error("router Q8 publication poison failed");
                     if (hipMemsetAsync(output->gpu_data_ptr(),0xa5,output->numel()*sizeof(float),static_cast<hipStream_t>(stream)) != hipSuccess ||
                         hipMemsetAsync(routes->gpu_data_ptr(),0xa5,routes->numel()*sizeof(float),static_cast<hipStream_t>(stream)) != hipSuccess)
                         throw std::runtime_error("grouped WMMA publication poison failed");
+                };
+                const auto verify_q8_publication = [&](int live) {
+                    if (!token_publication) return;
+                    std::vector<unsigned char> q8(expected_q8.size()), scales(expected_scales.size());
+                    const auto drain_q8 = [&](void *) {
+                        if (!backend->synchronizeStream(stream,parameter.device.ordinal)) std::terminate();
+                    };
+                    std::unique_ptr<void,decltype(drain_q8)> q8_retirement(&context,drain_q8);
+                    ASSERT_TRUE(backend->deviceToHost(q8.data(),router_publication->quantized_rows,
+                        q8.size(),parameter.device.ordinal,stream));
+                    ASSERT_TRUE(backend->deviceToHost(scales.data(),router_publication->row_scales,
+                        scales.size(),parameter.device.ordinal,stream));
+                    ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                    const size_t active_q8 = static_cast<size_t>(live)*hidden;
+                    const size_t active_scales = static_cast<size_t>(live)*(hidden/32)*sizeof(float);
+                    ASSERT_EQ(std::memcmp(q8.data(),expected_q8.data(),active_q8),0);
+                    ASSERT_EQ(std::memcmp(scales.data(),expected_scales.data(),active_scales),0);
+                    ASSERT_TRUE(std::all_of(q8.begin()+active_q8,q8.end(),[](auto v) { return v == 0xa5; }));
+                    ASSERT_TRUE(std::all_of(scales.begin()+active_scales,scales.end(),[](auto v) { return v == 0xa5; }));
+                    ASSERT_EQ(reuse_count(),reuse_after_capture);
                 };
                 const auto verify = [&](int live) {
                     auto replay_ids = route_ids;
@@ -681,6 +956,9 @@ namespace
                     std::unique_ptr<void,decltype(drain_publication)> publication_retirement(&context,drain_publication);
                     for (size_t i = static_cast<size_t>(live)*top_k; i < replay_ids.size(); ++i) replay_ids[i] = -1.0f;
                     ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(),replay_ids.data(),replay_ids.size()*sizeof(float),parameter.device.ordinal,stream));
+                    if (token_publication)
+                        ASSERT_TRUE(backend->hostToDevice(device_live->gpu_data_ptr(),&live,sizeof(live),
+                            parameter.device.ordinal,stream));
                     auto reference = expected;
                     std::fill(reference.begin() + static_cast<size_t>(live)*hidden,reference.end(),0.0f);
                     for (size_t path = 0; path < graphs.size(); ++path)
@@ -696,10 +974,32 @@ namespace
                         ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
                         ASSERT_EQ(std::memcmp(reference.data(),actual.data(),actual.size()*sizeof(float)),0)
                             << "path=" << path << " live=" << live;
+                        ASSERT_NO_FATAL_FAILURE(verify_q8_publication(live));
                     }
                 };
                 for (int live : {parameter.live_rows,0,1,std::min(8,parameter.live_rows),parameter.live_rows})
                 { ASSERT_NO_FATAL_FAILURE(verify(live)); }
+                if (token_publication)
+                    for (size_t path = 0; path < graphs.size(); ++path)
+                    {
+                        router_proofs[path]->omit();
+                        poison();
+                        ASSERT_TRUE(graphs[path]->launch());
+                        ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),
+                            actual.size()*sizeof(float),parameter.device.ordinal,stream));
+                        ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                        ASSERT_NE(std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float)),0);
+                        router_proofs[path]->restore();
+                        for (int restored = 0; restored < 2; ++restored)
+                        {
+                            poison();
+                            ASSERT_TRUE(graphs[path]->launch());
+                            ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),
+                                actual.size()*sizeof(float),parameter.device.ordinal,stream));
+                            ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                            ASSERT_EQ(std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float)),0);
+                        }
+                    }
                 for (int warmup = 0; warmup < 5; ++warmup)
                     for (auto *candidate : graphs) ASSERT_TRUE(candidate->launch());
                 if (profile)
@@ -726,6 +1026,42 @@ namespace
                 const auto verify_both_writers = [&] {
                     std::vector<int> counts(experts);
                     for (float id : route_ids) if (id >= 0) ++counts[static_cast<int>(id)];
+                    if (token_publication)
+                    {
+                        int mixed_policies = 0;
+                        for (size_t path = 3; path < graphs.size(); ++path)
+                        {
+                            const int floor = static_cast<int>(dot_candidates[path].floor);
+                            if (!std::any_of(counts.begin(),counts.end(),[&](int n) { return n >= floor; }) ||
+                                !std::any_of(counts.begin(),counts.end(),[&](int n) { return n > 0 && n < floor; })) continue;
+                            ++mixed_policies;
+                            auto *capture = dynamic_cast<HIPGraphCapture *>(graphs[path]);
+                            ASSERT_NE(capture,nullptr);
+                            ROCmGroupedBranchMutation mutation(*capture,static_cast<hipStream_t>(stream));
+                            for (auto omitted : {rocm::MoEGroupedBranchSuppression::Ordered,rocm::MoEGroupedBranchSuppression::Wmma})
+                            {
+                                mutation.suppress(omitted);
+                                poison();
+                                ASSERT_TRUE(graphs[path]->launch());
+                                ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),
+                                    actual.size()*sizeof(float),parameter.device.ordinal,stream));
+                                ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                                ASSERT_NE(std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float)),0);
+                                mutation.restore();
+                                for (int restored = 0; restored < 2; ++restored)
+                                {
+                                    poison();
+                                    ASSERT_TRUE(graphs[path]->launch());
+                                    ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),
+                                        actual.size()*sizeof(float),parameter.device.ordinal,stream));
+                                    ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                                    ASSERT_EQ(std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float)),0);
+                                }
+                            }
+                        }
+                        ASSERT_GT(mixed_policies,0);
+                        return;
+                    }
                     std::vector<float> reference_routes(routes->numel()), observed_routes(routes->numel());
                     const auto drain_observations = [&](void *) {
                         if (!backend->synchronizeStream(stream,parameter.device.ordinal)) std::terminate();
@@ -864,6 +1200,7 @@ namespace
                         ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
                         ASSERT_EQ(std::memcmp(reference.data(),actual.data(),actual.size()*sizeof(float)),0)
                             << dot_candidates[path].name << " live=" << live;
+                        ASSERT_NO_FATAL_FAILURE(verify_q8_publication(live));
                     }
                     if (timing_replay) continue;
                     for (int sample = 0; sample < sample_count; ++sample)
@@ -885,7 +1222,7 @@ namespace
                 }
                 ASSERT_NO_FATAL_FAILURE(verify(0));
                 ASSERT_NO_FATAL_FAILURE(verify(parameter.live_rows));
-                if (timing_replay) return;
+                if (timing_replay || token_publication) return;
             }
 #endif
             std::array<float, 9> samples{};
@@ -1215,6 +1552,15 @@ namespace
     /** @test Authenticate actual imported wide timing nodes through dirty threshold replays. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_MacroCapturedTimingReplay)
     { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaMacroTimingReplay); }
+    /** @test Replay ordinary router-Q8/direct-token publication through retained thresholds. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_RouterQ8TokenReplay)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaMacroTimingReplay,ExpertPublication::RouterQ8TokenRows); }
+    /** @test Time real routing, injected expert grouping and direct token publication together. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_RouterQ8TokenTournament)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaMacroTournament,ExpertPublication::RouterQ8TokenRows); }
+    /** @test Profile one native direct-token operation including its real router producer. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_RouterQ8TokenProfile)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaMacroProfile,ExpertPublication::RouterQ8TokenRows); }
     /** @test Isolate one complete full-capacity wide candidate for exact profiling. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_IsolatedMacroProfile)
     { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaMacroProfile); }

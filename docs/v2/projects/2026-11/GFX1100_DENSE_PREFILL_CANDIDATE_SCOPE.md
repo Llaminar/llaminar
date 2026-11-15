@@ -145,8 +145,8 @@ Collection uses actual gfx1100 HIP5/PCI0000:b5:00.0, two M cells per retained
 weight batch. Per-batch receipts bind original producer/artifact hashes and
 retain the observer's activity reports. Rejected attempts remain archived;
 isolation receipts are no longer an acceptance gate under the user's scope.
-Collection, kernel profiling, generated installation and rebuilt Auto qualification are
-distinct gates. No broader exact rows are installed at this tooling checkpoint.
+Collection, kernel profiling, generated installation and rebuilt Auto qualification
+are distinct gates; all four are now complete for this declared84-cell scope.
 
 The original run completed all 84 cells in 42 accepted batches; three
 observed-overlap batches were rejected and recollected. The user accepts this
@@ -164,13 +164,31 @@ means across each 17-key group are:
 `decisions.json` and `candidate-summary.csv` retain the complete inventory;
 its digest is
 `sha256:bdfdb4906f49c60e1d1e0f7eb333d26db4c4117a9ba1431366465e393a226ead`.
-There are 168 original-alias winner/baseline profile obligations. The initial
-Q4_0/M512/QKV winner pilot passes eight trace/counter passes, authenticates
-activation quantization plus native WMMA, reports zero scratch and positive
-activity, and restores AUTO power after STABLE_STD. This pilot does not certify
-the remaining requests. The original124 completed profile obligations are
-accepted;44 of168 remain. Complete those profiles and rebuilt Auto qualification
-before claiming the broader installed policy; no broader rows have been installed.
+All168 original-alias winner/baseline profile obligations are complete and pass
+the canonical publication validator. Activation quantization and the selected
+native producer are authenticated separately from canonical timings; power-state
+restoration remains part of each counter record.
+
+The selective emitter adds68 keys and retains616 original entries, for684 total.
+The generated include SHA256 is
+`3cb0480cc4cbe3f0e4f617c9c8d6c1da6e9bafe11fb5c5d8e3ee8659f740863b`;
+`dense-broader-install-receipt.json` binds the unchanged decision digest and base.
+Both normal HIP architecture builds pass.15 device-free policy/ownership cases
+and all12 installed-source replay groups pass against the rebuilt table. Rebuilt
+actual-Auto timing is complete for all84 source cells. Every cell is faster than
+its original Auto median: gains range from1.22653 to2.05860×, with geometric mean
+1.39951× across the84 original source cells. Each retains31 samples of16 captured
+complete operations, observed selected launch and zero local-memory resource
+witnesses. The collector admits only the expected compiled684-row inventory and
+exact native producer; it does not substitute a forced candidate for Auto.
+
+The accepted result is
+`/tmp/llaminar-gfx1100-wmma-prefill-evidence/dense-installed-auto-accepted/campaign.json`,
+schema `dense-installed-auto-accepted-campaign-v1`, producer SHA256
+`ae674bfc6e31db7e5b7f3d2ba81f0f0b028e39011339cb6091ff032df8bc6bdf`.
+It records complete=true, all_faster_than_original_auto=true and restored AUTO
+power. This closes rebuilt-Auto qualification for the finite scope above; it
+makes no claim about other geometries, a full model benchmark or full preflight.
 
 The six focused registered integration checks all pass in 12.94s, including the
 compiled policy query, actual loader ownership replay, overlay admission,
@@ -180,35 +198,9 @@ This is the authorized focused suite, not full preflight execution.
 
 ## Superseded isolation-only recollection
 
-The local timing and profiling monitors recognized `llaminar` but omitted the
-actual `llaminar2` executable. Their sparse match logs cannot establish absence
-of that work. Independent foreign process records prove overlap for 30 of the
-124 accepted counter records. The other 94 retain valid native artifacts but
-lack complete isolation evidence. No overlap was demonstrated for the 84 timing
-cells. These audit observations remain recorded; the user has explicitly removed
-isolation proof as an acceptance condition for this task. The original timing
-and completed profile evidence is usable without isolation-only recollection.
-
-`dense-broader-llaminar2-isolation-audit.json` binds exact own receipt intervals,
-request IDs, foreign process ancestry, PID/start ticks and original file hashes
-(SHA256 `c6537d48b394d766d85a9b414a269e0fefec1a07684caa4773bf1f0133d4d7d7`).
-The original corpus, its68 selected additions and proposed684-row composed policy
-remain the active evidence and publication inputs. The monitor defect is in local
-tooling; the production dispatch and frozen native Release producer are unchanged.
-
-The isolation-only replacement generation `dense-broader-qkv-isolated-v2/` is
-canceled as a task requirement. Preserve any observations already collected;
-they do not replace the original plan, decisions or requests automatically.
-Finish the original44 remaining profile obligations, publish the selected policy
-and collect actual installed-Auto observations with the rebuilt producer.
-
-The replacement collector retains complete compressed process snapshots and
-synchronous start/end observations. It rejects malformed or empty observations,
-a missing observer owner, duplicate PIDs, monitor exceptions, native failures,
-changed producers and incomplete retirement. Six focused device-free monitor
-regressions pass. Each two-M batch runs under the canonical native guardian;
-immutable raw attempts survive, and the common CSV/manifest validators own cell
-promotion. A Sol 6.1 review found no remaining launch blocker after the parser
-and exact resume-batch joins were corrected. These tooling improvements and
-retained artifacts do not create an isolation requalification work item. The
-[superseded audit](GFX1100_PREFILL_ISOLATION_REQUALIFICATION.md) records the scope decision.
+The user removed isolation receipts and isolation-only recollection from this
+task's acceptance conditions. The original timing/profile artifacts remain
+usable and unchanged. The replacement generation is canceled; historical audit
+and partial replacement artifacts are retained locally. See the
+[superseded audit](GFX1100_PREFILL_ISOLATION_REQUALIFICATION.md) for the original
+investigation. No remaining work depends on that audit or its monitors.

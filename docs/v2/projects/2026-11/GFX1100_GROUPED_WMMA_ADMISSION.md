@@ -61,7 +61,8 @@ reference. Poisoned scratch, public output and canonical routes prevent stale
 storage from supplying missing work. The Qwen power-law cases carry the same
 independent omitted-writer controls.
 
-Focused registrations are `V2_Integration_ROCmGroupedWmmaReplay`,
+Focused registrations are `V2_Integration_ROCmGroupedWmmaN32Replay`, `V2_Integration_ROCmGroupedWmmaN64Replay` and
+`V2_Integration_ROCmGroupedWmmaBoundaryReplay`,
 `V2_Integration_ROCmGroupedWmmaSplitReplay`,
 `V2_Integration_ROCmGroupedWmmaHybridReplay` and
 `V2_Integration_ROCmGroupedWmmaHybridAllCodebooksReplay`. All are explicitly in
@@ -554,6 +555,40 @@ SHA256 `838520de0f33e8dd92be6bdb3e446baab23e2a23c1f5a6e92bddab01465da68d`.
 Build, source, loaded-code, profile and numerical evidence remain bound to this
 explicit fenced producer; profiler durations are not canonical latency labels.
 
-Bounded-workloop diagnostics under `/tmp` compile but increase register use.
-The separate local-thread-id variant is also diagnostic. Neither experiment
-changes production dispatch or supplies a measured performance claim.
+## Rejected bounded worker grid
+
+A bounded candidate flattened column/directory work into at most511 physical
+workers per role. An iteration-local thread-id fence reduced adaptive IQ2_S
+registers to57 for gate/up and68 for down. Both shipped HIP targets compiled;
+all72 native variants had zero private storage, memory spills and scratch
+instructions. These resource improvements did not produce a complete-operation
+win. The final five-case tournament retained10,540 native-event samples:
+
+| Full-live operation | Dot4 / N32 | Dot4 / bounded wide |
+|---|---:|---:|
+| Qwen uniform |1.3070×|0.9809×|
+| Qwen hotset |1.1711×|0.8650×|
+| Qwen power law |1.0541×|0.8569×|
+| Compact Q4_0 |1.0517×|0.8231×|
+| Compact IQ2_S |1.0398×|0.7912×|
+
+The candidate passed19 Unit cases, four Release smokes and162 native cases
+across11 focused registrations (260.27s). A larger mixed-format case explicitly
+crossed the worker bound. The former combined45-case native registration timed
+out during setup; disjoint N32, N64 and boundary registrations preserve all
+cases and the120-second limit. ANSI escape normalization repaired the evidence
+reader against saved successful logs; it did not rerun or alter native results.
+
+The loop and its candidate-specific geometry checks were removed. The restored
+Release grouped HIP object has SHA256
+`24dcfb5317904196cbfb5c2212ccbb76c8afc092a4a3ebc502751d4a1955cb2d`, identical to
+the previously profiled fence. The rejected candidate's70-file archive is
+`grouped-persistent-producer-snapshot/snapshot.json`, SHA256
+`9874c15ce4c5bb90b991557abe8c9487b620d70538045efe29fce55660dc5d57`.
+`grouped-persistent-rejection.json` and `grouped-persistent-summary.json` retain
+its decision and samples. No runtime-counter qualification is claimed for it.
+
+The next qualification measures the actual ordinary router-Q8/direct-token
+operation with all-local routes. See the
+[operation proof](GFX1100_GROUPED_PREFILL_OPERATION_PROOF.md). Canonical route
+publication with half the experts local remains a separate component control.
