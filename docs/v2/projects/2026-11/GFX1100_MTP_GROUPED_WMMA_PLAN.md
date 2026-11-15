@@ -1,6 +1,7 @@
 # gfx1100 WMMA for grouped MTP decode
 
-Status: added to the active WMMA work list on 2026-11-14 at the user's request.
+Status: active implementation; the standalone grouped epilogue prerequisite is
+qualified on 2026-11-15 by focused replay, feature and counter evidence.
 This implementation plan extends the [prefill campaign](GFX1100_PREFILL_WMMA.md)
 and the [MTP project plan](../2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md).
 It records source-audit findings and pending work, not a performance certificate.
@@ -60,16 +61,14 @@ timing is exploratory evidence. The model-loading `V2_Perf_DenseVerifierRows_ROC
 M2/3/4 gate follows component qualification. Register the focused native replay
 explicitly in production preflight before treating this slice as complete.
 
-The standalone verifier epilogue also needs a focused regression. Its current
-native grouped admission requires beta zero and unmapped output. Nonzero beta
-or mapped output enters a host row loop in a fully active verifier scope;
-with an explicit multi-row `DeviceRowRange`, its first one-row quantizer instead
-rejects the mismatched physical geometry. Neither behavior certifies grouped
-execution. Implement the count-aware grouped combine using persistent workspace
-and the original row authority, and test alpha, beta and bias against independent
-serial rows while preserving inactive output bytes. Existing M1 alpha/beta tests
-and fused per-column bias tests do not cover this defect. New WMMA candidate
-admission must never silently enter that row loop.
+The standalone grouped epilogue prerequisite is implemented. Nonzero beta and
+mapped output now use one grouped producer and a count-aware persistent-scratch
+combine; the production serial-row loop is removed. Four captured replay cases
+pass in Release and Integration, and the affected all-format/device-counted
+feature suite passes. Request holes, a nonzero subview origin and bit-preserving
+mapped copies have explicit regressions. Full-target compilation reports zero
+spills; all 28 exact counter passes completed. See the [repair proof and evidence](GFX1100_MTP_VERIFIER_EPILOGUE.md).
+This prerequisite does not establish a WMMA verifier candidate or speedup.
 
 Implementation seams are the standalone, homogeneous-batched and mixed-batched
 `rocmLaunch_native_quantised_small_m_*` functions in
@@ -84,18 +83,24 @@ Add a typed verifier candidate scope separate from the prefill override, and
 reject incompatible forcing before recording graph nodes. The current WMMA
 body uses four waves and `RM=BM/32`; an M16 enum alone would create zero row
 fragments. An economical M16 candidate needs an explicit two-wave mapping while
-sharing decoder and commit helpers. The existing combine epilogue also needs
-the enclosing verifier prefix forwarded explicitly: its current
-`dispatchProjectionRows(M, nullptr)` only inherits `ProjectionRowWork`.
+sharing decoder and commit helpers. The repaired combine epilogue already
+forwards both the verifier prefix and independent request-work authority.
 
-The smallest epilogue regression is Q4_0 M3/N17/K32 with nonzero initial output,
-alpha, beta and bias, replaying live3,1,0,2 through one captured graph. Add mapped
-output, independent production M1 byte oracles, inactive-byte preservation and
-actual grouped-symbol/launch-count checks. Register it explicitly in production
-preflight; do not infer this coverage from the larger source-format sweep.
+The first producer should use a dedicated wave64 translation unit and M16/N64
+tile: two waves own columns 0–31 and 32–63, with two column fragments per wave.
+Retain one CTA per canonical serial-M1 K partition and the existing ordered
+reducer. Each partition writes the established `[P, physical_tile_M, N]` scratch
+layout; P1 publishes directly. This retains K parallelism at shallow M and keeps
+the existing TN64 fused-bundle column offsets. Original request intervals drive
+bounded row cursors before weight decoding; tails must not read or write inactive
+rows. A later N32 candidate needs its own producer geometry, rather than reusing
+TN64 bundle offsets. Existing prefill entrypoints and candidate selection remain
+separate from this verifier implementation.
 
 ## Implementation work list
 
+- [x] Remove standalone beta/mapped verifier row replay; prove grouped combine
+  correctness, original row ownership and inactive-byte preservation.
 - [ ] Freeze a source-owned operation/format/geometry inventory and baseline the
   actual captured ROCm verifier path. Include dense QKV, attention output,
   gate/up, SwiGLU/down, shared experts, GDN projections and selected LM-head rows;
@@ -158,5 +163,6 @@ preflight; do not infer this coverage from the larger source-format sweep.
    host scheduling state. Authenticate installed Automatic with fresh timing
    and replay evidence instead of relabeling forced-candidate observations.
 
-Current result: the source audit establishes the gap. No new MTP WMMA producer,
-installed policy or MTP speedup has been qualified by this work-list update.
+Current result: the grouped epilogue prerequisite passes its focused correctness
+and feature gates. No new MTP WMMA producer, installed verifier policy or MTP
+speedup has been qualified; those remain the active implementation work.

@@ -20895,6 +20895,17 @@ if(HAVE_ROCM)
         MPI_PROCS 1
         NO_MODELS
     )
+    add_executable(v2_integration_rocm_verifier_epilogue_replay
+        integration/kernels/rocm/Test__ROCmVerifierEpilogueReplay.cpp)
+    target_link_libraries(v2_integration_rocm_verifier_epilogue_replay
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_EpilogueReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_verifier_epilogue_replay>
+                --gtest_filter=ROCmVerifierEpilogueReplay.*
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;MTP;GroupedVerifierRows;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+    )
     # Capacity attribution reuses the functional byte oracle but stays outside
     # production preflight, exactly like the CUDA economy registration.
     add_executable(v2_perf_rocm_device_counted_verifier_rows
@@ -30214,6 +30225,7 @@ if(HAVE_ROCM)
     V2_Integration_GroupedVerifierRows_ROCm_Embedding
     V2_Integration_ROCmEmbeddingNativeSourcePreservation
     V2_Integration_ROCm_DeviceCountedVerifierRows
+    V2_Integration_GroupedVerifierRows_ROCm_EpilogueReplay
     V2_Integration_GroupedVerifierRows_ROCm_AllFormats
     V2_Integration_ROCmActivationQuantization
     V2_Integration_Q8FiniteScaleContract_ROCm

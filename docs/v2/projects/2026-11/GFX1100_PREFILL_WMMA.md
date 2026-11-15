@@ -9,6 +9,7 @@ Attention additionally requires linear complete-operation scaling through 64K
 KV tokens with the query bucket held fixed, as explicitly confirmed by the user.
 The added [MTP grouped-decode work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md) covers
 missing dense WMMA producers and verifier qualification of routed/router/attention paths.
+The [grouped epilogue prerequisite](GFX1100_MTP_VERIFIER_EPILOGUE.md) passes four replay cases in both builds, the affected feature suite and 28 exact counter checks.
 Floating half-operand GEMM is an additional confirmed gap in the sampled vendor
 path: its actual loaded gfx1100 code object uses vector mixed-FP16 FMA, not WMMA.
 The earlier two-anchor NativeQuantised objective is documented separately in

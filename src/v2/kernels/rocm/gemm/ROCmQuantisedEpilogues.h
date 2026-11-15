@@ -40,4 +40,23 @@ bool rocmQuantGemm_applyFp32Epilogue(float* output,const float* bias,int M,int N
  */
 bool rocmQuantGemm_applyFp32Epilogue_rows(float* output,const float* bias,int M,int N,
     float alpha,int device,void* stream,const llaminar2::DeviceRowRange* rows);
+/**
+ * @brief Combine a persistent computed matrix with its original output rows.
+ * @param computed Borrowed computed FP32 matrix [M,N], distinct from existing for beta.
+ * @param output Final destination [M,N], which may alias computed or existing.
+ * @param existing Original output [M,N], required when beta is nonzero.
+ * @param bias Optional original column bias [N], added after the beta contribution.
+ * @param M Positive physical row extent; never a downloaded live count.
+ * @param N Positive output width; M*N must fit the native INT32 index program.
+ * @param alpha Computed-result multiplier, preceding beta and bias arithmetic.
+ * @param beta Existing-output multiplier; zero does not read existing.
+ * @param device Exact owning ROCm device ordinal.
+ * @param stream Exact non-default stream ordered after the computed producer.
+ * @param rows Optional original prefix authority, also inherited by explicit request work.
+ * @return Native submission result; inactive rows have no reads or writes.
+ * @throws std::invalid_argument For invalid geometry, stream or prefix extent.
+ */
+bool rocmQuantGemm_applyFp32CombineEpilogue(const float* computed,float* output,
+    const float* existing,const float* bias,int M,int N,float alpha,float beta,
+    int device,void* stream,const llaminar2::DeviceRowRange* rows=nullptr);
 }

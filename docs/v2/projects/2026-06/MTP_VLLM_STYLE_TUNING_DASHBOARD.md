@@ -3,9 +3,9 @@
 Serving frontier: 2026-10-09, hybrid PP(TP(2 ROCm), TP(2 CUDA)). Keep below 200 lines and 15,000 bytes;
 history: [October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md) and [project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md).
 
-gfx1100 WMMA, 2026-11-14: grouped decode exists, but dense uses Dot4 and routed WMMA candidates have no installed Automatic selection.
-Implementation and verifier qualification are now on the [WMMA work list](../2026-11/GFX1100_MTP_GROUPED_WMMA_PLAN.md);
-no MTP WMMA performance claim is established.
+gfx1100 MTP, 2026-11-15: grouped beta/mapped epilogue repair passes four replay cases in both builds and the affected feature suite.
+The [WMMA work list](../2026-11/GFX1100_MTP_GROUPED_WMMA_PLAN.md) still needs actual verifier producers and measured selection;
+installed M512 prefill dispatch does not certify MTP WMMA or a verifier speedup.
 
 GDN integration, 2026-10-26: `e2c971301` pushed; full prerequisites2841pass/29skip, post-packaging Unit782/782 and five loader checks pass.
 Matched Qwen3.6 ROCm decode improves10–15%; CUDA is flat with683MiB less workspace. CPU counter batching gains5.91%. [Limits and evidence](../2026-10/GDN_FIXED_EPOCH_BACKEND_PORT_PLAN.md).

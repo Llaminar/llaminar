@@ -288,15 +288,6 @@ namespace llaminar2
                 const float *d_bias,
                 int rocm_device_id, void *stream);
 
-            bool rocmQuantGemm_applyFp32CombineEpilogue(
-                const float *d_computed,
-                float *d_output,
-                const float *d_existing,
-                const float *d_bias,
-                int M, int N,
-                float alpha, float beta,
-                int rocm_device_id, void *stream);
-
             // In-place bias addition: output[m,n] += bias[n] (common .hip)
             bool rocmQuantGemm_biasAdd(
                 float *d_output,     // [M × N] FP32 output (modified in-place)
@@ -2878,9 +2869,17 @@ namespace llaminar2
 
                 const bool supports_native_small_m =
                     impl_->has_native_quantised && (m >= 2 || countedVerifierRows(m));
-                if (supports_native_small_m &&
-                    !gemv_output_needs_copyout && beta == 0.0f)
+                if (supports_native_small_m)
                 {
+                    // Preserve the original output for beta. Mapped destinations
+                    // receive one coalesced, row-admitted combine/copy after the
+                    // grouped producer; capacity-wide DMA would overwrite dead rows.
+                    float *grouped_output = gemv_output_needs_copyout ? impl_->d_C_fp32 : d_output;
+                    if (gemv_output_needs_copyout &&
+                        (!grouped_output || grouped_output == d_output ||
+                         workspace_->getBufferSize(GemmWorkspaceBuffers::TEMP_C_FP32) <
+                             static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(float)))
+                        throw std::invalid_argument("Grouped verifier epilogue requires distinct full-capacity persistent FP32 scratch");
                     if ((k % 32) != 0)
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] NativeQuantised small-M verifier requires K multiple of 32, got M="
@@ -2908,7 +2907,7 @@ namespace llaminar2
                             impl_->d_weights_native_scales,
                             impl_->d_weights_native_mins,
                             impl_->d_weights_native_emins,
-                            d_output,
+                            grouped_output,
                             impl_->d_scales_A_blockwise,
                             impl_->d_sums_A_blockwise,
                             impl_->d_scatter_partial,
@@ -2924,7 +2923,18 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (alpha != 1.0f || d_bias)
+                    if (gemv_output_needs_copyout)
+                    {
+                        if (!rocmQuantGemm_applyFp32CombineEpilogue(
+                                grouped_output, d_output, beta != 0.0f ? d_output : nullptr,
+                                d_bias, m, n, alpha, beta, rocm_device_id_, gpu_stream_,
+                                VerifierKernelModeScope::rowsFor(m)))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Grouped verifier combine/copy failed");
+                            return false;
+                        }
+                    }
+                    else if (alpha != 1.0f || d_bias)
                     {
                         if (!applyFp32EpilogueScoped(
                                 d_output,
@@ -2975,132 +2985,8 @@ namespace llaminar2
                     return true;
                 }
 
-                for (int row = 0; row < m; ++row)
-                {
-                    const float *d_input_row = d_input + static_cast<size_t>(row) * k;
-                    float *d_output_row = d_output + static_cast<size_t>(row) * n;
-                    float *d_gemv_output = gemv_output_needs_copyout ? impl_->d_C_fp32 : d_output_row;
-
-                    if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
-                            d_input_row,
-                            impl_->d_A_int8,
-                            impl_->d_scales_A_blockwise,
-                            1,
-                            k,
-                            rocm_device_id_,
-                            gpu_stream_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M blockwise activation quantization failed at row "
-                                  << row);
-                        return false;
-                    }
-
-                    if (impl_->has_native_quantised)
-                    {
-                        if (!rocmGemv_native_quantised_fp32_with_policy(
-                                impl_->d_A_int8,
-                                impl_->d_weights_native_quantised,
-                                impl_->d_weights_native_scales,
-                                impl_->d_weights_native_mins,
-                                impl_->d_weights_native_emins,
-                                d_gemv_output,
-                                impl_->d_scales_A,
-                                impl_->d_scatter_partial,
-                                n, k,
-                                impl_->native_quantised_codebook_id,
-                                requireNativeQuantisedArithmeticPolicyCodebook(
-                                    impl_->native_quantised_codebook_id,
-                                    impl_->native_source_identity),
-                                rocm_device_id_, gpu_stream_,
-                                impl_->d_scales_A_blockwise))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-quantised GEMV failed at row "
-                                      << row);
-                            return false;
-                        }
-
-                        if (beta != 0.0f)
-                        {
-                            if (!rocmQuantGemm_applyFp32CombineEpilogue(
-                                    d_gemv_output,
-                                    d_gemv_output,
-                                    d_output_row,
-                                    d_bias,
-                                    1,
-                                    n,
-                                    alpha,
-                                    beta,
-                                    rocm_device_id_,
-                                    gpu_stream_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-quantised beta epilogue failed at row "
-                                          << row);
-                                return false;
-                            }
-                        }
-                        else if (alpha != 1.0f || d_bias)
-                        {
-                            if (!rocmQuantGemm_applyFp32Epilogue(
-                                    d_gemv_output,
-                                    d_bias,
-                                    1,
-                                    n,
-                                    alpha,
-                                    rocm_device_id_,
-                                    gpu_stream_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-quantised epilogue failed at row "
-                                          << row);
-                                return false;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        const float *d_existing = (beta != 0.0f) ? d_output_row : nullptr;
-                        bool int8_decode_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
-                            impl_->d_A_int8, d_weights_vnni, d_gemv_output,
-                            impl_->d_scales_A_blockwise, d_scales_B,
-                            n, k,
-                            alpha, beta,
-                            d_existing, d_bias,
-                            rocm_device_id_, gpu_stream_);
-
-                        if (!int8_decode_ok)
-                        {
-                            int8_decode_ok = rocmGemv_int8_scatter_vnni_blockwise(
-                                impl_->d_A_int8, d_weights_vnni, d_gemv_output, impl_->d_scales_A_blockwise, d_scales_B, d_bias,
-                                impl_->d_scatter_partial, impl_->d_selfreduce_counters,
-                                n, k, alpha, beta, d_existing,
-                                rocm_device_id_, gpu_stream_);
-                        }
-
-                        if (!int8_decode_ok)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M INT8 GEMV failed at row "
-                                      << row);
-                            return false;
-                        }
-                    }
-
-                    if (gemv_output_needs_copyout)
-                    {
-                        const hipError_t copy_err = hipMemcpyAsync(
-                            d_output_row,
-                            impl_->d_C_fp32,
-                            static_cast<size_t>(n) * sizeof(float),
-                            hipMemcpyDeviceToDevice,
-                            static_cast<hipStream_t>(gpu_stream_));
-                        if (copy_err != hipSuccess)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M GEMV output copy failed at row "
-                                      << row << ": " << hipGetErrorString(copy_err));
-                            return false;
-                        }
-                    }
-                }
-                publishROCmTensorWrite(*C, rocm_device_id_, gpu_stream_);
-                return true;
+                throw std::invalid_argument(
+                    "Grouped ROCm verifier projection requires prepared NativeQuantised weights");
             }
 
             if (m == 1 && !countedVerifierRows(m))
@@ -6419,7 +6305,7 @@ namespace llaminar2
                 throw std::runtime_error(
                     "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ACC_INT32");
             }
-            // Shared FP32 temp buffers (used by serial paths only)
+            // Persistent FP32 temporaries also own grouped verifier combine/copy.
             if (!workspace_->hasBuffer(GemmWorkspaceBuffers::TEMP_A_FP32))
             {
                 throw std::runtime_error(
