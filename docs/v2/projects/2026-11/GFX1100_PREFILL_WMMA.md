@@ -7,10 +7,10 @@ experts, attention, and Q8 router logits. Each requires production-path componen
 correctness, captured replay, unprofiled Release timing and kernel profiling.
 Attention additionally requires linear complete-operation scaling through 64K
 KV tokens with the query bucket held fixed, as explicitly confirmed by the user.
-The added [MTP work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md) now has native producers
-and exact-hosted IQ4_XS Auto selection:72 M5–16 cells win1.032–1.618×; M2–4 keeps Dot4.
-Release149 native +7 epilogue cases, five ROCm and six host registrations pass;
-broader verifier operation/codebook qualification remains open.
+The added [MTP work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md) has all21-source exact-hosted
+Auto timing:1,264 native wins/1,890 cells (1.002–2.005×);626 keys keep Dot4.
+Release171 native cases, five focused ROCm registrations and all168 per-source
+profiles pass with zero memory spills. Broader verifier operations/router admission remain open.
 rocBLAS remains the half-operand implementation: three custom WMMA variants lost
 every measured cell. [Investigation and deferral](GFX1100_HALF_OPERAND_PREFILL_INVESTIGATION.md).
 The earlier two-anchor NativeQuantised objective is documented separately in

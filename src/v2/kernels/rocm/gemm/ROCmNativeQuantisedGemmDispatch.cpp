@@ -343,6 +343,73 @@ ScopedNativeQuantisedVerifierOperation::~ScopedNativeQuantisedVerifierOperation(
 std::optional<NativeQuantisedVerifierOperation> ScopedNativeQuantisedVerifierOperation::current() noexcept
 { return active_ ? active_->operation_ : std::nullopt; }
 
+namespace
+{
+/** @brief Measured widths retain complete source identity and separate public operations.
+ * Bit M-2 admits one exact physical width, only within M2..16. Shape columns
+ * are N/K17408/5120,5120/17408,10240/5120. Zero and nonmonotone masks are valid;
+ * unmeasured sources, geometries and widths remain the ordered implementation.
+ * Each admitted cell won its complete-operation median and at least22 of31
+ * paired comparisons. Source aliases do not borrow another source's evidence. */
+struct VerifierMeasuredWidths
+{
+    NativeQuantisedSourceIdentity source;
+    std::array<uint16_t,3> projection_rows;
+    std::array<uint16_t,3> swiglu_rows;
+};
+constexpr std::array<VerifierMeasuredWidths,21> kVerifierMeasuredWidths{{
+    {{0,false,true},{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}}, // Q4_0
+    {{4,false,true},{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}}, // IQ4_NL
+    {{4,true,true},{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}}, // IQ4_XS
+    {{5,false,true},{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}}, // Q4_1
+    {{5,true,true},{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}}, // Q4_K
+    {{6,false,true},{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}}, // Q5_0
+    {{7,false,true},{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}}, // Q5_1
+    {{7,true,true},{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}}, // Q5_K
+    {{8,true,true},{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}}, // Q6_K
+    {{9,true,true},{0x7f80,0x7f80,0x7f80},{0x7f80,0x7f80,0x7f80}}, // Q3_K
+    {{10,true,true},{0x7f80,0x7f80,0x7f80},{0x7f80,0x7f80,0x7f80}}, // Q2_K
+    {{11,true,true},{0x7f80,0x7fe0,0x7f80},{0x7f80,0x7fe0,0x7f80}}, // IQ3_S
+    {{12,true,true},{0x7f80,0x7fc0,0x7f80},{0x7f80,0x7fc0,0x7f80}}, // IQ3_XXS
+    {{13,true,true},{0x7f80,0x7f80,0x7f80},{0x7f80,0x7f80,0x7f80}}, // IQ2_S
+    {{14,true,true},{0x7f80,0x7f80,0x7f80},{0x7f80,0x7f80,0x7f80}}, // IQ2_XS
+    {{15,true,true},{0x7f00,0x7f80,0x7f80},{0x7f00,0x7f80,0x7f80}}, // IQ2_XXS
+    {{16,true,true},{0x7800,0x7f80,0x7800},{0x7800,0x7f80,0x7800}}, // IQ1_S
+    {{17,true,true},{0x7800,0x7e00,0x7800},{0x7000,0x7f00,0x7800}}, // IQ1_M
+    {{19,false,true},{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}}, // Q8_0
+    {{20,false,true},{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}}, // Q8_1
+    {{21,true,true},{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}}, // Q8_K
+}};
+static_assert([] {
+    for(size_t i=0;i<kVerifierMeasuredWidths.size();++i) {
+        const auto &row=kVerifierMeasuredWidths[i];
+        if(!row.source.present || canonicalDeviceVnniCodebookId(row.source)==255)return false;
+        for(auto mask:row.projection_rows)if(mask&0x8000u)return false;
+        for(auto mask:row.swiglu_rows)if(mask&0x8000u)return false;
+        for(size_t j=0;j<i;++j)if(row.source==kVerifierMeasuredWidths[j].source)return false;
+    }
+    return true;
+}(),"Measured verifier source tuples must be unique/catalogued and widths bounded to M2..16");
+
+/** @brief Resolve a measured complete operation without observing device-owned live rows.
+ * @param operation Authenticated original public operation. @param m Exact physical width.
+ * @return Whether this source/operation/geometry/width has qualified native evidence. */
+bool measuredVerifierWmmaKey(const NativeQuantisedVerifierOperation &operation,int m) noexcept
+{
+    if(m<2 || m>16)return false;
+    const int shape=operation.n==17408 && operation.k==5120 ? 0 :
+        operation.n==5120 && operation.k==17408 ? 1 :
+        operation.n==10240 && operation.k==5120 ? 2 : -1;
+    if(shape<0)return false;
+    for(const auto &row:kVerifierMeasuredWidths)if(row.source==operation.source) {
+        const auto *masks=operation.kind==NativeQuantisedVerifierOperationKind::Projection ? &row.projection_rows :
+            operation.kind==NativeQuantisedVerifierOperationKind::SwiGLUDown ? &row.swiglu_rows : nullptr;
+        return masks && (((*masks)[shape] & (uint16_t{1}<<(m-2)))!=0);
+    }
+    return false;
+}
+}
+
 NativeQuantisedVerifierCandidate nativeQuantisedVerifierProducer(
     int device, bool decode_equivalent, const NativeQuantisedVerifierWork &work)
 {
@@ -359,10 +426,10 @@ NativeQuantisedVerifierCandidate nativeQuantisedVerifierProducer(
     }
     const auto operation = ScopedNativeQuantisedVerifierOperation::current();
     const int m = work.rows.physicalRows();
-    if (!decode_equivalent || !operation || m < 5 || m > 16 || work.projections != 1 ||
+    if (!decode_equivalent || !operation || m < 2 || m > 16 || work.projections != 1 ||
         currentProjectionRowWork(m) || work.policy != NativeQuantisedVerifierPolicyMatch::CanonicalSerial ||
-        work.physical_codebook != kNativeQuantisedIQ4XSSourceScaleCodebook ||
-        !operation->source.present || operation->source.codebook_id != 4 || !operation->source.is_superblock ||
+        !operation->source.present ||
+        work.physical_codebook != canonicalDeviceVnniCodebookId(operation->source) ||
         operation->device != device || operation->m != m || operation->n != work.n || operation->k != work.k ||
         !operation->weights || operation->weights != work.weights ||
         !ScopedCapturedVerifierExtent::current().matches(DeviceId::rocm(device), work.rows))
@@ -370,12 +437,9 @@ NativeQuantisedVerifierCandidate nativeQuantisedVerifierProducer(
     if (operation->kind != NativeQuantisedVerifierOperationKind::Projection &&
         operation->kind != NativeQuantisedVerifierOperationKind::SwiGLUDown)
         throw std::invalid_argument("Unknown original verifier operation");
-    // Complete public operations, exact physical M2..16, 31 AB/BA pairs:
-    // Dot4 wins every M2..4 key; native WMMA wins every M5..16 key. A larger
-    // fused operation cannot acquire eligibility by splitting into singleton leaves.
-    const bool measured_shape = (work.n == 17408 && work.k == 5120) ||
-        (work.n == 5120 && work.k == 17408) || (work.n == 10240 && work.k == 5120);
-    if (!measured_shape || nativeQuantisedHardwareForDevice(device).architecture !=
+    // A larger fused operation cannot acquire eligibility by splitting into
+    // singleton leaves. Every source, operation and physical width owns its key.
+    if (!measuredVerifierWmmaKey(*operation,m) || nativeQuantisedHardwareForDevice(device).architecture !=
         native_quantised::NativeQuantisedArchitecture::rocm(11,0,0))
         return NativeQuantisedVerifierCandidate::Dot4;
     return NativeQuantisedVerifierCandidate::WmmaM16N64;

@@ -17,13 +17,15 @@ The standalone beta/mapped-output prerequisite now preserves grouped execution
 and original device row ownership; four replay cases pass in both optimized
 builds and the affected all-format/device-counted suite passes. See the
 [epilogue repair proof](../2026-11/GFX1100_MTP_VERIFIER_EPILOGUE.md).
-Native M16/N64 replay now passes149 Release cases plus7 epilogues, five focused
-ROCm registrations and six host checks. Exact hosted width identity reaches the
-original capture worker and belongs to graph identity. Automatic keeps Dot4 at
-M2–4 and selects WMMA at M5–16 for measured IQ4_XS single projection/SwiGLU keys.
-All72 selected cells win1.032–1.618×, geometric mean1.260×; shallow Dot4 controls
-stay within0.47%. All24 exact profiles pass with zero memory spills. Other codebooks/geometries,
-multi-output/routed/router/attention work and model qualification remain open.
+Native M16/N64 replay now passes171 Release cases and five focused ROCm
+registrations. Prior seven epilogue cases and six host checks remain green.
+Exact hosted width identity reaches the original capture worker and belongs to
+graph identity. The all21-source actual Automatic sweep passes1,890 complete
+projection/SwiGLU cells across three N/K anchors and M2–16. All1,264 selected
+native cells win1.00198–2.00465× (geometric mean1.28647×);626 keys retain Dot4.
+All168 per-source profiles pass with zero memory spills. Other geometries, multi-output/routed/shared
+operations, router admission and grouped attention/floating arithmetic remain
+open. These are component results, not model-level MTP performance claims.
 
 ## Current branch integration and backend port
 

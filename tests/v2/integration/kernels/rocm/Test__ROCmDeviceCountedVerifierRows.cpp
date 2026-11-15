@@ -140,7 +140,7 @@ private:
 enum class VerifierProjectionBundle { Single, Homogeneous, MixedDecoder, TensorProjection, TensorSwiGLU };
 
 /** @brief Profiler replays never repeat the independently measured byte/timing corpus. */
-enum class VerifierProbePurpose { CorrectnessOnly, CorrectnessAndTiming, IsolatedProfile, PairedCandidates, PairedAllCounts, PairedExactWidth, PairedAutomaticExactWidth, IsolatedAutomaticProfile };
+enum class VerifierProbePurpose { CorrectnessOnly, CorrectnessAndTiming, IsolatedProfile, PairedCandidates, PairedAllCounts, PairedExactWidth, PairedAutomaticExactWidth, IsolatedAutomaticProfile, ExactAutomaticReplay };
 
 /** @brief Learned bias is independent of row admission and must survive replay. */
 enum class VerifierBias { None, PerColumn };
@@ -158,6 +158,56 @@ struct VerifierCapacityProbe
     VerifierGridCertificate grid_certificate = VerifierGridCertificate::NotRequested;
     int profile_live = 3; ///< Explicit original live count for one isolated profiler replay.
 };
+
+/** @brief Independent expected width fixtures keyed by original tensor type.
+ * Columns are N/K17408/5120,5120/17408,10240/5120; bit M-2 names one width.
+ * Production uses source tuples, so these expectations also authenticate aliases. */
+struct ExpectedVerifierWidths
+{
+    TensorType type;
+    std::array<uint16_t,3> projection_rows,swiglu_rows;
+};
+constexpr std::array<ExpectedVerifierWidths,21> kExpectedVerifierWidths{{
+    {TensorType::Q4_0,{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}},
+    {TensorType::IQ4_NL,{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}},
+    {TensorType::IQ4_XS,{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}},
+    {TensorType::Q4_1,{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}},
+    {TensorType::Q4_K,{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}},
+    {TensorType::Q5_0,{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}},
+    {TensorType::Q5_1,{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}},
+    {TensorType::Q5_K,{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}},
+    {TensorType::Q6_K,{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}},
+    {TensorType::Q3_K,{0x7f80,0x7f80,0x7f80},{0x7f80,0x7f80,0x7f80}},
+    {TensorType::Q2_K,{0x7f80,0x7f80,0x7f80},{0x7f80,0x7f80,0x7f80}},
+    {TensorType::IQ3_S,{0x7f80,0x7fe0,0x7f80},{0x7f80,0x7fe0,0x7f80}},
+    {TensorType::IQ3_XXS,{0x7f80,0x7fc0,0x7f80},{0x7f80,0x7fc0,0x7f80}},
+    {TensorType::IQ2_S,{0x7f80,0x7f80,0x7f80},{0x7f80,0x7f80,0x7f80}},
+    {TensorType::IQ2_XS,{0x7f80,0x7f80,0x7f80},{0x7f80,0x7f80,0x7f80}},
+    {TensorType::IQ2_XXS,{0x7f00,0x7f80,0x7f80},{0x7f00,0x7f80,0x7f80}},
+    {TensorType::IQ1_S,{0x7800,0x7f80,0x7800},{0x7800,0x7f80,0x7800}},
+    {TensorType::IQ1_M,{0x7800,0x7e00,0x7800},{0x7000,0x7f00,0x7800}},
+    {TensorType::Q8_0,{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}},
+    {TensorType::Q8_1,{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}},
+    {TensorType::Q8_K,{0x7ff8,0x7ff8,0x7ff8},{0x7ff8,0x7ff8,0x7ff8}},
+}};
+
+/** @brief Return independently recorded native eligibility for a public operation.
+ * @param format Original source format. @param bundle Complete public operation.
+ * @param m Physical width. @param n Full output columns. @param k Full reduction width.
+ * @return Expected producer from the frozen paired qualification, without calling production policy. */
+static bool expectedVerifierWmma(const QuantizedVerifierFormatCase &format,
+    VerifierProjectionBundle bundle,int m,int n,int k)
+{
+    if(m<2 || m>16)return false;
+    const int shape=n==17408 && k==5120 ? 0 : n==5120 && k==17408 ? 1 : n==10240 && k==5120 ? 2 : -1;
+    if(shape<0)return false;
+    for(const auto &row:kExpectedVerifierWidths)if(row.type==format.tensor_type) {
+        const auto *masks=bundle==VerifierProjectionBundle::TensorProjection ? &row.projection_rows :
+            bundle==VerifierProjectionBundle::TensorSwiGLU ? &row.swiglu_rows : nullptr;
+        return masks && (((*masks)[shape] & (uint16_t{1}<<(m-2)))!=0);
+    }
+    return false;
+}
 
 /**
  * @brief Stress one physical launch family against an independent serial oracle.
@@ -192,7 +242,8 @@ static void proveDeviceCountedRows(
         probe->purpose == VerifierProbePurpose::PairedExactWidth ||
         probe->purpose == VerifierProbePurpose::PairedAutomaticExactWidth);
     const bool exact_auto = probe && (probe->purpose == VerifierProbePurpose::PairedAutomaticExactWidth ||
-        probe->purpose == VerifierProbePurpose::IsolatedAutomaticProfile);
+        probe->purpose == VerifierProbePurpose::IsolatedAutomaticProfile ||
+        probe->purpose == VerifierProbePurpose::ExactAutomaticReplay);
     ASSERT_TRUE(!paired || ((candidate==NativeQuantisedVerifierCandidate::WmmaM16N64 || exact_auto) &&
         (bundle==VerifierProjectionBundle::TensorProjection || bundle==VerifierProjectionBundle::TensorSwiGLU)));
 
@@ -369,7 +420,7 @@ static void proveDeviceCountedRows(
             }
             capture.finish();
             ASSERT_TRUE(launched);
-            if(candidate==NativeQuantisedVerifierCandidate::WmmaM16N64 || (exact_auto && M>=5)) {
+            if(candidate==NativeQuantisedVerifierCandidate::WmmaM16N64 || (exact_auto && expectedVerifierWmma(format,bundle,M,N,K))) {
                 std::vector<GPUGraphKernelNodeInfo> nodes; std::string error;
                 ASSERT_TRUE(graph->inspectKernelNodes(nodes,&error)) << error;
                 int producers=0;
@@ -397,7 +448,7 @@ static void proveDeviceCountedRows(
                         << "The actual recorded serial policy must contain empty tail planes";
                 }
             }
-            if(exact_auto && M<=4) {
+            if(exact_auto && !expectedVerifierWmma(format,bundle,M,N,K)) {
                 std::vector<GPUGraphKernelNodeInfo> nodes;std::string error;
                 ASSERT_TRUE(graph->inspectKernelNodes(nodes,&error))<<error;
                 int grouped=0;
@@ -1020,13 +1071,16 @@ class ROCmVerifierWmmaFormatEconomy : public ::testing::TestWithParam<QuantizedV
  * @brief Measure one original codebook without borrowing another format's crossover.
  * @param format Complete source-format registry entry, including normalized aliases.
  * @param widths Exact physical transaction widths, never a mutable host count.
+ * @param candidate Explicit native experiment or actual installed Automatic.
  * @details Every cell retains the existing31 alternating pairs of eight public
  * projection/SwiGLU operations, authenticated native inventory, serial bytes
  * and poisoned partial/empty/regrown replay. This is performance-only work.
  */
 static void proveCodebookExactWidths(const QuantizedVerifierFormatCase &format,
-    std::span<const int> widths)
+    std::span<const int> widths,
+    NativeQuantisedVerifierCandidate candidate=NativeQuantisedVerifierCandidate::WmmaM16N64)
 {
+    ASSERT_TRUE(candidate==NativeQuantisedVerifierCandidate::WmmaM16N64 || candidate==NativeQuantisedVerifierCandidate::Automatic);
     initializeROCmHardwareMetadata();
     int device_count=0;
     if(hipGetDeviceCount(&device_count)!=hipSuccess || device_count==0)
@@ -1039,8 +1093,9 @@ static void proveCodebookExactWidths(const QuantizedVerifierFormatCase &format,
         for(int rows:widths)
             for(auto operation:{VerifierProjectionBundle::TensorProjection,VerifierProjectionBundle::TensorSwiGLU})
                 ASSERT_NO_FATAL_FAILURE(proveDeviceCountedRows(format,operation,
-                    VerifierCapacityProbe{rows,columns,width,VerifierProbePurpose::PairedExactWidth},
-                    VerifierBias::None,NativeQuantisedVerifierCandidate::WmmaM16N64,&source));
+                    VerifierCapacityProbe{rows,columns,width,candidate==NativeQuantisedVerifierCandidate::Automatic ?
+                        VerifierProbePurpose::PairedAutomaticExactWidth : VerifierProbePurpose::PairedExactWidth},
+                    VerifierBias::None,candidate,&source));
     }
 }
 
@@ -1085,6 +1140,36 @@ TEST(ROCmVerifierWmmaDispatch, PreparedSourceReuse)
     EXPECT_THROW((void)source.kernel(format,DeviceId::rocm(1),n,k),std::invalid_argument);
 }
 
+/** @test Every source crosses its installed Automatic boundaries through retained dirty replay.
+ * The long-K anchor exercises both public operations. The separate performance
+ * sweep authenticates all three shapes and every physical width; this focused
+ * feature regression retains their source aliases, real dispatch and byte oracle
+ * without replaying the timing corpus in routine production preflight. */
+TEST_P(ROCmDeviceCountedVerifierWmma, ExactHostedAutomaticReplay)
+{
+    initializeROCmHardwareMetadata();
+    int device_count=0;
+    if(hipGetDeviceCount(&device_count)!=hipSuccess || device_count==0)
+        GTEST_SKIP()<<"No ROCm device available";
+    if(nativeQuantisedHardwareForDevice(0).architecture!=
+        native_quantised::NativeQuantisedArchitecture::rocm(11,0,0))
+        GTEST_SKIP()<<"Native verifier WMMA requires actual gfx1100";
+    const auto &format=GetParam();
+    constexpr int n=5120,k=17408;
+    VerifierPreparedSource source(format,DeviceId::rocm(0),n,k);
+    for(auto operation:{VerifierProjectionBundle::TensorProjection,VerifierProjectionBundle::TensorSwiGLU}) {
+        std::array<bool,17> widths{};
+        widths[2]=widths[16]=true;
+        for(int m=3;m<=16;++m)
+            if(expectedVerifierWmma(format,operation,m,n,k)!=expectedVerifierWmma(format,operation,m-1,n,k))
+                widths[m]=widths[m-1]=true;
+        for(int m=2;m<=16;++m)if(widths[m])
+            ASSERT_NO_FATAL_FAILURE(proveDeviceCountedRows(format,operation,
+                VerifierCapacityProbe{m,n,k,VerifierProbePurpose::ExactAutomaticReplay},
+                VerifierBias::None,NativeQuantisedVerifierCandidate::Automatic,&source));
+    }
+}
+
 /** @brief First bracket shallow, crossover and full verifier widths for every source format. */
 TEST_P(ROCmVerifierWmmaFormatEconomy, DISABLED_ExactWidthEndpoints)
 {
@@ -1097,6 +1182,21 @@ TEST_P(ROCmVerifierWmmaFormatEconomy, DISABLED_ExactWidthSweep)
 {
     constexpr std::array widths{2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
     ASSERT_NO_FATAL_FAILURE(proveCodebookExactWidths(GetParam(),widths));
+}
+
+/** @brief Authenticate all installed widths with fresh complete-operation paired timing. */
+TEST_P(ROCmVerifierWmmaFormatEconomy, DISABLED_AutomaticExactWidthSweep)
+{
+    constexpr std::array widths{2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+    ASSERT_NO_FATAL_FAILURE(proveCodebookExactWidths(GetParam(),widths,NativeQuantisedVerifierCandidate::Automatic));
+}
+
+/** @brief Isolate one installed source decoder at exact M16 for counter collection. */
+TEST_P(ROCmVerifierWmmaFormatEconomy, DISABLED_AutomaticExact16Profile)
+{
+    ASSERT_NO_FATAL_FAILURE(proveDeviceCountedRows(GetParam(),VerifierProjectionBundle::TensorProjection,
+        VerifierCapacityProbe{16,5120,17408,VerifierProbePurpose::IsolatedAutomaticProfile,
+            VerifierGridCertificate::NotRequested,16},VerifierBias::None,NativeQuantisedVerifierCandidate::Automatic));
 }
 
 INSTANTIATE_TEST_SUITE_P(AllFormats,ROCmVerifierWmmaFormatEconomy,
@@ -1156,14 +1256,17 @@ TEST(ROCmVerifierWmmaDispatch, ExactHostedKeysAndExclusions)
     };
     const auto dot=NativeQuantisedVerifierCandidate::Dot4;
     const auto matrix=NativeQuantisedVerifierCandidate::WmmaM16N64;
-    for(int m=2;m<=33;++m)
+    for(const auto &format:quantizedMoEVerifierFormats())
+      for(int m=2;m<=33;++m)
         for(const auto [n,k]:std::array<std::pair<int,int>,6>{{{17408,5120},{5120,17408},{10240,5120},{17408,5088},{5121,17408},{8192,2048}}})
             for(auto kind:{NativeQuantisedVerifierOperationKind::Projection,NativeQuantisedVerifierOperationKind::SwiGLUDown}) {
                 const auto rows=DeviceRowRange::deviceCounted(m,&count);
                 const auto extent=CapturedVerifierExtent::exactHostedRequest(device,rows);
-                const NativeQuantisedVerifierOperation operation{kind,0,m,n,k,&payload,{4,true,true}};
-                const NativeQuantisedVerifierWork work{rows,&payload,n,k,1,24,NativeQuantisedVerifierPolicyMatch::CanonicalSerial};
-                const bool measured=m>=5 && m<=16 && ((n==17408 && k==5120)||(n==5120 && k==17408)||(n==10240 && k==5120));
+                const NativeQuantisedVerifierOperation operation{kind,0,m,n,k,&payload,
+                    {format.source_codebook_id,format.source_is_superblock,true}};
+                const NativeQuantisedVerifierWork work{rows,&payload,n,k,1,format.device_execution_codebook_id,NativeQuantisedVerifierPolicyMatch::CanonicalSerial};
+                const bool measured=expectedVerifierWmma(format,kind==NativeQuantisedVerifierOperationKind::Projection ?
+                    VerifierProjectionBundle::TensorProjection : VerifierProjectionBundle::TensorSwiGLU,m,n,k);
                 EXPECT_EQ(select(extent,operation,work),measured?matrix:dot);
                 EXPECT_EQ(select({},operation,work),dot);
                 EXPECT_EQ(select(extent,std::nullopt,work),dot);
@@ -1172,14 +1275,21 @@ TEST(ROCmVerifierWmmaDispatch, ExactHostedKeysAndExclusions)
     const auto extent=CapturedVerifierExtent::exactHostedRequest(device,rows);
     const NativeQuantisedVerifierOperation original{NativeQuantisedVerifierOperationKind::Projection,0,5,17408,5120,&payload,{4,true,true}};
     const NativeQuantisedVerifierWork original_work{rows,&payload,17408,5120,1,24,NativeQuantisedVerifierPolicyMatch::CanonicalSerial};
-    for(int source=0;source<=25;++source)for(bool superblock:{false,true})for(bool present:{false,true}) {
-        auto operation=original;operation.source={static_cast<uint8_t>(source),superblock,present};
-        EXPECT_EQ(select(extent,operation,original_work),source==4 && superblock && present?matrix:dot);
-    }
-    for(int physical=0;physical<=32;++physical) {
-        auto work=original_work;work.physical_codebook=static_cast<uint8_t>(physical);
-        EXPECT_EQ(select(extent,original,work),physical==24?matrix:dot);
-    }
+    for(int m:{5,16})
+      for(int source=0;source<=25;++source)for(bool superblock:{false,true})for(bool present:{false,true})
+      for(int physical=0;physical<=32;++physical)
+        for(auto kind:{NativeQuantisedVerifierOperationKind::Projection,NativeQuantisedVerifierOperationKind::SwiGLUDown}) {
+            auto operation=original;operation.m=m;operation.kind=kind;operation.source={static_cast<uint8_t>(source),superblock,present};
+            auto work=original_work;work.rows=DeviceRowRange::deviceCounted(m,&count);work.physical_codebook=static_cast<uint8_t>(physical);
+            const auto cross_extent=CapturedVerifierExtent::exactHostedRequest(device,work.rows);
+            bool measured=false;
+            for(const auto &format:quantizedMoEVerifierFormats())
+                if(present && source==format.source_codebook_id && superblock==format.source_is_superblock &&
+                    physical==format.device_execution_codebook_id)
+                    measured=expectedVerifierWmma(format,kind==NativeQuantisedVerifierOperationKind::Projection ?
+                        VerifierProjectionBundle::TensorProjection : VerifierProjectionBundle::TensorSwiGLU,m,17408,5120);
+            EXPECT_EQ(select(cross_extent,operation,work),measured?matrix:dot);
+        }
     for(int mutation=0;mutation<13;++mutation) {
         SCOPED_TRACE(mutation);
         auto operation=original;auto work=original_work;
@@ -1346,8 +1456,10 @@ TEST(ROCmVerifierWmmaDispatch, NativeWorkerCaptureAndDirtyReplay)
                 ordered+=node.name.find("native_quantised_verifier_ordered_m4n64")!=std::string::npos;
                 dots+=node.name.find("gemv_native_quantised_small_m_")!=std::string::npos;
             }
-            EXPECT_EQ(matrices,admitted && m>=5?1:0);EXPECT_EQ(ordered,0);
-            EXPECT_EQ(dots>0,!(admitted && m>=5));
+            const bool expected_matrix=admitted && expectedVerifierWmma(*format,swiglu ?
+                VerifierProjectionBundle::TensorSwiGLU : VerifierProjectionBundle::TensorProjection,m,n,k);
+            EXPECT_EQ(matrices,expected_matrix?1:0);EXPECT_EQ(ordered,0);
+            EXPECT_EQ(dots>0,!expected_matrix);
             for(int replay=0;replay<2;++replay)for(int active:{m,0,4,1,m}) {
                 live=active;
                 ASSERT_EQ(hipMemsetAsync(output->gpu_data_ptr(),0xa5,actual.size()*sizeof(uint32_t),stream),hipSuccess);

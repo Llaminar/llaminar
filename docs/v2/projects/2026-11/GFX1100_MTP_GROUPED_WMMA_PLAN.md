@@ -1,12 +1,14 @@
 # gfx1100 WMMA for grouped MTP decode
 
-Status: the grouped epilogue prerequisite is pushed at `73f7e2adc`. Native
-M16/N64 verifier kernels and exact-hosted Automatic selection are implemented.
-Final Release replay passes149 native cases and7 epilogue cases; five focused
-ROCm and six host registrations pass. Actual Automatic wins all72 measured
-IQ4_XS M5–16 cells by1.032–1.618×; M2–4 retains the original Dot4 producer.
-All24 final selected-kernel profiles pass. Broader operation/codebook
-economy and model-level MTP qualification remain open.
+Status: native M16/N64 verifier kernels and exact-hosted Automatic selection
+now cover all21 source formats at the three measured projection/SwiGLU shapes.
+The actual Automatic sweep passes1,890 cells: all1,264 native-selected cells win
+1.00198–2.00465×, geometric mean1.28647×;626 keys retain Dot4. Current Release
+replay passes171 native cases and five focused ROCm registrations pass. Prior
+seven epilogue and six host checks remain green. All168 per-source profiles pass
+with zero memory spills; broader bundles/routed/shared operations, router admission and
+grouped attention/floating arithmetic remain open. These component results do
+not claim model-level MTP speedups or full production certification.
 This implementation plan extends the [prefill campaign](GFX1100_PREFILL_WMMA.md)
 and the [MTP project plan](../2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md).
 It records the implementation frontier and remaining qualification, not a
@@ -20,7 +22,7 @@ serial-row byte contract. Ordinary prefill evidence does not qualify MTP.
 
 | Operation | Current ROCm execution | WMMA work required |
 |---|---|---|
-| Dense quantized projections | Dedicated M16/N64 native leaves preserve serial arithmetic through standalone, homogeneous and mixed APIs. Automatic selects measured exact-hosted IQ4_XS single projection/SwiGLU keys at M5–16; Dot4 owns other keys. | Extend measured selection to other codebooks, geometries, multi-output bundles and real grouped transactions. |
+| Dense quantized projections | Dedicated M16/N64 native leaves preserve serial arithmetic through standalone, homogeneous and mixed APIs. Automatic uses source/operation/shape-specific masks for all21 source formats at M2–16; Dot4 owns other keys. | Finish per-source profiling; qualify other geometries, multi-output bundles and real grouped transactions. |
 | Routed expert gate/up and down | Multi-row MTP enters the fixed-topology grouped transaction in `MoEExpertComputeStage::executeDecodeEquivalentVerifierPrefill`. Native projection candidates and M512 population policies exist; those policies do not admit ordinary verifier capacities. Sparse RouteOwned execution remains a distinct Dot4 producer. | Reuse and qualify native leaves for actual verifier routes, including sparse groups; install measured selection. The prefill-named interface alone does not prove MTP coverage. |
 | Floating grouped projections | `ROCmFloatingPointGemmKernel.cpp` selects `rocmFp16_batched_projection`, `rocmFp32_small_n_batched_projection`, or `rocmFp32x16_batched_projection`, preserving the serial fixed reduction tree. | Evaluate matrix candidates under each declared arithmetic contract. Half storage does not authorize changing FP32 operands or reduction order. |
 | Q8 router | The real verifier API already reaches the forced-capable byte-exact WMMA leaf. Automatic admits only whole-row capacity512/K2560/E512; forced replay covers M1–65 and both bases. | Measure verifier geometry economy, then qualify full-router Automatic selection and reuse of the original Q8 publication. No new arithmetic leaf is initially required. |
@@ -313,7 +315,7 @@ Additional current evidence under the same ignored evidence root:
   Run the focused and feature suites requested by the user; this work item does
   not claim full-preflight or model-level certification from component results.
 
-## Exact hosted width implementation
+## Initial exact-hosted IQ4_XS qualification
 
 `CapturedVerifierExtent` now binds the original participant, count pointer and
 unsliced single-request width without reading count contents. Only the admitted
@@ -334,7 +336,7 @@ and contradictory input rejection. Three explicit preflight registrations own
 these device-free regressions. All three and the three affected Unit registrations
 pass. Sol6.1 reviews found no remaining blockers in this implementation slice.
 
-The Release paired panel now measures physical widths2–16 independently for both
+The initial Release paired panel measures physical widths2–16 independently for both
 complete public projection/SwiGLU operations and all three IQ4_XS geometries:
 90 cells,31 AB/BA pairs and8 complete operations per sample. The forced comparison
 selects Dot4 at every M2–4 key and WMMA at every M5–16 key. The subsequent actual
@@ -356,14 +358,14 @@ The native worker regression uses the production executor/controller, real GPU
 worker, arena contracts and full coherence. Guarded and exact M4/5/16 captures
 exercise both public APIs. Captured symbols prove selection; independent serial
 M1 output, poisoned partial/empty/regrown replay and unchanged construction counts
-prove bytes and graph reuse. Final native replay covers21 source formats,
+prove bytes and graph reuse. That native replay covers21 source formats,
 heterogeneous weights, request subviews, physical tails and empty K partitions.
 Both optimized builds compile gfx906/gfx1100 with zero private storage or VGPR
 memory spills. gfx906 emits no matrix entry; six gfx1100 entries use80–87 logical
 VGPRs and7,040 LDS bytes. The reported72 scalar spills in generic request variants
 are certified scalar-to-vector register-lane moves, not memory traffic.
 
-Final evidence under `/tmp/llaminar-gfx1100-wmma-prefill-evidence`:
+Initial IQ4_XS evidence under `/tmp/llaminar-gfx1100-wmma-prefill-evidence`:
 
 - Forced exact widths: `mtp-verifier-wmma-exact-widths-release-1794744248860220133/receipt.json`.
 - Actual Automatic timing: `mtp-verifier-automatic-exact-widths-release-1794746462444185812/receipt.json`.
@@ -384,73 +386,179 @@ Those counters characterize the selected kernels; unprofiled complete-operation
 events above own the latency claim. Profile summary:
 `mtp-verifier-automatic-profile-summary.json`, SHA256
 `01a772c39b9f17c684a407856f729d58fa9be4ecec9f4f5f589f7ec03c69a91f`.
-The final280-file source/binary/ISA/evidence archive is
+The initial280-file source/binary/ISA/evidence archive is
 `mtp-verifier-automatic-qualified-snapshot/snapshot.json`, SHA256
 `09be5854cf2bfa9bb17297d26abb36df35ec75cbebad1778394bd5ea1da392e6`.
 
-## Broader codebook economy
+## All-codebook Automatic economy
 
-The performance-only `AllFormats/ROCmVerifierWmmaFormatEconomy` panels derive all21
-source formats from the canonical verifier registry. They retain source aliases
-separately and reuse the existing complete public projection/SwiGLU byte oracle,
-poisoned replay, native inventory and31 paired samples of eight operations.
-`DISABLED_ExactWidthEndpoints` brackets M4/5/8/16; `DISABLED_ExactWidthSweep`
-measures every M2–16 at all three established N/K shapes. Their corpora remain
-separate because endpoint keys overlap the full sweep. These tests do not expand
-Automatic admission or routine preflight budgets.
+The performance-only `AllFormats/ROCmVerifierWmmaFormatEconomy` panels enumerate
+all21 source formats from the canonical verifier registry, retaining normalized
+aliases separately. Both complete public projection and SwiGLU operations cover
+M2–16 at N/K17408/5120,5120/17408 and10240/5120:1,890 cells,31 alternating AB/BA
+pairs and eight complete captured operations per sample,117,180 raw samples.
+Timing includes preparation and epilogues. These amortized native-event operation
+measurements are neither isolated producer cycles nor model/E2E throughput.
 
-The first Q4_0 endpoint panel passes all24 cells/1,488 samples. Dot4 wins all six
-M4 cells; WMMA wins all18 M5/8/16 cells, with complete-operation gains from1.019×
-to1.548×. This brackets the crossover but does not yet qualify all widths or an
-Automatic policy. Receipt: `mtp-verifier-codebook-endpoints-Q4_0-1794749957198871476/receipt.json`
-under the existing local evidence root. Full-width collection follows before
-extending production selection.
+Each key installs WMMA only when its forced ratio of medians exceeds one and
+at least22 of31 paired ratios exceed one. This rejects the two median-only IQ1_M
+near ties. The rank10/rank22 interval is a per-cell97.055% order-statistic interval
+under independent sampling; alternation does not establish independence, and
+no simultaneous-confidence claim is made across the sweep. Every actual
+Automatic native cell subsequently passed both criteria. The smallest measured
+win is about0.20%; the rule does not imply a large gain at every admitted key.
 
-The full sweep retains one immutable source tensor and production-prepared
-handle per codebook/N/K. Every width and public operation still gets fresh
-workspace, streams, activations, row publication, serial oracle and captured
-graphs. Typed source/device/geometry checks reject borrowing another matrix.
-Case-scope cleanup drains work, retires graphs and clears kernel bindings before
-workspace retirement, including fatal assertion exits. The focused
-`ROCmVerifierWmmaDispatch.PreparedSourceReuse` regression passes in Release and
-Integration across grow/shrink and projection/SwiGLU reuse, and rejects source4
-alias, device and N/K mismatches. It runs in the existing explicitly registered
-`V2_Integration_GroupedVerifierRows_ROCm_WmmaReplay` feature gate.
+| Source | Native cells/90 | Native speedup range |
+|---|---:|---:|
+|Q4_0|72|1.0178–1.5540×|
+|IQ4_NL|72|1.0169–1.5737×|
+|IQ4_XS|72|1.0343–1.6162×|
+|Q4_1|72|1.0107–1.6451×|
+|Q4_K|72|1.0099–1.6439×|
+|Q5_0|72|1.0795–1.7779×|
+|Q5_1|72|1.0731–1.7887×|
+|Q5_K|72|1.0744–1.7886×|
+|Q6_K|72|1.1263–1.8951×|
+|Q3_K|48|1.1161–1.4335×|
+|Q2_K|48|1.0474–1.3192×|
+|IQ3_S|52|1.0034–1.5625×|
+|IQ3_XXS|50|1.0129–1.5245×|
+|IQ2_S|48|1.0299–1.4695×|
+|IQ2_XS|48|1.0429–1.4377×|
+|IQ2_XXS|46|1.0096–1.4352×|
+|IQ1_S|32|1.0532–1.3593×|
+|IQ1_M|28|1.0020–1.2889×|
+|Q8_0|72|1.1660–2.0046×|
+|Q8_1|72|1.1813–1.9936×|
+|Q8_K|72|1.1659–1.9937×|
 
-Before this setup change, completed Q4_0 through Q5_1 records and their exact
-producer are preserved in `mtp-verifier-codebook-before-reuse-snapshot/`.
-The collection resumes only between completed format records; it does not
-replace or interrupt a timed cell. Reuse regression receipts are
-`mtp-verifier-automatic-release-rows-1794751923977198886/receipt.json` and
-`mtp-verifier-automatic-integration-rows-1794751927971381609/receipt.json`.
-All150 Release native cases pass in
-`mtp-verifier-automatic-release-rows-1794752022508852148/receipt.json`; all five
-affected focused registrations pass in69.63s in
-`mtp-verifier-final-focused-1794752070785011663/receipt.json`.
+The native-selected aggregate is1,264 wins/1,264 cells, range1.001978–2.004648×,
+geometric mean1.286471×. The626 deliberately ordered controls range
+0.993164–1.007960×. Their captured inventory confirms the same Dot4 producer.
+
+Production stores independent projection/SwiGLU width masks per complete source
+identity and exact N/K shape. Physical aliases do not substitute for provenance.
+Full payload/single-operation/exact-hosted/serial-policy/gfx1100 guards remain
+mandatory. Unmeasured geometry/widths, generic guarded capacities, request
+batches, expanded descriptors, bias, mapped or sliced output and multi-output
+bundles remain outside this admission. The independent test table coversM2–33,
+neighboring shapes, all source/superblock/presence/physical identities atM5 andM16,
+and the existing ownership and policy exclusions.
+
+`AllFormats/ROCmDeviceCountedVerifierWmma.ExactHostedAutomaticReplay` exercises
+actual native capture for every source at long K, both operations, endpoints and
+both sides of each mask transition. Kernel inventory proves the selected engine;
+serial-M1 bytes and poisoned partial/empty/regrown replay prove correctness.
+The existing explicitly registered
+`V2_Integration_GroupedVerifierRows_ROCm_WmmaReplay` includes these regressions.
+All171 Release native cases pass; all five affected Integration registrations
+pass. Release and Integration compile the declared gfx906/gfx1100 set; device
+arithmetic and the previously qualified zero-memory-spill objects are unchanged.
+All168 all-source M16/N5120/K17408 profiles pass, one metric and exact kernel
+per launch. Each actual selected decoder uses128 threads, wave64,80 logical and
+allocated VGPRs,67 logical SGPRs,7,040 bytes of LDS (7,168 allocated), and zero
+private storage/VGPR memory spills. Measured occupancy ranges32.95–39.15%,
+memory-unit busy50.76–69.00% and L2 hit rate12.88–24.05%.
+These counters describe the selected producer; unprofiled complete-operation
+timings own the speedup claims. Joins authenticate each source/test/metric,
+raw counter/trace/code-object/log hashes and the unchanged timing producer.
+
+The sweep reuses one immutable source tensor and prepared handle per source/N/K.
+Every width/operation owns fresh workspace, streams, activations, count, serial
+oracle and captured graphs. Source/device/geometry mismatches fail. RAII drains
+work and retires graphs before clearing bindings and retiring workspace, including
+fatal assertion exits. The focused `PreparedSourceReuse` regression tests
+projection/SwiGLU grow/shrink reuse and rejects alias/device/geometry mismatches.
+
+Current evidence under `/tmp/llaminar-gfx1100-wmma-prefill-evidence`:
+
+- Forced all21 sweep: `mtp-verifier-codebook-full-width-batch-1794750171902086513/progress.json`.
+- Exact qualified selection: `mtp-verifier-measured-policy-work/selection.json`.
+- Actual Automatic sweep: `mtp-verifier-codebook-automatic-batch-1794754086313447250/progress.json`.
+- Release171 cases: `mtp-verifier-automatic-release-rows-1794753873809409359/receipt.json`.
+- Five focused Integration registrations: `mtp-verifier-final-focused-1794753954817390682/receipt.json`.
+- Both optimized builds: `mtp-verifier-all-codebook-policy-{release,integration}-build2.log`.
+- All168 exact profiles: `mtp-verifier-codebook-profile-batch-1794755510052370606/progress.json`.
+- Frozen forced producer/results: `mtp-verifier-all-codebook-forced-snapshot/snapshot.json`;
+  `mtp-verifier-codebook-before-reuse-snapshot/snapshot.json` preserves the first
+  seven sources' earlier producer. Setup reuse changed only between completed
+  source panels, never during a timed cell.
+
+The profile summary is `mtp-verifier-all-codebook-automatic-profile-summary.json`,
+SHA256 `37a52709f448189d73ee6b611f7763d365ac1bbe7538f689f6e7d5fc9a9411ec`. The complete qualified archive is
+`mtp-verifier-all-codebook-automatic-qualified-snapshot/snapshot.json`,
+SHA256 `93c3a3749bde69953f49f581073c4065a8bf8693b52801a5a1d318ce54294a41`, with1619 file records. It preserves the
+source patch, binaries, paired samples, raw profiles and focused gate evidence.
+Its prior forced and initial IQ4_XS archives remain explicit hash-pinned external
+references; retain those alongside this archive when moving the evidence.
+
+## Routed/shared verifier qualification boundary
+
+Reuse `Perf__GPUExpertPipeline.cpp::runExpertPipeline` for a finite Qwen
+H2048/I512/E256/top8 panel at physical M8/9/16, IQ2_S gate/up and IQ4_XS down.
+Start with Dot4/N32/N64 EveryExpert and Uniform/Hotset routing; sparse and empty
+work comes from device live prefixes or explicit route holes, not an invented
+routing-profile label. Retain the existing paired internal events, poison,
+publication observations and owned retirement. Include retained
+16→8→9→0→16 transitions without recapture.
+
+The capture and active-work proofs must distinguish topology from execution.
+M8 has no ExpertTiled/native leaves; M9/16 retain them but sparse live work can
+select RouteOwned. Bind actual native/ordered symbols and router-Q8 consumers,
+including the RouteOwned gate/up ABI. Native writer omission must change output
+only while that family owns active work; it must leave RouteOwned output intact.
+Do not require both threshold writers when the independent route histogram
+cannot exercise both. Profile the actual selected family and retain live-bearing
+sample keys so different retained workloads cannot collide in the timing corpus.
+
+The existing performance fixture's numerical snapshot is eager grouped Dot4,
+not a serial-runtime oracle. Before timing, reuse
+`groupedExpertDecodeFromRuntime(...RuntimePlacementTable)` from
+`Test__ROCmMoEKernel`'s Qwen runtime comparison and require its original per-row
+bytes to match the grouped snapshot and candidates. Production optimizations
+remain enabled. For the verifier router boundary, use the existing
+`routeVerifierRowsDecodeEquivalent` entry with matching preparation; controlled
+expert routes remain explicitly injected into separate buffers. This does not
+claim that the real router selected the synthetic distribution.
+
+Shared experts need their actual `SharedExpertFFNStage` grouped path separately:
+`force_grouped_verifier_prefill_for_decode=true` and
+`force_decode_equivalent_verifier_prefill=false` reach the device-counted shared
+group and existing pipeline. Reuse the current shared-stage fixture and final
+gate/add serial regression. A synthetic one-expert route alone does not qualify
+the stage's gate/add and router-Q8 handoff semantics. No MoE selection change is
+installed by this audit.
 
 ## Verifier router economy and attention arithmetic
 
-The router performance inventory now includes every physical M2–16, with
-separate complete-operation four/eight/sixteen-wave tournaments. The first
-endpoint panels cover M2/5/8/16, K/E2048/256,2560/512,3072/256,8192/512 and
-both bases. Each of96 candidate cells retains31 paired internal-event samples,
-poisoned output/Q8-bank observations and exact native geometry checks.
+The complete Q8 router tournament covers every M2–16 at K/E2048/256,
+2560/512,3072/256 and8192/512 in both bases. All three wave-tile variants pass
+120 cells each with31 paired internal-event samples, poisoned logits/original
+expert-Q8 banks and exact native geometry. Sixteen waves beats both four and
+eight at every measured key; it beats Dot4 by median at90/120 keys. Requiring
+22/31 paired wins qualifies87 keys:
 
-| Native tile | Wins/32 endpoint cells | All-cell geometric mean | M16 range |
-|---|---:|---:|---:|
-| Four waves |4|0.838×|0.818–1.032×|
-| Eight waves |12|0.962×|1.014–1.188×|
-| Sixteen waves |20|1.035×|1.130–1.283×|
+| K/E | Original basis WMMA widths | Hadamard basis WMMA widths |
+|---|---|---|
+|2048/256|5–16|5–16|
+|2560/512|5–16|5–16|
+|3072/256|5–16|6–16|
+|8192/512|9–16|9–16|
 
-All M2 cells favor Dot4. Sixteen waves wins six of eight M5 and M8 cells,
-and all M16 cells. This component includes hidden quantization, logits and
-original expert-Q8 restoration; it is not full routing/top-k certification.
-Resolve every intermediate width and original row ownership before installing
-an exact-hosted router rule. Automatic remains the existing M512 policy.
-Receipts: `mtp-router-4wave-endpoints-1794751808042792414/receipt.json`,
-`mtp-router-8wave-endpoints-1794751845878501716/receipt.json` and
-`mtp-router-16wave-endpoints-1794751866239827258/receipt.json`; the collector records each
-exact source, binary, core, sample and restored power mode.
+The M4/K2560 near ties and Hadamard M5/K3072 remain Dot4. This component includes
+hidden quantization, logits and original expert-Q8 restoration; it does not
+certify full routing/top-k. The exact-hosted selection/rebinding and native/timing
+replay patch is staged separately while dense profiling freezes the main core.
+Seven device-free policy cases and all three fixture syntax checks pass. Both
+changed HIP producers compile for gfx906/gfx1100 using the configured Integration
+flags and enabled spill guard in the staging directory. Linked native replay
+and actual Automatic timing remain pending. Installed production
+router Automatic still has only the established M512 rule.
+
+Receipts: `mtp-router-4wave-sweep-1794753501313488585/receipt.json`,
+`mtp-router-8wave-sweep-1794753251349606578/receipt.json`,
+`mtp-router-16wave-sweep-1794753292288995241/receipt.json`;
+`mtp-router-verifier-selection-preview.json` holds the87-key selection.
 
 A standalone FP16/HD256 attention arithmetic probe compares each original
 lane's two ordered dot2 updates against one sparse native matrix plane. Both
@@ -469,7 +577,46 @@ must not replace the original per-lane arithmetic without proving the complete
 byte contract, and these resources do not qualify a production candidate.
 Evidence: `mtp-attention-score-probe-run.json` and its siblings. Per-row split
 traversal, online softmax/V state and complete attention economy remain open.
-No attention dispatch change is installed.
+Two separate diagnostics preserve the original source and control kernels.
+`mtp-attention-carry-only-probe.hip` feeds the already-compared serial partials
+through indexed and named-scalar carry trees, reporting lane0, other lanes and
+fused-score differences separately. Both compile and load at13 VGPRs/private0.
+`mtp-attention-rolled-score-probe.hip` additionally retains the sparse WMMA tree
+while preventing outer-loop unrolling; both carry representations compile and
+load at34 VGPRs, zero private storage and zero VGPR spills. ISA has one static
+WMMA site and no scratch sites, versus64 WMMA/225 scratch sites in the unchanged
+old192-VGPR/private1084 control. This resolves that diagnostic's resource issue
+without proving complete attention economy.
+
+Both new runs retain2,097,152 exact matrix/serial partials. The named carry-only
+and named rolled-WMMA roots match all8,192 serial lane0 scores, including special
+values; they match each other. The indexed carry reproduces the old fused score,
+including269 lane0 NaN-bit differences. Every finite comparison across all64
+lanes passes. Named root versus the other63 serial lanes still differs at15,964
+special-value observations, so lane0 agreement alone does not certify the full
+attention contract. The `*-run.json` records own per-variant results: exit1 also
+includes the retained old failing control and is not an independent verdict on
+each candidate. Source/binary/allocation/ISA artifacts share each probe's prefix.
+
+The downstream question now has a concrete negative result.
+`mtp-attention-output-tiled-probe` invokes the same compiled softmax/PV consumer
+on the original64 lane scores and the replicated named WMMA root. Its copied
+HD256 FP16 arithmetic is bound to the production source SHA: four wave-strided
+key sequences, ascending wave merge, ascending split reduction and two64-thread
+output tiles of128 dimensions. It covers512 original16-key streams plus three
+NaN-only differing-score witnesses at first/middle/last positions, finite half V
+including signed zeros, and both one/two splits. All finite outputs match, but
+final FP32 words differ at4,644/131,840 and3,084/131,840 respectively. Both m/l
+partial banks match; O partials and final O retain differing NaN bits. The earlier
+single-output-tile diagnostic produces identical mismatch counts.
+
+This rejects the shared-root score candidate under the complete byte contract;
+softmax does not erase its payload differences. It does not prove WMMA hardware
+cannot implement exact attention. A subsequent candidate must preserve the
+original lane-specific arithmetic through final output; merely fixing lane0 or
+relaxing special-value equality cannot qualify it. These are diagnostic copies,
+not production capture or economy evidence. No attention dispatch change is
+installed.
 
 ## Required acceptance evidence
 
