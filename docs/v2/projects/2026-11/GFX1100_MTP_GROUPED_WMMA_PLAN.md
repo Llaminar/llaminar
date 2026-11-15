@@ -8,8 +8,16 @@ replay passes171 native cases and five focused ROCm registrations pass. Prior
 seven epilogue and six host checks remain green. All168 per-source profiles pass
 with zero memory spills. Router Automatic qualifies85/120 exact-hosted keys
 (1.00291–1.28437×, geometric mean1.10438×); seven focused registrations pass.
-All80 router profiles pass without spills. Broader bundles/routed/shared
-operations and production grouped attention remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
+All80 router profiles pass without spills. A forced FP16/HD256 grouped-attention
+candidate passes captured serial-byte replay, real append/RoPE replay and
+special values under all four original wave counts. Query/score padding and
+cooperative K loading improve the candidate, but its current generation still
+wins0/90 complete-operation timing cells; Automatic therefore remains Dot2.
+Fixed-query32K→64K scaling passes, and eight exact producer profiles complete
+without spills. A fuller query/head matrix layout is the next structural
+experiment; further padding is not the frontier. See the
+[attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Broader bundles and
+routed/shared operations remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
 not claim model-level MTP speedups or full production certification.
 This implementation plan extends the [prefill campaign](GFX1100_PREFILL_WMMA.md)
 and the [MTP project plan](../2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md).
@@ -28,7 +36,7 @@ serial-row byte contract. Ordinary prefill evidence does not qualify MTP.
 | Routed expert gate/up and down | Multi-row MTP enters the fixed-topology grouped transaction in `MoEExpertComputeStage::executeDecodeEquivalentVerifierPrefill`. Native projection candidates and M512 population policies exist; those policies do not admit ordinary verifier capacities. Sparse RouteOwned execution remains a distinct Dot4 producer. | Reuse and qualify native leaves for actual verifier routes, including sparse groups; install measured selection. The prefill-named interface alone does not prove MTP coverage. |
 | Floating grouped projections | `ROCmFloatingPointGemmKernel.cpp` selects `rocmFp16_batched_projection`, `rocmFp32_small_n_batched_projection`, or `rocmFp32x16_batched_projection`, preserving the serial fixed reduction tree. | Direct half/BF16 substitution changes native FP32 operands; a real half-input WMMA witness also changes the explicit FP16RNE reduction. Retain the existing exact producers; no ordinary rocBLAS replacement. |
 | Q8 router | The real verifier API already reaches the forced-capable byte-exact WMMA leaf. Automatic admits the original M512 key and85 exact-hosted M2–16 keys across four measured K/E shapes and both bases. | Actual Automatic component timing, seven focused registrations and80 source-bound profiles pass. Full routing/top-k remains a separate transaction boundary. |
-| Verifier attention | Typed grouped decode uses `flash_decoding_mi50_kernel` plus its reducer, with no WMMA choice. The M512 prefill helper has a different arithmetic tree. | Implement a decode-specific candidate preserving lane-owned dot2 chains, wave64 reduction, online softmax and split merge; qualify captured append-plus-attention and fixed-query scaling through64K KV. |
+| Verifier attention | Explicit FP16/HD256 `WmmaLaneExact` preserves lane-owned dot2/XOR, softmax/PV and original split reduction. Captured ring/sentinel/special-value and append/RoPE replay pass. Fixed-query scaling through64K passes; current cooperative-K timing loses all90 cells. Automatic remains ordered. | Qualify a profitable measured domain with a fuller query/head layout, retaining exact feature and resource gates. See the [proof](GFX1100_MTP_ATTENTION_WMMA.md). |
 
 The dense native decoder switch currently contains 18 physical cases. Qualification
 must enumerate the repository's full source-format inventory, including normalized
@@ -496,6 +504,15 @@ references; retain those alongside this archive when moving the evidence.
 
 ## Routed/shared verifier qualification boundary
 
+The next finite implementation slice extends existing owners rather than adding
+a new harness. `Perf__GPUExpertPipeline.cpp::runExpertPipeline` already owns
+prepared descriptors, routes, internal events and dirty observations; add a
+separate verifier roster because its ordinary WMMA roster excludes M<64.
+Capture the actual `MoEExpertComputeStage::execute` with
+`force_decode_equivalent_verifier_prefill=true`, normally prepared engines and
+`active_row_count_device`. Prepare the actual verifier router under
+`DecodeEquivalentVerifier` and retain its Q8 producer in the transaction.
+
 Reuse `Perf__GPUExpertPipeline.cpp::runExpertPipeline` for a finite Qwen
 H2048/I512/E256/top8 panel at physical M8/9/16, IQ2_S gate/up and IQ4_XS down.
 Start with Dot4/N32/N64 EveryExpert and Uniform/Hotset routing; sparse and empty
@@ -530,6 +547,35 @@ group and existing pipeline. Reuse the current shared-stage fixture and final
 gate/add serial regression. A synthetic one-expert route alone does not qualify
 the stage's gate/add and router-Q8 handoff semantics. No MoE selection change is
 installed by this audit.
+
+## Remaining bundle inventory
+
+The remaining dense work is complete bundle qualification, not another
+all-format leaf implementation. Derive geometry/provenance from
+`qwen_release_geometry.py::model_projection_geometries` and `QwenProjectionUse`,
+and operation identity from the actual typed stage descriptors. Each record
+needs ordered prepared sources/codebooks, original and physical N/K, projection
+count, TP slices, row authority, epilogue and complete timed boundary. Shape
+deduplication alone cannot distinguish QKV, GDN and selected LM-head work.
+
+| Bundle | Existing owner to extend | Missing evidence |
+|---|---|---|
+| Attention QKV or K/V-only | `FusedQKVGEMMStage` and native heterogeneous three-output replay | Actual unequal-width stage bundle and original slices |
+| Attention output | `GEMMStage` verifier path and Wo serial-byte tests | Source-owned output geometry and TP partition |
+| Gate/up through SwiGLU/down | `FusedGateUpGEMMStage` and public SwiGLU/down adapters | Connected captured operation with shared quantization and epilogues |
+| GDN projections | `GDNProjectionCaptureHarness` | Complete four-source stage timing, retaining floating controls |
+| Shared expert FFN | Actual shared-stage owner above | Gate/up/down, final shared gate/add and verifier-router Q8 handoff |
+| Selected LM-head | `HiddenStateRowsSelectStage` through `LMHeadStage` | Selection-plus-head boundary and original vocabulary/row ownership |
+
+Use the existing registered Qwen dense/GDN and MoE/shared profiles, including
+their full and TP-sharded declarations. Retain all21 source formats from the
+owning format inventory and separate mixed-format controls. Prove every M2–16;
+start paired economics at M4/5/8/16 and resolve any observed crossover before
+admission. Reuse the complete-operation event/poison/serial mechanics in
+`Test__ROCmDeviceCountedVerifierRows.cpp`; its current timing admission is
+singleton projection/SwiGLU only. Merely timing low-level bundle enums that
+reuse one matrix would not qualify distinct production sources. Automatic's
+multi-output and `ProjectionRowWork` exclusions remain until this proof exists.
 
 ## Verifier router economy and attention arithmetic
 

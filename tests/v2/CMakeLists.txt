@@ -21161,6 +21161,23 @@ if(HAVE_ROCM)
     )
     message(STATUS "V2 Tests: Added ROCm stable graph flash-decode benchmarks")
 
+    add_executable(v2_perf_rocm_verifier_attention_wmma
+        performance/kernels/rocm/Perf__ROCmVerifierAttentionWmma.cpp)
+    target_link_libraries(v2_perf_rocm_verifier_attention_wmma
+        llaminar2_core GTest::gtest GTest::gtest_main
+        rocprofiler-sdk-roctx::rocprofiler-sdk-roctx)
+    add_v2_test(V2_Integration_ROCmVerifierAttentionTimingReplay
+        COMMAND $<TARGET_FILE:v2_perf_rocm_verifier_attention_wmma>
+                --gtest_filter=ROCmVerifierAttentionTiming.CapturedEventBoundaryReplay
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;MTP;WMMA;GraphCapture;Replay;ByteExact;64K;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierAttentionTimingReplay)
+    add_v2_test(V2_Perf_ROCmVerifierAttentionWmmaPrefixScaling
+        COMMAND $<TARGET_FILE:v2_perf_rocm_verifier_attention_wmma> --gtest_also_run_disabled_tests
+                --gtest_filter=NativeGfx1100/ROCmVerifierAttentionPerf.DISABLED_PairedPrefixScaling/*
+        LABELS "V2;Performance;ROCm;Attention;MTP;WMMA;GraphCapture;PrefixScaling;64K;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 180 RESOURCE_LOCK rocm_gpu_0)
+
     # Performance Test: ROCm Flash Attention Prefill and captured context policy.
     # Covers direct-query and persistent K/V-context schedules, every native KV
     # representation, all released Qwen/TP geometries, and 256K context replay.
@@ -22273,6 +22290,7 @@ if(HAVE_ROCM)
     # against CPU attention reference with cosine similarity metrics
     add_executable(v2_integration_rocm_flash_attention_parity 
         integration/kernels/rocm/Test__ROCmFlashAttentionParity.cpp
+        integration/kernels/rocm/Test__ROCmVerifierAttentionWmma.cpp
     )
     target_link_libraries(v2_integration_rocm_flash_attention_parity 
         llaminar2_core 
@@ -22300,6 +22318,18 @@ if(HAVE_ROCM)
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
     )
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmFlashAttentionWmmaQKReplay)
+    add_v2_test(V2_Integration_ROCmVerifierAttentionWmmaReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
+                --gtest_filter=ROCmVerifierAttentionWmma.DirectRingDirtyReplay:ROCmVerifierAttentionWmma.SpecialValuesDirtyReplay:Test__ROCmFlashAttentionParity.CapturedAppendThenAttention_WmmaLaneExact_FP16HD256
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;MTP;GroupedVerifierRows;WMMA;GraphCapture;Replay;ByteExact;NativeRing;FP16;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 180 RESOURCE_LOCK rocm_gpu_0)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierAttentionWmmaReplay)
+    add_v2_test(V2_Integration_ROCmVerifierAttentionControlAndPayloadReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
+                --gtest_filter=ROCmVerifierAttentionWmma.ThreadOverrideOwnsArithmeticWithoutSplitOverride:ROCmVerifierAttentionWmma.AllWaveSpecialValuesDirtyReplay
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;MTP;WMMA;GraphCapture;Replay;ByteExact;FP16;ExceptionalValues;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierAttentionControlAndPayloadReplay)
     add_v2_test(V2_Integration_ROCmFlashAttentionAutomaticQKReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
                 --gtest_filter=ROCmFlashAttentionAutomaticQK.*

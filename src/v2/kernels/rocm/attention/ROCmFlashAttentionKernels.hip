@@ -26,6 +26,8 @@
  *     without repeating integer division for every historical token.
  *   - Ordinary and grouped rows share the same ordered parallel reduction,
  *     including deterministic mode; there is no serial-only policy branch.
+ *   - Explicit grouped gfx1100 WMMA preserves all original score lanes in LDS,
+ *     including independent row splits/rings and lane-specific NaN payloads.
  *
  * MI50 Optimization Strategy:
  *   1. Maximize LDS utilization (64KB per CU)
@@ -47,6 +49,7 @@
 #include "../../attention/AttentionDeviceParams.h"
 #include "ROCmFlashAttentionLaunchPolicy.h"
 #include "ROCmFlashAttentionQK.h"
+#include "ROCmVerifierAttentionWmma.h"
 #include "../../../tensors/BlockStructures.h"
 #include <cmath>
 #include <cfloat>
@@ -63,6 +66,7 @@ namespace llaminar2::rocm
 namespace
 {
 thread_local FlashAttentionQKEngine recording_qk_engine = FlashAttentionQKEngine::Automatic;
+thread_local VerifierAttentionEngine recording_verifier_engine = VerifierAttentionEngine::Automatic;
 }
 ScopedFlashAttentionQKEngine::ScopedFlashAttentionQKEngine(FlashAttentionQKEngine engine)
     : previous_(recording_qk_engine)
@@ -77,6 +81,21 @@ ScopedFlashAttentionQKEngine::ScopedFlashAttentionQKEngine(FlashAttentionQKEngin
     throw std::invalid_argument("unknown ROCm attention Q/K engine");
 }
 ScopedFlashAttentionQKEngine::~ScopedFlashAttentionQKEngine() { recording_qk_engine = previous_; }
+
+/** @copydoc ScopedVerifierAttentionEngine::ScopedVerifierAttentionEngine */
+ScopedVerifierAttentionEngine::ScopedVerifierAttentionEngine(VerifierAttentionEngine engine)
+    : previous_(recording_verifier_engine)
+{
+    switch (engine)
+    {
+    case VerifierAttentionEngine::Automatic:
+    case VerifierAttentionEngine::OrderedDot2:
+    case VerifierAttentionEngine::WmmaLaneExact: recording_verifier_engine = engine; return;
+    }
+    throw std::invalid_argument("unknown ROCm grouped verifier attention engine");
+}
+/** @copydoc ScopedVerifierAttentionEngine::~ScopedVerifierAttentionEngine */
+ScopedVerifierAttentionEngine::~ScopedVerifierAttentionEngine() { recording_verifier_engine = previous_; }
 }
 
 namespace
@@ -2914,6 +2933,8 @@ namespace
         }
     }
 
+#include "ROCmVerifierAttentionWmma.hip.inc"
+
     /**
      * @brief Flash Decoding reduction kernel
      *
@@ -3561,9 +3582,9 @@ static int launch_decode(
         rocm_env.fa_decode_num_splits.has_value();
     const int forced_splits =
         forced_splits_present ? *rocm_env.fa_decode_num_splits : 0;
-    const bool forced_tpb_present =
-        rocm_env.fa_decode_num_splits_present &&
-        rocm_env.fa_decode_tpb.has_value();
+    // The wave-count override is independent of split-count presence. Both
+    // scalar and grouped recording must embed the same requested arithmetic.
+    const bool forced_tpb_present = rocm_env.fa_decode_tpb.has_value();
     const int forced_tpb =
         forced_tpb_present ? *rocm_env.fa_decode_tpb : 0;
 
@@ -3667,7 +3688,8 @@ static int launch_grouped_decode(
         "Grouped launcher requires a row-local cache ownership policy");
 
     if (!Q || !K_cache || !V_cache || !O || !O_partial || !m_partial ||
-        !l_partial || !device_params || !hip_stream || row_count < 2 ||
+        !l_partial || !device_params || !hip_stream || hip_stream == hipStreamLegacy ||
+        hip_stream == hipStreamPerThread || row_count < 2 ||
         row_count >
             llaminar2::attention::kMaxGroupedVerifierAttentionRows ||
         query_rows_per_request <= 0 || max_kv_len <= 0 ||
@@ -3694,9 +3716,9 @@ static int launch_grouped_decode(
         rocm_env.fa_decode_num_splits.has_value();
     const int forced_splits =
         forced_splits_present ? *rocm_env.fa_decode_num_splits : 0;
-    const bool forced_tpb_present =
-        rocm_env.fa_decode_num_splits_present &&
-        rocm_env.fa_decode_tpb.has_value();
+    // The wave-count override is independent of split-count presence. Both
+    // scalar and grouped recording must embed the same requested arithmetic.
+    const bool forced_tpb_present = rocm_env.fa_decode_tpb.has_value();
     const int forced_tpb =
         forced_tpb_present ? *rocm_env.fa_decode_tpb : 0;
 
@@ -3708,6 +3730,36 @@ static int launch_grouped_decode(
         [](int ordinal) -> const llaminar2::ROCmDeviceHardware & {
             return llaminar2::rocmHardwareMetadata().at(ordinal);
         });
+    int stream_device = -1;
+    if (hipStreamGetDevice(hip_stream, &stream_device) != hipSuccess || stream_device != hardware.ordinal)
+    {
+        printf("[launch_grouped_decode] Explicit stream must belong to the admitted current device\n");
+        return -1;
+    }
+    const bool valid_head_mapping = gqa_n_rep > 0
+        ? head_start >= 0 && static_cast<long long>(head_start) + n_heads <= static_cast<long long>(n_kv_heads) * gqa_n_rep
+        : n_heads % n_kv_heads == 0;
+    if (!valid_head_mapping)
+    {
+        printf("[launch_grouped_decode] Invalid local or replicated GQA ownership\n");
+        return -1;
+    }
+    using VerifierEngine = llaminar2::rocm::VerifierAttentionEngine;
+    const auto requested_engine = llaminar2::rocm::recording_verifier_engine;
+    const bool native_verifier = requested_engine == VerifierEngine::WmmaLaneExact;
+    if (native_verifier)
+    {
+        const bool valid_native = KV_TYPE == KVTypeTag::FP16 && ROW_MODE == FlashDecodeRowMode::SharedKVVerifier &&
+            head_dim == 256 && (hardware.isa_target == "gfx1100" || hardware.isa_target.starts_with("gfx1100:")) &&
+            hardware.maximum_threads_per_block >= 1024 &&
+            hardware.lds_per_block >= sizeof(verifier_attention_wmma_detail::Storage) &&
+            (!forced_tpb_present || (forced_tpb >= 64 && forced_tpb <= 256 && forced_tpb % 64 == 0));
+        if (!valid_native)
+        {
+            printf("[launch_grouped_decode] Lane-exact WMMA requires gfx1100 shared-KV FP16 HD256, 1024-thread/LDS resources and whole original waves\n");
+            return -1;
+        }
+    }
     const int num_cus = hardware.compute_units;
     const float softmax_scale =
         1.0f / sqrtf(static_cast<float>(head_dim));
@@ -3719,38 +3771,51 @@ static int launch_grouped_decode(
     /* Clear a pre-existing asynchronous launch error before attributing one. */
     (void)hipGetLastError();
 
-    const dim3 split_grid(n_heads, max_num_splits, row_count);
-    constexpr int physical_threads = 256;
-    hipLaunchKernelGGL(
-        (head_dim == 256
-             ? flash_decoding_mi50_kernel<KV_TYPE, 256>
-             : flash_decoding_mi50_kernel<KV_TYPE, 0>),
-        split_grid,
-        dim3(physical_threads),
-        smem_size,
-        hip_stream,
-        Q,
-        K_cache,
-        V_cache,
-        O_partial,
-        m_partial,
-        l_partial,
-        max_kv_len,
-        n_heads,
-        n_kv_heads,
-        head_dim,
-        max_num_splits,
-        softmax_scale,
-        device_params,
-        ROW_MODE,
-        query_rows_per_request,
-        num_cus,
-        forced_splits_present,
-        forced_splits,
-        forced_tpb_present,
-        forced_tpb,
-        head_start,
-        gqa_n_rep);
+    if (native_verifier)
+    {
+        const dim3 native_grid(n_heads, max_num_splits, (row_count + 3) / 4);
+        hipLaunchKernelGGL(verifier_attention_wmma_detail::flash_decode_verifier_wmma_fp16_hd256_kernel,
+            native_grid, dim3(1024), 0, hip_stream, Q,
+            static_cast<const __half *>(K_cache), static_cast<const __half *>(V_cache),
+            O_partial, m_partial, l_partial, device_params, row_count, n_heads, n_kv_heads,
+            max_num_splits, num_cus, softmax_scale, forced_splits_present, forced_splits,
+            forced_tpb_present, forced_tpb, head_start, gqa_n_rep);
+    }
+    else
+    {
+        const dim3 split_grid(n_heads, max_num_splits, row_count);
+        constexpr int physical_threads = 256;
+        hipLaunchKernelGGL(
+            (head_dim == 256
+                 ? flash_decoding_mi50_kernel<KV_TYPE, 256>
+                 : flash_decoding_mi50_kernel<KV_TYPE, 0>),
+            split_grid,
+            dim3(physical_threads),
+            smem_size,
+            hip_stream,
+            Q,
+            K_cache,
+            V_cache,
+            O_partial,
+            m_partial,
+            l_partial,
+            max_kv_len,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_num_splits,
+            softmax_scale,
+            device_params,
+            ROW_MODE,
+            query_rows_per_request,
+            num_cus,
+            forced_splits_present,
+            forced_splits,
+            forced_tpb_present,
+            forced_tpb,
+            head_start,
+            gqa_n_rep);
+    }
     hipError_t error = hipGetLastError();
     if (error != hipSuccess)
     {
@@ -3790,6 +3855,10 @@ static int launch_grouped_decode(
         return -1;
     }
 
+    if constexpr (KV_TYPE == KVTypeTag::FP16 && ROW_MODE == FlashDecodeRowMode::SharedKVVerifier)
+        llaminar2::rocm::recordVerifierAttentionSubmission(native_verifier ? VerifierEngine::WmmaLaneExact : VerifierEngine::OrderedDot2,
+            {row_count,max_kv_len,n_heads,n_kv_heads,head_dim,max_num_splits,head_start,gqa_n_rep},
+            hardware.isa_target,hardware.ordinal);
     return 0;
 }
 

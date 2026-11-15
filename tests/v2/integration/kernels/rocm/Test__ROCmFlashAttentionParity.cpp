@@ -16,6 +16,7 @@
  *   cache formats, context partitions, ring wrap and replacement query data
  * - GQA configurations (n_heads != n_kv_heads)
  * - Deterministic captured decode retains KV parallelism and grouped/serial bytes
+ * - Grouped WMMA consumes real append/RoPE publication across retained replay
  *
  * **Pass Criteria**:
  * - Cross-backend CPU-vs-ROCm attention parity keeps numerical gates because
@@ -74,6 +75,7 @@
 #include "kernels/rocm/attention/ROCmFlashAttentionKernelT.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionQK.h"
+#include "kernels/rocm/attention/ROCmVerifierAttentionWmma.h"
 #include "kernels/cpu/attention/CPUFlashAttentionKernelT.h"
 #include "kernels/cpu/CPURingKVCache.h"
 #endif
@@ -842,7 +844,8 @@ protected:
         const char *label = nullptr,
         ActivationPrecision cache_precision = ActivationPrecision::FP16,
         int head_start = 0,
-        int gqa_n_rep = 0);
+        int gqa_n_rep = 0,
+        rocm::VerifierAttentionEngine engine = rocm::VerifierAttentionEngine::Automatic);
 #endif
 };
 
@@ -3694,6 +3697,7 @@ TEST_F(Test__ROCmFlashAttentionParity, AttentionStage_FP16Cache_Qwen36M4RoPEOnRe
  * @param cache_precision Native cache encoding; projection inputs follow its publisher contract.
  * @param head_start Global query-head offset for this LocalTP participant.
  * @param gqa_n_rep Global GQA replication ratio, or zero for the local ratio.
+ * @param engine Producer embedded in a fresh worker-owned graph recording.
  *
  * Captured and serial caches derive their quantization anchor from the same
  * history and append the same real rows. The scoped capture proves exact event
@@ -3710,7 +3714,8 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
     const char *label,
     ActivationPrecision cache_precision,
     int head_start,
-    int gqa_n_rep)
+    int gqa_n_rep,
+    rocm::VerifierAttentionEngine engine)
 {
     if (!hasROCm())
     {
@@ -3925,22 +3930,78 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
     TransferEngine::requireDeviceInput(q_grouped_tensor.get(), device, stream);
     ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
 
+    const bool native_verifier = engine == rocm::VerifierAttentionEngine::WmmaLaneExact;
+    const size_t checkpoint_bytes = native_verifier ? kv_cache->deviceSequenceStateCheckpointBytes() : 0;
+    std::unique_ptr<INT32Tensor> checkpoint;
+    std::vector<float> replay_reference(q_size), replay_output(q_size);
+    if (native_verifier)
     {
-        // The graph scope retires before its borrowed stream and tensors even
-        // when an assertion fails; append and attention share one capture DAG.
+        ASSERT_GT(checkpoint_bytes, 0u);
+        checkpoint = std::make_unique<INT32Tensor>(std::vector<size_t>{(checkpoint_bytes + 3) / 4});
+        auto join_checkpoint = [&](void *) {
+            if (hipStreamSynchronize(stream) != hipSuccess) std::terminate();
+        };
+        std::unique_ptr<void, decltype(join_checkpoint)> checkpoint_completion(checkpoint.get(), join_checkpoint);
+        ASSERT_TRUE(transfer.uploadFull(checkpoint.get(), device, stream).success);
+        ASSERT_TRUE(kv_cache->captureDeviceSequenceStateCheckpoint(
+            0, checkpoint->gpu_data_ptr(), checkpoint_bytes, stream));
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+    }
+    auto &worker = GPUDeviceContextPool::instance().getContext(device);
+    worker.submitAndWait([&]
+    {
+        // Record the whole append/attention transaction on its owning worker;
+        // a caller-thread engine scope cannot select a worker-local producer.
+        rocm::ScopedVerifierAttentionEngine engine_scope(engine);
         HIPGraphCapture graph(stream, device.rocm_ordinal());
-        ScopedBackendGraphCapture capture(graph, label ? label : "Grouped HIP attention");
+        auto drain = [&](void *) {
+            if (hipStreamSynchronize(stream) != hipSuccess) std::terminate();
+        };
+        std::unique_ptr<void, decltype(drain)> completion(&worker, drain);
+        ScopedBackendGraphCapture capture(worker, graph, label ? label : "Grouped HIP attention");
         ASSERT_TRUE(capture.begin());
         const bool capture_ok = append_stage.execute(nullptr) && attn_stage.execute(nullptr);
         capture.finish();
         ASSERT_TRUE(capture_ok);
-        if (kv_len >= 256 && n_heads <= 24)
+        if (native_verifier)
+        {
+            std::vector<GPUGraphKernelNodeInfo> nodes;
+            ASSERT_TRUE(graph.inspectKernelNodes(nodes));
+            const auto producer = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
+                return node.name.find("flash_decode_verifier_wmma_fp16_hd256_kernel") != std::string::npos;
+            });
+            ASSERT_NE(producer, nodes.end());
+            EXPECT_EQ(producer->block_x, 1024u);
+            EXPECT_EQ(producer->grid_z, (seq_len + 3u) / 4u);
+            EXPECT_EQ(producer->local_memory_bytes_per_thread, 0u);
+            EXPECT_EQ(std::count_if(nodes.begin(), nodes.end(), [](const auto &node) {
+                return node.name.find("flash_decoding_reduce_mi50_kernel") != std::string::npos;
+            }), 1);
+        }
+        else if (kv_len >= 256 && n_heads <= 24)
             test::expectParallelDecodeProducer(
                 graph, "flash_decoding_mi50_kernel", n_heads, seq_len);
         ASSERT_TRUE(graph.instantiate());
-        ASSERT_TRUE(graph.launch());
-        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
-    }
+        for (int replay = 0; replay < (native_verifier ? 3 : 1); ++replay)
+        {
+            // The admitted prefix is unchanged. Restoring its device metadata
+            // hides speculative payload bytes before the same captured append
+            // overwrites them; no recapture or host cache-count repair occurs.
+            if (replay)
+                ASSERT_TRUE(kv_cache->restoreDeviceSequenceStateCheckpoint(
+                    0, checkpoint->gpu_data_ptr(), checkpoint_bytes, stream));
+            ASSERT_EQ(hipMemsetAsync(out_grouped_tensor->gpu_data_ptr(), 0xa5,
+                q_size * sizeof(float), stream), hipSuccess);
+            ASSERT_TRUE(graph.launch());
+            ASSERT_EQ(hipMemcpyAsync(replay_output.data(), out_grouped_tensor->gpu_data_ptr(),
+                q_size * sizeof(float), hipMemcpyDeviceToHost, stream), hipSuccess);
+            ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+            if (!replay) replay_reference = replay_output;
+            else ASSERT_EQ(std::memcmp(replay_reference.data(), replay_output.data(), q_size * sizeof(float)), 0)
+                << "retained append/attention replay=" << replay;
+        }
+    });
+    ASSERT_FALSE(::testing::Test::HasFatalFailure());
     ASSERT_EQ(kv_cache->get_cached_tokens(0, 0), kv_len);
 
     std::vector<float> grouped_output(q_size, 0.0f);
@@ -4019,6 +4080,19 @@ void Test__ROCmFlashAttentionParity::runCapturedAppendThenAttentionFP16CacheQwen
 
     cleanupWorkspace(serial_kernel);
     ASSERT_EQ(hipStreamDestroy(stream), hipSuccess);
+}
+
+/** @brief Replay real append/RoPE/WMMA attention and compare independent serial rows. */
+TEST_F(Test__ROCmFlashAttentionParity, CapturedAppendThenAttention_WmmaLaneExact_FP16HD256)
+{
+    const auto &hardware = rocmHardwareMetadata().at(0);
+    if (hardware.isa_target != "gfx1100" && !hardware.isa_target.starts_with("gfx1100:"))
+        GTEST_SKIP() << "This single-device stage fixture requires native gfx1100 as ROCm:0";
+    for (const int rows : {2, 3, 4, 8, 9, 16})
+        for (const int history : {30, 513})
+            ASSERT_NO_FATAL_FAILURE(runCapturedAppendThenAttentionFP16CacheQwen36RoPEOnReadRowsMatchSerialDecode(
+                mpi_ctx_, rows, history, 8, 1, 256, "lane-exact WMMA append/RoPE replay",
+                ActivationPrecision::FP16, 8, 16, rocm::VerifierAttentionEngine::WmmaLaneExact));
 }
 
 /**

@@ -9,7 +9,8 @@
  * Native scalar decode retains the cache format even below a wavefront-wide
  * head, so grouped verification shares its query rounding and dot arithmetic.
  *
- * Target Architecture: AMD MI50 (gfx906 / Vega 20)
+ * Native targets: gfx906 ordered decode and gfx1100 ordered/WMMA producers.
+ * Grouped engine counters describe capture-time submissions, not device replay.
  *
  * @author David Sanftenberg
  * Device-specific launch plans bind immutable admitted CU/LDS limits before
@@ -30,6 +31,7 @@
 #include "../../../utils/ROCmKernelProfiler.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/PerfStatsCollector.h"
+#include "ROCmVerifierAttentionWmma.h"
 #include "../../attention/AttentionDeviceParams.h"
 #include <hip/hip_runtime.h>
 #include <algorithm>
@@ -330,6 +332,22 @@ namespace llaminar2
 {
     namespace rocm
     {
+        /** @copydoc recordVerifierAttentionSubmission */
+        void recordVerifierAttentionSubmission(VerifierAttentionEngine engine,
+            const VerifierAttentionGeometry &geometry, std::string_view native_isa, int device)
+        {
+            if (!PerfStatsCollector::isRecordFamilyEnabled(
+                    "gpu_graph_inventory", "rocm_verifier_attention_kernel_submissions")) return;
+            PerfStatsCollector::addCounter("gpu_graph_inventory", "rocm_verifier_attention_kernel_submissions", 1.0,
+                "kernel_submission", "rocm:" + std::to_string(device), {
+                    {"engine",verifierAttentionEngineName(engine)}, {"native_isa",std::string(native_isa)},
+                    {"query_rows",std::to_string(geometry.rows)}, {"kv_capacity",std::to_string(geometry.kv_capacity)},
+                    {"query_heads",std::to_string(geometry.query_heads)}, {"kv_heads",std::to_string(geometry.kv_heads)},
+                    {"head_dim",std::to_string(geometry.head_dim)}, {"split_capacity",std::to_string(geometry.split_capacity)},
+                    {"head_start",std::to_string(geometry.head_start)}, {"replicated_gqa",std::to_string(geometry.replicated_gqa)},
+                    {"kv_format","fp16"}, {"row_layout","shared_kv"}});
+        }
+
         /** @copydoc recordFlashAttentionQKSubmission */
         void recordFlashAttentionQKSubmission(FlashAttentionQKEngine engine,
             const attention::AttentionPrefillCaptureGeometry &geometry,
