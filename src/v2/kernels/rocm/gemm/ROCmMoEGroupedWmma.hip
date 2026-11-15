@@ -69,8 +69,10 @@ MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device, const MoEGro
 {
     const auto domain = groupedPopulationDomain(key);
     if (recording_engine == MoEGroupedPrefillEngine::Automatic &&
-        domain == MoEGroupedPopulationDomain::Qwen && nativeGroupedDevice(device))
-        return {MoEGroupedPrefillEngine::PopulationAdaptive,MoEGroupedWmmaRowFloor::Sixteen,domain};
+        (domain == MoEGroupedPopulationDomain::Qwen || domain == MoEGroupedPopulationDomain::Compact) &&
+        nativeGroupedDevice(device))
+        return {MoEGroupedPrefillEngine::PopulationAdaptive,domain == MoEGroupedPopulationDomain::Compact
+            ? MoEGroupedWmmaRowFloor::EveryExpert : MoEGroupedWmmaRowFloor::Sixteen,domain};
     if (recording_engine == MoEGroupedPrefillEngine::Automatic ||
         recording_engine == MoEGroupedPrefillEngine::OrderedDot4)
         return {MoEGroupedPrefillEngine::OrderedDot4,MoEGroupedWmmaRowFloor::EveryExpert};

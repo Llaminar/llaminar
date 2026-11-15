@@ -451,7 +451,7 @@ Q4_0=0 orIQ2_S=13. Both roles use ordered16×256/block256 and native16×32/block
 source-owned partition counts remain16 forGU(K512) and8 forDown(K256). N32 wins
 overN64 at every previously measured active tiled compact point, including full
 Q4_0/IQ2_S gains1.053×/1.043× overDot4. These are explicit-candidate results;
-compact Automatic still selectsDot4.
+the committed compact Automatic selectedDot4 before the implementation below.
 
 Both compact roles may share one TM16 directory: counts and offsets remain
 read-only, and SwiGLU has no directory argument. Bind the same264-entry capacity
@@ -479,6 +479,164 @@ complete immutable domain, exact stream/device, counts/offsets, selection and
 fixed-TM16 layout; Down consumes it once within the same lexical operation owner.
 This is capture construction metadata, never a host copy of live device state.
 
+### Compact automatic implementation and initial measurements
+
+The working implementation admits both compact source identities and shares the
+fixed-TM16 directory through a noncopyable operation owner and move-only GU
+receipt. Down validates the complete route key, pointer/layout bindings and
+native capture ID before consuming that receipt. A retained identity tag rejects
+tokens from a destroyed owner even when its address is reused. None of this
+construction metadata is read or advanced during device replay. A64-thread
+planner publishes the device choice and at most264 live tile entries; no LDS or
+block barrier is required. Both roles retain separate ordered/native consumers.
+All eight positive expert counts must be equal and at least12 to selectN32;
+other ExpertTiled work selectsDot4. Existing sparse RouteOwned admission runs
+before those consumers read the directory.
+
+Initial Release replays pass forQ4_0,IQ2_S andQwen. Both device-free registrations
+also pass. The native fixture independently authenticates one shared planner,
+no Down planner, exact source/geometry and both arithmetic consumers per role.
+Auxiliary capture probes reject a264-word bank, moved/consumed/foreign receipts,
+same-address owner replacement,15 malformed packets and crossed recording
+intervals. Real poisoned/reset replay covers sparse interior holes, native17/18
+tails, the88-to96-route threshold, full/empty transitions, each omitted producer
+and restored repeated replay. An explicit CompactReplay preflight registration
+selects both source fixtures. These initial checks do not yet certify the full
+feature suite or all active-kernel counter evidence.
+
+Each initial uniform tournament authenticates7,595 paired samples across35
+live-work sizes and seven policies, including the actual automatic parent:
+
+| Operation | Auto wins vsDot4 | Geometric Dot4/Auto | Full512 Dot4/Auto |
+|---|---:|---:|---:|
+| CompactQ4_0 |27/35|1.074124|1.126926|
+| CompactIQ2_S |27/35|1.057426|1.084671|
+| Qwen shared-body recheck |29/35|1.040502|1.178827|
+
+Compact loses roughly5–12% in the smallest cells. This initial topology is
+unpromoted. Ordered grids contain264GU/528Down workers; native grids contain
+2,112GU workers withz2 and4,224Down workers. Exact coldQ4 GPUBusy passes measure
+7.041µs and7.120µs for the inactive native GU/Down launches. These diagnostics
+motivate testing smaller native grids; they are separate from canonical timing.
+The next launch-only experiment uses1,024GU workers withz2 and2,048Down workers.
+Existing live-work loops retain complete coverage, including partial last tiles.
+No physical-residency claim is inferred from HIP's calculated occupancy result.
+
+Both initial builds pass the completegfx906/gfx1100 spill guard. The allocation
+census covers1,095 kernels per build, including an unusedgfx906 compact planner
+that the subsequent architecture guard removes. Compact's eight consumers use
+53–64VGPRs and zero private/vector spills; its planner uses22VGPRs and zeroLDS
+on gfx1100. Qwen's shared-body extraction changes its compiled GU allocation
+details, so earlier Qwen timings/profiles are not silently treated as fresh
+evidence. The initial73-file source/Release/evidence archive is
+`grouped-population-compact-auto-snapshot/snapshot.json`, SHA256
+`5ce4fcb079b57d86d15138da55301adccc4a15e3e5c66dc4a9388b8952568c4d`.
+The Down inactive profile completed separately at
+`population-compact-auto-profile-0-down_native-11-GPUBusy-1794727607214549079/receipt.json`.
+
+The capped native grids also pass both source replays and their 7,595-sample
+tournaments. Q4_0 reaches 1.058892 geometric speedup and 1.096035 at full work;
+IQ2_S reaches 1.058192 and 1.031437. Both still win 27/35 sizes, with sparse
+losses reaching about 8–9%. The cap does not resolve the fixed launch overhead
+and weakens full-work gains, so it is not promoted. Both builds pass the spill
+guard, and their censuses cover 1,094 kernels after removing the unused planner.
+The next candidate combines both arithmetic branches in one 128-thread consumer
+per role, with ordered TN128 and native BN32. This preserves TM16 ownership and
+removes two launches; its changed allocation and cold staging need measurement.
+
+The combined-loop candidate passes both source replays and both 7,595-sample
+tournaments. Q4_0 reaches 1.086386 geometric speedup but 0.979633 at full work;
+IQ2_S reaches 1.097963 and 0.994421. Its four allocations use 77/84/78/84 VGPRs,
+with zero private/vector spills. The 59-file archive is
+`grouped-population-compact-fused-snapshot/snapshot.json`, SHA256
+`d5108b189a89f32a7bc224d58cd9ff97306e6927cdc79c143e10b343f94fb76a`.
+A ten-wave compiler hint is rejected before runtime: the spill guard detects
+20/28/44 bytes of memory spill slots in three kernels. The rejected-build receipt
+is `grouped-population-compact-waves10-rejected/receipt.json`, SHA256
+`655608ef3985b4493471fe2473773d7e8357b603c771f3d7216e61713ebdbc53`.
+No runtime result is attributed to that failed build.
+
+Compact has one K32 block per canonical partition. Folding each row immediately
+retains the same `wideCommit(+0.0f,...)` and rounded partition addition, while
+shortening partial-accumulator lifetimes. Both byte replays and tournaments pass,
+but allocation changes only to 77/84/76/83 VGPRs. Full ratios remain
+0.987320/1.001915; this alone does not recover full-work performance. Its 49-file
+archive is `grouped-population-compact-fold-snapshot/snapshot.json`, SHA256
+`2a06ce6a2cc379e6b09f38ce206ede9f4f1bc9b46543267ef888081b37f6ba2c`.
+
+The next version chooses Compact's global family before entering the work loop.
+Separate inlined ordered/native loops borrow one wrapper-owned LDS union and row
+table through typed views. Views retain the union owner so assignments explicitly
+name the active member; they do not borrow an initially inactive member directly.
+The resulting allocations are 57/64/56/63 VGPRs with unchanged LDS and no memory
+spills. Both builds cover 1,090 kernels. Q4_0/IQ2_S Release replays pass, as do both
+host registrations and the full focused suite: 16 registrations, 233 native
+executions and 231 unique cases. The two Compact cases are deliberately repeated
+by their explicit preflight registration. The receipt is
+`grouped-population-compact-outer-owner-focused-all-1794730223108455369/receipt.json`.
+
+Q4_0 wins every tiled size, with geometric/full ratios 1.106574/1.100620. Sparse
+losses remain up to about 2.2%. IQ2_S repeats a large-work weakness: the second
+tournament gives geometric/full ratios 1.085799/0.990523, with about 3.4% and 4.9%
+losses at live256/384. Exact full IQ2_S GPUBusy passes measure GU190.202µs and
+Down88.921µs. This remains unpromoted performance evidence. The 78-file archive is
+`grouped-population-compact-outer-owner-snapshot/snapshot.json`, SHA256
+`5fc248f3345e707e2d7a97b2fb99fe383cee082e8471d00d8138e037a5de14a9`.
+The launch-only experiment retains Q4 grids528/1056 and expands IQ2_S to
+GU2112 withz2 and Down4224, reducing native work per worker without changing
+arithmetic, ownership or the population decision.
+Its replay and 7,595-sample tournament pass. IQ2_S geometric/full ratios become
+1.080469/1.051213, with 25/35 wins; sparse losses reach 3.2%, and live256/384/480/481
+remain within about 0.9% below Dot4. The full GU profile falls to156.281µs with
+the same64-VGPR allocation. These are explicit tradeoffs, not an all-sizes win.
+The changed launch geometry also passes the two-case Compact integration
+registration at `grouped-population-compact-iq2grid-focused-compact-1794732100490058375/receipt.json`.
+All six architecture-specific device code objects are byte-identical to the
+preceding complete focused-suite producer; the bridge is
+`grouped-population-compact-iq2grid-device-byte-bridge.json`.
+The 70-pass counter campaign passes for ordered/native execution in both roles
+and both codebooks, plus the shared planner. Its owner is
+`grouped-population-compact-iq2grid-counter-campaign-1794732259651347510/campaign.json`;
+the authenticated summary is `grouped-population-compact-iq2grid-profile-summary.json`,
+SHA256 `da131b486ed35141afa7c0785c1abc7757501dde19f7217c7df671152eae4baf`.
+All ten cells report zero scratch and zero LDS bank-conflict metric. Q4_0 GU/down
+use 57/56 VGPRs and 1808/1744 LDS bytes; IQ2_S uses 64/63 VGPRs and 1872/1808
+bytes. The shared directory uses 22 VGPRs and no LDS. All code-object identities
+and launch grids agree across the seven counters per cell. Reported wave counts
+are not achieved occupancy, and profiler intervals do not replace canonical
+unprofiled complete-operation timings.
+
+Two independent read-only reviews found no source arithmetic, ownership,
+capture or replay-registration blocker. Qwen's helper extraction retains its
+ordered commits and barriers, but its compiled GU allocation differs from the
+previous checkpoint. Fresh three-distribution timing and 42 exact counter passes
+are owned by
+`grouped-population-qwen-compact-refresh-campaign-1794733400040581565/campaign.json`.
+All 42 counter passes and 22,785
+timing samples pass: uniform geometric/full ratios are 1.040109/1.182662 with
+29/35 wins, hotset 1.146497/1.160086 with 33/35 wins, and power-law
+1.030900/1.041256 with 26/35 wins. The worst latency increases over Dot4 are
+about 1.17%, 0.83% and 1.42%, respectively. These fresh values replace the older
+Qwen checkpoint's measurements for the current shared implementation; they do
+not establish that every measured work size wins. The profile summary is
+`grouped-population-qwen-compact-refresh-profile-summary.json`, SHA256
+`93956451c2ce87b6343854ffcce532d7a421ad3431f53e513c1926e9f51a7921`.
+It authenticates one code-object identity across all six cells and seven metrics
+per cell, with zero private scratch, vector spills and reported LDS conflicts.
+Ordered GU is 57VGPR/106SGPR/544B LDS with51 audited scalar register-lane moves;
+native GU is67/89/3664B, and down is83/105/1808B. The two directory kernels are
+40/40/4356B and6/22/4096B. Source review, actual capture/dirty replay, complete
+operation timings and these profiles qualify the current Compact implementation
+and shared Qwen refactor, with the reported work-size tradeoffs.
+
+The qualified checkpoint freezes 1,331 source, build, replay, timing and profile
+artifacts in `grouped-population-compact-qualified-snapshot/snapshot.json`, SHA256
+`6b24d24a815426ac49f3563bf9c6be7818c366c3349d866a3837cf91e92e66bf`.
+The final worst Compact latency increases over Dot4 are2.282% at Q4_0 live7 and
+3.291% at IQ2_S live3 (the corresponding throughput-ratio deficits are2.231%
+and3.186%). Residual small-work tuning and the added MTP implementation remain
+open; this checkpoint does not certify those unfinished objectives.
+
 All relative evidence paths above are under
 `/tmp/llaminar-gfx1100-wmma-prefill-evidence/`. These are local investigation
-artifacts, not published corpus payloads or a completed performance claim.
+artifacts, not published corpus payloads or a completed overall-goal certificate.

@@ -825,3 +825,38 @@ TEST(Test__ROCmMoEGroupedPopulation, PersistentDirectoryStorageReplay)
     EXPECT_THROW((void)MoEGroupedPopulationDirectoryLayout(0),std::invalid_argument);
     EXPECT_THROW((void)MoEGroupedPopulationDirectoryLayout(-1),std::invalid_argument);
 }
+
+/** @test Route-publication identity is complete and independent of live device values. */
+TEST(Test__ROCmMoEGroupedPopulation, RoutePublicationBindingReplay)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::rocm;
+    int counts[8]{}, offsets[8]{}, foreign[8]{};
+    const ROCmMoEGroupedPrefillRouteKey key{
+        .gateup_codebook=0,.down_codebook=0,.hidden_size=512,.expert_width=256,
+        .expert_count=8,.top_k=8,.rows=512,
+        .operation=MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes};
+    const ROCmMoEGroupedRouteAdmission admission(key,counts,offsets);
+    for (int replay=0;replay<3;++replay)
+    {
+        counts[0]=replay; offsets[7]=replay*8;
+        EXPECT_TRUE(admission.binds(key,counts,offsets));
+        EXPECT_FALSE(admission.binds(key,foreign,offsets));
+        EXPECT_FALSE(admission.binds(key,counts,foreign));
+        EXPECT_FALSE(admission.binds(key,nullptr,offsets));
+        EXPECT_FALSE(admission.binds(key,counts,nullptr));
+        for (auto field : {&ROCmMoEGroupedPrefillRouteKey::hidden_size,&ROCmMoEGroupedPrefillRouteKey::expert_width,
+                           &ROCmMoEGroupedPrefillRouteKey::expert_count,&ROCmMoEGroupedPrefillRouteKey::top_k,
+                           &ROCmMoEGroupedPrefillRouteKey::rows})
+        {
+            auto changed=key; ++(changed.*field);
+            EXPECT_FALSE(admission.binds(changed,counts,offsets));
+        }
+        auto changed=key; changed.gateup_codebook=13;
+        EXPECT_FALSE(admission.binds(changed,counts,offsets));
+        changed=key; changed.down_codebook=13;
+        EXPECT_FALSE(admission.binds(changed,counts,offsets));
+        changed=key; changed.operation=MoEPrefillMeasuredOperation::Unmeasured;
+        EXPECT_FALSE(admission.binds(changed,counts,offsets));
+    }
+}

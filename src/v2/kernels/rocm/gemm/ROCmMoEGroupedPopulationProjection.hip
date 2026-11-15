@@ -2,13 +2,15 @@
  * @file ROCmMoEGroupedPopulationProjection.hip
  * @brief Independent compilation owner for the device-population projection transaction.
  *
- * Gate/up publishes its decision and directory before its exclusive consumers; down
- * rebuilds the directory for its fused consumer after SwiGLU. Both roles borrow
- * canonical arena storage. This shard owns and initializes its private IQ2_S
+ * Gate/up publishes its decision and directory before its exclusive consumers.
+ * Qwen down rebuilds its row map after SwiGLU; Compact down borrows GU's fixed
+ * TM16 map within the same native recording interval. All roles borrow canonical
+ * arena storage. This shard owns and initializes its private IQ2_S
  * lookup table through the existing backend generation transaction before capture.
  */
 #include <hip/hip_runtime.h>
 #include "ROCmMoEGroupedPopulationDecision.h"
+#include "ROCmMoEGroupedCompactPopulation.h"
 #include "ROCmMoEGroupedPopulationWork.h"
 #include "ROCmMoEGroupedPopulationPublication.h"
 #include "ROCmNativeQuantisedDecodeEquivalentMath.h"
@@ -229,6 +231,176 @@ bool submitMoEGroupedPopulation(MoEPrefillProjectionRole role, MoEGroupedPopulat
 #else
     return false;
 #endif
+}
+
+
+/** @brief Publish Compact's fixed-TM16 directory once for both projection roles.
+ * @param counts Authoritative eight-expert counts. @param directory Canonical 265-word bank.
+ * @param admission Current device route authority. @param selection Sole decision publisher.
+ * @note The first eight lanes reduce one complete expert table. Padded lanes
+ * participate with identities; no inter-wave state or block barrier is needed. */
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1100__)
+__global__ __launch_bounds__(64,1)
+void moe_grouped_build_compact_population_directory_kernel(const int *counts,uint32_t *directory,
+    ROCmMoEGroupedRouteAdmission admission,MoEGroupedPopulationPublisher selection)
+{
+    const int tid = threadIdx.x;
+    if (!admission.allows(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled))
+    {
+        if (tid == 0) selection.publish(MoEGroupedPopulationFamily::Dot4);
+        return;
+    }
+    const int slots = admission.activeSlots();
+    const int count = tid < 8 ? counts[tid] : 0;
+    if (count < 0 || count > slots || slots > 4096) __builtin_trap();
+    int active = count > 0, minimum = count > 0 ? count : INT_MAX, maximum = count, sum = count;
+    #pragma unroll
+    for (int step = 4; step > 0; step /= 2)
+    {
+        active += __shfl_down(active,step,8);
+        minimum = min(minimum,__shfl_down(minimum,step,8));
+        maximum = max(maximum,__shfl_down(maximum,step,8));
+        sum += __shfl_down(sum,step,8);
+    }
+    if (tid == 0)
+    {
+        if (sum != slots) __builtin_trap();
+        selection.publish(groupedPopulationFamily(MoEGroupedPopulationDomain::Compact,{active,minimum,maximum}));
+    }
+    const int expert_tiles = (count + 15) / 16;
+    int inclusive = expert_tiles;
+    #pragma unroll
+    for (int stride = 1; stride < 8; stride <<= 1)
+    {
+        const int previous = __shfl_up(inclusive,stride,8);
+        if (tid % 8 >= stride) inclusive += previous;
+    }
+    const int total = __shfl(inclusive,7,64);
+    if (total > MoEGroupedCompactPopulationTransaction::kDirectoryCapacity) __builtin_trap();
+    if (tid == 0) directory[MoEGroupedCompactPopulationTransaction::kDirectoryCapacity] = total;
+    // Counts beyond the first subgroup are zero. Only live entries are written;
+    // unused capacity stays poisoned and every consumer stops at the live count.
+    for (int tile = 0; tile < expert_tiles; ++tile)
+        directory[inclusive-expert_tiles+tile] =
+            (static_cast<uint32_t>(tile*16) << moe_grouped_directory::kExpertBits) | static_cast<uint32_t>(tid);
+}
+#endif
+
+namespace grouped_wmma_detail
+{
+/** @brief Record Compact's one adaptive arithmetic producer on one exact stream.
+ * @tparam FMT Source-preserving physical decoder. @tparam GateUp Two output roles versus down.
+ * @param args Complete immutable projection packet. @param control Device population binding.
+ * @param stream Authenticated exact stream. @return Complete successful role receipt or no receipt. */
+template<NativeQuantisedGemmFormat FMT,bool GateUp>
+std::optional<MoEGroupedPrefillRoleSubmission> submitCompactPopulationRole(
+    const MoEGroupedWmmaArguments &args,MoEGroupedPopulationControl control,hipStream_t stream)
+{
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1100__)
+    constexpr int n = GateUp ? 256 : 512;
+    // Q4 keeps the coarse ordered extent. IQ2's larger native grid exposes
+    // independent table decodes instead of serializing four tiles per worker.
+    // Both arithmetic choices still use one consumer and the exact live limit.
+    constexpr int worker_columns = FMT == NATIVE_QUANTISED_GEMM_IQ2_S ? 32 : 128;
+    const dim3 grid(MoEGroupedCompactPopulationTransaction::kDirectoryCapacity*(n/worker_columns),1,GateUp ? 2 : 1);
+    MoEGroupedPrefillRoleSubmission submitted;
+    populationProjectionCompact<FMT,GateUp,PopulationArithmetic::Mixed>
+        <<<grid,128,0,stream>>>(args,control);
+    if (hipGetLastError() != hipSuccess) return std::nullopt;
+    submitted.record({MoEGroupedPrefillEngine::PopulationAdaptive,
+        MoEGroupedWmmaRowFloor::EveryExpert,16,32,128,16,1,128});
+    return submitted;
+#else
+    return std::nullopt;
+#endif
+}
+}
+
+bool MoEGroupedCompactPopulationTransaction::accepts(MoEPrefillProjectionRole role,uint32_t codebooks,
+    const MoEGroupedWmmaArguments &args) const
+{
+    const bool gu = role == MoEPrefillProjectionRole::GateUp;
+    const int n = gu ? 256 : 512, k = gu ? 512 : 256;
+    if (role != MoEPrefillProjectionRole::GateUp && role != MoEPrefillProjectionRole::Down) return false;
+    if (codebooks != (gu ? key_.gateup_physical : key_.down_physical) ||
+        !args.activations || !args.activation_scales || !args.descriptors || !args.output ||
+        args.group_counts != counts_ || args.group_offsets != offsets_ || args.directory != workspace_.directory ||
+        args.directory_capacity != kDirectoryCapacity || args.rows != key_.rows || args.top_k != key_.top_k ||
+        args.experts != key_.experts || args.device != device_ || args.n != n || args.k != k ||
+        args.branch_suppression != MoEGroupedBranchSuppression::None ||
+        args.input != (gu ? MoEGroupedWmmaInput::OriginalTokens : MoEGroupedWmmaInput::GroupedRows) ||
+        gu != (args.second_descriptors != nullptr) || gu != (args.second_output != nullptr) ||
+        (gu && !args.group_token_indices) || !args.dot_admission.binds(role,n,k) ||
+        args.dot_admission.rowPlan().isWide() ||
+        args.dot_admission.rowPlan().floor() != MoEGroupedWmmaRowFloor::EveryExpert ||
+        args.dot_admission.rowPlan().rows(1) != 16) return false;
+    const int source = codebooks == 1u ? 0 : 13;
+    const ROCmMoEGroupedPrefillRouteKey route_key{
+        .gateup_codebook=static_cast<uint8_t>(source),.down_codebook=static_cast<uint8_t>(source),
+        .hidden_size=key_.hidden,.expert_width=key_.intermediate,.expert_count=key_.experts,
+        .top_k=key_.top_k,.rows=key_.rows,.operation=key_.operation};
+    if (!args.admission.binds(route_key,counts_,offsets_)) return false;
+    if (args.partitions.forCodebook(source) != MoEProjectionNumericalContract::orderedKPartitionsForWidth(k)) return false;
+    const auto stream = static_cast<hipStream_t>(stream_);
+    if (stream == hipStreamLegacy || stream == hipStreamPerThread || !nativeGroupedDevice(device_)) return false;
+    int stream_device = -1;
+    return hipStreamGetDevice(stream,&stream_device) == hipSuccess && stream_device == device_;
+}
+
+std::optional<MoEGroupedCompactPopulationTransaction::GateUpSubmission>
+MoEGroupedCompactPopulationTransaction::gateUp(uint32_t codebooks,const MoEGroupedWmmaArguments &args)
+{
+    if (construction_ != Construction::Fresh)
+        throw std::logic_error("Compact population operation already recorded gate/up");
+    construction_ = Construction::Retired;
+    if (!accepts(MoEPrefillProjectionRole::GateUp,codebooks,args)) return std::nullopt;
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1100__)
+    const auto stream = static_cast<hipStream_t>(stream_);
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    unsigned long long capture_id = 0;
+    if (hipStreamGetCaptureInfo(stream,&status,&capture_id) != hipSuccess ||
+        (status != hipStreamCaptureStatusNone && status != hipStreamCaptureStatusActive)) return std::nullopt;
+    recording_ = status == hipStreamCaptureStatusActive ? Recording::Captured : Recording::Eager;
+    capture_id_ = recording_ == Recording::Captured ? capture_id : 0;
+    moe_grouped_build_compact_population_directory_kernel<<<1,64,0,stream>>>(
+        counts_,workspace_.directory,args.admission,MoEGroupedPopulationPublisher(workspace_.selection));
+    if (hipGetLastError() != hipSuccess) return std::nullopt;
+    const MoEGroupedPopulationControl control{MoEGroupedPopulationBinding(workspace_.selection)};
+    auto receipt = codebooks == 1u
+        ? grouped_wmma_detail::submitCompactPopulationRole<NATIVE_QUANTISED_GEMM_Q4_0,true>(args,control,stream)
+        : grouped_wmma_detail::submitCompactPopulationRole<NATIVE_QUANTISED_GEMM_IQ2_S,true>(args,control,stream);
+    if (!receipt) return std::nullopt;
+    construction_ = Construction::GateUpRecorded;
+    return GateUpSubmission(identity_,std::move(*receipt));
+#else
+    return std::nullopt;
+#endif
+}
+
+std::optional<MoEGroupedPrefillRoleSubmission> MoEGroupedCompactPopulationTransaction::down(
+    GateUpSubmission &&produced,uint32_t codebooks,const MoEGroupedWmmaArguments &args)
+{
+    if (produced.identity_ != identity_ || construction_ != Construction::GateUpRecorded)
+        throw std::logic_error("Compact down requires this operation's unconsumed GU directory");
+    produced.identity_.reset();
+    construction_ = Construction::Retired;
+    if (!accepts(MoEPrefillProjectionRole::Down,codebooks,args)) return std::nullopt;
+    const MoEGroupedPopulationControl control{MoEGroupedPopulationBinding(workspace_.selection)};
+    const auto stream = static_cast<hipStream_t>(stream_);
+    hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+    unsigned long long capture_id = 0;
+    if (hipStreamGetCaptureInfo(stream,&status,&capture_id) != hipSuccess ||
+        (recording_ == Recording::Captured &&
+            (status != hipStreamCaptureStatusActive || capture_id != capture_id_)) ||
+        (recording_ == Recording::Eager && status != hipStreamCaptureStatusNone) ||
+        recording_ == Recording::Unbound)
+        throw std::logic_error("Compact down crossed its GU native recording interval");
+    // GU, SwiGLU and down are ordered on this exact stream. Fixed TM16 row
+    // mapping and capacity are unchanged, so the same live-count publication
+    // remains authoritative; down records no planner or host readiness probe.
+    return codebooks == 1u
+        ? grouped_wmma_detail::submitCompactPopulationRole<NATIVE_QUANTISED_GEMM_Q4_0,false>(args,control,stream)
+        : grouped_wmma_detail::submitCompactPopulationRole<NATIVE_QUANTISED_GEMM_IQ2_S,false>(args,control,stream);
 }
 
 

@@ -55,6 +55,7 @@
 #include "kernels/rocm/gemm/ROCmMoEGroupedWmma.h"
 #include "utils/ROCmGroupedBranchMutation.h"
 #include "utils/ROCmGroupedPopulationCaptureProof.h"
+#include "utils/ROCmGroupedCompactPopulationReplayProof.h"
 #endif
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -533,10 +534,10 @@ namespace
         const bool compact_population = population && parameter.rows == 512 && parameter.hidden == 512 &&
             parameter.intermediate == 256 && parameter.experts == 8 && !parameter.down_format &&
             (parameter.format == TensorType::Q4_0 || parameter.format == TensorType::IQ2_S);
-        // Compact's TM16/TN256 ordered geometry needs its own fused qualification.
+        // Admission is independently reconstructed from original fixture facts.
         const auto population_domain = qwen_population ? rocm::MoEGroupedPopulationDomain::Qwen :
-            rocm::MoEGroupedPopulationDomain::Unmeasured;
-        const int automatic_native_families = qwen_population ? 1 : 0;
+            compact_population ? rocm::MoEGroupedPopulationDomain::Compact : rocm::MoEGroupedPopulationDomain::Unmeasured;
+        const int automatic_native_families = qwen_population || compact_population ? 1 : 0;
         if (native)
         {
             initializeROCmHardwareMetadata();
@@ -864,7 +865,7 @@ namespace
                     const int native_families = dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::Automatic
                         ? automatic_native_families : 1;
                     ASSERT_EQ(native_nodes,2 * native_families * (profile ? 1 : repeats));
-                    const int ordered_families = dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::Automatic
+                    const int ordered_families = !compact_population && dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::Automatic
                         ? automatic_native_families : 0;
                     ASSERT_EQ(ordered_population_nodes,ordered_families * (profile ? 1 : repeats));
                     ASSERT_EQ(gate_up_nodes,(native_families + ordered_families) * (profile ? 1 : repeats));
@@ -966,10 +967,12 @@ namespace
                         automatic_submissions += record.value;
                         ASSERT_EQ(std::stoi(record.tags.at("gateup_submitted_tiled_leaves"))*(profile ? 1 : repeats),gateup_leaves);
                         ASSERT_EQ(std::stoi(record.tags.at("down_submitted_tiled_leaves"))*(profile ? 1 : repeats),down_leaves);
-                        ASSERT_EQ(record.tags.at("gateup_submitted_tiles"),
+                        const std::string compact_tiles =
+                            "device_population_v1:16x32/threads=128/ordered_rows=16/ordered_columns=128/floor=0/leaves=1";
+                        ASSERT_EQ(record.tags.at("gateup_submitted_tiles"),compact_population ? compact_tiles :
                             "dot4:12x128/threads=128/ordered_rows=0/ordered_columns=0/floor=0/leaves=1;"
                             "wmma_n32:16x32/threads=128/ordered_rows=0/ordered_columns=0/floor=0/leaves=1");
-                        ASSERT_EQ(record.tags.at("down_submitted_tiles"),
+                        ASSERT_EQ(record.tags.at("down_submitted_tiles"),compact_population ? compact_tiles :
                             "device_population_v1:16x32/threads=128/ordered_rows=16/ordered_columns=128/floor=16/leaves=1");
                         ASSERT_EQ(record.tags.at("gateup_submitted_tiles").find("wide_dot4_wmma"),std::string::npos);
                     }
@@ -990,7 +993,8 @@ namespace
                             static_cast<const int *>(device_live->gpu_data_ptr()),
                             static_cast<const int *>(workspace.getBuffer(MoEWorkspaceBuffers::GROUP_TOKEN_INDICES)),
                             parameter.rows,hidden,intermediate,profile ? 1 : repeats,
-                            dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::Automatic ? 2 * automatic_native_families : path != 0));
+                            dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::Automatic
+                                ? (compact_population ? 1 : 2) * automatic_native_families : path != 0));
                     }
                 }
                 std::unique_ptr<ROCmGroupedPopulationCaptureProof> population_proof;
@@ -1004,7 +1008,22 @@ namespace
                         *captured,static_cast<hipStream_t>(stream),population_domain,population_selection,
                         static_cast<const int *>(workspace.getBuffer(MoEWorkspaceBuffers::GROUP_COUNTS)),
                         static_cast<const uint32_t *>(workspace.getBuffer(MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY)),
-                        experts,profile ? 1 : repeats));
+                        experts,profile ? 1 : repeats,compact_population ? (parameter.format == TensorType::Q4_0 ? 0 : 13) : -1));
+                }
+                if (mode == ExpertBenchmark::PopulationReplay && compact_population)
+                {
+                    const auto [gu,gu_control] = population_proof->capturedRoleBindings(rocm::MoEPrefillProjectionRole::GateUp);
+                    const auto [down,down_control] = population_proof->capturedRoleBindings(rocm::MoEPrefillProjectionRole::Down);
+                    const uint32_t mask = parameter.format == TensorType::Q4_0 ? 1u : uint32_t{1} << 13;
+                    const rocm::MoEGroupedPopulationKey key{
+                        .operation=MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
+                        .input=rocm::MoEGroupedPopulationInput::OriginalTokens,
+                        .preparation=rocm::MoEGroupedPopulationPreparation::PublishedQ8,
+                        .rows=parameter.rows,.hidden=hidden,.intermediate=intermediate,.experts=experts,.top_k=top_k,
+                        .gateup_physical=mask,.down_physical=mask,.gateup_source=mask,.down_source=mask};
+                    ASSERT_NO_FATAL_FAILURE(replayCompactPopulationSubmission(context,stream,key,
+                        rocm::MoEGroupedPopulationWorkspace{population_selection,const_cast<uint32_t *>(gu.directory),
+                            MoEWorkspaceBuffers::rocmAdaptivePrefillDirectoryWords(parameter.rows*top_k,experts)},gu,down));
                 }
                 if (mode == ExpertBenchmark::PopulationReplay && population_domain == rocm::MoEGroupedPopulationDomain::Qwen)
                 {
@@ -1202,14 +1221,17 @@ namespace
                     }
                 };
                 const auto verify_population_producer_omissions = [&] {
-                    if (!qwen_population) return;
+                    if (!qwen_population && !compact_population) return;
                     const auto selected_family = expected_population(parameter.rows);
                     std::vector<int> counts(experts);
                     for (float id : route_ids) if (id >= 0) ++counts[static_cast<int>(id)];
                     if (!population_proof->tiled(std::accumulate(counts.begin(),counts.end(),0))) return;
+                    for (const auto role : {rocm::MoEPrefillProjectionRole::GateUp,rocm::MoEPrefillProjectionRole::Down})
+                    {
+                    if (!compact_population && role == rocm::MoEPrefillProjectionRole::Down) continue;
                     for (auto branch : {rocm::MoEGroupedBranchSuppression::Ordered,rocm::MoEGroupedBranchSuppression::Wmma})
                     {
-                        population_proof->omitArithmetic(branch);
+                        population_proof->omitArithmetic(branch,role);
                         poison();
                         ASSERT_TRUE(graphs.back()->launch());
                         ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),actual.size()*sizeof(float),parameter.device.ordinal,stream));
@@ -1247,6 +1269,7 @@ namespace
                             ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
                             ASSERT_EQ(std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float)),0);
                         }
+                    }
                     }
                 };
                 for (int live : {parameter.live_rows,0,1,std::min(8,parameter.live_rows),parameter.live_rows})
@@ -1563,7 +1586,10 @@ namespace
                         balanced(8,11,Family::Dot4); balanced(8,12,Family::N32); balanced(8,13,Family::N32);
                         balanced(7,16,Family::Dot4); balanced(8,512,Family::N32); balanced(0,0,Family::Dot4);
                         histograms.push_back({{15,16,16,16,16,16,16,16},Family::Dot4});
-                        balanced(8,512,Family::N32);
+                        histograms.push_back({{0,33,0,1,17,0,0,16},Family::Dot4});
+                        balanced(8,17,Family::N32); balanced(8,18,Family::N32);
+                        balanced(8,512,Family::N32); balanced(0,0,Family::Dot4);
+                        balanced(8,12,Family::N32); balanced(8,11,Family::Dot4);
                     }
                     const auto original_routes = route_ids, original_expected = expected;
                     const auto original_q8 = expected_q8, original_scales = expected_scales;
@@ -1975,6 +2001,10 @@ namespace
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_PopulationColdProfile)
     { runExpertPipeline(GetParam(),ExpertBenchmark::PopulationProfile,ExpertPublication::RouterQ8TokenRows,
         PopulationProfileWork{.live_rows=15,.producer=PopulationProfileProducer::Automatic}); }
+    /** @brief Profile Compact's ordered producer immediately below its native threshold. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_PopulationCompactColdProfile)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::PopulationProfile,ExpertPublication::RouterQ8TokenRows,
+        PopulationProfileWork{.live_rows=11,.producer=PopulationProfileProducer::Automatic}); }
     /** @brief Profile sparse paired experts at the actual forty-token live workload. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_PopulationPairProfile)
     { runExpertPipeline(GetParam(),ExpertBenchmark::PopulationProfile,ExpertPublication::RouterQ8TokenRows,

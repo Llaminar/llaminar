@@ -19,7 +19,7 @@ The earlier two-anchor NativeQuantised objective is documented separately in
 | Operation | CUDA implementation | ROCm implementation and gap |
 |---|---|---|
 | Dense quantized prefill | Native prepared-weight adapters select INT8 matrix tiles and preserve source scale arithmetic. | `ROCmNativeQuantisedWmma.hip` already implements all physical decoders on actual gfx1100. The original installed anchors cover N8192/K2048 at M512/1024. The installed 68-key QKV/shared-expert expansion passes all84 rebuilt actual-Auto cells. |
-| Routed quantized MoE | `CUDAMoEGroupedPrefillKernels.cu` uses `mma.sync.m16n8k32` for grouped projections. | `ROCmMoEGroupedWmma.hip` implements source-exact M16N32/N64 leaves under existing ExpertTiled device admission. Automatic remains ordered Dot4 while measured selection is qualified; RouteOwned retains its admitted sparse/empty domain. |
+| Routed quantized MoE | `CUDAMoEGroupedPrefillKernels.cu` uses `mma.sync.m16n8k32` for grouped projections. | `ROCmMoEGroupedWmma.hip` implements source-exact M16N32/N64 leaves under existing ExpertTiled device admission. Automatic admits measured Qwen and Compact population domains. RouteOwned owns sparse/empty work. |
 | Attention prefill | `CUDAFlashAttentionKernels.cu:1109` uses WMMA half QK with FP32 score accumulation; its general PV is scalar FP32. The active bounded HD256 specialization additionally uses tensor-core PV at `CUDATensorPrefillKernels.cu:328`. | `ROCmFlashAttentionKernels.hip` now has an explicit native four-plane QK candidate preserving the existing half-dot chains and FP32 PV. Automatic installs one-kernel Dot2/WMMA live-prefix selection in the measured FP16 M512 domain. |
 | Q8 router logits | `CUDARouterQ8PrefillDevice.cuh` uses exact INT8 MMA with the router's fixed FP32 tree. | Four/eight/sixteen-wave candidates preserve the ROCm adjacent-leaf tree. Automatic installs Sixteen for whole-row M512/K2560/E512 in both bases; compact-owned rows remain Dot4. |
 | Explicit half-operand floating projection | `CuBLASGemmKernel.cu:380` submits FP16 A/B and FP32 C through the tensor-operation library interface. | `HipBLASGemmKernel.cpp:291` submits half A/B and FP32 C through `hipblasGemmEx`, but the sampled M512/N8192/K2048 gfx1100 dispatch selects a vector FMA implementation. Library API admission does not establish matrix instruction use. |
@@ -34,22 +34,15 @@ production dispatch: GPU prepared quantized weights use NativeQuantised adapters
 | Area | Implementation | Functional/component evidence | Performance evidence |
 |---|---|---|---|
 | Broader dense dispatch | Bound installed-Auto/WMMA collector and selective publisher | Core-table ownership replay, eight binding and 16 decision regressions pass | 68 keys installed (684 total);168 profiles and84 rebuilt Auto cells pass; Auto gains1.22653–2.05860×, geometric mean1.39951× |
-| Grouped MoE | Wave64 M16N32/N64; fused Dot4/WMMA whole-expert floors4/8/12/16; all physical decoders | Serial, promoted, mixed-writer omission, threshold/reset and split/sliced-down replay pass | Ordinary router-Q8/token-output tournament:15,810 samples, six policies/five cases; full Qwen N32 wins1.20750×/1.15204×, mixed wide1.05358×; Auto stays Dot4 |
+| Grouped MoE | Wave64 M16N32/N64; fused Dot4/WMMA whole-expert floors4/8/12/16; all physical decoders | Serial, promoted, mixed-writer omission, threshold/reset and split/sliced-down replay pass | Ordinary router-Q8/token-output tournament:15,810 samples, six policies/five cases; full Qwen N32 wins1.20750×/1.15204×, mixed wide1.05358×; Qwen Auto results below |
 | Attention | Automatic one-kernel Dot2/WMMA live-prefix selection in the measured FP16 M512 domain | Actual Auto, immutable exclusions, counters, all-format, threshold/ring/partial/reset and internal timing-owner replays pass | Accepted64K gains1.155×/1.138× and doubling1.998×/1.993×;26 cells/14 counter passes |
 | Q8 router | Automatic Sixteen-wave tile for exact whole-row M512/K2560/E512; explicit 4/8/16-wave candidates retained | 14 GPU feature cases, five pure policy cases and both timing owners pass; actual Auto template, ownership and submission counters authenticated | Accepted full512 gains2.744×/2.551×;12 cells/seven counter passes |
 | Floating half GEMM | Existing production hipBLAS path; sampled native matrix gap confirmed | Three retained graph replays pass, each containing cast and vendor GEMM | Loaded bytes/ISA authenticated; complete Release cast+GEMM timing pending |
 
 [Router qualification](GFX1100_ROUTER_LIVE_PREFILL.md) records admission, retained-prefix timing and profiles.
 
-Grouped N32, N64 and boundary replay have separate explicit preflight registrations
-under the ordinary120-second timeout. Their disjoint inventory preserves all
-serial-row, mixed physical4/24 and K/N-tail cases; the former combined45-case
-registration exceeded its setup budget. Split replay has its own registration.
-The physical23 fixture uses real CPU packing/promotion, an independent compact
-Q5_K Dot4 reference, both public output banks and changed-input retained replay.
-Disabling each native projection independently makes that reference fail, proving
-the recorded kernels contribute. Split replay covers both tiles, all 21 source
-formats, whole-expert phases and compact column-owned down slices.
+Focused replay covers every source format, serial-row bytes, mixed/promoted
+descriptors, K/N tails, column slices, branch omissions and dirty/reset replay.
 
 [Operation proof](GFX1100_GROUPED_PREFILL_OPERATION_PROOF.md) records the accepted
 ordinary router-Q8/token-output tournament:15,810 samples across five cases and
@@ -59,19 +52,23 @@ sparse work favors Dot4. GU128 was correct but unpromoted. Bounded511 was reject
 The feature branch admits population Automatic for the exact Qwen domain,
 using separate ordered/native GU consumers and fused Down, with direct one-row
 GU arithmetic and selection folded into the GU directory. All22,785 Release
-samples pass: uniform32/35 wins (mean1.048×), hotset34/35 (1.151×), power-law28/35
-(1.028×); full gains1.175×/1.155×/1.034×. Remaining losses reach1.2%/0.3%/1.9%.
+refreshed samples pass: uniform29/35 wins (mean1.040×), hotset33/35 (1.146×),
+power-law26/35 (1.031×); full gains1.183×/1.160×/1.041×. Remaining losses reach
+1.2%/0.9%/1.5%.
 Both Release and Integration compile the complete target set without memory
-spills. All231 native cases, two host checks and42 counter passes are green.
-Compact Auto and complete performance qualification remain open. The
-[operation proof](GFX1100_GROUPED_PREFILL_OPERATION_PROOF.md) owns the experiments
-and archive identities, including rejected separate-Down and72-VGPR variants.
+spills. All233 focused native executions and both host checks are green.
+Compact Auto shares one typed directory and one adaptive consumer per role.
+All 233 focused native executions pass, plus both cases after the IQ2_S grid
+change. Q4_0 geometric/full gains are 1.107×/1.101×; IQ2_S gains 1.080×/1.051×.
+Sparse latency increases reach 2.3%/3.3%. All 70 exact counter passes are green, with zero
+scratch and zero reported LDS bank conflicts. All42 refreshed Qwen counter passes
+are also green. This slice is qualified; residual small-work losses remain open.
+The [operation proof](GFX1100_GROUPED_PREFILL_OPERATION_PROOF.md) owns measurements,
+ownership regressions and archive identities.
 
-The user accepts the existing dense/CUDA-reference, router and attention
-performance evidence without an isolation-receipt requirement. Isolation-only
-recollection is canceled; the [audit](GFX1100_PREFILL_ISOLATION_REQUALIFICATION.md)
-is superseded as a work requirement. Raw observations remain unchanged. This
-scope decision does not assert that collection had no competing workloads.
+The user removed isolation receipts and recollection from the work requirements.
+Existing dense/CUDA-reference, router and attention evidence remains accepted;
+the [isolation audit](GFX1100_PREFILL_ISOLATION_REQUALIFICATION.md) is superseded.
 
 Attention Automatic resolves the measured immutable domain once at capture:
 FP16/B1/M512/HD256/capacity65536,Q/KV12/2 or8/1, full causal query scheduling and

@@ -14,7 +14,7 @@ serial-row byte contract. Ordinary prefill evidence does not qualify MTP.
 | Operation | Current ROCm execution | WMMA work required |
 |---|---|---|
 | Dense quantized projections | `ROCmQuantisedGemmKernel.cpp` enters `rocmGemv_native_quantised_small_m_*_policy` in the decode-equivalent verifier scope, before ordinary prefill dispatch. `ROCmGemvKernel_native_quantised.hip` uses bounded shared-weight row tiles and ordered dot products. | Implement a native gfx1100 candidate preserving serial arithmetic for every physical decoder and source alias; cover standalone and fused projection APIs. |
-| Routed expert gate/up and down | Multi-row MTP enters the fixed-topology grouped transaction in `MoEExpertComputeStage::executeDecodeEquivalentVerifierPrefill`. `ROCmMoEGroupedWmma.hip` already has native projection candidates, but `selectedMoEGroupedPrefillPolicy` maps Automatic to OrderedDot4. Sparse RouteOwned execution remains a distinct Dot4 producer. | Reuse and qualify native leaves for actual verifier routes, including sparse groups; install measured selection. The prefill-named interface alone does not prove MTP coverage. |
+| Routed expert gate/up and down | Multi-row MTP enters the fixed-topology grouped transaction in `MoEExpertComputeStage::executeDecodeEquivalentVerifierPrefill`. Native projection candidates and M512 population policies exist; those policies do not admit ordinary verifier capacities. Sparse RouteOwned execution remains a distinct Dot4 producer. | Reuse and qualify native leaves for actual verifier routes, including sparse groups; install measured selection. The prefill-named interface alone does not prove MTP coverage. |
 | Floating grouped projections | `ROCmFloatingPointGemmKernel.cpp` selects `rocmFp16_batched_projection`, `rocmFp32_small_n_batched_projection`, or `rocmFp32x16_batched_projection`, preserving the serial fixed reduction tree. | Evaluate matrix candidates under each declared arithmetic contract. Half storage does not authorize changing FP32 operands or reduction order. |
 | Q8 router | Native WMMA candidates exist, but Automatic admits only whole-row capacity512/K2560/E512. | Qualify verifier row counts and ownership, both router bases and reuse of the router's original Q8 publication. |
 | Verifier attention | The installed adaptive WMMA policy admits exact M512 prefill geometries. | Audit the actual verifier dispatch and qualify matrix use separately, preserving serial attention bytes and fixed-query scaling through 64K KV. |
@@ -29,6 +29,70 @@ CUDA provides a useful existing implementation pattern:
 launches `launchTensorCoreSmallMGenerated`. Its `verifierMmaM16N8K32` helper uses
 signed INT8 `mma.sync.aligned.m16n8k32`. Preserve the ROCm serial arithmetic
 contract when adapting operand staging, integer accumulation and epilogues.
+
+## First implementation slice
+
+Start with device-counted dense NativeQuantised standalone and fused projection
+APIs in the actual decode-equivalent verifier scope. The existing
+`ROCmNativeQuantisedWmma.hip.inc` already accepts serial-M1 partition counts and
+preserves each K32 commit and ordered FP32 fold. The missing authority is row
+ownership: `ROCmNativeQuantisedWmmaLaunch.h` has static M/N/K and serial partitions,
+but no `DeviceRowRange`/`ProjectionWork`. Reuse that arithmetic while adding the
+existing device-owned row contract; launching over allocated capacity would
+overwrite inactive rows and does not qualify a verifier producer.
+
+Extend `tests/v2/integration/kernels/rocm/Test__ROCmDeviceCountedVerifierRows.cpp`.
+It already captures public verifier APIs, varies prefix counts, compares raw
+bytes against independently executed production M1 rows, and checks poisoned
+inactive outputs. Cover standalone projection, homogeneous and mixed fused
+bundles, and fused SwiGLU/down through one retained capacity31 graph. Exercise
+full, small, empty and regrown work, every live row count 2–16, and 17/31. Its
+current `deviceCounted(M,count)` fixture does not establish nonzero origins or
+request-batched ownership; add those separately. Enumerate the source-format
+registry and promoted aliases. Replace Dot4-specific grid certificates with
+candidate-specific WMMA identity and contribution checks.
+
+The first economy panel can reuse that fixture's Qwen3.8 IQ4_XS geometries:
+N17408/K5120, N5120/K17408 and N10240/K5120, with capacities3/16 and live2/3/16.
+Compare complete captured operations, including preparation and epilogues,
+against the current grouped producer with31 paired samples. Existing seven-sample
+timing is exploratory evidence. The model-loading `V2_Perf_DenseVerifierRows_ROCm`
+M2/3/4 gate follows component qualification. Register the focused native replay
+explicitly in production preflight before treating this slice as complete.
+
+The standalone verifier epilogue also needs a focused regression. Its current
+native grouped admission requires beta zero and unmapped output. Nonzero beta
+or mapped output enters a host row loop in a fully active verifier scope;
+with an explicit multi-row `DeviceRowRange`, its first one-row quantizer instead
+rejects the mismatched physical geometry. Neither behavior certifies grouped
+execution. Implement the count-aware grouped combine using persistent workspace
+and the original row authority, and test alpha, beta and bias against independent
+serial rows while preserving inactive output bytes. Existing M1 alpha/beta tests
+and fused per-column bias tests do not cover this defect. New WMMA candidate
+admission must never silently enter that row loop.
+
+Implementation seams are the standalone, homogeneous-batched and mixed-batched
+`rocmLaunch_native_quantised_small_m_*` functions in
+`ROCmGemvKernel_native_quantised.hip`, declared through
+`ROCmGroupedVerifierLaunch.h`. Use `projectionWorkForLaunch(M, row_range)` and
+the existing compile-time work dispatch. Cursor bounds name original physical
+rows, including request holes and nonzero origins; they are not compacted row
+counts. Preserve the source-policy serial partition selection already resolved
+by those adapters, including original unsliced output widths for fused bundles.
+
+Add a typed verifier candidate scope separate from the prefill override, and
+reject incompatible forcing before recording graph nodes. The current WMMA
+body uses four waves and `RM=BM/32`; an M16 enum alone would create zero row
+fragments. An economical M16 candidate needs an explicit two-wave mapping while
+sharing decoder and commit helpers. The existing combine epilogue also needs
+the enclosing verifier prefix forwarded explicitly: its current
+`dispatchProjectionRows(M, nullptr)` only inherits `ProjectionRowWork`.
+
+The smallest epilogue regression is Q4_0 M3/N17/K32 with nonzero initial output,
+alpha, beta and bias, replaying live3,1,0,2 through one captured graph. Add mapped
+output, independent production M1 byte oracles, inactive-byte preservation and
+actual grouped-symbol/launch-count checks. Register it explicitly in production
+preflight; do not infer this coverage from the larger source-format sweep.
 
 ## Implementation work list
 

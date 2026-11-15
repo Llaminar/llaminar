@@ -1,6 +1,6 @@
 /**
  * @file ROCmMoEGroupedPopulationProjection.hip.inc
- * @brief Exclusive gate/up and fused down producers for the admitted Qwen operation.
+ * @brief Shared exact arithmetic for admitted Qwen and Compact population producers.
  *
  * Both arithmetic branches preserve the source partition order and share the
  * shard-local IQ table and the same contribution helpers as explicit WMMA leaves.
@@ -10,80 +10,135 @@
  */
 /** @brief Compiled arithmetic ownership within the retained population transaction. */
 enum class PopulationArithmetic { Mixed, Ordered, Native };
+/** @brief One compile-time authority for admitted row, column and partition geometry.
+ * @tparam TwoRoles Gate/up versus down. @tparam Domain Complete immutable operation. */
+template<bool TwoRoles,MoEGroupedPopulationDomain Domain>
+struct PopulationProjectionGeometry
+{
+    static constexpr bool compact = Domain == MoEGroupedPopulationDomain::Compact;
+    static constexpr int tm = !compact && TwoRoles ? 12 : 16;
+    static constexpr int n = compact ? (TwoRoles ? 256 : 512) : (TwoRoles ? 512 : 2048);
+    static constexpr int k = compact ? (TwoRoles ? 512 : 256) : (TwoRoles ? 2048 : 512);
+    static constexpr int partitions = MoEProjectionNumericalContract::orderedKPartitionsForWidth(k);
+    static constexpr int span = (k / 32 + partitions - 1) / partitions;
+    static constexpr int kb = span < 2 ? span : 2;
+};
+
+/** @brief Typed LDS ownership and borrowed branch views for one population CTA.
+ * @tparam FMT Physical decoder. @tparam TM Ordered rows. @tparam KB Native K32 stages. */
+template<NativeQuantisedGemmFormat FMT,int TM,int KB>
+struct PopulationProjectionStorage
+{
+    using Traits = NATIVE_QUANTISEDGemmTraits<FMT>;
+    static constexpr int sums = FMT == NATIVE_QUANTISED_GEMM_IQ1_M ? 4 :
+        Traits::is_dual_scale_asym ? 2 : Traits::is_asymmetric ? 1 : 0;
+    struct Native
+    {
+        I32x4 a[KB][16][2], b[KB][32][2];
+        uint16_t primary[KB][32], secondary[KB][Traits::needs_aux_compute ? 32 : 1];
+        uint32_t minima[KB][Traits::is_dual_scale_asym ? 32 : 1];
+        uint16_t qh[KB][FMT == NATIVE_QUANTISED_GEMM_IQ1_M ? 32 : 1];
+        int sums[KB][PopulationProjectionStorage::sums ? PopulationProjectionStorage::sums : 1][16];
+        alignas(16) float scales[KB][4][4];
+    };
+    struct Ordered
+    {
+        int words[TM][8];
+        float scales[TM];
+        int sums[PopulationProjectionStorage::sums ? PopulationProjectionStorage::sums : 1][TM];
+    };
+    struct Mixed { union { Native native; Ordered ordered; }; };
+    struct Cold { Ordered ordered; };
+    struct Hot { Native native; };
+    /** The wrapper retains the union; each selected loop borrows only its own member. */
+    struct OrderedView { Mixed &owner; };
+    struct NativeView { Mixed &owner; };
+    template<PopulationArithmetic Arithmetic>
+    using Owned = std::conditional_t<Arithmetic == PopulationArithmetic::Mixed,Mixed,
+        std::conditional_t<Arithmetic == PopulationArithmetic::Ordered,Cold,Hot>>;
+    template<PopulationArithmetic Arithmetic>
+    using Borrowed = std::conditional_t<Arithmetic == PopulationArithmetic::Ordered,OrderedView,NativeView>;
+};
 /** @tparam FMT Actual physical decoder. @tparam TwoRoles Gate/up versus down.
- * @tparam Arithmetic Mixed Down or one exclusive GU arithmetic producer.
- * @param v Original projection bindings. @param control Borrowed device choice and diagnostic suppression. */
-template<NativeQuantisedGemmFormat FMT, bool TwoRoles, PopulationArithmetic Arithmetic = PopulationArithmetic::Mixed>
-__global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArguments v, MoEGroupedPopulationControl control)
+ * @tparam Arithmetic Mixed choice or one exclusive arithmetic producer.
+ * @tparam Domain Immutable geometry and source-arithmetic family.
+ * @tparam Stage Exact owned or borrowed LDS type; invalid branch views fail compilation.
+ * @param v Original projection bindings. @param control Borrowed device choice and diagnostic suppression.
+ * @param stage Wrapper-owned storage or its exclusive branch view. @param source_rows Same CTA's row table. */
+template<NativeQuantisedGemmFormat FMT, bool TwoRoles, PopulationArithmetic Arithmetic,
+    MoEGroupedPopulationDomain Domain,class Stage>
+__device__ __forceinline__ void populationProjectionBody(const MoEGroupedWmmaArguments &v,
+    const MoEGroupedPopulationControl &control,Stage &stage,int (&source_rows)[16])
 {
 #if defined(__gfx1100__)
     static_assert(__builtin_amdgcn_is_invocable(__builtin_amdgcn_wmma_i32_16x16x16_iu8_w64));
     using Traits = NATIVE_QUANTISEDGemmTraits<FMT>;
     using F32x4 = float __attribute__((ext_vector_type(4)));
-    constexpr int TM = TwoRoles ? 12 : 16, TN = 128, BN = 32;
+    constexpr bool compact = Domain == MoEGroupedPopulationDomain::Compact;
+    static_assert(compact || Domain == MoEGroupedPopulationDomain::Qwen);
+    static_assert(!compact || Arithmetic != PopulationArithmetic::Mixed);
+    using Geometry = PopulationProjectionGeometry<TwoRoles,Domain>;
+    constexpr int TM = Geometry::tm, TN = 128, BN = 32, Threads = 128;
     constexpr int BM = 16;
-    constexpr int N = TwoRoles ? 512 : 2048, K = TwoRoles ? 2048 : 512;
-    constexpr int Source = TwoRoles ? 13 : 4, blocks = K / 32;
+    constexpr int N = Geometry::n, K = Geometry::k;
+    constexpr int Source = compact ? static_cast<int>(FMT) : (TwoRoles ? 13 : 4), blocks = K / 32;
+    constexpr unsigned ratio_shift = 2u;
+    constexpr unsigned native_column_shift = compact ? (TwoRoles ? 3u : 4u) : (TwoRoles ? 4u : 6u);
     static_assert(MoEProjectionNumericalContract::ownsOrderedKPartitionTree(Source));
-    constexpr int partitions = MoEProjectionNumericalContract::orderedKPartitionsForWidth(K);
-    constexpr int span = (blocks + partitions - 1) / partitions;
-    constexpr int KB = span < 2 ? span : 2;
+    constexpr int partitions = Geometry::partitions, span = Geometry::span, KB = Geometry::kb;
+    using Storage = PopulationProjectionStorage<FMT,TM,KB>;
+    using ExpectedStage = std::conditional_t<compact,typename Storage::template Borrowed<Arithmetic>,
+        typename Storage::template Owned<Arithmetic>>;
+    static_assert(std::is_same_v<Stage,ExpectedStage>);
+    // Keep the union owner in every assignment expression. Borrowing an
+    // inactive member directly would obscure its implicit lifetime activation.
+    auto &bank = [&]() -> auto & {
+        if constexpr (compact) return stage.owner;
+        else return stage;
+    }();
     constexpr auto Input = TwoRoles ? MoEGroupedWmmaInput::OriginalTokens : MoEGroupedWmmaInput::GroupedRows;
-    // This shard implements only the exact admitted Qwen operation. Keep the
-    // captured contract check, then use its fixed geometry for work addressing.
+    // Every admitted domain seals its source geometry before capture. Keep the
+    // device contract check, then use fixed geometry for exact work addressing.
     if (v.n != N || v.k != K || v.rows != 512 || v.top_k != 8 || v.input != Input) __builtin_trap();
     constexpr int Sums = FMT == NATIVE_QUANTISED_GEMM_IQ1_M ? 4 :
         Traits::is_dual_scale_asym ? 2 : Traits::is_asymmetric ? 1 : 0;
-    if (!v.admission.allows(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled)) return;
-    const auto family = control.binding.load();
+    if constexpr (!compact)
+        if (!v.admission.allows(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled)) return;
+    const auto family = [&] {
+        if constexpr (compact) return Arithmetic == PopulationArithmetic::Ordered
+            ? MoEGroupedPopulationFamily::Dot4 : MoEGroupedPopulationFamily::N32;
+        else return control.binding.load();
+    }();
     if (control.omitted == family) return;
     if constexpr (Arithmetic == PopulationArithmetic::Ordered)
         if (family == MoEGroupedPopulationFamily::N32) return;
     if constexpr (Arithmetic == PopulationArithmetic::Native)
         if (family == MoEGroupedPopulationFamily::Dot4) return;
-    if (!v.dot_admission.rowPlan().isWide()) __builtin_trap();
+    if constexpr (compact)
+    {
+        if (v.experts != 8 || v.dot_admission.rowPlan().isWide() ||
+            v.dot_admission.rowPlan().floor() != MoEGroupedWmmaRowFloor::EveryExpert ||
+            v.dot_admission.rowPlan().rows(1) != 16) __builtin_trap();
+    }
+    else if (!v.dot_admission.rowPlan().isWide()) __builtin_trap();
     // The captured source policy must match the canonical partition tree.
     // Constexpr bounds retain the exact folds and remove the unused down stage.
     if (v.partitions.forCodebook(Source) != partitions) __builtin_trap();
     const int active_slots = v.admission.activeSlots();
     // A global Dot4 decision has no native writers. Compact its work extent to
-    // real 128-column tiles; mixed/native families retain 32-column addressing.
+    // actual ordered column tiles; mixed/native families retain 32-column addressing.
     const bool coarse = Arithmetic == PopulationArithmetic::Ordered ||
         (Arithmetic == PopulationArithmetic::Mixed && family == MoEGroupedPopulationFamily::Dot4);
-    const unsigned column_shift = (TwoRoles ? 4u : 6u) - (coarse ? 2u : 0u);
+    const unsigned column_shift = native_column_shift - (coarse ? ratio_shift : 0u);
     const unsigned columns = 1u << column_shift;
     const auto layout = MoEGroupedPopulationDirectoryLayout(v.directory_capacity);
     const uint32_t tiles = __builtin_amdgcn_readfirstlane(v.directory[layout.liveCountIndex()]);
     if (tiles > static_cast<unsigned>(v.directory_capacity)) __builtin_trap();
-    struct NativeStage
-    {
-        I32x4 a[KB][BM][2], b[KB][BN][2];
-        uint16_t primary[KB][BN], secondary[KB][Traits::needs_aux_compute ? BN : 1];
-        uint32_t minima[KB][Traits::is_dual_scale_asym ? BN : 1];
-        uint16_t qh[KB][FMT == NATIVE_QUANTISED_GEMM_IQ1_M ? BN : 1];
-        int sums[KB][Sums ? Sums : 1][BM];
-        // A WMMA lane owns rows group + 4*element. Scalar stores preserve
-        // disjoint addresses; the consuming lane reads its four scales together.
-        alignas(16) float scales[KB][4][4];
-    };
-    struct OrderedStage
-    {
-        int words[TM][8];
-        float scales[TM];
-        int sums[Sums ? Sums : 1][TM];
-    };
-    struct MixedStage { union { NativeStage native; OrderedStage ordered; }; };
-    struct ColdStage { OrderedStage ordered; };
-    struct HotStage { NativeStage native; };
-    using Stage = std::conditional_t<Arithmetic == PopulationArithmetic::Mixed,MixedStage,
-        std::conditional_t<Arithmetic == PopulationArithmetic::Ordered,ColdStage,HotStage>>;
-    __shared__ Stage stage;
-    __shared__ int source_rows[BM];
     // One worker owns a disjoint residue class of the compact live work extent.
     // The publication and descriptors are uniform across all lanes of a block.
     for (uint32_t item = blockIdx.x; item < tiles * columns; item += gridDim.x)
     {
-    const uint32_t column = (item & (columns - 1)) << (coarse ? 2u : 0u);
+    const uint32_t column = (item & (columns - 1)) << (coarse ? ratio_shift : 0u);
     const uint32_t tile = v.directory[item >> column_shift];
     if (tile == UINT32_MAX) __builtin_trap();
     const int expert = tile & moe_grouped_directory::kExpertMask;
@@ -121,13 +176,13 @@ __global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArgume
     // Mixed families retain fine native columns, with only each fourth cold
     // item owning a wide tile. In wholly Dot4 work every compact item already
     // maps to that fourth column, so no iteration is spent on inactive columns.
-    if (producer == MoEGroupedDotProducer::OrderedDot4 && column % 4 != 0) continue;
-    const int step = populationProjectionRows(TwoRoles ? MoEPrefillProjectionRole::GateUp : MoEPrefillProjectionRole::Down,family,count);
+    if (producer == MoEGroupedDotProducer::OrderedDot4 && column % (TN/BN) != 0) continue;
+    const int step = compact ? 16 : populationProjectionRows(TwoRoles ? MoEPrefillProjectionRole::GateUp : MoEPrefillProjectionRole::Down,family,count);
     if (step != (producer == MoEGroupedDotProducer::Wmma ? BM : TM) || first_row % step) __builtin_trap();
     const int live = min(step,count-first_row), first_slot = offset + first_row;
-    const int macro_n = (column / 4) * TN;
+    const int macro_n = (column / (TN/BN)) * TN;
     float *out = TwoRoles && blockIdx.z ? v.second_output : v.output;
-    if constexpr (TwoRoles && Arithmetic != PopulationArithmetic::Native)
+    if constexpr (!compact && TwoRoles && Arithmetic != PopulationArithmetic::Native)
     if (producer == MoEGroupedDotProducer::OrderedDot4 && live == 1)
     {
         // One-row experts cannot amortize shared activation staging. Every
@@ -247,13 +302,13 @@ __global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArgume
                 if constexpr (FMT == NATIVE_QUANTISED_GEMM_IQ1_M) qh = static_cast<uint16_t>(raw[1]);
                 // As in the wide ordered leaf, each word has one cooperative
                 // producer. Invalid column lanes still participate in every barrier.
-                for (int item = tid; item < live*8; item += TN)
+                for (int item = tid; item < live*8; item += Threads)
                 {
                     const int row = item / 8, word = item % 8;
                     const auto input = reinterpret_cast<const int32_t *>(v.activations +
                         static_cast<size_t>(source_row(row))*K + kb*32);
                     const int value = input[word];
-                    stage.ordered.words[row][word] = value;
+                    bank.ordered.words[row][word] = value;
                     if constexpr (Sums > 0)
                     {
                         // Every live row contributes a complete eight-lane
@@ -265,11 +320,11 @@ __global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArgume
                         for (int shift = words_per_sum/2; shift; shift /= 2)
                             sum += __shfl_down(sum,shift,words_per_sum);
                         if (word % words_per_sum == 0)
-                            stage.ordered.sums[word/words_per_sum][row] = sum;
+                            bank.ordered.sums[word/words_per_sum][row] = sum;
                     }
                 }
                 if (tid < live)
-                    stage.ordered.scales[tid] = v.activation_scales[static_cast<size_t>(source_row(tid))*blocks + kb];
+                    bank.ordered.scales[tid] = v.activation_scales[static_cast<size_t>(source_row(tid))*blocks + kb];
                 __syncthreads();
                 if (owns_column)
                     wideVisitRows<0,TM>(live,[&](auto index) {
@@ -277,20 +332,32 @@ __global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArgume
                         int low = 0;
                         #pragma unroll
                         for (int word = 0; word < 4; ++word)
-                            low = rocm_integer_contract::signedDot4(stage.ordered.words[row][word],decoded[word],low);
+                            low = rocm_integer_contract::signedDot4(bank.ordered.words[row][word],decoded[word],low);
                         int high = Traits::is_dual_scale ? 0 : low;
                         #pragma unroll
                         for (int word = 4; word < 8; ++word)
-                            high = rocm_integer_contract::signedDot4(stage.ordered.words[row][word],decoded[word],high);
+                            high = rocm_integer_contract::signedDot4(bank.ordered.words[row][word],decoded[word],high);
                         I32x4 sums = {};
                         #pragma unroll
                         for (int group = 0; group < Sums; ++group)
-                            sums[group] = stage.ordered.sums[group][row];
-                        partial[row] = wideCommit<FMT>(partial[row],low,high,weight,aux,minima,qh,stage.ordered.scales[row],sums);
+                            sums[group] = bank.ordered.sums[group][row];
+                        if constexpr (compact)
+                        {
+                            // Compact has exactly one K32 block per canonical
+                            // partition. Commit from the same positive zero,
+                            // then fold this row immediately in partition order.
+                            // Independent row folds need not retain sixteen
+                            // partials across the staging-retirement barrier.
+                            static_assert(span == 1 && blocks == partitions && partitions > 1);
+                            const float one = wideCommit<FMT>(0.0f,low,high,weight,aux,minima,qh,bank.ordered.scales[row],sums);
+                            total[row] = __fadd_rn(total[row],one);
+                        }
+                        else
+                            partial[row] = wideCommit<FMT>(partial[row],low,high,weight,aux,minima,qh,bank.ordered.scales[row],sums);
                     });
                 __syncthreads();
             }
-            wideVisitRows<0,TM>(live,[&](auto index) {
+            if constexpr (!compact) wideVisitRows<0,TM>(live,[&](auto index) {
                 constexpr int row = decltype(index)::value;
                 total[row] = partitions == 1 ? partial[row] : __fadd_rn(total[row],partial[row]);
             });
@@ -319,7 +386,7 @@ __global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArgume
             for (int first = p*span; first < end; first += KB)
             {
                 const int stages = min(KB,end-first);
-                for (int item = tid; item < stages*BN; item += TN)
+                for (int item = tid; item < stages*BN; item += Threads)
                 {
                     const int slice = item/BN, col = item%BN, kb = first+slice;
                     const size_t linear = static_cast<size_t>(kb)*N + n0+col;
@@ -336,14 +403,14 @@ __global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArgume
                     I32x4 lo, hi;
                     #pragma unroll
                     for (int word = 0; word < 4; ++word) { lo[word] = decoded[word]; hi[word] = decoded[word+4]; }
-                    stage.native.b[slice][col^slice][(col>>2)&1] = lo;
-                    stage.native.b[slice][col^slice][((col>>2)&1)^1] = hi;
-                    stage.native.primary[slice][col] = scale;
-                    if constexpr (Traits::needs_aux_compute) stage.native.secondary[slice][col] = aux;
-                    if constexpr (Traits::is_dual_scale_asym) stage.native.minima[slice][col] = minima;
-                    if constexpr (FMT == NATIVE_QUANTISED_GEMM_IQ1_M) stage.native.qh[slice][col] = static_cast<uint16_t>(raw[1]);
+                    bank.native.b[slice][col^slice][(col>>2)&1] = lo;
+                    bank.native.b[slice][col^slice][((col>>2)&1)^1] = hi;
+                    bank.native.primary[slice][col] = scale;
+                    if constexpr (Traits::needs_aux_compute) bank.native.secondary[slice][col] = aux;
+                    if constexpr (Traits::is_dual_scale_asym) bank.native.minima[slice][col] = minima;
+                    if constexpr (FMT == NATIVE_QUANTISED_GEMM_IQ1_M) bank.native.qh[slice][col] = static_cast<uint16_t>(raw[1]);
                 }
-                for (int item = tid; item < stages*BM*2; item += TN)
+                for (int item = tid; item < stages*BM*2; item += Threads)
                 {
                     const int slice = item/(BM*2), row = item%(BM*2)/2, half = item%2;
                     const int kb = first+slice;
@@ -351,14 +418,14 @@ __global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArgume
                     if (row < live)
                         values = reinterpret_cast<const I32x4 *>(v.activations +
                             static_cast<size_t>(source_row(row))*K + kb*32)[half];
-                    stage.native.a[slice][row^slice][half^((row>>2)&1)] = values;
+                    bank.native.a[slice][row^slice][half^((row>>2)&1)] = values;
                     if constexpr (Sums == 1)
                     {
                         int sum = 0;
                         #pragma unroll
                         for (int word = 0; word < 4; ++word) sum = rocm_integer_contract::signedDot4(values[word],0x01010101,sum);
                         sum += __shfl_xor(sum,1,32);
-                        if (half == 0) stage.native.sums[slice][0][row] = sum;
+                        if (half == 0) bank.native.sums[slice][0][row] = sum;
                     }
                     else if constexpr (Sums > 1)
                         #pragma unroll
@@ -368,9 +435,9 @@ __global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArgume
                             #pragma unroll
                             for (int word = 0; word < 8/Sums; ++word)
                                 sum = rocm_integer_contract::signedDot4(values[group*(8/Sums)+word],0x01010101,sum);
-                            stage.native.sums[slice][half*(Sums/2)+group][row] = sum;
+                            bank.native.sums[slice][half*(Sums/2)+group][row] = sum;
                         }
-                    if (half == 0) stage.native.scales[slice][row % 4][row / 4] = row < live ?
+                    if (half == 0) bank.native.scales[slice][row % 4][row / 4] = row < live ?
                         v.activation_scales[static_cast<size_t>(source_row(row))*blocks + kb] : 1.0f;
                 }
                 __syncthreads();
@@ -378,17 +445,17 @@ __global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArgume
                 for (int slice = 0; slice < KB && first+slice < end; ++slice)
                 {
                     const int col = wave*16 + lane%16, ar = lane%16;
-                    const I32x4 bl = stage.native.b[slice][col^slice][(col>>2)&1];
-                    const I32x4 bh = stage.native.b[slice][col^slice][((col>>2)&1)^1];
-                    const I32x4 al = stage.native.a[slice][ar^slice][(ar>>2)&1];
-                    const I32x4 ah = stage.native.a[slice][ar^slice][((ar>>2)&1)^1];
+                    const I32x4 bl = bank.native.b[slice][col^slice][(col>>2)&1];
+                    const I32x4 bh = bank.native.b[slice][col^slice][((col>>2)&1)^1];
+                    const I32x4 al = bank.native.a[slice][ar^slice][(ar>>2)&1];
+                    const I32x4 ah = bank.native.a[slice][ar^slice][((ar>>2)&1)^1];
                     const I32x4 zero = {};
                     const auto low = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w64(true,al,true,bl,zero,false);
                     const auto high = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w64(true,ah,true,bh,Traits::is_dual_scale ? zero : low,false);
-                    const uint16_t scale = stage.native.primary[slice][col];
-                    const uint16_t aux = Traits::needs_aux_compute ? stage.native.secondary[slice][col] : uint16_t{0};
-                    const uint32_t minima = Traits::is_dual_scale_asym ? stage.native.minima[slice][col] : uint32_t{0};
-                    const uint16_t qh = FMT == NATIVE_QUANTISED_GEMM_IQ1_M ? stage.native.qh[slice][col] : uint16_t{0};
+                    const uint16_t scale = bank.native.primary[slice][col];
+                    const uint16_t aux = Traits::needs_aux_compute ? bank.native.secondary[slice][col] : uint16_t{0};
+                    const uint32_t minima = Traits::is_dual_scale_asym ? bank.native.minima[slice][col] : uint32_t{0};
+                    const uint16_t qh = FMT == NATIVE_QUANTISED_GEMM_IQ1_M ? bank.native.qh[slice][col] : uint16_t{0};
                     const auto weight = [&] {
                         if constexpr (Traits::is_dual_scale) return rocm_native_quantised_load_dual_weight_scales<FMT>(scale,aux);
                         else return ROCmNativeQuantisedDualWeightScales{rocm_native_quantised_load_single_weight_scale<FMT>(scale,aux),0.0f};
@@ -396,14 +463,14 @@ __global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArgume
                     // Copy bits from one aligned group; the commit order and
                     // floating-point operations below remain exactly unchanged.
                     F32x4 activation_scales;
-                    __builtin_memcpy(&activation_scales,stage.native.scales[slice][lane/16],sizeof(activation_scales));
+                    __builtin_memcpy(&activation_scales,bank.native.scales[slice][lane/16],sizeof(activation_scales));
                     #pragma unroll
                     for (int element = 0; element < 4; ++element)
                     {
                         const int row = element*4 + lane/16;
                         I32x4 sums = {};
                         #pragma unroll
-                        for (int group = 0; group < Sums; ++group) sums[group] = stage.native.sums[slice][group][row];
+                        for (int group = 0; group < Sums; ++group) sums[group] = bank.native.sums[slice][group][row];
                         partial[element] = wideCommit<FMT>(partial[element],low[element],high[element],weight,aux,minima,qh,activation_scales[element],sums);
                     }
                 }
@@ -423,5 +490,56 @@ __global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArgume
     // The final K-stage barrier in either branch retires all LDS readers before
     // this worker reuses staging for its next independently owned tile.
     }
+#endif
+}
+
+/** @brief Preserve Qwen's exact retained kernel identity while sharing arithmetic.
+ * @tparam FMT Physical decoder. @tparam TwoRoles GU versus down.
+ * @tparam Arithmetic Exclusive GU or mixed down ownership.
+ * @param v Original projection packet. @param control Device choice and test suppression. */
+template<NativeQuantisedGemmFormat FMT, bool TwoRoles, PopulationArithmetic Arithmetic = PopulationArithmetic::Mixed>
+__global__ __launch_bounds__(128) void populationProjection(MoEGroupedWmmaArguments v, MoEGroupedPopulationControl control)
+{
+#if defined(__gfx1100__)
+    using Geometry = PopulationProjectionGeometry<TwoRoles,MoEGroupedPopulationDomain::Qwen>;
+    using Storage = PopulationProjectionStorage<FMT,Geometry::tm,Geometry::kb>;
+    __shared__ typename Storage::template Owned<Arithmetic> stage;
+    __shared__ int source_rows[16];
+    populationProjectionBody<FMT,TwoRoles,Arithmetic,MoEGroupedPopulationDomain::Qwen>(v,control,stage,source_rows);
+#endif
+}
+
+/** @brief Compact's adaptive consumer shares fixed TM16 rows between arithmetic branches.
+ * @tparam FMT Source-preserving physical decoder. @tparam TwoRoles GU versus down.
+ * @tparam Arithmetic Compiled branch ownership; Mixed retains the device choice.
+ * @param v Original projection packet. @param control Device choice and test suppression. */
+template<NativeQuantisedGemmFormat FMT, bool TwoRoles, PopulationArithmetic Arithmetic>
+__global__ __launch_bounds__(128)
+void populationProjectionCompact(MoEGroupedWmmaArguments v, MoEGroupedPopulationControl control)
+{
+#if defined(__gfx1100__)
+    static_assert(Arithmetic == PopulationArithmetic::Mixed);
+    if (!v.admission.allows(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled)) return;
+    const auto family = control.binding.load();
+    using Geometry = PopulationProjectionGeometry<TwoRoles,MoEGroupedPopulationDomain::Compact>;
+    using Storage = PopulationProjectionStorage<FMT,Geometry::tm,Geometry::kb>;
+    // One block-wide decision owns the entire loop. Both specialized loops
+    // borrow the same union and row table; exclusive control flow alone would
+    // not guarantee that separately declared LDS banks share physical bytes.
+    __shared__ typename Storage::Mixed stage;
+    __shared__ int source_rows[16];
+    if (family == MoEGroupedPopulationFamily::Dot4)
+    {
+        typename Storage::OrderedView view{stage};
+        populationProjectionBody<FMT,TwoRoles,PopulationArithmetic::Ordered,MoEGroupedPopulationDomain::Compact>(
+            v,control,view,source_rows);
+    }
+    else if (family == MoEGroupedPopulationFamily::N32)
+    {
+        typename Storage::NativeView view{stage};
+        populationProjectionBody<FMT,TwoRoles,PopulationArithmetic::Native,MoEGroupedPopulationDomain::Compact>(
+            v,control,view,source_rows);
+    }
+    else __builtin_trap();
 #endif
 }

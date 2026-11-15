@@ -12,6 +12,7 @@
 #include "backends/rocm/HIPGraphCapture.h"
 #include "kernels/common/MoEGroupedDirectory.h"
 #include "kernels/rocm/gemm/ROCmMoEGroupedPopulationProjection.h"
+#include "kernels/rocm/gemm/ROCmMoEGroupedCompactPopulation.h"
 #include "kernels/rocm/gemm/ROCmMoEGroupedPopulationWork.h"
 #include "kernels/rocm/gemm/ROCmMoEGroupedPopulationPublication.h"
 #include <hip/hip_runtime.h>
@@ -34,14 +35,18 @@ enum class PopulationCapturedArithmetic { Mixed, Ordered, Native };
  * @return Exact compiled arithmetic; throws for an unsupported decoder, role or template ABI. */
 inline PopulationCapturedArithmetic capturedPopulationArithmetic(std::string_view symbol,bool gateup)
 {
-    if (symbol.find("populationProjection") == std::string_view::npos ||
-        symbol.find(gateup ? "Format13ELb1E" : "Format24ELb0E") == std::string_view::npos)
+    const bool compact = symbol.find("populationProjectionCompact") != std::string_view::npos;
+    const bool format = compact
+        ? symbol.find(gateup ? "Format0ELb1E" : "Format0ELb0E") != std::string_view::npos ||
+          symbol.find(gateup ? "Format13ELb1E" : "Format13ELb0E") != std::string_view::npos
+        : symbol.find(gateup ? "Format13ELb1E" : "Format24ELb0E") != std::string_view::npos;
+    if (symbol.find("populationProjection") == std::string_view::npos || !format)
         throw std::runtime_error("Population decoder or role changed");
-    if (!gateup && symbol.find("PopulationArithmeticE0EE") != std::string_view::npos)
+    if ((compact || !gateup) && symbol.find("PopulationArithmeticE0EE") != std::string_view::npos)
         return PopulationCapturedArithmetic::Mixed;
-    if (gateup && symbol.find("PopulationArithmeticE1EE") != std::string_view::npos)
+    if (!compact && gateup && symbol.find("PopulationArithmeticE1EE") != std::string_view::npos)
         return PopulationCapturedArithmetic::Ordered;
-    if (gateup && symbol.find("PopulationArithmeticE2EE") != std::string_view::npos)
+    if (!compact && gateup && symbol.find("PopulationArithmeticE2EE") != std::string_view::npos)
         return PopulationCapturedArithmetic::Native;
     throw std::runtime_error("Population physical arithmetic changed");
 }
@@ -63,6 +68,7 @@ class ROCmGroupedPopulationCaptureProof final
     std::vector<Consumer> consumers_;
     std::optional<rocm::ROCmMoEGroupedRouteAdmission> admission_;
     bool omitted_ = false;
+    bool compact_ = false;
     /** @param status Native operation result. @throws std::runtime_error On failure. */
     static void require(hipError_t status)
     { if (status != hipSuccess) throw std::runtime_error("Population capture inspection failed"); }
@@ -89,20 +95,22 @@ class ROCmGroupedPopulationCaptureProof final
     }
 public:
     /** @param graph Instantiated production parent. @param stream Its exact execution stream.
-     * @param domain Independently expected admission (Qwen or Unmeasured).
+     * @param domain Independently expected admission (Qwen, Compact or Unmeasured).
      * @param selection Arena-owned decision. @param counts Actual expert counts.
      * @param directory Actual role directory bank. @param experts Exact expert capacity.
-     * @param repeats Complete repeated operations.
+     * @param repeats Complete repeated operations. @param compact_source Expected source0/13 for Compact.
      * @throws std::runtime_error For missing, extra or incorrectly bound producers/consumers. */
     ROCmGroupedPopulationCaptureProof(HIPGraphCapture &graph,hipStream_t stream,
         rocm::MoEGroupedPopulationDomain domain,uint32_t *selection,const int *counts,
-        const uint32_t *directory,int experts,int repeats)
-        : graph_(graph),stream_(stream)
+        const uint32_t *directory,int experts,int repeats,int compact_source = -1)
+        : graph_(graph),stream_(stream),compact_(domain == rocm::MoEGroupedPopulationDomain::Compact)
     {
         using namespace rocm;
         if (!graph.graph() || !graph.executable() || !stream ||
             stream == hipStreamLegacy || stream == hipStreamPerThread || !selection || !counts || !directory ||
-            (domain != MoEGroupedPopulationDomain::Qwen && domain != MoEGroupedPopulationDomain::Unmeasured))
+            (domain != MoEGroupedPopulationDomain::Qwen && domain != MoEGroupedPopulationDomain::Compact &&
+             domain != MoEGroupedPopulationDomain::Unmeasured) ||
+            (compact_ && (experts != 8 || (compact_source != 0 && compact_source != 13))))
             throw std::runtime_error("Population proof requires complete capture bindings");
         size_t size = 0;
         require(hipGraphGetNodes(graph.graph(),nullptr,&size));
@@ -110,8 +118,8 @@ public:
         require(hipGraphGetNodes(graph.graph(),nodes.data(),&size));
         std::array<int,2> roles{}, directories{}, ordered{};
         int classifiers = 0;
-        std::array<int,2> gateup_arithmetic{};
-        const bool admitted = domain == MoEGroupedPopulationDomain::Qwen;
+        std::array<int,2> gateup_arithmetic{}, down_arithmetic{};
+        const bool admitted = domain != MoEGroupedPopulationDomain::Unmeasured;
         for (auto node : nodes)
         {
             hipGraphNodeType type;
@@ -122,11 +130,22 @@ public:
             const char *name = hipKernelNameRefByPtr(params.func,stream);
             if (!name) throw std::runtime_error("Population proof has an unnamed kernel");
             const std::string_view symbol(name);
-            if (symbol.find("moe_grouped_build_population_directory_kernel") != std::string_view::npos)
+            if (symbol.find("moe_grouped_build_compact_population_directory_kernel") != std::string_view::npos)
+            {
+                if (!compact_ || argument<const int *>(params,0) != counts ||
+                    argument<uint32_t *>(params,1) != directory ||
+                    argument<MoEGroupedPopulationPublisher>(params,3).address() != selection ||
+                    params.gridDim.x != 1 || params.gridDim.y != 1 || params.gridDim.z != 1 ||
+                    params.blockDim.x != 64 || params.blockDim.y != 1 || params.blockDim.z != 1)
+                    throw std::runtime_error("Compact shared directory bindings changed");
+                admission_ = argument<ROCmMoEGroupedRouteAdmission>(params,2);
+                ++classifiers; ++directories[0];
+            }
+            else if (symbol.find("moe_grouped_build_population_directory_kernel") != std::string_view::npos)
             {
                 const bool gu = symbol.find("ProjectionRoleE0") != std::string_view::npos;
                 const bool down = symbol.find("ProjectionRoleE1") != std::string_view::npos;
-                if (!admitted || gu == down || argument<const int *>(params,0) != counts ||
+                if (!admitted || compact_ || gu == down || argument<const int *>(params,0) != counts ||
                     argument<uint32_t *>(params,1) != directory || argument<int>(params,2) != experts ||
                     (gu ? argument<MoEGroupedPopulationPublisher>(params,5).address() :
                         argument<MoEGroupedPopulationBinding>(params,5).address()) != selection ||
@@ -150,21 +169,35 @@ public:
                 const auto projection = argument<MoEGroupedWmmaArguments>(params,0);
                 const auto control = argument<MoEGroupedPopulationControl>(params,1);
                 const bool gu = projection.second_descriptors != nullptr;
+                const auto arithmetic = capturedPopulationArithmetic(symbol,gu);
+                const bool compact_kernel = symbol.find("populationProjectionCompact") != std::string_view::npos;
+                const int n = compact_ ? (gu ? 256 : 512) : (gu ? 512 : 2048);
+                const int k = compact_ ? (gu ? 512 : 256) : (gu ? 2048 : 512);
+                const int threads = 128;
+                const unsigned workers = compact_
+                    ? MoEGroupedCompactPopulationTransaction::kDirectoryCapacity * (n / (compact_source == 13 ? 32 : 128))
+                    : kMoEGroupedPopulationWorkers;
+                if (compact_kernel != compact_ || (compact_ &&
+                    symbol.find(compact_source == 0 ? "Format0ELb" : "Format13ELb") == std::string_view::npos))
+                    throw std::runtime_error("Population domain/source specialization changed");
                 if (control.binding.address() != selection || control.omitted != MoEGroupedPopulationFamily::Invalid ||
                     projection.branch_suppression != MoEGroupedBranchSuppression::None ||
                     projection.group_counts != counts || projection.directory != directory || projection.experts != experts ||
-                    projection.rows != 512 || projection.top_k != 8 || projection.n != (gu ? 512 : 2048) ||
-                    projection.k != (gu ? 2048 : 512) || params.blockDim.x != 128 || params.blockDim.y != 1 ||
-                    params.blockDim.z != 1 || params.gridDim.x != kMoEGroupedPopulationWorkers ||
+                    projection.rows != 512 || projection.top_k != 8 || projection.n != n ||
+                    projection.k != k || params.blockDim.x != static_cast<unsigned>(threads) || params.blockDim.y != 1 ||
+                    params.blockDim.z != 1 || params.gridDim.x != workers ||
                     params.gridDim.y != 1 ||
                     params.gridDim.z != (gu ? 2u : 1u) ||
-                    projection.dot_admission.rowPlan().floor() != MoEGroupedWmmaRowFloor::Sixteen)
+                    projection.dot_admission.rowPlan().floor() != (compact_
+                        ? MoEGroupedWmmaRowFloor::EveryExpert : MoEGroupedWmmaRowFloor::Sixteen) ||
+                    (compact_ && (projection.directory_capacity != MoEGroupedCompactPopulationTransaction::kDirectoryCapacity ||
+                        projection.dot_admission.rowPlan().isWide() || projection.dot_admission.rowPlan().rows(1) != 16)))
                     throw std::runtime_error("Population fused consumer identity changed");
-                const auto arithmetic = capturedPopulationArithmetic(symbol,gu);
                 unsigned enabled = 0;
                 require(hipGraphNodeGetEnabled(graph_.executable(),node,&enabled));
                 if (enabled != 1) throw std::runtime_error("Population consumer starts disabled");
                 if (gu) ++gateup_arithmetic[arithmetic == PopulationCapturedArithmetic::Native ? 1 : 0];
+                else if (compact_) ++down_arithmetic[arithmetic == PopulationCapturedArithmetic::Native ? 1 : 0];
                 consumers_.push_back({node,params,projection,control,arithmetic});
                 ++roles[gu ? 0 : 1];
             }
@@ -174,8 +207,10 @@ public:
                 ++ordered[1];
         }
         const int expected = admitted ? repeats : 0;
-        if (classifiers != expected || roles != std::array<int,2>{2*expected,expected} ||
-            directories != std::array<int,2>{expected,expected} || gateup_arithmetic != std::array<int,2>{expected,expected} ||
+        if (classifiers != expected || roles != std::array<int,2>{(compact_ ? 1 : 2)*expected,expected} ||
+            directories != std::array<int,2>{expected,compact_ ? 0 : expected} ||
+            gateup_arithmetic != std::array<int,2>{expected,compact_ ? 0 : expected} ||
+            (compact_ && down_arithmetic != std::array<int,2>{expected,0}) ||
             (admitted ? ordered != std::array<int,2>{0,0} : (ordered[0] < repeats || ordered[1] < repeats)))
             throw std::runtime_error("Population retained producer/consumer inventory is incomplete");
     }
@@ -201,7 +236,8 @@ public:
     { return admission_ && admission_->strategyForSlots(slots) == rocm::ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled; }
     /** @param family Logical arithmetic choice. @return Whether the shared consumer can execute that choice. */
     [[nodiscard]] bool contains(rocm::MoEGroupedPopulationFamily family) const
-    { return family < rocm::MoEGroupedPopulationFamily::Invalid && !consumers_.empty(); }
+    { return family < rocm::MoEGroupedPopulationFamily::Invalid && !consumers_.empty() &&
+        (!compact_ || family != rocm::MoEGroupedPopulationFamily::WideFloor16); }
     /** @param family Suppressed logical choice in every repeated shared GU/down consumer.
      * @throws std::runtime_error For an absent choice, active omission, or native mutation failure. */
     void omit(rocm::MoEGroupedPopulationFamily family)
@@ -210,19 +246,31 @@ public:
         omitted_ = true;
         for (auto &consumer : consumers_) { consumer.control.omitted = family; require(apply(consumer)); }
     }
-    /** @param branch Physical GU arithmetic producer disabled; unaffected experts retain their intermediates.
+    /** @param branch Physical arithmetic producer disabled; unaffected experts retain their intermediates.
+     * @param role Exact GU or down producer; the other role remains enabled.
      * @throws std::runtime_error For unsupported suppression or an already active mutation. */
-    void omitArithmetic(rocm::MoEGroupedBranchSuppression branch)
+    void omitArithmetic(rocm::MoEGroupedBranchSuppression branch,
+        rocm::MoEPrefillProjectionRole role = rocm::MoEPrefillProjectionRole::GateUp)
     {
-        if (omitted_ || consumers_.empty() || (branch != rocm::MoEGroupedBranchSuppression::Ordered &&
+        if ((role != rocm::MoEPrefillProjectionRole::GateUp && role != rocm::MoEPrefillProjectionRole::Down) ||
+            (!compact_ && role == rocm::MoEPrefillProjectionRole::Down) ||
+            omitted_ || consumers_.empty() || (branch != rocm::MoEGroupedBranchSuppression::Ordered &&
             branch != rocm::MoEGroupedBranchSuppression::Wmma))
             throw std::runtime_error("Invalid fused arithmetic omission");
         omitted_ = true;
         const auto arithmetic = branch == rocm::MoEGroupedBranchSuppression::Ordered
             ? PopulationCapturedArithmetic::Ordered : PopulationCapturedArithmetic::Native;
         for (auto &consumer : consumers_)
-            if (consumer.arithmetic == arithmetic)
-                require(hipGraphNodeSetEnabled(graph_.executable(),consumer.node,0));
+            if ((consumer.projection.second_descriptors != nullptr) == (role == rocm::MoEPrefillProjectionRole::GateUp))
+            {
+                if (consumer.arithmetic == PopulationCapturedArithmetic::Mixed)
+                {
+                    consumer.projection.branch_suppression = branch;
+                    require(apply(consumer));
+                }
+                else if (consumer.arithmetic == arithmetic)
+                    require(hipGraphNodeSetEnabled(graph_.executable(),consumer.node,0));
+            }
     }
     /** @brief Drain the exact stream and restore all controls, including partial mutation failures. */
     void restore() noexcept

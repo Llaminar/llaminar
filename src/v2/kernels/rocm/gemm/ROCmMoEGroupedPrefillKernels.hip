@@ -74,6 +74,7 @@
 #include "ROCmMoEPrefillArithmetic.h"
 #include "ROCmMoEGroupedWmma.h"
 #include "ROCmMoEGroupedPopulationProjection.h"
+#include "ROCmMoEGroupedCompactPopulation.h"
 #include "execution/moe/MoEGroupedWorkspaceGeometry.h"
 #include "ROCmMoERouteOwnedTuning.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
@@ -4396,10 +4397,23 @@ bool rocmMoE_grouped_prefill_pipeline(
     if (population_adaptive && !d_population_selection) return false;
     std::optional<MoEGroupedPopulationControl> population_control;
     if (population_adaptive) population_control.emplace(MoEGroupedPopulationControl{MoEGroupedPopulationBinding(d_population_selection)});
+    const bool compact_population = population_adaptive &&
+        dot_policy.population == llaminar2::rocm::MoEGroupedPopulationDomain::Compact;
+    using CompactPopulation = llaminar2::rocm::MoEGroupedCompactPopulationTransaction;
+    std::optional<CompactPopulation> compact_transaction;
+    std::optional<CompactPopulation::GateUpSubmission> compact_produced;
+    if (compact_population)
+        compact_transaction.emplace(population_key,llaminar2::rocm::MoEGroupedPopulationWorkspace{
+            d_population_selection,reinterpret_cast<uint32_t *>(d_group_work_directory),
+            llaminar2::MoEWorkspaceBuffers::rocmAdaptivePrefillDirectoryWords(total_slots,num_experts)},
+            d_group_counts,d_group_offsets,device_id,stream);
     const auto make_dot_admission = [&](llaminar2::rocm::MoEGroupedPrefillEngine engine,
         llaminar2::rocm::MoEGroupedWmmaRowFloor floor, MoEPrefillProjectionRole role,
         int source_n, int physical_n, int k)
     {
+        if (compact_population)
+            return MoEGroupedDotAdmission::nativeCandidate(role,source_n,physical_n,k,
+                llaminar2::rocm::MoEGroupedWmmaRowFloor::EveryExpert);
         return engine == llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma
             ? MoEGroupedDotAdmission::wideCandidate(role,source_n,physical_n,k,floor)
             : MoEGroupedDotAdmission::nativeCandidate(role,source_n,physical_n,k,floor);
@@ -4503,8 +4517,9 @@ bool rocmMoE_grouped_prefill_pipeline(
     {
         directory_plan.reset();
         current_directory_capacity = 0;
-        return moe_prefill_directory_capacity(total_slots,num_experts,
-            role == MoEPrefillProjectionRole::GateUp ? 12 : 16);
+        return compact_population ? CompactPopulation::kDirectoryCapacity :
+            moe_prefill_directory_capacity(total_slots,num_experts,
+                role == MoEPrefillProjectionRole::GateUp ? 12 : 16);
     };
 
     /** Capture-time addresses and conservative bounds for two device spans. */
@@ -4807,13 +4822,23 @@ bool rocmMoE_grouped_prefill_pipeline(
                     : llaminar2::rocm::MoEGroupedWmmaInput::OriginalTokens,
                 .partitions = gateup_k_partition_policy, .admission = admission,
                 .dot_admission = gateup_dot_admission};
-            const bool accepted = population_adaptive
-                ? llaminar2::rocm::submitMoEGroupedPopulation(MoEPrefillProjectionRole::GateUp,
-                    {d_population_selection,reinterpret_cast<uint32_t *>(d_group_work_directory),
-                     llaminar2::MoEWorkspaceBuffers::rocmAdaptivePrefillDirectoryWords(total_slots,num_experts)},
-                    gateup_codebook_mask,args,*population_control,stream,&native_submitted)
-                : llaminar2::rocm::submitMoEGroupedWmma(engine,gateup_codebook_mask,args,stream,&native_submitted);
-            if (!accepted) return false;
+            if (compact_population)
+            {
+                auto produced = compact_transaction->gateUp(gateup_codebook_mask,args);
+                if (!produced) return false;
+                native_submitted = produced->receipt();
+                compact_produced.emplace(std::move(*produced));
+            }
+            else
+            {
+                const bool accepted = population_adaptive
+                    ? llaminar2::rocm::submitMoEGroupedPopulation(MoEPrefillProjectionRole::GateUp,
+                        {d_population_selection,reinterpret_cast<uint32_t *>(d_group_work_directory),
+                         llaminar2::MoEWorkspaceBuffers::rocmAdaptivePrefillDirectoryWords(total_slots,num_experts)},
+                        gateup_codebook_mask,args,*population_control,stream,&native_submitted)
+                    : llaminar2::rocm::submitMoEGroupedWmma(engine,gateup_codebook_mask,args,stream,&native_submitted);
+                if (!accepted) return false;
+            }
             for (size_t i = 0; i < native_submitted.size; ++i)
                 pending.gateup.record(native_submitted.tiles[i]);
         }
@@ -5087,13 +5112,23 @@ bool rocmMoE_grouped_prefill_pipeline(
                     .input = llaminar2::rocm::MoEGroupedWmmaInput::GroupedRows,
                     .partitions = down_k_partition_policy, .admission = admission,
                     .dot_admission = down_dot_admission};
-                const bool accepted = population_adaptive
-                    ? llaminar2::rocm::submitMoEGroupedPopulation(MoEPrefillProjectionRole::Down,
-                    {d_population_selection,reinterpret_cast<uint32_t *>(d_group_work_directory),
-                     llaminar2::MoEWorkspaceBuffers::rocmAdaptivePrefillDirectoryWords(total_slots,num_experts)},
-                    down_codebook_mask,args,*population_control,stream,&native_submitted)
-                    : llaminar2::rocm::submitMoEGroupedWmma(engine,down_codebook_mask,args,stream,&native_submitted);
-                if (!accepted) return false;
+                if (compact_population)
+                {
+                    if (!compact_produced) throw std::logic_error("Compact down has no current GU producer");
+                    auto submitted = compact_transaction->down(std::move(*compact_produced),down_codebook_mask,args);
+                    if (!submitted) return false;
+                    native_submitted = *submitted;
+                }
+                else
+                {
+                    const bool accepted = population_adaptive
+                        ? llaminar2::rocm::submitMoEGroupedPopulation(MoEPrefillProjectionRole::Down,
+                        {d_population_selection,reinterpret_cast<uint32_t *>(d_group_work_directory),
+                         llaminar2::MoEWorkspaceBuffers::rocmAdaptivePrefillDirectoryWords(total_slots,num_experts)},
+                        down_codebook_mask,args,*population_control,stream,&native_submitted)
+                        : llaminar2::rocm::submitMoEGroupedWmma(engine,down_codebook_mask,args,stream,&native_submitted);
+                    if (!accepted) return false;
+                }
                 for (size_t i = 0; i < native_submitted.size; ++i)
                     pending.down.record(native_submitted.tiles[i]);
                 launched_down = true;

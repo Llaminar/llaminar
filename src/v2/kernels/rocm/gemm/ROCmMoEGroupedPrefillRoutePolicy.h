@@ -216,6 +216,13 @@ namespace llaminar2::rocm
                 throw std::invalid_argument("MoE route admission requires a complete group publication");
         }
 
+        /** @param key Complete expected immutable route policy.
+         * @param counts Expected authoritative device counts. @param offsets Their exclusive prefixes.
+         * @return Whether this packet borrows exactly that policy/publication, without reading device state. */
+        [[nodiscard]] LLAMINAR_MOE_ROUTE_HD constexpr bool binds(
+            const ROCmMoEGroupedPrefillRouteKey &key,const int *counts,const int *offsets) const noexcept
+        { return key_ == key && counts_ == counts && offsets_ == offsets; }
+
         /**
          * @brief Resolve the pure policy from a validated active-slot count.
          * @param slots Sum of all expert counts, never the allocated slot count.
