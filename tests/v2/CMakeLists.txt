@@ -10908,6 +10908,14 @@ add_v2_test(V2_Perf_MoEVerifierPrefill
     RESOURCE_LOCK RealModel_Perf
 )
 
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_ROCmSharedVerifierTransactionReplay
+        COMMAND $<TARGET_FILE:v2_perf_moe_verifier_prefill>
+                --gtest_filter=NativeGfx1100/ROCmSharedVerifierTransaction.CapturedReplay/*
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MTP;MoE;SharedExpert;WMMA;GraphCapture;Replay;ByteExact;DeviceResident;NativeISA-gfx1100;HardwareOptional;Devices1"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 180 RESOURCE_LOCK rocm_gpu_0)
+endif()
+
 # The GPU tuning corpus may promote a candidate only after comparing every
 # output bit on the producer stream. Keep that small certificate primitive in
 # focused backend integration binaries so sampled-row regressions, IEEE-value
@@ -21171,7 +21179,6 @@ if(HAVE_ROCM)
                 --gtest_filter=ROCmVerifierAttentionTiming.CapturedEventBoundaryReplay
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;MTP;WMMA;GraphCapture;Replay;ByteExact;64K;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierAttentionTimingReplay)
     add_v2_test(V2_Perf_ROCmVerifierAttentionWmmaPrefixScaling
         COMMAND $<TARGET_FILE:v2_perf_rocm_verifier_attention_wmma> --gtest_also_run_disabled_tests
                 --gtest_filter=NativeGfx1100/ROCmVerifierAttentionPerf.DISABLED_PairedPrefixScaling/*
@@ -22317,19 +22324,16 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;Prefill;AllFormats;GraphCapture;ByteExact;NativeRing;64K;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
     )
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmFlashAttentionWmmaQKReplay)
     add_v2_test(V2_Integration_ROCmVerifierAttentionWmmaReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
                 --gtest_filter=ROCmVerifierAttentionWmma.DirectRingDirtyReplay:ROCmVerifierAttentionWmma.SpecialValuesDirtyReplay:ROCmVerifierAttentionWmma.HeadGroupsAndTailsDirtyReplay:Test__ROCmFlashAttentionParity.CapturedAppendThenAttention_WmmaLaneExact_FP16HD256
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;MTP;GroupedVerifierRows;WMMA;GraphCapture;Replay;ByteExact;NativeRing;FP16;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS TIMEOUT 180 RESOURCE_LOCK rocm_gpu_0)
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierAttentionWmmaReplay)
     add_v2_test(V2_Integration_ROCmVerifierAttentionControlAndPayloadReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
                 --gtest_filter=ROCmVerifierAttentionWmma.ThreadOverrideOwnsArithmeticWithoutSplitOverride:ROCmVerifierAttentionWmma.AllWaveSpecialValuesDirtyReplay:ROCmVerifierAttentionWmma.ThreeWaveTileOrderDirtyReplay
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;MTP;WMMA;GraphCapture;Replay;ByteExact;FP16;ExceptionalValues;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierAttentionControlAndPayloadReplay)
     add_v2_test(V2_Integration_ROCmFlashAttentionAutomaticQKReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
                 --gtest_filter=ROCmFlashAttentionAutomaticQK.*
@@ -38847,6 +38851,11 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity)
 if(HAVE_ROCM)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCmSharedVerifierTransactionReplay
+        V2_Integration_ROCmVerifierAttentionWmmaReplay
+        V2_Integration_ROCmVerifierAttentionControlAndPayloadReplay
+        V2_Integration_ROCmVerifierAttentionTimingReplay
+        V2_Integration_ROCmFlashAttentionWmmaQKReplay
         V2_Integration_ROCmFlashAttentionAdaptiveQKReplay
         V2_Integration_ROCmFlashAttentionAutomaticQKReplay
         V2_Integration_ROCmFlashAttentionAutomaticTimingReplay

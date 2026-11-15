@@ -21,6 +21,11 @@ slice qualifies actual routed/shared MTP transactions. See the
 [attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Broader bundles and
 routed/shared operations remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
 not claim model-level MTP speedups or full production certification.
+The complete shared-verifier fixture now covers all21 source formats and mixed
+capacities8/9/16. Forced N32 wins all177 native-active timing cells by
+1.21873–1.87860×; sparse cells remain mixed. All24 replay cases and18 diagnostic
+profiles pass. Actual Automatic admission and its all-format qualification
+remain open. See the [shared transaction proof](GFX1100_MTP_SHARED_VERIFIER.md).
 This implementation plan extends the [prefill campaign](GFX1100_PREFILL_WMMA.md)
 and the [MTP project plan](../2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md).
 It records the implementation frontier and remaining qualification, not a
@@ -541,6 +546,16 @@ remain enabled. For the verifier router boundary, use the existing
 `routeVerifierRowsDecodeEquivalent` entry with matching preparation; controlled
 expert routes remain explicitly injected into separate buffers. This does not
 claim that the real router selected the synthetic distribution.
+
+The old performance fixture rewrites and uploads route IDs for each live prefix;
+that does not qualify device-counted verifier replay. Controlled Uniform/Hotset
+templates need a captured device-counted publisher that preserves live slot
+IDs/weights and writes(-1,0) beyond the prefix. No existing single-device API
+provides that copy: `publishOwnedRouteRows` requires real multi-participant packet
+ownership and cannot honestly be borrowed here. Use a narrow test-owned publisher
+or actual router selections, and keep template inputs separate from real router
+outputs. The serial runtime oracle must preserve holes and original slot order
+without renormalizing the surviving weights.
 
 Shared experts need their actual `SharedExpertFFNStage` grouped path separately.
 Extend `Perf__ROCmMoEVerifierPrefill.cpp::runROCmSharedExpertStageCase` with one

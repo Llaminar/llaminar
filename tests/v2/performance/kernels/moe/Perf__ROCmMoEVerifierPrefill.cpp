@@ -12,6 +12,8 @@
  * must not be mistaken for additional expert computation in that comparison.
  * Benchmark geometry admission is shared with CUDA and rejects malformed
  * explicit selectors instead of silently substituting or dropping shapes.
+ * The shared verifier transaction additionally captures router Q8 publication,
+ * the production FFN stage and final gate/add with a device-owned live count.
  * Explicit promoted-source diagnostics share the established transfer helper
  * and real prepared-engine publication, retaining compact sources as oracle.
  */
@@ -46,6 +48,10 @@
 
 #ifdef HAVE_ROCM
 #include "backends/rocm/HIPGraphCapture.h"
+#include "backends/BackendManager.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "kernels/rocm/gemm/ROCmMoEGroupedWmma.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <hip/hip_runtime.h>
 #include <rocprofiler-sdk-roctx/roctx.h>
@@ -2002,6 +2008,8 @@ namespace
             serial_ms,
             metrics};
     }
+
+    #include "ROCmSharedVerifierTransaction.h"
 
     BenchResult runROCmSharedExpertStageSerialOnlyCase(int rows, const QuantFormatCase &format)
     {
@@ -5692,3 +5700,21 @@ TEST(Perf__MoEVerifierPrefill, ROCm_AllFormatAspectRatioMGroupedPrefillDispatchT
         << "grouped-prefill trainer filters selected no format/shape cases";
 #endif
 }
+
+#ifdef HAVE_ROCM
+/** @test Replay all source formats, every live row count and physical topology boundaries. */
+TEST_P(ROCmSharedVerifierTransaction, CapturedReplay)
+{ runROCmSharedVerifierTransaction(GetParam(), SharedVerifierEvidence::Replay); }
+/** @test Opt-in paired complete-operation timing for the same retained transaction. */
+TEST_P(ROCmSharedVerifierTransaction, DISABLED_Paired)
+{ runROCmSharedVerifierTransaction(GetParam(), SharedVerifierEvidence::Timing); }
+/** @test Profile one selected N32 source/capacity producer independently of timing. */
+TEST_P(ROCmSharedVerifierTransaction, DISABLED_ProfileN32)
+{ runROCmSharedVerifierTransaction(GetParam(), SharedVerifierEvidence::ProfileN32); }
+/** @test Profile one selected N64 source/capacity producer independently of timing. */
+TEST_P(ROCmSharedVerifierTransaction, DISABLED_ProfileN64)
+{ runROCmSharedVerifierTransaction(GetParam(), SharedVerifierEvidence::ProfileN64); }
+INSTANTIATE_TEST_SUITE_P(NativeGfx1100, ROCmSharedVerifierTransaction,
+    ::testing::ValuesIn(sharedVerifierTransactionCases()),
+    [](const ::testing::TestParamInfo<SharedVerifierCase> &info) { return info.param.name; });
+#endif
