@@ -40,6 +40,7 @@
 #include "kernels/rocm/gdn/ROCmGatedNormSingleQ8.h"
 #include "ROCmQuantisedEpilogues.h"
 #include "ROCmQuantisedGemmKernel.h"
+#include "ROCmNativeQuantisedVerifierLaunch.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -5490,6 +5491,23 @@ namespace llaminar2
                 return false;
             }
             auto decode_equivalent_dispatch = beginVerifierDecodeEquivalentScope();
+            std::optional<NativeQuantisedVerifierOperation> operation;
+            if (projections.size() == 1)
+            {
+                const auto &projection = projections.front();
+                auto *owner = dynamic_cast<ROCmQuantisedGemmKernel *>(projection.kernel);
+                const auto &slice = projection.original_output_slice;
+                const int policy_n = rocmGemv_native_quantised_get_serial_partition_n();
+                if (owner && owner->impl_ && owner->impl_->has_native_quantised &&
+                    projection.output && !projection.output->isMapped() && !projection.bias &&
+                    owner->rocm_device_id_ == rocm_device_id_ && projection.n == static_cast<int>(owner->N_) &&
+                    k == static_cast<int>(owner->K_) && (policy_n <= 0 || policy_n == projection.n) &&
+                    (!slice || (slice->firstColumn() == 0 && slice->physicalColumns() == slice->policyColumns())))
+                    operation = NativeQuantisedVerifierOperation{NativeQuantisedVerifierOperationKind::Projection,
+                        rocm_device_id_, m, projection.n, k, owner->impl_->d_weights_native_quantised,
+                        owner->impl_->native_source_identity};
+            }
+            const ScopedNativeQuantisedVerifierOperation original_operation(operation);
             return multiply_fused_tensor(input, projections, m, k, mpi_ctx, workspace);
         }
 
@@ -6702,6 +6720,14 @@ namespace llaminar2
                 return false;
             }
             auto decode_equivalent_dispatch = beginVerifierDecodeEquivalentScope();
+            std::optional<NativeQuantisedVerifierOperation> operation;
+            const int policy_n = rocmGemv_native_quantised_get_serial_partition_n();
+            if (impl_ && impl_->has_native_quantised && output && !output->isMapped() &&
+                n == static_cast<int>(N_) && k == static_cast<int>(K_) &&
+                alpha == 1.0f && beta == 0.0f && (policy_n <= 0 || policy_n == n))
+                operation = NativeQuantisedVerifierOperation{NativeQuantisedVerifierOperationKind::SwiGLUDown,
+                    rocm_device_id_, m, n, k, impl_->d_weights_native_quantised, impl_->native_source_identity};
+            const ScopedNativeQuantisedVerifierOperation original_operation(operation);
             return multiply_tensor_with_fused_swiglu(
                 gate, up, output, m, n, k, alpha, beta, workspace);
         }

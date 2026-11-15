@@ -7,6 +7,9 @@
  * its final combine/copy, including empty work and repeated dirty replay.
  */
 #include <gtest/gtest.h>
+#include "kernels/rocm/gemm/ROCmNativeQuantisedVerifierLaunch.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
+
 #include <hip/hip_runtime.h>
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/rocm/HIPGraphCapture.h"
@@ -58,9 +61,13 @@ struct FixtureStreamDrain
  * @param placement Persistent output storage contract, retained across replays.
  * @param admission Whether a device word owns the current live prefix.
  * @param beta Existing-output contribution, including the mapped-copy case.
+ * @tparam M Physical view rows. @tparam RequestRows Original request capacity.
+ * @tparam Origin Original view origin.
+ * @param candidate Captured grouped producer; independent M1 oracle is unchanged.
  */
-template<int M = 3>
-void proveVerifierEpilogue(OutputPlacement placement, RowAdmission admission, float beta)
+template<int M = 3, int RequestRows = 3, int Origin = 1>
+void proveVerifierEpilogue(OutputPlacement placement, RowAdmission admission, float beta,
+    rocm::NativeQuantisedVerifierCandidate candidate = rocm::NativeQuantisedVerifierCandidate::Automatic)
 {
     int devices = 0;
     if (hipGetDeviceCount(&devices) != hipSuccess || devices == 0)
@@ -70,6 +77,10 @@ void proveVerifierEpilogue(OutputPlacement placement, RowAdmission admission, fl
     const auto device = DeviceId::rocm(0);
     ScopedGPUStream stream_owner(device);
     const auto stream = static_cast<hipStream_t>(stream_owner.get());
+    if((candidate==rocm::NativeQuantisedVerifierCandidate::WmmaM16N64) &&
+        rocm::nativeQuantisedHardwareForDevice(0).architecture!=native_quantised::NativeQuantisedArchitecture::rocm(11,0,0))
+        GTEST_SKIP() << "Native verifier WMMA requires actual gfx1100";
+
     const auto &formats = quantizedVerifierFormats();
     const auto format = std::find_if(formats.begin(), formats.end(),
         [](const auto &entry) { return entry.tensor_type == TensorType::Q4_0; });
@@ -137,7 +148,7 @@ void proveVerifierEpilogue(OutputPlacement placement, RowAdmission admission, fl
         static_cast<const std::int32_t *>(count->gpu_data_ptr()));
     const auto work = admission == RowAdmission::Requests
         ? ProjectionRowWork::fromRequests(DeviceRequestRowRanges::deviceCounted(
-              2, 3, static_cast<const std::int32_t *>(count->gpu_data_ptr()))).slice(1, M)
+              2, RequestRows, static_cast<const std::int32_t *>(count->gpu_data_ptr()))).slice(Origin, M)
         : ProjectionRowWork::fromPrefix(rows);
     graph = GPUDeviceContextPool::instance().retainAMDContext(0)->createGraphCapture(stream);
     {
@@ -146,6 +157,7 @@ void proveVerifierEpilogue(OutputPlacement placement, RowAdmission admission, fl
         auto arithmetic = admission == RowAdmission::Counted
             ? kernel->beginVerifierDecodeEquivalentScope(rows)
             : kernel->beginVerifierDecodeEquivalentScope();
+        rocm::ScopedNativeQuantisedVerifierCandidate candidate_scope(candidate,0);
         ScopedBackendGraphCapture capture(*graph, "verifier_epilogue_replay");
         ASSERT_TRUE(capture.begin());
         ASSERT_TRUE(kernel->multiply_tensor(input.get(), output.get(),
@@ -154,12 +166,25 @@ void proveVerifierEpilogue(OutputPlacement placement, RowAdmission admission, fl
         std::vector<GPUGraphKernelNodeInfo> nodes;
         std::string error;
         ASSERT_TRUE(graph->inspectKernelNodes(nodes, &error)) << error;
-        EXPECT_EQ(std::count_if(nodes.begin(), nodes.end(), [](const auto &node) {
-            return node.name.find("gemv_native_quantised_small_m_kernel_t") != std::string::npos;
+        EXPECT_EQ(std::count_if(nodes.begin(), nodes.end(), [&](const auto &node) {
+            return node.name.find((candidate==rocm::NativeQuantisedVerifierCandidate::WmmaM16N64)
+                ? "native_quantised_verifier_wmma_m16n64" : "gemv_native_quantised_small_m_kernel_t") != std::string::npos;
         }), 1) << "A verifier projection must record its grouped producer exactly once";
         EXPECT_EQ(std::count_if(nodes.begin(), nodes.end(), [](const auto &node) {
             return node.name.find("gemv_native_quantised_kernel_t") != std::string::npos;
         }), 0) << "Serial M1 repair must never coexist with the grouped producer";
+        if((candidate==rocm::NativeQuantisedVerifierCandidate::WmmaM16N64))
+            for(const auto &node:nodes) {
+                EXPECT_EQ(node.name.find("gemv_native_quantised_small_m_kernel_t"),std::string::npos);
+                if(node.name.find("native_quantised_verifier_wmma_m16n64")!=std::string::npos) {
+                    ASSERT_TRUE(node.valid()); EXPECT_EQ(node.block_x,128u);
+                    EXPECT_EQ(node.block_y,1u); EXPECT_EQ(node.block_z,1u);
+                    EXPECT_EQ(node.grid_x,1u); EXPECT_EQ(node.grid_y,1u); EXPECT_EQ(node.grid_z,1u);
+                }
+            }
+        EXPECT_EQ(std::count_if(nodes.begin(),nodes.end(),[](const auto &node) {
+            return node.name.find("native_quantised_verifier_ordered_m4n64")!=std::string::npos;
+        }), 0);
         if (admission != RowAdmission::Fixed)
         {
             auto *native = dynamic_cast<HIPGraphCapture *>(graph.get());
@@ -207,7 +232,9 @@ void proveVerifierEpilogue(OutputPlacement placement, RowAdmission admission, fl
         ASSERT_TRUE(graph->instantiate());
     }
     const std::vector<std::array<std::int32_t, 2>> publications = admission == RowAdmission::Requests
-        ? std::vector<std::array<std::int32_t, 2>>{{3,3},{1,2},{0,0},{2,1},{0,3},{3,0},{3,3}}
+        ? (RequestRows == 3
+            ? std::vector<std::array<std::int32_t, 2>>{{3,3},{1,2},{0,0},{2,1},{0,3},{3,0},{3,3}}
+            : std::vector<std::array<std::int32_t, 2>>{{5,4},{6,5},{5,4},{5,5},{6,4},{0,0},{8,8},{5,4}})
         : std::vector<std::array<std::int32_t, 2>>{{M,0},{1,0},{0,0},{2,0},{M,0},{0,0},{M,0}};
     for (const auto &publication : publications)
     {
@@ -230,12 +257,12 @@ void proveVerifierEpilogue(OutputPlacement placement, RowAdmission admission, fl
         ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
         for (int i = 0; i < M * N; ++i)
         {
-            // The generic view begins at original row one across two requests
-            // of capacity three. Resolve this independent oracle directly from
+            // Resolve the original request coordinate independently from the
+            // view origin and request capacity. This oracle derives directly from
             // authored counts rather than reusing the producer's row cursor.
-            const int original_row = 1 + i / N;
+            const int original_row = Origin + i / N;
             const bool active = admission == RowAdmission::Requests
-                ? original_row % 3 < publication[original_row / 3]
+                ? original_row % RequestRows < publication[original_row / RequestRows]
                 : i / N < publication[0];
             ASSERT_EQ(actual[i], std::bit_cast<std::uint32_t>(active ? oracle[i] : initial[i]))
                 << "output index=" << i;
@@ -326,4 +353,29 @@ TEST(ROCmVerifierEpilogueReplay, MappedCopyBits)
                 << "live=" << live << " index=" << i;
     }
     graph.reset();
+}
+
+/** @brief Native row cursors retain request holes, subview origin and mapped beta bytes. */
+TEST(ROCmVerifierWmmaEpilogueReplay, RequestHolesAndSubview)
+{
+    for(auto placement:{OutputPlacement::Device,OutputPlacement::Mapped})
+        ASSERT_NO_FATAL_FAILURE(proveVerifierEpilogue<4>(placement,RowAdmission::Requests,-0.25f,
+            rocm::NativeQuantisedVerifierCandidate::WmmaM16N64));
+}
+/** @brief Native P1 standalone publication retains fixed/counted alpha-beta arithmetic. */
+TEST(ROCmVerifierWmmaEpilogueReplay, FixedAndCounted)
+{
+    for(auto admission:{RowAdmission::Fixed,RowAdmission::Counted})
+        for(auto placement:{OutputPlacement::Device,OutputPlacement::Mapped})
+            ASSERT_NO_FATAL_FAILURE(proveVerifierEpilogue(placement,admission,-0.25f,
+                rocm::NativeQuantisedVerifierCandidate::WmmaM16N64));
+}
+
+
+/** @brief Native replay preserves four/five-row intervals across independent request origins. */
+TEST(ROCmVerifierWmmaEpilogueReplay, NativeRequestIntervalInterleaving)
+{
+    for (auto placement : {OutputPlacement::Device, OutputPlacement::Mapped})
+        ASSERT_NO_FATAL_FAILURE((proveVerifierEpilogue<14,8,1>(placement,
+            RowAdmission::Requests, -0.25f, rocm::NativeQuantisedVerifierCandidate::WmmaM16N64)));
 }

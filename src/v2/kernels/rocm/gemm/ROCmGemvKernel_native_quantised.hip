@@ -69,6 +69,7 @@
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
+#include "ROCmNativeQuantisedVerifierLaunch.h"
 #include "kernels/rocm/gemm/ROCmNativeM1Reduction.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -4625,7 +4626,6 @@ __global__ void gemv_native_quantised_reduce_small_m_kernel_t(
     }
 }
 
-constexpr int NATIVE_QUANTISED_SMALL_M_MAX_BATCH = 8;
 constexpr int NATIVE_QUANTISED_SMALL_M_GRAPH_SAFE_KB_CAP =
     llaminar2::NativeQuantisedGroupedDecodePolicy::maximum_k_partitions;
 constexpr int NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE = 2;
@@ -4650,33 +4650,6 @@ constexpr int native_quantised_verifier_rows_per_tile(int m)
         ? NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE
         : NATIVE_QUANTISED_VERIFIER_WIDE_ROWS_PER_TILE;
 }
-
-/**
- * @brief Per-launch projection inventory with one borrowed row owner.
- *
- * Each physical scratch tile copies this descriptor, rebases only its outputs,
- * and slices rows in the original controller coordinate system. No device
- * pointer is rebound during replay and no projection maintains its own count.
- */
-struct NativeQuantisedSmallMBatchedArgs
-{
-    int num_projections = 0;
-    int total_grid_n = 0;
-    int N[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
-    int grid_offsets[NATIVE_QUANTISED_SMALL_M_MAX_BATCH + 1] = {};
-    const uint8_t* payload[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
-    const uint16_t* scales[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
-    const uint16_t* mins[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
-    const uint32_t* emins[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
-    const float* bias[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
-    float* output[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
-    float* partial[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
-    uint8_t codebook[NATIVE_QUANTISED_SMALL_M_MAX_BATCH] = {};
-    // Preserve the aligned projection planes at the front of the launch ABI.
-    // Row admission dies before decoder dispatch, unlike those live operands.
-    llaminar2::DeviceRowRange rows; ///< Original prefix/grid geometry.
-    llaminar2::ProjectionRowWork work; ///< Independent original-row arithmetic admission.
-};
 
 /**
  * @brief Resolve the projection owning one captured column tile.
@@ -6488,6 +6461,15 @@ bool rocmLaunch_native_quantised_small_m_fp32(
     }
     if (kb < 1) kb = 1;
 
+    const auto verifier_candidate = llaminar2::rocm::nativeQuantisedVerifierProducer(
+        device_id, decode_equivalent, {rows, d_payload, N, K, 1, static_cast<uint8_t>(FMT),
+        generated_cfg.has_generated && explicit_kb_override <= 0 && explicit_waves_override <= 0 &&
+        kb == generated_cfg.kb && target_waves_per_cu == generated_cfg.target_waves_per_cu &&
+        (g_native_quantised_serial_partition_n <= 0 || g_native_quantised_serial_partition_n == N)
+            ? llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::CanonicalSerial
+            : llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::Unmeasured});
+    const bool wmma = verifier_candidate != llaminar2::rocm::NativeQuantisedVerifierCandidate::Dot4;
+
     if (kb > 1 && !d_partial_fp32)
     {
         fprintf(stderr, "[rocmGemv_native_quantised_small_m_fp32] kb=%d>1 but no small-M partial buffer (M=%d N=%d K=%d)\n",
@@ -6519,7 +6501,7 @@ bool rocmLaunch_native_quantised_small_m_fp32(
     {
         const int tile_m = min(workspace_tile_rows, M - row_base);
         const auto tile_rows = rows.slice(row_base, tile_m);
-        const int tile_rows_per_group = native_quantised_verifier_rows_per_tile(tile_m);
+        const int tile_rows_per_group = wmma ? 16 : native_quantised_verifier_rows_per_tile(tile_m);
         const int tile_row_groups = llaminar2::deviceRowWorkerGroups(
             tile_rows, tile_rows_per_group,
             static_cast<int64_t>(grid_n) * kb, target_total_waves);
@@ -6538,7 +6520,24 @@ bool rocmLaunch_native_quantised_small_m_fp32(
         float* tile_c =
             d_C_fp32 + static_cast<size_t>(row_base) * N;
 
-        if (tile_rows_per_group == NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE)
+        if (wmma)
+        {
+            NativeQuantisedSmallMBatchedArgs bundle{.rows=tile_rows,
+                .work=llaminar2::projectionWorkForLaunch(M,row_range).slice(row_base,tile_m)};
+            bundle.num_projections=1; bundle.total_grid_n=grid_n;
+            bundle.N[0]=N; bundle.grid_offsets[1]=grid_n;
+            bundle.payload[0]=d_payload; bundle.scales[0]=d_block_scales;
+            bundle.mins[0]=d_block_mins; bundle.emins[0]=d_block_emins;
+            bundle.output[0]=tile_c; bundle.partial[0]=d_partial_fp32;
+            bundle.codebook[0]=static_cast<uint8_t>(FMT);
+            llaminar2::rocm::submitNativeQuantisedVerifierWmma({
+                .activations=tile_a,.activation_scales=tile_scales,.activation_sums=tile_sums,.projections=bundle,
+                .device=device_id,.k=K,.partitions=kb,.row_workers=tile_row_groups,
+                .has_request_work=llaminar2::currentProjectionRowWork(M)!=nullptr,
+                .publication=kb==1 ? llaminar2::rocm::VerifierWmmaPublication::Standalone :
+                    llaminar2::rocm::VerifierWmmaPublication::OrderedPartial},stream);
+        }
+        else if (tile_rows_per_group == NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE)
         {
             llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
         hipLaunchKernelGGL(
@@ -6736,6 +6735,16 @@ bool rocmLaunch_native_quantised_small_m_batched_fp32(
     }
     if (kb < 1) kb = 1;
 
+    const auto verifier_candidate = llaminar2::rocm::nativeQuantisedVerifierProducer(
+        device_id, decode_equivalent, {rows, args.payload[0], Ns[0], K, num_projections, static_cast<uint8_t>(FMT),
+        generated_cfg.has_generated && api_kb_override <= 0 && api_waves_override <= 0 &&
+        rocm_env.native_quantised_gemv_kb <= 0 && rocm_env.native_quantised_gemv_target_waves <= 0 &&
+        kb == generated_cfg.kb && target_waves_per_cu == generated_cfg.target_waves_per_cu &&
+        (g_native_quantised_serial_partition_n <= 0 || g_native_quantised_serial_partition_n == Ns[0])
+            ? llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::CanonicalSerial
+            : llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::Unmeasured});
+    const bool wmma = verifier_candidate != llaminar2::rocm::NativeQuantisedVerifierCandidate::Dot4;
+
     if (kb > 1)
     {
         for (int p = 0; p < num_projections; ++p)
@@ -6767,7 +6776,7 @@ bool rocmLaunch_native_quantised_small_m_batched_fp32(
     for (int row_base = 0; row_base < M; row_base += workspace_tile_rows)
     {
         const int tile_m = min(workspace_tile_rows, M - row_base);
-        const int tile_rows_per_group = native_quantised_verifier_rows_per_tile(tile_m);
+        const int tile_rows_per_group = wmma ? 16 : native_quantised_verifier_rows_per_tile(tile_m);
         NativeQuantisedSmallMBatchedArgs tile_args = args;
         tile_args.rows = rows.slice(row_base, tile_m);
         tile_args.work = args.work.slice(row_base,tile_m);
@@ -6797,7 +6806,17 @@ bool rocmLaunch_native_quantised_small_m_batched_fp32(
         // only its live destination/epilogue into this captured producer.
         const auto launch = [&]<NativeQuantisedVerifierPublication Publication>()
         {
-            if (tile_rows_per_group == NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE)
+            if (wmma)
+            {
+                llaminar2::rocm::submitNativeQuantisedVerifierWmma({
+                    .activations=tile_a,.activation_scales=tile_scales,.activation_sums=tile_sums,.projections=tile_args,
+                    .device=device_id,.k=K,.partitions=kb,.row_workers=tile_row_groups,
+                    .has_request_work=llaminar2::currentProjectionRowWork(M)!=nullptr,
+                    .publication=Publication==NativeQuantisedVerifierPublication::DirectOutput
+                        ? llaminar2::rocm::VerifierWmmaPublication::Batched
+                        : llaminar2::rocm::VerifierWmmaPublication::OrderedPartial},stream);
+            }
+            else if (tile_rows_per_group == NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE)
             {
                 llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
         hipLaunchKernelGGL(
@@ -7057,6 +7076,13 @@ bool rocmLaunch_native_quantised_small_m_batched_mixed_fp32(
     }
     if (kb < 1) kb = 1;
 
+    const auto verifier_candidate = llaminar2::rocm::nativeQuantisedVerifierProducer(
+        device_id, decode_equivalent, {rows, args.payload[0], Ns[0], K, num_projections, args.codebook[0],
+        false
+            ? llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::CanonicalSerial
+            : llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::Unmeasured});
+    const bool wmma = verifier_candidate != llaminar2::rocm::NativeQuantisedVerifierCandidate::Dot4;
+
     if (kb > 1)
     {
         for (int p = 0; p < num_projections; ++p)
@@ -7088,7 +7114,7 @@ bool rocmLaunch_native_quantised_small_m_batched_mixed_fp32(
     for (int row_base = 0; row_base < M; row_base += workspace_tile_rows)
     {
         const int tile_m = min(workspace_tile_rows, M - row_base);
-        const int tile_rows_per_group = native_quantised_verifier_rows_per_tile(tile_m);
+        const int tile_rows_per_group = wmma ? 16 : native_quantised_verifier_rows_per_tile(tile_m);
         NativeQuantisedSmallMBatchedArgs tile_args = args;
         tile_args.rows = rows.slice(row_base, tile_m);
         tile_args.work = args.work.slice(row_base,tile_m);
@@ -7118,7 +7144,17 @@ bool rocmLaunch_native_quantised_small_m_batched_mixed_fp32(
         // only its live destination/epilogue into this captured producer.
         const auto launch = [&]<NativeQuantisedVerifierPublication Publication>()
         {
-            if (tile_rows_per_group == NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE)
+            if (wmma)
+            {
+                llaminar2::rocm::submitNativeQuantisedVerifierWmma({
+                    .activations=tile_a,.activation_scales=tile_scales,.activation_sums=tile_sums,.projections=tile_args,
+                    .device=device_id,.k=K,.partitions=kb,.row_workers=tile_row_groups,
+                    .has_request_work=llaminar2::currentProjectionRowWork(M)!=nullptr,
+                    .publication=Publication==NativeQuantisedVerifierPublication::DirectOutput
+                        ? llaminar2::rocm::VerifierWmmaPublication::Batched
+                        : llaminar2::rocm::VerifierWmmaPublication::OrderedPartial},stream);
+            }
+            else if (tile_rows_per_group == NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE)
             {
                 llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
         hipLaunchKernelGGL(

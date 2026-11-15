@@ -2703,7 +2703,8 @@ namespace llaminar2
                 {},
                 policy.retained_parent_composer,
                 initial_submission,
-                policy.auxiliary_branch_factory);
+                policy.auxiliary_branch_factory,
+                policy.captured_verifier_extent);
 
             if (success)
             {
@@ -2862,7 +2863,8 @@ namespace llaminar2
                                                                GraphInitialSubmissionPolicy
                                                                    initial_submission,
                                                                GraphCaptureAuxiliaryBranchFactory
-                                                                   auxiliary_branch_factory)
+                                                                   auxiliary_branch_factory,
+                                                               CapturedVerifierExtent captured_verifier_extent)
     {
         graph.requireExecutable();
         if (!ctx || !gpu_stream || !gpu_ctx)
@@ -2870,6 +2872,12 @@ namespace llaminar2
             LOG_ERROR("[DeviceGraphExecutor] GPU graph capture/replay requires an exact device context, explicit stream, and live GPU worker context");
             return false;
         }
+
+        if (captured_verifier_extent.isExact() && !captured_verifier_extent.belongsTo(ctx->deviceId()))
+            throw std::invalid_argument("Exact hosted verifier extent belongs to another native participant");
+        if (segment_cache.initialized &&
+            segment_cache.captured_verifier_extent != captured_verifier_extent)
+            throw std::logic_error("Retained graph changed its exact hosted verifier extent");
 
         if(const auto& bound=segment_cache.participant_source_binding){
             const auto original=graph.retainedParticipantSourcePlan();
@@ -2889,11 +2897,11 @@ namespace llaminar2
                 collective_nodes,collectives_graph_capturable,false,defer_final_sync,
                 capture_boundary,plan_policy,launch_dependency,event_published_outputs,
                 retained_parent_composer,GraphInitialSubmissionPolicy::MaterializeWithoutLaunch,
-                auxiliary_branch_factory))return false;
+                auxiliary_branch_factory,captured_verifier_extent))return false;
             return executeWithCachedGraphReplay(graph,ctx,segment_cache,gpu_stream,gpu_ctx,
                 collective_nodes,collectives_graph_capturable,false,defer_final_sync,
                 capture_boundary,plan_policy,launch_dependency,event_published_outputs,
-                retained_parent_composer,initial_submission,auxiliary_branch_factory);
+                retained_parent_composer,initial_submission,auxiliary_branch_factory,captured_verifier_extent);
         }
 
         if(segment_cache.original_storage_attachment)segment_cache.original_storage_attachment->requireCurrent();
@@ -4606,6 +4614,7 @@ namespace llaminar2
 
             graph.reset();
             segment_cache.needs_capture = true;
+            segment_cache.captured_verifier_extent = captured_verifier_extent;
             const auto capture_result =
                 DeviceGraphCaptureController::executeCapturePhase(
                     graph,

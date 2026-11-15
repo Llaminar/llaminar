@@ -1926,6 +1926,15 @@ namespace llaminar2
             LOG_ERROR("[ForwardExecutionEngine] Workspace declaration or unknown submission intent is not executable");
             return false;
         }
+        if (input.captured_verifier_extent.isExact() &&
+            (input.execution_role != ForwardExecutionRole::GroupedMTPVerifier ||
+             input.execution_phase != ForwardExecutionPhase::Decode || input.batch_size != 1 ||
+             input.seq_len < 2 || input.bucket_seq_len != 0 ||
+             (input.real_seq_len != 0 && input.real_seq_len != input.seq_len) ||
+             !input.sequence_lengths_device ||
+             !input.captured_verifier_extent.matches(input.device,
+                 DeviceRowRange::deviceCounted(input.seq_len, input.sequence_lengths_device))))
+            throw std::invalid_argument("Exact hosted verifier input changed its original role, device or rows");
         (void)sparseQueryExecutionProgramIndex(input.sparse_query_execution_program);
         if (input.sparse_query_prefill_proof)
         {
@@ -2292,6 +2301,7 @@ namespace llaminar2
                 .device = effective_input.device,
                 .execution_role = effective_input.execution_role,
                 .state_transaction = effective_input.state_transaction,
+                .captured_verifier_extent = effective_input.captured_verifier_extent,
                 .decode = is_decode,
                 .sparse_query_execution_program = effective_input.sparse_query_execution_program,
                 .decode_has_history = decode_has_history,
@@ -2701,6 +2711,8 @@ namespace llaminar2
         }
 
         const ForwardGraphCache &cache = cache_it->second;
+        if (signature.captured_verifier_extent != cache.segment_cache.captured_verifier_extent)
+            return reject("exact forward signature and native verifier extent disagree");
         if (!signature.device.is_gpu() || !signature.decode)
             return reject("device-loop composition requires a GPU decode graph");
         if (!signature.usesDeviceTokenIds() ||
@@ -2865,6 +2877,8 @@ namespace llaminar2
         const ForwardGraphCache &cache = cache_it->second;
         if (!cache.valid || !cache.graph)
             return reject("the exact forward graph cache entry is not valid");
+        if (signature.captured_verifier_extent != cache.segment_cache.captured_verifier_extent)
+            return reject("exact forward signature and native verifier extent disagree");
         if (!signature.device.is_gpu() || !signature.decode)
             return reject("retained replay requires a GPU decode graph");
         if (!signature.usesDeviceTokenIds() ||
@@ -3084,7 +3098,8 @@ namespace llaminar2
                 std::move(parent_composer),
                 DeviceGraphExecutor::GraphInitialSubmissionPolicy::
                     CaptureInstantiateAndLaunch,
-                auxiliary_branch_factory))
+                auxiliary_branch_factory,
+                signature.captured_verifier_extent))
         {
             return fail("retained decode graph replay submission failed");
         }
@@ -3383,6 +3398,7 @@ namespace llaminar2
         DeviceGraphExecutor::DecodeCapturePolicy capture_policy =
             host.buildDecodeCapturePolicy(
                 !forward_cache.collective_nodes.empty(), ctx);
+        capture_policy.captured_verifier_extent = input.captured_verifier_extent;
         if (!capture_policy.allow_cached_graph_replay)
         {
             LOG_ERROR(
@@ -4005,6 +4021,7 @@ namespace llaminar2
                     has_collective_nodes,
                     ctx);
             }
+            capture_policy.captured_verifier_extent = input.captured_verifier_extent;
             if (input.moe_overlay_graph_launch_dependency)
             {
                 if (capture_policy.launch_dependency)

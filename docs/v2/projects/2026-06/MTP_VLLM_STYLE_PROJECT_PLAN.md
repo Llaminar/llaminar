@@ -10,14 +10,20 @@ ROCm native producers and measured selection across dense/fused/shared
 projections, routed experts, router and attention, with explicit floating-format
 arithmetic admission. The [implementation work list](../2026-11/GFX1100_MTP_GROUPED_WMMA_PLAN.md)
 owns source findings, all-format/runtime-row byte gates, captured replay and
-profiling requirements. This is pending implementation/qualification; existing
+profiling requirements. Broader implementation/qualification remains open;
 prefill wins do not establish MTP speedups. Component work uses the user's
 focused/feature-suite scope and does not claim full production certification.
 The standalone beta/mapped-output prerequisite now preserves grouped execution
 and original device row ownership; four replay cases pass in both optimized
 builds and the affected all-format/device-counted suite passes. See the
 [epilogue repair proof](../2026-11/GFX1100_MTP_VERIFIER_EPILOGUE.md).
-Actual MTP WMMA implementation and economy qualification remain open.
+Native M16/N64 replay now passes149 Release cases plus7 epilogues, five focused
+ROCm registrations and six host checks. Exact hosted width identity reaches the
+original capture worker and belongs to graph identity. Automatic keeps Dot4 at
+M2–4 and selects WMMA at M5–16 for measured IQ4_XS single projection/SwiGLU keys.
+All72 selected cells win1.032–1.618×, geometric mean1.260×; shallow Dot4 controls
+stay within0.47%. All24 exact profiles pass with zero memory spills. Other codebooks/geometries,
+multi-output/routed/router/attention work and model qualification remain open.
 
 ## Current branch integration and backend port
 

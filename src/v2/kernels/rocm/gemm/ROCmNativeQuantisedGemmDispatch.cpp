@@ -12,6 +12,9 @@
 #include "ROCmNativeQuantisedGemmShard.h"
 #include "ROCmVNNIPrefillLaunch.h"
 #include "ROCmNativeQuantisedWmmaLaunch.h"
+#include "ROCmNativeQuantisedVerifierLaunch.h"
+#include "kernels/common/ProjectionWorkLaunch.h"
+#include "ROCmNativeQuantisedArchitecture.h"
 #include "../../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../../utils/PerfStatsCollector.h"
 
@@ -19,6 +22,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstdio>
+#include <exception>
 #include <stdexcept>
 
 #include <hip/hip_runtime_api.h>
@@ -78,7 +82,7 @@ constexpr uint8_t defaultArithmeticPolicyCodebook(uint8_t codebook_id)
                : codebook_id;
 }
 
-constexpr std::array<ROCmNativeQuantisedGridInitShardFn, 9> kGridInitializers = {
+constexpr std::array<ROCmNativeQuantisedGridInitShardFn, 10> kGridInitializers = {
     rocmInitIQGridTables_gemm_shard_0,
     rocmInitIQGridTables_gemm_shard_1,
     rocmInitIQGridTables_gemm_shard_2,
@@ -88,6 +92,7 @@ constexpr std::array<ROCmNativeQuantisedGridInitShardFn, 9> kGridInitializers = 
     rocmInitIQGridTables_gemm_shard_6,
     rocmInitIQGridTables_gemm_shard_7,
     llaminar2::rocm::initializeNativeQuantisedWmmaGrids,
+    llaminar2::rocm::initializeNativeQuantisedVerifierWmmaGrids,
 };
 } // namespace
 
@@ -295,4 +300,84 @@ extern "C" bool rocmInitIQGridTables_gemm(
         }
     }
     return true;
+}
+
+namespace llaminar2::rocm {
+namespace {
+thread_local std::optional<NativeQuantisedVerifierSelection> verifier_selection;
+thread_local const ScopedNativeQuantisedVerifierCandidate *verifier_scope=nullptr;
+}
+std::optional<NativeQuantisedVerifierSelection> nativeQuantisedVerifierSelection() noexcept
+{ return verifier_selection; }
+ScopedNativeQuantisedVerifierCandidate::ScopedNativeQuantisedVerifierCandidate(
+    NativeQuantisedVerifierCandidate candidate, int device) : previous_(verifier_selection), previous_scope_(verifier_scope)
+{
+    const auto hardware = nativeQuantisedHardwareForDevice(device);
+    switch (candidate) {
+    case NativeQuantisedVerifierCandidate::Automatic:
+    case NativeQuantisedVerifierCandidate::Dot4: break;
+    case NativeQuantisedVerifierCandidate::WmmaM16N64:
+        if (hardware.architecture != native_quantised::NativeQuantisedArchitecture::rocm(11,0,0))
+            throw std::invalid_argument("Native verifier WMMA requires actual gfx1100");
+        break;
+    default: throw std::invalid_argument("Unknown native verifier candidate");
+    }
+    verifier_selection = NativeQuantisedVerifierSelection{candidate,device};
+    verifier_scope=this;
+}
+ScopedNativeQuantisedVerifierCandidate::~ScopedNativeQuantisedVerifierCandidate()
+{
+    if(verifier_scope!=this)std::terminate();
+    verifier_selection=previous_;verifier_scope=previous_scope_;
+}
+thread_local const ScopedNativeQuantisedVerifierOperation *ScopedNativeQuantisedVerifierOperation::active_ = nullptr;
+ScopedNativeQuantisedVerifierOperation::ScopedNativeQuantisedVerifierOperation(
+    std::optional<NativeQuantisedVerifierOperation> operation) noexcept
+    : operation_(operation), previous_(active_)
+{ active_ = this; }
+ScopedNativeQuantisedVerifierOperation::~ScopedNativeQuantisedVerifierOperation()
+{
+    if (active_ != this) std::terminate();
+    active_ = previous_;
+}
+std::optional<NativeQuantisedVerifierOperation> ScopedNativeQuantisedVerifierOperation::current() noexcept
+{ return active_ ? active_->operation_ : std::nullopt; }
+
+NativeQuantisedVerifierCandidate nativeQuantisedVerifierProducer(
+    int device, bool decode_equivalent, const NativeQuantisedVerifierWork &work)
+{
+    if (verifier_selection) {
+        if (verifier_selection->device != device)
+            throw std::invalid_argument("Native verifier candidate belongs to another device");
+        if (verifier_selection->candidate == NativeQuantisedVerifierCandidate::Dot4)
+            return NativeQuantisedVerifierCandidate::Dot4;
+        if (verifier_selection->candidate != NativeQuantisedVerifierCandidate::Automatic) {
+            if (!decode_equivalent)
+                throw std::invalid_argument("Native verifier WMMA requires serial-M1 arithmetic scope");
+            return verifier_selection->candidate;
+        }
+    }
+    const auto operation = ScopedNativeQuantisedVerifierOperation::current();
+    const int m = work.rows.physicalRows();
+    if (!decode_equivalent || !operation || m < 5 || m > 16 || work.projections != 1 ||
+        currentProjectionRowWork(m) || work.policy != NativeQuantisedVerifierPolicyMatch::CanonicalSerial ||
+        work.physical_codebook != kNativeQuantisedIQ4XSSourceScaleCodebook ||
+        !operation->source.present || operation->source.codebook_id != 4 || !operation->source.is_superblock ||
+        operation->device != device || operation->m != m || operation->n != work.n || operation->k != work.k ||
+        !operation->weights || operation->weights != work.weights ||
+        !ScopedCapturedVerifierExtent::current().matches(DeviceId::rocm(device), work.rows))
+        return NativeQuantisedVerifierCandidate::Dot4;
+    if (operation->kind != NativeQuantisedVerifierOperationKind::Projection &&
+        operation->kind != NativeQuantisedVerifierOperationKind::SwiGLUDown)
+        throw std::invalid_argument("Unknown original verifier operation");
+    // Complete public operations, exact physical M2..16, 31 AB/BA pairs:
+    // Dot4 wins every M2..4 key; native WMMA wins every M5..16 key. A larger
+    // fused operation cannot acquire eligibility by splitting into singleton leaves.
+    const bool measured_shape = (work.n == 17408 && work.k == 5120) ||
+        (work.n == 5120 && work.k == 17408) || (work.n == 10240 && work.k == 5120);
+    if (!measured_shape || nativeQuantisedHardwareForDevice(device).architecture !=
+        native_quantised::NativeQuantisedArchitecture::rocm(11,0,0))
+        return NativeQuantisedVerifierCandidate::Dot4;
+    return NativeQuantisedVerifierCandidate::WmmaM16N64;
+}
 }

@@ -592,6 +592,7 @@ namespace llaminar2
     {
         /** Present only inside original learned-sidecar construction; never inferred from rows. */
         std::optional<MTPSidecarCaptureRole> mtp_sidecar_capture_role;
+        CapturedVerifierExtent captured_verifier_extent; ///< Exact hosted admission; ordinary inputs retain guarded capacity.
         const int *token_ids = nullptr;    ///< Token IDs [batch_size * seq_len]
         /**
          * @brief Optional device-resident INT32 token IDs.

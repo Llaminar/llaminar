@@ -20895,6 +20895,13 @@ if(HAVE_ROCM)
         MPI_PROCS 1
         NO_MODELS
     )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_WmmaReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_device_counted_verifier_rows>
+                --gtest_filter=AllFormats/ROCmDeviceCountedVerifierWmma.*:ROCmVerifierWmmaDispatch.*
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;MTP;GroupedVerifierRows;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+    )
     add_executable(v2_integration_rocm_verifier_epilogue_replay
         integration/kernels/rocm/Test__ROCmVerifierEpilogueReplay.cpp)
     target_link_libraries(v2_integration_rocm_verifier_epilogue_replay
@@ -20902,6 +20909,13 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_EpilogueReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_verifier_epilogue_replay>
                 --gtest_filter=ROCmVerifierEpilogueReplay.*
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;MTP;GroupedVerifierRows;GraphCapture;ByteExact;Regression"
+        MPI_PROCS 1
+        NO_MODELS
+    )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_WmmaEpilogueReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_verifier_epilogue_replay>
+                --gtest_filter=ROCmVerifierWmmaEpilogueReplay.*
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;MTP;GroupedVerifierRows;GraphCapture;ByteExact;Regression"
         MPI_PROCS 1
         NO_MODELS
@@ -30226,6 +30240,8 @@ if(HAVE_ROCM)
     V2_Integration_ROCmEmbeddingNativeSourcePreservation
     V2_Integration_ROCm_DeviceCountedVerifierRows
     V2_Integration_GroupedVerifierRows_ROCm_EpilogueReplay
+    V2_Integration_GroupedVerifierRows_ROCm_WmmaReplay
+    V2_Integration_GroupedVerifierRows_ROCm_WmmaEpilogueReplay
     V2_Integration_GroupedVerifierRows_ROCm_AllFormats
     V2_Integration_ROCmActivationQuantization
     V2_Integration_Q8FiniteScaleContract_ROCm
@@ -38392,6 +38408,32 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_test_cpu_fixed_epoch_gdn)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "OMP_NUM_THREADS=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUGDNStateStorageAdmission)
+endif()
+
+# Exact hosted scheduling facts survive capture-worker entry, retained replay and reset.
+if(NOT V2_PERF_TESTS_ONLY)
+    add_v2_test(V2_Integration_MTPCapturedVerifierExtentPolicy
+        COMMAND $<TARGET_FILE:v2_test_mtp_verifier_policy>
+            --gtest_filter=Test__MTPVerifierPolicy.CapturedVerifierExtent*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;GraphCapture;Ownership;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    add_v2_test(V2_Integration_MTPCapturedVerifierExtentReplay
+        COMMAND $<TARGET_FILE:v2_test_forward_graph_types>
+            --gtest_filter=Test__ForwardGraphSignature.CapturedVerifierExtent*:Test__GraphSegmentCache.CapturedVerifierExtent*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;GraphCapture;Ownership;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    add_v2_test(V2_Integration_MTPCapturedVerifierExtentInput
+        COMMAND $<TARGET_FILE:v2_test_forward_execution_engine>
+            --gtest_filter=Test__ForwardExecutionEngine.CapturedVerifierExtent*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;GraphCapture;Ownership;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_MTPCapturedVerifierExtentInput
+        V2_Integration_MTPCapturedVerifierExtentPolicy
+        V2_Integration_MTPCapturedVerifierExtentReplay)
 endif()
 
 # Exact hosted verifier identities and their physical owners must be admitted together.

@@ -22253,7 +22253,16 @@ namespace llaminar2
             throw std::logic_error("Exact verifier selection requires an admitted row/outcome family");
         const auto &signature = mtp_retained_verifier_signatures_.at(sparseQueryExecutionProgramIndex(program))
             .at(static_cast<std::size_t>(rows - 2)).at(outcome == MTPVerifierOutcomeGraphMode::Greedy ? 0u : 1u);
-        if (!signature || signature->seq_len != rows || signature->batch_size != 1 ||
+        const auto expected_extent =
+            mtpVerifierGraphFamily() == MTPVerifierGraphFamily::ExactRows &&
+            mtpVerifierExecutionRole() == MTPVerifierExecutionRole::HostedCapturedTransactions &&
+            mtp_graph_owner_plan_.ownsControllerExecutables()
+                ? CapturedVerifierExtent::exactHostedRequest(state_.device_id,
+                    DeviceRowRange::deviceCounted(rows,
+                        static_cast<const int32_t *>(mtp_verifier_request_lengths_dev_)))
+                : CapturedVerifierExtent{};
+        if (!signature || signature->captured_verifier_extent != expected_extent ||
+            signature->seq_len != rows || signature->batch_size != 1 ||
             signature->sparse_query_execution_program != program ||
             signature->mtp_verifier_outcome_graph_mode != outcome ||
             !forward_engine_->retainedDecodeGraph(*signature))

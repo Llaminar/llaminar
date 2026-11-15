@@ -720,6 +720,7 @@ if(HAVE_ROCM)
         kernels/rocm/gemm/ROCmNativeQuantisedGemmShard7.hip
         kernels/rocm/gemm/ROCmMoEGroupedPopulationProjection.hip
         kernels/rocm/gemm/ROCmMoEGroupedWmma.hip # Source-exact grouped gfx1100 matrix leaves
+        kernels/rocm/gemm/ROCmNativeQuantisedVerifierWmma.hip # Native grouped verifier
         kernels/rocm/gemm/ROCmNativeQuantisedWmma.hip # Independent native gfx1100 WMMA compilation
         kernels/rocm/gemm/ROCmSmallNFP32ProjectionKernels.hip # Graph-capturable FP32 small-output projection kernels
         kernels/rocm/gemm/ROCmMoEGroupedPrefillKernels.hip    # Grouped MoE prefill pipeline (graph-capturable, all experts single launch)
@@ -895,6 +896,7 @@ if(HAVE_ROCM)
     # ordered backend's wave64 default; gfx906 retains its only native wave64
     # mode and emits no WMMA entry. Both targets retain the same spill guard.
     set_property(SOURCE kernels/rocm/gemm/ROCmNativeQuantisedWmma.hip
+        kernels/rocm/gemm/ROCmNativeQuantisedVerifierWmma.hip
         kernels/rocm/moe/ROCmRouterQ8Prefill.hip
         kernels/rocm/gemm/ROCmMoEGroupedPopulationProjection.hip
         kernels/rocm/gemm/ROCmMoEGroupedWmma.hip
@@ -1653,6 +1655,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/TPColumnReduceScatterStage.cpp
     execution/compute_stages/stages/MoEProjectionPipeline.cpp
     execution/compute_stages/stages/MoERoutingPipeline.cpp
+    kernels/common/CapturedVerifierExtent.cpp
     kernels/common/ColumnShardAssemblyKernels.cpp
     kernels/common/SharedExpertColumnGateKernels.cpp
     execution/compute_stages/stages/QGateSplitStage.cpp

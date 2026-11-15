@@ -7,9 +7,10 @@ experts, attention, and Q8 router logits. Each requires production-path componen
 correctness, captured replay, unprofiled Release timing and kernel profiling.
 Attention additionally requires linear complete-operation scaling through 64K
 KV tokens with the query bucket held fixed, as explicitly confirmed by the user.
-The added [MTP grouped-decode work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md) covers
-missing dense WMMA producers and verifier qualification of routed/router/attention paths.
-The [grouped epilogue prerequisite](GFX1100_MTP_VERIFIER_EPILOGUE.md) passes four replay cases in both builds, the affected feature suite and 28 exact counter checks.
+The added [MTP work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md) now has native producers
+and exact-hosted IQ4_XS Auto selection:72 M5–16 cells win1.032–1.618×; M2–4 keeps Dot4.
+Release149 native +7 epilogue cases, five ROCm and six host registrations pass;
+broader verifier operation/codebook qualification remains open.
 Floating half-operand GEMM is an additional confirmed gap in the sampled vendor
 path: its actual loaded gfx1100 code object uses vector mixed-FP16 FMA, not WMMA.
 The earlier two-anchor NativeQuantised objective is documented separately in

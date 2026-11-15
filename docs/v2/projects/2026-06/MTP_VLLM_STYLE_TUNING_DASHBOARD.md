@@ -3,9 +3,9 @@
 Serving frontier: 2026-10-09, hybrid PP(TP(2 ROCm), TP(2 CUDA)). Keep below 200 lines and 15,000 bytes;
 history: [October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md) and [project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md).
 
-gfx1100 MTP, 2026-11-15: grouped beta/mapped epilogue repair passes four replay cases in both builds and the affected feature suite.
-The [WMMA work list](../2026-11/GFX1100_MTP_GROUPED_WMMA_PLAN.md) still needs actual verifier producers and measured selection;
-installed M512 prefill dispatch does not certify MTP WMMA or a verifier speedup.
+gfx1100 MTP, 2026-11-15:149 native +7 epilogue Release cases, five focused ROCm and six host registrations pass.
+[WMMA work list](../2026-11/GFX1100_MTP_GROUPED_WMMA_PLAN.md): actual Auto keeps Dot4 at M2–4; all72 measured IQ4_XS M5–16 cells win1.032–1.618× (geo1.260×).
+Exact hosted capture identity is installed;24 profiles pass with zero memory spills. Broader operation/codebook and model qualification remain open.
 
 GDN integration, 2026-10-26: `e2c971301` pushed; full prerequisites2841pass/29skip, post-packaging Unit782/782 and five loader checks pass.
 Matched Qwen3.6 ROCm decode improves10–15%; CUDA is flat with683MiB less workspace. CPU counter batching gains5.91%. [Limits and evidence](../2026-10/GDN_FIXED_EPOCH_BACKEND_PORT_PLAN.md).
