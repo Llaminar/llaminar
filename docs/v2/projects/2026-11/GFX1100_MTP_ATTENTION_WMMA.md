@@ -3,6 +3,9 @@
 This is an implementation and proof record, not a tuning dashboard. The current
 candidate is explicit-only: Automatic still selects the ordered decode producer.
 The ordinary M512 prefill attention result does not qualify grouped MTP decode.
+The four-query candidate from3dd802ba2 is the baseline below. The retained
+eight-query candidate and rejected experiments follow it; none has yet qualified
+an Automatic domain.
 
 ## Arithmetic and ownership
 
@@ -185,14 +188,98 @@ key case. The union mapping consumes fewer cross-query outputs. These are
 arithmetic-count ratios, not measured hardware utilization or an impossibility
 proof. They explain why further padding is not the next experiment.
 
-A reviewed structural candidate would group two query rows with eight heads
-sharing one KV head and consume all four WMMA result registers. It is not yet
-implemented or qualified. Its64KiB score bank must be swizzled rather than
-padded; metadata and Q operands must remain in registers. Four independent
-logical wave states per physical wave must preserve every NaN payload and
-original key order. The score→max/sum→scale→output scratch lifecycle needs a
-barrier after all owner waves snapshot their scales, before any output writes.
-Head grouping must authenticate local and replicated GQA ownership, and full
-fragment mapping must be proven before integration. Register pressure and
-64KiB occupancy are explicit risks. Automatic remains Dot2 until a complete
-operation wins with its byte and resource contracts intact.
+## Query/head tiling experiments
+
+The full-query layout groups two query rows with eight heads sharing one KV
+head and consumes all four WMMA result registers. The earlier source- and
+binary-bound `mtp-attention-score-probe-run.json` already authenticates the
+fragment mapping across2,097,152 original lane partials, including special
+values. That probe's separate shared-root score experiment failed; the new
+layout uses only its lane-partial mapping and retains all64 original lanes.
+
+One64KiB shared bank uses the bijection
+`plane*256 + ((query*16 + key)^plane)` instead of padding. Metadata and packed
+Q operands stay in registers. Four independent query states per physical wave
+retain their original NaN payloads and key order. Explicit barriers separate
+score, maxima/sum, scale and output roles. Owner waves snapshot their scales
+into lanes0–3 before any output overwrite; shuffles recover the original
+ascending wave merge.
+
+Head intervals are clipped independently against KV-head boundaries and the
+local replicated shard. New `HeadGroupsAndTailsDirtyReplay` cases cover partial
+groups, ratios1/3/5/16, offsets crossing cache-head boundaries, entirely empty
+head groups, and M3/16 dirty ring replay with an independent serial oracle.
+The explicit focused preflight registration now includes this test. All six
+focused GTests pass in `mtp-attention-wmma-focused-1794767111392140911`; timing
+boundary replay passes in `mtp-attention-wmma-replay-1794767051282282081`.
+
+Both shipped targets compile without spills, but the full-query kernel uses
+121 VGPRs,80 SGPRs and65,536 shared bytes. It wins zero of90 cells:
+Dot2/WMMA geometric mean0.492819, range0.404315–0.664031. At
+M16/heads16/KV2/64K it takes18.03ms versus9.28ms for Dot2. Exact profiling
+measures22.18% occupancy and40.08% memory-unit busy. The frozen source, binary,
+timing and three counter passes are in `mtp-attention-wmma-full-tile-snapshot`;
+timing receipt is `mtp-attention-wmma-timing-1794767207976857189/receipt.json`.
+
+ISA review finds four hoisted sparse Q tuples retaining24 zero VGPRs and16
+complete score addresses through the PV loop. An empty read/write asm identity
+on the two packed Q words and plane makes tuple/address construction local to
+each matrix issue without changing bits. Rebuilt ISA confirms that removal:
+register use falls to97 VGPRs, with zero spills and unchanged64KiB LDS. All six
+focused tests pass in `mtp-attention-wmma-focused-1794767514629757851`.
+Nevertheless, timing still wins zero of90 cells, geometric mean0.490341, and
+measured occupancy stays22.20%. The largest case takes18.36ms. Evidence is
+`mtp-attention-wmma-timing-1794767552787488290/receipt.json` and
+`mtp-attention-wmma-lifetime-snapshot/snapshot.json`. This resource improvement
+does not establish an economic improvement.
+
+The eight-query candidate reduces the tile to two rows × four heads, two
+independent query states per physical wave and a32KiB swizzled bank. Both
+shipped targets compile without spills; Release and Integration report80 VGPRs
+and75 SGPRs. All six focused tests pass in
+`mtp-attention-wmma-focused-1794768096629616798/receipt.json`.
+
+Its90-cell panel still has no WMMA wins, but improves the geometric-mean ratio
+to0.640798 (range0.524007–0.778216). It is1.09039× faster geometrically than the
+committed four-query/cooperative-K candidate, with61/90 native-to-native wins;
+this does not qualify it over Dot2. At M16/heads16/KV2/64K it takes14.18ms versus
+9.29ms. Fixed-query32K→64K ratios remain1.9540–1.9913 for Dot2 and1.9472–1.9966
+for WMMA. Timing is `mtp-attention-wmma-timing-1794768153323302687/receipt.json`;
+the source, binary and eight exact producer profiles are in
+`mtp-attention-wmma-eight-query-snapshot/snapshot.json`.
+
+The smaller bank permits two resident blocks and measured occupancy rises to
+43.49%, with zero LDS conflicts. However, the anchor's L2 hit rate falls to
+53.16% and fetch traffic is1,049,417KB; the committed four-query/staged-key
+anchor reported81.74% and527,008KB. The comparison changes both tile and input
+staging, so it does not isolate the cause of the traffic increase.
+
+A controlled traversal experiment folded query tiles into grid.x so adjacent
+blocks could reuse a KV split. All six focused tests passed and resources stayed
+unchanged. The90-cell timing panel still won no Dot2 comparisons; its geometric
+mean ratio was0.640721. Relative to the eight-query traversal, aggregate native
+latency was unchanged (old/new geometric mean0.998768), while the M16/H16/KV2
+64-key case regressed from83.33us to103.48us. At the64K anchor, L2 hit rate rose
+from53.16% to75.03% and fetch traffic fell from1,049,417KB to180,339KB. That83%
+traffic reduction without an aggregate latency gain does not support fetch
+traffic as the main limiter in this anchor. The traversal change was rejected;
+the eight-query source was restored. Evidence is
+`mtp-attention-wmma-timing-1794768639877756469/receipt.json` and the complete
+`mtp-attention-wmma-kv-major-snapshot/snapshot.json` archive.
+
+The next bounded candidate uses one query row and four heads per CTA with
+cooperatively staged keys. A single original row policy removes the union of
+differing split/ring/wave schedules while retaining every original lane and key
+order. Three-wave rows need a rotating offset across16-key tiles, so finite
+multi-tile replay must accompany that change. Automatic remains Dot2 until a
+complete operation wins with its byte and resource contracts intact.
+
+Restoring the eight-query source reproduces the exact Release core and timing
+binary SHA256 values in its frozen archive; no timing recollection is needed.
+Both Release and Integration rebuild the shipped gfx906/gfx1100 targets with
+the spill guard enabled. The five affected feature registrations pass all28
+GTests with no skips in
+`mtp-attention-wmma-feature-1794769329902315861/receipt.json`. This includes
+all-format grouped attention, dimension/ring cursor, native replay, independent
+thread-control/exceptional-value replay and the captured timing owner. Binary
+identity is recorded in `mtp-attention-wmma-restored-eight-binary-identity.json`.

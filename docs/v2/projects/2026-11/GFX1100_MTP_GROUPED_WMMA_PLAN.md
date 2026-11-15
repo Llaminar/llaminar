@@ -10,12 +10,14 @@ with zero memory spills. Router Automatic qualifies85/120 exact-hosted keys
 (1.00291–1.28437×, geometric mean1.10438×); seven focused registrations pass.
 All80 router profiles pass without spills. A forced FP16/HD256 grouped-attention
 candidate passes captured serial-byte replay, real append/RoPE replay and
-special values under all four original wave counts. Query/score padding and
-cooperative K loading improve the candidate, but its current generation still
-wins0/90 complete-operation timing cells; Automatic therefore remains Dot2.
-Fixed-query32K→64K scaling passes, and eight exact producer profiles complete
-without spills. A fuller query/head matrix layout is the next structural
-experiment; further padding is not the frontier. See the
+special values under all four original wave counts. The two-row/four-head layout improves
+the candidate but still wins0/90 complete-operation timing cells; Automatic
+therefore remains Dot2. Fixed-query32K→64K scaling passes, and eight exact
+producer profiles complete without spills. A traversal experiment cuts fetch
+traffic83% without an aggregate latency gain and is rejected. The next bounded
+layout uses one row/four heads with cooperative keys to remove differing row
+policies from each CTA. The restored eight-query source reproduces its exact
+Release binary hashes and all28 affected feature GTests pass. See the
 [attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Broader bundles and
 routed/shared operations remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
 not claim model-level MTP speedups or full production certification.
@@ -36,7 +38,7 @@ serial-row byte contract. Ordinary prefill evidence does not qualify MTP.
 | Routed expert gate/up and down | Multi-row MTP enters the fixed-topology grouped transaction in `MoEExpertComputeStage::executeDecodeEquivalentVerifierPrefill`. Native projection candidates and M512 population policies exist; those policies do not admit ordinary verifier capacities. Sparse RouteOwned execution remains a distinct Dot4 producer. | Reuse and qualify native leaves for actual verifier routes, including sparse groups; install measured selection. The prefill-named interface alone does not prove MTP coverage. |
 | Floating grouped projections | `ROCmFloatingPointGemmKernel.cpp` selects `rocmFp16_batched_projection`, `rocmFp32_small_n_batched_projection`, or `rocmFp32x16_batched_projection`, preserving the serial fixed reduction tree. | Direct half/BF16 substitution changes native FP32 operands; a real half-input WMMA witness also changes the explicit FP16RNE reduction. Retain the existing exact producers; no ordinary rocBLAS replacement. |
 | Q8 router | The real verifier API already reaches the forced-capable byte-exact WMMA leaf. Automatic admits the original M512 key and85 exact-hosted M2–16 keys across four measured K/E shapes and both bases. | Actual Automatic component timing, seven focused registrations and80 source-bound profiles pass. Full routing/top-k remains a separate transaction boundary. |
-| Verifier attention | Explicit FP16/HD256 `WmmaLaneExact` preserves lane-owned dot2/XOR, softmax/PV and original split reduction. Captured ring/sentinel/special-value and append/RoPE replay pass. Fixed-query scaling through64K passes; current cooperative-K timing loses all90 cells. Automatic remains ordered. | Qualify a profitable measured domain with a fuller query/head layout, retaining exact feature and resource gates. See the [proof](GFX1100_MTP_ATTENTION_WMMA.md). |
+| Verifier attention | Explicit FP16/HD256 `WmmaLaneExact` preserves lane-owned dot2/XOR, softmax/PV and original split reduction. Captured ring/sentinel/special-value and append/RoPE replay pass. Fixed-query scaling through64K passes; current eight-query timing loses all90 cells. Automatic remains ordered. | Qualify a profitable measured domain with a single-row/head layout, retaining exact feature and resource gates. See the [proof](GFX1100_MTP_ATTENTION_WMMA.md). |
 
 The dense native decoder switch currently contains 18 physical cases. Qualification
 must enumerate the repository's full source-format inventory, including normalized

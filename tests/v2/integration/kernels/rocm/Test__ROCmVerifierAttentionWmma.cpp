@@ -87,6 +87,9 @@ public:
     }
 };
 
+/** @brief A contiguous local query-head shard in the global GQA mapping. */
+struct VerifierHeadMapping { int start; int repetition; };
+
 /**
  * @brief Retain the actual parameter writer, grouped producer and split reducer.
  *
@@ -101,10 +104,12 @@ public:
  * @param specials Include exceptional native operands. @param heads Local query heads.
  * @param kv_heads Visible cache heads; distinct input words exercise head addressing.
  * @param cancellation_threads Optional arithmetic witness: zero means default, otherwise explicit TPB.
+ * @param head_mapping Optional explicit replicated shard, including partial KV-head groups.
  */
 void runVerifierWmmaRingReplay(
     int ordinal, int rows, int capacity, bool replicated, bool specials, int heads = 8, int kv_heads = 1,
-    std::optional<int> cancellation_threads = std::nullopt)
+    std::optional<int> cancellation_threads = std::nullopt,
+    std::optional<VerifierHeadMapping> head_mapping = std::nullopt)
 {
     using Engine = rocm::VerifierAttentionEngine;
     constexpr int width = 256;
@@ -116,13 +121,15 @@ void runVerifierWmmaRingReplay(
         for (auto &value : result) value = distribution(rng);
         return result;
     };
-    const int head_start = replicated ? 8 : 0, repetition = replicated ? 16 : 0;
+    const auto mapping = head_mapping.value_or(VerifierHeadMapping{replicated ? 8 : 0, replicated ? 16 : 0});
+    const int head_start = mapping.start, repetition = mapping.repetition;
     const auto device = DeviceId::rocm(ordinal);
     auto &worker = GPUDeviceContextPool::instance().getContext(device);
     worker.submitAndWait([&]
     {
         SCOPED_TRACE(::testing::Message() << "M=" << rows << " capacity=" << capacity
-            << " replicated=" << replicated << " specials=" << specials);
+            << " replicated=" << replicated << " specials=" << specials << " heads=" << heads
+            << " kv_heads=" << kv_heads << " head_start=" << head_start << " repetition=" << repetition);
         const auto stream = static_cast<hipStream_t>(worker.defaultStream());
         auto &transfer = TransferEngine::instance();
         const size_t q_columns = heads * width, kv_columns = kv_heads * width;
@@ -229,10 +236,12 @@ void runVerifierWmmaRingReplay(
                 return node.name.find(producer_name) != std::string::npos;
             });
             ASSERT_NE(producer, nodes.end());
-            EXPECT_EQ(producer->grid_x, unsigned(heads));
+            const int ratio = repetition > 0 ? repetition : heads / kv_heads;
+            EXPECT_EQ(producer->grid_x, path ? unsigned(kv_heads * ((ratio - 1) / 4 + 1)) : unsigned(heads));
             EXPECT_GT(producer->grid_y, 0u);
             EXPECT_EQ(producer->block_x, path ? 1024u : 256u);
-            EXPECT_EQ(producer->grid_z, path ? (rows + 3u) / 4u : unsigned(rows));
+            EXPECT_EQ(producer->grid_z, path ? unsigned((rows + 1) / 2) : unsigned(rows));
+            if (path) EXPECT_EQ(producer->static_shared_memory_bytes, 32768u);
             EXPECT_EQ(producer->local_memory_bytes_per_thread, 0u);
             EXPECT_GT(producer->max_active_blocks_per_sm, 0u);
             const auto reducer = std::find_if(nodes.begin(), nodes.end(), [](const auto &node) {
@@ -389,6 +398,21 @@ TEST(ROCmVerifierAttentionWmma, SpecialValuesDirtyReplay)
     if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
     for (const int rows : {2, 4, 9, 16})
         ASSERT_NO_FATAL_FAILURE(runVerifierWmmaRingReplay(ordinal, rows, 64, rows == 9, true));
+}
+
+/** @brief Preserve ownership at partial matrix head groups and replicated KV boundaries. */
+TEST(ROCmVerifierAttentionWmma, HeadGroupsAndTailsDirtyReplay)
+{
+    const int ordinal = verifierWmmaDevice();
+    if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
+    struct Case { int heads, kv_heads; VerifierHeadMapping mapping; };
+    constexpr std::array<Case, 8> cases{{
+        {1, 1, {0, 0}}, {3, 1, {0, 0}}, {10, 2, {0, 0}}, {16, 1, {0, 0}},
+        {8, 2, {5, 8}}, {5, 3, {7, 4}}, {9, 1, {3, 16}}, {8, 2, {15, 16}}}};
+    for (const auto &c : cases)
+        for (const int rows : {3, 16})
+            ASSERT_NO_FATAL_FAILURE(runVerifierWmmaRingReplay(ordinal, rows, 513, false, true,
+                c.heads, c.kv_heads, std::nullopt, c.mapping));
 }
 
 /** @brief A TPB-only override must select its real arithmetic without a split variable. */
