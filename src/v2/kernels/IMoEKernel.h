@@ -3194,11 +3194,14 @@ namespace llaminar2
          * borrowed from the same controller as the surrounding verifier.
          *
          * @param rows Physical capacity with fixed or device-owned live rows.
+         * @param kind Explicit execution purpose; only counted original verifier rows qualify measured selection.
          * @return Whether the native backend published the group on its exact stream.
          */
-        virtual bool prepareSharedExpertPrefillGroup(DeviceRowRange rows)
+        virtual bool prepareSharedExpertPrefillGroup(DeviceRowRange rows,
+            MoESharedExpertGroupKind kind = MoESharedExpertGroupKind::Ordinary)
         {
             (void)rows;
+            (void)kind;
             return false;
         }
 

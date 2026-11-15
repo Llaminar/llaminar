@@ -67,6 +67,9 @@ ScopedMoEGroupedPrefillEngine::~ScopedMoEGroupedPrefillEngine()
 
 MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device, const MoEGroupedPopulationKey &key)
 {
+    if (recording_engine == MoEGroupedPrefillEngine::Automatic &&
+        sharedVerifierWmmaQualified(key) && nativeGroupedDevice(device))
+        return {MoEGroupedPrefillEngine::WmmaM16N32, MoEGroupedWmmaRowFloor::EveryExpert};
     const auto domain = groupedPopulationDomain(key);
     if (recording_engine == MoEGroupedPrefillEngine::Automatic &&
         (domain == MoEGroupedPopulationDomain::Qwen || domain == MoEGroupedPopulationDomain::Compact) &&

@@ -5714,6 +5714,9 @@ TEST_P(ROCmSharedVerifierTransaction, DISABLED_ProfileN32)
 /** @test Profile one selected N64 source/capacity producer independently of timing. */
 TEST_P(ROCmSharedVerifierTransaction, DISABLED_ProfileN64)
 { runROCmSharedVerifierTransaction(GetParam(), SharedVerifierEvidence::ProfileN64); }
+/** @test Profile one actual Automatic source/capacity producer separately from timing. */
+TEST_P(ROCmSharedVerifierTransaction, DISABLED_ProfileAutomatic)
+{ runROCmSharedVerifierTransaction(GetParam(), SharedVerifierEvidence::ProfileAutomatic); }
 INSTANTIATE_TEST_SUITE_P(NativeGfx1100, ROCmSharedVerifierTransaction,
     ::testing::ValuesIn(sharedVerifierTransactionCases()),
     [](const ::testing::TestParamInfo<SharedVerifierCase> &info) { return info.param.name; });

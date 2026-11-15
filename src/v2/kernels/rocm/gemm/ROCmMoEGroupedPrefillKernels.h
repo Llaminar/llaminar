@@ -37,6 +37,7 @@
  * @param submitted Optional complete successful host-submission receipt; cleared on entry.
  * @param d_population_selection Dedicated device decision, required for admitted population policies.
  * @param completed_observation Required with an explicit capability; caller-owned host construction receipt, cleared on failure.
+ * @param singleton_sources Original sources borrowed from immutable singleton descriptor tables; empty for other operations.
  * @return True if the declared transaction was enqueued on the non-null stream.
  */
 extern "C"
@@ -79,7 +80,8 @@ bool rocmMoE_grouped_prefill_pipeline(
     const llaminar2::rocm::MoERouteOwnedGateUpAdmission *explicit_admission = nullptr,
     llaminar2::rocm::MoERouteOwnedGateUpLaunchSet *completed_observation = nullptr,
     uint32_t *d_population_selection = nullptr,
-    llaminar2::rocm::MoEGroupedPrefillSubmission *submitted = nullptr);
+    llaminar2::rocm::MoEGroupedPrefillSubmission *submitted = nullptr,
+    llaminar2::rocm::MoEGroupedSourceTuple singleton_sources = {});
 
 /**
  * @brief Fold already-weighted route outputs in the original router order.

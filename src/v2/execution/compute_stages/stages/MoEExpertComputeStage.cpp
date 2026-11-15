@@ -10478,7 +10478,8 @@ namespace llaminar2
         if (!kernel->prepareSharedExpertPrefillGroup(
                 params_.active_row_count_device
                     ? DeviceRowRange::deviceCounted(params_.seq_len, params_.active_row_count_device)
-                    : DeviceRowRange::fullyActive(params_.seq_len)))
+                    : DeviceRowRange::fullyActive(params_.seq_len),
+                MoESharedExpertGroupKind::DecodeEquivalentVerifier))
         {
             LOG_ERROR("[SharedExpertFFNStage] Failed to prepare shared expert verifier group"
                       << " device=" << params_.device_id.to_string()
@@ -10775,7 +10776,8 @@ namespace llaminar2
                 !ensureSharedGroupedDownDescriptorTable(
                     kernel, params_.d_model, params_.intermediate) ||
                 !kernel->prepareSharedExpertPrefillGroup(
-                    DeviceRowRange::fullyActive(params_.seq_len)))
+                    DeviceRowRange::fullyActive(params_.seq_len),
+                    MoESharedExpertGroupKind::DecodeEquivalentVerifier))
             {
                 LOG_ERROR("[SharedExpertFFNStage] Failed to prepare the fixed "
                           "grouped verifier launch state before graph capture");

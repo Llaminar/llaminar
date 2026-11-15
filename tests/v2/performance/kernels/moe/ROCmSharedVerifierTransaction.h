@@ -11,20 +11,58 @@
  */
 
 /** @brief Separate fast lifecycle replay from paired Release collection. */
-enum class SharedVerifierEvidence { Replay, Timing, ProfileN32, ProfileN64 };
+enum class SharedVerifierEvidence { Replay, Timing, ProfileN32, ProfileN64, ProfileAutomatic };
 
 /** @brief Original source formats and retained physical capacity identify a transaction. */
-struct SharedVerifierCase { std::string name; const char *gateup; const char *down; int rows; };
+struct SharedVerifierCase { std::string name; const char *gateup; const char *down; int rows; bool native_automatic; };
 /** @brief Independently filterable source/capacity case; live counts remain device data. */
 class ROCmSharedVerifierTransaction : public ::testing::TestWithParam<SharedVerifierCase> {};
+
+/** @brief Observe only immutable submissions, restoring the caller's collector policy. */
+class SharedVerifierSubmissionCollection final
+{
+    std::array<std::optional<std::string>, 2> previous_;
+    static constexpr std::array names_{"LLAMINAR_PERF_STATS_JSON", "LLAMINAR_PERF_STATS_FILTER"};
+    /** @brief Restore exact values or absence after all producer workers join. */
+    void restore() noexcept
+    {
+        for (size_t i = 0; i < names_.size(); ++i)
+            if (previous_[i] ? setenv(names_[i], previous_[i]->c_str(), 1) : unsetenv(names_[i])) std::terminate();
+        llaminar2::PerfStatsCollector::reloadConfigurationFromEnvironment();
+    }
+public:
+    /** @brief Enable shared projection and router-Q8 reuse counters before worker entry. */
+    SharedVerifierSubmissionCollection()
+    {
+        for (size_t i = 0; i < names_.size(); ++i)
+            if (const auto *value = std::getenv(names_[i])) previous_[i] = value;
+        if (setenv(names_[0], "1", 1) || setenv(names_[1],
+                "kernel.rocm_moe_grouped_prefill_batch_invariant_calls,kernel.rocm_moe_grouped_prefill_router_q8_reuse_calls", 1))
+        {
+            restore();
+            throw std::runtime_error("cannot enable shared verifier submission collection");
+        }
+        llaminar2::PerfStatsCollector::reloadConfigurationFromEnvironment();
+    }
+    /** @brief Restore policy after graph owners and their worker retire. */
+    ~SharedVerifierSubmissionCollection() { restore(); }
+    SharedVerifierSubmissionCollection(const SharedVerifierSubmissionCollection &) = delete;
+    SharedVerifierSubmissionCollection &operator=(const SharedVerifierSubmissionCollection &) = delete;
+};
 /** @return Canonical all-format M16 cases plus mixed-source M8/M9/M16 topology controls. */
 std::vector<SharedVerifierCase> sharedVerifierTransactionCases()
 {
     std::vector<SharedVerifierCase> cases;
     for (const auto &format : llaminar2::test::quantizedVerifierFormats())
-        cases.push_back({std::string(format.label) + "_M16", format.label, format.label, 16});
+        cases.push_back({std::string(format.label) + "_M16", format.label, format.label, 16, true});
     for (int rows : {8, 9, 16})
-        cases.push_back({"IQ2S_IQ4XS_M" + std::to_string(rows), "IQ2_S", "IQ4_XS", rows});
+        cases.push_back({"IQ2S_IQ4XS_M" + std::to_string(rows), "IQ2_S", "IQ4_XS", rows, rows > 8});
+    // Actual classifier exclusions: neighboring capacities and source aliases
+    // must not inherit admission from the same normalized arithmetic masks.
+    cases.push_back({"Q4_0_M9", "Q4_0", "Q4_0", 9, false});
+    cases.push_back({"IQ4_XS_M15", "IQ4_XS", "IQ4_XS", 15, false});
+    cases.push_back({"IQ2S_IQ4NL_M16", "IQ2_S", "IQ4_NL", 16, false});
+    cases.push_back({"Q8_0_Q8_1_M16", "Q8_0", "Q8_1", 16, false});
     return cases;
 }
 
@@ -78,10 +116,12 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
     for (int i = 0; i < int(rocmHardwareMetadata().size()); ++i)
         if (rocmHardwareMetadata().at(i).isa_target.starts_with("gfx1100")) { ordinal = i; break; }
     if (ordinal < 0) GTEST_SKIP() << "Native gfx1100 is not visible";
-    const bool profile = evidence == SharedVerifierEvidence::ProfileN32 || evidence == SharedVerifierEvidence::ProfileN64;
+    const bool profile = evidence == SharedVerifierEvidence::ProfileN32 || evidence == SharedVerifierEvidence::ProfileN64 ||
+        evidence == SharedVerifierEvidence::ProfileAutomatic;
     if (profile && (::testing::UnitTest::GetInstance()->test_to_run_count() != 1 || c.rows <= 8))
         throw std::invalid_argument("Shared verifier profiling requires one native-capable source/capacity case");
     ScopedROCmBatchInvariantRouterPolicy router_policy;
+    SharedVerifierSubmissionCollection submission_collection;
     if (!DeviceManager::instance().hardware()) DeviceManager::instance().initialize(-1, false);
     const DeviceId device = DeviceId::rocm(ordinal);
     const auto &hardware = rocmHardwareMetadata().at(ordinal);
@@ -93,8 +133,8 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
     {
         constexpr int hidden_width = 2048, width = 512, experts = 256, top_k = 8;
         const int rows = c.rows, repeats = profile ? 1 : 8;
-        constexpr std::array engines{Engine::OrderedDot4, Engine::WmmaM16N32, Engine::WmmaM16N64};
-        constexpr std::array names{"Dot4", "N32", "N64"};
+        constexpr std::array engines{Engine::OrderedDot4, Engine::WmmaM16N32, Engine::WmmaM16N64, Engine::Automatic};
+        constexpr std::array names{"Dot4", "N32", "N64", "Automatic"};
         const auto stream = static_cast<hipStream_t>(worker.defaultStream());
         auto *backend = getBackendFor(device);
         ASSERT_NE(stream, nullptr);
@@ -129,14 +169,14 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
         auto serial_output = makeZeros({size_t{1}, size_t(hidden_width)});
         auto serial_residual = makeZeros({size_t{1}, size_t(hidden_width)});
         auto serial_combined = makeZeros({size_t{1}, size_t(hidden_width)});
-        std::array<std::shared_ptr<FP32Tensor>, 3> output, combined, gate_scratch, up_scratch, route_ids, route_weights;
-        std::array<std::unique_ptr<IMoEKernel>, 3> router, shared;
-        std::array<std::shared_ptr<MoERouterQ8HiddenPublication>, 3> publication;
-        std::array<std::unique_ptr<SharedExpertFFNStage>, 3> stages;
-        std::array<std::unique_ptr<SharedExpertGateStage>, 3> gates;
-        std::array<std::unique_ptr<DeviceWorkspaceManager>, 3> workspaces;
-        std::array<std::unique_ptr<IGPUGraphCapture>, 3> fragments, graphs;
-        std::array<std::vector<hipGraphNode_t>, 3> gate_nodes, native_nodes, router_nodes;
+        std::array<std::shared_ptr<FP32Tensor>, 4> output, combined, gate_scratch, up_scratch, route_ids, route_weights;
+        std::array<std::unique_ptr<IMoEKernel>, 4> router, shared;
+        std::array<std::shared_ptr<MoERouterQ8HiddenPublication>, 4> publication;
+        std::array<std::unique_ptr<SharedExpertFFNStage>, 4> stages;
+        std::array<std::unique_ptr<SharedExpertGateStage>, 4> gates;
+        std::array<std::unique_ptr<DeviceWorkspaceManager>, 4> workspaces;
+        std::array<std::unique_ptr<IGPUGraphCapture>, 4> fragments, graphs;
+        std::array<std::vector<hipGraphNode_t>, 4> gate_nodes, native_nodes, router_nodes;
         std::array<std::vector<uint32_t>, 3> expected;
         for (auto &bank : expected) bank.resize(size_t(rows) * hidden_width);
         std::vector<uint32_t> observed(expected[0].size()), combined_observed(observed.size());
@@ -210,7 +250,24 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
                 experts, top_k, true, route_ids[path].get(), route_weights[path].get(), count) &&
                 stages[path]->execute(&context) && gates[path]->execute(&context);
         };
-        for (int path = 0; path < 3; ++path)
+        const auto submissions = [&] {
+            std::array<double, 4> counts{};
+            for (const auto &record : PerfStatsCollector::snapshot({
+                    "kernel.rocm_moe_grouped_prefill_batch_invariant_calls",
+                    "kernel.rocm_moe_grouped_prefill_router_q8_reuse_calls"}))
+            {
+                if (record.tags.at("seq_len") != std::to_string(rows) || record.tags.at("top_k") != "1") continue;
+                if (record.name == "rocm_moe_grouped_prefill_router_q8_reuse_calls") { counts[3] += record.value; continue; }
+                requireHipBenchBody(record.tags.at("counter_semantics") == "host_submissions" &&
+                    record.tags.at("hidden_preparation") == "router_q8" && record.tags.at("geometry_role") == "physical_capacity",
+                    "shared verifier counter ownership");
+                const auto &policy = record.tags.at("dot_policy");
+                requireHipBenchBody(policy == "dot4" || policy == "wmma_n32" || policy == "wmma_n64", "shared verifier policy counter");
+                counts[policy == "dot4" ? 0 : policy == "wmma_n32" ? 1 : 2] += record.value;
+            }
+            return counts;
+        };
+        for (int path = 0; path < 4; ++path)
         {
             output[path] = makeZeros({size_t(rows), size_t(hidden_width)});
             combined[path] = makeZeros({size_t(rows), size_t(hidden_width)});
@@ -261,6 +318,7 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
                 .d_model = hidden_width, .num_experts = experts, .top_k = top_k}));
             ASSERT_TRUE(stages[path]->prepareGraphLaunch(&context, stream));
             ASSERT_TRUE(gates[path]->prepareGraphLaunch(&context, stream));
+            auto expected_submissions = submissions();
             rocm::ScopedMoEGroupedPrefillEngine engine(engines[path], rocm::MoEGroupedWmmaRowFloor::EveryExpert);
             ASSERT_TRUE(enqueue(path));
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
@@ -326,13 +384,13 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
                     native_nodes[path].push_back(node);
                     const auto &args = *static_cast<const rocm::MoEGroupedWmmaArguments *>(launch.kernelParams[0]);
                     ASSERT_GT(path, 0);
-                    ASSERT_EQ(launch.blockDim.x, path == 1 ? 128u : 256u);
+                    ASSERT_EQ(launch.blockDim.x, path == 2 ? 256u : 128u);
                     ASSERT_EQ(launch.blockDim.y, 1u); ASSERT_EQ(launch.blockDim.z, 1u);
                     ASSERT_EQ(args.rows, rows); ASSERT_EQ(args.experts, 1); ASSERT_EQ(args.top_k, 1);
                     if (launch.gridDim.z == 2)
                     {
                         ++native_gateup;
-                        ASSERT_EQ(launch.gridDim.x, unsigned(width / (path == 1 ? 32 : 64)));
+                        ASSERT_EQ(launch.gridDim.x, unsigned(width / (path == 2 ? 64 : 32)));
                         ASSERT_EQ(args.activations, publication[path]->quantized_rows);
                         ASSERT_EQ(args.activation_scales, publication[path]->row_scales);
                         ASSERT_EQ(args.input, rocm::MoEGroupedWmmaInput::OriginalTokens);
@@ -342,7 +400,7 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
                     {
                         ++native_down;
                         ASSERT_EQ(launch.gridDim.z, 1u);
-                        ASSERT_EQ(launch.gridDim.x, unsigned(hidden_width / (path == 1 ? 32 : 64)));
+                        ASSERT_EQ(launch.gridDim.x, unsigned(hidden_width / (path == 2 ? 64 : 32)));
                         ASSERT_EQ(args.n, hidden_width); ASSERT_EQ(args.k, width);
                         ASSERT_EQ(args.input, rocm::MoEGroupedWmmaInput::GroupedRows);
                         ASSERT_EQ(args.activations, workspaces[path]->getBuffer(MoEWorkspaceBuffers::PREFILL_SWIGLU_INT8));
@@ -350,11 +408,15 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
                     }
                 }
             }
-            ASSERT_EQ(native_gateup, path && rows > 8 ? repeats : 0);
-            ASSERT_EQ(native_down, path && rows > 8 ? repeats : 0);
+            const bool native = path == 3 ? c.native_automatic : path && rows > 8;
+            ASSERT_EQ(native_gateup, native ? repeats : 0);
+            ASSERT_EQ(native_down, native ? repeats : 0);
             ASSERT_EQ(gate_nodes[path].size(), repeats);
             ASSERT_EQ(router_nodes[path].size(), repeats);
-            ASSERT_EQ(native_nodes[path].size(), path && rows > 8 ? 2 * repeats : 0);
+            ASSERT_EQ(native_nodes[path].size(), native ? 2 * repeats : 0);
+            expected_submissions[path == 3 ? (c.native_automatic ? 1 : 0) : path] += repeats + 1;
+            expected_submissions[3] += repeats + 1;
+            ASSERT_EQ(submissions(), expected_submissions);
             std::vector<GPUGraphKernelNodeInfo> inventory;
             ASSERT_TRUE(graphs[path]->inspectKernelNodes(inventory));
             std::set<std::string> printed;
@@ -367,6 +429,7 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
                         node.grid_z, node.block_x, node.name.c_str());
             }
         }
+        const auto recorded_submissions = submissions();
         const auto poison = [&](int path) {
             auto &workspace = *workspaces[path];
             for (const char *name : {MoEWorkspaceBuffers::PREFILL_GATE, MoEWorkspaceBuffers::PREFILL_UP,
@@ -411,7 +474,7 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
         {
             published_live = live_rows;
             ASSERT_TRUE(backend->hostToDevice(live.gpu_data_ptr(), &published_live, sizeof(published_live), ordinal, stream));
-            for (int path = 0; path < 3; ++path)
+            for (int path = 0; path < 4; ++path)
             {
                 SCOPED_TRACE(::testing::Message() << names[path] << " live=" << live_rows);
                 auto *parent = dynamic_cast<HIPGraphCapture *>(graphs[path].get());
@@ -428,7 +491,7 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
                     private_observed.size(), ordinal, stream));
                 ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
                 ASSERT_TRUE(std::all_of(private_observed.begin(), private_observed.end(), [](auto byte) { return byte == 0x5a; }));
-                if (path && rows > 8)
+                if (path == 3 ? c.native_automatic : path && rows > 8)
                 {
                     SharedVerifierNodeOmission native_omission(parent->executable(), stream, native_nodes[path]);
                     native_omission.omit(); replay(path);
@@ -464,7 +527,8 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
         {
             published_live = rows;
             ASSERT_TRUE(backend->hostToDevice(live.gpu_data_ptr(), &published_live, sizeof(published_live), ordinal, stream));
-            const int path = evidence == SharedVerifierEvidence::ProfileN32 ? 1 : 2;
+            const int path = evidence == SharedVerifierEvidence::ProfileAutomatic ? 3 :
+                evidence == SharedVerifierEvidence::ProfileN32 ? 1 : 2;
             for (int warm = 0; warm < 10; ++warm) ASSERT_TRUE(graphs[path]->launch());
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
             // Poison outside the selected region so the profiled replay must
@@ -481,6 +545,7 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
             ASSERT_TRUE(matches(observed, 1) && matches(combined_observed, 2))
                 << "profiled replay differs from serial gate/add";
             std::printf("ROCM_SHARED_VERIFIER_PROFILE_OBSERVED,%s,%s,%d\n", c.name.c_str(), names[path], rows);
+            ASSERT_EQ(submissions(), recorded_submissions);
             return;
         }
         const int samples = evidence == SharedVerifierEvidence::Timing ? 31 : 3;
@@ -493,10 +558,10 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
             ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
             for (int sample = 0; sample < samples; ++sample)
             {
-                std::array<double, 3> elapsed{};
-                for (int order = 0; order < 3; ++order)
+                std::array<double, 4> elapsed{};
+                for (int order = 0; order < 4; ++order)
                 {
-                    const int path = sample % 2 ? 2 - order : order;
+                    const int path = sample % 2 ? 3 - order : order;
                     replay(path);
                     ASSERT_TRUE(matches(observed, 1) && matches(combined_observed, 2));
                     const auto timing = graphs[path]->consumeOrderedTimelineTiming();
@@ -508,9 +573,10 @@ void runROCmSharedVerifierTransaction(const SharedVerifierCase &c, SharedVerifie
                     ASSERT_EQ(graphs[path]->consumeOrderedTimelineTiming().state, GPUOrderedTimelineTimingState::AwaitingLaunch);
                     elapsed[path] = timing.samples[0].elapsed_ms * 1000.0 / repeats;
                 }
-                std::printf("ROCM_SHARED_VERIFIER_PAIR,%s,%d,%d,%d,%.9f,%.9f,%.9f\n", c.name.c_str(), rows, live_rows, sample,
-                    elapsed[0], elapsed[1], elapsed[2]);
+                std::printf("ROCM_SHARED_VERIFIER_PAIR,%s,%d,%d,%d,%.9f,%.9f,%.9f,%.9f\n", c.name.c_str(), rows, live_rows, sample,
+                    elapsed[0], elapsed[1], elapsed[2], elapsed[3]);
             }
         }
+        ASSERT_EQ(submissions(), recorded_submissions);
     });
 }

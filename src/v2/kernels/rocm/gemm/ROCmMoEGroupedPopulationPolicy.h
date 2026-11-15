@@ -10,6 +10,7 @@
  */
 #pragma once
 #include "kernels/common/MoEPrefillProjectionExecution.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include <climits>
 #include <cstdint>
 #include <stdexcept>
@@ -32,7 +33,13 @@ enum class MoEGroupedPopulationInput : uint8_t { OriginalTokens, OriginalRouteSl
 /** @brief Quantization ownership retained by the complete operation. */
 enum class MoEGroupedPopulationPreparation : uint8_t { Internal, PublishedQ8 };
 
-/** @brief Complete immutable key; source aliases remain distinct from physical decoders. */
+/** @brief Original immutable singleton sources, separate from normalized arithmetic masks. */
+struct MoEGroupedSourceTuple
+{
+    NativeQuantisedSourceIdentity gate{}, up{}, down{};
+};
+
+/** @brief Complete immutable key; exact singleton sources preserve arithmetic-mask aliases. */
 struct MoEGroupedPopulationKey
 {
     MoEPrefillMeasuredOperation operation = MoEPrefillMeasuredOperation::Unmeasured;
@@ -40,7 +47,38 @@ struct MoEGroupedPopulationKey
     MoEGroupedPopulationPreparation preparation = MoEGroupedPopulationPreparation::Internal;
     int rows = 0, hidden = 0, intermediate = 0, experts = 0, top_k = 0;
     uint32_t gateup_physical = 0, down_physical = 0, gateup_source = 0, down_source = 0;
+    MoEGroupedSourceTuple singleton_sources{};
 };
+
+/** @brief Admit the measured complete shared-verifier transaction without reading live rows.
+ * @param key Original operation, source tuple, geometry and activation ownership.
+ * @return Whether the existing N32 producer is qualified for this immutable key.
+ * Source masks encode arithmetic and may merge aliases; exact original sources
+ * and canonical physical masks must agree independently. Existing RouteOwned
+ * admission still selects the dot producer for live prefixes through eight. */
+[[nodiscard]] constexpr bool sharedVerifierWmmaQualified(const MoEGroupedPopulationKey &key) noexcept
+{
+    static_assert(native_quantised_formats::kAllSourceFormats.size() == 21,
+        "Requalify shared verifier WMMA before extending the source inventory");
+    if (key.operation != MoEPrefillMeasuredOperation::CompleteFullWidthSharedVerifierTokenRows ||
+        key.input != MoEGroupedPopulationInput::OriginalTokens ||
+        key.preparation != MoEGroupedPopulationPreparation::PublishedQ8 ||
+        key.hidden != 2048 || key.intermediate != 512 || key.experts != 1 || key.top_k != 1)
+        return false;
+    const auto &sources = key.singleton_sources;
+    if (sources.gate != sources.up) return false;
+    const auto gu = canonicalDeviceVnniCodebookId(sources.gate);
+    const auto down = canonicalDeviceVnniCodebookId(sources.down);
+    if (gu >= 32 || down >= 32 || key.gateup_physical != (uint32_t{1} << gu) ||
+        key.down_physical != (uint32_t{1} << down) ||
+        key.gateup_source != (uint32_t{1} << canonicalDeviceVnniCodebookId(sources.gate.codebook_id)) ||
+        key.down_source != (uint32_t{1} << canonicalDeviceVnniCodebookId(sources.down.codebook_id)))
+        return false;
+    if (key.rows == 16 && sources.gate == sources.down) return true;
+    return (key.rows == 9 || key.rows == 16) &&
+        sources.gate == NativeQuantisedSourceIdentity{13, true, true} &&
+        sources.down == NativeQuantisedSourceIdentity{4, true, true};
+}
 
 /** @param key Actual validated capture operation. @return Recognized candidate domain; the native selector separately admits qualified implementations. */
 [[nodiscard]] constexpr MoEGroupedPopulationDomain groupedPopulationDomain(

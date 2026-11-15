@@ -8778,9 +8778,9 @@ namespace llaminar2
         return true;
     }
 
-    bool CUDAMoEKernel::prepareSharedExpertPrefillGroup(DeviceRowRange rows)
+    bool CUDAMoEKernel::prepareSharedExpertPrefillGroup(DeviceRowRange rows, MoESharedExpertGroupKind kind)
     {
-        grouped_prefill_grouping_.invalidate();
+        auto grouping_publication = grouped_prefill_grouping_.beginSharedExpert(kind, rows);
         const int seq_len = rows.physicalRows();
         if (seq_len <= 0)
             return false;
@@ -8807,6 +8807,7 @@ namespace llaminar2
             {{"seq_len", std::to_string(seq_len)},
              {"top_k", "1"},
              {"active_expert_slots", "1"}});
+        std::move(grouping_publication).publish();
         return true;
     }
 
@@ -9103,7 +9104,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                 execution.measuredOperation(
                     canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
                                                   : MoEPrefillOutputLayout::TokenRows,
-                    grouped_prefill_grouping_.scope()),
+                    grouped_prefill_grouping_.scopeForProjection(seq_len, top_k)),
                 gateup_table.codebook_mask,
                 down_table.codebook_mask,
                 seq_len,

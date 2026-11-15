@@ -21,10 +21,12 @@
 #pragma once
 
 #include "WorkspaceOverwriteContract.h"
+#include "DeviceRowRange.h"
 
 #include <stdexcept>
 #include <cstdint>
 #include <utility>
+#include <optional>
 
 namespace llaminar2
 {
@@ -45,8 +47,12 @@ namespace llaminar2
     {
         Unspecified, ///< No successful all-route grouping producer is bound.
         AllRoutes, ///< The ordinary unmasked grouping producer owns every route.
-        SelectedRoutes ///< A mask or published runtime assignment may select routes.
+        SelectedRoutes, ///< A mask or published runtime assignment may select routes.
+        SharedVerifierCountedOriginalRows ///< Explicit verifier, original counted rows and one implicit shared route.
     };
+
+    /** @brief Shared grouping's declared execution purpose, independent of live count contents. */
+    enum class MoESharedExpertGroupKind : std::uint8_t { Ordinary, DecodeEquivalentVerifier };
 
     /**
      * @brief Own static grouping-origin publication for one kernel instance.
@@ -67,10 +73,23 @@ namespace llaminar2
         MoEPrefillGroupingProvenance &operator=(const MoEPrefillGroupingProvenance &) = delete;
 
         /** @brief Revoke provenance when grouping buffers or their owner change. */
-        void invalidate() noexcept { scope_ = MoEPrefillRouteScope::Unspecified; }
+        void invalidate() noexcept { scope_ = MoEPrefillRouteScope::Unspecified; shared_rows_.reset(); }
 
         /** @return The last successfully published static producer's origin. */
         [[nodiscard]] MoEPrefillRouteScope scope() const noexcept { return scope_; }
+
+        /** @brief Authenticate a consuming projection against its original grouping.
+         * @param rows Actual physical projection rows, not the current live count.
+         * @param top_k Original route slots per token.
+         * @return The successfully published origin for this exact consumer.
+         * @throws std::logic_error If a shared verifier reuses a different row authority's grouping. */
+        [[nodiscard]] MoEPrefillRouteScope scopeForProjection(int rows, int top_k) const
+        {
+            if (scope_ == MoEPrefillRouteScope::SharedVerifierCountedOriginalRows &&
+                (!shared_rows_ || shared_rows_->physical_rows != rows || shared_rows_->count_capacity != rows || top_k != 1))
+                throw std::logic_error("shared verifier projection changed its prepared row geometry");
+            return scope_;
+        }
 
         /** @brief One noncopyable setup publication; it never owns device work. */
         class Preparation final
@@ -102,6 +121,7 @@ namespace llaminar2
                 if (!owner_)
                     throw std::logic_error("grouped MoE origin publication already consumed");
                 owner_->scope_ = scope_;
+                owner_->shared_rows_ = shared_rows_;
                 owner_->preparing_ = false;
                 owner_ = nullptr;
             }
@@ -112,10 +132,12 @@ namespace llaminar2
              * @brief Revoke the prior producer before any replacement can fail.
              * @param owner Kernel-instance metadata receiving this publication.
              * @param scope Fixed origin selected by the typed producer factory.
+             * @param shared_rows Original immutable verifier row identity, never a count value.
              * @throws std::logic_error before altering an already active owner.
              */
-            Preparation(MoEPrefillGroupingProvenance &owner, MoEPrefillRouteScope scope)
-                : owner_(&owner), scope_(scope)
+            Preparation(MoEPrefillGroupingProvenance &owner, MoEPrefillRouteScope scope,
+                std::optional<DeviceRowRange::CaptureIdentity> shared_rows = std::nullopt)
+                : owner_(&owner), scope_(scope), shared_rows_(shared_rows)
             {
                 if (owner.preparing_)
                     throw std::logic_error("grouped MoE origin preparation overlaps an active producer");
@@ -124,6 +146,7 @@ namespace llaminar2
             }
             MoEPrefillGroupingProvenance *owner_;
             MoEPrefillRouteScope scope_;
+            std::optional<DeviceRowRange::CaptureIdentity> shared_rows_;
         };
 
         /**
@@ -144,8 +167,31 @@ namespace llaminar2
             return Preparation(*this, MoEPrefillRouteScope::SelectedRoutes);
         }
 
+        /** @brief Begin an explicit shared grouping without inspecting device state.
+         * @param kind Declared ordinary or serial-equivalent verifier operation.
+         * @param rows Original capture geometry and borrowed count authority.
+         * @return Unpublished origin; only original counted verifier rows qualify.
+         * @throws std::invalid_argument For an unknown purpose, revoking old provenance.
+         * @throws std::logic_error If another preparation owns this instance. */
+        [[nodiscard]] Preparation beginSharedExpert(MoESharedExpertGroupKind kind, DeviceRowRange rows)
+        {
+            if (preparing_)
+                throw std::logic_error("shared grouping origin overlaps an active producer");
+            invalidate();
+            if (kind != MoESharedExpertGroupKind::Ordinary && kind != MoESharedExpertGroupKind::DecodeEquivalentVerifier)
+                throw std::invalid_argument("unknown shared expert grouping purpose");
+            const auto identity = rows.captureIdentity();
+            const bool counted_verifier = kind == MoESharedExpertGroupKind::DecodeEquivalentVerifier &&
+                identity.count && identity.count_capacity == identity.physical_rows &&
+                identity.first_physical_row == 0 && identity.repeats_per_row == 1;
+            return Preparation(*this, counted_verifier ? MoEPrefillRouteScope::SharedVerifierCountedOriginalRows
+                                                       : MoEPrefillRouteScope::Unspecified,
+                counted_verifier ? std::optional{identity} : std::nullopt);
+        }
+
     private:
         MoEPrefillRouteScope scope_ = MoEPrefillRouteScope::Unspecified;
+        std::optional<DeviceRowRange::CaptureIdentity> shared_rows_; ///< Capture metadata only; device owns the count value.
         bool preparing_ = false; ///< Exactly one setup publication owns this instance.
     };
 
@@ -159,7 +205,8 @@ namespace llaminar2
     enum class MoEPrefillMeasuredOperation : std::uint8_t
     {
         Unmeasured,
-        CompleteFullWidthTokenRowsAllRoutes
+        CompleteFullWidthTokenRowsAllRoutes,
+        CompleteFullWidthSharedVerifierTokenRows
     };
 
     /** @brief One explicit projection transaction, without implicit replay. */
@@ -232,14 +279,17 @@ namespace llaminar2
                 throw std::invalid_argument("unknown grouped MoE measured publication layout");
             if (scope != MoEPrefillRouteScope::Unspecified &&
                 scope != MoEPrefillRouteScope::AllRoutes &&
-                scope != MoEPrefillRouteScope::SelectedRoutes)
+                scope != MoEPrefillRouteScope::SelectedRoutes &&
+                scope != MoEPrefillRouteScope::SharedVerifierCountedOriginalRows)
                 throw std::invalid_argument("unknown grouped MoE measured route scope");
-            return phase_ == Phase::Complete && first_column_ == 0 &&
-                           column_count_ == model_columns_ &&
-                           layout == MoEPrefillOutputLayout::TokenRows &&
-                           scope == MoEPrefillRouteScope::AllRoutes
-                       ? MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes
-                       : MoEPrefillMeasuredOperation::Unmeasured;
+            if (phase_ != Phase::Complete || first_column_ != 0 || column_count_ != model_columns_ ||
+                layout != MoEPrefillOutputLayout::TokenRows)
+                return MoEPrefillMeasuredOperation::Unmeasured;
+            if (scope == MoEPrefillRouteScope::AllRoutes)
+                return MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes;
+            if (scope == MoEPrefillRouteScope::SharedVerifierCountedOriginalRows)
+                return MoEPrefillMeasuredOperation::CompleteFullWidthSharedVerifierTokenRows;
+            return MoEPrefillMeasuredOperation::Unmeasured;
         }
 
         /**

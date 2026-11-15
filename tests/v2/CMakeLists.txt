@@ -6939,6 +6939,12 @@ add_v2_test(V2_Integration_ROCmGroupedPopulationPolicyReplay
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedPopulationPolicyReplay)
 
+add_v2_test(V2_Integration_ROCmSharedVerifierPolicyReplay
+    COMMAND $<TARGET_FILE:v2_test_rocm_moe_grouped_prefill_dispatch>
+        --gtest_filter=Test__ROCmMoEGroupedPopulation.SharedVerifier*
+    LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;MTP;SharedExpert;DeviceFree;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+
 add_test(NAME V2_Unit_Qwen36MoEGPURebalanceSprintScript
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_qwen36_moe_gpu_rebalance_sprint.py
@@ -36767,6 +36773,14 @@ add_v2_test(V2_Integration_MoEPrefillMeasuredOperation
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MoEPrefillMeasuredOperation)
 
+add_v2_test(V2_Integration_MoESharedVerifierGroupingOriginReplay
+    COMMAND $<TARGET_FILE:v2_test_moe_prefill_measured_operation>
+            --gtest_filter=MoEPrefillMeasuredOperation.SharedVerifierOriginReplay
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;MTP;SharedExpert;DeviceFree;Dispatch;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_MoESharedVerifierGroupingOriginReplay)
+
 # Preserve the source-format identity in the same captured verifier cases that
 # independently compare every output byte with serial execution.
 if(TARGET v2_integration_cuda_moe_kernel)
@@ -38852,6 +38866,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
 if(HAVE_ROCM)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_ROCmSharedVerifierTransactionReplay
+        V2_Integration_ROCmSharedVerifierPolicyReplay
         V2_Integration_ROCmVerifierAttentionWmmaReplay
         V2_Integration_ROCmVerifierAttentionControlAndPayloadReplay
         V2_Integration_ROCmVerifierAttentionTimingReplay

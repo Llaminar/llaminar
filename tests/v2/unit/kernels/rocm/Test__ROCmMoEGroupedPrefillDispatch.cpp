@@ -860,3 +860,86 @@ TEST(Test__ROCmMoEGroupedPopulation, RoutePublicationBindingReplay)
         EXPECT_FALSE(admission.binds(changed,counts,offsets));
     }
 }
+
+/** @test Exact source tuples, including aliases, qualify only their measured physical capacities. */
+TEST(Test__ROCmMoEGroupedPopulation, SharedVerifierSourceAndCapacityReplay)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::rocm;
+    const auto &formats = native_quantised_formats::kAllSourceFormats;
+    for (const auto &gate : formats)
+        for (const auto &up : formats)
+            for (const auto &down : formats)
+                for (int rows : {1, 8, 9, 10, 15, 16, 17, 31})
+                {
+                    const auto identity = [](const NativeQuantisedSourceFormat &format) {
+                        return NativeQuantisedSourceIdentity{format.metadata->codebook_id, format.metadata->is_superblock, true};
+                    };
+                    MoEGroupedPopulationKey key{
+                        .operation = MoEPrefillMeasuredOperation::CompleteFullWidthSharedVerifierTokenRows,
+                        .input = MoEGroupedPopulationInput::OriginalTokens,
+                        .preparation = MoEGroupedPopulationPreparation::PublishedQ8,
+                        .rows = rows, .hidden = 2048, .intermediate = 512, .experts = 1, .top_k = 1,
+                        .gateup_physical = nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(*gate.metadata)) |
+                                          nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(*up.metadata)),
+                        .down_physical = nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(*down.metadata)),
+                        .gateup_source = nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(gate.metadata->codebook_id)) |
+                                        nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(up.metadata->codebook_id)),
+                        .down_source = nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(down.metadata->codebook_id)),
+                        .singleton_sources = {identity(gate), identity(up), identity(down)}};
+                    const bool same = gate.quant_type == up.quant_type && gate.quant_type == down.quant_type;
+                    const bool mixed = gate.quant_type == "IQ2_S" && up.quant_type == "IQ2_S" && down.quant_type == "IQ4_XS";
+                    EXPECT_EQ(sharedVerifierWmmaQualified(key), (same && rows == 16) || (mixed && (rows == 9 || rows == 16)))
+                        << gate.quant_type << '/' << up.quant_type << '/' << down.quant_type << " rows=" << rows;
+                    EXPECT_EQ(groupedPopulationDomain(key), MoEGroupedPopulationDomain::Unmeasured);
+                }
+}
+
+/** @test Missing provenance, changed geometry, unmeasured operations and promoted storage cannot inherit a winner. */
+TEST(Test__ROCmMoEGroupedPopulation, SharedVerifierIndependentExclusionsReplay)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::rocm;
+    const MoEGroupedPopulationKey original{
+        .operation = MoEPrefillMeasuredOperation::CompleteFullWidthSharedVerifierTokenRows,
+        .input = MoEGroupedPopulationInput::OriginalTokens,
+        .preparation = MoEGroupedPopulationPreparation::PublishedQ8,
+        .rows = 16, .hidden = 2048, .intermediate = 512, .experts = 1, .top_k = 1,
+        .gateup_physical = 1u << 13, .down_physical = 1u << 24,
+        .gateup_source = 1u << 13, .down_source = 1u << 4,
+        .singleton_sources = {{13, true, true}, {13, true, true}, {4, true, true}}};
+    ASSERT_TRUE(sharedVerifierWmmaQualified(original));
+    for (auto operation : {MoEPrefillMeasuredOperation::Unmeasured, MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes})
+    {
+        auto changed = original; changed.operation = operation;
+        EXPECT_FALSE(sharedVerifierWmmaQualified(changed));
+    }
+    auto changed = original; changed.input = MoEGroupedPopulationInput::OriginalRouteSlots;
+    EXPECT_FALSE(sharedVerifierWmmaQualified(changed));
+    changed = original; changed.preparation = MoEGroupedPopulationPreparation::Internal;
+    EXPECT_FALSE(sharedVerifierWmmaQualified(changed));
+    for (auto member : {&MoEGroupedPopulationKey::hidden, &MoEGroupedPopulationKey::intermediate,
+                        &MoEGroupedPopulationKey::experts, &MoEGroupedPopulationKey::top_k})
+        for (int delta : {-1, 1})
+        {
+            changed = original; changed.*member += delta;
+            EXPECT_FALSE(sharedVerifierWmmaQualified(changed));
+        }
+    for (auto member : {&MoEGroupedPopulationKey::gateup_physical, &MoEGroupedPopulationKey::down_physical,
+                        &MoEGroupedPopulationKey::gateup_source, &MoEGroupedPopulationKey::down_source})
+        for (uint32_t mask : {0u, 1u, 1u << 4, 1u << 13, 1u << 23, 1u << 24, (1u << 4) | (1u << 24)})
+        {
+            if (original.*member == mask) continue;
+            changed = original; changed.*member = mask;
+            EXPECT_FALSE(sharedVerifierWmmaQualified(changed));
+        }
+    for (auto member : {&MoEGroupedSourceTuple::gate, &MoEGroupedSourceTuple::up, &MoEGroupedSourceTuple::down})
+    {
+        changed = original; (changed.singleton_sources.*member).present = false;
+        EXPECT_FALSE(sharedVerifierWmmaQualified(changed));
+        changed = original; (changed.singleton_sources.*member).is_superblock = false;
+        EXPECT_FALSE(sharedVerifierWmmaQualified(changed));
+        changed = original; (changed.singleton_sources.*member).codebook_id = 255;
+        EXPECT_FALSE(sharedVerifierWmmaQualified(changed));
+    }
+}

@@ -1020,7 +1020,8 @@ namespace llaminar2
             int num_experts) override;
 
         /** @copydoc IMoEKernel::prepareSharedExpertPrefillGroup */
-        bool prepareSharedExpertPrefillGroup(DeviceRowRange rows) override;
+        bool prepareSharedExpertPrefillGroup(DeviceRowRange rows,
+            MoESharedExpertGroupKind kind = MoESharedExpertGroupKind::Ordinary) override;
 
         /** @copydoc IMoEKernel::bindRouterQ8HiddenPublication */
         bool bindRouterQ8HiddenPublication(

@@ -4252,7 +4252,8 @@ bool rocmMoE_grouped_prefill_pipeline(
     const llaminar2::rocm::MoERouteOwnedGateUpAdmission *explicit_admission,
     llaminar2::rocm::MoERouteOwnedGateUpLaunchSet *completed_observation,
     uint32_t *d_population_selection,
-    llaminar2::rocm::MoEGroupedPrefillSubmission *submitted)
+    llaminar2::rocm::MoEGroupedPrefillSubmission *submitted,
+    llaminar2::rocm::MoEGroupedSourceTuple singleton_sources)
 {
     if (submitted) *submitted = {};
     if (completed_observation) *completed_observation = {};
@@ -4386,7 +4387,8 @@ bool rocmMoE_grouped_prefill_pipeline(
             : llaminar2::rocm::MoEGroupedPopulationPreparation::Internal,
         .rows = seq_len, .hidden = d_model, .intermediate = intermediate, .experts = num_experts, .top_k = top_k,
         .gateup_physical = gateup_codebook_mask, .down_physical = down_codebook_mask,
-        .gateup_source = gateup_policy_codebook_mask, .down_source = down_policy_codebook_mask};
+        .gateup_source = gateup_policy_codebook_mask, .down_source = down_policy_codebook_mask,
+        .singleton_sources = singleton_sources};
     const auto dot_policy = llaminar2::rocm::selectedMoEGroupedPrefillPolicy(device_id,population_key);
     llaminar2::rocm::MoEGroupedPrefillSubmission pending;
     pending.policy = dot_policy;

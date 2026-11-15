@@ -51,6 +51,60 @@ namespace
     }
 }
 
+/** @test Shared verifier origin is explicit, count-independent, revocable and complete-operation-only. */
+TEST(MoEPrefillMeasuredOperation, SharedVerifierOriginReplay)
+{
+    using llaminar2::DeviceRowRange;
+    using Kind = llaminar2::MoESharedExpertGroupKind;
+    llaminar2::MoEPrefillGroupingProvenance provenance;
+    int32_t unpublished = std::numeric_limits<int32_t>::min();
+    const auto counted = DeviceRowRange::deviceCounted(16, &unpublished);
+    for (const auto rows : {counted, DeviceRowRange::fullyActive(16), counted.slice(0, 9),
+                           counted.slice(1, 15), counted.repeatEachRow(2), counted})
+    {
+        auto publication = provenance.beginSharedExpert(Kind::DecodeEquivalentVerifier, rows);
+        EXPECT_EQ(provenance.scope(), Scope::Unspecified);
+        EXPECT_THROW((void)provenance.beginAllRoutes(), std::logic_error);
+        std::move(publication).publish();
+        const bool original = rows.captureIdentity() == counted.captureIdentity();
+        EXPECT_EQ(provenance.scope(), original ? Scope::SharedVerifierCountedOriginalRows : Scope::Unspecified);
+        EXPECT_EQ(provenance.scopeForProjection(rows.physicalRows(), 1), provenance.scope());
+        if (original)
+        {
+            EXPECT_THROW((void)provenance.scopeForProjection(9, 1), std::logic_error);
+            EXPECT_THROW((void)provenance.scopeForProjection(32, 1), std::logic_error);
+            EXPECT_THROW((void)provenance.scopeForProjection(16, 2), std::logic_error);
+        }
+        EXPECT_EQ(Execution::complete(2048).measuredOperation(Layout::TokenRows, provenance.scope()),
+            original ? Operation::CompleteFullWidthSharedVerifierTokenRows : Operation::Unmeasured);
+        EXPECT_EQ(Execution::complete(2048).measuredOperation(Layout::OriginalRouteRows, provenance.scope()), Operation::Unmeasured);
+        for (auto execution : {Execution::gateUp(2048), Execution::down(2048, 0, 2048), Execution::down(2048, 0, 1024)})
+            EXPECT_EQ(execution.measuredOperation(Layout::TokenRows, provenance.scope()), Operation::Unmeasured);
+        EXPECT_EQ(unpublished, std::numeric_limits<int32_t>::min());
+    }
+    {
+        auto failed = provenance.beginSharedExpert(Kind::Ordinary, counted);
+    }
+    EXPECT_EQ(provenance.scope(), Scope::Unspecified);
+    {
+        auto ordinary = provenance.beginSharedExpert(Kind::Ordinary, counted);
+        std::move(ordinary).publish();
+        EXPECT_EQ(provenance.scope(), Scope::Unspecified);
+    }
+    {
+        auto verifier = provenance.beginSharedExpert(Kind::DecodeEquivalentVerifier, counted);
+        std::move(verifier).publish();
+    }
+    EXPECT_THROW((void)provenance.beginSharedExpert(static_cast<Kind>(255), counted), std::invalid_argument);
+    EXPECT_EQ(provenance.scope(), Scope::Unspecified);
+    {
+        auto wider = provenance.beginSharedExpert(Kind::DecodeEquivalentVerifier, DeviceRowRange::deviceCounted(32, &unpublished));
+        std::move(wider).publish();
+        EXPECT_THROW((void)provenance.scopeForProjection(16, 1), std::logic_error);
+        EXPECT_EQ(provenance.scopeForProjection(32, 1), Scope::SharedVerifierCountedOriginalRows);
+    }
+}
+
 /** The actual producer metadata revokes old evidence before failed setup. */
 TEST(MoEPrefillMeasuredOperation, GroupingPreparationFailureAndResetRevokePriorOrigin)
 {

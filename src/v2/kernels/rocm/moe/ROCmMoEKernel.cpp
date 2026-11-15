@@ -11199,9 +11199,9 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmMoEKernel::prepareSharedExpertPrefillGroup(DeviceRowRange rows)
+    bool ROCmMoEKernel::prepareSharedExpertPrefillGroup(DeviceRowRange rows, MoESharedExpertGroupKind kind)
     {
-        grouped_prefill_grouping_.invalidate();
+        auto grouping_publication = grouped_prefill_grouping_.beginSharedExpert(kind, rows);
         const int seq_len = rows.physicalRows();
         if (seq_len <= 0)
             return false;
@@ -11298,6 +11298,7 @@ namespace llaminar2
                     {"top_k", "1"},
                     {"active_expert_slots", "1"}});
         }
+        std::move(grouping_publication).publish();
         return true;
     }
 
@@ -11774,6 +11775,21 @@ namespace llaminar2
             return false;
         }
         // Launch the fixed, fully grouped pipeline without a host synchronization.
+        // These retained descriptors are immutable preparation metadata. Runtime
+        // placement tables cannot provide a host source authority for selection.
+        rocm::MoEGroupedSourceTuple singleton_sources;
+        if (num_experts == 1 && gateup_table.descriptor_source == MoEDecodeDescriptorSource::StaticDescriptorTable &&
+            down_table.descriptor_source == MoEDecodeDescriptorSource::StaticDescriptorTable &&
+            gateup_table.host_gate_descs.size() == 1 && gateup_table.host_up_descs.size() == 1 &&
+            down_table.host_descs.size() == 1)
+        {
+            const auto source = [](const DeviceNativeQuantisedMatrixDesc &descriptor) {
+                return NativeQuantisedSourceIdentity{descriptor.source_codebook_id,
+                    descriptor.source_is_superblock != 0, descriptor.source_identity_present != 0};
+            };
+            singleton_sources = {source(gateup_table.host_gate_descs.front()),
+                source(gateup_table.host_up_descs.front()), source(down_table.host_descs.front())};
+        }
         rocm::MoEGroupedPrefillSubmission grouped_submitted;
         const bool ok = execution.overwriteOutputThenPublish(
             execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
@@ -11823,8 +11839,9 @@ namespace llaminar2
                     device_ordinal_,
                     producer_stream,
                     execution,
-                    grouped_prefill_grouping_.scope(), owner_admission,
-                    owner_admission ? &owner_completed : nullptr, d_grouped_population_selection_, &grouped_submitted);
+                    grouped_prefill_grouping_.scopeForProjection(seq_len, top_k), owner_admission,
+                    owner_admission ? &owner_completed : nullptr, d_grouped_population_selection_, &grouped_submitted,
+                    singleton_sources);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {

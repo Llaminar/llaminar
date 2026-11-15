@@ -21,11 +21,13 @@ slice qualifies actual routed/shared MTP transactions. See the
 [attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Broader bundles and
 routed/shared operations remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
 not claim model-level MTP speedups or full production certification.
-The complete shared-verifier fixture now covers all21 source formats and mixed
-capacities8/9/16. Forced N32 wins all177 native-active timing cells by
-1.21873–1.87860×; sparse cells remain mixed. All24 replay cases and18 diagnostic
-profiles pass. Actual Automatic admission and its all-format qualification
-remain open. See the [shared transaction proof](GFX1100_MTP_SHARED_VERIFIER.md).
+Shared-verifier Automatic now admits all21 same-source M16 tuples and mixed
+IQ2_S/IQ4_XS M9/M16. All28 replay cases pass453 source/capacity/live keys.
+All177 native-active Automatic cells win all31 pairs by1.23091–1.88403×;
+sparse admitted cells have geometric gain1.03576× and worst latency loss1.16%.
+Four focused host and six CUDA/ROCm feature registrations pass. The368-pass
+source/role/counter profile sweep is running; freeze and feature publication
+follow it. See the [shared transaction proof](GFX1100_MTP_SHARED_VERIFIER.md).
 This implementation plan extends the [prefill campaign](GFX1100_PREFILL_WMMA.md)
 and the [MTP project plan](../2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md).
 It records the implementation frontier and remaining qualification, not a
