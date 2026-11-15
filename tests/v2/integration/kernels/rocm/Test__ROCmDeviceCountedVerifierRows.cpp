@@ -62,6 +62,80 @@ struct VerifierFixtureStreamDrain {
     ~VerifierFixtureStreamDrain() { if(hipStreamSynchronize(stream)!=hipSuccess)std::terminate(); }
 };
 
+/**
+ * @brief Retain one immutable production-prepared source across sequential widths.
+ *
+ * The source tensor outlives the prepared handle, which borrows its metadata.
+ * No workspace, captured executable, activation or mutable row count is shared.
+ */
+class VerifierPreparedSource final
+{
+public:
+    /** @brief Prepare the original seeded source once for one exact matrix.
+     * @param format Complete source identity and creator. @param device Original owner.
+     * @param columns Full output width. @param width Full reduction width. */
+    VerifierPreparedSource(const QuantizedVerifierFormatCase &format,
+        DeviceId device, int columns, int width)
+        : source_(format.create({static_cast<size_t>(columns),static_cast<size_t>(width)},72041)),
+          prepared_(makeGpuPreparedGemm(source_.get(),device,
+              std::string("test.device_rows.")+format.label,
+              ModelContextId{static_cast<uint64_t>(720410+format.source_codebook_id)})),
+          device_(device),columns_(columns),width_(width),type_(format.tensor_type),
+          source_id_(format.source_codebook_id),superblock_(format.source_is_superblock) {}
+
+    /** @brief Authenticate an immutable matrix before lending its kernel to a case.
+     * @param format Requested complete source identity. @param device Original owner.
+     * @param columns Full output width. @param width Full reduction width.
+     * @return The retained ROCm kernel, with no case workspace or stream binding.
+     * @throws std::invalid_argument For a different source, owner or geometry.
+     * @throws std::runtime_error For an unexpected prepared kernel type. */
+    ROCmQuantisedGemmKernel &kernel(const QuantizedVerifierFormatCase &format,
+        DeviceId device, int columns, int width) const
+    {
+        if(device!=device_ || columns!=columns_ || width!=width_ ||
+            format.tensor_type!=type_ || format.source_codebook_id!=source_id_ ||
+            format.source_is_superblock!=superblock_)
+            throw std::invalid_argument("Verifier prepared source cannot cross source/device/geometry");
+        auto *result=dynamic_cast<ROCmQuantisedGemmKernel *>(prepared_.kernel);
+        if(!result)throw std::runtime_error("Verifier source requires a prepared ROCm quantized kernel");
+        return *result;
+    }
+private:
+    std::unique_ptr<TensorBase> source_;
+    GpuPreparedGemm prepared_;
+    DeviceId device_;
+    int columns_,width_;
+    TensorType type_;
+    uint8_t source_id_;
+    bool superblock_;
+};
+
+/** @brief Retire a case binding before its workspace, including fatal test exits. */
+class VerifierFixtureKernelBinding final
+{
+public:
+    /** @brief Bind fresh case storage on its exact stream.
+     * @param kernel Retained immutable source kernel. @param workspace Case-owned storage.
+     * @param stream Nondefault case stream, retained until this scope retires. */
+    VerifierFixtureKernelBinding(ROCmQuantisedGemmKernel &kernel,
+        DeviceWorkspaceManager &workspace,hipStream_t stream):kernel_(kernel),stream_(stream)
+    {
+        try {kernel_.setGPUStream(stream_);kernel_.bindWorkspace(&workspace);}
+        catch(...) {kernel_.unbindWorkspace();kernel_.clearGPUStreamBinding();throw;}
+    }
+    VerifierFixtureKernelBinding(const VerifierFixtureKernelBinding &)=delete;
+    VerifierFixtureKernelBinding &operator=(const VerifierFixtureKernelBinding &)=delete;
+    /** @brief Graphs and observations retire first; clear the borrowed case binding next. */
+    ~VerifierFixtureKernelBinding()
+    {
+        if(hipStreamSynchronize(stream_)!=hipSuccess)std::terminate();
+        kernel_.unbindWorkspace();kernel_.clearGPUStreamBinding();
+    }
+private:
+    ROCmQuantisedGemmKernel &kernel_;
+    hipStream_t stream_;
+};
+
 /** @brief Native launch families sharing the same device count contract. */
 enum class VerifierProjectionBundle { Single, Homogeneous, MixedDecoder, TensorProjection, TensorSwiGLU };
 
@@ -92,6 +166,7 @@ struct VerifierCapacityProbe
  * @param probe Optional captured geometry and native scheduling certificate.
  * @param bias_policy Include a nonzero learned bias in fused serial/graph proofs.
  * @param candidate Exact construction-time producer; the serial oracle stays independent.
+ * @param reused_source Optional immutable same-format matrix; every mutable case owner stays fresh.
  *
  * Fused cases use three independent outputs and partial slices. MixedDecoder
  * exercises the per-projection decoder dispatcher for every codebook; the
@@ -101,7 +176,8 @@ static void proveDeviceCountedRows(
     const QuantizedVerifierFormatCase &format, VerifierProjectionBundle bundle,
     std::optional<VerifierCapacityProbe> probe = std::nullopt,
     VerifierBias bias_policy = VerifierBias::None,
-    NativeQuantisedVerifierCandidate candidate = NativeQuantisedVerifierCandidate::Automatic)
+    NativeQuantisedVerifierCandidate candidate = NativeQuantisedVerifierCandidate::Automatic,
+    VerifierPreparedSource *reused_source = nullptr)
 {
     int device_count = 0;
     if (hipGetDeviceCount(&device_count) != hipSuccess || device_count == 0)
@@ -139,13 +215,10 @@ static void proveDeviceCountedRows(
             nativeQuantisedHardwareForDevice(0).architecture!=native_quantised::NativeQuantisedArchitecture::rocm(11,0,0))
             GTEST_SKIP() << "Native verifier WMMA requires actual gfx1100";
 
-        auto weights = format.create({matrix_columns, matrix_width}, 72041);
-        auto prepared = makeGpuPreparedGemm(
-            weights.get(), device, std::string("test.device_rows.") + format.label,
-            ModelContextId{static_cast<uint64_t>(720410 + format.source_codebook_id)});
-        auto *kernel = dynamic_cast<ROCmQuantisedGemmKernel *>(prepared.kernel);
-        ASSERT_NE(kernel, nullptr);
-        kernel->setGPUStream(stream);
+        std::unique_ptr<VerifierPreparedSource> local_source;
+        if(!reused_source)
+            local_source=std::make_unique<VerifierPreparedSource>(format,device,N,K);
+        auto *kernel=&(reused_source?*reused_source:*local_source).kernel(format,device,N,K);
         auto requirements = kernel->getWorkspaceRequirements(M, N, K);
         if (projection_count > 1)
         {
@@ -155,7 +228,7 @@ static void proveDeviceCountedRows(
         auto workspace = std::make_unique<DeviceWorkspaceManager>(
             device, requirements.total_bytes_with_alignment());
         ASSERT_TRUE(workspace->allocate(requirements));
-        kernel->bindWorkspace(workspace.get());
+        const VerifierFixtureKernelBinding binding(*kernel,*workspace,stream);
         ASSERT_TRUE(kernel->prepareFusedProjectionGraphCapture(projection_count));
         ASSERT_NE(workspace, nullptr);
         DeviceNativeQuantisedMatrixDesc matrix;
@@ -564,11 +637,8 @@ static void proveDeviceCountedRows(
             // candidate never repairs its output before the byte observation.
             for(auto &executable:timing_graphs)ASSERT_NO_FATAL_FAILURE(validate(*executable));
         }
-        for(auto &executable:timing_graphs)executable.reset();
-        dot_control.reset();
-        graph.reset(); // Retire captured operands before their workspace owner.
-        kernel->unbindWorkspace();
-        kernel->clearGPUStreamBinding();
+        // Reverse declaration order drains the exact stream, retires graphs and
+        // buffers, then clears the kernel binding before the workspace retires.
     }
 }
 
@@ -957,12 +1027,62 @@ class ROCmVerifierWmmaFormatEconomy : public ::testing::TestWithParam<QuantizedV
 static void proveCodebookExactWidths(const QuantizedVerifierFormatCase &format,
     std::span<const int> widths)
 {
-    for(const auto [columns,width]:std::array<std::pair<int,int>,3>{{{17408,5120},{5120,17408},{10240,5120}}})
+    initializeROCmHardwareMetadata();
+    int device_count=0;
+    if(hipGetDeviceCount(&device_count)!=hipSuccess || device_count==0)
+        GTEST_SKIP()<<"No ROCm device available";
+    if(nativeQuantisedHardwareForDevice(0).architecture!=
+        native_quantised::NativeQuantisedArchitecture::rocm(11,0,0))
+        GTEST_SKIP()<<"Native verifier WMMA requires actual gfx1100";
+    for(const auto [columns,width]:std::array<std::pair<int,int>,3>{{{17408,5120},{5120,17408},{10240,5120}}}) {
+        VerifierPreparedSource source(format,DeviceId::rocm(0),columns,width);
         for(int rows:widths)
             for(auto operation:{VerifierProjectionBundle::TensorProjection,VerifierProjectionBundle::TensorSwiGLU})
                 ASSERT_NO_FATAL_FAILURE(proveDeviceCountedRows(format,operation,
                     VerifierCapacityProbe{rows,columns,width,VerifierProbePurpose::PairedExactWidth},
-                    VerifierBias::None,NativeQuantisedVerifierCandidate::WmmaM16N64));
+                    VerifierBias::None,NativeQuantisedVerifierCandidate::WmmaM16N64,&source));
+    }
+}
+
+/** @test Prepared sources survive grow/shrink/API reuse while every case binding retires. */
+TEST(ROCmVerifierWmmaDispatch, PreparedSourceReuse)
+{
+    initializeROCmHardwareMetadata();
+    int device_count=0;
+    if(hipGetDeviceCount(&device_count)!=hipSuccess || device_count==0)
+        GTEST_SKIP()<<"No ROCm device available";
+    if(nativeQuantisedHardwareForDevice(0).architecture!=
+        native_quantised::NativeQuantisedArchitecture::rocm(11,0,0))
+        GTEST_SKIP()<<"Native verifier WMMA requires actual gfx1100";
+    const auto &formats=quantizedMoEVerifierFormats();
+    const auto found=std::find_if(formats.begin(),formats.end(),
+        [](const auto &format){return format.tensor_type==TensorType::IQ4_XS;});
+    ASSERT_NE(found,formats.end());
+    const auto &format=*found;
+    const auto device=DeviceId::rocm(0);
+    constexpr int n=65,k=768;
+    VerifierPreparedSource source(format,device,n,k);
+    auto *kernel=&source.kernel(format,device,n,k);
+    DeviceNativeQuantisedMatrixDesc original;
+    ASSERT_TRUE(kernel->exportNativeQuantisedMatrixDesc(original));
+    for(const auto [rows,operation]:std::array<std::pair<int,VerifierProjectionBundle>,4>{{
+        {5,VerifierProjectionBundle::TensorProjection},{16,VerifierProjectionBundle::TensorSwiGLU},
+        {2,VerifierProjectionBundle::TensorProjection},{5,VerifierProjectionBundle::TensorSwiGLU}}}) {
+        ASSERT_NO_FATAL_FAILURE(proveDeviceCountedRows(format,operation,
+            VerifierCapacityProbe{rows,n,k,VerifierProbePurpose::CorrectnessOnly},
+            VerifierBias::None,NativeQuantisedVerifierCandidate::WmmaM16N64,&source));
+        EXPECT_EQ(&source.kernel(format,device,n,k),kernel);
+        EXPECT_FALSE(kernel->hasWorkspace());
+        EXPECT_THROW((void)kernel->requireGPUStream(),std::runtime_error);
+        DeviceNativeQuantisedMatrixDesc current;
+        ASSERT_TRUE(kernel->exportNativeQuantisedMatrixDesc(current));
+        EXPECT_EQ(current.payload,original.payload);
+    }
+    auto alias=format;alias.tensor_type=TensorType::IQ4_NL;alias.source_is_superblock=false;
+    EXPECT_THROW((void)source.kernel(alias,device,n,k),std::invalid_argument);
+    EXPECT_THROW((void)source.kernel(format,device,n+1,k),std::invalid_argument);
+    EXPECT_THROW((void)source.kernel(format,device,n,k+256),std::invalid_argument);
+    EXPECT_THROW((void)source.kernel(format,DeviceId::rocm(1),n,k),std::invalid_argument);
 }
 
 /** @brief First bracket shallow, crossover and full verifier widths for every source format. */

@@ -13,6 +13,9 @@
  * host submission gaps; an external event only joins completed timing samples.
  * Installed Automatic tournaments retain an explicit Dot4 oracle and authenticate
  * the same sixteen-wave kernel selected by ordinary production recording.
+ * Forced tournaments also enumerate every physical verifier width from two
+ * through sixteen. Full-capacity and retained-prefix evidence remain separate:
+ * a win at an exact hosted width does not admit guarded-capacity recording.
  */
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -387,6 +390,12 @@ TEST(ROCmRouterQ8Timing, CapturedEventBoundaryReplay)
 
 /** @test Publish paired timing only after captured bytes and resource identity agree. */
 TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedProductionTournament) { benchmarkRouter(GetParam(),RouterBenchmark::FullCapacity); }
+/** @test Compare eight K waves at an exact physical width using the complete router operation. */
+TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedEightWaveProductionTournament)
+{ benchmarkRouter(GetParam(),RouterBenchmark::FullCapacity,rocm::RouterQ8WaveTile::Eight); }
+/** @test Compare sixteen K waves at an exact physical width using the complete router operation. */
+TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedSixteenWaveProductionTournament)
+{ benchmarkRouter(GetParam(),RouterBenchmark::FullCapacity,rocm::RouterQ8WaveTile::Sixteen); }
 /** @test Measure partial work through retained capacity, including empty and one-row publication. */
 TEST_P(ROCmRouterQ8Prefill, DISABLED_CapturedLivePrefixTournament) { benchmarkRouter(GetParam(),RouterBenchmark::LivePrefix); }
 /** @test Eight cooperating K waves retain the same ordered oracle and poisoned live prefixes. */
@@ -410,7 +419,7 @@ TEST_P(ROCmRouterQ8Prefill, DISABLED_IsolatedEightWaveProfile)
 TEST_P(ROCmRouterQ8Prefill, DISABLED_IsolatedSixteenWaveProfile)
 { benchmarkRouter(GetParam(),RouterBenchmark::Profile,rocm::RouterQ8WaveTile::Sixteen); }
 
-/** @return Canonical row buckets, authenticated model routers and explicit boundary controls. */
+/** @return Every verifier width, canonical prefill buckets, model routers and boundary controls. */
 std::vector<RouterCase> routerCases()
 {
     std::set<std::pair<int,int>> shapes;
@@ -425,6 +434,8 @@ std::vector<RouterCase> routerCases()
     for (auto shape : {std::pair{96,17},std::pair{3072,128},std::pair{4096,256},std::pair{8192,64}})
         shapes.insert(shape);
     std::vector<int> rows{16,32};
+    for (int count = 2; count < 16; ++count)
+        rows.push_back(count);
     rows.insert(rows.end(),kSupportedPrefillGraphBucketSizes.begin(),kSupportedPrefillGraphBucketSizes.end());
     std::vector<RouterCase> result;
     for (auto basis : {RouterQ8Basis::Original,RouterQ8Basis::SignedHadamard32})

@@ -406,6 +406,71 @@ Automatic policy. Receipt: `mtp-verifier-codebook-endpoints-Q4_0-179474995719887
 under the existing local evidence root. Full-width collection follows before
 extending production selection.
 
+The full sweep retains one immutable source tensor and production-prepared
+handle per codebook/N/K. Every width and public operation still gets fresh
+workspace, streams, activations, row publication, serial oracle and captured
+graphs. Typed source/device/geometry checks reject borrowing another matrix.
+Case-scope cleanup drains work, retires graphs and clears kernel bindings before
+workspace retirement, including fatal assertion exits. The focused
+`ROCmVerifierWmmaDispatch.PreparedSourceReuse` regression passes in Release and
+Integration across grow/shrink and projection/SwiGLU reuse, and rejects source4
+alias, device and N/K mismatches. It runs in the existing explicitly registered
+`V2_Integration_GroupedVerifierRows_ROCm_WmmaReplay` feature gate.
+
+Before this setup change, completed Q4_0 through Q5_1 records and their exact
+producer are preserved in `mtp-verifier-codebook-before-reuse-snapshot/`.
+The collection resumes only between completed format records; it does not
+replace or interrupt a timed cell. Reuse regression receipts are
+`mtp-verifier-automatic-release-rows-1794751923977198886/receipt.json` and
+`mtp-verifier-automatic-integration-rows-1794751927971381609/receipt.json`.
+All150 Release native cases pass in
+`mtp-verifier-automatic-release-rows-1794752022508852148/receipt.json`; all five
+affected focused registrations pass in69.63s in
+`mtp-verifier-final-focused-1794752070785011663/receipt.json`.
+
+## Verifier router economy and attention arithmetic
+
+The router performance inventory now includes every physical M2–16, with
+separate complete-operation four/eight/sixteen-wave tournaments. The first
+endpoint panels cover M2/5/8/16, K/E2048/256,2560/512,3072/256,8192/512 and
+both bases. Each of96 candidate cells retains31 paired internal-event samples,
+poisoned output/Q8-bank observations and exact native geometry checks.
+
+| Native tile | Wins/32 endpoint cells | All-cell geometric mean | M16 range |
+|---|---:|---:|---:|
+| Four waves |4|0.838×|0.818–1.032×|
+| Eight waves |12|0.962×|1.014–1.188×|
+| Sixteen waves |20|1.035×|1.130–1.283×|
+
+All M2 cells favor Dot4. Sixteen waves wins six of eight M5 and M8 cells,
+and all M16 cells. This component includes hidden quantization, logits and
+original expert-Q8 restoration; it is not full routing/top-k certification.
+Resolve every intermediate width and original row ownership before installing
+an exact-hosted router rule. Automatic remains the existing M512 policy.
+Receipts: `mtp-router-4wave-endpoints-1794751808042792414/receipt.json`,
+`mtp-router-8wave-endpoints-1794751845878501716/receipt.json` and
+`mtp-router-16wave-endpoints-1794751866239827258/receipt.json`; the collector records each
+exact source, binary, core, sample and restored power mode.
+
+A standalone FP16/HD256 attention arithmetic probe compares each original
+lane's two ordered dot2 updates against one sparse native matrix plane. Both
+operands zero-fill the six unused pairs before the two real pairs. All2,097,152
+sampled partials match bitwise, including broad finite values, subnormals,
+extrema, signed zeros, infinities and quiet NaNs. The loaded matrix descriptor
+reports46 registers and zero private/shared storage. Evidence:
+`mtp-attention-dot2-probe-run.json` and its log/source/binary siblings.
+This proves sampled intermediate arithmetic only. A second probe adds signaling
+NaNs and authored cancellation/subnormal/zero witnesses, then reconstructs one
+scaled score with a bit-reversed carry tree. Its2,097,152 partials still match;
+all finite complete-score comparisons match, but16,078 special-value comparisons
+out of524,288 total scores differ. The score implementation also reports192
+registers and1,084 bytes of private storage. It is unqualified: a shared root
+must not replace the original per-lane arithmetic without proving the complete
+byte contract, and these resources do not qualify a production candidate.
+Evidence: `mtp-attention-score-probe-run.json` and its siblings. Per-row split
+traversal, online softmax/V state and complete attention economy remain open.
+No attention dispatch change is installed.
+
 ## Required acceptance evidence
 
 1. **Rows and formats.** Use production M=1 as the independent serial oracle;

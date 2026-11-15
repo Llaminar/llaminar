@@ -39,7 +39,7 @@ production dispatch: GPU prepared quantized weights use NativeQuantised adapters
 | Grouped MoE | Wave64 M16N32/N64; fused Dot4/WMMA whole-expert floors4/8/12/16; all physical decoders | Serial, promoted, mixed-writer omission, threshold/reset and split/sliced-down replay pass | Ordinary router-Q8/token-output tournament:15,810 samples, six policies/five cases; full Qwen N32 wins1.20750×/1.15204×, mixed wide1.05358×; Qwen Auto results below |
 | Attention | Automatic one-kernel Dot2/WMMA live-prefix selection in the measured FP16 M512 domain | Actual Auto, immutable exclusions, counters, all-format, threshold/ring/partial/reset and internal timing-owner replays pass | Accepted64K gains1.155×/1.138× and doubling1.998×/1.993×;26 cells/14 counter passes |
 | Q8 router | Automatic Sixteen-wave tile for exact whole-row M512/K2560/E512; explicit 4/8/16-wave candidates retained | 14 GPU feature cases, five pure policy cases and both timing owners pass; actual Auto template, ownership and submission counters authenticated | Accepted full512 gains2.744×/2.551×;12 cells/seven counter passes |
-| Floating half GEMM | Existing production hipBLAS path; sampled native matrix gap confirmed | Three retained graph replays pass, each containing cast and vendor GEMM | Loaded bytes/ISA authenticated; complete Release cast+GEMM timing pending |
+| Floating half GEMM | Retain production hipBLAS after bounded custom-kernel investigation | Three candidate variants pass retained byte/replay checks | All six complete cast+GEMM cells lose for every variant; custom replacement deferred |
 
 [Router qualification](GFX1100_ROUTER_LIVE_PREFILL.md) records admission, retained-prefix timing and profiles.
 
