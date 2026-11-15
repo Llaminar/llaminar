@@ -11,8 +11,8 @@ The added [MTP work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md) now has native produ
 and exact-hosted IQ4_XS Auto selection:72 M5–16 cells win1.032–1.618×; M2–4 keeps Dot4.
 Release149 native +7 epilogue cases, five ROCm and six host registrations pass;
 broader verifier operation/codebook qualification remains open.
-Floating half-operand GEMM is an additional confirmed gap in the sampled vendor
-path: its actual loaded gfx1100 code object uses vector mixed-FP16 FMA, not WMMA.
+rocBLAS remains the half-operand implementation: three custom WMMA variants lost
+every measured cell. [Investigation and deferral](GFX1100_HALF_OPERAND_PREFILL_INVESTIGATION.md).
 The earlier two-anchor NativeQuantised objective is documented separately in
 [GFX1100_NATIVE_QUANTISED_WMMA.md](GFX1100_NATIVE_QUANTISED_WMMA.md).
 
@@ -24,7 +24,7 @@ The earlier two-anchor NativeQuantised objective is documented separately in
 | Routed quantized MoE | `CUDAMoEGroupedPrefillKernels.cu` uses `mma.sync.m16n8k32` for grouped projections. | `ROCmMoEGroupedWmma.hip` implements source-exact M16N32/N64 leaves under existing ExpertTiled device admission. Automatic admits measured Qwen and Compact population domains. RouteOwned owns sparse/empty work. |
 | Attention prefill | `CUDAFlashAttentionKernels.cu:1109` uses WMMA half QK with FP32 score accumulation; its general PV is scalar FP32. The active bounded HD256 specialization additionally uses tensor-core PV at `CUDATensorPrefillKernels.cu:328`. | `ROCmFlashAttentionKernels.hip` now has an explicit native four-plane QK candidate preserving the existing half-dot chains and FP32 PV. Automatic installs one-kernel Dot2/WMMA live-prefix selection in the measured FP16 M512 domain. |
 | Q8 router logits | `CUDARouterQ8PrefillDevice.cuh` uses exact INT8 MMA with the router's fixed FP32 tree. | Four/eight/sixteen-wave candidates preserve the ROCm adjacent-leaf tree. Automatic installs Sixteen for whole-row M512/K2560/E512 in both bases; compact-owned rows remain Dot4. |
-| Explicit half-operand floating projection | `CuBLASGemmKernel.cu:380` submits FP16 A/B and FP32 C through the tensor-operation library interface. | `HipBLASGemmKernel.cpp:291` submits half A/B and FP32 C through `hipblasGemmEx`, but the sampled M512/N8192/K2048 gfx1100 dispatch selects a vector FMA implementation. Library API admission does not establish matrix instruction use. |
+| Explicit half-operand floating projection | `CuBLASGemmKernel.cu:380` submits FP16 A/B and FP32 C through the tensor-operation library interface. | `HipBLASGemmKernel.cpp:291` submits half A/B and FP32 C through `hipblasGemmEx`, but the sampled M512/N8192/K2048 gfx1100 dispatch selects a vector FMA implementation. Custom WMMA variants lost; retain rocBLAS. |
 
 Native FP16/BF16 storage alone does not imply the half-operand arithmetic policy.
 Other floating projections keep their declared FP32 activation/reduction contract
