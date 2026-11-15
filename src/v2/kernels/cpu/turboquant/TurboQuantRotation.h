@@ -22,6 +22,9 @@
  * Matvecs select native NEON/AVX2/AVX-512 without unavailable-ISA substitutes.
  * Original matrix/query/output borrows are checked before dispatch. Rotation
  * generation remains a cold builder; inference allocates no matrix/head mirror.
+ * GPU compiler translation units share the cold rotation/context data, but do
+ * not expose CPU execution entrypoints: their project ISA envelope does not
+ * imply that the GPU frontend compiled any host SIMD leaves.
  */
 
 #pragma once
@@ -568,6 +571,10 @@ namespace llaminar2
 #endif
     } // namespace rotation_detail
 
+// GPU context builders consume the immutable rotation without CPU execution.
+// Their build-wide ISA definitions may name AVX2/AVX-512 while the frontend
+// deliberately has no host SIMD flags; never dispatch to absent leaves there.
+#if !defined(__CUDACC__) && !defined(__HIPCC__)
     /** @brief Apply native forward rotation to original disjoint operands.
      * @param rot Original complete immutable matrix; @param x Original FP32 input.
      * @param y Original writable result; may not alias input, matrix or descriptor bytes.
@@ -589,6 +596,7 @@ namespace llaminar2
         const auto input = rotation_detail::Invocation::bind(rot, y, x);
         ISA_DISPATCH_VOID(rotation_detail::transpose, input);
     }
+#endif
 
     // ========================================================================
     // Verification utilities

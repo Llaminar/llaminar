@@ -65,6 +65,11 @@ foreach(_stage_header_suite IN ITEMS Unit Integration)
         COMMAND "${Python3_EXECUTABLE}" -B
             "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_stage_header_boundary.py"
         LABELS ${_stage_header_labels})
+    v2_add_core_free_test(V2_${_stage_header_suite}_TurboQuantGPUHeaderBoundary
+        COMMAND "${Python3_EXECUTABLE}" -B
+            "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_turboquant_gpu_header_boundary.py"
+            --cxx "${CMAKE_CXX_COMPILER}"
+        LABELS ${_stage_header_labels})
 endforeach()
 v2_add_core_free_test(V2_Unit_CPUHostTopology
     COMMAND "${Python3_EXECUTABLE}" -B
