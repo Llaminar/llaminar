@@ -54,6 +54,7 @@
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/rocm/gemm/ROCmMoEGroupedWmma.h"
 #include "utils/ROCmGroupedBranchMutation.h"
+#include "utils/ROCmGroupedPopulationCaptureProof.h"
 #endif
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -69,6 +70,7 @@
 #include <initializer_list>
 #include <limits>
 #include <memory>
+#include <numeric>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -226,7 +228,7 @@ namespace
             : json_(prior("LLAMINAR_PERF_STATS_JSON")),
               filter_(prior("LLAMINAR_PERF_STATS_FILTER")) {
             if (setenv("LLAMINAR_PERF_STATS_JSON","1",1) != 0 ||
-                setenv("LLAMINAR_PERF_STATS_FILTER","kernel.rocm_moe_grouped_prefill_router_q8_reuse_calls",1) != 0) {
+                setenv("LLAMINAR_PERF_STATS_FILTER","kernel.rocm_moe_grouped_prefill_router_q8_reuse_calls,kernel.rocm_moe_grouped_prefill_batch_invariant_calls",1) != 0) {
                 restore("LLAMINAR_PERF_STATS_FILTER",filter_);
                 restore("LLAMINAR_PERF_STATS_JSON",json_);
                 throw std::runtime_error("Cannot select router Q8 submission observation environment");
@@ -248,13 +250,23 @@ namespace
     /** @brief Public operation boundary whose immutable publication shape is timed. */
     enum class ExpertPublication { CanonicalRoutesThenFold, RouterQ8TokenRows };
 
+    /** @brief Physical producer whose retained graph the diagnostic profiler submits. */
+    enum class PopulationProfileProducer { Automatic, Ordered };
+    /** @brief Immutable diagnostic workload; capacity and device-owned runtime policy stay intact. */
+    struct PopulationProfileWork
+    {
+        int live_rows;
+        PopulationProfileProducer producer;
+    };
+
     /** @brief One complete benchmark operation, with profiler runs kept untimed. */
     enum class ExpertBenchmark
     {
         Installed, WmmaReplay, WmmaTournament, Wmma32Profile, Wmma64Profile,
         WmmaHybridReplay, WmmaHybridTournament, WmmaHybrid32Profile, WmmaHybridTimingReplay,
         OrderedProfile, OrderedColdProfile, WmmaAdaptive32ColdProfile,
-        WmmaMacroReplay, WmmaMacroTournament, WmmaMacroTimingReplay, WmmaMacroProfile, WmmaMacroColdProfile
+        WmmaMacroReplay, WmmaMacroTournament, WmmaMacroTimingReplay, WmmaMacroProfile, WmmaMacroColdProfile,
+        PopulationReplay, PopulationTournament, PopulationProfile
     };
 
 #ifdef HAVE_ROCM
@@ -288,11 +300,11 @@ namespace
          * @param stream Exact execution stream. @param publication Real router metadata.
          * @param live Device-owned live count. @param grouped_ids Grouping authority.
          * @param rows Physical bucket. @param width Hidden width. @param intermediate GU width.
-         * @param repeats Expected complete operation count. @param native Native GU is selected.
+         * @param repeats Expected complete operation count. @param projection_consumers Exact retained GU consumers per complete operation.
          * @throws std::runtime_error For missing producers, duplicate quantization or wrong bindings. */
         RouterQ8CaptureProof(HIPGraphCapture &graph,hipStream_t stream,
             const MoERouterQ8HiddenPublication &publication,const int *live,const int *grouped_ids,
-            int rows,int width,int intermediate,int repeats,bool native)
+            int rows,int width,int intermediate,int repeats,int projection_consumers)
             : graph_(graph),stream_(stream)
         {
             if (!graph.graph() || !graph.executable() || !stream ||
@@ -335,11 +347,11 @@ namespace
                         args.activation_scales != publication.row_scales ||
                         args.group_token_indices != grouped_ids || args.rows != rows ||
                         args.k != width || args.n != intermediate)
-                        throw std::runtime_error("Native GU does not consume the real router publication");
+                        throw std::runtime_error("GU does not consume the real router publication");
                     ++consumers;
                 }
             }
-            if (producers_.size() != static_cast<size_t>(repeats) || consumers != (native ? repeats : 0))
+            if (producers_.size() != static_cast<size_t>(repeats) || consumers != projection_consumers * repeats)
                 throw std::runtime_error("Router Q8 producer/consumer inventory is incomplete");
         }
         /** @brief Restore all producer nodes before the borrowed graph retires. */
@@ -462,9 +474,11 @@ namespace
 
     /** @brief Reuse production geometry and source preparation for native tournaments.
      * @param parameter Exact existing model/control case. @param mode Timing or isolated profile owner.
-     * @param publication_mode Complete public operation boundary retained by every candidate. */
+     * @param publication_mode Complete public operation boundary retained by every candidate.
+     * @param profile_work Optional exact live work and producer for the population profiler only. */
     void runExpertPipeline(Case parameter, ExpertBenchmark mode = ExpertBenchmark::Installed,
-        ExpertPublication publication_mode = ExpertPublication::CanonicalRoutesThenFold)
+        ExpertPublication publication_mode = ExpertPublication::CanonicalRoutesThenFold,
+        std::optional<PopulationProfileWork> profile_work = std::nullopt)
     {
         const bool token_publication = publication_mode == ExpertPublication::RouterQ8TokenRows;
         std::optional<RouterQ8SubmissionObservation> observation;
@@ -472,13 +486,17 @@ namespace
         const bool native = mode != ExpertBenchmark::Installed;
         if (token_publication && !native)
             throw std::invalid_argument("Router Q8 token probes require a native tournament mode");
-        const bool macro = mode == ExpertBenchmark::WmmaMacroReplay || mode == ExpertBenchmark::WmmaMacroTournament ||
+        const bool population = mode == ExpertBenchmark::PopulationReplay ||
+            mode == ExpertBenchmark::PopulationTournament || mode == ExpertBenchmark::PopulationProfile;
+        if (population && !token_publication)
+            throw std::invalid_argument("Population probes require the complete router Q8 token operation");
+        const bool macro = population || mode == ExpertBenchmark::WmmaMacroReplay || mode == ExpertBenchmark::WmmaMacroTournament ||
             mode == ExpertBenchmark::WmmaMacroTimingReplay || mode == ExpertBenchmark::WmmaMacroProfile ||
             mode == ExpertBenchmark::WmmaMacroColdProfile;
-        const bool timing_replay = mode == ExpertBenchmark::WmmaHybridTimingReplay || mode == ExpertBenchmark::WmmaMacroTimingReplay;
+        const bool timing_replay = mode == ExpertBenchmark::PopulationReplay || mode == ExpertBenchmark::WmmaHybridTimingReplay || mode == ExpertBenchmark::WmmaMacroTimingReplay;
         const bool cold_profile = mode == ExpertBenchmark::WmmaAdaptive32ColdProfile ||
                                   mode == ExpertBenchmark::OrderedColdProfile || mode == ExpertBenchmark::WmmaMacroColdProfile;
-        const bool profile = mode == ExpertBenchmark::Wmma32Profile || mode == ExpertBenchmark::Wmma64Profile ||
+        const bool profile = mode == ExpertBenchmark::PopulationProfile || mode == ExpertBenchmark::Wmma32Profile || mode == ExpertBenchmark::Wmma64Profile ||
             mode == ExpertBenchmark::WmmaHybrid32Profile || mode == ExpertBenchmark::OrderedProfile ||
             mode == ExpertBenchmark::WmmaMacroProfile || cold_profile;
         if (profile && ::testing::UnitTest::GetInstance()->test_to_run_count() != 1)
@@ -494,8 +512,31 @@ namespace
             ASSERT_EQ(parameter.rows,512) << "Cold profiles retain the full 512-row capture capacity";
             parameter.live_rows = 64;
         }
+        if (profile_work)
+        {
+            if (mode != ExpertBenchmark::PopulationProfile || profile_work->live_rows <= 0 ||
+                profile_work->live_rows > parameter.rows ||
+                (profile_work->producer != PopulationProfileProducer::Automatic &&
+                 profile_work->producer != PopulationProfileProducer::Ordered))
+                throw std::invalid_argument("Invalid exact population profile workload");
+            parameter.live_rows = profile_work->live_rows;
+        }
 #ifdef HAVE_ROCM
-        const auto dot_candidates = groupedDotCandidates(hybrid,macro,token_publication);
+        auto dot_candidates = groupedDotCandidates(hybrid,macro,token_publication);
+        if (population) dot_candidates.push_back({rocm::MoEGroupedPrefillEngine::Automatic,
+            rocm::MoEGroupedWmmaRowFloor::EveryExpert,"Automatic"});
+        // Independent fixture admission: source TensorTypes, public operation and
+        // physical case geometry are available before the production selector runs.
+        const bool qwen_population = population && parameter.rows == 512 && parameter.hidden == 2048 &&
+            parameter.intermediate == 512 && parameter.experts == 256 && parameter.format == TensorType::IQ2_S &&
+            parameter.down_format == TensorType::IQ4_XS;
+        const bool compact_population = population && parameter.rows == 512 && parameter.hidden == 512 &&
+            parameter.intermediate == 256 && parameter.experts == 8 && !parameter.down_format &&
+            (parameter.format == TensorType::Q4_0 || parameter.format == TensorType::IQ2_S);
+        // Compact's TM16/TN256 ordered geometry needs its own fused qualification.
+        const auto population_domain = qwen_population ? rocm::MoEGroupedPopulationDomain::Qwen :
+            rocm::MoEGroupedPopulationDomain::Unmeasured;
+        const int automatic_native_families = qwen_population ? 1 : 0;
         if (native)
         {
             initializeROCmHardwareMetadata();
@@ -649,6 +690,23 @@ namespace
                     parameter.device.is_cuda() ? "CUDA" : "ROCm",
                     std::string(native_quantised_dispatch::moeRoutingProfileName(parameter.route_profile)).c_str(),
                     parameter.ownership_degree, parameter.rows, parameter.live_rows, active_routes);
+            if (mode == ExpertBenchmark::PopulationProfile)
+            {
+                std::vector<int> counts(experts);
+                for (float id : route_ids) if (id >= 0) ++counts[static_cast<int>(id)];
+                int positive = 0, minimum = std::numeric_limits<int>::max(), maximum = 0;
+                for (int count : counts) if (count > 0)
+                { ++positive; minimum = std::min(minimum,count); maximum = std::max(maximum,count); }
+                ASSERT_GT(positive,0);
+                // Fifteen live tokens in uniform Qwen routing means120 one-row
+                // experts. It is not the fifteen-rows-per-expert threshold.
+                if (qwen_population && parameter.route_profile == MoERoutingProfile::Uniform &&
+                    parameter.live_rows == 15)
+                { ASSERT_EQ(active_routes,120u); ASSERT_EQ(positive,120); ASSERT_EQ(minimum,1); ASSERT_EQ(maximum,1); }
+                std::printf("population_profile_work,capacity=%d,live=%d,routes=%zu,experts=%d,min=%d,max=%d,producer=%s\n",
+                    parameter.rows,parameter.live_rows,active_routes,positive,minimum,maximum,
+                    profile_work && profile_work->producer == PopulationProfileProducer::Ordered ? "Dot4" : "Automatic");
+            }
             if (cold_profile)
             {
                 std::vector<int> counts(experts);
@@ -763,16 +821,25 @@ namespace
                     capture.finish();
                     std::vector<GPUGraphKernelNodeInfo> nodes;
                     ASSERT_TRUE(graphs[path]->inspectKernelNodes(nodes));
-                    int native_nodes = 0, gate_up_nodes = 0, down_nodes = 0;
+                    int native_nodes = 0, ordered_population_nodes = 0, gate_up_nodes = 0, down_nodes = 0;
                     std::set<std::tuple<uintptr_t,uint32_t,uint32_t,uint32_t,uint32_t>> seen;
                     for (const auto &node : nodes)
                     {
                         ASSERT_EQ(node.local_memory_bytes_per_thread,0u) << node.name;
-                        ASSERT_EQ(node.name.find("moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel"),std::string::npos);
-                        ASSERT_EQ(node.name.find("moe_grouped_down_batch_invariant_tiled_prefill_kernel"),std::string::npos);
+                        if (dot_candidates[path].engine != rocm::MoEGroupedPrefillEngine::Automatic)
+                        {
+                            ASSERT_EQ(node.name.find("moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel"),std::string::npos);
+                            ASSERT_EQ(node.name.find("moe_grouped_down_batch_invariant_tiled_prefill_kernel"),std::string::npos);
+                        }
                         if (node.name.find("grouped_wmma_detail") == std::string::npos) continue;
-                        const bool adaptive = dot_candidates[path].floor != rocm::MoEGroupedWmmaRowFloor::EveryExpert;
-                        ASSERT_NE(node.name.find(adaptive ? "ELb1EE" : "ELb0EE"),std::string::npos) << node.name;
+                        const bool automatic = dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::Automatic;
+                        if (automatic)
+                            ASSERT_NE(node.name.find("populationProjection"),std::string::npos) << node.name;
+                        else
+                        {
+                            const bool adaptive = dot_candidates[path].floor != rocm::MoEGroupedWmmaRowFloor::EveryExpert;
+                            ASSERT_NE(node.name.find(adaptive ? "ELb1EE" : "ELb0EE"),std::string::npos) << node.name;
+                        }
                         if (dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::WideDot4Wmma)
                         {
                             ASSERT_NE(node.name.find("wideProjection"),std::string::npos);
@@ -783,7 +850,9 @@ namespace
                             const unsigned native_columns = columns / 4;
                             ASSERT_EQ(node.grid_x,(n+native_columns-1)/native_columns);
                         }
-                        ++native_nodes;
+                        if (automatic && capturedPopulationArithmetic(node.name,node.grid_z == 2) == PopulationCapturedArithmetic::Ordered)
+                            ++ordered_population_nodes;
+                        else ++native_nodes;
                         if (node.grid_z == 2) ++gate_up_nodes;
                         else if (node.grid_z == 1) ++down_nodes;
                         else FAIL() << "Unexpected grouped projection role";
@@ -792,9 +861,14 @@ namespace
                                 node.registers_per_thread,node.static_shared_memory_bytes,node.max_active_blocks_per_sm,
                                 node.grid_x,node.grid_y,node.grid_z,node.block_x,node.name.c_str());
                     }
-                    ASSERT_GE(native_nodes,2 * (profile ? 1 : repeats));
-                    ASSERT_EQ(gate_up_nodes,profile ? 1 : repeats);
-                    ASSERT_EQ(down_nodes,profile ? 1 : repeats);
+                    const int native_families = dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::Automatic
+                        ? automatic_native_families : 1;
+                    ASSERT_EQ(native_nodes,2 * native_families * (profile ? 1 : repeats));
+                    const int ordered_families = dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::Automatic
+                        ? automatic_native_families : 0;
+                    ASSERT_EQ(ordered_population_nodes,ordered_families * (profile ? 1 : repeats));
+                    ASSERT_EQ(gate_up_nodes,(native_families + ordered_families) * (profile ? 1 : repeats));
+                    ASSERT_EQ(down_nodes,native_families * (profile ? 1 : repeats));
                     ASSERT_TRUE(graphs[path]->instantiate());
                     if (dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::WideDot4Wmma)
                     {
@@ -806,7 +880,7 @@ namespace
                         EXPECT_EQ(roles,(std::array<size_t,2>{size_t(profile ? 1 : repeats),size_t(profile ? 1 : repeats)}));
                     }
                 }
-                const bool internal_timing = timing_replay || mode == ExpertBenchmark::WmmaTournament ||
+                const bool internal_timing = timing_replay || mode == ExpertBenchmark::PopulationTournament || mode == ExpertBenchmark::WmmaTournament ||
                     mode == ExpertBenchmark::WmmaHybridTournament || mode == ExpertBenchmark::WmmaMacroTournament;
                 if (internal_timing)
                 {
@@ -864,6 +938,43 @@ namespace
                 }
                 std::vector<std::unique_ptr<RouterQ8CaptureProof>> router_proofs;
                 const double reuse_after_capture = token_publication ? reuse_count() : 0;
+                const auto submitted_count = [&] {
+                    double count = 0;
+                    for (const auto &record : PerfStatsCollector::snapshot({"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"}))
+                        count += record.value;
+                    return count;
+                };
+                const double submissions_after_capture = token_publication ? submitted_count() : 0;
+                if (population)
+                {
+                    double automatic_submissions = 0;
+                    std::vector<GPUGraphKernelNodeInfo> actual_nodes;
+                    ASSERT_TRUE(graphs.back()->inspectKernelNodes(actual_nodes));
+                    int gateup_leaves = 0, down_leaves = 0;
+                    for (const auto &node : actual_nodes)
+                    {
+                        if (node.name.find("grouped_wmma_detail") != std::string::npos)
+                            (node.grid_z == 2 ? gateup_leaves : down_leaves)++;
+                        else if (node.name.find("moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel") != std::string::npos) ++gateup_leaves;
+                        else if (node.name.find("moe_grouped_down_batch_invariant_tiled_prefill_kernel") != std::string::npos) ++down_leaves;
+                    }
+                    for (const auto &record : PerfStatsCollector::snapshot({"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"}))
+                    {
+                        ASSERT_EQ(record.tags.at("counter_semantics"),"host_submissions");
+                        ASSERT_EQ(record.tags.at("hidden_preparation"),"router_q8");
+                        if (record.tags.at("dot_policy") != "device_population_v1") continue;
+                        automatic_submissions += record.value;
+                        ASSERT_EQ(std::stoi(record.tags.at("gateup_submitted_tiled_leaves"))*(profile ? 1 : repeats),gateup_leaves);
+                        ASSERT_EQ(std::stoi(record.tags.at("down_submitted_tiled_leaves"))*(profile ? 1 : repeats),down_leaves);
+                        ASSERT_EQ(record.tags.at("gateup_submitted_tiles"),
+                            "dot4:12x128/threads=128/ordered_rows=0/ordered_columns=0/floor=0/leaves=1;"
+                            "wmma_n32:16x32/threads=128/ordered_rows=0/ordered_columns=0/floor=0/leaves=1");
+                        ASSERT_EQ(record.tags.at("down_submitted_tiles"),
+                            "device_population_v1:16x32/threads=128/ordered_rows=16/ordered_columns=128/floor=16/leaves=1");
+                        ASSERT_EQ(record.tags.at("gateup_submitted_tiles").find("wide_dot4_wmma"),std::string::npos);
+                    }
+                    ASSERT_EQ(automatic_submissions,automatic_native_families ? (profile ? 1 : repeats) : 0);
+                }
                 if (token_publication)
                 {
                     ASSERT_EQ(router_publication->source_rows,input->gpu_data_ptr());
@@ -878,7 +989,56 @@ namespace
                             static_cast<hipStream_t>(stream),*router_publication,
                             static_cast<const int *>(device_live->gpu_data_ptr()),
                             static_cast<const int *>(workspace.getBuffer(MoEWorkspaceBuffers::GROUP_TOKEN_INDICES)),
-                            parameter.rows,hidden,intermediate,profile ? 1 : repeats,path != 0));
+                            parameter.rows,hidden,intermediate,profile ? 1 : repeats,
+                            dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::Automatic ? 2 * automatic_native_families : path != 0));
+                    }
+                }
+                std::unique_ptr<ROCmGroupedPopulationCaptureProof> population_proof;
+                auto *population_selection = static_cast<uint32_t *>(workspace.getBuffer(
+                    MoEWorkspaceBuffers::ROCM_GROUPED_POPULATION_SELECTION));
+                if (population)
+                {
+                    auto *captured = dynamic_cast<HIPGraphCapture *>(graphs.back());
+                    ASSERT_NE(captured,nullptr);
+                    ASSERT_NO_THROW(population_proof = std::make_unique<ROCmGroupedPopulationCaptureProof>(
+                        *captured,static_cast<hipStream_t>(stream),population_domain,population_selection,
+                        static_cast<const int *>(workspace.getBuffer(MoEWorkspaceBuffers::GROUP_COUNTS)),
+                        static_cast<const uint32_t *>(workspace.getBuffer(MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY)),
+                        experts,profile ? 1 : repeats));
+                }
+                if (mode == ExpertBenchmark::PopulationReplay && population_domain == rocm::MoEGroupedPopulationDomain::Qwen)
+                {
+                    // Probe the real submission boundary with captured production
+                    // packets. These auxiliary graphs are inspected, never launched.
+                    for (const auto role : {rocm::MoEPrefillProjectionRole::GateUp,rocm::MoEPrefillProjectionRole::Down})
+                    {
+                        const auto [args,control] = population_proof->capturedRoleBindings(role);
+                        const size_t required = rocm::MoEGroupedPopulationDirectoryLayout(args.directory_capacity).words();
+                        for (const bool exact : {false,true})
+                        {
+                            auto probe = context.createGraphCapture(stream);
+                            rocm::MoEGroupedPrefillRoleSubmission submitted;
+                            submitted.record({rocm::MoEGroupedPrefillEngine::PopulationAdaptive,
+                                rocm::MoEGroupedWmmaRowFloor::Sixteen,16,32,128,12,7,128});
+                            bool accepted = false;
+                            {
+                                ScopedBackendGraphCapture capture(context,*probe,"population workspace bound");
+                                ASSERT_TRUE(capture.begin());
+                                accepted = rocm::submitMoEGroupedPopulation(role,
+                                    {population_selection,static_cast<uint32_t *>(workspace.getBuffer(
+                                        MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY)),required - (exact ? 0 : 1)},
+                                    uint32_t{1} << (role == rocm::MoEPrefillProjectionRole::GateUp ? 13 : 24),
+                                    args,control,stream,&submitted);
+                                capture.finish();
+                            }
+                            ASSERT_EQ(accepted,exact);
+                            const unsigned leaves = role == rocm::MoEPrefillProjectionRole::GateUp ? 2u : 1u;
+                            ASSERT_EQ(submitted.leaves(),exact ? leaves : 0u);
+                            ASSERT_EQ(submitted.size,exact ? leaves : 0u);
+                            std::vector<GPUGraphKernelNodeInfo> nodes;
+                            ASSERT_TRUE(probe->inspectKernelNodes(nodes));
+                            ASSERT_EQ(nodes.size(),exact ? leaves + 1u : 0u);
+                        }
                     }
                 }
                 if (timing_replay)
@@ -910,7 +1070,8 @@ namespace
                     for (const char *name : {MoEWorkspaceBuffers::PREFILL_A_INT8,MoEWorkspaceBuffers::PREFILL_A_SCALES,
                             MoEWorkspaceBuffers::PREFILL_GATE,MoEWorkspaceBuffers::PREFILL_UP,
                             MoEWorkspaceBuffers::PREFILL_SWIGLU_INT8,MoEWorkspaceBuffers::PREFILL_SWIGLU_SCALES,
-                            MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY})
+                            MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY,
+                            MoEWorkspaceBuffers::ROCM_GROUPED_POPULATION_SELECTION})
                     {
                         void *bank = workspace.getBuffer(name);
                         const size_t bytes = workspace.getBufferSize(name);
@@ -947,6 +1108,36 @@ namespace
                     ASSERT_TRUE(std::all_of(q8.begin()+active_q8,q8.end(),[](auto v) { return v == 0xa5; }));
                     ASSERT_TRUE(std::all_of(scales.begin()+active_scales,scales.end(),[](auto v) { return v == 0xa5; }));
                     ASSERT_EQ(reuse_count(),reuse_after_capture);
+                    ASSERT_EQ(submitted_count(),submissions_after_capture);
+                };
+                // Expected decisions derive from the fixture's routes, never a
+                // device count download. This scalar oracle is outside timing.
+                const auto expected_population = [&](int live) {
+                    using enum rocm::MoEGroupedPopulationFamily;
+                    std::vector<int> counts(experts);
+                    int slots = 0;
+                    for (size_t i = 0; i < std::min(route_ids.size(),static_cast<size_t>(live)*top_k); ++i)
+                        if (route_ids[i] >= 0) { ++counts[static_cast<int>(route_ids[i])]; ++slots; }
+                    if (!population_proof->tiled(slots)) return Dot4;
+                    std::erase(counts,0);
+                    if (counts.empty()) return Dot4;
+                    const auto [low,high] = std::minmax_element(counts.begin(),counts.end());
+                    if (compact_population)
+                        return counts.size() == 8 && *low == *high && *low >= 12 ? N32 : Dot4;
+                    if (*low >= 16 || (counts.size() <= 32 && *low >= 7)) return N32;
+                    if (*high >= 16 || *high >= 5 * *low || (*low == 12 && *high == 12)) return WideFloor16;
+                    return Dot4;
+                };
+                const auto verify_population = [&](int live) {
+                    if (!population || !automatic_native_families) return;
+                    uint32_t selected = UINT32_MAX;
+                    const auto drain_selection = [&](void *) {
+                        if (!backend->synchronizeStream(stream,parameter.device.ordinal)) std::terminate();
+                    };
+                    std::unique_ptr<void,decltype(drain_selection)> selection_retirement(&context,drain_selection);
+                    ASSERT_TRUE(backend->deviceToHost(&selected,population_selection,sizeof(selected),parameter.device.ordinal,stream));
+                    ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                    ASSERT_EQ(selected,static_cast<uint32_t>(expected_population(live))) << "live=" << live;
                 };
                 const auto verify = [&](int live) {
                     auto replay_ids = route_ids;
@@ -975,6 +1166,87 @@ namespace
                         ASSERT_EQ(std::memcmp(reference.data(),actual.data(),actual.size()*sizeof(float)),0)
                             << "path=" << path << " live=" << live;
                         ASSERT_NO_FATAL_FAILURE(verify_q8_publication(live));
+                        if (population && path + 1 == graphs.size()) ASSERT_NO_FATAL_FAILURE(verify_population(live));
+                    }
+                };
+                const auto verify_population_writers = [&](int live) {
+                    if (!population || !automatic_native_families) return;
+                    int slots = 0;
+                    for (size_t i = 0; i < std::min(route_ids.size(),static_cast<size_t>(live)*top_k); ++i)
+                        slots += route_ids[i] >= 0;
+                    const bool tiled = population_proof->tiled(slots);
+                    const auto selected = expected_population(live);
+                    auto reference = expected;
+                    std::fill(reference.begin()+static_cast<size_t>(live)*hidden,reference.end(),0.0f);
+                    for (auto family : {rocm::MoEGroupedPopulationFamily::Dot4,
+                            rocm::MoEGroupedPopulationFamily::N32,rocm::MoEGroupedPopulationFamily::WideFloor16})
+                    {
+                        if (!population_proof->contains(family)) continue;
+                        population_proof->omit(family);
+                        poison();
+                        ASSERT_TRUE(graphs.back()->launch());
+                        ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),actual.size()*sizeof(float),parameter.device.ordinal,stream));
+                        ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                        ASSERT_EQ(std::memcmp(reference.data(),actual.data(),actual.size()*sizeof(float)) != 0,
+                            tiled && family == selected) << "live=" << live << " omitted=" << static_cast<int>(family);
+                        population_proof->restore();
+                        for (int restored = 0; restored < 2; ++restored)
+                        {
+                            poison();
+                            ASSERT_TRUE(graphs.back()->launch());
+                            ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),actual.size()*sizeof(float),parameter.device.ordinal,stream));
+                            ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                            ASSERT_EQ(std::memcmp(reference.data(),actual.data(),actual.size()*sizeof(float)),0);
+                            ASSERT_NO_FATAL_FAILURE(verify_population(live));
+                        }
+                    }
+                };
+                const auto verify_population_producer_omissions = [&] {
+                    if (!qwen_population) return;
+                    const auto selected_family = expected_population(parameter.rows);
+                    std::vector<int> counts(experts);
+                    for (float id : route_ids) if (id >= 0) ++counts[static_cast<int>(id)];
+                    if (!population_proof->tiled(std::accumulate(counts.begin(),counts.end(),0))) return;
+                    for (auto branch : {rocm::MoEGroupedBranchSuppression::Ordered,rocm::MoEGroupedBranchSuppression::Wmma})
+                    {
+                        population_proof->omitArithmetic(branch);
+                        poison();
+                        ASSERT_TRUE(graphs.back()->launch());
+                        ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),actual.size()*sizeof(float),parameter.device.ordinal,stream));
+                        ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                        int surviving_tokens = 0, missing_tokens = 0;
+                        bool expect_missing = false, expect_surviving = false;
+                        for (int token=0;token<parameter.rows;++token)
+                        {
+                            bool omitted = false, surviving = false;
+                            for (int slot=0;slot<top_k;++slot)
+                            {
+                                const int expert = static_cast<int>(route_ids[token*top_k+slot]);
+                                if (expert < 0) continue;
+                                const bool is_ordered = selected_family == rocm::MoEGroupedPopulationFamily::Dot4 ||
+                                    (selected_family == rocm::MoEGroupedPopulationFamily::WideFloor16 && counts[expert] < 16);
+                                const bool removed = is_ordered == (branch == rocm::MoEGroupedBranchSuppression::Ordered);
+                                omitted |= removed; surviving |= !removed;
+                            }
+                            const int different = std::memcmp(actual.data()+token*hidden,expected.data()+token*hidden,hidden*sizeof(float));
+                            if (!omitted) {
+                                ASSERT_EQ(different,0) << "surviving token=" << token;
+                                surviving_tokens += surviving; expect_surviving |= surviving;
+                            }
+                            else { expect_missing = true; if (different) ++missing_tokens; }
+                        }
+                        if (expect_surviving) ASSERT_GT(surviving_tokens,0);
+                        if (expect_missing) ASSERT_GT(missing_tokens,0);
+                        else ASSERT_EQ(std::memcmp(actual.data(),expected.data(),actual.size()*sizeof(float)),0);
+                        population_proof->restore();
+                        for (int restored=0;restored<2;++restored)
+                        {
+                            poison();
+                            ASSERT_TRUE(graphs.back()->launch());
+                            ASSERT_TRUE(backend->deviceToHost(actual.data(),output->gpu_data_ptr(),actual.size()*sizeof(float),parameter.device.ordinal,stream));
+                            ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                            ASSERT_EQ(std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float)),0);
+                        }
                     }
                 };
                 for (int live : {parameter.live_rows,0,1,std::min(8,parameter.live_rows),parameter.live_rows})
@@ -1005,7 +1277,9 @@ namespace
                 if (profile)
                 {
                     ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
-                    const std::string profile_name = (mode == ExpertBenchmark::OrderedProfile || mode == ExpertBenchmark::OrderedColdProfile) ? "Dot4" :
+                    const std::string profile_name = mode == ExpertBenchmark::PopulationProfile ?
+                        (profile_work && profile_work->producer == PopulationProfileProducer::Ordered ? "Dot4" : "Automatic") :
+                        (mode == ExpertBenchmark::OrderedProfile || mode == ExpertBenchmark::OrderedColdProfile) ? "Dot4" :
                         (mode == ExpertBenchmark::WmmaHybrid32Profile || mode == ExpertBenchmark::WmmaAdaptive32ColdProfile) ? "N32Floor8" :
                         macro ? "WideFloor16" : mode == ExpertBenchmark::Wmma32Profile ? "N32" : "N64";
                     const auto selected = std::find_if(dot_candidates.begin(),dot_candidates.end(),
@@ -1175,9 +1449,16 @@ namespace
                         0,1,16,17,31,parameter.live_rows};
                     std::erase_if(live_points,[&](int n) { return n > parameter.live_rows; });
                 }
+                if (population)
+                {
+                    live_points = {0,1,3,4,7,8,9,11,12,13,15,16,17,31,32,39,40,41,48,57,58,60,63,64,65,68,
+                        124,128,256,384,480,481,496,511,512};
+                    std::erase_if(live_points,[&](int n) { return n > parameter.live_rows; });
+                }
                 for (int live : live_points)
                 {
                     ASSERT_NO_FATAL_FAILURE(verify(live));
+                    ASSERT_NO_FATAL_FAILURE(verify_population_writers(live));
                     if (replay_only) continue;
                     auto reference = expected;
                     std::fill(reference.begin()+static_cast<size_t>(live)*hidden,reference.end(),0.0f);
@@ -1219,6 +1500,124 @@ namespace
                     else
                         std::printf("MOE_WMMA_MEDIAN,%s,%.9f,%.9f,%.9f,%.6f,%.6f\n",parameter.name.c_str(),
                             times[0][15],times[1][15],times[2][15],times[0][15]/times[1][15],times[0][15]/times[2][15]);
+                }
+                if (population && automatic_native_families)
+                {
+                    using Family = rocm::MoEGroupedPopulationFamily;
+                    struct Histogram { std::vector<int> counts; Family expected; };
+                    std::vector<Histogram> histograms;
+                    const auto balanced = [&](int active,int count,Family family) {
+                        histograms.push_back({std::vector<int>(active,count),family});
+                    };
+                    if (qwen_population)
+                    {
+                        balanced(32,6,Family::Dot4); balanced(32,7,Family::N32); balanced(32,8,Family::N32);
+                        balanced(31,7,Family::N32); balanced(33,7,Family::Dot4);
+                        balanced(64,11,Family::Dot4); balanced(64,12,Family::WideFloor16); balanced(64,13,Family::Dot4);
+                        balanced(64,15,Family::Dot4); balanced(64,16,Family::N32); balanced(64,17,Family::N32);
+                        for (int maximum : {4,5,6})
+                        {
+                            std::vector<int> counts(64,1); counts.back() = maximum;
+                            histograms.push_back({counts,maximum == 4 ? Family::Dot4 : Family::WideFloor16});
+                        }
+                        auto near_cold = std::vector<int>(64,12); near_cold.back() = 13;
+                        histograms.push_back({near_cold,Family::Dot4});
+                        auto mixed = std::vector<int>(64,15); mixed.back() = 16;
+                        histograms.push_back({mixed,Family::WideFloor16});
+                        // Cross the retained worker bound in both roles with
+                        // cold and native writers, then replay smaller traces.
+                        mixed.assign(128,15); mixed.back() = 16;
+                        histograms.push_back({mixed,Family::WideFloor16});
+                        balanced(0,0,Family::Dot4); balanced(1,1,Family::Dot4);
+                        balanced(63,1,Family::Dot4); balanced(64,1,Family::Dot4); balanced(65,1,Family::Dot4);
+                        balanced(256,16,Family::N32); balanced(0,0,Family::Dot4);
+                        balanced(256,12,Family::WideFloor16); balanced(33,7,Family::Dot4); balanced(256,16,Family::N32);
+                        // Direct one-row GU work, cold12-row tails and retained
+                        // direct/staged transitions share the production graph.
+                        balanced(256,13,Family::Dot4);
+                        auto single_and_pair = std::vector<int>(256,1);
+                        std::fill(single_and_pair.begin()+128,single_and_pair.end(),2);
+                        histograms.push_back({single_and_pair,Family::Dot4});
+                        std::reverse(single_and_pair.begin(),single_and_pair.end());
+                        histograms.push_back({single_and_pair,Family::Dot4});
+                        auto single_and_hot = std::vector<int>(128,1);
+                        std::fill(single_and_hot.begin()+64,single_and_hot.end(),16);
+                        histograms.push_back({single_and_hot,Family::WideFloor16});
+                        // A native tile's one-row tail must stay on its native
+                        // producer, even though it has the same live row count.
+                        balanced(128,17,Family::N32);
+                    }
+                    else
+                    {
+                        balanced(8,11,Family::Dot4); balanced(8,12,Family::N32); balanced(8,13,Family::N32);
+                        balanced(7,16,Family::Dot4); balanced(8,512,Family::N32); balanced(0,0,Family::Dot4);
+                        histograms.push_back({{15,16,16,16,16,16,16,16},Family::Dot4});
+                        balanced(8,512,Family::N32);
+                    }
+                    const auto original_routes = route_ids, original_expected = expected;
+                    const auto original_q8 = expected_q8, original_scales = expected_scales;
+                    std::vector<float> original_input(input->numel()), changed_input(original_input.size());
+                    const int live = parameter.rows;
+                    const auto drain_trace = [&](void *) {
+                        if (!backend->synchronizeStream(stream,parameter.device.ordinal)) std::terminate();
+                    };
+                    std::unique_ptr<void,decltype(drain_trace)> trace_retirement(&context,drain_trace);
+                    ASSERT_TRUE(backend->deviceToHost(original_input.data(),input->gpu_data_ptr(),original_input.size()*sizeof(float),parameter.device.ordinal,stream));
+                    ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                    for (size_t trace = 0; trace < histograms.size(); ++trace)
+                    {
+                        route_ids.assign(route_ids.size(),-1.0f);
+                        std::vector<int> filled(parameter.rows);
+                        int cold_span = parameter.rows, hot_span = 0;
+                        if (histograms[trace].expected == Family::WideFloor16)
+                        {
+                            int cold_slots=0,hot_slots=0,cold_max=0,hot_max=0;
+                            for (int count : histograms[trace].counts)
+                                if (count < 16) { cold_slots+=count; cold_max=std::max(cold_max,count); }
+                                else { hot_slots+=count; hot_max=std::max(hot_max,count); }
+                            if (cold_slots && hot_slots)
+                            {
+                                cold_span=std::max(cold_max,(cold_slots+top_k-1)/top_k);
+                                hot_span=std::max(hot_max,(hot_slots+top_k-1)/top_k);
+                                ASSERT_LE(cold_span+hot_span,parameter.rows);
+                            }
+                        }
+                        // Mixed arithmetic owns disjoint token spans so omission
+                        // proves both missing outputs and untouched surviving bytes.
+                        // Allocate each expert to distinct least-filled token rows;
+                        // the holdout has no duplicate expert in a token's top-k.
+                        for (size_t expert = 0; expert < histograms[trace].counts.size(); ++expert)
+                        {
+                            const bool hot = hot_span && histograms[trace].counts[expert] >= 16;
+                            std::vector<int> rows(hot ? hot_span : cold_span);
+                            std::iota(rows.begin(),rows.end(),hot ? cold_span : 0);
+                            std::stable_sort(rows.begin(),rows.end(),[&](int a,int b) { return filled[a] < filled[b]; });
+                            for (int n = 0; n < histograms[trace].counts[expert]; ++n)
+                            {
+                                const int row = rows[n];
+                                ASSERT_LT(filled[row],top_k);
+                                route_ids[row*top_k+filled[row]++] = static_cast<float>(expert);
+                            }
+                        }
+                        for (size_t i = 0; i < original_input.size(); ++i)
+                            changed_input[i] = original_input[i] * (trace % 2 ? -0.5f : 1.0f);
+                        ASSERT_TRUE(backend->hostToDevice(input->gpu_data_ptr(),changed_input.data(),changed_input.size()*sizeof(float),parameter.device.ordinal,stream));
+                        ASSERT_TRUE(backend->hostToDevice(ids->gpu_data_ptr(),route_ids.data(),route_ids.size()*sizeof(float),parameter.device.ordinal,stream));
+                        ASSERT_TRUE(backend->hostToDevice(device_live->gpu_data_ptr(),&live,sizeof(live),parameter.device.ordinal,stream));
+                        poison();
+                        ASSERT_TRUE(graphs[0]->launch());
+                        ASSERT_TRUE(backend->deviceToHost(expected.data(),output->gpu_data_ptr(),expected.size()*sizeof(float),parameter.device.ordinal,stream));
+                        ASSERT_TRUE(backend->deviceToHost(expected_q8.data(),router_publication->quantized_rows,expected_q8.size(),parameter.device.ordinal,stream));
+                        ASSERT_TRUE(backend->deviceToHost(expected_scales.data(),router_publication->row_scales,expected_scales.size(),parameter.device.ordinal,stream));
+                        ASSERT_TRUE(backend->synchronizeStream(stream,parameter.device.ordinal));
+                        ASSERT_EQ(expected_population(live),histograms[trace].expected) << "holdout=" << trace;
+                        ASSERT_NO_FATAL_FAILURE(verify(live));
+                        ASSERT_NO_FATAL_FAILURE(verify_population_writers(live));
+                        ASSERT_NO_FATAL_FAILURE(verify_population_producer_omissions());
+                    }
+                    route_ids = original_routes; expected = original_expected;
+                    expected_q8 = original_q8; expected_scales = original_scales;
+                    ASSERT_TRUE(backend->hostToDevice(input->gpu_data_ptr(),original_input.data(),original_input.size()*sizeof(float),parameter.device.ordinal,stream));
                 }
                 ASSERT_NO_FATAL_FAILURE(verify(0));
                 ASSERT_NO_FATAL_FAILURE(verify(parameter.live_rows));
@@ -1553,6 +1952,23 @@ namespace
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_MacroCapturedTimingReplay)
     { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaMacroTimingReplay); }
     /** @test Replay ordinary router-Q8/direct-token publication through retained thresholds. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_PopulationReplay)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::PopulationReplay,ExpertPublication::RouterQ8TokenRows); }
+    /** @brief Pair actual device-selected complete operations against all explicit candidates. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_PopulationTournament)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::PopulationTournament,ExpertPublication::RouterQ8TokenRows); }
+    /** @brief Profile one complete Automatic operation outside canonical timings. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_PopulationProfile)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::PopulationProfile,ExpertPublication::RouterQ8TokenRows); }
+    /** @brief Attribute the measured fifteen-token Auto loss with unchanged512-row capacity. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_PopulationColdProfile)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::PopulationProfile,ExpertPublication::RouterQ8TokenRows,
+        PopulationProfileWork{.live_rows=15,.producer=PopulationProfileProducer::Automatic}); }
+    /** @brief Profile the matching ordered baseline with the same router and live route histogram. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_PopulationOrderedColdProfile)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::PopulationProfile,ExpertPublication::RouterQ8TokenRows,
+        PopulationProfileWork{.live_rows=15,.producer=PopulationProfileProducer::Ordered}); }
+    /** @brief Preserve the original explicit-candidate router publication replay. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_RouterQ8TokenReplay)
     { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaMacroTimingReplay,ExpertPublication::RouterQ8TokenRows); }
     /** @test Time real routing, injected expert grouping and direct token publication together. */

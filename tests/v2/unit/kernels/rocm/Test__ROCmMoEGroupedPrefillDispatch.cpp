@@ -13,6 +13,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "kernels/rocm/gemm/ROCmMoEGroupedPopulationPublication.h"
 #include "kernels/common/MoEPrefillProjectionExecution.h"
 
 /** @brief Output sharding keeps the full matrix's immutable arithmetic key. */
@@ -660,4 +661,167 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, RowPlanRejectsInvalidGeometryAndSepara
         for (auto floor : {Floor::EveryExpert,Floor::Four,Floor::Eight,Floor::Twelve,Floor::Sixteen})
             for (int count : {1,13,15,16,17,31,257})
                 EXPECT_EQ(MoEGroupedRowPlan::nativeMicro(role,floor).rows(count),16);
+}
+
+#include "kernels/rocm/gemm/ROCmMoEGroupedPopulationPolicy.h"
+#include "kernels/rocm/gemm/ROCmMoEGroupedWmma.h"
+#include "kernels/rocm/gemm/ROCmMoEGroupedPopulationDecision.h"
+#include "kernels/rocm/gemm/ROCmMoEGroupedPopulationWork.h"
+#include "execution/moe/MoEGroupedWorkspaceGeometry.h"
+
+/** @test Exact operation admission excludes each independent neighboring capture identity. */
+TEST(Test__ROCmMoEGroupedPopulation, ImmutableOperationReplay)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::rocm;
+    const MoEGroupedPopulationKey qwen{
+        .operation=MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
+        .input=MoEGroupedPopulationInput::OriginalTokens,
+        .preparation=MoEGroupedPopulationPreparation::PublishedQ8,
+        .rows=512,.hidden=2048,.intermediate=512,.experts=256,.top_k=8,
+        .gateup_physical=1u<<13,.down_physical=1u<<24,.gateup_source=1u<<13,.down_source=1u<<4};
+    EXPECT_EQ(groupedPopulationDomain(qwen),MoEGroupedPopulationDomain::Qwen);
+    for (auto member : {&MoEGroupedPopulationKey::rows,&MoEGroupedPopulationKey::hidden,
+                       &MoEGroupedPopulationKey::intermediate,&MoEGroupedPopulationKey::experts,
+                       &MoEGroupedPopulationKey::top_k})
+        for (int difference : {-1,1})
+        {
+            auto changed=qwen; changed.*member+=difference;
+            EXPECT_EQ(groupedPopulationDomain(changed),MoEGroupedPopulationDomain::Unmeasured);
+        }
+    for (auto member : {&MoEGroupedPopulationKey::gateup_physical,&MoEGroupedPopulationKey::down_physical,
+                       &MoEGroupedPopulationKey::gateup_source,&MoEGroupedPopulationKey::down_source})
+        for (uint32_t mask : {0u,1u,1u<<4,1u<<13,1u<<24,(1u<<4)|(1u<<24)})
+        {
+            if (mask==qwen.*member) continue;
+            auto changed=qwen; changed.*member=mask;
+            EXPECT_EQ(groupedPopulationDomain(changed),MoEGroupedPopulationDomain::Unmeasured);
+        }
+    auto changed=qwen;changed.operation=MoEPrefillMeasuredOperation::Unmeasured;
+    EXPECT_EQ(groupedPopulationDomain(changed),MoEGroupedPopulationDomain::Unmeasured);
+    changed=qwen;changed.input=MoEGroupedPopulationInput::OriginalRouteSlots;
+    EXPECT_EQ(groupedPopulationDomain(changed),MoEGroupedPopulationDomain::Unmeasured);
+    changed=qwen;changed.preparation=MoEGroupedPopulationPreparation::Internal;
+    EXPECT_EQ(groupedPopulationDomain(changed),MoEGroupedPopulationDomain::Unmeasured);
+    for (uint32_t mask : {1u,1u<<13})
+    {
+        auto compact=qwen;compact.hidden=512;compact.intermediate=256;compact.experts=8;
+        compact.gateup_physical=compact.down_physical=compact.gateup_source=compact.down_source=mask;
+        EXPECT_EQ(groupedPopulationDomain(compact),MoEGroupedPopulationDomain::Compact);
+    }
+    for (auto execution : {MoEPrefillProjectionExecution::gateUp(2048),
+                           MoEPrefillProjectionExecution::down(2048,0,2048),
+                           MoEPrefillProjectionExecution::down(2048,0,1024)})
+        EXPECT_EQ(execution.measuredOperation(MoEPrefillOutputLayout::TokenRows,MoEPrefillRouteScope::AllRoutes),
+                  MoEPrefillMeasuredOperation::Unmeasured);
+    const auto complete=MoEPrefillProjectionExecution::complete(2048);
+    EXPECT_EQ(complete.measuredOperation(MoEPrefillOutputLayout::OriginalRouteRows,MoEPrefillRouteScope::AllRoutes),
+              MoEPrefillMeasuredOperation::Unmeasured);
+    EXPECT_EQ(complete.measuredOperation(MoEPrefillOutputLayout::TokenRows,MoEPrefillRouteScope::SelectedRoutes),
+              MoEPrefillMeasuredOperation::Unmeasured);
+}
+
+/** @test Replay measured population identities and adversarial threshold neighbors without a device. */
+TEST(Test__ROCmMoEGroupedPopulation, PopulationThresholdReplay)
+{
+    using namespace llaminar2::rocm;
+    using enum MoEGroupedPopulationFamily;
+    struct Trace { MoEGroupedPopulation population; MoEGroupedPopulationFamily family; };
+    constexpr Trace qwen[] = {
+        {{0,INT_MAX,0},Dot4}, {{256,1,1},Dot4}, {{256,8,8},Dot4},
+        {{256,11,11},Dot4}, {{256,12,12},WideFloor16}, {{256,13,13},Dot4},
+        {{256,12,13},Dot4}, {{256,15,15},Dot4}, {{256,15,16},WideFloor16},
+        {{256,16,16},N32}, {{256,17,17},N32},
+        {{31,7,8},N32}, {{32,7,8},N32}, {{33,7,8},Dot4},
+        {{32,6,8},Dot4}, {{32,8,8},N32}, {{32,11,13},N32},
+        {{68,1,4},Dot4}, {{68,1,5},WideFloor16}, {{68,1,6},WideFloor16},
+        {{32,16,18},N32}, {{138,1,13},WideFloor16}};
+    for (int replay=0;replay<3;++replay)
+        for (const auto &trace:qwen)
+            EXPECT_EQ(groupedPopulationFamily(MoEGroupedPopulationDomain::Qwen,trace.population),trace.family);
+    for (auto trace : {Trace{{8,11,11},Dot4},Trace{{8,12,12},N32},Trace{{8,13,13},N32},
+                       Trace{{8,12,13},Dot4},Trace{{7,16,16},Dot4},Trace{{8,17,17},N32}})
+        EXPECT_EQ(groupedPopulationFamily(MoEGroupedPopulationDomain::Compact,trace.population),trace.family);
+    for (auto population : {MoEGroupedPopulation{-1,1,1},MoEGroupedPopulation{257,1,1},
+                            MoEGroupedPopulation{1,0,1},MoEGroupedPopulation{1,2,1},
+                            MoEGroupedPopulation{1,1,4097},MoEGroupedPopulation{0,1,1}})
+        EXPECT_EQ(groupedPopulationFamily(MoEGroupedPopulationDomain::Qwen,population),Invalid);
+    EXPECT_EQ(groupedPopulationFamily(MoEGroupedPopulationDomain::Unmeasured,{8,16,16}),Invalid);
+    // Every physically possible positive minimum and a representative tail set
+    // has a total decision, independent of unmeasured exact histogram ordering.
+    for (int active=1;active<=256;++active)
+        for (int minimum=1;minimum<=4096/active;++minimum)
+            for (int maximum : {minimum,minimum+1,2*minimum})
+                if (maximum<=4096-(active-1)*minimum)
+                    EXPECT_NE(groupedPopulationFamily(MoEGroupedPopulationDomain::Qwen,{active,minimum,maximum}),Invalid);
+}
+
+/** @test A projection gate cannot advertise another writer, and submitted geometry remains explicit. */
+TEST(Test__ROCmMoEGroupedPopulation, BindingAndSubmissionReplay)
+{
+    using namespace llaminar2::rocm;
+    using enum MoEGroupedPopulationFamily;
+    uint32_t opaque_storage=0xa5a5a5a5; // Factory never reads this device-address stand-in.
+    const MoEGroupedPopulationBinding binding(&opaque_storage);
+    EXPECT_EQ(binding.address(),&opaque_storage);
+    EXPECT_THROW((void)MoEGroupedPopulationBinding(nullptr),std::invalid_argument);
+    const MoEGroupedPopulationPublisher publisher(&opaque_storage);
+    EXPECT_EQ(publisher.address(),binding.address());
+    EXPECT_EQ(opaque_storage,0xa5a5a5a5u);
+    EXPECT_THROW((void)MoEGroupedPopulationPublisher(nullptr),std::invalid_argument);
+    MoEGroupedPrefillSubmission receipt;
+    EXPECT_EQ(receipt.state,MoEGroupedPrefillSubmission::State::Empty);
+    const MoEGroupedPrefillTileSubmission tile{MoEGroupedPrefillEngine::WmmaM16N32,
+        MoEGroupedWmmaRowFloor::EveryExpert,16,32,128,0,1};
+    receipt.gateup.record(tile);receipt.gateup.record(tile);
+    EXPECT_EQ(receipt.gateup.size,1u); EXPECT_EQ(receipt.gateup.leaves(),2u);
+    EXPECT_EQ(receipt.gateup.tiles[0].threads,128);
+    receipt.gateup.record({MoEGroupedPrefillEngine::WideDot4Wmma,
+        MoEGroupedWmmaRowFloor::Sixteen,16,64,256,12,1,256});
+    EXPECT_EQ(receipt.gateup.size,2u); EXPECT_EQ(receipt.gateup.leaves(),3u);
+    receipt={};
+    EXPECT_EQ(receipt.gateup.leaves(),0u);EXPECT_EQ(receipt.down.leaves(),0u);
+    EXPECT_EQ(receipt.state,MoEGroupedPrefillSubmission::State::Empty);
+}
+
+/** @test Producer and consumer agree on concentrated native rows and exact ordered Qwen rows. */
+TEST(Test__ROCmMoEGroupedPopulation, FusedRowOwnershipReplay)
+{
+    using namespace llaminar2::rocm;
+    using enum MoEGroupedPopulationFamily;
+    struct Trace { MoEGroupedPopulationFamily family; int count; bool native; int rows; };
+    for (const auto trace : {Trace{Dot4,1,false,12},Trace{Dot4,12,false,12},Trace{Dot4,15,false,12},
+             Trace{N32,7,true,16},Trace{N32,12,true,16},Trace{N32,13,true,16},Trace{N32,15,true,16},
+             Trace{N32,16,true,16},Trace{N32,17,true,16},Trace{N32,4096,true,16},
+             Trace{WideFloor16,12,false,12},Trace{WideFloor16,13,false,12},Trace{WideFloor16,15,false,12},
+             Trace{WideFloor16,16,true,16},Trace{WideFloor16,17,true,16},Trace{WideFloor16,4096,true,16}})
+    {
+        EXPECT_EQ(populationProjectionProducer(trace.family,trace.count),trace.native
+            ? MoEGroupedDotProducer::Wmma : MoEGroupedDotProducer::OrderedDot4);
+        const int gu = populationProjectionRows(MoEPrefillProjectionRole::GateUp,trace.family,trace.count);
+        ASSERT_EQ(gu,trace.rows);
+        EXPECT_EQ(populationProjectionRows(MoEPrefillProjectionRole::Down,trace.family,trace.count),16);
+        int next = 0;
+        for (int first=0;first<trace.count;first+=gu)
+            for (int row=first;row<std::min(first+gu,trace.count);++row) EXPECT_EQ(row,next++);
+        EXPECT_EQ(next,trace.count);
+    }
+    EXPECT_EQ(populationProjectionRows(MoEPrefillProjectionRole::GateUp,N32,0),0);
+    EXPECT_EQ(populationProjectionRows(MoEPrefillProjectionRole::Down,Invalid,1),0);
+    EXPECT_EQ(populationProjectionRows(static_cast<MoEPrefillProjectionRole>(255),Dot4,1),0);
+}
+
+/** @test The live publication has a distinct, bounded word in the existing arena bank. */
+TEST(Test__ROCmMoEGroupedPopulation, PersistentDirectoryStorageReplay)
+{
+    using namespace llaminar2::rocm;
+    for (int capacity : {1,16,512,598})
+    {
+        const MoEGroupedPopulationDirectoryLayout layout(capacity);
+        EXPECT_EQ(layout.liveCountIndex(),capacity);
+        EXPECT_EQ(layout.words(),static_cast<std::size_t>(capacity)+1);
+        EXPECT_LE(layout.words(),llaminar2::MoEWorkspaceBuffers::rocmAdaptivePrefillDirectoryWords(4096,256));
+    }
+    EXPECT_THROW((void)MoEGroupedPopulationDirectoryLayout(0),std::invalid_argument);
+    EXPECT_THROW((void)MoEGroupedPopulationDirectoryLayout(-1),std::invalid_argument);
 }

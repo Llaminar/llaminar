@@ -1,6 +1,15 @@
+/**
+ * @file MoEWorkspaceRequirements.h
+ * @brief Canonical named workspace BOM for routing and expert transactions.
+ *
+ * These typed requirements feed the arena and physical memory authority. Device
+ * publications retain dedicated storage for their complete captured lifetimes;
+ * launchers bind these regions without constructing a second allocation ledger.
+ */
 #pragma once
 
 #include "../local_execution/device/WorkspaceDescriptor.h"
+#include "MoEGroupedWorkspaceGeometry.h"
 #include "../../tensors/TensorKernels.h"
 #include "../../kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 #include "../../kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
@@ -84,6 +93,8 @@ namespace llaminar2
         constexpr const char *ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE = "rocm_moe_runtime_prefill_gate_desc_table";
         constexpr const char *ROCM_RUNTIME_PREFILL_UP_DESC_TABLE = "rocm_moe_runtime_prefill_up_desc_table";
         constexpr const char *ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE = "rocm_moe_runtime_prefill_down_desc_table";
+        /** One classifier publication, consumed unchanged by both projection roles. */
+        constexpr const char *ROCM_GROUPED_POPULATION_SELECTION = "rocm_moe_grouped_population_selection";
         constexpr const char *ROCM_PREFILL_WORK_DIRECTORY =
             "rocm_moe_prefill_work_directory";
 
@@ -150,33 +161,7 @@ namespace llaminar2
             return (value + divisor - 1) / divisor;
         }
 
-        /**
-         * @brief Return persistent words for the adaptive ROCm prefill planner.
-         *
-         * The directory owns two device-published count words followed by
-         * independent conservative TM12 and TM16 spans. Each populated expert
-         * contributes at most one partially filled tile, which bounds a span by
-         * `active_experts + ceil(total_slots / tile_rows)`. Clamping each span
-         * to total route slots keeps the contract valid for very small models
-         * without reserving a dense expert-by-row rectangle.
-         */
-        inline std::size_t rocmAdaptivePrefillDirectoryWords(
-            std::size_t total_slots,
-            std::size_t num_experts)
-        {
-            total_slots = std::max<std::size_t>(1, total_slots);
-            num_experts = std::max<std::size_t>(1, num_experts);
-            const std::size_t active_experts =
-                std::min(total_slots, num_experts);
-            const auto capacity = [=](std::size_t tile_rows)
-            {
-                return std::min(
-                    total_slots,
-                    active_experts +
-                        (total_slots + tile_rows - 1) / tile_rows);
-            };
-            return 2u + capacity(12u) + capacity(16u);
-        }
+
 
         inline void add(WorkspaceRequirements &reqs, const char *name, std::size_t bytes)
         {
@@ -435,6 +420,7 @@ namespace llaminar2
 
             add(reqs, ROCM_SHARED_GATE, static_cast<std::size_t>(max_seq_len) * sizeof(float));
             add(reqs, ROCM_GROUP_MAX_TOKENS, sizeof(int));
+            add(reqs, ROCM_GROUPED_POPULATION_SELECTION, sizeof(uint32_t));
             add(reqs, ROCM_PREFILL_WORK_DIRECTORY,
                 rocmAdaptivePrefillDirectoryWords(
                     prefill_slots,

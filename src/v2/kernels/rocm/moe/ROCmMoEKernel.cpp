@@ -1520,69 +1520,70 @@ namespace
         return text;
     }
 
-    /**
-     * @brief Describe the joint policy embedded in one grouped-prefill graph.
-     *
-     * This query has the complete exact-overlay key and therefore cannot report
-     * a generic role geometry while production executes a model-specific pair.
-     * Mixed descriptor tables continue to launch one generated generic policy
-     * per execution codebook and are explicitly reported as mixed. A missing
-     * uniform policy is an internal invariant violation: the launch must already
-     * have failed rather than publishing misleading telemetry.
-     */
-    MoEPrefillPairPolicyTags queryMoEPrefillPairPolicyTags(
-        uint32_t gateup_codebook_mask,
-        uint32_t down_codebook_mask,
-        int seq_len,
-        int hidden_size,
-        int expert_width,
-        int expert_count,
-        int top_k,
-        llaminar2::MoEPrefillMeasuredOperation operation)
+    /** @param engine Actual submitted policy. @return Stable capture-policy name. */
+    const char *groupedEngineTag(llaminar2::rocm::MoEGroupedPrefillEngine engine)
     {
-        if (seq_len <= 8)
-            return {{"1", "64"}, {"1", "64"}, "direct"};
-
-        const int gateup_codebook =
-            singleCodebookFromMask(gateup_codebook_mask);
-        const int down_codebook = singleCodebookFromMask(down_codebook_mask);
-        if (gateup_codebook < 0 || down_codebook < 0)
+        using enum llaminar2::rocm::MoEGroupedPrefillEngine;
+        switch (engine)
         {
-            return {
-                {"mixed", "mixed"},
-                {"mixed", "mixed"},
-                "generic_mixed_codebooks"};
+        case OrderedDot4: return "dot4";
+        case WmmaM16N32: return "wmma_n32";
+        case WmmaM16N64: return "wmma_n64";
+        case WideDot4Wmma: return "wide_dot4_wmma";
+        case PopulationAdaptive: return "device_population_v1";
+        case Automatic: break;
         }
+        throw std::logic_error("unresolved grouped engine in completed submission");
+    }
 
-        int gateup_tile_m = 0;
-        int gateup_tile_n = 0;
-        int down_tile_m = 0;
-        int down_tile_n = 0;
-        int exact_overlay = 0;
-        if (!rocmMoE_grouped_prefill_query_production_pair_config_for_operation(
-                operation,
-                static_cast<uint8_t>(gateup_codebook),
-                static_cast<uint8_t>(down_codebook),
-                seq_len,
-                hidden_size,
-                expert_width,
-                expert_count,
-                top_k,
-                &gateup_tile_m,
-                &gateup_tile_n,
-                &down_tile_m,
-                &down_tile_n,
-                &exact_overlay))
+    /** @param role Exact successfully submitted tiled geometries.
+     * @return Diagnostic roster of columns, rows, threads, ordered rows, floor and leaf count. */
+    std::string groupedTileRoster(const llaminar2::rocm::MoEGroupedPrefillRoleSubmission &role)
+    {
+        std::string result;
+        for (size_t i = 0; i < role.size; ++i)
         {
-            return {
-                {"missing", "missing"},
-                {"missing", "missing"},
-                "missing"};
+            const auto &tile = role.tiles[i];
+            if (!result.empty()) result += ';';
+            result += std::string(groupedEngineTag(tile.engine)) + ":" + std::to_string(tile.rows) + "x" +
+                std::to_string(tile.columns) + "/threads=" + std::to_string(tile.threads) +
+                "/ordered_rows=" + std::to_string(tile.ordered_rows) +
+                "/ordered_columns=" + std::to_string(tile.ordered_columns) +
+                "/floor=" + std::to_string(static_cast<int>(tile.floor)) + "/leaves=" + std::to_string(tile.count);
         }
-        return {
-            {std::to_string(gateup_tile_m), std::to_string(gateup_tile_n)},
-            {std::to_string(down_tile_m), std::to_string(down_tile_n)},
-            exact_overlay != 0 ? "exact_overlay" : "generic"};
+        return result.empty() ? "none" : result;
+    }
+
+    /** @param role Accepted tiled leaves. @param route_owned Whether the direct family was submitted.
+     * @return Retained route families; never a claim about the live replay choice. */
+    std::string groupedRouteRoster(const llaminar2::rocm::MoEGroupedPrefillRoleSubmission &role, bool route_owned)
+    {
+        if (role.size) return route_owned ? "device_route_owned_or_expert_tiled" : "expert_tiled";
+        return route_owned ? "route_owned" : "not_submitted";
+    }
+
+    /** @param submitted Completed low-level construction receipt.
+     * @return Geometry tags from actual submissions, with mixed families represented explicitly. */
+    MoEPrefillPairPolicyTags submittedMoEPrefillPairPolicyTags(
+        const llaminar2::rocm::MoEGroupedPrefillSubmission &submitted)
+    {
+        using Receipt = llaminar2::rocm::MoEGroupedPrefillSubmission;
+        if (submitted.state != Receipt::State::Complete)
+            throw std::logic_error("grouped telemetry requires a successful submission receipt");
+        const auto role_tags = [](const auto &role, bool route_owned) -> MoEPrefillPolicyTags {
+            if (role.size == 0) return {route_owned ? "route_owned" : "none",route_owned ? "route_owned" : "none"};
+            if (role.size != 1) return {"mixed","mixed"};
+            const auto &tile = role.tiles[0];
+            return {tile.ordered_rows ? std::to_string(tile.ordered_rows) + "/" + std::to_string(tile.rows)
+                                      : std::to_string(tile.rows),
+                    tile.ordered_columns ? std::to_string(tile.ordered_columns) + "/" + std::to_string(tile.columns)
+                                         : std::to_string(tile.columns)};
+        };
+        return {role_tags(submitted.gateup,submitted.gateup_route_owned),
+                role_tags(submitted.down,submitted.down_route_owned),
+                submitted.policy.engine == llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4
+                    ? (submitted.exact_ordered_overlay ? "exact_overlay" : "generic")
+                    : groupedEngineTag(submitted.policy.engine)};
     }
 
     bool tryGroupedDecodeGateLogits(
@@ -2338,6 +2339,7 @@ namespace llaminar2
         d_prefill_gate_ = nullptr;
         d_prefill_up_ = nullptr;
         d_prefill_work_directory_ = nullptr;
+        d_grouped_population_selection_ = nullptr;
 
         max_write_heads_experts_ = 0;
         staging_capacity_ = 0;
@@ -11404,9 +11406,13 @@ namespace llaminar2
                 reinterpret_cast<void **>(&d_prefill_work_directory_),
                 MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY,
                 words * sizeof(uint32_t),
-                "ensureGroupedPrefillWorkDirectoryCapacity"))
+                "ensureGroupedPrefillWorkDirectoryCapacity") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_population_selection_),
+                MoEWorkspaceBuffers::ROCM_GROUPED_POPULATION_SELECTION, sizeof(uint32_t),
+                "ensureGroupedPrefillWorkDirectoryCapacity(population)"))
         {
             d_prefill_work_directory_ = nullptr;
+            d_grouped_population_selection_ = nullptr;
             return false;
         }
         return true;
@@ -11768,6 +11774,7 @@ namespace llaminar2
             return false;
         }
         // Launch the fixed, fully grouped pipeline without a host synchronization.
+        rocm::MoEGroupedPrefillSubmission grouped_submitted;
         const bool ok = execution.overwriteOutputThenPublish(
             execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
             execution.executesDown() ? publication_output->size_bytes() : 0u,
@@ -11817,7 +11824,7 @@ namespace llaminar2
                     producer_stream,
                     execution,
                     grouped_prefill_grouping_.scope(), owner_admission,
-                    owner_admission ? &owner_completed : nullptr);
+                    owner_admission ? &owner_completed : nullptr, d_grouped_population_selection_, &grouped_submitted);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -11851,18 +11858,7 @@ namespace llaminar2
                 active_expert_slots > 0)
         {
             const MoEPrefillPairPolicyTags policy =
-                queryMoEPrefillPairPolicyTags(
-                    gateup_table.codebook_mask,
-                    down_table.codebook_mask,
-                    seq_len,
-                    d_model,
-                    intermediate,
-                    num_experts,
-                    top_k,
-                    execution.measuredOperation(
-                        canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
-                                                      : MoEPrefillOutputLayout::TokenRows,
-                        grouped_prefill_grouping_.scope()));
+                submittedMoEPrefillPairPolicyTags(grouped_submitted);
             const std::string common_row_tile =
                 policy.gateup.tile_m == policy.down.tile_m
                     ? policy.gateup.tile_m
@@ -11887,18 +11883,16 @@ namespace llaminar2
                      codebookMaskTag(gateup_table.policy_codebook_mask)},
                     {"down_policy_codebook_mask",
                      codebookMaskTag(down_table.policy_codebook_mask)},
-                    {"gateup_route",
-                     seq_len > 8
-                         ? (reuse_router_q8_hidden
-                                ? "expert_tiled_router_q8"
-                                : "expert_tiled_original_row_quant")
-                         : (reuse_router_q8_hidden
-                                ? "route_owned_router_q8"
-                                : "route_owned_original_row_quant")},
-                    {"down_route",
-                     seq_len > 8
-                         ? "expert_tiled_partials_ordered_publish"
-                         : "direct_ordered_publish"},
+                    {"gateup_route", groupedRouteRoster(grouped_submitted.gateup,grouped_submitted.gateup_route_owned)},
+                    {"down_route", groupedRouteRoster(grouped_submitted.down,grouped_submitted.down_route_owned)},
+                    {"hidden_preparation", !execution.executesGateUp() ? "not_submitted" :
+                        reuse_router_q8_hidden ? "router_q8" : "original_row_quant"},
+                    {"dot_policy", groupedEngineTag(grouped_submitted.policy.engine)},
+                    {"gateup_submitted_tiles", groupedTileRoster(grouped_submitted.gateup)},
+                    {"down_submitted_tiles", groupedTileRoster(grouped_submitted.down)},
+                    {"gateup_submitted_tiled_leaves", std::to_string(grouped_submitted.gateup.leaves())},
+                    {"down_submitted_tiled_leaves", std::to_string(grouped_submitted.down.leaves())},
+                    {"counter_semantics", "host_submissions"},
                     {"gateup_tile_m", policy.gateup.tile_m},
                     {"gateup_tile_n", policy.gateup.tile_n},
                     {"down_tile_m", policy.down.tile_m},
@@ -12168,6 +12162,7 @@ namespace llaminar2
 
         const bool reuse_router_q8_hidden = execution.executesGateUp() &&
             canReuseRouterQ8Hidden(d_hidden, seq_len, d_model);
+        rocm::MoEGroupedPrefillSubmission grouped_submitted;
         const bool ok = execution.overwriteOutputThenPublish(
             execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
             execution.executesDown() ? publication_output->size_bytes() : 0u,
@@ -12213,7 +12208,7 @@ namespace llaminar2
                     producer_stream,
                     execution,
                     MoEPrefillRouteScope::SelectedRoutes, owner_admission,
-                    owner_admission ? &owner_completed : nullptr);
+                    owner_admission ? &owner_completed : nullptr, d_grouped_population_selection_, &grouped_submitted);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -12246,18 +12241,7 @@ namespace llaminar2
                 active_expert_slots > 0)
         {
             const MoEPrefillPairPolicyTags policy =
-                queryMoEPrefillPairPolicyTags(
-                    gateup_table.codebook_mask,
-                    down_table.codebook_mask,
-                    seq_len,
-                    d_model,
-                    intermediate,
-                    num_experts,
-                    top_k,
-                    execution.measuredOperation(
-                        canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
-                                                      : MoEPrefillOutputLayout::TokenRows,
-                        MoEPrefillRouteScope::SelectedRoutes));
+                submittedMoEPrefillPairPolicyTags(grouped_submitted);
             const std::string common_row_tile =
                 policy.gateup.tile_m == policy.down.tile_m
                     ? policy.gateup.tile_m
@@ -12282,18 +12266,16 @@ namespace llaminar2
                      codebookMaskTag(gateup_table.policy_codebook_mask)},
                     {"down_policy_codebook_mask",
                      codebookMaskTag(down_table.policy_codebook_mask)},
-                    {"gateup_route",
-                     seq_len > 8
-                         ? (reuse_router_q8_hidden
-                                ? "expert_tiled_router_q8"
-                                : "expert_tiled_original_row_quant")
-                         : (reuse_router_q8_hidden
-                                ? "route_owned_router_q8"
-                                : "route_owned_original_row_quant")},
-                    {"down_route",
-                     seq_len > 8
-                         ? "expert_tiled_partials_ordered_publish"
-                         : "direct_ordered_publish"},
+                    {"gateup_route", groupedRouteRoster(grouped_submitted.gateup,grouped_submitted.gateup_route_owned)},
+                    {"down_route", groupedRouteRoster(grouped_submitted.down,grouped_submitted.down_route_owned)},
+                    {"hidden_preparation", !execution.executesGateUp() ? "not_submitted" :
+                        reuse_router_q8_hidden ? "router_q8" : "original_row_quant"},
+                    {"dot_policy", groupedEngineTag(grouped_submitted.policy.engine)},
+                    {"gateup_submitted_tiles", groupedTileRoster(grouped_submitted.gateup)},
+                    {"down_submitted_tiles", groupedTileRoster(grouped_submitted.down)},
+                    {"gateup_submitted_tiled_leaves", std::to_string(grouped_submitted.gateup.leaves())},
+                    {"down_submitted_tiled_leaves", std::to_string(grouped_submitted.down.leaves())},
+                    {"counter_semantics", "host_submissions"},
                     {"gateup_tile_m", policy.gateup.tile_m},
                     {"gateup_tile_n", policy.gateup.tile_n},
                     {"down_tile_m", policy.down.tile_m},

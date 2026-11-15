@@ -58,6 +58,7 @@
 #include "kernels/common/MoEGroupedDirectory.h"
 #include <hip/hip_fp16.h>
 #include <algorithm>
+#include <bit>
 #include <cstdint>
 #include <optional>
 #include <type_traits>
@@ -72,6 +73,8 @@
 #include "ROCmMoEGroupedPrefillKernels.h"
 #include "ROCmMoEPrefillArithmetic.h"
 #include "ROCmMoEGroupedWmma.h"
+#include "ROCmMoEGroupedPopulationProjection.h"
+#include "execution/moe/MoEGroupedWorkspaceGeometry.h"
 #include "ROCmMoERouteOwnedTuning.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include <exception>
@@ -89,6 +92,8 @@ using llaminar2::rocm::MoEPrefillProjectionRole;
 using llaminar2::rocm::MoEGroupedDotAdmission;
 using llaminar2::rocm::MoEGroupedDotProducer;
 using llaminar2::rocm::MoEGroupedRowPlan;
+using llaminar2::rocm::MoEGroupedPopulationBinding;
+using llaminar2::rocm::MoEGroupedPopulationControl;
 
 /**
  * @brief Bound publication scheduling independently of captured row capacity.
@@ -4244,8 +4249,11 @@ bool rocmMoE_grouped_prefill_pipeline(
     const llaminar2::MoEPrefillProjectionExecution& execution,
     llaminar2::MoEPrefillRouteScope route_scope,
     const llaminar2::rocm::MoERouteOwnedGateUpAdmission *explicit_admission,
-    llaminar2::rocm::MoERouteOwnedGateUpLaunchSet *completed_observation)
+    llaminar2::rocm::MoERouteOwnedGateUpLaunchSet *completed_observation,
+    uint32_t *d_population_selection,
+    llaminar2::rocm::MoEGroupedPrefillSubmission *submitted)
 {
+    if (submitted) *submitted = {};
     if (completed_observation) *completed_observation = {};
     if ((explicit_admission != nullptr) != (completed_observation != nullptr))
         throw std::logic_error("model route-owned lowering requires one capability and one caller-owned observation");
@@ -4368,20 +4376,34 @@ bool rocmMoE_grouped_prefill_pipeline(
     if (llaminar2::HipDeviceGuard::setDevice(device_id) != hipSuccess) return false;
     hipStream_t hip_stream = static_cast<hipStream_t>(stream);
     if (!hip_stream || hip_stream == hipStreamLegacy || hip_stream == hipStreamPerThread) return false;
-    const auto dot_policy = llaminar2::rocm::selectedMoEGroupedPrefillPolicy(device_id);
+    const llaminar2::rocm::MoEGroupedPopulationKey population_key{
+        .operation = measured_operation,
+        .input = grouped_indices_are_route_slots ? llaminar2::rocm::MoEGroupedPopulationInput::OriginalRouteSlots
+                                                : llaminar2::rocm::MoEGroupedPopulationInput::OriginalTokens,
+        .preparation = d_prequantized_hidden && d_prequantized_hidden_scales
+            ? llaminar2::rocm::MoEGroupedPopulationPreparation::PublishedQ8
+            : llaminar2::rocm::MoEGroupedPopulationPreparation::Internal,
+        .rows = seq_len, .hidden = d_model, .intermediate = intermediate, .experts = num_experts, .top_k = top_k,
+        .gateup_physical = gateup_codebook_mask, .down_physical = down_codebook_mask,
+        .gateup_source = gateup_policy_codebook_mask, .down_source = down_policy_codebook_mask};
+    const auto dot_policy = llaminar2::rocm::selectedMoEGroupedPrefillPolicy(device_id,population_key);
+    llaminar2::rocm::MoEGroupedPrefillSubmission pending;
+    pending.policy = dot_policy;
+    pending.exact_ordered_overlay = pair_config.exact_overlay;
     const auto dot_engine = dot_policy.engine;
+    const bool population_adaptive = dot_engine == llaminar2::rocm::MoEGroupedPrefillEngine::PopulationAdaptive;
     const bool native_wmma = dot_engine != llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4;
-    const auto make_dot_admission = [&](MoEPrefillProjectionRole role, int source_n, int physical_n, int k)
+    if (population_adaptive && !d_population_selection) return false;
+    std::optional<MoEGroupedPopulationControl> population_control;
+    if (population_adaptive) population_control.emplace(MoEGroupedPopulationControl{MoEGroupedPopulationBinding(d_population_selection)});
+    const auto make_dot_admission = [&](llaminar2::rocm::MoEGroupedPrefillEngine engine,
+        llaminar2::rocm::MoEGroupedWmmaRowFloor floor, MoEPrefillProjectionRole role,
+        int source_n, int physical_n, int k)
     {
-        if (!native_wmma) return MoEGroupedDotAdmission{};
-        return dot_engine == llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma
-            ? MoEGroupedDotAdmission::wideCandidate(role,source_n,physical_n,k,dot_policy.minimum_expert_rows)
-            : MoEGroupedDotAdmission::nativeCandidate(role,source_n,physical_n,k,dot_policy.minimum_expert_rows);
+        return engine == llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma
+            ? MoEGroupedDotAdmission::wideCandidate(role,source_n,physical_n,k,floor)
+            : MoEGroupedDotAdmission::nativeCandidate(role,source_n,physical_n,k,floor);
     };
-    const auto gateup_dot_admission = make_dot_admission(MoEPrefillProjectionRole::GateUp,
-        intermediate,intermediate,d_model);
-    const auto down_dot_admission = make_dot_admission(MoEPrefillProjectionRole::Down,
-        d_model,down_columns,intermediate);
     (void)hipGetLastError(); // clear prior errors
     const bool has_prequantized_hidden =
         d_prequantized_hidden && d_prequantized_hidden_scales;
@@ -4452,6 +4474,7 @@ bool rocmMoE_grouped_prefill_pipeline(
             return 0;
         }
 
+        if (hipGetLastError() != hipSuccess) return 0;
         directory_plan = plan;
         current_directory_capacity = capacity;
         return capacity;
@@ -4469,9 +4492,19 @@ bool rocmMoE_grouped_prefill_pipeline(
             dim3(1),dim3(llaminar2::moe_grouped_directory::directoryThreads(num_experts)),0,hip_stream,
             d_group_counts,reinterpret_cast<uint32_t*>(d_group_work_directory),num_experts,
             capacity,admission,plan);
+        if (hipGetLastError() != hipSuccess) return 0;
         directory_plan = plan;
         current_directory_capacity = capacity;
         return capacity;
+    };
+
+    /** Reserve the producer's conservative span; the population shard fills it on the same stream. */
+    const auto population_directory_capacity = [&](MoEPrefillProjectionRole role) -> int
+    {
+        directory_plan.reset();
+        current_directory_capacity = 0;
+        return moe_prefill_directory_capacity(total_slots,num_experts,
+            role == MoEPrefillProjectionRole::GateUp ? 12 : 16);
     };
 
     /** Capture-time addresses and conservative bounds for two device spans. */
@@ -4543,6 +4576,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                 tile12_capacity,
                 tile16_capacity, admission);
         }
+        if (hipGetLastError() != hipSuccess) return {};
         directory_plan.reset();
         current_directory_capacity = 0;
         return view;
@@ -4624,6 +4658,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                     gateup_k_partition_policy, num_experts, \
                     adaptive_directory.header + \
                         kMoEPrefillAdaptiveTile12CountWord, admission); \
+                if (hipGetLastError() != hipSuccess) return false; \
                 hipLaunchKernelGGL( \
                     HIP_KERNEL_NAME(moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel<FMT, 16, TN>), \
                     tile16_grid, expert_block, 0, hip_stream, \
@@ -4637,6 +4672,11 @@ bool rocmMoE_grouped_prefill_pipeline(
                     gateup_k_partition_policy, num_experts, \
                     adaptive_directory.header + \
                         kMoEPrefillAdaptiveTile16CountWord, admission); \
+                if (hipGetLastError() != hipSuccess) return false; \
+                pending.gateup.record({llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4, \
+                    llaminar2::rocm::MoEGroupedWmmaRowFloor::EveryExpert,12,TN,TN,0,1}); \
+                pending.gateup.record({llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4, \
+                    llaminar2::rocm::MoEGroupedWmmaRowFloor::EveryExpert,16,TN,TN,0,1}); \
             } while (0)
         #define LAUNCH_GATEUP_EXPERT_TILED(FMT, TM, TN) \
             do { \
@@ -4656,6 +4696,9 @@ bool rocmMoE_grouped_prefill_pipeline(
                     candidate_directory_capacity, seq_len, top_k, grouped_indices_are_route_slots, \
                     1, intermediate, d_model, \
                     gateup_k_partition_policy, num_experts, nullptr, admission); \
+                if (hipGetLastError() != hipSuccess) return false; \
+                pending.gateup.record({llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4, \
+                    llaminar2::rocm::MoEGroupedWmmaRowFloor::EveryExpert,TM,TN,TN,0,1}); \
             } while (0)
 
         #define DISPATCH_GATEUP_TILE_N(FMT, TM, CONFIG) \
@@ -4693,6 +4736,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                 if (moe_prefill_launch_mask(gateup_codebook_mask) & (uint32_t{1} << static_cast<uint32_t>(FMT))) { \
                     if (use_route_owned) { \
                         LAUNCH_GATEUP_ROUTE_OWNED(FMT); \
+                        pending.gateup_route_owned = true; \
                     } \
                     if (use_expert_row_tiles && !native_wmma) { \
                         const MoEPrefillTileConfig candidate = has_uniform_codebook_pair \
@@ -4741,23 +4785,37 @@ bool rocmMoE_grouped_prefill_pipeline(
 
         if (use_expert_row_tiles && native_wmma)
         {
-            const int capacity = ensure_native_directory(gateup_dot_admission);
-            if (capacity <= 0 || !llaminar2::rocm::submitMoEGroupedWmma(dot_engine,
-                    gateup_codebook_mask, {
-                        .activations = reuse_prequantized_hidden ? d_prequantized_hidden : d_scratch_A_int8,
-                        .activation_scales = reuse_prequantized_hidden ? d_prequantized_hidden_scales : d_scratch_scales,
-                        .group_token_indices = d_group_token_indices,
-                        .group_counts = d_group_counts, .group_offsets = d_group_offsets,
-                        .directory = reinterpret_cast<const uint32_t *>(d_group_work_directory),
-                        .descriptors = gate_descs, .second_descriptors = up_descs,
-                        .output = d_scratch_gate, .second_output = d_scratch_up,
-                        .directory_capacity = capacity, .rows = seq_len, .top_k = top_k,
-                        .n = intermediate, .k = d_model, .experts = num_experts, .device = device_id,
-                        .input = grouped_indices_are_route_slots
-                            ? llaminar2::rocm::MoEGroupedWmmaInput::OriginalRouteSlots
-                            : llaminar2::rocm::MoEGroupedWmmaInput::OriginalTokens,
-                        .partitions = gateup_k_partition_policy, .admission = admission,
-                        .dot_admission = gateup_dot_admission}, stream)) return false;
+            const auto engine = population_adaptive ? llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma : dot_engine;
+            const auto gateup_dot_admission = make_dot_admission(engine,dot_policy.minimum_expert_rows,
+                MoEPrefillProjectionRole::GateUp,intermediate,intermediate,d_model);
+            llaminar2::rocm::MoEGroupedPrefillRoleSubmission native_submitted;
+            const int capacity = population_adaptive ? population_directory_capacity(MoEPrefillProjectionRole::GateUp)
+                : ensure_native_directory(gateup_dot_admission);
+            if (capacity <= 0) return false;
+            const llaminar2::rocm::MoEGroupedWmmaArguments args = {
+                .activations = reuse_prequantized_hidden ? d_prequantized_hidden : d_scratch_A_int8,
+                .activation_scales = reuse_prequantized_hidden ? d_prequantized_hidden_scales : d_scratch_scales,
+                .group_token_indices = d_group_token_indices,
+                .group_counts = d_group_counts, .group_offsets = d_group_offsets,
+                .directory = reinterpret_cast<const uint32_t *>(d_group_work_directory),
+                .descriptors = gate_descs, .second_descriptors = up_descs,
+                .output = d_scratch_gate, .second_output = d_scratch_up,
+                .directory_capacity = capacity, .rows = seq_len, .top_k = top_k,
+                .n = intermediate, .k = d_model, .experts = num_experts, .device = device_id,
+                .input = grouped_indices_are_route_slots
+                    ? llaminar2::rocm::MoEGroupedWmmaInput::OriginalRouteSlots
+                    : llaminar2::rocm::MoEGroupedWmmaInput::OriginalTokens,
+                .partitions = gateup_k_partition_policy, .admission = admission,
+                .dot_admission = gateup_dot_admission};
+            const bool accepted = population_adaptive
+                ? llaminar2::rocm::submitMoEGroupedPopulation(MoEPrefillProjectionRole::GateUp,
+                    {d_population_selection,reinterpret_cast<uint32_t *>(d_group_work_directory),
+                     llaminar2::MoEWorkspaceBuffers::rocmAdaptivePrefillDirectoryWords(total_slots,num_experts)},
+                    gateup_codebook_mask,args,*population_control,stream,&native_submitted)
+                : llaminar2::rocm::submitMoEGroupedWmma(engine,gateup_codebook_mask,args,stream,&native_submitted);
+            if (!accepted) return false;
+            for (size_t i = 0; i < native_submitted.size; ++i)
+                pending.gateup.record(native_submitted.tiles[i]);
         }
 
         constexpr int blocks_per_workgroup = kMoESwiGLUQuantizeThreads / 32;
@@ -4880,6 +4938,7 @@ bool rocmMoE_grouped_prefill_pipeline(
             #undef LAUNCH_ROUTE_OWNED_DOWN_IF_EXACT
             #undef LAUNCH_ROUTE_OWNED_DOWN
             #undef LAUNCH_CANONICAL_DOWN_WORKERS
+            pending.down_route_owned = true;
         }
         if (use_expert_row_tiles)
         {
@@ -4899,6 +4958,9 @@ bool rocmMoE_grouped_prefill_pipeline(
                             reinterpret_cast<const uint32_t*>(d_group_work_directory), \
                             d_scratch_gate, candidate_directory_capacity, down_columns, intermediate, \
                             down_k_partition_policy, num_experts, nullptr, admission); \
+                if (hipGetLastError() != hipSuccess) return false; \
+                    pending.down.record({llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4, \
+                        llaminar2::rocm::MoEGroupedWmmaRowFloor::EveryExpert,TM,TN,TN,0,1}); \
                 } while (0)
             #define LAUNCH_DOWN_ADAPTIVE(FMT, TN) \
                 do { \
@@ -4922,6 +4984,7 @@ bool rocmMoE_grouped_prefill_pipeline(
                         down_k_partition_policy, num_experts, \
                         adaptive_directory.header + \
                             kMoEPrefillAdaptiveTile12CountWord, admission); \
+                if (hipGetLastError() != hipSuccess) return false; \
                     hipLaunchKernelGGL( \
                         HIP_KERNEL_NAME(moe_grouped_down_batch_invariant_tiled_prefill_kernel<FMT, 16, TN>), \
                         tile16_grid, expert_block, 0, hip_stream, \
@@ -4932,6 +4995,11 @@ bool rocmMoE_grouped_prefill_pipeline(
                         down_k_partition_policy, num_experts, \
                         adaptive_directory.header + \
                             kMoEPrefillAdaptiveTile16CountWord, admission); \
+                if (hipGetLastError() != hipSuccess) return false; \
+                    pending.down.record({llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4, \
+                        llaminar2::rocm::MoEGroupedWmmaRowFloor::EveryExpert,12,TN,TN,0,1}); \
+                    pending.down.record({llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4, \
+                        llaminar2::rocm::MoEGroupedWmmaRowFloor::EveryExpert,16,TN,TN,0,1}); \
                 } while (0)
 
             #define DISPATCH_DOWN_TILE_N(FMT, TM, CONFIG) \
@@ -5001,19 +5069,33 @@ bool rocmMoE_grouped_prefill_pipeline(
 
             if (native_wmma)
             {
-                const int capacity = ensure_native_directory(down_dot_admission);
-                if (capacity <= 0 || !llaminar2::rocm::submitMoEGroupedWmma(dot_engine,
-                        down_codebook_mask, {
-                            .activations = d_scratch_swiglu_int8,
-                            .activation_scales = d_scratch_swiglu_scales,
-                            .group_counts = d_group_counts, .group_offsets = d_group_offsets,
-                            .directory = reinterpret_cast<const uint32_t *>(d_group_work_directory),
-                            .descriptors = down_descs, .output = d_scratch_gate,
-                            .directory_capacity = capacity, .rows = seq_len, .top_k = top_k,
-                            .n = down_columns, .k = intermediate, .experts = num_experts, .device = device_id,
-                            .input = llaminar2::rocm::MoEGroupedWmmaInput::GroupedRows,
-                            .partitions = down_k_partition_policy, .admission = admission,
-                            .dot_admission = down_dot_admission}, stream)) return false;
+                    const auto engine = population_adaptive ? llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma : dot_engine;
+                const auto down_dot_admission = make_dot_admission(engine,dot_policy.minimum_expert_rows,
+                    MoEPrefillProjectionRole::Down,d_model,down_columns,intermediate);
+                llaminar2::rocm::MoEGroupedPrefillRoleSubmission native_submitted;
+                const int capacity = population_adaptive ? population_directory_capacity(MoEPrefillProjectionRole::Down)
+                    : ensure_native_directory(down_dot_admission);
+                if (capacity <= 0) return false;
+                const llaminar2::rocm::MoEGroupedWmmaArguments args = {
+                    .activations = d_scratch_swiglu_int8,
+                    .activation_scales = d_scratch_swiglu_scales,
+                    .group_counts = d_group_counts, .group_offsets = d_group_offsets,
+                    .directory = reinterpret_cast<const uint32_t *>(d_group_work_directory),
+                    .descriptors = down_descs, .output = d_scratch_gate,
+                    .directory_capacity = capacity, .rows = seq_len, .top_k = top_k,
+                    .n = down_columns, .k = intermediate, .experts = num_experts, .device = device_id,
+                    .input = llaminar2::rocm::MoEGroupedWmmaInput::GroupedRows,
+                    .partitions = down_k_partition_policy, .admission = admission,
+                    .dot_admission = down_dot_admission};
+                const bool accepted = population_adaptive
+                    ? llaminar2::rocm::submitMoEGroupedPopulation(MoEPrefillProjectionRole::Down,
+                    {d_population_selection,reinterpret_cast<uint32_t *>(d_group_work_directory),
+                     llaminar2::MoEWorkspaceBuffers::rocmAdaptivePrefillDirectoryWords(total_slots,num_experts)},
+                    down_codebook_mask,args,*population_control,stream,&native_submitted)
+                    : llaminar2::rocm::submitMoEGroupedWmma(engine,down_codebook_mask,args,stream,&native_submitted);
+                if (!accepted) return false;
+                for (size_t i = 0; i < native_submitted.size; ++i)
+                    pending.down.record(native_submitted.tiles[i]);
                 launched_down = true;
             }
             #undef LAUNCH_DOWN_IF_PRESENT
@@ -5072,6 +5154,8 @@ bool rocmMoE_grouped_prefill_pipeline(
         if (completed_observation) *completed_observation = completed;
         else g_moe_route_launch = completed; // Explicit diagnostic compatibility only.
     }
+    pending.state = llaminar2::rocm::MoEGroupedPrefillSubmission::State::Complete;
+    if (submitted) *submitted = pending;
     return true;
 }
 
@@ -5143,7 +5227,8 @@ bool rocmInitIQGridTables_moe_prefill(
     e = hipMemcpyToSymbol(d_pf_iq1s_grid, h_iq1s_grid, sizeof(d_pf_iq1s_grid));
     if (e != hipSuccess) { fprintf(stderr, "[rocmInitIQGridTables_moe_prefill] iq1s failed: %s\n", hipGetErrorString(e)); return false; }
     return llaminar2::rocm::initializeMoEGroupedWmmaGrids(device_id,
-        h_iq3s_grid, h_iq3xxs_grid, h_iq2s_grid, h_iq2xs_grid, h_iq2xxs_grid, h_iq1s_grid);
+        h_iq3s_grid, h_iq3xxs_grid, h_iq2s_grid, h_iq2xs_grid, h_iq2xxs_grid, h_iq1s_grid) &&
+        llaminar2::rocm::initializeMoEGroupedPopulationGrids(device_id,h_iq2s_grid);
 }
 
 } // extern "C"

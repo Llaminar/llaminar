@@ -96,9 +96,9 @@ At full512 live rows, speedup over the same operation with explicit Dot4 is:
 | Compact IQ2_S | N32 | 1.04256× |
 
 Sparse work still favors Dot4; pure N32 loses to Dot4 at full Qwen power-law
-(0.97897×). There is no universal winning candidate. Population-based selection
-is a design proposal, not an installed or timed selector; compact mixed-count
-work and unsampled transition populations must not acquire performance claims.
+(0.97897×). There is no universal winning candidate. The accepted operation corpus motivates population-based selection. The later
+Automatic experiments below have their own correctness and timing evidence;
+compact mixed-count work and unsampled populations retain no performance claim.
 
 Evidence is
 `/tmp/llaminar-gfx1100-wmma-prefill-evidence/grouped-serving-timings/campaign.json`,
@@ -114,8 +114,290 @@ timing rows pass. Normalized wide gains change only0.9988–1.0138× across the 
 cases and leave the three-family requirement intact. No runtime hardware-counter
 qualification is claimed; tooling and the88-file archive are retained in the
 [detailed investigation](GFX1100_GROUPED_WMMA_ADMISSION.md).
-The seven experimental source files are restored exactly to `f6e727942`; the
-profiled GU256 fence remains the baseline. Working binaries still contain GU128
-until rebuilt and cannot certify that restored source. Device-population
-Automatic selection and its route-owned/count-threshold lifecycle gates are
-next, still unimplemented; no admission row or Automatic installation is claimed.
+## Device-population Automatic experiments
+
+The published feature checkpoint remains `2f3fe48cf`; its grouped Automatic
+selection is ordered Dot4. The working candidate adds an exact immutable key
+and one device-owned population decision, retaining RouteOwned precedence.
+Qwen admission requires M512/H2048/I512/E256/top8, original token indices,
+router-published Q8, physical GU13/down24 and source GU13/down4. Compact
+admission remains unfinished. Source partitions and publication arithmetic
+are unchanged.
+
+The first retained topology captured guarded Dot4, N32 and WideFloor16 families.
+It passed 231 GPU cases and three host registrations across Release/Integration,
+with zero memory spills on gfx906/gfx1100. Its complete Qwen uniform tournament
+contained 35 live extents × seven policies ×31 samples, eight operations per
+sample. Automatic won only four extents, geometric-mean Dot4/Automatic0.840273;
+full512 reached1.13450×. The extra91,488 dormant native CTAs per operation made
+that topology uneconomical. It is rejected, with57 files archived under
+`grouped-population-three-family-snapshot/snapshot.json`, SHA256
+`16918ccb51f9ca6cc700d542d8f34aa05f00ed6b7482e7bbc984f6414b441b6f`.
+
+The replacement fuses the arithmetic families into one128-thread consumer per
+projection role. Global N32 uses16-row directory entries even at concentrated
+counts7–15; other cold Qwen GU tiles retain12 rows, avoiding overlapping native
+writers. The actual Automatic replay passed family omissions, disjoint mixed
+writer omissions, changed inputs and retained reset/replay. Release gfx906 and
+gfx1100 compilation passed; native GU/down used72/71 VGPRs,3664 LDS bytes and
+no private memory or memory spills. Four focused host policy tests passed.
+
+That static-grid fused version completed the same7,595-sample tournament:
+8/35 extents beat Dot4, geometric mean0.986162×, full512 gain1.152×. Small work
+still lost (empty0.900×, live1 0.916×), so fusion alone is not qualified for
+Automatic promotion. Its36-file archive is
+`grouped-population-fused-static-snapshot/snapshot.json`, SHA256
+`3c4fe9782fa3021dee6c2441e7ac74ec8a9f3019b9df1890f2968fdac4599177`.
+The detailed decision is `grouped-population-fused-tournament-decision.json`.
+No hardware-counter qualification is claimed for either rejected topology.
+
+The next experiment used2,047 persistent workers, gate/up z=2,
+and a device-published live directory length. The trailing count word fits the
+existing canonical work bank; each role rebuilds it on the same stream. Workers
+visit only live tiles, and the odd stride rotates cold column ownership.
+A128-expert mixed15/16-row trace crosses the worker bound in both roles.
+This differs from the previously rejected511-worker candidate. Five host policy
+tests and the full Qwen Automatic replay pass. Both architectures compile with
+zero private memory or vector spills; GU/down use57/68 VGPRs,3664 LDS bytes and
+22 active blocks per WGP. ISA has39/51 scalar-to-vector register moves and
+151/187 readlane instructions, without scratch loads/stores.
+
+The7,595-sample tournament wins13/35 extents with geometric mean0.987460×.
+Empty/live1 improve to1.024×/1.012×, but full512 falls to1.005× against the
+explicit N32 candidate's1.212×. This variant is also rejected. The52-file archive
+is `grouped-population-persistent2047-snapshot/snapshot.json`, SHA256
+`af782a9f570a0769fab28605f3a50c46509996cb43f9e853dc798545909ee3a7`.
+`grouped-population-persistent-tournament-decision.json` owns all35 cell medians.
+Hardware counters remain uncollected. Next work targets loop-carried register
+lifetimes and compact scheduling when the global decision is wholly Dot4; neither
+is a qualified implementation yet.
+
+The new classifier, planners and consumers compile in their own HIP shard.
+Its IQ2_S lookup table is initialized within the existing runtime-generation
+transaction before capture. Shared arithmetic helpers retain one source; the
+canonical workspace geometry is in a lightweight header usable by HIP and the
+workspace BOM. This limits subsequent tuning rebuilds to the new kernel family.
+
+Further complete-operation experiments retain the same35 live extents,
+seven policies and31 samples per cell:
+
+| Variant | Geometric Dot4/Auto | Winning extents | Full512 |
+|---|---:|---:|---:|
+| Fixed Qwen geometry |1.00009×|15/35|1.0182×|
+| Coarse Dot4 work enumeration |1.01963×|23/35|1.0139×|
+| Separate ordered/native consumers |0.99647×|9/35|1.055×|
+| Separate, canonical partitions, native lane ranges |1.00672×|9/35|1.1717×|
+
+All passed retained Qwen replay and compiled for gfx906/gfx1100 without private
+memory or vector spills. The coarse-work variant is called `compact` in local
+experiment filenames; it does not admit the Compact E8 model geometry. An
+opaque argument-reload probe introduced232 private bytes and was rejected
+before GPU execution. The separate consumers' stronger omission proof disables
+actual physical down-producer nodes, covering Dot4, N32 and mixed choices,
+inactive producers, changed inputs and two restored dirty replays.
+
+Canonical partition specialization derives16 folds from
+`MoEProjectionNumericalContract`, with GU/down spans4/1 and staging depths2/1.
+The host submission and device arguments must match that same source contract;
+descriptor provenance remains checked. This removes unused down staging without
+changing arithmetic order. With the native lane fence removed, native GU/down
+use67/59 VGPRs,3664/1872 LDS bytes and no scalar register moves. Ordered consumers
+use56/62 VGPRs and audited register-lane moves, with no scratch memory.
+Small-work launch overhead still loses3–5%, so this candidate is not promoted.
+
+Archives and manifest SHA256:
+
+- `grouped-population-specialized-snapshot`: `67f4419eba1e24742588e29b9b5fe896d27a25931c25204da3334b75fbd00eea`.
+- `grouped-population-compact-snapshot`: `af52d88429a689547c5ea29109be6fcb68df717b9b94329d22cb7a8ced54d788`.
+- `grouped-population-separate-snapshot`: `0bb0b23a291873cf7b3b4a10c11949dec860748df561aee4a2efbcf446dddfb5`.
+- `grouped-population-contract-snapshot`: `038a515c5b47e0554ad93d386848a0e6ccf7a079d73395f8a32cc9dfc2fd5983` (replay/resource proof only; not timed).
+- `grouped-population-native-lanes-snapshot`: `b4ca29f01f77629b7b5e4857082aa64aebe0e4830182df94f706fd096ab98e48`.
+
+Recombining the canonical-partition consumers while confining the opaque lane
+fence to the cold branch passes replay, but raises GU/down allocation to82/83
+VGPRs. Its uniform tournament wins19/35 extents, geometric mean1.018508× and
+full512 1.1062×. This43-file archive is `grouped-population-refused-snapshot`,
+manifest SHA256 `5844372c7c069ffdfc2c5a2091951b44db28f9d5992ff68ed6ebb7dcd4d47a75`.
+An early replay during the fixture rebuild used mismatched binary topology and
+failed; it is retained as invalid build-order evidence. The later replay and
+tournament authenticate the completed executable and core before/after execution.
+
+The following experiment removes the standalone classifier. Gate/up directory
+planning reduces its already loaded counts across eight wave64s, publishes one
+typed device decision, and broadcasts it before computing tile rows. Sparse
+and empty replays still publish Dot4; down retains a read-only binding. It uses
+no extra arena storage. Both shipped targets compile without private memory or
+vector spills. The five host policy tests and actual Qwen replay pass, including
+new exact-size/one-word-short workspace probes. These probes capture the real
+submission boundary without launching the auxiliary graphs: exact storage
+records two kernels per role; short storage rejects with an empty receipt/graph.
+
+The folded uniform tournament wins23/35 extents, geometric mean1.027127×,
+full512 1.1130×. Empty and tiny work improve, but live15 still loses5.15% and
+several middle extents lose1–2%. Concentrated routing wins35/35 extents with
+geometric mean1.149130×. Decisions are in
+`grouped-population-folded-tournament-decision.json` and
+`grouped-population-folded-hotset-tournament-decision.json`.
+The power-law tournament passes byte correctness, but several cells have large
+within-cell timing variability. For live41, Automatic ranges813–3353µs; at
+live48, Dot4 ranges547–4791µs and Automatic852–4760µs. The raw medians are retained
+in `grouped-population-folded-power-law-tournament-decision.json`; they do not
+qualify a dispatch threshold. The source of this variability is not inferred.
+
+Integration compilation completes for gfx906/gfx1100. All1,084 final projection
+metadata records have zero private storage and vector spills, in
+`grouped-population-folded-integration-allocation/allocation.json`.
+All231 focused native cases pass:45 population,24 router-Q8 and162 grouped
+cases across15 explicit registrations. Review found a separate legacy counter assertion in
+`ROCm_M832256_RoutedExpertBatchInvariantEconomy`: it expected removed route
+labels and invented1×64 geometry for route-owned work. Its assertions now check
+actual route/tile rosters, hidden preparation and host-submission semantics;
+the updated benchmark builds and passes all three row sizes8/32/256.
+Hardware-counter qualification has not been collected for these variants.
+
+The complete folded baseline is frozen in the98-file
+`grouped-population-folded-snapshot/snapshot.json`, SHA256
+`acb5325cc3d84cb9b0b557dc40a07e66f7485afe462b3c64e4ffedc2f8f55f1f`.
+This snapshot includes both Release and Integration producers and all focused
+test receipts. Later experiments below have their own narrower evidence.
+
+Transposing native activation scales into aligned four-float lane groups removes
+four scalar LDS loads and adds one128-bit load per shader. Distinct scalar
+writers avoid vector-component read/modify/write races; row mapping and commits
+remain unchanged. ISA joins and instruction censuses are in
+`grouped-population-scale-vector-isa-proof.json`. GU/down resources stay82/83
+VGPRs and3664/1872 LDS bytes, with no private memory. Replay passes;7,595 uniform
+timing samples yield23/35 wins, geometric mean1.029051× and full512 1.1559×.
+The41-file archive is `grouped-population-scale-vector-snapshot/snapshot.json`,
+SHA256 `cfe2bfafdb66c634f3837f3a73e077576268c5027ed48e45a7fd170a557fea68`.
+
+Down now derives its contiguous grouped source row directly from the validated
+tile interval. Gate/up retains its indirect token map. Removing the redundant
+down row-map publication removes one barrier, four scalar LDS load sites and
+one scalar store site; all24 scalar-to-vector register moves disappear. Down
+retains83 VGPRs and uses1808 LDS bytes, with private/vector spills zero.
+Its final K barrier already retires readers before the next persistent tile.
+Replay and7,595 uniform samples pass:24/35 wins, geometric mean1.032144×,
+full512 1.1733×. Live15 still loses4.3%. The39-file archive is
+`grouped-population-direct-down-snapshot/snapshot.json`, SHA256
+`9a1e48a5fc0d981609696355262fe6587963adb002d6e2f3be09ab10f44da78e`.
+
+A subsequent unqualified experiment retains fused gate/up and splits only down
+into independently allocated ordered/native consumers. It preserves the same
+directory, decision and direct grouped addressing. The compiler reports GU82,
+ordered down63 and native down65 VGPRs, all without private memory; the down
+staging footprints are640/1808 bytes. Capture proof authenticates all three
+physical specializations, actual down-node omissions and exact submission
+rosters. Replay and7,595 samples pass, but uniform geometric mean falls to1.017025×
+with16/35 wins; live15 loses5.5%. Full512 remains1.1753×. The extra
+launch is uneconomical, so this topology is rejected and direct-down restored.
+The40-file archive is `grouped-population-hybrid-down-snapshot/snapshot.json`,
+SHA256 `b0ff4c2f3f34a6790de4c3fa52a3f0e449585304315f38649edbf4571fb59d7b`.
+
+
+### Single-row gate/up investigation
+
+Exact selected-region traces retain512-row capacity with15 live tokens:120
+experts each own one row. Auto GU took288,321ns versus ordered256,361ns;
+down took184,480ns versus183,201ns. These are diagnostic profiler intervals,
+not canonical timing. Separate GU passes report positive GPUBusy and wavefronts,
+loaded native code bytes and zero scratch. The87-file baseline profile archive
+is `grouped-population-live-profile-snapshot/snapshot.json`, SHA256
+`50ac99877f56e8b48201710f2225a9b908bfc104570d448f5f58bb7ffa8217d1`.
+
+A GU-only ordered single-row branch now reads its immutable Q8 activation
+row directly. It retains source13's two independent dot chains and sixteen
+ordered FP32 partition folds. It includes cold one-row tails and excludes
+native tails. ISA confirms two128-bit activation loads, eight signed dot4 sites,
+no LDS access and no barrier in that branch. GU remains82VGPR/106SGPR with21
+register-lane moves and3664 LDS bytes; Down remains unchanged; both have zero
+private/vector spills. Added heldouts cover256×13 cold tails, reversed single/pair
+counts, mixed single/native experts and native17-row tails through the retained
+production graph. Replay and all7,595 samples pass. Uniform wins32/35 sizes,
+geometric mean1.043996×, full512 1.1808×; live15 still loses2.3%.
+The42-file archive is `grouped-population-single-row-snapshot/snapshot.json`,
+SHA256 `f1f2f28ec707b2f4f4d215c564b8ea46ce7cef650887a6f3e14b4dd7ded0ea9a`.
+
+The next compiler-only probe requests a minimum10 waves per execution unit for
+GU while keeping Down's bound unchanged. Release compiles both targets with
+zero private/vector spills; GU decreases82→72VGPR, with the same21 register-lane
+moves. Replay and7,595 samples pass, but only19/35 sizes win; geometric
+mean falls to1.025794× and several cells lose3.9%. This probe is rejected.
+Its40-file archive is `grouped-population-gu-waves10-snapshot/snapshot.json`,
+SHA256 `8306cdc033bfee9e7933a1d6d63d5b900bc568fb727a1ffa26bcf1910c92e78b`.
+
+A subsequent experiment gives GU separate ordered/native consumers and keeps
+Down fused. It retains the direct single-row branch and one shared decision/
+directory. Compiler allocations are57/67VGPR and544/3664 LDS bytes for the two
+GU producers; their register-lane moves are53/0. Down remains83VGPR/1808LDS
+with zero lane moves. Both targets compile without private/vector spills;
+capture/replay and all22,785 samples across three routing profiles pass.
+Uniform wins32/35 sizes (geometric1.048364×, full1.174997×), hotset34/35
+(1.151460×, full1.155274×) and power-law28/35 (1.028069×, full1.033593×).
+Remaining losses reach1.2% uniform,0.3% hotset and1.9% power-law. These are
+retained comparison results, not an all-sizes no-regression claim.
+The initial uniform39-file archive is
+`grouped-population-hybrid-gu-snapshot/snapshot.json`, SHA256
+`496092d5db8d687dfd5ee4fb4073ecb0bb4b9b55ac2bf00bce88f8c4b0ac02a8`.
+The matching Integration build passes both architecture spill checks. Its full
+231-case focused suite passes15 registrations without skips; the receipt is
+`grouped-population-hybrid-gu-focused-all-1794719380208072973/receipt.json`.
+Read-only review of the complete production diff found no blocker. Both host
+registrations and the legacyM8/M32/M256 counter-owner benchmark also pass
+against the current core. Release and Integration resource censuses each cover
+1,085 kernels acrossgfx906/gfx1100, with zero private/vector spills.
+
+All42 exact counter passes succeed: seven metrics each for orderedGU/live15,
+nativeGU/live512, Down/live15 and512, and each directory/live512. Every pass
+authenticates loaded code bytes, native PCI/UUID, captured dispatch identity,
+positive GPU activity/wave counts, zero scratch and original power restoration.
+The campaign is `grouped-population-hybrid-gu-counter-campaign-1794719981575775408/campaign.json`;
+`grouped-population-hybrid-gu-profile-summary.json` records resources and metrics.
+Both GU leaves and Down report zero LDS bank conflicts. Logical consumer
+VGPR/LDS allocations are57/544,67/3664 and83/1808; GU directory uses40/4356,
+Down directory6/4096. OrderedGU has53 audited scalar-to-vector register moves,
+with no memory spills. The captured HIP residency ceilings are22/22/18 blocks
+for the consumers; these are static resource limits, not achieved occupancy.
+Profiler intervals remain diagnostic; unprofiled whole-operation samples own
+performance conclusions. The full evidence archive is
+`grouped-population-hybrid-gu-green-snapshot/snapshot.json`.
+
+The current feature installs this measured Qwen population rule. Compact Auto
+and remaining small-work regressions remain open. A subsequent planner
+optimization can replace the shared Hillis-Steele scan with wave-local integer
+prefix scans and one publication barrier, while retaining exact packed rows,
+count validation and deterministic integer totals. It requires fresh replay,
+whole-operation timing and directory profiles before adoption.
+
+
+### Compact Auto implementation boundary
+
+The audited compact domains retainM512/H512/I256/E8/top8 with source/physical
+Q4_0=0 orIQ2_S=13. Both roles use ordered16×256/block256 and native16×32/block128;
+source-owned partition counts remain16 forGU(K512) and8 forDown(K256). N32 wins
+overN64 at every previously measured active tiled compact point, including full
+Q4_0/IQ2_S gains1.053×/1.043× overDot4. These are explicit-candidate results;
+compact Automatic still selectsDot4.
+
+Both compact roles may share one TM16 directory: counts and offsets remain
+read-only, and SwiGLU has no directory argument. Bind the same264-entry capacity
+and its live-count word at264 to both roles; the current Qwen-style GU12 bound
+would instead use350 and cannot be reused unchanged. Canonical storage already
+reserves616 words. Reuse needs a typed capture-time publication binding from GU
+submission to Down on the same exact stream, including domain, pointer/layout,
+count/offset and selection bindings; pointer presence is not readiness. Empty
+and sparse consumers must reject ExpertTiled before reading stale directory bytes.
+This scope remains Complete/full-width/TokenRows/AllRoutes only.
+
+Generalize compile-time geometry rather than copying arithmetic. Derive ordered/
+native column ratio fromTN/BN: compact uses8, unlikeQwen's4. Compact GU/down
+native columns are8/16 and ordered columns1/2. Parameterize source identity,
+partition tree, row steps, planner domain and ordered/native thread counts.
+Replay must prove shared pointer/capacity and one planner per complete operation,
+cold/hot/empty resets, poisoned unused capacity, source0/13 ownership and both
+physical producers. Added inactive launches and removed Down planner must be
+measured together before installing compact Automatic.
+
+All relative evidence paths above are under
+`/tmp/llaminar-gfx1100-wmma-prefill-evidence/`. These are local investigation
+artifacts, not published corpus payloads or a completed performance claim.

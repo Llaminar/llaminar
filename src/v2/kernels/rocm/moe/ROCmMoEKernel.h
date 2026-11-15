@@ -1677,6 +1677,7 @@ namespace llaminar2
         float *d_prefill_swiglu_scales_ = nullptr; ///< [prefill_slots_cap_, intermediate / 32]
         float *d_prefill_gate_ = nullptr;          ///< [prefill_slots_cap_, max(d_model,intermediate)]
         float *d_prefill_up_ = nullptr;            ///< [prefill_slots_cap_, intermediate]
+        uint32_t *d_grouped_population_selection_ = nullptr; ///< Arena-owned replay decision; no host mirror.
         uint32_t *d_prefill_work_directory_ = nullptr; ///< Device-authored adaptive TM12/TM16 spans.
         int prefill_slots_cap_ = 0;           ///< Current capacity (total_slots)
         int prefill_d_model_cap_ = 0;         ///< Current d_model capacity

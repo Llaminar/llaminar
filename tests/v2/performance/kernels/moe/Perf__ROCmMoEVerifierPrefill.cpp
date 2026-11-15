@@ -4711,6 +4711,7 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M1234_RoutedExpertFFNDecodeEquivalent)
 #endif
 }
 
+/** @test Grouped economy reports actual submitted families and tile rosters across the sparse boundary. */
 TEST(Perf__MoEVerifierPrefill, ROCm_M832256_RoutedExpertBatchInvariantEconomy)
 {
 #ifndef HAVE_ROCM
@@ -4729,10 +4730,10 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M832256_RoutedExpertBatchInvariantEconomy)
         expectGraphReplayFasterThanReference(routed);
         expectGfx906LongPrefillThroughput(routed);
 
-        int expected_gateup_tile_m = 1;
-        int expected_gateup_tile_n = 64;
-        int expected_down_tile_m = 1;
-        int expected_down_tile_n = 64;
+        int expected_gateup_tile_m = 0;
+        int expected_gateup_tile_n = 0;
+        int expected_down_tile_m = 0;
+        int expected_down_tile_n = 0;
         if (rows > 8)
         {
             ASSERT_TRUE(rocmMoE_grouped_prefill_query_tile_config(
@@ -4753,17 +4754,29 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M832256_RoutedExpertBatchInvariantEconomy)
                 &expected_down_tile_n));
         }
         const std::string expected_gateup_tile_m_text =
-            std::to_string(expected_gateup_tile_m);
+            rows > 8 ? std::to_string(expected_gateup_tile_m) : "route_owned";
         const std::string expected_gateup_tile_n_text =
-            std::to_string(expected_gateup_tile_n);
+            rows > 8 ? std::to_string(expected_gateup_tile_n) : "route_owned";
         const std::string expected_down_tile_m_text =
-            std::to_string(expected_down_tile_m);
+            rows > 8 ? std::to_string(expected_down_tile_m) : "route_owned";
         const std::string expected_down_tile_n_text =
-            std::to_string(expected_down_tile_n);
+            rows > 8 ? std::to_string(expected_down_tile_n) : "route_owned";
         const std::string expected_common_row_tile =
             expected_gateup_tile_m == expected_down_tile_m
                 ? expected_gateup_tile_m_text
                 : "mixed";
+        // Route-owned kernels have their own geometry authority; they are not
+        // synthetic 1x64 tiled leaves. Long captures retain both guarded routes.
+        const auto expected_roster = [rows](int tile_m, int tile_n) {
+            return rows <= 8 ? std::string("none") :
+                "dot4:" + std::to_string(tile_m) + "x" + std::to_string(tile_n) +
+                "/threads=" + std::to_string(tile_n) +
+                "/ordered_rows=0/ordered_columns=0/floor=0/leaves=1";
+        };
+        const auto expected_gateup_roster = expected_roster(expected_gateup_tile_m,expected_gateup_tile_n);
+        const auto expected_down_roster = expected_roster(expected_down_tile_m,expected_down_tile_n);
+        const char *expected_route = rows > 8 ? "device_route_owned_or_expert_tiled" : "route_owned";
+        const char *expected_leaves = rows > 8 ? "1" : "0";
 
         const auto records = llaminar2::PerfStatsCollector::snapshot(
             {"kernel.rocm_moe_grouped_prefill_batch_invariant_calls"});
@@ -4780,16 +4793,17 @@ TEST(Perf__MoEVerifierPrefill, ROCm_M832256_RoutedExpertBatchInvariantEconomy)
                 };
                 return record.name == "rocm_moe_grouped_prefill_batch_invariant_calls" &&
                        tag_equals("seq_len", expected_rows.c_str()) &&
-                       tag_equals(
-                           "gateup_route",
-                           rows > 8
-                               ? "expert_tiled_original_row_quant"
-                               : "route_owned_original_row_quant") &&
-                       tag_equals(
-                           "down_route",
-                           rows > 8
-                               ? "expert_tiled_partials_ordered_publish"
-                               : "direct_ordered_publish") &&
+                       tag_equals("gateup_route", expected_route) &&
+                       tag_equals("down_route", expected_route) &&
+                       tag_equals("hidden_preparation", "original_row_quant") &&
+                       tag_equals("counter_semantics", "host_submissions") &&
+                       tag_equals("geometry_role", "physical_capacity") &&
+                       tag_equals("route_admission", "device_group_plan") &&
+                       tag_equals("dot_policy", "dot4") &&
+                       tag_equals("gateup_submitted_tiles", expected_gateup_roster.c_str()) &&
+                       tag_equals("down_submitted_tiles", expected_down_roster.c_str()) &&
+                       tag_equals("gateup_submitted_tiled_leaves", expected_leaves) &&
+                       tag_equals("down_submitted_tiled_leaves", expected_leaves) &&
                        tag_equals("gateup_tile_m", expected_gateup_tile_m_text.c_str()) &&
                        tag_equals("gateup_tile_n", expected_gateup_tile_n_text.c_str()) &&
                        tag_equals("down_tile_m", expected_down_tile_m_text.c_str()) &&

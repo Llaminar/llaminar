@@ -14,6 +14,7 @@
  */
 #include <hip/hip_runtime.h>
 #include "ROCmMoEGroupedWmma.h"
+#include "ROCmMoEGroupedPopulationProjection.h"
 #include "ROCmNativeQuantisedDecodeEquivalentMath.h"
 #include "kernels/common/MoEGroupedDirectory.h"
 #include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
@@ -29,6 +30,8 @@ namespace
 thread_local MoEGroupedPrefillEngine recording_engine = MoEGroupedPrefillEngine::Automatic;
 thread_local MoEGroupedWmmaRowFloor recording_floor = MoEGroupedWmmaRowFloor::EveryExpert;
 
+}
+
 /** @brief Authenticate the compiled native instruction and maximum tile resources.
  * @param device Admitted visible HIP ordinal. @return Whether WMMA can execute. */
 bool nativeGroupedDevice(int device)
@@ -36,7 +39,6 @@ bool nativeGroupedDevice(int device)
     const auto &h = rocmHardwareMetadata().at(device);
     return (h.isa_target == "gfx1100" || h.isa_target.starts_with("gfx1100:")) &&
         h.maximum_threads_per_block >= 256 && h.lds_per_block >= 8192;
-}
 }
 
 ScopedMoEGroupedPrefillEngine::ScopedMoEGroupedPrefillEngine(
@@ -49,6 +51,8 @@ ScopedMoEGroupedPrefillEngine::ScopedMoEGroupedPrefillEngine(
         throw std::invalid_argument("grouped WMMA row floor requires an explicit native candidate");
     switch (engine)
     {
+    case MoEGroupedPrefillEngine::PopulationAdaptive:
+        throw std::invalid_argument("population dispatch is owned by Automatic operation admission");
     case MoEGroupedPrefillEngine::Automatic:
     case MoEGroupedPrefillEngine::OrderedDot4:
     case MoEGroupedPrefillEngine::WmmaM16N32:
@@ -61,8 +65,12 @@ ScopedMoEGroupedPrefillEngine::ScopedMoEGroupedPrefillEngine(
 ScopedMoEGroupedPrefillEngine::~ScopedMoEGroupedPrefillEngine()
 { recording_engine = previous_; recording_floor = previous_floor_; }
 
-MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device)
+MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device, const MoEGroupedPopulationKey &key)
 {
+    const auto domain = groupedPopulationDomain(key);
+    if (recording_engine == MoEGroupedPrefillEngine::Automatic &&
+        domain == MoEGroupedPopulationDomain::Qwen && nativeGroupedDevice(device))
+        return {MoEGroupedPrefillEngine::PopulationAdaptive,MoEGroupedWmmaRowFloor::Sixteen,domain};
     if (recording_engine == MoEGroupedPrefillEngine::Automatic ||
         recording_engine == MoEGroupedPrefillEngine::OrderedDot4)
         return {MoEGroupedPrefillEngine::OrderedDot4,MoEGroupedWmmaRowFloor::EveryExpert};
@@ -74,7 +82,7 @@ MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device)
 namespace grouped_wmma_detail
 {
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1100__)
-using I32x4 = int __attribute__((ext_vector_type(4)));
+#include "ROCmMoEGroupedWmmaMath.hip.inc"
 
 /** @brief Compute an unweighted grouped projection tile with exact serial arithmetic.
  * @tparam FMT Actual physical descriptor decoder; IQ4 ids remain distinct.
@@ -332,8 +340,10 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
 }
 
 bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
-    const MoEGroupedWmmaArguments &args, void *stream)
+    const MoEGroupedWmmaArguments &args, void *stream, MoEGroupedPrefillRoleSubmission *submitted)
 {
+    if (submitted) *submitted = {};
+    MoEGroupedPrefillRoleSubmission pending;
     const auto native_stream = static_cast<hipStream_t>(stream);
     if (!native_stream || native_stream == hipStreamLegacy || native_stream == hipStreamPerThread ||
         args.branch_suppression != MoEGroupedBranchSuppression::None ||
@@ -359,7 +369,10 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
             if (args.second_descriptors)
                 grouped_wmma_detail::projection<FMT,BN,true,Adaptive><<<grid,BN*4,0,native_stream>>>(args);
             else grouped_wmma_detail::projection<FMT,BN,false,Adaptive><<<grid,BN*4,0,native_stream>>>(args);
-            return hipGetLastError() == hipSuccess;
+            if (hipGetLastError() != hipSuccess) return false;
+            pending.record({engine,args.dot_admission.rowPlan().floor(),16,BN,BN*4,
+                Adaptive ? 16 : 0,1,Adaptive ? BN : 0});
+            return true;
         };
         auto wide = [&]<bool Adaptive>() {
             const int threads = args.second_descriptors ? 256 : 128;
@@ -368,7 +381,10 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
             if (args.second_descriptors)
                 grouped_wmma_detail::wideProjection<FMT,true,Adaptive><<<grid,threads,0,native_stream>>>(args);
             else grouped_wmma_detail::wideProjection<FMT,false,Adaptive><<<grid,threads,0,native_stream>>>(args);
-            return hipGetLastError() == hipSuccess;
+            if (hipGetLastError() != hipSuccess) return false;
+            pending.record({engine,args.dot_admission.rowPlan().floor(),16,native_columns,threads,
+                Adaptive ? (args.second_descriptors ? 12 : 16) : 0,1,Adaptive ? threads : 0});
+            return true;
         };
         switch (engine)
         {
@@ -401,7 +417,9 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
     MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_Q8_0);
     MOE_WMMA_FORMAT(NATIVE_QUANTISED_GEMM_EXPANDED_INT8_MIN);
 #undef MOE_WMMA_FORMAT
-    return codebooks && !remaining;
+    if (!codebooks || remaining) return false;
+    if (submitted) *submitted = pending;
+    return true;
 #else
     return false;
 #endif

@@ -14,11 +14,13 @@
 #include "ROCmMoEPrefillArithmetic.h"
 #include "ROCmMoEGroupedPrefillRoutePolicy.h"
 #include "ROCmMoEGroupedDotAdmission.h"
+#include "ROCmMoEGroupedPopulationPolicy.h"
+#include <array>
 
 namespace llaminar2::rocm
 {
 /** @brief Explicit recording choices; Automatic retains installed measured policy. */
-enum class MoEGroupedPrefillEngine { Automatic, OrderedDot4, WmmaM16N32, WmmaM16N64, WideDot4Wmma };
+enum class MoEGroupedPrefillEngine { Automatic, PopulationAdaptive, OrderedDot4, WmmaM16N32, WmmaM16N64, WideDot4Wmma };
 
 /** @brief Nestable worker-local selection, embedded in the captured native nodes. */
 class ScopedMoEGroupedPrefillEngine final
@@ -43,13 +45,61 @@ struct MoEGroupedPrefillPolicy
 {
     MoEGroupedPrefillEngine engine;
     MoEGroupedWmmaRowFloor minimum_expert_rows;
+    MoEGroupedPopulationDomain population = MoEGroupedPopulationDomain::Unmeasured;
+};
+
+/** @brief One distinct successfully submitted tiled launch geometry, including dormant leaves. */
+struct MoEGroupedPrefillTileSubmission
+{
+    MoEGroupedPrefillEngine engine = MoEGroupedPrefillEngine::OrderedDot4;
+    MoEGroupedWmmaRowFloor floor = MoEGroupedWmmaRowFloor::EveryExpert;
+    int rows = 0, columns = 0, threads = 0, ordered_rows = 0;
+    uint32_t count = 0;
+    int ordered_columns = 0; ///< Cold branch width, distinct from native columns.
+};
+
+/** @brief Bounded capture-time inventory; no container allocation or device-state mirror. */
+struct MoEGroupedPrefillRoleSubmission
+{
+    std::array<MoEGroupedPrefillTileSubmission,16> tiles{};
+    size_t size = 0;
+    /** @param tile Actual submitted geometry and number of physical-codebook leaves.
+     * @throws std::logic_error If an unsupported geometry roster exceeds its declared bound. */
+    void record(MoEGroupedPrefillTileSubmission tile)
+    {
+        for (size_t i = 0; i < size; ++i)
+        {
+            auto &old = tiles[i];
+            if (old.engine == tile.engine && old.floor == tile.floor && old.rows == tile.rows &&
+                old.columns == tile.columns && old.threads == tile.threads && old.ordered_rows == tile.ordered_rows &&
+                old.ordered_columns == tile.ordered_columns)
+            { old.count += tile.count; return; }
+        }
+        if (size == tiles.size()) throw std::logic_error("grouped submission geometry inventory overflow");
+        tiles[size++] = tile;
+    }
+    /** @return Number of submitted tiled kernels, not replay executions. */
+    [[nodiscard]] uint32_t leaves() const noexcept
+    { uint32_t result = 0; for (size_t i = 0; i < size; ++i) result += tiles[i].count; return result; }
+};
+
+/** @brief Caller-owned construction receipt; published only after complete launch success. */
+struct MoEGroupedPrefillSubmission
+{
+    enum class State : uint8_t { Empty, Complete };
+    State state = State::Empty;
+    MoEGroupedPrefillPolicy policy{MoEGroupedPrefillEngine::OrderedDot4,MoEGroupedWmmaRowFloor::EveryExpert};
+    MoEGroupedPrefillRoleSubmission gateup, down;
+    bool gateup_route_owned = false, down_route_owned = false;
+    bool exact_ordered_overlay = false;
 };
 
 /** @brief Resolve recording against immutable native hardware metadata.
  * @param device Visible HIP ordinal owning the complete transaction.
+ * @param key Actual immutable operation, including source aliases and Q8 ownership.
  * @return Concrete Dot4 or native WMMA engine and whole-expert row floor.
  * @throws std::invalid_argument When an explicit native candidate is unsupported. */
-MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device);
+MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device, const MoEGroupedPopulationKey &key);
 
 /** @brief Which authoritative row index addresses the quantized activation bank. */
 enum class MoEGroupedWmmaInput { OriginalTokens, OriginalRouteSlots, GroupedRows };
@@ -91,9 +141,11 @@ struct MoEGroupedWmmaArguments
  * @param codebooks Actual physical descriptor mask, preserving separate IQ4 ids.
  * @param args Frozen bindings and original full-width arithmetic partition policy.
  * @param stream Explicit non-default producer stream owned by args.device.
+ * @param submitted Optional caller-owned role inventory, cleared on entry and published on full success.
  * @return Whether every required native launch was accepted. */
 bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
-                         const MoEGroupedWmmaArguments &args, void *stream);
+                         const MoEGroupedWmmaArguments &args, void *stream,
+                         MoEGroupedPrefillRoleSubmission *submitted = nullptr);
 
 /** @brief Publish this TU's immutable IQ grids during backend initialization.
  * @param device Owning native device. @param iq3s IQ3_S uint32 table.

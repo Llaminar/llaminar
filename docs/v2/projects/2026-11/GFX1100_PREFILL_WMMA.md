@@ -51,20 +51,21 @@ Disabling each native projection independently makes that reference fail, provin
 the recorded kernels contribute. Split replay covers both tiles, all 21 source
 formats, whole-expert phases and compact column-owned down slices.
 
-Bounded511 was rejected; its70-file archive remains in the investigation.
+[Operation proof](GFX1100_GROUPED_PREFILL_OPERATION_PROOF.md) records the accepted
+ordinary router-Q8/token-output tournament:15,810 samples across five cases and
+six policies. Full Qwen uniform/hotset favors N32; power-law favors WideFloor16;
+sparse work favors Dot4. GU128 was correct but unpromoted. Bounded511 was rejected.
 
-[Operation proof](GFX1100_GROUPED_PREFILL_OPERATION_PROOF.md) records completed
-ordinary prefill timing: five cases ×17 live points ×six policies ×31 samples,
-including the real router-Q8 producer, injected expert routes and direct token
-publication. Qwen uses all-local shard1 uniform/hotset/power-law; two compact
-controls retain E8. Both builds and24 focused native replays pass (51.87s).
-`grouped-serving-timings/campaign.json` binds all15,810 qualified rows. N32 wins
-full uniform/hotset; WideFloor16 wins full power-law. Sparse work still favors
-Dot4. GU128 passed186 native cases/15,810 timings but is unpromoted: normalized
-wide changes0.9988–1.0138× leave three families necessary. No hardware counters
-are claimed. Source is restored to f6e727942; binaries still contain GU128 until
-rebuilt. Auto stays Dot4; device-population selection is next, unimplemented.
-[Investigation](GFX1100_GROUPED_WMMA_ADMISSION.md) owns the comparisons/archive.
+The feature branch admits population Automatic for the exact Qwen domain,
+using separate ordered/native GU consumers and fused Down, with direct one-row
+GU arithmetic and selection folded into the GU directory. All22,785 Release
+samples pass: uniform32/35 wins (mean1.048×), hotset34/35 (1.151×), power-law28/35
+(1.028×); full gains1.175×/1.155×/1.034×. Remaining losses reach1.2%/0.3%/1.9%.
+Both Release and Integration compile the complete target set without memory
+spills. All231 native cases, two host checks and42 counter passes are green.
+Compact Auto and complete performance qualification remain open. The
+[operation proof](GFX1100_GROUPED_PREFILL_OPERATION_PROOF.md) owns the experiments
+and archive identities, including rejected separate-Down and72-VGPR variants.
 
 The user accepts the existing dense/CUDA-reference, router and attention
 performance evidence without an isolation-receipt requirement. Isolation-only
