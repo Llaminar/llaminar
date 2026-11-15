@@ -1535,6 +1535,7 @@ namespace
                         // Direct one-row GU work, cold12-row tails and retained
                         // direct/staged transitions share the production graph.
                         balanced(256,13,Family::Dot4);
+                        balanced(256,14,Family::Dot4); // Two-row cold tails use the direct producer.
                         auto single_and_pair = std::vector<int>(256,1);
                         std::fill(single_and_pair.begin()+128,single_and_pair.end(),2);
                         histograms.push_back({single_and_pair,Family::Dot4});
@@ -1546,6 +1547,16 @@ namespace
                         // A native tile's one-row tail must stay on its native
                         // producer, even though it has the same live row count.
                         balanced(128,17,Family::N32);
+                        balanced(128,18,Family::N32); // Two-row native tails retain WMMA ownership.
+                        // Interior holes cross four-expert lane groups, the
+                        // midpoint and the last lane. Mixed row steps must keep
+                        // exact expert-major offsets through every zero gap.
+                        std::vector<int> holed(256,0);
+                        for (const auto [expert,count] : std::array<std::pair<int,int>,11>{{
+                            {0,13},{2,15},{3,1},{4,16},{7,2},{8,12},
+                            {127,13},{128,1},{251,16},{252,2},{255,17}}})
+                            holed[expert] = count;
+                        histograms.push_back({holed,Family::WideFloor16});
                     }
                     else
                     {
@@ -1964,6 +1975,10 @@ namespace
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_PopulationColdProfile)
     { runExpertPipeline(GetParam(),ExpertBenchmark::PopulationProfile,ExpertPublication::RouterQ8TokenRows,
         PopulationProfileWork{.live_rows=15,.producer=PopulationProfileProducer::Automatic}); }
+    /** @brief Profile sparse paired experts at the actual forty-token live workload. */
+    TEST_P(ROCmGroupedWmmaPerf, DISABLED_PopulationPairProfile)
+    { runExpertPipeline(GetParam(),ExpertBenchmark::PopulationProfile,ExpertPublication::RouterQ8TokenRows,
+        PopulationProfileWork{.live_rows=40,.producer=PopulationProfileProducer::Automatic}); }
     /** @brief Profile the matching ordered baseline with the same router and live route histogram. */
     TEST_P(ROCmGroupedWmmaPerf, DISABLED_PopulationOrderedColdProfile)
     { runExpertPipeline(GetParam(),ExpertBenchmark::PopulationProfile,ExpertPublication::RouterQ8TokenRows,

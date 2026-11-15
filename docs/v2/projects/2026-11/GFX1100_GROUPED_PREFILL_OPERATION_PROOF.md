@@ -362,12 +362,86 @@ Profiler intervals remain diagnostic; unprofiled whole-operation samples own
 performance conclusions. The full evidence archive is
 `grouped-population-hybrid-gu-green-snapshot/snapshot.json`.
 
-The current feature installs this measured Qwen population rule. Compact Auto
-and remaining small-work regressions remain open. A subsequent planner
-optimization can replace the shared Hillis-Steele scan with wave-local integer
-prefix scans and one publication barrier, while retaining exact packed rows,
-count validation and deterministic integer totals. It requires fresh replay,
-whole-operation timing and directory profiles before adoption.
+The committed feature installs this measured Qwen population rule. Compact Auto
+and remaining small-work regressions remain open.
+
+### Directory experiments and residual-loss attribution
+
+Two directory rewrites passed byte replay and the complete 7,595-sample uniform
+tournament but did not improve whole-operation economics. The wave-local scan
+with one LDS publication barrier achieved a1.044125 geometric ratio and32/35
+wins. A single wave64, with four consecutive experts per lane and no LDS or
+barriers, achieved1.033811 and31/35, versus the committed1.048364 and32/35.
+Both were rejected; production retains its committed planner. Exact snapshots:
+
+- `grouped-population-wave-scan-snapshot/snapshot.json`, SHA256
+  `85fb5cd7f4684977c71ad5a5a4e0605444139f0c2cccf4e4ec76e8092a1b27b7`.
+- `grouped-population-single-wave-snapshot/snapshot.json`,54 files, SHA256
+  `6ec2b51c33b3c340f4404bd18e1c1d595cebea89466a7f06f90cb8c1ee195f4f`.
+
+The single-wave producer compiled with GU29/52 andDown25/26 VGPR/SGPR, zero LDS,
+private bytes and vector spills. Projection allocations remained unchanged.
+Exact GPUBusy profiler passes authenticated one64-thread directory dispatch each,
+zero scratch and restored power. Diagnostic GU/Down intervals were15.601/7.600µs,
+versus9.800/5.000µs in the corresponding committed GPUBusy passes. These isolated
+profile intervals support attribution; the unprofiled tournaments own the
+rejection. Release replay and both host registrations passed. The archive also
+contains a nonqualifying initial replay attempted before the test relink; its
+old512-thread expectation correctly rejected the64-thread producer. Only the
+subsequent completed-build replay and tournament count as candidate evidence.
+
+The retained focused replay now adds an interior-zero histogram with108 routes
+across11 experts. It crosses four-expert lane boundaries, the midpoint and the
+last expert, with mixed12/16-row tiles. Real grouping, poisoned banks, producer
+omissions, restored repeated replay and empty/full reset exercise the production
+parent. This case remains useful after reverting the planner experiment.
+
+A separate deterministic100,000-resample analysis authenticates all three
+committed tournament logs. Uniform39/40/41 and power-law40/41/63/64/65/68 each
+show Auto slower in31/31 paired rounds and strictly positive block-bootstrap
+loss intervals. The largest median loss is1.897%; these are within-run findings,
+not independent-run reproducibility claims. Hotset7 is noise-compatible, while
+power-law48 is only weak evidence of a0.218% loss. See
+`grouped-population-hybrid-gu-statistical-review-1794722494317292469.json`, SHA256
+`428f1ff15ff1f67e371c3ebc91b5e94717e589294311e038b4e77ebcddbba9b1`.
+Two direct-two-row GU candidates also preserve exact bytes but lose aggregate
+performance. Shared Rows1/Rows2 control flow gives1.029597 geometric speedup
+and22/35 wins; separate one-row and two-row branches give1.028590 and24/35.
+Both improve the original39–41-row losses while introducing larger16/17/31/32
+losses. They are rejected; the committed one-row branch remains authoritative.
+The snapshots are `grouped-population-direct-pair-snapshot/snapshot.json`
+(SHA256 `d37de111d1286b9c5ea826399a2ab68ed9ed558c37e8b4071c2812adb838189b`)
+and `grouped-population-direct-pair-split-snapshot/snapshot.json`
+(SHA256 `97f38d6e6e08329b7fd8fffe289772fa7f9e6db038f203d3b6e07947309ca804`).
+Their GU allocations are63/106 and62/106 VGPR/SGPR, with zero private/vector
+spills; exact GPUBusy profiles authenticate each producer. Static ISA comparison
+shows the one-row K32 arithmetic/load sequence unchanged and no overlap between
+both rows' activation vectors. It does not establish a cause for the regressions.
+Cold14/native18 tail traces and the exact40-live-row profile hook remain useful
+regressions/attribution fixtures after reverting these candidates.
+
+Reducing only native GU to1,023 workers gives1.040186 geometric speedup and32/35
+wins, but full-live speedup drops to1.139034. It is also rejected. This probe
+changes launch geometry only; ordered GU/down and all arithmetic stay unchanged.
+Its archive is `grouped-population-native-1023-snapshot/snapshot.json`, SHA256
+`4fefd2e27be4a0ea0afd3cef40e34b35f653e0f66be89377455fdd512d95702b`.
+The final grid-only candidate uses orderedGU1,024/nativeGU2,048/down2,047.
+Replay and7,595 paired samples pass, but geometric speedup is1.036885 with32/35
+wins. Full-live improves to1.184238 while the original39–41 losses remain, so it
+also loses the aggregate comparison and is rejected. Exact GU profile passes
+authenticate the new grids and unchanged57/67-VGPR, scratch-free kernels. Its
+44-file archive is `grouped-population-balanced-gu-snapshot/snapshot.json`, SHA256
+`3ecf6153c34a17e05f2f3d5257058acdeef5c802f378e8aa1485675c13768e70`.
+All production code is restored to the committed hybrid-GU implementation before
+Compact work; only stronger replay/attribution fixtures and these notes survive.
+The restored producer plus expanded fixtures passes all231 native cases across15
+focused registrations: `grouped-population-expanded-replay-focused-all-1794725750567670704/receipt.json`.
+An initial all-codebook run reached its unchanged180-second timeout without a
+numerical failure; the isolated42-case rerun passed in93.31seconds, followed by
+the complete green rerun. Neither timeout nor test scope was relaxed. Both
+production libraries are byte-identical to the prior green checkpoint. The
+24-file input/artifact snapshot is `grouped-population-expanded-replay-snapshot/snapshot.json`,
+SHA256 `c2d04cc4d3003fe1d84766afb3049fc9e0b8d41d6d31acd4fc84d63ce7d97f31`.
 
 
 ### Compact Auto implementation boundary
@@ -396,7 +470,14 @@ partition tree, row steps, planner domain and ordered/native thread counts.
 Replay must prove shared pointer/capacity and one planner per complete operation,
 cold/hot/empty resets, poisoned unused capacity, source0/13 ownership and both
 physical producers. Added inactive launches and removed Down planner must be
-measured together before installing compact Automatic.
+measured together before installing compact Automatic. Bound each compact
+ordered grid by its immutable directory capacity times actual ordered columns:
+GU264 andDown528 workers for capacity264. Launching2,047 workers for these coarse
+extents would add avoidable dormant work. Native workers need their own measured
+bound. A move-only produced-directory token carries the successful GU receipt,
+complete immutable domain, exact stream/device, counts/offsets, selection and
+fixed-TM16 layout; Down consumes it once within the same lexical operation owner.
+This is capture construction metadata, never a host copy of live device state.
 
 All relative evidence paths above are under
 `/tmp/llaminar-gfx1100-wmma-prefill-evidence/`. These are local investigation
