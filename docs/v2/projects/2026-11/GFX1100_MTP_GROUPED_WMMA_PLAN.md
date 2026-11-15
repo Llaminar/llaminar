@@ -388,6 +388,24 @@ The final280-file source/binary/ISA/evidence archive is
 `mtp-verifier-automatic-qualified-snapshot/snapshot.json`, SHA256
 `09be5854cf2bfa9bb17297d26abb36df35ec75cbebad1778394bd5ea1da392e6`.
 
+## Broader codebook economy
+
+The performance-only `AllFormats/ROCmVerifierWmmaFormatEconomy` panels derive all21
+source formats from the canonical verifier registry. They retain source aliases
+separately and reuse the existing complete public projection/SwiGLU byte oracle,
+poisoned replay, native inventory and31 paired samples of eight operations.
+`DISABLED_ExactWidthEndpoints` brackets M4/5/8/16; `DISABLED_ExactWidthSweep`
+measures every M2–16 at all three established N/K shapes. Their corpora remain
+separate because endpoint keys overlap the full sweep. These tests do not expand
+Automatic admission or routine preflight budgets.
+
+The first Q4_0 endpoint panel passes all24 cells/1,488 samples. Dot4 wins all six
+M4 cells; WMMA wins all18 M5/8/16 cells, with complete-operation gains from1.019×
+to1.548×. This brackets the crossover but does not yet qualify all widths or an
+Automatic policy. Receipt: `mtp-verifier-codebook-endpoints-Q4_0-1794749957198871476/receipt.json`
+under the existing local evidence root. Full-width collection follows before
+extending production selection.
+
 ## Required acceptance evidence
 
 1. **Rows and formats.** Use production M=1 as the independent serial oracle;

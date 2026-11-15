@@ -40,6 +40,7 @@
 #include <tuple>
 #include <iomanip>
 #include <optional>
+#include <span>
 #include <iostream>
 #include <vector>
 
@@ -941,6 +942,46 @@ TEST(ROCmDeviceCountedVerifierRowsEconomy, Qwen38PairedWmmaExactWidths)
 TEST(ROCmDeviceCountedVerifierRowsEconomy, Qwen38AutomaticExactWidths)
 { ASSERT_NO_FATAL_FAILURE(proveQwen38PairedWmma(VerifierProbePurpose::PairedAutomaticExactWidth,
     NativeQuantisedVerifierCandidate::Automatic)); }
+
+/** @brief Independent source-codebook economy cells use the same complete public byte oracle. */
+class ROCmVerifierWmmaFormatEconomy : public ::testing::TestWithParam<QuantizedVerifierFormatCase> {};
+
+/**
+ * @brief Measure one original codebook without borrowing another format's crossover.
+ * @param format Complete source-format registry entry, including normalized aliases.
+ * @param widths Exact physical transaction widths, never a mutable host count.
+ * @details Every cell retains the existing31 alternating pairs of eight public
+ * projection/SwiGLU operations, authenticated native inventory, serial bytes
+ * and poisoned partial/empty/regrown replay. This is performance-only work.
+ */
+static void proveCodebookExactWidths(const QuantizedVerifierFormatCase &format,
+    std::span<const int> widths)
+{
+    for(const auto [columns,width]:std::array<std::pair<int,int>,3>{{{17408,5120},{5120,17408},{10240,5120}}})
+        for(int rows:widths)
+            for(auto operation:{VerifierProjectionBundle::TensorProjection,VerifierProjectionBundle::TensorSwiGLU})
+                ASSERT_NO_FATAL_FAILURE(proveDeviceCountedRows(format,operation,
+                    VerifierCapacityProbe{rows,columns,width,VerifierProbePurpose::PairedExactWidth},
+                    VerifierBias::None,NativeQuantisedVerifierCandidate::WmmaM16N64));
+}
+
+/** @brief First bracket shallow, crossover and full verifier widths for every source format. */
+TEST_P(ROCmVerifierWmmaFormatEconomy, DISABLED_ExactWidthEndpoints)
+{
+    constexpr std::array widths{4,5,8,16};
+    ASSERT_NO_FATAL_FAILURE(proveCodebookExactWidths(GetParam(),widths));
+}
+
+/** @brief Resolve every admitted physical width before installing an extended measured policy. */
+TEST_P(ROCmVerifierWmmaFormatEconomy, DISABLED_ExactWidthSweep)
+{
+    constexpr std::array widths{2,3,4,5,6,7,8,9,10,11,12,13,14,15,16};
+    ASSERT_NO_FATAL_FAILURE(proveCodebookExactWidths(GetParam(),widths));
+}
+
+INSTANTIATE_TEST_SUITE_P(AllFormats,ROCmVerifierWmmaFormatEconomy,
+    ::testing::ValuesIn(quantizedMoEVerifierFormats()),
+    [](const ::testing::TestParamInfo<QuantizedVerifierFormatCase> &info){return std::string(info.param.label);});
 
 
 /**
