@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Device-free negative controls for the installed native dependency verifier.
+"""@file test_native_completed_broadcast_proof.py
+@brief Device-free negative controls for the installed native dependency verifier.
 
 Synthetic reports test validation policy only; actual source-body certificates
 are produced by the dependency builder and consumed by separate preflight tests.
@@ -269,7 +270,8 @@ class OwnedEntryRecordPathTests(unittest.TestCase):
         entry.loader.exec_module(artifact)
         builder = artifact.module("owned_record_test_builder", ROOT / "scripts/docker/llvm-lto-linker/build.py")
         self.spec = dict(schema=1, library=str(self.library), record_root=str(self.records), architectures=self.targets)
-        self.producer = dict(resource_evidence_complete=True, architectures=self.targets, observations=[])
+        self.producer = dict(resource_evidence_complete=True, architectures=self.targets, observations=[],
+                             library_sha256=hashlib.sha256(self.library.read_bytes()).hexdigest())
         self.files = {}
         for target in self.targets:
             original = builder.final_record_base(self.library, target)
@@ -298,6 +300,35 @@ class OwnedEntryRecordPathTests(unittest.TestCase):
         """The new-driver paths and alias retain every original partition in order."""
         self.assertEqual(self.observe(), self.files)
         self.assertTrue(all(len(paths) == 8 for paths in self.files.values()))
+
+    def test_installed_copy_keeps_original_partitions_and_exact_library_identity(self):
+        """A real copied installation must reuse the original authenticated object records."""
+        installed = self.root / "installed" / "librccl.so.1"
+        installed.parent.mkdir()
+        installed.write_bytes(self.library.read_bytes())
+        self.assertNotEqual(installed.resolve(), self.library.resolve())
+        self.assertEqual(self.owner.owned_record_files(
+            self.records, installed, self.targets, self.producer), self.files)
+
+    def test_changed_original_or_installed_copy_is_rejected(self):
+        """Parent admission cannot hide replacement of either side before this audit."""
+        installed = self.root / "installed.so"
+        original_bytes = self.library.read_bytes()
+        for changed in (self.library, installed):
+            with self.subTest(changed=changed):
+                self.library.write_bytes(original_bytes)
+                installed.write_bytes(original_bytes)
+                changed.write_bytes(b"different library bytes")
+                with self.assertRaisesRegex(RuntimeError, "authenticated output"):
+                    self.owner.owned_record_files(self.records, installed, self.targets, self.producer)
+
+    def test_missing_or_foreign_parent_library_digest_is_rejected(self):
+        """Equal files alone cannot invent or replace the original producer's identity."""
+        for digest in (None, "", "not-a-digest", "0" * 64):
+            with self.subTest(digest=digest):
+                self.producer["library_sha256"] = digest
+                with self.assertRaisesRegex(RuntimeError, "authenticated output"):
+                    self.observe()
 
     def test_missing_current_partition_rejects_complete_legacy_decoys(self):
         """Old naming may not hide a lost current-target allocation record."""
