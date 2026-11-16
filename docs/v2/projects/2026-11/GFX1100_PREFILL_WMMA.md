@@ -12,6 +12,9 @@ Auto timing:1,264 native wins/1,890 cells (1.002–2.005×);626 keys keep Dot4.
 Release171 native cases, five focused ROCm registrations and all168 per-source
 profiles pass with zero memory spills. MTP router Auto now wins85/120 keys
 (geo1.104×), with seven focused registrations and80 spill-free profiles green.
+Shared-expert MTP Auto wins all177 native-active cells (geo1.437×), with all368
+profiles complete. QKV/KV Auto wins all1,415 native cells (geo1.320×); focused
+gates and64 profiles pass. Routed MTP and connected stages remain.
 rocBLAS remains the half-operand implementation: three custom WMMA variants lost
 every measured cell. [Investigation and deferral](GFX1100_HALF_OPERAND_PREFILL_INVESTIGATION.md).
 The earlier two-anchor NativeQuantised objective is documented separately in
@@ -134,13 +137,10 @@ zero scratch/spills/LDS conflicts. GPU busy 100%, memory busy 71.47%, L2 hit 95.
 AUTO power restored. [Qualification](GFX1100_ROUTER_LIVE_PREFILL.md) separates
 current Auto evidence from the prior 144-cell candidate tournament.
 
-Dense v6 plans now bind original include bytes to the compiled core table and
-Release producer. A loader replay reproduces and guards the repaired table
-interposition defect. Complete typed install/retain decisions preserve every
-unchanged row and generic absence; only per-alias profitable WMMA changes need
-new profiles. All-retain produces byte-identical policy and a no-change receipt.
-Six focused gates pass. All168 broader profile obligations now pass;68 additions
-compose the684-row table.15 host cases and12 installed-source replay groups pass.
+Dense plans bind policy bytes, compiled core and Release producer. Loader replay
+guards table interposition; additive installation preserves unchanged rows.
+All168 broader profiles pass;68 additions compose the684-row table. Six focused
+gates,15 host cases and12 installed-source replay groups pass.
 All84 rebuilt actual-Auto source cells now pass: every median beats original
 Auto by1.22653–2.05860×, geometric mean1.39951×, with authenticated684-row table
 and restored AUTO power (`dense-installed-auto-accepted/campaign.json`). Earlier
@@ -151,9 +151,11 @@ with zero spills; its Integration trace is not Release timing qualification.
 See `floating-half-authenticated-profile/derived/` for the loaded object/ISA.
 Grouped floating direct-WMMA witnesses change native input precision and the
 explicit-half reduction result. The existing three byte gates pass; retain their
-fixed-order producers. Grouped attention's all-lane LDS diagnostic now preserves
-NaN payloads through final output atS1/S2, with zero scratch. Production row
-metadata/capture/economy remain open; see the [MTP work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md).
+fixed-order producers. Grouped attention now passes production row/capture,
+special-value and append/RoPE replay, plus fixed-query64K scaling. Its current
+byte-exact WMMA candidate loses all90 measured comparisons; Automatic retains
+Dot2. Its economy disposition remains open; see the
+[MTP work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md).
 
 ## Remaining implementation constraints
 

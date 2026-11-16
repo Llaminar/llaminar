@@ -13,6 +13,9 @@
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include <cstdint>
 #include <optional>
+#include <array>
+
+namespace llaminar2 { enum class VerifierProjectionBundleKind : std::uint8_t; }
 
 inline constexpr int NATIVE_QUANTISED_SMALL_M_MAX_BATCH = 8;
 
@@ -71,6 +74,30 @@ private:
 };
 /** @brief Generated serial policy qualification, excluding diagnostic tuning overrides. */
 enum class NativeQuantisedVerifierPolicyMatch { Unmeasured, CanonicalSerial };
+/** @brief Serial arithmetic partitions and the independent measured launch wave target. */
+struct NativeQuantisedVerifierSerialPolicy {
+    int partitions; ///< Fixed serial-M1 reduction partition count.
+    int target_waves; ///< Generated resident-wave target, independent of partition count.
+    bool operator==(const NativeQuantisedVerifierSerialPolicy&) const = default;
+};
+/**
+ * @brief Qualify every member before a homogeneous or mixed subgroup borrows measured timing.
+ * @param count Nonempty bounded subgroup size.
+ * @param actual Effective policy used by the impending native launch.
+ * @param resolve Return each member's canonical policy, or nullopt for an unqualified source/slice.
+ * @return Whether every original member owns the effective arithmetic and wave policy.
+ */
+template<class ResolveMember>
+[[nodiscard]] constexpr bool matchesNativeQuantisedVerifierSerialPolicies(int count,
+    NativeQuantisedVerifierSerialPolicy actual, ResolveMember&& resolve) {
+    if(count<1 || count>NATIVE_QUANTISED_SMALL_M_MAX_BATCH || actual.partitions<1 || actual.target_waves<1)
+        return false;
+    for(int member=0;member<count;++member) {
+        const auto canonical=resolve(member);
+        if(!canonical || *canonical!=actual)return false;
+    }
+    return true;
+}
 /** @brief Actual producer arguments before physical scratch tiling or row slicing. */
 struct NativeQuantisedVerifierWork {
     DeviceRowRange rows; ///< Original count binding and complete physical geometry.
@@ -78,7 +105,54 @@ struct NativeQuantisedVerifierWork {
     int n, k, projections; ///< Actual producer dimensions and bundle population.
     uint8_t physical_codebook; ///< Actual decoder identity, distinct from source provenance.
     NativeQuantisedVerifierPolicyMatch policy; ///< Exact canonical M1 partition and launch policy.
+    const NativeQuantisedSmallMBatchedArgs *bundle = nullptr; ///< Original actual subgroup before scratch tiling.
+    const int8_t *activations = nullptr; ///< Quantization publication owned by the complete operation.
+    const float *activation_scales = nullptr; ///< Original block-scale bank.
+    const int32_t *activation_sums = nullptr; ///< Original exact block-sum bank.
 };
+/** @brief One original semantic member, independent of backend policy subgrouping. */
+struct NativeQuantisedVerifierBundleMember {
+    const uint8_t *weights = nullptr;
+    const uint16_t *scales = nullptr, *mins = nullptr;
+    const uint32_t *emins = nullptr;
+    float *output = nullptr;
+    int n = 0;
+    NativeQuantisedSourceIdentity source{};
+};
+/** @brief Fixed-size source and activation provenance for one complete stage operation. */
+struct NativeQuantisedVerifierBundleOperation {
+    VerifierProjectionBundleKind kind;
+    int device, k, count;
+    DeviceRowRange rows;
+    const int8_t *activations;
+    const float *activation_scales;
+    const int32_t *activation_sums;
+    std::array<NativeQuantisedVerifierBundleMember,3> members{};
+};
+/** @brief Copy original prepared provenance before subgrouping; never retain a host view on device. */
+class ScopedNativeQuantisedVerifierBundle final {
+public:
+    /** @param operation Authenticated complete stage or an explicit unmeasured boundary. */
+    explicit ScopedNativeQuantisedVerifierBundle(std::optional<NativeQuantisedVerifierBundleOperation> operation) noexcept;
+    /** @brief Restore the exact enclosing native operation in LIFO order. */
+    ~ScopedNativeQuantisedVerifierBundle();
+    ScopedNativeQuantisedVerifierBundle(const ScopedNativeQuantisedVerifierBundle&)=delete;
+    ScopedNativeQuantisedVerifierBundle& operator=(const ScopedNativeQuantisedVerifierBundle&)=delete;
+    /** @return Current immutable original bundle, or null for unmeasured work. */
+    [[nodiscard]] static const NativeQuantisedVerifierBundleOperation *current() noexcept;
+private:
+    std::optional<NativeQuantisedVerifierBundleOperation> operation_;
+    const ScopedNativeQuantisedVerifierBundle *previous_;
+    static thread_local const ScopedNativeQuantisedVerifierBundle *active_;
+};
+/** @brief Authenticate one-to-one subgroup membership and its original quantization publication.
+ * @param operation Complete original prepared binding. @param work Actual launch before tiling.
+ * @param device Exact launch participant. @return Whether this subgroup consumes only its admitted members. */
+[[nodiscard]] bool matchesNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOperation &operation,
+    const NativeQuantisedVerifierWork &work, int device) noexcept;
+/** @brief Resolve measured full-extent bundle keys without querying hardware or live rows.
+ * @param operation Complete source/shape/operation identity. @return Whether its original M has qualified native timing. */
+[[nodiscard]] bool measuredNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOperation &operation) noexcept;
 /** @brief First-class grouped implementations; Automatic retains qualified selection. */
 enum class NativeQuantisedVerifierCandidate { Automatic, Dot4, WmmaM16N64 };
 /** @brief Construction-only selection bound to one authenticated device. */

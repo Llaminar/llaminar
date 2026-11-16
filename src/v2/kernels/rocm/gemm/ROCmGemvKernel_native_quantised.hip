@@ -6735,14 +6735,21 @@ bool rocmLaunch_native_quantised_small_m_batched_fp32(
     }
     if (kb < 1) kb = 1;
 
+    bool canonical_members = generated_cfg.has_generated && api_kb_override <= 0 && api_waves_override <= 0 &&
+        rocm_env.native_quantised_gemv_kb <= 0 && rocm_env.native_quantised_gemv_target_waves <= 0;
+    canonical_members = canonical_members && llaminar2::rocm::matchesNativeQuantisedVerifierSerialPolicies(
+        num_projections, {kb,target_waves_per_cu}, [&](int member)
+            -> std::optional<llaminar2::rocm::NativeQuantisedVerifierSerialPolicy> {
+            const auto policy = resolveNativeQuantisedSerialM1RuntimeConfig(static_cast<uint8_t>(FMT), Ns[member], K);
+            if(!policy.has_generated || (g_native_quantised_serial_partition_n > 0 &&
+                g_native_quantised_serial_partition_n != Ns[member]))return std::nullopt;
+            return llaminar2::rocm::NativeQuantisedVerifierSerialPolicy{policy.kb,policy.target_waves_per_cu};
+        });
     const auto verifier_candidate = llaminar2::rocm::nativeQuantisedVerifierProducer(
         device_id, decode_equivalent, {rows, args.payload[0], Ns[0], K, num_projections, static_cast<uint8_t>(FMT),
-        generated_cfg.has_generated && api_kb_override <= 0 && api_waves_override <= 0 &&
-        rocm_env.native_quantised_gemv_kb <= 0 && rocm_env.native_quantised_gemv_target_waves <= 0 &&
-        kb == generated_cfg.kb && target_waves_per_cu == generated_cfg.target_waves_per_cu &&
-        (g_native_quantised_serial_partition_n <= 0 || g_native_quantised_serial_partition_n == Ns[0])
-            ? llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::CanonicalSerial
-            : llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::Unmeasured});
+        canonical_members ? llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::CanonicalSerial
+            : llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::Unmeasured,
+        &args, d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise});
     const bool wmma = verifier_candidate != llaminar2::rocm::NativeQuantisedVerifierCandidate::Dot4;
 
     if (kb > 1)
@@ -7076,11 +7083,24 @@ bool rocmLaunch_native_quantised_small_m_batched_mixed_fp32(
     }
     if (kb < 1) kb = 1;
 
+    // Equal K partitions alone do not authenticate a complete subgroup's
+    // performance policy: every member must also own the actual wave target.
+    bool canonical_members = llaminar2::rocm::ScopedNativeQuantisedVerifierBundle::current() &&
+        generated_cfg.has_generated && api_kb_override <= 0 && api_waves_override <= 0 &&
+        rocm_env.native_quantised_gemv_kb <= 0 && rocm_env.native_quantised_gemv_target_waves <= 0;
+    canonical_members = canonical_members && llaminar2::rocm::matchesNativeQuantisedVerifierSerialPolicies(
+        num_projections, {kb,target_waves_per_cu}, [&](int member)
+            -> std::optional<llaminar2::rocm::NativeQuantisedVerifierSerialPolicy> {
+            const auto policy = resolveNativeQuantisedSerialM1RuntimeConfig(codebook_ids[member], Ns[member], K);
+            if(!policy.has_generated || (g_native_quantised_serial_partition_n > 0 &&
+                g_native_quantised_serial_partition_n != Ns[member]))return std::nullopt;
+            return llaminar2::rocm::NativeQuantisedVerifierSerialPolicy{policy.kb,policy.target_waves_per_cu};
+        });
     const auto verifier_candidate = llaminar2::rocm::nativeQuantisedVerifierProducer(
         device_id, decode_equivalent, {rows, args.payload[0], Ns[0], K, num_projections, args.codebook[0],
-        false
-            ? llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::CanonicalSerial
-            : llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::Unmeasured});
+        canonical_members ? llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::CanonicalSerial
+            : llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::Unmeasured,
+        &args, d_A_int8, d_scale_A_blockwise, d_sum_A_blockwise});
     const bool wmma = verifier_candidate != llaminar2::rocm::NativeQuantisedVerifierCandidate::Dot4;
 
     if (kb > 1)

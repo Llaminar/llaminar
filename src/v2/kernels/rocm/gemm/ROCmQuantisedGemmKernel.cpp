@@ -41,6 +41,7 @@
 #include "ROCmQuantisedEpilogues.h"
 #include "ROCmQuantisedGemmKernel.h"
 #include "ROCmNativeQuantisedVerifierLaunch.h"
+#include "kernels/common/VerifierProjectionBundle.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -5491,6 +5492,53 @@ namespace llaminar2
                 return false;
             }
             auto decode_equivalent_dispatch = beginVerifierDecodeEquivalentScope();
+            std::optional<NativeQuantisedVerifierBundleOperation> bundle_operation;
+            const auto *original_bundle = ScopedVerifierProjectionBundle::current();
+            const auto *declared_rows = VerifierKernelModeScope::rowsFor(m);
+            const auto original_rows = declared_rows ? *declared_rows : DeviceRowRange::fullyActive(m);
+            if (original_bundle && m >= 2 && m <= 16 && workspace &&
+                original_bundle->matches(DeviceId::rocm(rocm_device_id_), input, original_rows, k, projections) &&
+                ScopedCapturedVerifierExtent::current().matches(DeviceId::rocm(rocm_device_id_), original_rows) &&
+                !currentProjectionRowWork(m))
+            {
+                NativeQuantisedVerifierBundleOperation candidate{
+                    .kind = original_bundle->kind(), .device = rocm_device_id_, .k = k,
+                    .count = static_cast<int>(projections.size()), .rows = original_rows,
+                    .activations = static_cast<const int8_t *>(workspace->getBuffer(GemmWorkspaceBuffers::QUANT_A)),
+                    .activation_scales = static_cast<const float *>(workspace->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE)),
+                    .activation_sums = static_cast<const int32_t *>(workspace->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))};
+                bool valid = candidate.activations && candidate.activation_scales && candidate.activation_sums &&
+                    candidate.count >= 2 && candidate.count <= static_cast<int>(candidate.members.size());
+                for (int index = 0; valid && index < candidate.count; ++index)
+                {
+                    const auto &projection = projections[index];
+                    auto *owner = dynamic_cast<ROCmQuantisedGemmKernel *>(projection.kernel);
+                    DeviceNativeQuantisedMatrixDesc descriptor;
+                    const auto &slice = projection.original_output_slice;
+                    // Inspection only: preparation/allocation belongs to the
+                    // original stage. Unknown/mixed policies retain Dot4.
+                    valid = owner && owner->rocm_device_id_ == rocm_device_id_ &&
+                        owner->inspectPreparedNativeQuantisedMatrixDesc(descriptor) &&
+                        projection.output && !projection.output->isMapped() && !projection.bias &&
+                        descriptor.n == projection.n && descriptor.k == k && descriptor.source_identity_present &&
+                        (!slice || (slice->firstColumn() == 0 && slice->physicalColumns() == slice->policyColumns()));
+                    if (valid)
+                    {
+                        candidate.members[index] = {
+                            .weights = descriptor.payload,
+                            .scales = static_cast<const uint16_t *>(descriptor.scales),
+                            .mins = static_cast<const uint16_t *>(descriptor.mins),
+                            .emins = static_cast<const uint32_t *>(descriptor.emins),
+                            .output = static_cast<float *>(projection.output->gpu_data_ptr()),
+                            .n = projection.n,
+                            .source = {descriptor.source_codebook_id, bool(descriptor.source_is_superblock), true}};
+                        valid = candidate.members[index].output != nullptr;
+                    }
+                }
+                if (valid) bundle_operation = candidate;
+            }
+            // Even an unmeasured nested API hides the enclosing native bundle.
+            const ScopedNativeQuantisedVerifierBundle original_native_bundle(bundle_operation);
             std::optional<NativeQuantisedVerifierOperation> operation;
             if (projections.size() == 1)
             {

@@ -104,8 +104,12 @@ Automatic GU/down producer and binds its loaded code object, source, physical
 capacity, native device and resources to the unprofiled timing record. The first
 mixed M16 Automatic GU pass reports 55 logical VGPRs, 56 allocated VGPRs,
 128 threads, 3,520 LDS bytes, zero private storage/spills and 100% GPUBusy.
-The all-source sweep covers 23 admitted cases, two roles and eight metrics;
-its progress record is authoritative until all 368 passes finish.
+The all-source sweep completes all368 passes:23 admitted cases, two roles and
+eight metrics. Independent review verifies every receipt/artifact hash, exact
+inventory, source/timing join, loaded object and device identity. Every pass
+retires successfully and restores ordinary `AUTO` power. Logical VGPR counts
+span52–69 and LDS3,392–4,160 bytes; private storage and memory spills are zero.
+All measured GPUBusy values are100%, with128–256 wavefronts and positive VALU work.
 
 Prior forced mixed-source diagnostics measured low occupancy (GU 1.584%, down
 2.630%) despite the complete operation's speedup. Those 18 diagnostics do not
@@ -119,11 +123,27 @@ Evidence root: `/tmp/llaminar-gfx1100-wmma-prefill-evidence`.
 - Four host registrations: `shared-verifier-auto-host-receipt-r2.json`.
 - Six backend feature registrations: `mtp-shared-verifier-automatic-feature-1794775018952372789/receipt.json`.
 - Automatic profiles: `mtp-shared-verifier-automatic-profile-batch-1794775093977237140/progress.json`.
+- Additive frozen continuation: `mtp-shared-verifier-automatic-frozen-profile-batch-1794777857388729098/progress.json`.
+- Complete independent artifact audit: `shared-verifier-profile-final-audit.json`,
+  SHA256 `f8a8684d49e581ccaba263c0cbf57d9d5e8cf3e6558c96b134dd72edf3f0fa82`.
 - Release build: `shared-verifier-auto-release-build-r2.log`.
 - Integration builds: `shared-verifier-auto-integration-build.log` and `shared-verifier-auto-feature-integration-build.log`.
 
 Release and Integration compile the full shipped ROCm gfx906/gfx1100 target set
 and CUDA sm86 with the spill guards enabled. Native runtime performance evidence
-belongs to gfx1100. Remaining checkpoint work is to finish the Automatic profiles,
-freeze their exact evidence and publish the feature changes. Routed MTP and the
-broader grouped-stage bundles remain separate open work.
+belongs to gfx1100. Implementation and focused qualification were committed and
+pushed as `3c7903a85`. The profiling producer is preserved in
+`mtp-shared-verifier-automatic-producer-snapshot/snapshot.json`, manifest SHA256
+`346296d17b89cd0ba01b0b84180a54f73f9d60c00c59c74c71e6cb8364ff712a`.
+The original dispatcher retired after its current collector drained. Its127
+completed exact-source counter records are retained by the additive continuation;
+new runs load the copied binary and core and authenticate identical timed bytes.
+The loader uses a directory containing only the frozen core, retaining the
+original GNU OpenMP dependency. No timing samples are recollected or relabeled.
+
+These profiles qualify the committed shared producer. Later routed diagnostic
+changes to common admission/kernel code require their own final qualification;
+the frozen sweep does not certify a changed binary. The additive record closes
+all368 shared-profile obligations:127 original records plus241 frozen-worker
+records. Routed MTP and the broader grouped-stage bundles remain separate open
+work, and changed common code still needs the affected feature replays.

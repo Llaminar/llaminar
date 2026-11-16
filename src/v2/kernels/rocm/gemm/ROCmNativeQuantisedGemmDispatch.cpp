@@ -14,6 +14,7 @@
 #include "ROCmNativeQuantisedWmmaLaunch.h"
 #include "ROCmNativeQuantisedVerifierLaunch.h"
 #include "kernels/common/ProjectionWorkLaunch.h"
+#include "kernels/common/VerifierProjectionBundle.h"
 #include "ROCmNativeQuantisedArchitecture.h"
 #include "../../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../../utils/PerfStatsCollector.h"
@@ -343,8 +344,89 @@ ScopedNativeQuantisedVerifierOperation::~ScopedNativeQuantisedVerifierOperation(
 std::optional<NativeQuantisedVerifierOperation> ScopedNativeQuantisedVerifierOperation::current() noexcept
 { return active_ ? active_->operation_ : std::nullopt; }
 
+thread_local const ScopedNativeQuantisedVerifierBundle *ScopedNativeQuantisedVerifierBundle::active_ = nullptr;
+ScopedNativeQuantisedVerifierBundle::ScopedNativeQuantisedVerifierBundle(
+    std::optional<NativeQuantisedVerifierBundleOperation> operation) noexcept
+    : operation_(operation), previous_(active_)
+{ active_ = this; }
+ScopedNativeQuantisedVerifierBundle::~ScopedNativeQuantisedVerifierBundle()
+{
+    if (active_ != this) std::terminate();
+    active_ = previous_;
+}
+const NativeQuantisedVerifierBundleOperation *ScopedNativeQuantisedVerifierBundle::current() noexcept
+{ return active_ && active_->operation_ ? &*active_->operation_ : nullptr; }
+
+bool matchesNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOperation &operation,
+    const NativeQuantisedVerifierWork &work, int device) noexcept
+{
+    const int expected = operation.kind == VerifierProjectionBundleKind::AttentionQKV ? 3 :
+        operation.kind == VerifierProjectionBundleKind::AttentionKV ? 2 : 0;
+    if (!expected || operation.count != expected || operation.device != device || operation.k != work.k ||
+        work.rows.physicalRows() < 2 || work.rows.physicalRows() > 16 ||
+        operation.rows.captureIdentity() != work.rows.captureIdentity() ||
+        work.policy != NativeQuantisedVerifierPolicyMatch::CanonicalSerial || !work.bundle ||
+        !operation.activations || !operation.activation_scales || !operation.activation_sums ||
+        operation.activations != work.activations || operation.activation_scales != work.activation_scales ||
+        operation.activation_sums != work.activation_sums || work.projections < 1 || work.projections > expected)
+        return false;
+    const auto &packet = *work.bundle;
+    if (packet.num_projections != work.projections || packet.rows.captureIdentity() != work.rows.captureIdentity() ||
+        packet.work.captureIdentity() != ProjectionRowWork::fromPrefix(work.rows).captureIdentity() ||
+        packet.payload[0] != work.weights || packet.N[0] != work.n || packet.codebook[0] != work.physical_codebook)
+        return false;
+    for (int member = 0; member < expected; ++member)
+    {
+        const auto &original = operation.members[member];
+        if (!original.weights || !original.scales || !original.output || original.n <= 0 ||
+            !original.source.present || canonicalDeviceVnniCodebookId(original.source) == 255)
+            return false;
+        for (int earlier = 0; earlier < member; ++earlier)
+            if (operation.members[earlier].output == original.output) return false;
+    }
+    unsigned seen = 0;
+    int previous_member = -1;
+    for (int projection = 0; projection < work.projections; ++projection)
+    {
+        if (packet.bias[projection]) return false;
+        int match = -1;
+        for (int member = 0; member < expected; ++member)
+        {
+            const auto &original = operation.members[member];
+            if (packet.output[projection] == original.output && packet.payload[projection] == original.weights &&
+                packet.N[projection] == original.n && packet.scales[projection] == original.scales &&
+                packet.mins[projection] == original.mins && packet.emins[projection] == original.emins &&
+                packet.codebook[projection] == canonicalDeviceVnniCodebookId(original.source))
+                match = member;
+        }
+        if (match <= previous_member || (seen & (1u << match))) return false;
+        seen |= 1u << match;
+        previous_member = match;
+    }
+    return true;
+}
+
 namespace
 {
+/** @brief Source-specific full-extent masks for complete original QKV/KV operations. */
+struct VerifierBundleMeasuredWidths
+{
+    NativeQuantisedSourceIdentity source;
+    std::array<uint16_t,7> rows;
+};
+#include "ROCmNativeQuantisedVerifierBundlePolicy.inc"
+static_assert([] {
+    for (size_t i = 0; i < kVerifierBundleMeasuredWidths.size(); ++i)
+    {
+        const auto &entry = kVerifierBundleMeasuredWidths[i];
+        if (!entry.source.present || canonicalDeviceVnniCodebookId(entry.source) == 255) return false;
+        for (auto mask : entry.rows) if (mask & 0x8000u) return false;
+        for (size_t j = 0; j < i; ++j)
+            if (entry.source == kVerifierBundleMeasuredWidths[j].source) return false;
+    }
+    return true;
+}(), "Complete verifier bundle masks require unique source identities and widths M2..16");
+
 /** @brief Measured widths retain complete source identity and separate public operations.
  * Bit M-2 admits one exact physical width, only within M2..16. Shape columns
  * are N/K17408/5120,5120/17408,10240/5120. Zero and nonmonotone masks are valid;
@@ -410,6 +492,38 @@ bool measuredVerifierWmmaKey(const NativeQuantisedVerifierOperation &operation,i
 }
 }
 
+bool measuredNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOperation &operation) noexcept
+{
+    const int m = operation.rows.physicalRows();
+    const bool qkv = operation.kind == VerifierProjectionBundleKind::AttentionQKV;
+    if (m < 2 || m > 16 ||
+        (qkv ? operation.count != 3 :
+            operation.kind != VerifierProjectionBundleKind::AttentionKV || operation.count != 2))
+        return false;
+    const auto &source = operation.members[0].source;
+    for (int member = 0; member < operation.count; ++member)
+        if (operation.members[member].source != source) return false;
+    const auto n = [&](int member) { return operation.members[member].n; };
+    int shape = -1;
+    if (qkv)
+    {
+        if (operation.k == 5120 && n(0) == 12288 && n(1) == 1024 && n(2) == 1024) shape = 0;
+        if (operation.k == 5120 && n(0) == 6144 && n(1) == 512 && n(2) == 512) shape = 2;
+        if (operation.k == 2048 && n(0) == 8192 && n(1) == 512 && n(2) == 512) shape = 4;
+        if (operation.k == 2048 && n(0) == 2048 && n(1) == 512 && n(2) == 512) shape = 6;
+    }
+    else
+    {
+        if (operation.k == 5120 && n(0) == 1024 && n(1) == 1024) shape = 1;
+        if (operation.k == 5120 && n(0) == 512 && n(1) == 512) shape = 3;
+        if (operation.k == 2048 && n(0) == 512 && n(1) == 512) shape = 5;
+    }
+    if (shape < 0) return false;
+    for (const auto &entry : kVerifierBundleMeasuredWidths)
+        if (entry.source == source) return (entry.rows[shape] & (uint16_t{1} << (m-2))) != 0;
+    return false;
+}
+
 NativeQuantisedVerifierCandidate nativeQuantisedVerifierProducer(
     int device, bool decode_equivalent, const NativeQuantisedVerifierWork &work)
 {
@@ -424,6 +538,17 @@ NativeQuantisedVerifierCandidate nativeQuantisedVerifierProducer(
             return verifier_selection->candidate;
         }
     }
+    if (const auto *bundle = ScopedNativeQuantisedVerifierBundle::current())
+    {
+        const bool qualified = decode_equivalent && !currentProjectionRowWork(work.rows.physicalRows()) &&
+            ScopedCapturedVerifierExtent::current().matches(DeviceId::rocm(device), work.rows) &&
+            matchesNativeQuantisedVerifierBundle(*bundle,work,device) && measuredNativeQuantisedVerifierBundle(*bundle) &&
+            nativeQuantisedHardwareForDevice(device).architecture == native_quantised::NativeQuantisedArchitecture::rocm(11,0,0);
+        return qualified ? NativeQuantisedVerifierCandidate::WmmaM16N64 : NativeQuantisedVerifierCandidate::Dot4;
+    }
+    // An unmeasured original bundle cannot gain scalar eligibility by splitting
+    // into a same-shaped singleton subgroup or by failing provenance admission.
+    if (ScopedVerifierProjectionBundle::current()) return NativeQuantisedVerifierCandidate::Dot4;
     const auto operation = ScopedNativeQuantisedVerifierOperation::current();
     const int m = work.rows.physicalRows();
     if (!decode_equivalent || !operation || m < 2 || m > 16 || work.projections != 1 ||

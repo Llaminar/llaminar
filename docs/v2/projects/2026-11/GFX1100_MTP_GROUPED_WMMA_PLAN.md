@@ -16,18 +16,19 @@ layout improves native latency in83/90 cells over the eight-query candidate
 therefore remains Dot2. Fixed-query32K→64K scaling passes. Both shipped targets
 compile without spills; the native producer uses49 VGPRs and27,152 LDS bytes.
 All29 affected feature GTests and eight exact producer profiles pass, including
-explicit finite/special TPB192 multi-tile replay. Grouped-attention economy remains open; the next implementation
-slice qualifies actual routed/shared MTP transactions. See the
+explicit finite/special TPB192 multi-tile replay. Grouped-attention economy remains open.
+QKV Automatic qualifies measured complete bundles; routed MTP remains open. See the
 [attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Broader bundles and
-routed/shared operations remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
+routed operations remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
 not claim model-level MTP speedups or full production certification.
 Shared-verifier Automatic now admits all21 same-source M16 tuples and mixed
 IQ2_S/IQ4_XS M9/M16. All28 replay cases pass453 source/capacity/live keys.
 All177 native-active Automatic cells win all31 pairs by1.23091–1.88403×;
 sparse admitted cells have geometric gain1.03576× and worst latency loss1.16%.
-Four focused host and six CUDA/ROCm feature registrations pass. The368-pass
-source/role/counter profile sweep is running; freeze and feature publication
-follow it. See the [shared transaction proof](GFX1100_MTP_SHARED_VERIFIER.md).
+Four focused host and six CUDA/ROCm feature registrations pass. All368
+source/role/counter profile passes are complete and independently audited;
+the frozen producer retains zero private storage and memory spills.
+See the [shared transaction proof](GFX1100_MTP_SHARED_VERIFIER.md).
 This implementation plan extends the [prefill campaign](GFX1100_PREFILL_WMMA.md)
 and the [MTP project plan](../2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md).
 It records the implementation frontier and remaining qualification, not a
@@ -590,6 +591,39 @@ and final-gate semantics. No MoE selection change is installed by this audit.
 
 ## Remaining bundle inventory
 
+The actual QKV panel now lives in `Test__ROCmQKVVerifierTransaction.cpp`.
+`makeGpuPreparedQKVFixture` retains three independently seeded weights in one
+prepared store per candidate. A third independent store/kernel/workspace owner
+runs actual M1 `FusedQKVGEMMStage` calls as the oracle. Grouped owners bind
+`force_decode_equivalent_verifier_prefill` and the original `verifier_row_range`.
+Preparation and input coherence complete before capture; the retained fragment
+records the actual stage under its graph dependency ledger. The Release native
+Q4_0 local-MoE smoke passes both QKV/KV-only, every physicalM2–16 and live prefix,
+dirty/reset replay, quantizer/native omissions and exact captured arguments.
+All85 Release cases and all five registered Integration replays now pass,
+covering the21-format/four-geometry inventory and mixed-source/bias control.
+Initial Q4_0/IQ4_XS timing passes1,200 physical/live cells. Full dense QKV wins
+all31 pairs fromM9 and KV-only fromM5; M16 gains are1.389–1.448× and2.083–2.251×,
+respectively. The local-MoE crossover differs by source. All-source/four-geometry
+full-extent timing now passes84 cases/2,520 cells/78,120 pairs. The proposed
+Automatic policy retains1,217 of2,205 distinct source/operation/width keys
+with a5% qualification margin across the candidate and two actual-Automatic panels.
+Final actual-Automatic timing passes2,520 cells: all1,415 native-selected cells
+win at the median (geometric mean1.32030×),1,105 retain Dot4. All five Automatic
+Integration registrations/86 cases, ten affected registrations and all64 exact
+geometry profiles pass.
+See the [QKV component proof](GFX1100_MTP_QKV_VERIFIER.md).
+
+The source audit distinguishes local projection widths from original-output
+slicing. `Qwen35Graph.cpp` attaches original K/V slices for QueryInterval
+coverage, and that mode explicitly rejects retained MTP graph capacity. Ordinary
+local QKV/KV arithmetic uses its local width/serial partition authority; the new
+component shapes preserve that behavior. Original-output-slice bytes remain
+covered by their separate component fixture. They do not establish MTP economy
+or admit QueryInterval for MTP. The stage has no request-hole declaration;
+lower-level hole coverage is not actual-stage evidence. Forced candidate evidence remains separate from the final actual-Automatic
+panel. Unmeasured complete bundles retain the ordered implementation.
+
 The remaining dense work is complete bundle qualification, not another
 all-format leaf implementation. Derive geometry/provenance from
 `qwen_release_geometry.py::model_projection_geometries` and `QwenProjectionUse`,
@@ -600,11 +634,11 @@ deduplication alone cannot distinguish QKV, GDN and selected LM-head work.
 
 | Bundle | Existing owner to extend | Missing evidence |
 |---|---|---|
-| Attention QKV or K/V-only | `FusedQKVGEMMStage` and native heterogeneous three-output replay | Actual unequal-width stage bundle and original slices |
+| Attention QKV or K/V-only | Actual unequal-width `FusedQKVGEMMStage` with independent prepared owners | Actual-Automatic confirmation, focused gates and64 geometry profiles pass; QueryInterval slicing excludes retained MTP |
 | Attention output | `GEMMStage` verifier path and Wo serial-byte tests | Source-owned output geometry and TP partition |
 | Gate/up through SwiGLU/down | `FusedGateUpGEMMStage` and public SwiGLU/down adapters | Connected captured operation with shared quantization and epilogues |
 | GDN projections | `GDNProjectionCaptureHarness` | Complete four-source stage timing, retaining floating controls |
-| Shared expert FFN | Actual shared-stage owner above | Gate/up/down, final shared gate/add and verifier-router Q8 handoff |
+| Shared expert FFN | Actual shared-stage owner above | Qualified through gate/add and verifier-router Q8 handoff;368 profiles complete; residual sparse overhead remains visible |
 | Selected LM-head | `HiddenStateRowsSelectStage` through `LMHeadStage` | Selection-plus-head boundary and original vocabulary/row ownership |
 
 Use the existing registered Qwen dense/GDN and MoE/shared profiles, including

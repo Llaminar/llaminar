@@ -1656,6 +1656,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/MoEProjectionPipeline.cpp
     execution/compute_stages/stages/MoERoutingPipeline.cpp
     kernels/common/CapturedVerifierExtent.cpp
+    kernels/common/VerifierProjectionBundle.cpp
     kernels/common/ColumnShardAssemblyKernels.cpp
     kernels/common/SharedExpertColumnGateKernels.cpp
     execution/compute_stages/stages/QGateSplitStage.cpp

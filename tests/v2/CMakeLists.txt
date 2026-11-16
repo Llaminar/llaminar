@@ -6810,6 +6810,25 @@ add_v2_test(V2_Integration_BenchmarkGeometrySelection
     LABELS "V2;Integration;ProductionTestPreflight;Benchmark;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
+add_executable(v2_test_verifier_projection_bundle
+    unit/kernels/Test__VerifierProjectionBundle.cpp)
+target_link_libraries(v2_test_verifier_projection_bundle
+    llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_VerifierProjectionBundle
+    COMMAND $<TARGET_FILE:v2_test_verifier_projection_bundle>
+    LABELS "V2;Unit;DeviceFree;MTP;QKV;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+if(HAVE_ROCM)
+    add_executable(v2_test_rocm_verifier_bundle_policy
+        unit/kernels/rocm/Test__ROCmVerifierBundlePolicy.cpp)
+    target_link_libraries(v2_test_rocm_verifier_bundle_policy
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Unit_ROCmVerifierBundlePolicy
+        COMMAND $<TARGET_FILE:v2_test_rocm_verifier_bundle_policy>
+        LABELS "V2;Unit;DeviceFree;MTP;QKV;Regression;Replay"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+endif()
+
 add_executable(v2_test_rocm_router_q8_policy
     unit/kernels/rocm/Test__ROCmRouterQ8Policy.cpp
     ${CMAKE_SOURCE_DIR}/kernels/common/CapturedVerifierExtent.cpp)
@@ -20899,6 +20918,35 @@ if(HAVE_ROCM)
         MPI_PROCS 1
         NO_MODELS
     )
+    # Actual fused stages own independent prepared bundles and persistent
+    # workspaces; local TP shapes qualify component arithmetic and ownership.
+    add_executable(v2_integration_rocm_qkv_verifier_transaction
+        integration/kernels/rocm/Test__ROCmQKVVerifierTransaction.cpp)
+    target_link_libraries(v2_integration_rocm_qkv_verifier_transaction
+        llaminar2_core GTest::gtest GTest::gtest_main rocprofiler-sdk-roctx::rocprofiler-sdk-roctx)
+    foreach(qkv_geometry DenseFull DenseLocalTP2 MoEFull MoELocalTP4)
+        add_v2_test(V2_Integration_ROCmQKVVerifier${qkv_geometry}Replay
+            COMMAND $<TARGET_FILE:v2_integration_rocm_qkv_verifier_transaction>
+                --gtest_filter=AllSources/ROCmQKVVerifierTransaction.${qkv_geometry}Replay/*
+            LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;QKV;AllFormats;GraphCapture;ByteExact;Replay;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 180)
+        add_v2_test(V2_Integration_ROCmQKVVerifier${qkv_geometry}AutomaticReplay
+            COMMAND $<TARGET_FILE:v2_integration_rocm_qkv_verifier_transaction>
+                --gtest_filter=AllSources/ROCmQKVVerifierTransaction.${qkv_geometry}AutomaticReplay/*
+            LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;QKV;AllFormats;GraphCapture;ByteExact;Replay;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 180)
+    endforeach()
+    add_v2_test(V2_Integration_ROCmQKVVerifierAutomaticExclusionsReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_qkv_verifier_transaction>
+            --gtest_filter=ROCmQKVVerifierTransactionAutomatic.*
+        LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;QKV;GraphCapture;ByteExact;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+    add_v2_test(V2_Integration_ROCmQKVVerifierMixedBiasReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_qkv_verifier_transaction>
+            --gtest_filter=ROCmQKVVerifierTransactionMixed.ActualStageBiasReplay
+        LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;QKV;GraphCapture;ByteExact;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+
     add_executable(v2_integration_rocm_device_counted_verifier_rows
         integration/kernels/rocm/Test__ROCmDeviceCountedVerifierRows.cpp)
     target_link_libraries(v2_integration_rocm_device_counted_verifier_rows
@@ -20962,6 +21010,7 @@ if(HAVE_ROCM)
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;GEMM;Attention;MTP;GroupedVerifierRows;DecodeEquivalent;IQ3_S;NativeQuantised;Regression"
         MPI_PROCS 1
+        NO_MODELS
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_GDNProjection
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
@@ -20969,6 +21018,7 @@ if(HAVE_ROCM)
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;GEMM;GDN;MTP;GroupedVerifierRows;DecodeEquivalent;IQ4_XS;NativeQuantised;Regression"
         MPI_PROCS 1
+        NO_MODELS
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_Qwen35GDNOutputProjection
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
@@ -20985,6 +21035,7 @@ if(HAVE_ROCM)
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;GEMM;MTP;GroupedVerifierRows;DecodeEquivalent;LocalTP;Wo;ReplicatedWo;AllFormats;Regression"
         MPI_PROCS 1
+        NO_MODELS
     )
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_FloatingFormats
         COMMAND $<TARGET_FILE:v2_integration_rocm_quantised_gemm_small_m>
@@ -21050,6 +21101,7 @@ if(HAVE_ROCM)
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;GEMM;MTP;SerialDecode;RouteProof;PerfStats;NativeQuantised;Regression"
         MPI_PROCS 1
+        NO_MODELS
     )
     message(STATUS "V2 Tests: Added native-quantised GEMV integration tests (16 formats)")
 
@@ -38855,6 +38907,19 @@ if(NOT V2_PERF_TESTS_ONLY)
         V2_Integration_MPILocalTransportExplicitNone)
 endif()
 
+add_v2_test(V2_Integration_VerifierProjectionBundleReplay
+    COMMAND $<TARGET_FILE:v2_test_verifier_projection_bundle>
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;QKV;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_VerifierProjectionBundleReplay)
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_ROCmVerifierBundlePolicyReplay
+        COMMAND $<TARGET_FILE:v2_test_rocm_verifier_bundle_policy>
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;QKV;Regression;Replay"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierBundlePolicyReplay)
+endif()
+
 # New native-Q8 evidence controls run in the existing exact evidence owner.
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_ROCmAdaptiveQKPolicyReplay
@@ -38865,6 +38930,16 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity)
 if(HAVE_ROCM)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_ROCmQKVVerifierDenseFullReplay
+        V2_Integration_ROCmQKVVerifierDenseLocalTP2Replay
+        V2_Integration_ROCmQKVVerifierMoEFullReplay
+        V2_Integration_ROCmQKVVerifierMoELocalTP4Replay
+        V2_Integration_ROCmQKVVerifierMixedBiasReplay
+        V2_Integration_ROCmQKVVerifierDenseFullAutomaticReplay
+        V2_Integration_ROCmQKVVerifierDenseLocalTP2AutomaticReplay
+        V2_Integration_ROCmQKVVerifierMoEFullAutomaticReplay
+        V2_Integration_ROCmQKVVerifierMoELocalTP4AutomaticReplay
+        V2_Integration_ROCmQKVVerifierAutomaticExclusionsReplay
         V2_Integration_ROCmSharedVerifierTransactionReplay
         V2_Integration_ROCmSharedVerifierPolicyReplay
         V2_Integration_ROCmVerifierAttentionWmmaReplay
