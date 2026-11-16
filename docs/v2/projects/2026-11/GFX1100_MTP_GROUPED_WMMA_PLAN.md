@@ -19,7 +19,7 @@ All29 affected feature GTests and eight exact producer profiles pass, including
 explicit finite/special TPB192 multi-tile replay. The bounded grouped-attention
 experiment is closed with Dot2: native loses all2,790 paired samples. Full-curve
 fixed-query fits through64K have R²≥0.999892 for Dot2 and≥0.999771 for WMMA.
-QKV, GDN and connected dense FFN Automatic qualify measured complete operations; routed MTP remains open. See the
+QKV, GDN, connected dense FFN and Wo Automatic qualify measured complete operations; routed MTP and selected LM-head remain open. See the
 [attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Broader bundles and
 routed operations remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
 not claim model-level MTP speedups or full production certification.
@@ -640,7 +640,7 @@ deduplication alone cannot distinguish QKV, GDN and selected LM-head work.
 | Bundle | Existing owner to extend | Missing evidence |
 |---|---|---|
 | Attention QKV or K/V-only | Actual unequal-width `FusedQKVGEMMStage` with independent prepared owners | Actual-Automatic confirmation, focused gates and64 geometry profiles pass; QueryInterval slicing excludes retained MTP |
-| Attention output | Actual `GEMMStage` Wo owner with independent prepared controls | All126 Release/Integration cases and1890 timing cells pass;761 seed keys span all21 sources. Actual-Automatic qualification remains open; TP-sized cases qualify local extents, not source-slice loading. [Proof](GFX1100_MTP_WO_VERIFIER.md) |
+| Attention output | Actual `GEMMStage` Wo owner with independent prepared controls | Automatic746 keys across all21 sources win both1890-cell panels (confirmation geo1.237135×);129 gates/137 cases and16 profiles pass. TP-sized cases qualify local extents, not source-slice loading. [Proof](GFX1100_MTP_WO_VERIFIER.md) |
 | Gate/up through SwiGLU/down | Actual connected `FusedGateUpGEMMStage` → fused-SwiGLU `GEMMStage` with five independent owners | Automatic admits136 incremental GU keys across all21 formats; both315-cell panels retain every selected median win (confirmation geo1.112072×); six host/26 GPU gates and16 profiles pass |
 | GDN projections | Actual four-source `GDNProjectionStage` with independent prepared owners | Automatic161 keys win in both630-cell panels;16 profiles, six host gates/32 cases, eight GPU gates/128 cases and CUDA/ROCm capture/12 cases pass |
 | Shared expert FFN | Actual shared-stage owner above | Qualified through gate/add and verifier-router Q8 handoff;368 profiles complete; residual sparse overhead remains visible |
@@ -681,8 +681,7 @@ scalar SwiGLU selection remains unchanged. Actual-Automatic qualification now
 compares the complete chain against prior Dot4 GU plus Automatic down: all136
 selected keys win both315-cell panels. Six host gates/39 cases,26 affected GPU
 gates/86 cases and16 exact GU/down profiles pass. See the linked proof for
-immutable seed provenance and final qualification; Wo and selected LM-head
-remain open.
+immutable seed provenance and final qualification; selected LM-head remains open.
 
 ## Verifier router economy and attention arithmetic
 

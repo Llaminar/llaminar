@@ -16,7 +16,9 @@ Shared-expert MTP Auto wins all177 native-active cells (geo1.437×), with all368
 profiles complete. QKV/KV Auto wins all1,415 native cells (geo1.320×); focused
 gates and64 profiles pass. GDN Auto qualifies161 keys with16 profiles; connected
 FFN Auto qualifies136 GU keys (confirmation geo1.112×), with six host/26
-GPU gates and16 profiles. Routed MTP, Wo and selected LM-head remain.
+GPU gates and16 profiles. Wo Auto qualifies746 keys across21 formats
+(confirmation geo1.237×), with129 gates/137 cases and16 profiles.
+Routed MTP and selected LM-head remain.
 rocBLAS remains the half-operand implementation: three custom WMMA variants lost
 every measured cell. [Investigation and deferral](GFX1100_HALF_OPERAND_PREFILL_INVESTIGATION.md).
 The earlier two-anchor NativeQuantised objective is documented separately in

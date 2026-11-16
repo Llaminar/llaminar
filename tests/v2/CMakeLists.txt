@@ -20953,19 +20953,24 @@ if(HAVE_ROCM)
     add_executable(v2_integration_rocm_wo_verifier_transaction
         integration/kernels/rocm/Test__ROCmWoVerifierTransaction.cpp)
     target_link_libraries(v2_integration_rocm_wo_verifier_transaction
-        llaminar2_core GTest::gtest GTest::gtest_main)
+        llaminar2_core GTest::gtest GTest::gtest_main rocprofiler-sdk-roctx::rocprofiler-sdk-roctx)
     foreach(wo_geometry IN ITEMS Dense DenseTP2 DenseTP4 MoE MoETP2 MoETP4)
         foreach(wo_source IN ITEMS Q4_0 IQ4_NL IQ4_XS Q4_1 Q4_K Q5_0 Q5_1 Q5_K
                 Q6_K Q3_K Q2_K IQ3_S IQ3_XXS IQ2_S IQ2_XS IQ2_XXS IQ1_S IQ1_M Q8_0 Q8_1 Q8_K)
             add_v2_test(V2_Integration_ROCmWoVerifierReplay_${wo_geometry}_${wo_source}
                 COMMAND $<TARGET_FILE:v2_integration_rocm_wo_verifier_transaction>
-                    --gtest_filter=AllSources/ROCmWoVerifierTransaction.Replay/${wo_geometry}_${wo_source}
-                LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;Attention;AllFormats;GraphCapture;ByteExact;Replay;Regression"
+                    --gtest_filter=AllSources/ROCmWoVerifierTransaction.AutomaticReplay/${wo_geometry}_${wo_source}
+                LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;Devices1;NativeISA-gfx1100;GEMM;MTP;Attention;AllFormats;GraphCapture;ByteExact;Replay;Regression"
                 MPI_PROCS 1 NO_MODELS TIMEOUT 60)
             list(APPEND _rocm_wo_verifier_preflight_tests V2_Integration_ROCmWoVerifierReplay_${wo_geometry}_${wo_source})
         endforeach()
     endforeach()
 
+    add_v2_test(V2_Integration_ROCmWoVerifierGuardedReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_wo_verifier_transaction>
+            --gtest_filter=AllSources/ROCmWoVerifierTransaction.GuardedReplay/*_Q4_0
+        LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;Devices1;NativeISA-gfx1100;GEMM;MTP;Attention;GraphCapture;ByteExact;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     # The connected dense FFN retains GU publication through fused SwiGLU/down.
     add_executable(v2_integration_rocm_ffn_verifier_transaction
         integration/kernels/rocm/Test__ROCmFFNVerifierTransaction.cpp)
@@ -21028,6 +21033,12 @@ if(HAVE_ROCM)
         integration/kernels/rocm/Test__ROCmDeviceCountedVerifierRows.cpp)
     target_link_libraries(v2_integration_rocm_device_counted_verifier_rows
         llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_ROCmWoVerifierPolicyReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_device_counted_verifier_rows>
+            --gtest_filter=ROCmVerifierWmmaDispatch.WoMeasuredProjectionKeysAndExclusions
+        LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;Devices1;NativeISA-gfx1100;GEMM;MTP;Attention;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
     add_v2_test(V2_Integration_ROCm_DeviceCountedVerifierRows
         COMMAND $<TARGET_FILE:v2_integration_rocm_device_counted_verifier_rows>
                 --gtest_filter=*ROCmDeviceCountedVerifierRows.*
@@ -39047,6 +39058,8 @@ if(HAVE_ROCM)
         V2_Integration_ROCmQKVVerifierMoELocalTP4AutomaticReplay
         V2_Integration_ROCmQKVVerifierAutomaticExclusionsReplay
         ${_rocm_wo_verifier_preflight_tests}
+        V2_Integration_ROCmWoVerifierGuardedReplay
+        V2_Integration_ROCmWoVerifierPolicyReplay
         ${_rocm_ffn_verifier_preflight_tests}
         V2_Integration_ROCmFFNVerifierMixedReplay
         V2_Integration_ROCmFFNVerifierGuardedReplay

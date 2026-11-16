@@ -27,6 +27,7 @@
 #include <cstdio>
 #include <exception>
 #include <stdexcept>
+#include <utility>
 
 #include <hip/hip_runtime_api.h>
 
@@ -501,6 +502,45 @@ static_assert([] {
     return true;
 }(),"GU masks require distinct original sources and widths M2..16");
 
+/** @brief Standalone projection masks for six measured full and TP-sized Wo extents. */
+struct VerifierWoMeasuredWidths
+{
+    NativeQuantisedSourceIdentity source;
+    std::array<uint16_t,6> projection_rows;
+};
+#include "ROCmNativeQuantisedVerifierWoPolicy.inc"
+static_assert([] {
+    for(size_t i=0;i<kVerifierWoShapes.size();++i) {
+        const auto [n,k]=kVerifierWoShapes[i];
+        if(n<=0 || n%64 || k<=0 || k%512)return false;
+        for(size_t previous=0;previous<i;++previous)if(kVerifierWoShapes[previous]==kVerifierWoShapes[i])return false;
+    }
+    for(size_t i=0;i<kVerifierWoMeasuredWidths.size();++i) {
+        const auto &entry=kVerifierWoMeasuredWidths[i];
+        if(!entry.source.present || canonicalDeviceVnniCodebookId(entry.source)==255)return false;
+        for(auto mask:entry.projection_rows)if(mask&0x8000u)return false;
+        for(size_t previous=0;previous<i;++previous)
+            if(entry.source==kVerifierWoMeasuredWidths[previous].source)return false;
+    }
+    return true;
+}(),"Wo masks require distinct original sources/geometries and widths M2..16");
+
+/** @brief Consult only the ordinary projection qualification at its original extent.
+ * @param operation Authenticated public operation; other arithmetic kinds cannot borrow it.
+ * @param m Exact physical request width already validated against the captured row owner.
+ * @return Whether this source, geometry and width have complete Wo timing evidence. */
+bool measuredVerifierWoKey(const NativeQuantisedVerifierOperation &operation,int m) noexcept
+{
+    if(operation.kind!=NativeQuantisedVerifierOperationKind::Projection || m<2 || m>16)return false;
+    for(size_t shape=0;shape<kVerifierWoShapes.size();++shape)
+        if(kVerifierWoShapes[shape]==std::pair{operation.n,operation.k}) {
+            for(const auto &entry:kVerifierWoMeasuredWidths)
+                if(entry.source==operation.source)return (entry.projection_rows[shape]&(uint16_t{1}<<(m-2)))!=0;
+            return false;
+        }
+    return false;
+}
+
 /** @brief Measured widths retain complete source identity and separate public operations.
  * Bit M-2 admits one exact physical width, only within M2..16. Shape columns
  * are N/K17408/5120,5120/17408,10240/5120. Zero and nonmonotone masks are valid;
@@ -556,7 +596,7 @@ bool measuredVerifierWmmaKey(const NativeQuantisedVerifierOperation &operation,i
     const int shape=operation.n==17408 && operation.k==5120 ? 0 :
         operation.n==5120 && operation.k==17408 ? 1 :
         operation.n==10240 && operation.k==5120 ? 2 : -1;
-    if(shape<0)return false;
+    if(shape<0)return measuredVerifierWoKey(operation,m);
     for(const auto &row:kVerifierMeasuredWidths)if(row.source==operation.source) {
         const auto *masks=operation.kind==NativeQuantisedVerifierOperationKind::Projection ? &row.projection_rows :
             operation.kind==NativeQuantisedVerifierOperationKind::SwiGLUDown ? &row.swiglu_rows : nullptr;

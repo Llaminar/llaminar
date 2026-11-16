@@ -12,6 +12,7 @@
  */
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
+#include <rocprofiler-sdk-roctx/roctx.h>
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/rocm/HIPGraphCapture.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
@@ -26,6 +27,7 @@
 #include "transfer/TransferEngine.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
+#include "../../../utils/ROCmWoVerifierExpectations.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -41,6 +43,36 @@ using namespace llaminar2;
 using namespace llaminar2::rocm;
 using namespace llaminar2::test;
 namespace {
+/** @brief Collect one retained native transaction outside setup and observations. */
+class ProfileWindow final {
+    bool active_=false;
+public:
+    /** @brief Resume only after the caller has drained setup and poisoned outputs. */
+    ProfileWindow() {
+        if(roctxRangePushA("ROCmWoVerifierTransaction")<0)throw std::runtime_error("Wo profiler range failed");
+        if(roctxProfilerResume(0)!=0) {(void)roctxRangePop();throw std::runtime_error("Wo profiler resume failed");}
+        active_=true;
+    }
+    /** @brief Pause before output observation; cleanup remains unconditional on exceptions. */
+    void finish() {
+        if(!active_)return;
+        const int paused=roctxProfilerPause(0),popped=roctxRangePop();active_=false;
+        if(paused!=0 || popped<0)throw std::runtime_error("Wo profiler pause failed");
+    }
+    /** @brief Never let a failed replay leave profiling active for another kernel. */
+    ~ProfileWindow() {
+        if(active_) {
+            const int paused=roctxProfilerPause(0),popped=roctxRangePop();
+            if(paused!=0 || popped<0)std::terminate();
+        }
+    }
+    ProfileWindow(const ProfileWindow&)=delete;
+    ProfileWindow &operator=(const ProfileWindow&)=delete;
+};
+/** @brief Replay, paired events or one separately profiled actual-Automatic transaction. */
+enum class Observation {Replay,Paired,Profile};
+/** @brief Original hosted extent or an explicitly unqualified retained capacity. */
+enum class Extent {ExactHosted,Guarded};
 /** @brief Fail the component before issuing more work with an invalid owner. */
 void require(bool ok,const char *message){if(!ok)throw std::runtime_error(message);}
 /** @brief Join exact-stream work before any fixture-owned storage retires. */
@@ -92,9 +124,9 @@ struct StageOwner {
     ~StageOwner(){if(hipStreamSynchronize(stream)!=hipSuccess)std::terminate();stage->unbindWorkspace();}
 };
 /** @brief Replay each physical and live extent through the real projection.
- * @param spec Original source and model geometry. @param timed Retain31 rotated triples.
- * @param hosted Whether recording retains the original exact-hosted request extent. */
-void prove(const Case &spec,bool timed,bool hosted=true){
+ * @param spec Original source and model geometry. @param observation Replay,31 triples or a profiled M16.
+ * @param extent Whether recording retains the original exact-hosted request extent. */
+void prove(const Case &spec,Observation observation,Extent extent=Extent::ExactHosted){
     int count=0;if(hipGetDeviceCount(&count)!=hipSuccess || !count)GTEST_SKIP()<<"No ROCm device";
     initializeROCmHardwareMetadata();int ordinal=-1;
     for(int device=0;device<count;++device)if(nativeQuantisedHardwareForDevice(device).architecture==native_quantised::NativeQuantisedArchitecture::rocm(11,0,0)){ordinal=device;break;}
@@ -102,6 +134,9 @@ void prove(const Case &spec,bool timed,bool hosted=true){
     const auto device=DeviceId::rocm(ordinal);auto worker=GPUDeviceContextPool::instance().retainAMDContext(ordinal);
     worker->submitAndWait([&]{
         const auto stream=static_cast<hipStream_t>(worker->defaultStream());auto context=IDeviceContext::create(device);ASSERT_TRUE(context);
+        const bool timed=observation==Observation::Paired,profiled=observation==Observation::Profile,hosted=extent==Extent::ExactHosted;
+        ASSERT_TRUE(observation==Observation::Replay || timed || profiled);
+        if(profiled)ASSERT_TRUE(hosted);
         const auto &[label,n,k]=spec.geometry;const auto &format=spec.source;const int repeats=timed?8:1;
         constexpr std::array candidates{NativeQuantisedVerifierCandidate::Dot4,NativeQuantisedVerifierCandidate::Automatic,NativeQuantisedVerifierCandidate::WmmaM16N64};
         constexpr std::array names{"dot4","automatic","wmma"};
@@ -144,7 +179,7 @@ void prove(const Case &spec,bool timed,bool hosted=true){
         }
         ASSERT_TRUE(std::all_of(oracle.begin(),oracle.end(),[](auto word){return std::isfinite(std::bit_cast<float>(word));}));
         ASSERT_TRUE(std::any_of(oracle.begin(),oracle.end(),[](auto word){return word!=0;}));
-        for(int m=2;m<=16;++m){
+        for(int m=profiled?16:2;m<=16;++m){
             SCOPED_TRACE(::testing::Message()<<format.label<<" "<<label<<" M="<<m);
             auto live=TestTensorFactory::createINT32({1});live->mutable_int32_data()[0]=m;
             std::array<std::unique_ptr<FP32Tensor>,3> outputs;std::vector<uint32_t> actual(size_t(m)*n);
@@ -167,7 +202,7 @@ void prove(const Case &spec,bool timed,bool hosted=true){
                 ScopedBackendGraphCapture capture(*worker,*fragments[path],"original Wo projection",&ledger);ASSERT_TRUE(capture.begin());
                 for(int repeat=0;repeat<repeats;++repeat){ScopedGraphCaptureStage stage(owner.stage.get());ASSERT_TRUE(owner.stage->execute(context.get()));stage.complete();}
                 capture.finish();const std::array<GPUOrderedTimelineStep,1> steps{{{.name=names[path],.kind=GPUOrderedTimelineStepKind::CapturedFragment,.capture=fragments[path].get()}}};
-                ASSERT_TRUE(graphs[path]->buildOrderedTimelineTransaction(steps,GPUOrderedTimelineInstrumentation::PerStepEvents));ASSERT_TRUE(graphs[path]->instantiate());
+                ASSERT_TRUE(graphs[path]->buildOrderedTimelineTransaction(steps,profiled?GPUOrderedTimelineInstrumentation::Disabled:GPUOrderedTimelineInstrumentation::PerStepEvents));ASSERT_TRUE(graphs[path]->instantiate());
                 auto *parent=dynamic_cast<HIPGraphCapture *>(graphs[path].get());ASSERT_TRUE(parent);
                 size_t size=0;ASSERT_EQ(hipGraphGetNodes(parent->graph(),nullptr,&size),hipSuccess);std::vector<hipGraphNode_t> nodes(size);ASSERT_EQ(hipGraphGetNodes(parent->graph(),nodes.data(),&size),hipSuccess);
                 const auto quant=owner.workspace->getBuffer(GemmWorkspaceBuffers::QUANT_A),scales=owner.workspace->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE),sums=owner.workspace->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE);
@@ -208,7 +243,9 @@ void prove(const Case &spec,bool timed,bool hosted=true){
                     }else ASSERT_EQ(launch.gridDim.y,1u);
                     std::printf("ROCM_WO_VERIFIER_PACKET,%s,%s,%d,%s,%u,%d,%d\n",format.label,label,m,names[path],launch.gridDim.y,span,int(partial));
                 }
-                ASSERT_EQ(families[path][0].size(),size_t(repeats));ASSERT_EQ(families[path][1].size(),path==2?size_t(repeats):0u);
+                ASSERT_EQ(families[path][0].size(),size_t(repeats));
+                const bool expected_native=path==2 || (path==1 && hosted && expectedROCmWoVerifierNative(format.tensor_type,n,k,m));
+                ASSERT_EQ(families[path][1].size(),expected_native?size_t(repeats):0u);
                 if(!produced.empty()){std::sort(produced.begin(),produced.end());std::sort(reduced.begin(),reduced.end());ASSERT_EQ(produced,reduced);}
                 std::vector<GPUGraphKernelNodeInfo> inventory;ASSERT_TRUE(graphs[path]->inspectKernelNodes(inventory));std::set<std::string> printed;
                 for(const auto &node:inventory){ASSERT_TRUE(node.valid());ASSERT_EQ(node.local_memory_bytes_per_thread,0u);if(printed.insert(node.name).second)
@@ -219,8 +256,17 @@ void prove(const Case &spec,bool timed,bool hosted=true){
                 require(hipMemsetAsync(outputs[path]->gpu_data_ptr(),0xa5,actual.size()*sizeof(uint32_t),stream)==hipSuccess,"Wo output poison failed");
                 for(const auto &buffer:stages[path]->requirements.buffers)if(buffer.content_lifetime==WorkspaceContentLifetime::ParticipantExecution){const auto bytes=stages[path]->workspace->getBufferSize(buffer.name);if(bytes)require(hipMemsetAsync(stages[path]->workspace->getBuffer(buffer.name),0xff,bytes,stream)==hipSuccess,"Wo scratch poison failed");}
             };
-            const auto replay=[&](int path){poison(path);require(graphs[path]->launch(),"Wo retained replay failed");require(hipMemcpyAsync(actual.data(),outputs[path]->gpu_data_ptr(),actual.size()*sizeof(uint32_t),hipMemcpyDeviceToHost,stream)==hipSuccess,"Wo output observation failed");require(hipStreamSynchronize(stream)==hipSuccess,"Wo observation join failed");};
+            const auto observe=[&](int path){require(hipMemcpyAsync(actual.data(),outputs[path]->gpu_data_ptr(),actual.size()*sizeof(uint32_t),hipMemcpyDeviceToHost,stream)==hipSuccess,"Wo output observation failed");require(hipStreamSynchronize(stream)==hipSuccess,"Wo observation join failed");};
+            const auto replay=[&](int path){poison(path);require(graphs[path]->launch(),"Wo retained replay failed");observe(path);};
             const auto matches=[&]{for(size_t i=0;i<actual.size();++i){const auto expected=i<size_t(published)*n?oracle[i]:0xa5a5a5a5u;if(actual[i]!=expected)return ::testing::AssertionFailure()<<"element="<<i<<" live="<<published<<" expected_bits="<<expected<<" actual_bits="<<actual[i];}return ::testing::AssertionSuccess();};
+            if(profiled){
+                ASSERT_EQ(families[1][1].size(),1u);
+                for(int warm=0;warm<10;++warm)ASSERT_TRUE(graphs[1]->launch());
+                ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);poison(1);ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+                {ProfileWindow window;const bool launched=graphs[1]->launch();const bool joined=hipStreamSynchronize(stream)==hipSuccess;
+                    window.finish();ASSERT_TRUE(launched && joined);}
+                observe(1);ASSERT_TRUE(matches());std::printf("ROCM_WO_VERIFIER_PROFILE_OBSERVED,%s,%s,%d\n",format.label,label,m);continue;
+            }
             std::vector<int> sequence{m,1,0,m,m};for(int prefix=2;prefix<m;++prefix)sequence.push_back(prefix);
             for(int prefix:sequence){published=prefix;ASSERT_EQ(hipMemcpyAsync(count_owner,&published,sizeof(published),hipMemcpyHostToDevice,stream),hipSuccess);
                 for(int path=0;path<3;++path){replay(path);ASSERT_TRUE(matches())<<names[path];
@@ -244,7 +290,18 @@ std::vector<Case> cases(){std::vector<Case> out;for(auto geometry:geometries)for
 }
 /** @brief One independent projection owner per geometry/source registration. */
 class ROCmWoVerifierTransaction:public ::testing::TestWithParam<Case>{};
-TEST_P(ROCmWoVerifierTransaction,Replay){prove(GetParam(),false);}
-TEST_P(ROCmWoVerifierTransaction,DISABLED_Paired){prove(GetParam(),true);}
+TEST_P(ROCmWoVerifierTransaction,AutomaticReplay){prove(GetParam(),Observation::Replay);}
+TEST_P(ROCmWoVerifierTransaction,GuardedReplay){prove(GetParam(),Observation::Replay,Extent::Guarded);}
+TEST_P(ROCmWoVerifierTransaction,DISABLED_AutomaticPaired){prove(GetParam(),Observation::Paired);}
+/** @brief Profile one of the two qualified operation/geometry anchors. */
+void profileWo(const char *name){
+    ASSERT_EQ(::testing::UnitTest::GetInstance()->test_to_run_count(),1)
+        << "A profiler launch must select exactly one Wo geometry before device setup";
+    const auto geometry=std::find_if(geometries.begin(),geometries.end(),[&](const auto &g){return std::string_view(g.name)==name;});
+    const auto &formats=quantizedMoEVerifierFormats();const auto format=std::find_if(formats.begin(),formats.end(),[](const auto &f){return f.tensor_type==TensorType::IQ4_XS;});
+    ASSERT_NE(geometry,geometries.end());ASSERT_NE(format,formats.end());prove({*format,*geometry},Observation::Profile);
+}
+TEST(ROCmWoVerifierProfile,DISABLED_DenseIQ4XS16){profileWo("Dense");}
+TEST(ROCmWoVerifierProfile,DISABLED_MoETP4IQ4XS16){profileWo("MoETP4");}
 INSTANTIATE_TEST_SUITE_P(AllSources,ROCmWoVerifierTransaction,::testing::ValuesIn(cases()),
     [](const ::testing::TestParamInfo<Case> &info){return std::string(info.param.geometry.name)+"_"+info.param.source.label;});

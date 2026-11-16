@@ -26,6 +26,7 @@
 #include "transfer/TransferEngine.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
+#include "../../../utils/ROCmWoVerifierExpectations.h"
 #include "../../../utils/ScopedGPUStream.h"
 #include "../../../utils/TestTensorFactory.h"
 #include "../../../utils/DeviceCountedFloatingRowsProof.h"
@@ -1319,6 +1320,70 @@ TEST(ROCmVerifierWmmaDispatch, ExactHostedKeysAndExclusions)
         ScopedNativeQuantisedVerifierCandidate diagnostic(forced,0);
         EXPECT_EQ(select(extent,original,original_work),forced);
     }
+    EXPECT_FALSE(ScopedNativeQuantisedVerifierOperation::current());
+    EXPECT_FALSE(ScopedCapturedVerifierExtent::current().isExact());
+}
+
+/** @test Every independent Wo seed key retains its original operation/extent guards.
+ * Expected masks come from frozen complete-stage samples, not a production include.
+ * Mapping and epilogue exclusions remain covered by the actual public-API replay;
+ * this metadata-only selector test does not fabricate tensor mappings. */
+TEST(ROCmVerifierWmmaDispatch, WoMeasuredProjectionKeysAndExclusions)
+{
+    initializeROCmHardwareMetadata();int ordinal=-1;
+    for(size_t i=0;i<rocmHardwareMetadata().size();++i)
+        if(nativeQuantisedHardwareForDevice(static_cast<int>(i)).architecture==
+            native_quantised::NativeQuantisedArchitecture::rocm(11,0,0)){ordinal=static_cast<int>(i);break;}
+    if(ordinal<0)GTEST_SKIP()<<"UNQUALIFIED: native Wo policy requires actual gfx1100";
+    const auto device=DeviceId::rocm(ordinal);int32_t count=0,foreign_count=0;uint8_t payload=0,foreign_payload=0;
+    const auto dot=NativeQuantisedVerifierCandidate::Dot4,matrix=NativeQuantisedVerifierCandidate::WmmaM16N64;
+    constexpr auto &shapes=kWoVerifierExpectedShapes;
+    const auto select=[&](CapturedVerifierExtent extent,std::optional<NativeQuantisedVerifierOperation> operation,
+                          const NativeQuantisedVerifierWork &work,bool decode=true){
+        ScopedCapturedVerifierExtent admitted(extent);ScopedNativeQuantisedVerifierOperation original(operation);
+        return nativeQuantisedVerifierProducer(ordinal,decode,work);
+    };
+    size_t selected=0;
+    for(const auto &format:quantizedMoEVerifierFormats()) {
+        for(size_t shape=0;shape<shapes.size();++shape)for(int m=1;m<=33;++m) {
+            const auto [n,k]=shapes[shape];SCOPED_TRACE(::testing::Message()<<format.label<<" N="<<n<<" K="<<k<<" M="<<m);
+            const auto rows=DeviceRowRange::deviceCounted(m,&count);
+            const auto extent=m>1?CapturedVerifierExtent::exactHostedRequest(device,rows):CapturedVerifierExtent{};
+            const NativeQuantisedVerifierOperation operation{NativeQuantisedVerifierOperationKind::Projection,ordinal,m,n,k,&payload,
+                {format.source_codebook_id,format.source_is_superblock,true}};
+            const NativeQuantisedVerifierWork work{rows,&payload,n,k,1,format.device_execution_codebook_id,NativeQuantisedVerifierPolicyMatch::CanonicalSerial};
+            const bool measured=expectedROCmWoVerifierNative(format.tensor_type,n,k,m);
+            selected+=measured;
+            for(int live:{0,1,m}){count=live;EXPECT_EQ(select(extent,operation,work),measured?matrix:dot);}
+            EXPECT_EQ(select({},operation,work),dot);EXPECT_EQ(select(extent,std::nullopt,work),dot);
+            auto swiglu=operation;swiglu.kind=NativeQuantisedVerifierOperationKind::SwiGLUDown;
+            EXPECT_EQ(select(extent,swiglu,work),dot);
+            for(int mutation=0;mutation<15;++mutation) {
+                auto altered=operation;auto packet=work;
+                switch(mutation) {
+                case 0:packet.rows=DeviceRowRange::deviceCounted(m,&foreign_count);break;
+                case 1:packet.weights=&foreign_payload;break;
+                case 2:packet.projections=2;break;
+                case 3:packet.policy=NativeQuantisedVerifierPolicyMatch::Unmeasured;break;
+                case 4:altered.source.present=false;break;
+                case 5:altered.device=ordinal+1;break;
+                case 6:altered.m=m+1;break;
+                case 7:altered.n=++packet.n;break;
+                case 8:altered.k=packet.k+=32;break;
+                case 9:packet.rows=DeviceRowRange::fullyActive(m);break;
+                case 10:altered.source={255,false,true};break;
+                case 11:packet.physical_codebook=255;break;
+                case 12:packet.rows=DeviceRowRange::deviceCounted(m+1,&count).slice(0,m);break;
+                case 13:packet.rows=DeviceRowRange::deviceCounted(m+1,&count).slice(1,m);break;
+                case 14:altered.weights=nullptr;break;
+                }
+                EXPECT_EQ(select(extent,altered,packet),dot)<<"mutation="<<mutation;
+            }
+            EXPECT_EQ(select(extent,operation,work,false),dot);
+            {ProjectionRowWorkScope generic(ProjectionRowWork::fromPrefix(rows));EXPECT_EQ(select(extent,operation,work),dot);}
+        }
+    }
+    EXPECT_EQ(selected,746u);
     EXPECT_FALSE(ScopedNativeQuantisedVerifierOperation::current());
     EXPECT_FALSE(ScopedCapturedVerifierExtent::current().isExact());
 }
