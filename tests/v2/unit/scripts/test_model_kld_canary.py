@@ -421,7 +421,15 @@ class ModelKLDLifecycleTests(unittest.TestCase):
 
 class ModelKLDCITests(unittest.TestCase):
     """Master-only integration keeps both ISA evidence and native owner cleanup."""
-    def test_complete_red_numerics_still_collect_both_isas(self):
+    def test_admission_rejects_red_numerics_while_holding_both_isa_reports(self):
+        """Admission (not collection) rejects a red numerical cell precisely.
+
+        The real collector behaviour is covered by
+        test_published_accuracy_collects_both_isas_before_reporting_red_panel;
+        this contract keeps the admission side: a complete both-ISA bundle is
+        admitted, a red numerical cell is still collected for BOTH ISAs but is
+        rejected precisely with the KL phase-failure verdict.
+        """
         from types import SimpleNamespace
         import tempfile,json
         import run_published_image_suite as suite
