@@ -8,6 +8,7 @@
  * a model, initializing an accelerator or enforcing noisy timing thresholds.
  */
 #include "integration/parity/ModelParityDefinition.h"
+#include "integration/parity/ModelParityReleaseTopologies.h"
 #include "integration/parity/qwen36/Qwen36ModelParityDefinitions.h"
 #include "integration/parity/qwen38/Qwen38ModelParityDefinitions.h"
 #include "config/OrchestrationConfigParser.h"
@@ -95,7 +96,12 @@ namespace llaminar2::test::parity
                     cell, ModelParityRuntimePlacementProjection::AutomaticCell));
                 EXPECT_NE(exported["benchmark"]["args"], exported["e2e"]["server_args"]);
             }
-        EXPECT_EQ(tags, 8);
+        // Since release eligibility moved to the bounded release matrix, the
+        // legacy diagnostic definitions in this set must contribute no tags;
+        // every benchmark cell comes from a release topology and times the
+        // same production defaults. The count therefore follows the canonical
+        // release population instead of restating it as a magic number.
+        EXPECT_EQ(tags, static_cast<int>(modelParityReleaseTopologies().size()));
     }
 
     TEST(ModelParityBenchmarkProjection, StressEconomicsCannotChangeTimingPolicy)

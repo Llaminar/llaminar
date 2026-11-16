@@ -54,6 +54,33 @@ namespace llaminar2::test::parity
             PrintTo(cell, &output);
             return nlohmann::json::parse(output.str());
         }
+
+        /**
+         * @brief Attach the historical certification selector in test scope.
+         * @param definition Legacy numerical definition to make certification-eligible.
+         *
+         * Release eligibility belongs to the bounded release matrix; the legacy
+         * model definitions export no implicit tags. These regressions still
+         * prove the certification machinery, so they attach the exact one-cell
+         * Dynamic/Ordinal/adaptive overlay selector a tagging caller declares.
+         */
+        void attachCertificationSelector(ModelParityDefinition &definition)
+        {
+            definition.e2e_certifiable = {{
+                .mtp = ModelParityMTP::DynamicDepth,
+                .owner_order = RoutedExpertOwnerOrder::Ordinal,
+                .movement = ModelParityExpertMovement::Dynamic,
+            }};
+        }
+
+        /** @return True when no expanded cell carries a certification tag. */
+        bool exportsNoImplicitCertification(const ModelParityDefinition &definition)
+        {
+            for (const auto &cell : expandModelParityDefinition(definition))
+                if (cell.e2e_certification)
+                    return false;
+            return true;
+        }
     }
 
     /** Both vendors need a same-model whole-expert control, not another model's score. */
@@ -62,10 +89,17 @@ namespace llaminar2::test::parity
         for (const auto &topology : {qwen36::qwen36MoECuda2ExpertOverlayTopology(),
                                     qwen36::qwen36MoERocm2ExpertOverlayTopology()})
         {
-            const auto control = expandModelParityDefinition(
-                qwen36::qwen36MoEExpertOverlayCertificationDefinition(topology, "/reference"));
-            const auto projection = expandModelParityDefinition(
-                qwen36::qwen36MoEProjectionParityDefinition(topology, "/reference"));
+            auto control_definition =
+                qwen36::qwen36MoEExpertOverlayCertificationDefinition(topology, "/reference");
+            auto projection_definition =
+                qwen36::qwen36MoEProjectionParityDefinition(topology, "/reference");
+            // Legacy numerical matrices must not imply release eligibility.
+            EXPECT_TRUE(exportsNoImplicitCertification(control_definition));
+            EXPECT_TRUE(exportsNoImplicitCertification(projection_definition));
+            attachCertificationSelector(control_definition);
+            attachCertificationSelector(projection_definition);
+            const auto control = expandModelParityDefinition(control_definition);
+            const auto projection = expandModelParityDefinition(projection_definition);
             ASSERT_EQ(control.size(), 24u);
             ASSERT_EQ(projection.size(), control.size());
             std::size_t tagged = 0;
@@ -132,7 +166,10 @@ namespace llaminar2::test::parity
         const auto diagnostic = qwen36::ornith15MoEQ8AccuracyParityDefinition(
             qwen36::ornith15MoERocm4ExpertOverlayTopology(),
             "pytorch_ornith15_q8_natural_decode_rocm4_snapshots");
-        const auto certificate = qwen36::ornith15MoEQ8Rocm4CertificationDefinition();
+        auto certificate = qwen36::ornith15MoEQ8Rocm4CertificationDefinition();
+        // The retained numerical certificate carries no implicit release tag.
+        EXPECT_TRUE(exportsNoImplicitCertification(certificate));
+        attachCertificationSelector(certificate);
         const auto before = expandModelParityDefinition(diagnostic);
         const auto after = expandModelParityDefinition(certificate);
         ASSERT_EQ(before.size(), 24u);
@@ -203,6 +240,17 @@ namespace llaminar2::test::parity
         }
         controls.push_back(qwen36::ornith15MoEQ8Rocm4CertificationDefinition());
         projections.push_back(qwen36::ornith15MoEQ8Rocm4ProjectionCertificationDefinition());
+        // Fine-tune and projection matrices must not imply release eligibility.
+        for (const auto &definition : controls)
+            EXPECT_TRUE(exportsNoImplicitCertification(definition));
+        for (const auto &definition : projections)
+            EXPECT_TRUE(exportsNoImplicitCertification(definition));
+        // Attach the identical selector on both sides so the matched-control
+        // comparison proves the projection exports the same public contract.
+        for (auto &definition : controls)
+            attachCertificationSelector(definition);
+        for (auto &definition : projections)
+            attachCertificationSelector(definition);
         for (std::size_t variant = 0; variant < controls.size(); ++variant)
         {
             const auto before = expandModelParityDefinition(controls[variant]);
