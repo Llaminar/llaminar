@@ -602,6 +602,10 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
  && cp build_v2_release/_deps/utf8proc-src/LICENSE.md /src/runtime-licenses/utf8proc/ \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -P /usr/local/lib/libllaminar_nccl.so* /src/runtime-libs/; fi \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -r /usr/local/share/licenses/llaminar-nccl /src/runtime-licenses/; fi \
+ # Stage the builder-authored NCCL install receipt beside its library so the
+ # sealed test runner can authenticate the DSO byte identity at the exact path
+ # its CTest registration probes (dirname(NCCL_LIBRARY)/llaminar-nccl-build.txt).
+ && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ] && [ -f /usr/local/lib/llaminar-nccl-build.txt ]; then cp /usr/local/lib/llaminar-nccl-build.txt /src/runtime-libs/; fi \
  && if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
         HIP_RUNTIME_STAGE_PREFIX=/src/runtime-hip bash scripts/docker/install-hip-graph-runtime.sh; \
         ROCR_RUNTIME_STAGE_PREFIX=/src/runtime-rocr bash scripts/docker/install-rocr-helper-numa.sh; \
@@ -642,6 +646,19 @@ COPY Dockerfile .dockerignore .gitignore ./
 FROM builder AS test-workspace
 
 RUN set -e; \
+    # Preserve the builder-authored RCCL install receipt.  ``verify`` proofs in
+    # the sealed runner authenticate the DSO bytes against this receipt at the
+    # exact CTest-probed path (RCCL_PROTOCOL_BUILD_DIR/.llaminar-rccl-commit),
+    # so it must survive the source-build tree removal below.
+    if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] \
+       && [ -f /src/external/rccl/build/.llaminar-rccl-commit ]; then \
+        mkdir -p /src/external/rccl/build; \
+    fi; \
+    rccl_receipt=""; \
+    if [ -f /src/external/rccl/build/.llaminar-rccl-commit ]; then \
+        rccl_receipt="/tmp/llaminar-rccl-commit"; \
+        cp /src/external/rccl/build/.llaminar-rccl-commit "${rccl_receipt}"; \
+    fi; \
     rm -rf /src/build_v2_release \
            /src/runtime-bin \
            /src/runtime-libs \
@@ -649,6 +666,10 @@ RUN set -e; \
            /src/external/onednn \
            /src/external/rccl \
            /src/build_v2_integration/_deps; \
+    if [ -n "${rccl_receipt}" ]; then \
+        mkdir -p /src/external/rccl/build; \
+        mv "${rccl_receipt}" /src/external/rccl/build/.llaminar-rccl-commit; \
+    fi; \
     rm -f /src/build_v2_integration/libcuda_backend.a \
           /src/build_v2_integration/librocm_backend.a \
           /src/build_v2_integration/libdevice_benchmarks.a \
