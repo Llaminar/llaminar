@@ -640,7 +640,7 @@ deduplication alone cannot distinguish QKV, GDN and selected LM-head work.
 | Bundle | Existing owner to extend | Missing evidence |
 |---|---|---|
 | Attention QKV or K/V-only | Actual unequal-width `FusedQKVGEMMStage` with independent prepared owners | Actual-Automatic confirmation, focused gates and64 geometry profiles pass; QueryInterval slicing excludes retained MTP |
-| Attention output | `GEMMStage` verifier path and Wo serial-byte tests | Source-owned output geometry and TP partition |
+| Attention output | Actual `GEMMStage` Wo owner with independent prepared controls | All126 Release/Integration cases and1890 timing cells pass;761 seed keys span all21 sources. Actual-Automatic qualification remains open; TP-sized cases qualify local extents, not source-slice loading. [Proof](GFX1100_MTP_WO_VERIFIER.md) |
 | Gate/up through SwiGLU/down | Actual connected `FusedGateUpGEMMStage` → fused-SwiGLU `GEMMStage` with five independent owners | Automatic admits136 incremental GU keys across all21 formats; both315-cell panels retain every selected median win (confirmation geo1.112072×); six host/26 GPU gates and16 profiles pass |
 | GDN projections | Actual four-source `GDNProjectionStage` with independent prepared owners | Automatic161 keys win in both630-cell panels;16 profiles, six host gates/32 cases, eight GPU gates/128 cases and CUDA/ROCm capture/12 cases pass |
 | Shared expert FFN | Actual shared-stage owner above | Qualified through gate/add and verifier-router Q8 handoff;368 profiles complete; residual sparse overhead remains visible |
