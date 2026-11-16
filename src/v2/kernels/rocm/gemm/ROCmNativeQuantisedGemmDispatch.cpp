@@ -434,7 +434,7 @@ bool matchesNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOpe
     const NativeQuantisedVerifierWork &work,int device) noexcept
 {
     const int expected=operation.kind==VerifierProjectionBundleKind::AttentionQKV?3:
-        operation.kind==VerifierProjectionBundleKind::AttentionKV?2:0;
+        (operation.kind==VerifierProjectionBundleKind::AttentionKV || operation.kind==VerifierProjectionBundleKind::GateUp)?2:0;
     return expected && operation.count==expected && matchesVerifierMembers(
         std::span(operation.members).first(expected),operation.device,operation.k,operation.rows,
         operation.activations,operation.activation_scales,operation.activation_sums,work,device);
@@ -483,6 +483,23 @@ static_assert([] {
     }
     return true;
 }(), "Complete verifier bundle masks require unique source identities and widths M2..16");
+
+/** @brief Original two-source GU qualification, separate from attention and scalar down. */
+struct VerifierGateUpMeasuredWidths
+{
+    NativeQuantisedSourceIdentity source;
+    uint16_t rows;
+};
+#include "ROCmNativeQuantisedVerifierGateUpPolicy.inc"
+static_assert([] {
+    for(size_t i=0;i<kVerifierGateUpMeasuredWidths.size();++i) {
+        const auto &entry=kVerifierGateUpMeasuredWidths[i];
+        if(!entry.source.present || canonicalDeviceVnniCodebookId(entry.source)==255 || (entry.rows&0x8000u))return false;
+        for(size_t previous=0;previous<i;++previous)
+            if(entry.source==kVerifierGateUpMeasuredWidths[previous].source)return false;
+    }
+    return true;
+}(),"GU masks require distinct original sources and widths M2..16");
 
 /** @brief Measured widths retain complete source identity and separate public operations.
  * Bit M-2 admits one exact physical width, only within M2..16. Shape columns
@@ -552,6 +569,15 @@ bool measuredVerifierWmmaKey(const NativeQuantisedVerifierOperation &operation,i
 bool measuredNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOperation &operation) noexcept
 {
     const int m = operation.rows.physicalRows();
+    if(operation.kind==VerifierProjectionBundleKind::GateUp) {
+        if(m<2 || m>16 || operation.count!=2 || operation.k!=5120 ||
+            operation.members[0].n!=17408 || operation.members[1].n!=17408 ||
+            operation.members[0].source!=operation.members[1].source)return false;
+        for(const auto &entry:kVerifierGateUpMeasuredWidths)
+            if(entry.source==operation.members[0].source)
+                return (entry.rows&(uint16_t{1}<<(m-2)))!=0;
+        return false;
+    }
     const bool qkv = operation.kind == VerifierProjectionBundleKind::AttentionQKV;
     if (m < 2 || m > 16 ||
         (qkv ? operation.count != 3 :

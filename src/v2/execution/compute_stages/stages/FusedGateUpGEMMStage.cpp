@@ -4,6 +4,7 @@
  */
 
 #include "FusedGateUpGEMMStage.h"
+#include "kernels/common/VerifierProjectionBundle.h"
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
@@ -306,10 +307,17 @@ namespace llaminar2
         bindStageStream(gate_gemm);
         bindStageStream(up_gemm);
 
-        std::vector<ITensorGemm::TensorProjectionDesc> projections = {
+        const std::vector<ITensorGemm::TensorProjectionDesc> projections = {
             {gate_gemm, output_gate, params_.n_gate, params_.bias_gate, "gate"},
             {up_gemm, output_up, params_.n_up, params_.bias_up, "up"}};
         auto verifier_rows = gate_gemm->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
+        // Authenticate the original two-source operation before compatible
+        // backend subgrouping. The scope ends with this GU call; the following
+        // SwiGLU/down stage retains its separate scalar operation authority.
+        const ScopedVerifierProjectionBundle original_bundle(VerifierProjectionBundleBinding::bind(
+            VerifierProjectionBundleKind::GateUp, params_.device_id, input,
+            params_.verifier_row_range.value_or(DeviceRowRange::fullyActive(params_.m)),
+            params_.k, projections));
         const bool success = gate_gemm->multiply_fused_verifier_rows_decode_equivalent(
             input,
             projections,

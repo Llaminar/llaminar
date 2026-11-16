@@ -20953,14 +20953,14 @@ if(HAVE_ROCM)
     add_executable(v2_integration_rocm_ffn_verifier_transaction
         integration/kernels/rocm/Test__ROCmFFNVerifierTransaction.cpp)
     target_link_libraries(v2_integration_rocm_ffn_verifier_transaction
-        llaminar2_core GTest::gtest GTest::gtest_main)
+        llaminar2_core GTest::gtest GTest::gtest_main rocprofiler-sdk-roctx::rocprofiler-sdk-roctx)
     # Each source performs four connected controls across all M2..16. Keep a
     # bounded per-source gate instead of extending a monolithic timeout.
     foreach(ffn_source IN ITEMS Q4_0 IQ4_NL IQ4_XS Q4_1 Q4_K Q5_0 Q5_1 Q5_K
             Q6_K Q3_K Q2_K IQ3_S IQ3_XXS IQ2_S IQ2_XS IQ2_XXS IQ1_S IQ1_M Q8_0 Q8_1 Q8_K)
         add_v2_test(V2_Integration_ROCmFFNVerifierReplay_${ffn_source}
             COMMAND $<TARGET_FILE:v2_integration_rocm_ffn_verifier_transaction>
-                --gtest_filter=AllSources/ROCmFFNVerifierTransaction.Replay/${ffn_source}
+                --gtest_filter=AllSources/ROCmFFNVerifierTransaction.AutomaticReplay/${ffn_source}
             LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;FFN;AllFormats;GraphCapture;ByteExact;Replay;Regression"
             MPI_PROCS 1 NO_MODELS TIMEOUT 60)
         list(APPEND _rocm_ffn_verifier_preflight_tests V2_Integration_ROCmFFNVerifierReplay_${ffn_source})
@@ -20968,6 +20968,12 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmFFNVerifierMixedReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_ffn_verifier_transaction>
             --gtest_filter=ROCmFFNVerifierMixed.IndependentSourcesReplay
+        LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;FFN;GraphCapture;ByteExact;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+
+    add_v2_test(V2_Integration_ROCmFFNVerifierGuardedReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_ffn_verifier_transaction>
+            --gtest_filter=ROCmFFNVerifierAutomatic.GuardedCapacityReplay
         LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;FFN;GraphCapture;ByteExact;Replay;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
@@ -38984,6 +38990,25 @@ if(HAVE_ROCM)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGDNVerifierPolicyReplay)
 endif()
 
+# Original GateUp binding and the actual stage/down lifetime are device-free.
+add_v2_test(V2_Integration_VerifierGateUpBundleReplay
+    COMMAND $<TARGET_FILE:v2_test_verifier_projection_bundle> --gtest_filter=VerifierProjectionBundle.GateUp*
+    LABELS "V2;Integration;ProductionTestPreflight;GEMM;MTP;DeviceFree;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_GateUpVerifierStageBoundaryReplay
+    COMMAND $<TARGET_FILE:v2_test_fused_gate_up_gemm_stage> --gtest_filter=Test__FusedGateUpGEMMStage.VerifierBundleLifetimeBeforeDownReplay
+    LABELS "V2;Integration;ProductionTestPreflight;GEMM;MTP;DeviceFree;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_VerifierGateUpBundleReplay V2_Integration_GateUpVerifierStageBoundaryReplay)
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_ROCmVerifierGateUpPolicyReplay
+        COMMAND $<TARGET_FILE:v2_test_rocm_verifier_bundle_policy> --gtest_filter=ROCmVerifierBundlePolicy.GateUp*
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;MTP;DeviceFree;Regression;Replay"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierGateUpPolicyReplay)
+endif()
+
 # New native-Q8 evidence controls run in the existing exact evidence owner.
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_ROCmAdaptiveQKPolicyReplay
@@ -39006,6 +39031,7 @@ if(HAVE_ROCM)
         V2_Integration_ROCmQKVVerifierAutomaticExclusionsReplay
         ${_rocm_ffn_verifier_preflight_tests}
         V2_Integration_ROCmFFNVerifierMixedReplay
+        V2_Integration_ROCmFFNVerifierGuardedReplay
         V2_Integration_ROCmGDNVerifierSingleQ8Replay
         V2_Integration_ROCmGDNVerifierTwoTermQ8Replay
         V2_Integration_ROCmGDNVerifierMixedReplay

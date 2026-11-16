@@ -9,6 +9,8 @@
  */
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
+#include <rocprofiler-sdk-roctx/roctx.h>
+#include "kernels/common/VerifierProjectionBundle.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/rocm/HIPGraphCapture.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
@@ -43,9 +45,35 @@ constexpr int hidden=5120, intermediate=17408;
 constexpr std::array<int,3> columns{intermediate,intermediate,hidden};
 constexpr std::array<int,3> reductions{hidden,hidden,intermediate};
 /** @brief Whole-chain controls distinguish existing down admission from GU improvement. */
-enum class Policy { Dot4, Automatic, WmmaGateUpAutomaticDown, Wmma };
-constexpr std::array<Policy,4> policies{Policy::Dot4,Policy::Automatic,Policy::WmmaGateUpAutomaticDown,Policy::Wmma};
-constexpr std::array<const char *,4> names{"dot4","automatic","wmma_gu_auto_down","wmma"};
+enum class Policy { Dot4, PriorAutomatic, Automatic, WmmaGateUpAutomaticDown, Wmma };
+/** @brief Seed candidate, installed selection, or guarded-capacity exclusion. */
+enum class Comparison { ForcedGU, Automatic, GuardedAutomatic };
+/** @brief Collect one retained native transaction outside setup and observations. */
+class ProfileWindow final {
+    bool active_=false;
+public:
+    /** @brief Resume only after the caller has drained setup and poisoned outputs. */
+    ProfileWindow() {
+        if(roctxRangePushA("ROCmFFNVerifierTransaction")<0)throw std::runtime_error("FFN profiler range failed");
+        if(roctxProfilerResume(0)!=0) {(void)roctxRangePop();throw std::runtime_error("FFN profiler resume failed");}
+        active_=true;
+    }
+    /** @brief Pause before output observation; cleanup remains unconditional on exceptions. */
+    void finish() {
+        if(!active_)return;
+        const int paused=roctxProfilerPause(0),popped=roctxRangePop();active_=false;
+        if(paused!=0 || popped<0)throw std::runtime_error("FFN profiler pause failed");
+    }
+    /** @brief Never let a failed replay leave profiling active for another kernel. */
+    ~ProfileWindow() {
+        if(active_) {
+            const int paused=roctxProfilerPause(0),popped=roctxRangePop();
+            if(paused!=0 || popped<0)std::terminate();
+        }
+    }
+    ProfileWindow(const ProfileWindow&)=delete;
+    ProfileWindow &operator=(const ProfileWindow&)=delete;
+};
 /** @brief Fail the component before issuing more work with an invalid owner. */
 void require(bool ok,const char *message){if(!ok)throw std::runtime_error(message);}
 /** @brief Join exact-stream work before any fixture-owned storage retires. */
@@ -97,14 +125,17 @@ public:
  * @param policy Explicit comparison arm. @param down Whether this is the down stage.
  * @return Immutable candidate for subsequent graph construction only. */
 NativeQuantisedVerifierCandidate candidate(Policy policy,bool down){
-    if(policy==Policy::Dot4)return NativeQuantisedVerifierCandidate::Dot4;
-    if(policy==Policy::Automatic || (down && policy==Policy::WmmaGateUpAutomaticDown))return NativeQuantisedVerifierCandidate::Automatic;
+    if(policy==Policy::Dot4 || (policy==Policy::PriorAutomatic && !down))return NativeQuantisedVerifierCandidate::Dot4;
+    if(policy==Policy::Automatic || policy==Policy::PriorAutomatic || (down && policy==Policy::WmmaGateUpAutomaticDown))return NativeQuantisedVerifierCandidate::Automatic;
     return NativeQuantisedVerifierCandidate::WmmaM16N64;
 }
 /** @brief Prove actual-chain bytes and measure incremental GU admission.
  * @param format Original gate/up/down source format. @param timed Collect31 rotated complete-chain samples.
- * @param mixed Keep gate original while up/down use independent Q8_0 sources. */
-void prove(const QuantizedVerifierFormatCase &format,bool timed,bool mixed=false){
+ * @param mixed Keep gate original while up/down use independent Q8_0 sources.
+ * @param comparison Explicit candidate or measured production selection.
+ * @param profile_rows One separately profiled exact width; setup and observations stay outside the marker. */
+void prove(const QuantizedVerifierFormatCase &format,bool timed,bool mixed=false,
+    Comparison comparison=Comparison::ForcedGU,std::optional<int> profile_rows=std::nullopt){
     int count=0;if(hipGetDeviceCount(&count)!=hipSuccess || !count)GTEST_SKIP()<<"No ROCm device";
     initializeROCmHardwareMetadata();int ordinal=-1;
     for(int device=0;device<count;++device)if(nativeQuantisedHardwareForDevice(device).architecture==native_quantised::NativeQuantisedArchitecture::rocm(11,0,0)){ordinal=device;break;}
@@ -112,6 +143,11 @@ void prove(const QuantizedVerifierFormatCase &format,bool timed,bool mixed=false
     const auto device=DeviceId::rocm(ordinal);auto worker=GPUDeviceContextPool::instance().retainAMDContext(ordinal);
     worker->submitAndWait([&]{
         const auto stream=static_cast<hipStream_t>(worker->defaultStream());auto context=IDeviceContext::create(device);ASSERT_TRUE(context);
+        const bool installed=comparison!=Comparison::ForcedGU,hosted=comparison!=Comparison::GuardedAutomatic;
+        const std::array<Policy,4> policies{Policy::Dot4,Policy::PriorAutomatic,installed?Policy::Automatic:Policy::WmmaGateUpAutomaticDown,Policy::Wmma};
+        const std::array<const char *,4> names{"dot4","prior_automatic",installed?"automatic":"wmma_gu_auto_down","wmma"};
+        if(profile_rows){ASSERT_EQ(comparison,Comparison::Automatic);ASSERT_FALSE(timed);ASSERT_FALSE(mixed);ASSERT_EQ(*profile_rows,16);}
+        std::printf("ROCM_FFN_VERIFIER_MODE,%s,%d,%d\n",format.label,int(mixed),int(comparison));
         const int repeats=timed?8:1;
         std::array<std::shared_ptr<TensorBase>,3> weights;
         std::array<GpuPreparedFFNFixture,5> prepared;
@@ -172,7 +208,7 @@ void prove(const QuantizedVerifierFormatCase &format,bool timed,bool mixed=false
             ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
         }
         for(const auto &out:oracle){ASSERT_TRUE(std::all_of(out.begin(),out.end(),[](auto word){return std::isfinite(std::bit_cast<float>(word));}));ASSERT_TRUE(std::any_of(out.begin(),out.end(),[](auto word){return word!=0;}));}
-        for(int m=2;m<=16;++m){
+        for(int m=profile_rows.value_or(2);m<=profile_rows.value_or(16);++m){
             SCOPED_TRACE(::testing::Message()<<format.label<<" mixed="<<mixed<<" M="<<m);
             auto live=TestTensorFactory::createINT32({1});live->mutable_int32_data()[0]=m;
             std::array<std::array<std::unique_ptr<FP32Tensor>,3>,4> outputs;
@@ -187,7 +223,7 @@ void prove(const QuantizedVerifierFormatCase &format,bool timed,bool mixed=false
             for(int path=0;path<4;++path){
                 for(int role=0;role<3;++role){outputs[path][role]=TestTensorFactory::createFP32({size_t(m),size_t(columns[role])});ASSERT_TRUE(outputs[path][role]->allocateOnDevice(device,stream));actual[role].resize(size_t(m)*columns[role]);}
                 chains[path]=make_chain(path,m,input.get(),outputs[path],rows);auto &chain=*chains[path];
-                ScopedCapturedVerifierExtent extent(CapturedVerifierExtent::exactHostedRequest(device,rows));
+                ScopedCapturedVerifierExtent extent(hosted?CapturedVerifierExtent::exactHostedRequest(device,rows):CapturedVerifierExtent{});
                 ASSERT_TRUE(execute(chain,input.get(),outputs[path],policies[path]));ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
                 TransferEngine::requireDeviceInput(input.get(),device,stream);TransferEngine::requireDeviceInput(live.get(),device,stream);
                 std::vector<GraphCaptureDependencyLedger::StagePlan> plans;
@@ -202,10 +238,11 @@ void prove(const QuantizedVerifierFormatCase &format,bool timed,bool mixed=false
                 ScopedBackendGraphCapture capture(*worker,*fragments[path],"original GU through SwiGLU/down",&ledger);ASSERT_TRUE(capture.begin());
                 for(int repeat=0;repeat<repeats;++repeat){
                     {ScopedGraphCaptureStage stage(chain.gu.get());ScopedNativeQuantisedVerifierCandidate select(candidate(policies[path],false),ordinal);ASSERT_TRUE(chain.gu->execute(context.get()));stage.complete();}
+                    ASSERT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);
                     {ScopedGraphCaptureStage stage(chain.down.get());ScopedNativeQuantisedVerifierCandidate select(candidate(policies[path],true),ordinal);ASSERT_TRUE(chain.down->execute(context.get()));stage.complete();}
                 }
                 capture.finish();const std::array<GPUOrderedTimelineStep,1> steps{{{.name=names[path],.kind=GPUOrderedTimelineStepKind::CapturedFragment,.capture=fragments[path].get()}}};
-                ASSERT_TRUE(graphs[path]->buildOrderedTimelineTransaction(steps,GPUOrderedTimelineInstrumentation::PerStepEvents));ASSERT_TRUE(graphs[path]->instantiate());
+                ASSERT_TRUE(graphs[path]->buildOrderedTimelineTransaction(steps,profile_rows?GPUOrderedTimelineInstrumentation::Disabled:GPUOrderedTimelineInstrumentation::PerStepEvents));ASSERT_TRUE(graphs[path]->instantiate());
                 auto *parent=dynamic_cast<HIPGraphCapture *>(graphs[path].get());ASSERT_TRUE(parent);
                 size_t size=0;ASSERT_EQ(hipGraphGetNodes(parent->graph(),nullptr,&size),hipSuccess);std::vector<hipGraphNode_t> nodes(size);ASSERT_EQ(hipGraphGetNodes(parent->graph(),nodes.data(),&size),hipSuccess);
                 const auto quant=chain.workspace->getBuffer(GemmWorkspaceBuffers::QUANT_A);
@@ -258,6 +295,8 @@ void prove(const QuantizedVerifierFormatCase &format,bool timed,bool mixed=false
                     if(name.find("native_quantised_verifier_wmma_m16n64")==std::string_view::npos)continue;
                     const auto &packet=*static_cast<const NativeQuantisedSmallMBatchedArgs *>(launch.kernelParams[3]);
                     const int k=*static_cast<int *>(launch.kernelParams[4]);const bool down=k==intermediate;ASSERT_TRUE(down || k==hidden);
+                    if(profile_rows && path==2)std::printf("ROCM_FFN_VERIFIER_PROFILE_PACKET,%s,%d,%d,%d,%u,%u,%u,%u\n",
+                        format.label,m,down?2:0,packet.num_projections,launch.gridDim.x,launch.gridDim.y,launch.gridDim.z,launch.blockDim.x);
                     families[path][down?3:2].push_back(node);ASSERT_EQ(packet.rows.captureIdentity(),rows.captureIdentity());ASSERT_EQ(packet.work.captureIdentity(),ProjectionRowWork::fromPrefix(rows).captureIdentity());
                     ASSERT_EQ(*static_cast<const int8_t **>(launch.kernelParams[0]),quant);ASSERT_EQ(*static_cast<const float **>(launch.kernelParams[1]),scales);ASSERT_EQ(*static_cast<const int32_t **>(launch.kernelParams[2]),sums);
                     ASSERT_EQ(launch.gridDim.x,unsigned(packet.total_grid_n));ASSERT_GT(launch.gridDim.y,0u);ASSERT_EQ(launch.gridDim.z,1u);ASSERT_EQ(launch.blockDim.x,128u);
@@ -284,11 +323,15 @@ void prove(const QuantizedVerifierFormatCase &format,bool timed,bool mixed=false
                 if(path==0){ASSERT_TRUE(families[path][2].empty());ASSERT_TRUE(families[path][3].empty());}
                 if(path==1)ASSERT_TRUE(families[path][2].empty());
                 if(path==1 || path==2){
-                    if(m==2)ASSERT_TRUE(families[path][3].empty());
-                    if(m==16)ASSERT_EQ(contributions[2],repeats);
-                    if(!mixed && format.tensor_type==TensorType::IQ4_XS)ASSERT_EQ(contributions[2],m>=5?repeats:0);
+                    if(m==2 || !hosted)ASSERT_TRUE(families[path][3].empty());
+                    if(m==16 && hosted)ASSERT_EQ(contributions[2],repeats);
+                    if(hosted && !mixed && format.tensor_type==TensorType::IQ4_XS)ASSERT_EQ(contributions[2],m>=5?repeats:0);
                 }
-                if(path>=2){ASSERT_EQ(contributions[0],repeats);ASSERT_EQ(contributions[1],repeats);}
+                if(path==3 || (path==2 && !installed)){ASSERT_EQ(contributions[0],repeats);ASSERT_EQ(contributions[1],repeats);}
+                if(path==2 && installed){
+                    if(m==2 || mixed || !hosted)ASSERT_TRUE(families[path][2].empty());
+                    if(m==16 && !mixed && hosted){ASSERT_EQ(contributions[0],repeats);ASSERT_EQ(contributions[1],repeats);}
+                }
                 if(path==3)ASSERT_EQ(contributions[2],repeats);
                 for(int role=0;role<3;++role)ASSERT_TRUE(contributions[role]==0 || contributions[role]==repeats);
                 // Dot4 may have its own reducer. Only a native partial creates
@@ -302,20 +345,30 @@ void prove(const QuantizedVerifierFormatCase &format,bool timed,bool mixed=false
             }
             // The incremental control changes GU only; down must keep the same actual engine.
             ASSERT_EQ(families[1][3].size(),families[2][3].size());
-            const auto replay=[&](int path){
+            const auto poison=[&](int path){
                 for(int role=0;role<3;++role)require(hipMemsetAsync(outputs[path][role]->gpu_data_ptr(),0xa5,actual[role].size()*sizeof(uint32_t),stream)==hipSuccess,"FFN output poison failed");
                 for(const auto &buffer:chains[path]->requirements.buffers)if(buffer.content_lifetime==WorkspaceContentLifetime::ParticipantExecution){
                     const auto bytes=chains[path]->workspace->getBufferSize(buffer.name);if(bytes)require(hipMemsetAsync(chains[path]->workspace->getBuffer(buffer.name),0xff,bytes,stream)==hipSuccess,"FFN scratch poison failed");}
-                require(graphs[path]->launch(),"FFN retained replay failed");
+            };
+            const auto observe=[&](int path){
                 for(int role=0;role<3;++role)require(hipMemcpyAsync(actual[role].data(),outputs[path][role]->gpu_data_ptr(),actual[role].size()*sizeof(uint32_t),hipMemcpyDeviceToHost,stream)==hipSuccess,"FFN output observation failed");
                 require(hipStreamSynchronize(stream)==hipSuccess,"FFN observation join failed");
             };
+            const auto replay=[&](int path){poison(path);require(graphs[path]->launch(),"FFN retained replay failed");observe(path);};
             const auto matches_role=[&](int role){
                 for(size_t i=0;i<actual[role].size();++i){const auto expected=i<size_t(published)*columns[role]?oracle[role][i]:0xa5a5a5a5u;
                     if(actual[role][i]!=expected)return ::testing::AssertionFailure()<<"role="<<role<<" element="<<i<<" live="<<published<<" expected_bits="<<expected<<" actual_bits="<<actual[role][i];}
                 return ::testing::AssertionSuccess();
             };
             const auto matches=[&]{for(int role=0;role<3;++role){const auto result=matches_role(role);if(!result)return result;}return ::testing::AssertionSuccess();};
+            if(profile_rows){
+                ASSERT_EQ(families[2][2].size(),1u);ASSERT_EQ(families[2][3].size(),1u);
+                for(int warm=0;warm<10;++warm)ASSERT_TRUE(graphs[2]->launch());
+                ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);poison(2);ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
+                {ProfileWindow window;const bool launched=graphs[2]->launch();const bool joined=hipStreamSynchronize(stream)==hipSuccess;
+                    window.finish();ASSERT_TRUE(launched && joined);}
+                observe(2);ASSERT_TRUE(matches());std::printf("ROCM_FFN_VERIFIER_PROFILE_OBSERVED,%s,%d\n",format.label,m);continue;
+            }
             std::vector<int> sequence{m,1,0,m,m};for(int prefix=2;prefix<m;++prefix)sequence.push_back(prefix);
             for(int prefix:sequence){
                 published=prefix;ASSERT_EQ(hipMemcpyAsync(count_owner,&published,sizeof(published),hipMemcpyHostToDevice,stream),hipSuccess);
@@ -348,9 +401,17 @@ void prove(const QuantizedVerifierFormatCase &format,bool timed,bool mixed=false
 }
 /** @brief Each original source format owns an independent connected-stage replay. */
 class ROCmFFNVerifierTransaction:public ::testing::TestWithParam<QuantizedVerifierFormatCase>{};
-TEST_P(ROCmFFNVerifierTransaction,Replay){prove(GetParam(),false);}
+TEST_P(ROCmFFNVerifierTransaction,AutomaticReplay){prove(GetParam(),false,false,Comparison::Automatic);}
 TEST_P(ROCmFFNVerifierTransaction,DISABLED_Paired){prove(GetParam(),true);}
-TEST(ROCmFFNVerifierMixed,IndependentSourcesReplay){prove(quantizedMoEVerifierFormats().front(),false,true);}
+TEST_P(ROCmFFNVerifierTransaction,DISABLED_AutomaticPaired){prove(GetParam(),true,false,Comparison::Automatic);}
+TEST(ROCmFFNVerifierMixed,IndependentSourcesReplay){prove(quantizedMoEVerifierFormats().front(),false,true,Comparison::Automatic);}
 TEST(ROCmFFNVerifierMixed,DISABLED_IndependentSourcesPaired){prove(quantizedMoEVerifierFormats().front(),true,true);}
+/** @test Guarded capacity cannot acquire the hosted GU/down timing authority. */
+TEST(ROCmFFNVerifierAutomatic,GuardedCapacityReplay){prove(quantizedMoEVerifierFormats().front(),false,false,Comparison::GuardedAutomatic);}
+/** @test One actual IQ4_XS complete chain supplies separately isolated GU and down profiles. */
+TEST(ROCmFFNVerifierProfile,DISABLED_IQ4XSM16){
+    const auto &formats=quantizedMoEVerifierFormats();const auto format=std::find_if(formats.begin(),formats.end(),[](const auto &f){return f.tensor_type==TensorType::IQ4_XS;});
+    ASSERT_NE(format,formats.end());prove(*format,false,false,Comparison::Automatic,16);
+}
 INSTANTIATE_TEST_SUITE_P(AllSources,ROCmFFNVerifierTransaction,::testing::ValuesIn(quantizedMoEVerifierFormats()),
     [](const ::testing::TestParamInfo<QuantizedVerifierFormatCase> &info){return std::string(info.param.label);});

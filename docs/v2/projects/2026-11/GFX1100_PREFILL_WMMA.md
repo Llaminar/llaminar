@@ -14,7 +14,9 @@ profiles pass with zero memory spills. MTP router Auto now wins85/120 keys
 (geo1.104×), with seven focused registrations and80 spill-free profiles green.
 Shared-expert MTP Auto wins all177 native-active cells (geo1.437×), with all368
 profiles complete. QKV/KV Auto wins all1,415 native cells (geo1.320×); focused
-gates and64 profiles pass. Routed MTP and connected stages remain.
+gates and64 profiles pass. GDN Auto qualifies161 keys with16 profiles; connected
+FFN Auto qualifies136 GU keys (confirmation geo1.112×), with six host/26
+GPU gates and16 profiles. Routed MTP, Wo and selected LM-head remain.
 rocBLAS remains the half-operand implementation: three custom WMMA variants lost
 every measured cell. [Investigation and deferral](GFX1100_HALF_OPERAND_PREFILL_INVESTIGATION.md).
 The earlier two-anchor NativeQuantised objective is documented separately in
@@ -126,16 +128,10 @@ and owned rows remain ordered. Exact engine-specific submission counters record
 capture, stay unchanged during GPU replay, and omit empty static owned projections.
 Both shipping HIP targets pass Release/Integration spill guards; Sol reviews clear.
 
-Fresh actual-Auto Release timing has 12 cells of 31 paired samples,16 complete
-operations each, with clean compiler-overlap and unchanged-producer receipts.
-Full 512 improves 309.105→112.646µs (Original,2.744×) and 318.130→124.723µs
-(Hadamard32,2.551×). All live 0/1/16/256/511/512 cells win; live1 paired 95%
-intervals are 1.0061–1.0139 and 1.0078–1.0125. Other candidate widths retain live1
-losses and are not installed. The actual-Auto profile matches the timing producer:
-wave64, 74 logical/76 allocated VGPRs, 19 SGPRs, 16KiB LDS, 2 INT8 WMMA sites,
-zero scratch/spills/LDS conflicts. GPU busy 100%, memory busy 71.47%, L2 hit 95.83%;
-AUTO power restored. [Qualification](GFX1100_ROUTER_LIVE_PREFILL.md) separates
-current Auto evidence from the prior 144-cell candidate tournament.
+Router's final 12-cell/31-pair panel wins every retained live-prefix cell in both
+bases. Profiles authenticate loaded code and restored AUTO power, with zero
+scratch/spills. The linked router proof retains raw timings, counter values,
+source identities and the earlier candidate tournament.
 
 Dense plans bind policy bytes, compiled core and Release producer. Loader replay
 guards table interposition; additive installation preserves unchanged rows.
@@ -154,7 +150,7 @@ explicit-half reduction result. The existing three byte gates pass; retain their
 fixed-order producers. Grouped attention now passes production row/capture,
 special-value and append/RoPE replay, plus fixed-query64K scaling. Its current
 byte-exact WMMA candidate loses all90 measured comparisons; Automatic retains
-Dot2. Its economy disposition remains open; see the
+Dot2. The bounded grouped-attention economy experiment is closed; see the
 [MTP work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md).
 
 ## Remaining implementation constraints

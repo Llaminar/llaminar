@@ -144,3 +144,37 @@ TEST(VerifierProjectionBundle, RecordingWorkersDoNotShareAdmission)
     std::thread first([&]{run(a);}),second([&]{run(b);});
     first.join();second.join();
 }
+
+/** @test GU authenticates exactly its original two roles and cannot authorize a copied API. */
+TEST(VerifierProjectionBundle, GateUpOriginalSpanAndNestedBoundary)
+{
+    BundleFixture f;
+    const auto members=std::span(f.projections).first(2);
+    const auto binding=VerifierProjectionBundleBinding::bind(VerifierProjectionBundleKind::GateUp,
+        DeviceId::rocm(0),f.input.get(),f.rows,32,members);
+    EXPECT_EQ(binding.kind(),VerifierProjectionBundleKind::GateUp);
+    for(int live:{16,1,0,8,16}) {
+        f.count=live;
+        EXPECT_TRUE(binding.matches(DeviceId::rocm(0),f.input.get(),f.rows,32,members));
+    }
+    const auto copied=f.projections;
+    EXPECT_FALSE(binding.matches(DeviceId::rocm(0),f.input.get(),f.rows,32,std::span(copied).first(2)));
+    EXPECT_FALSE(binding.matches(DeviceId::rocm(0),f.input.get(),f.rows,32,members.first(1)));
+    EXPECT_FALSE(binding.matches(DeviceId::rocm(1),f.input.get(),f.rows,32,members));
+    EXPECT_FALSE(binding.matches(DeviceId::rocm(0),f.foreign_input.get(),f.rows,32,members));
+    EXPECT_FALSE(binding.matches(DeviceId::rocm(0),f.input.get(),DeviceRowRange::deviceCounted(16,&f.foreign_count),32,members));
+    EXPECT_THROW((void)VerifierProjectionBundleBinding::bind(VerifierProjectionBundleKind::GateUp,
+        DeviceId::rocm(0),f.input.get(),f.rows,32,members.first(1)),std::invalid_argument);
+    EXPECT_THROW((void)VerifierProjectionBundleBinding::bind(VerifierProjectionBundleKind::GateUp,
+        DeviceId::rocm(0),f.input.get(),f.rows,32,f.projections),std::invalid_argument);
+    EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);
+    {
+        ScopedVerifierProjectionBundle original(binding);
+        const auto *owner=ScopedVerifierProjectionBundle::current();
+        try {ScopedVerifierProjectionBundle unknown(std::nullopt);EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);throw std::runtime_error("GU interrupted");}
+        catch(const std::runtime_error &) {}
+        EXPECT_EQ(ScopedVerifierProjectionBundle::current(),owner);
+    }
+    // The subsequent down call must see its own operation authority.
+    EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);
+}

@@ -1,10 +1,12 @@
 # gfx1100 connected dense FFN verifier
 
-The complete FFN core fixture now captures normalized FP32 input through actual
-`FusedGateUpGEMMStage` and fused-SwiGLU `GEMMStage`, ending at the FP32 branch
-output. All-source Release replay/timing passes22 cases and330 complete-chain cells.
-The136 stronger homogeneous winners span all21 source formats. All22 registered Integration gates also pass. No gate/up Automatic admission
-is installed by this fixture.
+Automatic now selects native GateUp for 136 source/width keys across all 21
+formats at the ordinary dense hidden5120/FFN17408 shape. Two complete FFN-chain
+Release panels each pass 315 cells and retain median wins at every selected key:
+geometric gains 1.113881× and 1.112072×. Six focused host
+gates/39 cases, 26 affected GPU gates/86 cases and all 16 exact producer profiles
+pass. This qualifies the bounded component; routed MTP, Wo and selected LM-head
+qualification remain separate work.
 
 ## Original operation and independent controls
 
@@ -17,9 +19,9 @@ verifier row binding and connected gate/up outputs match the actual stage
 configuration. Norm, residual addition and TP collectives are outside this
 explicitly bounded FFN core transaction.
 
-The four controls are complete Dot4, current Automatic, forced WMMA gate/up
+The seed controls are complete Dot4, prior Automatic, forced WMMA gate/up
 with Automatic down, and complete forced WMMA. The incremental GU comparison
-is current Automatic versus forced GU with unchanged Automatic down. Down
+is prior Automatic versus forced GU with unchanged Automatic down. Down
 already has independent scalar SwiGLU admission; a complete forced-WMMA win
 against Dot4 alone cannot qualify adding GU to production Automatic.
 
@@ -57,10 +59,11 @@ Preparation, poison, oracle and observation stay outside that interval.
 Ordinary AUTO power is required before and after unprofiled collection.
 Counters remain a separate qualification step after any native admission.
 
-The21 per-source Integration gates each retain a60-second deadline; the mixed
-control has its own gate. All22 names are explicitly included in the final
-ProductionTestPreflight inventory. This is the requested focused feature scope,
-not a full preflight or model-level MTP claim.
+The 21 per-source Integration gates each retain a 60-second deadline; mixed
+sources and guarded capacity have their own gates. All 23 names and the three
+new device-free binding/policy/stage-boundary regressions are explicitly in
+ProductionTestPreflight. The requested focused feature suite ran; the complete
+preflight suite and model-level MTP certification are outside this evidence.
 
 ## Incremental gate/up candidate economy
 
@@ -80,12 +83,69 @@ separate diagnostic controls and do not authorize a homogeneous source key.
 The generator recomputes eligibility from exact sample indices0–30 and all
 four finite-positive costs, checking the stored summary against those raw
 observations. It never uses the full-forced-versus-Dot4 ratio as the GU
-qualification label. Actual-Automatic replay/timing and separate exact-producer
-profiles remain required before installing a production selection.
+qualification label. The final installed-selection confirmation below uses
+fresh actual-Automatic observations against the same previous stage choices.
+
+## Installed Automatic qualification
+
+`VerifierProjectionBundleKind::GateUp` authenticates the original const two-source
+span in the actual stage before backend subgrouping. Its scope ends before down.
+Original input, count/extent, device, Q8 banks, prepared sources and output bindings
+must agree; copied/partial public spans, mixed sources, unknown shapes and guarded
+capacity do not borrow this qualification. Legal backend subgroups retain their
+original complete-operation authority. Device-free tests cover all source
+cross-products, M1–33, the IQ4_XS/M12 exclusion and scope restoration on false,
+exception and repeated actual GateUp-to-down stage execution.
+
+Final comparisons retain four independently prepared complete chains: Dot4,
+previous selection (Dot4 GU plus unchanged Automatic down), installed Automatic,
+and full forced WMMA. The scalar down mask, native arithmetic and launchers are
+unchanged. The old producer is frozen, and the collector independently checks
+every down decision against that mask. Canonical partition/span and native
+producer/reducer equality are asserted during replay; the seed log does not
+retain a numeric per-packet P/span export.
+
+Each actual-Automatic panel contains 315 source/M cells and 9,765 four-arm
+samples. All 136 selected medians win in both panels. First-run gain is
+1.044631–1.223892×; confirmation is
+1.046938–1.220591×, geometric mean
+1.112072×. The original seed's 5% filter is not a promised
+minimum on subsequent measurements. Unselected cases retain the same captured
+kernel/resource inventory; separate prepared allocations still show timing
+variation. Unselected geometric ratios are 1.000448× and 0.998993×; the second
+panel retains IQ2_XS/M2 and M3 ratios 0.903788× and 0.919963×, and IQ3_S/M4
+is slower in both panels. The audits preserve these observations without
+attributing their cause. This evidence does not claim every unselected cell is
+faster.
+
+The separate IQ4_XS/M16 profiler owner replays one actual chain with setup and
+observation outside the marker. GU and down share a native symbol, so attribution
+joins the exact counter Dispatch_Id and independently checks role, population
+and grid: GU 544×16×1/two members and down 80×16×1/one member. All 16 passes
+use the timing producer's loaded ELF `3cb215279203a6e5781dac965660e7fca1e5824f1ffaa926201cb4a4d84c896a`:
+wave64, 128 threads, 80 VGPRs, 7,040 LDS bytes and zero scratch/private storage or
+memory spills. GU/down measured occupancy is 45.76%/34.38%, memory busy
+64.13%/60.17%, L2 hit 20.03%/14.85%, with 2.31% LDS bank conflict. Both report
+100% GPU busy. These counter runs use STABLE_STD and restore AUTO; unprofiled
+qualification uses AUTO throughout. Complete source builds retain gfx906/gfx1100
+and CUDA sm86, with enforced spill guards.
 
 ## Evidence
 
 Root: `/tmp/llaminar-gfx1100-wmma-prefill-evidence`.
+
+- Final actual-Automatic snapshot: `mtp-ffn-verifier-automatic-qualified-snapshot-1794798130863860885/snapshot.json`, SHA256
+  `d7cc52b5eaed9ec2f5bb3913528c1f4baa8e252381431c93121947aaac58dbb8`. It freezes both final timing panels, host/GPU gates,
+  profile owner, all 16 counter records, raw observations, exact producer versions,
+  compiler logs and independent audits. The seed snapshot below remains the
+  immutable selection provenance.
+- First/second actual-Automatic timing: `mtp-ffn-verifier-automatic-release-timing-1794796054085743285/receipt.json` and
+  `mtp-ffn-verifier-automatic-release-timing-1794797063552840481/receipt.json`.
+- Independent timing audits: `ffn-automatic-first-timing-audit.json` and
+  `ffn-automatic-second-timing-audit.json`.
+- Final source builds: `ffn-automatic-release-build-r1.log`,
+  `ffn-automatic-integration-build-r1.log`, `ffn-automatic-host-build-r2.log`;
+  affected target rebuild: `ffn-auto-affected-feature-build.log`.
 
 - Reviewed smoke: `mtp-ffn-verifier-seed-release-replay-1794794089533027378/receipt.json`,
   three cases,33.792s GoogleTest wall time.

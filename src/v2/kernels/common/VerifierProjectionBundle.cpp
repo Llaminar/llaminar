@@ -25,7 +25,7 @@ VerifierProjectionBundleBinding VerifierProjectionBundleBinding::bind(
     DeviceRowRange rows, int reduction, Projections projections)
 {
     const std::size_t members = kind == VerifierProjectionBundleKind::AttentionQKV ? 3 :
-        kind == VerifierProjectionBundleKind::AttentionKV ? 2 : 0;
+        (kind == VerifierProjectionBundleKind::AttentionKV || kind == VerifierProjectionBundleKind::GateUp) ? 2 : 0;
     if (!members || (!device.is_cpu() && !device.is_gpu()) || !input ||
         rows.physicalRows() < 1 || reduction < 1 || projections.size() != members)
         throw std::invalid_argument("Verifier projection bundle requires its complete original operation");

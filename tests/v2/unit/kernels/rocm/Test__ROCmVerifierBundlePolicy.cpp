@@ -1,6 +1,6 @@
 /**
  * @file Test__ROCmVerifierBundlePolicy.cpp
- * @brief Device-free replay of QKV source, subgroup and measured-key admission.
+ * @brief Device-free replay of QKV/GU sources, original subgroups and measured-key admission.
  *
  * Host words stand only for immutable addresses. These tests never dereference
  * a device count or initialize hardware; native capture tests qualify the actual
@@ -199,4 +199,57 @@ TEST(ROCmVerifierBundlePolicy, EveryMemberOwnsPartitionsAndWaveTarget)
     }
     EXPECT_FALSE(qualifies(0));
     EXPECT_FALSE(qualifies(NATIVE_QUANTISED_SMALL_M_MAX_BATCH+1));
+}
+
+/** @test Valid backend GU singleton packets retain the complete original operation. */
+TEST(ROCmVerifierBundlePolicy, GateUpSubgroupsAndOriginalAuthority)
+{
+    BundleFixture f;f.operation.kind=VerifierProjectionBundleKind::GateUp;f.operation.count=2;
+    f.operation.members[0].n=f.operation.members[1].n=17408;
+    for(unsigned mask:{1u,2u,3u})for(int live:{16,1,0,16}) {
+        f.subgroup(mask);f.count=live;
+        EXPECT_TRUE(matchesNativeQuantisedVerifierBundle(f.operation,f.work,0));
+        EXPECT_TRUE(measuredNativeQuantisedVerifierBundle(f.operation));
+    }
+    f.subgroup(3);
+    auto foreign=f.operation;foreign.kind=VerifierProjectionBundleKind::AttentionKV;
+    EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(foreign));
+    foreign=f.operation;foreign.count=1;EXPECT_FALSE(matchesNativeQuantisedVerifierBundle(foreign,f.work,0));
+    foreign=f.operation;foreign.count=3;EXPECT_FALSE(matchesNativeQuantisedVerifierBundle(foreign,f.work,0));
+    foreign=f.operation;foreign.kind=static_cast<VerifierProjectionBundleKind>(255);
+    EXPECT_FALSE(matchesNativeQuantisedVerifierBundle(foreign,f.work,0));EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(foreign));
+    f.work.activations=&f.foreign_quantized;EXPECT_FALSE(matchesNativeQuantisedVerifierBundle(f.operation,f.work,0));
+    f.work.activations=&f.quantized;f.packet.rows=DeviceRowRange::deviceCounted(16,&f.foreign_count);
+    EXPECT_FALSE(matchesNativeQuantisedVerifierBundle(f.operation,f.work,0));
+}
+
+/** @test Every original source/M key remains separate from mixed aliases and unmeasured geometry. */
+TEST(ROCmVerifierBundlePolicy, GateUpSourceInventoryAndMeasuredHoles)
+{
+    BundleFixture f;auto operation=f.operation;operation.kind=VerifierProjectionBundleKind::GateUp;operation.count=2;
+    operation.members[0].n=operation.members[1].n=17408;
+    int selected=0;
+    for(const auto &format:quantizedVerifierFormats())for(int m=1;m<=33;++m) {
+        operation.rows=DeviceRowRange::deviceCounted(m,&f.count);
+        const NativeQuantisedSourceIdentity source{format.source_codebook_id,format.source_is_superblock,true};
+        operation.members[0].source=operation.members[1].source=source;
+        const bool native=measuredNativeQuantisedVerifierBundle(operation);selected+=native;
+        if(m<2 || m>16)EXPECT_FALSE(native);
+        if(m==16)EXPECT_TRUE(native);
+        auto unknown=operation;unknown.k+=32;EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(unknown));
+        unknown=operation;unknown.members[1].n+=64;EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(unknown));
+        unknown=operation;unknown.members[0].source.present=false;EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(unknown));
+        for(const auto &other:quantizedVerifierFormats()) {
+            const NativeQuantisedSourceIdentity second{other.source_codebook_id,other.source_is_superblock,true};
+            if(second==source)continue;
+            auto mixed=operation;mixed.members[1].source=second;
+            EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(mixed));
+        }
+    }
+    // The independent frozen complete-chain panel admits136 of315 source/M keys.
+    EXPECT_EQ(selected,136);
+    operation.members[0].source=operation.members[1].source={4,true,true};
+    operation.rows=DeviceRowRange::deviceCounted(11,&f.count);EXPECT_TRUE(measuredNativeQuantisedVerifierBundle(operation));
+    operation.rows=DeviceRowRange::deviceCounted(12,&f.count);EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(operation));
+    operation.rows=DeviceRowRange::deviceCounted(13,&f.count);EXPECT_TRUE(measuredNativeQuantisedVerifierBundle(operation));
 }

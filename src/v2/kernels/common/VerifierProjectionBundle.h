@@ -18,11 +18,12 @@
 
 namespace llaminar2
 {
-/** @brief Complete supported attention projection operations, in semantic order. */
+/** @brief Complete supported fused projection operations, in semantic order. */
 enum class VerifierProjectionBundleKind : std::uint8_t
 {
     AttentionQKV, ///< Original query, key, value descriptors in that order.
     AttentionKV,  ///< Original key and value descriptors; no unused query member.
+    GateUp,       ///< Original gate and up descriptors; down has its own operation authority.
 };
 
 /** @brief Validated, immutable identity of one original fused verifier call. */
