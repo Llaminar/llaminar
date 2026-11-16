@@ -13,6 +13,7 @@
  */
 
 #include <gtest/gtest.h>
+#include <type_traits>
 #include "kernels/rocm/gemm/ROCmMoEGroupedPopulationPublication.h"
 #include "kernels/common/MoEPrefillProjectionExecution.h"
 
@@ -335,6 +336,78 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, LiveAdmissionPreservesExactKeysAndReje
     EXPECT_THROW((ROCmMoEGroupedRouteAdmission(key, &storage, &storage)), std::invalid_argument);
     key.rows = 0;
     EXPECT_THROW((ROCmMoEGroupedRouteAdmission(key, &storage, &storage)), std::invalid_argument);
+}
+
+/** @test Lowering preserves every slot around exact rows and every immutable-key exclusion. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, LoweredLiveSlotPolicyBoundaryReplay)
+{
+    using namespace llaminar2::rocm;
+    static_assert(std::is_trivially_copyable_v<ROCmMoELiveSlotPolicy>);
+    static_assert(std::is_trivially_copyable_v<ROCmMoEGroupedRouteAdmission>);
+    int unread = -991;
+    for(int rows=1;rows<=65;++rows)
+        for(int top_k:{1,2,3,8,16})
+            for(int mutation=0;mutation<8;++mutation)
+            {
+                ROCmMoEGroupedPrefillRouteKey key{
+                    .gateup_codebook=19,.down_codebook=19,.hidden_size=3072,.expert_width=1024,
+                    .expert_count=256,.top_k=top_k,.rows=rows,
+                    .operation=llaminar2::MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes};
+                switch(mutation)
+                {
+                case 1: key.gateup_codebook=20; break;
+                case 2: key.down_codebook=21; break;
+                case 3: key.hidden_size=2048; break;
+                case 4: key.expert_width=512; break;
+                case 5: key.expert_count=255; break;
+                case 6: key.operation=llaminar2::MoEPrefillMeasuredOperation::Unmeasured; break;
+                case 7: key.operation=llaminar2::MoEPrefillMeasuredOperation::CompleteFullWidthSharedVerifierTokenRows; break;
+                default: break;
+                }
+                const auto lowered=ROCmMoELiveSlotPolicy::lower(key);
+                const ROCmMoEGroupedRouteAdmission admission(key,&unread,&unread);
+                ASSERT_TRUE(admission.binds(key,&unread,&unread));
+                for(int slots=0;slots<=rows*top_k;++slots)
+                {
+                    auto live=key; live.rows=slots?1+(slots-1)/top_k:1;
+                    const auto expected=selectROCmMoEGroupedPrefillRouteStrategy(live).strategy;
+                    ASSERT_EQ(lowered.choose(slots),expected) << "rows=" << rows << " slots=" << slots << " mutation=" << mutation;
+                    ASSERT_EQ(admission.strategyForSlots(slots),expected);
+                }
+                EXPECT_EQ(lowered.choose(-1),ROCmMoEGroupedPrefillRouteStrategy::Invalid);
+                EXPECT_EQ(lowered.choose(rows*top_k+1),ROCmMoEGroupedPrefillRouteStrategy::Invalid);
+            }
+    EXPECT_EQ(unread,-991);
+}
+
+/** @test Valid extreme capacities and subtraction guards never overflow signed arithmetic. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, LoweredLiveSlotPolicyOverflowReplay)
+{
+    using namespace llaminar2::rocm;
+    for(const auto geometry:std::array<std::pair<int,int>,3>{{{1,INT32_MAX},{INT32_MAX,1},{INT32_MAX/3,3}}})
+    {
+        ROCmMoEGroupedPrefillRouteKey key{
+            .gateup_codebook=13,.down_codebook=24,.hidden_size=2048,.expert_width=512,
+            .expert_count=INT32_MAX,.top_k=geometry.second,.rows=geometry.first};
+        const int capacity=int(int64_t(key.rows)*key.top_k);
+        const auto lowered=ROCmMoELiveSlotPolicy::lower(key);
+        for(int slots:{0,1,7,8,9,capacity-1,capacity})
+        {
+            auto live=key; live.rows=slots?1+(slots-1)/key.top_k:1;
+            EXPECT_EQ(lowered.choose(slots),selectROCmMoEGroupedPrefillRouteStrategy(live).strategy);
+        }
+        EXPECT_TRUE(lowered.validSpan(0,capacity));
+        EXPECT_TRUE(lowered.validSpan(capacity,0));
+        EXPECT_TRUE(lowered.validSpan(1,capacity-1));
+        EXPECT_FALSE(lowered.validSpan(1,capacity));
+        EXPECT_FALSE(lowered.validSpan(capacity,1));
+        EXPECT_FALSE(lowered.validSpan(-1,0));
+        EXPECT_FALSE(lowered.validSpan(0,-1));
+        EXPECT_FALSE(lowered.validSpan(INT32_MIN,INT32_MAX));
+        if(capacity<INT32_MAX) EXPECT_EQ(lowered.choose(capacity+1),ROCmMoEGroupedPrefillRouteStrategy::Invalid);
+        key.rows=INT32_MAX;key.top_k=2;
+        EXPECT_THROW((void)ROCmMoELiveSlotPolicy::lower(key),std::invalid_argument);
+    }
 }
 
 namespace
@@ -668,6 +741,24 @@ TEST(Test__ROCmMoEGroupedPrefillDispatch, RowPlanRejectsInvalidGeometryAndSepara
 #include "kernels/rocm/gemm/ROCmMoEGroupedPopulationDecision.h"
 #include "kernels/rocm/gemm/ROCmMoEGroupedPopulationWork.h"
 #include "execution/moe/MoEGroupedWorkspaceGeometry.h"
+
+/** @test The persistent bank covers full tail initialization of either mutually exclusive layout. */
+TEST(Test__ROCmMoEGroupedPopulation, FixedTileDirectoryCapacityReplay)
+{
+    using llaminar2::MoEWorkspaceBuffers::rocmAdaptivePrefillDirectoryWords;
+    // Eight populated experts at M512/top8 still clear the entire conservative
+    // TM4 span: 8 + ceil(4096/4) = 1032. The old dual TM12/TM16 bank held 616.
+    EXPECT_EQ(rocmAdaptivePrefillDirectoryWords(4096,8),1032u);
+    for (std::size_t experts : {1u,8u,32u,256u,512u})
+        for (std::size_t slots : {1u,8u,64u,72u,128u,4096u,32768u})
+        {
+            const auto words = rocmAdaptivePrefillDirectoryWords(slots,experts);
+            const auto active = std::min(slots,experts);
+            for (std::size_t rows : {4u,8u,12u,16u})
+                EXPECT_GE(words,std::min(slots,active+(slots+rows-1)/rows));
+            EXPECT_GE(words,2u+std::min(slots,active+(slots+11)/12)+std::min(slots,active+(slots+15)/16));
+        }
+}
 
 /** @test Exact operation admission excludes each independent neighboring capture identity. */
 TEST(Test__ROCmMoEGroupedPopulation, ImmutableOperationReplay)

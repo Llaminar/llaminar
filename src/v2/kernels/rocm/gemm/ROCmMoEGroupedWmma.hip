@@ -29,6 +29,7 @@ namespace
 {
 thread_local MoEGroupedPrefillEngine recording_engine = MoEGroupedPrefillEngine::Automatic;
 thread_local MoEGroupedWmmaRowFloor recording_floor = MoEGroupedWmmaRowFloor::EveryExpert;
+thread_local MoEGroupedDirectorySource recording_directory = MoEGroupedDirectorySource::RolePlanner;
 
 }
 
@@ -42,9 +43,13 @@ bool nativeGroupedDevice(int device)
 }
 
 ScopedMoEGroupedPrefillEngine::ScopedMoEGroupedPrefillEngine(
-    MoEGroupedPrefillEngine engine, MoEGroupedWmmaRowFloor floor)
-    : previous_(recording_engine), previous_floor_(recording_floor)
+    MoEGroupedPrefillEngine engine, MoEGroupedWmmaRowFloor floor, MoEGroupedDirectorySource directory)
+    : previous_(recording_engine), previous_floor_(recording_floor), previous_directory_(recording_directory)
 {
+    if (directory != MoEGroupedDirectorySource::RolePlanner &&
+        (directory != MoEGroupedDirectorySource::GroupingOffsetSlots ||
+         engine != MoEGroupedPrefillEngine::WideDot4Wmma || floor != MoEGroupedWmmaRowFloor::Eight))
+        throw std::invalid_argument("grouping offset slots require explicit WideFloor8 arithmetic");
     if (!validMoEGroupedWmmaRowFloor(floor) ||
         ((engine == MoEGroupedPrefillEngine::Automatic || engine == MoEGroupedPrefillEngine::OrderedDot4) &&
          floor != MoEGroupedWmmaRowFloor::EveryExpert))
@@ -58,12 +63,14 @@ ScopedMoEGroupedPrefillEngine::ScopedMoEGroupedPrefillEngine(
     case MoEGroupedPrefillEngine::WmmaM16N32:
     case MoEGroupedPrefillEngine::WmmaM16N64:
     case MoEGroupedPrefillEngine::WideDot4Wmma:
-        recording_engine = engine; recording_floor = floor; return;
+        recording_engine = engine; recording_floor = floor; recording_directory = directory; return;
     }
     throw std::invalid_argument("unknown grouped MoE dot engine");
 }
 ScopedMoEGroupedPrefillEngine::~ScopedMoEGroupedPrefillEngine()
-{ recording_engine = previous_; recording_floor = previous_floor_; }
+{ recording_engine = previous_; recording_floor = previous_floor_; recording_directory = previous_directory_; }
+
+MoEGroupedDirectorySource selectedMoEGroupedDirectorySource() noexcept { return recording_directory; }
 
 MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device, const MoEGroupedPopulationKey &key)
 {
@@ -81,7 +88,7 @@ MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device, const MoEGro
         return {MoEGroupedPrefillEngine::OrderedDot4,MoEGroupedWmmaRowFloor::EveryExpert};
     if (!nativeGroupedDevice(device))
         throw std::invalid_argument("grouped MoE WMMA requires actual gfx1100 and native tile resources");
-    return {recording_engine,recording_floor};
+    return {recording_engine,recording_floor,MoEGroupedPopulationDomain::Unmeasured,recording_directory};
 }
 
 namespace grouped_wmma_detail

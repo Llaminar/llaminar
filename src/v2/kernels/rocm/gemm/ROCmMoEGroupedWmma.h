@@ -22,15 +22,23 @@ namespace llaminar2::rocm
 /** @brief Explicit recording choices; Automatic retains installed measured policy. */
 enum class MoEGroupedPrefillEngine { Automatic, PopulationAdaptive, OrderedDot4, WmmaM16N32, WmmaM16N64, WideDot4Wmma };
 
+/** @brief Directory producer embedded in the captured operation, independent of arithmetic. */
+enum class MoEGroupedDirectorySource { RolePlanner, GroupingOffsetSlots };
+
+/** @return Explicit capture policy shared by grouping and its subsequent projection. */
+MoEGroupedDirectorySource selectedMoEGroupedDirectorySource() noexcept;
+
 /** @brief Nestable worker-local selection, embedded in the captured native nodes. */
 class ScopedMoEGroupedPrefillEngine final
 {
 public:
     /** @brief Set the recording engine and its explicit whole-expert row floor.
      * @param engine Explicit candidate or installed policy.
-     * @param floor Native eligibility threshold; only native candidates accept a nonzero floor. */
+     * @param floor Native eligibility threshold; only native candidates accept a nonzero floor.
+     * @param directory Directory producer; offset slots require the explicit wide floor-eight candidate. */
     explicit ScopedMoEGroupedPrefillEngine(MoEGroupedPrefillEngine engine,
-        MoEGroupedWmmaRowFloor floor = MoEGroupedWmmaRowFloor::EveryExpert);
+        MoEGroupedWmmaRowFloor floor = MoEGroupedWmmaRowFloor::EveryExpert,
+        MoEGroupedDirectorySource directory = MoEGroupedDirectorySource::RolePlanner);
     /** @brief Restore the enclosing recording policy without changing retained graphs. */
     ~ScopedMoEGroupedPrefillEngine();
     ScopedMoEGroupedPrefillEngine(const ScopedMoEGroupedPrefillEngine &) = delete;
@@ -38,6 +46,7 @@ public:
 private:
     MoEGroupedPrefillEngine previous_;
     MoEGroupedWmmaRowFloor previous_floor_;
+    MoEGroupedDirectorySource previous_directory_;
 };
 
 /** @brief Resolved recording policy; Automatic never survives native admission. */
@@ -46,6 +55,7 @@ struct MoEGroupedPrefillPolicy
     MoEGroupedPrefillEngine engine;
     MoEGroupedWmmaRowFloor minimum_expert_rows;
     MoEGroupedPopulationDomain population = MoEGroupedPopulationDomain::Unmeasured;
+    MoEGroupedDirectorySource directory = MoEGroupedDirectorySource::RolePlanner;
 };
 
 /** @brief One distinct successfully submitted tiled launch geometry, including dormant leaves. */

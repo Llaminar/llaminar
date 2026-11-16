@@ -4,7 +4,7 @@
  *
  * Normal production admission rejects every suppression value except None.
  * This lease changes only that immutable argument in an already instantiated
- * adaptive down kernel. It retains both argument packets, joins the exact
+ * adaptive projection role. It retains both argument packets, joins the exact
  * capture stream and restores every successful patch before local storage dies.
  * Imported timing-parent nodes are inspected directly, never their source graph.
  */
@@ -79,7 +79,7 @@ inline std::array<size_t,2> inspectROCmGroupedWideCapture(HIPGraphCapture &captu
     return roles;
 }
 
-/** @brief Own a temporary branch omission on every repeated adaptive down node. */
+/** @brief Own a temporary branch omission on every repeated node of one adaptive role. */
 class ROCmGroupedBranchMutation final
 {
     /** @brief Stable original/fault packets and the unchanged native launch geometry. */
@@ -107,11 +107,14 @@ public:
     /** @brief Inspect actual executable nodes before changing any argument.
      * @param capture Instantiated graph, including an imported timing parent.
      * @param stream Exact non-default stream retained by this test graph.
+     * @param role Projection role whose arithmetic branch is omitted; defaults to down.
      * @throws std::runtime_error For missing adaptive nodes or incompatible argument packets. */
-    ROCmGroupedBranchMutation(HIPGraphCapture &capture, hipStream_t stream)
+    ROCmGroupedBranchMutation(HIPGraphCapture &capture, hipStream_t stream,
+        rocm::MoEPrefillProjectionRole role = rocm::MoEPrefillProjectionRole::Down)
         : executable_(capture.executable()), stream_(stream)
     {
-        if (!capture.graph() || !executable_ || !stream ||
+        if ((role != rocm::MoEPrefillProjectionRole::GateUp && role != rocm::MoEPrefillProjectionRole::Down) ||
+            !capture.graph() || !executable_ || !stream ||
             stream == hipStreamLegacy || stream == hipStreamPerThread)
             throw std::runtime_error("Grouped branch mutation requires a retained graph and exact stream");
         size_t count = 0;
@@ -119,6 +122,7 @@ public:
         std::vector<hipGraphNode_t> nodes(count);
         require(hipGraphGetNodes(capture.graph(),nodes.data(),&count),"inspect grouped nodes");
         patches_.reserve(count);
+        const bool gate_up = role == rocm::MoEPrefillProjectionRole::GateUp;
         for (auto node : nodes)
         {
             hipGraphNodeType type;
@@ -129,12 +133,12 @@ public:
             const char *name = hipKernelNameRefByPtr(params.func,stream_);
             if (!name) throw std::runtime_error("Grouped node has no native symbol");
             const std::string_view symbol(name);
-            if (symbol.find("grouped_wmma_detail") == std::string_view::npos || params.gridDim.z != 1)
+            if (symbol.find("grouped_wmma_detail") == std::string_view::npos || params.gridDim.z != (gate_up ? 2u : 1u))
                 continue;
-            // The last two template booleans identify Down and Adaptive=true.
-            if (symbol.find("ELb0ELb1EE") == std::string_view::npos ||
+            // The last two template booleans identify the role and Adaptive=true.
+            if (symbol.find(gate_up ? "ELb1ELb1EE" : "ELb0ELb1EE") == std::string_view::npos ||
                 !params.kernelParams || !params.kernelParams[0] || params.extra)
-                throw std::runtime_error("Branch mutation requires an actual adaptive down node");
+                throw std::runtime_error("Branch mutation requires an actual adaptive projection node");
             using Arguments = rocm::MoEGroupedWmmaArguments;
             static_assert(std::is_trivially_copyable_v<Arguments>);
             std::array<std::byte,sizeof(Arguments)> bytes;
@@ -143,17 +147,20 @@ public:
             const bool wide = symbol.find("wideProjection") != std::string_view::npos;
             if ((!wide && symbol.find("10projection") == std::string_view::npos) ||
                 original.dot_admission.rowPlan().isWide() != wide ||
-                (wide && original.dot_admission.rowPlan().role() != rocm::MoEPrefillProjectionRole::Down))
+                original.dot_admission.rowPlan().role() != role ||
+                !original.dot_admission.binds(role,original.n,original.k))
                 throw std::runtime_error("Grouped symbol and captured row plan disagree");
             Patch patch{.node=node,.params=params,.original=original,.fault=original};
             if (patch.original.branch_suppression != rocm::MoEGroupedBranchSuppression::None ||
-                !patch.original.dot_admission.mayUseOrdered() || patch.original.second_descriptors ||
-                patch.original.second_output || patch.original.input != rocm::MoEGroupedWmmaInput::GroupedRows)
+                !patch.original.dot_admission.mayUseOrdered() ||
+                (patch.original.second_descriptors != nullptr) != gate_up ||
+                (patch.original.second_output != nullptr) != gate_up ||
+                (!gate_up && patch.original.input != rocm::MoEGroupedWmmaInput::GroupedRows))
                 throw std::runtime_error("Grouped argument packet is incompatible with branch omission");
             patch.fault = patch.original;
             patches_.push_back(patch);
         }
-        if (patches_.empty()) throw std::runtime_error("No adaptive down writers were captured");
+        if (patches_.empty()) throw std::runtime_error("No adaptive writers of the requested role were captured");
         // The vector is complete before any pointer borrows its argument storage.
         for (auto &patch : patches_)
         {

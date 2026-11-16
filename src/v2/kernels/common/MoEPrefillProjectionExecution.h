@@ -22,11 +22,14 @@
 
 #include "WorkspaceOverwriteContract.h"
 #include "DeviceRowRange.h"
+#include "MoEGroupingPackedDirectory.h"
 
 #include <stdexcept>
 #include <cstdint>
 #include <utility>
 #include <optional>
+#include <exception>
+#include <memory>
 
 namespace llaminar2
 {
@@ -73,7 +76,82 @@ namespace llaminar2
         MoEPrefillGroupingProvenance &operator=(const MoEPrefillGroupingProvenance &) = delete;
 
         /** @brief Revoke provenance when grouping buffers or their owner change. */
-        void invalidate() noexcept { scope_ = MoEPrefillRouteScope::Unspecified; shared_rows_.reset(); }
+        void invalidate() noexcept
+        {
+            scope_ = MoEPrefillRouteScope::Unspecified;
+            shared_rows_.reset();
+            revokeDirectory();
+        }
+
+        /** @brief Revoke work-bank authority before another planner overwrites it, retaining route origin. */
+        void revokeDirectory() noexcept
+        {
+            packed_directory_.reset();
+            if (++generation_ == 0) std::terminate();
+        }
+
+        /** @brief Non-owning, non-detachable directory authority for one synchronous submission. */
+        class DirectoryBorrow final
+        {
+        public:
+            DirectoryBorrow(const DirectoryBorrow &) = delete;
+            DirectoryBorrow &operator=(const DirectoryBorrow &) = delete;
+            /** @return Whether this original generation published the optional layout.
+             * @throws std::logic_error If reset or another grouping revoked the borrow. */
+            [[nodiscard]] bool present() const { validate(); return directory_.has_value(); }
+            /** @brief Authenticate all original banks and geometry before recording a consumer.
+             * @param expected Exact current consuming workspace/stream/geometry declaration.
+             * @return Original published bindings. @throws std::logic_error For absence or mismatch. */
+            [[nodiscard]] const MoEGroupingPackedDirectory &requireMatching(
+                const MoEGroupingPackedDirectory &expected) const
+            {
+                validate();
+                if (!directory_ || *directory_ != expected)
+                    throw std::logic_error("grouped packed directory consumer changed its original producer binding");
+                return *directory_;
+            }
+            /** @brief Authenticate the actual native consumer packet against this live borrow.
+             * @param counts Original count bank. @param offsets Original offset bank.
+             * @param words Packed work bank. @param rows Physical token capacity.
+             * @param top_k Original route multiplicity. @param experts Expert domain.
+             * @param device Exact owning device. @param stream Exact ordered stream.
+             * @return Original published binding; no authority is transferred.
+             * @throws std::logic_error For a revoked, missing or incompatible publication. */
+            [[nodiscard]] const MoEGroupingPackedDirectory &requireProjection(
+                const int *counts, const int *offsets, const uint32_t *words,
+                int rows, int top_k, int experts, DeviceId device, void *stream) const
+            {
+                validate();
+                if (!directory_ || directory_->counts() != counts || directory_->offsets() != offsets ||
+                    directory_->words() != words || directory_->rows() != rows || directory_->topK() != top_k ||
+                    directory_->experts() != experts || directory_->device() != device || directory_->stream() != stream)
+                    throw std::logic_error("grouped packed directory does not bind the submitted projection packet");
+                return *directory_;
+            }
+        private:
+            friend class MoEPrefillGroupingProvenance;
+            /** @brief Snapshot immutable metadata while retaining its sole publication authority. */
+            explicit DirectoryBorrow(const MoEPrefillGroupingProvenance &owner)
+                : owner_(owner), lifetime_(owner.lifetime_), generation_(owner.generation_), directory_(owner.packed_directory_) {}
+            /** @brief A copied pointer set cannot resurrect revoked publication authority. */
+            void validate() const
+            {
+                if (lifetime_.expired() || owner_.preparing_ || owner_.generation_ != generation_)
+                    throw std::logic_error("grouped packed directory borrow was revoked by preparation or reset");
+            }
+            const MoEPrefillGroupingProvenance &owner_;
+            std::weak_ptr<const uint8_t> lifetime_; ///< Cold owner identity; checked before dereferencing its storage.
+            uint64_t generation_;
+            std::optional<MoEGroupingPackedDirectory> directory_;
+        };
+
+        /** @return A lexical borrow that cannot be copied or moved out as ownership.
+         * @throws std::logic_error While an incomplete grouping still owns publication. */
+        [[nodiscard]] DirectoryBorrow borrowDirectory() const
+        {
+            if (preparing_) throw std::logic_error("cannot borrow a directory from incomplete grouping");
+            return DirectoryBorrow(*this);
+        }
 
         /** @return The last successfully published static producer's origin. */
         [[nodiscard]] MoEPrefillRouteScope scope() const noexcept { return scope_; }
@@ -103,7 +181,7 @@ namespace llaminar2
             /** @brief Failed or abandoned setup cannot retain old provenance. */
             ~Preparation()
             {
-                if (owner_)
+                if (owner_ && !lifetime_.expired())
                 {
                     owner_->invalidate();
                     owner_->preparing_ = false;
@@ -112,16 +190,23 @@ namespace llaminar2
 
             /**
              * @brief Publish only after the entire grouping producer succeeded.
+             * @param directory Optional original packed layout submitted by the
+             * combined grouping publisher; other producers must leave it absent.
              * @throws std::logic_error if a consumed preparation is reused.
              * @note Invocation success means enqueued on its existing stream;
              *       no device count is inspected and no completion wait is added.
              */
-            void publish() &&
+            void publish(std::optional<MoEGroupingPackedDirectory> directory = std::nullopt) &&
             {
-                if (!owner_)
+                if (!owner_ || lifetime_.expired())
                     throw std::logic_error("grouped MoE origin publication already consumed");
+                if (directory && owner_->generation_ != generation_)
+                    throw std::logic_error("packed directory preparation was revoked before publication");
+                if (directory && scope_ != MoEPrefillRouteScope::AllRoutes)
+                    throw std::logic_error("packed work directory requires an ordinary all-route grouping producer");
                 owner_->scope_ = scope_;
                 owner_->shared_rows_ = shared_rows_;
+                owner_->packed_directory_ = std::move(directory);
                 owner_->preparing_ = false;
                 owner_ = nullptr;
             }
@@ -137,16 +222,19 @@ namespace llaminar2
              */
             Preparation(MoEPrefillGroupingProvenance &owner, MoEPrefillRouteScope scope,
                 std::optional<DeviceRowRange::CaptureIdentity> shared_rows = std::nullopt)
-                : owner_(&owner), scope_(scope), shared_rows_(shared_rows)
+                : owner_(&owner), lifetime_(owner.lifetime_), scope_(scope), shared_rows_(shared_rows)
             {
                 if (owner.preparing_)
                     throw std::logic_error("grouped MoE origin preparation overlaps an active producer");
                 owner.preparing_ = true;
                 owner.invalidate();
+                generation_ = owner.generation_;
             }
             MoEPrefillGroupingProvenance *owner_;
+            std::weak_ptr<const uint8_t> lifetime_; ///< Preparation cannot publish through a destroyed/replaced owner.
             MoEPrefillRouteScope scope_;
             std::optional<DeviceRowRange::CaptureIdentity> shared_rows_;
+            uint64_t generation_ = 0; ///< Packed storage cannot survive an intervening invalidation.
         };
 
         /**
@@ -192,6 +280,9 @@ namespace llaminar2
     private:
         MoEPrefillRouteScope scope_ = MoEPrefillRouteScope::Unspecified;
         std::optional<DeviceRowRange::CaptureIdentity> shared_rows_; ///< Capture metadata only; device owns the count value.
+        std::optional<MoEGroupingPackedDirectory> packed_directory_; ///< Original binding metadata, never live route counts.
+        const std::shared_ptr<const uint8_t> lifetime_ = std::make_shared<const uint8_t>(0); ///< Allocated only with the cold kernel owner.
+        uint64_t generation_ = 1; ///< Revokes lexical borrows on every replacement/reset.
         bool preparing_ = false; ///< Exactly one setup publication owns this instance.
     };
 

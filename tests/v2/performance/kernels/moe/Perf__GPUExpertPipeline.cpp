@@ -26,6 +26,8 @@
  * Native tournaments wrap complete retained operation batches in internal
  * timeline events. Each sample must overwrite poisoned state before another
  * candidate can repair it; host submission gaps stay outside the interval.
+ * Routed MTP probes use the actual counted router and expert stage with
+ * independent M1 runtime decode, including sparse replay and reset.
  * Seeded host sources are synthesized independently on physical CPU workers;
  * quantized preparation batches the original matrices through one production
  * loader while retaining individual prepared handles and source lifetimes.
@@ -40,6 +42,10 @@
 #include "execution/moe/MoERuntimeTable.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/IMoEKernel.h"
+#include "execution/compute_stages/stages/MoEExpertComputeStage.h"
+#include "mocks/MockComputeStage.h"
+#include "transfer/TransferEngine.h"
+#include "utils/DebugEnv.h"
 #include "kernels/KernelFactory.h"
 #include "utils/GpuPreparedGemmHarness.h"
 #include "utils/TestTensorFactory.h"
@@ -88,6 +94,9 @@ namespace
     using namespace llaminar2::test;
     using native_quantised_dispatch::MoERoutingProfile;
 
+    /** @brief Controlled router populations for counted MTP transaction qualification. */
+    enum class RoutedVerifierDistribution { Uniform, Hotset32, Concentrated8, MixedCohorts, ColdThenHot };
+
     /** One backend/storage/physical-row shape; no weight conversion is timed. */
     struct Case
     {
@@ -103,6 +112,7 @@ namespace
         int ownership_degree = 0; ///< Nonzero selects ordinal whole-expert ownership.
         std::optional<TensorType> down_format;
         MoERoutingProfile route_profile = MoERoutingProfile::Uniform;
+        std::optional<RoutedVerifierDistribution> verifier_distribution;
     };
 
     /** @return Symmetric storage, prompt/verifier geometry and sparse live-work cases. */
@@ -267,7 +277,8 @@ namespace
         WmmaHybridReplay, WmmaHybridTournament, WmmaHybrid32Profile, WmmaHybridTimingReplay,
         OrderedProfile, OrderedColdProfile, WmmaAdaptive32ColdProfile,
         WmmaMacroReplay, WmmaMacroTournament, WmmaMacroTimingReplay, WmmaMacroProfile, WmmaMacroColdProfile,
-        PopulationReplay, PopulationTournament, PopulationProfile
+        PopulationReplay, PopulationTournament, PopulationProfile,
+        RoutedVerifierReplay, RoutedVerifierTournament
     };
 
 #ifdef HAVE_ROCM
@@ -383,6 +394,7 @@ namespace
         rocm::MoEGroupedPrefillEngine engine;
         rocm::MoEGroupedWmmaRowFloor floor;
         std::string name;
+        rocm::MoEGroupedDirectorySource directory = rocm::MoEGroupedDirectorySource::RolePlanner;
     };
 
     /** @param hybrid Include all explicit whole-expert admission experiments.
@@ -473,6 +485,10 @@ namespace
     }
 #endif
 
+#ifdef HAVE_ROCM
+#include "ROCmRoutedVerifierTransaction.h"
+#endif
+
     /** @brief Reuse production geometry and source preparation for native tournaments.
      * @param parameter Exact existing model/control case. @param mode Timing or isolated profile owner.
      * @param publication_mode Complete public operation boundary retained by every candidate.
@@ -481,6 +497,11 @@ namespace
         ExpertPublication publication_mode = ExpertPublication::CanonicalRoutesThenFold,
         std::optional<PopulationProfileWork> profile_work = std::nullopt)
     {
+        const bool routed_verifier = mode == ExpertBenchmark::RoutedVerifierReplay || mode == ExpertBenchmark::RoutedVerifierTournament;
+#ifdef HAVE_ROCM
+        std::optional<RoutedVerifierRouterPolicy> routed_policy;
+        if (routed_verifier) routed_policy.emplace();
+#endif
         const bool token_publication = publication_mode == ExpertPublication::RouterQ8TokenRows;
         std::optional<RouterQ8SubmissionObservation> observation;
         if (token_publication) observation.emplace();
@@ -600,6 +621,13 @@ namespace
                 for (const auto &source : sources) jobs.push_back(source.get());
                 prepared = makeGpuPreparedGemmBatch(jobs,parameter.device,"expert.economy");
             }
+#ifdef HAVE_ROCM
+            if (routed_verifier)
+            {
+                runCapturedRoutedVerifier(parameter, mode, prepared, context);
+                return;
+            }
+#endif
             for (int expert = 0; expert < experts; ++expert)
             {
                 DeviceMoEExpertDescriptor descriptor{};
@@ -2055,6 +2083,41 @@ namespace
     { runExpertPipeline(GetParam(),ExpertBenchmark::WmmaAdaptive32ColdProfile); }
     INSTANTIATE_TEST_SUITE_P(NativeGfx1100,ROCmGroupedWmmaPerf,::testing::ValuesIn(groupedWmmaPerfCases()),
         [](const ::testing::TestParamInfo<Case> &info) { return info.param.name; });
+
+#ifdef HAVE_ROCM
+    /** @brief Separate MTP capacities from the ordinary prefill source roster. */
+    std::vector<Case> routedVerifierCases()
+    {
+        std::vector<Case> result;
+        for (int rows : {8, 9, 16})
+            for (auto distribution : {RoutedVerifierDistribution::Uniform, RoutedVerifierDistribution::Hotset32,
+                    RoutedVerifierDistribution::Concentrated8, RoutedVerifierDistribution::MixedCohorts,
+                    RoutedVerifierDistribution::ColdThenHot})
+            {
+                const char *name = nullptr;
+                switch (distribution)
+                {
+                case RoutedVerifierDistribution::Uniform: name = "Uniform"; break;
+                case RoutedVerifierDistribution::Hotset32: name = "Hotset32"; break;
+                case RoutedVerifierDistribution::Concentrated8: name = "Concentrated8"; break;
+                case RoutedVerifierDistribution::MixedCohorts: name = "MixedCohorts"; break;
+                case RoutedVerifierDistribution::ColdThenHot: name = "ColdThenHot"; break;
+                }
+                result.push_back({DeviceId::rocm(0), TensorType::IQ2_S, rows, rows, 8,
+                    std::string(name) + "_M" + std::to_string(rows),
+                    2048, 512, 256, 0, TensorType::IQ4_XS, MoERoutingProfile::Uniform, distribution});
+            }
+        return result;
+    }
+    /** @brief Independently selectable captured real-router MTP transaction. */
+    class ROCmRoutedVerifierTransaction : public ::testing::TestWithParam<Case> {};
+    TEST_P(ROCmRoutedVerifierTransaction, CapturedReplay)
+    { runExpertPipeline(GetParam(), ExpertBenchmark::RoutedVerifierReplay, ExpertPublication::RouterQ8TokenRows); }
+    TEST_P(ROCmRoutedVerifierTransaction, DISABLED_Paired)
+    { runExpertPipeline(GetParam(), ExpertBenchmark::RoutedVerifierTournament, ExpertPublication::RouterQ8TokenRows); }
+    INSTANTIATE_TEST_SUITE_P(NativeGfx1100, ROCmRoutedVerifierTransaction, ::testing::ValuesIn(routedVerifierCases()),
+        [](const ::testing::TestParamInfo<Case> &info) { return info.param.name; });
+#endif
 
     INSTANTIATE_TEST_SUITE_P(ProductionShape, GPUExpertPipeline, ::testing::ValuesIn(cases()),
         [](const ::testing::TestParamInfo<Case> &info) { return info.param.name; });

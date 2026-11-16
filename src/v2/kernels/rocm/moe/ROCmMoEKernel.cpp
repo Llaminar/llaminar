@@ -1068,6 +1068,8 @@ extern "C"
         int num_experts, int max_active_experts,
         int device_idx, void *stream);
 
+    bool hipMoE_build_active_expert_list_with_offset_slots(const llaminar2::MoEGroupingPackedDirectory &binding);
+
     bool hipMoE_max_expert_count(
         const int *expert_counts, int *d_max_out,
         int num_experts,
@@ -3968,6 +3970,15 @@ namespace llaminar2
         float *d_grouped_weights)
     {
         grouped_prefill_grouping_.invalidate();
+        return enqueueExpertGrouping(d_routing_indices, d_routing_weights, seq_len, num_experts, top_k,
+            d_expert_offsets, d_expert_counts, d_grouped_token_indices, d_grouped_weights, nullptr);
+    }
+
+    bool ROCmMoEKernel::enqueueExpertGrouping(
+        const int *d_routing_indices, const float *d_routing_weights,
+        int seq_len, int num_experts, int top_k, int *d_expert_offsets, int *d_expert_counts,
+        int *d_grouped_token_indices, float *d_grouped_weights, const MoEGroupingPackedDirectory *packed)
+    {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
@@ -4024,11 +4035,11 @@ namespace llaminar2
             return false;
         }
 
-        if (d_group_active_expert_ids_ &&
-            !hipMoE_build_active_expert_list(
+        if (packed ? !hipMoE_build_active_expert_list_with_offset_slots(*packed) :
+            (d_group_active_expert_ids_ && !hipMoE_build_active_expert_list(
                 d_expert_counts, d_group_active_expert_ids_,
                 num_experts, std::min(total_slots, num_experts),
-                device_ordinal_, getStream()))
+                device_ordinal_, getStream())))
         {
             LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] active expert list failed");
             return false;
@@ -10678,7 +10689,7 @@ namespace llaminar2
         int seq_len, int num_experts, int top_k)
     {
         auto grouping_publication = grouped_prefill_grouping_.beginAllRoutes();
-        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
+        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0 || seq_len > std::numeric_limits<int>::max()/top_k)
             return false;
 
         if (!setMoEDevice(device_ordinal_, "prepareExpertGroupsAsync"))
@@ -10786,6 +10797,14 @@ namespace llaminar2
             total_slots <= 64 &&
             num_experts <= static_cast<int>(kDeviceMoEMaxExperts) &&
             top_k <= 16;
+        std::optional<MoEGroupingPackedDirectory> packed_directory;
+        if (rocm::selectedMoEGroupedDirectorySource() == rocm::MoEGroupedDirectorySource::GroupingOffsetSlots)
+        {
+            if ((seq_len != 9 && seq_len != 16) || num_experts != 256 || top_k != 8)
+                throw std::invalid_argument("grouping offset-slot candidate requires physical M9/16, E256, top8");
+            if (!ensureGroupedPrefillWorkDirectoryCapacity(total_slots, num_experts)) return false;
+            packed_directory.emplace(groupingDirectoryBinding(seq_len, top_k, num_experts));
+        }
         if (use_small_grouping)
         {
             const int active_expert_slots = std::min(total_slots, num_experts);
@@ -10848,11 +10867,11 @@ namespace llaminar2
         }
 
         // 4. Group tokens by expert (counts, offsets, scatter) — all on device
-        if (!groupTokensByExpertDevice(
+        if (!enqueueExpertGrouping(
                 d_group_int_indices_, d_float_weights,
                 seq_len, num_experts, top_k,
                 d_group_offsets_, d_group_counts_,
-                d_group_token_indices_, d_group_weights_))
+                d_group_token_indices_, d_group_weights_, packed_directory ? &*packed_directory : nullptr))
         {
             LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] groupTokensByExpertDevice failed");
             return false;
@@ -10891,7 +10910,7 @@ namespace llaminar2
         // NO D2H copy, NO hipStreamSynchronize — data stays on device
         // for consumption by executeGroupedPrefillPipeline()
 
-        std::move(grouping_publication).publish();
+        std::move(grouping_publication).publish(std::move(packed_directory));
         return true;
     }
 
@@ -11385,14 +11404,21 @@ namespace llaminar2
     }
 
     /**
-     * @brief Resolve the dedicated graph-persistent adaptive work directory.
+     * @brief Borrow the current original grouping banks and exact named workspace extent.
      *
      * The directory is not interchangeable with the compact active-expert-id
-     * list: the adaptive planner publishes two live counts and two independent
-     * tile spans into it on every replay. Binding the named region here keeps
-     * that mutable lifetime explicit and prevents future grouping code from
-     * aliasing a buffer embedded in a captured projection graph.
+     * list. The combined producer retains raw IDs separately and stores packed
+     * descriptors into original exclusive intervals. Successful binding does
+     * not publish authority; only the complete grouping preparation can do so.
      */
+    MoEGroupingPackedDirectory ROCmMoEKernel::groupingDirectoryBinding(int rows, int top_k, int experts) const
+    {
+        return MoEGroupingPackedDirectory::wideFloor8(d_group_counts_, d_group_offsets_, d_group_active_expert_ids_,
+            d_prefill_work_directory_, workspace_ ? workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY) / sizeof(uint32_t) : 0,
+            rows, top_k, experts, DeviceId::rocm(device_ordinal_), workspace_, ExplicitGPUStream(getStream()));
+    }
+
+    /** @brief Bind the existing named adaptive directory and population banks before capture. */
     bool ROCmMoEKernel::ensureGroupedPrefillWorkDirectoryCapacity(
         int total_slots,
         int num_experts)
@@ -11570,6 +11596,9 @@ namespace llaminar2
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
+        const bool grouping_offset_slots = rocm::selectedMoEGroupedDirectorySource() ==
+            rocm::MoEGroupedDirectorySource::GroupingOffsetSlots;
+        if (!grouping_offset_slots) grouped_prefill_grouping_.revokeDirectory();
         const auto *owner_admission = ownerGateUpAdmissionForCall(gateup_desc_table_id, seq_len, execution,
             {.output_columns = intermediate, .reduction_columns = d_model});
         rocm::MoERouteOwnedGateUpLaunchSet owner_completed{};
@@ -11604,6 +11633,8 @@ namespace llaminar2
         rocm::validateMoERouteOwnedGateUpCodebook(gateup_table.codebook_mask, gateup_table.policy_codebook_mask, owner_admission);
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
+        if (grouping_offset_slots && floating)
+            throw std::invalid_argument("grouping offset-slot candidate requires native quantised descriptors");
 
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
             !down_table.valid || !down_table.deviceReady() ||
@@ -11791,6 +11822,9 @@ namespace llaminar2
                 source(gateup_table.host_up_descs.front()), source(down_table.host_descs.front())};
         }
         rocm::MoEGroupedPrefillSubmission grouped_submitted;
+        const auto grouping_directory = grouped_prefill_grouping_.borrowDirectory();
+        if (grouping_offset_slots)
+            (void)grouping_directory.requireMatching(groupingDirectoryBinding(seq_len, top_k, num_experts));
         const bool ok = execution.overwriteOutputThenPublish(
             execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
             execution.executesDown() ? publication_output->size_bytes() : 0u,
@@ -11841,7 +11875,7 @@ namespace llaminar2
                     execution,
                     grouped_prefill_grouping_.scopeForProjection(seq_len, top_k), owner_admission,
                     owner_admission ? &owner_completed : nullptr, d_grouped_population_selection_, &grouped_submitted,
-                    singleton_sources);
+                    singleton_sources, grouping_offset_slots ? &grouping_directory : nullptr);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -11905,6 +11939,8 @@ namespace llaminar2
                     {"hidden_preparation", !execution.executesGateUp() ? "not_submitted" :
                         reuse_router_q8_hidden ? "router_q8" : "original_row_quant"},
                     {"dot_policy", groupedEngineTag(grouped_submitted.policy.engine)},
+                    {"directory_source", grouped_submitted.policy.directory == rocm::MoEGroupedDirectorySource::GroupingOffsetSlots
+                        ? "grouping_offset_slots" : "role_planner"},
                     {"gateup_submitted_tiles", groupedTileRoster(grouped_submitted.gateup)},
                     {"down_submitted_tiles", groupedTileRoster(grouped_submitted.down)},
                     {"gateup_submitted_tiled_leaves", std::to_string(grouped_submitted.gateup.leaves())},

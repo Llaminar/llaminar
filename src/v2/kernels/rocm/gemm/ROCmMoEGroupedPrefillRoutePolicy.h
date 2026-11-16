@@ -126,6 +126,9 @@ namespace llaminar2::rocm
             },
         }};
 
+    /** @brief Canonical generic crossover, shared by the scalar oracle and capture lowering. */
+    inline constexpr int kROCmMoEGenericRouteOwnedRows = 8;
+
     /**
      * @brief Match immutable exact keys without a host-table device pointer.
      * @tparam Index Compile-time table position; the small table is unrolled.
@@ -174,12 +177,102 @@ namespace llaminar2::rocm
             return {.strategy = exact, .exact = true};
 
         return {
-            .strategy = key.rows <= 8
+            .strategy = key.rows <= kROCmMoEGenericRouteOwnedRows
                             ? ROCmMoEGroupedPrefillRouteStrategy::RouteOwned
                             : ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled,
             .exact = false,
         };
     }
+
+    /** @brief Capture-time lowering of the canonical selector to device slot intervals.
+     *
+     * Only immutable geometry is resolved here. The device still owns the live
+     * count, but each CTA avoids division and repeated full-key matching. Exact
+     * entries retain table order, their original strategy and their complete
+     * non-row identity. No alternative policy or device-state mirror exists. */
+    class ROCmMoELiveSlotPolicy final
+    {
+    public:
+        /** @brief Lower the original selector without reading a route publication.
+         * @param key Complete original capacity/format/operation identity.
+         * @return Sealed interval policy covering every valid live slot count.
+         * @throws std::invalid_argument For invalid or unrepresentable geometry. */
+        [[nodiscard]] static ROCmMoELiveSlotPolicy lower(ROCmMoEGroupedPrefillRouteKey key)
+        {
+            const auto capacity = static_cast<int64_t>(key.rows) * key.top_k;
+            if (!selectROCmMoEGroupedPrefillRouteStrategy(key).valid() || capacity > INT32_MAX)
+                throw std::invalid_argument("MoE live-slot policy requires representable original geometry");
+            ROCmMoELiveSlotPolicy result;
+            result.capacity_ = static_cast<int>(capacity);
+            const auto generic_limit = static_cast<int64_t>(kROCmMoEGenericRouteOwnedRows) * key.top_k;
+            result.ordered_limit_ = static_cast<int>(capacity < generic_limit ? capacity : generic_limit);
+            auto empty = key;
+            empty.rows = 1;
+            result.empty_ = selectROCmMoEGroupedPrefillRouteStrategy(empty).strategy;
+            for (const auto &entry : kROCmMoEGroupedPrefillExactRoutePolicies)
+            {
+                auto candidate = key;
+                candidate.rows = entry.key.rows;
+                if (candidate != entry.key || entry.key.rows <= 0 || entry.key.rows > key.rows) continue;
+                if (entry.strategy != ROCmMoEGroupedPrefillRouteStrategy::RouteOwned &&
+                    entry.strategy != ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled)
+                    throw std::invalid_argument("MoE exact live-slot policy names an invalid strategy");
+                const auto first = static_cast<int64_t>(entry.key.rows - 1) * key.top_k;
+                const auto last = static_cast<int64_t>(entry.key.rows) * key.top_k;
+                result.exact_[result.exact_count_++] = {static_cast<int>(first),static_cast<int>(last),entry.strategy};
+            }
+            return result;
+        }
+
+        /** @brief Apply the lowered policy to the device's current slot count.
+         * @param slots Original active count, including nonmultiples of top-k.
+         * @return The original selector's decision, or Invalid outside admitted capacity. */
+        [[nodiscard]] LLAMINAR_MOE_ROUTE_HD constexpr ROCmMoEGroupedPrefillRouteStrategy choose(int slots) const noexcept
+        {
+            if (slots < 0 || slots > capacity_) return ROCmMoEGroupedPrefillRouteStrategy::Invalid;
+            if (slots == 0) return empty_;
+            const auto exact = matchExact(slots);
+            if (exact != ROCmMoEGroupedPrefillRouteStrategy::Invalid) return exact;
+            return slots <= ordered_limit_ ? ROCmMoEGroupedPrefillRouteStrategy::RouteOwned
+                                          : ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled;
+        }
+
+        /** @brief Validate a device interval before adding its signed endpoints.
+         * @param offset Original nonnegative exclusive offset. @param count Original nonnegative count.
+         * @return Whether the safe integer sum lies within the original admitted capacity. */
+        [[nodiscard]] LLAMINAR_MOE_ROUTE_HD constexpr bool validSpan(int offset,int count) const noexcept
+        { return offset >= 0 && count >= 0 && offset <= capacity_ && count <= capacity_-offset; }
+
+    private:
+        /** @brief Only lower() may create a complete immutable policy. */
+        ROCmMoELiveSlotPolicy() = default;
+        /** @brief One ordered exact override on (first,last], preserving canonical table priority. */
+        struct ExactInterval
+        {
+            int first = 0, last = 0;
+            ROCmMoEGroupedPrefillRouteStrategy strategy = ROCmMoEGroupedPrefillRouteStrategy::Invalid;
+        };
+        /** @brief Constant-index traversal avoids addressable private arrays in a native packet.
+         * @tparam Index Canonical lowered table position. @param slots Current device count.
+         * @return First matching exact strategy, or Invalid when generic selection owns it. */
+        template<size_t Index = 0>
+        [[nodiscard]] LLAMINAR_MOE_ROUTE_HD constexpr ROCmMoEGroupedPrefillRouteStrategy matchExact(int slots) const noexcept
+        {
+            if constexpr (Index < kROCmMoEGroupedPrefillExactRoutePolicies.size())
+            {
+                if (Index >= exact_count_) return ROCmMoEGroupedPrefillRouteStrategy::Invalid;
+                const auto &entry = exact_[Index];
+                if (slots > entry.first && slots <= entry.last) return entry.strategy;
+                return matchExact<Index+1>(slots);
+            }
+            return ROCmMoEGroupedPrefillRouteStrategy::Invalid;
+        }
+        int capacity_ = 0, ordered_limit_ = 0;
+        std::array<ExactInterval,kROCmMoEGroupedPrefillExactRoutePolicies.size()> exact_{};
+        static_assert(kROCmMoEGroupedPrefillExactRoutePolicies.size() <= UINT8_MAX);
+        uint8_t exact_count_ = 0;
+        ROCmMoEGroupedPrefillRouteStrategy empty_ = ROCmMoEGroupedPrefillRouteStrategy::Invalid;
+    };
 
     /**
      * @brief Replay-time route admission from the already published group plan.
@@ -208,11 +301,9 @@ namespace llaminar2::rocm
          */
         ROCmMoEGroupedRouteAdmission(ROCmMoEGroupedPrefillRouteKey key,
                                     const int* counts, const int* offsets)
-            : key_(key), counts_(counts), offsets_(offsets)
+            : key_(key), counts_(counts), offsets_(offsets), slot_policy_(ROCmMoELiveSlotPolicy::lower(key))
         {
-            if (!counts || !offsets ||
-                !selectROCmMoEGroupedPrefillRouteStrategy(key).valid() ||
-                static_cast<std::int64_t>(key.rows) * key.top_k > INT32_MAX)
+            if (!counts || !offsets)
                 throw std::invalid_argument("MoE route admission requires a complete group publication");
         }
 
@@ -231,14 +322,7 @@ namespace llaminar2::rocm
         [[nodiscard]] LLAMINAR_MOE_ROUTE_HD constexpr
             ROCmMoEGroupedPrefillRouteStrategy strategyForSlots(int slots) const noexcept
         {
-            if (slots < 0 || static_cast<std::int64_t>(slots) >
-                    static_cast<std::int64_t>(key_.rows) * key_.top_k)
-                return ROCmMoEGroupedPrefillRouteStrategy::Invalid;
-            // An empty participant still uses the compact publisher to zero
-            // its output; it performs no expert dot products.
-            auto live = key_;
-            live.rows = slots == 0 ? 1 : 1 + (slots - 1) / key_.top_k;
-            return selectROCmMoEGroupedPrefillRouteStrategy(live).strategy;
+            return slot_policy_.choose(slots);
         }
 
         /**
@@ -290,11 +374,8 @@ namespace llaminar2::rocm
             const int last = key_.expert_count - 1;
             const int offset = __builtin_amdgcn_readfirstlane(offsets_[last]);
             const int count = __builtin_amdgcn_readfirstlane(counts_[last]);
-            const auto slots = static_cast<std::int64_t>(offset) + count;
-            if (offset < 0 || count < 0 || slots > INT32_MAX ||
-                slots > static_cast<std::int64_t>(key_.rows) * key_.top_k)
-                __builtin_trap();
-            return static_cast<int>(slots);
+            if (!slot_policy_.validSpan(offset,count)) __builtin_trap();
+            return offset + count;
         }
 
         /**
@@ -349,6 +430,7 @@ namespace llaminar2::rocm
         ROCmMoEGroupedPrefillRouteKey key_; ///< Complete immutable capture key.
         const int* counts_; ///< Borrowed ordered group-plan publication.
         const int* offsets_; ///< Exclusive prefixes owned by the same producer.
+        ROCmMoELiveSlotPolicy slot_policy_; ///< Sealed lowering of key_, never live device state.
     };
 } // namespace llaminar2::rocm
 

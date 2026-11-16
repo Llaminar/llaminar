@@ -26443,11 +26443,23 @@ if(HAVE_CUDA OR HAVE_ROCM)
     # Event-timed all-format expert economy is intentionally outside preflight.
     add_executable(v2_perf_gpu_expert_pipeline
         performance/kernels/moe/Perf__GPUExpertPipeline.cpp)
+    if(HAVE_ROCM)
+        add_v2_test(V2_Integration_ROCmGroupingOffsetSlotsReplay
+            COMMAND $<TARGET_FILE:v2_perf_gpu_expert_pipeline>
+                --gtest_filter=NativeGfx1100/ROCmRoutedVerifierTransaction.CapturedReplay/Uniform_M16
+            LABELS "V2;Integration;ROCm;MTP;MoE;Replay;GraphCapture;Regression;ByteExact;HardwareOptional;NativeISA-gfx1100;Devices1;ProductionTestPreflight"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 180 RESOURCE_LOCK rocm_gpu_0)
+    endif()
     target_include_directories(v2_perf_gpu_expert_pipeline PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(v2_perf_gpu_expert_pipeline PRIVATE
         v2_expert_transfer_parity_support GTest::gtest_main)
     if(HAVE_ROCM)
         target_link_libraries(v2_perf_gpu_expert_pipeline PRIVATE rocprofiler-sdk-roctx::rocprofiler-sdk-roctx)
+        add_v2_test(V2_Integration_ROCmRoutedVerifierTransactionReplay
+            COMMAND $<TARGET_FILE:v2_perf_gpu_expert_pipeline>
+                --gtest_filter=NativeGfx1100/ROCmRoutedVerifierTransaction.CapturedReplay/*
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;MTP;GraphCapture;Replay;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 180 RESOURCE_LOCK rocm_gpu_0)
         add_v2_test(V2_Integration_ROCmGroupedWmmaSplitReplay
             COMMAND $<TARGET_FILE:v2_perf_gpu_expert_pipeline> --gtest_also_run_disabled_tests
                 --gtest_filter=NativeGfx1100/ROCmGroupedWmmaPerf.DISABLED_CapturedSplitReplay/ROCm_AllCodebookPrefill_*Rows65:NativeGfx1100/ROCmGroupedWmmaPerf.DISABLED_CapturedSplitReplay/ROCm_Qwen36WholeExpertShard2Rows64
@@ -36936,6 +36948,22 @@ add_v2_test(V2_Integration_MoESharedVerifierGroupingOriginReplay
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MoESharedVerifierGroupingOriginReplay)
 
+add_v2_test(V2_Integration_MoEGroupingPackedDirectoryReplay
+    COMMAND $<TARGET_FILE:v2_test_moe_prefill_measured_operation>
+            --gtest_filter=MoEPrefillMeasuredOperation.PackedDirectory*
+    LABELS "V2;Integration;ProductionTestPreflight;MoE;MTP;DeviceFree;Dispatch;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_MoEGroupingPackedDirectoryReplay)
+
+add_v2_test(V2_Integration_ROCmGroupedLiveSlotPolicyReplay
+    COMMAND $<TARGET_FILE:v2_test_rocm_moe_grouped_prefill_dispatch>
+        --gtest_filter=Test__ROCmMoEGroupedPrefillDispatch.LiveRouteAdmission*:Test__ROCmMoEGroupedPrefillDispatch.LiveAdmission*:Test__ROCmMoEGroupedPrefillDispatch.LoweredLiveSlot*
+    LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;MTP;DeviceFree;Dispatch;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_ROCmGroupedLiveSlotPolicyReplay)
+
 # Preserve the source-format identity in the same captured verifier cases that
 # independently compare every output byte with serial execution.
 if(TARGET v2_integration_cuda_moe_kernel)
@@ -39043,6 +39071,13 @@ if(HAVE_ROCM)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGDNVerifierPolicyReplay)
 endif()
 
+add_v2_test(V2_Integration_ROCmGroupedDirectoryWorkspaceReplay
+    COMMAND $<TARGET_FILE:v2_test_gpu_workspace_allocation_policy>
+        --gtest_filter=Test__GpuWorkspaceAllocationPolicy.ROCmAdaptivePrefillDirectoryHasDedicatedMTotalCapacity
+    LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;MTP;DeviceFree;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedDirectoryWorkspaceReplay)
+
 # Original GateUp binding and the actual stage/down lifetime are device-free.
 add_v2_test(V2_Integration_VerifierGateUpBundleReplay
     COMMAND $<TARGET_FILE:v2_test_verifier_projection_bundle> --gtest_filter=VerifierProjectionBundle.GateUp*
@@ -39095,6 +39130,8 @@ if(HAVE_ROCM)
         V2_Integration_ROCmGDNVerifierSingleQ8AutomaticReplay
         V2_Integration_ROCmGDNVerifierTwoTermQ8AutomaticReplay
         V2_Integration_ROCmGDNVerifierAutomaticBoundariesReplay
+        V2_Integration_ROCmRoutedVerifierTransactionReplay
+        V2_Integration_ROCmGroupingOffsetSlotsReplay
         V2_Integration_ROCmSharedVerifierTransactionReplay
         V2_Integration_ROCmSharedVerifierPolicyReplay
         V2_Integration_ROCmVerifierAttentionWmmaReplay

@@ -20,7 +20,9 @@ namespace llaminar2::MoEWorkspaceBuffers
  * contributes at most one partially filled tile, which bounds a span by
  * `active_experts + ceil(total_slots / tile_rows)`. Clamping each span
  * to total route slots keeps the contract valid for very small models
- * without reserving a dense expert-by-row rectangle.
+ * without reserving a dense expert-by-row rectangle. The fixed-TM4 planner
+ * can instead initialize its complete conservative span. These layouts never execute
+ * concurrently, so they share a bank sized for their maximum, not their sum.
  */
 inline std::size_t rocmAdaptivePrefillDirectoryWords(
     std::size_t total_slots,
@@ -37,6 +39,6 @@ inline std::size_t rocmAdaptivePrefillDirectoryWords(
             active_experts +
                 (total_slots + tile_rows - 1) / tile_rows);
     };
-    return 2u + capacity(12u) + capacity(16u);
+    return std::max(2u + capacity(12u) + capacity(16u), capacity(4u));
 }
 }

@@ -63,6 +63,8 @@
 #include "kernels/common/DeviceRouterHadamardQ8.h"
 #include "kernels/common/RouterQ8Launch.h"
 #include "kernels/common/MoEGroupedFloatingPrefillKernels.h"
+#include "kernels/common/MoEGroupedOffsetSlots.h"
+#include "kernels/common/MoEGroupingPackedDirectory.h"
 #include "kernels/common/DeviceMoEFloatingWarp.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/MoERouterOwnedRows.h"
@@ -19350,13 +19352,22 @@ __device__ __forceinline__ void rocm_publish_runtime_prefill_plan_block(
  * the serial implementation while parallelizing reads, rank assignment,
  * writes, and sentinel padding.
  */
+template<bool PackedOffsetSlots>
 __global__ void rocm_moe_build_active_expert_list_kernel(
     const int *__restrict__ expert_counts,
     int *__restrict__ active_expert_ids,
     int num_experts,
-    int max_active_experts)
+    int max_active_experts,
+    const int *__restrict__ expert_offsets,
+    uint32_t *__restrict__ packed_directory,
+    int total_slots)
 {
     __shared__ ActiveExpertCompactionScratch scratch;
+    // The existing initialization barrier orders all sentinel stores before
+    // any expert publishes descriptors into its disjoint original interval.
+    if constexpr (PackedOffsetSlots)
+        for (int slot = threadIdx.x; slot < total_slots; slot += blockDim.x)
+            packed_directory[slot] = UINT32_MAX;
     rocm_initialize_active_expert_compaction(scratch);
 
     for (int chunk = 0; chunk < num_experts; chunk += blockDim.x)
@@ -19364,6 +19375,16 @@ __global__ void rocm_moe_build_active_expert_list_kernel(
         const int expert = chunk + static_cast<int>(threadIdx.x);
         const bool is_active =
             expert < num_experts && expert_counts[expert] > 0;
+        if constexpr (PackedOffsetSlots)
+        {
+            if (expert < num_experts)
+            {
+                const auto interval = llaminar2::moe_grouped_directory::WideFloor8OffsetSlots::bind(
+                    expert_counts[expert], expert_offsets[expert], total_slots);
+                for (int tile = 0; tile < interval.tiles(); ++tile)
+                    packed_directory[interval.slot(tile)] = interval.descriptor(expert, num_experts, tile);
+            }
+        }
         rocm_compact_active_expert_chunk(
             is_active,
             expert,
@@ -22144,9 +22165,9 @@ bool hipMoE_build_active_expert_list(
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
-    hipLaunchKernelGGL(rocm_moe_build_active_expert_list_kernel,
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rocm_moe_build_active_expert_list_kernel<false>),
         dim3(1), dim3(kActiveExpertThreads), 0, static_cast<hipStream_t>(stream),
-        expert_counts, active_expert_ids, num_experts, max_active_experts);
+        expert_counts, active_expert_ids, num_experts, max_active_experts, nullptr, nullptr, 0);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -22155,6 +22176,21 @@ bool hipMoE_build_active_expert_list(
         return false;
     }
     return true;
+}
+
+/** @brief Publish raw active IDs and duplicate-safe packed work in the same grouping launch.
+ * @param binding Validated original grouping banks and exact producer stream.
+ * @return Whether the complete combined producer was accepted. */
+bool hipMoE_build_active_expert_list_with_offset_slots(const llaminar2::MoEGroupingPackedDirectory &binding)
+{
+    if (!binding.device().is_rocm()) return false;
+    llaminar2::HipDeviceGuard::setDevice(binding.device().ordinal);
+    (void)hipGetLastError();
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rocm_moe_build_active_expert_list_kernel<true>),
+        dim3(1), dim3(kActiveExpertThreads), 0, static_cast<hipStream_t>(binding.stream()),
+        binding.counts(), const_cast<int *>(binding.activeIds()), binding.experts(),
+        std::min(binding.totalSlots(), binding.experts()), binding.offsets(), binding.words(), binding.totalSlots());
+    return hipGetLastError() == hipSuccess;
 }
 
 bool hipMoE_scatter_tokens(

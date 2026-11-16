@@ -1688,6 +1688,21 @@ namespace llaminar2
         uint64_t bound_workspace_id_ = 0;
 
         bool ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate);
+        /** @brief Enqueue original count/scan/scatter under the caller's grouping preparation.
+         * @param d_routing_indices Original route IDs. @param d_routing_weights Original probabilities.
+         * @param seq_len Physical token rows. @param num_experts Expert extent. @param top_k Route multiplicity.
+         * @param d_expert_offsets Exclusive offsets. @param d_expert_counts Counts.
+         * @param d_grouped_token_indices Grouped row map. @param d_grouped_weights Grouped probabilities.
+         * @param packed Optional unpublished original binding for combined directory publication.
+         * @return Whether every grouping launch succeeded; only the outer preparation may publish. */
+        bool enqueueExpertGrouping(const int *d_routing_indices, const float *d_routing_weights,
+            int seq_len, int num_experts, int top_k, int *d_expert_offsets, int *d_expert_counts,
+            int *d_grouped_token_indices, float *d_grouped_weights,
+            const MoEGroupingPackedDirectory *packed);
+        /** @brief Authenticate the currently bound named work bank without reading device counts.
+         * @param rows Original physical token rows. @param top_k Original route multiplicity.
+         * @param experts Original expert extent. @return Immutable current workspace binding. */
+        MoEGroupingPackedDirectory groupingDirectoryBinding(int rows, int top_k, int experts) const;
         /**
          * @brief Bind and validate the persistent adaptive prefill directory.
          * @param total_slots Number of routed rows that bound directory work.

@@ -38,6 +38,7 @@
  * @param d_population_selection Dedicated device decision, required for admitted population policies.
  * @param completed_observation Required with an explicit capability; caller-owned host construction receipt, cleared on failure.
  * @param singleton_sources Original sources borrowed from immutable singleton descriptor tables; empty for other operations.
+ * @param grouping_directory Lexical successful grouping authority for the explicit offset-slot producer.
  * @return True if the declared transaction was enqueued on the non-null stream.
  */
 extern "C"
@@ -81,7 +82,8 @@ bool rocmMoE_grouped_prefill_pipeline(
     llaminar2::rocm::MoERouteOwnedGateUpLaunchSet *completed_observation = nullptr,
     uint32_t *d_population_selection = nullptr,
     llaminar2::rocm::MoEGroupedPrefillSubmission *submitted = nullptr,
-    llaminar2::rocm::MoEGroupedSourceTuple singleton_sources = {});
+    llaminar2::rocm::MoEGroupedSourceTuple singleton_sources = {},
+    const llaminar2::MoEPrefillGroupingProvenance::DirectoryBorrow *grouping_directory = nullptr);
 
 /**
  * @brief Fold already-weighted route outputs in the original router order.

@@ -20,8 +20,7 @@ explicit finite/special TPB192 multi-tile replay. The bounded grouped-attention
 experiment is closed with Dot2: native loses all2,790 paired samples. Full-curve
 fixed-query fits through64K have R²≥0.999892 for Dot2 and≥0.999771 for WMMA.
 QKV, GDN, connected dense FFN, Wo and the measured Q6_K selected-head Automatic qualify complete operations; routed MTP and broader head coverage remain open. See the
-[attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Broader bundles and
-routed operations remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
+[attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Direct floating WMMA substitutions fail their byte contracts. These component results do
 not claim model-level MTP speedups or full production certification.
 Shared-verifier Automatic now admits all21 same-source M16 tuples and mixed
 IQ2_S/IQ4_XS M9/M16. All28 replay cases pass453 source/capacity/live keys.
@@ -310,6 +309,12 @@ Additional current evidence under the same ignored evidence root:
 
 ## Implementation work list
 
+The immediate component closure is routed MTP admission/economy and broader
+selected-head formats. The qualified Q6_K head, dense bundles, shared experts,
+router and attention disposition stay closed. Further ordinary-prefill sparse
+tail tuning, larger geometry/TP sweeps and model/controller certification are
+separate follow-up work; they do not expand this focused component gate.
+
 - [x] Remove standalone beta/mapped verifier row replay; prove grouped combine
   correctness, original row ownership and inactive-byte preservation.
 - [ ] Freeze a source-owned operation/format/geometry inventory and baseline the
@@ -545,25 +550,64 @@ Do not require both threshold writers when the independent route histogram
 cannot exercise both. Profile the actual selected family and retain live-bearing
 sample keys so different retained workloads cannot collide in the timing corpus.
 
-The existing performance fixture's numerical snapshot is eager grouped Dot4,
-not a serial-runtime oracle. Before timing, reuse
-`groupedExpertDecodeFromRuntime(...RuntimePlacementTable)` from
-`Test__ROCmMoEKernel`'s Qwen runtime comparison and require its original per-row
-bytes to match the grouped snapshot and candidates. Production optimizations
-remain enabled. For the verifier router boundary, use the existing
-`routeVerifierRowsDecodeEquivalent` entry with matching preparation; controlled
-expert routes remain explicitly injected into separate buffers. This does not
-claim that the real router selected the synthetic distribution.
+The new `ROCmRoutedVerifierTransaction.h` branch reuses the existing source
+synthesis and prepared-triplet owners, then captures the actual router and expert
+stage. All six M8/9/16 Uniform/Concentrated8 cases now pass Release and Integration
+replay across72 capacity/live-prefix keys, with independent M1 routing/runtime
+bytes, dirty reuse, reset, native/router omission, exact tile/role bindings,
+RouteOwned Q8 ABI, private-Q8 poison and unchanged host submission counters.
+The full Release panel contains2,232 triples (31 pairs/key, eight complete
+operations/sample). All nine concentrated native-active cells win all31 pairs
+with N32 (1.13174–1.19583×; geometric mean1.15912×); all nine uniform native-active
+cells lose. N64 wins the concentrated physical9 boundary, while N32 wins all
+concentrated physical16 medians. Sparse retained-native cells also lose up to
+5.18%. This justifies a device work-distribution policy, not unconditional WMMA.
+Explicit replay/preflight registration, selected-kernel profiles, additional
+route-pattern/ownership controls and actual Automatic qualification remain open.
+See the [routed transaction proof](GFX1100_MTP_ROUTED_VERIFIER.md). WideFloor8
+offset-slot publication and capture-time live-slot policy lowering pass the
+15-case Release/Integration replay roster. Ordinary-power full-M16 timing is
+334.141/356.971 microseconds for Dot4/offset Uniform and186.071/144.971 for
+Concentrated8; Automatic remains unchanged. The subsequent bounded split
+experiment passed all three replay cases/51 live-prefix keys, including mixed
+cold/hot writer omissions. Its independent cold GU4/down12 and pure hot native16
+leaves reduced register use, but full Uniform remained1.4% slower than Dot4 and
+all18 sparse control medians lost. Concentrated work still favored the existing
+fused offset candidate. The split implementation is archived and removed;
+prior offset-slot/lowering code is restored. The linked proof records34 timing
+cells/1054 four-arm observations and the immutable negative snapshot. Historical
+STABLE_STD panels below remain diagnostic.
 
-The old performance fixture rewrites and uploads route IDs for each live prefix;
-that does not qualify device-counted verifier replay. Controlled Uniform/Hotset
-templates need a captured device-counted publisher that preserves live slot
-IDs/weights and writes(-1,0) beyond the prefix. No existing single-device API
-provides that copy: `publishOwnedRouteRows` requires real multi-participant packet
-ownership and cannot honestly be borrowed here. Use a narrow test-owned publisher
-or actual router selections, and keep template inputs separate from real router
-outputs. The serial runtime oracle must preserve holes and original slot order
-without renormalizing the surviving weights.
+The expanded seven-path tournament now passes12 cases/144 live-bearing keys
+in Release and Integration. All4,464 paired Release samples pass serial bytes.
+WideFloor8 wins every pair in all nine concentrated and nine mixed-cohort tiled
+cells (geometric gains1.20952×/1.09562×), but loses six of nine Uniform tiled
+medians. Canonical Hotset32 remains entirely ordered under floor8 and gains
+only about1% geometrically. No unconditional candidate is admitted. The maximum-count
+experiment passed15 cases/180 live keys in both builds, but every ordered tiled
+cell lost (geometric ratio0.917×). Its extra retained families also harmed sparse
+controls. That experiment is archived and its maximum-publication machinery is
+removed. The subsequent SmallRows adaptive producer also failed economy and was
+retired. Its fixed-TM4 directory capacity correction remains because it fixes
+the shared workspace bound. Current offset-slot results and the later rejected
+independent-leaf experiment are recorded above. Detailed constraints and
+evidence belong to the linked transaction proof.
+
+The independent oracle uses real M1 `decodeRouteSelect` followed by
+`groupedExpertDecodeFromRuntime(...RuntimePlacementTable)` on a separate kernel,
+workspace and managed runtime table. It never borrows grouped Q8, a grouped Dot4
+snapshot or grouped route weights. Expected route IDs are independently known;
+weights and final output must match serial bytes.
+
+The route-publisher gap is resolved without a new GPU kernel: the first32 hidden
+dimensions carry a one-hot row code, the remaining dimensions retain dense expert
+inputs, and sparse router weights produce well-separated top8 logits. Uniform
+routes use distinct row-wise expert sets; the explicitly named Concentrated8 case
+uses the same eight experts for every row. This is a new controlled distribution,
+not the canonical32-expert Hotset profile. The real counted verifier router writes
+live IDs/weights and(-1,0) suffixes during capture. Input and gate upload happen
+once. Arbitrary interior route holes still need a genuine partial-owner fixture;
+no collective packet ownership or host-rewritten IDs are used to manufacture them.
 
 Shared experts need their actual `SharedExpertFFNStage` grouped path separately.
 Extend `Perf__ROCmMoEVerifierPrefill.cpp::runROCmSharedExpertStageCase` with one

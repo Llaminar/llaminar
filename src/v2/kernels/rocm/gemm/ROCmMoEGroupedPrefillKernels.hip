@@ -4253,7 +4253,8 @@ bool rocmMoE_grouped_prefill_pipeline(
     llaminar2::rocm::MoERouteOwnedGateUpLaunchSet *completed_observation,
     uint32_t *d_population_selection,
     llaminar2::rocm::MoEGroupedPrefillSubmission *submitted,
-    llaminar2::rocm::MoEGroupedSourceTuple singleton_sources)
+    llaminar2::rocm::MoEGroupedSourceTuple singleton_sources,
+    const llaminar2::MoEPrefillGroupingProvenance::DirectoryBorrow *grouping_directory)
 {
     if (submitted) *submitted = {};
     if (completed_observation) *completed_observation = {};
@@ -4394,6 +4395,21 @@ bool rocmMoE_grouped_prefill_pipeline(
     pending.policy = dot_policy;
     pending.exact_ordered_overlay = pair_config.exact_overlay;
     const auto dot_engine = dot_policy.engine;
+    const bool grouping_offset_slots = dot_policy.directory == llaminar2::rocm::MoEGroupedDirectorySource::GroupingOffsetSlots;
+    if (grouping_offset_slots)
+    {
+        if (!grouping_directory || dot_engine != llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma ||
+            dot_policy.minimum_expert_rows != llaminar2::rocm::MoEGroupedWmmaRowFloor::Eight ||
+            measured_operation != llaminar2::MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes ||
+            grouped_indices_are_route_slots || d_model != 2048 || intermediate != 512 ||
+            (seq_len != 9 && seq_len != 16) || num_experts != 256 || top_k != 8)
+            throw std::logic_error("grouping offset slots require the complete original static routed candidate");
+        (void)grouping_directory->requireProjection(d_group_counts, d_group_offsets,
+            reinterpret_cast<uint32_t *>(d_group_work_directory), seq_len, top_k, num_experts,
+            llaminar2::DeviceId::rocm(device_id), stream);
+    }
+    else if (grouping_directory && grouping_directory->present())
+        throw std::logic_error("a role planner cannot overwrite a live grouping directory publication");
     const bool population_adaptive = dot_engine == llaminar2::rocm::MoEGroupedPrefillEngine::PopulationAdaptive;
     const bool native_wmma = dot_engine != llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4;
     if (population_adaptive && !d_population_selection) return false;
@@ -4500,6 +4516,14 @@ bool rocmMoE_grouped_prefill_pipeline(
     const auto ensure_native_directory = [&](const MoEGroupedDotAdmission &dot) -> int
     {
         const auto plan = dot.rowPlan();
+        if (grouping_offset_slots)
+        {
+            if (plan != MoEGroupedRowPlan::wide(plan.role(), llaminar2::rocm::MoEGroupedWmmaRowFloor::Eight))
+                throw std::logic_error("offset-slot publication cannot serve an incompatible native row plan");
+            return grouping_directory->requireProjection(d_group_counts, d_group_offsets,
+                reinterpret_cast<uint32_t *>(d_group_work_directory), seq_len, top_k, num_experts,
+                llaminar2::DeviceId::rocm(device_id), stream).totalSlots();
+        }
         if (!plan.isWide()) return ensure_work_directory(16);
         if (directory_plan && *directory_plan == plan) return current_directory_capacity;
         const int capacity = moe_prefill_directory_capacity(total_slots,num_experts,plan.minimumRows());
