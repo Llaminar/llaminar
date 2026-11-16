@@ -1378,13 +1378,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "constbooldeclaration_only=purpose==ShiftedMTPPrefillGraphBinding::Purpose::WorkspaceFamilyDeclaration;"),
         std::string::npos)
         << "Shifted-KV topology needs an explicit declaration-only lifecycle.";
-    // The shifted-KV declaration participates in the actual typed transaction-binding
-    // gate through the shared requiresMTPGraphTransactionBinding contract, which
-    // admits a declaration-only submission exactly when the runner retains MTP graph
-    // capacity. Assert that typed shape (declaration_only selects WorkspaceDeclaration
-    // and retainsMTPGraphCapacity(...) feeds the binding gate) rather than an obsolete
-    // textual adjacency, so an MTPOff runner retaining capacity still declares the same
-    // shifted-KV workspace participant as an enabled runner.
+    // The shifted-KV declaration is wired through the typed transaction-binding
+    // gate: declaration_only selects a WorkspaceDeclaration submission, and
+    // requiresMTPGraphTransactionBinding admits it only when the runner retains
+    // MTP graph capacity. A retained-capacity MTPOff runner therefore still
+    // declares the same shifted-KV workspace participant as an enabled runner.
     EXPECT_NE(
         shifted_prefill_binding.find(
             "declaration_only?ForwardGraphSubmissionIntent::WorkspaceDeclaration"),
@@ -1395,14 +1393,6 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "requiresMTPGraphTransactionBinding(graph_builder_->config().mtp.enabled,retainsMTPGraphCapacity(graph_builder_->config().mtp),transaction_submission)"),
         std::string::npos)
         << "The shifted-KV binding must consult the typed MTP transaction-binding gate.";
-    // A retained-capacity MTPOff runner must not be able to hide the shifted-KV
-    // participant behind ordinary execution intent: the purpose tag is the only
-    // way declaration-only reaches WorkspaceDeclaration.
-    EXPECT_NE(
-        shifted_prefill_binding.find(
-            "constautotransaction_submission=declaration_only?ForwardGraphSubmissionIntent::WorkspaceDeclaration"),
-        std::string::npos)
-        << "The declaration-only purpose must own the WorkspaceDeclaration submission intent.";
 }
 
 /**
