@@ -395,9 +395,12 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
     shared_roots = driver_shared_root_environment(pairs)
     name = "llaminar-suite-driver-" + uuid.uuid4().hex
     coding = getattr(args, 'suite', None) == 'opencode'
-    # Numerical observers also create sibling runtime containers. Reuse the
-    # existing exact-owner retirement protocol, including driver cancellation.
-    owned = coding or getattr(args, 'suite', None) == 'accuracy'
+    # Numerical observers (accuracy panels, coding drivers and the model-KLD
+    # canaries) also create sibling runtime containers. Reuse the existing
+    # exact-owner retirement protocol, including driver cancellation.
+    owned = (coding
+             or getattr(args, 'suite', None) == 'accuracy'
+             or getattr(args, 'model_kld_canaries', False))
     launch = ["docker", "run", "--rm", "--init", "--name", name,
         *docker_paths.device_args(driver, "CPU+CUDA+ROCm", user=f"{cache_uid}:{lane_stat.st_gid}"),
         # The cache-owning non-root driver delegates only kernel-log reads to
