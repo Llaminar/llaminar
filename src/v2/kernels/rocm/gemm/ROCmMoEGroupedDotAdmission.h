@@ -92,6 +92,16 @@ public:
         return result;
     }
 
+    /** @param role Original shared GU or down role.
+     * @return Bounded column-directory plan, retaining original GU4/down12 cold arithmetic. */
+    static constexpr MoEGroupedRowPlan column(MoEPrefillProjectionRole role)
+    {
+        auto result=nativeMicro(role,MoEGroupedWmmaRowFloor::Eight);
+        result.rows_and_kind_=0xc0u | (role==MoEPrefillProjectionRole::GateUp ? 4u : 12u);
+        return result;
+    }
+    /** @return Whether compact directory words also encode native column ownership. */
+    [[nodiscard]] LLAMINAR_MOE_DOT_HD constexpr bool isColumn() const noexcept { return rows_and_kind_ & 0x40u; }
     /** @return Whether this plan belongs to a wide Dot4/native macro tile. */
     [[nodiscard]] LLAMINAR_MOE_DOT_HD constexpr bool isWide() const noexcept { return rows_and_kind_ & 0x80u; }
     /** @return The projection role sealed with its row policy. */
@@ -112,7 +122,8 @@ public:
 private:
     MoEPrefillProjectionRole role_ = MoEPrefillProjectionRole::GateUp;
     MoEGroupedWmmaRowFloor floor_ = MoEGroupedWmmaRowFloor::EveryExpert;
-    // One private byte retains the row step and wide-kind bit. This keeps the
+    // One private byte retains the row step, wide kind and column-ownership
+    // bit. Keeping all three in the row plan prevents directory aliasing. This keeps the
     // complete admission value in its original capture-packet footprint.
     uint8_t rows_and_kind_ = 16;
 };
@@ -175,6 +186,20 @@ public:
         return result;
     }
 
+    /** @brief Bind the bounded original-source column-directory candidate.
+     * @param role Projection role. @param source_n Unsliced width. @param physical_n Prepared width.
+     * @param k Contraction width. @return Exact sealed source/geometry/row identity.
+     * @throws std::invalid_argument When the original routed geometry is absent. */
+    static MoEGroupedDotAdmission columnCandidate(MoEPrefillProjectionRole role,int source_n,int physical_n,int k)
+    {
+        const bool gateup=role==MoEPrefillProjectionRole::GateUp;
+        if(source_n!=physical_n || source_n!=(gateup ? 512 : 2048) || k!=(gateup ? 2048 : 512))
+            throw std::invalid_argument("column candidate requires original full-width routed projections");
+        auto result=nativeCandidate(role,source_n,physical_n,k,MoEGroupedWmmaRowFloor::Eight);
+        result.row_plan_=MoEGroupedRowPlan::column(role);
+        return result;
+    }
+
     /** @return The exact plan borrowed by the directory builder and every projection role. */
     [[nodiscard]] LLAMINAR_MOE_DOT_HD constexpr MoEGroupedRowPlan rowPlan() const noexcept { return row_plan_; }
 
@@ -211,6 +236,10 @@ public:
         if (source == 20 || source == 21) source = 19;
         if (whole_expert_rows <= 0 || desc.n != physical_n_ || desc.k != k_ ||
             desc.codebook_id >= 32 || source >= 32)
+            return MoEGroupedDotProducer::Invalid;
+        if (row_plan_.isColumn() && (!desc.source_identity_present || !desc.source_is_superblock ||
+            desc.source_codebook_id != (row_plan_.role()==MoEPrefillProjectionRole::GateUp ? 13 : 4) ||
+            desc.codebook_id != (row_plan_.role()==MoEPrefillProjectionRole::GateUp ? 13 : 24)))
             return MoEGroupedDotProducer::Invalid;
         if (whole_expert_rows < static_cast<int>(row_plan_.floor()) ||
             !(physical_codebooks_ & (uint32_t{1} << desc.codebook_id)) ||

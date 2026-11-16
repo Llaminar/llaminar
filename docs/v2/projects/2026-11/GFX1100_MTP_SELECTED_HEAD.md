@@ -1,13 +1,16 @@
 # gfx1100 selected LM-head component
 
 The actual device row selector followed by the actual quantized LM-head stage
-has a measured Dot4/WMMA crossover at M5. The complete forced M2–16 panel
-qualifies seeded Q6_K at the original full-vocabulary geometries: N248320 with
-K5120 (dense) or K2048 (MoE). Dot4 wins all31 pairs at M2–4; WMMA wins all31
-at every M5–16. These are seeded weights, not original model-weight bytes.
-Narrow Automatic replay, two timing panels and16 native profiles now pass.
-TP ownership, other formats
-and controller integration remain outside this component's measured domain.
+now qualifies all 21 original source formats at full vocabulary N248320,
+K5120 (dense) or K2048 (MoE), and M2–16. Actual Automatic selects WMMA for
+490 measured keys and retains Dot4 for 140 controls. Every selected key wins
+all 31 paired comparisons: geometric gain 1.812366×, minimum 1.055170× and
+maximum 3.003279×. All 42 source/geometry replays pass across 630 row widths.
+
+These are seeded original-format weights. Original model-weight bytes,
+TP/source-slice ownership and controller integration remain outside this
+component. The Q6_K milestones below retain their historical scope; the final
+all-source qualification follows them.
 
 ## Operation and independent oracle
 
@@ -90,7 +93,7 @@ source edits:
   `selected-head-full-width-forced-snapshot-1794809356013805645/snapshot.json`,
   SHA256 `65abff9b47172656c37fa7445546d2c9ada4da8ae02c367765bed5d80d88bdd8`.
 
-## Qualified narrow Automatic selection
+## Qualified Q6_K Automatic baseline
 
 The measured rule selects Q6_K native WMMA only at M5–16 for these two heads. The actual LM-head stage
 binds a typed materialized-operation identity using the existing graph input
@@ -167,12 +170,85 @@ Final local evidence:
 - `selected-head-automatic-host.{log,xml}`, `selected-head-automatic-integration.{log,xml}`,
   and `selected-head-stage-boundary.{log,xml}`.
 
-This closes the measured Q6_K selected-head component. It does not certify other
-head codebooks, TP/source-slice ownership, MTP controller index production,
-original model-weight bytes, or complete-model MTP economy.
+This baseline closed Q6_K only. The subsequent all-source extension below
+retains the same TP/source-slice, controller, original model-weight and
+complete-model boundaries.
 
 Qualified snapshot:
 `selected-head-automatic-qualified-snapshot-1794811716955552070/snapshot.json`,
 SHA256 `5881d55092d41afa2fe9eddec4f93a772c473ab44d222d8c39f9d12669d6d1de`.
 It preserves60 timing cells/1860 triples,16 profiles, seven focused registrations,
 exact Release/Integration producers and source/build evidence before subsequent work.
+
+## Qualified all-source Automatic selection
+
+The canonical source inventory supplies 21 formats, each with independently
+prepared Dot4, Automatic, forced WMMA and serial-M1 owners. Source identity is
+preserved separately from physical decoding: Q8_0/Q8_1/Q8_K retain distinct
+original keys despite sharing decoder19, and IQ4_XS keeps original source4 with
+its superblock discriminator and physical decoder24. Physical-core parallel
+source construction retains the same deterministic 1024-row chunk protocol.
+
+A complete forced sweep first measures 630 source/geometry/width cells with
+31 triples each. Admission requires every pair to win and at least a 5% median
+margin. The resulting literal policy contains 490 keys; an independent
+TensorType-keyed golden table supplies the capture and host expectations.
+Neither table infers unmeasured intermediate widths or merges source aliases.
+
+| Original source | MoE K2048 WMMA widths | Dense K5120 WMMA widths |
+|---|---|---|
+| All formats except IQ1_S/IQ1_M | M5–16 | M5–16 |
+| IQ1_S | M6–16 | M9–16 |
+| IQ1_M | M9–16 | M9 and M11–16 |
+
+Dense IQ1_M M10 remains Dot4: its forced median gain was 1.049990709×, below
+the seed margin. The non-contiguous mask is intentional. Other geometries,
+counted rows, incompatible source/ownership bindings and widths outside the
+measured set retain their established policy. Host replay checks M1–65 and
+neighbor N/K values, including every source alias and the materialized-row
+boundary.
+
+Fresh actual-Automatic replay and timing authenticate 84 records: 42 Integration
+cases and 42 Release cases. All 630 replay widths preserve serial bytes through
+input/index changes, clamp/duplicates, reset, poison and repeated capture replay.
+Every source/geometry has an explicit production-preflight registration; only
+focused tests ran. The timing panel contains 19,530 triples, each timing eight
+complete selector/head operations. All 490 selected cells win all 31 comparisons;
+140 Dot4 controls preserve their expected captured engine census. A separate
+Sol6.1 audit independently reconstructs samples, source bindings, masks, medians
+and producer hashes and agrees with the qualification result.
+
+No GPU kernel was added for this extension. Current IQ1_M M16 profiles at both
+K values authenticate the same loaded ELF, ISA, descriptor and resources as
+the earlier Q6_K profiles. Sixteen separate counter launches use the current
+unprofiled timing producer. The generic native kernel remains wave64 with
+80 logical/allocated VGPRs, 67 SGPRs, 7040 logical LDS bytes (7168 allocated),
+and zero private storage or VGPR/SGPR spills.
+
+| IQ1_M native M16 profile | Dense K5120 | MoE K2048 |
+|---|---:|---:|
+| Occupancy % |46.9524|46.8988|
+| Memory unit busy % |75.1957|78.5839|
+| L2 hit % |28.1743|38.1547|
+| LDS bank conflict metric |1.904762|1.904762|
+| Wavefronts |124160|124160|
+
+Both guarded builds retain gfx906/gfx1100 and CUDA86. Canonical timings run in
+ordinary AUTO power; counter passes separately use STABLE_STD and restore AUTO.
+The earlier normalized RTX3090 parity anchors remain a separate qualification;
+this component establishes complete selected-head latency and byte behavior.
+
+Final evidence under the local campaign root:
+
+- `selected-head-all-source-initial-audit.json` and
+  `selected-head-all-source-policy-seed.json` (seed SHA256
+  `69d3e89177fc843e696a5f13ff80aefa2b38304f322a1cfadc18a31719fc30ed`).
+- `selected-head-all-source-automatic-queue-1794821093674163647/index.json` and
+  `selected-head-all-source-automatic-audit.json` (audit SHA256
+  `793f8af98e7ec2628db6069269b5d40cd6118b5c5b89e013ae350f1a9c7c504f`).
+- `selected-head-all-source-bounded-profiles-1794822885255372650/index.json`
+  joins all 16 current counter passes to the unchanged loaded code.
+- `selected-head-all-source-automatic-qualified-snapshot-1794824585209873874/snapshot.json`,
+  SHA256 `0f5d2d8ec9f56cf3d38218ce9506cbeb9c36f8023c81d5e62833c8e7a8b7a62a`,
+  retains both full panels, original sources, exact Release/Integration producers,
+  raw counter/ISA evidence and the historical unchanged-code joins.

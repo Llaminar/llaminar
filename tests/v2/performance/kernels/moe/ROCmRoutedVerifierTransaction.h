@@ -63,11 +63,14 @@ public:
 /** @brief Replay supplied duplicate routes through the actual grouping producer.
  * @param worker Exact owner of capture and observation. @param device Original gfx1100 device.
  * @param prepared Original prepared expert sources, shared with the actual-router fixture.
+ * @param directory_source Exact offset or column producer to replay.
  * @note This separate grouping oracle does not assume the actual router emits duplicate top-k IDs. */
 void runCapturedOffsetSlotGrouping(IWorkerGPUContext &worker, DeviceId device,
-    const std::vector<GpuPreparedGemm> &prepared)
+    const std::vector<GpuPreparedGemm> &prepared,
+    rocm::MoEGroupedDirectorySource directory_source=rocm::MoEGroupedDirectorySource::GroupingOffsetSlots)
 {
     constexpr int rows=16, routes=8, experts=256, slots=rows*routes;
+    const bool columns=directory_source==rocm::MoEGroupedDirectorySource::GroupingColumnSlots;
     const auto require=[](bool ok,const char *what) { if(!ok) throw std::runtime_error(what); };
     auto *backend=getBackendFor(device);
     const auto stream=static_cast<hipStream_t>(worker.defaultStream());
@@ -118,7 +121,7 @@ void runCapturedOffsetSlotGrouping(IWorkerGPUContext &worker, DeviceId device,
     const auto retire=[&](void *) { if(hipStreamSynchronize(stream)!=hipSuccess) std::terminate(); };
     std::unique_ptr<void,decltype(retire)> completion(&worker,retire);
     rocm::ScopedMoEGroupedPrefillEngine selected(rocm::MoEGroupedPrefillEngine::WideDot4Wmma,
-        rocm::MoEGroupedWmmaRowFloor::Eight,rocm::MoEGroupedDirectorySource::GroupingOffsetSlots);
+        rocm::MoEGroupedWmmaRowFloor::Eight,directory_source);
     ASSERT_TRUE(kernel->prepareExpertGroupsAsync(ids.get(),weights.get(),rows,experts,routes));
     ASSERT_EQ(hipStreamSynchronize(stream),hipSuccess);
     ScopedBackendGraphCapture capture(worker,*graph,"duplicate offset-slot grouping");
@@ -158,7 +161,7 @@ void runCapturedOffsetSlotGrouping(IWorkerGPUContext &worker, DeviceId device,
         read(directory,MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY);
         require(hipStreamSynchronize(stream)==hipSuccess,"duplicate grouping observation join failed");
     };
-    for(int pattern:{128,17,33,0,-1,0,-1,128})
+    for(int pattern:{128,17,33,5,7,0,-1,0,-1,128})
     {
         std::fill_n(ids->mutable_data(),slots,-1.f);
         std::array<int,experts> expected_counts{};
@@ -184,7 +187,14 @@ void runCapturedOffsetSlotGrouping(IWorkerGPUContext &worker, DeviceId device,
             if(count)
             {
                 ASSERT_EQ(active[active_count++],expert);
-                for(int row=0;row<count;row+=count<8?count:16)
+                if(columns) {
+                    // Independent writer oracle derives compact ordinals from
+                    // actual row/column work, not the production interval helper.
+                    int ordinal=0;
+                    for(int row=0;row<count;row+=count<8 ? 4 : 16)
+                        for(int quadrant=0;quadrant<(count<8 ? 1 : 4);++quadrant)
+                            expected_directory[offset+ordinal++]=(uint32_t(row)<<10)|(uint32_t(quadrant)<<8)|uint32_t(expert);
+                } else for(int row=0;row<count;row+=count<8?count:16)
                     expected_directory[offset+row]=(uint32_t(row)<<10)|uint32_t(expert);
             }
             offset+=count;
@@ -242,12 +252,22 @@ void runCapturedRoutedVerifier(const Case &c, ExpertBenchmark mode,
     constexpr int hidden = 2048, intermediate = 512, experts = 256, top_k = 8, repeats = 8;
     using Engine = rocm::MoEGroupedPrefillEngine;
     using Floor = rocm::MoEGroupedWmmaRowFloor;
-    const std::array<GroupedDotCandidate, 3> candidates{{
+    std::array<GroupedDotCandidate, 5> requested_candidates{{
         {Engine::OrderedDot4, Floor::EveryExpert, "Dot4"},
         {Engine::WideDot4Wmma, Floor::Eight, "WideFloor8"},
-        {Engine::WideDot4Wmma, Floor::Eight, "WideGroupingOffsetSlots", rocm::MoEGroupedDirectorySource::GroupingOffsetSlots}}};
+        {Engine::WideDot4Wmma, Floor::Eight, "WideGroupingOffsetSlots", rocm::MoEGroupedDirectorySource::GroupingOffsetSlots},
+        {Engine::WideDot4Wmma, Floor::Eight, "ColumnGroupingSlots", rocm::MoEGroupedDirectorySource::GroupingColumnSlots},
+        {Engine::Automatic, Floor::EveryExpert, "Automatic"}}};
+    const int automatic_path = c.rows == 16 ? 4 : c.rows > 8 ? 3 : 2;
+    requested_candidates[automatic_path] = {Engine::Automatic, Floor::EveryExpert, "Automatic"};
+    // Expected production policy is independent of the selector under test.
+    // The last owner records Automatic, including Dot4 controls at M8/M9.
+    auto candidates = requested_candidates;
+    candidates[automatic_path] = c.rows == 16
+        ? GroupedDotCandidate{Engine::WideDot4Wmma, Floor::Eight, "Automatic", rocm::MoEGroupedDirectorySource::GroupingColumnSlots}
+        : GroupedDotCandidate{Engine::OrderedDot4, Floor::EveryExpert, "Automatic"};
     constexpr int max_paths = std::tuple_size_v<decltype(candidates)>;
-    const int paths = c.rows > 8 ? max_paths : max_paths-1;
+    const int paths = automatic_path + 1;
     std::printf("ROCM_ROUTED_VERIFIER_CANDIDATES,%s",c.name.c_str());
     for(int path=0;path<paths;++path) std::printf(",%s",candidates[path].name.c_str());
     std::printf("\n");
@@ -255,8 +275,11 @@ void runCapturedRoutedVerifier(const Case &c, ExpertBenchmark mode,
     ASSERT_EQ(prepared.size(), experts * 3u); ASSERT_GE(c.rows, 8); ASSERT_LE(c.rows, 16);
     ASSERT_TRUE(c.verifier_distribution);
     const int rows = c.rows, ordinal = c.device.ordinal;
-    if(rows==16 && *c.verifier_distribution==RoutedVerifierDistribution::Uniform)
+    if(rows==16 && *c.verifier_distribution==RoutedVerifierDistribution::Uniform) {
         ASSERT_NO_FATAL_FAILURE(runCapturedOffsetSlotGrouping(worker,c.device,prepared));
+        ASSERT_NO_FATAL_FAILURE(runCapturedOffsetSlotGrouping(worker,c.device,prepared,
+            rocm::MoEGroupedDirectorySource::GroupingColumnSlots));
+    }
     auto *backend = getBackendFor(c.device);
     const auto stream = static_cast<hipStream_t>(worker.defaultStream());
     ASSERT_NE(backend, nullptr); ASSERT_NE(stream, nullptr);
@@ -457,7 +480,8 @@ void runCapturedRoutedVerifier(const Case &c, ExpertBenchmark mode,
         ASSERT_TRUE(stages[path]->prepareGraphLaunch(&context, stream));
         auto expected_submissions = submissions();
         const auto &candidate = candidates[path];
-        rocm::ScopedMoEGroupedPrefillEngine selected(candidate.engine, candidate.floor, candidate.directory);
+        const auto &requested = requested_candidates[path];
+        rocm::ScopedMoEGroupedPrefillEngine selected(requested.engine, requested.floor, requested.directory);
         ASSERT_TRUE(enqueue(path)); ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
         for (auto *t : {input.get(), gate.get(), outputs[path].get(), ids[path].get(), weights[path].get()})
             TransferEngine::requireDeviceInput(t, c.device, stream);
@@ -467,12 +491,13 @@ void runCapturedRoutedVerifier(const Case &c, ExpertBenchmark mode,
         for (int repeat = 0; repeat < repeats; ++repeat) ASSERT_TRUE(enqueue(path));
         capture.finish();
         const std::array<GPUOrderedTimelineStep, 1> steps{{{.name=candidates[path].name.c_str(), .kind=GPUOrderedTimelineStepKind::CapturedFragment, .capture=fragments[path].get()}}};
-        ASSERT_TRUE(graphs[path]->buildOrderedTimelineTransaction(steps, GPUOrderedTimelineInstrumentation::PerStepEvents));
+        ASSERT_TRUE(graphs[path]->buildOrderedTimelineTransaction(steps, mode == ExpertBenchmark::RoutedVerifierProfile
+            ? GPUOrderedTimelineInstrumentation::Disabled : GPUOrderedTimelineInstrumentation::PerStepEvents));
         ASSERT_TRUE(graphs[path]->instantiate());
         auto *parent = dynamic_cast<HIPGraphCapture *>(graphs[path].get()); ASSERT_NE(parent, nullptr);
         q8_proofs[path] = std::make_unique<RouterQ8CaptureProof>(*parent, stream, *owners[path]->router_q8_publication, count,
             static_cast<const int *>(workspaces[path]->getBuffer(MoEWorkspaceBuffers::GROUP_TOKEN_INDICES)),
-            rows, hidden, intermediate, repeats, path && rows > 8 ? 1 : 0);
+            rows, hidden, intermediate, repeats, candidate.engine != Engine::OrderedDot4 && rows > 8 ? 1 : 0);
         size_t node_count = 0; ASSERT_EQ(hipGraphGetNodes(parent->graph(), nullptr, &node_count), hipSuccess);
         std::vector<hipGraphNode_t> nodes(node_count); ASSERT_EQ(hipGraphGetNodes(parent->graph(), nodes.data(), &node_count), hipSuccess);
         std::array<int, 2> native_roles{};
@@ -484,10 +509,11 @@ void runCapturedRoutedVerifier(const Case &c, ExpertBenchmark mode,
             if (type != hipGraphNodeTypeKernel) continue;
             hipKernelNodeParams launch{}; ASSERT_EQ(hipGraphKernelNodeGetParams(node, &launch), hipSuccess);
             const char *symbol = hipKernelNameRefByPtr(launch.func, stream); ASSERT_NE(symbol, nullptr);
-            if (candidate.directory == rocm::MoEGroupedDirectorySource::GroupingOffsetSlots &&
+            if (candidate.directory != rocm::MoEGroupedDirectorySource::RolePlanner &&
                 std::string_view(symbol).find("rocm_moe_build_active_expert_list_kernel") != std::string_view::npos)
             {
-                ASSERT_NE(std::string_view(symbol).find("ILb1"),std::string_view::npos);
+                ASSERT_NE(std::string_view(symbol).find(candidate.directory==rocm::MoEGroupedDirectorySource::GroupingColumnSlots
+                    ? "ILb1ELb1EE" : "ILb1ELb0EE"),std::string_view::npos);
                 ASSERT_EQ(*static_cast<const int **>(launch.kernelParams[0]),workspaces[path]->getBuffer(MoEWorkspaceBuffers::GROUP_COUNTS));
                 ASSERT_EQ(*static_cast<int **>(launch.kernelParams[1]),workspaces[path]->getBuffer(MoEWorkspaceBuffers::GROUP_ACTIVE_EXPERT_IDS));
                 ASSERT_EQ(*static_cast<int *>(launch.kernelParams[2]),experts);
@@ -534,9 +560,11 @@ void runCapturedRoutedVerifier(const Case &c, ExpertBenchmark mode,
             const auto &args = *static_cast<const rocm::MoEGroupedWmmaArguments *>(launch.kernelParams[0]);
             ASSERT_GT(path, 0);
             const bool wide = candidate.engine == Engine::WideDot4Wmma;
+            const bool columns=candidate.directory==rocm::MoEGroupedDirectorySource::GroupingColumnSlots;
             const auto role = launch.gridDim.z == 2 ? rocm::MoEPrefillProjectionRole::GateUp : rocm::MoEPrefillProjectionRole::Down;
             const int tile = wide ? (launch.gridDim.z == 2 ? 64 : 32) : candidate.engine == Engine::WmmaM16N32 ? 32 : 64;
-            ASSERT_EQ(args.dot_admission.rowPlan(), wide ? rocm::MoEGroupedRowPlan::wide(role, candidate.floor) :
+            ASSERT_EQ(args.directory_layout,columns ? MoEGroupingPackedLayout::ColumnFloor8 : MoEGroupingPackedLayout::WideFloor8);
+            ASSERT_EQ(args.dot_admission.rowPlan(), columns ? rocm::MoEGroupedRowPlan::column(role) : wide ? rocm::MoEGroupedRowPlan::wide(role, candidate.floor) :
                 rocm::MoEGroupedRowPlan::nativeMicro(role, candidate.floor));
             ASSERT_TRUE(args.dot_admission.binds(role, args.n, args.k));
             ASSERT_NE(std::string_view(symbol).find(wide ? "wideProjection" : "ELi" + std::to_string(tile) + "ELb"), std::string_view::npos);
@@ -549,13 +577,13 @@ void runCapturedRoutedVerifier(const Case &c, ExpertBenchmark mode,
             ASSERT_EQ(args.group_counts, workspaces[path]->getBuffer(MoEWorkspaceBuffers::GROUP_COUNTS));
             ASSERT_EQ(args.group_offsets, workspaces[path]->getBuffer(MoEWorkspaceBuffers::GROUP_OFFSETS));
             ASSERT_EQ(args.directory,workspaces[path]->getBuffer(MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY));
-            if (candidate.directory == rocm::MoEGroupedDirectorySource::GroupingOffsetSlots)
+            if (candidate.directory != rocm::MoEGroupedDirectorySource::RolePlanner)
                 ASSERT_EQ(args.directory_capacity,rows*top_k);
             if (launch.gridDim.z == 2)
             {
                 ++native_roles[0];
                 ASSERT_EQ(args.group_token_indices, workspaces[path]->getBuffer(MoEWorkspaceBuffers::GROUP_TOKEN_INDICES));
-                ASSERT_EQ(launch.gridDim.x, unsigned(intermediate / tile));
+                ASSERT_EQ(launch.gridDim.x, unsigned(intermediate / (columns ? 256 : tile)));
                 ASSERT_NE(std::string_view(symbol).find("Format13E"), std::string_view::npos);
                 ASSERT_EQ(args.n, intermediate); ASSERT_EQ(args.k, hidden);
                 ASSERT_EQ(args.input, rocm::MoEGroupedWmmaInput::OriginalTokens);
@@ -570,7 +598,7 @@ void runCapturedRoutedVerifier(const Case &c, ExpertBenchmark mode,
                 ++native_roles[1]; ASSERT_EQ(launch.gridDim.z, 1u);
                 ASSERT_EQ(args.group_token_indices, nullptr);
                 ASSERT_EQ(args.output, workspaces[path]->getBuffer(MoEWorkspaceBuffers::PREFILL_GATE));
-                ASSERT_EQ(launch.gridDim.x, unsigned(hidden / tile));
+                ASSERT_EQ(launch.gridDim.x, unsigned(hidden / (columns ? 128 : tile)));
                 ASSERT_NE(std::string_view(symbol).find("Format24E"), std::string_view::npos);
                 ASSERT_EQ(args.n, hidden); ASSERT_EQ(args.k, intermediate);
                 ASSERT_EQ(args.input, rocm::MoEGroupedWmmaInput::GroupedRows);
@@ -580,16 +608,18 @@ void runCapturedRoutedVerifier(const Case &c, ExpertBenchmark mode,
                 native_admission[path] = args.admission;
             }
         }
-        ASSERT_EQ(native_nodes[path].size(), path && rows > 8 ? 2u * repeats : 0u);
+        ASSERT_EQ(native_nodes[path].size(), candidate.engine != Engine::OrderedDot4 && rows > 8 ? 2u * repeats : 0u);
         ASSERT_EQ(route_owned_gateup, repeats);
-        for (int role_count : native_roles) ASSERT_EQ(role_count, path && rows > 8 ? repeats : 0);
+        for (int role_count : native_roles) ASSERT_EQ(role_count, candidate.engine != Engine::OrderedDot4 && rows > 8 ? repeats : 0);
         if (candidate.engine == Engine::WideDot4Wmma)
             for (int count : wide_directories) ASSERT_EQ(count,
                 rows > 8 && candidate.directory == rocm::MoEGroupedDirectorySource::RolePlanner ? repeats : 0);
-        ASSERT_EQ(packed_publishers[path].size(),candidate.directory == rocm::MoEGroupedDirectorySource::GroupingOffsetSlots ? repeats : 0u);
+        ASSERT_EQ(packed_publishers[path].size(),candidate.directory != rocm::MoEGroupedDirectorySource::RolePlanner ? repeats : 0u);
         if (candidate.engine == Engine::WideDot4Wmma)
         {
-            const auto roles = inspectROCmGroupedWideCapture(*parent, stream, candidate.floor);
+            const auto roles = inspectROCmGroupedWideCapture(*parent, stream, candidate.floor,
+                candidate.directory==rocm::MoEGroupedDirectorySource::GroupingColumnSlots
+                    ? MoEGroupingPackedLayout::ColumnFloor8 : MoEGroupingPackedLayout::WideFloor8);
             ASSERT_EQ(roles[0], rows > 8 ? repeats : 0);
             ASSERT_EQ(roles[1], rows > 8 ? repeats : 0);
         }
@@ -623,13 +653,16 @@ void runCapturedRoutedVerifier(const Case &c, ExpertBenchmark mode,
         for (auto *t : {outputs[path].get(), ids[path].get(), weights[path].get()})
             require(hipMemsetAsync(t->gpu_data_ptr(), 0xa5, t->numel() * sizeof(float), stream) == hipSuccess, "Routed output poison failed");
     };
-    const auto replay = [&](int path) {
-        poison(path);
-        require(graphs[path]->launch(), "Routed retained replay failed");
+    const auto observe = [&](int path) {
         require(backend->deviceToHost(observed.data(), outputs[path]->gpu_data_ptr(), observed.size() * sizeof(uint32_t), ordinal, stream), "Routed observation failed");
         require(backend->deviceToHost(observed_ids.data(), ids[path]->gpu_data_ptr(), observed_ids.size() * sizeof(float), ordinal, stream), "Routed ID observation failed");
         require(backend->deviceToHost(observed_weights.data(), weights[path]->gpu_data_ptr(), observed_weights.size() * sizeof(float), ordinal, stream), "Routed weight observation failed");
         require(hipStreamSynchronize(stream) == hipSuccess, "Routed observation completion failed");
+    };
+    const auto replay = [&](int path) {
+        poison(path);
+        require(graphs[path]->launch(), "Routed retained replay failed");
+        observe(path);
     };
     const auto matches = [&] {
         for (size_t i = 0; i < observed.size(); ++i)
@@ -644,6 +677,25 @@ void runCapturedRoutedVerifier(const Case &c, ExpertBenchmark mode,
             ASSERT_EQ(std::bit_cast<uint32_t>(observed_weights[i]), active ? std::bit_cast<uint32_t>(expected_weights[i]) : 0u);
         }
     };
+    if (mode == ExpertBenchmark::RoutedVerifierProfile)
+    {
+        ASSERT_EQ(rows, 16);
+        replay(automatic_path); ASSERT_TRUE(matches()); ASSERT_NO_FATAL_FAILURE(verify_routes());
+        for (int warm = 0; warm < 10; ++warm) ASSERT_TRUE(graphs[automatic_path]->launch());
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        poison(automatic_path);
+        ASSERT_EQ(hipStreamSynchronize(stream), hipSuccess);
+        ASSERT_GE(roctxRangePushA("ROCmRoutedVerifierAutomatic"), 0);
+        ASSERT_EQ(roctxProfilerResume(0), 0);
+        const bool launched = graphs[automatic_path]->launch();
+        const auto joined = hipStreamSynchronize(stream);
+        const int paused = roctxProfilerPause(0), popped = roctxRangePop();
+        ASSERT_TRUE(launched && joined == hipSuccess && paused == 0 && popped >= 0);
+        observe(automatic_path); ASSERT_TRUE(matches()); ASSERT_NO_FATAL_FAILURE(verify_routes());
+        ASSERT_EQ(submissions(), recorded_submissions);
+        std::printf("ROCM_ROUTED_VERIFIER_PROFILE_OBSERVED,%s,%d,Automatic\n", c.name.c_str(), rows);
+        return;
+    }
     std::vector<int> live_sequence{rows, 8, std::min(rows, 9), 0, rows, rows};
     for (int n = 1; n <= rows; ++n) live_sequence.push_back(n);
     for (int n : live_sequence)

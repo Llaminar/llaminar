@@ -278,7 +278,7 @@ namespace
         OrderedProfile, OrderedColdProfile, WmmaAdaptive32ColdProfile,
         WmmaMacroReplay, WmmaMacroTournament, WmmaMacroTimingReplay, WmmaMacroProfile, WmmaMacroColdProfile,
         PopulationReplay, PopulationTournament, PopulationProfile,
-        RoutedVerifierReplay, RoutedVerifierTournament
+        RoutedVerifierReplay, RoutedVerifierTournament, RoutedVerifierProfile
     };
 
 #ifdef HAVE_ROCM
@@ -497,7 +497,8 @@ namespace
         ExpertPublication publication_mode = ExpertPublication::CanonicalRoutesThenFold,
         std::optional<PopulationProfileWork> profile_work = std::nullopt)
     {
-        const bool routed_verifier = mode == ExpertBenchmark::RoutedVerifierReplay || mode == ExpertBenchmark::RoutedVerifierTournament;
+        const bool routed_verifier = mode == ExpertBenchmark::RoutedVerifierReplay ||
+            mode == ExpertBenchmark::RoutedVerifierTournament || mode == ExpertBenchmark::RoutedVerifierProfile;
 #ifdef HAVE_ROCM
         std::optional<RoutedVerifierRouterPolicy> routed_policy;
         if (routed_verifier) routed_policy.emplace();
@@ -867,7 +868,13 @@ namespace
                         else
                         {
                             const bool adaptive = dot_candidates[path].floor != rocm::MoEGroupedWmmaRowFloor::EveryExpert;
-                            ASSERT_NE(node.name.find(adaptive ? "ELb1EE" : "ELb0EE"),std::string::npos) << node.name;
+                            const bool wide = dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::WideDot4Wmma;
+                            // Wide kernels append the directory policy after the arithmetic
+                            // flag. These ordinary population captures require that flag
+                            // to remain false; routed Column captures prove it separately.
+                            const std::string arithmetic_suffix = std::string(adaptive ? "ELb1" : "ELb0") +
+                                (wide ? "ELb0EE" : "EE");
+                            ASSERT_NE(node.name.find(arithmetic_suffix),std::string::npos) << node.name;
                         }
                         if (dot_candidates[path].engine == rocm::MoEGroupedPrefillEngine::WideDot4Wmma)
                         {
@@ -2115,6 +2122,8 @@ namespace
     { runExpertPipeline(GetParam(), ExpertBenchmark::RoutedVerifierReplay, ExpertPublication::RouterQ8TokenRows); }
     TEST_P(ROCmRoutedVerifierTransaction, DISABLED_Paired)
     { runExpertPipeline(GetParam(), ExpertBenchmark::RoutedVerifierTournament, ExpertPublication::RouterQ8TokenRows); }
+    TEST_P(ROCmRoutedVerifierTransaction, DISABLED_ProfileAutomatic)
+    { runExpertPipeline(GetParam(), ExpertBenchmark::RoutedVerifierProfile, ExpertPublication::RouterQ8TokenRows); }
     INSTANTIATE_TEST_SUITE_P(NativeGfx1100, ROCmRoutedVerifierTransaction, ::testing::ValuesIn(routedVerifierCases()),
         [](const ::testing::TestParamInfo<Case> &info) { return info.param.name; });
 #endif

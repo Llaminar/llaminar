@@ -2,7 +2,7 @@
  * @file Test__ROCmSelectedLMHeadTransaction.cpp
  * @brief Real device row selection followed by the quantized verifier LM head.
  *
- * Seeded Q6_K weights use original full-vocabulary model geometries. Two forced
+ * Seeded native source weights use original full-vocabulary model geometries. Two forced
  * controls, actual Automatic and an independent serial owner have separate prepared payloads,
  * activations, arenas and outputs. Fixture-owned device indices are inputs to
  * the real selector; this component does not certify the MTP metadata producer
@@ -26,9 +26,12 @@
 #include "kernels/rocm/gemm/ROCmNativeQuantisedVerifierLaunch.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 #include "transfer/TransferEngine.h"
+#include "tensors/TensorFactory.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
+#include "../../../utils/ROCmSelectedHeadGolden.h"
 #include <algorithm>
 #include <array>
 #include <bit>
@@ -45,6 +48,13 @@
 using namespace llaminar2;
 using namespace llaminar2::rocm;
 using namespace llaminar2::test;
+/** @brief Query the canonical original-source serial tree before inspecting captured grouped consumers.
+ * @param source Original arithmetic codebook, with Q8 aliases normalized explicitly.
+ * @param n Original vocabulary width. @param k Original contraction width.
+ * @param partitions Canonical serial reduction partitions. @param waves Canonical launch wave target.
+ * @return Whether this source/geometry has an installed serial policy. */
+extern "C" bool rocmGemv_native_quantised_query_serial_m1_config_with_policy(
+    uint8_t source,int n,int k,int *partitions,int *waves);
 namespace {
 constexpr int vocabulary = 248320;
 constexpr int source_rows = 19;
@@ -182,23 +192,26 @@ public:
 };
 
 /** @brief Real model geometry with seeded weights, not original model-weight evidence. */
-struct Geometry { const char *name; int hidden; };
-constexpr std::array geometries{Geometry{"Dense", 5120}, Geometry{"MoE", 2048}};
+struct Geometry { std::string name; int hidden; TensorType source=TensorType::Q6_K; };
+const std::array geometries{Geometry{"Dense", 5120}, Geometry{"MoE", 2048}};
 
 /** @brief Generate the large original source once using independent fixed row chunks.
- * @param format Exact Q6_K source factory. @param n Original vocabulary. @param k Hidden width.
+ * @param format Exact original native source factory. @param n Original vocabulary. @param k Hidden width.
  * @return One immutable original tensor; chunk seeds do not depend on scheduling.
  * @note Chunking changes no production representation. It bounds temporary factory
  * storage per worker and avoids serial synthesis of a billion-element source. */
 std::shared_ptr<TensorBase> makeSource(const QuantizedVerifierFormatCase &format, int n, int k)
 {
+    requireQuantizedVerifierSourceShape(format,n,k);
     constexpr int chunk_rows = 1024;
     const int chunks = (n+chunk_rows-1)/chunk_rows;
     const auto *hardware = DeviceManager::instance().hardware();
     require(hardware && hardware->total_physical_cores()>0 && omp_get_max_threads()>0,
         "Head source synthesis requires physical-worker inventory");
     const int workers = std::min({chunks,hardware->total_physical_cores(),omp_get_max_threads()});
-    const size_t row_bytes = size_t(k/256)*sizeof(Q6_KBlock);
+    const auto single_row=format.create({1,size_t(k)},96911u);
+    const size_t row_bytes=quantizedRawBytesForGpuPreparedTest(*single_row);
+    require(row_bytes>0,"Head source has no native row storage");
     AlignedVector<uint8_t> bytes(size_t(n)*row_bytes);
     std::vector<std::exception_ptr> errors(chunks);
     const auto start = std::chrono::steady_clock::now();
@@ -214,7 +227,8 @@ std::shared_ptr<TensorBase> makeSource(const QuantizedVerifierFormatCase &format
     for (const auto &error : errors) if (error) std::rethrow_exception(error);
     std::printf("ROCM_SELECTED_HEAD_SETUP,%d,%d,chunks=%d,workers=%d,seconds=%.6f\n",n,k,chunks,workers,
         std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count());
-    return std::make_shared<Q6_KTensor>(std::vector<size_t>{size_t(n),size_t(k)},std::move(bytes));
+    return TensorFactory::adoptQuantizedFinalStorage(format.tensor_type,
+        {size_t(n),size_t(k)},std::move(bytes),DeviceId::cpu());
 }
 
 /** @brief Replay or time fully materialized selected rows against independent M1.
@@ -247,8 +261,16 @@ void prove(const Geometry &geometry, Observation observation, int profile_m=0)
         auto context = IDeviceContext::create(device); ASSERT_TRUE(context);
         const int k = geometry.hidden, n = vocabulary, repeats = timed ? 8 : 1;
         const auto &formats = quantizedMoEVerifierFormats();
-        const auto format = std::find_if(formats.begin(), formats.end(), [](const auto &f) { return f.tensor_type == TensorType::Q6_K; });
+        const auto format = std::find_if(formats.begin(), formats.end(), [&](const auto &f) { return f.tensor_type == geometry.source; });
         ASSERT_NE(format, formats.end());
+        int serial_partitions=0,serial_waves=0;
+        const auto arithmetic_source=canonicalDeviceVnniCodebookId(format->source_codebook_id);
+        ASSERT_TRUE(rocmGemv_native_quantised_query_serial_m1_config_with_policy(
+            arithmetic_source,n,k,&serial_partitions,&serial_waves));
+        ASSERT_GT(serial_partitions,0);ASSERT_LE(serial_partitions,NativeQuantisedGroupedDecodePolicy::maximum_k_partitions);
+        ASSERT_GT(serial_waves,0);
+        std::printf("ROCM_SELECTED_HEAD_POLICY,%s,%u,%u,%d,%d,%d,%d\n",geometry.name.c_str(),
+            unsigned(format->source_codebook_id),unsigned(format->device_execution_codebook_id),n,k,serial_partitions,serial_waves);
         std::shared_ptr<TensorBase> weight;
         std::vector<GpuPreparedGemm> prepared;
         std::array<DeviceNativeQuantisedMatrixDesc,paths+1> descriptors;
@@ -266,14 +288,16 @@ void prove(const Geometry &geometry, Observation observation, int profile_m=0)
             ASSERT_EQ(prepared[owner].store->binding(prepared[owner].ref)->tensor, weight.get());
             ASSERT_TRUE(prepared[owner].kernel->exportNativeQuantisedMatrixDesc(descriptors[owner]));
             const auto &desc = descriptors[owner];
-            ASSERT_TRUE(desc.source_identity_present); ASSERT_EQ(desc.source_codebook_id, 8);
-            ASSERT_TRUE(desc.source_is_superblock); ASSERT_EQ(desc.codebook_id, 8);
+            ASSERT_TRUE(desc.source_identity_present); ASSERT_EQ(desc.source_codebook_id,format->source_codebook_id);
+            ASSERT_EQ(bool(desc.source_is_superblock),format->source_is_superblock);
+            ASSERT_EQ(desc.codebook_id,format->device_execution_codebook_id);
             ASSERT_EQ(desc.n, n); ASSERT_EQ(desc.k, k); ASSERT_EQ(desc.blocks_per_row, k/32u);
             for (int prior = 0; prior < owner; ++prior) {
                 ASSERT_NE(desc.payload, descriptors[prior].payload);
                 ASSERT_NE(prepared[owner].kernel, prepared[prior].kernel);
             }
-            std::printf("ROCM_SELECTED_HEAD_SOURCE,%s,%d,%d,%d,8,1,8\n", geometry.name, owner, n, k);
+            std::printf("ROCM_SELECTED_HEAD_SOURCE,%s,%d,%d,%d,%u,%d,%u\n",geometry.name.c_str(),owner,n,k,
+                unsigned(desc.source_codebook_id),int(bool(desc.source_is_superblock)),unsigned(desc.codebook_id));
         }
         const auto headParams = [&](int owner, int m, FP32Tensor *input, FP32Tensor *output) {
             LMHeadStage::Params p;
@@ -326,7 +350,7 @@ void prove(const Geometry &geometry, Observation observation, int profile_m=0)
             const Drain drain{stream};
             for (int row = 0; row < m; ++row) indices[row] = (row*7+3)%source_rows;
             for (int path = 0; path < paths; ++path) {
-                const bool expected_native = path == 2 || (path == 1 && m >= 5);
+                const bool expected_native = path == 2 || (path == 1 && selectedHeadExpectsWmma(geometry.source,vocabulary,geometry.hidden,m));
                 original[path] = TestTensorFactory::createFP32({source_rows,size_t(k)});
                 compact[path] = TestTensorFactory::createFP32({size_t(m),size_t(k)});
                 outputs[path] = TestTensorFactory::createFP32({size_t(m),size_t(n)});
@@ -434,10 +458,10 @@ void prove(const Geometry &geometry, Observation observation, int profile_m=0)
                         ASSERT_EQ(*static_cast<float **>(launch.kernelParams[1]),outputs[path]->gpu_data_ptr());
                         ASSERT_EQ(*static_cast<int *>(launch.kernelParams[2]),m);
                         ASSERT_EQ(*static_cast<int *>(launch.kernelParams[3]),n);
-                        ASSERT_EQ(*static_cast<int *>(launch.kernelParams[4]),16);
+                        ASSERT_EQ(*static_cast<int *>(launch.kernelParams[4]),serial_partitions);
                         ASSERT_EQ(static_cast<const DeviceRowRange *>(launch.kernelParams[5])->captureIdentity(),rows.captureIdentity());
                         ASSERT_EQ(static_cast<const ProjectionRowWork *>(launch.kernelParams[6])->captureIdentity(),ProjectionRowWork::fromPrefix(rows).captureIdentity());
-                        reduced.emplace_back(reinterpret_cast<uintptr_t>(*static_cast<const float **>(launch.kernelParams[0])),16);
+                        reduced.emplace_back(reinterpret_cast<uintptr_t>(*static_cast<const float **>(launch.kernelParams[0])),serial_partitions);
                     }
                     if (name.find("gemv_native_quantised_small_m_batched_shared_kernel_t") != std::string_view::npos ||
                         name.find("gemv_native_quantised_small_m_kernel_t") != std::string_view::npos) {
@@ -460,20 +484,23 @@ void prove(const Geometry &geometry, Observation observation, int profile_m=0)
                     ASSERT_EQ(*static_cast<const float **>(launch.kernelParams[1]),scales);
                     ASSERT_EQ(*static_cast<const int32_t **>(launch.kernelParams[2]),sums);
                     ASSERT_EQ(*static_cast<int *>(launch.kernelParams[4]),k);
-                    ASSERT_EQ(*static_cast<int *>(launch.kernelParams[5]),k/512);
+                    ASSERT_EQ(*static_cast<int *>(launch.kernelParams[5]),(k/32+serial_partitions-1)/serial_partitions);
                     ASSERT_EQ(launch.gridDim.x,3880u); ASSERT_EQ(packet.total_grid_n,3880);
-                    ASSERT_EQ(launch.gridDim.y,16u); ASSERT_EQ(launch.gridDim.z,1u);
+                    ASSERT_EQ(launch.gridDim.y,unsigned(serial_partitions)); ASSERT_EQ(launch.gridDim.z,1u);
                     ASSERT_EQ(launch.blockDim.x,128u);
-                    ASSERT_NE(name.find("VerifierWmmaPublicationE2E"),std::string_view::npos);
-                    const auto first = reinterpret_cast<uintptr_t>(packet.partial[0]);
-                    const auto end = first+size_t(16)*m*n*sizeof(float); ASSERT_GT(end,first);
-                    int admitted = 0;
-                    for (const char *bank : {GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL,GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED}) {
-                        const auto base = reinterpret_cast<uintptr_t>(owner.workspace->getBuffer(bank));
-                        const auto bytes = owner.workspace->getBufferSize(bank);
-                        admitted += base && first >= base && end <= base+bytes;
+                    const bool partial=name.find("VerifierWmmaPublicationE2E")!=std::string_view::npos;
+                    ASSERT_EQ(partial,serial_partitions>1);
+                    if (partial) {
+                        const auto first = reinterpret_cast<uintptr_t>(packet.partial[0]);
+                        const auto end = first+size_t(serial_partitions)*m*n*sizeof(float); ASSERT_GT(end,first);
+                        int admitted = 0;
+                        for (const char *bank : {GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL,GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL_BATCHED}) {
+                            const auto base = reinterpret_cast<uintptr_t>(owner.workspace->getBuffer(bank));
+                            const auto bytes = owner.workspace->getBufferSize(bank);
+                            admitted += base && first >= base && end <= base+bytes;
+                        }
+                        ASSERT_EQ(admitted,1); produced.emplace_back(first,serial_partitions);
                     }
-                    ASSERT_EQ(admitted,1); produced.emplace_back(first,16);
                 }
                 ASSERT_EQ(families[path][0].size(),size_t(repeats));
                 ASSERT_EQ(families[path][1].size(),size_t(repeats));
@@ -488,11 +515,12 @@ void prove(const Geometry &geometry, Observation observation, int profile_m=0)
                 for (const auto &node : inventory) {
                     ASSERT_TRUE(node.valid()); ASSERT_EQ(node.local_memory_bytes_per_thread,0u);
                     if (printed.insert(node.name).second)
-                        std::printf("ROCM_SELECTED_HEAD_RESOURCE,%s,%d,%s,%u,%zu,%s\n",geometry.name,m,names[path],node.registers_per_thread,node.static_shared_memory_bytes,node.name.c_str());
+                        std::printf("ROCM_SELECTED_HEAD_RESOURCE,%s,%d,%s,%u,%zu,%s\n",geometry.name.c_str(),m,names[path],node.registers_per_thread,node.static_shared_memory_bytes,node.name.c_str());
                 }
-                std::printf("ROCM_SELECTED_HEAD_CAPTURE,%s,%d,%s,%zu,%zu,%zu,16,%d\n",geometry.name,m,names[path],
-                    families[path][0].size(),families[path][1].size(),families[path][2].size(),k/512);
-                std::printf("ROCM_SELECTED_HEAD_ENGINE,%s,%d,%s,%d\n",geometry.name,m,names[path],native_producers);
+                std::printf("ROCM_SELECTED_HEAD_CAPTURE,%s,%d,%s,%zu,%zu,%zu,%d,%d\n",geometry.name.c_str(),m,names[path],
+                    families[path][0].size(),families[path][1].size(),families[path][2].size(),serial_partitions,
+                    (k/32+serial_partitions-1)/serial_partitions);
+                std::printf("ROCM_SELECTED_HEAD_ENGINE,%s,%d,%s,%d\n",geometry.name.c_str(),m,names[path],native_producers);
             }
             int revision = 0;
             const auto publish = [&] {
@@ -546,7 +574,7 @@ void prove(const Geometry &geometry, Observation observation, int profile_m=0)
                     window.finish();ASSERT_TRUE(launched && joined);
                 }
                 observe(1);ASSERT_TRUE(selectedMatches());ASSERT_TRUE(matches());
-                std::printf("ROCM_SELECTED_HEAD_PROFILE_OBSERVED,%s,%d,automatic\n",geometry.name,m);
+                std::printf("ROCM_SELECTED_HEAD_PROFILE_OBSERVED,%s,%d,automatic\n",geometry.name.c_str(),m);
                 continue;
             }
             // Changed inputs, permutation, duplicate rows, both clamp boundaries,
@@ -591,7 +619,7 @@ void prove(const Geometry &geometry, Observation observation, int profile_m=0)
                         elapsed[path] = timing.samples[0].elapsed_ms*1000./repeats;
                         ASSERT_TRUE(std::isfinite(elapsed[path]) && elapsed[path]>0);
                     }
-                    std::printf("ROCM_SELECTED_HEAD_PAIR,%s,%d,%d,%d,%d,%.9f,%.9f,%.9f\n",geometry.name,n,k,m,sample,elapsed[0],elapsed[1],elapsed[2]);
+                    std::printf("ROCM_SELECTED_HEAD_PAIR,%s,%d,%d,%d,%d,%.9f,%.9f,%.9f\n",geometry.name.c_str(),n,k,m,sample,elapsed[0],elapsed[1],elapsed[2]);
                 }
             }
         }
@@ -606,4 +634,17 @@ TEST_P(ROCmSelectedLMHeadTransaction, DISABLED_Paired) { prove(GetParam(),Observ
 TEST_P(ROCmSelectedLMHeadTransaction, DISABLED_ProfileM4) { prove(GetParam(),Observation::Profile,4); }
 TEST_P(ROCmSelectedLMHeadTransaction, DISABLED_ProfileM16) { prove(GetParam(),Observation::Profile,16); }
 INSTANTIATE_TEST_SUITE_P(OriginalGeometry,ROCmSelectedLMHeadTransaction,::testing::ValuesIn(geometries),
+    [](const ::testing::TestParamInfo<Geometry> &info) { return info.param.name; });
+
+/** @brief Every additional canonical source at both original widths; Q6_K keeps its qualified original names. */
+std::vector<Geometry> additionalHeadSources()
+{
+    std::vector<Geometry> result;
+    for (const auto &format:quantizedVerifierFormats())
+        if (format.tensor_type!=TensorType::Q6_K)
+            for (const auto &geometry:geometries)
+                result.push_back({geometry.name+"_"+format.label,geometry.hidden,format.tensor_type});
+    return result;
+}
+INSTANTIATE_TEST_SUITE_P(AllSourceGeometry,ROCmSelectedLMHeadTransaction,::testing::ValuesIn(additionalHeadSources()),
     [](const ::testing::TestParamInfo<Geometry> &info) { return info.param.name; });

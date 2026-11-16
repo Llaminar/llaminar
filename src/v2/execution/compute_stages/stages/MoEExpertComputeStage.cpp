@@ -7984,14 +7984,9 @@ namespace llaminar2
                 params_.routing_indices, params_.routing_weights,
                 seq_len, num_experts, top_k);
         }
-        else
-        {
-            groups_prepared = kernel->prepareExpertGroupsAsync(
-                params_.routing_indices, params_.routing_weights,
-                seq_len, num_experts, top_k);
-        }
-
-        if (!groups_prepared)
+        // Static all-route grouping is submitted with its complete projection
+        // below, so a backend can choose the directory from the original call.
+        if ((runtime_grouping || masked_grouping) && !groups_prepared)
         {
             const char *grouping_name = runtime_grouping
                                             ? "groupPrefillRoutes"
@@ -8015,7 +8010,7 @@ namespace llaminar2
                  {"top_k", std::to_string(top_k)}});
         }
 
-        // Execute the full grouped pipeline (5 kernel launches, zero sync)
+        // Submit the complete pipeline on the original stream without a host wait.
         bool pipeline_ok = false;
         if (runtime_grouping)
         {
@@ -8036,7 +8031,7 @@ namespace llaminar2
                 top_k,
                 params_.canonical_route_contributions);
         }
-        else
+        else if (masked_grouping)
         {
             pipeline_ok = kernel->executeGroupedPrefillPipeline(
                 params_.input, params_.output,
@@ -8045,6 +8040,13 @@ namespace llaminar2
                 seq_len, d_model, intermediate,
                 num_experts, top_k,
                 params_.canonical_route_contributions);
+        }
+        else
+        {
+            pipeline_ok = kernel->executeStaticRoutedPrefillTransaction(
+                compute_launch, params_.routing_indices, params_.routing_weights,
+                params_.input, params_.output, grouped_gateup_desc_table_id_, grouped_down_desc_table_id_,
+                seq_len, d_model, intermediate, num_experts, top_k, params_.canonical_route_contributions);
         }
 
         if (!pipeline_ok)

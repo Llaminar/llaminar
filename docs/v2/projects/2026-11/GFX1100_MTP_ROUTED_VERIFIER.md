@@ -1,14 +1,13 @@
 # gfx1100 routed MTP transaction
 
-The current grouping-owned offset-slot candidate passes serial-byte replay in
-Release and Integration for15 capacity/distribution cases and180 live-prefix
-keys. Ordinary AUTO-power timing shows concentrated and mixed-work gains, but
-uniform full16 remains about7% slower than Dot4. Capture-time route-policy
-lowering passes the nine affected Integration registrations/75 GTests. A bounded
-split cold-Dot4/hot-WMMA experiment also passes byte replay, but still loses
-full16 Uniform and sparse controls; it is archived and removed. Routed Automatic
-is unchanged. This is a component transaction, not model-level
-MTP throughput. Earlier experiments below retain their original scope.
+The Column directory producer removes idle column blocks from the fused
+Dot4/WMMA transaction while preserving serial bytes. Production Automatic binds
+the complete original static M16/H2048/I512/E256/top8 IQ2_S gate/up → IQ4_XS down
+transaction before grouping. Both actual-Automatic timing panels and the final
+focused replay suite pass. All48 source-bound counter passes are complete,
+with zero scratch or register spills. This closes the bounded routed component.
+Earlier offset and split experiments below retain their historical scope. This
+is component evidence, not model-level MTP throughput.
 
 The early routed timing drivers used `STABLE_STD`, the fixed profiling power mode.
 Those paired timings below are diagnostic candidate comparisons, not canonical
@@ -298,7 +297,7 @@ correction remains because the existing fixed-TM4 planner needs the larger bound
 These old STABLE_STD panels remain diagnostic evidence, not ordinary-power
 qualification or an installed policy.
 
-## Grouping-owned offset-slot candidate (in development)
+## Grouping-owned offset-slot candidate (historical)
 
 The explicit WideFloor8 candidate can publish its packed directory in the existing
 active-expert-list launch, after count/scan and before scatter. It retains the
@@ -406,7 +405,7 @@ The focused Integration run is preserved separately:
 `routed-slot-policy-integration-feature-snapshot-1794808346598358370/snapshot.json`,
 SHA256 `da6cbfd8f9f868e40562b7a6842679d975ca6d919eb182690d047be2ff41f20b`.
 
-## Evidence and outstanding work
+## Initial forced evidence and scope
 
 Evidence root: `/tmp/llaminar-gfx1100-wmma-prefill-evidence`.
 
@@ -416,12 +415,11 @@ Evidence root: `/tmp/llaminar-gfx1100-wmma-prefill-evidence`.
 - Analysis: `routed-verifier-forced-summary.json`.
 - Builds: `routed-verifier-transaction-release-build-r3.log` and `routed-verifier-transaction-integration-build.log`.
 
-Selected-kernel profiles, partial-ownership/interior-hole controls, broader source
-coverage, and actual Automatic admission/replay/timing remain open. Current
-coverage proves original local complete-expert work and device-counted suffixes;
-it does not qualify arbitrary holes or collective ownership. The shared-expert
-Automatic source/role profiler sweep runs independently against its unchanged
-producer. No full production-preflight or model E2E claim is made.
+This initial panel proves original local complete-expert work and device-counted
+suffixes. It does not qualify arbitrary interior holes, collective ownership or
+other routed source pairs. Later sections own subsequent admission and profile
+evidence. Shared-expert qualification is complete in its separate proof. No full
+production-preflight or model E2E claim is made.
 
 The initial forced panel is frozen in
 `mtp-routed-verifier-forced-seed-snapshot/snapshot.json`: three evidence records,
@@ -502,3 +500,140 @@ registrations/75 GTests in
 `routed-split-restored-feature-suite-1794815350727294757/receipt.json`.
 This rechecks the retained ordinary/shared/routed MoE, router-Q8 all-codebook,
 original-source, live-row and projection-phase paths on the restored core.
+
+## Column directory and original transaction admission
+
+The accepted candidate keeps one fused projection launch per role. Its
+`ColumnFloor8OffsetSlots` publication packs the active cold rows and hot column
+quadrants into the existing grouping-owned expert intervals. Counts1–7 publish
+four-row cold chunks; counts at least8 publish four column quadrants per
+sixteen-row tile. A slot is the expert offset plus its directory ordinal, not a
+row address. This removes the fourfold idle fine-column grid while preserving
+the existing ordered cold arithmetic and native hot arithmetic. The private
+branch geometry remains GU4/down12 for cold work and native16 for hot work.
+
+`executeStaticRoutedPrefillTransaction` binds immutable original tensors,
+descriptor-table identities, geometry, exact stream, workspace and kernel owner
+before the grouping producer runs. The lexical scope owns no live GPU value and
+stores no backend decision. Both grouping and projection authenticate the same
+original call. ROCm checks all256 original descriptor triplets, including
+payload/scales/minima, source and physical format, and matrix geometry. The
+existing generation-checked grouping directory remains the sole publication
+authority. Direct native submission must borrow that live publication.
+
+Automatic admits only actual gfx1100, full-width static original-token M16,
+H2048/I512/E256/top8, source13/superblock IQ2_S GU and source4/superblock IQ4_XS
+down (physical13/24), with the real router Q8 publication. Explicit engine
+choices remain authoritative. M8/M9, runtime, masked, shared, sliced and
+alternate-source operations retain their existing policies. Device-owned live
+slots retain RouteOwned through64; later work selects ordered or native
+arithmetic using the actual per-expert population. No host count readback,
+extra allocation or capture topology change is introduced during replay.
+
+The final fixture retains five independent M16 owners: Dot4, ordinary Wide,
+offset Wide, forced Column and actual Automatic. M8/M9 have independent Dot4
+Automatic expectations. Literal capture expectations are separate from the
+production selector. Production router/stage execution is compared with
+independent M1 runtime rows across five distributions, every live prefix,
+poison/reset/regrowth and repeated replay. Producer and cold/hot branch omissions
+prove writer ownership. The profiling owner disables event instrumentation,
+drains fixture poisoning on the exact stream before the selected ROCTx region,
+and verifies bytes and submission counters before and after replay.
+
+The ordinary Wide capture matchers were updated in all three affected fixtures
+to authenticate Adaptive and the appended ColumnDirectory flag independently.
+The previous suffix-only checks read the new directory flag as arithmetic and
+rejected valid adaptive captures. Existing explicit preflight registrations
+cover these replay regressions.
+
+### Actual Automatic timing and feature confirmation
+
+Both final Release panels use ordinary AUTO power, five independent retained
+owners,31 alternating-order observations per cell and eight complete operations
+per interval. Uniform and Concentrated8 each cover every live prefix0–16 at
+physical M16. All samples pass independent serial bytes. Every one of34 cells
+wins its median in both panels. Geometric gains are1.084850× and1.085104×;
+minimum gains are1.010049× and1.010470×.
+
+| Panel / full M16 distribution | Dot4 µs | Actual Auto µs | Speedup | Pair wins |
+|---|---:|---:|---:|---:|
+| initial / Uniform |333.711743|330.391735|1.010049×|31/31|
+| initial / Concentrated8 |239.166498|201.961249|1.184220×|31/31|
+| confirmation / Uniform |334.892750|331.422746|1.010470×|31/31|
+| confirmation / Concentrated8 |241.542131|202.946752|1.190175×|31/31|
+
+The first collector's strict31/31 condition stopped at two RouteOwned controls:
+Uniform live4 and Concentrated8 live7 each won30/31. All34 medians won, and all
+other32 cells won31/31. That strict-stop summary remains unchanged. A revised
+criterion—every median wins and at least27/31 pairs per cell in each of two
+complete panels—was frozen before collecting one full confirmation. No source,
+policy or workload changed, and no retry-until-pass loop was used. Confirmation
+wins1053/1054 pairs; the first panel wins1052/1054. All68 cell observations
+therefore win at least30/31, with65 winning31/31. The qualification claims
+repeatable complete-operation gains, not a universal per-sample improvement.
+
+Final focused validation passes10 host registrations and18 native Integration
+registrations/169 GTests. These include the three repaired capture matchers,
+all-codebook micro/wide/pure captures, promotion/tails, Qwen/Compact population,
+shared/routed transactions, directory publication, live/source rows, projection
+phases and representative Q6_K/IQ1_M selected heads. Full Release/Integration
+builds compile gfx906/gfx1100 and configured CUDA86 with spill guards intact.
+
+Evidence under `/tmp/llaminar-gfx1100-wmma-prefill-evidence`:
+
+- Initial actual-Auto panel and preserved strict stop:
+  `routed-column-automatic-qualification-1794826362693530504`.
+- Confirmation, fixed rule and combined timing summary:
+  `routed-column-automatic-confirmed-qualification-1794827103876938791`.
+- Feature receipt: `routed-column-automatic-feature-suite-1794826485310499052/receipt.json`.
+
+The five-arm comparison also retains the candidate tradeoff. Full Concentrated8
+confirmation takes200.992µs with ordinary Wide and202.947µs with Column Automatic;
+Column improves Uniform from369.758µs with ordinary Wide to331.423µs. The admitted
+producer improves both route extremes against the original Dot4 transaction,
+without claiming to beat every forced candidate at every distribution.
+
+### Exact producer profiles and frozen evidence
+
+All48 isolated counter passes complete: Uniform and Concentrated8, each with
+gate/up, down and grouping publication, eight metrics per exact kernel. Each
+profile joins the unchanged initial full-M16 unprofiled timing receipt to its
+actual retained graph/stream, loaded ELF offset, exact mangled symbol, descriptor
+allocation and selected-function ISA. The initial full-M16 timing cells each
+win31/31, so the stricter profile-owner check also passes. Profiling uses
+STABLE_STD and restores AUTO after each pass; profile durations are not timing
+qualification samples. The profile owner validates serial bytes before and after
+collection and retains unchanged submission counters.
+
+| Role | Block threads | Grid | Logical / allocated VGPR | SGPR | Logical LDS bytes |
+|---|---:|---|---:|---:|---:|
+| Gate/up |256|2×128×2|57 /60|59|5968|
+| Down |128|16×128×1|63 /64|76|3664|
+| Directory publisher |256|1×1×1|14 /16|59|72|
+
+Every producer uses wave64 and has zero private storage, SGPR/VGPR spills and
+scratch load/store instructions. Allocated LDS is6144/4096/512 bytes respectively.
+
+| Distribution / role | Occupancy % | Memory-unit busy % | L2 hit % | LDS bank conflict % | Wavefronts |
+|---|---:|---:|---:|---:|---:|
+| Concentrated8 / directory |0.020|0.000|54.545|0.000|4|
+| Concentrated8 / down |17.312|40.110|31.935|0.000|4096|
+| Concentrated8 / gateup |12.356|52.092|17.460|0.000|2048|
+| Uniform / directory |0.025|0.000|30.769|0.000|4|
+| Uniform / down |45.902|78.401|2.425|0.000|4096|
+| Uniform / gateup |52.164|82.146|1.217|0.000|2048|
+
+The complete metric matrix, including GPUBusy, FETCH_SIZE (KiB) and VALUInsts (SQ_INSTS_VALU/SQ_WAVES),
+is retained in `profiles.csv` beside `final-audit.json`. The counter observations
+describe these exact captured producers; they are not model-level throughput.
+
+Frozen final evidence: `routed-column-automatic-qualified-snapshot-1794828224379445482/snapshot.json`, SHA256
+`b9aca1f46e640d55611443679118a0668548c9e3b8b28bab4f3fa0bee9b92292`. It preserves both timing panels, the original strict-stop
+record, confirmation rule, focused gates, all48 profiles, exact source/binary
+versions and build logs.
+
+This completes the requested local routed component. Runtime/masked/shared and
+alternate-source/geometry domains remain outside this Column admission; their
+existing first-class policies remain in place. Arbitrary interior holes,
+collective ownership, model/controller throughput and full production preflight
+are not certified by these component tests.

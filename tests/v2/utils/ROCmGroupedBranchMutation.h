@@ -27,10 +27,11 @@ namespace llaminar2::test
 {
 /** @brief Authenticate immutable row plans in the actual retained wide projection nodes.
  * @param capture Instantiated source or imported parent graph. @param stream Exact capture stream.
- * @param floor Expected whole-expert cutoff. @return Gate/up and down node counts, in that order.
+ * @param floor Expected whole-expert cutoff. @param layout Expected original directory encoding.
+ * @return Gate/up and down node counts, in that order.
  * @throws std::runtime_error For malformed captures or symbol/packet/geometry disagreement. */
 inline std::array<size_t,2> inspectROCmGroupedWideCapture(HIPGraphCapture &capture, hipStream_t stream,
-    rocm::MoEGroupedWmmaRowFloor floor)
+    rocm::MoEGroupedWmmaRowFloor floor, MoEGroupingPackedLayout layout=MoEGroupingPackedLayout::WideFloor8)
 {
     const auto require = [](hipError_t status) {
         if (status != hipSuccess) throw std::runtime_error("Wide capture inspection failed");
@@ -66,12 +67,18 @@ inline std::array<size_t,2> inspectROCmGroupedWideCapture(HIPGraphCapture &captu
         const auto role = gate_up ? rocm::MoEPrefillProjectionRole::GateUp : rocm::MoEPrefillProjectionRole::Down;
         const unsigned threads = gate_up ? 256u : 128u;
         const unsigned native_columns = threads / 4;
-        if (args.dot_admission.rowPlan() != rocm::MoEGroupedRowPlan::wide(role,floor) ||
+        const bool columns=layout==MoEGroupingPackedLayout::ColumnFloor8;
+        const auto plan=columns ? rocm::MoEGroupedRowPlan::column(role) : rocm::MoEGroupedRowPlan::wide(role,floor);
+        const unsigned launch_columns=columns ? threads : native_columns;
+        const std::string expected_suffix=std::string(gate_up ? "ELb1" : "ELb0")+
+            (args.dot_admission.mayUseOrdered() ? "ELb1" : "ELb0")+(columns ? "ELb1EE" : "ELb0EE");
+        if (symbol.find(expected_suffix)==std::string_view::npos ||
+            args.dot_admission.rowPlan() != plan || args.directory_layout!=layout ||
             !args.dot_admission.binds(role,args.n,args.k) ||
             (args.second_descriptors != nullptr) != gate_up || (args.second_output != nullptr) != gate_up ||
             args.branch_suppression != rocm::MoEGroupedBranchSuppression::None ||
             params.blockDim.x != threads || params.blockDim.y != 1 || params.blockDim.z != 1 ||
-            params.gridDim.x != (args.n+native_columns-1)/native_columns ||
+            params.gridDim.x != (args.n+launch_columns-1)/launch_columns ||
             params.gridDim.y != static_cast<unsigned>(args.directory_capacity))
             throw std::runtime_error("Wide capture row plan or launch geometry changed");
         ++roles[gate_up ? 0 : 1];
@@ -135,8 +142,12 @@ public:
             const std::string_view symbol(name);
             if (symbol.find("grouped_wmma_detail") == std::string_view::npos || params.gridDim.z != (gate_up ? 2u : 1u))
                 continue;
-            // The last two template booleans identify the role and Adaptive=true.
-            if (symbol.find(gate_up ? "ELb1ELb1EE" : "ELb0ELb1EE") == std::string_view::npos ||
+            const bool wide = symbol.find("wideProjection") != std::string_view::npos;
+            // Ordinary leaves encode role/adaptive; wide leaves additionally
+            // encode column ownership. Authenticate that last bit against the packet.
+            const std::string role_suffix=gate_up ? "ELb1ELb1" : "ELb0ELb1";
+            if ((!wide && symbol.find(role_suffix+"EE")==std::string_view::npos) ||
+                (wide && symbol.find(role_suffix+"ELb")==std::string_view::npos) ||
                 !params.kernelParams || !params.kernelParams[0] || params.extra)
                 throw std::runtime_error("Branch mutation requires an actual adaptive projection node");
             using Arguments = rocm::MoEGroupedWmmaArguments;
@@ -144,7 +155,8 @@ public:
             std::array<std::byte,sizeof(Arguments)> bytes;
             std::memcpy(bytes.data(),params.kernelParams[0],bytes.size());
             const auto original = std::bit_cast<Arguments>(bytes);
-            const bool wide = symbol.find("wideProjection") != std::string_view::npos;
+            if (wide && symbol.find(role_suffix+(original.dot_admission.rowPlan().isColumn() ? "ELb1EE" : "ELb0EE"))==std::string_view::npos)
+                throw std::runtime_error("Grouped column template and row plan disagree");
             if ((!wide && symbol.find("10projection") == std::string_view::npos) ||
                 original.dot_admission.rowPlan().isWide() != wide ||
                 original.dot_admission.rowPlan().role() != role ||

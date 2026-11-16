@@ -1,6 +1,7 @@
 # gfx1100 WMMA for grouped MTP decode
 
-Status: native M16/N64 verifier kernels and exact-hosted Automatic selection
+Status: the requested prefill and grouped-MTP component work is complete.
+Native M16/N64 verifier kernels and exact-hosted Automatic selection
 now cover all21 source formats at the three measured projection/SwiGLU shapes.
 The actual Automatic sweep passes1,890 cells: all1,264 native-selected cells win
 1.00198–2.00465×, geometric mean1.28647×;626 keys retain Dot4. Current Release
@@ -19,9 +20,16 @@ All29 affected feature GTests and eight exact producer profiles pass, including
 explicit finite/special TPB192 multi-tile replay. The bounded grouped-attention
 experiment is closed with Dot2: native loses all2,790 paired samples. Full-curve
 fixed-query fits through64K have R²≥0.999892 for Dot2 and≥0.999771 for WMMA.
-QKV, GDN, connected dense FFN, Wo and the measured Q6_K selected-head Automatic qualify complete operations; routed MTP and broader head coverage remain open. See the
-[attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Direct floating WMMA substitutions fail their byte contracts. These component results do
-not claim model-level MTP speedups or full production certification.
+QKV, GDN, connected dense FFN, Wo and selected-head Automatic qualify complete
+operations. Selected-head coverage includes all21 original source formats and
+both full-vocabulary K geometries; routed Automatic also qualifies its exact
+M16 original-source transaction.
+Both34-cell panels retain every median win (confirmation geo1.085104×);10 host
+and18 native registrations/169 GTests plus all48 profiles pass. See the
+[routed proof](GFX1100_MTP_ROUTED_VERIFIER.md) and
+[attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Direct floating WMMA
+substitutions fail their byte contracts. These component results do not claim
+model-level MTP speedups or full production certification.
 Shared-verifier Automatic now admits all21 same-source M16 tuples and mixed
 IQ2_S/IQ4_XS M9/M16. All28 replay cases pass453 source/capacity/live keys.
 All177 native-active Automatic cells win all31 pairs by1.23091–1.88403×;
@@ -32,10 +40,10 @@ the frozen producer retains zero private storage and memory spills.
 See the [shared transaction proof](GFX1100_MTP_SHARED_VERIFIER.md).
 This implementation plan extends the [prefill campaign](GFX1100_PREFILL_WMMA.md)
 and the [MTP project plan](../2026-06/MTP_VLLM_STYLE_PROJECT_PLAN.md).
-It records the implementation frontier and remaining qualification, not a
-performance certificate for MTP.
+It records completed component qualifications and their boundaries. Historical
+design and experiment sections below are retained; linked proofs own final results.
 
-## Existing execution and missing coverage
+## Initial execution inventory and implementation plan
 
 Grouped execution already exists. The missing work is native matrix instruction
 producers and measured production selection for grouped decode, with its stricter
@@ -562,13 +570,14 @@ with N32 (1.13174–1.19583×; geometric mean1.15912×); all nine uniform native
 cells lose. N64 wins the concentrated physical9 boundary, while N32 wins all
 concentrated physical16 medians. Sparse retained-native cells also lose up to
 5.18%. This justifies a device work-distribution policy, not unconditional WMMA.
-Explicit replay/preflight registration, selected-kernel profiles, additional
-route-pattern/ownership controls and actual Automatic qualification remain open.
+This initial panel did not qualify Automatic. The final Column transaction
+passes explicit replay registrations, two actual-Automatic timing panels and48
+profiles. Other source and ownership domains remain outside its admission.
 See the [routed transaction proof](GFX1100_MTP_ROUTED_VERIFIER.md). WideFloor8
 offset-slot publication and capture-time live-slot policy lowering pass the
 15-case Release/Integration replay roster. Ordinary-power full-M16 timing is
 334.141/356.971 microseconds for Dot4/offset Uniform and186.071/144.971 for
-Concentrated8; Automatic remains unchanged. The subsequent bounded split
+Concentrated8; Automatic was unchanged at that checkpoint. The subsequent bounded split
 experiment passed all three replay cases/51 live-prefix keys, including mixed
 cold/hot writer omissions. Its independent cold GU4/down12 and pure hot native16
 leaves reduced register use, but full Uniform remained1.4% slower than Dot4 and
@@ -589,7 +598,7 @@ cell lost (geometric ratio0.917×). Its extra retained families also harmed spar
 controls. That experiment is archived and its maximum-publication machinery is
 removed. The subsequent SmallRows adaptive producer also failed economy and was
 retired. Its fixed-TM4 directory capacity correction remains because it fixes
-the shared workspace bound. Current offset-slot results and the later rejected
+the shared workspace bound. Those offset-slot results and the later rejected
 independent-leaf experiment are recorded above. Detailed constraints and
 evidence belong to the linked transaction proof.
 
@@ -638,7 +647,7 @@ drain that outlives the graph owners. Add a dedicated shared replay preflight
 registration. A synthetic one-expert route alone does not qualify these handoff
 and final-gate semantics. No MoE selection change is installed by this audit.
 
-## Remaining bundle inventory
+## Bundle qualification inventory
 
 The actual QKV panel now lives in `Test__ROCmQKVVerifierTransaction.cpp`.
 `makeGpuPreparedQKVFixture` retains three independently seeded weights in one
@@ -673,22 +682,22 @@ or admit QueryInterval for MTP. The stage has no request-hole declaration;
 lower-level hole coverage is not actual-stage evidence. Forced candidate evidence remains separate from the final actual-Automatic
 panel. Unmeasured complete bundles retain the ordered implementation.
 
-The remaining dense work is complete bundle qualification, not another
-all-format leaf implementation. Derive geometry/provenance from
+The completed dense component qualifications bind complete bundles rather than
+independent leaves. Additional domains must derive geometry/provenance from
 `qwen_release_geometry.py::model_projection_geometries` and `QwenProjectionUse`,
 and operation identity from the actual typed stage descriptors. Each record
 needs ordered prepared sources/codebooks, original and physical N/K, projection
 count, TP slices, row authority, epilogue and complete timed boundary. Shape
 deduplication alone cannot distinguish QKV, GDN and selected LM-head work.
 
-| Bundle | Existing owner to extend | Missing evidence |
+| Bundle | Production owner | Qualification and boundaries |
 |---|---|---|
 | Attention QKV or K/V-only | Actual unequal-width `FusedQKVGEMMStage` with independent prepared owners | Actual-Automatic confirmation, focused gates and64 geometry profiles pass; QueryInterval slicing excludes retained MTP |
 | Attention output | Actual `GEMMStage` Wo owner with independent prepared controls | Automatic746 keys across all21 sources win both1890-cell panels (confirmation geo1.237135×);129 gates/137 cases and16 profiles pass. TP-sized cases qualify local extents, not source-slice loading. [Proof](GFX1100_MTP_WO_VERIFIER.md) |
 | Gate/up through SwiGLU/down | Actual connected `FusedGateUpGEMMStage` → fused-SwiGLU `GEMMStage` with five independent owners | Automatic admits136 incremental GU keys across all21 formats; both315-cell panels retain every selected median win (confirmation geo1.112072×); six host/26 GPU gates and16 profiles pass |
 | GDN projections | Actual four-source `GDNProjectionStage` with independent prepared owners | Automatic161 keys win in both630-cell panels;16 profiles, six host gates/32 cases, eight GPU gates/128 cases and CUDA/ROCm capture/12 cases pass |
 | Shared expert FFN | Actual shared-stage owner above | Qualified through gate/add and verifier-router Q8 handoff;368 profiles complete; residual sparse overhead remains visible |
-| Selected LM-head | Actual `HiddenStateRowsSelectStage` through `LMHeadStage`, independent prepared controls/M1 oracle | Full-vocabulary seeded Q6_K Automatic qualifies: Dot4 M2–4, WMMA M5–16 for dense/MoE. All24 selected keys win both30-cell panels (confirmation geo1.997859×); seven focused gates/16 profiles pass. [Proof](GFX1100_MTP_SELECTED_HEAD.md) |
+| Selected LM-head | Actual `HiddenStateRowsSelectStage` through `LMHeadStage`, independent prepared controls/M1 oracle | All21 original formats qualify at full vocabulary:490 Automatic keys win31/31 pairs (geo1.812366×),140 controls retain Dot4;42 native cases/630 widths and16 current profiles pass, with an unchanged-code join to the16 earlier Q6 profiles. [Proof](GFX1100_MTP_SELECTED_HEAD.md) |
 
 Use the existing registered Qwen dense/GDN and MoE/shared profiles, including
 their full and TP-sharded declarations. Retain all21 source formats from the
@@ -725,7 +734,7 @@ scalar SwiGLU selection remains unchanged. Actual-Automatic qualification now
 compares the complete chain against prior Dot4 GU plus Automatic down: all136
 selected keys win both315-cell panels. Six host gates/39 cases,26 affected GPU
 gates/86 cases and16 exact GU/down profiles pass. See the linked proof for
-immutable seed provenance and final qualification; selected-head Q6_K qualification is documented separately.
+immutable seed provenance and final qualification; selected-head qualification across all21 source formats is documented separately.
 
 ## Verifier router economy and attention arithmetic
 
@@ -960,7 +969,14 @@ standalone diagnostic, not production-path or performance qualification.
    host scheduling state. Authenticate installed Automatic with fresh timing
    and replay evidence instead of relabeling forced-candidate observations.
 
-Current result: native verifier replay, narrow exact-hosted Automatic selection
-and profiling pass the focused component gates and are frozen for the feature
-checkpoint. Broader operation/geometry and model qualification follow. This
-does not close the full prefill/MTP goal or claim all-codebook MTP economy.
+Current result: the requested prefill and grouped-MTP component work is complete.
+Captured byte replay, work-size dispatch, repeated complete-operation timing and
+exact producer profiles qualify the installed domains. Selected heads cover all21
+formats; routed Column admission is the exact mixed-source M16 transaction above.
+Fixed-query attention scales linearly through64K. Uneconomical grouped-attention
+and floating substitutions retain the existing producers, including rocBLAS.
+
+No required component task remains. Additional routed sources/ownership modes,
+unmeasured geometries and residual sparse MoE costs are follow-up tuning domains.
+Model/controller E2E and full-preflight certification remain separate; this
+completion does not claim model-level MTP throughput or universal speedups.

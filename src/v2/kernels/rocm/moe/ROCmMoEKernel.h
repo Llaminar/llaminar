@@ -43,6 +43,8 @@ namespace llaminar2
     namespace rocm
     {
         class HipBLASGemmKernel;
+        struct MoEGroupedPopulationKey;
+        enum class MoEGroupedDirectorySource;
     }
 
     /**
@@ -1701,8 +1703,13 @@ namespace llaminar2
             const MoEGroupingPackedDirectory *packed);
         /** @brief Authenticate the currently bound named work bank without reading device counts.
          * @param rows Original physical token rows. @param top_k Original route multiplicity.
-         * @param experts Original expert extent. @return Immutable current workspace binding. */
-        MoEGroupingPackedDirectory groupingDirectoryBinding(int rows, int top_k, int experts) const;
+         * @param experts Original expert extent. @param source Resolved producer layout.
+         * @return Immutable current workspace binding. */
+        MoEGroupingPackedDirectory groupingDirectoryBinding(int rows, int top_k, int experts,
+            rocm::MoEGroupedDirectorySource source) const;
+        /** @return Pure original-operation key after authenticating scope, static descriptors and Q8 publication.
+         * @throws std::logic_error If an enclosing operation names another owner, stream or workspace. */
+        rocm::MoEGroupedPopulationKey originalRoutedPopulationKey() const;
         /**
          * @brief Bind and validate the persistent adaptive prefill directory.
          * @param total_slots Number of routed rows that bound directory work.

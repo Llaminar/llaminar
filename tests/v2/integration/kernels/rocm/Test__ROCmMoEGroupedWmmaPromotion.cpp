@@ -163,8 +163,12 @@ void runGroupedWmmaPromotion(GroupedPromotionMode mode)
                         const unsigned n = node.grid_z == 2 ? intermediate : hidden_width;
                         ASSERT_EQ(node.grid_x,(n+native_columns-1)/native_columns);
                     }
-                    ASSERT_NE(node.name.find(policies[path].minimum_expert_rows == Floor::EveryExpert
-                        ? "ELb0EE" : "ELb1EE"),std::string::npos) << node.name;
+                    // Ordinary Wide appends ColumnDirectory=false after Adaptive;
+                    // checking both prevents the directory bit from posing as arithmetic.
+                    const std::string arithmetic_suffix = std::string(
+                        policies[path].minimum_expert_rows == Floor::EveryExpert ? "ELb0" : "ELb1") +
+                        (wide ? "ELb0EE" : "EE");
+                    ASSERT_NE(node.name.find(arithmetic_suffix),std::string::npos) << node.name;
                     ASSERT_EQ(node.local_memory_bytes_per_thread,0u);
                     if (node.grid_z == 2) ++gate_up_count;
                     else if (node.grid_z == 1) ++down_count;

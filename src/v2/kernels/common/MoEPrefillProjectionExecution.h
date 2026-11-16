@@ -115,16 +115,19 @@ namespace llaminar2
              * @param words Packed work bank. @param rows Physical token capacity.
              * @param top_k Original route multiplicity. @param experts Expert domain.
              * @param device Exact owning device. @param stream Exact ordered stream.
+             * @param layout Exact work encoding expected by this consumer.
              * @return Original published binding; no authority is transferred.
              * @throws std::logic_error For a revoked, missing or incompatible publication. */
             [[nodiscard]] const MoEGroupingPackedDirectory &requireProjection(
                 const int *counts, const int *offsets, const uint32_t *words,
-                int rows, int top_k, int experts, DeviceId device, void *stream) const
+                int rows, int top_k, int experts, DeviceId device, void *stream,
+                MoEGroupingPackedLayout layout = MoEGroupingPackedLayout::WideFloor8) const
             {
                 validate();
                 if (!directory_ || directory_->counts() != counts || directory_->offsets() != offsets ||
                     directory_->words() != words || directory_->rows() != rows || directory_->topK() != top_k ||
-                    directory_->experts() != experts || directory_->device() != device || directory_->stream() != stream)
+                    directory_->experts() != experts || directory_->device() != device || directory_->stream() != stream ||
+                    directory_->layout() != layout)
                     throw std::logic_error("grouped packed directory does not bind the submitted projection packet");
                 return *directory_;
             }

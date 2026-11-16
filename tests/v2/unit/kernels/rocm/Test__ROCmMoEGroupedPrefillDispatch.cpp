@@ -14,8 +14,78 @@
 
 #include <gtest/gtest.h>
 #include <type_traits>
+#include <array>
 #include "kernels/rocm/gemm/ROCmMoEGroupedPopulationPublication.h"
 #include "kernels/common/MoEPrefillProjectionExecution.h"
+
+/** @test Every original descriptor and complete-operation dimension owns routed Automatic admission. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, ColumnDirectoryAutomaticOriginalSourcesReplay)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::rocm;
+    uint8_t payload = 0;
+    std::array<DeviceNativeQuantisedMatrixDesc, 256> gate, up, down;
+    for (int e = 0; e < 256; ++e)
+    {
+        gate[e] = {.payload=&payload, .scales=&payload, .mins=&payload, .n=512, .k=2048, .blocks_per_row=64,
+            .codebook_id=13, .source_codebook_id=13, .source_is_superblock=1, .source_identity_present=1};
+        up[e] = gate[e]; down[e] = gate[e];
+        down[e].n=2048; down[e].k=512; down[e].blocks_per_row=16;
+        down[e].codebook_id=24; down[e].source_codebook_id=4;
+    }
+    MoEGroupedPopulationKey key{
+        .operation=MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
+        .input=MoEGroupedPopulationInput::OriginalTokens,
+        .preparation=MoEGroupedPopulationPreparation::PublishedQ8,
+        .rows=16, .hidden=2048, .intermediate=512, .experts=256, .top_k=8,
+        .gateup_physical=1u<<13, .down_physical=1u<<24, .gateup_source=1u<<13, .down_source=1u<<4,
+        .routed_sources=routedVerifierOriginalSources(gate,up,down)};
+    ASSERT_TRUE(routedVerifierColumnQualified(key));
+    for (auto *role : {&gate, &up, &down}) for (auto &descriptor : *role)
+        for (int mutation = 0; mutation < 10; ++mutation)
+        {
+            const auto saved = descriptor;
+            switch (mutation)
+            {
+            case 0: descriptor.source_identity_present=0; break;
+            case 1: descriptor.source_is_superblock=0; break;
+            case 2: ++descriptor.source_codebook_id; break;
+            case 3: descriptor.codebook_id=23; break;
+            case 4: --descriptor.n; break;
+            case 5: --descriptor.k; break;
+            case 6: --descriptor.blocks_per_row; break;
+            case 7: descriptor.payload=nullptr; break;
+            case 8: descriptor.scales=nullptr; break;
+            case 9: descriptor.mins=nullptr; break;
+            }
+            auto changed=key; changed.routed_sources=routedVerifierOriginalSources(gate,up,down);
+            EXPECT_FALSE(routedVerifierColumnQualified(changed)); descriptor=saved;
+        }
+    auto changed=key; changed.routed_sources=routedVerifierOriginalSources(std::span(gate).first(255),up,down);
+    EXPECT_FALSE(routedVerifierColumnQualified(changed));
+    for (int rows=1; rows<=65; ++rows)
+    { changed=key; changed.rows=rows; EXPECT_EQ(routedVerifierColumnQualified(changed),rows==16); }
+    for (int field=0; field<11; ++field)
+    {
+        changed=key;
+        switch(field)
+        {
+        case 0: changed.operation=MoEPrefillMeasuredOperation::Unmeasured; break;
+        case 1: changed.input=MoEGroupedPopulationInput::OriginalRouteSlots; break;
+        case 2: changed.preparation=MoEGroupedPopulationPreparation::Internal; break;
+        case 3: --changed.hidden; break;
+        case 4: --changed.intermediate; break;
+        case 5: --changed.experts; break;
+        case 6: --changed.top_k; break;
+        case 7: changed.gateup_physical|=1; break;
+        case 8: changed.down_physical=1u<<23; break;
+        case 9: changed.gateup_source|=1; break;
+        case 10: changed.down_source=1u<<24; break;
+        }
+        EXPECT_FALSE(routedVerifierColumnQualified(changed));
+    }
+    ASSERT_TRUE(routedVerifierColumnQualified(key));
+}
 
 /** @brief Output sharding keeps the full matrix's immutable arithmetic key. */
 TEST(Test__ROCmMoEGroupedPrefillDispatch, ProjectionTransactionsKeepCanonicalGeometry)
@@ -1033,4 +1103,61 @@ TEST(Test__ROCmMoEGroupedPopulation, SharedVerifierIndependentExclusionsReplay)
         changed = original; (changed.singleton_sources.*member).codebook_id = 255;
         EXPECT_FALSE(sharedVerifierWmmaQualified(changed));
     }
+}
+
+/** @test Column ownership retains original source identity and independent GU4/down12 row plans. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, ColumnDirectoryAdmissionReplay)
+{
+    using namespace llaminar2::rocm;
+    for(auto role:{MoEPrefillProjectionRole::GateUp,MoEPrefillProjectionRole::Down}) {
+        const bool gu=role==MoEPrefillProjectionRole::GateUp;
+        const int n=gu ? 512 : 2048,k=gu ? 2048 : 512;
+        const auto admission=MoEGroupedDotAdmission::columnCandidate(role,n,n,k);
+        const auto plan=admission.rowPlan();
+        EXPECT_TRUE(plan.isColumn());EXPECT_TRUE(plan.isWide());
+        EXPECT_NE(plan,MoEGroupedRowPlan::wide(role,MoEGroupedWmmaRowFloor::Eight));
+        for(int mutation=-1;mutation<4;++mutation)for(int count=1;count<=128;++count) {
+            llaminar2::DeviceNativeQuantisedMatrixDesc desc{};
+            desc.n=n;desc.k=k;desc.codebook_id=gu ? 13 : 24;
+            desc.source_identity_present=1;desc.source_is_superblock=1;desc.source_codebook_id=gu ? 13 : 4;
+            if(mutation==0)desc.source_identity_present=0;
+            if(mutation==1)desc.source_is_superblock=0;
+            if(mutation==2)desc.source_codebook_id=19;
+            if(mutation==3)desc.codebook_id=23;
+            EXPECT_EQ(admission.select(desc,count),mutation>=0 ? MoEGroupedDotProducer::Invalid :
+                count<8 ? MoEGroupedDotProducer::OrderedDot4 : MoEGroupedDotProducer::Wmma);
+            EXPECT_EQ(plan.rows(count),count<8 ? (gu ? 4 : 12) : 16);
+        }
+        EXPECT_THROW((void)MoEGroupedDotAdmission::columnCandidate(role,n,n/2,k),std::invalid_argument);
+        EXPECT_THROW((void)MoEGroupedDotAdmission::columnCandidate(role,n,n,k+32),std::invalid_argument);
+    }
+}
+
+/** @test Direct column submission retains generation and layout authority, including reset. */
+TEST(Test__ROCmMoEGroupedPrefillDispatch, ColumnDirectoryDirectPublicationReplay)
+{
+    using namespace llaminar2;using namespace llaminar2::rocm;
+    std::array<int,256> counts{},offsets{},active{};std::array<uint32_t,128> words{};int workspace=0;
+    const auto device=DeviceId::rocm(0);const auto stream=ExplicitGPUStream(reinterpret_cast<void *>(0x1000));
+    const auto binding=MoEGroupingPackedDirectory::columnFloor8(counts.data(),offsets.data(),active.data(),words.data(),128,16,8,256,device,&workspace,stream);
+    MoEPrefillGroupingProvenance owner;
+    auto preparation=owner.beginAllRoutes();std::move(preparation).publish(binding);
+    const auto borrow=owner.borrowDirectory();
+    const ROCmMoEGroupedPrefillRouteKey key{.gateup_codebook=13,.down_codebook=4,
+        .hidden_size=2048,.expert_width=512,.expert_count=256,.top_k=8,.rows=16,
+        .operation=MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes};
+    MoEGroupedWmmaArguments args{.admission=ROCmMoEGroupedRouteAdmission(key,counts.data(),offsets.data())};
+    args.group_counts=counts.data();args.group_offsets=offsets.data();args.directory=words.data();
+    args.rows=16;args.top_k=8;args.experts=256;args.device=0;
+    args.dot_admission=MoEGroupedDotAdmission::columnCandidate(MoEPrefillProjectionRole::GateUp,512,512,2048);
+    args.directory_layout=MoEGroupingPackedLayout::ColumnFloor8;
+    EXPECT_NO_THROW(requireMoEGroupedColumnPublication(args,&borrow,stream.get()));
+    EXPECT_THROW(requireMoEGroupedColumnPublication(args,nullptr,stream.get()),std::logic_error);
+    args.directory_layout=MoEGroupingPackedLayout::WideFloor8;
+    EXPECT_THROW(requireMoEGroupedColumnPublication(args,&borrow,stream.get()),std::logic_error);
+    args.directory_layout=MoEGroupingPackedLayout::ColumnFloor8;
+    owner.invalidate();EXPECT_THROW(requireMoEGroupedColumnPublication(args,&borrow,stream.get()),std::logic_error);
+    args.dot_admission=MoEGroupedDotAdmission::wideCandidate(MoEPrefillProjectionRole::GateUp,512,512,2048,MoEGroupedWmmaRowFloor::Eight);
+    args.directory_layout=static_cast<MoEGroupingPackedLayout>(255);
+    EXPECT_THROW(requireMoEGroupedColumnPublication(args,nullptr,stream.get()),std::logic_error);
 }

@@ -32,6 +32,7 @@
 #include "common/DeviceRowRange.h"
 #include "common/MoERouterOwnedRows.h"
 #include "common/MoEPrefillProjectionExecution.h"
+#include "common/MoERoutedTransactionScope.h"
 #include "../execution/moe/MoEGroupedIntermediateExchangeABI.h"
 #include "../execution/moe/MoEGroupedPlanDemand.h"
 
@@ -3294,6 +3295,40 @@ namespace llaminar2
             (void)layout; (void)route_participants; (void)packet; (void)packet_byte_offset;
             (void)packet_bytes; (void)participant;
             return false;
+        }
+
+        /**
+         * @brief Group and execute one original static, unmasked routed transaction.
+         * @param launch Exact stage-owned stream and persistent workspace.
+         * @param routing_indices Original route IDs, consumed only on device.
+         * @param routing_weights Original route probabilities.
+         * @param hidden Original token-row activations.
+         * @param output Ordered token output unless contributions owns publication.
+         * @param gateup_desc_table_id Original gate/up descriptor table.
+         * @param down_desc_table_id Original down descriptor table.
+         * @param seq_len Physical token extent, not a downloaded live count.
+         * @param d_model Full hidden width.
+         * @param intermediate Full expert intermediate width.
+         * @param num_experts Original expert count.
+         * @param top_k Routes per token.
+         * @param contributions Optional canonical route publication target.
+         * @return Whether both grouping and complete projection were submitted.
+         * @note Masked, runtime and separately scheduled projection phases use
+         * their own existing APIs; they cannot borrow this complete identity.
+         */
+        bool executeStaticRoutedPrefillTransaction(
+            const MoEKernelLaunchContext &launch, ITensor *routing_indices, ITensor *routing_weights,
+            ITensor *hidden, ITensor *output, int gateup_desc_table_id, int down_desc_table_id,
+            int seq_len, int d_model, int intermediate, int num_experts, int top_k,
+            ITensor *contributions = nullptr)
+        {
+            const ScopedMoERoutedTransaction original(MoERoutedTransactionBinding{
+                this, routing_indices, routing_weights, hidden, output, contributions,
+                gateup_desc_table_id, down_desc_table_id, seq_len, d_model, intermediate,
+                num_experts, top_k, launch.stream, launch.workspace});
+            return prepareExpertGroupsAsync(routing_indices, routing_weights, seq_len, num_experts, top_k) &&
+                executeGroupedPrefillPipeline(hidden, output, gateup_desc_table_id, down_desc_table_id,
+                    seq_len, d_model, intermediate, num_experts, top_k, contributions);
         }
 
         /**

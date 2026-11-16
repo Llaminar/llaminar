@@ -26581,15 +26581,19 @@ void runRoutedOnlyGroupedPrefillQwen36ShapeRuntimeMMatchesRowByRowDecode(
                     ASSERT_EQ(std::string_view(name).find("moe_grouped_gate_up_batch_invariant_tiled_prefill_kernel"),std::string_view::npos);
                     ASSERT_EQ(std::string_view(name).find("moe_grouped_down_batch_invariant_tiled_prefill_kernel"),std::string_view::npos);
                     if (std::string_view(name).find("grouped_wmma_detail") == std::string_view::npos) continue;
-                    ASSERT_NE(std::string_view(name).find(row_floor == llaminar2::rocm::MoEGroupedWmmaRowFloor::EveryExpert
-                        ? "ELb0EE" : "ELb1EE"),std::string_view::npos) << name;
+                    const bool wide = engine == llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma;
+                    // Ordinary Wide adds ColumnDirectory=false after Adaptive;
+                    // authenticate both flags so capture proves the intended arithmetic.
+                    const std::string arithmetic_suffix = std::string(
+                        row_floor == llaminar2::rocm::MoEGroupedWmmaRowFloor::EveryExpert ? "ELb0" : "ELb1") +
+                        (wide ? "ELb0EE" : "EE");
+                    ASSERT_NE(std::string_view(name).find(arithmetic_suffix),std::string_view::npos) << name;
                     if (params.gridDim.z == 2) ++native_gate_up;
                     else if (params.gridDim.z == 1) ++native_down;
                     else FAIL() << "Unexpected grouped WMMA projection role";
                     hipFuncAttributes resources{};
                     ASSERT_EQ(hipFuncGetAttributes(&resources, params.func), hipSuccess);
                     EXPECT_EQ(resources.localSizeBytes, 0u) << name;
-                    const bool wide = engine == llaminar2::rocm::MoEGroupedPrefillEngine::WideDot4Wmma;
                     const unsigned columns = wide ? (params.gridDim.z == 2 ? 256u : 128u) :
                         engine == llaminar2::rocm::MoEGroupedPrefillEngine::WmmaM16N32 ? 32u : 64u;
                     EXPECT_EQ(params.blockDim.x,wide ? columns : columns*4);

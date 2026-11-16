@@ -9,6 +9,7 @@
 #include "kernels/common/VerifierProjectionBundle.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedVerifierLaunch.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
+#include "../../../utils/ROCmSelectedHeadGolden.h"
 #include <gtest/gtest.h>
 #include <array>
 
@@ -266,15 +267,14 @@ TEST(ROCmVerifierBundlePolicy, MaterializedHeadCompleteInventoryReplay)
         for (int n:{248320,124160,248384}) for (int m=1;m<=65;++m) {
             operation.k=k;operation.members[0].n=n;operation.rows=DeviceRowRange::fullyActive(m);
             operation.members[0].source={format.source_codebook_id,format.source_is_superblock,true};
-            const bool expected=operation.members[0].source==NativeQuantisedSourceIdentity{8,true,true} &&
-                (k==2048 || k==5120) && n==248320 && m>=5 && m<=16;
+            const bool expected=selectedHeadExpectsWmma(format.tensor_type,n,k,m);
             const bool actual=measuredNativeQuantisedVerifierBundle(operation);
             EXPECT_EQ(actual,expected)<<format.label<<" N="<<n<<" K="<<k<<" M="<<m;
             selected+=actual;
             operation.rows=DeviceRowRange::deviceCounted(m,&f.count);
             EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(operation));
         }
-    EXPECT_EQ(selected,24);
+    EXPECT_EQ(selected,490);
 }
 
 /** @test Single-member head packets retain source, full-row, bank and arithmetic identity. */

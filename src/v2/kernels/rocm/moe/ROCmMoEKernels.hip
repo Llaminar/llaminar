@@ -19352,7 +19352,7 @@ __device__ __forceinline__ void rocm_publish_runtime_prefill_plan_block(
  * the serial implementation while parallelizing reads, rank assignment,
  * writes, and sentinel padding.
  */
-template<bool PackedOffsetSlots>
+template<bool PackedOffsetSlots, bool ColumnSlots=false>
 __global__ void rocm_moe_build_active_expert_list_kernel(
     const int *__restrict__ expert_counts,
     int *__restrict__ active_expert_ids,
@@ -19379,8 +19379,10 @@ __global__ void rocm_moe_build_active_expert_list_kernel(
         {
             if (expert < num_experts)
             {
-                const auto interval = llaminar2::moe_grouped_directory::WideFloor8OffsetSlots::bind(
-                    expert_counts[expert], expert_offsets[expert], total_slots);
+                using Interval = std::conditional_t<ColumnSlots,
+                    llaminar2::moe_grouped_directory::ColumnFloor8OffsetSlots,
+                    llaminar2::moe_grouped_directory::WideFloor8OffsetSlots>;
+                const auto interval = Interval::bind(expert_counts[expert], expert_offsets[expert], total_slots);
                 for (int tile = 0; tile < interval.tiles(); ++tile)
                     packed_directory[interval.slot(tile)] = interval.descriptor(expert, num_experts, tile);
             }
@@ -22186,10 +22188,14 @@ bool hipMoE_build_active_expert_list_with_offset_slots(const llaminar2::MoEGroup
     if (!binding.device().is_rocm()) return false;
     llaminar2::HipDeviceGuard::setDevice(binding.device().ordinal);
     (void)hipGetLastError();
-    hipLaunchKernelGGL(HIP_KERNEL_NAME(rocm_moe_build_active_expert_list_kernel<true>),
-        dim3(1), dim3(kActiveExpertThreads), 0, static_cast<hipStream_t>(binding.stream()),
-        binding.counts(), const_cast<int *>(binding.activeIds()), binding.experts(),
-        std::min(binding.totalSlots(), binding.experts()), binding.offsets(), binding.words(), binding.totalSlots());
+    const auto launch = [&]<bool Column>() {
+        hipLaunchKernelGGL(HIP_KERNEL_NAME(rocm_moe_build_active_expert_list_kernel<true,Column>),
+            dim3(1), dim3(kActiveExpertThreads), 0, static_cast<hipStream_t>(binding.stream()),
+            binding.counts(), const_cast<int *>(binding.activeIds()), binding.experts(),
+            std::min(binding.totalSlots(), binding.experts()), binding.offsets(), binding.words(), binding.totalSlots());
+    };
+    if(binding.layout()==llaminar2::MoEGroupingPackedLayout::ColumnFloor8)launch.template operator()<true>();
+    else launch.template operator()<false>();
     return hipGetLastError() == hipSuccess;
 }
 

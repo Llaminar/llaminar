@@ -17,6 +17,7 @@
 #include "ROCmMoEGroupedPopulationProjection.h"
 #include "ROCmNativeQuantisedDecodeEquivalentMath.h"
 #include "kernels/common/MoEGroupedDirectory.h"
+#include "kernels/common/MoEGroupedOffsetSlots.h"
 #include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 #include "kernels/rocm/common/ROCmSignedDot4.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
@@ -47,9 +48,13 @@ ScopedMoEGroupedPrefillEngine::ScopedMoEGroupedPrefillEngine(
     : previous_(recording_engine), previous_floor_(recording_floor), previous_directory_(recording_directory)
 {
     if (directory != MoEGroupedDirectorySource::RolePlanner &&
-        (directory != MoEGroupedDirectorySource::GroupingOffsetSlots ||
+        ((directory != MoEGroupedDirectorySource::GroupingOffsetSlots &&
+          directory != MoEGroupedDirectorySource::GroupingColumnSlots) ||
          engine != MoEGroupedPrefillEngine::WideDot4Wmma || floor != MoEGroupedWmmaRowFloor::Eight))
         throw std::invalid_argument("grouping offset slots require explicit WideFloor8 arithmetic");
+    if(directory==MoEGroupedDirectorySource::GroupingColumnSlots &&
+        (engine!=MoEGroupedPrefillEngine::WideDot4Wmma || floor!=MoEGroupedWmmaRowFloor::Eight))
+        throw std::invalid_argument("column directory requires explicit WideFloor8 arithmetic");
     if (!validMoEGroupedWmmaRowFloor(floor) ||
         ((engine == MoEGroupedPrefillEngine::Automatic || engine == MoEGroupedPrefillEngine::OrderedDot4) &&
          floor != MoEGroupedWmmaRowFloor::EveryExpert))
@@ -70,10 +75,12 @@ ScopedMoEGroupedPrefillEngine::ScopedMoEGroupedPrefillEngine(
 ScopedMoEGroupedPrefillEngine::~ScopedMoEGroupedPrefillEngine()
 { recording_engine = previous_; recording_floor = previous_floor_; recording_directory = previous_directory_; }
 
-MoEGroupedDirectorySource selectedMoEGroupedDirectorySource() noexcept { return recording_directory; }
-
 MoEGroupedPrefillPolicy selectedMoEGroupedPrefillPolicy(int device, const MoEGroupedPopulationKey &key)
 {
+    if (recording_engine == MoEGroupedPrefillEngine::Automatic &&
+        routedVerifierColumnQualified(key) && nativeGroupedDevice(device))
+        return {MoEGroupedPrefillEngine::WideDot4Wmma, MoEGroupedWmmaRowFloor::Eight,
+            MoEGroupedPopulationDomain::Unmeasured, MoEGroupedDirectorySource::GroupingColumnSlots};
     if (recording_engine == MoEGroupedPrefillEngine::Automatic &&
         sharedVerifierWmmaQualified(key) && nativeGroupedDevice(device))
         return {MoEGroupedPrefillEngine::WmmaM16N32, MoEGroupedWmmaRowFloor::EveryExpert};
@@ -352,9 +359,11 @@ __global__ __launch_bounds__(BN * 4) void projection(MoEGroupedWmmaArguments v)
 }
 
 bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
-    const MoEGroupedWmmaArguments &args, void *stream, MoEGroupedPrefillRoleSubmission *submitted)
+    const MoEGroupedWmmaArguments &args, void *stream, MoEGroupedPrefillRoleSubmission *submitted,
+    const MoEPrefillGroupingProvenance::DirectoryBorrow *publication)
 {
     if (submitted) *submitted = {};
+    requireMoEGroupedColumnPublication(args,publication,stream);
     MoEGroupedPrefillRoleSubmission pending;
     const auto native_stream = static_cast<hipStream_t>(stream);
     if (!native_stream || native_stream == hipStreamLegacy || native_stream == hipStreamPerThread ||
@@ -368,6 +377,14 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
         ((args.second_descriptors == nullptr) != (args.second_output == nullptr)) ||
         !args.dot_admission.binds(args.second_descriptors ? MoEPrefillProjectionRole::GateUp
                                                         : MoEPrefillProjectionRole::Down,args.n,args.k)) return false;
+    const bool columns=args.dot_admission.rowPlan().isColumn();
+    if(columns!=(args.directory_layout==MoEGroupingPackedLayout::ColumnFloor8))return false;
+    if(columns && (engine!=MoEGroupedPrefillEngine::WideDot4Wmma || args.rows!=16 || args.top_k!=8 ||
+        args.experts!=256 || args.directory_capacity!=128 || args.dot_admission.rowPlan().floor()!=MoEGroupedWmmaRowFloor::Eight ||
+        args.dot_admission.sourceOutputColumns()!=args.n ||
+        (args.second_descriptors ? (args.n!=512 || args.k!=2048 || codebooks!=(uint32_t{1}<<13) ||
+             args.input!=MoEGroupedWmmaInput::OriginalTokens) :
+            (args.n!=2048 || args.k!=512 || codebooks!=(uint32_t{1}<<24) || args.input!=MoEGroupedWmmaInput::GroupedRows))))return false;
     int stream_device = -1;
     if (hipStreamGetDevice(native_stream,&stream_device) != hipSuccess || stream_device != args.device) return false;
 #if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx1100__)
@@ -385,6 +402,20 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
             pending.record({engine,args.dot_admission.rowPlan().floor(),16,BN,BN*4,
                 Adaptive ? 16 : 0,1,Adaptive ? BN : 0});
             return true;
+        };
+        auto column = [&]() {
+            // Only the two original physical decoders instantiate this bounded
+            // experiment. Other formats fail before recording a partial family.
+            if constexpr(FMT==NATIVE_QUANTISED_GEMM_IQ2_S || FMT==NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE) {
+                constexpr bool two=FMT==NATIVE_QUANTISED_GEMM_IQ2_S;
+                constexpr int threads=two ? 256 : 128, native_columns=threads/4;
+                const dim3 grid((args.n+threads-1)/threads,args.directory_capacity,two ? 2 : 1);
+                grouped_wmma_detail::wideProjection<FMT,two,true,true><<<grid,threads,0,native_stream>>>(args);
+                if(hipGetLastError()!=hipSuccess)return false;
+                pending.record({engine,args.dot_admission.rowPlan().floor(),16,native_columns,threads,two ? 4 : 12,1,threads});
+                return true;
+            }
+            return false;
         };
         auto wide = [&]<bool Adaptive>() {
             const int threads = args.second_descriptors ? 256 : 128;
@@ -405,6 +436,7 @@ bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
         case MoEGroupedPrefillEngine::WmmaM16N64:
             return args.dot_admission.mayUseOrdered() ? tile.template operator()<64,true>() : tile.template operator()<64,false>();
         case MoEGroupedPrefillEngine::WideDot4Wmma:
+            if(columns)return column();
             return args.dot_admission.mayUseOrdered() ? wide.template operator()<true>() : wide.template operator()<false>();
         default: return false;
         }

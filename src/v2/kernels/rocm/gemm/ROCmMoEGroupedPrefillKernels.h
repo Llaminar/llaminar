@@ -39,6 +39,7 @@
  * @param completed_observation Required with an explicit capability; caller-owned host construction receipt, cleared on failure.
  * @param singleton_sources Original sources borrowed from immutable singleton descriptor tables; empty for other operations.
  * @param grouping_directory Lexical successful grouping authority for the explicit offset-slot producer.
+ * @param routed_sources All original static descriptors authenticated by the complete transaction scope.
  * @return True if the declared transaction was enqueued on the non-null stream.
  */
 extern "C"
@@ -83,7 +84,8 @@ bool rocmMoE_grouped_prefill_pipeline(
     uint32_t *d_population_selection = nullptr,
     llaminar2::rocm::MoEGroupedPrefillSubmission *submitted = nullptr,
     llaminar2::rocm::MoEGroupedSourceTuple singleton_sources = {},
-    const llaminar2::MoEPrefillGroupingProvenance::DirectoryBorrow *grouping_directory = nullptr);
+    const llaminar2::MoEPrefillGroupingProvenance::DirectoryBorrow *grouping_directory = nullptr,
+    llaminar2::rocm::MoEGroupedSourceTuple routed_sources = {});
 
 /**
  * @brief Fold already-weighted route outputs in the original router order.

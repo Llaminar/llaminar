@@ -1,10 +1,10 @@
 # ROCm prefill matrix-instruction coverage
 
-Dashboard limit: **15,000 UTF-8 bytes**. Current coverage and qualification; backend procedures remain in the ROCm tuning skill.
+Dashboard limit: **15,000 UTF-8 bytes**. Current status; procedures live in the ROCm tuning skill.
 
-The active objective covers four areas: broader dense dispatch, grouped routed
-experts, attention, and Q8 router logits. Each requires production-path component
-correctness, captured replay, unprofiled Release timing and kernel profiling.
+The requested component work is complete across four areas: broader dense dispatch, grouped routed
+experts, attention, and Q8 router logits. Acceptance requires captured byte replay,
+unprofiled Release timing and kernel profiles.
 Attention additionally requires linear complete-operation scaling through 64K
 KV tokens with the query bucket held fixed, as explicitly confirmed by the user.
 The added [MTP work list](GFX1100_MTP_GROUPED_WMMA_PLAN.md) has all21-source exact-hosted
@@ -18,10 +18,12 @@ gates and64 profiles pass. GDN Auto qualifies161 keys with16 profiles; connected
 FFN Auto qualifies136 GU keys (confirmation geo1.112×), with six host/26
 GPU gates and16 profiles. Wo Auto qualifies746 keys across21 formats
 (confirmation geo1.237×), with129 gates/137 cases and16 profiles.
-[Selected Q6_K head](GFX1100_MTP_SELECTED_HEAD.md) Auto qualifies both full vocabularies:
-Dot4 M2–4, WMMA M5–16 (confirmation geo1.998×), seven gates/16 profiles.
-Routed MTP and broader head-format qualification remain; sparse tail tuning is follow-up work.
-The split routed candidate was rejected and removed.
+[Selected head](GFX1100_MTP_SELECTED_HEAD.md) Auto qualifies all21 formats at both full-vocabulary
+geometries:490 keys win31/31 pairs (geo1.812×),140 retain Dot4;42 native cases,
+630 widths and16 current profiles pass, joined to unchanged Q6 kernel evidence.
+[Routed MTP](GFX1100_MTP_ROUTED_VERIFIER.md) Auto wins all34 medians in both panels
+(confirmation geo1.085×);18 native gates/169 cases and48 profiles pass.
+Residual sparse MoE costs remain follow-up tuning.
 rocBLAS remains the half-operand implementation: three custom WMMA variants lost
 every measured cell. [Investigation and deferral](GFX1100_HALF_OPERAND_PREFILL_INVESTIGATION.md).
 The earlier two-anchor NativeQuantised objective is documented separately in
@@ -75,13 +77,9 @@ All 233 focused native executions pass, plus both cases after the IQ2_S grid
 change. Q4_0 geometric/full gains are 1.107×/1.101×; IQ2_S gains 1.080×/1.051×.
 Sparse latency increases reach 2.3%/3.3%. All 70 exact counter passes are green, with zero
 scratch and zero reported LDS bank conflicts. All42 refreshed Qwen counter passes
-are also green. This slice is qualified; residual small-work losses remain open.
+are also green. This slice is qualified; residual small-work costs are follow-up tuning.
 The [operation proof](GFX1100_GROUPED_PREFILL_OPERATION_PROOF.md) owns measurements,
 ownership regressions and archive identities.
-
-The user removed isolation receipts and recollection from the work requirements.
-Existing dense/CUDA-reference, router and attention evidence remains accepted;
-the [isolation audit](GFX1100_PREFILL_ISOLATION_REQUALIFICATION.md) is superseded.
 
 Attention Automatic resolves the measured immutable domain once at capture:
 FP16/B1/M512/HD256/capacity65536,Q/KV12/2 or8/1, full causal query scheduling and

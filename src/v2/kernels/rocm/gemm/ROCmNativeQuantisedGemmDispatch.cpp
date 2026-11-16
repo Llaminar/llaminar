@@ -478,6 +478,24 @@ bool matchesNativeQuantisedGDNVerifier(const NativeQuantisedGDNVerifierOperation
 
 namespace
 {
+/** @brief Full-source head masks, with original K2048/K5120 column ownership. */
+struct VerifierMaterializedHeadMeasuredWidths
+{
+    NativeQuantisedSourceIdentity source;
+    std::array<uint16_t,2> rows;
+};
+#include "ROCmNativeQuantisedVerifierMaterializedHeadPolicy.inc"
+static_assert([] {
+    for(size_t i=0;i<kVerifierMaterializedHeadMeasuredWidths.size();++i) {
+        const auto &entry=kVerifierMaterializedHeadMeasuredWidths[i];
+        if(!entry.source.present || canonicalDeviceVnniCodebookId(entry.source)==255)return false;
+        for(auto mask:entry.rows)if(mask&0x8000u)return false;
+        for(size_t previous=0;previous<i;++previous)
+            if(entry.source==kVerifierMaterializedHeadMeasuredWidths[previous].source)return false;
+    }
+    return true;
+}(),"Materialized head masks require unique original sources and M2..16 widths");
+
 /** @brief Source-specific full-extent masks for complete original QKV/KV operations. */
 struct VerifierBundleMeasuredWidths
 {
@@ -622,13 +640,15 @@ bool measuredNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOp
 {
     const int m = operation.rows.physicalRows();
     if (operation.kind == VerifierProjectionBundleKind::MaterializedLMHead) {
-        // Every M2..16 was measured independently for these original Q6_K heads.
-        // Dot4 wins M2..4; native wins all31 pairs at each M5..16. No source alias,
-        // local-vocabulary slice or different serial partition width borrows it.
-        return m >= 5 && m <= 16 && operation.count == 1 &&
-            operation.rows.captureIdentity() == DeviceRowRange::fullyActive(m).captureIdentity() &&
-            operation.members[0].n == 248320 && (operation.k == 5120 || operation.k == 2048) &&
-            operation.members[0].source == NativeQuantisedSourceIdentity{8,true,true};
+        // Every source/width has its own complete selector/head measurement.
+        // The original full materialization and serial tree remain prerequisites.
+        if(m<2 || m>16 || operation.count!=1 || operation.members[0].n!=248320 ||
+            (operation.k!=2048 && operation.k!=5120) ||
+            operation.rows.captureIdentity()!=DeviceRowRange::fullyActive(m).captureIdentity())return false;
+        for(const auto &entry:kVerifierMaterializedHeadMeasuredWidths)
+            if(entry.source==operation.members[0].source)
+                return (entry.rows[operation.k==2048 ? 0 : 1]&(uint16_t{1}<<(m-2)))!=0;
+        return false;
     }
     if(operation.kind==VerifierProjectionBundleKind::GateUp) {
         if(m<2 || m>16 || operation.count!=2 || operation.k!=5120 ||

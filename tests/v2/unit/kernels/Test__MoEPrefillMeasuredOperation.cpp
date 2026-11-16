@@ -12,6 +12,7 @@
 
 #include "kernels/common/MoEPrefillProjectionExecution.h"
 #include "kernels/common/MoEGroupedOffsetSlots.h"
+#include "kernels/common/MoERoutedTransactionScope.h"
 #include "kernels/rocm/gemm/ROCmMoEProductionPrefillPolicy.h"
 #include "kernels/rocm/gemm/ROCmMoEGroupedPrefillRoutePolicy.h"
 #include "kernels/cuda/gemm/CUDAMoEProductionPrefillPolicy.h"
@@ -51,6 +52,60 @@ namespace
                                              .measuredOperation(layout, Scope::AllRoutes));
         return operations;
     }
+}
+
+/** @test Original immutable identity survives nesting/reset without lending a parent's policy. */
+TEST(MoEPrefillMeasuredOperation, PackedDirectoryOriginalTransactionReplay)
+{
+    using namespace llaminar2;
+    int storage[8]{};
+    MoERoutedTransactionBinding binding{
+        reinterpret_cast<IMoEKernel *>(&storage[0]), reinterpret_cast<ITensor *>(&storage[1]),
+        reinterpret_cast<ITensor *>(&storage[2]), reinterpret_cast<ITensor *>(&storage[3]),
+        reinterpret_cast<ITensor *>(&storage[4]), nullptr, 2, 3, 16, 2048, 512, 256, 8,
+        &storage[5], reinterpret_cast<DeviceWorkspaceManager *>(&storage[6])};
+    ASSERT_EQ(ScopedMoERoutedTransaction::current(), nullptr);
+    for (int replay = 0; replay < 3; ++replay)
+    {
+        ScopedMoERoutedTransaction outer(binding);
+        EXPECT_NO_THROW(ScopedMoERoutedTransaction::requireMatching(binding));
+        {
+            ScopedMoERoutedTransaction hidden(std::nullopt);
+            EXPECT_EQ(ScopedMoERoutedTransaction::current(), nullptr);
+            EXPECT_THROW(ScopedMoERoutedTransaction::requireMatching(binding), std::logic_error);
+        }
+        for (int field = 0; field < 15; ++field)
+        {
+            auto other = binding;
+            switch (field)
+            {
+            case 0: other.owner = reinterpret_cast<IMoEKernel *>(&storage[7]); break;
+            case 1: other.indices = binding.weights; break;
+            case 2: other.weights = binding.indices; break;
+            case 3: other.hidden = binding.output; break;
+            case 4: other.output = binding.hidden; break;
+            case 5: other.contributions = binding.output; break;
+            case 6: ++other.gateup_table; break;
+            case 7: ++other.down_table; break;
+            case 8: ++other.rows; break;
+            case 9: ++other.hidden_width; break;
+            case 10: ++other.intermediate; break;
+            case 11: ++other.experts; break;
+            case 12: ++other.top_k; break;
+            case 13: other.stream = &storage[7]; break;
+            case 14: other.workspace = reinterpret_cast<DeviceWorkspaceManager *>(&storage[7]); break;
+            }
+            EXPECT_THROW(ScopedMoERoutedTransaction::requireMatching(other), std::logic_error);
+            { ScopedMoERoutedTransaction nested(other); EXPECT_NO_THROW(ScopedMoERoutedTransaction::requireMatching(other)); }
+            EXPECT_NO_THROW(ScopedMoERoutedTransaction::requireMatching(binding));
+        }
+        auto invalid = binding; invalid.stream = nullptr;
+        EXPECT_THROW((ScopedMoERoutedTransaction(invalid)), std::invalid_argument);
+        invalid = binding; invalid.rows = INT_MAX;
+        EXPECT_THROW((ScopedMoERoutedTransaction(invalid)), std::invalid_argument);
+        EXPECT_NO_THROW(ScopedMoERoutedTransaction::requireMatching(binding));
+    }
+    EXPECT_EQ(ScopedMoERoutedTransaction::current(), nullptr);
 }
 
 /** @test Duplicate routes and interior sentinel holes retain every original expert row exactly once. */
@@ -565,4 +620,69 @@ TEST(MoEPrefillMeasuredOperation, UnseenShapesAndFamiliesRemainExactMisses)
     }
     EXPECT_EQ(cuda, -71);
     EXPECT_EQ(rocm.gateup_tile_n, 17);
+}
+
+/** @test Every legal bounded interval has exactly one writer per live row and output column. */
+TEST(MoEPrefillMeasuredOperation, PackedDirectoryColumnCoverageReplay)
+{
+    using llaminar2::moe_grouped_directory::ColumnFloor8OffsetSlots;
+    for(int count=0;count<=128;++count)for(int offset=0;offset<=128-count;++offset) {
+        const auto interval=ColumnFloor8OffsetSlots::bind(count,offset,128);
+        ASSERT_LE(interval.tiles(),count);
+        std::vector<int> gu(count*256),down(count*128);
+        for(int ordinal=0;ordinal<interval.tiles();++ordinal) {
+            const auto word=interval.descriptor(255,256,ordinal);
+            const int slot=interval.slot(ordinal),row=word>>10,quadrant=(word>>8)&3;
+            ASSERT_GE(slot,offset);ASSERT_LT(slot,offset+count);
+            ASSERT_TRUE(interval.owns(word,255,slot));
+            EXPECT_FALSE(interval.owns(word,255,slot+1));
+            EXPECT_FALSE(interval.owns(word,255,std::numeric_limits<int>::min()));
+            EXPECT_FALSE(interval.owns(word,255,std::numeric_limits<int>::max()));
+            EXPECT_FALSE(interval.owns(word^(1u<<8),255,slot));
+            EXPECT_FALSE(interval.owns(word^(1u<<10),255,slot));
+            for(int role=0;role<2;++role) {
+                if(role && count<8 && row)continue;
+                const int columns=role ? 128 : 256,step=count<8 ? (role ? 12 : 4) : 16;
+                const int width=count<8 ? columns : columns/4;
+                auto &visits=role ? down : gu;
+                for(int r=row;r<std::min(count,row+step);++r)
+                    for(int col=quadrant*width;col<(quadrant+1)*width;++col)++visits[r*columns+col];
+            }
+        }
+        for(int writers:gu)ASSERT_EQ(writers,1);
+        for(int writers:down)ASSERT_EQ(writers,1);
+    }
+    for(const auto bad:{std::array{-1,0,128},std::array{1,-1,128},std::array{129,0,128},
+        std::array{17,112,128},std::array{0,0,129},std::array{0,0,0}})
+        EXPECT_THROW((void)ColumnFloor8OffsetSlots::bind(bad[0],bad[1],bad[2]),std::invalid_argument);
+    const auto tail=ColumnFloor8OffsetSlots::bind(17,111,128);
+    EXPECT_EQ(tail.tiles(),8);EXPECT_EQ(tail.slot(7),118);
+    EXPECT_THROW((void)tail.slot(8),std::invalid_argument);
+    EXPECT_THROW((void)tail.descriptor(255,255,0),std::invalid_argument);
+}
+
+/** @test A column consumer cannot borrow an ordinary directory with otherwise identical addresses. */
+TEST(MoEPrefillMeasuredOperation, PackedDirectoryColumnIdentityReplay)
+{
+    using Binding=llaminar2::MoEGroupingPackedDirectory;
+    using Layout=llaminar2::MoEGroupingPackedLayout;
+    std::array<int,256> counts{},offsets{},active{};std::array<uint32_t,128> words{};int workspace=0;
+    const auto device=llaminar2::DeviceId::rocm(0);
+    const auto stream=llaminar2::ExplicitGPUStream(reinterpret_cast<void *>(0x1000));
+    const auto wide=Binding::wideFloor8(counts.data(),offsets.data(),active.data(),words.data(),128,16,8,256,device,&workspace,stream);
+    const auto column=Binding::columnFloor8(counts.data(),offsets.data(),active.data(),words.data(),128,16,8,256,device,&workspace,stream);
+    EXPECT_NE(wide,column);
+    llaminar2::MoEPrefillGroupingProvenance owner;
+    for(const auto binding:{wide,column}) {
+        auto preparation=owner.beginAllRoutes();std::move(preparation).publish(binding);
+        const auto borrow=owner.borrowDirectory();
+        EXPECT_EQ(borrow.requireMatching(binding),binding);
+        for(auto layout:{Layout::WideFloor8,Layout::ColumnFloor8}) {
+            const auto consume=[&] {return borrow.requireProjection(counts.data(),offsets.data(),words.data(),16,8,256,device,stream.get(),layout).layout();};
+            if(layout==binding.layout())EXPECT_EQ(consume(),layout);
+            else EXPECT_THROW((void)consume(),std::logic_error);
+        }
+        owner.invalidate();EXPECT_THROW((void)borrow.present(),std::logic_error);
+    }
+    EXPECT_THROW((void)Binding::columnFloor8(counts.data(),offsets.data(),active.data(),words.data(),128,9,8,256,device,&workspace,stream),std::invalid_argument);
 }

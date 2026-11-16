@@ -12,6 +12,7 @@
  */
 #pragma once
 #include "ROCmMoEPrefillArithmetic.h"
+#include "kernels/common/MoEPrefillProjectionExecution.h"
 #include "ROCmMoEGroupedPrefillRoutePolicy.h"
 #include "ROCmMoEGroupedDotAdmission.h"
 #include "ROCmMoEGroupedPopulationPolicy.h"
@@ -23,10 +24,7 @@ namespace llaminar2::rocm
 enum class MoEGroupedPrefillEngine { Automatic, PopulationAdaptive, OrderedDot4, WmmaM16N32, WmmaM16N64, WideDot4Wmma };
 
 /** @brief Directory producer embedded in the captured operation, independent of arithmetic. */
-enum class MoEGroupedDirectorySource { RolePlanner, GroupingOffsetSlots };
-
-/** @return Explicit capture policy shared by grouping and its subsequent projection. */
-MoEGroupedDirectorySource selectedMoEGroupedDirectorySource() noexcept;
+enum class MoEGroupedDirectorySource { RolePlanner, GroupingOffsetSlots, GroupingColumnSlots };
 
 /** @brief Nestable worker-local selection, embedded in the captured native nodes. */
 class ScopedMoEGroupedPrefillEngine final
@@ -143,8 +141,28 @@ struct MoEGroupedWmmaArguments
     MoEPrefillSerialM1KPartitionPolicy partitions;
     ROCmMoEGroupedRouteAdmission admission; ///< Required existing group-plan authority.
     MoEGroupedDotAdmission dot_admission; ///< One whole-expert choice shared by both arithmetic branches.
+    MoEGroupingPackedLayout directory_layout = MoEGroupingPackedLayout::WideFloor8; ///< Exact published work encoding.
     MoEGroupedBranchSuppression branch_suppression = MoEGroupedBranchSuppression::None; ///< Rejected by production when non-None.
 };
+
+/** @brief Authenticate the required live publication before any direct column submission.
+ * @param args Actual frozen packet. @param publication Borrow from the current grouping generation.
+ * @param stream Exact producer stream retained by the caller.
+ * @throws std::logic_error For an absent, revoked, mismatched or falsely tagged column layout. */
+inline void requireMoEGroupedColumnPublication(const MoEGroupedWmmaArguments &args,
+    const MoEPrefillGroupingProvenance::DirectoryBorrow *publication, void *stream)
+{
+    if(args.directory_layout!=MoEGroupingPackedLayout::WideFloor8 && args.directory_layout!=MoEGroupingPackedLayout::ColumnFloor8)
+        throw std::logic_error("unknown grouped directory encoding");
+    const bool column=args.dot_admission.rowPlan().isColumn();
+    if(column!=(args.directory_layout==MoEGroupingPackedLayout::ColumnFloor8))
+        throw std::logic_error("column row plan and directory encoding disagree");
+    if(!column)return;
+    if(!publication)throw std::logic_error("column projection requires its live grouping publication");
+    (void)publication->requireProjection(args.group_counts,args.group_offsets,args.directory,
+        args.rows,args.top_k,args.experts,DeviceId::rocm(args.device),stream,
+        MoEGroupingPackedLayout::ColumnFloor8);
+}
 
 /** @brief Record all physical-codebook leaves for one gate/up or down projection.
  * @param engine Concrete native tile selected for this device at recording time.
@@ -152,10 +170,12 @@ struct MoEGroupedWmmaArguments
  * @param args Frozen bindings and original full-width arithmetic partition policy.
  * @param stream Explicit non-default producer stream owned by args.device.
  * @param submitted Optional caller-owned role inventory, cleared on entry and published on full success.
+ * @param publication Required current grouping publication for the column-layout candidate.
  * @return Whether every required native launch was accepted. */
 bool submitMoEGroupedWmma(MoEGroupedPrefillEngine engine, uint32_t codebooks,
                          const MoEGroupedWmmaArguments &args, void *stream,
-                         MoEGroupedPrefillRoleSubmission *submitted = nullptr);
+                         MoEGroupedPrefillRoleSubmission *submitted = nullptr,
+                         const MoEPrefillGroupingProvenance::DirectoryBorrow *publication = nullptr);
 
 /** @brief Publish this TU's immutable IQ grids during backend initialization.
  * @param device Owning native device. @param iq3s IQ3_S uint32 table.

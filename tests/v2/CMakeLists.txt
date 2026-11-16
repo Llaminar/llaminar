@@ -20984,6 +20984,17 @@ if(HAVE_ROCM)
             LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;Devices1;NativeISA-gfx1100;GEMM;MTP;LMHead;GraphCapture;ByteExact;Replay;Regression"
             MPI_PROCS 1 NO_MODELS TIMEOUT 180 RESOURCE_LOCK rocm_gpu_0)
         list(APPEND _rocm_selected_lm_head_preflight_tests V2_Integration_ROCmSelectedLMHead${head_geometry}Replay)
+        # Bound each full-vocabulary source independently; Q6_K keeps its
+        # existing original-geometry gate and the fixture owns the full roster.
+        foreach(head_source IN ITEMS Q4_0 IQ4_NL IQ4_XS Q4_1 Q4_K Q5_0 Q5_1 Q5_K
+                Q3_K Q2_K IQ3_S IQ3_XXS IQ2_S IQ2_XS IQ2_XXS IQ1_S IQ1_M Q8_0 Q8_1 Q8_K)
+            add_v2_test(V2_Integration_ROCmSelectedLMHead${head_geometry}Replay_${head_source}
+                COMMAND $<TARGET_FILE:v2_integration_rocm_selected_lm_head_transaction>
+                    --gtest_filter=AllSourceGeometry/ROCmSelectedLMHeadTransaction.CapturedReplay/${head_geometry}_${head_source}
+                LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;Devices1;NativeISA-gfx1100;GEMM;MTP;LMHead;AllFormats;GraphCapture;ByteExact;Replay;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 180 RESOURCE_LOCK rocm_gpu_0)
+            list(APPEND _rocm_selected_lm_head_preflight_tests V2_Integration_ROCmSelectedLMHead${head_geometry}Replay_${head_source})
+        endforeach()
     endforeach()
 
     # The connected dense FFN retains GU publication through fused SwiGLU/down.
@@ -43186,3 +43197,11 @@ if(TARGET v2_integration_moe_overlay_residency_consensus_mpi)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_MoERemoteProjectionBoundedTelemetry_MPI)
 endif()
+
+# Bounded column-directory source/role ownership uses device-free recorded packets.
+add_v2_test(V2_Integration_ROCmColumnDirectoryAdmissionReplay
+    COMMAND $<TARGET_FILE:v2_test_rocm_moe_grouped_prefill_dispatch>
+        --gtest_filter=Test__ROCmMoEGroupedPrefillDispatch.ColumnDirectory*
+    LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;MTP;DeviceFree;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmColumnDirectoryAdmissionReplay)

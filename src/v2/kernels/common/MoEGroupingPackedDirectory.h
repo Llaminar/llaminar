@@ -4,7 +4,8 @@
  *
  * Counts and offsets stay device-owned. The combined grouping producer can use
  * each expert's original offset interval for packed WideFloor8 descriptors,
- * retaining interior sentinel holes without another prefix scan. This value
+ * retaining interior sentinel holes without another prefix scan. A distinct
+ * column layout seals its work encoding into the same publication identity. This value
  * borrows existing workspace storage; it neither allocates nor owns live bytes.
  * MoEPrefillGroupingProvenance owns publication and revokes stale borrowers.
  */
@@ -23,6 +24,8 @@
 
 namespace llaminar2
 {
+/** @brief Directory arithmetic is part of immutable producer/consumer identity. */
+enum class MoEGroupingPackedLayout : uint8_t { WideFloor8, ColumnFloor8 };
 static_assert(sizeof(int) == sizeof(uint32_t));
 static_assert(std::bit_cast<uint32_t>(int{-1}) == UINT32_MAX);
 /** @brief Exact capture-time storage and geometry for the offset-slot layout. */
@@ -76,6 +79,26 @@ public:
         return {counts, offsets, active_ids, words, capacity_words, rows, top_k, experts, device, workspace, stream};
     }
 
+    /** @brief Bind compact column work using the same original banks and owner.
+     * @param counts Original count bank. @param offsets Exclusive offsets.
+     * @param active_ids Separate raw IDs. @param words Existing work storage.
+     * @param capacity_words Actual work-bank capacity. @param rows Physical token rows.
+     * @param top_k Route multiplicity. @param experts Exact descriptor domain.
+     * @param device Original GPU. @param workspace Storage owner. @param stream Exact producer stream.
+     * @return Validated column-layout binding. @throws std::invalid_argument For other geometry. */
+    static MoEGroupingPackedDirectory columnFloor8(const int *counts,const int *offsets,
+        const int *active_ids,uint32_t *words,size_t capacity_words,int rows,int top_k,int experts,
+        DeviceId device,const void *workspace,ExplicitGPUStream stream)
+    {
+        if(rows!=16 || top_k!=8 || experts!=256)
+            throw std::invalid_argument("column directory requires M16/E256/top8");
+        auto result=wideFloor8(counts,offsets,active_ids,words,capacity_words,rows,top_k,experts,device,workspace,stream);
+        result.layout_=MoEGroupingPackedLayout::ColumnFloor8;
+        return result;
+    }
+    /** @return Exact arithmetic layout retained by this publication. */
+    [[nodiscard]] MoEGroupingPackedLayout layout() const noexcept { return layout_; }
+
     /** @return Original authoritative count bank. */
     [[nodiscard]] const int *counts() const noexcept { return counts_; }
     /** @return Original immutable exclusive-offset bank. */
@@ -106,7 +129,7 @@ public:
         return counts_ == other.counts_ && offsets_ == other.offsets_ && active_ids_ == other.active_ids_ &&
             words_ == other.words_ && capacity_words_ == other.capacity_words_ && rows_ == other.rows_ &&
             top_k_ == other.top_k_ && experts_ == other.experts_ && device_ == other.device_ &&
-            workspace_ == other.workspace_ && stream_.get() == other.stream_.get();
+            workspace_ == other.workspace_ && stream_.get() == other.stream_.get() && layout_ == other.layout_;
     }
 
 private:
@@ -124,5 +147,6 @@ private:
     DeviceId device_;
     const void *workspace_;
     ExplicitGPUStream stream_;
+    MoEGroupingPackedLayout layout_ = MoEGroupingPackedLayout::WideFloor8;
 };
 }

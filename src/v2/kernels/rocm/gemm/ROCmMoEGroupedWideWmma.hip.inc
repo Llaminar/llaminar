@@ -5,7 +5,10 @@
  * Included inside grouped_wmma_detail by its sole native translation unit.
  * Sparse experts retain one output column per thread and twelve/sixteen ordered
  * rows. Dense experts distribute native column chunks across separate blocks.
- * Cold experts use every fourth block, returning before any shared publication. The sealed row plan owns both directory offsets and arithmetic choice;
+ * Ordinary wide work uses every fourth block for cold experts. The bounded
+ * column layout instead encodes native quadrants in compact directory words,
+ * retains coarse column grids and uses GU4/down12 cold rows. The sealed row
+ * plan owns both directory offsets and arithmetic choice;
  * each branch keeps the original source partitions and contribution helpers.
  * Mutually exclusive LDS staging shares one union. No tile loop or packet copy
  * through a device helper extends the projection argument lifetime into scratch.
@@ -14,29 +17,43 @@
 /** @brief Preserve wide sparse geometry and native dense reuse in one captured leaf.
  * @tparam FMT Exact physical decoder. @tparam TwoRoles Gate/up versus down.
  * @tparam Adaptive Whether the ordered branch is reachable.
+ * @tparam ColumnDirectory Whether compact words own native column quadrants.
  * @param v Frozen bindings, sealed shared row plan and source partition authority. */
-template<NativeQuantisedGemmFormat FMT, bool TwoRoles, bool Adaptive>
+template<NativeQuantisedGemmFormat FMT, bool TwoRoles, bool Adaptive, bool ColumnDirectory=false>
 __global__ __launch_bounds__(TwoRoles ? 256 : 128) void wideProjection(MoEGroupedWmmaArguments v)
 {
 #if defined(__gfx1100__)
     static_assert(__builtin_amdgcn_is_invocable(__builtin_amdgcn_wmma_i32_16x16x16_iu8_w64));
     using Traits = NATIVE_QUANTISEDGemmTraits<FMT>;
-    constexpr int TM = TwoRoles ? 12 : 16, TN = TwoRoles ? 256 : 128, BN = TN / 4;
+    constexpr int TM = ColumnDirectory ? (TwoRoles ? 4 : 12) : (TwoRoles ? 12 : 16);
+    constexpr int TN = TwoRoles ? 256 : 128, BN = TN / 4;
     constexpr int BM = 16, KB = 2;
     constexpr int Sums = FMT == NATIVE_QUANTISED_GEMM_IQ1_M ? 4 :
         Traits::is_dual_scale_asym ? 2 : Traits::is_asymmetric ? 1 : 0;
     if (!v.admission.allows(ROCmMoEGroupedPrefillRouteStrategy::ExpertTiled)) return;
-    if (!v.dot_admission.rowPlan().isWide()) __builtin_trap();
+    if (!v.dot_admission.rowPlan().isWide() || v.dot_admission.rowPlan().isColumn()!=ColumnDirectory ||
+        (v.directory_layout==MoEGroupingPackedLayout::ColumnFloor8)!=ColumnDirectory) __builtin_trap();
     if (blockIdx.y >= static_cast<unsigned>(v.directory_capacity)) return;
     const uint32_t tile = v.directory[blockIdx.y];
     if (tile == UINT32_MAX) return;
-    const int expert = tile & moe_grouped_directory::kExpertMask;
-    const int first_row = tile >> moe_grouped_directory::kExpertBits;
+    const int expert = tile & (ColumnDirectory ? 255u : moe_grouped_directory::kExpertMask);
+    const int first_row = tile >> 10;
+    const int quadrant = ColumnDirectory ? (tile>>8)&3 : 0;
     if (expert >= v.experts) __builtin_trap();
     const int count = v.group_counts[expert], offset = v.group_offsets[expert];
     if (count <= first_row || offset < 0 ||
         static_cast<int64_t>(offset) + count > v.admission.activeSlots()) __builtin_trap();
+    if constexpr(ColumnDirectory) {
+        const auto interval=moe_grouped_directory::ColumnFloor8OffsetSlots::bind(count,offset,v.directory_capacity);
+        if(!interval.owns(tile,expert,blockIdx.y))__builtin_trap();
+        // GU needs rows0/4 for cold counts5..7. Down12 owns the whole cold
+        // expert at row0. Authenticate the row4 word before skipping it.
+        if constexpr(!TwoRoles)if(count<8 && first_row!=0)return;
+    }
     const auto desc = TwoRoles && blockIdx.z ? v.second_descriptors[expert] : v.descriptors[expert];
+    if constexpr(ColumnDirectory)
+        if(desc.codebook_id!=FMT || !desc.source_identity_present || !desc.source_is_superblock ||
+            desc.source_codebook_id!=(TwoRoles ? 13 : 4))__builtin_trap();
     if (desc.codebook_id != FMT) return;
     if (!desc.payload || !desc.scales || desc.n != v.n || desc.k != v.k ||
         desc.blocks_per_row != static_cast<uint32_t>(v.k / 32) ||
@@ -61,7 +78,7 @@ __global__ __launch_bounds__(TwoRoles ? 256 : 128) void wideProjection(MoEGroupe
     // column tile per four blocks; the other three return uniformly before
     // source-row publication or any barrier. This preserves disjoint writers
     // for partial column tails without serializing hot column chunks.
-    if constexpr (Adaptive)
+    if constexpr (Adaptive && !ColumnDirectory)
         if (producer == MoEGroupedDotProducer::OrderedDot4 && blockIdx.x % 4 != 0) return;
     const int step = v.dot_admission.rowPlan().rows(count);
     if (step != (producer == MoEGroupedDotProducer::Wmma ? BM : TM) || first_row % step) __builtin_trap();
@@ -71,7 +88,7 @@ __global__ __launch_bounds__(TwoRoles ? 256 : 128) void wideProjection(MoEGroupe
         partitions > NativeQuantisedGroupedDecodePolicy::maximum_k_partitions) __builtin_trap();
     const int span = (blocks + partitions - 1) / partitions;
     const int tid = threadIdx.x, lane = tid % 64, wave = tid / 64;
-    const int macro_n = (blockIdx.x / 4) * TN;
+    const int macro_n = (ColumnDirectory ? blockIdx.x : blockIdx.x / 4) * TN;
     float *out = TwoRoles && blockIdx.z ? v.second_output : v.output;
 
     struct NativeStage
@@ -203,7 +220,7 @@ __global__ __launch_bounds__(TwoRoles ? 256 : 128) void wideProjection(MoEGroupe
     // Keep the canonical K/partition order while exposing independent columns
     // to the scheduler; the ordered branch above owns its wider column extent.
     {
-        const int n0 = blockIdx.x * BN;
+        const int n0 = ColumnDirectory ? macro_n + quadrant*BN : blockIdx.x * BN;
         float total[4] = {};
         for (int p = 0; p < partitions; ++p)
         {
