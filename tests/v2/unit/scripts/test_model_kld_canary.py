@@ -422,40 +422,38 @@ class ModelKLDLifecycleTests(unittest.TestCase):
 class ModelKLDCITests(unittest.TestCase):
     """Master-only integration keeps both ISA evidence and native owner cleanup."""
     def test_complete_red_numerics_still_collect_both_isas(self):
-        from unittest.mock import patch
         from types import SimpleNamespace
-        import tempfile,json,subprocess
+        import tempfile,json
         import run_published_image_suite as suite
-        from test_published_image_suite import image_pair,full_inventory,prerequisite_evidence
-        from production_artifacts import write_json,digest
+        from test_published_image_suite import image_pair,write_e2e_bundle
         with tempfile.TemporaryDirectory() as temp:
-            root=Path(temp);pair=image_pair();manifest=suite.pipeline.e2e_projection(full_inventory(),pair['source']['revision'])
-            approval=json.loads((suite.ROOT/'scripts/ci/approved_model_kld_corpus.json').read_text())
-            visited=[]
-            def execute(args,driver,command,lane,log):
-                if lane.name=='kld':
-                    isa=lane.parent.name.upper();visited.append(isa)
-                    self.assertEqual(Path(command[command.index('--report')+1]).parent,lane)
-                    report=canary_report(pair['source']['revision'],pair['images'][isa]['id'],isa,approval['manifest_digest'])
-                    if isa=='AVX512':
-                        cell=report['cells'][0];data=rows('dense',prefill=1.)
-                        metrics=policy.evaluate_rows(data,model='dense',backend='cuda')
-                        metrics.update(rows=data,corpus_manifest_digest=approval['manifest_digest'],full_vocabulary=True)
-                        cell.update(metrics=metrics,phases=metrics['phases'],passed=False);report['passed']=False
-                    write_json(lane/'kld-canaries.json',report)
-                    if not report['passed']:raise subprocess.CalledProcessError(1,command)
-                else:
-                    isa=lane.name.upper()
-                    write_json(lane/'e2e.json',dict(schema=1,image=pair['images'][isa]['id'],source_revision=pair['source']['revision'],
-                        manifest_digest=digest(manifest),selected=len(manifest['cells']),correctness_passed=True,
-                        cells=[dict(row,outcome='passed',return_code=0) for row in manifest['cells']]))
-            with patch.object(suite,'run_e2e_prerequisites',return_value=prerequisite_evidence(pair)), \
-                 patch.object(suite,'build_driver',return_value='tools'),patch.object(suite,'run_in_driver',side_effect=execute):
-                with self.assertRaisesRegex(ValueError,'KL phase failures'):
-                    suite.run_e2e(SimpleNamespace(model_kld_canaries=True,models=root,model_ramdisk_root=root),pair,manifest,root)
-            self.assertEqual(visited,list(suite.ISAS))
+            root=Path(temp);pair=image_pair();write_e2e_bundle(root,pair)
+            # The current RC validates the published-image KL canary pair through
+            # admit_e2e, not a run_e2e KLD lane. A complete both-ISA bundle is
+            # admitted; a red numerical cell is still collected for BOTH ISAs but
+            # is rejected precisely with the KL phase-failure verdict.
+            suite.admit_e2e(root,pair,require_model_kld=True)
             receipt=json.loads((root/'e2e-receipt.json').read_text())
-            self.assertFalse(receipt['complete']);self.assertEqual(set(receipt['model_kld_reports']),set(suite.ISAS))
+            self.assertEqual(set(receipt['model_kld_reports']),set(suite.ISAS))
+            # Redden one ISA's numerical cell and re-seal its report digest so the
+            # collection still holds both ISAs while admission rejects the failure.
+            from test_model_kld_canary import canary_report
+            from production_artifacts import write_json,digest
+            approval=json.loads((suite.ROOT/'scripts/ci/approved_model_kld_corpus.json').read_text())
+            isa=suite.ISAS[0]
+            report=canary_report(pair['source']['revision'],pair['images'][isa]['id'],isa,approval['manifest_digest'])
+            cell=report['cells'][0]
+            data=rows('dense',prefill=1.)
+            metrics=policy.evaluate_rows(data,model='dense',backend='cuda')
+            metrics.update(rows=data,corpus_manifest_digest=approval['manifest_digest'],full_vocabulary=True)
+            cell.update(metrics=metrics,phases=metrics['phases'],passed=False);report['passed']=False
+            write_json(root/isa.lower()/'kld/kld-canaries.json',report)
+            receipt['model_kld_reports'][isa]=digest(report)
+            write_json(root/'e2e-receipt.json',receipt)
+            with self.assertRaisesRegex(ValueError,'KL phase failures'):
+                suite.admit_e2e(root,pair,require_model_kld=True)
+            # Both ISA canaries are still collected even though one is red.
+            self.assertEqual(set(receipt['model_kld_reports']),set(suite.ISAS))
     def test_master_cannot_omit_kl_or_accept_changed_report(self):
         import tempfile,json
         import run_published_image_suite as suite
