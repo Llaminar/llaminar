@@ -637,7 +637,7 @@ deduplication alone cannot distinguish QKV, GDN and selected LM-head work.
 | Attention QKV or K/V-only | Actual unequal-width `FusedQKVGEMMStage` with independent prepared owners | Actual-Automatic confirmation, focused gates and64 geometry profiles pass; QueryInterval slicing excludes retained MTP |
 | Attention output | `GEMMStage` verifier path and Wo serial-byte tests | Source-owned output geometry and TP partition |
 | Gate/up through SwiGLU/down | `FusedGateUpGEMMStage` and public SwiGLU/down adapters | Connected captured operation with shared quantization and epilogues |
-| GDN projections | `GDNProjectionCaptureHarness` | Complete four-source stage timing, retaining floating controls |
+| GDN projections | New actual `GDNProjectionStage` transaction fixture with independent prepared owners | All43 Release cases, three Integration gates and630 forced timing cells pass; complete-identity Automatic admission and profiles remain |
 | Shared expert FFN | Actual shared-stage owner above | Qualified through gate/add and verifier-router Q8 handoff;368 profiles complete; residual sparse overhead remains visible |
 | Selected LM-head | `HiddenStateRowsSelectStage` through `LMHeadStage` | Selection-plus-head boundary and original vocabulary/row ownership |
 
@@ -650,6 +650,29 @@ admission. Reuse the complete-operation event/poison/serial mechanics in
 singleton projection/SwiGLU only. Merely timing low-level bundle enums that
 reuse one matrix would not qualify distinct production sources. Automatic's
 multi-output and `ProjectionRowWork` exclusions remain until this proof exists.
+
+See the [complete GDN proof](GFX1100_MTP_GDN_VERIFIER.md) for the four-source
+SingleQ8/TwoTermQ8 fixture, independent M1 contract and work-size crossovers.
+
+## Connected dense FFN boundary
+
+The actual ordinary dense builder in `QwenGraphBase.cpp` records
+`FusedGateUpGEMMStage` followed by `GEMMStage` with `gate_input`, fused SwiGLU,
+alpha1/beta0 and the same original verifier rows. The installed
+Qwen3.8-27B GGUF directory supplies hidden5120/FFN17408 and original IQ4_XS
+weights: gate/up N17408/K5120 twice, down N5120/K17408. Source4/superblock and
+physical24 remain distinct. Ordinary dense FFN uses SingleQ8; QFN HC-up
+TwoTerm belongs to a different residual-mixer path.
+
+The next complete component should retain normalized input → gate/up → fused
+SwiGLU/down → branch output, using three independent `makeGpuPreparedFFNFixture`
+owners and one merged persistent workspace per owner. Compare gate/up and final
+bytes to complete independent M1 rows, with dirty prefixes, reset and separate
+producer omissions. The qualified `SharedExpertFFNStage` is a different owner
+and does not certify this chain. Gate/up needs its own complete original-source
+identity; it must not borrow `AttentionKV`. Existing scalar SwiGLU Automatic may
+already admit down, so measure the current Automatic chain as well as forced
+Dot4/WMMA before claiming an incremental production gain.
 
 ## Verifier router economy and attention arithmetic
 

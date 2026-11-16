@@ -20947,6 +20947,24 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;QKV;GraphCapture;ByteExact;Replay;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
+    # Complete GDN owns two native sources and two original prepared-half controls.
+    add_executable(v2_integration_rocm_gdn_verifier_transaction
+        integration/kernels/rocm/Test__ROCmGDNVerifierTransaction.cpp)
+    target_link_libraries(v2_integration_rocm_gdn_verifier_transaction
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    foreach(gdn_precision SingleQ8 TwoTermQ8)
+        add_v2_test(V2_Integration_ROCmGDNVerifier${gdn_precision}Replay
+            COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_verifier_transaction>
+                --gtest_filter=AllSources/ROCmGDNVerifierTransaction.${gdn_precision}Replay/*
+            LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;GDN;AllFormats;GraphCapture;ByteExact;Replay;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 180)
+    endforeach()
+    add_v2_test(V2_Integration_ROCmGDNVerifierMixedReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_verifier_transaction>
+            --gtest_filter=ROCmGDNVerifierMixed.IndependentSourcesReplay
+        LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;GDN;GraphCapture;ByteExact;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+
     add_executable(v2_integration_rocm_device_counted_verifier_rows
         integration/kernels/rocm/Test__ROCmDeviceCountedVerifierRows.cpp)
     target_link_libraries(v2_integration_rocm_device_counted_verifier_rows
@@ -38940,6 +38958,9 @@ if(HAVE_ROCM)
         V2_Integration_ROCmQKVVerifierMoEFullAutomaticReplay
         V2_Integration_ROCmQKVVerifierMoELocalTP4AutomaticReplay
         V2_Integration_ROCmQKVVerifierAutomaticExclusionsReplay
+        V2_Integration_ROCmGDNVerifierSingleQ8Replay
+        V2_Integration_ROCmGDNVerifierTwoTermQ8Replay
+        V2_Integration_ROCmGDNVerifierMixedReplay
         V2_Integration_ROCmSharedVerifierTransactionReplay
         V2_Integration_ROCmSharedVerifierPolicyReplay
         V2_Integration_ROCmVerifierAttentionWmmaReplay
