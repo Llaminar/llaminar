@@ -475,7 +475,7 @@ class ModelKLDCITests(unittest.TestCase):
         import run_published_image_suite as suite
         with tempfile.TemporaryDirectory() as temp:
             root=Path(temp);(root/'cache').mkdir();lane=root/'kld';lane.mkdir();socket=root/'docker.sock';socket.touch()
-            args=SimpleNamespace(output=root,models=root,model_ramdisk_root=root,e2e_bundle=None,suite='e2e',model_kld_canaries=True)
+            args=SimpleNamespace(output=root,models=root,model_ramdisk_root=root,e2e_bundle=None,suite='accuracy')
             with patch.dict(suite.os.environ,{'DOCKER_HOST':'unix://'+str(socket)}),patch.object(suite.docker_paths,'device_args',return_value=[]),patch.object(suite.docker_paths,'mounts',return_value=[]),patch.object(suite.pipeline,'run',side_effect=KeyboardInterrupt) as run,patch.object(suite,'retire_coding_children') as retire,patch.object(suite,'restore_lane_ownership'):
                 with self.assertRaises(KeyboardInterrupt):suite.run_in_driver(args,'tools',['python','canary.py'],lane,'kld.log')
             command=run.call_args.args[0];owner=command[command.index('--name')+1]

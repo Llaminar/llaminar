@@ -397,10 +397,12 @@ def run_in_driver(args, driver: str, command: list[str], lane: Path, log: str) -
     coding = getattr(args, 'suite', None) == 'opencode'
     # Numerical observers (accuracy panels, coding drivers and the model-KLD
     # canaries) also create sibling runtime containers. Reuse the existing
-    # exact-owner retirement protocol, including driver cancellation.
+    # exact-owner retirement protocol, including driver cancellation. The
+    # model-KLD canaries belong to the accuracy suite, so no separate
+    # compatibility flag is needed; a production runner always selects an
+    # explicit suite (preflight, e2e, accuracy, benchmarks or opencode).
     owned = (coding
-             or getattr(args, 'suite', None) == 'accuracy'
-             or getattr(args, 'model_kld_canaries', False))
+             or getattr(args, 'suite', None) == 'accuracy')
     launch = ["docker", "run", "--rm", "--init", "--name", name,
         *docker_paths.device_args(driver, "CPU+CUDA+ROCm", user=f"{cache_uid}:{lane_stat.st_gid}"),
         # The cache-owning non-root driver delegates only kernel-log reads to
