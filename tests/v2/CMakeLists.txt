@@ -6811,7 +6811,8 @@ add_v2_test(V2_Integration_BenchmarkGeometrySelection
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
 add_executable(v2_test_verifier_projection_bundle
-    unit/kernels/Test__VerifierProjectionBundle.cpp)
+    unit/kernels/Test__VerifierProjectionBundle.cpp
+    unit/kernels/Test__VerifierGDNBundle.cpp)
 target_link_libraries(v2_test_verifier_projection_bundle
     llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_VerifierProjectionBundle
@@ -6820,7 +6821,8 @@ add_v2_test(V2_Unit_VerifierProjectionBundle
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 if(HAVE_ROCM)
     add_executable(v2_test_rocm_verifier_bundle_policy
-        unit/kernels/rocm/Test__ROCmVerifierBundlePolicy.cpp)
+        unit/kernels/rocm/Test__ROCmVerifierBundlePolicy.cpp
+        unit/kernels/rocm/Test__ROCmGDNVerifierPolicy.cpp)
     target_link_libraries(v2_test_rocm_verifier_bundle_policy
         llaminar2_core GTest::gtest GTest::gtest_main)
     add_v2_test(V2_Unit_ROCmVerifierBundlePolicy
@@ -20951,7 +20953,7 @@ if(HAVE_ROCM)
     add_executable(v2_integration_rocm_gdn_verifier_transaction
         integration/kernels/rocm/Test__ROCmGDNVerifierTransaction.cpp)
     target_link_libraries(v2_integration_rocm_gdn_verifier_transaction
-        llaminar2_core GTest::gtest GTest::gtest_main)
+        llaminar2_core GTest::gtest GTest::gtest_main rocprofiler-sdk-roctx::rocprofiler-sdk-roctx)
     foreach(gdn_precision SingleQ8 TwoTermQ8)
         add_v2_test(V2_Integration_ROCmGDNVerifier${gdn_precision}Replay
             COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_verifier_transaction>
@@ -20959,6 +20961,18 @@ if(HAVE_ROCM)
             LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;GDN;AllFormats;GraphCapture;ByteExact;Replay;Regression"
             MPI_PROCS 1 NO_MODELS TIMEOUT 180)
     endforeach()
+    foreach(gdn_precision SingleQ8 TwoTermQ8)
+        add_v2_test(V2_Integration_ROCmGDNVerifier${gdn_precision}AutomaticReplay
+            COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_verifier_transaction>
+                --gtest_filter=AllSources/ROCmGDNVerifierTransaction.${gdn_precision}AutomaticReplay/*
+            LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;GDN;AllFormats;GraphCapture;ByteExact;Replay;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 180)
+    endforeach()
+    add_v2_test(V2_Integration_ROCmGDNVerifierAutomaticBoundariesReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_verifier_transaction>
+            --gtest_filter=ROCmGDNVerifierAutomatic.*
+        LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;GDN;GraphCapture;ByteExact;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     add_v2_test(V2_Integration_ROCmGDNVerifierMixedReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_verifier_transaction>
             --gtest_filter=ROCmGDNVerifierMixed.IndependentSourcesReplay
@@ -38930,12 +38944,22 @@ add_v2_test(V2_Integration_VerifierProjectionBundleReplay
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;QKV;Regression;Replay"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_VerifierProjectionBundleReplay)
+add_v2_test(V2_Integration_VerifierGDNBundleReplay
+    COMMAND $<TARGET_FILE:v2_test_verifier_projection_bundle> --gtest_filter=VerifierGDNBundle.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;GDN;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_VerifierGDNBundleReplay)
 if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmVerifierBundlePolicyReplay
         COMMAND $<TARGET_FILE:v2_test_rocm_verifier_bundle_policy>
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;QKV;Regression;Replay"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierBundlePolicyReplay)
+    add_v2_test(V2_Integration_ROCmGDNVerifierPolicyReplay
+        COMMAND $<TARGET_FILE:v2_test_rocm_verifier_bundle_policy> --gtest_filter=ROCmGDNVerifierPolicy.*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;GDN;Regression;Replay"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGDNVerifierPolicyReplay)
 endif()
 
 # New native-Q8 evidence controls run in the existing exact evidence owner.
@@ -38961,6 +38985,9 @@ if(HAVE_ROCM)
         V2_Integration_ROCmGDNVerifierSingleQ8Replay
         V2_Integration_ROCmGDNVerifierTwoTermQ8Replay
         V2_Integration_ROCmGDNVerifierMixedReplay
+        V2_Integration_ROCmGDNVerifierSingleQ8AutomaticReplay
+        V2_Integration_ROCmGDNVerifierTwoTermQ8AutomaticReplay
+        V2_Integration_ROCmGDNVerifierAutomaticBoundariesReplay
         V2_Integration_ROCmSharedVerifierTransactionReplay
         V2_Integration_ROCmSharedVerifierPolicyReplay
         V2_Integration_ROCmVerifierAttentionWmmaReplay

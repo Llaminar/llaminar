@@ -153,6 +153,8 @@ private:
 /** @brief Resolve measured full-extent bundle keys without querying hardware or live rows.
  * @param operation Complete source/shape/operation identity. @return Whether its original M has qualified native timing. */
 [[nodiscard]] bool measuredNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOperation &operation) noexcept;
+/** @return Whether this worker has a complete native GDN binding; no tensor headers enter HIP code. */
+[[nodiscard]] bool hasNativeQuantisedGDNVerifier() noexcept;
 /** @brief First-class grouped implementations; Automatic retains qualified selection. */
 enum class NativeQuantisedVerifierCandidate { Automatic, Dot4, WmmaM16N64 };
 /** @brief Construction-only selection bound to one authenticated device. */

@@ -13,6 +13,8 @@
 #include "ROCmVNNIPrefillLaunch.h"
 #include "ROCmNativeQuantisedWmmaLaunch.h"
 #include "ROCmNativeQuantisedVerifierLaunch.h"
+#include "ROCmNativeQuantisedGDNVerifier.h"
+#include "kernels/common/VerifierGDNBundle.h"
 #include "kernels/common/ProjectionWorkLaunch.h"
 #include "kernels/common/VerifierProjectionBundle.h"
 #include "ROCmNativeQuantisedArchitecture.h"
@@ -357,32 +359,35 @@ ScopedNativeQuantisedVerifierBundle::~ScopedNativeQuantisedVerifierBundle()
 const NativeQuantisedVerifierBundleOperation *ScopedNativeQuantisedVerifierBundle::current() noexcept
 { return active_ && active_->operation_ ? &*active_->operation_ : nullptr; }
 
-bool matchesNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOperation &operation,
-    const NativeQuantisedVerifierWork &work, int device) noexcept
+namespace
 {
-    const int expected = operation.kind == VerifierProjectionBundleKind::AttentionQKV ? 3 :
-        operation.kind == VerifierProjectionBundleKind::AttentionKV ? 2 : 0;
-    if (!expected || operation.count != expected || operation.device != device || operation.k != work.k ||
+/** @brief Shared packet authentication; complete operations own their own role eligibility. */
+bool matchesVerifierMembers(std::span<const NativeQuantisedVerifierBundleMember> members,
+    int original_device,int k,const DeviceRowRange &rows,const int8_t *activations,
+    const float *activation_scales,const int32_t *activation_sums,
+    const NativeQuantisedVerifierWork &work,int device) noexcept
+{
+    if (members.empty() || members.size() > NATIVE_QUANTISED_SMALL_M_MAX_BATCH || original_device != device || k != work.k ||
         work.rows.physicalRows() < 2 || work.rows.physicalRows() > 16 ||
-        operation.rows.captureIdentity() != work.rows.captureIdentity() ||
+        rows.captureIdentity() != work.rows.captureIdentity() ||
         work.policy != NativeQuantisedVerifierPolicyMatch::CanonicalSerial || !work.bundle ||
-        !operation.activations || !operation.activation_scales || !operation.activation_sums ||
-        operation.activations != work.activations || operation.activation_scales != work.activation_scales ||
-        operation.activation_sums != work.activation_sums || work.projections < 1 || work.projections > expected)
+        !activations || !activation_scales || !activation_sums ||
+        activations != work.activations || activation_scales != work.activation_scales ||
+        activation_sums != work.activation_sums || work.projections < 1 || work.projections > static_cast<int>(members.size()))
         return false;
     const auto &packet = *work.bundle;
     if (packet.num_projections != work.projections || packet.rows.captureIdentity() != work.rows.captureIdentity() ||
         packet.work.captureIdentity() != ProjectionRowWork::fromPrefix(work.rows).captureIdentity() ||
         packet.payload[0] != work.weights || packet.N[0] != work.n || packet.codebook[0] != work.physical_codebook)
         return false;
-    for (int member = 0; member < expected; ++member)
+    for (int member = 0; member < static_cast<int>(members.size()); ++member)
     {
-        const auto &original = operation.members[member];
+        const auto &original = members[member];
         if (!original.weights || !original.scales || !original.output || original.n <= 0 ||
             !original.source.present || canonicalDeviceVnniCodebookId(original.source) == 255)
             return false;
         for (int earlier = 0; earlier < member; ++earlier)
-            if (operation.members[earlier].output == original.output) return false;
+            if (members[earlier].output == original.output) return false;
     }
     unsigned seen = 0;
     int previous_member = -1;
@@ -390,9 +395,9 @@ bool matchesNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOpe
     {
         if (packet.bias[projection]) return false;
         int match = -1;
-        for (int member = 0; member < expected; ++member)
+        for (int member = 0; member < static_cast<int>(members.size()); ++member)
         {
-            const auto &original = operation.members[member];
+            const auto &original = members[member];
             if (packet.output[projection] == original.output && packet.payload[projection] == original.weights &&
                 packet.N[projection] == original.n && packet.scales[projection] == original.scales &&
                 packet.mins[projection] == original.mins && packet.emins[projection] == original.emins &&
@@ -404,6 +409,58 @@ bool matchesNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOpe
         previous_member = match;
     }
     return true;
+}
+
+/** @brief Validate both quantized roles and distinct outputs before considering a subgroup. */
+bool validGDNOperation(const NativeQuantisedGDNVerifierOperation &operation) noexcept
+{
+    if(operation.device<0 || !operation.input || operation.k<1) return false;
+    if(operation.precision==QuantizedActivationOperandPrecision::TwoTermQ8) {
+        if(!operation.correction_rows || operation.correction_rows->captureIdentity()!=operation.rows.captureIdentity())return false;
+    } else if(operation.precision!=QuantizedActivationOperandPrecision::SingleQ8 || operation.correction_rows)return false;
+    for(const auto *member:{&operation.qkv,&operation.z})
+        if(!member->weights || !member->scales || !member->output || member->n<1 ||
+            !member->source.present || canonicalDeviceVnniCodebookId(member->source)==255)return false;
+    for(const auto *control:{&operation.alpha,&operation.beta})
+        if(!control->engine || !control->weights.valid() || control->weights.k!=operation.k || !control->output ||
+            control->weights.type!=TensorType::FP16 || control->precision!=FloatingActivationOperandPrecision::FP16RNE)return false;
+    const std::array outputs{operation.qkv.output,operation.z.output,operation.alpha.output,operation.beta.output};
+    for(size_t i=0;i<outputs.size();++i)for(size_t j=0;j<i;++j)if(outputs[i]==outputs[j])return false;
+    return true;
+}
+}
+
+bool matchesNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOperation &operation,
+    const NativeQuantisedVerifierWork &work,int device) noexcept
+{
+    const int expected=operation.kind==VerifierProjectionBundleKind::AttentionQKV?3:
+        operation.kind==VerifierProjectionBundleKind::AttentionKV?2:0;
+    return expected && operation.count==expected && matchesVerifierMembers(
+        std::span(operation.members).first(expected),operation.device,operation.k,operation.rows,
+        operation.activations,operation.activation_scales,operation.activation_sums,work,device);
+}
+
+thread_local const ScopedNativeQuantisedGDNVerifier *ScopedNativeQuantisedGDNVerifier::active_=nullptr;
+ScopedNativeQuantisedGDNVerifier::ScopedNativeQuantisedGDNVerifier(
+    std::optional<NativeQuantisedGDNVerifierOperation> operation) noexcept
+    :operation_(std::move(operation)),previous_(active_) {active_=this;}
+ScopedNativeQuantisedGDNVerifier::~ScopedNativeQuantisedGDNVerifier()
+{if(active_!=this)std::terminate();active_=previous_;}
+const NativeQuantisedGDNVerifierOperation *ScopedNativeQuantisedGDNVerifier::current() noexcept
+{return active_ && active_->operation_?&*active_->operation_:nullptr;}
+
+bool hasNativeQuantisedGDNVerifier() noexcept
+{return ScopedNativeQuantisedGDNVerifier::current()!=nullptr;}
+
+bool matchesNativeQuantisedGDNVerifier(const NativeQuantisedGDNVerifierOperation &operation,
+    const NativeQuantisedVerifierWork &work,int device) noexcept
+{
+    if(!validGDNOperation(operation))return false;
+    const std::array members{operation.qkv,operation.z};
+    const auto eligible=std::span(members).subspan(
+        operation.precision==QuantizedActivationOperandPrecision::TwoTermQ8?1:0);
+    return matchesVerifierMembers(eligible,operation.device,operation.k,operation.rows,
+        operation.activations,operation.activation_scales,operation.activation_sums,work,device);
 }
 
 namespace
@@ -524,6 +581,38 @@ bool measuredNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOp
     return false;
 }
 
+namespace
+{
+/** @brief Source-specific complete GDN masks; columns preserve QKV arithmetic. */
+struct GDNVerifierMeasuredWidths
+{
+    NativeQuantisedSourceIdentity source;
+    std::array<uint16_t,2> rows;
+};
+#include "ROCmNativeQuantisedGDNVerifierPolicy.inc"
+static_assert([] {
+    for(size_t i=0;i<kGDNVerifierMeasuredWidths.size();++i) {
+        const auto &entry=kGDNVerifierMeasuredWidths[i];
+        if(!entry.source.present || canonicalDeviceVnniCodebookId(entry.source)==255)return false;
+        for(auto mask:entry.rows)if(mask & 0x8000u)return false;
+        for(size_t j=0;j<i;++j)if(entry.source==kGDNVerifierMeasuredWidths[j].source)return false;
+    }
+    return true;
+}(),"Complete GDN masks require unique source identities and widths M2..16");
+}
+
+bool measuredNativeQuantisedGDNVerifier(const NativeQuantisedGDNVerifierOperation &operation) noexcept
+{
+    const int m=operation.rows.physicalRows();
+    if(m<2 || m>16 || !validGDNOperation(operation) || operation.k!=2560 ||
+        operation.qkv.n!=10240 || operation.z.n!=6144 || operation.alpha.weights.n!=48 ||
+        operation.beta.weights.n!=48 || operation.qkv.source!=operation.z.source)return false;
+    const int mode=operation.precision==QuantizedActivationOperandPrecision::TwoTermQ8?1:0;
+    for(const auto &entry:kGDNVerifierMeasuredWidths)
+        if(entry.source==operation.qkv.source)return (entry.rows[mode] & (uint16_t{1}<<(m-2)))!=0;
+    return false;
+}
+
 NativeQuantisedVerifierCandidate nativeQuantisedVerifierProducer(
     int device, bool decode_equivalent, const NativeQuantisedVerifierWork &work)
 {
@@ -546,9 +635,17 @@ NativeQuantisedVerifierCandidate nativeQuantisedVerifierProducer(
             nativeQuantisedHardwareForDevice(device).architecture == native_quantised::NativeQuantisedArchitecture::rocm(11,0,0);
         return qualified ? NativeQuantisedVerifierCandidate::WmmaM16N64 : NativeQuantisedVerifierCandidate::Dot4;
     }
+    if (const auto *gdn = ScopedNativeQuantisedGDNVerifier::current())
+    {
+        const bool qualified = decode_equivalent && !currentProjectionRowWork(work.rows.physicalRows()) &&
+            ScopedCapturedVerifierExtent::current().matches(DeviceId::rocm(device),work.rows) &&
+            matchesNativeQuantisedGDNVerifier(*gdn,work,device) && measuredNativeQuantisedGDNVerifier(*gdn) &&
+            nativeQuantisedHardwareForDevice(device).architecture == native_quantised::NativeQuantisedArchitecture::rocm(11,0,0);
+        return qualified ? NativeQuantisedVerifierCandidate::WmmaM16N64 : NativeQuantisedVerifierCandidate::Dot4;
+    }
     // An unmeasured original bundle cannot gain scalar eligibility by splitting
     // into a same-shaped singleton subgroup or by failing provenance admission.
-    if (ScopedVerifierProjectionBundle::current()) return NativeQuantisedVerifierCandidate::Dot4;
+    if (ScopedVerifierProjectionBundle::current() || ScopedVerifierGDNBundle::current()) return NativeQuantisedVerifierCandidate::Dot4;
     const auto operation = ScopedNativeQuantisedVerifierOperation::current();
     const int m = work.rows.physicalRows();
     if (!decode_equivalent || !operation || m < 2 || m > 16 || work.projections != 1 ||

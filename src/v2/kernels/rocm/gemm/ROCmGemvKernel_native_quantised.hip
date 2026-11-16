@@ -6461,13 +6461,26 @@ bool rocmLaunch_native_quantised_small_m_fp32(
     }
     if (kb < 1) kb = 1;
 
+    // A standalone Z leaf still belongs to the complete four-role GDN
+    // operation. Preserve its original packet and Q8 publication before tiling
+    // so it can authenticate the same roles as a batched subgroup.
+    NativeQuantisedSmallMBatchedArgs original_packet{.rows=rows,
+        .work=llaminar2::projectionWorkForLaunch(M,row_range)};
+    original_packet.num_projections=1; original_packet.total_grid_n=grid_n;
+    original_packet.N[0]=N; original_packet.grid_offsets[1]=grid_n;
+    original_packet.payload[0]=d_payload; original_packet.scales[0]=d_block_scales;
+    original_packet.mins[0]=d_block_mins; original_packet.emins[0]=d_block_emins;
+    original_packet.output[0]=d_C_fp32; original_packet.partial[0]=d_partial_fp32;
+    original_packet.codebook[0]=static_cast<uint8_t>(FMT);
     const auto verifier_candidate = llaminar2::rocm::nativeQuantisedVerifierProducer(
         device_id, decode_equivalent, {rows, d_payload, N, K, 1, static_cast<uint8_t>(FMT),
         generated_cfg.has_generated && explicit_kb_override <= 0 && explicit_waves_override <= 0 &&
         kb == generated_cfg.kb && target_waves_per_cu == generated_cfg.target_waves_per_cu &&
         (g_native_quantised_serial_partition_n <= 0 || g_native_quantised_serial_partition_n == N)
             ? llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::CanonicalSerial
-            : llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::Unmeasured});
+            : llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::Unmeasured,
+        llaminar2::rocm::hasNativeQuantisedGDNVerifier()?&original_packet:nullptr,
+        d_A_int8,d_scale_A_blockwise,d_sum_A_blockwise});
     const bool wmma = verifier_candidate != llaminar2::rocm::NativeQuantisedVerifierCandidate::Dot4;
 
     if (kb > 1 && !d_partial_fp32)
@@ -7085,7 +7098,8 @@ bool rocmLaunch_native_quantised_small_m_batched_mixed_fp32(
 
     // Equal K partitions alone do not authenticate a complete subgroup's
     // performance policy: every member must also own the actual wave target.
-    bool canonical_members = llaminar2::rocm::ScopedNativeQuantisedVerifierBundle::current() &&
+    bool canonical_members = (llaminar2::rocm::ScopedNativeQuantisedVerifierBundle::current() ||
+        llaminar2::rocm::hasNativeQuantisedGDNVerifier()) &&
         generated_cfg.has_generated && api_kb_override <= 0 && api_waves_override <= 0 &&
         rocm_env.native_quantised_gemv_kb <= 0 && rocm_env.native_quantised_gemv_target_waves <= 0;
     canonical_members = canonical_members && llaminar2::rocm::matchesNativeQuantisedVerifierSerialPolicies(

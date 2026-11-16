@@ -1,11 +1,14 @@
 # Grouped verifier attention: lane-exact gfx1100 WMMA
 
-This is an implementation and proof record, not a tuning dashboard. The current
-candidate is explicit-only: Automatic still selects the ordered decode producer.
-The ordinary M512 prefill attention result does not qualify grouped MTP decode.
-The four-query candidate from3dd802ba2 is the baseline below. The retained
-single-row/head candidate and earlier experiments follow it; none has yet qualified
-an Automatic domain.
+The bounded FP16/HD256 grouped-attention experiment is complete with a negative
+economy result. Automatic retains Dot2; the lane-exact WMMA implementation stays
+an explicit diagnostic candidate. It lost every one of2,790 paired samples in
+the90-cell final panel. This does not assert impossibility for future workloads.
+The ordinary M512 prefill attention dispatch remains separately qualified.
+
+This is an implementation and proof record, not a tuning dashboard. The
+four-query candidate from3dd802ba2 is the baseline below; the retained
+single-row/head candidate and earlier experiments follow it.
 
 ## Four-row baseline arithmetic and ownership
 
@@ -28,7 +31,7 @@ Equal split starts/ring mappings with four original waves share a 16-key tile.
 Otherwise a union of each row/wave's next key retains its original traversal.
 This preserves unequal row lengths and split boundaries without host metadata,
 additional persistent workspace, allocations or recapture. Explicit unsupported
-native requests fail admission; Automatic does not enter the candidate yet.
+native requests fail admission; Automatic does not enter the candidate.
 
 ## Captured production proof
 
@@ -250,8 +253,8 @@ the source, binary and eight exact producer profiles are in
 
 The smaller bank permits two resident blocks and measured occupancy rises to
 43.49%, with zero LDS conflicts. However, the anchor's L2 hit rate falls to
-53.16% and fetch traffic is1,049,417KB; the committed four-query/staged-key
-anchor reported81.74% and527,008KB. The comparison changes both tile and input
+53.16% and fetch traffic is1,049,417 KiB; the committed four-query/staged-key
+anchor reported81.74% and527,008 KiB. The comparison changes both tile and input
 staging, so it does not isolate the cause of the traffic increase.
 
 A controlled traversal experiment folded query tiles into grid.x so adjacent
@@ -260,7 +263,7 @@ unchanged. The90-cell timing panel still won no Dot2 comparisons; its geometric
 mean ratio was0.640721. Relative to the eight-query traversal, aggregate native
 latency was unchanged (old/new geometric mean0.998768), while the M16/H16/KV2
 64-key case regressed from83.33us to103.48us. At the64K anchor, L2 hit rate rose
-from53.16% to75.03% and fetch traffic fell from1,049,417KB to180,339KB. That83%
+from53.16% to75.03% and fetch traffic fell from1,049,417 KiB to180,339 KiB. That83%
 traffic reduction without an aggregate latency gain does not support fetch
 traffic as the main limiter in this anchor. The traversal change was rejected;
 the eight-query source was restored. Evidence is
@@ -320,8 +323,9 @@ case takes14.208ms versus9.278ms for Dot2. Fixed-query32K→64K growth is
 
 The simpler single-row layout is retained as the explicit candidate. Automatic
 continues selecting Dot2. Correctness, reduced register pressure and linear
-scaling do not establish a profitable WMMA domain; grouped-attention economy
-remains open while the next implementation slice qualifies routed/shared MTP.
+scaling do not establish a profitable WMMA domain. The bounded grouped-attention
+tuning item is closed with Dot2 selected for this measured domain. Further native
+experiments require a new workload or a concrete change in the amount of work.
 
 After correcting the resource assertion, all five affected feature registrations
 pass all29 GTests without skips in
@@ -331,10 +335,38 @@ thread controls, exceptional values and timing-owner replay are green together.
 
 All eight exact producer counter passes complete with positive activity and
 source/binary bindings to the unprofiled timing panel. At M16/H16/KV2/64K,
-occupancy is66.69%, memory-unit busy67.72%, L2 hit rate50.25%, fetch2,100,962KB,
-wavefront count32,768, VALU instructions73,344.28 and LDS bank conflicts0.
+occupancy is66.69%, memory-unit busy67.72%, L2 hit rate50.25%, fetch2,100,962 KiB,
+wavefront count32,768, average vector-ALU instructions/wave73,344.28 and LDS
+bank conflicts0.
 The single-row grid doubles the CTA/wave count versus the eight-query grid;
 these resource improvements therefore do not imply less total work. Native
 private storage and reported memory spills remain zero. The complete source,
 Release core/executable, raw timing and eight profiles are frozen in
 `mtp-attention-wmma-one-row-snapshot/snapshot.json` (nine bound records).
+
+## Final bounded disposition and full-curve scaling audit
+
+The independent CPU audit rechecks all90 cell medians and2,790 paired samples:
+WMMA has zero pair wins, with Dot2/WMMA ratios0.622839–0.894187. Current candidate
+and performance-fixture sources still match the retained evidence. The complete
+snapshot authenticates94 files/nine records,29 no-skip feature GTests across five
+registrations, and eight exact-producer counter passes with zero scratch/spills.
+
+Across ten fixed-query/head geometries, ordinary least-squares fits to all nine
+retained KV medians through64K have positive slopes and minimum R²0.999892 for
+Dot2 and0.999771 for WMMA. Thus the growing-KV linear-scaling requirement is
+supported by each full measured curve, beyond the32K→64K endpoint ratio. Exact
+dense whole-prompt attention is not the workload claimed here.
+
+The audit is
+`/tmp/llaminar-gfx1100-wmma-prefill-evidence/mtp-attention-bounded-negative-disposition-audit.json`,
+SHA256 `34cd0d935b72070e5af02801c77ed6d24350b4789d5a7188d47a5874c929f180`.
+It retains all ten fit fields, exact receipt/source/snapshot hashes and SDK metric
+definitions. `FETCH_SIZE` is KiB: the final anchor's2,100,962.125 KiB corresponds
+to2,151,385,216 bytes. `VALUInsts` is average issued vector-ALU instructions per
+wave (`SQ_INSTS_VALU/SQ_WAVES`), not a total instruction count or useful TOPS.
+
+Production Automatic contains no dormant grouped WMMA leaf. Ordinary M512
+prefill retains its existing device-owned work-size selection: WMMA for qualified
+long prefixes and Dot2 for short, ring or partial work. No additional grouped
+kernel campaign is required to close this negative tuning result.

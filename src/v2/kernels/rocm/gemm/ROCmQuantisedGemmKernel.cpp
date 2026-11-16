@@ -42,6 +42,9 @@
 #include "ROCmQuantisedGemmKernel.h"
 #include "ROCmNativeQuantisedVerifierLaunch.h"
 #include "kernels/common/VerifierProjectionBundle.h"
+#include "kernels/common/VerifierGDNBundle.h"
+#include "ROCmNativeQuantisedGDNVerifier.h"
+#include "ROCmFloatingPointGemmKernel.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -5537,8 +5540,61 @@ namespace llaminar2
                 }
                 if (valid) bundle_operation = candidate;
             }
+            std::optional<NativeQuantisedGDNVerifierOperation> gdn_operation;
+            const auto *gdn_subgroup = ScopedVerifierGDNSubgroup::current();
+            if (gdn_subgroup && input && input->native_type()==TensorType::FP32 && m >= 2 && m <= 16 && workspace &&
+                gdn_subgroup->matches(DeviceId::rocm(rocm_device_id_),input,original_rows,k,projections) &&
+                ScopedCapturedVerifierExtent::current().matches(DeviceId::rocm(rocm_device_id_),original_rows) &&
+                !currentProjectionRowWork(m))
+            {
+                const auto &original = gdn_subgroup->original();
+                const auto all = original.projections();
+                NativeQuantisedGDNVerifierOperation candidate{
+                    .device=rocm_device_id_,.k=k,.input=input,.rows=original_rows,
+                    .precision=original.precision(),.correction_rows=original.correctionRows(),
+                    .activations=static_cast<const int8_t *>(workspace->getBuffer(GemmWorkspaceBuffers::QUANT_A)),
+                    .activation_scales=static_cast<const float *>(workspace->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE)),
+                    .activation_sums=static_cast<const int32_t *>(workspace->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))};
+                bool valid = candidate.activations && candidate.activation_scales && candidate.activation_sums;
+                const std::array native_members{&candidate.qkv,&candidate.z};
+                const std::array controls{&candidate.alpha,&candidate.beta};
+                for (int role=0;valid && role<4;++role)
+                {
+                    const auto &projection=all[role];
+                    const auto &slice=projection.original_output_slice;
+                    valid=projection.output && projection.output->native_type()==TensorType::FP32 && !projection.output->isMapped() && !projection.bias &&
+                        (!slice || (slice->firstColumn()==0 && slice->physicalColumns()==slice->policyColumns()));
+                    if(!valid)break;
+                    auto *output=static_cast<float *>(projection.output->gpu_data_ptr());
+                    if(role<2)
+                    {
+                        auto *owner=dynamic_cast<ROCmQuantisedGemmKernel *>(projection.kernel);
+                        DeviceNativeQuantisedMatrixDesc descriptor;
+                        valid=owner && owner->rocm_device_id_==rocm_device_id_ && output &&
+                            owner->inspectPreparedNativeQuantisedMatrixDesc(descriptor) &&
+                            descriptor.n==projection.n && descriptor.k==k && descriptor.source_identity_present;
+                        if(valid)*native_members[role]={.weights=descriptor.payload,
+                            .scales=static_cast<const uint16_t *>(descriptor.scales),
+                            .mins=static_cast<const uint16_t *>(descriptor.mins),
+                            .emins=static_cast<const uint32_t *>(descriptor.emins),.output=output,.n=projection.n,
+                            .source={descriptor.source_codebook_id,bool(descriptor.source_is_superblock),true}};
+                    }
+                    else
+                    {
+                        auto *owner=dynamic_cast<ROCmFloatingPointGemmKernel *>(projection.kernel);
+                        ContiguousFloatingPointWeightDescriptor descriptor;
+                        valid=owner && owner->rocm_device_id()==rocm_device_id_ && output &&
+                            owner->exportContiguousFloatingPointWeights(descriptor) && descriptor.valid() &&
+                            descriptor.n==projection.n && descriptor.k==k;
+                        if(valid)*controls[role-2]={.engine=owner,.weights=descriptor,.output=output,
+                            .precision=owner->floatingActivationOperandPrecision()};
+                    }
+                }
+                if(valid)gdn_operation=candidate;
+            }
             // Even an unmeasured nested API hides the enclosing native bundle.
             const ScopedNativeQuantisedVerifierBundle original_native_bundle(bundle_operation);
+            const ScopedNativeQuantisedGDNVerifier original_native_gdn(gdn_operation);
             std::optional<NativeQuantisedVerifierOperation> operation;
             if (projections.size() == 1)
             {

@@ -16,8 +16,10 @@ layout improves native latency in83/90 cells over the eight-query candidate
 therefore remains Dot2. Fixed-query32K→64K scaling passes. Both shipped targets
 compile without spills; the native producer uses49 VGPRs and27,152 LDS bytes.
 All29 affected feature GTests and eight exact producer profiles pass, including
-explicit finite/special TPB192 multi-tile replay. Grouped-attention economy remains open.
-QKV Automatic qualifies measured complete bundles; routed MTP remains open. See the
+explicit finite/special TPB192 multi-tile replay. The bounded grouped-attention
+experiment is closed with Dot2: native loses all2,790 paired samples. Full-curve
+fixed-query fits through64K have R²≥0.999892 for Dot2 and≥0.999771 for WMMA.
+QKV and GDN Automatic qualify measured complete bundles; routed MTP remains open. See the
 [attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Broader bundles and
 routed operations remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
 not claim model-level MTP speedups or full production certification.
@@ -323,9 +325,12 @@ Additional current evidence under the same ignored evidence root:
   participants, compact/promoted descriptors, and sliced down projections.
   Reuse ongoing grouped-prefill kernel work without treating prefill qualification
   as a verifier certificate or introducing prefill LLEP assignment into decode.
-- [ ] Evaluate floating grouped projections, router and verifier attention as
-  separate candidates. Record a precise unsupported result where an instruction
-  cannot satisfy the arithmetic contract; never relax byte equality to admit it.
+- [x] Evaluate floating grouped projections, router and verifier attention as
+  separate candidates. Router has a measured native domain; direct floating
+  substitutions retain their exact existing producer because WMMA changes bytes.
+  The bounded verifier-attention candidate is exact and linear through64K but
+  loses all2,790 pairs, so Automatic remains Dot2. Ordinary rocBLAS stays in scope
+  as the qualified floating producer; no broader vendor replacement is pursued.
 - [ ] Measure complete captured operations against the current operation-specific
   grouped implementation and serial throughput. Install work-size-aware Dot/WMMA
   selection only from qualified measurements, then verify actual Automatic hits.
@@ -637,7 +642,7 @@ deduplication alone cannot distinguish QKV, GDN and selected LM-head work.
 | Attention QKV or K/V-only | Actual unequal-width `FusedQKVGEMMStage` with independent prepared owners | Actual-Automatic confirmation, focused gates and64 geometry profiles pass; QueryInterval slicing excludes retained MTP |
 | Attention output | `GEMMStage` verifier path and Wo serial-byte tests | Source-owned output geometry and TP partition |
 | Gate/up through SwiGLU/down | `FusedGateUpGEMMStage` and public SwiGLU/down adapters | Connected captured operation with shared quantization and epilogues |
-| GDN projections | New actual `GDNProjectionStage` transaction fixture with independent prepared owners | All43 Release cases, three Integration gates and630 forced timing cells pass; complete-identity Automatic admission and profiles remain |
+| GDN projections | Actual four-source `GDNProjectionStage` with independent prepared owners | Automatic161 keys win in both630-cell panels;16 profiles, six host gates/32 cases, eight GPU gates/128 cases and CUDA/ROCm capture/12 cases pass |
 | Shared expert FFN | Actual shared-stage owner above | Qualified through gate/add and verifier-router Q8 handoff;368 profiles complete; residual sparse overhead remains visible |
 | Selected LM-head | `HiddenStateRowsSelectStage` through `LMHeadStage` | Selection-plus-head boundary and original vocabulary/row ownership |
 
@@ -744,8 +749,10 @@ out of524,288 total scores differ. The score implementation also reports192
 registers and1,084 bytes of private storage. It is unqualified: a shared root
 must not replace the original per-lane arithmetic without proving the complete
 byte contract, and these resources do not qualify a production candidate.
-Evidence: `mtp-attention-score-probe-run.json` and its siblings. Per-row split
-traversal, online softmax/V state and complete attention economy remain open.
+Evidence: `mtp-attention-score-probe-run.json` and its siblings. These probes did
+not establish per-row split traversal, online softmax/V state or complete economy.
+The later complete producer and bounded Dot2 disposition are documented in the
+[attention proof](GFX1100_MTP_ATTENTION_WMMA.md).
 Two separate diagnostics preserve the original source and control kernels.
 `mtp-attention-carry-only-probe.hip` feeds the already-compared serial partials
 through indexed and named-scalar carry trees, reporting lane0, other lanes and
