@@ -1,6 +1,6 @@
 /**
  * @file Test__ROCmVerifierBundlePolicy.cpp
- * @brief Device-free replay of QKV/GU sources, original subgroups and measured-key admission.
+ * @brief Device-free replay of QKV/GU/head sources, original subgroups and measured-key admission.
  *
  * Host words stand only for immutable addresses. These tests never dereference
  * a device count or initialize hardware; native capture tests qualify the actual
@@ -24,6 +24,7 @@ struct BundleFixture
     int32_t count=16,foreign_count=16,sum=0,foreign_sum=0;
     uint8_t weights[4]{};
     uint16_t scales[4]{};
+    uint32_t emins[4]{};
     float outputs[4]{},activation_scale=1,foreign_scale=1;
     int8_t quantized=0,foreign_quantized=0;
     DeviceRowRange rows=DeviceRowRange::deviceCounted(16,&count);
@@ -252,4 +253,86 @@ TEST(ROCmVerifierBundlePolicy, GateUpSourceInventoryAndMeasuredHoles)
     operation.rows=DeviceRowRange::deviceCounted(11,&f.count);EXPECT_TRUE(measuredNativeQuantisedVerifierBundle(operation));
     operation.rows=DeviceRowRange::deviceCounted(12,&f.count);EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(operation));
     operation.rows=DeviceRowRange::deviceCounted(13,&f.count);EXPECT_TRUE(measuredNativeQuantisedVerifierBundle(operation));
+}
+
+/** @test Head admission is total across every source and widths outside the measured domain. */
+TEST(ROCmVerifierBundlePolicy, MaterializedHeadCompleteInventoryReplay)
+{
+    BundleFixture f;
+    auto operation=f.operation;
+    operation.kind=VerifierProjectionBundleKind::MaterializedLMHead;operation.count=1;
+    int selected=0;
+    for (const auto &format:quantizedVerifierFormats()) for (int k:{2048,5120,1024,2560,5152})
+        for (int n:{248320,124160,248384}) for (int m=1;m<=65;++m) {
+            operation.k=k;operation.members[0].n=n;operation.rows=DeviceRowRange::fullyActive(m);
+            operation.members[0].source={format.source_codebook_id,format.source_is_superblock,true};
+            const bool expected=operation.members[0].source==NativeQuantisedSourceIdentity{8,true,true} &&
+                (k==2048 || k==5120) && n==248320 && m>=5 && m<=16;
+            const bool actual=measuredNativeQuantisedVerifierBundle(operation);
+            EXPECT_EQ(actual,expected)<<format.label<<" N="<<n<<" K="<<k<<" M="<<m;
+            selected+=actual;
+            operation.rows=DeviceRowRange::deviceCounted(m,&f.count);
+            EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(operation));
+        }
+    EXPECT_EQ(selected,24);
+}
+
+/** @test Single-member head packets retain source, full-row, bank and arithmetic identity. */
+TEST(ROCmVerifierBundlePolicy, MaterializedHeadForeignBindingsRejectedReplay)
+{
+    for (int mutation=-1;mutation<23;++mutation) {
+        SCOPED_TRACE(mutation);
+        BundleFixture f;
+        f.operation.kind=VerifierProjectionBundleKind::MaterializedLMHead;f.operation.count=1;
+        f.operation.k=f.work.k=2048;
+        f.operation.rows=f.packet.rows=f.work.rows=DeviceRowRange::fullyActive(16);
+        f.packet.work=ProjectionRowWork::fromPrefix(f.work.rows);
+        f.operation.members[0].n=248320;f.operation.members[0].source={8,true,true};f.subgroup(1);
+        ASSERT_TRUE(matchesNativeQuantisedVerifierBundle(f.operation,f.work,0));
+        ASSERT_TRUE(measuredNativeQuantisedVerifierBundle(f.operation));
+        switch(mutation) {
+        case 0:f.work.activations=&f.foreign_quantized;break;
+        case 1:f.work.activation_scales=&f.foreign_scale;break;
+        case 2:f.work.activation_sums=&f.foreign_sum;break;
+        case 3:f.work.rows=DeviceRowRange::deviceCounted(16,&f.count);break;
+        case 4:f.packet.rows=DeviceRowRange::deviceCounted(16,&f.count);break;
+        case 5:f.packet.work=ProjectionRowWork::fromPrefix(DeviceRowRange::deviceCounted(16,&f.count));break;
+        case 6:f.packet.payload[0]=&f.weights[3];break;
+        case 7:f.packet.scales[0]=&f.scales[3];break;
+        case 8:f.packet.output[0]=&f.outputs[3];break;
+        case 9:f.packet.N[0]+=64;break;
+        case 10:f.packet.codebook[0]=19;break;
+        case 11:f.packet.bias[0]=&f.outputs[3];break;
+        case 12:f.work.policy=NativeQuantisedVerifierPolicyMatch::Unmeasured;break;
+        case 13:f.operation.device=1;break;
+        case 14:f.packet.mins[0]=&f.scales[3];break;
+        case 15:f.work.bundle=nullptr;break;
+        case 16:f.operation.count=2;break;
+        case 17:f.work.k+=32;break;
+        case 18:f.operation.members[0].source.present=false;break;
+        case 19:f.operation.rows=DeviceRowRange::deviceCounted(16,&f.count);break;
+        case 20:f.operation.rows=DeviceRowRange::fullyActive(32).slice(8,16);break;
+        case 21:f.operation.rows=DeviceRowRange::fullyActive(8).repeatEachRow(2);break;
+        case 22:f.packet.emins[0]=&f.emins[3];break;
+        }
+        EXPECT_EQ(matchesNativeQuantisedVerifierBundle(f.operation,f.work,0),mutation==-1);
+        if (mutation==16 || mutation==18 || (mutation>=19 && mutation<=21))
+            EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(f.operation));
+    }
+}
+
+/** @test Singleton scalar packets are exposed only for a complete materialized head. */
+TEST(ROCmVerifierBundlePolicy, MaterializedHeadSingletonScopeReplay)
+{
+    BundleFixture f;
+    EXPECT_FALSE(hasNativeQuantisedMaterializedHead());
+    for (auto kind:{VerifierProjectionBundleKind::AttentionQKV,VerifierProjectionBundleKind::AttentionKV,
+                   VerifierProjectionBundleKind::GateUp,VerifierProjectionBundleKind::MaterializedLMHead}) {
+        f.operation.kind=kind;
+        ScopedNativeQuantisedVerifierBundle scope(f.operation);
+        EXPECT_EQ(hasNativeQuantisedMaterializedHead(),kind==VerifierProjectionBundleKind::MaterializedLMHead);
+        {ScopedNativeQuantisedVerifierBundle empty(std::nullopt);EXPECT_FALSE(hasNativeQuantisedMaterializedHead());}
+        EXPECT_EQ(hasNativeQuantisedMaterializedHead(),kind==VerifierProjectionBundleKind::MaterializedLMHead);
+    }
+    EXPECT_FALSE(hasNativeQuantisedMaterializedHead());
 }

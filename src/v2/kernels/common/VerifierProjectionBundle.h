@@ -1,11 +1,13 @@
 /**
  * @file VerifierProjectionBundle.h
- * @brief Original fused-stage identity for construction-time verifier dispatch.
+ * @brief Original projection-stage identity for construction-time verifier dispatch.
  *
  * A complete operation owns its performance key before a backend groups compatible
  * leaves. This borrowed identity lives only across the synchronous stage call;
  * neither its address nor its descriptor span enters a captured device packet.
  * Device row counts remain device-owned and are never observed by this scope.
+ * A materialized head instead owns an explicit fully written fixed row extent;
+ * it cannot borrow a source request's count or an enclosing prefix scope.
  */
 #pragma once
 
@@ -24,6 +26,7 @@ enum class VerifierProjectionBundleKind : std::uint8_t
     AttentionQKV, ///< Original query, key, value descriptors in that order.
     AttentionKV,  ///< Original key and value descriptors; no unused query member.
     GateUp,       ///< Original gate and up descriptors; down has its own operation authority.
+    MaterializedLMHead, ///< One original head over fully written compact rows.
 };
 
 /** @brief Validated, immutable identity of one original fused verifier call. */

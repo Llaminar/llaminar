@@ -178,3 +178,75 @@ TEST(VerifierProjectionBundle, GateUpOriginalSpanAndNestedBoundary)
     // The subsequent down call must see its own operation authority.
     EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);
 }
+
+/** @test Materialized heads accept one fixed original output, never count or slice authority. */
+TEST(VerifierProjectionBundle, MaterializedHeadSingletonAndFullRowsReplay)
+{
+    BundleFixture f;
+    const auto members=std::span(f.projections).first(1);
+    const auto full=DeviceRowRange::fullyActive(16);
+    const auto bind=[&](const DeviceRowRange &rows,auto projections) {
+        return VerifierProjectionBundleBinding::bind(VerifierProjectionBundleKind::MaterializedLMHead,
+            DeviceId::rocm(0),f.input.get(),rows,32,projections);
+    };
+    const auto original=bind(full,members);
+    EXPECT_TRUE(original.matches(DeviceId::rocm(0),f.input.get(),full,32,members));
+    const auto copied=f.projections;
+    EXPECT_FALSE(original.matches(DeviceId::rocm(0),f.input.get(),full,32,std::span(copied).first(1)));
+    for (const auto &rows : {f.rows,DeviceRowRange::fullyActive(32).slice(8,16),
+                             DeviceRowRange::fullyActive(8).repeatEachRow(2)}) {
+        EXPECT_THROW(bind(rows,members),std::invalid_argument);
+        EXPECT_FALSE(original.matches(DeviceId::rocm(0),f.input.get(),rows,32,members));
+    }
+    EXPECT_THROW(bind(full,members.first(0)),std::invalid_argument);
+    EXPECT_THROW(bind(full,std::span(f.projections).first(2)),std::invalid_argument);
+    EXPECT_FALSE(original.matches(DeviceId::rocm(0),f.foreign_input.get(),full,32,members));
+    EXPECT_FALSE(original.matches(DeviceId::rocm(1),f.input.get(),full,32,members));
+}
+
+/** @test Fixed row materialization shadows and then restores an enclosing source prefix. */
+TEST(VerifierProjectionBundle, MaterializedHeadNestedPrefixResetReplay)
+{
+    BundleFixture f;
+    const auto source=DeviceRowRange::deviceCounted(19,&f.count);
+    const auto full=DeviceRowRange::fullyActive(16);
+    const auto members=std::span(f.projections).first(1);
+    for (int live : {0,19,1,0,19}) {
+        f.count=live;
+        ITensorGemm::VerifierKernelModeScope outer(source);
+        ASSERT_EQ(ITensorGemm::VerifierKernelModeScope::rowsFor(19)->captureIdentity(),source.captureIdentity());
+        {
+            auto fixed=f.engine.beginVerifierDecodeEquivalentScope(full);
+            const ScopedVerifierProjectionBundle head(VerifierProjectionBundleBinding::bind(
+                VerifierProjectionBundleKind::MaterializedLMHead,DeviceId::rocm(0),f.input.get(),full,32,members));
+            EXPECT_EQ(ITensorGemm::VerifierKernelModeScope::rowsFor(16)->captureIdentity(),full.captureIdentity());
+            EXPECT_TRUE(ScopedVerifierProjectionBundle::current()->matches(DeviceId::rocm(0),f.input.get(),full,32,members));
+        }
+        EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);
+        EXPECT_EQ(ITensorGemm::VerifierKernelModeScope::rowsFor(19)->captureIdentity(),source.captureIdentity());
+        EXPECT_EQ(f.count,live);
+    }
+    EXPECT_EQ(ITensorGemm::VerifierKernelModeScope::rowsFor(16),nullptr);
+}
+
+/** @test Compact fixed rows cannot silently flatten request-local holes. */
+TEST(VerifierProjectionBundle, MaterializedHeadRejectsRequestScopeReplay)
+{
+    /** @brief Expose the protected request binding only for a device-free rejection proof. */
+    struct RequestScope final : ITensorGemm::VerifierKernelModeScope {
+        explicit RequestScope(DeviceRequestRowRanges rows) : VerifierKernelModeScope(rows) {}
+    };
+    BundleFixture f;
+    const auto requests=DeviceRequestRowRanges::deviceCounted(2,8,&f.count);
+    {
+        RequestScope outer(requests);
+        EXPECT_THROW(f.engine.beginVerifierDecodeEquivalentScope(DeviceRowRange::fullyActive(16)),std::invalid_argument);
+        const auto *retained=ITensorGemm::VerifierKernelModeScope::requestsFor(16);
+        ASSERT_NE(retained,nullptr);
+        EXPECT_EQ(retained->lengthOwner(),&f.count);
+        EXPECT_EQ(retained->requests(),2);
+        EXPECT_EQ(ScopedVerifierProjectionBundle::current(),nullptr);
+    }
+    EXPECT_EQ(ITensorGemm::VerifierKernelModeScope::requestsFor(16),nullptr);
+    EXPECT_EQ(ITensorGemm::VerifierKernelModeScope::rowsFor(16),nullptr);
+}

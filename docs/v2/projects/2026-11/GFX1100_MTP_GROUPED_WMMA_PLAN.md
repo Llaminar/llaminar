@@ -19,7 +19,7 @@ All29 affected feature GTests and eight exact producer profiles pass, including
 explicit finite/special TPB192 multi-tile replay. The bounded grouped-attention
 experiment is closed with Dot2: native loses all2,790 paired samples. Full-curve
 fixed-query fits through64K have R²≥0.999892 for Dot2 and≥0.999771 for WMMA.
-QKV, GDN, connected dense FFN and Wo Automatic qualify measured complete operations; routed MTP and selected LM-head remain open. See the
+QKV, GDN, connected dense FFN, Wo and the measured Q6_K selected-head Automatic qualify complete operations; routed MTP and broader head coverage remain open. See the
 [attention proof](GFX1100_MTP_ATTENTION_WMMA.md). Broader bundles and
 routed operations remain open. Direct floating WMMA substitutions fail their byte contracts. These component results do
 not claim model-level MTP speedups or full production certification.
@@ -644,7 +644,7 @@ deduplication alone cannot distinguish QKV, GDN and selected LM-head work.
 | Gate/up through SwiGLU/down | Actual connected `FusedGateUpGEMMStage` → fused-SwiGLU `GEMMStage` with five independent owners | Automatic admits136 incremental GU keys across all21 formats; both315-cell panels retain every selected median win (confirmation geo1.112072×); six host/26 GPU gates and16 profiles pass |
 | GDN projections | Actual four-source `GDNProjectionStage` with independent prepared owners | Automatic161 keys win in both630-cell panels;16 profiles, six host gates/32 cases, eight GPU gates/128 cases and CUDA/ROCm capture/12 cases pass |
 | Shared expert FFN | Actual shared-stage owner above | Qualified through gate/add and verifier-router Q8 handoff;368 profiles complete; residual sparse overhead remains visible |
-| Selected LM-head | `HiddenStateRowsSelectStage` through `LMHeadStage` | Selection-plus-head boundary and original vocabulary/row ownership |
+| Selected LM-head | Actual `HiddenStateRowsSelectStage` through `LMHeadStage`, independent prepared controls/M1 oracle | Full-vocabulary seeded Q6_K Automatic qualifies: Dot4 M2–4, WMMA M5–16 for dense/MoE. All24 selected keys win both30-cell panels (confirmation geo1.997859×); seven focused gates/16 profiles pass. [Proof](GFX1100_MTP_SELECTED_HEAD.md) |
 
 Use the existing registered Qwen dense/GDN and MoE/shared profiles, including
 their full and TP-sharded declarations. Retain all21 source formats from the
@@ -681,7 +681,7 @@ scalar SwiGLU selection remains unchanged. Actual-Automatic qualification now
 compares the complete chain against prior Dot4 GU plus Automatic down: all136
 selected keys win both315-cell panels. Six host gates/39 cases,26 affected GPU
 gates/86 cases and16 exact GU/down profiles pass. See the linked proof for
-immutable seed provenance and final qualification; selected LM-head remains open.
+immutable seed provenance and final qualification; selected-head Q6_K qualification is documented separately.
 
 ## Verifier router economy and attention arithmetic
 

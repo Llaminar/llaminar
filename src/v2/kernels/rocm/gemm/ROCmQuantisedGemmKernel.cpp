@@ -5499,9 +5499,15 @@ namespace llaminar2
             const auto *original_bundle = ScopedVerifierProjectionBundle::current();
             const auto *declared_rows = VerifierKernelModeScope::rowsFor(m);
             const auto original_rows = declared_rows ? *declared_rows : DeviceRowRange::fullyActive(m);
+            const bool materialized_head = original_bundle &&
+                original_bundle->kind() == VerifierProjectionBundleKind::MaterializedLMHead;
+            const bool admitted_extent = materialized_head
+                ? original_rows.captureIdentity() == DeviceRowRange::fullyActive(m).captureIdentity()
+                : ScopedCapturedVerifierExtent::current().matches(DeviceId::rocm(rocm_device_id_), original_rows);
             if (original_bundle && m >= 2 && m <= 16 && workspace &&
                 original_bundle->matches(DeviceId::rocm(rocm_device_id_), input, original_rows, k, projections) &&
-                ScopedCapturedVerifierExtent::current().matches(DeviceId::rocm(rocm_device_id_), original_rows) &&
+                admitted_extent &&
+                (!materialized_head || (input && input->native_type() == TensorType::FP32 && !input->isMapped())) &&
                 !currentProjectionRowWork(m))
             {
                 NativeQuantisedVerifierBundleOperation candidate{
@@ -5511,7 +5517,8 @@ namespace llaminar2
                     .activation_scales = static_cast<const float *>(workspace->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE)),
                     .activation_sums = static_cast<const int32_t *>(workspace->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))};
                 bool valid = candidate.activations && candidate.activation_scales && candidate.activation_sums &&
-                    candidate.count >= 2 && candidate.count <= static_cast<int>(candidate.members.size());
+                    (materialized_head ? candidate.count == 1 : candidate.count >= 2) &&
+                    candidate.count <= static_cast<int>(candidate.members.size());
                 for (int index = 0; valid && index < candidate.count; ++index)
                 {
                     const auto &projection = projections[index];
@@ -5523,6 +5530,7 @@ namespace llaminar2
                     valid = owner && owner->rocm_device_id_ == rocm_device_id_ &&
                         owner->inspectPreparedNativeQuantisedMatrixDesc(descriptor) &&
                         projection.output && !projection.output->isMapped() && !projection.bias &&
+                        (!materialized_head || projection.output->native_type() == TensorType::FP32) &&
                         descriptor.n == projection.n && descriptor.k == k && descriptor.source_identity_present &&
                         (!slice || (slice->firstColumn() == 0 && slice->physicalColumns() == slice->policyColumns()));
                     if (valid)

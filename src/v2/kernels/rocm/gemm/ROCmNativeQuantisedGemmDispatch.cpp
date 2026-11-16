@@ -6,7 +6,8 @@
  * each runtime codebook to the one physical HIP shard that owns its kernel
  * instantiations. Exact ownership makes unsupported or duplicate mappings
  * structurally visible while allowing all eight expensive shards to compile in
- * parallel.
+ * parallel. Verifier selection authenticates original operations and their row
+ * domains: hosted prefixes and fixed materialized heads have separate admission.
  */
 
 #include "ROCmNativeQuantisedGemmShard.h"
@@ -435,7 +436,12 @@ bool matchesNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOpe
     const NativeQuantisedVerifierWork &work,int device) noexcept
 {
     const int expected=operation.kind==VerifierProjectionBundleKind::AttentionQKV?3:
-        (operation.kind==VerifierProjectionBundleKind::AttentionKV || operation.kind==VerifierProjectionBundleKind::GateUp)?2:0;
+        (operation.kind==VerifierProjectionBundleKind::AttentionKV || operation.kind==VerifierProjectionBundleKind::GateUp)?2:
+        operation.kind==VerifierProjectionBundleKind::MaterializedLMHead?1:0;
+    if (operation.kind==VerifierProjectionBundleKind::MaterializedLMHead &&
+        (operation.rows.physicalRows()<1 ||
+         operation.rows.captureIdentity()!=DeviceRowRange::fullyActive(operation.rows.physicalRows()).captureIdentity()))
+        return false;
     return expected && operation.count==expected && matchesVerifierMembers(
         std::span(operation.members).first(expected),operation.device,operation.k,operation.rows,
         operation.activations,operation.activation_scales,operation.activation_sums,work,device);
@@ -449,6 +455,12 @@ ScopedNativeQuantisedGDNVerifier::~ScopedNativeQuantisedGDNVerifier()
 {if(active_!=this)std::terminate();active_=previous_;}
 const NativeQuantisedGDNVerifierOperation *ScopedNativeQuantisedGDNVerifier::current() noexcept
 {return active_ && active_->operation_?&*active_->operation_:nullptr;}
+
+bool hasNativeQuantisedMaterializedHead() noexcept
+{
+    const auto *bundle=ScopedNativeQuantisedVerifierBundle::current();
+    return bundle && bundle->kind==VerifierProjectionBundleKind::MaterializedLMHead;
+}
 
 bool hasNativeQuantisedGDNVerifier() noexcept
 {return ScopedNativeQuantisedGDNVerifier::current()!=nullptr;}
@@ -609,6 +621,15 @@ bool measuredVerifierWmmaKey(const NativeQuantisedVerifierOperation &operation,i
 bool measuredNativeQuantisedVerifierBundle(const NativeQuantisedVerifierBundleOperation &operation) noexcept
 {
     const int m = operation.rows.physicalRows();
+    if (operation.kind == VerifierProjectionBundleKind::MaterializedLMHead) {
+        // Every M2..16 was measured independently for these original Q6_K heads.
+        // Dot4 wins M2..4; native wins all31 pairs at each M5..16. No source alias,
+        // local-vocabulary slice or different serial partition width borrows it.
+        return m >= 5 && m <= 16 && operation.count == 1 &&
+            operation.rows.captureIdentity() == DeviceRowRange::fullyActive(m).captureIdentity() &&
+            operation.members[0].n == 248320 && (operation.k == 5120 || operation.k == 2048) &&
+            operation.members[0].source == NativeQuantisedSourceIdentity{8,true,true};
+    }
     if(operation.kind==VerifierProjectionBundleKind::GateUp) {
         if(m<2 || m>16 || operation.count!=2 || operation.k!=5120 ||
             operation.members[0].n!=17408 || operation.members[1].n!=17408 ||
@@ -695,8 +716,12 @@ NativeQuantisedVerifierCandidate nativeQuantisedVerifierProducer(
     }
     if (const auto *bundle = ScopedNativeQuantisedVerifierBundle::current())
     {
+        const bool admitted_extent = bundle->kind == VerifierProjectionBundleKind::MaterializedLMHead
+            ? work.rows.physicalRows() > 0 &&
+                work.rows.captureIdentity() == DeviceRowRange::fullyActive(work.rows.physicalRows()).captureIdentity()
+            : ScopedCapturedVerifierExtent::current().matches(DeviceId::rocm(device), work.rows);
         const bool qualified = decode_equivalent && !currentProjectionRowWork(work.rows.physicalRows()) &&
-            ScopedCapturedVerifierExtent::current().matches(DeviceId::rocm(device), work.rows) &&
+            admitted_extent &&
             matchesNativeQuantisedVerifierBundle(*bundle,work,device) && measuredNativeQuantisedVerifierBundle(*bundle) &&
             nativeQuantisedHardwareForDevice(device).architecture == native_quantised::NativeQuantisedArchitecture::rocm(11,0,0);
         return qualified ? NativeQuantisedVerifierCandidate::WmmaM16N64 : NativeQuantisedVerifierCandidate::Dot4;

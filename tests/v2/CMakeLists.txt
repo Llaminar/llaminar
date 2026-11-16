@@ -20971,6 +20971,21 @@ if(HAVE_ROCM)
             --gtest_filter=AllSources/ROCmWoVerifierTransaction.GuardedReplay/*_Q4_0
         LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;Devices1;NativeISA-gfx1100;GEMM;MTP;Attention;GraphCapture;ByteExact;Replay;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+    # The compact head consumes the actual workspace-bound device row selector.
+    # Seeded Q6_K qualifies Automatic only at the two measured full vocabularies.
+    add_executable(v2_integration_rocm_selected_lm_head_transaction
+        integration/kernels/rocm/Test__ROCmSelectedLMHeadTransaction.cpp)
+    target_link_libraries(v2_integration_rocm_selected_lm_head_transaction
+        llaminar2_core GTest::gtest GTest::gtest_main rocprofiler-sdk-roctx::rocprofiler-sdk-roctx)
+    foreach(head_geometry IN ITEMS Dense MoE)
+        add_v2_test(V2_Integration_ROCmSelectedLMHead${head_geometry}Replay
+            COMMAND $<TARGET_FILE:v2_integration_rocm_selected_lm_head_transaction>
+                --gtest_filter=OriginalGeometry/ROCmSelectedLMHeadTransaction.CapturedReplay/${head_geometry}
+            LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;Devices1;NativeISA-gfx1100;GEMM;MTP;LMHead;GraphCapture;ByteExact;Replay;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 180 RESOURCE_LOCK rocm_gpu_0)
+        list(APPEND _rocm_selected_lm_head_preflight_tests V2_Integration_ROCmSelectedLMHead${head_geometry}Replay)
+    endforeach()
+
     # The connected dense FFN retains GU publication through fused SwiGLU/down.
     add_executable(v2_integration_rocm_ffn_verifier_transaction
         integration/kernels/rocm/Test__ROCmFFNVerifierTransaction.cpp)
@@ -39000,6 +39015,11 @@ add_v2_test(V2_Integration_VerifierProjectionBundleReplay
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;QKV;Regression;Replay"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_VerifierProjectionBundleReplay)
+add_v2_test(V2_Integration_MaterializedLMHeadBindingReplay
+    COMMAND $<TARGET_FILE:v2_test_verifier_projection_bundle> --gtest_filter=VerifierProjectionBundle.MaterializedHead*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;LMHead;Regression;Replay"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MaterializedLMHeadBindingReplay)
 add_v2_test(V2_Integration_VerifierGDNBundleReplay
     COMMAND $<TARGET_FILE:v2_test_verifier_projection_bundle> --gtest_filter=VerifierGDNBundle.*
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;GDN;Regression;Replay"
@@ -39011,6 +39031,11 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;QKV;Regression;Replay"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierBundlePolicyReplay)
+    add_v2_test(V2_Integration_ROCmMaterializedLMHeadPolicyReplay
+        COMMAND $<TARGET_FILE:v2_test_rocm_verifier_bundle_policy> --gtest_filter=ROCmVerifierBundlePolicy.MaterializedHead*
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;LMHead;Regression;Replay"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMaterializedLMHeadPolicyReplay)
     add_v2_test(V2_Integration_ROCmGDNVerifierPolicyReplay
         COMMAND $<TARGET_FILE:v2_test_rocm_verifier_bundle_policy> --gtest_filter=ROCmGDNVerifierPolicy.*
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MTP;GDN;Regression;Replay"
@@ -39059,6 +39084,7 @@ if(HAVE_ROCM)
         V2_Integration_ROCmQKVVerifierAutomaticExclusionsReplay
         ${_rocm_wo_verifier_preflight_tests}
         V2_Integration_ROCmWoVerifierGuardedReplay
+        ${_rocm_selected_lm_head_preflight_tests}
         V2_Integration_ROCmWoVerifierPolicyReplay
         ${_rocm_ffn_verifier_preflight_tests}
         V2_Integration_ROCmFFNVerifierMixedReplay

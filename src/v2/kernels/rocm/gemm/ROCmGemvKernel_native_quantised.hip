@@ -6461,9 +6461,9 @@ bool rocmLaunch_native_quantised_small_m_fp32(
     }
     if (kb < 1) kb = 1;
 
-    // A standalone Z leaf still belongs to the complete four-role GDN
-    // operation. Preserve its original packet and Q8 publication before tiling
-    // so it can authenticate the same roles as a batched subgroup.
+    // A standalone Z or materialized head still belongs to its original stage
+    // operation. Preserve the actual output, source and Q8 publication before
+    // tiling so a scalar optimization retains the same full operand matching.
     NativeQuantisedSmallMBatchedArgs original_packet{.rows=rows,
         .work=llaminar2::projectionWorkForLaunch(M,row_range)};
     original_packet.num_projections=1; original_packet.total_grid_n=grid_n;
@@ -6472,6 +6472,8 @@ bool rocmLaunch_native_quantised_small_m_fp32(
     original_packet.mins[0]=d_block_mins; original_packet.emins[0]=d_block_emins;
     original_packet.output[0]=d_C_fp32; original_packet.partial[0]=d_partial_fp32;
     original_packet.codebook[0]=static_cast<uint8_t>(FMT);
+    // Only the complete materialized head may authorize a new singleton call;
+    // existing QKV/GU subgroups retain their separately qualified topology.
     const auto verifier_candidate = llaminar2::rocm::nativeQuantisedVerifierProducer(
         device_id, decode_equivalent, {rows, d_payload, N, K, 1, static_cast<uint8_t>(FMT),
         generated_cfg.has_generated && explicit_kb_override <= 0 && explicit_waves_override <= 0 &&
@@ -6479,7 +6481,8 @@ bool rocmLaunch_native_quantised_small_m_fp32(
         (g_native_quantised_serial_partition_n <= 0 || g_native_quantised_serial_partition_n == N)
             ? llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::CanonicalSerial
             : llaminar2::rocm::NativeQuantisedVerifierPolicyMatch::Unmeasured,
-        llaminar2::rocm::hasNativeQuantisedGDNVerifier()?&original_packet:nullptr,
+        (llaminar2::rocm::hasNativeQuantisedGDNVerifier() ||
+            llaminar2::rocm::hasNativeQuantisedMaterializedHead())?&original_packet:nullptr,
         d_A_int8,d_scale_A_blockwise,d_sum_A_blockwise});
     const bool wmma = verifier_candidate != llaminar2::rocm::NativeQuantisedVerifierCandidate::Dot4;
 

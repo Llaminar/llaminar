@@ -3,7 +3,8 @@
  * @brief Authenticate original fused verifier bindings and worker-local nesting.
  *
  * Storage identity distinguishes a complete operation from copied/reordered
- * policy subgroups. Backend admission separately validates prepared source
+ * policy subgroups. A materialized head requires a fixed, unsliced row identity.
+ * Backend admission separately validates prepared source
  * provenance, operand publications, epilogues and measured arithmetic policy.
  */
 #include "VerifierProjectionBundle.h"
@@ -25,10 +26,14 @@ VerifierProjectionBundleBinding VerifierProjectionBundleBinding::bind(
     DeviceRowRange rows, int reduction, Projections projections)
 {
     const std::size_t members = kind == VerifierProjectionBundleKind::AttentionQKV ? 3 :
-        (kind == VerifierProjectionBundleKind::AttentionKV || kind == VerifierProjectionBundleKind::GateUp) ? 2 : 0;
+        (kind == VerifierProjectionBundleKind::AttentionKV || kind == VerifierProjectionBundleKind::GateUp) ? 2 :
+        kind == VerifierProjectionBundleKind::MaterializedLMHead ? 1 : 0;
     if (!members || (!device.is_cpu() && !device.is_gpu()) || !input ||
         rows.physicalRows() < 1 || reduction < 1 || projections.size() != members)
         throw std::invalid_argument("Verifier projection bundle requires its complete original operation");
+    if (kind == VerifierProjectionBundleKind::MaterializedLMHead &&
+        rows.captureIdentity() != DeviceRowRange::fullyActive(rows.physicalRows()).captureIdentity())
+        throw std::invalid_argument("Materialized LM-head requires its complete fixed row extent");
     for (std::size_t i = 0; i < members; ++i)
     {
         const auto &projection = projections[i];
