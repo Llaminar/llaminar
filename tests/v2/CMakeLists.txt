@@ -20949,6 +20949,28 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;QKV;GraphCapture;ByteExact;Replay;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 
+    # The connected dense FFN retains GU publication through fused SwiGLU/down.
+    add_executable(v2_integration_rocm_ffn_verifier_transaction
+        integration/kernels/rocm/Test__ROCmFFNVerifierTransaction.cpp)
+    target_link_libraries(v2_integration_rocm_ffn_verifier_transaction
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    # Each source performs four connected controls across all M2..16. Keep a
+    # bounded per-source gate instead of extending a monolithic timeout.
+    foreach(ffn_source IN ITEMS Q4_0 IQ4_NL IQ4_XS Q4_1 Q4_K Q5_0 Q5_1 Q5_K
+            Q6_K Q3_K Q2_K IQ3_S IQ3_XXS IQ2_S IQ2_XS IQ2_XXS IQ1_S IQ1_M Q8_0 Q8_1 Q8_K)
+        add_v2_test(V2_Integration_ROCmFFNVerifierReplay_${ffn_source}
+            COMMAND $<TARGET_FILE:v2_integration_rocm_ffn_verifier_transaction>
+                --gtest_filter=AllSources/ROCmFFNVerifierTransaction.Replay/${ffn_source}
+            LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;FFN;AllFormats;GraphCapture;ByteExact;Replay;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+        list(APPEND _rocm_ffn_verifier_preflight_tests V2_Integration_ROCmFFNVerifierReplay_${ffn_source})
+    endforeach()
+    add_v2_test(V2_Integration_ROCmFFNVerifierMixedReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_ffn_verifier_transaction>
+            --gtest_filter=ROCmFFNVerifierMixed.IndependentSourcesReplay
+        LABELS "V2;Integration;ROCm;gfx1100;HardwareOptional;GEMM;MTP;FFN;GraphCapture;ByteExact;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+
     # Complete GDN owns two native sources and two original prepared-half controls.
     add_executable(v2_integration_rocm_gdn_verifier_transaction
         integration/kernels/rocm/Test__ROCmGDNVerifierTransaction.cpp)
@@ -38982,6 +39004,8 @@ if(HAVE_ROCM)
         V2_Integration_ROCmQKVVerifierMoEFullAutomaticReplay
         V2_Integration_ROCmQKVVerifierMoELocalTP4AutomaticReplay
         V2_Integration_ROCmQKVVerifierAutomaticExclusionsReplay
+        ${_rocm_ffn_verifier_preflight_tests}
+        V2_Integration_ROCmFFNVerifierMixedReplay
         V2_Integration_ROCmGDNVerifierSingleQ8Replay
         V2_Integration_ROCmGDNVerifierTwoTermQ8Replay
         V2_Integration_ROCmGDNVerifierMixedReplay

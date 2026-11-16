@@ -641,7 +641,7 @@ deduplication alone cannot distinguish QKV, GDN and selected LM-head work.
 |---|---|---|
 | Attention QKV or K/V-only | Actual unequal-width `FusedQKVGEMMStage` with independent prepared owners | Actual-Automatic confirmation, focused gates and64 geometry profiles pass; QueryInterval slicing excludes retained MTP |
 | Attention output | `GEMMStage` verifier path and Wo serial-byte tests | Source-owned output geometry and TP partition |
-| Gate/up through SwiGLU/down | `FusedGateUpGEMMStage` and public SwiGLU/down adapters | Connected captured operation with shared quantization and epilogues |
+| Gate/up through SwiGLU/down | Actual connected `FusedGateUpGEMMStage` → fused-SwiGLU `GEMMStage` with five independent owners | All22 Release cases/330 cells and22 registered replay gates pass;136 stronger incremental GU winners span all21 formats; Automatic remains open |
 | GDN projections | Actual four-source `GDNProjectionStage` with independent prepared owners | Automatic161 keys win in both630-cell panels;16 profiles, six host gates/32 cases, eight GPU gates/128 cases and CUDA/ROCm capture/12 cases pass |
 | Shared expert FFN | Actual shared-stage owner above | Qualified through gate/add and verifier-router Q8 handoff;368 profiles complete; residual sparse overhead remains visible |
 | Selected LM-head | `HiddenStateRowsSelectStage` through `LMHeadStage` | Selection-plus-head boundary and original vocabulary/row ownership |
@@ -669,9 +669,10 @@ weights: gate/up N17408/K5120 twice, down N5120/K17408. Source4/superblock and
 physical24 remain distinct. Ordinary dense FFN uses SingleQ8; QFN HC-up
 TwoTerm belongs to a different residual-mixer path.
 
-The next complete component should retain normalized input → gate/up → fused
-SwiGLU/down → branch output, using three independent `makeGpuPreparedFFNFixture`
-owners and one merged persistent workspace per owner. Compare gate/up and final
+The [connected FFN fixture](GFX1100_MTP_FFN_VERIFIER.md) now retains normalized
+input → gate/up → fused SwiGLU/down → branch output, using five independent
+`makeGpuPreparedFFNFixture` owners (four controls plus M1) and one merged
+persistent workspace per owner. Compare gate/up and final
 bytes to complete independent M1 rows, with dirty prefixes, reset and separate
 producer omissions. The qualified `SharedExpertFFNStage` is a different owner
 and does not certify this chain. Gate/up needs its own complete original-source
