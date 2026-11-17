@@ -13,10 +13,30 @@
  * the observed status, and CUDADriverApi supplies the loader binding result.
  */
 #pragma once
+#include <string>
 #include <string_view>
 
 namespace llaminar2
 {
+    /** @brief One exact native loader observation for a requested object. */
+    struct CUDADriverLoaderOutcome
+    {
+        bool loadable = false; ///< Whether the loader completely loaded the object.
+        std::string diagnostic; ///< The loader's exact dlerror text, empty when none.
+    };
+
+    /**
+     * @brief Probe the authoritative binding's loader path for one requested object.
+     * @param request Exact object name or path the binding would request.
+     * @return The loader's own outcome; never an exception or a second opinion.
+     * @note This is the single native probe implementation: the production
+     *       driver-presence authority and its device-free proof both call it.
+     *       It uses the authoritative binding's exact flags so presence answers
+     *       the same loader and search-path question, never a lazier one, and it
+     *       never pins the library, resolves further symbols or touches a bound
+     *       table.
+     */
+    CUDADriverLoaderOutcome probeNativeLibraryBinding(std::string_view request) noexcept;
     /** @brief Exact loader outcome for the optional native driver library. */
     enum class CUDADriverBindingStatus
     {
@@ -50,21 +70,25 @@ namespace llaminar2
      * @param loaderDiagnostic The loader's diagnostic for a failed load, empty when none.
      * @return The typed binding status.
      *
-     * Only the requested library itself being absent from every search path is
-     * genuine non-installation. The loader names the object it could not open,
-     * so any other diagnostic (an unopened dependency, an unresolved symbol, an
-     * invalid file format or an access failure) means the requested library was
-     * found but cannot serve: a present, broken installation, never absence.
+     * Only a complete, exact match of the loader's own non-installation
+     * diagnostic, naming the requested SONAME itself with nothing additional,
+     * establishes genuine absence. A present library that cannot bind for any
+     * reason (an unopened dependency, an unresolved symbol, an invalid format,
+     * an access failure), an unknown or localized diagnostic, an empty request
+     * and any trailing contradictory text all mean the requested library was
+     * found or the outcome cannot be positively established: never absence.
      */
     [[nodiscard]] constexpr CUDADriverBindingStatus classifyCUDADriverBinding(
         bool loadable, std::string_view requestedSoname, std::string_view loaderDiagnostic) noexcept
     {
         if (loadable)
             return CUDADriverBindingStatus::Loadable;
+        if (requestedSoname.empty())
+            return CUDADriverBindingStatus::PresentButUnbindable;
         constexpr std::string_view absentTail = ": cannot open shared object file: No such file or directory";
-        return requestedSoname.size() + absentTail.size() <= loaderDiagnostic.size() &&
+        return loaderDiagnostic.size() == requestedSoname.size() + absentTail.size() &&
                loaderDiagnostic.substr(0, requestedSoname.size()) == requestedSoname &&
-               loaderDiagnostic.substr(requestedSoname.size(), absentTail.size()) == absentTail
+               loaderDiagnostic.substr(requestedSoname.size()) == absentTail
                    ? CUDADriverBindingStatus::NotInstalled
                    : CUDADriverBindingStatus::PresentButUnbindable;
     }

@@ -73,19 +73,11 @@ const CUDADriverApi &CUDADriverApi::instance()
 
 CUDADriverBindingStatus CUDADriverApi::probeDriverBinding() noexcept
 {
+    // The exact production request: this authority owns the libcuda.so.1
+    // SONAME, and the shared native probe owns the one loader implementation.
     constexpr std::string_view driverSoname = "libcuda.so.1";
-    // Same flags and exact SONAME as the authoritative binding, so the loader
-    // cannot answer a different search-path question. The temporary handle is
-    // released immediately: nothing was called through it, and an already
-    // loaded driver only gains and loses one reference count.
-    if (void *library = dlopen(driverSoname.data(), RTLD_NOW | RTLD_LOCAL))
-    {
-        dlclose(library);
-        return CUDADriverBindingStatus::Loadable;
-    }
-    const char *error = dlerror();
-    return classifyCUDADriverBinding(false, driverSoname,
-        error != nullptr ? std::string_view{error} : std::string_view{});
+    const CUDADriverLoaderOutcome outcome = probeNativeLibraryBinding(driverSoname);
+    return classifyCUDADriverBinding(outcome.loadable, driverSoname, outcome.diagnostic);
 }
 
 #define LLAMINAR_CUDA_DRIVER_SYMBOL_TEXT_(symbol) #symbol
