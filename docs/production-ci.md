@@ -1,7 +1,8 @@
 # Production image certification
 
 The release path is **feature → develop → rc/* → master**. Feature PRs run
-Unit/host checks on both ISAs; develop publishes build-only images. A non-draft
+Unit/host checks on both ISAs and single-device CUDA/ROCm checks on AVX2;
+develop publishes build-only images. A non-draft
 RC-to-master PR qualifies that frozen published pair through complete
 preflight, numerical panels, six five-phase OpenCode sessions and benchmarks.
 All RC jobs run on the Xeon runner. Only a certified RC merge publishes a
@@ -37,13 +38,19 @@ Separate self-hosted runners build AVX2 and AVX512 full-backend
 `model-free` test images in parallel. Each image executes complete device-free
 `Unit` plus the
 production-preflight `host` lane. The canonical production scheduler owns
-host selection; CUDA, ROCm and exclusive preflight lanes are not executed. The test
-container receives no GPU devices or model mounts. This is PR validation, not
+host selection. That container receives no GPU devices or model mounts.
+AVX2 then requires the CMake-owned `DevelopGPUPreflight` inventory in a
+separate container exposing both GPUs. This exercises model-free prepared
+weights, captured execution/replay and RAM-prefix initialization with one
+device per vendor. Complete CUDA, ROCm and exclusive preflight remain
+production gates. This is PR validation, not
 release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
 The active `develop` ruleset requires both `Develop PR / Unit + host (AVX2)`
 and `Develop PR / Unit + host (AVX512)`, an up-to-date PR, and squash merge.
+The AVX2 check retains its stable required-context name while also requiring
+the single-device GPU scope.
 Repository administrators have an explicit PR-only bypass for authorized
 manual merges. Direct human pushes, force pushes and deletion remain rejected.
 `.github/workflows/develop-auto-merge.yml` arms GitHub's native
@@ -87,6 +94,7 @@ does not cancel the other. Each PR/ISA job has its own
 same PR and ISA without serializing its two hosts.
 Each host serializes its own jobs; AVX2 shares its queue with publication.
 Each job calls `run_develop_image_gate.py --cpu-isa <ISA>` without publication.
+AVX2 also passes `--pr-gpus CUDA+ROCm`; AVX512 explicitly selects `none`.
 Before toolchain preparation, CPU admission checks every visible CPU against
 the requested shipped ISA contract, including AVX512-VNNI for AVX512. Missing
 flags fail explicitly instead of changing the ISA; a runner label alone is
@@ -97,16 +105,20 @@ PR registry cache access is `import-only`, with no registry credentials or
 cache export. The `cache-develop-toolchain` action restores or builds complete,
 dependency-bound OCI images before source compilation. No registry-write
 permission is granted. The model-free image compiles Unit and preflight
-executables, while `run_develop_pr_tests.py` executes only complete Unit and
-host inventories. Unit retains unrestricted parallelism; host uses canonical
-serial scheduling. Neither may skip tests. Logs and JUnit evidence are retained
-separately; `pr-tests.json` records the narrower `unit-and-host` scope.
-Accelerator preflight, model staging, generation, HF parity, E2E and benchmarks
+executables. `run_develop_pr_tests.py --scope unit-and-host` executes complete
+Unit and host inventories. Unit retains unrestricted parallelism; host uses
+canonical serial scheduling. The subsequent AVX2 `--scope single-gpu`
+transaction requires nonempty CUDA and ROCm inventories, each declaring
+`DevelopGPUPreflight`, `SingleGPU` and one MPI rank. It runs vendors sequentially
+on this host's one CPU package. Missing devices, failures and skips fail the gate.
+Logs and JUnit evidence are retained in `pr-tests/` and `pr-gpu-tests/`;
+`pr-validation.json` binds both receipts as `unit-host-single-gpu` evidence.
+Full accelerator preflight, model staging, generation, HF parity, E2E and benchmarks
 remain outside this PR gate. Only build logs, image/test receipts and CTest/JUnit evidence are
 uploaded to GitHub under artifact names containing the ISA. Run the same AVX2 PR transaction locally with:
 
 ```bash
-python3 scripts/ci/run_develop_image_gate.py --cpu-isa AVX2 \
+python3 scripts/ci/run_develop_image_gate.py --cpu-isa AVX2 --pr-gpus CUDA+ROCm \
   --output parity-results/develop-pr-gate
 ```
 
@@ -118,7 +130,7 @@ Real-model source admission in the RC gate runs inside the six blessed cells'
 numerical fixtures on both ISAs. There is no separate broad QFN admission
 matrix or standalone HTTP gate. Every selected native cell must execute with
 its complete source, stage and lifecycle obligations; missing required hardware
-fails qualification. PR Unit/host receipts do not satisfy full production
+fails qualification. PR receipts do not satisfy full production
 preflight or numerical acceptance.
 
 ## Develop branch image publication
@@ -221,6 +233,22 @@ group, with no passwordless sudo rule for workflow jobs. The systemd service
 `actions.runner.Llaminar.llaminar-develop-108.service` starts at boot.
 The release archive is verified against GitHub's declared SHA256 before
 registration. Registration credentials are temporary and never belong in Git.
+
+The AVX2 host supplies an MI50 and an NVIDIA RTX 3080 Laptop GPU. Docker's
+canonical `device_args` authority exposes the NVIDIA runtime, `/dev/kfd`, DRM
+nodes and their supplemental groups only to the GPU test container. The runner
+does not need passwordless sudo or broad host device permissions.
+An administrator-owned udev rule in
+`/etc/udev/rules.d/80-llaminar-mi50-runtime-power.rules` keeps the inspected MI50's
+PCI `power/control` set to `on` at add/bind. This avoids runtime-suspended UMC
+telemetry reads on this host; it does not force maximum clocks. Match the
+actual PCI address and vendor/device IDs when provisioning another machine.
+The host's `/etc/default/grub.d/80-llaminar-iommu.cfg` appends `iommu=pt` to
+`GRUB_CMDLINE_LINUX_DEFAULT`. Run `update-grub` after changing it and reboot
+before qualifying hardware. Verify the MI50's IOMMU group reports `identity`
+and interrupt remapping remains enabled. Passthrough removes DMA address
+isolation for devices using identity domains; keep this a host-administrator
+choice, never a mutation performed by PR jobs.
 
 The host's `/etc/sysctl.d/70-llaminar-ci.conf` sets
 `kernel.core_pattern=/proc/llaminar-core-disabled`. Procfs cannot create that

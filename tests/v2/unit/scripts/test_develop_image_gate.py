@@ -8,6 +8,7 @@ here so ISA coverage, model exclusion and read-only cache access stay explicit.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import os
 from pathlib import Path
 import shlex
@@ -34,17 +35,129 @@ def images(isa: str) -> dict:
             "runtime": {"id": f"runtime-{isa.lower()}"}}
 
 
-def pr_report() -> dict:
+def pr_report(scope: pr_runner.PRTestScope = pr_runner.PRTestScope.HOST) -> dict:
     """Build a scoped PR receipt; full accelerator preflight remains unproven."""
-    return {"schema": 1, "scope": "unit-and-host", "complete": True, "return_code": 0,
+    return {"schema": 1, "scope": scope.value, "complete": True, "return_code": 0,
             "lanes": {lane: {"complete": True, "return_code": 0,
-                              "tests": [name], "test_count": 1}
-                      for lane, name in (("unit", "V2_Unit_Contract"),
-                                         ("host", "V2_Integration_HostContract"))}}
+                              "tests": [f"V2_{lane}_Contract"], "test_count": 1}
+                      for lane in scope.lanes}}
 
 
 class DevelopImageGateTests(unittest.TestCase):
     """Keep develop publishing smaller than, and incapable of replacing, certification."""
+
+    def test_single_gpu_admission_rejects_ambiguous_ownership(self):
+        """Replay both vendors and reject the former duplicate-rank launch contract."""
+        rows = tuple(pr_runner.PreflightRegistration(
+            name=f"V2_Integration_{vendor}",
+            labels=frozenset({"Integration", "ProductionTestPreflight", "DevelopGPUPreflight",
+                              "SingleGPU", vendor}), mpi_ranks=1, lane=lane, ctest_index=index)
+            for index, (vendor, lane) in enumerate((
+                ("CUDA", pr_runner.PreflightExecutionLane.CUDA_SOCKET),
+                ("ROCm", pr_runner.PreflightExecutionLane.ROCM_SOCKET)), start=1))
+        expected = {"cuda": (rows[0].name,), "rocm": (rows[1].name,)}
+        for _ in range(3):
+            self.assertEqual(pr_runner.single_gpu_plan(rows), expected)
+        for change in (
+                {"mpi_ranks": 2}, {"mpi_ranks": None},
+                {"labels": rows[0].labels - {"SingleGPU"}},
+                {"labels": rows[0].labels | {"HardwareOptional"}},
+                {"labels": rows[0].labels | {"ROCm"}},
+                {"lane": pr_runner.PreflightExecutionLane.EXCLUSIVE}):
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, "single-device"):
+                pr_runner.single_gpu_plan((replace(rows[0], **change), rows[1]))
+        for incomplete in ((), rows[:1], rows[1:]):
+            with self.assertRaisesRegex(ValueError, "nonempty CUDA and ROCm"):
+                pr_runner.single_gpu_plan(incomplete)
+
+    def test_gpu_scope_executes_exact_ctest_inventory_and_rejects_skips(self):
+        """Replay native CTest indices with poisoned unselected cases and failed GPUs."""
+        for outcome in (0, 9, 77):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                build = root / "build"
+                build.mkdir()
+                # This device-free launcher fixture preserves explicit MPI argv
+                # while executing one Python child, with no MPI or GPU runtime.
+                launcher = root / "mpirun"
+                launcher.write_text(f'#!{sys.executable}\nimport os, sys\n'
+                                    'assert sys.argv[1:3] == ["-np", "1"]\n'
+                                    'os.execv(sys.argv[3], sys.argv[3:])\n')
+                launcher.chmod(0o755)
+                forbidden = root / "unselected-ran"
+                lines = []
+                for name, vendor, selected in (("Host", "", False), ("ROCm", "ROCm", True),
+                                                ("Mixed", "CUDA;ROCm", False),
+                                                ("CUDA", "CUDA", True)):
+                    code = (f"raise SystemExit({outcome if vendor == 'ROCm' else 0})" if selected else
+                            f"from pathlib import Path; Path('{forbidden}').touch(); raise SystemExit(99)")
+                    labels = f"Integration;ProductionTestPreflight;{vendor}"
+                    if selected:
+                        labels += ";DevelopGPUPreflight;SingleGPU"
+                    lines += [f'add_test(V2_Integration_{name} "{launcher}" -np 1 '
+                              f'"{sys.executable}" -c "{code}")',
+                              f'set_tests_properties(V2_Integration_{name} PROPERTIES '
+                              f'LABELS "{labels}" TIMEOUT 30 SKIP_RETURN_CODE 77)']
+                (build / "CTestTestfile.cmake").write_text("\n".join(lines) + "\n")
+                output = root / "out"
+                arguments = ["--scope", "single-gpu", "--build-dir", str(build),
+                             "--installed-build-receipt", str(root / "receipt"), "--output", str(output)]
+                with patch.object(pr_runner, "validate"):
+                    if outcome == 77:
+                        with self.assertRaisesRegex(ValueError, "without skipping"):
+                            pr_runner.main(arguments)
+                    else:
+                        self.assertEqual(pr_runner.main(arguments) == 0, outcome == 0)
+                self.assertFalse(forbidden.exists())
+                report = json.loads((output / "pr-tests.json").read_text())
+                self.assertEqual(report["scope"], "single-gpu")
+                self.assertEqual(report["complete"], outcome == 0)
+                self.assertEqual(report["lanes"]["cuda"]["tests"], ["V2_Integration_CUDA"])
+                self.assertEqual(report["lanes"]["rocm"]["tests"], ["V2_Integration_ROCm"])
+
+    def test_gpu_checks_use_separate_required_container_and_receipt(self):
+        """Keep Unit device-free and require both subsequent vendor observations."""
+        for mutation in (None, "missing-rocm", "skipped-rocm", "failed-rocm"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                scopes = []
+
+                def execute(command, log):
+                    scope = (pr_runner.PRTestScope.GPU if "--gpus" in command
+                             else pr_runner.PRTestScope.HOST)
+                    scopes.append(scope)
+                    prefix = "pr-gpu-tests" if scope is pr_runner.PRTestScope.GPU else "pr-tests"
+                    report = pr_report(scope)
+                    if scope is pr_runner.PRTestScope.GPU:
+                        self.assertEqual(command[-2:], ["--scope", "single-gpu"])
+                        if mutation == "missing-rocm":
+                            report["lanes"].pop("rocm")
+                        elif mutation == "skipped-rocm":
+                            report["lanes"]["rocm"]["complete"] = False
+                        elif mutation == "failed-rocm":
+                            report["lanes"]["rocm"]["return_code"] = 8
+                    gate.write_json(directory / prefix / "pr-tests.json", report)
+
+                with patch.object(gate.docker_paths, "device_args",
+                                  side_effect=[[], ["--gpus", "all", "--device", "/dev/kfd"]]) as devices, \
+                     patch.object(gate.docker_paths, "mounts", return_value=[]), \
+                     patch.object(gate, "run", side_effect=execute), \
+                     patch.object(gate.subprocess, "run"):
+                    if mutation is None:
+                        report = gate.run_pr_tests(images("AVX2"), directory, gate.PRGPUCoverage.CUDA_ROCM)
+                        self.assertEqual(set(report["lanes"]), {"unit", "host", "cuda", "rocm"})
+                        self.assertEqual(report["scope"], "unit-host-single-gpu")
+                    else:
+                        with self.assertRaisesRegex(ValueError, "incomplete"):
+                            gate.run_pr_tests(images("AVX2"), directory, gate.PRGPUCoverage.CUDA_ROCM)
+                    self.assertEqual([call.args[1] for call in devices.call_args_list], ["CPU", "CUDA+ROCm"])
+                self.assertEqual(scopes, [pr_runner.PRTestScope.HOST, pr_runner.PRTestScope.GPU])
+                self.assertEqual((directory / "pr-validation.json").exists(), mutation is None)
+
+    def test_gpu_requirements_cannot_be_ignored_by_build_only(self):
+        """Reject a requested GPU gate when the transaction would not execute tests."""
+        with self.assertRaises(SystemExit):
+            gate.parse_arguments(["--output", "/unused", "--build-only", "--pr-gpus", "CUDA+ROCm"])
 
     def test_pr_driver_runs_exact_unit_and_host_inventories_and_rejects_skips(self):
         """Replay real CTest selection while poison accelerator cases stay unrun."""
@@ -341,8 +454,8 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(job["runs-on"], "${{ matrix.runner }}")
         self.assertEqual(job["strategy"], {"fail-fast": "false", "max-parallel": "2",
             "matrix": {"cpu_isa": ["AVX2", "AVX512"], "include": [
-                {"cpu_isa": "AVX2", "runner": "llaminar-develop-avx2"},
-                {"cpu_isa": "AVX512", "runner": "llaminar-avx512"}]}})
+                {"cpu_isa": "AVX2", "runner": "llaminar-develop-avx2", "pr_gpus": "CUDA+ROCm"},
+                {"cpu_isa": "AVX512", "runner": "llaminar-avx512", "pr_gpus": "none"}]}})
         self.assertEqual(len({row["runner"] for row in job["strategy"]["matrix"]["include"]}), 2)
         self.assertEqual(f"{caller['name']} / {job['name']}",
                          "Develop PR / Unit + host (${{ matrix.cpu_isa }})")
@@ -369,6 +482,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertNotIn("sudo", "\n".join(commands))
         build_step = next(step for step in steps if "exec python3" in step.get("run", ""))
         self.assertEqual(build_step["env"], {"CPU_ISA": "${{ matrix.cpu_isa }}",
+                                            "PR_GPUS": "${{ matrix.pr_gpus }}",
                                             "LLAMINAR_DOCKER_BUILD_CACHE_ACCESS": "import-only"})
         self.assertIn("LLAMINAR_DOCKER_BUILD_CACHE_IMAGE", commands[-1])
         artifact = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
@@ -379,7 +493,11 @@ class DevelopImageGateTests(unittest.TestCase):
             self.assertEqual(command[:2], ["python3", "scripts/ci/run_develop_image_gate.py"])
             arguments = command[2:]
             arguments[arguments.index("--cpu-isa") + 1] = isa
+            gpu_policy = next(row["pr_gpus"] for row in job["strategy"]["matrix"]["include"]
+                              if row["cpu_isa"] == isa)
+            arguments[arguments.index("--pr-gpus") + 1] = gpu_policy
             policy = gate.parse_arguments(arguments)
+            self.assertEqual(policy.pr_gpus.value, gpu_policy)
             self.assertEqual(policy.cpu_isas, [isa])
             self.assertFalse(policy.publish)
             self.assertIsNone(policy.image)
@@ -397,9 +515,14 @@ class DevelopImageGateTests(unittest.TestCase):
                     events.append(("build", args.cpu_isa))
                     return images(args.cpu_isa)
 
-                def unit_tests(built, directory):
+                def unit_tests(built, directory, gpu_coverage):
                     events.append(("unit", built["test-runner"]["id"]))
-                    return pr_report()
+                    self.assertEqual(gpu_coverage.value, gpu_policy)
+                    report = pr_report()
+                    report["scope"] = gpu_coverage.validation
+                    if gpu_coverage is gate.PRGPUCoverage.CUDA_ROCM:
+                        report["lanes"].update(pr_report(pr_runner.PRTestScope.GPU)["lanes"])
+                    return report
 
                 with patch.object(gate, "require_host_cpu_isa") as cpu_admission, \
                      patch.object(gate, "source_identity", return_value=source), \
@@ -416,7 +539,7 @@ class DevelopImageGateTests(unittest.TestCase):
                 self.assertTrue(receipt["complete"])
                 self.assertFalse(receipt["published"])
                 self.assertEqual(set(receipt["variants"]), {isa})
-                self.assertEqual(receipt["validation"], "unit-and-host")
+                self.assertEqual(receipt["validation"], policy.pr_gpus.validation)
                 self.assertEqual(receipt["variants"][isa]["unit_test_count"], 1)
                 self.assertEqual(receipt["variants"][isa]["host_test_count"], 1)
 

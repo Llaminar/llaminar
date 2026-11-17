@@ -5,7 +5,8 @@ This intentionally small gate is distinct from the full production
 certification pipeline. The develop push selects build-only publication of
 AVX512 and AVX2 full-backend runtimes without compiling or running test images.
 The separate PR gate runs the complete CMake-owned Unit inventory and the
-canonical host preflight lane inside its installed test runner, without GPUs.
+canonical host preflight lane inside a device-free container. AVX2 PRs also
+require the CMake-owned single-device CUDA/ROCm inventory in a separate container.
 Neither policy discovers models, stages a
 corpus, launches a server, runs mathematical parity, E2E, remote MPI, or a
 benchmark, and it never calls an image a certified release artifact.
@@ -13,6 +14,7 @@ benchmark, and it never calls an image a certified release artifact.
 from __future__ import annotations
 
 import argparse
+from enum import Enum
 import json
 import os
 from pathlib import Path
@@ -22,6 +24,7 @@ import sys
 import uuid
 
 import docker_paths
+from run_develop_pr_tests import PRTestScope
 from production_artifacts import CPUISA, digest, image_identity, write_json
 from run_production_cross_host_e2e import CPU_ISA_FEATURES
 from run_production_pipeline import (
@@ -30,6 +33,18 @@ from run_production_pipeline import (
 )
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+class PRGPUCoverage(str, Enum):
+    """Explicit accelerator requirement; missing GPUs never change the policy."""
+
+    NONE = "none"
+    CUDA_ROCM = "CUDA+ROCm"
+
+    @property
+    def validation(self) -> str:
+        """Name the complete requested PR evidence without implying release approval."""
+        return "unit-and-host" if self is PRGPUCoverage.NONE else "unit-host-single-gpu"
 
 
 def require_host_cpu_isa(isa: str) -> None:
@@ -86,8 +101,8 @@ def remote_image_id(tag: str) -> str | None:
     return identity
 
 
-def run_pr_tests(images: dict, directory: Path) -> dict:
-    """Run complete Unit and host-preflight inventories without exposing accelerators.
+def _run_pr_scope(images: dict, directory: Path, scope: PRTestScope) -> dict:
+    """Run one container with exactly its declared CPU or GPU ownership.
 
     The test runner already contains its immutable model-free executable inventory
     and installed receipt.  Bind only the evidence directory; attaching models
@@ -95,36 +110,53 @@ def run_pr_tests(images: dict, directory: Path) -> dict:
     a second, undocumented input surface.
     """
     image = images[ImageRole.TEST_RUNNER.value]["id"]
-    name = "llaminar-develop-pr-tests-" + uuid.uuid4().hex
+    prefix = "pr-tests" if scope is PRTestScope.HOST else "pr-gpu-tests"
+    name = "llaminar-develop-" + prefix + "-" + uuid.uuid4().hex
     command = ["python3", "scripts/ci/run_develop_pr_tests.py",
                "--build-dir", "build_v2_integration",
                "--installed-build-receipt", "/src/installed-tests.json",
-               "--output", "/ci-results/pr-tests"]
-    # Native CPU MPI tests need the same namespace, shared-memory and ptrace
-    # contract as other CPU test runners; this selector exposes no GPU devices.
+               "--output", f"/ci-results/{prefix}"]
+    if scope is PRTestScope.GPU:
+        command += ["--scope", scope.value]
+    # Unit and host never see device nodes. The later GPU scope requires both
+    # vendors through the same Docker device/group authority as production.
     launch = ["docker", "run", "--rm", "--name", name,
-              *docker_paths.device_args(image, "CPU", user=f"{os.getuid()}:{os.getgid()}"),
+              *docker_paths.device_args(image, scope.backends, user=f"{os.getuid()}:{os.getgid()}"),
               *(part for group in os.getgroups() for part in ("--group-add", str(group))),
               *docker_paths.mounts([(directory, "/ci-results", False)]),
               "-w", "/src", image,
-              *logged_container_command(command, "/ci-results/pr-tests.process.log")]
+              *logged_container_command(command, f"/ci-results/{prefix}.process.log")]
     try:
-        run(launch, directory / "pr-tests.log")
+        run(launch, directory / f"{prefix}.log")
     finally:
         subprocess.run(["docker", "rm", "-f", name], check=False, timeout=30,
                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    report_path = directory / "pr-tests" / "pr-tests.json"
+    report_path = directory / prefix / "pr-tests.json"
     report = json.loads(report_path.read_text())
-    if (report.get("scope") != "unit-and-host" or report.get("complete") is not True
+    if (report.get("scope") != scope.value or report.get("complete") is not True
             or report.get("return_code") != 0
-            or set(report.get("lanes", {})) != {"unit", "host"}):
-        raise ValueError("PR Unit/host receipt is incomplete or unsuccessful")
+            or set(report.get("lanes", {})) != set(scope.lanes)):
+        raise ValueError(f"PR {scope.value} receipt is incomplete or unsuccessful")
     for lane in report["lanes"].values():
         tests = lane.get("tests", [])
         if (lane.get("complete") is not True or lane.get("return_code") != 0
                 or not tests or lane.get("test_count") != len(tests)
                 or len(set(tests)) != len(tests)):
-            raise ValueError("PR Unit/host lane is incomplete or unsuccessful")
+            raise ValueError(f"PR {scope.value} lane is incomplete or unsuccessful")
+    return report
+
+
+def run_pr_tests(images: dict, directory: Path,
+                 gpu_coverage: PRGPUCoverage = PRGPUCoverage.NONE) -> dict:
+    """Finish CPU gates before opening either GPU, retaining separate receipts."""
+    host = _run_pr_scope(images, directory, PRTestScope.HOST)
+    if gpu_coverage is PRGPUCoverage.NONE:
+        return host
+    gpu = _run_pr_scope(images, directory, PRTestScope.GPU)
+    report = {"schema": 1, "scope": gpu_coverage.validation, "complete": True,
+              "return_code": 0, "lanes": {**host["lanes"], **gpu["lanes"]},
+              "scope_digests": {host["scope"]: digest(host), gpu["scope"]: digest(gpu)}}
+    write_json(directory / "pr-validation.json", report)
     return report
 
 
@@ -150,7 +182,7 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     """Parse only the small explicit surface supported by the develop gate."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--output", type=Path, required=True,
-                        help="new ignored directory for build or Unit/host evidence")
+                        help="new ignored directory for build or required PR scope evidence")
     parser.add_argument("--image", help="AVX512 develop runtime tag; AVX2 appends -avx2")
     parser.add_argument("--build-only", action="store_true",
                         help="build runtime images without compiling or executing Unit/preflight tests")
@@ -158,6 +190,10 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
                         help="push both runtime images after both selected ISA transactions succeed")
     parser.add_argument("--cpu-isa", choices=SHIPPING_ISAS, action="append", dest="cpu_isas",
                         help="explicit local diagnostic ISA subset; publication requires both")
+    parser.add_argument("--pr-gpus", type=PRGPUCoverage,
+                        choices=[coverage.value for coverage in PRGPUCoverage],
+                        default=PRGPUCoverage.NONE,
+                        help="require single-device CUDA and ROCm PR checks after Unit/host")
     args = parser.parse_args(argv)
     requested = args.cpu_isas or list(SHIPPING_ISAS)
     if len(set(requested)) != len(requested):
@@ -166,7 +202,9 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     if args.publish and (not args.image or set(args.cpu_isas) != set(SHIPPING_ISAS)):
         parser.error("--publish requires --image and both AVX512 and AVX2 gates")
     if args.publish and not args.build_only:
-        parser.error("--publish requires --build-only; PR Unit/host validation never publishes")
+        parser.error("--publish requires --build-only; PR validation never publishes")
+    if args.build_only and args.pr_gpus is not PRGPUCoverage.NONE:
+        parser.error("--pr-gpus cannot be combined with --build-only")
     args.output = args.output.resolve()
     return args
 
@@ -183,7 +221,7 @@ def main(argv: list[str] | None = None) -> int:
     source = source_identity()
     receipt = {"schema": 1, "source": source, "complete": False, "published": False,
                "variants": {}, "image": args.image,
-               "validation": "build-only" if args.build_only else "unit-and-host"}
+               "validation": "build-only" if args.build_only else args.pr_gpus.validation}
     write_json(args.output / "develop-image-gate.json", receipt)
     for isa in args.cpu_isas:
         if source_identity() != source:
@@ -203,7 +241,7 @@ def main(argv: list[str] | None = None) -> int:
                            test_inventory=TestRunnerInventory.MODEL_FREE)
             require_image(images[ImageRole.TEST_RUNNER.value], source, isa, ImageRole.TEST_RUNNER,
                           test_inventory=TestRunnerInventory.MODEL_FREE)
-            pr_tests = run_pr_tests(images, directory)
+            pr_tests = run_pr_tests(images, directory, args.pr_gpus)
             variant = {
                 "test_runner_image": images[ImageRole.TEST_RUNNER.value]["id"],
                 "test_runner_inventory": TestRunnerInventory.MODEL_FREE.value,
@@ -211,6 +249,9 @@ def main(argv: list[str] | None = None) -> int:
                 "unit_test_count": pr_tests["lanes"]["unit"]["test_count"],
                 "host_test_count": pr_tests["lanes"]["host"]["test_count"],
             }
+            if args.pr_gpus is PRGPUCoverage.CUDA_ROCM:
+                variant["gpu_test_counts"] = {
+                    lane: pr_tests["lanes"][lane]["test_count"] for lane in PRTestScope.GPU.lanes}
         receipt["variants"][isa] = variant
         write_json(args.output / "develop-image-gate.json", receipt)
     if source_identity() != source:

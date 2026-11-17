@@ -5145,6 +5145,18 @@ set_tests_properties(V2_Integration_DevelopPRGateContract PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;BuildSystem;Container;PullRequest;Regression"
     TIMEOUT 15
 )
+add_test(NAME V2_Integration_DevelopSingleGPUPreflightAdmission
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_develop_image_gate.py
+            DevelopImageGateTests.test_single_gpu_admission_rejects_ambiguous_ownership
+            DevelopImageGateTests.test_gpu_scope_executes_exact_ctest_inventory_and_rejects_skips
+            DevelopImageGateTests.test_gpu_checks_use_separate_required_container_and_receipt
+            DevelopImageGateTests.test_gpu_requirements_cannot_be_ignored_by_build_only
+)
+set_tests_properties(V2_Integration_DevelopSingleGPUPreflightAdmission PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;Container;PullRequest;Regression"
+    TIMEOUT 15
+)
 
 # Model-free admission, phase thresholds and lifecycle failures are fast gates.
 # Full vocabulary/model work belongs only to the published master GPU gate.
@@ -24305,7 +24317,7 @@ foreach(measurement_backend IN ITEMS CPU CUDA ROCm)
             COMMAND $<TARGET_FILE:v2_integration_planning_execution_measurement>
                 --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_CoalescedPool
             LABELS "V2;Integration;Kernels;${measurement_backend};Regression"
-            TIMEOUT 120 NO_MODELS)
+            MPI_PROCS 1 TIMEOUT 120 NO_MODELS)
     endif()
 endforeach()
 
@@ -38297,6 +38309,33 @@ foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     endif()
     set_property(TEST ${V2_PREFLIGHT_TEST} APPEND PROPERTY
         LABELS ProductionTestPreflight)
+endforeach()
+
+# PR accelerators have one device per vendor. These complete single-device
+# fixtures exercise production prepared weights, captured execution/replay and
+# arena-backed RAM-prefix initialization without models or dual-GPU skips.
+# Keep membership here so PR drivers consume the same CTest authority as the
+# complete production gate. A missing registration is an error, not a reduced
+# PR lane. Prepared-weight binding above owns one process and one device;
+# its independent fixture has no cross-rank work to duplicate across MPI ranks.
+foreach(V2_PR_GPU_BACKEND IN ITEMS CUDA ROCm)
+    if((V2_PR_GPU_BACKEND STREQUAL "CUDA" AND NOT HAVE_CUDA) OR
+       (V2_PR_GPU_BACKEND STREQUAL "ROCm" AND NOT HAVE_ROCM))
+        continue()
+    endif()
+    foreach(V2_PR_GPU_FAMILY IN ITEMS
+            GPUPreparedWeightBinding GPUGraphCaptureExecution GPURamPrefixInitialization)
+        set(V2_PR_GPU_TEST V2_Integration_${V2_PR_GPU_FAMILY}_${V2_PR_GPU_BACKEND})
+        if(NOT TEST ${V2_PR_GPU_TEST})
+            message(FATAL_ERROR "Single-device PR GPU test is not registered: ${V2_PR_GPU_TEST}")
+        endif()
+        get_property(V2_PR_GPU_LABELS TEST ${V2_PR_GPU_TEST} PROPERTY LABELS)
+        if(NOT "ProductionTestPreflight" IN_LIST V2_PR_GPU_LABELS)
+            message(FATAL_ERROR "PR GPU test must belong to production preflight: ${V2_PR_GPU_TEST}")
+        endif()
+        set_property(TEST ${V2_PR_GPU_TEST} APPEND PROPERTY
+            LABELS "DevelopGPUPreflight;SingleGPU")
+    endforeach()
 endforeach()
 
 
