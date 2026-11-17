@@ -174,6 +174,22 @@ class PreflightInventoryOwnershipTests(unittest.TestCase):
                 self.assertTrue(counts | {"LocalHostDevices", "HardwareOptional"} <= set(native_labels))
                 self.assertNotIn("HardwareOptional", rejection_labels)
 
+    def test_ticket_cutpoints_qualify_physical_tp_peers_and_keep_single_gpu_prefill(self) -> None:
+        """The single-GPU shared FFN cutpoint remains mandatory independently of the TP peers."""
+        tests = {row["name"]: row for row in self.document["tests"]}
+        for backend in ("CUDA", "ROCm"):
+            if backend.lower() not in BACKENDS:
+                continue
+            for case in ("PrefillEarlyCPUTicket", "LocalTPNativeTicketCutpoint", "LocalTPPrefillEarlyCPUTicket"):
+                row = tests[f"V2_Integration_Qwen35MoE{case}_{backend}"]
+                labels = next(prop["value"] for prop in row["properties"] if prop["name"] == "LABELS")
+                with self.subTest(backend=backend, case=case):
+                    self.assertIn("ProductionTestPreflight", labels)
+                    if case.startswith("LocalTP"):
+                        self.assertTrue({"HardwareOptional", "Devices2", "LocalHostDevices"} <= set(labels))
+                    else:
+                        self.assertNotIn("HardwareOptional", labels)
+
     def test_every_filter_retains_complete_process_ownership(self) -> None:
         """CUDA, ROCm and performance filters inherit their executable's scope."""
         self.assertTrue(validate_inventory(self.document, BACKENDS))

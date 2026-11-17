@@ -27554,20 +27554,28 @@ foreach(V2_CANONICAL_JOIN_BACKEND IN ITEMS CUDA ROCm)
             COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
                     --gtest_filter=Test__Qwen35MoEGraphNativeProductionLowering.LocalTPCPUTicketNativeCollective${V2_CANONICAL_JOIN_BACKEND}
             LABELS "V2;Integration;ProductionTestPreflight;${V2_CANONICAL_JOIN_BACKEND};CPU;MoE;ExpertOverlay;MPI;GraphCapture;Regression"
-            MPI_PROCS 1
+            GPU_DEVICES 2 MPI_PROCS 1
             NO_MODELS
             TIMEOUT 30
         )
         list(APPEND V2_OVERLAY_TICKET_LOWERING_PREFLIGHT_TESTS ${V2_LOCAL_TP_NATIVE_TICKET_TEST})
-        set(V2_EARLY_CPU_TICKET_TEST
-            V2_Integration_Qwen35MoEPrefillEarlyCPUTicket_${V2_CANONICAL_JOIN_BACKEND})
-        add_v2_test(${V2_EARLY_CPU_TICKET_TEST}
-            COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
-                    --gtest_filter=Test__Qwen35MoEGraphNativeProductionLowering.PrefillCPUTicketPrecedesSharedFFN${V2_CANONICAL_JOIN_BACKEND}
-            LABELS "V2;Integration;ProductionTestPreflight;${V2_CANONICAL_JOIN_BACKEND};CPU;MoE;ExpertOverlay;GraphCapture;Ordering;Regression"
-            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
-        list(APPEND V2_OVERLAY_TICKET_LOWERING_PREFLIGHT_TESTS ${V2_EARLY_CPU_TICKET_TEST})
-
+        foreach(_prefill_topology IN ITEMS SingleGPU LocalTP)
+            if(_prefill_topology STREQUAL "SingleGPU")
+                set(_prefill_prefix "")
+                set(_prefill_devices "")
+            else()
+                set(_prefill_prefix LocalTP)
+                set(_prefill_devices GPU_DEVICES 2)
+            endif()
+            set(V2_EARLY_CPU_TICKET_TEST
+                V2_Integration_Qwen35MoE${_prefill_prefix}PrefillEarlyCPUTicket_${V2_CANONICAL_JOIN_BACKEND})
+            add_v2_test(${V2_EARLY_CPU_TICKET_TEST}
+                COMMAND $<TARGET_FILE:v2_test_qwen35moe_graph_native_production_lowering>
+                        --gtest_filter=Test__Qwen35MoEGraphNativeProductionLowering.${_prefill_prefix}PrefillCPUTicketPrecedesSharedFFN${V2_CANONICAL_JOIN_BACKEND}
+                LABELS "V2;Integration;ProductionTestPreflight;${V2_CANONICAL_JOIN_BACKEND};CPU;MoE;ExpertOverlay;GraphCapture;Ordering;Regression"
+                MPI_PROCS 1 ${_prefill_devices} NO_MODELS TIMEOUT 30)
+            list(APPEND V2_OVERLAY_TICKET_LOWERING_PREFLIGHT_TESTS ${V2_EARLY_CPU_TICKET_TEST})
+        endforeach()
     endif()
 endforeach()
 
