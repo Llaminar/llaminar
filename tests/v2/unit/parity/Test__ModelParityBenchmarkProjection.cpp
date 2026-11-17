@@ -96,8 +96,8 @@ namespace llaminar2::test::parity
                     cell, ModelParityRuntimePlacementProjection::AutomaticCell));
                 EXPECT_NE(exported["benchmark"]["args"], exported["e2e"]["server_args"]);
             }
-        // Since release eligibility moved to the bounded release matrix, the
-        // legacy diagnostic definitions in this set must contribute no tags;
+        // Release eligibility lives in the bounded release matrix, so the
+        // legacy diagnostic definitions in this set contribute no tags;
         // every benchmark cell comes from a release topology and times the
         // same production defaults. The count therefore follows the canonical
         // release population instead of restating it as a magic number.

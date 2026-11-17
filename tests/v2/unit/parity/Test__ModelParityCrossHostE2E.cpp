@@ -204,8 +204,9 @@ namespace llaminar2::test::parity
         const auto variants = qwen36::withOrnith15CertificationModels(definitions);
         ASSERT_EQ(variants.size(), 2u);
         EXPECT_EQ(variants.front().e2e_certifiable.front().remote_cpu_overlays.size(), 2u);
-        // The fine-tune withdraws every inherited runtime eligibility profile
-        // (432d93c90), so it cannot reach remote overlay certification at all.
+        // The fine-tune exports no runtime eligibility profile of its own
+        // and inherits none from its source model, so it cannot reach remote
+        // overlay certification at all.
         EXPECT_TRUE(variants.back().e2e_certifiable.empty());
         for (const auto &cell : expandModelParityDefinition(variants.back()))
             EXPECT_TRUE(record(cell).at("cross_host_e2e").empty());
@@ -213,10 +214,10 @@ namespace llaminar2::test::parity
 
     TEST(ModelParityCrossHostE2E, LegacyDefinitionCarriesNoImplicitRemoteEligibility)
     {
-        // Historical SIGSEGV control: 432d93c90 moved release eligibility to
-        // the six-cell release matrix, and these unit proofs must construct
-        // their remote tag explicitly. A legacy definition that silently
-        // regains a tag would reintroduce unchecked `.front()` assumptions.
+        // Release eligibility lives in the bounded release matrix; these unit
+        // proofs must construct their remote tag explicitly. A legacy
+        // definition that silently regains a tag would reintroduce unchecked
+        // `.front()` assumptions in downstream projections.
         const auto legacy = qwen36::qwen36MoEParityDefinition(
             qwen36::qwen36SingleDeviceTopology("SourceGPU", GlobalDeviceAddress::rocm(0)),
             "/reference", qwen36::qwen36MoESingleDeviceThresholds());

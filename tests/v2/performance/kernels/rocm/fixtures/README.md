@@ -33,7 +33,10 @@ fixtures, exactly as the validators require.
 ## Files
 
 - `rocm_native_quantised_prefill_alias_smoke.csv`
-  - Rows: Q4_1, Q5_1, Q8_0, IQ4_XS, IQ4_NL in `prefill` phase.
+  - Rows: Q4_1, Q5_1, Q8_0, Q8_1, Q8_K, IQ4_XS, IQ4_NL in `prefill` phase.
+    Q8_1 (source codebook 20) and Q8_K (source 21) both execute on physical
+    codebook 19 and collapse into the single generated `CB=19 (Q8_0)` runtime
+    branch together with Q8_0.
   - Satisfies `validate_rocm_native_quantised_trainer_csv.py`
     (`--require-alias-group --require-policy-prefill-m --require-prefill-m 600`) and the
     prefill generator's fragments `CB=5/7/19/24/4`, `{128,32,1,2}`, `M=600`,
