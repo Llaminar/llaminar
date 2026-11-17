@@ -11,6 +11,7 @@
 #include "CUDAHardwareMetadata.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "utils/DebugEnv.h"
+#include "utils/Logger.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstring>
@@ -27,8 +28,17 @@ namespace llaminar2
         }
         /**
          * @brief Enumerate one complete native visibility set without selecting a context.
-         * @return Exact ordered records; a genuine no-device result is empty.
+         * @return Exact ordered records; any genuine no-device result is empty.
          * @throws std::runtime_error On a failed native query, never publishing a partial set.
+         *
+         * A member whose installed NVIDIA driver cannot serve this runtime (a
+         * driverless host or a stub driver, reported as
+         * `cudaErrorInsufficientDriver` or `cudaErrorSystemDriverMismatch`)
+         * exposes no CUDA-capable device to this process; that is a complete
+         * empty visibility set, not a failed query. Full-backend binaries must
+         * keep discovering and serving on CPU-only cluster members, while an
+         * explicit CUDA request still fails at admission with its own device
+         * diagnostic instead of a discovery crash.
          */
         std::vector<CUDADeviceHardware> readHardware()
         {
@@ -39,6 +49,13 @@ namespace llaminar2
             int count = 0;
             const auto status = cudaGetDeviceCount(&count);
             if (status == cudaErrorNoDevice) return {};
+            if (status == cudaErrorInsufficientDriver || status == cudaErrorSystemDriverMismatch)
+            {
+                LOG_WARN("CUDA discovery found no usable NVIDIA driver for this runtime ("
+                    << cudaGetErrorString(status)
+                    << "); this member publishes an empty CUDA visibility set");
+                return {};
+            }
             if (status != cudaSuccess)
                 throw std::runtime_error(std::string("CUDA hardware enumeration failed: ") + cudaGetErrorString(status));
             if (count < 0)
