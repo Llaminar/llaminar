@@ -7,10 +7,14 @@
  * The binding classifier is additionally driven through the one shared native
  * probe (probeNativeLibraryBinding, the same implementation the production
  * driver-presence authority calls) with genuine loader outcomes: a genuinely
- * missing requested SONAME, a real DSO whose dependency is missing, a real DSO
- * with an unresolvable symbol, a present-but-invalid binary and a loadable
- * system library. Fixture files live in exclusive per-test temporary storage
- * with scope-bound cleanup. No CUDA SDK, driver or device is required.
+ * missing requested SONAME, build-owned fixtures whose dependency and import
+ * contracts this tree owns (one NEEDED entry provided only by a link-time
+ * stub that never ships, one import nothing defines), a present-but-invalid
+ * binary and a loadable build-owned library. Every real-fault control is
+ * architecture-neutral and asserts the loader's own diagnostic names the
+ * owned fault. Invalid-binary bytes live in exclusive per-test temporary
+ * storage with scope-bound cleanup. No CUDA SDK, driver or device is
+ * required, and no arbitrary system library is inspected.
  */
 #include "backends/cuda/CUDADiscoveryAdmission.h"
 #include <gtest/gtest.h>
@@ -25,6 +29,16 @@
 #include <string_view>
 #include <system_error>
 #include <vector>
+
+#ifndef LLAMINAR_NATIVE_LOADER_MISSING_DEPENDENCY_FIXTURE
+#error "the native loader proof requires its build-owned missing-dependency fixture"
+#endif
+#ifndef LLAMINAR_NATIVE_LOADER_UNDEFINED_SYMBOL_FIXTURE
+#error "the native loader proof requires its build-owned undefined-symbol fixture"
+#endif
+#ifndef LLAMINAR_NATIVE_LOADER_LOADABLE_FIXTURE
+#error "the native loader proof requires its build-owned loadable fixture"
+#endif
 
 namespace llaminar2::test
 {
@@ -84,25 +98,21 @@ namespace llaminar2::test
             std::filesystem::path path_;
         };
 
-        /** @brief Copy a real system library and rename one NUL-delimited byte string. */
-        std::filesystem::path editedSystemLibraryCopy(const std::filesystem::path &destination,
-            const std::string &from, const std::string &to)
-        {
-            EXPECT_EQ(from.size(), to.size());
-            std::ifstream source("/lib/x86_64-linux-gnu/libm.so.6", std::ios::binary);
-            EXPECT_TRUE(source.is_open());
-            std::vector<char> bytes{std::istreambuf_iterator<char>{source},
-                                    std::istreambuf_iterator<char>{}};
-            const std::string delimited{std::string{'\0'} + from + '\0'};
-            const auto position = std::string(bytes.data(), bytes.size()).find(delimited);
-            EXPECT_NE(position, std::string::npos) << "system library lacks the expected string";
-            if (position == std::string::npos)
-                return {};
-            std::memcpy(bytes.data() + position + 1, to.data(), to.size());
-            std::ofstream output{destination, std::ios::binary | std::ios::trunc};
-            output.write(bytes.data(), static_cast<std::streamsize>(bytes.size()));
-            return destination;
-        }
+        /** @brief The build-owned fixture whose dependency is genuinely absent. */
+        constexpr std::string_view missingDependencyFixture{
+            LLAMINAR_NATIVE_LOADER_MISSING_DEPENDENCY_FIXTURE};
+        /** @brief The build-owned fixture with one unresolvable import. */
+        constexpr std::string_view undefinedSymbolFixture{
+            LLAMINAR_NATIVE_LOADER_UNDEFINED_SYMBOL_FIXTURE};
+        /** @brief The build-owned dependency-light loadable fixture. */
+        constexpr std::string_view loadableFixture{
+            LLAMINAR_NATIVE_LOADER_LOADABLE_FIXTURE};
+        /** @brief The NEEDED entry only the removed link stub provided. */
+        constexpr std::string_view absentDependencyName{
+            "libllaminar-absent-dependency.so.9"};
+        /** @brief The import nothing in this tree or a system provides. */
+        constexpr std::string_view undefinedImportName{
+            "llaminar_test_undefined_import_v1"};
     }
 
     TEST(CUDADiscoveryAdmissionContract, SuccessAndNoDeviceAdmitWithoutProbingBreakage)
@@ -202,38 +212,33 @@ namespace llaminar2::test
         EXPECT_EQ(classifyCUDADriverBinding(missing.loadable, absentRequest, missing.diagnostic),
             Binding::NotInstalled);
 
-        // A real present DSO whose dependency cannot be opened: a copy of the
-        // real system math library with one NEEDED entry renamed to a
-        // nonexistent same-length SONAME. The loader's diagnostic names the
-        // missing dependency, never the requested object's own absence.
+        // A real present DSO whose one dependency cannot be opened: the
+        // build-owned fixture linked against a stub that existed only during
+        // the link. The loader's diagnostic names the missing dependency,
+        // never the requested object's own absence. The contract is owned by
+        // this tree, so the control is identical on every architecture.
         {
-            ExclusiveProbeDirectory missingDependency{"llaminar-missing-dependency-probe"};
-            const std::filesystem::path fixture = editedSystemLibraryCopy(
-                missingDependency.file("libm-missing-dependency.so"), "libc.so.6", "libZ.so.9");
-            const auto outcome = probeNativeLibraryBinding(fixture.string());
+            const auto outcome = probeNativeLibraryBinding(missingDependencyFixture);
             ASSERT_FALSE(outcome.loadable);
-            EXPECT_NE(outcome.diagnostic.find("libZ.so.9"), std::string::npos)
+            EXPECT_NE(outcome.diagnostic.find(absentDependencyName), std::string::npos)
                 << "the loader must name the missing dependency: " << outcome.diagnostic;
-            EXPECT_EQ(classifyCUDADriverBinding(outcome.loadable, fixture.string(), outcome.diagnostic),
-                Binding::PresentButUnbindable);
+            EXPECT_EQ(classifyCUDADriverBinding(outcome.loadable, missingDependencyFixture,
+                outcome.diagnostic), Binding::PresentButUnbindable);
         }
 
-        // A real present DSO with an unresolvable symbol: the same system
-        // library copy with one undefined import renamed to a nonexistent
-        // same-length name. The loader's diagnostic reports the undefined
-        // symbol against the requested object itself.
+        // A real present DSO with an unresolvable symbol: the build-owned
+        // fixture importing a name nothing provides. The loader's diagnostic
+        // reports the undefined-symbol fault and names the import against
+        // the requested object itself.
         {
-            ExclusiveProbeDirectory undefinedSymbol{"llaminar-undefined-symbol-probe"};
-            const std::filesystem::path fixture = editedSystemLibraryCopy(
-                undefinedSymbol.file("libm-undefined-symbol.so"), "qsort", "qsorz");
-            const auto outcome = probeNativeLibraryBinding(fixture.string());
+            const auto outcome = probeNativeLibraryBinding(undefinedSymbolFixture);
             ASSERT_FALSE(outcome.loadable);
             EXPECT_NE(outcome.diagnostic.find("undefined symbol"), std::string::npos)
                 << "the loader must report the fault kind: " << outcome.diagnostic;
-            EXPECT_NE(outcome.diagnostic.find("qsorz"), std::string::npos)
+            EXPECT_NE(outcome.diagnostic.find(undefinedImportName), std::string::npos)
                 << "the loader must name the unresolvable import: " << outcome.diagnostic;
-            EXPECT_EQ(classifyCUDADriverBinding(outcome.loadable, fixture.string(), outcome.diagnostic),
-                Binding::PresentButUnbindable);
+            EXPECT_EQ(classifyCUDADriverBinding(outcome.loadable, undefinedSymbolFixture,
+                outcome.diagnostic), Binding::PresentButUnbindable);
         }
 
         // A present-but-invalid binary: the file exists, so the loader's
@@ -253,11 +258,11 @@ namespace llaminar2::test
                 Binding::PresentButUnbindable);
         }
 
-        // A loadable system library proves the positive presence path through
-        // the same shared probe.
-        const auto loadable = probeNativeLibraryBinding("libm.so.6");
+        // A loadable build-owned library proves the positive presence path
+        // through the same shared probe.
+        const auto loadable = probeNativeLibraryBinding(loadableFixture);
         ASSERT_TRUE(loadable.loadable);
-        EXPECT_EQ(classifyCUDADriverBinding(loadable.loadable, "libm.so.6", loadable.diagnostic),
-            Binding::Loadable);
+        EXPECT_EQ(classifyCUDADriverBinding(loadable.loadable, loadableFixture,
+            loadable.diagnostic), Binding::Loadable);
     }
 }
