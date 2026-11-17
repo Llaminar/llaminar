@@ -12455,10 +12455,13 @@ add_executable(v2_integration_rccl_host_transport_storage
 target_compile_features(v2_integration_rccl_host_transport_storage PRIVATE cxx_std_20)
 target_link_libraries(v2_integration_rccl_host_transport_storage PRIVATE
     llaminar2_core hip::host GTest::gtest)
-add_v2_test(V2_Integration_RCCLHostTransportStorage
-    COMMAND $<TARGET_FILE:v2_integration_rccl_host_transport_storage>
-    LABELS "V2;Integration;ProductionTestPreflight;ROCm;RCCL;Collective;Memory;GraphCapture;Lifecycle;Regression"
-    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+foreach(_rccl_width IN ITEMS 2 4)
+    add_v2_test(V2_Integration_RCCLHostTransportStorage_Clique${_rccl_width}
+        COMMAND $<TARGET_FILE:v2_integration_rccl_host_transport_storage>
+                --gtest_filter=NativeSharedHost/RCCLHostTransportStorageTest.NativePinnedOwnershipSurvivesCapturedReplay/Clique${_rccl_width}*
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;RCCL;Collective;Memory;GraphCapture;Lifecycle;Regression"
+        GPU_DEVICES ${_rccl_width} MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+endforeach()
 add_executable(v2_integration_rccl_backend integration/collective/backends/Test__RCCLBackend.cpp)
 target_link_libraries(v2_integration_rccl_backend 
     llaminar2_core 

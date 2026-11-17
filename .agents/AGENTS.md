@@ -700,8 +700,8 @@ container-scoped retirement even when a shared PID namespace exposes other jobs.
 Same-process SHM connections use native mapped pinned backing; cross-process
 connections retain real IPC, never an exported raw process pointer. The required
 passive storage ABI observes endpoint mappings, not unique physical bytes, and
-must never become a second admission ledger. `V2_Integration_RCCLHostTransportStorage`
-proves captured replay and both endpoint retirement orders; dependency admission
+must never become a second admission ledger. `V2_Integration_RCCLHostTransportStorage_Clique2`
+and `V2_Integration_RCCLHostTransportStorage_Clique4` each prove captured replay and both endpoint retirement orders; dependency admission
 and source-bound packaging regressions also belong to `ProductionTestPreflight`.
 
 ROCm graph execution also requires the canonical HIP runtime built by

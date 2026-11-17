@@ -190,6 +190,17 @@ class PreflightInventoryOwnershipTests(unittest.TestCase):
                     else:
                         self.assertNotIn("HardwareOptional", labels)
 
+    def test_rccl_captured_storage_retains_both_retirement_orders_at_each_clique_width(self) -> None:
+        """Each required native clique has the exact matching address count and replay filter."""
+        tests = {row["name"]: row for row in self.document["tests"]}
+        if "V2_Integration_RCCLBackend" in tests:
+            for width in (2, 4):
+                row = tests[f"V2_Integration_RCCLHostTransportStorage_Clique{width}"]
+                labels = next(prop["value"] for prop in row["properties"] if prop["name"] == "LABELS")
+                self.assertTrue({"HardwareOptional", "LocalHostDevices", f"Devices{width}"} <= set(labels))
+                self.assertIn("--gtest_filter=NativeSharedHost/RCCLHostTransportStorageTest."
+                              f"NativePinnedOwnershipSurvivesCapturedReplay/Clique{width}*", row["command"])
+
     def test_every_filter_retains_complete_process_ownership(self) -> None:
         """CUDA, ROCm and performance filters inherit their executable's scope."""
         self.assertTrue(validate_inventory(self.document, BACKENDS))
