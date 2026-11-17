@@ -864,6 +864,29 @@ COPY --from=test-workspace /src/ /src/
 COPY --from=builder /usr/local/lib/python3.12/dist-packages/ \
      /usr/local/lib/python3.12/dist-packages/
 
+# The sealed CTest registration replays the builder's exact configured MPI
+# library path (CMake recorded the toolchain's unversioned MPI dev link, whose
+# slim-runtime counterpart is only the distro SONAME library). Materialize
+# exactly that recorded link identity from the sealed receipt so the native
+# MPI ABI proof loads the same distro SONAME library the builder selected.
+# A receipt that records no link identity, or a target that does not resolve
+# in this image, fails the image build instead of letting a proof load a
+# different or missing library.
+RUN set -e; \
+    if [ -f /src/installed-tests.json ]; then \
+        link_path="$(jq -r '.inventory.mpi_library.path // empty' /src/installed-tests.json)"; \
+        link_target="$(jq -r '.inventory.mpi_library.link_target // empty' /src/installed-tests.json)"; \
+        if [ -z "$link_path" ]; then \
+            echo "sealed receipt does not record the configured MPI library" >&2; exit 1; \
+        fi; \
+        if [ ! -e "$link_path" ] && [ -n "$link_target" ]; then \
+            ln -s "$link_target" "$link_path"; \
+        fi; \
+        if [ ! -e "$link_path" ]; then \
+            echo "configured MPI library does not resolve in the test runner: $link_path -> ${link_target:-regular file}" >&2; exit 1; \
+        fi; \
+    fi
+
 # Test executables carry the Integration core in their CTest-relative build
 # tree.  ``runtime`` also contains the Release core at /usr/local/lib for the
 # serving executable.  Resolve the test-local library first: mixing a sealed

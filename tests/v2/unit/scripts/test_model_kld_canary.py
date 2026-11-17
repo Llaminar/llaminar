@@ -519,8 +519,12 @@ class ModelKLDPackagingTests(unittest.TestCase):
             registration={'tests':[dict(name='V2_Integration_ModelKLDCanaryCLI',command=[str(binary),'--help'],properties={'LABELS':['ProductionTestPreflight']})]}
             with patch.object(installed.subprocess,'check_output',return_value=json.dumps(registration)):
                 with self.assertRaisesRegex(ValueError,'executable is missing'):installed.inventory(root)
-                for name in ['CMakeCache.txt','compile_commands.json','build.ninja','CMakeFiles/rules.ninja','CTestTestfile.cmake']:
+                mpi_library=root/'usr/lib/openmpi/lib/libmpi.so'
+                mpi_library.parent.mkdir(parents=True)
+                mpi_library.write_bytes(b'fixture MPI runtime library')
+                for name in ['compile_commands.json','build.ninja','CMakeFiles/rules.ninja','CTestTestfile.cmake']:
                     path=root/name;path.parent.mkdir(exist_ok=True);path.write_text('fixture')
+                (root/'CMakeCache.txt').write_text(f'MPI_mpi_LIBRARY:FILEPATH={mpi_library}\n')
                 binary.write_bytes(b'placeholder native observer')
                 inventory=installed.inventory(root);self.assertIn(binary.name,inventory['files'])
                 receipt=root/'receipt.json';receipt.write_text(json.dumps(dict(

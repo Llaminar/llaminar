@@ -5827,8 +5827,13 @@ class InfrastructureTests(unittest.TestCase):
         """A smaller installed Unit image must remain an explicit scope."""
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for name in ("CMakeCache.txt", "compile_commands.json", "build.ninja", "CTestTestfile.cmake"):
+            mpi_library = root / "usr/lib/libmpi.so"
+            mpi_library.parent.mkdir(parents=True)
+            mpi_library.write_bytes(b"fixture MPI runtime library")
+            for name in ("compile_commands.json", "build.ninja", "CTestTestfile.cmake"):
                 (root / name).write_text("fixture")
+            (root / "CMakeCache.txt").write_text(
+                f"MPI_mpi_LIBRARY:FILEPATH={mpi_library}\n")
             (root / "CMakeFiles").mkdir()
             (root / "CMakeFiles/rules.ninja").write_text("fixture")
             (root / "v2_unit").write_text("fixture executable")
@@ -5898,7 +5903,11 @@ class InfrastructureTests(unittest.TestCase):
     def test_installed_seal_allows_unbuilt_tests_outside_pipeline_gates(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory)
-            (path / "CMakeCache.txt").write_text("configured")
+            mpi_library = path / "usr/lib/libmpi.so"
+            mpi_library.parent.mkdir(parents=True)
+            mpi_library.write_bytes(b"fixture MPI runtime library")
+            (path / "CMakeCache.txt").write_text(
+                f"MPI_mpi_LIBRARY:FILEPATH={mpi_library}\n")
             (path / "compile_commands.json").write_text("[]")
             (path / "build.ninja").write_text("configured")
             (path / "CMakeFiles").mkdir()
