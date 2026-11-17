@@ -218,6 +218,48 @@ register_owned_marker(LateUnit "V2;Unit" 3)
             self.assertEqual(properties['ActualPreflight']['PROCESSORS'], 2)
 
 
+    def test_rooted_transport_replay_registration_follows_admitted_sockets(self):
+        """The shared registration module admits both replays only on two real sockets."""
+        single = TOPOLOGY.TestHostTopology((cpu(0, 36, 0, '0'),)).document()
+        dual = json.loads((ROOT / 'tests/v2/fixtures/cpu/dual_socket_28core_smt2_topology.json')
+                          .read_text(encoding='utf-8'))
+        for document, sockets, expected in (
+                (single, 1, []),
+                (dual, 2, ['V2_Integration_CPURootedGatherParallelCopyReplay',
+                           'V2_Integration_ShmemSpinAbsorbingAbortReplay'])):
+            with self.subTest(sockets=sockets), tempfile.TemporaryDirectory(
+                    prefix='llaminar-socket-registration-') as directory:
+                root = Path(directory)
+                (root / 'topology.json').write_text(json.dumps(document), encoding='utf-8')
+                (root / 'CMakeLists.txt').write_text('''cmake_minimum_required(VERSION 3.24)
+project(RootedTransportSocketRegistration NONE)
+include([=[''' + str(MODULE_DIR / 'V2TestHostTopology.cmake') + ''']=])
+file(READ "${CMAKE_CURRENT_SOURCE_DIR}/topology.json" evidence)
+v2_bind_test_host_topology("${evidence}")
+# The production registration sink is recorded verbatim; the eligibility
+# decision under test belongs to the shared production module.
+function(add_v2_test name)
+    set_property(GLOBAL APPEND PROPERTY V2_FIXTURE_REGISTERED "${name}")
+endfunction()
+include([=[''' + str(MODULE_DIR / 'V2RootedTransportSocketReplayTests.cmake') + ''']=])
+get_property(registered GLOBAL PROPERTY V2_FIXTURE_REGISTERED)
+message("FIXTURE_REGISTERED=${registered}")
+message("FIXTURE_PREFLIGHT=${V2_ROOTED_TRANSPORT_SOCKET_REPLAY_TESTS}")
+''', encoding='utf-8')
+                result = subprocess.run(['cmake', '-S', str(root), '-B', str(root / 'build'),
+                                         '-G', 'Ninja', '-DCMAKE_MAKE_PROGRAM:FILEPATH=' + str(shutil.which('ninja'))],
+                                        capture_output=True, text=True, timeout=60)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                output = result.stdout + result.stderr
+                registered = output.split('FIXTURE_REGISTERED=', 1)[1].splitlines()[0]
+                self.assertEqual(registered, ';'.join(expected))
+                preflight = output.split('FIXTURE_PREFLIGHT=', 1)[1].splitlines()[0]
+                self.assertEqual(preflight, ';'.join(expected))
+                if expected:
+                    self.assertNotIn('unqualified', output)
+                else:
+                    self.assertIn('unqualified', output)
+
     def test_actual_owner_retires_receipt_before_failed_readmission(self):
         """Success cannot survive rejected projection or failed native observer admission."""
         _, good = recorded_spark_document()
