@@ -40277,7 +40277,11 @@ add_v2_test(V2_Integration_PooledImmutableMixedLocalProtocolReplay
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
         --gtest_filter=PooledImmutableNative.MixedLocal* --gtest_repeat=20
     LABELS "V2;Integration;DeviceFree;Collective;Qwen4Exp;Replay;Lifecycle;Regression;ProductionTestPreflight"
-    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    # The 20 in-process repeats walk the full-backend mock-device population
+    # (~3 s per repeat, ~62 s total on this lane); the earlier 30 s budget only
+    # fit the CPU-only build profile and was SIGTERM'd mid-replay. 120 s is the
+    # preflight receipt's hard ceiling (run_production_parity_campaigns.py).
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
 # One exact original case per deadline preserves all 20 fresh-process replays.
 set(_pooled_mixed_local_graph_cases ${_pooled_original_owner_cases})
