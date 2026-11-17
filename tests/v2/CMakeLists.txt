@@ -4852,6 +4852,14 @@ foreach(_declared_benchmark_case
         LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Benchmark;Lifecycle;Regression"
         TIMEOUT 30)
 endforeach()
+add_test(NAME V2_Integration_ProductionChildLogIntegrity
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_pipeline.py
+        InfrastructureTests.test_child_log_retains_interleaved_bytes_and_real_exit_status)
+set_tests_properties(V2_Integration_ProductionChildLogIntegrity PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;Regression"
+    TIMEOUT 30)
+
 add_test(NAME V2_Integration_InstalledCompanionCancellationOwner
     COMMAND ${Python3_EXECUTABLE}
         ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_pipeline.py
