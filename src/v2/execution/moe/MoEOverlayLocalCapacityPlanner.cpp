@@ -1204,12 +1204,16 @@ namespace llaminar2
             {
                 resource_devices.insert(device_plan.device());
                 // Admission can reject a row before a completed physical plan
-                // exists. Keep its original per-owner contribution available at
-                // DEBUG in optimized builds: TRACE is compiled out there, which
-                // otherwise hides Auto/Apply ownership differences behind one
-                // aggregate fixed-byte count. This cold diagnostic reads the
-                // canonical BOM only; it creates no parallel accounting ledger.
-                LOG_DEBUG(
+                // exists. This is per-device geometry detail, not a decision
+                // summary, so it belongs at TRACE (the intended verbosity for
+                // per-device BOM geometry) rather than DEBUG: the planner's
+                // complete-selection diagnostics must not flood DEBUG with
+                // per-device geometry. The mandatory aggregate admission
+                // diagnostics (proposed/evaluated/capacity_rejected and the
+                // admitted physical plan) stay at their existing levels. This
+                // cold diagnostic reads the canonical BOM only; it creates no
+                // parallel accounting ledger.
+                LOG_TRACE(
                     "[MoEOverlayCapacity] fixed component BOM device="
                     << device_plan.device().toString()
                     << " weights=" << device_plan.weight_bytes()

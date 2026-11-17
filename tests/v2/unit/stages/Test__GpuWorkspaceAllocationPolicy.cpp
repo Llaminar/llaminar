@@ -1378,11 +1378,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "constbooldeclaration_only=purpose==ShiftedMTPPrefillGraphBinding::Purpose::WorkspaceFamilyDeclaration;"),
         std::string::npos)
         << "Shifted-KV topology needs an explicit declaration-only lifecycle.";
+    // The shifted-KV declaration is wired through the typed transaction-binding
+    // gate: declaration_only selects a WorkspaceDeclaration submission, and
+    // requiresMTPGraphTransactionBinding admits it only when the runner retains
+    // MTP graph capacity. A retained-capacity MTPOff runner therefore still
+    // declares the same shifted-KV workspace participant as an enabled runner.
     EXPECT_NE(
         shifted_prefill_binding.find(
-            "declaration_only&&retainsMTPGraphCapacity(graph_builder_->config().mtp)"),
+            "declaration_only?ForwardGraphSubmissionIntent::WorkspaceDeclaration"),
         std::string::npos)
-        << "An MTPOff runner retaining capacity must declare the same shifted-KV workspace participant as an enabled runner.";
+        << "A declaration-only shifted-KV binding must route through WorkspaceDeclaration.";
+    EXPECT_NE(
+        shifted_prefill_binding.find(
+            "requiresMTPGraphTransactionBinding(graph_builder_->config().mtp.enabled,retainsMTPGraphCapacity(graph_builder_->config().mtp),transaction_submission)"),
+        std::string::npos)
+        << "The shifted-KV binding must consult the typed MTP transaction-binding gate.";
 }
 
 /**
