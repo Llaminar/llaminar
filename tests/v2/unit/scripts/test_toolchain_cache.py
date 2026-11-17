@@ -18,6 +18,8 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 import toolchain_cache as cache
@@ -75,6 +77,17 @@ class ToolchainCacheTests(unittest.TestCase):
         self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
                  "-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture")
         return self.git("rev-parse", "HEAD^{tree}").decode().strip()
+
+    def test_sdk_cache_upload_failure_is_independent_of_toolchain_build_status(self):
+        """Only publishing intermediate layers can fail independently of the build."""
+        action = yaml.safe_load((ROOT / ".github/actions/cache-develop-toolchain/action.yml").read_text())
+        steps = action["runs"]["steps"]
+        checkpoint = next(step for step in steps if step.get("with", {}).get("target") == "gpu-sdk")
+        cache_export = dict(field.split("=", 1) for field in checkpoint["with"]["cache-to"].split(","))
+        self.assertEqual(cache_export["type"], "gha")
+        self.assertEqual(cache_export.get("ignore-error"), "true")
+        for step in steps:
+            self.assertFalse(step.get("continue-on-error", False))
 
     def test_dependency_key_survives_source_edits_and_rejects_each_dependency_change(self):
         before = cache.identity(self.tree, "AVX512")

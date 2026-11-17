@@ -191,7 +191,8 @@ image does not inherit in-file ARG state. Both development workflows pin Buildx 
 BuildKit to the same versions.
 
 On a cold image-cache miss, `gpu-sdk` is checkpointed through the GitHub Actions
-cache v2 backend in `mode=max` under `llaminar-gpu-sdk`. The complete toolchain
+cache v2 backend in `mode=max` under `llaminar-gpu-sdk`. If the cache service
+rejects a layer upload, the job can use its locally built SDK. The complete toolchain
 then builds, exports as OCI and authenticates. It is saved before Llaminar
 compilation, so a later build/test failure retains the dependency image.
 Old mutable ISA toolchain layer-cache indexes are no longer used. PR entries

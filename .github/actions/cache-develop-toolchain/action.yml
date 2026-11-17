@@ -53,7 +53,9 @@ runs:
           type=gha,scope=llaminar-gpu-sdk,version=2
           type=registry,ref=${{ steps.cache.outputs.image }}-avx512
           type=registry,ref=${{ steps.cache.outputs.image }}-avx2
-        cache-to: type=gha,scope=llaminar-gpu-sdk,mode=max,version=2
+        # A cache outage can cost a future rebuild. This job still requires
+        # a successful SDK build and a verified complete OCI toolchain.
+        cache-to: type=gha,scope=llaminar-gpu-sdk,mode=max,version=2,ignore-error=true
     - name: Build complete AVX512 toolchain on a cache miss
       if: (inputs.cpu-isa == 'AVX512' || inputs.cpu-isa == 'both') && steps.restore-avx512.outputs.cache-hit != 'true'
       uses: docker/build-push-action@v7
