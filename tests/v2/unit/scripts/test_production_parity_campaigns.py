@@ -1750,7 +1750,7 @@ add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COM
             self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
             rows = campaigns.discover_production_test_preflight_registrations(build)
             requirements = campaigns.preflight_optional_hardware_requirements(rows)
-            self.assertEqual(len(rows), 131) # 128 exact bodies, two focused aliases and one odd probe.
+            self.assertEqual(len(rows), 81) # 80 representative bodies and one odd geometry probe.
             self.assertEqual(set(requirements), {row.name for row in rows})
             listing = json.loads(subprocess.check_output(
                 ["ctest", "--test-dir", str(build), "--show-only=json-v1"], text=True, timeout=10))
@@ -1769,7 +1769,29 @@ add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COM
                     self.assertFalse(any(character in expected for character in "*?:"))
                     self.assertNotIn(expected, exact_bodies)
                     exact_bodies.add(expected)
-            self.assertEqual(len(exact_bodies), 128)
+            self.assertEqual(len(exact_bodies), 80)
+            # Every topology keeps both actual native bodies and every pair of
+            # policy axes. The canonical balanced control retains all triples.
+            from itertools import combinations, product
+            axes = (("Ordinal", "Random"), ("Static", "Dynamic"),
+                    ("DisabledMTP", "Fixed1MTP", "Fixed3MTP", "DynamicMTP"))
+            coverage = {}
+            for test in listing["tests"]:
+                for role in filters:
+                    prefix = f"V2_Integration_MoEPipeline{role}_"
+                    if test["name"].startswith(prefix):
+                        topology, order, movement, lane = test["name"].removeprefix(prefix).rsplit("_", 3)
+                        coverage.setdefault((topology, role), set()).add((order, movement, lane))
+            self.assertEqual(len(coverage), 8)
+            for (topology, role), cases in coverage.items():
+                with self.subTest(topology=topology, role=role):
+                    if topology == "MI50_EP4_MI50_EP4":
+                        self.assertEqual(cases, set(product(*axes)))
+                    else:
+                        self.assertEqual(len(cases), 8)
+                        for first, second in combinations(range(3), 2):
+                            self.assertEqual({(case[first], case[second]) for case in cases},
+                                             set(product(axes[first], axes[second])))
             for row in rows:
                 widths = ([3, 1, 5] if row.name.endswith("OddGeometryProbe") else
                           [int(width) for width in re.findall(r"MI50_EP(\d+)", row.name)])

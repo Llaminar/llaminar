@@ -30266,16 +30266,16 @@ add_v2_test(V2_Integration_PrefixCacheIQ2SScaleArithmeticGeneration
         --gtest_filter=Test__PrefixCacheFingerprint.OriginalIQ2SScaleRejectsV14AndRestartsStably
     LABELS "V2;Integration;DeviceFree;CPU;IQ2_S;PrefixCache;Regression"
     MPI_PROCS 1 NO_MODELS)
-add_v2_test(V2_Integration_IQ2SMetadataProtocol
+add_v2_test(V2_Integration_NativeQuantizedMetadataProtocol
     COMMAND ${Python3_EXECUTABLE} -B
         ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_grouped_oracle_extent.py
         NativeQuantisedSecondaryMetadataTypeTest
-    LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;IQ2_S;Metadata;Regression"
-    MPI_PROCS 1 NO_MODELS)
+    LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;IQ2_S;IQ4_XS;Metadata;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_IQ2SPackedArchiveGeneration
     V2_Integration_PrefixCacheIQ2SScaleArithmeticGeneration
-    V2_Integration_IQ2SMetadataProtocol)
+    V2_Integration_NativeQuantizedMetadataProtocol)
 
 # Borrowed source matrices retain each row's final block during GPU upload.
 add_v2_test(V2_Integration_NativeQuantizedRowViewExtent
@@ -30312,12 +30312,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_IQ4XSTupleArchiveGeneration
     V2_Integration_PrefixCacheIQ4XSScaleArithmeticGeneration)
 
-add_v2_test(V2_Integration_IQ4XSTupleMetadataProtocol
-    COMMAND ${Python3_EXECUTABLE} -B
-        ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_grouped_oracle_extent.py
-        NativeQuantisedSecondaryMetadataTypeTest
-    LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;IQ4_XS;Metadata;Regression"
-    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+
 add_v2_test(V2_Integration_IQ4XSTupleDispatchIdentity
     COMMAND ${Python3_EXECUTABLE} -B
         ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_quantised_common_dispatch_policy.py
@@ -30325,7 +30320,6 @@ add_v2_test(V2_Integration_IQ4XSTupleDispatchIdentity
     LABELS "V2;Integration;DeviceFree;CPU;CUDA;ROCm;IQ4_XS;Dispatch;Regression"
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
-    V2_Integration_IQ4XSTupleMetadataProtocol
     V2_Integration_IQ4XSTupleDispatchIdentity)
 if(TARGET v2_integration_iq4xs_source_equations AND HAVE_CUDA)
     add_v2_test(V2_Integration_CUDA_IQ4XSSourceTupleDirectRowpar
@@ -42003,15 +41997,7 @@ if(TARGET v2_test_device_execution_timeline)
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PipelineParentMaintenanceEventReplay)
 endif()
-if(HAVE_ROCM AND TARGET v2_integration_moe_pipeline_weight_preparation)
-    v2_mi50_pipeline_optional_hardware_labels("MI50_EP4_MI50_EP4" _maintenance_order_hardware)
-    add_v2_test(V2_Integration_PipelineFollowerMaintenanceOrdering_ROCm8
-        COMMAND $<TARGET_FILE:v2_integration_moe_pipeline_weight_preparation>
-            --gtest_filter=Topologies/MoEPipelineRequestLifecycle.FirstDecodeResetAndPrefixReuse/MI50_EP4_MI50_EP4_Ordinal_Dynamic_DisabledMTP
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MI50;${_maintenance_order_hardware};ExpertParallel;Pipeline;GraphCapture;PrefixCache;RequestReset;Replay;Regression"
-        MPI_PROCS 2 NO_MODELS TIMEOUT 120)
-    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PipelineFollowerMaintenanceOrdering_ROCm8)
-endif()
+
 
 # Batch immutable roots and actual source builders share one original source/row declaration.
 add_v2_test(V2_Integration_MappedBatchOriginalSourceInventoryContract
