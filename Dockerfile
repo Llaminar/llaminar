@@ -421,8 +421,13 @@ RUN set -e; \
 # separate layer keyed only on requirements.txt so source edits don't
 # invalidate it.
 COPY requirements.txt ./requirements.txt
+# Ubuntu's pip discards a partial wheel on a mid-transfer read timeout. Use
+# a build-only installer with byte-range resumption for the large CPU wheels.
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --break-system-packages -r requirements.txt
+    --mount=type=tmpfs,target=/tmp/wheel-installer \
+    python3 -m pip install --no-deps --target /tmp/wheel-installer pip==26.2.1 \
+ && PYTHONPATH=/tmp/wheel-installer python3 -m pip install \
+        --resume-retries 3 --break-system-packages -r requirements.txt
 
 FROM toolchain AS builder
 
