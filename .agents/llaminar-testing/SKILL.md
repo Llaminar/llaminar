@@ -74,7 +74,7 @@ failures and skips in selected tests fail the gate. Never infer GPU counts from
 MPI width or test names. CMake `GPU_DEVICES`, or `CUDA_DEVICES` and
 `ROCM_DEVICES`, declare local physical counts. Original NUMA, native ISA and
 peer requirements retain their stricter canonical labels; unknown PCI NUMA
-location cannot establish those contracts. `pr-validation.json` binds Unit,
+location cannot establish those contracts. `pr-tests/pr-validation.json` binds Unit,
 host, accelerator and exclusive receipts to the complete qualification under
 `unit-and-hardware-preflight`. This validates only the observed hardware, not
 absent topologies or a release.

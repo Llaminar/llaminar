@@ -122,8 +122,8 @@ def main(argv: list[str] | None = None) -> int:
     # The AVX2 runner has one CPU package and one GPU of each vendor. Keep GPU
     # lanes sequential so their MPI/OpenMP placement never competes with itself.
     overall = 0
-    validation_errors = []
     for lane, tests, parallel in lanes:
+        print(f"[production-preflight] {lane}: selected {len(tests)} tests", flush=True)
         if not tests:
             report["lanes"][lane] = {"complete": True, "return_code": 0,
                                       "tests": [], "test_count": 0}
@@ -154,19 +154,19 @@ def main(argv: list[str] | None = None) -> int:
                 validate_results(output / f"{lane}.xml", tests)
             except ValueError as error:
                 evidence["validation_error"] = str(error)
-                validation_errors.append(str(error))
+                print(f"[production-preflight] {lane}: {error}", flush=True)
                 overall = overall or 8
             else:
                 evidence["complete"] = True
         # CTest exit 8 means completed tests failed. After native retirement,
         # retain their red result and still exercise the independent next lane.
+        print(f"[production-preflight] {lane}: {len(tests)} selected, "
+              f"result={'passed' if evidence['complete'] else 'failed'}", flush=True)
         report["return_code"] = overall
         write_json(path, report)
     report["complete"] = overall == 0
     report["return_code"] = overall
     write_json(path, report)
-    if validation_errors:
-        raise ValueError("; ".join(validation_errors))
     return overall
 
 

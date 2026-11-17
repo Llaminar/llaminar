@@ -158,13 +158,11 @@ class DevelopImageGateTests(unittest.TestCase):
                              "--installed-build-receipt", str(root / "receipt"), "--output", str(output)]
                 with patch.object(pr_runner, "validate"), \
                      patch.object(pr_runner, "observe_preflight_hardware", return_value=hardware()):
-                    if outcome == 77:
-                        with self.assertRaisesRegex(ValueError, "without skipping"):
-                            pr_runner.main(arguments)
-                    else:
-                        self.assertEqual(pr_runner.main(arguments) == 0, outcome == 0)
+                    self.assertEqual(pr_runner.main(arguments), 0 if outcome == 0 else 8)
                 self.assertFalse(forbidden.exists())
                 report = json.loads((output / "pr-tests.json").read_text())
+                if outcome == 77:
+                    self.assertIn("without skipping", report["lanes"]["rocm"]["validation_error"])
                 self.assertEqual(report["scope"], "hardware-preflight")
                 self.assertEqual(report["complete"], outcome == 0)
                 self.assertEqual(report["lanes"]["cuda"]["tests"], ["V2_Integration_CUDA"])
@@ -259,12 +257,8 @@ class DevelopImageGateTests(unittest.TestCase):
                 arguments = ["--build-dir", str(build), "--installed-build-receipt",
                              str(root / "receipt"), "--output", str(output)]
                 with patch.object(pr_runner, "validate") as validate:
-                    if 77 in (unit_outcome, host_outcome):
-                        with self.assertRaisesRegex(ValueError, "without skipping"):
-                            pr_runner.main(arguments)
-                    else:
-                        code = pr_runner.main(arguments)
-                        self.assertEqual(code == 0, unit_outcome == host_outcome == 0)
+                    code = pr_runner.main(arguments)
+                    self.assertEqual(code, 0 if unit_outcome == host_outcome == 0 else 8)
                 validate.assert_called_once_with(root / "receipt", build,
                                                  pr_runner.InstalledTestScope.PRODUCTION)
                 self.assertFalse(forbidden.exists())
