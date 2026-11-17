@@ -868,22 +868,29 @@ COPY --from=builder /usr/local/lib/python3.12/dist-packages/ \
 # library path (CMake recorded the toolchain's unversioned MPI dev link, whose
 # slim-runtime counterpart is only the distro SONAME library). Materialize
 # exactly that recorded link identity from the sealed receipt so the native
-# MPI ABI proof loads the same distro SONAME library the builder selected.
-# A receipt that records no link identity, or a target that does not resolve
-# in this image, fails the image build instead of letting a proof load a
-# different or missing library.
+# MPI ABI proof loads the same distro SONAME library the builder selected,
+# then verify the resolved artifact's SHA256 against the same receipt: the
+# installed image must carry the original bytes, and a same-length or retargeted
+# substitute fails the image build. A receipt that records no link identity, or
+# a target that does not resolve in this image, fails the same way instead of
+# letting a proof load a different or missing library.
 RUN set -e; \
     if [ -f /src/installed-tests.json ]; then \
         link_path="$(jq -r '.inventory.mpi_library.path // empty' /src/installed-tests.json)"; \
         link_target="$(jq -r '.inventory.mpi_library.link_target // empty' /src/installed-tests.json)"; \
-        if [ -z "$link_path" ]; then \
-            echo "sealed receipt does not record the configured MPI library" >&2; exit 1; \
+        sealed_sha="$(jq -r '.inventory.mpi_library.sha256 // empty' /src/installed-tests.json)"; \
+        if [ -z "$link_path" ] || [ -z "$sealed_sha" ]; then \
+            echo "sealed receipt does not record the configured MPI library identity" >&2; exit 1; \
         fi; \
         if [ ! -e "$link_path" ] && [ -n "$link_target" ]; then \
             ln -s "$link_target" "$link_path"; \
         fi; \
         if [ ! -e "$link_path" ]; then \
             echo "configured MPI library does not resolve in the test runner: $link_path -> ${link_target:-regular file}" >&2; exit 1; \
+        fi; \
+        installed_sha="$(sha256sum "$(readlink -f "$link_path")" | cut -d' ' -f1)"; \
+        if [ "$installed_sha" != "$sealed_sha" ]; then \
+            echo "configured MPI library content identity mismatch: installed $installed_sha, sealed $sealed_sha" >&2; exit 1; \
         fi; \
     fi
 

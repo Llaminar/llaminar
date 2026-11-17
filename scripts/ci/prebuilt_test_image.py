@@ -20,7 +20,7 @@ from pathlib import Path
 import re
 import subprocess
 
-from production_artifacts import digest, write_json
+from production_artifacts import digest, file_digest, write_json
 from run_production_parity_campaigns import (
     PRODUCTION_CAMPAIGN_NAME, PRODUCTION_TEST_PREFLIGHT_LABEL,
     PRODUCTION_PARITY_UNIT_LABEL, PRODUCTION_PARITY_UNIT_PREFIX,
@@ -36,15 +36,17 @@ RUNTIME_FILE_PREFIXES = ("v2_", "llaminar_", "libllaminar", "mca_schizo_llaminar
 
 
 def _configured_mpi_library(build: Path) -> dict:
-    """Seal the builder's exact configured MPI library selection.
+    """Seal the builder's exact configured MPI library selection and bytes.
 
     The native MPI ABI proof replays the CTest-recorded ``--mpi-library``
     operand, so an installed test image must carry exactly the library path
     CMake recorded from its toolchain. The slim runtime closure replaces the
     unversioned MPI dev link with the distro SONAME library, so the receipt
-    seals the configured path together with its link identity and bytes;
-    validation fails closed when a runner image omits that library or ships a
-    different one instead of letting the ABI proof load a substitute.
+    seals the configured path, its link identity, the resolved artifact path
+    and a streaming SHA256 of the resolved bytes; validation fails closed
+    when a runner image omits that library, retargets the link or replaces
+    the bytes (including a same-length replacement) instead of letting the
+    ABI proof load a substitute.
     """
     cache = (build / "CMakeCache.txt").read_text()
     match = re.search(r"^MPI_mpi_LIBRARY:FILEPATH=(.+?)\s*$", cache, re.MULTILINE)
@@ -54,7 +56,9 @@ def _configured_mpi_library(build: Path) -> dict:
     if not library.is_file():
         raise ValueError(
             f"configured MPI library is missing from the installed test image: {library}")
-    entry = {"path": str(library), "bytes": library.stat().st_size}
+    resolved = library.resolve(strict=True)
+    entry = {"path": str(library), "resolved_path": str(resolved),
+             "bytes": resolved.stat().st_size, "sha256": file_digest(resolved)}
     if library.is_symlink():
         entry["link_target"] = os.readlink(library)
     return entry
