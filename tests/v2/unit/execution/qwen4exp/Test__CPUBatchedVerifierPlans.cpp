@@ -8,6 +8,7 @@
  * its native snapshots. Independent serial GDN calls are only the test oracle;
  * publication itself performs no recurrence or model execution.
  */
+#include "../../../utils/HostNUMANodes.h"
 #include "backends/BackendManager.h"
 #include "execution/compute_stages/stages/GDNRecurrenceStage.h"
 #include "execution/compute_stages/stages/ShortConv1dStage.h"
@@ -29,7 +30,7 @@ using namespace llaminar2;
 TEST(CPUBatchedVerifierPlans, CompactGDNAndConvolutionBanksUseValidatedPlans)
 {
     llaminar::v2::ThreadCountGuard threads(1);
-    if(!hasCPUBackend())initCPUBackend(1);
+    if(!hasCPUBackend())initCPUBackend(llaminar2::test::hostLastNUMANode());
     constexpr int requests=3,stride=3,rows=requests*stride,elements=4;
     const CPUGDNStateLayout layout(1,2,2);
     const std::vector<int> live{3,0,2};
