@@ -24708,15 +24708,19 @@ if(HAVE_CUDA OR HAVE_ROCM)
         list(APPEND _source_lifetime_backends Hybrid)
     endif()
     foreach(_backend IN LISTS _source_lifetime_backends)
+        # Materialization touches both participants. The rejection case fails
+        # before uploading to either GPU and also runs on single-card hosts.
+        set(_lifetime_devices GPU_DEVICES 2)
         set(_lifetime_labels "${_backend}")
         if(_backend STREQUAL "Hybrid")
             set(_lifetime_labels "CUDA;ROCm")
+            set(_lifetime_devices CUDA_DEVICES 1 ROCM_DEVICES 1)
         endif()
         add_v2_test(V2_Integration_PreparedWeightSourceLifetime_${_backend}
             COMMAND $<TARGET_FILE:v2_integration_moe_pipeline_weight_preparation>
                 --gtest_filter=Backends/PreparedWeightSourceLifetime.SharedBytesSurviveUntilEveryGraphIsMaterialized/${_backend}
             LABELS "V2;Integration;ProductionTestPreflight;${_lifetime_labels};TensorParallel;MTP;WeightLifecycle;Regression"
-            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+            MPI_PROCS 1 ${_lifetime_devices} NO_MODELS TIMEOUT 120)
         add_v2_test(V2_Integration_PreparedWeightSourceRejection_${_backend}
             COMMAND $<TARGET_FILE:v2_integration_moe_pipeline_weight_preparation>
                 --gtest_filter=Backends/PreparedWeightSourceLifetime.RetiredUnpreparedSourceFailsWithoutReload/${_backend}

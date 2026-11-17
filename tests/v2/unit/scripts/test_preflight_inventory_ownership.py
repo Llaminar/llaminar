@@ -158,6 +158,22 @@ class PreflightInventoryOwnershipTests(unittest.TestCase):
         cls.document = json.loads(subprocess.check_output(
             ["ctest", "--test-dir", str(BUILD), "--show-only=json-v1"], text=True, timeout=10))
 
+    def test_shared_weight_lifetime_qualifies_both_physical_consumers(self) -> None:
+        """Require both live GPUs for materialization and retain the pre-upload rejection on one GPU."""
+        available = {name for name in ("CUDA", "ROCm") if name.lower() in BACKENDS}
+        geometries = {name: {"Devices2"} for name in available}
+        if len(available) == 2:
+            geometries["Hybrid"] = {"Devices2", "CUDADevices1", "ROCmDevices1"}
+        tests = {row["name"]: row for row in self.document["tests"]}
+        for suffix, counts in geometries.items():
+            with self.subTest(suffix=suffix):
+                native = tests[f"V2_Integration_PreparedWeightSourceLifetime_{suffix}"]
+                rejection = tests[f"V2_Integration_PreparedWeightSourceRejection_{suffix}"]
+                native_labels = next(prop["value"] for prop in native["properties"] if prop["name"] == "LABELS")
+                rejection_labels = next(prop["value"] for prop in rejection["properties"] if prop["name"] == "LABELS")
+                self.assertTrue(counts | {"LocalHostDevices", "HardwareOptional"} <= set(native_labels))
+                self.assertNotIn("HardwareOptional", rejection_labels)
+
     def test_every_filter_retains_complete_process_ownership(self) -> None:
         """CUDA, ROCm and performance filters inherit their executable's scope."""
         self.assertTrue(validate_inventory(self.document, BACKENDS))
