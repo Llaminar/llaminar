@@ -2910,6 +2910,14 @@ add_v2_test(V2_Unit_CPUBackend
     MPI_PROCS 1
 )
 
+# Exercise explicit host topology in the same CPU backend as the full Unit suite.
+add_v2_test(V2_Integration_CPUBackendNUMAIdentity
+    COMMAND $<TARGET_FILE:v2_unit_cpu_backend>
+        --gtest_filter=Test__CPUBackend.DeviceCountIsOneForAnyNumaNode:Test__CPUBackend.DeviceNameShowsNumaNode:Test__CPUBackend.NumaNodeAccessor
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Backend;NUMA;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 10)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUBackendNUMAIdentity)
+
 # Test: HostMemoryCapacity - shared CPU inventory/preflight accounting
 add_executable(v2_unit_host_memory_capacity
     unit/backends/Test__HostMemoryCapacity.cpp)
