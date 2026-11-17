@@ -14,7 +14,7 @@ if(TARGET v2_integration_captured_transfer_channel)
                 COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                     --gtest_filter=CapturedTransferNativePeerVisibility.${_visibility_backend}OriginalInventory257Offset1
                 LABELS "V2;Integration;ProductionTestPreflight;${_visibility_backend};GPU;NativeCollective;Transfer;GraphCapture;ByteExact;Regression"
-                TIMEOUT 30 MPI_PROCS 2 NO_MODELS)
+                TIMEOUT 30 GPU_DEVICES 2 MPI_PROCS 2 NO_MODELS)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
                 V2_Integration_CapturedNativePeerVisibility_${_visibility_backend}2_257Offset1)
         endif()

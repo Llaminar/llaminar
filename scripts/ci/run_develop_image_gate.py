@@ -6,7 +6,7 @@ certification pipeline. The develop push selects build-only publication of
 AVX512 and AVX2 full-backend runtimes without compiling or running test images.
 The separate PR gate runs the complete CMake-owned Unit inventory and the
 canonical host preflight lane inside a device-free container. AVX2 PRs also
-require the CMake-owned single-device CUDA/ROCm inventory in a separate container.
+require every hardware-qualified production preflight test in a separate GPU container.
 Neither policy discovers models, stages a
 corpus, launches a server, runs mathematical parity, E2E, remote MPI, or a
 benchmark, and it never calls an image a certified release artifact.
@@ -25,7 +25,7 @@ import uuid
 
 import docker_paths
 from run_develop_pr_tests import PRTestScope
-from production_artifacts import CPUISA, digest, image_identity, write_json
+from production_artifacts import CPUISA, digest, image_identity, write_json, validate_preflight_qualification
 from run_production_cross_host_e2e import CPU_ISA_FEATURES
 from run_production_pipeline import (
     TestRunnerInventory, ImageRole, SHIPPING_ISAS, build, logged_container_command,
@@ -44,7 +44,7 @@ class PRGPUCoverage(str, Enum):
     @property
     def validation(self) -> str:
         """Name the complete requested PR evidence without implying release approval."""
-        return "unit-and-host" if self is PRGPUCoverage.NONE else "unit-host-single-gpu"
+        return "unit-and-host" if self is PRGPUCoverage.NONE else "unit-and-hardware-preflight"
 
 
 def require_host_cpu_isa(isa: str) -> None:
@@ -140,7 +140,7 @@ def _run_pr_scope(images: dict, directory: Path, scope: PRTestScope) -> dict:
     for lane in report["lanes"].values():
         tests = lane.get("tests", [])
         if (lane.get("complete") is not True or lane.get("return_code") != 0
-                or not tests or lane.get("test_count") != len(tests)
+                or (not tests and scope is PRTestScope.HOST) or lane.get("test_count") != len(tests)
                 or len(set(tests)) != len(tests)):
             raise ValueError(f"PR {scope.value} lane is incomplete or unsuccessful")
     return report
@@ -153,8 +153,17 @@ def run_pr_tests(images: dict, directory: Path,
     if gpu_coverage is PRGPUCoverage.NONE:
         return host
     gpu = _run_pr_scope(images, directory, PRTestScope.GPU)
+    qualification = gpu.get("qualification")
+    if not isinstance(qualification, dict):
+        raise ValueError("PR hardware preflight is missing its complete qualification")
+    validate_preflight_qualification(qualification.get("registered"), qualification)
+    executed = [*host["lanes"]["host"]["tests"],
+                *(name for lane in gpu["lanes"].values() for name in lane["tests"])]
+    if sorted(executed) != sorted(qualification["selected"]):
+        raise ValueError("PR receipts do not cover the exact hardware-qualified production preflight")
     report = {"schema": 1, "scope": gpu_coverage.validation, "complete": True,
               "return_code": 0, "lanes": {**host["lanes"], **gpu["lanes"]},
+              "qualification": qualification,
               "scope_digests": {host["scope"]: digest(host), gpu["scope"]: digest(gpu)}}
     write_json(directory / "pr-validation.json", report)
     return report
@@ -193,7 +202,7 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--pr-gpus", type=PRGPUCoverage,
                         choices=[coverage.value for coverage in PRGPUCoverage],
                         default=PRGPUCoverage.NONE,
-                        help="require single-device CUDA and ROCm PR checks after Unit/host")
+                        help="run all hardware-qualified production preflight after Unit/host")
     args = parser.parse_args(argv)
     requested = args.cpu_isas or list(SHIPPING_ISAS)
     if len(set(requested)) != len(requested):

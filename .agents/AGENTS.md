@@ -349,10 +349,13 @@ required gate, owner approval and an up-to-date merge candidate. The canonical
 PR workflow builds AVX2 and AVX512 full-backend model-free test images in
 parallel on separate self-hosted runners. Each runs complete device-free `Unit`
 plus the canonical preflight `host` lane. AVX2 additionally requires the
-CMake-owned `DevelopGPUPreflight` single-device CUDA and ROCm inventory in a
-separate GPU container; failures, missing devices and skips block the gate.
-Both ISA checks must pass. Complete CUDA, ROCm and exclusive preflight lanes
-remain production gates. A successful develop merge
+complete hardware-qualified `ProductionTestPreflight` inventory in a separate
+GPU container, including CUDA, ROCm, mixed-backend and exclusive work. Native
+hardware observation and explicit CMake requirements own eligibility; absent
+geometries remain unqualified in the receipt. Both GPUs are required, and
+failures or skips in selected tests block the gate. Both ISA checks must pass.
+Production certification still requires its own complete hardware qualification.
+A successful develop merge
 builds and publishes both AVX512 and AVX2 runtime images on the AVX2 development host,
 without compiling or running test images.
 These images are development artifacts; this gate does not certify a release.
@@ -1214,7 +1217,7 @@ The registered pre-commit hook builds only `v2_unit_gate` and
 E2E, broader integration selections, or benchmarks. Register the tracked hooks
 with `git config --local core.hooksPath .githooks`; see `.githooks/README.md`.
 The [branch and release workflow](#branch-and-release-workflow) owns the CI
-sequence: Unit/host checks plus AVX2 single-device GPU checks on feature PRs,
+sequence: Unit/host checks plus AVX2 hardware-qualified production preflight on feature PRs,
 build-only develop publication, then
 the RC gate on the Xeon runner. `.github/workflows/master-pr-certification.yml`
 uses `run_published_image_suite.py` for complete preflight, numerical panels,

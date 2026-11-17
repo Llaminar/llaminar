@@ -3,8 +3,8 @@ name: Develop Unit and host gate
 # Runner-group access is pinned to this workflow on develop. The caller keeps
 # the pull_request event, so checkout still tests its proposed merge commit.
 # Dedicated AVX2 and AVX512 hosts run complete Unit plus host preflight in
-# parallel. AVX2 then requires the single-device CUDA/ROCm PR inventory in a
-# separate container. CPU admission rejects unsupported hardware before compilation.
+# parallel. AVX2 then requires every supported production preflight test in a
+# separate GPU container. CPU admission rejects unsupported hardware before compiling.
 on:
   workflow_call:
 

@@ -2,8 +2,9 @@
 """Run one explicitly isolated PR test scope in the installed image.
 
 CTest owns test selection, resource weights and timeouts. The canonical
-production scheduler supplies the host lane. A separate GPU container executes
-the CMake-owned single-device PR inventory, serially on CUDA then ROCm.
+production scheduler supplies all lanes and hardware qualification. A separate
+GPU container executes every eligible non-host production preflight test,
+including exclusive, mixed-backend and multi-rank work.
 Installed-image admission proves executable presence,
 while separate JUnit evidence proves every selected test ran without skips.
 This scoped PR receipt cannot certify complete production prerequisites.
@@ -13,6 +14,7 @@ from __future__ import annotations
 import argparse
 from contextlib import ExitStack
 from enum import Enum
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -20,10 +22,12 @@ import xml.etree.ElementTree as ET
 
 from prebuilt_test_image import InstalledTestScope, validate
 from production_artifacts import write_json
+from mpi_session_retirement import owned_session_bases, retirement_scope
 from run_production_parity_campaigns import (
     PreflightExecutionLane, PreflightRegistration, discover_production_parity_unit_tests,
     discover_production_test_preflight_registrations, preflight_execution_plan,
-    _preflight_index_selection,
+    preflight_optional_hardware_requirements, preflight_hardware_qualification,
+    observe_preflight_hardware, source_hardware_devices, _preflight_index_selection,
 )
 
 
@@ -31,12 +35,12 @@ class PRTestScope(str, Enum):
     """Disjoint container ownership: device-free checks or required GPU checks."""
 
     HOST = "unit-and-host"
-    GPU = "single-gpu"
+    GPU = "hardware-preflight"
 
     @property
     def lanes(self) -> tuple[str, ...]:
         """Return the exact receipt lanes required for this container scope."""
-        return ("unit", "host") if self is PRTestScope.HOST else ("cuda", "rocm")
+        return ("unit", "host") if self is PRTestScope.HOST else ("cuda", "rocm", "exclusive")
 
     @property
     def backends(self) -> str:
@@ -44,27 +48,25 @@ class PRTestScope(str, Enum):
         return "CPU" if self is PRTestScope.HOST else "CUDA+ROCm"
 
 
-def single_gpu_plan(registrations: tuple[PreflightRegistration, ...]) -> dict[str, tuple[str, ...]]:
-    """Admit every CMake PR GPU member and reject incomplete hardware contracts.
+def hardware_preflight_plan(registrations: tuple[PreflightRegistration, ...],
+                            hardware: dict) -> tuple[dict[str, tuple[str, ...]], dict]:
+    """Run the complete hardware-qualified complement of the CPU host lane.
 
-    This is a declared subset of production preflight, never a filter that
-    silently drops tests after hardware discovery or a failed execution.
-    Missing devices must fail the native tests; neither vendor is optional.
+    CMake and the production qualifier own eligibility. MPI width, exclusive
+    scheduling and mixed vendors never exclude a supported test. Only a declared
+    absent hardware geometry may remain unqualified, with its evidence retained.
     """
-    selected = {"cuda": [], "rocm": []}
-    for row in registrations:
-        if "DevelopGPUPreflight" not in row.labels:
-            continue
-        vendors = row.labels & {"CUDA", "ROCm"}
-        if (len(vendors) != 1 or "SingleGPU" not in row.labels
-                or "HardwareOptional" in row.labels or row.mpi_ranks != 1
-                or row.lane not in (PreflightExecutionLane.CUDA_SOCKET,
-                                    PreflightExecutionLane.ROCM_SOCKET)):
-            raise ValueError(f"PR GPU test lacks strict single-device ownership: {row.name}")
-        selected[next(iter(vendors)).lower()].append(row.name)
-    if not all(selected.values()):
-        raise ValueError("PR GPU gate requires nonempty CUDA and ROCm inventories")
-    return {lane: tuple(names) for lane, names in selected.items()}
+    observed = source_hardware_devices(hardware)
+    if not {"cuda", "rocm"} <= {address[0] for address in observed}:
+        raise ValueError("PR hardware preflight requires both CUDA and ROCm devices")
+    requirements = preflight_optional_hardware_requirements(registrations)
+    qualification = preflight_hardware_qualification(
+        tuple(row.name for row in registrations), requirements, hardware if requirements else None)
+    selected = set(qualification["selected"])
+    plan = preflight_execution_plan(row for row in registrations if row.name in selected)
+    return {"cuda": plan[PreflightExecutionLane.CUDA_SOCKET],
+            "rocm": plan[PreflightExecutionLane.ROCM_SOCKET],
+            "exclusive": plan[PreflightExecutionLane.EXCLUSIVE]}, qualification
 
 
 def validate_results(path: Path, expected: tuple[str, ...]) -> None:
@@ -94,6 +96,11 @@ def main(argv: list[str] | None = None) -> int:
     # Admission authenticates installation; each scope selects its own lanes.
     validate(args.installed_build_receipt, build, InstalledTestScope.PRODUCTION)
     registrations = discover_production_test_preflight_registrations(build)
+    inventory = json.loads(subprocess.run(
+        ["ctest", "--test-dir", str(build), "--show-only=json-v1"],
+        check=True, capture_output=True, text=True).stdout)
+    session_bases = owned_session_bases(inventory)
+    qualification = None
     if args.scope is PRTestScope.HOST:
         units = discover_production_parity_unit_tests(build)
         hosts = preflight_execution_plan(registrations)[PreflightExecutionLane.HOST]
@@ -101,17 +108,29 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("PR gate requires nonempty Unit and host preflight inventories")
         lanes = (("unit", units, len(os.sched_getaffinity(0))), ("host", hosts, 1))
     else:
-        lanes = tuple((lane, tests, 1) for lane, tests in single_gpu_plan(registrations).items())
+        plan, qualification = hardware_preflight_plan(
+            registrations, observe_preflight_hardware(build, None))
+        lanes = tuple((lane, tests, 1) for lane, tests in plan.items())
     report = {"schema": 1, "scope": args.scope.value, "complete": False,
               "return_code": None, "lanes": {}}
+    if qualification is not None:
+        report["qualification"] = qualification
     path = output / "pr-tests.json"
     write_json(path, report)
     # Unit keeps unrestricted parallelism. Host follows the production lane's
     # serial resource ownership; each test retains its own CMake worker budget.
     # The AVX2 runner has one CPU package and one GPU of each vendor. Keep GPU
     # lanes sequential so their MPI/OpenMP placement never competes with itself.
+    overall = 0
+    validation_errors = []
     for lane, tests, parallel in lanes:
+        if not tests:
+            report["lanes"][lane] = {"complete": True, "return_code": 0,
+                                      "tests": [], "test_count": 0}
+            continue
         with ExitStack() as selectors:
+            selectors.enter_context(retirement_scope(
+                session_bases[name] for name in tests if name in session_bases))
             selection = (["-L", "^Unit$"] if lane == "unit" else
                          ["-I", str(selectors.enter_context(
                              _preflight_index_selection(build, registrations, tests)))])
@@ -124,16 +143,31 @@ def main(argv: list[str] | None = None) -> int:
         evidence = {"complete": False, "return_code": result.returncode,
                     "tests": tests, "test_count": len(tests)}
         report["lanes"][lane] = evidence
-        report["return_code"] = result.returncode
+        overall = overall or result.returncode
+        report["return_code"] = overall
         write_json(path, report)
-        if result.returncode:
+        if result.returncode not in (0, 8):
+            # Infrastructure/termination errors cannot admit another native lane.
             return result.returncode
-        validate_results(output / f"{lane}.xml", tests)
-        evidence["complete"] = True
+        if not result.returncode:
+            try:
+                validate_results(output / f"{lane}.xml", tests)
+            except ValueError as error:
+                evidence["validation_error"] = str(error)
+                validation_errors.append(str(error))
+                overall = overall or 8
+            else:
+                evidence["complete"] = True
+        # CTest exit 8 means completed tests failed. After native retirement,
+        # retain their red result and still exercise the independent next lane.
+        report["return_code"] = overall
         write_json(path, report)
-    report["complete"] = True
+    report["complete"] = overall == 0
+    report["return_code"] = overall
     write_json(path, report)
-    return 0
+    if validation_errors:
+        raise ValueError("; ".join(validation_errors))
+    return overall
 
 
 if __name__ == "__main__":

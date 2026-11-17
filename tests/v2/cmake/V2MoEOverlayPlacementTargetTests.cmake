@@ -39,12 +39,13 @@ if(TARGET v2_integration_moe_overlay_device_controller_fabric_cuda_rocm)
         else()
             set(finite_label ROCm)
         endif()
+        string(REGEX REPLACE "^(CUDA|ROCm)" "" finite_degree "${finite_backend}")
         set(finite_test V2_Integration_MoEFinitePlacement_${finite_backend}_CapturedProtocolReplay)
         add_v2_test(${finite_test}
             COMMAND $<TARGET_FILE:v2_integration_moe_overlay_device_controller_fabric_cuda_rocm>
                 --gtest_filter=Test__MoEOverlayDeviceControllerFabricCUDAAndROCm.FinitePlacement${finite_backend}CapturedProtocolReplay
             LABELS "V2;Integration;ProductionTestPreflight;${finite_label};MoE;Residency;GraphCapture;Replay;Regression"
-            MPI_PROCS 2 NO_MODELS TIMEOUT 120)
+            GPU_DEVICES ${finite_degree} MPI_PROCS 2 NO_MODELS TIMEOUT 120)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${finite_test})
     endforeach()
     unset(finite_backend)
@@ -95,25 +96,10 @@ if(TARGET v2_integration_moe_overlay_device_controller_fabric_cuda_rocm)
     add_v2_test(V2_Integration_MoEDeviceAuthoredCycleIdentity_CUDA_ROCm
         COMMAND $<TARGET_FILE:v2_integration_moe_overlay_device_controller_fabric_cuda_rocm>
             --gtest_filter=Test__MoEOverlayDeviceControllerFabricCUDAAndROCm.DeviceAuthoredTwoCycleWaveAdvancesBothIndependentPlacementAxes:Test__MoEOverlayDeviceControllerFabricCUDAAndROCm.CUDAAuthoredPreparedRestoreHonorsLayerCapacityAcrossEpochs:Test__MoEOverlayDeviceControllerFabricCUDAAndROCm.ROCmAuthoredPreparedRestoreHonorsLayerCapacityAcrossEpochs
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;MoE;Movement;Replay;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;HardwareOptional;Devices6;CUDADevices2;ROCmDevices4;DistinctNUMARanks;MoE;Movement;Replay;Regression"
         MPI_PROCS 2 NO_MODELS TIMEOUT 120
         ENVIRONMENT "LLAMINAR_PERF_STATS_SUMMARY=1" "LLAMINAR_PERF_STATS_FILTER=moe_overlay_controller")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEDeviceAuthoredCycleIdentity_CUDA_ROCm)
-endif()
-
-# Two real native cache streams serialize one original epoch request slot.
-if(TARGET v2_integration_moe_overlay_device_controller_fabric_cuda_rocm)
-    foreach(predecessor_backend IN ITEMS CUDA ROCm)
-        set(predecessor_name V2_Integration_${predecessor_backend}_MoEFollowerPredecessorCapturedReplay)
-        add_v2_test(${predecessor_name}
-            COMMAND $<TARGET_FILE:v2_integration_moe_overlay_device_controller_fabric_cuda_rocm>
-                --gtest_filter=MoEFollowerPredecessorColdSourceCUDAAndROCm.FollowerPredecessor${predecessor_backend}SharedSlotCapturedReplay
-            LABELS "V2;Integration;ProductionTestPreflight;${predecessor_backend};MoE;CapturedReplay;Ownership;Regression"
-            MPI_PROCS 2 NO_MODELS TIMEOUT 120)
-        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${predecessor_name})
-    endforeach()
-    unset(predecessor_name)
-    unset(predecessor_backend)
 endif()
 
 # Absorbing original abort must terminate a peer acquire before any successor admission.

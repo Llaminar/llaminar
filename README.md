@@ -1413,10 +1413,11 @@ without driving maintenance.
 PRs into `develop` build AVX512 and AVX2 test images in parallel on separate
 self-hosted runners. Each runs the complete device-free Unit suite
 and the host lane of production preflight; both checks and owner approval
-are required. AVX2 also runs the CMake-declared single-device CUDA and ROCm
-PR checks in a separate GPU container. Missing devices, failures and skips
-block that gate. Complete accelerator and exclusive preflight remain
-production checks. After merge, the AVX2 development host builds and publishes the AVX512 and AVX2
+are required. AVX2 also runs every hardware-supported production preflight test in
+a separate GPU container, including CUDA, ROCm, mixed-backend and exclusive
+lanes. Explicit hardware requirements record unavailable topologies as
+unqualified; missing GPUs, selected-test failures and skips block the gate.
+After merge, the AVX2 development host builds and publishes the AVX512 and AVX2
 Release development images without running tests. Both workflows restore complete
 toolchain images keyed by dependency inputs and ISA. They save newly built
 toolchains before source compilation, so later failures retain them. Production validation and

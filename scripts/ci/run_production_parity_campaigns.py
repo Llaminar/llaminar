@@ -1035,7 +1035,7 @@ def preflight_optional_hardware_requirements(
         stage_labels = sorted(label for label in row.labels if label.startswith("StageSizes"))
         rank_labels = sorted(label for label in row.labels if label.startswith("RankSizes"))
         if "HardwareOptional" not in row.labels:
-            if row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"} or isa_labels or stage_labels or rank_labels or any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels):
+            if row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair", "LocalHostDevices"} or isa_labels or stage_labels or rank_labels or any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels):
                 raise RuntimeError("optional ISA/stage labels require HardwareOptional: " + row.name)
             continue
         device_labels = sorted(label for label in row.labels if label.startswith("Devices"))
@@ -1045,6 +1045,10 @@ def preflight_optional_hardware_requirements(
                 or any(not re.fullmatch(r"RankSizes[1-9][0-9]*x[1-9][0-9]*", label) for label in rank_labels)):
             raise RuntimeError("malformed optional native geometry: " + row.name)
         backends = row.labels & {"CUDA", "ROCm"}
+        local_host = "LocalHostDevices" in row.labels
+        if local_host and (isa_labels or stage_labels or rank_labels or
+                           row.labels & {"DistinctNUMARanks", "DirectedPeerEdge", "NoDirectedPeerPair"}):
+            raise RuntimeError("local device counts cannot replace a topology contract: " + row.name)
         family_labels = sorted(label for label in row.labels
                                if label.startswith(("CUDADevices", "ROCmDevices")))
         if family_labels:
@@ -1057,7 +1061,7 @@ def preflight_optional_hardware_requirements(
             if set(degrees) != {"cuda", "rocm"} or sum(degrees.values()) != int(device_labels[0][7:]):
                 raise RuntimeError("inconsistent optional mixed-family geometry: " + row.name)
             requirement = {"backend_degrees": degrees, "mpi_ranks": row.mpi_ranks,
-                "locality": "two-distinct-numa-local-ranks" if "DistinctNUMARanks" in row.labels
+                "locality": "local-host" if local_host else "two-distinct-numa-local-ranks" if "DistinctNUMARanks" in row.labels
                             else "original-numa-local-rank"}
             try:
                 validate_optional_native_cohort_requirement(requirement)
@@ -1072,7 +1076,7 @@ def preflight_optional_hardware_requirements(
             raise RuntimeError("unsupported optional native geometry: " + row.name)
         try:
             requirement = {"backend": next(iter(backends)).lower(), "degree": int(device_labels[0][7:]),
-                "locality": "two-distinct-numa-local-ranks" if distinct_ranks else "original-numa-local-rank"}
+                "locality": "local-host" if local_host else "two-distinct-numa-local-ranks" if distinct_ranks else "original-numa-local-rank"}
             peer_labels = row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"}
             if len(peer_labels) > 1:
                 raise ValueError("conflicting optional directed peer geometry")

@@ -1,7 +1,7 @@
 # Production image certification
 
 The release path is **feature → develop → rc/* → master**. Feature PRs run
-Unit/host checks on both ISAs and single-device CUDA/ROCm checks on AVX2;
+Unit/host checks on both ISAs and hardware-qualified production preflight on AVX2;
 develop publishes build-only images. A non-draft
 RC-to-master PR qualifies that frozen published pair through complete
 preflight, numerical panels, six five-phase OpenCode sessions and benchmarks.
@@ -39,18 +39,18 @@ Separate self-hosted runners build AVX2 and AVX512 full-backend
 `Unit` plus the
 production-preflight `host` lane. The canonical production scheduler owns
 host selection. That container receives no GPU devices or model mounts.
-AVX2 then requires the CMake-owned `DevelopGPUPreflight` inventory in a
-separate container exposing both GPUs. This exercises model-free prepared
-weights, captured execution/replay and RAM-prefix initialization with one
-device per vendor. Complete CUDA, ROCm and exclusive preflight remain
-production gates. This is PR validation, not
+AVX2 then runs the complete hardware-qualified production preflight inventory
+in a separate container exposing both GPUs. This includes the CUDA, ROCm and
+exclusive lanes, mixed vendors and multi-rank fixtures. Canonical hardware
+qualification records unavailable declared geometries as unqualified; it never
+turns a selected-test failure or skip into a pass. This is PR validation, not
 release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
 The active `develop` ruleset requires both `Develop PR / Unit + host (AVX2)`
 and `Develop PR / Unit + host (AVX512)`, an up-to-date PR, and squash merge.
 The AVX2 check retains its stable required-context name while also requiring
-the single-device GPU scope.
+the hardware-qualified production preflight scope.
 Repository administrators have an explicit PR-only bypass for authorized
 manual merges. Direct human pushes, force pushes and deletion remain rejected.
 `.github/workflows/develop-auto-merge.yml` arms GitHub's native
@@ -107,14 +107,21 @@ dependency-bound OCI images before source compilation. No registry-write
 permission is granted. The model-free image compiles Unit and preflight
 executables. `run_develop_pr_tests.py --scope unit-and-host` executes complete
 Unit and host inventories. Unit retains unrestricted parallelism; host uses
-canonical serial scheduling. The subsequent AVX2 `--scope single-gpu`
-transaction requires nonempty CUDA and ROCm inventories, each declaring
-`DevelopGPUPreflight`, `SingleGPU` and one MPI rank. It runs vendors sequentially
-on this host's one CPU package. Missing devices, failures and skips fail the gate.
+canonical serial scheduling. The subsequent AVX2 `--scope hardware-preflight`
+transaction observes native hardware and qualifies the complete CMake inventory.
+All selected CUDA, ROCm and exclusive entries run sequentially on this host's
+one CPU package. MPI process count does not determine physical GPU count.
+`GPU_DEVICES` or the paired `CUDA_DEVICES`/`ROCM_DEVICES` declarations represent
+local physical cardinality (`LocalHostDevices`); original NUMA ownership,
+ISA cohorts and directed peer access retain their stricter requirements. PCI
+NUMA `-1` is valid unknown locality, never evidence for an original NUMA cohort.
+Both vendors are mandatory, and selected-test failures and skips fail the gate.
 Logs and JUnit evidence are retained in `pr-tests/` and `pr-gpu-tests/`;
-`pr-validation.json` binds both receipts as `unit-host-single-gpu` evidence.
-Full accelerator preflight, model staging, generation, HF parity, E2E and benchmarks
-remain outside this PR gate. Only build logs, image/test receipts and CTest/JUnit evidence are
+`pr-validation.json` binds both receipts as `unit-and-hardware-preflight`
+evidence and proves their union exactly matches the qualified inventory.
+The receipt retains all registered, selected and unqualified tests with reasons.
+Model staging, generation, HF parity, E2E and benchmarks remain separate gates.
+Only build logs, image/test receipts and CTest/JUnit evidence are
 uploaded to GitHub under artifact names containing the ISA. Run the same AVX2 PR transaction locally with:
 
 ```bash

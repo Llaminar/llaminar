@@ -69,7 +69,7 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
         if (set(requirement) != {"backend_degrees", "locality", "mpi_ranks"}
                 or not isinstance(degrees, dict) or set(degrees) != {"cuda", "rocm"}
                 or any(type(degree) is not int or degree <= 0 for degree in degrees.values())
-                or requirement["locality"] not in ("original-numa-local-rank", "two-distinct-numa-local-ranks")
+                or requirement["locality"] not in ("local-host", "original-numa-local-rank", "two-distinct-numa-local-ranks")
                 or type(requirement["mpi_ranks"]) is not int or requirement["mpi_ranks"] <= 0
                 or (requirement["locality"] == "two-distinct-numa-local-ranks" and requirement["mpi_ranks"] != 2)):
             raise ValueError("invalid optional mixed-family preflight geometry")
@@ -81,7 +81,7 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
         raise ValueError("invalid optional preflight requirement")
     backend, degree, locality = (requirement[key] for key in ("backend", "degree", "locality"))
     if (backend not in ("cuda", "rocm") or type(degree) is not int or degree <= 0
-            or locality not in ("original-numa-local-rank", "two-distinct-numa-local-ranks")
+            or locality not in ("local-host", "original-numa-local-rank", "two-distinct-numa-local-ranks")
             or (locality == "two-distinct-numa-local-ranks" and degree != 2 and "rank_sizes" not in requirement)):
         raise ValueError("unsupported optional preflight geometry")
     if "native_isa" in requirement:
@@ -89,6 +89,8 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
         syntax = r"gfx[0-9][0-9a-f]*" if backend == "rocm" else r"sm_?[0-9]+[a-z]?"
         if not isinstance(isa, str) or re.fullmatch(syntax, isa) is None:
             raise ValueError("invalid optional preflight native ISA")
+    if locality == "local-host" and set(requirement) != required:
+        raise ValueError("local device counts cannot replace a topology contract")
     if "peer_access" in requirement:
         if (requirement["peer_access"] not in ("directed-edge", "no-directed-pair") or degree < 2
                 or (requirement["peer_access"] == "no-directed-pair" and degree != 2)
@@ -127,6 +129,24 @@ def optional_native_cohort_absence(requirement: dict, hardware: dict) -> dict | 
         observed_pipeline_hardware_requirement, source_hardware_devices)
     observed = source_hardware_devices(hardware)
     absence = {"qualification": "hardware-ineligible-unqualified", "requirement": requirement}
+    if requirement["locality"] == "local-host":
+        # Local ordinal fixtures declare physical counts, not NUMA ownership.
+        # Linux legitimately reports -1 for PCI locality on single-socket hosts;
+        # never invent a NUMA node or use that absence to discard runnable cases.
+        needed = (requirement["backend_degrees"] if "backend_degrees" in requirement
+                  else {requirement["backend"]: requirement["degree"]})
+        counts = {}
+        for backend in needed:
+            devices = [device for address, device in observed.items() if address[0] == backend]
+            uuids = [device.get("uuid") for device in devices]
+            ordinals = [device["ordinal"] for device in devices]
+            if (any(not isinstance(uuid, str) or not uuid for uuid in uuids)
+                    or len(set(uuids)) != len(uuids) or len(set(ordinals)) != len(ordinals)):
+                raise ValueError("local physical counts require unique native GPU identities")
+            counts[backend] = len(devices)
+        if all(counts[backend] >= degree for backend, degree in needed.items()):
+            return None
+        return {**absence, "observed_device_counts": counts}
     if "backend_degrees" in requirement:
         cohorts = {backend: {} for backend in requirement["backend_degrees"]}
         unknown = {backend: [] for backend in cohorts}
