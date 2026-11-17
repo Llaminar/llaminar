@@ -184,7 +184,7 @@ class DevelopImageGateTests(unittest.TestCase):
                     scope = (pr_runner.PRTestScope.GPU if "--gpus" in command
                              else pr_runner.PRTestScope.HOST)
                     scopes.append(scope)
-                    prefix = "pr-gpu-tests" if scope is pr_runner.PRTestScope.GPU else "pr-tests"
+                    prefix = "pr-tests/gpu" if scope is pr_runner.PRTestScope.GPU else "pr-tests"
                     report = pr_report(scope)
                     if scope is pr_runner.PRTestScope.GPU:
                         self.assertEqual(command[-2:], ["--scope", "hardware-preflight"])
@@ -215,7 +215,17 @@ class DevelopImageGateTests(unittest.TestCase):
                             gate.run_pr_tests(images("AVX2"), directory, gate.PRGPUCoverage.CUDA_ROCM)
                     self.assertEqual([call.args[1] for call in devices.call_args_list], ["CPU", "CUDA+ROCm"])
                 self.assertEqual(scopes, [pr_runner.PRTestScope.HOST, pr_runner.PRTestScope.GPU])
-                self.assertEqual((directory / "pr-validation.json").exists(), mutation is None)
+                self.assertEqual((directory / "pr-tests/pr-validation.json").exists(), mutation is None)
+
+    def test_completed_host_failure_still_exercises_gpus_and_keeps_pr_red(self):
+        """A completed CPU test failure preserves both the red job and GPU evidence."""
+        with patch.object(gate, "_run_pr_scope", side_effect=[
+                subprocess.CalledProcessError(8, "ctest"), pr_report(pr_runner.PRTestScope.GPU)]) as run:
+            with self.assertRaises(subprocess.CalledProcessError) as failed:
+                gate.run_pr_tests(images("AVX2"), Path("/unused"), gate.PRGPUCoverage.CUDA_ROCM)
+        self.assertEqual(failed.exception.returncode, 8)
+        self.assertEqual([call.args[2] for call in run.call_args_list],
+                         [pr_runner.PRTestScope.HOST, pr_runner.PRTestScope.GPU])
 
     def test_gpu_requirements_cannot_be_ignored_by_build_only(self):
         """Reject a requested GPU gate when the transaction would not execute tests."""
@@ -561,6 +571,10 @@ class DevelopImageGateTests(unittest.TestCase):
             arguments[arguments.index("--pr-gpus") + 1] = gpu_policy
             policy = gate.parse_arguments(arguments)
             self.assertEqual(policy.pr_gpus.value, gpu_policy)
+            # develop's protected caller supplies only the ISA and output on
+            # the first PR introducing GPU coverage. Exercise its actual argv.
+            protected = gate.parse_arguments(["--cpu-isa", isa, "--output", "/unused"])
+            self.assertIs(protected.pr_gpus, policy.pr_gpus)
             self.assertEqual(policy.cpu_isas, [isa])
             self.assertFalse(policy.publish)
             self.assertIsNone(policy.image)

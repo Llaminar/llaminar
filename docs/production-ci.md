@@ -94,7 +94,7 @@ does not cancel the other. Each PR/ISA job has its own
 same PR and ISA without serializing its two hosts.
 Each host serializes its own jobs; AVX2 shares its queue with publication.
 Each job calls `run_develop_image_gate.py --cpu-isa <ISA>` without publication.
-AVX2 also passes `--pr-gpus CUDA+ROCm`; AVX512 explicitly selects `none`.
+An AVX2-only test job defaults to `--pr-gpus CUDA+ROCm`, including when the protected caller supplies only the ISA. AVX512 defaults to `none`.
 Before toolchain preparation, CPU admission checks every visible CPU against
 the requested shipped ISA contract, including AVX512-VNNI for AVX512. Missing
 flags fail explicitly instead of changing the ISA; a runner label alone is
@@ -116,8 +116,8 @@ local physical cardinality (`LocalHostDevices`); original NUMA ownership,
 ISA cohorts and directed peer access retain their stricter requirements. PCI
 NUMA `-1` is valid unknown locality, never evidence for an original NUMA cohort.
 Both vendors are mandatory, and selected-test failures and skips fail the gate.
-Logs and JUnit evidence are retained in `pr-tests/` and `pr-gpu-tests/`;
-`pr-validation.json` binds both receipts as `unit-and-hardware-preflight`
+Logs and JUnit evidence are retained in `pr-tests/` and `pr-tests/gpu/`;
+`pr-tests/pr-validation.json` binds both receipts as `unit-and-hardware-preflight`
 evidence and proves their union exactly matches the qualified inventory.
 The receipt retains all registered, selected and unqualified tests with reasons.
 Model staging, generation, HF parity, E2E and benchmarks remain separate gates.

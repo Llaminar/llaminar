@@ -110,8 +110,8 @@ def _run_pr_scope(images: dict, directory: Path, scope: PRTestScope) -> dict:
     a second, undocumented input surface.
     """
     image = images[ImageRole.TEST_RUNNER.value]["id"]
-    prefix = "pr-tests" if scope is PRTestScope.HOST else "pr-gpu-tests"
-    name = "llaminar-develop-" + prefix + "-" + uuid.uuid4().hex
+    prefix = "pr-tests" if scope is PRTestScope.HOST else "pr-tests/gpu"
+    name = "llaminar-develop-" + prefix.replace("/", "-") + "-" + uuid.uuid4().hex
     command = ["python3", "scripts/ci/run_develop_pr_tests.py",
                "--build-dir", "build_v2_integration",
                "--installed-build-receipt", "/src/installed-tests.json",
@@ -149,7 +149,14 @@ def _run_pr_scope(images: dict, directory: Path, scope: PRTestScope) -> dict:
 def run_pr_tests(images: dict, directory: Path,
                  gpu_coverage: PRGPUCoverage = PRGPUCoverage.NONE) -> dict:
     """Finish CPU gates before opening either GPU, retaining separate receipts."""
-    host = _run_pr_scope(images, directory, PRTestScope.HOST)
+    try:
+        host = _run_pr_scope(images, directory, PRTestScope.HOST)
+    except subprocess.CalledProcessError as error:
+        # When CTest finished with failures the CPU container has retired. The
+        # independent GPU scope can still produce its hardware evidence.
+        if error.returncode == 8 and gpu_coverage is PRGPUCoverage.CUDA_ROCM:
+            _run_pr_scope(images, directory, PRTestScope.GPU)
+        raise
     if gpu_coverage is PRGPUCoverage.NONE:
         return host
     gpu = _run_pr_scope(images, directory, PRTestScope.GPU)
@@ -165,7 +172,7 @@ def run_pr_tests(images: dict, directory: Path,
               "return_code": 0, "lanes": {**host["lanes"], **gpu["lanes"]},
               "qualification": qualification,
               "scope_digests": {host["scope"]: digest(host), gpu["scope"]: digest(gpu)}}
-    write_json(directory / "pr-validation.json", report)
+    write_json(directory / "pr-tests/pr-validation.json", report)
     return report
 
 
@@ -201,13 +208,17 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
                         help="explicit local diagnostic ISA subset; publication requires both")
     parser.add_argument("--pr-gpus", type=PRGPUCoverage,
                         choices=[coverage.value for coverage in PRGPUCoverage],
-                        default=PRGPUCoverage.NONE,
-                        help="run all hardware-qualified production preflight after Unit/host")
+                        default=None,
+                        help="PR accelerator coverage (AVX2-only test jobs default to CUDA+ROCm)")
     args = parser.parse_args(argv)
     requested = args.cpu_isas or list(SHIPPING_ISAS)
     if len(set(requested)) != len(requested):
         parser.error("duplicate CPU ISA selection")
     args.cpu_isas = [isa for isa in SHIPPING_ISAS if isa in requested]
+    if args.pr_gpus is None:
+        # The protected reusable workflow selects one ISA per runner.
+        args.pr_gpus = (PRGPUCoverage.CUDA_ROCM if args.cpu_isas == ["AVX2"] and not args.build_only
+                        else PRGPUCoverage.NONE)
     if args.publish and (not args.image or set(args.cpu_isas) != set(SHIPPING_ISAS)):
         parser.error("--publish requires --image and both AVX512 and AVX2 gates")
     if args.publish and not args.build_only:

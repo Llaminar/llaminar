@@ -101,9 +101,5 @@ jobs:
             ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/*/pr-tests.log
             ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/*/pr-tests.process.log
             ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/*/pr-tests/**
-            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/*/pr-gpu-tests.log
-            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/*/pr-gpu-tests.process.log
-            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/*/pr-gpu-tests/**
-            ${{ runner.temp }}/llaminar-develop-pr-${{ github.run_id }}-${{ github.run_attempt }}/*/pr-validation.json
           if-no-files-found: warn
           retention-days: 30
