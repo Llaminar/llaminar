@@ -14,13 +14,16 @@
  */
 #include "backends/cuda/CUDADiscoveryAdmission.h"
 #include <gtest/gtest.h>
+#include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 namespace llaminar2::test
@@ -37,13 +40,17 @@ namespace llaminar2::test
          * mkdtemp both creates and reserves one unique 0700 directory in a
          * single atomic step, so concurrent test processes can never share,
          * collide on or pre-create another run's storage; a stale process id
-         * cannot make a name predictable. Destruction removes the directory
-         * tree even when assertions fail during unwinding.
+         * cannot make a name predictable. A failed reservation refuses
+         * construction fatally with the operating system's own error, so an
+         * owner can never exist without reserved storage and later probe
+         * paths can never silently resolve relative to the working
+         * directory. Destruction removes the directory tree even when
+         * assertions fail during unwinding.
          */
         class ExclusiveProbeDirectory final
         {
         public:
-            /** @brief Reserve one exclusive directory under the system temp root. */
+            /** @brief Reserve one exclusive directory or refuse construction fatally. */
             explicit ExclusiveProbeDirectory(const std::string &stem)
             {
                 const std::string pattern =
@@ -52,9 +59,9 @@ namespace llaminar2::test
                 buffer.push_back('\0');
                 char *const created = ::mkdtemp(buffer.data());
                 if (created == nullptr)
-                    ADD_FAILURE() << "cannot reserve an exclusive probe directory";
-                else
-                    path_ = created;
+                    throw std::system_error{errno, std::generic_category(),
+                        "cannot reserve an exclusive probe directory"};
+                path_ = created;
             }
             ExclusiveProbeDirectory(const ExclusiveProbeDirectory &) = delete;
             ExclusiveProbeDirectory &operator=(const ExclusiveProbeDirectory &) = delete;
@@ -162,6 +169,27 @@ namespace llaminar2::test
             Binding::PresentButUnbindable);
         EXPECT_EQ(classifyCUDADriverBinding(false, soname,
             "libcuda.so.1: cannot open shared object file: Datei nicht gefunden"), Binding::PresentButUnbindable);
+    }
+
+    TEST(CUDADriverBindingContract, ProbeDirectoryConstructionRefusesFatally)
+    {
+        // Construction-failure control: the stem names a directory whose
+        // parent was reserved exclusively but whose own parent path does not
+        // exist, so the atomic reservation cannot succeed. Construction must
+        // refuse fatally with a system error, never hand out a usable-looking
+        // owner, and never leave a probe file resolved relative to the
+        // working directory.
+        ExclusiveProbeDirectory owner{"llaminar-probe-construction-root"};
+        const std::string unreachable =
+            (owner.file("missing-parent") / "probe").string();
+        ASSERT_FALSE(std::filesystem::exists(unreachable));
+        EXPECT_THROW(
+            { [[maybe_unused]] ExclusiveProbeDirectory refused{unreachable}; },
+            std::system_error);
+        std::error_code ignored;
+        EXPECT_FALSE(std::filesystem::exists(
+            std::filesystem::current_path() / "probe", ignored))
+            << "a refused owner must not create a relative probe file";
     }
 
     TEST(CUDADriverBindingContract, SharedNativeProbeClassifiesGenuineLoaderOutcomes)
