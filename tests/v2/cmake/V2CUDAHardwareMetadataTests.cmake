@@ -18,6 +18,26 @@ add_v2_test(V2_Integration_CUDAHardwareMetadataReplay
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CUDAHardwareMetadataReplay)
 
+# Typed optional-driver admission contract, driven through the actual loader
+# producer for absence and breakage; no CUDA SDK, driver or device required.
+add_executable(v2_unit_cuda_discovery_admission
+    unit/backends/Test__CUDADiscoveryAdmission.cpp)
+target_include_directories(v2_unit_cuda_discovery_admission PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2")
+target_compile_features(v2_unit_cuda_discovery_admission PRIVATE cxx_std_20)
+target_link_libraries(v2_unit_cuda_discovery_admission PRIVATE
+    GTest::gtest_main ${CMAKE_DL_LIBS})
+add_v2_test(V2_Unit_CUDADiscoveryAdmission
+    COMMAND $<TARGET_FILE:v2_unit_cuda_discovery_admission>
+    LABELS "V2;Unit;DeviceFree;CUDA;HardwareMetadata;Discovery;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_CUDADiscoveryAdmissionReplay
+    COMMAND $<TARGET_FILE:v2_unit_cuda_discovery_admission> --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CUDA;HardwareMetadata;Discovery;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_CUDADiscoveryAdmissionReplay)
+
 # Native authentication is deliberately separate from the device-free Unit proof.
 # The test visits every visible device and explicitly leaves absent hardware unqualified.
 if(HAVE_CUDA)

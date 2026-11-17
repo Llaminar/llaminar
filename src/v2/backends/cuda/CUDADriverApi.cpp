@@ -14,6 +14,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace llaminar2
 {
@@ -68,6 +69,23 @@ const CUDADriverApi &CUDADriverApi::instance()
         return complete;
     }();
     return api;
+}
+
+CUDADriverBindingStatus CUDADriverApi::probeDriverBinding() noexcept
+{
+    constexpr std::string_view driverSoname = "libcuda.so.1";
+    // Same flags and exact SONAME as the authoritative binding, so the loader
+    // cannot answer a different search-path question. The temporary handle is
+    // released immediately: nothing was called through it, and an already
+    // loaded driver only gains and loses one reference count.
+    if (void *library = dlopen(driverSoname.data(), RTLD_NOW | RTLD_LOCAL))
+    {
+        dlclose(library);
+        return CUDADriverBindingStatus::Loadable;
+    }
+    const char *error = dlerror();
+    return classifyCUDADriverBinding(false, driverSoname,
+        error != nullptr ? std::string_view{error} : std::string_view{});
 }
 
 #define LLAMINAR_CUDA_DRIVER_SYMBOL_TEXT_(symbol) #symbol
