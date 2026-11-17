@@ -174,6 +174,9 @@ Registry access defaults to `read-write` for publication; PRs explicitly select
 authorities are mutually exclusive.
 
 Both development workflows first run `.github/actions/cache-develop-toolchain`.
+Llaminar test builds require CMake and CTest 4.0 or later. The toolchain and
+installed runner share the Kitware package pinned in `requirements.txt` so
+CTest reports each MPI owner’s timeout signal and grace period in its inventory.
 `toolchain_cache.py` constructs a restricted committed dependency context and
 keys a complete OCI toolchain image by those Git objects, policy version and
 CPU ISA. Source-only commits retain the key. SDK/installer, dependency-pin,

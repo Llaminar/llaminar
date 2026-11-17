@@ -4414,9 +4414,16 @@ class ImageIdentityTests(unittest.TestCase):
         # generator. Keep exactly that small fixture closure; importing the
         # builder would conceal a missing dependency and turn the test image
         # back into a compiler image.
-        for package in ("build-essential", "cmake", "git", "jq"):
+        for package in ("build-essential", "git", "jq"):
             with self.subTest(package=package):
                 self.assertIn(package, test_runner)
+        self.assertIn(
+            "COPY --from=toolchain /usr/local/bin/cmake /usr/local/bin/ctest /usr/local/bin/cpack /usr/local/bin/",
+            test_runner,
+        )
+        apt_install = test_runner.split("apt-get install -y --no-install-recommends", 1)[1].split(
+            "&& rm -rf /var/lib/apt/lists/*", 1)[0]
+        self.assertNotIn("cmake", apt_install)
         self.assertIn(
             "COPY --from=toolchain /usr/local/bin/ninja /usr/local/bin/ninja",
             test_runner,

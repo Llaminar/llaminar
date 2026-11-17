@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1.6
 #
+# @file Dockerfile
+# @brief Build source-bound serving and test images with one genuine dependency/tool closure.
 # Llaminar — CUDA + ROCm runtime image
 #
 # Two-stage build:
@@ -600,6 +602,19 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
  && cp build_v2_release/_deps/utf8proc-src/LICENSE.md /src/runtime-licenses/utf8proc/ \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -P /usr/local/lib/libllaminar_nccl.so* /src/runtime-libs/; fi \
  && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then cp -r /usr/local/share/licenses/llaminar-nccl /src/runtime-licenses/; fi \
+ # Stage the builder-authored NCCL install receipt beside its library so the
+ # sealed test runner can authenticate the DSO byte identity at the exact path
+ # its CTest registration probes (dirname(NCCL_LIBRARY)/llaminar-nccl-build.txt).
+ # The receipt is a canonical part of the CUDA dependency closure installed by
+ # scripts/docker/install-nccl.sh; staging must fail closed when it is absent
+ # instead of silently sealing an unauditable NCCL library.
+ && if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
+        if [ ! -f /usr/local/lib/llaminar-nccl-build.txt ]; then \
+            echo "ERROR: LLAMINAR_ENABLE_CUDA=ON requires the builder-authored NCCL receipt /usr/local/lib/llaminar-nccl-build.txt (scripts/docker/install-nccl.sh); refusing to stage an unauditable NCCL library" >&2; \
+            exit 1; \
+        fi; \
+        cp /usr/local/lib/llaminar-nccl-build.txt /src/runtime-libs/; \
+    fi \
  && if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
         HIP_RUNTIME_STAGE_PREFIX=/src/runtime-hip bash scripts/docker/install-hip-graph-runtime.sh; \
         ROCR_RUNTIME_STAGE_PREFIX=/src/runtime-rocr bash scripts/docker/install-rocr-helper-numa.sh; \
@@ -640,6 +655,17 @@ COPY Dockerfile .dockerignore .gitignore ./
 FROM builder AS test-workspace
 
 RUN set -e; \
+    # Preserve the builder-authored RCCL install receipt.  ``verify`` proofs in
+    # the sealed runner authenticate the DSO bytes against this receipt at the
+    # exact CTest-probed path (RCCL_PROTOCOL_BUILD_DIR/.llaminar-rccl-commit),
+    # so it must survive the source-build tree removal below.  The receipt
+    # exists only when RCCL was built from source; it is staged conditionally
+    # by that source-build policy and no full vendor tree is retained.
+    rccl_receipt=""; \
+    if [ -f /src/external/rccl/build/.llaminar-rccl-commit ]; then \
+        rccl_receipt="/tmp/llaminar-rccl-commit"; \
+        cp /src/external/rccl/build/.llaminar-rccl-commit "${rccl_receipt}"; \
+    fi; \
     rm -rf /src/build_v2_release \
            /src/runtime-bin \
            /src/runtime-libs \
@@ -647,6 +673,10 @@ RUN set -e; \
            /src/external/onednn \
            /src/external/rccl \
            /src/build_v2_integration/_deps; \
+    if [ -n "${rccl_receipt}" ]; then \
+        mkdir -p /src/external/rccl/build; \
+        mv "${rccl_receipt}" /src/external/rccl/build/.llaminar-rccl-commit; \
+    fi; \
     rm -f /src/build_v2_integration/libcuda_backend.a \
           /src/build_v2_integration/librocm_backend.a \
           /src/build_v2_integration/libdevice_benchmarks.a \
@@ -802,7 +832,6 @@ ARG LLAMINAR_SOURCE_TREE
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       build-essential \
-      cmake \
       git \
       jq \
  && rm -rf /var/lib/apt/lists/*
@@ -820,6 +849,10 @@ RUN if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
 # /usr/local path. Copy that tiny exact executable rather than substituting the
 # distribution version and silently testing a different generator contract.
 COPY --from=toolchain /usr/local/bin/ninja /usr/local/bin/ninja
+# Keep the builder's exact Kitware entrypoints, not Ubuntu's older CTest JSON
+# interface. Their package/native binaries/data come from the same builder's
+# dist-packages copy below, so the installed inventory retains timeout ownership.
+COPY --from=toolchain /usr/local/bin/cmake /usr/local/bin/ctest /usr/local/bin/cpack /usr/local/bin/
 
 # Preserve the exact source/build paths encoded in CTest and binary RUNPATHs.
 # Copying the sealed workspace wholesale avoids a second hand-maintained list
