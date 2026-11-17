@@ -499,6 +499,7 @@ if(HAVE_CUDA)
     # Note: CUDAWorkerImpl.cu provides cuda_worker::initializeContext/cleanupContext for GPUDeviceWorker
     add_library(cuda_backend STATIC 
         backends/cuda/CUDADriverApi.cpp
+        backends/cuda/CUDADiscoveryAdmission.cpp
         backends/cuda/CUDABackend.cu
         backends/cuda/CUDAHardwareMetadata.cu
         backends/cuda/CUDATensorValidation.cu
