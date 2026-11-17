@@ -15,6 +15,7 @@
 #include "backends/cuda/CUDADiscoveryAdmission.h"
 #include <gtest/gtest.h>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -30,35 +31,49 @@ namespace llaminar2::test
         using Binding = CUDADriverBindingStatus;
         using Disposition = CUDADiscoveryDisposition;
 
-        /** @brief Exclusive temporary probe file removed with its scope, even on failure. */
-        class UniqueProbeFile final
+        /**
+         * @brief Atomically reserved exclusive probe directory with scope-bound cleanup.
+         *
+         * mkdtemp both creates and reserves one unique 0700 directory in a
+         * single atomic step, so concurrent test processes can never share,
+         * collide on or pre-create another run's storage; a stale process id
+         * cannot make a name predictable. Destruction removes the directory
+         * tree even when assertions fail during unwinding.
+         */
+        class ExclusiveProbeDirectory final
         {
         public:
-            /** @brief Reserve one unreadable-or-writable unique path beside the others. */
-            explicit UniqueProbeFile(const std::string &stem)
-                : path_(std::filesystem::temp_directory_path() /
-                        (stem + "-" + std::to_string(::getpid()) + "-" +
-                         std::to_string(++counter()) + ".so"))
+            /** @brief Reserve one exclusive directory under the system temp root. */
+            explicit ExclusiveProbeDirectory(const std::string &stem)
             {
+                const std::string pattern =
+                    (std::filesystem::temp_directory_path() / (stem + "-XXXXXX")).string();
+                std::vector<char> buffer(pattern.begin(), pattern.end());
+                buffer.push_back('\0');
+                char *const created = ::mkdtemp(buffer.data());
+                if (created == nullptr)
+                    ADD_FAILURE() << "cannot reserve an exclusive probe directory";
+                else
+                    path_ = created;
             }
-            UniqueProbeFile(const UniqueProbeFile &) = delete;
-            UniqueProbeFile &operator=(const UniqueProbeFile &) = delete;
-            /** @brief Remove the probe file and any leftover, never throwing. */
-            ~UniqueProbeFile()
+            ExclusiveProbeDirectory(const ExclusiveProbeDirectory &) = delete;
+            ExclusiveProbeDirectory &operator=(const ExclusiveProbeDirectory &) = delete;
+            /** @brief Remove the reserved tree, never throwing. */
+            ~ExclusiveProbeDirectory()
             {
-                std::error_code ignored;
-                std::filesystem::remove(path_, ignored);
+                if (!path_.empty())
+                {
+                    std::error_code ignored;
+                    std::filesystem::remove_all(path_, ignored);
+                }
             }
-            /** @return The exclusive probe path. */
-            [[nodiscard]] const std::filesystem::path &path() const noexcept { return path_; }
+            /** @return One file path inside the exclusive directory. */
+            [[nodiscard]] std::filesystem::path file(const std::string &name) const
+            {
+                return path_ / name;
+            }
 
         private:
-            /** @return Process-local monotonic counter for concurrent-safe names. */
-            static unsigned long long &counter()
-            {
-                static unsigned long long value = 0;
-                return value;
-            }
             std::filesystem::path path_;
         };
 
@@ -164,11 +179,13 @@ namespace llaminar2::test
         // nonexistent same-length SONAME. The loader's diagnostic names the
         // missing dependency, never the requested object's own absence.
         {
-            UniqueProbeFile missingDependency{"llaminar-missing-dependency-probe"};
+            ExclusiveProbeDirectory missingDependency{"llaminar-missing-dependency-probe"};
             const std::filesystem::path fixture = editedSystemLibraryCopy(
-                missingDependency.path(), "libc.so.6", "libZ.so.9");
+                missingDependency.file("libm-missing-dependency.so"), "libc.so.6", "libZ.so.9");
             const auto outcome = probeNativeLibraryBinding(fixture.string());
             ASSERT_FALSE(outcome.loadable);
+            EXPECT_NE(outcome.diagnostic.find("libZ.so.9"), std::string::npos)
+                << "the loader must name the missing dependency: " << outcome.diagnostic;
             EXPECT_EQ(classifyCUDADriverBinding(outcome.loadable, fixture.string(), outcome.diagnostic),
                 Binding::PresentButUnbindable);
         }
@@ -178,11 +195,15 @@ namespace llaminar2::test
         // same-length name. The loader's diagnostic reports the undefined
         // symbol against the requested object itself.
         {
-            UniqueProbeFile undefinedSymbol{"llaminar-undefined-symbol-probe"};
+            ExclusiveProbeDirectory undefinedSymbol{"llaminar-undefined-symbol-probe"};
             const std::filesystem::path fixture = editedSystemLibraryCopy(
-                undefinedSymbol.path(), "qsort", "qsorz");
+                undefinedSymbol.file("libm-undefined-symbol.so"), "qsort", "qsorz");
             const auto outcome = probeNativeLibraryBinding(fixture.string());
             ASSERT_FALSE(outcome.loadable);
+            EXPECT_NE(outcome.diagnostic.find("undefined symbol"), std::string::npos)
+                << "the loader must report the fault kind: " << outcome.diagnostic;
+            EXPECT_NE(outcome.diagnostic.find("qsorz"), std::string::npos)
+                << "the loader must name the unresolvable import: " << outcome.diagnostic;
             EXPECT_EQ(classifyCUDADriverBinding(outcome.loadable, fixture.string(), outcome.diagnostic),
                 Binding::PresentButUnbindable);
         }
@@ -190,14 +211,17 @@ namespace llaminar2::test
         // A present-but-invalid binary: the file exists, so the loader's
         // diagnostic cannot be the requested object's own absence.
         {
-            UniqueProbeFile invalid{"llaminar-invalid-elf-probe"};
+            ExclusiveProbeDirectory invalid{"llaminar-invalid-elf-probe"};
+            const std::filesystem::path probe = invalid.file("not-an-elf.so");
             {
-                std::ofstream output{invalid.path(), std::ios::binary | std::ios::trunc};
+                std::ofstream output{probe, std::ios::binary | std::ios::trunc};
                 output << "this is not an ELF shared object";
             }
-            const auto outcome = probeNativeLibraryBinding(invalid.path().string());
+            const auto outcome = probeNativeLibraryBinding(probe.string());
             ASSERT_FALSE(outcome.loadable);
-            EXPECT_EQ(classifyCUDADriverBinding(outcome.loadable, invalid.path().string(), outcome.diagnostic),
+            EXPECT_EQ(outcome.diagnostic.find("No such file"), std::string::npos)
+                << "an existing file must not be reported absent: " << outcome.diagnostic;
+            EXPECT_EQ(classifyCUDADriverBinding(outcome.loadable, probe.string(), outcome.diagnostic),
                 Binding::PresentButUnbindable);
         }
 
