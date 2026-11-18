@@ -69,8 +69,9 @@ CUDA, ROCm and exclusive test in the canonical `ProductionTestPreflight`
 inventory. The production scheduler and native hardware observation own
 selection, including mixed-backend and multi-rank cases. CUDA, ROCm and
 exclusive lanes run sequentially on this host's one CPU package. Both vendors
-are required. Missing declared optional geometry is recorded as unqualified;
-failures and skips in selected tests fail the gate. Never infer GPU counts from
+are required. Missing declared geometry produces a pre-launch JUnit skip in
+`pr-tests/gpu/hardware-skips.xml` with the original observations. Failures and
+runtime skips in selected tests fail the gate. Never infer GPU counts from
 MPI width or test names. CMake `GPU_DEVICES`, or `CUDA_DEVICES` and
 `ROCM_DEVICES`, declare local physical counts. Original NUMA, native ISA and
 peer requirements retain their stricter canonical labels; unknown PCI NUMA

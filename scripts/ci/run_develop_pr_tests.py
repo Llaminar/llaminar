@@ -80,6 +80,33 @@ def validate_results(path: Path, expected: tuple[str, ...]) -> None:
             raise ValueError(f"PR test did not pass without skipping: {case.get('name')}")
 
 
+def write_hardware_skips(output: Path, qualification: dict) -> None:
+    """Report pre-launch hardware skips separately from CTest execution results."""
+    skipped = qualification["unqualified"]
+    suite = ET.Element("testsuite", name="Preflight hardware qualification",
+                       tests=str(len(skipped)), skipped=str(len(skipped)),
+                       failures="0", errors="0", time="0")
+    devices = (qualification["hardware"] or {}).get("devices", [])
+    for name, absence in skipped.items():
+        requirement = absence["requirement"]
+        degrees = (requirement["backend_degrees"] if "backend_degrees" in requirement
+                   else {requirement["backend"]: requirement["degree"]})
+        shortages = []
+        for backend, required in degrees.items():
+            count = sum(device["backend"] == backend for device in devices)
+            if count < required:
+                vendor = {"cuda": "CUDA", "rocm": "ROCm"}[backend]
+                shortages.append(f"requires {required} {vendor} GPUs, runner has {count}")
+        message = (", ".join(shortages) if shortages else
+                   "Runner does not satisfy " + json.dumps(requirement, sort_keys=True))
+        case = ET.SubElement(suite, "testcase", name=name, classname="ProductionTestPreflight",
+                             status="notrun", time="0")
+        ET.SubElement(case, "skipped", message=message).text = json.dumps(absence, sort_keys=True)
+    ET.indent(suite)
+    ET.ElementTree(suite).write(output, encoding="utf-8", xml_declaration=True)
+    print(f"[production-preflight] {len(skipped)} hardware skips ({output.name})", flush=True)
+
+
 def main(argv: list[str] | None = None) -> int:
     """Authenticate installed tests and retain exact, non-skipping scope evidence."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -115,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
               "return_code": None, "lanes": {}}
     if qualification is not None:
         report["qualification"] = qualification
+        write_hardware_skips(output / "hardware-skips.xml", qualification)
     path = output / "pr-tests.json"
     write_json(path, report)
     # Unit keeps unrestricted parallelism. Host follows the production lane's

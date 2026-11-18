@@ -125,6 +125,9 @@ Logs and JUnit evidence are retained in `pr-tests/` and `pr-tests/gpu/`;
 `pr-tests/pr-validation.json` binds both receipts as `unit-and-hardware-preflight`
 evidence and proves their union exactly matches the qualified inventory.
 The receipt retains all registered, selected and unqualified tests with reasons.
+`pr-tests/gpu/hardware-skips.xml` lists each hardware skip separately in JUnit.
+For a missing GPU it gives the required and observed counts by vendor. A test
+requiring one CUDA and one ROCm GPU still runs when both are present.
 Model staging, generation, HF parity, E2E and benchmarks remain separate gates.
 Only build logs, image/test receipts and CTest/JUnit evidence are
 uploaded to GitHub under artifact names containing the ISA. Run the same AVX2 PR transaction locally with:

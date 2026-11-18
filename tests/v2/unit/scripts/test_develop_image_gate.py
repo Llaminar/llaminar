@@ -19,6 +19,7 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 import yaml
 
@@ -87,6 +88,10 @@ class DevelopImageGateTests(unittest.TestCase):
         plan, qualification = pr_runner.hardware_preflight_plan(rows, hardware(cuda=2))
         self.assertIn(rows[-1].name, plan["cuda"])
         self.assertFalse(qualification["unqualified"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hardware-skips.xml"
+            pr_runner.write_hardware_skips(path, qualification)
+            self.assertEqual(ET.parse(path).getroot().get("skipped"), "0")
         for incomplete in (hardware(cuda=0), hardware(rocm=0)):
             with self.assertRaisesRegex(ValueError, "both CUDA and ROCm"):
                 pr_runner.hardware_preflight_plan(rows, incomplete)
@@ -168,6 +173,13 @@ class DevelopImageGateTests(unittest.TestCase):
                 self.assertEqual(report["lanes"]["cuda"]["tests"], ["V2_Integration_CUDA"])
                 self.assertEqual(report["lanes"]["rocm"]["tests"], ["V2_Integration_ROCm"])
                 self.assertEqual(set(report["qualification"]["unqualified"]), {"V2_Integration_Wide"})
+                suite = ET.parse(output / "hardware-skips.xml").getroot()
+                self.assertEqual((suite.get("tests"), suite.get("skipped")), ("1", "1"))
+                case, = suite.findall("testcase")
+                self.assertEqual((case.get("name"), case.get("status")), ("V2_Integration_Wide", "notrun"))
+                skip = case.find("skipped")
+                self.assertEqual(skip.get("message"), "requires 2 CUDA GPUs, runner has 1")
+                self.assertEqual(json.loads(skip.text), report["qualification"]["unqualified"][case.get("name")])
                 self.assertEqual(report["lanes"]["exclusive"]["tests"], ["V2_Integration_Mixed"])
                 self.assertTrue(report["lanes"]["exclusive"]["complete"])
 
