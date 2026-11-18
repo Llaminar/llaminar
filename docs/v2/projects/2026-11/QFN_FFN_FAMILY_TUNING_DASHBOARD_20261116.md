@@ -11,8 +11,8 @@ Decode measures the 255 tokens after the first.
 
 | MTP off | Llaminar prefill tok/s | Castagna prefill tok/s | Llaminar decode tok/s | Castagna decode tok/s | Decode gain |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| 512-token review | 1038.32 | 878.32 | 86.43 | 86.17 | +0.30% |
-| 2048-token code | 1008.04 | 1003.65 | 81.37 | 75.93 | +7.16% |
+| 512-token review | 1038.42 | 876.82 | 86.92 | 86.38 | +0.62% |
+| 2048-token code | 1008.12 | 1003.40 | 80.63 | 75.48 | +6.82% |
 
 Llaminar used retained HC/FFN, ordered peer push and the inline GDN projection
 in ordinary decode. With only that last projection disabled, the same binary
@@ -24,39 +24,35 @@ arms matched byte for byte. Mean KL was 0.014315 on prefill and 0.022115 on deco
 Across engines the first differing generated token was 0 for review and 44
 for code. Each engine repeated its own ordinary histories exactly.
 
-| MTP mode | Review prefill / decode tok/s | Code prefill / decode tok/s | Own ordinary decode, six 256-token histories |
+| MTP mode | Review prefill / decode tok/s | Code prefill / decode tok/s | Matches own ordinary histories |
 | --- | ---: | ---: | --- |
-| Llaminar grouped HC projection, fixed 3 | 1001.45 / 106.17 | 970.32 / 88.04 | 6/6 exact |
-| Llaminar grouped HC projection, dynamic | 998.66 / 111.05 | 969.34 / 90.73 | 6/6 exact |
-| Castagna fixed 3 | 774.28 / 114.89 | 888.35 / 106.31 | 0/6 exact, first divergence at review token 224 and code token 14 |
+| Llaminar grouped verifier, fixed 3 including three follow-up changes | 1002.74 / 122.94 | 970.94 / 100.20 | 6/6 |
+| Llaminar grouped verifier updates, dynamic | 1002.89 / 116.99 | 970.22 / 95.08 | 6/6 |
+| Castagna fixed 3, quiet repeat | 785.74 / 117.62 | 892.87 / 108.39 | 0/6 |
 
-On the same binary, disabling the grouped projection gave 99.43 and 82.56
-decode tok/s at fixed depth. Each prompt retained its full token history,
-draft count, accepted drafts and verifier calls in all three measurements.
-Llaminar still trails Castagna by 7.6% on review and 17.2% on code at fixed
-depth. The dynamic control with the projection disabled measured 105.65 and
-86.25 decode tok/s. The six dynamic outputs and all verifier counts also matched.
+Register top-K, short-context indexer fusion and vector GDN accepted-state
+publication raised fixed-depth decode from 119.20 to 122.94 tok/s on review
+and from 97.96 to 100.20 on code. The six same-executable generations and
+their MTP work matched exactly. The new candidate leads the quiet fork on
+review by 4.53% and trails on code by 7.55%. Dynamic figures above are for
+the preceding verifier configuration. Its follow-up was interrupted by reboot.
+On review the preceding Llaminar verifier took 25.06 ms versus
+16.97 ms in Castagna, including peer work. The HC, projection, routing and
+expert subtotal accounts for 6.61 ms of the remaining 8.09 ms. Draft
+prediction is close at 0.988 versus 0.977 ms per proposed token. The grouped
+FFN is the next controlled full-model comparison.
+[Phase measurements, run identities and commands](QFN_MI50_STAGE_COMPARISON_20261118.md)
 
-The dynamic repeat verified the loaded executable and libraries, token IDs,
-driver state and GPU retirement. Review accepted 197 of 294 drafted tokens
-over 58 verifier calls. Code accepted 187 of 345 over 69 calls.
+The current ordinary decode trace covers all 255 post-prefill review tokens.
+Values are mean active milliseconds per GPU per token. The projection group
+includes the fused GDN input projection.
 
-The original retained HC/FFN profile, before peer push and GDN fusion,
-covers all 255 post-prefill tokens on the 512-token review prompt.
-The figures below are mean kernel occupancy per GPU. The stages overlap.
-
-| Stage | Llaminar ms/token | Castagna ms/token |
+| Stage | Llaminar | Castagna |
 | --- | ---: | ---: |
-| Hyperconnections, projections, activation preparation, router and experts | 9.543 | 6.747 |
-| Collectives and ordered sum | 3.727 | 2.439 |
-| Attention, indexer and RoPE | 0.633 | 0.204 |
-| GDN and convolution state | 0.744 | 0.600 |
-
-Each cycle included 48 retained FFN launches. The remaining HC reads issued
-49 short-K projections and 49 branch-mixing kernels. All four devices issued
-97 small RCCL gathers with ordered sums and one vocabulary gather per cycle.
-Castagna issued 96 direct FP32 peer pushes. Both traces reproduced their own
-unprofiled outputs. Independent throughput runs measure the benefit of each change.
+| Hyperconnections, projections, router and experts | 8.219 | 6.747 |
+| Collectives and ordered sum | 1.969 | 2.439 |
+| Attention, indexer and RoPE | 0.650 | 0.204 |
+| GDN and convolution state | 0.745 | 0.600 |
 
 A second Release compared the original gather and ascending FP32 fold with a
 direct peer push that preserves the same sum order. The only change between
@@ -198,8 +194,4 @@ after warmup. The same capture census found no retained M1 nodes in prefill
 or verifier graphs. A short-K projection and branch-mix fusion removed 49
 nodes per ordinary decode graph. The matched six histories stayed exact.
 Review improved from 68.03 to 68.22 tok/s, code from 64.67 to 64.89. The
-fusion remains experimental. The matched fixed-depth review trace found 2,295
-kernels per Llaminar verifier and 485 for Castagna. Summed HC, projection,
-routing and expert work accounted for 23.21 versus 12.57 ms per verification.
-The next comparison targets those grouped operations on the full model. The
-wider TP2 Q8-down shard remains a separate tuning target.
+fusion remains experimental. The wider TP2 Q8-down shard remains a separate tuning target.
