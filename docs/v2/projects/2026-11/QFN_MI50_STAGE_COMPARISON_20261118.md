@@ -463,6 +463,17 @@ sustained 873.24 GB/s on this card. Cache-resident throughput and physical
 fetch throughput use different byte counts.
 [Physical counter calibration](/tmp/qfn-mi50-generic-m4-route-groups-c2/roofline-counters/counter-roofline-c2.json)
 
+The Q5_K/Q8_0 gate and down measured 64.32 and 41.12 µs.
+Their physical fetch rates reached 63.6% and 67.1% of their respective
+packet probes. For Q4_K/Q5_1 the 120- and 160-workgroup issue probes used
+the native 256 threads per workgroup and sustained 85.71 and 80.19 billion
+vector wave instructions per second. At those rates the measured gate
+and down instruction counts take 10.50 and 14.10 µs. The probes issue
+independent packed dots. Real work also includes dependent floating-point
+operations, address generation and synchronization.
+[Measurement procedure](../../../../tests/v2/performance/kernels/qwen4exp/verifier-roofline.md)
+[Per-resource results](/tmp/qfn-mi50-verifier-roofline/physical-resources.csv)
+
 ## Reproduction
 
 The local evidence root for native phase attribution is

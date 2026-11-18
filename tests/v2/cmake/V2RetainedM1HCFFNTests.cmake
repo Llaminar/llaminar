@@ -10,6 +10,12 @@ add_v2_test(V2_Unit_RetainedClosedHCFFNSummary
     LABELS "V2;Unit;DeviceFree;Benchmark;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15)
 
+add_v2_test(V2_Unit_VerifierRooflineMeasurement
+    COMMAND ${Python3_EXECUTABLE}
+        ${CMAKE_CURRENT_SOURCE_DIR}/performance/kernels/qwen4exp/test_verifier_roofline.py
+    LABELS "V2;Unit;DeviceFree;Benchmark;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 15)
+
 set(LLAMINAR_CASTAGNA_SOURCE_DIR "" CACHE PATH
     "Optional pinned Castagna checkout for the full-region native A/B diagnostic (no download)")
 if(NOT HAVE_ROCM)
