@@ -13,6 +13,7 @@
  */
 #pragma once
 
+#include "utils/DebugEnv.h"
 #include "loaders/WeightIdentity.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 
@@ -100,7 +101,7 @@ namespace llaminar2
          */
         static std::vector<IntermediateInterval> nativeIntermediateIntervals(
             int columns, int participants, int native_group, int rotation,
-            int preferred_grain = 128)
+            int preferred_grain = qfnGPUExpertPreferredIntermediateGrain())
         {
             if (columns <= 0 || participants <= 0 || native_group <= 0 ||
                 rotation < 0 || preferred_grain <= 0)

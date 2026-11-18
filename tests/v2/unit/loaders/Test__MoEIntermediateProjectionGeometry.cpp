@@ -24,7 +24,9 @@
 #include "utils/QuantizedVerifierFormats.h"
 
 #include <gtest/gtest.h>
+#include <algorithm>
 #include <array>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <memory>
@@ -85,6 +87,49 @@ public:
         bool, float, float, const TensorBase *, const IMPIContext *, int,
         DeviceWorkspaceManager *, int) override { return false; }
 };
+}
+
+/** @test Original layer rotation changes the owner of wider tiles without splitting any source block. */
+TEST(MoEIntermediateProjectionGeometry, BalancedNativeTilesMinimizeTheLargestPhysicalShard)
+{
+    for (const int native_group : {1, 32, 256}) {
+        const int unit = std::max(32, native_group);
+        for (const int blocks : {5, 12, 20}) {
+            const int columns = blocks * unit;
+            for (int degree = 1; degree <= blocks; ++degree) {
+                for (int rotation = 0; rotation < degree; ++rotation) {
+                    const auto cuts = Ownership::nativeIntermediateIntervals(columns, degree, native_group, rotation, 32);
+                    ASSERT_EQ(cuts.size(), static_cast<size_t>(degree));
+                    int frontier = 0;
+                    for (int member = 0; member < degree; ++member) {
+                        const auto& cut = cuts[member];
+                        const int original = (member + degree - rotation) % degree;
+                        const int extra = original >= degree - blocks % degree ? 1 : 0;
+                        EXPECT_EQ(cut.first_column, frontier);
+                        EXPECT_EQ(cut.columns, (blocks / degree + extra) * unit);
+                        frontier += cut.columns;
+                    }
+                    EXPECT_EQ(frontier, columns);
+                }
+            }
+        }
+        EXPECT_THROW(Ownership::nativeIntermediateIntervals(unit, 2, native_group, 0, 32), std::invalid_argument);
+    }
+}
+
+/** @test The process-wide GPU layout selection is honored by the same geometry used for reservations and materialization. */
+TEST(MoEIntermediateProjectionGeometry, SelectedNativeTilesApplyToAllRoutedQFNMainLayers)
+{
+    const char* setting = std::getenv("LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES");
+    const bool balanced = setting && std::strcmp(setting, "1") == 0;
+    for (int layer = 0; layer < 48; ++layer) {
+        const auto cuts = Ownership::nativeIntermediateIntervals(640, 4, 32, layer);
+        ASSERT_EQ(cuts.size(), 4u);
+        for (int member = 0; member < 4; ++member) {
+            const int original_width = member == (layer + 3) % 4 ? 256 : 128;
+            EXPECT_EQ(cuts[member].columns, balanced ? 160 : original_width);
+        }
+    }
 }
 
 /** @test Each participant retains all E, and gate/up N matches down K exactly. */

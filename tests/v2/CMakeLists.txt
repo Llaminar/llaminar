@@ -35675,6 +35675,12 @@ add_v2_test(V2_Integration_MoEIntermediateProjectionGeometry
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Projection;SourceIdentity;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
+add_v2_test(V2_Integration_MoEExpertBalancedNativeTiles
+    COMMAND $<TARGET_FILE:v2_unit_weight_manager_moe_expert_overlay_preparation>
+        --gtest_filter=MoEIntermediateProjectionGeometry.SelectedNativeTilesApplyToAllRoutedQFNMainLayers:MoEIntermediateProjectionGeometry.BalancedNativeTilesMinimizeTheLargestPhysicalShard
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Projection;SourceIdentity;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES=1;LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;OMP_NUM_THREADS=1;OMP_DYNAMIC=false;OPENBLAS_NUM_THREADS=1;MKL_NUM_THREADS=1")
 add_v2_test(V2_Integration_ExpertProjectionMaterialization
     COMMAND $<TARGET_FILE:v2_test_model_loader_row_slice>
         --gtest_filter=*ModelLoaderExpertSelectionTest.NativeProjectionWeightManager*
@@ -35696,6 +35702,7 @@ add_v2_test(V2_Integration_StaticExpertProjectionNativeBlocks
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_ModelLoaderNativeExpertProjectionSlices
     V2_Integration_MoEIntermediateProjectionGeometry
+    V2_Integration_MoEExpertBalancedNativeTiles
     V2_Integration_ExpertProjectionMaterialization
     V2_Integration_StaticExpertProjectionPreparation
     V2_Integration_StaticExpertProjectionNativeBlocks)

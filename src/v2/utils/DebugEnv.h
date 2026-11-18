@@ -127,6 +127,22 @@ namespace llaminar2
         return enabled;
     }
 
+    /** @brief Return the experimental preferred tile for GPU expert intermediate sharding.
+     * @return The native activation group size for balanced shards or the original 128-column preference.
+     * @throws std::invalid_argument For values other than 0 and 1.
+     * @details The source weight group remains indivisible for either setting. Both admission
+     * and materialization obtain the same policy before constructing any intervals. */
+    inline int qfnGPUExpertPreferredIntermediateGrain()
+    {
+        static const int grain = [] {
+            const char* mode = std::getenv("LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES");
+            if (!mode || std::strcmp(mode, "0") == 0) return 128;
+            if (std::strcmp(mode, "1") == 0) return 32;
+            throw std::invalid_argument("LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES accepts 0 or 1");
+        }();
+        return grain;
+    }
+
     /**
      * @brief Tracks whether selected environment variables were present at the last reload.
      *
