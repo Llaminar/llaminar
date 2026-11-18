@@ -70,6 +70,16 @@ if(TARGET v2_integration_moe_intermediate_ffn_finalization)
     target_include_directories(v2_integration_moe_intermediate_ffn_finalization PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     v2_test_device_scope(v2_integration_moe_intermediate_ffn_finalization FullInventory)
 
+    add_v2_test(V2_Integration_ROCmGroupedFFNFormatProgramDemand
+        COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
+            --gtest_filter=ROCmGroupedFFNFormatProgramNative.RejectsForeignRuntimeAndIncorrectDemandBeforeRecording
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeQuantised;GraphCapture;Replay;Regression;Devices1;NativeISA-gfx906"
+        MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
+        ENVIRONMENT "LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16;LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER=1;LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK=1;LLAMINAR_QFN_ROCM_GROUPED_FFN_ALL_FORMATS=1;LLAMINAR_PERF_STATS_SUMMARY=1;LLAMINAR_PERF_STATS_FILTER=kernel.rocm_grouped_ffn_frontier_calls")
+    if(TEST V2_Integration_ROCmGroupedFFNFormatProgramDemand)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedFFNFormatProgramDemand)
+    endif()
+
     add_v2_test(V2_Integration_FullNativeHCFFN_RetainedClosed_ROCm
         COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
             --gtest_filter=FullNativeHCFFN.ROCmRetainedClosedReplay:FullNativeHCFFN.ROCmRetainedBalancedTP2Replay

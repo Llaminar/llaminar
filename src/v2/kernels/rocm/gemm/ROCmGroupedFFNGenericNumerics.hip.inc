@@ -9,6 +9,26 @@
  */
 namespace generic {
 
+/**
+ * @brief Register value for a role already authenticated by one of the two authorities.
+ * @details Shared fields originate from immutable capture kernargs. Materialize
+ * fields separately to avoid selecting a shared-descriptor address in private
+ * memory. A routed construction requires the real acquired-bank role view.
+ */
+class ReadyProjectionFields final {
+    friend class ::llaminar2::rocm::grouped_ffn::PreparedGroupedSharedRole;
+    DeviceNativeQuantisedMatrixDesc descriptor_;
+    __device__ explicit ReadyProjectionFields(const DeviceNativeQuantisedMatrixDesc& source)
+        : descriptor_{.payload=source.payload,.scales=source.scales,.mins=source.mins,
+                      .emins=source.emins,.n=source.n,.codebook_id=source.codebook_id} {}
+public:
+    /** @return Independent immutable fields from the original published role. */
+    __device__ static ReadyProjectionFields from(PublishedNativeProjection projection)
+    { return ReadyProjectionFields(projection.descriptor()); }
+    /** @return Field value consumed by the unchanged native K32 arithmetic. */
+    __device__ const DeviceNativeQuantisedMatrixDesc& descriptor() const { return descriptor_; }
+};
+
 /** @brief Original quantized activation and optional exact full-block integer sum. */
 struct ProjectionRow {
     const int8_t* codes{};
@@ -39,16 +59,16 @@ static constexpr bool validFormats(const NativeQuantisedExecutionFormatEnvelope&
  * expert. The single-partition policy returns the leaf directly as in serial M1.
  * For Q2_K and IQ1_M the shared original accumulator retains its segmented sums.
  */
-template<NativeQuantisedFormatPrefill Format,int MaxUsers,int PartitionWorkers,bool OneBlockPerPartition>
+template<NativeQuantisedFormatPrefill Format,int MaxUsers,int PartitionWorkers,bool OneBlockPerPartition,class Projection>
+    requires (std::is_same_v<Projection,PublishedNativeProjection> || std::is_same_v<Projection,ReadyProjectionFields>)
 __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjectionFormat(
-    const DeviceNativeQuantisedMatrixDesc& desc,int column,int width,
+    Projection projection,int column,int width,
     const ProjectionUsers<MaxUsers>& users,int parts,int lane)
 {
     static_assert(PartitionWorkers==1 || PartitionWorkers==4);
     using Traits=PrefillNATIVE_QUANTISEDTraits<Format>;
+    const auto& desc=projection.descriptor();
     const int blocks=width/32;
-    if(!prefill_native_quantised_desc_shape_ok<Format>(desc,desc.n,width))
-        __builtin_trap();
     const int worker=lane/(64/PartitionWorkers);
     // Only the original resolved policy selects the one-block program.
     // Arithmetic still starts each partition at +0, then appends its result.
@@ -111,22 +131,21 @@ __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjectionFormat(
  * @param parts Original source policy resolved before capture by the existing serial owner.
  * @param formats Capture-stable execution and source policy masks for this role.
  */
-template<int MaxUsers,int PartitionWorkers,unsigned Groups=15,bool OneBlockPerPartition=false>
+template<int MaxUsers,int PartitionWorkers,unsigned Groups=15,bool OneBlockPerPartition=false,class Projection>
+    requires (std::is_same_v<Projection,PublishedNativeProjection> || std::is_same_v<Projection,ReadyProjectionFields>)
 __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjection(
-    const DeviceNativeQuantisedMatrixDesc& desc,int column,int columns,int width,
+    Projection projection,int column,int width,
     const ProjectionUsers<MaxUsers>& users,int parts,int lane,
     const NativeQuantisedExecutionFormatEnvelope& formats)
 {
-    if(desc.n!=columns || column<0 || column>=columns || users.live<1 || users.live>MaxUsers ||
-        parts<1 || parts>width/32 || (OneBlockPerPartition && parts!=width/32) ||
-        !(formats.execution_codebook_mask & nativeQuantisedCodebookMaskBit(desc.codebook_id)) ||
-        !(formats.policy_codebook_mask & nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(desc.arithmeticPolicyCodebookId()))))
+    const auto physical=projection.descriptor().codebook_id;
+    if(!(formats.execution_codebook_mask & nativeQuantisedCodebookMaskBit(physical)))
         __builtin_trap();
 #define LLAMINAR_ORDERED_FORMAT(ID) case ID: \
     if constexpr(ResidentMoEFFNDecoderProgram::familyMask<Groups>() & nativeQuantisedCodebookMaskBit(ID)) \
-        return orderedProjectionFormat<ID,MaxUsers,PartitionWorkers,OneBlockPerPartition>(desc,column,width,users,parts,lane); \
+        return orderedProjectionFormat<ID,MaxUsers,PartitionWorkers,OneBlockPerPartition>(projection,column,width,users,parts,lane); \
     else __builtin_trap()
-    switch(static_cast<NativeQuantisedFormatPrefill>(desc.codebook_id)) {
+    switch(static_cast<NativeQuantisedFormatPrefill>(physical)) {
         LLAMINAR_ORDERED_FORMAT(NATIVE_QUANTISED_PF_Q4_0);
         LLAMINAR_ORDERED_FORMAT(NATIVE_QUANTISED_PF_IQ4_NL);
         LLAMINAR_ORDERED_FORMAT(NATIVE_QUANTISED_PF_IQ4_XS_SOURCE);

@@ -6,6 +6,7 @@
  */
 #include "kernels/rocm/gemm/ROCmGroupedFFNFormatSelection.h"
 #include <gtest/gtest.h>
+#include <type_traits>
 
 namespace {
 using namespace llaminar2;
@@ -180,3 +181,8 @@ TEST(ROCmGroupedFFNFormatSelection, MeasuredSumAdmissionDistinguishesSourceAlias
     EXPECT_FALSE(matches());
 }
 } // namespace
+
+
+/** Raw runtime pointers cannot issue the receipt accepted by the numerical launcher. */
+static_assert(!std::is_constructible_v<ffn::BoundSourceFormatProgram,const ffn::SourceFormatProgram&,
+    llaminar2::DeviceMoELayerRuntime*,int>);

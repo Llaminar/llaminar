@@ -8,24 +8,59 @@
  */
 #include "ROCmGroupedFFNGenericNumerics.hip.inc"
 
-namespace {
-/** @brief One immutable shared descriptor and its separate source and decoder policies. */
-struct SealedSharedRole {
-    DeviceNativeQuantisedMatrixDesc descriptor;
-    NativeQuantisedExecutionFormatEnvelope formats;
-    int partitions;
+/**
+ * @brief Shared descriptor copy certified once by the original capture preparation.
+ * @details Only launchFormatProgram can seed this immutable value. Kernel
+ * readers get the same published-native view as the acquired original bank.
+ */
+class PreparedGroupedSharedRole final {
+    friend bool launchFormatProgram(const RoutePlan&,const std::array<DeviceNativeQuantisedMatrixDesc,3>&,
+        const Output&,int,void*,const DirectBankInput&,const BoundSourceFormatProgram&);
+    DeviceNativeQuantisedMatrixDesc descriptor_{};
+    NativeQuantisedExecutionFormatEnvelope formats_{};
+    int partitions_{};
+    PreparedGroupedSharedRole() = default;
+    PreparedGroupedSharedRole(const DeviceNativeQuantisedMatrixDesc& descriptor,
+        NativeQuantisedExecutionFormatEnvelope formats,int partitions)
+        : descriptor_(descriptor),formats_(formats),partitions_(partitions) {}
+public:
+    /** @return Immutable device descriptor certified at preparation. */
+    __device__ __forceinline__ PublishedNativeProjection projection() const
+    { return PublishedNativeProjection(&descriptor_); }
+    /** @return One register value from these capture-validated shared fields. */
+    __device__ __forceinline__ generic::ReadyProjectionFields fields() const
+    { return generic::ReadyProjectionFields(descriptor_); }
+    /** @return The original role's retained numerical partition count. */
+    __host__ __device__ int partitions() const noexcept { return partitions_; }
+    /** @return Its retained source/physical envelope. */
+    __host__ __device__ NativeQuantisedExecutionFormatEnvelope formats() const noexcept { return formats_; }
 };
 
-/** @brief Typed ready original local native expert with exact physical publication identity. */
-__device__ __forceinline__ const native_runtime_abi::DeviceMoEExpertDescriptorView&
-groupedExpert(const AcquiredBank& bank,int expert)
-{
-    const auto& selected=bank.bank().experts[expert];
-    if(selected.weight_format!=DeviceMoEWeightFormat::NativeQuantised ||
-        selected.projection_set!=DeviceMoEProjectionSet::IntermediateShard)
-        __builtin_trap();
-    return selected;
-}
+/**
+ * @brief Borrow original grouped route slots after their stream-ordered publication.
+ * @details This view owns no route bytes. Only the same acquired bank and
+ * existing epoch/ticket receipt issued by publishRoutes authorize the borrow.
+ */
+class AcquiredGroupedRoutePublication final {
+    AcquiredBank bank_;
+    __device__ explicit AcquiredGroupedRoutePublication(const DirectBankInput& input)
+        : bank_(acquireBank<true>(input)) {}
+public:
+    /** @return A retained view of the exact bank that emitted the requested slots. */
+    __device__ static AcquiredGroupedRoutePublication acquire(const DirectBankInput& input)
+    { return AcquiredGroupedRoutePublication(input); }
+    /** @return The ready local Down role from this original live publication. */
+    __device__ PublishedNativeProjection localDownIf(bool active,int slot,int live) const
+    {
+        if(active)return bank_.localNativeDownFromGroupedSlot(slot,live*topK);
+        return bank_.localNativeProjectionOrInactive(-1,PublishedNativeProjectionRole::Down);
+    }
+    /** @return Original FP32 route weight for this same verified local slot. */
+    __device__ float weight(int slot) const { return bank_.runtime()->route_weights[slot]; }
+};
+
+namespace {
+using SealedSharedRole=PreparedGroupedSharedRole;
 
 /**
  * @brief Share the true row's activation loads across an immutable physical gate/up pair.
@@ -42,19 +77,15 @@ groupedExpert(const AcquiredBank& bank,int expert)
  * @return Independent, ordered gate and up projection values.
  */
 template<NativeQuantisedFormatPrefill Format,bool Routed>
-__device__ __forceinline__ Projections sealedPair(const DeviceNativeQuantisedMatrixDesc& gate,
-    const DeviceNativeQuantisedMatrixDesc& up,const generic::ProjectionRow& row,
-    int parts,int span,int column,int lane,std::uint32_t originalSourceMask=0)
+__device__ __forceinline__ Projections sealedPair(PublishedNativeProjection gateRole,
+    PublishedNativeProjection upRole,const generic::ProjectionRow& row,int parts,int column,int lane)
 {
-    if constexpr(Routed) {
-        if(!prefill_native_quantised_desc_shape_ok<Format>(gate,span,hidden) ||
-           !prefill_native_quantised_desc_shape_ok<Format>(up,span,hidden) ||
-           !(originalSourceMask & nativeQuantisedCodebookMaskBit(
-               canonicalDeviceVnniCodebookId(gate.arithmeticPolicyCodebookId()))) ||
-           !(originalSourceMask & nativeQuantisedCodebookMaskBit(
-               canonicalDeviceVnniCodebookId(up.arithmeticPolicyCodebookId()))))
-            __builtin_trap();
-    }
+    const auto& gate=gateRole.descriptor();
+    const auto& up=upRole.descriptor();
+    // A reachable mutable expert may use a different native physical reader.
+    // Shape, source and plane validity belong to the published-role authority.
+    if constexpr(Routed)
+        if(gate.codebook_id!=Format || up.codebook_id!=Format)__builtin_trap();
     if constexpr(PrefillNATIVE_QUANTISEDTraits<Format>::is_asymmetric &&
                  !PrefillNATIVE_QUANTISEDTraits<Format>::is_dual_scale) {
         if(row.sum32)
@@ -77,7 +108,6 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
     const auto bank=acquireBank<false>(direct);
     if(blockIdx.x==0)publishRoutes(direct,bank,live);
     if(live==0)return;
-    const int participant=__builtin_amdgcn_readfirstlane(static_cast<int>(bank.runtime()->participant_id));
 
     __shared__ float gate_sums[16];
     if(blockIdx.x<live) {
@@ -107,24 +137,20 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
         const int row=routed?slot/topK:slot;
         const int block=local%blocks;
         const int column=block*32+lane%16+__builtin_amdgcn_readfirstlane(tileLane/64)*16;
-        int id=-1;
-        if(active && routed) {
-            const auto route=selectRoute(direct,bank,slot,live);
-            id=__builtin_amdgcn_readfirstlane(route.expert);
-            active=id>=0 && __builtin_amdgcn_readfirstlane(route.participant)==participant;
-        }
+        // The original router packet already owns this slot's expert choice.
+        // Resolve locality/readiness once and retain both roles from that row.
+        const int id=active && routed?__builtin_amdgcn_readfirstlane(static_cast<int>(direct.indices[slot])):-1;
+        const auto picked=bank.localNativeGateUpOrInactive(id);
+        if(routed)active=picked.local();
         if(active) {
-            const auto* expert=routed?&groupedExpert(bank,id):nullptr;
             const generic::ProjectionUsers<1> users{{{hiddenCodes+row*hidden,hiddenScales+row*(hidden/32),
                 direct.affineSums?direct.affineSums->hiddenRows+row*(hidden/32):nullptr}},1};
             if constexpr(RoutedCodebook>=0) {
                 const auto values=routed
                     ?sealedPair<static_cast<NativeQuantisedFormatPrefill>(RoutedCodebook),true>(
-                        expert->gate,expert->up,users.rows[0],gateParts,span,column,lane,
-                        routedFormats.policy_codebook_mask)
+                        picked.gate,picked.up,users.rows[0],gateParts,column,lane)
                     :sealedPair<NATIVE_QUANTISED_PF_Q8_0,false>(
-                        sharedGate.descriptor,sharedUp.descriptor,users.rows[0],sharedGate.partitions,
-                        span,column,lane);
+                        sharedGate.projection(),sharedUp.projection(),users.rows[0],sharedGate.partitions(),column,lane);
                 if(lane<16) {
                     if(!routed) {
                         output.sharedGateScratch[row*span+column]=values.gate;
@@ -137,37 +163,13 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
 #pragma unroll 1
                 for(int role=0;role<2;++role) {
                     const bool isGate=role==0;
-                    // Select scalar fields from kernargs. Selecting a by-value role
-                    // aggregate here forces two full per-thread private shadow copies.
-#define LLAMINAR_FRONTIER_ROLE_FIELD(FIELD) \
-        (expert?(isGate?expert->gate.FIELD:expert->up.FIELD) \
-               :(isGate?sharedGate.descriptor.FIELD:sharedUp.descriptor.FIELD))
-                    const DeviceNativeQuantisedMatrixDesc matrix{
-                        .payload=LLAMINAR_FRONTIER_ROLE_FIELD(payload),
-                        .scales=LLAMINAR_FRONTIER_ROLE_FIELD(scales),
-                        .mins=LLAMINAR_FRONTIER_ROLE_FIELD(mins),
-                        .emins=LLAMINAR_FRONTIER_ROLE_FIELD(emins),
-                        .n=static_cast<decltype(DeviceNativeQuantisedMatrixDesc::n)>(
-                            __builtin_amdgcn_readfirstlane(LLAMINAR_FRONTIER_ROLE_FIELD(n))),
-                        .k=static_cast<decltype(DeviceNativeQuantisedMatrixDesc::k)>(
-                            __builtin_amdgcn_readfirstlane(LLAMINAR_FRONTIER_ROLE_FIELD(k))),
-                        .blocks_per_row=static_cast<decltype(DeviceNativeQuantisedMatrixDesc::blocks_per_row)>(
-                            __builtin_amdgcn_readfirstlane(LLAMINAR_FRONTIER_ROLE_FIELD(blocks_per_row))),
-                        .codebook_id=static_cast<decltype(DeviceNativeQuantisedMatrixDesc::codebook_id)>(
-                            __builtin_amdgcn_readfirstlane(LLAMINAR_FRONTIER_ROLE_FIELD(codebook_id))),
-                        .source_codebook_id=static_cast<decltype(DeviceNativeQuantisedMatrixDesc::source_codebook_id)>(
-                            __builtin_amdgcn_readfirstlane(LLAMINAR_FRONTIER_ROLE_FIELD(source_codebook_id))),
-                        .source_identity_present=static_cast<decltype(DeviceNativeQuantisedMatrixDesc::source_identity_present)>(
-                            __builtin_amdgcn_readfirstlane(LLAMINAR_FRONTIER_ROLE_FIELD(source_identity_present))),
-                    };
-#undef LLAMINAR_FRONTIER_ROLE_FIELD
-                    const NativeQuantisedExecutionFormatEnvelope formats{
-                        expert?routedFormats.execution_codebook_mask:(isGate?sharedGate.formats.execution_codebook_mask:sharedUp.formats.execution_codebook_mask),
-                        expert?routedFormats.policy_codebook_mask:(isGate?sharedGate.formats.policy_codebook_mask:sharedUp.formats.policy_codebook_mask),
-                    };
-                    const int parts=expert?(isGate?gateParts:upParts):
-                        (isGate?sharedGate.partitions:sharedUp.partitions);
-                    const auto values=generic::orderedProjection<1,4,Groups>(matrix,column,span,hidden,users,parts,lane,formats);
+                    const auto projection=routed
+                        ? generic::ReadyProjectionFields::from(isGate?picked.gate:picked.up)
+                        : (isGate?sharedGate.fields():sharedUp.fields());
+                    const auto formats=routed?routedFormats:(isGate?sharedGate.formats():sharedUp.formats());
+                    const int parts=routed?(isGate?gateParts:upParts):
+                        (isGate?sharedGate.partitions():sharedUp.partitions());
+                    const auto values=generic::orderedProjection<1,4,Groups>(projection,column,hidden,users,parts,lane,formats);
                     if(isGate)gateValue=values.value[0];
                     else if(lane<16) {
                         if(!routed) {
@@ -216,21 +218,20 @@ void groupedFFNFormatProgramDown(const int32_t* liveOwner,Scratch scratch,Output
     const int column=blockIdx.x*columns+lane;
     const int live=__builtin_amdgcn_readfirstlane(*liveOwner);
     if(live<0 || live>capacity)__builtin_trap();
-    const auto bank=acquireBank<true>(direct);
+    const auto published=AcquiredGroupedRoutePublication::acquire(direct);
     const int row=blockIdx.y;
     __shared__ float complete[topK+1][columns];
     for(int route=wave;route<=topK;route+=threads/columns) {
         float dot=0.0f;
         const bool routed=route<topK;
         const int slot=routed?row*topK+route:row;
-        if(row<live && (!routed || __builtin_amdgcn_readfirstlane(bank.runtime()->route_participant_ids[slot])==static_cast<int>(bank.runtime()->participant_id))) {
+        const auto local=published.localDownIf(row<live && routed,slot,live);
+        if(row<live && (!routed || local)) {
+            const auto projection=routed?generic::ReadyProjectionFields::from(local):sharedDown.fields();
             const int span=routed?routedColumns:sharedColumns;
             const int blocks=span/32;
-            const int id=routed?__builtin_amdgcn_readfirstlane(bank.runtime()->route_expert_ids[slot]):-1;
-            if(routed && (id<0 || id>=experts))__builtin_trap();
-            const auto matrix=routed?groupedExpert(bank,id).down:sharedDown.descriptor;
-            const auto formats=routed?routedFormats:sharedDown.formats;
-            const auto parts=routed?routedParts:sharedDown.partitions;
+            const auto formats=routed?routedFormats:sharedDown.formats();
+            const auto parts=routed?routedParts:sharedDown.partitions();
             const auto* codes=routed?scratch.routed_codes:scratch.shared_codes;
             const auto* scales=routed?scratch.routed_scales:scratch.shared_scales;
             const generic::ProjectionUsers<1> user{{{codes+slot*span,scales+slot*blocks,
@@ -238,15 +239,15 @@ void groupedFFNFormatProgramDown(const int32_t* liveOwner,Scratch scratch,Output
             float value;
             if constexpr(RoutedPhysical>=0) {
                 constexpr auto physical=static_cast<NativeQuantisedFormatPrefill>(RoutedPhysical);
-                if(matrix.codebook_id!=(routed?RoutedPhysical:int(NATIVE_QUANTISED_PF_Q8_0)) ||
-                   !(formats.policy_codebook_mask & nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(matrix.arithmeticPolicyCodebookId()))) ||
-                   matrix.n!=hidden || parts<1 || parts>blocks || (OneBlockPerPartition && parts!=blocks))__builtin_trap();
-                value=routed?generic::orderedProjectionFormat<physical,1,1,OneBlockPerPartition>(matrix,column,span,user,parts,lane).value[0]:
-                    generic::orderedProjectionFormat<NATIVE_QUANTISED_PF_Q8_0,1,1,OneBlockPerPartition>(matrix,column,span,user,parts,lane).value[0];
+                if(routed && projection.descriptor().codebook_id!=RoutedPhysical)__builtin_trap();
+                value=routed?generic::orderedProjectionFormat<physical,1,1,OneBlockPerPartition>(
+                    projection,column,span,user,parts,lane).value[0]:
+                    generic::orderedProjectionFormat<NATIVE_QUANTISED_PF_Q8_0,1,1,OneBlockPerPartition>(
+                    projection,column,span,user,parts,lane).value[0];
             } else {
-                value=generic::orderedProjection<1,1,Groups,OneBlockPerPartition>(matrix,column,hidden,span,user,parts,lane,formats).value[0];
+                value=generic::orderedProjection<1,1,Groups,OneBlockPerPartition>(projection,column,span,user,parts,lane,formats).value[0];
             }
-            dot=routed?rocm_native_quantised_weight_route_rn(bank.runtime()->route_weights[slot],value):
+            dot=routed?rocm_native_quantised_weight_route_rn(published.weight(slot),value):
                 rocm_native_quantised_accumulate_rn(0.0f,rocm_native_quantised_weight_route_rn(1.0f,value));
         }
         complete[route][lane]=dot;
@@ -293,8 +294,10 @@ SourceFormatProgram SourceFormatProgram::prepare(const SourceFormatDeclaration& 
 }
 
 bool launchFormatProgram(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDesc,3>& sharedWeights,
-    const Output& output,int device,void* stream,const DirectBankInput& direct,const SourceFormatProgram& program)
+    const Output& output,int device,void* stream,const DirectBankInput& direct,const BoundSourceFormatProgram& bound)
 {
+    if(!bound.matches(direct.runtime,device))return false;
+    const auto& program=bound.program();
     const int routedColumns=program.routedColumns(), sharedColumns=program.sharedColumns();
     const auto& formats=program.formats();
     if(device<0 || reinterpret_cast<uintptr_t>(stream)<=2 || !direct.runtime || !direct.indices ||
@@ -370,7 +373,7 @@ bool launchFormatProgram(const RoutePlan& plan,const std::array<DeviceNativeQuan
         default: break;
         }
     }
-    const bool shortDown=roles[2].partitions==sharedColumns/32 && routedParts[2]==routedColumns/32;
+    const bool shortDown=roles[2].partitions()==sharedColumns/32 && routedParts[2]==routedColumns/32;
     if(shortDown) {
         const auto families=ResidentMoEFFNDecoderProgram::fromExecutionMask(
             formats.routedDown.execution_codebook_mask | formats.shared[2].execution_codebook_mask);

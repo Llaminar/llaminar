@@ -16,6 +16,7 @@
 #endif
 namespace llaminar2::rocm::router_native { template<class> class AcquiredRuntimeDecodeBank; }
 namespace llaminar2::rocm::full_native_ffn { class PreparedFullNativeSharedSource; }
+namespace llaminar2::rocm::grouped_ffn { class PreparedGroupedSharedRole; }
 namespace llaminar2 {
 /** @brief Semantic projection role; never a caller-provided descriptor offset. */
 enum class PublishedNativeProjectionRole : unsigned char { Gate, Up, Down };
@@ -28,6 +29,7 @@ enum class PublishedNativeProjectionRole : unsigned char { Gate, Up, Down };
 class PublishedNativeProjection final {
     template<class> friend class rocm::router_native::AcquiredRuntimeDecodeBank;
     friend class rocm::full_native_ffn::PreparedFullNativeSharedSource;
+    friend class rocm::grouped_ffn::PreparedGroupedSharedRole;
     const DeviceNativeQuantisedMatrixDesc* descriptor_;
     /** @brief Issue only inside an existing prepared/acquired authority. */
     LLAMINAR_DESCRIPTOR_HD explicit constexpr PublishedNativeProjection(

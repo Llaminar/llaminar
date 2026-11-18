@@ -55,7 +55,10 @@ The counted four-row reader passed static and deferred replay across all
 On original 128- and 256-column QFN shards, paired gate/up reads saved
 10%–13% on Q4_K; Q5_K was 4.5%–7.9% slower, so its reads stay separate.
 Gate/up sustains roughly half of the matched physical-read rate on the
-original shards. Full-model rates above apply to the equal-width K32-sum run.
+original shards. On those shards, the prepared reader raised full-model
+fixed-three decode from 114.89 to 124.58 tok/s on review and 94.66 to
+102.51 on code, with identical token histories and verifier work.
+The table above uses the separate equal-width run.
 [Shard timings and read calibration](QFN_MI50_STAGE_COMPARISON_20261118.md#original-shard-widths-and-verifier-preparation)
 
 The current ordinary decode trace covers all 255 post-prefill review tokens.

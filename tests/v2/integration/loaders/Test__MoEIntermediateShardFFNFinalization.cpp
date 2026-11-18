@@ -34,6 +34,7 @@
 #include "backends/BackendManager.h"
 #ifdef HAVE_ROCM
 #include "backends/rocm/HIPGraphCapture.h"
+#include "kernels/rocm/gemm/ROCmGroupedFFNFormatSelection.h"
 #include "collective/OriginalNativeGraphCaptureGroup.h"
 #include "kernels/rocm/gemm/ROCmResidentMoEFFN.h"
 #include "kernels/rocm/gemm/ROCmGateUpLastProducer.h"
@@ -72,6 +73,7 @@
 #include "execution/moe/MoEOverlayHostAuthorityBankRecipe.h"
 #include "execution/moe/MoEOverlayOriginalGPUCohortContexts.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/rocm/gemm/ROCmGroupedFFNFrontier.h"
 #include "utils/PerfStatsCollector.h"
@@ -151,6 +153,7 @@ struct OriginalFFNFixtureGeometry {
     int top_k=kTopK; ///< Original metadata-selected route extent, never a prepared override.
     OriginalFFNRouterSource router_source=OriginalFFNRouterSource::TieControl; ///< Original raw source bytes, not a routing override.
     OriginalFFNGeometryContract contract=OriginalFFNGeometryContract::SourceDerived; ///< Assert an exact admitted source geometry.
+    bool verify_runtime_admission=false; ///< Inspect capture admission with two original owners.
     std::string_view grouped_matrix_case{}; ///< Nonempty selects the isolated M4 source-catalog fixture.
     std::string_view grouped_matrix_symbol{}; ///< Expected selected production candidate symbol, when armed.
     GroupedM4FixtureProgram grouped_matrix_program=GroupedM4FixtureProgram::AllFormats; ///< Exact capture program family.
@@ -1041,6 +1044,94 @@ void captureLane(Lane &lane, bool grouped, DeviceId device, int member, IWorkerG
     rendezvous.arrive_and_wait();
 }
 
+#ifdef HAVE_ROCM
+/** @brief Reject a foreign runtime or prefill demand before either verifier node is recorded. */
+void verifyGroupedFormatRuntimeAdmission(Lane& lane,DeviceMoERuntimeTable& foreign,DeviceId device)
+{
+    namespace ffn=rocm::grouped_ffn;
+    constexpr int rows=ffn::capacity, slots=rows*ffn::topK, hidden=ffn::hidden, width=160;
+    struct CaptureOperands
+    {
+        std::uint64_t bank[3];
+        std::int32_t live;
+        float routeIds[slots], routeWeights[slots], hiddenFP32[rows*hidden];
+        std::int8_t hiddenCodes[rows*hidden], routedCodes[slots*width], sharedCodes[rows*width];
+        float hiddenScales[rows*(hidden/32)], routedScales[slots*(width/32)], sharedScales[rows*(width/32)];
+        float gate[rows], sharedInputGate[hidden], sharedGate[rows*width], sharedUp[rows*width];
+        float routed[rows*hidden], shared[rows*hidden], combined[rows*hidden], contributions[slots*hidden];
+    };
+    auto& context=*lane.worker;
+    auto* stream=lane.stream;
+    auto storage = TestTensorFactory::createFP32({(sizeof(CaptureOperands)+sizeof(float)-1)/sizeof(float)});
+    ASSERT_TRUE(storage->ensureOnDevice(device,stream));
+    auto *operands = static_cast<CaptureOperands*>(storage->gpu_data_ptr());
+    auto upSource = TestTensorFactory::createQ8_0Random({width,hidden},7151);
+    auto downSource = TestTensorFactory::createQ8_0Random({hidden,width},7152);
+    auto upOwner = makeGpuPreparedGemm(upSource.get(),device,"test.format_program.capture.up");
+    auto downOwner = makeGpuPreparedGemm(downSource.get(),device,"test.format_program.capture.down");
+    DeviceNativeQuantisedMatrixDesc up{}, down{};
+    ASSERT_TRUE(upOwner.kernel->exportNativeQuantisedMatrixDesc(up));
+    ASSERT_TRUE(downOwner.kernel->exportNativeQuantisedMatrixDesc(down));
+    const auto* source=lane.runtime->fragmentDescriptorDeclaration(0);
+    ASSERT_NE(source,nullptr);
+    const auto& roles=source->sourceFormats();
+    const auto program=ffn::SourceFormatProgram::prepare(ffn::declareSourceFormats(
+        source->originalBinding().localIntermediateColumns(),width,
+        source->nativeGateUpEnvelope(),source->nativeDownEnvelope(),
+        {roles[0].native_quantised,roles[1].native_quantised,roles[2].native_quantised},{up,up,down}));
+    const auto bound=ffn::BoundSourceFormatProgram::prepare(*lane.runtime,0,program);
+    // A Q4_1 gate has the same physical decoder as this Q4_K gate. The
+    // original binding must still reject the other source before recording.
+    auto aliased=program.routedSources();
+    ASSERT_EQ(aliased[0].codebook_id,native_quantised_formats::Q4_K.codebook_id);
+    ASSERT_TRUE(aliased[0].is_superblock);
+    aliased[0].is_superblock=false;
+    const auto foreignPolicy=ffn::SourceFormatProgram::prepare(ffn::declareSourceFormats(
+        program.routedColumns(),width,source->nativeGateUpEnvelope(),source->nativeDownEnvelope(),
+        aliased,{up,up,down}));
+    EXPECT_THROW(ffn::BoundSourceFormatProgram::prepare(*lane.runtime,0,foreignPolicy),std::invalid_argument);
+
+    const ffn::RoutePlan plan{.live=&operands->live,.hiddenCodes=operands->hiddenCodes,
+        .hiddenScales=operands->hiddenScales,.hiddenFP32=operands->hiddenFP32};
+    const ffn::Output output{
+        .routedCodes=operands->routedCodes,.routedScales=operands->routedScales,
+        .sharedCodes=operands->sharedCodes,.sharedScales=operands->sharedScales,
+        .gateValues=operands->gate,.sharedInputGate=operands->sharedInputGate,
+        .sharedGateScratch=operands->sharedGate,.sharedUpScratch=operands->sharedUp,
+        .routedOutput=operands->routed,.sharedOutput=operands->shared,.combined=operands->combined,
+        .routeContributions=operands->contributions};
+    auto* original=lane.runtime->deviceLayerState(0);
+    ASSERT_TRUE(bound.matches(original,device.ordinal));
+    auto* foreignRuntime=foreign.deviceLayerState(0);
+    ASSERT_NE(foreignRuntime,nullptr);
+    ASSERT_FALSE(bound.matches(foreignRuntime,device.ordinal));
+    ASSERT_FALSE(bound.matches(original,device.ordinal+1));
+    const auto inspect=[&](DeviceMoELayerRuntime* runtime,MoEGroupedPlanDemand demand,int ordinal,bool expected) {
+        const ffn::DirectBankInput bank{.runtime=runtime,.indices=operands->routeIds,
+            .weights=operands->routeWeights,.demand=demand,.bankIdentity=operands->bank};
+        auto graph = context.createGraphCapture(stream);
+        ASSERT_NE(graph,nullptr);
+        auto *native = dynamic_cast<HIPGraphCapture*>(graph.get());
+        ASSERT_NE(native,nullptr);
+        {
+            ScopedBackendGraphCapture recording(context,*graph,"format-program runtime admission");
+            ASSERT_TRUE(recording.begin());
+            EXPECT_EQ(ffn::launchFormatProgram(plan,{up,up,down},output,ordinal,stream,bank,
+                bound),expected);
+            recording.finish();
+        }
+        std::size_t nodes=0;
+        ASSERT_EQ(hipGraphGetNodes(native->graph(),nullptr,&nodes),hipSuccess);
+        EXPECT_EQ(nodes,expected?2u:0u);
+    };
+    inspect(original,MoEGroupedPlanDemand::None,device.ordinal,true);
+    inspect(original,MoEGroupedPlanDemand::DeferredAcceptedRows,device.ordinal,true);
+    inspect(original,MoEGroupedPlanDemand::OrdinaryPrefill,device.ordinal,false);
+    inspect(foreignRuntime,MoEGroupedPlanDemand::None,device.ordinal,false);
+    inspect(original,MoEGroupedPlanDemand::None,device.ordinal+1,false);
+}
+#endif
+
 /**
  * @brief Run the production grouped graph against a diagnostic serial graph on one worker.
  * @param shape Original source geometry for both retained captures.
@@ -1111,6 +1202,10 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
             if (!shape.grouped_matrix_case.empty())
                 PerfStatsCollector::reset();
             auto candidate = build(rows, true);
+#ifdef HAVE_ROCM
+            if(shape.verify_runtime_admission)
+                verifyGroupedFormatRuntimeAdmission(*candidate,*serial->runtime,device);
+#endif
             if(require_frontier) {
                 std::vector<GPUGraphKernelNodeInfo> captured;
                 std::string error;
@@ -2051,6 +2146,22 @@ TEST(FullNativeHCFFN,ROCmRetainedBalancedTP2Replay)
     replayMandatoryFullNativeHCFFN(OriginalSourceQualification::FullNativeHCFFNFinal,
         FullProductionHCStorageReuse::Distinct,shape,FullProductionHCObservation::RetainedDemandedOnly);
 }
+#ifdef HAVE_ROCM
+/** @test A foreign but valid original table cannot identify the program's captured layer. */
+TEST(ROCmGroupedFFNFormatProgramNative, RejectsForeignRuntimeAndIncorrectDemandBeforeRecording)
+{
+    const auto format=nativeLayoutRouterFFNSource();
+    const OriginalFFNFixtureGeometry shape{.hidden=2560,.routed=128,.shared=160,.experts=512,.top_k=10,
+        .router_source=OriginalFFNRouterSource::Dense,.verify_runtime_admission=true,
+        .grouped_matrix_case="runtime_admission",.grouped_matrix_symbol="groupedFFNFormatProgramGate",
+        .deferred_frontier_history=true};
+    originalRankLocalReplay(DeviceType::ROCm,1,[&](const auto& devices) {
+        proveOriginalFinalization(devices,false,OriginalSourceQualification::GroupedFFNSourceMatrix,
+            &format,LocalFFNProgram::Original,shape);
+    },"gfx906");
+}
+#endif
+
 /** @test Exercise the actual grouped two-node lowering with original source preparation and serial-row witnesses. */
 TEST(FullNativeHCFFN,ROCmGroupedFFNFrontierByteReplay)
 {

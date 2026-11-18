@@ -48,6 +48,7 @@
 #include "../gemm/ROCmMoEGroupedPrefillKernels.h"
 #include "../gemm/ROCmMoERouteOwnedTuning.h"
 #include "../../../execution/moe/MoERuntimeTable.h"
+#include "../../../execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
@@ -1746,6 +1747,32 @@ namespace
 
 namespace llaminar2::rocm::grouped_ffn
 {
+/** @copydoc BoundSourceFormatProgram::prepare */
+BoundSourceFormatProgram BoundSourceFormatProgram::prepare(
+    DeviceMoERuntimeTable& table,int modelLayer,const SourceFormatProgram& program)
+{
+    const auto* source=table.fragmentDescriptorDeclaration(modelLayer);
+    const auto device=table.deviceId();
+    if(!source || !device.is_rocm() || !table.isMirroredToDevice() ||
+       source->weightFormat()!=DeviceMoEWeightFormat::NativeQuantised ||
+       !source->validFor(device,experts,hidden,program.routedColumns()))
+        throw std::invalid_argument("Grouped FFN format program requires its original native ROCm runtime layer");
+    const auto matchesEnvelope=[](const auto& actual,const auto& expected) {
+        return actual.execution_codebook_mask==expected.execution_codebook_mask &&
+            actual.policy_codebook_mask==expected.policy_codebook_mask;
+    };
+    const auto& original=source->sourceFormats();
+    const std::array sources{original[0].native_quantised,original[1].native_quantised,
+        original[2].native_quantised};
+    if(sources!=program.routedSources() ||
+       !matchesEnvelope(source->nativeGateUpEnvelope(),program.formats().routedGateUp) ||
+       !matchesEnvelope(source->nativeDownEnvelope(),program.formats().routedDown))
+        throw std::invalid_argument("Grouped FFN format program disagrees with the original runtime source");
+    auto* runtime=table.deviceLayerState(modelLayer);
+    if(!runtime)throw std::invalid_argument("Grouped FFN format program requires admitted device storage");
+    return BoundSourceFormatProgram(program,runtime,device.ordinal);
+}
+
 /** @copydoc prepareFormatTables */
 bool prepareFormatTables(const WeightFormats& formats,int device)
 {
@@ -12641,8 +12668,9 @@ namespace llaminar2
             }
             const auto* formats=std::get_if<program::SourceFormatProgram>(&frontier->program);
             if(formats) {
-                if(!program::launchFormatProgram(plan,frontier->sharedWeights,publication,device_ordinal_,stream,
-                        direct,*formats))
+                if(!frontier->boundSourceProgram ||
+                   !program::launchFormatProgram(plan,frontier->sharedWeights,publication,device_ordinal_,stream,
+                        direct,*frontier->boundSourceProgram))
                     return false;
             } else {
                 const auto& measured=std::get<program::MeasuredProgram>(frontier->program);

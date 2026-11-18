@@ -11,6 +11,7 @@
 #include <array>
 #include <cstdlib>
 #include <cstring>
+#include <optional>
 #include <stdexcept>
 #include <variant>
 #include <cstddef>
@@ -20,6 +21,7 @@ namespace llaminar2 {
 class TensorBase;
 class ITensor;
 struct DeviceMoELayerRuntime;
+class DeviceMoERuntimeTable;
 namespace rocm::grouped_ffn {
 inline constexpr int capacity=4, hidden=2560, routedWidth=128, sharedWidth=160, topK=10, experts=512;
 inline constexpr std::size_t sharedCodesBytes=capacity*sharedWidth;
@@ -143,6 +145,29 @@ public:
     }
 };
 
+/** @brief Capture receipt joining one program to the original prepared table layer. */
+class BoundSourceFormatProgram final {
+    SourceFormatProgram program_;
+    DeviceMoELayerRuntime* runtime_;
+    int ordinal_;
+
+    BoundSourceFormatProgram(const SourceFormatProgram& program,DeviceMoELayerRuntime* runtime,int ordinal)
+        :program_(program),runtime_(runtime),ordinal_(ordinal) {}
+public:
+    /** @brief Bind only through the original owning ROCm runtime table.
+     * @throws std::invalid_argument If the layer or its original source disagrees with the program.
+     */
+    static BoundSourceFormatProgram prepare(DeviceMoERuntimeTable& table,int modelLayer,
+        const SourceFormatProgram& program);
+    /** @return Whether both addresses and the admitted device identify the original layer. */
+    bool matches(const DeviceMoELayerRuntime* runtime,int ordinal) const noexcept
+    {
+        return runtime_==runtime && ordinal_==ordinal;
+    }
+    /** @return The program admitted by that table's original sources. */
+    const SourceFormatProgram& program() const noexcept {return program_;}
+};
+
 using Program=std::variant<MeasuredProgram,SourceFormatProgram>;
 
 /** @return Participant-local routed intermediate width embedded in the two leaves. */
@@ -228,6 +253,7 @@ struct LocalPublication {
     TensorBase* combined;
     DirectBankRouter directRouter{};
     Program program;
+    std::optional<BoundSourceFormatProgram> boundSourceProgram;
 };
 
 /** @brief Canonical original mutable plan views from the complete grouped-plan owner. */
@@ -290,11 +316,11 @@ bool launch(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDe
  * @param device Exact admitted ROCm ordinal.
  * @param stream Exact non-default graph stream.
  * @param direct Original placement-bank acquisition and deferred-demand policy.
- * @param program Original authenticated sources, decoder envelopes and participant geometry.
+ * @param bound Original authenticated runtime, source formats and participant geometry.
  * @return Whether both native submissions succeeded.
  */
 bool launchFormatProgram(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDesc,3>& shared,
-    const Output& output,int device,void* stream,const DirectBankInput& direct,const SourceFormatProgram& program);
+    const Output& output,int device,void* stream,const DirectBankInput& direct,const BoundSourceFormatProgram& bound);
 
 } // namespace rocm::grouped_ffn
 } // namespace llaminar2

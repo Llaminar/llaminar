@@ -28,9 +28,6 @@
 #include <cstring>
 #include <vector>
 #include "kernels/rocm/gemm/ROCmMoERouteOwnedTuning.h"
-#include "kernels/rocm/gemm/ROCmGroupedFFNFrontier.h"
-#include "kernels/rocm/gemm/ROCmGroupedFFNFormatSelection.h"
-#include "execution/moe/MoERuntimeTable.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include "../kernels/moe/NativeQuantisedExpertTransferParityTest.h"
 #include <gtest/gtest.h>
@@ -210,89 +207,6 @@ TEST(ROCmMoERouteOwnedGeometryNative, PublicInvalidBindingsLeaveEmptyNativeCaptu
         EXPECT_FALSE(currentMoERouteOwnedGateUpGeometry());
     });
 }
-/**
- * @test Wrong demand is the only difference between admitted empty/accepted
- * publication and a rejected ordinary-prefill launch. The graph node count
- * proves that rejection happens before either native projection is emitted.
- */
-TEST(ROCmGroupedFFNFormatProgramNative, PrefillDemandLeavesEmptyCapture)
-{
-    using llaminar2::test::makeGpuPreparedGemm;
-    using llaminar2::test::TestTensorFactory;
-    namespace ffn = grouped_ffn;
-    constexpr int width = 160;
-    constexpr int rows = ffn::capacity;
-    constexpr int hidden = ffn::hidden;
-    constexpr int slots = rows * ffn::topK;
-    struct CaptureOperands
-    {
-        DeviceMoELayerRuntime runtime;
-        std::uint64_t bank[3];
-        std::int32_t live;
-        float routeIds[slots], routeWeights[slots], hiddenFP32[rows*hidden];
-        std::int8_t hiddenCodes[rows*hidden], routedCodes[slots*width], sharedCodes[rows*width];
-        float hiddenScales[rows*(hidden/32)], routedScales[slots*(width/32)], sharedScales[rows*(width/32)];
-        float gate[rows], sharedInputGate[hidden], sharedGate[rows*width], sharedUp[rows*width];
-        float routed[rows*hidden], shared[rows*hidden], combined[rows*hidden], contributions[slots*hidden];
-    };
-    const auto device = DeviceId::rocm(0);
-    auto &context = GPUDeviceContextPool::instance().getContext(device);
-    context.submitAndWait([&]
-    {
-        auto *stream = context.defaultStream();
-        ASSERT_NE(stream,nullptr);
-        auto storage = TestTensorFactory::createFP32({(sizeof(CaptureOperands)+sizeof(float)-1)/sizeof(float)});
-        ASSERT_TRUE(storage->ensureOnDevice(device,stream));
-        auto *operands = static_cast<CaptureOperands*>(storage->gpu_data_ptr());
-        auto upSource = TestTensorFactory::createQ8_0Random({width,hidden},7151);
-        auto downSource = TestTensorFactory::createQ8_0Random({hidden,width},7152);
-        auto upOwner = makeGpuPreparedGemm(upSource.get(),device,"test.format_program.capture.up");
-        auto downOwner = makeGpuPreparedGemm(downSource.get(),device,"test.format_program.capture.down");
-        DeviceNativeQuantisedMatrixDesc up{}, down{};
-        ASSERT_TRUE(upOwner.kernel->exportNativeQuantisedMatrixDesc(up));
-        ASSERT_TRUE(downOwner.kernel->exportNativeQuantisedMatrixDesc(down));
-        NativeQuantisedExecutionFormatEnvelope q8;
-        ASSERT_TRUE(addNativeQuantisedExecutionFormat(q8,up.codebook_id,
-            {up.source_codebook_id,up.source_is_superblock!=0,up.source_identity_present!=0},false));
-        const NativeQuantisedSourceIdentity source{up.source_codebook_id,up.source_is_superblock!=0,
-            up.source_identity_present!=0};
-        const auto program=ffn::SourceFormatProgram::prepare(
-            ffn::declareSourceFormats(width,width,q8,q8,{source,source,source},{up,up,down}));
-        const ffn::RoutePlan plan{.live=&operands->live,.hiddenCodes=operands->hiddenCodes,
-            .hiddenScales=operands->hiddenScales,.hiddenFP32=operands->hiddenFP32};
-        const ffn::Output output{
-            .routedCodes=operands->routedCodes,.routedScales=operands->routedScales,
-            .sharedCodes=operands->sharedCodes,.sharedScales=operands->sharedScales,
-            .gateValues=operands->gate,.sharedInputGate=operands->sharedInputGate,
-            .sharedGateScratch=operands->sharedGate,.sharedUpScratch=operands->sharedUp,
-            .routedOutput=operands->routed,.sharedOutput=operands->shared,.combined=operands->combined,
-            .routeContributions=operands->contributions};
-        for(const auto demand:{MoEGroupedPlanDemand::None,MoEGroupedPlanDemand::DeferredAcceptedRows,
-                              MoEGroupedPlanDemand::OrdinaryPrefill})
-        {
-            const ffn::DirectBankInput bank{.runtime=&operands->runtime,.indices=operands->routeIds,
-                .weights=operands->routeWeights,.demand=demand,.bankIdentity=operands->bank};
-            const bool expected = demand!=MoEGroupedPlanDemand::OrdinaryPrefill;
-            auto graph = context.createGraphCapture(stream);
-            ASSERT_NE(graph,nullptr);
-            auto *native = dynamic_cast<HIPGraphCapture*>(graph.get());
-            ASSERT_NE(native,nullptr);
-            {
-                ScopedBackendGraphCapture recording(context,*graph,"format-program demand admission");
-                ASSERT_TRUE(recording.begin());
-                EXPECT_EQ(ffn::launchFormatProgram(plan,{up,up,down},output,device.ordinal,stream,bank,
-                    program),expected);
-                recording.finish();
-            }
-            std::size_t nodes = 0;
-            ASSERT_EQ(hipGraphGetNodes(native->graph(),nullptr,&nodes),hipSuccess);
-            EXPECT_EQ(nodes,expected?2u:0u);
-            // The capture is inspected and destroyed. The replay suite owns
-            // initialized device epochs, numerical execution, and history.
-        }
-    });
-}
-
 /**
  * @brief Inspect exact worker-plane resources and reject shape mismatches before any enqueue.
  *

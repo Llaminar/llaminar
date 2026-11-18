@@ -564,6 +564,27 @@ control and the 256 MiB streaming control used independent physical counters.
 [Packet benchmark procedure](../../../../tests/v2/performance/kernels/rocm/roofline/README.md)
 [Measurements by PCI, geometry and source format](/tmp/qfn-mi50-parent-roofline-c2/score.json)
 
+### Full-model fixed-depth result on the original TP4 shards
+
+Release checkpoint `8e11d8880` used four MI50s, RAM ngrams and the original
+128/128/128/256 routed split with 160 shared columns. The control and reader
+used the same executable and model. Each performed one warmup followed by
+three measured 256-token generations per prompt. Only
+`LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER` changed between arms.
+
+| Fixed depth 3 | Staged decode (tok/s) | Prepared reader decode (tok/s) | Paired change | Prepared reader prefill (tok/s) |
+| --- | ---: | ---: | ---: | ---: |
+| Review 512 | 114.892 | 124.581 | +8.44% | 1,002.452 |
+| Code 2048 | 94.655 | 102.513 | +8.34% | 970.566 |
+
+All six generated histories matched their own ordinary controls and both arms
+agreed on all five verifier counters. Review took 74 rounds with 182 accepted
+tokens. Code took 86 rounds with 170 accepted tokens. With speculation off,
+the paired decode changes were −0.17% and +0.61%, respectively. The fork ran
+the same input IDs but generated different histories and verifier work.
+[Original per-trial counts and timings](/tmp/qfn-mi50-w-readers-model-gate/w-readers-r1-fixed3-summary.json)
+[Cross-engine work comparison](/tmp/qfn-mi50-w-readers-model-gate/w-readers-r1-staged-historical-fork.json)
+
 ## Reproduction
 
 The local evidence root for native phase attribution is

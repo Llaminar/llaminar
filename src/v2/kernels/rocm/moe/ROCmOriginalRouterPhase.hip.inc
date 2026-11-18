@@ -27,6 +27,7 @@
 #include "kernels/common/NativeQuantisedDescriptorValidation.h"
 #include "kernels/common/MoEDecodeDescriptorPublication.h"
 #include "execution/config/RoutedExpertPolicy.h"
+namespace llaminar2::rocm::grouped_ffn { class AcquiredGroupedRoutePublication; }
 namespace llaminar2::rocm::router_native {
 inline constexpr int kDeviceMoEMaxExperts=moe_runtime_abi::kMaxExperts;
 inline constexpr int kDeviceMoEMaxTopK=16;
@@ -338,6 +339,33 @@ template<class RuntimeView>class RuntimeDecodeExecutionBankStorage;
 template<class RuntimeView>class AcquiredRuntimeDecodeBank final
 {
     friend class RuntimeDecodeExecutionBankStorage<RuntimeView>;
+    friend class ::llaminar2::rocm::grouped_ffn::AcquiredGroupedRoutePublication;
+
+    /**
+     * @brief Borrow Down for a slot from the completed original route publisher.
+     * @param slot Original live top-k coordinate in this request's publication.
+     * @param liveSlots Actual counted live route extent, checked by the consumer.
+     * @return Empty for a remote row, or the exact ready native local role.
+     * @pre The sole grouped-route borrower has verified the existing published
+     * bank/epoch/ticket after the captured producer stream edge.
+     */
+    __device__ __forceinline__ PublishedNativeProjection localNativeDownFromGroupedSlot(
+        int slot,int liveSlots) const
+    {
+        if(slot<0 || slot>=liveSlots)fail_fast_incomplete_llep_transfer();
+        const auto participant=static_cast<int>(runtime_->participant_id);
+        if(__builtin_amdgcn_readfirstlane(runtime_->route_participant_ids[slot])!=participant)
+            return PublishedNativeProjection(nullptr);
+        const int expert=__builtin_amdgcn_readfirstlane(runtime_->route_expert_ids[slot]);
+        if(expert<0 || static_cast<unsigned>(expert)>=bank_->expert_count)
+            fail_fast_incomplete_llep_transfer();
+        const auto& row=bank_->experts[expert];
+        if(row.projection_set!=DeviceMoEProjectionSet::IntermediateShard ||
+           row.weight_format!=DeviceMoEWeightFormat::NativeQuantised)
+            fail_fast_incomplete_llep_transfer();
+        return PublishedNativeProjection(&row.down);
+    }
+
     RuntimeView* runtime_;
     const RouterBankView<RuntimeView>* bank_;
     /** @brief Construct only from the original canonical validated placement, or inside typed storage copy. */
@@ -437,6 +465,32 @@ public:
         if(expert<0||static_cast<unsigned>(expert)>=bank_->expert_count)
             return PublishedNativeProjection(nullptr);
         return localNativeProjection(expert,role);
+    }
+    /** @brief Gate and up borrowed together from one checked original live row. */
+    struct LocalNativeGateUp {
+        PublishedNativeProjection gate;
+        PublishedNativeProjection up;
+        /** @return Whether this selected row is a ready local native expert. */
+        __device__ bool local() const noexcept { return bool(gate); }
+    };
+
+    /**
+     * @brief Resolve one live route and issue both local native roles together.
+     * @param expert The original selected ID, or the original inactive sentinel.
+     * @return Empty when out of range or remote, otherwise both exact local roles.
+     * @details Reuses the normal current bank locality checks. Both projections
+     * refer to the same ready row and are valid only in this acquired epoch.
+     */
+    __device__ __forceinline__ LocalNativeGateUp localNativeGateUpOrInactive(int expert) const
+    {
+        if(expert<0 || static_cast<unsigned>(expert)>=bank_->expert_count ||
+           intermediateShardMembership(expert).disposition!=MoEIntermediateShardRowDisposition::Local)
+            return {PublishedNativeProjection(nullptr),PublishedNativeProjection(nullptr)};
+        const auto& row=bank_->experts[expert];
+        if(row.projection_set!=DeviceMoEProjectionSet::IntermediateShard ||
+           row.weight_format!=DeviceMoEWeightFormat::NativeQuantised)
+            fail_fast_incomplete_llep_transfer();
+        return {PublishedNativeProjection(&row.gate),PublishedNativeProjection(&row.up)};
     }
     /** @return Original runtime whose immutable acquired epoch issued this view. */
     __device__ __forceinline__ RuntimeView* runtime() const {return runtime_;}
