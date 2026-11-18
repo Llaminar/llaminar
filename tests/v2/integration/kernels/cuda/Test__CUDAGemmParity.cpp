@@ -2783,8 +2783,20 @@ TEST_F(Test__CUDAGemmParity, NativeQuantisedPrefillActiveRowsAllFormatsByteExact
     bool bk256_wide_seen = false;
     bool profiled_narrow_large_k_crossover_seen = false;
 
-    for (const auto &geometry :
-         nativeQuantisedPrefillAllFormatGeometryEquivalenceCases())
+    int sm_count = 0;
+    ASSERT_EQ(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+                                     gpu_device_.cuda_ordinal()), cudaSuccess);
+    ASSERT_GT(sm_count, 0);
+    auto geometries = nativeQuantisedPrefillAllFormatGeometryEquivalenceCases();
+    // Two waves of 128x128 blocks exercise the automatic 512-thread tile on
+    // both mobile and full-size GPUs. One simple codebook suffices for this
+    // grid-fill boundary; the shared geometries still cover every codebook.
+    constexpr int rows = 512;
+    constexpr int row_tiles = rows / 128;
+    const int column_tiles = (std::max(56, 2 * sm_count) + row_tiles - 1) / row_tiles;
+    const auto &wide_tile_witness = geometries.emplace_back(NativeQuantisedPrefillGeometryEquivalenceCase{
+        "two_waves_128x128", column_tiles * 128 - 1, 2304, {{rows, rows}}});
+    for (const auto &geometry : geometries)
     {
         SCOPED_TRACE(geometry.label);
         ASSERT_FALSE(geometry.row_cases.empty());
@@ -2802,6 +2814,8 @@ TEST_F(Test__CUDAGemmParity, NativeQuantisedPrefillActiveRowsAllFormatsByteExact
 
         for (const auto &format : cudaSmallMNativeFormats())
         {
+            if (&geometry == &wide_tile_witness && std::string_view(format.name) != "Q8_0")
+                continue;
             SCOPED_TRACE(format.name);
 
             cudaStream_t stream = nullptr;
@@ -2818,13 +2832,6 @@ TEST_F(Test__CUDAGemmParity, NativeQuantisedPrefillActiveRowsAllFormatsByteExact
                 << format.name << " CUDA prepared kernel";
             cuda_kernel->setGPUStream(stream);
 
-            int sm_count = 0;
-            ASSERT_EQ(
-                cudaDeviceGetAttribute(
-                    &sm_count,
-                    cudaDevAttrMultiProcessorCount,
-                    gpu_device_.cuda_ordinal()),
-                cudaSuccess);
             int uses_ordered_reducer = 0;
             int canonical_k_partitions = 0;
             ASSERT_TRUE(
