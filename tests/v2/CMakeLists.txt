@@ -4448,13 +4448,13 @@ set_tests_properties(V2_Unit_AcceleratorBuildTypeFlags PROPERTIES
     LABELS "V2;Unit;BuildSystem;CUDA;ROCm;Performance;Regression"
     TIMEOUT 30
 )
-# Replay native scheduling on both the constrained runner and roomier build hosts.
+# Host preflight replays native scheduling without claiming an accelerator.
 foreach(_suite IN ITEMS Unit Integration)
     set(_test "V2_${_suite}_CUDABuildParallelism")
     add_test(NAME "${_test}" COMMAND "${CMAKE_COMMAND}"
         -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/TestCUDABuildParallelism.cmake")
     set_tests_properties("${_test}" PROPERTIES
-        LABELS "V2;${_suite};DeviceFree;BuildSystem;CUDA;Regression" TIMEOUT 30)
+        LABELS "V2;${_suite};DeviceFree;BuildSystem;Regression" TIMEOUT 30)
 endforeach()
 set_property(TEST V2_Integration_CUDABuildParallelism APPEND PROPERTY LABELS ProductionTestPreflight)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDABuildParallelism)
