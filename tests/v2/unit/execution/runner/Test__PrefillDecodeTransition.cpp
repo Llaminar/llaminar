@@ -23,6 +23,9 @@
  * device-free runner, so serving bucket defaults cannot bypass that coverage.
  * Stochastic admission must carry the same resolved request entropy consumed
  * by prefill sampling and captured verification, including unseeded batches.
+ * Serving-slot retirement observes actual owning-lease release while the
+ * predecessor's planning companion is still live, with a reversed-order
+ * fixture control and device-free fatal-admission regressions.
  *
  * @author David Sanftenberg
  * @date April 2026
@@ -59,9 +62,14 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
+#include <functional>
 #include <map>
+#include <regex>
+#include <set>
 #include <memory>
 #include <optional>
+#include <sstream>
 #include <string>
 #include <utility>
 #include <vector>
@@ -71,6 +79,80 @@ using namespace testing;
 
 namespace
 {
+    /** @brief Test-owned observations made at transaction-state release time. */
+    struct MTPLeaseReleaseProbe
+    {
+        bool armed{false};
+        std::function<bool()> companion_is_live;
+        std::vector<bool> companion_snapshots;
+    };
+
+    /**
+     * @brief Bound a release observer to a live runner operation.
+     *
+     * Disarming on every scope exit, including fatal GTest assertions, prevents
+     * a late mock teardown from dereferencing an already-destroyed runner.
+     */
+    class ScopedMTPLeaseReleaseObservation
+    {
+    public:
+        /**
+         * @brief Arm the probe for one synchronous retirement boundary.
+         * @param probe Test-owned release recorder; it must outlive this scope.
+         * @param companion_is_live Read only a companion outside the dying lease.
+         */
+        ScopedMTPLeaseReleaseObservation(
+            MTPLeaseReleaseProbe &probe,
+            std::function<bool()> companion_is_live)
+            : probe_(probe)
+        {
+            probe_.companion_snapshots.clear();
+            probe_.companion_is_live = std::move(companion_is_live);
+            probe_.armed = true;
+        }
+
+        /** @brief Withdraw the borrowed runner reference before later teardown. */
+        ~ScopedMTPLeaseReleaseObservation()
+        {
+            probe_.armed = false;
+            probe_.companion_is_live = {};
+        }
+
+        ScopedMTPLeaseReleaseObservation(
+            const ScopedMTPLeaseReleaseObservation &) = delete;
+        ScopedMTPLeaseReleaseObservation &operator=(
+            const ScopedMTPLeaseReleaseObservation &) = delete;
+
+    private:
+        MTPLeaseReleaseProbe &probe_;
+    };
+
+    /**
+     * @brief Create mock transaction backing with a last-owner observation.
+     * @param probe Optional test-owned recorder; no runner ownership is retained.
+     * @return Owning state used by the normal mock publication path.
+     *
+     * The targeted fixture withdraws the mock's strong reference before arming
+     * the probe, making actual bank retirement the last owning release. Other
+     * tests retain their normal mock ownership. No production callback is added.
+     */
+    std::shared_ptr<DeviceResidentMTPTransactionState>
+    makeObservedMockMTPTransactionState(
+        std::shared_ptr<MTPLeaseReleaseProbe> probe)
+    {
+        return std::shared_ptr<DeviceResidentMTPTransactionState>(
+            new DeviceResidentMTPTransactionState{},
+            [probe = std::move(probe)](DeviceResidentMTPTransactionState *state)
+            {
+                if (probe && probe->armed)
+                {
+                    probe->companion_snapshots.push_back(
+                        probe->companion_is_live());
+                }
+                delete state;
+            });
+    }
+
     float mtpSeededVerifierThreshold(uint64_t seed,
                                      int logical_position,
                                      int purpose)
@@ -1440,6 +1522,14 @@ namespace
             }
             resident_logical_state_request_count_ = request.requestCount();
             resident_logical_state_valid_ = true;
+            if (!mock_mtp_transaction_)
+            {
+                mock_mtp_transaction_ =
+                    makeObservedMockMTPTransactionState(mock_mtp_release_probe_);
+            }
+            mock_mtp_transaction_->device = primary_device_;
+            mock_mtp_transaction_->request_count = request.requestCount();
+            mock_mtp_transaction_->session_epoch = 1;
             all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_enabled_ = false;
             row_indexed_all_position_logits_row_count_ = 0;
@@ -1471,6 +1561,9 @@ namespace
             handle.ready_event = const_cast<int *>(&resident_ready_event_token_);
             handle.live_state_epoch = 1;
             handle.publication_generation = 1;
+            if (mock_mtp_transaction_)
+                handle.mtp_transaction = DeviceResidentMTPTransactionLease{
+                    .state = mock_mtp_transaction_};
             return handle;
         }
 
@@ -2359,7 +2452,7 @@ namespace
             if (!mock_mtp_transaction_)
             {
                 mock_mtp_transaction_ =
-                    std::make_shared<DeviceResidentMTPTransactionState>();
+                    makeObservedMockMTPTransactionState(mock_mtp_release_probe_);
             }
             mock_mtp_transaction_->device = primary_device_;
             mock_mtp_transaction_->request_count = request_count;
@@ -7329,6 +7422,52 @@ namespace
         bool greedy_outcome_graph_produced_{false};
         std::shared_ptr<DeviceResidentMTPTransactionState>
             mock_mtp_transaction_;
+        std::shared_ptr<MTPLeaseReleaseProbe> mock_mtp_release_probe_;
+
+     public:
+        /** @return Current owning-reference count without retaining a lease. */
+        [[nodiscard]] auto mockMTPTransactionUseCount() const
+        {
+            return mock_mtp_transaction_.use_count();
+        }
+
+        /**
+         * @brief Install a release probe before the first transaction publication.
+         * @param probe Recorder retained by subsequently created mock states.
+         * @return False if backing was already published or the probe is absent.
+         */
+        [[nodiscard]] bool configureMTPLeaseReleaseProbe(
+            std::shared_ptr<MTPLeaseReleaseProbe> probe)
+        {
+            if (mock_mtp_transaction_ || !probe)
+                return false;
+            mock_mtp_release_probe_ = std::move(probe);
+            return true;
+        }
+
+        /**
+         * @brief Withdraw mock backing and diagnostic-record ownership.
+         * @return Non-owning identity/count observer for that exact predecessor.
+         *
+         * The saved publication request also owns an outcome lease. Drop only
+         * its matching reference, then the backing owner, so the test can prove
+         * the remaining references belong to the bank. Ordinary tests retain
+         * both owners and never call this method.
+         */
+        [[nodiscard]] std::weak_ptr<DeviceResidentMTPTransactionState>
+        releaseMockMTPTransactionOwnership()
+        {
+            std::weak_ptr<DeviceResidentMTPTransactionState> observer =
+                mock_mtp_transaction_;
+            auto &recordedLease =
+                last_device_resident_publication_request_.outcome.mtp_transaction;
+            if (recordedLease.state == mock_mtp_transaction_)
+                recordedLease = {};
+            mock_mtp_transaction_.reset();
+            return observer;
+        }
+
+     private:
         bool resident_logical_state_valid_{false};
         int resident_logical_state_request_count_{0};
         std::array<int32_t, kMockResidentOutcomeRequestCapacity>
@@ -7411,6 +7550,19 @@ namespace
          * @param token_budget Exact number of terminal response tokens expected.
          * @return Result surfaced after the device-owned loop reaches terminal.
          */
+        /**
+         * @brief Exact configuration fingerprint swept by this harness.
+         *
+         * The recorded replay's policy declaration must match this fingerprint;
+         * a mismatch means the fixture was captured against a different
+         * configuration and is rejected before any behavioral comparison.
+         */
+        static std::string servingSlotPolicyFingerprint()
+        {
+            return "widths=1,2;chained=yes;prefix-cache=disabled;"
+                   "greedy-default+speculative-seeded-123;device-free-mock";
+        }
+
         static GenerationResult decodeWithBudget(
             OrchestrationRunner *runner,
             int token_budget)
@@ -7465,9 +7617,172 @@ namespace
         }
 
         /**
+         * @brief Run one deterministic device-free serving-slot scenario and
+         *        return its normalized observable event stream.
+         *
+         * The recorded replay drives the PRODUCTION controller (never a test
+         * mirror) through fixed request lifecycles - admission, serial decode,
+         * forced-token, MTP transactions at the exercised verifier width, the
+         * convenience generate() surface, the direct next-admission edge, and
+         * the canonical clearCache retirement boundary - and records exactly
+         * the public observables: admission success, per-step returned tokens,
+         * completion, typed commit state, and error lengths.
+         */
+        std::string runServingSlotScenario(const std::string &kind)
+        {
+            std::ostringstream events;
+            auto recordPrefill = [&events](bool ok, size_t prompt_tokens)
+            {
+                events << "R" << prompt_tokens << ':' << (ok ? '1' : '0') << '\n';
+            };
+            auto recordStep = [&events](const GenerationResult &result)
+            {
+                events << "D";
+                for (int32_t token : result.tokens)
+                    events << token << ',';
+                events << ':' << (result.is_complete ? '1' : '0')
+                       << ':' << static_cast<int>(result.returned_token_commit)
+                       << ':' << result.error.size() << '\n';
+            };
+            auto recordGenerate = [&events](const GenerationResult &result)
+            {
+                events << "G";
+                for (int32_t token : result.tokens)
+                    events << token << ',';
+                events << ':' << result.error.size() << '\n';
+            };
+
+            if (kind == "serial3")
+            {
+                auto [runner, mock] = createRunner();
+                (void)mock;
+                for (const auto &prompt : std::vector<std::vector<int32_t>>{
+                         {1, 2, 3, 4, 5}, {9, 8}, {42}})
+                {
+                    recordPrefill(runner->prefill(prompt), prompt.size());
+                    recordStep(decodeWithBudget(runner, 3));
+                    recordStep(decodeWithBudget(runner, 3));
+                    runner->clearCache();
+                    events << "C\n";
+                }
+            }
+            else if (kind == "mtp_greedy2")
+            {
+                auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+                (void)mock;
+                for (const auto &prompt : std::vector<std::vector<int32_t>>{{1, 2, 3}, {4}})
+                {
+                    recordPrefill(runner->prefill(prompt), prompt.size());
+                    recordStep(decodeWithBudget(runner, 3));
+                    recordStep(decodeWithBudget(runner, 3));
+                    runner->clearCache();
+                    events << "C\n";
+                }
+            }
+            else if (kind == "mtp_spec_seed")
+            {
+                auto [runner, mock] = createRunner(
+                    /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr,
+                    false, false, DeviceId::cpu(), 1, false, false, {},
+                    MTPVerifyMode::SpeculativeSampling);
+                (void)mock;
+                SamplingParams params;
+                params.temperature = 0.7f;
+                params.top_k = 7;
+                params.top_p = 0.9f;
+                params.seed = 123u;
+                runner->setSamplingParams(params);
+                recordPrefill(runner->prefill({1, 2, 3}), 3);
+                mock->setHostTerminalSamplingLogits({0.3f, 0.4f, 0.1f, 0.2f, -0.1f,
+                                                     0.0f, -0.3f, -0.2f, -0.5f, -0.4f});
+                recordStep(decodeWithBudget(runner, 3));
+                recordStep(decodeWithBudget(runner, 3));
+                runner->clearCache();
+                events << "C\n";
+            }
+            else if (kind == "forced")
+            {
+                auto [runner, mock] = createRunner();
+                (void)mock;
+                recordPrefill(runner->prefill({1, 2}), 2);
+                recordStep(runner->forceDecodeToken(42));
+                recordStep(decodeWithBudget(runner, 2));
+                runner->clearCache();
+                events << "C\n";
+            }
+            else if (kind == "generate2")
+            {
+                auto [runner, mock] = createRunner();
+                (void)mock;
+                recordGenerate(runner->generate({1, 2}, 3, SamplingParams{}));
+                recordGenerate(runner->generate({9}, 2, SamplingParams{}));
+            }
+            else if (kind == "direct_prefill")
+            {
+                auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+                (void)mock;
+                recordPrefill(runner->prefill({1, 2}), 2);
+                recordStep(decodeWithBudget(runner, 1));
+                /*
+                 * Direct next admission without the canonical clearCache
+                 * boundary: the admission edge itself must retire the previous
+                 * request's handoff bank before the new request opens. The
+                 * recorded baseline carries whatever the pinned controller
+                 * actually does here; the lifecycle suite asserts the intended
+                 * per-slot semantics separately.
+                 */
+                recordPrefill(runner->prefill({3, 4}), 2);
+                recordStep(decodeWithBudget(runner, 2));
+                runner->clearCache();
+                events << "C\n";
+            }
+            else if (kind == "mtp_w2_greedy")
+            {
+                auto [runner, mock] = createRunner(/*mtp_enabled=*/true, true, {}, nullptr,
+                                                   false, false, DeviceId::cpu(), 2,
+                                                   /*chained_mtp_support=*/true);
+                (void)mock;
+                for (const auto &prompt : std::vector<std::vector<int32_t>>{{1, 2, 3}, {4}})
+                {
+                    recordPrefill(runner->prefill(prompt), prompt.size());
+                    recordStep(decodeWithBudget(runner, 3));
+                    recordStep(decodeWithBudget(runner, 3));
+                    runner->clearCache();
+                    events << "C\n";
+                }
+            }
+            else if (kind == "mtp_w2_spec")
+            {
+                auto [runner, mock] = createRunner(
+                    /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr,
+                    false, false, DeviceId::cpu(), 2, /*chained_mtp_support=*/true,
+                    false, {}, MTPVerifyMode::SpeculativeSampling);
+                (void)mock;
+                SamplingParams params;
+                params.temperature = 0.7f;
+                params.top_k = 7;
+                params.top_p = 0.9f;
+                params.seed = 123u;
+                runner->setSamplingParams(params);
+                recordPrefill(runner->prefill({1, 2}), 2);
+                mock->setHostTerminalSamplingLogits({0.3f, 0.4f, 0.1f, 0.2f, -0.1f,
+                                                     0.0f, -0.3f, -0.2f, -0.5f, -0.4f});
+                recordStep(decodeWithBudget(runner, 3));
+                runner->clearCache();
+                events << "C\n";
+            }
+            else
+            {
+                events << "UNKNOWN:" << kind << '\n';
+            }
+            return events.str();
+        }
+
+        /**
          * @brief Create an OrchestrationRunner with the mock runner injected
          */
-        std::pair<OrchestrationRunner *, MockInferenceRunner *> createRunner(bool mtp_enabled = false,
+        template <typename RunnerType = OrchestrationRunner>
+        std::pair<RunnerType *, MockInferenceRunner *> createRunner(bool mtp_enabled = false,
                                                                              bool mtp_accept = true,
                                                                              std::string mtp_unsupported_reason = {},
                                                                              std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
@@ -7553,12 +7868,12 @@ namespace
             std::unique_ptr<OrchestrationRunner> runner;
             if (mpi_ctx)
             {
-                runner = std::make_unique<OrchestrationRunner>(
+                runner = std::make_unique<RunnerType>(
                     std::move(config), runner_plan, std::move(mock), std::move(mpi_ctx));
             }
             else
             {
-                runner = std::make_unique<OrchestrationRunner>(
+                runner = std::make_unique<RunnerType>(
                     std::move(config), runner_plan, std::move(mock));
             }
 
@@ -7568,7 +7883,7 @@ namespace
             runner->setSamplingParams(greedy);
 
             runners_.push_back(std::move(runner));
-            return {runners_.back().get(), mock_ptr};
+            return {static_cast<RunnerType *>(runners_.back().get()), mock_ptr};
         }
 
         std::pair<OrchestrationRunner *, MockInferenceRunner *>
@@ -18823,6 +19138,938 @@ namespace
             EXPECT_EQ(mpi->guard_checks,1u);
             EXPECT_TRUE(mpi->diagnostic_preceded_guard);
         }
+    }
+
+    // =========================================================================
+    // Serving-slot handoff: recorded replay + capacity-one lifecycle contracts
+    // =========================================================================
+
+    // Recorded-trace parsing: strict versioned schema with exact
+    // scenario/config compatibility. Reference and candidate identities are
+    // separate fields and need not be equal; malformed, missing, duplicate,
+    // or unsupported declarations are rejected with precise reasons.
+    namespace serving_slot_replay
+    {
+        struct RecordedTrace
+        {
+            std::map<std::string, std::string> metadata;
+            std::vector<std::string> declaredScenarios;
+            std::map<std::string, std::string> referenceStreams;
+        };
+
+        RecordedTrace parseRecordedTrace(
+            const std::string &raw,
+            const std::vector<std::string> &expectedScenarios,
+            const std::string &expectedPolicyFingerprint)
+        {
+            RecordedTrace trace;
+            std::istringstream reader(raw);
+            std::string line;
+            std::string current;
+            bool inHeader = true;
+            while (std::getline(reader, line))
+            {
+                if (!line.empty() && line.back() == '\r')
+                    line.pop_back();
+                if (line.rfind("# ", 0) == 0)
+                {
+                    if (!inHeader)
+                        throw std::runtime_error(
+                            "recorded trace: metadata line after scenario sections");
+                    const std::string body = line.substr(2);
+                    const auto separator = body.find(": ");
+                    if (separator == std::string::npos)
+                        continue; // free-form comment line, not a declaration
+                    const std::string key = body.substr(0, separator);
+                    const std::string value = body.substr(separator + 2);
+                    if (key == "scenarios")
+                    {
+                        if (!trace.declaredScenarios.empty())
+                            throw std::runtime_error(
+                                "recorded trace: duplicate scenarios declaration");
+                        std::istringstream values(value);
+                        std::string scenario;
+                        while (values >> scenario)
+                            trace.declaredScenarios.push_back(scenario);
+                        continue;
+                    }
+                    static const std::set<std::string> known = {
+                        "format", "reference-source", "reference-capture-host",
+                        "reference-build", "reference-harness-blob", "policy",
+                        "candidate-binding"};
+                    if (!known.count(key))
+                        throw std::runtime_error(
+                            "recorded trace: unsupported metadata key: " + key);
+                    if (trace.metadata.count(key))
+                        throw std::runtime_error(
+                            "recorded trace: duplicate metadata key: " + key);
+                    if (value.empty())
+                        throw std::runtime_error(
+                            "recorded trace: empty metadata value for: " + key);
+                    trace.metadata[key] = value;
+                    continue;
+                }
+                if (line.rfind(">>> ", 0) == 0)
+                {
+                    inHeader = false;
+                    current = line.substr(4);
+                    if (trace.referenceStreams.count(current))
+                        throw std::runtime_error(
+                            "recorded trace: duplicate scenario section: " + current);
+                    trace.referenceStreams[current] = {};
+                    continue;
+                }
+                if (inHeader)
+                    throw std::runtime_error(
+                        "recorded trace: event line before any scenario section");
+                if (current.empty())
+                    throw std::runtime_error(
+                        "recorded trace: event outside scenario section");
+                trace.referenceStreams[current] += line + "\n";
+            }
+            if (trace.metadata.count("format") == 0 ||
+                trace.metadata.at("format") != "1")
+                throw std::runtime_error(
+                    "recorded trace: unsupported or missing format (need format: 1)");
+            for (const char *key : {"reference-source", "reference-capture-host",
+                                    "reference-build", "reference-harness-blob",
+                                    "policy"})
+                if (!trace.metadata.count(key))
+                    throw std::runtime_error(
+                        std::string("recorded trace: missing required metadata: ") + key);
+            if (trace.declaredScenarios != expectedScenarios)
+                throw std::runtime_error(
+                    "recorded trace: declared scenario list does not match the harness scenarios");
+            if (trace.metadata.at("policy") != expectedPolicyFingerprint)
+                throw std::runtime_error(
+                    "recorded trace: declared policy \"" + trace.metadata.at("policy") +
+                    "\" is not compatible with this harness configuration (expected: \"" +
+                    expectedPolicyFingerprint + "\")");
+            // Structured identity contract. Role separation: the
+            // reference-source declares the base production source identity
+            // (40-hex commit/blob SHA prefix + description); the harness blob
+            // is a content identity of the exact captured harness; the build
+            // and capture-host identify the capture environment. Reference and
+            // candidate identities are separate roles and are never compared
+            // with each other for equality. Placeholder/short values are
+            // rejected before the structural checks so the diagnostic names
+            // the specific defect.
+            for (const char *contentKey :
+                 {"reference-source", "reference-build", "reference-harness-blob"})
+                if (trace.metadata.at(contentKey).size() < 16)
+                    throw std::runtime_error(
+                        std::string("recorded trace: placeholder-or-too-short ")
+                        + "identity value for: " + contentKey);
+            if (!std::regex_match(trace.metadata.at("reference-source"),
+                                  std::regex("[0-9a-f]{40}( .*)?")))
+                throw std::runtime_error(
+                    "recorded trace: reference-source is not a 40-hex content identity with optional description");
+            if (!std::regex_match(trace.metadata.at("reference-harness-blob"),
+                                  std::regex("[0-9a-f]{40}")))
+                throw std::runtime_error(
+                    "recorded trace: reference-harness-blob is not a full 40-hex content identity");
+            if (trace.metadata.at("reference-build").empty() ||
+                trace.metadata.at("reference-build").find("SHARED_CORE=ON") ==
+                    std::string::npos)
+                throw std::runtime_error(
+                    "recorded trace: reference-build must be a nonempty build identity declaring SHARED_CORE=ON");
+            if (trace.metadata.at("reference-capture-host").size() < 4)
+                throw std::runtime_error(
+                    "recorded trace: reference-capture-host too short to be a real host identity");
+            for (const auto &scenario : expectedScenarios)
+                if (!trace.referenceStreams.count(scenario) ||
+                    trace.referenceStreams.at(scenario).empty())
+                    throw std::runtime_error(
+                        "recorded trace: missing or empty reference stream for: " + scenario);
+            for (const auto &stream : trace.referenceStreams)
+                if (std::find(expectedScenarios.begin(), expectedScenarios.end(),
+                              stream.first) == expectedScenarios.end())
+                    throw std::runtime_error(
+                        "recorded trace: extra undeclared scenario section: " + stream.first);
+            return trace;
+        }
+    }
+
+    /** Recorded-replay suite over the shared production-controller harness. */
+    class Test__ServingSlotHandoffReplay : public Test__PrefillDecodeTransition {};
+
+    /** Synthetic lifecycle-contract suite over the same harness. */
+    class Test__ServingSlotHandoffLifecycle : public Test__PrefillDecodeTransition {};
+
+    /**
+     * Derived seam-runner type for epoch/exhaustion/lease evidence. The
+     * seam-dependent tests compile only where the corrected runner (with the
+     * seam) exists; base-source reference captures compile from the same
+     * scenario/parse logic with this section excluded, recording that in the
+     * capture identity.
+     */
+    class TestableServingSlotRunner : public OrchestrationRunner
+    {
+     public:
+        template <typename... Args>
+        explicit TestableServingSlotRunner(Args &&...args)
+            : OrchestrationRunner(std::forward<Args>(args)...)
+        {
+        }
+
+#ifndef LLAMINAR_CB_HANDOFF_BASE_CAPTURE
+        using OrchestrationRunner::stageServingSlotGenerationForTest;
+        using OrchestrationRunner::servingSlotGenerationForTest;
+        using OrchestrationRunner::servingSlotHandoffForTest;
+        using OrchestrationRunner::injectCorruptSlotHandoffStateForTest;
+#endif
+    };
+
+#define LLAMINAR_CB_HANDOFF_SEAM_TESTS 1
+
+    /**
+     * @brief Recorded-input replay of the production controller baseline.
+     *
+     * The golden was captured at the reference production source/build identity
+     * (pin 28ddbe253c76977c91989da4cde584377bca9fa1) through the real device-free
+     * boundary. The comparison is behavioral: the reference and candidate
+     * identities are recorded separately in the fixture header, so replay never
+     * requires an identical commit and never rebaselines after an edit.
+     * Regeneration happens ONLY through the explicit capture environment
+     * switch; a failing replay must be investigated, never auto-regenerated.
+     */
+    TEST_F(Test__ServingSlotHandoffReplay, MatchesRecordedReferenceBaseline)
+    {
+        const std::vector<std::string> scenarios = {
+            "serial3", "mtp_greedy2", "mtp_w2_greedy", "mtp_spec_seed",
+            "mtp_w2_spec", "forced", "generate2", "direct_prefill"};
+        std::map<std::string, std::string> actual;
+        for (const auto &kind : scenarios)
+            actual[kind] = runServingSlotScenario(kind);
+
+        const std::filesystem::path golden{LLAMINAR_CB_HANDOFF_GOLDEN};
+        if (std::getenv("LLAMINAR_CB_HANDOFF_CAPTURE") != nullptr)
+        {
+            /*
+             * Capture writes the REFERENCE streams and must be run against the
+             * unchanged base production source with this exact harness; the
+             * required identity environment describes the actual capture and
+             * is never invented retrospectively. Candidate verification never
+             * regenerates this file.
+             */
+            const char *source = std::getenv("LLAMINAR_CB_HANDOFF_REFERENCE_SOURCE");
+            const char *captureHost = std::getenv("LLAMINAR_CB_HANDOFF_CAPTURE_HOST");
+            const char *build = std::getenv("LLAMINAR_CB_HANDOFF_BUILD");
+            const char *harnessBlob = std::getenv("LLAMINAR_CB_HANDOFF_HARNESS_BLOB");
+            ASSERT_NE(source, nullptr) << "capture requires LLAMINAR_CB_HANDOFF_REFERENCE_SOURCE";
+            ASSERT_NE(captureHost, nullptr) << "capture requires LLAMINAR_CB_HANDOFF_CAPTURE_HOST";
+            ASSERT_NE(build, nullptr) << "capture requires LLAMINAR_CB_HANDOFF_BUILD";
+            ASSERT_NE(harnessBlob, nullptr) << "capture requires LLAMINAR_CB_HANDOFF_HARNESS_BLOB";
+            std::filesystem::create_directories(golden.parent_path());
+            std::ofstream output(golden);
+            output << "# format: 1\n"
+                   << "# reference-source: " << source << "\n"
+                   << "# reference-capture-host: " << captureHost << "\n"
+                   << "# reference-build: " << build << "\n"
+                   << "# reference-harness-blob: " << harnessBlob << "\n"
+                   << "# policy: " << servingSlotPolicyFingerprint() << "\n"
+                   << "# candidate-binding: external, via qualification receipts pairing worktree HEAD, clean-tree status, and the full test-name inventory\n"
+                   << "# scenarios:";
+            for (const auto &kind : scenarios)
+                output << ' ' << kind;
+            output << "\n";
+            for (const auto &kind : scenarios)
+            {
+                output << ">>> " << kind << "\n" << actual[kind];
+                if (!actual[kind].empty() && actual[kind].back() != '\n')
+                    output << "\n";
+            }
+            ASSERT_TRUE(output.good()) << "cannot write " << golden;
+            GTEST_SKIP() << "capture mode wrote the recorded reference baseline at " << golden;
+        }
+
+        ASSERT_TRUE(std::filesystem::exists(golden))
+            << "recorded baseline missing: " << golden;
+        std::ifstream input(golden);
+        std::ostringstream raw;
+        raw << input.rdbuf();
+        serving_slot_replay::RecordedTrace trace;
+        try
+        {
+            trace = serving_slot_replay::parseRecordedTrace(
+                raw.str(), scenarios, servingSlotPolicyFingerprint());
+        }
+        catch (const std::exception &error)
+        {
+            FAIL() << "recorded baseline rejected by the strict trace parser: "
+                   << error.what();
+        }
+        for (const auto &kind : scenarios)
+            EXPECT_EQ(actual[kind], trace.referenceStreams[kind])
+                << "production controller behavior diverged from the recorded "
+                   "reference baseline for scenario " << kind
+                << "; investigate the divergence instead of regenerating the "
+                   "fixture automatically";
+    }
+
+    /**
+     * @brief The strict trace parser rejects malformed, incomplete,
+     *        duplicated, and unsupported declarations, and accepts a trace
+     *        whose reference identity differs from any candidate identity
+     *        (reference and candidate are separate fields that never need to
+     *        be equal).
+     */
+    TEST_F(Test__ServingSlotHandoffReplay, RejectsMalformedAndIncompatibleTraces)
+    {
+        const std::vector<std::string> scenarios = {"serial3", "mtp_greedy2"};
+        const auto makeValid = []()
+        {
+            return std::string(
+                "# format: 1\n"
+                "# reference-source: 28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source)\n"
+                "# reference-capture-host: dgx-station (tdsynnex, aarch64 Neoverse-V2)\n"
+                "# reference-build: Integration/SHARED_CORE=ON/NEON_I8MM/image:sha256:b3a70cb060bb\n"
+                "# reference-harness-blob: 83471b15c5bc2ab2f01e3d4455a6b7c8d9e0f1a2\n"
+                "# policy: " + servingSlotPolicyFingerprint() + "\n"
+                "# scenarios: serial3 mtp_greedy2\n"
+                ">>> serial3\nR1:1\n>>> mtp_greedy2\nR1:1\n");
+        };
+        EXPECT_NO_THROW(serving_slot_replay::parseRecordedTrace(
+            makeValid(), scenarios, servingSlotPolicyFingerprint()));
+
+        // Negative cases: each derives from a valid trace and changes ONLY its
+        // targeted defect, so the failure reaches the intended branch and the
+        // asserted diagnostic verifies the parser caught that branch.
+        struct Case
+        {
+            const char *name;
+            const char *expectedDiagnostic;
+            std::string trace;
+        };
+        const auto mutate = [&makeValid](const std::string &find,
+                                         const std::string &replacement,
+                                         bool insert = false)
+        {
+            std::string t = makeValid();
+            if (insert)
+                t.insert(t.find(find), replacement);
+            else
+                t.replace(t.find(find), find.size(), replacement);
+            return t;
+        };
+        auto eraseLine = [&makeValid](const std::string &lineWithNewline)
+        {
+            std::string t = makeValid();
+            const auto pos = t.find(lineWithNewline);
+            if (pos != std::string::npos)
+                t.erase(pos, lineWithNewline.size());
+            return t;
+        };
+
+        const std::vector<Case> cases = {
+            {"missing format", "unsupported or missing format",
+             eraseLine("# format: 1\n")},
+            {"unsupported format", "unsupported or missing format",
+             mutate("# format: 1", "# format: 2")},
+            {"missing required identity", "missing required metadata: reference-source",
+             eraseLine("# reference-source: 28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source)\n")},
+            {"duplicate identity key", "duplicate metadata key: reference-source",
+             mutate("28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source)\n",
+                    "28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source)\n# reference-source: 28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source)\n", true)},
+            {"unsupported metadata key", "unsupported metadata key: future-key",
+             mutate("# reference-source:", "# future-key: x\n# reference-source:", true)},
+            {"empty metadata value", "empty metadata value for: policy",
+             mutate("# policy: " + servingSlotPolicyFingerprint(), "# policy: ")},
+            {"duplicate scenario section", "duplicate scenario section: serial3",
+             mutate(">>> mtp_greedy2", ">>> serial3\nR1:1\n>>> mtp_greedy2", true)},
+            {"event before section", "event line before any scenario section",
+             mutate("# format: 1", "# format: 1\nR1:1")},
+            {"empty scenario stream", "missing or empty reference stream for: mtp_greedy2",
+             mutate(">>> mtp_greedy2\nR1:1\n", ">>> mtp_greedy2\n")},
+            {"declared scenario missing from stream", "declared scenario list does not match",
+             mutate("# scenarios: serial3 mtp_greedy2", "# scenarios: serial3")},
+            {"extra undeclared scenario section", "extra undeclared scenario section: ghost",
+             mutate(">>> mtp_greedy2\nR1:1\n", ">>> mtp_greedy2\nR1:1\n>>> ghost\nR9:1\n")},
+            {"policy fingerprint incompatible", "not compatible with this harness configuration",
+             mutate("policy: " + servingSlotPolicyFingerprint(),
+                    "policy: widths=3;prefix-cache=enabled")},
+            {"placeholder identity rejected", "placeholder-or-too-short identity value for: reference-source",
+             mutate("reference-source: 28ddbe253c76977c91989da4cde584377bca9fa1 (unchanged base production source)",
+                    "reference-source: x")},
+            {"malformed harness blob identity", "reference-harness-blob is not a full 40-hex content identity",
+             mutate("# reference-harness-blob: 83471b15c5bc2ab2f01e3d4455a6b7c8d9e0f1a2",
+                    "# reference-harness-blob: not-a-real-content-identity-value")},
+        };
+        for (const auto &attempt : cases)
+        {
+            SCOPED_TRACE(attempt.name);
+            try
+            {
+                (void)serving_slot_replay::parseRecordedTrace(
+                    attempt.trace, scenarios, servingSlotPolicyFingerprint());
+                FAIL() << "malformed trace parsed without rejection";
+            }
+            catch (const std::exception &error)
+            {
+                EXPECT_NE(std::string(error.what()).find(attempt.expectedDiagnostic),
+                          std::string::npos)
+                    << "diagnostic mismatch: " << error.what();
+            }
+        }
+    }
+
+    TEST_F(Test__ServingSlotHandoffLifecycle, SequentialReuseMatchesFreshRunner)
+    {
+        const std::vector<float> rowA = {0.10f, 0.20f, 0.90f, 0.30f, 0.20f,
+                                         0.10f, 0.05f, 0.04f, 0.03f, 0.02f};
+        const std::vector<float> rowB = {0.10f, 0.20f, 0.10f, 0.20f, 0.30f, 0.90f,
+                                         0.05f, 0.04f, 0.03f, 0.02f};
+
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        mock->setHostTerminalSamplingLogits(rowA);
+        const GenerationResult a1 = decodeWithBudget(runner, 3);
+        ASSERT_TRUE(a1.success()) << a1.error;
+        runner->clearCache();
+        ASSERT_TRUE(runner->prefill({4, 5}));
+        mock->setHostTerminalSamplingLogits(rowB);
+        const GenerationResult b1 = decodeWithBudget(runner, 3);
+        const GenerationResult b2 = decodeWithBudget(runner, 3);
+        ASSERT_TRUE(b1.success()) << b1.error;
+
+        auto [controlA, controlAMock] = createRunner(/*mtp_enabled=*/true);
+        (void)controlAMock;
+        ASSERT_TRUE(controlA->prefill({1, 2, 3}));
+        controlAMock->setHostTerminalSamplingLogits(rowA);
+        const GenerationResult ca1 = decodeWithBudget(controlA, 3);
+        ASSERT_TRUE(ca1.success()) << ca1.error;
+
+        auto [controlB, controlBMock] = createRunner(/*mtp_enabled=*/true);
+        (void)controlBMock;
+        ASSERT_TRUE(controlB->prefill({4, 5}));
+        controlBMock->setHostTerminalSamplingLogits(rowB);
+        const GenerationResult cb1 = decodeWithBudget(controlB, 3);
+        const GenerationResult cb2 = decodeWithBudget(controlB, 3);
+        ASSERT_TRUE(cb1.success()) << cb1.error;
+
+        EXPECT_EQ(a1.tokens, ca1.tokens) << "request A must match its fresh-run control";
+        EXPECT_EQ(b1.tokens, cb1.tokens)
+            << "request B inherited prior-request handoff state";
+        EXPECT_EQ(b2.tokens, cb2.tokens);
+    }
+
+    /**
+     * @brief A direct next admission (no clearCache) still opens B's handoff
+     *        bank from B's own request: the admission edge retires the
+     *        predecessor visibly instead of inheriting its condition state.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, DirectPrefillRetiresPriorRequestHandoff)
+    {
+        const std::vector<float> rowA = {0.10f, 0.20f, 0.90f, 0.30f, 0.20f,
+                                         0.10f, 0.05f, 0.04f, 0.03f, 0.02f};
+        const std::vector<float> rowB = {0.10f, 0.20f, 0.10f, 0.20f, 0.30f, 0.90f,
+                                         0.05f, 0.04f, 0.03f, 0.02f};
+
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1, 2}));
+        mock->setHostTerminalSamplingLogits(rowA);
+        const GenerationResult a1 = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(a1.success()) << a1.error;
+
+        ASSERT_TRUE(runner->prefill({3, 4}));
+        mock->setHostTerminalSamplingLogits(rowB);
+        const GenerationResult b1 = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(b1.success()) << b1.error;
+
+        auto [control, controlMock] = createRunner(/*mtp_enabled=*/true);
+        (void)controlMock;
+        ASSERT_TRUE(control->prefill({3, 4}));
+        controlMock->setHostTerminalSamplingLogits(rowB);
+        const GenerationResult cb1 = decodeWithBudget(control, 2);
+        ASSERT_TRUE(cb1.success()) << cb1.error;
+
+        EXPECT_EQ(b1.tokens, cb1.tokens)
+            << "a direct admission must not inherit the previous request's "
+               "ready condition or speculative handoff";
+    }
+
+    /**
+     * @brief Intentionally hardened invalid-input contract: a decode after the
+     *        exact retirement boundary has no admitted request to serve.
+     *
+     * The pre-hardening capture observed a successful stateless decode here;
+     * that historical observation is superseded by this contract and stays in
+     * fixture history (15b93b850 golden). The rejection must happen before any
+     * bank mutation, so the MTP publication path cannot create retired+payload
+     * state that a later decode would fatal on.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, DirectDecodeAfterRetirementIsRejected)
+    {
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1, 2}));
+        const GenerationResult a1 = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(a1.success()) << a1.error;
+        runner->clearCache();
+
+        const GenerationResult rejected = decodeWithBudget(runner, 1);
+        EXPECT_FALSE(rejected.success());
+        EXPECT_NE(rejected.error.find("no live admission"), std::string::npos)
+            << rejected.error;
+
+        // Recovery: the next admission opens a fresh bank and decoding works.
+        ASSERT_TRUE(runner->prefill({3, 4}));
+        const GenerationResult b1 = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(b1.success()) << b1.error;
+    }
+
+    /**
+     * @brief Death regressions for the five corrupt-state production
+     *        entrypoints: payload in a retired bank is a fatal precondition
+     *        (std::abort), not a recoverable error. Each test injects the
+     *        corrupt state through the narrow fault-injection seam and
+     *        exercises one entrypoint, expecting the abort with the
+     *        diagnostic. Registered as ProductionTestPreflight members.
+     */
+    class Test__ServingSlotHandoffDeathRegressions : public Test__PrefillDecodeTransition {};
+
+#ifndef LLAMINAR_CB_HANDOFF_BASE_CAPTURE
+    TEST_F(Test__ServingSlotHandoffDeathRegressions, DecodeStepCorruptBankAborts)
+    {
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(/*mtp_enabled=*/true);
+        (void)mock;
+        runner->injectCorruptSlotHandoffStateForTest();
+        EXPECT_DEATH(runner->decodeStep(), "corrupt slot handoff state");
+    }
+
+    TEST_F(Test__ServingSlotHandoffDeathRegressions, ForceDecodeTokenCorruptBankAborts)
+    {
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(/*mtp_enabled=*/true);
+        (void)mock;
+        runner->injectCorruptSlotHandoffStateForTest();
+        EXPECT_DEATH(runner->forceDecodeToken(42), "corrupt slot handoff state");
+    }
+
+    TEST_F(Test__ServingSlotHandoffDeathRegressions, PrefillCorruptBankAborts)
+    {
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(/*mtp_enabled=*/true);
+        (void)mock;
+        runner->injectCorruptSlotHandoffStateForTest();
+        EXPECT_DEATH(runner->prefill({1, 2}), "corrupt slot handoff state");
+    }
+
+    /** @brief Nonempty batch admission must reject a corrupt bank fatally. */
+    TEST_F(Test__ServingSlotHandoffDeathRegressions, PrefillBatchCorruptBankAborts)
+    {
+        auto [runner, mock] = createRunner<TestableServingSlotRunner>(
+            /*mtp_enabled=*/true, /*mtp_accept=*/true,
+            /*mtp_unsupported_reason=*/{}, /*mpi_ctx=*/nullptr,
+            /*mtp_token_coordination=*/false, /*hide_local_logits=*/false,
+            DeviceId::cpu(), /*mtp_draft_tokens=*/1,
+            /*chained_mtp_support=*/false, /*sidecar_sample_fusion=*/false,
+            MTPDepthPolicyConfig{}, MTPVerifyMode::Greedy,
+            /*local_pp_topology=*/false, /*max_request_batch=*/2);
+        mock->setBatchCapacity(2);
+        runner->injectCorruptSlotHandoffStateForTest();
+        EXPECT_DEATH(runner->prefillBatch({{1, 2}, {3, 4}}),
+                     "corrupt slot handoff state");
+    }
+#endif // LLAMINAR_CB_HANDOFF_BASE_CAPTURE
+
+    /** Forced-token entry carries the same inactive-slot contract. */
+    TEST_F(Test__ServingSlotHandoffLifecycle, ForcedTokenAfterRetirementIsRejected)
+    {
+        auto [runner, mock] = createRunner();
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1}));
+        runner->clearCache();
+        const GenerationResult rejected = runner->forceDecodeToken(42);
+        EXPECT_FALSE(rejected.success());
+        EXPECT_NE(rejected.error.find("no live admission"), std::string::npos)
+            << rejected.error;
+    }
+
+    /**
+     * @brief A failed admission must not open or mutate the bank: the slot
+     *        stays retired, the hardened decode contract reports it, and the
+     *        next valid admission recovers immediately.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, FailedAdmissionLeavesRetiredBankUntouched)
+    {
+        auto [runner, mock] = createRunner(/*mtp_enabled=*/true);
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1, 2}));
+        const GenerationResult a1 = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(a1.success()) << a1.error;
+        runner->clearCache();
+
+        EXPECT_FALSE(runner->prefill({}));
+        const GenerationResult rejected = decodeWithBudget(runner, 1);
+        EXPECT_FALSE(rejected.success());
+        EXPECT_NE(rejected.error.find("no live admission"), std::string::npos)
+            << rejected.error;
+
+        ASSERT_TRUE(runner->prefill({5}));
+        const GenerationResult b1 = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(b1.success()) << b1.error;
+    }
+
+    /**
+     * @brief Resident capacity one is not verifier width one: exercise the
+     *        grouped verifier at draft width 2 across a retirement boundary.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, MTPWidthTwoSequentialReuseMatchesFreshRunner)
+    {
+        const std::vector<float> rowA = {0.10f, 0.20f, 0.90f, 0.30f, 0.20f,
+                                         0.10f, 0.05f, 0.04f, 0.03f, 0.02f};
+        const std::vector<float> rowB = {0.10f, 0.20f, 0.10f, 0.20f, 0.30f, 0.90f,
+                                         0.05f, 0.04f, 0.03f, 0.02f};
+
+        auto [runner, mock] = createRunner(
+            /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr, false, false,
+            DeviceId::cpu(), /*mtp_draft_tokens=*/2, /*chained_mtp_support=*/true);
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1, 2, 3}));
+        mock->setHostTerminalSamplingLogits(rowA);
+        const GenerationResult a1 = decodeWithBudget(runner, 3);
+        ASSERT_TRUE(a1.success()) << a1.error;
+        runner->clearCache();
+        ASSERT_TRUE(runner->prefill({4, 5}));
+        mock->setHostTerminalSamplingLogits(rowB);
+        const GenerationResult b1 = decodeWithBudget(runner, 3);
+        ASSERT_TRUE(b1.success()) << b1.error;
+
+        auto [control, controlMock] = createRunner(
+            /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr, false, false,
+            DeviceId::cpu(), /*mtp_draft_tokens=*/2, /*chained_mtp_support=*/true);
+        (void)controlMock;
+        ASSERT_TRUE(control->prefill({4, 5}));
+        controlMock->setHostTerminalSamplingLogits(rowB);
+        const GenerationResult cb1 = decodeWithBudget(control, 3);
+        ASSERT_TRUE(cb1.success()) << cb1.error;
+
+        EXPECT_EQ(b1.tokens, cb1.tokens)
+            << "width-2 request B inherited prior-request handoff state";
+    }
+
+    /**
+     * @brief Exhaustion refuses BEFORE any mutation, including the predecessor
+     *        retirement: a near-max staged generation mints exactly once, the
+     *        next admission is refused without touching the live bank, and the
+     *        predecessor admission remains fully functional.
+     */
+#ifndef LLAMINAR_CB_HANDOFF_BASE_CAPTURE
+    TEST_F(Test__ServingSlotHandoffLifecycle, ExhaustionRefusesBeforePredecessorMutation)
+    {
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(/*mtp_enabled=*/true);
+        (void)mock;
+        const std::uint64_t nearMax =
+            std::numeric_limits<std::uint64_t>::max() - 1;
+        runner->stageServingSlotGenerationForTest(nearMax);
+
+        // Admission mints the exhausted boundary value and opens the bank.
+        ASSERT_TRUE(runner->prefill({1, 2}));
+        EXPECT_EQ(runner->servingSlotGenerationForTest(),
+                  std::numeric_limits<std::uint64_t>::max());
+        const auto admittedBank = runner->servingSlotHandoffForTest();
+        EXPECT_TRUE(admittedBank.hasPayload());
+        EXPECT_FALSE(admittedBank.retired);
+        EXPECT_EQ(admittedBank.admission_epoch,
+                  std::numeric_limits<std::uint64_t>::max());
+
+        // The next admission refuses: counter and predecessor bank unmoved.
+        const std::uint64_t errorEpochBefore = runner->servingSlotGenerationForTest();
+        EXPECT_FALSE(runner->prefill({3, 4}));
+        EXPECT_NE(runner->lastError(), "");
+        EXPECT_NE(runner->lastError().find("Serving-slot admission generation exhausted"),
+                  std::string::npos)
+            << runner->lastError();
+        EXPECT_EQ(runner->servingSlotGenerationForTest(), errorEpochBefore);
+        const auto afterBank = runner->servingSlotHandoffForTest();
+        EXPECT_EQ(afterBank.admission_epoch,
+                  std::numeric_limits<std::uint64_t>::max());
+        EXPECT_FALSE(afterBank.retired);
+        EXPECT_TRUE(afterBank.hasPayload());
+
+        // The predecessor admission is still fully funcional after the refusal.
+        const GenerationResult stillAlive = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(stillAlive.success()) << stillAlive.error;
+        EXPECT_EQ(runner->servingSlotGenerationForTest(),
+                  std::numeric_limits<std::uint64_t>::max());
+    }
+#endif
+
+    /**
+     * @brief Admission generations are observable and strictly monotonic
+     *        across admission edges, with retirement keeping the epoch and
+     *        re-admission minting the next one.
+     */
+#ifndef LLAMINAR_CB_HANDOFF_BASE_CAPTURE
+    TEST_F(Test__ServingSlotHandoffLifecycle, AdmissionsMintMonotonicObservableEpochs)
+    {
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(/*mtp_enabled=*/true);
+        (void)mock;
+        runner->stageServingSlotGenerationForTest(5);
+
+        ASSERT_TRUE(runner->prefill({1, 2}));
+        EXPECT_EQ(runner->servingSlotGenerationForTest(), 6u);
+        EXPECT_EQ(runner->servingSlotHandoffForTest().admission_epoch, 6u);
+        EXPECT_FALSE(runner->servingSlotHandoffForTest().retired);
+
+        runner->clearCache();
+        EXPECT_EQ(runner->servingSlotGenerationForTest(), 6u);
+        EXPECT_TRUE(runner->servingSlotHandoffForTest().retired);
+        EXPECT_EQ(runner->servingSlotHandoffForTest().admission_epoch, 6u);
+
+        ASSERT_TRUE(runner->prefill({3, 4}));
+        EXPECT_EQ(runner->servingSlotGenerationForTest(), 7u);
+        EXPECT_EQ(runner->servingSlotHandoffForTest().admission_epoch, 7u);
+
+        // Direct replacement (no clearCache) mints the next generation.
+        ASSERT_TRUE(runner->prefill({5}));
+        EXPECT_EQ(runner->servingSlotGenerationForTest(), 8u);
+        EXPECT_EQ(runner->servingSlotHandoffForTest().admission_epoch, 8u);
+        EXPECT_FALSE(runner->servingSlotHandoffForTest().retired);
+    }
+#endif
+
+#ifndef LLAMINAR_CB_HANDOFF_BASE_CAPTURE
+    /**
+     * @brief Observe borrower release before the predecessor planning companion.
+     *
+     * The actual direct-prefill replacement retires the owning bank. Only its
+     * separate, live planning member and admission epoch are inspected by the
+     * release observer; the ready condition being destroyed is never accessed.
+     * This proves planning-companion order, not native event destruction or
+     * retirement of pending correction fields absent from this scenario.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, DirectReplacementReleasesBorrowerBeforePlanningCompanion)
+    {
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(
+                /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr,
+                /*mtp_token_coordination=*/true, false, DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/1);
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+        mock->enableMTPSidecarPreservesMainState();
+        mock->enableMTPShiftedRowReuseFromSidecar();
+        mock->enableMTPSidecarLogitsStreamHandoff();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->setVerifierAcceptedPrefixScript({1, 1});
+        mock->enableDeviceResidentGeneration(
+            DeviceGenerationTerminalRequestResult{
+                .tokens = {MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                           MockInferenceRunner::MTP_ARGMAX_TOKEN},
+                .remaining_token_count = 0,
+                .model_stopped = false,
+                .transaction_count = 1,
+                .accepted_speculative_token_count = 1,
+                .rejected_transaction_count = 0,
+                .consumed_verifier_row_count = 2,
+                .published_state_commit_count = 2,
+                .attempted_draft_token_count = 1,
+                .verifier_token_count = 2,
+                .final_draft_depth = 1,
+            });
+
+        auto probe = std::make_shared<MTPLeaseReleaseProbe>();
+        ASSERT_TRUE(mock->configureMTPLeaseReleaseProbe(probe));
+
+        // Publish the owning lease through the ordinary mock controller path.
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const GenerationResult first = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(first.success()) << first.error;
+
+        const auto &bank = runner->servingSlotHandoffForTest();
+        ASSERT_FALSE(bank.retired);
+        ASSERT_TRUE(bank.ready_mtp_condition_.has_value());
+        ASSERT_TRUE(bank.ready_mtp_condition_->resident_state.has_value());
+        ASSERT_TRUE(bank.ready_mtp_condition_->resident_state->mtp_transaction.valid());
+
+        ASSERT_TRUE(bank.decode_transaction_planning_position_.has_value());
+        const auto predecessorEpoch = bank.admission_epoch;
+
+        // Account for every bank-held reference to this same transaction before
+        // dropping the mock owner. The final bank release must precede clearing
+        // the planning companion, even if ready and prelaunched fields co-own it.
+        const auto *state =
+            bank.ready_mtp_condition_->resident_state->mtp_transaction.state.get();
+        long bankOwners = 1;
+        if (bank.pending_mtp_condition_resident_state_ &&
+            bank.pending_mtp_condition_resident_state_->mtp_transaction.state.get() == state)
+            ++bankOwners;
+        if (bank.prelaunched_mtp_first_sidecar_resident_state_ &&
+            bank.prelaunched_mtp_first_sidecar_resident_state_->mtp_transaction.state.get() == state)
+            ++bankOwners;
+        const auto predecessor = mock->releaseMockMTPTransactionOwnership();
+        ASSERT_FALSE(predecessor.expired());
+        ASSERT_EQ(predecessor.use_count(), bankOwners)
+            << "only the identified bank borrowers may retain this transaction";
+        {
+            ScopedMTPLeaseReleaseObservation observation(
+                *probe,
+                [&runner, predecessorEpoch]
+                {
+                    const auto &liveBank = runner->servingSlotHandoffForTest();
+                    return liveBank.admission_epoch == predecessorEpoch &&
+                           !liveBank.retired &&
+                           liveBank.decode_transaction_planning_position_.has_value();
+                });
+            ASSERT_TRUE(runner->prefill({6, 7}));
+        }
+        EXPECT_TRUE(predecessor.expired());
+        EXPECT_THAT(probe->companion_snapshots, ElementsAre(true));
+
+        const auto &successor = runner->servingSlotHandoffForTest();
+        EXPECT_FALSE(successor.retired);
+        EXPECT_EQ(successor.admission_epoch, predecessorEpoch + 1);
+        EXPECT_FALSE(successor.ready_mtp_condition_.has_value());
+        EXPECT_FALSE(successor.pending_mtp_condition_resident_state_.has_value());
+        EXPECT_FALSE(successor.prelaunched_mtp_first_sidecar_resident_state_.has_value());
+    }
+
+    /**
+     * @brief The same release probe distinguishes a companions-first fixture.
+     *
+     * This is a negative control for the observation channel, not a second
+     * production retirement implementation or a claim of mutated-source replay.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, ReleaseProbeDetectsCompanionFirstOrder)
+    {
+        auto probe = std::make_shared<MTPLeaseReleaseProbe>();
+        std::optional<int> planningPosition{7};
+        auto lease = makeObservedMockMTPTransactionState(probe);
+        const std::weak_ptr<DeviceResidentMTPTransactionState> observer = lease;
+        {
+            ScopedMTPLeaseReleaseObservation observation(
+                *probe, [&planningPosition] { return planningPosition.has_value(); });
+            planningPosition.reset();
+            lease.reset();
+        }
+        EXPECT_TRUE(observer.expired());
+        EXPECT_THAT(probe->companion_snapshots, ElementsAre(false));
+    }
+
+    /** @brief Direct replacement releases the borrower and supports new decode. */
+    TEST_F(Test__ServingSlotHandoffLifecycle, DirectReplacementReleasesPredecessorLeases)
+    {
+        using sampling_math::DeviceGenerationLeadingRowDisposition;
+        auto [runner, mock] =
+            createRunner<TestableServingSlotRunner>(
+                /*mtp_enabled=*/true, /*mtp_accept=*/true, {}, nullptr,
+                /*mtp_token_coordination=*/true, false, DeviceId::cuda(0),
+                /*mtp_draft_tokens=*/1);
+        mock->enableGroupedOutcomeDeviceResidentPublication(/*rows=*/4);
+        mock->enableStochasticDeviceSampling();
+        mock->enableDeviceResidentMTPSpecStatePublication();
+        mock->hideMTPSpecStatePublicationFromPolicy();
+        mock->enableMTPSidecarPreservesMainState();
+        mock->enableMTPShiftedRowReuseFromSidecar();
+        mock->enableMTPSidecarLogitsStreamHandoff();
+        mock->enableMTPDeviceDraftTokenInput();
+        mock->setVerifierAcceptedPrefixScript({1, 1});
+        mock->enableDeviceResidentGeneration(
+            DeviceGenerationTerminalRequestResult{
+                .tokens = {MockInferenceRunner::PREFILL_ARGMAX_TOKEN,
+                           MockInferenceRunner::MTP_ARGMAX_TOKEN},
+                .remaining_token_count = 0,
+                .model_stopped = false,
+                .transaction_count = 1,
+                .accepted_speculative_token_count = 1,
+                .rejected_transaction_count = 0,
+                .consumed_verifier_row_count = 2,
+                .published_state_commit_count = 2,
+                .attempted_draft_token_count = 1,
+                .verifier_token_count = 2,
+                .final_draft_depth = 1,
+            });
+
+        // Predecessor admission: opens the device-resident controller and
+        // leaves a lease-bearing condition in the slot handoff bank. The
+        // mock's deviceResidentLogicalSequenceState() populates the
+        // mtp_transaction lease on the handle at the publication edge.
+        ASSERT_TRUE(runner->prefill({1, 2, 3, 4, 5}));
+        const GenerationResult first = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(first.success()) << first.error;
+
+        const auto &predecessorBank = runner->servingSlotHandoffForTest();
+        EXPECT_FALSE(predecessorBank.retired);
+        ASSERT_TRUE(predecessorBank.hasPayload());
+        ASSERT_TRUE(predecessorBank.ready_mtp_condition_.has_value());
+        ASSERT_TRUE(predecessorBank.ready_mtp_condition_->resident_state.has_value());
+        const auto &predecessorResidentState =
+            *predecessorBank.ready_mtp_condition_->resident_state;
+
+        ASSERT_TRUE(predecessorResidentState.mtp_transaction.valid());
+
+        // Record the pre-replacement observations: the lease is co-owned
+        // by the mock and the bank.
+        const auto predecessorUseCount = mock->mockMTPTransactionUseCount();
+        EXPECT_GE(predecessorUseCount, 2u)
+            << "the lease must be co-owned by the mock and the bank";
+        const uint64_t predecessorEpoch = predecessorBank.admission_epoch;
+
+        // This companion test observes the borrower-count decrease across
+        // replacement; release-time ordering is checked separately above.
+        ASSERT_TRUE(runner->prefill({6, 7}));
+
+        // The use_count drops: the bank's lease copy was released.
+        const auto postReplacementUseCount =
+            mock->mockMTPTransactionUseCount();
+        EXPECT_LT(postReplacementUseCount, predecessorUseCount)
+            << "the bank's lease copy must be released on replacement: "
+               "use_count " << predecessorUseCount << " → "
+               << postReplacementUseCount;
+
+        // The successor bank is fresh: all predecessor lease-bearing fields
+        // are cleared, the epoch advanced.
+        const auto &replacementBank = runner->servingSlotHandoffForTest();
+        EXPECT_FALSE(replacementBank.retired);
+        EXPECT_EQ(replacementBank.admission_epoch, predecessorEpoch + 1u)
+            << "the direct replacement must mint the next admission generation";
+        EXPECT_FALSE(replacementBank.ready_mtp_condition_.has_value());
+        EXPECT_FALSE(replacementBank.pending_mtp_condition_resident_state_.has_value());
+        EXPECT_FALSE(replacementBank.prelaunched_mtp_first_sidecar_resident_state_.has_value());
+
+        // Recovery: the successor decode path works with the new lease.
+        const GenerationResult second = decodeWithBudget(runner, 2);
+        ASSERT_TRUE(second.success()) << second.error;
+        const auto &successorBank = runner->servingSlotHandoffForTest();
+        ASSERT_TRUE(successorBank.ready_mtp_condition_.has_value());
+        ASSERT_TRUE(successorBank.ready_mtp_condition_->resident_state.has_value());
+
+        // Ordering: two full admission/finish cycles on record.
+        EXPECT_THAT(mock->deviceGenerationLifecycleEvents(),
+                    ElementsAre("admission", "resident_verifier",
+                                "materialize:greedy", "launch", "finish",
+                                "admission", "resident_verifier",
+                                "materialize:greedy", "launch", "finish"));
+    }
+#endif // LLAMINAR_CB_HANDOFF_BASE_CAPTURE
+
+    /**
+     * @brief Scalar/fixed-cohort boundary: the batched entry requires its own
+     *        batched prefill and must not disturb the live scalar handoff bank.
+     */
+    TEST_F(Test__ServingSlotHandoffLifecycle, BatchedBoundaryDoesNotDisturbScalarBank)
+    {
+        auto [runner, mock] = createRunner();
+        (void)mock;
+        ASSERT_TRUE(runner->prefill({1, 2}));
+        const GenerationResult before = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(before.success()) << before.error;
+
+        const GenerationBatchResult batched = decodeBatchWithBudget(runner, 1, 1);
+        EXPECT_FALSE(batched.error.empty())
+            << "batched decode without a batched prefill must be rejected";
+
+        const GenerationResult after = decodeWithBudget(runner, 1);
+        ASSERT_TRUE(after.success()) << after.error;
     }
 
 } // namespace
