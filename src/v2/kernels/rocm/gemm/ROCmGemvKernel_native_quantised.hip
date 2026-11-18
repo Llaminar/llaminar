@@ -45,6 +45,9 @@
  * LDS and fuses their ordered publication into one native launch per projection.
  * Source-policy partition counts and public route fragments remain unchanged.
  *
+ * An opt-in gfx906 HC-down contributor reuses each original physical Q8 block
+ * across up to four device-admitted verifier rows and preserves the staged reducer.
+ *
  * Split from ROCmGemvKernel.hip.
  *
  * @see ROCmGemvKernel_INT8_VNNI.hip for INT8 VNNI kernels
@@ -78,6 +81,7 @@
 #include <string>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
 #include "kernels/rocm/gemm/ROCmNativeM1Reduction.h"
 #include "../../../utils/DebugEnv.h"
@@ -6149,6 +6153,86 @@ __global__ void gemv_native_quantised_reduce_small_m_kernel_t(
     }
 }
 
+namespace
+{
+constexpr int kHCDownColumns = 320;
+constexpr int kHCDownReduction = 10240;
+constexpr int kHCDownPartitions = 16;
+constexpr int kHCDownPackedBlocks = kHCDownReduction / 32;
+constexpr int kHCDownWindow = kHCDownPackedBlocks / kHCDownPartitions;
+constexpr int kHCDownTileRows = 4;
+constexpr int kHCDownTileColumns = 32;
+
+/** @brief Existing counted row owner and persistent prepared GEMV storage. */
+struct HCDownLongKArgs
+{
+    const int8_t *activation;
+    const uint8_t *payload;
+    const uint16_t *weight_scales;
+    const float *activation_scales;
+    float *partials;
+    llaminar2::DeviceRowRange rows;
+};
+
+/**
+ * @brief Produce the original FP32 K32 × 20 terms for one [partition,row,column] tile.
+ *
+ * Every lane decodes one physical Q8 block, reuses it across the live row
+ * tile and publishes one typed single-scale term per live row. Four lanes
+ * fold those terms in increasing original block order. The unchanged public
+ * reducer consumes ascending partitions with the existing physical row stride.
+ */
+__global__ __launch_bounds__(kHCDownTileColumns * kHCDownWindow)
+void qfn_hc_down_long_k_contributions(HCDownLongKArgs args)
+{
+    const int row_base = int(blockIdx.z) * kHCDownTileRows;
+    const int width = min(kHCDownTileRows, args.rows.activeRows() - row_base);
+    if (width <= 0)
+        return;
+
+    const int thread = int(threadIdx.x);
+    const int local_group = thread / kHCDownTileColumns;
+    const int local_col = thread % kHCDownTileColumns;
+    const int group = int(blockIdx.y) * kHCDownWindow + local_group;
+    const int col = int(blockIdx.x) * kHCDownTileColumns + local_col;
+    const int weight_index = group * kHCDownColumns + col;
+    const auto *packed = reinterpret_cast<const int4 *>(args.payload + weight_index * 32);
+    const int4 lo = packed[0], hi = packed[1];
+    const int weight[] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+    const float scale = __half2float(__ushort_as_half(args.weight_scales[weight_index]));
+    __shared__ float terms[kHCDownTileRows][kHCDownWindow][kHCDownTileColumns];
+#pragma unroll
+    for (int row = 0; row < kHCDownTileRows; ++row)
+    {
+        if (row >= width)
+            break;
+        const int input_index = (row_base + row) * kHCDownPackedBlocks + group;
+        const auto *input = reinterpret_cast<const int *>(args.activation + input_index * 32);
+        int dot = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            dot = llaminar2::rocm_integer_contract::signedDot4(input[i], weight[i], dot);
+        terms[row][local_group][local_col] =
+            llaminar2::device_native_quantised_contract::singleScaleBlock(
+                dot, scale, args.activation_scales[input_index]);
+    }
+    __syncthreads();
+
+    // Each live scratch word has one writer. Inactive words remain dirty.
+    if (local_group < width)
+    {
+        float sum = 0.0f;
+#pragma unroll
+        for (int group_offset = 0; group_offset < kHCDownWindow; ++group_offset)
+            sum = llaminar2::device_native_quantised_contract::accumulate(
+                sum, terms[local_group][group_offset][local_col]);
+        const auto plane = int(blockIdx.y) * args.rows.physicalRows() + row_base + local_group;
+        args.partials[plane * kHCDownColumns + col] = sum;
+    }
+}
+
+} // namespace
+
 constexpr int NATIVE_QUANTISED_SMALL_M_MAX_BATCH = 8;
 constexpr int NATIVE_QUANTISED_SMALL_M_GRAPH_SAFE_KB_CAP =
     llaminar2::NativeQuantisedGroupedDecodePolicy::maximum_k_partitions;
@@ -8164,12 +8248,37 @@ bool rocmLaunch_native_quantised_small_m_fp32(
         return false;
     }
 
+    bool hc_down_long_k = false;
+    if constexpr (FMT == NATIVE_QUANTISED_Q8_0)
+    {
+        if (decode_equivalent && generated_cfg.has_generated &&
+            generated_cfg.kb == kHCDownPartitions && kb == kHCDownPartitions &&
+            arithmetic_policy_codebook_id == static_cast<uint8_t>(NATIVE_QUANTISED_Q8_0) &&
+            N == kHCDownColumns && K == kHCDownReduction && M >= 2 && M <= 8 &&
+            row_range && row_range->countOwner() && !d_block_mins && !d_block_emins &&
+            !llaminar2::currentProjectionRowWork(M) && llaminar2::qfnGroupedHCDownLongKExperiment())
+        {
+            const auto &hardware = llaminar2::rocmHardwareMetadata().at(device_id);
+            hc_down_long_k = (hardware.isa_target == "gfx906" || hardware.isa_target.starts_with("gfx906:")) &&
+                hardware.compute_units == 60 && hardware.native_wave_width == 64 &&
+                hardware.maximum_threads_per_block >= kHCDownTileColumns * kHCDownWindow;
+            if (hc_down_long_k &&
+                (reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+                 (reinterpret_cast<std::uintptr_t>(d_payload) & 15u) ||
+                 (reinterpret_cast<std::uintptr_t>(d_A_int8) & 3u)))
+            {
+                fprintf(stderr, "[rocmGemv_native_quantised_small_m_fp32] invalid exact HC-down alignment or stream\n");
+                return false;
+            }
+        }
+    }
+
     recordNativeQuantisedSmallMLaunch(
         M,
         N,
         K,
         static_cast<unsigned>(FMT),
-        grid_n,
+        hc_down_long_k ? N / kHCDownTileColumns : grid_n,
         kb,
         target_waves_per_cu,
         false,
@@ -8207,7 +8316,18 @@ bool rocmLaunch_native_quantised_small_m_fp32(
         float* tile_c =
             d_C_fp32 + static_cast<size_t>(row_base) * N;
 
-        if (tile_rows_per_group == NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE)
+        if (hc_down_long_k)
+        {
+            static_assert(llaminar2::kDefaultNativeQuantisedVerifierRowCapacity >= 8);
+            const dim3 grid(N / kHCDownTileColumns, kb, (tile_m + kHCDownTileRows - 1) / kHCDownTileRows);
+            constexpr int threads = kHCDownTileColumns * kHCDownWindow;
+            hipLaunchKernelGGL(qfn_hc_down_long_k_contributions, grid, dim3(threads), 0,
+                static_cast<hipStream_t>(stream),
+                (HCDownLongKArgs{tile_a, d_payload, d_block_scales, tile_scales, d_partial_fp32, tile_rows}));
+            llaminar2::PerfStatsCollector::addCounter("gemm", "qfn_grouped_hc_down_long_k_nodes", 1.0,
+                "gemm", "rocm:" + std::to_string(device_id));
+        }
+        else if (tile_rows_per_group == NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE)
         {
             llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
         hipLaunchKernelGGL(

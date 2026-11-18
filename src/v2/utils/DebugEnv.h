@@ -66,6 +66,22 @@ namespace llaminar2
     }
 
     /**
+     * @brief Select the grouped gfx906 HC-down contributor at capture time.
+     * @return True when the process enables this measured verifier geometry.
+     * @throws std::invalid_argument If the switch is neither zero nor one.
+     */
+    inline bool qfnGroupedHCDownLongKExperiment()
+    {
+        static const bool enabled = [] {
+            const char* mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_LONG_K");
+            if (!mode || std::strcmp(mode, "0") == 0) return false;
+            if (std::strcmp(mode, "1") == 0) return true;
+            throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_LONG_K accepts 0 or 1");
+        }();
+        return enabled;
+    }
+
+    /**
      * @brief Read the cold process opt-in for the gfx906 grouped GDN K4 convolution.
      * @return True when the process requests the measured counted verifier leaf.
      * @throws std::invalid_argument If the environment value is neither zero nor one.

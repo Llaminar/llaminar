@@ -20696,6 +20696,16 @@ if(HAVE_ROCM)
         MPI_PROCS 1
         NO_MODELS
     )
+    add_executable(v2_integration_rocm_grouped_hcdown_long_k
+        integration/kernels/rocm/Test__ROCmGroupedHCDownLongK.cpp)
+    target_link_libraries(v2_integration_rocm_grouped_hcdown_long_k
+        llaminar2_core GTest::gtest GTest::gtest_main)
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_HCDownLongK
+        COMMAND $<TARGET_FILE:v2_integration_rocm_grouped_hcdown_long_k>
+            --gtest_filter=ROCmGroupedHCDownLongK.DecoderPartialsAndFinalMatchSerialWithDirtyCapacity
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;MTP;GroupedVerifierRows;GraphCapture;ByteExact;Replay;Regression;gfx906"
+        ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0;LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_LONG_K=1"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK rocm_gpu_0)
     add_executable(v2_integration_rocm_device_counted_verifier_rows
         integration/kernels/rocm/Test__ROCmDeviceCountedVerifierRows.cpp)
     target_link_libraries(v2_integration_rocm_device_counted_verifier_rows
@@ -38412,6 +38422,9 @@ add_v2_test(V2_Integration_MoEOverlayInferenceEpochRoster
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayInferenceEpochRoster)
 
+if(TEST V2_Integration_GroupedVerifierRows_ROCm_HCDownLongK)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedVerifierRows_ROCm_HCDownLongK)
+endif()
 if(TEST V2_Integration_GroupedVerifierRows_ROCm_QFNK4ShortConv)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedVerifierRows_ROCm_QFNK4ShortConv)
 endif()
