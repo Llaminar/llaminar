@@ -144,8 +144,15 @@ The candidate gained 3.14% and 2.29% in decode over its control. Review is
 4.53% above the quiet fork median. Code is 7.55% below it and needs another
 8.17% throughput gain to reach parity. The control and treatment executed
 74 review and 86 code verifications per generation. The contributions of the
-three individual changes still require native phase measurements. The dynamic
-comparison was interrupted by a host reboot and has no paired result.
+three individual changes still require native phase measurements.
+
+The post-reboot dynamic comparison also retired cleanly. Review prefill/decode
+moved from 1000.95/115.85 to 1001.90/119.30 tok/s. Code moved from
+969.63/94.23 to 969.79/97.02 tok/s. All six generated histories and all five
+work counters matched. Review executed 58 verifications and 294 draft steps,
+and code executed 69 verifications and 345 draft steps. The corresponding
+unprofiled evidence is in `boot3-r1-dynamic-{control,phase}` beside the fixed
+evidence. A matched dynamic fork measurement remains unavailable.
 
 For the earlier core, the 2048-token trace produced all 256 expected IDs and
 exactly reproduced all three unprofiled token histories, all five work counters
@@ -164,6 +171,68 @@ of whole GQA-group owners. Llaminar divides query heads across four participants
 in each layer. Both perform 72 query-head/layer instances per GPU. Mean
 device-active time therefore answers a different question from elapsed time
 across the active participants. [Source comparison and ownership](../2026-10/QFN_CASTAGNA_STAGE_COMPARISON.md)
+
+## Which TP participant finishes each FFN layer last
+
+The retained review trace joins each layer's last FFN producer on the common
+rocprof clock across all four cards. A verifier marker closes each round. The
+join authenticated 48 FFN completions per card in each of 74 rounds. The
+physical GGUF shard inventory identifies one 256-column routed shard and three
+128-column shards per layer. The wide owner rotates between cards.
+
+**The 256-column owner published last in all 3,552 comparisons, with no ties.**
+For each layer we took the median difference between its completion and the
+latest 128-column completion across the 74 rounds. Those medians range from
+20.80 to 40.59 µs. Their median is 38.01 µs. Subtracting each participant's
+own preceding peer-reduction end before comparing widths gives 38.04 µs.
+This identifies the participant to accelerate before the following collective.
+It does not establish the savings a particular kernel will deliver.
+
+The narrower FFN fusion reached 31, 34, 32 and 32 layers on the four cards.
+The other unselected 128-column sites use different weight formats. On a
+separate same-ELF whole-model test with only the grouped HC-up and convolution
+policies already enabled, the fusion removed 217–238 native graph nodes per
+M4 verification. Review decode changed from 107.32 to 107.19 tok/s and code
+from 88.47 to 88.79 tok/s. All six token histories and work counters matched.
+
+A paired native review trace measured 1.76–1.91 ms less work per verification
+on each card in the selected narrow FFN suffixes, a 38.1–38.8% reduction.
+Before fusion the wide participant was last in 3,546 of 3,552 layer-rounds;
+afterwards it was last in 3,550. The typical wide-to-last-narrow gap grew
+from 17.25 to 74.43 µs. This is the same narrow-only A/B and has its own
+control, distinct from the later 38.01 µs baseline above. Cutting work on
+the earlier arrivals explains how an isolated speedup can leave request
+throughput nearly unchanged.
+
+A fusion on the 256-column Q4_K/Q5_1 slice measured 227.85 µs staged and
+227.73–227.80 µs fused in the complete local FFN graph. It left the widest
+participant with the same amount of work. All three original
+expert format pairs in this model use Q5_1 or Q8_0 down weights with
+32-column source groups. Four 160-column
+intervals therefore cover the original 640 columns exactly.
+
+The same MI50 measured complete local operations on the original wide
+participant and on its proposed 160-column interval. Each layout passed
+serial-row byte equivalence on its own original weights and routes.
+
+| Original layer and routed gate/up, down | Retained ordinary, F256 → F160 (µs) | Staged four-row verifier, F256 → F160 (µs) |
+| --- | ---: | ---: |
+| L1 Q4_K, Q5_1 | 69.854 → 62.822 | 212.350 → 178.703 |
+| L2 Q5_K, Q8_0 | 71.419 → 65.522 | 256.133 → 231.298 |
+| L4 Q4_K, Q8_0 | 68.779 → 60.322 | 209.851 → 174.223 |
+
+The other three participants gain 32 columns each under the proposed layout.
+The complete four-card measurement must account for those increases, peer
+waits, and any change in routing caused by regrouping the FP32 partial sums.
+Each layout needs an independent frozen-history accuracy panel and an ordinary
+generation control for its own MTP output.
+
+Ordinary review attention also illustrates the importance of measuring across
+participants. The union across GPUs is 0.738 ms/token for Llaminar and 0.598
+for Castagna. Attention was the only active kernel category for 0.565 and
+0.008 ms/token respectively. In Castagna, attention overlapped peer pushes
+alone for 0.337 ms/token. GPU intervals cannot distinguish a peer kernel
+moving useful data from one waiting for an arrival.
 
 ## Reproduction
 
@@ -190,6 +259,25 @@ flock -x "$M/grouped-mtp-suite.lock" bash "$X/run-phases.sh" execute replay-01
 ```
 
 The clean pre-reboot evidence is under `$X/quartet-r1-fixed3-{control,phase}`.
-The matching ordinary arm is `$X/quartet-r1-off`. The next measurements are
-the full-model grouped FFN A/B, native attribution on both prompts and the
-dynamic control/treatment pair. Use fresh same-boot controls after a reboot.
+The matching ordinary arm is `$X/quartet-r1-off`. The resumed dynamic
+comparison used `$X/boot3-r1-{off,dynamic-control,dynamic-phase}`.
+The six measured generations and five verifier-work counters matched their
+controls. Use fresh same-boot controls after a reboot.
+
+The repository analyzer reads the original ROCProfiler database, measured
+verification count and authenticated physical PCI admission from each window.
+It derives the final prefill and target graph boundaries directly from native
+dispatches. Supply the matching per-PCI ordered source inventory for the run.
+
+```bash
+F=/tmp/qfn-mi50-grouped-ffn-frontier/quartet
+layout=/tmp/qfn-mi50-ffn-other-sol62/per-pci-mapping.json
+analyze=tests/v2/performance/kernels/qwen4exp/ffn_arrivals.py
+python3 "$analyze" "$D/quartet-r1-fixed3-trace" "$layout"
+python3 "$analyze" "$F/native-k4-control-review512" "$layout"
+python3 "$analyze" "$F/native-k4-treatment-review512" "$layout"
+```
+
+The F160 component results, matched F256 measurements and harness commands
+are in `/tmp/qfn-mi50-f160-sol62/REPORT.md`. Full-model timing and the
+frozen-history panel for the equal-width layout are pending.

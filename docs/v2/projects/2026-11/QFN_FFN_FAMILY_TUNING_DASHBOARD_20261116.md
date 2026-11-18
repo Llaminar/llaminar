@@ -27,20 +27,26 @@ for code. Each engine repeated its own ordinary histories exactly.
 | MTP mode | Review prefill / decode tok/s | Code prefill / decode tok/s | Matches own ordinary histories |
 | --- | ---: | ---: | --- |
 | Llaminar grouped verifier, fixed 3 including three follow-up changes | 1002.74 / 122.94 | 970.94 / 100.20 | 6/6 |
-| Llaminar grouped verifier updates, dynamic | 1002.89 / 116.99 | 970.22 / 95.08 | 6/6 |
+| Llaminar grouped verifier, dynamic including three follow-up changes | 1001.90 / 119.30 | 969.79 / 97.02 | 6/6 |
 | Castagna fixed 3, quiet repeat | 785.74 / 117.62 | 892.87 / 108.39 | 0/6 |
 
 Register top-K, short-context indexer fusion and vector GDN accepted-state
 publication raised fixed-depth decode from 119.20 to 122.94 tok/s on review
 and from 97.96 to 100.20 on code. The six same-executable generations and
 their MTP work matched exactly. The new candidate leads the quiet fork on
-review by 4.53% and trails on code by 7.55%. Dynamic figures above are for
-the preceding verifier configuration. Its follow-up was interrupted by reboot.
+review by 4.53% and trails on code by 7.55%. Dynamic decode rose from 115.85 to 119.30 on review and 94.23 to 97.02
+on code. All six generations retained the same MTP work.
 On review the preceding Llaminar verifier took 25.06 ms versus
 16.97 ms in Castagna, including peer work. The HC, projection, routing and
 expert subtotal accounts for 6.61 ms of the remaining 8.09 ms. Draft
-prediction is close at 0.988 versus 0.977 ms per proposed token. The grouped
-FFN is the next controlled full-model comparison.
+prediction is close at 0.988 versus 0.977 ms per proposed token. In every
+one of the 3,552 aligned layer/round comparisons the 256-column expert shard
+finished last, typically 38 µs after the last 128-column shard. The narrow-only
+FFN fusion saved 1.76–1.91 ms of device work per card per verification,
+while whole-model throughput changed by less than 0.4% on its initial pair. Equalizing the routed widths at 160 columns reduced local
+verifier time on the former wide participant by 25–36 µs across all three
+original format pairs. The whole-model four-card throughput and frozen-history
+accuracy checks are pending.
 [Phase measurements, run identities and commands](QFN_MI50_STAGE_COMPARISON_20261118.md)
 
 The current ordinary decode trace covers all 255 post-prefill review tokens.
