@@ -195,6 +195,70 @@ void rocm_gdn_dense_compact_accepted_prefix_kernel(llaminar2::gdn::GDNDenseCompa
         if (mirror) mirror[index] = state;
     }
 }
+/** @brief Publish a QFN ValueMajor tile of independent four-key packets.
+ *
+ * Every group must authenticate all twelve original head owners before any
+ * write. The producer completion event orders every immutable checkpoint and
+ * correction read. A negative flattened row preserves both output images.
+ * @param p Validated single-request compact transaction and ordered destinations.
+ */
+__global__ __launch_bounds__(128)
+void rocm_gdn_dense_compact_accepted_prefix_kernel_vector4(
+    llaminar2::gdn::GDNDenseCompactAcceptedPrefixInput p)
+{
+    using namespace llaminar2::gdn;
+    constexpr int heads = 12, key_width = 128, value_width = 128;
+    constexpr int matrix = key_width * value_width, tile_elements = 2048;
+    const auto& t = p.transaction;
+    const auto& g = t.geometry;
+    const int observed = __builtin_amdgcn_readfirstlane(*p.selection.data());
+    const int live = int(__float_as_uint(t.storage[g.published_rows_word]));
+    if (threadIdx.x < heads)
+    {
+        const auto head = rocm_dense_compact_publication(
+            t.storage + std::size_t(threadIdx.x) * g.headStrideFloats());
+        if (!g.validPublication(head, t.generation, t.layout, t.arithmetic) ||
+            head.published_rows != unsigned(live)) __builtin_trap();
+    }
+    GDNDenseAcceptedSelectionResult action;
+    if (!p.selection.resolveObserved(0, live, observed, action)) __builtin_trap();
+    __syncthreads();
+    if (action.action() == GDNDenseAcceptedSelectionAction::NoOp) return;
+
+    GDNDenseCompactSelection selection{};
+    if (!g.selectForLiveRows(live, int(action.acceptedCount()), selection)) __builtin_trap();
+    const auto* source = t.storage + std::size_t(blockIdx.x) * g.headStrideFloats();
+    const auto* base = source + g.checkpointOffsetFloats() +
+        selection.checkpoint * g.checkpointStrideFloats();
+    auto* dst = p.destination_state + blockIdx.x * matrix;
+    auto* mirror = p.request_zero_mirror.destination();
+    if (mirror) mirror += blockIdx.x * matrix;
+    const auto begin = blockIdx.y * tile_elements + 4 * threadIdx.x;
+    const auto limit = (blockIdx.y + 1) * tile_elements;
+    const auto first = selection.first_record;
+    const auto last = first + selection.update_count;
+    for (auto index = begin; index < limit; index += 4 * blockDim.x)
+    {
+        // Each packet has one value and four independent keys. Reusing the
+        // common decay and correction does not change each key's update order.
+        const int key = int(index % key_width);
+        const int value = int(index / key_width);
+        float4 state = *reinterpret_cast<const float4 *>(base + index);
+        for (auto row = first; row < last; ++row)
+        {
+            const float* record = source + g.recordsOffsetFloats() + row * g.recordStrideFloats();
+            const float decay = record[key_width + value_width];
+            const float delta = record[key_width + value];
+            const float4 keys = *reinterpret_cast<const float4 *>(record + key);
+            state.x = rocm_dense_compact_apply(state.x, decay, delta, keys.x);
+            state.y = rocm_dense_compact_apply(state.y, decay, delta, keys.y);
+            state.z = rocm_dense_compact_apply(state.z, decay, delta, keys.z);
+            state.w = rocm_dense_compact_apply(state.w, decay, delta, keys.w);
+        }
+        *reinterpret_cast<float4 *>(dst + index) = state;
+        if (mirror) *reinterpret_cast<float4 *>(mirror + index) = state;
+    }
+}
 } // namespace
 
 namespace llaminar2::gdn
@@ -263,6 +327,18 @@ bool launchROCmDenseCompactAcceptedPrefix(const GDNDenseCompactAcceptedPrefixInp
     if (reinterpret_cast<std::uintptr_t>(stream) <= 2 || !validROCmDenseCompactAcceptedPrefixStorage(p))
         return false;
     const auto &g = p.transaction.geometry;
+    const auto address = reinterpret_cast<std::uintptr_t>(p.destination_state) |
+        reinterpret_cast<std::uintptr_t>(p.request_zero_mirror.destination());
+    if (g.requests() == 1 && g.heads() == 12 && g.keyWidth() == 128 && g.valueWidth() == 128 &&
+        g.rowsPerRequest() >= 2 && g.rowsPerRequest() <= 8 &&
+        g.retentionProgram().mode == GDNDenseRetentionMode::ExactCorrections &&
+        p.transaction.layout == GDNRecurrenceStateLayout::ValueMajorKeyContiguous &&
+        address % alignof(float4) == 0 && qfnGroupedGDNAcceptedVectorExperiment())
+    {
+        hipLaunchKernelGGL(rocm_gdn_dense_compact_accepted_prefix_kernel_vector4,
+            dim3(12, 8), dim3(128), 0, static_cast<hipStream_t>(stream), p);
+        return hipGetLastError() == hipSuccess;
+    }
     const auto tiles = g.matrixTileCount(kROCmDenseCompactPublisherTileElements);
     if (!tiles || tiles > 65535) return false;
     hipLaunchKernelGGL(rocm_gdn_dense_compact_accepted_prefix_kernel,

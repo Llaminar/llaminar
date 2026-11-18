@@ -97,6 +97,20 @@ namespace llaminar2
         return enabled;
     }
 
+    /** @brief Select the aligned ROCm QFN accepted-state publisher at capture.
+     * @return Whether the explicit vector publication experiment is enabled.
+     * @throws std::invalid_argument For values other than 0 or 1. */
+    inline bool qfnGroupedGDNAcceptedVectorExperiment()
+    {
+        static const bool enabled = [] {
+            const char* mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_GDN_ACCEPTED_VECTOR4");
+            if (!mode || std::strcmp(mode, "0") == 0) return false;
+            if (std::strcmp(mode, "1") == 0) return true;
+            throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_GDN_ACCEPTED_VECTOR4 accepts 0 or 1");
+        }();
+        return enabled;
+    }
+
     /**
      * @brief Tracks whether selected environment variables were present at the last reload.
      *

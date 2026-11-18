@@ -21649,6 +21649,13 @@ if(HAVE_ROCM)
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;GatedDeltaNet;ShortConv;GraphCapture;ByteExact;Ownership;Regression"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
+    add_v2_test(V2_Integration_ROCmGDNAcceptedVectorPublicationReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+            --gtest_filter=Test__ROCmGDNPaddedRealLength.QFNAcceptedVectorPublication:Test__ROCmGDNPaddedRealLength.QFNAcceptedVectorUnalignedOutputs
+            --gtest_brief=1
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GatedDeltaNet;GraphCapture;ByteExact;MTP;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0;LLAMINAR_QFN_ROCM_GROUPED_GDN_ACCEPTED_VECTOR4=1")
     add_v2_test(V2_Integration_ROCmGDNValueMajorGrouped
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
             --gtest_filter=Test__ROCmGDNPaddedRealLength.ValueMajorProductionGroupedAndAlignmentBytes
@@ -38422,6 +38429,9 @@ add_v2_test(V2_Integration_MoEOverlayInferenceEpochRoster
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayInferenceEpochRoster)
 
+if(TEST V2_Integration_ROCmGDNAcceptedVectorPublicationReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGDNAcceptedVectorPublicationReplay)
+endif()
 if(TEST V2_Integration_GroupedVerifierRows_ROCm_HCDownLongK)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedVerifierRows_ROCm_HCDownLongK)
 endif()
