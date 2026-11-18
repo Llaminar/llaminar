@@ -4756,6 +4756,17 @@ if(TEST V2_Integration_HTTPDriverBusyLogDrain)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HTTPDriverBusyLogDrain)
 endif()
 
+# Observer retirement requires the visible same-boot journal, independent of storage writeback.
+add_v2_test(V2_Integration_HTTPDriverFinalJournalVisibility
+    COMMAND ${Python3_EXECUTABLE}
+            ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_gpu_driver_diagnostics.py
+            GPUDriverWindowTests.test_final_journal_visibility_does_not_wait_for_storage_sync
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;E2E;DriverHealth;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+if(TEST V2_Integration_HTTPDriverFinalJournalVisibility)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HTTPDriverFinalJournalVisibility)
+endif()
+
 # Exercise the actual Python process-group deadline consumer before HTTP cells.
 add_v2_test(V2_Integration_HTTPCellDeadline
     COMMAND ${Python3_EXECUTABLE}
