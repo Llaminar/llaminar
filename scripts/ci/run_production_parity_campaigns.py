@@ -1037,7 +1037,7 @@ def preflight_optional_hardware_requirements(
         context_cases = [label.removeprefix("MaximumContext") for label in row.labels
                          if label.startswith("MaximumContext")]
         if "HardwareOptional" not in row.labels:
-            if context_cases or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair", "LocalHostDevices", "ROCmHostCall"} or isa_labels or stage_labels or rank_labels or any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels):
+            if context_cases or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair", "LocalHostDevices", "ROCmHostCall", "IndependentNUMAReporters", "NUMALocalOrdinal0"} or isa_labels or stage_labels or rank_labels or any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels):
                 raise RuntimeError("optional ISA/stage labels require HardwareOptional: " + row.name)
             continue
         device_labels = sorted(label for label in row.labels if label.startswith("Devices"))
@@ -1048,13 +1048,17 @@ def preflight_optional_hardware_requirements(
             raise RuntimeError("malformed optional native geometry: " + row.name)
         backends = row.labels & {"CUDA", "ROCm"}
         local_host = "LocalHostDevices" in row.labels
+        independent_reporters = "IndependentNUMAReporters" in row.labels
+        if independent_reporters and (backends != {"CUDA", "ROCm"} or "DistinctNUMARanks" in row.labels):
+            raise RuntimeError("independent reporters require both native families: " + row.name)
         if local_host and (isa_labels or stage_labels or rank_labels or
-                           row.labels & {"DistinctNUMARanks", "DirectedPeerEdge", "NoDirectedPeerPair"}):
+                           row.labels & {"DistinctNUMARanks", "DirectedPeerEdge", "NoDirectedPeerPair",
+                                         "IndependentNUMAReporters", "NUMALocalOrdinal0"}):
             raise RuntimeError("local device counts cannot replace a topology contract: " + row.name)
         family_labels = sorted(label for label in row.labels
                                if label.startswith(("CUDADevices", "ROCmDevices")))
         if family_labels:
-            if ("ROCmHostCall" in row.labels or context_cases or backends != {"CUDA", "ROCm"} or len(family_labels) != 2
+            if (row.labels & {"ROCmHostCall", "NUMALocalOrdinal0"} or context_cases or backends != {"CUDA", "ROCm"} or len(family_labels) != 2
                     or len(device_labels) != 1 or isa_labels or stage_labels or rank_labels or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"}
                     or any(re.fullmatch(r"(?:CUDA|ROCm)Devices[1-9][0-9]*", label) is None for label in family_labels)):
                 raise RuntimeError("ambiguous optional mixed-family geometry: " + row.name)
@@ -1062,8 +1066,12 @@ def preflight_optional_hardware_requirements(
                        for label in family_labels}
             if set(degrees) != {"cuda", "rocm"} or sum(degrees.values()) != int(device_labels[0][7:]):
                 raise RuntimeError("inconsistent optional mixed-family geometry: " + row.name)
-            requirement = {"backend_degrees": degrees, "mpi_ranks": row.mpi_ranks,
-                "locality": "local-host" if local_host else "two-distinct-numa-local-ranks" if "DistinctNUMARanks" in row.labels
+            # NO_MPI runs a single process that can own both local devices.
+            # Keep rank-qualified geometries tied to their actual MPI launch.
+            ranks = 1 if local_host and row.mpi_ranks is None else row.mpi_ranks
+            requirement = {"backend_degrees": degrees, "mpi_ranks": ranks,
+                "locality": "local-host" if local_host else "independent-numa-reporters" if independent_reporters
+                            else "two-distinct-numa-local-ranks" if "DistinctNUMARanks" in row.labels
                             else "original-numa-local-rank"}
             try:
                 validate_optional_native_cohort_requirement(requirement)
@@ -1079,6 +1087,8 @@ def preflight_optional_hardware_requirements(
         try:
             requirement = {"backend": next(iter(backends)).lower(), "degree": int(device_labels[0][7:]),
                 "locality": "local-host" if local_host else "two-distinct-numa-local-ranks" if distinct_ranks else "original-numa-local-rank"}
+            if "NUMALocalOrdinal0" in row.labels:
+                requirement["ordinal"] = 0
             if "ROCmHostCall" in row.labels:
                 requirement["requires_host_native_atomics"] = True
             if context_cases:

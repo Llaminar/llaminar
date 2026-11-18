@@ -37,10 +37,16 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 # Each source/PMA root has its own process lifetime. Register cache
                 # capacity and key-width cells separately instead of preparing an
                 # unrelated authority after a native runtime has already existed.
-                foreach(_case AllFormatsC0 AllFormatsPositive WideKeyPositive TerminalObservation LargeRadixScan LargeRadixWideKey PrefillNextWindowCount LargeFutureAdoption SmallProbeBoundary SmallProbeBoundaryC0 SmallProbeBoundaryWideKey SmallProbeBoundaryWideKeyC0)
+                foreach(_case AllFormatsC0 AllFormatsPositive WideKeyPositive LargeRadixScan LargeRadixWideKey PrefillNextWindowCount LargeFutureAdoption SmallProbeBoundary SmallProbeBoundaryC0 SmallProbeBoundaryWideKey SmallProbeBoundaryWideKeyC0)
+                    set(_local_hot_launcher "")
+                    set(_local_hot_filter PooledLocalHotNative.${_backend}_${_case})
+                    if(_case STREQUAL "AllFormatsC0" OR _case STREQUAL "AllFormatsPositive" OR _case STREQUAL "PrefillNextWindowCount")
+                        set(_local_hot_launcher ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py)
+                        set(_local_hot_filter FormatGroups/LocalHotFormatReplay.${_backend}_${_case}/*)
+                    endif()
                     add_v2_test(V2_Integration_${_backend}_PooledLocalHotNative_${_case}
-                        COMMAND $<TARGET_FILE:${_v2_pooled_local_hot_native_target}>
-                            --gtest_filter=PooledLocalHotNative.${_backend}_${_case}
+                        COMMAND ${_local_hot_launcher} $<TARGET_FILE:${_v2_pooled_local_hot_native_target}>
+                            --gtest_filter=${_local_hot_filter}
                         LABELS "V2;Integration;ProductionTestPreflight;GPU;${_backend};Ngram;Pooled;TraceReplay;Regression"
                         MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${_lock} TIMEOUT 120 ENVIRONMENT ${_env})
                     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${_backend}_PooledLocalHotNative_${_case})

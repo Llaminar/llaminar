@@ -1457,6 +1457,32 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertFalse(campaigns.preflight_hardware_qualification(
             (local_name, remote_name), requirements, observed)["selected"])
 
+    def test_original_gpu_bootstrap_address_and_independent_reporters(self):
+        """A visible peer cannot supply ordinal zero's identity; independent reporters may share a NUMA node."""
+        lane = campaigns.PreflightExecutionLane.EXCLUSIVE
+        bootstrap = campaigns.PreflightRegistration("V2_Integration_Bootstrap", frozenset(
+            ("CUDA", "HardwareOptional", "Devices1", "NUMALocalOrdinal0")), 1, lane, 1)
+        reporters = campaigns.PreflightRegistration("V2_Integration_Reporters", frozenset(
+            ("CUDA", "ROCm", "HardwareOptional", "Devices2", "CUDADevices1", "ROCmDevices1",
+             "IndependentNUMAReporters")), 3, lane, 2)
+        requirements = campaigns.preflight_optional_hardware_requirements((bootstrap, reporters))
+        for cuda, rocm, selected in ((-1, -1, []), (-1, 11, ["V2_Integration_Reporters"]),
+                                     (7, 7, ["V2_Integration_Bootstrap", "V2_Integration_Reporters"]), (7, 11, ["V2_Integration_Bootstrap", "V2_Integration_Reporters"])):
+            hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+                {"backend": "cpu", "ordinal": 0, "numa_node": node} for node in (7, 11)] + [
+                {"backend": "cuda", "ordinal": 0, "numa_node": cuda},
+                {"backend": "cuda", "ordinal": 1, "numa_node": 7},
+                {"backend": "rocm", "ordinal": 0, "numa_node": rocm}]}
+            with self.subTest(cuda=cuda, rocm=rocm):
+                result = campaigns.preflight_hardware_qualification(("V2_Integration_Bootstrap", "V2_Integration_Reporters"), requirements, hardware)
+                self.assertEqual(result["selected"], selected)
+                if cuda == 7 and rocm == 11:
+                    # Two distinct active reporters consume both processes.
+                    busy = {**requirements["V2_Integration_Reporters"], "mpi_ranks": 2}
+                    self.assertIsNotNone(campaigns.optional_native_cohort_absence(busy, hardware))
+        with self.assertRaisesRegex(ValueError, "ordinal"):
+            campaigns.validate_optional_native_cohort_requirement({**requirements["V2_Integration_Bootstrap"], "ordinal": 1})
+
     def test_optional_rank_populations_preserve_distinct_original_owners(self):
         """Unequal native domains cannot borrow cards from another original NUMA owner."""
         name = "V2_Integration_OriginalUnequalRanks"
@@ -1480,6 +1506,20 @@ class ProductionParityCampaignTest(unittest.TestCase):
                             {"backend": "rocm", "degree": 6, "locality": "two-distinct-numa-local-ranks", "rank_sizes": [2, 4], "mpi_ranks": 1}):
             with self.assertRaises(ValueError):
                 campaigns.validate_optional_native_cohort_requirement(requirement)
+
+    def test_process_owned_cross_vendor_replay_uses_one_local_process(self):
+        """Direct cross-vendor runs qualify the real local pair with no MPI launcher."""
+        name = "V2_Integration_CrossVendorLocal"
+        args = ["llaminar_mpi_session", "--session-base", "/sessions", "--",
+                "python3", "run_cohort_original_cases.py", "/native", "--gtest_filter=Pair.*"]
+        labels = frozenset(("CUDA", "ROCm", "HardwareOptional", "LocalHostDevices",
+                            "Devices2", "CUDADevices1", "ROCmDevices1"))
+        ranks, lane = campaigns._preflight_execution_lane(name, labels, args, [])
+        self.assertIsNone(ranks)
+        row = campaigns.PreflightRegistration(name, labels, ranks, lane, 1)
+        self.assertEqual(campaigns.preflight_optional_hardware_requirements((row,))[name],
+                         {"locality": "local-host", "backend_degrees": {"cuda": 1, "rocm": 1},
+                          "mpi_ranks": 1})
 
     def test_optional_mixed_family_degrees_are_generic_and_fail_closed(self):
         """Positive per-family widths are exact; the legacy receipt arm remains strict."""

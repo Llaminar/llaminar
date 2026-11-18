@@ -72,13 +72,16 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
         if (set(requirement) != {"backend_degrees", "locality", "mpi_ranks"}
                 or not isinstance(degrees, dict) or set(degrees) != {"cuda", "rocm"}
                 or any(type(degree) is not int or degree <= 0 for degree in degrees.values())
-                or requirement["locality"] not in ("local-host", "original-numa-local-rank", "two-distinct-numa-local-ranks")
+                or requirement["locality"] not in ("local-host", "original-numa-local-rank",
+                                                    "two-distinct-numa-local-ranks", "independent-numa-reporters")
                 or type(requirement["mpi_ranks"]) is not int or requirement["mpi_ranks"] <= 0
-                or (requirement["locality"] == "two-distinct-numa-local-ranks" and requirement["mpi_ranks"] != 2)):
+                or (requirement["locality"] == "two-distinct-numa-local-ranks" and requirement["mpi_ranks"] != 2)
+                or (requirement["locality"] == "independent-numa-reporters" and
+                    (requirement["mpi_ranks"] < 2 or degrees != {"cuda": 1, "rocm": 1}))):
             raise ValueError("invalid optional mixed-family preflight geometry")
         return
     required = {"backend", "degree", "locality"}
-    optional = {"native_isa", "stage_sizes", "rank_sizes", "mpi_ranks", "peer_access", "maximum_context_case", "capacity_basis", "requires_host_native_atomics"}
+    optional = {"native_isa", "stage_sizes", "rank_sizes", "mpi_ranks", "peer_access", "maximum_context_case", "capacity_basis", "requires_host_native_atomics", "ordinal"}
     if (not isinstance(requirement, dict) or not required <= requirement.keys()
             or not requirement.keys() <= required | optional):
         raise ValueError("invalid optional preflight requirement")
@@ -87,6 +90,11 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
             or locality not in ("local-host", "original-numa-local-rank", "two-distinct-numa-local-ranks")
             or (locality == "two-distinct-numa-local-ranks" and degree != 2 and "rank_sizes" not in requirement)):
         raise ValueError("unsupported optional preflight geometry")
+    if "ordinal" in requirement:
+        if (set(requirement) != required | {"ordinal"} or locality != "original-numa-local-rank"
+                or type(requirement["ordinal"]) is not int or requirement["ordinal"] != 0 or degree != 1):
+            raise ValueError("invalid native bootstrap ordinal requirement")
+        return
     if "requires_host_native_atomics" in requirement:
         if (set(requirement) != required | {"requires_host_native_atomics"}
                 or requirement["requires_host_native_atomics"] is not True
@@ -207,16 +215,33 @@ def optional_native_cohort_absence(requirement: dict, hardware: dict) -> dict | 
                               if numa in cpu_nodes and len(ordinals) >= requirement["backend_degrees"][backend]}
                     for backend, groups in cohorts.items()}
         cuda_nodes, rocm_nodes = eligible["cuda"], eligible["rocm"]
-        legal_owners = (bool(cuda_nodes & rocm_nodes) if requirement["locality"] == "original-numa-local-rank"
-                        else any(cuda != rocm for cuda in cuda_nodes for rocm in rocm_nodes))
-        if legal_owners and len(cpu_nodes) >= requirement["mpi_ranks"]:
-            return None
+        # The reporter test launches one extra process. GPUs on the same or
+        # different CPU nodes can report; the remaining process must stay idle.
+        if requirement["locality"] == "independent-numa-reporters":
+            reporter_nodes = cuda_nodes | rocm_nodes
+            if cuda_nodes and rocm_nodes and len(reporter_nodes) < requirement["mpi_ranks"]:
+                return None
+        else:
+            legal_owners = (bool(cuda_nodes & rocm_nodes) if requirement["locality"] == "original-numa-local-rank"
+                            else any(cuda != rocm for cuda in cuda_nodes for rocm in rocm_nodes))
+            if legal_owners and len(cpu_nodes) >= requirement["mpi_ranks"]:
+                return None
         return {**absence, "observed_cpu_discovery_nodes": sorted(cpu_nodes),
                 "observed_family_numa_cohorts": {backend: [
                     {"numa_node": numa, "ordinals": sorted(groups[numa])} for numa in sorted(groups)]
                     for backend, groups in cohorts.items()},
                 "unknown_locality_ordinals": {backend: sorted(ordinals) for backend, ordinals in unknown.items()}}
     backend, degree, locality = (requirement[key] for key in ("backend", "degree", "locality"))
+    if "ordinal" in requirement:
+        # The command pins ordinal zero before bootstrap. Another visible
+        # card with a known locality cannot supply its missing owner.
+        device = observed.get((backend, requirement["ordinal"], -1))
+        cpu_nodes = {device["numa_node"] for address, device in observed.items()
+                     if address[0] == "cpu" and device["numa_node"] >= 0}
+        if device and device["numa_node"] in cpu_nodes:
+            return None
+        return {**absence, "observed_ordinal_numa": device["numa_node"] if device else None,
+                "observed_cpu_discovery_nodes": sorted(cpu_nodes)}
     if "stage_sizes" in requirement and "native_isa" in requirement:
         # This is the same observed selector used for QFN source qualification.
         # The request has no invented addresses; runtime still binds the exact

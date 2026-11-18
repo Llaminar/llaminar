@@ -521,11 +521,6 @@ void CrossVendorReadReplay::build(){
     });join();
     requireProvider(!boundary_->hasActiveInterval(),"Cold reset invented an active service interval");
 }
-// Each format retains three source graph executables and one owner executable
-// until process exit. Distribute independent original sources across processes
-// so an all-format sweep does not require all of their host reservations at once.
-constexpr unsigned kCrossVendorFormatGroups = 6;
-
 /**
  * @brief Replay complete original format trajectories at one explicit cache capacity.
  * @param sourceDevice Actual original continuation endpoint.
@@ -537,8 +532,8 @@ constexpr unsigned kCrossVendorFormatGroups = 6;
 void crossVendorReadFormats(DeviceId sourceDevice,DeviceId ownerDevice,std::uint32_t selectedSlots,
                             std::optional<unsigned> group = std::nullopt){
     requireProvider(selectedSlots==0 || selectedSlots==3,"All-format reader requires explicit C0 or positive geometry");
-    requireProvider(!group || *group < kCrossVendorFormatGroups, "Unknown cross-vendor format group");
-    const auto inGroup = [&](std::size_t index) { return !group || index % kCrossVendorFormatGroups == *group; };
+    const std::optional<PooledFormatReplayGroup> partition(group);
+    const auto inGroup = [&](std::size_t index) { return !partition || partition->includes(index); };
     if(!hasCPUBackend())initCPUBackend(-1);
     std::vector<CrossVendorReadReplaySpec> cases;std::size_t supported=0,unsupported=0;
     for(const auto& format:embeddingVerifierFormats()){

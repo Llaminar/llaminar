@@ -31,6 +31,7 @@
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <iostream>
+#include <set>
 #include <omp.h>
 
 using namespace llaminar2;
@@ -349,7 +350,23 @@ namespace
         if (mpi->is_root())
         {
             EXPECT_GT(prices, 0u);
-            EXPECT_GT(multi_device_prices, 0u);
+            // Ranks sharing a CPU NUMA node are aliases for the same physical
+            // endpoint. A CPU-only request on that node must price only serial
+            // candidates, even when two or three MPI ranks join preparation.
+            std::set<std::pair<int, int>> cpu_endpoints;
+            for (const auto &rank : inventory->ranks)
+            {
+                if (rank.cpu.numa_node >= 0)
+                    cpu_endpoints.emplace(rank.node_id, rank.cpu.numa_node);
+                else
+                    for (const auto &socket : rank.cpu_socket_info)
+                        if (rankOwnsCPUNode(rank, socket.numa_node))
+                            cpu_endpoints.emplace(rank.node_id, socket.numa_node);
+            }
+            if (backend == DeviceType::CPU && cpu_endpoints.size() == 1)
+                EXPECT_EQ(multi_device_prices, 0u);
+            else
+                EXPECT_GT(multi_device_prices, 0u);
             if (backend != DeviceType::CPU) EXPECT_GT(overlay_prices, 0u);
         }
         else EXPECT_EQ(prices, 0u);
