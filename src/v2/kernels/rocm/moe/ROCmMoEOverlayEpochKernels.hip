@@ -5,7 +5,9 @@
  * This is deliberately symmetric with the CUDA implementation.  Inference
  * acquires one immutable placement ticket, maintenance prepares and publishes
  * the alternate bank on its own explicit stream, and retirement polls the
- * device grace period without blocking an inference stream.
+ * device grace period without blocking an inference stream. The status owner
+ * publishes rejected operations, selectors, banks and epochs directly. Device
+ * printf would require PCIe host atomics even on successful graph replays.
  */
 
 #include "ROCmMoEOverlayEpochKernels.h"
@@ -166,95 +168,6 @@ namespace
         status->observed_state = observed_state;
         __threadfence();
         atomicStore32(&status->code, rawCode(code));
-    }
-
-    /**
-     * @brief Emit a failure-only local epoch snapshot before downstream work aborts.
-     *
-     * This mirrors CUDA's fatal-path witness. Successful graph replays never
-     * execute a device printf; a rejected boundary reports the exact selector,
-     * bank state, and reader ownership that caused the retained transaction to
-     * become invalid.
-     */
-    __device__ __forceinline__ void reportBoundaryFailure(
-        const char *reason,
-        const DeviceMoEOverlayEpochControl *control,
-        const DeviceMoEOverlayEpochTicket *ticket,
-        std::uint64_t required_epoch = 0u)
-    {
-        printf("overlay_epoch_boundary_failure reason=%s ticket=%p "
-               "ticket_epoch=%llu ticket_selector=%llu required_epoch=%llu "
-               "published_selector=%llu bank0_epoch=%llu bank1_epoch=%llu "
-               "bank0_readers=%llu bank1_readers=%llu "
-               "bank0_state=%u bank1_state=%u acquisitions=%llu\n",
-               reason,
-               ticket,
-               static_cast<unsigned long long>(ticket->epoch),
-               static_cast<unsigned long long>(ticket->selector),
-               static_cast<unsigned long long>(required_epoch),
-               static_cast<unsigned long long>(
-                   atomicLoad64(&control->published_selector)),
-               static_cast<unsigned long long>(
-                   atomicLoad64(&control->bank_epochs[0])),
-               static_cast<unsigned long long>(
-                   atomicLoad64(&control->bank_epochs[1])),
-               static_cast<unsigned long long>(
-                   atomicLoad64(&control->bank_readers[0])),
-               static_cast<unsigned long long>(
-                   atomicLoad64(&control->bank_readers[1])),
-               atomicLoad32(&control->bank_states[0]),
-               atomicLoad32(&control->bank_states[1]),
-               static_cast<unsigned long long>(
-                   atomicLoad64(&control->acquisitions_in_flight)));
-    }
-
-    /**
-     * @brief Emit the mapped admission identity when epoch resolution fails.
-     *
-     * The admission record is the sole cross-device authority. Reading it only
-     * on the fatal branch distinguishes malformed identity from a sequence
-     * disagreement without adding a host shadow, transfer, or synchronization
-     * to a successful inference transaction.
-     */
-    __device__ __forceinline__ void reportAdmissionFailure(
-        DeviceMoEOverlayEpochAdmissionBarrierBinding barrier,
-        const std::uint64_t *external_admission_epoch,
-        std::uint64_t required_epoch)
-    {
-        constexpr std::uint32_t kParticipantCount =
-            llaminar2::kMoEOverlayDeviceControllerInferenceEpochMaxParticipants;
-        const auto *const record = barrier.record;
-        const std::uint64_t arrival =
-            record && barrier.participant_id < kParticipantCount
-                ? systemAcquire64(
-                      &record->arrival_sequence[barrier.participant_id])
-                : 0u;
-        printf("overlay_epoch_admission_failure participant=%u record=%p "
-               "external=%p external_epoch=%llu required_epoch=%llu "
-               "magic=%u version=%u mask=0x%x publisher=%u "
-               "fingerprint=%llu frozen_epoch=%llu publication=%llu "
-               "arrival=%llu\n",
-               barrier.participant_id,
-               record,
-               external_admission_epoch,
-               static_cast<unsigned long long>(
-                   external_admission_epoch
-                       ? systemAcquire64(external_admission_epoch)
-                       : 0u),
-               static_cast<unsigned long long>(required_epoch),
-               record ? record->magic : 0u,
-               record ? record->version : 0u,
-               record ? record->participant_mask : 0u,
-               record ? record->publisher_participant_id : 0u,
-               static_cast<unsigned long long>(
-                   record ? systemAcquire64(&record->topology_fingerprint)
-                          : 0u),
-               static_cast<unsigned long long>(
-                   record ? systemAcquire64(&record->epoch) : 0u),
-               static_cast<unsigned long long>(
-                   record ? systemAcquire64(&record->publication_sequence)
-                          : 0u),
-               static_cast<unsigned long long>(arrival));
     }
 
     /** @return Bank retaining @p epoch, or the explicit invalid sentinel. */
@@ -549,10 +462,7 @@ namespace
         finishStatus(status,operation,success?DeviceMoEOverlayEpochStatusCode::Success:code,
             epoch,selector,selector?selectorBank(selector):kInvalidBank,0u);
         if(!success) {
-            printf("overlay_finite_parent_failure action=%u code=%u state=%u children=%llu\n",
-                static_cast<unsigned>(action),static_cast<unsigned>(code),parent?atomicLoad32(&parent->state):UINT32_MAX,
-                static_cast<unsigned long long>(parent?atomicLoad64(&parent->children):0u));
-            __builtin_trap();
+            __builtin_verbose_trap("Llaminar MoE", "finite parent epoch operation failed");
         }
     }
 
@@ -580,8 +490,7 @@ namespace
         /* A live ticket here means the preceding request failed to release. */
         if (ticket->epoch != 0u || ticket->selector != 0u || ticket->parent_generation != 0u || ticket->parent_sequence != 0u)
         {
-            reportBoundaryFailure(
-                "acquire_live_ticket", control, ticket);
+
             finishStatus(
                 status,
                 DeviceMoEOverlayEpochOperation::Acquire,
@@ -607,8 +516,7 @@ namespace
                 reinterpret_cast<unsigned long long *>(
                 &control->acquisitions_in_flight),
                 ~0ull);
-            reportBoundaryFailure(
-                "acquire_invalid_selector", control, ticket);
+
             finishStatus(
                 status,
                 DeviceMoEOverlayEpochOperation::Acquire,
@@ -678,15 +586,8 @@ namespace
                 reinterpret_cast<unsigned long long *>(
                 &control->acquisitions_in_flight),
                 ~0ull);
-            reportAdmissionFailure(
-                admission_barrier,
-                external_admission_epoch,
-                required_epoch);
-            reportBoundaryFailure(
-                "acquire_unresolved_epoch",
-                control,
-                ticket,
-                required_epoch);
+
+
             finishStatus(
                 status,
                 DeviceMoEOverlayEpochOperation::Acquire,
@@ -718,11 +619,7 @@ namespace
                 reinterpret_cast<unsigned long long *>(
                 &control->acquisitions_in_flight),
                 ~0ull);
-            reportBoundaryFailure(
-                "acquire_unpublished_bank",
-                control,
-                ticket,
-                required_epoch);
+
             finishStatus(
                 status,
                 DeviceMoEOverlayEpochOperation::Acquire,
@@ -746,11 +643,7 @@ namespace
                 reinterpret_cast<unsigned long long *>(
                 &control->acquisitions_in_flight),
                 ~0ull);
-            reportBoundaryFailure(
-                "acquire_generation_overflow",
-                control,
-                ticket,
-                required_epoch);
+
             finishStatus(
                 status,
                 DeviceMoEOverlayEpochOperation::Acquire,
@@ -857,8 +750,7 @@ namespace
                 atomicAdd(reinterpret_cast<unsigned long long*>(&parent->children),1ull);
                 atomicAdd(reinterpret_cast<unsigned long long*>(&control->acquisitions_in_flight),~0ull);
             }
-            reportBoundaryFailure(
-                "release_invalid_ticket", control, ticket, epoch);
+
             finishStatus(
                 status,
                 DeviceMoEOverlayEpochOperation::Release,
@@ -915,8 +807,6 @@ namespace
             selector,
             bank,
             atomicLoad32(&control->bank_states[bank]));
-        reportBoundaryFailure(
-            "release_reader_underflow", control, ticket, epoch);
     }
 
     /** @brief Claim the non-published empty bank for background preparation. */

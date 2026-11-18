@@ -140,10 +140,12 @@ namespace llaminar2::test
                         for (int expert = 0; expert < experts; ++expert)
                             input[row * experts + expert] = replay % 2 == 0 ? 0.f :
                                 std::sin(float(expert * 17 + row * 31 + replay));
-                    // Never leave the upper half unexercised, even for a tied
-                    // row: the final expert wins each transaction and histogram.
+                    // Alternate the winning expert on the same retained graph.
+                    // A dropped device launch or stale captured result must be
+                    // observable even when both routing outputs still agree.
+                    const int winner = replay % 2 == 0 ? experts - 1 : 0;
                     for (int row = 0; row < rows; ++row)
-                        input[row * experts + experts - 1] = 8.f;
+                        input[row * experts + winner] = 8.f;
                     std::fill_n(runtime->decode_histogram, kDeviceMoEMaxExperts, uint64_t{0});
                     std::fill_n(runtime->decode_local_histogram, kDeviceMoEMaxExperts, uint64_t{0});
                     ASSERT_TRUE(backend->hostToDeviceOnStream(serial_logits->gpu_data_ptr(), input.data(), input.size() * sizeof(float), device.ordinal, stream));
@@ -162,9 +164,9 @@ namespace llaminar2::test
                     for (size_t route = 0; route < route_count; ++route)
                         EXPECT_EQ(std::bit_cast<uint32_t>(weights[route]), std::bit_cast<uint32_t>(grouped_w[route])) << route;
                     for (int row = 0; row < rows; ++row)
-                        EXPECT_EQ(ids[row * top_k], experts - 1);
-                    EXPECT_EQ(after->decode_histogram[experts - 1], rows);
-                    EXPECT_EQ(after->decode_local_histogram[experts - 1], rows);
+                        EXPECT_EQ(ids[row * top_k], winner);
+                    EXPECT_EQ(after->decode_histogram[winner], rows);
+                    EXPECT_EQ(after->decode_local_histogram[winner], rows);
                     EXPECT_EQ(std::accumulate(std::begin(after->decode_histogram), std::end(after->decode_histogram), uint64_t{0}), route_count);
                 }
             }

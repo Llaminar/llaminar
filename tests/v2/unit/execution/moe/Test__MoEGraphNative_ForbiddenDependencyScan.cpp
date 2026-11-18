@@ -1855,12 +1855,8 @@ namespace llaminar2::test
                 requirement.find("runtime_execution_bank(runtime)"),
                 std::string::npos)
                 << backend << " must resolve the exact ticket-selected bank";
-            const std::string fatal_call =
-                std::string_view(backend) == "CUDA"
-                    ? "FAIL_FAST_INCOMPLETE_LLEP_TRANSFER"
-                    : "fail_fast_incomplete_llep_transfer()";
             EXPECT_NE(
-                requirement.find(fatal_call),
+                requirement.find("FAIL_FAST_INCOMPLETE_LLEP_TRANSFER"),
                 std::string::npos)
                 << backend << " must make an invalid ticket fatal on device";
 
