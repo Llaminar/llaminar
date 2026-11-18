@@ -585,6 +585,139 @@ the same input IDs but generated different histories and verifier work.
 [Original per-trial counts and timings](/tmp/qfn-mi50-w-readers-model-gate/w-readers-r1-fixed3-summary.json)
 [Cross-engine work comparison](/tmp/qfn-mi50-w-readers-model-gate/w-readers-r1-staged-historical-fork.json)
 
+Dynamic MTP in the same two Release arms measured 116.077 → 116.221 tok/s on
+review and 94.817 → 94.641 on code. Paired prefill changed by less than 0.3%.
+The arms generated identical tokens and performed identical verifier work on
+each prompt. At fixed depth, a separate native capture found 192 gate/up and
+192 down reader nodes per GPU across four verifier graphs. The wider and
+narrower source shards both executed the selected reader. The paired captures
+retained the same peer-push count. [Dynamic per-trial results](/tmp/qfn-mi50-w-readers-model-gate/w-readers-r1-dynamic-summary.json)
+[Native node and width inventory](/tmp/qfn-mi50-w-readers-model-gate/w-readers-r1-qualified-native-pair.json)
+
+### Transferring the single-row loop to grouped verification
+
+The single-row F256/S192 HC/FFN checkpoint measured 69.62–69.72 µs on three
+runs. Its gate/up wave computes four output columns and sixteen independent
+K partitions. Each lane appends five K32 blocks in order. Only the eight
+packed dot operations *within* a K32 block are unrolled per projection. The
+fold obtains later partition values as it consumes them. The verifier instead
+works on sixteen columns and four partitions at a time across each wave,
+with four visits to cover the same sixteen partitions. Both layouts can
+produce identical serial sums. They differ in contiguous weight access,
+exchange instructions and register lifetimes.
+[Single-row contract and timings](QFN_MI50_RETAINED_HC_FFN.md)
+
+The gfx906 scalar and vector instructions explain an opportunity beyond
+integer dot throughput. In the closed single-row Q4 path, the gate role
+borrows its original descriptor fields before the K loop. The up role still
+has scalar field loads in the loop. Hidden codes and coefficients come from
+the block's already populated LDS panels. In the four-row Q4 path, vector
+loads fetch the routed plane pointers in the loop before their dependent
+payload and scale loads. Each active wave uses one acquired expert slot.
+Its plane pointers can therefore be captured in registers for the duration
+of that job. The acquisition must repeat when the launched graph sees a
+new bank epoch. Its immutable shared-expert descriptors arrive by value.
+
+| Complete captured four-row parent on MI50, µs | F128/S160 | F256/S160 |
+| --- | ---: | ---: |
+| Typed reader at `d50b74c9a` | 140.26 | 207.65 |
+| Physical codebook checks moved to publication | 142.77 | 210.84 |
+| Prepared width/partition arithmetic plus preceding change | 141.98 | 210.92 |
+| Paired packed gate/up words plus publication-time checks | 140.29 | 207.45 |
+
+Each value is the average of the two process medians from a mirrored run
+order on PCI ba. Each process timed 12 batches of 32 complete operations
+from the original QFN L1 source. All arms passed the native byte checks. In
+the routed Q4 inline-sum K32 loop, the paired reader reduces 32 static
+`v_dot4_i32_i8` instructions to 24, including eight for the shared activation
+sum. The same loop grows from seven to eleven static `s_waitcnt`
+instructions. These counts describe compiler output; they do not measure
+cycles spent stalled. The complete gate entry uses 62 VGPRs in the typed
+and paired variants, versus 84 in the width/partition variant. All three
+have zero private scratch. The paired reader showed no repeatable advantage
+over the typed program across both widths.
+[Mirrored timings and native receipt paths](/tmp/qfn-mi50-verifier-roofline/typed-verifier-abba.json)
+
+Borrowing both routed descriptors' payload, scale and minimum pointers once
+per wave was a larger improvement. On PCI 8c the complete Q4 parent took
+141.35 → 133.03 µs at F128 and 207.88 → 191.12 µs at F256. The treatment
+moved four scalar memory instructions before the K loop. In the inline-sum
+backedge it removed two vector four-word and two vector two-word loads and
+reduced static waits from eleven to eight. It allocated 70 VGPRs versus 62,
+with 104 SGPRs and zero private scratch in both. Static and deferred native
+replays passed on the original weights. This experimental build is separate
+from the four-card throughput run.
+An ordinary C++ field copy hoisted the same loads and used 86 VGPRs. It
+improved the parent by only 0.49% at F128 and 0.54% at F256.
+[Scalar and ordinary C++ field-borrow brackets](/tmp/qfn-mi50-q4-wave-field-borrow/RUN.md)
+
+The initial hand-written address helper sign-extended the low 32 bits
+returned by `readfirstlane`. The first experimental GPU run faulted and was
+excluded. Explicit unsigned halves preserve all 64 pointer bits. A fresh
+original control passed after the fault. The published bank can move between
+executions, so the wave must obtain its pointers again after each acquire.
+At F128 and F256, native replay relocated six actual planes over epochs 2,
+3 and 4, changing the selected bank 0 → 1 → 0. Poisoning the retired
+fixture allocations left serial byte equivalence intact.
+[F128 relocation receipt](/tmp/qfn-mi50-q4-wave-field-borrow/moved-scalar-r2-f128/result.json)
+[F256 relocation receipt](/tmp/qfn-mi50-q4-wave-field-borrow/moved-scalar-r2-f256/result.json)
+
+Changing who owns a Q8 output block produced opposite results at the two
+TP widths. Giving one wave all 32 columns kept SwiGLU values in registers
+through quantization. It removed the two per-tile CTA barriers, reduced LDS
+from 320 to 64 bytes and retained 62 VGPRs. The complete parent went from
+206.98 to 199.13 µs at F256 and from 140.31 to 162.13 µs at F128. For
+four live rows the new mapping supplies 85 and 45 workgroups respectively
+on the 60-CU MI50. That smaller grid is a possible contributor to the
+narrow-shard regression. A simpler owner-relative fold removed six static
+cross-lane permutes and seven static waits, but changed full time by less
+than 0.2% on either shard. Both experiments passed their serial byte checks.
+[Wave-local publication bracket](/tmp/qfn-mi50-verifier-roofline/wave-retry-abba.json)
+[Output-owner fold bracket](/tmp/qfn-mi50-verifier-roofline/owner-fold-pinned-abba.json)
+
+The matched Q4 experiment also tested computing the exact signed K32 sums
+in the existing router quantizer and publishing intermediate sums alongside
+the routed activation. That helps the previously measured equal-width fixed
+program. In this source-format program the complete F128/S160 parent took
+140.31 → 141.44 µs, and F256/S160 took 207.30 → 210.62 µs. The trace shows
+both arms executed five nodes and used their intended quantizer. In the wide
+shard, Down took 56.48 → 59.84 µs despite the cheaper dot expression. The
+source-format program continues to compute its sums inline.
+[Same-binary timing arms](/tmp/qfn-mi50-verifier-roofline/uneven-activation-abba.json)
+[Per-stage kernel inventory](/tmp/qfn-mi50-verifier-roofline/affine-c2/symbols.json)
+
+The fixed-format Down kernel provided a stronger transfer from single-row
+decode. Capture preparation certifies the original format, width and planes.
+The current grouped route publication still authenticates the acquired bank
+and epoch. The projection can then enter its native one-block-per-partition
+loop directly. On real F160 shards the isolated change took 146.33 → 143.89
+µs on L1, 162.25 → 148.28 µs on L2 and 151.07 → 136.69 µs on L4 for the
+whole captured operation. L2's Down dispatch alone fell from 48.0 to 34.4
+µs. All arms checked serial bytes and original expert routing.
+[Fixed-pitch measurements and stage attribution](/tmp/qfn-mi50-fixed-bank-proof/REPORT.md)
+
+With the separate Q5_K gate/up reader, specializing the pitch and original
+five-block partition increased register use from 70 to 110–111 VGPRs and
+still improved the complete parent at F128, F160 and F256. In the wide
+case, physical fetches stayed within 0.01% and VALU wave instructions fell
+3.75%. Both shipped architectures compiled with zero private scratch.
+These measurements make register lifetime and dependent loads worth tracking
+alongside allocation count. [Independent Q5_K receipts](/tmp/qfn-mi50-q5-fixed-span-c2/typed-w/REPORT.md)
+
+A Release combining the fixed Down change with the separate Q5_K pitch
+reader replayed both paths against the actual QFN weights on PCI c2.
+F128/S160 L1 in the fixed program measured 149.78 → 136.50 µs. F256/S160
+L2 in the source-format program measured 232.25 → 223.28 µs. Each bracket
+used fresh processes in control, treatment, treatment, control order. Source
+intervals were checked on every arm because the wide shard rotates by layer.
+The control was `d50b74c9a` and the combined core SHA256 was
+`2f2a80d37cf62422425c7380a1f0b7f3bbefe58a32c7c241a42697c36d254376`.
+All ten focused production-preflight registrations passed on this combined
+core. The two 160-column replays used private tmpfs for generated fixtures
+and the registered 120-second limit. They took 97.52 and 101.06 seconds.
+[Complete operation and byte-replay receipts](/tmp/qfn-mi50-verifier-roofline/combined-original-abba.json)
+[Registered native gates and ELF identities](/tmp/qfn-mi50-fixed-bank-proof/canonical-w/combined-r1/qualified.json)
+
 ## Reproduction
 
 The local evidence root for native phase attribution is

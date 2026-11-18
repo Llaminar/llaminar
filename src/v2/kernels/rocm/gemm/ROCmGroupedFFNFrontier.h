@@ -5,6 +5,7 @@
 #pragma once
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/MoEProjectionNumericalContract.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include "execution/moe/MoEGroupedPlanDemand.h"
 #include "backends/DeviceId.h"
@@ -30,6 +31,9 @@ inline constexpr std::size_t sharedGateBytes=capacity*sizeof(float);
 /** @brief Cold-selected routed width for the exact Q4_K/Q5_1 stage. */
 enum class RoutedGeometry : int { F128=128, F160=160 };
 inline constexpr int routedColumns(RoutedGeometry geometry) { return static_cast<int>(geometry); }
+
+/** @brief Physical output pitch of the measured original Q5_K gate/up reader. */
+enum class FixedQ5GatePitch : int { F128=128, F160=160, F256=256 };
 
 /** @brief Exact immutable reachable routed decoder pair. */
 enum class RoutedDecoder { Q4K_Q51, Q4K_Q80, Q5K_Q80 };
@@ -130,6 +134,38 @@ public:
     const auto& routedPartitions() const noexcept {return routedPartitions_;}
     /** @return Fixed gate, up and down partition counts for the immutable shared expert. */
     const auto& sharedPartitions() const noexcept {return sharedPartitions_;}
+    /**
+     * @brief Select the measured separate-reader Q5_K schedule after original source preparation.
+     * @param sharedWeights Immutable shared descriptors passed to the existing capture launcher.
+     * @return Measured pitch when every reachable role has the fixed physical reader and serial tree.
+     */
+    std::optional<FixedQ5GatePitch> fixedQ5GatePitch(
+        const std::array<DeviceNativeQuantisedMatrixDesc,3>& sharedWeights) const noexcept
+    {
+        const int pitch=routedColumns();
+        if((pitch!=128 && pitch!=160 && pitch!=256) || sharedColumns()!=160)return std::nullopt;
+        constexpr auto q5Id=native_quantised_formats::Q5_1.codebook_id;
+        constexpr auto q8Id=native_quantised_formats::Q8_0.codebook_id;
+        constexpr auto parts=MoEProjectionNumericalContract::ordered_k_partitions;
+        constexpr auto q5=nativeQuantisedCodebookMaskBit(q5Id);
+        constexpr auto q8=nativeQuantisedCodebookMaskBit(q8Id);
+        constexpr NativeQuantisedSourceIdentity q5k{native_quantised_formats::Q5_K.codebook_id,true,true};
+        const auto& masks=formats();
+        if(masks.routedGateUp.execution_codebook_mask!=q5 || masks.routedGateUp.policy_codebook_mask!=q5)
+            return std::nullopt;
+        for(unsigned role=0;role<2;++role) {
+            const auto& shared=sharedWeights[role];
+            if(routedSources()[role]!=q5k || routedPartitions_[role]!=parts ||
+               sharedPartitions_[role]!=parts || shared.n!=sharedColumns() || shared.k!=hidden ||
+               shared.codebook_id!=q8Id || !shared.source_identity_present ||
+               shared.source_codebook_id!=q8Id || shared.source_is_superblock ||
+               masks.shared[role].execution_codebook_mask!=q8 ||
+               masks.shared[role].policy_codebook_mask!=q8)
+                return std::nullopt;
+        }
+        return static_cast<FixedQ5GatePitch>(pitch);
+    }
+
     /** @return Whether the two immutable reduction trees admit the measured joint Q4_1 reader.
      * The physical Q5_1 reader was slower when paired on original Q5_K TP shards.
      * Check reachable encodings as well as counts so the graph can survive expert movement.
@@ -145,30 +181,31 @@ public:
     }
 };
 
+using Program=std::variant<MeasuredProgram,SourceFormatProgram>;
+
 /** @brief Capture receipt joining one program to the original prepared table layer. */
 class BoundSourceFormatProgram final {
-    SourceFormatProgram program_;
+    Program program_;
     DeviceMoELayerRuntime* runtime_;
     int ordinal_;
 
-    BoundSourceFormatProgram(const SourceFormatProgram& program,DeviceMoELayerRuntime* runtime,int ordinal)
+    BoundSourceFormatProgram(const Program& program,DeviceMoELayerRuntime* runtime,int ordinal)
         :program_(program),runtime_(runtime),ordinal_(ordinal) {}
 public:
     /** @brief Bind only through the original owning ROCm runtime table.
      * @throws std::invalid_argument If the layer or its original source disagrees with the program.
      */
     static BoundSourceFormatProgram prepare(DeviceMoERuntimeTable& table,int modelLayer,
-        const SourceFormatProgram& program);
+        const Program& program,
+        const std::array<DeviceNativeQuantisedMatrixDesc,3>& shared={});
     /** @return Whether both addresses and the admitted device identify the original layer. */
     bool matches(const DeviceMoELayerRuntime* runtime,int ordinal) const noexcept
     {
         return runtime_==runtime && ordinal_==ordinal;
     }
     /** @return The program admitted by that table's original sources. */
-    const SourceFormatProgram& program() const noexcept {return program_;}
+    const Program& program() const noexcept {return program_;}
 };
-
-using Program=std::variant<MeasuredProgram,SourceFormatProgram>;
 
 /** @return Participant-local routed intermediate width embedded in the two leaves. */
 inline int routedColumns(const Program& program)
@@ -307,7 +344,8 @@ struct Output {
  */
 bool launch(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDesc,3>& sharedWeights,
             const Output& output,int device,void* stream,const DirectBankInput& direct={},
-            RoutedGeometry geometry=RoutedGeometry::F128,RoutedDecoder decoder=RoutedDecoder::Q4K_Q51);
+            RoutedGeometry geometry=RoutedGeometry::F128,RoutedDecoder decoder=RoutedDecoder::Q4K_Q51,
+            const BoundSourceFormatProgram* bound=nullptr);
 
 /** @brief Record the counted native gate/up and down leaves for a sealed format declaration.
  * @param plan Original device-owned counts, router rows and reachable expert descriptors.

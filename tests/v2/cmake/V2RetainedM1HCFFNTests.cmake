@@ -165,7 +165,7 @@ if(TARGET v2_integration_moe_intermediate_ffn_finalization)
 
     add_v2_test(V2_Integration_GroupedM4BankPublicationRejects_ROCm
         COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
-            --gtest_filter=OriginalSources/GroupedM4Source.Static/Q4_K_sparse_routes
+            --gtest_filter=OriginalSources/GroupedM4Source.Static/Q4_K_sparse_routes:OriginalSources/GroupedM4Source.Deferred/Q5_K_sparse_routes
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;GraphCapture;Replay;ByteExact;GeneratedSource;Devices1;NativeISA-gfx906"
         MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
         ENVIRONMENT ${grouped_m4_all_formats_env})

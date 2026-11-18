@@ -28,6 +28,7 @@
 #include "kernels/common/OriginalM1HiddenQ8Publication.h"
 #include "ROCmMoEKernel.h"
 #include "kernels/rocm/gemm/ROCmGroupedFFNFrontier.h"
+#include "kernels/rocm/gemm/ROCmGroupedFFNFormatSelection.h"
 #include "kernels/common/NativeQuantisedDescriptorValidation.h"
 #include "../gemm/ROCmResidentMoEFFN.h"
 #include "../gemm/ROCmNativeLayoutRouterFFN.h"
@@ -1749,25 +1750,36 @@ namespace llaminar2::rocm::grouped_ffn
 {
 /** @copydoc BoundSourceFormatProgram::prepare */
 BoundSourceFormatProgram BoundSourceFormatProgram::prepare(
-    DeviceMoERuntimeTable& table,int modelLayer,const SourceFormatProgram& program)
+    DeviceMoERuntimeTable& table,int modelLayer,const Program& program,
+    const std::array<DeviceNativeQuantisedMatrixDesc,3>& shared)
 {
     const auto* source=table.fragmentDescriptorDeclaration(modelLayer);
     const auto device=table.deviceId();
     if(!source || !device.is_rocm() || !table.isMirroredToDevice() ||
        source->weightFormat()!=DeviceMoEWeightFormat::NativeQuantised ||
-       !source->validFor(device,experts,hidden,program.routedColumns()))
+       !source->validFor(device,experts,hidden,routedColumns(program)))
         throw std::invalid_argument("Grouped FFN format program requires its original native ROCm runtime layer");
-    const auto matchesEnvelope=[](const auto& actual,const auto& expected) {
-        return actual.execution_codebook_mask==expected.execution_codebook_mask &&
-            actual.policy_codebook_mask==expected.policy_codebook_mask;
-    };
     const auto& original=source->sourceFormats();
-    const std::array sources{original[0].native_quantised,original[1].native_quantised,
-        original[2].native_quantised};
-    if(sources!=program.routedSources() ||
-       !matchesEnvelope(source->nativeGateUpEnvelope(),program.formats().routedGateUp) ||
-       !matchesEnvelope(source->nativeDownEnvelope(),program.formats().routedDown))
-        throw std::invalid_argument("Grouped FFN format program disagrees with the original runtime source");
+    if(const auto* measured=std::get_if<MeasuredProgram>(&program)) {
+        if(measuredDecoder(routedColumns(measured->geometry),source->nativeGateUpEnvelope(),
+                source->nativeDownEnvelope(),original)!=measured->decoder)
+            throw std::invalid_argument("Measured grouped FFN disagrees with the original runtime source");
+        if(measured->sums==AffineSumSource::RouterPublication &&
+           !hasMeasuredSumLayout(measured->geometry,measured->decoder,original,shared))
+            throw std::invalid_argument("Measured grouped FFN runtime cannot consume the captured K32 sums");
+    } else {
+        const auto& format=std::get<SourceFormatProgram>(program);
+        const auto matchesEnvelope=[](const auto& actual,const auto& expected) {
+            return actual.execution_codebook_mask==expected.execution_codebook_mask &&
+                actual.policy_codebook_mask==expected.policy_codebook_mask;
+        };
+        const std::array sources{original[0].native_quantised,original[1].native_quantised,
+            original[2].native_quantised};
+        if(sources!=format.routedSources() ||
+           !matchesEnvelope(source->nativeGateUpEnvelope(),format.formats().routedGateUp) ||
+           !matchesEnvelope(source->nativeDownEnvelope(),format.formats().routedDown))
+            throw std::invalid_argument("Grouped FFN format program disagrees with the original runtime source");
+    }
     auto* runtime=table.deviceLayerState(modelLayer);
     if(!runtime)throw std::invalid_argument("Grouped FFN format program requires admitted device storage");
     return BoundSourceFormatProgram(program,runtime,device.ordinal);
@@ -12675,7 +12687,8 @@ namespace llaminar2
             } else {
                 const auto& measured=std::get<program::MeasuredProgram>(frontier->program);
                 if(!program::launch(plan,frontier->sharedWeights,publication,device_ordinal_,stream,direct,
-                        measured.geometry,measured.decoder))
+                        measured.geometry,measured.decoder,
+                        frontier->boundSourceProgram?&*frontier->boundSourceProgram:nullptr))
                     return false;
             }
             markDeviceWritten(publication_output,device,stream);

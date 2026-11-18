@@ -57,7 +57,8 @@ On original 128- and 256-column QFN shards, paired gate/up reads saved
 Gate/up sustains roughly half of the matched physical-read rate on the
 original shards. On those shards, the prepared reader raised full-model
 fixed-three decode from 114.89 to 124.58 tok/s on review and 94.66 to
-102.51 on code, with identical token histories and verifier work.
+102.51 on code. Dynamic decode changed by +0.12% and −0.25%. All paired
+histories and verifier counts matched.
 The table above uses the separate equal-width run.
 [Shard timings and read calibration](QFN_MI50_STAGE_COMPARISON_20261118.md#original-shard-widths-and-verifier-preparation)
 

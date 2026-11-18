@@ -268,9 +268,9 @@ public:
         runtime_generation_=backend_?backend_->deviceRuntimeGeneration(device().ordinal):0;
         if(!runtime_generation_)
             throw std::logic_error("Grouped FFN frontier has no admitted backend generation");
-        if(const auto* program=std::get_if<frontier::SourceFormatProgram>(&publication_.program))
+        if(qfnGroupedFFNDirectBankExperiment())
             publication_.boundSourceProgram=frontier::BoundSourceFormatProgram::prepare(
-                *binding_->params.runtime,binding_->layer,*program);
+                *binding_->params.runtime,binding_->layer,publication_.program,publication_.sharedWeights);
         const auto tensors=extraOperands();
         for(std::size_t i=0;i<tensors.size();++i)
             operands_[i]=TransferEngine{}.retainCapturedDeviceStorage(*tensors[i],device(),tensors[i]->size_bytes());

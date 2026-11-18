@@ -98,6 +98,33 @@ __device__ __forceinline__ AcquiredBank acquireBank(const DirectBankInput& input
     return bank;
 }
 
+} // namespace
+
+/**
+ * @brief Borrow original grouped route slots after their stream-ordered publication.
+ * @details This view owns no route bytes. Only the same acquired bank and
+ * existing epoch/ticket receipt issued by publishRoutes authorize the borrow.
+ */
+class AcquiredGroupedRoutePublication final {
+    AcquiredBank bank_;
+    __device__ explicit AcquiredGroupedRoutePublication(const DirectBankInput& input)
+        : bank_(acquireBank<true>(input)) {}
+public:
+    /** @return A retained view of the exact bank that emitted the requested slots. */
+    __device__ static AcquiredGroupedRoutePublication acquire(const DirectBankInput& input)
+    { return AcquiredGroupedRoutePublication(input); }
+    /** @return The ready local Down role from this original live publication. */
+    __device__ PublishedNativeProjection localDownIf(bool active,int slot,int live) const
+    {
+        if(active)return bank_.localNativeDownFromGroupedSlot(slot,live*topK);
+        return bank_.localNativeProjectionOrInactive(-1,PublishedNativeProjectionRole::Down);
+    }
+    /** @return Original FP32 route weight for this same verified local slot. */
+    __device__ float weight(int slot) const { return bank_.runtime()->route_weights[slot]; }
+};
+
+namespace {
+
 /** @brief Joint original gate/up range loads with independent ordered accumulators. */
 template<NativeQuantisedFormatPrefill Format,int Columns,bool ReuseSum=false>
 __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuantisedMatrixDesc& gate,const DeviceNativeQuantisedMatrixDesc& up,
@@ -182,11 +209,15 @@ void groupedFFNPairedGatePublish(Args p)
         const int original=routed?local/routedBlocks:row;
         int compact=row;
         int expert=0;
+        const auto localRoles=[&] {
+            if constexpr(Direct) {
+                const int id=active && routed?__builtin_amdgcn_readfirstlane(static_cast<int>(p.direct.indices[original])):-1;
+                return bank.localNativeGateUpOrInactive(id);
+            } else return 0;
+        }();
         if(active && routed) {
             if constexpr(Direct) {
-                const auto selection=selectRoute(p.direct,bank,original,live);
-                expert=selection.expert;
-                compact=selection.participant==static_cast<int>(bank.runtime()->participant_id)?original:-1;
+                compact=localRoles.local()?original:-1;
             } else {
                 compact=input.originalToGrouped[original];
                 expert=input.originalExpertIds[original];
@@ -208,26 +239,24 @@ void groupedFFNPairedGatePublish(Args p)
                 const auto* gateDesc=input.routedGate;
                 const auto* upDesc=input.routedUp;
                 if constexpr(Direct) {
-                    const auto& row=bank.bank().experts[selected];
-                    if(row.weight_format!=DeviceMoEWeightFormat::NativeQuantised ||
-                       row.projection_set!=DeviceMoEProjectionSet::IntermediateShard)
-                        __builtin_trap();
-                    gateDesc=&row.gate;
-                    upDesc=&row.up;
+                    gateDesc=&localRoles.gate.descriptor();
+                    upDesc=&localRoles.up.descriptor();
                 } else {
                     gateDesc+=selected;
                     upDesc+=selected;
                 }
                 const auto& gate=*gateDesc;
                 const auto& up=*upDesc;
-                if(!prefill_native_quantised_desc_shape_ok<Gate>(gate,RoutedColumns,hidden) ||
-                   !prefill_native_quantised_desc_shape_ok<Gate>(up,RoutedColumns,hidden))
-                    __builtin_trap();
-                if constexpr(Gate==NATIVE_QUANTISED_PF_Q5_1)
-                    if(!gate.source_identity_present || !up.source_identity_present ||
-                       gate.source_codebook_id!=7 || up.source_codebook_id!=7 ||
-                       !gate.source_is_superblock || !up.source_is_superblock)
+                if constexpr(!Direct) {
+                    if(!prefill_native_quantised_desc_shape_ok<Gate>(gate,RoutedColumns,hidden) ||
+                       !prefill_native_quantised_desc_shape_ok<Gate>(up,RoutedColumns,hidden))
                         __builtin_trap();
+                    if constexpr(Gate==NATIVE_QUANTISED_PF_Q5_1)
+                        if(!gate.source_identity_present || !up.source_identity_present ||
+                           gate.source_codebook_id!=7 || up.source_codebook_id!=7 ||
+                           !gate.source_is_superblock || !up.source_is_superblock)
+                            __builtin_trap();
+                }
                 const std::int16_t* sums=nullptr;
                 if constexpr(ReuseSum)sums=p.direct.affineSums->hiddenRows+row*(hidden/32);
                 value=pairedProjections<Gate,RoutedColumns,ReuseSum>(gate,up,codes,scales,column,16,lane,sums);
@@ -271,22 +300,27 @@ void groupedFFNPairedGatePublish(Args p)
 
 }
 
-/** @brief Original five one-block serial partitions with the producer's exact signed integer sum. */
-template<NativeQuantisedFormatPrefill Format>
-__device__ __forceinline__ float exactK32AffineDown(const DeviceNativeQuantisedMatrixDesc& down,
-    int column,const std::int8_t* codes,const float* scales,const std::int16_t* sums)
+/** @brief Fold original one-block serial partitions of a cold-sealed fixed role.
+ * @details The fixed launch proves the K32 shape and one block per partition.
+ * Each partial starts at +0 and the existing ordered fold retains its RN operations.
+ */
+template<NativeQuantisedFormatPrefill Format,int Blocks,bool ReuseSum=false>
+__device__ __forceinline__ float fixedPublishedDown(const DeviceNativeQuantisedMatrixDesc& down,
+    int column,const std::int8_t* codes,const float* scales,const std::int16_t* sums=nullptr)
 {
     using Traits=PrefillNATIVE_QUANTISEDTraits<Format>;
     float total=0.0f;
 #pragma unroll 1
-    for(int block=0;block<5;++block) {
+    for(int block=0;block<Blocks;++block) {
         const std::size_t index=std::size_t(block)*hidden+column;
         const auto* data=down.payload+index*Traits::payload_bytes;
         int32_t decoded[8];
         moe_prefill_decode_groups<Format,false>(data,decoded,nullptr);
         const auto* activation=reinterpret_cast<const int32_t*>(codes+block*32);
-        const float partial=moe_prefill_accumulate_decoded_block<Format,true>(
-            down,index,data,decoded,activation,scales[block],0.0f,sums[block]);
+        int sum=0;
+        if constexpr(ReuseSum)sum=sums[block];
+        const float partial=moe_prefill_accumulate_decoded_block<Format,ReuseSum>(
+            down,index,data,decoded,activation,scales[block],0.0f,sum);
         total=rocm_native_quantised_accumulate_rn(total,partial);
     }
     return total;
@@ -320,8 +354,8 @@ void groupedFFNTokenDown(Args p)
         }
         return;
     }
-    const auto bank=[&]{
-        if constexpr(Direct)return acquireBank<true>(p.direct);
+    const auto published=[&]{
+        if constexpr(Direct)return AcquiredGroupedRoutePublication::acquire(p.direct);
         else return 0;
     }();
     __shared__ float complete[topK+1][Columns];
@@ -329,29 +363,23 @@ void groupedFFNTokenDown(Args p)
         float value=0.0f;
         if(route<topK) {
             const int original=row*topK+route;
-            int compact,expert;
-            if constexpr(Direct) {
-                const auto* runtime=bank.runtime();
-                expert=__builtin_amdgcn_readfirstlane(runtime->route_expert_ids[original]);
-                const int participant=__builtin_amdgcn_readfirstlane(runtime->route_participant_ids[original]);
-                compact=participant==static_cast<int>(runtime->participant_id)?original:-1;
-            } else {
-                compact=__builtin_amdgcn_readfirstlane(input.originalToGrouped[original]);
-                expert=__builtin_amdgcn_readfirstlane(input.originalExpertIds[original]);
-            }
+            const auto localDown=[&] {
+                if constexpr(Direct)return published.localDownIf(true,original,live);
+                else return 0;
+            }();
+            const int compact=[&] {
+                if constexpr(Direct)return static_cast<bool>(localDown)?original:-1;
+                else return __builtin_amdgcn_readfirstlane(input.originalToGrouped[original]);
+            }();
             if(compact>=0) {
-                if(compact>=capacity*topK || expert<0 || expert>=experts)__builtin_trap();
                 const DeviceNativeQuantisedMatrixDesc* down;
                 float weight;
                 if constexpr(Direct) {
-                    down=&bank.bank().experts[expert].down;
-                    weight=bank.runtime()->route_weights[original];
-                    if(!prefill_native_quantised_desc_shape_ok<Down>(*down,hidden,RoutedColumns))
-                        __builtin_trap();
-                    if constexpr(Down==NATIVE_QUANTISED_PF_Q8_0)
-                        if(!down->source_identity_present || down->source_codebook_id!=19)
-                            __builtin_trap();
+                    down=&localDown.descriptor();
+                    weight=published.weight(original);
                 } else {
+                    const int expert=__builtin_amdgcn_readfirstlane(input.originalExpertIds[original]);
+                    if(compact>=capacity*topK || expert<0 || expert>=experts)__builtin_trap();
                     down=&input.routedDown[expert];
                     weight=input.groupWeights[compact];
                 }
@@ -360,17 +388,25 @@ void groupedFFNTokenDown(Args p)
                 const float dot=[&]{
                     if constexpr(ReuseSum) {
                         static_assert(RoutedColumns==160 && Down==NATIVE_QUANTISED_PF_Q5_1 && Direct);
-                        return exactK32AffineDown<Down>(*down,co,codes,scales,
+                        return fixedPublishedDown<Down,routedBlocks,true>(*down,co,codes,scales,
                             p.direct.affineSums->routedRows+compact*routedBlocks);
+                    } else if constexpr(Direct) {
+                        return fixedPublishedDown<Down,routedBlocks>(*down,co,codes,scales);
                     } else return moe_prefill_dot_desc_serial_m1<Down>(*down,co,codes,scales,hidden,routedBlocks);
                 }();
                 value=rocm_native_quantised_weight_route_rn(weight,dot);
             }
             if(output.routeContributions)output.routeContributions[original*hidden+co]=value;
         } else {
-            const float dot=moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_Q8_0>(
-                p.shared[2],co,scratch.shared_codes+row*sharedWidth,
-                scratch.shared_scales+row*sharedBlocks,hidden,5);
+            const auto* codes=scratch.shared_codes+row*sharedWidth;
+            const auto* scales=scratch.shared_scales+row*sharedBlocks;
+            const float dot=[&] {
+                if constexpr(Direct)
+                    return fixedPublishedDown<NATIVE_QUANTISED_PF_Q8_0,sharedBlocks>(p.shared[2],co,codes,scales);
+                else
+                    return moe_prefill_dot_desc_serial_m1<NATIVE_QUANTISED_PF_Q8_0>(
+                        p.shared[2],co,codes,scales,hidden,sharedBlocks);
+            }();
             value=rocm_native_quantised_accumulate_rn(0.0f,rocm_native_quantised_weight_route_rn(1.0f,dot));
         }
         complete[route][x]=value;
@@ -393,8 +429,25 @@ void groupedFFNTokenDown(Args p)
 
 bool launch(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDesc,3>& sharedWeights,
             const Output& output,int device,void* stream,const DirectBankInput& direct,
-            RoutedGeometry geometry,RoutedDecoder decoder)
+            RoutedGeometry geometry,RoutedDecoder decoder,const BoundSourceFormatProgram* bound)
 {
+    if(direct.runtime) {
+        const auto* measured=bound?std::get_if<MeasuredProgram>(&bound->program()):nullptr;
+        if(!measured || !bound->matches(direct.runtime,device) || measured->geometry!=geometry ||
+           measured->decoder!=decoder || bool(direct.affineSums)!=(measured->sums==AffineSumSource::RouterPublication) ||
+           (direct.demand!=MoEGroupedPlanDemand::None && direct.demand!=MoEGroupedPlanDemand::DeferredAcceptedRows) ||
+           !plan.hiddenCodes || !plan.hiddenScales || !plan.hiddenFP32 ||
+           !output.routedCodes || !output.routedScales || !output.sharedInputGate)
+            return false;
+        for(unsigned index=0;index<sharedWeights.size();++index) {
+            const auto& role=sharedWeights[index];
+            const bool down=index==2;
+            if(role.n!=(down?hidden:sharedWidth) || role.k!=(down?sharedWidth:hidden) ||
+               !NativeQuantisedDescriptorValidation::publishable(role) || role.codebook_id!=19 ||
+               !role.source_identity_present || role.source_codebook_id!=19 || role.source_is_superblock)
+                return false;
+        }
+    } else if(bound) return false;
     const int routed=routedColumns(geometry);
     if(geometry!=RoutedGeometry::F128 && (geometry!=RoutedGeometry::F160 || !direct.runtime))
         return false;

@@ -38,6 +38,7 @@ std::vector<M4SourceCase> groupedM4Cases()
     cases.push_back({"Q8_1_shared_down_prepared",M4SourceRole::SharedDown,"Q8_1",{}});
     cases.push_back({"Q4_K_repeat_routes",M4SourceRole::RoutedGateUp,"Q4_K",{}});
     cases.push_back({"Q4_K_sparse_routes",M4SourceRole::RoutedGateUp,"Q4_K",{}});
+    cases.push_back({"Q5_K_sparse_routes",M4SourceRole::RoutedGateUp,"Q5_K",{}});
     cases.push_back({"Q2_K_sparse_routes",M4SourceRole::RoutedDown,"Q2_K",{}});
     cases.push_back({"IQ1_M_sparse_routes",M4SourceRole::RoutedDown,"IQ1_M",{}});
     cases.push_back({"IQ4_NL_up_IQ4_XS",M4SourceRole::RoutedGateUp,"IQ4_NL",{}});
@@ -126,6 +127,8 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing)
     const std::array<std::string_view,1> requested{pci?pci:""};
     shape.grouped_matrix_case=item.name;
     expectGroupedM4Program(shape);
+    if(item.name=="Q5_K_sparse_routes" && shape.grouped_matrix_program==GroupedM4FixtureProgram::AllFormats)
+        shape.grouped_matrix_symbol="groupedFFNFormatProgramGateILj1ELin1ELi160E";
     shape.grouped_matrix_timing=timing;
     shape.deferred_frontier_history=deferred;
     std::osyncstream(std::cout)<<"M4_SOURCE_INPUT,case="<<item.name

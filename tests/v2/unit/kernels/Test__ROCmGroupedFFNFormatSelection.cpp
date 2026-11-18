@@ -17,12 +17,12 @@ constexpr int shared=256;
 constexpr unsigned char plane=0;
 
 /** @return Independently prepared gate, up or down metadata for the supplied representation. */
-DeviceNativeQuantisedMatrixDesc matrix(const NativeQuantisedFormatInfo& source,std::uint8_t physical,bool down)
+DeviceNativeQuantisedMatrixDesc matrix(const NativeQuantisedFormatInfo& source,std::uint8_t physical,bool down,int columns=shared)
 {
     return {.payload=&plane,.scales=&plane,
         .mins=NativeQuantisedDescriptorValidation::secondary(physical)?&plane:nullptr,
-        .emins=physical==10?&plane:nullptr,.n=down?ffn::hidden:shared,.k=down?shared:ffn::hidden,
-        .blocks_per_row=unsigned(down?shared:ffn::hidden)/32,.codebook_id=physical,
+        .emins=physical==10?&plane:nullptr,.n=down?ffn::hidden:columns,.k=down?columns:ffn::hidden,
+        .blocks_per_row=unsigned(down?columns:ffn::hidden)/32,.codebook_id=physical,
         .source_codebook_id=source.codebook_id,.source_is_superblock=source.is_superblock,
         .source_identity_present=1};
 }
@@ -140,6 +140,32 @@ TEST(ROCmGroupedFFNFormatSelection, PairsGateAndUpOnlyForMeasuredPhysicalReader)
     EXPECT_FALSE(ffn::SourceFormatProgram::prepare(layout).pairsGateAndUp());
 }
 
+/** @test Packed pitch selection preserves original source and reachable physical-reader identity. */
+TEST(ROCmGroupedFFNFormatSelection, FixedQ5PitchRequiresMeasuredWidthsAndExactGateSources)
+{
+    const auto q8=reachable(formats::Q8_0,false);
+    const auto q5=reachable(formats::Q5_K,false);
+    const auto q5k=sources(formats::Q5_K,formats::Q5_K,formats::Q8_0);
+    const auto sharedWeights=[](int columns,const NativeQuantisedFormatInfo& up) {
+        return std::array{matrix(formats::Q8_0,19,false,columns),matrix(up,19,false,columns),
+            matrix(formats::Q8_0,19,true,columns)};
+    };
+    const auto classify=[&](int routed,int shared,const auto& format,const auto& routedSources,const auto& weights) {
+        const auto declaration=ffn::declareSourceFormats(routed,shared,format,q8,routedSources,weights);
+        return ffn::SourceFormatProgram::prepare(declaration).fixedQ5GatePitch(weights);
+    };
+    const auto exact=sharedWeights(160,formats::Q8_0);
+    for(int width:{128,160,256})
+        EXPECT_EQ(classify(width,160,q5,q5k,exact),static_cast<ffn::FixedQ5GatePitch>(width));
+    for(int width:{96,192,320,384})
+        EXPECT_FALSE(classify(width,160,q5,q5k,exact));
+    for(int width:{128,320})
+        EXPECT_FALSE(classify(160,width,q5,q5k,sharedWeights(width,formats::Q8_0)));
+    EXPECT_FALSE(classify(160,160,q5,sources(formats::Q5_K,formats::Q5_1,formats::Q8_0),exact));
+    EXPECT_FALSE(classify(160,160,q5,q5k,sharedWeights(160,formats::Q8_K)));
+    EXPECT_FALSE(classify(160,160,reachable(formats::Q5_K),q5k,exact));
+}
+
 #endif
 
 TEST(ROCmGroupedFFNFormatSelection, CapturesMeasuredDecoderOnlyForSupportedSourceAliases)
@@ -184,5 +210,5 @@ TEST(ROCmGroupedFFNFormatSelection, MeasuredSumAdmissionDistinguishesSourceAlias
 
 
 /** Raw runtime pointers cannot issue the receipt accepted by the numerical launcher. */
-static_assert(!std::is_constructible_v<ffn::BoundSourceFormatProgram,const ffn::SourceFormatProgram&,
+static_assert(!std::is_constructible_v<ffn::BoundSourceFormatProgram,const ffn::Program&,
     llaminar2::DeviceMoELayerRuntime*,int>);

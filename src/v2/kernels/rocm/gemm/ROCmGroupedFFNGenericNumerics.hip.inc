@@ -59,7 +59,7 @@ static constexpr bool validFormats(const NativeQuantisedExecutionFormatEnvelope&
  * expert. The single-partition policy returns the leaf directly as in serial M1.
  * For Q2_K and IQ1_M the shared original accumulator retains its segmented sums.
  */
-template<NativeQuantisedFormatPrefill Format,int MaxUsers,int PartitionWorkers,bool OneBlockPerPartition,class Projection>
+template<NativeQuantisedFormatPrefill Format,int MaxUsers,int PartitionWorkers,bool OneBlockPerPartition,int FixedGatePitch=0,class Projection>
     requires (std::is_same_v<Projection,PublishedNativeProjection> || std::is_same_v<Projection,ReadyProjectionFields>)
 __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjectionFormat(
     Projection projection,int column,int width,
@@ -68,11 +68,19 @@ __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjectionFormat(
     static_assert(PartitionWorkers==1 || PartitionWorkers==4);
     using Traits=PrefillNATIVE_QUANTISEDTraits<Format>;
     const auto& desc=projection.descriptor();
-    const int blocks=width/32;
+    constexpr bool fixedGate=FixedGatePitch!=0;
+    constexpr int gateParts=MoEProjectionNumericalContract::ordered_k_partitions;
+    constexpr int gateBlocks=hidden/32;
+    static_assert(!fixedGate || (PartitionWorkers==4 && !OneBlockPerPartition &&
+        gateParts==16 && gateBlocks==80));
+    // Published role authority and the cold schedule already prove pitch,
+    // decoder and the original five-block partition extent.
+    const int blocks=fixedGate?gateBlocks:width/32;
+    parts=fixedGate?gateParts:parts;
     const int worker=lane/(64/PartitionWorkers);
     // Only the original resolved policy selects the one-block program.
     // Arithmetic still starts each partition at +0, then appends its result.
-    const int stride=OneBlockPerPartition?1:(blocks+parts-1)/parts;
+    const int stride=fixedGate?gateBlocks/gateParts:OneBlockPerPartition?1:(blocks+parts-1)/parts;
     ProjectionResult<MaxUsers> total{};
 #pragma unroll 1
     for(int group=0;group<parts;group+=PartitionWorkers) {
@@ -80,9 +88,10 @@ __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjectionFormat(
         ProjectionResult<MaxUsers> partial{};
         if(partition<parts) {
             const int begin=partition*stride;
-            const int end=OneBlockPerPartition?begin+1:min(begin+stride,blocks);
+            const int end=fixedGate?begin+gateBlocks/gateParts:OneBlockPerPartition?begin+1:min(begin+stride,blocks);
+#pragma unroll 1
             for(int b=begin;b<end;++b) {
-                const size_t index=size_t(b)*desc.n+column;
+                const size_t index=size_t(b)*(fixedGate?FixedGatePitch:desc.n)+column;
                 const auto* payload=desc.payload+index*Traits::payload_bytes;
                 int32_t decoded[8];
                 moe_prefill_decode_groups<Format>(payload,decoded);

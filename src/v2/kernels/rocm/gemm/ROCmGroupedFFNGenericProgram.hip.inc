@@ -36,29 +36,6 @@ public:
     __host__ __device__ NativeQuantisedExecutionFormatEnvelope formats() const noexcept { return formats_; }
 };
 
-/**
- * @brief Borrow original grouped route slots after their stream-ordered publication.
- * @details This view owns no route bytes. Only the same acquired bank and
- * existing epoch/ticket receipt issued by publishRoutes authorize the borrow.
- */
-class AcquiredGroupedRoutePublication final {
-    AcquiredBank bank_;
-    __device__ explicit AcquiredGroupedRoutePublication(const DirectBankInput& input)
-        : bank_(acquireBank<true>(input)) {}
-public:
-    /** @return A retained view of the exact bank that emitted the requested slots. */
-    __device__ static AcquiredGroupedRoutePublication acquire(const DirectBankInput& input)
-    { return AcquiredGroupedRoutePublication(input); }
-    /** @return The ready local Down role from this original live publication. */
-    __device__ PublishedNativeProjection localDownIf(bool active,int slot,int live) const
-    {
-        if(active)return bank_.localNativeDownFromGroupedSlot(slot,live*topK);
-        return bank_.localNativeProjectionOrInactive(-1,PublishedNativeProjectionRole::Down);
-    }
-    /** @return Original FP32 route weight for this same verified local slot. */
-    __device__ float weight(int slot) const { return bank_.runtime()->route_weights[slot]; }
-};
-
 namespace {
 using SealedSharedRole=PreparedGroupedSharedRole;
 
@@ -95,7 +72,7 @@ __device__ __forceinline__ Projections sealedPair(PublishedNativeProjection gate
     return pairedProjections<Format,0>(gate,up,row.codes,row.scales,column,parts,lane);
 }
 
-template<unsigned Groups,int RoutedCodebook=-1>
+template<unsigned Groups,int RoutedCodebook=-1,int FixedQ5Pitch=0>
 __global__ __launch_bounds__(threads)
 void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCodes,
     const float* hiddenScales,const float* hiddenFP32,Scratch scratch,Output output,DirectBankInput direct,
@@ -169,7 +146,16 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
                     const auto formats=routed?routedFormats:(isGate?sharedGate.formats():sharedUp.formats());
                     const int parts=routed?(isGate?gateParts:upParts):
                         (isGate?sharedGate.partitions():sharedUp.partitions());
-                    const auto values=generic::orderedProjection<1,4,Groups>(projection,column,hidden,users,parts,lane,formats);
+                    const auto values=[&] {
+                        if constexpr(FixedQ5Pitch>0)
+                            return routed
+                                ?generic::orderedProjectionFormat<NATIVE_QUANTISED_PF_Q5_1,1,4,false,FixedQ5Pitch>(
+                                    projection,column,hidden,users,parts,lane)
+                                :generic::orderedProjectionFormat<NATIVE_QUANTISED_PF_Q8_0,1,4,false,160>(
+                                    projection,column,hidden,users,parts,lane);
+                        else
+                            return generic::orderedProjection<1,4,Groups>(projection,column,hidden,users,parts,lane,formats);
+                    }();
                     if(isGate)gateValue=values.value[0];
                     else if(lane<16) {
                         if(!routed) {
@@ -297,7 +283,9 @@ bool launchFormatProgram(const RoutePlan& plan,const std::array<DeviceNativeQuan
     const Output& output,int device,void* stream,const DirectBankInput& direct,const BoundSourceFormatProgram& bound)
 {
     if(!bound.matches(direct.runtime,device))return false;
-    const auto& program=bound.program();
+    const auto* formatsProgram=std::get_if<SourceFormatProgram>(&bound.program());
+    if(!formatsProgram)return false;
+    const auto& program=*formatsProgram;
     const int routedColumns=program.routedColumns(), sharedColumns=program.sharedColumns();
     const auto& formats=program.formats();
     if(device<0 || reinterpret_cast<uintptr_t>(stream)<=2 || !direct.runtime || !direct.indices ||
@@ -335,13 +323,20 @@ bool launchFormatProgram(const RoutePlan& plan,const std::array<DeviceNativeQuan
     const auto gateFamilies=ResidentMoEFFNDecoderProgram::fromExecutionMask(
         formats.routedGateUp.execution_codebook_mask | formats.shared[0].execution_codebook_mask |
         formats.shared[1].execution_codebook_mask);
-    const auto launchGate=[&]<unsigned Groups,int RoutedCodebook=-1>() {
-        hipLaunchKernelGGL((groupedFFNFormatProgramGate<Groups,RoutedCodebook>),dim3(gateGrid),dim3(threads),0,native,
+    const auto launchGate=[&]<unsigned Groups,int RoutedCodebook=-1,int FixedQ5Pitch=0>() {
+        hipLaunchKernelGGL((groupedFFNFormatProgramGate<Groups,RoutedCodebook,FixedQ5Pitch>),dim3(gateGrid),dim3(threads),0,native,
             plan.live,plan.hiddenCodes,plan.hiddenScales,plan.hiddenFP32,scratch,output,direct,
             routedColumns,sharedColumns,formats.routedGateUp,routedParts[0],routedParts[1],roles[0],roles[1]);
     };
     if(program.pairsGateAndUp())
         launchGate.template operator()<1,NATIVE_QUANTISED_PF_Q4_1>();
+    else if(const auto pitch=program.fixedQ5GatePitch(sharedWeights)) {
+        switch(*pitch) {
+            case FixedQ5GatePitch::F128: launchGate.template operator()<1,-1,128>(); break;
+            case FixedQ5GatePitch::F160: launchGate.template operator()<1,-1,160>(); break;
+            case FixedQ5GatePitch::F256: launchGate.template operator()<1,-1,256>(); break;
+        }
+    }
     else if(gateFamilies.groups()==1) launchGate.template operator()<1>();
     else launchGate.template operator()<15>();
     if(hipGetLastError()!=hipSuccess)return false;

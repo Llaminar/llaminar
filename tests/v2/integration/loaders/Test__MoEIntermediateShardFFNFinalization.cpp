@@ -1106,7 +1106,13 @@ void verifyGroupedFormatRuntimeAdmission(Lane& lane,DeviceMoERuntimeTable& forei
     ASSERT_NE(foreignRuntime,nullptr);
     ASSERT_FALSE(bound.matches(foreignRuntime,device.ordinal));
     ASSERT_FALSE(bound.matches(original,device.ordinal+1));
-    const auto inspect=[&](DeviceMoELayerRuntime* runtime,MoEGroupedPlanDemand demand,int ordinal,bool expected) {
+    const ffn::MeasuredProgram measured{ffn::RoutedGeometry::F128,ffn::RoutedDecoder::Q4K_Q51};
+    const auto fixedBound=ffn::BoundSourceFormatProgram::prepare(*lane.runtime,0,measured,{up,up,down});
+    const auto inspect=[&](DeviceMoELayerRuntime* runtime,MoEGroupedPlanDemand demand,int ordinal,bool expected,
+                           const ffn::BoundSourceFormatProgram* fixed=nullptr,
+                           ffn::RoutedDecoder decoder=ffn::RoutedDecoder::Q4K_Q51,bool omitScratch=false) {
+        auto checkedOutput=output;
+        if(omitScratch)checkedOutput.routedCodes=nullptr;
         const ffn::DirectBankInput bank{.runtime=runtime,.indices=operands->routeIds,
             .weights=operands->routeWeights,.demand=demand,.bankIdentity=operands->bank};
         auto graph = context.createGraphCapture(stream);
@@ -1116,8 +1122,10 @@ void verifyGroupedFormatRuntimeAdmission(Lane& lane,DeviceMoERuntimeTable& forei
         {
             ScopedBackendGraphCapture recording(context,*graph,"format-program runtime admission");
             ASSERT_TRUE(recording.begin());
-            EXPECT_EQ(ffn::launchFormatProgram(plan,{up,up,down},output,ordinal,stream,bank,
-                bound),expected);
+            const bool launched=fixed ?
+                ffn::launch(plan,{up,up,down},checkedOutput,ordinal,stream,bank,measured.geometry,decoder,fixed):
+                ffn::launchFormatProgram(plan,{up,up,down},output,ordinal,stream,bank,bound);
+            EXPECT_EQ(launched,expected);
             recording.finish();
         }
         std::size_t nodes=0;
@@ -1129,6 +1137,13 @@ void verifyGroupedFormatRuntimeAdmission(Lane& lane,DeviceMoERuntimeTable& forei
     inspect(original,MoEGroupedPlanDemand::OrdinaryPrefill,device.ordinal,false);
     inspect(foreignRuntime,MoEGroupedPlanDemand::None,device.ordinal,false);
     inspect(original,MoEGroupedPlanDemand::None,device.ordinal+1,false);
+    inspect(original,MoEGroupedPlanDemand::None,device.ordinal,true,&fixedBound);
+    inspect(original,MoEGroupedPlanDemand::DeferredAcceptedRows,device.ordinal,true,&fixedBound);
+    inspect(original,MoEGroupedPlanDemand::OrdinaryPrefill,device.ordinal,false,&fixedBound);
+    inspect(foreignRuntime,MoEGroupedPlanDemand::None,device.ordinal,false,&fixedBound);
+    inspect(original,MoEGroupedPlanDemand::None,device.ordinal,false,&bound);
+    inspect(original,MoEGroupedPlanDemand::None,device.ordinal,false,&fixedBound,ffn::RoutedDecoder::Q5K_Q80);
+    inspect(original,MoEGroupedPlanDemand::None,device.ordinal,false,&fixedBound,ffn::RoutedDecoder::Q4K_Q51,true);
 }
 #endif
 
@@ -1489,7 +1504,7 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         source.resident_participant_mask+source.expert_count);
                     update.overlay_route_participant.assign(source.overlay_route_participant,
                         source.overlay_route_participant+source.expert_count);
-                    if (shape.grouped_matrix_case=="Q4_K_sparse_routes") {
+                    if (shape.grouped_matrix_case=="Q4_K_sparse_routes" || shape.grouped_matrix_case=="Q5_K_sparse_routes") {
                         const auto original=std::as_bytes(std::span(&current,1));
                         const std::vector<std::byte> saved(original.begin(),original.end());
                         const auto rejected=[&](auto mutate,std::string_view named_field) {
@@ -1510,7 +1525,7 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         };
                         rejected([](auto& expert){expert.gate.n-=32;},"gate shape");
                         rejected([](auto& expert){expert.down.k-=32;},"down reduction");
-                        rejected([](auto& expert){expert.up.source_is_superblock=0;},"Q4 arithmetic source alias");
+                        rejected([](auto& expert){expert.up.source_is_superblock=0;},"original source superblock alias");
                         rejected([](auto& expert){expert.gate.codebook_id=19;},"reachable physical decoder");
                         rejected([](auto& expert){expert.gate.mins=nullptr;},"secondary coefficient plane");
                         rejected([](auto& expert){--expert.down.blocks_per_row;},"K32 block geometry");
