@@ -54,17 +54,18 @@ __device__ __forceinline__ Route selectRoute(const DirectBankInput& input,const 
 }
 
 /** @brief Keep original route metadata and the optional deferred accepted-prefix input visible. */
-__device__ __forceinline__ void publishRoutes(const DirectBankInput& input,const AcquiredBank& bank,int live)
+__device__ __forceinline__ void publishRoutes(const DirectBankInput& input,const AcquiredBank& bank,int live,
+    int physicalRows=capacity)
 {
     auto* runtime=bank.runtime();
-    if(runtime->prefill_route_capacity<capacity*topK || !runtime->route_expert_ids ||
+    if(runtime->prefill_route_capacity<physicalRows*topK || !runtime->route_expert_ids ||
        !runtime->route_participant_ids || !runtime->route_weights ||
        (input.demand==MoEGroupedPlanDemand::DeferredAcceptedRows &&
-        (runtime->deferred_verifier_route_capacity<capacity*topK ||
+        (runtime->deferred_verifier_route_capacity<physicalRows*topK ||
          !runtime->deferred_verifier_route_expert_ids || !runtime->deferred_verifier_route_participant_ids)))
         __builtin_trap();
     const int slot=threadIdx.x;
-    if(slot<capacity*topK) {
+    if(slot<physicalRows*topK) {
         const auto route=selectRoute(input,bank,slot,live);
         runtime->route_expert_ids[slot]=route.expert;
         runtime->route_participant_ids[slot]=route.participant;

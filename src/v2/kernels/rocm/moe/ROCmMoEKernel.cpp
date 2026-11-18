@@ -12353,7 +12353,7 @@ namespace llaminar2
     {
         namespace geometry=rocm::grouped_ffn;
         return executeGroupedRuntimeProjection(runtime,host,hidden,nullptr,gate_id,down_id,
-            geometry::capacity,geometry::hidden,geometry::routedColumns(publication.program),geometry::experts,geometry::topK,
+            publication.rows.physicalRows(),geometry::hidden,geometry::routedColumns(publication.program),geometry::experts,geometry::topK,
             MoEPrefillProjectionExecution::intermediateShard(geometry::hidden),route_partials,&publication);
     }
 
@@ -12639,8 +12639,23 @@ namespace llaminar2
                frontier->rows.physicalRows()!=seq_len || !frontier->rows.countOwner() ||
                !workspace_ || !d_prefill_A_int8_ || !d_prefill_A_scales_ ||
                d_prefill_A_int8_==d_router_q8_hidden_ || d_prefill_A_scales_==d_router_q8_hidden_scales_ ||
-               workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_SHARED_GATE)<program::sharedGateBytes)
-                throw std::logic_error("Retained grouped FFN requires the original Q8 router bank and sealed routed/shared format declarations");
+               workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_SHARED_GATE)<std::size_t(seq_len)*sizeof(float))
+                throw std::logic_error("Retained grouped FFN requires its original Q8/router descriptor contract:"
+                    " reuse_q8="+std::to_string(reuse_router_q8_hidden)+
+                    " gateup_owned="+std::to_string(owner_admission!=nullptr)+
+                    " intermediate_shard="+std::to_string(execution.isIntermediateShard())+
+                    " gate_mask="+std::to_string(gateup_table.codebook_mask)+
+                    "/"+std::to_string(gate_format.execution_codebook_mask)+
+                    " gate_policy="+std::to_string(gateup_table.policy_codebook_mask)+
+                    "/"+std::to_string(gate_format.policy_codebook_mask)+
+                    " down_mask="+std::to_string(down_table.codebook_mask)+
+                    "/"+std::to_string(down_format.execution_codebook_mask)+
+                    " down_policy="+std::to_string(down_table.policy_codebook_mask)+
+                    "/"+std::to_string(down_format.policy_codebook_mask)+
+                    " rows="+std::to_string(frontier->rows.physicalRows())+
+                    "/"+std::to_string(seq_len)+
+                    " publication="+std::to_string(router_q8_hidden_publication_?router_q8_hidden_publication_->published_rows:0)+
+                    " shared_gate_bytes="+std::to_string(workspace_?workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_SHARED_GATE):0));
             if(!requireTensorOnDevice(frontier->sharedInputGate,device,stream,"shared input gate","grouped FFN frontier"))
                 return false;
             const std::array outputs{frontier->sharedGateScratch,frontier->sharedUpScratch,frontier->routedOutput,
@@ -12681,7 +12696,7 @@ namespace llaminar2
             const auto* formats=std::get_if<program::SourceFormatProgram>(&frontier->program);
             if(formats) {
                 if(!frontier->boundSourceProgram ||
-                   !program::launchFormatProgram(plan,frontier->sharedWeights,publication,device_ordinal_,stream,
+                   !program::launchFormatProgram(plan,frontier->rows,frontier->sharedWeights,publication,device_ordinal_,stream,
                         direct,*frontier->boundSourceProgram))
                     return false;
             } else {

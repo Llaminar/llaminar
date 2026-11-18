@@ -63,7 +63,12 @@ and from 119.20 to 114.12 µs on the narrow shard. The smallest TP8
 shard took 0.42 µs longer. Nine focused preflight tests passed.
 The counted six-row FFN reduced the captured local router/FFN time by
 35.5% on the narrow shard and 25.0% on the wide shard.
-Four-card qualification of those verifier changes is in progress.
+On four MI50s the six-row change alone raised dynamic decode from 115.92 to
+126.91 tok/s on review and 94.43 to 103.81 on code, with matching tokens
+and verifier work. The combined Release passed 13 focused preflight cases.
+At four rows and F256/S256, all 15 generated format families improved,
+with a 22.01% median reduction in local time. Full-model timing is in progress.
+[Six-row model trial](QFN_MI50_STAGE_COMPARISON_20261118.md#six-row-dynamic-verifier-on-the-original-tp4-shards)
 [Full-model measurements](QFN_MI50_STAGE_COMPARISON_20261118.md#transferring-the-single-row-loop-to-grouped-verification)
 [Verifier tiles and packet scheduling](QFN_MI50_STAGE_COMPARISON_20261118.md#verifier-tile-assignment-and-packet-scheduling)
 

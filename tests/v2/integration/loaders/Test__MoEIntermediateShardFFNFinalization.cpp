@@ -155,10 +155,13 @@ struct OriginalFFNFixtureGeometry {
     OriginalFFNGeometryContract contract=OriginalFFNGeometryContract::SourceDerived; ///< Assert an exact admitted source geometry.
     bool verify_runtime_admission=false; ///< Inspect capture admission with two original owners.
     std::string_view grouped_matrix_case{}; ///< Nonempty selects the isolated M4 source-catalog fixture.
+    bool verify_grouped_gate_tiles=false; ///< Require one native output tile per wave pair.
+    unsigned expected_grouped_decoder_family=0; ///< Independent family for a focused source fixture.
     int expected_q51_down_pitch=0; ///< Independent native Down width used by the focused promotion replay.
     std::string_view grouped_matrix_symbol{}; ///< Expected selected production candidate symbol, when armed.
     GroupedM4FixtureProgram grouped_matrix_program=GroupedM4FixtureProgram::AllFormats; ///< Exact capture program family.
     bool grouped_matrix_symbol_present=true; ///< Whether the selected production symbol must be present.
+    int grouped_matrix_rows=4; ///< Captured physical width of a source-matrix replay.
     bool grouped_matrix_timing=false; ///< Measure the captured M4 parent after byte replay.
     bool deferred_frontier_history=false; ///< Exercise the original accepted-prefix commit with the two-node publication.
     std::size_t frontier_sum_test_extent=0; ///< One deliberately undersized original input lease.
@@ -798,7 +801,7 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
     // width. Two GGUF sources can share a decoder ID and require different graphs.
     const bool expectFrontier=shape.grouped_matrix_symbol.empty() && grouped && rows==4 && kH==2560 && (shape.routed==128 || (shape.routed==160 && qfnGroupedFFNEqualFrontierOptIn() && qfnGroupedFFNDirectBankExperiment())) && shared_f==160 &&
         kExperts==512 && kTopK==10 && qfnGroupedFFNFrontierOptIn();
-    const bool expectFormatProgram=grouped && rows==4 && !shape.grouped_matrix_symbol.empty() &&
+    const bool expectFormatProgram=grouped && rows==shape.grouped_matrix_rows && !shape.grouped_matrix_symbol.empty() &&
         shape.grouped_matrix_symbol_present;
     if(execution==MoEIntermediateShardFFNExecution::Staged && !expectFrontier && !expectFormatProgram)
     {
@@ -1111,7 +1114,8 @@ void verifyGroupedFormatRuntimeAdmission(Lane& lane,DeviceMoERuntimeTable& forei
     const auto fixedBound=ffn::BoundSourceFormatProgram::prepare(*lane.runtime,0,measured,{up,up,down});
     const auto inspect=[&](DeviceMoELayerRuntime* runtime,MoEGroupedPlanDemand demand,int ordinal,bool expected,
                            const ffn::BoundSourceFormatProgram* fixed=nullptr,
-                           ffn::RoutedDecoder decoder=ffn::RoutedDecoder::Q4K_Q51,bool omitScratch=false) {
+                           ffn::RoutedDecoder decoder=ffn::RoutedDecoder::Q4K_Q51,bool omitScratch=false,
+                           std::optional<DeviceRowRange> countGeometry=std::nullopt) {
         auto checkedOutput=output;
         if(omitScratch)checkedOutput.routedCodes=nullptr;
         const ffn::DirectBankInput bank{.runtime=runtime,.indices=operands->routeIds,
@@ -1125,7 +1129,7 @@ void verifyGroupedFormatRuntimeAdmission(Lane& lane,DeviceMoERuntimeTable& forei
             ASSERT_TRUE(recording.begin());
             const bool launched=fixed ?
                 ffn::launch(plan,{up,up,down},checkedOutput,ordinal,stream,bank,measured.geometry,decoder,fixed):
-                ffn::launchFormatProgram(plan,{up,up,down},output,ordinal,stream,bank,bound);
+                ffn::launchFormatProgram(plan,countGeometry.value_or(DeviceRowRange::deviceCounted(rows,plan.live)),{up,up,down},output,ordinal,stream,bank,bound);
             EXPECT_EQ(launched,expected);
             recording.finish();
         }
@@ -1134,6 +1138,13 @@ void verifyGroupedFormatRuntimeAdmission(Lane& lane,DeviceMoERuntimeTable& forei
         EXPECT_EQ(nodes,expected?2u:0u);
     };
     inspect(original,MoEGroupedPlanDemand::None,device.ordinal,true);
+    for(const auto invalid : {DeviceRowRange::fullyActive(rows),
+        DeviceRowRange::deviceCounted(6,plan.live).slice(1,4),
+        DeviceRowRange::deviceCounted(rows,plan.live+1),
+        DeviceRowRange::deviceCounted(8,plan.live)})
+        inspect(original,MoEGroupedPlanDemand::None,device.ordinal,false,nullptr,
+            ffn::RoutedDecoder::Q4K_Q51,false,invalid);
+
     inspect(original,MoEGroupedPlanDemand::DeferredAcceptedRows,device.ordinal,true);
     inspect(original,MoEGroupedPlanDemand::OrdinaryPrefill,device.ordinal,false);
     inspect(foreignRuntime,MoEGroupedPlanDemand::None,device.ordinal,false);
@@ -1247,7 +1258,7 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
             if (!shape.grouped_matrix_case.empty()) {
                 std::vector<GPUGraphKernelNodeInfo> nodes;
                 std::string error;
-                require(rows==4 && candidate->capture->inspectKernelNodes(nodes,&error),"Inspect the exact physical M4 parent");
+                require(rows==shape.grouped_matrix_rows && candidate->capture->inspectKernelNodes(nodes,&error),"Inspect the exact physical M4 parent");
                 std::size_t selected=0;
                 for (const auto& node:nodes) {
                     if (!shape.grouped_matrix_symbol.empty() && node.name_resolved &&
@@ -1263,13 +1274,13 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                     const std::string consumer=pitch?
                         "groupedFFNFormatProgramDownILj15ELb1ELi7ELi"+std::to_string(pitch)+"E":
                         fixed_program?"groupedFFNTokenDown":"groupedFFNFormatProgramDown";
-                    if(pitch || shape.grouped_matrix_case=="Q4_K_deep_grid") {
+                    if(shape.verify_grouped_gate_tiles || pitch || shape.grouped_matrix_case=="Q4_K_deep_grid" || shape.grouped_matrix_case=="Q4_K_underfilled_grid") {
                         require(!fixed_program && (!pitch || pitch==shape.routed) && shape.grouped_matrix_symbol_present,
                             "Direct-tile replay requires its exact all-format capture");
                         const GPUGraphKernelNodeInfo* gate=nullptr;
                         for(const auto& node:nodes) {
                             if(!node.name_resolved || node.name.find("groupedFFNFormatProgramGate")==std::string::npos)continue;
-                            require(!gate,"exactly one original Q4 Gate node");
+                            require(!gate,"exactly one original grouped Gate node");
                             gate=&node;
                         }
                         // Two wave pairs in each block own one K32 output tile apiece.
@@ -1278,9 +1289,9 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         const unsigned tiles=rows*(shape.top_k*(shape.routed/32)+shape.shared/32);
                         require(gate && gate->grid_x==(tiles+1)/2 && gate->grid_y==1 && gate->grid_z==1 &&
                             gate->block_x==256 && gate->block_y==1 && gate->block_z==1,
-                            "captured Q4 Gate must cover every original tile once");
+                            "captured grouped Gate must cover every original tile once");
                         std::osyncstream(std::cout)<<"M4_SOURCE_TILE_GEOMETRY,case="<<shape.grouped_matrix_case
-                            <<",F="<<shape.routed<<",down_symbol="<<consumer<<",gate_symbol="<<gate->name
+                            <<",M="<<rows<<",F="<<shape.routed<<",S="<<shape.shared<<",down_symbol="<<consumer<<",gate_symbol="<<gate->name
                             <<",gate_grid="<<gate->grid_x<<'x'<<gate->grid_y<<'x'<<gate->grid_z
                             <<",gate_block="<<gate->block_x<<'x'<<gate->block_y<<'x'<<gate->block_z<<'\n';
                     }
@@ -1296,13 +1307,16 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                             !record.tags.contains("program") || record.tags.at("program")!=program)
                             continue;
                         require(record.device==device.toString() && record.count==1 && record.value==1 &&
-                            record.tags.at("physical_rows")=="4" &&
+                            record.tags.at("physical_rows")==std::to_string(rows) &&
                             record.tags.at("routed_width")==std::to_string(shape.routed) &&
                             record.tags.at("shared_width")==std::to_string(shape.shared),
                             "Grouped native program counted an incompatible launch or source");
                         const auto& family=record.tags.at("decoder_family");
                         require(!family.empty() && family.find_first_not_of("0123456789")==std::string::npos,
                             "Grouped decoder family must be an exact compiled identity");
+                        require(!shape.expected_grouped_decoder_family ||
+                            family==std::to_string(shape.expected_grouped_decoder_family),
+                            "Native decoder family must match the independently declared source");
                         families.push_back(family);
                     }
                     require(families.size()==static_cast<std::size_t>(shape.grouped_matrix_symbol_present),
@@ -1518,7 +1532,7 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         }
                     verifyHistory(replay,"after commit");
                 }
-                if((require_frontier || !shape.grouped_matrix_case.empty()) && rows==4 &&
+                if((require_frontier || !shape.grouped_matrix_case.empty()) && rows==shape.grouped_matrix_rows &&
                    (replay==0 || (provePhysicalMove && (replay==2 || replay==3)))) {
                     // The actual route-plan producer reacquires a new runtime
                     // bank while both fused compute nodes keep their capture.
@@ -1672,7 +1686,7 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                 rendezvous.arrive_and_wait();
             }
             if (shape.grouped_matrix_timing) {
-                require(tp.degree()==1 && rows==4 && !shape.deferred_frontier_history,
+                require(tp.degree()==1 && rows==shape.grouped_matrix_rows && !shape.deferred_frontier_history,
                     "M4 event brackets own an exclusive static singleton capture");
                 auto child=worker.createGraphCapture(stream);
                 auto parent=worker.createGraphCapture(stream);
@@ -2129,7 +2143,7 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                         constexpr std::array default_counts{1,3,kMaxRows};
                         constexpr std::array q8_down_counts{3,4};
                         const bool frontier=qualification==OriginalSourceQualification::GroupedFFNFrontierReplay;
-                        constexpr std::array matrix_counts{4};
+                        const std::array matrix_counts{shape.grouped_matrix_rows};
                         const std::span<const int> capacities=!shape.grouped_matrix_case.empty()?std::span<const int>{matrix_counts}:
                             (frontier||qualification==OriginalSourceQualification::GroupedQ8DownReplay)?
                             std::span<const int>{q8_down_counts}:std::span<const int>{default_counts};

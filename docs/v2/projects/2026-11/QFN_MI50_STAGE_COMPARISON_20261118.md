@@ -761,7 +761,7 @@ modes did the same verification work in each pair.
 
 Fixed-depth review used 296 target rows in 74 verifier calls and code used
 344 in 86, exactly four rows per call. Dynamic review used 352 in 58 calls
-and code used 414 in 69. The optimized FFN program currently selects the
+and code used 414 in 69. At that revision, the optimized FFN program selected only the
 four-row capture. The largest absolute paired prefill change was 0.13%.
 [Full-model timings and matched work](/tmp/qfn-mi50-w-q4-borrow-model/comparison.json)
 
@@ -905,6 +905,98 @@ export LLAMINAR_PERF_STATS_FILTER=kernel.rocm_grouped_ffn_frontier_calls
 mpirun -np 1 --bind-to none "$BUILD/tests/v2/v2_integration_moe_intermediate_ffn_finalization" \
   --gtest_also_run_disabled_tests --gtest_filter=GroupedM4SourceWindow.DISABLED_OriginalQFN
 ```
+
+### Six-row dynamic verifier on the original TP4 shards
+
+The six-row captured FFN ran a full generation on four MI50s with the
+original 128/128/128/256 partition and RAM ngrams. Control and candidate
+used the same private Release core, `7edc20278a65`. Only the six-row FFN
+selection changed. Each prompt had three warmed 256-token trials.
+
+| Prompt | Dynamic prefill, control → six-row (tok/s) | Dynamic decode, control → six-row (tok/s) | Median paired decode gain | Verifier calls / target rows |
+| --- | ---: | ---: | ---: | ---: |
+| Review, 512 tokens | 1000.62 → 1000.26 | 115.92 → 126.91 | +9.51% | 58 / 352 |
+| Code, 2048 tokens | 970.11 → 969.56 | 94.43 → 103.81 | +10.18% | 69 / 414 |
+
+All generated token IDs matched each run's ordinary decode. The two
+dynamic arms matched all five counts for proposals, acceptance, rejection,
+verifier calls and verified rows. Ordinary decode changed by less than
+0.3% in both prompts. Storage stalls overlapped the staged control window.
+The earlier independently measured c237 rates of 116.08 and 94.74 tok/s
+were within 0.4% of the fresh control.
+[Serving trials](/tmp/qfn-mi50-m6-counted-frontier-evidence/serving/native-r2-comparison.json)
+[Independent history and counter comparison](/tmp/qfn-mi50-m6-counted-frontier-evidence/serving/native-r2-c237-history.json)
+
+Each affected six-row capture removed eight local FFN dispatches in each
+of the 48 layers, or 384 native nodes per GPU. Four of the 60 retained
+captures per participant changed. At physical six rows the isolated
+router and FFN fell from 268.28 to 173.05 µs at F128 and from 321.60 to
+241.09 µs at F256. Empty, partial, full and moved-bank replays matched
+serial decode bytes. These trials isolate the six-row change ahead of
+qualifying it together with the four-row tile and packet changes.
+[Native capture inventory](/tmp/qfn-mi50-m6-counted-frontier-evidence/serving/native-r2-capture-delta.json)
+[Original source windows](/tmp/qfn-mi50-m6-counted-frontier-evidence/pci8c-real-r2-battery-comparison.json)
+
+The four-row packet-depth check also compared one and two outstanding K32
+reads with the *same* dedicated tile grid and projection code. Two packets
+reduced the complete parent from 98.43 to 94.57 µs on the underfilled
+F64/S96 grid and from 229.93 to 218.46 µs at F384/S320. They cost 4.10%
+at F640/S640. On both original TP4 widths and the three held-out TP3
+widths, the single-packet parent was faster. The dispatch experiment
+therefore selects two packets for less than one workgroup per CU or a
+sparse final round after at least two complete rounds.
+[Seven original windows on PCI bd](/tmp/qfn-mi50-original-packet-dispatch-bd/comparison-single-a.json)
+[Held-out three-way windows](/tmp/qfn-mi50-gate-packet-holdout-final-bd/comparison-single-a.json)
+
+### Combined counted verifier across original widths and formats
+
+On PCI bd, a second comparison held the counted FFN active in *both* arms
+for four and six rows. The previous six-row candidate used the original
+c237 tile/packet schedule. The combined Release used dedicated tiles on
+wide mixed-format gates, packet-depth selection and the width-specific
+Q5_1 down reader. The same original source windows and live routes passed
+serial byte replay. The table gives µs per complete captured router and
+expert FFN. The measurements exclude HC and peer reduction.
+
+| Rows | TP degree | Routed / shared width | Routed gate / down | Previous counted | Combined counted | Change |
+| ---: | ---: | ---: | --- | ---: | ---: | ---: |
+| 4 | 4 | 128 / 160 | Q4_K / Q5_1 | 121.53 | 113.75 | -6.41% |
+| 4 | 4 | 256 / 160 | Q4_K / Q5_1 | 180.12 | 152.98 | -15.07% |
+| 4 | 8 | 64 / 96 | Q4_K / Q5_1 | 99.09 | 93.68 | -5.46% |
+| 6 | 4 | 128 / 160 | Q4_K / Q5_1 | 165.64 | 150.14 | -9.36% |
+| 6 | 4 | 256 / 160 | Q4_K / Q5_1 | 233.65 | 217.57 | -6.88% |
+| 6 | 4 | 128 / 160 | Q5_K / Q8_0 | 183.46 | 170.70 | -6.96% |
+| 6 | 4 | 256 / 160 | Q5_K / Q8_0 | 273.24 | 270.19 | -1.12% |
+
+All four arms used the prepared source, serving register top-K and twelve
+32-operation samples per width. A host NVMe stall delayed container
+retirement in the control bracket. These values come from native GPU
+events during replay. The all-format experiment on PCI c2 independently
+covered 15 generated source families at four rows and F256/S256. All
+15 improved in both directions of the A/B/B/A bracket. The median
+reduction in complete local time was 22.01%, ranging from 9.94% on
+G01 to 33.87% on G07. Hardware-counter inspection of the original
+wide Q5_K gate measured 459.58 GB/s, or 78.82% of its independently
+calibrated 170-workgroup packet-read reference.
+[Combined real-shard A/B samples](/tmp/qfn-mi50-combined-rows-bd/comparison-previous-a2.json)
+[Per-family source identities and timings](/tmp/qfn-mi50-all-readers-c2/batch-catalog-r1/catalog-score.csv)
+[Q5_K physical counter scope and calibration](/tmp/qfn-mi50-all-readers-c2/REPORT.md)
+
+All 13 focused preflight cases passed on the combined ELF. The first
+pass exposed three test registrations that started their single MPI rank
+on socket 0 while the test MI50 belonged to socket 1. Using the existing
+one-rank-per-socket registration let the NUMA-local rank run each test.
+An existing bank-rejection case timed out during a host NVMe write stall.
+It passed at the original 120-second limit on the same binary. Both
+shipped ROCm targets passed the spill guard.
+[Per-test native receipts on the same ELF](/tmp/qfn-mi50-fixed-bank-proof/canonical-counted-m6-tiles/qualified.json)
+
+For G15, the wide gate fell from 224.80 to 153.60 µs. Its physical read
+rate rose from 104.87 to 145.97 GB/s, reaching 26.83% of the 543.99 GB/s
+matched packet-read reference. The receipt verifies all 40 ordered route
+IDs. This gap leaves the indexed decoder's instruction and dependency
+costs to be quantified before assigning the remaining time to memory.
+[G15 route, physical fetch and issue counters](/tmp/qfn-mi50-all-readers-c2/g15-score.json)
 
 ## Reproduction
 

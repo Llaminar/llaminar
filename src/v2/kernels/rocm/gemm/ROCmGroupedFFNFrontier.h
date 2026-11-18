@@ -25,6 +25,8 @@ struct DeviceMoELayerRuntime;
 class DeviceMoERuntimeTable;
 namespace rocm::grouped_ffn {
 inline constexpr int capacity=4, hidden=2560, routedWidth=128, sharedWidth=160, topK=10, experts=512;
+/** @return The full physical rows qualified by the counted all-format launch. */
+inline constexpr bool supportsFormatRows(int rows) noexcept { return rows==capacity || rows==6; }
 inline constexpr std::size_t sharedCodesBytes=capacity*sharedWidth;
 inline constexpr std::size_t sharedScalesBytes=capacity*(sharedWidth/32)*sizeof(float);
 inline constexpr std::size_t sharedGateBytes=capacity*sizeof(float);
@@ -380,6 +382,7 @@ bool launch(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDe
 
 /** @brief Record the counted native gate/up and down leaves for a sealed format declaration.
  * @param plan Original device-owned counts, router rows and reachable expert descriptors.
+ * @param rows Original unsliced verifier count owner and physical graph capacity.
  * @param shared Original immutable shared gate, up and down matrices.
  * @param output Existing graph workspace and publication targets.
  * @param device Exact admitted ROCm ordinal.
@@ -388,7 +391,8 @@ bool launch(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDe
  * @param bound Original authenticated runtime, source formats and participant geometry.
  * @return Whether both native submissions succeeded.
  */
-bool launchFormatProgram(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDesc,3>& shared,
+bool launchFormatProgram(const RoutePlan& plan,const DeviceRowRange& rows,
+    const std::array<DeviceNativeQuantisedMatrixDesc,3>& shared,
     const Output& output,int device,void* stream,const DirectBankInput& direct,const BoundSourceFormatProgram& bound);
 
 } // namespace rocm::grouped_ffn

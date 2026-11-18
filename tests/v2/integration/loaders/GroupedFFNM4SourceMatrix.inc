@@ -9,7 +9,7 @@
 namespace llaminar2::test {
 namespace {
 
-enum class M4SourceRole { RoutedGateUp, RoutedDown, SharedGateUp, SharedDown, Family, RuntimeOnly, FixedQ51Down };
+enum class M4SourceRole { RoutedGateUp, RoutedDown, SharedGateUp, SharedDown, Family, RuntimeOnly, FixedQ51Down, WideQ5GateUp, WideFamily };
 
 struct M4SourceCase {
     std::string name; ///< Filter and receipt identity.
@@ -39,9 +39,11 @@ std::vector<M4SourceCase> groupedM4Cases()
     cases.push_back({"Q8_1_shared_down_prepared",M4SourceRole::SharedDown,"Q8_1",{}});
     cases.push_back({"Q4_K_repeat_routes",M4SourceRole::RoutedGateUp,"Q4_K",{}});
     cases.push_back({"Q4_K_sparse_routes",M4SourceRole::RoutedGateUp,"Q4_K",{}});
+    cases.push_back({"Q4_K_underfilled_grid",M4SourceRole::RoutedGateUp,"Q4_K",{}});
     cases.push_back({"Q4_K_deep_grid",M4SourceRole::RoutedGateUp,"Q4_K",{}});
     cases.push_back({"Q4_K_Q5_1_Down_F128",M4SourceRole::FixedQ51Down,"Q4_K",{},128});
     cases.push_back({"Q4_K_Q5_1_Down_F256",M4SourceRole::FixedQ51Down,"Q4_K",{},256});
+    cases.push_back({"Q5_K_wide_direct_tiles",M4SourceRole::WideQ5GateUp,"Q5_K",{}});
     cases.push_back({"Q5_K_sparse_routes",M4SourceRole::RoutedGateUp,"Q5_K",{}});
     cases.push_back({"Q2_K_sparse_routes",M4SourceRole::RoutedDown,"Q2_K",{}});
     cases.push_back({"IQ1_M_sparse_routes",M4SourceRole::RoutedDown,"IQ1_M",{}});
@@ -49,8 +51,11 @@ std::vector<M4SourceCase> groupedM4Cases()
     cases.push_back({"IQ4_XS_up_IQ4_NL",M4SourceRole::RoutedGateUp,"IQ4_XS",{}});
     cases.push_back({"IQ4_NL_shared_up_IQ4_XS",M4SourceRole::SharedGateUp,"IQ4_NL",{}});
     cases.push_back({"IQ4_XS_shared_up_IQ4_NL",M4SourceRole::SharedGateUp,"IQ4_XS",{}});
-    for (const auto& family:fullNativeHCFFNFamilyCases())
+    for (const auto& family:fullNativeHCFFNFamilyCases()) {
         cases.push_back({family.name,M4SourceRole::Family,{},family});
+        if(family.groups==15)
+            cases.push_back({"G15_IQ3_XXS_wide_direct_tiles",M4SourceRole::WideFamily,{},family});
+    }
     return cases;
 }
 
@@ -80,7 +85,7 @@ void expectGroupedM4Program(OriginalFFNFixtureGeometry& shape)
 }
 
 /** @brief Use the original source preparer and run the counted M4 production graph. */
-void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing)
+void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing,int physicalRows=4)
 {
     if (item.role==M4SourceRole::RuntimeOnly) {
         require(!timing,"Q8_1 has no GGUF source-backed timing arm");
@@ -91,7 +96,9 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing)
     const auto& q8=quantizedVerifierFormat("Q8_0");
     const auto& selected=item.family?q8:quantizedVerifierFormat(item.source);
     const bool fixedQ51Down=item.role==M4SourceRole::FixedQ51Down;
-    const auto& gate=(item.role==M4SourceRole::RoutedGateUp || fixedQ51Down)?selected:q8;
+    const bool wideQ5GateUp=item.role==M4SourceRole::WideQ5GateUp;
+    const bool wideFamily=item.role==M4SourceRole::WideFamily;
+    const auto& gate=(item.role==M4SourceRole::RoutedGateUp || fixedQ51Down || wideQ5GateUp)?selected:q8;
     const auto& down=fixedQ51Down?quantizedVerifierFormat("Q5_1"):
         item.role==M4SourceRole::RoutedDown?selected:q8;
     const auto& shared=item.role==M4SourceRole::SharedGateUp?selected:q8;
@@ -103,8 +110,10 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing)
     });
     require(original!=variants.end(),"Routed gate/up has its original source preparer");
     auto shape=fullNativeHCFFNFamilyGeometry();
+    shape.grouped_matrix_rows=physicalRows;
     if (!item.family) {
-        shape.routed=fixedQ51Down?item.fixed_down_pitch:down.source_is_superblock?256:160;
+        shape.routed=fixedQ51Down?item.fixed_down_pitch:
+            (wideQ5GateUp || down.source_is_superblock?256:160);
         shape.shared=shared_down.source_is_superblock?256:160;
     }
     if(item.name=="Q4_K_deep_grid") {
@@ -112,6 +121,9 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing)
         // 320 shared columns, enough tiles to exercise the long-grid program.
         shape.routed=384;
         shape.shared=320;
+    } else if(item.name=="Q4_K_underfilled_grid") {
+        shape.routed=64;
+        shape.shared=96;
     }
     auto format=item.family?fullNativeHCFFNFamilySource(*item.family,shape):*original;
     format.name=item.name;
@@ -144,10 +156,20 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing)
         shape.expected_q51_down_pitch=item.fixed_down_pitch;
         shape.grouped_matrix_symbol="groupedFFNFormatProgramGate";
     }
-    if(item.name=="Q4_K_deep_grid")
-        shape.grouped_matrix_symbol="groupedFFNFormatProgramGateILj1ELi5ELi0ELi2EE";
+    if(item.name=="Q4_K_deep_grid" || item.name=="Q4_K_underfilled_grid")
+        shape.grouped_matrix_symbol="groupedFFNFormatProgramGateILj1ELi5ELi0ELi2ELb1EE";
     if(item.name=="Q5_K_sparse_routes" && shape.grouped_matrix_program==GroupedM4FixtureProgram::AllFormats)
-        shape.grouped_matrix_symbol="groupedFFNFormatProgramGateILj1ELin1ELi160ELi1EE";
+        shape.grouped_matrix_symbol="groupedFFNFormatProgramGateILj1ELin1ELi160ELi1ELb0EE";
+    if(wideQ5GateUp) {
+        shape.grouped_matrix_symbol="groupedFFNFormatProgramGateILj1ELin1ELi256ELi1ELb1EE";
+        shape.verify_grouped_gate_tiles=true;
+        shape.expected_grouped_decoder_family=1;
+    }
+    if(wideFamily) {
+        shape.grouped_matrix_symbol="groupedFFNFormatProgramGateILj15ELin1ELi0ELi1ELb1EE";
+        shape.verify_grouped_gate_tiles=true;
+        shape.expected_grouped_decoder_family=item.family->groups;
+    }
     shape.grouped_matrix_timing=timing;
     shape.deferred_frontier_history=deferred;
     std::osyncstream(std::cout)<<"M4_SOURCE_INPUT,case="<<item.name
@@ -197,6 +219,33 @@ TEST_P(GroupedM4Source, Deferred) { runGroupedM4Source(GetParam(),true,false); }
 /** @test A separate unprofiled event window with the same exact parent and byte oracle. */
 TEST_P(GroupedM4Source, DISABLED_Events) { runGroupedM4Source(GetParam(),false,true); }
 
+/** @test Exact retained M6 publications under zero, partial and full live counts. */
+TEST(GroupedM6Source, CountedReplay)
+{
+    const auto matrix=groupedM4Cases();
+    const auto original=std::ranges::find_if(matrix,
+        [](const M4SourceCase& item){return item.name=="Q4_K_routed_gate_up";});
+    ASSERT_NE(original,matrix.end());
+    runGroupedM4Source(*original,false,false,6);
+    runGroupedM4Source(*original,true,false,6);
+}
+
+/** @test Publish moved Q5_1 planes and preserve accepted history in one retained M6 graph. */
+class GroupedM6Q51Down : public ::testing::TestWithParam<int> {};
+
+TEST_P(GroupedM6Q51Down, Deferred)
+{
+    const auto matrix=groupedM4Cases();
+    const auto original=std::ranges::find_if(matrix,[&](const M4SourceCase& item) {
+        return item.role==M4SourceRole::FixedQ51Down && item.fixed_down_pitch==GetParam();
+    });
+    ASSERT_NE(original,matrix.end());
+    runGroupedM4Source(*original,true,false,6);
+}
+
+INSTANTIATE_TEST_SUITE_P(OriginalSources,GroupedM6Q51Down,::testing::Values(128,256),
+    [](const ::testing::TestParamInfo<int>& item){return "F"+std::to_string(item.param);});
+
 INSTANTIATE_TEST_SUITE_P(OriginalSources,GroupedM4Source,::testing::ValuesIn(groupedM4Cases()),
     [](const ::testing::TestParamInfo<M4SourceCase>& item){return item.param.name;});
 
@@ -213,6 +262,10 @@ TEST(GroupedM4SourceWindow, DISABLED_OriginalQFN)
     auto window=realProductionTPInputFromEnv();
     auto format=window.format();
     auto shape=window.geometry();
+    if(const char* rows=std::getenv("LLAMINAR_TEST_QFN_WINDOW_ROWS")) {
+        require(std::string_view(rows)=="4" || std::string_view(rows)=="6","Exact original M4/M6 fixture rows");
+        shape.grouped_matrix_rows=std::string_view(rows)=="6"?6:4;
+    }
     const char* demand=std::getenv("LLAMINAR_TEST_GROUPED_M4_DEMAND");
     const char* events=std::getenv("LLAMINAR_TEST_QFN_WINDOW_EVENTS");
     require(demand && (std::string_view(demand)=="static" || std::string_view(demand)=="deferred"),

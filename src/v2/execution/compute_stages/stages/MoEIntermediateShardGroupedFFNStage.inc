@@ -15,14 +15,15 @@ bool groupedFFNFrontierWidthEligible(int columns)
          qfnGroupedFFNEqualFrontierOptIn() && qfnGroupedFFNDirectBankExperiment());
 }
 
-/** @return The cold-selected local program for a counted four-row MI50 verifier stage. */
+/** @return The cold-selected local program for a qualified counted MI50 verifier stage. */
 std::optional<frontier::Program> groupedFFNFrontierProgram(const Binding& binding,
     const SharedExpertFFNStage::Params& shared,const DeviceMoEExpertDescriptor& source)
 {
     const auto& p=binding.params;
     if(!qfnGroupedFFNFrontierOptIn() || !binding.device().is_rocm() ||
        p.phase!=MoEOverlayServicePhaseHint::GroupedVerifier ||
-       p.row_mode!=MoEIntermediateShardRowMode::Grouped || p.rows!=frontier::capacity ||
+       p.row_mode!=MoEIntermediateShardRowMode::Grouped || !frontier::supportsFormatRows(p.rows) ||
+       (p.rows!=frontier::capacity && !qfnGroupedFFNAllFormatsOptIn()) ||
        p.top_k!=frontier::topK || !p.live_rows || !p.live_rows->countOwner() ||
        binding.route_authority==RouteAuthority::PreparedService ||
        binding.original.modelColumns()!=frontier::hidden ||
@@ -83,11 +84,12 @@ class GroupedFFNFrontierStage final : public IComputeStage, public IWorkspaceCon
     /** @return Exact live shared Q8 extent or the explicitly selected sum layout in the same input bank. */
     std::array<ScratchRequirement,4> scratchRequirements()const
     {
-        const auto codes=std::size_t(frontier::capacity)*frontier::sharedColumns(publication_.program);
+        const auto rows=std::size_t(publication_.rows.physicalRows());
+        const auto codes=rows*frontier::sharedColumns(publication_.program);
         const bool sums=frontier::usesExactK32Sums(publication_.program);
         return {{{MoEWorkspaceBuffers::PREFILL_A_INT8,sums?frontier::k32SumWorkspaceBytes:codes},
             {MoEWorkspaceBuffers::PREFILL_A_SCALES,codes/32*sizeof(float)},
-            {MoEWorkspaceBuffers::ROCM_SHARED_GATE,frontier::sharedGateBytes},
+            {MoEWorkspaceBuffers::ROCM_SHARED_GATE,rows*sizeof(float)},
             {MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY,frontier::bankIdentityBytes}}};
     }
     std::array<std::shared_ptr<const WorkspaceBufferLease>,4> scratch_leases_;
@@ -168,7 +170,7 @@ public:
     /** @return The unchanged original grouped quote, including the router-disjoint reusable scratch. */
     WorkspaceRequirements getWorkspaceRequirements(int m,int=0,int=0)const override
     {
-        auto requirements=MoEWorkspaceBuffers::rocmMoE(std::max(m,frontier::capacity),frontier::hidden,
+        auto requirements=MoEWorkspaceBuffers::rocmMoE(std::max(m,publication_.rows.physicalRows()),frontier::hidden,
             frontier::routedColumns(publication_.program),frontier::experts,frontier::topK);
         // The routed and shared branches reuse the same named banks at disjoint times.
         WorkspaceRequirements shared;
@@ -222,6 +224,7 @@ public:
         mix(qfnGroupedFFNDirectBankExperiment());
         mix(frontier::usesExactK32Sums(publication_.program));
         mix(publication_.program.index());
+        mix(publication_.rows.physicalRows());
         mix(frontier::routedColumns(publication_.program));
         mix(frontier::sharedColumns(publication_.program));
         const auto mixFormat=[&](const NativeQuantisedExecutionFormatEnvelope& format) {
@@ -268,6 +271,13 @@ public:
         runtime_generation_=backend_?backend_->deviceRuntimeGeneration(device().ordinal):0;
         if(!runtime_generation_)
             throw std::logic_error("Grouped FFN frontier has no admitted backend generation");
+        if(binding_->params.demand==MoEGroupedPlanDemand::DeferredAcceptedRows) {
+            const auto& runtime=binding_->params.runtime->hostLayerState(binding_->layer);
+            const auto slots=std::uint32_t(publication_.rows.physicalRows()*frontier::topK);
+            if(runtime.deferred_verifier_route_capacity<slots ||
+               !runtime.deferred_verifier_route_expert_ids || !runtime.deferred_verifier_route_participant_ids)
+                throw std::logic_error("Grouped FFN frontier requires the original full-capacity deferred route planes");
+        }
         if(qfnGroupedFFNDirectBankExperiment())
             publication_.boundSourceProgram=frontier::BoundSourceFormatProgram::prepare(
                 *binding_->params.runtime,binding_->layer,publication_.program,publication_.sharedWeights);

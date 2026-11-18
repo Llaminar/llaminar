@@ -14,7 +14,7 @@
  * readers get the same published-native view as the acquired original bank.
  */
 class PreparedGroupedSharedRole final {
-    friend bool launchFormatProgram(const RoutePlan&,const std::array<DeviceNativeQuantisedMatrixDesc,3>&,
+    friend bool launchFormatProgram(const RoutePlan&,const DeviceRowRange&,const std::array<DeviceNativeQuantisedMatrixDesc,3>&,
         const Output&,int,void*,const DirectBankInput&,const BoundSourceFormatProgram&);
     DeviceNativeQuantisedMatrixDesc descriptor_{};
     NativeQuantisedExecutionFormatEnvelope formats_{};
@@ -72,18 +72,18 @@ __device__ __forceinline__ Projections sealedPair(PublishedNativeProjection gate
     return pairedProjections<Format,0,false,Routed,K32Packets>(gate,up,row.codes,row.scales,column,parts,lane);
 }
 
-template<unsigned Groups,int RoutedCodebook=-1,int FixedQ5Pitch=0,int K32Packets=1>
+template<unsigned Groups,int RoutedCodebook,int FixedQ5Pitch,int K32Packets,bool DedicatedTiles>
 __global__ __launch_bounds__(threads)
 void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCodes,
     const float* hiddenScales,const float* hiddenFP32,Scratch scratch,Output output,DirectBankInput direct,
-    int routedColumns,int sharedColumns,NativeQuantisedExecutionFormatEnvelope routedFormats,
+    int physicalRows,int routedColumns,int sharedColumns,NativeQuantisedExecutionFormatEnvelope routedFormats,
     int gateParts,int upParts,SealedSharedRole sharedGate,SealedSharedRole sharedUp)
 {
     const int tid=threadIdx.x;
     const int live=__builtin_amdgcn_readfirstlane(*liveOwner);
-    if(live<0 || live>capacity)__builtin_trap();
+    if(live<0 || live>physicalRows)__builtin_trap();
     const auto bank=acquireBank<false>(direct);
-    if(blockIdx.x==0)publishRoutes(direct,bank,live);
+    if(blockIdx.x==0)publishRoutes(direct,bank,live,physicalRows);
     if(live==0)return;
 
     __shared__ float gate_sums[16];
@@ -94,7 +94,6 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
     }
     constexpr int owners=threads/tileThreads;
     __shared__ float published[owners][32];
-    constexpr bool oneTile = RoutedCodebook >= 0;
     // Ownership and the original route slots are identical across a whole
     // physical wave, even though columns and partition lanes are different.
     const int owner=__builtin_amdgcn_readfirstlane(tid/tileThreads);
@@ -190,7 +189,7 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
         }
         // A dedicated tile publishes once. Only a workgroup that reuses this
         // LDS slot for another tile must wait for the previous readers.
-        if constexpr(oneTile) break;
+        if constexpr(DedicatedTiles) break;
         else __syncthreads();
     }
 }
@@ -263,7 +262,7 @@ void groupedFFNFormatProgramDown(const int32_t* liveOwner,Scratch scratch,Output
     const int wave=__builtin_amdgcn_readfirstlane(threadIdx.x/columns);
     const int column=blockIdx.x*columns+lane;
     const int live=__builtin_amdgcn_readfirstlane(*liveOwner);
-    if(live<0 || live>capacity)__builtin_trap();
+    if(live<0 || live>static_cast<int>(gridDim.y))__builtin_trap();
     const auto published=AcquiredGroupedRoutePublication::acquire(direct);
     const int row=blockIdx.y;
     __shared__ float complete[topK+1][columns];
@@ -353,10 +352,16 @@ SourceFormatProgram SourceFormatProgram::prepare(const SourceFormatDeclaration& 
     return {declaration,routed,shared};
 }
 
-bool launchFormatProgram(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDesc,3>& sharedWeights,
+bool launchFormatProgram(const RoutePlan& plan,const DeviceRowRange& rows,
+    const std::array<DeviceNativeQuantisedMatrixDesc,3>& sharedWeights,
     const Output& output,int device,void* stream,const DirectBankInput& direct,const BoundSourceFormatProgram& bound)
 {
-    if(!bound.matches(direct.runtime,device))return false;
+    const int physicalRows=rows.physicalRows();
+    const auto geometry=rows.captureIdentity();
+    if(!bound.matches(direct.runtime,device) || !supportsFormatRows(physicalRows) ||
+       rows.countOwner()!=plan.live || geometry.first_physical_row!=0 ||
+       geometry.count_capacity!=physicalRows || geometry.repeats_per_row!=1)
+        return false;
     const auto* formatsProgram=std::get_if<SourceFormatProgram>(&bound.program());
     if(!formatsProgram)return false;
     const auto& program=*formatsProgram;
@@ -369,9 +374,9 @@ bool launchFormatProgram(const RoutePlan& plan,const std::array<DeviceNativeQuan
        !output.routedCodes || !output.routedScales || !output.sharedCodes || !output.sharedScales ||
        !output.sharedInputGate || !output.gateValues || !output.sharedGateScratch || !output.sharedUpScratch ||
        !output.routedOutput || !output.sharedOutput || !output.combined || !output.routeContributions ||
-       routedColumns<=0 || routedColumns%32 || routedColumns>INT_MAX/(capacity*topK) ||
-       sharedColumns<=0 || sharedColumns%32 || sharedColumns>INT_MAX/capacity ||
-       (direct.affineSums && (routedColumns!=160 || sharedColumns!=160)) ||
+       routedColumns<=0 || routedColumns%32 || routedColumns>INT_MAX/(physicalRows*topK) ||
+       sharedColumns<=0 || sharedColumns%32 || sharedColumns>INT_MAX/physicalRows ||
+       (direct.affineSums && (physicalRows!=capacity || routedColumns!=160 || sharedColumns!=160)) ||
        !generic::validFormats(formats.routedGateUp) || !generic::validFormats(formats.routedDown))
         return false;
     const Scratch scratch{output.routedCodes,output.routedScales,output.sharedCodes,output.sharedScales,output.gateValues};
@@ -392,39 +397,50 @@ bool launchFormatProgram(const RoutePlan& plan,const std::array<DeviceNativeQuan
     }
     const auto native=static_cast<hipStream_t>(stream);
     constexpr int owners=threads/tileThreads;
-    const int maxTiles=capacity*(topK*(routedColumns/32)+sharedColumns/32);
-    const int tileGrid=std::max(capacity,(maxTiles+owners-1)/owners);
+    const int maxTiles=physicalRows*(topK*(routedColumns/32)+sharedColumns/32);
+    const int tileGrid=std::max(physicalRows,(maxTiles+owners-1)/owners);
     const auto gateFamilies=ResidentMoEFFNDecoderProgram::fromExecutionMask(
         formats.routedGateUp.execution_codebook_mask | formats.shared[0].execution_codebook_mask |
         formats.shared[1].execution_codebook_mask);
-    const auto launchGate=[&]<unsigned Groups,int RoutedCodebook=-1,int FixedQ5Pitch=0,int K32Packets=1>() {
-        const int gateGrid=RoutedCodebook>=0 ? tileGrid : std::min(gateBlocks,tileGrid);
-        hipLaunchKernelGGL((groupedFFNFormatProgramGate<Groups,RoutedCodebook,FixedQ5Pitch,K32Packets>),dim3(gateGrid),dim3(threads),0,native,
-            plan.live,plan.hiddenCodes,plan.hiddenScales,plan.hiddenFP32,scratch,output,direct,
-            routedColumns,sharedColumns,formats.routedGateUp,routedParts[0],routedParts[1],roles[0],roles[1]);
+    const auto recordGate=[&]<unsigned Groups,int RoutedCodebook,int FixedQ5Pitch,int K32Packets,bool DedicatedTiles>() {
+        const int grid=DedicatedTiles?tileGrid:std::min(gateBlocks,tileGrid);
+        hipLaunchKernelGGL((groupedFFNFormatProgramGate<Groups,RoutedCodebook,FixedQ5Pitch,K32Packets,DedicatedTiles>),
+            dim3(grid),dim3(threads),0,native,plan.live,plan.hiddenCodes,plan.hiddenScales,plan.hiddenFP32,
+            scratch,output,direct,physicalRows,routedColumns,sharedColumns,formats.routedGateUp,
+            routedParts[0],routedParts[1],roles[0],roles[1]);
+    };
+    const auto launchGate=[&]<unsigned Groups,int FixedQ5Pitch=0>() {
+        // Reused workgroups hide packet latency on small separate-reader grids.
+        // When the resident grid would repeat tiles, distribute the original
+        // Q8 tiles to independent wave pairs and retire them after publication.
+        if(tileGrid>gateBlocks)
+            recordGate.template operator()<Groups,-1,FixedQ5Pitch,1,true>();
+        else
+            recordGate.template operator()<Groups,-1,FixedQ5Pitch,1,false>();
     };
     if(program.pairsGateAndUp()) {
-        // The measured 60-CU schedule has two workgroups per CU in a
-        // 120-block round. Extra in-flight reads help a sparse final round;
-        // fully populated rounds repay the lower live-register count.
+        // With fewer workgroups than CUs, two outstanding packets hide the
+        // original load dependency. A small tail also benefits on long grids
+        // after two full resident rounds. In original intermediate grids a
+        // second packet raised register lifetime and slowed the complete parent.
         const int tail=tileGrid%gateBlocks;
-        if(tileGrid>gateBlocks && tail>0 && tail<=gateBlocks/4)
-            launchGate.template operator()<1,NATIVE_QUANTISED_PF_Q4_1,0,2>();
+        if(tileGrid<gateBlocks/2 || (tileGrid>=2*gateBlocks && tail>0 && tail<=gateBlocks/4))
+            recordGate.template operator()<1,NATIVE_QUANTISED_PF_Q4_1,0,2,true>();
         else
-            launchGate.template operator()<1,NATIVE_QUANTISED_PF_Q4_1>();
+            recordGate.template operator()<1,NATIVE_QUANTISED_PF_Q4_1,0,1,true>();
     }
     else if(const auto pitch=program.fixedQ5GatePitch(sharedWeights)) {
         switch(*pitch) {
-            case FixedQ5GatePitch::F128: launchGate.template operator()<1,-1,128>(); break;
-            case FixedQ5GatePitch::F160: launchGate.template operator()<1,-1,160>(); break;
-            case FixedQ5GatePitch::F256: launchGate.template operator()<1,-1,256>(); break;
+            case FixedQ5GatePitch::F128: launchGate.template operator()<1,128>(); break;
+            case FixedQ5GatePitch::F160: launchGate.template operator()<1,160>(); break;
+            case FixedQ5GatePitch::F256: launchGate.template operator()<1,256>(); break;
         }
     }
     else if(gateFamilies.groups()==1) launchGate.template operator()<1>();
     else launchGate.template operator()<15>();
     if(hipGetLastError()!=hipSuccess)return false;
     const auto launchDown=[&]<unsigned Groups,bool OneBlockPerPartition,int RoutedPhysical=-1,int FixedRoutedWidth=0>() {
-        hipLaunchKernelGGL((groupedFFNFormatProgramDown<Groups,OneBlockPerPartition,RoutedPhysical,FixedRoutedWidth>),dim3(hidden/64,capacity),dim3(threads),0,native,
+        hipLaunchKernelGGL((groupedFFNFormatProgramDown<Groups,OneBlockPerPartition,RoutedPhysical,FixedRoutedWidth>),dim3(hidden/64,physicalRows),dim3(threads),0,native,
             plan.live,scratch,output,direct,routedColumns,sharedColumns,formats.routedDown,
             routedParts[2],roles[2]);
     };
