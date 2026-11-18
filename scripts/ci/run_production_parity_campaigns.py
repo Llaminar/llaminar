@@ -1037,7 +1037,7 @@ def preflight_optional_hardware_requirements(
         context_cases = [label.removeprefix("MaximumContext") for label in row.labels
                          if label.startswith("MaximumContext")]
         if "HardwareOptional" not in row.labels:
-            if context_cases or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair", "LocalHostDevices"} or isa_labels or stage_labels or rank_labels or any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels):
+            if context_cases or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair", "LocalHostDevices", "ROCmHostCall"} or isa_labels or stage_labels or rank_labels or any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels):
                 raise RuntimeError("optional ISA/stage labels require HardwareOptional: " + row.name)
             continue
         device_labels = sorted(label for label in row.labels if label.startswith("Devices"))
@@ -1054,7 +1054,7 @@ def preflight_optional_hardware_requirements(
         family_labels = sorted(label for label in row.labels
                                if label.startswith(("CUDADevices", "ROCmDevices")))
         if family_labels:
-            if (context_cases or backends != {"CUDA", "ROCm"} or len(family_labels) != 2
+            if ("ROCmHostCall" in row.labels or context_cases or backends != {"CUDA", "ROCm"} or len(family_labels) != 2
                     or len(device_labels) != 1 or isa_labels or stage_labels or rank_labels or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"}
                     or any(re.fullmatch(r"(?:CUDA|ROCm)Devices[1-9][0-9]*", label) is None for label in family_labels)):
                 raise RuntimeError("ambiguous optional mixed-family geometry: " + row.name)
@@ -1079,6 +1079,8 @@ def preflight_optional_hardware_requirements(
         try:
             requirement = {"backend": next(iter(backends)).lower(), "degree": int(device_labels[0][7:]),
                 "locality": "local-host" if local_host else "two-distinct-numa-local-ranks" if distinct_ranks else "original-numa-local-rank"}
+            if "ROCmHostCall" in row.labels:
+                requirement["requires_host_native_atomics"] = True
             if context_cases:
                 if len(context_cases) != 1:
                     raise ValueError("ambiguous maximum-context physical requirement")

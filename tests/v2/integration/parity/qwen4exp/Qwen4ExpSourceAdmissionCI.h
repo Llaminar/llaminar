@@ -12,6 +12,9 @@
 #include "Qwen4ExpCPUJointSocketEvidence.h"
 #include "../ModelParityRuntimeExport.h"
 #include "backends/HardwareInventory.h"
+#ifdef HAVE_ROCM
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#endif
 #include "../../../fixtures/planning/MaximumContextStateGeometry.h"
 #include <algorithm>
 #include <filesystem>
@@ -226,6 +229,12 @@ inline void exportQwen4ExpSourceHardware(const std::filesystem::path &path,
         // This fixture always allocates on physical ordinal zero. Price each
         // independent model/policy with the same planner used to materialize it.
         if (physical && ordinal == 0 && scope != HardwareInventoryScope::SourceAdmission) {
+#ifdef HAVE_ROCM
+            if (std::string_view(backend) == "rocm") {
+                const auto& original = rocmHardwareMetadata().at(ordinal);
+                out << ",\"host_native_atomics\":" << (original.host_native_atomics ? "true" : "false");
+            }
+#endif
             const bool shared = scope == HardwareInventoryScope::SharedPreflight;
             if (!total || physical->free_memory_bytes > total)
                 throw std::runtime_error("Invalid original maximum-context capacity observation");

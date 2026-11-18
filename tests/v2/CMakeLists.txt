@@ -25364,8 +25364,8 @@ if(HAVE_ROCM)
         PRIVATE GTest::gtest GTest::gtest_main)
     add_v2_test(V2_Integration_HIPHostThreadStack
         COMMAND $<TARGET_FILE:v2_integration_hip_host_thread_stack>
-        LABELS "V2;Integration;ProductionTestPreflight;Backends;GraphCapture;ROCm;HIP;Memory;Lifecycle;Regression"
-        MPI_PROCS 1
+        LABELS "V2;Integration;ProductionTestPreflight;Backends;GraphCapture;ROCm;ROCmHostCall;HIP;Memory;Lifecycle;Regression"
+        GPU_DEVICES 1 MPI_PROCS 1
         NO_MODELS
         TIMEOUT 30)
     # NoCU maintenance must not lose bytes when owners outnumber DMA engines.
@@ -41588,6 +41588,7 @@ if(Python3_Interpreter_FOUND AND NOT V2_PERF_TESTS_ONLY)
     add_v2_test(V2_Integration_PreflightObservedNativePipelineQualification
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_parity_campaigns.py
+            ProductionParityCampaignTest.test_hostcall_listener_qualifies_only_with_original_host_native_atomics
             ProductionParityCampaignTest.test_maximum_context_uses_the_original_ordinal_bom_and_shared_or_dedicated_capacity
             ProductionParityCampaignTest.test_optional_observed_pipeline_isa_selects_exact_original_cohort
             ProductionParityCampaignTest.test_optional_native_geometry_accepts_positive_widths_and_rejects_bad_labels

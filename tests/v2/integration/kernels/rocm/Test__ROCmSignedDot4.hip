@@ -199,6 +199,10 @@ namespace llaminar2::test
         for (int ordinal = 0; ordinal < static_cast<int>(inventory.size()); ++ordinal)
         {
             SCOPED_TRACE(ordinal);
+            int native_atomics = -1;
+            ASSERT_EQ(hipDeviceGetAttribute(&native_atomics, hipDeviceAttributeHostNativeAtomicSupported, ordinal), hipSuccess);
+            ASSERT_TRUE(native_atomics == 0 || native_atomics == 1);
+            EXPECT_EQ(inventory.at(ordinal).host_native_atomics, native_atomics == 1);
             int actual = -1, before = -1, after = -1;
             ASSERT_EQ(hipDeviceGetAttribute(&actual, hipDeviceAttributeCanUseStreamWaitValue, ordinal), hipSuccess);
             ASSERT_TRUE(actual == 0 || actual == 1);

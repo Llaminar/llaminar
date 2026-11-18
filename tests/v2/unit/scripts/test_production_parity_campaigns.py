@@ -1675,6 +1675,24 @@ class ProductionParityCampaignTest(unittest.TestCase):
             self.assertEqual(qualified["selected"], [host.name])
             self.assertIn(name, qualified["unqualified"])
 
+    def test_hostcall_listener_qualifies_only_with_original_host_native_atomics(self):
+        """Hostcall capability qualifies its listener regression independently of ordinary compute."""
+        labels = {"ROCm", "HardwareOptional", "ROCmHostCall", "LocalHostDevices", "Devices1"}
+        row = campaigns.PreflightRegistration("V2_Integration_HIPHostThreadStack", frozenset(labels),
+                                             1, campaigns.PreflightExecutionLane.ROCM_SOCKET, 1)
+        required = campaigns.preflight_optional_hardware_requirements([row])
+        device = {"backend": "rocm", "ordinal": 0, "numa_node": -1, "uuid": "original"}
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [device]}
+        for capable in (False, True):
+            device["host_native_atomics"] = capable
+            result = campaigns.preflight_hardware_qualification((row.name,), required, hardware)
+            self.assertEqual(result["selected"], [row.name] if capable else [])
+            if not capable:
+                self.assertIs(result["unqualified"][row.name]["host_native_atomics"], False)
+        del device["host_native_atomics"]
+        with self.assertRaisesRegex(ValueError, "missing original ROCm host atomics"):
+            campaigns.preflight_hardware_qualification((row.name,), required, hardware)
+
     def test_maximum_context_uses_the_original_ordinal_bom_and_shared_or_dedicated_capacity(self):
         """Shortage is explicit per model/policy, and dedicated gates still require physically capable cards."""
         cases = {"DenseOff": 12, "DenseMTP": 18, "MoEOff": 5, "MoEMTP": 9}

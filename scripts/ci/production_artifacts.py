@@ -78,7 +78,7 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
             raise ValueError("invalid optional mixed-family preflight geometry")
         return
     required = {"backend", "degree", "locality"}
-    optional = {"native_isa", "stage_sizes", "rank_sizes", "mpi_ranks", "peer_access", "maximum_context_case", "capacity_basis"}
+    optional = {"native_isa", "stage_sizes", "rank_sizes", "mpi_ranks", "peer_access", "maximum_context_case", "capacity_basis", "requires_host_native_atomics"}
     if (not isinstance(requirement, dict) or not required <= requirement.keys()
             or not requirement.keys() <= required | optional):
         raise ValueError("invalid optional preflight requirement")
@@ -87,6 +87,12 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
             or locality not in ("local-host", "original-numa-local-rank", "two-distinct-numa-local-ranks")
             or (locality == "two-distinct-numa-local-ranks" and degree != 2 and "rank_sizes" not in requirement)):
         raise ValueError("unsupported optional preflight geometry")
+    if "requires_host_native_atomics" in requirement:
+        if (set(requirement) != required | {"requires_host_native_atomics"}
+                or requirement["requires_host_native_atomics"] is not True
+                or (backend, locality, degree) != ("rocm", "local-host", 1)):
+            raise ValueError("invalid native ROCm hostcall requirement")
+        return
     if "maximum_context_case" in requirement or "capacity_basis" in requirement:
         if (set(requirement) != required | {"maximum_context_case", "capacity_basis"}
                 or locality != "local-host" or degree != 1
@@ -155,11 +161,17 @@ def optional_native_cohort_absence(requirement: dict, hardware: dict) -> dict | 
                     or len(set(uuids)) != len(uuids) or len(set(ordinals)) != len(ordinals)):
                 raise ValueError("local physical counts require unique native GPU identities")
             counts[backend] = len(devices)
+        if requirement.get("requires_host_native_atomics") and counts["rocm"]:
+            device = observed.get(("rocm", 0, -1), {})
+            capable = device.get("host_native_atomics")
+            if type(capable) is not bool:
+                raise ValueError("missing original ROCm host atomics observation")
+            if not capable:
+                return {**absence, "ordinal": 0, "uuid": device["uuid"], "host_native_atomics": False}
         if "maximum_context_case" in requirement and counts[requirement["backend"]]:
             # Native materialization always uses ordinal zero. Another card's
             # free bytes or an unknown observation cannot certify its request.
-            device = next((row for address, row in observed.items()
-                           if address[:2] == (requirement["backend"], 0)), None)
+            device = observed.get((requirement["backend"], 0, -1))
             sample = device.get("maximum_context") if device else None
             total = device.get("total_memory_bytes") if device else None
             if (not isinstance(sample, dict) or set(sample) != {"basis", "capacity_bytes", "minimum_bytes"}

@@ -39,6 +39,7 @@ namespace llaminar2
         int pci_domain = 0, pci_bus = 0, pci_device = 0;
         int compute_units = 0, native_wave_width = 0, maximum_threads_per_block = 0;
         bool can_use_stream_wait_value = false; ///< SDK-reported device/runtime support for 32/64-bit stream wait-value primitives.
+        bool host_native_atomics = false; ///< Loaded HIP driver reports PCIe host atomics for its hostcall listener.
         int wall_clock_rate_khz = 0; ///< Constant-frequency wall_clock64 clock, not the variable core clock.
         std::size_t lds_per_block = 0, total_memory = 0, last_level_cache = 0;
         // Compatibility only: these preserve existing API answers and must not

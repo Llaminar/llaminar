@@ -746,7 +746,9 @@ segment still publishes a requested native completion signal, including child
 graphs and cross-stream consumers. A reserved signal without a producer is a
 fatal native lifecycle defect, not permission to add a host synchronization.
 `V2_Integration_HIPHostThreadStack` proves retained diagnostic/timeline graphs
-admit a client with large initial ELF TLS. Native pthread stack admission owns
+admit a client with large initial ELF TLS on a link with native host atomics.
+Production MoE kernels publish epoch failure status and trap on fatal routing
+contracts without requiring a hostcall listener. Native pthread stack admission owns
 that layout; never cap worker stacks below valid client TLS or add retries and
 environment overrides to hide a rejected thread. The installer backports the
 upstream stack repair when absent from its pinned release.
