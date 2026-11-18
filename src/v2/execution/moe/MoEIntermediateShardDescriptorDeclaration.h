@@ -37,6 +37,8 @@ namespace llaminar2
             std::shared_ptr<const MoEOverlayFragmentFamily> family);
         /** @return Whether canonical construction admitted this source declaration. */
         bool valid() const noexcept { return bool(family_); }
+        /** @return The exact original family whose ownership this declaration retains. */
+        const MoEOverlayFragmentFamily* originalFamily() const noexcept { return family_.get(); }
         /** @return Exact original member/source geometry shared with runtime placement validation. */
         const DeviceMoEIntermediateShardBinding& originalBinding() const noexcept { return original_; }
         /** @return Fixed source-preserving floating precision, or the native quantized family. */

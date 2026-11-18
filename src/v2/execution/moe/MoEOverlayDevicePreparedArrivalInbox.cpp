@@ -13,6 +13,7 @@
 
 #include "DeviceMoEExpertDescriptorBuilder.h"
 #include "MoEExpertShardCohort.h"
+#include "MoEIntermediateShardDescriptorDeclaration.h"
 #include "MoERuntimeTable.h"
 #include "backends/IBackend.h"
 #include "MoEOverlayDeviceTransportProtocol.h"
@@ -173,7 +174,7 @@ namespace llaminar2
         const MoEOverlayTierMigration &migration,
         std::span<const MoEOverlayParticipantDestinationArrival> arrivals,
         std::uint64_t candidate_epoch, int participant_id,
-        const MoEOverlayFragmentFamily *family,
+        const MoEIntermediateShardDescriptorDeclaration *source,
         std::optional<DeviceMoEExpertDescriptor> &output,
         std::string *error) noexcept
     {
@@ -219,6 +220,7 @@ namespace llaminar2
         if (target->isCohort())
         {
             MoEOverlayPreparedFragmentPayload fragment;
+            const auto *family = source ? source->originalFamily() : nullptr;
             if (!family)
                 return reject(error, "device fragment arrival has no original runtime-bound family");
             if (local->destinationEpoch() != candidate_epoch)
@@ -238,13 +240,15 @@ namespace llaminar2
                 return reject(error, "device fragment arrival changed its original global GPU member");
             if (!exportDeviceMoEFragmentWeightDescriptors(fragment, descriptor))
                 return reject(error, "device fragment arrival has incomplete native projection geometry");
+            if (!matchesExportedFragment(*source, descriptor))
+                return reject(error, "device fragment arrival disagrees with its original source precision, physical planes or local geometry");
             descriptor.logical_expert_id = migration.expert_id;
             descriptor.owner_participant = -1;
             descriptor.local_slot = migration.expert_id;
             // Prepared bytes are not executable until candidate publication.
             descriptor.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident);
         }
-        else if (family)
+        else if (source)
             return reject(error, "device whole arrival cannot occupy an original fragment lane");
         else
         {
@@ -256,6 +260,20 @@ namespace llaminar2
         }
         output = descriptor;
         return true;
+    }
+
+    bool MoEOverlayDevicePreparedArrivalInbox::matchesExportedFragment(
+        const MoEIntermediateShardDescriptorDeclaration &source,
+        const DeviceMoEExpertDescriptor &descriptor) noexcept
+    {
+        if (!source.valid() || descriptor.projection_set != DeviceMoEProjectionSet::IntermediateShard ||
+            descriptor.weight_format != source.weightFormat())
+            return false;
+        if (descriptor.weight_format == DeviceMoEWeightFormat::NativeQuantised)
+            return source.matchesPublishedNativeGateUp(descriptor.gate, descriptor.up) &&
+                source.matchesPublishedNativeDown(descriptor.down);
+        return source.matchesFloatingGateUp(descriptor.floating_gate, descriptor.floating_up) &&
+            source.matchesFloatingDown(descriptor.floating_down);
     }
 
     bool MoEOverlayDevicePreparedArrivalInbox::stage(
@@ -294,11 +312,11 @@ namespace llaminar2
         {
             const auto &migration = batch.migrations[ordinal];
             const auto &keyed = prepared.migrations[ordinal].destination_arrivals;
-            const auto *family = config_.runtime_binding.runtime_table_host
-                ? config_.runtime_binding.runtime_table_host->fragmentFamily(migration.layer_idx) : nullptr;
+            const auto *source = config_.runtime_binding.runtime_table_host
+                ? config_.runtime_binding.runtime_table_host->fragmentDescriptorDeclaration(migration.layer_idx) : nullptr;
             std::optional<DeviceMoEExpertDescriptor> descriptor;
             if (!exportDestinationArrival(migration, keyed, batch.candidate_epoch,
-                    config_.runtime_binding.overlay_participant_id, family, descriptor, error))
+                    config_.runtime_binding.overlay_participant_id, source, descriptor, error))
                 return false;
             prepared_arrivals_staging_[ordinal] = descriptor.value_or(DeviceMoEExpertDescriptor{});
             local_arrivals += descriptor.has_value() ? 1u : 0u;

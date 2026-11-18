@@ -13,7 +13,7 @@
 
 #pragma once
 #include "MoEOverlayRouteTarget.h"
-#include "DeviceMoEIntermediateShardBinding.h"
+#include "MoEIntermediateShardDescriptorDeclaration.h"
 #include "DeviceMoEExpertFlags.h"
 
 #include "DeviceMoEOverlayEpochABI.h"
@@ -1286,10 +1286,16 @@ namespace llaminar2
         /** @return Original local family, or null for complete/gate-up execution.
          *  @throws std::out_of_range For a layer outside this table. */
         [[nodiscard]] const MoEOverlayFragmentFamily *fragmentFamily(int layer_idx) const;
+        /**
+         * @brief Borrow the cold descriptor proof carried by this original layer.
+         * @param layer_idx Global model layer owned by this table.
+         * @return Lifetime-stable original proof, or null for a whole-expert layer.
+         */
+        [[nodiscard]] const MoEIntermediateShardDescriptorDeclaration *fragmentDescriptorDeclaration(int layer_idx) const;
         /** @return The exact movable family authenticated by the fixed graph binding. */
         [[nodiscard]] DeviceMoEProjectionSet movableProjections() const noexcept
         {
-            return !fragment_families_.empty() ? DeviceMoEProjectionSet::IntermediateShard :
+            return !fragment_descriptor_declarations_.empty() ? DeviceMoEProjectionSet::IntermediateShard :
                 fixed_down_banks_.empty() ? DeviceMoEProjectionSet::CompleteExpert : DeviceMoEProjectionSet::GateUp;
         }
 
@@ -1701,7 +1707,7 @@ namespace llaminar2
         /** Model lifetime, independent of both placement banks and request snapshots. */
         const std::vector<std::shared_ptr<const MoEOverlayFixedDownProjectionBank>> fixed_down_banks_;
         /** Original immutable fragment source; never pins an executable placement epoch. */
-        const std::vector<std::shared_ptr<const MoEOverlayFragmentFamily>> fragment_families_;
+        std::vector<MoEIntermediateShardDescriptorDeclaration> fragment_descriptor_declarations_;
         std::vector<DeviceMoEPrefillRouteScratchBindings>
             prefill_route_scratch_;
         int32_t *deferred_verifier_route_expert_ids_ = nullptr;

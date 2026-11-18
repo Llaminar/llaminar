@@ -35,6 +35,7 @@ namespace llaminar2
 {
     class IBackend;
     class MappedHostTransferRegion;
+    class MoEIntermediateShardDescriptorDeclaration;
     class MoEOverlayDeviceTransportProtocol;
 
     /**
@@ -90,7 +91,7 @@ namespace llaminar2
          * @param arrivals Process-local member-keyed arrivals from the same physical wave.
          * @param candidate_epoch Exact unpublished durable destination epoch.
          * @param participant_id Original global GPU member, never its domain-local index.
-         * @param family Original runtime-bound fragment family; absent for whole lanes.
+         * @param source Exact runtime-owned descriptor declaration; absent for whole lanes.
          * @param output Local descriptor, or empty for an external destination; unchanged on failure.
          * @param error Optional precise source/member/epoch/geometry rejection.
          * @return True only after every key is unique and belongs to the original target,
@@ -104,9 +105,19 @@ namespace llaminar2
             const MoEOverlayTierMigration &migration,
             std::span<const MoEOverlayParticipantDestinationArrival> arrivals,
             std::uint64_t candidate_epoch, int participant_id,
-            const MoEOverlayFragmentFamily *family,
+            const MoEIntermediateShardDescriptorDeclaration *source,
             std::optional<DeviceMoEExpertDescriptor> &output,
             std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Validate the raw descriptor just exported by this arrival's prepared engines.
+         * @param source Same cold original declaration that authenticated the completed payload.
+         * @param descriptor Unpublished export with its actual decoder, arithmetic source and planes.
+         * @return True for a complete original fragment matching every local projection.
+         */
+        [[nodiscard]] static bool matchesExportedFragment(
+            const MoEIntermediateShardDescriptorDeclaration &source,
+            const DeviceMoEExpertDescriptor &descriptor) noexcept;
 
         /**
          * @brief Stage immutable descriptors for this participant's arrivals.

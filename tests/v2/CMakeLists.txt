@@ -1298,6 +1298,12 @@ add_v2_test(V2_Integration_MoEProjectionPreparation
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_MoEPreparedArrivalNativeDescriptorRejects
+    COMMAND $<TARGET_FILE:v2_unit_weight_manager_moe_expert_overlay_preparation>
+        --gtest_filter=MoEPreparedArrivalPublication.RejectsChangedOriginalSourceAndIncompleteNativePlanes
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;ExpertOverlay;Descriptors;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+)
 # Missing requested experts must fail before any frozen source is retired;
 # independently prepared residents may legitimately outlive those sources.
 add_v2_test(V2_Integration_PreparedOverlaySourceRetirement
@@ -29579,6 +29585,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MPIBootstrapLocalRankfileAllocation
     ${V2_HIP_SDMA_TIMING_PREFLIGHT_TESTS}
     V2_Integration_MoESourcePolicyOwnerBoundaries
+    V2_Integration_MoEPreparedArrivalNativeDescriptorRejects
     V2_Integration_GPUBlockingSynchronizationPolicy
     V2_Integration_GPUBlockingSynchronizationPolicyNegativeControls
     V2_Integration_CPUExecutionExactRegistration

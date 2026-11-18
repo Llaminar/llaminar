@@ -969,7 +969,6 @@ namespace llaminar2
           overlay_epoch_ticket_slot_(config.overlay_epoch_ticket_slot),
           overlay_placement_source_(config.overlay_placement_source),
           fixed_down_banks_(std::move(config.fixed_down_banks)),
-          fragment_families_(std::move(config.fragment_families)),
           first_model_layer_(config.first_model_layer)
     {
         if (!device_id_.is_valid())
@@ -985,21 +984,22 @@ namespace llaminar2
                                         std::to_string(kDeviceMoEMaxTopK) + "]");
         if (mirror_to_device_ && !device_id_.is_gpu())
             throw std::runtime_error("[MoERuntimeTable] device mirroring requires a GPU device");
-        if (!fragment_families_.empty())
+        if (!config.fragment_families.empty())
         {
             if (!device_id_.is_gpu() || !fixed_down_banks_.empty() ||
-                fragment_families_.size() != static_cast<size_t>(num_layers_))
+                config.fragment_families.size() != static_cast<size_t>(num_layers_))
                 throw std::invalid_argument("[MoERuntimeTable] fragment execution requires one original GPU family per layer and no fixed down bank");
+            fragment_descriptor_declarations_.reserve(num_layers_);
             for (int row = 0; row < num_layers_; ++row)
             {
-                const auto &family = fragment_families_[row];
+                const auto &family = config.fragment_families[row];
                 if (!family)
                     throw std::invalid_argument("[MoERuntimeTable] fragment family is absent");
-                (void)DeviceMoEIntermediateShardBinding::fromOriginalFamily(*family);
+                auto declaration = MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(family);
                 const auto &cohort = *family->cohort();
                 const auto &member = cohort.participants()[family->participantIndex()];
                 const auto *original = family->preparation()->jointOwnerMap()->participantForId(member.participant_id);
-                const auto &first = *fragment_families_.front();
+                const auto &first = *config.fragment_families.front();
                 const auto &first_member = first.cohort()->participants()[first.participantIndex()];
                 if (original->device != device_id_ || cohort.source().layer_idx != firstModelLayer() + row ||
                     cohort.ownership(family->participantIndex()).geometry().experts != num_experts_ ||
@@ -1009,6 +1009,7 @@ namespace llaminar2
                     member != first_member || family->participantIndex() != first.participantIndex() ||
                     !std::ranges::equal(cohort.participants(), first.cohort()->participants()))
                     throw std::invalid_argument("[MoERuntimeTable] fragment families changed original model/layer/member identity");
+                fragment_descriptor_declarations_.push_back(std::move(declaration));
             }
         }
         if (!fixed_down_banks_.empty())
@@ -1171,10 +1172,10 @@ namespace llaminar2
                 if (!source || !fixed_down_banks_[static_cast<size_t>(layer)]->sameIdentity(*source))
                     throw std::invalid_argument("[MoERuntimeTable] child and canonical table require identical fixed down bindings");
             }
-            for (int layer = 0; !fragment_families_.empty() && layer < num_layers_; ++layer)
+            for (int layer = 0; !fragment_descriptor_declarations_.empty() && layer < num_layers_; ++layer)
             {
                 const auto *source = overlay_placement_source_->fragmentFamily(firstModelLayer() + layer);
-                const auto &family = *fragment_families_[layer];
+                const auto &family = *fragment_descriptor_declarations_[layer].originalFamily();
                 if (!source || family.model() != source->model() ||
                     family.preparation() != source->preparation() || family.cohort() != source->cohort() ||
                     family.cohort().owner_before(source->cohort()) || source->cohort().owner_before(family.cohort()) ||
@@ -3534,8 +3535,16 @@ namespace llaminar2
 
     const MoEOverlayFragmentFamily *DeviceMoERuntimeTable::fragmentFamily(int layer_idx) const
     {
+        const auto *source = fragmentDescriptorDeclaration(layer_idx);
+        return source ? source->originalFamily() : nullptr;
+    }
+
+    const MoEIntermediateShardDescriptorDeclaration *DeviceMoERuntimeTable::fragmentDescriptorDeclaration(
+        int layer_idx) const
+    {
         validateLayerIndex(layer_idx);
-        return fragment_families_.empty() ? nullptr : fragment_families_[storageIndexForModelLayer(layer_idx)].get();
+        return fragment_descriptor_declarations_.empty() ? nullptr :
+            &fragment_descriptor_declarations_[storageIndexForModelLayer(layer_idx)];
     }
 
     void DeviceMoERuntimeTable::validateUpdate(int layer_idx, const MoEPlacementUpdate &update) const
@@ -3552,9 +3561,8 @@ namespace llaminar2
     {
         if (update.expert_count != static_cast<uint32_t>(num_experts_))
             throw std::invalid_argument(layerPrefix(layer_idx) + "placement update expert_count must match table expert_count");
-        const auto *fragment = fragmentFamily(layer_idx);
-        const auto source_declaration = fragment ? MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(
-            fragment_families_[storageIndexForModelLayer(layer_idx)]) : MoEIntermediateShardDescriptorDeclaration{};
+        const auto *source_declaration = fragmentDescriptorDeclaration(layer_idx);
+        const auto *fragment = source_declaration ? source_declaration->originalFamily() : nullptr;
         if (update.participant_count == 0 || (!fragment && update.participant_count > kDeviceMoEMaxParticipants))
             throw std::invalid_argument(layerPrefix(layer_idx) + "participant_count must be in [1, " +
                                         std::to_string(kDeviceMoEMaxParticipants) + "]");
@@ -3583,7 +3591,6 @@ namespace llaminar2
         }
 
         const uint32_t valid_participant_mask = fragment ? 0u : participantMaskLimit(update.participant_count);
-        const auto& fragment_binding = source_declaration.originalBinding();
         for (uint32_t expert = 0; expert < update.expert_count; ++expert)
         {
             const auto &desc = update.experts[expert];
@@ -3601,7 +3608,7 @@ namespace llaminar2
                 MoEOverlayRouteTarget::fromWord(overlayRouteParticipantForUpdate(update, expert));
             if (fragment)
             {
-                const auto &binding = fragment_binding;
+                const auto &binding = source_declaration->originalBinding();
                 // A published fragment bank is complete for every expert, even
                 // rows owned by another cohort. Reject a missing destination or
                 // a whole-owner alias of this cohort member at the producer,
@@ -3627,12 +3634,12 @@ namespace llaminar2
                     if (desc.logical_expert_id != static_cast<int32_t>(expert) || desc.local_slot < 0 ||
                         !deviceMoEIntermediateShardFlagsValid(desc.flags) ||
                         !descriptorReady(desc, DeviceMoEProjectionSet::IntermediateShard) ||
-                        desc.weight_format != source_declaration.weightFormat() ||
+                        desc.weight_format != source_declaration->weightFormat() ||
                         !(desc.weight_format == DeviceMoEWeightFormat::NativeQuantised
-                            ? (source_declaration.matchesPublishedNativeGateUp(desc.gate,desc.up) &&
-                               source_declaration.matchesPublishedNativeDown(desc.down))
-                            : (source_declaration.matchesFloatingGateUp(desc.floating_gate,desc.floating_up) &&
-                               source_declaration.matchesFloatingDown(desc.floating_down))))
+                            ? (source_declaration->matchesPublishedNativeGateUp(desc.gate,desc.up) &&
+                               source_declaration->matchesPublishedNativeDown(desc.down))
+                            : (source_declaration->matchesFloatingGateUp(desc.floating_gate,desc.floating_up) &&
+                               source_declaration->matchesFloatingDown(desc.floating_down))))
                         throw std::invalid_argument(layerPrefix(layer_idx) + "fragment descriptor disagrees with original source precision/format or local geometry");
                 }
                 continue;
