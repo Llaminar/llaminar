@@ -19,6 +19,7 @@
 
 #include "ExpertWeightFormat.h"
 #include "ExpertTierWeightStream.h"
+#include "ExpertTierProjectionByteRange.h"
 #include "GPUExpertTransfer.h"
 #include "MoEOverlayDistributedResidencyProtocol.h"
 #include "backends/DeviceId.h"
@@ -143,6 +144,29 @@ namespace llaminar2
          */
         [[nodiscard]] MoEOverlayRemoteProjectionManifest forCPUIntersection(
             const ExpertTierWeightProjectionIntersection& intersection) const;
+
+        /**
+         * @brief Restrict separated GPU arrays to their original native-block overlap.
+         * @param intersection Original source/destination projections, with independent strides.
+         * @return Resealed compact manifest retaining the source execution format.
+         * @throws std::invalid_argument For foreign source dimensions or non-native K boundaries.
+         */
+        [[nodiscard]] MoEOverlayRemoteProjectionManifest forGPUIntersection(
+            const ExpertTierWeightProjectionIntersection& intersection) const;
+
+        /**
+         * @brief Map compact wire bytes to a contiguous run in both native GPU roots.
+         * @param region Separated payload/scales/mins/emins region index.
+         * @param wire_offset Already transferred bytes in that compact region.
+         * @param capacity Maximum useful bytes this lane can carry.
+         * @return Independent root offsets and exact bytes, or no range for invalid bounds.
+         *
+         * The endpoint authenticates this immutable manifest before use. K blocks
+         * are outermost in GPU storage, so a partial N intersection must stop at
+         * each N run. Full-N intersections remain one contiguous span across K.
+         */
+        [[nodiscard]] std::optional<ExpertTierProjectionByteRange> gpuRegionRange(
+            std::size_t region, std::uint64_t wire_offset, std::uint64_t capacity) const noexcept;
 
         /**
          * @brief Bind floating source bytes to an original-coordinate overlap without conversion.

@@ -10,6 +10,7 @@
 
 #pragma once
 #include "backends/DeviceId.h"
+#include "config/TensorParallelConfig.h"
 #include "execution/config/RuntimeConfig.h"
 #include "planning/ModelMemoryProfile.h"
 #include <cstddef>
@@ -43,6 +44,8 @@ struct ActivationGraphMemoryGeometry
     int first_layer = 0;            ///< First main-model layer assigned here.
     int last_layer = -1;            ///< Last main-model layer assigned here.
     int total_shards = 1;           ///< Dense tensor-parallel participant count.
+    int shard_index = 0;            ///< Original cohort coordinate for native routed source cuts.
+    std::optional<DeviceShardingAssignment> shared_tp_assignment; ///< Original dense/shared source cut, never inferred from routed F.
     RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         ///< Frozen physical expert layout; determines which publication banks exist.
     int mtp_target_query_rows = 2;  ///< Flattened maximum verifier-row capacity.

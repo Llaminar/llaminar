@@ -61,7 +61,9 @@ void Qwen4ExpGraphConfigBuilder::populateFromDirectory(const GGUFModel &model, G
     config.n_heads = exact->sparseAttention().query_heads;
     config.n_kv_heads = exact->sparseAttention().kv_heads;
     config.head_dim = exact->sparseAttention().head_dimension;
-    config.d_ff = exact->experts().intermediate;
+    // Dense TP assignments supply the shared branch's source N/N/K cuts.
+    // Routed F is independently retained below and by its original fragment family.
+    config.d_ff = exact->experts().shared_intermediate;
     config.vocab_size = exact->vocabularySize();
     config.rms_norm_eps = exact->normEpsilon();
     config.rope_theta = exact->rotaryBase();

@@ -99,7 +99,7 @@ namespace llaminar2
             MoEExpertProjectionOwnership projection;
             std::vector<ParticipantExpertBinding> experts; ///< Original ordinal E order; CPU unselected entries remain empty.
             std::vector<WeightBinding> sources; ///< Original frozen views, in selected expert-major G/U/D order.
-            std::shared_ptr<const CPUExpertShardSourceSelection> cpu_joint_source; ///< Closed CPU fragment selection; dense experts has empty unselected entries.
+            std::shared_ptr<const ExpertShardSourceSelection> joint_source; ///< Closed CPU/GPU fragment selection; unselected expert entries remain empty.
         };
 
         /**
@@ -151,7 +151,7 @@ namespace llaminar2
             std::span<const WeightBinding> sources) const;
 
         /**
-         * @brief Borrow only already-prepared CPU fragments from their retained original source declarations.
+         * @brief Borrow prepared CPU/GPU fragments from their original source declarations.
          * @param original_model Original model store lifetime, never an unscoped engine lookup.
          * @param original_participant Exact original rank/NUMA/domain/tier/member descriptor.
          * @param layer Original model layer, not a compact source index.
@@ -163,7 +163,7 @@ namespace llaminar2
          * the SAME declarations retained at registration and delegates complete
          * acquisition; it never reconstructs IDs from compact tensor geometry.
          */
-        [[nodiscard]] std::optional<StaticProjectionLayer> acquireCPUJointLayer(
+        [[nodiscard]] std::optional<StaticProjectionLayer> acquireJointLayer(
             ModelContextId original_model,const MoEExpertOwnerParticipant& original_participant,int layer) const;
 
         ExpertGemmRegistry() = default;
@@ -402,7 +402,7 @@ namespace llaminar2
          * @param error Receives a precise failure; validation publishes no partial map.
          * @return True only after one atomic publication of all process-local scopes.
          *
-         * Whole payloads keep their original domain aliases. CPU fragments keep
+         * Whole payloads keep their original domain aliases. Joint fragments keep
          * exact participant keys and original source/Store/layout declarations;
          * only their actual sealed engine owners change. No whole-expert alias
          * or source identity is manufactured from a fragment triplet. Other
@@ -443,7 +443,7 @@ namespace llaminar2
         /**
          * @brief Stage the single registry replacement; unsealed inputs are test-only.
          * @param scopes Complete checked participant/layer surface.
-         * @param bindings Checked whole payloads; never CPU fragment adapters.
+         * @param bindings Checked whole payloads; never fragment adapters.
          * @param banks Canonical banks already authorized by the public seal; component tests may corrupt this input.
          * @param residency Original declaration authority paired with the banks, null only for untyped corruption tests.
          * @param error Receives validation/allocation failure before atomic swap.

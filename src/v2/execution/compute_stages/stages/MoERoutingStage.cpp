@@ -87,6 +87,11 @@ namespace llaminar2
     MoERoutingStage::MoERoutingStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        // A device count can be zero on any captured replay. Host token-window
+        // bookkeeping cannot infer that live extent; GPU demand remains in the
+        // runtime ledger and is admitted/drained through its device authority.
+        if (params_.device_id.is_gpu() && params_.active_row_count_device && params_.decode_histogram)
+            throw std::invalid_argument("Counted GPU routing requires device-owned histogram boundaries");
         if (params_.owned_rows)
         {
             const auto &owned = *params_.owned_rows;
@@ -331,6 +336,18 @@ namespace llaminar2
         return true;
     }
 
+    uint64_t MoERoutingStage::graphCaptureVariantSignature() const
+    {
+        const auto owner=params_.routed_pipeline_kernel_owner;
+        if(!owner||!owner->router_q8_publication||!owner->router_q8_publication->requiredOriginalM1Source())return 0;
+        if(moe_kernel_)(void)moe_kernel_->originalM1HiddenQ8BindingSignature();
+        std::uint64_t signature=0x4d315138524f5554ULL;
+        for(const auto word:{reinterpret_cast<std::uintptr_t>(owner->router_q8_publication.get()),
+                reinterpret_cast<std::uintptr_t>(params_.input),static_cast<std::uintptr_t>(params_.d_model),
+                static_cast<std::uintptr_t>(params_.seq_len)})signature=(signature^word)*1099511628211ULL;
+        return signature?signature:1;
+    }
+
     bool MoERoutingStage::prepareGraphLaunch(IDeviceContext *ctx, void *stream)
     {
         (void)ctx;
@@ -404,6 +421,18 @@ namespace llaminar2
                 return false;
             }
 
+            const auto owner=params_.routed_pipeline_kernel_owner;
+            if(owner&&owner->router_q8_publication&&owner->router_q8_publication->requiredOriginalM1Source()) {
+                // This candidate certifies the prepared FP16 router; its Q8
+                // publication reads original FP32 hidden values independently.
+                // Other router precision/basis modes retain their own controls.
+                if(launch_plan.kind!=MoERouteLaunchKind::RuntimeDecode||params_.seq_len!=1||params_.active_row_count_device||
+                   !params_.gate_weights||params_.gate_weights->native_type()!=TensorType::FP16)
+                    throw std::invalid_argument("Original M1 hidden Q8 requires the fully-active prepared FP16 runtime router");
+                if(!kernel->prepareOriginalM1HiddenQ8Publication(params_.input,DeviceRowRange::fullyActive(1)))
+                    throw std::logic_error("Original M1 hidden Q8 router preparation failed");
+            }
+
             /*
              * Snapshot topology is finalized after launch preparation and
              * before beginCapture(). Require the diagnostic descriptor to
@@ -423,7 +452,7 @@ namespace llaminar2
             }
         }
 
-        if (params_.seq_len > 1 && params_.active_row_count_device &&
+        if (params_.device_id.is_gpu() && params_.active_row_count_device &&
             PerfStatsCollector::isDomainEnabled("moe"))
         {
             PerfStatsCollector::addCounter(
@@ -1031,7 +1060,8 @@ namespace llaminar2
                     apply_storage_row,
                     params_.device_rebalance_command_buffer_count,
                     params_.absolute_position_ids_device,
-                    params_.routed_row_execution_policy);
+                    params_.routed_row_execution_policy,
+                    params_.active_row_count_device);
             }
             else
             {
@@ -1050,7 +1080,8 @@ namespace llaminar2
                     /*write_legacy_outputs=*/true,
                     params_.collect_device_runtime_histogram,
                     params_.absolute_position_ids_device,
-                    params_.routed_row_execution_policy);
+                    params_.routed_row_execution_policy,
+                    params_.active_row_count_device);
             }
 
             if (!routed)
@@ -1121,25 +1152,24 @@ namespace llaminar2
         }
 
         if (params_.device_id.is_gpu() && params_.seq_len == 1 &&
-            !isDeviceRoutedDecodeGraphCapturable())
+            !isDeviceRoutedDecodeGraphCapturable() &&
+            !isDeviceRoutedPrefillExecutionSupported())
         {
             /*
-             * Every GPU decode topology, including partial expert owners and
-             * depth-scoped MTP sidecars, must publish through a mask-aware
-             * device runtime table. routeWithTensors() is the grouped prefill
-             * primitive; admitting it here would create an eager-only decode
-             * contract outside the captured graph and split ownership of live
-             * route state.
+             * Decode still requires its runtime/ticket authority. A declared
+             * grouped-prefill M=1 has the same cold prepared router resources
+             * and tensor publication as wider prefill; physical row count
+             * alone cannot reclassify that explicit phase as decode.
              */
             LOG_ERROR("[MoERoutingStage] GPU single-row MoE routing requires "
-                      "either the runtime-table device path or an explicit "
-                      "fixed-capacity ExpertOverlay ticket on "
+                      "the runtime-table decode path, a declared grouped-prefill "
+                      "policy, or an explicit fixed-capacity ExpertOverlay ticket on "
                       << params_.device_id.toString());
             return false;
         }
 
         const int32_t *device_active_rows =
-            params_.device_id.is_gpu() && seq_len > 1
+            params_.device_id.is_gpu()
                 ? params_.active_row_count_device
                 : nullptr;
         if (device_active_rows &&

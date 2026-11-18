@@ -1,6 +1,6 @@
 /**
  * @file MoEExpertShardCohort.h
- * @brief Immutable source-native geometry of jointly owned CPU expert fragments.
+ * @brief Immutable source-native geometry of jointly owned expert fragments.
  *
  * One logical resident is present only when every original fragment is present.
  * This value owns no allocation, quota or execution state. The existing owner
@@ -27,7 +27,7 @@ namespace llaminar2 {
 /** @brief Source-authenticated, immutable joint ownership of one layer's expert layout. */
 class MoEExpertShardCohort final {
 public:
-    /** @brief Original canonical owner-map participant, including its actual socket. */
+    /** @brief Original canonical owner-map participant, including rank and physical locality. */
     struct Participant {
         int participant_id;
         int world_rank;
@@ -69,11 +69,9 @@ public:
         std::vector<Participant> participants,std::vector<Interval> intervals) {
         if(participants.size()<2 || participants.size()>static_cast<size_t>(std::numeric_limits<int>::max()) || intervals.size()!=participants.size())
             throw std::invalid_argument("CPU expert shard cohort requires complete ordered membership and intervals");
-        const auto geometry=sourceGeometry(layer,experts);
         // NODE_LOCAL inventory binding belongs to the caller's original topology.
         // Hostname spellings are retained identity labels, never a locality proof.
         std::set<int> ids,ranks,numa;
-        std::vector<MoEExpertProjectionOwnership> fragments;
         for(std::size_t p=0;p<participants.size();++p){
             const auto& member=participants[p];
             if(member.participant_id<0 || member.world_rank<0 || !member.address.isCPU() ||
@@ -81,16 +79,52 @@ public:
                !ids.insert(member.participant_id).second || !ranks.insert(member.world_rank).second ||
                !numa.insert(member.address.numa_node).second)
                 throw std::invalid_argument("CPU expert shard cohort requires distinct original rank/NUMA endpoints");
-            auto ownership=MoEExpertProjectionOwnership::withinExpertIntermediateSlices(geometry,static_cast<int>(p),intervals);
-            for(const auto& source:layer.projections){
-                const auto role=weightRole(source.projection);const auto local=ownership.projection(role);
-                const int block=sourceBlock(source.format);
-                if(source.K%block || local.first_column%block || local.columns%block)
-                    throw std::invalid_argument("Expert shard source K cut requires unsupported native codebook repacking");
-            }
-            fragments.push_back(std::move(ownership));
         }
+        auto fragments = sourceFragments(layer, experts, intervals);
         return {std::move(layer),std::move(participants),std::move(fragments)};
+    }
+    /**
+     * @brief Partition GPU F with native blocks, activation groups and economical tiles.
+     * @param layer Original unsliced source metadata, including the down codebook.
+     * @param participants Original domain width; no hardware-count specialization.
+     * @param rotation Layer coordinate rotating the larger fragments.
+     * @return Complete positive intervals, with no padding or requantization.
+     * @throws std::invalid_argument For source geometry which cannot form legal fragments.
+     */
+    static std::vector<Interval> gpuIntervals(const MoEOverlayLayerWeightManifest &layer,
+        int participants, int rotation)
+    {
+        const auto axes = sourceAxes(layer);
+        return MoEExpertProjectionOwnership::nativeIntermediateIntervals(axes.second, participants,
+            sourceBlock(projection(layer, ExpertTierWeightProjection::Down).format), rotation);
+    }
+    /**
+     * @brief Seal homogeneous GPU fragments owned by one original MPI rank.
+     * @param layer Original unsliced source layer metadata.
+     * @param experts Original complete expert-axis extent.
+     * @param participants Canonical owner-map members, in collective reduction order.
+     * @param intervals Complete native F partition in that same order.
+     * @return Source-bound joint ownership; this grants no execution capability.
+     * @throws std::invalid_argument For mixed backends/ranks, duplicate GPUs or illegal source cuts.
+     * @note The original inventory-bound domain proves physical locality. Ordinals
+     *       identify members, never a shard coordinate or an alternate MPI rank.
+     */
+    static MoEExpertShardCohort checkedRankLocalGPU(MoEOverlayLayerWeightManifest layer,
+        int experts, std::vector<Participant> participants, std::vector<Interval> intervals)
+    {
+        if (participants.empty() || participants.size() > size_t(std::numeric_limits<int>::max()) ||
+            intervals.size() != participants.size())
+            throw std::invalid_argument("GPU expert shard cohort requires complete ordered membership and intervals");
+        const auto &first = participants.front();
+        std::set<int> ids, devices;
+        for (const auto &member : participants)
+            if (member.participant_id < 0 || member.world_rank < 0 || !member.address.isGPU() ||
+                member.world_rank != first.world_rank || member.address.device_type != first.address.device_type ||
+                member.address.device_ordinal < 0 || !ids.insert(member.participant_id).second ||
+                !devices.insert(member.address.device_ordinal).second)
+                throw std::invalid_argument("GPU expert shard cohort requires unique homogeneous devices on one original rank");
+        auto fragments = sourceFragments(layer, experts, intervals);
+        return {std::move(layer), std::move(participants), std::move(fragments)};
     }
     /** @param other Immutable cohort definition to compare, independent of its wrapper address.
      * @return Equality covers original source formats, endpoint identity and every F interval. */
@@ -151,6 +185,35 @@ public:
         auto result=sourceSlice(participant,role,std::move(expert_ids));result.inner_is_presliced=false;return result;
     }
 private:
+    /**
+     * @brief Validate native source cuts once for both CPU and GPU membership contracts.
+     * @param layer Original unsliced role/format manifest.
+     * @param experts Original complete expert-axis extent.
+     * @param intervals Ordered, complete F partition already matched to membership.
+     * @return Exact role rectangles for every member, without copied weight payloads.
+     * @throws std::invalid_argument For inconsistent source axes or split native blocks.
+     */
+    static std::vector<MoEExpertProjectionOwnership> sourceFragments(
+        const MoEOverlayLayerWeightManifest &layer, int experts, const std::vector<Interval> &intervals)
+    {
+        const auto geometry = sourceGeometry(layer, experts);
+        std::vector<MoEExpertProjectionOwnership> fragments;
+        fragments.reserve(intervals.size());
+        for (size_t p = 0; p < intervals.size(); ++p)
+        {
+            auto ownership = MoEExpertProjectionOwnership::withinExpertIntermediateSlices(
+                geometry, static_cast<int>(p), intervals);
+            for (const auto &source : layer.projections)
+            {
+                const auto local = ownership.projection(weightRole(source.projection));
+                const int block = sourceBlock(source.format);
+                if (source.K % block || local.first_column % block || local.columns % block)
+                    throw std::invalid_argument("Expert shard source K cut requires unsupported native codebook repacking");
+            }
+            fragments.push_back(std::move(ownership));
+        }
+        return fragments;
+    }
     /**
      * @brief Retain only fully checked source metadata and original participants.
      * @param source Validated original model-global layer and native formats.

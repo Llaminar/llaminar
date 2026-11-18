@@ -7,6 +7,11 @@
  * descriptors and to know when a departed slot can be recycled.  This ledger
  * records only those physical facts.  It cannot observe histograms, score a
  * placement, change a movement command, or publish a device runtime bank.
+ * One closed internal payload alternative retains either the ordinary declared
+ * engine family or the original authenticated F fragment. Separate typed public
+ * receipts prevent fragment engines from certifying whole-expert semantics.
+ * Whole and fragment coordinates may coexist in one ledger; their fixed source
+ * families cannot change when logical experts migrate between those targets.
  */
 
 #pragma once
@@ -20,6 +25,7 @@
 #include <optional>
 #include <string>
 #include <vector>
+#include <variant>
 
 namespace llaminar2
 {
@@ -107,6 +113,62 @@ namespace llaminar2
         [[nodiscard]] bool valid() const noexcept;
     };
 
+    /** @brief Typed fragment allocation receipt; never convertible to a whole expert. */
+    struct MoEOverlayDeviceFragmentPhysicalSlot
+    {
+        MoEOverlayDevicePhysicalSlotKey key;
+        std::uint64_t entered_epoch = 0u;
+        bool bootstrap_allocation = false;
+        MoEOverlayPreparedFragmentPayload payload;
+
+        /** @return Whether this receipt retains a complete authenticated fragment. */
+        [[nodiscard]] bool valid() const noexcept;
+    };
+
+    /** @brief Completed local fragment awaiting the same device RCU publication. */
+    struct MoEOverlayDeviceStagedFragmentArrival
+    {
+        MoEOverlayDevicePhysicalSlotKey key;
+        MoEOverlayPreparedFragmentPayload payload;
+    };
+
+    /** @brief Quiescent fragment inventory, retaining original immutable provenance. */
+    struct MoEOverlayDeviceFragmentInventorySnapshot
+    {
+        std::uint64_t epoch = 0u;
+        std::vector<MoEOverlayDeviceFragmentPhysicalSlot> slots;
+
+        /** @return Whether the epoch and every retained original fragment coordinate are complete. */
+        [[nodiscard]] bool valid() const noexcept;
+    };
+
+    /** @brief Closed physical lifetime; a fragment never acquires whole-expert semantics. */
+    using MoEOverlayDevicePreparedPhysicalPayload =
+        std::variant<MoEOverlayPreparedExpertPayload, MoEOverlayPreparedFragmentPayload>;
+
+    /** @brief Exact local member receipt for a mixed whole/cohort wave. */
+    struct MoEOverlayDevicePreparedPhysicalArrival
+    {
+        MoEOverlayDevicePhysicalSlotKey key;
+        MoEOverlayDevicePreparedPhysicalPayload payload;
+    };
+
+    /** @brief Allocation lifetime retained until the original old-reader barrier. */
+    struct MoEOverlayDevicePreparedPhysicalSlot
+    {
+        MoEOverlayDevicePhysicalSlotKey key;
+        std::uint64_t entered_epoch = 0u;
+        bool bootstrap_allocation = false;
+        MoEOverlayDevicePreparedPhysicalPayload payload;
+    };
+
+    /** @brief Quiescent mixed inventory; payload alternatives preserve original family. */
+    struct MoEOverlayDevicePreparedPhysicalInventory
+    {
+        std::uint64_t epoch = 0u;
+        std::vector<MoEOverlayDevicePreparedPhysicalSlot> slots;
+    };
+
     /**
      * @brief Thread-safe physical lifetime follower for device-owned Dynamic RCU.
      *
@@ -123,6 +185,7 @@ namespace llaminar2
         struct Config
         {
             std::uint64_t initial_epoch = 0u;
+            /** Sorted local overlay IDs. A rank outside the overlay follows each epoch with empty inventory. */
             std::vector<int> local_participant_ids;
             std::vector<MoEOverlayDeviceInitialPhysicalSlot> initial_slots;
             /** Immutable family accepted for sources and every future arrival. */
@@ -133,6 +196,132 @@ namespace llaminar2
             /** Exact per-layer expert geometry of the admitted runtime. */
             std::uint32_t num_experts = 0u;
         };
+
+        /** @brief One original registry-authenticated local participant/layer family. */
+        struct FragmentFamily
+        {
+            int participant_id = -1;
+            int layer_idx = -1;
+            std::shared_ptr<const MoEOverlayFragmentFamily> family;
+        };
+
+        /** @brief Closed fragment enrollment; ordinary payloads cannot inhabit this arm. */
+        struct FragmentConfig
+        {
+            std::uint64_t initial_epoch = 0u;
+            std::vector<int> local_participant_ids;
+            std::vector<MoEOverlayDeviceFragmentPhysicalSlot> initial_slots;
+            std::vector<FragmentFamily> families;
+            int first_model_layer = 0;
+            std::uint32_t num_layers = 0u;
+            std::uint32_t num_experts = 0u;
+        };
+
+        /**
+         * @brief One physical ledger with fixed whole and original fragment coordinates.
+         * Whole rows are those absent from families; each declared fragment row
+         * retains its original source contract even while no expert is resident.
+         */
+        struct MixedConfig
+        {
+            Config whole;
+            std::vector<FragmentFamily> families;
+            std::vector<MoEOverlayDeviceFragmentPhysicalSlot> initial_fragments;
+        };
+
+        /**
+         * @brief Enroll mixed targets without creating another storage authority.
+         * @param config Exact whole inventory and immutable original fragment rows.
+         * @return One ledger following the existing begin/stage/publish/retire lifecycle.
+         * @throws std::invalid_argument For conflicting coordinates or foreign families.
+         */
+        [[nodiscard]] static std::unique_ptr<MoEOverlayDevicePhysicalSlotLedger> createMixed(MixedConfig config);
+
+        /**
+         * @brief Stage every exact local member in one atomic mixed wave.
+         * @param batch Same authenticated movement identity as begin.
+         * @param arrivals Complete original-member receipts, with no duplicate or foreign key.
+         * @param error Rejection diagnostic; failure leaves the wave unstaged.
+         * @return True only after all local obligations are complete.
+         */
+        [[nodiscard]] bool stagePrepared(const MoEOverlayDevicePhysicalMovementBatch &batch,
+            std::vector<MoEOverlayDevicePreparedPhysicalArrival> arrivals, std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Retire mixed source lifetimes after the original reader barrier.
+         * @param batch Same published movement identity.
+         * @param retired Output retaining every departed local source.
+         * @param error Rejection diagnostic; no source is removed on rejection.
+         * @return True after the original wave becomes terminal.
+         */
+        [[nodiscard]] bool retirePrepared(const MoEOverlayDevicePhysicalMovementBatch &batch,
+            std::vector<MoEOverlayDevicePreparedPhysicalSlot> *retired, std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Borrow exact quiescent inventory without flattening payload alternatives.
+         * @param epoch Exact durable epoch, with no wave still active.
+         * @param error Rejection diagnostic.
+         * @return Immutable shared physical lifetimes, never a selected-owner mirror.
+         */
+        [[nodiscard]] std::optional<MoEOverlayDevicePreparedPhysicalInventory> preparedSnapshot(
+            std::uint64_t epoch, std::string *error = nullptr) const noexcept;
+
+        /**
+         * @brief Borrow only fixed source metadata for a participant/layer row.
+         * @param participant Original global member identity.
+         * @param layer Original model layer.
+         * @return Original retained family, or null for a whole-expert row.
+         */
+        [[nodiscard]] std::shared_ptr<const MoEOverlayFragmentFamily> fragmentFamily(int participant, int layer) const noexcept;
+
+        /**
+         * @brief Retain original fragment families and enroll complete local sources.
+         * @param config Exact model geometry, local members and authenticated families.
+         * @throws std::invalid_argument For foreign families, coordinates, epochs or payloads.
+         */
+        [[nodiscard]] static std::unique_ptr<MoEOverlayDevicePhysicalSlotLedger> createFragments(FragmentConfig config);
+
+        /**
+         * @brief Borrow a fragment source without converting its projection semantics.
+         * @param batch Exact pending movement identity.
+         * @param key Original local source coordinate named by that movement.
+         * @param error Optional rejection diagnostic.
+         * @return Retained original fragment, or no value on a wrong arm or identity.
+         */
+        [[nodiscard]] std::optional<MoEOverlayPreparedFragmentPayload> sourceFragmentPayload(
+            const MoEOverlayDevicePhysicalMovementBatch &batch,
+            const MoEOverlayDevicePhysicalSlotKey &key, std::string *error = nullptr) const noexcept;
+
+        /**
+         * @brief Stage exactly the local fragment arrivals of the authenticated wave.
+         * @param batch Exact pending movement identity.
+         * @param arrivals Registry-sealed fragments for this candidate epoch.
+         * @param error Optional rejection diagnostic.
+         * @return True only when every original destination family is complete.
+         */
+        [[nodiscard]] bool stageFragments(const MoEOverlayDevicePhysicalMovementBatch &batch,
+            std::vector<MoEOverlayDeviceStagedFragmentArrival> arrivals,
+            std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Release fragment sources only after the caller's old-reader barrier.
+         * @param batch Exact published movement identity.
+         * @param retired Receives the original source lifetimes.
+         * @param error Optional rejection diagnostic.
+         * @return True when the same pending wave becomes terminal.
+         */
+        [[nodiscard]] bool retireFragments(const MoEOverlayDevicePhysicalMovementBatch &batch,
+            std::vector<MoEOverlayDeviceFragmentPhysicalSlot> *retired,
+            std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Borrow the quiescent inventory through the fragment-only interface.
+         * @param epoch Exact current durable epoch.
+         * @param error Optional rejection diagnostic.
+         * @return Complete fragment inventory, or no value for a wrong arm/lifecycle.
+         */
+        [[nodiscard]] std::optional<MoEOverlayDeviceFragmentInventorySnapshot> fragmentSnapshot(
+            std::uint64_t epoch, std::string *error = nullptr) const noexcept;
 
         /**
          * @brief Validate and enroll the immutable initial physical inventory.
@@ -247,6 +436,12 @@ namespace llaminar2
         [[nodiscard]] bool hasPendingWave() const noexcept;
 
     private:
+        struct MixedEnrollment {};
+        /** @brief Enroll original immutable families before accepting mixed physical arrivals. */
+        MoEOverlayDevicePhysicalSlotLedger(MixedConfig config, MixedEnrollment);
+        struct FragmentEnrollment {};
+        /** @brief Private named-factory constructor keeps existing aggregate Config calls unambiguous. */
+        MoEOverlayDevicePhysicalSlotLedger(FragmentConfig config, FragmentEnrollment);
         struct Impl;
         std::unique_ptr<Impl> impl_;
     };

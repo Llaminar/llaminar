@@ -59,18 +59,17 @@ namespace llaminar2
         const bool dynamic = rebalance.mode == MoERebalanceRuntimeMode::Dynamic;
         const bool host_dynamic = dynamic && storage.migration_storage != MoEOverlayMigrationStorageKind::NoPeer &&
             plan.authority_execution == MoEOverlayAuthorityExecutionKind::HostResident;
-        const bool projected=std::any_of(plan.domains.begin(),plan.domains.end(),[](const auto& domain){
-            return domain.routed_compute_policy==RoutedExpertComputePolicy::GateUpOwnedDownColumns ||
-                (domain.routed_compute_policy==RoutedExpertComputePolicy::TensorSharded && domain.participants.size()>1 &&
-                 std::any_of(domain.participants.begin(),domain.participants.end(),[](const auto& member){return member.isCPU();}));
-        });
+        const bool projected = MoEExpertOwnerMap::usesJointFragments(plan) ||
+            std::any_of(plan.domains.begin(), plan.domains.end(), [](const auto &domain) {
+                return domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+            });
         std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation;
         if(projected) {
             const auto runtime=resolveMoEExpertOverlayRuntimePlan(std::make_shared<const MoERoutedExpertPlacementPlan>(plan),
                 {.current_world_rank=input.world_rank,.validate_mvp_root_reachability=false});
             preparation=std::make_shared<const MoEExpertOverlayPreparationPlan>(MoEExpertOverlayPreparationPlan::build(*runtime,input.loader));
         }
-        const auto joint_map=preparation?preparation->cpuJointOwnerMap():nullptr;
+        const auto joint_map=preparation?preparation->jointOwnerMap():nullptr;
         if(joint_map && !input.original_model.value)
             throw std::invalid_argument("CPU joint runtime setup requires its original model identity");
         std::optional<MoEExpertOwnerMap> whole_owners;

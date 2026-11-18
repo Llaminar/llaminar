@@ -9,6 +9,7 @@
  */
 
 #include "MoEOverlayDeviceControllerTopology.h"
+#include "MoEExpertShardCohort.h"
 
 #include <algorithm>
 #include <stdexcept>
@@ -121,7 +122,7 @@ namespace llaminar2
         /** Return the continuation-root participant that must own policy. */
         const MoEExpertOwnerParticipant &requireLeader(
             const MoERoutedExpertPlacementPlan &plan,
-            const MoEExpertOwnerMap &owner_map)
+            std::span<const MoEExpertOwnerParticipant> participants)
         {
             const std::string &continuation_domain =
                 !plan.continuation_domain_spec.domain.empty()
@@ -141,7 +142,7 @@ namespace llaminar2
             }
 
             const MoEExpertOwnerParticipant *leader = nullptr;
-            for (const auto &participant : owner_map.participants())
+            for (const auto &participant : participants)
             {
                 if (participant.domain_name == continuation_domain &&
                     participant.domain_participant_index == root_ordinal)
@@ -177,6 +178,10 @@ namespace llaminar2
         {
             return false;
         }
+        if (!cohort_target.isAbsent() &&
+            (!cohort_target.isCohort() ||
+             std::int64_t(cohort_target.word()) != -std::int64_t(tier_index) - 2))
+            return false;
         return intra_group_transport ==
                    MoEOverlayDeviceControllerIntraGroupTransport::SingleParticipant
                    ? participant_ids.size() == 1u
@@ -238,6 +243,34 @@ namespace llaminar2
                 covered[static_cast<std::size_t>(participant_id)] = true;
             }
         }
+        for (std::size_t index = 0; index < source_cohorts.size(); ++index)
+        {
+            const auto &declaration = source_cohorts[index];
+            if (!declaration.cohort || declaration.tier_index < 0)
+                return false;
+            const auto target = MoEOverlayRouteTarget::fromWord(
+                static_cast<std::int32_t>(-std::int64_t(declaration.tier_index) - 2));
+            const auto *group = groupForTarget(target);
+            if (!group || declaration.cohort->participants().size() != group->participant_ids.size())
+                return false;
+            for (std::size_t member = 0; member < group->participant_ids.size(); ++member)
+            {
+                const auto &source = declaration.cohort->participants()[member];
+                const auto id = group->participant_ids[member];
+                if (source.participant_id != id || source.address != participants[id].address ||
+                    source.world_rank != participants[id].world_rank)
+                    return false;
+            }
+            for (std::size_t previous = 0; previous < index; ++previous)
+                if (source_cohorts[previous].tier_index == declaration.tier_index &&
+                    source_cohorts[previous].cohort->source().layer_idx == declaration.cohort->source().layer_idx)
+                    return false;
+        }
+        for (const auto &group : groups)
+            if (group.cohort_target.isCohort() &&
+                std::none_of(source_cohorts.begin(), source_cohorts.end(), [&group](const auto &source)
+                    { return source.tier_index == group.tier_index; }))
+                return false;
         return leader_group_seen &&
                std::all_of(covered.begin(), covered.end(), [](bool value)
                            { return value; });
@@ -254,6 +287,92 @@ namespace llaminar2
                 return group.contains(participant_id);
             });
         return found == groups.end() ? nullptr : &*found;
+    }
+
+    std::optional<MoEOverlayDynamicPolicyWorkspaceDeclaration>
+    declareMoEOverlayDynamicPolicyWorkspace(const MoERoutedExpertPlacementPlan &plan, std::uint32_t experts)
+    {
+        if (plan.authority_execution != MoEOverlayAuthorityExecutionKind::DeviceResident)
+            return std::nullopt;
+        const auto participants = MoEExpertOwnerMap::declaredParticipants(plan,
+            {.reject_tensor_sharded_domains = false});
+        if (participants.size() > UINT32_MAX || plan.routed_tiers.size() > UINT32_MAX)
+            throw std::invalid_argument("Dynamic policy workspace declaration exceeds the runtime index namespace");
+        const auto &leader = requireLeader(plan, participants);
+        std::size_t groups = 0u;
+        std::size_t targets = 0u;
+        for (std::size_t tier = 0u; tier < plan.routed_tiers.size(); ++tier)
+        {
+            const auto [domain, ordinal] = requireDomain(plan, plan.routed_tiers[tier].domain);
+            (void)ordinal;
+            std::vector<const MoEExpertOwnerParticipant *> members;
+            for (const auto &participant : participants)
+            {
+                if (!participant.device.is_gpu() || !participant.world_rank_known)
+                    throw std::invalid_argument("Dynamic policy workspace declaration requires original GPU participant owners");
+                if (participant.tier_idx == static_cast<int>(tier)) members.push_back(&participant);
+            }
+            if (members.empty()) throw std::invalid_argument("Dynamic policy workspace tier has no original participants");
+            groups += supportsNativeIntraGroup(*domain, members) ? 1u : members.size();
+            targets += domain->routed_compute_policy == RoutedExpertComputePolicy::TensorSharded
+                ? 1u : members.size();
+        }
+        if (groups <= 1u) return std::nullopt;
+        const MoEOverlayDynamicPolicyShape shape{static_cast<std::uint32_t>(participants.size()),
+            static_cast<std::uint32_t>(targets), static_cast<std::uint32_t>(plan.routed_tiers.size()), experts};
+        if (!MoEOverlayDynamicPolicyWorkspaceHeader::bytesFor(shape))
+            throw std::invalid_argument("Dynamic policy workspace declaration has invalid or overflowing geometry");
+        return MoEOverlayDynamicPolicyWorkspaceDeclaration{leader.world_rank, leader.device, shape};
+    }
+
+    std::vector<MoEOverlayDeviceControllerLogicalTargetMetadata>
+    MoEOverlayDeviceControllerTopology::logicalTargets() const
+    {
+        if (!valid() || participants.size() > UINT32_MAX)
+            throw std::invalid_argument("Logical policy roster requires a complete original topology");
+        std::vector<MoEOverlayDeviceControllerLogicalTargetMetadata> result;
+        for (const auto &group : groups)
+        {
+            if (group.cohort_target.isCohort())
+                result.push_back({.target = group.cohort_target,
+                    .group_id = static_cast<std::uint32_t>(group.group_id),
+                    .tier_index = group.tier_index, .tier_priority = group.tier_priority,
+                    .member_count = static_cast<std::uint32_t>(group.participant_ids.size())});
+            else
+                for (std::size_t member = 0; member < group.participant_ids.size(); ++member)
+                    result.push_back({.target = MoEOverlayRouteTarget::whole(group.participant_ids[member]),
+                        .group_id = static_cast<std::uint32_t>(group.group_id),
+                        .tier_index = group.tier_index, .tier_priority = group.tier_priority,
+                        .first_group_member = static_cast<std::uint32_t>(member), .member_count = 1u});
+        }
+        return result;
+    }
+
+    const MoEOverlayDeviceControllerGroup *MoEOverlayDeviceControllerTopology::groupForTarget(
+        MoEOverlayRouteTarget target) const noexcept
+    {
+        if (target.isWhole())
+        {
+            const auto *group = groupForParticipant(target.word());
+            return group && group->cohort_target.isAbsent() ? group : nullptr;
+        }
+        if (!target.isCohort())
+            return nullptr;
+        const auto found = std::find_if(groups.begin(), groups.end(), [target](const auto &group)
+            { return group.cohort_target.word() == target.word(); });
+        return found == groups.end() ? nullptr : &*found;
+    }
+
+    std::shared_ptr<const MoEExpertShardCohort> MoEOverlayDeviceControllerTopology::cohortForTarget(
+        MoEOverlayRouteTarget target, int layer) const noexcept
+    {
+        const auto *group = target.isCohort() ? groupForTarget(target) : nullptr;
+        if (!group)
+            return {};
+        const auto found = std::find_if(source_cohorts.begin(), source_cohorts.end(),
+            [group, layer](const auto &source) { return source.tier_index == group->tier_index &&
+                source.cohort && source.cohort->source().layer_idx == layer; });
+        return found == source_cohorts.end() ? nullptr : found->cohort;
     }
 
     bool MoEOverlayDeviceControllerTopology::usesNodeLocalMappedControl()
@@ -288,7 +407,10 @@ namespace llaminar2
 
         MoEOverlayDeviceControllerTopology topology;
         topology.participants = owner_map.participants();
-        const auto &leader = requireLeader(plan, owner_map);
+        if (topology.participants != MoEExpertOwnerMap::declaredParticipants(
+                plan, {.reject_tensor_sharded_domains = false}))
+            throw std::invalid_argument("Device controller source catalogue changed original declared participants");
+        const auto &leader = requireLeader(plan, owner_map.participants());
         if (!leader.device.is_gpu() || !leader.world_rank_known)
         {
             throw std::invalid_argument(
@@ -417,6 +539,64 @@ namespace llaminar2
             }
         }
 
+        // Join the canonical original source authority, never selected expert
+        // rows. Empty tiers retain the SAME block built once by OwnerMap and
+        // remain cohorts without inventing an expert or a physical payload.
+        std::size_t source_rows = 0u;
+        for (const auto &placement : plan.placements)
+        {
+            const auto rows = owner_map.placementsForLayer(placement.layer);
+            if (rows.size() > owner_map.owners().size() - source_rows)
+                throw std::invalid_argument("Device controller repeats original source layers");
+            source_rows += rows.size();
+            if (rows.size() != placement.routed_expert_tier.size())
+                throw std::invalid_argument("Device controller source has missing original layer/expert rows");
+            for (std::size_t expert = 0; expert < rows.size(); ++expert)
+            {
+                const auto &row = rows[expert];
+                const auto original = owner_map.originalShardCohort(row.tier_idx, placement.layer);
+                if (row.expert_id != static_cast<int>(expert) ||
+                    row.tier_idx != placement.routed_expert_tier[expert] ||
+                    row.shard_cohort != original || row.shard_cohort.owner_before(original) ||
+                    original.owner_before(row.shard_cohort))
+                    throw std::invalid_argument("Device controller row replaced its original source/placement authority");
+            }
+            for (std::size_t tier = 0; tier < plan.routed_tiers.size(); ++tier)
+            {
+                const auto [domain, unused_ordinal] = requireDomain(plan, plan.routed_tiers[tier].domain);
+                (void)unused_ordinal;
+                const auto cohort = owner_map.originalShardCohort(static_cast<int>(tier), placement.layer);
+                if (domain->routed_compute_policy != RoutedExpertComputePolicy::TensorSharded)
+                {
+                    if (cohort)
+                        throw std::invalid_argument("Whole device target cannot adopt an original shard source");
+                    continue;
+                }
+                if (!cohort || cohort->source().layer_idx != placement.layer ||
+                    cohort->ownership(0).geometry().experts != static_cast<int>(rows.size()))
+                    throw std::invalid_argument("Device TensorSharded target has no exact original tier/layer source");
+                const auto &members = cohort->participants();
+                const auto *resolved_group = members.empty() ? nullptr :
+                    topology.groupForParticipant(members.front().participant_id);
+                if (!resolved_group || resolved_group->tier_index != static_cast<int>(tier) ||
+                    resolved_group->participant_ids.size() != members.size())
+                    throw std::invalid_argument("Device cohort must retain one complete original native group");
+                for (std::size_t member = 0; member < members.size(); ++member)
+                {
+                    const auto id = resolved_group->participant_ids[member];
+                    const auto &declared = topology.participants[static_cast<std::size_t>(id)];
+                    if (members[member].participant_id != id || members[member].world_rank != declared.world_rank ||
+                        members[member].address != declared.address ||
+                        declared.domain_participant_index != static_cast<int>(member))
+                        throw std::invalid_argument("Device cohort source changed its original member/rank/coordinate");
+                }
+                auto &group = topology.groups[static_cast<std::size_t>(resolved_group->group_id)];
+                group.cohort_target = MoEOverlayRouteTarget::cohort(static_cast<int>(tier));
+                topology.source_cohorts.push_back({static_cast<int>(tier), cohort});
+            }
+        }
+        if (source_rows != owner_map.owners().size())
+            throw std::invalid_argument("Device controller source contains foreign original layers");
         std::uint64_t fingerprint = 1469598103934665603ULL;
         mixScalar(fingerprint, topology.leader_participant_id);
         mixScalar(fingerprint, topology.leader_world_rank);
@@ -437,6 +617,7 @@ namespace llaminar2
             mixScalar(fingerprint, group.group_id);
             mixScalar(fingerprint, group.tier_index);
             mixScalar(fingerprint, group.tier_priority);
+            mixScalar(fingerprint, group.cohort_target.word());
             mixScalar(fingerprint, group.domain_ordinal);
             mixScalar(fingerprint, group.root_participant_id);
             mixScalar(fingerprint, group.root_world_rank);

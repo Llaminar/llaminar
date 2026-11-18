@@ -16,15 +16,24 @@
  * - SwiGLU: silu(gate) * up activation
  *
  * All operations are dispatched on the kernel's bound HIP stream.
+ * Complete local HC/router/FFN preparation extends the same retained source,
+ * table and workspace authority; the original HC stage keeps its physical
+ * leases and no parallel weight owner or default execution policy is added.
  */
 
 #pragma once
+#include "kernels/common/OriginalM1HiddenQ8Publication.h"
+#include "execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
 
 #include "../../IMoEKernel.h"
 #include "../../../config/MoERouterArithmeticPolicy.h"
 #include "../../common/DeviceResidentRouterGateCache.h"
+#include "../../common/MoEDecodeDescriptorPublication.h"
+#include "../../common/ResidentMoEFFN.h"
 #include "../ROCmKernelBase.h"
 #include "../gemm/ROCmMoERouteOwnedTuning.h"
+#include "../gemm/ROCmGateUpLastProducer.h"
+#include "../gemm/ROCmDownLastProducer.h"
 #include "../../../tensors/TensorType.h"
 #include "../../../execution/moe/MoERuntimePointerWorkspaceOwners.h"
 
@@ -43,6 +52,7 @@ namespace llaminar2
     namespace rocm
     {
         class HipBLASGemmKernel;
+        struct FullNativeHCFFNPrefixArgs;
     }
 
     /**
@@ -54,9 +64,39 @@ namespace llaminar2
      * Constructor requires a device ordinal. The kernel obtains its
      * HIP stream from GPUDeviceContextPool.
      */
-    class ROCmMoEKernel : public IMoEKernel, public ROCmKernelBase
+    class ROCmMoEKernel : public IMoEKernel, public ROCmKernelBase, public IResidentMoEFFNPreparation
     {
     public:
+        /** @copydoc IResidentMoEFFNPreparation::prepareResidentMoEFFN */
+        std::unique_ptr<PreparedResidentMoEFFN> prepareResidentMoEFFN(
+            const ResidentMoEFFNRequest& request,void* stream) override;
+
+        /** @brief Prepare one explicit original-router/native-layout FFN program.
+         * @param request Existing original source and output declaration.
+         * @param router_weights Original prepared FP16 router matrix.
+         * @param indices Original public routing IDs. @param weights Original public probabilities.
+         * @param normalize Original topK normalization policy. @param stream Exact preparation stream.
+         * @return Existing sealed local program owner with router incorporated.
+         */
+        std::unique_ptr<PreparedResidentMoEFFN> prepareNativeLayoutRouterFFN(
+            const ResidentMoEFFNRequest& request,TensorBase* router_weights,TensorBase* indices,
+            TensorBase* weights,bool normalize,void* stream);
+
+        /**
+         * @brief Prepare the complete original HC prefix and router/FFN in the existing resident owner.
+         * @param request Original source/table/output declaration resolved by the same FFN preparation authority.
+         * @param router_weights Original prepared FP16 router matrix.
+         * @param indices Original public routing IDs. @param weights Original public probabilities.
+         * @param normalize Original topK normalization policy.
+         * @param prefix Borrowed original HC binding; its stage retains and validates all tensor/source/count leases.
+         * Its barrier_state must be null because this owner binds the complete instance-owned barrier slot.
+         * @param stream Exact original non-default preparation stream.
+         * @return The existing prepared resident interface, admitted once for the actual complete function.
+         */
+        std::unique_ptr<PreparedResidentMoEFFN> prepareFullNativeHCFFN(
+            const ResidentMoEFFNRequest& request,TensorBase* router_weights,TensorBase* indices,
+            TensorBase* weights,bool normalize,const rocm::FullNativeHCFFNPrefixArgs& prefix,void* stream);
+
         /**
          * @brief Construct a ROCm MoE kernel for the given device
          * @param device_ordinal ROCm GPU ordinal (0-based)
@@ -367,6 +407,7 @@ namespace llaminar2
             ITensor *gate_weights,
             const MoERouteLaunchPlan &plan) override;
 
+        /** @copydoc IMoEKernel::decodeRouteSelect */
         bool decodeRouteSelect(
             DeviceMoELayerRuntime *runtime_layer,
             ITensor *hidden, ITensor *gate_weights,
@@ -376,8 +417,10 @@ namespace llaminar2
             bool write_legacy_outputs,
             bool update_runtime_histogram,
             const int32_t *absolute_position_ids_device,
-            RoutedExpertRowExecutionPolicy row_execution_policy) override;
+            RoutedExpertRowExecutionPolicy row_execution_policy,
+            const int32_t *active_row_count_device = nullptr) override;
 
+        /** @copydoc IMoEKernel::decodeRouteSelectWithReadyRebalanceApply */
         bool decodeRouteSelectWithReadyRebalanceApply(
             DeviceMoELayerRuntime *runtime_layers,
             DeviceMoELayerRuntime *runtime_layer,
@@ -398,7 +441,8 @@ namespace llaminar2
             int rebalance_target_layer,
             uint32_t rebalance_command_buffer_count,
             const int32_t *absolute_position_ids_device,
-            RoutedExpertRowExecutionPolicy row_execution_policy) override;
+            RoutedExpertRowExecutionPolicy row_execution_policy,
+            const int32_t *active_row_count_device = nullptr) override;
 
         void zeroBuffer(ITensor *tensor, size_t bytes) override;
 
@@ -461,7 +505,8 @@ namespace llaminar2
             int d_model,
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source =
-                MoEDecodeDescriptorSource::StaticDescriptorTable) override;
+                MoEDecodeDescriptorSource::StaticDescriptorTable,
+            const MoEIntermediateShardDescriptorDeclaration *original_family = nullptr) override;
 
         int uploadGroupedExpertGateUpDescriptorTables(
             const DeviceNativeQuantisedMatrixDesc *gate_descs,
@@ -470,7 +515,8 @@ namespace llaminar2
             int d_model,
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source =
-                MoEDecodeDescriptorSource::StaticDescriptorTable) override;
+                MoEDecodeDescriptorSource::StaticDescriptorTable,
+            const MoEIntermediateShardDescriptorDeclaration *original_family = nullptr) override;
 
         /** @copydoc IMoEKernel::uploadGroupedExpertFloatingDownDescriptorTable */
         int uploadGroupedExpertFloatingDownDescriptorTable(
@@ -478,7 +524,9 @@ namespace llaminar2
             DeviceMoEWeightFormat weight_format,
             int num_experts,
             int d_model,
-            int intermediate) override;
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source = MoEDecodeDescriptorSource::StaticDescriptorTable,
+            const MoEIntermediateShardDescriptorDeclaration *original_family = nullptr) override;
 
         /** @copydoc IMoEKernel::uploadGroupedExpertFloatingGateUpDescriptorTables */
         int uploadGroupedExpertFloatingGateUpDescriptorTables(
@@ -487,7 +535,9 @@ namespace llaminar2
             DeviceMoEWeightFormat weight_format,
             int num_experts,
             int d_model,
-            int intermediate) override;
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source = MoEDecodeDescriptorSource::StaticDescriptorTable,
+            const MoEIntermediateShardDescriptorDeclaration *original_family = nullptr) override;
 
         bool updateGroupedExpertDownDescriptorTable(
             int descriptor_table_id,
@@ -554,6 +604,10 @@ namespace llaminar2
             int d_model,
             int intermediate) override;
 
+        /** @copydoc IMoEKernel::preparePairedRouterDecodeDescriptors */
+        MoEDecodeDescriptorPublisher preparePairedRouterDecodeDescriptors(
+            DeviceMoELayerRuntime *runtime_layer, int gateup_table, int down_table, int top_k) override;
+
         /** @copydoc IMoEKernel::prepareGroupedRuntimeDecodeLaunchState */
         bool prepareGroupedRuntimeDecodeLaunchState(
             int gateup_descriptor_table_id,
@@ -562,6 +616,16 @@ namespace llaminar2
             int d_model,
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source) override;
+
+        /** @copydoc IMoEKernel::prepareGateUpPublication */
+        std::uint64_t prepareGateUpPublication(int table,int top_k,MoEGateUpPublicationPolicy policy) override;
+        /** @copydoc IMoEKernel::gateUpPublicationSignature */
+        std::uint64_t gateUpPublicationSignature(int table,int top_k) const override;
+
+        /** @copydoc IMoEKernel::prepareDownPublication */
+        std::uint64_t prepareDownPublication(int table,int top_k,MoEDownPublicationPolicy policy) override;
+        /** @copydoc IMoEKernel::downPublicationSignature */
+        std::uint64_t downPublicationSignature(int table,int top_k) const override;
 
         /** @copydoc IMoEKernel::prepareGroupedTableDecodeLaunchState */
         bool prepareGroupedTableDecodeLaunchState(
@@ -617,7 +681,8 @@ namespace llaminar2
             ITensor *canonical_route_contributions = nullptr,
             DeviceMoELayerRuntime *runtime_layer = nullptr,
             MoEDecodeDescriptorSource descriptor_source =
-                MoEDecodeDescriptorSource::StaticDescriptorTable) override;
+                MoEDecodeDescriptorSource::StaticDescriptorTable,
+            MoEExplicitRouteDemand demand = MoEExplicitRouteDemand::PublishDecode) override;
 
         bool reduceCanonicalRouteContributions(
             ITensor *canonical_route_contributions,
@@ -1022,6 +1087,10 @@ namespace llaminar2
         /** @copydoc IMoEKernel::prepareSharedExpertPrefillGroup */
         bool prepareSharedExpertPrefillGroup(DeviceRowRange rows) override;
 
+        /** @copydoc IMoEKernel::prepareOriginalM1HiddenQ8Publication */
+        bool prepareOriginalM1HiddenQ8Publication(const TensorBase*,DeviceRowRange) override;
+        /** @copydoc IMoEKernel::originalM1HiddenQ8BindingSignature */
+        std::uint64_t originalM1HiddenQ8BindingSignature() const override;
         /** @copydoc IMoEKernel::bindRouterQ8HiddenPublication */
         bool bindRouterQ8HiddenPublication(
             std::shared_ptr<MoERouterQ8HiddenPublication> publication,
@@ -1140,7 +1209,7 @@ namespace llaminar2
             int intermediate,
             const int *device_expert_ids,
             const float *device_weights,
-            bool use_runtime_descriptors,
+            MoEDecodeDescriptorSource descriptor_source,
             bool allow_router_q8_reuse,
             const char *counter_source,
             ITensor *canonical_route_contributions);
@@ -1317,7 +1386,7 @@ namespace llaminar2
         bool canReuseRouterQ8Hidden(
             const float *source,
             int rows,
-            int d_model) const noexcept;
+            int d_model) const;
         bool bindWorkspaceBuffer(void **ptr, const char *name, size_t bytes, const char *context);
 
         /**
@@ -1406,6 +1475,16 @@ namespace llaminar2
             std::size_t workspace_slot = 0;
         };
 
+        struct GateUpLastProducerBinding;
+        std::unordered_map<int,std::shared_ptr<GateUpLastProducerBinding>> gate_up_last_producer_;
+        /** @brief Borrow only a fully validated prepared M1 counter view for this original table. */
+        const NativeTileCompletionView* gateUpCompletionForCall(int table,int top_k) const;
+        /** @brief Immutable original down/route counter lease and source/table seals. */
+        struct DownLastProducerBinding;
+        std::unordered_map<int,std::shared_ptr<DownLastProducerBinding>> down_last_producer_;
+        /** @return Validated original two-level publication view, or null for explicit Staged. */
+        const NativeDownCompletionView* downCompletionForCall(int table,int top_k) const;
+
         struct GroupedDownDescriptorTable
         {
             DeviceNativeQuantisedMatrixDesc *device_descs = nullptr;
@@ -1424,6 +1503,8 @@ namespace llaminar2
                 MoEDecodeDescriptorSource::StaticDescriptorTable;
             DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeQuantised;
             std::size_t workspace_slot = 0;
+            /** Original source authority is metadata only; no engines or placement reader is retained. */
+            MoEIntermediateShardDescriptorDeclaration original_family;
             bool valid = false;
 
             /** @return Whether the selected descriptor family has device storage. */
@@ -1458,6 +1539,8 @@ namespace llaminar2
                 MoEDecodeDescriptorSource::StaticDescriptorTable;
             DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeQuantised;
             std::size_t workspace_slot = 0;
+            /** Original source authority is metadata only; no engines or placement reader is retained. */
+            MoEIntermediateShardDescriptorDeclaration original_family;
             bool valid = false;
 
             std::optional<rocm::MoERouteOwnedGateUpAdmission> owner_m1_admission;
@@ -1628,12 +1711,53 @@ namespace llaminar2
         float *d_shared_gate_scratch_ = nullptr; ///< [shared_gate_scratch_capacity_] floats on device
         int shared_gate_scratch_capacity_ = 0;
 
+        /**
+         * @brief Cold paired-stage identity; descriptor values remain in the arena on device.
+         *
+         * The original graph edge owns producer ordering. This record never
+         * tracks whether a replay ran or which experts/epoch it selected.
+         */
+        /** @brief Backend-private sealed resident program with original table owner access. */
+        class PreparedResidentFFN;
+        /**
+         * @brief Resolve original sources/tables once for either the standalone or complete local program.
+         * @param request Original source/output declaration. @param stream Exact prepared stream.
+         * @param router Original FP16 router, absent for the existing router-external program.
+         * @param indices Original selected-ID tensor. @param weights Original selected-weight tensor.
+         * @param normalize Original router normalization policy.
+         * @param prefix Optional original HC phase binding, never an alternate descriptor owner.
+         * @return Existing prepared owner with one actual-function admission.
+         */
+        std::unique_ptr<PreparedResidentMoEFFN> prepareResidentMoEFFNImpl(
+            const ResidentMoEFFNRequest& request,void* stream,TensorBase* router,TensorBase* indices,
+            TensorBase* weights,bool normalize,const rocm::FullNativeHCFFNPrefixArgs* prefix=nullptr);
+
+        struct PairedRouterDescriptors
+        {
+            DeviceMoELayerRuntime *runtime;
+            DeviceWorkspaceManager *workspace;
+            uint64_t workspace_id;
+            void *stream;
+            int gateup_table;
+            int down_table;
+            int top_k;
+            MoEDecodeDescriptorPublication outputs;
+        };
+        std::optional<PairedRouterDescriptors> paired_router_descriptors_;
+
+        /** @brief Reject a foreign arena/stream/runtime before either paired stage records work. */
+        const PairedRouterDescriptors &requirePairedRouterDescriptors(
+            DeviceMoELayerRuntime *runtime, int num_experts, int top_k) const;
+
         // Reusable private logits scratch for routeCore().
         float *d_route_logits_ = nullptr;            ///< [route_logits_capacity_] floats on device
         float *d_route_logits_partials_ = nullptr;   ///< [route_logits_partials_capacity_] floats on device
         int8_t *d_router_q8_hidden_ = nullptr;       ///< [router_q8_hidden_rows_cap_, router_q8_hidden_d_model_cap_] device rows
         float *d_router_q8_hidden_scales_ = nullptr; ///< [router_q8_hidden_rows_cap_, router_q8_hidden_blocks_cap_] device scales
         /** Capture-time publication metadata; payload remains entirely on device. */
+        /** Consumer-only original M1 checked view; separate mutable scratch remains private. */
+        std::shared_ptr<const OriginalM1HiddenQ8ReadView> original_m1_hidden_q8_read_;
+        OriginalM1HiddenQ8ReadLifecycle original_m1_hidden_q8_read_lifecycle_=OriginalM1HiddenQ8ReadLifecycle::Cold;
         std::shared_ptr<MoERouterQ8HiddenPublication>
             router_q8_hidden_publication_ =
                 std::make_shared<MoERouterQ8HiddenPublication>();

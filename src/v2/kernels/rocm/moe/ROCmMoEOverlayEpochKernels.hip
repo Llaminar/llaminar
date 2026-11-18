@@ -221,17 +221,14 @@ namespace
         const std::uint64_t *external_admission_epoch,
         std::uint64_t required_epoch)
     {
-        constexpr std::uint32_t kParticipantCount =
-            llaminar2::kMoEOverlayDeviceControllerInferenceEpochMaxParticipants;
-        const auto *const record = barrier.record;
-        const std::uint64_t arrival =
-            record && barrier.participant_id < kParticipantCount
-                ? systemAcquire64(
-                      &record->arrival_sequence[barrier.participant_id])
-                : 0u;
+        auto *const record = barrier.record;
+        const auto lane = record ? record->memberIndex(barrier.participant_id, barrier.storage_bytes) : UINT32_MAX;
+        auto *const arrivals = record ? record->arrivals(barrier.storage_bytes) : nullptr;
+        const std::uint64_t arrival = arrivals && lane != UINT32_MAX
+            ? systemAcquire64(&arrivals[lane]) : 0u;
         printf("overlay_epoch_admission_failure participant=%u record=%p "
                "external=%p external_epoch=%llu required_epoch=%llu "
-               "magic=%u version=%u mask=0x%x publisher=%u "
+               "magic=%u version=%u members=%u publisher=%u "
                "fingerprint=%llu frozen_epoch=%llu publication=%llu "
                "arrival=%llu\n",
                barrier.participant_id,
@@ -244,7 +241,7 @@ namespace
                static_cast<unsigned long long>(required_epoch),
                record ? record->magic : 0u,
                record ? record->version : 0u,
-               record ? record->participant_mask : 0u,
+               record ? record->member_count : 0u,
                record ? record->publisher_participant_id : 0u,
                static_cast<unsigned long long>(
                    record ? systemAcquire64(&record->topology_fingerprint)
@@ -289,7 +286,7 @@ namespace
             return false;
         if (!barrier.record)
         {
-            if (barrier.participant_id != 0xffffffffu)
+            if (barrier.participant_id != 0xffffffffu || barrier.storage_bytes != 0u)
                 return false;
             *required_epoch = finite_epoch ? finite_epoch : external_admission_epoch
                                   ? systemAcquire64(external_admission_epoch) : 0u;
@@ -298,41 +295,28 @@ namespace
 
         MoEOverlayDeviceControllerInferenceEpochRecord *const record =
             barrier.record;
-        constexpr std::uint32_t kParticipantCount =
-            llaminar2::kMoEOverlayDeviceControllerInferenceEpochMaxParticipants;
-        constexpr std::uint32_t kValidMask =
-            (1u << kParticipantCount) - 1u;
         const std::uint32_t participant = barrier.participant_id;
-        const std::uint32_t mask = record->participant_mask;
         const std::uint32_t publisher = record->publisher_participant_id;
-        if (!external_admission_epoch ||
-            record->magic !=
-                llaminar2::kMoEOverlayDeviceControllerInferenceEpochMagic ||
-            record->version !=
-                llaminar2::kMoEOverlayDeviceControllerInferenceEpochVersion ||
-            record->topology_fingerprint == 0u || mask == 0u ||
-            (mask & ~kValidMask) != 0u || participant >= kParticipantCount ||
-            publisher >= kParticipantCount ||
-            (mask & (1u << participant)) == 0u ||
-            (mask & (1u << publisher)) == 0u)
+        const std::uint32_t lane = record->memberIndex(participant, barrier.storage_bytes);
+        auto *const arrivals = record->arrivals(barrier.storage_bytes);
+        if (!external_admission_epoch || !arrivals || lane == UINT32_MAX ||
+            record->memberIndex(publisher, barrier.storage_bytes) == UINT32_MAX)
         {
             return false;
         }
 
         const std::uint64_t previous =
-            systemAcquire64(&record->arrival_sequence[participant]);
+            systemAcquire64(&arrivals[lane]);
         if (previous == UINT64_MAX)
             return false;
         const std::uint64_t sequence = previous + 1u;
-        systemRelease64(&record->arrival_sequence[participant], sequence);
+        systemRelease64(&arrivals[lane], sequence);
 
         if (participant == publisher)
         {
-            for (std::uint32_t member = 0u; member < kParticipantCount; ++member)
+            for (std::uint32_t member = 0u; member < record->member_count; ++member)
             {
-                if ((mask & (1u << member)) == 0u)
-                    continue;
-                while (systemAcquire64(&record->arrival_sequence[member]) <
+                while (systemAcquire64(&arrivals[member]) <
                        sequence)
                 {
                     // One control wave waits; compute waves remain schedulable.
@@ -649,6 +633,7 @@ namespace
             resolved = !external_admission_epoch &&
                        !admission_barrier.record &&
                        admission_barrier.participant_id == 0xffffffffu &&
+                       admission_barrier.storage_bytes == 0u &&
                        resolvePeerPlacementEpoch(
                            peer_placement_epoch, &required_epoch);
         }
@@ -659,7 +644,7 @@ namespace
                 admission_barrier,
                 &required_epoch,finite_epoch);
         }
-        else if (admission_barrier.participant_id != 0xffffffffu)
+        else if (admission_barrier.participant_id != 0xffffffffu || admission_barrier.storage_bytes != 0u)
         {
             resolved = false;
         }

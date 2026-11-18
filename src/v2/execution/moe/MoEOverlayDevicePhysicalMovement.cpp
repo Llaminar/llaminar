@@ -5,6 +5,9 @@
  * Immutable command identities are also used for fatal transport diagnostics.
  * Those diagnostics consume existing receipts, never device state downloads
  * or independent placement decisions, and run before abort changes lifecycle.
+ * A logical movement retains its whole or cohort target. Shadow obligations
+ * expand to the original physical members without assigning a scalar owner
+ * to a shard cohort or counting its fragments as separate expert movements.
  */
 
 #include "MoEOverlayDevicePhysicalMovement.h"
@@ -141,8 +144,8 @@ namespace llaminar2
                 mix(entry.ordinal);
                 mix(entry.layer);
                 mix(entry.expert);
-                mix(entry.source_participant);
-                mix(entry.destination_participant);
+                mix(static_cast<std::uint32_t>(entry.source_target.word()));
+                mix(static_cast<std::uint32_t>(entry.destination_target.word()));
                 mix(entry.payload_slot);
                 mix(entry.flags);
                 mix(entry.payload_bytes);
@@ -192,16 +195,34 @@ namespace llaminar2
             };
         }
 
+        /** @brief Resolve one original complete target without selecting a cohort member owner. */
+        MoEExpertOwner physicalTarget(const MoEOverlayDeviceControllerTopology &topology,
+            MoEOverlayRouteTarget target, int layer, std::uint32_t expert)
+        {
+            const auto *group = topology.groupForTarget(target);
+            if (!group)
+                throw std::invalid_argument("device command names an undeclared whole/cohort target");
+            if (target.isWhole())
+                return physicalOwner(topology, static_cast<std::uint32_t>(target.word()), layer, expert);
+            auto cohort = topology.cohortForTarget(target, layer);
+            if (!cohort)
+                throw std::invalid_argument("device cohort command has no original source layer geometry");
+            return {.layer_idx = layer, .expert_id = static_cast<int>(expert), .tier_idx = group->tier_index,
+                .owner_participant = -1, .device = DeviceId::invalid(), .resident = true,
+                .tier_name = topology.participants[group->participant_ids.front()].tier_name,
+                .domain_name = group->domain_name, .shard_cohort = std::move(cohort)};
+        }
+
         /** Resolve migration direction strictly from opaque integer priority. */
         MoEOverlayTierMigrationDirection movementDirection(
             const MoEOverlayDeviceControllerTopology &topology,
-            int source_participant,
-            int destination_participant)
+            MoEOverlayRouteTarget source_target,
+            MoEOverlayRouteTarget destination_target)
         {
             const auto *source =
-                topology.groupForParticipant(source_participant);
+                topology.groupForTarget(source_target);
             const auto *destination =
-                topology.groupForParticipant(destination_participant);
+                topology.groupForTarget(destination_target);
             if (!source || !destination)
                 throw std::invalid_argument(
                     "device physical movement cannot resolve participant priority");
@@ -234,46 +255,21 @@ namespace llaminar2
                 "device physical movement command has an invalid objective axis");
         }
 
-        /** Build exact destination slot demand from physical arrivals. */
-        std::vector<MoEOverlayTierShadowRequirement> shadowRequirements(
-            const std::vector<MoEOverlayTierMigration> &migrations)
-        {
-            std::map<RequirementKey, std::size_t> counts;
-            for (const auto &migration : migrations)
-            {
-                ++counts[{migration.layer_idx,
-                          migration.destination.tier_idx,
-                          migration.destination.owner_participant}];
-            }
-
-            std::vector<MoEOverlayTierShadowRequirement> result;
-            result.reserve(counts.size());
-            for (const auto &[key, count] : counts)
-            {
-                const auto [layer, tier, participant] = key;
-                result.push_back({
-                    .layer_idx = layer,
-                    .tier_idx = tier,
-                    .destination_participant = participant,
-                    .slot_count = count,
-                });
-            }
-            return result;
-        }
-
         /** Compare batch slot demand with the exact migrations it represents. */
         bool shadowRequirementsValid(
             const std::vector<MoEOverlayTierMigration> &migrations,
-            const std::vector<MoEOverlayTierShadowRequirement> &requirements)
+            const std::vector<MoEOverlayTierShadowRequirement> &requirements,
+            MoEOverlayShadowRequirementMode mode)
             noexcept
         {
             std::map<RequirementKey, std::size_t> expected;
-            for (const auto &migration : migrations)
+            try
             {
-                ++expected[{migration.layer_idx,
-                            migration.destination.tier_idx,
-                            migration.destination.owner_participant}];
+                for (const auto &requirement : buildMoEOverlayShadowRequirements(migrations, mode))
+                    expected.emplace(RequirementKey{requirement.layer_idx, requirement.tier_idx,
+                        requirement.destination_participant}, requirement.slot_count);
             }
+            catch (const std::logic_error &) { return false; }
             std::map<RequirementKey, std::size_t> actual;
             for (const auto &requirement : requirements)
             {
@@ -343,8 +339,11 @@ namespace llaminar2
 
         std::uint64_t bytes = 0u;
         std::set<std::pair<int, int>> durable_experts;
+        std::set<int> physical_members;
         for (const auto &migration : migrations)
         {
+            const auto source = MoEExpertPlacementTarget::fromPlacement(migration.source);
+            const auto destination = MoEExpertPlacementTarget::fromPlacement(migration.destination);
             if (migration.layer_idx < first_model_layer || migration.expert_id < 0 ||
                 static_cast<std::uint32_t>(migration.layer_idx - first_model_layer) >= num_layers ||
                 static_cast<std::uint32_t>(migration.expert_id) >= num_experts ||
@@ -352,12 +351,9 @@ namespace llaminar2
                 migration.destination.layer_idx != migration.layer_idx ||
                 migration.source.expert_id != migration.expert_id ||
                 migration.destination.expert_id != migration.expert_id ||
-                migration.source.owner_participant < 0 ||
-                migration.destination.owner_participant < 0 ||
-                migration.source.owner_participant ==
-                    migration.destination.owner_participant ||
-                !migration.source.device.is_gpu() ||
-                !migration.destination.device.is_gpu() ||
+                !source || !destination || *source == *destination ||
+                (!source->isCohort() && !migration.source.device.is_valid()) ||
+                (!destination->isCohort() && !migration.destination.device.is_valid()) ||
                 (durablePlacementKind(kind) &&
                  migration.axis ==
                      MoEOptimizationMovementAxis::ParticipantPlacement &&
@@ -368,6 +364,14 @@ namespace llaminar2
             {
                 return false;
             }
+            // IDs are canonical topology identities, not dense array offsets.
+            // Count actual members rather than imposing an ordinal ceiling or
+            // treating the cohort's -1 scalar-owner sentinel as a participant.
+            for (const auto *target : {&*source, &*destination})
+                for (std::size_t member = 0; member < target->participantCount(); ++member)
+                    physical_members.insert(target->participantId(member));
+            if (physical_members.size() > participant_count)
+                return false;
             bytes += static_cast<std::uint64_t>(
                 migration.estimated_weight_bytes);
             if (durablePlacementKind(kind) &&
@@ -378,7 +382,9 @@ namespace llaminar2
             }
         }
         if (bytes != packed_weight_bytes ||
-            !shadowRequirementsValid(migrations, shadow_requirements))
+            !shadowRequirementsValid(migrations, shadow_requirements,
+                durablePlacementKind(kind) ? MoEOverlayShadowRequirementMode::DurablePlacement
+                    : MoEOverlayShadowRequirementMode::TransientCopy))
         {
             return false;
         }
@@ -481,14 +487,14 @@ namespace llaminar2
             // Command rows remain compact on device. Only physical owners,
             // migration cycles and allocation keys use model-global layers.
             const int model_layer = command.modelLayerForStorageIndex(entry.layer);
-            auto source = physicalOwner(
+            auto source = physicalTarget(
                 topology,
-                entry.source_participant,
+                entry.source_target,
                 model_layer,
                 entry.expert);
-            auto destination = physicalOwner(
+            auto destination = physicalTarget(
                 topology,
-                entry.destination_participant,
+                entry.destination_target,
                 model_layer,
                 entry.expert);
             result.migrations.push_back({
@@ -499,15 +505,17 @@ namespace llaminar2
                     static_cast<std::size_t>(entry.payload_bytes),
                 .direction = movementDirection(
                     topology,
-                    source.owner_participant,
-                    destination.owner_participant),
+                    entry.source_target,
+                    entry.destination_target),
                 .axis = movementAxis(entry.flags),
                 .source = std::move(source),
                 .destination = std::move(destination),
             });
         }
 
-        result.shadow_requirements = shadowRequirements(result.migrations);
+        result.shadow_requirements = buildMoEOverlayShadowRequirements(result.migrations,
+            durablePlacementKind(result.kind) ? MoEOverlayShadowRequirementMode::DurablePlacement
+                : MoEOverlayShadowRequirementMode::TransientCopy);
         if (durablePlacementKind(result.kind) &&
             !result.migrations.empty())
         {
@@ -535,8 +543,8 @@ namespace llaminar2
                     {
                         if (command.entries[index].layer != command.entries[seed].layer)
                             throw std::invalid_argument("device authored cycle spans source layers");
-                        if (command.entries[index].source_participant ==
-                            command.entries[current].destination_participant)
+                        if (command.entries[index].source_target.word() ==
+                            command.entries[current].destination_target.word())
                         {
                             if (next != command.entries.size())
                                 throw std::invalid_argument("device authored cycle repeats a placement target");

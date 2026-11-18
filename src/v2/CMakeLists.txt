@@ -752,6 +752,7 @@ if(HAVE_ROCM)
         kernels/rocm/ops/ROCmTPRankOrderedReductionKernels.hip # Batch-invariant rank-ordered TP sums
         # MoE (Mixture of Experts) kernels
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
+        kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNDevice.hip
         kernels/rocm/moe/ROCmMoEOverlayActivationPacketKernels.hip # Device-owned node-local sparse activation packets
         kernels/rocm/moe/ROCmMoEOverlayDeviceControllerKernels.hip # Node-local sole-controller lifecycle
         backends/rocm/PlanningGPUClockMarker.hip # Bounded startup fixed-clock timing
@@ -1613,6 +1614,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/SendActivationsStage.cpp
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEExpertComputeStage.cpp
+    execution/compute_stages/stages/MoEIntermediateShardPipeline.cpp
     execution/compute_stages/stages/MoECPUExpertShardRouteStage.cpp
     execution/compute_stages/stages/MoEOverlayPinnedRouteEvidenceViews.cpp
     execution/compute_stages/stages/MoEExpertDispatchStage.cpp
@@ -1731,7 +1733,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEGraphRoleRunner.cpp
     execution/moe/MoEOverlayParticipantGraphRunner.cpp
     execution/moe/MoEExpertOverlayPreparationPlan.cpp
-    execution/moe/CPUExpertShardSourceSelection.cpp
+    execution/moe/ExpertShardSourceSelection.cpp
+    execution/moe/MoEOverlayNoPeerResidency.cpp
     execution/moe/MoEExpertOverlayProfiler.cpp
     execution/moe/MoEExpertOverlayRuntimePlan.cpp
     execution/moe/MoEOverlayInferenceTransaction.cpp
@@ -1749,6 +1752,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
     execution/moe/MoERuntimeTable.cpp
+    execution/moe/MoEIntermediateShardArenaGeometry.cpp
+    execution/moe/MoEIntermediateShardRuntimeBinding.cpp
     execution/moe/DeviceMoERebalanceWorkspaceContract.cpp
     execution/moe/DeviceMoETransferSlotDirectory.cpp
     execution/moe/GpuExpertSlotPool.cpp
@@ -1941,6 +1946,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/PlanningPCIeCommunicationCost.cpp
     planning/PlanningCPUExpertMeasurement.cpp
     planning/PlanningGPUExpertMeasurement.cpp
+    planning/PlanningGPUCohortServiceMeasurement.cpp
     planning/PlanningModelSample.cpp
     planning/PlanningExpertSample.cpp
     planning/PlanningMatrixSample.cpp

@@ -48,6 +48,9 @@
 #error "Compile Qwen4Exp GPU primitives through a native backend translation unit"
 #endif
 
+#include "kernels/common/OriginalSingleQ8Block32.cuh"
+
+#include "GPUBranchRMSNormBody.cuh"
 namespace llaminar2::qwen4exp
 {
 namespace QFN_BACKEND_NAMESPACE
@@ -86,55 +89,33 @@ __device__ inline float sigmoid(float value) { return 1.0f / (1.0f + expf(-value
  * storage of the original reduction edges, never their operands or RN order.
  * All output lanes consume the final shared sum after a collective barrier.
  */
+/** @brief Original256-lane norm arithmetic, inlined unchanged into both wrappers. */
+__device__ __forceinline__ void branchNormBody(BranchRMSNormArgs a)
+{
+ const auto task=static_cast<std::size_t>(blockIdx.x);
+ if(task/4>=static_cast<std::size_t>(liveRows(a.extent)))return;
+ __shared__ float sums[kThreads];
+ branch_norm_native::task(a.input,a.gain,a.output,a.hidden,a.epsilon,task,sums);
+}
 __global__ __launch_bounds__(kThreads, 2) void normKernel(BranchRMSNormArgs a)
 {
-    const auto task = static_cast<std::size_t>(blockIdx.x);
-    if (task / 4 >= static_cast<std::size_t>(liveRows(a.extent))) return;
-    const auto base = task * a.hidden;
-    const unsigned lane = threadIdx.x;
-    float partial = 0.0f;
-    for (unsigned channel = lane; channel < static_cast<unsigned>(a.hidden); channel += kThreads)
-    {
-        const float value = a.input[base + channel];
-        partial = fmaf(value, value, partial);
-    }
-    __shared__ float sums[kThreads];
-    sums[lane] = partial;
-    __syncthreads();
-#if defined(QFN_ROCM)
-    // Publish edge128 across waves before wave0 reads both sides of edge64.
-    // Keep the original left/right operand priority at each shared-memory edge.
-    if (lane < 128) sums[lane] = __fadd_rn(sums[lane], sums[lane + 128]);
-    __syncthreads();
-    if (lane < 64)
-    {
-        // Edge64 now lives in the owning wave's registers. Every lane executes
-        // each shuffle, but only the original edge owners perform RN additions;
-        // this preserves the full 128/64/32/.../1 tree, including NaN operands.
-        float sum = __fadd_rn(sums[lane], sums[lane + 64]);
-#pragma unroll
-        for (unsigned stride = 32; stride > 0; stride /= 2)
-        {
-            const float partner = __shfl_down(sum, stride, 64);
-            if (lane < stride) sum = __fadd_rn(sum, partner);
-        }
-        if (lane == 0) sums[0] = sum;
-    }
-    // Unlike a lane0-only projection reducer, normalization has consumers in
-    // all four waves. Publish lane0's result before any output lane reads it.
-    __syncthreads();
-#else
-#pragma unroll
-    for (unsigned stride = kThreads / 2; stride > 0; stride /= 2)
-    {
-        if (lane < stride) sums[lane] = __fadd_rn(sums[lane], sums[lane + stride]);
-        __syncthreads();
-    }
-#endif
-    const float inverse = 1.0f / sqrtf(sums[0] / static_cast<float>(a.hidden) + a.epsilon);
-    const auto gainBase = (task % 4) * a.hidden;
-    for (unsigned channel = lane; channel < static_cast<unsigned>(a.hidden); channel += kThreads)
-        a.output[base + channel] = __fmul_rn(__fmul_rn(a.input[base + channel], inverse), a.gain[gainBase + channel]);
+    branchNormBody(a);
+
+}
+/** @brief Retain original norm producer grid and publish each branch's exact K32 blocks. */
+__global__ __launch_bounds__(kThreads,2) void normSingleQ8Kernel(BranchRMSNormSingleQ8Args args) {
+ const auto a=args.norm;
+ branchNormBody(a);
+ // All original normalized stores must precede the borrowed producer's reads.
+ // This is one CTA-local edge; every branch is K32-aligned and independent.
+ __syncthreads();
+ const unsigned lane=threadIdx.x%32,warp=threadIdx.x/32;
+ const auto base=static_cast<std::size_t>(blockIdx.x)*a.hidden;
+ for(unsigned block=warp;block<static_cast<unsigned>(a.hidden/32);block+=kThreads/32) {
+  const auto offset=base+block*32;
+  original_single_q8::publish(a.output[offset+lane],true,args.codes+offset,
+      args.scales+offset/32,nullptr,lane);
+ }
 }
 /** @brief Expand ordinary embedding channels into four branch-major streams. */
 __global__ __launch_bounds__(kThreads, 2) void expandKernel(ResidualExpandArgs a)
@@ -178,10 +159,26 @@ __global__ __launch_bounds__(kThreads, 2) void writeKernel(ResidualWriteArgs a)
     if (rowBranch / 4 >= static_cast<std::size_t>(liveRows(a.extent))) return;
     const auto channel = (blockIdx.x % blocks) * kThreads + threadIdx.x;
     if (channel >= static_cast<unsigned>(a.hidden)) return;
-    const float gate = 2.0f * sigmoid(a.gateLogits[rowBranch] * 0.25f);
+    const float gate = branch_norm_native::residualGate(a.gateLogits[rowBranch]);
     const auto offset = rowBranch * a.hidden + channel;
-    const float update = __fmul_rn(gate, a.block[(rowBranch / 4) * a.hidden + channel]);
-    a.output[offset] = __fadd_rn(a.residual[offset], update);
+    a.output[offset] = branch_norm_native::residualValue(
+        a.residual[offset],gate,a.block[(rowBranch / 4) * a.hidden + channel]);
+}
+/**
+ * @brief Fuse one rounded residual write with its next fixed-order branch normalization.
+ * @param a Complete immutable geometry and two distinct persistent output banks.
+ * @details One CTA owns each row/branch, retaining the same 256 arithmetic lanes.
+ * Each lane stores its rounded write before the norm FMA; after reduction it
+ * reloads only its own published channels. The broadcast block input is never
+ * overwritten. Exact residual alias is safe because each channel has one writer.
+ */
+__global__ __launch_bounds__(kThreads, 2) void writeBranchNormKernel(ResidualWriteBranchRMSNormArgs a)
+{
+    const auto task = static_cast<std::size_t>(blockIdx.x);
+    if (task / 4 >= static_cast<std::size_t>(liveRows(a.extent))) return;
+    __shared__ float sums[kThreads];
+    branch_norm_native::writeTask(a.residual,a.block,a.gateLogits,a.output,a.gain,
+        a.normalized,a.hidden,a.epsilon,task,sums,threadIdx.x,true);
 }
 /** @brief Device-friendly hash constants with no host-only std::array methods. */
 struct DeviceHashPolicy
@@ -329,6 +326,13 @@ public:
         normKernel<<<static_cast<unsigned>(a.extent.rows) * 4, kThreads, 0, explicitStream(stream)>>>(a);
         checkLaunch();
     }
+    /** @brief Explicit original M1 norm/publication; validates before either output is authored. */
+    void branchRMSNormSingleQ8(const BranchRMSNormSingleQ8Args& a,void* stream) const override {
+        detail::validate(a);
+        const auto native=explicitStream(stream);
+        normSingleQ8Kernel<<<4,kThreads,0,native>>>(a);checkLaunch();
+    }
+
     /** @copydoc IQwen4ExpKernels::residualExpand */
     void residualExpand(const ResidualExpandArgs &a, void *stream) const override
     {
@@ -360,6 +364,15 @@ public:
         const auto grid = static_cast<std::size_t>(a.extent.rows) * 4 * blocks(a.hidden);
         detail::require(grid <= INT_MAX, "Qwen4Exp residual write grid exceeds backend capacity");
         writeKernel<<<static_cast<unsigned>(grid), kThreads, 0, explicitStream(stream)>>>(a);
+        checkLaunch();
+    }
+    /** @copydoc IQwen4ExpKernels::residualWriteBranchRMSNorm */
+    void residualWriteBranchRMSNorm(const ResidualWriteBranchRMSNormArgs &a, void *stream) const override
+    {
+        detail::validate(a);
+        const auto grid = static_cast<std::size_t>(a.extent.rows) * 4;
+        detail::require(grid <= INT_MAX,"Qwen4Exp fused write/branch norm grid exceeds backend capacity");
+        writeBranchNormKernel<<<static_cast<unsigned>(grid),kThreads,0,explicitStream(stream)>>>(a);
         checkLaunch();
     }
     /** @copydoc IQwen4ExpKernels::ngramHash */

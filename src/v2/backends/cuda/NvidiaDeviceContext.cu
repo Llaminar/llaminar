@@ -924,6 +924,22 @@ namespace llaminar2
         return true;
     }
 
+    bool NvidiaDeviceContext::recordCapturedTimingEventChecked(void *event, void *stream)
+    {
+        if (!event || reinterpret_cast<std::uintptr_t>(stream) <= 2)
+            throw std::invalid_argument("CUDA captured timing requires an event and exact non-default stream");
+        CUDA_CHECK(cudaSetDevice(device_ordinal_));
+        cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+        CUDA_CHECK(cudaStreamIsCapturing(static_cast<cudaStream_t>(stream), &status));
+        if (status != cudaStreamCaptureStatusActive)
+            throw std::logic_error("CUDA captured timing requires its active original capture");
+        // Keep a real event-record node. A default captured event may be
+        // elided into dependency metadata and has no timestamp after replay.
+        CUDA_CHECK(cudaEventRecordWithFlags(static_cast<cudaEvent_t>(event),
+            static_cast<cudaStream_t>(stream), cudaEventRecordExternal));
+        return true;
+    }
+
     void NvidiaDeviceContext::waitEvent(void *event, void *stream)
     {
         if (!event)

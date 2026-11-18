@@ -8,11 +8,17 @@
  * solely for identity and diagnostics. A pipeline's bounded cache search uses
  * complete joint candidates, preserving one CPU/GPU admission certificate for
  * all stages even when one participant limits its local replica grant.
+ * Tensor-sharded domains contribute their original source-native local manifests:
+ * CPU cohorts retain per-socket MPI ownership, and homogeneous GPU cohorts retain
+ * their original rank-local native collective and each physical device budget.
+ * Automatic transport intent uses the existing backend selector after physical
+ * membership is bound; it does not weaken native scope or ownership validation.
  */
 
 #include "MoEOverlayCapacityAdmission.h"
 #include "MoEOverlayNoPeerResidency.h"
 #include "MoEOverlayPhysicalLaneDemand.h"
+#include "config/BackendSelector.h"
 
 #include <algorithm>
 #include <limits>
@@ -83,8 +89,9 @@ namespace llaminar2
                 return MoEOverlayTierCopyPolicy::Replicated;
             case RoutedExpertComputePolicy::TensorSharded:
                 // A degree-one CPU tensor policy owns the complete matrix.
-                // Only multi-member CPU domains require fragment cohorts;
-                // the authored public compute policy remains unchanged.
+                // GPU domains retain their explicit fragment ownership even
+                // at degree one; multi-member CPU domains require cohorts.
+                // The authored public compute policy remains unchanged.
                 if (domain.participants.size() == 1 && domain.participants.front().isCPU())
                     return MoEOverlayTierCopyPolicy::Apportioned;
                 return MoEOverlayTierCopyPolicy::TensorSharded;
@@ -724,20 +731,57 @@ namespace llaminar2
                 participant_devices.push_back(device);
             }
 
-            if(request.copy_policy==MoEOverlayTierCopyPolicy::TensorSharded){
-                if(domain.scope!=ExecutionDomainScope::NODE_LOCAL ||
-                   domain.world_ranks.size()!=domain.participants.size())
-                    throw std::invalid_argument("CPU tensor-shard admission requires original node-local ranks");
+            if (request.copy_policy == MoEOverlayTierCopyPolicy::TensorSharded)
+            {
+                const bool cpu = domain.participants.front().isCPU();
+                if (cpu)
+                {
+                    if (domain.scope != ExecutionDomainScope::NODE_LOCAL ||
+                        domain.world_ranks.size() != domain.participants.size())
+                        throw std::invalid_argument(
+                            "CPU tensor-shard admission requires original node-local ranks");
+                }
+                else
+                {
+                    // Saved automatic plans retain AUTO transport intent. Use
+                    // the same selector as the collective BOM on these already
+                    // bound devices, preserving explicit backend constraints.
+                    const auto backend = BackendSelector::resolve(domain.backend, participant_devices);
+                    const bool native = domain.participants.front().isCUDA()
+                        ? backend == CollectiveBackendType::NCCL
+                        : domain.participants.front().isROCm() && backend == CollectiveBackendType::RCCL;
+                    const bool identity = domain.participants.size() == 1 &&
+                        backend == CollectiveBackendType::HOST;
+                    if (domain.scope != ExecutionDomainScope::RANK_LOCAL ||
+                        domain.owner_rank < 0 || (!native && !identity))
+                        throw std::invalid_argument(
+                            "GPU tensor-shard admission requires its original rank-local native domain");
+                }
                 std::vector<MoEExpertShardCohort::Participant> members;
-                for(std::size_t p=0;p<domain.participants.size();++p)
+                members.reserve(domain.participants.size());
+                for (std::size_t p = 0; p < domain.participants.size(); ++p)
+                {
+                    if (!cpu && boundParticipantWorldRank(domain, p) != domain.owner_rank)
+                        throw std::invalid_argument(
+                            "GPU tensor-shard admission cannot cross original MPI rank ownership");
                     members.push_back({request.participants[p].participant_id,
-                        boundParticipantWorldRank(domain,p),domain.participants[p]});
-                for(const auto& layer:layer_weight_manifest)
-                    request.shard_cohorts.push_back(std::make_shared<const MoEExpertShardCohort>(
-                        MoEExpertShardCohort::checked(layer,num_experts,members,
-                            MoEExpertShardCohort::balancedIntervals(layer,static_cast<int>(members.size())))));
-                if(tier.memory_budget_bytes!=0)
-                    throw std::invalid_argument("CPU shard tiers require physical PMA budgets, not an ambiguous aggregate tier byte cap");
+                        boundParticipantWorldRank(domain, p), domain.participants[p]});
+                }
+                // The original source factory owns both native block alignment
+                // and layer rotation. Admission only prices its local manifests;
+                // it must not invent a second F partition or full-copy charge.
+                for (const auto &layer : layer_weight_manifest)
+                    request.shard_cohorts.push_back(
+                        std::make_shared<const MoEExpertShardCohort>(
+                            cpu ? MoEExpertShardCohort::checked(layer, num_experts, members,
+                                      MoEExpertShardCohort::balancedIntervals(
+                                          layer, static_cast<int>(members.size())))
+                                : MoEExpertShardCohort::checkedRankLocalGPU(layer, num_experts, members,
+                                      MoEExpertShardCohort::gpuIntervals(
+                                          layer, static_cast<int>(members.size()), layer.layer_idx))));
+                if (tier.memory_budget_bytes != 0)
+                    throw std::invalid_argument(
+                        "Tensor-sharded tiers require physical PMA budgets, not an ambiguous aggregate tier byte cap");
             }
             request.max_live_experts_per_layer.assign(
                 layer_count, num_experts);

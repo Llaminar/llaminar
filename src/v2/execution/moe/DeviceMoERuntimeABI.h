@@ -103,7 +103,7 @@ namespace llaminar2::moe_runtime_abi
     inline constexpr std::uint32_t kMaxExperts = 512u;
 
     /** ABI generation for graph-resident records; old captured addresses are incompatible. */
-    inline constexpr std::uint32_t kRuntimeLayoutVersion = 2u;
+    inline constexpr std::uint32_t kRuntimeLayoutVersion = 3u;
 
     /**
      * @brief Integer grouping assigns one lane to each live expert.
@@ -173,13 +173,20 @@ namespace llaminar2::moe_runtime_abi
     /** Offset of the overlay-wide sparse-packet target array inside a bank. */
     inline constexpr std::size_t kOverlayRouteParticipantOffset = 125952;
 
-    inline constexpr std::size_t kLayerRuntimeBytes = 281064;
+    inline constexpr std::size_t kLayerRuntimeBytes = 281096;
     /** First device-local decode execution counter in the inline ABI. */
     inline constexpr std::size_t kDecodeLocalHistogramOffset = 260272;
     /** First device-local ordinary-prefill execution counter. */
     inline constexpr std::size_t kPrefillLocalHistogramOffset = 268464;
     /** First device-local grouped-verifier execution counter. */
     inline constexpr std::size_t kGroupedVerifierLocalHistogramOffset = 276656;
+    /** Original global selected-route planes, preceding the matching local plane. */
+    inline constexpr std::size_t kDecodeSelectedHistogramOffset =
+        kDecodeLocalHistogramOffset - kHistogramMaxExperts * sizeof(std::uint64_t);
+    inline constexpr std::size_t kPrefillSelectedHistogramOffset =
+        kPrefillLocalHistogramOffset - kHistogramMaxExperts * sizeof(std::uint64_t);
+    inline constexpr std::size_t kGroupedVerifierSelectedHistogramOffset =
+        kGroupedVerifierLocalHistogramOffset - kHistogramMaxExperts * sizeof(std::uint64_t);
     inline constexpr std::size_t kRouteParticipantIdsOffset = 280848;
     inline constexpr std::size_t kDeferredVerifierExpertIdsOffset = 280856;
     inline constexpr std::size_t kDeferredVerifierParticipantIdsOffset = 280864;
@@ -198,6 +205,9 @@ namespace llaminar2::moe_runtime_abi
     inline constexpr std::size_t kOverlayPlacementBanksOffset = 281048;
     /** Failure-only provenance for the last device epoch-boundary operation. */
     inline constexpr std::size_t kOverlayEpochStatusOffset = 281056;
+
+    /** Original fragment geometry, never rewritten by placement publication. */
+    inline constexpr std::size_t kIntermediateShardBindingOffset = 281064;
 
     static_assert(sizeof(void *) == 8,
                   "DeviceMoELayerRuntime ABI requires 64-bit pointers");

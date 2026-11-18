@@ -4369,4 +4369,17 @@ namespace llaminar2
         return mutableDebugEnv();
     }
 
+
+    /** @return Explicit retained M1 HC/FFN experiment selected once at cold graph ownership. */
+    inline bool qfnRetainedM1HCFFNOptIn()
+    {
+        static const bool enabled=[] {
+            constexpr const char* name="LLAMINAR_QFN_RETAINED_M1_HC_FFN_CANDIDATE";
+            const char* value=std::getenv(name);
+            if(value&&std::strcmp(value,"0")!=0&&std::strcmp(value,"1")!=0)
+                throw std::invalid_argument(std::string(name)+" requires 0 or 1");
+            return value&&std::strcmp(value,"1")==0;
+        }();
+        return enabled;
+    }
 } // namespace llaminar2

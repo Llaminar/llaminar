@@ -18,6 +18,7 @@
 
 #include <cstddef>
 #include <limits>
+#include <numeric>
 #include <span>
 #include <stdexcept>
 #include <utility>
@@ -78,6 +79,64 @@ namespace llaminar2
             /** @brief Compare ownership and complete arithmetic/slice identity. */
             bool operator==(const Projection &) const = default;
         };
+
+        /**
+         * @brief Partition F without cutting a native down-weight or Q8 activation group.
+         * @param columns Complete original intermediate width.
+         * @param participants Original domain degree, independent of GPU ordinals.
+         * @param native_group Indivisible original down-weight group along K.
+         * @param rotation Original layer's rotation of the wider partitions.
+         * @param preferred_grain Preferred GEMM tile width; source alignment wins.
+         * @return Contiguous positive intervals covering F exactly once.
+         * @throws std::invalid_argument For absent, unaligned or unrepresentable geometry.
+         *
+         * Coarse tiles keep the small expert GEMMs economical. When that tile
+         * would strand a participant, use the smallest legal source/activation
+         * group. This is a geometry choice, not an alternative execution mode.
+         * A topology wider than the number of native groups has empty members;
+         * it needs the explicit empty-fragment execution contract and cannot be
+         * represented by this positive-fragment layout. No device-count cap is
+         * imposed. Rotation changes only ownership, never original source order.
+         */
+        static std::vector<IntermediateInterval> nativeIntermediateIntervals(
+            int columns, int participants, int native_group, int rotation,
+            int preferred_grain = 128)
+        {
+            if (columns <= 0 || participants <= 0 || native_group <= 0 ||
+                rotation < 0 || preferred_grain <= 0)
+                throw std::invalid_argument("Native intermediate partition requires positive source/domain geometry");
+            const auto lcm = [](int a, int b) {
+                const auto units = a / std::gcd(a, b);
+                if (units > std::numeric_limits<int>::max() / b)
+                    throw std::invalid_argument("Native intermediate partition alignment overflows");
+                return units * b;
+            };
+            // Q8 intermediate activation scales belong to complete groups of
+            // 32 values. A slice must not silently recalibrate part of a group.
+            const int minimum_grain = lcm(native_group, 32);
+            if (columns % minimum_grain || columns / minimum_grain < participants)
+                throw std::invalid_argument("Intermediate source has too few complete native/Q8 groups for positive fragments");
+            const int preferred = lcm(minimum_grain, preferred_grain);
+            const int grain = columns % preferred == 0 && columns / preferred >= participants
+                ? preferred : minimum_grain;
+            const int blocks = columns / grain;
+            const int base = blocks / participants;
+            const int remainder = blocks % participants;
+            const int rotated = rotation % participants;
+            std::vector<IntermediateInterval> result;
+            result.reserve(static_cast<std::size_t>(participants));
+            int frontier = 0;
+            for (int p = 0; p < participants; ++p)
+            {
+                // Wider fragments start at the final coordinates, then rotate
+                // between layers. Widening is balanced in native tiles.
+                const int coordinate = p >= rotated ? p - rotated : participants - (rotated - p);
+                const int width = (base + (coordinate >= participants - remainder)) * grain;
+                result.push_back({frontier, width});
+                frontier += width; // The partition sum is bounded by columns.
+            }
+            return result;
+        }
 
         /**
          * @brief Describe ordinary whole-expert ownership at one participant.

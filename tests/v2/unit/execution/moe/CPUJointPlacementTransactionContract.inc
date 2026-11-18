@@ -275,7 +275,7 @@ TEST(CPUJointPlacementTransactionContract, MultiwaveRestorationUsesCanonicalLogi
         SCOPED_TRACE(width);
         JointPlacementOriginal original(width,1,6,2,1);
         DecodeExpertHistogram histogram({.num_layers=2,.num_experts=6,.top_k=1,.window_size=1,
-            .placement_ownership=original.preparation->cpuJointOwnerMap()});
+            .placement_ownership=original.preparation->jointOwnerMap()});
         auto config=original.config();
         config.maintenance_mode=MoERebalanceRuntimeMode::Dynamic;
         config.histogram=&histogram;

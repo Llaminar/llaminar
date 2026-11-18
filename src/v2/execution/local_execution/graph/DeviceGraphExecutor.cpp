@@ -20,6 +20,7 @@
 #include "snapshots/SnapshotStorageLayout.h"
 #include "../../../snapshots/SnapshotSemanticObservation.h"
 #include "DeviceGraphExecutor.h"
+#include "../../compute_stages/IGraphOutputDemand.h"
 #include "RetainedHostServiceProgram.h"
 #include "RetainedParentTicketServiceWorker.h"
 #include "RetainedParentTicketServiceWorker.h"
@@ -1135,6 +1136,39 @@ namespace llaminar2
         return true;
     }
 
+    void DeviceGraphExecutor::sealGraphOutputDemands(ComputeGraph& graph)
+    {
+        if(isGraphCaptureActive())
+            throw std::logic_error("Graph output demand must be sealed before capture");
+        for(const auto& name:graph.getExecutionOrder())
+        {
+            auto* node=graph.getNode(name);
+            if(!node||!node->stage)continue;
+            auto* demand=dynamic_cast<IGraphOutputDemand*>(node->stage.get());
+            if(!demand)continue;
+            const auto declaration=demand->coldSnapshotPublicationDeclaration();
+            if(!declaration)continue;
+            if(!arena_)
+                throw std::logic_error("Cold graph output demand requires its canonical BufferArena");
+            std::unordered_set<std::string> declared_names;
+            for(const auto& output:declaration->outputs)
+                if(!output.name||!*output.name||!declared_names.insert(output.name).second)
+                    throw std::invalid_argument("Cold snapshot output names must be nonempty and unique");
+            std::vector<std::string> selected;
+            // A disabled callback has no observation consumer. A configured
+            // callback is never called here: the original descriptor-aware
+            // full-stage/singleton filter alone selects possible publications.
+            if(config_.snapshot_callback&&shouldCaptureSnapshotStage(name,*declaration))
+                for(const auto& output:declaration->outputs)
+                {
+                    StageDumpInfo singleton=*declaration;
+                    singleton.outputs.clear();singleton.outputs.push_back(output);
+                    if(shouldCaptureSnapshotStage(name,singleton))selected.emplace_back(output.name);
+                }
+            demand->sealGraphOutputDemand(graph,*arena_,selected,snapshot_configuration_epoch_);
+        }
+    }
+
     bool DeviceGraphExecutor::allocateGraphStorageForCapture(
         ComputeGraph &graph,
         IDeviceContext *ctx,
@@ -1159,6 +1193,7 @@ namespace llaminar2
             return false;
         }
 
+        sealGraphOutputDemands(graph);
         std::unordered_set<ITensor *> allocated;
         for (const auto &name : graph.getExecutionOrder())
         {

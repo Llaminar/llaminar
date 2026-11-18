@@ -91,6 +91,7 @@ namespace llaminar2
                     .compute_units = properties.multiProcessorCount,
                     .native_wave_width = properties.warpSize,
                     .maximum_threads_per_block = properties.maxThreadsPerBlock,
+                    .can_launch_cooperative = properties.cooperativeLaunch != 0,
                     .can_use_stream_wait_value = observeROCmStreamWaitValueCapability(ordinal,
                         [](int *supported, int device) {
                             return hipDeviceGetAttribute(supported, hipDeviceAttributeCanUseStreamWaitValue, device);

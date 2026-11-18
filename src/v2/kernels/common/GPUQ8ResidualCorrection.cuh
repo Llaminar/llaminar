@@ -22,6 +22,8 @@
 #define Q8R_STREAM cudaStream_t
 #define Q8R_FACTORY cudaQ8ResidualCorrectedProjection
 #define Q8R_HC_FACTORY cudaHCResidualDownQ8Projection
+#define Q8R_HC_READ_FACTORY cudaHCResidualReadQ8Projection
+#define Q8R_HC_SHORT_READ_FACTORY cudaHCResidualShortKReadQ8Projection
 #define Q8R_COLUMN_REFERENCE cudaQ8ResidualOriginalColumnReference
 #define Q8R_NAMESPACE cuda_q8_residual
 #define Q8R_ERROR cudaGetLastError
@@ -36,6 +38,8 @@
 #define Q8R_STREAM hipStream_t
 #define Q8R_FACTORY rocmQ8ResidualCorrectedProjection
 #define Q8R_HC_FACTORY rocmHCResidualDownQ8Projection
+#define Q8R_HC_READ_FACTORY rocmHCResidualReadQ8Projection
+#define Q8R_HC_SHORT_READ_FACTORY rocmHCResidualShortKReadQ8Projection
 #define Q8R_COLUMN_REFERENCE rocmQ8ResidualOriginalColumnReference
 #define Q8R_NAMESPACE rocm_q8_residual
 #define Q8R_ERROR hipGetLastError
@@ -56,10 +60,13 @@
 #else
 #include "kernels/rocm/gemm/ROCmQ8ResidualGrouped.cuh"
 #endif
+#include "GPUHCDownPublication.cuh"
 #include <cstdint>
+#include <algorithm>
 #include <climits>
 #include <string>
 #include <type_traits>
+#include "GPUHCShortKBlockBody.cuh"
 namespace llaminar2 {
 namespace Q8R_NAMESPACE {
 /** @brief Native signed four-byte integer dot without any floating operand. */
@@ -137,21 +144,8 @@ __global__ __launch_bounds__(256,2) void publishHCResidualDown(GPUHCResidualDown
  const int live=a.rows.activeRows();
  if(task>=static_cast<std::uint64_t>(live)*bpr)return;
  const unsigned lane=threadIdx.x%32;const auto offset=task*32+lane;
- const float scaled=a.input[offset]*0.25f;
- const float value=scaled*(1.0f/(1.0f+expf(-scaled)));
- hc.activated[offset]=value;
- if(!isfinite(value))invalidActivation();float maximum=fabsf(value);
- for(int distance=16;distance;distance/=2)maximum=fmaxf(maximum,Q8R_SHFL(maximum,distance));
- const float stored=blockScale(maximum);
- const int primary=quantizedValue(value,stored);
- a.primary[offset]=static_cast<signed char>(primary);
- const float residual=device_fp32_contract::add(value,-device_fp32_contract::multiply(stored,static_cast<float>(primary)));
- if(!isfinite(residual))invalidActivation();
- float residualMaximum=fabsf(residual);
- for(int distance=16;distance;distance/=2)residualMaximum=fmaxf(residualMaximum,Q8R_SHFL(residualMaximum,distance));
- const float residualScale=blockScale(residualMaximum);
- a.residual[offset]=static_cast<signed char>(quantizedValue(residual,residualScale));
- if(lane==0){a.primaryScales[task]=stored;a.residualScales[task]=residualScale;}
+ const GPUHCDownOutputView output{a.rows,a.weights.k,hc.activated,a.primary,a.residual,a.primaryScales,a.residualScales};
+ hc_down_publication::publish(a.input[offset],output,offset);
 }
 /** @brief Bounded real-row reuse with independent Q8 terms and one final output store.
  * @tparam Rows Fixed maximum real rows per lane; never changes a row's K order.
@@ -186,6 +180,17 @@ template<int Rows>__global__ __launch_bounds__(128,2) void project(GPUQ8Residual
  for(int r=0;r<Rows;++r)if(rowBase+r<static_cast<unsigned>(live))
   a.output[(rowBase+r)*a.weights.n+column]=device_fp32_contract::add(primary[r],residual[r]);
 }
+/** @brief Shared original signed-Q8 block arithmetic for one unchanged output owner.
+ * @param a Exact native matrix, published activation banks and scales.
+ * @param group Original K32 contribution index.
+ * @param column Original branch-major projection output index.
+ * @param p Primary contribution; rounded exactly as the standalone short-K program.
+ * @param q Residual contribution; folded independently by the output owner.
+ */
+__device__ __forceinline__ void shortKBlockContribution(const GPUQ8ResidualCorrectionArgs& a,
+ unsigned group,std::uint64_t column,float& p,float& q) {
+ hc_short_k_native::contribution(a,group,column,p,q);
+}
 /**
  * @brief Compute independent K32 contributions, then retain the original ordered fold.
  * @tparam Groups Actual K32 group count; no inactive reduction capacity is admitted.
@@ -208,22 +213,7 @@ __global__ __launch_bounds__(Groups*kQ8ResidualShortKColumns,1) void projectShor
  const int live=a.rows.activeRows();
  float p=0.f,q=0.f;
  if(live>0&&column<static_cast<unsigned>(a.weights.n)) {
-  const auto linear=static_cast<std::uint64_t>(group)*a.weights.n+column;
-  const auto*payload=reinterpret_cast<const int4*>(a.weights.payload+linear*32);
-  const int4 low=payload[0],high=payload[1];
-  const int weights[8]{low.x,low.y,low.z,low.w,high.x,high.y,high.z,high.w};
-  const auto bits=static_cast<const unsigned short*>(a.weights.scales)[linear];
-  const float weightScale=__half2float(__ushort_as_half(bits));
-  const auto*p0=reinterpret_cast<const int*>(a.primary+group*32);
-  const auto*p1=reinterpret_cast<const int*>(a.residual+group*32);
-  int dot0=0,dot1=0;
-#pragma unroll
-  for(int word=0;word<8;++word) {
-   dot0=dot4(p0[word],weights[word],dot0);
-   dot1=dot4(p1[word],weights[word],dot1);
-  }
-  p=device_native_quantised_contract::singleScaleBlock(dot0,weightScale,a.primaryScales[group]);
-  q=device_native_quantised_contract::singleScaleBlock(dot1,weightScale,a.residualScales[group]);
+  shortKBlockContribution(a,group,column,p,q);
  }
  primary[group][localColumn]=p;
  residual[group][localColumn]=q;
@@ -236,6 +226,61 @@ __global__ __launch_bounds__(Groups*kQ8ResidualShortKColumns,1) void projectShor
    sum1=device_fp32_contract::add(sum1,residual[block][localColumn]);
   }
   a.output[column]=device_fp32_contract::add(sum0,sum1);
+ }
+}
+/**
+ * @brief Finish the four-branch read with exactly the original short-K producer grid.
+ * @tparam Groups Complete original K32 count; no padded groups or branch loops.
+ * @param read Original Q8 banks, retained logits and normalized/mixed arena operands.
+ *
+ * Each original 32-column tile becomes four contiguous eight-column branch
+ * segments. The same Groups*32 lanes and 2*Groups*32 floats of LDS author the
+ * same number of native weight blocks as projectShortK. Each output owner folds
+ * primary/residual in increasing K order and adds them once. Its now-dead primary
+ * LDS column carries that exact logit across one additional CTA barrier; eight
+ * owners then execute the original branch-order sigmoid/FMA read. Gate logits
+ * remain public outputs, including the final partial tile. No inter-CTA state,
+ * redundant dot, normalization, global barrier or allocation is introduced.
+ */
+template<int Groups>
+__global__ __launch_bounds__(Groups*kQ8ResidualShortKColumns,1)
+void projectHCShortKRead(GPUHCResidualReadProjection read) {
+ static_assert(Groups>=2&&Groups<=16);
+ constexpr unsigned Columns=32,MixedColumns=8;
+ __shared__ float primary[Groups][Columns],residual[Groups][Columns];
+ const auto a=read.down.projection;
+ const unsigned group=threadIdx.x/Columns,lane=threadIdx.x%Columns;
+ const unsigned branch=lane/MixedColumns,local=lane%MixedColumns;
+ const unsigned hidden=static_cast<unsigned>(a.weights.n/4);
+ const auto mixedColumn=static_cast<std::uint64_t>(blockIdx.x)*MixedColumns+local;
+ const auto column=static_cast<std::uint64_t>(branch)*hidden+mixedColumn;
+ const int live=a.rows.activeRows();
+ float p=0.f,q=0.f;
+ if(live>0&&mixedColumn<hidden)shortKBlockContribution(a,group,column,p,q);
+ primary[group][lane]=p;residual[group][lane]=q;
+ __syncthreads();
+ if(group==0&&live>0&&mixedColumn<hidden) {
+  float sum0=0.f,sum1=0.f;
+#pragma unroll
+  for(int block=0;block<Groups;++block) {
+   sum0=device_fp32_contract::add(sum0,primary[block][lane]);
+   sum1=device_fp32_contract::add(sum1,residual[block][lane]);
+  }
+  const float value=device_fp32_contract::add(sum0,sum1);
+  a.output[column]=value;
+  // Every output owner reads only its own LDS column, so this overwrite cannot
+  // race another owner still completing the unchanged ascending-K fold.
+  primary[0][lane]=value;
+ }
+ __syncthreads();
+ if(group==0&&lane<MixedColumns&&live>0&&mixedColumn<hidden) {
+  float mixed=0.f;
+#pragma unroll
+  for(unsigned b=0;b<4;++b) {
+   const float gate=1.0f/(1.0f+expf(-primary[0][b*MixedColumns+lane]));
+   mixed=fmaf(gate,read.normalized[static_cast<std::uint64_t>(b)*hidden+mixedColumn],mixed);
+  }
+  read.mixed[mixedColumn]=mixed*0.25f;
  }
 }
 /**
@@ -300,7 +345,8 @@ __global__ __launch_bounds__(128, 2) void projectNative(GPUQ8ResidualCorrectionA
 }
 /** @brief Validate only static prepared identities and admitted pointer geometry. */
 inline Q8R_STREAM validate(const GPUQ8ResidualCorrectionArgs &a, void *stream, NativeEmbeddingIQTables tables,
-                           const GPUHCResidualDownPublication* hc=nullptr)
+                           const GPUHCResidualDownPublication* hc=nullptr,
+                           const GPUHCResidualReadProjection* read=nullptr)
 {
     validateQ8ResidualCorrectionGeometry(a.rows.physicalRows(), a.weights.n, a.weights.k);
     const auto native = static_cast<Q8R_STREAM>(stream);
@@ -327,7 +373,8 @@ inline Q8R_STREAM validate(const GPUQ8ResidualCorrectionArgs &a, void *stream, N
         Q8ResidualStorageSpan{a.primary, values, 16}, Q8ResidualStorageSpan{a.residual, values, 16},
         Q8ResidualStorageSpan{a.primaryScales, values / 32 * sizeof(float), alignof(float)},
         Q8ResidualStorageSpan{a.residualScales, values / 32 * sizeof(float), alignof(float)},
-        Q8ResidualStorageSpan{hc?hc->activated:nullptr,hc?values*sizeof(float):0,alignof(float)}};
+        Q8ResidualStorageSpan{hc?hc->activated:nullptr,hc?values*sizeof(float):0,alignof(float)},
+        Q8ResidualStorageSpan{read?read->mixed:nullptr,read?outputValues/4*sizeof(float):0,alignof(float)}};
     const bool grids = q8ResidualNeedsIQTables(a.weights.codebook_id);
     if (grids &&
         (!tables.iq3s || !tables.iq3xxs || !tables.iq2s || !tables.iq2xs || !tables.iq2xxs || !tables.iq1s))
@@ -354,10 +401,112 @@ inline Q8R_STREAM validate(const GPUQ8ResidualCorrectionArgs &a, void *stream, N
         Q8ResidualStorageSpan{tables.iq2s, grids ? 1024 * sizeof(std::uint64_t) : 0, alignof(std::uint64_t)},
         Q8ResidualStorageSpan{tables.iq2xs, grids ? 512 * sizeof(std::uint64_t) : 0, alignof(std::uint64_t)},
         Q8ResidualStorageSpan{tables.iq2xxs, grids ? 256 * sizeof(std::uint64_t) : 0, alignof(std::uint64_t)},
-        Q8ResidualStorageSpan{tables.iq1s, grids ? 2048 * sizeof(std::uint64_t) : 0, alignof(std::uint64_t)}};
+        Q8ResidualStorageSpan{tables.iq1s, grids ? 2048 * sizeof(std::uint64_t) : 0, alignof(std::uint64_t)},
+        Q8ResidualStorageSpan{read?read->normalized:nullptr,read?outputValues*sizeof(float):0,alignof(float)}};
     if(hc&&!hc->activated)throw std::invalid_argument("HC GPU requires its retained FP32 activation output");
+    if(read&&(!hc||!read->normalized||!read->mixed||a.weights.n%4))
+        throw std::invalid_argument("HC fused read requires four complete branches and distinct normalized/mixed operands");
     validateQ8ResidualStorage(writes, reads);
     return native;
+}
+
+/**
+ * @brief Own four branch projections and their exact mixed-channel epilogue.
+ * @tparam C Actual unchanged prepared codebook, including native metadata planes.
+ * @param read Complete retained HC publication, original branches and outputs.
+ * @param tables Original immutable IQ decoder tables.
+ *
+ * One K32 group/branch/column tuple owns each contribution. Sixteen mixed columns
+ * per CTA give each branch a contiguous 64-byte weight segment; two branch
+ * workers each visit two branches, retaining more decode CTAs without splitting
+ * a warp's accesses into four short segments. A bounded LDS tile carries
+ * those values to the original ascending-K fold; long K visits consecutive tiles
+ * without changing that fold. The four final terms are added once per branch,
+ * stored to the original logits, then consumed by the original four ordered FMAs.
+ * Rows own independent CTAs, so grouped and serial arithmetic are identical.
+ */
+template<std::uint8_t C>
+__global__ __launch_bounds__(512,1) void projectHCRead(GPUHCResidualReadProjection read,
+                                                      NativeEmbeddingIQTables tables)
+{
+    using Traits=NativeDecoder::CodebookTraits<C>;
+    constexpr unsigned Columns=16,Groups=16,Branches=4,BranchWorkers=2;
+    const auto a=read.down.projection;
+    const unsigned hidden=static_cast<unsigned>(a.weights.n/4);
+    const unsigned tiles=(hidden+Columns-1)/Columns;
+    const unsigned row=blockIdx.x/tiles,column=(blockIdx.x%tiles)*Columns+threadIdx.x%Columns;
+    if(row>=static_cast<unsigned>(a.rows.activeRows()))return;
+    const unsigned groupLane=threadIdx.x/(Columns*BranchWorkers),localColumn=threadIdx.x%Columns;
+    const unsigned branchLane=(threadIdx.x/Columns)%BranchWorkers;
+    // Each simultaneous branch pair spans distinct bank lanes. Consecutive K
+    // groups retain the same physical ordering as the complete fixed-order fold.
+    __shared__ float primary[Groups][Branches][Columns],residual[Groups][Branches][Columns];
+    float sum0[4]{},sum1[4]{};
+    NativeDecoder decoder(tables);
+    for(unsigned start=0;start<a.weights.blocks_per_row;start+=Groups)
+    {
+        const unsigned group=start+groupLane;
+#pragma unroll
+        for(unsigned branch=branchLane;branch<Branches;branch+=BranchWorkers)
+        {
+            float p=0.f,q=0.f;
+            if(group<a.weights.blocks_per_row&&column<hidden)
+            {
+                const auto block=static_cast<std::uint64_t>(group)*a.weights.n+branch*hidden+column;
+                const auto* payload=a.weights.payload+block*Traits::payload_bytes;
+                int weights[8];decoder.decode_groups<C>(payload,weights);
+                const NativeBlock<C> meta(a.weights,block,payload);
+                const auto activation=static_cast<std::uint64_t>(row)*a.weights.blocks_per_row+group;
+                const auto* p0=reinterpret_cast<const int*>(a.primary+activation*32);
+                const auto* p1=reinterpret_cast<const int*>(a.residual+activation*32);
+                int dp[2]{},dq[2]{},sp[4]{},sq[4]{};
+#pragma unroll
+                for(int word=0;word<8;++word)
+                {
+                    const int half=Traits::is_dual_scale?word/4:0;
+                    dp[half]=dot4(p0[word],weights[word],dp[half]);
+                    dq[half]=dot4(p1[word],weights[word],dq[half]);
+                    if constexpr(Traits::is_asymmetric||Traits::is_dual_scale_asym||Traits::is_iq1_m)
+                    {
+                        sp[word/2]=dot4(p0[word],0x01010101,sp[word/2]);
+                        sq[word/2]=dot4(p1[word],0x01010101,sq[word/2]);
+                    }
+                }
+                p=nativeContribution<C>(decoder,meta,dp[0],dp[1],a.primaryScales[activation],sp);
+                q=nativeContribution<C>(decoder,meta,dq[0],dq[1],a.residualScales[activation],sq);
+            }
+            primary[groupLane][branch][localColumn]=p;
+            residual[groupLane][branch][localColumn]=q;
+        }
+        __syncthreads();
+        if(groupLane==0&&branchLane==0&&column<hidden)
+        {
+            const unsigned count=min(Groups,a.weights.blocks_per_row-start);
+#pragma unroll
+            for(unsigned branch=0;branch<4;++branch)
+                for(unsigned group=0;group<count;++group)
+                {
+                    sum0[branch]=device_fp32_contract::add(sum0[branch],primary[group][branch][localColumn]);
+                    sum1[branch]=device_fp32_contract::add(sum1[branch],residual[group][branch][localColumn]);
+                }
+        }
+        // Original owners finish their reads before a later K tile reuses LDS.
+        if(start+Groups<a.weights.blocks_per_row)__syncthreads();
+    }
+    if(groupLane==0&&branchLane==0&&column<hidden)
+    {
+        float mixed=0.f;
+#pragma unroll
+        for(unsigned branch=0;branch<4;++branch)
+        {
+            const auto offset=(static_cast<std::uint64_t>(row)*4+branch)*hidden+column;
+            const float value=device_fp32_contract::add(sum0[branch],sum1[branch]);
+            a.output[offset]=value;
+            const float gate=1.0f/(1.0f+expf(-value));
+            mixed=fmaf(gate,read.normalized[offset],mixed);
+        }
+        read.mixed[static_cast<std::uint64_t>(row)*hidden+column]=mixed*0.25f;
+    }
 }
 /**
  * @brief Launch the exact specialization selected from validated immutable geometry.
@@ -431,9 +580,12 @@ static void submitQ8ResidualProjection(const GPUQ8ResidualCorrectionArgs &a, voi
     const auto grid = shortGeometry ? shortGeometry->blocks : geometry.blocks;
     if ((tasks + 7) / 8 > INT_MAX || grid > INT_MAX)
         throw std::invalid_argument("Two-term GPU Q8 retained launch grid exceeds native capacity");
-    if constexpr(std::is_same_v<Publication,GPUHCResidualDownPublication>)
-        Q8R_NAMESPACE::publishHCResidualDown<<<static_cast<unsigned>((tasks + 7) / 8),256,0,native>>>(publication);
-    else
+    if constexpr(std::is_same_v<Publication,GPUHCResidualDownPublication>) {
+        if(publication.source==HCDownQ8PublicationSource::Standalone)
+            Q8R_NAMESPACE::publishHCResidualDown<<<static_cast<unsigned>((tasks + 7) / 8),256,0,native>>>(publication);
+        else if(publication.source!=HCDownQ8PublicationSource::OriginalReducer)
+            throw std::invalid_argument("Unknown HC down publication source");
+    } else
         Q8R_NAMESPACE::publish<<<static_cast<unsigned>((tasks + 7) / 8), 256, 0, native>>>(a);
     // The consumer is submitted only after the exact producer enqueue succeeds.
     // Both native nodes retain the same immutable bank/row tuple and stream.
@@ -507,6 +659,69 @@ void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs& a,void* stream,NativeEmbeddi
 void Q8R_HC_FACTORY(const GPUHCResidualDownPublication& hc,void* stream,NativeEmbeddingIQTables tables) {
  submitQ8ResidualProjection(hc.projection,stream,tables,hc);
 }
+/** @brief Submit only the sealed M1 signed-Q8 producer-shaped read candidate. */
+void Q8R_HC_SHORT_READ_FACTORY(const GPUHCResidualReadProjection& read,void* stream) {
+ const auto& a=read.down.projection;
+ const auto native=Q8R_NAMESPACE::validate(a,stream,{},&read.down,&read);
+ const auto geometry=q8ResidualShortKGeometry(
+#if defined(Q8_RESIDUAL_CUDA)
+     Q8ResidualGroupedBackend::CUDA,
+#else
+     Q8ResidualGroupedBackend::ROCm,
+#endif
+     a.rows.physicalRows(),a.weights.n,
+     a.weights.k,a.weights.codebook_id);
+ if(!geometry||a.weights.n%4)
+  throw std::invalid_argument("HC short-K read requires original M1 signed-Q8 short-K and four branches");
+ // ceil((4H)/32)==ceil(H/8): retain the original producer's actual grid even
+ // for the partial mixed-channel tile. Device-owned zero-live work stays empty.
+ if(read.down.source==HCDownQ8PublicationSource::Standalone)
+  Q8R_NAMESPACE::publishHCResidualDown<<<(a.weights.blocks_per_row+7)/8,256,0,native>>>(read.down);
+ else if(read.down.source!=HCDownQ8PublicationSource::OriginalReducer)
+  throw std::invalid_argument("Unknown HC read publication source");
+ const auto published=Q8R_ERROR();
+ if(published!=Q8R_SUCCESS)
+  throw std::runtime_error(std::string("HC short-K read publication failed: ")+Q8R_ERROR_TEXT(published));
+#define Q8R_HC_SHORT_READ_CASE(G) case G: Q8R_NAMESPACE::projectHCShortKRead<G><<<static_cast<unsigned>(geometry->blocks),geometry->threads,0,native>>>(read); break
+ switch(geometry->groups) {
+  Q8R_HC_SHORT_READ_CASE(2); Q8R_HC_SHORT_READ_CASE(3); Q8R_HC_SHORT_READ_CASE(4);
+  Q8R_HC_SHORT_READ_CASE(5); Q8R_HC_SHORT_READ_CASE(6); Q8R_HC_SHORT_READ_CASE(7);
+  Q8R_HC_SHORT_READ_CASE(8); Q8R_HC_SHORT_READ_CASE(9); Q8R_HC_SHORT_READ_CASE(10);
+  Q8R_HC_SHORT_READ_CASE(11); Q8R_HC_SHORT_READ_CASE(12); Q8R_HC_SHORT_READ_CASE(13);
+  Q8R_HC_SHORT_READ_CASE(14); Q8R_HC_SHORT_READ_CASE(15); Q8R_HC_SHORT_READ_CASE(16);
+  default: throw std::logic_error("Validated HC short-K read group has no specialization");
+ }
+#undef Q8R_HC_SHORT_READ_CASE
+ const auto projected=Q8R_ERROR();
+ if(projected!=Q8R_SUCCESS)
+  throw std::runtime_error(std::string("HC short-K read projection failed: ")+Q8R_ERROR_TEXT(projected));
+}
+/** @brief Submit a shared original publisher and one complete four-branch read consumer. */
+void Q8R_HC_READ_FACTORY(const GPUHCResidualReadProjection& read,void* stream,NativeEmbeddingIQTables tables)
+{
+    const auto& a=read.down.projection;
+    const auto native=Q8R_NAMESPACE::validate(a,stream,tables,&read.down,&read);
+    const auto groups=a.weights.blocks_per_row;
+    const auto tasks=static_cast<std::uint64_t>(a.rows.physicalRows())*groups;
+    const auto tiles=(static_cast<std::uint64_t>(a.weights.n/4)+15)/16;
+    const auto blocks=static_cast<std::uint64_t>(a.rows.physicalRows())*tiles;
+    if((tasks+7)/8>INT_MAX||blocks>INT_MAX)
+        throw std::invalid_argument("HC fused read launch geometry exceeds native capacity");
+    if(read.down.source==HCDownQ8PublicationSource::Standalone)
+    Q8R_NAMESPACE::publishHCResidualDown<<<static_cast<unsigned>((tasks+7)/8),256,0,native>>>(read.down);
+ else if(read.down.source!=HCDownQ8PublicationSource::OriginalReducer)
+    throw std::invalid_argument("Unknown HC read publication source");
+    const auto published=Q8R_ERROR();
+    if(published!=Q8R_SUCCESS)
+        throw std::runtime_error(std::string("HC fused read publication failed: ")+Q8R_ERROR_TEXT(published));
+    const unsigned threads=std::min(groups,16u)*32;
+    visitQ8ResidualNativeCodebook(a.weights.codebook_id,[&]<std::uint8_t C>() {
+        Q8R_NAMESPACE::projectHCRead<C><<<static_cast<unsigned>(blocks),threads,0,native>>>(read,tables);
+    });
+    const auto projected=Q8R_ERROR();
+    if(projected!=Q8R_SUCCESS)
+        throw std::runtime_error(std::string("HC fused read projection failed: ")+Q8R_ERROR_TEXT(projected));
+}
 #if !defined(Q8_RESIDUAL_CUDA)
 /**
  * @brief Submit original single-group ordinary arithmetic through the shared publication boundary.
@@ -562,6 +777,8 @@ void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs &a, void *stream)
 #undef Q8R_STREAM
 #undef Q8R_FACTORY
 #undef Q8R_HC_FACTORY
+#undef Q8R_HC_READ_FACTORY
+#undef Q8R_HC_SHORT_READ_FACTORY
 #undef Q8R_COLUMN_REFERENCE
 #undef Q8R_NAMESPACE
 #undef Q8R_ERROR

@@ -7,7 +7,7 @@
  * it neither authorizes a new source nor manufactures a physical alias lease.
  */
 #include "loaders/PreparedWeightIdentityContract.h"
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 #include "tensors/TensorClasses.h"
 #include <utility>
 
@@ -43,16 +43,16 @@ namespace llaminar2
     PreparedWeightIdentityContract::PreparedWeightIdentityContract(std::vector<size_t> shape, TensorType type,
         FloatingActivationOperandPrecision precision, WeightSliceSpec slice,
         std::optional<MoEExpertProjectionOwnership> projection, std::shared_ptr<TensorBase> original_projection,
-        std::shared_ptr<const CPUExpertShardSourceSelection> cpu_joint_source,
+        std::shared_ptr<const ExpertShardSourceSelection> joint_source,
         std::optional<NativeWeightSourceProjection> native_source)
         : shape_(std::move(shape)), type_(type), precision_(precision), slice_(std::move(slice)),
-          projection_(std::move(projection)), original_projection_(std::move(original_projection)), native_source_(std::move(native_source)), cpu_joint_source_(std::move(cpu_joint_source)) {}
+          projection_(std::move(projection)), original_projection_(std::move(original_projection)), native_source_(std::move(native_source)), joint_source_(std::move(joint_source)) {}
 
     std::optional<PreparedWeightIdentityContract> PreparedWeightIdentityContract::fromBinding(const WeightBinding &b)
     {
         if (!b.tensor) return std::nullopt;
         return PreparedWeightIdentityContract(b.tensor->shape(), b.tensor->native_type(),
-            b.floating_operand_precision, b.slice, b.projection_ownership, b.projection_source_owner,b.cpu_joint_source,b.native_source);
+            b.floating_operand_precision, b.slice, b.projection_ownership, b.projection_source_owner,b.joint_source,b.native_source);
     }
     PreparedWeightIdentityContract PreparedWeightIdentityContract::completeOriginalMatrix(size_t rows, size_t columns,
         TensorType type, FloatingActivationOperandPrecision precision)
@@ -79,9 +79,9 @@ namespace llaminar2
     bool PreparedWeightIdentityContract::compatible(const PreparedWeightIdentityContract &r) const
     {
         if(native_source_!=r.native_source_)return false;
-        if(bool(cpu_joint_source_)!=bool(r.cpu_joint_source_) ||
-           (cpu_joint_source_ && (*cpu_joint_source_!=*r.cpu_joint_source_ ||
-               cpu_joint_source_->cohort()!=r.cpu_joint_source_->cohort()))) return false;
+        if(bool(joint_source_)!=bool(r.joint_source_) ||
+           (joint_source_ && (*joint_source_!=*r.joint_source_ ||
+               joint_source_->cohort()!=r.joint_source_->cohort()))) return false;
         if (projection_ != r.projection_ || shape_ != r.shape_ || type_ != r.type_ || precision_ != r.precision_)
             return false;
         if (projection_ && (original_projection_ != r.original_projection_ ||

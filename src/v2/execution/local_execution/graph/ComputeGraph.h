@@ -6,6 +6,8 @@
  *
  * Extracted from DeviceGraphExecutor.h to allow consumers that only need
  * graph/node types to avoid pulling in the full executor dependency tree.
+ * Cold local-region lowering explicitly names every exported intermediate
+ * completion edge; it never hides an outside consumer behind a node alias.
  */
 
 #pragma once
@@ -21,6 +23,7 @@
 #include <cstdint>
 #include <memory>
 #include <optional>
+#include <span>
 #include <vector>
 #include <string>
 #include <unordered_map>
@@ -28,6 +31,20 @@
 
 namespace llaminar2
 {
+
+    /**
+     * @brief Exact outside users of one public output preserved by a fused local region.
+     *
+     * The replacement stage owns the original output buffers and their leases.
+     * This declaration changes only completion dependencies: every named reader
+     * waits for the retained region terminal, which publishes all its outputs.
+     * Missing, extra and duplicate producer/consumer edges are rejected cold.
+     */
+    struct LocalRegionExport
+    {
+        std::string producer; ///< Original interior producer, distinct from the retained terminal.
+        std::vector<std::string> consumers; ///< Exact existing outside readers on this participant.
+    };
 
     /** @brief Select the complete DAG or only nodes executed by its main native units. */
     enum class GraphLeafScope : uint8_t
@@ -412,6 +429,57 @@ namespace llaminar2
         ComputeGraph &addNode(const std::string &name,
                               std::unique_ptr<IComputeStage> stage,
                               DeviceId device = DeviceId::cpu());
+
+        /**
+         * @brief Replace a cold producer stage and bypass exactly one direct successor.
+         * @param producer Existing stage retained under its original node name and device.
+         * @param successor Existing single-predecessor node whose work the replacement includes.
+         * @param replacement Complete combined stage, already numerically and hazard-validated by its builder.
+         * @return This graph after every successor consumer is rewired to the retained producer.
+         * @throws std::invalid_argument Before mutation for live schedules, unsupported metadata or a non-direct edge.
+         * @details All original producer consumers/dependencies remain intact.
+         * Cached topology/stage views are invalidated atomically. Capture-wave,
+         * ticket, read-ahead and retained-auxiliary anchors cannot be removed or
+         * relabeled implicitly; their owners must perform an explicit lowering.
+         */
+        ComputeGraph &replaceProducerAndBypassSuccessor(const std::string &producer,
+            const std::string &successor,std::unique_ptr<IComputeStage> replacement);
+
+        /**
+         * @brief Replace a declared cold local region while retaining its sole external output node.
+         * @param region Exact original node names, including the retained terminal.
+         * @param terminal Original region sink, whose name and outside consumers remain unchanged.
+         * @param replacement Complete participant-local stage owning all original public outputs.
+         * @return This graph with one replacement depending on the union of original external producers.
+         * @throws std::invalid_argument Before mutation for foreign devices, collectives, outside
+         * interior consumers, disconnected regions, live schedules or sealed capture metadata.
+         * @details The typed builder proves arithmetic and buffer hazards. This operation proves
+         * graph closure: every removed node reaches the terminal inside the region and no other
+         * region node has outside consumers. It never absorbs communication or retained frontiers.
+         * All allocations precede the non-throwing ownership change, preserving the original graph
+         * on failure. No execution, allocation planning or runtime decision occurs here.
+         */
+        ComputeGraph &replaceClosedLocalRegion(const std::vector<std::string> &region,
+            const std::string &terminal,std::unique_ptr<IComputeStage> replacement);
+
+        /**
+         * @brief Lower a cold local region with explicitly preserved interior publications.
+         * @param region Exact original nodes, including terminal and exported producers.
+         * @param terminal Retained completion node for every output of the replacement.
+         * @param replacement Complete local stage retaining the original public buffers and leases.
+         * @param exports Exact original interior-producer/outside-consumer edges to redirect.
+         * @return This graph after one atomic topology mutation.
+         * @throws std::invalid_argument Before mutation for incomplete exports, foreign readers,
+         * disconnected work, forbidden metadata or any cycle introduced by region contraction.
+         * @details Every member must reach the terminal or an explicitly exported producer
+         * through region-only edges. This admits independent publication branches without
+         * inventing an original dependency. The complete proposed DAG is validated before
+         * mutation, so a path leaving and re-entering the region cannot deadlock capture.
+         * Empty exports retain the strict single-output contract of the other overload.
+         */
+        ComputeGraph &replaceClosedLocalRegion(const std::vector<std::string> &region,
+            const std::string &terminal,std::unique_ptr<IComputeStage> replacement,
+            std::span<const LocalRegionExport> exports);
 
         /**
          * @brief Add a dependency between nodes

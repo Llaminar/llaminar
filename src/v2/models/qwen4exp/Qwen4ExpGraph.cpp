@@ -20,6 +20,8 @@
 #include "../../execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "Qwen4ExpBufferLayout.h"
 #include "Qwen4ExpTrunkBinding.h"
+#include "Qwen4ExpRetainedM1HCFFNPolicy.h"
+#include "execution/compute_stages/stages/MoEIntermediateShardPipeline.h"
 #include "../../execution/compute_stages/stages/qwen4exp/Qwen4ExpPLEBuilder.h"
 #include "../../execution/compute_stages/stages/qwen4exp/Qwen4ExpSparseAttentionBuilder.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
@@ -60,6 +62,24 @@ namespace llaminar2
             throw std::invalid_argument(
                 "QSA prefill8_decode33 requires explicit fp16_tile and the canonical single-request graph family");
     }
+void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph,const std::string &internalBoundary)
+{
+    if(!forward_input_construction_)return;
+    const auto &input=*forward_input_construction_;
+    if(input.execution_phase!=ForwardExecutionPhase::Decode ||
+       input.execution_role!=ForwardExecutionRole::MainInference || input.seq_len!=1 || input.batch_size!=1)return;
+    const auto *boundary=graph.getNode(internalBoundary);
+    if(useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNOptIn(),input.execution_phase,input.execution_role,input.seq_len,input.batch_size)) {
+        if(!boundary || !boundary->device.is_rocm())
+            throw std::invalid_argument("QFN retained full HC/FFN requires original ROCm layer composition");
+        if(config_.qfn_hc_norm_q8_candidate||
+           config_.qfn_hc_short_k_read_candidate||config_.qfn_hc_down_publish_candidate||
+           config_.qfn_hidden_q8_reuse_candidate)
+            throw std::invalid_argument("QFN retained full HC/FFN requires the original staged HC and router declarations");
+        lowerRetainedM1HCFFN(graph,internalBoundary);
+        return;
+    }
+}
 void Qwen4ExpGraph::appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const
 {
     Qwen35MoEGraph::appendPrefixCacheFingerprintMaterial(material);

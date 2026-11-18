@@ -71,4 +71,31 @@ inline constexpr std::array<std::array<std::size_t, 3>, 6> kMoERouteGeometryTimi
     return kMoERouteGeometryTimingOrders[round % kMoERouteGeometryTimingOrders.size()];
 }
 
+/** @brief One four-submission paired order, independent of the chosen input record. */
+enum class PairedTimingOrder {ABBA,BAAB};
+/** @brief An input record and its paired order for one chronological timing round. */
+struct PairedRecordTimingRound {
+    std::size_t record; ///< Exact input-record axis, never selected by latency sorting.
+    PairedTimingOrder order; ///< Alternates on each complete visit cycle.
+    /** @return The unchanged two-control/two-candidate order for this round. */
+    [[nodiscard]] constexpr std::array<int,4> sides() const noexcept {
+        return order==PairedTimingOrder::ABBA?std::array<int,4>{0,1,1,0}:std::array<int,4>{1,0,0,1};
+    }
+};
+/**
+ * @brief Balance every input record across both paired orders without coupling parity to input.
+ * @tparam Records Positive count of matched immutable input records.
+ * @param chronologicalRound Zero-based chronological phase, including warmup visits.
+ * @return Current record and ABBA/BAAB order, reversing on each visit to that record.
+ * @details Every contiguous2*Records rounds contains each record once in each
+ * order, regardless of starting phase. Existing within-parent execution stays
+ * unchanged; this only selects the next matched input and submission sequence.
+ */
+template<std::size_t Records>
+[[nodiscard]] constexpr PairedRecordTimingRound pairedRecordTimingRound(std::size_t chronologicalRound) noexcept {
+    static_assert(Records>0,"Paired record timing requires at least one input record");
+    return {chronologicalRound%Records,(chronologicalRound/Records)%2==0?
+        PairedTimingOrder::ABBA:PairedTimingOrder::BAAB};
+}
+
 }

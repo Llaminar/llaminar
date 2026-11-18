@@ -203,6 +203,22 @@ Qwen4ExpHyperconnectionBuilder::BlockRead QwenGraphBase::addBranchBlockRead(
         context.arithmetic = Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier;
     else if (usesHCUpCorrection(config_,prepared_read.up))
         context.upProjectionRows = singleRequestProjectionQueryRows(rows, device);
+    if(!predictor&&config_.qfn_hc_norm_q8_candidate&&device.is_gpu()&&rows==1&&
+       forward_input_construction_&&forward_input_construction_->execution_phase==ForwardExecutionPhase::Decode&&
+       forward_input_construction_->execution_role==ForwardExecutionRole::MainInference)
+        context.branchNormExecution=Qwen4ExpHCBranchNormExecution::PublishOriginalSingleQ8;
+    if(!predictor&&config_.qfn_hc_short_k_read_candidate&&device.is_gpu()&&rows==1&&
+       forward_input_construction_&&forward_input_construction_->execution_phase==ForwardExecutionPhase::Decode&&
+       forward_input_construction_->execution_role==ForwardExecutionRole::MainInference)
+        context.readExecution=Qwen4ExpHCReadExecution::ProducerGridShortK;
+    if(!predictor&&config_.qfn_hc_down_publish_candidate&&rows==1&&forward_input_construction_&&
+       forward_input_construction_->execution_phase==ForwardExecutionPhase::Decode&&
+       forward_input_construction_->execution_role==ForwardExecutionRole::MainInference)
+    {
+        context.downPublication=Qwen4ExpHCDownPublication::ReducerEpilogue;
+        if(config_.qfn_hc_down_lookahead_candidate)
+            context.downProducerProgram=HCDownProducerProgram::TwoK32Lookahead;
+    }
     return Qwen4ExpHyperconnectionBuilder::appendRead(graph, context,
         {prepared_read,
          Qwen4ExpPreparedProjection(*weights.inject, *prepared_weight_store_, device)},
@@ -238,6 +254,22 @@ void QwenGraphBase::addBranchAttentionReadOnly(ComputeGraph &graph,
     if (predictor) context.arithmetic=Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier;
     else if (usesHCUpCorrection(config_,prepared_read.up))
         context.upProjectionRows = singleRequestProjectionQueryRows(rows, device);
+    if(!predictor&&config_.qfn_hc_norm_q8_candidate&&device.is_gpu()&&rows==1&&
+       forward_input_construction_&&forward_input_construction_->execution_phase==ForwardExecutionPhase::Decode&&
+       forward_input_construction_->execution_role==ForwardExecutionRole::MainInference)
+        context.branchNormExecution=Qwen4ExpHCBranchNormExecution::PublishOriginalSingleQ8;
+    if(!predictor&&config_.qfn_hc_short_k_read_candidate&&device.is_gpu()&&rows==1&&
+       forward_input_construction_&&forward_input_construction_->execution_phase==ForwardExecutionPhase::Decode&&
+       forward_input_construction_->execution_role==ForwardExecutionRole::MainInference)
+        context.readExecution=Qwen4ExpHCReadExecution::ProducerGridShortK;
+    if(!predictor&&config_.qfn_hc_down_publish_candidate&&rows==1&&forward_input_construction_&&
+       forward_input_construction_->execution_phase==ForwardExecutionPhase::Decode&&
+       forward_input_construction_->execution_role==ForwardExecutionRole::MainInference)
+    {
+        context.downPublication=Qwen4ExpHCDownPublication::ReducerEpilogue;
+        if(config_.qfn_hc_down_lookahead_candidate)
+            context.downProducerProgram=HCDownProducerProgram::TwoK32Lookahead;
+    }
     Qwen4ExpHyperconnectionBuilder::appendFinalRead(graph,context,
         prepared_read,
         readBuffers(buffers, buffers.current_hidden, buffers.idFor(BufferId::HIDDEN_STATE),
@@ -257,6 +289,22 @@ std::string QwenGraphBase::addBranchHeadRead(ComputeGraph &graph, TensorBase *hi
                 forward_input_construction_->sequence_lengths_device : nullptr) : std::nullopt);
     if (usesHCUpCorrection(config_,prepared_read.up))
         context.upProjectionRows = singleRequestProjectionQueryRows(rows, device);
+    if(config_.qfn_hc_norm_q8_candidate&&device.is_gpu()&&rows==1&&
+       forward_input_construction_&&forward_input_construction_->execution_phase==ForwardExecutionPhase::Decode&&
+       forward_input_construction_->execution_role==ForwardExecutionRole::MainInference)
+        context.branchNormExecution=Qwen4ExpHCBranchNormExecution::PublishOriginalSingleQ8;
+    if(config_.qfn_hc_short_k_read_candidate&&device.is_gpu()&&rows==1&&
+       forward_input_construction_&&forward_input_construction_->execution_phase==ForwardExecutionPhase::Decode&&
+       forward_input_construction_->execution_role==ForwardExecutionRole::MainInference)
+        context.readExecution=Qwen4ExpHCReadExecution::ProducerGridShortK;
+    if(config_.qfn_hc_down_publish_candidate&&rows==1&&forward_input_construction_&&
+       forward_input_construction_->execution_phase==ForwardExecutionPhase::Decode&&
+       forward_input_construction_->execution_role==ForwardExecutionRole::MainInference)
+    {
+        context.downPublication=Qwen4ExpHCDownPublication::ReducerEpilogue;
+        if(config_.qfn_hc_down_lookahead_candidate)
+            context.downProducerProgram=HCDownProducerProgram::TwoK32Lookahead;
+    }
     return Qwen4ExpHyperconnectionBuilder::appendFinalRead(graph, context,
         prepared_read,
         readBuffers(buffers_.layer_buffers, hidden, input_buffer_id,

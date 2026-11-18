@@ -420,6 +420,16 @@ namespace llaminar2
             int layer,DeviceId device,const std::string &dependency,ModelInvocationPrefix &prefix);
 
         /**
+         * @brief Apply model-owned lowering after one attention/FFN layer composition.
+         * @param graph Cold participant-local graph containing both complete fragments.
+         * @param internalBoundary Original attention terminal, before the newly merged FFN.
+         * @details The default preserves the composed graph. Overrides declare
+         * reusable builder transformations; they never execute or own live state.
+         */
+        virtual void postLayerComposition(ComputeGraph &graph,const std::string &internalBoundary)
+        { (void)graph; (void)internalBoundary; }
+
+        /**
          * @brief Retain immutable input bindings only during declarative graph construction.
          *
          * Nested graph builders restore the outer input automatically. Stages

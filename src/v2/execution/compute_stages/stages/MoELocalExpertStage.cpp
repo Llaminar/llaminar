@@ -22,7 +22,7 @@
 
 #include "MoELocalExpertStage.h"
 #include "../../moe/CanonicalMoERouteRecord.h"
-#include "../../moe/CPUExpertShardSourceSelection.h"
+#include "../../moe/ExpertShardSourceSelection.h"
 
 #include "MoEExpertComputeStage.h"
 #include "execution/moe/MoEOverlayHostRowWork.h"
@@ -2788,7 +2788,7 @@ namespace llaminar2
         // successor still owns the declared canonical return layout.
         if (!params_.cpu_joint_route_producer)
             output.layout = params_.return_layout;
-        std::optional<MoEOverlayParticipantResidencyRegistry::CPUJointLayer> execution_joint_layer;
+        std::optional<MoEOverlayParticipantResidencyRegistry::JointLayer> execution_joint_layer;
         if(params_.cpu_joint_route_producer) {
             const auto &publication=*params_.cpu_joint_layer;
             execution_joint_layer=publication.acquireEpoch(input.residency_epoch);
@@ -3438,8 +3438,8 @@ namespace llaminar2
                             return false;
                         }
                     }
-                    if(execution_layer_bank->cpu_fragment_family) {
-                        const auto& fragment=execution_layer_bank->cpu_fragments[expert_index];
+                    if(execution_layer_bank->fragment_family) {
+                        const auto& fragment=execution_layer_bank->fragments[expert_index];
                         invocation_gate_engines_[expert_index]=fragment.gate().get();
                         invocation_up_engines_[expert_index]=fragment.up().get();
                         invocation_down_engines_[expert_index]=fragment.down().get();
@@ -4467,7 +4467,7 @@ namespace llaminar2
 
         const auto* completed_layer_bank=deferred_residency_bank_
             ? &deferred_residency_bank_->layerForModelLayer(params_.layer_idx):nullptr;
-        if(completed_layer_bank && completed_layer_bank->cpu_fragment_family &&
+        if(completed_layer_bank && completed_layer_bank->fragment_family &&
            PerfStatsCollector::isDomainEnabled("moe_overlay_residency")){
             // The completed route vector is already the invocation's authority.
             // Fold consecutive equal experts with a scalar; no duplicate counts,
@@ -4476,7 +4476,7 @@ namespace llaminar2
                 const auto expert=active_routes_[begin].expert_id;
                 size_t end=begin+1;
                 while(end<active_routes_.size() && active_routes_[end].expert_id==expert)++end;
-                completed_layer_bank->cpu_fragments.at(size_t(expert)).recordCompletedExecution(
+                completed_layer_bank->fragments.at(size_t(expert)).recordCompletedExecution(
                     deferred_residency_bank_->epoch,static_cast<std::uint64_t>(end-begin));
                 begin=end;
             }

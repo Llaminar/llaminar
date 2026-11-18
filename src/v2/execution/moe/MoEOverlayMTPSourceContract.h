@@ -4,13 +4,15 @@
  *
  * This passive contract validates the retained source recipe, not prepared
  * engines or native readiness. Registry publication later authenticates actual
- * Store/PMA lifetimes and every prepared projection independently.
+ * Store/PMA lifetimes and every prepared projection independently. Cohort
+ * population is validated by its source factory; a GPU singleton retains the
+ * same complete-F source contract while CPU single-device experts remain whole.
  */
 #pragma once
 #include <limits>
 #include "MoEExpertOverlayPreparationPlan.h"
 #include "MoEExpertOwnerMap.h"
-#include "CPUExpertShardSourceSelection.h"
+#include "ExpertShardSourceSelection.h"
 #include <map>
 #include <set>
 #include <span>
@@ -38,8 +40,8 @@ inline void requireMoEOverlayMTPSourceCoverage(const MoEExpertOwnerMap &owners,
     using Coordinate=std::tuple<int,int,int>;
     std::map<Coordinate,unsigned> local_roles;
     if(preparation)for(const auto &request:preparation->requests()) {
-        if(!source_layers.contains(request.layer) || request.participant_world_rank!=world_rank || !request.cpu_joint_source)continue;
-        const auto &selected=*request.cpu_joint_source;
+        if(!source_layers.contains(request.layer) || request.participant_world_rank!=world_rank || !request.joint_source)continue;
+        const auto &selected=*request.joint_source;
         const auto *row=owners.placementFor(request.layer,request.expert_id);
         if(!row || !row->shard_cohort || selected.cohort()!=row->shard_cohort ||
            selected.layer()!=request.layer || !selected.contains(request.expert_id) ||
@@ -67,10 +69,10 @@ inline void requireMoEOverlayMTPSourceCoverage(const MoEExpertOwnerMap &owners,
             if(!owners.ownerFor(layer,expert))throw std::invalid_argument("MTP predictor expert lost its original whole owner");
             continue;
         }
-        if(!preparation || preparation->cpuJointOwnerMap().get()!=&owners)
+        if(!preparation || preparation->jointOwnerMap().get()!=&owners)
             throw std::invalid_argument("MTP joint source requires the same original preparation/map authority");
         const auto &cohort=*placement->shard_cohort;
-        if(cohort.source().layer_idx!=layer || cohort.participants().size()<2 || cohort.participants().size()>static_cast<size_t>(std::numeric_limits<int>::max()))
+        if(cohort.source().layer_idx!=layer || cohort.participants().empty() || cohort.participants().size()>static_cast<size_t>(std::numeric_limits<int>::max()))
             throw std::invalid_argument("MTP predictor cohort changed original layer/population");
         for(size_t member=0;member<cohort.participants().size();++member) {
             const auto &original=cohort.participants()[member];

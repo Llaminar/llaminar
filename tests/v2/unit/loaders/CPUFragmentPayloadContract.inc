@@ -10,12 +10,12 @@
 #include <type_traits>
 
 static_assert(!std::is_constructible_v<
-              llaminar2::MoEOverlayPreparedCPUFragmentPayload, llaminar2::ModelContextId,
+              llaminar2::MoEOverlayPreparedFragmentPayload, llaminar2::ModelContextId,
               std::shared_ptr<const llaminar2::MoEExpertOverlayPreparationPlan>,
               std::shared_ptr<const llaminar2::MoEExpertShardCohort>, std::size_t, int,
               std::array<std::shared_ptr<llaminar2::ITensorGemm>, 3>>);
 
-static_assert(!std::is_convertible_v<llaminar2::MoEOverlayPreparedCPUFragmentPayload,
+static_assert(!std::is_convertible_v<llaminar2::MoEOverlayPreparedFragmentPayload,
                                     llaminar2::MoEOverlayPreparedExpertPayload>);
 
 TEST(CPUFragmentPayloadContract,
@@ -45,19 +45,19 @@ TEST(CPUFragmentPayloadContract,
     for (int replay = 0; replay < 3; ++replay)
     {
         for (std::size_t role = 0; role < 3; ++role)
-            EXPECT_TRUE(MoEOverlayPreparedCPUFragmentPayload::validateRole(
+            EXPECT_TRUE(MoEOverlayPreparedFragmentPayload::validateRole(
                 *selected->cohort(), selected->participantIndex(),
                 static_cast<ExpertTierWeightProjection>(role), engines[role], &error))
                 << error;
-        EXPECT_FALSE(MoEOverlayPreparedCPUFragmentPayload::validateRole(
+        EXPECT_FALSE(MoEOverlayPreparedFragmentPayload::validateRole(
             *selected->cohort(), selected->participantIndex(), ExpertTierWeightProjection::Gate,
             engines[2], &error));
         EXPECT_NE(error.find("geometry/source format"), std::string::npos);
-        EXPECT_FALSE(MoEOverlayPreparedCPUFragmentPayload::validateRole(
+        EXPECT_FALSE(MoEOverlayPreparedFragmentPayload::validateRole(
             *selected->cohort(), 99, ExpertTierWeightProjection::Gate, engines[0], &error));
-        EXPECT_FALSE(MoEOverlayPreparedCPUFragmentPayload::validateRole(
+        EXPECT_FALSE(MoEOverlayPreparedFragmentPayload::validateRole(
             *selected->cohort(), 0, ExpertTierWeightProjection::Gate, {}, &error));
-        EXPECT_FALSE(MoEOverlayPreparedCPUFragmentPayload::validateRole(
+        EXPECT_FALSE(MoEOverlayPreparedFragmentPayload::validateRole(
             *selected->cohort(), 0, static_cast<ExpertTierWeightProjection>(77), engines[0],
             &error));
     }
@@ -72,7 +72,7 @@ TEST(CPUFragmentPayloadContract,
         selected->ownership().intermediateIntervals().end());
     const auto foreign =
         MoEExpertShardCohort::checked(foreignManifest, 512, participants, intervals);
-    EXPECT_FALSE(MoEOverlayPreparedCPUFragmentPayload::validateRole(
+    EXPECT_FALSE(MoEOverlayPreparedFragmentPayload::validateRole(
         foreign, selected->participantIndex(), ExpertTierWeightProjection::Gate, engines[0],
         &error));
     EXPECT_NE(error.find("geometry/source format"), std::string::npos);
@@ -83,14 +83,14 @@ TEST(CPUFragmentPayloadContract,
 {
     using namespace llaminar2;
     MoEOverlayPreparedExpertArrival ordinary;
-    MoEOverlayPreparedCPUFragmentPayload fragment;
+    MoEOverlayPreparedFragmentPayload fragment;
     EXPECT_TRUE(fragment.empty());
     EXPECT_FALSE(fragment.valid());
-    EXPECT_FALSE(ordinary.isCPUJointFragment());
+    EXPECT_FALSE(ordinary.isJointFragment());
     EXPECT_EQ(ordinary.destinationEpoch(), 0u);
     std::string error;
-    EXPECT_FALSE(ordinary.completeCPUFragment(fragment, &error));
+    EXPECT_FALSE(ordinary.completeFragment(fragment, &error));
     EXPECT_TRUE(fragment.empty());
     EXPECT_NE(error.find("wrong-arm"), std::string::npos);
-    EXPECT_TRUE(fragment.sameIdentity(MoEOverlayPreparedCPUFragmentPayload{}));
+    EXPECT_TRUE(fragment.sameIdentity(MoEOverlayPreparedFragmentPayload{}));
 }

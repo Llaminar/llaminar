@@ -208,11 +208,12 @@ namespace llaminar2
             return std::nullopt;
         }
 
-        /** @return Logical tensor partition geometry, including the exact full-matrix CPU TP1 case. */
+        /** @return Canonical original domain geometry, including CPU TP1 and rank-local GPU TP1. */
         bool supportsRoutedExpertTensorSharding() const
         {
-            return (participants.size()==1 && participants.front().isCPU()) ||
-                (isCollectiveDomain() && hasMultipleParticipants());
+            // The public domain declaration owns this rule. Duplicating it
+            // here previously rejected GPU TP1 after its canonical admission.
+            return toExecutionDomainDefinition().supportsRoutedExpertTensorSharding();
         }
 
         bool supportsWholeExpertApportionment() const
@@ -1209,7 +1210,7 @@ namespace llaminar2
             if (domain.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded && !domain.supportsRoutedExpertTensorSharding())
             {
                 addError("routed expert domain '" + domain.name +
-                         "' uses expert_compute=tensor-sharded but is neither CPU TP1 nor a multi-participant collective domain");
+                         "' uses expert_compute=tensor-sharded but has no positive original domain-scoped TP membership");
             }
         }
 

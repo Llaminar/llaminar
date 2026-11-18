@@ -16,14 +16,14 @@ TEST(CPUTensorTP1PreparedStatic, OriginalSourceAndStaticSetupRetainWholeMatrixPo
  const auto runtime=resolveMoEExpertOverlayRuntimePlan(std::make_shared<const MoERoutedExpertPlacementPlan>(plan),
   {.current_world_rank=0,.validate_mvp_root_reachability=false});
  const auto prepared=MoEExpertOverlayPreparationPlan::build(*runtime,*source.loader);
- EXPECT_FALSE(prepared.cpuJointOwnerMap());
+ EXPECT_FALSE(prepared.jointOwnerMap());
  const auto cpu=prepared.filteredForDevice(DeviceId::cpu());
  ASSERT_EQ(cpu.requests().size(),448u*3);
- for(const auto& request:cpu.requests()){EXPECT_FALSE(request.cpu_joint_source);EXPECT_FALSE(request.projection_ownership);}
+ for(const auto& request:cpu.requests()){EXPECT_FALSE(request.joint_source);EXPECT_FALSE(request.projection_ownership);}
  const auto weights=cpu.sourceWeightPlan(*source.loader,ModelContextId{175});
  ASSERT_EQ(weights.requirements().size(),3u);
  for(const auto& requirement:weights.requirements()){
-  EXPECT_FALSE(requirement.cpu_joint_source);EXPECT_FALSE(requirement.projection_ownership);
+  EXPECT_FALSE(requirement.joint_source);EXPECT_FALSE(requirement.projection_ownership);
   EXPECT_EQ(requirement.slice.expert_ids.size(),448u);
   EXPECT_EQ(requirement.slice.row_start,0u);EXPECT_EQ(requirement.slice.col_start,0u);
   EXPECT_EQ(requirement.slice.row_count,requirement.slice.source_rows);
@@ -47,6 +47,6 @@ TEST(CPUTensorTP1PreparedStatic, OriginalSourceAndStaticSetupRetainWholeMatrixPo
  EXPECT_EQ(setup.authority()->snapshot()->ownershipKind(),MoEOverlayResidencyOwnershipKind::WholeExperts);
  EXPECT_FALSE(setup.residency()->projectionPreparation());
  ASSERT_EQ(setup.residency()->localParticipantIds().size(),2u);
- for(const auto pid:setup.residency()->localParticipantIds())EXPECT_FALSE(setup.residency()->isCPUJointParticipant(pid));
+ for(const auto pid:setup.residency()->localParticipantIds())EXPECT_FALSE(setup.residency()->isJointParticipant(pid));
  EXPECT_FALSE(setup.residency()->allInitialBanksReady());
 }

@@ -1,4 +1,6 @@
 #pragma once
+#include "kernels/common/OriginalM1HiddenQ8Publication.h"
+#include "execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
 
 /**
  * @file CUDAMoEKernel.h
@@ -341,6 +343,7 @@ namespace llaminar2
             ITensor *gate_weights,
             const MoERouteLaunchPlan &plan) override;
 
+        /** @copydoc IMoEKernel::decodeRouteSelect */
         bool decodeRouteSelect(
             DeviceMoELayerRuntime *runtime_layer,
             ITensor *hidden, ITensor *gate_weights,
@@ -350,8 +353,10 @@ namespace llaminar2
             bool write_legacy_outputs,
             bool update_runtime_histogram,
             const int32_t *absolute_position_ids_device,
-            RoutedExpertRowExecutionPolicy row_execution_policy) override;
+            RoutedExpertRowExecutionPolicy row_execution_policy,
+            const int32_t *active_row_count_device = nullptr) override;
 
+        /** @copydoc IMoEKernel::decodeRouteSelectWithReadyRebalanceApply */
         bool decodeRouteSelectWithReadyRebalanceApply(
             DeviceMoELayerRuntime *runtime_layers,
             DeviceMoELayerRuntime *runtime_layer,
@@ -372,7 +377,8 @@ namespace llaminar2
             int rebalance_target_layer,
             uint32_t rebalance_command_buffer_count,
             const int32_t *absolute_position_ids_device,
-            RoutedExpertRowExecutionPolicy row_execution_policy) override;
+            RoutedExpertRowExecutionPolicy row_execution_policy,
+            const int32_t *active_row_count_device = nullptr) override;
 
         void zeroBuffer(ITensor *tensor, size_t bytes) override;
 
@@ -536,7 +542,8 @@ namespace llaminar2
             int d_model,
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source =
-                MoEDecodeDescriptorSource::StaticDescriptorTable) override;
+                MoEDecodeDescriptorSource::StaticDescriptorTable,
+            const MoEIntermediateShardDescriptorDeclaration *original_family = nullptr) override;
 
         /// @brief Upload persistent gate/up descriptor tables for grouped CUDA prefill.
         int uploadGroupedExpertGateUpDescriptorTables(
@@ -546,7 +553,8 @@ namespace llaminar2
             int d_model,
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source =
-                MoEDecodeDescriptorSource::StaticDescriptorTable) override;
+                MoEDecodeDescriptorSource::StaticDescriptorTable,
+            const MoEIntermediateShardDescriptorDeclaration *original_family = nullptr) override;
 
         /** @copydoc IMoEKernel::uploadGroupedExpertFloatingDownDescriptorTable */
         int uploadGroupedExpertFloatingDownDescriptorTable(
@@ -554,7 +562,9 @@ namespace llaminar2
             DeviceMoEWeightFormat weight_format,
             int num_experts,
             int d_model,
-            int intermediate) override;
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source = MoEDecodeDescriptorSource::StaticDescriptorTable,
+            const MoEIntermediateShardDescriptorDeclaration *original_family = nullptr) override;
 
         /** @copydoc IMoEKernel::uploadGroupedExpertFloatingGateUpDescriptorTables */
         int uploadGroupedExpertFloatingGateUpDescriptorTables(
@@ -563,7 +573,9 @@ namespace llaminar2
             DeviceMoEWeightFormat weight_format,
             int num_experts,
             int d_model,
-            int intermediate) override;
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source = MoEDecodeDescriptorSource::StaticDescriptorTable,
+            const MoEIntermediateShardDescriptorDeclaration *original_family = nullptr) override;
 
         bool updateGroupedExpertDownDescriptorTable(
             int descriptor_table_id,
@@ -616,6 +628,10 @@ namespace llaminar2
         /** @copydoc IMoEKernel::prepareSharedExpertPrefillGroup */
         bool prepareSharedExpertPrefillGroup(DeviceRowRange rows) override;
 
+        /** @copydoc IMoEKernel::prepareOriginalM1HiddenQ8Publication */
+        bool prepareOriginalM1HiddenQ8Publication(const TensorBase*,DeviceRowRange) override;
+        /** @copydoc IMoEKernel::originalM1HiddenQ8BindingSignature */
+        std::uint64_t originalM1HiddenQ8BindingSignature() const override;
         /** @copydoc IMoEKernel::bindRouterQ8HiddenPublication */
         bool bindRouterQ8HiddenPublication(
             std::shared_ptr<MoERouterQ8HiddenPublication> publication,
@@ -740,7 +756,8 @@ namespace llaminar2
             ITensor *canonical_route_contributions = nullptr,
             DeviceMoELayerRuntime *runtime_layer = nullptr,
             MoEDecodeDescriptorSource descriptor_source =
-                MoEDecodeDescriptorSource::StaticDescriptorTable) override;
+                MoEDecodeDescriptorSource::StaticDescriptorTable,
+            MoEExplicitRouteDemand demand = MoEExplicitRouteDemand::PublishDecode) override;
 
         /// @brief Execute graph-capturable grouped SwiGLU/down decode from runtime-table ids and weights.
         bool groupedExpertDownDecodeFromRuntime(
@@ -1072,7 +1089,7 @@ namespace llaminar2
             int intermediate,
             const int *device_expert_ids,
             const float *device_weights,
-            bool use_runtime_descriptors,
+            MoEDecodeDescriptorSource descriptor_source,
             bool allow_router_q8_reuse,
             const char *counter_source,
             ITensor *canonical_route_contributions);
@@ -1339,7 +1356,7 @@ namespace llaminar2
         bool canReuseRouterQ8Hidden(
             const float *source,
             int rows,
-            int d_model) const noexcept;
+            int d_model) const;
 
         /**
          * @brief Explain why a router Q8 hidden publication cannot be consumed.
@@ -1386,6 +1403,8 @@ namespace llaminar2
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::StaticDescriptorTable;
             DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeQuantised;
+            /** Original source authority is metadata only; no engines or placement reader is retained. */
+            MoEIntermediateShardDescriptorDeclaration original_family;
             bool valid = false;
 
             /** @return Whether the selected descriptor family has device storage. */
@@ -1420,6 +1439,8 @@ namespace llaminar2
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::StaticDescriptorTable;
             DeviceMoEWeightFormat weight_format = DeviceMoEWeightFormat::NativeQuantised;
+            /** Original source authority is metadata only; no engines or placement reader is retained. */
+            MoEIntermediateShardDescriptorDeclaration original_family;
             bool valid = false;
 
             /** @return Whether both selected descriptor tables are resident. */
@@ -1563,6 +1584,9 @@ namespace llaminar2
         int8_t *d_decode_hidden_int8_ = nullptr;
         float *d_decode_hidden_scales_ = nullptr;
         /** Capture-time publication metadata; payload remains entirely on device. */
+        /** Consumer-only original M1 checked view; separate mutable scratch remains private. */
+        std::shared_ptr<const OriginalM1HiddenQ8ReadView> original_m1_hidden_q8_read_;
+        OriginalM1HiddenQ8ReadLifecycle original_m1_hidden_q8_read_lifecycle_=OriginalM1HiddenQ8ReadLifecycle::Cold;
         std::shared_ptr<MoERouterQ8HiddenPublication>
             router_q8_hidden_publication_ =
                 std::make_shared<MoERouterQ8HiddenPublication>();

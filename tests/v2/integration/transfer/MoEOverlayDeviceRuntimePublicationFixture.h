@@ -158,24 +158,26 @@ namespace llaminar2::test
                     for (std::uint32_t expert = 0u; expert < input.num_experts; ++expert)
                     {
                         auto &runtime = host_layers[layer];
-                        const auto count = runtime.decode_histogram[expert];
+                        const auto count = input.selected_demand.at(static_cast<std::size_t>(layer) * input.num_experts + expert);
+                        const auto local = runtime.decode_local_histogram[expert];
+                        runtime.decode_histogram[expert] = runtime.prefill_histogram[expert] = runtime.grouped_verifier_histogram[expert] = 0u;
+                        runtime.decode_local_histogram[expert] = runtime.prefill_local_histogram[expert] = runtime.grouped_verifier_local_histogram[expert] = 0u;
                         if (demand_source == moe_runtime_abi::HistogramSource::GroupedVerifier)
                         {
                             runtime.grouped_verifier_histogram[expert] = count;
-                            runtime.grouped_verifier_local_histogram[expert] = count;
+                            runtime.grouped_verifier_local_histogram[expert] = local;
                         }
                         else if (demand_source == moe_runtime_abi::HistogramSource::Prefill)
                         {
                             runtime.prefill_histogram[expert] = count;
-                            runtime.prefill_local_histogram[expert] = count;
+                            runtime.prefill_local_histogram[expert] = local;
                         }
-                        else if (demand_source != moe_runtime_abi::HistogramSource::Decode)
-                            throw std::invalid_argument("Unknown synthetic histogram source");
-                        if (demand_source != moe_runtime_abi::HistogramSource::Decode)
+                        else if (demand_source == moe_runtime_abi::HistogramSource::Decode)
                         {
-                            runtime.decode_histogram[expert] = 0u;
-                            runtime.decode_local_histogram[expert] = 0u;
+                            runtime.decode_histogram[expert] = count;
+                            runtime.decode_local_histogram[expert] = local;
                         }
+                        else throw std::invalid_argument("Unknown recorded histogram source");
                     }
                 }
 
@@ -400,7 +402,13 @@ namespace llaminar2::test
                 DeviceMoEExpertDescriptor{});
             for (const auto &entry : batch.entries)
             {
-                if (entry.destination_participant !=
+                if (!entry.destination_target.isWhole())
+                {
+                    if (error)
+                        *error = "whole-only publication fixture received a cohort target";
+                    return false;
+                }
+                if (entry.destination_target.word() !=
                     static_cast<std::uint32_t>(participant_.participant_id))
                 {
                     continue;
@@ -575,9 +583,9 @@ namespace llaminar2::test
             std::uint32_t expert)
         {
             std::uint32_t owner =
-                static_cast<std::uint32_t>(input.participants.size());
+                static_cast<std::uint32_t>(input.targets.size());
             for (std::uint32_t participant = 0u;
-                 participant < input.participants.size();
+                 participant < input.targets.size();
                  ++participant)
             {
                 const std::size_t index =
@@ -588,7 +596,7 @@ namespace llaminar2::test
                 if (moe_rebalance_policy::collectedStateAuthoritativeOwner(
                         input.collected_state.at(index)))
                 {
-                    if (owner != input.participants.size())
+                    if (owner != input.targets.size())
                     {
                         throw std::logic_error(
                             "snapshot has multiple authoritative owners");
@@ -596,9 +604,11 @@ namespace llaminar2::test
                     owner = participant;
                 }
             }
-            if (owner == input.participants.size())
+            if (owner == input.targets.size())
                 throw std::logic_error("snapshot has no authoritative owner");
-            return owner;
+            if (!input.targets[owner].target.isWhole())
+                throw std::logic_error("Whole runtime fixture requires an original whole target, not a cohort representative");
+            return static_cast<std::uint32_t>(input.targets[owner].target.word());
         }
 
         /** Initialize one layer without inventing a participant-local owner map. */
@@ -673,11 +683,9 @@ namespace llaminar2::test
                      layer) *
                         input.num_experts +
                     expert;
-                runtime.decode_histogram[expert] =
-                    moe_rebalance_policy::collectedStateActivationCount(
-                        input.collected_state.at(state_index));
-                runtime.decode_local_histogram[expert] =
-                    runtime.decode_histogram[expert];
+                runtime.decode_local_histogram[expert] = moe_rebalance_policy::collectedStateActivationCount(
+                    input.collected_state.at(state_index));
+
             }
         }
 

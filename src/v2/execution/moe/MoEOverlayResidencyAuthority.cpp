@@ -91,32 +91,29 @@ namespace llaminar2
             return result;
         }
 
-        /** @return Whether the immutable plan contains actual CPU tensor-shard members. */
-        bool jointCPUPlan(const MoERoutedExpertPlacementPlan& plan)
+        /** @return Whether the original routed tiers contain complete CPU/GPU shard groups. */
+        bool jointFragmentPlan(const MoERoutedExpertPlacementPlan& plan)
         {
-            return std::any_of(plan.domains.begin(),plan.domains.end(),[](const auto& domain){
-                return domain.routed_compute_policy==RoutedExpertComputePolicy::TensorSharded &&
-                    domain.participants.size()>1 && std::any_of(domain.participants.begin(),domain.participants.end(),
-                        [](const auto& member){return member.isCPU();});
-            });
+            return MoEExpertOwnerMap::usesJointFragments(plan);
         }
         /** @brief Authenticate the original typed map against this exact model/plan once at cold construction. */
         void requireJointSource(const MoERoutedExpertPlacementPlan& plan,const MoERoutedExpertModelMetadata& model,
             const MoEExpertOverlayPreparationPlan& preparation)
         {
-            const auto& original=preparation.cpuJointOwnerMap();
-            if(!original || !jointCPUPlan(plan) || model.num_layers<=0 || model.num_experts<=0 ||
+            const auto& original=preparation.jointOwnerMap();
+            if(!original || !jointFragmentPlan(plan) || model.num_layers<=0 || model.num_experts<=0 ||
                plan.placements.size()!=size_t(model.num_layers) ||
                original->participants()!=MoEExpertOwnerMap::declaredParticipants(plan,{.reject_tensor_sharded_domains=false}) ||
                original->owners().size()!=size_t(model.num_layers)*size_t(model.num_experts))
                 throw std::invalid_argument("Static joint residency requires its original complete source map and members");
             for(const auto& domain:plan.domains)
-                if(domain.routed_compute_policy==RoutedExpertComputePolicy::TensorSharded &&
-                   std::any_of(domain.participants.begin(),domain.participants.end(),[](const auto& member){return member.isCPU();}) &&
-                   (domain.scope!=ExecutionDomainScope::NODE_LOCAL || domain.routed_phase_policy!=RoutedExpertPhasePolicy::Uniform ||
+                if(domain.routed_compute_policy==RoutedExpertComputePolicy::TensorSharded && !domain.participants.empty() &&
+                   (domain.participants.size()>1 || domain.participants.front().isGPU()) &&
+                   (domain.scope != (domain.participants.front().isCPU() ? ExecutionDomainScope::NODE_LOCAL : ExecutionDomainScope::RANK_LOCAL) ||
+                    domain.routed_phase_policy!=RoutedExpertPhasePolicy::Uniform ||
                     domain.routed_decode_assignment_policy!=RoutedExpertAssignmentPolicy::StaticOwner ||
                     domain.routed_prefill_assignment_policy!=RoutedExpertAssignmentPolicy::StaticOwner))
-                    throw std::invalid_argument("CPU joint residency requires original node-local Uniform StaticOwner phases");
+                    throw std::invalid_argument("Joint residency requires original domain membership and Uniform StaticOwner phases");
             for(size_t index=0;index<original->owners().size();++index) {
                 const auto& row=original->owners()[index];
                 const auto placement=std::find_if(plan.placements.begin(),plan.placements.end(),[&](const auto& layer){return layer.layer==row.layer_idx;});
@@ -136,8 +133,8 @@ namespace llaminar2
                     for(const auto& member:row.shard_cohort->participants()) {
                         const auto* declared=original->participantForId(member.participant_id);
                         if(!declared || declared->world_rank!=member.world_rank || declared->address!=member.address ||
-                           declared->device!=DeviceId::cpu() || declared->tier_idx!=row.tier_idx)
-                            throw std::invalid_argument("Joint fragment source changed its original CPU rank/NUMA member");
+                           declared->device!=member.address.toLocalDeviceId() || declared->tier_idx!=row.tier_idx)
+                            throw std::invalid_argument("Joint fragment source changed its original rank/device member");
                     }
                 } else if(!original->participantForId(row.owner_participant)) {
                     throw std::invalid_argument("Joint snapshot contains an invalid ordinary whole-expert row");
@@ -148,7 +145,7 @@ namespace llaminar2
 
     MoEOverlayResidencyOwnershipKind MoEOverlayResidencySnapshot::ownershipKind() const noexcept
     {
-        return joint_ ? MoEOverlayResidencyOwnershipKind::CPUJointFragments
+        return joint_ ? MoEOverlayResidencyOwnershipKind::JointFragments
                       : MoEOverlayResidencyOwnershipKind::WholeExperts;
     }
 
@@ -196,10 +193,23 @@ namespace llaminar2
     {
         if (!joint_)
             return owner_map;
-        const auto original = joint_->preparation->cpuJointOwnerMap();
+        const auto original = joint_->preparation->jointOwnerMap();
         if (!original)
             throw std::logic_error("Joint snapshot lost its original source map");
         return *original;
+    }
+
+    bool MoEOverlayTierMigration::crossesBackend() const noexcept
+    {
+        // Cohort construction proves a common compute backend for every
+        // member. Reading that type does not manufacture a representative
+        // physical owner, rank or shard coordinate.
+        const auto backend = [](const MoEExpertOwner &target) {
+            return target.shard_cohort
+                ? target.shard_cohort->participants().front().address.device_type
+                : target.device.type;
+        };
+        return backend(source) != backend(destination);
     }
 
     bool MoEOverlayTierMigration::crossesWorldRank() const noexcept
@@ -212,7 +222,7 @@ namespace llaminar2
             for (std::size_t from = 0; from < source.shard_cohort->participants().size(); ++from)
                 for (std::size_t to = 0; to < destination.shard_cohort->participants().size(); ++to)
                 {
-                    // All three CPU fragment projections use the SAME F
+                    // All three fragment projections use the SAME F
                     // interval (Gate/Up N and Down K). Empty intersections do
                     // not create remote movement, even if ranks differ.
                     const auto a = source.shard_cohort->ownership(from).projection(WeightRole::MoEExpertUp);
@@ -893,7 +903,7 @@ namespace llaminar2
         MoEOverlayRouteTarget economyExecutionTarget(const MoEExpertOwner& owner) {
             if(!MoEExpertPlacementTarget::fromPlacement(owner))
                 throw std::invalid_argument("Economy source has no checked complete target");
-            return owner.shard_cohort?MoEOverlayRouteTarget::cpuCohort(owner.tier_idx):
+            return owner.shard_cohort?MoEOverlayRouteTarget::cohort(owner.tier_idx):
                 MoEOverlayRouteTarget::whole(owner.owner_participant);
         }
         /**
@@ -1686,7 +1696,7 @@ namespace llaminar2
             axis == MoEOptimizationMovementAxis::Combined;
         return candidate_tier_idx >= 0 &&
                !candidate_target.isAbsent() &&
-               (!candidate_target.isCPUCohort() ||
+               (!candidate_target.isCohort() ||
                 candidate_target.word() == -std::int64_t(candidate_tier_idx) - 2) && valid_axis &&
                (changed ||
                 (activation_count == 0 && estimated_weight_bytes == 0));
@@ -1861,7 +1871,7 @@ namespace llaminar2
             return false;
         }
         const bool joint = previous->ownershipKind() ==
-                           MoEOverlayResidencyOwnershipKind::CPUJointFragments;
+                           MoEOverlayResidencyOwnershipKind::JointFragments;
         const auto same_owner = [](const auto &a, const auto &b)
         { return a.get() == b.get() && !a.owner_before(b) && !b.owner_before(a); };
         const auto matches_placement = [&](const MoEExpertOwner &canonical,
@@ -2651,14 +2661,15 @@ namespace llaminar2
             throw std::invalid_argument(
                 "MoE overlay residency authority requires an enabled tiered overlay");
         }
-        if (jointCPUPlan(config_.initial_plan))
+        if (jointFragmentPlan(config_.initial_plan))
         {
             if (config_.maintenance_mode == MoERebalanceRuntimeMode::Off &&
                 (config_.histogram || config_.participant_rebalance_policy.enabled ||
                  config_.phase_service_profile || config_.migration_cost_profile ||
                  config_.migration_economy_policy || config_.economy_layer_catalog))
-                throw std::invalid_argument("Static CPU joint placement cannot own maintenance or economic state");
-            if (config_.maintenance_mode == MoERebalanceRuntimeMode::Dynamic &&
+                throw std::invalid_argument("Static joint placement cannot own maintenance or economic state");
+            if (MoEExpertOwnerMap::usesCPUJointFragments(config_.initial_plan) &&
+                config_.maintenance_mode == MoERebalanceRuntimeMode::Dynamic &&
                 (config_.initial_plan.authority_execution != MoEOverlayAuthorityExecutionKind::HostResident ||
                  !hasTierResidencyAxis(availableMoEOptimizationMovementAxes(config_.initial_plan)) ||
                  std::none_of(config_.initial_plan.domains.begin(), config_.initial_plan.domains.end(),
@@ -3018,7 +3029,7 @@ namespace llaminar2
             return std::nullopt;
         };
 
-        if(config_.projection_preparation && config_.projection_preparation->cpuJointOwnerMap())
+        if(config_.projection_preparation && config_.projection_preparation->jointOwnerMap())
             return reject("Current-batch LLEP cannot reinterpret complete CPU cohort fragment ownership");
         if (layer_idx < 0 || domain_name.empty() ||
             domain_participant_count <= 1)
@@ -3135,7 +3146,7 @@ namespace llaminar2
         requireHostDynamicPublicationAuthority(
             const char *operation) const
     {
-        if (jointCPUPlan(config_.initial_plan) && config_.maintenance_mode == MoERebalanceRuntimeMode::Off)
+        if (jointFragmentPlan(config_.initial_plan) && config_.maintenance_mode == MoERebalanceRuntimeMode::Off)
             throw std::logic_error(std::string(operation) + ": Static CPU cohorts have no mutable publication authority");
         if (!migrationEnabled() ||
             config_.initial_plan.authority_execution !=
@@ -3660,7 +3671,7 @@ namespace llaminar2
         const
     {
         const auto current = snapshot();
-        if (current && current->ownershipKind() == MoEOverlayResidencyOwnershipKind::CPUJointFragments)
+        if (current && current->ownershipKind() == MoEOverlayResidencyOwnershipKind::JointFragments)
         {
             if (!current->valid() || !initial_snapshot_ || !initial_snapshot_->valid())
                 return false;
@@ -3758,9 +3769,9 @@ namespace llaminar2
         };
 
         const bool joint = previous->ownershipKind() ==
-                           MoEOverlayResidencyOwnershipKind::CPUJointFragments;
+                           MoEOverlayResidencyOwnershipKind::JointFragments;
         auto target = joint
-            ? prepareCPUJointPlacementCandidate(previous, previous->epoch,
+            ? prepareJointPlacementCandidate(previous, previous->epoch,
                   initial_snapshot_->placement_plan->placements)
             : buildSnapshot(
             previous->epoch + 1u,
@@ -3773,7 +3784,7 @@ namespace llaminar2
             const auto changes = wholeOwnerTargetChanges(target->placementOwnerMap(),
                 initial_snapshot_->placementOwnerMap().owners());
             if (!changes.empty())
-                target = prepareCPUJointPlacementCandidate(previous, previous->epoch,
+                target = prepareJointPlacementCandidate(previous, previous->epoch,
                     initial_snapshot_->placement_plan->placements, changes);
         }
         requireCapacityPreserving(*previous, *target);
@@ -3858,7 +3869,7 @@ namespace llaminar2
             }
 
             auto trial_snapshot = joint
-                ? prepareCPUJointPlacementTransaction(previous, previous->epoch,
+                ? prepareJointPlacementTransaction(previous, previous->epoch,
                       trial_plan.placements).candidate
                 : buildSnapshot(
                 previous->epoch + 1u,
@@ -3870,7 +3881,7 @@ namespace llaminar2
             {
                 const auto changes = wholeOwnerTargetChanges(trial_snapshot->placementOwnerMap(), exact_targets);
                 if (!changes.empty())
-                    trial_snapshot = prepareCPUJointPlacementCandidate(previous, previous->epoch,
+                    trial_snapshot = prepareJointPlacementCandidate(previous, previous->epoch,
                         trial_plan.placements, changes);
             }
             requireCapacityPreserving(*previous, *trial_snapshot);
@@ -4011,7 +4022,7 @@ namespace llaminar2
     {
         const auto current = snapshot();
         const bool joint = current && current->ownershipKind() ==
-            MoEOverlayResidencyOwnershipKind::CPUJointFragments;
+            MoEOverlayResidencyOwnershipKind::JointFragments;
         // Whole-owner participant placement uses canonical typed maps even when
         // another tier is a CPU cohort; a cohort is never a scalar participant.
         // Structural candidate support still does not mint service certification.
@@ -4106,10 +4117,10 @@ namespace llaminar2
         {
             if (joint)
             {
-                auto candidate = prepareCPUJointPlacementCandidate(previous, previous->epoch, plan.placements);
+                auto candidate = prepareJointPlacementCandidate(previous, previous->epoch, plan.placements);
                 const auto changes = wholeOwnerTargetChanges(candidate->placementOwnerMap(), exact_targets);
                 if (!changes.empty())
-                    candidate = prepareCPUJointPlacementCandidate(previous, previous->epoch,
+                    candidate = prepareJointPlacementCandidate(previous, previous->epoch,
                         std::move(plan.placements), changes);
                 requireCapacityPreserving(*previous, *candidate);
                 return candidate;
@@ -6940,7 +6951,7 @@ namespace llaminar2
                 if (!checked_target)
                     throw std::logic_error("Authoritative candidate has an incomplete fixed target");
                 entry.candidate_target = checked_target->isCohort()
-                    ? MoEOverlayRouteTarget::cpuCohort(candidate_owner->tier_idx)
+                    ? MoEOverlayRouteTarget::cohort(candidate_owner->tier_idx)
                     : MoEOverlayRouteTarget::whole(candidate_owner->owner_participant);
 
                 const auto migration = migration_by_coordinate.find(
@@ -7054,7 +7065,7 @@ namespace llaminar2
         }
 
         auto candidate = previous->originalProjectionPreparation()
-            ? prepareCPUJointPlacementCandidate(previous, previous->epoch, candidate_plan.placements)
+            ? prepareJointPlacementCandidate(previous, previous->epoch, candidate_plan.placements)
             : buildSnapshot(previous->epoch + 1u, std::move(candidate_plan),
                             config_.model_metadata, &previous->owner_map, &candidate_ownership);
         if (previous->originalProjectionPreparation())
@@ -7070,7 +7081,7 @@ namespace llaminar2
                         .current_participant = entry.candidate_target.word()});
             }
             if (!changes.empty())
-                candidate = prepareCPUJointPlacementCandidate(previous, previous->epoch,
+                candidate = prepareJointPlacementCandidate(previous, previous->epoch,
                     candidate_plan.placements, changes);
         }
         // Authenticate every dense coordinate, including unchanged targets, against
@@ -7084,7 +7095,7 @@ namespace llaminar2
                 if (!target)
                     throw std::invalid_argument("Authoritative target lacks a complete original placement");
                 const auto expected = target->isCohort()
-                    ? MoEOverlayRouteTarget::cpuCohort(owner->tier_idx)
+                    ? MoEOverlayRouteTarget::cohort(owner->tier_idx)
                     : MoEOverlayRouteTarget::whole(owner->owner_participant);
                 const auto &entry = plan.entries[plan.offset(layer, expert)];
                 if (entry.candidate_tier_idx != owner->tier_idx ||
@@ -7867,7 +7878,7 @@ namespace llaminar2
     }
 
     std::shared_ptr<const MoEOverlayResidencySnapshot>
-    MoEOverlayResidencyAuthority::prepareCPUJointPlacementCandidate(
+    MoEOverlayResidencyAuthority::prepareJointPlacementCandidate(
         const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
         uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements,
         std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes) const
@@ -7895,7 +7906,7 @@ namespace llaminar2
         candidate->epoch = previous->epoch + 1;
         candidate->placement_plan =
             std::make_shared<const MoERoutedExpertPlacementPlan>(std::move(plan));
-        candidate->joint_.emplace(MoEOverlayResidencySnapshot::CPUJointDefinition{
+        candidate->joint_.emplace(MoEOverlayResidencySnapshot::JointDefinition{
             previous->joint_->source_plan, previous->joint_->preparation, candidate->epoch,
             candidate->placement_plan, live});
         if (!candidate->valid())
@@ -7905,7 +7916,7 @@ namespace llaminar2
     }
 
     MoEOverlayResidencyTransaction
-    MoEOverlayResidencyAuthority::prepareCPUJointPlacementTransaction(
+    MoEOverlayResidencyAuthority::prepareJointPlacementTransaction(
         const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
         uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements,
         std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes) const
@@ -7913,7 +7924,7 @@ namespace llaminar2
         MoEOverlayResidencyTransaction result;
         result.expected_epoch = expected_epoch;
         result.previous = expected_live;
-        result.candidate = prepareCPUJointPlacementCandidate(
+        result.candidate = prepareJointPlacementCandidate(
             expected_live, expected_epoch, std::move(placements), whole_owner_changes);
         requireCapacityPreserving(*result.previous, *result.candidate);
         result.migrations = buildMigrations(*result.previous, *result.candidate, nullptr, 0, whole_owner_changes);
@@ -7950,19 +7961,19 @@ namespace llaminar2
             throw std::invalid_argument(message.str());
         }
 
-        if(jointCPUPlan(plan)) {
+        if(jointFragmentPlan(plan)) {
             if(epoch!=1 || previous_owners || explicit_ownership || !joint_preparation)
                 throw std::invalid_argument("CPU joint snapshot requires its original Static source preparation, never scalar migration");
             requireJointSource(plan,metadata,*joint_preparation);
             auto snapshot=std::make_shared<MoEOverlayResidencySnapshot>();
             snapshot->epoch=epoch;snapshot->placement_plan=std::make_shared<const MoERoutedExpertPlacementPlan>(std::move(plan));
-            const auto original_owners = joint_preparation->cpuJointOwnerMap();
-            snapshot->joint_.emplace(MoEOverlayResidencySnapshot::CPUJointDefinition{
+            const auto original_owners = joint_preparation->jointOwnerMap();
+            snapshot->joint_.emplace(MoEOverlayResidencySnapshot::JointDefinition{
                 snapshot->placement_plan, std::move(joint_preparation), epoch,
                 snapshot->placement_plan, original_owners});
             return snapshot;
         }
-        if(joint_preparation && joint_preparation->cpuJointOwnerMap())
+        if(joint_preparation && joint_preparation->jointOwnerMap())
             throw std::invalid_argument("Joint source preparation cannot be rebound to a whole-expert plan");
         auto mutable_plan = std::make_shared<MoERoutedExpertPlacementPlan>(
             std::move(plan));
@@ -8205,19 +8216,30 @@ namespace llaminar2
     }
 
     std::vector<MoEOverlayTierShadowRequirement> buildMoEOverlayShadowRequirements(
-        const std::vector<MoEOverlayTierMigration> &migrations)
+        const std::vector<MoEOverlayTierMigration> &migrations,
+        MoEOverlayShadowRequirementMode mode)
     {
+        if (mode != MoEOverlayShadowRequirementMode::DurablePlacement &&
+            mode != MoEOverlayShadowRequirementMode::TransientCopy)
+            throw std::logic_error("MoE shadow slots require a declared movement contract");
         using RequirementKey = std::tuple<int, int, int>;
         std::map<RequirementKey, size_t> counts;
         std::set<std::pair<int, int>> logical_edges;
+        std::set<std::tuple<int, int, int>> physical_arrivals;
         for (const auto &migration : migrations)
         {
             const auto targets = migrationPlacementTargets(migration);
-            if (!targets || !logical_edges.emplace(migration.layer_idx, migration.expert_id).second)
+            if (!targets || (mode == MoEOverlayShadowRequirementMode::DurablePlacement &&
+                !logical_edges.emplace(migration.layer_idx, migration.expert_id).second))
                 throw std::logic_error("MoE shadow slots require complete original placement targets");
             const auto &destination = targets->second;
             for (size_t member = 0; member < destination.participantCount(); ++member)
+            {
+                if (!physical_arrivals.emplace(migration.layer_idx, migration.expert_id,
+                        destination.participantId(member)).second)
+                    throw std::logic_error("MoE shadow slots contain a duplicate physical arrival");
                 ++counts[{migration.layer_idx, destination.tierIndex(), destination.participantId(member)}];
+            }
         }
         std::vector<MoEOverlayTierShadowRequirement> requirements;
         requirements.reserve(counts.size());

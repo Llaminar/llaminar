@@ -1880,7 +1880,7 @@ namespace llaminar2
         deviceMoERetargetTransferMatrixFormat(
             dst.descriptor.up,
             src.descriptor.up);
-        if (src.descriptor.projection_set == DeviceMoEProjectionSet::CompleteExpert)
+        if (deviceMoEProjectionSetHasDown(src.descriptor.projection_set))
             deviceMoERetargetTransferMatrixFormat(
                 dst.descriptor.down,
                 src.descriptor.down);

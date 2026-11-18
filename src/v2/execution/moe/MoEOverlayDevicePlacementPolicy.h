@@ -6,8 +6,8 @@
  * must emit the same canonical command sequence as this pointer-free reference.
  * The reference is used by fast unit tests and real-device differential tests;
  * it is never an inference-time host authority.  Policy preserves every
- * participant's per-layer expert quota, prefers lower integer priorities, and
- * then reduces participant makespan within equal-priority tiers.
+ * logical target's per-layer expert quota, prefers lower integer priorities, and
+ * then reduces logical-target makespan within equal-priority tiers.
  */
 
 #pragma once
@@ -22,17 +22,19 @@
 
 namespace llaminar2
 {
-    /** Immutable logical identity needed to score one overlay participant. */
-    struct MoEOverlayDevicePlacementParticipant
+    /** Immutable original target and private index used by the replay oracle. */
+    struct MoEOverlayDevicePlacementTarget
     {
-        std::uint32_t participant_id = 0u; ///< Dense controller participant id.
+        std::uint32_t vertex_index = 0u; ///< Private dense algorithm index, never a participant alias.
         std::int32_t tier_priority = 0;    ///< Lower integer means preferred tier.
-        std::int32_t tier_index = -1;      ///< Dense measured-service tier.
+        std::int32_t tier_index = -1;      ///< Original routed tier.
+        MoEOverlayRouteTarget target;      ///< Original complete target tag.
 
         /** @return Whether this record occupies its canonical dense index. */
         [[nodiscard]] constexpr bool validAt(std::size_t index) const noexcept
         {
-            return participant_id == index;
+            return vertex_index == index && !target.isAbsent() &&
+                (!target.isCohort() || std::int64_t(target.word()) == -std::int64_t(tier_index) - 2);
         }
     };
 
@@ -45,7 +47,7 @@ namespace llaminar2
         std::uint64_t transaction_generation = 0u;
         /** `[decode,prefill][layer][expert]` cumulative routed demand. */
         std::vector<std::uint64_t> phase_expert_demand;
-        /** `[tier][layer][decode,prefill,grouped]` ns per activation. */
+        /** `[target][layer][decode,prefill,grouped]` ns per activation. */
         std::vector<std::uint64_t> service_costs;
         /** Dense `[source][destination][layer]` directed movement prices. */
         std::vector<MoEOverlayDeviceControllerMigrationCost> migration_costs;
@@ -67,15 +69,17 @@ namespace llaminar2
     {
         std::uint32_t num_layers = 0u;
         std::uint32_t num_experts = 0u;
-        std::vector<MoEOverlayDevicePlacementParticipant> participants;
+        std::vector<MoEOverlayDevicePlacementTarget> targets;
 
         /**
-         * Participant-major, layer-major, expert-major snapshot words.
+         * Logical-target-major, layer-major, expert-major normalized member receipts.
          * Every word is produced by
-         * `moe_rebalance_policy::packCollectedState`; exactly one participant
+         * `moe_rebalance_policy::packCollectedState`; exactly one complete logical target
          * must carry the authoritative-owner bit for each layer/expert.
          */
         std::vector<std::uint64_t> collected_state;
+        /** Original-root selected-route window, independent of physical ownership. */
+        std::vector<std::uint64_t> selected_demand;
 
         /** Exact complete packed GPU expert bytes for each model layer. */
         std::vector<std::uint64_t> payload_bytes_per_layer;
@@ -142,8 +146,8 @@ namespace llaminar2
     struct MoEOverlayDevicePlacementPolicyPlan
     {
         std::vector<MoEOverlayDeviceMovementCommand> commands;
-        /** Layer-major/expert-major authoritative owner after accepted cycles. */
-        std::vector<std::int32_t> candidate_owner;
+        /** Layer-major/expert-major private target vertex after accepted cycles. */
+        std::vector<std::int32_t> candidate_vertex;
         MoEOverlayDevicePlacementPolicyEvidence evidence;
 
         /** @return Whether a non-empty capacity-preserving candidate was found. */
@@ -156,9 +160,9 @@ namespace llaminar2
     /**
      * @brief Deterministic CPU specification for the device Dynamic planner.
      *
-     * The planner first assigns the hottest experts to participant quotas in
+     * The planner first assigns the hottest experts to target quotas in
      * ascending priority order. Within one priority it greedily minimizes
-     * current makespan while preserving every participant's exact expert
+     * current makespan while preserving every target's exact expert
      * cardinality. The resulting balanced directed move graph is decomposed
      * into complete cycles; only individually improving cycles enter a bounded
      * one-round wave. This makes a partially applied epoch impossible.

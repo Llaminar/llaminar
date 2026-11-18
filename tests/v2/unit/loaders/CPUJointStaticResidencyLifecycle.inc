@@ -87,7 +87,7 @@ llaminar2::MoEOverlayResidencyAuthority::Config staticJointConfig(const StaticJo
 }
 /** @return Exact CPU member ids from the retained original map, not device ordinals. */
 std::vector<int> staticJointMembers(const StaticJointOriginal& original) {
- std::vector<int> ids;for(const auto& member:original.preparation->cpuJointOwnerMap()->participants())
+ std::vector<int> ids;for(const auto& member:original.preparation->jointOwnerMap()->participants())
   if(member.domain_name=="cpu_joint")ids.push_back(member.participant_id);
  return ids;
 }
@@ -98,9 +98,9 @@ TEST(CPUJointStaticResidency, SameSourceMapAndExplicitJointTicketSchema) {
  const auto builds=MoEExpertOwnerMap::initialBuildAttempts();MoEOverlayResidencyAuthority authority(staticJointConfig(original));
  EXPECT_EQ(MoEExpertOwnerMap::initialBuildAttempts(),builds);
  const auto snapshot=authority.snapshot();ASSERT_TRUE(snapshot);ASSERT_TRUE(snapshot->valid());
- EXPECT_EQ(snapshot->ownershipKind(),MoEOverlayResidencyOwnershipKind::CPUJointFragments);
- EXPECT_EQ(snapshot->jointOwnerMap(),original.preparation->cpuJointOwnerMap());
- EXPECT_EQ(&snapshot->originalOwnerMap(),original.preparation->cpuJointOwnerMap().get());
+ EXPECT_EQ(snapshot->ownershipKind(),MoEOverlayResidencyOwnershipKind::JointFragments);
+ EXPECT_EQ(snapshot->jointOwnerMap(),original.preparation->jointOwnerMap());
+ EXPECT_EQ(&snapshot->originalOwnerMap(),original.preparation->jointOwnerMap().get());
  EXPECT_TRUE(snapshot->owner_map.owners().empty());EXPECT_TRUE(snapshot->layered_ownership.empty());
  EXPECT_THROW(snapshot->originalOwnerMap().ownerFor(7,64),std::logic_error);
  for(int i=0;i<20;++i) {
@@ -145,41 +145,41 @@ TEST(CPUJointStaticResidency, FragmentPublicationEpochIdentityAndFinalSourceRete
  const auto id=all[size_t(rank)];
  MoEOverlayParticipantResidencyRegistry banks({.local_participant_ids={id},.num_layers=1,.num_experts=512,.initial_epoch=29,
   .projection_preparation=original.preparation,.first_model_layer=7,.original_model=ModelContextId{155}});
- EXPECT_EQ(&banks.initialOwnerMap(),original.preparation->cpuJointOwnerMap().get());
+ EXPECT_EQ(&banks.initialOwnerMap(),original.preparation->jointOwnerMap().get());
  EXPECT_EQ(banks.localParticipantIds(),std::vector<int>{id});EXPECT_FALSE(banks.allInitialBanksReady());
  ExpertGemmRegistry engines;std::string error;
- EXPECT_TRUE(banks.isCPUJointParticipant(id));EXPECT_FALSE(banks.isCPUJointParticipant(all[size_t(1-rank)]));
+ EXPECT_TRUE(banks.isJointParticipant(id));EXPECT_FALSE(banks.isJointParticipant(all[size_t(1-rank)]));
  EXPECT_TRUE(banks.endpoint(id));
- EXPECT_THROW(banks.initialCPUJointLayer(id,7),std::logic_error);
- EXPECT_FALSE(banks.registerInitialCPUJointBank(engines,ModelContextId{156},id,&error));
- const auto* participant=original.preparation->cpuJointOwnerMap()->participantForId(id);ASSERT_NE(participant,nullptr);
- const auto selected=original.preparation->cpuShardSourceFor(7,*participant);auto sources=jointSources(selected);
+ EXPECT_THROW(banks.initialJointLayer(id,7),std::logic_error);
+ EXPECT_FALSE(banks.registerInitialJointBank(engines,ModelContextId{156},id,&error));
+ const auto* participant=original.preparation->jointOwnerMap()->participantForId(id);ASSERT_NE(participant,nullptr);
+ const auto selected=original.preparation->shardSourceFor(7,*participant);auto sources=jointSources(selected);
  sources.registerInto(engines,0,1);
- EXPECT_FALSE(banks.registerInitialCPUJointBank(engines,ModelContextId{155},id,&error));
- EXPECT_THROW(banks.initialCPUJointLayer(id,7),std::logic_error);
+ EXPECT_FALSE(banks.registerInitialJointBank(engines,ModelContextId{155},id,&error));
+ EXPECT_THROW(banks.initialJointLayer(id,7),std::logic_error);
  sources.registerInto(engines,1);
- ASSERT_TRUE(banks.registerInitialCPUJointBank(engines,ModelContextId{155},id,&error))<<error;
- const auto first=banks.initialCPUJointLayer(id,7);ASSERT_TRUE(first);ASSERT_TRUE(first->sourceSelection());
+ ASSERT_TRUE(banks.registerInitialJointBank(engines,ModelContextId{155},id,&error))<<error;
+ const auto first=banks.initialJointLayer(id,7);ASSERT_TRUE(first);ASSERT_TRUE(first->sourceSelection());
  EXPECT_EQ(first->epoch(),29u);EXPECT_EQ(first->participantId(),id);EXPECT_EQ(first->sourceSelection(),selected);
- ASSERT_TRUE(banks.registerInitialCPUJointBank(engines,ModelContextId{155},id,&error));
- EXPECT_EQ(banks.initialCPUJointLayer(id,7),first);EXPECT_EQ(banks.cpuJointLayer(id,7,29),first);
- EXPECT_THROW(banks.cpuJointLayer(id,7,1),std::invalid_argument);
- EXPECT_THROW(banks.cpuJointLayer(id,8,29),std::invalid_argument);
+ ASSERT_TRUE(banks.registerInitialJointBank(engines,ModelContextId{155},id,&error));
+ EXPECT_EQ(banks.initialJointLayer(id,7),first);EXPECT_EQ(banks.jointLayer(id,7,29),first);
+ EXPECT_THROW(banks.jointLayer(id,7,1),std::invalid_argument);
+ EXPECT_THROW(banks.jointLayer(id,8,29),std::invalid_argument);
  EXPECT_FALSE(banks.registerInitialLayer(id,7,std::vector<bool>(512),std::vector<MoEOverlayPreparedExpertPayload>(512),&error));
  EXPECT_TRUE(banks.allInitialBanksReady());EXPECT_TRUE(banks.incompleteInitialBanks().empty());
  physical_fragments+=banks.verifyImmutablePreparedSources(engines);
  const auto selections=banks.initialBankExpertSelections();ASSERT_EQ(selections.size(),1u);
- EXPECT_EQ(selections[0].ownership_kind,MoEOverlayParticipantResidencyRegistry::InitialOwnershipKind::CPUJointFragments);
+ EXPECT_EQ(selections[0].ownership_kind,MoEOverlayParticipantResidencyRegistry::InitialOwnershipKind::JointFragments);
  EXPECT_EQ(selections[0].expert_ids.size(),448u);EXPECT_TRUE(selections[0].matches_frozen_owner_map);
  engines.clear();EXPECT_THROW((void)banks.verifyImmutablePreparedSources(engines),std::logic_error);
- EXPECT_TRUE(first->acquireInitialConstruction()->layerForModelLayer(7).cpu_fragments[511].valid());
+ EXPECT_TRUE(first->acquireInitialConstruction()->layerForModelLayer(7).fragments[511].valid());
  }
  EXPECT_EQ(physical_fragments,896u); //448 original experts per independently tested local actor; no physical two-socket claim.
 }
 /** @test Static setup reuses one original preparation/map under the exact admitted rank resources. */
 TEST(CPUJointStaticResidency, OriginalPhysicalAdmissionCreatesAllLocalTypedEndpoints) {
  using namespace llaminar2;const auto original=staticJointOriginal();const auto source=jointManifest();
- const auto& map=*original.preparation->cpuJointOwnerMap();
+ const auto& map=*original.preparation->jointOwnerMap();
  const auto local=map.placementFor(7,64)->shard_cohort->localManifest(0);
  const auto cpu=MoEOverlayCapacityResolver::preparedFootprints({local}).front().cpu_live_bytes;
  const auto gpu=MoEOverlayCapacityResolver::preparedFootprints({source}).front().gpu_live_bytes;
@@ -204,11 +204,11 @@ TEST(CPUJointStaticResidency, OriginalPhysicalAdmissionCreatesAllLocalTypedEndpo
   ASSERT_TRUE(setup.authority());ASSERT_TRUE(setup.residency());
   EXPECT_FALSE(setup.histogram());EXPECT_FALSE(setup.interference());
   const auto& preparation=setup.residency()->projectionPreparation();ASSERT_TRUE(preparation);
-  EXPECT_EQ(setup.authority()->snapshot()->jointOwnerMap(),preparation->cpuJointOwnerMap());
-  EXPECT_EQ(&setup.residency()->initialOwnerMap(),preparation->cpuJointOwnerMap().get());
+  EXPECT_EQ(setup.authority()->snapshot()->jointOwnerMap(),preparation->jointOwnerMap());
+  EXPECT_EQ(&setup.residency()->initialOwnerMap(),preparation->jointOwnerMap().get());
   ASSERT_EQ(setup.residency()->localParticipantIds().size(),2u);
-  const auto members=staticJointMembers(original);EXPECT_TRUE(setup.residency()->isCPUJointParticipant(members[0]));
-  EXPECT_FALSE(setup.residency()->isCPUJointParticipant(members[1]));
+  const auto members=staticJointMembers(original);EXPECT_TRUE(setup.residency()->isJointParticipant(members[0]));
+  EXPECT_FALSE(setup.residency()->isJointParticipant(members[1]));
   EXPECT_FALSE(setup.residency()->allInitialBanksReady());
  }
  EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RoutedExpertWeights,
@@ -219,8 +219,8 @@ TEST(CPUJointStaticResidency, OriginalPhysicalAdmissionCreatesAllLocalTypedEndpo
 TEST(CPUJointStaticResidency, RetainedExecutorStartsWithOriginalSourceEngines) {
  using namespace llaminar2;
  const auto original=staticJointOriginal(0);const auto ids=staticJointMembers(original);const int id=ids[0];
- const auto* member=original.preparation->cpuJointOwnerMap()->participantForId(id);ASSERT_TRUE(member);
- const auto selected=original.preparation->cpuShardSourceFor(7,*member);
+ const auto* member=original.preparation->jointOwnerMap()->participantForId(id);ASSERT_TRUE(member);
+ const auto selected=original.preparation->shardSourceFor(7,*member);
  ExpertGemmRegistry engines;
  MoEOverlayParticipantResidencyRegistry banks({.local_participant_ids={id},.num_layers=1,.num_experts=512,.initial_epoch=29,
   .projection_preparation=original.preparation,.first_model_layer=7,.original_model=ModelContextId{155}});
@@ -231,8 +231,8 @@ TEST(CPUJointStaticResidency, RetainedExecutorStartsWithOriginalSourceEngines) {
  auto sources=jointSources(selected,layout->physicalBytes(),layout->workspaceBytes());
  const auto memory=sources.actor->memory;auto& store=*sources.actor->manager->preparedWeightStore();
  sources.registerInto(engines);
- std::string error;ASSERT_TRUE(banks.registerInitialCPUJointBank(engines,ModelContextId{155},id,&error))<<error;
- const auto published=banks.initialCPUJointLayer(id,7);
+ std::string error;ASSERT_TRUE(banks.registerInitialJointBank(engines,ModelContextId{155},id,&error))<<error;
+ const auto published=banks.initialJointLayer(id,7);
  const auto arena=std::make_shared<MoELocalExpertSerialBufferArena>(MoELocalExpertSerialBufferArena::Config{
   .device_id=DeviceId::cpu(),.row_capacity=2,.row_capacity_buckets={1,2},.d_model=8,.routing_top_k=1,
   .cpu_canonical_route_storage=MoELocalExpertSerialBufferArena::CPUCanonicalRouteStoragePolicy::RetainSerialMaximum,
@@ -283,7 +283,7 @@ TEST(CPUJointStaticResidency, RetainedExecutorStartsWithOriginalSourceEngines) {
   complete.expert_mask.assign(512,false);complete.prepared_gate_gemm.assign(512,nullptr);
   complete.prepared_up_gemm.assign(512,nullptr);complete.prepared_down_gemm.assign(512,nullptr);
   for(int expert:selected->expertIds()) {
-   const auto& engine=construction->layerForModelLayer(7).cpu_fragments[expert];
+   const auto& engine=construction->layerForModelLayer(7).fragments[expert];
    complete.expert_mask[expert]=true;complete.prepared_gate_gemm[expert]=engine.gate().get();
    complete.prepared_up_gemm[expert]=engine.up().get();complete.prepared_down_gemm[expert]=engine.down().get();
   }
@@ -302,7 +302,7 @@ TEST(CPUJointStaticResidency, RetainedExecutorStartsWithOriginalSourceEngines) {
   EXPECT_EQ(output.layout,MoEOverlayReturnLayout::CanonicalExpertRoutes);
   EXPECT_EQ(output.live_row_count,0u);
  }
- auto replaced=params;replaced.prepared_gate_gemm[64]=published->acquireInitialConstruction()->layerForModelLayer(7).cpu_fragments[64].gate().get();
+ auto replaced=params;replaced.prepared_gate_gemm[64]=published->acquireInitialConstruction()->layerForModelLayer(7).fragments[64].gate().get();
  EXPECT_THROW((void)MoELocalExpertStage(replaced),std::invalid_argument);
  auto missing=params;missing.cpu_workspace_source.reset();
  EXPECT_THROW((void)MoELocalExpertStage(missing),std::invalid_argument);
@@ -313,8 +313,8 @@ TEST(CPUJointStaticResidency, ColdLoadGraphPreservesOriginalSourceAuthority) {
  using namespace llaminar2;
  const auto original=staticJointOriginal();const auto source=jointManifest();
  const auto initial_member=staticJointMembers(original).front();
- const auto initial_selection=original.preparation->cpuShardSourceFor(7,
-  *original.preparation->cpuJointOwnerMap()->participantForId(initial_member));
+ const auto initial_selection=original.preparation->shardSourceFor(7,
+  *original.preparation->jointOwnerMap()->participantForId(initial_member));
  const auto local=initial_selection->cohort()->localManifest(initial_selection->participantIndex());
  const auto cpu=MoEOverlayCapacityResolver::preparedFootprints({local}).front().cpu_live_bytes;
  const auto gpu=MoEOverlayCapacityResolver::preparedFootprints({source}).front().gpu_live_bytes;
@@ -350,9 +350,9 @@ TEST(CPUJointStaticResidency, ColdLoadGraphPreservesOriginalSourceAuthority) {
   .rebalance=maintenance,.storage_policy=storage,.capacity=capacity,.memory=memory,
   .world_rank=0,.world_size=2,.original_model=model});
  const auto retained=cold.residency()->projectionPreparation();ASSERT_TRUE(retained);
- const auto owners=retained->cpuJointOwnerMap();ASSERT_TRUE(owners);
+ const auto owners=retained->jointOwnerMap();ASSERT_TRUE(owners);
  const auto* participant=owners->participantForId(initial_member);ASSERT_TRUE(participant);
- const auto selected=retained->cpuShardSourceFor(7,*participant);ASSERT_TRUE(selected);
+ const auto selected=retained->shardSourceFor(7,*participant);ASSERT_TRUE(selected);
  const auto runtime=resolveMoEExpertOverlayRuntimePlan(std::make_shared<const MoERoutedExpertPlacementPlan>(frozen),
   {.current_world_rank=0,.validate_mvp_root_reachability=false});ASSERT_TRUE(runtime);
  std::string error;
@@ -360,20 +360,20 @@ TEST(CPUJointStaticResidency, ColdLoadGraphPreservesOriginalSourceAuthority) {
  // cold authority. Actual preparation must not make it publishable into A.
  {
   const auto foreign=MoEExpertOverlayPreparationPlan::build(*runtime,*original.loader).filteredForDevice(DeviceId::cpu());
-  const auto foreign_selection=foreign.cpuShardSourceFor(7,*participant);
+  const auto foreign_selection=foreign.shardSourceFor(7,*participant);
   EXPECT_EQ(*foreign_selection,*selected);EXPECT_NE(foreign_selection->cohort(),selected->cohort());
   WeightManager competing(*original.loader,original.mpi);competing.installPhysicalMemoryAuthority(memory);
   const auto loaded=competing.materialize(foreign.sourceWeightPlan(*original.loader,model));
   ASSERT_EQ(loaded.bindings().size(),448u*3);
-  const auto competing_lease=competing.expertGemmRegistry().acquireCPUJointLayer(model,*participant,7);
-  ASSERT_TRUE(competing_lease);ASSERT_TRUE(competing_lease->cpu_joint_source);
-  EXPECT_EQ(*competing_lease->cpu_joint_source,*selected);
-  EXPECT_NE(competing_lease->cpu_joint_source->cohort(),selected->cohort());
+  const auto competing_lease=competing.expertGemmRegistry().acquireJointLayer(model,*participant,7);
+  ASSERT_TRUE(competing_lease);ASSERT_TRUE(competing_lease->joint_source);
+  EXPECT_EQ(*competing_lease->joint_source,*selected);
+  EXPECT_NE(competing_lease->joint_source->cohort(),selected->cohort());
   for(const auto& source_binding:competing_lease->sources)EXPECT_EQ(source_binding.identity.model_id,model);
-  EXPECT_FALSE(cold.residency()->registerInitialCPUJointBank(competing.expertGemmRegistry(),model,
+  EXPECT_FALSE(cold.residency()->registerInitialJointBank(competing.expertGemmRegistry(),model,
    participant->participant_id,&error));
   EXPECT_NE(error.find("exact original source/cohort lease"),std::string::npos)<<error;
-  EXPECT_THROW(cold.residency()->initialCPUJointLayer(participant->participant_id,7),std::logic_error);
+  EXPECT_THROW(cold.residency()->initialJointLayer(participant->participant_id,7),std::logic_error);
  }
  EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RoutedExpertWeights,
   PhysicalMemoryMaterializationKind::NewAllocation),0u);
@@ -382,8 +382,8 @@ TEST(CPUJointStaticResidency, ColdLoadGraphPreservesOriginalSourceAuthority) {
  EXPECT_EQ(MoEExpertOwnerMap::initialBuildAttempts(),before);
  const auto loading=MoEExpertOverlayPreparationPlan::forOriginalSource(*runtime,*original.loader,retained)
   .filteredForDevice(DeviceId::cpu());
- EXPECT_EQ(loading.cpuJointOwnerMap(),owners);
- EXPECT_EQ(loading.cpuShardSourceFor(7,*participant)->cohort(),selected->cohort());
+ EXPECT_EQ(loading.jointOwnerMap(),owners);
+ EXPECT_EQ(loading.shardSourceFor(7,*participant)->cohort(),selected->cohort());
  EXPECT_EQ(MoEExpertOwnerMap::initialBuildAttempts(),before);
  WeightManager manager(*original.loader,original.mpi);manager.installPhysicalMemoryAuthority(memory);
  const auto loaded=manager.materialize(loading.sourceWeightPlan(*original.loader,model));
@@ -391,9 +391,9 @@ TEST(CPUJointStaticResidency, ColdLoadGraphPreservesOriginalSourceAuthority) {
  ASSERT_TRUE(manager.prepareMoEExpertOverlayWeights(*runtime,DeviceId::cpu(),&loaded,nullptr,
   PreparedWeightAdmission::AllocateCompleteSet,retained));
  EXPECT_EQ(MoEExpertOwnerMap::initialBuildAttempts(),before);
- ASSERT_TRUE(cold.residency()->registerInitialCPUJointBank(manager.expertGemmRegistry(),model,
+ ASSERT_TRUE(cold.residency()->registerInitialJointBank(manager.expertGemmRegistry(),model,
   participant->participant_id,&error))<<error;
- const auto published=cold.residency()->initialCPUJointLayer(participant->participant_id,7);ASSERT_TRUE(published);
+ const auto published=cold.residency()->initialJointLayer(participant->participant_id,7);ASSERT_TRUE(published);
  EXPECT_EQ(published->sourceSelection()->cohort(),selected->cohort());
  std::vector<bool> mask(512,false);for(const int expert:selected->expertIds())mask[expert]=true;
  MoEOverlayPreparedGraphBankRequest request{.device=DeviceId::cpu(),.tp_context=nullptr,.tp_participant=0,
@@ -405,9 +405,9 @@ TEST(CPUJointStaticResidency, ColdLoadGraphPreservesOriginalSourceAuthority) {
  for(int expert=0;expert<512;++expert)EXPECT_EQ(graph.gate[expert]!=nullptr,selected->contains(expert));
  request.original_model=ModelContextId{360};
  EXPECT_THROW(adoptMoEOverlayPreparedGraphBank(*runtime,manager.expertGemmRegistry(),request),std::invalid_argument);
- EXPECT_FALSE(cold.residency()->registerInitialCPUJointBank(manager.expertGemmRegistry(),ModelContextId{360},
+ EXPECT_FALSE(cold.residency()->registerInitialJointBank(manager.expertGemmRegistry(),ModelContextId{360},
   participant->participant_id,&error));
- EXPECT_EQ(cold.residency()->initialCPUJointLayer(participant->participant_id,7),published);
+ EXPECT_EQ(cold.residency()->initialJointLayer(participant->participant_id,7),published);
  EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::WeightLoadStaging,
   PhysicalMemoryMaterializationKind::NewAllocation),0u);
 }

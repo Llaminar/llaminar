@@ -2,8 +2,8 @@
  * @file Qwen4ExpKernels.h
  * @brief Allocation-free FP32 gated-residual and PLE execution contracts.
  *
- * Large projections and branch RMSNorm use the ordinary prepared GEMM/norm
- * bridges. These primitives own only the model-specific elementwise arithmetic,
+ * Large projections use the ordinary prepared GEMM bridges. Branch RMSNorm
+ * and optional residual-write/next-norm fusion retain their fixed lane tree. These primitives own only the model-specific elementwise arithmetic,
  * exact integer hashing and dilated history. Candidate evaluation never mutates
  * committed history: the caller supplies distinct persistent input/output banks
  * and explicitly publishes the accepted prefix. All matrices are contiguous,
@@ -14,6 +14,7 @@
 #include "Qwen4ExpPrefillNextTokenWindow.h"
 #include <array>
 #include <cstdint>
+#include <stdexcept>
 #include <memory>
 
 namespace llaminar2::qwen4exp
@@ -69,6 +70,13 @@ struct BranchRMSNormArgs
     const float *gain = nullptr; ///< [4,H] actual learned gain, distinct per branch.
     float *output = nullptr; ///< [rows,4,H], optionally equal to input.
 };
+/** @brief Original fully-active M1 branch norm plus existing HC-down SingleQ8 banks. */
+struct BranchRMSNormSingleQ8Args {
+ BranchRMSNormArgs norm; ///< Original FP32 norm contract and retained output.
+ std::int8_t* codes; ///< Original HC-down QUANT_A bank, with4H physical bytes.
+ float* scales; ///< Original HC-down SCALES_A_BLOCKWISE words,4H/32 blocks.
+};
+
 
 /** @brief Broadcast one H-wide embedding into four independent residual branches. */
 struct ResidualExpandArgs
@@ -107,6 +115,29 @@ struct ResidualWriteArgs
     const float *block = nullptr; ///< [rows,H] attention or MoE output.
     const float *gateLogits = nullptr; ///< [rows,4] existing injection GEMM output.
     float *output = nullptr; ///< [rows,4,H], may alias residual.
+};
+
+/**
+ * @brief Publish a residual write and normalize its rounded bytes for the next branch read.
+ * @details This is an explicit graph operation, never an automatically selected path.
+ * The residual update retains separate FP32 multiplication/addition boundaries;
+ * normalization consumes that rounded value with the original 256-lane FMA/tree
+ * and applies inverse RMS before actual branch gain. Both outputs are retained.
+ * output may equal residual exactly. normalized is disjoint from every input
+ * and output; partial overlaps are forbidden. Inactive rows in both outputs
+ * remain untouched. No scratch storage or mutable host state is required.
+ */
+struct ResidualWriteBranchRMSNormArgs
+{
+    RowExtent extent; ///< Admitted/live token rows shared by write and normalization.
+    int hidden = 0; ///< Per-branch width H.
+    float epsilon = 1e-6f; ///< Positive finite next-branch checkpoint epsilon.
+    const float *residual = nullptr; ///< [rows,4,H] original unnormalized branches.
+    const float *block = nullptr; ///< [rows,H] attention or MoE block output.
+    const float *gateLogits = nullptr; ///< [rows,4] original injection projection.
+    float *output = nullptr; ///< [rows,4,H] rounded write, optionally equal to residual.
+    const float *gain = nullptr; ///< [4,H] actual next-branch learned gain.
+    float *normalized = nullptr; ///< [rows,4,H] distinct normalized next-branch output.
 };
 
 /** @brief Exact PLE suffix hash, without mutation of committed token history. */
@@ -208,6 +239,10 @@ public:
      * @throws std::invalid_argument For missing operands or invalid static geometry.
      */
     virtual void branchRMSNorm(const BranchRMSNormArgs &args, void *stream) const = 0;
+    /** @brief Explicit GPU norm/publication; CPU inference does not advertise this candidate. */
+    virtual void branchRMSNormSingleQ8(const BranchRMSNormSingleQ8Args&,void*) const
+    {throw std::logic_error("HC branch norm SingleQ8 requires its explicit GPU implementation");}
+
     /** @brief Expand ordinary embeddings; @throws std::invalid_argument for invalid bindings.
      * @param args Complete immutable operand and admitted-geometry binding.
      * @param stream Exact non-default GPU stream; ignored by the CPU implementation.
@@ -232,6 +267,13 @@ public:
      * @throws std::invalid_argument For missing operands or invalid static geometry.
      */
     virtual void residualWrite(const ResidualWriteArgs &args, void *stream) const = 0;
+    /**
+     * @brief Publish the original rounded residual write and its next branch normalization together.
+     * @param args Complete typed operands, shared row extent and immutable next-norm policy.
+     * @param stream Exact non-default GPU stream; ignored by CPU.
+     * @throws std::invalid_argument For invalid geometry, epsilon or operand overlap.
+     */
+    virtual void residualWriteBranchRMSNorm(const ResidualWriteBranchRMSNormArgs &args, void *stream) const = 0;
     /** @brief Produce sixteen exact ngram IDs per live row without changing history.
      * @param args Complete immutable operand and admitted-geometry binding.
      * @param stream Exact non-default GPU stream; ignored by the CPU implementation.

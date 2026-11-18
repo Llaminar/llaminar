@@ -22,9 +22,11 @@
 #include <exception>
 #include <cstdio>
 #include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
+#include "kernels/common/HCDownOutputPublicationArgs.h"
 
 namespace llaminar2::rocm
 {
+class NativeQ8SerialGeometryAdmission;
 /** @brief One original reducer's physical column/partition geometry. */
 struct NativeM1ReductionShape
 {
@@ -97,6 +99,11 @@ public:
     NativeM1ReductionTicket &operator=(NativeM1ReductionTicket &&)=delete;
 private:
     friend struct NativeM1ReductionIssuer;
+    friend struct CTAOwnedHCTicketConsumer; // ROCm ordinary HC tail consumes the original producer authority.
+    friend bool enqueueNativeM1HCDownProjection(const std::int8_t *A,const std::uint8_t *payload,
+    const void *scales,const void *mins,const void *emins,float *output,const float *scale_a,
+    float *partials,int n,int k,std::uint8_t execution,std::uint8_t policy,int device,void *stream,
+    const float *block_scales,const GPUHCDownOutputView &publication,const NativeQ8SerialGeometryAdmission *prepared);
     friend bool submitNativeM1Reductions(std::span<NativeM1ReductionTicket>,int,void *);
     enum class State : std::uint8_t { Empty,Direct,Pending,Consumed,Aborted };
     State state_=State::Empty;
@@ -141,4 +148,24 @@ bool enqueueNativeM1Producer(NativeM1ReductionTicket &ticket,const std::int8_t *
  * @throws std::invalid_argument For absent, consumed, foreign or aliasing tickets.
  */
 bool submitNativeM1Reductions(std::span<NativeM1ReductionTicket> tickets,int device,void *stream);
+/**
+ * @brief Submit the unchanged original producer and its reducer-owned HC publication.
+ * @details The original issued ticket authenticates the actual128-lane/one-column
+ * geometry. No global completion protocol or replacement partition is introduced.
+ * @param A Original SingleQ8 normalized input. @param payload Original prepared bytes.
+ * @param scales Original native scales. @param mins Original optional metadata.
+ * @param emins Original optional secondary metadata. @param output Public raw down.
+ * @param scale_a Original row scale. @param partials Original partition-major bank.
+ * @param n Original bottleneck width. @param k Original reduction width.
+ * @param execution Original physical codebook. @param policy Original source arithmetic codebook.
+ * @param device Exact participant. @param stream Exact original non-default stream.
+ * @param block_scales Original SingleQ8 block scales. @param publication Sealed existing up banks.
+ * @param prepared Optional exact cold-admitted lookahead for this HC purpose; null keeps Original.
+ * @return Native producer and epilogue enqueue success, without an alternate route.
+ */
+bool enqueueNativeM1HCDownProjection(const std::int8_t *A,const std::uint8_t *payload,
+    const void *scales,const void *mins,const void *emins,float *output,const float *scale_a,
+    float *partials,int n,int k,std::uint8_t execution,std::uint8_t policy,int device,void *stream,
+    const float *block_scales,const GPUHCDownOutputView &publication,
+    const NativeQ8SerialGeometryAdmission *prepared=nullptr);
 } // namespace llaminar2::rocm

@@ -38,7 +38,7 @@ TEST_F(Test__GlobalTPContext_MPI, CPUShardSourceRangesPreserveLivePrefixes)
 }
 
 #include "execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 #include "execution/moe/MoEExpertShardCohort.h"
 #include "execution/moe/CanonicalMoERouteRecord.h"
 #include "utils/PerfStatsCollector.h"
@@ -70,7 +70,7 @@ TEST_F(Test__GlobalTPContext_MPI, CPUShardStageUsesOriginalCohortAndUnweightedRo
     const MoEOverlayLayerWeightManifest source{3,{{{ExpertTierWeightProjection::Gate,512,H,format},
         {ExpertTierWeightProjection::Up,512,H,format},{ExpertTierWeightProjection::Down,H,512,format}}}};
     const auto placement=MoEExpertOwnerMap::buildShardPlacement(plan,{source});
-    const auto selected=CPUExpertShardSourceSelection::fromOriginalPlacement(placement,3,world_rank_);
+    const auto selected=ExpertShardSourceSelection::fromOriginalPlacement(placement,3,world_rank_);
     auto tp=createTwoRankContext(1844);
     ASSERT_EQ(tp->scope(),TPScope::NODE_LOCAL);
     // Keep the original asymmetric-storage threshold regression and also test
@@ -87,7 +87,7 @@ TEST_F(Test__GlobalTPContext_MPI, CPUShardStageUsesOriginalCohortAndUnweightedRo
     MoECPUExpertShardRouteStage::Params p{selected,tp.get(),&records,&indices,&weights,world_rank_==1?&combined:nullptr,
         world_rank_==1?std::span(ranges):std::span<RootedFloatRecordRange>{},maps,required,M,K,H,1,"original_cpu_shards"};
     p.standalone_execution_phase=ExpertHistogramSource::DecodeToken; // Authored record-contract invocation, independent of reusable M capacity.
-    auto foreign=p;foreign.original_source=CPUExpertShardSourceSelection::fromOriginalPlacement(placement,3,1-world_rank_);
+    auto foreign=p;foreign.original_source=ExpertShardSourceSelection::fromOriginalPlacement(placement,3,1-world_rank_);
     EXPECT_THROW(MoECPUExpertShardRouteStage{foreign},std::invalid_argument);
     auto changed=p;changed.columns=H+1;
     EXPECT_THROW(MoECPUExpertShardRouteStage{changed},std::invalid_argument);

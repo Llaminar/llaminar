@@ -753,6 +753,13 @@ namespace llaminar2
         const size_t effective_count =
             params_.count > 0 ? params_.count : params_.tensor->numel();
         const size_t degree = static_cast<size_t>(params_.tp_ctx->degree());
+        return canonicalRankWorkspaceRequirements(effective_count,degree);
+    }
+
+    WorkspaceRequirements TPAllreduceStage::canonicalRankWorkspaceRequirements(
+        size_t effective_count,size_t degree)
+    {
+        WorkspaceRequirements requirements;
         if (effective_count == 0 || degree < 2 ||
             effective_count >
                 std::numeric_limits<size_t>::max() / degree / sizeof(float))

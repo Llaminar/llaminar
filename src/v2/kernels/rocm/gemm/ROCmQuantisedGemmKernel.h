@@ -476,6 +476,7 @@ namespace llaminar2
                 DeviceWorkspaceManager *workspace = nullptr,
                 int activation_row_offset = 0) override;
 
+            /** @copydoc ITensorGemm::prepare_gated_rmsnorm_single_q8 */
             /** @copydoc ITensorGemm::validate_gated_rmsnorm_single_q8 */
             void validate_gated_rmsnorm_single_q8(GatedRMSNormProjectionInput input,
                 TensorBase* output,int n,int k,DeviceWorkspaceManager* workspace) const override;
@@ -741,6 +742,9 @@ namespace llaminar2
             /** @copydoc ITensorGemm::multiply_q8_residual_corrected */
             void multiply_q8_residual_corrected(const TensorBase*input,TensorBase*output,
                 DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace) override;
+            /** @copydoc ITensorGemm::multiply_hc_down_projection */
+            bool multiply_hc_down_projection(const HCDownProjectionInput& input,TensorBase* output,int n,int k,
+                DeviceWorkspaceManager* workspace,const HCDownOutputPublication* output_publication=nullptr) override;
             /** @copydoc ITensorGemm::multiply_q8_residual_corrected(HCResidualDownInput,TensorBase*,DeviceRowRange,int,int,DeviceWorkspaceManager*) */
             void multiply_q8_residual_corrected(HCResidualDownInput input,TensorBase*output,
                 DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace) override;

@@ -81,6 +81,7 @@ struct PackedVnniDestination
     int group_rows;
     int blocks_per_row;
     int allocation_payload_bytes_per_block;
+    int first_source_block; ///< First selected32-value source subgroup, before destination compaction.
 };
 
 /**
@@ -91,6 +92,7 @@ __device__ __forceinline__ size_t packedVnniLinearIndex(
     int block,
     PackedVnniDestination destination)
 {
+    block -= destination.first_source_block;
     const int absolute_row = destination.row_offset + local_row;
     if (destination.group_rows <= 0)
     {
@@ -206,8 +208,9 @@ __global__ void cuda_repack_q4_0_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y;
-    if (n >= N || b >= blocks_per_row) return;
+    const int b = destination.first_source_block + blockIdx.y;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const auto& blk = d_raw[n * blocks_per_row + b];
     const size_t linear = packedVnniLinearIndex(n, b, destination);
@@ -230,8 +233,9 @@ __global__ void cuda_repack_q4_1_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y;
-    if (n >= N || b >= blocks_per_row) return;
+    const int b = destination.first_source_block + blockIdx.y;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const auto& blk = d_raw[n * blocks_per_row + b];
     const size_t linear = packedVnniLinearIndex(n, b, destination);
@@ -254,8 +258,9 @@ __global__ void cuda_repack_q5_0_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y;
-    if (n >= N || b >= blocks_per_row) return;
+    const int b = destination.first_source_block + blockIdx.y;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const auto& blk = d_raw[n * blocks_per_row + b];
     const size_t linear = packedVnniLinearIndex(n, b, destination);
@@ -280,8 +285,9 @@ __global__ void cuda_repack_q5_1_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y;
-    if (n >= N || b >= blocks_per_row) return;
+    const int b = destination.first_source_block + blockIdx.y;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const auto& blk = d_raw[n * blocks_per_row + b];
     const size_t linear = packedVnniLinearIndex(n, b, destination);
@@ -306,8 +312,9 @@ __global__ void cuda_repack_q8_0_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y;
-    if (n >= N || b >= blocks_per_row) return;
+    const int b = destination.first_source_block + blockIdx.y;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const auto& blk = d_raw[n * blocks_per_row + b];
     const size_t linear = packedVnniLinearIndex(n, b, destination);
@@ -341,8 +348,9 @@ __global__ void cuda_repack_q8_1_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y;
-    if (n >= N || b >= blocks_per_row) return;
+    const int b = destination.first_source_block + blockIdx.y;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const auto& blk = d_raw[n * blocks_per_row + b];
     const size_t linear = packedVnniLinearIndex(n, b, destination);
@@ -369,8 +377,9 @@ __global__ void cuda_repack_q8_k_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y;
-    if (n >= N || b >= blocks_per_row) return;
+    const int b = destination.first_source_block + blockIdx.y;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int superblock = b / 8;
     const int subblock = b % 8;
@@ -396,9 +405,10 @@ __global__ void cuda_repack_q4k_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -449,9 +459,10 @@ __global__ void cuda_repack_q5k_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -525,9 +536,10 @@ __global__ void cuda_repack_q6k_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -587,9 +599,10 @@ __global__ void cuda_repack_q3k_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -671,9 +684,10 @@ __global__ void cuda_repack_q2k_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -736,9 +750,10 @@ __global__ void cuda_repack_iq4xs_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -771,9 +786,10 @@ __global__ void cuda_repack_iq3s_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -805,9 +821,10 @@ __global__ void cuda_repack_iq3xxs_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -866,9 +883,10 @@ __global__ void cuda_repack_iq2s_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -898,9 +916,10 @@ __global__ void cuda_repack_iq2xs_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -941,9 +960,10 @@ __global__ void cuda_repack_iq2xxs_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -989,9 +1009,10 @@ __global__ void cuda_repack_iq1s_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -1039,9 +1060,10 @@ __global__ void cuda_repack_iq1m_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y * blockDim.y + threadIdx.y;
+    const int b = destination.first_source_block + blockIdx.y * blockDim.y + threadIdx.y;
     const int blocks_per_row = K / 32;
-    if (n >= N || b >= blocks_per_row) return;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const int sb_idx  = b / 8;
     const int sub_idx = b % 8;
@@ -1099,11 +1121,13 @@ bool launchVnniRepackCUDA(
     int output_row_offset,
     int packed_group_rows,
     int allocation_payload_bytes_per_block,
+    NativeQuantisedRepackColumns columns,
     void* stream)
 {
     cudaStream_t cuda_stream = reinterpret_cast<cudaStream_t>(stream);
-    const int blocks_per_row = K / 32;
-    if (!stream || N <= 0 || K <= 0 || K % 32 != 0 || output_N <= 0 ||
+    const int source_K = columns.sourceColumns();
+    const int blocks_per_row = source_K / 32;
+    if (!stream || N <= 0 || K <= 0 || K % 32 != 0 || columns.columns() != K || output_N <= 0 ||
         N > output_N || output_row_offset < 0 ||
         output_row_offset > output_N - N ||
         allocation_payload_bytes_per_block <
@@ -1118,9 +1142,10 @@ bool launchVnniRepackCUDA(
         .matrix_rows = output_N,
         .row_offset = output_row_offset,
         .group_rows = packed_group_rows,
-        .blocks_per_row = blocks_per_row,
+        .blocks_per_row = columns.blocks(),
         .allocation_payload_bytes_per_block =
             allocation_payload_bytes_per_block,
+        .first_source_block = columns.firstBlock(),
     };
 
     /*
@@ -1134,7 +1159,7 @@ bool launchVnniRepackCUDA(
     case RepackFormat::Q4_0:
     case RepackFormat::IQ4_NL: {
         dim3 block(256, 1);
-        dim3 grid((N + 255) / 256, blocks_per_row);
+        dim3 grid((N + 255) / 256, columns.blocks());
         cuda_repack_q4_0_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q4_0Block*>(d_raw_blocks),
             d_payload, d_scales, N, blocks_per_row, destination);
@@ -1142,7 +1167,7 @@ bool launchVnniRepackCUDA(
     }
     case RepackFormat::Q4_1: {
         dim3 block(256, 1);
-        dim3 grid((N + 255) / 256, blocks_per_row);
+        dim3 grid((N + 255) / 256, columns.blocks());
         cuda_repack_q4_1_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q4_1Block*>(d_raw_blocks),
             d_payload, d_scales, d_mins, N, blocks_per_row, destination);
@@ -1150,7 +1175,7 @@ bool launchVnniRepackCUDA(
     }
     case RepackFormat::Q5_0: {
         dim3 block(256, 1);
-        dim3 grid((N + 255) / 256, blocks_per_row);
+        dim3 grid((N + 255) / 256, columns.blocks());
         cuda_repack_q5_0_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q5_0Block*>(d_raw_blocks),
             d_payload, d_scales, N, blocks_per_row, destination);
@@ -1158,7 +1183,7 @@ bool launchVnniRepackCUDA(
     }
     case RepackFormat::Q5_1: {
         dim3 block(256, 1);
-        dim3 grid((N + 255) / 256, blocks_per_row);
+        dim3 grid((N + 255) / 256, columns.blocks());
         cuda_repack_q5_1_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q5_1Block*>(d_raw_blocks),
             d_payload, d_scales, d_mins, N, blocks_per_row, destination);
@@ -1166,7 +1191,7 @@ bool launchVnniRepackCUDA(
     }
     case RepackFormat::Q8_0: {
         dim3 block(256, 1);
-        dim3 grid((N + 255) / 256, blocks_per_row);
+        dim3 grid((N + 255) / 256, columns.blocks());
         cuda_repack_q8_0_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q8_0Block*>(d_raw_blocks),
             d_payload, d_scales, N, blocks_per_row, destination);
@@ -1174,138 +1199,138 @@ bool launchVnniRepackCUDA(
     }
     case RepackFormat::Q8_1: {
         dim3 block(256, 1);
-        dim3 grid((N + 255) / 256, blocks_per_row);
+        dim3 grid((N + 255) / 256, columns.blocks());
         cuda_repack_q8_1_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q8_1Block*>(d_raw_blocks),
             d_payload, d_scales, N, blocks_per_row, destination);
         break;
     }
     case RepackFormat::Q8_K: {
-        const int superblocks_per_row = (K + 255) / 256;
+        const int superblocks_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(256, 1);
-        dim3 grid((N + 255) / 256, blocks_per_row);
+        dim3 grid((N + 255) / 256, columns.blocks());
         cuda_repack_q8_k_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q8_KBlock*>(d_raw_blocks),
             d_payload, d_scales, N, blocks_per_row, superblocks_per_row, destination);
         break;
     }
     case RepackFormat::Q4_K: {
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_q4k_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q4_KBlock*>(d_raw_blocks),
-            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, source_K, sb_per_row, destination);
         break;
     }
     case RepackFormat::Q5_K: {
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_q5k_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q5_KBlock*>(d_raw_blocks),
-            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, source_K, sb_per_row, destination);
         break;
     }
     case RepackFormat::Q6_K: {
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_q6k_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q6_KBlock*>(d_raw_blocks),
-            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, source_K, sb_per_row, destination);
         break;
     }
     case RepackFormat::Q3_K: {
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_q3k_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q3_KBlock*>(d_raw_blocks),
-            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, source_K, sb_per_row, destination);
         break;
     }
     case RepackFormat::Q2_K: {
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_q2k_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const Q2_KBlock*>(d_raw_blocks),
-            d_payload, d_scales, d_mins, d_emins, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, d_emins, N, source_K, sb_per_row, destination);
         break;
     }
     case RepackFormat::IQ4_XS: {
         if (!d_raw_blocks || !d_payload || !d_scales || !d_mins) return false;
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_iq4xs_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const IQ4_XSBlock*>(d_raw_blocks),
-            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, source_K, sb_per_row, destination);
         break;
     }
     case RepackFormat::IQ3_S: {
         if (!d_mins) throw std::invalid_argument("IQ3_S requires original coefficient metadata");
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_iq3s_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const IQ3_SBlock*>(d_raw_blocks),
-            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, source_K, sb_per_row, destination);
         break;
     }
     case RepackFormat::IQ3_XXS: {
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_iq3xxs_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const IQ3_XXSBlock*>(d_raw_blocks),
-            d_payload, d_scales, N, K, sb_per_row, destination);
+            d_payload, d_scales, N, source_K, sb_per_row, destination);
         break;
     }
     case RepackFormat::IQ2_S: {
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_iq2s_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const IQ2_SBlock*>(d_raw_blocks),
-            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, source_K, sb_per_row, destination);
         break;
     }
     case RepackFormat::IQ2_XS: {
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_iq2xs_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const IQ2_XSBlock*>(d_raw_blocks),
-            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, source_K, sb_per_row, destination);
         break;
     }
     case RepackFormat::IQ2_XXS: {
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_iq2xxs_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const IQ2_XXSBlock*>(d_raw_blocks),
-            d_payload, d_scales, N, K, sb_per_row, destination);
+            d_payload, d_scales, N, source_K, sb_per_row, destination);
         break;
     }
     case RepackFormat::IQ1_S: {
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_iq1s_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const IQ1_SBlock*>(d_raw_blocks),
-            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, source_K, sb_per_row, destination);
         break;
     }
     case RepackFormat::IQ1_M: {
-        const int sb_per_row = (K + 255) / 256;
+        const int sb_per_row = source_K / 256 + (source_K % 256 != 0);
         dim3 block(64, 4);
-        dim3 grid((N + 63) / 64, (blocks_per_row + 3) / 4);
+        dim3 grid((N + 63) / 64, (columns.blocks() + 3) / 4);
         cuda_repack_iq1m_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const IQ1_MBlock*>(d_raw_blocks),
-            d_payload, d_scales, d_mins, N, K, sb_per_row, destination);
+            d_payload, d_scales, d_mins, N, source_K, sb_per_row, destination);
         break;
     }
     default:
@@ -1337,6 +1362,18 @@ bool launchVnniRepackCUDA(
 // ============================================================================
 // Host dispatch compatibility wrappers
 // ============================================================================
+
+/** @brief Preserve existing complete-row preparation with an explicit whole-source interval. */
+bool launchVnniRepackCUDA(
+    RepackFormat format,const void* d_raw_blocks,uint8_t* d_payload,uint16_t* d_scales,
+    uint16_t* d_mins,uint32_t* d_emins,int N,int K,int output_N,int output_row_offset,
+    int packed_group_rows,int allocation_payload_bytes_per_block,void* stream)
+{
+    if(K<=0||K%32)return false;
+    return launchVnniRepackCUDA(format,d_raw_blocks,d_payload,d_scales,d_mins,d_emins,N,K,
+        output_N,output_row_offset,packed_group_rows,allocation_payload_bytes_per_block,
+        NativeQuantisedRepackColumns::whole(K),stream);
+}
 
 bool launchVnniRepackCUDA(
     RepackFormat format,

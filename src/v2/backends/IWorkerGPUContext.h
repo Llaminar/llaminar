@@ -7,7 +7,8 @@
  * identities; no method may reinterpret a null stream as an ambient default.
  */
 
-#pragma once
+#ifndef LLAMINAR2_BACKENDS_IWORKERGPUCONTEXT_H
+#define LLAMINAR2_BACKENDS_IWORKERGPUCONTEXT_H
 
 #include "GPUProjectionSubmission.h"
 
@@ -447,6 +448,28 @@ namespace llaminar2
         }
 
         /**
+         * @brief Retain a timestamp-producing event node in an active native capture.
+         * @param event Existing original-device event created with GPUEventPurpose::Timing.
+         * @param stream Exact non-default stream currently being captured on this device.
+         * @return Whether the native timestamp node was recorded successfully.
+         * @throws std::invalid_argument For a missing event or default stream.
+         * @throws std::logic_error When the stream is not capturing or the implementation lacks this operation.
+         *
+         * Ordinary captured event records may become dependency bookkeeping and
+         * cannot certify elapsed time. This explicit diagnostic operation uses
+         * the native external-event node flag; it does not publish tensor
+         * coherence or allocate a new event. The caller retains the event until
+         * all captured readers retire and queries it only after the terminal.
+         * @thread_safety Invoke on the original stream's capture owner.
+         */
+        virtual bool recordCapturedTimingEventChecked(void *event, void *stream)
+        {
+            if (!event || reinterpret_cast<std::uintptr_t>(stream) <= 2)
+                throw std::invalid_argument("Captured timing requires an event and exact non-default stream");
+            throw std::logic_error("This worker does not implement captured timing event nodes");
+        }
+
+        /**
          * @brief Make a stream wait for an event
          * @param event Event handle to wait for
          * @param stream Exact consumer stream. Must not be null.
@@ -829,3 +852,5 @@ namespace llaminar2
     };
 
 } // namespace llaminar2
+
+#endif // LLAMINAR2_BACKENDS_IWORKERGPUCONTEXT_H

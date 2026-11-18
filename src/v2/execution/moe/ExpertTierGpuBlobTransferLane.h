@@ -20,6 +20,7 @@
 #include "ExpertTierSourceReadiness.h"
 #include "ExpertTierTransferMeasurement.h"
 #include "GPUExpertTransfer.h"
+#include "ExpertTierProjectionByteRange.h"
 #include "../../backends/DeviceId.h"
 #include "../../transfer/MappedTransferProgressEpoch.h"
 
@@ -53,7 +54,9 @@ namespace llaminar2
     struct ExpertTierGpuBlobChunk
     {
         ExpertTierGpuBlobRegion region = ExpertTierGpuBlobRegion::Payload;
-        std::size_t region_offset = 0;
+        std::size_t region_offset = 0; ///< Compact wire offset, not an allocation offset.
+        std::size_t source_offset = 0; ///< Offset in the original source region.
+        std::size_t destination_offset = 0; ///< Offset in the original destination region.
         std::size_t bytes = 0;
         std::uint64_t sequence = 0;
 
@@ -71,6 +74,8 @@ namespace llaminar2
      * It emits payload, scales, optional minima, then optional effective minima
      * in a deterministic order. A chunk never straddles two arrays, which makes
      * retry, byte accounting, and destination pointer validation unambiguous.
+     * Rectangles additionally stop at either root's noncontiguous boundary;
+     * their source and destination offsets need not equal the wire offset.
      */
     class ExpertTierGpuBlobChunkProtocol final
     {
@@ -95,6 +100,29 @@ namespace llaminar2
             const GpuExpertPackedDescriptor &source,
             const GpuExpertPackedDescriptor &destination,
             std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Bind independent native roots to their compact original overlap.
+         * @param source Original live source representation and allocation geometry.
+         * @param destination Final receiving representation and independent geometry.
+         * @param intersection Checked original-coordinate ownership overlap.
+         * @param error Optional exact geometry or format diagnostic.
+         * @return Whether every live plane is authenticated before any submission.
+         */
+        bool begin(const GpuExpertPackedDescriptor& source,
+            const GpuExpertPackedDescriptor& destination,
+            const ExpertTierWeightProjectionIntersection& intersection,
+            std::string* error = nullptr) noexcept;
+
+        /**
+         * @brief Bind row-major floating roots without copying unrelated columns.
+         * @param intersection Checked independent source and destination rectangles.
+         * @param element_bytes FP16/BF16 (2) or FP32 (4) storage size.
+         * @param error Optional exact geometry diagnostic.
+         * @return Whether the compact live rectangle has been admitted by the cursor.
+         */
+        bool beginFloating(const ExpertTierWeightProjectionIntersection& intersection,
+            std::size_t element_bytes, std::string* error = nullptr) noexcept;
 
         /**
          * @brief Reset the cursor for one contiguous floating projection.
@@ -134,11 +162,16 @@ namespace llaminar2
         }
 
     private:
+        /** @brief Clear a prior or rejected binding before authenticating the next one. */
+        void reset() noexcept;
         /** @brief Advance past empty or completely emitted separated regions. */
         void seekNextNonEmptyRegion() noexcept;
 
         std::size_t chunk_capacity_bytes_ = 0;
         std::array<std::size_t, 4> region_bytes_{};
+        std::array<std::size_t, 4> element_bytes_{};
+        std::optional<ExpertTierWeightProjectionIntersection> intersection_;
+        ExpertTierProjectionByteOrder order_ = ExpertTierProjectionByteOrder::NativeGPUBlocks;
         std::size_t region_index_ = 0;
         std::size_t region_offset_ = 0;
         std::size_t total_bytes_ = 0;
@@ -288,6 +321,34 @@ namespace llaminar2
             const GpuExpertPackedDescriptor &destination,
             const ExpertTierSourceReadiness &source_readiness,
             std::string *error = nullptr) noexcept;
+
+        /**
+         * @brief Relay only the original native intersection through the retained epochs.
+         * @param source Immutable original source arrays.
+         * @param destination Preallocated final arrays with independent strides.
+         * @param intersection Exact original ownership overlap.
+         * @param source_readiness Exact producer event or installed-bank proof.
+         * @param error Optional exact start failure.
+         * @return Whether the compact transfer has started without allocation.
+         */
+        bool start(const GpuExpertPackedDescriptor& source,
+            const GpuExpertPackedDescriptor& destination,
+            const ExpertTierWeightProjectionIntersection& intersection,
+            const ExpertTierSourceReadiness& source_readiness, std::string* error = nullptr) noexcept;
+
+        /**
+         * @brief Relay a byte-identical floating intersection through the existing lane.
+         * @param source Original source allocation and precision.
+         * @param destination Original final allocation and precision.
+         * @param intersection Exact original ownership overlap.
+         * @param source_readiness Exact producer event or installed-bank proof.
+         * @param error Optional exact start failure.
+         * @return Whether the bounded retained transfer has started.
+         */
+        bool startFloating(const ContiguousFloatingPointWeightDescriptor& source,
+            const ContiguousFloatingPointWeightDescriptor& destination,
+            const ExpertTierWeightProjectionIntersection& intersection,
+            const ExpertTierSourceReadiness& source_readiness, std::string* error = nullptr) noexcept;
 
         /**
          * @brief Start a byte-preserving heterogeneous floating projection relay.

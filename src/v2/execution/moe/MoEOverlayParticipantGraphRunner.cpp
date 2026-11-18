@@ -31,7 +31,7 @@
 #include "MoEOverlayFollowerRowGeometry.h"
 #include "MoECPUExpertWorkspaceSource.h"
 #include "execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 #include "MoEOverlayHostServiceContract.h"
 #include "MoEOverlayParticipantResidency.h"
 #include "MoEExpertOverlayPreparationPlan.h"
@@ -970,7 +970,7 @@ namespace llaminar2
         // Establish original context/source identity here, not from a lazy builder.
         {
             std::string error;
-            if (!config_.participant_residency->admitInitialCPUJointGraphSources(
+            if (!config_.participant_residency->admitInitialJointGraphSources(
                     config_.model_context, &error))
                 throw std::runtime_error("Participant CPU joint cold graph admission failed: " + error);
         }
@@ -2032,7 +2032,7 @@ namespace llaminar2
                 MoEExpertOverlayPreparationPlan::build(*runtime_plan_,config_.model_context->concreteLoader()))
                 .filteredForRank(execution_plan_->currentRankPlan())
                 .filteredForDevices(participantDevices(local_participants_));
-            if(preparation.cpuJointOwnerMap() && preparation.cpuJointOwnerMap().get()!=owner_map_.get())
+            if(preparation.jointOwnerMap() && preparation.jointOwnerMap().get()!=owner_map_.get())
                 throw std::runtime_error("CPU joint participant preparation replaced original source owner map");
             const auto sources = preparation.sourceWeightPlan(
                 config_.model_context->concreteLoader(), plan.strategy().model_id);
@@ -3028,7 +3028,7 @@ namespace llaminar2
                             endpoint->participant_id));
                 endpoint->layers.reserve(spec.source_layers.size());
 
-                const bool joint=config_.participant_residency->isCPUJointParticipant(endpoint->participant_id);
+                const bool joint=config_.participant_residency->isJointParticipant(endpoint->participant_id);
                 const auto participant_residency = joint?std::shared_ptr<MoEOverlayParticipantResidency>{}:
                     config_.participant_residency->endpoint(endpoint->participant_id);
                 if (!joint && !participant_residency)
@@ -3050,11 +3050,11 @@ namespace llaminar2
                     std::vector<MoEOverlayPreparedExpertPayload>
                         prepared_payloads;
                     std::string residency_error;
-                    std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> joint_layer;
+                    std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::JointLayer> joint_layer;
                     if(joint) {
                         if(!config_.cpu_joint_context || !prepared_store_)
                             throw std::runtime_error("CPU joint follower has no original prepared source/domain");
-                        joint_layer=adoptMoEOverlayCPUJointGraphDeclaration(*config_.participant_residency,registry,
+                        joint_layer=adoptMoEOverlayJointGraphDeclaration(*config_.participant_residency,registry,
                             prepared_store_->modelId(),endpoint->participant_id,layer,num_experts,d_model,expert_intermediate);
                         if(!joint_layer || !joint_layer->sourceSelection() ||
                            !compact_arena->cpuJointLayout() || !compact_arena->cpuJointPackedRecords())
@@ -3593,7 +3593,7 @@ namespace llaminar2
                                             external.logical_expert_id=expert;external.owner_participant=-1;
                                             update.overlay_route_participant[static_cast<size_t>(
                                                 expert)] =
-                                                MoEOverlayRouteTarget::cpuCohort(
+                                                MoEOverlayRouteTarget::cohort(
                                                     placement->tier_idx)
                                                     .word();
                                             continue; // Fixed CPU cohort remains external to GPU

@@ -333,7 +333,7 @@ namespace llaminar2
                 // separately for sparse request and rank-batch protocols.
                 graph_mpi_ctx = MPIContextFactory::borrowOriginalCPUStage(ctx.mpi_ctx, global_tp_ctx);
                 if(binding->owners().residency->projectionPreparation() &&
-                    binding->owners().residency->projectionPreparation()->cpuJointOwnerMap()) {
+                    binding->owners().residency->projectionPreparation()->jointOwnerMap()) {
                     const auto original_cpu=std::dynamic_pointer_cast<GlobalTPContext>(global_tp_ctx);
                     if(!original_cpu || !original_cpu->authenticatesOriginalCPUExpertBorrow(global_tp_ctx))
                         throw std::invalid_argument("CPU pipeline fragment graphs require their original admitted expert domain");

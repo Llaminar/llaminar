@@ -12,7 +12,7 @@
 #include "loaders/WeightPlan.h"
 #include "CPUJointSourceTestPlan.h"
 #include "memory/NUMAAllocator.h"
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 #include "tensors/NativeWeightSourceRange.h"
 #include <algorithm>
 namespace llaminar2::test {
@@ -39,7 +39,7 @@ inline MoERoutedExpertPlacementPlan localCPUJointSourceTestPlan() {
 }
 /** @return Same normalized original source requirement authored by the closed cohort selection. */
 inline WeightRequirement nativeJointRequirementForTest(
-    const std::shared_ptr<const CPUExpertShardSourceSelection>& selected,WeightRole role,const std::string& name)
+    const std::shared_ptr<const ExpertShardSourceSelection>& selected,WeightRole role,const std::string& name)
 {
     if(!selected)throw std::invalid_argument("Source fixture requires its original cohort selection");
     WeightRequirement request;request.canonical_name=name;request.role=role;request.layer=selected->layer();
@@ -49,7 +49,7 @@ inline WeightRequirement nativeJointRequirementForTest(
     request.tp_rank_or_device_index=request.overlay_participant_index=int(selected->participantIndex());
     request.overlay_participant_world_rank=selected->participant().world_rank;
     request.overlay_domain=selected->participant().domain_name;
-    request.cpu_joint_source=selected;request.projection_ownership=selected->ownership();
+    request.joint_source=selected;request.projection_ownership=selected->ownership();
     WeightPlan plan;plan.add(std::move(request));return plan.requirements().front();
 }
 /** @return Exact native-only input quote for a reader test; no final consumer scratch is invented. */

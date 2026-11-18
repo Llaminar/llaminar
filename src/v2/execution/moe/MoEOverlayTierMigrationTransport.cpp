@@ -703,7 +703,7 @@ namespace llaminar2
                         throw std::invalid_argument("Completed physical piece omitted its actual ready operation payload quote");
                     const auto targetWord = [](const MoEOverlayPhysicalProjectionTarget &target) {
                         return target.members.size() == 1 ? target.members.front().participant_id :
-                            MoEOverlayRouteTarget::cpuCohort(target.tier_idx).word();
+                            MoEOverlayRouteTarget::cohort(target.tier_idx).word();
                     };
                     const auto &intersection = *piece.intersection;
                     const auto &source = intersection.source();

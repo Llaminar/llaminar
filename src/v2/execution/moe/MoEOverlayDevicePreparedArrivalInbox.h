@@ -27,6 +27,8 @@
 
 #include <cstdint>
 #include <memory>
+#include <optional>
+#include <span>
 #include <string>
 
 namespace llaminar2
@@ -81,6 +83,30 @@ namespace llaminar2
         /** @return Immutable-address binding embedded into controller graphs. */
         [[nodiscard]] MoEOverlayDeviceRuntimePublicationBinding
         publicationBinding() const noexcept;
+
+        /**
+         * @brief Export only the exact local member of one complete physical destination.
+         * @param migration Original whole/cohort physical target and global expert/layer.
+         * @param arrivals Process-local member-keyed arrivals from the same physical wave.
+         * @param candidate_epoch Exact unpublished durable destination epoch.
+         * @param participant_id Original global GPU member, never its domain-local index.
+         * @param family Original runtime-bound fragment family; absent for whole lanes.
+         * @param output Local descriptor, or empty for an external destination; unchanged on failure.
+         * @param error Optional precise source/member/epoch/geometry rejection.
+         * @return True only after every key is unique and belongs to the original target,
+         *         and the local destination has its complete exact payload.
+         *
+         * This device-free physical boundary exports no policy or readiness for a
+         * sibling. The caller's existing transport receipt publishes these bytes;
+         * complete-member group ACKs still govern global candidate admission.
+         */
+        [[nodiscard]] static bool exportDestinationArrival(
+            const MoEOverlayTierMigration &migration,
+            std::span<const MoEOverlayParticipantDestinationArrival> arrivals,
+            std::uint64_t candidate_epoch, int participant_id,
+            const MoEOverlayFragmentFamily *family,
+            std::optional<DeviceMoEExpertDescriptor> &output,
+            std::string *error = nullptr) noexcept;
 
         /**
          * @brief Stage immutable descriptors for this participant's arrivals.

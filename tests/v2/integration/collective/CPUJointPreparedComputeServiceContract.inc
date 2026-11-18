@@ -16,7 +16,7 @@
 #include "execution/moe/MoEOverlayMPIEconomyEvidenceExchange.h"
 #include "execution/moe/MoEOverlayEconomyEvidenceCodec.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 #include "backends/BackendManager.h"
 #include "loaders/WeightManager.h"
 #include "../../utils/CPUJointSourceTestPlan.h"
@@ -131,7 +131,7 @@ void CPUExpertDomainNative::preparedComputeSourceAndRetirement(PreparedServiceRe
         auto preparation=std::make_shared<const MoEExpertOverlayPreparationPlan>(MoEExpertOverlayPreparationPlan::build(*runtime,loader));
         const auto loading=preparation->filteredForDevice(DeviceId::cpu()).sourceWeightPlan(loader,model);
         std::vector<int> local_ids;int participant=-1,whole=-1;
-        for(const auto& descriptor:preparation->cpuJointOwnerMap()->participants()) {
+        for(const auto& descriptor:preparation->jointOwnerMap()->participants()) {
             if(descriptor.world_rank_known && descriptor.world_rank==rank) {
                 local_ids.push_back(descriptor.participant_id);
                 if(descriptor.domain_name=="cpu_joint")participant=descriptor.participant_id;
@@ -139,7 +139,7 @@ void CPUExpertDomainNative::preparedComputeSourceAndRetirement(PreparedServiceRe
             }
         }
         requirePreparedCompute(participant>=0,"original local CPU fragment participant");
-        const auto selected=preparation->cpuShardSourceFor(0,*preparation->cpuJointOwnerMap()->participantForId(participant));
+        const auto selected=preparation->shardSourceFor(0,*preparation->jointOwnerMap()->participantForId(participant));
         requirePreparedCompute(selected && selected->contains(selected_expert),"same global selected expert");
         std::vector<NativeCPUCollectiveProgram::Participant> members;
         for(int member=0;member<2;++member)members.push_back({member,GlobalDeviceAddress::cpu(nodes[member],inventory->ranks[member].hostname)});
@@ -185,8 +185,8 @@ void CPUExpertDomainNative::preparedComputeSourceAndRetirement(PreparedServiceRe
         std::string error;
         requirePreparedCompute(registry->bindOriginalPreparedContext(original,preparation,&error),error.c_str());
         requirePreparedCompute(registry->finalizeInitialBanksFromPreparedRegistry(manager->expertGemmRegistry(),&error),error.c_str());
-        {const auto frame=registry->initialCPUJointLayer(participant,0)->acquireEpoch(1);
-         requirePreparedCompute(bool(frame),"actual original source bank");retired_gate=frame->bankLease()->layerForModelLayer(0).cpu_fragments[selected_expert].gate();}
+        {const auto frame=registry->initialJointLayer(participant,0)->acquireEpoch(1);
+         requirePreparedCompute(bool(frame),"actual original source bank");retired_gate=frame->bankLease()->layerForModelLayer(0).fragments[selected_expert].gate();}
         std::variant<NativeCPUCollectiveProgram::DomainUse,NativeCPUCollectiveProgram::ProcessUse> use(
             std::in_place_type<NativeCPUCollectiveProgram::DomainUse>,program.admit(memory,rank));
         if(!observed_original_pool){original_pool_admission=memory->admission();observed_original_pool=true;}
@@ -232,7 +232,7 @@ void CPUExpertDomainNative::preparedComputeSourceAndRetirement(PreparedServiceRe
                     const auto observed=Service::measurePreparedCPUJoint(*registry,1,participant,0,selected_expert,phase,domain,memory,span);
                     EXPECT_EQ(bool(observed),rank==0);
                     if(observed) {
-                        EXPECT_EQ(observed->target.word(),MoEOverlayRouteTarget::cpuCohort(cohort_tier).word());
+                        EXPECT_EQ(observed->target.word(),MoEOverlayRouteTarget::cohort(cohort_tier).word());
                         EXPECT_EQ(observed->expert,selected_expert);EXPECT_EQ(observed->logical_rows_per_invocation,uint64_t(rows));
                         EXPECT_EQ(observed->measured_invocations,Service::kMeasuredSamples);EXPECT_GT(observed->total_root_wall_nanoseconds,0u);
                         EXPECT_EQ(observed->boundary,Service::PreparedComputeBoundary::InputReadyStartReleaseToCanonicalOutput);
@@ -293,7 +293,7 @@ void CPUExpertDomainNative::preparedComputeSourceAndRetirement(PreparedServiceRe
                         EXPECT_EQ(row.sample_count,local.front().sample_count);
                         EXPECT_EQ(row.expert_ids,local.front().expert_ids);
                     }
-                    EXPECT_EQ(row.coordinate.target.word(),MoEOverlayRouteTarget::cpuCohort(0).word());
+                    EXPECT_EQ(row.coordinate.target.word(),MoEOverlayRouteTarget::cohort(0).word());
                     EXPECT_EQ(row.coordinate.layer,0);
                     for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase) {
                         const auto& entry=declaration->entries().front();
@@ -305,7 +305,7 @@ void CPUExpertDomainNative::preparedComputeSourceAndRetirement(PreparedServiceRe
                     const auto profile=MoEOverlayEconomyProfileComposer::composePreparedService(declaration,complete);
                     EXPECT_EQ(profile->prepared_plan,declaration);
                     requirePreparedCompute(profile->target_costs.size()==1,"one complete composed cohort price");
-                    EXPECT_EQ(profile->target_costs.front().target.word(),MoEOverlayRouteTarget::cpuCohort(0).word());
+                    EXPECT_EQ(profile->target_costs.front().target.word(),MoEOverlayRouteTarget::cohort(0).word());
                     for(const auto cost:profile->target_costs.front().nanoseconds_per_activation)EXPECT_GT(cost,0u);
                     const auto after=exchange.stats();
                     EXPECT_EQ(after.evidence_payload_bytes_sent-before.evidence_payload_bytes_sent,rank==0?root_bytes:0u);

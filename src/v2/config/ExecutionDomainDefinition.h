@@ -155,7 +155,7 @@ namespace llaminar2
         /** @brief Return true when LLEP may schedule among complete residents. */
         bool supportsLeastLoadedResidentAssignment() const;
 
-        /** @brief Accept a real multi-participant tensor domain or exact full-matrix CPU TP1; no native readiness is implied. */
+        /** @brief Accept positive original tensor-domain geometry, including CPU TP1 and rank-local GPU TP1; no native readiness is implied. */
         bool supportsRoutedExpertTensorSharding() const;
 
         /**

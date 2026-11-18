@@ -17,7 +17,9 @@
  * Frozen host policies survive preparation and the complete graph
  * lifecycle owns reclamation of shared model bytes. Static original F shards
  * enter this same pool/staging pipeline only through complete declared frozen
- * participant sources; they never publish whole-expert or overlay aliases.
+ * participant sources; they never publish whole-expert aliases. Overlay
+ * preparation authenticates each frozen fragment against its original exact
+ * domain/rank/member/role request before publishing a prepared registry entry.
  * Each sharding operation retains an immutable TP assignment while parallel
  * participant construction may atomically republish the shared manager owner.
  * Preparation role classification shares the exact identity contract consumed
@@ -31,13 +33,16 @@
  */
 
 #include "WeightManager.h"
+#include "loaders/BoundedGPUExpertSource.h"
+#include <map>
+#include <tuple>
 #include "utils/ScopedOpenMPPartitionAffinity.h"
 #include "CPUWeightRequirementOwner.h"
 #include "tensors/NativeTensorExtent.h"
 #include "loaders/NativeWeightSourceTransaction.h"
 #include "kernels/cpu/gemm/CPUPreparedWeightWriter.h"
 #include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 #include "loaders/PreparedWeightIdentityContract.h"
 #include "WeightSlicer.h"
 #include "MoEExpertSourceView.h"
@@ -271,9 +276,9 @@ namespace llaminar2
                     mixInt(interval.columns);
                 }
             }
-            if(requirement.cpu_joint_source) {
-                mixString("original_cpu_joint_fragment_v1");
-                const auto& member=requirement.cpu_joint_source->participant();
+            if(requirement.joint_source) {
+                const auto& member=requirement.joint_source->participant();
+                mixString(member.device.is_cpu() ? "original_cpu_joint_fragment_v1" : "original_gpu_joint_fragment_v1");
                 mixInt(member.participant_id);mixInt(member.world_rank);
                 mixString(member.address.toString());
             }
@@ -390,9 +395,10 @@ namespace llaminar2
          * @param device Preparation participant being entered.
          * @param include_expert_jobs Whether this invocation actually prepares expert handles.
          *
-         * Static GPU matrices require the original source and explicit expert
-         * work. CPU joint fragments can enter the dense pass with expert work
-         * excluded when their native source transaction already committed them.
+         * Static GPU matrices retain their original source through both passes;
+         * the dense pass defers their handles to explicit expert preparation.
+         * CPU joint fragments can enter the dense pass with expert work excluded
+         * when their native source transaction already committed them.
          */
         void validateStaticProjectionPreparation(const FrozenModelWeightSet &frozen, DeviceId device,
                                                    bool include_expert_jobs = true)
@@ -404,10 +410,10 @@ namespace llaminar2
                 if (device.is_gpu())
                 {
                     (void)ExpertGemmRegistry::staticProjectionScope(binding);
-                    if (!include_expert_jobs || (!binding.projection_source_owner && !binding.native_source))
-                        throw std::invalid_argument("Static GPU preparation requires its original source owner and explicit expert work");
+                    if (!binding.projection_source_owner && !binding.native_source)
+                        throw std::invalid_argument("Static GPU preparation requires its original source owner");
                 }
-                else if (binding.cpu_joint_source)
+                else if (binding.joint_source)
                 {
                     (void)ExpertGemmRegistry::staticProjectionScope(binding);
                     if (!binding.native_source && (!include_expert_jobs || !binding.projection_source_owner))
@@ -1081,7 +1087,7 @@ namespace llaminar2
         const WeightRequirement &requirement,const std::string &name)
     {
         if(!requirement.target_device.is_gpu() || !requirement.lookup_device || !requirement.lookup_device->is_cpu() ||
-            requirement.cpu_joint_source || requirement.role==WeightRole::ImmutableRowTable)
+            requirement.joint_source || requirement.role==WeightRole::ImmutableRowTable)
             throw std::invalid_argument("GPU preparation requires its declared original host-source lookup purpose");
         std::shared_ptr<TensorBase> source;
         if(requirement.bypass_tensor_parallel)source=getReplicatedWeight(name,requirement.target_device);
@@ -2455,8 +2461,8 @@ namespace llaminar2
         if (!source.matrix_count || source.range.original_expert >= outer ||
             source.matrix_count > outer-source.range.original_expert)
             throw std::invalid_argument("CPU source population exceeds its original outer extent");
-        if (original.cpu_joint_source) {
-            const auto &member = original.cpu_joint_source->participant();
+        if (original.joint_source) {
+            const auto &member = original.joint_source->participant();
             if (member.world_rank != memory->worldRank() || original.residency.home_device != member.device ||
                 placement != CPUStoragePlacement::onNode(member.address.numa_node))
                 throw std::invalid_argument("CPU source population changed original retained member placement");
@@ -2482,9 +2488,9 @@ namespace llaminar2
             }
             if (!retained->identity.sameSourceDefinition(original.identity) || retained->slice != original.slice ||
                 retained->native_source != original.native_source || retained->projection_ownership != original.projection_ownership ||
-                bool(retained->cpu_joint_source) != bool(original.cpu_joint_source) ||
-                (original.cpu_joint_source && (*retained->cpu_joint_source != *original.cpu_joint_source ||
-                    retained->cpu_joint_source->cohort() != original.cpu_joint_source->cohort())) ||
+                bool(retained->joint_source) != bool(original.joint_source) ||
+                (original.joint_source && (*retained->joint_source != *original.joint_source ||
+                    retained->joint_source->cohort() != original.joint_source->cohort())) ||
                 !retained->tensor || retained->tensor_owner.get() != retained->tensor ||
                 retained->tensor->native_type() != expected_type || retained->tensor->home_device() != original.residency.home_device ||
                 retained->floating_operand_precision != source.operand_precision || !retained->prepared ||
@@ -2498,7 +2504,7 @@ namespace llaminar2
             }
             return *retained;
         }
-        if (!original.cpu_joint_source && isRoutedExpertRole(original.identity.role)) {
+        if (!original.joint_source && isRoutedExpertRole(original.identity.role)) {
             const auto role = original.identity.role==WeightRole::MoEExpertGate ? ExpertGemmRegistry::WeightRole::GATE :
                 original.identity.role==WeightRole::MoEExpertUp ? ExpertGemmRegistry::WeightRole::UP : ExpertGemmRegistry::WeightRole::DOWN;
             auto *existing = original.identity.overlay_domain.empty() ?
@@ -2562,7 +2568,7 @@ namespace llaminar2
     {
         const auto role = requirement.role == WeightRole::Other ? inferWeightRole(requirement.canonical_name) : requirement.role;
         memory_owner = resolveCPUWeightRequirementOwner(requirement, memory_owner);
-        const auto selected = requirement.cpu_joint_source;
+        const auto selected = requirement.joint_source;
         const auto parent_id = stableMaterializedBindingId(requirement,strategy);
         if (selected) {
             const auto memory = physicalMemoryAuthority();
@@ -2571,8 +2577,8 @@ namespace llaminar2
                 memory_owner != PhysicalMemoryOwner::RoutedExpertWeights || weight_precision_ != WeightPrecision::NATIVE)
                 throw std::invalid_argument("Retained CPU projection changed its original source/placement/native purpose");
             if (existing) {
-                if (!existing->cpu_joint_source || *existing->cpu_joint_source != *selected ||
-                    existing->cpu_joint_source->cohort() != selected->cohort())
+                if (!existing->joint_source || *existing->joint_source != *selected ||
+                    existing->joint_source->cohort() != selected->cohort())
                     throw std::invalid_argument("Retained CPU projection replaced its original selection owner");
                 size_t count = 0;
                 for (const auto &source : existing->sources) if (source.identity.role == requirement.role) {
@@ -2623,7 +2629,7 @@ namespace llaminar2
                 original_tied_source == &requirement || original_tied_source->canonical_name != name ||
                 original_tied_source->target_device != requirement.target_device ||
                 original_tied_source->derivation == WeightDerivationKind::TiedAlias ||
-                original_tied_source->cpu_joint_source || original_tied_source->projection_ownership ||
+                original_tied_source->joint_source || original_tied_source->projection_ownership ||
                 (!original_tied_source->source_name.empty() && original_tied_source->source_name != name))
                 throw std::invalid_argument("CPU tied alias changed its original plan source/selection");
             const auto source_role=original_tied_source->role==WeightRole::Other
@@ -2714,7 +2720,7 @@ namespace llaminar2
             }
             original.slice.inner_is_presliced = true;
             original.projection_ownership = requirement.projection_ownership;
-            original.cpu_joint_source = selected;
+            original.joint_source = selected;
             original.residency.home_device = requirement.target_device;
             original.residency.resident_device = requirement.target_device;
             original.residency.host_policy = requirement.host_policy;
@@ -2764,7 +2770,7 @@ namespace llaminar2
                         retained->floating_operand_precision!=operand || !retained->immutable ||
                         retained->residency.host_policy!=original.residency.host_policy ||
                         retained->residency.raw_host_data_available!=original.residency.raw_host_data_available ||
-                        retained->projection_ownership!=original.projection_ownership || retained->cpu_joint_source ||
+                        retained->projection_ownership!=original.projection_ownership || retained->joint_source ||
                         !engine || !engine->weights_converted() ||
                         engine->get_n()!=int(projection.finalRows()) || engine->get_k()!=int(projection.finalColumns()))
                         throw std::invalid_argument("CPU tied alias replaced its original committed final owner");
@@ -2915,23 +2921,23 @@ namespace llaminar2
         const auto tp_config = tensorParallelConfig();
         ModelWeightSetBuilder builder(plan.strategy());
         const auto source_budget = configuredNativeWeightLoadStagingBudgetBytes();
-        using JointSnapshot=std::pair<std::shared_ptr<const CPUExpertShardSourceSelection>,
+        using JointSnapshot=std::pair<std::shared_ptr<const ExpertShardSourceSelection>,
             std::optional<ExpertGemmRegistry::StaticProjectionLayer>>;
         std::vector<JointSnapshot> joint_snapshots;
         // Capture complete prior publications before loading any new role. A
         // partially failed layer is fatal, never an invitation to retry/merge.
-        for(const auto &requirement:plan.requirements())if(requirement.cpu_joint_source) {
-            const auto selected=requirement.cpu_joint_source;
+        for(const auto &requirement:plan.requirements())if(requirement.target_device.is_cpu() && requirement.joint_source) {
+            const auto selected=requirement.joint_source;
             if(std::none_of(joint_snapshots.begin(),joint_snapshots.end(),
                 [&](const auto &entry){return *entry.first==*selected;}))
-                joint_snapshots.emplace_back(selected,expert_gemm_registry_.acquireCPUJointLayer(
+                joint_snapshots.emplace_back(selected,expert_gemm_registry_.acquireJointLayer(
                     plan.strategy().model_id,selected->participant(),selected->layer()));
         }
 
         size_t expected_cpu_experts = 0, retained_cpu_experts = 0;
         for (const auto &requirement : plan.requirements()) {
             const auto role = requirement.role==WeightRole::Other ? inferWeightRole(requirement.canonical_name) : requirement.role;
-            if (!requirement.target_device.is_cpu() || requirement.cpu_joint_source || !isRoutedExpertRole(role)) continue;
+            if (!requirement.target_device.is_cpu() || requirement.joint_source || !isRoutedExpertRole(role)) continue;
             const auto &name = requirement.source_name.empty()?requirement.canonical_name:requirement.source_name;
             if (!loader_.hasTensor(name)) {
                 if (!requirement.required) continue;
@@ -2963,10 +2969,10 @@ namespace llaminar2
         {
             if (requirement.target_device.is_cpu() && requirement.role != WeightRole::ImmutableRowTable) {
                 const ExpertGemmRegistry::StaticProjectionLayer *existing = nullptr;
-                if (requirement.cpu_joint_source) {
+                if (requirement.joint_source) {
                     const auto found = std::find_if(joint_snapshots.begin(),joint_snapshots.end(),
-                        [&](const auto &entry) { return *entry.first == *requirement.cpu_joint_source &&
-                            entry.first->cohort() == requirement.cpu_joint_source->cohort(); });
+                        [&](const auto &entry) { return *entry.first == *requirement.joint_source &&
+                            entry.first->cohort() == requirement.joint_source->cohort(); });
                     if (found == joint_snapshots.end()) throw std::logic_error("Original CPU source snapshot is absent");
                     if (found->second) existing = &*found->second;
                 }
@@ -2998,8 +3004,9 @@ namespace llaminar2
             {
                 if (weight_precision_ != WeightPrecision::NATIVE)
                     throw std::invalid_argument("Static expert projection requires original native weights, without conversion");
-                tensor = loader_.loadTensorExpertProjectionSlice(
-                    load_name, requirement.slice, lookup_device, WeightPrecision::NATIVE);
+                tensor = BoundedGPUExpertSource::declare(loader_, load_name,
+                    projectNativeWeightSource(requirement, loader_.nativeWeightSourceGeometry(load_name)),
+                    requirement.target_device);
                 const std::vector<size_t> expected{requirement.slice.row_count,
                     requirement.slice.col_count, requirement.slice.expert_count};
                 if (!tensor || tensor->shape() != expected)
@@ -3145,7 +3152,7 @@ namespace llaminar2
 
             binding.slice = requirement.slice;
             binding.projection_ownership = requirement.projection_ownership;
-            binding.cpu_joint_source = requirement.cpu_joint_source;
+            binding.joint_source = requirement.joint_source;
             binding.residency.home_device = requirement.target_device;
             binding.residency.resident_device = requirement.target_device;
             binding.residency.host_policy = requirement.host_policy;
@@ -4529,7 +4536,7 @@ namespace llaminar2
             int registered = 0;
             std::vector<std::pair<ExpertGemmRegistry::ParticipantLayerScope,std::vector<WeightBinding>>> joint_layers;
             for(const auto& binding:frozen_weights.bindings()) {
-                if(!binding.cpu_joint_source || !bindingTargetsDevice(binding,device))continue;
+                if(!binding.joint_source || !bindingTargetsDevice(binding,device))continue;
                 const auto scope=ExpertGemmRegistry::staticProjectionScope(binding);
                 auto found=std::find_if(joint_layers.begin(),joint_layers.end(),[&](const auto& layer){return layer.first==scope;});
                 if(found==joint_layers.end()){joint_layers.push_back({scope,{}});found=joint_layers.end()-1;}
@@ -4564,7 +4571,7 @@ namespace llaminar2
 
             for (const auto &binding : frozen_weights.bindings())
             {
-                if(binding.cpu_joint_source)continue;
+                if(binding.joint_source)continue;
                 if (!shouldPrepareFrozenGemmBinding(*this, binding, device, include_expert_jobs))
                     continue;
                 const PreparedWeightKind expected_kind =
@@ -5883,7 +5890,7 @@ namespace llaminar2
         std::vector<MoEOverlayCpuPreparationGroup> groups;
         for (const auto &request : preparation_plan.requests())
         {
-            if (!request.device.is_cpu() || request.cpu_joint_source ||
+            if (!request.device.is_cpu() || request.joint_source ||
                 request.role != ExpertGemmRegistry::WeightRole::GATE)
             {
                 continue;
@@ -5924,7 +5931,7 @@ namespace llaminar2
             }
         }
         const bool has_joint_cpu = std::any_of(preparation_plan.requests().begin(), preparation_plan.requests().end(),
-            [](const auto &request) { return request.device.is_cpu() && bool(request.cpu_joint_source); });
+            [](const auto &request) { return request.device.is_cpu() && bool(request.joint_source); });
         const bool has_empty_cpu = std::any_of(groups.begin(), groups.end(), [](const auto &group) {
             return group.existing == MoEOverlayCpuPreparationState::Empty;
         });
@@ -5972,7 +5979,7 @@ namespace llaminar2
             std::vector<unsigned> selected_roles(groups.size(), 0u);
             for (const auto &requirement : declared.requirements()) {
                 if (!requirement.target_device.is_cpu()) continue;
-                if (requirement.cpu_joint_source) {
+                if (requirement.joint_source) {
                     cpu_sources.add(requirement);
                     continue;
                 }
@@ -6007,14 +6014,14 @@ namespace llaminar2
         if (preparation_plan.hasCpuRoutedAssignments())
         {
             const bool has_joint=std::any_of(preparation_plan.requests().begin(),preparation_plan.requests().end(),
-                [](const auto& request){return bool(request.cpu_joint_source);});
+                [](const auto& request){return request.device.is_cpu() && bool(request.joint_source);});
             if(has_joint) {
                 if(!original_cpu_sources)throw std::invalid_argument("CPU projection preparation requires original frozen source bindings");
                 const auto matrices=original_cpu_sources->projectedExpertMatrices();
                 std::vector<WeightBinding> joint_sources;
                 for(const auto& source:matrices.bindings()) {
-                    if(!source.cpu_joint_source)continue;
-                    if(*preparation_plan.cpuShardSourceFor(source.identity.layer,source.cpu_joint_source->participant())!=*source.cpu_joint_source)
+                    if(!source.joint_source)continue;
+                    if(*preparation_plan.shardSourceFor(source.identity.layer,source.joint_source->participant())!=*source.joint_source)
                         throw std::invalid_argument("CPU joint preparation changed its frozen source selection");
                     joint_sources.push_back(source);
                 }
@@ -6240,6 +6247,7 @@ namespace llaminar2
             /** Complete source/partition identity, never inferred from the smaller physical N. */
             std::optional<MoEExpertProjectionOwnership> projection_ownership;
             std::optional<WeightBinding> static_source = std::nullopt; ///< Exact marked view; no domain/device alias is published.
+            GPUPreparedWeightPoolLayout pool_layout = GPUPreparedWeightPoolLayout::SourceNative; ///< Same physical stride policy for planning, repacking and engine binding.
         };
         std::vector<MoEExpertJob> moe_jobs;
         size_t moe_jobs_already_satisfied = 0;
@@ -6262,32 +6270,74 @@ namespace llaminar2
             ExpertGemmRegistry::ParticipantLayerScope scope;
             MoEExpertProjectionOwnership projection;
             std::vector<WeightBinding> sources;
+            GPUPreparedWeightPoolLayout pool_layout;
         };
         std::vector<StaticLayerSources> static_layers;
+        // Index the immutable declarations once. A linear request scan for
+        // every matrix would make full-model fragment preparation quadratic.
+        using StaticRequestKey = std::tuple<std::string, DeviceId, int, int, int, int,
+            ExpertGemmRegistry::WeightRole>;
+        std::map<StaticRequestKey, const MoEExpertOverlayPreparationRequest *> unmatched_static_requests;
+        bool ordinary_overlay_requests = false;
+        if (include_expert_jobs && overlay_preparation_plan)
+            for (const auto &request : overlay_preparation_plan->requests())
+                if (request.device == target_device)
+                {
+                    if (request.projection_ownership && !request.projection_ownership->hasMovableProjectionSet())
+                    {
+                        const StaticRequestKey key{request.domain_name, request.device, request.participant_world_rank,
+                            request.participant_index, request.layer, request.expert_id, request.role};
+                        if (!unmatched_static_requests.emplace(key, &request).second)
+                            throw std::invalid_argument("Static preparation repeats an original fragment request");
+                    }
+                    else
+                        ordinary_overlay_requests = true;
+                }
         if (frozen_weights && include_expert_jobs)
         {
             for (const auto &binding : frozen_weights->bindings())
             {
                 if (!binding.projection_ownership || !bindingTargetsDevice(binding, target_device)) continue;
-                if (overlay_preparation_plan) {
-                    if(!binding.cpu_joint_source ||
-                       *overlay_preparation_plan->cpuShardSourceFor(binding.identity.layer,
-                           binding.cpu_joint_source->participant())!=*binding.cpu_joint_source)
-                        throw std::invalid_argument("Static source lacks its exact original CPU joint preparation selection");
+                const auto scope = ExpertGemmRegistry::staticProjectionScope(binding);
+                auto pool_layout = GPUPreparedWeightPoolLayout::SourceNative;
+                if (overlay_preparation_plan)
+                {
+                    const auto role = binding.identity.role == WeightRole::MoEExpertGate
+                        ? ExpertGemmRegistry::WeightRole::GATE
+                        : binding.identity.role == WeightRole::MoEExpertUp
+                            ? ExpertGemmRegistry::WeightRole::UP : ExpertGemmRegistry::WeightRole::DOWN;
+                    if (binding.identity.role != WeightRole::MoEExpertGate &&
+                        binding.identity.role != WeightRole::MoEExpertUp &&
+                        binding.identity.role != WeightRole::MoEExpertDown)
+                        throw std::invalid_argument("Static source has no routed expert projection role");
+                    const StaticRequestKey key{scope.domain_name, scope.device, scope.participant_world_rank,
+                        scope.participant_index, scope.layer, binding.identity.expert, role};
+                    const auto found = unmatched_static_requests.find(key);
+                    const auto *request = found == unmatched_static_requests.end() ? nullptr : found->second;
+                    if (!request || request->projection_ownership != binding.projection_ownership ||
+                        bool(request->joint_source) != bool(binding.joint_source) ||
+                        (binding.joint_source &&
+                         *request->joint_source != *binding.joint_source))
+                        throw std::invalid_argument("Static source lacks its exact original fragment preparation request");
+                    pool_layout = request->gpuPoolLayout();
+                    unmatched_static_requests.erase(found);
                 }
                 if (layer_filter && !layer_filter(binding.identity.canonical_name))
                     throw std::invalid_argument("Static source declarations must be filtered as complete participant layers");
-                const auto scope = ExpertGemmRegistry::staticProjectionScope(binding);
                 auto found = std::find_if(static_layers.begin(), static_layers.end(), [&](const auto &layer) {
                     return layer.scope == scope;
                 });
                 if (found == static_layers.end())
                 {
-                    static_layers.push_back({scope, *binding.projection_ownership, {}});
+                    static_layers.push_back({scope, *binding.projection_ownership, {}, pool_layout});
                     found = static_layers.end() - 1;
                 }
+                if (found->pool_layout != pool_layout)
+                    throw std::invalid_argument("One original expert fragment bank declares conflicting pool layouts");
                 found->sources.push_back(binding);
             }
+            if (!unmatched_static_requests.empty())
+                throw std::invalid_argument("Static preparation omitted an original fragment request");
             for (const auto &layer : static_layers)
             {
                 const auto existing = expert_gemm_registry_.acquireStaticProjectionLayer(
@@ -6307,7 +6357,7 @@ namespace llaminar2
                     moe_jobs.push_back({layer.scope.layer, source.identity.expert, role, slot,
                         layer.scope.domain_name, {}, -1, layer.scope.participant_world_rank, layer.scope.participant_index,
                         source.projection_source_owner.get(), source.projection_source_owner,
-                        source.tensor_owner, source.projection_ownership, source});
+                        source.tensor_owner, source.projection_ownership, source, layer.pool_layout});
                 }
             }
         }
@@ -6409,8 +6459,7 @@ namespace llaminar2
                     add_moe_parent(name, tensor, tensor.get(), full_slice);
                 }
             }
-            else if (!collected_from_frozen && overlay_preparation_plan &&
-                     overlay_preparation_plan->hasRequestsForDevice(target_device))
+            else if (!collected_from_frozen && ordinary_overlay_requests)
             {
                 LOG_ERROR("[WeightManager] GPU overlay preparation for "
                           << target_device.to_string()
@@ -6423,7 +6472,8 @@ namespace llaminar2
             // cannot silently certify a model with missing prepared experts.
             if (overlay_preparation_plan)
                 for (const auto &request : overlay_preparation_plan->requests())
-                    if (request.device == target_device)
+                    if (request.device == target_device &&
+                        (!request.projection_ownership || request.projection_ownership->hasMovableProjectionSet()))
                         moe_layers.try_emplace(request.layer);
 
             // Compile each projection independently. A fixed down bank covers
@@ -6618,7 +6668,9 @@ namespace llaminar2
                                             participant_world_rank, participant_index,
                                             rt.source->tensor,
                                             rt.source->owner,
-                                            std::move(view), projection});
+                                            std::move(view), projection, std::nullopt,
+                                            overlay_preparation_plan ? GPUPreparedWeightPoolLayout::MigrationReusable
+                                                                     : GPUPreparedWeightPoolLayout::SourceNative});
                     }
                 }
 
@@ -6720,8 +6772,8 @@ namespace llaminar2
         // early release and replace the frozen graph's physical source identity.
         for (const auto &dense_job : gemm_weights)
         {
-            if (!dense_job.tensor || dense_job.tensor->is_raw_data_released() ||
-                dense_job.tensor->size_bytes() == 0 || dense_job.tensor->raw_data() == nullptr)
+            if (!dense_job.tensor || (!boundedGPUWeightSource(*dense_job.tensor) &&
+                (dense_job.tensor->is_raw_data_released() || dense_job.tensor->size_bytes() == 0 || dense_job.tensor->raw_data() == nullptr)))
             {
                 throw std::runtime_error(
                     "[WeightManager] GPU preparation requires a live immutable source for '" +
@@ -6792,8 +6844,8 @@ namespace llaminar2
             if (!tensor)
                 continue;
 
-            auto *unpackable = dynamic_cast<IINT8Unpackable *>(tensor);
-            const NativeQuantisedFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            const auto *bounded = boundedGPUWeightSource(*tensor);
+            const NativeQuantisedFormatInfo *vnni = gpuWeightSourceFormat(*tensor);
             if (!vnni)
             {
                 // Floating-point types (FP32, FP16, BF16) don't use VNNI repack —
@@ -6820,7 +6872,7 @@ namespace llaminar2
 
             const int N = static_cast<int>(tensor->rows());
             const int K = static_cast<int>(tensor->cols());
-            const size_t raw_bytes = tensor->size_bytes();
+            const size_t raw_bytes = bounded ? bounded->sourceBytes() : tensor->size_bytes();
 
             orchestrator->planWeight(target_device.ordinal, name, N, K,
                                      vnni->payload_bytes, canonicalDeviceVnniFormat(*vnni).is_asymmetric,
@@ -6856,8 +6908,8 @@ namespace llaminar2
         for (size_t semantic_index = 0; semantic_index < moe_jobs.size(); ++semantic_index)
         {
             const auto &mj = moe_jobs[semantic_index];
-            auto *unpackable = dynamic_cast<IINT8Unpackable *>(mj.view.get());
-            const NativeQuantisedFormatInfo *vnni = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            const NativeQuantisedFormatInfo *vnni = gpuWeightSourceFormat(*mj.view);
+            const auto *bounded = dynamic_cast<const BoundedGPUExpertSource *>(mj.view.get());
             WeightJob logical_job;
             logical_job.name = mj.slot_name;
             logical_job.host_raw_data = mj.view ? mj.view->raw_data() : nullptr;
@@ -6870,7 +6922,7 @@ namespace llaminar2
                 const auto type = mj.view->native_type();
                 if (type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16)
                 {
-                    logical_job.raw_bytes = mj.view->size_bytes();
+                    logical_job.raw_bytes = bounded ? bounded->sourceBytes() : mj.view->size_bytes();
                     logical_job.format = RepackFormat::RAW_FP;
                     logical_job.N = static_cast<int>(mj.view->rows());
                     logical_job.K = static_cast<int>(mj.view->cols());
@@ -6910,29 +6962,23 @@ namespace llaminar2
                 }
 #endif
 
-                logical_job.raw_bytes = quantizedViewRawBytes(*mj.view);
+                logical_job.raw_bytes = bounded ? bounded->sourceBytes() : quantizedViewRawBytes(*mj.view);
                 logical_job.format = *repack_format;
                 logical_job.N = static_cast<int>(mj.view->rows());
                 logical_job.K = static_cast<int>(mj.view->cols());
                 logical_job.is_asymmetric = canonicalDeviceVnniFormat(*vnni).is_asymmetric;
-                const auto allocation = overlay_preparation_plan
-                                            ? reusableDeviceVnniAllocationFormat(
-                                                  *vnni)
-                                            : NativeQuantisedReusableDeviceAllocationFormat{
-                                                  .payload_bytes_per_block =
-                                                      static_cast<uint8_t>(
-                                                          vnni->payload_bytes),
-                                                  .has_mins =
-                                                      canonicalDeviceVnniFormat(*vnni).is_asymmetric,
-                                                  .has_emins =
-                                                      vnni->has_emins,
-                                              };
+                const auto allocation = gpuPreparedWeightPoolAllocation(*vnni, mj.pool_layout);
                 logical_job.packed_payload_capacity_bytes_per_block =
                     allocation.payload_bytes_per_block;
                 moe_vnni_infos.push_back(vnni);
             }
 
-            if (!logical_job.host_raw_data || logical_job.raw_bytes == 0)
+            if (bounded)
+            {
+                logical_job.bounded_source = bounded->source();
+                logical_job.source_offset_bytes = bounded->sourceOffset();
+            }
+            if ((!logical_job.host_raw_data && !logical_job.bounded_source) || logical_job.raw_bytes == 0)
             {
                 ++moe_jobs_without_raw_source;
                 continue;
@@ -6994,18 +7040,11 @@ namespace llaminar2
                 const auto *vnni = moe_vnni_infos[first_semantic_index];
                 if (vnni)
                 {
-                    const auto allocation = overlay_preparation_plan
-                                                ? reusableDeviceVnniAllocationFormat(
-                                                      *vnni)
-                                                : NativeQuantisedReusableDeviceAllocationFormat{
-                                                      .payload_bytes_per_block =
-                                                          static_cast<uint8_t>(
-                                                              vnni->payload_bytes),
-                                                      .has_mins =
-                                                          canonicalDeviceVnniFormat(*vnni).is_asymmetric,
-                                                      .has_emins =
-                                                          vnni->has_emins,
-                                                  };
+                    const auto layout = moe_jobs[first_semantic_index].pool_layout;
+                    for (const auto &member : run.members)
+                        if (moe_jobs[moe_logical_to_semantic.at(member.source_job_index)].pool_layout != layout)
+                            throw std::logic_error("Coalesced MoE sources changed their physical pool layout");
+                    const auto allocation = gpuPreparedWeightPoolAllocation(*vnni, layout);
                     if (run.job
                             .packed_payload_capacity_bytes_per_block !=
                         allocation.payload_bytes_per_block)
@@ -7267,8 +7306,18 @@ namespace llaminar2
 
             WeightJob job;
             job.name = name;
-            job.host_raw_data = tensor->raw_data();
-            job.raw_bytes = tensor->size_bytes();
+            if (const auto *bounded = boundedGPUWeightSource(*tensor))
+            {
+                job.bounded_source = bounded->source();
+                job.source_offset_bytes = bounded->sourceOffset();
+                job.columns = bounded->columns();
+                job.raw_bytes = bounded->sourceBytes();
+            }
+            else
+            {
+                job.host_raw_data = tensor->raw_data();
+                job.raw_bytes = tensor->size_bytes();
+            }
             job.format = *repack_fmt;
             job.N = static_cast<int>(tensor->rows());
             job.K = static_cast<int>(tensor->cols());
@@ -7331,7 +7380,7 @@ namespace llaminar2
             if (!tensor || !kernel)
                 return false;
 
-            const bool quantized = hasVnniPackedQuantizedPayload(tensor);
+            const bool quantized = gpuWeightSourceFormat(*tensor) != nullptr;
             KernelFactory::GemmPreparationKind resolved_kind = quantized
                                                                    ? (target_device.is_cuda()   ? KernelFactory::GemmPreparationKind::CUDA_INT8_PACKED
                                                                       : target_device.is_rocm() ? KernelFactory::GemmPreparationKind::ROCM_INT8_PACKED
@@ -7467,9 +7516,7 @@ namespace llaminar2
             std::shared_ptr<ITensorGemm> kernel(
                 llaminar::v2::kernels::KernelFactory::createGemmFromGPUWeightPool(
                     *mj.view, target_device, orchestrator, storage.slot_name,
-                    static_cast<size_t>(storage.row_offset), overlay_preparation_plan
-                        ? GPUPreparedWeightPoolLayout::MigrationReusable
-                        : GPUPreparedWeightPoolLayout::SourceNative));
+                    static_cast<size_t>(storage.row_offset), mj.pool_layout));
 
             if (kernel)
             {
@@ -9389,24 +9436,8 @@ namespace llaminar2
             name, col_start, col_start + col_count, device, WeightPrecision::NATIVE));
 
         if (!slice_tensor)
-        {
-            LOG_DEBUG("[WeightManager] Native input-parallel column slice unavailable for " << name
-                                                                                           << " cols [" << col_start
-                                                                                           << ", " << (col_start + col_count)
-                                                                                           << "); falling back to FP32 slice");
-
-            // Some quantized GGUF formats require column slices to start and end on
-            // their packed block boundary. A 4-way TP shard can be narrower than
-            // that block (for example 128 columns from an IQ3_S 256-column block),
-            // so we dequantize once on the host and copy the exact logical columns.
-            auto full_fp32_tensor = loader_.loadTensor(name, DeviceId::cpu(), WeightPrecision::CONVERT_TO_FP32);
-            if (!full_fp32_tensor)
-            {
-                throw std::runtime_error("[WeightManager] Failed to load FP32 fallback for input-parallel: " + name);
-            }
-
-            slice_tensor = sliceColumnRange(full_fp32_tensor, col_start, col_count);
-        }
+            throw std::runtime_error("[WeightManager] Native input-parallel source cannot represent logical columns [" +
+                std::to_string(col_start) + "," + std::to_string(col_start + col_count) + ") for " + name);
 
         // Input-parallel uses row-parallel metadata (mathematically similar but with column slicing)
         auto meta = SliceMetadata::forRowParallel(

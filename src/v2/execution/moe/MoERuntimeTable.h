@@ -6,11 +6,15 @@
  * never owns the fixed down-column bank; its typed payload contract is distinct
  * from the complete-expert contract used by ordinary grouped execution.
  * Tables own compact storage for an immutable global model-layer interval;
- * reset and prefix restore preserve that stage identity.
+ * reset and prefix restore preserve that stage identity. GPU fragment tables
+ * bind original cohort/member/F geometry separately from mutable residency;
+ * a fragment never acquires a whole-expert owner or a replica bitmask.
  */
 
 #pragma once
 #include "MoEOverlayRouteTarget.h"
+#include "DeviceMoEIntermediateShardBinding.h"
+#include "DeviceMoEExpertFlags.h"
 
 #include "DeviceMoEOverlayEpochABI.h"
 #include "DeviceMoEOverlayServiceTelemetry.h"
@@ -42,6 +46,7 @@ namespace llaminar2
     class DeviceMoEOverlayEpochArena;
     class MoEOverlayEconomyCalibrationLayerCatalog;
     class MoEOverlayFixedDownProjectionBank;
+    class MoEOverlayFragmentFamily;
     using DeviceMoERuntimeHistogramBank =
         moe_runtime_abi::DeviceMoERuntimeHistogramBank;
     using RuntimeExpertHistogramSourceMask =
@@ -116,43 +121,6 @@ namespace llaminar2
     inline constexpr uint32_t kDeviceMoEMaxTransferSlots = 0x7fffffffu;
     inline constexpr uint32_t kDeviceMoEMaxTopK = 16;
     inline constexpr uint32_t kDeviceMoEMaxParticipants = 8;
-
-    enum class DeviceMoEExpertFlags : uint32_t
-    {
-        None = 0,
-        Valid = 1u << 0,
-        Resident = 1u << 1,
-        Replicated = 1u << 2,
-        PreferredOwner = 1u << 3,
-        LocalCompute = 1u << 4,
-        TransferSlot = 1u << 5,
-    };
-
-    constexpr DeviceMoEExpertFlags operator|(DeviceMoEExpertFlags lhs, DeviceMoEExpertFlags rhs) noexcept
-    {
-        return static_cast<DeviceMoEExpertFlags>(static_cast<uint32_t>(lhs) | static_cast<uint32_t>(rhs));
-    }
-
-    constexpr DeviceMoEExpertFlags operator&(DeviceMoEExpertFlags lhs, DeviceMoEExpertFlags rhs) noexcept
-    {
-        return static_cast<DeviceMoEExpertFlags>(static_cast<uint32_t>(lhs) & static_cast<uint32_t>(rhs));
-    }
-
-    constexpr DeviceMoEExpertFlags &operator|=(DeviceMoEExpertFlags &lhs, DeviceMoEExpertFlags rhs) noexcept
-    {
-        lhs = lhs | rhs;
-        return lhs;
-    }
-
-    constexpr uint32_t toMoEExpertFlags(DeviceMoEExpertFlags flags) noexcept
-    {
-        return static_cast<uint32_t>(flags);
-    }
-
-    constexpr bool hasMoEExpertFlag(uint32_t flags, DeviceMoEExpertFlags flag) noexcept
-    {
-        return (flags & static_cast<uint32_t>(flag)) != 0;
-    }
 
     enum class DeviceMoEReplicaRole : uint8_t
     {
@@ -394,7 +362,11 @@ namespace llaminar2
          * without a host copy, synchronization, or shadow lifecycle.
          */
         const DeviceMoEOverlayEpochStatus *overlay_epoch_status = nullptr;
+        /** Original local F geometry; current membership remains in the acquired bank. */
+        DeviceMoEIntermediateShardBinding intermediate_shard;
     };
+    static_assert(offsetof(DeviceMoELayerRuntime, intermediate_shard) ==
+                  moe_runtime_abi::kIntermediateShardBindingOffset);
 
     static_assert(std::is_trivially_copyable_v<DeviceMoEExpertDescriptor>);
     static_assert(
@@ -735,6 +707,8 @@ namespace llaminar2
         uint8_t local_compute = 0;
         uint8_t replica_role = static_cast<uint8_t>(DeviceMoEReplicaRole::None);
         uint32_t resident_participant_mask = 0;
+        /** Exact global whole/cohort target from the captured placement bank. */
+        int32_t overlay_route_participant = -1;
     };
 
     struct DeviceMoEPortableLayerRuntimeState
@@ -850,6 +824,12 @@ namespace llaminar2
             int top_k = 0;
             int token_capacity = 0;
         };
+
+        /** @brief Exact existing ten-buffer payload for cold PMA BOM construction.
+         * @param config Same validated geometry consumed by materialization.
+         * @return Requested bytes without allocating/querying a device.
+         * @throws std::invalid_argument For incomplete or overflowing geometry. */
+        static size_t plannedAllocationBytes(const Config& config);
 
         explicit DeviceMoESerialRouteScratchArena(Config config);
         ~DeviceMoESerialRouteScratchArena();
@@ -1242,16 +1222,43 @@ namespace llaminar2
             /**
              * @brief Immutable fixed down slices for projection-distributed execution.
              *
-             * Empty means complete-expert execution. Otherwise exactly one
+             * Empty leaves complete-expert or fragment-family execution. Otherwise exactly one
              * authenticated bank per layer is required. Their geometry defines
              * the movable family; there is no independent policy flag that can
              * admit gate/up payloads without the fixed down lifetimes. Reset,
              * prefix restore and placement epochs cannot replace these banks.
              */
             std::vector<std::shared_ptr<const MoEOverlayFixedDownProjectionBank>> fixed_down_banks;
+            /**
+             * Original closed GPU fragment family for every represented layer.
+             * This is mutually exclusive with fixed_down_banks. It retains cold
+             * source identity only, not initial-bank readers or weight allocations.
+             * Current expert membership belongs exclusively to placement banks.
+             */
+            std::vector<std::shared_ptr<const MoEOverlayFragmentFamily>> fragment_families;
             /** First global model layer represented by the compact table. */
             int first_model_layer = 0;
         };
+
+        /** @brief Canonical private prepared-service table geometry, not an allocation grant. */
+        struct PreparedServiceStorageGeometry {
+            size_t host_bytes=0; ///< Exact known table, layer templates and pointer/flag roots.
+            size_t device_bytes=0; ///< Original three layer templates and private route scratch.
+        };
+        /** @brief Exact canonical three-template allocation count shared with materialization. */
+        static constexpr size_t kStateTemplateCopies=3;
+        /**
+         * @brief Quote the actual private cold top-k-one fragment service table.
+         * @param device Original GPU metadata; no device query or allocation occurs.
+         * @param experts Complete original expert count, independent of the selected sample.
+         * @param rows Explicit private route-row capacity at top-k one.
+         * @return Exact known one-layer host/device payload for the sole PMA BOM.
+         * @throws std::invalid_argument For invalid geometry.
+         * @note Source-family authentication remains mandatory at materialization;
+         * this size declaration grants no prepared or execution authority.
+         */
+        static PreparedServiceStorageGeometry preparedFragmentServiceStorageGeometry(
+            DeviceId device,int experts,int rows);
 
         explicit DeviceMoERuntimeTable(Config config);
         DeviceMoERuntimeTable(DeviceId device_id,
@@ -1276,10 +1283,14 @@ namespace llaminar2
             (void)fixedDownProjectionBank(layer_idx); // Validate the same layer boundary before indexing.
             return fixed_down_banks_.empty() ? nullptr : fixed_down_banks_[storageIndexForModelLayer(layer_idx)];
         }
+        /** @return Original local family, or null for complete/gate-up execution.
+         *  @throws std::out_of_range For a layer outside this table. */
+        [[nodiscard]] const MoEOverlayFragmentFamily *fragmentFamily(int layer_idx) const;
         /** @return The exact movable family authenticated by the fixed graph binding. */
         [[nodiscard]] DeviceMoEProjectionSet movableProjections() const noexcept
         {
-            return fixed_down_banks_.empty() ? DeviceMoEProjectionSet::CompleteExpert : DeviceMoEProjectionSet::GateUp;
+            return !fragment_families_.empty() ? DeviceMoEProjectionSet::IntermediateShard :
+                fixed_down_banks_.empty() ? DeviceMoEProjectionSet::CompleteExpert : DeviceMoEProjectionSet::GateUp;
         }
 
         DeviceMoELayerRuntime *deviceLayerState(int layer_idx) override;
@@ -1689,6 +1700,8 @@ namespace llaminar2
         DeviceMoERuntimeTable *overlay_placement_source_ = nullptr;
         /** Model lifetime, independent of both placement banks and request snapshots. */
         const std::vector<std::shared_ptr<const MoEOverlayFixedDownProjectionBank>> fixed_down_banks_;
+        /** Original immutable fragment source; never pins an executable placement epoch. */
+        const std::vector<std::shared_ptr<const MoEOverlayFragmentFamily>> fragment_families_;
         std::vector<DeviceMoEPrefillRouteScratchBindings>
             prefill_route_scratch_;
         int32_t *deferred_verifier_route_expert_ids_ = nullptr;
@@ -1720,7 +1733,15 @@ namespace llaminar2
          */
         void validateLayerIndex(int layer_idx) const;
         void validateUpdate(int layer_idx, const MoEPlacementUpdate &update) const;
-        void resetLayer(DeviceMoELayerRuntime &state) const;
+        /** @brief Validate bank semantics independently of the publication epoch.
+         * @param layer_idx Original model layer whose immutable binding is authoritative.
+         * @param update Candidate contents from setup publication or snapshot import.
+         * @throws std::invalid_argument For incomplete ownership, geometry or payload. */
+        void validatePlacementContents(int layer_idx, const MoEPlacementUpdate &update) const;
+        /** @brief Clear request data while restoring this layer's immutable source binding.
+         * @param state Request record, not an authority for model topology.
+         * @param layer_idx Original owned model layer. */
+        void resetLayer(DeviceMoELayerRuntime &state, int layer_idx) const;
         void captureInitialLayerStateIfNeeded(int layer_idx, void *stream);
         bool prefillRouteScratchAllocationHasCapacity(
             const DeviceMoEPrefillRouteScratchBindings &allocation,

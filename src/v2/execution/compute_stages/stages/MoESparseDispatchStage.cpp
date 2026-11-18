@@ -466,7 +466,7 @@ namespace llaminar2
                     LOG_ERROR("[MoESparseDispatchStage] Sparse descriptor lost its original residency epoch");
                     return false;
                 }
-                if (snapshot.ownershipKind() == MoEOverlayResidencyOwnershipKind::CPUJointFragments)
+                if (snapshot.ownershipKind() == MoEOverlayResidencyOwnershipKind::JointFragments)
                 {
                     const auto& owners = snapshot.placementOwnerMap();
                     bool whole = false;

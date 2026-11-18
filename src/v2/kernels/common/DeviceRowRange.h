@@ -164,15 +164,18 @@ namespace llaminar2
         // native collective bindings. Its device method stays forcibly inline.
         [[nodiscard]] __device__ inline __attribute__((always_inline)) int activeRows() const
         {
-            int published = count_ ? *count_ : capacity_;
 #if defined(__HIP_DEVICE_COMPILE__)
-            // This descriptor and its immutable-per-launch publication are
-            // wave-uniform kernel operands. State that fact explicitly: a
-            // generic-pointer load otherwise makes LLVM carry divergent EXEC
-            // masks through every row/format arm, spilling scalar registers.
-            // This is a register broadcast, not another count authority or a
-            // communication/synchronization operation.
-            published = __builtin_amdgcn_readfirstlane(published);
+            // Capacity is already a uniform launch scalar. Broadcast only the
+            // external publication, inside its non-null branch. Broadcasting
+            // after the conditional lets LLVM select count_ or &capacity_,
+            // forcing an enclosing kernarg record into per-thread storage.
+            // This is still a register operation, with the same device owner
+            // and producer edge; it adds no communication or synchronization.
+            int published = capacity_;
+            if (count_)
+                published = __builtin_amdgcn_readfirstlane(*count_);
+#else
+            int published = count_ ? *count_ : capacity_;
 #endif
             const int active = activeRowsFor(published);
             if (active < 0)

@@ -44,7 +44,7 @@ struct CPUJointHostGraphEndpoint {
         const auto endpoint=residency.endpoint(local.runtime_participant_index);
         if(!endpoint || !endpoint->device().is_cpu())
             throw std::invalid_argument("CPU joint continuation lost its original prepared endpoint");
-        const auto frame=adoptMoEOverlayCPUJointGraphDeclaration(residency,registry,model,
+        const auto frame=adoptMoEOverlayJointGraphDeclaration(residency,registry,model,
             local.runtime_participant_index,local.layer_idx,local.num_experts,local.d_model,local.expert_intermediate);
         const auto& geometry=*arena->cpuJointLayout();
         if(!frame || !frame->sourceSelection() ||

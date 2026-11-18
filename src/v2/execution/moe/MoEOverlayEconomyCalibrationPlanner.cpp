@@ -442,7 +442,7 @@ namespace llaminar2
             snapshot->firstModelLayer() != firstModelLayer() ||
             snapshot->layerCount() != static_cast<int>(layerCount()))
             throw std::invalid_argument("Target expansion requires the original sealed cohort source and exact layer interval");
-        if (snapshot->ownershipKind() != MoEOverlayResidencyOwnershipKind::CPUJointFragments)
+        if (snapshot->ownershipKind() != MoEOverlayResidencyOwnershipKind::JointFragments)
             return expandOriginalMeasurements(measurements, {});
         if (!snapshot->originalProjectionPreparation())
             throw std::invalid_argument("Target expansion lost its original cohort source preparation");
@@ -577,7 +577,7 @@ namespace llaminar2
         {
             const auto target = MoEExpertPlacementTarget::fromPlacement(owner);
             if (!target) throw std::invalid_argument("Calibration source has an incomplete original target");
-            return target->isCohort() ? MoEOverlayRouteTarget::cpuCohort(target->tierIndex())
+            return target->isCohort() ? MoEOverlayRouteTarget::cohort(target->tierIndex())
                                       : MoEOverlayRouteTarget::whole(target->participantId(0));
         }
     }

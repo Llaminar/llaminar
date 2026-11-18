@@ -102,7 +102,7 @@ TEST(CPUJointInitialBankPrepassContract,
     const auto ids = staticJointMembers(original);
     ASSERT_FALSE(ids.empty());
     const auto id = ids.front();
-    const auto *participant = original.preparation->cpuJointOwnerMap()->participantForId(id);
+    const auto *participant = original.preparation->jointOwnerMap()->participantForId(id);
     ASSERT_TRUE(participant);
     InferenceStrategy strategy{.model_id = model};
     WeightPlan full(strategy, PhysicalMemoryOwner::RoutedExpertWeights);
@@ -110,7 +110,7 @@ TEST(CPUJointInitialBankPrepassContract,
     WeightPlan later(strategy, PhysicalMemoryOwner::RoutedExpertWeights);
     for (int layer = 7; layer < 9; ++layer)
     {
-        const auto selection = original.preparation->cpuShardSourceFor(layer, *participant);
+        const auto selection = original.preparation->shardSourceFor(layer, *participant);
         for (const auto role :
              {WeightRole::MoEExpertGate, WeightRole::MoEExpertUp, WeightRole::MoEExpertDown})
         {
@@ -131,7 +131,7 @@ TEST(CPUJointInitialBankPrepassContract,
     size_t final_bytes = 0;
     for (int layer = 7; layer < 9; ++layer)
     {
-        const auto selection = original.preparation->cpuShardSourceFor(layer, *participant);
+        const auto selection = original.preparation->shardSourceFor(layer, *participant);
         for (const auto &projection :
              selection->cohort()->localManifest(selection->participantIndex()).projections)
             final_bytes += selection->expertIds().size() *
@@ -158,24 +158,24 @@ TEST(CPUJointInitialBankPrepassContract,
         manager->expertGemmRegistry(), 7, &error));
     EXPECT_FALSE(banks.endpoint(id)->acquire(1));
     EXPECT_FALSE(banks.allInitialBanksReady());
-    EXPECT_THROW(banks.initialCPUJointLayer(id, 7), std::logic_error);
+    EXPECT_THROW(banks.initialJointLayer(id, 7), std::logic_error);
     ASSERT_EQ(manager->materialize(later).bindings().size(), 1344u);
     ASSERT_TRUE(banks.registerInitialLayerFromPreparedRegistry(
         manager->expertGemmRegistry(), 7, &error)) << error;
     ASSERT_TRUE(banks.allInitialBanksReady());
-    auto first_frame = banks.initialCPUJointLayer(id, 7);
+    auto first_frame = banks.initialJointLayer(id, 7);
     auto first_construction = first_frame->acquireInitialConstruction();
     ASSERT_TRUE(first_construction);
     ASSERT_TRUE(first_construction->containsModelLayer(8));
-    EXPECT_TRUE(first_construction->layerForModelLayer(7).cpu_fragments[71].valid());
-    EXPECT_TRUE(first_construction->layerForModelLayer(8).cpu_fragments[71].valid());
-    const auto later_frame = banks.initialCPUJointLayer(id, 8);
+    EXPECT_TRUE(first_construction->layerForModelLayer(7).fragments[71].valid());
+    EXPECT_TRUE(first_construction->layerForModelLayer(8).fragments[71].valid());
+    const auto later_frame = banks.initialJointLayer(id, 8);
     ASSERT_TRUE(later_frame->acquireInitialConstruction());
     EXPECT_EQ(later_frame->sourceSelection()->layer(), 8);
-    EXPECT_THROW(banks.initialCPUJointLayer(id, 9), std::invalid_argument);
+    EXPECT_THROW(banks.initialJointLayer(id, 9), std::invalid_argument);
     ExpertGemmRegistry foreign;
-    EXPECT_FALSE(banks.registerInitialCPUJointBank(foreign, model, id, &error));
-    EXPECT_FALSE(banks.registerInitialCPUJointBank(manager->expertGemmRegistry(), ModelContextId{1},
+    EXPECT_FALSE(banks.registerInitialJointBank(foreign, model, id, &error));
+    EXPECT_FALSE(banks.registerInitialJointBank(manager->expertGemmRegistry(), ModelContextId{1},
                                                    id, &error));
     // Source lookup entries may retire after the one immutable bank installs.
     // Every retained graph re-entry borrows that actual bank, never rescans all
@@ -184,14 +184,14 @@ TEST(CPUJointInitialBankPrepassContract,
     for (int repeat = 0; repeat < 20; ++repeat)
     {
         ASSERT_TRUE(
-            banks.registerInitialCPUJointBank(manager->expertGemmRegistry(), model, id, &error))
+            banks.registerInitialJointBank(manager->expertGemmRegistry(), model, id, &error))
             << error;
-        EXPECT_EQ(banks.initialCPUJointLayer(id, 7), first_frame);
+        EXPECT_EQ(banks.initialJointLayer(id, 7), first_frame);
     }
     first_construction.reset();
     ASSERT_TRUE(banks.endpoint(id)->retire(1));
     EXPECT_FALSE(first_frame->acquireInitialConstruction());
     EXPECT_FALSE(
-        banks.registerInitialCPUJointBank(manager->expertGemmRegistry(), model, id, &error));
+        banks.registerInitialJointBank(manager->expertGemmRegistry(), model, id, &error));
     EXPECT_NE(error.find("resurrect"), std::string::npos);
 }

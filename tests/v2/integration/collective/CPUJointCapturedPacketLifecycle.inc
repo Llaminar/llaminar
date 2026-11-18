@@ -1161,17 +1161,17 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
         MoEExpertOverlayPreparationPlan::build(*runtime, loader));
     const auto local = preparation->filteredForDevice(DeviceId::cpu());
     requireOriginal(!local.requests().empty(), "original source member requests");
-    const auto selected = local.requests().front().cpu_joint_source;
+    const auto selected = local.requests().front().joint_source;
     requireOriginal(selected && selected->participant().world_rank == rank &&
                         selected->participant().address.numa_node == nodes[rank],
                     "same original source member placement");
     requireOriginal(local.requests().size() == selected->expertIds().size() * 3,
                     "complete original local expert triplet inventory");
     for (const auto &request : local.requests())
-        requireOriginal(request.cpu_joint_source == selected &&
+        requireOriginal(request.joint_source == selected &&
                             request.participant_world_rank == rank,
                         "same original local source selection for every prepared role");
-    const auto owners = preparation->cpuJointOwnerMap();
+    const auto owners = preparation->jointOwnerMap();
     requireOriginal(bool(owners), "original fixed cohort map");
     const auto local_id = selected->participant().participant_id;
     int remote_id = -1;
@@ -1264,10 +1264,10 @@ inline void runOriginal(DeviceId device, PacketPhaseScenario scenario)
                                                        .first_model_layer = 0,
                                                        .original_model = model});
     std::string error;
-    requireOriginal(residency->registerInitialCPUJointBank(manager.expertGemmRegistry(), model,
+    requireOriginal(residency->registerInitialJointBank(manager.expertGemmRegistry(), model,
                                                            local_id, &error),
                     error.c_str());
-    const auto layer = residency->initialCPUJointLayer(local_id, 0);
+    const auto layer = residency->initialJointLayer(local_id, 0);
     requireOriginal(bool(layer), "actual cold fragment bank");
     auto arena = std::make_shared<
         MoELocalExpertSerialBufferArena>(MoELocalExpertSerialBufferArena::Config{

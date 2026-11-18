@@ -4,6 +4,8 @@
  *
  * The original shared cohort remains the only source of layout and membership.
  * These methods observe metadata and mint neither residency nor native readiness.
+ * A checked GPU singleton is still a complete cohort; the source factory owns
+ * population validation, including the distinct CPU multi-rank requirement.
  */
 #include "MoEOptimizationMovementEndpoint.h"
 #include "MoEExpertOwnerMap.h"
@@ -22,33 +24,33 @@ MoEOptimizationMovementEndpoint MoEOptimizationMovementEndpoint::fromOwner(const
     if(owner.tier_idx<0 || owner.tier_idx>std::numeric_limits<int32_t>::max()-1 || owner.layer_idx<0 || owner.shard_cohort->source().layer_idx!=owner.layer_idx ||
        owner.owner_participant!=-1 || owner.device.is_valid())
         throw std::invalid_argument("Completed cohort movement endpoint differs from original complete placement");
-    return MoEOptimizationMovementEndpoint(CPUCohort{owner.tier_idx,owner.shard_cohort});
+    return MoEOptimizationMovementEndpoint(Cohort{owner.tier_idx,owner.shard_cohort});
 }
 const MoEOptimizationMovementEndpoint::Whole& MoEOptimizationMovementEndpoint::whole() const {
     if(!isWhole())throw std::logic_error("Whole movement projection rejects complete cohort or absent endpoint");
     return std::get<Whole>(value_);
 }
-const MoEOptimizationMovementEndpoint::CPUCohort& MoEOptimizationMovementEndpoint::cohort() const {
-    if(!isCPUCohort() || !std::get<CPUCohort>(value_).original)throw std::logic_error("Cohort movement projection requires complete original cohort");
-    return std::get<CPUCohort>(value_);
+const MoEOptimizationMovementEndpoint::Cohort& MoEOptimizationMovementEndpoint::cohort() const {
+    if(!isCohort() || !std::get<Cohort>(value_).original)throw std::logic_error("Cohort movement projection requires complete original cohort");
+    return std::get<Cohort>(value_);
 }
 MoEOverlayRouteTarget MoEOptimizationMovementEndpoint::target() const noexcept {
     if(isWhole())return MoEOverlayRouteTarget::whole(std::get<Whole>(value_).participant);
-    if(isCPUCohort())return MoEOverlayRouteTarget::cpuCohort(std::get<CPUCohort>(value_).tier);
+    if(isCohort())return MoEOverlayRouteTarget::cohort(std::get<Cohort>(value_).tier);
     return {};
 }
 bool MoEOptimizationMovementEndpoint::valid() const noexcept {
     if(isWhole()){const auto& w=std::get<Whole>(value_);return w.participant>=0&&w.device.is_valid()&&(!w.world_rank||*w.world_rank>=0);}
-    if(isCPUCohort()){const auto& c=std::get<CPUCohort>(value_);return c.tier>=0&&c.tier<=std::numeric_limits<int32_t>::max()-1&&bool(c.original)&&c.original->participants().size()>=2;}
+    if(isCohort()){const auto& c=std::get<Cohort>(value_);return c.tier>=0&&c.tier<=std::numeric_limits<int32_t>::max()-1&&bool(c.original)&&!c.original->participants().empty();}
     return false;
 }
 bool MoEOptimizationMovementEndpoint::validForLayer(int layer) const noexcept {
-    return layer>=0 && valid() && (!isCPUCohort() || std::get<CPUCohort>(value_).original->source().layer_idx==layer);
+    return layer>=0 && valid() && (!isCohort() || std::get<Cohort>(value_).original->source().layer_idx==layer);
 }
 bool MoEOptimizationMovementEndpoint::operator==(const MoEOptimizationMovementEndpoint& other) const {
     if(value_.index()!=other.value_.index())return false;
     if(isWhole())return whole()==other.whole();
-    if(isCPUCohort()){const auto& a=std::get<CPUCohort>(value_);const auto& b=std::get<CPUCohort>(other.value_);
+    if(isCohort()){const auto& a=std::get<Cohort>(value_);const auto& b=std::get<Cohort>(other.value_);
         if(a.tier!=b.tier)return false;
         // Default moves preserve the variant arm but transfer its shared borrow.
         // Null arms remain comparable without projecting invalid ownership.

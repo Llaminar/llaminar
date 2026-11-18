@@ -92,7 +92,7 @@ namespace llaminar2
         {
             if (domain.scope != ExecutionDomainScope::RANK_LOCAL ||
                 domain.routed_compute_policy != RoutedExpertComputePolicy::TensorSharded ||
-                domain.participants.size() < 2)
+                domain.participants.empty())
             {
                 return false;
             }

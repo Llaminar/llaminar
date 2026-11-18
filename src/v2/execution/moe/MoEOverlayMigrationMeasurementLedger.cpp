@@ -358,7 +358,7 @@ namespace llaminar2
                     return reject("Presealed movement evidence differs from original members, cuts or formats");
             } else if(!row->coordinate.source_target.isWhole() || !row->coordinate.destination_target.isWhole())
                 return reject("Legacy whole declarations cannot authenticate cohort reuse");
-            if((row->coordinate.source_target.isCPUCohort() || row->coordinate.destination_target.isCPUCohort()) && !state.setup_quotes_bound)
+            if((row->coordinate.source_target.isCohort() || row->coordinate.destination_target.isCohort()) && !state.setup_quotes_bound)
                 return reject("Cohort presealed reuse requires original setup-bound piece quotes");
             if(row->pieces.size()!=state.piece_count)return reject("Presealed movement evidence has incomplete original piece coverage");
             for(std::size_t piece=0;piece<state.piece_count;++piece) {

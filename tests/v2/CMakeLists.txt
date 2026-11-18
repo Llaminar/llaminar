@@ -29343,6 +29343,13 @@ if(NOT V2_PERF_TESTS_ONLY OR V2_HIP_ARGUMENT_OWNER_SELECTED)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HIPRuntimeSDKDeployment)
 endif()
 
+# Release reaches the focused explicit native owners without the full preflight
+# block below. Integration registers the same owners before validating that list.
+if(V2_PERF_TESTS_ONLY)
+    include(cmake/V2RetainedM1HCFFNTests.cmake)
+    include(cmake/V2ROCmRetainedM1NumericsTests.cmake)
+endif()
+
 # =============================================================================
 # Production model-parity preflight
 # =============================================================================
@@ -38288,6 +38295,16 @@ endif()
 # New native-Q8 evidence controls run in the existing exact evidence owner.
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity)
+
+include(cmake/V2RetainedM1HCFFNTests.cmake)
+include(cmake/V2ROCmRetainedM1NumericsTests.cmake)
+
+add_v2_test(V2_Integration_MoEOverlayInferenceEpochRoster
+    COMMAND $<TARGET_FILE:v2_test_moe_overlay_device_epoch_protocol>
+        --gtest_filter=Test__MoEOverlayDeviceEpochProtocol.SymmetricContinuationFreezesOneEpochAfterEveryLocalGuardArrives:Test__MoEOverlayDeviceEpochProtocol.ExtentRoster*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;GraphCapture;RCU;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayInferenceEpochRoster)
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})

@@ -25,6 +25,7 @@
 #include "planning/KVCacheMemoryEstimator.h"
 #include "backends/DeviceId.h"
 #include "kernels/common/QuantizedActivationOperandPrecision.h"
+#include "kernels/common/NativeTileCompletion.h"
 #include "config/CollectiveBackendType.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/config/RuntimeConfig.h"
@@ -336,6 +337,9 @@ struct DevicePlanConfig
         qwen4exp::QwenSparseAttentionArithmetic::FixedFP32; ///< Same admitted arithmetic consumed
                                                             ///< by execution.
     qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
+
+    MoEGateUpPublicationPolicy gate_up_publication=MoEGateUpPublicationPolicy::Staged; ///< Admitted ordinary M1 counter geometry.
+    MoEDownPublicationPolicy down_publication=MoEDownPublicationPolicy::Staged; ///< Admitted ordinary M1 route-fold geometry.
 
     /// Setup-frozen arithmetic that changes named HC-up activation scratch only.
     QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;

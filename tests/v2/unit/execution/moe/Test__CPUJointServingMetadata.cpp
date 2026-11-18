@@ -12,7 +12,7 @@
 #include "execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "utils/PerfStatsCollector.h"
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 #include "execution/moe/CanonicalMoERouteRecord.h"
 #include "tensors/TensorClasses.h"
 #include "utils/CPUForwardSamplingTestFixture.h"
@@ -80,7 +80,7 @@ TEST(CPUJointServingMetadata, OriginalPopulationAndReturnRolesThroughEight) {
                                         : MoEOverlayActivationReturnRole::JointContributor);
             EXPECT_EQ(originalCPUExpertShardCohortTarget(
                           &actual, {.world_rank = member, .participant_id = member}, layers),
-                      MoEOverlayRouteTarget::cpuCohort(first->tier_idx).word());
+                      MoEOverlayRouteTarget::cohort(first->tier_idx).word());
             EXPECT_TRUE(moeOverlayActivationReturnCountsMatch(uint32_t(role),member==0?3:0,member==0?7:0,3,7));
             EXPECT_FALSE(moeOverlayActivationReturnCountsMatch(uint32_t(role),member==0?0:3,member==0?0:7,3,7));
         }
@@ -136,7 +136,7 @@ TEST(CPUJointServingMetadata, ActualStageSharesRootExtentAcrossAsymmetricPartici
         const auto plan=declaration(population);
         const auto map=MoEExpertOwnerMap::buildShardPlacement(plan,{native});
         for(int member=0;member<population;++member)for(size_t live:{size_t(K),size_t(1),size_t(0)}) {
-            auto selection=CPUExpertShardSourceSelection::fromOriginalPlacement(map,7,member);
+            auto selection=ExpertShardSourceSelection::fromOriginalPlacement(map,7,member);
             RootExtentRecorder tp(population,member);
             const size_t local_capacity=member==0?size_t(population*K):size_t(K);
             FP32Tensor packed({local_capacity*(H+1)+1}),indices({M,K}),weights({M,K}),combined({M*K,H});
@@ -196,7 +196,7 @@ TEST(CPUJointServingMetadata, ActualStageRejectsSparsePhaseWithoutOriginalPrepar
     const MoEOverlayLayerWeightManifest native{7,{{{ExpertTierWeightProjection::Gate,64,H,format},
         {ExpertTierWeightProjection::Up,64,H,format},{ExpertTierWeightProjection::Down,H,64,format}}}};
     const auto placement=MoEExpertOwnerMap::buildShardPlacement(declaration(2),{native});
-    const auto selected=CPUExpertShardSourceSelection::fromOriginalPlacement(placement,7,1);
+    const auto selected=ExpertShardSourceSelection::fromOriginalPlacement(placement,7,1);
     auto context=IDeviceContext::create(DeviceId::cpu());
     for(const auto [capacity,phase]:std::array<std::pair<int,ExpertHistogramSource>,4>{{
         {64,ExpertHistogramSource::DecodeToken},{1,ExpertHistogramSource::PrefillChunk},
@@ -263,7 +263,7 @@ TEST(CPUJointServingMetadata, PreparedComputeRejectsForeignDomainBeforeCollectiv
             const std::string&,std::span<RootedFloatRecordRange>) override {++traffic;return false;}
     };
     const auto original=MoEExpertOwnerMap::buildShardPlacement(declaration(2),{source()});
-    const auto selection=CPUExpertShardSourceSelection::fromOriginalPlacement(original,7,1);
+    const auto selection=ExpertShardSourceSelection::fromOriginalPlacement(original,7,1);
     FP32Tensor packed({2*(256+1)+1}),indices({1,1}),weights({1,1}),combined({1,256});
     std::array<RootedFloatRecordRange,2> ranges{};
     std::array<int32_t,2> maps{};std::array<float,1> required{};
@@ -346,7 +346,7 @@ TEST(CPUJointServingMetadata, RootTimingLifecycle) {
         std::array<RootedFloatRecordRange,2> ranges{};
         std::array<int32_t,2> maps{};std::array<float,1> required{};
         MoECPUExpertShardRouteStage::Params params{
-            .original_source=CPUExpertShardSourceSelection::fromOriginalPlacement(placement,7,member),
+            .original_source=ExpertShardSourceSelection::fromOriginalPlacement(placement,7,member),
             .tp=&tp,.packed_records=&packed,.route_indices=&indices,.route_weights=&weights,
             .combined_routes=member==0?&combined:nullptr,
             .source_ranges=member==0?std::span(ranges):std::span<RootedFloatRecordRange>{},

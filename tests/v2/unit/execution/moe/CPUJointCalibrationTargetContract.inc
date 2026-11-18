@@ -29,7 +29,7 @@ TEST(CPUJointCalibrationTargetContract, CompleteOriginalTargetsProduceUnpublisha
         EXPECT_TRUE(std::is_sorted(coordinates.begin(), coordinates.end()));
         EXPECT_THROW((void)planner.requiredCoordinates(), std::logic_error);
         const auto whole = MoEOverlayRouteTarget::whole(0);
-        const auto cohort = MoEOverlayRouteTarget::cpuCohort(1);
+        const auto cohort = MoEOverlayRouteTarget::cohort(1);
         for (const auto &coordinate : coordinates)
         {
             ASSERT_TRUE(coordinate.valid());
@@ -88,7 +88,7 @@ TEST(CPUJointCalibrationTargetContract, CompleteOriginalTargetsProduceUnpublisha
         EXPECT_THROW((void)planner.buildPairSwap(0, 1, 0, 3), std::invalid_argument);
         EXPECT_THROW((void)planner.buildPairSwap(whole, whole, 0, 3), std::invalid_argument);
         EXPECT_THROW((void)planner.buildPairSwap(whole, cohort, 0, 0), std::invalid_argument);
-        EXPECT_THROW((void)planner.buildPairSwap(whole, MoEOverlayRouteTarget::cpuCohort(7), 0, 3), std::invalid_argument);
+        EXPECT_THROW((void)planner.buildPairSwap(whole, MoEOverlayRouteTarget::cohort(7), 0, 3), std::invalid_argument);
         EXPECT_THROW((void)planner.buildPairSwap(whole, cohort, 1, 3), std::invalid_argument);
         // Ordinary public joint maintenance remains unsupported despite valid metadata.
         EXPECT_THROW((void)authority.proposeFromHistogram(), std::logic_error);
@@ -173,8 +173,8 @@ TEST(CPUJointCalibrationTargetContract, UnequalOriginalCohortsAreCompleteTargets
     MoEOverlayEconomyCalibrationPlanner planner({.live_snapshot=live,
         .complete_expert_bytes_per_layer=catalog.completeExpertBytesPerLayer()});
     ASSERT_EQ(planner.requiredTargetCoordinates().size(), 6u); // Three targets, not six physical members.
-    const auto wave = planner.buildPairSwap(MoEOverlayRouteTarget::cpuCohort(1),
-        MoEOverlayRouteTarget::cpuCohort(2), 0, 1);
+    const auto wave = planner.buildPairSwap(MoEOverlayRouteTarget::cohort(1),
+        MoEOverlayRouteTarget::cohort(2), 0, 1);
     ASSERT_TRUE(wave.valid());
     ASSERT_EQ(wave.migrations.size(), 2u);
     EXPECT_EQ(wave.migrations[0].source.shard_cohort->participants().size(), 2u);

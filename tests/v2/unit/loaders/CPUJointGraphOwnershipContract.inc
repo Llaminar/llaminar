@@ -34,7 +34,7 @@ TEST(CPUJointGraphOwnership, ExternalJointProjectionPreservesOriginalMembership)
         for (int expert = 0; expert < 512; ++expert)
         {
             EXPECT_EQ(global[expert], expert < 64 ? 0
-                                                  : MoEOverlayRouteTarget::cpuCohort(
+                                                  : MoEOverlayRouteTarget::cohort(
                                                         owners.placementFor(7, expert)->tier_idx)
                                                         .word());
             EXPECT_EQ(continuation[expert], expert < 64 ? 0 : -1);
@@ -117,7 +117,7 @@ TEST(CPUJointGraphOwnership, ActualQwenFamilyBorrowsOriginalPreparedMap)
     EXPECT_EQ(stats.original_owner_map_reuses, 1u);
     EXPECT_EQ(stats.continuation_resolutions, 1u);
     EXPECT_EQ(&config.moe.expert_overlay_participant_residency->initialOwnerMap(),
-              original.preparation->cpuJointOwnerMap().get());
+              original.preparation->jointOwnerMap().get());
 
     // A selected joint mode without its original source preparation must fail;
     // no whole-owner reconstruction is a valid replacement.

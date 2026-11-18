@@ -12,6 +12,7 @@
 #include <optional>
 
 #include "tensors/NativeQuantisedFormatInfo.h"
+#include "NativeQuantisedRepackColumns.h"
 
 namespace llaminar2 {
 
@@ -109,6 +110,7 @@ struct RepackKernels {
                                   int output_row_offset,
                                   int packed_group_rows,
                                   int allocation_payload_bytes_per_block,
+                                  NativeQuantisedRepackColumns columns,
                                   void* stream);
 
     VnniRepackFn vnniRepack = nullptr;

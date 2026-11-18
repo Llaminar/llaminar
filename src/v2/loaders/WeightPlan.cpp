@@ -15,9 +15,10 @@
 
 #include "ExpertGemmRegistry.h"
 #include "WeightPlan.h"
+#include "loaders/BoundedGPUExpertSource.h"
 #include "tensors/NativeWeightSourceRange.h"
 #include <limits>
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 
 #include "WeightLifecycleTrace.h"
 #include "MoEExpertSourceView.h"
@@ -93,7 +94,7 @@ namespace llaminar2
             requirement.layer = inferWeightLayer(requirement.canonical_name);
         if (requirement.expert < 0)
             requirement.expert = inferWeightExpert(requirement.canonical_name);
-        if (requirement.cpu_joint_source && !requirement.projection_ownership)
+        if (requirement.joint_source && !requirement.projection_ownership)
             throw std::invalid_argument("CPU joint source requires its exact original projection ownership");
         if (requirement.projection_ownership)
         {
@@ -114,10 +115,10 @@ namespace llaminar2
                 (requirement.overlay_participant_index >= 0 &&
                  requirement.overlay_participant_index != ownership.participant()))
                 throw std::invalid_argument("Static expert projection requires its exact original role/participant source request");
-            if (requirement.cpu_joint_source) {
-                const auto& selected=*requirement.cpu_joint_source;
+            if (requirement.joint_source) {
+                const auto& selected=*requirement.joint_source;
                 const auto& participant=selected.participant();
-                if(requirement.target_device!=DeviceId::cpu() || selected.layer()!=requirement.layer ||
+                if(requirement.target_device!=participant.device || selected.layer()!=requirement.layer ||
                    selected.ownership()!=ownership || requirement.overlay_domain!=participant.domain_name ||
                    requirement.overlay_participant_world_rank!=participant.world_rank ||
                    requirement.overlay_participant_index!=participant.domain_participant_index)
@@ -136,8 +137,8 @@ namespace llaminar2
             original.expert_ids.reserve(original.expert_count);
             for (int expert = 0; expert < ownership.geometry().experts; ++expert)
                 original.expert_ids.push_back(expert);
-            if(requirement.cpu_joint_source)
-                original=requirement.cpu_joint_source->sourceLoadSlice(requirement.role);
+            if(requirement.joint_source)
+                original=requirement.joint_source->sourceLoadSlice(requirement.role);
             // An already normalized requirement may be composed into another
             // plan, but contradictory caller coordinates are never substituted.
             if (!sameSourceSlice(requirement.slice, WeightSliceSpec{}) &&
@@ -360,7 +361,7 @@ namespace llaminar2
                 builder.addBinding(parent);
                 continue;
             }
-            if(parent.native_source && parent.cpu_joint_source && parent.tensor && parent.tensor->shape().size()==2) {
+            if(parent.native_source && parent.joint_source && parent.tensor && parent.tensor->shape().size()==2) {
                 ExpertGemmRegistry::validateStaticProjectionSource(parent);
                 if(!identifiers.insert(parent.binding_id).second)
                     throw std::logic_error("Static expert matrix binding identity collision");
@@ -372,25 +373,29 @@ namespace llaminar2
                 parent.tensor->shape().size() != 3 || !isRoutedExpertRole(parent.identity.role) ||
                 parent.identity.derivation != WeightDerivationKind::ExpertSlice || !parent.slice.inner_is_presliced)
                 throw std::invalid_argument("Projected expert matrices require owned compact static source bindings");
-            if (parent.tensor->is_raw_data_released() || !parent.tensor->raw_data())
+            const auto *bounded_parent = dynamic_cast<const BoundedGPUExpertSource *>(parent.tensor);
+            if (!bounded_parent && (parent.tensor->is_raw_data_released() || !parent.tensor->raw_data()))
                 throw std::runtime_error("Static expert source retired before its matrix bindings were created");
             const auto &ownership = *parent.projection_ownership;
             const MoEExpertSourceView source(parent.tensor->shape(), parent.slice);
-            if (parent.cpu_joint_source)
+            if (parent.joint_source && parent.joint_source->participant().device.is_cpu())
                 throw std::invalid_argument("CPU source matrices must be committed by the common bounded consumer");
-            const auto expected_count = size_t(ownership.geometry().experts);
+            const auto selected = parent.joint_source;
+            const auto expected_count = selected ? selected->expertIds().size() : size_t(ownership.geometry().experts);
             if (source.experts().size() != expected_count)
-                throw std::invalid_argument("Static expert source must retain the complete original expert inventory");
+                throw std::invalid_argument("Static expert source must retain its complete original expert selection");
             for (size_t ordinal=0;ordinal<expected_count;++ordinal)
             {
-                const int expert = int(ordinal);
+                const int expert = selected ? selected->expertIds()[ordinal] : int(ordinal);
                 if (source.experts()[ordinal] != expert)
                     throw std::invalid_argument("Static expert source does not preserve original ordinal IDs");
                 const auto matrix = source.matrix(expert, parent.identity.role, &ownership);
                 auto view = parent.tensor->create_view({matrix.rows, matrix.columns}, matrix.element_offset);
+                const auto *bounded_view = dynamic_cast<const BoundedGPUExpertSource *>(view.get());
+                const size_t parent_bytes = bounded_parent ? bounded_parent->sourceBytes() : parent.tensor->size_bytes();
+                const size_t view_bytes = bounded_view ? bounded_view->sourceBytes() : view ? view->size_bytes() : 0;
                 if (!view || view->native_type() != parent.tensor->native_type() ||
-                    parent.tensor->size_bytes() % expected_count ||
-                    view->size_bytes() != parent.tensor->size_bytes() / expected_count)
+                    parent_bytes % expected_count || view_bytes != parent_bytes / expected_count)
                     throw std::runtime_error("Static expert matrix view lost its native source representation");
                 WeightBinding binding = parent;
                 binding.identity.canonical_name = parent.identity.canonical_name + "@expert" + std::to_string(expert);
@@ -460,7 +465,7 @@ namespace llaminar2
         const auto role = requirement.role == WeightRole::Other ? inferWeightRole(requirement.canonical_name) : requirement.role;
         const bool experts = source.original_shape.size() == 3 && isRoutedExpertRole(role);
         if (requirement.native_source_assembly) {
-            if (experts || source.original_shape.size()>2 || requirement.cpu_joint_source || requirement.projection_ownership ||
+            if (experts || source.original_shape.size()>2 || requirement.joint_source || requirement.projection_ownership ||
                 requirement.derivation!=WeightDerivationKind::FusedSubblockConcat ||
                 requirement.slice.row_start || requirement.slice.row_count || requirement.slice.col_start || requirement.slice.col_count ||
                 requirement.slice.expert_start || requirement.slice.expert_count || !requirement.slice.expert_ids.empty() ||

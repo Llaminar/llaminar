@@ -5,10 +5,14 @@
  * The ledger retains prepared allocation lifetimes within one immutable
  * pipeline stage. It never owns placement policy or a second memory budget.
  * Global layer keys and stage-bound transaction receipts prevent a same-shaped
- * peer stage from publishing or retiring these allocations.
+ * peer stage from publishing or retiring these allocations. Fixed original
+ * whole/fragment rows share one mixed transaction and complete member receipt
+ * set; neither source borrowing nor terminal snapshots flatten fragment semantics.
  */
 
 #include "MoEOverlayDevicePhysicalSlotLedger.h"
+#include "MoEExpertShardCohort.h"
+#include "MoEExpertOwnerMap.h"
 
 #include <algorithm>
 #include <limits>
@@ -17,6 +21,7 @@
 #include <set>
 #include <stdexcept>
 #include <tuple>
+#include <type_traits>
 #include <utility>
 
 namespace llaminar2
@@ -31,26 +36,18 @@ namespace llaminar2
             return false;
         }
 
-        /** Convert one resolved migration endpoint into a ledger coordinate. */
-        MoEOverlayDevicePhysicalSlotKey sourceKey(
-            const MoEOverlayTierMigration &migration) noexcept
+        /** @return Actual original physical members; a cohort never acquires a scalar owner. */
+        std::vector<MoEOverlayDevicePhysicalSlotKey> physicalKeys(
+            const MoEOverlayTierMigration &migration, bool source)
         {
-            return {
-                .participant_id = migration.source.owner_participant,
-                .layer_idx = migration.layer_idx,
-                .expert_id = migration.expert_id,
-            };
-        }
-
-        /** Convert one resolved migration destination into a ledger coordinate. */
-        MoEOverlayDevicePhysicalSlotKey destinationKey(
-            const MoEOverlayTierMigration &migration) noexcept
-        {
-            return {
-                .participant_id = migration.destination.owner_participant,
-                .layer_idx = migration.layer_idx,
-                .expert_id = migration.expert_id,
-            };
+            const auto target = MoEExpertPlacementTarget::fromPlacement(
+                source ? migration.source : migration.destination);
+            std::vector<MoEOverlayDevicePhysicalSlotKey> keys;
+            if (!target) return keys;
+            keys.reserve(target->participantCount());
+            for (std::size_t member = 0; member < target->participantCount(); ++member)
+                keys.push_back({target->participantId(member), migration.layer_idx, migration.expert_id});
+            return keys;
         }
     } // namespace
 
@@ -62,6 +59,23 @@ namespace llaminar2
                    other.participant_id,
                    other.layer_idx,
                    other.expert_id);
+    }
+
+    bool MoEOverlayDeviceFragmentPhysicalSlot::valid() const noexcept
+    {
+        if (!key.valid() || !entered_epoch || !payload.valid() ||
+            payload.expertId() != key.expert_id || payload.arrivalEpoch() > entered_epoch ||
+            payload.cohort()->source().layer_idx != key.layer_idx)
+            return false;
+        const auto members = payload.cohort()->participants();
+        return payload.participantIndex() < members.size() &&
+            members[payload.participantIndex()].participant_id == key.participant_id;
+    }
+
+    bool MoEOverlayDeviceFragmentInventorySnapshot::valid() const noexcept
+    {
+        return epoch != 0u && std::all_of(slots.begin(), slots.end(),
+            [this](const auto &slot) { return slot.valid() && slot.entered_epoch <= epoch; });
     }
 
     bool MoEOverlayDeviceInitialPhysicalSlot::valid() const noexcept
@@ -113,12 +127,46 @@ namespace llaminar2
                    static_cast<std::uint32_t>(key.expert_id) < num_experts;
         }
 
+        using Payload = MoEOverlayDevicePreparedPhysicalPayload;
+        using Families = std::map<std::pair<int, int>, std::shared_ptr<const MoEOverlayFragmentFamily>>;
+
+        /** @return Whether this ledger retains closed fragment families. */
+        bool fragments() const noexcept { return fragments_only; }
+
+        /** @return Whether the legacy whole-only interface describes every admitted row. */
+        bool whole() const noexcept { return families.empty(); }
+
+        /** @return Whether the exact original family, coordinate and epoch are authenticated. */
+        bool accepts(const MoEOverlayDevicePhysicalSlotKey &key, const Payload &payload,
+                     std::uint64_t maximum_epoch, bool arrival = false) const noexcept
+        {
+            if (!key.valid() || !contains(key) || !local(key.participant_id)) return false;
+            if (const auto *whole = std::get_if<MoEOverlayPreparedExpertPayload>(&payload))
+                return !families.contains({key.participant_id, key.layer_idx}) && whole->readyFor(whole_family);
+            const auto &fragment = std::get<MoEOverlayPreparedFragmentPayload>(payload);
+            const auto found = families.find({key.participant_id, key.layer_idx});
+            return found != families.end() && found->second->accepts(fragment, key.expert_id) &&
+                (arrival ? fragment.arrivalEpoch() == maximum_epoch : fragment.arrivalEpoch() <= maximum_epoch);
+        }
+
+        /** @return Whether a command names the SAME retained original source/cohort authority. */
+        bool matchesPlacement(const MoEOverlayDevicePhysicalSlotKey &key,
+                              const MoEExpertOwner &placement) const noexcept
+        {
+            const auto found = families.find({key.participant_id, key.layer_idx});
+            if (found == families.end()) return !placement.shard_cohort;
+            const auto &original = found->second->cohort();
+            return original == placement.shard_cohort &&
+                !original.owner_before(placement.shard_cohort) &&
+                !placement.shard_cohort.owner_before(original);
+        }
+
         /** Physical allocation retained independently of device descriptor bytes. */
         struct ActiveSlot
         {
             std::uint64_t entered_epoch = 0u;
             bool bootstrap_allocation = false;
-            MoEOverlayPreparedExpertPayload payload;
+            Payload payload;
         };
 
         /** Immutable identity and mutable transport phase of one Dynamic wave. */
@@ -133,7 +181,7 @@ namespace llaminar2
             std::vector<MoEOverlayTierMigration> migrations;
             std::map<
                 MoEOverlayDevicePhysicalSlotKey,
-                MoEOverlayPreparedExpertPayload>
+                Payload>
                 staged_arrivals;
             bool staged = false;
             bool published = false;
@@ -162,13 +210,22 @@ namespace llaminar2
                 participant_id);
         }
 
+        /** @brief Stage either closed payload arm through the same wave lifecycle. */
+        template <class Arrival> bool stage(const MoEOverlayDevicePhysicalMovementBatch &batch,
+            std::vector<Arrival> arrivals, std::string *error) noexcept;
+        /** @brief Retire either closed payload arm after the same reader barrier. */
+        template <class Slot> bool retire(const MoEOverlayDevicePhysicalMovementBatch &batch,
+            std::vector<Slot> *retired, std::string *error) noexcept;
+
         mutable std::mutex mutex;
         const int first_model_layer;
         const std::uint32_t num_layers;
         const std::uint32_t num_experts;
         std::uint64_t current_epoch = 0u;
         std::vector<int> local_participant_ids;
-        DeviceMoEProjectionSet movable_projections = DeviceMoEProjectionSet::CompleteExpert;
+        DeviceMoEProjectionSet whole_family = DeviceMoEProjectionSet::CompleteExpert;
+        Families families;
+        bool fragments_only = false;
         std::map<MoEOverlayDevicePhysicalSlotKey, ActiveSlot> active;
         std::optional<PendingWave> pending;
     };
@@ -183,7 +240,7 @@ namespace llaminar2
             config.num_experts == 0u ||
             (config.movable_projections != DeviceMoEProjectionSet::CompleteExpert &&
              config.movable_projections != DeviceMoEProjectionSet::GateUp) || config.initial_epoch == 0u ||
-            config.local_participant_ids.empty() ||
+            (!config.local_participant_ids.empty() && config.local_participant_ids.front() < 0) ||
             !std::is_sorted(
                 config.local_participant_ids.begin(),
                 config.local_participant_ids.end()) ||
@@ -193,15 +250,15 @@ namespace llaminar2
                 config.local_participant_ids.end())
         {
             throw std::invalid_argument(
-                "device physical slot ledger requires valid stage geometry, a positive epoch and sorted unique local participants");
+                "device physical slot ledger requires valid stage geometry, a positive epoch and sorted unique nonnegative local participant IDs");
         }
         impl_->current_epoch = config.initial_epoch;
-        impl_->movable_projections = config.movable_projections;
+        impl_->whole_family = config.movable_projections;
         impl_->local_participant_ids =
             std::move(config.local_participant_ids);
         for (auto &slot : config.initial_slots)
         {
-            if (!slot.valid() || !slot.payload.readyFor(impl_->movable_projections) ||
+            if (!slot.valid() || !impl_->accepts(slot.key, slot.payload, slot.entered_epoch) ||
                 slot.entered_epoch > config.initial_epoch ||
                 !impl_->local(slot.key.participant_id) || !impl_->contains(slot.key))
             {
@@ -218,6 +275,84 @@ namespace llaminar2
             if (!inserted)
                 throw std::invalid_argument(
                     "device physical slot ledger initial inventory contains a duplicate coordinate");
+        }
+    }
+
+    std::unique_ptr<MoEOverlayDevicePhysicalSlotLedger>
+    MoEOverlayDevicePhysicalSlotLedger::createFragments(FragmentConfig config)
+    {
+        return std::unique_ptr<MoEOverlayDevicePhysicalSlotLedger>(
+            new MoEOverlayDevicePhysicalSlotLedger(std::move(config), FragmentEnrollment{}));
+    }
+
+    std::unique_ptr<MoEOverlayDevicePhysicalSlotLedger>
+    MoEOverlayDevicePhysicalSlotLedger::createMixed(MixedConfig config)
+    {
+        return std::unique_ptr<MoEOverlayDevicePhysicalSlotLedger>(
+            new MoEOverlayDevicePhysicalSlotLedger(std::move(config), MixedEnrollment{}));
+    }
+
+    MoEOverlayDevicePhysicalSlotLedger::MoEOverlayDevicePhysicalSlotLedger(FragmentConfig config, FragmentEnrollment)
+        : MoEOverlayDevicePhysicalSlotLedger(MixedConfig{
+              .whole = {.initial_epoch = config.initial_epoch,
+                  .local_participant_ids = config.local_participant_ids,
+                  .first_model_layer = config.first_model_layer,
+                  .num_layers = config.num_layers, .num_experts = config.num_experts},
+              .families = std::move(config.families),
+              .initial_fragments = std::move(config.initial_slots)}, MixedEnrollment{})
+    {
+        // The legacy fragment-only factory requires every local row to be a fragment.
+        for (const int participant : impl_->local_participant_ids)
+            for (std::uint32_t layer = 0; layer < impl_->num_layers; ++layer)
+                if (!impl_->families.contains({participant, impl_->first_model_layer + static_cast<int>(layer)}))
+                    throw std::invalid_argument("device fragment slot ledger requires complete local family coverage");
+        impl_->fragments_only = true;
+    }
+
+    MoEOverlayDevicePhysicalSlotLedger::MoEOverlayDevicePhysicalSlotLedger(MixedConfig config, MixedEnrollment)
+        : MoEOverlayDevicePhysicalSlotLedger(std::move(config.whole))
+    {
+        Impl::Families families;
+        ModelContextId original_model{};
+        std::shared_ptr<const MoEExpertOverlayPreparationPlan> original_preparation;
+        for (auto &entry : config.families)
+        {
+            const MoEOverlayDevicePhysicalSlotKey key{entry.participant_id, entry.layer_idx, 0};
+            if (!key.valid() || !impl_->local(entry.participant_id) || !impl_->contains(key) ||
+                !entry.family || !entry.family->cohort() || !entry.family->preparation() ||
+                !entry.family->model().value)
+                throw std::invalid_argument("device fragment slot ledger requires original local families");
+            if (!original_preparation)
+            {
+                original_model = entry.family->model();
+                original_preparation = entry.family->preparation();
+            }
+            const auto &preparation = entry.family->preparation();
+            if (entry.family->model() != original_model || preparation != original_preparation ||
+                preparation.owner_before(original_preparation) || original_preparation.owner_before(preparation))
+                throw std::invalid_argument("device fragment slot ledger cannot mix original model/preparation authorities");
+            const auto &cohort = *entry.family->cohort();
+            const auto member = entry.family->participantIndex();
+            if (member >= cohort.participants().size() ||
+                cohort.participants()[member].participant_id != entry.participant_id ||
+                cohort.source().layer_idx != entry.layer_idx ||
+                cohort.ownership(member).geometry().experts != static_cast<int>(impl_->num_experts) ||
+                !families.emplace(std::make_pair(entry.participant_id, entry.layer_idx), std::move(entry.family)).second)
+                throw std::invalid_argument("device fragment slot ledger rejected foreign member or source geometry");
+        }
+        impl_->families = std::move(families);
+        // A row's fixed projection contract cannot change beneath a retained source.
+        for (const auto &[key, slot] : impl_->active)
+            if (!impl_->accepts(key, slot.payload, slot.entered_epoch))
+                throw std::invalid_argument("device mixed ledger whole source conflicts with its fragment row");
+        for (auto &slot : config.initial_fragments)
+        {
+            if (!slot.valid() || slot.entered_epoch > impl_->current_epoch ||
+                !impl_->accepts(slot.key, slot.payload, slot.entered_epoch) ||
+                !impl_->active.emplace(slot.key, Impl::ActiveSlot{
+                    .entered_epoch = slot.entered_epoch, .bootstrap_allocation = slot.bootstrap_allocation,
+                    .payload = std::move(slot.payload)}).second)
+                throw std::invalid_argument("device fragment slot ledger rejected initial fragment family, epoch or coordinate");
         }
     }
 
@@ -254,26 +389,29 @@ namespace llaminar2
         std::set<MoEOverlayDevicePhysicalSlotKey> local_destinations;
         for (const auto &migration : batch.migrations)
         {
-            const auto source = sourceKey(migration);
-            const auto destination = destinationKey(migration);
-            if (impl_->local(source.participant_id))
+            for (const auto &source : physicalKeys(migration, true))
             {
+                if (!impl_->local(source.participant_id)) continue;
                 const auto found = impl_->active.find(source);
-                if (found == impl_->active.end() ||
-                    !found->second.payload.readyFor(impl_->movable_projections))
+                if (found == impl_->active.end() || !impl_->matchesPlacement(source, migration.source) ||
+                    !impl_->accepts(source, found->second.payload, found->second.entered_epoch))
                 {
                     return reject(
                         error,
-                        "device physical slot ledger cannot resolve a local source allocation");
+                        "device physical slot ledger cannot resolve a local source allocation in its original family");
                 }
             }
-            if (impl_->local(destination.participant_id) &&
-                (impl_->active.contains(destination) ||
-                 !local_destinations.insert(destination).second))
+            for (const auto &destination : physicalKeys(migration, false))
             {
-                return reject(
-                    error,
-                    "device physical slot ledger destination is already active or duplicated");
+                if (impl_->local(destination.participant_id) &&
+                    (!impl_->matchesPlacement(destination, migration.destination) ||
+                     impl_->active.contains(destination) ||
+                     !local_destinations.insert(destination).second))
+                {
+                    return reject(
+                        error,
+                        "device physical slot ledger destination is foreign, already active or duplicated");
+                }
             }
         }
 
@@ -306,27 +444,64 @@ namespace llaminar2
                 "device physical slot ledger source request has invalid wave or endpoint identity");
             return std::nullopt;
         }
+        const bool named = std::any_of(impl_->pending->migrations.begin(), impl_->pending->migrations.end(),
+            [&](const auto &migration) {
+                const auto keys = physicalKeys(migration, true);
+                return std::find(keys.begin(), keys.end(), key) != keys.end();
+            });
         const auto found = impl_->active.find(key);
-        if (found == impl_->active.end() || !found->second.payload.readyFor(impl_->movable_projections))
+        if (!named || found == impl_->active.end() || !std::holds_alternative<MoEOverlayPreparedExpertPayload>(found->second.payload) ||
+            !impl_->accepts(key, found->second.payload, found->second.entered_epoch))
         {
             reject(
                 error,
                 "device physical slot ledger source is not active");
             return std::nullopt;
         }
-        return found->second.payload;
+        return std::get<MoEOverlayPreparedExpertPayload>(found->second.payload);
     }
 
-    bool MoEOverlayDevicePhysicalSlotLedger::stage(
+    std::optional<MoEOverlayPreparedFragmentPayload>
+    MoEOverlayDevicePhysicalSlotLedger::sourceFragmentPayload(
         const MoEOverlayDevicePhysicalMovementBatch &batch,
-        std::vector<MoEOverlayDeviceStagedPhysicalArrival> arrivals,
+        const MoEOverlayDevicePhysicalSlotKey &key, std::string *error) const noexcept
+    {
+        if (error) error->clear();
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (!impl_->exact(batch))
+        {
+            reject(error, "device fragment slot ledger source has wrong payload arm or wave identity");
+            return std::nullopt;
+        }
+        const bool named = std::any_of(impl_->pending->migrations.begin(), impl_->pending->migrations.end(),
+            [&](const auto &migration) {
+                const auto keys = physicalKeys(migration, true);
+                return std::find(keys.begin(), keys.end(), key) != keys.end();
+            });
+        const auto found = impl_->active.find(key);
+        if (!named || found == impl_->active.end() ||
+            !std::holds_alternative<MoEOverlayPreparedFragmentPayload>(found->second.payload) ||
+            !impl_->accepts(key, found->second.payload, found->second.entered_epoch))
+        {
+            reject(error, "device fragment slot ledger source is not a named original local fragment");
+            return std::nullopt;
+        }
+        return std::get<MoEOverlayPreparedFragmentPayload>(found->second.payload);
+    }
+
+    template <class Arrival>
+    bool MoEOverlayDevicePhysicalSlotLedger::Impl::stage(
+        const MoEOverlayDevicePhysicalMovementBatch &batch,
+        std::vector<Arrival> arrivals,
         std::string *error) noexcept
     {
         if (error)
             error->clear();
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (!impl_->exact(batch) || impl_->pending->staged ||
-            impl_->pending->published)
+        std::lock_guard<std::mutex> lock(mutex);
+        if ((std::is_same_v<Arrival, MoEOverlayDeviceStagedFragmentArrival> && !fragments()) ||
+            (std::is_same_v<Arrival, MoEOverlayDeviceStagedPhysicalArrival> && !whole()) ||
+            !exact(batch) || pending->staged ||
+            pending->published)
         {
             return reject(
                 error,
@@ -334,20 +509,19 @@ namespace llaminar2
         }
 
         std::set<MoEOverlayDevicePhysicalSlotKey> expected;
-        for (const auto &migration : impl_->pending->migrations)
+        for (const auto &migration : pending->migrations)
         {
-            const auto key = destinationKey(migration);
-            if (impl_->local(key.participant_id))
-                expected.insert(key);
+            for (const auto &key : physicalKeys(migration, false))
+                if (local(key.participant_id)) expected.insert(key);
         }
 
         std::map<
             MoEOverlayDevicePhysicalSlotKey,
-            MoEOverlayPreparedExpertPayload>
+            Payload>
             staged;
         for (auto &arrival : arrivals)
         {
-            if (!arrival.valid() || !arrival.payload.readyFor(impl_->movable_projections) ||
+            if (!accepts(arrival.key, arrival.payload, batch.candidate_epoch, true) ||
                 !expected.contains(arrival.key) ||
                 !staged.emplace(
                            arrival.key, std::move(arrival.payload)).second)
@@ -362,9 +536,30 @@ namespace llaminar2
                 error,
                 "device physical slot ledger did not receive every local destination");
 
-        impl_->pending->staged_arrivals = std::move(staged);
-        impl_->pending->staged = true;
+        pending->staged_arrivals = std::move(staged);
+        pending->staged = true;
         return true;
+    }
+
+    bool MoEOverlayDevicePhysicalSlotLedger::stage(
+        const MoEOverlayDevicePhysicalMovementBatch &batch,
+        std::vector<MoEOverlayDeviceStagedPhysicalArrival> arrivals, std::string *error) noexcept
+    {
+        return impl_->stage(batch, std::move(arrivals), error);
+    }
+
+    bool MoEOverlayDevicePhysicalSlotLedger::stageFragments(
+        const MoEOverlayDevicePhysicalMovementBatch &batch,
+        std::vector<MoEOverlayDeviceStagedFragmentArrival> arrivals, std::string *error) noexcept
+    {
+        return impl_->stage(batch, std::move(arrivals), error);
+    }
+
+    bool MoEOverlayDevicePhysicalSlotLedger::stagePrepared(
+        const MoEOverlayDevicePhysicalMovementBatch &batch,
+        std::vector<MoEOverlayDevicePreparedPhysicalArrival> arrivals, std::string *error) noexcept
+    {
+        return impl_->stage(batch, std::move(arrivals), error);
     }
 
     bool MoEOverlayDevicePhysicalSlotLedger::publish(
@@ -385,7 +580,7 @@ namespace llaminar2
         for (const auto &[key, payload] :
              impl_->pending->staged_arrivals)
         {
-            if (impl_->active.contains(key) || !payload.readyFor(impl_->movable_projections))
+            if (impl_->active.contains(key) || !impl_->accepts(key, payload, batch.candidate_epoch, true))
                 return reject(
                     error,
                     "device physical slot ledger destination changed before publication");
@@ -406,9 +601,10 @@ namespace llaminar2
         return true;
     }
 
-    bool MoEOverlayDevicePhysicalSlotLedger::retire(
+    template <class Slot>
+    bool MoEOverlayDevicePhysicalSlotLedger::Impl::retire(
         const MoEOverlayDevicePhysicalMovementBatch &batch,
-        std::vector<MoEOverlayDeviceRetiredPhysicalSlot> *retired,
+        std::vector<Slot> *retired,
         std::string *error) noexcept
     {
         if (error)
@@ -418,38 +614,78 @@ namespace llaminar2
                 error,
                 "device physical slot ledger retirement requires an output owner");
 
-        std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (!impl_->exact(batch) || !impl_->pending->published ||
-            impl_->current_epoch != batch.candidate_epoch)
+        std::lock_guard<std::mutex> lock(mutex);
+        if ((std::is_same_v<Slot, MoEOverlayDeviceFragmentPhysicalSlot> && !fragments()) ||
+            (std::is_same_v<Slot, MoEOverlayDeviceRetiredPhysicalSlot> && !whole()) || !exact(batch) || !pending->published ||
+            current_epoch != batch.candidate_epoch)
         {
             return reject(
                 error,
                 "device physical slot ledger retirement has invalid lifecycle or epoch");
         }
 
-        std::vector<MoEOverlayDeviceRetiredPhysicalSlot> result;
-        for (const auto &migration : impl_->pending->migrations)
+        // Validate the complete removal set before moving any lifetime. Even a
+        // wrong typed projection must leave the entire published wave intact.
+        for (const auto &migration : pending->migrations)
+            for (const auto &key : physicalKeys(migration, true))
+            {
+                if (!local(key.participant_id)) continue;
+                const auto found = active.find(key);
+                if (found == active.end() || !accepts(key, found->second.payload, found->second.entered_epoch))
+                    return reject(error, "device physical ledger lost an original source before retirement");
+                if constexpr (!std::is_same_v<decltype(Slot::payload), Payload>)
+                    if (!std::holds_alternative<decltype(Slot::payload)>(found->second.payload))
+                        return reject(error, "device physical ledger retirement has a wrong typed payload arm");
+            }
+        std::vector<Slot> result;
+        for (const auto &migration : pending->migrations)
         {
-            const auto key = sourceKey(migration);
-            if (!impl_->local(key.participant_id))
-                continue;
-            const auto found = impl_->active.find(key);
-            if (found == impl_->active.end())
-                return reject(
-                    error,
-                    "device physical slot ledger lost a source before retirement");
-            result.push_back({
-                .key = key,
-                .entered_epoch = found->second.entered_epoch,
-                .bootstrap_allocation =
-                    found->second.bootstrap_allocation,
-                .payload = std::move(found->second.payload),
-            });
-            impl_->active.erase(found);
+            for (const auto &key : physicalKeys(migration, true))
+            {
+                if (!local(key.participant_id)) continue;
+                const auto found = active.find(key);
+                if (found == active.end())
+                    return reject(
+                        error,
+                        "device physical slot ledger lost a source before retirement");
+                result.push_back({
+                    .key = key,
+                    .entered_epoch = found->second.entered_epoch,
+                    .bootstrap_allocation = found->second.bootstrap_allocation,
+                    .payload = [&]() -> decltype(Slot::payload) {
+                        if constexpr (std::is_same_v<decltype(Slot::payload), Payload>)
+                            return std::move(found->second.payload);
+                        else
+                            return std::get<decltype(Slot::payload)>(std::move(found->second.payload));
+                    }(),
+                });
+                active.erase(found);
+            }
         }
-        impl_->pending.reset();
+        pending.reset();
         *retired = std::move(result);
         return true;
+    }
+
+    bool MoEOverlayDevicePhysicalSlotLedger::retire(
+        const MoEOverlayDevicePhysicalMovementBatch &batch,
+        std::vector<MoEOverlayDeviceRetiredPhysicalSlot> *retired, std::string *error) noexcept
+    {
+        return impl_->retire(batch, retired, error);
+    }
+
+    bool MoEOverlayDevicePhysicalSlotLedger::retireFragments(
+        const MoEOverlayDevicePhysicalMovementBatch &batch,
+        std::vector<MoEOverlayDeviceFragmentPhysicalSlot> *retired, std::string *error) noexcept
+    {
+        return impl_->retire(batch, retired, error);
+    }
+
+    bool MoEOverlayDevicePhysicalSlotLedger::retirePrepared(
+        const MoEOverlayDevicePhysicalMovementBatch &batch,
+        std::vector<MoEOverlayDevicePreparedPhysicalSlot> *retired, std::string *error) noexcept
+    {
+        return impl_->retire(batch, retired, error);
     }
 
     bool MoEOverlayDevicePhysicalSlotLedger::abort(
@@ -477,7 +713,7 @@ namespace llaminar2
         if (error)
             error->clear();
         std::lock_guard<std::mutex> lock(impl_->mutex);
-        if (epoch == 0u || epoch != impl_->current_epoch)
+        if (!impl_->whole() || epoch == 0u || epoch != impl_->current_epoch)
         {
             reject(
                 error,
@@ -501,7 +737,7 @@ namespace llaminar2
                 .key = key,
                 .entered_epoch = slot.entered_epoch,
                 .bootstrap_allocation = slot.bootstrap_allocation,
-                .payload = slot.payload,
+                .payload = std::get<MoEOverlayPreparedExpertPayload>(slot.payload),
             });
         }
         if (!result.valid())
@@ -512,6 +748,65 @@ namespace llaminar2
             return std::nullopt;
         }
         return result;
+    }
+
+    std::optional<MoEOverlayDeviceFragmentInventorySnapshot>
+    MoEOverlayDevicePhysicalSlotLedger::fragmentSnapshot(std::uint64_t epoch, std::string *error) const noexcept
+    {
+        if (error) error->clear();
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (!impl_->fragments() || !epoch || epoch != impl_->current_epoch || impl_->pending)
+        {
+            reject(error, "device fragment inventory requires its exact quiescent epoch and payload arm");
+            return std::nullopt;
+        }
+        MoEOverlayDeviceFragmentInventorySnapshot result{.epoch = epoch};
+        result.slots.reserve(impl_->active.size());
+        for (const auto &[key, slot] : impl_->active)
+        {
+            if (!impl_->accepts(key, slot.payload, slot.entered_epoch))
+            {
+                reject(error, "device fragment inventory lost its original source family");
+                return std::nullopt;
+            }
+            result.slots.push_back({.key = key, .entered_epoch = slot.entered_epoch,
+                .bootstrap_allocation = slot.bootstrap_allocation,
+                .payload = std::get<MoEOverlayPreparedFragmentPayload>(slot.payload)});
+        }
+        return result;
+    }
+
+    std::optional<MoEOverlayDevicePreparedPhysicalInventory>
+    MoEOverlayDevicePhysicalSlotLedger::preparedSnapshot(std::uint64_t epoch, std::string *error) const noexcept
+    {
+        if (error) error->clear();
+        std::lock_guard<std::mutex> lock(impl_->mutex);
+        if (!epoch || epoch != impl_->current_epoch || impl_->pending)
+        {
+            reject(error, "device mixed inventory requires its exact quiescent durable epoch");
+            return std::nullopt;
+        }
+        MoEOverlayDevicePreparedPhysicalInventory result{.epoch = epoch};
+        result.slots.reserve(impl_->active.size());
+        for (const auto &[key, slot] : impl_->active)
+        {
+            if (!impl_->accepts(key, slot.payload, slot.entered_epoch))
+            {
+                reject(error, "device mixed inventory lost an original physical source family");
+                return std::nullopt;
+            }
+            result.slots.push_back({.key = key, .entered_epoch = slot.entered_epoch,
+                .bootstrap_allocation = slot.bootstrap_allocation, .payload = slot.payload});
+        }
+        return result;
+    }
+
+    std::shared_ptr<const MoEOverlayFragmentFamily>
+    MoEOverlayDevicePhysicalSlotLedger::fragmentFamily(int participant, int layer) const noexcept
+    {
+        // Immutable after construction, independent of live selected-owner state.
+        const auto found = impl_->families.find({participant, layer});
+        return found == impl_->families.end() ? nullptr : found->second;
     }
 
     std::uint64_t MoEOverlayDevicePhysicalSlotLedger::currentEpoch()

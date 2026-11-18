@@ -50,7 +50,7 @@ namespace llaminar2
                 return false;
             const auto& snapshot = **output.residency_lease;
             if (!snapshot.valid() || snapshot.epoch != output.residency_epoch ||
-                snapshot.ownershipKind() != MoEOverlayResidencyOwnershipKind::CPUJointFragments)
+                snapshot.ownershipKind() != MoEOverlayResidencyOwnershipKind::JointFragments)
                 return false;
             const auto& owners = snapshot.placementOwnerMap();
             const MoEExpertShardCohort* cohort = nullptr;
