@@ -7564,7 +7564,9 @@ if(HAVE_CUDA OR HAVE_ROCM)
             string(REPLACE "_" ";" _channel_backends "${_channel_pair}")
             list(REMOVE_DUPLICATES _channel_backends)
             set(_channel_mpi_procs 2)
-            set(_channel_geometry "")
+            # Each replay resolves a pair of physical endpoints owned by one
+            # original rank. Two MPI ranks can never stand in for two cards.
+            set(_channel_geometry "HardwareOptional;Devices2")
             if(_channel_pair STREQUAL "CUDA_ROCm" OR _channel_pair STREQUAL "ROCm_CUDA")
                 # Both native families must belong to one actual NUMA owner.
                 set(_channel_geometry "HardwareOptional;Devices2;CUDADevices1;ROCmDevices1")
