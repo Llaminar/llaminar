@@ -712,6 +712,68 @@ objects passed the spill guard. The Release core used for the native tests has S
 `ff44736ca064c57d3d1c982bc537e313c412f735ac051cb714b6a36e86318cfd`.
 [Focused native test log](/tmp/qfn-mi50-fixed-bank-proof/canonical-wave/wave-r1/run.log)
 
+The gate and up descriptor loads each have one wait before entering the
+loop. Issuing all four scalar loads before one wait changed the four-row
+parent from 134.81 to 134.62 µs at F128 and 193.39 to 193.79 µs at F256.
+The compiler used the same registers and the arithmetic instructions
+matched. All eight timing runs passed the byte checks. The integrated
+kernel keeps the existing load schedule.
+[Single-wait timing and ISA comparison](/tmp/qfn-mi50-q4-one-wait-c2/REPORT.md)
+
+On gfx906 the inspected Q5_K reader already hoists its role-plane addresses.
+The K loop in `groupedFFNFormatProgramGate<1,-1,160>` reads packed weights,
+activation data and coefficients. The IQ1_M branch in the runtime-dispatched
+`groupedFFNFormatProgramGate<15,-1,0>` also retains its plane addresses.
+Its additional dependent loads index the IQ lookup table from a wave-uniform
+base. Neither loop repeats the descriptor loads removed from routed Q4.
+
+The current four-row FFN leaves have different distances from their
+same-card read-only references. Each row below uses the original layer 1
+routes and coefficients, H2560, ten selected experts, S160 and the same
+MI50 on PCI c2. Each reference reads the corresponding set of native
+weight planes using the same launch geometry. Separate profiling passes
+measure kernel timestamps and physical fetch bytes.
+
+| Original routed width | Gate/up, µs | Gate/up read rate | Down, µs | Down read rate |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 (participant 3) | 46.40 | 356.01 GB/s, 75.34% | 36.48 | 269.24 GB/s, 50.37% |
+| 256 (participant 0) | 84.64 | 388.88 GB/s, 78.50% | 56.80 | 340.73 GB/s, 56.43% |
+
+On the wider shard Down fetched 18,899.81 KiB and wrote 317.50 KiB. Its
+VALU issue rate was 38.37% of the separate packed-dot calibration. The
+complete windows used the original counted router. A capture on PCI ba
+with the serving fixed-row router and register top-K selectors enabled
+measured 4.16 µs for activation quantization, 16.96 µs for router logits,
+12.80 µs for top-K, 46.08 µs for gate/up and 36.32 µs for Down at F128.
+[Leaf counters, read ceilings and route IDs](/tmp/qfn-mi50-q4-k32-pipeline-c2/baseline-score.json)
+
+In the four-MI50 serving comparison, `c237ef9da` and its parent
+`5709b071f` used the original 128/128/128/256 routed split, RAM ngrams
+and identical runtime flags. Each prompt had three warmed generations of
+256 tokens. All 18 pairs produced identical generated tokens. Both MTP
+modes did the same verification work in each pair.
+
+| Mode | Review 512 decode, tok/s | Code 2048 decode, tok/s | Median paired decode change, review / code |
+| --- | ---: | ---: | ---: |
+| Off | 86.35 → 86.91 | 81.25 → 81.55 | +0.28% / +0.37% |
+| Fixed depth three | 126.46 → 130.72 | 103.68 → 107.28 | +3.37% / +3.49% |
+| Dynamic | 116.49 → 116.08 | 94.58 → 94.74 | −0.25% / +0.29% |
+
+Fixed-depth review used 296 target rows in 74 verifier calls and code used
+344 in 86, exactly four rows per call. Dynamic review used 352 in 58 calls
+and code used 414 in 69. The optimized FFN program currently selects the
+four-row capture. The largest absolute paired prefill change was 0.13%.
+[Full-model timings and matched work](/tmp/qfn-mi50-w-q4-borrow-model/comparison.json)
+
+A fresh run of the pinned Castagna fork with speculation off used the
+same quartet, GGUF and prompt token IDs. On review, `c237ef9da` decoded
+at 86.91 tok/s and Castagna at 85.76 (+1.34% for Llaminar). On code the
+rates were 81.55 and 73.65 (+10.73%). Prefill was 1,038.53 versus 874.62
+tok/s on review and 1,008.71 versus 922.66 on code. Each engine completed
+three 256-token outputs per prompt. Output histories diverged at generated
+index 0 on review and 44 on code, so each engine routed its own continuation.
+[Independent samples, token checks and retirement](/tmp/qfn-mi50-w-q4-borrow-model/ordinary-fork-comparison.json)
+
 The matched Q4 experiment also tested computing the exact signed K32 sums
 in the existing router quantizer and publishing intermediate sums alongside
 the routed activation. That helps the previously measured equal-width fixed
