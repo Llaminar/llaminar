@@ -44,7 +44,9 @@ Release ELF, Q4_K/Q5_1 measured 150.23 → 135.36 µs, Q5_K/Q8_0
 routed gate/up and down; the immutable shared expert used Q8_0 in all three.
 The four-MI50 full-model fixed-depth gate gained 2.35% and 2.65%
 on review512 and code2048. Dynamic MTP changed by less than 0.1%.
-The dominant gate/down leaves reached 59%/62% of the same-card
+On code2048, the matched fixed-depth verifier dispatch union fell from
+25.08 to 23.45 ms/round. The full four-card span fell from 26.64 to
+25.04 ms. The dominant gate/down leaves reached 59%/62% of the same-card
 geometry-matched read probe. Broader source formats remain under tuning.
 [Matched runs and read calibration](QFN_MI50_STAGE_COMPARISON_20261118.md#counted-verifier-format-qualification)
 

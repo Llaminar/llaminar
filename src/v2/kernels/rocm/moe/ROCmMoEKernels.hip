@@ -14444,9 +14444,8 @@ void rocm_moe_gate_logits_fp32_grouped_verifier_kernel(
  * including the half2 loop for even K, while sharing each gate load across the
  * sixteen-row tile handled by the expert-owned block.
  */
-template<bool Partitioned = false>
-__global__ __launch_bounds__(128, 2)
-void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
+template<bool Partitioned, int FixedRows>
+__device__ __forceinline__ void groupedFP16RouterRows(
     const float *__restrict__ hidden,
     const __half *__restrict__ gate_weights,
     float *__restrict__ logits,
@@ -14463,72 +14462,112 @@ void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
         seq_len = rows.count;
         device_effective_seq_len = nullptr;
     }
-    constexpr int ROWS_PER_BLOCK = 16;
+    static_assert(!Partitioned || FixedRows == 0);
+    constexpr int ROWS_PER_BLOCK = FixedRows ? FixedRows : 16;
+    const int width = FixedRows ? 2560 : d_model;
+    const int experts = FixedRows ? 512 : num_experts;
     const int expert = blockIdx.x;
-    if (expert >= num_experts) return;
+    if (expert >= experts) return;
 
-    const int active_rows = device_effective_seq_len ? *device_effective_seq_len : seq_len;
+    const int active_rows = FixedRows
+        ? __builtin_amdgcn_readfirstlane(*device_effective_seq_len)
+        : (device_effective_seq_len ? *device_effective_seq_len : seq_len);
     if (active_rows < 0 || active_rows > seq_len) __builtin_trap();
-    const int row_base = static_cast<int>(blockIdx.y) * ROWS_PER_BLOCK;
+    const int row_base = FixedRows ? 0 : static_cast<int>(blockIdx.y) * ROWS_PER_BLOCK;
     const int rows_in_block = min(ROWS_PER_BLOCK, active_rows - row_base);
     if (rows_in_block <= 0) return;
 
-    const __half *w = gate_weights + static_cast<size_t>(expert) * d_model;
+    // Compare the original device-owned prefix before each row's input or output touch.
+    // A fixed tile can retain one independently ordered accumulator per row.
+    const auto visitRows = [rows_in_block](auto visit) {
+        if constexpr (FixedRows)
+        {
+#pragma unroll
+            for (int row = 0; row < ROWS_PER_BLOCK; ++row)
+                if (row < rows_in_block) visit(row);
+        }
+        else
+            for (int row = 0; row < rows_in_block; ++row)
+                visit(row);
+    };
+    const __half *w = gate_weights + static_cast<size_t>(expert) * width;
     float sums[ROWS_PER_BLOCK] = {};
 
-    if ((d_model & 1) == 0)
+    if ((width & 1) == 0)
     {
-        const int pair_count = d_model >> 1;
+        const int pair_count = width >> 1;
         const __half2 *w2 = reinterpret_cast<const __half2 *>(w);
         for (int i = threadIdx.x; i < pair_count; i += blockDim.x)
         {
             const float2 ww = __half22float2(w2[i]);
             const int h = i << 1;
-            for (int local_row = 0; local_row < rows_in_block; ++local_row)
+            visitRows([&](int local_row)
             {
                 const int row = row_base + local_row;
-                const float *row_hidden = hidden + static_cast<size_t>(row) * d_model;
+                const float *row_hidden = hidden + static_cast<size_t>(row) * width;
                 sums[local_row] += router_fp16_operand(row_hidden[h]) * ww.x + router_fp16_operand(row_hidden[h + 1]) * ww.y;
-            }
+            });
         }
     }
     else
     {
-        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        for (int i = threadIdx.x; i < width; i += blockDim.x)
         {
             const float ww = __half2float(w[i]);
-            for (int local_row = 0; local_row < rows_in_block; ++local_row)
+            visitRows([&](int local_row)
             {
                 const int row = row_base + local_row;
-                sums[local_row] += router_fp16_operand(hidden[static_cast<size_t>(row) * d_model + i]) * ww;
-            }
+                sums[local_row] += router_fp16_operand(hidden[static_cast<size_t>(row) * width + i]) * ww;
+            });
         }
     }
 
     __shared__ float warp_sums[ROWS_PER_BLOCK][8];
     const int lane = threadIdx.x % warpSize;
     const int warp_id = threadIdx.x / warpSize;
-    for (int local_row = 0; local_row < rows_in_block; ++local_row)
+    visitRows([&](int local_row)
     {
         float reduced = rocm_moe_wave_reduce_sum_f32(sums[local_row]);
         if (lane == 0) warp_sums[local_row][warp_id] = reduced;
-    }
+    });
     __syncthreads();
 
     if (warp_id == 0)
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
-        for (int local_row = 0; local_row < rows_in_block; ++local_row)
+        visitRows([&](int local_row)
         {
             float reduced = (lane < nw) ? warp_sums[local_row][lane] : 0.0f;
             reduced = rocm_moe_wave_reduce_sum_f32(reduced);
             if (lane == 0)
             {
                 const int row = row_base + local_row;
-                logits[static_cast<size_t>(row) * num_experts + expert] = reduced;
+                logits[static_cast<size_t>(row) * experts + expert] = reduced;
             }
-        }
+        });
     }
+}
+
+/** @brief Preserve the original runtime-tiled grouped and partitioned entry. */
+template<bool Partitioned = false>
+__global__ __launch_bounds__(128, 2)
+void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
+    const float *__restrict__ hidden, const __half *__restrict__ gate_weights,
+    float *__restrict__ logits, int seq_len, int d_model, int num_experts,
+    const int *__restrict__ count, llaminar2::DeviceRowPartition partition = {})
+{
+    groupedFP16RouterRows<Partitioned, 0>(
+        hidden, gate_weights, logits, seq_len, d_model, num_experts, count, partition);
+}
+
+/** @brief Compile the original FP32 accumulation and wave order for one counted tile. */
+template<int Rows>
+__global__ __launch_bounds__(128, 2)
+void qfn_grouped_fp16_router_fixed_rows(
+    const float *__restrict__ hidden, const __half *__restrict__ gate_weights,
+    float *__restrict__ logits, const int *__restrict__ count, int capacity)
+{
+    groupedFP16RouterRows<false, Rows>(hidden, gate_weights, logits, capacity, 2560, 512, count);
 }
 
 /**
@@ -16865,8 +16904,31 @@ bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
         return false;
     (void)hipGetLastError();
 
-    launch_fp16_router_rows<false>(hidden, static_cast<const __half *>(gate_weights_fp16), logits,
-        seq_len, seq_len, d_model, num_experts, device_effective_seq_len, {}, static_cast<hipStream_t>(stream));
+    bool fixed_rows = false;
+    if (device_effective_seq_len && (seq_len == 4 || seq_len == 7 || seq_len == 8) &&
+        d_model == 2560 && num_experts == 512 && llaminar2::qfnGroupedFP16RouterFixedRowsOptIn())
+    {
+        const auto &hardware = llaminar2::rocmHardwareMetadata().at(device_idx);
+        fixed_rows = hardware.compute_units == 60 && hardware.native_wave_width == 64 &&
+            (hardware.isa_target == "gfx906" || hardware.isa_target.starts_with("gfx906:"));
+    }
+    if (fixed_rows)
+    {
+        if (reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            (reinterpret_cast<std::uintptr_t>(gate_weights_fp16) & 3u))
+            return false;
+        const auto native = static_cast<hipStream_t>(stream);
+        const auto *gate = static_cast<const __half *>(gate_weights_fp16);
+        if (seq_len == 4)
+            hipLaunchKernelGGL(qfn_grouped_fp16_router_fixed_rows<4>, dim3(512), dim3(128), 0,
+                native, hidden, gate, logits, device_effective_seq_len, seq_len);
+        else
+            hipLaunchKernelGGL(qfn_grouped_fp16_router_fixed_rows<8>, dim3(512), dim3(128), 0,
+                native, hidden, gate, logits, device_effective_seq_len, seq_len);
+    }
+    else
+        launch_fp16_router_rows<false>(hidden, static_cast<const __half *>(gate_weights_fp16), logits,
+            seq_len, seq_len, d_model, num_experts, device_effective_seq_len, {}, static_cast<hipStream_t>(stream));
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -16875,6 +16937,9 @@ bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
                 hipGetErrorString(err));
         return false;
     }
+    if (fixed_rows)
+        llaminar2::PerfStatsCollector::addCounter("kernel", "qfn_grouped_fp16_router_fixed_rows_nodes", 1.0,
+            "router", "rocm:" + std::to_string(device_idx), {{"physical_rows", std::to_string(seq_len)}});
     llaminar2::PerfStatsCollector::addCounter("kernel", "rocm_moe_router_fp16_operand_calls", 1.0,
         "router", "rocm:" + std::to_string(device_idx),
         {{"m", std::to_string(seq_len)}, {"d_model", std::to_string(d_model)}, {"num_experts", std::to_string(num_experts)},

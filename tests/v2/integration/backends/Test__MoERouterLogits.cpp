@@ -216,3 +216,5 @@ namespace llaminar2::test
 } // namespace llaminar2::test
 
 #include "MoEGroupedRegisterTopKReplay.inc"
+
+#include "MoEGroupedFixedFP16RouterReplay.inc"

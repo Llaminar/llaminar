@@ -413,6 +413,19 @@ participant per round.
 [Native target/draft timing](/tmp/qfn-mi50-current-stage-pair/qualified-f160-code-candidate.json)
 [Per-layer native census](/tmp/qfn-mi50-f160-fixed3-profile/boot3-r3-candidate-census.json)
 
+The fixed-row FP16 router selects its M4, M7 or M8 program during graph
+preparation. The kernel consumes the original device-owned live count, with
+the same half rounding and FP32 reduction tree as counted M1. On one MI50
+with the original layer-1 weights and F160/S160, the local M4 graph measured
+147.6635, 139.4655, 139.4585 and 147.6790 µs across control, candidate,
+candidate and control. The projection fell from 26.08 to 17.76 µs at the
+same 512×128 launch geometry. Both arms used the same register top-K kernel.
+The production preflight replays passed with partial and zero live rows,
+deferred publication and dirty inactive buffers on the exact Release core.
+These measurements cover one participant's graph. The switch
+`LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS=1` selects the candidate.
+[Native source, paired windows and run commands](/tmp/qfn-mi50-fixed-router-canonical-sol62/canonical/REPORT.md)
+
 The exact K32 reuse experiment used original-source four-row F160/S160
 fixtures on MI50 PCI c2. Each row below is a median in microseconds.
 Its two control windows bracket the treatment in the same Release.
@@ -444,6 +457,18 @@ work counters at each MTP setting.
 | Off | 87.824 → 87.810 | 82.399 → 82.440 |
 | Fixed depth 3 | 133.935 → 137.055 | 131.859 → 135.338 |
 | Dynamic | 121.091 → 121.158 | 134.684 → 134.592 |
+
+The same-ELF timestamp pair on code2048 fixed depth 3 contains 73 verifier
+rounds per arm, with 183 accepted drafts and identical 256-token histories.
+The dispatch union per device fell from 25.077 to 23.450 ms per round.
+The span from the earliest dispatch to the last completion across the four
+cards fell from 26.640 to 25.040 ms. Gate/up fell from 2.816 to 2.779 ms
+and down/fold from 2.582 to 2.025 ms. Of the 0.928 ms decrease in peer
+kernel residence, 0.922 ms occurred before the last participating GPU
+entered the matching transfer. These observations share a timeline and
+must not be added to the independently measured end-to-end improvement.
+Castagna's earlier code2048 dispatch-union reference was 18.222 ms.
+[Matched timestamp pair and per-PCI attribution](/tmp/qfn-mi50-k32-affine-model-gate/timestamp-trace/c2-code2048-same-elf-pair-r1.json)
 
 The fixed-depth improvement measures 2.35% and 2.65% on paired trials.
 Dynamic MTP changed by less than 0.1% on both prompts. The standalone

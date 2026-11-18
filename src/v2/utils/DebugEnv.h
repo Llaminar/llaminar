@@ -139,6 +139,18 @@ namespace llaminar2
         return enabled;
     }
 
+    /** @brief Select the immutable counted small-row FP16 router program on MI50. */
+    inline bool qfnGroupedFP16RouterFixedRowsOptIn()
+    {
+        static const bool enabled = [] {
+            const char* mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS");
+            if (!mode || std::strcmp(mode, "0") == 0) return false;
+            if (std::strcmp(mode, "1") == 0) return true;
+            throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS accepts 0 or 1");
+        }();
+        return enabled;
+    }
+
     /** @brief Return the experimental preferred tile for GPU expert intermediate sharding.
      * @return The native activation group size for balanced shards or the original 128-column preference.
      * @throws std::invalid_argument For values other than 0 and 1.
