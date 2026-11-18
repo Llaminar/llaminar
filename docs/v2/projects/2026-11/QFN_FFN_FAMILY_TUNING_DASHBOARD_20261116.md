@@ -36,17 +36,21 @@ and from 97.96 to 100.20 on code. The six same-executable generations and
 their MTP work matched exactly. The new candidate leads the quiet fork on
 review by 4.53% and trails on code by 7.55%. Dynamic decode rose from 115.85 to 119.30 on review and 94.23 to 97.02
 on code. All six generations retained the same MTP work.
-On review the preceding Llaminar verifier took 25.06 ms versus
-16.97 ms in Castagna, including peer work. The HC, projection, routing and
-expert subtotal accounts for 6.61 ms of the remaining 8.09 ms. Draft
-prediction is close at 0.988 versus 0.977 ms per proposed token. In every
-one of the 3,552 aligned layer/round comparisons the 256-column expert shard
+Independent post-reboot fixed-depth medians were 123.22 and 100.13 decode
+tok/s. Native verifier time was 24.78 versus 16.97 ms on review and
+26.39 versus 18.22 ms on code. HC, projections, routing and experts account
+for 6.27 and 6.14 ms of those gaps. On code, GDN publication fell from
+0.843 to 0.317 ms and top-K from 1.029 to 0.783 ms per verifier.
+In the preceding trace, across all 3,552 layer/round comparisons the 256-column expert shard
 finished last, typically 38 µs after the last 128-column shard. The narrow-only
 FFN fusion saved 1.76–1.91 ms of device work per card per verification,
 while whole-model throughput changed by less than 0.4% on its initial pair. Equalizing the routed widths at 160 columns reduced local
 verifier time on the former wide participant by 25–36 µs across all three
-original format pairs. The whole-model four-card throughput and frozen-history
-accuracy checks are pending.
+original format pairs. Byte checks on the original GGUF passed at TP1/2/4/8
+for both layouts. The new split gave all four ranks 160 columns in every
+layer. Both real-model accuracy panels passed. Equal-width prefill/decode
+mean KL was 0.03150/0.01928 versus the original 0.01432/0.02211.
+The full-model throughput runs are in progress.
 [Phase measurements, run identities and commands](QFN_MI50_STAGE_COMPARISON_20261118.md)
 
 The current ordinary decode trace covers all 255 post-prefill review tokens.

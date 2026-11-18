@@ -1,10 +1,11 @@
 # Four-MI50 QFN inference phases against Castagna Veloce
 
-The fixed-depth verifier is the largest measured gap on the 512-token review
-prompt. Llaminar needs 25.06 ms of device activity per four-row verification.
-Castagna needs 16.97 ms including its native peer reductions. The two engines
-are within 0.011 ms per draft token on average. These measurements use the
-tuned Llaminar Release candidate. Its individual switches remain experimental.
+The fixed-depth verifier is the largest measured gap on both prompts. With
+the three follow-up changes, Llaminar used 24.78 ms per four-row review
+verification and 26.39 ms for code. Castagna used 16.97 and 18.22 ms
+including its native peer reductions. Both Llaminar fixed-depth prompts
+improved end to end. Code decode still trails the fork. The individual
+switches remain experimental.
 
 ## Matched workload
 
@@ -16,7 +17,7 @@ matched input IDs. Reported throughput is the median of three unprofiled
 256-token generations after warmup. Decode counts the 255 tokens after the
 first. Native timings come from separate rocprofv3 traces.
 
-The Llaminar core SHA256 is
+The initial Llaminar core SHA256 is
 `731498df6d777a77372aa68dcff49b9ad67fb26e5f3822744057e2c45f4c800b`.
 Castagna is revision `3483d462715d61f21ed5877836be35a724446359`.
 Each profile reproduced its own unprofiled token history and draft work.
@@ -143,8 +144,11 @@ iteration. Both arms passed driver and retirement checks before the host reboot.
 The candidate gained 3.14% and 2.29% in decode over its control. Review is
 4.53% above the quiet fork median. Code is 7.55% below it and needs another
 8.17% throughput gain to reach parity. The control and treatment executed
-74 review and 86 code verifications per generation. The contributions of the
-three individual changes still require native phase measurements.
+74 review and 86 code verifications per generation. After reboot an independent, unprofiled, same-boot pair measured
+119.56 → 123.22 decode tok/s on review and 97.65 → 100.13 on code.
+Its prefill rates were 1001.64 → 1000.68 and 969.79 → 970.06 tok/s.
+Both fixed-depth arms reproduced all six same-layout serial histories and
+all five MTP-work counters per generation.
 
 The post-reboot dynamic comparison also retired cleanly. Review prefill/decode
 moved from 1000.95/115.85 to 1001.90/119.30 tok/s. Code moved from
@@ -154,16 +158,46 @@ and code executed 69 verifications and 345 draft steps. The corresponding
 unprofiled evidence is in `boot3-r1-dynamic-{control,phase}` beside the fixed
 evidence. A matched dynamic fork measurement remains unavailable.
 
-For the earlier core, the 2048-token trace produced all 256 expected IDs and
-exactly reproduced all three unprofiled token histories, all five work counters
-and the 86 M4 verification boundaries. Its original profiling runner rejected
-the trace because it required a 512-token input. Offline replay of the corrected
-workload check accepts both genuine prompt receipts and rejects altered input
-counts, generated IDs and MTP counters. This gives **diagnostic** stage timings
-of 26.664 ms per verification and 1.032 ms per draft. The independently
-qualified fork trace measured 18.222 ms and 1.208 ms respectively over its
-81 verifications and 243 proposals. A passing native rerun is still required
-before using the Llaminar code trace as a phase gate.
+Four fresh ROCProfiler captures passed admission, token-history, verifier-work,
+driver and retirement checks. The profiler accepted both original input lengths.
+All timings below are milliseconds, averaged over four physical participants.
+The verifier and accepted-state columns each count dispatch overlap once per
+device per round. Draft time uses each engine’s actual number of proposals.
+
+| Prompt and engine | Verifier | HC, projections, router and experts | Draft per proposal | Accepted-state publication |
+| --- | ---: | ---: | ---: | ---: |
+| Review control | 24.961 | 19.119 | 0.990 | 1.132 |
+| Review candidate | 24.782 | 18.881 | 0.997 | 0.562 |
+| Review Castagna | 16.970 | 12.616 | 0.977 | — |
+| Code control | 26.545 | 19.439 | 1.036 | 1.073 |
+| Code candidate | 26.391 | 19.171 | 1.039 | 0.546 |
+| Code Castagna | 18.222 | 13.033 | 1.208 | — |
+
+Every Llaminar participant executed 48 router top-K kernels and 36 GDN
+accepted-state updates per round in both arms. Register top-K reduced native
+time for those 48 calls from 1.037 to 0.779 ms on review and 1.029 to
+0.783 ms on code. Vector GDN publication reduced the 36 updates from 0.901
+to 0.331 ms on review and 0.843 to 0.317 ms on code. The candidate launched
+12 fused short-context indexer preparations per review round and zero on code.
+The two Llaminar arms executed 74 review rounds and 86 code rounds. The
+corresponding Castagna traces contain 76 and 81 rounds. The largest
+remaining verifier subtotal on code is HC, projection, router and experts,
+with a 6.14 ms gap.
+
+The 2048-token prefill dispatch unions were 2109.4 ms for the candidate
+and 1249.2 ms for Castagna. These are GPU-active times under instrumentation.
+The independent unprofiled comparison above measures prefill as users
+experience it. The fork’s 672 large reduce-and-distribute operations on
+each card include 4,032 runtime copy kernels. Counting those kernels gives
+35.32 ms of visible collective work per card. The elapsed spans of its large
+transactions averaged 329.63 ms per card. Llaminar’s visible collective
+kernels took 330.27 ms per card. Kernel duration and transaction spans
+measure different things. Neither trace records copy-engine counters.
+The source algorithms imply 15.426 GB of directed collective payload for
+Llaminar and 6.052 GB for Castagna. Llaminar transports exact FP32 rank
+inputs for its ordered expert fold. Castagna rounds its large reduction
+inputs and final owner shards to BF16. These byte counts exclude transport
+overhead and additional host legs.
 
 On ordinary review decode each Llaminar GPU executes 12 attention producers
 per token, while each Castagna GPU executes six. The pinned fork rotates pairs
@@ -227,6 +261,27 @@ waits, and any change in routing caused by regrouping the FP32 partial sums.
 Each layout needs an independent frozen-history accuracy panel and an ordinary
 generation control for its own MTP output.
 
+The native-byte source test checked 401,100,800 bytes at each of TP1, TP2,
+TP4 and TP8 for both layouts. It compared routed and shared gate, up and
+down slices with the original GGUF, sampling one routed expert per layer.
+Both layouts passed. Candidate TP2 uses two 320-column intervals, TP4 uses
+four 160-column intervals, and TP8 retains rotating 64/96-column intervals
+to preserve whole native blocks.
+
+The four-MI50 Release PyTorch panels also passed independently on the same
+16 frozen histories, covering 16 prefill and 96 teacher-forced decode rows.
+Each row compares all 248,320 final logits. All 48 layers reported the
+expected routed column widths on all four physical participants. The
+candidate includes modified grouped verifier kernels, which teacher-forced
+ordinary decode does not exercise.
+
+| Layout and phase | Mean KL, nats | Top-1 agreement | Mean top-5 overlap |
+| --- | ---: | ---: | ---: |
+| Original, prefill | 0.01432 | 93.75% | 96.25% |
+| Equal width, prefill | 0.03150 | 93.75% | 92.50% |
+| Original, decode | 0.02211 | 94.79% | 91.04% |
+| Equal width, decode | 0.01928 | 95.83% | 91.67% |
+
 Ordinary review attention also illustrates the importance of measuring across
 participants. The union across GPUs is 0.738 ms/token for Llaminar and 0.598
 for Castagna. Attention was the only active kernel category for 0.565 and
@@ -261,8 +316,21 @@ flock -x "$M/grouped-mtp-suite.lock" bash "$X/run-phases.sh" execute replay-01
 The clean pre-reboot evidence is under `$X/quartet-r1-fixed3-{control,phase}`.
 The matching ordinary arm is `$X/quartet-r1-off`. The resumed dynamic
 comparison used `$X/boot3-r1-{off,dynamic-control,dynamic-phase}`.
+The independent fixed-depth pair used `$X/boot3-r1-fixed3-{control,phase}`.
 The six measured generations and five verifier-work counters matched their
-controls. Use fresh same-boot controls after a reboot.
+controls. The four new ROCProfiler runs can be reanalyzed with the same
+per-round denominator and fork inputs used in the table.
+
+```bash
+for arm in baseline treatment; do
+  for prompt in review512 code2048; do
+    fork="$M/trace-fork-fixed3-r1"
+    if [[ "$prompt" == code2048 ]]; then fork="$P/code-fork-r1"; fi
+    python3 "$P/phase-queues.py" "$prompt" "$X/phase-native-boot3-$arm-$prompt" \
+      "$fork" "$P/replay-$arm-$prompt.json"
+  done
+done
+```
 
 The repository analyzer reads the original ROCProfiler database, measured
 verification count and authenticated physical PCI admission from each window.
@@ -279,5 +347,10 @@ python3 "$analyze" "$F/native-k4-treatment-review512" "$layout"
 ```
 
 The F160 component results, matched F256 measurements and harness commands
-are in `/tmp/qfn-mi50-f160-sol62/REPORT.md`. Full-model timing and the
-frozen-history panel for the equal-width layout are pending.
+are in `/tmp/qfn-mi50-f160-sol62/REPORT.md`. The complete balanced Release,
+source ownership contract and run commands are recorded in
+`/tmp/qfn-mi50-f160-frontier-balanced-sol62/DISPATCH.md`. Its
+`parity/combined-boot3-r1-panel-gate.json` ties both full-vocabulary panels
+to the same core, measured widths, original GGUF and PyTorch references.
+The prefill transport census and read-only trace queries are in
+`/tmp/qfn-mi50-code2048-comm-attribution/REPORT.md`.
