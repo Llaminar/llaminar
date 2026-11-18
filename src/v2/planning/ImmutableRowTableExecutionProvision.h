@@ -79,6 +79,8 @@ private:
                               g.first_layer,
                               g.last_layer,
                               g.total_shards,
+                              g.shard_index,
+                              g.shared_tp_assignment,
                               g.routed_compute_policy,
                               g.mtp_target_query_rows,
                               g.retained_mtp_candidate_rows,

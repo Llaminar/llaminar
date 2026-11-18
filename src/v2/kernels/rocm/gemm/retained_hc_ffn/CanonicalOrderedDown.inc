@@ -54,17 +54,40 @@ public:
     __device__ __forceinline__ explicit CurrentDownFields(const NativeMatrix* descriptor,
         std::integral_constant<unsigned,Columns>) : columns_(Columns)
     {
-        static_assert(NeedMins && Columns>0);
+        static_assert(Columns>0);
         static_assert(offsetof(NativeMatrix,payload)==0 && offsetof(NativeMatrix,scales)==8 &&
             offsetof(NativeMatrix,mins)==16 && offsetof(NativeMatrix,emins)==24 && sizeof(NativeMatrix)>=32);
-        using PointerWords = unsigned __attribute__((ext_vector_type(8)));
         const auto address=reinterpret_cast<uint64_t>(native_weight_uniform(descriptor));
-        PointerWords bits;
-        asm volatile("s_load_dwordx8 %0, %1, 0\n\t"
-                     "s_waitcnt lgkmcnt(0)" : "=&s"(bits) : "s"(address) : "memory");
-        payload_=reinterpret_cast<const uint8_t*>(uint64_t(bits[0])|(uint64_t(bits[1])<<32));
-        scales_=reinterpret_cast<const unsigned short*>(uint64_t(bits[2])|(uint64_t(bits[3])<<32));
-        mins_=reinterpret_cast<const unsigned short*>(uint64_t(bits[4])|(uint64_t(bits[5])<<32));
+        if constexpr(NeedMins) {
+            using PointerWords = unsigned __attribute__((ext_vector_type(8)));
+            PointerWords bits;
+            asm volatile("s_load_dwordx8 %0, %1, 0\n\t"
+                         "s_waitcnt lgkmcnt(0)" : "=&s"(bits) : "s"(address) : "memory");
+            payload_=reinterpret_cast<const uint8_t*>(uint64_t(bits[0])|(uint64_t(bits[1])<<32));
+            scales_=reinterpret_cast<const unsigned short*>(uint64_t(bits[2])|(uint64_t(bits[3])<<32));
+            mins_=reinterpret_cast<const unsigned short*>(uint64_t(bits[4])|(uint64_t(bits[5])<<32));
+        } else {
+            NativeScalarWords4 bits;
+            asm volatile("s_load_dwordx4 %0, %1, 0\n\t"
+                         "s_waitcnt lgkmcnt(0)" : "=&s"(bits) : "s"(address) : "memory");
+            payload_=reinterpret_cast<const uint8_t*>(uint64_t(bits[0])|(uint64_t(bits[1])<<32));
+            scales_=reinterpret_cast<const unsigned short*>(uint64_t(bits[2])|(uint64_t(bits[3])<<32));
+            mins_=nullptr;
+        }
+    }
+
+    /**
+     * @brief Borrow shared Q8 down payload and scale from their original kernargs.
+     * @tparam Columns Output extent proved by shared source preparation.
+     * @param descriptor Original by-value shared down matrix descriptor.
+     */
+    template<unsigned Columns>
+    __device__ __forceinline__ explicit CurrentDownFields(const NativeMatrix& descriptor,
+        std::integral_constant<unsigned,Columns>) :
+        columns_(Columns), payload_(static_cast<const uint8_t*>(descriptor.payload)),
+        scales_(static_cast<const unsigned short*>(descriptor.scales)), mins_(nullptr)
+    {
+        static_assert(!NeedMins && Columns>0);
     }
 
     /**

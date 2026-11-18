@@ -115,6 +115,9 @@ struct OriginalFragmentSourceGeometry final {
 struct OriginalFragmentPreparationHooks {
     std::optional<OriginalFragmentSourceGeometry> geometry; ///< Absent preserves the original mixed/floating fixture dimensions.
     std::function<void(const MoERoutedExpertPlacementPlan&,int)> authored_plan;
+    std::optional<std::array<GGUFTensorType,3>> routed_source_types; ///< Explicit native directory supplied by source hook.
+    /// Generate the declared role payloads through the existing bounded original-source writer.
+    bool generate_declared_routed_sources=false;
     GGUFTensorType shared_type=GGUFTensorType::F32; ///< Exact optional shared-source directory format; old owner remains FP32.
     /// Author additional genuine GGUF payloads before the ModelContext opens the file.
     std::function<void(PlanningGGUFFixture&)> source;
@@ -281,15 +284,18 @@ struct OriginalFragmentFabric final {
         authored.authority_execution=resolveMoEOverlayAuthorityExecutionKind(authored);
         plan=std::make_shared<const MoERoutedExpertPlacementPlan>(std::move(authored));
         if(hooks.authored_plan)hooks.authored_plan(*plan,rank);
-        const std::array role_types=mixed?std::array{GGUFTensorType::Q4_K,GGUFTensorType::Q4_K,GGUFTensorType::Q5_1}:
-            std::array{GGUFTensorType::F32,GGUFTensorType::F32,GGUFTensorType::F32};
+        const auto role_types=hooks.routed_source_types.value_or(mixed?
+            std::array{GGUFTensorType::Q4_K,GGUFTensorType::Q4_K,GGUFTensorType::Q5_1}:
+            std::array{GGUFTensorType::F32,GGUFTensorType::F32,GGUFTensorType::F32});
+        if(hooks.routed_source_types&&!hooks.source&&!hooks.generate_declared_routed_sources)
+            throw std::invalid_argument("Original routed source directory requires its native payload author");
         file=std::make_unique<PlanningGGUFFixture>(true,false,role_types[0],width,std::nullopt,8,
             PlanningGGUFFixture::Geometry::Directory,1,experts,hooks.shared_type,role_types,
             PlanningGGUFFixture::MoEDimensions{unsigned(hidden),unsigned(geometry.shared),unsigned(geometry.top_k)});
         // These are genuine separately encoded GGUF projection parents. In particular
         // down Q5_1 has native32 K groups; no Q4_K source is reinterpreted at F640.
         const std::array names{"blk.0.ffn_gate_exps.weight","blk.0.ffn_up_exps.weight","blk.0.ffn_down_exps.weight"};
-        for(size_t role=0;role<names.size();++role) {
+        for(size_t role=0;role<names.size()&&(!hooks.routed_source_types||hooks.generate_declared_routed_sources);++role) {
             const size_t rows=role==2?hidden:width,columns=role==2?width:hidden;
             // Author large original fixtures in bounded expert chunks. The
             // conservative FP32 extent also bounds each quantizer's temporary
@@ -303,8 +309,13 @@ struct OriginalFragmentFabric final {
                 const size_t count=std::min(experts_per_chunk,size_t(experts)-first);
                 const auto seed=91+role+first*17;
                 std::unique_ptr<TensorBase> source;
-                if(mixed && role==2)source=TestTensorFactory::createQ5_1Random({count*rows,columns},seed);
-                else if(mixed) {
+                if(role_types[role]==GGUFTensorType::Q5_1)
+                    source=TestTensorFactory::createQ5_1Random({count*rows,columns},seed);
+                else if(role_types[role]==GGUFTensorType::Q8_0)
+                    source=TestTensorFactory::createQ8_0Random({count*rows,columns},seed);
+                else if(role_types[role]==GGUFTensorType::Q5_K)
+                    source=TestTensorFactory::createQ5_KRandom({count*rows,columns},seed);
+                else if(role_types[role]==GGUFTensorType::Q4_K) {
                     const auto generated=TestTensorFactory::createQ4_KRandom({count*rows,columns},seed);
                     std::vector<uint8_t> native(generated->size_bytes());
                     std::memcpy(native.data(),generated->raw_data(),native.size());
@@ -319,6 +330,8 @@ struct OriginalFragmentFabric final {
                     }
                     source=std::make_unique<Q4_KTensor>(std::vector<size_t>{count*rows,columns},native);
                 } else {
+                    if(role_types[role]!=GGUFTensorType::F32)
+                        throw std::invalid_argument("Original fragment fixture cannot generate the declared source type");
                     auto values=TestTensorFactory::createFP32Zeros({count*rows,columns});
                     for(size_t expert=0;expert<count;++expert)for(size_t n=0;n<rows;++n)for(size_t k=0;k<columns;++k)
                         values->mutable_data()[(expert*rows+n)*columns+k]=sourceValue(int(first+expert),n,k,columns,rows);

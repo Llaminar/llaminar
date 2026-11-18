@@ -345,10 +345,12 @@ __device__ __forceinline__ ActivationBlockOperand preloadActivationBlock(
  * @param acc_lo Receives original low-chain dot. @param acc_hi Receives original high-chain dot.
  * @details Shared by ordinary and paired consumers; the group mappings and
  * previous-dot dependencies are unchanged, and no FP32 commit occurs here.
+ * @tparam Grid Original table authority by default, or an explicitly published exact lookup view.
+ * @param grid Lookup bytes retained until this complete canonical consumer retires.
  */
-template<NativeQuantisedFormat FMT>
+template<NativeQuantisedFormat FMT,class Grid=NativeQuantisedGridLookup>
 __device__ __forceinline__ void consumePackedIntegerDots(const BlockOperand<FMT>& operand,
-    const int8_t* code,int32_t& acc_lo,int32_t& acc_hi)
+    const int8_t* code,int32_t& acc_lo,int32_t& acc_hi,Grid grid={})
 {
     using Traits=NATIVE_QUANTISEDTraits<FMT>;
     const auto* activation=reinterpret_cast<const int32_t*>(code);
@@ -359,7 +361,7 @@ __device__ __forceinline__ void consumePackedIntegerDots(const BlockOperand<FMT>
     #pragma unroll
     for(unsigned group=0;group<8;++group)
     {
-        const int32_t weight=moe_decode_native_quantised_group<FMT,true>(operand.packed,group,previous_dot);
+        const int32_t weight=moe_decode_native_quantised_group<FMT,true>(operand.packed,group,previous_dot,grid);
         const int32_t input=activation[group];
         if constexpr(Traits::is_dual_scale)
         {
@@ -456,13 +458,15 @@ __device__ __forceinline__ void commitPackedIntegerDots(const BlockOperand<FMT>&
  * @details Down words-preload delegates to this single body. IQ1_M and
  * dual-asymmetric corrections receive the same original register-held words
  * through the canonical commit; no correction is duplicated.
+ * @tparam Grid Original table authority by default, or an explicitly published exact lookup view.
+ * @param grid Lookup bytes retained until this complete canonical consumer retires.
  */
-template<NativeQuantisedFormat FMT>
+template<NativeQuantisedFormat FMT,class Grid=NativeQuantisedGridLookup>
 __device__ __forceinline__ void consumePackedBlockLateMetadata(const BlockOperand<FMT>& operand,
-    const int8_t* code,const float* scales,const int32_t* sums,uint32_t index,float& accumulator)
+    const int8_t* code,const float* scales,const int32_t* sums,uint32_t index,float& accumulator,Grid grid={})
 {
     int32_t acc_lo,acc_hi;
-    consumePackedIntegerDots<FMT>(operand,code,acc_lo,acc_hi);
+    consumePackedIntegerDots<FMT>(operand,code,acc_lo,acc_hi,grid);
     const int32_t last_dot=NATIVE_QUANTISEDTraits<FMT>::is_dual_scale?acc_hi:acc_lo;
     const float scale=activationMetadataAfterDot(scales,index,last_dot);
     int32_t sum=0;
@@ -482,17 +486,19 @@ __device__ __forceinline__ void consumePackedBlockLateMetadata(const BlockOperan
  * caller still loads all four weights first; no four-expert activation array
  * exists. Full shipping allocation must prove register scalar replacement and
  * that future consumers do not extend these current-expert word lifetimes.
+ * @tparam Grid Original table authority by default, or an explicitly published exact lookup view.
+ * @param grid Lookup bytes retained until this complete canonical consumer retires.
  */
-template<NativeQuantisedFormat FMT,ActivationIssue Issue=ActivationIssue::DownWordsPreload>
+template<NativeQuantisedFormat FMT,ActivationIssue Issue=ActivationIssue::DownWordsPreload,class Grid=NativeQuantisedGridLookup>
 __device__ __forceinline__ void consumePackedBlock(const BlockOperand<FMT>& operand,
-    const int8_t* code,const float* scales,const int32_t* sums,uint32_t index,float& accumulator)
+    const int8_t* code,const float* scales,const int32_t* sums,uint32_t index,float& accumulator,Grid grid={})
 {
     if constexpr(Issue==ActivationIssue::GateUpBlockPreload)
     {
         const auto activation=preloadActivationBlock<FMT>(code,scales,sums,index);
         const auto* original_bytes=reinterpret_cast<const int8_t*>(activation.words);
         int32_t acc_lo,acc_hi;
-        consumePackedIntegerDots<FMT>(operand,original_bytes,acc_lo,acc_hi);
+        consumePackedIntegerDots<FMT>(operand,original_bytes,acc_lo,acc_hi,grid);
         commitPackedIntegerDots<FMT>(operand,original_bytes,acc_lo,acc_hi,
             activation.scale,activation.sum,accumulator);
     }
@@ -508,7 +514,7 @@ __device__ __forceinline__ void consumePackedBlock(const BlockOperand<FMT>& oper
             "+v"(words[4]),"+v"(words[5]),"+v"(words[6]),"+v"(words[7]));
 #endif
         consumePackedBlockLateMetadata<FMT>(operand,
-            reinterpret_cast<const int8_t*>(words),scales,sums,index,accumulator);
+            reinterpret_cast<const int8_t*>(words),scales,sums,index,accumulator,grid);
     }
 }
 
@@ -526,12 +532,21 @@ __device__ __forceinline__ void consumePackedBlock(const BlockOperand<FMT>& oper
  * @return Original ascending-K32 partial, or positive zero for the leader-authenticated invariant rejection.
  * @pre Caller selects the record's exact physical decoder and original N/K;
  * the original publication leader authors numeric_validity before the same LDS join.
+ * @tparam Grid Original table authority by default, or an explicitly published exact lookup view.
+ * @param grid Lookup bytes retained until this complete canonical consumer retires.
  */
 template<NativeQuantisedFormat FMT,ActivationIssue Issue=ActivationIssue::DownWordsPreload,
-    class Reader=NativeLayoutWeightReader,class Binding>
+    class Reader=NativeLayoutWeightReader,class Binding,class Grid=NativeQuantisedGridLookup>
 __device__ __forceinline__ float phaseRolePartial(const Binding& binding,unsigned n,
-    const int8_t* code,const float* scale,const int32_t* sums,unsigned N,unsigned K,unsigned part)
+    const int8_t* code,const float* scale,const int32_t* sums,unsigned N,unsigned K,unsigned part,Grid grid={})
 {
+    if constexpr ((FMT == NATIVE_QUANTISED_IQ2_S || FMT == NATIVE_QUANTISED_IQ3_S ||
+                   FMT == NATIVE_QUANTISED_IQ3_XXS) && requires { grid.template useDeviceTable<FMT>(); }) {
+        // Select the address space once for the whole K partition. Both paths
+        // consume the same encoded weights with the same ordered integer dots.
+        if (grid.template useDeviceTable<FMT>())
+            return phaseRolePartial<FMT,Issue,Reader>(binding,n,code,scale,sums,N,K,part,NativeQuantisedGridLookup{});
+    }
     using Traits=NATIVE_QUANTISEDTraits<FMT>;
     if(waveMetadataValue(binding.numeric_validity)!=PhaseProjectionValidation::State::Valid)return 0.f;
     const unsigned first=part*waveMetadataValue(binding.partition_blocks),last=min(K/32,first+waveMetadataValue(binding.partition_blocks));
@@ -546,9 +561,80 @@ __device__ __forceinline__ float phaseRolePartial(const Binding& binding,unsigne
     {
         const size_t linear=size_t(block)*N+n;const auto operand=preloadBlock<FMT,Reader>(payload,weight_scales,mins,emins,linear);
         consumePackedBlock<FMT,Issue>(operand,
-            code+size_t(block)*32,scale,sums,block,accumulator);
+            code+size_t(block)*32,scale,sums,block,accumulator,grid);
     }
     return accumulator;
+}
+/**
+ * @brief Reuse one immutable activation block across compatible independent role partials.
+ * @tparam FMT Actual physical decoder, never inferred from the other role's source policy.
+ * @tparam Reader Existing original generic reader or the admitted global-only weight reader.
+ * @tparam Binding Original phase record reference, retaining native LDS provenance.
+ * @param gate Original gate record. @param up Original independently validated up record.
+ * @param n Original output column. @param code Immutable original activation codes.
+ * @param scale Original activation block scales. @param sums Original exact code sums.
+ * @param N Original complete output width. @param K Original complete reduction width.
+ * @param part Exact original partition coordinate, common only after the compatibility checks.
+ * @param gate_acc Receives this original gate partial only when compatibility succeeds.
+ * @param up_acc Receives this original up partial only when compatibility succeeds.
+ * @return True after both partials are complete. False leaves outputs unchanged;
+ * the caller must execute the existing independent-role consumers for that valid
+ * incompatible pair, including their original zero and unsupported-format rules.
+ * @details Compatibility is a reuse condition, not a new capability or source
+ * policy. Both original publication leaders have already performed their own
+ * fatal policy/readiness/numeric classification before the existing LDS join.
+ * Only equal ready/valid physical formats and equal P/partition widths share
+ * activation reads. Source scopes name one current weight operand per role;
+ * actual compiler live ranges remain a mandatory resource/ISA gate. Each role
+ * retains its own ascending K32 commits; no integer decoder,
+ * FP commit, partition fold, public store or publication join is duplicated here.
+ * @pre All active peers borrow the same immutable role pair. Codes/scales/sums
+ * remain read-only until both roles finish, as in the existing GU phase.
+ * gate_acc and up_acc are the distinct original role accumulators.
+ */
+template<NativeQuantisedFormat FMT,class Reader=NativeLayoutWeightReader,class Binding>
+__device__ __forceinline__ bool pairedIndependentRolePartial(const Binding& gate,const Binding& up,
+    unsigned n,const int8_t* code,const float* scale,const int32_t* sums,unsigned N,unsigned K,unsigned part,
+    float& gate_acc,float& up_acc)
+{
+    if(n>=N||!waveMetadataValue(gate.ready)||!waveMetadataValue(up.ready)||
+        waveMetadataValue(gate.numeric_validity)!=PhaseProjectionValidation::State::Valid||
+        waveMetadataValue(up.numeric_validity)!=PhaseProjectionValidation::State::Valid||
+        waveMetadataValue(gate.codebook)!=FMT||waveMetadataValue(up.codebook)!=FMT)return false;
+    const unsigned parts=waveMetadataValue(gate.parts),width=waveMetadataValue(gate.partition_blocks);
+    if(part>=parts||parts!=waveMetadataValue(up.parts)||width!=waveMetadataValue(up.partition_blocks))return false;
+    const auto* gp=waveMetadataValue(gate.payload);const auto* gs=waveMetadataValue(gate.scales);
+    const auto* upayload=waveMetadataValue(up.payload);const auto* us=waveMetadataValue(up.scales);
+    const uint16_t *gm=nullptr,*um=nullptr;const uint32_t *ge=nullptr,*ue=nullptr;
+    if constexpr(NATIVE_QUANTISEDTraits<FMT>::requires_secondary_metadata) {
+        gm=waveMetadataValue(gate.mins);um=waveMetadataValue(up.mins);
+    }
+    if constexpr(NATIVE_QUANTISEDTraits<FMT>::needs_emin_array) {
+        ge=waveMetadataValue(gate.emins);ue=waveMetadataValue(up.emins);
+    }
+    const unsigned first=part*width,last=min(K/32,first+width);
+    gate_acc=0.f;up_acc=0.f;
+#pragma unroll 1
+    for(unsigned block=first;block<last;++block) {
+        const std::size_t linear=std::size_t(block)*N+n;
+        ActivationBlockOperand activation;
+        {
+            const auto operand=preloadBlock<FMT,Reader>(gp,gs,gm,ge,linear);
+            activation=preloadActivationBlock<FMT>(code+std::size_t(block)*32,scale,sums,block);
+            const auto* original=reinterpret_cast<const int8_t*>(activation.words);
+            int32_t low,high;
+            consumePackedIntegerDots<FMT>(operand,original,low,high);
+            commitPackedIntegerDots<FMT>(operand,original,low,high,activation.scale,activation.sum,gate_acc);
+        }
+        {
+            const auto operand=preloadBlock<FMT,Reader>(upayload,us,um,ue,linear);
+            const auto* original=reinterpret_cast<const int8_t*>(activation.words);
+            int32_t low,high;
+            consumePackedIntegerDots<FMT>(operand,original,low,high);
+            commitPackedIntegerDots<FMT>(operand,original,low,high,activation.scale,activation.sum,up_acc);
+        }
+    }
+    return true;
 }
 /**
  * @brief Q4 strategy: load gate/up together using each role's scalar original planes.

@@ -126,7 +126,10 @@ const void* fullProductionHCFunction(const MoEOverlayParticipantLayerBank& sourc
         mask|=std::uint32_t(1)<<descriptor.codebook_id;
     }
     const auto program=rocm::ResidentMoEFFNDecoderProgram::fromExecutionMask(mask);
-    require(!expected_groups||program.groups()==expected_groups,"full production actual source envelope selects expected decoder group union");
+    if (expected_groups && program.groups() != expected_groups)
+        throw std::runtime_error("Prepared decoder group " + std::to_string(program.groups()) +
+            " from physical mask " + std::to_string(mask) + " differs from expected group " +
+            std::to_string(expected_groups));
     return rocm::fullNativeHCFFNKernelFunction(program);
 }
 /**
@@ -273,7 +276,8 @@ void replayFullNativeHCFFN(DeviceId device,int member,ILocalTPContext& tp,std::b
     const TensorParallelConfig& partition,PreparedWeightStore& store,OriginalFFNFixtureGeometry shape,
     FullProductionHCProbe mode,FullProductionHCStorageReuse storage_reuse=FullProductionHCStorageReuse::Distinct,
     unsigned expected_groups=0,bool timing=false,
-    FullProductionHCObservation observation=FullProductionHCObservation::ObservedAll)
+    FullProductionHCObservation observation=FullProductionHCObservation::ObservedAll,
+    RealRetainedTPSourceWindow* original_window=nullptr)
 {
     require(device.is_rocm()&&tp.degree()==1&&member==0&&shape.hidden==2560&&mode!=FullProductionHCProbe::Disabled,
         "full production replay uses its explicit ordinary original M1 local source");
@@ -329,8 +333,12 @@ void replayFullNativeHCFFN(DeviceId device,int member,ILocalTPContext& tp,std::b
         auto frame=banks.initialJointLayer(original_member,0);require(bool(frame),"original HC/FFN source bank");
         auto setup=frame->acquireInitialConstruction();require(bool(setup),"original HC/FFN construction lease");
         const auto& source=setup->layerForModelLayer(0);
+        const auto declaration=MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(source.fragment_family);
         const auto full_function=retained?
-            rocm::retainedM1HCFFNKernelFunction(FullNativeHCFFNOutputDemand::none(),MoESelectedDescriptorDemand::AcquiredBankOnly):
+            rocm::retainedM1HCFFNKernelFunction(FullNativeHCFFNOutputDemand::none(),
+                MoESelectedDescriptorDemand::AcquiredBankOnly, {
+                    .routed_gate=declaration.nativeGateUpEnvelope().execution_codebook_mask,
+                    .routed_down=declaration.nativeDownEnvelope().execution_codebook_mask}):
             fullProductionHCFunction(source,shared,store,device,expected_groups);
         // All sources, captures and asynchronous destinations precede the guard.
         // Its destructor retires work before any borrowed storage can be released.
@@ -350,8 +358,17 @@ void replayFullNativeHCFFN(DeviceId device,int member,ILocalTPContext& tp,std::b
             p.down=fullProductionHCFloat(R,device,stream);p.activated=fullProductionHCFloat(R,device,stream);
             p.logits=fullProductionHCFloat(K,device,stream);
             if(outside_reader)p.reader_mixed=fullProductionHCFloat(H,device,stream);
-            p.down_source=TestTensorFactory::createQ8_0Random({R,K},864411u);
-            p.up_source=TestTensorFactory::createQ8_0Random({K,R},864412u);
+            if(original_window) {
+                p.down_source=original_window->loadHC("hc_ffn_down.weight",TensorType::Q8_0,{K,R});
+                p.up_source=original_window->loadHC("hc_ffn_up.weight",TensorType::Q8_0,{R,K});
+                auto gain=original_window->loadHC("hc_ffn_norm.weight",TensorType::FP32,{K});
+                std::memcpy(p.gain->mutable_data(),gain->raw_data(),K*sizeof(float));
+                TransferEngine::prepareDeviceInput(p.gain.get(),device,stream);
+                require(completion.join(),"retire original real HC gain publication");
+            } else {
+                p.down_source=TestTensorFactory::createQ8_0Random({R,K},864411u);
+                p.up_source=TestTensorFactory::createQ8_0Random({K,R},864412u);
+            }
             p.down_prepared=makeGpuPreparedGemm(p.down_source.get(),device,"full.hc.down");
             p.up_prepared=makeGpuPreparedGemm(p.up_source.get(),device,"full.hc.up");
             p.down_prepared.orchestrator->finalize();p.up_prepared.orchestrator->finalize();
@@ -706,6 +723,31 @@ void replayFullNativeHCFFN(DeviceId device,int member,ILocalTPContext& tp,std::b
                     baseline[side]=observed[side];baseline_ids[side]=ids[side];baseline_weights[side]=weights[side];
                 }
                 exact("paired family timing input record");
+                if(original_window&&round>=5) {
+                    const auto& rows=runtime_observed[1].acquired;
+                    const auto& participants=runtime_observed[1].participants;
+                    const int local_participant=int(lanes[1]->runtime->hostLayerState(0).participant_id);
+                    const auto matrix_bytes=[](const DeviceNativeQuantisedMatrixDesc& matrix) {
+                        const auto* source=native_quantised_formats::forSourceIdentity(
+                            matrix.source_codebook_id,matrix.source_is_superblock);
+                        require(source&&matrix.valid()&&matrix.source_identity_present&&
+                            matrix.codebook_id==canonicalDeviceVnniCodebookId(*source),
+                            "actual timed route's canonical native projection descriptor");
+                        const auto format=canonicalDeviceVnniFormat(*source);
+                        return std::size_t(matrix.n)*matrix.blocks_per_row*
+                            (format.payload_bytes_per_block+sizeof(uint16_t)*(1u+format.is_asymmetric+format.has_emins));
+                    };
+                    std::size_t local_routes=0,logical_routed_bytes=0;
+                    for(std::size_t slot=0;slot<participants.size();++slot)
+                        if(participants[slot]==local_participant) {
+                            ++local_routes;
+                            const auto& row=rows[slot];
+                            logical_routed_bytes+=matrix_bytes(row.gate)+matrix_bytes(row.up)+matrix_bytes(row.down);
+                        }
+                    std::osyncstream(std::cout)<<"QFN_RETAINED_WINDOW_TIMED_WORK,round="<<round-5
+                        <<",record="<<order.record<<",local_routes="<<local_routes
+                        <<",logical_routed_bytes="<<logical_routed_bytes<<'\n';
+                }
                 const bool abba=order.order==native_quantised_dispatch::PairedTimingOrder::ABBA;
                 const std::array<unsigned,4> sequence=abba?std::array{0u,1u,1u,0u}:std::array{1u,0u,0u,1u};
                 for(unsigned slot=0;slot<sequence.size();++slot) {

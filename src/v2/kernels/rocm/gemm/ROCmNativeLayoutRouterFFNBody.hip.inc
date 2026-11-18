@@ -137,17 +137,19 @@ __device__ __forceinline__ PhaseProjection phaseProjection(
  * @tparam Issue Internal activation issue contract, defaulting to down words-only preload.
  * @tparam Mask Admitted immutable physical decoder envelope.
  * @tparam Reader Default original generic loads or an explicitly proven weight-only reader.
- * @tparam Binding Existing native LDS or generic metadata reference; never copied. */
+ * @tparam Binding Existing native LDS or generic metadata reference; never copied.
+ * @tparam Grid Original device table or exact published lookup view.
+ * @param grid Immutable lookup bytes retained for the original role consumer. */
 template<uint32_t Mask,ActivationIssue Issue=ActivationIssue::DownWordsPreload,
-    class Reader=NativeLayoutWeightReader,class Binding>
+    class Reader=NativeLayoutWeightReader,class Binding,class Grid=NativeQuantisedGridLookup>
 __device__ __forceinline__ float phasePartial(const Binding& p,unsigned n,const int8_t* code,const float* scale,
-    const int32_t* sums,unsigned N,unsigned K,unsigned part)
+    const int32_t* sums,unsigned N,unsigned K,unsigned part,Grid grid={})
 {
     // The enclosing gate team or down batch owns one immutable record per
     // physical wave. Preserve that authority at the dispatcher as well as
     // within each decoder; column and partition eligibility remain lane-local.
     if(!waveMetadataValue(p.ready)||n>=N||part>=waveMetadataValue(p.parts))return 0.f;
-#define LAYOUT_CASE(F) case F:if constexpr(Mask&(1u<<unsigned(F)))return phaseRolePartial<F,Issue,Reader>(p,n,code,scale,sums,N,K,part);else break;
+#define LAYOUT_CASE(F) case F:if constexpr(Mask&(1u<<unsigned(F)))return phaseRolePartial<F,Issue,Reader>(p,n,code,scale,sums,N,K,part,grid);else break;
     switch(waveMetadataValue(p.codebook))
     {
     LAYOUT_CASE(NATIVE_QUANTISED_Q4_0) LAYOUT_CASE(NATIVE_QUANTISED_IQ4_NL)

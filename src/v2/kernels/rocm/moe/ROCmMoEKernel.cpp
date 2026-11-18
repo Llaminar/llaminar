@@ -13254,6 +13254,7 @@ public:
         mix(args_.original.firstIntermediateColumn());mix(args_.original.intermediateColumns());
         mix(args_.original.target().participantId());mix(args_.original.target().cohortTarget());
         const auto& evidence=admission_.evidence();
+        sealRetainedModelReceipt();
         mix(static_cast<std::uint64_t>(evidence.kind));mix(evidence.generation);mix(evidence.nativeEntries().size());
         mix(static_cast<std::uint64_t>(evidence.device.type));mix(evidence.device.ordinal);
         for(const auto& entry:evidence.nativeEntries())
@@ -13446,12 +13447,17 @@ public:
             const rocm::FullNativeHCFFNArgs full{*native_router_,*full_prefix_};
             if(full_prefix_->implementation==rocm::FullNativeHCFFNImplementation::RetainedGFX906M1) {
                 const auto& evidence=admission_.evidence();
+                const auto histogram=rocm::retainedM1NativeHistogramPolicy(request_.model_main_inference?
+                    request_.model_main_inference->histogram_producer:MoERuntimeHistogramProducerRole::ProductionDecode);
                 if(evidence.generation!=workspace_id_||evidence.nativeEntries().size()!=1||
-                   evidence.nativeEntries().front().function!=rocm::retainedM1HCFFNKernelFunction(full.prefix.output_demand,full.prefix.selected_descriptor_demand))
+                   evidence.nativeEntries().front().function!=rocm::retainedM1HCFFNKernelFunction(full.prefix.output_demand,
+                       full.prefix.selected_descriptor_demand,full.suffix.ffn.execution,histogram))
                     throw std::logic_error("Retained M1 HC/FFN lost its exact prepared function");
                 rocm::launchRetainedM1HCFFNDevice(full,request_.shared.gate,request_.shared.up,request_.shared.down,
-                    rocm::retainedM1HCFFNScratch(full_prefix_->barrier_state),workspace_id_,stream);
-                PerfStatsCollector::addCounter("kernel","rocm_retained_m1_hc_ffn_calls",1.0,"moe",evidence.device.toString());
+                    rocm::retainedM1HCFFNScratch(full_prefix_->barrier_state),workspace_id_,stream,histogram);
+                if(!retained_model_receipt_.empty()&&::llaminar2::isGraphCaptureActive())
+                    PerfStatsCollector::addCounter("gpu_graph_inventory","retained_m1_layer_binding",1.0,
+                        "graph_setup",evidence.device.toString(),retained_model_receipt_);
             } else rocm::launchFullNativeHCFFN(admission_,full,stream,workspace_id_);
             PerfStatsCollector::addCounter("kernel","rocm_full_native_hc_ffn_calls",1.0,"moe",
                 admission_.evidence().device.toString(),{{"resident_grid",std::to_string(args_.resident_grid)}});
@@ -13463,8 +13469,53 @@ public:
              {"shared_f",std::to_string(args_.shared_columns)},{"resident_grid",std::to_string(args_.resident_grid)},{"native_launches",std::to_string(admission_.evidence().nativeEntries().size())}});
     }
 private:
+    /**
+     * @brief Seal an opt-in diagnostic census from original model, detector and prepared launch owners.
+     * @pre The exact registered HIP entry and its stream were admitted cold by the original backend.
+     * @details Captured replay never resolves function names or constructs tags.
+     */
+    void sealRetainedModelReceipt()
+    {
+        if(!request_.model_main_inference ||
+           !PerfStatsCollector::isRecordFamilyEnabled("gpu_graph_inventory","retained_m1_layer_binding"))return;
+        if(!full_prefix_ || full_prefix_->implementation!=rocm::FullNativeHCFFNImplementation::RetainedGFX906M1)
+            throw std::logic_error("Retained model receipt requires its original retained preparation");
+
+        const auto sourceName=[](const ExpertWeightFormat& role) -> const char* {
+            const auto source=role.native_quantised;
+            if(role.isNativeQuantised() && source.present) {
+                if(source.codebook_id==5 && source.is_superblock)return "Q4_K";
+                if(source.codebook_id==7)return source.is_superblock?"Q5_K":"Q5_1";
+                if(source.codebook_id==19 && !source.is_superblock)return "Q8_0";
+            }
+            throw std::logic_error("Retained model receipt lost its original GGUF source identity");
+        };
+        const auto& mode=*request_.model_main_inference;
+        const auto& sources=request_.original.sourceFormats();
+        const auto& evidence=admission_.evidence();
+        const auto& entry=evidence.nativeEntries().front();
+        const auto* symbol=hipKernelNameRefByPtr(entry.function,static_cast<hipStream_t>(stream_));
+        if(!symbol||!*symbol||mode.source_layer<0||!barrier_slot_)
+            throw std::logic_error("Retained model receipt requires its resolved HIP kernel and source layer");
+        const auto& hardware=rocmHardwareMetadata().at(evidence.device.ordinal);
+        retained_model_receipt_={
+            {"layer",std::to_string(mode.source_layer)},
+            {"h",std::to_string(args_.hidden_columns)},{"r",std::to_string(full_prefix_->hc.publication.columns)},
+            {"f",std::to_string(args_.routed_columns)},{"s",std::to_string(args_.shared_columns)},
+            {"experts",std::to_string(args_.experts)},{"top_k",std::to_string(args_.top_k)},
+            {"f_start",std::to_string(args_.original.firstIntermediateColumn())},
+            {"s_start",std::to_string(mode.shared_source_first_column)},
+            {"gate",sourceName(sources[0])},{"up",sourceName(sources[1])},{"down",sourceName(sources[2])},
+            {"pci",hardware.pci_address},{"phase","decode"},{"role","main_inference"},
+            {"rows",std::to_string(args_.rows.physicalRows())},{"requests","1"},
+            {"scratch_slot",std::to_string(barrier_slot_->slot())},
+            {"kernel",symbol},{"grid",std::to_string(entry.grid)+"x1x1"},{"block",std::to_string(entry.threads)+"x1x1"},
+        };
+    }
+
     ROCmMoEKernel* owner_;
     const ResidentMoEFFNRequest request_;
+    PerfStatsCollector::Tags retained_model_receipt_; ///< Cold optional model census; no device state is cached here.
     const rocm::ResidentMoEFFNArgs args_;
     const rocm::PreparedMoEFFNProgram admission_;
     const std::shared_ptr<PersistentWorkspaceSlotLease> barrier_slot_; ///< Exclusive barrier bytes until graph retirement.
@@ -13734,7 +13785,9 @@ std::unique_ptr<PreparedResidentMoEFFN> ROCmMoEKernel::prepareResidentMoEFFNImpl
             if(full.prefix.implementation==rocm::FullNativeHCFFNImplementation::RetainedGFX906M1)
                 (void)rocm::ROCmRetainedM1HCFFNBinding::resolve(full,request.shared,masks);
             const auto admission=full.prefix.implementation==rocm::FullNativeHCFFNImplementation::RetainedGFX906M1
-                ?rocm::prepareRetainedM1HCFFN(device,full,masks,workspace_->id())
+                ?rocm::prepareRetainedM1HCFFN(device,full,masks,workspace_->id(),
+                    rocm::retainedM1NativeHistogramPolicy(request.model_main_inference?
+                        request.model_main_inference->histogram_producer:MoERuntimeHistogramProducerRole::ProductionDecode))
                 :rocm::prepareFullNativeHCFFN(device,full,masks,workspace_->id());
             validateFullNativeHCFFNPrefixBinding(full.prefix,full.suffix);
             validateFullNativeHCFFNStorage(full.prefix,full.suffix,scratch,*workspace_);

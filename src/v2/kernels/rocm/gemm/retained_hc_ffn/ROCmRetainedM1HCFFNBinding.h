@@ -10,7 +10,7 @@
 
 #include <stdexcept>
 #include "execution/moe/MoERuntimeTable.h"
-#include "kernels/rocm/gemm/ROCmFullNativeHCFFN.h"
+#include "ROCmRetainedM1HCFFNDevice.h"
 
 namespace llaminar2::rocm {
 
@@ -38,17 +38,21 @@ public:
         const auto& suffix=full.suffix;
         const auto& ffn=suffix.ffn;
         const auto& hc=full.prefix.hc;
-        if(ffn.hidden_columns!=2560 || ffn.routed_columns!=256 || ffn.shared_columns!=192 ||
-           ffn.experts!=512 || ffn.top_k!=10 || hc.norm.hidden!=ffn.hidden_columns ||
+        const int routed=ffn.routed_columns;
+        const int shared_width=ffn.shared_columns;
+        // Routed cuts rotate independently of the dense/shared assignment, so
+        // all four TP8 F/S pairs can occur across the original layer sequence.
+        const bool original_shard=(routed==640 && shared_width==640) ||
+            ((routed==256 || routed==384) && shared_width==320) ||
+            ((routed==128 || routed==256) && shared_width==160) ||
+            ((routed==64 || routed==96) && (shared_width==64 || shared_width==96));
+        const bool matched_reference_shard=routed==256 && shared_width==192;
+        if(ffn.hidden_columns!=2560 || (!original_shard && !matched_reference_shard) ||
+           ffn.experts!=512 || ffn.top_k!=retainedM1SelectedExperts || hc.norm.hidden!=ffn.hidden_columns ||
            hc.mixed!=ffn.hidden || hc.publication.columns!=320)
-            throw std::invalid_argument("Retained ROCm HC/FFN arithmetic requires H2560/R320/F256/S192/E512/topK10");
+            throw std::invalid_argument("Retained ROCm HC/FFN requires H2560/R320/E512/topK10 and a declared native TP1/2/4/8 or F256/S192 reference shard");
 
-        const auto rows=ffn.rows.captureIdentity();
-        const auto counted_one=DeviceRowRange::CaptureIdentity{rows.count,1,0,1,1};
-        if(!rows.count || rows!=counted_one || hc.norm.extent.rows!=1 ||
-           hc.norm.extent.liveRows!=rows.count || hc.up.rows.captureIdentity()!=rows ||
-           hc.publication.rows.captureIdentity()!=rows)
-            throw std::invalid_argument("Retained ROCm HC/FFN phases require the same original counted M1 row");
+        const auto* count=validateRowAuthority(ffn.rows,hc);
 
         if(hc.injection.weights || hc.injection.output)
             throw std::invalid_argument("Retained ROCm HC/FFN admission has no independent FP32 injection");
@@ -57,21 +61,39 @@ public:
 
         if(shared.weight_format!=DeviceMoEWeightFormat::NativeQuantised ||
            !nativeQ8(hc.down_weights,320,10240) || !nativeQ8(hc.up.weights,10240,320) ||
-           !nativeQ8(shared.gate,192,2560) || !nativeQ8(shared.up,192,2560) ||
-           !nativeQ8(shared.down,2560,192))
+           !nativeQ8(shared.gate,ffn.shared_columns,ffn.hidden_columns) ||
+           !nativeQ8(shared.up,ffn.shared_columns,ffn.hidden_columns) ||
+           !nativeQ8(shared.down,ffn.hidden_columns,ffn.shared_columns))
             throw std::invalid_argument("Retained ROCm HC/FFN requires original native Q8 HC and shared sources");
 
-        constexpr std::uint32_t q4_k=1u<<5, q5_1=1u<<7, q8_0=1u<<19;
-        if(masks.routed_gate!=q4_k || masks.routed_down!=q5_1 ||
+        constexpr std::uint32_t q8_0=1u<<19;
+        if(!retainedM1RoutedFormat(masks.execution) ||
+           masks.routed_gate!=masks.execution.routed_gate || masks.routed_down!=masks.execution.routed_down ||
            masks.shared_gate!=q8_0 || masks.shared_down!=q8_0 ||
-           masks.execution.routed_gate!=q4_k || masks.execution.routed_down!=q5_1 ||
            masks.execution.shared_gate!=q8_0 || masks.execution.shared_down!=q8_0)
             throw std::invalid_argument("Retained ROCm HC/FFN requires its exact original and reachable native role envelopes");
 
-        return ROCmRetainedM1HCFFNBinding(rows.count);
+        return ROCmRetainedM1HCFFNBinding(count);
     }
 
-    /** @return Original M1 execution owner, borrowed for the prepared native graph. */
+    /**
+     * @brief Authenticate one identical ordinary row contract across the original phases.
+     * @param suffix Original FFN row range.
+     * @param hc Exact source-owned HC argument views.
+     * @return The original counted row owner, or null for the original fully-active row.
+     * @throws std::invalid_argument For a foreign owner, expansion or logical/physical extent.
+     */
+    static const std::int32_t* validateRowAuthority(DeviceRowRange suffix,const PersistentHCReadArgs& hc)
+    {
+        const auto rows=suffix.captureIdentity();
+        const auto expected=DeviceRowRange::CaptureIdentity{rows.count,1,0,1,1};
+        if(rows!=expected || hc.norm.extent.rows!=1 || hc.norm.extent.liveRows!=rows.count ||
+           hc.up.rows.captureIdentity()!=rows || hc.publication.rows.captureIdentity()!=rows)
+            throw std::invalid_argument("Retained ROCm HC/FFN phases require the same original M1 row authority");
+        return rows.count;
+    }
+
+    /** @return Original counted row owner, or null for the fully-active contract. */
     const std::int32_t* countOwner() const noexcept {return count_;}
 
 private:

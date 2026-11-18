@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
+#include <type_traits>
 
 namespace llaminar2::rocm {
 /** @brief Load a captured policy at its original first-kernarg field offsets. */
@@ -37,6 +38,66 @@ struct FullNativeHCFFNSuffixGeometry {
     unsigned panel_rows; ///< Native4..64 rows, or the minimum counted linear one-row panel.
     std::uint64_t useful_ctas; ///< Live task ceiling, never an occupancy estimate.
 };
+/** @brief Exact routed format eligible for the original IQ2_S lookup table. */
+inline constexpr std::uint32_t routedIQ2SBit = 1u << unsigned(NATIVE_QUANTISED_IQ2_S);
+
+/** @brief Count 64-bit IQ2_S entries reachable through the sealed routed role. */
+__host__ __device__ constexpr unsigned routedIQ2GridEntries(std::uint32_t mask) {
+    return (mask & routedIQ2SBit)
+        ? NATIVE_QUANTISEDTraits<NATIVE_QUANTISED_IQ2_S>::grid_lds_bytes / sizeof(std::uint64_t) : 0;
+}
+
+/**
+ * @brief Count the immutable lookup words needed by the routed gate/up declaration.
+ * @tparam Format Original IQ3 codebook. @param mask Captured gate/up decoder mask.
+ * @return Number of 32-bit entries, including the whole index range of that codebook.
+ */
+template<NativeQuantisedFormat Format>
+__host__ __device__ constexpr std::size_t routedIQ3GridWords(std::uint32_t mask) {
+    static_assert(Format == NATIVE_QUANTISED_IQ3_S || Format == NATIVE_QUANTISED_IQ3_XXS);
+    return mask & (1u << unsigned(Format)) ? NATIVE_QUANTISEDTraits<Format>::grid_lds_bytes / sizeof(std::uint32_t) : 0;
+}
+
+/** @brief Actual scope of each independently measured routed lookup placement. */
+template<std::uint32_t Mask>
+struct RoutedGridPolicy {
+#if defined(__gfx906__)
+    static constexpr bool has_low_grid = (Mask & ResidentMoEFFNDecoderProgram::iq1_and_iq2_grid) != 0;
+    static constexpr bool has_high_grid = (Mask & ResidentMoEFFNDecoderProgram::iq3_and_iq4_grid) != 0;
+    static constexpr bool iq2 = has_low_grid && !has_high_grid; ///< G08 through G11.
+    static constexpr bool iq3 = has_low_grid && has_high_grid; ///< G12 through G15.
+#else
+    static constexpr bool iq2 = false;
+    static constexpr bool iq3 = false;
+#endif
+};
+
+/** @brief Contiguous table spans inside an already-admitted prefix arena. */
+struct RoutedGridLayout {
+    unsigned iq2_entries; ///< Complete 64-bit IQ2_S entries when placed first.
+    unsigned iq3_small_entries; ///< Complete 32-bit IQ3_S entries following IQ2_S.
+    unsigned iq3_extra_small_entries; ///< Complete 32-bit IQ3_XXS entries at the end.
+};
+
+/**
+ * @brief Place only exact reachable tables that fit in retired HC storage.
+ * @param mask Same sealed gate/up physical codebook declaration used by role publication.
+ * @param available Bytes after the existing coefficient panel and its two records.
+ * @return Whole non-overlapping spans. Zero entries keep that format's immutable module table.
+ * @details Preserve the already-qualified joint IQ3 placement in a mixed format bank.
+ * IQ2_S precedes those spans so the naturally 8-byte-aligned starting address is retained.
+ */
+__host__ __device__ constexpr RoutedGridLayout routedGridLayout(std::uint32_t mask, std::size_t available) {
+    const unsigned small = routedIQ3GridWords<NATIVE_QUANTISED_IQ3_S>(mask);
+    const unsigned extra_small = routedIQ3GridWords<NATIVE_QUANTISED_IQ3_XXS>(mask);
+    const auto iq3_bytes = (small + extra_small) * sizeof(std::uint32_t);
+    const bool cache_iq3 = iq3_bytes <= available;
+    const auto iq2_room = available - (cache_iq3 ? iq3_bytes : 0);
+    const auto iq2_entries = routedIQ2GridEntries(mask);
+    return {iq2_entries * sizeof(std::uint64_t) <= iq2_room ? iq2_entries : 0,
+            cache_iq3 ? small : 0, cache_iq3 ? extra_small : 0};
+}
+
 /**
  * @brief Size the bounded native suffix without reading device state or allocating.
  * @param args Original cold-resolved positive projection/source policies.
@@ -59,8 +120,8 @@ inline FullNativeHCFFNSuffixGeometry fullNativeHCFFNSuffixGeometry(
     const unsigned wanted_blocks=std::min(80u,((blocks+15u)/16u)*16u);
     const bool panel=(mask&a.execution.routed_gate&(1u<<unsigned(NATIVE_QUANTISED_Q4_1)))!=0;
     const std::size_t hidden=(H+(H/32)*8+15u)&~std::size_t(15u);
-    const std::size_t records=2*sizeof(native_layout_ffn::PhaseProjection);
-    const std::size_t available=maximum_dynamic_bytes>hidden+records?maximum_dynamic_bytes-hidden-records:0;
+    const std::size_t fixed=2*sizeof(native_layout_ffn::PhaseProjection);
+    const std::size_t available=maximum_dynamic_bytes>hidden+fixed?maximum_dynamic_bytes-hidden-fixed:0;
     unsigned panel_rows=64,panel_blocks=0;
     if(panel) {
         // Preserve the native16-block bank permutation while reducing only
@@ -75,8 +136,8 @@ inline FullNativeHCFFNSuffixGeometry fullNativeHCFFNSuffixGeometry(
         if(!panel_blocks) {
             panel_rows=1;
             const std::size_t raw_hidden=H+(H/32)*8;
-            const std::size_t linear_available=maximum_dynamic_bytes>raw_hidden+records?
-                maximum_dynamic_bytes-raw_hidden-records:0;
+            const std::size_t linear_available=maximum_dynamic_bytes>raw_hidden+fixed?
+                maximum_dynamic_bytes-raw_hidden-fixed:0;
             // Returning a real one-block minimum makes insufficient LDS fail
             // cold admission precisely; it never skips or changes coefficient work.
             panel_blocks=unsigned(std::max<std::size_t>(1,std::min<std::size_t>(wanted_blocks,
@@ -84,7 +145,7 @@ inline FullNativeHCFFNSuffixGeometry fullNativeHCFFNSuffixGeometry(
         }
     }
     const std::size_t panel_bytes=std::size_t(2)*panel_blocks*panel_rows*sizeof(std::uint32_t);
-    const std::size_t gu=(panel_rows==1||!panel_blocks?H+(H/32)*8:hidden)+panel_bytes+records;
+    const std::size_t gu=(panel_rows==1||!panel_blocks?H+(H/32)*8:hidden)+panel_bytes+fixed;
     const std::size_t values=routes*F+S;
     const std::size_t down=values+(values/32)*8+(routes+1)*64*sizeof(float);
     const std::uint64_t router=(std::uint64_t(a.experts)+15)/16;
@@ -423,12 +484,55 @@ __device__ __forceinline__ void consumeQ4Window(const Binding& gate,const Bindin
     }
 }
 /**
+ * @brief Immutable lookup tables shared by a CTA throughout its routed gate/up work.
+ * @details The 64-bit IQ2_S span precedes the 32-bit IQ3 spans. The existing
+ * role-record publication orders every populated span before the first reads.
+ * Arithmetic and the order of all integer dot products are independent of placement.
+ */
+template<bool CacheIQ2, bool CacheIQ3>
+struct RoutedGateUpTables : NativeQuantisedGridLookup {
+    const CurrentFormatLDSValue<std::uint64_t>* iq2_small = nullptr; ///< Optional original IQ2_S grid.
+    const CurrentFormatLDSValue<std::uint32_t>* iq3_small = nullptr; ///< Optional original IQ3_S grid.
+    const CurrentFormatLDSValue<std::uint32_t>* iq3_extra_small = nullptr; ///< Optional original IQ3_XXS grid.
+
+    /** @tparam Format Selected physical role format. @return Whether its module table is the live source. */
+    template<NativeQuantisedFormat Format>
+        requires ((CacheIQ2 && Format == NATIVE_QUANTISED_IQ2_S) ||
+                  (CacheIQ3 && (Format == NATIVE_QUANTISED_IQ3_S || Format == NATIVE_QUANTISED_IQ3_XXS)))
+    __device__ __forceinline__ bool useDeviceTable() const {
+        if constexpr (Format == NATIVE_QUANTISED_IQ2_S) return iq2_small == nullptr;
+        else if constexpr (Format == NATIVE_QUANTISED_IQ3_S) return iq3_small == nullptr;
+        else {
+            static_assert(Format == NATIVE_QUANTISED_IQ3_XXS);
+            return iq3_extra_small == nullptr;
+        }
+    }
+
+    /** @tparam Format Original IQ2 encoding. @param index Original index. @return Eight packed magnitude bytes. */
+    template<NativeQuantisedFormat Format>
+    __device__ __forceinline__ std::uint64_t iq2(unsigned index) const {
+        if constexpr (CacheIQ2 && Format == NATIVE_QUANTISED_IQ2_S) return iq2_small[index];
+        else return NativeQuantisedGridLookup::iq2<Format>(index);
+    }
+
+    /** @tparam Format Physical IQ3 encoding of this role. @param index Original decoded index. @return Four original signed-magnitude codes. */
+    template<NativeQuantisedFormat Format>
+    __device__ __forceinline__ std::uint32_t iq3(unsigned index) const {
+        static_assert(Format == NATIVE_QUANTISED_IQ3_S || Format == NATIVE_QUANTISED_IQ3_XXS);
+        if constexpr (!CacheIQ3) return NativeQuantisedGridLookup::iq3<Format>(index);
+        else if constexpr (Format == NATIVE_QUANTISED_IQ3_S) return iq3_small[index];
+        else return iq3_extra_small[index];
+    }
+};
+
+/**
  * @brief Balanced original selected-route GU with bounded, real-only Q4 coefficient windows.
  * @tparam Mask Complete admitted physical family; unrelated formats use the same canonical role helper.
  * @param args Original argument authority. @param scratch Original selection and acquired bank.
  * @param live Device-owned row activity. @param codes Completed hidden codes.
  * @param scales Completed hidden scales. @param sums Completed hidden exact sums.
  * @param arena Existing phase-exclusive panel/record region after hiddenQ8.
+ * @param available_after_hidden Bytes already admitted for the earlier HC phase beyond hiddenQ8.
  * @param panel_blocks Cold-admitted K32 window, capped80.
  * @param panel_rows Native poweroftwo4..64 capacity or the minimum linear one-row panel.
  * @details Each CTA cohort owns an original selected slot; aligned cardinal
@@ -439,7 +543,7 @@ __device__ __forceinline__ void consumeQ4Window(const Binding& gate,const Bindin
 template<std::uint32_t Mask>
 __device__ __forceinline__ void routedGateUp(const NativeLayoutRouterFFNArgs& args,
     NativeLayoutFFNPhaseScratch& scratch,bool live,const int8_t* codes,const float* scales,
-    const int32_t* sums,unsigned char* arena,unsigned panel_blocks,unsigned panel_rows) {
+    const int32_t* sums,unsigned char* arena,unsigned panel_blocks,unsigned panel_rows,unsigned available_after_hidden) {
     const auto& a=args.ffn;
     const unsigned H=a.hidden_columns,F=a.routed_columns,routes=a.top_k;
     constexpr bool HasQ4=(Mask&(1u<<unsigned(NATIVE_QUANTISED_Q4_1)))!=0;
@@ -457,6 +561,41 @@ __device__ __forceinline__ void routedGateUp(const NativeLayoutRouterFFNArgs& ar
     const unsigned last=min(F,unsigned(std::uint64_t(rank+1)*chunks/owners)*grain);
     const unsigned wave=waveMetadataValue(unsigned(threadIdx.x)/64),lane=phasePhysicalLane64();
     if(first==last)return; // Uniform empty owner still reaches the caller's grid join.
+    // The sealed role mask includes both gate and up across reachable bank epochs.
+    // Empty owners leave before populating LDS. Each remaining CTA will execute
+    // publishRoutedPair's join before a consumer reads the tables.
+    using GridPolicy = RoutedGridPolicy<Mask>;
+    using Grid = std::conditional_t<GridPolicy::iq2 || GridPolicy::iq3,
+        RoutedGateUpTables<GridPolicy::iq2, GridPolicy::iq3>, NativeQuantisedGridLookup>;
+    Grid lookup{};
+    if constexpr (GridPolicy::iq2 || GridPolicy::iq3) {
+        constexpr auto iq3_mask = (1u << unsigned(NATIVE_QUANTISED_IQ3_S)) | (1u << unsigned(NATIVE_QUANTISED_IQ3_XXS));
+        constexpr auto cached_formats = (GridPolicy::iq2 ? routedIQ2SBit : 0) |
+                                        (GridPolicy::iq3 ? iq3_mask : 0);
+        const auto live_formats = cached_formats & LLAMINAR_TUNED_SUFFIX_MASK(routed_gate);
+        const auto occupied = 2 * (panel_words * sizeof(unsigned) + sizeof(PhaseProjection));
+        const auto available = available_after_hidden > occupied ? available_after_hidden - occupied : 0;
+        const auto tables = routedGridLayout(live_formats, available);
+
+        // The original base is 16-byte-aligned. Complete K32 hidden Q8,
+        // both panel planes and the two role records preserve 8-byte alignment.
+        // Every selected span is contained in the already-admitted prefix extent.
+        auto* iq2 = currentFormatAddress((CurrentFormatLDSValue<std::uint64_t>*)(records + 2));
+        auto* iq3 = (CurrentFormatLDSValue<std::uint32_t>*)(iq2 + tables.iq2_entries);
+        if (tables.iq2_entries) {
+            if (threadIdx.x < tables.iq2_entries) iq2[threadIdx.x] = d_iq2s_grid[threadIdx.x];
+            lookup.iq2_small = iq2;
+        }
+        if (tables.iq3_small_entries) {
+            if (threadIdx.x < tables.iq3_small_entries) iq3[threadIdx.x] = d_iq3s_grid[threadIdx.x];
+            lookup.iq3_small = iq3;
+        }
+        if (tables.iq3_extra_small_entries) {
+            auto* extra = iq3 + tables.iq3_small_entries;
+            if (threadIdx.x < tables.iq3_extra_small_entries) extra[threadIdx.x] = d_iq3xxs_grid[threadIdx.x];
+            lookup.iq3_extra_small = extra;
+        }
+    }
     for(unsigned route=cohort;route<routes;route+=cohorts) {
         publishRoutedPair(args,scratch,route,live,records);
         const auto* current=currentFormatAddress((CurrentFormatLDSValue<const PhaseProjection>*)records);
@@ -484,8 +623,19 @@ __device__ __forceinline__ void routedGateUp(const NativeLayoutRouterFFNArgs& ar
                     if(H/32-block>panel_blocks)workgroupJoin<WorkgroupJoinMemory::LDSOnly>();
                 }
             } else if(local<count) {
-                g=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader>(gate,n,codes,scales,sums,F,H,part);
-                u=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader>(up,n,codes,scales,sums,F,H,part);
+                bool shared_activation=false;
+#if defined(__gfx906__)
+                using Program=llaminar2::rocm::ResidentMoEFFNDecoderProgram;
+                // Original symmetric gate/up families only share the immutable
+                // K32 activation. Each role retains its own decoder and FP fold.
+                if constexpr(Mask==Program::familyMask<3>())
+                    shared_activation=pairedIndependentRolePartial<NATIVE_QUANTISED_Q4_0,GlobalWeightReader>(
+                        gate,up,n,codes,scales,sums,F,H,part,g,u);
+#endif
+                if(!shared_activation) {
+                    g=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader>(gate,n,codes,scales,sums,F,H,part,lookup);
+                    u=phasePartial<Mask,ActivationIssue::GateUpBlockPreload,GlobalWeightReader>(up,n,codes,scales,sums,F,H,part,lookup);
+                }
             }
             const NativeLayoutDownWaveGeometry geometry{16,4};
             // Only waves owning a real output need the ordered P folds. The
@@ -790,7 +940,17 @@ __device__ __forceinline__ void down(const NativeLayoutRouterFFNArgs& args,Nativ
     bool live,const int8_t* codes,const float* scales,const int32_t* sums,float* completed,
     FullNativeHCFFNOutputDemand output_demand) {
     const auto& a=args.ffn;const unsigned H=a.hidden_columns,F=a.routed_columns,S=a.shared_columns,routes=a.top_k;
-    const auto owned=NativeLayoutDownGeometry::rows(H,blockIdx.x,gridDim.x);
+    auto owned=NativeLayoutDownGeometry::rows(H,blockIdx.x,gridDim.x);
+    if constexpr (RoutedGridPolicy<Mask>::iq2) {
+        if (LLAMINAR_TUNED_SUFFIX_MASK(routed_gate) == routedIQ2SBit) {
+            // Whole-wave ownership keeps the original active columns in each
+            // tile. Inactive owners retire after both original grid joins.
+            constexpr unsigned columns=NativeLayoutDownGeometry::columns;
+            static_assert(columns==rocmOrderedWaveWidth);
+            const auto tiles=NativeLayoutDownGeometry::rows((H+columns-1)/columns,blockIdx.x,gridDim.x);
+            owned={min(H,tiles.begin*columns),min(H,tiles.end*columns)};
+        }
+    }
     if(owned.begin==owned.end)return; // Both global publication joins already completed.
     auto* bindings=scratch.phase.down;
     const auto* runtime=reinterpret_cast<const DeviceMoELayerRuntimeView*>(a.runtime);
@@ -842,6 +1002,7 @@ __device__ __forceinline__ void down(const NativeLayoutRouterFFNArgs& args,Nativ
  * @param grid Existing instance-owned two-phase suffix barrier, at phasezero.
  * @param scratch Existing CTA-local selector/bank/static metadata storage.
  * @param storage Admitted16-byte-aligned phase arena, extent from fullNativeHCFFNSuffixGeometry.
+ * @param prefix_bytes Bytes already admitted for the earlier HC phase on this exact capture.
  * @param output_demand Immutable graph/observation materialization policy for this prepared generation.
  * @details args.full_entry_panel is the exact cold geometry result sealed in capture identity.
  * @pre Every1024-thread CTA enters. Original row/source/publication/stream and
@@ -851,7 +1012,7 @@ __device__ __forceinline__ void down(const NativeLayoutRouterFFNArgs& args,Nativ
  */
 template<std::uint32_t Mask>
 __device__ __forceinline__ void tunedFullNativeHCFFNSuffix(const NativeLayoutRouterFFNArgs args,
-    ResidentGridBarrier& grid,NativeLayoutFFNPhaseScratch& scratch,unsigned char* storage,
+    ResidentGridBarrier& grid,NativeLayoutFFNPhaseScratch& scratch,unsigned char* storage,unsigned prefix_bytes,
     FullNativeHCFFNOutputDemand output_demand) {
     using namespace native_layout_ffn;
     const auto& a=args.ffn;const unsigned H=a.hidden_columns,F=a.routed_columns,S=a.shared_columns,routes=a.top_k;
@@ -890,7 +1051,8 @@ __device__ __forceinline__ void tunedFullNativeHCFFNSuffix(const NativeLayoutRou
             RoutedExpertRowExecutionPolicy::IntermediateShardLocal,true>(scratch.gate_state.bank.borrow(),
             selection.selected_ids,selection.selected_weights,a.experts,routes,args.router_indices,
             args.router_weights_output,args.write_router_outputs,a.rows.countOwner(),args.router_publication);
-    full_native_ffn::routedGateUp<Mask>(args,scratch,live,codes,scales,sums,arena,panel_blocks,panel_rows);
+    full_native_ffn::routedGateUp<Mask>(args,scratch,live,codes,scales,sums,arena,panel_blocks,panel_rows,
+        prefix_bytes > hidden_bytes ? unsigned(prefix_bytes - hidden_bytes) : 0u);
     grid.sync(); // Retire every raw-logit selector reader and publish routed activation/descriptors.
     if(output_demand.contains(FullNativeHCFFNOutputRole::RouterProbabilities)&&blockIdx.x==0)
       for(unsigned expert=threadIdx.x;expert<unsigned(a.experts);expert+=1024)

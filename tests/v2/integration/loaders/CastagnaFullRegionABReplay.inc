@@ -21,12 +21,16 @@ CastagnaOracleConfig castagnaOracleConfig() {
 
 /** @brief Explicit immutable input selection; generated diagnostics remain separate. */
 enum class CastagnaABSource { Generated, BoundedCentered, RealGGUF };
+/** @brief Which predeclared input cohort must agree between the independent native routers. */
+enum class CastagnaRouteCohort { AllReplayHistories, TimedRecords };
 /** @brief Local probe input record, never a production model flag or ambient environment override. */
 struct CastagnaABInput {
     CastagnaABSource source=CastagnaABSource::Generated;
     std::string path;
     unsigned layer=1;
-    unsigned participant=3;
+    unsigned participant=3; ///< Logical source-split slot after removing the layer-dependent physical rotation.
+    unsigned degree=4; ///< Reference split used to derive both engines' original local source windows.
+    CastagnaRouteCohort route_cohort=CastagnaRouteCohort::AllReplayHistories;
     /** @return Whether the real source path was explicitly requested. */
     bool real() const noexcept {return source==CastagnaABSource::RealGGUF;}
     /** @return Canonical layer-local tensor name in the selected original source. */
@@ -34,10 +38,27 @@ struct CastagnaABInput {
 };
 /** @brief The selected original checkpoint; seeded boundary activations remain diagnostic inputs. */
 CastagnaABInput realCastagnaABInput() {
-    if (const char* path=std::getenv("LLAMINAR_TEST_CASTAGNA_GGUF");path&&*path)
-        return {CastagnaABSource::RealGGUF,path,1,3};
-    return {CastagnaABSource::RealGGUF,
-        "/opt/llaminar-models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",1,3};
+    const auto coordinate = [](const char* key, unsigned initial) {
+        const char* value = std::getenv(key);
+        if (!value) return initial;
+        const std::string_view text(value);
+        unsigned result = 0;
+        const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), result);
+        require(error == std::errc{} && end == text.data() + text.size(), "invalid original comparator coordinate");
+        return result;
+    };
+    const char* path = std::getenv("LLAMINAR_TEST_CASTAGNA_GGUF");
+    const auto layer = coordinate("LLAMINAR_TEST_CASTAGNA_LAYER", 1);
+    const auto degree = coordinate("LLAMINAR_TEST_CASTAGNA_TP", 4);
+    const auto participant = coordinate("LLAMINAR_TEST_CASTAGNA_LOGICAL_SLOT", 3);
+    require(degree && participant < degree, "original comparator coordinate out of range");
+    const auto* timing_cohort=std::getenv("LLAMINAR_TEST_CASTAGNA_ROUTE_COHORT");
+    require(!timing_cohort || std::string_view(timing_cohort)=="timed_records",
+        "unknown original comparator route cohort");
+    return {CastagnaABSource::RealGGUF, path && *path ? path :
+        "/opt/llaminar-models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf",
+        layer, participant, degree,
+        timing_cohort ? CastagnaRouteCohort::TimedRecords : CastagnaRouteCohort::AllReplayHistories};
 }
 
 /**
@@ -106,7 +127,7 @@ std::unique_ptr<INT32Tensor> castagnaABRawTensor(const TensorBase& source,Device
     require(completion.join(),"cold exact source upload");return tensor;
 }
 /**
- * @brief Populate local test GGUF from exact default-TP4 windows of one original full source.
+ * @brief Populate the local GGUF from the original fork partition at the selected TP degree.
  * @param local Destination directory with the real local dimensions.
  * @param format Original source factories; never a prepared byte reconstruction.
  * @param shape Local geometry; selected participant is found from source-owned split rules.
@@ -116,18 +137,21 @@ std::unique_ptr<INT32Tensor> castagnaABRawTensor(const TensorBase& source,Device
  */
 void writeCastagnaABOriginalWindows(PlanningGGUFFixture& local,const SourceFormat& format,
     OriginalFFNFixtureGeometry shape,const CastagnaABInput& input={}) {
-    unsigned participant=4;
-    for(unsigned slot=0;slot<4;++slot) {
-        const auto routed=qfn_castagna_reference::equalWeightSourceShard(640,128,4,slot);
-        const auto shared=qfn_castagna_reference::equalWeightSourceShard(640,64,4,slot);
-        if(routed.count==unsigned(shape.routed)&&shared.count==unsigned(shape.shared))participant=slot;
+    unsigned participant=input.degree;
+    for(unsigned slot=0;slot<input.degree;++slot) {
+        const auto routed=qfn_castagna_reference::equalWeightSourceShard(640,128,input.degree,slot);
+        const auto shared=qfn_castagna_reference::equalWeightSourceShard(640,64,input.degree,slot);
+        if ((!input.real() || input.participant == slot) &&
+            routed.count == unsigned(shape.routed) && shared.count == unsigned(shape.shared)) participant = slot;
     }
-    require(participant<4,"selected localshape belongs to actual default forkTP4 windows");
-    const auto routed=qfn_castagna_reference::equalWeightSourceShard(640,128,4,participant);
-    const auto shared=qfn_castagna_reference::equalWeightSourceShard(640,64,4,participant);
+    require(participant<input.degree,"selected local shape belongs to the original fork split");
+    const auto routed=qfn_castagna_reference::equalWeightSourceShard(640,128,input.degree,participant);
+    const auto shared=qfn_castagna_reference::equalWeightSourceShard(640,64,input.degree,participant);
+    require(format.down_quantized, "comparison requires an independently declared original routed-down encoding");
     PlanningGGUFFixture full(true,false,PlanningGGUFFixture::sourceType(format.type),640,
         std::nullopt,8,PlanningGGUFFixture::Geometry::Directory,1,512,GGUFTensorType::Q8_0,
-        std::array{GGUFTensorType::Q4_K,GGUFTensorType::Q4_K,GGUFTensorType::Q5_1},
+        std::array{PlanningGGUFFixture::sourceType(format.type), PlanningGGUFFixture::sourceType(format.type),
+            PlanningGGUFFixture::sourceType(format.down_quantized->tensor_type)},
         PlanningGGUFFixture::MoEDimensions{2560,640,10});
     auto full_shape=shape;full_shape.routed=640;full_shape.shared=640;
     if(!input.real()) {
@@ -150,9 +174,9 @@ void writeCastagnaABOriginalWindows(PlanningGGUFFixture& local,const SourceForma
     for(unsigned role=0;role<3;++role)for(unsigned expert=0;expert<512;++expert) {
         const std::string name=kRoutedNames[role],source_name=original_name(name);
         const auto source=loader.nativeWeightSourceGeometry(source_name);
-        require(source.original_type==(role==2?TensorType::Q5_1:TensorType::Q4_K)&&
+        require(source.original_type==(role==2?format.down_quantized->tensor_type:format.type)&&
             source.original_shape==std::vector<size_t>({role==2?size_t(640):size_t(2560),role==2?size_t(2560):size_t(640),512}),
-            "real routed source must retain original Q4_K/Q5_1 full dimensions");
+            "routed source must retain the declared original encoding and complete dimensions");
         const bool down=role==2;
         NativeWeightSourceWindow window{.original_expert=expert,.selected_expert_ordinal=expert,
             .first_row=down?0:routed.first,.rows=down?2560:routed.count,
@@ -184,10 +208,11 @@ void writeCastagnaABOriginalWindows(PlanningGGUFFixture& local,const SourceForma
         loader.readNativeWeightSourceWindow(source_name,window,{storage,window.nativeBytes()});
         local.writePayload(name,0,{reinterpret_cast<const uint8_t*>(storage),window.nativeBytes()});
     }
-    std::osyncstream(std::cout)<<"CASTAGNA_FULL_AB_SOURCE,generated="<<!input.real()<<",original_F=640,original_S=640,tp=4,participant="
+    std::osyncstream(std::cout)<<"CASTAGNA_FULL_AB_SOURCE,generated="<<!input.real()<<",original_F=640,original_S=640,tp="<<input.degree<<",participant="
         <<participant<<",bounded_centered="<<(input.source==CastagnaABSource::BoundedCentered)
         <<",real_gguf="<<input.real()<<",layer="<<input.layer<<",routed_first="<<routed.first<<",routed_count="<<routed.count
-        <<",shared_first="<<shared.first<<",shared_count="<<shared.count<<"\n";
+        <<",shared_first="<<shared.first<<",shared_count="<<shared.count
+        <<",gate="<<tensorTypeName(format.type)<<",down="<<tensorTypeName(format.down_quantized->tensor_type)<<"\n";
 }
 
 /**
@@ -429,8 +454,16 @@ void replayCastagnaFullRegionAB(DeviceId device,int member,ILocalTPContext& tp,s
         request.prefix={static_cast<const float*>(prefix[0].residual->gpu_data_ptr()),
             static_cast<const float*>(prefix[0].previous->gpu_data_ptr()),static_cast<const float*>(prefix[0].raw->gpu_data_ptr()),
             static_cast<const float*>(prefix[0].gain->gpu_data_ptr()),ptr(0),ptr(1),1e-6f,.25f,.25f,.25f,2.f};
+        using ForkGate = qfn_castagna_reference::GateSource;
+        using ForkDown = qfn_castagna_reference::DownSource;
+        const auto gate_type = loader.nativeWeightSourceGeometry(kRoutedNames[0]).original_type;
+        const auto down_type = loader.nativeWeightSourceGeometry(kRoutedNames[2]).original_type;
+        require((gate_type == TensorType::Q4_K || gate_type == TensorType::Q5_K) &&
+            (down_type == TensorType::Q5_1 || down_type == TensorType::Q8_0),
+            "original fork requests an admitted GGUF gate/up and down encoding");
         request.ffn={reinterpret_cast<const float*>(ptr(9)),ptr(5),ptr(6),ptr(7),reinterpret_cast<const float*>(ptr(8)),
-            ptr(2),ptr(3),ptr(4),qfn_castagna_reference::GateSource::Q4_K,qfn_castagna_reference::DownSource::Q5_1,
+            ptr(2),ptr(3),ptr(4),gate_type == TensorType::Q4_K ? ForkGate::Q4_K : ForkGate::Q5_K,
+            down_type == TensorType::Q5_1 ? ForkDown::Q5_1 : ForkDown::Q8_0,
             unsigned(shape.routed),unsigned(shape.shared),unsigned(shape.top_k),1e-20f};
         if(observe_phases)for(unsigned side=0;side<2;++side) {
             timestamp_storage[side]=TestTensorFactory::createINT32({2*(timestamp_ctas*timestamp_slots+timestamp_guards)});
@@ -526,8 +559,11 @@ void replayCastagnaFullRegionAB(DeviceId device,int member,ILocalTPContext& tp,s
                 require(production==FullProductionHCProbe::MiddleRead?nodes.size()>=2u:nodes.size()==1u,
                     "full production final entry or complete middle collective/write graph");
                 if(retained) {
-                    const auto function=rocm::retainedM1HCFFNKernelFunction(
-                        FullNativeHCFFNOutputDemand::none(),MoESelectedDescriptorDemand::AcquiredBankOnly);
+                    const auto original = MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(source.fragment_family);
+                    const auto function = rocm::retainedM1HCFFNKernelFunction(
+                        FullNativeHCFFNOutputDemand::none(), MoESelectedDescriptorDemand::AcquiredBankOnly,
+                        {.routed_gate = original.nativeGateUpEnvelope().execution_codebook_mask,
+                         .routed_down = original.nativeDownEnvelope().execution_codebook_mask});
                     require(function&&nodes.front().function_identity==reinterpret_cast<std::uintptr_t>(function)&&
                         nodes.front().local_memory_bytes_per_thread==0&&nodes.front().block_x==1024,
                         "actual retained closed capture and physical launch geometry");
@@ -772,9 +808,9 @@ void replayCastagnaFullRegionAB(DeviceId device,int member,ILocalTPContext& tp,s
         if(oracle_config.action!=CastagnaOracleAction::Disabled) {
             oracle_metadata.text("R53-fork-math-native-Q4K-effective-half-Q51-Q8-T1POST-v1");
             for(const auto value:{H,K,R,unsigned(shape.routed),unsigned(shape.shared),unsigned(shape.experts),unsigned(shape.top_k),
-                                 input.layer,input.participant,4u,128u,64u,60u,1024u,64u})oracle_metadata.scalar(std::uint32_t(value));
-            const auto routed_window=qfn_castagna_reference::equalWeightSourceShard(640,128,4,input.participant);
-            const auto shared_window=qfn_castagna_reference::equalWeightSourceShard(640,64,4,input.participant);
+                                 input.layer,input.participant,input.degree,128u,64u,60u,1024u,64u})oracle_metadata.scalar(std::uint32_t(value));
+            const auto routed_window=qfn_castagna_reference::equalWeightSourceShard(640,128,input.degree,input.participant);
+            const auto shared_window=qfn_castagna_reference::equalWeightSourceShard(640,64,input.degree,input.participant);
             for(const auto value:{routed_window.first,routed_window.count,shared_window.first,shared_window.count})oracle_metadata.scalar(value);
             for(const auto value:{request.prefix.epsilon,request.prefix.down_scale,request.prefix.pre_scale,
                 request.prefix.post_scale1,request.prefix.post_scale2,request.ffn.selected_sum_clamp})oracle_metadata.scalar(std::bit_cast<std::uint32_t>(value));
@@ -957,7 +993,11 @@ void replayCastagnaFullRegionAB(DeviceId device,int member,ILocalTPContext& tp,s
         }
         std::osyncstream(std::cout)<<"CASTAGNA_FULL_AB_ROUTE_SCOPE,all_histories_same_selected_set="<<identical_route_work
             <<",cross_engine_arithmetic_equal=0\n";
-        if(retained)require(identical_route_work,"retained timing requires equal selected expert sets across all 20 histories");
+        // The original checkpoint compares the independently selected experts for all
+        // 20 histories. Other source windows retain all 20 staged byte checks and
+        // disclose every router difference. For those cases, every actually timed
+        // record must match, including priming. The schedule is independent of routing.
+        if(retained && input.route_cohort==CastagnaRouteCohort::AllReplayHistories)require(identical_route_work,"retained timing requires equal selected expert sets across all 20 histories");
         if(timing) {
             // Primary original/adapted Castagna pair first; retain the three
             // existing comparisons as secondary controls. Every observation is

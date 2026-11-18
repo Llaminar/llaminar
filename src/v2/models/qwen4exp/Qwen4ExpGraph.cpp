@@ -76,7 +76,7 @@ void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph,const std::string &
            config_.qfn_hc_short_k_read_candidate||config_.qfn_hc_down_publish_candidate||
            config_.qfn_hidden_q8_reuse_candidate)
             throw std::invalid_argument("QFN retained full HC/FFN requires the original staged HC and router declarations");
-        lowerRetainedM1HCFFN(graph,internalBoundary);
+        lowerRetainedM1HCFFNMainInference(graph,internalBoundary);
         return;
     }
 }

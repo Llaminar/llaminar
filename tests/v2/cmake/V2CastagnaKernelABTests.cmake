@@ -105,4 +105,23 @@ if(CMAKE_BUILD_TYPE STREQUAL "Release")
         LABELS "V2;Performance;ROCm;MoE;Hyperconnection;GraphCapture;ComponentTiming;RealModel;ExternalComparator;HardwareOptional;Devices1;NativeISA-gfx906"
         MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120 RESOURCE_LOCK RealModel_Perf
         ENVIRONMENT "LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16")
+
+    # TP2 has shared widths admitted by both engines. On TP4 the additional
+    # matched F256/S192 case exercises the fork reference used by the checkpoint.
+    foreach(_layer IN ITEMS 1 2 4)
+        foreach(_coordinate IN ITEMS "2-0" "2-1" "4-3")
+            if(_layer EQUAL 1 AND _coordinate STREQUAL "4-3")
+                continue()
+            endif()
+            string(REPLACE "-" ";" _tp_member "${_coordinate}")
+            list(GET _tp_member 0 _tp)
+            list(GET _tp_member 1 _member)
+            add_v2_test(V2_Perf_RetainedClosedHCFFN_Layer${_layer}_TP${_tp}Slot${_member}_ROCm
+                COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
+                    --gtest_also_run_disabled_tests --gtest_filter=CastagnaFullRegionAB.DISABLED_ROCmRetainedClosedRealFinalEvents
+                LABELS "V2;Performance;ROCm;MoE;Hyperconnection;GraphCapture;ComponentTiming;RealModel;ExternalComparator;HardwareOptional;Devices1;NativeISA-gfx906"
+                MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120 RESOURCE_LOCK RealModel_Perf
+                ENVIRONMENT "LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16;LLAMINAR_TEST_CASTAGNA_LAYER=${_layer};LLAMINAR_TEST_CASTAGNA_TP=${_tp};LLAMINAR_TEST_CASTAGNA_LOGICAL_SLOT=${_member};LLAMINAR_TEST_CASTAGNA_ROUTE_COHORT=timed_records")
+        endforeach()
+    endforeach()
 endif()

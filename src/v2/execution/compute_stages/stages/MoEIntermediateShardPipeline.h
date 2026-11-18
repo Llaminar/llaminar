@@ -223,4 +223,11 @@ namespace llaminar2
      * retained normalized branches and the FFN sum remains explicit.
      */
     void lowerRetainedM1HCFFN(ComputeGraph& graph,const std::string& previous_write_node);
+
+    /**
+     * @brief Lower the original QFN M1 main-inference decode and retain its model census identity.
+     * @param graph Original composed participant-local model graph.
+     * @param previous_write_node Original attention write terminal.
+     */
+    void lowerRetainedM1HCFFNMainInference(ComputeGraph& graph,const std::string& previous_write_node);
 }

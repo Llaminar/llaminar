@@ -27867,6 +27867,7 @@ add_v2_test(V2_Integration_CompactExpertContinuationWorkspace
 
 # Test: MemoryPlanner — end-to-end planning with single/multi-device configs
 add_executable(v2_test_memory_planner
+    unit/planning/Test__NgramExecutionProvision.cpp
     unit/planning/Test__MemoryPlanner.cpp
     unit/planning/Test__OrchestrationCandidateAdmission.cpp
     unit/planning/Test__PlanningAdmissionPreparation.cpp
@@ -27896,6 +27897,26 @@ add_executable(v2_test_memory_planner
     unit/planning/Test__MoEPipelineFixedMemory.cpp)
 target_link_libraries(v2_test_memory_planner llaminar2_core GTest::gtest GTest::gtest_main)
 target_include_directories(v2_test_memory_planner PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor)
+if(HAVE_ROCM)
+    add_v2_test(V2_Integration_RetainedM1WorkspaceAdmission
+        COMMAND $<TARGET_FILE:v2_test_memory_planner>
+            --gtest_filter=RetainedM1WorkspaceAdmission.OriginalTP4ContinuationPricesSealedWorkspace
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MoE;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1;LLAMINAR_QFN_RETAINED_M1_HC_FFN_CANDIDATE=1")
+    if(TEST V2_Integration_RetainedM1WorkspaceAdmission)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedM1WorkspaceAdmission)
+    endif()
+endif()
+add_v2_test(V2_Integration_NgramTensorShardedTP4AdmissionWire
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=NgramExecutionProvision.TensorShardedTP4WireRetainsOriginalSharedAssignment
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;ImmutableTable;MoE;TraceReplay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+if(TEST V2_Integration_NgramTensorShardedTP4AdmissionWire)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NgramTensorShardedTP4AdmissionWire)
+endif()
 # Original discovered peer facts choose legal groups only after physical admission.
 add_v2_test(V2_Integration_AutomaticObservedPeerGroupingReplay
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
@@ -32399,8 +32420,6 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
 
 # Apply inside tests/v2/CMakeLists.txt after v2_test_memory_planner exists,
 # before final ProductionTestPreflight inventory closure. No production source additions.
-target_sources(v2_test_memory_planner PRIVATE
-    unit/planning/Test__NgramExecutionProvision.cpp)
 add_v2_test(V2_Integration_NgramMandatoryExecutionProvision
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=NgramExecutionProvision.*

@@ -721,14 +721,14 @@ __device__ __forceinline__ void runtime_publish_independent_decode_dispatch_from
  * @details The sole typed input owns the original bank, geometry, and policy. The
  * bool is the exact local result. The native owner retains its selected descriptor output contract.
  */
-template<bool PublishDescriptors,bool BindHistogramWriter,class RuntimeView,unsigned Experts>
+template<bool PublishDescriptors,bool BindHistogramWriter,bool UpdateRuntimeHistogram=true,class RuntimeView,unsigned Experts>
 __device__ __forceinline__ bool runtime_publish_bound_original_fragment_dispatch(
     ValidatedOriginalFragmentBank<RuntimeView,Experts> fragment,const int* selected_ids,
     const float* selected_weights,float* legacy_indices,float* legacy_weights,
     const int32_t* active_row_count_device,llaminar2::MoEDecodeDescriptorPublication publication)
 {
     return runtime_publish_independent_decode_dispatch_from_issued_source<
-        true,llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal,PublishDescriptors,RuntimeView,
+        UpdateRuntimeHistogram,llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal,PublishDescriptors,RuntimeView,
         RuntimeDecodePublicationValidation::BoundOriginalFragment,Experts,BindHistogramWriter>(
             fragment,selected_ids,selected_weights,Experts,fragment.topK(),legacy_indices,legacy_weights,
             true,active_row_count_device,publication);

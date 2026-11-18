@@ -40,6 +40,7 @@ class FullEpochNumericalPair final {
  std::vector<DeviceMoEExpertDescriptor> acquired_;
  std::array<std::vector<DeviceNativeQuantisedMatrixDesc>,3> published_;
  const void* full_function_=nullptr;
+ rocm::ResidentMoEFFNExecutionMasks retained_execution_{}; ///< Kernel identity from the original GPU-only format envelope.
  std::array<std::size_t,Planes> widths_;
  DeviceMoEOverlayEpochStatus status_{};int32_t observed_count_=-1;std::array<uint32_t,2> acquired_header_{};
  unsigned member_=0;
@@ -215,6 +216,17 @@ public:
   require(original_source.fragment_family&&original_source.fragment_family->cohort()->participants().size()==std::size_t(tp_->degree()),
    "retained epoch GPU width matches actual original cohort");
   member_=original_source.fragment_family->participantIndex();
+  if(tp_->degree()==4&&shape_.contract==OriginalFFNGeometryContract::QFNTensorSharded) {
+   const auto region=MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(original_source.fragment_family);
+   const auto& routed=region.originalBinding();
+   const auto& local_shared=partition.forRank(int(member_));
+   require(routed.intermediateColumns()==640&&local_shared.d_ff_count==160&&
+    (routed.localIntermediateColumns()==128||routed.localIntermediateColumns()==256),
+    "actual full TP4 motion has the production local widths");
+   std::osyncstream(std::cout)<<"QFN_MOTION_ACTUAL_TP4_SHARD,member="<<member_<<",device="<<device_.toString()
+    <<",F="<<routed.localIntermediateColumns()<<",F_start="<<routed.firstIntermediateColumn()
+    <<",S="<<local_shared.d_ff_count<<",S_start="<<local_shared.d_ff_start<<'\n';
+  }
   require(member_<tp_->devices().size()&&tp_->devices()[member_].toLocalDeviceId()==device_,
    "retained epoch preserves actual original collective member order");
   const auto* gate=shared.optionalLayerForDevice(0,"ffn_gate_shexp.weight",device);
@@ -240,6 +252,11 @@ public:
    context_=IDeviceContext::create(device_,1);
    const auto& bank=initial_->bank->layerForModelLayer(0);
    full_function_=fullProductionHCFunction(bank,shared,store,device_);
+   if(retained()) {
+    const auto declaration=MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(bank.fragment_family);
+    retained_execution_.routed_gate=declaration.nativeGateUpEnvelope().execution_codebook_mask;
+    retained_execution_.routed_down=declaration.nativeDownEnvelope().execution_codebook_mask;
+   }
    for(unsigned side=0;side<2;++side) {
     auto& p=prefix_[side];const unsigned H=shape.hidden,K=4*H;
     p.residual=fullProductionHCFloat(K,device_,stream_);p.previous=fullProductionHCFloat(H,device_,stream_);
@@ -339,7 +356,7 @@ private:
       std::vector<GPUGraphKernelNodeInfo> nodes;std::string error;
       require(capture_[side]->inspectKernelNodes(nodes,&error),"inspect retained fast source epoch graph: "+error);
       const auto fast_count=std::count_if(nodes.begin(),nodes.end(),[&](const auto& node){
-       return node.function_identity==reinterpret_cast<std::uintptr_t>(rocm::retainedM1HCFFNKernelFunction(FullNativeHCFFNOutputDemand::none(),descriptorDemand()));});
+       return node.function_identity==reinterpret_cast<std::uintptr_t>(rocm::retainedM1HCFFNKernelFunction(FullNativeHCFFNOutputDemand::none(),descriptorDemand(),retained_execution_));});
       if(fast_count!=1||nodes.size()<3) {
        std::osyncstream out(std::cerr);
        out<<"RETAINED_DESCRIPTOR_GRAPH_IDENTITY,reader="<<hasDescriptorReader()<<",matched="<<fast_count<<",actual=";
@@ -347,7 +364,7 @@ private:
        for(const auto role:{MoESelectedDescriptorDemand::ExternalTables,MoESelectedDescriptorDemand::AcquiredBankOnly})
         for(const auto demand:{FullNativeHCFFNOutputDemand::none(),FullNativeHCFFNOutputDemand::all()})
          out<<",role="<<static_cast<unsigned>(role)<<",observed="<<static_cast<unsigned>(demand.bits())<<",owner="<<std::hex
-            <<reinterpret_cast<std::uintptr_t>(rocm::retainedM1HCFFNKernelFunction(demand,role));
+            <<reinterpret_cast<std::uintptr_t>(rocm::retainedM1HCFFNKernelFunction(demand,role,retained_execution_));
        out<<'\n';
       }
       require(fast_count==1&&nodes.size()>=3,"actual retained fast kernel and original native epoch boundaries");
@@ -435,9 +452,14 @@ public:
        current.promoted_experts.end(),int(ids_[1][slot]))!=current.promoted_experts.end()) {
      const auto& row=acquired_[slot];
      if(retained()) {
-      require(row.gate.codebook_id==5&&row.up.codebook_id==5&&row.down.codebook_id==7&&
-       row.gate.payload&&row.up.payload&&row.down.payload&&row.down.scales,
-       "genuine GPU arrival executes its actual prepared 5/5/7 descriptors");
+      const auto declaration=MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(
+       current.bank->layerForModelLayer(0).fragment_family);
+      require(declaration.matchesNativeGateUp(row.gate,row.up)&&declaration.matchesNativeDown(row.down),
+       "genuine GPU arrival executes actual same-source prepared descriptors");
+      std::osyncstream(std::cout)<<"QFN_RETAINED_ACQUIRED_ARRIVAL,epoch="<<epoch<<",member="<<member_
+       <<",expert="<<int(ids_[1][slot])<<",gate="<<unsigned(row.gate.codebook_id)
+       <<",up="<<unsigned(row.up.codebook_id)<<",down="<<unsigned(row.down.codebook_id)
+       <<",F="<<row.gate.n<<",down_N="<<row.down.n<<",down_K="<<row.down.k<<'\n';
      } else require(row.down.codebook_id==kNativeQuantisedExpandedInt8MinCodebook&&row.down.payload&&row.down.scales,
       "genuine CPU arrival executes its actual prepared physical23 descriptor");
      witnessed=true;

@@ -46,25 +46,56 @@ const void* retainedM1HCFFNKernelFunction() noexcept
         1,true,false,false,false,qfn_castagna_reference::GateSource::Q4_K,true,true,true,true,true>);
 }
 
+/** @brief Resolve exact retained mode once from the two existing observation policies. */
+template<qfn_castagna_reference::GateSource Gate, unsigned Down,bool CollectHistogram=true>
+static const void* retainedKernel(FullNativeHCFFNOutputDemand demand,
+    MoESelectedDescriptorDemand descriptors) noexcept
+{
+    const auto entry=[]<bool Observe, bool Publish>() {
+        return reinterpret_cast<const void*>(&hc_persist_kernel<
+            1,true,false,false,false,Gate,Observe,true,true,true,true,Publish,Down,CollectHistogram>);
+    };
+    switch(descriptors) {
+    case MoESelectedDescriptorDemand::AcquiredBankOnly:
+        return demand.bits()?entry.template operator()<true,false>():entry.template operator()<false,false>();
+    case MoESelectedDescriptorDemand::ExternalTables:
+        return demand.bits()?entry.template operator()<true,true>():entry.template operator()<false,true>();
+    }
+    return nullptr;
+}
+
 /** @copydoc retainedM1HCFFNKernelFunction(FullNativeHCFFNOutputDemand) */
 const void* retainedM1HCFFNKernelFunction(FullNativeHCFFNOutputDemand demand,
     MoESelectedDescriptorDemand descriptors) noexcept
 {
-    if(descriptors==MoESelectedDescriptorDemand::AcquiredBankOnly) {
-        if(demand.bits())return reinterpret_cast<const void*>(&hc_persist_kernel<
-            1,true,false,false,false,qfn_castagna_reference::GateSource::Q4_K,true,true,true,true,true,false>);
-        return reinterpret_cast<const void*>(&hc_persist_kernel<
-            1,true,false,false,false,qfn_castagna_reference::GateSource::Q4_K,false,true,true,true,true,false>);
+    return retainedKernel<qfn_castagna_reference::GateSource::Q4_K,7>(demand,descriptors);
+}
+
+const void* retainedM1HCFFNKernelFunction(FullNativeHCFFNOutputDemand demand,
+    MoESelectedDescriptorDemand descriptors, ResidentMoEFFNExecutionMasks execution,
+    RetainedM1NativeHistogramPolicy histogram) noexcept
+{
+    const auto format=retainedM1RoutedFormat(execution);
+    if(!format)return nullptr;
+    using Gate=qfn_castagna_reference::GateSource;
+    const auto select=[&]<bool Collect>() -> const void* {
+        switch(*format) {
+        case RetainedM1RoutedFormat::Q4K_Q51:return retainedKernel<Gate::Q4_K,7,Collect>(demand,descriptors);
+        case RetainedM1RoutedFormat::Q4K_Q80:return retainedKernel<Gate::Q4_K,19,Collect>(demand,descriptors);
+        case RetainedM1RoutedFormat::Q5K_Q80:return retainedKernel<Gate::Q5_K,19,Collect>(demand,descriptors);
+        }
+        return nullptr;
+    };
+    switch(histogram) {
+    case RetainedM1NativeHistogramPolicy::RouteOnly:return select.template operator()<false>();
+    case RetainedM1NativeHistogramPolicy::ObserveDecode:return select.template operator()<true>();
     }
-    if(descriptors!=MoESelectedDescriptorDemand::ExternalTables)return nullptr;
-    if(demand.bits())return retainedM1HCFFNKernelFunction();
-    return reinterpret_cast<const void*>(&hc_persist_kernel<
-        1,true,false,false,false,qfn_castagna_reference::GateSource::Q4_K,false,true,true,true,true>);
+    return nullptr;
 }
 
 /** @copydoc prepareRetainedM1HCFFN */
 PreparedMoEFFNProgram prepareRetainedM1HCFFN(DeviceId device,FullNativeHCFFNArgs& full,
-    ResidentMoEFFNPolicyMasks masks,std::uint64_t generation)
+    ResidentMoEFFNPolicyMasks masks,std::uint64_t generation,RetainedM1NativeHistogramPolicy histogram)
 {
     if(!device.is_rocm()||full.prefix.implementation!=FullNativeHCFFNImplementation::RetainedGFX906M1)
         throw std::invalid_argument("Retained M1 HC/FFN requires an original ROCm experimental declaration");
@@ -73,7 +104,7 @@ PreparedMoEFFNProgram prepareRetainedM1HCFFN(DeviceId device,FullNativeHCFFNArgs
        hardware.compute_units!=NB||reinterpret_cast<std::uintptr_t>(full.prefix.hc.mixed)%16)
         throw std::invalid_argument("Retained M1 HC/FFN requires exact gfx906/60CU and aligned mixed storage");
     resolvePersistentHCReadPolicy(full.prefix.hc,full.prefix.output_demand);
-    const auto* function=retainedM1HCFFNKernelFunction(full.prefix.output_demand,full.prefix.selected_descriptor_demand);
+    const auto* function=retainedM1HCFFNKernelFunction(full.prefix.output_demand,full.prefix.selected_descriptor_demand,masks.execution,histogram);
     if(!function)throw std::invalid_argument("Retained M1 HC/FFN selected descriptor demand is invalid");
     const auto native=NativeCooperativeKernelBoundary<NativeCooperativeBackend::ROCm>::prepare(
         device,function,NT,0,generation,NativeResidentLaunchPolicy::Ordinary);
@@ -90,7 +121,7 @@ PreparedMoEFFNProgram prepareRetainedM1HCFFN(DeviceId device,FullNativeHCFFNArgs
 /** @copydoc launchRetainedM1HCFFNDevice */
 void launchRetainedM1HCFFNDevice(const FullNativeHCFFNArgs& full,
     const DeviceNativeQuantisedMatrixDesc& shared_gate,const DeviceNativeQuantisedMatrixDesc& shared_up,
-    const DeviceNativeQuantisedMatrixDesc& shared_down,void* scratch,std::uint64_t generation,void* stream)
+    const DeviceNativeQuantisedMatrixDesc& shared_down,void* scratch,std::uint64_t generation,void* stream,RetainedM1NativeHistogramPolicy histogram)
 {
     if(reinterpret_cast<std::uintptr_t>(stream)<=2 || !scratch || !generation ||
        reinterpret_cast<std::uintptr_t>(scratch)%alignof(InstanceOriginalScratch))
@@ -128,19 +159,37 @@ void launchRetainedM1HCFFNDevice(const FullNativeHCFFNArgs& full,
     outputs.shared_gate=r.ffn.shared_gate_output;outputs.shared_up=r.ffn.shared_up_output;
     const qfn_castagna_native::InstanceScratchBinding binding{scratch,retainedM1HCFFNScratchBytes(),generation};
     const hc_ar ar{};
-    const auto launch=[&]<bool Observe,bool PublishRoleTables>() {
-        hc_persist_kernel<1,true,false,false,false,qfn_castagna_reference::GateSource::Q4_K,Observe,true,true,true,true,PublishRoleTables>
+    using Gate=qfn_castagna_reference::GateSource;
+    const auto launch=[&]<Gate RoutedGate,unsigned RoutedDown,bool Observe,bool PublishRoleTables,bool Collect>() {
+        hc_persist_kernel<1,true,false,false,false,RoutedGate,Observe,true,true,true,true,PublishRoleTables,RoutedDown,Collect>
            <<<NB,NT,0,static_cast<hipStream_t>(stream)>>>(source,hc.norm.gain,hc.down_weights,hc.up.weights,
             hc.norm.epsilon,.25f,.25f,p.write.output,hc.norm.output,hc.mixed,ffn,ar,outputs,binding);
     };
-    const auto issue=[&]<bool PublishRoleTables>() {
-        if(p.output_demand.bits())launch.template operator()<true,PublishRoleTables>();
-        else launch.template operator()<false,PublishRoleTables>();
+    const auto issue=[&]<Gate RoutedGate,unsigned RoutedDown,bool Publish,bool Collect>() {
+        if(p.output_demand.bits())launch.template operator()<RoutedGate,RoutedDown,true,Publish,Collect>();
+        else launch.template operator()<RoutedGate,RoutedDown,false,Publish,Collect>();
     };
-    switch(p.selected_descriptor_demand) {
-    case MoESelectedDescriptorDemand::ExternalTables: issue.template operator()<true>(); break;
-    case MoESelectedDescriptorDemand::AcquiredBankOnly: issue.template operator()<false>(); break;
-    default: throw std::logic_error("Retained M1 HC/FFN lost its sealed descriptor demand");
+    const auto submit=[&]<Gate RoutedGate,unsigned RoutedDown,bool Collect>() {
+        switch(p.selected_descriptor_demand) {
+        case MoESelectedDescriptorDemand::ExternalTables: issue.template operator()<RoutedGate,RoutedDown,true,Collect>(); return;
+        case MoESelectedDescriptorDemand::AcquiredBankOnly: issue.template operator()<RoutedGate,RoutedDown,false,Collect>(); return;
+        }
+        throw std::logic_error("Retained M1 HC/FFN lost its sealed descriptor demand");
+    };
+    const auto format=retainedM1RoutedFormat(r.ffn.execution);
+    if(!format)throw std::logic_error("Retained M1 HC/FFN lost its sealed routed format");
+    const auto dispatch=[&]<bool Collect>() {
+        switch(*format) {
+        case RetainedM1RoutedFormat::Q4K_Q51: submit.template operator()<Gate::Q4_K,7,Collect>(); return;
+        case RetainedM1RoutedFormat::Q4K_Q80: submit.template operator()<Gate::Q4_K,19,Collect>(); return;
+        case RetainedM1RoutedFormat::Q5K_Q80: submit.template operator()<Gate::Q5_K,19,Collect>(); return;
+        }
+        throw std::logic_error("Retained M1 HC/FFN lost its sealed routed format");
+    };
+    switch(histogram) {
+    case RetainedM1NativeHistogramPolicy::RouteOnly:dispatch.template operator()<false>();break;
+    case RetainedM1NativeHistogramPolicy::ObserveDecode:dispatch.template operator()<true>();break;
+    default:throw std::logic_error("Retained M1 HC/FFN lost its original histogram producer role");
     }
     const auto status=hipGetLastError();
     if(status!=hipSuccess)

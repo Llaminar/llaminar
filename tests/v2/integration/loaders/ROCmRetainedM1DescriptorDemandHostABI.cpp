@@ -7,6 +7,7 @@
  * constant source-level call silently bypassing that boundary.
  */
 #include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNDevice.h"
+#include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNBinding.h"
 #include <array>
 #include <cstdio>
 #include <cstdlib>
@@ -40,9 +41,47 @@ using llaminar2::rocm::retainedM1HCFFNKernelFunction;
     return retainedM1HCFFNKernelFunction(output,descriptor_mode!=0?
         MoESelectedDescriptorDemand::AcquiredBankOnly:MoESelectedDescriptorDemand::ExternalTables);
 }
+/** @brief Authenticate counted and fully-active ordinary rows without reading device-owned data. */
+bool originalRows()
+{
+    using namespace llaminar2;
+    const auto fully=DeviceRowRange::fullyActive(1);
+    rocm::PersistentHCReadArgs hc{.publication={.rows=fully},.up={.rows=fully}};
+    hc.norm.extent.rows=1;
+    using Binding=rocm::ROCmRetainedM1HCFFNBinding;
+    if(Binding::validateRowAuthority(fully,hc)!=nullptr)return false;
+    std::array<std::int32_t,2> originalCount{0,1}; // cold opaque owners with distinct addresses
+    for(std::size_t owner=0;owner<originalCount.size();++owner)
+    {
+        const auto& count=originalCount[owner];
+        const auto row=DeviceRowRange::deviceCounted(1,&count);
+        hc.norm.extent.liveRows=&count;
+        hc.up.rows=hc.publication.rows=row;
+        if(Binding::validateRowAuthority(row,hc)!=&count)return false;
+        for(const auto wrong:{fully,DeviceRowRange::deviceCounted(1,&originalCount[1-owner]),
+                               row.repeatEachRow(2),DeviceRowRange::deviceCounted(2,&count).slice(1,1)})
+        {
+            try { (void)Binding::validateRowAuthority(wrong,hc); return false; }
+            catch(const std::invalid_argument&) {}
+        }
+    }
+    return true;
 }
 
-/** @return Success when both policies select distinct native entries and invalid modes reject. */
+/**
+ * @brief Exercise the real mixed GCC/HIP selector with a runtime-derived source and role.
+ * @return The selected native program, or null for a foreign policy or format.
+ */
+[[gnu::noinline]] const void* nativeHistogramSelection(FullNativeHCFFNOutputDemand output,
+    MoESelectedDescriptorDemand descriptors, llaminar2::rocm::ResidentMoEFFNExecutionMasks masks,
+    const volatile std::uint32_t& role)
+{
+    using Policy=llaminar2::rocm::RetainedM1NativeHistogramPolicy;
+    return retainedM1HCFFNKernelFunction(output,descriptors,masks,static_cast<Policy>(role));
+}
+}
+
+/** @return Success when complete native entry and graph row identities are preserved. */
 int main()
 {
     constexpr auto external=MoESelectedDescriptorDemand::ExternalTables;
@@ -70,6 +109,28 @@ int main()
             std::fprintf(stderr,"Retained M1 descriptor selector accepted invalid mode %u\n",invalid);
             return EXIT_FAILURE;
         }
+    }
+    using namespace llaminar2;
+    constexpr std::uint32_t q4=1u<<5, q5=1u<<7, q8=1u<<19;
+    for(const auto sources:{rocm::ResidentMoEFFNExecutionMasks{q4,q5,q8,q8},
+        rocm::ResidentMoEFFNExecutionMasks{q4,q8,q8,q8},rocm::ResidentMoEFFNExecutionMasks{q5,q8,q8,q8}})
+        for(const auto output:{lean,observed})for(const auto demand:{closed,external})
+        {
+            role=0;
+            const auto routeOnly=nativeHistogramSelection(output,demand,sources,role);
+            role=1;
+            const auto observedHistogram=nativeHistogramSelection(output,demand,sources,role);
+            if(!routeOnly||!observedHistogram||routeOnly==observedHistogram)return EXIT_FAILURE;
+            for(const auto invalid:{2u,256u,UINT32_MAX})
+            {
+                role=invalid;
+                if(nativeHistogramSelection(output,demand,sources,role))return EXIT_FAILURE;
+            }
+        }
+    if(!originalRows())
+    {
+        std::fprintf(stderr,"Retained M1 row authority matrix failed\n");
+        return EXIT_FAILURE;
     }
     return EXIT_SUCCESS;
 }

@@ -10,6 +10,9 @@
  * state retain their original owners and publication ordering.
  */
 
+/** @brief Distinguish model-owned decode from an explicitly borrowed local graph transaction. */
+enum class ResidentFFNGraphRole { LocalRegion, MainInference };
+
 /** @brief One participant's complete routed/shared local FFN, excluding router and final collective. */
 class ResidentStage final : public IComputeStage, public IWorkspaceConsumer, public IGraphOutputDemand
 {
@@ -17,9 +20,10 @@ public:
     /** @brief Freeze the original finalizer's already-authenticated source and arena declarations. */
     ResidentStage(std::shared_ptr<Binding> binding,const SharedExpertFFNStage::Params &shared,
         DeviceMoEExpertDescriptor descriptor,TensorBase *input_gate,
-        MoEIntermediateShardTensorBinding combined,std::string name)
+        MoEIntermediateShardTensorBinding combined,std::string name,unsigned shared_source_first_column)
         :IComputeStage(binding->device()),binding_(std::move(binding)),shared_(shared),descriptor_(descriptor),
-         input_gate_(input_gate),combined_(combined),name_(std::move(name))
+         input_gate_(input_gate),combined_(combined),name_(std::move(name)),
+         shared_source_first_column_(shared_source_first_column)
     {
         const auto &p=binding_->params;
         if(p.rows!=1 || p.row_mode!=MoEIntermediateShardRowMode::Decode ||
@@ -33,10 +37,12 @@ public:
     /** @return Original graph-owned router dependency. */
     const std::string& routerName() const noexcept { return binding_->params.router_node; }
     /** @brief Retain the same declarations while admitting the original router inside this node. */
-    std::unique_ptr<ResidentStage> withNativeRouter(const MoERoutingStage::Params& router) const
+    std::unique_ptr<ResidentStage> withNativeRouter(const MoERoutingStage::Params& router,
+        ResidentFFNGraphRole role) const
     {
         if(program_||binding_->prepared||binding_->route_authority!=RouteAuthority::OriginalRouter||
-            !router.collect_device_runtime_histogram||router.routed_pipeline_kernel_owner!=binding_->params.kernel_owner||
+            (role!=ResidentFFNGraphRole::MainInference&&!router.collect_device_runtime_histogram)||
+            router.routed_pipeline_kernel_owner!=binding_->params.kernel_owner||
             router.moe_runtime_table!=binding_->params.runtime||router.input!=binding_->params.hidden.tensor||
             router.output_indices!=binding_->params.routing_indices.tensor||router.output_weights!=binding_->params.routing_weights.tensor||
             router.device_id!=device()||router.seq_len!=binding_->params.rows||
@@ -46,7 +52,8 @@ public:
             router.force_grouped_verifier_prefill_for_decode||router.force_decode_equivalent_verifier_prefill||router.owned_rows||
             router.decode_route_publication!=MoEDecodeRoutePublicationPolicy::DeviceRuntimeTable)
             throw std::logic_error("Native-layout FFN requires cold original router histogram authority");
-        auto result=std::make_unique<ResidentStage>(binding_,shared_,descriptor_,input_gate_,combined_,name_);
+        auto result=std::make_unique<ResidentStage>(binding_,shared_,descriptor_,input_gate_,combined_,name_,
+            shared_source_first_column_);
         result->native_router_=router;
         return result;
     }
@@ -57,11 +64,13 @@ public:
      * @return Cold complete local-region stage; no standalone HC program is prepared.
      */
     std::unique_ptr<ResidentStage> withFullNativePrefix(std::shared_ptr<Qwen4ExpHCReadPhaseOwner> prefix,
-        Qwen4ExpFloatBinding mixed,rocm::FullNativeHCFFNImplementation implementation) const {
+        Qwen4ExpFloatBinding mixed,rocm::FullNativeHCFFNImplementation implementation,ResidentFFNGraphRole role) const {
         if(program_||binding_->prepared||!native_router_||!prefix||full_prefix_||
             mixed.tensor!=binding_->params.hidden.tensor||mixed.buffer!=binding_->params.hidden.id||mixed.byteOffset!=0)
             throw std::logic_error("Full native HC requires cold original router/FFN and exact mixed publication");
-        auto result=std::make_unique<ResidentStage>(binding_,shared_,descriptor_,input_gate_,combined_,name_);
+        auto result=std::make_unique<ResidentStage>(binding_,shared_,descriptor_,input_gate_,combined_,name_,
+            shared_source_first_column_);
+        result->graph_role_=role;
         result->native_router_=native_router_;result->full_prefix_=std::move(prefix);result->implementation_=implementation;
         result->all_phase_outputs_=result->full_prefix_->phaseOutputs();
         const auto hc=result->full_prefix_->optionalPhaseOutputs();
@@ -185,6 +194,10 @@ public:
         request.route_contributions=p.route_partials.tensor;request.routed_output=p.output.tensor;
         request.shared_output=shared_.output;request.combined_output=combined_.tensor;
         request.shared_gate_scratch=shared_.gate_scratch;request.shared_up_scratch=shared_.up_scratch;
+        if(graph_role_==ResidentFFNGraphRole::MainInference)
+            request.model_main_inference=ResidentMoEFFNModelCoordinates{binding_->layer,shared_source_first_column_,
+                native_router_->collect_device_runtime_histogram?MoERuntimeHistogramProducerRole::ProductionDecode:
+                    MoERuntimeHistogramProducerRole::NotProducer};
         std::unique_ptr<PreparedResidentMoEFFN> admitted;
         if(native_router_)
         {
@@ -357,9 +370,15 @@ public:
             int(binding_->descriptors.size()),binding_->params.top_k);
         if(full_prefix_)requirements.merge(full_prefix_->phaseWorkspaceRequirements());
 #ifdef HAVE_ROCM
-        if(native_router_)MoEWorkspaceBuffers::add(requirements,MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER,
-            (full_prefix_?rocm::fullNativeHCFFNSlotBytes(implementation_):NativeLayoutBarrierLayout::bytes)*
-                MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,WorkspaceContentLifetime::SerialGraphFamily);
+        if(native_router_)
+        {
+            if(full_prefix_&&implementation_==rocm::FullNativeHCFFNImplementation::RetainedGFX906M1)
+                requirements.merge(rocm::retainedM1HCFFNWorkspace());
+            else
+                MoEWorkspaceBuffers::add(requirements,MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER,
+                    (full_prefix_?rocm::fullNativeHCFFNSlotBytes(implementation_):NativeLayoutBarrierLayout::bytes)*
+                        MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,WorkspaceContentLifetime::SerialGraphFamily);
+        }
 #else
         if(native_router_)throw std::logic_error("Native-layout router FFN workspace requires ROCm");
 #endif
@@ -467,6 +486,8 @@ private:
     TensorBase *const input_gate_;
     const MoEIntermediateShardTensorBinding combined_;
     const std::string name_;
+    const unsigned shared_source_first_column_; ///< Original authenticated shared down K origin.
+    ResidentFFNGraphRole graph_role_=ResidentFFNGraphRole::LocalRegion;
     DeviceWorkspaceManager *workspace_=nullptr;
     std::unique_ptr<PreparedResidentMoEFFN> program_;
     std::uint64_t program_identity_=0;

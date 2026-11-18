@@ -12,12 +12,25 @@
 #include "ResidentMoEFFNProgramEvidence.h"
 #include "execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "execution/moe/ExpertHistogramSource.h"
 #include <memory>
+#include <optional>
 
 namespace llaminar2
 {
 class TensorBase;
 class ITensor;
+
+/**
+ * @brief Original model placement coordinates for the retained decode receipt.
+ * @details Source geometry and physical kernel metadata remain with their existing owners.
+ */
+struct ResidentMoEFFNModelCoordinates
+{
+    int source_layer;
+    unsigned shared_source_first_column;
+    MoERuntimeHistogramProducerRole histogram_producer; ///< Original model router authorization.
+};
 
 /** @brief Complete source-authenticated ordinary M1 region after the original router. */
 struct ResidentMoEFFNRequest
@@ -35,6 +48,7 @@ struct ResidentMoEFFNRequest
     ITensor* combined_output=nullptr;
     ITensor* shared_gate_scratch=nullptr;
     ITensor* shared_up_scratch=nullptr;
+    std::optional<ResidentMoEFFNModelCoordinates> model_main_inference;
 };
 
 /** @brief Backend-owned sealed local transaction; no public private-buffer accessor. */

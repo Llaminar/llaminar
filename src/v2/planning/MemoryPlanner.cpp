@@ -46,6 +46,11 @@
 #include "planning/ActivationMemoryEstimator.h"
 #include "planning/CollectiveMemoryEstimator.h"
 #include "planning/WorkspaceMemoryEstimator.h"
+#ifdef HAVE_ROCM
+#include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNWorkspace.h"
+#include "models/qwen4exp/Qwen4ExpRetainedM1HCFFNPolicy.h"
+#include "utils/DebugEnv.h"
+#endif
 #include "planning/PlanningMemoryQuoteReuse.h"
 #include "execution/compute_stages/stages/GDNLiveStateWorkspaceContract.h"
 #include "kernels/HybridGDNStateGeometry.h"
@@ -2538,6 +2543,20 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             }
         }
 
+#ifdef HAVE_ROCM
+        if (cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+            cfg.device.is_rocm() && profile.flash_next && cfg.first_layer < profile.mainLayerCount() &&
+            cfg.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
+            useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNOptIn(),ForwardExecutionPhase::Decode,
+                ForwardExecutionRole::MainInference,1,cfg.batch_size))
+        {
+            // The same serial family backs all original graph shapes. Add the
+            // retained instance slots once, before PMA scales physical owners.
+            workspace_bytes = checkedAdd(workspace_bytes,
+                rocm::retainedM1HCFFNWorkspace().total_bytes_with_alignment(),
+                "QFN retained M1 serial-family workspace");
+        }
+#endif
         // Distinct graph owners can reuse one serial family across shapes,
         // but cannot alias one physical block while they run concurrently.
         workspace_bytes = checkedMultiply(

@@ -18,6 +18,7 @@
  * independent gate/up sources exercise actual admitted IQ4 role asymmetry
  * through the same source loader, prepared owners and full replay captures.
  */
+#include <charconv>
 #include "tensors/TensorSlice.h"
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "execution/compute_stages/IGraphOutputDemand.h"
@@ -40,6 +41,7 @@
 #include "kernels/rocm/gemm/ROCmNativeLayoutRouterFFN.h"
 #include "kernels/rocm/gemm/ROCmFullNativeHCFFN.h"
 #include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNDevice.h"
+#include "planning/TensorParallelSourceDeclaration.h"
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpHyperconnectionBuilder.h"
 #include "utils/GpuPreparedGemmHarness.h"
 #endif
@@ -159,7 +161,7 @@ void require(bool valid, const std::string &operation)
 enum class CastagnaPhaseObservation { Disabled, PerCTA };
 
 /** @brief Keep source-only recipe checks independent from native FFN arithmetic. */
-enum class OriginalSourceQualification { FFNFinalization, HostAuthorityRecipes, PreparedService, ResidentFFN, ResidentFFNEconomy, GateUpLastProducer, GateUpPairedK32, DownLastProducer, OriginalM1HiddenQ8, NativeLayoutRouterFFN, NativeLayoutRouterFFNParentReplay, NativeLayoutRouterFFNEconomy,CastagnaFullRegionAB,CastagnaFullRegionABEconomy,CastagnaFullRegionABReal,CastagnaFullRegionABRealEconomy,CastagnaFullRegionABBounded,CastagnaFullRegionABBoundedEconomy, FullNativeHCFFNFinal, FullNativeHCFFNMiddle };
+enum class OriginalSourceQualification { FFNFinalization, HostAuthorityRecipes, PreparedService, ResidentFFN, ResidentFFNEconomy, GateUpLastProducer, GateUpPairedK32, DownLastProducer, OriginalM1HiddenQ8, NativeLayoutRouterFFN, NativeLayoutRouterFFNParentReplay, NativeLayoutRouterFFNEconomy,CastagnaFullRegionAB,CastagnaFullRegionABEconomy,CastagnaFullRegionABReal,CastagnaFullRegionABRealEconomy,CastagnaFullRegionABBounded,CastagnaFullRegionABBoundedEconomy, FullNativeHCFFNFinal, FullNativeHCFFNMiddle, GroupedQ8DownReplay };
 /** @brief Explicit test-only full production graph lowering; default preserves every R57 arm. */
 enum class FullProductionHCProbe { Disabled, FinalRead, MiddleRead };
 /** @brief Cold observer/read demand; every mode uses the actual production full entry. */
@@ -188,7 +190,8 @@ struct SourceFormat
     const QuantizedVerifierFormatCase *up_quantized = nullptr; ///< Optional actual source up tensor, not a descriptor relabel.
     const QuantizedVerifierFormatCase *down_quantized = nullptr; ///< Optional actual source down tensor with independent native encoding.
     std::uint8_t expected_native_layout_groups = 0; ///< Optional exact compiled family asserted from original source envelopes.
-    const QuantizedVerifierFormatCase *shared_up_quantized = nullptr; ///< Optional genuine shared-up encoding; other shared roles retain shared_quantized.
+    const QuantizedVerifierFormatCase *shared_up_quantized = nullptr; ///< Optional genuine shared-up encoding.
+    const QuantizedVerifierFormatCase *shared_down_quantized = nullptr; ///< Optional original shared-down encoding independent of gate/up.
 };
 
 /**
@@ -313,8 +316,10 @@ void writeOriginalSources(PlanningGGUFFixture &file, const SourceFormat &format,
         if (role < 3 && format.shared_quantized)
         {
             const std::size_t n = role == 2 ? kH : kSharedF, k = role == 2 ? kSharedF : kH;
-            const auto* original_format=role==1&&format.shared_up_quantized
-                ?format.shared_up_quantized:format.shared_quantized;
+            const std::array formats{format.shared_quantized,
+                format.shared_up_quantized ? format.shared_up_quantized : format.shared_quantized,
+                format.shared_down_quantized ? format.shared_down_quantized : format.shared_quantized};
+            const auto* original_format = formats[role];
             const auto source = original_format->create({n, k}, 7103 + role);
             file.writePayload(kSharedNames[role], 0,
                 {static_cast<const uint8_t *>(source->raw_data()), source->size_bytes()});
@@ -983,11 +988,17 @@ void captureLane(Lane &lane, bool grouped, DeviceId device, int member, IWorkerG
     rendezvous.arrive_and_wait();
 }
 
-/** @brief Run retained serial/grouped graphs on one original GPU worker. */
+/**
+ * @brief Run the production grouped graph against a diagnostic serial graph on one worker.
+ * @param shape Original source geometry for both retained captures.
+ * @param capacities Exact immutable grouped row capacities to qualify.
+ */
 void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::barrier<> &rendezvous,
     MoEOverlayParticipantResidencyRegistry &banks, int original_member,
-    const FrozenModelWeightSet &shared, const TensorParallelConfig &shared_partition, PreparedWeightStore &store)
+    const FrozenModelWeightSet &shared, const TensorParallelConfig &shared_partition, PreparedWeightStore &store,
+    OriginalFFNFixtureGeometry shape,std::span<const int> capacities)
 {
+    const int hidden=shape.hidden;
     auto &worker = GPUDeviceContextPool::instance().getContext(device);
     worker.submitAndWait([&] {
         auto *local_tp = dynamic_cast<LocalTPContext *>(&tp);
@@ -1002,7 +1013,10 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
             auto setup = frame->acquireInitialConstruction();
             require(bool(setup), "original setup-only source reader");
             auto lane = makeLane(rows, grouped, device, member, tp, worker, *context, stream,
-                setup->layerForModelLayer(0), shared, shared_partition, store);
+                setup->layerForModelLayer(0), shared, shared_partition, store,
+                MoEIntermediateShardFFNExecution::Staged,MoEGateUpPublicationPolicy::Staged,
+                OriginalM1HiddenQ8FixturePolicy::CountedOriginal,{}, {},MoEDownPublicationPolicy::Staged,
+                CompletionSerialFamilyReplay::Disabled,shape);
             // Runtime and stages retain only the original closed family. No
             // initial epoch reader survives into recording or request replay.
             setup = {};
@@ -1010,26 +1024,26 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
             return lane;
         };
         auto serial = build(1, false);
-        for (const int rows : {1, 3, kMaxRows})
+        for (const int rows : capacities)
         {
             auto candidate = build(rows, true);
-            std::vector<float> input(std::size_t(rows) * kH), expected(input.size()), actual(input.size());
+            std::vector<float> input(std::size_t(rows) * hidden), expected(input.size()), actual(input.size());
             for (int row = 0; row < rows; ++row)
             {
-                for (int column = 0; column < kH; ++column)
-                    input[std::size_t(row) * kH + column] = column == 0 ? 1.f + float(row % 7) / 16.f
+                for (int column = 0; column < hidden; ++column)
+                    input[std::size_t(row) * hidden + column] = column == 0 ? 1.f + float(row % 7) / 16.f
                         : float((row * 5 + column * 3) % 17 - 8) / 128.f;
                 const int live = 1, sideband = member + 1;
                 require(backend->hostToDeviceOnStream(serial->sideband->gpu_data_ptr(), &sideband, sizeof(sideband),
                     device.ordinal, stream), "reset original M1 collective sideband");
-                require(backend->hostToDeviceOnStream(serial->hidden->gpu_data_ptr(), input.data() + std::size_t(row) * kH,
-                    kH * sizeof(float), device.ordinal, stream), "publish diagnostic serial input");
+                require(backend->hostToDeviceOnStream(serial->hidden->gpu_data_ptr(), input.data() + std::size_t(row) * hidden,
+                    hidden * sizeof(float), device.ordinal, stream), "publish diagnostic serial input");
                 require(backend->hostToDeviceOnStream(serial->active->gpu_data_ptr(), &live, sizeof(live),
                     device.ordinal, stream), "publish diagnostic serial count");
                 rendezvous.arrive_and_wait();
                 require(serial->capture->launch(), "launch real M1 FFN oracle graph");
-                require(backend->deviceToHostOnStream(expected.data() + std::size_t(row) * kH,
-                    serial->combined->gpu_data_ptr(), kH * sizeof(float), device.ordinal, stream), "observe terminal M1 FFN oracle");
+                require(backend->deviceToHostOnStream(expected.data() + std::size_t(row) * hidden,
+                    serial->combined->gpu_data_ptr(), hidden * sizeof(float), device.ordinal, stream), "observe terminal M1 FFN oracle");
                 require(worker.synchronizeStreamChecked(stream), "join diagnostic M1 observation");
                 rendezvous.arrive_and_wait();
             }
@@ -1072,11 +1086,11 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                 require(worker.synchronizeStreamChecked(stream), "terminal complete FFN observation join");
                 require(sideband_sum == tp.degree() * (tp.degree() + 1) / 2,
                     "same final FFN collective must preserve original sideband publication even for empty rows");
-                const auto expected_sent = static_cast<unsigned long long>(live) * kH * sizeof(float) * (tp.degree() - 1);
+                const auto expected_sent = static_cast<unsigned long long>(live) * hidden * sizeof(float) * (tp.degree() - 1);
                 require(sent == expected_sent, "one final native FFN sum must send exactly live H rows, including empty prefixes");
                 for (std::size_t element = 0; element < actual.size(); ++element)
                 {
-                    const float reference = element < std::size_t(live) * kH ? expected[element] : 0.f;
+                    const float reference = element < std::size_t(live) * hidden ? expected[element] : 0.f;
                     if (!std::isfinite(actual[element]) || std::bit_cast<uint32_t>(actual[element]) != std::bit_cast<uint32_t>(reference))
                         throw std::runtime_error("Original final FFN bytes differ: member=" + std::to_string(member) +
                             " rows=" + std::to_string(rows) + " live=" + std::to_string(live) +
@@ -1090,6 +1104,7 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
 }
 
 #include "MoEIntermediateShardResidentFFNReplay.inc"
+#include "RealRetainedTPSourceWindow.inc"
 #if defined(HAVE_ROCM)
 #include "FullNativeHCFFNReplay.inc"
 #include "FullNativeHCFFNEpochReplay.inc"
@@ -1118,7 +1133,8 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
     FullProductionHCProbe full_hc=FullProductionHCProbe::Disabled,
     FullProductionHCStorageReuse hc_storage_reuse=FullProductionHCStorageReuse::Distinct,
     bool full_hc_timing=false,
-    FullProductionHCObservation full_hc_observation=FullProductionHCObservation::ObservedAll)
+    FullProductionHCObservation full_hc_observation=FullProductionHCObservation::ObservedAll,
+    RealRetainedTPSourceWindow* original_window=nullptr)
 {
     const int kH=shape.hidden,kRoutedF=shape.routed,kSharedF=shape.shared,kExperts=shape.experts,kTopK=shape.top_k;
     require(kH>0&&kH%32==0&&kRoutedF>0&&kRoutedF%32==0&&kSharedF>0&&kSharedF%32==0&&
@@ -1140,7 +1156,8 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
         qualification == OriginalSourceQualification::CastagnaFullRegionABBounded ||
         qualification == OriginalSourceQualification::CastagnaFullRegionABBoundedEconomy ||
         qualification == OriginalSourceQualification::FullNativeHCFFNFinal ||
-        qualification == OriginalSourceQualification::FullNativeHCFFNMiddle) == (selected_source != nullptr),
+        qualification == OriginalSourceQualification::FullNativeHCFFNMiddle ||
+        qualification == OriginalSourceQualification::GroupedQ8DownReplay) == (selected_source != nullptr),
         "prepared calibration requires one original model source per process");
     require(!devices.empty(), "selected original participant family");
     const auto mpi = MPIContextFactory::global();
@@ -1168,7 +1185,11 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                 PlanningGGUFFixture::sourceType(format.down_quantized?format.down_quantized->tensor_type:format.type)}}:std::nullopt,
             PlanningGGUFFixture::MoEDimensions{uint32_t(kH),uint32_t(kSharedF),uint32_t(kTopK)},
             format.shared_up_quantized?std::optional<GGUFTensorType>{
-                PlanningGGUFFixture::sourceType(format.shared_up_quantized->tensor_type)}:std::nullopt);
+                PlanningGGUFFixture::sourceType(format.shared_up_quantized->tensor_type)}:std::nullopt,
+            format.shared_down_quantized?std::optional<GGUFTensorType>{
+                PlanningGGUFFixture::sourceType(format.shared_down_quantized->tensor_type)}:std::nullopt);
+        if(original_window)original_window->copyTo(file,shape,format);
+        else
 #if defined(LLAMINAR_CASTAGNA_KERNEL_AB)
         if(qualification==OriginalSourceQualification::CastagnaFullRegionAB||
            qualification==OriginalSourceQualification::CastagnaFullRegionABEconomy||
@@ -1311,30 +1332,32 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                 PreparedWeightAdmission::AllocateCompleteSet, preparation), "prepare original routed F slices");
             const auto member = std::find(devices.begin(), devices.end(), device) - devices.begin();
             require(manager.prepareWeightsForDevice(shared[member], device), "prepare original participant-local shared F slices and gates");
-            if(format.shared_up_quantized) {
-                // This boundary verifies what the real loader prepared; no
-                // device descriptor, source identity or policy is authored here.
-                require(format.shared_quantized,"asymmetric shared source retains its original gate/down encoding");
-                std::array<DeviceNativeQuantisedMatrixDesc,2> actual;
-                constexpr std::array names{"ffn_gate_shexp.weight","ffn_up_shexp.weight"};
-                const std::array expected{format.shared_quantized,format.shared_up_quantized};
-                for(unsigned role=0;role<2;++role) {
-                    const auto* binding=shared[member].optionalLayerForDevice(0,names[role],device);
-                    require(binding,"asymmetric shared role has an original frozen source binding");
-                    const auto ref=store->preparedRefForBinding(binding->binding_id,device);
-                    require(ref.has_value(),"asymmetric shared role retains its original prepared reference");
-                    auto* engine=store->gemmKernel(*ref);
-                    require(engine&&engine->weights_converted()&&
-                        engine->inspectPreparedNativeQuantisedMatrixDesc(actual[role])&&actual[role].valid()&&
-                        actual[role].n==kSharedF&&actual[role].k==kH&&
-                        actual[role].codebook_id==expected[role]->device_execution_codebook_id&&
-                        actual[role].source_identity_present&&
-                        actual[role].source_codebook_id==expected[role]->source_codebook_id&&
-                        bool(actual[role].source_is_superblock)==expected[role]->source_is_superblock,
-                        "asymmetric shared role preserves its actual physical and original source-policy identities");
+            if (format.shared_up_quantized || format.shared_down_quantized) {
+                // Read the loader's three original, potentially differently encoded
+                // sources. Down transposes the gate/up axes and uses the local TP slice.
+                require(format.shared_quantized, "asymmetric shared matrices have an original gate encoding");
+                constexpr std::array names{"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"};
+                const std::array expected{format.shared_quantized,
+                    format.shared_up_quantized ? format.shared_up_quantized : format.shared_quantized,
+                    format.shared_down_quantized ? format.shared_down_quantized : format.shared_quantized};
+                std::array<DeviceNativeQuantisedMatrixDesc, names.size()> actual{};
+                for (std::size_t role = 0; role < names.size(); ++role) {
+                    const auto* binding = shared[member].optionalLayerForDevice(0, names[role], device);
+                    require(binding && binding->tensor, "shared role has an original frozen tensor binding");
+                    const auto ref = store->preparedRefForBinding(binding->binding_id, device);
+                    require(ref.has_value(), "shared role retains its original prepared reference");
+                    const auto* engine = store->gemmKernel(*ref);
+                    auto& desc = actual[role];
+                    require(engine && engine->weights_converted() && engine->inspectPreparedNativeQuantisedMatrixDesc(desc) &&
+                        desc.valid() && desc.n == binding->tensor->rows() && desc.k == binding->tensor->cols() &&
+                        desc.codebook_id == expected[role]->device_execution_codebook_id && desc.source_identity_present &&
+                        desc.source_codebook_id == expected[role]->source_codebook_id &&
+                        bool(desc.source_is_superblock) == expected[role]->source_is_superblock,
+                        "shared role preserves the local dimensions and exact source encoding");
+                    for (std::size_t earlier = 0; earlier < role; ++earlier)
+                        require(actual[earlier].payload != desc.payload && actual[earlier].scales != desc.scales,
+                            "independently sourced shared weights retain distinct physical planes");
                 }
-                require(actual[0].payload!=actual[1].payload&&actual[0].scales!=actual[1].scales,
-                    "asymmetric shared roles retain distinct original allocations");
             }
         }
         if (devices.size() > 1)
@@ -1429,7 +1452,7 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                             shared[member],*manager.tensorParallelConfig(),*store,shape,
                             qualification==OriginalSourceQualification::FullNativeHCFFNMiddle?
                                 FullProductionHCProbe::MiddleRead:FullProductionHCProbe::FinalRead,hc_storage_reuse,
-                            format.expected_native_layout_groups,full_hc_timing,full_hc_observation);
+                            format.expected_native_layout_groups,full_hc_timing,full_hc_observation,original_window);
                     else
 #endif
 #if defined(LLAMINAR_CASTAGNA_KERNEL_AB)
@@ -1470,8 +1493,14 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                                 ? LocalFFNReplayCandidate::GateUpLastProducer:
                               qualification==OriginalSourceQualification::DownLastProducer
                                 ? LocalFFNReplayCandidate::DownLastProducer:LocalFFNReplayCandidate::Resident,local_program,shape);
-                    else
-                        replayParticipant(devices[member], member, *tp, rendezvous, banks, original_members[member], shared[member], *manager.tensorParallelConfig(), *store);
+                    else {
+                        constexpr std::array default_counts{1,3,kMaxRows};
+                        constexpr std::array q8_down_counts{3,4};
+                        const std::span<const int> capacities=qualification==OriginalSourceQualification::GroupedQ8DownReplay?
+                            std::span<const int>{q8_down_counts}:std::span<const int>{default_counts};
+                        replayParticipant(devices[member],member,*tp,rendezvous,banks,original_members[member],
+                            shared[member],*manager.tensorParallelConfig(),*store,shape,capacities);
+                    }
                 }
                 catch (...)
                 { errors[member] = std::current_exception(); tp->requestAbort(); rendezvous.arrive_and_drop(); }
@@ -1498,15 +1527,26 @@ namespace llaminar2::test {
 /** @brief Run the existing source/capture owner with an explicit full production lowering. */
 void replayFullProductionHCFFN(FullProductionHCProbe mode,bool real,bool timing=false,
     FullProductionHCObservation observation=FullProductionHCObservation::ObservedAll) {
-    const auto source=nativeLayoutRouterFFNSource();
     const bool retained=observation==FullProductionHCObservation::RetainedDemandedOnly;
     const char* requested_pci=retained?std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_PCI"):nullptr;
     const char* gguf=retained?std::getenv("LLAMINAR_TEST_CASTAGNA_GGUF"):nullptr;
     if(retained)require(gguf&&*gguf,"Set LLAMINAR_TEST_CASTAGNA_GGUF to the first local QFN UD-Q4_K_XL shard");
     const std::array<std::string_view,1> pci{requested_pci?requested_pci:""};
     originalRankLocalReplay(DeviceType::ROCm,1,[&](const auto& devices) {
-        const OriginalFFNFixtureGeometry shape{.hidden=2560,.routed=256,.shared=192,.experts=512,.top_k=10,
-            .router_source=OriginalFFNRouterSource::Dense};
+        const auto input = realCastagnaABInput();
+        auto source = nativeLayoutRouterFFNSource();
+        if (real) {
+            ModelLoader model;
+            model.setUseMmap(true);
+            require(model.loadModel(input.path), "read original source metadata for the Castagna comparison");
+            const auto gate = model.nativeWeightSourceGeometry(input.name("ffn_gate_exps.weight")).original_type;
+            const auto down = model.nativeWeightSourceGeometry(input.name("ffn_down_exps.weight")).original_type;
+            source = RealRetainedTPSourceWindow::sourceFormat(gate, down);
+        }
+        const auto routed = qfn_castagna_reference::equalWeightSourceShard(640, 128, input.degree, input.participant);
+        const auto shared = qfn_castagna_reference::equalWeightSourceShard(640, 64, input.degree, input.participant);
+        const OriginalFFNFixtureGeometry shape{.hidden=2560,.routed=static_cast<int>(routed.count),
+            .shared=static_cast<int>(shared.count),.experts=512,.top_k=10,.router_source=OriginalFFNRouterSource::Dense};
         // Inventory-only receipt: original discovery owns rank/device placement.
         // No HIP query, visibility remap or native work is added to observation.
         const auto mpi=MPIContextFactory::global();
@@ -1581,5 +1621,140 @@ TEST(FullNativeHCFFN,ROCmRetainedClosedReplay) {
     replayMandatoryFullNativeHCFFN(OriginalSourceQualification::FullNativeHCFFNFinal,
         FullProductionHCStorageReuse::Distinct,kFullNativeHCFFNFixtureGeometry,FullProductionHCObservation::RetainedDemandedOnly);
 }
+/** @test Both native Q8-down source families keep grouped byte equality through count/reset replay. */
+TEST(FullNativeHCFFN,ROCmGroupedQ8DownByteReplay)
+{
+    const auto qualification=OriginalSourceQualification::GroupedQ8DownReplay;
+    const auto sources=sourceFormats(qualification);
+    const auto& reference_formats=quantizedVerifierFormats();
+    const auto q8=std::find_if(reference_formats.begin(),reference_formats.end(),[](const auto& candidate) {
+        return candidate.tensor_type==TensorType::Q8_0;
+    });
+    require(q8!=reference_formats.end(),"original native Q8_0 grouped source");
+    constexpr OriginalFFNFixtureGeometry shape{.hidden=2560,.routed=384,.shared=320,.experts=16,.top_k=10,
+        .router_source=OriginalFFNRouterSource::Dense};
+    const char* requested_pci=std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_PCI");
+    const std::array<std::string_view,1> requested{requested_pci?requested_pci:""};
+    originalRankLocalReplay(DeviceType::ROCm,1,[&](const auto& devices) {
+        for(const auto gate:{TensorType::Q4_K,TensorType::Q5_K}) {
+            const auto source=std::find_if(sources.begin(),sources.end(),[&](const auto& value){return value.type==gate;});
+            require(source!=sources.end(),"original native grouped gate format");
+            auto format=*source;
+            format.shared_quantized=&*q8;
+            format.down_quantized=&*q8;
+            proveOriginalFinalization(devices,false,qualification,&format,LocalFFNProgram::Original,shape);
+            std::osyncstream(std::cout)<<"QFN_Q8_DOWN_GROUPED_REPLAY,gate="<<format.name
+                <<",down=Q8_0,grouped_capacities=3/4,replays_per_capacity=20,byte_oracle=original_serial"<<'\n';
+        }
+    },"gfx906",requested[0].empty()?std::span<const std::string_view>{}:std::span<const std::string_view>{requested});
+}
 } // namespace llaminar2::test
+#endif
+
+#if defined(HAVE_ROCM)
+namespace llaminar2::test {
+
+/** @return Exact user-selected original layer and retained TP source participant. */
+RealRetainedTPSourceWindow realProductionTPInputFromEnv()
+{
+    const char* path=std::getenv("LLAMINAR_TEST_CASTAGNA_GGUF");
+    require(path&&*path,"real TP window requires explicit original source");
+    const auto coordinate=[](const char* name) {
+        const char* value=std::getenv(name);
+        require(value&&*value,std::string("missing original TP window coordinate ")+name);
+        const std::string_view input(value);
+        int number=-1;
+        const auto [end,error]=std::from_chars(input.data(),input.data()+input.size(),number);
+        require(error==std::errc{}&&end==input.data()+input.size()&&number>=0,
+            std::string("invalid original TP window coordinate ")+name);
+        return number;
+    };
+    // Original ordered source roster, deliberately separate from the local
+    // replay owner. Neither fork cuts nor the local replay device determine F or S.
+    const char* roster=std::getenv("LLAMINAR_TEST_QFN_SOURCE_ROCM_ORDINALS");
+    require(roster&&*roster,"original source requires its resolved physical roster");
+    std::vector<DeviceId> members;
+    for(std::string_view input(roster);!input.empty();) {
+        const auto separator=input.find(',');
+        const auto value=input.substr(0,separator);
+        int ordinal=-1;
+        const auto [end,error]=std::from_chars(value.data(),value.data()+value.size(),ordinal);
+        require(error==std::errc{}&&end==value.data()+value.size()&&ordinal>=0,
+            "invalid resolved original source ROCm ordinal");
+        members.push_back(DeviceId::rocm(ordinal));
+        if(separator==std::string_view::npos) break;
+        input.remove_prefix(separator+1);
+        require(!input.empty(),"missing final original source ROCm ordinal");
+    }
+    return RealRetainedTPSourceWindow(path,coordinate("LLAMINAR_TEST_QFN_SOURCE_LAYER"),
+        coordinate("LLAMINAR_TEST_QFN_SOURCE_PARTICIPANT"),members);
+}
+
+/** @test Exact original QFN TP source windows through both actual graph owners. */
+TEST(FullNativeHCFFN, DISABLED_ROCmRetainedProductionTPWindow)
+{
+    const char* pci=std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_PCI");
+    require(pci&&*pci,"real TP window requires explicit PCI");
+    auto window=realProductionTPInputFromEnv();
+    auto format=window.format();
+    const char* mode=std::getenv("LLAMINAR_TEST_QFN_WINDOW_EVENTS");
+    require(!mode||std::string_view(mode)=="1","original window event mode must be explicit");
+    const bool timing=mode!=nullptr;
+    if(timing) {
+        const auto mask=nativeQuantisedCodebookMaskBit(canonicalDeviceVnniCodebookId(format.identity.native_quantised))|
+            nativeQuantisedCodebookMaskBit(format.down_quantized->device_execution_codebook_id)|
+            nativeQuantisedCodebookMaskBit(format.shared_quantized->device_execution_codebook_id);
+        format.expected_native_layout_groups=rocm::ResidentMoEFFNDecoderProgram::fromExecutionMask(mask).groups();
+    }
+    const auto shape=window.geometry();
+    const std::array<std::string_view,1> address{pci};
+    originalRankLocalReplay(DeviceType::ROCm,1,[&](const auto& devices) {
+        proveOriginalFinalization(devices,false,OriginalSourceQualification::FullNativeHCFFNFinal,
+            &format,LocalFFNProgram::Original,shape,CastagnaPhaseObservation::Disabled,
+            FullProductionHCProbe::FinalRead,FullProductionHCStorageReuse::Distinct,timing,
+            FullProductionHCObservation::RetainedDemandedOnly,&window);
+    },"gfx906",address);
+}
+
+/** @test Original native fragments from a real TP4 window move and are consumed after epoch publication. */
+TEST(FullNativeHCFFN, DISABLED_ROCmRetainedProductionWindowEpoch)
+{
+    try {
+        auto window=realProductionTPInputFromEnv();
+        const char* pci=std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_MOVEMENT_PCIS");
+        require(pci&&*pci,"real window movement requires three explicit PCI owners");
+        std::string_view list(pci);
+        std::array<std::string_view,3> owners;
+        for(std::size_t index=0;index<owners.size();++index) {
+            const auto separator=list.find(',');
+            require((separator==std::string_view::npos)==(index+1==owners.size()),
+                "real window movement requires exactly three original PCI identities");
+            owners[index]=list.substr(0,separator);
+            require(!owners[index].empty(),"real window movement PCI is nonempty");
+            if(separator!=std::string_view::npos)list.remove_prefix(separator+1);
+        }
+        promoted23_replay::run(promoted23_replay::NumericalProgram::FullHCFFNEpoch,owners,
+            promoted23_replay::EpochSource::GPUNative5_7,&window);
+        if(::testing::Test::HasFailure())MPI_Abort(MPI_COMM_WORLD,2);
+    } catch(const std::exception& error){ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
+}
+
+/** @test Layer-zero raw model weights exercise four genuine TP participants through an actual arrival. */
+TEST(FullNativeHCFFN, DISABLED_ROCmRetainedProductionTP4Epoch)
+{
+    try {
+        const char* scope=std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_MOVEMENT_PCIS");
+        require(scope&&*scope,"real TP4 epoch requires exact singleton, four-rank target, and singleton PCI groups");
+        auto source=realProductionTPInputFromEnv();
+        const auto pci=originalRetainedClosedMovementPCIs(scope);
+        promoted23_replay::run(promoted23_replay::NumericalProgram::FullHCFFNEpoch,pci,
+            promoted23_replay::EpochSource::GPUNativeRealTP4,&source);
+        if(::testing::Test::HasFailure())MPI_Abort(MPI_COMM_WORLD,2);
+    } catch(const std::exception& error){ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
+}
+}
+#endif
+
+#if defined(HAVE_ROCM)
+#include "FullNativeHCFFNFamilyReplay.inc"
 #endif

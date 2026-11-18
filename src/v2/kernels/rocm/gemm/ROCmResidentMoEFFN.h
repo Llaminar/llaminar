@@ -7,6 +7,7 @@
  * consumer; no new live memory ledger, weight copy or route mirror is created.
  */
 #pragma once
+
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/NativeCooperativeKernel.h"
 #include "kernels/common/ResidentMoEFFNProgramEvidence.h"
@@ -286,6 +287,7 @@ struct ResidentMoEFFNPolicyMasks
  * value contains immutable launch/resource observations and, only for actual
  * cooperative execution, its exact native residency admission.
  */
+enum class RetainedM1NativeHistogramPolicy : std::uint32_t;
 class PreparedMoEFFNProgram final
 {
 public:
@@ -293,7 +295,8 @@ public:
     const ResidentMoEFFNProgramEvidence& evidence() const noexcept {return evidence_;}
 private:
     friend PreparedMoEFFNProgram prepareFullNativeHCFFN(DeviceId,FullNativeHCFFNArgs&,ResidentMoEFFNPolicyMasks,std::uint64_t);
-    friend PreparedMoEFFNProgram prepareRetainedM1HCFFN(DeviceId,FullNativeHCFFNArgs&,ResidentMoEFFNPolicyMasks,std::uint64_t);
+    friend PreparedMoEFFNProgram prepareRetainedM1HCFFN(DeviceId,FullNativeHCFFNArgs&,ResidentMoEFFNPolicyMasks,
+        std::uint64_t,RetainedM1NativeHistogramPolicy);
     friend void launchFullNativeHCFFN(const PreparedMoEFFNProgram&,const FullNativeHCFFNArgs&,void*,std::uint64_t);
     friend PreparedMoEFFNProgram prepareNativeLayoutRouterFFN(DeviceId,NativeLayoutRouterFFNArgs&,ResidentMoEFFNPolicyMasks,std::uint64_t);
     friend void launchNativeLayoutRouterFFN(const PreparedMoEFFNProgram&,const NativeLayoutRouterFFNArgs&,void*,std::uint64_t);

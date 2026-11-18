@@ -45,6 +45,6 @@ __global__ __launch_bounds__(1024,1) void fullNativeHCFFNKernel(
     // Prefix publication and local reader retirement have completed. Both LDS
     // regions are now phase-exclusive; no additive per-phase storage is needed.
     ResidentGridBarrier suffix_grid{suffix.barrier_state};
-    tunedFullNativeHCFFNSuffix<Mask>(suffix,suffix_grid,shared.ffn,dynamic_storage,prefix.output_demand);
+    tunedFullNativeHCFFNSuffix<Mask>(suffix,suffix_grid,shared.ffn,dynamic_storage,prefix_bytes,prefix.output_demand);
 }
 }

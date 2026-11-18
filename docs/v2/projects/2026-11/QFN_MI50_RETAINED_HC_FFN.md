@@ -6,13 +6,15 @@ One captured MI50 kernel performs the complete local post-attention hyperconnect
 router and expert/shared FFN operation for a single decode row. Timing ends before
 the collective. The model’s separate FP32 HC injection node lies outside this
 final-read measurement. The input weights are layer 1 of Qwen3.8-Flash-Next-UD-Q4_K_XL.
-The comparator selects Castagna TP4 participant 3, with routed columns [384, 640) and shared columns [448, 640)
+The comparator selects logical slot 3 of the Castagna TP4 source split, with routed columns [384, 640) and shared columns [448, 640)
 of the two 640-wide source matrices. Routed gate/up weights use Q4_K, routed
 down uses Q5_1 and the three shared projections use Q8_0. H is 2560, E is
 512 and top-K is 10.
 Both arms start from the same seeded boundary activations and selected expert sets.
 Llaminar retains its own arithmetic, movable expert storage and route histogram.
-The fork uses its original arithmetic and omits the histogram.
+The fork uses its original arithmetic and omits the histogram. The fork rotates the physical participant assigned to a source slot
+by layer class. This single-card comparison authenticates the source interval
+and the timed PCI device independently.
 
 The comparison uses the unchanged Castagna device section from commit
 `3483d462715d61f21ed5877836be35a724446359`. Its exporter checks the revision,
@@ -29,8 +31,9 @@ rotating the larger shard across layers. The measured S192 entry therefore cover
 none of those 192 automatic layer/participant assignments. Of the 48 layers,
 43 have the measured routed weight types. Layers 4, 30, 46 and 47 use Q8_0 down,
 and layer 2 uses both Q5_K gate/up and Q8_0 down. Acceleration of normal serving
-requires the S160 shapes and these additional formats, followed by a matched
-whole-model throughput and accuracy run.
+uses the S160 shapes and these additional formats. The follow-up measurements
+cover those source windows, whole-model throughput and MTP token parity.
+[Tuning dashboard](QFN_FFN_FAMILY_TUNING_DASHBOARD_20261116.md)
 
 The pinned fork accepts shared widths in multiples of 64. Its down projection
 consumes pairs of 32-value blocks. A direct launch at S160 would leave the last
@@ -91,8 +94,8 @@ midpoints and their immediate neighbors. The native HC and FFN regressions also
 exercise 80,327 exceptional rows, including signed zero and signaling NaNs. A six-MI50 replay with two socket
 ranks and three two-member RCCL cohorts verified that all six participants
 consumed new expert bytes and published changed outputs in the second epoch.
-Grouped MTP performance, whole-model throughput and the other weight-format
-specialisations require their own measurements. This entry is opt-in through
+The dashboard records separate grouped MTP, whole-model and per-format
+measurements for the follow-up Release build. This entry is opt-in through
 `LLAMINAR_QFN_RETAINED_M1_HC_FFN_CANDIDATE=1` for an eligible graph.
 
 ## Comparing the remaining weight formats

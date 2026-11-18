@@ -48,7 +48,7 @@ template<class Poll> void await(Poll&& poll,const char* what) {
 /** @brief Select original standalone FFN replay or retained full numerical epoch transition. */
 enum class NumericalProgram { NativeLayout, FullHCFFNEpoch };
 /** @brief Genuine source route for this numerical fixture, never a destination format override. */
-enum class EpochSource { CPUPromoted23, GPUNative5_7, GPUNativeCohort2, GPUNativeCohort2WithDescriptorReader };
+enum class EpochSource { CPUPromoted23, GPUNative5_7, GPUNativeCohort2, GPUNativeCohort2WithDescriptorReader, GPUNativeRealTP4, GPUNativeCohort2Q4Q8, GPUNativeCohort2Q5Q8 };
 /**
  * @brief Execute the original physical fabric and retained numerical publication lifecycle.
  * @param program Existing standalone or complete captured numerical observer.
@@ -56,15 +56,25 @@ enum class EpochSource { CPUPromoted23, GPUNative5_7, GPUNativeCohort2, GPUNativ
  * @param epoch_source Genuine CPU-promoted or native GPU source/geometry selection.
  */
 void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const std::string_view> pci={},
-    EpochSource epoch_source=EpochSource::CPUPromoted23) {
+    EpochSource epoch_source=EpochSource::CPUPromoted23,RealRetainedTPSourceWindow* real_window=nullptr) {
     const bool gpu_native=epoch_source!=EpochSource::CPUPromoted23;
-    const bool cohort2=epoch_source==EpochSource::GPUNativeCohort2||epoch_source==EpochSource::GPUNativeCohort2WithDescriptorReader;
+    const bool q5_q8=epoch_source==EpochSource::GPUNativeCohort2Q5Q8;
+    const bool q8_down=q5_q8||epoch_source==EpochSource::GPUNativeCohort2Q4Q8;
+    const bool cohort2=q8_down||epoch_source==EpochSource::GPUNativeCohort2||
+        epoch_source==EpochSource::GPUNativeCohort2WithDescriptorReader;
+    const bool real_tp4=epoch_source==EpochSource::GPUNativeRealTP4;
+    const bool native_cohorts=cohort2||real_tp4;
     const std::size_t degree=cohort2?2u:1u;
-    require(pci.empty()||pci.size()==(gpu_native?3u*degree:2u),
+    require(pci.empty()||pci.size()==(real_tp4?6u:gpu_native?3u*degree:2u),
         "original source fixture declares one PCI per requested GPU cohort");
     require(!gpu_native||program==NumericalProgram::FullHCFFNEpoch,
         "native GPU-source epoch fixture requires the retained complete numerical program");
-    const OriginalFFNFixtureGeometry geometry=gpu_native
+    require(!real_window||(gpu_native&&!cohort2),"original real TP4 sources move across declared native owners");
+    require(!real_tp4||(real_window&&real_window->originalLayer()==0&&pci.size()==6),
+        "complete real TP4 movement first proves actual layer0 rotation and six original GPU owners");
+    const OriginalFFNFixtureGeometry geometry=real_tp4?
+        OriginalFFNFixtureGeometry{2560,640,640,512,10,OriginalFFNRouterSource::TieControl,OriginalFFNGeometryContract::QFNTensorSharded}:
+        real_window?real_window->geometry():gpu_native
         ?OriginalFFNFixtureGeometry{2560,cohort2?512:256,cohort2?384:192,512,10,OriginalFFNRouterSource::TieControl}
         :OriginalFFNFixtureGeometry{256,640,256,6,2,OriginalFFNRouterSource::TieControl};
     std::map<DeviceId,FrozenModelWeightSet> shared;
@@ -98,25 +108,39 @@ void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const
             domains.clear();epochs.clear();boundaries.clear();weights.clear();}
     };
     OriginalFragmentPreparationHooks hooks;
-    if(cohort2)hooks.authored_plan=[&](const MoERoutedExpertPlacementPlan& plan,int rank) {
+    if(native_cohorts)hooks.authored_plan=[&](const MoERoutedExpertPlacementPlan& plan,int rank) {
         for(const auto& d:plan.domains) {
             if(d.owner_rank!=rank)continue;
             require(d.routed_compute_policy==RoutedExpertComputePolicy::TensorSharded&&
-                d.participants.size()==degree,"actual complete original local GPU cohort");
+                d.participants.size()==(real_tp4&&d.name=="warm"?4u:degree),
+                "actual complete original local GPU cohort");
             auto& domain=local_domains[d.name];
             for(const auto& member:d.participants) {
                 domain.devices.push_back(member.toLocalDeviceId());
                 require(domain_of.emplace(domain.devices.back(),d.name).second,"original disjoint GPU cohorts");
             }
-            domain.shared_partition=TensorParallelConfig::equalSplit(degree,8,2,geometry.shared,320,domain.devices);
+            domain.shared_partition=TensorParallelConfig::equalSplit(domain.devices.size(),8,2,geometry.shared,320,domain.devices);
         }
     };
     hooks.geometry=OriginalFragmentSourceGeometry{geometry.hidden,geometry.routed,geometry.shared,geometry.experts,geometry.top_k};
     hooks.shared_type=GGUFTensorType::Q8_0;
+    if(q8_down) {
+        const auto gate=q5_q8?GGUFTensorType::Q5_K:GGUFTensorType::Q4_K;
+        hooks.routed_source_types=std::array{gate,gate,GGUFTensorType::Q8_0};
+        hooks.generate_declared_routed_sources=true;
+    }
+    if(real_window) {
+        const auto format=real_window->format();
+        const auto gate=PlanningGGUFFixture::sourceType(format.type);
+        hooks.routed_source_types=std::array{gate,gate,
+            PlanningGGUFFixture::sourceType(format.down_quantized->tensor_type)};
+    }
     hooks.source=[&](PlanningGGUFFixture& file) {
+        if(real_window)real_window->copyTo(file,geometry,real_window->format(),RealRetainedWindowRoles::NativeProjections,
+            real_tp4?RealRetainedWindowExtent::WholeLayer:RealRetainedWindowExtent::OriginalShard);
         // Author only shared/router tensors; routed source remains the exact
         // existing Q4_K/Q4_K/Q5_1 physical-fabric fixture payload.
-        for(size_t role=0;role<kSharedNames.size();++role) {
+        for(size_t role=real_window?3u:0u;role<kSharedNames.size();++role) {
             if(role<3) {
                 const auto n=role==2?geometry.hidden:geometry.shared;
                 const auto k=role==2?geometry.shared:geometry.hidden;
@@ -154,7 +178,7 @@ void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const
             // All local source cohorts are singleton; this does not repartition
             // an existing source cohort or invent a representative member.
             const std::vector<DeviceId> singleton{device};
-            const auto& participants=cohort2?local_domains.at(domain_of.at(device)).devices:singleton;
+            const auto& participants=native_cohorts?local_domains.at(domain_of.at(device)).devices:singleton;
             manager.setTensorParallelConfig(std::make_shared<TensorParallelConfig>(
                 TensorParallelConfig::equalSplit(participants.size(),8,2,geometry.shared,320,participants)));
             auto plan_source=sharedPlan(model,participants,device);
@@ -204,6 +228,13 @@ void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const
         gpu_native
             ?OriginalFragmentTargetRequest{"capacity",DeviceType::ROCm,degree,{},!cohort2&&!pci.empty()?std::string(pci[2]):std::string{}}
             :OriginalFragmentTargetRequest{"capacity",DeviceType::CPU,2}};
+    if(real_tp4) {
+        requests[0].pci_address=std::string(pci[0]);
+        requests[1].pci_address.clear();
+        requests[1].degree=4;
+        requests[1].pci_addresses.assign(pci.begin()+1,pci.begin()+5);
+        requests[2].pci_address=std::string(pci[5]);
+    }
     if(cohort2)for(std::size_t i=0;i<requests.size();++i) {
         require(!pci.empty(),"exact original PCI roster for this NUMA-local diagnostic");
         requests[i].pci_addresses.assign(pci.begin()+i*degree,pci.begin()+(i+1)*degree);
@@ -218,9 +249,10 @@ void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const
         (void)name;
         std::vector<GlobalDeviceAddress> addresses;
         for(const DeviceId device:domain.devices)addresses.push_back(GlobalDeviceAddress::fromLocalDeviceId(device));
-        domain.communicator=createLocalTPContext(addresses,{},CollectiveBackendType::RCCL);
-        require(domain.communicator&&domain.communicator->degree()==int(degree)&&
-            domain.communicator->backend()==CollectiveBackendType::RCCL,"actual original native RCCL cohort");
+        const bool collective=domain.devices.size()>1;
+        domain.communicator=createLocalTPContext(addresses,{},collective?CollectiveBackendType::RCCL:CollectiveBackendType::AUTO);
+        require(domain.communicator&&domain.communicator->degree()==int(domain.devices.size())&&
+            (!collective||domain.communicator->backend()==CollectiveBackendType::RCCL),"actual original native local cohort");
     }
     std::exception_ptr native_failure;
     const auto abort_native=[&](std::exception_ptr first) {
@@ -297,15 +329,14 @@ void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const
                 state->promoted_experts.push_back(migration.expert_id);
                 if(gpu_native) {
                     const auto& fragment=state->bank->layerForModelLayer(0).fragments.at(migration.expert_id);
-                    const std::array engines{fragment.gate(),fragment.up(),fragment.down()};
-                    constexpr std::array<uint32_t,3> physical{5,5,7};
-                    for(size_t role=0;role<engines.size();++role) {
-                        MoEOverlayPreparedWeightSource arrived;
-                        require(resolveMoEOverlayPreparedWeightSource(engines[role],device,arrived,&error),
-                            "resolve actual GPU-source numerical arrival: "+error);
-                        require(arrived.gpu_packed.codebook_id==physical[role],
-                            "GPU-source numerical arrival retains its native physical decoder");
-                    }
+                    std::array<DeviceNativeQuantisedMatrixDesc,3> arrived;
+                    const auto declaration=MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(
+                        state->bank->layers.front().fragment_family);
+                    require(fragment.gate()->exportNativeQuantisedMatrixDesc(arrived[0])&&
+                        fragment.up()->exportNativeQuantisedMatrixDesc(arrived[1])&&
+                        fragment.down()->exportNativeQuantisedMatrixDesc(arrived[2])&&
+                        declaration.matchesNativeGateUp(arrived[0],arrived[1])&&declaration.matchesNativeDown(arrived[2]),
+                        "actual GPU-source numerical arrival retains its original geometry, provenance and physical decoder");
                 }
             }
         }
@@ -323,7 +354,8 @@ void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const
         auto boundary=std::make_unique<ColdPublicationBoundary>();
         bindings.push_back({.device=device,.runtime_layers_device=state->runtime->deviceLayerState(0),
             .runtime_table_host=state->runtime.get(),.overlay_participant_id=member->participant_id,
-            .domain_participant_id=uint32_t(member->domain_participant_index),.domain_participant_count=uint32_t(degree),
+            .domain_participant_id=uint32_t(member->domain_participant_index),
+            .domain_participant_count=uint32_t(state->bank->layers.front().fragment_family->cohort()->participants().size()),
             .layer_count=1,.expert_count=geometry.experts,.top_k=geometry.top_k,
             .epoch_control=state->arena->control(),.maintenance_epoch=state->arena->maintenanceEpoch(),
             .maintenance_status=state->arena->maintenanceStatus(),.inference_boundary=boundary.get(),
@@ -348,7 +380,8 @@ void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const
         std::vector<std::future<void>> preparing;
         std::vector<std::pair<DeviceId,std::shared_ptr<FullEpochNumericalPair>>> prepared_pairs(published.size());
         unsigned prepared_count=0;
-        if(program==NumericalProgram::FullHCFFNEpoch)for(const auto& [device,state]:published)if(!state->promoted_experts.empty()) {
+        if(program==NumericalProgram::FullHCFFNEpoch)for(const auto& [device,state]:published)
+            if(!state->promoted_experts.empty()&&(!real_tp4||domain_of.at(device)=="warm")) {
             const auto index=prepared_count++;
             preparing.push_back(std::async(std::launch::async,[&,device,state,index] {
             const auto& members=original.registry->initialOwnerMap().participants();
@@ -359,7 +392,7 @@ void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const
             require(initial->bank&&initial->epoch()==1,"full epoch retains actual initially published source lease");
             std::shared_ptr<ILocalTPContext> tp;
             TensorParallelConfig partition;
-            if(cohort2) {
+            if(native_cohorts) {
                 const auto& domain=local_domains.at(domain_of.at(device));
                 tp=domain.communicator;partition=domain.shared_partition;
             } else tp=createLocalTPContext({GlobalDeviceAddress::fromLocalDeviceId(device)},{},CollectiveBackendType::AUTO);
@@ -372,9 +405,9 @@ void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const
         }
         joinOriginalNativeWorkerSubmissions(preparing,abort_native,std::chrono::steady_clock::now()+std::chrono::seconds(30));
         if(native_failure)std::rethrow_exception(native_failure);
-        if(cohort2) {
+        if(native_cohorts) {
             for(const auto& [name,domain]:local_domains) {
-                (void)name;
+                if(real_tp4&&name!="warm")continue;
                 std::vector<std::shared_ptr<FullEpochNumericalPair>> members;
                 for(const auto& device:domain.devices) {
                     const auto found=std::find_if(prepared_pairs.begin(),prepared_pairs.begin()+prepared_count,
@@ -415,14 +448,19 @@ void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const
         await([&](std::string* e){return publication->pollPublication(e);},"candidate publication event");
     }
     unsigned long long local_count=local_promoted,global_count=0;
-    const unsigned long long expected_arrivals=gpu_native?requests.size()*degree:1u;
+    if(q8_down)
+        std::osyncstream(std::cout)<<"QFN_Q8_DOWN_MOVEMENT_SOURCE,gate="<<(q5_q8?"Q5_K":"Q4_K")
+            <<",up="<<(q5_q8?"Q5_K":"Q4_K")<<",down=Q8_0,source_F="<<geometry.routed
+            <<",source_S="<<geometry.shared<<",cohort_degree="<<degree<<'\n';
+    const unsigned long long expected_arrivals=real_tp4?6u:gpu_native?requests.size()*degree:1u;
     require(MPI_Allreduce(&local_count,&global_count,1,MPI_UNSIGNED_LONG_LONG,MPI_SUM,MPI_COMM_WORLD)==MPI_SUCCESS&&
             global_count==expected_arrivals,
         "every declared physical arrival has its original numerical destination witness");
     if(MPI_Barrier(MPI_COMM_WORLD)!=MPI_SUCCESS)throw std::runtime_error("promoted physical source publication rendezvous");
     std::vector<std::future<void>> replaying;
     for(const auto& [device,state]:published)if(!state->promoted_experts.empty()) {
-        if(cohort2) {
+        if(real_tp4&&domain_of.at(device)!="warm")continue;
+        if(native_cohorts) {
             require(numerical.contains(device),"same retained component graph with its original RCCL cohort");
             replaying.push_back(std::async(std::launch::async,[&,device,state]{numerical.at(device)->replay(*state,true);}));
             continue;
@@ -496,13 +534,26 @@ std::vector<std::string_view> originalRetainedClosedMovementPCIs(const char* env
     }
     throw std::runtime_error("Retained closed movement requires three rank-local gfx906 pairs from original inventory");
 }
-/** @test A real closed movement cohort retains two actual native RCCL members. */
-TEST(FullNativeHCFFN,ROCmRetainedFastGPUOriginalCohort2EpochSwitchReplay) {
+/** @brief Keep every original participant aligned while testing the declared native arrival format. */
+void replayOriginalRetainedClosedCohort2(promoted23_replay::EpochSource source) {
     try {
         const auto pci=originalRetainedClosedMovementPCIs(std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_MOVEMENT_PCIS"));
         promoted23_replay::run(promoted23_replay::NumericalProgram::FullHCFFNEpoch,pci,
-            promoted23_replay::EpochSource::GPUNativeCohort2);
+            source);
         if(::testing::Test::HasFailure())MPI_Abort(MPI_COMM_WORLD,2);
     } catch(const std::exception& error){ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
+}
+
+/** @test A real closed movement cohort retains two actual native RCCL members. */
+TEST(FullNativeHCFFN,ROCmRetainedFastGPUOriginalCohort2EpochSwitchReplay) {
+    replayOriginalRetainedClosedCohort2(promoted23_replay::EpochSource::GPUNativeCohort2);
+}
+
+/** @test Both native Q8-down leaves consume changed expert bytes through the same retained capture. */
+TEST(FullNativeHCFFN,ROCmRetainedFastGPUQ4KQ8EpochSwitchReplay) {
+    replayOriginalRetainedClosedCohort2(promoted23_replay::EpochSource::GPUNativeCohort2Q4Q8);
+}
+TEST(FullNativeHCFFN,ROCmRetainedFastGPUQ5KQ8EpochSwitchReplay) {
+    replayOriginalRetainedClosedCohort2(promoted23_replay::EpochSource::GPUNativeCohort2Q5Q8);
 }
 #endif

@@ -525,7 +525,7 @@ __device__ __forceinline__ void moe_quant4(const float4 v, q81 & b, const int su
 
 #include "CurrentLlaminarHCPrefix.inc"
 
-template <int T, bool POST, bool STASH, bool INJ, bool AR4, qfn_castagna_reference::GateSource GateFormat, bool ObserveCanonical=false,bool Instance=false,bool Sense=false,bool Packed=false,bool Weighted=false,bool PublishRoleTables=true>
+template <int T, bool POST, bool STASH, bool INJ, bool AR4, qfn_castagna_reference::GateSource GateFormat, bool ObserveCanonical=false,bool Instance=false,bool Sense=false,bool Packed=false,bool Weighted=false,bool PublishRoleTables=true,unsigned RoutedDownCodebook=7,bool CollectHistogram=true>
 __launch_bounds__(NT)
 #if HCP_NT == 512
 __attribute__((amdgpu_waves_per_eu(1, 2)))
@@ -582,10 +582,12 @@ static_assert(!Packed||(Sense&&Instance),"Packed lifetime protocol requires inst
     // inputs (T*(nused*ffr + ff)/32 blocks)
     // (T <= 3: also mixed in f32 for the E phase's f32 matvecs, T*10 KB)
     constexpr int ARENA = T < 4 ? T*E*4 : 4*4800;
-    // Q4 GU owns one temporary64-row coefficient panel in this phase union.
+    // Affine GU owns its existing temporary64-row effective half coefficient panel in this phase union.
     // Earlier mixed/HC users and later down Q8 users retain their original edges.
-    constexpr int NATIVE_GU_PANEL_BYTES = GateFormat == qfn_castagna_reference::GateSource::Q4_K ? 2*(E/32)*NativeQ4PanelContract::row_capacity*sizeof(unsigned) : 0;
-    constexpr int NATIVE_PHASE_BYTES = ARENA > T*PSTR*4 ? ARENA : T*PSTR*4;
+    constexpr int NATIVE_GU_PANEL_BYTES = 2*(E/32)*NativeQ4PanelContract::row_capacity*sizeof(unsigned);
+    constexpr int PREFIX_PHASE_BYTES = (256+2*E)*sizeof(float);
+    constexpr int NATIVE_BODY_BYTES = ARENA > T*PSTR*4 ? ARENA : T*PSTR*4;
+    constexpr int NATIVE_PHASE_BYTES = NATIVE_BODY_BYTES > PREFIX_PHASE_BYTES ? NATIVE_BODY_BYTES : PREFIX_PHASE_BYTES;
     __shared__ __attribute__((aligned(16))) char arena[NATIVE_PHASE_BYTES > NATIVE_GU_PANEL_BYTES ? NATIVE_PHASE_BYTES : NATIVE_GU_PANEL_BYTES];
     static_assert(sizeof(arena)>=(256+2*E)*sizeof(float),
         "Wide HC norm staging must fit the existing phase arena");
@@ -637,7 +639,7 @@ static_assert(!Packed||(Sense&&Instance),"Packed lifetime protocol requires inst
         using Runtime=llaminar2::rocm::native_runtime_abi::DeviceMoELayerRuntimeView;
         using Acquired=llaminar2::rocm::router_native::AcquiredRuntimeDecodeBank<Runtime>;
         const auto inactive_bank=Acquired::acquire(ffn.moe.runtime);
-        if(bid==0)llaminar2::rocm::router_native::runtime_publish_independent_decode_dispatch_from_bank<true,
+        if(bid==0)llaminar2::rocm::router_native::runtime_publish_independent_decode_dispatch_from_bank<CollectHistogram,
             llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal,PublishRoleTables,Runtime,
             llaminar2::rocm::router_native::RuntimeDecodePublicationValidation::ValidatedOriginalFragment>(inactive_bank,
                 nullptr,nullptr,NR,ffn.moe.nused,ffn.moe.public_ids,ffn.moe.public_weights,true,
@@ -920,7 +922,7 @@ static_assert(!Packed||(Sense&&Instance),"Packed lifetime protocol requires inst
                     const int expert=selection.selected_ids[tid];
                     bool local;
                     if(bid==0) {
-                        local=llaminar2::rocm::router_native::runtime_publish_bound_original_fragment_dispatch<false,!PublishRoleTables&&!ObserveCanonical>(
+                        local=llaminar2::rocm::router_native::runtime_publish_bound_original_fragment_dispatch<false,CollectHistogram&&!PublishRoleTables&&!ObserveCanonical,CollectHistogram>(
                             fragment,selection.selected_ids,selection.selected_weights,
                             mo.public_ids,mo.public_weights,mo.active_rows,mo.publication);
                     } else {
@@ -976,8 +978,9 @@ static_assert(!Packed||(Sense&&Instance),"Packed lifetime protocol requires inst
         // chunks balance real output rows across the cohort; cyclic entry
         // rounds cover more entries than CTAs without a global partial bank.
         {
-            static_assert(GateFormat==qfn_castagna_reference::GateSource::Q4_K,
-                "Current private tuple is native affine Q4 gate/up only");
+            constexpr bool Q4=GateFormat==qfn_castagna_reference::GateSource::Q4_K;
+            static_assert(Q4 || GateFormat==qfn_castagna_reference::GateSource::Q5_K,
+                "The retained entry uses canonical native affine Q4 or Q5 gate/up");
             constexpr unsigned WaveRows=NativeQ4PanelContract::rows_per_wave;
             constexpr unsigned Capacity=NativeQ4PanelContract::row_capacity;
             static_assert(NT%64==0 && Capacity==WaveRows*(NT/64) && E%512==0,
@@ -1040,9 +1043,24 @@ static_assert(!Packed||(Sense&&Instance),"Packed lifetime protocol requires inst
                                 if(local_row<count) {
 #pragma unroll 1
                                     for(unsigned block=part*partition_width;block<blocks&&block<(part+1)*partition_width;++block) {
-                                        const auto wg=native_qk_item<false,true>(gate_fields,r,int(block/8),int((block%8)/2),int(block&1),panel,tile);
-                                        const auto wu=native_qk_item<false,true>(&up_matrix,r,int(block/8),int((block%8)/2),int(block&1),panel+(E/32)*Capacity,tile);
-                                        canonicalQ4PairCommit(wg,wu,canonical_hidden[t][block],gg,uu);
+                                        const auto& activation=canonical_hidden[t][block];
+                                        if constexpr(Q4) {
+                                            const auto wg=native_qk_item<false,true>(gate_fields,r,int(block/8),int((block%8)/2),int(block&1),panel,tile);
+                                            const auto wu=native_qk_item<false,true>(&up_matrix,r,int(block/8),int((block%8)/2),int(block&1),panel+(E/32)*Capacity,tile);
+                                            canonicalQ4PairCommit(wg,wu,activation,gg,uu);
+                                        } else {
+                                            // Native Q5_K uses the same executable K32 block as Q5_1.
+                                            // Source-superblock provenance was authenticated before publication.
+                                            namespace numeric=llaminar2::device_native_quantised_contract;
+                                            // Q5 uses the identical affine metadata planes. Its payload
+                                            // and high bits remain eight original native dot4 operands.
+                                            const auto field=native_q4_panel_index(local_row,block);
+                                            int words[6];
+                                            native_q51_block<false>(gate_fields,r,int(block),words,panel[field]);
+                                            gg=numeric::accumulate(gg,currentDownQ51Block(words,activation));
+                                            native_q51_block<false>(&up_matrix,r,int(block),words,panel[(E/32)*Capacity+field]);
+                                            uu=numeric::accumulate(uu,currentDownQ51Block(words,activation));
+                                        }
                                     }
                                 }
                                 // Reconverge all64 peers before the original
@@ -1131,25 +1149,43 @@ static_assert(!Packed||(Sense&&Instance),"Packed lifetime protocol requires inst
         lds_sync();
         HTS(12)
         const auto* sq = dq + T * NU * NBK;
+        // The closed Q8-down tuple seals both down matrices at H.
+        // Narrow their address stride without changing either K partition.
+        constexpr bool FixedQ8Down=ClosedRetainedPolicy &&
+            RoutedDownCodebook==19;
         // Route/column owners retain each expert's complete K fold in
         // registers. A small LDS bank exposes only finished weighted routes,
         // permitting independent experts to use different physical waves.
         // One CTA publication edge replaces all intra-dot K shuffles.
+        // Every positive native slice is 32-column aligned. The widest
+        // retained source can fill all routed slots plus the shared bank.
+        // Closed Q8 down is admitted only for H2560 on exactly 60 CTAs,
+        // with one live row and ten selected slots. Every CTA owns up to
+        // one wave of columns, so each of the eleven waves owns one route.
+        constexpr bool OneWavePerRoute = FixedQ8Down;
+        static_assert(!OneWavePerRoute || (E==2560 && NB==60 && T==1 && (E+NB-1)/NB<=64));
+        constexpr int max_q8_blocks=T*(NUMAX*FFRMAX+FF)/32;
+        constexpr int max_output_columns=(E+NB-1)/NB;
+        const unsigned first_column=unsigned(e0);
+        const unsigned columns=unsigned(n);
+        static_assert(sizeof(arena)>=max_q8_blocks*sizeof(CanonicalFFNQ8Block)+
+            T*(NUMAX+1)*max_output_columns*sizeof(float),
+            "Retained native quantized inputs and finished route rows must fit the phase LDS");
         auto* completed = reinterpret_cast<float*>(dq + T * (NU * NBK + unsigned(ffn.ff / 32)));
         const unsigned columns_per_wave = 64;
-        const unsigned tiles = (unsigned(n) + columns_per_wave - 1) / columns_per_wave;
-        const unsigned route_count = unsigned(NU + 1);
+        const unsigned tiles = OneWavePerRoute ? 1u : (columns + columns_per_wave - 1) / columns_per_wave;
+        const unsigned route_count = OneWavePerRoute ? ::llaminar2::rocm::retainedM1SelectedExperts + 1 : unsigned(NU + 1);
         const unsigned wave = unsigned(tid) / columns_per_wave;
         const unsigned lane_column = unsigned(tid) % columns_per_wave;
         const unsigned tasks = unsigned(T) * route_count * tiles;
         for (unsigned task = wave; task < tasks; task += unsigned(NT) / columns_per_wave) {
             const unsigned tile = task % tiles;
             const unsigned row_route = task / tiles;
-            const unsigned token = row_route / route_count;
-            const unsigned route = row_route % route_count;
+            const unsigned token = OneWavePerRoute ? 0u : row_route / route_count;
+            const unsigned route = OneWavePerRoute ? task : row_route % route_count;
             const unsigned local = tile * columns_per_wave + lane_column;
-            if (local < unsigned(n)) {
-                const unsigned column = unsigned(e0) + local;
+            if (local < columns) {
+                const unsigned column = first_column + local;
                 float value;
                 if (route < unsigned(NU)) {
                     using NativeRoute=llaminar2::rocm::fast_native::PublishedNativeRoute;
@@ -1158,7 +1194,8 @@ static_assert(!Packed||(Sense&&Instance),"Packed lifetime protocol requires inst
                         else return NativeRoute::borrow(sel_e[token],native_route_masks[token],route);
                     }();
                     if(selected_job) {
-                        const float down = currentDownRow<7,(!ObserveCanonical&&!PublishRoleTables)?E:0>(native_down + selected_job, column,
+                        const float down = currentDownRow<RoutedDownCodebook,
+                            ((RoutedDownCodebook==7&&!ObserveCanonical&&!PublishRoleTables)||FixedQ8Down)?E:0>(native_down + selected_job, column,
                             unsigned(ffr), dq + (token * unsigned(NU) + route) * unsigned(NBK));
                         value = ::llaminar2::device_native_quantised_contract::weightRoute(
                             sel_w[token][route], down);
@@ -1168,26 +1205,26 @@ static_assert(!Packed||(Sense&&Instance),"Packed lifetime protocol requires inst
                             observation.route_contributions[
                                 (size_t(token) * NU + route) * E + column] = value;
                 } else {
-                    const float down = currentDownRow<19>(ffn.native_sdown, column,
+                    const float down = currentDownRow<19,FixedQ8Down?E:0>(ffn.native_sdown, column,
                         unsigned(ffn.ff), sq + token * unsigned(ffn.ff / 32));
                     value = ::llaminar2::device_native_quantised_contract::accumulate(0.0f,
                         ::llaminar2::device_native_quantised_contract::weightRoute(1.0f, down));
                 }
-                completed[(token * route_count + route) * unsigned(n) + local] = value;
+                completed[(token * route_count + route) * columns + local] = value;
             }
         }
         lds_sync();
-        for (unsigned local = unsigned(tid); local < unsigned(n); local += unsigned(NT)) {
+        for (unsigned local = unsigned(tid); local < columns; local += unsigned(NT)) {
 #pragma unroll
             for (unsigned token = 0; token < unsigned(T); ++token) {
                 float routed = 0.0f;
                 for (unsigned route = 0; route < unsigned(NU); ++route)
                     routed = ::llaminar2::device_native_quantised_contract::accumulate(routed,
-                        completed[(token * route_count + route) * unsigned(n) + local]);
+                        completed[(token * route_count + route) * columns + local]);
                 const float shared = ::llaminar2::device_fp32_contract::multiply(pw[token],
-                    completed[(token * route_count + unsigned(NU)) * unsigned(n) + local]);
+                    completed[(token * route_count + unsigned(NU)) * columns + local]);
                 const float value = ::llaminar2::device_fp32_contract::add(routed, shared);
-                const unsigned column = unsigned(e0) + local;
+                const unsigned column = first_column + local;
                 if constexpr (ObserveCanonical)
                     if (observation.routed_output)
                         observation.routed_output[size_t(token) * E + column] = routed;

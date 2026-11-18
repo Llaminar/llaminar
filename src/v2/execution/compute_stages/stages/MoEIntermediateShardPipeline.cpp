@@ -13,7 +13,7 @@
  */
 #include "kernels/common/NativeLayoutBarrierLayout.h"
 #include "MoEIntermediateShardPipeline.h"
-#include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNDevice.h"
+#include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNWorkspace.h"
 #include "MoERoutingStage.h"
 #include "qwen4exp/Qwen4ExpHyperconnectionBuilder.h"
 #include "kernels/common/FullNativeHCFFNBarrierLayout.h"
@@ -886,7 +886,7 @@ MoEIntermediateShardFFNOutput finalizeMoEIntermediateShardFFN(ComputeGraph &grap
         if(!compute || compute->binding()!=binding || compute->phase()!=Phase::Compute)
             throw std::logic_error("Resident FFN must consume this graph's original routed compute and fold");
         auto resident=std::make_unique<ResidentStage>(binding,s,prepared,shared_gate,
-            finalization.local_combined,finalization.shared_ffn_node);
+            finalization.local_combined,finalization.shared_ffn_node,unsigned(g.row_start));
         // The original shared branch follows the routed fold because they
         // reuse scratch. Keep that sink's public graph identity and preserve
         // every external input; only the explicit final sum consumes its new
@@ -912,8 +912,9 @@ MoEIntermediateShardFFNOutput finalizeMoEIntermediateShardFFN(ComputeGraph &grap
     return {sum_name, finalization.local_combined, p.family, p.live_rows, p.rows, routed.model_columns, p.phase};
 }
 
-/** @copydoc lowerNativeLayoutRouterFFN */
-void lowerNativeLayoutRouterFFN(ComputeGraph& graph,const std::string& resident_node)
+/** @brief Borrow the original router under the caller's closed M1 graph role. */
+static void lowerNativeLayoutRouterFFNForRole(ComputeGraph& graph,const std::string& resident_node,
+    ResidentFFNGraphRole role)
 {
     auto* node=graph.getNode(resident_node);
     const auto* resident=node?dynamic_cast<const ResidentStage*>(node->stage.get()):nullptr;
@@ -922,13 +923,20 @@ void lowerNativeLayoutRouterFFN(ComputeGraph& graph,const std::string& resident_
     const auto* router_node=graph.getNode(router_name);
     const auto* router=router_node?dynamic_cast<const MoERoutingStage*>(router_node->stage.get()):nullptr;
     if(!router)throw std::invalid_argument("Native-layout router FFN requires its original graph router");
-    auto replacement=resident->withNativeRouter(router->declaration());
+    auto replacement=resident->withNativeRouter(router->declaration(),role);
     graph.replaceClosedLocalRegion({router_name,resident_node},resident_node,std::move(replacement));
+}
+
+/** @copydoc lowerNativeLayoutRouterFFN */
+void lowerNativeLayoutRouterFFN(ComputeGraph& graph,const std::string& resident_node)
+{
+    lowerNativeLayoutRouterFFNForRole(graph,resident_node,ResidentFFNGraphRole::LocalRegion);
 }
 
 /** @brief Close a matched original HC/FFN region while preserving declared outside edges. */
 static void lowerFullNativeHCFFNRegion(ComputeGraph& graph,const std::string& resident_node,
-    const std::string& previous_write_node,const std::string& hc_read_node,bool retain_original_injection)
+    const std::string& previous_write_node,const std::string& hc_read_node,bool retain_original_injection,
+    ResidentFFNGraphRole role=ResidentFFNGraphRole::LocalRegion)
 {
     auto* node=graph.getNode(resident_node);
     const auto* resident=node?dynamic_cast<const ResidentStage*>(node->stage.get()):nullptr;
@@ -939,7 +947,7 @@ static void lowerFullNativeHCFFNRegion(ComputeGraph& graph,const std::string& re
     const auto& operation=std::get<Qwen4ExpPrimitiveStage::ResidualRead>(read->getParams().operation);
     auto prefix=Qwen4ExpHyperconnectionBuilder::retainFullNativeReadPhase(graph,region);
     const auto implementation=retain_original_injection?rocm::FullNativeHCFFNImplementation::RetainedGFX906M1:rocm::FullNativeHCFFNImplementation::Canonical;
-    auto replacement=resident->withFullNativePrefix(std::move(prefix),operation.output,implementation);
+    auto replacement=resident->withFullNativePrefix(std::move(prefix),operation.output,implementation,role);
     std::vector<std::string> members{region.previous_write,region.branch_norm,region.down,region.up,region.read,resident_node};
     if(!region.injection.empty())members.push_back(region.injection);
     for(std::size_t i=0;i<members.size();++i)for(std::size_t j=0;j<i;++j)
@@ -968,8 +976,9 @@ void lowerFullNativeHCFFN(ComputeGraph& graph,const std::string& resident_node,
     lowerFullNativeHCFFNRegion(graph,resident_node,previous_write_node,hc_read_node,false);
 }
 
-/** @copydoc lowerRetainedM1HCFFN */
-void lowerRetainedM1HCFFN(ComputeGraph& graph,const std::string& previous_write_node)
+/** @brief Lower one exact retained local region with its original invocation role. */
+static void lowerRetainedM1HCFFNForRole(ComputeGraph& graph,const std::string& previous_write_node,
+    ResidentFFNGraphRole role)
 {
     using HC=Qwen4ExpPrimitiveStage;
     const auto* boundary=graph.getNode(previous_write_node);
@@ -1008,8 +1017,20 @@ void lowerRetainedM1HCFFN(ComputeGraph& graph,const std::string& previous_write_
     }
     if(!sink)throw std::invalid_argument("Retained M1 HC/FFN requires its original resident local FFN sink");
     const auto sink_name=sink->name,read_name=read->name;
-    lowerNativeLayoutRouterFFN(graph,sink_name);
-    lowerFullNativeHCFFNRegion(graph,sink_name,previous_write_node,read_name,true);
+    lowerNativeLayoutRouterFFNForRole(graph,sink_name,role);
+    lowerFullNativeHCFFNRegion(graph,sink_name,previous_write_node,read_name,true,role);
+}
+
+/** @copydoc lowerRetainedM1HCFFN */
+void lowerRetainedM1HCFFN(ComputeGraph& graph,const std::string& previous_write_node)
+{
+    lowerRetainedM1HCFFNForRole(graph,previous_write_node,ResidentFFNGraphRole::LocalRegion);
+}
+
+/** @copydoc lowerRetainedM1HCFFNMainInference */
+void lowerRetainedM1HCFFNMainInference(ComputeGraph& graph,const std::string& previous_write_node)
+{
+    lowerRetainedM1HCFFNForRole(graph,previous_write_node,ResidentFFNGraphRole::MainInference);
 }
 
 }

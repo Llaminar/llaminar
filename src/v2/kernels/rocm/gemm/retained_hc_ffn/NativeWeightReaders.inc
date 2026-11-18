@@ -232,17 +232,20 @@ __device__ __forceinline__ void native_q8_pair(const Descriptor& matrix,int row,
  * @param matrix Exact original native Q5_1 descriptor. @param row Original output row.
  * @param block Original K32 block. @param words Original6-word destination.
  */
-template<class Descriptor>
-__device__ __forceinline__ void native_q51_block(const Descriptor& matrix,int row,int block,int (&words)[6])
+template<bool LoadCoefficients=true,class Descriptor>
+__device__ __forceinline__ void native_q51_block(const Descriptor& matrix,int row,int block,int (&words)[6],
+    unsigned coefficients=0u)
 {
     unsigned columns;
     const uint8_t* payload;
     const unsigned short *scales,*mins;
-    native_descriptor_fields<true>(matrix,columns,payload,scales,mins);
+    native_descriptor_fields<LoadCoefficients>(matrix,columns,payload,scales,mins);
     const size_t linear=size_t(block)*columns+row;
     const int4 q=native_global_weight_read<int4>(payload+linear*20);
-    words[0]=int(unsigned(native_global_weight_read<unsigned short>(scales+linear))|
-        (unsigned(native_global_weight_read<unsigned short>(mins+linear))<<16));
+    if constexpr(LoadCoefficients)
+        coefficients=unsigned(native_global_weight_read<unsigned short>(scales+linear))|
+            (unsigned(native_global_weight_read<unsigned short>(mins+linear))<<16);
+    words[0]=int(coefficients);
     words[1]=native_global_weight_read<int>(payload+linear*20+16);
     words[2]=q.x;words[3]=q.y;words[4]=q.z;words[5]=q.w;
 }

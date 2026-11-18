@@ -105,7 +105,8 @@ namespace llaminar2::test
          * @param shared_type Independent native shared-FFN source format; gates remain FP32.
          * @param routed_types Optional original gate/up/down source formats, preserving each directory encoding.
          * @param dimensions Optional genuine MoE source dimensions; no prepared descriptor is relabeled.
-         * @param shared_up_type Optional independent original shared-up source; absent preserves shared_type.
+         * @param shared_up_type Optional original shared-up encoding.
+         * @param shared_down_type Optional original shared-down encoding. Omitted roles use shared_type.
          */
         explicit PlanningGGUFFixture(bool moe = false, bool mtp = false,
             GGUFTensorType expert_type = GGUFTensorType::F32, uint32_t expert_width = 256,
@@ -114,22 +115,25 @@ namespace llaminar2::test
             GGUFTensorType shared_type = GGUFTensorType::F32,
             std::optional<std::array<GGUFTensorType,3>> routed_types = std::nullopt,
             std::optional<MoEDimensions> dimensions = std::nullopt,
-            std::optional<GGUFTensorType> shared_up_type = std::nullopt)
+            std::optional<GGUFTensorType> shared_up_type = std::nullopt,
+            std::optional<GGUFTensorType> shared_down_type = std::nullopt)
         {
             if (GGUFTensorInfo{.type = expert_type}.getTypeSize() == 0 ||
                 GGUFTensorInfo{.type = shared_type}.getTypeSize() == 0)
                 throw std::invalid_argument("Planning fixture requires a supported GGUF format");
-            if(shared_up_type&&GGUFTensorInfo{.type=*shared_up_type}.getTypeSize()==0)
-                throw std::invalid_argument("Planning fixture requires a supported original shared-up format");
+            for (auto type : {shared_up_type, shared_down_type})
+                if (type && GGUFTensorInfo{.type=*type}.getTypeSize() == 0)
+                    throw std::invalid_argument("Planning fixture requires a valid original shared projection type");
             if(routed_types)for(const auto type:*routed_types)
                 if(GGUFTensorInfo{.type=type}.getTypeSize()==0)
                     throw std::invalid_argument("Planning fixture requires supported original routed formats");
-            char pattern[] = "/tmp/llaminar-planning-XXXXXX.gguf";
-            const int descriptor = ::mkstemps(pattern, 5);
+            // The fixture owner chooses temporary storage through the standard
+            // environment. Large generated expert weights can use a bounded tmpfs.
+            path_ = (std::filesystem::temp_directory_path() / "llaminar-planning-XXXXXX.gguf").string();
+            const int descriptor = ::mkstemps(path_.data(), 5);
             if (descriptor < 0) throw std::runtime_error("Cannot create planning GGUF fixture");
             ::close(descriptor);
-            path_ = pattern;
-            try { write(moe, mtp, expert_type, expert_width, gdn_projection, attention_heads, geometry, main_layers,expert_count,shared_type,routed_types,dimensions,shared_up_type); }
+            try { write(moe, mtp, expert_type, expert_width, gdn_projection, attention_heads, geometry, main_layers,expert_count,shared_type,routed_types,dimensions,shared_up_type,shared_down_type); }
             catch (...) { remove(); throw; }
         }
         /** @brief Remove only this fixture's file, including during exception unwinding. */
@@ -163,7 +167,8 @@ namespace llaminar2::test
         void write(bool moe, bool mtp, GGUFTensorType expert_type, uint32_t expert_width,
             std::optional<GGUFTensorType> gdn_projection, uint32_t attention_heads, Geometry geometry, uint32_t main_layers,uint32_t expert_count,
             GGUFTensorType shared_type, std::optional<std::array<GGUFTensorType,3>> routed_types,
-            std::optional<MoEDimensions> dimensions,std::optional<GGUFTensorType> shared_up_type)
+            std::optional<MoEDimensions> dimensions,std::optional<GGUFTensorType> shared_up_type,
+            std::optional<GGUFTensorType> shared_down_type)
         {
             if(expert_count==0)throw std::invalid_argument("Planning fixture requires positive original expert count");
             const uint32_t hidden_columns=dimensions?dimensions->hidden_columns:256;
@@ -207,7 +212,7 @@ namespace llaminar2::test
                     tensors.push_back({prefix + "ffn_gate_shexp.weight", {hidden_columns, shared_width}, shared_type});
                     tensors.push_back({prefix + "ffn_up_shexp.weight", {hidden_columns, shared_width},
                         shared_up_type.value_or(shared_type)});
-                    tensors.push_back({prefix + "ffn_down_shexp.weight", {shared_width, hidden_columns}, shared_type});
+                    tensors.push_back({prefix + "ffn_down_shexp.weight", {shared_width, hidden_columns}, shared_down_type.value_or(shared_type)});
                     tensors.push_back({prefix + "ffn_gate_inp_shexp.weight", {hidden_columns}});
                 }
                 else

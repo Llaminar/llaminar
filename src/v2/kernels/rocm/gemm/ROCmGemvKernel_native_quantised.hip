@@ -2796,19 +2796,34 @@ __device__ __forceinline__ uint32_t moe_native_group_byte(const uint8_t* payload
     return raw;
 }
 /**
+ * @brief Default immutable device-table lookup authority for canonical IQ decode.
+ * @details Explicit full-entry views may borrow byte-identical phase-local LDS;
+ * all existing owners retain these original module-table reads by default.
+ */
+struct NativeQuantisedGridLookup {
+    /** @brief Read the original four-code IQ3 entry. @tparam FMT Original format. @param index Original decoded index. @return Unchanged packed bytes. */
+    template<NativeQuantisedFormat FMT> __device__ __forceinline__ uint32_t iq3(unsigned index) const {return iq3_grid_lookup<FMT>(index);}
+    /** @brief Read the original eight-code IQ2 entry. @tparam FMT Original format. @param index Original decoded index. @return Unchanged packed bytes. */
+    template<NativeQuantisedFormat FMT> __device__ __forceinline__ uint64_t iq2(unsigned index) const {return iq2_grid_lookup<FMT>(index);}
+    /** @brief Read the original IQ1 entry. @param index Original decoded index. @return Unchanged packed bytes. */
+    __device__ __forceinline__ uint64_t iq1(unsigned index) const {return iq1_grid_lookup(index);}
+};
+/**
  * @brief Decode exactly one original four-code group, without expanding future groups.
  * @tparam FMT Canonical physical codebook from the existing supported inventory.
  * @tparam Ordered Apply NativeLayout's register-only dependency to every raw packed input.
+ * @tparam Grid Explicit immutable lookup view; existing owners use original device tables.
  * @param payload Original canonical block, including original IQ sign/tail bytes.
  * @param group Original output group0..7. @param previous_dot Prior integer result, unchanged by decode.
+ * @param table_view Lookup authority with byte-identical entries, valid for this complete consumer.
  * @return The identical four signed/unsigned int8 codes packed in one integer word.
  * @details The legacy eight-group API delegates here with Ordered=false. Ordered
  * mode delays raw inputs before mapping, rather than serializing already-expanded
  * values. Grid lookups and bit mappings are the original canonical operations.
  */
-template<NativeQuantisedFormat FMT,bool Ordered=false>
+template<NativeQuantisedFormat FMT,bool Ordered=false,class Grid=NativeQuantisedGridLookup>
 __device__ __forceinline__ int32_t moe_decode_native_quantised_group(
-    const uint8_t* __restrict__ payload,unsigned group,int32_t previous_dot=0)
+    const uint8_t* __restrict__ payload,unsigned group,int32_t previous_dot=0,Grid table_view={})
 {
     using Traits=NATIVE_QUANTISEDTraits<FMT>;
     static_assert(NATIVE_QUANTISEDGroupedMoESupported<FMT>::value,
@@ -2877,7 +2892,7 @@ __device__ __forceinline__ int32_t moe_decode_native_quantised_group(
         }
         else sign_byte=static_cast<uint8_t>(signs>>((group/2)*8));
         const uint8_t sign_nibble=group&1?sign_byte>>4:sign_byte&0xF;
-        return static_cast<int32_t>(iq_apply_signs_4(iq3_grid_lookup<FMT>(idx),sign_nibble));
+        return static_cast<int32_t>(iq_apply_signs_4(table_view.template iq3<FMT>(idx),sign_nibble));
     }
     else if constexpr(Traits::is_iq2_grid)
     {
@@ -2894,7 +2909,7 @@ __device__ __forceinline__ int32_t moe_decode_native_quantised_group(
                 static_cast<uint8_t>(moe_native_group_byte<Ordered>(payload,8,previous_dot));
         }
         else sign_byte=static_cast<uint8_t>(signs>>(lookup*8));
-        const uint64_t grid=iq2_grid_lookup<FMT>(idx);
+        const uint64_t grid=table_view.template iq2<FMT>(idx);
         const uint32_t word=group&1?static_cast<uint32_t>(grid>>32):static_cast<uint32_t>(grid);
         const uint8_t sign_nibble=group&1?sign_byte>>4:sign_byte&0xF;
         return static_cast<int32_t>(iq_apply_signs_4(word,sign_nibble));
@@ -2911,7 +2926,7 @@ __device__ __forceinline__ int32_t moe_decode_native_quantised_group(
             high=((h0|(h1<<8))>>(3*lookup))&7;
         }
         else high=(moe_native_group_byte<Ordered>(payload,4+lookup/2,previous_dot)>>((lookup%2)*4))&7;
-        const uint64_t grid=iq1_grid_lookup(qs|(high<<8));
+        const uint64_t grid=table_view.iq1(qs|(high<<8));
         return group&1?static_cast<int32_t>(static_cast<uint32_t>(grid>>32)):
             static_cast<int32_t>(static_cast<uint32_t>(grid));
     }
@@ -10259,3 +10274,18 @@ void launchCTAOwnedHCRead(const CTAOwnedHCReadProgram& program,const PersistentH
 #include "ROCmNativeLayoutRouterFFNLaunch.hip.inc"
 #include "ROCmFullNativeHCFFNBody.hip.inc"
 #include "ROCmFullNativeHCFFNLaunch.hip.inc"
+
+#if !defined(__HIP_DEVICE_COMPILE__)
+#include "ROCmRoutedGridDonation.h"
+
+namespace llaminar2::rocm {
+/** @copydoc inspectRoutedGridDonation */
+RoutedGridDonation inspectRoutedGridDonation(std::uint32_t routed_formats, unsigned prefix_bytes,
+    std::size_t hidden_bytes, std::size_t panel_and_records_bytes) noexcept {
+    const auto after_hidden = prefix_bytes > hidden_bytes ? unsigned(prefix_bytes - hidden_bytes) : 0u;
+    const auto available = after_hidden > panel_and_records_bytes ? after_hidden - panel_and_records_bytes : 0;
+    const auto layout = routedGridLayout(routed_formats, available);
+    return {layout.iq2_entries, layout.iq3_small_entries, layout.iq3_extra_small_entries};
+}
+}
+#endif
