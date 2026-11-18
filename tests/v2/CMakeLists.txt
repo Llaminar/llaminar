@@ -25999,6 +25999,12 @@ if(HAVE_CUDA OR HAVE_ROCM)
             MPI_PROCS 1
             NO_MODELS
             TIMEOUT 60)
+        add_v2_test(V2_Integration_MoEGroupedRegisterTopKReplay_ROCm
+            COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+                --gtest_filter=MoERouterLogits.ROCmGroupedRegisterTopKCapturedByteReplay
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;MTP;GraphCapture;ByteExact;Replay;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120
+            ENVIRONMENT "LLAMINAR_QFN_ROCM_GROUPED_TOPK_REGISTERS=1")
         add_v2_test(V2_Integration_ROCmMoERuntimeGroupResources
             COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
                 --gtest_filter=ROCmMoEKernelResources.*
@@ -29929,6 +29935,7 @@ if(HAVE_ROCM)
     V2_Integration_MoEProjectionPhases_ROCm
     V2_Integration_MoERouterHiddenQ8_ROCm
     V2_Integration_MoERouterLogits_ROCm
+    V2_Integration_MoEGroupedRegisterTopKReplay_ROCm
     V2_Integration_MoERouterOwnedExchange_ROCm2
     V2_Integration_MoERouterOwnedExchange_ROCm4
     V2_Integration_MoERouterOwnedRows_ROCm

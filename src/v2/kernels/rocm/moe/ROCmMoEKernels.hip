@@ -50,7 +50,9 @@
 #include <cstdio>
 #include <cfloat>
 #include <string>
+#include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
 
 #include "execution/moe/DeviceMoELLEPPlannerScratch.h"
 #include "execution/moe/DeviceMoERebalanceABI.h"
@@ -15393,6 +15395,70 @@ __global__ void rocm_moe_fp16_projection_route_descriptors_kernel(
 }
 
 /**
+ * @brief Select stable expert probabilities while retaining each original probability in a register.
+ * @details A lane owns at most eight experts. Each round elects exactly one
+ * value/ID pair. The winning entry becomes negative infinity, just as in the
+ * original LDS tournament. This detail matters when all remaining logits are NaN.
+ */
+__device__ __forceinline__ void moe_grouped_topk_cached(
+    const float* __restrict__ probs, int count, int top, int* __restrict__ ids,
+    float* __restrict__ weights)
+{
+    constexpr int width = 64;
+    if (threadIdx.x >= width) return;
+    const int lane = threadIdx.x;
+    float values[8];
+    #pragma unroll
+    for (int i = 0; i < 8; ++i) {
+        const int expert = i * width + lane;
+        values[i] = expert < count ? probs[expert] : -INFINITY;
+    }
+    int cached_id = kDeviceMoEMaxExperts;
+    float cached_value = -INFINITY;
+    for (int slot = 0; slot < top; ++slot) {
+        {
+            cached_value = -INFINITY;
+            cached_id = kDeviceMoEMaxExperts;
+            #pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                const int expert = i * width + lane;
+                const float value = values[i];
+                // Recompute in ascending ID order; exact ties retain the first real expert.
+                const bool take = (expert < count) &
+                    moe_topk_pair_better(value, expert, cached_value, cached_id);
+                cached_value = take ? value : cached_value;
+                cached_id = take ? expert : cached_id;
+            }
+        }
+        float best = cached_value;
+        int id = cached_id;
+        int winner;
+        {
+            const float largest = __shfl(rocm_moe_wave_reduce_max_f32(cached_value),0);
+            const unsigned long long mask = __ballot(cached_value == largest);
+            const int first = __ffsll(static_cast<long long>(mask)) - 1;
+            if ((mask & (mask-1)) == 0) {
+                winner = __shfl(cached_id,first);
+                best = __shfl(cached_value,first);
+            } else {
+                int smallest = cached_value == largest ? cached_id : kDeviceMoEMaxExperts;
+                #pragma unroll
+                for (int offset=32;offset;offset/=2)
+                    smallest = min(smallest,__shfl_down(smallest,offset));
+                winner = __shfl(smallest,0);
+                best = winner < count ? __shfl(cached_value,winner & 63) : -INFINITY;
+            }
+            id = winner;
+        }
+        if (lane == 0) { ids[slot] = id; weights[slot] = best; }
+        #pragma unroll
+        for (int i = 0; i < 8; ++i) {
+            if (winner == i * width + lane) values[i] = -INFINITY;
+        }
+    }
+}
+
+/**
  * @brief Decode-equivalent softmax/top-k for grouped prefill rows.
  *
  * The MTP verifier is allowed to publish grouped rows into live decode state, so
@@ -15402,8 +15468,8 @@ __global__ void rocm_moe_fp16_projection_route_descriptors_kernel(
  * rocm_moe_softmax_topk_decode_runtime_wave64_kernel's probability reduction,
  * top-k selection, and top-k renormalization order inside each block.
  */
-template<bool Partitioned = false>
-__global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
+template<bool Partitioned, bool RegisterSelector>
+__device__ __forceinline__ void grouped_softmax_rows_body(
     float *__restrict__ logits,                       // [seq_len, num_experts] IN logits, OUT probabilities
     float *__restrict__ expert_indices,               // [seq_len, top_k] OUT
     float *__restrict__ expert_weights,               // [seq_len, top_k] OUT
@@ -15540,7 +15606,10 @@ __global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
 
     __shared__ int selected_ids[kDeviceMoEMaxTopK];
     __shared__ float selected_weights[kDeviceMoEMaxTopK];
-    moe_select_topk_probabilities_block(expert_probs, num_experts, top_k, selected_ids, selected_weights);
+    if constexpr (RegisterSelector)
+        moe_grouped_topk_cached(expert_probs, num_experts, top_k, selected_ids, selected_weights);
+    else
+        moe_select_topk_probabilities_block(expert_probs, num_experts, top_k, selected_ids, selected_weights);
 
     if (threadIdx.x == 0)
     {
@@ -15587,6 +15656,48 @@ __global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
             }
         }
     }
+}
+
+/** @brief Original grouped and partitioned softmax/top-k launch entry. */
+template<bool Partitioned = false>
+__global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
+    float *__restrict__ logits,                       // [seq_len, num_experts] IN logits, OUT probabilities
+    float *__restrict__ expert_indices,               // [seq_len, top_k] OUT
+    float *__restrict__ expert_weights,               // [seq_len, top_k] OUT
+    int seq_len, int num_experts, int top_k,
+    bool normalize_weights,
+    const int *__restrict__ device_effective_seq_len,
+    DeviceMoELayerRuntimeView *__restrict__ deferred_selected_route_ledger,
+    llaminar2::DeviceRowPartition partition = {},
+    llaminar2::MoERouterSelectedRoute *selected_packet = nullptr,
+    std::uint64_t *selected_bytes = nullptr)
+{
+    grouped_softmax_rows_body<Partitioned, false>(logits, expert_indices, expert_weights, seq_len,
+        num_experts, top_k, normalize_weights, device_effective_seq_len,
+        deferred_selected_route_ledger, partition, selected_packet, selected_bytes);
+}
+
+/** @brief Qualified gfx906 register selector; all other arithmetic uses the common body. */
+__global__ void qfn_grouped_softmax_register_selector_kernel(
+    float *__restrict__ logits,                       // [seq_len, num_experts] IN logits, OUT probabilities
+    float *__restrict__ expert_indices,               // [seq_len, top_k] OUT
+    float *__restrict__ expert_weights,               // [seq_len, top_k] OUT
+    int seq_len, int num_experts, int top_k,
+    bool normalize_weights,
+    const int *__restrict__ device_effective_seq_len,
+    DeviceMoELayerRuntimeView *__restrict__ deferred_selected_route_ledger,
+    llaminar2::DeviceRowPartition partition = {},
+    llaminar2::MoERouterSelectedRoute *selected_packet = nullptr,
+    std::uint64_t *selected_bytes = nullptr)
+{
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx906__)
+    grouped_softmax_rows_body<false, true>(logits, expert_indices, expert_weights, seq_len, num_experts,
+        top_k, normalize_weights, device_effective_seq_len, deferred_selected_route_ledger,
+        partition, selected_packet, selected_bytes);
+#else
+    // An incompatible code object can never be selected by the host.
+    __builtin_trap();
+#endif
 }
 
 __global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
@@ -17551,13 +17662,37 @@ bool hipMoE_softmax_topk_decode_equivalent_rows(
     }
 
     const int threads = 256;
-    hipLaunchKernelGGL(rocm_moe_softmax_topk_decode_equivalent_rows_kernel,
-        dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
-        logits, expert_indices, expert_weights,
-        seq_len, num_experts, top_k, normalize_weights,
-        device_effective_seq_len,
-        static_cast<DeviceMoELayerRuntimeView *>(
-            deferred_selected_route_ledger));
+    // This selection depends only on immutable graph geometry and discovery;
+    // the live count remains a device-owned input in the shared body.
+    bool use_register_selector = false;
+    if (device_effective_seq_len && seq_len >= 2 && seq_len <= 8 &&
+        num_experts == kDeviceMoEMaxExperts && top_k == 10 &&
+        llaminar2::qfnGroupedTopKRegisterOptIn())
+    {
+        const auto &hardware = llaminar2::rocmHardwareMetadata().at(device_idx);
+        use_register_selector = hardware.compute_units == 60 && hardware.native_wave_width == 64 &&
+            (hardware.isa_target == "gfx906" || hardware.isa_target.starts_with("gfx906:"));
+    }
+    if (use_register_selector)
+    {
+        hipLaunchKernelGGL(qfn_grouped_softmax_register_selector_kernel,
+            dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
+            logits, expert_indices, expert_weights,
+            seq_len, num_experts, top_k, normalize_weights,
+            device_effective_seq_len,
+            static_cast<DeviceMoELayerRuntimeView *>(
+                deferred_selected_route_ledger));
+    }
+    else
+    {
+        hipLaunchKernelGGL(rocm_moe_softmax_topk_decode_equivalent_rows_kernel,
+            dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
+            logits, expert_indices, expert_weights,
+            seq_len, num_experts, top_k, normalize_weights,
+            device_effective_seq_len,
+            static_cast<DeviceMoELayerRuntimeView *>(
+                deferred_selected_route_ledger));
+    }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -17566,6 +17701,9 @@ bool hipMoE_softmax_topk_decode_equivalent_rows(
                 hipGetErrorString(err));
         return false;
     }
+    if (use_register_selector)
+        llaminar2::PerfStatsCollector::addCounter("rocm_moe", "grouped_register_topk_calls", 1.0,
+            "verifier", "ROCm:" + std::to_string(device_idx), {{"physical_rows", std::to_string(seq_len)}});
     return true;
 }
 

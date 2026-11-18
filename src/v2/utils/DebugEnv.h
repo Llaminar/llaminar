@@ -112,6 +112,22 @@ namespace llaminar2
     }
 
     /**
+     * @brief Select register-resident Top-K for the qualified counted QFN verifier on MI50.
+     * @return True when explicitly requested before native capture.
+     * @throws std::invalid_argument If the supplied selector is neither zero nor one.
+     */
+    inline bool qfnGroupedTopKRegisterOptIn()
+    {
+        static const bool enabled = [] {
+            const char* value = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_TOPK_REGISTERS");
+            if (!value || std::strcmp(value, "0") == 0) return false;
+            if (std::strcmp(value, "1") == 0) return true;
+            throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_TOPK_REGISTERS accepts 0 or 1");
+        }();
+        return enabled;
+    }
+
+    /**
      * @brief Tracks whether selected environment variables were present at the last reload.
      *
      * Some call sites need to distinguish a parsed default from an explicit user override.

@@ -214,3 +214,5 @@ namespace llaminar2::test
             proveRouterLogits({.rows = 512, .width = width, .experts = 256});
     }
 } // namespace llaminar2::test
+
+#include "MoEGroupedRegisterTopKReplay.inc"
