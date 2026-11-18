@@ -148,6 +148,7 @@ struct OriginalFFNFixtureGeometry {
     OriginalFFNRouterSource router_source=OriginalFFNRouterSource::TieControl; ///< Original raw source bytes, not a routing override.
     OriginalFFNGeometryContract contract=OriginalFFNGeometryContract::SourceDerived; ///< Assert an exact admitted source geometry.
     bool deferred_frontier_history=false; ///< Exercise the original accepted-prefix commit with the two-node publication.
+    std::size_t frontier_sum_test_extent=0; ///< One deliberately undersized original input lease.
     std::size_t frontier_directory_test_extent=0; ///< Nonzero installs one intentionally invalid cold quote.
 };
 constexpr std::array kRoutedRoles{WeightRole::MoEExpertGate, WeightRole::MoEExpertUp, WeightRole::MoEExpertDown};
@@ -581,7 +582,7 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
 {
     const int kH=shape.hidden,kExperts=shape.experts,kTopK=shape.top_k;
     auto lane = std::make_unique<Lane>(); lane->rows = rows; lane->output_observation=observation;
-    lane->expected_cold_rejection=alias_probe!=NativeRouterAliasProbe::None || shape.frontier_directory_test_extent!=0;
+    lane->expected_cold_rejection=alias_probe!=NativeRouterAliasProbe::None || (shape.frontier_directory_test_extent!=0 || shape.frontier_sum_test_extent!=0);
     lane->worker = &worker; lane->stream = stream; lane->tp = &tp;
     const auto fp = [&](std::vector<std::size_t> shape) {
         auto value = TestTensorFactory::createFP32(shape);
@@ -874,12 +875,13 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
             }
             requirements.merge(consumer->getWorkspaceRequirements(rows));
         }
-    if(shape.frontier_directory_test_extent!=0) {
-        const auto role=MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY;
+    if(shape.frontier_directory_test_extent!=0 || shape.frontier_sum_test_extent!=0) {
+        const auto role=shape.frontier_sum_test_extent ? MoEWorkspaceBuffers::PREFILL_A_INT8 :
+            MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY;
         auto descriptor=std::find_if(requirements.buffers.begin(),requirements.buffers.end(),
             [role](const auto& buffer){return buffer.name==role;});
         require(descriptor!=requirements.buffers.end(),"frontier negative replay requires the existing workspace role");
-        descriptor->size_bytes=shape.frontier_directory_test_extent;
+        descriptor->size_bytes=shape.frontier_sum_test_extent ? shape.frontier_sum_test_extent : shape.frontier_directory_test_extent;
     }
     if(hidden_q8!=OriginalM1HiddenQ8FixturePolicy::CountedOriginal) {
         require(memory&&hidden_q8_workspace,"original M1 lanes require their admitted exact workspace quote");
@@ -1023,7 +1025,7 @@ void captureLane(Lane &lane, bool grouped, DeviceId device, int member, IWorkerG
 void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::barrier<> &rendezvous,
     MoEOverlayParticipantResidencyRegistry &banks, int original_member,
     const FrozenModelWeightSet &shared, const TensorParallelConfig &shared_partition, PreparedWeightStore &store,
-    OriginalFFNFixtureGeometry shape,std::span<const int> capacities,bool require_frontier=false)
+    OriginalFFNFixtureGeometry shape,std::span<const int> capacities,bool require_frontier=false,bool affine_sum_tuple=false)
 {
     const int hidden=shape.hidden;
     auto &worker = GPUDeviceContextPool::instance().getContext(device);
@@ -1034,13 +1036,14 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
         auto *stream = worker.getOrCreateAuxiliaryStream("original_intermediate_ffn_finalizer");
         auto context = IDeviceContext::create(device, 1);
         auto *backend = getBackendFor(device);
-        const auto build = [&](int rows, bool grouped, std::size_t directory_test_extent=0) {
+        const auto build = [&](int rows, bool grouped, std::size_t directory_test_extent=0, std::size_t sum_test_extent=0) {
             auto frame = banks.initialJointLayer(original_member, 0);
             require(frame != nullptr, "original joint layer");
             auto setup = frame->acquireInitialConstruction();
             require(bool(setup), "original setup-only source reader");
             auto lane_shape=shape;
             lane_shape.frontier_directory_test_extent=directory_test_extent;
+            lane_shape.frontier_sum_test_extent=sum_test_extent;
             auto lane = makeLane(rows, grouped, device, member, tp, worker, *context, stream,
                 setup->layerForModelLayer(0), shared, shared_partition, store,
                 MoEIntermediateShardFFNExecution::Staged,MoEGateUpPublicationPolicy::Staged,
@@ -1068,6 +1071,19 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                 }
                 require(rejected,"one-byte-under acquired-bank scratch must fail before native recording");
             }
+            const bool sums=affine_sum_tuple && require_frontier && rows==4 && shape.routed==160 &&
+                qfnGroupedFFNEqualFrontierOptIn() && qfnGroupedFFNDirectBankExperiment() &&
+                rocm::grouped_ffn::exactK32SumsOptIn();
+            if(sums && shape.deferred_frontier_history) {
+                bool rejected=false;
+                try {
+                    (void)build(rows,true,0,rocm::grouped_ffn::k32SumWorkspaceBytes-1);
+                } catch(const std::logic_error& failure) {
+                    rejected=std::string_view(failure.what()).find("Grouped FFN frontier scratch is undersized")!=std::string_view::npos;
+                }
+                require(rejected,"one-byte-under affine sums must fail before native recording");
+                std::cout << "EQUAL_WIDTH_K32_SUM_COLD_UNDERSIZED_REJECTED\n";
+            }
             auto candidate = build(rows, true);
             if(require_frontier) {
                 std::vector<GPUGraphKernelNodeInfo> captured;
@@ -1079,6 +1095,8 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                     });
                 };
                 const auto expected=rows==4?1:0;
+                require(countSymbol("rocm_moe_router_hidden_quantize_q8_rows_and_sums_kernel")==int(sums),
+                    "Exact K32 sum router producer does not match cold graph demand");
                 require(countSymbol("groupedFFNPairedGatePublish")==expected &&
                     countSymbol("groupedFFNTokenDown")==expected &&
                     (!expected || (countSymbol("group_small_runtime_kernel")==
@@ -1670,7 +1688,10 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                         const std::span<const int> capacities=(frontier||qualification==OriginalSourceQualification::GroupedQ8DownReplay)?
                             std::span<const int>{q8_down_counts}:std::span<const int>{default_counts};
                         replayParticipant(devices[member],member,*tp,rendezvous,banks,original_members[member],
-                            shared[member],*manager.tensorParallelConfig(),*store,shape,capacities,frontier);
+                            shared[member],*manager.tensorParallelConfig(),*store,shape,capacities,frontier,
+                            format.down_quantized &&
+                            ((format.type==TensorType::Q4_K && format.down_quantized->tensor_type==TensorType::Q5_1) ||
+                             (format.type==TensorType::Q5_K && format.down_quantized->tensor_type==TensorType::Q8_0)));
                     }
                 }
                 catch (...)

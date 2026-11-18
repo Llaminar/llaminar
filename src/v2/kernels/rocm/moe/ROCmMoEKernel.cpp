@@ -3240,7 +3240,7 @@ namespace llaminar2
            hidden!=publication->requiredOriginalM1Source()||identity!=DeviceRowRange::fullyActive(1).captureIdentity()||!workspace_)
             throw std::invalid_argument("Original M1 hidden Q8 requires its cold declared fully-active source");
         const auto stream=getStream();const int width=publication->requiredOriginalM1Width();
-        if(router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumer) {
+        if(router_q8_publication_access_!=MoERouterQ8PublicationAccess::RequiredConsumer) {
             if(!publication->original_m1_binding)
                 publication->original_m1_binding=std::make_shared<OriginalM1HiddenQ8Binding>(
                     DeviceId::rocm(device_ordinal_),*hidden,width,stream,*workspace_,OriginalM1HiddenQ8Bank::RouterROCm);
@@ -3266,7 +3266,7 @@ namespace llaminar2
             const auto stream=ExplicitGPUStream(gpu_stream_).get();
             if(original_m1_hidden_q8_read_lifecycle_==OriginalM1HiddenQ8ReadLifecycle::Invalidated)
                 throw std::logic_error("Original M1 hidden Q8 reader lost its prepared scratch lifetime");
-            if(router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumer)
+            if(router_q8_publication_access_!=MoERouterQ8PublicationAccess::RequiredConsumer)
                 publication.original_m1_binding->validate(*publication.requiredOriginalM1Source(),stream,workspace_);
             else if(original_m1_hidden_q8_read_)
                 original_m1_hidden_q8_read_->validate(*publication.requiredOriginalM1Source(),stream,workspace_);
@@ -3282,7 +3282,7 @@ namespace llaminar2
         if (!router_q8_hidden_publication_ ||
             !router_q8_hidden_publication_->hasRequiredConsumer())
             return true;
-        if (router_q8_publication_access_ != MoERouterQ8PublicationAccess::ProducerAndConsumer ||
+        if (router_q8_publication_access_ == MoERouterQ8PublicationAccess::RequiredConsumer ||
             !router_q8_hidden_publication_->acceptsProducerRows(rows, width))
         {
             LOG_ERROR("[ROCmMoEKernel] required Q8 producer geometry/access mismatch");
@@ -3297,8 +3297,18 @@ namespace llaminar2
         if (!router_q8_hidden_publication_ ||
             !router_q8_hidden_publication_->hasRequiredConsumer())
             return true;
-        if (!prepareRequiredRouterQ8Hidden(rows, width, top_k) ||
-            !hipMoE_publish_original_hidden_q8_rows(source, d_router_q8_hidden_,
+        if (!prepareRequiredRouterQ8Hidden(rows, width, top_k)) return false;
+        const bool affine=router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumerWithExactK32Sums;
+        if (affine) {
+            namespace frontier=llaminar2::rocm::grouped_ffn;
+            auto* raw=workspace_?workspace_->getBuffer(MoEWorkspaceBuffers::PREFILL_A_INT8):nullptr;
+            if(!raw || rows!=frontier::capacity || width!=frontier::hidden || top_k!=frontier::topK || !live_rows ||
+               workspace_->getBufferSize(MoEWorkspaceBuffers::PREFILL_A_INT8)<frontier::k32SumWorkspaceBytes)
+                throw std::logic_error("Exact K32 sum router lost its admitted counted workspace");
+            if(!hipMoE_publish_original_hidden_q8_with_k32_sums(source,d_router_q8_hidden_,
+                d_router_q8_hidden_scales_,frontier::exactK32Sums(raw)->hiddenRows,device_ordinal_,getStream(),live_rows))
+                return false;
+        } else if(!hipMoE_publish_original_hidden_q8_rows(source, d_router_q8_hidden_,
                 d_router_q8_hidden_scales_, rows, width, device_ordinal_, getStream(), live_rows))
             return false;
         publishRouterQ8Hidden(source, rows,
@@ -3311,8 +3321,8 @@ namespace llaminar2
 
     void ROCmMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
     {
-        if (router_q8_publication_access_ ==
-                MoERouterQ8PublicationAccess::ProducerAndConsumer &&
+        if (router_q8_publication_access_ !=
+                MoERouterQ8PublicationAccess::RequiredConsumer &&
             router_q8_hidden_publication_)
         {
             router_q8_hidden_publication_->clearPayload();
@@ -3345,6 +3355,13 @@ namespace llaminar2
         if(router_q8_hidden_publication_&&router_q8_hidden_publication_->original_m1_binding&&
            (publication!=router_q8_hidden_publication_||access!=router_q8_publication_access_))
             throw std::logic_error("Captured original M1 hidden Q8 publication/access cannot be rebound");
+        // The original routing stage reaffirms producer access on the same
+        // shared owner. It cannot erase an exact graph-local demand.
+        if(router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumerWithExactK32Sums) {
+            if(router_q8_hidden_publication_!=publication || access==MoERouterQ8PublicationAccess::RequiredConsumer)
+                throw std::logic_error("Exact K32 sum publication cannot rebind its router owner");
+            return true;
+        }
         router_q8_hidden_publication_ = std::move(publication);
         router_q8_publication_access_ = access;
         return true;
@@ -3356,8 +3373,8 @@ namespace llaminar2
         bool recorded_during_capture,
         RouterQ8Basis router_basis) noexcept
     {
-        if (router_q8_publication_access_ !=
-                MoERouterQ8PublicationAccess::ProducerAndConsumer ||
+        if (router_q8_publication_access_ ==
+                MoERouterQ8PublicationAccess::RequiredConsumer ||
             !router_q8_hidden_publication_)
         {
             LOG_ERROR("[ROCmMoEKernel::publishRouterQ8Hidden] consumer-only kernel attempted publication");
@@ -8409,7 +8426,7 @@ namespace llaminar2
         if(reuse_required_hidden) {
             const auto& publication=*router_q8_hidden_publication_;
             if(floating)throw std::logic_error("Required M1 hidden Q8 reader has incompatible floating projection arithmetic");
-            if(router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumer) {
+            if(router_q8_publication_access_!=MoERouterQ8PublicationAccess::RequiredConsumer) {
                 if(!canReuseRouterQ8Hidden(d_hidden,1,d_model))throw std::logic_error("Required M1 routed hidden Q8 reader is absent");
                 original_hidden_codes=publication.original_m1_binding->codes();
                 original_hidden_scales=publication.original_m1_binding->scales();
@@ -12604,6 +12621,14 @@ namespace llaminar2
                 direct={device_runtime_layer,static_cast<const float*>(router.indices->gpu_data_ptr()),
                     static_cast<const float*>(router.weights->gpu_data_ptr()),router.demand,
                     reinterpret_cast<std::uint64_t*>(d_prefill_work_directory_)};
+                if(router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumerWithExactK32Sums) {
+                    const auto* raw=workspace_->getBuffer(MoEWorkspaceBuffers::PREFILL_A_INT8);
+                    if(frontier->routedGeometry!=program::RoutedGeometry::F160 ||
+                       !program::supportsExactK32Sums(frontier->routedDecoder) || raw!=d_prefill_A_int8_ ||
+                       workspace_->getBufferSize(MoEWorkspaceBuffers::PREFILL_A_INT8)<program::k32SumWorkspaceBytes)
+                        throw std::logic_error("Exact K32 sum consumer lost the original router workspace");
+                    direct.affineSums=program::exactK32Sums(d_prefill_A_int8_);
+                }
             }
             if(!program::launch(plan,frontier->sharedWeights,publication,device_ordinal_,stream,direct,frontier->routedGeometry,frontier->routedDecoder))return false;
             markDeviceWritten(publication_output,device,stream);

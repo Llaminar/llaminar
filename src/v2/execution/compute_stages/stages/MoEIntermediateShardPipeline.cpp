@@ -15,6 +15,7 @@
 #include "MoEIntermediateShardPipeline.h"
 #include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNWorkspace.h"
 #include "MoERoutingStage.h"
+#include "kernels/KernelFactory.h"
 #include "qwen4exp/Qwen4ExpHyperconnectionBuilder.h"
 #include "kernels/common/FullNativeHCFFNBarrierLayout.h"
 #include "kernels/common/FullNativeHCFFNOutputDemand.h"
@@ -943,6 +944,20 @@ MoEIntermediateShardFFNOutput finalizeMoEIntermediateShardFFN(ComputeGraph &grap
         const auto* compute=node?dynamic_cast<const Stage*>(node->stage.get()):nullptr;
         if(!compute || compute->binding()!=binding || compute->phase()!=Phase::Compute)
             throw std::logic_error("Grouped FFN frontier lost the original local compute producer");
+        if(groupedFFNFrontierUsesExactK32Sums(*binding,{prepared.gate,prepared.up,prepared.down})) {
+            const auto* routerNode=graph.getNode(p.router_node);
+            const auto* router=routerNode?dynamic_cast<const MoERoutingStage*>(routerNode->stage.get()):nullptr;
+            auto& owner=*p.kernel_owner;
+            if(!router || router->declaration().routed_pipeline_kernel_owner!=p.kernel_owner ||
+               router->declaration().input!=p.hidden.tensor ||
+               router->declaration().active_row_count_device!=p.live_rows->countOwner() ||
+               !router->declaration().gate_weights || router->declaration().gate_weights->native_type()!=TensorType::FP16)
+                throw std::logic_error("Exact K32 sums need the original shared counted FP16 router owner");
+            if(!owner.kernel)owner.kernel=llaminar::v2::kernels::KernelFactory::createMoEKernel(binding->device());
+            if(!owner.kernel || !owner.kernel->bindRouterQ8HiddenPublication(owner.router_q8_publication,
+                    MoERouterQ8PublicationAccess::ProducerAndConsumerWithExactK32Sums))
+                throw std::logic_error("Exact K32 sum publication failed cold binding");
+        }
         auto frontier=std::make_unique<GroupedFFNFrontierStage>(binding,s,prepared,shared_gate,
             finalization.local_combined,finalization.shared_ffn_node);
         graph.replaceClosedLocalRegion({compute_name,routed.producer,finalization.shared_ffn_node},

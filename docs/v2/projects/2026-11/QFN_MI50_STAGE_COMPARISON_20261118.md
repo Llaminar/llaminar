@@ -399,6 +399,70 @@ single authoritative expert bank when weights migrate.
 [Matched routed-phase census](/tmp/qfn-castagna-family-sprints-r61/G08/experiments/12-retained-body-grouped/e15-matched-gu/RESULT.md) ·
 [Native 160-column timings and traffic counters](/tmp/qfn-mi50-f160-roofline-c2-sol62/REPORT.md)
 
+## Counted verifier format qualification
+
+The code2048 fixed-three trace of the equal-width Release above completed
+73 verifier rounds with 183 accepted tokens and reproduced all 256 generated
+IDs from both of its own ordinary and fixed-depth controls. Per GPU the
+complete target occupied 22.94 ms per four-row round. The earlier layout
+took 26.39 ms. The fork occupied 18.22 ms across its 81 rounds. The
+equal-width draft occupied 1.026 ms per proposed token versus 1.208 ms
+for the fork. The original source inventory and native launch geometry
+confirmed 43 Q4_K/Q5_1, four Q4_K/Q8_0 and one Q5_K/Q8_0 leaf pair per
+participant per round.
+[Native target/draft timing](/tmp/qfn-mi50-current-stage-pair/qualified-f160-code-candidate.json)
+[Per-layer native census](/tmp/qfn-mi50-f160-fixed3-profile/boot3-r3-candidate-census.json)
+
+The exact K32 reuse experiment used original-source four-row F160/S160
+fixtures on MI50 PCI c2. Each row below is a median in microseconds.
+Its two control windows bracket the treatment in the same Release.
+Each replay compared the live results with serial M1, including deferred
+routing and replacement of the expert bank. This candidate does not alter
+quantized weights, scales or floating-point partial order.
+
+| Original routed gate/up and down | Control 1 | Selected path | Control 2 |
+| --- | ---: | ---: | ---: |
+| Q4_K and Q5_1 | 150.230 | 135.361 | 150.294 |
+| Q5_K and Q8_0 | 150.139 | 145.894 | 150.081 |
+| Q4_K and Q8_0, ordinary sum path | 135.024 | 135.119 | 134.821 |
+
+The third case uses the original producer. Its separate wave-register
+candidate rose from 136.36 to 138.76 µs. The immutable experiment core
+was `6f9f21a8a59ef5eddb2110b37b2cb9265ea090f862b61b0fab90ff028882b1d4`.
+The full-model and benchmark-only source combinations are distinct scopes.
+[Native fixture qualification](/tmp/qfn-mi50-f160-affine-sums-sol62/frozen-release-narrow-c2/qualification.json)
+
+The four-MI50 full-model A/B changed only
+`LLAMINAR_QFN_ROCM_GROUPED_FFN_AFFINE_SUMS` in the same Release. Each
+cell contains the median decode throughput after prefill across three
+256-token generations, in tokens/s. All six arms retired cleanly. Both
+policies produced the same tokens on both prompts and matched the verifier
+work counters at each MTP setting.
+
+| MTP | Review, 512 tokens, off → on | Code, 2,048 tokens, off → on |
+| --- | ---: | ---: |
+| Off | 87.824 → 87.810 | 82.399 → 82.440 |
+| Fixed depth 3 | 133.935 → 137.055 | 131.859 → 135.338 |
+| Dynamic | 121.091 → 121.158 | 134.684 → 134.592 |
+
+The fixed-depth improvement measures 2.35% and 2.65% on paired trials.
+Dynamic MTP changed by less than 0.1% on both prompts. The standalone
+branch regression exercised all three source combinations, both static
+and deferred routing, and the expert bank epoch change in 108.11 s.
+[Matched full-model results](/tmp/qfn-mi50-k32-affine-model-gate/affine-k32-c2-r1-summary.json)
+[Registered replay result](/tmp/qfn-mi50-verifier-roofline/k32-branch-replay.json)
+
+On the dominant Q4_K/Q5_1 layer the gate and down leaves measured 56.48
+and 38.40 µs. Separate counter runs on the same card measured 19,938.0
+and 11,876.625 KiB of physical fetches. A four-bank packet read using
+the same geometry sustained 611.78 and 514.79 GB/s. Applying those rates
+to the measured fetches gives 33.37 and 23.62 µs, or 59.1% and 61.5% of
+the read-only probe's bandwidth. The full operations also perform format
+decode, ordered arithmetic and publication. A 256 MiB linear stream
+sustained 873.24 GB/s on this card. Cache-resident throughput and physical
+fetch throughput use different byte counts.
+[Physical counter calibration](/tmp/qfn-mi50-generic-m4-route-groups-c2/roofline-counters/counter-roofline-c2.json)
+
 ## Reproduction
 
 The local evidence root for native phase attribution is

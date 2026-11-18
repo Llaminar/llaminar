@@ -26,6 +26,16 @@ extern "C"
     bool cudaMoE_publish_original_hidden_q8_rows(const float *hidden, std::int8_t *codes,
         float *scales, int rows, int width, int device, void *stream,
         const int *live_rows);
+    /** @brief Quantize at most four live H2560 rows and publish an exact integer sum per K32.
+     * @param hidden Original FP32 activations. @param codes Existing canonical Q8 output.
+     * @param scales Existing FP32 scales. @param sums Admitted int16 workspace for 80 sums per row.
+     * @param device Exact owning ordinal. @param stream Explicit producer stream.
+     * @param live_rows Device-owned count. Inactive rows remain untouched.
+     * @return Whether the native counted publication was successfully enqueued.
+     */
+    bool hipMoE_publish_original_hidden_q8_with_k32_sums(const float* hidden,std::int8_t* codes,
+        float* scales,std::int16_t* sums,int device,void* stream,const int* live_rows);
+
     /** @copydoc cudaMoE_publish_original_hidden_q8_rows */
     bool hipMoE_publish_original_hidden_q8_rows(const float *hidden, std::int8_t *codes,
         float *scales, int rows, int width, int device, void *stream,

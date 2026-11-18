@@ -33,6 +33,35 @@ std::optional<frontier::RoutedDecoder> groupedFFNFrontierDecoder(const Binding& 
     return std::nullopt;
 }
 
+/**
+ * @brief Select sum publication from the original routed source identity.
+ *
+ * The execution codebook also names direct affine formats. Require the
+ * immutable original GGUF identities as well as the reachable decoder before
+ * opting in to the exact measured program.
+ */
+bool groupedFFNFrontierUsesExactK32Sums(const Binding& binding,
+    const std::array<DeviceNativeQuantisedMatrixDesc,3>& shared)
+{
+    if(binding.original.localIntermediateColumns()!=160 ||
+       !qfnGroupedFFNDirectBankExperiment() || !frontier::exactK32SumsOptIn())
+        return false;
+    const auto decoder=groupedFFNFrontierDecoder(binding);
+    if(!decoder || !frontier::supportsExactK32Sums(*decoder))return false;
+    if(!std::all_of(shared.begin(),shared.end(),[](const auto& matrix) {
+        return matrix.source_identity_present && matrix.source_codebook_id==19 && !matrix.source_is_superblock;
+    }))return false;
+    const auto& roles=binding.descriptor_declaration.sourceFormats();
+    const auto sourceMatches=[](const ExpertWeightFormat& format,unsigned codebook,bool superblock) {
+        const auto& source=format.native_quantised;
+        return format.isNativeQuantised() && source.present &&
+            source.codebook_id==codebook && source.is_superblock==superblock;
+    };
+    const auto gate=frontier::routedGateCodebook(*decoder);
+    return sourceMatches(roles[0],gate,true) && sourceMatches(roles[1],gate,true) &&
+        sourceMatches(roles[2],frontier::routedDownCodebook(*decoder),false);
+}
+
 /** @brief Select exactly the measured MI50 M4 source tuple. */
 bool groupedFFNFrontierEligible(const Binding& binding,const SharedExpertFFNStage::Params& shared,
     const DeviceMoEExpertDescriptor& source)
@@ -207,6 +236,7 @@ public:
         auto value=binding_->signature^0x46464e47524f5550ULL;
         const auto mix=[&](std::uint64_t part){value=(value^part)*kFNV1a64Prime;};
         mix(qfnGroupedFFNDirectBankExperiment());
+        mix(groupedFFNFrontierUsesExactK32Sums(*binding_,publication_.sharedWeights));
         mix(frontier::routedColumns(publication_.routedGeometry));
         mix(static_cast<unsigned>(publication_.routedDecoder));
         for(auto* tensor:extraOperands())mix(reinterpret_cast<std::uintptr_t>(tensor));
@@ -235,9 +265,11 @@ public:
         for(std::size_t i=0;i<scratch_requirements.size();++i) {
             const auto& required=scratch_requirements[i];
             const auto extent=workspace_->getBufferSize(required.name);
-            if(extent<required.minimum_bytes)
+            const bool sumBank=i==0 && groupedFFNFrontierUsesExactK32Sums(*binding_,publication_.sharedWeights);
+            const auto minimum=sumBank?frontier::k32SumWorkspaceBytes:required.minimum_bytes;
+            if(extent<minimum)
                 throw std::logic_error("Grouped FFN frontier scratch is undersized: "+
-                    std::string(required.name)+" expected "+std::to_string(required.minimum_bytes)+
+                    std::string(required.name)+" expected "+std::to_string(minimum)+
                     " bytes, got "+std::to_string(extent));
             scratch_leases_[i]=workspace_->retainBuffer(required.name,0,extent);
         }

@@ -180,6 +180,7 @@ namespace llaminar2
     {
         ProducerAndConsumer = 0,
         RequiredConsumer = 1,
+        ProducerAndConsumerWithExactK32Sums = 2, ///< Closed ROCm F160 verifier owns the original quantizer's sums.
     };
 
     /**

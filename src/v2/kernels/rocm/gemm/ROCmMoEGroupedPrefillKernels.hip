@@ -808,7 +808,7 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
  * @param acc Running FP32 accumulator for this row and output column.
  * @return The accumulator after exactly one serial-shaped K-block update.
  */
-template <NativeQuantisedFormatPrefill FMT>
+template <NativeQuantisedFormatPrefill FMT, bool UseExactSum=false>
 __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
     const DeviceNativeQuantisedMatrixDesc& desc,
     size_t linear,
@@ -816,7 +816,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
     const int32_t* __restrict__ packed_groups,
     const int32_t* __restrict__ a4,
     float scale_ab,
-    float acc)
+    float acc, int exactSum=0)
 {
     using Traits = PrefillNATIVE_QUANTISEDTraits<FMT>;
     const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
@@ -952,11 +952,14 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
                 FMT == NATIVE_QUANTISED_PF_IQ3_S ? min_base[linear] : uint16_t{0});
         if constexpr (Traits::is_asymmetric)
         {
-            constexpr int32_t ones = 0x01010101;
-            int32_t sum_a = 0;
+            int32_t sum_a = exactSum;
+            if constexpr(!UseExactSum) {
+                constexpr int32_t ones = 0x01010101;
+                sum_a = 0;
 #pragma unroll
-            for (int g = 0; g < 8; ++g)
-                sum_a = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a);
+                for (int g = 0; g < 8; ++g)
+                    sum_a = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a);
+            }
 
             const uint16_t min_bits = min_base[linear];
             const float block_m =

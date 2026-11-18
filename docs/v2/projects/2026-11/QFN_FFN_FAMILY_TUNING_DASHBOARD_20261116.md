@@ -30,9 +30,23 @@ Throughput describes each engine's actual completed work.
 The shipping Castagna local HC/FFN kernel took 156.27 µs for four rows on
 the wide layer-1 slice. Our matched full body took 256.42 µs. Bypassing
 route grouping helped three rows but cost 5.2% at four. Routed gate/up took
-77.36 versus 27.12 µs on precisely matched expert IDs. The new full-model
-native trace will show how much equalizing the widths saves per round.
+77.36 versus 27.12 µs on precisely matched expert IDs. Equal-width code2048
+reduced the full profiled verifier from 26.39 to 22.94 ms per round.
+Castagna measured 18.22 ms. Each profiler run matched its unprofiled
+control's tokens and work counts.
 [Phase measurements, run identities and commands](QFN_MI50_STAGE_COMPARISON_20261118.md)
+
+The counted four-row FFN can reuse exact K32 activation sums on the two
+measured affine format combinations that benefit. On the same MI50 and
+Release ELF, Q4_K/Q5_1 measured 150.23 → 135.36 µs, Q5_K/Q8_0
+150.14 → 145.89 µs, and Q4_K/Q8_0 kept its original path (135.02 →
+135.12 µs in that bracket). These labels are
+routed gate/up and down; the immutable shared expert used Q8_0 in all three.
+The four-MI50 full-model fixed-depth gate gained 2.35% and 2.65%
+on review512 and code2048. Dynamic MTP changed by less than 0.1%.
+The dominant gate/down leaves reached 59%/62% of the same-card
+geometry-matched read probe. Broader source formats remain under tuning.
+[Matched runs and read calibration](QFN_MI50_STAGE_COMPARISON_20261118.md#counted-verifier-format-qualification)
 
 The current ordinary decode trace covers all 255 post-prefill review tokens.
 Values are mean active milliseconds per GPU per token. The projection group

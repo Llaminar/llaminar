@@ -8,6 +8,9 @@
 #include "execution/moe/MoEGroupedPlanDemand.h"
 #include "backends/DeviceId.h"
 #include <array>
+#include <cstdlib>
+#include <cstring>
+#include <stdexcept>
 #include <cstddef>
 #include <cstdint>
 
@@ -26,6 +29,12 @@ inline constexpr int routedColumns(RoutedGeometry geometry) { return static_cast
 
 /** @brief Exact immutable reachable routed decoder pair. */
 enum class RoutedDecoder { Q4K_Q51, Q4K_Q80, Q5K_Q80 };
+
+/** @brief Identify the measured physical formats that benefit from K32 sums. */
+constexpr bool supportsExactK32Sums(RoutedDecoder decoder) noexcept
+{
+    return decoder==RoutedDecoder::Q4K_Q51 || decoder==RoutedDecoder::Q5K_Q80;
+}
 constexpr unsigned routedGateCodebook(RoutedDecoder decoder)
 {
     return decoder==RoutedDecoder::Q5K_Q80?7u:5u;
@@ -36,6 +45,36 @@ constexpr unsigned routedDownCodebook(RoutedDecoder decoder)
 }
 
 inline constexpr std::size_t bankIdentityBytes=3*sizeof(std::uint64_t);
+
+/** @brief Disjoint typed tail in the already admitted, serial frontier input scratch.
+ * The shared SwiGLU codes occupy [0,640). Router and gate publishers write only their own
+ * live K32 sums through the same graph stream, before either consumer can read them.
+ */
+struct ExactK32Sums {
+    std::int16_t hiddenRows[capacity*(hidden/32)];
+    std::int16_t routedRows[capacity*topK*(160/32)];
+};
+static_assert(sharedCodesBytes % alignof(ExactK32Sums)==0);
+inline constexpr auto k32SumWorkspaceBytes=sharedCodesBytes+sizeof(ExactK32Sums);
+
+/** @brief Consume a scoped opt-in during graph construction, before capture identity seals. */
+inline bool exactK32SumsOptIn()
+{
+    static const bool enabled=[] {
+        const char* mode=std::getenv("LLAMINAR_QFN_ROCM_GROUPED_FFN_AFFINE_SUMS");
+        if(!mode || std::strcmp(mode,"0")==0)return false;
+        if(std::strcmp(mode,"1")==0)return true;
+        throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_FFN_AFFINE_SUMS accepts 0 or 1");
+    }();
+    return enabled;
+}
+
+/** @brief Form the disjoint typed sum view after the caller validates its lease extent. */
+inline ExactK32Sums* exactK32Sums(void* scratch)
+{
+    return reinterpret_cast<ExactK32Sums*>(static_cast<std::byte*>(scratch)+sharedCodesBytes);
+}
+
 
 /** @brief Router publication handed directly to the qualified two-node transaction. */
 struct DirectBankRouter {
@@ -80,6 +119,7 @@ struct DirectBankInput {
     const float* weights=nullptr;
     MoEGroupedPlanDemand demand=MoEGroupedPlanDemand::None;
     std::uint64_t* bankIdentity=nullptr;
+    ExactK32Sums* affineSums=nullptr; ///< Same stream and graph workspace as the two-role scratch.
 };
 
 /** @brief Every native publication is bound to the same original stream and workspace lifetime. */

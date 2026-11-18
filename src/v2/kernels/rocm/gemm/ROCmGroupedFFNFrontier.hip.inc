@@ -98,9 +98,9 @@ __device__ __forceinline__ AcquiredBank acquireBank(const DirectBankInput& input
 }
 
 /** @brief Joint original gate/up range loads with independent ordered accumulators. */
-template<NativeQuantisedFormatPrefill Format,int Columns>
+template<NativeQuantisedFormatPrefill Format,int Columns,bool ReuseSum=false>
 __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuantisedMatrixDesc& gate,const DeviceNativeQuantisedMatrixDesc& up,
-    const std::int8_t* codes,const float* scales,int column,int parts,int lane)
+    const std::int8_t* codes,const float* scales,int column,int parts,int lane,const std::int16_t* sums=nullptr)
 {
     using Traits=PrefillNATIVE_QUANTISEDTraits<Format>;
     const int worker=lane/16;
@@ -119,11 +119,13 @@ __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuant
                 const auto scale=scales[block];
                 const auto* gatePayload=gate.payload+index*Traits::payload_bytes;
                 const auto* upPayload=up.payload+index*Traits::payload_bytes;
+                int sum=0;
+                if constexpr(ReuseSum)sum=sums[block];
                 int32_t decoded[8];
                 moe_prefill_decode_groups<Format,false>(gatePayload,decoded,nullptr);
-                g=moe_prefill_accumulate_decoded_block<Format>(gate,index,gatePayload,decoded,a4,scale,g);
+                g=moe_prefill_accumulate_decoded_block<Format,ReuseSum>(gate,index,gatePayload,decoded,a4,scale,g,sum);
                 moe_prefill_decode_groups<Format,false>(upPayload,decoded,nullptr);
-                u=moe_prefill_accumulate_decoded_block<Format>(up,index,upPayload,decoded,a4,scale,u);
+                u=moe_prefill_accumulate_decoded_block<Format,ReuseSum>(up,index,upPayload,decoded,a4,scale,u,sum);
             }
         if(parts==1)return {g,u};
 #pragma unroll
@@ -140,7 +142,8 @@ __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuant
 }
 
 /** @brief Publish both original activation banks and the counted shared sigmoid plane. */
-template<bool Direct,int RoutedColumns,int GateBlocks,NativeQuantisedFormatPrefill Gate=NATIVE_QUANTISED_PF_Q4_1>
+template<bool Direct,int RoutedColumns,int GateBlocks,NativeQuantisedFormatPrefill Gate=NATIVE_QUANTISED_PF_Q4_1,
+    bool ReuseSum=false,bool PublishRoutedSum=false>
 __global__ __launch_bounds__(threads)
 void groupedFFNPairedGatePublish(Args p)
 {
@@ -223,7 +226,9 @@ void groupedFFNPairedGatePublish(Args p)
                        gate.source_codebook_id!=7 || up.source_codebook_id!=7 ||
                        !gate.source_is_superblock || !up.source_is_superblock)
                         __builtin_trap();
-                value=pairedProjections<Gate,RoutedColumns>(gate,up,codes,scales,column,16,lane);
+                const std::int16_t* sums=nullptr;
+                if constexpr(ReuseSum)sums=p.direct.affineSums->hiddenRows+row*(hidden/32);
+                value=pairedProjections<Gate,RoutedColumns,ReuseSum>(gate,up,codes,scales,column,16,lane,sums);
             } else {
                 value=pairedProjections<NATIVE_QUANTISED_PF_Q8_0,sharedWidth>(p.shared[0],p.shared[1],
                     codes,scales,column,16,lane);
@@ -248,15 +253,45 @@ void groupedFFNPairedGatePublish(Args p)
             auto* s=routed?planes.routed_scales:planes.shared_scales;
             // The grouped route slot is the original authority for scratch identity.
             if(tileLane==0)s[compact*blocks+block]=scale;
-            q[compact*span+block*32+tileLane]=static_cast<std::int8_t>(quantizeQ8FromScale(value,scale));
+            const auto code=static_cast<std::int8_t>(quantizeQ8FromScale(value,scale));
+            q[compact*span+block*32+tileLane]=code;
+            if constexpr(PublishRoutedSum) {
+                if(routed) {
+                    int sum=code;
+#pragma unroll
+                    for(int mask=16;mask>0;mask>>=1)sum+=__shfl_xor(sum,mask,32);
+                    if(tileLane==0)p.direct.affineSums->routedRows[compact*blocks+block]=static_cast<std::int16_t>(sum);
+                }
+            }
         }
         __syncthreads();
     }
 
 }
 
+/** @brief Original five one-block serial partitions with the producer's exact signed integer sum. */
+template<NativeQuantisedFormatPrefill Format>
+__device__ __forceinline__ float exactK32AffineDown(const DeviceNativeQuantisedMatrixDesc& down,
+    int column,const std::int8_t* codes,const float* scales,const std::int16_t* sums)
+{
+    using Traits=PrefillNATIVE_QUANTISEDTraits<Format>;
+    float total=0.0f;
+#pragma unroll 1
+    for(int block=0;block<5;++block) {
+        const std::size_t index=std::size_t(block)*hidden+column;
+        const auto* data=down.payload+index*Traits::payload_bytes;
+        int32_t decoded[8];
+        moe_prefill_decode_groups<Format,false>(data,decoded,nullptr);
+        const auto* activation=reinterpret_cast<const int32_t*>(codes+block*32);
+        const float partial=moe_prefill_accumulate_decoded_block<Format,true>(
+            down,index,data,decoded,activation,scales[block],0.0f,sums[block]);
+        total=rocm_native_quantised_accumulate_rn(total,partial);
+    }
+    return total;
+}
+
 /** @brief Column-major token-local down, with full wave-owned useful output lanes. */
-template<bool Direct,int RoutedColumns,NativeQuantisedFormatPrefill Down=NATIVE_QUANTISED_PF_Q5_1>
+template<bool Direct,int RoutedColumns,NativeQuantisedFormatPrefill Down=NATIVE_QUANTISED_PF_Q5_1,bool ReuseSum=false>
 __global__ __launch_bounds__(256,2)
 void groupedFFNTokenDown(Args p)
 {
@@ -318,9 +353,15 @@ void groupedFFNTokenDown(Args p)
                     down=&input.routedDown[expert];
                     weight=input.groupWeights[compact];
                 }
-                const float dot=moe_prefill_dot_desc_serial_m1<Down>(
-                    *down,co,scratch.routed_codes+compact*RoutedColumns,
-                    scratch.routed_scales+compact*routedBlocks,hidden,routedBlocks);
+                const auto* codes=scratch.routed_codes+compact*RoutedColumns;
+                const auto* scales=scratch.routed_scales+compact*routedBlocks;
+                const float dot=[&]{
+                    if constexpr(ReuseSum) {
+                        static_assert(RoutedColumns==160 && Down==NATIVE_QUANTISED_PF_Q5_1 && Direct);
+                        return exactK32AffineDown<Down>(*down,co,codes,scales,
+                            p.direct.affineSums->routedRows+compact*routedBlocks);
+                    } else return moe_prefill_dot_desc_serial_m1<Down>(*down,co,codes,scales,hidden,routedBlocks);
+                }();
                 value=rocm_native_quantised_weight_route_rn(weight,dot);
             }
             if(output.routeContributions)output.routeContributions[original*hidden+co]=value;
@@ -375,6 +416,28 @@ bool launch(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDe
         if(!direct.indices || !direct.weights || !direct.bankIdentity)return false;
         if(geometry==RoutedGeometry::F160) {
             constexpr int wide=routedColumns(RoutedGeometry::F160), wideGateBlocks=120;
+            if(direct.affineSums) {
+                switch(decoder) {
+                case RoutedDecoder::Q4K_Q51:
+                    hipLaunchKernelGGL((groupedFFNPairedGatePublish<true,wide,wideGateBlocks,NATIVE_QUANTISED_PF_Q4_1,true,true>),
+                        dim3(wideGateBlocks),dim3(threads),0,native,args);
+                    break;
+                case RoutedDecoder::Q4K_Q80:
+                    return false;
+                case RoutedDecoder::Q5K_Q80:
+                    hipLaunchKernelGGL((groupedFFNPairedGatePublish<true,wide,wideGateBlocks,NATIVE_QUANTISED_PF_Q5_1,true,false>),
+                        dim3(wideGateBlocks),dim3(threads),0,native,args);
+                    break;
+                }
+                if(hipGetLastError()!=hipSuccess)return false;
+                if(decoder==RoutedDecoder::Q4K_Q51)
+                    hipLaunchKernelGGL((groupedFFNTokenDown<true,wide,NATIVE_QUANTISED_PF_Q5_1,true>),
+                        dim3(hidden/64,capacity),dim3(threads),0,native,args);
+                else
+                    hipLaunchKernelGGL((groupedFFNTokenDown<true,wide,NATIVE_QUANTISED_PF_Q8_0>),
+                        dim3(hidden/64,capacity),dim3(threads),0,native,args);
+                return hipGetLastError()==hipSuccess;
+            }
             if(decoder==RoutedDecoder::Q5K_Q80)
                 hipLaunchKernelGGL((groupedFFNPairedGatePublish<true,wide,wideGateBlocks,NATIVE_QUANTISED_PF_Q5_1>),
                     dim3(wideGateBlocks),dim3(threads),0,native,args);

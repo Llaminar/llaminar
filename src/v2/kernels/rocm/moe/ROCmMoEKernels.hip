@@ -14049,13 +14049,10 @@ __global__ void rocm_moe_gate_logits_single_token_q8_weights_kernel(
  * changes a row's scale, rounding, or output address; the published bytes are
  * also consumed directly by routed and shared experts without requantization.
  */
-__global__ void rocm_moe_router_hidden_quantize_q8_rows_kernel(
-    const float *__restrict__ hidden,
-    int8_t *__restrict__ hidden_q8,
-    float *__restrict__ hidden_scales,
-    int seq_len,
-    int d_model,
-    const int *__restrict__ device_effective_seq_len)
+template<bool PublishSum>
+__device__ __forceinline__ void rocm_moe_router_hidden_quantize_q8_rows_body(
+    const float* hidden, int8_t* hidden_q8, float* hidden_scales, int seq_len,
+    int d_model,const int* device_effective_seq_len, std::int16_t* sums)
 {
     constexpr int BLOCK_SIZE = 32;
     const int block_idx = blockIdx.x * (blockDim.x / BLOCK_SIZE) + threadIdx.x / BLOCK_SIZE;
@@ -14086,8 +14083,31 @@ __global__ void rocm_moe_router_hidden_quantize_q8_rows_kernel(
         hidden_scales[static_cast<size_t>(row) * blocks_per_row + block_idx] = scale;
     }
 
-    hidden_q8[row_offset + k] =
-        rocm_moe_quantize_q8_decode_equivalent(value, scale);
+    const auto code=rocm_moe_quantize_q8_decode_equivalent(value, scale);
+    hidden_q8[row_offset + k] = code;
+    if constexpr(PublishSum) {
+        int sum=code;
+#pragma unroll
+        for(int mask=16;mask>0;mask>>=1)sum+=__shfl_xor(sum,mask,BLOCK_SIZE);
+        if(lane==0)sums[static_cast<std::size_t>(row)*blocks_per_row+block_idx]=static_cast<std::int16_t>(sum);
+    }
+}
+
+
+/** @brief Original launch identity over the same exact quantizer. */
+__global__ void rocm_moe_router_hidden_quantize_q8_rows_kernel(
+    const float* hidden, int8_t* hidden_q8, float* hidden_scales, int seq_len,
+    int d_model,const int* device_effective_seq_len)
+{
+    rocm_moe_router_hidden_quantize_q8_rows_body<false>(
+        hidden,hidden_q8,hidden_scales,seq_len,d_model,device_effective_seq_len,nullptr);
+}
+
+/** @brief Closed frontier's extra immutable integer plane, in the original quantizer node. */
+__global__ void rocm_moe_router_hidden_quantize_q8_rows_and_sums_kernel(
+    const float* hidden, int8_t* codes,float* scales,const int* live,std::int16_t* sums)
+{
+    rocm_moe_router_hidden_quantize_q8_rows_body<true>(hidden,codes,scales,4,2560,live,sums);
 }
 
 /**
@@ -16990,6 +17010,19 @@ bool hipMoE_gate_logits_single_token_q8_weights(
         if (hipGetLastError() != hipSuccess) return false;
     }
     return true;
+}
+
+/** @copydoc hipMoE_publish_original_hidden_q8_with_k32_sums */
+bool hipMoE_publish_original_hidden_q8_with_k32_sums(const float* hidden,std::int8_t* codes,
+    float* scales,std::int16_t* sums,int device,void* stream,const int* live_rows)
+{
+    if (!hidden || !codes || !scales || !sums || !live_rows ||
+        reinterpret_cast<std::uintptr_t>(stream)<=2u || device<0 ||
+        static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device))!=hipSuccess)
+        return false;
+    hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_rows_and_sums_kernel,
+        dim3(80,4),dim3(32),0,static_cast<hipStream_t>(stream),hidden,codes,scales,live_rows,sums);
+    return hipGetLastError()==hipSuccess;
 }
 
 /** @copydoc hipMoE_publish_original_hidden_q8_rows */
