@@ -43,14 +43,17 @@ public:
         GEMMStage::Params down,GEMMStage::Params up,std::optional<GEMMStage::Params> inject,
         Qwen4ExpHyperconnectionReadBuffers buffers,std::optional<Qwen4ExpFloatBinding> injection,std::string terminal,
         WorkspaceRequirements workspace_requirements,
-        std::optional<Qwen4ExpPrimitiveStage::ResidualWrite> previous_write=std::nullopt)
+        std::optional<Qwen4ExpPrimitiveStage::ResidualWrite> previous_write=std::nullopt,
+        Qwen4ExpHCTrunkSource trunk_source=Qwen4ExpHCTrunkSource::PreviousWrite)
         :IComputeStage(context.device),context_(std::move(context)),norm_(std::move(norm)),
          down_(std::move(down)),up_(std::move(up)),inject_(std::move(inject)),buffers_(buffers),
-         injection_(injection),terminal_(std::move(terminal)),previous_write_(std::move(previous_write)),workspace_requirements_(std::move(workspace_requirements))
+         injection_(injection),terminal_(std::move(terminal)),previous_write_(std::move(previous_write)),trunk_source_(trunk_source),workspace_requirements_(std::move(workspace_requirements))
     {
         check(device().is_rocm()&&context_.rows.capacity==1&&context_.arithmetic==Qwen4ExpProjectionArithmetic::Ordinary&&
             up_.quantized_operand_precision==QuantizedActivationOperandPrecision::TwoTermQ8,
             "Persistent HC requires the explicit original ROCm ordinary M1 two-term operation");
+        if(trunk_source_==Qwen4ExpHCTrunkSource::PublishedTrunk)
+            check(!previous_write_&&!inject_&&!ctaOwned(),"Published HC trunk requires its original standalone input and injection");
         check(inject_.has_value()==injection_.has_value(),"Original HC injection source and output must be present together");
         check(norm_.hidden==context_.hidden&&std::bit_cast<std::uint32_t>(norm_.epsilon)==std::bit_cast<std::uint32_t>(context_.epsilon)&&
             norm_.input.tensor==buffers_.trunk.tensor&&norm_.input.buffer==buffers_.trunk.buffer&&
@@ -129,12 +132,17 @@ public:
     WorkspaceRequirements phaseWorkspaceRequirements() const override {return workspace_requirements_;}
     /** @return Original phase/write arguments without a barrier or separate admission. */
     rocm::FullNativeHCFFNPrefixArgs fullPrefixArguments() const override {
-        check(args_.has_value()&&previous_write_.has_value(),"Full HC arguments require original prepared write/read bindings");
+        check(args_.has_value(),"Full HC arguments require original prepared read bindings");
+        if(trunk_source_==Qwen4ExpHCTrunkSource::PublishedTrunk)
+            return {*args_,{},nullptr,output_demand_};
+        check(previous_write_.has_value(),"Full HC arguments require the original previous write");
         const auto& w=*previous_write_;
         return {*args_,{static_cast<const float*>(w.residual.tensor->gpu_data_ptr()),
             static_cast<const float*>(w.block.tensor->gpu_data_ptr()),static_cast<const float*>(w.gateLogits.tensor->gpu_data_ptr()),
             static_cast<float*>(w.output.tensor->gpu_data_ptr())},nullptr,output_demand_};
     }
+    /** @copydoc Qwen4ExpHCReadPhaseOwner::trunkSource */
+    Qwen4ExpHCTrunkSource trunkSource() const noexcept override {return trunk_source_;}
     /** @return Original inputs for this declaration's numerical boundary. */
     std::vector<Qwen4ExpFloatBinding> phaseInputs() const override {
         if(previous_write_)return {previous_write_->residual,previous_write_->block,previous_write_->gateLogits};
@@ -148,7 +156,8 @@ public:
     }
     /** @copydoc Qwen4ExpHCReadPhaseOwner::sealFullOutputDemand */
     void sealFullOutputDemand(FullNativeHCFFNOutputDemand demand) override {
-        check(previous_write_.has_value(),"Only a complete full-region owner may narrow HC publications");
+        check(previous_write_.has_value()||trunk_source_==Qwen4ExpHCTrunkSource::PublishedTrunk,
+            "Only a complete full-region owner may narrow HC publications");
         check(!args_||demand==output_demand_,"Prepared HC output demand cannot change");
         output_demand_=demand;
     }
@@ -314,7 +323,7 @@ public:
     std::uint64_t graphCaptureVariantSignature() const override {
         validateDeclaredRoots();if(args_)validateStorage(prepared_stream_);
         auto hash=kFNV1a64OffsetBasis;const auto mix=[&](std::uint64_t value){hash=(hash^value)*kFNV1a64Prime;};
-        mix(bool(inject_));mix(bool(previous_write_));mix(output_demand_.bits());
+        mix(bool(inject_));mix(bool(previous_write_));mix(output_demand_.bits());mix(static_cast<unsigned>(trunk_source_));
         if(previous_write_)for(const auto& v:std::array{previous_write_->residual,previous_write_->block,previous_write_->gateLogits,previous_write_->output}) {mix(reinterpret_cast<std::uintptr_t>(v.tensor));mix(static_cast<unsigned>(v.buffer));mix(v.byteOffset);}
         mix(static_cast<unsigned>(context_.readExecution));mix(context_.hidden);mix(context_.lowRank);
         if(ctaOwned()){mix(1024);mix(48);mix(context_.lowRank/32);}
@@ -501,6 +510,7 @@ private:
     const std::optional<Qwen4ExpFloatBinding> injection_; ///< Present exactly with the original injection projection.
     const std::string terminal_;
     const std::optional<Qwen4ExpPrimitiveStage::ResidualWrite> previous_write_; ///< Original full-prefix write declaration, never a second owner.
+    Qwen4ExpHCTrunkSource trunk_source_; ///< Exact original owner of the HC norm input.
     const WorkspaceRequirements workspace_requirements_; ///< Original named-bank order determines the same exact packed PMA extent.
     FullNativeHCFFNOutputDemand output_demand_=FullNativeHCFFNOutputDemand::all(); ///< Frozen before storage/native preparation.
     std::vector<TensorSeal> roots_;

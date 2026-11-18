@@ -32,6 +32,10 @@
 #include "../../tensors/Tensors.h"
 #include "../../transfer/TransferEngine.h"
 #include "../../utils/DebugEnv.h"
+#ifdef HAVE_ROCM
+#include "execution/compute_stages/stages/qwen4exp/RetainedGDNPreAttentionStage.h"
+#include "models/qwen4exp/Qwen4ExpRetainedGDNPreAttentionPolicy.h"
+#endif
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -62,12 +66,23 @@ namespace llaminar2
             throw std::invalid_argument(
                 "QSA prefill8_decode33 requires explicit fp16_tile and the canonical single-request graph family");
     }
-void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph,const std::string &internalBoundary)
+void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph, const LayerComposition &composition)
 {
     if(!forward_input_construction_)return;
     const auto &input=*forward_input_construction_;
     if(input.execution_phase!=ForwardExecutionPhase::Decode ||
        input.execution_role!=ForwardExecutionRole::MainInference || input.seq_len!=1 || input.batch_size!=1)return;
+#ifdef HAVE_ROCM
+    if (usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionOptIn(), composition.device,
+            config_.moe.routed_compute_policy, input.execution_phase, input.execution_role,
+            input.seq_len, input.batch_size) &&
+        isGDNLayer(composition.layer))
+    {
+        lowerRetainedQwenGDNPreAttention(graph, "layer" + std::to_string(composition.layer) + "_gdn_proj",
+                                         composition.input_boundary);
+    }
+#endif
+    const auto &internalBoundary = composition.attention_terminal;
     const auto *boundary=graph.getNode(internalBoundary);
     if(useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNOptIn(),input.execution_phase,input.execution_role,input.seq_len,input.batch_size)) {
         if(!boundary || !boundary->device.is_rocm())

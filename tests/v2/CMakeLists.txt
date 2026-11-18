@@ -972,6 +972,21 @@ add_v2_test(V2_Integration_Qwen4ExpHCUpGraphPolicy
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Policy;Capture;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 
+if(HAVE_ROCM)
+    add_executable(v2_test_retained_gdn_pre_attention_lowering
+        unit/execution/qwen4exp/Test__RetainedGDNPreAttentionLowering.cpp)
+    if(TARGET v2_test_retained_gdn_pre_attention_lowering)
+        target_include_directories(v2_test_retained_gdn_pre_attention_lowering PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_link_libraries(v2_test_retained_gdn_pre_attention_lowering PRIVATE llaminar2_core GTest::gtest_main OpenMP::OpenMP_CXX)
+    endif()
+    add_v2_test(V2_Integration_RetainedGDNPreAttentionLowering
+        COMMAND $<TARGET_FILE:v2_test_retained_gdn_pre_attention_lowering>
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;GDN;Capture;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1")
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RetainedGDNPreAttentionLowering)
+endif()
+
 # Test: ExpertGemmRegistry - MoE expert GEMM engine registry
 if(HAVE_CUDA OR HAVE_ROCM)
     add_executable(v2_integration_moe_512_expert_routing
@@ -1009,6 +1024,20 @@ if(HAVE_CUDA OR HAVE_ROCM)
         target_link_libraries(v2_test_qwen4exp_device_primitives PRIVATE hip::host ${CMAKE_DL_LIBS})
         set_target_properties(v2_test_qwen4exp_device_primitives PROPERTIES
             HIP_STANDARD 20 HIP_STANDARD_REQUIRED ON)
+        add_v2_test(V2_Integration_ROCmGroupedHCUpShortK
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=Q8ResidualCorrectionDevice.ROCmGroupedHCUpShortKProductionReplay
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;MTP;Capture;ByteExact;Regression"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0;LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K=1"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedHCUpShortK)
+        add_v2_test(V2_Integration_ROCmRetainedPreAttentionGDN
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=Q8ResidualCorrectionDevice.ROCmRetainedPreAttentionGDN
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;Capture;ByteExact;Regression"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmRetainedPreAttentionGDN)
         add_v2_test(V2_Integration_ROCmBranchNormHistoricalTree
             COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                 --gtest_filter=Qwen4ExpDevicePrimitives.ROCmBranchNormHistoricalTree

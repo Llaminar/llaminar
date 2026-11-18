@@ -754,6 +754,7 @@ if(HAVE_ROCM)
         # MoE (Mixture of Experts) kernels
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
         kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNDevice.hip
+        kernels/rocm/gemm/retained_hc_ffn/RetainedPreAttentionDevice.hip
         kernels/rocm/moe/ROCmMoEOverlayActivationPacketKernels.hip # Device-owned node-local sparse activation packets
         kernels/rocm/moe/ROCmMoEOverlayDeviceControllerKernels.hip # Node-local sole-controller lifecycle
         backends/rocm/PlanningGPUClockMarker.hip # Bounded startup fixed-clock timing
@@ -1635,6 +1636,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/AttentionOutputGateStage.cpp
     execution/compute_stages/stages/GatedRMSNormStage.cpp
     execution/compute_stages/stages/GDNProjectionStage.cpp
+    execution/compute_stages/stages/qwen4exp/RetainedGDNPreAttentionStage.cpp
     execution/compute_stages/stages/ShortConv1dStage.cpp
     execution/compute_stages/stages/GDNRecurrenceStage.cpp
     execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp

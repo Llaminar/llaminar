@@ -225,6 +225,7 @@ __device__ __forceinline__ void current_hc_two_contributions(
 /**
  * @brief Pinned current HC prefix with balanced native-column issue.
  * @tparam T Exact retained diagnostic token rows, never an inferred live count.
+ * @tparam PublishedTrunk Read the norm producer's published trunk without owning a POST write.
  * @tparam Precision Explicit SingleQ8 or TwoTermQ8 operation.
  * @param src Original POST input view. @param gain Original FP32 norm weights.
  * @param down Prepared Q8 down source. @param up Prepared Q8 up source.
@@ -241,7 +242,7 @@ __device__ __forceinline__ void current_hc_two_contributions(
  * banks, mixed. All physical lanes reach all CTA joins. One whole-CTA panel
  * publishes actual K32 contributions; output owners then fold both banks in registers.
  */
-template<int T,::llaminar2::QuantizedActivationOperandPrecision Precision,bool Observe,bool TileEightHCUp>
+template<int T,::llaminar2::QuantizedActivationOperandPrecision Precision,bool Observe,bool TileEightHCUp,bool PublishedTrunk=false>
 __device__ __forceinline__ void current_llaminar_hc_prefix(
     const hc_src& src,const float* gain,const NativeMatrix& down,const NativeMatrix& up,
     float epsilon,float* post,float* normalized,float* mixed,float* temporary,
@@ -285,8 +286,9 @@ __device__ __forceinline__ void current_llaminar_hc_prefix(
     }
     // All 1,024 physical workers issue the original immutable source/gain
     // reads. Scalar channels require no stronger alignment than the original
-    // FP32 inputs. The same ResidualBranchInput publishes every public POST
-    // word once; exact in-place residual writes remain same-channel owned.
+    // FP32 inputs. PreviousWrite publishes every POST word once and keeps
+    // exact in-place writes same-channel owned. PublishedTrunk only reads
+    // the existing publication. Both materialize the same local norm input.
     for(unsigned task=bid;task<unsigned(T*HC);task+=NB) {
         const unsigned t=task/HC,c=task%HC;
         const auto base=std::uint64_t(task)*E;
@@ -304,14 +306,22 @@ __device__ __forceinline__ void current_llaminar_hc_prefix(
         }
         float* norm_local=temporary+256;
         float* gain_local=norm_local+E;
-        const float gate=::llaminar2::qwen4exp::branch_norm_native::residualGate(src.raw[task]);
-        const ::llaminar2::qwen4exp::branch_norm_native::ResidualBranchInput input{
-            src.x+base,src.out+std::uint64_t(t)*E,post+base,gate};
-        for(unsigned channel=tid;channel<unsigned(E);channel+=NT) {
-            const float original_gain=gain[c*E+channel];
-            const float value=input.publish(channel);
-            norm_local[channel]=value;
-            gain_local[channel]=original_gain;
+        if constexpr(PublishedTrunk) {
+            const ::llaminar2::qwen4exp::branch_norm_native::RetainedBranchInput input{src.x+base};
+            for(unsigned channel=tid;channel<unsigned(E);channel+=NT) {
+                norm_local[channel]=input.publish(channel);
+                gain_local[channel]=gain[c*E+channel];
+            }
+        } else {
+            const float gate=::llaminar2::qwen4exp::branch_norm_native::residualGate(src.raw[task]);
+            const ::llaminar2::qwen4exp::branch_norm_native::ResidualBranchInput input{
+                src.x+base,src.out+std::uint64_t(t)*E,post+base,gate};
+            for(unsigned channel=tid;channel<unsigned(E);channel+=NT) {
+                const float original_gain=gain[c*E+channel];
+                const float value=input.publish(channel);
+                norm_local[channel]=value;
+                gain_local[channel]=original_gain;
+            }
         }
         // Every physical lane reaches this new publication edge. The original
         // 256 logical owners then consume their unchanged channel+256*j FMA

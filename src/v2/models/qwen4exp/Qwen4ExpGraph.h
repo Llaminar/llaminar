@@ -77,7 +77,7 @@ public:
     std::shared_ptr<IRetainedGraphStorageBoundary> retainedStorageBoundary(DeviceId device) override;
 protected:
     /** @copydoc QwenGraphBase::postLayerComposition */
-    void postLayerComposition(ComputeGraph &graph,const std::string &internalBoundary) override;
+    void postLayerComposition(ComputeGraph &graph, const LayerComposition &composition) override;
     /** @copydoc QwenGraphBase::addModelInvocationPrefix */
     std::unique_ptr<ModelInvocationPrefix> addModelInvocationPrefix(ComputeGraph&,const ForwardInput&,
         DeviceId,ModelInvocationShape) override;

@@ -49,6 +49,8 @@
 #ifdef HAVE_ROCM
 #include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNWorkspace.h"
 #include "models/qwen4exp/Qwen4ExpRetainedM1HCFFNPolicy.h"
+#include "models/qwen4exp/Qwen4ExpRetainedGDNPreAttentionPolicy.h"
+#include "execution/compute_stages/stages/qwen4exp/RetainedGDNPreAttentionStage.h"
 #include "utils/DebugEnv.h"
 #endif
 #include "planning/PlanningMemoryQuoteReuse.h"
@@ -2563,6 +2565,19 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             workspace_bytes = checkedAdd(workspace_bytes,
                 rocm::retainedM1HCFFNWorkspace().total_bytes_with_alignment(),
                 "QFN retained M1 serial-family workspace");
+        }
+        if (profile.flash_next && cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+            usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionOptIn(), cfg.device,
+                cfg.routed_compute_policy, ForwardExecutionPhase::Decode,
+                ForwardExecutionRole::MainInference, 1, cfg.batch_size))
+        {
+            const int last_main = std::min(last_layer, profile.mainLayerCount() - 1);
+            if (last_main >= cfg.first_layer &&
+                static_cast<size_t>(last_main - cfg.first_layer + 1) >
+                    profile.flashNextSparseLayerCount(cfg.first_layer, last_main))
+                workspace_bytes = checkedAdd(workspace_bytes,
+                    retainedGDNPreAttentionWorkspace().total_bytes_with_alignment(),
+                    "QFN retained GDN serial-family workspace");
         }
 #endif
         // Distinct graph owners can reuse one serial family across shapes,

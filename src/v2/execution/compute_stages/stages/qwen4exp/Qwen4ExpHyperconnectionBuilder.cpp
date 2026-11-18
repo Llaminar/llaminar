@@ -419,6 +419,14 @@ std::string Qwen4ExpHyperconnectionBuilder::appendWrite(ComputeGraph &graph,Bloc
 Qwen4ExpFullNativeHCRegion Qwen4ExpHyperconnectionBuilder::describeFullNativeReadRegion(
     ComputeGraph& graph,const std::string& previous_write,const std::string& read_name)
 {
+    return describeFullNativeReadRegion(graph,previous_write,read_name,
+        Qwen4ExpHCInjectionOwnership::DiscoverInRegion);
+}
+
+Qwen4ExpFullNativeHCRegion Qwen4ExpHyperconnectionBuilder::describeFullNativeReadRegion(
+    ComputeGraph& graph,const std::string& previous_write,const std::string& read_name,
+    Qwen4ExpHCInjectionOwnership injection_ownership)
+{
     const auto* read_node=graph.getNode(read_name);
     const auto* read=read_node?dynamic_cast<const Qwen4ExpPrimitiveStage*>(read_node->stage.get()):nullptr;
     const auto* r=read?std::get_if<Qwen4ExpPrimitiveStage::ResidualRead>(&read->getParams().operation):nullptr;
@@ -448,13 +456,16 @@ Qwen4ExpFullNativeHCRegion Qwen4ExpHyperconnectionBuilder::describeFullNativeRea
     const auto& n=std::get<Qwen4ExpPrimitiveStage::BranchRMSNorm>(norm->getParams().operation);
     // Only an actual independent prepared four-logit projection sharing this
     // exact norm input is an injection export. A final read has none.
-    for(const auto& name:graph.getExecutionOrder()) {
-        const auto* node=graph.getNode(name);const auto* p=dynamic_cast<const GEMMStage*>(node->stage.get());
-        if(!p||p==down||p==up)continue;
-        const auto& a=p->getParams();
-        if(a.A==n.output.tensor&&a.n==4&&a.k==4*n.hidden&&
-            std::find(node->dependencies.begin(),node->dependencies.end(),norm_name)!=node->dependencies.end()) {
-            require(injection_name.empty(),"Full HC norm has ambiguous independent injection exports");injection_name=name;
+    if(injection_ownership==Qwen4ExpHCInjectionOwnership::DiscoverInRegion)
+    {
+        for(const auto& name:graph.getExecutionOrder()) {
+            const auto* node=graph.getNode(name);const auto* p=dynamic_cast<const GEMMStage*>(node->stage.get());
+            if(!p||p==down||p==up)continue;
+            const auto& a=p->getParams();
+            if(a.A==n.output.tensor&&a.n==4&&a.k==4*n.hidden&&
+                std::find(node->dependencies.begin(),node->dependencies.end(),norm_name)!=node->dependencies.end()) {
+                require(injection_name.empty(),"Full HC norm has ambiguous independent injection exports");injection_name=name;
+            }
         }
     }
     const auto& dp=down->getParams();const auto& up_params=up->getParams();
@@ -471,6 +482,12 @@ Qwen4ExpFullNativeHCRegion Qwen4ExpHyperconnectionBuilder::describeFullNativeRea
 /** @copydoc Qwen4ExpHyperconnectionBuilder::retainFullNativeReadPhase */
 std::shared_ptr<Qwen4ExpHCReadPhaseOwner> Qwen4ExpHyperconnectionBuilder::retainFullNativeReadPhase(
     ComputeGraph& graph,const Qwen4ExpFullNativeHCRegion& region)
+{
+    return retainFullNativeReadPhase(graph,region,Qwen4ExpHCTrunkSource::PreviousWrite);
+}
+
+std::shared_ptr<Qwen4ExpHCReadPhaseOwner> Qwen4ExpHyperconnectionBuilder::retainFullNativeReadPhase(
+    ComputeGraph& graph,const Qwen4ExpFullNativeHCRegion& region,Qwen4ExpHCTrunkSource source)
 {
 #ifdef HAVE_ROCM
     const auto& c=region.context;
@@ -496,16 +513,20 @@ std::shared_ptr<Qwen4ExpHCReadPhaseOwner> Qwen4ExpHyperconnectionBuilder::retain
         require(binding&&binding->tensor==p.B,"Full HC projection prepared reference differs from its original source");
         return stage;
     };
-    const auto* write=primitive(region.previous_write);
+    const bool ownsWrite=source==Qwen4ExpHCTrunkSource::PreviousWrite;
+    require(ownsWrite==!region.previous_write.empty()&&(ownsWrite||region.injection.empty()),
+        "Full HC trunk source or independent injection declaration is inconsistent");
+    const auto* write=ownsWrite?primitive(region.previous_write):nullptr;
     const auto* norm=primitive(region.branch_norm);
     const auto* read=primitive(region.read);
     const auto* down=projection(region.down);const auto* up=projection(region.up);
     const auto* injection=region.injection.empty()?nullptr:projection(region.injection);
-    const auto* w=std::get_if<Qwen4ExpPrimitiveStage::ResidualWrite>(&write->getParams().operation);
+    const auto* w=write?std::get_if<Qwen4ExpPrimitiveStage::ResidualWrite>(&write->getParams().operation):nullptr;
     const auto* n=std::get_if<Qwen4ExpPrimitiveStage::BranchRMSNorm>(&norm->getParams().operation);
     const auto* r=std::get_if<Qwen4ExpPrimitiveStage::ResidualRead>(&read->getParams().operation);
-    require(w&&n&&r&&w->hidden==c.hidden&&r->hidden==c.hidden&&
-        w->output.tensor==n->input.tensor&&w->output.buffer==n->input.buffer&&w->output.byteOffset==0&&
+    require(n&&r&&r->hidden==c.hidden&&n->input.byteOffset==0&&
+        (!ownsWrite||(w&&w->hidden==c.hidden&&w->output.tensor==n->input.tensor&&
+            w->output.buffer==n->input.buffer&&w->output.byteOffset==0))&&
         r->normalized.tensor==n->output.tensor&&r->normalized.buffer==n->output.buffer&&
         r->normalized.byteOffset==0&&r->gateLogits.tensor==up->getParams().C,
         "Full HC write/norm/read original public boundaries differ");
@@ -526,7 +547,8 @@ std::shared_ptr<Qwen4ExpHCReadPhaseOwner> Qwen4ExpHyperconnectionBuilder::retain
         require(node&&std::find(node->dependencies.begin(),node->dependencies.end(),producer)!=node->dependencies.end(),
             "Full HC region lacks an original direct producer edge");
     };
-    edge(region.previous_write,region.branch_norm);edge(region.branch_norm,region.down);
+    if(ownsWrite)edge(region.previous_write,region.branch_norm);
+    edge(region.branch_norm,region.down);
     edge(region.down,region.up);edge(region.up,region.read);edge(region.branch_norm,region.read);
     if(injection) {
         require(injection->getParams().a_buffer_id&&*injection->getParams().a_buffer_id==n->output.buffer&&
@@ -537,10 +559,17 @@ std::shared_ptr<Qwen4ExpHCReadPhaseOwner> Qwen4ExpHyperconnectionBuilder::retain
         edge(region.branch_norm,region.injection);
     }
     WorkspaceRequirements requirements;
-    for(const auto& name:graph.getExecutionOrder()) {
-        if(name!=region.down&&name!=region.up&&name!=region.injection)continue;
-        const auto* stage=static_cast<const GEMMStage*>(graph.getNode(name)->stage.get());
-        const auto& p=stage->getParams();requirements.merge(stage->getWorkspaceRequirements(p.m,p.n,p.k));
+    const auto mergeRequirements=[&](const GEMMStage& stage) {
+        const auto& p=stage.getParams();
+        requirements.merge(stage.getWorkspaceRequirements(p.m,p.n,p.k));
+    };
+    if(!injection) {
+        // The direct typed down→up edge authenticates their original quote order.
+        mergeRequirements(*down);
+        mergeRequirements(*up);
+    } else for(const auto& name:graph.getExecutionOrder()) {
+        if(name==region.down||name==region.up||name==region.injection)
+            mergeRequirements(*static_cast<const GEMMStage*>(graph.getNode(name)->stage.get()));
     }
     std::optional<Qwen4ExpFloatBinding> injection_binding;
     if(injection) {
@@ -550,9 +579,10 @@ std::shared_ptr<Qwen4ExpHCReadPhaseOwner> Qwen4ExpHyperconnectionBuilder::retain
     }
     return std::make_shared<PersistentHCReadStage>(c,*n,down->getParams(),up->getParams(),
         injection?std::optional<GEMMStage::Params>{injection->getParams()}:std::nullopt,buffers,
-        injection_binding,region.read,std::move(requirements),*w);
+        injection_binding,region.read,std::move(requirements),
+        w?std::optional<Qwen4ExpPrimitiveStage::ResidualWrite>{*w}:std::nullopt,source);
 #else
-    (void)graph;(void)region;
+    (void)graph;(void)region;(void)source;
     throw std::invalid_argument("Full native HC requires the compiled ROCm backend");
 #endif
 }

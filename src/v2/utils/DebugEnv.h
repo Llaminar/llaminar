@@ -11,6 +11,7 @@
 #include <cstring>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 
 #include "utils/PrefillGraphBucketDefaults.h"
 #include "execution/local_execution/graph/ReadAheadScheduling.h"
@@ -48,6 +49,21 @@
 
 namespace llaminar2
 {
+
+    /**
+     * @brief Immutable process opt-in for the gfx906 grouped signed-Q8 HC-up leaf.
+     * @return True only when the experimental capture policy is explicitly selected.
+     */
+    inline bool qfnGroupedHCUpShortKExperiment()
+    {
+        static const bool enabled = [] {
+            const char *mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K");
+            if (!mode || std::strcmp(mode,"0")==0) return false;
+            if (std::strcmp(mode,"1")==0) return true;
+            throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K accepts 0 or 1");
+        }();
+        return enabled;
+    }
 
     /**
      * @brief Tracks whether selected environment variables were present at the last reload.

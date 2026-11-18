@@ -40,6 +40,11 @@
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmWeightPacker.h"
 #ifdef HAVE_ROCM
+#include "kernels/rocm/gemm/RetainedPreAttentionDevice.h"
+#include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
+#include <iostream>
+#include <filesystem>
+#include <fstream>
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"
 #include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.h"
@@ -1627,3 +1632,7 @@ TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M512K10240TileEventsQ8_
  proveNativeQ8PrefillTiles("Q8_K",512);
 }
 #endif
+
+#include "RetainedPreAttentionGDNReplay.inc"
+
+#include "GroupedHCUpShortKReplay.inc"

@@ -127,7 +127,13 @@ struct Qwen4ExpHyperconnectionWriteBuffers
     Qwen4ExpFloatBinding outputTrunk; ///< [M,4H], may exactly alias the retained original trunk.
 };
 
-/** @brief Explicit cold original HC region consumed by one full local lowering. */
+/** @brief Which original producer owns the trunk consumed by HC normalization. */
+enum class Qwen4ExpHCTrunkSource { PreviousWrite, PublishedTrunk };
+
+/** @brief Whether a composed local kernel absorbs the original injection projection. */
+enum class Qwen4ExpHCInjectionOwnership { DiscoverInRegion, KeepOriginalStage };
+
+/** @brief Exact original declarations forming one native HC read region. */
 struct Qwen4ExpFullNativeHCRegion {
     Qwen4ExpHyperconnectionContext context; ///< Original immutable arithmetic/row declaration.
     std::string previous_write,branch_norm,down,up,read,injection; ///< Exact existing nodes, no graph search.
@@ -164,6 +170,8 @@ public:
     virtual std::array<Qwen4ExpFloatBinding,2> optionalPhaseOutputs() const=0;
     /** @brief Retire phase borrows after the enclosing native program retires. */
     virtual void invalidatePhaseBindings()=0;
+    /** @return Exact original source kind, never inferred from nullable kernel operands. */
+    virtual Qwen4ExpHCTrunkSource trunkSource() const noexcept { return Qwen4ExpHCTrunkSource::PreviousWrite; }
 };
 
 /** @brief Reusable graph composition with a single-use paired-write capability. */
@@ -237,8 +245,23 @@ public:
      */
     static Qwen4ExpFullNativeHCRegion describeFullNativeReadRegion(
         ComputeGraph& graph,const std::string& previous_write,const std::string& read);
+    /**
+     * @brief Resolve original direct HC edges with explicit injection ownership.
+     * @param graph Original participant graph.
+     * @param previous_write Exact prior write name, or empty for a separately published trunk.
+     * @param read Exact original residual read.
+     * @param injection Policy for the original independent four-logit projection.
+     * @return Cold region declarations with all opted-in stage identities.
+     */
+    static Qwen4ExpFullNativeHCRegion describeFullNativeReadRegion(
+        ComputeGraph& graph,const std::string& previous_write,const std::string& read,
+        Qwen4ExpHCInjectionOwnership injection);
+    /** @return Original preparation-only root preserving the exact source/row/workspace leases. */
     static std::shared_ptr<Qwen4ExpHCReadPhaseOwner> retainFullNativeReadPhase(
         ComputeGraph& graph,const Qwen4ExpFullNativeHCRegion& region);
+    /** @brief Retain the original read and its explicit distinct trunk publication authority. */
+    static std::shared_ptr<Qwen4ExpHCReadPhaseOwner> retainFullNativeReadPhase(
+        ComputeGraph& graph,const Qwen4ExpFullNativeHCRegion& region,Qwen4ExpHCTrunkSource source);
 
     /** @brief Append a final read-only mixer; no write capability is created.
      * @param graph Existing participant-local graph.

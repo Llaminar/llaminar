@@ -419,15 +419,21 @@ namespace llaminar2
         virtual std::string addModelLayerInput(ComputeGraph &graph,const ForwardInput &input,
             int layer,DeviceId device,const std::string &dependency,ModelInvocationPrefix &prefix);
 
+        /** @brief Original participant and producer frontiers for a newly merged layer. */
+        struct LayerComposition
+        {
+            int layer; ///< Absolute model layer that owns both fragments.
+            DeviceId device; ///< Execution participant chosen for this layer.
+            const std::string &input_boundary; ///< Preceding producer, empty at graph entry.
+            const std::string &attention_terminal; ///< Original attention-to-FFN join.
+        };
+
         /**
          * @brief Apply model-owned lowering after one attention/FFN layer composition.
-         * @param graph Cold participant-local graph containing both complete fragments.
-         * @param internalBoundary Original attention terminal, before the newly merged FFN.
-         * @details The default preserves the composed graph. Overrides declare
-         * reusable builder transformations; they never execute or own live state.
+         * @param graph Participant DAG containing both original fragments.
+         * @param composition Layer and producer frontiers used to merge this invocation.
          */
-        virtual void postLayerComposition(ComputeGraph &graph,const std::string &internalBoundary)
-        { (void)graph; (void)internalBoundary; }
+        virtual void postLayerComposition(ComputeGraph &, const LayerComposition &) {}
 
         /**
          * @brief Retain immutable input bindings only during declarative graph construction.

@@ -1853,7 +1853,7 @@ namespace llaminar2
         // Merge: attention -> FFN
         std::string attn_last = attn_graph.terminalNode();
         attn_graph.merge(std::move(ffn_graph), attn_last);
-        postLayerComposition(attn_graph,attn_last);
+        postLayerComposition(attn_graph, {ctx.layer_idx, ctx.device, {}, attn_last});
 
         return attn_graph;
     }
@@ -2425,7 +2425,7 @@ namespace llaminar2
 
             // Merge FFN graph, connecting to attention terminal
             graph.merge(std::move(ffn_graph), attn_last);
-            postLayerComposition(graph,attn_last);
+            postLayerComposition(graph, {layer, device, prev_node, attn_last});
 
             // Use the determined FFN terminal as the prev node for next layer
             prev_node = ffn_last;
@@ -2790,7 +2790,7 @@ namespace llaminar2
 
             // Merge FFN graph, connecting to attention terminal
             graph.merge(std::move(ffn_graph), attn_last);
-            postLayerComposition(graph,attn_last);
+            postLayerComposition(graph, {layer, device, prev_node, attn_last});
 
             // Use the determined FFN terminal as the prev node for next layer
             prev_node = ffn_last;
@@ -3142,7 +3142,7 @@ namespace llaminar2
 
                 // Merge FFN graph
                 graph.merge(std::move(ffn_graph), attn_last);
-                postLayerComposition(graph,attn_last);
+                postLayerComposition(graph, {layer, stage_device, prev_node, attn_last});
 
                 prev_node = ffn_last;
             }

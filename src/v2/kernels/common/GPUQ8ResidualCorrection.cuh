@@ -34,6 +34,8 @@
 #include "kernels/rocm/common/ROCmSignedDot4.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "utils/DebugEnv.h"
 #include "kernels/rocm/ops/ROCmSwiGLUDecodeEquivalentMath.h"
 #define Q8R_STREAM hipStream_t
 #define Q8R_FACTORY rocmQ8ResidualCorrectedProjection
@@ -180,6 +182,71 @@ template<int Rows>__global__ __launch_bounds__(128,2) void project(GPUQ8Residual
  for(int r=0;r<Rows;++r)if(rowBase+r<static_cast<unsigned>(live))
   a.output[(rowBase+r)*a.weights.n+column]=device_fp32_contract::add(primary[r],residual[r]);
 }
+#if !defined(Q8_RESIDUAL_CUDA)
+/** @brief Each lane computes both native Q8 terms for one K32 and multiple actual rows. */
+__global__ __launch_bounds__(320) void projectHCGroupedShortK(GPUQ8ResidualCorrectionArgs a)
+{
+    constexpr unsigned Groups=10, Rows=4, Columns=32, OutputWidth=10240;
+    __shared__ float primary[Rows][Groups][Columns],residual[Rows][Groups][Columns];
+    const unsigned kBlock=threadIdx.x/Columns, ci=threadIdx.x%Columns;
+    const unsigned column=blockIdx.x*Columns+ci;
+    const unsigned rowBase=blockIdx.y*Rows;
+    const unsigned live=a.rows.activeRows();
+    if(rowBase>=live)return;
+    const unsigned active=live-rowBase<Rows?live-rowBase:Rows;
+    const auto location=kBlock*OutputWidth+column;
+    const auto* payload=reinterpret_cast<const int4*>(a.weights.payload+location*32u);
+    const int4 low=payload[0],high=payload[1];
+    const int words[8]{low.x,low.y,low.z,low.w,high.x,high.y,high.z,high.w};
+    const auto scale=__half2float(__ushort_as_half(static_cast<const unsigned short*>(a.weights.scales)[location]));
+#pragma unroll
+    for(unsigned r=0;r<Rows;++r) {
+        if(r>=active)break;
+        const unsigned activation=(rowBase+r)*Groups+kBlock;
+        const auto* a0=reinterpret_cast<const int*>(a.primary+activation*32);
+        const auto* a1=reinterpret_cast<const int*>(a.residual+activation*32);
+        int dot0=0,dot1=0;
+#pragma unroll
+        for(unsigned word=0;word<8;++word) {
+            dot0=hc_short_k_native::dot4(a0[word],words[word],dot0);
+            dot1=hc_short_k_native::dot4(a1[word],words[word],dot1);
+        }
+        primary[r][kBlock][ci]=device_native_quantised_contract::singleScaleBlock(dot0,scale,a.primaryScales[activation]);
+        residual[r][kBlock][ci]=device_native_quantised_contract::singleScaleBlock(dot1,scale,a.residualScales[activation]);
+    }
+    __syncthreads();
+
+    // Each of the live row groups has its own fold wave. Original +0/K32
+    // additions stay in ascending order and the two banks combine only once.
+    if(kBlock<active) {
+        float sum0=0.f,sum1=0.f;
+#pragma unroll
+        for(unsigned group=0;group<Groups;++group) {
+            sum0=device_fp32_contract::add(sum0,primary[kBlock][group][ci]);
+            sum1=device_fp32_contract::add(sum1,residual[kBlock][group][ci]);
+        }
+        a.output[(rowBase+kBlock)*OutputWidth+column]=device_fp32_contract::add(sum0,sum1);
+    }
+}
+
+/** @brief Admit only the observed physical roster and original grouped Q8 HC-up tuple. */
+inline bool useHCGroupedShortK(const GPUQ8ResidualCorrectionArgs& a)
+{
+    const auto physical=a.rows.physicalRows();
+    if(physical<2||physical>8||a.weights.n!=10240||a.weights.k!=320||
+       a.weights.blocks_per_row!=10||a.weights.codebook_id!=19||!a.weights.source_identity_present||
+       a.weights.source_codebook_id!=19||a.weights.source_is_superblock||
+       !qfnGroupedHCUpShortKExperiment())
+        return false;
+    int ordinal=-1;
+    if(const auto error=hipGetDevice(&ordinal);error!=hipSuccess)
+        throw std::runtime_error(hipGetErrorString(error));
+    const auto& metadata=rocmHardwareMetadata().at(ordinal);
+    return metadata.compute_units==60&&metadata.native_wave_width==64&&
+        (metadata.isa_target=="gfx906"||metadata.isa_target.starts_with("gfx906:"));
+}
+#endif
+
 /** @brief Shared original signed-Q8 block arithmetic for one unchanged output owner.
  * @param a Exact native matrix, published activation banks and scales.
  * @param group Original K32 contribution index.
@@ -577,6 +644,11 @@ static void submitQ8ResidualProjection(const GPUQ8ResidualCorrectionArgs &a, voi
         a.rows.physicalRows(), a.weights.n, a.weights.k, a.weights.codebook_id);
     if (shortGeometry && a.weights.blocks_per_row != static_cast<unsigned>(shortGeometry->groups))
         throw std::invalid_argument("Ordered short-K source groups differ from retained geometry");
+#if !defined(Q8_RESIDUAL_CUDA)
+    bool groupedHCShortK=false;
+    if constexpr (!SingleGroupReference && std::is_same_v<Publication,GPUHCResidualDownPublication>)
+        groupedHCShortK=Q8R_NAMESPACE::useHCGroupedShortK(a);
+#endif
     const auto grid = shortGeometry ? shortGeometry->blocks : geometry.blocks;
     if ((tasks + 7) / 8 > INT_MAX || grid > INT_MAX)
         throw std::invalid_argument("Two-term GPU Q8 retained launch grid exceeds native capacity");
@@ -598,6 +670,12 @@ static void submitQ8ResidualProjection(const GPUQ8ResidualCorrectionArgs &a, voi
         Q8R_NAMESPACE::projectGrouped<1><<<static_cast<unsigned>(grid),geometry.threads,0,native>>>(a);
 #endif
     }
+#if !defined(Q8_RESIDUAL_CUDA)
+    else if(groupedHCShortK)
+    {
+        Q8R_NAMESPACE::projectHCGroupedShortK<<<dim3(320,(a.rows.physicalRows()+3)/4),320,0,native>>>(a);
+    }
+#endif
     else if (shortGeometry)
         Q8R_NAMESPACE::launchOrderedShortK(a, *shortGeometry, native);
     else visitQ8ResidualNativeCodebook(a.weights.codebook_id, [&]<std::uint8_t C>() {
@@ -633,6 +711,11 @@ static void submitQ8ResidualProjection(const GPUQ8ResidualCorrectionArgs &a, voi
     // This is accepted host submission/capture evidence only. Retained native
     // replay does not revisit this factory or increment this counter. No live
     // count, device ordinal or compiler resource query is performed here.
+#if !defined(Q8_RESIDUAL_CUDA)
+    if (groupedHCShortK && PerfStatsCollector::isDomainEnabled("kernel"))
+        PerfStatsCollector::addCounter("kernel","q8_residual_grouped_hc_short_k_submissions",
+            1.0,"submission",{},{{"physical_rows",std::to_string(a.rows.physicalRows())}});
+#endif
     if (shortGeometry && PerfStatsCollector::isDomainEnabled("kernel"))
     {
 #if defined(Q8_RESIDUAL_CUDA)
