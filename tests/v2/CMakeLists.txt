@@ -38794,13 +38794,13 @@ foreach(_peer_reset_backend IN ITEMS CUDA ROCm)
                 --gtest_filter=Test__ExpertTierGpuPeerTransfer${_peer_reset_backend}.RepeatedPreparationPreservesCapturedAuxiliaryReset
                 --gtest_brief=1
             LABELS "V2;Integration;ProductionTestPreflight;${_peer_reset_backend};${_peer_reset_backend}2;MoE;GPUTransfer;GraphCapture;Lifecycle;ByteExact;Regression"
-            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+            GPU_DEVICES 2 MPI_PROCS 1 NO_MODELS TIMEOUT 30)
         add_v2_test(V2_Integration_PeerPreparationErrorPreservation_${_peer_reset_backend}
             COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
                 --gtest_filter=Test__ExpertTierGpuPeerTransfer${_peer_reset_backend}.PreparationPreservesUnrelatedPreexistingError
                 --gtest_brief=1
             LABELS "V2;Integration;ProductionTestPreflight;${_peer_reset_backend};${_peer_reset_backend}2;MoE;GPUTransfer;Lifecycle;ErrorState;Regression"
-            MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+            GPU_DEVICES 2 MPI_PROCS 1 NO_MODELS TIMEOUT 30)
         if(TEST V2_Integration_PeerPreparationResetLifecycle_${_peer_reset_backend})
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
                 V2_Integration_PeerPreparationResetLifecycle_${_peer_reset_backend}

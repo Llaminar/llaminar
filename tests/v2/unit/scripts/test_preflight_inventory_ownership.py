@@ -201,6 +201,21 @@ class PreflightInventoryOwnershipTests(unittest.TestCase):
                 self.assertIn("--gtest_filter=NativeSharedHost/RCCLHostTransportStorageTest."
                               f"NativePinnedOwnershipSurvivesCapturedReplay/Clique{width}*", row["command"])
 
+    def test_native_peer_preparation_and_foreign_finite_storage_require_two_originals(self) -> None:
+        """The rejection constructs the foreign graph, even when its attachment must fail."""
+        tests = {row["name"]: row for row in self.document["tests"]}
+        for family in ("CUDA", "ROCm"):
+            if family.lower() not in BACKENDS:
+                continue
+            for name in (f"PeerPreparationResetLifecycle_{family}", f"PeerPreparationErrorPreservation_{family}",
+                         f"{family}_FiniteStorage_RejectsOriginalForeignDevice", f"{family}_FiniteStorage_Live0"):
+                row = tests[f"V2_Integration_{name}"]
+                labels = next(prop["value"] for prop in row["properties"] if prop["name"] == "LABELS")
+                if name.endswith("Live0"):
+                    self.assertNotIn("HardwareOptional", labels)
+                else:
+                    self.assertTrue({family, "Devices2", "LocalHostDevices", "HardwareOptional"} <= set(labels))
+
     def test_every_filter_retains_complete_process_ownership(self) -> None:
         """CUDA, ROCm and performance filters inherit their executable's scope."""
         self.assertTrue(validate_inventory(self.document, BACKENDS))
