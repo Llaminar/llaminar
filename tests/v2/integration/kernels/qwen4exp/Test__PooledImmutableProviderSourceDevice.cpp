@@ -282,10 +282,23 @@ TEST(PooledImmutableProviderSourceDevice,NoPeerCapturedROCmConsumerROCmStoragePo
 TEST(PooledImmutableProviderSourceDevice,CrossVendorCUDAConsumerROCmStorageColdPrefillFirstError){crossVendorColdPrefillLifecycle(DeviceId::cuda(0),DeviceId::rocm(0));}
 /** @test Symmetric actual ROCm source/CUDA owner first-error lifecycle. */
 TEST(PooledImmutableProviderSourceDevice,CrossVendorROCmConsumerCUDAStorageColdPrefillFirstError){crossVendorColdPrefillLifecycle(DeviceId::rocm(0),DeviceId::cuda(0));}
-TEST(PooledImmutableProviderSourceDevice,CrossVendorCapturedCUDAConsumerROCmStorageC0ReadAllFormats){crossVendorReadFormats(DeviceId::cuda(0),DeviceId::rocm(0),0);}
-TEST(PooledImmutableProviderSourceDevice,CrossVendorCapturedCUDAConsumerROCmStoragePositiveReadAllFormats){crossVendorReadFormats(DeviceId::cuda(0),DeviceId::rocm(0),3);}
-TEST(PooledImmutableProviderSourceDevice,CrossVendorCapturedROCmConsumerCUDAStorageC0ReadAllFormats){crossVendorReadFormats(DeviceId::rocm(0),DeviceId::cuda(0),0);}
-TEST(PooledImmutableProviderSourceDevice,CrossVendorCapturedROCmConsumerCUDAStoragePositiveReadAllFormats){crossVendorReadFormats(DeviceId::rocm(0),DeviceId::cuda(0),3);}
+/** @brief Each process admits and retires the original graph population for its format group. */
+class CrossVendorCapturedReadFormats : public ::testing::TestWithParam<unsigned> {};
+
+TEST_P(CrossVendorCapturedReadFormats, CUDAConsumerROCmStorageC0) {
+    crossVendorReadFormats(DeviceId::cuda(0), DeviceId::rocm(0), 0, GetParam());
+}
+TEST_P(CrossVendorCapturedReadFormats, CUDAConsumerROCmStoragePositive) {
+    crossVendorReadFormats(DeviceId::cuda(0), DeviceId::rocm(0), 3, GetParam());
+}
+TEST_P(CrossVendorCapturedReadFormats, ROCmConsumerCUDAStorageC0) {
+    crossVendorReadFormats(DeviceId::rocm(0), DeviceId::cuda(0), 0, GetParam());
+}
+TEST_P(CrossVendorCapturedReadFormats, ROCmConsumerCUDAStoragePositive) {
+    crossVendorReadFormats(DeviceId::rocm(0), DeviceId::cuda(0), 3, GetParam());
+}
+INSTANTIATE_TEST_SUITE_P(FormatGroups, CrossVendorCapturedReadFormats,
+                         ::testing::Range(0u, kCrossVendorFormatGroups));
 /** @test Actual CUDA Pin live identity threshold 63, retained capture/reset and exact owner evidence. */
 TEST(PooledImmutableProviderSourceDevice,ExactIdentityCUDAPin63){exactIdentityNativeBoundary(DeviceId::cuda(0),63,ExactIdentityBoundaryTrace::Pin);}
 /** @test Actual CUDA Pin live identity threshold 64, retained capture/reset and exact owner evidence. */

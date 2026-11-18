@@ -6,15 +6,17 @@
 if(HAVE_CUDA AND HAVE_ROCM)
     foreach(_pooled_read_direction CUDAConsumerROCmStorage ROCmConsumerCUDAStorage)
         foreach(_pooled_read_capacity C0 Positive)
-            set(_pooled_read_test "V2_Integration_CrossVendor_PooledImmutable_${_pooled_read_direction}_${_pooled_read_capacity}_ReadAllFormatsReplay")
-            add_v2_test(${_pooled_read_test}
-                COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
-                    --gtest_filter=PooledImmutableProviderSourceDevice.CrossVendorCaptured${_pooled_read_direction}${_pooled_read_capacity}ReadAllFormats
-                LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;CrossVendor;Ngram;Source;Ownership;TraceReplay;Capture;Component;AllFormats;ByteExact;Regression"
-                CUDA_DEVICES 1 ROCM_DEVICES 1
-                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "cuda_gpu_0;rocm_gpu_0"
-                ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=0")
-            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_pooled_read_test})
+            foreach(_group RANGE 0 5)
+                set(_pooled_read_test "V2_Integration_CrossVendor_PooledImmutable_${_pooled_read_direction}_${_pooled_read_capacity}_ReadAllFormatsReplay_Group${_group}")
+                add_v2_test(${_pooled_read_test}
+                    COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                        --gtest_filter=FormatGroups/CrossVendorCapturedReadFormats.${_pooled_read_direction}${_pooled_read_capacity}/${_group}
+                    LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;CrossVendor;Ngram;Source;Ownership;TraceReplay;Capture;Component;AllFormats;ByteExact;Regression"
+                    CUDA_DEVICES 1 ROCM_DEVICES 1
+                    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "cuda_gpu_0;rocm_gpu_0"
+                    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=0")
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_pooled_read_test})
+            endforeach()
         endforeach()
     endforeach()
 endif()

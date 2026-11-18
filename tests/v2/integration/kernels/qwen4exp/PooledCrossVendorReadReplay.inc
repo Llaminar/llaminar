@@ -521,27 +521,42 @@ void CrossVendorReadReplay::build(){
     });join();
     requireProvider(!boundary_->hasActiveInterval(),"Cold reset invented an active service interval");
 }
+// Each format retains three source graph executables and one owner executable
+// until process exit. Distribute independent original sources across processes
+// so an all-format sweep does not require all of their host reservations at once.
+constexpr unsigned kCrossVendorFormatGroups = 6;
+
 /**
- * @brief One explicit capacity shard retains every original format and source/read/reset oracle.
+ * @brief Replay complete original format trajectories at one explicit cache capacity.
  * @param sourceDevice Actual original continuation endpoint.
  * @param ownerDevice Actual opposite-vendor storage-only endpoint.
  * @param selectedSlots Explicit C0 or positive3 geometry; each native registration keeps its30s deadline.
- * @details Capacity shards divide independent cases, never a transaction, format or replay trajectory.
+ * @param group Optional process group in the complete canonical format sweep.
+ * @details Each selected format keeps every transaction, reset and retirement in one native process.
  */
-void crossVendorReadFormats(DeviceId sourceDevice,DeviceId ownerDevice,std::uint32_t selectedSlots){
+void crossVendorReadFormats(DeviceId sourceDevice,DeviceId ownerDevice,std::uint32_t selectedSlots,
+                            std::optional<unsigned> group = std::nullopt){
     requireProvider(selectedSlots==0 || selectedSlots==3,"All-format reader requires explicit C0 or positive geometry");
+    requireProvider(!group || *group < kCrossVendorFormatGroups, "Unknown cross-vendor format group");
+    const auto inGroup = [&](std::size_t index) { return !group || index % kCrossVendorFormatGroups == *group; };
     if(!hasCPUBackend())initCPUBackend(-1);
     std::vector<CrossVendorReadReplaySpec> cases;std::size_t supported=0,unsupported=0;
     for(const auto& format:embeddingVerifierFormats()){
         const std::size_t columns=format.prepared_native_quantized?768:257;auto original=format.create({97,columns},1701);const auto gguf=providerFormat(original->native_type());
         if(!gguf){requireProvider(original->native_type()==TensorType::Q8_1,"Original source format disappeared from cross-vendor coverage");++unsupported;continue;}
-        ++supported;auto file=std::make_shared<ProviderFile>(*original,*gguf,columns);cases.push_back({file,selectedSlots});
+        if (inGroup(supported))
+            cases.push_back({std::make_shared<ProviderFile>(*original,*gguf,columns),selectedSlots});
+        ++supported;
     }
-    const auto sparse=std::make_shared<ProviderFile>();
-    EXPECT_NE(std::memcmp(sparse->original(7).data(),sparse->original(ProviderFile::High).data(),sparse->row_bytes),0);
-    const auto sparseBegin=cases.size();cases.push_back({sparse,selectedSlots});
+    const std::size_t selectedFormats = cases.size();
+    const bool includeSparse = inGroup(supported);
+    if (includeSparse) {
+        const auto sparse=std::make_shared<ProviderFile>();
+        EXPECT_NE(std::memcmp(sparse->original(7).data(),sparse->original(ProviderFile::High).data(),sparse->row_bytes),0);
+        cases.push_back({sparse,selectedSlots});
+    }
     CrossVendorReadReplayPrograms programs(std::move(cases));programs.prepare(sourceDevice,ownerDevice);
-    for(std::size_t index=0;index<supported;++index){const auto slots=programs.program(index).spec.slots;
+    for(std::size_t index=0;index<selectedFormats;++index){const auto slots=programs.program(index).spec.slots;
         programs.run(index,[&](CrossVendorReadReplay& replay){
             std::vector<std::uint64_t> warm(16,1),large(64,1),fullHits(64,1),small(16,2);for(std::size_t i=0;i<warm.size();++i)if(i%2)warm[i]=2;
             for(std::size_t i=0;i<large.size();++i)large[i]=1+i%5;for(std::size_t i=0;i<fullHits.size();++i)fullHits[i]=1+i%3;
@@ -550,7 +565,7 @@ void crossVendorReadFormats(DeviceId sourceDevice,DeviceId ownerDevice,std::uint
     }
     // Sparse high-row storage is part of the same predeclared native/PMA
     // population, not a second source adopted after process-retained graphs.
-    for(std::size_t index=sparseBegin;index<sparseBegin+1;++index){const auto slots=programs.program(index).spec.slots;programs.run(index,[&](CrossVendorReadReplay& replay){
+    if(includeSparse){const auto slots=programs.program(selectedFormats).spec.slots;programs.run(selectedFormats,[&](CrossVendorReadReplay& replay){
         std::vector<std::uint64_t> warm(16,7),large(64,7),full(64,7),small(16,ProviderFile::High);
         const std::array<std::uint64_t,5> rows{7,ProviderFile::High,700,701,900};for(std::size_t i=0;i<warm.size();++i)if(i%2)warm[i]=ProviderFile::High;
         for(std::size_t i=0;i<large.size();++i)large[i]=rows[i%rows.size()];for(std::size_t i=0;i<full.size();++i)full[i]=rows[i%3];
