@@ -1744,6 +1744,15 @@ namespace
 
 }
 
+namespace llaminar2::rocm::grouped_ffn
+{
+/** @copydoc prepareFormatTables */
+bool prepareFormatTables(const WeightFormats& formats,int device)
+{
+    return !groupedPrefillMaskNeedsIQTables(formats.executionMask()) || ensureIQGridTablesInitialized(device);
+}
+}
+
 namespace llaminar2
 {
 
@@ -12305,7 +12314,7 @@ namespace llaminar2
     {
         namespace geometry=rocm::grouped_ffn;
         return executeGroupedRuntimeProjection(runtime,host,hidden,nullptr,gate_id,down_id,
-            geometry::capacity,geometry::hidden,geometry::routedColumns(publication.routedGeometry),geometry::experts,geometry::topK,
+            geometry::capacity,geometry::hidden,geometry::routedColumns(publication.program),geometry::experts,geometry::topK,
             MoEPrefillProjectionExecution::intermediateShard(geometry::hidden),route_partials,&publication);
     }
 
@@ -12582,16 +12591,17 @@ namespace llaminar2
             canReuseRouterQ8Hidden(d_hidden, seq_len, d_model);
         if(frontier) {
             namespace program=rocm::grouped_ffn;
-            const auto gate_mask=1u<<program::routedGateCodebook(frontier->routedDecoder);
-            const auto down_mask=1u<<program::routedDownCodebook(frontier->routedDecoder);
+            const auto [gate_format,down_format]=program::routedFormats(frontier->program);
             if(!reuse_router_q8_hidden || owner_admission || !execution.isIntermediateShard() ||
-               gateup_table.codebook_mask!=gate_mask || gateup_table.policy_codebook_mask!=gate_mask ||
-               down_table.codebook_mask!=down_mask || down_table.policy_codebook_mask!=down_mask ||
+               gateup_table.codebook_mask!=gate_format.execution_codebook_mask ||
+               gateup_table.policy_codebook_mask!=gate_format.policy_codebook_mask ||
+               down_table.codebook_mask!=down_format.execution_codebook_mask ||
+               down_table.policy_codebook_mask!=down_format.policy_codebook_mask ||
                frontier->rows.physicalRows()!=seq_len || !frontier->rows.countOwner() ||
                !workspace_ || !d_prefill_A_int8_ || !d_prefill_A_scales_ ||
                d_prefill_A_int8_==d_router_q8_hidden_ || d_prefill_A_scales_==d_router_q8_hidden_scales_ ||
                workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_SHARED_GATE)<program::sharedGateBytes)
-                throw std::logic_error("Retained grouped FFN requires the original Q8 router bank and admitted routed/S160 plan");
+                throw std::logic_error("Retained grouped FFN requires the original Q8 router bank and sealed routed/shared format declarations");
             if(!requireTensorOnDevice(frontier->sharedInputGate,device,stream,"shared input gate","grouped FFN frontier"))
                 return false;
             const std::array outputs{frontier->sharedGateScratch,frontier->sharedUpScratch,frontier->routedOutput,
@@ -12623,18 +12633,29 @@ namespace llaminar2
                     reinterpret_cast<std::uint64_t*>(d_prefill_work_directory_)};
                 if(router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumerWithExactK32Sums) {
                     const auto* raw=workspace_->getBuffer(MoEWorkspaceBuffers::PREFILL_A_INT8);
-                    if(frontier->routedGeometry!=program::RoutedGeometry::F160 ||
-                       !program::supportsExactK32Sums(frontier->routedDecoder) || raw!=d_prefill_A_int8_ ||
+                    if(!program::usesExactK32Sums(frontier->program) || raw!=d_prefill_A_int8_ ||
                        workspace_->getBufferSize(MoEWorkspaceBuffers::PREFILL_A_INT8)<program::k32SumWorkspaceBytes)
                         throw std::logic_error("Exact K32 sum consumer lost the original router workspace");
                     direct.affineSums=program::exactK32Sums(d_prefill_A_int8_);
                 }
             }
-            if(!program::launch(plan,frontier->sharedWeights,publication,device_ordinal_,stream,direct,frontier->routedGeometry,frontier->routedDecoder))return false;
+            const auto* formats=std::get_if<program::SourceFormatProgram>(&frontier->program);
+            if(formats) {
+                if(!program::launchFormatProgram(plan,frontier->sharedWeights,publication,device_ordinal_,stream,
+                        direct,*formats))
+                    return false;
+            } else {
+                const auto& measured=std::get<program::MeasuredProgram>(frontier->program);
+                if(!program::launch(plan,frontier->sharedWeights,publication,device_ordinal_,stream,direct,
+                        measured.geometry,measured.decoder))
+                    return false;
+            }
             markDeviceWritten(publication_output,device,stream);
             for(auto* result:outputs)markDeviceWritten(result,device,stream);
             PerfStatsCollector::addCounter("kernel","rocm_grouped_ffn_frontier_calls",1.0,"moe",device.toString(),
-                {{"physical_rows","4"},{"routed_width",std::to_string(intermediate)},{"shared_width","160"}});
+                {{"physical_rows",std::to_string(seq_len)},{"routed_width",std::to_string(intermediate)},
+                 {"shared_width",std::to_string(program::sharedColumns(frontier->program))},
+                 {"program",formats?"all_formats":"fixed"},{"decoder_family",formats?std::to_string(formats->family()):"1"}});
             return true;
         }
         const bool ok = execution.overwriteOutputThenPublish(

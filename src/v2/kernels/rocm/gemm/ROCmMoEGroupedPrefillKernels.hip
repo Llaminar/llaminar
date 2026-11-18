@@ -45,6 +45,7 @@
  */
 
 #include "kernels/rocm/common/ROCmSignedDot4.h"
+#include <bit>
 #include <hip/hip_runtime.h>
 #include "kernels/common/MoEGroupedDirectory.h"
 #include <hip/hip_fp16.h>

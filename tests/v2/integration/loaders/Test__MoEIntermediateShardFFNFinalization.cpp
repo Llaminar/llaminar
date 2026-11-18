@@ -74,6 +74,7 @@
 #include "execution/moe/MoERuntimeTable.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "kernels/rocm/gemm/ROCmGroupedFFNFrontier.h"
+#include "utils/PerfStatsCollector.h"
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEOverlayParticipantResidency.h"
@@ -135,9 +136,12 @@ namespace
 {
 constexpr int kH = 256, kRoutedF = 1024, kSharedF = 256, kExperts = 8, kTopK = 2, kMaxRows = 129;
 /** @brief Original source router recipe; shared by unchanged staged and candidate graphs. */
-enum class OriginalFFNRouterSource { TieControl,Dense };
+enum class OriginalFFNRouterSource { TieControl, Dense, SparseSharedRoutes };
 /** @brief Optional exact source/topology assertion; never overrides production slicing. */
 enum class OriginalFFNGeometryContract { SourceDerived,QFNTensorSharded,QFNSingletonShardShape };
+/** @brief Independently expected graph program for the grouped source replay. */
+enum class GroupedM4FixtureProgram { AllFormats, Fixed };
+
 /** @brief Immutable original-source dimensions passed through admission, preparation and actual worker capture. */
 struct OriginalFFNFixtureGeometry {
     int hidden=kH; ///< Model/source H; original default fixture remains unchanged.
@@ -147,6 +151,11 @@ struct OriginalFFNFixtureGeometry {
     int top_k=kTopK; ///< Original metadata-selected route extent, never a prepared override.
     OriginalFFNRouterSource router_source=OriginalFFNRouterSource::TieControl; ///< Original raw source bytes, not a routing override.
     OriginalFFNGeometryContract contract=OriginalFFNGeometryContract::SourceDerived; ///< Assert an exact admitted source geometry.
+    std::string_view grouped_matrix_case{}; ///< Nonempty selects the isolated M4 source-catalog fixture.
+    std::string_view grouped_matrix_symbol{}; ///< Expected selected production candidate symbol, when armed.
+    GroupedM4FixtureProgram grouped_matrix_program=GroupedM4FixtureProgram::AllFormats; ///< Exact capture program family.
+    bool grouped_matrix_symbol_present=true; ///< Whether the selected production symbol must be present.
+    bool grouped_matrix_timing=false; ///< Measure the captured M4 parent after byte replay.
     bool deferred_frontier_history=false; ///< Exercise the original accepted-prefix commit with the two-node publication.
     std::size_t frontier_sum_test_extent=0; ///< One deliberately undersized original input lease.
     std::size_t frontier_directory_test_extent=0; ///< Nonzero installs one intentionally invalid cold quote.
@@ -166,7 +175,7 @@ void require(bool valid, const std::string &operation)
 enum class CastagnaPhaseObservation { Disabled, PerCTA };
 
 /** @brief Keep source-only recipe checks independent from native FFN arithmetic. */
-enum class OriginalSourceQualification { FFNFinalization, HostAuthorityRecipes, PreparedService, ResidentFFN, ResidentFFNEconomy, GateUpLastProducer, GateUpPairedK32, DownLastProducer, OriginalM1HiddenQ8, NativeLayoutRouterFFN, NativeLayoutRouterFFNParentReplay, NativeLayoutRouterFFNEconomy,CastagnaFullRegionAB,CastagnaFullRegionABEconomy,CastagnaFullRegionABReal,CastagnaFullRegionABRealEconomy,CastagnaFullRegionABBounded,CastagnaFullRegionABBoundedEconomy, FullNativeHCFFNFinal, FullNativeHCFFNMiddle, GroupedQ8DownReplay, GroupedFFNFrontierReplay };
+enum class OriginalSourceQualification { FFNFinalization, HostAuthorityRecipes, PreparedService, ResidentFFN, ResidentFFNEconomy, GateUpLastProducer, GateUpPairedK32, DownLastProducer, OriginalM1HiddenQ8, NativeLayoutRouterFFN, NativeLayoutRouterFFNParentReplay, NativeLayoutRouterFFNEconomy,CastagnaFullRegionAB,CastagnaFullRegionABEconomy,CastagnaFullRegionABReal,CastagnaFullRegionABRealEconomy,CastagnaFullRegionABBounded,CastagnaFullRegionABBoundedEconomy, FullNativeHCFFNFinal, FullNativeHCFFNMiddle, GroupedQ8DownReplay, GroupedFFNFrontierReplay, GroupedFFNSourceMatrix };
 /** @brief Explicit test-only full production graph lowering; default preserves every R57 arm. */
 enum class FullProductionHCProbe { Disabled, FinalRead, MiddleRead };
 /** @brief Cold observer/read demand; every mode uses the actual production full entry. */
@@ -342,8 +351,19 @@ void writeOriginalSources(PlanningGGUFFixture &file, const SourceFormat &format,
         else if (role == 4)
         {
             std::fill(source.begin(), source.end(), 0.f);
-            for (int expert = 0; expert < kExperts; ++expert)
-                source[std::size_t(expert) * kH] = expert == 0 ? 2.f : expert == 1 ? 1.f : -1.f;
+            if (shape.router_source==OriginalFFNRouterSource::SparseSharedRoutes) {
+                require(kExperts>=25 && shape.top_k==10 && kH>4,"Sparse route source geometry");
+                // Five experts participate in every row. Four additional
+                // groups cover five disjoint experts per row via independent
+                // hidden features. The ordinary router still computes all scores.
+                for (int expert=0;expert<5;++expert)
+                    source[std::size_t(expert)*kH]=2.f+float(expert)/16.f;
+                for (int expert=5;expert<25;++expert)
+                    source[std::size_t(expert)*kH+1+(expert-5)/5]=4.f+float(expert%5)/16.f;
+            } else {
+                for (int expert = 0; expert < kExperts; ++expert)
+                    source[std::size_t(expert) * kH] = expert == 0 ? 2.f : expert == 1 ? 1.f : -1.f;
+            }
         }
         file.writePayload(kSharedNames[role], 0, {reinterpret_cast<const uint8_t *>(source.data()), source.size() * sizeof(float)});
     }
@@ -770,9 +790,13 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
         finish.final_sum.sidebands.push_back({.kind = LocalTPCollectiveSidebandKind::AllreduceSum,
             .recv_buffer = lane->sideband->gpu_data_ptr(), .element_count = 1, .dtype = CollectiveDataType::INT32,
             .name = "original_ffn_fixture_sideband"});
-    const bool expectFrontier=grouped && rows==4 && kH==2560 && (shape.routed==128 || (shape.routed==160 && qfnGroupedFFNEqualFrontierOptIn() && qfnGroupedFFNDirectBankExperiment())) && shared_f==160 &&
+    // A source-matrix case declares the expected native symbol independently of the
+    // width. Two GGUF sources can share a decoder ID and require different graphs.
+    const bool expectFrontier=shape.grouped_matrix_symbol.empty() && grouped && rows==4 && kH==2560 && (shape.routed==128 || (shape.routed==160 && qfnGroupedFFNEqualFrontierOptIn() && qfnGroupedFFNDirectBankExperiment())) && shared_f==160 &&
         kExperts==512 && kTopK==10 && qfnGroupedFFNFrontierOptIn();
-    if(execution==MoEIntermediateShardFFNExecution::Staged && !expectFrontier)
+    const bool expectFormatProgram=grouped && rows==4 && !shape.grouped_matrix_symbol.empty() &&
+        shape.grouped_matrix_symbol_present;
+    if(execution==MoEIntermediateShardFFNExecution::Staged && !expectFrontier && !expectFormatProgram)
     {
         proveIntermediateShardFFNFinalizationDeclaration(lane->graph,routed,finish);
         require(lane->graph.size()==6,"exactly one router, two routed stages, shared FFN, gate-add and final sum");
@@ -1084,6 +1108,8 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                 require(rejected,"one-byte-under affine sums must fail before native recording");
                 std::cout << "EQUAL_WIDTH_K32_SUM_COLD_UNDERSIZED_REJECTED\n";
             }
+            if (!shape.grouped_matrix_case.empty())
+                PerfStatsCollector::reset();
             auto candidate = build(rows, true);
             if(require_frontier) {
                 std::vector<GPUGraphKernelNodeInfo> captured;
@@ -1107,12 +1133,99 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                 require(candidate->graph.size()==(expected?3u:6u),
                     "New publication must preserve router and explicit final TP sum");
             }
+            if (!shape.grouped_matrix_case.empty()) {
+                std::vector<GPUGraphKernelNodeInfo> nodes;
+                std::string error;
+                require(rows==4 && candidate->capture->inspectKernelNodes(nodes,&error),"Inspect the exact physical M4 parent");
+                std::size_t selected=0;
+                for (const auto& node:nodes) {
+                    if (!shape.grouped_matrix_symbol.empty() && node.name_resolved &&
+                        node.name.find(shape.grouped_matrix_symbol)!=std::string::npos)
+                        ++selected;
+                }
+                require(shape.grouped_matrix_symbol.empty() ||
+                    selected==static_cast<std::size_t>(shape.grouped_matrix_symbol_present),
+                    "Captured M4 graph does not match the independently selected experiment arm");
+                if (!shape.grouped_matrix_symbol.empty()) {
+                    const bool fixed_program=shape.grouped_matrix_program==GroupedM4FixtureProgram::Fixed;
+                    const std::string_view consumer=fixed_program?"groupedFFNTokenDown":"groupedFFNFormatProgramDown";
+                    const std::string_view program=fixed_program?"fixed":"all_formats";
+                    const auto down=std::count_if(nodes.begin(),nodes.end(),[&](const auto& node) {
+                        return node.name_resolved && node.name.find(consumer)!=std::string::npos;
+                    });
+                    require(static_cast<std::size_t>(down)==static_cast<std::size_t>(shape.grouped_matrix_symbol_present),
+                        "Grouped consumer must align with the expected native producer presence");
+                    std::vector<std::string> families;
+                    for (const auto& record:PerfStatsCollector::snapshot({"kernel.rocm_grouped_ffn_frontier_calls"})) {
+                        if (record.domain!="kernel" || record.name!="rocm_grouped_ffn_frontier_calls" ||
+                            !record.tags.contains("program") || record.tags.at("program")!=program)
+                            continue;
+                        require(record.device==device.toString() && record.count==1 && record.value==1 &&
+                            record.tags.at("physical_rows")=="4" &&
+                            record.tags.at("routed_width")==std::to_string(shape.routed) &&
+                            record.tags.at("shared_width")==std::to_string(shape.shared),
+                            "Grouped native program counted an incompatible launch or source");
+                        const auto& family=record.tags.at("decoder_family");
+                        require(!family.empty() && family.find_first_not_of("0123456789")==std::string::npos,
+                            "Grouped decoder family must be an exact compiled identity");
+                        families.push_back(family);
+                    }
+                    require(families.size()==static_cast<std::size_t>(shape.grouped_matrix_symbol_present),
+                        "Physical count and all-format counter must agree with the selected native graph");
+                    if (!families.empty()) std::osyncstream(std::cout)
+                        <<"M4_SOURCE_PROGRAM,case="<<shape.grouped_matrix_case<<",program="<<program
+                        <<",decoder_family="<<families.front()<<",F="<<shape.routed<<",S="<<shape.shared<<'\n';
+                }
+                const auto& runtime=candidate->runtime->hostLayerState(0);
+                const auto& prepared_bank=runtime.banks[runtime.active_bank];
+                const auto* routed=std::find_if(prepared_bank.experts,prepared_bank.experts+prepared_bank.expert_count,
+                    [](const auto& desc){
+                        return desc.projection_set==DeviceMoEProjectionSet::IntermediateShard &&
+                               desc.movableWeightsReady() && desc.down.valid();
+                    });
+                require(routed!=prepared_bank.experts+prepared_bank.expert_count,"Recorded M4 input has native routed descriptors");
+                std::array<ITensorGemm*,3> shared_engines{};
+                constexpr std::array shared_names{"ffn_gate_shexp.weight","ffn_up_shexp.weight","ffn_down_shexp.weight"};
+                for (std::size_t role=0;role<shared_engines.size();++role) {
+                    const auto* binding=shared.optionalLayerForDevice(0,shared_names[role],device);
+                    require(binding,"Recorded M4 input has an original shared source binding");
+                    const auto ref=store.preparedRefForBinding(binding->binding_id,device);
+                    require(ref.has_value(),"Recorded M4 input has a prepared shared source binding");
+                    shared_engines[role]=store.gemmKernel(*ref);
+                }
+                DeviceMoEExpertDescriptor shared_desc;
+                require(exportDeviceMoEExpertWeightDescriptors(shared_engines[0],shared_engines[1],shared_engines[2],
+                    hidden,shape.shared,shared_desc),"Recorded M4 input has native shared descriptors");
+                std::osyncstream receipt(std::cout);
+                receipt<<"M4_SOURCE_DESCRIPTORS,case="<<shape.grouped_matrix_case;
+                const auto report=[&](std::string_view role,const DeviceNativeQuantisedMatrixDesc& desc) {
+                    require(desc.valid() && desc.source_identity_present,"Recorded native descriptor has original source policy");
+                    receipt<<','<<role<<'='<<unsigned(desc.codebook_id)<<'/'<<unsigned(desc.source_codebook_id)
+                        <<'/'<<unsigned(desc.source_is_superblock)<<'/'<<desc.n<<'/'<<desc.k;
+                };
+                report("gate",routed->gate);
+                report("up",routed->up);
+                report("down",routed->down);
+                report("shared_gate",shared_desc.gate);
+                report("shared_up",shared_desc.up);
+                report("shared_down",shared_desc.down);
+                receipt<<'\n'; receipt.emit();
+                std::osyncstream(std::cout)<<"M4_SOURCE_CAPTURE,case="<<shape.grouped_matrix_case
+                    <<",demand="<<(shape.deferred_frontier_history?"deferred":"static")
+                    <<",m="<<rows<<",nodes="<<nodes.size()<<",selected="<<selected
+                    <<",required_symbol="<<shape.grouped_matrix_symbol<<'\n';
+            }
             std::vector<float> input(std::size_t(rows) * hidden), expected(input.size()), actual(input.size());
             for (int row = 0; row < rows; ++row)
             {
                 for (int column = 0; column < hidden; ++column)
                     input[std::size_t(row) * hidden + column] = column == 0 ? 1.f + float(row % 7) / 16.f
                         : float((row * 5 + column * 3) % 17 - 8) / 128.f;
+                if (shape.router_source==OriginalFFNRouterSource::SparseSharedRoutes) {
+                    auto* features=input.data()+std::size_t(row)*hidden;
+                    std::fill_n(features+1,4,0.f);
+                    features[1+row]=1.f;
+                }
                 const int live = 1, sideband = member + 1;
                 require(backend->hostToDeviceOnStream(serial->sideband->gpu_data_ptr(), &sideband, sizeof(sideband),
                     device.ordinal, stream), "reset original M1 collective sideband");
@@ -1205,6 +1318,33 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                             " replay=" + std::to_string(replay) + " element=" + std::to_string(element) +
                             " actual=" + std::to_string(actual[element]) + " serial=" + std::to_string(reference));
                 }
+                if(shape.router_source==OriginalFFNRouterSource::SparseSharedRoutes && replay==0) {
+                    std::vector<float> indices(static_cast<std::size_t>(rows)*shape.top_k);
+                    require(backend->deviceToHostOnStream(indices.data(),candidate->indices->gpu_data_ptr(),
+                        indices.size()*sizeof(float),device.ordinal,stream) &&
+                        worker.synchronizeStreamChecked(stream),"Observe real sparse original expert routes");
+                    std::array<int,25> uses{};
+                    for (const float id:indices) {
+                        require(id>=0.f && id<float(uses.size()) && id==std::trunc(id),"Original sparse route selected a valid expert");
+                        ++uses[static_cast<std::size_t>(id)];
+                    }
+                    require(live==4 && std::all_of(uses.begin(),uses.begin()+5,[](int n){return n==4;}) &&
+                        std::all_of(uses.begin()+5,uses.end(),[](int n){return n==1;}),
+                        "Original sparse route distribution must contain both reused and independent experts");
+                    std::osyncstream(std::cout)<<"M4_SOURCE_SPARSE_ROUTES,case="<<shape.grouped_matrix_case
+                        <<",rows=4,shared_experts=5,unique_experts=20,total_routes=40"<<'\n';
+                }
+                if(shape.grouped_matrix_case=="Q4_K_repeat_routes" && replay==0) {
+                    std::vector<float> indices(static_cast<std::size_t>(rows)*shape.top_k);
+                    require(backend->deviceToHostOnStream(indices.data(),candidate->indices->gpu_data_ptr(),
+                        indices.size()*sizeof(float),device.ordinal,stream) &&
+                        worker.synchronizeStreamChecked(stream),"Observe actual repeated expert routes");
+                    for(int row=1;row<live;++row)
+                        require(std::equal(indices.begin(),indices.begin()+shape.top_k,
+                            indices.begin()+row*shape.top_k),"Original tie-control router must repeat exact expert IDs");
+                    std::osyncstream(std::cout)<<"M4_SOURCE_REPEATED_ROUTES,case="<<shape.grouped_matrix_case
+                        <<",rows="<<live<<",top_k="<<shape.top_k<<'\n';
+                }
                 if(shape.deferred_frontier_history) {
                     // Exercise mixed accepted, rejected and invalid result metadata on the
                     // original native commit. Replayed but uncommitted rows never reach history.
@@ -1234,7 +1374,7 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         }
                     verifyHistory(replay,"after commit");
                 }
-                if(require_frontier && rows==4 && replay==0) {
+                if((require_frontier || !shape.grouped_matrix_case.empty()) && rows==4 && replay==0) {
                     // The actual route-plan producer reacquires a new runtime
                     // bank while both fused compute nodes keep their capture.
                     auto& runtime=*candidate->runtime;
@@ -1254,6 +1394,34 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         source.resident_participant_mask+source.expert_count);
                     update.overlay_route_participant.assign(source.overlay_route_participant,
                         source.overlay_route_participant+source.expert_count);
+                    if (shape.grouped_matrix_case=="Q4_K_sparse_routes") {
+                        const auto original=std::as_bytes(std::span(&current,1));
+                        const std::vector<std::byte> saved(original.begin(),original.end());
+                        const auto rejected=[&](auto mutate,std::string_view named_field) {
+                            auto attempted=update;
+                            require(attempted.local_compute_mask.front()==1u,"Negative bank proof owns its actual expert zero");
+                            mutate(attempted.experts.front());
+                            bool rejected_before_publication=false;
+                            try {
+                                (void)runtime.prepareInactiveBank(0,attempted);
+                            } catch (const std::invalid_argument& error) {
+                                rejected_before_publication=std::string_view(error.what()).find(
+                                    "fragment descriptor disagrees with original source precision/format or local geometry")
+                                    !=std::string_view::npos;
+                            }
+                            require(rejected_before_publication && std::equal(saved.begin(),saved.end(),original.begin()) &&
+                                capture_identity()==original_identity,
+                                "Incompatible "+std::string(named_field)+" must preserve both banks and capture identity");
+                        };
+                        rejected([](auto& expert){expert.gate.n-=32;},"gate shape");
+                        rejected([](auto& expert){expert.down.k-=32;},"down reduction");
+                        rejected([](auto& expert){expert.up.source_is_superblock=0;},"Q4 arithmetic source alias");
+                        rejected([](auto& expert){expert.gate.codebook_id=19;},"reachable physical decoder");
+                        rejected([](auto& expert){expert.gate.mins=nullptr;},"secondary coefficient plane");
+                        rejected([](auto& expert){--expert.down.blocks_per_row;},"K32 block geometry");
+                        std::osyncstream(std::cout)<<"M4_SOURCE_BANK_NEGATIVES,case="<<shape.grouped_matrix_case
+                            <<",rejected=6,bank_bytes_unchanged=1,capture_identity_unchanged=1"<<'\n';
+                    }
                     require(runtime.prepareInactiveBank(0,update),"prepare original descriptors in the inactive bank");
                     auto* layer=reinterpret_cast<std::byte*>(runtime.deviceLayerState(0));
                     if(shape.deferred_frontier_history) {
@@ -1285,6 +1453,40 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         "The next bank must reach the same captured grouped verifier");
                 }
                 rendezvous.arrive_and_wait();
+            }
+            if (shape.grouped_matrix_timing) {
+                require(tp.degree()==1 && rows==4 && !shape.deferred_frontier_history,
+                    "M4 event brackets own an exclusive static singleton capture");
+                auto child=worker.createGraphCapture(stream);
+                auto parent=worker.createGraphCapture(stream);
+                std::array<std::string,32> names;
+                std::array<GPUOrderedTimelineStep,32> steps;
+                for (std::size_t i=0;i<steps.size();++i) {
+                    names[i]="grouped_ffn_"+std::to_string(i);
+                    steps[i]={.name=names[i].c_str(),.capture=candidate->capture.get()};
+                }
+                require(child->buildOrderedTimelineTransaction(steps,GPUOrderedTimelineInstrumentation::Disabled),
+                    "Record the genuine 32 grouped M4 parents");
+                const GPUOrderedTimelineStep bracket{.name="grouped_ffn_32",.capture=child.get()};
+                require(parent->buildOrderedTimelineTransaction(std::span(&bracket,1),
+                    GPUOrderedTimelineInstrumentation::PerStepEvents) && parent->instantiate() &&
+                    parent->nodeCount()==child->nodeCount()+2,"One event pair around the entire 32-parent bracket");
+                const int live=rows;
+                require(backend->hostToDeviceOnStream(candidate->active->gpu_data_ptr(),&live,sizeof(live),
+                    device.ordinal,stream),"Use the original device-owned M4 count in the timed parent");
+                for (int trial=0;trial<16;++trial) {
+                    require(parent->launch() && backend->deviceToHostOnStream(actual.data(),candidate->combined->gpu_data_ptr(),
+                        actual.size()*sizeof(float),device.ordinal,stream) && worker.synchronizeStreamChecked(stream),
+                        "Observe completed production M4 timing bracket after the terminal event");
+                    require(std::memcmp(expected.data(),actual.data(),actual.size()*sizeof(float))==0,
+                        "Timed M4 bracket differs from the original serial oracle");
+                    const auto receipt=parent->consumeOrderedTimelineTiming();
+                    require(receipt.state==GPUOrderedTimelineTimingState::Complete && receipt.samples.size()==1 &&
+                        receipt.samples[0].elapsed_ms>0,"Read one complete 32-operation native interval");
+                    if (trial>=4) std::osyncstream(std::cout)<<std::setprecision(12)
+                        <<"M4_SOURCE_SAMPLE,case="<<shape.grouped_matrix_case<<",trial="<<trial-4
+                        <<",operations=32,us_per_op="<<receipt.samples[0].elapsed_ms*1000.0/32<<'\n';
+                }
             }
         }
     });
@@ -1345,7 +1547,8 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
         qualification == OriginalSourceQualification::FullNativeHCFFNFinal ||
         qualification == OriginalSourceQualification::FullNativeHCFFNMiddle ||
         qualification == OriginalSourceQualification::GroupedQ8DownReplay ||
-        qualification == OriginalSourceQualification::GroupedFFNFrontierReplay) == (selected_source != nullptr),
+        qualification == OriginalSourceQualification::GroupedFFNFrontierReplay ||
+        qualification == OriginalSourceQualification::GroupedFFNSourceMatrix) == (selected_source != nullptr),
         "prepared calibration requires one original model source per process");
     require(!devices.empty(), "selected original participant family");
     const auto mpi = MPIContextFactory::global();
@@ -1436,6 +1639,29 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
         std::vector<FrozenModelWeightSet> shared;
         shared.reserve(devices.size());
         for (const auto device : devices) shared.push_back(manager.materialize(sharedPlan(model, devices, device)));
+        if (shape.grouped_matrix_case=="Q8_1_shared_down_prepared") {
+            // Q8_1 is an admitted prepared matrix, but its [K,N,E] GGUF
+            // parent is invalid. Freeze the actual 2-D tensor before the
+            // common PMA quotation and native WeightManager preparation.
+            require(shared.size()==1,"Prepared Q8_1 replay is an explicit local shared binding");
+            auto& original=shared.front();
+            ModelWeightSetBuilder bindings(original.strategy());
+            for (auto binding:original.bindings()) {
+                if (binding.identity.canonical_name=="blk.0.ffn_down_shexp.weight") {
+                    require(binding.tensor && binding.tensor->rows()==size_t(kH) &&
+                        binding.tensor->cols()==size_t(kSharedF),"Prepared test matrix has original shared down axes");
+                    binding.tensor_owner=TestTensorFactory::createQ8_1Random(
+                        {size_t(kH),size_t(kSharedF)},-.125f,.125f,7253);
+                    binding.tensor=binding.tensor_owner.get();
+                    binding.native_source.reset();
+                    binding.projection_source_owner.reset();
+                    binding.prepared.reset();
+                }
+                bindings.addBinding(std::move(binding));
+            }
+            original=FrozenModelWeightSet(original.strategy(),bindings.freezeBindings(),original.physicalMemoryOwner());
+            original.validateForGraph();
+        }
         // A genuine singleton has an identity sum, not a HOST/native wire
         // transaction. Preserve the common quote fields for larger cohorts.
         const auto collective = devices.size() > 1
@@ -1527,7 +1753,8 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                 constexpr std::array names{"ffn_gate_shexp.weight", "ffn_up_shexp.weight", "ffn_down_shexp.weight"};
                 const std::array expected{format.shared_quantized,
                     format.shared_up_quantized ? format.shared_up_quantized : format.shared_quantized,
-                    format.shared_down_quantized ? format.shared_down_quantized : format.shared_quantized};
+                    shape.grouped_matrix_case=="Q8_1_shared_down_prepared" ? &quantizedVerifierFormat("Q8_1") :
+                        format.shared_down_quantized ? format.shared_down_quantized : format.shared_quantized};
                 std::array<DeviceNativeQuantisedMatrixDesc, names.size()> actual{};
                 for (std::size_t role = 0; role < names.size(); ++role) {
                     const auto* binding = shared[member].optionalLayerForDevice(0, names[role], device);
@@ -1685,7 +1912,9 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                         constexpr std::array default_counts{1,3,kMaxRows};
                         constexpr std::array q8_down_counts{3,4};
                         const bool frontier=qualification==OriginalSourceQualification::GroupedFFNFrontierReplay;
-                        const std::span<const int> capacities=(frontier||qualification==OriginalSourceQualification::GroupedQ8DownReplay)?
+                        constexpr std::array matrix_counts{4};
+                        const std::span<const int> capacities=!shape.grouped_matrix_case.empty()?std::span<const int>{matrix_counts}:
+                            (frontier||qualification==OriginalSourceQualification::GroupedQ8DownReplay)?
                             std::span<const int>{q8_down_counts}:std::span<const int>{default_counts};
                         replayParticipant(devices[member],member,*tp,rendezvous,banks,original_members[member],
                             shared[member],*manager.tensorParallelConfig(),*store,shape,capacities,frontier,
@@ -2005,4 +2234,5 @@ TEST(FullNativeHCFFN, DISABLED_ROCmRetainedProductionTP4Epoch)
 
 #if defined(HAVE_ROCM)
 #include "FullNativeHCFFNFamilyReplay.inc"
+#include "GroupedFFNM4SourceMatrix.inc"
 #endif

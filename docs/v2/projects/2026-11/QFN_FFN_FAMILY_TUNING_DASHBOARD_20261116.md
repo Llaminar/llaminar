@@ -50,6 +50,14 @@ On code2048, the matched fixed-depth verifier dispatch union fell from
 geometry-matched read probe. Broader source formats remain under tuning.
 [Matched runs and read calibration](QFN_MI50_STAGE_COMPARISON_20261118.md#counted-verifier-format-qualification)
 
+The counted four-row reader passed static and deferred replay across all
+15 generated format families. Median local time improved 9.23% over staged.
+On original 128- and 256-column QFN shards, paired gate/up reads saved
+10%–13% on Q4_K; Q5_K was 4.5%–7.9% slower, so its reads stay separate.
+Gate/up sustains roughly half of the matched physical-read rate on the
+original shards. Full-model rates above apply to the equal-width K32-sum run.
+[Shard timings and read calibration](QFN_MI50_STAGE_COMPARISON_20261118.md#original-shard-widths-and-verifier-preparation)
+
 The current ordinary decode trace covers all 255 post-prefill review tokens.
 Values are mean active milliseconds per GPU per token. The projection group
 includes the fused GDN input projection.

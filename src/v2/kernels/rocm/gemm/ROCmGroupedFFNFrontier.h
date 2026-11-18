@@ -5,12 +5,14 @@
 #pragma once
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "kernels/common/DeviceRowRange.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "execution/moe/MoEGroupedPlanDemand.h"
 #include "backends/DeviceId.h"
 #include <array>
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include <variant>
 #include <cstddef>
 #include <cstdint>
 
@@ -30,6 +32,29 @@ inline constexpr int routedColumns(RoutedGeometry geometry) { return static_cast
 /** @brief Exact immutable reachable routed decoder pair. */
 enum class RoutedDecoder { Q4K_Q51, Q4K_Q80, Q5K_Q80 };
 
+/** @brief Reachable physical decoders and original arithmetic policies for each projection.
+ * Gate and up share one movable table declaration. The immutable shared
+ * projections retain independent identities for gate, up and down.
+ */
+struct WeightFormats {
+    NativeQuantisedExecutionFormatEnvelope routedGateUp;
+    NativeQuantisedExecutionFormatEnvelope routedDown;
+    std::array<NativeQuantisedExecutionFormatEnvelope,3> shared;
+
+    /** @return Physical union required for immutable per-device decoder tables. */
+    constexpr std::uint32_t executionMask() const noexcept
+    {
+        return routedGateUp.execution_codebook_mask|routedDown.execution_codebook_mask|
+            shared[0].execution_codebook_mask|shared[1].execution_codebook_mask|shared[2].execution_codebook_mask;
+    }
+};
+
+/** @brief Publish immutable lookup tables for every reachable indexed-grid projection before capture.
+ * @param formats Complete original role envelopes. @param device Exact admitted ROCm ordinal.
+ * @return Whether all required per-device immutable grids are ready in this runtime generation.
+ */
+bool prepareFormatTables(const WeightFormats& formats,int device);
+
 /** @brief Identify the measured physical formats that benefit from K32 sums. */
 constexpr bool supportsExactK32Sums(RoutedDecoder decoder) noexcept
 {
@@ -42,6 +67,114 @@ constexpr unsigned routedGateCodebook(RoutedDecoder decoder)
 constexpr unsigned routedDownCodebook(RoutedDecoder decoder)
 {
     return decoder==RoutedDecoder::Q4K_Q51?7u:19u;
+}
+
+/** @brief Producer of affine Q8 row sums for a measured captured contraction. */
+enum class AffineSumSource { Inline, RouterPublication };
+
+/** @brief Existing fixed-width native specialization with its measured decoder pair. */
+struct MeasuredProgram {
+    RoutedGeometry geometry;
+    RoutedDecoder decoder;
+    AffineSumSource sums=AffineSumSource::Inline;
+};
+
+/**
+ * @brief A counted verifier program whose source identities come from the original preparation family.
+ * Physical execution encodings may change when an expert moves. Its gate, up and down
+ * arithmetic identities remain independent and determine the serial reduction order.
+ */
+class SourceFormatDeclaration {
+    friend SourceFormatDeclaration declareSourceFormats(int,int,NativeQuantisedExecutionFormatEnvelope,
+        NativeQuantisedExecutionFormatEnvelope,const std::array<NativeQuantisedSourceIdentity,3>&,
+        const std::array<DeviceNativeQuantisedMatrixDesc,3>&);
+    /** @brief Construct only after every original role has passed the source-envelope checks. */
+    SourceFormatDeclaration(int routed,int shared,WeightFormats masks,unsigned decoderFamily,
+        const std::array<NativeQuantisedSourceIdentity,3>& original)
+        : routedColumns_(routed),sharedColumns_(shared),formats_(masks),family_(decoderFamily),original_(original) {}
+    int routedColumns_, sharedColumns_;
+    WeightFormats formats_;
+    unsigned family_;
+    std::array<NativeQuantisedSourceIdentity,3> original_;
+public:
+    /** @return Physical routed width on the current participant. */
+    int routedColumns() const noexcept {return routedColumns_;}
+    /** @return Physical shared-expert width on the current participant. */
+    int sharedColumns() const noexcept {return sharedColumns_;}
+    /** @return Capture-stable envelopes of all physical readers and arithmetic policies. */
+    const WeightFormats& formats() const noexcept {return formats_;}
+    /** @return Decoder-structure family selected from all five envelopes. */
+    unsigned family() const noexcept {return family_;}
+    /** @return Original gate, up and down source identities in projection order. */
+    const auto& routedSources() const noexcept {return original_;}
+};
+
+/** @brief Six immutable serial trees for one captured stage on its admitted ROCm participant. */
+class SourceFormatProgram final : public SourceFormatDeclaration {
+    std::array<int,3> routedPartitions_,sharedPartitions_;
+    /** @brief Only the canonical serial decoder query may issue counts for these sources. */
+    SourceFormatProgram(const SourceFormatDeclaration& declaration,
+                        std::array<int,3> routed,std::array<int,3> shared)
+        : SourceFormatDeclaration(declaration),routedPartitions_(routed),sharedPartitions_(shared) {}
+public:
+    /**
+     * @brief Resolve all six independent source reductions before graph capture.
+     * @param declaration Authenticated original roles and their reachable physical representations.
+     * @return A program carrying the exact serial-M1 policy for every role.
+     * @throws std::invalid_argument If the canonical serial configuration rejects a role.
+     */
+    static SourceFormatProgram prepare(const SourceFormatDeclaration& declaration);
+    /** @return Fixed gate, up and down partition counts for a routed expert. */
+    const auto& routedPartitions() const noexcept {return routedPartitions_;}
+    /** @return Fixed gate, up and down partition counts for the immutable shared expert. */
+    const auto& sharedPartitions() const noexcept {return sharedPartitions_;}
+    /** @return Whether the two immutable reduction trees admit the measured joint Q4_1 reader.
+     * The physical Q5_1 reader was slower when paired on original Q5_K TP shards.
+     * Check reachable encodings as well as counts so the graph can survive expert movement.
+     */
+    bool pairsGateAndUp() const noexcept
+    {
+        const auto q4=nativeQuantisedCodebookMaskBit(native_quantised_formats::Q4_1.codebook_id);
+        const auto q8=nativeQuantisedCodebookMaskBit(native_quantised_formats::Q8_0.codebook_id);
+        const auto& masks=formats();
+        return routedPartitions_[0]==routedPartitions_[1] && sharedPartitions_[0]==sharedPartitions_[1] &&
+            masks.routedGateUp.execution_codebook_mask==q4 && masks.shared[0].execution_codebook_mask==q8 &&
+            masks.shared[1].execution_codebook_mask==q8;
+    }
+};
+
+using Program=std::variant<MeasuredProgram,SourceFormatProgram>;
+
+/** @return Participant-local routed intermediate width embedded in the two leaves. */
+inline int routedColumns(const Program& program)
+{
+    if(const auto* measured=std::get_if<MeasuredProgram>(&program))return routedColumns(measured->geometry);
+    return std::get<SourceFormatProgram>(program).routedColumns();
+}
+
+/** @return Independent participant-local shared intermediate width. */
+inline int sharedColumns(const Program& program)
+{
+    if(const auto* formats=std::get_if<SourceFormatProgram>(&program))return formats->sharedColumns();
+    return sharedWidth;
+}
+
+/** @return Whether the selected leaves consume the measured F160 router sum layout. */
+inline bool usesExactK32Sums(const Program& program)
+{
+    const auto* measured=std::get_if<MeasuredProgram>(&program);
+    return measured && measured->sums==AffineSumSource::RouterPublication;
+}
+
+/** @return The gate/up and down table contracts sealed before placement can change. */
+inline std::array<NativeQuantisedExecutionFormatEnvelope,2> routedFormats(const Program& program)
+{
+    if(const auto* formats=std::get_if<SourceFormatProgram>(&program))
+        return {formats->formats().routedGateUp,formats->formats().routedDown};
+    const auto decoder=std::get<MeasuredProgram>(program).decoder;
+    const auto gate=nativeQuantisedCodebookMaskBit(routedGateCodebook(decoder));
+    const auto down=nativeQuantisedCodebookMaskBit(routedDownCodebook(decoder));
+    return {{{gate,gate},{down,down}}};
 }
 
 inline constexpr std::size_t bankIdentityBytes=3*sizeof(std::uint64_t);
@@ -94,8 +227,7 @@ struct LocalPublication {
     TensorBase* sharedOutput;
     TensorBase* combined;
     DirectBankRouter directRouter{};
-    RoutedGeometry routedGeometry=RoutedGeometry::F128;
-    RoutedDecoder routedDecoder=RoutedDecoder::Q4K_Q51;
+    Program program;
 };
 
 /** @brief Canonical original mutable plan views from the complete grouped-plan owner. */
@@ -150,6 +282,19 @@ struct Output {
 bool launch(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDesc,3>& sharedWeights,
             const Output& output,int device,void* stream,const DirectBankInput& direct={},
             RoutedGeometry geometry=RoutedGeometry::F128,RoutedDecoder decoder=RoutedDecoder::Q4K_Q51);
+
+/** @brief Record the counted native gate/up and down leaves for a sealed format declaration.
+ * @param plan Original device-owned counts, router rows and reachable expert descriptors.
+ * @param shared Original immutable shared gate, up and down matrices.
+ * @param output Existing graph workspace and publication targets.
+ * @param device Exact admitted ROCm ordinal.
+ * @param stream Exact non-default graph stream.
+ * @param direct Original placement-bank acquisition and deferred-demand policy.
+ * @param program Original authenticated sources, decoder envelopes and participant geometry.
+ * @return Whether both native submissions succeeded.
+ */
+bool launchFormatProgram(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDesc,3>& shared,
+    const Output& output,int device,void* stream,const DirectBankInput& direct,const SourceFormatProgram& program);
 
 } // namespace rocm::grouped_ffn
 } // namespace llaminar2

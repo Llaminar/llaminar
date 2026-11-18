@@ -8,6 +8,15 @@ the parent with device events in an unprofiled Release run. Use a separate
 timestamp-only trace to attribute time to leaves. Isolate hardware counters
 by symbol and dispatch geometry in separate runs of the same captured work.
 
+Resolve the original gate, up and down reduction schedules during graph
+preparation, separately for routed and shared weights. Verify shared source
+planes during preparation and incoming expert descriptors before publishing
+an inactive bank. Captured replay still acquires the current bank generation
+and reads the device-owned live row count, routes and weights. Use a changed
+bank and a partial verifier replay to check this distinction. Compare compiled
+ISA for the recorded kernel symbol to verify that per-tile descriptor checks
+actually disappeared. Time the unprofiled parent in both run orders.
+
 Measure memory service on the same card with the native weights' access
 pattern, extent, route ordering and launch geometry. Include both the
 working set of an ordinary warm request and a working set larger than L2.

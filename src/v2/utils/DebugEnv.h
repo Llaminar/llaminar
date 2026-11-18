@@ -191,6 +191,18 @@ namespace llaminar2
         return enabled;
     }
 
+    /** @brief Select the source-aware verifier leaves for a native format qualification run. */
+    inline bool qfnGroupedFFNAllFormatsOptIn()
+    {
+        static const bool enabled=[] {
+            const auto* value=std::getenv("LLAMINAR_QFN_ROCM_GROUPED_FFN_ALL_FORMATS");
+            if(!value || std::strcmp(value,"0")==0)return false;
+            if(std::strcmp(value,"1")==0)return true;
+            throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_FFN_ALL_FORMATS accepts 0 or 1");
+        }();
+        return enabled;
+    }
+
     /** @brief Select the measured two-node grouped local FFN for the original MI50 verifier tuple. */
     inline bool qfnGroupedFFNFrontierOptIn()
     {

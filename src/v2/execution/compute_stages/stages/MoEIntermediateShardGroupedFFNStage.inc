@@ -15,80 +15,54 @@ bool groupedFFNFrontierWidthEligible(int columns)
          qfnGroupedFFNEqualFrontierOptIn() && qfnGroupedFFNDirectBankExperiment());
 }
 
-/** @brief Select an exact candidate without weakening the original narrow binding. */
-std::optional<frontier::RoutedDecoder> groupedFFNFrontierDecoder(const Binding& binding)
-{
-    const auto gate=binding.descriptor_declaration.nativeGateUpEnvelope();
-    const auto down=binding.descriptor_declaration.nativeDownEnvelope();
-    const auto matches=[&](unsigned g,unsigned d) {
-        return gate.execution_codebook_mask==(1u<<g) && gate.policy_codebook_mask==(1u<<g) &&
-            down.execution_codebook_mask==(1u<<d) && down.policy_codebook_mask==(1u<<d);
-    };
-    using Program=frontier::RoutedDecoder;
-    if(matches(5,7))return Program::Q4K_Q51;
-    if(binding.original.localIntermediateColumns()==160) {
-        if(matches(5,19))return Program::Q4K_Q80;
-        if(matches(7,19))return Program::Q5K_Q80;
-    }
-    return std::nullopt;
-}
-
-/**
- * @brief Select sum publication from the original routed source identity.
- *
- * The execution codebook also names direct affine formats. Require the
- * immutable original GGUF identities as well as the reachable decoder before
- * opting in to the exact measured program.
- */
-bool groupedFFNFrontierUsesExactK32Sums(const Binding& binding,
-    const std::array<DeviceNativeQuantisedMatrixDesc,3>& shared)
-{
-    if(binding.original.localIntermediateColumns()!=160 ||
-       !qfnGroupedFFNDirectBankExperiment() || !frontier::exactK32SumsOptIn())
-        return false;
-    const auto decoder=groupedFFNFrontierDecoder(binding);
-    if(!decoder || !frontier::supportsExactK32Sums(*decoder))return false;
-    if(!std::all_of(shared.begin(),shared.end(),[](const auto& matrix) {
-        return matrix.source_identity_present && matrix.source_codebook_id==19 && !matrix.source_is_superblock;
-    }))return false;
-    const auto& roles=binding.descriptor_declaration.sourceFormats();
-    const auto sourceMatches=[](const ExpertWeightFormat& format,unsigned codebook,bool superblock) {
-        const auto& source=format.native_quantised;
-        return format.isNativeQuantised() && source.present &&
-            source.codebook_id==codebook && source.is_superblock==superblock;
-    };
-    const auto gate=frontier::routedGateCodebook(*decoder);
-    return sourceMatches(roles[0],gate,true) && sourceMatches(roles[1],gate,true) &&
-        sourceMatches(roles[2],frontier::routedDownCodebook(*decoder),false);
-}
-
-/** @brief Select exactly the measured MI50 M4 source tuple. */
-bool groupedFFNFrontierEligible(const Binding& binding,const SharedExpertFFNStage::Params& shared,
-    const DeviceMoEExpertDescriptor& source)
+/** @return The cold-selected local program for a counted four-row MI50 verifier stage. */
+std::optional<frontier::Program> groupedFFNFrontierProgram(const Binding& binding,
+    const SharedExpertFFNStage::Params& shared,const DeviceMoEExpertDescriptor& source)
 {
     const auto& p=binding.params;
-    if(!binding.device().is_rocm() || p.phase!=MoEOverlayServicePhaseHint::GroupedVerifier ||
+    if(!qfnGroupedFFNFrontierOptIn() || !binding.device().is_rocm() ||
+       p.phase!=MoEOverlayServicePhaseHint::GroupedVerifier ||
        p.row_mode!=MoEIntermediateShardRowMode::Grouped || p.rows!=frontier::capacity ||
        p.top_k!=frontier::topK || !p.live_rows || !p.live_rows->countOwner() ||
        binding.route_authority==RouteAuthority::PreparedService ||
        binding.original.modelColumns()!=frontier::hidden ||
-       !groupedFFNFrontierWidthEligible(binding.original.localIntermediateColumns()) ||
        binding.descriptors.size()!=frontier::experts ||
        binding.format!=DeviceMoEWeightFormat::NativeQuantised ||
        source.weight_format!=DeviceMoEWeightFormat::NativeQuantised ||
-       shared.intermediate!=frontier::sharedWidth || !shared.gate_scratch || !shared.up_scratch ||
-       !shared.required_router_q8_publication)return false;
+       !shared.gate_scratch || !shared.up_scratch || !shared.required_router_q8_publication)
+        return std::nullopt;
     const auto& hardware=rocmHardwareMetadata().at(binding.device().ordinal);
     if(hardware.compute_units!=60 || hardware.native_wave_width!=64 ||
-       (hardware.isa_target!="gfx906" && !hardware.isa_target.starts_with("gfx906:")))return false;
+       (hardware.isa_target!="gfx906" && !hardware.isa_target.starts_with("gfx906:")))return std::nullopt;
+    const int columns=binding.original.localIntermediateColumns();
+    if(qfnGroupedFFNAllFormatsOptIn()) {
+        if(!qfnGroupedFFNDirectBankExperiment())
+            throw std::invalid_argument("All-format grouped FFN requires the counted direct-bank router");
+        const auto& original=binding.descriptor_declaration.sourceFormats();
+        return frontier::SourceFormatProgram::prepare(frontier::declareSourceFormats(columns,shared.intermediate,
+            binding.descriptor_declaration.nativeGateUpEnvelope(),binding.descriptor_declaration.nativeDownEnvelope(),
+            {original[0].native_quantised,original[1].native_quantised,original[2].native_quantised},
+            {source.gate,source.up,source.down}));
+    }
     const auto exactShared=[](const DeviceNativeQuantisedMatrixDesc& m,int n,int k) {
         return m.valid() && m.n==n && m.k==k && m.codebook_id==19 &&
             m.source_identity_present && m.source_codebook_id==19;
     };
-    return groupedFFNFrontierDecoder(binding).has_value() &&
-        exactShared(source.gate,frontier::sharedWidth,frontier::hidden) &&
-        exactShared(source.up,frontier::sharedWidth,frontier::hidden) &&
-        exactShared(source.down,frontier::hidden,frontier::sharedWidth);
+    if(!groupedFFNFrontierWidthEligible(columns) || shared.intermediate!=frontier::sharedWidth ||
+       !exactShared(source.gate,frontier::sharedWidth,frontier::hidden) ||
+       !exactShared(source.up,frontier::sharedWidth,frontier::hidden) ||
+       !exactShared(source.down,frontier::hidden,frontier::sharedWidth))return std::nullopt;
+    const auto& declaration=binding.descriptor_declaration;
+    if(const auto decoder=frontier::measuredDecoder(columns,declaration.nativeGateUpEnvelope(),
+            declaration.nativeDownEnvelope(),declaration.sourceFormats())) {
+        const auto geometry=static_cast<frontier::RoutedGeometry>(columns);
+        const bool sums=qfnGroupedFFNDirectBankExperiment() && frontier::exactK32SumsOptIn() &&
+            frontier::hasMeasuredSumLayout(geometry,*decoder,binding.descriptor_declaration.sourceFormats(),
+                {source.gate,source.up,source.down});
+        return frontier::MeasuredProgram{geometry,*decoder,sums?frontier::AffineSumSource::RouterPublication:
+            frontier::AffineSumSource::Inline};
+    }
+    return std::nullopt;
 }
 
 /** @brief Replace only the participant-local routed/shared contraction, excluding router and TP. */
@@ -106,12 +80,17 @@ class GroupedFFNFrontierStage final : public IComputeStage, public IWorkspaceCon
         const char* name;
         std::size_t minimum_bytes;
     };
-    static constexpr std::array scratch_requirements{
-        ScratchRequirement{MoEWorkspaceBuffers::PREFILL_A_INT8,frontier::sharedCodesBytes},
-        ScratchRequirement{MoEWorkspaceBuffers::PREFILL_A_SCALES,frontier::sharedScalesBytes},
-        ScratchRequirement{MoEWorkspaceBuffers::ROCM_SHARED_GATE,frontier::sharedGateBytes},
-        ScratchRequirement{MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY,frontier::bankIdentityBytes}};
-    std::array<std::shared_ptr<const WorkspaceBufferLease>,scratch_requirements.size()> scratch_leases_;
+    /** @return Exact live shared Q8 extent or the explicitly selected sum layout in the same input bank. */
+    std::array<ScratchRequirement,4> scratchRequirements()const
+    {
+        const auto codes=std::size_t(frontier::capacity)*frontier::sharedColumns(publication_.program);
+        const bool sums=frontier::usesExactK32Sums(publication_.program);
+        return {{{MoEWorkspaceBuffers::PREFILL_A_INT8,sums?frontier::k32SumWorkspaceBytes:codes},
+            {MoEWorkspaceBuffers::PREFILL_A_SCALES,codes/32*sizeof(float)},
+            {MoEWorkspaceBuffers::ROCM_SHARED_GATE,frontier::sharedGateBytes},
+            {MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY,frontier::bankIdentityBytes}}};
+    }
+    std::array<std::shared_ptr<const WorkspaceBufferLease>,4> scratch_leases_;
     IBackend* backend_=nullptr;
     std::uint64_t runtime_generation_=0;
 
@@ -141,6 +120,7 @@ class GroupedFFNFrontierStage final : public IComputeStage, public IWorkspaceCon
            workspace_->id()!=binding_->prepared->workspace_id ||
            getBackendFor(device())!=backend_ || backend_->deviceRuntimeGeneration(device().ordinal)!=runtime_generation_)
             throw std::logic_error("Grouped FFN frontier changed its captured workspace or backend generation");
+        const auto scratch_requirements=scratchRequirements();
         for(std::size_t i=0;i<scratch_requirements.size();++i) {
             const auto* name=scratch_requirements[i].name;
             if(workspace_->getBuffer(name)!=scratch_leases_[i]->data() ||
@@ -155,14 +135,12 @@ class GroupedFFNFrontierStage final : public IComputeStage, public IWorkspaceCon
 public:
     /** @brief Capture the original exact shared bindings and the original local plan owner. */
     GroupedFFNFrontierStage(std::shared_ptr<Binding> binding,const SharedExpertFFNStage::Params& shared,
-        const DeviceMoEExpertDescriptor& descriptor,TensorBase* gate,
+        const DeviceMoEExpertDescriptor& descriptor,frontier::Program program,TensorBase* gate,
         MoEIntermediateShardTensorBinding combined,std::string name)
         : IComputeStage(binding->device()),binding_(std::move(binding)),shared_(shared),
         publication_{*binding_->params.live_rows,{descriptor.gate,descriptor.up,descriptor.down},gate,
             shared.gate_scratch,shared.up_scratch,dynamic_cast<TensorBase*>(binding_->params.output.tensor),
-            shared.output,dynamic_cast<TensorBase*>(combined.tensor),{},
-            static_cast<frontier::RoutedGeometry>(binding_->original.localIntermediateColumns()),
-            groupedFFNFrontierDecoder(*binding_).value()},combined_id_(combined.id),name_(std::move(name))
+            shared.output,dynamic_cast<TensorBase*>(combined.tensor),{},std::move(program)},combined_id_(combined.id),name_(std::move(name))
     {
         for(auto* tensor:extraOperands())
             if(!tensor || tensor->native_type()!=TensorType::FP32)
@@ -190,8 +168,14 @@ public:
     /** @return The unchanged original grouped quote, including the router-disjoint reusable scratch. */
     WorkspaceRequirements getWorkspaceRequirements(int m,int=0,int=0)const override
     {
-        return MoEWorkspaceBuffers::rocmMoE(std::max(m,frontier::capacity),frontier::hidden,
-            frontier::routedColumns(publication_.routedGeometry),frontier::experts,frontier::topK);
+        auto requirements=MoEWorkspaceBuffers::rocmMoE(std::max(m,frontier::capacity),frontier::hidden,
+            frontier::routedColumns(publication_.program),frontier::experts,frontier::topK);
+        // The routed and shared branches reuse the same named banks at disjoint times.
+        WorkspaceRequirements shared;
+        for(const auto& scratch:scratchRequirements())
+            MoEWorkspaceBuffers::add(shared,scratch.name,scratch.minimum_bytes);
+        requirements.merge(shared);
+        return requirements;
     }
     /** @brief Borrow the executor's exact admitted workspace. */
     void bindWorkspace(DeviceWorkspaceManager* workspace) override
@@ -236,13 +220,35 @@ public:
         auto value=binding_->signature^0x46464e47524f5550ULL;
         const auto mix=[&](std::uint64_t part){value=(value^part)*kFNV1a64Prime;};
         mix(qfnGroupedFFNDirectBankExperiment());
-        mix(groupedFFNFrontierUsesExactK32Sums(*binding_,publication_.sharedWeights));
-        mix(frontier::routedColumns(publication_.routedGeometry));
-        mix(static_cast<unsigned>(publication_.routedDecoder));
+        mix(frontier::usesExactK32Sums(publication_.program));
+        mix(publication_.program.index());
+        mix(frontier::routedColumns(publication_.program));
+        mix(frontier::sharedColumns(publication_.program));
+        const auto mixFormat=[&](const NativeQuantisedExecutionFormatEnvelope& format) {
+            mix(format.execution_codebook_mask);
+            mix(format.policy_codebook_mask);
+        };
+        for(const auto& format:frontier::routedFormats(publication_.program))mixFormat(format);
+        if(const auto* program=std::get_if<frontier::SourceFormatProgram>(&publication_.program)) {
+            mix(program->family());
+            for(const int parts:program->routedPartitions())mix(parts);
+            for(const int parts:program->sharedPartitions())mix(parts);
+            // A union loses role order and block-family identity. Both are captured here.
+            for(const auto& source:program->routedSources()) {
+                mix(source.codebook_id);
+                mix(source.is_superblock);
+            }
+            for(const auto& format:program->formats().shared)mixFormat(format);
+        }
         for(auto* tensor:extraOperands())mix(reinterpret_cast<std::uintptr_t>(tensor));
         for(const auto& matrix:publication_.sharedWeights) {
             mix(reinterpret_cast<std::uintptr_t>(matrix.payload));
             mix(reinterpret_cast<std::uintptr_t>(matrix.scales));
+            mix(reinterpret_cast<std::uintptr_t>(matrix.mins));
+            mix(reinterpret_cast<std::uintptr_t>(matrix.emins));
+            mix(matrix.n);mix(matrix.k);mix(matrix.blocks_per_row);mix(matrix.codebook_id);
+            mix(matrix.allocation_payload_bytes_per_block);mix(matrix.allocation_has_mins);mix(matrix.allocation_has_emins);
+            mix(matrix.source_codebook_id);mix(matrix.source_is_superblock);mix(matrix.source_identity_present);
         }
         for(const auto& output:outputs())mix(static_cast<std::uint64_t>(output.id));
         return value?value:1;
@@ -252,6 +258,9 @@ public:
     bool prepareGraphLaunch(IDeviceContext* ctx,void* stream)override
     {
         if(!ctx || ctx->deviceId()!=device() || !workspace_ || !stream || isGraphCaptureActive())return false;
+        if(const auto* program=std::get_if<frontier::SourceFormatProgram>(&publication_.program);
+           program && !frontier::prepareFormatTables(program->formats(),device().ordinal))
+            throw std::logic_error("Grouped FFN could not prepare the original IQ grid tables");
         binding_->prepare(workspace_,stream);
         setGPUStream(stream);
         if(scratch_leases_[0]){validateSeal();return true;}
@@ -262,11 +271,11 @@ public:
         const auto tensors=extraOperands();
         for(std::size_t i=0;i<tensors.size();++i)
             operands_[i]=TransferEngine{}.retainCapturedDeviceStorage(*tensors[i],device(),tensors[i]->size_bytes());
+        const auto scratch_requirements=scratchRequirements();
         for(std::size_t i=0;i<scratch_requirements.size();++i) {
             const auto& required=scratch_requirements[i];
             const auto extent=workspace_->getBufferSize(required.name);
-            const bool sumBank=i==0 && groupedFFNFrontierUsesExactK32Sums(*binding_,publication_.sharedWeights);
-            const auto minimum=sumBank?frontier::k32SumWorkspaceBytes:required.minimum_bytes;
+            const auto minimum=required.minimum_bytes;
             if(extent<minimum)
                 throw std::logic_error("Grouped FFN frontier scratch is undersized: "+
                     std::string(required.name)+" expected "+std::to_string(minimum)+

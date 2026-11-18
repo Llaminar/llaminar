@@ -3646,7 +3646,8 @@ add_v2_test(V2_Unit_TensorLayout
 
 # Test: NativeQuantised intrinsic format metadata
 # Backend-independent regression for codebook IDs consumed by CUDA/ROCm/CPU sweep generators.
-add_executable(v2_test_native_quantised_format_info unit/tensors/Test__NativeQuantisedFormatInfo.cpp)
+add_executable(v2_test_native_quantised_format_info unit/tensors/Test__NativeQuantisedFormatInfo.cpp
+    unit/kernels/Test__ROCmGroupedFFNFormatSelection.cpp)
 target_link_libraries(v2_test_native_quantised_format_info
     llaminar2_core
     GTest::gtest
@@ -3657,6 +3658,11 @@ add_v2_test(V2_Unit_NativeQuantisedFormatInfo
     LABELS "V2;Unit;TensorOperations;NativeQuantised;Quantization;Codebook;Regression"
     MPI_PROCS 1
 )
+
+add_v2_test(V2_Integration_ROCmGroupedFFNFormatSelection
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_format_info> --gtest_filter=ROCmGroupedFFNFormatSelection.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Quantization;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 
 # The learned-dispatch fitter evaluates millions of exact leaf objectives and
 # legal feature splits. ABI v7 keeps the full top-64 tree beam on CUDA or ROCm,
@@ -26015,7 +26021,9 @@ if(HAVE_CUDA OR HAVE_ROCM)
         target_sources(v2_integration_moe_live_rows PRIVATE
             integration/backends/Test__MoERouterLogits.cpp
             integration/backends/Test__ROCmMoEKernelResources.cpp
+            integration/backends/Test__ROCmMoERouteOwnedGeometry.cpp
             integration/backends/ROCmMoEDiagnosticFrame.hip)
+        target_link_libraries(v2_integration_moe_live_rows PRIVATE hip::host)
         add_v2_test(V2_Integration_MoERouterLogits_ROCm
             COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
                 --gtest_filter=MoERouterLogits.ROCmCapturedSerialPartitions
@@ -26023,6 +26031,11 @@ if(HAVE_CUDA OR HAVE_ROCM)
             MPI_PROCS 1
             NO_MODELS
             TIMEOUT 60)
+        add_v2_test(V2_Integration_ROCmGroupedFFNFormatProgramDemand
+            COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
+                --gtest_filter=ROCmGroupedFFNFormatProgramNative.PrefillDemandLeavesEmptyCapture
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;NativeQuantised;GraphCapture;Replay;Regression;NativeISA-gfx906"
+            MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
         add_v2_test(V2_Integration_MoEGroupedRegisterTopKReplay_ROCm
             COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
                 --gtest_filter=MoERouterLogits.ROCmGroupedRegisterTopKCapturedByteReplay
@@ -29586,6 +29599,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     ${V2_HIP_SDMA_TIMING_PREFLIGHT_TESTS}
     V2_Integration_MoESourcePolicyOwnerBoundaries
     V2_Integration_MoEPreparedArrivalNativeDescriptorRejects
+    V2_Integration_ROCmGroupedFFNFormatSelection
     V2_Integration_GPUBlockingSynchronizationPolicy
     V2_Integration_GPUBlockingSynchronizationPolicyNegativeControls
     V2_Integration_CPUExecutionExactRegistration
@@ -29968,6 +29982,7 @@ if(HAVE_ROCM)
     V2_Integration_MoERouterLogits_ROCm
     V2_Integration_MoEGroupedRegisterTopKReplay_ROCm
     V2_Integration_MoEGroupedFixedFP16RouterReplay_ROCm
+    V2_Integration_ROCmGroupedFFNFormatProgramDemand
     V2_Integration_MoERouterOwnedExchange_ROCm2
     V2_Integration_MoERouterOwnedExchange_ROCm4
     V2_Integration_MoERouterOwnedRows_ROCm
@@ -36443,9 +36458,6 @@ add_v2_test(V2_Integration_ROCmMoERouteOwnedGeometryContract
     LABELS "V2;Integration;ProductionTestPreflight;MoE;NativeQuantised;Geometry;Regression;DeviceFree"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 if(HAVE_ROCM AND NOT V2_PERF_TESTS_ONLY)
-    target_sources(v2_integration_moe_live_rows PRIVATE
-        integration/backends/Test__ROCmMoERouteOwnedGeometry.cpp)
-    target_link_libraries(v2_integration_moe_live_rows PRIVATE hip::host)
     add_v2_test(V2_Integration_ROCmMoERouteOwnedGeometryAdmission
         COMMAND $<TARGET_FILE:v2_integration_moe_live_rows>
             --gtest_filter=ROCmMoERouteOwnedGeometryNative.*

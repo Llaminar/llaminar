@@ -499,6 +499,71 @@ operations, address generation and synchronization.
 [Measurement procedure](../../../../tests/v2/performance/kernels/qwen4exp/verifier-roofline.md)
 [Per-resource results](/tmp/qfn-mi50-verifier-roofline/physical-resources.csv)
 
+### Original shard widths and verifier preparation
+
+The counted four-row reader resolves six serial-M1 reduction schedules from
+the original weights during graph preparation. The shared gate, up and down
+keep independent schedules, as do the three routed projections. A published
+expert can change address or physical encoding when it moves. Its source
+identity and reduction order remain fixed for the captured program.
+
+The table gives median microseconds per captured local operation on MI50
+`0000:ba:00.0`. Each run timed 12 windows of 32 replays. Each row used
+the original QFN GGUF shard, four rows and 160 shared columns. Both readers
+passed the serial byte comparison. The run order was separate, paired,
+paired, separate; each table cell is the median of its two runs.
+
+| Original routed gate/up, down | Routed columns | Separate reads (µs) | Paired gate/up (µs) |
+| --- | ---: | ---: | ---: |
+| L1 Q4_K, Q5_1 | 128 | 164.25 | 146.53 |
+| L1 Q4_K, Q5_1 | 256 | 238.78 | 214.34 |
+| L2 Q5_K, Q8_0 | 128 | 165.58 | 173.10 |
+| L2 Q5_K, Q8_0 | 256 | 244.60 | 263.92 |
+| L4 Q4_K, Q8_0 | 128 | 155.96 | 139.78 |
+| L4 Q4_K, Q8_0 | 256 | 229.46 | 200.48 |
+
+The graph selects paired reads for the measured physical Q4_1 gate/up and
+Q8_0 shared projections when each pair has equal partition counts. The Q5_K
+shards retain separate reads. Moving partition lookup to preparation alone
+changed the L1 wide parent by less than 1 µs in a separate bracket.
+[Timing receipts](/tmp/qfn-mi50-verifier-roofline)
+[Source-window fixture](../../../../tests/v2/integration/loaders/GroupedFFNM4SourceMatrix.inc)
+
+A separate same-ELF comparison covered 15 generated source families. The
+direct reader reduced local parent time against the staged graph by a median
+9.23%, with individual gains of 0.81%–26.10%. G02 (plain Q4_0) and G13
+(IQ3_XXS/Q5_1 with IQ2_S shared) each gained less than 1%. G15 measured
+326.94 → 271.18 µs. Static and deferred captures matched serial bytes for
+all 15. These are local verifier timings; the four-device model measurements
+above describe the separate equal-width, K32-sum experiment.
+[Family timing CSV](/tmp/qfn-mi50-m4-source-matrix/parent-readers-families-abba-r1/result.csv)
+[Captured replay results](/tmp/qfn-mi50-m4-source-matrix/parent-readers-families-parity-bd-r1/result.json)
+
+The same reader passed 80 independent static captures, varying 20 encodable
+original GGUF formats across routed gate/up, routed down, shared gate/up and
+shared down. A separate prepared Q8_1 shared-down fixture retained source ID
+20 with execution ID 19, and passed static and deferred replay. The fixture
+also checks the existing rejection of Q8_1 as an original routed GGUF tensor.
+[Complete independent source and role results](/tmp/qfn-mi50-m4-source-matrix/parent-readers-qualified-matrix.json)
+
+Timestamp-only wide-layer traces attributed the format split to gate/up.
+For Q4_K it took 126.88 → 105.44 µs, and for Q5_K it took 141.28 → 164.16
+µs. All four recorded gate symbols used zero private scratch. The paired Q5_K
+kernel used 80 VGPRs versus 84 separately, despite taking longer.
+[Captured stage medians](/tmp/qfn-mi50-verifier-roofline/prepared-graph-stage-traces.json)
+
+The packet probe also covered both original TP widths and each calibrated
+format's secondary weight planes. On PCI c2, the separate gate/up reader
+reached 48.5%–52.9% of its matched physical-read rate across the six original
+shards. Q5_1 down reached 48.0%–54.4% and Q8_0 down reached 69.9%–85.2%.
+In G15, IQ3_XXS routed gate/up with IQ2_S shared reached 36.9%, and Q6_K
+down with Q8_0 shared reached 49.0%. For L1 wide gate/up the read-only probe
+fetched 32,056.6 KiB versus 32,156.9 KiB in the numeric kernel. The probe
+omits arithmetic, activation reads and publication. The raw cache-resident
+control and the 256 MiB streaming control used independent physical counters.
+[Packet benchmark procedure](../../../../tests/v2/performance/kernels/rocm/roofline/README.md)
+[Measurements by PCI, geometry and source format](/tmp/qfn-mi50-parent-roofline-c2/score.json)
+
 ## Reproduction
 
 The local evidence root for native phase attribution is

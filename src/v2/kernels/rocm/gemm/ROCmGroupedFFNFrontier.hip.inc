@@ -8,6 +8,7 @@
  * stream edge, allowing each phase to keep its own register and grid geometry.
  */
 #include "ROCmGroupedFFNFrontier.h"
+#include "ROCmResidentMoEFFN.h"
 #include "kernels/rocm/moe/ROCmSharedExpertGateAddBody.cuh"
 #include "kernels/rocm/moe/ROCmOriginalRouterPhase.hip.inc"
 #include "kernels/rocm/moe/ROCmNativeRuntimeBankView.h"
@@ -103,6 +104,7 @@ __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuant
     const std::int8_t* codes,const float* scales,int column,int parts,int lane,const std::int16_t* sums=nullptr)
 {
     using Traits=PrefillNATIVE_QUANTISEDTraits<Format>;
+    const int width=Columns>0?Columns:gate.n;
     const int worker=lane/16;
     const int perPart=(hidden/32+parts-1)/parts;
     float gateTotal=0.0f,upTotal=0.0f;
@@ -114,7 +116,7 @@ __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuant
         float g=0.0f,u=0.0f;
         if(originalPart<parts)
             for(int block=begin;block<end;++block) {
-                const auto index=static_cast<std::size_t>(block)*Columns+column;
+                const auto index=static_cast<std::size_t>(block)*width+column;
                 const auto* a4=reinterpret_cast<const int32_t*>(codes+block*32);
                 const auto scale=scales[block];
                 const auto* gatePayload=gate.payload+index*Traits::payload_bytes;
@@ -462,5 +464,7 @@ bool launch(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDe
     }
     return hipGetLastError()==hipSuccess;
 }
+
+#include "ROCmGroupedFFNGenericProgram.hip.inc"
 
 } // namespace llaminar2::rocm::grouped_ffn

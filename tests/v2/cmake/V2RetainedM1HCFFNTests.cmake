@@ -130,6 +130,53 @@ if(TARGET v2_integration_moe_intermediate_ffn_finalization)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_FullNativeHCFFN_EqualF160GroupedFrontierK32SumReplay_ROCm)
     endif()
 
+    # Assert both captured symbols and production counters in the focused replays.
+    # The separate matrix runner times every original source/role combination.
+    set(grouped_m4_all_formats_env
+        LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16
+        LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER=1
+        LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK=1
+        LLAMINAR_QFN_ROCM_GROUPED_FFN_ALL_FORMATS=1
+        LLAMINAR_TEST_GROUPED_M4_PROGRAM=all_formats
+        LLAMINAR_TEST_GROUPED_M4_REQUIRED_SYMBOL=groupedFFNFormatProgramGate
+        LLAMINAR_TEST_GROUPED_M4_SYMBOL_PRESENT=1
+        LLAMINAR_PERF_STATS_SUMMARY=1
+        LLAMINAR_PERF_STATS_FILTER=kernel.rocm_grouped_ffn_frontier_calls
+    )
+    add_v2_test(V2_Integration_GroupedM4SourceCountedReplay_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
+            --gtest_filter=GroupedM4SourceInventory.CoversOriginalCatalog:OriginalSources/GroupedM4Source.Static/Q4_K_routed_gate_up:OriginalSources/GroupedM4Source.Deferred/Q4_K_routed_gate_up:OriginalSources/GroupedM4Source.Static/Q8_1_source_boundary
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;GraphCapture;Replay;ByteExact;GeneratedSource;Devices1;NativeISA-gfx906"
+        MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
+        ENVIRONMENT ${grouped_m4_all_formats_env})
+    if(TEST V2_Integration_GroupedM4SourceCountedReplay_ROCm)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedM4SourceCountedReplay_ROCm)
+    endif()
+
+    add_v2_test(V2_Integration_GroupedM4BankPublicationRejects_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
+            --gtest_filter=OriginalSources/GroupedM4Source.Static/Q4_K_sparse_routes
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;GraphCapture;Replay;ByteExact;GeneratedSource;Devices1;NativeISA-gfx906"
+        MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
+        ENVIRONMENT ${grouped_m4_all_formats_env})
+    if(TEST V2_Integration_GroupedM4BankPublicationRejects_ROCm)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedM4BankPublicationRejects_ROCm)
+    endif()
+
+    add_v2_test(V2_Integration_GroupedM4MeasuredSourceAlias_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
+            --gtest_filter=OriginalSources/GroupedM4Source.Static/Q5_1_routed_gate_up
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;GraphCapture;ByteExact;Replay;Regression;Devices1;NativeISA-gfx906"
+        MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
+        ENVIRONMENT LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16 LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER=1
+            LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK=1 LLAMINAR_QFN_ROCM_GROUPED_FFN_EQUAL_FRONTIER=1
+            LLAMINAR_QFN_ROCM_GROUPED_FFN_ALL_FORMATS=0 LLAMINAR_TEST_GROUPED_M4_PROGRAM=fixed
+            LLAMINAR_TEST_GROUPED_M4_REQUIRED_SYMBOL=groupedFFNPairedGatePublish LLAMINAR_TEST_GROUPED_M4_SYMBOL_PRESENT=0
+            LLAMINAR_PERF_STATS_SUMMARY=1 LLAMINAR_PERF_STATS_FILTER=kernel.rocm_grouped_ffn_frontier_calls)
+    if(TEST V2_Integration_GroupedM4MeasuredSourceAlias_ROCm)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedM4MeasuredSourceAlias_ROCm)
+    endif()
+
     # Rebuild original encodings and select the kernel from its prepared weights.
     # Both correctness modes run under the same rank allocation. Performance
     # uses an independent native event session with only consumer-visible outputs.
