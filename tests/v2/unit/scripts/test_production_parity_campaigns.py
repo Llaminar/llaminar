@@ -1858,13 +1858,16 @@ add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COM
         row = campaigns.PreflightRegistration(name, frozenset(("Integration", "HardwareOptional",
             "ROCm", "Devices2", "DistinctNUMARanks")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 2)
         mixed = campaigns.PreflightRegistration("V2_Integration_CapturedTransferRank_MixedCUDA_ROCm",
-            frozenset(("Integration", "CUDA", "ROCm")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 3)
+            frozenset(("Integration", "CUDA", "ROCm", "HardwareOptional", "Devices2",
+                       "CUDADevices1", "ROCmDevices1", "DistinctNUMARanks")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 3)
         local = campaigns.PreflightRegistration("V2_Integration_NativeCompleted_ROCm4",
             frozenset(("Integration", "ROCm", "Devices4")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 4)
         tests = ("V2_Unit_A", name, mixed.name, local.name)
         requirements = campaigns.preflight_optional_hardware_requirements((row, mixed, local))
         self.assertEqual(requirements, {name: {"backend": "rocm", "degree": 2,
-            "locality": "two-distinct-numa-local-ranks"}})
+            "locality": "two-distinct-numa-local-ranks"},
+            mixed.name: {"backend_degrees": {"cuda": 1, "rocm": 1}, "mpi_ranks": 2,
+                         "locality": "two-distinct-numa-local-ranks"}})
         same_socket = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
             {"backend": "rocm", "ordinal": ordinal, "numa_node": 1} for ordinal in range(5)]}
         from production_artifacts import validate_preflight_qualification
@@ -1876,7 +1879,7 @@ add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COM
                 qualified = campaigns.preflight_hardware_qualification(tests, requirements, hardware)
                 self.assertEqual(name in qualified["selected"], eligible)
                 self.assertEqual(name in qualified["unqualified"], not eligible)
-                self.assertIn(mixed.name, qualified["selected"])
+                self.assertIn(mixed.name, qualified["unqualified"])
                 self.assertIn(local.name, qualified["selected"])
                 validate_preflight_qualification(list(tests), qualified)
                 forged = {**qualified, "selected": [test for test in tests if test != name] if eligible else list(tests),

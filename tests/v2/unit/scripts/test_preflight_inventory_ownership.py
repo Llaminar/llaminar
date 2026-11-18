@@ -216,6 +216,28 @@ class PreflightInventoryOwnershipTests(unittest.TestCase):
                 else:
                     self.assertTrue({family, "Devices2", "LocalHostDevices", "HardwareOptional"} <= set(labels))
 
+    def test_original_channel_and_pipeline_replays_require_their_physical_endpoints(self) -> None:
+        """Run each cohort only when the native selector can bind its actual participants."""
+        for row in self.document["tests"]:
+            labels = set(next((prop["value"] for prop in row["properties"] if prop["name"] == "LABELS"), ()))
+            if "ProductionTestPreflight" not in labels:
+                continue
+            name = row["name"]
+            expected = set()
+            for argument in row.get("command", []):
+                if argument.startswith("--pipeline-native-degree="):
+                    degree = int(argument.partition("=")[2])
+                    expected.add(f"Devices{degree}")
+            if name.startswith(("V2_Integration_CapturedChannelCancellation_",
+                                "V2_Integration_PipelineActivationCompletedFanout_")):
+                expected.add("Devices2")
+            if name == "V2_Integration_CapturedTransferRank_MixedCUDA_ROCm":
+                expected.update(("Devices2", "CUDADevices1", "ROCmDevices1", "DistinctNUMARanks"))
+            if expected:
+                with self.subTest(name=name):
+                    self.assertTrue(expected | {"HardwareOptional"} <= labels)
+                    self.assertNotIn("LocalHostDevices", labels)
+
     def test_every_filter_retains_complete_process_ownership(self) -> None:
         """CUDA, ROCm and performance filters inherit their executable's scope."""
         self.assertTrue(validate_inventory(self.document, BACKENDS))

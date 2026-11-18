@@ -24388,52 +24388,52 @@ foreach(measurement_backend IN ITEMS CPU CUDA ROCm)
             COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
                 --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=1
                 --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_HostDeviceCapturedClockReplay
-            LABELS "V2;Integration;Planning;${measurement_backend};Replay;Regression;ProductionTestPreflight"
+            LABELS "HardwareOptional;Devices1;V2;Integration;Planning;${measurement_backend};Replay;Regression;ProductionTestPreflight"
             MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
         add_v2_test(V2_Integration_PlanningHostDeviceService_${measurement_backend}
             COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
                 --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=1
                 --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_HostDeviceService
-            LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
+            LABELS "HardwareOptional;Devices1;V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
             MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
         add_v2_test(V2_Integration_PlanningNativeLocalTP_${measurement_backend}
             COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
                 --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
                 --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_NativeLocalTP
-            LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
-            GPU_DEVICES 2 MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
+            LABELS "HardwareOptional;Devices2;V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
+            MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
         add_v2_test(V2_Integration_PlanningDirectedPairMatrixReplay_${measurement_backend}
             COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
                 --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
                 --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_DirectedPairMatrixReplay
-            LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
-            GPU_DEVICES 2 MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
+            LABELS "HardwareOptional;Devices2;V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
+            MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningDirectedPairMatrixReplay_${measurement_backend})
         add_v2_test(V2_Integration_PlanningNativeGatherCapturedClockReplay_${measurement_backend}
             COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
                 --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
                 --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_NativeGatherCapturedClockReplay
-            LABELS "V2;Integration;Planning;${measurement_backend};Replay;Regression;ProductionTestPreflight"
-            GPU_DEVICES 2 MPI_PROCS 1 NO_MPI TIMEOUT 120 NO_MODELS)
+            LABELS "HardwareOptional;Devices2;V2;Integration;Planning;${measurement_backend};Replay;Regression;ProductionTestPreflight"
+            MPI_PROCS 1 NO_MPI TIMEOUT 120 NO_MODELS)
         add_v2_test(V2_Integration_PlanningNativeCollectiveCapturedClockReplay_${measurement_backend}
             COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
                 --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
                 --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_NativeCollectiveCapturedClockReplay
-            LABELS "V2;Integration;Planning;${measurement_backend};Replay;Regression;ProductionTestPreflight"
-            GPU_DEVICES 2 MPI_PROCS 1 NO_MPI TIMEOUT 120 NO_MODELS)
+            LABELS "HardwareOptional;Devices2;V2;Integration;Planning;${measurement_backend};Replay;Regression;ProductionTestPreflight"
+            MPI_PROCS 1 NO_MPI TIMEOUT 120 NO_MODELS)
         add_v2_test(V2_Integration_PlanningPhysicalPeerOnlyReplay_${measurement_backend}
             COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
                 --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
                 --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_PhysicalPeerOnlyReplay
-            LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight;Economy"
-            GPU_DEVICES 2 MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
+            LABELS "HardwareOptional;Devices2;V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight;Economy"
+            MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningPhysicalPeerOnlyReplay_${measurement_backend})
         add_v2_test(V2_Integration_PlanningPreparedDevicePeerCopy_${measurement_backend}
             COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
                 --pipeline-native-family=${_planning_host_family} --pipeline-native-degree=2
                 --gtest_filter=PlanningExecutionMeasurementIntegration.${measurement_backend}_PreparedDevicePeerCopyContract
-            LABELS "V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
-            GPU_DEVICES 2 MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
+            LABELS "HardwareOptional;Devices2;V2;Integration;Planning;${measurement_backend};Regression;ProductionTestPreflight"
+            MPI_PROCS 1 NO_MPI TIMEOUT 60 NO_MODELS)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningPreparedDevicePeerCopy_${measurement_backend})
         # Explicit, short startup timing diagnostic. Correctness replay above
         # owns preflight; timing has no machine-dependent pass/fail threshold.
@@ -28416,14 +28416,14 @@ if(HAVE_CUDA)
         COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
             --pipeline-native-family=cuda --pipeline-native-degree=2
             --gtest_filter=PlanningExecutionMeasurementIntegration.CUDA_NativeLocalTPContextStorageLifetime
-        LABELS "V2;Integration;ProductionTestPreflight;Planning;CUDA;NCCL;GraphCapture;PhysicalMemoryAuthority;Lifecycle;Regression"
-        GPU_DEVICES 2 MPI_PROCS 1 NO_MPI TIMEOUT 30 NO_MODELS)
+        LABELS "HardwareOptional;Devices2;V2;Integration;ProductionTestPreflight;Planning;CUDA;NCCL;GraphCapture;PhysicalMemoryAuthority;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI TIMEOUT 30 NO_MODELS)
     add_v2_test(V2_Integration_CUDA_NativeLocalTPContextStoragePrefillBucket
         COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
             --pipeline-native-family=cuda --pipeline-native-degree=2
             --gtest_filter=PlanningExecutionMeasurementIntegration.CUDA_NativeLocalTPContextStoragePrefillBucket
-        LABELS "V2;Integration;ProductionTestPreflight;Planning;CUDA;NCCL;GraphCapture;PhysicalMemoryAuthority;Lifecycle;Regression"
-        GPU_DEVICES 2 MPI_PROCS 1 NO_MPI TIMEOUT 30 NO_MODELS)
+        LABELS "HardwareOptional;Devices2;V2;Integration;ProductionTestPreflight;Planning;CUDA;NCCL;GraphCapture;PhysicalMemoryAuthority;Lifecycle;Regression"
+        MPI_PROCS 1 NO_MPI TIMEOUT 30 NO_MODELS)
 endif()
 
 # Test: ClusterInventoryGatherer — pure projection from observed hardware fixtures.
@@ -31933,6 +31933,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
         if(_topology MATCHES "^(CUDA|ROCm)1_CPU1$")
             string(TOLOWER "${CMAKE_MATCH_1}" _no_peer_family)
             set(_no_peer_launch --pipeline-native-family=${_no_peer_family} --pipeline-native-degree=1)
+            list(APPEND _no_peer_labels HardwareOptional Devices1)
             set(_no_peer_process NO_MPI)
             set(_no_peer_mpi_procs 1)
         endif()
@@ -32118,7 +32119,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 COMMAND $<TARGET_FILE:v2_integration_moe_pipeline_weight_preparation>
                     --pipeline-native-family=${_ordinary_retention_family} --pipeline-native-degree=1
                     --gtest_filter=Backends/HostedOrdinaryForward.MaterializesCompleteHostedBodyAndReusesAcrossResets/${_backend}_${_retention}
-                LABELS "V2;Integration;ProductionTestPreflight;${_backend};CPU;MoE;ExpertOverlay;GraphCapture;Ownership;RequestReset;Regression"
+                LABELS "HardwareOptional;Devices1;V2;Integration;ProductionTestPreflight;${_backend};CPU;MoE;ExpertOverlay;GraphCapture;Ownership;RequestReset;Regression"
                 MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
                 V2_Integration_OrdinaryForwardRetention_${_backend}_${_retention})
@@ -38455,8 +38456,8 @@ foreach(_backend CUDA ROCm)
         COMMAND $<TARGET_FILE:v2_integration_pipeline_mtp_state>
             --pipeline-native-family=${_pipeline_teacher_family} --pipeline-native-degree=2
             --gtest_filter=Backends/PipelineMTPStateOwnership.OrdinaryPipelineForwardOnlyPreservesPendingTeachers/${_backend}
-        LABELS "V2;Integration;ProductionTestPreflight;${_backend};PipelineParallel;GraphCapture;Lifecycle;ByteExact;Regression"
-        GPU_DEVICES 2 MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
+        LABELS "HardwareOptional;Devices2;V2;Integration;ProductionTestPreflight;${_backend};PipelineParallel;GraphCapture;Lifecycle;ByteExact;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120)
 endforeach()
 
 # Keep terminal-result and teardown synchronization allowances narrowly scoped.
@@ -38508,17 +38509,15 @@ if(HAVE_CUDA)
     endforeach()
     foreach(_width 2 4)
         set(_failure_test V2_Integration_PipelineForwardOnlyEnqueueFailure_CUDA)
-        set(_failure_hardware "")
         if(_width EQUAL 4)
             string(APPEND _failure_test "_Stages4")
-            set(_failure_hardware "HardwareOptional;Devices4")
         endif()
         add_v2_test(${_failure_test}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py
                 $<TARGET_FILE:v2_integration_pipeline_forward_only_failure_cuda> --pipeline-native-family=cuda --pipeline-native-degree=${_width}
                 --original-case-env=LLAMINAR_TEST_PIPELINE_REPLAY_ORDER=forward,reverse
                 --original-case-env=LLAMINAR_TEST_PIPELINE_REPLAY_FAULT=first,second,tail
-            LABELS "V2;Integration;ProductionTestPreflight;CUDA;PipelineParallel;GraphCapture;Lifecycle;FaultInjection;Regression;${_failure_hardware}"
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;PipelineParallel;GraphCapture;Lifecycle;FaultInjection;Regression;HardwareOptional;Devices${_width}"
             MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120
             ENVIRONMENT "LLAMINAR_TEST_PIPELINE_REPLAY_WIDTH=${_width}")
     endforeach()
@@ -38536,17 +38535,15 @@ if(HAVE_ROCM)
     endforeach()
     foreach(_width 2 4)
         set(_failure_test V2_Integration_PipelineForwardOnlyEnqueueFailure_ROCm)
-        set(_failure_hardware "")
         if(_width EQUAL 4)
             string(APPEND _failure_test "_Stages4")
-            set(_failure_hardware "HardwareOptional;Devices4")
         endif()
         add_v2_test(${_failure_test}
             COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py
                 $<TARGET_FILE:v2_integration_pipeline_forward_only_failure_rocm> --pipeline-native-family=rocm --pipeline-native-degree=${_width}
                 --original-case-env=LLAMINAR_TEST_PIPELINE_REPLAY_ORDER=forward,reverse
                 --original-case-env=LLAMINAR_TEST_PIPELINE_REPLAY_FAULT=first,second,tail
-            LABELS "V2;Integration;ProductionTestPreflight;ROCm;PipelineParallel;GraphCapture;Lifecycle;FaultInjection;Regression;${_failure_hardware}"
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;PipelineParallel;GraphCapture;Lifecycle;FaultInjection;Regression;HardwareOptional;Devices${_width}"
             MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 120
             ENVIRONMENT "LLAMINAR_TEST_PIPELINE_REPLAY_WIDTH=${_width}")
     endforeach()
@@ -40537,7 +40534,7 @@ if(TARGET v2_integration_captured_transfer_channel)
                 add_v2_test(${_cancel_name}
                     COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                         --gtest_filter=CapturedTransferCancellation.${_cancel_backend}${_cancel_phase}
-                    LABELS "V2;Integration;ProductionTestPreflight;GPU;${_cancel_backend};Transfer;Capture;Cancellation;Replay;Regression"
+                    LABELS "V2;Integration;ProductionTestPreflight;GPU;${_cancel_backend};HardwareOptional;Devices2;Transfer;Capture;Cancellation;Replay;Regression"
                     MPI_PROCS 2 NO_MODELS TIMEOUT 30)
                 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_cancel_name})
             endforeach()
@@ -41326,7 +41323,7 @@ if(TARGET v2_integration_captured_transfer_channel)
         add_v2_test(V2_Integration_CapturedTransferRank_MixedCUDA_ROCm
             COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                 --gtest_filter=CapturedTransferRankNative.MixedCUDA_ROCmRecordedRowsAndRetirement
-            LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;Transfer;MPI;GraphCapture;LiveExtent;ByteExact;Replay;Regression"
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;HardwareOptional;Devices2;CUDADevices1;ROCmDevices1;DistinctNUMARanks;Transfer;MPI;GraphCapture;LiveExtent;ByteExact;Replay;Regression"
             MPI_PROCS 2 NO_MODELS TIMEOUT 120)
         if(TEST V2_Integration_CapturedTransferRank_MixedCUDA_ROCm)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedTransferRank_MixedCUDA_ROCm)
@@ -41375,7 +41372,7 @@ if(TARGET v2_integration_captured_transfer_channel)
             add_v2_test(V2_Integration_PipelineActivationCompletedFanout_${_fanout_backend}
                 COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                     --gtest_filter=PipelineActivationFanoutNative.${_fanout_backend}RecordedRowsAndPoisonReplay
-                LABELS "V2;Integration;ProductionTestPreflight;${_fanout_backend};Transfer;MPI;Pipeline;GraphCapture;LiveExtent;ByteExact;Replay;Regression"
+                LABELS "V2;Integration;ProductionTestPreflight;${_fanout_backend};HardwareOptional;Devices2;Transfer;MPI;Pipeline;GraphCapture;LiveExtent;ByteExact;Replay;Regression"
                 MPI_PROCS 2 NO_MODELS TIMEOUT 120)
             if(TEST V2_Integration_PipelineActivationCompletedFanout_${_fanout_backend})
                 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PipelineActivationCompletedFanout_${_fanout_backend})
@@ -41810,7 +41807,7 @@ foreach(_hosted_prefix_backend CUDA ROCm)
             COMMAND $<TARGET_FILE:v2_integration_moe_pipeline_weight_preparation>
                 --pipeline-native-family=${_hosted_prefix_family} --pipeline-native-degree=1
                 --gtest_filter=MoEHostedActivationPublication.PendingHostLiveExtent_${_hosted_prefix_backend}
-            LABELS "V2;Integration;ProductionTestPreflight;${_hosted_prefix_backend};Pipeline;Transfer;Publication;LiveExtent;Replay;Regression"
+            LABELS "HardwareOptional;Devices1;V2;Integration;ProductionTestPreflight;${_hosted_prefix_backend};Pipeline;Transfer;Publication;LiveExtent;Replay;Regression"
             MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_HostedActivationPublishedLivePrefix_${_hosted_prefix_backend})
     endif()
