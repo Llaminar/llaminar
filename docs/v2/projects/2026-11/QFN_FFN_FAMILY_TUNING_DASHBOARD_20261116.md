@@ -2,6 +2,26 @@
 
 Status dashboard for 15 physical decoder specialisations. Limit 15,000 UTF-8 bytes.
 
+## Current Release on the original four-MI50 split
+
+Checkpoint `261abf958` used routed expert widths of 128/128/128/256,
+160 shared columns per GPU and the measured verifier switches. Both engines
+ran the same input IDs on the same four cards. Entries are **prefill / decode
+tokens per second**, medians of three 256-token generations after warmup.
+
+| Mode | Review 512, Llaminar | Review 512, Castagna | Code 2048, Llaminar | Code 2048, Castagna |
+| --- | ---: | ---: | ---: | ---: |
+| Off | 1041.79 / 86.46 | 874.62 / 85.76 | 1009.02 / 81.36 | 922.66 / 73.64 |
+| Fixed 3 | 1002.95 / 137.00 | 785.74 / 117.62 | 970.55 / 112.44 | 892.87 / 108.39 |
+| Dynamic / adaptive | 1000.75 / 131.45 | 672.70 / 70.71 | 970.76 / 108.02 | 794.71 / 79.81 |
+
+All 18 Llaminar histories matched the qualified control. Both MTP modes
+also matched their own ordinary decode and all five verifier-work counters.
+Castagna generated different continuations and its throughput includes its
+own draft acceptance. The largest remaining fixed-depth stage deficit on
+code2048 is 3.08 ms/round in HC, projections, routing and experts.
+[Matched workload, numerical checks and phase timings](QFN_MI50_STAGE_COMPARISON_20261118.md#fixed-depth-verifier-on-the-original-tp4-split-code2048)
+
 ## Full-model throughput on four MI50s with equal-width Llaminar shards
 
 Both Release engines used the same four model shards, the same four cards
@@ -73,7 +93,9 @@ at six rows. Its gate reaches 27.6% of the corresponding read reference.
 G13 shares those gate operands and improved from 437.70 to 359.86 µs.
 The original TP4 code2048 fixed-3 target now measures 23.17 ms/round versus
 18.22 for Castagna. HC, projections, routing and experts account for 3.08 ms
-of the 4.95 ms gap.
+of the 4.95 ms gap. The subsequent HC, selector and indexed-reader changes kept all 18
+generations exact. Fixed-depth decode measured 137.38 and 111.88 tok/s on
+review512 and code2048. Aggregate performance was within 0.5% of the predecessor.
 [Latest four-card stage timings](QFN_MI50_STAGE_COMPARISON_20261118.md#fixed-depth-verifier-on-the-original-tp4-split-code2048)
 [Indexed-format measurements](QFN_MI50_STAGE_COMPARISON_20261118.md#indexed-weight-formats-on-mi50)
 [Architecture coverage](QFN_MI50_STAGE_COMPARISON_20261118.md#verifier-schedules-by-gpu)
@@ -93,37 +115,13 @@ includes the fused GDN input projection.
 | Attention, indexer and RoPE | 0.650 | 0.204 |
 | GDN and convolution state | 0.745 | 0.600 |
 
-A second Release compared the original gather and ascending FP32 fold with a
-direct peer push that preserves the same sum order. The only change between
-arms was the transport selector. All six 256-token outputs matched. Each
-ordinary graph lost 97 native nodes per card.
-
-| Prompt | Gather/fold decode | Direct peer decode | Castagna decode | Direct peer prefill |
-| --- | ---: | ---: | ---: | ---: |
-| Review 512 | 68.28 | 78.30 | 86.17 | 1038.48 |
-| Code 2048 | 64.68 | 74.05 | 75.93 | 1009.12 |
-
-Direct peer saved 1.87 and 1.96 ms per generated token. The isolated 10 KiB
-reduction took 12.15 µs against 26.81 µs for gather and fold.
-
-Native partial, empty, abort and same-process owner-replacement replays passed.
-Two sequential model owners reused one real communicator and each released its
-host and device reservations. The final lifecycle build reproduced all six
-histories at 78.23 and 74.04 decode tok/s. Peer push remains opt-in. Wider deployment needs
-native coverage of additional cohorts and their serving lifecycles.
-
-An independent publication fusion removed 98 decode nodes per device and
-matched six ordinary histories. It regressed review from 67.69 to 66.17 tok/s
-and code from 64.39 to 62.69 tok/s. The publication fusion stays out of the selected policy.
-
-The review fixed-3 trace reproduced all 256 output IDs and its unprofiled
-222 draft steps, 182 accepts and 74 verifier calls. Each MI50 ran a 2,392-node
-verifier graph 74 times (296 target rows). It accounted for 88.4–88.6% of
-post-prefill summed kernel time, measured separately on each card. On the
-first card routed expert projection/activation took 6.80 ms per verifier
-call, other projections 6.32 ms and HC normalization/residual 5.96 ms.
-The 320-wide Q8 residual projection alone took 3.54 ms across 97 dispatches
-per verifier call. The trace used the original gather/fold transport.
+Direct peer push saved 1.87–1.96 ms per ordinary token over the earlier
+gather and ordered fold, removed 97 nodes per GPU and matched all six
+histories. Its isolated 10 KiB reduction took 12.15 versus 26.81 µs.
+This transport remains opt-in. Native replays cover partial and empty work,
+abort and communicator reuse. A separate publication fusion reduced node
+count but slowed both prompts and remains outside the selected policy.
+[Transport and lifecycle measurements](QFN_MI50_STAGE_COMPARISON_20261118.md)
 
 ## Real-model shapes
 

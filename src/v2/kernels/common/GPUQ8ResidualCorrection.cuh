@@ -34,7 +34,8 @@
 #include "kernels/rocm/common/ROCmSignedDot4.h"
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
-#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "kernels/common/VerifierDispatchTable.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
 #include "utils/DebugEnv.h"
 #include "kernels/rocm/ops/ROCmSwiGLUDecodeEquivalentMath.h"
 #define Q8R_STREAM hipStream_t
@@ -184,11 +185,15 @@ template<int Rows>__global__ __launch_bounds__(128,2) void project(GPUQ8Residual
 }
 #if !defined(Q8_RESIDUAL_CUDA)
 /** @brief Each lane computes both native Q8 terms for one K32 and multiple actual rows. */
-__global__ __launch_bounds__(320) void projectHCGroupedShortK(GPUQ8ResidualCorrectionArgs a)
+template<unsigned Columns>
+__device__ __forceinline__ void projectHCGroupedShortKBody(
+    GPUQ8ResidualCorrectionArgs a, float (&primary)[4][10][Columns], float (&residual)[4][10][Columns])
 {
-    constexpr unsigned Groups=10, Rows=4, Columns=32, OutputWidth=10240;
-    __shared__ float primary[Rows][Groups][Columns],residual[Rows][Groups][Columns];
-    const unsigned kBlock=threadIdx.x/Columns, ci=threadIdx.x%Columns;
+    constexpr unsigned Groups=10, Rows=4, OutputWidth=10240;
+    static_assert(Columns==32 || Columns==64);
+    const unsigned ci=threadIdx.x%Columns;
+    const unsigned kBlock=Columns==64
+        ? __builtin_amdgcn_readfirstlane(threadIdx.x/Columns) : threadIdx.x/Columns;
     const unsigned column=blockIdx.x*Columns+ci;
     const unsigned rowBase=blockIdx.y*Rows;
     const unsigned live=a.rows.activeRows();
@@ -229,21 +234,47 @@ __global__ __launch_bounds__(320) void projectHCGroupedShortK(GPUQ8ResidualCorre
     }
 }
 
-/** @brief Admit only the observed physical roster and original grouped Q8 HC-up tuple. */
-inline bool useHCGroupedShortK(const GPUQ8ResidualCorrectionArgs& a)
+/** @brief Original half-wave K32 layout for unmeasured row capacities. */
+__global__ __launch_bounds__(320) void projectHCGroupedShortK(GPUQ8ResidualCorrectionArgs a)
+{
+    __shared__ float primary[4][10][32],residual[4][10][32];
+    projectHCGroupedShortKBody(a,primary,residual);
+}
+
+/** @brief One physical MI50 wave per K32 group, measured for four retained rows. */
+__global__ __launch_bounds__(640) void projectHCGroupedShortKWide(GPUQ8ResidualCorrectionArgs a)
+{
+    __shared__ float primary[4][10][64],residual[4][10][64];
+    projectHCGroupedShortKBody(a,primary,residual);
+}
+
+/** @brief Prepared ROCm grouped HC-up schedule for this original native tuple. */
+enum class HCGroupedShortKSchedule { Disabled, Column32, Column64 };
+
+/**
+ * @brief Choose the schedule for the participant recording this grouped Q8 projection.
+ * @param a Prepared original weights and retained row geometry.
+ * @param stream Exact non-null stream from operand and publication validation.
+ * @return The admitted native schedule for this tuple and stream owner.
+ */
+inline HCGroupedShortKSchedule selectHCGroupedShortK(const GPUQ8ResidualCorrectionArgs& a, hipStream_t stream)
 {
     const auto physical=a.rows.physicalRows();
     if(physical<2||physical>8||a.weights.n!=10240||a.weights.k!=320||
        a.weights.blocks_per_row!=10||a.weights.codebook_id!=19||!a.weights.source_identity_present||
        a.weights.source_codebook_id!=19||a.weights.source_is_superblock||
        !qfnGroupedHCUpShortKExperiment())
-        return false;
+        return HCGroupedShortKSchedule::Disabled;
     int ordinal=-1;
-    if(const auto error=hipGetDevice(&ordinal);error!=hipSuccess)
+    if(const auto error=hipStreamGetDevice(stream, &ordinal);error!=hipSuccess)
         throw std::runtime_error(hipGetErrorString(error));
-    const auto& metadata=rocmHardwareMetadata().at(ordinal);
-    return metadata.compute_units==60&&metadata.native_wave_width==64&&
-        (metadata.isa_target=="gfx906"||metadata.isa_target.starts_with("gfx906:"));
+    const auto hardware=rocm::nativeQuantisedHardwareForDevice(ordinal);
+    if(native_quantised::selectVerifierDispatchTable(hardware)!=native_quantised::VerifierDispatchTable::MI50)
+        return HCGroupedShortKSchedule::Disabled;
+    // A full native wave shares each activation K32 across 64 output columns.
+    // Only M4 was measured; preserve the original schedule for other row buckets.
+    return physical==4 && hardware.admits(640,20480)
+        ? HCGroupedShortKSchedule::Column64 : HCGroupedShortKSchedule::Column32;
 }
 #endif
 
@@ -645,9 +676,10 @@ static void submitQ8ResidualProjection(const GPUQ8ResidualCorrectionArgs &a, voi
     if (shortGeometry && a.weights.blocks_per_row != static_cast<unsigned>(shortGeometry->groups))
         throw std::invalid_argument("Ordered short-K source groups differ from retained geometry");
 #if !defined(Q8_RESIDUAL_CUDA)
-    bool groupedHCShortK=false;
+    using Q8R_NAMESPACE::HCGroupedShortKSchedule;
+    auto groupedHCShortK=HCGroupedShortKSchedule::Disabled;
     if constexpr (!SingleGroupReference && std::is_same_v<Publication,GPUHCResidualDownPublication>)
-        groupedHCShortK=Q8R_NAMESPACE::useHCGroupedShortK(a);
+        groupedHCShortK=Q8R_NAMESPACE::selectHCGroupedShortK(a,native);
 #endif
     const auto grid = shortGeometry ? shortGeometry->blocks : geometry.blocks;
     if ((tasks + 7) / 8 > INT_MAX || grid > INT_MAX)
@@ -671,10 +703,10 @@ static void submitQ8ResidualProjection(const GPUQ8ResidualCorrectionArgs &a, voi
 #endif
     }
 #if !defined(Q8_RESIDUAL_CUDA)
-    else if(groupedHCShortK)
-    {
+    else if(groupedHCShortK==HCGroupedShortKSchedule::Column64)
+        Q8R_NAMESPACE::projectHCGroupedShortKWide<<<160,640,0,native>>>(a);
+    else if(groupedHCShortK==HCGroupedShortKSchedule::Column32)
         Q8R_NAMESPACE::projectHCGroupedShortK<<<dim3(320,(a.rows.physicalRows()+3)/4),320,0,native>>>(a);
-    }
 #endif
     else if (shortGeometry)
         Q8R_NAMESPACE::launchOrderedShortK(a, *shortGeometry, native);
@@ -712,7 +744,7 @@ static void submitQ8ResidualProjection(const GPUQ8ResidualCorrectionArgs &a, voi
     // replay does not revisit this factory or increment this counter. No live
     // count, device ordinal or compiler resource query is performed here.
 #if !defined(Q8_RESIDUAL_CUDA)
-    if (groupedHCShortK && PerfStatsCollector::isDomainEnabled("kernel"))
+    if (groupedHCShortK!=HCGroupedShortKSchedule::Disabled && PerfStatsCollector::isDomainEnabled("kernel"))
         PerfStatsCollector::addCounter("kernel","q8_residual_grouped_hc_short_k_submissions",
             1.0,"submission",{},{{"physical_rows",std::to_string(a.rows.physicalRows())}});
 #endif

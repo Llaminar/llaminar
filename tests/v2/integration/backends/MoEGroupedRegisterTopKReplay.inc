@@ -263,7 +263,7 @@ namespace
                     };
                     // The tested donor's adversarial cases and native policy
                     // recordings both retain their exact input bytes over replay.
-                    constexpr int adversarial_patterns = 8;
+                    constexpr int adversarial_patterns = 10;
                     for (int pattern = 0; pattern < adversarial_patterns + int(recorded.size()); ++pattern)
                     {
                         if (pattern >= adversarial_patterns)
@@ -282,6 +282,13 @@ namespace
                                     case 5: if (expert == 1) value = std::numeric_limits<float>::infinity(); break;
                                     case 6: if (expert > 1) value = nan; break;
                                     case 7: value = expert % 2 ? -0.f : 0.f; break;
+                                    // Every 64-expert wave has candidates tied at the global cutoff.
+                                    case 8: value = ((expert + row) % 64 < 3) ? 1.0f : -1.0f; break;
+                                    // Put the ten winners in one 16-entry local frontier; the
+                                    // next group has adjacent FP32 logits and competes at rank ten.
+                                    case 9: value = expert >= 448 && expert < 458 ? 4.0f :
+                                                    (expert >= 256 && expert < 274 ?
+                                                        std::nextafter(4.0f, 0.0f) : 0.0f); break;
                                 }
                                 input[size_t(row) * experts + expert] = value;
                             }

@@ -148,14 +148,23 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
                     const int parts=routed?(isGate?gateParts:upParts):
                         (isGate?sharedGate.partitions():sharedUp.partitions());
                     const auto values=[&] {
-                        if constexpr(FixedQ5Pitch>0)
+                        if constexpr(batchIQ3XXS) {
+                            // The bound original gate/up envelopes prove these physical
+                            // readers for every bank reachable by this capture.
+                            return routed
+                                ?generic::orderedProjectionFormat<NATIVE_QUANTISED_PF_IQ3_XXS,1,4,false,0,true>(
+                                    projection,column,hidden,users,parts,lane)
+                                :generic::orderedProjectionFormat<NATIVE_QUANTISED_PF_IQ2_S,1,4,false>(
+                                    projection,column,hidden,users,parts,lane);
+                        }
+                        else if constexpr(FixedQ5Pitch>0)
                             return routed
                                 ?generic::orderedProjectionFormat<NATIVE_QUANTISED_PF_Q5_1,1,4,false,FixedQ5Pitch>(
                                     projection,column,hidden,users,parts,lane)
                                 :generic::orderedProjectionFormat<NATIVE_QUANTISED_PF_Q8_0,1,4,false,160>(
                                     projection,column,hidden,users,parts,lane);
                         else
-                            return generic::orderedProjection<1,4,Groups,false,batchIQ3XXS>(projection,column,hidden,users,parts,lane,formats);
+                            return generic::orderedProjection<1,4,Groups>(projection,column,hidden,users,parts,lane,formats);
                     }();
                     if(isGate)gateValue=values.value[0];
                     else if(lane<16) {

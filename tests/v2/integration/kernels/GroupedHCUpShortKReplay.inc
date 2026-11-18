@@ -3,16 +3,18 @@
  * @brief Counted production capture and independent exact M1 oracle for ROCm HC-up.
  */
 #ifdef HAVE_ROCM
+#include "kernels/common/VerifierDispatchTable.h"
 namespace {
 /** @brief Compare an actual production grouped capture with exact independent M1 diagnostic calls.
- * @param device Physical gfx906 test participant. @param m Retained physical row capacity.
+ * @param device Original physical ROCm test participant. @param m Retained physical row capacity.
  * @param source_file Optional original GGUF-native Q8_0 window for manual replay.
  */
 void proveGroupedHCUpShortK(DeviceId device,int m,const std::filesystem::path& source_file) {
     auto* backend=getBackendFor(device);
     require(backend&&backend->deviceCount()>device.ordinal,"Exact rank-local ROCm participant required");
-    const auto& hardware=rocmHardwareMetadata().at(device.ordinal);
-    require(hardware.compute_units==60&&hardware.isa_target.starts_with("gfx906"),"Exact physical MI50 expected");
+    const auto hardware=rocm::nativeQuantisedHardwareForDevice(device.ordinal);
+    const auto table=native_quantised::selectVerifierDispatchTable(hardware);
+    const bool measured=table==native_quantised::VerifierDispatchTable::MI50;
     constexpr int n=10240,k=320,blocks=10,guards=16;
     auto& worker=GPUDeviceContextPool::instance().getContext(device);
     worker.submitAndWait([&] {
@@ -53,13 +55,30 @@ void proveGroupedHCUpShortK(DeviceId device,int m,const std::filesystem::path& s
             require(graph->instantiate(),"Instantiate grouped HC-up");
             std::vector<GPUGraphKernelNodeInfo> nodes;
             std::string error;
-            require(graph->inspectKernelNodes(nodes,&error)&&nodes.size()==2,"Exact native publisher and consumer");
+            require(graph->inspectKernelNodes(nodes,&error)&&nodes.size()==2&&graph->nodeCount()==2,
+                    "Exact native publisher and consumer without transfer nodes");
             bool selected=false;
             for(const auto& node:nodes) {
                 require(node.name_resolved&&node.local_memory_bytes_per_thread==0,"Zero private bytes in both retained entries");
-                selected|=node.name.find("projectHCGroupedShortK")!=std::string::npos;
+                if(node.name.find("publishHCResidualDown")!=std::string::npos)
+                    continue;
+                if(measured) {
+                    const bool wide=m==4 && hardware.admits(640,20480);
+                    require(node.name.find(wide?"projectHCGroupedShortKWide":"projectHCGroupedShortK")!=std::string::npos &&
+                            node.block_x==(wide?640u:320u) && node.grid_x==(wide?160u:320u) &&
+                            node.grid_y==static_cast<unsigned>((m+3)/4) &&
+                            node.static_shared_memory_bytes==(wide?20480u:10240u),
+                            "Observed retained HC-up schedule must match the measured table");
+                } else {
+                    require(table==native_quantised::VerifierDispatchTable::Portable &&
+                            node.name.find("projectHCGroupedShortK")==std::string::npos &&
+                            node.block_x==128u && node.grid_x==static_cast<unsigned>(80*((m+3)/4)) &&
+                            node.grid_y==1 && node.static_shared_memory_bytes==0,
+                            "Unmeasured ROCm participates through its original portable grouped projection");
+                }
+                selected=true;
             }
-            require(selected,"Original production ingress did not select grouped HC-up short K");
+            require(selected,"Original production ingress did not select the table-owned HC-up projection");
             return graph;
         };
         const auto serial=[&](int count) {
@@ -148,5 +167,16 @@ TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCUpShortKProductionReplay)
         return;
     }
     GTEST_SKIP()<<"Experimental grouped HC-up requires native gfx906 wave64 and 60 CUs";
+}
+
+/** @test Measured MI50 and portable ROCm schedules both keep original four-row bytes. */
+TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCUpMeasuredTableReplay)
+{
+    auto* backend=getBackendFor(DeviceId::rocm(0));
+    require(backend&&backend->deviceCount()>0,"ROCm lane requires a visible physical device");
+    const auto& roster=rocmHardwareMetadata();
+    ASSERT_GT(roster.size(),0u);
+    for(std::size_t index=0;index<roster.size();++index)
+        proveGroupedHCUpShortK(DeviceId::rocm(roster.at(static_cast<int>(index)).ordinal),4,{});
 }
 #endif

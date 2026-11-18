@@ -15454,68 +15454,96 @@ __global__ void rocm_moe_fp16_projection_route_descriptors_kernel(
     if (threadIdx.x == 0) llaminar2::native_tile_completion::reset(completion.counters);
 }
 
+/** @brief Admitted native MI50 geometry for the measured QFN grouped selector. */
+constexpr int kQFNRegisterSelectorExperts = 512;
+constexpr int kQFNRegisterSelectorTopK = 10;
+
 /**
- * @brief Select stable expert probabilities while retaining each original probability in a register.
- * @details A lane owns at most eight experts. Each round elects exactly one
- * value/ID pair. The winning entry becomes negative infinity, just as in the
- * original LDS tournament. This detail matters when all remaining logits are NaN.
+ * @brief Merge four wave-local top-16 lists to select QFN's ten ordered experts.
+ * @param probabilities Softmax results in LDS, produced by the serial-equivalent reduction.
+ * @param selected_ids Shared output for the original IDs in descending probability order.
+ * @param selected_weights Shared output for the exact selected softmax probabilities.
+ *
+ * Four wave64s own 128 experts each. Keeping 16 from each wave covers every
+ * global top-ten candidate and fits the merge of the four lists in one wave.
+ * The comparison key ranks a nonnegative probability by its FP32 bits, then
+ * breaks ties by ascending expert ID. A zero key denotes a NaN probability.
+ * No arithmetic on the sorted keys modifies the original numeric weights.
  */
-__device__ __forceinline__ void moe_grouped_topk_cached(
-    const float* __restrict__ probs, int count, int top, int* __restrict__ ids,
-    float* __restrict__ weights)
+__device__ __forceinline__ void moe_grouped_topk_register_merge(
+    const float* __restrict__ probabilities, int* __restrict__ selected_ids,
+    float* __restrict__ selected_weights)
 {
-    constexpr int width = 64;
-    if (threadIdx.x >= width) return;
-    const int lane = threadIdx.x;
-    float values[8];
+    using Key = unsigned long long;
+    constexpr int wave_width = 64;
+    constexpr int frontier_per_wave = 16;
+    constexpr int id_bits = 10;  // Includes the nonzero tie key of expert zero.
+    static_assert(kQFNRegisterSelectorExperts < (1u << id_bits));
+    const unsigned lane = threadIdx.x % wave_width;
+    const unsigned wave = threadIdx.x / wave_width;
+
+    const auto pack = [&](int id) -> Key {
+        const float probability = probabilities[id];
+        if (!(probability >= 0.0f)) return 0;
+        const unsigned bits = probability == 0.0f ? 0u : __float_as_uint(probability);
+        return (static_cast<Key>(bits) << id_bits) | static_cast<unsigned>(kQFNRegisterSelectorExperts - id);
+    };
+    const auto exchange = [&](Key key, int distance, bool keep_high) -> Key {
+        const Key other = __shfl_xor(key, distance, wave_width);
+        return keep_high ? max(key, other) : min(key, other);
+    };
+
+    Key first = pack(threadIdx.x);
+    Key second = pack(threadIdx.x + kQFNRegisterSelectorExperts / 2);
+    // Sorting the two runs in opposite directions forms one bitonic 128-key run.
     #pragma unroll
-    for (int i = 0; i < 8; ++i) {
-        const int expert = i * width + lane;
-        values[i] = expert < count ? probs[expert] : -INFINITY;
-    }
-    int cached_id = kDeviceMoEMaxExperts;
-    float cached_value = -INFINITY;
-    for (int slot = 0; slot < top; ++slot) {
-        {
-            cached_value = -INFINITY;
-            cached_id = kDeviceMoEMaxExperts;
-            #pragma unroll
-            for (int i = 0; i < 8; ++i) {
-                const int expert = i * width + lane;
-                const float value = values[i];
-                // Recompute in ascending ID order; exact ties retain the first real expert.
-                const bool take = (expert < count) &
-                    moe_topk_pair_better(value, expert, cached_value, cached_id);
-                cached_value = take ? value : cached_value;
-                cached_id = take ? expert : cached_id;
-            }
-        }
-        float best = cached_value;
-        int id = cached_id;
-        int winner;
-        {
-            const float largest = __shfl(rocm_moe_wave_reduce_max_f32(cached_value),0);
-            const unsigned long long mask = __ballot(cached_value == largest);
-            const int first = __ffsll(static_cast<long long>(mask)) - 1;
-            if ((mask & (mask-1)) == 0) {
-                winner = __shfl(cached_id,first);
-                best = __shfl(cached_value,first);
-            } else {
-                int smallest = cached_value == largest ? cached_id : kDeviceMoEMaxExperts;
-                #pragma unroll
-                for (int offset=32;offset;offset/=2)
-                    smallest = min(smallest,__shfl_down(smallest,offset));
-                winner = __shfl(smallest,0);
-                best = winner < count ? __shfl(cached_value,winner & 63) : -INFINITY;
-            }
-            id = winner;
-        }
-        if (lane == 0) { ids[slot] = id; weights[slot] = best; }
+    for (int width = 2; width <= wave_width; width *= 2) {
         #pragma unroll
-        for (int i = 0; i < 8; ++i) {
-            if (winner == i * width + lane) values[i] = -INFINITY;
+        for (int distance = width / 2; distance > 0; distance /= 2) {
+            const bool high = ((lane & width) == 0) == ((lane & distance) == 0);
+            first = exchange(first, distance, high);
+            second = exchange(second, distance, !high);
         }
     }
+    first = max(first, second);
+    #pragma unroll
+    for (int distance = wave_width / 2; distance > 0; distance /= 2)
+        first = exchange(first, distance, (lane & distance) == 0);
+
+    __shared__ Key frontiers[wave_width];
+    if (lane < frontier_per_wave) {
+        const unsigned in_run = (wave & 1) ? frontier_per_wave - 1 - lane : lane;
+        frontiers[wave * frontier_per_wave + in_run] = first;
+    }
+    __syncthreads();
+    if (wave == 0) {
+        Key key = frontiers[lane];
+        // Each adjacent pair is already bitonic. Two merges complete the sort.
+        #pragma unroll
+        for (int width = 2 * frontier_per_wave; width <= wave_width; width *= 2)
+            #pragma unroll
+            for (int distance = width / 2; distance > 0; distance /= 2)
+                key = exchange(key, distance, ((lane & width) == 0) == ((lane & distance) == 0));
+
+        const int id = key ? kQFNRegisterSelectorExperts - int(key & ((1u << id_bits) - 1))
+                           : kDeviceMoEMaxExperts;
+        int consumed_id = id;
+        if (__ballot(lane < kQFNRegisterSelectorTopK && !key)) {
+            // Serial selection marks each consumed score -infinity. If too few
+            // finite experts exist, its smallest consumed ID wins the remaining
+            // rounds; an all-NaN row retains the original sentinel.
+            consumed_id = lane < kQFNRegisterSelectorTopK ? id : kDeviceMoEMaxExperts;
+            #pragma unroll
+            for (int distance = wave_width / 2; distance > 0; distance /= 2)
+                consumed_id = min(consumed_id, __shfl_xor(consumed_id, distance, wave_width));
+        }
+        if (lane < kQFNRegisterSelectorTopK) {
+            selected_ids[lane] = key ? id : consumed_id;
+            selected_weights[lane] = key ? probabilities[id] : -INFINITY;
+        }
+    }
+    // The normalization and ledger publisher consumes all ten wave results.
+    __syncthreads();
 }
 
 /**
@@ -15667,7 +15695,7 @@ __device__ __forceinline__ void grouped_softmax_rows_body(
     __shared__ int selected_ids[kDeviceMoEMaxTopK];
     __shared__ float selected_weights[kDeviceMoEMaxTopK];
     if constexpr (RegisterSelector)
-        moe_grouped_topk_cached(expert_probs, num_experts, top_k, selected_ids, selected_weights);
+        moe_grouped_topk_register_merge(expert_probs, selected_ids, selected_weights);
     else
         moe_select_topk_probabilities_block(expert_probs, num_experts, top_k, selected_ids, selected_weights);
 
@@ -17767,7 +17795,7 @@ bool hipMoE_softmax_topk_decode_equivalent_rows(
     // the live count remains a device-owned input in the shared body.
     bool use_register_selector = false;
     if (device_effective_seq_len && seq_len >= 2 && seq_len <= 8 &&
-        num_experts == kDeviceMoEMaxExperts && top_k == 10 &&
+        num_experts == kQFNRegisterSelectorExperts && top_k == kQFNRegisterSelectorTopK &&
         llaminar2::qfnGroupedTopKRegisterOptIn())
     {
         const auto hardware = llaminar2::rocm::nativeQuantisedHardwareForDevice(device_idx);

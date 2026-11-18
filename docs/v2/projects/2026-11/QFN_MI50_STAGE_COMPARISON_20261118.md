@@ -1053,8 +1053,13 @@ Llaminar's largest subtotal includes 5.210 ms of other projections, 3.781 ms
 of hyperconnections, 2.324 ms of grouped gate/up and 1.863 ms of grouped
 down/fold. On the shared four-device clock, 2.368 ms of communication
 overlapped compute and 1.718 ms had only communication running. GPU-active
-prefill timing was measured under the profiler. The unprofiled throughput
-table above gives user-visible prefill and decode rates.
+prefill timing was measured under the profiler. The full prompt dispatch
+window averaged 2113.18 ms per GPU in Llaminar and 2148.44 ms in Castagna.
+Recorded kernels occupied 99.72% and 58.15% of those windows respectively.
+The fork spent 899.21 ms of its prompt window outside recorded kernel
+intervals. This accounts for the difference between its short active-kernel
+time and the end-to-end prefill result. The unprofiled throughput table
+above gives user-visible rates.
 [Per-device dispatch intervals](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-code2048-phases.json)
 [Per-stage time and overlap across the four cards](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-code2048-target-breakdown.json)
 
@@ -1203,6 +1208,101 @@ gfx1100, SM80, SM86, SM89 and SM90 targets compiled with spill checking.
 The retained single-row HC/FFN and pre-attention loadable code matched the
 control on both AMD targets.
 [Combined Release receipts](/tmp/qfn-mi50-fixed-bank-proof/canonical-combined-tables/qualified.json)
+
+The four-card original-split Release at `261abf958` cleared all three
+modes across review512 and code2048 with the kernel tuning switches enabled.
+All 18 generated histories matched the earlier qualified Release. Both MTP
+modes matched fresh ordinary decode and reproduced all five speculative work
+counters. The dashboard lists the full prefill and decode rates alongside
+the fork for each mode. The fork's adaptive control proposed 408 and 360
+tokens per request on review and code respectively, accepting 199 on each.
+Its API exposes proposed and accepted tokens. Its verifier-round and target-row
+counts are unavailable.
+[Matched full-model throughput and retained receipts](/tmp/qfn-mi50-w-r3-verifier-cohort/final-tables-serving-summary.json)
+
+### Four-row hyperconnection projection and grouped router selection
+
+On MI50, one entire wave can share a K32 activation packet across 64
+Q8_0 output columns in the hyperconnection up-projection. On original
+layer 0 the complete four-row publication and projection fell from 15.860
+to 14.210 µs. An independent layer 3 run measured 15.860 to 14.205 µs.
+The measured cell has 10,240 outputs, K320 and two Q8 activation terms.
+The wide launch owns ten wave64s and 20 KiB of LDS. Both kernels retain
+the per-output K32 fold order. Across four original role fixtures all
+28 row-capacity tests matched serial bytes, including dirty and empty
+replay. Unmeasured row capacities retained their existing schedules.
+[Projection event brackets, input roles and captured geometry](/tmp/qfn-mi50-hcup-wave64-bd/REPORT.md)
+
+Selecting ten experts from 512 grouped softmax probabilities took
+16.175 µs at four rows with the existing MI50 selector. Merging four
+register-sorted lists took 13.695 µs. Six rows measured 16.190 to
+13.693 µs. Each timing is the median of 32 paired windows. Every
+window replays 32 original-logit restores and 32 selections in one
+captured graph. A separate single-dispatch profile measured 15.04 and
+12.48 µs. Both launched 16 wavefronts at M4 with 34 VGPRs, 44 SGPRs
+and zero spills. The merge occupied four waves per row for selection,
+used 512 extra LDS bytes, and increased the profiled VALU instruction
+metric from 375.25 to 658.75 per wave. Parallel selection reduced elapsed
+time even with the extra instructions. Probability bytes, IDs, normalized
+weights and the optional route ledger agreed on the recorded inputs and
+on ties, nonfinite logits, zero live rows and repeated dirty replay.
+[Single-dispatch and batched event timings and ISA](/tmp/qfn-mi50-router-merge-counted-c5/score.json)
+[Profiled candidate dispatch](/tmp/qfn-mi50-router-merge-profile-c5/merge-probe/3cd9f562a1d1/7_results.json)
+
+With the G13 and G15 gate inputs already proven at graph preparation,
+their loop can call the two admitted readers directly. Relative to the
+batched IQ3_XXS checkpoint, six-row complete verifier time went from
+356.52 to 328.51 µs on G13 and 323.81 to 294.67 µs on G15.
+Four-row time improved by 1.44% and 1.74% respectively. Six-row gate
+time fell from 216.32 to about 184.3 µs on both. Register use fell from
+81 to 62 VGPRs and 104 to 98 SGPRs. LDS stayed at 320 bytes with zero
+private bytes. These are generated fixtures with their original native
+weight formats. The real TP4 code2048 prompt exercises different weights.
+[Direct-reader static, deferred, routing and event checks](/tmp/qfn-mi50-iq3-direct-c2/REPORT.md)
+
+### Checking local improvements against the complete verifier
+
+The code2048 depth-three campaign isolated the wider HC projection and the
+indexed reader changes before enabling the new selector. Three runs per
+mode reproduced the control's generated IDs. Each fixed-depth run verified
+344 rows across 86 rounds. Median decode changed from 112.437 to 112.370
+tok/s. Median prefill changed from 970.545 to 970.533 tok/s. The faster HC
+projection had little effect on this model-wide result. The deployed model's
+original routed operands do not exercise the G13/G15 indexed-reader improvement.
+[Matched Release runs and accepted work](/tmp/qfn-mi50-w-r3-verifier-cohort/twoleaves-code-comparison.json)
+
+The local five-node router and expert replay includes the new selector but
+excludes HC. Gate/up uses the original Q4_K layer-one weights and down uses
+Q5_1. All four arms used the same MI50, original routed width, shared width
+160, and serial byte check. Values are means of the two process medians in
+control, candidate, candidate, control order. Each process median covers
+12 native event windows of 32 operations.
+
+| Live rows | Routed width | Previous, µs | Candidate, µs |
+| ---: | ---: | ---: | ---: |
+| 4 | 128 | 113.69 | 114.72 |
+| 4 | 256 | 151.27 | 150.10 |
+| 6 | 128 | 139.23 | 138.44 |
+| 6 | 256 | 197.14 | 195.78 |
+
+The standalone selector improved by 2.48 µs at four rows. The complete
+local operation was 1.03 µs slower on the narrow shard and 1.17 µs faster
+on the wide shard. Their individual dispatch savings cannot be summed to
+predict the verifier round.
+[Original-shard inputs, matched timings and replay](/tmp/qfn-mi50-topk-real-shards-c5/comparison.json)
+
+The Release containing all three changes (`3c2861e7`) reproduced its
+predecessor's histories and verifier work in all 18 generations. Fixed
+depth 3 measured 137.38 tok/s on review512 and 111.88 on code2048,
+compared with 137.00 and 112.44 previously. The paired changes across
+all three modes were between −0.43% and +0.39% for decode and within
+0.19% for prefill. The integrated result supports the component gains
+and gives no evidence of improved end-to-end throughput on this model.
+Six targeted MI50 regressions passed on this Release. A 7900 XTX and
+an RTX 3090 each passed the replay for its selected schedule.
+[Full-model histories and throughput](/tmp/qfn-mi50-w-r3-verifier-cohort/fuller-comparison.json)
+[Native replay and Release identity](/tmp/qfn-mi50-fixed-bank-proof/canonical-verifier-merge/qualified.json)
+
 
 ## Reproduction
 

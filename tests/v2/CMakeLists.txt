@@ -1031,6 +1031,12 @@ if(HAVE_CUDA OR HAVE_ROCM)
             ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0;LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K=1"
             MPI_PROCS 1 NO_MODELS TIMEOUT 60)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedHCUpShortK)
+        add_v2_test(V2_Integration_ROCmGroupedHCUpMeasuredTableReplay
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=Q8ResidualCorrectionDevice.ROCmGroupedHCUpMeasuredTableReplay
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;MTP;HardwareMetadata;Capture;ByteExact;Replay;Regression"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0;LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K=1"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 60)
         add_v2_test(V2_Integration_ROCmGroupedHCDownReducePublish
             COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                 --gtest_filter=Q8ResidualCorrectionDevice.ROCmGroupedHCDownReducePublishReplay
@@ -38488,6 +38494,9 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayInferenc
 
 if(TEST V2_Integration_ROCmGDNAcceptedVectorPublicationReplay)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGDNAcceptedVectorPublicationReplay)
+endif()
+if(TEST V2_Integration_ROCmGroupedHCUpMeasuredTableReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedHCUpMeasuredTableReplay)
 endif()
 if(TEST V2_Integration_GroupedVerifierRows_ROCm_HCDownLongK)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedVerifierRows_ROCm_HCDownLongK)
