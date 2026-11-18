@@ -23,7 +23,7 @@ jobs:
 
   failed-job-logs:
     needs: unit
-    if: failure() && needs.unit.result == 'failure'
+    if: always() && (needs.unit.result == 'failure' || needs.unit.result == 'cancelled')
     permissions:
       actions: read
     uses: ./.github/workflows/failed-job-logs.yml

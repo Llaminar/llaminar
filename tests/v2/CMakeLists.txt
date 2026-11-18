@@ -5227,6 +5227,7 @@ add_test(NAME V2_Integration_DevelopImageGateCancellation
     COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_develop_image_gate.py
             DevelopImageGateTests.test_canceled_build_retires_exact_child_group
+            DevelopImageGateTests.test_failed_job_logs_survive_a_killed_build_and_a_missing_sibling_log
             DevelopImageGateTests.test_ci_replaces_the_step_shell_with_the_cancellable_driver
 )
 set_tests_properties(V2_Integration_DevelopImageGateCancellation PROPERTIES

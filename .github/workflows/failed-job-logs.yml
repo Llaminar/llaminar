@@ -14,7 +14,8 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - name: Download GitHub's transcripts for failed jobs in this attempt
+      - name: Download GitHub's transcripts for failed or interrupted jobs in this attempt
+        id: transcripts
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
@@ -24,12 +25,15 @@ jobs:
           mkdir -p "$directory"
           jobs="$RUNNER_TEMP/failed-jobs.tsv"
           gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
-            --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure") |
+            --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure" or
+                  (.conclusion == "cancelled" and any(.steps[]?; .started_at != null))) |
                   [.id, (.name | gsub("[^A-Za-z0-9._-]+"; "-") | rtrimstr("-") | .[:120])] | @tsv' > "$jobs"
           if [[ ! -s "$jobs" ]]; then
-            echo "::error::GitHub returned no failed jobs for attempt $GITHUB_RUN_ATTEMPT"
-            exit 1
+            # A superseded queued job has no runner transcript.
+            echo "No jobs with transcripts in attempt $GITHUB_RUN_ATTEMPT"
+            exit 0
           fi
+          echo "expected=true" >> "$GITHUB_OUTPUT"
           status=0
           while IFS=$'\t' read -r id name; do
             raw="$RUNNER_TEMP/job-$id.raw"
@@ -49,7 +53,7 @@ jobs:
           exit "$status"
       - name: Upload failed job logs to this run
         id: upload
-        if: ${{ !cancelled() }}
+        if: ${{ always() && steps.transcripts.outputs.expected == 'true' }}
         uses: actions/upload-artifact@v4
         with:
           name: failed-job-logs-${{ github.run_id }}-${{ github.run_attempt }}
@@ -57,7 +61,7 @@ jobs:
           if-no-files-found: error
           retention-days: 30
       - name: Link the transcripts from the run summary
-        if: ${{ !cancelled() && steps.upload.outputs.artifact-url != '' }}
+        if: ${{ always() && steps.upload.outputs.artifact-url != '' }}
         shell: bash
         env:
           ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}

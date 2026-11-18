@@ -196,6 +196,7 @@ class DevelopImageGateTests(unittest.TestCase):
                     scope = (pr_runner.PRTestScope.GPU if "--gpus" in command
                              else pr_runner.PRTestScope.HOST)
                     scopes.append(scope)
+                    self.assertEqual(command[command.index("--ulimit") + 1], "core=0:0")
                     prefix = "pr-tests/gpu" if scope is pr_runner.PRTestScope.GPU else "pr-tests"
                     report = pr_report(scope)
                     if scope is pr_runner.PRTestScope.GPU:
@@ -511,12 +512,13 @@ class DevelopImageGateTests(unittest.TestCase):
         for caller, build in (("develop-pr.yml", "unit"), ("ci.yml", "develop-images")):
             job = yaml.load((workflows / caller).read_text(), Loader=yaml.BaseLoader)["jobs"]["failed-job-logs"]
             self.assertEqual(job["needs"], build)
-            self.assertEqual(job["if"], f"failure() && needs.{build}.result == 'failure'")
+            self.assertEqual(job["if"], f"always() && (needs.{build}.result == 'failure' || needs.{build}.result == 'cancelled')")
             self.assertEqual(job["permissions"], {"actions": "read"})
             self.assertEqual(job["uses"], "./.github/workflows/failed-job-logs.yml")
         workflow = yaml.load((workflows / "failed-job-logs.yml").read_text(), Loader=yaml.BaseLoader)
         collect, upload, summary = workflow["jobs"]["collect"]["steps"]
-        self.assertEqual(upload["if"], "${{ !cancelled() }}")
+        self.assertIn('.conclusion == "cancelled"', collect["run"])
+        self.assertEqual(upload["if"], "${{ always() && steps.transcripts.outputs.expected == 'true' }}")
         self.assertIn("github.run_attempt", upload["with"]["name"])
         self.assertIn("steps.upload.outputs.artifact-url", summary["env"]["ARTIFACT_URL"])
 
@@ -538,7 +540,7 @@ esac
             gh.chmod(0o755)
             curl.chmod(0o755)
             env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", RUNNER_TEMP=directory,
-                       GH_TOKEN="unused", GITHUB_API_URL="https://api.example", GITHUB_REPOSITORY="test/repo",
+                       GITHUB_OUTPUT=str(root / "outputs"), GH_TOKEN="unused", GITHUB_API_URL="https://api.example", GITHUB_REPOSITORY="test/repo",
                        GITHUB_RUN_ID="41", GITHUB_RUN_ATTEMPT="2")
             result = subprocess.run(["bash", "-c", collect["run"]], env=env, capture_output=True, text=True)
             self.assertNotEqual(result.returncode, 0)

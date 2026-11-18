@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Replay dependency identity and OCI admission without compilers or devices.
+"""@file test_toolchain_cache.py
+@brief Replay dependency identity and OCI admission without compilers or devices.
 
 The fixture repository separates source edits from actual dependency changes.
 Real OCI descriptors exercise swapped ISAs, stale inputs, missing/corrupt blobs
@@ -88,6 +89,18 @@ class ToolchainCacheTests(unittest.TestCase):
         self.assertEqual(cache_export.get("ignore-error"), "true")
         for step in steps:
             self.assertFalse(step.get("continue-on-error", False))
+
+    def test_dedicated_avx512_cache_miss_uses_the_persistent_builder(self):
+        """A warm AVX512 worker can produce a verified OCI image without a remote SDK round-trip."""
+        action = yaml.safe_load((ROOT / ".github/actions/cache-develop-toolchain/action.yml").read_text())
+        checkpoint, avx512, avx2 = [step for step in action["runs"]["steps"]
+                                    if step.get("with", {}).get("target") in {"gpu-sdk", "toolchain"}]
+        self.assertNotIn("inputs.cpu-isa == 'AVX512'", checkpoint["if"])
+        self.assertIn("inputs.cpu-isa == 'both'", checkpoint["if"])
+        self.assertIn("inputs.cpu-isa == 'AVX2'", checkpoint["if"])
+        self.assertEqual(avx512["with"]["cache-from"], "type=registry,ref=${{ steps.cache.outputs.image }}-avx512")
+        self.assertIn("type=oci,", avx512["with"]["outputs"])
+        self.assertIn("type=gha,", avx2["with"]["cache-from"])
 
     def test_dependency_key_survives_source_edits_and_rejects_each_dependency_change(self):
         before = cache.identity(self.tree, "AVX512")

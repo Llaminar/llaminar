@@ -84,7 +84,7 @@ jobs:
 
   failed-job-logs:
     needs: develop-images
-    if: failure() && needs.develop-images.result == 'failure'
+    if: always() && (needs.develop-images.result == 'failure' || needs.develop-images.result == 'cancelled')
     permissions:
       actions: read
     uses: ./.github/workflows/failed-job-logs.yml

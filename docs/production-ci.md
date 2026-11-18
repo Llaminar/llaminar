@@ -120,7 +120,9 @@ still uses unrestricted `--parallel` and the complete GPU architecture list.
 
 `run_develop_pr_tests.py --scope unit-and-host` executes complete
 Unit and host inventories. Unit retains unrestricted parallelism; host uses
-canonical serial scheduling. The subsequent AVX2 `--scope hardware-preflight`
+canonical serial scheduling. PR test containers set the core-file limit to zero
+so intentional death tests exercise their fatal signal within the replay deadline.
+The subsequent AVX2 `--scope hardware-preflight`
 transaction observes native hardware and qualifies the complete CMake inventory.
 All selected CUDA, ROCm and exclusive entries run sequentially on this host's
 one CPU package. MPI process count does not determine physical GPU count.
@@ -143,8 +145,8 @@ requiring one CUDA and one ROCm GPU still runs when both are present.
 Model staging, generation, HF parity, E2E and benchmarks remain separate gates.
 The workflow run's **Artifacts** section contains build logs, image/test receipts
 and CTest/JUnit evidence under each ISA's name. After a PR check or develop
-image publication fails, the run summary also links `failed-job-logs-<run>-<attempt>`.
-Each file contains GitHub's transcript for one failed job, including setup,
+image publication fails or times out, the run summary also links `failed-job-logs-<run>-<attempt>`.
+Each file contains GitHub's transcript for one failed or interrupted job, including setup,
 the runner's exit status and cleanup. A separate runner collects these logs
 so they survive a killed build process. Logs are retained for 30 days.
 
@@ -219,7 +221,9 @@ hits. The builder declares its build arguments explicitly because an external
 image does not inherit in-file ARG state. Both development workflows pin Buildx and
 BuildKit to the same versions.
 
-On a cold image-cache miss, `gpu-sdk` is checkpointed through the GitHub Actions
+On a complete OCI cache miss, the dedicated AVX512 PR runner builds the
+pinned toolchain directly with its persistent BuildKit worker and registry
+cache import. The AVX2 development host also checkpoints `gpu-sdk` through the GitHub Actions
 cache v2 backend in `mode=max` under `llaminar-gpu-sdk`. If the cache service
 rejects a layer upload, the job can use its locally built SDK. The complete toolchain
 then builds, exports as OCI and authenticates. It is saved before Llaminar

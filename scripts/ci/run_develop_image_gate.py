@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file run_develop_image_gate.py
+# @brief Build the develop images and exercise the PR test inventories in scoped containers.
 """Build and optionally validate/publish both develop runtime images.
 
 This intentionally small gate is distinct from the full production
@@ -120,7 +122,9 @@ def _run_pr_scope(images: dict, directory: Path, scope: PRTestScope) -> dict:
         command += ["--scope", scope.value]
     # Unit and host never see device nodes. The later GPU scope requires both
     # vendors through the same Docker device/group authority as production.
-    launch = ["docker", "run", "--rm", "--name", name,
+    # Death tests intentionally trap in subprocesses. A core dump for each trap
+    # can exhaust the replay deadline on hosts with a crash-reporting service.
+    launch = ["docker", "run", "--rm", "--name", name, "--ulimit", "core=0:0",
               *docker_paths.device_args(image, scope.backends, user=f"{os.getuid()}:{os.getgid()}"),
               *(part for group in os.getgroups() for part in ("--group-add", str(group))),
               *docker_paths.mounts([(directory, "/ci-results", False)]),
