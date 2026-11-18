@@ -817,6 +817,95 @@ and the registered 120-second limit. They took 97.52 and 101.06 seconds.
 [Complete operation and byte-replay receipts](/tmp/qfn-mi50-verifier-roofline/combined-original-abba.json)
 [Registered native gates and ELF identities](/tmp/qfn-mi50-fixed-bank-proof/canonical-w/combined-r1/qualified.json)
 
+### Verifier tile assignment and packet scheduling
+
+The original QFN layer 1 on four MI50s has 128- and 256-column routed
+shards and a 160-column shared shard. The timings below use the serving
+FP16 router and register top-K selector. Each event times 32 complete
+captured four-row router and expert-FFN operations on one participant.
+Each process contributes 12 event samples. Controls and candidates run in
+mirrored order on the same device. The native fixture also compares every
+live row with serial decode. HC and peer reduction have separate timing
+scopes.
+
+| Q4_K gate/up schedule | F128/S160, µs | F256/S160, µs |
+| --- | ---: | ---: |
+| Original grid, two wave pairs per block with tile reuse | 118.81 | 177.20 |
+| One output tile per wave pair, 16 columns per wave | 116.98 | 158.22 |
+| One tile per block, 8 columns per wave | 114.66 | 167.72 |
+| One tile per block, 4 columns per wave | 129.92 | 202.66 |
+
+The 16-column layout launches 90 and 170 workgroups respectively. Giving
+each wave pair its own output tile removes a barrier that protected LDS
+reuse. The four-column layout reproduces the single-row mapping of 16
+concurrent K partitions but loses on both four-row widths. The source
+arithmetic and ordered expert folds stay the same across these experiments.
+[Two wave pairs per block](/tmp/qfn-mi50-single-tile-ba/abba-score.json)
+[Eight columns per wave](/tmp/qfn-mi50-partition-8-ba/abba-score.json)
+[Four columns per wave](/tmp/qfn-mi50-partition-4-ba/abba-score.json)
+
+On PCI c2, the wide single-tile gate fetched 31,383.56 KiB in 66.08 µs.
+Its 486.31 GB/s was **87.51%** of the independently calibrated 555.72 GB/s
+read-only packet rate at 170 workgroups. The wide down projection reached
+57.12% of its own reference. Issuing pairs of K32 reads raised the gate
+fraction to 90.19%, while the complete wide parent rose by 1.00 µs in that
+bracket. Whole-parent timing decides the schedule.
+[Matched rates, counter scopes and replay receipts](/tmp/qfn-mi50-q4-k32-pipeline-c2/REPORT.md)
+
+The original Q5_1 down reader benefits from loading several packets before
+folding them. At F128, reading four packets instead of two reduced the
+down dispatch from 32.16 to 30.88 µs. Its external 64-byte read requests
+changed by 0.10%. At F256 four-packet reads increased the down time from
+49.12 to 51.20 µs. The width-specific program uses four at F128 and two at
+F256. Native replay moved all three weight planes between banks, poisoned
+the retired storage and verified serial bytes and deferred acceptance after
+each publication.
+[Down packet profiles and production replay](/tmp/qfn-mi50-q51-down-c5/REPORT.md)
+
+The combined Release ran on PCI bd against the previous Release, in A/B/B/A
+order, with the same model bytes, routes, router and graph scope on each arm.
+These are complete four-row router and expert-FFN times on one participant.
+The TP degree selects the real column slice used by that participant.
+
+| TP degree | Routed / shared columns | Previous, µs | Combined, µs | Change |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 640 / 640 | 313.83 | 296.75 | −5.44% |
+| 2 | 384 / 320 | 225.91 | 217.39 | −3.77% |
+| 4 | 128 / 160 | 119.20 | 114.12 | −4.26% |
+| 4 | 256 / 160 | 178.30 | 151.10 | −15.25% |
+| 8 | 64 / 96 | 98.32 | 98.74 | +0.43% |
+
+All nine focused preflight cases passed on the checkpoint. Original three-way
+source windows also passed native serial-byte replay on all three participants.
+On those held-out windows, issuing one K32 packet per step was 0.78–1.25%
+faster than issuing two. The final-round occupancy alone did not predict
+the winner. Both shipped ROCm targets passed the compile-time spill guard.
+The retained single-row kernel loadable segments matched the control on both.
+[Original model window timings](/tmp/qfn-mi50-gate-packet-holdout-final-bd/comparison-original-a.json)
+[Three-way packet comparison](/tmp/qfn-mi50-gate-packet-holdout-final-bd/comparison-single-a.json)
+[Preflight results](/tmp/qfn-mi50-fixed-bank-proof/canonical-tile-packets/tile-r1/ctest.xml)
+
+To reproduce the original four-row layer-1 window inside a single-MI50
+Release test container, supply the actual GGUF shard and set participant 0
+for the 256-column shard or 1 for the 128-column shard. Each invocation
+checks serial bytes and records twelve 32-operation event samples.
+
+```bash
+export LLAMINAR_TEST_CASTAGNA_GGUF=/opt/llaminar-models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+export LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16 LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES=0
+export LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER=1 LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK=1
+export LLAMINAR_QFN_ROCM_GROUPED_FFN_EQUAL_FRONTIER=1 LLAMINAR_QFN_ROCM_GROUPED_FFN_ALL_FORMATS=1
+export LLAMINAR_QFN_ROCM_GROUPED_FFN_AFFINE_SUMS=0 LLAMINAR_QFN_ROCM_GROUPED_TOPK_REGISTERS=1
+export LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS=1 LLAMINAR_TEST_GROUPED_M4_PROGRAM=all_formats
+export LLAMINAR_TEST_GROUPED_M4_DEMAND=static LLAMINAR_TEST_QFN_WINDOW_EVENTS=1 LLAMINAR_TEST_QFN_SOURCE_LAYER=1
+export LLAMINAR_TEST_QFN_SOURCE_ROCM_ORDINALS=0,1,2,3 LLAMINAR_TEST_QFN_SOURCE_PARTICIPANT=0
+export LLAMINAR_TEST_GROUPED_M4_REQUIRED_SYMBOL=groupedFFNFormatProgramGateILj1ELi5ELi0
+export LLAMINAR_TEST_GROUPED_M4_SYMBOL_PRESENT=1 LLAMINAR_PERF_STATS_SUMMARY=1
+export LLAMINAR_PERF_STATS_FILTER=kernel.rocm_grouped_ffn_frontier_calls
+mpirun -np 1 --bind-to none "$BUILD/tests/v2/v2_integration_moe_intermediate_ffn_finalization" \
+  --gtest_also_run_disabled_tests --gtest_filter=GroupedM4SourceWindow.DISABLED_OriginalQFN
+```
+
 ## Reproduction
 
 The local evidence root for native phase attribution is

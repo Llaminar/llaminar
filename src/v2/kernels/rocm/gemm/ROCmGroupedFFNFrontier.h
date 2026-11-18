@@ -35,6 +35,9 @@ inline constexpr int routedColumns(RoutedGeometry geometry) { return static_cast
 /** @brief Physical output pitch of the measured original Q5_K gate/up reader. */
 enum class FixedQ5GatePitch : int { F128=128, F160=160, F256=256 };
 
+/** @brief Routed pitch of the original Q5_1 down projection with one K32 packet per partition. */
+enum class FixedQ51DownPitch : int { F128=128, F256=256 };
+
 /** @brief Exact immutable reachable routed decoder pair. */
 enum class RoutedDecoder { Q4K_Q51, Q4K_Q80, Q5K_Q80 };
 
@@ -164,6 +167,34 @@ public:
                 return std::nullopt;
         }
         return static_cast<FixedQ5GatePitch>(pitch);
+    }
+
+    /**
+     * @brief Bind the paired-packet down reader to the original numerical and placement contract.
+     * @param sharedDown Original shared down projection, validated alongside this program.
+     * @return The measured routed pitch when every reachable physical reader retains its layout.
+     * @details Q5_K and Q5_1 share a physical codebook. Only the plain Q5_1 source with
+     * one original K32 packet per down partition has been qualified for this schedule.
+     */
+    std::optional<FixedQ51DownPitch> fixedQ51DownPitch(const DeviceNativeQuantisedMatrixDesc& sharedDown) const noexcept
+    {
+        using namespace native_quantised_formats;
+        const int pitch=routedColumns();
+        if((pitch!=128 && pitch!=256) || sharedColumns()!=sharedWidth) return std::nullopt;
+        constexpr NativeQuantisedSourceIdentity gate{Q4_K.codebook_id,true,true};
+        constexpr NativeQuantisedSourceIdentity down{Q5_1.codebook_id,false,true};
+        const auto singleReader=[](NativeQuantisedExecutionFormatEnvelope formats,unsigned codebook) {
+            const auto mask=nativeQuantisedCodebookMaskBit(codebook);
+            return formats.execution_codebook_mask==mask && formats.policy_codebook_mask==mask;
+        };
+        if(routedSources()!=std::array{gate,gate,down} ||
+           !singleReader(formats().routedGateUp,Q4_1.codebook_id) ||
+           !singleReader(formats().routedDown,Q5_1.codebook_id) ||
+           !singleReader(formats().shared[2],Q8_0.codebook_id) ||
+           !sharedDown.source_identity_present || sharedDown.source_codebook_id!=Q8_0.codebook_id ||
+           sharedDown.source_is_superblock || routedPartitions_[2]!=pitch/32 ||
+           sharedPartitions_[2]!=sharedWidth/32) return std::nullopt;
+        return static_cast<FixedQ51DownPitch>(pitch);
     }
 
     /** @return Whether the two immutable reduction trees admit the measured joint Q4_1 reader.

@@ -72,6 +72,7 @@ def main():
     parser.add_argument("--build", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--routes", type=Path, help="Ordered 40-ID histories required for packet")
+    parser.add_argument("--single-tile", action="store_true", help="One original tile per gate wave pair")
     parser.add_argument("--packet-shape", nargs=5, type=int,
                         metavar=("TUPLE", "F", "S", "ROUTED_PARTS", "SHARED_PARTS"),
                         help="Score one tuple (0=Q4_K/Q5_1, 1=Q4_K/Q8_0, 2=Q5_K/Q8_0, 3=G15) "
@@ -99,6 +100,10 @@ def main():
                 or not 1 <= routed_parts <= 80 or not 1 <= shared_parts <= 80):
             parser.error("Invalid tuple, K32-aligned extents or source gate partitions")
         checks_per_round = 4
+    if args.single_tile and (args.probe != "packet" or args.packet_shape is None):
+        parser.error("Single-tile calibration requires the explicit calibrated gate packet shape")
+    if args.single_tile:
+        checks_per_round = 2
     exact_issue = args.issue_grid is not None or args.issue_block is not None
     if exact_issue:
         if args.probe != "issue" or args.issue_grid is None or args.issue_grid <= 0 or args.issue_block is None:
@@ -122,6 +127,8 @@ def main():
     probe_operands = ([str(routes)] if routes else [])
     if args.packet_shape is not None:
         probe_operands.extend(map(str, args.packet_shape))
+        if args.single_tile:
+            probe_operands.append("single-tile")
     if exact_issue:
         probe_operands = [str(args.issue_grid), str(args.issue_block)]
     argv = [[*prefix, str(binary), str(round_index), args.pci, *probe_operands]

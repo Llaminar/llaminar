@@ -16,9 +16,11 @@ public:
     RealRetainedTPSourceWindow(const char* path, int layer, int participant, const std::vector<DeviceId>& members)
         : layer_(layer), participant_(participant)
     {
+        require(std::in_range<int>(members.size()) && participant>=0 &&
+                static_cast<std::size_t>(participant)<members.size(),"real TP continuation coordinate");
+        // The production partitioner below owns model and native-block alignment.
+        // Every roster it can partition is a valid original-shard replay input.
         const int width=static_cast<int>(members.size());
-        require((width==1||width==2||width==4||width==8)&&participant>=0&&participant<width,
-            "real TP continuation coordinate");
         loader_.setUseMmap(true);
         require(loader_.loadModel(path),"load original split GGUF for TP source slices");
         const auto gate=geometryOf(kRoutedNames[0]),up=geometryOf(kRoutedNames[1]);

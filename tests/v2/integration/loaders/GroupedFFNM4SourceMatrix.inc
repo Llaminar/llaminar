@@ -9,13 +9,14 @@
 namespace llaminar2::test {
 namespace {
 
-enum class M4SourceRole { RoutedGateUp, RoutedDown, SharedGateUp, SharedDown, Family, RuntimeOnly };
+enum class M4SourceRole { RoutedGateUp, RoutedDown, SharedGateUp, SharedDown, Family, RuntimeOnly, FixedQ51Down };
 
 struct M4SourceCase {
     std::string name; ///< Filter and receipt identity.
     M4SourceRole role; ///< One varied codebook or an original decoder-family recipe.
     std::string_view source; ///< Canonical source name when varying a single role.
     std::optional<FullNativeHCFFNFamilyCase> family; ///< Source-authenticated mixed recipe.
+    int fixed_down_pitch=0; ///< Independently expected original Q5_1 Down specialization.
 };
 
 /** @return Immutable catalog entries and the independent decoder-family recipes. */
@@ -38,6 +39,9 @@ std::vector<M4SourceCase> groupedM4Cases()
     cases.push_back({"Q8_1_shared_down_prepared",M4SourceRole::SharedDown,"Q8_1",{}});
     cases.push_back({"Q4_K_repeat_routes",M4SourceRole::RoutedGateUp,"Q4_K",{}});
     cases.push_back({"Q4_K_sparse_routes",M4SourceRole::RoutedGateUp,"Q4_K",{}});
+    cases.push_back({"Q4_K_deep_grid",M4SourceRole::RoutedGateUp,"Q4_K",{}});
+    cases.push_back({"Q4_K_Q5_1_Down_F128",M4SourceRole::FixedQ51Down,"Q4_K",{},128});
+    cases.push_back({"Q4_K_Q5_1_Down_F256",M4SourceRole::FixedQ51Down,"Q4_K",{},256});
     cases.push_back({"Q5_K_sparse_routes",M4SourceRole::RoutedGateUp,"Q5_K",{}});
     cases.push_back({"Q2_K_sparse_routes",M4SourceRole::RoutedDown,"Q2_K",{}});
     cases.push_back({"IQ1_M_sparse_routes",M4SourceRole::RoutedDown,"IQ1_M",{}});
@@ -86,8 +90,10 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing)
     }
     const auto& q8=quantizedVerifierFormat("Q8_0");
     const auto& selected=item.family?q8:quantizedVerifierFormat(item.source);
-    const auto& gate=item.role==M4SourceRole::RoutedGateUp?selected:q8;
-    const auto& down=item.role==M4SourceRole::RoutedDown?selected:q8;
+    const bool fixedQ51Down=item.role==M4SourceRole::FixedQ51Down;
+    const auto& gate=(item.role==M4SourceRole::RoutedGateUp || fixedQ51Down)?selected:q8;
+    const auto& down=fixedQ51Down?quantizedVerifierFormat("Q5_1"):
+        item.role==M4SourceRole::RoutedDown?selected:q8;
     const auto& shared=item.role==M4SourceRole::SharedGateUp?selected:q8;
     const bool prepared_q8=item.name=="Q8_1_shared_down_prepared";
     const auto& shared_down=item.role==M4SourceRole::SharedDown&&!prepared_q8?selected:q8;
@@ -98,8 +104,14 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing)
     require(original!=variants.end(),"Routed gate/up has its original source preparer");
     auto shape=fullNativeHCFFNFamilyGeometry();
     if (!item.family) {
-        shape.routed=down.source_is_superblock?256:160;
+        shape.routed=fixedQ51Down?item.fixed_down_pitch:down.source_is_superblock?256:160;
         shape.shared=shared_down.source_is_superblock?256:160;
+    }
+    if(item.name=="Q4_K_deep_grid") {
+        // The original unequal TP2 cut gives this participant 384 routed and
+        // 320 shared columns, enough tiles to exercise the long-grid program.
+        shape.routed=384;
+        shape.shared=320;
     }
     auto format=item.family?fullNativeHCFFNFamilySource(*item.family,shape):*original;
     format.name=item.name;
@@ -127,8 +139,15 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing)
     const std::array<std::string_view,1> requested{pci?pci:""};
     shape.grouped_matrix_case=item.name;
     expectGroupedM4Program(shape);
+    if(fixedQ51Down) {
+        require(item.fixed_down_pitch==128 || item.fixed_down_pitch==256,"independent supported Q5_1 Down fixture pitch");
+        shape.expected_q51_down_pitch=item.fixed_down_pitch;
+        shape.grouped_matrix_symbol="groupedFFNFormatProgramGate";
+    }
+    if(item.name=="Q4_K_deep_grid")
+        shape.grouped_matrix_symbol="groupedFFNFormatProgramGateILj1ELi5ELi0ELi2EE";
     if(item.name=="Q5_K_sparse_routes" && shape.grouped_matrix_program==GroupedM4FixtureProgram::AllFormats)
-        shape.grouped_matrix_symbol="groupedFFNFormatProgramGateILj1ELin1ELi160E";
+        shape.grouped_matrix_symbol="groupedFFNFormatProgramGateILj1ELin1ELi160ELi1EE";
     shape.grouped_matrix_timing=timing;
     shape.deferred_frontier_history=deferred;
     std::osyncstream(std::cout)<<"M4_SOURCE_INPUT,case="<<item.name

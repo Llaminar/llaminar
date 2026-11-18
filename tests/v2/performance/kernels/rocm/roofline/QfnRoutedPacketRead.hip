@@ -96,7 +96,7 @@ __device__ __forceinline__ Word gateTile(Payload data,std::size_t base,int width
 }
 
 /** @brief Read exactly the gate/down weight packets owned by each active production lane. */
-template<int Bytes,bool Secondary,bool Gate,int SharedBytes=32,bool SharedSecondary=false>
+template<int Bytes,bool Secondary,bool Gate,int SharedBytes=32,bool SharedSecondary=false,bool SingleTile=false>
 __global__ void packetRead(Payload routed,Payload shared,const int* routes,Geometry shape,int bank,Word* result)
 {
     const int tid=threadIdx.x;
@@ -118,6 +118,7 @@ __global__ void packetRead(Payload routed,Payload shared,const int* routes,Geome
                 const int column=(tile-routedTiles)%sharedBlocks*32+offset;
                 sum+=gateTile<SharedBytes,SharedSecondary>(shared,0,shape.shared,column,shape.sharedParts,lane/16);
             }
+            if constexpr(SingleTile)break;
         }
     } else {
         const int column=blockIdx.x*64+lane;
@@ -208,13 +209,13 @@ std::vector<Word> expectedLanes(Geometry shape,const RouteRows& routes,int gridX
 }
 
 /** @brief Measure one exact original geometry and physically verify all lanes after each bank mode. */
-template<int Bytes,bool Secondary,bool Gate,int SharedBytes=32,bool SharedSecondary=false>
+template<int Bytes,bool Secondary,bool Gate,int SharedBytes=32,bool SharedSecondary=false,bool SingleTile=false>
 void run(int family,int round,hipStream_t stream,const RouteRows& routes,Geometry shape)
 {
     const std::size_t routedCount=std::size_t(H)*shape.routed/32*(Gate?2:1);
     const std::size_t sharedCount=std::size_t(H)*shape.shared/32*(Gate?2:1);
     const int gateTiles=Live*(Top*(shape.routed/32)+shape.shared/32);
-    const int gridX=Gate?std::clamp((gateTiles+1)/2,Live,120):H/64;
+    const int gridX=Gate?(SingleTile?(gateTiles+1)/2:std::clamp((gateTiles+1)/2,Live,120)):H/64;
     const int gridY=Gate?1:Live;
     const std::size_t outputCount=gridX*gridY*Threads;
     const double requestBytes=Live*(Top*routedCount*(Bytes+2+2*int(Secondary))+sharedCount*(SharedBytes+2+2*int(SharedSecondary)));
@@ -238,7 +239,7 @@ void run(int family,int round,hipStream_t stream,const RouteRows& routes,Geometr
     HIP(hipEventCreate(&begin));
     HIP(hipEventCreate(&end));
     auto launch=[&](int bank) {
-        hipLaunchKernelGGL((packetRead<Bytes,Secondary,Gate,SharedBytes,SharedSecondary>),dim3(gridX,gridY),dim3(Threads),0,stream,
+        hipLaunchKernelGGL((packetRead<Bytes,Secondary,Gate,SharedBytes,SharedSecondary,SingleTile>),dim3(gridX,gridY),dim3(Threads),0,stream,
                            routed,shared,ids,shape,bank,out);
         HIP(hipGetLastError());
     };
@@ -314,13 +315,15 @@ int main(int argc,char** argv)
 {
     Geometry shape;
     int family=-1,round=0;
-    if((argc!=4 && argc!=9) || !parse(argv[1],round,0,100) ||
-       (argc==9 && (!parse(argv[4],family,0,3) || !parse(argv[5],shape.routed,32,640) ||
+    const bool singleTile=argc==10 && std::string_view(argv[9])=="single-tile";
+    if((argc!=4 && argc!=9 && !singleTile) || !parse(argv[1],round,0,100) ||
+       (argc>=9 && (!parse(argv[4],family,0,3) || !parse(argv[5],shape.routed,32,640) ||
            !parse(argv[6],shape.shared,32,640) || !parse(argv[7],shape.routedParts,1,80) ||
            !parse(argv[8],shape.sharedParts,1,80) || shape.routed%32 || shape.shared%32))) {
-        std::fprintf(stderr,"Usage: %s ROUND PCI ROUTES [TUPLE F S ROUTED_GATE_PARTS SHARED_GATE_PARTS]\n",argv[0]);
+        std::fprintf(stderr,"Usage: %s ROUND PCI ROUTES [TUPLE F S ROUTED_GATE_PARTS SHARED_GATE_PARTS [single-tile]]\n",argv[0]);
         return 2;
     }
+    if(singleTile && family<0)return 2;
     std::vector<RouteRows> histories(family<0?3:1);
     if(!readRoutes(argv[3],histories))return 2;
     int count=0;
@@ -336,7 +339,13 @@ int main(int argc,char** argv)
     std::printf("DEVICE,%s,%s,%d,%d\n",argv[2],props.gcnArchName,props.multiProcessorCount,props.l2CacheSize);
     hipStream_t stream;
     HIP(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking));
-    if(family<0)
+    if(singleTile && family==3)
+        run<12,false,true,9,true,true>(family,round,stream,histories.front(),shape);
+    else if(singleTile && family==2)
+        run<20,true,true,32,false,true>(family,round,stream,histories.front(),shape);
+    else if(singleTile)
+        run<16,true,true,32,false,true>(family,round,stream,histories.front(),shape);
+    else if(family<0)
         for(int i=0;i<3;++i)runTuple(i,round,stream,histories[i],shape);
     else runTuple(family,round,stream,histories.front(),shape);
     HIP(hipStreamDestroy(stream));

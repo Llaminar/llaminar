@@ -54,15 +54,18 @@ The counted four-row reader passed static and deferred replay across all
 15 generated format families. Median local time improved 9.23% over staged.
 On original 128- and 256-column QFN shards, paired gate/up reads saved
 10%–13% on Q4_K; Q5_K was 4.5%–7.9% slower, so its reads stay separate.
-Gate/up sustains roughly half of the matched physical-read rate on the
-original shards. On those shards, the prepared reader raised full-model
-fixed-three decode from 114.89 to 124.58 tok/s on review and 94.66 to
-102.51 on code. Dynamic decode changed by +0.12% and −0.25%. All paired
-histories and verifier counts matched.
-On the paired Q4 gate, borrowing the weight-plane pointers once per wave
-brought the four-row parent to 134.36 µs at F128 and 193.30 µs at F256.
-The table above uses the separate equal-width run.
-[Shard timings and read calibration](QFN_MI50_STAGE_COMPARISON_20261118.md#original-shard-widths-and-verifier-preparation)
+On original TP4 shards, the checkpointed Release build reached 130.72 tok/s on
+review512 and 107.28 on code2048 at fixed depth three. At dynamic depth
+it reached 116.08 and 94.74. Four-row dedicated tiles now bring the wide
+Q4 gate to 87.5% of its matched physical-read reference. The complete
+four-row router/FFN fell from 178.30 to 151.10 µs on the wide TP4 shard
+and from 119.20 to 114.12 µs on the narrow shard. The smallest TP8
+shard took 0.42 µs longer. Nine focused preflight tests passed.
+The counted six-row FFN reduced the captured local router/FFN time by
+35.5% on the narrow shard and 25.0% on the wide shard.
+Four-card qualification of those verifier changes is in progress.
+[Full-model measurements](QFN_MI50_STAGE_COMPARISON_20261118.md#transferring-the-single-row-loop-to-grouped-verification)
+[Verifier tiles and packet scheduling](QFN_MI50_STAGE_COMPARISON_20261118.md#verifier-tile-assignment-and-packet-scheduling)
 
 The current ordinary decode trace covers all 255 post-prefill review tokens.
 Values are mean active milliseconds per GPU per token. The projection group

@@ -166,6 +166,34 @@ TEST(ROCmGroupedFFNFormatSelection, FixedQ5PitchRequiresMeasuredWidthsAndExactGa
     EXPECT_FALSE(classify(160,160,reachable(formats::Q5_K),q5k,exact));
 }
 
+/** @test A fixed down reader must remain correct for every descriptor reachable after a move. */
+TEST(ROCmGroupedFFNFormatSelection, PairedDownRequiresOriginalSourcePitchAndSingleReader)
+{
+    const auto q4=reachable(formats::Q4_K,false);
+    const auto q51=reachable(formats::Q5_1,false);
+    const auto original=sources(formats::Q4_K,formats::Q4_K,formats::Q5_1);
+    const auto select=[&](int width,int sharedWidth,const auto& routed,const auto& gate,
+                          const auto& down,const NativeQuantisedFormatInfo& sharedDown) {
+        const std::array weights{matrix(formats::Q8_0,19,false,sharedWidth),
+                                 matrix(formats::Q8_0,19,false,sharedWidth),
+                                 matrix(sharedDown,19,true,sharedWidth)};
+        const auto declaration=ffn::declareSourceFormats(width,sharedWidth,gate,down,routed,weights);
+        return ffn::SourceFormatProgram::prepare(declaration).fixedQ51DownPitch(weights[2]);
+    };
+    for(int width:{128,256})
+        EXPECT_EQ(select(width,160,original,q4,q51,formats::Q8_0),static_cast<ffn::FixedQ51DownPitch>(width));
+    for(int width:{64,96,160,320,384,640})
+        EXPECT_FALSE(select(width,160,original,q4,q51,formats::Q8_0));
+    EXPECT_FALSE(select(128,320,original,q4,q51,formats::Q8_0));
+    EXPECT_FALSE(select(128,160,original,q4,q51,formats::Q8_K));
+    EXPECT_FALSE(select(256,160,sources(formats::Q4_1,formats::Q4_K,formats::Q5_1),q4,q51,formats::Q8_0));
+    EXPECT_FALSE(select(256,160,sources(formats::Q4_K,formats::Q4_K,formats::Q5_K),
+                        q4,reachable(formats::Q5_K,false),formats::Q8_0));
+    EXPECT_EQ(select(256,160,original,reachable(formats::Q4_K,true),q51,formats::Q8_0),
+              ffn::FixedQ51DownPitch::F256);
+    EXPECT_FALSE(select(256,160,original,q4,reachable(formats::Q5_1,true),formats::Q8_0));
+}
+
 #endif
 
 TEST(ROCmGroupedFFNFormatSelection, CapturesMeasuredDecoderOnlyForSupportedSourceAliases)

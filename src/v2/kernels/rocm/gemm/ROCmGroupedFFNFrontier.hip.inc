@@ -166,7 +166,7 @@ __device__ __forceinline__ RoutedQ4Planes borrowRoutedQ4Planes(
 
 /** @brief Read the packed role's original global bytes without changing its layout. */
 template<class T>
-__device__ __forceinline__ T readQ4PreparedGlobal(const void* pointer)
+__device__ __forceinline__ T readPackedGlobal(const void* pointer)
 {
     const auto* source=reinterpret_cast<const unsigned char __attribute__((address_space(1)))*>(
         reinterpret_cast<uintptr_t>(pointer));
@@ -180,11 +180,11 @@ template<bool ReuseSum>
 __device__ __forceinline__ void accumulateRoutedQ4Pair(RoutedQ4Planes gate,RoutedQ4Planes up,
     size_t index,const int* activation,float scale,int sum,float& g,float& u)
 {
-    const auto gateWords=readQ4PreparedGlobal<int4>(gate.payload+index*16);
-    const auto upWords=readQ4PreparedGlobal<int4>(up.payload+index*16);
+    const auto gateWords=readPackedGlobal<int4>(gate.payload+index*16);
+    const auto upWords=readPackedGlobal<int4>(up.payload+index*16);
     const auto dots=q4PairedDots<!ReuseSum>(gateWords,upWords,activation,sum);
     const auto coefficient=[&](const void* plane) {
-        return __half2float(__ushort_as_half(readQ4PreparedGlobal<uint16_t>(
+        return __half2float(__ushort_as_half(readPackedGlobal<uint16_t>(
             static_cast<const uint16_t*>(plane)+index)));
     };
     g=rocm_native_quantised_commit_corrected_single_scale_block(
@@ -193,8 +193,43 @@ __device__ __forceinline__ void accumulateRoutedQ4Pair(RoutedQ4Planes gate,Route
         u,dots.up,coefficient(up.scales),dots.sum,coefficient(up.mins),scale);
 }
 
+/** @brief Original packed operands for one routed K32 block. */
+struct RoutedQ4Block {
+    int4 gateWords,upWords;
+    uint16_t gateScale,gateMin,upScale,upMin;
+};
+
+/** @brief Load one original K32 block of each ready role. */
+__device__ __forceinline__ RoutedQ4Block loadRoutedQ4Block(
+    RoutedQ4Planes gate,RoutedQ4Planes up,size_t index)
+{
+    return {readPackedGlobal<int4>(gate.payload+index*16),
+            readPackedGlobal<int4>(up.payload+index*16),
+            readPackedGlobal<uint16_t>(static_cast<const uint16_t*>(gate.scales)+index),
+            readPackedGlobal<uint16_t>(static_cast<const uint16_t*>(gate.mins)+index),
+            readPackedGlobal<uint16_t>(static_cast<const uint16_t*>(up.scales)+index),
+            readPackedGlobal<uint16_t>(static_cast<const uint16_t*>(up.mins)+index)};
+}
+
+/** @brief Append one affine K32 pair with the retained M1 integer and FP32 operations. */
+template<bool ReuseSum>
+__device__ __forceinline__ void commitRoutedQ4Block(const RoutedQ4Block& weight,
+    int block,const int8_t* codes,const float* scales,const int16_t* sums,float& g,float& u)
+{
+    const auto* activation=reinterpret_cast<const int32_t*>(codes+block*32);
+    const float scale=scales[block];
+    const auto dots=q4PairedDots<!ReuseSum>(
+        weight.gateWords,weight.upWords,activation,ReuseSum?sums[block]:0);
+    g=rocm_native_quantised_commit_corrected_single_scale_block(
+        g,dots.gate,__half2float(__ushort_as_half(weight.gateScale)),dots.sum,
+        __half2float(__ushort_as_half(weight.gateMin)),scale);
+    u=rocm_native_quantised_commit_corrected_single_scale_block(
+        u,dots.up,__half2float(__ushort_as_half(weight.upScale)),dots.sum,
+        __half2float(__ushort_as_half(weight.upMin)),scale);
+}
+
 /** @brief Joint original gate/up range loads with independent ordered accumulators. */
-template<NativeQuantisedFormatPrefill Format,int Columns,bool ReuseSum=false,bool RoutedWaveQ4=false>
+template<NativeQuantisedFormatPrefill Format,int Columns,bool ReuseSum=false,bool RoutedWaveQ4=false,int K32Packets=1>
 __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuantisedMatrixDesc& gate,const DeviceNativeQuantisedMatrixDesc& up,
     const std::int8_t* codes,const float* scales,int column,int parts,int lane,const std::int16_t* sums=nullptr)
 {
@@ -219,6 +254,30 @@ __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuant
         const int begin=originalPart*perPart;
         const int end=min(begin+perPart,hidden/32);
         float g=0.0f,u=0.0f;
+        static_assert(K32Packets==1 || K32Packets==2);
+#if defined(__gfx906__)
+        if constexpr(scalarQ4 && K32Packets==2) {
+            if(originalPart<parts) {
+                int block=begin;
+                // Every weight load belongs to this original serial partition.
+                // Expose the two independent memory groups together while
+                // preserving one ascending FP32 commit chain for each role.
+#pragma unroll 1
+                for(;block+1<end;block+=2) {
+                    const auto index=static_cast<size_t>(block)*width+column;
+                    const auto first=loadRoutedQ4Block(gatePlanes,upPlanes,index);
+                    const auto second=loadRoutedQ4Block(gatePlanes,upPlanes,index+width);
+                    commitRoutedQ4Block<ReuseSum>(first,block,codes,scales,sums,g,u);
+                    commitRoutedQ4Block<ReuseSum>(second,block+1,codes,scales,sums,g,u);
+                }
+                if(block<end) {
+                    const auto index=static_cast<size_t>(block)*width+column;
+                    const auto tail=loadRoutedQ4Block(gatePlanes,upPlanes,index);
+                    commitRoutedQ4Block<ReuseSum>(tail,block,codes,scales,sums,g,u);
+                }
+            }
+        } else
+#endif
         if(originalPart<parts)
             for(int block=begin;block<end;++block) {
                 const auto index=static_cast<std::size_t>(block)*width+column;

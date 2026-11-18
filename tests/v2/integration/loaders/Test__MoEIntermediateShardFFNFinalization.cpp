@@ -155,6 +155,7 @@ struct OriginalFFNFixtureGeometry {
     OriginalFFNGeometryContract contract=OriginalFFNGeometryContract::SourceDerived; ///< Assert an exact admitted source geometry.
     bool verify_runtime_admission=false; ///< Inspect capture admission with two original owners.
     std::string_view grouped_matrix_case{}; ///< Nonempty selects the isolated M4 source-catalog fixture.
+    int expected_q51_down_pitch=0; ///< Independent native Down width used by the focused promotion replay.
     std::string_view grouped_matrix_symbol{}; ///< Expected selected production candidate symbol, when armed.
     GroupedM4FixtureProgram grouped_matrix_program=GroupedM4FixtureProgram::AllFormats; ///< Exact capture program family.
     bool grouped_matrix_symbol_present=true; ///< Whether the selected production symbol must be present.
@@ -1258,7 +1259,31 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                     "Captured M4 graph does not match the independently selected experiment arm");
                 if (!shape.grouped_matrix_symbol.empty()) {
                     const bool fixed_program=shape.grouped_matrix_program==GroupedM4FixtureProgram::Fixed;
-                    const std::string_view consumer=fixed_program?"groupedFFNTokenDown":"groupedFFNFormatProgramDown";
+                    const int pitch=shape.expected_q51_down_pitch;
+                    const std::string consumer=pitch?
+                        "groupedFFNFormatProgramDownILj15ELb1ELi7ELi"+std::to_string(pitch)+"E":
+                        fixed_program?"groupedFFNTokenDown":"groupedFFNFormatProgramDown";
+                    if(pitch || shape.grouped_matrix_case=="Q4_K_deep_grid") {
+                        require(!fixed_program && (!pitch || pitch==shape.routed) && shape.grouped_matrix_symbol_present,
+                            "Direct-tile replay requires its exact all-format capture");
+                        const GPUGraphKernelNodeInfo* gate=nullptr;
+                        for(const auto& node:nodes) {
+                            if(!node.name_resolved || node.name.find("groupedFFNFormatProgramGate")==std::string::npos)continue;
+                            require(!gate,"exactly one original Q4 Gate node");
+                            gate=&node;
+                        }
+                        // Two wave pairs in each block own one K32 output tile apiece.
+                        // A resident grid capped at 120 silently misses wide-shard work
+                        // after tile reuse is removed, even if narrower tests pass.
+                        const unsigned tiles=rows*(shape.top_k*(shape.routed/32)+shape.shared/32);
+                        require(gate && gate->grid_x==(tiles+1)/2 && gate->grid_y==1 && gate->grid_z==1 &&
+                            gate->block_x==256 && gate->block_y==1 && gate->block_z==1,
+                            "captured Q4 Gate must cover every original tile once");
+                        std::osyncstream(std::cout)<<"M4_SOURCE_TILE_GEOMETRY,case="<<shape.grouped_matrix_case
+                            <<",F="<<shape.routed<<",down_symbol="<<consumer<<",gate_symbol="<<gate->name
+                            <<",gate_grid="<<gate->grid_x<<'x'<<gate->grid_y<<'x'<<gate->grid_z
+                            <<",gate_block="<<gate->block_x<<'x'<<gate->block_y<<'x'<<gate->block_z<<'\n';
+                    }
                     const std::string_view program=fixed_program?"fixed":"all_formats";
                     const auto down=std::count_if(nodes.begin(),nodes.end(),[&](const auto& node) {
                         return node.name_resolved && node.name.find(consumer)!=std::string::npos;
@@ -1387,9 +1412,13 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                 mismatch(history_local,observed_local,"local");
             };
             const char* originalMove=std::getenv("LLAMINAR_TEST_QFN_Q4_PHYSICAL_MOVE");
-            const bool provePhysicalMove=shape.grouped_matrix_case=="Q4_K_sparse_routes" ||
+            const auto* downMove=std::getenv("LLAMINAR_TEST_M4_Q51_DOWN_RELOCATION");
+            const bool relocateDown=shape.expected_q51_down_pitch!=0 ||
+                (shape.grouped_matrix_case=="OriginalQFN" && downMove && std::string_view(downMove)=="1");
+            const bool provePhysicalMove=relocateDown || shape.grouped_matrix_case=="Q4_K_sparse_routes" ||
                 (shape.grouped_matrix_case=="OriginalQFN" && originalMove && std::string_view(originalMove)=="1");
             std::vector<std::shared_ptr<void>> movedPlanes;
+            std::optional<std::array<std::uint32_t,2>> lastPhysicalPublication;
             std::size_t clonedBytes=0;
             for (int replay = 0; replay < 20; ++replay)
             {
@@ -1539,30 +1568,39 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                             <<",rejected=6,bank_bytes_unchanged=1,capture_identity_unchanged=1"<<'\n';
                     }
                     if(provePhysicalMove) {
-                        const int n=shape.routed;
-                        const auto blocks=std::size_t(n)*(shape.hidden/32);
-                        const auto roleBytes=blocks*20;
-                        clonedBytes=2*source.expert_count*roleBytes;
+                        const int n=relocateDown?shape.hidden:shape.routed;
+                        const int k=relocateDown?shape.routed:shape.hidden;
+                        const auto blocks=std::size_t(n)*(k/32);
+                        const auto payload=blocks*(relocateDown?20:16);
+                        const auto coefficients=blocks*2;
+                        const auto roleBytes=payload+2*coefficients;
+                        clonedBytes=(relocateDown?1:2)*source.expert_count*roleBytes;
                         auto* allocation=static_cast<std::uint8_t*>(backend->allocate(clonedBytes,device.ordinal));
                         require(allocation,"allocate independent fixture-owned copies of original weight planes");
                         movedPlanes.emplace_back(allocation,[backend,ordinal=device.ordinal](void* ptr){backend->free(ptr,ordinal);});
                         auto copyRole=[&](auto& projection,const std::size_t team) {
-                            require(projection.codebook_id==5 && projection.n==n &&
-                                projection.k==shape.hidden,"exact original Q4_K native layout");
+                            require(projection.codebook_id==(relocateDown?7:5) && projection.n==n &&
+                                projection.k==k,"exact original native movement layout");
+                            if(relocateDown)
+                                require(projection.source_identity_present && projection.source_codebook_id==7 &&
+                                    !projection.source_is_superblock,"only original plain Q5_1 Down can use this witness");
                             auto* base=allocation+team*roleBytes;
-                            require(backend->deviceToDevice(base,projection.payload,blocks*16,device.ordinal,stream) &&
-                                backend->deviceToDevice(base+blocks*16,projection.scales,blocks*2,device.ordinal,stream) &&
-                                backend->deviceToDevice(base+blocks*18,projection.mins,blocks*2,device.ordinal,stream),
-                                "copy original prepared Q4_K physical planes on the captured lane's transfer stream");
+                            require(backend->deviceToDevice(base,projection.payload,payload,device.ordinal,stream) &&
+                                backend->deviceToDevice(base+payload,projection.scales,coefficients,device.ordinal,stream) &&
+                                backend->deviceToDevice(base+payload+coefficients,projection.mins,coefficients,device.ordinal,stream),
+                                "copy original prepared physical planes on the captured lane's transfer stream");
                             require(base!=projection.payload,"physical plane address changed");
                             projection.payload=base;
-                            projection.scales=base+blocks*16;
-                            projection.mins=base+blocks*18;
+                            projection.scales=base+payload;
+                            projection.mins=base+payload+coefficients;
                         };
                         for(std::size_t expert=0;expert<source.expert_count;++expert)
                             if(update.local_compute_mask[expert]) {
-                                copyRole(update.experts[expert].gate,2*expert);
-                                copyRole(update.experts[expert].up,2*expert+1);
+                                if(relocateDown)copyRole(update.experts[expert].down,expert);
+                                else {
+                                    copyRole(update.experts[expert].gate,2*expert);
+                                    copyRole(update.experts[expert].up,2*expert+1);
+                                }
                             }
                     }
                     require(runtime.prepareInactiveBank(0,update),"prepare original descriptors in the inactive bank");
@@ -1581,6 +1619,14 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                                 &next,sizeof(next),device.ordinal,stream) &&
                             worker.synchronizeStreamChecked(stream),
                             "publish only the prepared bank and epoch through the exact fixture stream");
+                        if(provePhysicalMove) {
+                            // Narrow device publication leaves the fixture's host recipe
+                            // untouched. Advance the existing recipe for the next bank
+                            // preparation without writing device-owned replay history.
+                            auto& fixtureRecipe=runtime.hostLayerState(0);
+                            fixtureRecipe.active_bank=next;
+                            fixtureRecipe.active_epoch=update.epoch;
+                        }
                         copyHistory();
                         verifyHistory(replay,"after placement change");
                     } else {
@@ -1593,6 +1639,12 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         sizeof(seen[1]),device.ordinal,stream) && worker.synchronizeStreamChecked(stream),
                         "Observe terminal epoch after original publication");
                     if(provePhysicalMove) {
+                        if(lastPhysicalPublication) {
+                            require(seen==std::array{(*lastPhysicalPublication)[0]+1u,
+                                                       1u-(*lastPhysicalPublication)[1]},
+                                "Each physical move publishes a strictly newer epoch in the opposite bank");
+                        }
+                        lastPhysicalPublication=seen;
                         const auto expert=std::find(update.local_compute_mask.begin(),update.local_compute_mask.end(),1)-
                             update.local_compute_mask.begin();
                         require(expert<update.expert_count,"fixture must have an original live local expert");
@@ -1602,15 +1654,17 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         require(backend->deviceToHostOnStream(&arrived,layer+offset,sizeof(arrived),device.ordinal,stream) &&
                             worker.synchronizeStreamChecked(stream),"observe actual relocated expert descriptor identity");
                         const auto& expected=update.experts[expert];
-                        require(arrived.gate.payload==expected.gate.payload && arrived.gate.scales==expected.gate.scales &&
-                            arrived.gate.mins==expected.gate.mins && arrived.up.payload==expected.up.payload &&
-                            arrived.up.scales==expected.up.scales && arrived.up.mins==expected.up.mins,
-                            "device-published gate/up identity retained all six moved planes");
+                        const auto matches=[](const auto& a,const auto& b) {
+                            return a.payload==b.payload && a.scales==b.scales && a.mins==b.mins;
+                        };
+                        require(relocateDown?matches(arrived.down,expected.down):
+                            matches(arrived.gate,expected.gate) && matches(arrived.up,expected.up),
+                            "device-published role retains all relocated physical plane addresses");
                         if(movedPlanes.size()>1)
                             require(backend->memset(movedPlanes[movedPlanes.size()-2].get(),0,clonedBytes,device.ordinal,stream) &&
                                 worker.synchronizeStreamChecked(stream),"retired fixture-only copy is poisoned before next replay");
                         std::osyncstream(std::cout)<<"M4_SOURCE_PHYSICAL_MOVE,epoch="<<update.epoch
-                            <<",retained_bank="<<(1u-oldBank)<<",descriptor_planes=6,replay="<<replay<<'\n';
+                            <<",retained_bank="<<(1u-oldBank)<<",descriptor_planes="<<(relocateDown?3:6)<<",replay="<<replay<<'\n';
                     }
                     require(seen==std::array{update.epoch,1u-oldBank} && capture_identity()==original_identity,
                         "The next bank must reach the same captured grouped verifier");

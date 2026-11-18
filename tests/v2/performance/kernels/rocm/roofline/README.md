@@ -63,3 +63,19 @@ python capture.py "${ARGS[@]}" --output "$RESULTS/packet-down-fetch" \
 Iteration 257 selects a warm rotating-bank dispatch for an explicit one-tuple invocation. Record WriteSize in a separate invocation using `--metric write`. The original three-history F160/S160 invocation is still accepted without `--packet-shape`. The later same-symbol dispatch in that invocation uses iteration 691. Capture rejects absent or mismatched counter triggers and metric sets.
 
 Use the independent quiet median for a scored shape and warm case. The physical rate is FetchSize or WriteSize in KiB multiplied by 1024, divided by elapsed microseconds and then by 1000 for decimal GB/s. The application's requested packed bytes and useful unique bytes retain their own denominators. Report observed rates, source binding, resource geometry and service-time comparisons separately. Keep native binaries, raw counters and histories outside the source tree.
+
+The Q4 packet probe can also calibrate a direct single-tile gate launch.
+Pass `--single-tile --packet-shape 0 F S ROUTED_GATE_PARTS SHARED_GATE_PARTS`
+with the original route packet. This mode emits gate samples only. It launches
+one 256-thread workgroup per pair of 32-column tiles, with no grid-stride reuse.
+Use `packetRead<16,\s*true,\s*true,\s*32,\s*false,\s*true>` as the counter
+kernel filter. Match the physical launch, original ordered routes and prepared
+K32 partition policy before comparing it with an inference dispatch.
+
+The same gate-only switch accepts all explicit tuples. Tuple 1 uses the
+same Q4_K routed and Q8_0 shared gate format as tuple 0. Tuple 2 uses
+the original Q5_K prepared affine reader and Q8_0 shared reader, with kernel
+filter `packetRead<20,\s*true,\s*true,\s*32,\s*false,\s*true>`. Tuple 3
+uses the G15 IQ3_XXS routed and IQ2_S shared prepared readers, with filter
+`packetRead<12,\s*false,\s*true,\s*9,\s*true,\s*true>`.
+Keep the original route order and K32 partitions for each measured shard.

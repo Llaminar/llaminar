@@ -173,6 +173,32 @@ if(TARGET v2_integration_moe_intermediate_ffn_finalization)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedM4BankPublicationRejects_ROCm)
     endif()
 
+    foreach(pitch IN ITEMS 128 256)
+        set(replay "V2_Integration_GroupedM4Q51DownF${pitch}Replay_ROCm")
+        set(replay_case "Q4_K_Q5_1_Down_F${pitch}")
+        add_v2_test(${replay}
+            COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
+                --gtest_filter=OriginalSources/GroupedM4Source.Static/${replay_case}:OriginalSources/GroupedM4Source.Deferred/${replay_case}
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;GraphCapture;Replay;ByteExact;GeneratedSource;Regression;Devices1;NativeISA-gfx906"
+            MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
+            ENVIRONMENT ${grouped_m4_all_formats_env} LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS=1
+                LLAMINAR_QFN_ROCM_GROUPED_TOPK_REGISTERS=1)
+        if(TEST ${replay})
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${replay})
+        endif()
+    endforeach()
+
+    add_v2_test(V2_Integration_GroupedM4DeepGridPackets_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
+            --gtest_filter=OriginalSources/GroupedM4Source.Deferred/Q4_K_deep_grid
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;GraphCapture;Replay;ByteExact;GeneratedSource;Regression;Devices1;NativeISA-gfx906"
+        MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
+        ENVIRONMENT ${grouped_m4_all_formats_env} LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS=1
+            LLAMINAR_QFN_ROCM_GROUPED_TOPK_REGISTERS=1)
+    if(TEST V2_Integration_GroupedM4DeepGridPackets_ROCm)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedM4DeepGridPackets_ROCm)
+    endif()
+
     add_v2_test(V2_Integration_GroupedM4MeasuredSourceAlias_ROCm
         COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
             --gtest_filter=OriginalSources/GroupedM4Source.Static/Q5_1_routed_gate_up
