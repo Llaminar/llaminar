@@ -28,7 +28,8 @@
 #include <unordered_set>
 #ifdef HAVE_ROCM
 #include "kernels/rocm/gemm/ROCmPersistentHCRead.h"
-#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "kernels/common/VerifierDispatchTable.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
 #include "utils/DebugEnv.h"
 #include "kernels/rocm/gemm/ROCmFullNativeHCFFN.h"
 #include "kernels/rocm/gemm/ROCmCTAOwnedHCRead.h"
@@ -250,8 +251,7 @@ std::vector<PendingNode> readNodes(const Qwen4ExpHyperconnectionContext &c,
        c.projectionRows->captureIdentity().repeats_per_row==1 &&
        c.arithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier &&
        up_arithmetic==Qwen4ExpHCUpArithmetic::QuantizedTwoTermQ8 &&
-       qfnGroupedHCDownReducePublishExperiment() && qfnGroupedHCDownLongKExperiment() &&
-       qfnGroupedHCUpShortKExperiment())
+       qfnGroupedHCDownReducePublishEnabled())
     {
         const auto originalQ8 = [&](const Qwen4ExpPreparedProjection& weight) {
             DeviceNativeQuantisedMatrixDesc source;
@@ -260,9 +260,12 @@ std::vector<PendingNode> readNodes(const Qwen4ExpHyperconnectionContext &c,
                 source.codebook_id==19 && source.source_identity_present &&
                 source.source_codebook_id==19 && !source.source_is_superblock;
         };
-        const auto& hw=rocmHardwareMetadata().at(c.device.ordinal);
-        groupedDownPublish=hw.isa_target.starts_with("gfx906") && hw.compute_units==60 &&
-            hw.native_wave_width==64 && hw.maximum_threads_per_block>=640 &&
+        const auto hardware=rocm::nativeQuantisedHardwareForDevice(c.device.ordinal);
+        // The measured long-K contributor writes the same 16 ordered partitions.
+        // Selecting its publication here gives the down/up stages a shared bank
+        // lease without changing the HC-up projection or residual-read schedule.
+        groupedDownPublish=native_quantised::selectVerifierDispatchTable(hardware)==
+            native_quantised::VerifierDispatchTable::MI50 && hardware.admits(640,10240) &&
             originalQ8(w.down) && originalQ8(w.up);
     }
 #endif

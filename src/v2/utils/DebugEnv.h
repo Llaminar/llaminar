@@ -81,13 +81,13 @@ namespace llaminar2
         return enabled;
     }
 
-    /** @brief Select the measured grouped HC-down reducer publication once per process. */
-    inline bool qfnGroupedHCDownReducePublishExperiment()
+    /** @brief Allow the measured counted HC-down publication unless diagnostics disable it. */
+    inline bool qfnGroupedHCDownReducePublishEnabled()
     {
         static const bool enabled = [] {
             const char* mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH");
-            if (!mode || std::strcmp(mode, "0") == 0) return false;
-            if (std::strcmp(mode, "1") == 0) return true;
+            if (!mode || std::strcmp(mode, "1") == 0) return true;
+            if (std::strcmp(mode, "0") == 0) return false;
             throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH accepts 0 or 1");
         }();
         return enabled;

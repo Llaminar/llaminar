@@ -1043,7 +1043,25 @@ if(HAVE_CUDA OR HAVE_ROCM)
             LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;MTP;Capture;ByteExact;Replay;Regression"
             ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0;LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_LONG_K=1;LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K=1;LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH=1"
             MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK rocm_gpu_0)
-        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedHCDownReducePublish)
+        foreach(case IN ITEMS Default Off Portable)
+            set(test_name V2_Integration_ROCmGroupedHCDownReducePublish${case})
+            add_v2_test(${test_name}
+                COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_filter=Q8ResidualCorrectionDevice.ROCmGroupedHCDownReducePublish${case}Replay
+                LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;MTP;Capture;ByteExact;Replay;Regression"
+                ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK rocm_gpu_0)
+            set_property(TEST ${test_name} APPEND PROPERTY ENVIRONMENT_MODIFICATION
+                "LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH=unset:"
+                "LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_LONG_K=unset:"
+                "LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K=unset:")
+            if(case STREQUAL "Off")
+                set_property(TEST ${test_name} APPEND PROPERTY ENVIRONMENT_MODIFICATION
+                    "LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH=set:0"
+                    "LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_LONG_K=set:1"
+                    "LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K=set:1")
+            endif()
+        endforeach()
         add_v2_test(V2_Integration_ROCmRetainedPreAttentionGDN
             COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                 --gtest_filter=Q8ResidualCorrectionDevice.ROCmRetainedPreAttentionGDN
@@ -38498,6 +38516,15 @@ endif()
 if(TEST V2_Integration_ROCmGroupedHCUpMeasuredTableReplay)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedHCUpMeasuredTableReplay)
 endif()
+foreach(test_name IN ITEMS
+        V2_Integration_ROCmGroupedHCDownReducePublish
+        V2_Integration_ROCmGroupedHCDownReducePublishDefault
+        V2_Integration_ROCmGroupedHCDownReducePublishOff
+        V2_Integration_ROCmGroupedHCDownReducePublishPortable)
+    if(TEST ${test_name})
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${test_name})
+    endif()
+endforeach()
 if(TEST V2_Integration_GroupedVerifierRows_ROCm_HCDownLongK)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedVerifierRows_ROCm_HCDownLongK)
 endif()

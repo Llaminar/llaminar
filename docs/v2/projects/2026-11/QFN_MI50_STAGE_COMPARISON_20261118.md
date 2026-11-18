@@ -1148,6 +1148,27 @@ weights. The model throughput measurements above use four MI50s.
 [Held-epoch fixture and independent reader checks](/tmp/qfn-held-grouped-c2/README.md)
 [Release preflight replay](/tmp/qfn-mi50-fixed-bank-proof/canonical-held-epoch/native-1/ctest.xml)
 
+The next Release prepared Gate, Up and Down operands in the existing
+softmax/top-k selector for eligible 128-column shards. Ten lanes issued
+the original selected slots together. A serial lane-zero prototype spent
+68.80 µs in selection, compared with 11.36 µs in the control. The
+lane-parallel version uses a separate selector entry so ordinary verifier
+capacities retain their own compiled kernel. On the 256-column shard the
+existing Gate launch publishes the Down operands. The measured four-row
+parent includes the router projection, selector and both expert launches.
+
+| Original layer 1, held Q4_K/Q5_1 expert weights | Checked control (µs) | Prepared operands (µs) |
+| --- | ---: | ---: |
+| 128 routed, 160 shared columns | 118.52 | 109.76 |
+| 256 routed, 160 shared columns | 155.08 | 155.85 |
+
+The 128-column path requires the original paired physical formats and a
+held durable bank. A captured verifier using the original layer-2 Q5_K
+holdout selected the checked path. A six-row replay and an M4-to-M3 reset
+also retained their expected route handling. These are local parent times.
+[Reverse-order native timings and authority checks](/tmp/qfn-mi50-m4-ready-serving/REPORT.md)
+[Held-epoch, source holdout, six-row and reset qualification](/tmp/qfn-mi50-m4-ready-serving/promotion-native-gate.json)
+
 The HC up-projection can compute the four-branch residual read from its
 own live logits. With the grouped Down reducer enabled, this shortened
 the captured local HC parent from six launches to five and saved
@@ -1157,6 +1178,33 @@ three generations, median decode fell from 113.83 to 113.20 tok/s with
 the extra fusion. Its complete-model result leaves the read staged.
 [Exact captured HC tests and reverse-order timings](/tmp/qfn-mi50-hcup-read-c2/REPORT.md)
 [Four-card same-Release throughput and accepted-token counts](/tmp/qfn-mi50-w-r3-verifier-cohort/hc-read-admission-comparison.json)
+
+With the residual read staged, enabling the grouped HC-down reducer on
+the same Release removed 97 launches from the selected four-row verifier
+on every MI50. Its captured size fell from 1,935 to 1,838 native nodes.
+Median decode rose from 111.88 to 113.54 tok/s on code2048 (+1.49%
+paired). Prefill changed by +0.04% paired. All token IDs and work
+counters matched. Host I/O pressure was lower during the treatment.
+[Same-binary HC-down reducer timing, graph counts and I/O pressure](/tmp/qfn-mi50-w-r3-verifier-cohort/fuller-hc-reducer-comparison.json)
+
+The automatic policy selects the measured contributor and reducer while building
+a counted four-row verifier graph for an MI50 with original Q8 down and up
+weights. The reducer folds the same 16 partitions in order and writes the
+activation bank consumed by the next projection. A diagnostic value of `0`
+for `LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH` selects the staged
+path. The up-projection and residual read keep their own dispatch.
+
+With the tuning switches unset, an original layer-3 replay measured the
+complete HC parent at **86.76 → 73.67 µs** with four live rows. Two live rows
+took 68.19 → 58.24 µs and one took 59.41 → 50.96 µs. Empty replay took
+16.34 → 16.26 µs. Each pair used 32 interleaved event samples per live count
+and 48 complete graph replays per sample. The partials, published banks,
+serial outputs and retained state matched byte for byte. This comparison
+includes selecting the long-K contributor. The four-card run above had
+already selected that contributor in both arms and isolates publication.
+[Layer-3 event timings](/tmp/qfn-mi50-hc-reducer-default/native-bd-timing-no-env-v1/result.json)
+[MI50 and gfx1100 qualification](/tmp/qfn-mi50-hc-reducer-default/qualified.json)
+[Six registered Release regressions, including automatic, forced-off and portable dispatch](/tmp/qfn-mi50-hc-reducer-default/ctest-qualified.json)
 
 ### Physical read limits on the six-row TP4 verifier
 

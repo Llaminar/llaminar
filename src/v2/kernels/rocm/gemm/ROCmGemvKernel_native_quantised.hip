@@ -8275,7 +8275,8 @@ bool rocmLaunch_native_quantised_small_m_fp32(
             arithmetic_policy_codebook_id == static_cast<uint8_t>(NATIVE_QUANTISED_Q8_0) &&
             N == kHCDownColumns && K == kHCDownReduction && M >= 2 && M <= 8 &&
             row_range && row_range->countOwner() && !d_block_mins && !d_block_emins &&
-            !llaminar2::currentProjectionRowWork(M) && llaminar2::qfnGroupedHCDownLongKExperiment())
+            !llaminar2::currentProjectionRowWork(M) &&
+            (publication || llaminar2::qfnGroupedHCDownLongKExperiment()))
         {
             const auto &hardware = llaminar2::rocmHardwareMetadata().at(device_id);
             hc_down_long_k = (hardware.isa_target == "gfx906" || hardware.isa_target.starts_with("gfx906:")) &&

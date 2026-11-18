@@ -573,7 +573,7 @@ void proveCancellationRead(DeviceId device)
 }
 /** @brief Freeze a complete original HC read chain before installing103. */
 /** @brief Original/typed fusion comparison or explicit fixed-tile K-pair staging. */
-enum class HC103Path {Control,Typed,GroupedKPair,GroupedReducer};
+enum class HC103Path {Control,Typed,GroupedKPair,GroupedReducer,GroupedReducerStaged};
 /** @brief Native replay, paired events, or one event-free retained profile variant. */
 enum class HC103Observation {Correctness,Paired,ProfileProduction,ProfileReference};
 /** @brief Test-only native-address substitution without transferring allocation ownership. */
@@ -606,6 +606,7 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
  const bool profiling=observation==HC103Observation::ProfileProduction||observation==HC103Observation::ProfileReference;
  const bool kPair=path==HC103Path::GroupedKPair;
  const bool groupedReducer=path==HC103Path::GroupedReducer;
+ const bool groupedReplay=groupedReducer||path==HC103Path::GroupedReducerStaged;
  const bool ordinaryDown=observation!=HC103Observation::Correctness;
  const bool typed=path!=HC103Path::Control;
  require(!kPair||(device.is_rocm()&&m>=32&&hidden>=16),"HC K-pair diagnostic requires its native ROCm grouped geometry");
@@ -758,6 +759,10 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
    require(actualDown[0]&&actualUp[0],"HC103 actual builder lost prepared GEMM stages");
    ASSERT_TRUE(actualUp[0]->getParams().hc_residual_down.has_value());
    EXPECT_EQ(actualUp[0]->getParams().A,raw);EXPECT_EQ(actualUp[0]->getParams().hc_residual_down->activated,activated[0].get());
+   if(path==HC103Path::GroupedReducerStaged) {
+    EXPECT_FALSE(actualDown[0]->getParams().hc_down_output);
+    EXPECT_FALSE(actualUp[0]->getParams().hc_prepublished_down);
+   }
    if(groupedReducer) {
     const auto& output=actualDown[0]->getParams().hc_down_output;
     ASSERT_TRUE(output);
@@ -907,7 +912,7 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
    require(downStages[side]->execute(context.get()),"HC103 prepared down rejected");
    const qwen4exp::RowExtent extent{m,count};
 #ifdef HAVE_ROCM
-   if(groupedReducer){
+   if(groupedReplay){
     auto reference=referenceProjection(side);
     reference.primary=static_cast<signed char*>(upWorkspace[side]->value->getBuffer(kGPUProjectionPrimaryQ8));
     reference.residual=static_cast<signed char*>(upWorkspace[side]->value->getBuffer(kGPUProjectionResidualQ8));
@@ -1062,21 +1067,27 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
     <<",row_tile=32,column_tile=64,threads=256,warmup=8,observations=31,event_free=1\n";
    s.retire();referenceGraph.reset();return;
   }
-  if(groupedReducer) {
-   ASSERT_EQ(inventory[0].size(),6u);
+#ifdef HAVE_ROCM
+  if(groupedReplay) {
+   ASSERT_EQ(inventory[0].size(),groupedReducer?6u:7u);
    ASSERT_EQ(inventory[1].size(),7u);
    for(int side=0;side<2;++side) {
     const auto has=[&](std::string_view leaf) {
      return std::any_of(inventory[side].begin(),inventory[side].end(),
       [leaf](const GPUGraphKernelNodeInfo& node){return node.name.find(leaf)!=std::string::npos;});
     };
-    EXPECT_TRUE(has("qfn_hc_down_long_k_contributions"));
-    EXPECT_TRUE(has("projectHCGroupedShortK"));
-    EXPECT_EQ(has("groupedHCDownReducePublish"),side==0);
-    EXPECT_EQ(has("publishHCResidualDown"),side==1);
+    const auto& hardware=rocmHardwareMetadata().at(device.ordinal);
+    const bool mi50=hardware.isa_target.starts_with("gfx906") && hardware.compute_units==60 &&
+        hardware.native_wave_width==64;
+    const bool fused=groupedReducer && side==0;
+    EXPECT_EQ(has("qfn_hc_down_long_k_contributions"),fused||(mi50&&qfnGroupedHCDownLongKExperiment()));
+    EXPECT_EQ(has("projectHCGroupedShortK"),mi50&&qfnGroupedHCUpShortKExperiment());
+    EXPECT_EQ(has("groupedHCDownReducePublish"),fused);
+    EXPECT_EQ(has("publishHCResidualDown"),!fused);
    }
   }
-  if(typed&&!kPair&&!groupedReducer) {
+#endif
+  if(typed&&!kPair&&!groupedReplay) {
    ASSERT_EQ(inventory[0].size()+copies,inventory[1].size());
    using Key=std::tuple<std::string,unsigned,unsigned,unsigned,unsigned,unsigned,unsigned>;
    std::array<std::map<Key,int>,2> remaining;
@@ -1118,7 +1129,7 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
   const auto retainedOwners=s.owners->size();
   const int replays=observation==HC103Observation::Correctness?20:1;
   for(int replay=0;replay<replays;++replay) {
-   const int live=groupedReducer?std::array{m,2,0,1,3}[replay%5]:
+   const int live=groupedReplay?std::array{m,2,0,1,3}[replay%5]:
     timing||replay%4==0?m:replay%4==1?std::min(m,1):replay%4==2?0:std::max(0,m-1);
    SCOPED_TRACE(::testing::Message()<<"replay="<<replay<<" live="<<live);
    std::vector<float> input(std::size_t(m+1)*trunk);
@@ -1150,7 +1161,7 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
    compare("activated",static_cast<float*>(activated[0]->gpu_data_ptr()),static_cast<float*>(activated[1]->gpu_data_ptr()),activated[0]->numel(),lowRank);
    compare("up",static_cast<float*>(up[0]->gpu_data_ptr()),static_cast<float*>(up[1]->gpu_data_ptr()),up[0]->numel(),trunk);
    compare("read",static_cast<float*>(read[0]->gpu_data_ptr()),static_cast<float*>(read[1]->gpu_data_ptr()),read[0]->numel(),hidden);
-   if(groupedReducer) {
+   if(groupedReplay) {
     for(const auto& name:{kGPUProjectionPrimaryQ8,kGPUProjectionResidualQ8}) {
      const auto* candidate=static_cast<const signed char*>(upWorkspace[0]->value->getBuffer(name));
      const auto* reference=static_cast<const signed char*>(upWorkspace[1]->value->getBuffer(name));
@@ -1196,7 +1207,7 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
    }
    ASSERT_FALSE(::testing::Test::HasFailure());
   }
-  if(groupedReducer) {
+  if(groupedReplay) {
    const auto snapshot=[&] {
     std::vector<std::uint8_t> bytes;
     const auto append=[&](const auto& plane) {
@@ -1751,5 +1762,49 @@ TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCDownReducePublishReplay)
     hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
  for(bool alias:{false,true})
   proveHC103Chain(DeviceId::rocm(0),4,2560,320,alias,HC103Path::GroupedReducer);
+}
+#endif
+
+#ifdef HAVE_ROCM
+/** @test Automatic MI50 counted M4 reducer publication requires no experimental switches. */
+TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCDownReducePublishDefaultReplay)
+{
+ ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH"),nullptr);
+ ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_LONG_K"),nullptr);
+ ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K"),nullptr);
+ auto* backend=getROCmBackend();
+ if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
+ const auto& hardware=rocmHardwareMetadata().at(0);
+ if(!hardware.isa_target.starts_with("gfx906")||hardware.compute_units!=60||
+    hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
+ for(bool alias:{false,true})
+  proveHC103Chain(DeviceId::rocm(0),4,2560,320,alias,HC103Path::GroupedReducer);
+}
+
+/** @test Explicit 0 retains the separate reducer and publisher on eligible MI50. */
+TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCDownReducePublishOffReplay)
+{
+ ASSERT_STREQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH"),"0");
+ auto* backend=getROCmBackend();
+ if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
+ const auto& hardware=rocmHardwareMetadata().at(0);
+ if(!hardware.isa_target.starts_with("gfx906")||hardware.compute_units!=60||
+    hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
+ proveHC103Chain(DeviceId::rocm(0),4,2560,320,false,HC103Path::GroupedReducerStaged);
+}
+
+/** @test A portable gfx1100 counted M4 capture retains the staged publication. */
+TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCDownReducePublishPortableReplay)
+{
+ ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH"),nullptr);
+ auto* backend=getROCmBackend();
+ if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
+ for(int ordinal=0; ordinal<backend->deviceCount(); ++ordinal) {
+  if(rocmHardwareMetadata().at(ordinal).isa_target.starts_with("gfx1100")) {
+   proveHC103Chain(DeviceId::rocm(ordinal),4,2560,320,false,HC103Path::GroupedReducerStaged);
+   return;
+  }
+ }
+ GTEST_SKIP()<<"Requires an actual gfx1100";
 }
 #endif

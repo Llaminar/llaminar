@@ -4,22 +4,25 @@ Status dashboard for 15 physical decoder specialisations. Limit 15,000 UTF-8 byt
 
 ## Current Release on the original four-MI50 split
 
-Checkpoint `261abf958` used routed expert widths of 128/128/128/256,
+Checkpoint `7001788d8` used routed expert widths of 128/128/128/256,
 160 shared columns per GPU and the measured verifier switches. Both engines
 ran the same input IDs on the same four cards. Entries are **prefill / decode
 tokens per second**, medians of three 256-token generations after warmup.
 
 | Mode | Review 512, Llaminar | Review 512, Castagna | Code 2048, Llaminar | Code 2048, Castagna |
 | --- | ---: | ---: | ---: | ---: |
-| Off | 1041.79 / 86.46 | 874.62 / 85.76 | 1009.02 / 81.36 | 922.66 / 73.64 |
-| Fixed 3 | 1002.95 / 137.00 | 785.74 / 117.62 | 970.55 / 112.44 | 892.87 / 108.39 |
-| Dynamic / adaptive | 1000.75 / 131.45 | 672.70 / 70.71 | 970.76 / 108.02 | 794.71 / 79.81 |
+| Off | 1040.78 / 86.80 | 874.62 / 85.76 | 1008.53 / 81.16 | 922.66 / 73.64 |
+| Fixed 3 | 1001.09 / 137.38 | 785.74 / 117.62 | 970.47 / 111.88 | 892.87 / 108.39 |
+| Dynamic / adaptive | 999.25 / 131.68 | 672.70 / 70.71 | 970.17 / 107.59 | 794.71 / 79.81 |
 
 All 18 Llaminar histories matched the qualified control. Both MTP modes
 also matched their own ordinary decode and all five verifier-work counters.
 Castagna generated different continuations and its throughput includes its
 own draft acceptance. The largest remaining fixed-depth stage deficit on
 code2048 is 3.08 ms/round in HC, projections, routing and experts.
+On code2048 the HC-down reducer alone reached 113.54 tok/s. Publishing
+expert Down operands in Gate alone reached 112.97 tok/s. Both reproduced
+the 111.88 tok/s control's token history and verifier work.
 [Matched workload, numerical checks and phase timings](QFN_MI50_STAGE_COMPARISON_20261118.md#fixed-depth-verifier-after-the-counted-routing-and-hc-changes)
 
 ## Full-model throughput on four MI50s with equal-width Llaminar shards
