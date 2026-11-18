@@ -71,7 +71,9 @@ def main():
     parser.add_argument("--pci", required=True, help="Domain:bus:device.function of the sole exposed MI50")
     parser.add_argument("--build", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--routes", type=Path, help="Ordered 40-ID histories required for packet")
+    parser.add_argument("--routes", type=Path, help="Ten ordered expert IDs per physical verifier row, required for packet")
+    parser.add_argument("--packet-rows", type=int, choices=(4, 6),
+                        help="Physical verifier rows. Defaults to four")
     parser.add_argument("--single-tile", action="store_true", help="One original tile per gate wave pair")
     parser.add_argument("--packet-shape", nargs=5, type=int,
                         metavar=("TUPLE", "F", "S", "ROUTED_PARTS", "SHARED_PARTS"),
@@ -90,6 +92,9 @@ def main():
         parser.error("Profiling requires kernel, positive iteration and metric")
     if (args.probe == "packet") != bool(args.routes):
         parser.error("Exactly the packet probe requires the original route IDs")
+
+    if args.packet_rows is not None and args.probe != "packet":
+        parser.error("Explicit verifier rows require the packet probe")
 
     name, tag, checks_per_round = PROBES[args.probe]
     if args.packet_shape is not None:
@@ -129,6 +134,8 @@ def main():
         probe_operands.extend(map(str, args.packet_shape))
         if args.single_tile:
             probe_operands.append("single-tile")
+    if args.packet_rows is not None:
+        probe_operands.extend(("--rows", str(args.packet_rows)))
     if exact_issue:
         probe_operands = [str(args.issue_grid), str(args.issue_block)]
     argv = [[*prefix, str(binary), str(round_index), args.pci, *probe_operands]
@@ -177,6 +184,11 @@ def main():
             row[isa_index].split(":")[0] != "gfx906" or row[isa_index + 1] != "60"
             for row in devices):
         raise RuntimeError("Probe selected the wrong PCI or a device outside the 60-CU gfx906 scope")
+    if args.probe == "packet":
+        rows = args.packet_rows or 4
+        row_records = [line for line in lines if line.startswith("PACKET_ROWS,")]
+        if row_records != [f"PACKET_ROWS,{rows}"] * len(rounds):
+            raise RuntimeError("Native packet probe reported a different verifier row count")
     if digest(binary) != identity["binary_sha256"] or (routes and digest(routes) != identity["routes_sha256"]):
         raise RuntimeError("Native input changed during capture")
     result = {"passed": True, "driver_clean": clean, "physical_before": before, "physical_after": after,

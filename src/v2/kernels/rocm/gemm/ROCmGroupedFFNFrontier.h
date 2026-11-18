@@ -1,10 +1,11 @@
 /**
  * @file ROCmGroupedFFNFrontier.h
- * @brief Typed MI50 M4 publication for an original prepared local FFN.
+ * @brief Device-bound publication and launch policy for a counted ROCm verifier FFN.
  */
 #pragma once
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/VerifierDispatchTable.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include "execution/moe/MoEGroupedPlanDemand.h"
@@ -118,6 +119,33 @@ public:
     unsigned family() const noexcept {return family_;}
     /** @return Original gate, up and down source identities in projection order. */
     const auto& routedSources() const noexcept {return original_;}
+
+    /**
+     * @brief Match the original and reachable physical encodings of the four gate/up operands.
+     * @param routed Original format of both movable routed projections.
+     * @param shared Original format of both immutable shared projections.
+     * @param sharedWeights Prepared descriptors already validated by the graph recorder.
+     * @return True when the ordered gate reader stays valid through every admitted expert move.
+     * Down has a separate launch and cannot change this producer's tile or arithmetic.
+     */
+    bool hasOriginalGateReaders(const NativeQuantisedFormatInfo& routed,const NativeQuantisedFormatInfo& shared,
+        const std::array<DeviceNativeQuantisedMatrixDesc,3>& sharedWeights) const noexcept
+    {
+        const auto exact=[](NativeQuantisedExecutionFormatEnvelope envelope,unsigned codebook) {
+            const auto bit=nativeQuantisedCodebookMaskBit(codebook);
+            return envelope.execution_codebook_mask==bit && envelope.policy_codebook_mask==bit;
+        };
+        const NativeQuantisedSourceIdentity source{routed.codebook_id,routed.is_superblock,true};
+        if(!exact(formats().routedGateUp,routed.codebook_id))return false;
+        for(unsigned role=0;role<2;++role) {
+            const auto& desc=sharedWeights[role];
+            if(routedSources()[role]!=source || !exact(formats().shared[role],shared.codebook_id) ||
+               !desc.source_identity_present || desc.source_codebook_id!=shared.codebook_id ||
+               desc.codebook_id!=shared.codebook_id || bool(desc.source_is_superblock)!=shared.is_superblock)
+                return false;
+        }
+        return true;
+    }
 };
 
 /** @brief Six immutable serial trees for one captured stage on its admitted ROCm participant. */
@@ -221,9 +249,14 @@ class BoundSourceFormatProgram final {
     Program program_;
     DeviceMoELayerRuntime* runtime_;
     int ordinal_;
+    native_quantised::VerifierDispatchTable table_;
+    int multiprocessors_;
 
-    BoundSourceFormatProgram(const Program& program,DeviceMoELayerRuntime* runtime,int ordinal)
-        :program_(program),runtime_(runtime),ordinal_(ordinal) {}
+    /** @brief Bind both source and launch policy to the runtime table's actual owner. */
+    BoundSourceFormatProgram(const Program& program,DeviceMoELayerRuntime* runtime,
+        const native_quantised::NativeQuantisedGPUHardware& hardware)
+        :program_(program),runtime_(runtime),ordinal_(hardware.ordinal),
+         table_(native_quantised::selectVerifierDispatchTable(hardware)),multiprocessors_(hardware.compute_units) {}
 public:
     /** @brief Bind only through the original owning ROCm runtime table.
      * @throws std::invalid_argument If the layer or its original source disagrees with the program.
@@ -236,6 +269,10 @@ public:
     {
         return runtime_==runtime && ordinal_==ordinal;
     }
+    /** @return Kernel scheduling table selected for this captured participant. */
+    native_quantised::VerifierDispatchTable dispatchTable() const noexcept { return table_; }
+    /** @return Two reusable workgroups per HIP multiprocessor. This is a CU on MI50 and a WGP on RDNA3. */
+    std::int64_t reusableGateBlocks() const noexcept { return 2LL * multiprocessors_; }
     /** @return The program admitted by that table's original sources. */
     const Program& program() const noexcept {return program_;}
 };

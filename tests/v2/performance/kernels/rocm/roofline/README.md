@@ -35,7 +35,7 @@ Once warmed, the 2 MiB working set is read 64 times per dispatch at 128 workgrou
 
 ## QFN routed read pattern
 
-Supply one whitespace-separated history of 40 expert IDs observed on the original M4 graph. Preserve row and selected-slot order, including repeated experts across different rows. Each row must contain ten distinct local expert IDs. Record the source model, participant, native shard extents, bank history and graph settings with the route file.
+Supply the ordered expert IDs from the original counted graph. The full-live replay prints them in its `ROOFLINE_ROUTES` record before timing begins. The default four-row graph supplies 40 IDs. Preserve row and selected-slot order, including repeated experts across different rows. Each row must contain ten distinct local expert IDs. Record the source model, participant, native shard extents, bank history and graph settings with the route file.
 
 Pass the tuple number, routed and shared intermediate widths, and both gate K partition counts as `--packet-shape TUPLE F S ROUTED_PARTS SHARED_PARTS`. For the original H2560 source policies the gate reductions use 16 partitions. The native K32 blocks use these independent layouts.
 
@@ -79,3 +79,10 @@ filter `packetRead<20,\s*true,\s*true,\s*32,\s*false,\s*true>`. Tuple 3
 uses the G15 IQ3_XXS routed and IQ2_S shared prepared readers, with filter
 `packetRead<12,\s*false,\s*true,\s*9,\s*true,\s*true>`.
 Keep the original route order and K32 partitions for each measured shard.
+
+For a six-row verifier, pass `--packet-rows 6` with the 60 expert IDs
+recorded in order from the exact full-live replay. The probe checks
+ten distinct IDs per row and rejects truncated or surplus input before
+opening a device. It uses the requested row count for the native tile
+grid, traffic denominator and independent per-lane checksum. Existing
+four-row measurements use 40 ordered IDs per tuple.

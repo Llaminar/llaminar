@@ -39,7 +39,7 @@
 #ifdef HAVE_ROCM
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
 #include "kernels/rocm/gemm/ROCmGroupedFFNFormatSelection.h"
-#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
 #include "utils/DebugEnv.h"
 #endif
 #ifdef HAVE_ROCM

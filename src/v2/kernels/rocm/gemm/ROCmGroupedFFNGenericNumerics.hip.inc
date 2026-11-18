@@ -59,7 +59,7 @@ static constexpr bool validFormats(const NativeQuantisedExecutionFormatEnvelope&
  * expert. The single-partition policy returns the leaf directly as in serial M1.
  * For Q2_K and IQ1_M the shared original accumulator retains its segmented sums.
  */
-template<NativeQuantisedFormatPrefill Format,int MaxUsers,int PartitionWorkers,bool OneBlockPerPartition,int FixedGatePitch=0,class Projection>
+template<NativeQuantisedFormatPrefill Format,int MaxUsers,int PartitionWorkers,bool OneBlockPerPartition,int FixedGatePitch=0,bool BatchIQ3XXS=false,class Projection>
     requires (std::is_same_v<Projection,PublishedNativeProjection> || std::is_same_v<Projection,ReadyProjectionFields>)
 __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjectionFormat(
     Projection projection,int column,int width,
@@ -94,7 +94,7 @@ __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjectionFormat(
                 const size_t index=size_t(b)*(fixedGate?FixedGatePitch:desc.n)+column;
                 const auto* payload=desc.payload+index*Traits::payload_bytes;
                 int32_t decoded[8];
-                moe_prefill_decode_groups<Format>(payload,decoded);
+                moe_prefill_decode_groups<Format,false,BatchIQ3XXS>(payload,decoded);
 #pragma unroll
                 for(int user=0;user<MaxUsers;++user) {
                     if(user>=users.live)continue;
@@ -140,7 +140,7 @@ __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjectionFormat(
  * @param parts Original source policy resolved before capture by the existing serial owner.
  * @param formats Capture-stable execution and source policy masks for this role.
  */
-template<int MaxUsers,int PartitionWorkers,unsigned Groups=15,bool OneBlockPerPartition=false,class Projection>
+template<int MaxUsers,int PartitionWorkers,unsigned Groups=15,bool OneBlockPerPartition=false,bool BatchIQ3XXS=false,class Projection>
     requires (std::is_same_v<Projection,PublishedNativeProjection> || std::is_same_v<Projection,ReadyProjectionFields>)
 __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjection(
     Projection projection,int column,int width,
@@ -152,7 +152,7 @@ __device__ __forceinline__ ProjectionResult<MaxUsers> orderedProjection(
         __builtin_trap();
 #define LLAMINAR_ORDERED_FORMAT(ID) case ID: \
     if constexpr(ResidentMoEFFNDecoderProgram::familyMask<Groups>() & nativeQuantisedCodebookMaskBit(ID)) \
-        return orderedProjectionFormat<ID,MaxUsers,PartitionWorkers,OneBlockPerPartition>(projection,column,width,users,parts,lane); \
+        return orderedProjectionFormat<ID,MaxUsers,PartitionWorkers,OneBlockPerPartition,0,BatchIQ3XXS>(projection,column,width,users,parts,lane); \
     else __builtin_trap()
     switch(static_cast<NativeQuantisedFormatPrefill>(physical)) {
         LLAMINAR_ORDERED_FORMAT(NATIVE_QUANTISED_PF_Q4_0);

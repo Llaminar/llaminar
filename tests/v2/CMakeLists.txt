@@ -29514,6 +29514,8 @@ endif()
 # block below. Integration registers the same owners before validating that list.
 if(V2_PERF_TESTS_ONLY)
     include(cmake/V2RetainedM1HCFFNTests.cmake)
+    include(cmake/V2CUDAVerifierDispatchTableTests.cmake)
+    include(cmake/V2ROCmGroupedFFNArchitectureTests.cmake)
     include(cmake/V2ROCmRetainedM1NumericsTests.cmake)
 endif()
 
@@ -38473,6 +38475,8 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_NativeQuantisedDensePrefillEvidenceIdentity)
 
 include(cmake/V2RetainedM1HCFFNTests.cmake)
+include(cmake/V2CUDAVerifierDispatchTableTests.cmake)
+include(cmake/V2ROCmGroupedFFNArchitectureTests.cmake)
 include(cmake/V2ROCmRetainedM1NumericsTests.cmake)
 
 add_v2_test(V2_Integration_MoEOverlayInferenceEpochRoster

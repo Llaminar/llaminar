@@ -52,7 +52,8 @@
 #include <string>
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
-#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
+#include "kernels/common/VerifierDispatchTable.h"
 
 #include "execution/moe/DeviceMoELLEPPlannerScratch.h"
 #include "execution/moe/DeviceMoERebalanceABI.h"
@@ -16908,9 +16909,9 @@ bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
     if (device_effective_seq_len && seq_len >= 2 && seq_len <= 8 &&
         d_model == 2560 && num_experts == 512 && llaminar2::qfnGroupedFP16RouterFixedRowsOptIn())
     {
-        const auto &hardware = llaminar2::rocmHardwareMetadata().at(device_idx);
-        fixed_rows = hardware.compute_units == 60 && hardware.native_wave_width == 64 &&
-            (hardware.isa_target == "gfx906" || hardware.isa_target.starts_with("gfx906:"));
+        const auto hardware = llaminar2::rocm::nativeQuantisedHardwareForDevice(device_idx);
+        fixed_rows = llaminar2::native_quantised::selectVerifierDispatchTable(hardware) ==
+            llaminar2::native_quantised::VerifierDispatchTable::MI50;
     }
     if (fixed_rows)
     {
@@ -17769,9 +17770,9 @@ bool hipMoE_softmax_topk_decode_equivalent_rows(
         num_experts == kDeviceMoEMaxExperts && top_k == 10 &&
         llaminar2::qfnGroupedTopKRegisterOptIn())
     {
-        const auto &hardware = llaminar2::rocmHardwareMetadata().at(device_idx);
-        use_register_selector = hardware.compute_units == 60 && hardware.native_wave_width == 64 &&
-            (hardware.isa_target == "gfx906" || hardware.isa_target.starts_with("gfx906:"));
+        const auto hardware = llaminar2::rocm::nativeQuantisedHardwareForDevice(device_idx);
+        use_register_selector = llaminar2::native_quantised::selectVerifierDispatchTable(hardware) ==
+            llaminar2::native_quantised::VerifierDispatchTable::MI50;
     }
     if (use_register_selector)
     {

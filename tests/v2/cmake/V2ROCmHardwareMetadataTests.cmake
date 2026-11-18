@@ -17,6 +17,13 @@ add_v2_test(V2_Integration_ROCmHardwareMetadataReplay
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_ROCmHardwareMetadataReplay)
 
+add_v2_test(V2_Integration_ROCmVerifierDispatchTableBindingReplay
+    COMMAND $<TARGET_FILE:v2_unit_rocm_hardware_metadata>
+        --gtest_filter=ROCmHardwareMetadata.VerifierTableFollowsPhysicalArchitectureAndComputeUnits
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;HardwareMetadata;GroupedVerifierRows;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierDispatchTableBindingReplay)
+
 add_v2_test(V2_Integration_ROCmServiceWallClockBindingReplay
     COMMAND $<TARGET_FILE:v2_unit_rocm_hardware_metadata>
         --gtest_filter=ROCmHardwareMetadata.ServiceWallClockBindingIsExactStableAndRequired

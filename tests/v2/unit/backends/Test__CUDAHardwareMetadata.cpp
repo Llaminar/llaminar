@@ -9,6 +9,7 @@
  */
 #include "backends/cuda/CUDAHardwareMetadata.h"
 #include "kernels/cuda/attention/CUDAFlashAttentionHardware.h"
+#include "kernels/cuda/gemm/CUDANativeQuantisedArchitecture.h"
 #include "kernels/cuda/moe/CUDARouterQ8Prefill.h"
 #include "kernels/common/ColumnShardAssemblyKernels.h"
 #include <gtest/gtest.h>
@@ -58,6 +59,35 @@ namespace llaminar2::test
             }
             return result;
         }
+    }
+
+    /** @test Verifier schedules use the original device's exact native identity. */
+    TEST(CUDAHardwareMetadata, VerifierDispatchUsesAdmittedNativeArchitecture)
+    {
+        using namespace native_quantised;
+        auto rows = cudaRecords(9);
+        rows[7].sm_minor = 6;
+        rows[8].sm_minor = 9;
+        CUDAHardwareAuthority authority;
+        authority.initialize([&] { return rows; });
+        const auto &inventory = authority.snapshot();
+        const auto tuned = cuda::nativeQuantisedHardware(inventory.at(7));
+        const auto portable = cuda::nativeQuantisedHardware(inventory.at(8));
+        EXPECT_EQ(tuned.ordinal, 7);
+        EXPECT_EQ(portable.ordinal, 8);
+        EXPECT_EQ(tuned.compute_units, rows[7].sm_count);
+        EXPECT_EQ(selectVerifierDispatchTable(tuned), VerifierDispatchTable::SM86);
+        EXPECT_EQ(selectVerifierDispatchTable(portable), VerifierDispatchTable::Portable);
+        auto invalid = rows[7];
+        invalid.native_warp_width = 64;
+        EXPECT_THROW((void)selectVerifierDispatchTable(cuda::nativeQuantisedHardware(invalid)),
+                     std::invalid_argument);
+        invalid = rows[7];
+        invalid.sm_major = 0;
+        EXPECT_THROW(cuda::nativeQuantisedHardware(invalid), std::invalid_argument);
+        invalid = rows[7];
+        invalid.ordinal = -1;
+        EXPECT_THROW(cuda::nativeQuantisedHardware(invalid), std::invalid_argument);
     }
 
     /** @test CPU-only construction/read never enters discovery or silently admits emptiness. */

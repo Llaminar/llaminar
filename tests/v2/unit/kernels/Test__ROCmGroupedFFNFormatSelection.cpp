@@ -74,6 +74,33 @@ TEST(ROCmGroupedFFNFormatSelection, AllSourceAndMigrationFormatsRetainIndependen
     }
 }
 
+/** @test An indexed gate schedule depends on its gate/up readers, including every encoding reachable by movement. */
+TEST(ROCmGroupedFFNFormatSelection, IndexedGateReadersAreIndependentOfDownAndRejectMixedEncodings)
+{
+    const auto& gate=formats::IQ3_XXS;
+    const auto& sharedGate=formats::IQ2_S;
+    for(const auto* down:{&formats::Q5_1,&formats::Q6_K}) {
+        SCOPED_TRACE(down->codebook_id);
+        const std::array weights{matrix(sharedGate,sharedGate.codebook_id,false),
+            matrix(sharedGate,sharedGate.codebook_id,false),matrix(*down,down->codebook_id,true)};
+        const auto declare=[&](bool movable) {
+            return ffn::declareSourceFormats(256,shared,reachable(gate,movable),reachable(*down),
+                sources(gate,gate,*down),weights);
+        };
+        const auto compact=declare(false);
+        EXPECT_TRUE(compact.hasOriginalGateReaders(gate,sharedGate,weights));
+        EXPECT_FALSE(declare(true).hasOriginalGateReaders(gate,sharedGate,weights));
+        EXPECT_FALSE(compact.hasOriginalGateReaders(formats::IQ3_S,sharedGate,weights));
+        for(unsigned role=0;role<2;++role) {
+            auto changed=weights;
+            changed[role].source_identity_present=0;
+            EXPECT_FALSE(compact.hasOriginalGateReaders(gate,sharedGate,changed));
+            changed[role]=matrix(formats::Q4_0,formats::Q4_0.codebook_id,false);
+            EXPECT_FALSE(compact.hasOriginalGateReaders(gate,sharedGate,changed));
+        }
+    }
+}
+
 TEST(ROCmGroupedFFNFormatSelection, RejectsMissingRolesSourcePlanesAndInvalidWidths)
 {
     const auto q8=reachable(formats::Q8_0);

@@ -122,7 +122,8 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
         if(active) {
             const generic::ProjectionUsers<1> users{{{hiddenCodes+row*hidden,hiddenScales+row*(hidden/32),
                 direct.affineSums?direct.affineSums->hiddenRows+row*(hidden/32):nullptr}},1};
-            if constexpr(RoutedCodebook>=0) {
+            constexpr bool batchIQ3XXS=RoutedCodebook==NATIVE_QUANTISED_PF_IQ3_XXS;
+            if constexpr(RoutedCodebook>=0 && !batchIQ3XXS) {
                 const auto values=routed
                     ?sealedPair<static_cast<NativeQuantisedFormatPrefill>(RoutedCodebook),true,K32Packets>(
                         picked.gate,picked.up,users.rows[0],gateParts,column,lane)
@@ -154,7 +155,7 @@ void groupedFFNFormatProgramGate(const int32_t* liveOwner,const int8_t* hiddenCo
                                 :generic::orderedProjectionFormat<NATIVE_QUANTISED_PF_Q8_0,1,4,false,160>(
                                     projection,column,hidden,users,parts,lane);
                         else
-                            return generic::orderedProjection<1,4,Groups>(projection,column,hidden,users,parts,lane,formats);
+                            return generic::orderedProjection<1,4,Groups,false,batchIQ3XXS>(projection,column,hidden,users,parts,lane,formats);
                     }();
                     if(isGate)gateValue=values.value[0];
                     else if(lane<16) {
@@ -402,29 +403,50 @@ bool launchFormatProgram(const RoutePlan& plan,const DeviceRowRange& rows,
     const auto gateFamilies=ResidentMoEFFNDecoderProgram::fromExecutionMask(
         formats.routedGateUp.execution_codebook_mask | formats.shared[0].execution_codebook_mask |
         formats.shared[1].execution_codebook_mask);
+    const auto table=bound.dispatchTable();
+    const auto reuseLimit=bound.reusableGateBlocks();
+    const bool measured=table==native_quantised::VerifierDispatchTable::MI50;
     const auto recordGate=[&]<unsigned Groups,int RoutedCodebook,int FixedQ5Pitch,int K32Packets,bool DedicatedTiles>() {
-        const int grid=DedicatedTiles?tileGrid:std::min(gateBlocks,tileGrid);
+        const int grid=DedicatedTiles?tileGrid:static_cast<int>(std::min<std::int64_t>(reuseLimit,tileGrid));
         hipLaunchKernelGGL((groupedFFNFormatProgramGate<Groups,RoutedCodebook,FixedQ5Pitch,K32Packets,DedicatedTiles>),
             dim3(grid),dim3(threads),0,native,plan.live,plan.hiddenCodes,plan.hiddenScales,plan.hiddenFP32,
             scratch,output,direct,physicalRows,routedColumns,sharedColumns,formats.routedGateUp,
             routedParts[0],routedParts[1],roles[0],roles[1]);
     };
+    // The indexed readers below hide lookup latency by reusing two workgroups
+    // per CU on the six-row MI50 grid. Other measured gate readers benefit
+    // from dedicating a wave pair to each tile. Selection occurs at capture.
+    using namespace native_quantised_formats;
+    const bool reuseIndexedTiles=measured && physicalRows==6 && routedColumns==256 && sharedColumns==256 &&
+        (program.hasOriginalGateReaders(IQ2_S,Q8_0,sharedWeights) ||
+         program.hasOriginalGateReaders(IQ2_S,Q4_0,sharedWeights) ||
+         program.hasOriginalGateReaders(IQ3_S,IQ4_NL,sharedWeights));
     const auto launchGate=[&]<unsigned Groups,int FixedQ5Pitch=0>() {
         // Reused workgroups hide packet latency on small separate-reader grids.
         // When the resident grid would repeat tiles, distribute the original
         // Q8 tiles to independent wave pairs and retire them after publication.
-        if(tileGrid>gateBlocks)
+        if(tileGrid>reuseLimit && !reuseIndexedTiles)
             recordGate.template operator()<Groups,-1,FixedQ5Pitch,1,true>();
         else
             recordGate.template operator()<Groups,-1,FixedQ5Pitch,1,false>();
     };
-    if(program.pairsGateAndUp()) {
+    if(!measured) {
+        // The portable reader supports every published format and preserves the
+        // original K partitions. HIP reports the scheduling unit count in the native inventory.
+        if(gateFamilies.groups()==1)recordGate.template operator()<1,-1,0,1,false>();
+        else recordGate.template operator()<15,-1,0,1,false>();
+    }
+    else if(tileGrid>reuseLimit && routedColumns==256 && sharedColumns==256 &&
+            program.hasOriginalGateReaders(IQ3_XXS,IQ2_S,sharedWeights)) {
+        recordGate.template operator()<15,NATIVE_QUANTISED_PF_IQ3_XXS,0,1,true>();
+    }
+    else if(program.pairsGateAndUp()) {
         // With fewer workgroups than CUs, two outstanding packets hide the
         // original load dependency. A small tail also benefits on long grids
         // after two full resident rounds. In original intermediate grids a
         // second packet raised register lifetime and slowed the complete parent.
-        const int tail=tileGrid%gateBlocks;
-        if(tileGrid<gateBlocks/2 || (tileGrid>=2*gateBlocks && tail>0 && tail<=gateBlocks/4))
+        const auto tail=tileGrid%reuseLimit;
+        if(tileGrid<reuseLimit/2 || (tileGrid>=2*reuseLimit && tail>0 && tail<=reuseLimit/4))
             recordGate.template operator()<1,NATIVE_QUANTISED_PF_Q4_1,0,2,true>();
         else
             recordGate.template operator()<1,NATIVE_QUANTISED_PF_Q4_1,0,1,true>();
@@ -444,7 +466,7 @@ bool launchFormatProgram(const RoutePlan& plan,const DeviceRowRange& rows,
             plan.live,scratch,output,direct,routedColumns,sharedColumns,formats.routedDown,
             routedParts[2],roles[2]);
     };
-    if(const auto pitch=program.fixedQ51DownPitch(sharedWeights[2])) {
+    if(const auto pitch=measured?program.fixedQ51DownPitch(sharedWeights[2]):std::nullopt) {
         // Affine-sum publication has its own F160 layout, disjoint from these widths.
         switch(*pitch) {
         case FixedQ51DownPitch::F128: launchDown.template operator()<15,true,NATIVE_QUANTISED_PF_Q5_1,128>(); break;
@@ -452,7 +474,7 @@ bool launchFormatProgram(const RoutePlan& plan,const DeviceRowRange& rows,
         }
         return hipGetLastError()==hipSuccess;
     }
-    if(formats.shared[2].execution_codebook_mask==nativeQuantisedCodebookMaskBit(NATIVE_QUANTISED_PF_Q8_0)) {
+    if(measured && formats.shared[2].execution_codebook_mask==nativeQuantisedCodebookMaskBit(NATIVE_QUANTISED_PF_Q8_0)) {
         switch(formats.routedDown.execution_codebook_mask) {
         case nativeQuantisedCodebookMaskBit(NATIVE_QUANTISED_PF_Q4_0): launchDown.template operator()<15,false,NATIVE_QUANTISED_PF_Q4_0>();return hipGetLastError()==hipSuccess;
         case nativeQuantisedCodebookMaskBit(NATIVE_QUANTISED_PF_IQ4_NL): launchDown.template operator()<15,false,NATIVE_QUANTISED_PF_IQ4_NL>();return hipGetLastError()==hipSuccess;

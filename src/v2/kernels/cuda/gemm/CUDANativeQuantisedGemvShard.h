@@ -15,6 +15,7 @@
 #include "CUDADeviceWorkspace.h"
 #include "CUDACanonicalKpartFold.h"
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/NativeQuantisedArchitecture.h"
 
 #include <cstddef>
 #include <cstdint>
@@ -46,6 +47,7 @@
         int *, int *, int *);                                           \
     extern "C" bool LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(                  \
         cudaNativeQuantisedGemvTuned_queryGeneratedGroupedDispatch, INDEX)( \
+        const llaminar2::native_quantised::NativeQuantisedArchitecture &, \
         uint8_t, int, int, int, int, int *, int *);                     \
     extern "C" bool LLAMINAR_CUDA_NATIVE_QUANTISED_SHARD_SYMBOL(                  \
         cudaNativeQuantisedGemvTuned_queryCanonicalM1Schedule, INDEX)(      \

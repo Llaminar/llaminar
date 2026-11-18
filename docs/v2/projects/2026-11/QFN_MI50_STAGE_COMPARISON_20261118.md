@@ -1029,6 +1029,35 @@ same-boot staged control measured 115.92 and 94.43. Paired improvements
 were 11.76% and 12.69%. Prefill stayed within 0.23% across the controls.
 [Three complete dynamic comparisons](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-dynamic-comparison.json)
 
+### Fixed-depth verifier on the original TP4 split, code2048
+
+A Release trace of `117b1d9d9` reproduced its unprofiled 256-token
+generation, with 86 verification rounds and 344 verified rows. Castagna
+completed 81 rounds on the same prompt IDs. Each engine's per-round
+measurements use its own completed work. The four-card native target
+dispatch union fell to 23.169 ms per round, from 26.391 ms in the earlier
+original-split run. Castagna measured 18.222 ms. Llaminar's first-to-last
+target dispatch span across the four devices was 23.616 ms per round.
+
+| Boundary | Llaminar | Castagna | Unit |
+| --- | ---: | ---: | --- |
+| Complete target verifier | 23.169 | 18.222 | active ms per round per GPU |
+| Hyperconnections, projections, activation preparation, routing and experts | 16.112 | 13.033 | summed ms per round per GPU |
+| Attention, indexer and RoPE | 1.322 | 0.495 | summed ms per round per GPU |
+| GDN and convolution state | 1.357 | 0.966 | summed ms per round per GPU |
+| Peer push | 2.886 | 2.486 | summed ms per round per GPU |
+| Draft prediction | 1.045 | 1.208 | active ms per proposal per GPU |
+| Prompt prefill | 2107.3 | 1249.2 | profiled active ms per GPU for the full prompt |
+
+Llaminar's largest subtotal includes 5.210 ms of other projections, 3.781 ms
+of hyperconnections, 2.324 ms of grouped gate/up and 1.863 ms of grouped
+down/fold. On the shared four-device clock, 2.368 ms of communication
+overlapped compute and 1.718 ms had only communication running. GPU-active
+prefill timing was measured under the profiler. The unprofiled throughput
+table above gives user-visible prefill and decode rates.
+[Per-device dispatch intervals](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-code2048-phases.json)
+[Per-stage time and overlap across the four cards](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-code2048-target-breakdown.json)
+
 ### Physical read limits on the six-row TP4 verifier
 
 The Release build at `117b1d9d9` ran layer 1 from the original QFN GGUF on
@@ -1080,7 +1109,137 @@ five verifier counters matched their controls. Prefill changed by −0.37% and
 [Original shard timings](/tmp/qfn-mi50-router-buckets-49/window/comparison-control-a2.json)
 [Canonical Release qualification](/tmp/qfn-mi50-fixed-bank-proof/canonical-router-buckets/qualified.json)
 
+### Six-row down-projection scheduling
+
+On a single MI50, the original TP4 layer-one Q4_K/Q5_1 shard with 256
+routed and 160 shared columns took 204.40 µs for the complete captured
+router and local FFN with four waves per down-projection workgroup. Six
+waves took 227.80 µs and eleven took 239.65 µs. Both halves of the mirrored
+run reproduced that ordering. Each arm replayed the same five captured
+nodes and checked the selected down kernel and its output against serial
+decode. The four-wave schedule stays selected.
+
+Publishing the routed Q8 activation sum in the gate for reuse by the down
+projection saved 1.11 µs at 256 routed columns and 0.24 µs at 128. These
+are complete local verifier timings on the original GGUF. The experiment
+adds an intermediate per route and K32 block. The production path
+continues to compute the sum in the down projection.
+[Mirrored timing brackets and captured kernel identities](/tmp/qfn-mi50-m6-roofline-bd/m6-down-schedule-comparison.json)
+
+### Indexed weight formats on MI50
+
+The six-row sweep covered all 15 original-format recipes at 256 routed
+and 256 shared columns. Four recipes were slower with a separate wave
+pair for each gate tile. Reusing gate workgroups on MI50 reduced the
+complete local verifier time on those recipes as follows. Values are
+the mean of the two arm medians from the mirrored timing sequence.
+
+| Routed gate/up | Shared gate/up | Routed down | Dedicated tiles, µs | Reused tiles, µs |
+| --- | --- | --- | ---: | ---: |
+| IQ2_S | Q8_0 | IQ2_S | 343.05 | 326.68 |
+| IQ2_S | Q4_0 | Q4_0 | 341.80 | 326.14 |
+| IQ2_S | Q8_0 | Q6_K | 345.17 | 326.50 |
+| IQ3_S | IQ4_NL | IQ2_S | 513.30 | 496.53 |
+
+All four deferred captures also matched serial output bytes. In the
+private run the driver observer timed out during shutdown. Its completed
+journal contained zero GPU findings and the card returned to its initial
+VRAM usage. The raw observer failure and the subsequent journal check
+are retained together.
+[Four-format timing and byte receipts](/tmp/qfn-mi50-m6-family-qualification/batch-repair-r1-adjudicated/score.csv)
+[Original observer result](/tmp/qfn-mi50-m6-family-qualification/batch-repair-r1/result.json)
+[Journal check](/tmp/qfn-mi50-m6-family-qualification/batch-repair-r1/driver-independent-adjudication.json)
+
+For IQ3_XXS routed gate/up and IQ2_S shared gate/up, issuing eight
+independent codebook reads together removed six waits from the MI50
+instruction sequence. With Q6_K routed down and Q8_0 shared down,
+four-row verifier time fell from 246.69 to 216.28 µs and six-row time
+from 403.71 to 324.75 µs. The gate used 81 vector registers, 104 scalar
+registers and 320 bytes of LDS with zero spills. The six-row gate reached
+27.6% of the measured read-only reference for its packet layout.
+These are local timings on generated original-format fixtures.
+[Gate and complete-parent timings, resource counts and read calibration](/tmp/qfn-mi50-g15-canonical-c2/REPORT.md)
+
+G13 uses the same routed and shared gate/up readers as G15, with Q5_1
+routed down and IQ2_S shared down. The down projection runs in a separate
+launch. Choosing the gate reader from its four actual gate/up operands
+gave G13 the same batched lookup. On the same Release binary the complete
+four-row verifier fell from 250.10 to 217.47 µs and the six-row verifier
+from 437.70 to 359.86 µs. The six-row gate itself fell from 293.28 to
+217.28 µs. Each row count had eight interleaved quiet measurements,
+identical ordered expert IDs, serial-byte checks and separate deferred
+capture checks. The selected gate requires singleton native arithmetic and
+physical formats for the routed operands and the original shared formats.
+[G13 captured native leaves, route identities and timings](/tmp/qfn-mi50-g13-canonical-c2/REPORT.md)
+
+### Verifier schedules by GPU
+
+The ROCm and CUDA grouped verifier recorders select a launch schedule
+from the owning ordinal's admitted hardware metadata. MI50 uses the
+60-CU gfx906 table. The 7900 XTX used the portable ROCm readers for
+Q4_K/Q5_1 at four and six rows and for the mixed IQ3_XXS family at six.
+Captured gate grids were 90, 96 and 96 workgroups respectively. HIP
+reports 48 workgroup processors on that card. The portable grid uses
+at most two workgroups per reported multiprocessor. On one rank with
+both AMD cards visible, each card selected its own kernels and matched
+its serial output bytes.
+[Native captures and physical device identities](/tmp/qfn-mi50-portable-architecture-replay/qualified.json)
+
+The RTX 3090 selected the SM86 grouped schedule and reproduced serial
+Q4_K output bytes on four dirty replays. A separate diagnostic forced
+the portable two-row DP4A kernel on this same GPU. It reproduced serial
+bytes and preserved inactive output for 0–16 active rows. With four
+active rows, it took 126.33 µs at N17408/K5120 and 115.98 µs at
+N5120/K17408. The tuned SM86 schedule took 88.17–88.71 µs and
+91.32–91.70 µs respectively. The shipped SM80, SM86, SM89 and SM90
+targets compiled. Native CUDA measurements here cover SM86.
+[CUDA capture, tuning controls and device checks](/tmp/qfn-mi50-cuda-verifier-table/REPORT.md)
+
+The combined Release core `80e786c6` passed six device-free metadata and
+table-binding tests, thirteen focused format, router and retained-M1
+registrations on MI50, eight native architecture cases across the two AMD
+cards, and the registered RTX 3090 capture replay. The shipped gfx906,
+gfx1100, SM80, SM86, SM89 and SM90 targets compiled with spill checking.
+The retained single-row HC/FFN and pre-attention loadable code matched the
+control on both AMD targets.
+[Combined Release receipts](/tmp/qfn-mi50-fixed-bank-proof/canonical-combined-tables/qualified.json)
+
 ## Reproduction
+
+On a Release build with the focused native fixtures enabled, the following
+command runs the card-selection and indexed-reader regressions. Run the
+hardware-specific registrations on workers that own the corresponding cards.
+
+```bash
+ctest --test-dir "$build" -C Release --no-tests=error --output-on-failure \
+  -R '^V2_Integration_(CUDAVerifierDispatchTableNativeReplay|ROCmGroupedFFNNativeArchitecture_(gfx906|gfx1100)|GroupedM6(IndexedGateReuse|MixedReader)Replay_ROCm|GroupedM4WideDecoderTiles_ROCm)$'
+```
+
+To time the combined G13 gate and local FFN on one exposed MI50, run the
+compiled source fixture on the GPU's socket. Set `build` to the absolute
+Release build directory and `mpi_base` to an existing temporary directory.
+The fixture checks the native gate symbol and
+serial output bytes before emitting event durations. The experiment above
+used alternating control and candidate arms on one instrumented binary.
+
+```bash
+export LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16
+export LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER=1
+export LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK=1
+export LLAMINAR_QFN_ROCM_GROUPED_FFN_ALL_FORMATS=1
+export LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS=1
+export LLAMINAR_QFN_ROCM_GROUPED_TOPK_REGISTERS=1
+export LLAMINAR_PERF_STATS_SUMMARY=1
+export LLAMINAR_PERF_STATS_FILTER=kernel.rocm_grouped_ffn_frontier_calls
+export LLAMINAR_TEST_GROUPED_M4_PROGRAM=all_formats
+export LLAMINAR_TEST_GROUPED_M4_REQUIRED_SYMBOL=groupedFFNFormatProgramGateILj15ELi12ELi0ELi1ELb1EE
+export LLAMINAR_TEST_GROUPED_M4_SYMBOL_PRESENT=1
+export LLAMINAR_TEST_GROUPED_M4_DEMAND=static
+"$build/llaminar_mpi_session" --session-base "$mpi_base" -- \
+  mpirun -np 1 --bind-to none "$build/tests/v2/v2_integration_moe_intermediate_ffn_finalization" \
+  --gtest_also_run_disabled_tests \
+  --gtest_filter='OriginalSources/GroupedM6Family.DISABLED_Events/G13_IQ3_XXS_DownQ5_1_SharedIQ2_S'
+```
 
 The local evidence root for native phase attribution is
 `/tmp/qfn-mi50-current-stage-pair`. It contains the read-only SQLite readers,

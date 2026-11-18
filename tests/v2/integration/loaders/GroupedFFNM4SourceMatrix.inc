@@ -1,6 +1,6 @@
 /**
  * @file GroupedFFNM4SourceMatrix.inc
- * @brief Compare the original counted M4 FFN capture against its native serial oracle.
+ * @brief Compare the original counted four- and six-row FFN captures with serial decode.
  *
  * The production source catalog owns the independent sweep. The existing
  * family recipes provide a separate mixed-decoder sweep. Only the explicit
@@ -53,6 +53,8 @@ std::vector<M4SourceCase> groupedM4Cases()
     cases.push_back({"IQ4_XS_shared_up_IQ4_NL",M4SourceRole::SharedGateUp,"IQ4_XS",{}});
     for (const auto& family:fullNativeHCFFNFamilyCases()) {
         cases.push_back({family.name,M4SourceRole::Family,{},family});
+        if(family.groups==13)
+            cases.push_back({"G13_IQ3_XXS_wide_direct_tiles",M4SourceRole::WideFamily,{},family});
         if(family.groups==15)
             cases.push_back({"G15_IQ3_XXS_wide_direct_tiles",M4SourceRole::WideFamily,{},family});
     }
@@ -85,7 +87,8 @@ void expectGroupedM4Program(OriginalFFNFixtureGeometry& shape)
 }
 
 /** @brief Use the original source preparer and run the counted M4 production graph. */
-void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing,int physicalRows=4)
+void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing,int physicalRows=4,
+    GroupedFFNFixtureSchedule schedule=GroupedFFNFixtureSchedule::SourceMatrix)
 {
     if (item.role==M4SourceRole::RuntimeOnly) {
         require(!timing,"Q8_1 has no GGUF source-backed timing arm");
@@ -151,6 +154,7 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing,int p
     const std::array<std::string_view,1> requested{pci?pci:""};
     shape.grouped_matrix_case=item.name;
     expectGroupedM4Program(shape);
+    shape.grouped_schedule=schedule;
     if(fixedQ51Down) {
         require(item.fixed_down_pitch==128 || item.fixed_down_pitch==256,"independent supported Q5_1 Down fixture pitch");
         shape.expected_q51_down_pitch=item.fixed_down_pitch;
@@ -166,9 +170,24 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing,int p
         shape.expected_grouped_decoder_family=1;
     }
     if(wideFamily) {
-        shape.grouped_matrix_symbol="groupedFFNFormatProgramGateILj15ELin1ELi0ELi1ELb1EE";
+        shape.grouped_matrix_symbol="groupedFFNFormatProgramGateILj15ELi12ELi0ELi1ELb1EE";
         shape.verify_grouped_gate_tiles=true;
         shape.expected_grouped_decoder_family=item.family->groups;
+    }
+    std::string nativeGate;
+    if(schedule==GroupedFFNFixtureSchedule::PortableGfx1100) {
+        // Source family is shared with the serial arithmetic oracle. The native
+        // schedule uses generic readers and a resident grid on this architecture.
+        shape.expected_q51_down_pitch=0;
+        shape.verify_grouped_gate_tiles=false;
+        shape.expected_grouped_decoder_family=item.family?item.family->groups:1;
+        nativeGate="groupedFFNFormatProgramGateILj"+std::to_string(shape.expected_grouped_decoder_family)+
+            "ELin1ELi0ELi1ELb0EE";
+        shape.grouped_matrix_symbol=nativeGate;
+    }
+    if(schedule!=GroupedFFNFixtureSchedule::SourceMatrix) {
+        shape.grouped_matrix_program=GroupedM4FixtureProgram::AllFormats;
+        shape.grouped_matrix_symbol_present=true;
     }
     shape.grouped_matrix_timing=timing;
     shape.deferred_frontier_history=deferred;
@@ -183,7 +202,7 @@ void runGroupedM4Source(const M4SourceCase& item,bool deferred,bool timing,int p
     originalRankLocalReplay(DeviceType::ROCm,1,[&](const auto& devices) {
         proveOriginalFinalization(devices,false,OriginalSourceQualification::GroupedFFNSourceMatrix,
             &format,LocalFFNProgram::Original,shape);
-    },"gfx906",requested.front().empty()?std::span<const std::string_view>{}:std::span<const std::string_view>{requested});
+    },schedule==GroupedFFNFixtureSchedule::PortableGfx1100?"gfx1100":"gfx906",requested.front().empty()?std::span<const std::string_view>{}:std::span<const std::string_view>{requested});
 }
 
 /** @test Independent quantized verifier registry cannot silently lose a compiled source/role case. */
@@ -218,6 +237,29 @@ TEST_P(GroupedM4Source, Static) { runGroupedM4Source(GetParam(),false,false); }
 TEST_P(GroupedM4Source, Deferred) { runGroupedM4Source(GetParam(),true,false); }
 /** @test A separate unprofiled event window with the same exact parent and byte oracle. */
 TEST_P(GroupedM4Source, DISABLED_Events) { runGroupedM4Source(GetParam(),false,true); }
+
+/** @brief Exercise the same 15 original source recipes at six physical verifier rows. */
+class GroupedM6Family : public ::testing::TestWithParam<FullNativeHCFFNFamilyCase> {
+protected:
+    /** @brief Exercise original model preparation, capture and serial-byte comparison.
+     * @param deferred Publish accepted-row state and replay dirty count transitions.
+     * @param timing Collect HIP event samples around the full, static captured parent.
+     */
+    void runFamily(bool deferred,bool timing) const
+    {
+        const auto& family=GetParam();
+        runGroupedM4Source({family.name,M4SourceRole::Family,{},family},deferred,timing,6);
+    }
+};
+
+/** @test Compare the counted native reader with serial decode for each live prefix. */
+TEST_P(GroupedM6Family, Static) { runFamily(false,false); }
+/** @test Prove deferred acceptance and publication for this counted native reader. */
+TEST_P(GroupedM6Family, Deferred) { runFamily(true,false); }
+/** @test Time full-live replays after comparing live and inactive bytes with serial decoding. */
+TEST_P(GroupedM6Family, DISABLED_Events) { runFamily(false,true); }
+INSTANTIATE_TEST_SUITE_P(OriginalSources,GroupedM6Family,::testing::ValuesIn(fullNativeHCFFNFamilyCases()),
+    [](const ::testing::TestParamInfo<FullNativeHCFFNFamilyCase>& item){return std::string(item.param.name);});
 
 /** @test Exact retained M6 publications under zero, partial and full live counts. */
 TEST(GroupedM6Source, CountedReplay)

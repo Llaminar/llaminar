@@ -15,7 +15,7 @@ bool groupedFFNFrontierWidthEligible(int columns)
          qfnGroupedFFNEqualFrontierOptIn() && qfnGroupedFFNDirectBankExperiment());
 }
 
-/** @return The cold-selected local program for a qualified counted MI50 verifier stage. */
+/** @return The cold-selected local program for a source-compatible counted ROCm verifier stage. */
 std::optional<frontier::Program> groupedFFNFrontierProgram(const Binding& binding,
     const SharedExpertFFNStage::Params& shared,const DeviceMoEExpertDescriptor& source)
 {
@@ -32,9 +32,6 @@ std::optional<frontier::Program> groupedFFNFrontierProgram(const Binding& bindin
        source.weight_format!=DeviceMoEWeightFormat::NativeQuantised ||
        !shared.gate_scratch || !shared.up_scratch || !shared.required_router_q8_publication)
         return std::nullopt;
-    const auto& hardware=rocmHardwareMetadata().at(binding.device().ordinal);
-    if(hardware.compute_units!=60 || hardware.native_wave_width!=64 ||
-       (hardware.isa_target!="gfx906" && !hardware.isa_target.starts_with("gfx906:")))return std::nullopt;
     const int columns=binding.original.localIntermediateColumns();
     if(qfnGroupedFFNAllFormatsOptIn()) {
         if(!qfnGroupedFFNDirectBankExperiment())
@@ -45,6 +42,11 @@ std::optional<frontier::Program> groupedFFNFrontierProgram(const Binding& bindin
             {original[0].native_quantised,original[1].native_quantised,original[2].native_quantised},
             {source.gate,source.up,source.down}));
     }
+    // The legacy fixed-layout experiment was measured on MI50. The all-format
+    // program above admits portable ROCm capture independently of table coverage.
+    const auto hardware=rocm::nativeQuantisedHardwareForDevice(binding.device().ordinal);
+    if(native_quantised::selectVerifierDispatchTable(hardware)!=native_quantised::VerifierDispatchTable::MI50)
+        return std::nullopt;
     const auto exactShared=[](const DeviceNativeQuantisedMatrixDesc& m,int n,int k) {
         return m.valid() && m.n==n && m.k==k && m.codebook_id==19 &&
             m.source_identity_present && m.source_codebook_id==19;

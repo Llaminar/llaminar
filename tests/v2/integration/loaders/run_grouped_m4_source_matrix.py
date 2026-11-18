@@ -1,4 +1,4 @@
-"""Plan independent M4 source/role windows and summarize exact same-ELF event brackets."""
+"""Plan counted verifier source windows and summarize matched captured event timings."""
 import argparse
 import csv
 import os
@@ -10,7 +10,7 @@ import re
 from statistics import median
 import subprocess
 
-NATIVE = "OriginalSources/GroupedM4Source"
+NATIVE_SUITES = {4: "OriginalSources/GroupedM4Source", 6: "OriginalSources/GroupedM6Family"}
 PREFIX = ("M4_SOURCE_INPUT", "M4_SOURCE_CAPTURE", "M4_SOURCE_SAMPLE",
           "M4_SOURCE_PROGRAM", "M4_SOURCE_DESCRIPTORS")
 
@@ -20,14 +20,14 @@ def sha(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def cases(listing):
+def cases(listing, rows):
     declared = {name:set() for name in ("Static","Deferred","DISABLED_Events")}
     current = False
     for line in listing.splitlines():
         if not line.strip():
             continue
         if not line.startswith(" "):
-            current = line.strip() == NATIVE + "."
+            current = line.strip() == NATIVE_SUITES[rows] + "."
             continue
         if not current:
             continue
@@ -38,8 +38,15 @@ def cases(listing):
     all_cases = declared["Static"]
     require(all_cases and all(covered==all_cases for covered in declared.values()),
             "Compile the complete Static, Deferred and Events fixture inventory")
-    require({name for name in all_cases if name.endswith("_source_boundary")}=={"Q8_1_source_boundary"},
-            "The original tensor source admission boundary changed")
+    if rows == 4:
+        require({name for name in all_cases if name.endswith("_source_boundary")} == {"Q8_1_source_boundary"},
+                "The original tensor source admission boundary changed")
+    else:
+        # The four-row fixture owns the source declarations. Reject an incomplete
+        # six-row listing even if its three observation modes all omit the same family.
+        expected = {name for name in cases(listing, 4) if re.fullmatch(r"G\d{2}_.*", name)
+                    and not name.endswith("_wide_direct_tiles")}
+        require(expected and all_cases == expected, "Six-row family coverage differs from the source catalog")
     return tuple(sorted(all_cases))
 
 
@@ -63,6 +70,8 @@ def command(test, fixture, launch):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("phase", choices=("plan", "run"))
+    parser.add_argument("--rows", type=int, choices=(4, 6), default=4,
+                        help="Counted physical verifier rows for source families or an original GGUF shard")
     parser.add_argument("--case", action="append")
     parser.add_argument("--case-glob", action="append", help="Select from the compiled case names")
     parser.add_argument("--original-window", action="store_true",
@@ -86,9 +95,9 @@ def main():
     require(args.fixture.is_file(), "Supply the compiled native test fixture")
     list_prefix = [str(args.listing_launcher.resolve())] if args.listing_launcher else []
     listing = (args.listing.read_text() if args.listing else subprocess.check_output(
-        [*list_prefix,str(args.fixture.resolve()),"--gtest_list_tests",f"--gtest_filter={NATIVE}.*"],
+        [*list_prefix,str(args.fixture.resolve()),"--gtest_list_tests","--gtest_filter=" + ":".join(suite + ".*" for suite in NATIVE_SUITES.values())],
         text=True,stderr=subprocess.STDOUT))
-    available = cases(listing)
+    available = cases(listing, args.rows)
     explicit = list(args.case or [])
     for pattern in args.case_glob or []:
         matches = [case for case in available if fnmatchcase(case, pattern)]
@@ -101,6 +110,7 @@ def main():
                 "LLAMINAR_TEST_QFN_SOURCE_PARTICIPANT", "LLAMINAR_TEST_QFN_SOURCE_ROCM_ORDINALS")
         original_source = {key: os.getenv(key,"") for key in keys}
         require(all(original_source.values()), "Set the exact original GGUF and TP shard coordinates")
+        original_source["LLAMINAR_TEST_QFN_WINDOW_ROWS"] = str(args.rows)
         original_source["LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES"] = os.getenv(
             "LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES","0")
     selected = ("OriginalQFN",) if original_source else tuple(explicit or available)
@@ -131,7 +141,7 @@ def main():
                 selected_arms = ("1" if args.arm=="candidate" else "0",)
             for slot,switch in enumerate(selected_arms):
                 expected_presence = "1" if all_formats and args.program=="fixed" else switch
-                filters = ":".join(f"{NATIVE}.{method}/{case}" for case in scope)
+                filters = ":".join(f"{NATIVE_SUITES[args.rows]}.{method}/{case}" for case in scope)
                 launch_env = {"LLAMINAR_MOE_ROUTER_ARITHMETIC": "fp16"}
                 if original_source:
                     filters = "GroupedM4SourceWindow.DISABLED_OriginalQFN"
@@ -184,10 +194,11 @@ def main():
                               "source_participant":original_source["LLAMINAR_TEST_QFN_SOURCE_PARTICIPANT"]}
             witness, = records(PREFIX[1])
             descriptors, = records(PREFIX[4])
-            require(witness["m"]=="4" and witness["selected"]==observation["expected_presence"],f"Wrong capture program in {sink}")
+            require(witness["m"]==str(args.rows) and witness["selected"]==observation["expected_presence"],f"Wrong capture program in {sink}")
             programs = records(PREFIX[3])
             require(len(programs)==int(observation["expected_presence"]) and
                     all(p["program"]==args.program for p in programs),f"Wrong grouped program count in {sink}")
+            input_row["rows"] = args.rows
             row = observations.setdefault(case, dict(input=input_row, descriptors=descriptors, windows=[]))
             require(row["input"]==input_row and row["descriptors"]==descriptors,
                     f"Source columns or execution format changed across arms for {case}")

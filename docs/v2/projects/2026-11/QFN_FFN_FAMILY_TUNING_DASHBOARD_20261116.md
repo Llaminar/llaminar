@@ -65,6 +65,18 @@ passed. The four-row, F256/S256 timings improved in all 15 generated
 families, with a median reduction of 22.01%.
 On the original six-row F256/S160 shard, gate/up reached 85.0% and down
 73.3% of the measured physical read rate for their respective packet layouts.
+Register-based routing at intermediate row counts raised dynamic decode to
+131.75 and 108.37 tok/s on the same histories. In the six-row format sweep,
+reused workgroups recovered 3.3%–5.4% on four indexed formats. Batched
+IQ3_XXS codebook reads took the G15 local verifier from 403.71 to 324.75 µs
+at six rows. Its gate reaches 27.6% of the corresponding read reference.
+G13 shares those gate operands and improved from 437.70 to 359.86 µs.
+The original TP4 code2048 fixed-3 target now measures 23.17 ms/round versus
+18.22 for Castagna. HC, projections, routing and experts account for 3.08 ms
+of the 4.95 ms gap.
+[Latest four-card stage timings](QFN_MI50_STAGE_COMPARISON_20261118.md#fixed-depth-verifier-on-the-original-tp4-split-code2048)
+[Indexed-format measurements](QFN_MI50_STAGE_COMPARISON_20261118.md#indexed-weight-formats-on-mi50)
+[Architecture coverage](QFN_MI50_STAGE_COMPARISON_20261118.md#verifier-schedules-by-gpu)
 [Six-row read calibration](QFN_MI50_STAGE_COMPARISON_20261118.md#physical-read-limits-on-the-six-row-tp4-verifier)
 [Six-row model trial](QFN_MI50_STAGE_COMPARISON_20261118.md#six-row-dynamic-verifier-on-the-original-tp4-shards)
 [Full-model measurements](QFN_MI50_STAGE_COMPARISON_20261118.md#transferring-the-single-row-loop-to-grouped-verification)

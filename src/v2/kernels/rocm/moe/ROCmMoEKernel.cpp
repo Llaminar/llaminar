@@ -28,6 +28,7 @@
 #include "kernels/common/OriginalM1HiddenQ8Publication.h"
 #include "ROCmMoEKernel.h"
 #include "kernels/rocm/gemm/ROCmGroupedFFNFrontier.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
 #include "kernels/rocm/gemm/ROCmGroupedFFNFormatSelection.h"
 #include "kernels/common/NativeQuantisedDescriptorValidation.h"
 #include "../gemm/ROCmResidentMoEFFN.h"
@@ -1782,7 +1783,7 @@ BoundSourceFormatProgram BoundSourceFormatProgram::prepare(
     }
     auto* runtime=table.deviceLayerState(modelLayer);
     if(!runtime)throw std::invalid_argument("Grouped FFN format program requires admitted device storage");
-    return BoundSourceFormatProgram(program,runtime,device.ordinal);
+    return BoundSourceFormatProgram(program,runtime,nativeQuantisedHardwareForDevice(device.ordinal));
 }
 
 /** @copydoc prepareFormatTables */
@@ -12711,6 +12712,8 @@ namespace llaminar2
             PerfStatsCollector::addCounter("kernel","rocm_grouped_ffn_frontier_calls",1.0,"moe",device.toString(),
                 {{"physical_rows",std::to_string(seq_len)},{"routed_width",std::to_string(intermediate)},
                  {"shared_width",std::to_string(program::sharedColumns(frontier->program))},
+                 {"verifier_dispatch_table",formats?native_quantised::verifierDispatchTableName(
+                     frontier->boundSourceProgram->dispatchTable()):"fixed"},
                  {"program",formats?"all_formats":"fixed"},{"decoder_family",formats?std::to_string(formats->family()):"1"}});
             return true;
         }

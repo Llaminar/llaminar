@@ -92,3 +92,10 @@ if(HAVE_CUDA)
 endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/V2NativeDeviceBindingTests.cmake)
+
+add_v2_test(V2_Integration_CUDAVerifierDispatchTableBindingReplay
+    COMMAND $<TARGET_FILE:v2_unit_cuda_hardware_metadata>
+        --gtest_filter=CUDAHardwareMetadata.VerifierDispatchUsesAdmittedNativeArchitecture
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CUDA;HardwareMetadata;GroupedVerifierRows;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAVerifierDispatchTableBindingReplay)

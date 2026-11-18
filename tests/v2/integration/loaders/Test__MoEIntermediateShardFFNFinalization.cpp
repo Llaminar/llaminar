@@ -34,6 +34,7 @@
 #include "backends/BackendManager.h"
 #ifdef HAVE_ROCM
 #include "backends/rocm/HIPGraphCapture.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/rocm/gemm/ROCmGroupedFFNFormatSelection.h"
 #include "collective/OriginalNativeGraphCaptureGroup.h"
 #include "kernels/rocm/gemm/ROCmResidentMoEFFN.h"
@@ -143,6 +144,8 @@ enum class OriginalFFNRouterSource { TieControl, Dense, SparseSharedRoutes };
 enum class OriginalFFNGeometryContract { SourceDerived,QFNTensorSharded,QFNSingletonShardShape };
 /** @brief Independently expected graph program for the grouped source replay. */
 enum class GroupedM4FixtureProgram { AllFormats, Fixed };
+/** @brief Native schedule expected by an explicitly scoped architecture replay. */
+enum class GroupedFFNFixtureSchedule { SourceMatrix, TunedGfx906, PortableGfx1100 };
 
 /** @brief Immutable original-source dimensions passed through admission, preparation and actual worker capture. */
 struct OriginalFFNFixtureGeometry {
@@ -160,6 +163,7 @@ struct OriginalFFNFixtureGeometry {
     int expected_q51_down_pitch=0; ///< Independent native Down width used by the focused promotion replay.
     std::string_view grouped_matrix_symbol{}; ///< Expected selected production candidate symbol, when armed.
     GroupedM4FixtureProgram grouped_matrix_program=GroupedM4FixtureProgram::AllFormats; ///< Exact capture program family.
+    GroupedFFNFixtureSchedule grouped_schedule=GroupedFFNFixtureSchedule::SourceMatrix;
     bool grouped_matrix_symbol_present=true; ///< Whether the selected production symbol must be present.
     int grouped_matrix_rows=4; ///< Captured physical width of a source-matrix replay.
     bool grouped_matrix_timing=false; ///< Measure the captured M4 parent after byte replay.
@@ -1271,7 +1275,8 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                 if (!shape.grouped_matrix_symbol.empty()) {
                     const bool fixed_program=shape.grouped_matrix_program==GroupedM4FixtureProgram::Fixed;
                     const int pitch=shape.expected_q51_down_pitch;
-                    const std::string consumer=pitch?
+                    const bool portable=shape.grouped_schedule==GroupedFFNFixtureSchedule::PortableGfx1100;
+                    const std::string consumer=portable?"groupedFFNFormatProgramDown":pitch?
                         "groupedFFNFormatProgramDownILj15ELb1ELi7ELi"+std::to_string(pitch)+"E":
                         fixed_program?"groupedFFNTokenDown":"groupedFFNFormatProgramDown";
                     if(shape.verify_grouped_gate_tiles || pitch || shape.grouped_matrix_case=="Q4_K_deep_grid" || shape.grouped_matrix_case=="Q4_K_underfilled_grid") {
@@ -1295,6 +1300,33 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                             <<",gate_grid="<<gate->grid_x<<'x'<<gate->grid_y<<'x'<<gate->grid_z
                             <<",gate_block="<<gate->block_x<<'x'<<gate->block_y<<'x'<<gate->block_z<<'\n';
                     }
+#ifdef HAVE_ROCM
+                    if(shape.grouped_schedule!=GroupedFFNFixtureSchedule::SourceMatrix) {
+                        const auto& target=rocmHardwareMetadata().at(device.ordinal);
+                        const auto hasGeometry=[](const auto& node,unsigned x,unsigned y) {
+                            return node.grid_x==x && node.grid_y==y && node.grid_z==1 &&
+                                   node.block_x==256 && node.block_y==1 && node.block_z==1;
+                        };
+                        const auto gate=std::ranges::find_if(nodes,[&](const auto& node) {
+                            return node.name_resolved && node.name.find(shape.grouped_matrix_symbol)!=std::string::npos;
+                        });
+                        const auto downNode=std::ranges::find_if(nodes,[&](const auto& node) {
+                            return node.name_resolved && node.name.find(consumer)!=std::string::npos &&
+                                   (!portable || node.name.find("ELin1ELi0EE")!=std::string::npos);
+                        });
+                        const unsigned tiles=rows*(shape.top_k*(shape.routed/32)+shape.shared/32);
+                        const unsigned tileGrid=(tiles+1)/2;
+                        const auto gateGrid=portable?std::min(tileGrid,2u*static_cast<unsigned>(target.compute_units)):tileGrid;
+                        require(gate!=nodes.end() && hasGeometry(*gate,gateGrid,1) &&
+                            downNode!=nodes.end() && hasGeometry(*downNode,shape.hidden/64,rows),
+                            "Native captured gate/down must keep the expected grid and device-counted row extent");
+                        std::osyncstream(std::cout)<<"GROUPED_FFN_ARCH_CAPTURE,isa="<<target.isa_target
+                            <<",pci="<<target.pci_address<<",cu="<<target.compute_units
+                            <<",physical_wave="<<target.native_wave_width<<",lds="<<target.lds_per_block
+                            <<",M="<<rows<<",gate_grid="<<gateGrid<<",gate="<<gate->name
+                            <<",down="<<downNode->name<<'\n';
+                    }
+#endif
                     const std::string_view program=fixed_program?"fixed":"all_formats";
                     const auto down=std::count_if(nodes.begin(),nodes.end(),[&](const auto& node) {
                         return node.name_resolved && node.name.find(consumer)!=std::string::npos;
@@ -1311,6 +1343,14 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                             record.tags.at("routed_width")==std::to_string(shape.routed) &&
                             record.tags.at("shared_width")==std::to_string(shape.shared),
                             "Grouped native program counted an incompatible launch or source");
+                        if(shape.grouped_schedule!=GroupedFFNFixtureSchedule::SourceMatrix) {
+                            const std::string_view table=portable?"portable":"gfx906-mi50";
+                            require(record.tags.contains("verifier_dispatch_table") &&
+                                record.tags.at("verifier_dispatch_table")==table,
+                                "Published verifier dispatch table must agree with the captured native schedule");
+                            std::osyncstream(std::cout)<<"GROUPED_FFN_ARCH_TABLE,device="<<device.toString()
+                                <<",table="<<table<<",M="<<rows<<'\n';
+                        }
                         const auto& family=record.tags.at("decoder_family");
                         require(!family.empty() && family.find_first_not_of("0123456789")==std::string::npos,
                             "Grouped decoder family must be an exact compiled identity");
@@ -1475,6 +1515,23 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                             " rows=" + std::to_string(rows) + " live=" + std::to_string(live) +
                             " replay=" + std::to_string(replay) + " element=" + std::to_string(element) +
                             " actual=" + std::to_string(actual[element]) + " serial=" + std::to_string(reference));
+                }
+                if (shape.grouped_matrix_timing && shape.grouped_matrix_case == "OriginalQFN" && replay == 0) {
+                    // The timed brackets restore this full-live prefix over the same immutable input.
+                    // Publish its real ordered IDs once so packet calibrations reproduce its cache reuse.
+                    const std::size_t slots = std::size_t(live) * shape.top_k;
+                    std::vector<float> ids(slots);
+                    require(live == rows && backend->deviceToHostOnStream(ids.data(), candidate->indices->gpu_data_ptr(),
+                        slots * sizeof(float), device.ordinal, stream) && worker.synchronizeStreamChecked(stream),
+                        "Observe original route IDs before entering the event brackets");
+                    std::osyncstream witness(std::cout);
+                    witness << "ROOFLINE_ROUTES";
+                    for (const float id : ids) {
+                        require(id >= 0.f && id < float(shape.experts) && id == std::trunc(id),
+                            "Original router published an invalid expert ID");
+                        witness << ',' << static_cast<int>(id);
+                    }
+                    witness << '\n';
                 }
                 if(shape.router_source==OriginalFFNRouterSource::SparseSharedRoutes && replay==0) {
                     std::vector<float> indices(static_cast<std::size_t>(rows)*shape.top_k);
@@ -2482,4 +2539,5 @@ TEST(FullNativeHCFFN, DISABLED_ROCmRetainedProductionTP4Epoch)
 #if defined(HAVE_ROCM)
 #include "FullNativeHCFFNFamilyReplay.inc"
 #include "GroupedFFNM4SourceMatrix.inc"
+#include "GroupedFFNNativeArchitectureReplay.inc"
 #endif

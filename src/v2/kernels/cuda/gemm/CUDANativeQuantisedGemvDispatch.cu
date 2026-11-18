@@ -230,6 +230,7 @@ bool cudaNativeQuantisedGemvTuned_resolveArithmeticPolicy(
 
 /** Resolve a source codebook's grouped-row policy on its owning shard. */
 bool cudaNativeQuantisedGemvTuned_resolveGroupedArithmeticPolicy(
+    const llaminar2::native_quantised::NativeQuantisedArchitecture &architecture,
     uint8_t codebook_id,
     int graph_captured,
     int m,
@@ -241,6 +242,7 @@ bool cudaNativeQuantisedGemvTuned_resolveGroupedArithmeticPolicy(
     LLAMINAR_ROUTE_CUDA_NATIVE_QUANTISED_SHARD(
         cudaNativeQuantisedGemvTuned_queryGeneratedGroupedDispatch,
         false,
+        architecture,
         codebook_id,
         graph_captured,
         m,

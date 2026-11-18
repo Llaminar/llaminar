@@ -1,5 +1,5 @@
 /** @file QfnRoutedPacketRead.hip
- * @brief Packet traffic reference for the QFN M4 parent direct native readers.
+ * @brief Packet traffic reference for four- and six-row QFN verifier readers.
  *
  * Preserve original route/role order and the prepared [K32][column] layout.
  * Use generated measurement data, with a different value at each plane
@@ -19,11 +19,11 @@
 #define HIP(call) do { auto err=(call); if(err!=hipSuccess){ \
     std::fprintf(stderr,"%s: %s\n",#call,hipGetErrorString(err)); std::exit(1); } } while(false)
 
-constexpr int Experts=512, Live=4, Top=10, H=2560, Banks=4, Threads=256;
+constexpr int Experts=512, Top=10, H=2560, Banks=4, Threads=256;
 using Word=unsigned int;
 using Half=unsigned short;
 using Byte=unsigned char;
-using RouteRows=std::array<int,Live*Top>;
+using RouteRows=std::vector<int>;
 
 /** @brief Immutable plane addresses in two role datasets, with independent coefficient streams. */
 struct Payload {
@@ -32,7 +32,9 @@ struct Payload {
     Half* secondary{};
 };
 
+/** @brief Original counted verifier geometry shared by the read reference and lane oracle. */
 struct Geometry {
+    int liveRows=4;
     int routed=160;
     int shared=160;
     int routedParts=16;
@@ -105,8 +107,8 @@ __global__ void packetRead(Payload routed,Payload shared,const int* routes,Geome
     if constexpr(Gate) {
         const int routedBlocks=shape.routed/32;
         const int sharedBlocks=shape.shared/32;
-        const int routedTiles=Live*Top*routedBlocks;
-        const int tileCount=routedTiles+Live*sharedBlocks;
+        const int routedTiles=shape.liveRows*Top*routedBlocks;
+        const int tileCount=routedTiles+shape.liveRows*sharedBlocks;
         for(int tile=blockIdx.x*2+tid/128;tile<tileCount;tile+=gridDim.x*2) {
             const int offset=tid%128/64*16+lane%16;
             if(tile<routedTiles) {
@@ -143,10 +145,10 @@ bool readRoutes(const char* path,std::vector<RouteRows>& histories)
 {
     std::ifstream input(path);
     for(auto& routes:histories)
-        for(int row=0;row<Live;++row) {
+        for(std::size_t start=0;start<routes.size();start+=Top) {
             std::array<bool,Experts> seen{};
             for(int slot=0;slot<Top;++slot) {
-                auto& id=routes[row*Top+slot];
+                auto& id=routes[start+slot];
                 if(!(input>>id) || id<0 || id>=Experts || seen[id])return false;
                 seen[id]=true;
             }
@@ -169,10 +171,10 @@ Word expectedPacket(int bytes,bool secondary,std::size_t index,Word dataset)
 template<int Bytes,bool Secondary,bool Gate,int SharedBytes=32,bool SharedSecondary=false>
 std::vector<Word> expectedLanes(Geometry shape,const RouteRows& routes,int gridX,int bank)
 {
-    std::vector<Word> expected(gridX*(Gate?1:Live)*Threads);
+    std::vector<Word> expected(gridX*(Gate?1:shape.liveRows)*Threads);
     if constexpr(Gate) {
-        const int routeTiles=Live*Top*(shape.routed/32);
-        const int totalTiles=routeTiles+Live*(shape.shared/32);
+        const int routeTiles=shape.liveRows*Top*(shape.routed/32);
+        const int totalTiles=routeTiles+shape.liveRows*(shape.shared/32);
         for(int tile=0;tile<totalTiles;++tile) {
             const bool shared=tile>=routeTiles;
             const int n=shared?shape.shared:shape.routed;
@@ -192,7 +194,7 @@ std::vector<Word> expectedLanes(Geometry shape,const RouteRows& routes,int gridX
                 }
         }
     } else {
-        for(int row=0;row<Live;++row)
+        for(int row=0;row<shape.liveRows;++row)
             for(int slot=0;slot<=Top;++slot) {
                 const bool shared=slot==Top;
                 const int blocks=(shared?shape.shared:shape.routed)/32;
@@ -214,11 +216,11 @@ void run(int family,int round,hipStream_t stream,const RouteRows& routes,Geometr
 {
     const std::size_t routedCount=std::size_t(H)*shape.routed/32*(Gate?2:1);
     const std::size_t sharedCount=std::size_t(H)*shape.shared/32*(Gate?2:1);
-    const int gateTiles=Live*(Top*(shape.routed/32)+shape.shared/32);
-    const int gridX=Gate?(SingleTile?(gateTiles+1)/2:std::clamp((gateTiles+1)/2,Live,120)):H/64;
-    const int gridY=Gate?1:Live;
+    const int gateTiles=shape.liveRows*(Top*(shape.routed/32)+shape.shared/32);
+    const int gridX=Gate?(SingleTile?(gateTiles+1)/2:std::clamp((gateTiles+1)/2,shape.liveRows,120)):H/64;
+    const int gridY=Gate?1:shape.liveRows;
     const std::size_t outputCount=gridX*gridY*Threads;
-    const double requestBytes=Live*(Top*routedCount*(Bytes+2+2*int(Secondary))+sharedCount*(SharedBytes+2+2*int(SharedSecondary)));
+    const double requestBytes=shape.liveRows*(Top*routedCount*(Bytes+2+2*int(Secondary))+sharedCount*(SharedBytes+2+2*int(SharedSecondary)));
     Payload routed{},shared{};
     const auto packets=Banks*Experts*routedCount;
     HIP(hipMalloc(&routed.bytes,packets*Bytes));
@@ -315,16 +317,25 @@ int main(int argc,char** argv)
 {
     Geometry shape;
     int family=-1,round=0;
+    if(argc>=6 && std::string_view(argv[argc-2])=="--rows") {
+        const std::string_view rows=argv[argc-1];
+        if(rows!="4" && rows!="6") {
+            std::fprintf(stderr,"Expected a counted verifier with four or six physical rows\n");
+            return 2;
+        }
+        shape.liveRows=rows=="4"?4:6;
+        argc-=2;
+    }
     const bool singleTile=argc==10 && std::string_view(argv[9])=="single-tile";
     if((argc!=4 && argc!=9 && !singleTile) || !parse(argv[1],round,0,100) ||
        (argc>=9 && (!parse(argv[4],family,0,3) || !parse(argv[5],shape.routed,32,640) ||
            !parse(argv[6],shape.shared,32,640) || !parse(argv[7],shape.routedParts,1,80) ||
            !parse(argv[8],shape.sharedParts,1,80) || shape.routed%32 || shape.shared%32))) {
-        std::fprintf(stderr,"Usage: %s ROUND PCI ROUTES [TUPLE F S ROUTED_GATE_PARTS SHARED_GATE_PARTS [single-tile]]\n",argv[0]);
+        std::fprintf(stderr,"Usage: %s ROUND PCI ROUTES [TUPLE F S ROUTED_GATE_PARTS SHARED_GATE_PARTS [single-tile]] [--rows 4|6]\n",argv[0]);
         return 2;
     }
     if(singleTile && family<0)return 2;
-    std::vector<RouteRows> histories(family<0?3:1);
+    std::vector<RouteRows> histories(family<0?3:1,RouteRows(shape.liveRows*Top));
     if(!readRoutes(argv[3],histories))return 2;
     int count=0;
     HIP(hipGetDeviceCount(&count));
@@ -337,6 +348,7 @@ int main(int argc,char** argv)
     HIP(hipGetDeviceProperties(&props,0));
     if(std::strncmp(props.gcnArchName,"gfx906",6)||props.warpSize!=64)return 2;
     std::printf("DEVICE,%s,%s,%d,%d\n",argv[2],props.gcnArchName,props.multiProcessorCount,props.l2CacheSize);
+    std::printf("PACKET_ROWS,%d\n",shape.liveRows);
     hipStream_t stream;
     HIP(hipStreamCreateWithFlags(&stream,hipStreamNonBlocking));
     if(singleTile && family==3)
