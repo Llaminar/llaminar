@@ -66,7 +66,7 @@ if(TARGET v2_integration_moe_intermediate_ffn_finalization)
 
     add_v2_test(V2_Integration_FullNativeHCFFN_RetainedClosed_ROCm
         COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
-            --gtest_filter=FullNativeHCFFN.ROCmRetainedClosedReplay
+            --gtest_filter=FullNativeHCFFN.ROCmRetainedClosedReplay:FullNativeHCFFN.ROCmRetainedBalancedTP2Replay
         LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;Hyperconnection;GraphCapture;Replay;ByteExact;GeneratedSource;Regression;Devices1;NativeISA-gfx906;DemandedOutputs"
         MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
         ENVIRONMENT "LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16")

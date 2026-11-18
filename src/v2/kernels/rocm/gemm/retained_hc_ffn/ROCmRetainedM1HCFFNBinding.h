@@ -40,17 +40,10 @@ public:
         const auto& hc=full.prefix.hc;
         const int routed=ffn.routed_columns;
         const int shared_width=ffn.shared_columns;
-        // Routed cuts rotate independently of the dense/shared assignment, so
-        // all four TP8 F/S pairs can occur across the original layer sequence.
-        const bool original_shard=(routed==640 && shared_width==640) ||
-            ((routed==256 || routed==384) && shared_width==320) ||
-            ((routed==128 || routed==256) && shared_width==160) ||
-            ((routed==64 || routed==96) && (shared_width==64 || shared_width==96));
-        const bool matched_reference_shard=routed==256 && shared_width==192;
-        if(ffn.hidden_columns!=2560 || (!original_shard && !matched_reference_shard) ||
+        if(ffn.hidden_columns!=2560 || !validNativeWidth(routed) || !validNativeWidth(shared_width) ||
            ffn.experts!=512 || ffn.top_k!=retainedM1SelectedExperts || hc.norm.hidden!=ffn.hidden_columns ||
            hc.mixed!=ffn.hidden || hc.publication.columns!=320)
-            throw std::invalid_argument("Retained ROCm HC/FFN requires H2560/R320/E512/topK10 and a declared native TP1/2/4/8 or F256/S192 reference shard");
+            throw std::invalid_argument("Retained ROCm HC/FFN requires H2560/R320/E512/topK10 and positive native K32 routed/shared widths up to 640");
 
         const auto* count=validateRowAuthority(ffn.rows,hc);
 
@@ -97,6 +90,12 @@ public:
     const std::int32_t* countOwner() const noexcept {return count_;}
 
 private:
+    /** @brief Check one positive whole K32 slice against the retained instance's per-role capacity. */
+    static constexpr bool validNativeWidth(int columns) noexcept
+    {
+        return columns>0 && columns<=640 && columns%32==0;
+    }
+
     /** @brief Preserve the original count after complete arithmetic validation. */
     explicit ROCmRetainedM1HCFFNBinding(const std::int32_t* count) : count_(count) {}
 

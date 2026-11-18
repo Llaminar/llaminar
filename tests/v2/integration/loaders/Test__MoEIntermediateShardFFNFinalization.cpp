@@ -1621,6 +1621,15 @@ TEST(FullNativeHCFFN,ROCmRetainedClosedReplay) {
     replayMandatoryFullNativeHCFFN(OriginalSourceQualification::FullNativeHCFFNFinal,
         FullProductionHCStorageReuse::Distinct,kFullNativeHCFFNFixtureGeometry,FullProductionHCObservation::RetainedDemandedOnly);
 }
+/** @test Balanced TP2's K32-native F320/S320 tile preserves the captured M1 result. */
+TEST(FullNativeHCFFN,ROCmRetainedBalancedTP2Replay)
+{
+    auto shape=kFullNativeHCFFNFixtureGeometry;
+    shape.routed=320;
+    shape.shared=320;
+    replayMandatoryFullNativeHCFFN(OriginalSourceQualification::FullNativeHCFFNFinal,
+        FullProductionHCStorageReuse::Distinct,shape,FullProductionHCObservation::RetainedDemandedOnly);
+}
 /** @test Both native Q8-down source families keep grouped byte equality through count/reset replay. */
 TEST(FullNativeHCFFN,ROCmGroupedQ8DownByteReplay)
 {
