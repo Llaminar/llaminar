@@ -17926,6 +17926,7 @@ namespace llaminar2
             return setError("Failed to create LOCAL TP context");
         }
 
+        plan_.runtime.rank_ordered_resources = local_tp_ctx_->rankOrderedResources();
         LOG_DEBUG("LOCAL TP context created with " << plan_.local_tp_devices.size() << " devices");
         return true;
     }

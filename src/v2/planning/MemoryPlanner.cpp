@@ -2193,6 +2193,14 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         *cfg.local_tp_backend)
                         .perDeviceBytes();
             }
+            if (cfg.rank_ordered_resources)
+            {
+                if (cfg.local_tp_backend != CollectiveBackendType::RCCL ||
+                    cfg.rank_ordered_resources->device != cfg.device || !cfg.device.is_rocm())
+                    throw std::invalid_argument("Native peer reduction BOM lost its original RCCL participant");
+                collective_bytes = checkedAdd(collective_bytes, cfg.rank_ordered_resources->device_bytes,
+                    "native rank-ordered connector backing");
+            }
             if (cfg.local_pipeline_backend.has_value())
                 collective_bytes += CollectiveMemoryEstimator::nativePipelineBoundaryBytes(*cfg.local_pipeline_backend);
         }
@@ -2662,7 +2670,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
              prefix_cache_host_staging_bytes != 0u ||
              cfg.weight_load_staging.host_bytes != 0u || pipeline_host_bytes != 0u ||
              (native_table_bytes != 0u && !native_ngram_lookup) || immutable_lookup_host_bytes != 0u ||
-             mixed_source_table || mixed_source_staging))
+             mixed_source_table || mixed_source_staging ||
+             (cfg.rank_ordered_resources && cfg.rank_ordered_resources->hostBytes())))
         {
             if (!cfg.associated_host_memory.has_value() ||
                 !cfg.associated_host_memory->valid() ||
@@ -2695,6 +2704,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 PhysicalMemoryOwner::WeightLoadStaging,
                 cfg.weight_load_staging.host_bytes);
             host_builder.add(PhysicalMemoryOwner::ActivationTransportStaging, pipeline_host_bytes);
+            if (cfg.rank_ordered_resources)
+                host_builder.add(PhysicalMemoryOwner::LocalCollective, cfg.rank_ordered_resources->hostBytes());
             appendPhysicalPlan(
                 result,
                 DeviceMemoryPlan(

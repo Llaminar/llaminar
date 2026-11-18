@@ -22216,6 +22216,33 @@ if(HAVE_ROCM)
         GTest::gtest
         GTest::gtest_main
     )
+    # The native regression shares the exact replay body with the performance
+    # probe, but enters through production MPI ownership and original discovery.
+    # Ordinal zero/one need not be colocated or peer accessible on a real host.
+    add_executable(v2_integration_rocm_peer_push
+        performance/Perf__RCCLAllreduceLatency.cpp integration/mpi_gtest_main.cpp
+        utils/OriginalPeerPushReplayPlacement.cpp)
+    if(TARGET v2_integration_rocm_peer_push)
+        target_compile_definitions(v2_integration_rocm_peer_push PRIVATE LLAMINAR_RCCL_NATIVE_REPLAY_OWNER=1)
+        target_link_libraries(v2_integration_rocm_peer_push PRIVATE llaminar2_core GTest::gtest)
+        v2_test_device_scope(v2_integration_rocm_peer_push FullInventory)
+        foreach(peer_push_case IN ITEMS Replay MixedPrefill Abort OwnerReplacement)
+            add_v2_test(V2_Integration_ROCmPeerPushCaptured${peer_push_case}
+                COMMAND $<TARGET_FILE:v2_integration_rocm_peer_push>
+                    --gtest_filter=Perf__RCCLAllreduceLatency.PeerPushCaptured${peer_push_case}
+                LABELS "V2;Integration;ProductionTestPreflight;ROCm;RCCL;GraphCapture;Replay;Regression"
+                MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
+                ENVIRONMENT "LLAMINAR_RCCL_PERF_DEVICE_COUNT=2;LLAMINAR_RCCL_RANK_ORDERED_PUSH=1")
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmPeerPushCaptured${peer_push_case})
+        endforeach()
+        # Use the original rank-owned native fixture for the unprofiled transport A/B.
+        add_v2_test(V2_Perf_ROCmPeerPushCapturedTiming
+            COMMAND $<TARGET_FILE:v2_integration_rocm_peer_push>
+                --gtest_filter=Perf__RCCLAllreduceLatency.PeerPushCapturedTiming
+            LABELS "V2;Performance;ROCm;RCCL;GraphCapture;TensorParallelism;Benchmark"
+            MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 600
+            ENVIRONMENT "LLAMINAR_RCCL_PERF_DEVICE_COUNT=4;LLAMINAR_RCCL_RANK_ORDERED_PUSH=1")
+    endif()
     add_v2_test(V2_Perf_RCCLAllreduceLatency
         COMMAND $<TARGET_FILE:v2_perf_rccl_allreduce_latency>
         LABELS "V2;Performance;ROCm;RCCL;AllReduce;Latency;TensorParallelism;gfx906;Benchmark"
@@ -27947,6 +27974,31 @@ add_v2_test(V2_Unit_MemoryPlanner
     MPI_PROCS 1
     NO_MODELS
 )
+# The native candidate uses the same physical ledger; this admission contract is device-free.
+add_executable(v2_test_peer_push_reduction unit/collective/Test__PeerPushReduction.cpp)
+if(TARGET v2_test_peer_push_reduction)
+    target_compile_features(v2_test_peer_push_reduction PRIVATE cxx_std_20)
+endif()
+target_link_libraries(v2_test_peer_push_reduction PRIVATE GTest::gtest_main)
+target_include_directories(v2_test_peer_push_reduction PRIVATE ${CMAKE_SOURCE_DIR})
+add_v2_test(V2_Unit_PeerPushReduction
+    COMMAND $<TARGET_FILE:v2_test_peer_push_reduction>
+    LABELS "V2;Unit;Collective;DeviceFree"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_PeerPushReductionLayout
+    COMMAND $<TARGET_FILE:v2_test_peer_push_reduction>
+    LABELS "V2;Integration;ProductionTestPreflight;Collective;DeviceFree;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PeerPushReductionLayout)
+
+add_v2_test(V2_Integration_RCCLRankOrderedAdmission
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.NativeRankOrderedConnector*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;RCCL;MemoryBudget;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+if(TEST V2_Integration_RCCLRankOrderedAdmission)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_RCCLRankOrderedAdmission)
+endif()
 # Immediate native packers use the same capped append workspace as streamed loading.
 add_v2_test(V2_Integration_ImmediateNativeWeightPackingEconomy
     COMMAND $<TARGET_FILE:v2_test_memory_planner>

@@ -620,6 +620,14 @@ namespace llaminar2
         }
     }
 
+    void RCCLBackend::retireRankOrderedAttachmentAfterGraphRelease() noexcept
+    {
+#ifdef HAVE_RCCL
+        if (coordinator_)
+            coordinator_->retireRankOrderedAttachmentAfterGraphRelease();
+#endif
+    }
+
     void RCCLBackend::shutdown()
     {
 #ifdef HAVE_RCCL
@@ -644,6 +652,13 @@ namespace llaminar2
             // instances reuse it without an init/destroy cycle.
             if (coordinator_)
             {
+                if (!coordinator_->rankOrderedAttachmentAllowsPooling())
+                {
+                    // Unretired or failed attachment lifetimes cannot cross
+                    // to a different model. Use the existing abort owner.
+                    abort();
+                    return;
+                }
                 std::lock_guard<std::mutex> pool_lock(coordinator_pool_mutex_);
                 const std::string pool_key = makePoolKey(device_ordinals_);
                 unregisterActiveCoordinatorOwnerLocked();
@@ -1934,6 +1949,37 @@ namespace llaminar2
 #else
         (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream;
         return NativeCollectiveEnqueueResult::failure("RCCL not available");
+#endif
+    }
+
+    std::vector<RankOrderedNativeResources> RCCLBackend::rankOrderedResources() const
+    {
+#ifdef HAVE_RCCL
+        return coordinator_ ? coordinator_->rankOrderedResources() : std::vector<RankOrderedNativeResources>{};
+#else
+        return {};
+#endif
+    }
+
+    bool RCCLBackend::prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_ && coordinator_->prepareRankOrderedResources(memory);
+#else
+        (void)memory;
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+        const NativeCollectiveRows &rows, int participant, void *stream)
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_ &&
+            coordinator_->rankOrderedFP32OnStream(send, banks, output, rows, participant, stream);
+#else
+        (void)send; (void)banks; (void)output; (void)rows; (void)participant; (void)stream;
+        return false;
 #endif
     }
 

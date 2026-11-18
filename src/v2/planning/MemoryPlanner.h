@@ -12,6 +12,8 @@
  */
 
 #pragma once
+
+#include "collective/RankOrderedNativeResources.h"
 #include "planning/PlanningNativeContextEvidence.h"
 #include "loaders/NativeWeightLoadStaging.h"
 #include "backends/NativeOrderingEventBudgetProjection.h"
@@ -377,6 +379,7 @@ struct DevicePlanConfig
      * installed by LocalTP; AUTO is invalid, not an alias for absence.
      */
     std::optional<CollectiveBackendType> local_tp_backend;
+    std::optional<RankOrderedNativeResources> rank_ordered_resources; ///< Original communicator quote for this physical participant.
 
     /** Exact PP parent ownership, independent of transport leadership and TP sharding. */
     PipelineForwardOnlyGraphOwner pipeline_forward_only_graph_owner = PipelineForwardOnlyGraphOwner::None;

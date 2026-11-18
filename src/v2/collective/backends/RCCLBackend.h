@@ -325,6 +325,14 @@ namespace llaminar2
         NativeCollectiveEnqueueResult nativeBroadcastBytesOnStream(const void* send, void* receive,
             const NativeCollectiveBytes& bytes, int root, int participant, void* stream) override;
 
+        /** @copydoc ICollectiveBackend::rankOrderedResources */
+        std::vector<RankOrderedNativeResources> rankOrderedResources() const override;
+        /** @copydoc ICollectiveBackend::prepareRankOrderedResources */
+        bool prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory) override;
+        /** @copydoc ICollectiveBackend::rankOrderedFP32OnStream */
+        bool rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+            const NativeCollectiveRows &rows, int participant, void *stream) override;
+
         /** @copydoc ICollectiveBackend::nativeRowsOnStream */
         bool nativeRowsOnStream(
             NativeRowCollective operation, const void *send, void *receive,
@@ -437,6 +445,10 @@ namespace llaminar2
         int localRank() const { return local_rank_; }
 
     private:
+        friend class LocalTPContext;
+        /** @brief End the original model's peer lease after its last graph reader. */
+        void retireRankOrderedAttachmentAfterGraphRelease() noexcept;
+
         bool initialized_ = false;
         std::string last_error_;
         int num_ranks_ = 0;

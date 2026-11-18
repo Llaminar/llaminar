@@ -1156,6 +1156,7 @@ namespace llaminar2
             // quota resolver. Native birth must never spend a post-quota slack estimate.
             for(auto& config:configs){
                 config.native_context_preparation=rank_plan.runtime.native_context_preparation;
+                config.rank_ordered_resources=rankOrderedResourcesForDevice(rank_plan.runtime.rank_ordered_resources,config.device);
                 if(!config.native_context_preparation)continue;
                 const auto& source=config.native_context_preparation;
                 if(source->memory()->worldRank()!=rank_plan.rank)throw std::logic_error("ExpertOverlay source crossed original rank authority");

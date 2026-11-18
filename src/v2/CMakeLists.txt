@@ -749,6 +749,7 @@ if(HAVE_ROCM)
         kernels/rocm/attention/ROCmQwen4ExpStateIO.hip
         kernels/rocm/attention/ROCmQwen4ExpPLERetained.hip
         kernels/rocm/attention/ROCmQwen4ExpBranchConcat.hip
+        kernels/rocm/ops/ROCmPeerPushReductionKernels.hip # Lossless small-payload direct peer reduction
         kernels/rocm/ops/ROCmTPRankOrderedReductionKernels.hip # Batch-invariant rank-ordered TP sums
         # MoE (Mixture of Experts) kernels
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
@@ -789,6 +790,7 @@ if(HAVE_ROCM)
         backends/rocm/HIPGraphCapture.cpp
         backends/ROCmEnumeration.cpp
         collective/backends/HostBackendROCm.cpp              # HIP-specific host memory registration
+        collective/backends/ROCmPeerPushResources.cpp        # PMA-owned small direct-peer collective storage
         collective/backends/RCCLBackend.cpp                  # RCCL backend (MUST be here, not in llaminar2_core)
         collective/backends/RCCLDynamicLoader.cpp            # Dynamic loader for RCCL (dlopen/dlsym)
         collective/backends/RCCLBackendHIP.cpp               # HIP runtime wrappers for RCCL backend

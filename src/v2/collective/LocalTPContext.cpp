@@ -686,6 +686,13 @@ namespace llaminar2
     LocalTPContext::~LocalTPContext()
     {
         retireOriginalNativeContextBorrows();
+#ifdef HAVE_RCCL
+        // Original runners release captured readers before this context.
+        // Absorbing abort still owns exceptional native retirement.
+        if (!abort_requested_.load(std::memory_order_acquire))
+            if (auto *rccl = dynamic_cast<RCCLBackend *>(backend_impl_.get()))
+                rccl->retireRankOrderedAttachmentAfterGraphRelease();
+#endif
         abortBackendAfterGraphOwnersReleased();
         releaseGraphCaptureBoundaryDeviceWords();
         releaseFp16ScratchBuffers();
@@ -3507,6 +3514,32 @@ namespace llaminar2
         return true;
     }
 
+    std::vector<RankOrderedNativeResources> LocalTPContext::rankOrderedResources() const
+    { return backend_impl_ ? backend_impl_->rankOrderedResources() : std::vector<RankOrderedNativeResources>{}; }
+
+    bool LocalTPContext::rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+        const NativeCollectiveRows &rows, int participant, void *stream, const std::string &stage_name)
+    {
+        if (!backend_initialized_ || !backend_impl_ || backend_ != CollectiveBackendType::RCCL ||
+            !backend_impl_->isMultiGpuSingleProcess() || !banks ||
+            !nativeCollectiveRowsValid(NativeRowCollective::AllReduce, send, output, rows,
+                CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM, degree(), participant, stream))
+            return false;
+        if (!backend_impl_->rankOrderedFP32OnStream(send, banks, output, rows, participant, stream))
+        {
+            LOG_ERROR("Native rank-ordered reduction failed stage=" << stage_name);
+            requestAbort();
+            return false;
+        }
+        PerfStatsCollector::addCounter("tp_rank_ordered_native", "recorded_calls", 1.0, {},
+            devices_[static_cast<size_t>(participant)].toLocalDeviceId().toString(),
+            {{"stage", stage_name}, {"capacity_rows", std::to_string(rows.rows().capacity())},
+             {"elements_per_row", std::to_string(rows.elementsPerRow())},
+             {"extent", rows.rows().countOwner() ? "device_prefix" : "fixed_rows"},
+             {"graph_capture", isGraphCaptureActive() ? "true" : "false"}});
+        return true;
+    }
+
     bool LocalTPContext::nativeRowsOnStream(
         NativeRowCollective operation, const void *send, void *receive,
         const NativeCollectiveRows &rows, CollectiveDataType dtype,
@@ -5599,8 +5632,10 @@ namespace llaminar2
                       << " bytes=" << backend_payload_capacity_bytes);
             return false;
         }
-        return reserveFp16ScratchElements(
-            fp16_scratch_elements, memory_authority);
+        if (!reserveFp16ScratchElements(fp16_scratch_elements, memory_authority)) return false;
+        if (!backend_impl_->rankOrderedResources().empty())
+            return backend_impl_->prepareRankOrderedResources(memory_authority);
+        return true;
     }
 
     void LocalTPContext::installDeviceCountedAllGather(std::shared_ptr<DeviceCountedAllGather> fabric)

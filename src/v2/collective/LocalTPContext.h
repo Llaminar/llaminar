@@ -261,6 +261,12 @@ namespace llaminar2
             const NativeCollectiveBytes& bytes, int root, int participant, void* stream,
             const std::string& stage_name) override;
 
+        /** @copydoc ICollectiveBackend::rankOrderedResources */
+        std::vector<RankOrderedNativeResources> rankOrderedResources() const override;
+        /** @copydoc ICollectiveBackend::rankOrderedFP32OnStream */
+        bool rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+            const NativeCollectiveRows &rows, int participant, void *stream, const std::string &stage_name) override;
+
         /** @copydoc ILocalTPContext::nativeRowsOnStream */
         bool nativeRowsOnStream(
             NativeRowCollective operation, const void *send, void *receive,

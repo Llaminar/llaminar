@@ -22,6 +22,7 @@
  * construction restores its caller before waiting for native initialization.
  */
 
+#include "collective/RankOrderedPeerPushOptIn.h"
 #include "RCCLCoordinator.h"
 #include "backends/NativeDeviceBinding.h"
 #include "../NativeReduceScatterContract.h"
@@ -29,8 +30,12 @@
 #include "../../utils/Logger.h"
 #include "../../utils/DebugEnv.h"
 #include "utils/ScopedOpenMPPartitionAffinity.h"
+#include "backends/ComputeBackend.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "../backends/ROCmPeerPushResources.h"
 
 #include <algorithm>
+#include <future>
 #include <optional>
 #include <functional>
 
@@ -44,6 +49,20 @@ namespace rccl = llaminar2::rccl_dynamic;
 
 namespace llaminar2
 {
+    /** @brief One quoted model attachment, destroyed before its native coordinator can be pooled. */
+    struct RCCLCoordinator::RankOrderedAttachment final
+    {
+        std::shared_ptr<PhysicalMemoryAuthority> memory;
+        std::vector<PhysicalMemoryOwnerReservation> host_reservations;
+        std::vector<PhysicalMemoryOwnerReservation> device_reservations;
+        // Reverse member destruction releases the native storage before its PMA roots.
+        std::vector<std::unique_ptr<ROCmPeerPushResources>> storage;
+    };
+    namespace rccl_backend_detail
+    {
+        /** @brief Enable a cold, already observed original direct peer edge. */
+        bool hipEnablePeerAccessDevice(int peer_device);
+    }
 
 #ifdef HAVE_RCCL
     static hipError_t selectHipDevice(int device_ordinal)
@@ -228,6 +247,30 @@ namespace llaminar2
             last_error_ = "No device ordinals provided";
             LOG_ERROR("[RCCLCoordinator] " << last_error_);
             return false;
+        }
+
+        if (rankOrderedPeerPushStartupOptIn())
+        {
+            try
+            {
+                std::vector<DeviceId> cohort;
+                cohort.reserve(device_ordinals.size());
+                for (const auto ordinal : device_ordinals)
+                    cohort.push_back(DeviceId::rocm(ordinal));
+                requireRankOrderedPeerPushClique(DeviceManager::instance().peerAccessCoverage(cohort));
+                for (const auto device : cohort)
+                {
+                    const auto &hardware = rocmHardwareMetadata().at(device.ordinal);
+                    if (!rankOrderedPeerPushQualifiedISA(hardware.isa_target))
+                        throw std::invalid_argument("RCCL FP32 direct peer is not qualified for " + hardware.isa_target);
+                }
+            }
+            catch (const std::exception &error)
+            {
+                last_error_ = error.what();
+                LOG_ERROR("[RCCLCoordinator] " << last_error_);
+                return false;
+            }
         }
 
         // Ensure RCCL is loaded
@@ -738,6 +781,29 @@ namespace llaminar2
             LOG_TRACE("[RCCLCoordinator] Initialized RCCL comm for device " << device_ordinals_[i]);
         }
 
+        if (rankOrderedPeerPushStartupOptIn())
+        {
+            try
+            {
+                rank_ordered_resources_.reserve(num_devices_);
+                for (int i = 0; i < num_devices_; ++i)
+                {
+                    std::size_t residency = 0;
+                    if (selectHipDevice(device_ordinals_[i]) != hipSuccess || !rocmPeerPushResidentCapacity(residency))
+                        throw std::runtime_error("native occupancy query failed");
+                    const auto layout = PeerPushLayout::create(rankOrderedPushMaxElements, num_devices_, residency);
+                    rank_ordered_resources_.push_back({DeviceId::rocm(device_ordinals_[i]),
+                        layout.inboxBytes() + layout.flagBytes() + layout.endpointBytes(), 1});
+                }
+            }
+            catch (const std::exception &error)
+            {
+                last_error_ = std::string("RCCL small peer-push cold quotation failed: ") + error.what();
+                cleanupOnThread();
+                return;
+            }
+            rank_ordered_state_ = RankOrderedPreparationState::Quoted;
+        }
         init_success_.store(true);
         LOG_DEBUG("[RCCLCoordinator] RCCL resources initialized on coordinator thread");
 #else
@@ -825,6 +891,11 @@ namespace llaminar2
             comms_[i] = nullptr;
         }
         comms_.clear();
+        // Native destruction is the physical retirement boundary, including
+        // partial connector preparation. Never release admission on enqueue failure.
+        rank_ordered_state_ = RankOrderedPreparationState::Retired;
+        rank_ordered_attachment_.reset();
+        rank_ordered_resources_.clear();
 
         // Step 3: Destroy completion events
         for (int i = 0; i < static_cast<int>(completion_events_.size()); ++i)
@@ -1876,6 +1947,147 @@ namespace llaminar2
 #else
         (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream;
         return NativeCollectiveEnqueueResult::failure("RCCL not available");
+#endif
+    }
+
+    std::vector<RankOrderedNativeResources> RCCLCoordinator::rankOrderedResources() const
+    { return rank_ordered_resources_; }
+
+    bool RCCLCoordinator::prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load() || !memory || rank_ordered_resources_.size() != comms_.size() ||
+            rank_ordered_resources_.empty())
+            throw std::logic_error("RCCL peer-push preparation requires its original cold quote and admitted PMA");
+        if (rank_ordered_state_ == RankOrderedPreparationState::Ready)
+        {
+            const auto &owner = rank_ordered_attachment_->memory;
+            if (memory != owner || memory.owner_before(owner) || owner.owner_before(memory))
+                throw std::logic_error("RCCL peer-push cannot borrow storage admitted by another PMA");
+            return true;
+        }
+        if (rank_ordered_state_ != RankOrderedPreparationState::Quoted || rank_ordered_attachment_)
+            throw std::logic_error("Failed/active RCCL peer preparation must retire; it cannot be retried");
+
+        auto attachment = std::make_unique<RankOrderedAttachment>();
+        attachment->memory = memory;
+        for (const auto &resource : rank_ordered_resources_)
+        {
+            attachment->device_reservations.push_back(memory->reserveNewAllocations(
+                resource.device, PhysicalMemoryOwner::LocalCollective, resource.device_bytes));
+            if (resource.hostBytes())
+                attachment->host_reservations.push_back(memory->reserveNewAllocations(
+                    DeviceId::cpu(), PhysicalMemoryOwner::LocalCollective, resource.hostBytes()));
+        }
+
+        // The communicator already owns the device-selected cold streams.
+        // Its model attachment must not borrow a different PMA through the
+        // independent prepared inference/transfer worker lifetime.
+        auto prepare = std::make_shared<std::packaged_task<void()>>([this]
+        {
+            auto &owned = *rank_ordered_attachment_;
+            const auto layout = PeerPushLayout::create(rankOrderedPushMaxElements, num_devices_,
+                PeerPushLayout::blocksFor(rankOrderedPushMaxElements));
+            std::vector<PeerPushEndpoint> endpoints;
+            endpoints.reserve(comms_.size());
+            for (std::size_t i = 0; i < comms_.size(); ++i)
+            {
+                const auto device = rank_ordered_resources_[i].device;
+                if (selectHipDevice(device.ordinal) != hipSuccess)
+                    throw std::runtime_error("RCCL peer push cannot select its original participant");
+                for (const auto peer : device_ordinals_)
+                {
+                    if (peer == device.ordinal) continue;
+                    const auto available = DeviceManager::instance().peerAccessAvailable(device, DeviceId::rocm(peer));
+                    if (!available || !*available || !rccl_backend_detail::hipEnablePeerAccessDevice(peer))
+                        throw std::runtime_error("RCCL small peer push requires every original directed P2P edge");
+                }
+                ncclLlaminarCompletionAuthority original{};
+                if (rccl::nativeCompletionAuthority(static_cast<rccl::ncclComm_t>(comms_[i]), &original) != rccl::ncclSuccess)
+                    throw std::runtime_error("RCCL peer push lost the original native abort authority");
+                if (layout.inboxBytes() + layout.flagBytes() + layout.endpointBytes() != rank_ordered_resources_[i].device_bytes)
+                    throw std::logic_error("RCCL peer-push layout changed after admission");
+                auto storage = ROCmPeerPushResources::create(device, owned.device_reservations[i],
+                    layout, static_cast<int>(i), original.abortFlag, streams_[i]);
+                endpoints.push_back(storage->endpoint());
+                owned.storage.push_back(std::move(storage));
+            }
+            for (std::size_t i = 0; i < endpoints.size(); ++i)
+            {
+                if (selectHipDevice(device_ordinals_[i]) != hipSuccess)
+                    throw std::runtime_error("RCCL peer push cannot publish on its original participant");
+                owned.storage[i]->publish(endpoints, streams_[i]);
+            }
+        });
+        auto done = prepare->get_future();
+        rank_ordered_attachment_ = std::move(attachment);
+        rank_ordered_state_ = RankOrderedPreparationState::Preparing;
+        try
+        {
+            enqueueWork([prepare] { (*prepare)(); });
+            done.get();
+        }
+        catch (...)
+        {
+            rank_ordered_state_ = RankOrderedPreparationState::Failed;
+            throw;
+        }
+        rank_ordered_state_ = RankOrderedPreparationState::Ready;
+        return true;
+#else
+        (void)memory;
+        return false;
+#endif
+    }
+
+    void RCCLCoordinator::retireRankOrderedAttachmentAfterGraphRelease() noexcept
+    {
+        if (rank_ordered_state_ != RankOrderedPreparationState::Ready)
+            return;
+        // The original LocalTP owner already revoked submission borrows and
+        // its runners retired producer events and capture handles. Only the
+        // model attachment ends here; the original communicator stays live.
+        rank_ordered_attachment_.reset();
+        rank_ordered_state_ = RankOrderedPreparationState::Quoted;
+    }
+
+    bool RCCLCoordinator::rankOrderedAttachmentAllowsPooling() const noexcept
+    {
+        return !rank_ordered_attachment_ &&
+            (rank_ordered_state_ == RankOrderedPreparationState::Unselected ||
+             rank_ordered_state_ == RankOrderedPreparationState::Quoted);
+    }
+
+    bool RCCLCoordinator::rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+        const NativeCollectiveRows &rows, int participant, void *stream)
+    {
+#ifdef HAVE_RCCL
+        if (!initialized_.load() || rank_ordered_state_ != RankOrderedPreparationState::Ready || !banks ||
+            !nativeCollectiveRowsValid(NativeRowCollective::AllReduce, send, output, rows,
+                CollectiveDataType::FLOAT32, CollectiveOp::ALLREDUCE_SUM, num_devices_, participant, stream))
+            return false;
+        if (selectHipDevice(device_ordinals_[participant]) != hipSuccess || hipGetLastError() != hipSuccess)
+            return false;
+        const bool accepted = launchROCmPeerPushFP32(rank_ordered_attachment_->storage.at(participant)->binding(),
+            static_cast<const float *>(send), static_cast<float *>(output), rows.rows().countOwner(),
+            rows.rows().capacity(), rows.elementsPerRow(), rows.payloadReceipt(), nullptr, stream);
+        if (!accepted)
+        {
+            LOG_ERROR("RCCL small peer-push enqueue failed participant=" << participant);
+            return false;
+        }
+        const auto enqueue_error = hipGetLastError();
+        if (enqueue_error != hipSuccess)
+        {
+            LOG_ERROR("RCCL native rank-ordered runtime enqueue failed participant=" << participant
+                      << " status=" << hipGetErrorString(enqueue_error));
+            return false;
+        }
+        collective_performed_.store(true);
+        return true;
+#else
+        (void)send; (void)banks; (void)output; (void)rows; (void)participant; (void)stream;
+        return false;
 #endif
     }
 

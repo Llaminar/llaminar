@@ -23,13 +23,12 @@ it improved decode by 34.25% and 33.21% with identical output tokens.
 | MTP mode | Review prefill / decode tok/s | Code prefill / decode tok/s | Own ordinary decode, six 256-token histories |
 | --- | ---: | ---: | --- |
 | Llaminar fixed 3 | 1001.18 / 90.29 | 970.67 / 75.26 | 6/6 exact |
-| Llaminar dynamic | 1000.39 / 97.20 | 970.42 / 79.92 | 6/6 exact, timing provisional |
+| Llaminar dynamic | 1001.95 / 97.43 | 969.71 / 79.95 | 6/6 exact |
 | Castagna fixed 3 | 774.28 / 114.89 | 888.35 / 106.31 | 0/6 exact, first divergence at review token 224 and code token 14 |
 
-The dynamic run passed request, driver and GPU retirement checks. A build
-removed a second hard link to its executable during the run. The original
-checker counted that metadata change as an identity failure. Repeat with the
-running executable and loaded libraries bound to independent file identities.
+The dynamic repeat verified the loaded executable and libraries, token IDs,
+driver state and GPU retirement. Review accepted 197 of 294 drafted tokens
+over 58 verifier calls. Code accepted 187 of 345 over 69 calls.
 
 The 512-token ordinary decode profile covers all 255 post-prefill tokens.
 The figures below are mean kernel occupancy per GPU. The stages overlap.
@@ -46,6 +45,43 @@ Each cycle included 48 retained FFN launches. The remaining HC reads issued
 97 small RCCL gathers with ordered sums and one vocabulary gather per cycle.
 Castagna issued 96 direct FP32 peer pushes. Both traces reproduced their own
 unprofiled outputs. Independent throughput runs measure the benefit of each change.
+
+A second Release compared the original gather and ascending FP32 fold with a
+direct peer push that preserves the same sum order. The only change between
+arms was the transport selector. All six 256-token outputs matched. Each
+ordinary graph lost 97 native nodes per card.
+
+| Prompt | Gather/fold decode | Direct peer decode | Castagna decode | Direct peer prefill |
+| --- | ---: | ---: | ---: | ---: |
+| Review 512 | 68.28 | 78.30 | 86.17 | 1038.48 |
+| Code 2048 | 64.68 | 74.05 | 75.93 | 1009.12 |
+
+Direct peer saved 1.87 and 1.96 ms per generated token. The isolated 10 KiB
+reduction took 12.15 µs against 26.81 µs for gather and fold.
+
+| Direct peer MTP | Review prefill / decode tok/s | Code prefill / decode tok/s | Exact histories vs own ordinary |
+| --- | ---: | ---: | ---: |
+| Fixed 3 | 1000.42 / 99.63 | 970.43 / 82.58 | 6/6 |
+| Dynamic | 999.90 / 105.27 | 968.13 / 86.49 | 6/6 |
+
+Native partial, empty, abort and same-process owner-replacement replays passed.
+Two sequential model owners reused one real communicator and each released its
+host and device reservations. The final lifecycle build reproduced all six
+histories at 78.23 and 74.04 decode tok/s. Peer push remains opt-in. Wider deployment needs
+native coverage of additional cohorts and their serving lifecycles.
+
+An independent publication fusion removed 98 decode nodes per device and
+matched six ordinary histories. It regressed review from 67.69 to 66.17 tok/s
+and code from 64.39 to 62.69 tok/s. The publication fusion stays out of the selected policy.
+
+The review fixed-3 trace reproduced all 256 output IDs and its unprofiled
+222 draft steps, 182 accepts and 74 verifier calls. Each MI50 ran a 2,392-node
+verifier graph 74 times (296 target rows). It accounted for 88.4–88.6% of
+post-prefill summed kernel time, measured separately on each card. On the
+first card routed expert projection/activation took 6.80 ms per verifier
+call, other projections 6.32 ms and HC normalization/residual 5.96 ms.
+The 320-wide Q8 residual projection alone took 3.54 ms across 97 dispatches
+per verifier call. The trace used the original gather/fold transport.
 
 ## Real-model shapes
 
@@ -152,7 +188,9 @@ The real four-card ordinary decode graph contains all 192 expected
 layer/participant bindings. Each device captured 192 retained nodes across
 the graph variants. The server completed three measured 32-token generations
 after warmup. The same capture census found no retained M1 nodes in prefill
-or verifier graphs. Next, measure the pre-attention projection and read in
-one launch, then compare the direct FP32 peer push against gather plus sum
-on the same four cards. The wider TP2 Q8-down shard remains a separate
-kernel tuning target.
+or verifier graphs. A short-K projection and branch-mix fusion removed 49
+nodes per ordinary decode graph. The matched six histories stayed exact.
+Review improved from 68.03 to 68.22 tok/s, code from 64.67 to 64.89. The
+fusion remains experimental. Next qualify direct peer on MTP and compare the
+pre-attention projections with the fork. The wider
+TP2 Q8-down shard remains a separate tuning target.
