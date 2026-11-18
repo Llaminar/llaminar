@@ -41,7 +41,12 @@ production-preflight `host` lane. The canonical production scheduler owns
 host selection. That container receives no GPU devices or model mounts.
 AVX2 then runs the complete hardware-qualified production preflight inventory
 in a separate container exposing both GPUs. This includes the CUDA, ROCm and
-exclusive lanes, mixed vendors and multi-rank fixtures. Canonical hardware
+exclusive lanes, mixed vendors and multi-rank fixtures. Maximum-context
+allocation is priced independently for dense and MoE models with MTP on and
+off. The shared runner uses observed free bytes on the original GPU. Dedicated
+production preflight uses its total capacity and requires capable cards to be
+available for the test. Each selected cell must physically materialize every
+applicable depth policy at the full model context. Canonical hardware
 qualification records unavailable declared geometries as unqualified; it never
 turns a selected-test failure or skip into a pass. This is PR validation, not
 release certification. The checkout is the PR merge ref, so the tests

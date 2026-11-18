@@ -62,6 +62,9 @@ def model_identities(manifest: dict) -> dict:
     return result
 
 
+MAXIMUM_CONTEXT_CASES = frozenset(("DenseOff", "DenseMTP", "MoEOff", "MoEMTP"))
+
+
 def validate_optional_native_cohort_requirement(requirement: dict) -> None:
     """Validate the typed optional geometry shared by registration and receipt readers."""
     if isinstance(requirement, dict) and "backend_degrees" in requirement:
@@ -75,7 +78,7 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
             raise ValueError("invalid optional mixed-family preflight geometry")
         return
     required = {"backend", "degree", "locality"}
-    optional = {"native_isa", "stage_sizes", "rank_sizes", "mpi_ranks", "peer_access"}
+    optional = {"native_isa", "stage_sizes", "rank_sizes", "mpi_ranks", "peer_access", "maximum_context_case", "capacity_basis"}
     if (not isinstance(requirement, dict) or not required <= requirement.keys()
             or not requirement.keys() <= required | optional):
         raise ValueError("invalid optional preflight requirement")
@@ -84,6 +87,14 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
             or locality not in ("local-host", "original-numa-local-rank", "two-distinct-numa-local-ranks")
             or (locality == "two-distinct-numa-local-ranks" and degree != 2 and "rank_sizes" not in requirement)):
         raise ValueError("unsupported optional preflight geometry")
+    if "maximum_context_case" in requirement or "capacity_basis" in requirement:
+        if (set(requirement) != required | {"maximum_context_case", "capacity_basis"}
+                or locality != "local-host" or degree != 1
+                or not isinstance(requirement["maximum_context_case"], str)
+                or requirement["maximum_context_case"] not in MAXIMUM_CONTEXT_CASES
+                or requirement["capacity_basis"] not in ("free", "total")):
+            raise ValueError("invalid maximum-context physical requirement")
+        return
     if "native_isa" in requirement:
         isa = requirement["native_isa"]
         syntax = r"gfx[0-9][0-9a-f]*" if backend == "rocm" else r"sm_?[0-9]+[a-z]?"
@@ -144,6 +155,26 @@ def optional_native_cohort_absence(requirement: dict, hardware: dict) -> dict | 
                     or len(set(uuids)) != len(uuids) or len(set(ordinals)) != len(ordinals)):
                 raise ValueError("local physical counts require unique native GPU identities")
             counts[backend] = len(devices)
+        if "maximum_context_case" in requirement and counts[requirement["backend"]]:
+            # Native materialization always uses ordinal zero. Another card's
+            # free bytes or an unknown observation cannot certify its request.
+            device = next((row for address, row in observed.items()
+                           if address[:2] == (requirement["backend"], 0)), None)
+            sample = device.get("maximum_context") if device else None
+            total = device.get("total_memory_bytes") if device else None
+            if (not isinstance(sample, dict) or set(sample) != {"basis", "capacity_bytes", "minimum_bytes"}
+                    or sample["basis"] != requirement["capacity_basis"]
+                    or type(total) is not int or total <= 0
+                    or type(sample["capacity_bytes"]) is not int or not 0 <= sample["capacity_bytes"] <= total
+                    or (sample["basis"] == "total" and sample["capacity_bytes"] != total)
+                    or not isinstance(sample["minimum_bytes"], dict)
+                    or set(sample["minimum_bytes"]) != MAXIMUM_CONTEXT_CASES
+                    or any(type(size) is not int or size <= 0 for size in sample["minimum_bytes"].values())):
+                raise ValueError("incomplete original maximum-context physical BOM or capacity")
+            minimum = sample["minimum_bytes"][requirement["maximum_context_case"]]
+            if sample["capacity_bytes"] < minimum:
+                return {**absence, "ordinal": 0, "uuid": device["uuid"],
+                        "required_bytes": minimum, "observed_capacity_bytes": sample["capacity_bytes"]}
         if all(counts[backend] >= degree for backend, degree in needed.items()):
             return None
         return {**absence, "observed_device_counts": counts}

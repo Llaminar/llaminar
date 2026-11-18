@@ -26490,11 +26490,17 @@ if(HAVE_CUDA OR HAVE_ROCM)
            (_backend STREQUAL "ROCm" AND NOT HAVE_ROCM))
             continue()
         endif()
-        add_v2_test(V2_Integration_MaximumContextStateAllocation_${_backend}
-            COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
-                --gtest_filter=Backends/MaximumContextStateAllocation.Qwen27BAnd35BAllMTPPolicies/${_backend}
-            LABELS "V2;Integration;ProductionTestPreflight;${_backend};MTP;Memory;Regression"
-            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        foreach(_context_case IN ITEMS DenseOff DenseMTP MoEOff MoEMTP)
+            set(_context_requirement "")
+            if(NOT _backend STREQUAL "CPU")
+                set(_context_requirement "HardwareOptional;LocalHostDevices;Devices1;MaximumContext${_context_case}")
+            endif()
+            add_v2_test(V2_Integration_MaximumContextStateAllocation_${_backend}_${_context_case}
+                COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                    --gtest_filter=Backends/MaximumContextStateAllocation.MaterializesEveryAdmittedPolicy/${_backend}${_context_case}
+                LABELS "V2;Integration;ProductionTestPreflight;${_backend};MTP;Memory;Regression;${_context_requirement}"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        endforeach()
     endforeach()
 endif()
 
@@ -41582,6 +41588,7 @@ if(Python3_Interpreter_FOUND AND NOT V2_PERF_TESTS_ONLY)
     add_v2_test(V2_Integration_PreflightObservedNativePipelineQualification
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_production_parity_campaigns.py
+            ProductionParityCampaignTest.test_maximum_context_uses_the_original_ordinal_bom_and_shared_or_dedicated_capacity
             ProductionParityCampaignTest.test_optional_observed_pipeline_isa_selects_exact_original_cohort
             ProductionParityCampaignTest.test_optional_native_geometry_accepts_positive_widths_and_rejects_bad_labels
             ProductionParityCampaignTest.test_observed_pipeline_cmake_registrations_emit_exact_optional_geometry

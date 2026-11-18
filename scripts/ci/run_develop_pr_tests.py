@@ -59,7 +59,7 @@ def hardware_preflight_plan(registrations: tuple[PreflightRegistration, ...],
     observed = source_hardware_devices(hardware)
     if not {"cuda", "rocm"} <= {address[0] for address in observed}:
         raise ValueError("PR hardware preflight requires both CUDA and ROCm devices")
-    requirements = preflight_optional_hardware_requirements(registrations)
+    requirements = preflight_optional_hardware_requirements(registrations, shared_capacity=True)
     qualification = preflight_hardware_qualification(
         tuple(row.name for row in registrations), requirements, hardware if requirements else None)
     selected = set(qualification["selected"])
@@ -109,7 +109,7 @@ def main(argv: list[str] | None = None) -> int:
         lanes = (("unit", units, len(os.sched_getaffinity(0))), ("host", hosts, 1))
     else:
         plan, qualification = hardware_preflight_plan(
-            registrations, observe_preflight_hardware(build, None))
+            registrations, observe_preflight_hardware(build, None, shared_capacity=True))
         lanes = tuple((lane, tests, 1) for lane, tests in plan.items())
     report = {"schema": 1, "scope": args.scope.value, "complete": False,
               "return_code": None, "lanes": {}}

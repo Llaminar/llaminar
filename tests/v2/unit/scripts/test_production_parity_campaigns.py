@@ -1675,6 +1675,35 @@ class ProductionParityCampaignTest(unittest.TestCase):
             self.assertEqual(qualified["selected"], [host.name])
             self.assertIn(name, qualified["unqualified"])
 
+    def test_maximum_context_uses_the_original_ordinal_bom_and_shared_or_dedicated_capacity(self):
+        """Shortage is explicit per model/policy, and dedicated gates still require physically capable cards."""
+        cases = {"DenseOff": 12, "DenseMTP": 18, "MoEOff": 5, "MoEMTP": 9}
+        rows = tuple(campaigns.PreflightRegistration(
+            "V2_Integration_MaximumContextStateAllocation_CUDA_" + case,
+            frozenset(("CUDA", "HardwareOptional", "LocalHostDevices", "Devices1", "MaximumContext" + case)),
+            1, campaigns.PreflightExecutionLane.CUDA_SOCKET, index)
+            for index, case in enumerate(cases, 1))
+        names = tuple(row.name for row in rows)
+        for shared, capacity, eligible in ((True, 5, {"MoEOff"}), (False, 16, {"MoEOff", "MoEMTP", "DenseOff"})):
+            required = campaigns.preflight_optional_hardware_requirements(rows, shared_capacity=shared)
+            memory = {"basis": "free" if shared else "total", "capacity_bytes": capacity,
+                      "minimum_bytes": cases.copy()}
+            hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+                {"backend": "cuda", "ordinal": 1, "numa_node": -1, "uuid": "other", "total_memory_bytes": 64},
+                {"backend": "cuda", "ordinal": 0, "numa_node": -1, "uuid": "original", "total_memory_bytes": 16,
+                 "maximum_context": memory}]}
+            receipt = campaigns.preflight_hardware_qualification(names, required, hardware)
+            self.assertEqual(set(receipt["selected"]), {row.name for row in rows if row.name.split("_")[-1] in eligible})
+            for name, absence in receipt["unqualified"].items():
+                self.assertEqual((absence["uuid"], absence["required_bytes"], absence["observed_capacity_bytes"]),
+                                 ("original", cases[name.split("_")[-1]], capacity))
+            for tamper in ({"capacity_bytes": 17}, {"minimum_bytes": {"MoEOff": 5}},
+                           {"basis": "total" if shared else "free"}):
+                altered = {**hardware, "devices": [hardware["devices"][0], {**hardware["devices"][1],
+                           "maximum_context": {**memory, **tamper}}]}
+                with self.assertRaisesRegex(ValueError, "maximum-context"):
+                    campaigns.preflight_hardware_qualification(names, required, altered)
+
     def test_optional_native_geometry_accepts_positive_widths_and_rejects_bad_labels(self):
         """Original local widths are generic; optional declarations stay exact and fail closed."""
         name = "V2_Integration_ArbitraryNativeGeometry"
@@ -1908,7 +1937,7 @@ add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COM
             def export(command, **kwargs):
                 self.assertEqual(command[0], str(binary.resolve()))
                 self.assertEqual(len(command), 2)
-                option = "--qfn-source-hardware-inventory="
+                option = "--preflight-hardware-inventory="
                 self.assertTrue(command[1].startswith(option))
                 output = Path(command[1][len(option):])
                 self.assertFalse(output.exists())
