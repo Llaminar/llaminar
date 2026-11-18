@@ -6231,6 +6231,24 @@ void qfn_hc_down_long_k_contributions(HCDownLongKArgs args)
     }
 }
 
+/** @brief Preserve all serial-rounded terms and publish original SiLU/Q8 planes locally. */
+__global__ void groupedHCDownReducePublish(
+    const float* partials, float* raw, llaminar2::GPUHCDownOutputView publication)
+{
+    const int column = int(blockIdx.x) * 64 + int(threadIdx.x);
+    const int row = int(blockIdx.y);
+    if (row >= publication.rows.activeRows())
+        return;
+    const int offset = row * kHCDownColumns + column;
+    float sum = 0.0f;
+#pragma unroll
+    for (int partition = 0; partition < kHCDownPartitions; ++partition)
+        sum = llaminar2::device_native_quantised_contract::accumulate(
+            sum, partials[partition * publication.rows.physicalRows() * kHCDownColumns + offset]);
+    raw[offset] = sum;
+    llaminar2::hc_down_publication::publish(sum, publication, offset);
+}
+
 } // namespace
 
 constexpr int NATIVE_QUANTISED_SMALL_M_MAX_BATCH = 8;
@@ -8150,7 +8168,8 @@ bool rocmLaunch_native_quantised_small_m_fp32(
     int M, int N, int K,
     int device_id, void* stream,
     uint8_t arithmetic_policy_codebook_id,
-    const llaminar2::DeviceRowRange *row_range)
+    const llaminar2::DeviceRowRange *row_range,
+    const llaminar2::GPUHCDownOutputView* publication = nullptr)
 {
     const auto rows = row_range
         ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
@@ -8273,6 +8292,13 @@ bool rocmLaunch_native_quantised_small_m_fp32(
         }
     }
 
+    if (publication && (!hc_down_long_k || M != kHCDownTileRows ||
+        publication->columns != kHCDownColumns ||
+        publication->rows.captureIdentity() != rows.captureIdentity() ||
+        !publication->activated || !publication->primary || !publication->residual ||
+        !publication->primaryScales || !publication->residualScales))
+        return false;
+
     recordNativeQuantisedSmallMLaunch(
         M,
         N,
@@ -8363,7 +8389,12 @@ bool rocmLaunch_native_quantised_small_m_fp32(
             return false;
         }
 
-        if (kb > 1)
+        if (publication)
+        {
+            hipLaunchKernelGGL(groupedHCDownReducePublish, dim3(grid_n, tile_m), dim3(THREADS), 0,
+                static_cast<hipStream_t>(stream), d_partial_fp32, tile_c, *publication);
+        }
+        else if (kb > 1)
         {
             llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
         hipLaunchKernelGGL(
@@ -8973,6 +9004,23 @@ bool rocmLaunch_native_quantised_small_m_batched_mixed_fp32(
 
     return true;
 }
+
+namespace llaminar2::rocm {
+bool enqueueGroupedHCDownReducePublish(
+    const int8_t* activation, const uint8_t* weights, const uint16_t* weight_scales,
+    float* raw, const float* activation_scales, const int32_t* activation_sums,
+    float* partials, int device, void* stream, const GPUHCDownOutputView& publication)
+{
+    if (reinterpret_cast<std::uintptr_t>(stream) <= 2 || !activation || !weights ||
+        !weight_scales || !raw || !activation_scales || !activation_sums || !partials)
+        return false;
+    HipDeviceGuard::setDevice(device);
+    return rocmLaunch_native_quantised_small_m_fp32<NATIVE_QUANTISED_Q8_0>(
+        activation, weights, weight_scales, nullptr, nullptr, raw, activation_scales, activation_sums,
+        partials, kHCDownTileRows, kHCDownColumns, kHCDownReduction, device, stream,
+        static_cast<uint8_t>(NATIVE_QUANTISED_Q8_0), &publication.rows, &publication);
+}
+} // namespace llaminar2::rocm
 
 extern "C" {
 

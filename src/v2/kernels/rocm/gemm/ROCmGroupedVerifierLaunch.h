@@ -11,6 +11,7 @@
 #pragma once
 
 #include "kernels/common/DeviceRowRange.h"
+#include "kernels/common/HCDownOutputPublicationArgs.h"
 #include <cstdint>
 
 extern "C"
@@ -106,4 +107,21 @@ extern "C"
         int policy_kb,
         int policy_target_waves,
         const llaminar2::DeviceRowRange *row_range = nullptr);
+}
+
+namespace llaminar2::rocm
+{
+    /**
+     * @brief Record the exact counted M4 signed-Q8 HC contributor and publishing reducer.
+     * @param activation Existing grouped V4 Q8 input. @param weights Original native payload.
+     * @param weight_scales Original FP16 scale bits. @param raw Existing public raw bottleneck.
+     * @param activation_scales Existing V4 scales. @param activation_sums Existing V4 sums.
+     * @param partials Original ordered split-K bank. @param device Exact gfx906 participant.
+     * @param stream Original producer/consumer stream. @param publication Sealed up bank lease.
+     * @return True only after the two original-geometry nodes were enqueued.
+     */
+    bool enqueueGroupedHCDownReducePublish(const int8_t* activation, const uint8_t* weights,
+        const uint16_t* weight_scales, float* raw, const float* activation_scales,
+        const int32_t* activation_sums, float* partials, int device, void* stream,
+        const GPUHCDownOutputView& publication);
 }

@@ -1500,6 +1500,51 @@ namespace llaminar2
         bool ROCmQuantisedGemmKernel::multiply_hc_down_projection(const HCDownProjectionInput& input,
             TensorBase* output,int n,int k,DeviceWorkspaceManager* workspace,const HCDownOutputPublication* output_publication)
         {
+            if(output_publication&&output_publication->producerProgram()==HCDownProducerProgram::GroupedM4Ordered)
+            {
+                constexpr int rows=4, columns=320, width=10240, partitions=16;
+                const auto target=DeviceId::rocm(rocm_device_id_);
+                (void)ExplicitGPUStream(gpu_stream_);
+                if(input.publication||!workspace||workspace->device()!=target||!workspace->isAllocated()||
+                   !output||output->isMapped()||&input.normalized==output||n!=columns||k!=width||
+                   input.normalized.native_type()!=TensorType::FP32||output->native_type()!=TensorType::FP32||
+                   input.normalized.numel()<rows*width||output->numel()<rows*columns)
+                    throw std::invalid_argument("Grouped HC-down reducer requires the original counted M4 storage");
+                DeviceNativeQuantisedMatrixDesc weights;
+                if(!inspectPreparedNativeQuantisedMatrixDesc(weights)||weights.codebook_id!=19||
+                   !weights.source_identity_present||weights.source_codebook_id!=19||weights.source_is_superblock)
+                    throw std::logic_error("Grouped HC-down reducer lost the original signed-Q8 source");
+                (void)requireQ8ResidualNativeMatrix(weights,rows,n,k);
+                const auto publication=output_publication->deviceView(output,workspace,gpu_stream_);
+                const auto requireBank=[&](const auto& name,std::size_t bytes) {
+                    void* data=workspace->getBuffer(name);
+                    if(!data||workspace->getBufferSize(name)<bytes)
+                        throw std::logic_error("Grouped HC-down reducer lost the exact original scratch extent");
+                    return data;
+                };
+                auto* codes=static_cast<int8_t*>(requireBank(GemmWorkspaceBuffers::QUANT_A,rows*width));
+                auto* scales=static_cast<float*>(requireBank(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE,
+                    rows*(width/32)*sizeof(float)));
+                auto* sums=static_cast<int32_t*>(requireBank(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,
+                    rows*(width/32)*sizeof(int32_t)));
+                auto* partials=static_cast<float*>(requireBank(scatterPartialBufferName(),
+                    partitions*rows*columns*sizeof(float)));
+                TransferEngine::requireDeviceInput(const_cast<TensorBase*>(&input.normalized),target,gpu_stream_);
+                TransferEngine::requireDeviceOutput(output,target,gpu_stream_);
+                auto mode=beginVerifierDecodeEquivalentScope(publication.rows);
+                if(!rocmQuantGemm_quantizeActivationsBlockwiseWithSums_rows(
+                    static_cast<const float*>(input.normalized.gpu_data_ptr()),codes,scales,sums,
+                    rows,width,rocm_device_id_,gpu_stream_,32,&publication.rows)||
+                   !rocm::enqueueGroupedHCDownReducePublish(codes,weights.payload,
+                    static_cast<const uint16_t*>(weights.scales),static_cast<float*>(output->gpu_data_ptr()),
+                    scales,sums,partials,rocm_device_id_,gpu_stream_,publication))
+                    return false;
+                PerfStatsCollector::addCounter("gemm","qfn_grouped_hc_down_reduce_publish_nodes",1.0,
+                    "gemm","rocm:"+std::to_string(rocm_device_id_));
+                output_publication->recordPublished();
+                publishROCmTensorWrite(*output,rocm_device_id_,gpu_stream_);
+                return true;
+            }
             const auto target=DeviceId::rocm(rocm_device_id_);
             (void)ExplicitGPUStream(gpu_stream_);
             if(!workspace||workspace->device()!=target||!workspace->isAllocated()||!output||output->isMapped()||

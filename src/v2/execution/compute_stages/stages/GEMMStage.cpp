@@ -334,15 +334,22 @@ namespace llaminar2
         }
         if(params_.hc_down_output) {
             const auto& out=*params_.hc_down_output;
-            if(!out.publication||out.publication->raw()!=params_.C||!params_.device_id.is_rocm()||params_.m!=1||
+            const bool grouped=out.publication&&
+                out.publication->producerProgram()==HCDownProducerProgram::GroupedM4Ordered;
+            const bool exactRows=grouped
+                ? params_.m==4&&params_.n==320&&params_.k==10240&&params_.verifier_row_range&&
+                  params_.force_decode_equivalent_verifier_prefill&&!params_.hc_branch_norm_input&&
+                  params_.verifier_row_range->captureIdentity()==out.publication->rows().captureIdentity()
+                : params_.m==1&&!params_.verifier_row_range&&!params_.force_decode_equivalent_verifier_prefill;
+            if(!out.publication||out.publication->raw()!=params_.C||!params_.device_id.is_rocm()||!exactRows||
                params_.quantized_operand_precision!=QuantizedActivationOperandPrecision::SingleQ8||
                params_.hc_residual_down||params_.hc_short_k_read||params_.gated_norm||params_.alpha!=1.f||params_.beta!=0.f||
-               params_.bias||params_.bias_tensor||params_.gate_input||params_.do_swiglu||params_.transpose_B||params_.verifier_row_range||params_.projection_row_work||
-               !params_.output_range.empty()||params_.request_rows||params_.force_decode_equivalent_verifier_prefill||
+               params_.bias||params_.bias_tensor||params_.gate_input||params_.do_swiglu||params_.transpose_B||params_.projection_row_work||
+               !params_.output_range.empty()||params_.request_rows||
                params_.n<64||params_.n>512||params_.n%32||params_.k%32||!params_.prepared_ref||!params_.prepared_store||
                !params_.a_buffer_id||!params_.c_buffer_id||out.activated_buffer==*params_.a_buffer_id||
                out.publication->activated()==params_.A)
-                throw std::invalid_argument("HC reducer epilogue requires original ROCm native SingleQ8 M1 output roles");
+                throw std::invalid_argument("HC reducer epilogue requires original ROCm native SingleQ8 reducer roles");
         }
         if(params_.hc_prepublished_down&&(!params_.hc_residual_down||params_.hc_down_output||
            params_.hc_prepublished_down->raw()!=params_.A||params_.hc_prepublished_down->activated()!=params_.hc_residual_down->activated))

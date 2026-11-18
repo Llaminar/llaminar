@@ -1031,6 +1031,13 @@ if(HAVE_CUDA OR HAVE_ROCM)
             ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0;LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K=1"
             MPI_PROCS 1 NO_MODELS TIMEOUT 60)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedHCUpShortK)
+        add_v2_test(V2_Integration_ROCmGroupedHCDownReducePublish
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=Q8ResidualCorrectionDevice.ROCmGroupedHCDownReducePublishReplay
+            LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;MTP;Capture;ByteExact;Replay;Regression"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0;LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_LONG_K=1;LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K=1;LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH=1"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK rocm_gpu_0)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmGroupedHCDownReducePublish)
         add_v2_test(V2_Integration_ROCmRetainedPreAttentionGDN
             COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                 --gtest_filter=Q8ResidualCorrectionDevice.ROCmRetainedPreAttentionGDN

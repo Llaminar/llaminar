@@ -10,7 +10,7 @@
 #include "DeviceRowRange.h"
 namespace llaminar2 {
 /** @brief Explicit original HC-down producer program; only its named publication purpose may opt in. */
-enum class HCDownProducerProgram : unsigned char { Original, TwoK32Lookahead };
+enum class HCDownProducerProgram : unsigned char { Original, TwoK32Lookahead, GroupedM4Ordered };
 /** @brief Immutable device bindings for one original HC bottleneck publication. */
 struct GPUHCDownOutputView final {
  DeviceRowRange rows; ///< Original publisher authority, independent of projection work.

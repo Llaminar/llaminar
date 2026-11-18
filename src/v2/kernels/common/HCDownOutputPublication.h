@@ -30,7 +30,7 @@ class HCDownOutputPublication final {
   std::array<const void*,2> pointers;std::array<std::size_t,2> bytes;
   std::array<std::vector<std::size_t>,2> shapes;
   std::array<std::shared_ptr<const CapturedDeviceStorageLease>,2> tensors;
-  std::array<Region,6> banks;
+  std::vector<Region> banks;
   std::optional<rocm::NativeQ8SerialGeometryAdmission> producer{}; ///< Cold exact symbol/resources; no GPU state mirror.
  };
  DeviceId device_;TensorBase* raw_;TensorBase* activated_;int columns_;DeviceRowRange rows_;
@@ -48,11 +48,16 @@ public:
   HCDownProducerProgram producer_program=HCDownProducerProgram::Original)
   :device_(device),raw_(&raw),activated_(&activated),columns_(columns),rows_(rows),producer_program_(producer_program) {
   const auto r=rows.captureIdentity();
-  if((producer_program!=HCDownProducerProgram::Original&&producer_program!=HCDownProducerProgram::TwoK32Lookahead)||
-     !device.is_rocm()||columns<64||columns>512||columns%32||r.physical_rows!=1||r.count_capacity!=1||
-     r.first_physical_row||r.repeats_per_row!=1||raw.native_type()!=TensorType::FP32||activated.native_type()!=TensorType::FP32||
-     raw.numel()<std::size_t(columns)||activated.numel()<std::size_t(columns))
-   throw std::invalid_argument("HC reducer publication requires original ROCm M1 complete32-column FP32 roles");
+  const bool grouped=producer_program==HCDownProducerProgram::GroupedM4Ordered;
+  const bool serial=producer_program==HCDownProducerProgram::Original||
+      producer_program==HCDownProducerProgram::TwoK32Lookahead;
+  const auto values=std::size_t(columns)*r.physical_rows;
+  if(!device.is_rocm()||columns<64||columns>512||columns%32||(!serial&&!grouped)||
+     (grouped ? (columns!=320||r.physical_rows!=4||r.count_capacity!=4||!r.count)
+              : (r.physical_rows!=1||r.count_capacity!=1))||
+     r.first_physical_row||r.repeats_per_row!=1||raw.native_type()!=TensorType::FP32||
+     activated.native_type()!=TensorType::FP32||raw.numel()<values||activated.numel()<values)
+   throw std::invalid_argument("HC reducer publication requires original ROCm complete32-column FP32 roles");
  }
  /** @brief Retain already admitted original tensors/banks once, outside capture.
   * @param workspace Existing original up workspace owner. @param stream Exact producer/consumer stream.
@@ -71,15 +76,27 @@ public:
    result.pointers[i]=t->gpu_data_ptr();result.bytes[i]=t->size_bytes();result.shapes[i]=t->shape();
    result.tensors[i]=TransferEngine{}.retainCapturedDeviceStorage(*t,device_,t->size_bytes());
   }
-  const std::array<const char*,6> names{kGPUProjectionPrimaryQ8.c_str(),kGPUProjectionResidualQ8.c_str(),
-    kGPUProjectionPrimaryQ8Scales.c_str(),kGPUProjectionResidualQ8Scales.c_str(),
-    GemmWorkspaceBuffers::SCALES_A,GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL};
-  for(std::size_t i=0;i<6;++i) {
-   const auto bytes=workspace.getBufferSize(names[i]);auto* pointer=workspace.getBuffer(names[i]);
-   const auto needed=i<2?std::size_t(columns_):i<4?std::size_t(columns_/32)*sizeof(float):
-     i==4?sizeof(float):std::size_t(columns_)*sizeof(float);
-   if(!pointer||bytes<needed)throw std::logic_error("HC reducer publication has incomplete original up banks");
-   result.banks[i]={names[i],pointer,bytes,workspace.retainBuffer(names[i],0,bytes)};
+  const auto values=std::size_t(columns_)*rows_.physicalRows();
+  const bool grouped=producer_program_==HCDownProducerProgram::GroupedM4Ordered;
+  const auto groupedInputValues=std::size_t{10240}*rows_.physicalRows();
+  struct BankRequirement { const char* name; std::size_t bytes; };
+  // The ordered contributor consumes these primary bytes/scales before
+  // the reducer reuses their prefix for HC-up. Retain one lease per name
+  // with the maximum of the two legitimate phase extents.
+  const auto primaryValues=grouped?groupedInputValues:values;
+  const std::array requirements{
+   BankRequirement{kGPUProjectionPrimaryQ8.c_str(),primaryValues},
+   BankRequirement{kGPUProjectionResidualQ8.c_str(),values},
+   BankRequirement{kGPUProjectionPrimaryQ8Scales.c_str(),primaryValues/32*sizeof(float)},
+   BankRequirement{kGPUProjectionResidualQ8Scales.c_str(),values/32*sizeof(float)},
+   BankRequirement{GemmWorkspaceBuffers::SCALES_A,grouped?0:sizeof(float)},
+   BankRequirement{GemmWorkspaceBuffers::ROCM_SCATTER_PARTIAL,values*sizeof(float)*(grouped?16:1)},
+   BankRequirement{GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,grouped?groupedInputValues/32*sizeof(std::int32_t):0}};
+  for(const auto& required:requirements) {
+   if(!required.bytes)continue;
+   const auto bytes=workspace.getBufferSize(required.name);auto* pointer=workspace.getBuffer(required.name);
+   if(!pointer||bytes<required.bytes)throw std::logic_error("HC reducer publication has incomplete original scratch");
+   result.banks.push_back({required.name,pointer,bytes,workspace.retainBuffer(required.name,0,bytes)});
   }
   const auto overlap=[](const void* a,std::size_t an,const void* b,std::size_t bn) {
    const auto x=reinterpret_cast<std::uintptr_t>(a),y=reinterpret_cast<std::uintptr_t>(b);
@@ -87,9 +104,9 @@ public:
     throw std::invalid_argument("HC reducer publication interval overflows");
    return x<y+bn&&y<x+an;
   };
-  if(result.pointers[0]!=result.pointers[1]&&overlap(result.pointers[0],columns_*sizeof(float),result.pointers[1],columns_*sizeof(float)))
+  if(result.pointers[0]!=result.pointers[1]&&overlap(result.pointers[0],values*sizeof(float),result.pointers[1],values*sizeof(float)))
    throw std::invalid_argument("HC raw/activated roles only allow exact alias or disjoint storage");
-  for(std::size_t i=0;i<6;++i) {
+  for(std::size_t i=0;i<result.banks.size();++i) {
    for(std::size_t t=0;t<2;++t)if(overlap(result.banks[i].pointer,result.banks[i].bytes,result.pointers[t],result.bytes[t]))
     throw std::invalid_argument("HC reducer Q8 bank aliases original public output");
    for(std::size_t j=0;j<i;++j)if(overlap(result.banks[i].pointer,result.banks[i].bytes,result.banks[j].pointer,result.banks[j].bytes))
@@ -152,7 +169,7 @@ public:
   * @throws std::logic_error If an explicitly selected lookahead program was not prepared.
   */
  const rocm::NativeQ8SerialGeometryAdmission* preparedProducer() const {
-  if(producer_program_==HCDownProducerProgram::Original)return nullptr;
+  if(producer_program_!=HCDownProducerProgram::TwoK32Lookahead)return nullptr;
   if(!seal_||!seal_->producer)throw std::logic_error("HC lookahead producer requires original cold preparation");
   return &*seal_->producer;
  }

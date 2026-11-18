@@ -28,6 +28,8 @@
 #include <unordered_set>
 #ifdef HAVE_ROCM
 #include "kernels/rocm/gemm/ROCmPersistentHCRead.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "utils/DebugEnv.h"
 #include "kernels/rocm/gemm/ROCmFullNativeHCFFN.h"
 #include "kernels/rocm/gemm/ROCmCTAOwnedHCRead.h"
 #include "transfer/TransferEngine.h"
@@ -239,6 +241,31 @@ std::vector<PendingNode> readNodes(const Qwen4ExpHyperconnectionContext &c,
     require(c.downProducerProgram==HCDownProducerProgram::Original||
         (c.downProducerProgram==HCDownProducerProgram::TwoK32Lookahead&&downPublish),
         "HC down lookahead requires its explicitly selected reducer-publication purpose");
+    bool groupedDownPublish=false;
+#ifdef HAVE_ROCM
+    if(!downPublish && !shortRead && !normPublication && c.device.is_rocm() &&
+       c.rows.capacity==4 && c.hidden==2560 && c.lowRank==320 && c.projectionRows && c.projectionRows->countOwner() &&
+       c.projectionRows->captureIdentity().count_capacity==4 &&
+       c.projectionRows->captureIdentity().first_physical_row==0 &&
+       c.projectionRows->captureIdentity().repeats_per_row==1 &&
+       c.arithmetic==Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier &&
+       up_arithmetic==Qwen4ExpHCUpArithmetic::QuantizedTwoTermQ8 &&
+       qfnGroupedHCDownReducePublishExperiment() && qfnGroupedHCDownLongKExperiment() &&
+       qfnGroupedHCUpShortKExperiment())
+    {
+        const auto originalQ8 = [&](const Qwen4ExpPreparedProjection& weight) {
+            DeviceNativeQuantisedMatrixDesc source;
+            const auto* engine=weight.store().gemmKernel(weight.ref());
+            return engine && engine->inspectPreparedNativeQuantisedMatrixDesc(source) &&
+                source.codebook_id==19 && source.source_identity_present &&
+                source.source_codebook_id==19 && !source.source_is_superblock;
+        };
+        const auto& hw=rocmHardwareMetadata().at(c.device.ordinal);
+        groupedDownPublish=hw.isa_target.starts_with("gfx906") && hw.compute_units==60 &&
+            hw.native_wave_width==64 && hw.maximum_threads_per_block>=640 &&
+            originalQ8(w.down) && originalQ8(w.up);
+    }
+#endif
     std::shared_ptr<HCDownOutputPublication> downPublication;
     if(downPublish) {
         DeviceNativeQuantisedMatrixDesc source;
@@ -252,6 +279,9 @@ std::vector<PendingNode> readNodes(const Qwen4ExpHyperconnectionContext &c,
         const auto rows=c.upProjectionRows.value_or(DeviceRowRange::fullyActive(1));
         downPublication=std::make_shared<HCDownOutputPublication>(c.device,*b.down.tensor,*b.activatedDown.tensor,c.lowRank,rows,c.downProducerProgram);
     }
+    if(groupedDownPublish)
+        downPublication=std::make_shared<HCDownOutputPublication>(c.device,*b.down.tensor,
+            *b.activatedDown.tensor,c.lowRank,*c.projectionRows,HCDownProducerProgram::GroupedM4Ordered);
     const std::array views{b.trunk,b.normalized,b.down,b.activatedDown,b.readLogits,b.mixed};
     for(std::size_t i=0;i<views.size();++i)
         for(std::size_t j=i+1;j<views.size();++j)
