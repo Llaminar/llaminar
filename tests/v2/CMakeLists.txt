@@ -5388,13 +5388,16 @@ target_link_libraries(v2_mpi_singleton_session_probe PRIVATE llaminar2_core)
 set_target_properties(v2_mpi_singleton_session_probe PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
-foreach(V2_MPI_REPLAY_CASE IN ITEMS launcher mpi native_options stubborn ctest_timeout singleton identity)
+# Include a relocated singleton with an exact-sibling negative control; a
+# successful launch proxy alone cannot authenticate entry to its MPI rank.
+foreach(V2_MPI_REPLAY_CASE IN ITEMS launcher mpi native_options stubborn ctest_timeout singleton staged_singleton identity)
     add_v2_test(V2_Integration_MPISessionRetirement_${V2_MPI_REPLAY_CASE}
         COMMAND ${Python3_EXECUTABLE}
             ${CMAKE_CURRENT_SOURCE_DIR}/integration/scripts/test_mpi_session_lifecycle.py
             --helper $<TARGET_FILE:llaminar_mpi_session>
             --probe $<TARGET_FILE:v2_mpi_session_probe>
             --singleton $<TARGET_FILE:v2_mpi_singleton_session_probe>
+            --module $<TARGET_FILE:llaminar_mpi_schizo>
             --mpirun ${MPIEXEC_EXECUTABLE}
             --case ${V2_MPI_REPLAY_CASE}
         LABELS "V2;Integration;ProductionTestPreflight;CPU;DeviceFree;MPI;Lifecycle;Regression"
@@ -16135,6 +16138,25 @@ add_v2_test(V2_Unit_PrefixCachePrefillFlow
     LABELS "V2;Unit;PrefixCache;OrchestrationRunner;Prefill"
     MPI_PROCS 1
 )
+# Injected post-open prefix failure regressions (slot handoff retirement).
+add_v2_test(V2_Integration_PrefixPostOpenFailureRetiresSlotHandoff
+    COMMAND $<TARGET_FILE:v2_test_prefix_cache_prefill_flow>
+        --gtest_filter=Test__PrefixCachePrefillFlow.TerminalRestoreFailureAfterOpenRetiresSlotHandoff:Test__PrefixCachePrefillFlow.HarvestFailureAfterOpenRetiresSlotHandoff
+    LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;ServingSlotHandoff;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PrefixPostOpenFailureRetiresSlotHandoff)
+
+# Fatal corruption death regressions: payload in a retired bank is a fatal
+# precondition (std::abort) for all five production entrypoints.
+add_v2_test(V2_Integration_ServingSlotHandoffDeathRegressions
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__ServingSlotHandoffDeathRegressions.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ServingSlotHandoff;DeathRegression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingSlotHandoffDeathRegressions)
+
 add_v2_test(V2_Integration_PrefixMetadataOnlyRestoreSummary
     COMMAND $<TARGET_FILE:v2_test_prefix_cache_prefill_flow>
         --gtest_filter=Test__PrefixCachePrefillFlow.MetadataOnlyLookupReportsRestoredMTPSections
@@ -25451,6 +25473,15 @@ target_link_libraries(v2_unit_prefill_decode_transition
     GTest::gmock
     GTest::gtest_main
 )
+# Recorded serving-slot handoff baseline. Captured at the reference production
+# source identity (content-blob hashes recorded inside the fixture header,
+# written only by the explicit capture invocation) through the device-free
+# boundary; replay validates the metadata structurally, compares behavior,
+# and never requires an identical commit. Regeneration is the explicit capture
+# switch only, never an automatic reaction to a failing comparison.
+target_compile_definitions(v2_unit_prefill_decode_transition PRIVATE
+    LLAMINAR_CB_HANDOFF_GOLDEN="${CMAKE_CURRENT_LIST_DIR}/../../tests/v2/fixtures/serving_slot_handoff/pin28dd_replay_baseline.txt"
+)
 add_v2_test(V2_Unit_PrefillDecodeTransition
     COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
     LABELS "V2;Unit;Orchestration;OrchestrationRunner;Regression;PrefillDecode"
@@ -25482,6 +25513,35 @@ add_v2_test(V2_Integration_MTPDirectTokenHistoryContracts
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MTPDirectTokenHistoryContracts)
+
+# Serving-slot handoff: recorded-input replay of the production controller
+# through the device-free boundary (reference identity recorded separately in
+# the fixture) plus the capacity-one lifecycle contracts. Registered beside the
+# prefill→decode family because they share its executable and mock harness.
+add_v2_test(V2_Integration_ServingSlotHandoffRecordedReplay
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__ServingSlotHandoffReplay.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ServingSlotHandoff;Replay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingSlotHandoffRecordedReplay)
+
+# The hardened lifecycle/defect regressions are explicit ProductionTestPreflight
+# members, not Unit-only cells, per the review-correction register.
+add_v2_test(V2_Integration_ServingSlotHandoffLifecycleContracts
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__ServingSlotHandoffLifecycle.*
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ServingSlotHandoff;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ServingSlotHandoffLifecycleContracts)
+
+add_v2_test(V2_Unit_ServingSlotHandoffLifecycle
+    COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
+        --gtest_filter=Test__ServingSlotHandoffLifecycle.*
+    LABELS "V2;Unit;Orchestration;OrchestrationRunner;ServingSlotHandoff;Lifecycle;DeviceFree;CPU;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 
 add_v2_test(V2_Integration_MTPBoundedSamplingPositionEvidence
     COMMAND $<TARGET_FILE:v2_unit_prefill_decode_transition>
