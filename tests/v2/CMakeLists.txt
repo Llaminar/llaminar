@@ -7555,53 +7555,54 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 MPI_PROCS 1 NO_MODELS TIMEOUT 180)
         endif()
     endforeach()
+    # All seven channel replay families bind their two endpoints through the
+    # same original NUMA-local rank selector. Preserve that topology for both
+    # homogeneous and mixed pairs, independently of the MPI launcher width.
+    function(v2_original_channel_pair_labels pair output)
+        string(REPLACE "_" ";" _backends "${pair}")
+        list(REMOVE_DUPLICATES _backends)
+        set(_labels ${_backends} HardwareOptional Devices2)
+        if("CUDA" IN_LIST _backends AND "ROCm" IN_LIST _backends)
+            list(APPEND _labels CUDADevices1 ROCmDevices1)
+        endif()
+        set(${output} "${_labels}" PARENT_SCOPE)
+    endfunction()
     foreach(_channel_pair CUDA_CUDA ROCm_ROCm CUDA_ROCm ROCm_CUDA)
         if((_channel_pair STREQUAL "CUDA_CUDA" AND HAVE_CUDA) OR
            (_channel_pair STREQUAL "ROCm_ROCm" AND HAVE_ROCM) OR
            (HAVE_CUDA AND HAVE_ROCM))
-            # Gate scheduling consumes exact backend capability labels. A
-            # combined spelling alone would misclassify this as host-only.
-            string(REPLACE "_" ";" _channel_backends "${_channel_pair}")
-            list(REMOVE_DUPLICATES _channel_backends)
-            set(_channel_mpi_procs 2)
-            # Each replay resolves a pair of physical endpoints owned by one
-            # original rank. Two MPI ranks can never stand in for two cards.
-            set(_channel_geometry "HardwareOptional;Devices2")
-            if(_channel_pair STREQUAL "CUDA_ROCm" OR _channel_pair STREQUAL "ROCm_CUDA")
-                # Both native families must belong to one actual NUMA owner.
-                set(_channel_geometry "HardwareOptional;Devices2;CUDADevices1;ROCmDevices1")
-            endif()
+            v2_original_channel_pair_labels("${_channel_pair}" _channel_labels)
             add_v2_test(V2_Integration_CapturedTransferChannel_${_channel_pair}
                 COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                     --gtest_filter=CapturedTransferChannelDevices.${_channel_pair}_RetainedRoundTrip
-                LABELS "V2;Integration;ProductionTestPreflight;Transfer;GraphCapture;GPU;${_channel_backends};${_channel_geometry};Regression"
+                LABELS "V2;Integration;ProductionTestPreflight;Transfer;GraphCapture;GPU;${_channel_labels};Regression"
                 TIMEOUT 120
-                MPI_PROCS ${_channel_mpi_procs}
+                MPI_PROCS 2
                 NO_MODELS
             )
             add_v2_test(V2_Integration_CapturedWorkspaceTransfer_${_channel_pair}
                 COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                     --gtest_filter=CapturedTransferChannelDevices.${_channel_pair}_RetainedWorkspaceRoundTrip
-                LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;GraphCapture;GPU;${_channel_backends};${_channel_geometry};Regression"
+                LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;GraphCapture;GPU;${_channel_labels};Regression"
                 TIMEOUT 120
-                MPI_PROCS ${_channel_mpi_procs}
+                MPI_PROCS 2
                 NO_MODELS
             )
             add_v2_test(V2_Integration_DeviceCountedTransferChannel_${_channel_pair}
                 COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                     --gtest_filter=DeviceCountedTransferChannel.${_channel_pair}
-                LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;GraphCapture;GPU;${_channel_backends};${_channel_geometry};Regression"
-                TIMEOUT 120 MPI_PROCS ${_channel_mpi_procs} NO_MODELS)
+                LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;GraphCapture;GPU;${_channel_labels};Regression"
+                TIMEOUT 120 MPI_PROCS 2 NO_MODELS)
             add_v2_test(V2_Integration_SourceSlicedTransferChannel_${_channel_pair}
                 COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                     --gtest_filter=DeviceCountedTransferChannel.${_channel_pair}_SourceSlices
-                LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;GraphCapture;GPU;${_channel_backends};Replay;${_channel_geometry};Regression"
-                TIMEOUT 120 MPI_PROCS ${_channel_mpi_procs} NO_MODELS)
+                LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;GraphCapture;GPU;Replay;${_channel_labels};Regression"
+                TIMEOUT 120 MPI_PROCS 2 NO_MODELS)
             add_v2_test(V2_Integration_FusedTransferChannel_${_channel_pair}
                 COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                     --gtest_filter=DeviceCountedTransferChannel.${_channel_pair}_FusedBoundaries
-                LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;GraphCapture;GPU;${_channel_backends};${_channel_geometry};Regression"
-                TIMEOUT 120 MPI_PROCS ${_channel_mpi_procs} NO_MODELS)
+                LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;GraphCapture;GPU;${_channel_labels};Regression"
+                TIMEOUT 120 MPI_PROCS 2 NO_MODELS)
         endif()
     endforeach()
 endif()
@@ -35931,18 +35932,12 @@ if(NOT V2_PERF_TESTS_ONLY)
             if((_batch_pair STREQUAL "CUDA_CUDA" AND HAVE_CUDA) OR
                (_batch_pair STREQUAL "ROCm_ROCm" AND HAVE_ROCM) OR
                (HAVE_CUDA AND HAVE_ROCM))
-                string(REPLACE "_" ";" _batch_backends "${_batch_pair}")
-                list(REMOVE_DUPLICATES _batch_backends)
-                set(_original_batch_mpi_procs 2)
-                set(_original_batch_geometry "")
-                if(_batch_pair STREQUAL "CUDA_ROCm" OR _batch_pair STREQUAL "ROCm_CUDA")
-                    set(_original_batch_geometry "HardwareOptional;Devices2;CUDADevices1;ROCmDevices1")
-                endif()
+                v2_original_channel_pair_labels("${_batch_pair}" _channel_labels)
                 add_v2_test(V2_Integration_CapturedEndpointBatch_${_batch_pair}
                     COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                         --gtest_filter=DeviceCountedTransferChannel.${_batch_pair}_BatchedEndpoints
-                    LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;GraphCapture;GPU;${_batch_backends};${_original_batch_geometry};Regression"
-                    MPI_PROCS ${_original_batch_mpi_procs} NO_MODELS TIMEOUT 120)
+                    LABELS "V2;Integration;ProductionTestPreflight;Transfer;Memory;GraphCapture;GPU;${_channel_labels};Regression"
+                    MPI_PROCS 2 NO_MODELS TIMEOUT 120)
                 if(TEST V2_Integration_CapturedEndpointBatch_${_batch_pair})
                     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedEndpointBatch_${_batch_pair})
                 endif()
@@ -36214,18 +36209,12 @@ if(NOT V2_PERF_TESTS_ONLY)
         foreach(_batch77_pair CUDA_CUDA ROCm_ROCm CUDA_ROCm ROCm_CUDA)
             if((_batch77_pair STREQUAL "CUDA_CUDA" AND HAVE_CUDA) OR
                (_batch77_pair STREQUAL "ROCm_ROCm" AND HAVE_ROCM) OR (HAVE_CUDA AND HAVE_ROCM))
-                string(REPLACE "_" ";" _batch77_labels "${_batch77_pair}")
-                list(REMOVE_DUPLICATES _batch77_labels)
-                set(_original_batch_mpi_procs 2)
-                set(_original_batch_geometry "")
-                if(_batch77_pair STREQUAL "CUDA_ROCm" OR _batch77_pair STREQUAL "ROCm_CUDA")
-                    set(_original_batch_geometry "HardwareOptional;Devices2;CUDADevices1;ROCmDevices1")
-                endif()
+                v2_original_channel_pair_labels("${_batch77_pair}" _channel_labels)
                 add_v2_test(V2_Integration_CapturedBatch16KiBBoundaries_${_batch77_pair}
                     COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                         --gtest_filter=DeviceCountedTransferChannel.${_batch77_pair}_Batch16KiBBoundaries
-                    LABELS "V2;Integration;ProductionTestPreflight;GPU;${_batch77_labels};Transfer;Memory;GraphCapture;${_original_batch_geometry};Regression"
-                    MPI_PROCS ${_original_batch_mpi_procs} NO_MODELS TIMEOUT 120)
+                    LABELS "V2;Integration;ProductionTestPreflight;GPU;Transfer;Memory;GraphCapture;${_channel_labels};Regression"
+                    MPI_PROCS 2 NO_MODELS TIMEOUT 120)
                 if(TEST V2_Integration_CapturedBatch16KiBBoundaries_${_batch77_pair})
                     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CapturedBatch16KiBBoundaries_${_batch77_pair})
                 endif()
