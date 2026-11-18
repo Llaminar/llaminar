@@ -71,7 +71,11 @@ def main():
     parser.add_argument("--pci", required=True, help="Domain:bus:device.function of the sole exposed MI50")
     parser.add_argument("--build", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
-    parser.add_argument("--routes", type=Path, help="Required for packet, three ordered 40-ID route histories")
+    parser.add_argument("--routes", type=Path, help="Ordered 40-ID histories required for packet")
+    parser.add_argument("--packet-shape", nargs=5, type=int,
+                        metavar=("TUPLE", "F", "S", "ROUTED_PARTS", "SHARED_PARTS"),
+                        help="Score one tuple (0=Q4_K/Q5_1, 1=Q4_K/Q8_0, 2=Q5_K/Q8_0, 3=G15) "
+                             "with its exact row extents and source gate partition counts")
     parser.add_argument("--issue-grid", type=int, help="Explicit calibrated workgroup count")
     parser.add_argument("--issue-block", type=int, choices=(256,1024), help="Explicit calibrated threads per workgroup")
     parser.add_argument("--kernel", help="Exact demangled kernel regex for a single profiled dispatch")
@@ -87,6 +91,14 @@ def main():
         parser.error("Exactly the packet probe requires the original route IDs")
 
     name, tag, checks_per_round = PROBES[args.probe]
+    if args.packet_shape is not None:
+        if args.probe != "packet":
+            parser.error("Explicit packet geometry requires the packet probe")
+        family, f, s, routed_parts, shared_parts = args.packet_shape
+        if (family not in range(4) or f not in range(32, 641, 32) or s not in range(32, 641, 32)
+                or not 1 <= routed_parts <= 80 or not 1 <= shared_parts <= 80):
+            parser.error("Invalid tuple, K32-aligned extents or source gate partitions")
+        checks_per_round = 4
     exact_issue = args.issue_grid is not None or args.issue_block is not None
     if exact_issue:
         if args.probe != "issue" or args.issue_grid is None or args.issue_grid <= 0 or args.issue_block is None:
@@ -108,6 +120,8 @@ def main():
                   "--kernel-iteration-range", f"[{args.iteration}-{args.iteration}]",
                   "--output-format", "json", "--output-directory", str(output), "--"]
     probe_operands = ([str(routes)] if routes else [])
+    if args.packet_shape is not None:
+        probe_operands.extend(map(str, args.packet_shape))
     if exact_issue:
         probe_operands = [str(args.issue_grid), str(args.issue_block)]
     argv = [[*prefix, str(binary), str(round_index), args.pci, *probe_operands]

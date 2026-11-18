@@ -35,17 +35,31 @@ Once warmed, the 2 MiB working set is read 64 times per dispatch at 128 workgrou
 
 ## QFN routed read pattern
 
-Supply a whitespace-separated route file with three groups of 40 original routed expert IDs. Group order is Q4_K/Q5_1, Q4_K/Q8_0, Q5_K/Q8_0. In each group the 40 IDs hold the four captured rows in original selected-slot order, with all ten routes local to the original participant. Use IDs observed on the actual fixed shape, rather than generated uniform indices. The file may be recorded with its source model revision, participant, original bank/epoch, graph settings and live route census outside this repository. The packet diagnostic rejects missing, extra and out-of-range IDs and repeated IDs in one row. It rotates four physically distinct device allocations and checks bank-tagged lane checksums. The kernel uses the original role payload and coefficient spacings. It omits shared weights and arithmetic.
+Supply one whitespace-separated history of 40 expert IDs observed on the original M4 graph. Preserve row and selected-slot order, including repeated experts across different rows. Each row must contain ten distinct local expert IDs. Record the source model, participant, native shard extents, bank history and graph settings with the route file.
+
+Pass the tuple number, routed and shared intermediate widths, and both gate K partition counts as `--packet-shape TUPLE F S ROUTED_PARTS SHARED_PARTS`. For the original H2560 source policies the gate reductions use 16 partitions. The native K32 blocks use these independent layouts.
+
+| Tuple | Routed gate/up | Routed down | Shared gate/up | Shared down |
+| --- | --- | --- | --- | --- |
+| 0 | Q4_K (16 + 2 + 2 B) | Q5_1 (20 + 2 + 2 B) | Q8_0 (32 + 2 B) | Q8_0 |
+| 1 | Q4_K (16 + 2 + 2 B) | Q8_0 (32 + 2 B) | Q8_0 | Q8_0 |
+| 2 | Q5_K (20 + 2 + 2 B) | Q8_0 (32 + 2 B) | Q8_0 | Q8_0 |
+| 3 | IQ3_XXS (12 + 2 B) | Q6_K (24 + 2 + 2 B) | IQ2_S (9 + 2 + 2 B) | Q8_0 |
+
+The two-byte planes hold scale and, where present, an affine minimum or second coefficient. This probe keeps the parent direct reader's 128-thread gate tile, per-wave K stripes, grid-stride routed and shared tiles, and down CTA's original slot and full-column traversal. The four routed banks occupy disjoint ranges. Shared matrices are reused across rows and banks. Every payload byte and coefficient varies with its address. The host reconstructs the expected checksum for every lane on all four banks using logical matrix coordinates.
+
+This is a weight-only traffic reference. Production descriptor indirection, address placement across independent allocation owners, activation loads, codebook LUT fetches, publication stores, dequantization arithmetic and reductions have separate cost. For odd-byte packets the calibration reads the complete physical payload and coefficients. It does not reproduce the decoder's exact instruction stream. Warm one-bank and rotating four-bank results describe the stated route working set. Neither mode guarantees cache residency or a cache flush.
 
 ```bash
-python capture.py packet --pci "$PCI" --build "$BUILD" --output "$RESULTS/packet-quiet" \
-  --routes "$ROUTES"
-python capture.py packet --pci "$PCI" --build "$BUILD" --output "$RESULTS/packet-gate-fetch" \
-  --routes "$ROUTES" --kernel 'packetRead<4, true, true>' --iteration 257 --metric fetch
-python capture.py packet --pci "$PCI" --build "$BUILD" --output "$RESULTS/packet-down-fetch" \
-  --routes "$ROUTES" --kernel 'packetRead<5, true, false>' --iteration 257 --metric fetch
+# QFN layer 1, original F256/S160 participant
+ARGS=(packet --pci "$PCI" --build "$BUILD" --routes "$ROUTES" --packet-shape 0 256 160 16 16)
+python capture.py "${ARGS[@]}" --output "$RESULTS/packet-quiet"
+python capture.py "${ARGS[@]}" --output "$RESULTS/packet-gate-fetch" \
+  --kernel 'packetRead<16, true, true, 32, false>' --iteration 257 --metric fetch
+python capture.py "${ARGS[@]}" --output "$RESULTS/packet-down-fetch" \
+  --kernel 'packetRead<20, true, false, 32, false>' --iteration 257 --metric fetch
 ```
 
-These select the first source tuple's warm four-bank dispatches. For the second Q4_K gate or the third symmetric Q8_0 down with the same respective signature, iteration 689 selects its later window. The third source gate uses `packetRead<5, true, true>` at 257. Both Q8_0 downs use `packetRead<8, false, false>`. Record WriteSize in a separate invocation using `--metric write`. Capture fails if an exact counter trigger is missing or if the profiler selects another metric set.
+Iteration 257 selects a warm rotating-bank dispatch for an explicit one-tuple invocation. Record WriteSize in a separate invocation using `--metric write`. The original three-history F160/S160 invocation is still accepted without `--packet-shape`. The later same-symbol dispatch in that invocation uses iteration 691. Capture rejects absent or mismatched counter triggers and metric sets.
 
 Use the independent quiet median for a scored shape and warm case. The physical rate is FetchSize or WriteSize in KiB multiplied by 1024, divided by elapsed microseconds and then by 1000 for decimal GB/s. The application's requested packed bytes and useful unique bytes retain their own denominators. Report observed rates, source binding, resource geometry and service-time comparisons separately. Keep native binaries, raw counters and histories outside the source tree.
