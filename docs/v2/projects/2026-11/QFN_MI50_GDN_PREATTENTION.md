@@ -190,3 +190,29 @@ mkdir -p "$RUN_DIR/mpi-session"
   --mtp --mtp-depth-policy fixed --mtp-draft-tokens 3 --mtp-graph-capacity-draft-tokens 3 \
   --mtp-min-draft-tokens 1 --mtp-max-draft-tokens 3 --mtp-initial-draft-tokens 0
 ```
+
+## Four-tap convolution in the grouped verifier
+
+At the TP4 width of 2,560 channels, a wave of 64 lanes owns 64 adjacent
+channels. Each lane loads its four filter weights and three history values
+once. It evaluates the live rows in order and writes each prefix snapshot
+directly from registers. The device count and accepted-prefix publisher
+keep their existing ownership.
+
+Use the fixed-depth command above with `GROUPED=1` for both arms. Set
+`LLAMINAR_QFN_ROCM_GROUPED_GDN_CONV_K4` to 0 for control and 1 for the
+candidate in separate processes. The same-binary QFN comparison measured
+106.26 to 107.81 decode tok/s on review and 88.05 to 89.41 on code. Both
+arms produced the same tokens and verifier work. These rates were measured
+on the original kernel before the two optional pointer cases were qualified.
+
+The focused replay exercises the final Release entry for capacities 2–8,
+including zero live rows, repeated execution, reset and all three legal
+combinations of absent history or count. It checks the output, prefix
+snapshots, padding and terminal state. Both native cases passed on MI50.
+The shipped gfx906 and gfx1100 compilations recorded zero spills.
+
+```bash
+cmake --build "$BUILD_DIR" --parallel --target v2_integration_rocm_gdn_padded_real_length
+ctest --test-dir "$BUILD_DIR" -C Release --no-tests=error --output-on-failure -R '^V2_Integration_GroupedVerifierRows_ROCm_QFNK4ShortConv$'
+```

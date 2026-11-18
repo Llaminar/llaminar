@@ -21705,6 +21705,12 @@ if(HAVE_ROCM)
         MPI_PROCS 1
         NO_MODELS
     )
+    add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_QFNK4ShortConv
+        COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
+            --gtest_filter=Test__ROCmGDNPaddedRealLength.QFNK4VerifierAcceptedPrefixIgnoresUnpublishedRows:Test__ROCmGDNPaddedRealLength.QFNK4VerifierPreservesOptionalBindings
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;MTP;GroupedVerifierRows;ShortConv;GraphCapture;ByteExact;StatePublication;Replay;Regression;gfx906"
+        ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0;LLAMINAR_QFN_ROCM_GROUPED_GDN_CONV_K4=1"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK rocm_gpu_0)
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_ShortConv
         COMMAND $<TARGET_FILE:v2_integration_rocm_gdn_padded_real_length>
                 --gtest_filter=Test__ROCmGDNPaddedRealLength.ShortConvQwen36M2InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M3InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.ShortConvQwen36M4InPlaceStateMatchesStepwiseReplay:Test__ROCmGDNPaddedRealLength.CapturedVerifierAndDecodeShortConvPublicationRuntimeM
@@ -38405,6 +38411,10 @@ add_v2_test(V2_Integration_MoEOverlayInferenceEpochRoster
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;GraphCapture;RCU;Replay;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEOverlayInferenceEpochRoster)
+
+if(TEST V2_Integration_GroupedVerifierRows_ROCm_QFNK4ShortConv)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedVerifierRows_ROCm_QFNK4ShortConv)
+endif()
 
 foreach(V2_PREFLIGHT_TEST IN LISTS V2_PRODUCTION_TEST_PREFLIGHT_TESTS)
     if(NOT TEST ${V2_PREFLIGHT_TEST})

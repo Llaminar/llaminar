@@ -66,6 +66,22 @@ namespace llaminar2
     }
 
     /**
+     * @brief Read the cold process opt-in for the gfx906 grouped GDN K4 convolution.
+     * @return True when the process requests the measured counted verifier leaf.
+     * @throws std::invalid_argument If the environment value is neither zero nor one.
+     */
+    inline bool qfnGroupedGDNConvK4Experiment()
+    {
+        static const bool enabled = [] {
+            const char* mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_GDN_CONV_K4");
+            if (!mode || std::strcmp(mode, "0") == 0) return false;
+            if (std::strcmp(mode, "1") == 0) return true;
+            throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_GDN_CONV_K4 accepts 0 or 1");
+        }();
+        return enabled;
+    }
+
+    /**
      * @brief Tracks whether selected environment variables were present at the last reload.
      *
      * Some call sites need to distinguish a parsed default from an explicit user override.
