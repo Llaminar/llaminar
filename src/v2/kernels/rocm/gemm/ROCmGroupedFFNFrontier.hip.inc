@@ -125,13 +125,91 @@ public:
 
 namespace {
 
+/** @brief Physical affine-Q4 fields already owned by the acquired bank. */
+struct RoutedQ4Planes {
+    const uint8_t* payload{};
+    const void* scales{};
+    const void* mins{};
+};
+
+#if defined(__gfx906__)
+/** @brief Borrow a ready routed role once for the wave-owned output tile.
+ * @param role The original ready descriptor in this launch's acquired active bank.
+ * @return The original payload, scale and minimum addresses for this role.
+ * @pre Every active lane of the wave borrowed the same role for one original
+ * expert slot. A lane-varying projection must use its own descriptor loads.
+ * @pre The original acquired bank generation and all its role planes stay live
+ * and immutable until this launch retires. The original execution owner holds
+ * that lifetime across publication and replay.
+ */
+__device__ __forceinline__ RoutedQ4Planes borrowRoutedQ4Planes(
+    const DeviceNativeQuantisedMatrixDesc& role)
+{
+    static_assert(offsetof(DeviceNativeQuantisedMatrixDesc,payload)==0);
+    static_assert(offsetof(DeviceNativeQuantisedMatrixDesc,scales)==8);
+    static_assert(offsetof(DeviceNativeQuantisedMatrixDesc,mins)==16);
+    const auto uniform=waveUniformAddress(reinterpret_cast<uintptr_t>(&role));
+    using Words4=uint32_t __attribute__((ext_vector_type(4)));
+    Words4 primary;
+    uint64_t minimum;
+    // The acquire pins the role. Coherent loads also see a refreshed address
+    // when a later launch reuses a retired bank; the wait completes both reads.
+    asm volatile("s_load_dwordx4 %0, %2, 0x0 glc\n\t"
+                 "s_load_dwordx2 %1, %2, 0x10 glc\n\t"
+                 "s_waitcnt lgkmcnt(0)"
+                 : "=&s"(primary), "=&s"(minimum) : "s"(uniform) : "memory");
+    return {reinterpret_cast<const uint8_t*>(composeWaveAddress(primary[0],primary[1])),
+            reinterpret_cast<const void*>(composeWaveAddress(primary[2],primary[3])),
+            reinterpret_cast<const void*>(minimum)};
+}
+#endif
+
+/** @brief Read the packed role's original global bytes without changing its layout. */
+template<class T>
+__device__ __forceinline__ T readQ4PreparedGlobal(const void* pointer)
+{
+    const auto* source=reinterpret_cast<const unsigned char __attribute__((address_space(1)))*>(
+        reinterpret_cast<uintptr_t>(pointer));
+    T value;
+    __builtin_memcpy(&value,source,sizeof(T));
+    return value;
+}
+
+/** @brief Append one affine K32 pair with the retained M1 integer and FP32 operations. */
+template<bool ReuseSum>
+__device__ __forceinline__ void accumulateRoutedQ4Pair(RoutedQ4Planes gate,RoutedQ4Planes up,
+    size_t index,const int* activation,float scale,int sum,float& g,float& u)
+{
+    const auto gateWords=readQ4PreparedGlobal<int4>(gate.payload+index*16);
+    const auto upWords=readQ4PreparedGlobal<int4>(up.payload+index*16);
+    const auto dots=q4PairedDots<!ReuseSum>(gateWords,upWords,activation,sum);
+    const auto coefficient=[&](const void* plane) {
+        return __half2float(__ushort_as_half(readQ4PreparedGlobal<uint16_t>(
+            static_cast<const uint16_t*>(plane)+index)));
+    };
+    g=rocm_native_quantised_commit_corrected_single_scale_block(
+        g,dots.gate,coefficient(gate.scales),dots.sum,coefficient(gate.mins),scale);
+    u=rocm_native_quantised_commit_corrected_single_scale_block(
+        u,dots.up,coefficient(up.scales),dots.sum,coefficient(up.mins),scale);
+}
+
 /** @brief Joint original gate/up range loads with independent ordered accumulators. */
-template<NativeQuantisedFormatPrefill Format,int Columns,bool ReuseSum=false>
+template<NativeQuantisedFormatPrefill Format,int Columns,bool ReuseSum=false,bool RoutedWaveQ4=false>
 __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuantisedMatrixDesc& gate,const DeviceNativeQuantisedMatrixDesc& up,
     const std::int8_t* codes,const float* scales,int column,int parts,int lane,const std::int16_t* sums=nullptr)
 {
     using Traits=PrefillNATIVE_QUANTISEDTraits<Format>;
     const int width=Columns>0?Columns:gate.n;
+#if defined(__gfx906__)
+    constexpr bool scalarQ4=RoutedWaveQ4 && Format==NATIVE_QUANTISED_PF_Q4_1;
+    RoutedQ4Planes gatePlanes{},upPlanes{};
+    if constexpr(scalarQ4) {
+        // The caller selects one original routed slot for this wave. Lanes
+        // differ only in output column and K partition, never in role address.
+        gatePlanes=borrowRoutedQ4Planes(gate);
+        upPlanes=borrowRoutedQ4Planes(up);
+    }
+#endif
     const int worker=lane/16;
     const int perPart=(hidden/32+parts-1)/parts;
     float gateTotal=0.0f,upTotal=0.0f;
@@ -146,15 +224,23 @@ __device__ __forceinline__ Projections pairedProjections(const DeviceNativeQuant
                 const auto index=static_cast<std::size_t>(block)*width+column;
                 const auto* a4=reinterpret_cast<const int32_t*>(codes+block*32);
                 const auto scale=scales[block];
-                const auto* gatePayload=gate.payload+index*Traits::payload_bytes;
-                const auto* upPayload=up.payload+index*Traits::payload_bytes;
-                int sum=0;
-                if constexpr(ReuseSum)sum=sums[block];
-                int32_t decoded[8];
-                moe_prefill_decode_groups<Format,false>(gatePayload,decoded,nullptr);
-                g=moe_prefill_accumulate_decoded_block<Format,ReuseSum>(gate,index,gatePayload,decoded,a4,scale,g,sum);
-                moe_prefill_decode_groups<Format,false>(upPayload,decoded,nullptr);
-                u=moe_prefill_accumulate_decoded_block<Format,ReuseSum>(up,index,upPayload,decoded,a4,scale,u,sum);
+#if defined(__gfx906__)
+                if constexpr(scalarQ4) {
+                    accumulateRoutedQ4Pair<ReuseSum>(gatePlanes,upPlanes,index,a4,scale,
+                        ReuseSum?sums[block]:0,g,u);
+                } else
+#endif
+                {
+                    const auto* gatePayload=gate.payload+index*Traits::payload_bytes;
+                    const auto* upPayload=up.payload+index*Traits::payload_bytes;
+                    int sum=0;
+                    if constexpr(ReuseSum)sum=sums[block];
+                    int32_t decoded[8];
+                    moe_prefill_decode_groups<Format,false>(gatePayload,decoded,nullptr);
+                    g=moe_prefill_accumulate_decoded_block<Format,ReuseSum>(gate,index,gatePayload,decoded,a4,scale,g,sum);
+                    moe_prefill_decode_groups<Format,false>(upPayload,decoded,nullptr);
+                    u=moe_prefill_accumulate_decoded_block<Format,ReuseSum>(up,index,upPayload,decoded,a4,scale,u,sum);
+                }
             }
         if(parts==1)return {g,u};
 #pragma unroll

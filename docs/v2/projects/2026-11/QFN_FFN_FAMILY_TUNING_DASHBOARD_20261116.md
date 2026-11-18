@@ -59,6 +59,8 @@ original shards. On those shards, the prepared reader raised full-model
 fixed-three decode from 114.89 to 124.58 tok/s on review and 94.66 to
 102.51 on code. Dynamic decode changed by +0.12% and −0.25%. All paired
 histories and verifier counts matched.
+On the paired Q4 gate, borrowing the weight-plane pointers once per wave
+brought the four-row parent to 134.36 µs at F128 and 193.30 µs at F256.
 The table above uses the separate equal-width run.
 [Shard timings and read calibration](QFN_MI50_STAGE_COMPARISON_20261118.md#original-shard-widths-and-verifier-preparation)
 

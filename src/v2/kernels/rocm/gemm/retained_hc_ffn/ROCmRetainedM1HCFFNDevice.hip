@@ -17,6 +17,7 @@
 #include "kernels/common/DeviceNativeQuantisedContributionContract.h"
 #include "kernels/common/MoEProjectionNumericalContract.h"
 #include "kernels/rocm/common/ROCmSignedDot4.h"
+#include "kernels/rocm/common/ROCmQ4PairedDot.h"
 #include "kernels/qwen4exp/GPUBranchRMSNormBody.cuh"
 #include "kernels/common/OriginalSingleQ8Block32.cuh"
 #include "kernels/common/GPUHCDownPublication.cuh"

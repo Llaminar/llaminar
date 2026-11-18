@@ -7,6 +7,7 @@
  * 3483d462715d61f21ed5877836be35a724446359; see ROCmCastagnaT1.LICENSE.
  */
 #include "ROCmNativeLayoutDownGeometry.h"
+#include "kernels/rocm/common/ROCmWaveAddress.h"
 #include "kernels/common/NativeQuantisedDescriptorValidation.h"
 #include <cstddef>
 namespace llaminar2::rocm::native_layout_ffn {
@@ -104,12 +105,7 @@ __device__ __forceinline__ T waveMetadataValue(T value)
 {
     if constexpr(std::is_pointer_v<T>)
     {
-        const auto address=reinterpret_cast<uintptr_t>(value);
-        // The builtin returns signed int. Preserve each unsigned half before
-        // widening so low bit31 cannot overwrite the pointer's high half.
-        const uint32_t low=__builtin_amdgcn_readfirstlane(static_cast<uint32_t>(address));
-        const uint32_t high=__builtin_amdgcn_readfirstlane(static_cast<uint32_t>(address>>32));
-        return reinterpret_cast<T>((uint64_t(high)<<32)|low);
+        return reinterpret_cast<T>(waveUniformAddress(reinterpret_cast<uintptr_t>(value)));
     }
     else return static_cast<T>(__builtin_amdgcn_readfirstlane(static_cast<unsigned>(value)));
 }

@@ -11,6 +11,7 @@
 #include "kernels/rocm/gemm/retained_hc_ffn/CanonicalFFNQ8.h"
 #include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1QuietMagnitude.h"
 #include "kernels/rocm/moe/ROCmOriginalRouterPhase.hip.inc"
+#include "kernels/rocm/common/ROCmWaveAddress.h"
 
 #include <algorithm>
 #include <array>
@@ -498,6 +499,46 @@ TEST(ROCmRetainedM1Numerics, CapturedPackedQueueMatchesOriginal)
             for (Word guard : actual[1][i].guard)
                 ASSERT_EQ(guard, sentinel) << i;
         }
+    }
+}
+
+namespace {
+/** @brief Replay the real first-lane intrinsic on externally supplied address words. */
+__global__ void replayWaveAddressBits(const std::uint64_t* input,std::uint64_t* output)
+{
+    const unsigned lane=blockIdx.x*blockDim.x+threadIdx.x;
+    output[lane]=rocm::waveUniformAddress(input[lane]);
+}
+}
+
+/** @test Bit 31 and bit 63 survive a retained replay of actual wave readfirstlane. */
+TEST(ROCmRetainedM1Numerics, CapturedWaveAddressPreservesUnsignedHalves)
+{
+    auto lifetime=GPUDeviceProcessLifetime::acquireNativeContext();
+    const int ordinal=nativeMI50();
+    if(ordinal<0)GTEST_SKIP() << "UNQUALIFIED: no visible gfx906 participant";
+    Replay replay(ordinal);
+    constexpr unsigned lanes=64;
+    std::array<std::uint64_t,6> words{0,0x00007f007fffffff,0x00007f0080000000,
+        0x8000000000000000,0x8000000080000000,0xffffffffffffffff};
+    std::array<std::uint64_t,words.size()*lanes> actual{},source{};
+    auto* input=replay.allocate<std::uint64_t>(source.size());
+    auto* output=replay.allocate<std::uint64_t>(actual.size());
+    replay.capture([&] {
+        replayWaveAddressBits<<<words.size(),lanes,0,replay.stream>>>(input,output);
+    });
+    for(unsigned pass=0;pass<3;++pass) {
+        std::rotate(words.begin(),words.begin()+1,words.end());
+        for(unsigned job=0;job<words.size();++job)
+            std::fill_n(source.data()+job*lanes,lanes,words[job]);
+        checked(hipMemcpyAsync(input,source.data(),sizeof(source),hipMemcpyHostToDevice,replay.stream));
+        checked(hipMemsetAsync(output,0xa5,sizeof(actual),replay.stream));
+        replay.enqueue();
+        checked(hipMemcpyAsync(actual.data(),output,sizeof(actual),hipMemcpyDeviceToHost,replay.stream));
+        checked(hipStreamSynchronize(replay.stream));
+        for(unsigned job=0;job<words.size();++job)
+            for(unsigned lane=0;lane<lanes;++lane)
+                ASSERT_EQ(actual[job*lanes+lane],words[job]) << job << '/' << lane;
     }
 }
 } // namespace llaminar2::test

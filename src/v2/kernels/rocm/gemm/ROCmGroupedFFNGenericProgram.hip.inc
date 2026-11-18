@@ -66,10 +66,10 @@ __device__ __forceinline__ Projections sealedPair(PublishedNativeProjection gate
     if constexpr(PrefillNATIVE_QUANTISEDTraits<Format>::is_asymmetric &&
                  !PrefillNATIVE_QUANTISEDTraits<Format>::is_dual_scale) {
         if(row.sum32)
-            return pairedProjections<Format,0,true>(
+            return pairedProjections<Format,0,true,Routed>(
                 gate,up,row.codes,row.scales,column,parts,lane,row.sum32);
     }
-    return pairedProjections<Format,0>(gate,up,row.codes,row.scales,column,parts,lane);
+    return pairedProjections<Format,0,false,Routed>(gate,up,row.codes,row.scales,column,parts,lane);
 }
 
 template<unsigned Groups,int RoutedCodebook=-1,int FixedQ5Pitch=0>

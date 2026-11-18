@@ -675,6 +675,43 @@ than 0.2% on either shard. Both experiments passed their serial byte checks.
 [Wave-local publication bracket](/tmp/qfn-mi50-verifier-roofline/wave-retry-abba.json)
 [Output-owner fold bracket](/tmp/qfn-mi50-verifier-roofline/owner-fold-pinned-abba.json)
 
+The two layout changes also ran together on PCI ba. With the scalar pointer
+borrow already active, wave-local publication increased complete time from
+190.30 to 194.43 µs at F256 and from 132.54 to 161.85 µs at F128. The
+selected paired Q4 program retains the two-wave publication tile at both
+widths. All eight arms passed the same serial byte oracle.
+[Same-card combined-change bracket](/tmp/qfn-mi50-verifier-roofline/dual-q4-abba.json)
+
+Integrating the scalar borrow into the existing paired projection loop
+against `5709b071f` on PCI c2 reduced time from 142.77 to 134.36 µs at
+F128 and from 211.35 to 193.30 µs at F256. The eight native windows had
+the same source tensors, five captured nodes, exact selected gate symbol
+and serial row bytes. Sharing the per-word dot operation keeps the retained
+single-row HC/FFN and pre-attention instruction bytes identical on gfx906
+and gfx1100. The integrated gfx906 gate uses 71 VGPRs, 104 SGPRs and
+320 bytes of LDS per workgroup. The compiler stores 51 scalar values in
+vector register lanes and emits no private-memory spills. The scalar-borrow
+prototype above used 70 VGPRs. [Integrated timing bracket](/tmp/qfn-mi50-q4-wave-integration-c2/abba-score.json)
+[Single-row code identity](/tmp/qfn-mi50-q4-wave-integration-c2/narrow-code.sha256)
+
+On F256, a separate native trace took the gate/up leaf from 104.32 to
+84.96 µs. Both counter arms fetched 32,143.06 KiB and launched 480 waves.
+The numeric kernel attained 315.52 → 387.41 GB/s, or 63.69% → 78.20% of
+the 495.39 GB/s measured by the same-card, same-shape read-only probe.
+All 40 route IDs matched the calibration, including the two repeated
+expert selections. VALU instructions fell from 1,487,602 to 1,461,522
+per dispatch. The larger timing improvement relative to the instruction
+count is consistent with eliminating a dependent pointer lookup per K32.
+The read-only probe omits dot products and publication. [Counter, trace
+and calibration receipts](/tmp/qfn-mi50-q4-wave-integration-c2/profile-score.json)
+
+Five focused production-preflight tests passed on the canonical Release,
+including captured high-bit addresses, moving bank publications, counted
+replay and retained single-row numerics. The gfx906 and gfx1100 Release
+objects passed the spill guard. The Release core used for the native tests has SHA-256
+`ff44736ca064c57d3d1c982bc537e313c412f735ac051cb714b6a36e86318cfd`.
+[Focused native test log](/tmp/qfn-mi50-fixed-bank-proof/canonical-wave/wave-r1/run.log)
+
 The matched Q4 experiment also tested computing the exact signed K32 sums
 in the existing router quantizer and publishing intermediate sums alongside
 the routed activation. That helps the previously measured equal-width fixed

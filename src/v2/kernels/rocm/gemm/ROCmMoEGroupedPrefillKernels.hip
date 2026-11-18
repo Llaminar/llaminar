@@ -45,6 +45,8 @@
  */
 
 #include "kernels/rocm/common/ROCmSignedDot4.h"
+#include "kernels/rocm/common/ROCmQ4PairedDot.h"
+#include "kernels/rocm/common/ROCmWaveAddress.h"
 #include <bit>
 #include <hip/hip_runtime.h>
 #include "kernels/common/MoEGroupedDirectory.h"

@@ -1386,6 +1386,11 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                 mismatch(history,observed,"selected");
                 mismatch(history_local,observed_local,"local");
             };
+            const char* originalMove=std::getenv("LLAMINAR_TEST_QFN_Q4_PHYSICAL_MOVE");
+            const bool provePhysicalMove=shape.grouped_matrix_case=="Q4_K_sparse_routes" ||
+                (shape.grouped_matrix_case=="OriginalQFN" && originalMove && std::string_view(originalMove)=="1");
+            std::vector<std::shared_ptr<void>> movedPlanes;
+            std::size_t clonedBytes=0;
             for (int replay = 0; replay < 20; ++replay)
             {
                 const std::array counts{rows, 0, rows > 1 ? rows - 1 : 0, std::min(1, rows), rows / 2, rows};
@@ -1484,7 +1489,8 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         }
                     verifyHistory(replay,"after commit");
                 }
-                if((require_frontier || !shape.grouped_matrix_case.empty()) && rows==4 && replay==0) {
+                if((require_frontier || !shape.grouped_matrix_case.empty()) && rows==4 &&
+                   (replay==0 || (provePhysicalMove && (replay==2 || replay==3)))) {
                     // The actual route-plan producer reacquires a new runtime
                     // bank while both fused compute nodes keep their capture.
                     auto& runtime=*candidate->runtime;
@@ -1532,6 +1538,33 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         std::osyncstream(std::cout)<<"M4_SOURCE_BANK_NEGATIVES,case="<<shape.grouped_matrix_case
                             <<",rejected=6,bank_bytes_unchanged=1,capture_identity_unchanged=1"<<'\n';
                     }
+                    if(provePhysicalMove) {
+                        const int n=shape.routed;
+                        const auto blocks=std::size_t(n)*(shape.hidden/32);
+                        const auto roleBytes=blocks*20;
+                        clonedBytes=2*source.expert_count*roleBytes;
+                        auto* allocation=static_cast<std::uint8_t*>(backend->allocate(clonedBytes,device.ordinal));
+                        require(allocation,"allocate independent fixture-owned copies of original weight planes");
+                        movedPlanes.emplace_back(allocation,[backend,ordinal=device.ordinal](void* ptr){backend->free(ptr,ordinal);});
+                        auto copyRole=[&](auto& projection,const std::size_t team) {
+                            require(projection.codebook_id==5 && projection.n==n &&
+                                projection.k==shape.hidden,"exact original Q4_K native layout");
+                            auto* base=allocation+team*roleBytes;
+                            require(backend->deviceToDevice(base,projection.payload,blocks*16,device.ordinal,stream) &&
+                                backend->deviceToDevice(base+blocks*16,projection.scales,blocks*2,device.ordinal,stream) &&
+                                backend->deviceToDevice(base+blocks*18,projection.mins,blocks*2,device.ordinal,stream),
+                                "copy original prepared Q4_K physical planes on the captured lane's transfer stream");
+                            require(base!=projection.payload,"physical plane address changed");
+                            projection.payload=base;
+                            projection.scales=base+blocks*16;
+                            projection.mins=base+blocks*18;
+                        };
+                        for(std::size_t expert=0;expert<source.expert_count;++expert)
+                            if(update.local_compute_mask[expert]) {
+                                copyRole(update.experts[expert].gate,2*expert);
+                                copyRole(update.experts[expert].up,2*expert+1);
+                            }
+                    }
                     require(runtime.prepareInactiveBank(0,update),"prepare original descriptors in the inactive bank");
                     auto* layer=reinterpret_cast<std::byte*>(runtime.deviceLayerState(0));
                     if(shape.deferred_frontier_history) {
@@ -1559,6 +1592,26 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                         backend->deviceToHostOnStream(&seen[1],layer+offsetof(DeviceMoELayerRuntime,active_bank),
                         sizeof(seen[1]),device.ordinal,stream) && worker.synchronizeStreamChecked(stream),
                         "Observe terminal epoch after original publication");
+                    if(provePhysicalMove) {
+                        const auto expert=std::find(update.local_compute_mask.begin(),update.local_compute_mask.end(),1)-
+                            update.local_compute_mask.begin();
+                        require(expert<update.expert_count,"fixture must have an original live local expert");
+                        const auto offset=offsetof(DeviceMoELayerRuntime,banks)+(1u-oldBank)*sizeof(DeviceMoEPlacementBank)+
+                            offsetof(DeviceMoEPlacementBank,experts)+expert*sizeof(DeviceMoEExpertDescriptor);
+                        DeviceMoEExpertDescriptor arrived{};
+                        require(backend->deviceToHostOnStream(&arrived,layer+offset,sizeof(arrived),device.ordinal,stream) &&
+                            worker.synchronizeStreamChecked(stream),"observe actual relocated expert descriptor identity");
+                        const auto& expected=update.experts[expert];
+                        require(arrived.gate.payload==expected.gate.payload && arrived.gate.scales==expected.gate.scales &&
+                            arrived.gate.mins==expected.gate.mins && arrived.up.payload==expected.up.payload &&
+                            arrived.up.scales==expected.up.scales && arrived.up.mins==expected.up.mins,
+                            "device-published gate/up identity retained all six moved planes");
+                        if(movedPlanes.size()>1)
+                            require(backend->memset(movedPlanes[movedPlanes.size()-2].get(),0,clonedBytes,device.ordinal,stream) &&
+                                worker.synchronizeStreamChecked(stream),"retired fixture-only copy is poisoned before next replay");
+                        std::osyncstream(std::cout)<<"M4_SOURCE_PHYSICAL_MOVE,epoch="<<update.epoch
+                            <<",retained_bank="<<(1u-oldBank)<<",descriptor_planes=6,replay="<<replay<<'\n';
+                    }
                     require(seen==std::array{update.epoch,1u-oldBank} && capture_identity()==original_identity,
                         "The next bank must reach the same captured grouped verifier");
                 }

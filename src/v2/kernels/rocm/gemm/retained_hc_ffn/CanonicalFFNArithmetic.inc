@@ -178,10 +178,7 @@ __device__ __forceinline__ void canonicalQ4PairCommit(const NativeQKItem& gate,c
 #pragma unroll
     for(unsigned group=0;group<8;++group) {
         const int value=activation.qs[group];
-        const int gq=int((gw[group&3]>>((group>>2)*4))&0x0f0f0f0fu);
-        const int uq=int((uw[group&3]>>((group>>2)*4))&0x0f0f0f0fu);
-        gd=llaminar2::rocm_integer_contract::signedDot4(value,gq,gd);
-        ud=llaminar2::rocm_integer_contract::signedDot4(value,uq,ud);
+        llaminar2::rocm::q4PairedDotStep(value,gw[group&3],uw[group&3],(group>>2)*4,gd,ud);
     }
     const unsigned gc=unsigned(gate.high.x),uc=unsigned(up.high.x);
     // A corrected K32 block is one canonical publication: first round the
