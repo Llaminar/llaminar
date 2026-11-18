@@ -20,7 +20,7 @@ also matched their own ordinary decode and all five verifier-work counters.
 Castagna generated different continuations and its throughput includes its
 own draft acceptance. The largest remaining fixed-depth stage deficit on
 code2048 is 3.08 ms/round in HC, projections, routing and experts.
-[Matched workload, numerical checks and phase timings](QFN_MI50_STAGE_COMPARISON_20261118.md#fixed-depth-verifier-on-the-original-tp4-split-code2048)
+[Matched workload, numerical checks and phase timings](QFN_MI50_STAGE_COMPARISON_20261118.md#fixed-depth-verifier-after-the-counted-routing-and-hc-changes)
 
 ## Full-model throughput on four MI50s with equal-width Llaminar shards
 
@@ -91,12 +91,12 @@ reused workgroups recovered 3.3%–5.4% on four indexed formats. Batched
 IQ3_XXS codebook reads took the G15 local verifier from 403.71 to 324.75 µs
 at six rows. Its gate reaches 27.6% of the corresponding read reference.
 G13 shares those gate operands and improved from 437.70 to 359.86 µs.
-The original TP4 code2048 fixed-3 target now measures 23.17 ms/round versus
+The original TP4 code2048 fixed-3 target now measures 23.23 ms/round versus
 18.22 for Castagna. HC, projections, routing and experts account for 3.08 ms
-of the 4.95 ms gap. The subsequent HC, selector and indexed-reader changes kept all 18
+of the 5.01 ms gap. The HC, selector and indexed-reader changes kept all 18
 generations exact. Fixed-depth decode measured 137.38 and 111.88 tok/s on
 review512 and code2048. Aggregate performance was within 0.5% of the predecessor.
-[Latest four-card stage timings](QFN_MI50_STAGE_COMPARISON_20261118.md#fixed-depth-verifier-on-the-original-tp4-split-code2048)
+[Latest four-card stage timings](QFN_MI50_STAGE_COMPARISON_20261118.md#fixed-depth-verifier-after-the-counted-routing-and-hc-changes)
 [Indexed-format measurements](QFN_MI50_STAGE_COMPARISON_20261118.md#indexed-weight-formats-on-mi50)
 [Architecture coverage](QFN_MI50_STAGE_COMPARISON_20261118.md#verifier-schedules-by-gpu)
 [Six-row read calibration](QFN_MI50_STAGE_COMPARISON_20261118.md#physical-read-limits-on-the-six-row-tp4-verifier)

@@ -120,6 +120,16 @@ if(TARGET v2_integration_moe_intermediate_ffn_finalization)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_FullNativeHCFFN_GroupedFFNDirectBankReplay_ROCm)
     endif()
 
+    add_v2_test(V2_Integration_FullNativeHCFFN_GroupedFFNHeldEpochReplay_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
+            --gtest_filter=FullNativeHCFFN.ROCmGroupedFFNHeldEpochReplay
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;GraphCapture;Replay;ByteExact;GeneratedSource;Regression;Devices1;NativeISA-gfx906"
+        MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
+        ENVIRONMENT "LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16;LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER=1;LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK=1;LLAMINAR_QFN_ROCM_GROUPED_FFN_EQUAL_FRONTIER=0;LLAMINAR_QFN_ROCM_GROUPED_FFN_ALL_FORMATS=1;LLAMINAR_PERF_STATS_SUMMARY=1")
+    if(TEST V2_Integration_FullNativeHCFFN_GroupedFFNHeldEpochReplay_ROCm)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_FullNativeHCFFN_GroupedFFNHeldEpochReplay_ROCm)
+    endif()
+
     add_v2_test(V2_Integration_FullNativeHCFFN_EqualF160GroupedFrontierReplay_ROCm
         COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
             --gtest_filter=FullNativeHCFFN.ROCmEqualF160GroupedFFNFrontierByteReplay

@@ -1063,6 +1063,101 @@ above gives user-visible rates.
 [Per-device dispatch intervals](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-code2048-phases.json)
 [Per-stage time and overlap across the four cards](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-code2048-target-breakdown.json)
 
+### Fixed-depth verifier after the counted routing and HC changes
+
+The Release at `7001788d8` verified the same 344 target rows in 86
+rounds on code2048. Its four-MI50 mean target GPU-active time was 23.233
+ms per round. The pinned fork remained at 18.222 ms over 81 rounds of
+its own generated history. The largest remaining group comprised
+hyperconnections, projections, activation preparation, routing and
+experts at 16.109 ms against 13.033 ms. Attention/indexing took 1.320
+ms against 0.495 ms, GDN/convolution took 1.365 ms against 0.966 ms,
+and peer push took 2.976 ms against 2.486 ms. Each fork participant ran
+94 instances of the four-row persistent HC kernel with its fused work
+enabled and two instances of its other HC variant per round. Together
+they occupied 10.48 ms per GPU. That scope includes work split among
+multiple Llaminar kernels in the table below.
+
+| Llaminar target operation | Launches per round per card | Mean ms per round per card |
+| --- | ---: | ---: |
+| HC up-projection | 97 | 1.248 |
+| HC down-projection contributions | 97 | 1.108 |
+| HC down residual publication | 97 | 0.569 |
+| Router FP16 projection | 48 | 0.886 |
+| Router softmax and top-k | 48 | 0.859 |
+| Expert gate/up, SwiGLU and Q8 publication | 48 | 2.344 |
+| Expert down-projection and ordered fold | 48 | 1.873 |
+
+HC up-projection saved 0.102 ms across 97 launches against the preceding
+trace. The whole verifier changed by 0.065 ms. Host I/O pressure was high
+during the trace. These figures describe device dispatches. The unprofiled
+rates above measure throughput.
+[Stage attribution and common-clock intervals](/tmp/qfn-mi50-w-r3-verifier-cohort/fuller-code2048-target-breakdown.json)
+[Original layer launch counts and native kernel symbols](/tmp/qfn-mi50-w-r3-verifier-cohort/fuller-code2048-grouped-kernels.json)
+
+### Moving route preparation out of the fixed-depth expert arithmetic
+
+The focused harness replayed four original layer-1 verifier rows with the
+admitted TP4 widths. In each layer three MI50s own 128 routed columns and
+the fourth owns 256. The wide shard rotates between participants across
+layers. Each owns 160 shared columns. The timed parent includes the router,
+selection and the complete local expert operation. Each candidate used its
+own same-card control. The table reports GPU-event times in microseconds.
+
+| Change | 128 columns, control → candidate | 256 columns, control → candidate |
+| --- | ---: | ---: |
+| Publish the native Down operands from the existing gate launch | 114.75 → 113.25 | 150.14 → 148.50 |
+| Prepare all expert operands in a separate graph node | 115.63 → 118.76 | 151.37 → 161.10 |
+| Give one workgroup ownership of an entire selected expert row | 114.89 → 113.71 | 150.73 → 158.29 |
+
+Publishing the Down operands removed repeated native-source and route checks
+from the output tiles. On the wide shard the compiled Down kernel used 48
+vector and 64 scalar registers, against 56 and 80 previously, with zero
+private bytes in both. A single matched hardware-counter sample measured
+18,794 versus 18,802 KiB fetched. The saving came with almost unchanged
+off-chip traffic. Both original-operand candidates passed serial byte replay.
+Preparing all operands in its own launch added a dependency to the captured
+parent. Giving each selected expert row to one workgroup left only 44
+workgroups on a 60-CU MI50 at the wide shard. Retaining enough independent
+output tiles matters even with forty routed slots available.
+[Original-shard Down preparation and timings](/tmp/qfn-mi50-m4-published-down-c5/comparison.json)
+[All 15 families across four- and six-row static and deferred replay](/tmp/qfn-mi50-m4-published-down-c5/all-format-qualified.json)
+[Separate preparation timings](/tmp/qfn-mi50-m4-route-operands-c5/comparison.json)
+[Original-row fusion and workgroup profile](/tmp/qfn-mi50-cta-route-fused/REPORT.md)
+
+On four MI50s, publishing the Down operands from the existing gate raised
+median fixed-depth decode on code2048 from 111.88 to 112.97 tok/s.
+The median paired gains were 0.97% for decode and −0.21% for prefill.
+Ordinary decode changed by 0.01%. Both Releases produced the identical
+256 output tokens in each of three generations, with 86 verifier rounds
+and 344 target rows per fixed-depth generation. Additional local timings
+on original layer 2 (Q5_K gate/up and Q8_0 Down) and layer 4 (Q4_K gate/up
+and Q8_0 Down) changed by less than 0.5% at both widths. The improvement
+on layer 1 depends on its weight formats as well as its width.
+[Four-MI50 model throughput, histories and verifier work](/tmp/qfn-mi50-w-r3-verifier-cohort/prepared-down-comparison.json)
+[Original layers 2 and 4 at both TP widths](/tmp/qfn-mi50-m4-published-down-c5/heldout-layers/comparison.json)
+
+The preflight regression publishes a newer expert bank on a maintenance
+stream between captured route preparation and expert computation. The
+first four-row verifier finishes on the held bank. It blocks reclamation
+until Down releases its lease. The next four-row verifier reads the new
+bank and its relocated Down scales. Twenty histories check serial output
+bytes and deferred accepted-prefix accounting under reset, partial and
+zero live rows. The fixture uses a single MI50 and generated original-format
+weights. The model throughput measurements above use four MI50s.
+[Held-epoch fixture and independent reader checks](/tmp/qfn-held-grouped-c2/README.md)
+[Release preflight replay](/tmp/qfn-mi50-fixed-bank-proof/canonical-held-epoch/native-1/ctest.xml)
+
+The HC up-projection can compute the four-branch residual read from its
+own live logits. With the grouped Down reducer enabled, this shortened
+the captured local HC parent from six launches to five and saved
+2.0–2.7 µs in two independent timing windows. The same-Release four-MI50
+test used the identical prompt, sampled history and verifier work. Across
+three generations, median decode fell from 113.83 to 113.20 tok/s with
+the extra fusion. Its complete-model result leaves the read staged.
+[Exact captured HC tests and reverse-order timings](/tmp/qfn-mi50-hcup-read-c2/REPORT.md)
+[Four-card same-Release throughput and accepted-token counts](/tmp/qfn-mi50-w-r3-verifier-cohort/hc-read-admission-comparison.json)
+
 ### Physical read limits on the six-row TP4 verifier
 
 The Release build at `117b1d9d9` ran layer 1 from the original QFN GGUF on
