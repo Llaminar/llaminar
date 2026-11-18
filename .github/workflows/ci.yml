@@ -1,3 +1,5 @@
+# @file ci.yml
+# @brief Publish the develop images and retain build evidence and failed job transcripts.
 name: CI
 
 # Develop publishes both Release runtime images on the dedicated development host.
@@ -79,3 +81,10 @@ jobs:
             parity-results/develop-image-gate/**/publish.log
           if-no-files-found: error
           retention-days: 30
+
+  failed-job-logs:
+    needs: develop-images
+    if: failure() && needs.develop-images.result == 'failure'
+    permissions:
+      actions: read
+    uses: ./.github/workflows/failed-job-logs.yml

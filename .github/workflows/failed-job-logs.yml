@@ -1,0 +1,65 @@
+# @file failed-job-logs.yml
+# @brief Archive GitHub's completed job transcripts on the caller's run page after a gate fails.
+name: Retain failed job logs
+
+on:
+  workflow_call:
+
+permissions:
+  actions: read
+
+jobs:
+  collect:
+    # GitHub has the step transcript even when a self-hosted build process was killed.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Download GitHub's transcripts for failed jobs in this attempt
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          directory="$RUNNER_TEMP/failed-job-logs"
+          mkdir -p "$directory"
+          jobs="$RUNNER_TEMP/failed-jobs.tsv"
+          gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+            --jq '.jobs[] | select(.conclusion == "failure" or .conclusion == "timed_out" or .conclusion == "startup_failure") |
+                  [.id, (.name | gsub("[^A-Za-z0-9._-]+"; "-") | rtrimstr("-") | .[:120])] | @tsv' > "$jobs"
+          if [[ ! -s "$jobs" ]]; then
+            echo "::error::GitHub returned no failed jobs for attempt $GITHUB_RUN_ATTEMPT"
+            exit 1
+          fi
+          status=0
+          while IFS=$'\t' read -r id name; do
+            raw="$RUNNER_TEMP/job-$id.raw"
+            # Log publication can lag the job conclusion. curl retries to a file
+            # so a partial response cannot duplicate lines in the final transcript.
+            if curl --fail --silent --show-error --location --retry 4 --retry-all-errors \
+                --connect-timeout 10 --max-time 60 --header "Authorization: Bearer $GH_TOKEN" \
+                --output "$raw" "$GITHUB_API_URL/repos/$GITHUB_REPOSITORY/actions/jobs/$id/logs" && [[ -s "$raw" ]]; then
+              # BuildKit errors can contain signed cache URLs in GitHub's own log.
+              sed -E 's@(https?://[^[:space:]"<>?]+)\?[^[:space:]"<>]+@\1?[redacted]@g' "$raw" > "$directory/$name-$id.log"
+            else
+              echo "::error::Could not download the transcript for job $id"
+              status=1
+            fi
+            rm -f -- "$raw"
+          done < "$jobs"
+          exit "$status"
+      - name: Upload failed job logs to this run
+        id: upload
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: failed-job-logs-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/failed-job-logs/*.log
+          if-no-files-found: error
+          retention-days: 30
+      - name: Link the transcripts from the run summary
+        if: ${{ !cancelled() && steps.upload.outputs.artifact-url != '' }}
+        shell: bash
+        env:
+          ARTIFACT_URL: ${{ steps.upload.outputs.artifact-url }}
+        run: |
+          printf '[Download failed job logs for attempt %s](%s)\n' "$GITHUB_RUN_ATTEMPT" "$ARTIFACT_URL" >> "$GITHUB_STEP_SUMMARY"

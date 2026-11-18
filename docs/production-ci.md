@@ -133,8 +133,14 @@ The receipt retains all registered, selected and unqualified tests with reasons.
 For a missing GPU it gives the required and observed counts by vendor. A test
 requiring one CUDA and one ROCm GPU still runs when both are present.
 Model staging, generation, HF parity, E2E and benchmarks remain separate gates.
-Only build logs, image/test receipts and CTest/JUnit evidence are
-uploaded to GitHub under artifact names containing the ISA. Run the same AVX2 PR transaction locally with:
+The workflow run's **Artifacts** section contains build logs, image/test receipts
+and CTest/JUnit evidence under each ISA's name. After a PR check or develop
+image publication fails, the run summary also links `failed-job-logs-<run>-<attempt>`.
+Each file contains GitHub's transcript for one failed job, including setup,
+the runner's exit status and cleanup. A separate runner collects these logs
+so they survive a killed build process. Logs are retained for 30 days.
+
+Run the same AVX2 PR transaction locally with:
 
 ```bash
 python3 scripts/ci/run_develop_image_gate.py --cpu-isa AVX2 --pr-gpus CUDA+ROCm \

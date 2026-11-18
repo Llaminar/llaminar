@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_develop_image_gate.py
+#  @brief Exercise PR and image publication commands, hardware scope and failure evidence.
 """Device-free contracts for model-free develop PR and image-publication gates.
 
 The PR workflow consumes the same image driver in independent AVX512 and AVX2
@@ -503,6 +505,48 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(buildx["with"]["keep-state"], "true")
         self.assertNotIn("sudo", workflow)
 
+    def test_failed_job_logs_survive_a_killed_build_and_a_missing_sibling_log(self):
+        """Replay a killed build's GitHub transcript without needing a live runner or network."""
+        workflows = ROOT / ".github/workflows"
+        for caller, build in (("develop-pr.yml", "unit"), ("ci.yml", "develop-images")):
+            job = yaml.load((workflows / caller).read_text(), Loader=yaml.BaseLoader)["jobs"]["failed-job-logs"]
+            self.assertEqual(job["needs"], build)
+            self.assertEqual(job["if"], f"failure() && needs.{build}.result == 'failure'")
+            self.assertEqual(job["permissions"], {"actions": "read"})
+            self.assertEqual(job["uses"], "./.github/workflows/failed-job-logs.yml")
+        workflow = yaml.load((workflows / "failed-job-logs.yml").read_text(), Loader=yaml.BaseLoader)
+        collect, upload, summary = workflow["jobs"]["collect"]["steps"]
+        self.assertEqual(upload["if"], "${{ !cancelled() }}")
+        self.assertIn("github.run_attempt", upload["with"]["name"])
+        self.assertIn("steps.upload.outputs.artifact-url", summary["env"]["ARTIFACT_URL"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # The API lists two failed jobs. One has no transcript yet. The
+            # other includes both a signed cache URL and the runner's exit code.
+            gh = root / "gh"
+            gh.write_text("#!/bin/sh\nprintf '12\\tAVX2\\n13\\tAVX512\\n'\n")
+            curl = root / "curl"
+            curl.write_text("""#!/bin/sh
+while [ "$1" != --output ]; do shift; done
+case "$3" in
+  */12/logs) : > "$2" ;;
+  */13/logs) printf '%s\\n' 'https://cache.example/blob?sig=private' 'exit code 137' > "$2" ;;
+  *) exit 1 ;;
+esac
+""")
+            gh.chmod(0o755)
+            curl.chmod(0o755)
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", RUNNER_TEMP=directory,
+                       GH_TOKEN="unused", GITHUB_API_URL="https://api.example", GITHUB_REPOSITORY="test/repo",
+                       GITHUB_RUN_ID="41", GITHUB_RUN_ATTEMPT="2")
+            result = subprocess.run(["bash", "-c", collect["run"]], env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("job 12", result.stdout)
+            logs = root / "failed-job-logs"
+            self.assertEqual([p.name for p in logs.iterdir()], ["AVX512-13.log"])
+            self.assertEqual((logs / "AVX512-13.log").read_text(), "https://cache.example/blob?[redacted]\nexit code 137\n")
+
     def test_develop_pr_runs_both_isas_on_separate_dedicated_runners(self):
         """Exercise the real PR command, not a separately invented argument set."""
         workflow = yaml.load((ROOT / ".github/workflows/develop-pr.yml").read_text(),
@@ -513,7 +557,7 @@ class DevelopImageGateTests(unittest.TestCase):
                          {"opened", "synchronize", "reopened", "ready_for_review"})
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertNotIn("concurrency", workflow)
-        self.assertEqual(set(workflow["jobs"]), {"unit"})
+        self.assertEqual(set(workflow["jobs"]), {"unit", "failed-job-logs"})
         job = workflow["jobs"]["unit"]
         self.assertEqual(job["uses"],
                          "Llaminar/llaminar/.github/workflows/develop-pr-tests.yml@develop")
