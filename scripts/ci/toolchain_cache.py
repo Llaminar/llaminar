@@ -1,34 +1,28 @@
 #!/usr/bin/env python3
-"""Admit complete, dependency-bound OCI toolchains for ephemeral cloud builders.
+"""Build and authenticate the dependency-only OCI context on the selected BuildKit worker.
 
-The cache key describes only the committed dependency context and CPU ISA.
-Building that restricted context makes an undeclared dependency a hard error.
-An exact cache hit restores a complete image, which Buildx consumes as the
-``toolchain`` named context; intermediate solver cache hits are not required.
-OCI content digests and image labels bind the restored bytes to those inputs.
+Local BuildKit layer reuse is optional. A complete per-ISA image and a verified
+receipt are mandatory; remote cache availability never admits or vetoes them.
+The ordinary Dockerfile remains the single source for direct and gated builds.
 """
 from __future__ import annotations
 
 import argparse
 import hashlib
-import io
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
 import re
 import subprocess
-import tarfile
 import time
 
 ROOT = Path(__file__).resolve().parents[2]
 TOOLCHAIN_ROOT_ENV = "LLAMINAR_DOCKER_TOOLCHAIN_ROOT"
 ISAS = ("AVX512", "AVX2")
-SCHEMA = 1
-# This is the complete available context, not merely a cache-key approximation.
-# Add dependencies here when adding a toolchain COPY outside these roots.
-INPUTS = ("Dockerfile", ".dockerignore", "requirements.txt", "scripts/docker",
-          "scripts/build", "scripts/ci/toolchain_cache.py",
-          ".github/actions/cache-develop-toolchain/action.yml")
+SCHEMA = 2
+# Bind invocation/admission policy as well as the actual bytes visible to the recipe.
+POLICY = ("scripts/ci/toolchain_cache.py", ".github/actions/cache-develop-toolchain/action.yml")
 INPUT_LABEL = "org.llaminar.toolchain_inputs"
 ISA_LABEL = "org.llaminar.toolchain_isa"
 INDEX_TYPE = "application/vnd.oci.image.index.v1+json"
@@ -40,39 +34,90 @@ def git(*arguments: str) -> bytes:
     return subprocess.check_output(["git", "-C", str(ROOT), *arguments])
 
 
+@dataclass(frozen=True)
+class DependencyContext:
+    """One committed recipe and its local inputs, used for both identity and staging."""
+
+    recipe: bytes
+    files: tuple[tuple[str, str, str], ...]  # path, Git file mode, blob OID
+
+    @classmethod
+    def from_tree(cls, tree: str) -> DependencyContext:
+        """Project the canonical recipe at its named source-build boundary, not a line count.
+
+        Dependency COPYs use literal, repository-relative file or directory operands.
+        Expand whole directories in Git (including modes), not from a second installer
+        list or a dirty checkout. Unsupported input forms must not produce a guessed key.
+        """
+        dockerfile = git("show", f"{tree}:Dockerfile")
+        sections = re.split(rb"(?im)^[ \t]*FROM[ \t]+toolchain[ \t]+AS[ \t]+builder[ \t]*\r?$", dockerfile)
+        if len(sections) != 2:
+            raise ValueError("toolchain recipe requires one FROM toolchain AS builder boundary")
+        recipe = sections[0]
+        required = {".dockerignore", *POLICY}
+        lines = recipe.decode().splitlines()
+        if any(re.match(r"\s*#\s*escape\s*=", line, re.I) for line in lines):
+            raise ValueError("toolchain recipe requires the default Dockerfile escape")
+        code = "\n".join(line for line in lines if not line.lstrip().startswith("#"))
+        for line in code.replace("\\\n", "").splitlines():
+            words = line.split()
+            if not words:
+                continue
+            op = words[0].upper()
+            if op in ("ADD", "ONBUILD") or "<<" in line or (
+                    op == "RUN" and any(word.startswith("--mount=") and
+                    (not word.startswith("--mount=type=cache,") or ",from=" in word) for word in words)):
+                raise ValueError(f"unsupported toolchain context input: {line[:100]}")
+            if op != "COPY":
+                continue
+            if len(words) < 3:
+                raise ValueError("toolchain COPY requires literal local sources and a destination")
+            for source in words[1:-1]:
+                path = source.rstrip("/")
+                if (not re.fullmatch(r"[\w.][\w./-]*", path, re.ASCII) or
+                        any(part in ("", ".", "..") for part in path.split("/")) or path == "Dockerfile"):
+                    raise ValueError(f"unsupported toolchain COPY input: {source}")
+                required.add(path)
+        raw = git("--literal-pathspecs", "ls-tree", "-rz", tree, "--", *sorted(required), "Dockerfile.dockerignore")
+        files = []
+        for entry in raw.split(b"\0"):
+            if entry:
+                header, path = entry.decode().split("\t", 1)
+                mode, kind, oid = header.split()
+                if kind != "blob" or mode not in ("100644", "100755"):
+                    raise ValueError(f"toolchain input must be a regular committed file: {path}")
+                files.append((path, mode, oid))
+        paths = {path for path, _, _ in files}
+        if not {".dockerignore", *POLICY}.issubset(paths):
+            raise ValueError("missing committed toolchain ignore or invocation policy file")
+        for source in sorted(required):
+            if source not in paths and not any(path.startswith(source + "/") for path in paths):
+                raise ValueError(f"missing committed toolchain input: {source}")
+        return cls(recipe, tuple(files))
+
+    def identity(self, isa: str) -> dict:
+        """Bind recipe bytes, complete local input closure, invocation policy and ISA."""
+        if isa not in ISAS:
+            raise ValueError("toolchain requires AVX512 or AVX2")
+        value = {"schema": SCHEMA, "cpu_isa": isa, "objects": self.files,
+                 "recipe_sha256": hashlib.sha256(self.recipe).hexdigest()}
+        value["fingerprint"] = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
+        return value
+
+    def stage(self, path: Path) -> None:
+        """Materialize exactly the fingerprinted blobs and modes, never a second recipe."""
+        path.mkdir()
+        (path / "Dockerfile").write_bytes(self.recipe)
+        for name, mode, oid in self.files:
+            target = path / name
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(git("cat-file", "blob", oid))
+            target.chmod(int(mode[-3:], 8))
+
+
 def identity(tree: str, isa: str) -> dict:
-    """Bind the available dependency context, policy version and explicit ISA."""
-    if isa not in ISAS:
-        raise ValueError("toolchain cache requires AVX512 or AVX2")
-    entries = git("ls-tree", "-r", "-z", tree, "--", *INPUTS).split(b"\0")
-    objects = [entry.decode() for entry in entries if entry]
-    paths = [entry.split("\t", 1)[1] for entry in objects]
-    if any(required not in paths for required in ("Dockerfile", ".dockerignore", "requirements.txt")):
-        raise ValueError("toolchain dependency context is incomplete")
-    if any(entry.split()[0] not in ("100644", "100755") for entry in objects):
-        raise ValueError("toolchain inputs must be regular committed files")
-    value = {"schema": SCHEMA, "cpu_isa": isa, "objects": objects}
-    value["fingerprint"] = hashlib.sha256(json.dumps(value, sort_keys=True).encode()).hexdigest()
-    return value
-
-
-def prepare(root: Path, isa: str, github_output: Path) -> None:
-    """Stage one restricted source context and immutable per-ISA cache keys."""
-    root.mkdir(parents=True, exist_ok=False)
-    context = root / "inputs"
-    context.mkdir()
-    tree = git("rev-parse", "HEAD^{tree}").decode().strip()
-    archive = git("archive", "--format=tar", tree, "--", *INPUTS)
-    with tarfile.open(fileobj=io.BytesIO(archive)) as source:
-        source.extractall(context, filter="data")
-    with github_output.open("a") as output:
-        output.write(f"context={context}\nroot={root}\n")
-        for selected in ISAS if isa == "both" else (isa,):
-            admitted = identity(tree, selected)
-            suffix = selected.lower()
-            output.write(f"key_{suffix}=llaminar-toolchain-oci-v{SCHEMA}-{suffix}-{admitted['fingerprint']}\n")
-            output.write(f"fingerprint_{suffix}={admitted['fingerprint']}\n")
-            output.write(f"path_{suffix}={root / suffix}\n")
+    """Recompute the required toolchain identity independently for a source snapshot."""
+    return DependencyContext.from_tree(tree).identity(isa)
 
 
 def regular(path: Path) -> None:
@@ -106,8 +151,8 @@ def blob(layout: Path, descriptor: dict, *, contents: bool = True) -> bytes:
 def admit(layout: Path, expected: dict, *, verify_layers: bool = False) -> dict:
     """Admit a single Linux/amd64 image bound to the exact dependency identity.
 
-    Cache restoration validates all layer digests once. The source image driver
-    rechecks the manifest/config and layer extents; BuildKit owns validation of
+    Local OCI export validates all layer digests once. The source image driver
+    rechecks the manifest/config, receipt and layer extents; BuildKit owns validation of
     the layer bytes as it imports the pinned OCI context into its content store.
     """
     if layout.is_symlink() or (layout / "blobs").is_symlink() or (layout / "blobs/sha256").is_symlink():
@@ -165,35 +210,59 @@ def build_context_arguments(isa: str, source_tree: str) -> list[str]:
         raise ValueError(f"{TOOLCHAIN_ROOT_ENV} must name the prepared absolute directory")
     layout = root / isa.lower()
     admitted = admit(layout, identity(source_tree, isa))
+    receipt = root / f"{isa.lower()}-toolchain.json"
+    regular(receipt)
+    verified = json.loads(receipt.read_bytes())
+    if not isinstance(verified, dict) or any(verified.get(key) != value for key, value in admitted.items()):
+        raise ValueError("toolchain receipt does not match the admitted OCI artifact")
     print(f"[toolchain-cache] consume isa={isa} manifest={admitted['manifest']} "
           f"inputs={admitted['fingerprint']}", flush=True)
     return ["--build-context", f"toolchain=oci-layout://{layout}@{admitted['manifest']}"]
 
 
+def verify(root: Path, expected: dict) -> None:
+    """Issue a receipt only after hashing all layers of a completed local export."""
+    started = time.monotonic()
+    suffix = expected["cpu_isa"].lower()
+    path = root / f"{suffix}-toolchain.json"
+    path.unlink(missing_ok=True)  # A rejected re-verification cannot leave yesterday's proof.
+    receipt = admit(root / suffix, expected, verify_layers=True)
+    receipt["validation_seconds"] = time.monotonic() - started
+    path.write_text(json.dumps(receipt, indent=2) + "\n")
+    print("[toolchain-cache] " + json.dumps(receipt), flush=True)
+
+
+def build_toolchains(root: Path, isa: str) -> None:
+    """Solve the real dependency stage on the retained worker and verify each ISA in turn.
+
+    Local BuildKit DAG hits reuse SDK/RCCL layers; there is no separate cache-only
+    solve, GHA importer/exporter or remote-archive round trip. Cold workers must
+    build the same full stage. A failed solve never authorizes an old export.
+    """
+    if not root.is_absolute() or isa not in (*ISAS, "both"):
+        raise ValueError("toolchain build requires an absolute output root and a shipping ISA or both")
+    root.mkdir(parents=True, exist_ok=False)
+    context = root / "inputs"
+    inputs = DependencyContext.from_tree(git("rev-parse", "HEAD^{tree}").decode().strip())
+    inputs.stage(context)
+    for selected in ISAS if isa == "both" else (isa,):
+        expected = inputs.identity(selected)
+        layout = root / selected.lower()
+        subprocess.run(["docker", "buildx", "build", "--progress=plain", "--network=host",
+                        "--platform=linux/amd64", "--target=toolchain", "--provenance=false", "--sbom=false",
+                        "--build-arg", f"LLAMINAR_CPU_ISA={selected}", "--label", f"{ISA_LABEL}={selected}",
+                        "--label", f"{INPUT_LABEL}={expected['fingerprint']}",
+                        "--output", f"type=oci,dest={layout},tar=false", str(context)], check=True)
+        verify(root, expected)
+
+
 def main() -> None:
-    """Prepare keys or verify/save an independently restored toolchain image."""
+    """Prepare the dependency authority consumed by the existing source-image driver."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("command", choices=("prepare", "verify"))
     parser.add_argument("--root", type=Path, required=True)
     parser.add_argument("--cpu-isa", choices=(*ISAS, "both"), required=True)
-    parser.add_argument("--github-output", type=Path)
-    parser.add_argument("--cache-hit", choices=("true", "false"), default="false")
     args = parser.parse_args()
-    if not args.root.is_absolute():
-        parser.error("--root must be absolute")
-    if args.command == "prepare":
-        if args.github_output is None:
-            parser.error("prepare requires --github-output")
-        prepare(args.root, args.cpu_isa, args.github_output)
-    else:
-        if args.cpu_isa == "both":
-            parser.error("verify requires one explicit ISA")
-        started = time.monotonic()
-        tree = git("rev-parse", "HEAD^{tree}").decode().strip()
-        receipt = admit(args.root / args.cpu_isa.lower(), identity(tree, args.cpu_isa), verify_layers=True)
-        receipt.update(cache_restored=args.cache_hit == "true", validation_seconds=time.monotonic() - started)
-        (args.root / f"{args.cpu_isa.lower()}-toolchain.json").write_text(json.dumps(receipt, indent=2) + "\n")
-        print("[toolchain-cache] " + json.dumps(receipt), flush=True)
+    build_toolchains(args.root, args.cpu_isa)
 
 
 if __name__ == "__main__":

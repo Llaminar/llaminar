@@ -52,8 +52,11 @@ class ToolchainCacheTests(unittest.TestCase):
         self.repo = self.root / "repo"
         self.repo.mkdir()
         self.git("init", "-q")
-        for name, data in {"Dockerfile": "FROM scratch AS toolchain\n", ".dockerignore": ".git\n",
-                           "requirements.txt": "dependency==1\n", "scripts/docker/seed": "SDK1\n",
+        for name, data in {"Dockerfile": "FROM scratch AS toolchain\n"
+                           "COPY scripts/docker/seed requirements.txt /sdk/\n"
+                           "COPY scripts/build/ /build/\nFROM toolchain AS builder\nCOPY src/ /src/\n",
+                           ".dockerignore": ".git\n", "requirements.txt": "dependency==1\n",
+                           "scripts/docker/seed": "SDK1\n", "scripts/docker/packager": "runtime only\n",
                            "scripts/build/guard.py": "policy = 1\n", "src/source.cpp": "version1\n",
                            "scripts/ci/toolchain_cache.py": "schema = 1\n",
                            ".github/actions/cache-develop-toolchain/action.yml": "name: policy\n"}.items():
@@ -82,7 +85,16 @@ class ToolchainCacheTests(unittest.TestCase):
         tree = self.commit()
         self.assertEqual(cache.identity(tree, "AVX512"), before)
         self.assertNotEqual(cache.identity(tree, "AVX2")["fingerprint"], before["fingerprint"])
-        for name in ("Dockerfile", ".dockerignore", "requirements.txt", "scripts/docker/seed", "scripts/build/guard.py",
+        dockerfile = self.repo / "Dockerfile"
+        with dockerfile.open("a") as stream:
+            stream.write("COPY scripts/docker/packager /packager\n")
+        (self.repo / "scripts/docker/packager").write_text("new downstream package\n")
+        tree = self.commit()
+        self.assertEqual(cache.identity(tree, "AVX512"), before)
+        dockerfile.write_text(dockerfile.read_text().replace("FROM scratch", "ARG SDK_VERSION=2\nFROM scratch"))
+        tree = self.commit()
+        self.assertNotEqual(cache.identity(tree, "AVX512"), before)
+        for name in (".dockerignore", "requirements.txt", "scripts/docker/seed", "scripts/build/guard.py",
                      "scripts/ci/toolchain_cache.py", ".github/actions/cache-develop-toolchain/action.yml"):
             previous = cache.identity(tree, "AVX512")
             with (self.repo / name).open("a") as stream:
@@ -91,18 +103,60 @@ class ToolchainCacheTests(unittest.TestCase):
             self.assertNotEqual(cache.identity(tree, "AVX512")["fingerprint"], previous["fingerprint"])
 
     def test_restricted_context_contains_all_keyed_dependencies_and_no_application_source(self):
-        output = self.root / "output"
-        cache.prepare(self.root / "prepared", "both", output)
-        self.assertTrue((self.root / "prepared/inputs/scripts/docker/seed").is_file())
-        self.assertFalse((self.root / "prepared/inputs/src").exists())
-        values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-        for isa in cache.ISAS:
-            self.assertIn(cache.identity(self.tree, isa)["fingerprint"], values["key_" + isa.lower()])
+        inputs = cache.DependencyContext.from_tree(self.tree)
+        context = self.root / "inputs"
+        (self.repo / "scripts/docker/seed").write_text("dirty, not authorized\n")
+        inputs.stage(context)
+        self.assertEqual((context / "scripts/docker/seed").read_text(), "SDK1\n")
+        files = {str(path.relative_to(context)) for path in context.rglob("*") if path.is_file()}
+        self.assertEqual(files, {"Dockerfile", ".dockerignore", "requirements.txt", "scripts/docker/seed",
+                                 "scripts/build/guard.py", *cache.POLICY})
+        self.assertNotIn(b"AS builder", (context / "Dockerfile").read_bytes())
+        self.assertEqual(hashlib.sha256((context / "Dockerfile").read_bytes()).hexdigest(),
+                         inputs.identity("AVX512")["recipe_sha256"])
+
+    def test_new_copy_directory_tracks_nested_files_and_modes_without_an_input_list(self):
+        dockerfile = self.repo / "Dockerfile"
+        dockerfile.write_text(dockerfile.read_text().replace("FROM toolchain AS builder",
+            "COPY extra/tools/ /new-sdk/\nFROM toolchain AS builder"))
+        helper = self.repo / "extra/tools/nested/generate"
+        helper.parent.mkdir(parents=True)
+        helper.write_text("generator v1")
+        first = cache.DependencyContext.from_tree(self.commit())
+        helper.chmod(0o755)
+        second = cache.DependencyContext.from_tree(self.commit())
+        self.assertNotEqual(first.identity("AVX2"), second.identity("AVX2"))
+        ctx = self.root / "second"
+        second.stage(ctx)
+        self.assertEqual((ctx / "extra/tools/nested/generate").stat().st_mode & 0o777, 0o755)
+        (helper.parent / "new-input").write_text("more data")
+        self.assertNotEqual(second.identity("AVX2"), cache.identity(self.commit(), "AVX2"))
+
+    def test_missing_ambiguous_or_unsupported_input_fails_before_issuing_identity(self):
+        dockerfile = self.repo / "Dockerfile"
+        original = dockerfile.read_text()
+        boundary = "FROM toolchain AS builder"
+        for instruction in ("COPY missing /tmp/", "COPY --from=other x /tmp/", "COPY scripts/* /tmp/",
+                            "ADD remote /tmp/", "RUN --mount=type=bind,target=/src build", boundary):
+            with self.subTest(instruction=instruction):
+                dockerfile.write_text(original.replace(boundary, instruction + "\n" + boundary))
+                with self.assertRaises(ValueError):
+                    cache.identity(self.commit(), "AVX2")
+        dockerfile.write_text(original.replace(boundary, "FROM scratch AS app"))
+        with self.assertRaisesRegex(ValueError, "boundary"):
+            cache.identity(self.commit(), "AVX2")
+        dockerfile.write_text(original)
+        seed = self.repo / "scripts/docker/seed"
+        seed.unlink()
+        seed.symlink_to("../../requirements.txt")
+        with self.assertRaisesRegex(ValueError, "regular committed file"):
+            cache.identity(self.commit(), "AVX512")
 
     def test_artifact_survives_source_failure_and_binds_a_new_source_tree_by_digest(self):
         expected = cache.identity(self.tree, "AVX512")
         root = self.root / "artifacts"
         descriptor, _ = oci(root / "avx512", expected)
+        cache.verify(root, expected)
         # A failed/changed application does not change the completed dependency image.
         (self.repo / "src/source.cpp").write_text("downstream source failed\n")
         source_tree = self.commit()
@@ -144,6 +198,76 @@ class ToolchainCacheTests(unittest.TestCase):
         with patch.dict(os.environ, {cache.TOOLCHAIN_ROOT_ENV: str(self.root)}), \
              self.assertRaisesRegex(ValueError, "missing"):
             cache.build_context_arguments("AVX512", self.tree)
+
+    def test_cold_build_and_layer_verification_are_mandatory_even_without_a_cache_service(self):
+        # Replace only the external solver. The real staging, command, verifier,
+        # receipts and source-consumption path run for single and dual-ISA callers.
+        real_run = subprocess.run
+        for request in (*cache.ISAS, "both"):
+            with self.subTest(request=request):
+                calls = []
+                def solve(command, **kwargs):
+                    if command[0] != "docker":
+                        return real_run(command, **kwargs)
+                    self.assertTrue(kwargs["check"])
+                    self.assertEqual(command[:3], ["docker", "buildx", "build"])
+                    self.assertIn("--target=toolchain", command)
+                    self.assertIn("--platform=linux/amd64", command)
+                    self.assertFalse(any(arg.startswith(("--cache-from", "--cache-to")) or
+                                         "type=gha" in arg for arg in command))
+                    selected = command[command.index("--build-arg") + 1].split("=")[1]
+                    expected = cache.identity(self.tree, selected)
+                    self.assertIn(f"{cache.INPUT_LABEL}={expected['fingerprint']}", command)
+                    self.assertIn(f"{cache.ISA_LABEL}={selected}", command)
+                    self.assertTrue((Path(command[-1]) / "scripts/build/guard.py").is_file())
+                    self.assertFalse((Path(command[-1]) / "src").exists())
+                    self.assertEqual(command[command.index("--output") + 1],
+                        f"type=oci,dest={root / selected.lower()},tar=false")
+                    oci(root / selected.lower(), expected)
+                    calls.append(selected)
+                    return subprocess.CompletedProcess(command, 0)
+                root = self.root / request
+                with patch.object(subprocess, "run", side_effect=solve), patch.dict(os.environ, {
+                        "ACTIONS_CACHE_URL": "http://127.0.0.1:1/unavailable", cache.TOOLCHAIN_ROOT_ENV: str(root)}):
+                    cache.build_toolchains(root, request)
+                    self.assertEqual(calls, list(cache.ISAS) if request == "both" else [request])
+                    for selected in calls:
+                        arguments = cache.build_context_arguments(selected, self.tree)
+                        receipt = json.loads((root / f"{selected.lower()}-toolchain.json").read_bytes())
+                        self.assertTrue(arguments[-1].endswith("@" + receipt["manifest"]))
+
+    def test_failed_solve_or_corrupt_export_cannot_issue_a_success_receipt(self):
+        real_run = subprocess.run
+        for reason in ("build-error", "corrupt-layer"):
+            with self.subTest(reason=reason):
+                root = self.root / reason
+                def solve(command, **kwargs):
+                    if command[0] != "docker":
+                        return real_run(command, **kwargs)
+                    if reason == "build-error":
+                        raise subprocess.CalledProcessError(19, command)
+                    _, layer = oci(root / "avx2", cache.identity(self.tree, "AVX2"))
+                    layer.write_bytes(b"x" * layer.stat().st_size)
+                    return subprocess.CompletedProcess(command, 0)
+                with patch.object(subprocess, "run", side_effect=solve), self.assertRaises(
+                        subprocess.CalledProcessError if reason == "build-error" else ValueError):
+                    cache.build_toolchains(root, "AVX2")
+                self.assertFalse((root / "avx2-toolchain.json").exists())
+
+    def test_missing_or_stale_receipt_rejected_before_image_consumption(self):
+        expected = cache.identity(self.tree, "AVX2")
+        root = self.root / "artifacts"
+        oci(root / "avx2", expected)
+        with patch.dict(os.environ, {cache.TOOLCHAIN_ROOT_ENV: str(root)}):
+            with self.assertRaisesRegex(ValueError, "missing"):
+                cache.build_context_arguments("AVX2", self.tree)
+            cache.verify(root, expected)
+            receipt = root / "avx2-toolchain.json"
+            values = json.loads(receipt.read_bytes())
+            values["manifest"] = "sha256:" + "a" * 64
+            receipt.write_text(json.dumps(values))
+            with self.assertRaisesRegex(ValueError, "receipt does not match"):
+                cache.build_context_arguments("AVX2", self.tree)
 
     def test_invalid_metadata_cannot_substitute_or_redirect_the_cached_image(self):
         expected = cache.identity(self.tree, "AVX512")

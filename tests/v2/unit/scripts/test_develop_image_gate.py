@@ -46,6 +46,31 @@ def pr_report() -> dict:
 class DevelopImageGateTests(unittest.TestCase):
     """Keep develop publishing smaller than, and incapable of replacing, certification."""
 
+    def test_toolchain_action_binds_the_source_driver_only_after_local_verification(self):
+        """Exercise the composite's actual shell and its failure edge; cache services are not steps."""
+        action = yaml.load((ROOT / ".github/actions/cache-develop-toolchain/action.yml").read_text(),
+                           Loader=yaml.BaseLoader)
+        self.assertEqual(action["runs"]["using"], "composite")
+        step, = action["runs"]["steps"]
+        self.assertEqual(set(step), {"name", "shell", "env", "run"})
+        self.assertEqual(step["env"], {"CPU_ISA": "${{ inputs.cpu-isa }}"})
+        self.assertEqual(step["shell"], "bash")
+        for isa, rc in (("AVX512", 0), ("AVX2", 0), ("both", 0), ("AVX512", 19)):
+            with self.subTest(isa=isa, rc=rc), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                (root / "scripts/ci").mkdir(parents=True)
+                (root / "scripts/ci/toolchain_cache.py").write_text(
+                    "import os,sys\n"
+                    "assert sys.argv[1:] == ['--root', os.environ['RUNNER_TEMP'] + '/llaminar-toolchains', "
+                    "'--cpu-isa', os.environ['CPU_ISA']]\nraise SystemExit(int(os.environ['PROOF_RC']))\n")
+                envfile = root / "env"
+                envfile.touch()
+                result = subprocess.run(["bash", "-c", step["run"]], cwd=root, env={**os.environ,
+                    "RUNNER_TEMP": temp, "GITHUB_ENV": str(envfile), "CPU_ISA": isa, "PROOF_RC": str(rc)})
+                self.assertEqual(result.returncode, rc)
+                self.assertEqual(envfile.read_text(), "" if rc else
+                    f"LLAMINAR_DOCKER_TOOLCHAIN_ROOT={temp}/llaminar-toolchains\n")
+
     def test_pr_driver_runs_exact_unit_and_host_inventories_and_rejects_skips(self):
         """Replay real CTest selection while poison accelerator cases stay unrun."""
         for unit_outcome, host_outcome in ((0, 0), (7, 0), (77, 0), (0, 7), (0, 77)):

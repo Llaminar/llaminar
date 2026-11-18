@@ -94,8 +94,8 @@ not hardware qualification.
 Build-only publication does not require native ISA support.
 
 PR registry cache access is `import-only`, with no registry credentials or
-cache export. The `cache-develop-toolchain` action restores or builds complete,
-dependency-bound OCI images before source compilation. No registry-write
+cache export. The `cache-develop-toolchain` action builds and authenticates a complete
+per-ISA OCI toolchain on the retained worker before source compilation. No registry-write
 permission is granted. The model-free image compiles Unit and preflight
 executables, while `run_develop_pr_tests.py` executes only complete Unit and
 host inventories. Unit retains unrestricted parallelism; host uses canonical
@@ -155,40 +155,30 @@ Registry access defaults to `read-write` for publication; PRs explicitly select
 authorities are mutually exclusive.
 
 Both development workflows first run `.github/actions/cache-develop-toolchain`.
-`toolchain_cache.py` constructs a restricted committed dependency context and
-keys a complete OCI toolchain image by those Git objects, policy version and
-CPU ISA. Source-only commits retain the key. SDK/installer, dependency-pin,
-Dockerfile and packaging-policy changes invalidate it. An undeclared dependency
-is absent from that build context and fails explicitly.
+`scripts/ci/toolchain_cache.py` builds the complete `toolchain` target on the
+named `llaminar-develop` BuildKit worker. No Actions-cache archive or SDK
+cache import/export is used in this step. Cold workers install the declared
+SDKs and dependencies; warm workers reuse their own layers and compiler cache
+mounts (`keep-state: true`). Cold builds still need the ordinary base image and
+pinned upstream installers. Authenticating the full OCI export costs local I/O
+also on a warm worker; it is not a cross-host image-transfer mechanism.
 
-An exact Actions cache hit restores the complete image. OCI descriptor hashes,
-layer bytes, platform and input/ISA labels must authenticate before admission;
-an invalid artifact fails instead of silently rebuilding. The source-bound
-image driver independently admits its dependency identity and passes the
-digest-pinned `toolchain=oci-layout://...` named context to Buildx. This replaces
-the toolchain stage directly, without depending on intermediate solver-cache
-hits. The builder declares its build arguments explicitly because an external
-image does not inherit in-file ARG state. Both development workflows pin Buildx and
-BuildKit to the same versions.
+Direct and prepared builds share the root Dockerfile: the prepared recipe ends
+at the named `FROM toolchain AS builder` boundary. Its literal `COPY` file and
+directory operands select the committed, mode-preserving input closure. The
+fingerprint binds that recipe, the copied objects, ignore rules, admission and
+invocation policy, and CPU ISA. Edits to downstream builder, test-runner or
+runtime packaging do not change it. Unsupported dependency input syntax is
+rejected rather than guessed; a missing declared file is an error.
 
-On a cold image-cache miss, `gpu-sdk` is checkpointed through the GitHub Actions
-cache v2 backend in `mode=max` under `llaminar-gpu-sdk`. The complete toolchain
-then builds, exports as OCI and authenticates. It is saved before Llaminar
-compilation, so a later build/test failure retains the dependency image.
-Old mutable ISA toolchain layer-cache indexes are no longer used. PR entries
-belong to their merge ref and cannot be
-restored by develop publication or another PR. They remain reusable across
-updates to that PR. Develop populates the same dependency keys for inbound PRs to read.
-The repository's cache storage limit is configured in GitHub Actions settings;
-GitHub owns eviction. These caches contain dependency images, not source
-builds or compiler-object cache mounts. The named `llaminar-develop` BuildKit worker uses `keep-state: true`; its
-local layers and ccache mounts survive job cleanup, failed builds and later
-commits. Each physical host retains its own worker, shared only by that host's
-serial jobs; compiler caches are not transferred between the hosts. Per-ISA `*-toolchain.json` receipts record restore/build status,
-dependency fingerprint, image manifest, size and validation time. The canonical
-image driver still admits and builds the exact source snapshot. See
-[Docker's cache backend reference](https://docs.docker.com/build/cache/backends/gha/)
-and [GitHub's cache scope rules](https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#restrictions-for-accessing-a-cache).
+Each requested ISA must export a complete Linux/amd64 OCI layout. Manifest
+and config digest, platform, input/ISA labels and **all layer bytes** must pass
+before its `*-toolchain.json` receipt is written. A build or verification
+failure aborts the job. Before building the exact source snapshot the image
+driver separately checks the source-derived identity and the matching receipt,
+and consumes only the digest-pinned `toolchain=oci-layout://...` context. Neither
+a layer cache hit nor a toolchain receipt replaces the source-image build, Unit,
+host or image-bound test receipts.
 Artifacts retain build/publication logs, timelines and identity
 receipts, never source snapshots or compiler caches.
 
