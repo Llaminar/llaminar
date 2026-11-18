@@ -998,6 +998,88 @@ IDs. This gap leaves the indexed decoder's instruction and dependency
 costs to be quantified before assigning the remaining time to memory.
 [G15 route, physical fetch and issue counters](/tmp/qfn-mi50-all-readers-c2/g15-score.json)
 
+### Original TP4 full-model checkpoint
+
+Release `117b1d9d9` used the original 128/128/128/256 routed shard widths.
+Each result is the median of three 256-token generations on the same four
+MI50s after warmup. Both prompts used the same token IDs and empty prefix
+cache. Ordinary, fixed-depth-3 and dynamic Llaminar matched all 256 ordinary
+output tokens on each trial. The fixed and dynamic comparisons with the
+previous Llaminar build matched all five measured verifier work counters.
+
+| Mode | Review prefill / decode (tok/s) | Code prefill / decode (tok/s) |
+| --- | ---: | ---: |
+| Ordinary Llaminar | 1040.54 / 86.41 | 1009.22 / 81.18 |
+| Ordinary Castagna | 874.62 / 85.76 | 922.66 / 73.64 |
+| Fixed-depth-3 Llaminar | 1001.58 / 136.83 | 970.02 / 112.71 |
+| Fixed-depth-3 Castagna | 785.74 / 117.62 | 892.87 / 108.39 |
+
+Against the previous Llaminar fixed-depth release the median paired decode
+gains were 4.88% and 4.86%, with prefill within 0.08%. Ordinary decode was
+0.66% and 0.59% slower during these trials. Host I/O pressure overlapped
+the code prompt. The external measurements used the same input IDs and
+diverged during generation. Castagna fixed-depth also diverged from its
+own ordinary history.
+[Fixed-depth and ordinary same-work comparisons](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-comparison.json)
+[Ordinary fork reference](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-fork-off-reference.json)
+[Fixed-depth fork reference](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-fork-fixed3-reference.json)
+
+Dynamic decode reached 129.52 tok/s on review and 106.30 on code. The
+same-boot staged control measured 115.92 and 94.43. Paired improvements
+were 11.76% and 12.69%. Prefill stayed within 0.23% across the controls.
+[Three complete dynamic comparisons](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-dynamic-comparison.json)
+
+### Physical read limits on the six-row TP4 verifier
+
+The Release build at `117b1d9d9` ran layer 1 from the original QFN GGUF on
+the 256-column routed, 160-column shared shard. Its six full verifier rows
+selected 60 expert slots and 55 distinct experts. At each full-live replay
+the ordered IDs and FP32 route weights matched. The gate and down probes
+read the same ordered IDs and original role formats on the same MI50.
+
+| Operation | Timed native dispatch | Native physical fetch | Read-only calibration | Fraction of measured read bandwidth |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_K gate/up plus shared Q8_0 | 101.44 µs | 491.42 GB/s | 578.43 GB/s | 85.0% |
+| Q5_1 down plus shared Q8_0 | 60.64 µs | 470.67 GB/s | 642.15 GB/s | 73.3% |
+
+Timings cover the final 512 full-live dispatches. Each physical count comes
+from a separate warm dispatch. The gate used 255 blocks and down used 40
+blocks across each of six rows. Both used 256 threads per block. The
+four-bank calibration verified each output lane and used 39 unprofiled
+samples per role. The percentages measure bandwidth for this specific
+access pattern. Production also decodes weights, computes projections,
+and publishes outputs.
+[Original route tape, physical counters and calibration](/tmp/qfn-mi50-m6-roofline-bd/physical-score.json)
+
+### Register router for intermediate verifier capacities
+
+The MI50 router used its fixed-row FP16 projection at physical capacities
+4, 7 and 8. Capacities 2, 3, 5 and 6 can use the same two compiled entries.
+At six rows, projection time fell from 40.12 to 26.15 µs. Projection and
+top-K together fell from 54.27 to 40.67 µs. The eight-row register entry
+used 19 VGPRs, versus 43 in the previous projection. Both had zero spills.
+The replay compared the FP32 logit bytes, routing IDs and weights across
+live counts, including zero.
+
+| Six-row original TP4 shard | Previous router + FFN | Register router + FFN |
+| --- | ---: | ---: |
+| Q4_K, F128/S160 | 149.38 µs | 138.34 µs |
+| Q4_K, F256/S160 | 215.31 µs | 202.08 µs |
+| Q5_K, F256/S160 | 267.89 µs | 256.74 µs |
+
+The unchanged four-row Q4_K control measured 113.43 and 113.16 µs in the
+same repeated bracket. All five focused production preflight tests passed,
+including fixed-row capture for every capacity 2–8 and retained single-row
+numerics. The retained HC/FFN loadable sections matched on gfx906 and gfx1100.
+In the four-MI50 Release run, dynamic decode rose from 129.52 to 131.75
+tok/s on review and from 106.30 to 108.37 on code. All six generations and
+five verifier counters matched their controls. Prefill changed by −0.37% and
+−0.15%. Short-window host I/O pressure reached 8–13% during this candidate.
+[Matched four-MI50 Release comparison](/tmp/qfn-mi50-w-r3-verifier-cohort/router-buckets-comparison.json)
+[Router and selector timings](/tmp/qfn-mi50-router-buckets-49/matched.json)
+[Original shard timings](/tmp/qfn-mi50-router-buckets-49/window/comparison-control-a2.json)
+[Canonical Release qualification](/tmp/qfn-mi50-fixed-bank-proof/canonical-router-buckets/qualified.json)
+
 ## Reproduction
 
 The local evidence root for native phase attribution is

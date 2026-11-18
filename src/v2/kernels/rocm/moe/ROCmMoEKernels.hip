@@ -16905,7 +16905,7 @@ bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
     (void)hipGetLastError();
 
     bool fixed_rows = false;
-    if (device_effective_seq_len && (seq_len == 4 || seq_len == 7 || seq_len == 8) &&
+    if (device_effective_seq_len && seq_len >= 2 && seq_len <= 8 &&
         d_model == 2560 && num_experts == 512 && llaminar2::qfnGroupedFP16RouterFixedRowsOptIn())
     {
         const auto &hardware = llaminar2::rocmHardwareMetadata().at(device_idx);
@@ -16919,7 +16919,9 @@ bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
             return false;
         const auto native = static_cast<hipStream_t>(stream);
         const auto *gate = static_cast<const __half *>(gate_weights_fp16);
-        if (seq_len == 4)
+        // Size the register accumulator array for the admitted row capacity.
+        // The device count still bounds every load and store in the final tile.
+        if (seq_len <= 4)
             hipLaunchKernelGGL(qfn_grouped_fp16_router_fixed_rows<4>, dim3(512), dim3(128), 0,
                 native, hidden, gate, logits, device_effective_seq_len, seq_len);
         else

@@ -2,7 +2,7 @@
 
 Status dashboard for 15 physical decoder specialisations. Limit 15,000 UTF-8 bytes.
 
-## Full-model throughput on four MI50s
+## Full-model throughput on four MI50s with equal-width Llaminar shards
 
 Both Release engines used the same four model shards, the same four cards
 behind one switch, an empty prompt cache, and the same exact input IDs.
@@ -54,20 +54,18 @@ The counted four-row reader passed static and deferred replay across all
 15 generated format families. Median local time improved 9.23% over staged.
 On original 128- and 256-column QFN shards, paired gate/up reads saved
 10%–13% on Q4_K; Q5_K was 4.5%–7.9% slower, so its reads stay separate.
-On original TP4 shards, the checkpointed Release build reached 130.72 tok/s on
-review512 and 107.28 on code2048 at fixed depth three. At dynamic depth
-it reached 116.08 and 94.74. Four-row dedicated tiles now bring the wide
-Q4 gate to 87.5% of its matched physical-read reference. The complete
-four-row router/FFN fell from 178.30 to 151.10 µs on the wide TP4 shard
-and from 119.20 to 114.12 µs on the narrow shard. The smallest TP8
-shard took 0.42 µs longer. Nine focused preflight tests passed.
-The counted six-row FFN reduced the captured local router/FFN time by
-35.5% on the narrow shard and 25.0% on the wide shard.
-On four MI50s the six-row change alone raised dynamic decode from 115.92 to
-126.91 tok/s on review and 94.43 to 103.81 on code, with matching tokens
-and verifier work. The combined Release passed 13 focused preflight cases.
-At four rows and F256/S256, all 15 generated format families improved,
-with a 22.01% median reduction in local time. Full-model timing is in progress.
+On the original TP4 layout, the combined four- and six-row Release and its
+predecessor generated identical tokens and performed the same verifier work.
+Fixed-depth-3 review improved from 130.46 to 136.83 tok/s and code from
+107.48 to 112.71. The fork measured 117.62 and 108.39 on the same inputs
+with different output histories. Ordinary decode reached 86.41 and 81.18
+tok/s versus the fork’s 85.76 and 73.64. Dynamic reached 129.52 and 106.30
+tok/s, 11.76% and 12.69% faster than the same-boot staged control. Thirteen focused preflight tests
+passed. The four-row, F256/S256 timings improved in all 15 generated
+families, with a median reduction of 22.01%.
+On the original six-row F256/S160 shard, gate/up reached 85.0% and down
+73.3% of the measured physical read rate for their respective packet layouts.
+[Six-row read calibration](QFN_MI50_STAGE_COMPARISON_20261118.md#physical-read-limits-on-the-six-row-tp4-verifier)
 [Six-row model trial](QFN_MI50_STAGE_COMPARISON_20261118.md#six-row-dynamic-verifier-on-the-original-tp4-shards)
 [Full-model measurements](QFN_MI50_STAGE_COMPARISON_20261118.md#transferring-the-single-row-loop-to-grouped-verification)
 [Verifier tiles and packet scheduling](QFN_MI50_STAGE_COMPARISON_20261118.md#verifier-tile-assignment-and-packet-scheduling)

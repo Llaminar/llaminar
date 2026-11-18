@@ -52,7 +52,9 @@ namespace
             ASSERT_TRUE(graph->inspectKernelNodes(nodes));
             ASSERT_EQ(nodes.size(), 1u);
             ASSERT_TRUE(nodes.front().name_resolved);
-            EXPECT_NE(nodes.front().name.find("qfn_grouped_fp16_router_fixed_rows"), std::string::npos);
+            const auto* expected_entry = rows <= 4 ? "qfn_grouped_fp16_router_fixed_rowsILi4E" :
+                                                     "qfn_grouped_fp16_router_fixed_rowsILi8E";
+            EXPECT_NE(nodes.front().name.find(expected_entry), std::string::npos) << nodes.front().name;
             EXPECT_EQ(nodes.front().grid_x, unsigned(experts));
             EXPECT_EQ(nodes.front().block_x, 128u);
             EXPECT_EQ(nodes.front().local_memory_bytes_per_thread, 0u);
@@ -99,7 +101,7 @@ namespace
 TEST(MoERouterLogits, ROCmGroupedFixedFP16RouterCapturedByteReplay)
 {
     ASSERT_TRUE(qfnGroupedFP16RouterFixedRowsOptIn());
-    for (int rows : {4, 7, 8})
+    for (int rows = 2; rows <= 8; ++rows)
         proveFixedFP16Router(rows);
 }
 } // namespace llaminar2::test
