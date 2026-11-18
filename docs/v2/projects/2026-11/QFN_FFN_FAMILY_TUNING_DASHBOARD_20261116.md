@@ -9,48 +9,29 @@ behind one switch, an empty prompt cache, and the same exact input IDs.
 Each cell has three measured generations of 256 tokens following a warmup.
 Decode measures the 255 tokens after the first.
 
-| MTP off | Llaminar prefill tok/s | Castagna prefill tok/s | Llaminar decode tok/s | Castagna decode tok/s | Decode gain |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 512-token review | 1038.42 | 876.82 | 86.92 | 86.38 | +0.62% |
-| 2048-token code | 1008.12 | 1003.40 | 80.63 | 75.48 | +6.82% |
-
-Llaminar used retained HC/FFN, ordered peer push and the inline GDN projection
-in ordinary decode. With only that last projection disabled, the same binary
-measured 78.83 and 74.05 decode tok/s. All six generated histories matched.
-Each of the four decode captures per GPU lost 466 native nodes; the prefill
-capture counts were identical. The two original builds measured 87.26/82.02
-and 86.65/80.95. Across 119 frozen final-logit rows, the final Release GDN
-arms matched byte for byte. Mean KL was 0.014315 on prefill and 0.022115 on decode.
-Across engines the first differing generated token was 0 for review and 44
-for code. Each engine repeated its own ordinary histories exactly.
-
-| MTP mode | Review prefill / decode tok/s | Code prefill / decode tok/s | Matches own ordinary histories |
+| Mode and engine | Review prefill / decode tok/s | Code prefill / decode tok/s | Matches own ordinary history |
 | --- | ---: | ---: | --- |
-| Llaminar grouped verifier, fixed 3 including three follow-up changes | 1002.74 / 122.94 | 970.94 / 100.20 | 6/6 |
-| Llaminar grouped verifier, dynamic including three follow-up changes | 1001.90 / 119.30 | 969.79 / 97.02 | 6/6 |
-| Castagna fixed 3, quiet repeat | 785.74 / 117.62 | 892.87 / 108.39 | 0/6 |
+| Llaminar, MTP off | 1082.65 / 88.71 | 1051.46 / 82.49 | 3 identical repeats per prompt |
+| Castagna, MTP off | 870.45 / 85.59 | 1003.97 / 75.03 | 3 identical repeats per prompt |
+| Llaminar, fixed 3 | 1042.02 / 134.08 | 1009.10 / 132.14 | 6/6 |
+| Castagna, fixed 3 | 785.74 / 117.62 | 892.87 / 108.39 | 0/6 |
+| Llaminar, dynamic (1–15) | 1040.70 / 120.95 | 1009.24 / 134.75 | 6/6 |
+| Castagna, adaptive (1–15) | 672.70 / 70.71 | 794.71 / 79.81 | 0/6 |
 
-Register top-K, short-context indexer fusion and vector GDN accepted-state
-publication raised fixed-depth decode from 119.20 to 122.94 tok/s on review
-and from 97.96 to 100.20 on code. The six same-executable generations and
-their MTP work matched exactly. The new candidate leads the quiet fork on
-review by 4.53% and trails on code by 7.55%. Dynamic decode rose from 115.85 to 119.30 on review and 94.23 to 97.02
-on code. All six generations retained the same MTP work.
-Independent post-reboot fixed-depth medians were 123.22 and 100.13 decode
-tok/s. Native verifier time was 24.78 versus 16.97 ms on review and
-26.39 versus 18.22 ms on code. HC, projections, routing and experts account
-for 6.27 and 6.14 ms of those gaps. On code, GDN publication fell from
-0.843 to 0.317 ms and top-K from 1.029 to 0.783 ms per verifier.
-In the preceding trace, across all 3,552 layer/round comparisons the 256-column expert shard
-finished last, typically 38 µs after the last 128-column shard. The narrow-only
-FFN fusion saved 1.76–1.91 ms of device work per card per verification,
-while whole-model throughput changed by less than 0.4% on its initial pair. Equalizing the routed widths at 160 columns reduced local
-verifier time on the former wide participant by 25–36 µs across all three
-original format pairs. Byte checks on the original GGUF passed at TP1/2/4/8
-for both layouts. The new split gave all four ranks 160 columns in every
-layer. Both real-model accuracy panels passed. Equal-width prefill/decode
-mean KL was 0.03150/0.01928 versus the original 0.01432/0.02211.
-The full-model throughput runs are in progress.
+Llaminar’s equal-width experiment placed 160 routed and 160 shared columns on
+each GPU across all 48 layers, with retained ordinary HC/FFN and a counted
+four-row FFN. Both frozen-history accuracy panels passed. Equal-width mean
+KL was 0.03150 prefill and 0.01928 decode; the original split measured
+0.01432 and 0.02211. Regrouping the FP32 partials changed the generated
+histories. Fixed-depth code used 73 verification rounds with equal widths
+versus 86 with the original split. On review those counts were 76 and 74.
+Throughput describes each engine's actual completed work.
+
+The shipping Castagna local HC/FFN kernel took 156.27 µs for four rows on
+the wide layer-1 slice. Our matched full body took 256.42 µs. Bypassing
+route grouping helped three rows but cost 5.2% at four. Routed gate/up took
+77.36 versus 27.12 µs on precisely matched expert IDs. The new full-model
+native trace will show how much equalizing the widths saves per round.
 [Phase measurements, run identities and commands](QFN_MI50_STAGE_COMPARISON_20261118.md)
 
 The current ordinary decode trace covers all 255 post-prefill review tokens.

@@ -1,11 +1,11 @@
 # Four-MI50 QFN inference phases against Castagna Veloce
 
-The fixed-depth verifier is the largest measured gap on both prompts. With
-the three follow-up changes, Llaminar used 24.78 ms per four-row review
-verification and 26.39 ms for code. Castagna used 16.97 and 18.22 ms
-including its native peer reductions. Both Llaminar fixed-depth prompts
-improved end to end. Code decode still trails the fork. The individual
-switches remain experimental.
+With 160 routed and 160 shared expert columns per GPU, Llaminar leads the
+pinned Castagna build in whole-model prefill and decode on both prompts
+with MTP off, at fixed depth three and with adaptive MTP. Llaminar also
+passed the MTP own-history check in both modes on both prompts. The local four-row HC/FFN body
+remains slower than Castagna. The comparisons below distinguish work per
+verification from output tokens per second.
 
 ## Matched workload
 
@@ -288,6 +288,105 @@ for Castagna. Attention was the only active kernel category for 0.565 and
 0.008 ms/token respectively. In Castagna, attention overlapped peer pushes
 alone for 0.337 ms/token. GPU intervals cannot distinguish a peer kernel
 moving useful data from one waiting for an arrival.
+
+## Equal-width Release qualification
+
+The same Llaminar Release ran the original and equal-width policies on the
+same quartet. Both passed the two accuracy gates above. Prefill and decode
+throughput below are in tokens per second. The fixed and adaptive Llaminar
+arms each matched all three 256-token histories from their own layout's
+ordinary decode on both prompts. Equal-width code fixed-3 took 73 rounds
+with 183 accepted draft tokens. The original split took 86 rounds with 170
+accepts. Review used 76 versus 74 rounds with 180 versus 182 accepts.
+The different work explains part of the change in delivered throughput.
+
+| Engine and policy | Review prefill / decode | Code prefill / decode |
+| --- | ---: | ---: |
+| Llaminar original, off | 1039.52 / 86.79 | 1008.07 / 81.47 |
+| Llaminar equal, off | 1082.65 / 88.71 | 1051.46 / 82.49 |
+| Castagna off, fresh quiet control | 870.45 / 85.59 | 1003.97 / 75.03 |
+| Llaminar original, fixed 3 | 998.76 / 121.50 | 969.40 / 99.85 |
+| Llaminar equal, fixed 3 | 1042.02 / 134.08 | 1009.10 / 132.14 |
+| Castagna fixed 3 | 785.74 / 117.62 | 892.87 / 108.39 |
+| Llaminar original, dynamic | 999.96 / 119.15 | 968.52 / 96.82 |
+| Llaminar equal, dynamic | 1040.70 / 120.95 | 1009.24 / 134.75 |
+| Castagna adaptive | 672.70 / 70.71 | 794.71 / 79.81 |
+
+Both adaptive controllers were allowed 1–15 draft tokens. Castagna used
+its native time-based depth policy. Its six measured adaptive outputs
+differed from its own MTP-off outputs. Each controller's timing includes
+its actual selected depths, proposed tokens and accepted work.
+[Adaptive comparator and per-request first difference](/tmp/qfn-mi50-fork-dynamic/quiet-r1.json)
+
+The equal-width reference core is
+`baa2b17af74a2711a37b16c97c6a30c11c60922ff4b262e40310bbac194a72ce`.
+It includes the experimental native gate/up, route, router and identity-indexer
+policies in its admission receipt. This is the tested binary. A clean build
+of the feature branch needs its own throughput result. The original accepted
+files, MPI teardown, driver window and physical VRAM retirement passed for
+each timing arm. The first fixed-3 candidate run failed the comparator artifact
+check; only its clean repeat contributes to the table.
+
+[Matched controls and exact sample histories](/tmp/qfn-mi50-f160-frontier-balanced-sol62/parity/combined-boot3-r1-summary.json) ·
+[Feature switches and reproduction commands](/tmp/qfn-mi50-f160-frontier-balanced-sol62/DISPATCH.md)
+
+## Four-row HC and FFN on one MI50
+
+The shipping Castagna kernel can be measured independently of its source
+rebuild. On the wide slice of layer 1 it used 60 blocks of 1,024 threads,
+64 VGPRs per lane and 51,240 bytes of shared memory per block, with zero
+private memory. It executed the local HC and FFN together. Across all 81
+verifier rounds of code2048, layers 1–47 used that fused path followed by
+a separate peer reduction. Layer 0 issued separate routed kernels. Using
+layer 0 as the timing reference would omit expert work.
+
+The harness used original QFN layer-1 weights, 256 routed columns, 192
+shared columns and identical seeded input rows. Times are microseconds per
+complete captured operation. Each timing arm had 16 samples of 32 operations.
+
+| Implementation | Three rows | Four rows |
+| --- | ---: | ---: |
+| Castagna deployed gfx906 object | — | 156.27 |
+| Castagna source rebuild in the paired harness | 126.36 | 156.71 |
+| Llaminar, reuse a loaded weight for two rows selecting the same expert | 221.72 | 256.42 |
+| Llaminar, assign work directly to the selected route slots | 206.25 | 269.66 |
+| Llaminar, load 16 adjacent weight columns and transpose partials before the ordered fold | 234.22 | 268.19 |
+
+The two Castagna entries agreed byte-for-byte on all five output planes.
+Each Llaminar variant passed 40 comparisons against its own serial oracle
+across 12 output planes. The paired fixture selected 26 distinct experts in
+40 slots. The separate 160-column native fixtures selected 35–39 across three
+layers. A second matched input came from the canonical PyTorch model at layer 1,
+using four teacher-forced rows following the original nine-token prompt.
+Castagna selected 30 distinct experts across 40 slots. Its deployed body
+took 161.45 µs and Llaminar took 263.61 µs. Packing affine scale and minimum
+together in advance increased Llaminar time to 284.35 µs. All 40 native
+comparisons passed on each arm. [Reference input planes and provenance](/tmp/qfn-mi50-real-m4-activations/manifest.json)
+
+Both microbenchmarks have a single resident layer.
+The wide serving rank took 188.48 µs for the Castagna operation in its trace.
+Actual model traffic and layer transitions matter. The previously attained
+68 µs result belongs to single-row decode.
+
+With equal routed and shared widths of 160, Llaminar's captured four-row
+FFN took 150.02 µs for Q4_K/Q5_1, 138.17 µs for Q4_K/Q8_0, and 152.79 µs
+for Q5_K/Q8_0. The corresponding staged controls took 179.00, 178.43 and
+235.64 µs. These intervals include the router and FFN. They exclude the HC
+prefix and four-device communication. Castagna's original program requires
+widths divisible by 64. Its 256-column result measures a different operation
+from these 160-column intervals.
+
+The routed gate/up phase on matched IDs took 77.36 µs in Llaminar versus
+27.12 µs in the fork on the original wide fixture. The next grid join took
+12.56 and 12.96 µs. Llaminar stages native affine coefficients through LDS and
+synchronizes the participating threads before using them. The next layout
+experiment moves lossless coefficient packing into weight preparation and
+keeps the ordered FP32 reduction. Its admission contract must preserve the
+single authoritative expert bank when weights migrate.
+
+[Shipping binary, source slices and paired replays](/tmp/qfn-mi50-fork-m4-native/REPORT.md) ·
+[Matched routed-phase census](/tmp/qfn-castagna-family-sprints-r61/G08/experiments/12-retained-body-grouped/e15-matched-gu/RESULT.md) ·
+[Native 160-column timings and traffic counters](/tmp/qfn-mi50-f160-roofline-c2-sol62/REPORT.md)
 
 ## Reproduction
 
