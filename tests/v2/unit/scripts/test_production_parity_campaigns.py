@@ -1717,7 +1717,7 @@ class ProductionParityCampaignTest(unittest.TestCase):
 
     def test_hostcall_listener_qualifies_only_with_original_host_native_atomics(self):
         """Hostcall capability qualifies its listener regression independently of ordinary compute."""
-        labels = {"ROCm", "HardwareOptional", "ROCmHostCall", "LocalHostDevices", "Devices1"}
+        labels = {"ROCm", "HardwareOptional", "ROCmHostNativeAtomics", "LocalHostDevices", "Devices1"}
         row = campaigns.PreflightRegistration("V2_Integration_HIPHostThreadStack", frozenset(labels),
                                              1, campaigns.PreflightExecutionLane.ROCM_SOCKET, 1)
         required = campaigns.preflight_optional_hardware_requirements([row])

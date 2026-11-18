@@ -120,6 +120,10 @@ one CPU package. MPI process count does not determine physical GPU count.
 local physical cardinality (`LocalHostDevices`); original NUMA ownership,
 ISA cohorts and directed peer access retain their stricter requirements. PCI
 NUMA `-1` is valid unknown locality, never evidence for an original NUMA cohort.
+The HIP hostcall listener and pooled lookup graphs that issue a system-scope
+compare/exchange on mapped host memory require the original ROCm device to
+report native host atomics. Stream wait/write, finite-join and ordinary GPU
+compute tests retain their own hardware requirements.
 Both vendors are mandatory, and selected-test failures and skips fail the gate.
 Logs and JUnit evidence are retained in `pr-tests/` and `pr-tests/gpu/`;
 `pr-tests/pr-validation.json` binds both receipts as `unit-and-hardware-preflight`

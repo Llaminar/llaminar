@@ -23,10 +23,17 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 set(_lock rocm_gpu_0)
             endif()
             foreach(_case OwnedAllHit ImportedAllHit OwnedMiss ImportedEmpty OldNoEdgeControl OriginalNativeComposerAllHit OriginalSourceAllHitAndMixed OriginalSourceTightQueryBound FutureOriginalSourceAdoptDiscard FutureOriginalSourceAfterAdoption OwnedFiniteJoin ImportedFiniteJoin MissingFiniteJoinControl)
+                set(_fork_requirements "")
+                # These four real-source graphs issue system-scope compare/exchange
+                # on the mapped host ready word. The marker-only and finite-join
+                # graphs use stream wait/write and remain valid without PCIe atomics.
+                if(_backend STREQUAL "ROCm" AND _case MATCHES "^(OriginalSource|FutureOriginalSource)")
+                    set(_fork_requirements "HardwareOptional;Devices1;LocalHostDevices;ROCmHostNativeAtomics")
+                endif()
                 add_v2_test(V2_Integration_${_backend}_LocalHotParentFork_${_case}
                     COMMAND $<TARGET_FILE:v2_integration_local_hot_native_fork>
                         --gtest_filter=LocalHotNativeParentFork.${_backend}_${_case}
-                    LABELS "V2;Integration;ProductionTestPreflight;GPU;${_backend};Graph;Ownership;TraceReplay;Ngram;Capture;LiveExtent;Regression"
+                    LABELS "V2;Integration;ProductionTestPreflight;GPU;${_backend};Graph;Ownership;TraceReplay;Ngram;Capture;LiveExtent;Regression" ${_fork_requirements}
                     MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${_lock} TIMEOUT 30 ENVIRONMENT ${_env})
                 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${_backend}_LocalHotParentFork_${_case})
             endforeach()

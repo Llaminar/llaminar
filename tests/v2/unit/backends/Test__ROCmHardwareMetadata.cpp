@@ -49,6 +49,16 @@ namespace llaminar2::test
         return result;
     }
     /** @test Neither construction nor unadmitted lookup invokes a hardware source. */
+    /** @test Only the exact GPU issuing a system CAS may authorize its mapped host access. */
+    TEST(ROCmHardwareMetadata, MappedHostCompareExchangeRequiresOriginalDeviceAtomics)
+    {
+        auto devices = records(2);
+        devices[1].host_native_atomics = true;
+        const ROCmHardwareInventory inventory(std::move(devices));
+        EXPECT_THROW(requireROCmMappedHostCompareExchange(inventory.at(0)), std::runtime_error);
+        EXPECT_NO_THROW(requireROCmMappedHostCompareExchange(inventory.at(1)));
+    }
+
     TEST(ROCmHardwareMetadata, CPUOnlyConstructionAndUnadmittedReadNeverEnumerate)
     {
         ROCmHardwareAuthority authority;

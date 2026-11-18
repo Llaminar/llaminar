@@ -25384,7 +25384,7 @@ if(HAVE_ROCM)
         PRIVATE GTest::gtest GTest::gtest_main)
     add_v2_test(V2_Integration_HIPHostThreadStack
         COMMAND $<TARGET_FILE:v2_integration_hip_host_thread_stack>
-        LABELS "V2;Integration;ProductionTestPreflight;Backends;GraphCapture;ROCm;ROCmHostCall;HIP;Memory;Lifecycle;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;Backends;GraphCapture;ROCm;ROCmHostNativeAtomics;HIP;Memory;Lifecycle;Regression"
         GPU_DEVICES 1 MPI_PROCS 1
         NO_MODELS
         TIMEOUT 30)

@@ -99,7 +99,7 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
         if (set(requirement) != required | {"requires_host_native_atomics"}
                 or requirement["requires_host_native_atomics"] is not True
                 or (backend, locality, degree) != ("rocm", "local-host", 1)):
-            raise ValueError("invalid native ROCm hostcall requirement")
+            raise ValueError("invalid native ROCm host atomics requirement")
         return
     if "maximum_context_case" in requirement or "capacity_basis" in requirement:
         if (set(requirement) != required | {"maximum_context_case", "capacity_basis"}

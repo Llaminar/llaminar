@@ -1037,7 +1037,7 @@ def preflight_optional_hardware_requirements(
         context_cases = [label.removeprefix("MaximumContext") for label in row.labels
                          if label.startswith("MaximumContext")]
         if "HardwareOptional" not in row.labels:
-            if context_cases or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair", "LocalHostDevices", "ROCmHostCall", "IndependentNUMAReporters", "NUMALocalOrdinal0"} or isa_labels or stage_labels or rank_labels or any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels):
+            if context_cases or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair", "LocalHostDevices", "ROCmHostNativeAtomics", "IndependentNUMAReporters", "NUMALocalOrdinal0"} or isa_labels or stage_labels or rank_labels or any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels):
                 raise RuntimeError("optional ISA/stage labels require HardwareOptional: " + row.name)
             continue
         device_labels = sorted(label for label in row.labels if label.startswith("Devices"))
@@ -1058,7 +1058,7 @@ def preflight_optional_hardware_requirements(
         family_labels = sorted(label for label in row.labels
                                if label.startswith(("CUDADevices", "ROCmDevices")))
         if family_labels:
-            if (row.labels & {"ROCmHostCall", "NUMALocalOrdinal0"} or context_cases or backends != {"CUDA", "ROCm"} or len(family_labels) != 2
+            if (row.labels & {"ROCmHostNativeAtomics", "NUMALocalOrdinal0"} or context_cases or backends != {"CUDA", "ROCm"} or len(family_labels) != 2
                     or len(device_labels) != 1 or isa_labels or stage_labels or rank_labels or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"}
                     or any(re.fullmatch(r"(?:CUDA|ROCm)Devices[1-9][0-9]*", label) is None for label in family_labels)):
                 raise RuntimeError("ambiguous optional mixed-family geometry: " + row.name)
@@ -1089,7 +1089,7 @@ def preflight_optional_hardware_requirements(
                 "locality": "local-host" if local_host else "two-distinct-numa-local-ranks" if distinct_ranks else "original-numa-local-rank"}
             if "NUMALocalOrdinal0" in row.labels:
                 requirement["ordinal"] = 0
-            if "ROCmHostCall" in row.labels:
+            if "ROCmHostNativeAtomics" in row.labels:
                 requirement["requires_host_native_atomics"] = True
             if context_cases:
                 if len(context_cases) != 1:
