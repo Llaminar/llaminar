@@ -110,7 +110,13 @@ PR registry cache access is `import-only`, with no registry credentials or
 cache export. The `cache-develop-toolchain` action restores or builds complete,
 dependency-bound OCI images before source compilation. No registry-write
 permission is granted. The model-free image compiles Unit and preflight
-executables. `run_develop_pr_tests.py --scope unit-and-host` executes complete
+executables. For CUDA builds, CMake uses the smaller of physical memory and
+the visible cgroup v2 limit to budget native jobs. When Ninja's default
+concurrency exceeds that budget, compilers and linkers share a Ninja pool
+and each nvcc invocation compiles the requested SMs in sequence. The build
+still uses unrestricted `--parallel` and the complete GPU architecture list.
+
+`run_develop_pr_tests.py --scope unit-and-host` executes complete
 Unit and host inventories. Unit retains unrestricted parallelism; host uses
 canonical serial scheduling. The subsequent AVX2 `--scope hardware-preflight`
 transaction observes native hardware and qualifies the complete CMake inventory.

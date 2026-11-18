@@ -1,4 +1,5 @@
-# Llaminar V2 build and public target contracts.
+# @file CMakeLists.txt
+# @brief Llaminar V2 build, backend dependencies and public target contracts.
 # Backend dependencies, generated model resources, and public header usage
 # requirements are owned here so serving tools compile independently of tests.
 cmake_minimum_required(VERSION 3.18)
@@ -293,8 +294,24 @@ if(HAVE_CUDA)
     endif()
     message(STATUS "V2: CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
     
-    # Enable nvcc multi-threaded compilation (auto-detect optimal thread count)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -t 0")
+    set(LLAMINAR_NVCC_THREADS 0)
+    if(CMAKE_GENERATOR MATCHES "Ninja")
+        include(ProcessorCount)
+        include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/CUDABuildParallelism.cmake")
+        ProcessorCount(_build_processors)
+        cmake_host_system_information(RESULT _build_memory_mib QUERY TOTAL_PHYSICAL_MEMORY)
+        if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/sys/fs/cgroup/memory.max")
+            file(STRINGS "/sys/fs/cgroup/memory.max" _cgroup_memory_bytes LIMIT_COUNT 1)
+            if(_cgroup_memory_bytes MATCHES "^[0-9]+$")
+                math(EXPR _cgroup_memory_mib "${_cgroup_memory_bytes} / 1048576")
+                if(_cgroup_memory_mib LESS _build_memory_mib)
+                    set(_build_memory_mib "${_cgroup_memory_mib}")
+                endif()
+            endif()
+        endif()
+        llaminar_configure_cuda_ninja_pools("${_build_memory_mib}" "${_build_processors}")
+    endif()
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -t ${LLAMINAR_NVCC_THREADS}")
     
     # CUDA optimization flags for Release builds
     # --use_fast_math: Enable fast math intrinsics (~10-30% speedup, slight precision loss)
@@ -303,24 +320,6 @@ if(HAVE_CUDA)
     # --prec-div=false: Fast division (slightly less accurate, negligible for inference)
     # --prec-sqrt=false: Fast sqrt (slightly less accurate)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math --ftz=true --prec-div=false --prec-sqrt=false")
-    
-    # NOTE: CUDA_SEPARABLE_COMPILATION is set on cuda_backend rather than
-    # globally. Combined with CUDA_RESOLVE_DEVICE_SYMBOLS,
-    # this resolves device symbols at library build time. Without this, every downstream
-    # executable (580+ test binaries) gets its own nvcc device-link step, adding ~19MB
-    # per executable and massive link time. With per-library resolution, only the GPU
-    # libraries need device linking — executables link normally.
-    #
-    # The nvlink_pool job limit is no longer needed (library device links vs 580+
-    # executable device links), but we keep a small pool as a safety net.
-    if(CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(GLOBAL APPEND PROPERTY JOB_POOLS nvlink_pool=8)
-        # Limit concurrent host linking — each ld.lld uses 1-2 GB RSS.
-        # Without this, 500+ test executables link simultaneously causing
-        # severe I/O wait and memory pressure.
-        set_property(GLOBAL APPEND PROPERTY JOB_POOLS link_pool=24)
-        set(CMAKE_JOB_POOL_LINK link_pool)
-    endif()
 endif()
 
 # =============================================================================
@@ -546,7 +545,7 @@ if(HAVE_CUDA)
         CUDA_EXTENSIONS ON
     )
     if(CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(TARGET cuda_backend PROPERTY JOB_POOL_LINK nvlink_pool)
+        set_property(TARGET cuda_backend PROPERTY JOB_POOL_LINK "${LLAMINAR_CUDA_DEVICE_LINK_POOL}")
     endif()
     target_include_directories(cuda_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     
