@@ -113,7 +113,9 @@ permission is granted. The model-free image compiles Unit and preflight
 executables. For CUDA builds, CMake uses the smaller of physical memory and
 the visible cgroup v2 limit to budget native jobs. When Ninja's default
 concurrency exceeds that budget, compilers and linkers share a Ninja pool
-and each nvcc invocation compiles the requested SMs in sequence. The build
+sized at 4 GiB per job after 4 GiB of host headroom. On hosts with less than
+2 GiB of usable memory per default Ninja job, each nvcc invocation compiles
+the requested SMs in sequence. The build
 still uses unrestricted `--parallel` and the complete GPU architecture list.
 
 `run_develop_pr_tests.py --scope unit-and-host` executes complete

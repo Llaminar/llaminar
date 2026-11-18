@@ -6,24 +6,30 @@ include_guard(GLOBAL)
 # @param memory_mib Physical memory on the build host or its smaller container limit, in MiB.
 # @param processors Number of CPUs available to Ninja.
 function(llaminar_configure_cuda_ninja_pools memory_mib processors)
-    # Ninja normally starts CPUs + 2 commands. In a four-SM build, nvcc -t 0
-    # multiplied 32 nvcc invocations into 102 live cicc processes on a 31 GiB
-    # host. Leave 4 GiB for the OS, runner and concurrent BuildKit stages.
-    # A compiler or ld.lld job can itself use 2 GiB.
-    math(EXPR memory_slots "(${memory_mib} - 4096) / 2048")
+    # The optimized C++ test compiles can each exceed 3 GiB RSS. Reserve 4 GiB
+    # per native job and leave 4 GiB for BuildKit, the runner and host services.
+    math(EXPR usable_mib "${memory_mib} - 4096")
+    math(EXPR memory_slots "${usable_mib} / 4096")
     math(EXPR ninja_slots "${processors} + 2")
     if(memory_slots LESS ninja_slots)
         if(memory_slots LESS 1)
             set(memory_slots 1)
         endif()
-        # Compiles, host links and CUDA device links draw from the same slots.
-        # Compile all requested SMs sequentially inside each admitted nvcc job.
+        # Prevent mixed waves of compiles and links from spending the same RAM.
         set_property(GLOBAL APPEND PROPERTY JOB_POOLS "native_build=${memory_slots}")
         set(CMAKE_JOB_POOL_COMPILE native_build PARENT_SCOPE)
         set(CMAKE_JOB_POOL_LINK native_build PARENT_SCOPE)
         set(LLAMINAR_CUDA_DEVICE_LINK_POOL native_build PARENT_SCOPE)
-        set(LLAMINAR_NVCC_THREADS 1 PARENT_SCOPE)
-        message(STATUS "V2: native build pool=${memory_slots}, nvcc threads=1 (${memory_mib} MiB, ${processors} CPUs)")
+        # On machines below 2 GiB per default Ninja job, parallel architecture
+        # passes also caused a distinct CUDA frontend peak during cold builds.
+        math(EXPR cuda_parallel_mib "2048 * ${ninja_slots}")
+        if(usable_mib LESS cuda_parallel_mib)
+            set(nvcc_threads 1)
+        else()
+            set(nvcc_threads 0)
+        endif()
+        set(LLAMINAR_NVCC_THREADS "${nvcc_threads}" PARENT_SCOPE)
+        message(STATUS "V2: native build pool=${memory_slots}, nvcc threads=${nvcc_threads} (${memory_mib} MiB, ${processors} CPUs)")
     else()
         # On larger hosts Ninja owns ordinary compile scheduling. Host linker
         # fanout and the per-library CUDA device-link step keep their own pools.
