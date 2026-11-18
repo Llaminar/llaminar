@@ -43,16 +43,22 @@ void proveIntermediateShardFFNFinalizationDeclaration(ComputeGraph &graph,
         catch (const std::invalid_argument &) { rejected = true; }
         router_node->stage = std::move(original);
         require(rejected && graph.size() == before,
-            "missing static MTP history boundary must fail before graph mutation");
+            "missing MTP history boundary must fail before graph mutation");
 
         MoEGroupedVerifierHistogramBoundarySet boundaries;
         MoEGroupedVerifierHistogramBoundaryResolution resolution;
         std::string error;
         require(boundaries.registerRoutedLayer(router->layerIndex(), "router", &error) &&
             boundaries.registerStage(router, "router", &error) && boundaries.resolve(resolution, &error),
-            "complete static MTP history boundary: " + error);
-        require(resolution.publishers.empty() && !resolution.publication_stream,
-            "static MTP history adds no histogram publisher or stream");
+            "complete MTP history boundary: " + error);
+        if (router->groupedVerifierHistogramRole()==MoEGroupedVerifierHistogramRole::DeferredAcceptedRows)
+            require(resolution.publishers.size()==1 && resolution.publishers.front()==router &&
+                resolution.publication_stream &&
+                resolution.publication_stream==router->groupedVerifierHistogramPublicationStream(),
+                "deferred MTP history preserves the original publisher and exact stream");
+        else
+            require(resolution.publishers.empty() && !resolution.publication_stream,
+                "static MTP history adds no histogram publisher or stream");
     }
     const auto output = finalizeMoEIntermediateShardFFN(graph, routed, declaration);
     EXPECT_EQ(graph.size(), before + 2);

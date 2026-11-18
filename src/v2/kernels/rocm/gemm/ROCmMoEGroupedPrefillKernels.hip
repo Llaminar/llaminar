@@ -5068,3 +5068,5 @@ bool rocmInitIQGridTables_moe_prefill(
 }
 
 } // extern "C"
+
+#include "ROCmGroupedFFNFrontier.hip.inc"

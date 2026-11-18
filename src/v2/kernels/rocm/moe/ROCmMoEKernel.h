@@ -48,6 +48,7 @@
 namespace llaminar2
 {
     class PersistentWorkspaceSlotLease;
+    namespace rocm::grouped_ffn { struct LocalPublication; }
 
     namespace rocm
     {
@@ -1145,6 +1146,22 @@ namespace llaminar2
             const MoEPrefillProjectionExecution &execution,
             ITensor *canonical_route_contributions = nullptr) override;
 
+        /**
+         * @brief Consume the already published grouped IntermediateShard plan and shared model source in two native nodes.
+         * The original routed count/descriptor owner remains this kernel instance.
+         * @param device_runtime_layer Original captured runtime layer record.
+         * @param runtime_host_layer Immutable metadata for its original workspace addresses.
+         * @param hidden Exact original mixed input and router Q8 source.
+         * @param gate_id Original grouped gate/up descriptor slot.
+         * @param down_id Original grouped down descriptor slot.
+         * @param route_partials Exact original canonical router-slot accumulator bank.
+         * @param publication Original shared prepared roles and participant-local accumulator destinations.
+         * @return Whether the exact two native nodes were submitted.
+         */
+        bool executeGroupedFFNFrontierFromPublishedRuntimePlan(DeviceMoELayerRuntime* device_runtime_layer,
+            const DeviceMoELayerRuntime& runtime_host_layer,ITensor* hidden,int gate_id,int down_id,
+            ITensor* route_partials,const rocm::grouped_ffn::LocalPublication& publication);
+
         bool hasGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate) const
         {
             return total_slots <= prefill_slots_cap_ &&
@@ -1234,6 +1251,13 @@ namespace llaminar2
             RuntimeTwoStep = 1,
             RuntimeFused = 2,
         };
+
+        /** @brief Share the original descriptor/count/scratch binding with the qualified local FFN publication. */
+        bool executeGroupedRuntimeProjection(DeviceMoELayerRuntime *device_runtime_layer,
+            const DeviceMoELayerRuntime &runtime_host_layer, ITensor *hidden, ITensor *output,
+            int gateup_desc_table_id,int down_desc_table_id,int seq_len,int d_model,int intermediate,
+            int num_experts,int top_k,const MoEPrefillProjectionExecution &execution,
+            ITensor *canonical_route_contributions,const rocm::grouped_ffn::LocalPublication* frontier);
 
         void syncBlasStream();
         bool ensureStagingCapacity(int count);

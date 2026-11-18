@@ -155,6 +155,42 @@ namespace llaminar2
         return grain;
     }
 
+    /** @brief Borrow the request-selected bank directly in the qualified grouped verifier. */
+    inline bool qfnGroupedFFNDirectBankExperiment()
+    {
+        static const bool enabled=[] {
+            const auto* value=std::getenv("LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK");
+            if(!value || std::strcmp(value,"0")==0)return false;
+            if(std::strcmp(value,"1")==0)return true;
+            throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK accepts 0 or 1");
+        }();
+        return enabled;
+    }
+
+    /** @brief Admit the separately qualified physical F160 direct-bank program. */
+    inline bool qfnGroupedFFNEqualFrontierOptIn()
+    {
+        static const bool enabled=[] {
+            const auto* value=std::getenv("LLAMINAR_QFN_ROCM_GROUPED_FFN_EQUAL_FRONTIER");
+            if(!value || std::strcmp(value,"0")==0)return false;
+            if(std::strcmp(value,"1")==0)return true;
+            throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_FFN_EQUAL_FRONTIER accepts 0 or 1");
+        }();
+        return enabled;
+    }
+
+    /** @brief Select the measured two-node grouped local FFN for the original MI50 verifier tuple. */
+    inline bool qfnGroupedFFNFrontierOptIn()
+    {
+        static const bool enabled=[] {
+            const auto* value=std::getenv("LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER");
+            if(!value || std::strcmp(value,"0")==0)return false;
+            if(std::strcmp(value,"1")==0)return true;
+            throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER accepts 0 or 1");
+        }();
+        return enabled;
+    }
+
     /**
      * @brief Tracks whether selected environment variables were present at the last reload.
      *

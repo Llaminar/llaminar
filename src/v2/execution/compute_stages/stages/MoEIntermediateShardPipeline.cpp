@@ -37,6 +37,9 @@
 #include "kernels/common/ResidentMoEFFN.h"
 #ifdef HAVE_ROCM
 #include "kernels/rocm/moe/ROCmMoEKernel.h"
+#include "kernels/rocm/gemm/ROCmGroupedFFNFrontier.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "utils/DebugEnv.h"
 #endif
 #ifdef HAVE_ROCM
 #include "kernels/rocm/gemm/ROCmResidentMoEFFN.h"
@@ -346,6 +349,37 @@ namespace
                 "runtime-published local fragment grouped projection");
         }
 
+#ifdef HAVE_ROCM
+        /** @brief Use the same original runtime route publisher, then consume its exact grouped frontier. */
+        bool executeFrontier(const rocm::grouped_ffn::LocalPublication& publication,void* stream)
+        {
+            if(!prepared || prepared->stream!=stream || !params.kernel_owner->kernel ||
+                params.row_mode!=MoEIntermediateShardRowMode::Grouped ||
+                params.phase!=MoEOverlayServicePhaseHint::GroupedVerifier || !params.live_rows ||
+                publication.rows.captureIdentity()!=params.live_rows->captureIdentity())
+                throw std::logic_error("Grouped FFN frontier lost the original verifier publication binding");
+            requireTensorAddresses();
+            auto* kernel=dynamic_cast<ROCmMoEKernel*>(params.kernel_owner->kernel.get());
+            if(!kernel)throw std::logic_error("Grouped FFN frontier requires the original ROCm runtime owner");
+            kernel->setGPUStream(stream);
+            auto* runtime=params.runtime->deviceLayerState(layer);
+            if(qfnGroupedFFNDirectBankExperiment()) {
+                auto direct=publication;
+                direct.directRouter={params.routing_indices.tensor,params.routing_weights.tensor,params.demand};
+                return requireOperation(kernel->executeGroupedFFNFrontierFromPublishedRuntimePlan(runtime,
+                    params.runtime->hostLayerState(layer),params.hidden.tensor,prepared->gate,prepared->down,
+                    params.route_partials.tensor,direct),"two-node grouped local FFN with acquired bank");
+            }
+            requireOperation(kernel->publishCompleteGroupedPrefillPlanFromRouter(runtime,params.routing_indices.tensor,
+                params.routing_weights.tensor,params.rows,params.rows,int(descriptors.size()),params.top_k,
+                prepared->gate,prepared->down,true,params.demand,DeviceMoEProjectionSet::IntermediateShard),
+                "complete local fragment grouped-plan publication");
+            return requireOperation(kernel->executeGroupedFFNFrontierFromPublishedRuntimePlan(runtime,
+                params.runtime->hostLayerState(layer),params.hidden.tensor,prepared->gate,prepared->down,
+                params.route_partials.tensor,publication),"two-node grouped local FFN");
+        }
+#endif
+
         /** @brief Capture-stable descriptor and workspace publication, containing no live placement. */
         struct Prepared
         {
@@ -559,7 +593,10 @@ namespace
         const std::array<MoEIntermediateShardTensorBinding, 1> fold_inputs_{binding_->params.route_partials};
         DeviceWorkspaceManager *workspace_ = nullptr;
     };
-    #include "MoEIntermediateShardResidentStage.inc"
+#ifdef HAVE_ROCM
+#include "MoEIntermediateShardGroupedFFNStage.inc"
+#endif
+#include "MoEIntermediateShardResidentStage.inc"
 
     /** @brief Append only after the selected original route authority has fully validated. */
     MoEIntermediateShardLocalPartial appendLocalPhases(ComputeGraph& graph,const std::shared_ptr<Binding>& binding)
@@ -898,6 +935,23 @@ MoEIntermediateShardFFNOutput finalizeMoEIntermediateShardFFN(ComputeGraph &grap
         graph.addDependency(sum_name,finalization.shared_ffn_node);
         return {sum_name,finalization.local_combined,p.family,p.live_rows,p.rows,routed.model_columns,p.phase};
     }
+#ifdef HAVE_ROCM
+    if(qfnGroupedFFNFrontierOptIn() && groupedFFNFrontierEligible(*binding,s,prepared))
+    {
+        const auto compute_name=p.prefix+"local_fragment_compute";
+        const auto* node=graph.getNode(compute_name);
+        const auto* compute=node?dynamic_cast<const Stage*>(node->stage.get()):nullptr;
+        if(!compute || compute->binding()!=binding || compute->phase()!=Phase::Compute)
+            throw std::logic_error("Grouped FFN frontier lost the original local compute producer");
+        auto frontier=std::make_unique<GroupedFFNFrontierStage>(binding,s,prepared,shared_gate,
+            finalization.local_combined,finalization.shared_ffn_node);
+        graph.replaceClosedLocalRegion({compute_name,routed.producer,finalization.shared_ffn_node},
+            finalization.shared_ffn_node,std::move(frontier));
+        graph.addNode(sum_name,std::move(sum_stage),binding->device());
+        graph.addDependency(sum_name,finalization.shared_ffn_node);
+        return {sum_name,finalization.local_combined,p.family,p.live_rows,p.rows,routed.model_columns,p.phase};
+    }
+#endif
     // The shared grouped kernel borrows only immutable original router Q8
     // addresses, never its mutable grouping state. Make its producer edge
     // explicit before the existing shared stage can be scheduled.

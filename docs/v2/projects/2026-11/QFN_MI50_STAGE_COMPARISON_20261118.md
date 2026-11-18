@@ -327,6 +327,17 @@ files, MPI teardown, driver window and physical VRAM retirement passed for
 each timing arm. The first fixed-3 candidate run failed the comparator artifact
 check; only its clean repeat contributes to the table.
 
+The standalone cohort runner takes a fresh run name and its frozen Release
+directory. It holds the physical roster for the numerical panel, own-Off
+controls and both MTP modes. On this benchmark host the full invocation is
+
+```bash
+cohort=/tmp/qfn-mi50-f160-frontier-balanced-sol62
+lock=/tmp/qfn-mi50-retained-real-tp4/r7-all-tp-live/full-model/grouped-mtp-suite.lock
+cd "$cohort/parity"
+flock -x "$lock" bash run-layout-cohort.sh execute checkpoint-r2 "$cohort/frozen-release"
+```
+
 [Matched controls and exact sample histories](/tmp/qfn-mi50-f160-frontier-balanced-sol62/parity/combined-boot3-r1-summary.json) ·
 [Feature switches and reproduction commands](/tmp/qfn-mi50-f160-frontier-balanced-sol62/DISPATCH.md)
 

@@ -1,0 +1,115 @@
+/**
+ * @file ROCmGroupedFFNFrontier.h
+ * @brief Typed MI50 M4 publication for an original prepared local FFN.
+ */
+#pragma once
+#include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
+#include "kernels/common/DeviceRowRange.h"
+#include "execution/moe/MoEGroupedPlanDemand.h"
+#include "backends/DeviceId.h"
+#include <array>
+#include <cstddef>
+#include <cstdint>
+
+namespace llaminar2 {
+class TensorBase;
+class ITensor;
+struct DeviceMoELayerRuntime;
+namespace rocm::grouped_ffn {
+inline constexpr int capacity=4, hidden=2560, routedWidth=128, sharedWidth=160, topK=10, experts=512;
+inline constexpr std::size_t sharedCodesBytes=capacity*sharedWidth;
+inline constexpr std::size_t sharedScalesBytes=capacity*(sharedWidth/32)*sizeof(float);
+inline constexpr std::size_t sharedGateBytes=capacity*sizeof(float);
+/** @brief Cold-selected routed width for the exact Q4_K/Q5_1 stage. */
+enum class RoutedGeometry : int { F128=128, F160=160 };
+inline constexpr int routedColumns(RoutedGeometry geometry) { return static_cast<int>(geometry); }
+
+/** @brief Exact immutable reachable routed decoder pair. */
+enum class RoutedDecoder { Q4K_Q51, Q4K_Q80, Q5K_Q80 };
+constexpr unsigned routedGateCodebook(RoutedDecoder decoder)
+{
+    return decoder==RoutedDecoder::Q5K_Q80?7u:5u;
+}
+constexpr unsigned routedDownCodebook(RoutedDecoder decoder)
+{
+    return decoder==RoutedDecoder::Q4K_Q51?7u:19u;
+}
+
+inline constexpr std::size_t bankIdentityBytes=3*sizeof(std::uint64_t);
+
+/** @brief Router publication handed directly to the qualified two-node transaction. */
+struct DirectBankRouter {
+    ITensor* indices=nullptr;
+    ITensor* weights=nullptr;
+    MoEGroupedPlanDemand demand=MoEGroupedPlanDemand::None;
+};
+
+/** @brief Original graph-owned source and arena operands, separate from mutable route state. */
+struct LocalPublication {
+    DeviceRowRange rows;
+    std::array<DeviceNativeQuantisedMatrixDesc,3> sharedWeights; ///< Fixed shared gate, up, down.
+    TensorBase* sharedInputGate;
+    TensorBase* sharedGateScratch;
+    TensorBase* sharedUpScratch;
+    TensorBase* routedOutput;
+    TensorBase* sharedOutput;
+    TensorBase* combined;
+    DirectBankRouter directRouter{};
+    RoutedGeometry routedGeometry=RoutedGeometry::F128;
+    RoutedDecoder routedDecoder=RoutedDecoder::Q4K_Q51;
+};
+
+/** @brief Canonical original mutable plan views from the complete grouped-plan owner. */
+struct RoutePlan {
+    const std::int32_t* live;
+    const std::int32_t* originalToGrouped;
+    const std::int32_t* originalExpertIds;
+    const float* groupWeights;
+    const std::int8_t* hiddenCodes;
+    const float* hiddenScales;
+    const float* hiddenFP32;
+    const DeviceNativeQuantisedMatrixDesc* routedGate;
+    const DeviceNativeQuantisedMatrixDesc* routedUp;
+    const DeviceNativeQuantisedMatrixDesc* routedDown;
+};
+
+/** @brief Exact runtime, routing inputs, and device workspace for the acquired bank identity. */
+struct DirectBankInput {
+    DeviceMoELayerRuntime* runtime=nullptr;
+    const float* indices=nullptr;
+    const float* weights=nullptr;
+    MoEGroupedPlanDemand demand=MoEGroupedPlanDemand::None;
+    std::uint64_t* bankIdentity=nullptr;
+};
+
+/** @brief Every native publication is bound to the same original stream and workspace lifetime. */
+struct Output {
+    std::int8_t* routedCodes;
+    float* routedScales;
+    std::int8_t* sharedCodes; ///< The original prefill input scratch is dead when router Q8 is selected.
+    float* sharedScales; ///< The corresponding original input scale scratch.
+    float* gateValues; ///< The original shared gate scratch.
+    const float* sharedInputGate;
+    float* sharedGateScratch;
+    float* sharedUpScratch;
+    float* routedOutput;
+    float* sharedOutput;
+    float* combined;
+    float* routeContributions;
+};
+
+/**
+ * @brief Enqueue the measured paired gate/up publisher and ordered token-local down.
+ * @param plan Original device-owned count, compaction and descriptor views.
+ * @param sharedWeights Original admitted immutable shared descriptor triple.
+ * @param output All original accumulators plus explicitly admitted workspace.
+ * @param device Exact admitted ROCm ordinal.
+ * @param stream Exact non-default stream following the original plan.
+ * @return True when both native submissions succeed.
+ */
+bool launch(const RoutePlan& plan,const std::array<DeviceNativeQuantisedMatrixDesc,3>& sharedWeights,
+            const Output& output,int device,void* stream,const DirectBankInput& direct={},
+            RoutedGeometry geometry=RoutedGeometry::F128,RoutedDecoder decoder=RoutedDecoder::Q4K_Q51);
+
+} // namespace rocm::grouped_ffn
+} // namespace llaminar2

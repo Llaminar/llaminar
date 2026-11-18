@@ -43,6 +43,7 @@
 #include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNDevice.h"
 #include "planning/TensorParallelSourceDeclaration.h"
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpHyperconnectionBuilder.h"
+#include "utils/DebugEnv.h"
 #include "utils/GpuPreparedGemmHarness.h"
 #endif
 #include <chrono>
@@ -72,6 +73,7 @@
 #include "execution/moe/MoEOverlayOriginalGPUCohortContexts.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
+#include "kernels/rocm/gemm/ROCmGroupedFFNFrontier.h"
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEOverlayParticipantResidency.h"
@@ -145,6 +147,8 @@ struct OriginalFFNFixtureGeometry {
     int top_k=kTopK; ///< Original metadata-selected route extent, never a prepared override.
     OriginalFFNRouterSource router_source=OriginalFFNRouterSource::TieControl; ///< Original raw source bytes, not a routing override.
     OriginalFFNGeometryContract contract=OriginalFFNGeometryContract::SourceDerived; ///< Assert an exact admitted source geometry.
+    bool deferred_frontier_history=false; ///< Exercise the original accepted-prefix commit with the two-node publication.
+    std::size_t frontier_directory_test_extent=0; ///< Nonzero installs one intentionally invalid cold quote.
 };
 constexpr std::array kRoutedRoles{WeightRole::MoEExpertGate, WeightRole::MoEExpertUp, WeightRole::MoEExpertDown};
 constexpr std::array kRoutedNames{"blk.0.ffn_gate_exps.weight", "blk.0.ffn_up_exps.weight", "blk.0.ffn_down_exps.weight"};
@@ -161,7 +165,7 @@ void require(bool valid, const std::string &operation)
 enum class CastagnaPhaseObservation { Disabled, PerCTA };
 
 /** @brief Keep source-only recipe checks independent from native FFN arithmetic. */
-enum class OriginalSourceQualification { FFNFinalization, HostAuthorityRecipes, PreparedService, ResidentFFN, ResidentFFNEconomy, GateUpLastProducer, GateUpPairedK32, DownLastProducer, OriginalM1HiddenQ8, NativeLayoutRouterFFN, NativeLayoutRouterFFNParentReplay, NativeLayoutRouterFFNEconomy,CastagnaFullRegionAB,CastagnaFullRegionABEconomy,CastagnaFullRegionABReal,CastagnaFullRegionABRealEconomy,CastagnaFullRegionABBounded,CastagnaFullRegionABBoundedEconomy, FullNativeHCFFNFinal, FullNativeHCFFNMiddle, GroupedQ8DownReplay };
+enum class OriginalSourceQualification { FFNFinalization, HostAuthorityRecipes, PreparedService, ResidentFFN, ResidentFFNEconomy, GateUpLastProducer, GateUpPairedK32, DownLastProducer, OriginalM1HiddenQ8, NativeLayoutRouterFFN, NativeLayoutRouterFFNParentReplay, NativeLayoutRouterFFNEconomy,CastagnaFullRegionAB,CastagnaFullRegionABEconomy,CastagnaFullRegionABReal,CastagnaFullRegionABRealEconomy,CastagnaFullRegionABBounded,CastagnaFullRegionABBoundedEconomy, FullNativeHCFFNFinal, FullNativeHCFFNMiddle, GroupedQ8DownReplay, GroupedFFNFrontierReplay };
 /** @brief Explicit test-only full production graph lowering; default preserves every R57 arm. */
 enum class FullProductionHCProbe { Disabled, FinalRead, MiddleRead };
 /** @brief Cold observer/read demand; every mode uses the actual production full entry. */
@@ -424,7 +428,7 @@ enum class EpochGraphLowering { FixtureNativeLayout,ModelRetained };
 struct Lane
 {
     std::shared_ptr<FP32Tensor> hidden, indices, weights, routes, routed, shared, combined, gate_scratch, up_scratch, receipt;
-    std::shared_ptr<INT32Tensor> active, sideband;
+    std::shared_ptr<INT32Tensor> active, sideband, accepted, publication_ok;
     std::shared_ptr<MoERoutedPipelineKernelOwner> owner;
     std::unique_ptr<IMoEKernel> hidden_q8_shared_kernel; ///< Original private backend instance exposed only to this focused fixture.
     std::shared_ptr<DeviceMoERuntimeTable> runtime;
@@ -577,7 +581,7 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
 {
     const int kH=shape.hidden,kExperts=shape.experts,kTopK=shape.top_k;
     auto lane = std::make_unique<Lane>(); lane->rows = rows; lane->output_observation=observation;
-    lane->expected_cold_rejection=alias_probe!=NativeRouterAliasProbe::None;
+    lane->expected_cold_rejection=alias_probe!=NativeRouterAliasProbe::None || shape.frontier_directory_test_extent!=0;
     lane->worker = &worker; lane->stream = stream; lane->tp = &tp;
     const auto fp = [&](std::vector<std::size_t> shape) {
         auto value = TestTensorFactory::createFP32(shape);
@@ -597,6 +601,15 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
     lane->up_scratch = fp({storage_rows, std::size_t(shared_f)});
     lane->active = TestTensorFactory::createINT32({1}); lane->active->mutable_typed_data()[0] = rows;
     require(lane->active->ensureOnDevice(device, stream), "admit original device row owner");
+    const bool deferred=grouped && shape.deferred_frontier_history;
+    if(deferred) {
+        lane->accepted=TestTensorFactory::createINT32({1});
+        lane->publication_ok=TestTensorFactory::createINT32({1});
+        for(auto* counter:{lane->accepted.get(),lane->publication_ok.get()}) {
+            counter->mutable_typed_data()[0]=0;
+            require(counter->ensureOnDevice(device,stream),"admit original accepted-prefix inputs");
+        }
+    }
     if(collective_witness==OriginalFFNCollectiveWitness::DiagnosticSideband)
     {
         lane->sideband = TestTensorFactory::createINT32({1});
@@ -626,7 +639,11 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
     } else {
         lane->runtime = std::make_shared<DeviceMoERuntimeTable>(DeviceMoERuntimeTable::Config{
             .device_id = device, .num_layers = 1, .num_experts = kExperts, .top_k = kTopK,
-            .mirror_to_device = true, .prefill_token_capacity = rows, .fragment_families = {source.fragment_family}});
+            .mirror_to_device = true,
+            .grouped_verifier_histogram_publication = deferred?GroupedVerifierHistogramPublicationMode::AcceptedRows:
+                GroupedVerifierHistogramPublicationMode::Disabled,
+            .prefill_token_capacity = rows, .deferred_verifier_token_capacity = deferred?rows:0,
+            .fragment_families = {source.fragment_family}});
         const auto &original_owners = *source.fragment_family->preparation()->jointOwnerMap();
         publishInitialMoEIntermediateShardRuntimeLayer(*lane->runtime, original_owners, source, 0, stream);
         require(lane->runtime->hasInitialLayerRuntimeState(0), "publish original fragment runtime");
@@ -655,7 +672,7 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
     router.force_decode_equivalent_verifier_prefill = grouped;
     router.force_grouped_verifier_prefill_for_decode = grouped && rows == 1;
     router.grouped_verifier_histogram_role =
-        selectMoEGroupedVerifierHistogramRole(grouped, /*collects_history=*/false);
+        selectMoEGroupedVerifierHistogramRole(grouped,deferred);
     if(alias_probe!=NativeRouterAliasProbe::None) {
         require(native_layout_router,"alias adversary requires actual native-layout owner admission");
         auto output=alias_probe==NativeRouterAliasProbe::RouterOutput?lane->indices:lane->shared;
@@ -670,6 +687,7 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
     local.gate_up_publication=gate_up_publication;
     local.down_publication=down_publication;
     local.phase = grouped ? MoEOverlayServicePhaseHint::GroupedVerifier : MoEOverlayServicePhaseHint::Decode;
+    if(deferred)local.demand=MoEGroupedPlanDemand::DeferredAcceptedRows;
     local.live_rows = count?DeviceRowRange::deviceCounted(rows,count):DeviceRowRange::fullyActive(rows); local.prefix = "routed/"; local.router_node = "router";
     local.hidden = {lane->hidden.get(), BufferId::NORMALIZED}; local.routing_indices = {alias_probe==NativeRouterAliasProbe::RouterOutput?static_cast<ITensor*>(lane->alias_probe.get()):lane->indices.get(), BufferId::MOE_EXPERT_INDICES};
     local.routing_weights = {lane->weights.get(), BufferId::MOE_EXPERT_WEIGHTS};
@@ -751,7 +769,9 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
         finish.final_sum.sidebands.push_back({.kind = LocalTPCollectiveSidebandKind::AllreduceSum,
             .recv_buffer = lane->sideband->gpu_data_ptr(), .element_count = 1, .dtype = CollectiveDataType::INT32,
             .name = "original_ffn_fixture_sideband"});
-    if(execution==MoEIntermediateShardFFNExecution::Staged)
+    const bool expectFrontier=grouped && rows==4 && kH==2560 && (shape.routed==128 || (shape.routed==160 && qfnGroupedFFNEqualFrontierOptIn() && qfnGroupedFFNDirectBankExperiment())) && shared_f==160 &&
+        kExperts==512 && kTopK==10 && qfnGroupedFFNFrontierOptIn();
+    if(execution==MoEIntermediateShardFFNExecution::Staged && !expectFrontier)
     {
         proveIntermediateShardFFNFinalizationDeclaration(lane->graph,routed,finish);
         require(lane->graph.size()==6,"exactly one router, two routed stages, shared FFN, gate-add and final sum");
@@ -854,6 +874,13 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
             }
             requirements.merge(consumer->getWorkspaceRequirements(rows));
         }
+    if(shape.frontier_directory_test_extent!=0) {
+        const auto role=MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY;
+        auto descriptor=std::find_if(requirements.buffers.begin(),requirements.buffers.end(),
+            [role](const auto& buffer){return buffer.name==role;});
+        require(descriptor!=requirements.buffers.end(),"frontier negative replay requires the existing workspace role");
+        descriptor->size_bytes=shape.frontier_directory_test_extent;
+    }
     if(hidden_q8!=OriginalM1HiddenQ8FixturePolicy::CountedOriginal) {
         require(memory&&hidden_q8_workspace,"original M1 lanes require their admitted exact workspace quote");
         requireOriginalM1HiddenQ8Workspace(requirements,hidden_q8_workspace->requirements);
@@ -996,7 +1023,7 @@ void captureLane(Lane &lane, bool grouped, DeviceId device, int member, IWorkerG
 void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::barrier<> &rendezvous,
     MoEOverlayParticipantResidencyRegistry &banks, int original_member,
     const FrozenModelWeightSet &shared, const TensorParallelConfig &shared_partition, PreparedWeightStore &store,
-    OriginalFFNFixtureGeometry shape,std::span<const int> capacities)
+    OriginalFFNFixtureGeometry shape,std::span<const int> capacities,bool require_frontier=false)
 {
     const int hidden=shape.hidden;
     auto &worker = GPUDeviceContextPool::instance().getContext(device);
@@ -1007,16 +1034,18 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
         auto *stream = worker.getOrCreateAuxiliaryStream("original_intermediate_ffn_finalizer");
         auto context = IDeviceContext::create(device, 1);
         auto *backend = getBackendFor(device);
-        const auto build = [&](int rows, bool grouped) {
+        const auto build = [&](int rows, bool grouped, std::size_t directory_test_extent=0) {
             auto frame = banks.initialJointLayer(original_member, 0);
             require(frame != nullptr, "original joint layer");
             auto setup = frame->acquireInitialConstruction();
             require(bool(setup), "original setup-only source reader");
+            auto lane_shape=shape;
+            lane_shape.frontier_directory_test_extent=directory_test_extent;
             auto lane = makeLane(rows, grouped, device, member, tp, worker, *context, stream,
                 setup->layerForModelLayer(0), shared, shared_partition, store,
                 MoEIntermediateShardFFNExecution::Staged,MoEGateUpPublicationPolicy::Staged,
                 OriginalM1HiddenQ8FixturePolicy::CountedOriginal,{}, {},MoEDownPublicationPolicy::Staged,
-                CompletionSerialFamilyReplay::Disabled,shape);
+                CompletionSerialFamilyReplay::Disabled,lane_shape);
             // Runtime and stages retain only the original closed family. No
             // initial epoch reader survives into recording or request replay.
             setup = {};
@@ -1026,7 +1055,40 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
         auto serial = build(1, false);
         for (const int rows : capacities)
         {
+            if(require_frontier && rows==4 && shape.deferred_frontier_history) {
+                constexpr auto extent=rocm::grouped_ffn::bankIdentityBytes;
+                bool rejected=false;
+                try {
+                    (void)build(rows,true,extent-1);
+                } catch(const std::logic_error& failure) {
+                    const std::string expected="Grouped FFN frontier scratch is undersized: "+
+                        std::string(MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY)+" expected "+
+                        std::to_string(extent)+" bytes, got "+std::to_string(extent-1);
+                    rejected=failure.what()==expected;
+                }
+                require(rejected,"one-byte-under acquired-bank scratch must fail before native recording");
+            }
             auto candidate = build(rows, true);
+            if(require_frontier) {
+                std::vector<GPUGraphKernelNodeInfo> captured;
+                std::string error;
+                require(candidate->capture->inspectKernelNodes(captured,&error),"Inspect actual local FFN graph closure");
+                const auto countSymbol=[&](std::string_view fragment) {
+                    return std::count_if(captured.begin(),captured.end(),[&](const auto& node){
+                        return node.name_resolved && node.name.find(fragment)!=std::string::npos;
+                    });
+                };
+                const auto expected=rows==4?1:0;
+                require(countSymbol("groupedFFNPairedGatePublish")==expected &&
+                    countSymbol("groupedFFNTokenDown")==expected &&
+                    (!expected || (countSymbol("group_small_runtime_kernel")==
+                        (qfnGroupedFFNDirectBankExperiment()?0:1) &&
+                        countSymbol("moe_grouped_swiglu_quantize_prefill_kernel")==0 &&
+                        countSymbol("moe_reduce_canonical_route_contributions_kernel")==0)),
+                    "Grouped FFN native graph changed original plan multiplicity or selected the wrong geometry");
+                require(candidate->graph.size()==(expected?3u:6u),
+                    "New publication must preserve router and explicit final TP sum");
+            }
             std::vector<float> input(std::size_t(rows) * hidden), expected(input.size()), actual(input.size());
             for (int row = 0; row < rows; ++row)
             {
@@ -1055,6 +1117,34 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                 return signatures;
             };
             const auto original_identity = capture_identity();
+            auto* state=reinterpret_cast<const std::byte*>(candidate->runtime->deviceLayerState(0));
+            std::vector<std::uint64_t> observed(shape.experts),observed_local(shape.experts);
+            const auto copyHistory=[&] {
+                require(backend->deviceToHostOnStream(observed.data(),
+                    state+offsetof(DeviceMoELayerRuntime,grouped_verifier_histogram),
+                    observed.size()*sizeof(observed[0]),device.ordinal,stream) &&
+                    backend->deviceToHostOnStream(observed_local.data(),
+                    state+offsetof(DeviceMoELayerRuntime,grouped_verifier_local_histogram),
+                    observed_local.size()*sizeof(observed_local[0]),device.ordinal,stream) &&
+                    worker.synchronizeStreamChecked(stream),"observe retained history at the fixture boundary");
+            };
+            // Cold runtime publication owns the initial history, including any
+            // planning exposure. Only the two before/after boundaries differ.
+            if(shape.deferred_frontier_history)copyHistory();
+            auto history=observed,history_local=observed_local;
+            const auto verifyHistory=[&](int replay,const char* phase){
+                const auto mismatch=[&](const auto& expected,const auto& actual,std::string_view plane) {
+                    const auto [x,y]=std::mismatch(expected.begin(),expected.end(),actual.begin());
+                    if(x!=expected.end())
+                        throw std::runtime_error("Grouped FFN history "+std::string(phase)+
+                            " plane="+std::string(plane)+" rows="+std::to_string(rows)+
+                            " replay="+std::to_string(replay)+" expert="+
+                            std::to_string(x-expected.begin())+" expected="+std::to_string(*x)+
+                            " observed="+std::to_string(*y));
+                };
+                mismatch(history,observed,"selected");
+                mismatch(history_local,observed_local,"local");
+            };
             for (int replay = 0; replay < 20; ++replay)
             {
                 const std::array counts{rows, 0, rows > 1 ? rows - 1 : 0, std::min(1, rows), rows / 2, rows};
@@ -1096,6 +1186,85 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                             " rows=" + std::to_string(rows) + " live=" + std::to_string(live) +
                             " replay=" + std::to_string(replay) + " element=" + std::to_string(element) +
                             " actual=" + std::to_string(actual[element]) + " serial=" + std::to_string(reference));
+                }
+                if(shape.deferred_frontier_history) {
+                    // Exercise mixed accepted, rejected and invalid result metadata on the
+                    // original native commit. Replayed but uncommitted rows never reach history.
+                    const int accepted=replay%3==0?live:std::max(0,live-1);
+                    const int publication_ok=replay%4!=2;
+                    std::vector<float> selected(static_cast<std::size_t>(rows)*shape.top_k);
+                    copyHistory();
+                    verifyHistory(replay,"before commit");
+                    require(backend->deviceToHostOnStream(selected.data(),candidate->indices->gpu_data_ptr(),
+                        selected.size()*sizeof(float),device.ordinal,stream),"observe native router oracle IDs");
+                    require(backend->hostToDeviceOnStream(candidate->accepted->gpu_data_ptr(),&accepted,sizeof(accepted),
+                        device.ordinal,stream) &&
+                        backend->hostToDeviceOnStream(candidate->publication_ok->gpu_data_ptr(),&publication_ok,
+                        sizeof(publication_ok),device.ordinal,stream),"publish original accepted-prefix test metadata");
+                    require(candidate->owner->kernel->commitGroupedVerifierHistograms({stream,candidate->workspace.get()},
+                        candidate->runtime->deviceLayerState(0),
+                        static_cast<const std::int32_t*>(candidate->accepted->gpu_data_ptr()),
+                        static_cast<const std::int32_t*>(candidate->publication_ok->gpu_data_ptr()),
+                        1,rows,rows,shape.experts,shape.top_k),"enqueue original accepted-row publisher");
+                    copyHistory();
+                    if(publication_ok)
+                        for(int slot=0;slot<accepted*shape.top_k;++slot) {
+                            const int expert=static_cast<int>(selected[slot]);
+                            require(expert>=0 && expert<shape.experts,"original active route expert");
+                            ++history[expert];
+                            ++history_local[expert]; // This singleton original family owns every selected route.
+                        }
+                    verifyHistory(replay,"after commit");
+                }
+                if(require_frontier && rows==4 && replay==0) {
+                    // The actual route-plan producer reacquires a new runtime
+                    // bank while both fused compute nodes keep their capture.
+                    auto& runtime=*candidate->runtime;
+                    const auto& current=runtime.hostLayerState(0);
+                    const auto oldEpoch=current.active_epoch;
+                    const auto oldBank=current.active_bank;
+                    const auto& source=current.banks[oldBank];
+                    MoEPlacementUpdate update;
+                    update.epoch=oldEpoch+1;
+                    update.expert_count=source.expert_count;
+                    update.participant_id=current.participant_id;
+                    update.participant_count=current.participant_count;
+                    update.experts.assign(source.experts,source.experts+source.expert_count);
+                    update.local_compute_mask.assign(source.local_compute_mask,source.local_compute_mask+source.expert_count);
+                    update.replica_role.assign(source.replica_role,source.replica_role+source.expert_count);
+                    update.resident_participant_mask.assign(source.resident_participant_mask,
+                        source.resident_participant_mask+source.expert_count);
+                    update.overlay_route_participant.assign(source.overlay_route_participant,
+                        source.overlay_route_participant+source.expert_count);
+                    require(runtime.prepareInactiveBank(0,update),"prepare original descriptors in the inactive bank");
+                    auto* layer=reinterpret_cast<std::byte*>(runtime.deviceLayerState(0));
+                    if(shape.deferred_frontier_history) {
+                        // The legacy embedded flip reuploads the whole layer. This fixture
+                        // exercises the production publication footprint: only the inactive
+                        // descriptor bank and its selection identity become different.
+                        const std::uint32_t next=1u-oldBank;
+                        const auto bank_offset=offsetof(DeviceMoELayerRuntime,banks)+next*sizeof(DeviceMoEPlacementBank);
+                        const auto& prepared=runtime.hostLayerState(0).banks[next];
+                        require(backend->hostToDeviceOnStream(layer+bank_offset,&prepared,sizeof(prepared),device.ordinal,stream) &&
+                            backend->hostToDeviceOnStream(layer+offsetof(DeviceMoELayerRuntime,active_epoch),
+                                &update.epoch,sizeof(update.epoch),device.ordinal,stream) &&
+                            backend->hostToDeviceOnStream(layer+offsetof(DeviceMoELayerRuntime,active_bank),
+                                &next,sizeof(next),device.ordinal,stream) &&
+                            worker.synchronizeStreamChecked(stream),
+                            "publish only the prepared bank and epoch through the exact fixture stream");
+                        copyHistory();
+                        verifyHistory(replay,"after placement change");
+                    } else {
+                        require(runtime.flipActiveBank(0,update.epoch,stream),"publish original next embedded bank");
+                    }
+                    std::array<std::uint32_t,2> seen{};
+                    require(backend->deviceToHostOnStream(&seen[0],layer+offsetof(DeviceMoELayerRuntime,active_epoch),
+                        sizeof(seen[0]),device.ordinal,stream) &&
+                        backend->deviceToHostOnStream(&seen[1],layer+offsetof(DeviceMoELayerRuntime,active_bank),
+                        sizeof(seen[1]),device.ordinal,stream) && worker.synchronizeStreamChecked(stream),
+                        "Observe terminal epoch after original publication");
+                    require(seen==std::array{update.epoch,1u-oldBank} && capture_identity()==original_identity,
+                        "The next bank must reach the same captured grouped verifier");
                 }
                 rendezvous.arrive_and_wait();
             }
@@ -1157,7 +1326,8 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
         qualification == OriginalSourceQualification::CastagnaFullRegionABBoundedEconomy ||
         qualification == OriginalSourceQualification::FullNativeHCFFNFinal ||
         qualification == OriginalSourceQualification::FullNativeHCFFNMiddle ||
-        qualification == OriginalSourceQualification::GroupedQ8DownReplay) == (selected_source != nullptr),
+        qualification == OriginalSourceQualification::GroupedQ8DownReplay ||
+        qualification == OriginalSourceQualification::GroupedFFNFrontierReplay) == (selected_source != nullptr),
         "prepared calibration requires one original model source per process");
     require(!devices.empty(), "selected original participant family");
     const auto mpi = MPIContextFactory::global();
@@ -1496,10 +1666,11 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                     else {
                         constexpr std::array default_counts{1,3,kMaxRows};
                         constexpr std::array q8_down_counts{3,4};
-                        const std::span<const int> capacities=qualification==OriginalSourceQualification::GroupedQ8DownReplay?
+                        const bool frontier=qualification==OriginalSourceQualification::GroupedFFNFrontierReplay;
+                        const std::span<const int> capacities=(frontier||qualification==OriginalSourceQualification::GroupedQ8DownReplay)?
                             std::span<const int>{q8_down_counts}:std::span<const int>{default_counts};
                         replayParticipant(devices[member],member,*tp,rendezvous,banks,original_members[member],
-                            shared[member],*manager.tensorParallelConfig(),*store,shape,capacities);
+                            shared[member],*manager.tensorParallelConfig(),*store,shape,capacities,frontier);
                     }
                 }
                 catch (...)
@@ -1630,6 +1801,53 @@ TEST(FullNativeHCFFN,ROCmRetainedBalancedTP2Replay)
     replayMandatoryFullNativeHCFFN(OriginalSourceQualification::FullNativeHCFFNFinal,
         FullProductionHCStorageReuse::Distinct,shape,FullProductionHCObservation::RetainedDemandedOnly);
 }
+/** @test Exercise the actual grouped two-node lowering with original source preparation and serial-row witnesses. */
+TEST(FullNativeHCFFN,ROCmGroupedFFNFrontierByteReplay)
+{
+    const auto format=nativeLayoutRouterFFNSource();
+    const OriginalFFNFixtureGeometry shape{.hidden=2560,.routed=128,.shared=160,.experts=512,.top_k=10,
+        .router_source=OriginalFFNRouterSource::Dense,.deferred_frontier_history=qfnGroupedFFNDirectBankExperiment()};
+    require(qfnGroupedFFNFrontierOptIn(),"Focused frontier replay requires explicit production opt-in");
+    const char* pci=std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_PCI");
+    const std::array<std::string_view,1> address{pci?pci:""};
+    originalRankLocalReplay(DeviceType::ROCm,1,[&](const auto& devices) {
+        proveOriginalFinalization(devices,false,OriginalSourceQualification::GroupedFFNFrontierReplay,
+            &format,LocalFFNProgram::Original,shape);
+    },"gfx906",address[0].empty()?std::span<const std::string_view>{}:std::span<const std::string_view>{address});
+}
+/** @test Capture the equal shard's three original tuples in static and deferred acceptance modes. */
+TEST(FullNativeHCFFN, ROCmEqualF160GroupedFFNFrontierByteReplay)
+{
+    require(qfnGroupedFFNFrontierOptIn() && qfnGroupedFFNDirectBankExperiment() &&
+        qfnGroupedFFNEqualFrontierOptIn(),"Equal F160 replay requires the three exact production policies");
+    const auto sources=sourceFormats(OriginalSourceQualification::ResidentFFN);
+    const auto& formats=quantizedVerifierFormats();
+    const auto q8=std::find_if(formats.begin(),formats.end(),[](const auto& f){return f.tensor_type==TensorType::Q8_0;});
+    const auto q5k=std::find_if(sources.begin(),sources.end(),[](const auto& f){return f.type==TensorType::Q5_K;});
+    require(q8!=formats.end() && q5k!=sources.end(),"Original F160 Q8 down/shared and Q5_K gate/up encodings");
+    auto q4_q51=nativeLayoutRouterFFNSource();
+    auto q4_q8=q4_q51;
+    q4_q8.name="Q4_K_DownQ8_0_SharedQ8_0";
+    q4_q8.down_quantized=&*q8;
+    auto q5_q8=*q5k;
+    q5_q8.name="Q5_K_DownQ8_0_SharedQ8_0";
+    q5_q8.down_quantized=&*q8;
+    q5_q8.shared_quantized=&*q8;
+    const auto tuples=std::array{q4_q51,q4_q8,q5_q8};
+    const char* pci=std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_PCI");
+    const std::array<std::string_view,1> address{pci?pci:""};
+    originalRankLocalReplay(DeviceType::ROCm,1,[&](const auto& devices) {
+        for(const auto& format:tuples)
+            for(bool deferred:{false,true}) {
+                SCOPED_TRACE(::testing::Message()<<format.name<<" deferred="<<deferred);
+                const OriginalFFNFixtureGeometry shape{.hidden=2560,.routed=160,.shared=160,.experts=512,.top_k=10,
+                    .router_source=OriginalFFNRouterSource::Dense,.deferred_frontier_history=deferred};
+                proveOriginalFinalization(devices,false,OriginalSourceQualification::GroupedFFNFrontierReplay,
+                    &format,LocalFFNProgram::Original,shape);
+            }
+    },"gfx906",address[0].empty()?std::span<const std::string_view>{}:std::span<const std::string_view>{address});
+}
+
 /** @test Both native Q8-down source families keep grouped byte equality through count/reset replay. */
 TEST(FullNativeHCFFN,ROCmGroupedQ8DownByteReplay)
 {

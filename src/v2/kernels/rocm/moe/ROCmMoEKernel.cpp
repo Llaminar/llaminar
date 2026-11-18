@@ -27,6 +27,7 @@
 #include "kernels/common/RouterQ8Launch.h"
 #include "kernels/common/OriginalM1HiddenQ8Publication.h"
 #include "ROCmMoEKernel.h"
+#include "kernels/rocm/gemm/ROCmGroupedFFNFrontier.h"
 #include "kernels/common/NativeQuantisedDescriptorValidation.h"
 #include "../gemm/ROCmResidentMoEFFN.h"
 #include "../gemm/ROCmNativeLayoutRouterFFN.h"
@@ -12275,6 +12276,34 @@ namespace llaminar2
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
+        return executeGroupedRuntimeProjection(device_runtime_layer,runtime_host_layer,hidden,output,
+            gateup_desc_table_id,down_desc_table_id,seq_len,d_model,intermediate,num_experts,top_k,execution,
+            canonical_route_contributions,nullptr);
+    }
+
+    /** @copydoc ROCmMoEKernel::executeGroupedFFNFrontierFromPublishedRuntimePlan */
+    bool ROCmMoEKernel::executeGroupedFFNFrontierFromPublishedRuntimePlan(DeviceMoELayerRuntime* runtime,
+        const DeviceMoELayerRuntime& host,ITensor* hidden,int gate_id,int down_id,ITensor* route_partials,
+        const rocm::grouped_ffn::LocalPublication& publication)
+    {
+        namespace geometry=rocm::grouped_ffn;
+        return executeGroupedRuntimeProjection(runtime,host,hidden,nullptr,gate_id,down_id,
+            geometry::capacity,geometry::hidden,geometry::routedColumns(publication.routedGeometry),geometry::experts,geometry::topK,
+            MoEPrefillProjectionExecution::intermediateShard(geometry::hidden),route_partials,&publication);
+    }
+
+    bool ROCmMoEKernel::executeGroupedRuntimeProjection(
+        DeviceMoELayerRuntime *device_runtime_layer,
+        const DeviceMoELayerRuntime &runtime_host_layer,
+        ITensor *hidden, ITensor *output,
+        int gateup_desc_table_id,
+        int down_desc_table_id,
+        int seq_len, int d_model, int intermediate,
+        int num_experts, int top_k,
+        const MoEPrefillProjectionExecution &execution,
+        ITensor *canonical_route_contributions,
+        const rocm::grouped_ffn::LocalPublication* frontier)
+    {
         if (execution.isIntermediateShard() != runtime_host_layer.intermediate_shard.enabled() ||
             (execution.isIntermediateShard() &&
              (runtime_host_layer.intermediate_shard.modelColumns() != static_cast<uint32_t>(d_model) ||
@@ -12467,6 +12496,9 @@ namespace llaminar2
 
         group_active_expert_slots_ = active_expert_slots;
 
+        if(frontier && floating)
+            throw std::logic_error("Retained grouped FFN lost its original native quantised source");
+
         if (floating)
         {
             const bool ok = execution.overwriteOutputThenPublish(
@@ -12531,6 +12563,55 @@ namespace llaminar2
 
         const bool reuse_router_q8_hidden = execution.executesGateUp() &&
             canReuseRouterQ8Hidden(d_hidden, seq_len, d_model);
+        if(frontier) {
+            namespace program=rocm::grouped_ffn;
+            const auto gate_mask=1u<<program::routedGateCodebook(frontier->routedDecoder);
+            const auto down_mask=1u<<program::routedDownCodebook(frontier->routedDecoder);
+            if(!reuse_router_q8_hidden || owner_admission || !execution.isIntermediateShard() ||
+               gateup_table.codebook_mask!=gate_mask || gateup_table.policy_codebook_mask!=gate_mask ||
+               down_table.codebook_mask!=down_mask || down_table.policy_codebook_mask!=down_mask ||
+               frontier->rows.physicalRows()!=seq_len || !frontier->rows.countOwner() ||
+               !workspace_ || !d_prefill_A_int8_ || !d_prefill_A_scales_ ||
+               d_prefill_A_int8_==d_router_q8_hidden_ || d_prefill_A_scales_==d_router_q8_hidden_scales_ ||
+               workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_SHARED_GATE)<program::sharedGateBytes)
+                throw std::logic_error("Retained grouped FFN requires the original Q8 router bank and admitted routed/S160 plan");
+            if(!requireTensorOnDevice(frontier->sharedInputGate,device,stream,"shared input gate","grouped FFN frontier"))
+                return false;
+            const std::array outputs{frontier->sharedGateScratch,frontier->sharedUpScratch,frontier->routedOutput,
+                frontier->sharedOutput,frontier->combined};
+            for(auto* result:outputs)
+                if(!requireOutputOnDevice(result,device,stream,"original local FFN output","grouped FFN frontier"))
+                    return false;
+            const program::RoutePlan plan{frontier->rows.countOwner(),d_group_original_to_grouped_,
+                runtime_host_layer.route_expert_ids,runtime_host_layer.grouped_route_weights,d_router_q8_hidden_,
+                d_router_q8_hidden_scales_,d_hidden,runtime_gate_descs,runtime_up_descs,runtime_down_descs};
+            const auto address=[](TensorBase* tensor){return static_cast<float*>(tensor->gpu_data_ptr());};
+            const program::Output publication{d_prefill_swiglu_int8_,d_prefill_swiglu_scales_,
+                d_prefill_A_int8_,d_prefill_A_scales_,
+                static_cast<float*>(workspace_->getBuffer(MoEWorkspaceBuffers::ROCM_SHARED_GATE)),
+                address(frontier->sharedInputGate),
+                address(frontier->sharedGateScratch),address(frontier->sharedUpScratch),address(frontier->routedOutput),
+                address(frontier->sharedOutput),address(frontier->combined),d_canonical_route_contributions};
+            program::DirectBankInput direct;
+            if(frontier->directRouter.indices) {
+                const auto& router=frontier->directRouter;
+                if((router.demand!=MoEGroupedPlanDemand::None && router.demand!=MoEGroupedPlanDemand::DeferredAcceptedRows) ||
+                   !requireTensorOnDevice(router.indices,device,stream,"original router indices","grouped FFN direct bank") ||
+                   !requireTensorOnDevice(router.weights,device,stream,"original router weights","grouped FFN direct bank") ||
+                   !d_prefill_work_directory_ ||
+                   workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY)<program::bankIdentityBytes)
+                    return false;
+                direct={device_runtime_layer,static_cast<const float*>(router.indices->gpu_data_ptr()),
+                    static_cast<const float*>(router.weights->gpu_data_ptr()),router.demand,
+                    reinterpret_cast<std::uint64_t*>(d_prefill_work_directory_)};
+            }
+            if(!program::launch(plan,frontier->sharedWeights,publication,device_ordinal_,stream,direct,frontier->routedGeometry,frontier->routedDecoder))return false;
+            markDeviceWritten(publication_output,device,stream);
+            for(auto* result:outputs)markDeviceWritten(result,device,stream);
+            PerfStatsCollector::addCounter("kernel","rocm_grouped_ffn_frontier_calls",1.0,"moe",device.toString(),
+                {{"physical_rows","4"},{"routed_width",std::to_string(intermediate)},{"shared_width","160"}});
+            return true;
+        }
         const bool ok = execution.overwriteOutputThenPublish(
             execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
             execution.executesDown() ? publication_output->size_bytes() : 0u,
