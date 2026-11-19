@@ -52,10 +52,9 @@ turns a selected-test failure or skip into a pass. This is PR validation, not
 release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
-The active `develop` ruleset requires both `Develop PR / Unit + host (AVX2)`
+The active `develop` ruleset requires both `Develop PR / Unit + hardware preflight (AVX2)`
 and `Develop PR / Unit + host (AVX512)`, an up-to-date PR, and squash merge.
-The AVX2 check retains its stable required-context name while also requiring
-the hardware-qualified production preflight scope.
+The AVX2 check requires the hardware-qualified production preflight scope.
 Repository administrators have an explicit PR-only bypass for authorized
 manual merges. Direct human pushes, force pushes and deletion remain rejected.
 `.github/workflows/develop-auto-merge.yml` arms GitHub's native
@@ -547,8 +546,8 @@ The master ruleset requires each named phase and final eligibility, with strict
 up-to-date master semantics and squash-only merge. `apply_master_ruleset.py`
 projects those requirements, protects RC updates and extends the existing sole-
 owner approval ruleset without changing approver membership or exceptions.
-Develop keeps its existing two ISA Unit/host checks, deletion and force-push
-guards. The general GitHub Actions app receives no bypass.
+Develop requires its AVX2 hardware preflight and AVX512 host checks and
+enforces deletion and force-push guards. The general GitHub Actions app receives no bypass.
 
 `release_accuracy_panels.py` reuses the canonical parity inventory and its
 registered CPU/FP32 PyTorch reference implementations. It reads the original

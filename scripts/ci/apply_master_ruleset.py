@@ -4,7 +4,7 @@
 """Install exact release-branch protection from the source-owned PR gates.
 
 The master rule requires seven GitHub Actions checks, including RC lineage. The develop rule requires
-both image-bound device-free Unit/host checks and blocks direct human pushes.
+both image-bound ISA checks, including AVX2 hardware preflight, and blocks direct human pushes.
 Repository administrators may explicitly bypass develop checks through a PR;
 the dedicated release-evidence deploy key also publishes the certified
 post-squash two-parent ancestry join. Never grant the general GitHub Actions
@@ -38,7 +38,7 @@ REQUIRED_CHECKS = (
     "RC release eligibility",
 )
 DEVELOP_REQUIRED_CHECKS = (
-    "Develop PR / Unit + host (AVX2)",
+    "Develop PR / Unit + hardware preflight (AVX2)",
     "Develop PR / Unit + host (AVX512)",
 )
 RELEASE_DEPLOY_KEY_TITLE = "llaminar-release-evidence"
