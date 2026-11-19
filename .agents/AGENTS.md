@@ -345,7 +345,8 @@ branch's workflow files do not define the current release policy.
 Push the feature branch and open a PR into `develop`. Draft PRs skip PR jobs;
 marking a PR ready for review starts its required checks. Same-repository,
 non-draft feature PRs enable native squash auto-merge, which must wait for every
-required gate, owner approval and an up-to-date merge candidate. The canonical
+required gate and an up-to-date merge candidate. Only PRs authored by
+`dbsanfte` into `develop` may auto-merge without an owner review. The canonical
 PR workflow builds AVX2 and AVX512 full-backend model-free test images in
 parallel on separate self-hosted runners. Each runs complete device-free `Unit`
 plus the canonical preflight `host` lane. AVX2 additionally requires the
@@ -388,8 +389,8 @@ OpenCode proof and benchmark evidence, bound to the same source and images.
 A certified RC squash merge into master tags a dated GitHub release, promotes
 the exact tested image digests and attaches the test-run identity, numerical
 accuracy CSVs and complete benchmark/stress evidence. No image is rebuilt on
-master. Owner approval covers `develop`, `rc/*` and `master`; passing checks
-alone does not authorize a merge. Post-release high-water publication preserves
+master. Owner approval covers `rc/*`, `master` and other contributors’
+PRs to `develop`. Post-release high-water publication preserves
 concurrent develop work and joins the certified master commit as its second
 parent. Never open or merge a master release merely because feature checks or develop image builds passed.
 

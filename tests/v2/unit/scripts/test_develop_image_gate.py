@@ -682,11 +682,28 @@ esac
                          {"opened", "reopened", "synchronize", "ready_for_review"})
         self.assertEqual(workflow["permissions"],
                          {"contents": "read", "pull-requests": "read"})
-        self.assertEqual(set(workflow["jobs"]), {"arm"})
+        self.assertEqual(set(workflow["jobs"]), {"arm", "arm-owner"})
         job = workflow["jobs"]["arm"]
         self.assertIn("head.repo.full_name == github.repository", job["if"])
         self.assertIn("!github.event.pull_request.draft", job["if"])
+        self.assertIn("github.event.pull_request.user.id != 3513358", job["if"])
         self.assertEqual(len(job["steps"]), 1)
+        owner = workflow["jobs"]["arm-owner"]
+        self.assertIn("github.event.pull_request.user.id == 3513358", owner["if"])
+        self.assertIn("head.repo.full_name == github.repository", owner["if"])
+        self.assertIn("!github.event.pull_request.draft", owner["if"])
+        self.assertEqual(owner["environment"], "llaminar-bot")
+        mint, arm = owner["steps"]
+        self.assertRegex(mint["uses"], r"^actions/create-github-app-token@[0-9a-f]{40}$")
+        self.assertEqual(mint["with"], {
+            "client-id": "${{ vars.LLAMINAR_BOT_CLIENT_ID }}",
+            "private-key": "${{ secrets.LLAMINAR_BOT_PRIVATE_KEY }}",
+            "permission-contents": "write", "permission-pull-requests": "write"})
+        self.assertEqual(arm["env"]["GH_TOKEN"], "${{ steps.bot.outputs.token }}")
+        self.assertIn("--auto --squash", arm["run"])
+        self.assertIn('--match-head-commit "$PR_HEAD_SHA"', arm["run"])
+        self.assertNotIn("--admin", str(workflow))
+        self.assertNotIn("checkout", str(owner))
         step = job["steps"][0]
         self.assertEqual(step["env"]["GH_TOKEN"], "${{ secrets.DEVELOP_AUTOMERGE_TOKEN }}")
         self.assertEqual(step["env"]["PR_NUMBER"],

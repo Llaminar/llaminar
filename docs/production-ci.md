@@ -18,8 +18,8 @@ Those optional tools do not add phases to RC certification.
 
 Ordinary work starts from current `develop` on a branch named
 `feat/short-feature-description`. Commit messages and PR titles use
-Conventional Commits. After both required Unit/host checks and owner approval pass, the feature PR
-squash-merges into `develop`. Only explicit user direction starts the separate
+Conventional Commits. Both Unit/host checks must pass for the up-to-date feature PR to squash-merge
+into `develop`. PRs by another contributor also require the owner’s review. Only explicit user direction starts the separate
 `rc/*`-to-`master` release PR and its full certification/release workflow.
 
 Documentation and CI/CD workflow maintenance may be committed and pushed
@@ -61,20 +61,15 @@ manual merges. Direct human pushes, force pushes and deletion remain rejected.
 `.github/workflows/develop-auto-merge.yml` arms GitHub's native
 auto-merge for same-repository, non-draft PRs. GitHub loads this
 `pull_request_target` policy from the trusted default branch, `master`, even
-when the PR targets `develop`. That installed copy uses the dedicated
-`DEVELOP_AUTOMERGE_TOKEN` repository secret; changing only the develop copy
-cannot repair the live policy. It does not check out PR code and cannot merge
-before the required image-bound check and review requirements succeed. The gate retains the same-repository PR policy; import a reviewed fork branch
-into this repository before requesting it.
+when the PR targets `develop`. Install workflow updates on the default branch
+before expecting them to arm new PRs. The workflow authenticates the event's
+head SHA and arms GitHub's native squash auto-merge.
 
-The automation secret is a fine-grained personal access token limited to
-`Llaminar/llaminar`, with Contents and Pull requests write permissions. It has
-no Administration permission. Native auto-merge waits for all required reviews
-and checks; the automation must never request an administrative merge override. The built-in
-`GITHUB_TOKEN` remains read-only: using it to merge would suppress the ordinary
-develop push workflow. A missing automation secret fails the arm job explicitly;
-there is no substitution of credentials. The command also authenticates the
-event's exact head SHA so a stale job cannot arm a changed candidate.
+For original PR author `dbsanfte` (GitHub user ID `3513358`), the workflow
+uses a short-lived installation token for the private `Llaminar/llaminar-bot`
+app. GitHub enforces both required checks and strict branch freshness for the
+app. Other authors use the existing `DEVELOP_AUTOMERGE_TOKEN` and require the
+owner's review. Re-running a job as the owner does not change the PR author.
 
 Create the token in GitHub's fine-grained token settings with resource owner
 `Llaminar` and only repository `llaminar`, then install or rotate it through
@@ -301,16 +296,31 @@ use it as an empty input. Workflow jobs do not change host kernel settings.
 
 ### Protected-branch approval
 
-The separate `Owner approval` repository ruleset covers `master`, `develop` and `rc/*`.
-It requires one approval from `@Llaminar/repository-approvers` for every file;
-that team's sole member is `@dbsanfte`. New reviewable commits dismiss stale
-approvals, and only `@dbsanfte` may dismiss reviews. Ordinary write access does
-not bypass these rules. The owner retains an explicit PR-only override for
-owner-authored changes; the existing release-evidence deploy-key exception
-preserves post-release evidence publication. The separate develop CI ruleset
-also permits an explicitly authorized PR-only administrator override; master
-CI requirements remain independent. Keep approver-team membership restricted to the owner.
-The check installer extends this independent approval ruleset to RC branches while preserving its reviewers and approval policy.
+The owner review rules require `@Llaminar/repository-approvers` (sole member
+`dbsanfte`) for all changed files. New reviewable commits dismiss stale
+approvals. The separate develop review rule grants `llaminar-bot` a review
+exception. The CI ruleset still enforces its required checks, and the original
+owner rule continues to cover `master` and `rc/*`.
+
+To provision the owner auto-merge app:
+
+1. Register the private `llaminar-bot` GitHub App under the Llaminar organization.
+   Disable its webhook, grant Contents and Pull requests write plus implicit
+   Metadata read, and install it on `Llaminar/llaminar` only. Upload the
+   [robot avatar](assets/llaminar-bot.png) in the app's display settings.
+2. Restrict the `llaminar-bot` Actions environment to a selected **branch**
+   named `master`. The trusted `pull_request_target` workflow runs from that
+   ref. Put the app client ID in the environment variable
+   `LLAMINAR_BOT_CLIENT_ID`. Generate a private key in GitHub and import it
+   into the environment secret through standard input:
+   `gh secret set LLAMINAR_BOT_PRIVATE_KEY --env llaminar-bot --repo Llaminar/llaminar < /path/to/app.pem`.
+3. Preview `python3 scripts/ci/apply_master_ruleset.py --owner-auto-merge-only`,
+   then apply the same command with `--apply`. It copies the current review
+   requirements into the develop rule and verifies them before it narrows the
+   original rule to release branches. It leaves the CI rulesets in place.
+4. On a same-repository owner PR, confirm that the native auto-merge enabler
+   is `llaminar-bot[bot]` and the merge waits for both image checks. On another
+   author's PR confirm that owner review remains required.
 
 ### ARC runner on the production host
 

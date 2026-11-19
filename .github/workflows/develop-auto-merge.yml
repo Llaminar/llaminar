@@ -1,3 +1,5 @@
+# @file develop-auto-merge.yml
+# @brief Select the native auto-merge identity from the immutable PR author.
 name: Arm develop PR auto-merge
 
 # This trusted default-branch workflow only enables GitHub's native auto-merge.
@@ -18,7 +20,8 @@ jobs:
   arm:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
-      !github.event.pull_request.draft
+      !github.event.pull_request.draft &&
+      github.event.pull_request.user.id != 3513358
     runs-on: ubuntu-24.04
     steps:
       - name: Squash-merge automatically after the required check succeeds
@@ -30,5 +33,33 @@ jobs:
         run: |
           set -euo pipefail
           : "${GH_TOKEN:?Repository secret DEVELOP_AUTOMERGE_TOKEN is required for auto-merge and post-merge CI}"
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash \
+            --match-head-commit "$PR_HEAD_SHA"
+
+  # Only dbsanfte-authored PRs can use the isolated review exception. The
+  # app has no exception on the independent, strict develop CI ruleset.
+  arm-owner:
+    if: >-
+      github.repository == 'Llaminar/llaminar' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.user.id == 3513358
+    runs-on: ubuntu-24.04
+    environment: llaminar-bot
+    steps:
+      - name: Mint a token for this repository
+        id: bot
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.LLAMINAR_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.LLAMINAR_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Arm native squash auto-merge for the owner
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
           gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash \
             --match-head-commit "$PR_HEAD_SHA"
