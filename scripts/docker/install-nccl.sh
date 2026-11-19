@@ -16,9 +16,11 @@
 # request NCCL's complete CUDA-toolkit architecture set.
 set -euo pipefail
 
-nccl_revision=dbc86fd06e8b0c4517b95d8958a09ccacf9520c9
-nccl_tag=v2.28.9-1
-nccl_version=2.28.9
+nccl_script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+source "${nccl_script_dir}/nccl-release.env"
+nccl_revision="${LLAMINAR_NCCL_GIT_COMMIT}"
+nccl_tag="${LLAMINAR_NCCL_GIT_REF}"
+nccl_version="${LLAMINAR_NCCL_VERSION}"
 nccl_prefix="${NCCL_INSTALL_PREFIX:-/usr/local}"
 nccl_patch="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/patches/nccl-capture-reentry.patch"
 nccl_rows_patch="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)/patches/nccl-device-live-rows.patch"
@@ -54,7 +56,7 @@ if [[ -f "${nccl_library}" && -f "${nccl_marker}" && -f "${nccl_gin_report}" && 
     exit 0
 fi
 
-nccl_build_dir="$(mktemp -d /tmp/llaminar-nccl-build.XXXXXXXX)"
+nccl_build_dir="$(mktemp -d "${TMPDIR:-/tmp}/llaminar-nccl-build.XXXXXXXX")"
 # This is exclusively the unique directory created above, never a caller's
 # source checkout, model cache, or shared build tree.
 trap 'rm -rf -- "${nccl_build_dir}"' EXIT

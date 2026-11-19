@@ -8,6 +8,8 @@
  * no GPU runtime or manufactured resource qualification is involved.
  */
 #include "backends/ReadAheadNativeResourceFamily.h"
+#include "../../utils/IntentionalFaultProcess.h"
+#include <csignal>
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include <cstdlib>
@@ -233,7 +235,7 @@ TEST(ReadAheadNativeResourceFamily,OriginalPublicationProofNeverDuplicatesEventP
     EXPECT_EQ(worker->records,2u);family.reset();empty(memory);
 }
 /** @test Active native readers cannot unwind original commitments or captured handles. */
-TEST(ReadAheadNativeResourceFamily,OutstandingSubmissionDestructionIsFatal){GTEST_FLAG_SET(death_test_style,"threadsafe");EXPECT_DEATH({auto memory=authority();auto worker=makeWorker();worker->memory=memory;auto family=ReadAheadNativeResourceReplayAccess::create(memory,worker,request());family->bindTerminal(std::shared_ptr<void>(handle(400),[](void*){}));family->beginSubmission();family.reset();},"");}
+TEST(ReadAheadNativeResourceFamily,OutstandingSubmissionDestructionIsFatal){GTEST_FLAG_SET(death_test_style,"threadsafe");EXPECT_EXIT({llaminar2::test::disableIntentionalFaultCoreDump();auto memory=authority();auto worker=makeWorker();worker->memory=memory;auto family=ReadAheadNativeResourceReplayAccess::create(memory,worker,request());family->bindTerminal(std::shared_ptr<void>(handle(400),[](void*){}));family->beginSubmission();family.reset();},::testing::KilledBySignal(SIGABRT),"");}
 /** @brief Independent baseline event admission; neither graph nor family bytes fund this owner. */
 std::shared_ptr<PhysicalMemoryAuthority> parentAuthority(std::size_t host=512,std::size_t gpu=1024){
     PhysicalMemoryPlanBuilder plan;plan.add({0,DeviceId::cpu(),1u<<20,1u<<20},PhysicalMemoryOwner::NativeReadAheadParentTerminal,host);
@@ -297,14 +299,14 @@ TEST(ReadAheadNativeResourceFamily,ContextResetRejectsForeignAuthorityBeforeCrea
 }
 /** @test A worker-only scope cannot silently drop retained native tokens without reset. */
 TEST(ReadAheadNativeResourceFamily,MissingOriginalResetIsFatal){
-    GTEST_FLAG_SET(death_test_style,"threadsafe");EXPECT_DEATH({
+    GTEST_FLAG_SET(death_test_style,"threadsafe");EXPECT_EXIT({llaminar2::test::disableIntentionalFaultCoreDump();
         auto memory=authority();auto worker=makeWorker();worker->memory=memory;
         auto family=ReadAheadNativeResourceReplayAccess::create(memory,worker,request(),ReadAheadNativeRetirementPolicy::OriginalContextReset);family.reset();worker.reset();
         {auto scope=GPUDeviceContextPool::instance().beginExclusiveGenerationRetirement(DeviceId::cuda(0));}
-    },"");
+    },::testing::KilledBySignal(SIGABRT),"");
 }
 /** @test Actual pending parent use cannot be destroyed or converted into a released physical obligation. */
-TEST(ReadAheadNativeParentTerminal,PendingDestructionIsFatal){GTEST_FLAG_SET(death_test_style,"threadsafe");EXPECT_DEATH({auto memory=parentAuthority();auto worker=makeWorker();worker->memory=memory;worker->parent=true;auto owner=ReadAheadNativeParentTerminalReplayAccess::create(memory,worker,request().closure);owner.reset();},"");}
+TEST(ReadAheadNativeParentTerminal,PendingDestructionIsFatal){GTEST_FLAG_SET(death_test_style,"threadsafe");EXPECT_EXIT({llaminar2::test::disableIntentionalFaultCoreDump();auto memory=parentAuthority();auto worker=makeWorker();worker->memory=memory;worker->parent=true;auto owner=ReadAheadNativeParentTerminalReplayAccess::create(memory,worker,request().closure);owner.reset();},::testing::KilledBySignal(SIGABRT),"");}
 /** @test Original process tokens survive20actual owner resets and lexical process cleanup. */
 TEST(ReadAheadNativeProcessRuntime,SameAuthorityTwentyResetUsesNeverRechargeOrRelease){
     GTEST_FLAG_SET(death_test_style,"threadsafe");

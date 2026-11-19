@@ -90,8 +90,63 @@ def coding_prompt(case: str, content: str) -> str:
             "read result.txt. Finish by reporting that you wrote and read the file.")
 
 
-def session_prompts(case: str, content: str) -> list[str]:
-    """Keep one real agent conversation across five independently verified changes."""
+_FIVE_PHASE_APP = (
+    "Start Taskboard using ThreadingHTTPServer and SQLite, Python standard library only. Create a taskboard "
+    "package and CLI `python3 -m taskboard --host 127.0.0.1 --port 8080 --database tasks.sqlite`. "
+    "Implement GET /health returning JSON {\"status\":\"ok\"}; GET /api/tasks listing tasks by id; "
+    "POST /api/tasks accepting {title: string} and returning 201 with {id,title,completed:false}. "
+    "Add HTTP unittests and a short README; run the tests.",
+    "Add GET /api/tasks/<id>, PATCH title/completed returning 200, and DELETE returning 204. "
+    "Add a server-rendered HTML page at / with escaped titles and task creation/completion/deletion controls. "
+    "Unicode and emoji must round-trip through HTTP, SQLite and HTML, including escaped JSON surrogate pairs. "
+    "Content-Length counts UTF-8 bytes. Test updates, deletion and HTML-injection titles.",
+    "Harden input validation: malformed JSON, non-object bodies, missing/empty/whitespace/non-string titles "
+    "and non-boolean completed values return JSON errors with status 400. Unknown task IDs return 404. "
+    "Invalid requests must preserve existing tasks. Add HTTP unittests and run them.",
+    "Test task creation, update and deletion persistence across process restarts. Test 12 concurrent creates "
+    "with unique IDs and exact titles, per-request SQLite connection ownership and an adequate listener queue. "
+    "Fix defects and run the tests. Filtering and pagination are outside this small app's scope.",
+    "Review the app and tests. First call glob with '**/*.py', grep with pattern 'def ' and include '*.py', "
+    "and read on a returned Python file; all three calls are required. Update README and run "
+    "`python3 -m unittest discover -s tests -v`. Finish all todos. Use write to create result.txt with exactly "
+    "123 and no newline, then read it as the tool-string sentinel.",
+)
+
+_TEN_PHASE_APP = (
+    "Start Taskboard, a Python web app using ThreadingHTTPServer and SQLite. Create the taskboard package, "
+    "a CLI runnable as `python3 -m taskboard --host 127.0.0.1 --port 8080 --database tasks.sqlite`, "
+    "and a README. Implement GET /health returning JSON {\"status\":\"ok\"}. "
+    "Keep this first increment small: add one HTTP unittest, run it and finish this turn. "
+    "The task API, HTML interface and database features will be requested in subsequent turns.",
+    "Add a JSON task API: GET /api/tasks returns a list ordered by id; POST /api/tasks accepts {title: string} "
+    "and returns 201 with {id, title, completed: false}. Add HTTP unittests for creating/listing tasks.",
+    "Extend the task API: GET /api/tasks/<id> returns that task. "
+    "PATCH updates title and/or completed and returns 200; DELETE returns 204. IDs are integers. Test it.",
+    "Add an HTML page at / with a task creation form and completion/deletion controls. Server-render "
+    "the initial task titles and safely escape them; JavaScript uses the JSON API. Add CSS and document usage.",
+    "Make Unicode and emoji round-trip exactly through HTTP, SQLite and HTML. Include tests with "
+    "🙂 👩🏽‍💻 🇬🇧 ❤️ 1️⃣ 🚀 中文 λ, and JSON encoded with both literal UTF-8 and escaped surrogate pairs. "
+    "Response Content-Length must count UTF-8 bytes. Test an HTML-injection title too.",
+    "Harden input validation: malformed JSON, non-object bodies, missing/empty/whitespace titles, "
+    "non-string titles and non-boolean completed values return JSON errors with status 400. "
+    "Unknown task IDs return 404. An invalid request must not corrupt persisted tasks. Test each case.",
+    "Add GET /api/tasks?completed=true or completed=false filtering plus limit and offset pagination. "
+    "Filtering happens before pagination; id ordering is stable. Invalid completed, negative/non-numeric "
+    "limits or offsets return 400. Add independent HTTP tests for all query variants.",
+    "Verify task persistence across app restarts. Add tests that creates, updates and deletes survive restart.",
+    "Add tests creating at least 12 tasks concurrently and checking unique IDs and all titles. "
+    "Use explicit per-request SQLite connection ownership and configure the HTTP listener to handle "
+    "that concurrent connection count. Distinguish HTTP connection failures from database errors.",
+    "Review the entire app and tests. Begin by calling the glob tool with pattern '**/*.py', "
+    "the grep tool with pattern 'def ' and include '*.py', and the read tool on a returned Python file. "
+    "These three tool calls are required parts of the review. Add missing edge-case tests, update README, "
+    "and run `python3 -m unittest discover -s tests -v`. Finish all todos. Finally use write to create "
+    "result.txt containing exactly 123 with no newline, then read it; this is a tool-string regression sentinel.",
+)
+
+
+def session_prompts(case: str, content: str, webapp_phases: int = 5) -> list[str]:
+    """Return the authored five- or ten-turn workload for a continuous agent conversation."""
     if case != "webapp":
         return [coding_prompt(case, content)]
     common = ("Work only in the current directory. Use Python's standard library only. "
@@ -100,27 +155,9 @@ def session_prompts(case: str, content: str) -> list[str]:
               "After at most three repair attempts in this turn, finish with a brief status and any remaining "
               "failing tests; the next turn can continue the work. Do not repeat an unchanged failing test "
               "without a code or configuration change. Avoid redundant manual server probes. ")
-    phases = [
-        "Start Taskboard using ThreadingHTTPServer and SQLite, Python standard library only. Create a taskboard "
-        "package and CLI `python3 -m taskboard --host 127.0.0.1 --port 8080 --database tasks.sqlite`. "
-        "Implement GET /health returning JSON {\"status\":\"ok\"}; GET /api/tasks listing tasks by id; "
-        "POST /api/tasks accepting {title: string} and returning 201 with {id,title,completed:false}. "
-        "Add HTTP unittests and a short README; run the tests.",
-        "Add GET /api/tasks/<id>, PATCH title/completed returning 200, and DELETE returning 204. "
-        "Add a server-rendered HTML page at / with escaped titles and task creation/completion/deletion controls. "
-        "Unicode and emoji must round-trip through HTTP, SQLite and HTML, including escaped JSON surrogate pairs. "
-        "Content-Length counts UTF-8 bytes. Test updates, deletion and HTML-injection titles.",
-        "Harden input validation: malformed JSON, non-object bodies, missing/empty/whitespace/non-string titles "
-        "and non-boolean completed values return JSON errors with status 400. Unknown task IDs return 404. "
-        "Invalid requests must preserve existing tasks. Add HTTP unittests and run them.",
-        "Test task creation, update and deletion persistence across process restarts. Test 12 concurrent creates "
-        "with unique IDs and exact titles, per-request SQLite connection ownership and an adequate listener queue. "
-        "Fix defects and run the tests. Filtering and pagination are outside this small app's scope.",
-        "Review the app and tests. First call glob with '**/*.py', grep with pattern 'def ' and include '*.py', "
-        "and read on a returned Python file; all three calls are required. Update README and run "
-        "`python3 -m unittest discover -s tests -v`. Finish all todos. Use write to create result.txt with exactly "
-        "123 and no newline, then read it as the tool-string sentinel.",
-    ]
+    if webapp_phases not in (5, 10):
+        raise ValueError("OpenCode webapp requires five or ten authored phases")
+    phases = _TEN_PHASE_APP if webapp_phases == 10 else _FIVE_PHASE_APP
     return [common + phase for phase in phases]
 
 
@@ -200,7 +237,7 @@ def app_process(workspace: Path, database: Path, output: Path):
                     process.wait()
 
 
-def check_webapp(directory: Path) -> dict:
+def check_webapp(directory: Path, webapp_phases: int = 5) -> dict:
     """Assert behavior independently of the tests authored by the coding model."""
     workspace = directory / "workspace"
     checks, failures = [], []
@@ -235,6 +272,10 @@ def check_webapp(directory: Path) -> dict:
             identity = tasks[0]["id"]
             status, updated = exchange(base, "PATCH", f"/api/tasks/{identity}", {"completed": True, "title": "done " + emoji})
             expect(status == 200 and updated.get("completed") is True and updated.get("title") == "done " + emoji, "update round trip")
+            if webapp_phases == 10:
+                expect(exchange(base, "GET", "/api/tasks?completed=true") == (200, [updated]), "completed filter")
+                expect(exchange(base, "GET", "/api/tasks?completed=false&limit=1&offset=0") == (200, [tasks[1]]),
+                       "filter before pagination")
             status, injection = exchange(base, "POST", "/api/tasks", {"title": '<script>alert("x")</script>'})
             expect(status == 201, "HTML title creation")
             status, page = exchange(base, "GET", "/")
@@ -245,6 +286,9 @@ def check_webapp(directory: Path) -> dict:
             expect(exchange(base, "POST", "/api/tasks", raw=b"{broken")[0] == 400, "malformed JSON")
             expect(exchange(base, "PATCH", f"/api/tasks/{identity}", {"completed": "true"})[0] == 400, "boolean validation")
             expect(exchange(base, "GET", "/api/tasks/999999999")[0] == 404, "missing task")
+            if webapp_phases == 10:
+                for query in ("completed=maybe", "limit=-1", "limit=no", "offset=-1", "offset=no"):
+                    expect(exchange(base, "GET", "/api/tasks?" + query)[0] == 400, f"invalid query {query}")
             with ThreadPoolExecutor(max_workers=12) as executor:
                 created = list(executor.map(lambda index: exchange(base, "POST", "/api/tasks", {"title": f"parallel-{index}"}), range(12)))
             expect(all(status == 201 for status, _ in created), "concurrent creates")
@@ -252,6 +296,8 @@ def check_webapp(directory: Path) -> dict:
             expect({task["title"] for _, task in created} == {f"parallel-{index}" for index in range(12)}, "all concurrent titles")
             status, inventory = exchange(base, "GET", "/api/tasks")
             expect(status == 200 and [task["id"] for task in inventory] == sorted(task["id"] for task in inventory), "stable ordering")
+            if webapp_phases == 10:
+                expect(exchange(base, "GET", "/api/tasks?limit=3&offset=2") == (200, inventory[2:5]), "pagination")
             expect(exchange(base, "DELETE", f"/api/tasks/{tasks[1]['id']}")[0] == 204, "delete")
             expect(exchange(base, "GET", f"/api/tasks/{tasks[1]['id']}")[0] == 404, "deleted task absent")
         with app_process(workspace, database, directory / "app.stderr") as base:
@@ -1348,7 +1394,8 @@ def run_session(args, ordinal: int, case: str, content: str) -> dict:
             "from answer import answer\nclass AnswerTest(unittest.TestCase):\n"
             "    def test_answer(self):\n        self.assertEqual(answer(), 123)\n")
     (directory / "expected.bin").write_bytes(content.encode())
-    prompts = session_prompts(case, content)
+    webapp_phases = getattr(args, 'webapp_phases', 5)
+    prompts = session_prompts(case, content, webapp_phases)
     prompt = "\n\n".join(prompts)
     (directory / "prompt.txt").write_text(prompt)
     started = time.monotonic()
@@ -1425,7 +1472,7 @@ def run_session(args, ordinal: int, case: str, content: str) -> dict:
     result["protocol_errors"].extend(f"phase {phase['phase'] + 1}: {phase['prompt']['error']}"
                                      for phase in phases if not phase["prompt"]["passed"])
     if case == "webapp":
-        acceptance = check_webapp(directory)
+        acceptance = check_webapp(directory, webapp_phases)
         result["webapp_acceptance"] = acceptance
         result["task_errors"].extend(acceptance["errors"])
         if len(phases) != len(prompts):
@@ -1466,6 +1513,8 @@ def main() -> int:
                         help="Explicit client reply-space reserve; leaves output limit unchanged, default uses native client policy")
     parser.add_argument("--session-timeout", type=float, default=None,
                         help="Optional elapsed seconds per turn; unset permits active turns of any duration")
+    parser.add_argument("--webapp-phases", type=int, choices=(5, 10), default=5,
+                        help="Five-turn release workload or extended ten-turn coding session with pagination")
     parser.add_argument("--case", action="append", choices=("webapp",))
     args = parser.parse_args()
     if args.measure_prefix_reuse and args.concurrency != 1:
@@ -1484,6 +1533,7 @@ def main() -> int:
     version = subprocess.check_output([args.opencode, "--version"], text=True, timeout=30).strip()
     document = {"schema": 2, "complete": False, "opencode_version": version, "gate": args.gate,
                 "model": args.model, "base_url": args.base_url, "concurrency": args.concurrency,
+                "webapp_phases": args.webapp_phases,
                 "measure_prefix_reuse": args.measure_prefix_reuse,
                 "context_length": args.context_length, "max_tokens": args.max_tokens,
                 "reply_reserve_tokens": args.reply_reserve_tokens,

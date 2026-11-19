@@ -22,6 +22,7 @@
  */
 
 #pragma once
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "kernels/common/OriginalM1HiddenQ8Publication.h"
 #include "execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
 
@@ -396,6 +397,13 @@ namespace llaminar2
             ITensor *output_indices, ITensor *output_weights,
             const int *device_effective_seq_len = nullptr,
             DeviceMoELayerRuntime *deferred_selected_route_ledger = nullptr) override;
+
+        /** @brief Route counted verifier rows with the original graph's immutable topology policy. */
+        bool routeGroupedVerifierWithPolicy(LocalGPUExpertKernelPolicy policy,
+            ITensor *hidden, ITensor *gate_weights,
+            int seq_len, int d_model, int num_experts, int top_k, bool normalize_weights,
+            ITensor *output_indices, ITensor *output_weights,
+            const int *device_effective_seq_len, DeviceMoELayerRuntime *deferred_selected_route_ledger);
 
         /**
          * @brief Bind HIP router scratch and immutable gate caches before capture.

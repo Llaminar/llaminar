@@ -10,6 +10,7 @@
  * boundary, and this partial operation supplies no complete-FFN timing evidence.
  */
 #pragma once
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "execution/config/RoutedExpertPolicy.h"
 #include "execution/moe/MoEGroupedPlanDemand.h"
 #include "execution/moe/DeviceMoEOverlayServiceTelemetry.h"
@@ -52,6 +53,7 @@ namespace llaminar2
         int rows = 0;
         int top_k = 0;
         MoEIntermediateShardRowMode row_mode = MoEIntermediateShardRowMode::Grouped;
+        LocalGPUExpertKernelPolicy verifier_kernel_policy = LocalGPUExpertKernelPolicy::Generic;
         MoEGateUpPublicationPolicy gate_up_publication=MoEGateUpPublicationPolicy::Staged; ///< Explicit ordinary native M1 tile publication; other paths remain Staged.
         MoEDownPublicationPolicy down_publication=MoEDownPublicationPolicy::Staged; ///< Explicit ordinary native M1 down/route completion; other paths remain Staged.
         RoutedExpertRowExecutionPolicy row_policy = RoutedExpertRowExecutionPolicy::IntermediateShardLocal;

@@ -1204,7 +1204,7 @@ TEST(RetainedM1WorkspaceAdmission, OriginalTP4ContinuationPricesSealedWorkspace)
         ASSERT_NE(ordinary,nullptr);
         EXPECT_EQ(retained->bytes(PhysicalMemoryOwner::ExecutionWorkspace),
             ordinary->bytes(PhysicalMemoryOwner::ExecutionWorkspace)+
-                (qfnRetainedM1HCFFNOptIn()?extent:0));
+                (qfnRetainedM1HCFFNEnabled(false)?extent:0));
     }
 }
 #endif

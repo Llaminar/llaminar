@@ -2,6 +2,7 @@
  * @file ImmutableRowTableAdmissionWire.cpp
  * @brief Authenticate bounded setup-only table candidate metadata with no payload reads.
  *
+ * Version19 carries the sealed GPU intermediate tiling for the common arena.
  * Version18 carries the original common activation TP assignment. Earlier frames cannot
  * restore a tensor-sharded arena. Version17 introduced independent local-hot intent and cannot silently
  * supply SSD defaults. Predictor head ownership remains beside resolved arithmetic and
@@ -22,7 +23,7 @@ namespace llaminar2
 {
 namespace
 {
-    constexpr std::uint32_t Magic = 0x4e475231u, Version = 18;
+    constexpr std::uint32_t Magic = 0x4e475231u, Version = 19;
     /** @brief Exact typed QFN layout words carried by this schema, without native padding. */
     constexpr std::array QfnLayoutWords{
         &Qwen4ExpMemoryGeometry::residual_width,
@@ -297,7 +298,8 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
                                         static_cast<int>(a.mtp_terminal_logits_layout),
                                         static_cast<int>(a.attention_phase_schedule),
                                         static_cast<int>(a.attention_arithmetic),
-                                        static_cast<int>(a.mtp_shifted_kv_head_layout)})
+                                        static_cast<int>(a.mtp_shifted_kv_head_layout),
+                                        static_cast<int>(a.gpu_expert_intermediate_tiling)})
                 {
                     if(value<0)throw std::invalid_argument("Ngram common activation geometry must be nonnegative");
                     append(out,static_cast<std::uint32_t>(value));
@@ -512,7 +514,7 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
                     kvStart > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
                     assignedKVHeads > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
                     throw std::invalid_argument("Ngram wire head coordinate exceeds native range");
-                int common[10];
+                int common[11];
                 for(int &field:common)
                 {
                     const auto value=in.read<std::uint32_t>();
@@ -522,7 +524,8 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
                 }
                 if(common[4]>1 || common[5]>static_cast<int>(RoutedExpertComputePolicy::GateUpOwnedDownColumns) ||
                     common[6]>static_cast<int>(MTPTerminalLogitsLayout::VocabularyShardPerParticipant) ||
-                    common[9]>static_cast<int>(MTPShiftedKVHeadLayout::FullModelPerParticipant))
+                    common[9]>static_cast<int>(MTPShiftedKVHeadLayout::FullModelPerParticipant) ||
+                    common[10]>static_cast<int>(GPUExpertIntermediateTiling::BalancedNativeK32))
                     throw std::invalid_argument("Ngram wire common activation policy is invalid");
                 if(common[7]!=static_cast<int>(qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform) &&
                    common[7]!=static_cast<int>(qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33))
@@ -583,6 +586,7 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
                     .shard_index = static_cast<int>(shard),
                     .shared_tp_assignment = original,
                     .routed_compute_policy = static_cast<RoutedExpertComputePolicy>(common[5]),
+                    .gpu_expert_intermediate_tiling = static_cast<GPUExpertIntermediateTiling>(common[10]),
                     .mtp_target_query_rows = fields[7],
                     .retained_mtp_candidate_rows = fields[8],
                     .mtp_terminal_logits_layout = static_cast<MTPTerminalLogitsLayout>(common[6]),

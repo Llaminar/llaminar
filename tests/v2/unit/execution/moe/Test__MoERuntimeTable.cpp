@@ -1378,7 +1378,7 @@ namespace llaminar2::test
         EXPECT_EQ(state.grouped_verifier_histogram[511], 31u);
         EXPECT_EQ(sizeof(DeviceMoEPlacementBank), moe_runtime_abi::kPlacementBankBytes);
         EXPECT_EQ(sizeof(DeviceMoELayerRuntime), moe_runtime_abi::kLayerRuntimeBytes);
-        EXPECT_EQ(moe_runtime_abi::kRuntimeLayoutVersion, 2u);
+        EXPECT_EQ(moe_runtime_abi::kRuntimeLayoutVersion, 3u);
         EXPECT_THROW((void)MoERuntimeTable(DeviceId::cpu(), 1, 513, 10), std::invalid_argument);
     }
 

@@ -1598,6 +1598,12 @@ namespace llaminar2
                                                                      int n, int k,
                                                                      DeviceWorkspaceManager *workspace)
         {
+            multiplyHCResidualDownWithPolicy(LocalGPUExpertKernelPolicy::Generic,std::move(hc),output,rows,n,k,workspace);
+        }
+
+        void ROCmQuantisedGemmKernel::multiplyHCResidualDownWithPolicy(LocalGPUExpertKernelPolicy policy,
+            HCResidualDownInput hc,TensorBase* output,DeviceRowRange rows,int n,int k,DeviceWorkspaceManager* workspace)
+        {
             const auto*input=&hc.raw;auto*activated=&hc.activated;
             validateHCResidualDownRows(rows,rows.physicalRows());
             validateQ8ResidualCorrectionGeometry(rows.physicalRows(), n, k);
@@ -1666,7 +1672,8 @@ namespace llaminar2
                     static_cast<const float*>(read.normalized.gpu_data_ptr()),
                     static_cast<float*>(read.mixed.gpu_data_ptr())},stream);
                 publishROCmTensorWrite(read.mixed, rocm_device_id_, stream);
-            } else rocmHCResidualDownQ8Projection(publication,stream,impl_->residual_iq_tables);
+            } else rocmHCResidualDownQ8ProjectionWithPolicy(publication,stream,impl_->residual_iq_tables,
+                policy==LocalGPUExpertKernelPolicy::QFNMI50TP4);
             if(hc.prepublished)hc.prepublished->consume();
             else publishROCmTensorWrite(*activated, rocm_device_id_, stream);
             publishROCmTensorWrite(*output, rocm_device_id_, stream);

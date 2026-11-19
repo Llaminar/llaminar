@@ -9,6 +9,7 @@ comparison. Wider shards can rotate by layer or tie in width.
 """
 import argparse
 import json
+import re
 import sqlite3
 from pathlib import Path
 from statistics import median
@@ -23,7 +24,7 @@ def read(path):
     return json.loads(path.read_text())
 
 
-def participant_rounds(db, tables, agent, rounds, layer_count):
+def participant_rounds(db, tables, agent, rounds, routed_widths):
     """Collect one ordered FFN producer per layer between successive verifier terminals."""
     kernel, graph, symbol = (tables[key] for key in ('kernel_dispatch', 'graph_launch', 'info_kernel_symbol'))
     # Graph IDs can be reused between warmup and measurement. The last prefill
@@ -55,6 +56,7 @@ def participant_rounds(db, tables, agent, rounds, layer_count):
         SELECT k.start,k.end,s.display_name FROM {kernel} k JOIN {symbol} s ON s.id=k.kernel_id
         WHERE k.agent_id=? AND k.start>=? AND k.graph_exec_id=? AND
         (instr(s.display_name,'peerPushFP32Kernel')>0 OR instr(s.display_name,'groupedFFNTokenDown')>0 OR
+         instr(s.display_name,'groupedFFNFormatProgramDown')>0 OR
          instr(s.display_name,'rocm_moe_shared_expert_gate_add_kernel')>0 OR
          instr(s.display_name,'summarize_greedy_speculative_verify')>0)
         ORDER BY k.start''', (agent, end, target))
@@ -63,11 +65,20 @@ def participant_rounds(db, tables, agent, rounds, layer_count):
         if 'peerPushFP32Kernel' in name:
             push_end = finish
         elif 'summarize_greedy_speculative_verify' in name:
-            require(len(layers) == layer_count, 'Missing or extra FFN producer within a verifier round')
+            require(len(layers) == len(routed_widths), 'Missing or extra FFN producer within a verifier round')
             history.append(layers)
             layers, push_end = [], None
         else:
             require(push_end is not None and push_end <= start <= finish, 'Missing ordered peer-to-FFN boundary')
+            if 'groupedFFNFormatProgramDown' in name:
+                # The last template argument is zero for a runtime width. A
+                # fixed-width reader independently identifies the actual shard.
+                match = re.search(r'groupedFFNFormatProgramDown<[^<>]*,\s*(\d+)>', name)
+                require(match and len(layers) < len(routed_widths),
+                        'Unknown grouped down signature or extra FFN producer')
+                width = int(match[1])
+                require(width == 0 or width == routed_widths[len(layers)],
+                        'Compiled FFN shard width differs from original participant inventory')
             layers.append((finish, finish - push_end))
             push_end = None
     require(len(history) == rounds and not layers, 'Incomplete verifier rounds')
@@ -107,7 +118,8 @@ def measure(window, inventory):
             pci = f"{data['domain']:04x}:{address >> 8:02x}:{(address >> 3) & 31:02x}.{address & 7}"
             if pci in participants:
                 require(pci not in history, 'Duplicate physical GPU in trace')
-                history[pci] = participant_rounds(db, tables, agent, rounds, count)
+                history[pci] = participant_rounds(db, tables, agent, rounds,
+                                                  [layer['routed'] for layer in inventory[pci]['layers']])
     require(history.keys() == participants.keys(), 'Native trace omitted a compute participant')
     layers = []
     for layer in range(count):

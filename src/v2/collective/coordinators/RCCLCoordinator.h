@@ -47,6 +47,7 @@
 
 namespace llaminar2
 {
+    enum class RankOrderedPeerPushRequest;
     class ROCmPeerPushResources;
 
     /**
@@ -63,6 +64,10 @@ namespace llaminar2
     {
     public:
         RCCLCoordinator();
+        /** @brief Bind the original model's admitted native transport selection before communicator creation. */
+        explicit RCCLCoordinator(RankOrderedPeerPushRequest request);
+        /** @return Immutable startup policy used to authenticate reuse of a pooled communicator. */
+        RankOrderedPeerPushRequest rankOrderedPushRequest() const noexcept { return rank_ordered_request_; }
         ~RCCLCoordinator() override;
 
         // Non-copyable, non-movable (owns thread state)
@@ -347,6 +352,8 @@ namespace llaminar2
 
         /** @copydoc ICollectiveBackend::rankOrderedResources */
         std::vector<RankOrderedNativeResources> rankOrderedResources() const;
+        /** @return Whether this original communicator quoted the prepared small-row transport. */
+        bool hasRankOrderedPeerPush() const noexcept { return !rank_ordered_resources_.empty(); }
         /** @copydoc ICollectiveBackend::prepareRankOrderedResources */
         bool prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory);
         /** @brief Retire the original model's peer attachment after its graph owner releases all readers. */
@@ -591,6 +598,8 @@ namespace llaminar2
 
         // RCCL state (owned by coordinator thread)
         // Stored as void* to avoid including rccl.h in public header
+        const RankOrderedPeerPushRequest rank_ordered_request_; ///< Part of the pooled native communicator identity.
+        bool rank_ordered_push_selected_ = false; ///< Fixed for the original communicator before its worker starts.
         std::vector<RankOrderedNativeResources> rank_ordered_resources_; ///< Original cold quote; never resampled after preparation.
         struct RankOrderedAttachment;
         std::unique_ptr<RankOrderedAttachment> rank_ordered_attachment_; ///< One model's unpooled PMA and native inboxes.

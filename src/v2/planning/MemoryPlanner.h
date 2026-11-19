@@ -19,6 +19,7 @@
 #include "backends/NativeOrderingEventBudgetProjection.h"
 #include "backends/CPUExecutionGeometry.h"
 #include "planning/MemoryPlan.h"
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/GraphSnapshotMemoryCapacity.h"
 #include "planning/PipelineTransferMemory.h"
@@ -362,6 +363,13 @@ struct DevicePlanConfig
 
     /** Frozen physical expert layout, shared by the activation BOM and graph schema. */
     RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+    LocalGPUExpertKernelPolicy local_gpu_expert_kernel_policy = LocalGPUExpertKernelPolicy::Generic;
+    GPUExpertIntermediateTiling gpu_expert_intermediate_tiling = GPUExpertIntermediateTiling::Coarse128;
+
+    /** @return Whether this arena belongs to the qualified QFN MI50 TP4 domain. */
+    bool usesQFNMI50TP4() const noexcept
+    { return local_gpu_expert_kernel_policy == LocalGPUExpertKernelPolicy::QFNMI50TP4; }
+
 
     /// Immutable original per-edge routes; their canonical quote is the only projection transport BOM.
     std::shared_ptr<const DeviceCountedAllGatherTopology> projection_exchange_topology;

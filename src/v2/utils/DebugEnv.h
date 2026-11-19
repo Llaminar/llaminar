@@ -54,15 +54,16 @@ namespace llaminar2
      * @brief Immutable process opt-in for the gfx906 grouped signed-Q8 HC-up leaf.
      * @return True only when the experimental capture policy is explicitly selected.
      */
-    inline bool qfnGroupedHCUpShortKExperiment()
+    inline bool qfnGroupedHCUpShortKExperiment(bool qualified_default=false)
     {
-        static const bool enabled = [] {
+        static const std::optional<bool> enabled=[]() -> std::optional<bool> {
             const char *mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K");
-            if (!mode || std::strcmp(mode,"0")==0) return false;
+            if (!mode) return std::nullopt;
+            if (std::strcmp(mode,"0")==0) return false;
             if (std::strcmp(mode,"1")==0) return true;
             throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K accepts 0 or 1");
         }();
-        return enabled;
+        return enabled.value_or(qualified_default);
     }
 
     /**
@@ -98,29 +99,31 @@ namespace llaminar2
      * @return True when the process requests the measured counted verifier leaf.
      * @throws std::invalid_argument If the environment value is neither zero nor one.
      */
-    inline bool qfnGroupedGDNConvK4Experiment()
+    inline bool qfnGroupedGDNConvK4Experiment(bool qualified_default=false)
     {
-        static const bool enabled = [] {
+        static const std::optional<bool> enabled=[]() -> std::optional<bool> {
             const char* mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_GDN_CONV_K4");
-            if (!mode || std::strcmp(mode, "0") == 0) return false;
+            if (!mode) return std::nullopt;
+            if (std::strcmp(mode, "0") == 0) return false;
             if (std::strcmp(mode, "1") == 0) return true;
             throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_GDN_CONV_K4 accepts 0 or 1");
         }();
-        return enabled;
+        return enabled.value_or(qualified_default);
     }
 
     /** @brief Select the aligned ROCm QFN accepted-state publisher at capture.
      * @return Whether the explicit vector publication experiment is enabled.
      * @throws std::invalid_argument For values other than 0 or 1. */
-    inline bool qfnGroupedGDNAcceptedVectorExperiment()
+    inline bool qfnGroupedGDNAcceptedVectorExperiment(bool qualified_default=false)
     {
-        static const bool enabled = [] {
+        static const std::optional<bool> enabled=[]() -> std::optional<bool> {
             const char* mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_GDN_ACCEPTED_VECTOR4");
-            if (!mode || std::strcmp(mode, "0") == 0) return false;
+            if (!mode) return std::nullopt;
+            if (std::strcmp(mode, "0") == 0) return false;
             if (std::strcmp(mode, "1") == 0) return true;
             throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_GDN_ACCEPTED_VECTOR4 accepts 0 or 1");
         }();
-        return enabled;
+        return enabled.value_or(qualified_default);
     }
 
     /**
@@ -128,67 +131,73 @@ namespace llaminar2
      * @return True when explicitly requested before native capture.
      * @throws std::invalid_argument If the supplied selector is neither zero nor one.
      */
-    inline bool qfnGroupedTopKRegisterOptIn()
+    inline bool qfnGroupedTopKRegisterOptIn(bool qualified_default=false)
     {
-        static const bool enabled = [] {
+        static const std::optional<bool> enabled=[]() -> std::optional<bool> {
             const char* value = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_TOPK_REGISTERS");
-            if (!value || std::strcmp(value, "0") == 0) return false;
+            if (!value) return std::nullopt;
+            if (std::strcmp(value, "0") == 0) return false;
             if (std::strcmp(value, "1") == 0) return true;
             throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_TOPK_REGISTERS accepts 0 or 1");
         }();
-        return enabled;
+        return enabled.value_or(qualified_default);
     }
 
     /** @brief Select the immutable counted small-row FP16 router program on MI50. */
-    inline bool qfnGroupedFP16RouterFixedRowsOptIn()
+    inline bool qfnGroupedFP16RouterFixedRowsOptIn(bool qualified_default=false)
     {
-        static const bool enabled = [] {
+        static const std::optional<bool> enabled=[]() -> std::optional<bool> {
             const char* mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS");
-            if (!mode || std::strcmp(mode, "0") == 0) return false;
+            if (!mode) return std::nullopt;
+            if (std::strcmp(mode, "0") == 0) return false;
             if (std::strcmp(mode, "1") == 0) return true;
             throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS accepts 0 or 1");
         }();
-        return enabled;
+        return enabled.value_or(qualified_default);
     }
 
-    /** @brief Return the experimental preferred tile for GPU expert intermediate sharding.
-     * @return The native activation group size for balanced shards or the original 128-column preference.
+    /**
+     * @brief Resolve the optional intermediate-shard diagnostic override at cold setup.
+     * @param automatic_grain Preferred tile from the bound domain and source policy.
+     * @return The requested tile, or the already resolved automatic tile when unset.
      * @throws std::invalid_argument For values other than 0 and 1.
-     * @details The source weight group remains indivisible for either setting. Both admission
-     * and materialization obtain the same policy before constructing any intervals. */
-    inline int qfnGPUExpertPreferredIntermediateGrain()
+     */
+    inline int qfnGPUExpertPreferredIntermediateGrain(int automatic_grain=128)
     {
-        static const int grain = [] {
+        static const int diagnostic_grain = [] {
             const char* mode = std::getenv("LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES");
-            if (!mode || std::strcmp(mode, "0") == 0) return 128;
+            if (!mode) return 0;
+            if (std::strcmp(mode, "0") == 0) return 128;
             if (std::strcmp(mode, "1") == 0) return 32;
             throw std::invalid_argument("LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES accepts 0 or 1");
         }();
-        return grain;
+        return diagnostic_grain ? diagnostic_grain : automatic_grain;
     }
 
     /** @brief Borrow the request-selected bank directly in the qualified grouped verifier. */
-    inline bool qfnGroupedFFNDirectBankExperiment()
+    inline bool qfnGroupedFFNDirectBankExperiment(bool qualified_default=false)
     {
-        static const bool enabled=[] {
+        static const std::optional<bool> enabled= []() -> std::optional<bool> {
             const auto* value=std::getenv("LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK");
-            if(!value || std::strcmp(value,"0")==0)return false;
+            if(!value)return std::nullopt;
+            if(std::strcmp(value,"0")==0)return false;
             if(std::strcmp(value,"1")==0)return true;
             throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK accepts 0 or 1");
         }();
-        return enabled;
+        return enabled.value_or(qualified_default);
     }
 
     /** @brief Admit the separately qualified physical F160 direct-bank program. */
-    inline bool qfnGroupedFFNEqualFrontierOptIn()
+    inline bool qfnGroupedFFNEqualFrontierOptIn(bool qualified_default=false)
     {
-        static const bool enabled=[] {
+        static const std::optional<bool> enabled= []() -> std::optional<bool> {
             const auto* value=std::getenv("LLAMINAR_QFN_ROCM_GROUPED_FFN_EQUAL_FRONTIER");
-            if(!value || std::strcmp(value,"0")==0)return false;
+            if(!value)return std::nullopt;
+            if(std::strcmp(value,"0")==0)return false;
             if(std::strcmp(value,"1")==0)return true;
             throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_FFN_EQUAL_FRONTIER accepts 0 or 1");
         }();
-        return enabled;
+        return enabled.value_or(qualified_default);
     }
 
     /** @brief Select the source-aware verifier leaves for a native format qualification run. */
@@ -204,15 +213,16 @@ namespace llaminar2
     }
 
     /** @brief Select the measured two-node grouped local FFN for the original MI50 verifier tuple. */
-    inline bool qfnGroupedFFNFrontierOptIn()
+    inline bool qfnGroupedFFNFrontierOptIn(bool qualified_default=false)
     {
-        static const bool enabled=[] {
+        static const std::optional<bool> enabled= []() -> std::optional<bool> {
             const auto* value=std::getenv("LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER");
-            if(!value || std::strcmp(value,"0")==0)return false;
+            if(!value)return std::nullopt;
+            if(std::strcmp(value,"0")==0)return false;
             if(std::strcmp(value,"1")==0)return true;
             throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER accepts 0 or 1");
         }();
-        return enabled;
+        return enabled.value_or(qualified_default);
     }
 
     /**
@@ -4536,16 +4546,20 @@ namespace llaminar2
     }
 
 
-    /** @return Explicit retained M1 HC/FFN experiment selected once at cold graph ownership. */
-    inline bool qfnRetainedM1HCFFNOptIn()
+    /**
+     * @brief Resolve an immutable diagnostic override against this participant's measured policy.
+     * @param qualified_domain Whether the admitted placement owns the tuned MI50 TP4 program.
+     * @return Whether to lower and reserve the retained single-row HC/FFN.
+     */
+    inline bool qfnRetainedM1HCFFNEnabled(bool qualified_domain)
     {
-        static const bool enabled=[] {
-            constexpr const char* name="LLAMINAR_QFN_RETAINED_M1_HC_FFN_CANDIDATE";
-            const char* value=std::getenv(name);
-            if(value&&std::strcmp(value,"0")!=0&&std::strcmp(value,"1")!=0)
-                throw std::invalid_argument(std::string(name)+" requires 0 or 1");
-            return value&&std::strcmp(value,"1")==0;
+        static const std::optional<bool> selected = []() -> std::optional<bool> {
+            const char *value = std::getenv("LLAMINAR_QFN_RETAINED_M1_HC_FFN_CANDIDATE");
+            if (!value) return std::nullopt;
+            if (std::strcmp(value, "0") == 0) return false;
+            if (std::strcmp(value, "1") == 0) return true;
+            throw std::invalid_argument("LLAMINAR_QFN_RETAINED_M1_HC_FFN_CANDIDATE requires 0 or 1");
         }();
-        return enabled;
+        return selected.value_or(qualified_domain);
     }
 } // namespace llaminar2

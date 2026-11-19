@@ -8,6 +8,7 @@
  * assignment. Local router slots never acquire transport or rank-bank padding.
  */
 #pragma once
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "config/TensorParallelConfig.h"
 #include <cstddef>
 #include <optional>
@@ -28,12 +29,14 @@ public:
      * @param shared_assignment Original dense/shared TP interval, absent only for a singleton.
      * @param first_layer First original source layer in this retained stage manifest.
      * @param last_layer Last retained source layer, inclusive; -1 selects the original full inventory.
+     * @param tiling Immutable partition preference consumed by the same original weight owner.
      * @return Exact maxima reused by serial main/predictor graph families.
      * @throws std::invalid_argument For incomplete source, incompatible/native-split geometry or foreign ownership.
      */
     static MoEIntermediateShardArenaGeometry resolve(const ModelMemoryProfile &source, int participants,
         int participant, const std::optional<DeviceShardingAssignment> &shared_assignment = {},
-        int first_layer = 0, int last_layer = -1);
+        int first_layer = 0, int last_layer = -1,
+        GPUExpertIntermediateTiling tiling = GPUExpertIntermediateTiling::Coarse128);
     /** @brief Bind the same exact physical row widths to the graph resolver. */
     void bindResolver(GraphResolverConfig &resolver) const;
     /** @brief Give simultaneous local partials distinct existing arena lifetime groups. */

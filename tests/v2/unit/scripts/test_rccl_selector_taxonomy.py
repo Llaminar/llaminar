@@ -116,7 +116,7 @@ class SelectorProofTests(unittest.TestCase):
         # The whole ordered pin remains mandatory: adding shared-file and thread repairs must
         # not disconnect selector, protocol or small-AllGather source identities.
         self.assertIn(
-            '${RCCL_GIT_REF}-smi-${rccl_smi_patch_sha}-completed-${rccl_completed_patch_sha}-capture-${rccl_capture_patch_sha}'
+            '${LLAMINAR_RCCL_GIT_COMMIT}-smi-${rccl_smi_patch_sha}-completed-${rccl_completed_patch_sha}-capture-${rccl_capture_patch_sha}'
             '-rows-${rccl_rows_patch_sha}-storage-${rccl_storage_patch_sha}'
             '-shm-${rccl_shm_patch_sha}-selector-${rccl_selector_patch_sha}-thread-${rccl_thread_patch_sha}'
             '-protocol-${rccl_protocol_patch_sha}-smallag-${rccl_small_allgather_patch_sha}',
@@ -131,7 +131,7 @@ class SelectorProofTests(unittest.TestCase):
         # Compiler provenance precedes, and never truncates, the strict repair suffix.
         self.assertIn(
             'targets-${rccl_target_hash}-llvm-lto-${rccl_lto_receipt_sha}'
-            '-producer-${rccl_lto_producer_sha}-${RCCL_GIT_REF}-smi-${rccl_smi_patch_sha}-completed-',
+            '-producer-${rccl_lto_producer_sha}-${LLAMINAR_RCCL_GIT_COMMIT}-smi-${rccl_smi_patch_sha}-completed-',
             (ROOT / 'Dockerfile').read_text())
         self.assertIn(
             'string(PREPEND RCCL_BUILD_ID "targets-${RCCL_TARGET_POLICY_HASH}'

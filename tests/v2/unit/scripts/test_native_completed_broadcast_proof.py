@@ -269,7 +269,8 @@ class OwnedEntryRecordPathTests(unittest.TestCase):
         entry.loader.exec_module(artifact)
         builder = artifact.module("owned_record_test_builder", ROOT / "scripts/docker/llvm-lto-linker/build.py")
         self.spec = dict(schema=1, library=str(self.library), record_root=str(self.records), architectures=self.targets)
-        self.producer = dict(resource_evidence_complete=True, architectures=self.targets, observations=[])
+        self.producer = dict(resource_evidence_complete=True, architectures=self.targets, observations=[],
+                             library_sha256=hashlib.sha256(self.library.read_bytes()).hexdigest())
         self.files = {}
         for target in self.targets:
             original = builder.final_record_base(self.library, target)
@@ -298,6 +299,30 @@ class OwnedEntryRecordPathTests(unittest.TestCase):
         """The new-driver paths and alias retain every original partition in order."""
         self.assertEqual(self.observe(), self.files)
         self.assertTrue(all(len(paths) == 8 for paths in self.files.values()))
+
+    def test_installed_copy_keeps_original_output_ownership_and_exact_bytes(self):
+        """Replay the container install layout without relaxing DSO or partition identity."""
+        installed = self.root / 'installed' / 'librccl.so.1'
+        installed.parent.mkdir()
+        installed.write_bytes(self.library.read_bytes())
+        self.alias = installed
+        self.assertEqual(self.observe(), self.files)
+        for mutation in ('installed', 'original', 'receipt'):
+            with self.subTest(mutation=mutation):
+                original_bytes = self.library.read_bytes()
+                installed_bytes = installed.read_bytes()
+                original_digest = self.producer['library_sha256']
+                if mutation == 'installed':
+                    installed.write_bytes(b'foreign installed DSO')
+                elif mutation == 'original':
+                    self.library.write_bytes(b'foreign original DSO')
+                else:
+                    self.producer.pop('library_sha256')
+                with self.assertRaisesRegex(RuntimeError, 'different original output'):
+                    self.observe()
+                self.library.write_bytes(original_bytes)
+                installed.write_bytes(installed_bytes)
+                self.producer['library_sha256'] = original_digest
 
     def test_missing_current_partition_rejects_complete_legacy_decoys(self):
         """Old naming may not hide a lost current-target allocation record."""

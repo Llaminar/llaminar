@@ -18,6 +18,9 @@
 
 namespace llaminar2
 {
+    /** @brief Whether this LocalTP owner can admit the measured optional peer transport to its model ledger. */
+    enum class RankOrderedQuotePolicy { ExplicitOnly, MeasuredDomain };
+
     /** @brief Additional storage owned by one original communicator participant. */
     struct RankOrderedNativeResources
     {
@@ -71,7 +74,7 @@ namespace llaminar2
 
     /**
      * @brief Select only the bank sizes with qualified native-push economics.
-     * @param enabled Explicit candidate selection, frozen before graph capture.
+     * @param enabled Whether the bound original communicator has quoted native push resources.
      * @param rows Actual retained transaction rows, not arena allocation capacity.
      * @param columns Exact FP32 row width; together these determine useful payload.
      * @return Whether the small-bank native implementation owns this operation.

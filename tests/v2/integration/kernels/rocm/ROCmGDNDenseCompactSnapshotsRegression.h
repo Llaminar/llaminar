@@ -2553,7 +2553,8 @@ TEST(Test__ROCmGDNPaddedRealLength, DensePreparedRetainedInvocationNoOpMirrors)
 }
 
 /** @test Actual H12 ValueMajor compact producer, publication and following reader at each width. */
-TEST(Test__ROCmGDNPaddedRealLength, QFNAcceptedVectorPublication)
+/** @brief Replay accepted H12 state for the diagnostic and admitted default paths. */
+static void verifyQFNAcceptedVectorPublication(bool measured_default)
 {
     ASSERT_TRUE(hasROCm());
     checkHip(hipSetDevice(0), "bind native accepted publication participant");
@@ -2568,13 +2569,13 @@ TEST(Test__ROCmGDNPaddedRealLength, QFNAcceptedVectorPublication)
             GDNDenseAcceptedSelectionKind::OwnRequestFlattenedRows);
         HipFloatBuffer mirror(actual.initial_host.size(), Cell::Poison);
         HipCapturedGraph publish(actual.stream.stream, [&] {
-            return launchROCmDenseCompactAcceptedPrefix({actual.transaction(),
+            return launchROCmDenseCompactAcceptedPrefixWithPolicy({actual.transaction(),
                 actual.acceptedSelection(), actual.initial.ptr,
                 GDNDenseCompactRequestZeroMirror::borrow(actual.geometry, mirror.ptr, mirror.count)},
-                actual.stream.stream);
+                actual.stream.stream,measured_default);
         });
         const char* mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_GDN_ACCEPTED_VECTOR4");
-        const bool requested = mode && std::string_view(mode) == "1";
+        const bool requested = mode ? std::string_view(mode) == "1" : measured_default;
         const auto nodes = eventLeaf(publish);
         const char* name = hipKernelNameRefByPtr(nodes.func, actual.stream.stream);
         ASSERT_NE(name, nullptr);
@@ -2619,6 +2620,24 @@ TEST(Test__ROCmGDNPaddedRealLength, QFNAcceptedVectorPublication)
 }
 
 /** @test A float-aligned destination or mirror uses scalar publication and preserves padding. */
+/** @test Preserve the explicit native accepted-vector diagnostic. */
+TEST(Test__ROCmGDNPaddedRealLength, QFNAcceptedVectorPublication)
+{
+    verifyQFNAcceptedVectorPublication(false);
+}
+
+/** @test The original qualified MI50 plan uses aligned accepted-state publication without an override. */
+TEST(Test__ROCmGDNPaddedRealLength, QFNAcceptedVectorPublicationDefault)
+{
+    ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_GDN_ACCEPTED_VECTOR4"),nullptr);
+    ASSERT_TRUE(hasROCm());
+    initializeROCmHardwareMetadata();
+    const auto& hardware=rocmHardwareMetadata().at(0);
+    if(!hardware.isa_target.starts_with("gfx906")||hardware.compute_units!=60||hardware.native_wave_width!=64)
+        GTEST_SKIP()<<"Requires an original 60-CU gfx906 participant";
+    verifyQFNAcceptedVectorPublication(true);
+}
+
 TEST(Test__ROCmGDNPaddedRealLength, QFNAcceptedVectorUnalignedOutputs)
 {
     ASSERT_TRUE(hasROCm());

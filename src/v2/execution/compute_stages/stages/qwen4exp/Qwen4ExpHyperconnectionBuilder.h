@@ -10,6 +10,7 @@
  * write handle. All graph nodes retain one explicit participant device.
  */
 #pragma once
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "Qwen4ExpPrimitiveStage.h"
 #include "../../../../loaders/WeightPlan.h"
 #include "../../../../kernels/common/DeviceRowRange.h"
@@ -95,6 +96,7 @@ struct Qwen4ExpHyperconnectionContext
     HCDownProducerProgram downProducerProgram=HCDownProducerProgram::Original; ///< Explicit cold-admitted program, only with the declared HC reducer publication.
     Qwen4ExpHCBranchNormExecution branchNormExecution=Qwen4ExpHCBranchNormExecution::Staged; ///< Independent original norm-to-down SingleQ8 publication candidate.
     Qwen4ExpHCReadExecution readExecution=Qwen4ExpHCReadExecution::Staged; ///< GPU ordinary M1 candidate, explicit and source-checked.
+    LocalGPUExpertKernelPolicy verifierKernelPolicy=LocalGPUExpertKernelPolicy::Generic; ///< Qualified original TP4 verifier schedule only.
     Qwen4ExpHCPersistentGrid persistentGrid=Qwen4ExpHCPersistentGrid::OnePerProcessor; ///< Immutable occupancy-bounded persistent program grid.
 };
 /** @brief Read weights, including already-converted distinct norm gains. */

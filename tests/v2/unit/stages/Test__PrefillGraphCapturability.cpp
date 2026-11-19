@@ -366,8 +366,8 @@ namespace
             int,
             int,
             int,
-            MoEDecodeDescriptorSource =
-                MoEDecodeDescriptorSource::StaticDescriptorTable) override
+            MoEDecodeDescriptorSource,
+            const MoEIntermediateShardDescriptorDeclaration *) override
         {
             return gateup_table_uploads++;
         }
@@ -376,8 +376,8 @@ namespace
             int,
             int,
             int,
-            MoEDecodeDescriptorSource =
-                MoEDecodeDescriptorSource::StaticDescriptorTable) override
+            MoEDecodeDescriptorSource,
+            const MoEIntermediateShardDescriptorDeclaration *) override
         {
             return down_table_uploads++;
         }
@@ -1327,7 +1327,8 @@ TEST_F(MoERoutingPrefillGraphCapture, PrefillRejectsInvalidTopK)
     }
 }
 
-TEST_F(MoERoutingPrefillGraphCapture, DeviceRuntimeHistogramNeedsNoHostReplayCallback)
+/** @test A device-owned live prefix cannot be paired with a host histogram producer. */
+TEST_F(MoERoutingPrefillGraphCapture, CountedPrefillRejectsHostReplayHistogram)
 {
     ScopedMoEGraphCaptureFlags flags(true, true);
 
@@ -1343,7 +1344,13 @@ TEST_F(MoERoutingPrefillGraphCapture, DeviceRuntimeHistogramNeedsNoHostReplayCal
         std::vector<int>(NUM_EXPERTS, 0));
     DecodeExpertHistogram histogram(histogram_config);
     params.decode_histogram = &histogram;
+    ASSERT_NE(params.active_row_count_device, nullptr);
+    EXPECT_THROW((void)MoERoutingStage(params), std::invalid_argument);
 
+    // The same counted prefill shape captures without a host producer.
+    // Accepted-row publisher authority is tested separately on its
+    // verifier-owned ledger and native producer stream.
+    params.decode_histogram = nullptr;
     MoERoutingStage stage(params);
     stage.setMoEKernelForTesting(&stub_kernel_);
 

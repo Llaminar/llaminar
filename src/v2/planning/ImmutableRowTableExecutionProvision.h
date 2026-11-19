@@ -82,6 +82,7 @@ private:
                               g.shard_index,
                               g.shared_tp_assignment,
                               g.routed_compute_policy,
+                              g.gpu_expert_intermediate_tiling,
                               g.mtp_target_query_rows,
                               g.retained_mtp_candidate_rows,
                               g.mtp_terminal_logits_layout,

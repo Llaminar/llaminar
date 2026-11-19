@@ -10,6 +10,7 @@
 #include "backends/DeviceType.h"
 #include <cstddef>
 #include <vector>
+#include <string_view>
 
 namespace llaminar2::test
 {
@@ -20,10 +21,12 @@ namespace llaminar2::test
      * @brief Select a complete peer group owned by one original discovery rank.
      * @param degree Requested native participant count, at least two.
      * @param backend Requested homogeneous GPU backend; CPU is rejected.
+     * @param native_isa Optional native target of an architecture-specific test.
      * @return Original device ordinals, or empty on an unselected original rank.
      * @throws std::invalid_argument For malformed or unavailable native ownership.
      * Every original rank calls once; no MPI scope or CPU binding is replaced.
      */
     std::vector<int> originalPeerPushReplayDevices(std::size_t degree,
-                                                  DeviceType backend = DeviceType::ROCm);
+                                                  DeviceType backend = DeviceType::ROCm,
+                                                  std::string_view native_isa = {});
 }

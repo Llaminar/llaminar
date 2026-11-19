@@ -84,17 +84,46 @@ class DockerToolchainClosureTests(unittest.TestCase):
                        if row.startswith("RUN ") and "llvm-lto-linker/artifact.py configure" in row)
         prefix = command[command.index("set -e;"):command.index("rccl_started_epoch=")]
         prefix = prefix.replace("/src/scripts/docker/rocm-release.env", str(ROOT / "scripts/docker/rocm-release.env"))
-        for override in (None, "gfx1100"):
+        prefix = prefix.replace("/tmp/install-scripts/rocm-image-targets.sh",
+                                str(ROOT / "scripts/docker/rocm-image-targets.sh"))
+        for override in (None, "gfx1100", "gfx906,gfx1100"):
             environment = dict(os.environ)
-            environment.pop("RCCL_GPU_TARGETS", None)
+            environment.pop("ROCM_RUNTIME_GPU_TARGETS", None)
             if override is not None:
-                environment["RCCL_GPU_TARGETS"] = override
+                environment["ROCM_RUNTIME_GPU_TARGETS"] = override
             result = subprocess.run(["/bin/sh", "-ec", prefix +
                                      "printf '%s\\n%s\\n' \"$RCCL_GPU_TARGETS\" \"$LLAMINAR_ROCM_GPU_TARGETS\""],
                                     env=environment, capture_output=True, text=True, check=True)
             selected, canonical = result.stdout.splitlines()
             self.assertTrue(canonical)
-            self.assertEqual(selected, override if override is not None else canonical)
+            self.assertEqual(selected, override.replace(",", ";") if override is not None else canonical)
+
+    def test_rccl_architecture_list_rejects_non_targets_and_duplicates(self):
+        helper = ROOT / "scripts/docker/rocm-image-targets.sh"
+        for requested in ("gfx906;native", "gfx906,gfx906", "gfx906\ngfx1100"):
+            with self.subTest(requested=requested):
+                result = subprocess.run(["bash", str(helper), requested], capture_output=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, b"")
+
+    def test_linker_proves_shipping_targets_and_extra_requested_architectures(self):
+        """Exercise the actual installer arguments before any expensive compiler work."""
+        directory = ROOT / "scripts/docker"
+        shipping = subprocess.check_output(["bash", str(directory / "rocm-image-targets.sh")], text=True).strip()
+        subset = shipping.split(";")[0]
+        extra = next(arch for arch in ("gfx942", "gfx950", "gfx1201") if arch not in shipping.split(";"))
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for name in ("install-rocm-lto-linker.sh", "rocm-release.env", "rocm-image-targets.sh"):
+                shutil.copy2(directory / name, root / name)
+            (root / "llvm-lto-linker").mkdir()
+            (root / "llvm-lto-linker/build.py").write_text(
+                'import sys\nprint(sys.argv[sys.argv.index("--architectures") + 1])\n')
+            for chosen, expected in ((subset, shipping), (f"{extra},{subset}", f"{shipping};{extra}")):
+                with self.subTest(architectures=chosen):
+                    actual = subprocess.check_output(["bash", str(root / "install-rocm-lto-linker.sh")],
+                        env={**os.environ, "ROCM_IMAGE_GPU_TARGETS": chosen}, text=True)
+                    self.assertEqual(actual.strip(), expected)
 
     def test_application_builds_admit_the_generated_rccl_header(self):
         """Replay both Docker bindings; source templates must fail ABI admission."""
@@ -126,8 +155,7 @@ class DockerToolchainClosureTests(unittest.TestCase):
                         if original:
                             command = command.replace("/rccl/build/include", "/rccl/src/include")
                         command = command.replace("/src/", str(root / "src") + "/")
-                        environment = dict(os.environ, LLAMINAR_ENABLE_ROCM="ON",
-                                           LLAMINAR_BUILD_RCCL_FROM_SOURCE="ON")
+                        environment = dict(os.environ, LLAMINAR_ENABLE_ROCM="ON")
                         arguments = subprocess.run(
                             ["/bin/sh", "-ec", command + '\nprintf \'%s\' "$RCCL_CMAKE_ARGS"'],
                             env=environment, capture_output=True, text=True, check=True)

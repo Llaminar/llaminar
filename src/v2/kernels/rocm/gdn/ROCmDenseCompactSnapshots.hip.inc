@@ -322,18 +322,32 @@ bool launchROCmDenseCompactRecurrence(const GDNDenseCompactCaptureInput &p, void
 }
 
 /** @brief Enqueue exact accepted reconstruction; native completion remains caller-owned. */
-bool launchROCmDenseCompactAcceptedPrefix(const GDNDenseCompactAcceptedPrefixInput &p, void *stream)
+bool launchROCmDenseCompactAcceptedPrefix(const GDNDenseCompactAcceptedPrefixInput &p,void *stream)
+{
+    return launchROCmDenseCompactAcceptedPrefixWithPolicy(p,stream,false);
+}
+
+bool launchROCmDenseCompactAcceptedPrefixWithPolicy(const GDNDenseCompactAcceptedPrefixInput &p,
+    void *stream,bool qualified_default)
 {
     if (reinterpret_cast<std::uintptr_t>(stream) <= 2 || !validROCmDenseCompactAcceptedPrefixStorage(p))
         return false;
     const auto &g = p.transaction.geometry;
+    if(qualified_default) {
+        int ordinal=-1;
+        if(hipStreamGetDevice(static_cast<hipStream_t>(stream),&ordinal)!=hipSuccess)
+            return false;
+        const auto& hardware=rocmHardwareMetadata().at(ordinal);
+        qualified_default=hardware.native_wave_width==64 && hardware.compute_units==60 &&
+            (hardware.isa_target=="gfx906" || hardware.isa_target.starts_with("gfx906:"));
+    }
     const auto address = reinterpret_cast<std::uintptr_t>(p.destination_state) |
         reinterpret_cast<std::uintptr_t>(p.request_zero_mirror.destination());
     if (g.requests() == 1 && g.heads() == 12 && g.keyWidth() == 128 && g.valueWidth() == 128 &&
         g.rowsPerRequest() >= 2 && g.rowsPerRequest() <= 8 &&
         g.retentionProgram().mode == GDNDenseRetentionMode::ExactCorrections &&
         p.transaction.layout == GDNRecurrenceStateLayout::ValueMajorKeyContiguous &&
-        address % alignof(float4) == 0 && qfnGroupedGDNAcceptedVectorExperiment())
+        address % alignof(float4) == 0 && qfnGroupedGDNAcceptedVectorExperiment(qualified_default))
     {
         hipLaunchKernelGGL(rocm_gdn_dense_compact_accepted_prefix_kernel_vector4,
             dim3(12, 8), dim3(128), 0, static_cast<hipStream_t>(stream), p);

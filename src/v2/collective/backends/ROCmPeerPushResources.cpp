@@ -10,6 +10,7 @@
  */
 #include "ROCmPeerPushResources.h"
 #include "backends/rocm/HipDeviceGuard.h"
+#include "utils/Logger.h"
 #include <hip/hip_runtime.h>
 #include <stdexcept>
 #include <string>
@@ -62,7 +63,7 @@ namespace llaminar2
         owner->slab_lease_ = reserve.claimAllocation(layout.inboxBytes() + layout.flagBytes());
         requireHIP(hipExtMallocWithFlags(&owner->slab_, owner->slab_lease_.bytes(), hipDeviceMallocUncached), "uncached inbox allocation");
         owner->table_lease_ = reserve.claimAllocation(layout.endpointBytes());
-        requireHIP(hipMalloc(&owner->table_, layout.endpointBytes()), "endpoint table allocation");
+        requireHIP(hipMalloc(&owner->table_, owner->table_lease_.bytes()), "endpoint table allocation");
         owner->endpoint_ = {static_cast<float *>(owner->slab_), reinterpret_cast<std::uint64_t *>(
             static_cast<unsigned char *>(owner->slab_) + layout.inboxBytes())};
         owner->binding_.endpoints = owner->table_;
@@ -77,7 +78,9 @@ namespace llaminar2
         int previous = -1;
         if (hipGetDevice(&previous) != hipSuccess || HipDeviceGuard::forceSetDevice(device_.ordinal) != 0)
             std::terminate();
-        // A failed cold publication can still own queued memset/copy work.
+        // Even before publication, this owner may have queued its flag reset.
+        // Partial preparation has no dedicated completion event. Its original
+        // stream remains alive until after the coordinator releases this owner.
         // Ready owners arrive only after the coordinator retires all readers.
         if (state_ != State::Ready && hipStreamSynchronize(static_cast<hipStream_t>(stream_)) != hipSuccess)
             std::terminate();
@@ -104,7 +107,15 @@ namespace llaminar2
         state_ = State::Publishing;
         requireHIP(hipMemcpyAsync(table_, peers.data(), binding_.layout.endpointBytes(), hipMemcpyHostToDevice,
                                  static_cast<hipStream_t>(stream)), "peer directory publication");
-        requireHIP(hipStreamSynchronize(static_cast<hipStream_t>(stream)), "cold publication completion");
+        // The coordinator's reusable collective completion event may be
+        // observed by another submitter. This cold write owns only its stream.
+        // The directory is borrowed from the caller. Once submitted, failure
+        // to retire the copy is fatal before unwinding can destroy that source.
+        if (const auto result = hipStreamSynchronize(static_cast<hipStream_t>(stream)); result != hipSuccess)
+        {
+            LOG_ERROR("Peer push cold publication completion failed: " << hipGetErrorString(result));
+            std::terminate();
+        }
         state_ = State::Ready;
     }
 

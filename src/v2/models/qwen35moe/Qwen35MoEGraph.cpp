@@ -2568,7 +2568,9 @@ namespace llaminar2
             const int retained_last = retainsMTPGraphCapacity(config_.mtp) && last == profile.mainLayerCount() - 1
                 ? profile.totalLayerCount() - 1 : last;
             intermediate_shard_arena_ = MoEIntermediateShardArenaGeometry::resolve(profile,
-                config_.tp_ctx->degree(), config_.tp_device_idx, assignment, config_.pp_layer_offset, retained_last);
+                config_.tp_ctx->degree(), config_.tp_device_idx, assignment, config_.pp_layer_offset, retained_last,
+                config_.moe.routed_expert_plan ? config_.moe.routed_expert_plan->gpu_expert_intermediate_tiling
+                                              : GPUExpertIntermediateTiling::Coarse128);
             return;
         }
         if (config_.moe.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns) return;
@@ -4958,6 +4960,8 @@ namespace llaminar2
         route.collect_device_runtime_histogram = false;
         route.active_row_count_device = count; route.absolute_position_ids_device = positions;
         route.force_decode_equivalent_verifier_prefill = grouped && phase != MoEOverlayServicePhaseHint::Prefill;
+        if(!mtp && phase==MoEOverlayServicePhaseHint::GroupedVerifier)
+            route.verifier_kernel_policy=plan->local_gpu_expert_kernel_policy;
         route.force_grouped_verifier_prefill_for_decode = grouped && rows == 1;
         // The local-F pipeline has projection stages instead of an expert-FFN
         // stage. Its router is the sole verifier-history boundary, including
@@ -4974,6 +4978,7 @@ namespace llaminar2
         local.family = declaration->family(); local.runtime = runtime; local.kernel_owner = owner;
         local.rows = rows; local.top_k = config_.moe.top_k; local.phase = phase;
         local.row_mode = grouped ? MoEIntermediateShardRowMode::Grouped : MoEIntermediateShardRowMode::Decode;
+        local.verifier_kernel_policy=route.verifier_kernel_policy;
         // These independent diagnostic policies select only the original ROCm
         // ordinary-main native M1 transaction. Grouped verification, predictor,
         // shared/floating programs retain their declared Staged implementations.
@@ -5059,7 +5064,8 @@ namespace llaminar2
         graph.addDependency(shared_node, routed.producer);
         MoEIntermediateShardFFNFinalization finish;
         if(config_.flash_next && !mtp && !grouped && phase==MoEOverlayServicePhaseHint::Decode &&
-            (config_.qfn_resident_ffn_candidate||qfnRetainedM1HCFFNOptIn()))
+            (config_.qfn_resident_ffn_candidate || qfnRetainedM1HCFFNEnabled(
+                config_.moe.routed_expert_plan && config_.moe.routed_expert_plan->usesQFNMI50TP4())))
             finish.execution=MoEIntermediateShardFFNExecution::ResidentCandidate;
         finish.shared_ffn_node = shared_node; finish.shared_weights = weight_bindings_.original_frozen_source;
         finish.shared_partition = config_.tp_config.get();
@@ -5137,6 +5143,14 @@ namespace llaminar2
         const std::string prefix = identity.prefix();
         std::string ffn_terminal;
         int total_tokens = batch_size * seq_len;
+        const bool main_condition =
+            !mtp_sidecar_context && config_.live_mtp_request_batch_condition;
+        // Resident MTP condition publishes the absolute target-cache length
+        // for attention and the pipeline handoff. A scalar condition already
+        // owns exactly one FFN activation. Verifier and predictor counts still
+        // govern their captured padding, including empty replays.
+        const int32_t *const routed_live_rows = main_condition && total_tokens == 1
+            ? nullptr : sequence_lengths_device;
         /*
          * Every lowering of this routed layer—direct continuation compute,
          * retained remote GPU replay, and serial CPU service—shares one
@@ -5238,8 +5252,12 @@ namespace llaminar2
                 phase = *forward_execution_phase_ == ForwardExecutionPhase::Prefill
                     ? MoEOverlayServicePhaseHint::Prefill : MoEOverlayServicePhaseHint::Decode;
             }
+            if (main_condition &&
+                (total_tokens != 1 || forward_execution_phase_ != ForwardExecutionPhase::Decode ||
+                 config_.grouped_mtp_verifier))
+                throw std::invalid_argument("GPU F-shard MTP condition requires one fixed main decode row");
             return buildIntermediateShardFFNGraphForLayer(layer, buffers, identity, total_tokens, device,
-                device_state_publication_stream, sequence_lengths_device, absolute_position_ids_device, predictor, phase);
+                device_state_publication_stream, routed_live_rows, absolute_position_ids_device, predictor, phase);
         }
 
         /*
@@ -7715,7 +7733,7 @@ namespace llaminar2
                     collect_runtime_histogram);
             route_params.active_row_count_device =
                 device.is_gpu() && batch_size == 1
-                    ? sequence_lengths_device
+                    ? routed_live_rows
                     : nullptr;
             route_params.output_indices = routing_indices;
             route_params.output_weights = routing_weights;
@@ -8079,7 +8097,7 @@ namespace llaminar2
                         : nullptr;
                 expert_params.active_row_count_device =
                     stage_device.is_gpu() && batch_size == 1
-                        ? sequence_lengths_device
+                        ? routed_live_rows
                         : nullptr;
                 expert_params.my_socket_id =
                     std::max(0, config_.tp_device_idx);
@@ -10017,7 +10035,7 @@ namespace llaminar2
                          */
                         ticket_params.active_row_count_device =
                             batch_size == 1 && total_tokens > 1
-                                ? sequence_lengths_device
+                                ? routed_live_rows
                                 : nullptr;
                         ticket_params.layer_idx = layer_idx;
                         ticket_params.bucket_rows = total_tokens;
@@ -12560,7 +12578,7 @@ namespace llaminar2
                          * capacity contract after a non-empty prefill. */
                         packet_params.active_row_count_device =
                             batch_size == 1 && total_tokens > 1
-                                ? sequence_lengths_device
+                                ? routed_live_rows
                                 : nullptr;
                         packet_params.hidden_buffer_id =
                             buffers.idFor(BufferId::NORMALIZED);
@@ -12618,7 +12636,7 @@ namespace llaminar2
                              * sequence-length scalar. */
                             packet_params.active_row_count_device =
                                 batch_size == 1 && total_tokens > 1
-                                    ? sequence_lengths_device
+                                    ? routed_live_rows
                                     : nullptr;
                             packet_params.hidden_buffer_id =
                                 buffers.idFor(BufferId::NORMALIZED);
@@ -14231,7 +14249,7 @@ namespace llaminar2
             // Capture capacity is not permission to evaluate padded rows.
             shared_params.active_row_count_device =
                 shared_device.is_gpu() && batch_size == 1
-                    ? sequence_lengths_device
+                    ? routed_live_rows
                     : nullptr;
             shared_params.d_model = config_.d_model;
             shared_params.intermediate = shared_intermediate;
@@ -14440,7 +14458,7 @@ namespace llaminar2
                     canonical_publication_lowering.participant_count;
                 publish_params.active_row_count_device =
                     device.is_gpu() && batch_size == 1
-                        ? sequence_lengths_device
+                        ? routed_live_rows
                         : nullptr;
                 publish_params.shared_output_buffer_id =
                     buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
@@ -14486,7 +14504,7 @@ namespace llaminar2
                     canonical_publication_lowering.participant_count;
                 finalize_params.active_row_count_device =
                     device.is_gpu() && batch_size == 1
-                        ? sequence_lengths_device
+                        ? routed_live_rows
                         : nullptr;
                 finalize_params.input_buffer_id =
                     buffers.idFor(BufferId::NORMALIZED);
@@ -14673,7 +14691,7 @@ namespace llaminar2
                             .reduction = native_sum->params(),
                             .producer = prefix + "shared_expert_ffn",
                             .gate = layer.shared_expert_gate_inp,
-                            .active_rows = batch_size == 1 ? sequence_lengths_device : nullptr,
+                            .active_rows = batch_size == 1 ? routed_live_rows : nullptr,
                             .combined_output = {buffers.attn_proj, buffers.idFor(BufferId::ATTN_PROJ)}});
                         shared_ffn_last = ffn_terminal;
                         moe_combined_output_ready = true;
@@ -14785,7 +14803,7 @@ namespace llaminar2
                 gate_params.d_model = config_.d_model;
                 gate_params.active_row_count_device =
                     shared_device.is_gpu() && batch_size == 1
-                        ? sequence_lengths_device
+                        ? routed_live_rows
                         : nullptr;
                 if (rooted_overlay_finalize)
                 {

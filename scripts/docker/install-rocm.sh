@@ -30,7 +30,7 @@ rocm_packages=(base sysdeps runtime math-common blas-host solver-host amdsmi pro
 rocm_system_packages=()
 case "${MODE}" in
     full|build)
-        rocm_packages+=(llvm llvm-dev runtime-dev blas-dev hipblas-common-dev ccl-dev rccl-dev hipify)
+        rocm_packages+=(llvm llvm-dev runtime-dev blas-dev hipblas-common-dev hipify)
         # HIP ROCclr's headless build still compiles GL interop. Tensile's host
         # library needs MessagePack C++ headers; none may be accidental extras
         # inherited only by a full development image.
@@ -69,7 +69,8 @@ if [[ "${MODE}" != runtime ]]; then
     bash "${rocm_script_dir}/install-rocm-smi-compat.sh"
     bash "${rocm_script_dir}/install-rocr-helper-numa.sh"
     bash "${rocm_script_dir}/install-hip-graph-runtime.sh"
-    bash "${rocm_script_dir}/install-rocblas.sh"
+    ROCBLAS_GPU_TARGETS="${ROCM_IMAGE_GPU_TARGETS:-${ROCBLAS_GPU_TARGETS:-${LLAMINAR_ROCM_GPU_TARGETS}}}" \
+        bash "${rocm_script_dir}/install-rocblas.sh"
 fi
 
 # The caller owns unrelated packages; never autoremove them during SDK setup.

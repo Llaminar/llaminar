@@ -357,6 +357,8 @@ namespace llaminar2
 
         /** @return Cold original-communicator resource quotes; empty for unselected policy. */
         virtual std::vector<RankOrderedNativeResources> rankOrderedResources() const { return {}; }
+        /** @return Whether the bound communicator owns a native direct-push quote, without copying its BOM. */
+        virtual bool hasRankOrderedPeerPush() const noexcept { return false; }
 
         /** @brief Publish the canonical ascending-rank FP32 sum in one native operation.
          * @param send Original local contribution, possibly identical to output.
@@ -1030,11 +1032,12 @@ namespace llaminar2
      * @param devices Devices participating in LOCAL TP
      * @param weights Work distribution weights (empty for equal distribution)
      * @param backend Backend type (AUTO to select based on device types)
+     * @param peer_quote Cold native transport ownership admitted by the calling planner.
      * @return Unique pointer to ILocalTPContext implementation
      */
     std::unique_ptr<ILocalTPContext> createLocalTPContext(
         std::vector<GlobalDeviceAddress> devices,
         std::vector<float> weights,
-        CollectiveBackendType backend);
+        CollectiveBackendType backend, RankOrderedQuotePolicy peer_quote = RankOrderedQuotePolicy::ExplicitOnly);
 
 } // namespace llaminar2

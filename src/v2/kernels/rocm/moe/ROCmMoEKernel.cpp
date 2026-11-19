@@ -660,6 +660,12 @@ extern "C"
         int device_idx, void *stream,
         const int *device_effective_seq_len = nullptr);
 
+    bool hipMoE_gate_logits_fp16_decode_equivalent_rows_with_policy(
+        const float *hidden, const void *gate_weights_fp16, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream,
+        const int *device_effective_seq_len, bool qualified_default);
+
     bool hipMoE_gate_logits_bf16_decode_equivalent_rows(
         const float *hidden, const void *gate_weights_bf16, float *logits,
         int seq_len, int d_model, int num_experts,
@@ -744,6 +750,15 @@ extern "C"
         int device_idx, void *stream,
         const int *device_effective_seq_len = nullptr,
         void *deferred_selected_route_ledger = nullptr);
+
+    bool hipMoE_softmax_topk_decode_equivalent_rows_with_policy(
+        float *logits,
+        float *expert_indices, float *expert_weights,
+        int seq_len, int num_experts, int top_k,
+        bool normalize_weights,
+        int device_idx, void *stream,
+        const int *device_effective_seq_len,
+        void *deferred_selected_route_ledger, bool qualified_default);
 
     bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
         const float *partials,
@@ -5105,6 +5120,19 @@ namespace llaminar2
         const int *device_effective_seq_len,
         DeviceMoELayerRuntime *deferred_selected_route_ledger)
     {
+        return routeGroupedVerifierWithPolicy(LocalGPUExpertKernelPolicy::Generic,hidden,gate_weights,
+            seq_len,d_model,num_experts,top_k,normalize_weights,output_indices,output_weights,
+            device_effective_seq_len,deferred_selected_route_ledger);
+    }
+
+    bool ROCmMoEKernel::routeGroupedVerifierWithPolicy(LocalGPUExpertKernelPolicy policy,
+        ITensor *hidden, ITensor *gate_weights,
+        int seq_len, int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights,
+        const int *device_effective_seq_len,
+        DeviceMoELayerRuntime *deferred_selected_route_ledger)
+    {
         constexpr const char *kContext = "ROCmMoEKernel::routeVerifierRowsDecodeEquivalent";
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -5185,6 +5213,9 @@ namespace llaminar2
         const auto &rocm_env = debugEnv().rocm;
         const bool gate_is_fp32 =
             gate_weights->native_type() == TensorType::FP32;
+        const bool qualified_default=policy==LocalGPUExpertKernelPolicy::QFNMI50TP4 &&
+            d_model==2560 && num_experts==512 && top_k==10 &&
+            gate_weights->native_type()==TensorType::FP16;
         const bool q8_router_requested = gate_is_fp32 && rocm_env.moe_router_q8;
         if (q8_router_requested && (d_model % 32) != 0)
         {
@@ -5266,7 +5297,7 @@ namespace llaminar2
         }
         else if (gate_weights->native_type() == TensorType::FP16)
         {
-            if (!hipMoE_gate_logits_fp16_decode_equivalent_rows(
+            if (!hipMoE_gate_logits_fp16_decode_equivalent_rows_with_policy(
                     d_hidden,
                     d_gate,
                     d_route_logits_,
@@ -5275,7 +5306,7 @@ namespace llaminar2
                     num_experts,
                     device_ordinal_,
                     getStream(),
-                    device_effective_seq_len))
+                    device_effective_seq_len,qualified_default))
             {
                 LOG_ERROR("[" << kContext << "] grouped FP16 verifier logits failed");
                 return false;
@@ -5306,7 +5337,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!hipMoE_softmax_topk_decode_equivalent_rows(
+        if (!hipMoE_softmax_topk_decode_equivalent_rows_with_policy(
                 d_route_logits_,
                 d_idx,
                 d_wt,
@@ -5317,7 +5348,7 @@ namespace llaminar2
                 device_ordinal_,
                 getStream(),
                 device_effective_seq_len,
-                static_cast<void *>(deferred_selected_route_ledger)))
+                static_cast<void *>(deferred_selected_route_ledger),qualified_default))
         {
             LOG_ERROR("[" << kContext << "] grouped decode-equivalent softmax/top-k failed");
             return false;

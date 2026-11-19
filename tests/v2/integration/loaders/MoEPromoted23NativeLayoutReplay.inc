@@ -499,46 +499,69 @@ void run(NumericalProgram program=NumericalProgram::NativeLayout,std::span<const
 } // namespace promoted23_replay
 
 #if defined(HAVE_ROCM) && defined(LLAMINAR_CASTAGNA_FAST_EPOCH)
+/** @brief Own six original PCI addresses across the live movement replay. */
+struct RetainedClosedMovementPCISelection {
+    std::array<std::string, 6> addresses;
+
+    /** @return A borrowed view for the retained replay whose selection stays in scope. */
+    std::array<std::string_view, 6> views() const & {
+        std::array<std::string_view, 6> result;
+        std::copy(addresses.begin(),addresses.end(),result.begin());
+        return result;
+    }
+    std::array<std::string_view, 6> views() const && = delete;
+};
+
 /**
  * @brief Use six original gfx906 devices in three wholly rank-local pairs.
  * @param env Optional explicit ordered cohort reservation used by the site runner.
- * @return Original PCI addresses retained by the caller's inventory or environment.
+ * @param inventory Original rank inventory retained by the enclosing replay.
+ * @return Owned original PCI addresses in the declared movement order.
  */
-std::vector<std::string_view> originalRetainedClosedMovementPCIs(const char* env) {
-    std::vector<std::string_view> pci;
+RetainedClosedMovementPCISelection originalRetainedClosedMovementPCIs(
+    const char* env, const ClusterInventory& inventory) {
+    RetainedClosedMovementPCISelection result;
+    std::size_t selected=0;
     if(env&&*env) {
         auto remaining=std::string_view(env);
-        require(remaining.back()!=',',"retained movement PCI override has a trailing separator");
-        while(!remaining.empty()) {
+        while(selected<result.addresses.size()) {
             const auto separator=remaining.find(',');
-            pci.push_back(remaining.substr(0,separator));
-            if(separator==std::string_view::npos)break;
-            remaining.remove_prefix(separator+1);
-        }
-        require(pci.size()==6&&std::all_of(pci.begin(),pci.end(),[](auto address){return !address.empty();}),
+            const auto address=remaining.substr(0,separator);
+            require(!address.empty() &&
+                    (separator==std::string_view::npos)==(selected+1==result.addresses.size()),
                 "retained movement PCI override requires six comma-separated original GPU addresses");
-        return pci;
+            result.addresses[selected++]=address;
+            if(separator!=std::string_view::npos)remaining.remove_prefix(separator+1);
+        }
+        return result;
     }
-    const auto mpi=MPIContextFactory::global();
-    require(mpi&&mpi->clusterInventory(),"retained movement uses actual MPI rank inventory");
-    for(const auto& rank:mpi->clusterInventory()->ranks) {
+    for(const auto& rank:inventory.ranks) {
         std::vector<std::string_view> local;
         for(const auto& gpu:rank.gpus) {
             if(gpu.type==DeviceType::ROCm&&rankOwnsGPUDevice(rank,gpu)&&!gpu.pci_bus_address.empty()&&
                std::string_view(gpu.native_isa).substr(0,gpu.native_isa.find(':'))=="gfx906")
                 local.push_back(gpu.pci_bus_address);
         }
-        const auto count=std::min(local.size() / 2 * 2,6-pci.size());
-        pci.insert(pci.end(),local.begin(),local.begin()+count);
-        if(pci.size()==6)return pci;
+        const auto count=std::min(local.size() / 2 * 2,result.addresses.size()-selected);
+        std::copy_n(local.begin(),count,result.addresses.begin()+selected);
+        selected+=count;
+        if(selected==result.addresses.size())return result;
     }
     throw std::runtime_error("Retained closed movement requires three rank-local gfx906 pairs from original inventory");
 }
 /** @brief Keep every original participant aligned while testing the declared native arrival format. */
 void replayOriginalRetainedClosedCohort2(promoted23_replay::EpochSource source) {
     try {
-        const auto pci=originalRetainedClosedMovementPCIs(std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_MOVEMENT_PCIS"));
-        promoted23_replay::run(promoted23_replay::NumericalProgram::FullHCFFNEpoch,pci,
+        // MPIContextFactory keeps a weak reference. Retain the original context
+        // through fabric construction and replay so selection and fabric use
+        // the very same original discovery publication.
+        const auto mpi=MPIContextFactory::global();
+        require(mpi!=nullptr,"retained movement uses its original MPI context");
+        const auto inventory=mpi->clusterInventory();
+        require(inventory!=nullptr,"retained movement uses actual MPI rank inventory");
+        const auto pci=originalRetainedClosedMovementPCIs(
+            std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_MOVEMENT_PCIS"),*inventory);
+        promoted23_replay::run(promoted23_replay::NumericalProgram::FullHCFFNEpoch,pci.views(),
             source);
         if(::testing::Test::HasFailure())MPI_Abort(MPI_COMM_WORLD,2);
     } catch(const std::exception& error){ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}

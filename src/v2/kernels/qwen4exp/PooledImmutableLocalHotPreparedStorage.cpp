@@ -12,6 +12,9 @@
 #include "PooledImmutableSourcePreparedStorage.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/NativeContextPreparation.h"
+#ifdef HAVE_ROCM
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#endif
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <stdexcept>
 #include <optional>
@@ -51,6 +54,13 @@ std::shared_ptr<PooledImmutableLocalHotPreparedStorage> PooledImmutableLocalHotP
         throw std::invalid_argument("Local hot roots require the original admitted source/rank before capture");
     if(!sameOwner(source->retainedOwnerObservation().authority(),memory))
         throw std::invalid_argument("Local hot roots cannot replace their original source PMA");
+#ifdef HAVE_ROCM
+    // The ready word lives in host memory. An ordinary mapped load/store
+    // capability does not authorize a PCIe atomic compare/exchange.
+    const auto device = geometry.allocator().device;
+    if (device.is_rocm())
+        requireROCmMappedHostCompareExchange(rocmHardwareMetadata().at(device.ordinal));
+#endif
     auto plan=PooledImmutableLocalHotNativePlan::fromOriginalSource(std::move(geometry),std::move(source));
     auto context=GPUDeviceContextPool::instance().retainExistingPreparedContext(plan.geometry().allocator().device,memory);
     const auto role=plan.geometry().allocator()==plan.originalSource()->geometry().allocator()

@@ -7,7 +7,6 @@ vacuous negative controls or a dependency layer missing the production patch.
 """
 
 import copy
-import hashlib
 import os
 import re
 import subprocess
@@ -16,6 +15,7 @@ import json
 from pathlib import Path
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -114,12 +114,14 @@ class RCCLProtocolProofTests(unittest.TestCase):
             ("SMALL_ALLGATHER", "small_allgather", "rccl-small-allgather-ll-policy.patch"),
         ]
         cmake = (ROOT / "src/v2/CMakeLists.txt").read_text()
-        pin = re.search(r'set\(RCCL_GIT_REF "([^"]+)"\)', cmake).group(1)
-        variables = {"RCCL_COMMIT": pin, "RCCL_GPU_TARGETS": "gfx906;gfx1100",
+        pin = re.search(r"^LLAMINAR_RCCL_GIT_COMMIT=(.+)$",
+                        (ROOT / "scripts/docker/rocm-release.env").read_text(), re.MULTILINE).group(1)
+        functions = (ROOT / "scripts/docker/rccl-functions.txt").read_text().strip()
+        variables = {"RCCL_COMMIT": pin, "RCCL_GPU_TARGETS": "gfx906;gfx1100", "_rccl_shipping_functions": functions,
                      "RCCL_LTO_RECEIPT_HASH": "a" * 64, "RCCL_LTO_PRODUCER_HASH": "b" * 64}
-        environment = dict(os.environ, RCCL_GIT_REF=pin, rccl_lto_receipt_sha="a" * 64,
+        environment = dict(os.environ, LLAMINAR_RCCL_GIT_COMMIT=pin, rccl_lto_receipt_sha="a" * 64,
                            rccl_lto_producer_sha="b" * 64,
-                           rccl_target_hash=hashlib.sha256(b"gfx906;gfx1100").hexdigest())
+                           RCCL_GPU_TARGETS="gfx906;gfx1100", rccl_build_funcs=functions)
         for upper, lower, patch in pairs:
             value = PROOF.digest(ROOT / "scripts/docker/patches" / patch)
             variables["RCCL_" + upper + "_PATCH_HASH"] = value
@@ -136,11 +138,33 @@ class RCCLProtocolProofTests(unittest.TestCase):
         docker = (ROOT / "Dockerfile").read_text()
         producer = next(line.strip().removesuffix("\\").rstrip() for line in docker.splitlines()
                         if line.strip().startswith("printf '%s\\n' \"p2p-${rccl_user_p2p_patch_sha}"))
-        result = subprocess.run(["bash", "-c", producer], env=environment,
+        target_options = next(line.strip().removesuffix("\\").rstrip() for line in docker.splitlines()
+                              if line.strip().startswith('rccl_target_hash='))
+        result = subprocess.run(["bash", "-c", target_options + "\n" + producer], env=environment,
                                 capture_output=True, text=True, timeout=20)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         docker_receipt = result.stdout.strip()
         self.assertEqual(cmake_receipt, docker_receipt)
+        # Replay the admission check for an installed build. The final
+        # compiler-resource proof has its own native tests. Here only that
+        # subprocess is replaced so both genuine receipt producers are tested.
+        spec = importlib.util.spec_from_file_location("installed_collective",
+            ROOT / "scripts/build/verify_collective_dependency.py")
+        installed = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(installed)
+        report = self.directory / "allocation.json"
+        report.write_text("{}")
+        with mock.patch.object(installed.subprocess, "run") as compiler_proof:
+            installed.confirm_source("rccl", self.library, report, output, variables["RCCL_GPU_TARGETS"])
+            compiler_proof.assert_called_once()
+        for setting, value in (("RCCL_GPU_TARGETS", "gfx906"), ("rccl_build_funcs", "")):
+            with self.subTest(changed=setting):
+                altered = subprocess.check_output(["bash", "-c", target_options + "\n" + producer],
+                    env={**environment, setting: value}, text=True)
+                output.write_text(altered)
+                with self.assertRaisesRegex(ValueError, "kernel configuration"):
+                    installed.confirm_source("rccl", self.library, report, output, variables["RCCL_GPU_TARGETS"])
+        output.write_text(cmake_receipt)
         for receipt in (cmake_receipt, docker_receipt):
             accepted(receipt)
             self.assertLess(receipt.index("-llvm-lto-"), receipt.index("-thread-"))

@@ -21,10 +21,7 @@
  *   6. Captured P4/H2560/M1 all-gather plus canonical ascending-rank FP32 sum
  *
  * **Target hardware**: AMD MI50 (gfx906), explicit two/four-device controls.
- * An isolated, single-test dependency experiment may select an absolute DSO
- * with LLAMINAR_RCCL_PERF_LIBRARY. It must be the process's first RCCL load;
- * ordinary tests retain the exact CMake-selected library. Selection never
- * substitutes a different library after an error or mutates a live runtime.
+ * Device admission uses the same configured RCCL dependency as production.
  *
  * @author GitHub Copilot
  * @date February 2026
@@ -215,6 +212,10 @@ namespace
          */
         void runRankOrderedReplay(RankOrderedReplayMode mode, int profileRows = 0, bool tinyPush = false);
 
+#ifdef LLAMINAR_RCCL_NATIVE_REPLAY_OWNER
+        /** @brief Capture, retire and reattach the native program under two real model PMAs. */
+        void replayOwnerReplacement(llaminar2::RankOrderedQuotePolicy quote_policy);
+#endif
         static constexpr std::size_t ownerReplacementColumns = 33;
 
         // Maximum buffer size covers Ornith's canonical prefill publication:
@@ -259,12 +260,17 @@ namespace
                 num_devices_ = static_cast<int>(parsed);
             }
 
+            const std::string_view test_name = ::testing::UnitTest::GetInstance()->current_test_info()->name();
+            const bool ownerReplacement = test_name == "PeerPushCapturedOwnerReplacement" ||
+                                          test_name == "PeerPushAutomaticOwnerReplacement";
             devices_.resize(num_devices_);
 #ifdef LLAMINAR_RCCL_NATIVE_REPLAY_OWNER
             // The integration owner discovers the original MPI world. Select
             // a real complete peer group without changing that world's ranks,
             // CPU binding or visible physical inventory.
-            const auto selected = llaminar2::test::originalPeerPushReplayDevices(std::size_t(num_devices_));
+            const auto selected = llaminar2::test::originalPeerPushReplayDevices(
+                std::size_t(num_devices_), llaminar2::DeviceType::ROCm,
+                test_name == "PeerPushAutomaticOwnerReplacement" ? "gfx906" : "");
             if (selected.empty())
             {
                 inactive_owner_ = true;
@@ -280,23 +286,8 @@ namespace
             // Print current NCCL environment for reference
             printCurrentNCCLEnv();
 
-            // A dependency candidate owns a fresh, filtered test process. Refuse
-            // to mistake an already loaded DSO for the explicitly requested one.
-            if (const char *diagnostic_library = std::getenv("LLAMINAR_RCCL_PERF_LIBRARY"))
-            {
-                ASSERT_EQ(diagnostic_library[0], '/') << "Diagnostic RCCL DSO requires an absolute path";
-                ASSERT_FALSE(rccl::isLoaded()) << "Diagnostic RCCL DSO requires a fresh single-test process";
-                ASSERT_TRUE(rccl::load(diagnostic_library)) << rccl::getLastError();
-            }
-            else if (!rccl::isLoaded())
-            {
-                ASSERT_TRUE(rccl::load()) << "Failed to load RCCL: " << rccl::getLastError();
-            }
+            ASSERT_TRUE(rccl::load()) << "Failed to load RCCL: " << rccl::getLastError();
 
-
-            const bool ownerReplacement =
-                std::string_view(::testing::UnitTest::GetInstance()->current_test_info()->name()) ==
-                "PeerPushCapturedOwnerReplacement";
             if (!ownerReplacement)
                 ASSERT_NO_FATAL_FAILURE(enableP2P());
 
@@ -2260,10 +2251,22 @@ namespace
 /** @test Two independent model PMAs reuse the same live RCCL clique after actual graph retirement. */
 TEST_F(Perf__RCCLAllreduceLatency, PeerPushCapturedOwnerReplacement)
 {
+    replayOwnerReplacement(llaminar2::RankOrderedQuotePolicy::ExplicitOnly);
+}
+
+/** @test The measured quartet uses the direct native graph without setting a transport diagnostic. */
+TEST_F(Perf__RCCLAllreduceLatency, PeerPushAutomaticOwnerReplacement)
+{
+    ASSERT_EQ(std::getenv("LLAMINAR_RCCL_RANK_ORDERED_PUSH"), nullptr);
+    replayOwnerReplacement(llaminar2::RankOrderedQuotePolicy::MeasuredDomain);
+}
+
+void Perf__RCCLAllreduceLatency::replayOwnerReplacement(llaminar2::RankOrderedQuotePolicy quote_policy)
+{
     using namespace llaminar2;
     if (inactive_owner_) return;
     ASSERT_TRUE(initialized_);
-    ASSERT_EQ(devices_.size(), 2u);
+    ASSERT_EQ(devices_.size(), static_cast<size_t>(num_devices_));
     const auto rank = test::originalPeerPushReplayWorldRank();
     constexpr auto owner = PhysicalMemoryOwner::LocalCollective;
     constexpr std::size_t columns = ownerReplacementColumns;
@@ -2274,7 +2277,16 @@ TEST_F(Perf__RCCLAllreduceLatency, PeerPushCapturedOwnerReplacement)
     std::shared_ptr<PhysicalMemoryAuthority> prior_memory;
     for (int generation = 0; generation < 2; ++generation)
     {
-        auto tp = createLocalTPContext(addresses, {}, CollectiveBackendType::RCCL);
+        if (quote_policy == RankOrderedQuotePolicy::MeasuredDomain)
+        {
+            // Even after a prior generation releases its measured native communicator,
+            // a model without an admitted peer budget gets its own original transport.
+            const auto generic = createLocalTPContext(addresses, {}, CollectiveBackendType::RCCL);
+            ASSERT_FALSE(generic->hasRankOrderedPeerPush());
+            ASSERT_TRUE(generic->rankOrderedResources().empty());
+        }
+        auto tp = createLocalTPContext(addresses, {}, CollectiveBackendType::RCCL, quote_policy);
+        ASSERT_TRUE(tp->hasRankOrderedPeerPush());
         const auto quote = tp->rankOrderedResources();
         ASSERT_EQ(quote.size(), addresses.size());
         PhysicalMemoryPlanBuilder plan;
@@ -2377,7 +2389,9 @@ TEST_F(Perf__RCCLAllreduceLatency, PeerPushCapturedOwnerReplacement)
                 ASSERT_EQ(status, hipSuccess);
                 std::array<float, columns> output;
                 ASSERT_EQ(hipMemcpy(output.data(), d.d_buffer, sizeof(output), hipMemcpyDeviceToHost), hipSuccess);
-                for (const auto value : output) EXPECT_EQ(value, base + (base + 1.0f));
+                float expected = 0;
+                for (std::size_t at = 0; at < devices_.size(); ++at) expected += base + static_cast<float>(at);
+                for (const auto value : output) EXPECT_EQ(value, expected);
             }
         }
         graphs.clear(); // Exact terminal events retired before final captured reader release.

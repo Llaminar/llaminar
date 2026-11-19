@@ -215,6 +215,11 @@ namespace llaminar2
     // ============================================================================
 
     RCCLCoordinator::RCCLCoordinator()
+        : RCCLCoordinator(rankOrderedPeerPushRequest(RankOrderedQuotePolicy::ExplicitOnly))
+    {}
+
+    RCCLCoordinator::RCCLCoordinator(RankOrderedPeerPushRequest request)
+        : rank_ordered_request_(request)
     {
         LOG_DEBUG("[RCCLCoordinator] Created");
     }
@@ -249,32 +254,41 @@ namespace llaminar2
             return false;
         }
 
-        if (rankOrderedPeerPushStartupOptIn())
+        try
         {
-            try
+            const auto request = rank_ordered_request_;
+            // TP4 is the measured automatic regime. Explicit diagnostics can also
+            // qualify other widths through the same clique and ISA checks.
+            rank_ordered_push_selected_ = false;
+            if (request == RankOrderedPeerPushRequest::Required ||
+                (request == RankOrderedPeerPushRequest::Automatic && device_ordinals.size() == 4))
             {
                 std::vector<DeviceId> cohort;
                 cohort.reserve(device_ordinals.size());
+                bool qualified_isa = true;
+                bool measured_cohort = device_ordinals.size() == 4;
                 for (const auto ordinal : device_ordinals)
-                    cohort.push_back(DeviceId::rocm(ordinal));
-                requireRankOrderedPeerPushClique(DeviceManager::instance().peerAccessCoverage(cohort));
-                for (const auto device : cohort)
                 {
-                    const auto &hardware = rocmHardwareMetadata().at(device.ordinal);
-                    if (!rankOrderedPeerPushQualifiedISA(hardware.isa_target))
-                        throw std::invalid_argument("RCCL FP32 direct peer is not qualified for " + hardware.isa_target);
+                    cohort.push_back(DeviceId::rocm(ordinal));
+                    const auto &hardware = rocmHardwareMetadata().at(ordinal);
+                    qualified_isa &= rankOrderedPeerPushQualifiedISA(hardware.isa_target);
+                    measured_cohort &= hardware.compute_units == 60;
                 }
+                const auto coverage = qualified_isa
+                    ? DeviceManager::instance().peerAccessCoverage(cohort) : std::nullopt;
+                rank_ordered_push_selected_ = selectRankOrderedPeerPush(
+                    request, coverage, qualified_isa, measured_cohort);
             }
-            catch (const std::exception &error)
-            {
-                last_error_ = error.what();
-                LOG_ERROR("[RCCLCoordinator] " << last_error_);
-                return false;
-            }
+        }
+        catch (const std::exception &error)
+        {
+            last_error_ = error.what();
+            LOG_ERROR("[RCCLCoordinator] " << last_error_);
+            return false;
         }
 
         // Ensure RCCL is loaded
-        if (!rccl::isLoaded() && !rccl::load())
+        if (!rccl::load())
         {
             const char *err = rccl::getLastError();
             last_error_ = std::string("Failed to load RCCL: ") + (err ? err : "unknown error");
@@ -781,7 +795,7 @@ namespace llaminar2
             LOG_TRACE("[RCCLCoordinator] Initialized RCCL comm for device " << device_ordinals_[i]);
         }
 
-        if (rankOrderedPeerPushStartupOptIn())
+        if (rank_ordered_push_selected_)
         {
             try
             {

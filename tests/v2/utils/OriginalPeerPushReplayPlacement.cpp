@@ -21,7 +21,8 @@ namespace llaminar2::test
         return rank;
     }
 
-    std::vector<int> originalPeerPushReplayDevices(std::size_t degree, DeviceType backend)
+    std::vector<int> originalPeerPushReplayDevices(std::size_t degree, DeviceType backend,
+                                                   std::string_view native_isa)
     {
         if (degree < 2 || (backend != DeviceType::CUDA && backend != DeviceType::ROCm))
             throw std::invalid_argument("Peer push replay requires at least two homogeneous GPU participants");
@@ -32,7 +33,8 @@ namespace llaminar2::test
         {
             std::vector<DeviceId> eligible;
             for (const auto &gpu : rank.gpus)
-                if (gpu.type == backend && rankOwnsGPUDevice(rank, gpu))
+                if (gpu.type == backend && rankOwnsGPUDevice(rank, gpu) &&
+                    (native_isa.empty() || std::string_view(gpu.native_isa).substr(0, gpu.native_isa.find(':')) == native_isa))
                     eligible.emplace_back(gpu.type, gpu.local_device_id);
             if (eligible.size() < degree) continue;
             const ObservedPeerGrouping grouping(rank);

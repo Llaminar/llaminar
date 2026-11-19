@@ -2,10 +2,165 @@
 
 With 160 routed and 160 shared expert columns per GPU, Llaminar leads the
 pinned Castagna build in whole-model prefill and decode on both prompts
-with MTP off, at fixed depth three and with adaptive MTP. Llaminar also
+with MTP off, at fixed depth three and with adaptive MTP in the historical
+equal-width experiment. That experiment used a local RCCL build with
+different library bytes from the published develop image. Its throughput
+applies to that build. Llaminar also
 passed the MTP own-history check in both modes on both prompts. The local four-row HC/FFN body
 remains slower than Castagna. The comparisons below distinguish work per
 verification from output tokens per second.
+
+## Shipping RCCL and automatic planning
+
+A Release built with the RCCL from the published develop image compared the
+two expert layouts on the same four MI50s, original GGUF and 2,048 input token
+IDs. The model used 512 GPU-resident experts, RAM ngrams, native FP16 KV and
+dynamic MTP (initial depth 5, range 1–15). Sampling was greedy, seed 42.
+The enabled prefix cache supplied zero tokens in both arms. The table gives
+medians of two unprofiled 256-token generations after warmup. Decode measures
+the 255 tokens after the first.
+
+| Stationary expert placement | Prefill tok/s | Decode tok/s | Verifier rounds | Rows verified | Drafted / accepted / rejected |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Automatic TensorSharded, 160 routed and shared columns per participant | 921.72 | 79.91 | 71 | 430 | 359 / 185 / 49 |
+| Explicit GateUpOwnedDownColumns | 939.02 | 64.48 | 65 | 394 | 329 / 190 / 42 |
+
+Each arm repeated its own output tokens and speculative work exactly. Their
+outputs first differed at zero-based token 44. The measured 23.92% decode
+gain and 1.84% prefill cost describe the complete requests. The historical
+134.75 tok/s dynamic result below also had a different output history and
+used a different RCCL library.
+
+Both runs used Llaminar core SHA256
+`a35559e26f8befd78432487d499ab54640f2d988861d918122ed1cb4b926c5c4`
+and RCCL SHA256
+`43a7472719749bab95b6b08127953679af37f1d37a4f4c576d5174a0f15b230b`.
+The native invocation, exact input token IDs, iterations and counts are in the
+[automatic benchmark](/tmp/qfn-mi50-opencode-tp4-sol62/terminal-r10-open-code/coding-benchmark/)
+and [former-layout control](/tmp/qfn-mi50-opencode-tp4-sol62/terminal-r10-http/coding-benchmark-former-policy/).
+
+The subsequent ten-phase OpenCode run completed seven phases. Its 131st
+HTTP request reached a new prefix checkpoint at 13,248 tokens and left one
+token to process. Replaying the original chat templates reproduced all 130
+OpenCode prompt lengths and their logged token-ID prefixes. Earlier requests,
+including their generated tokens, shared at most 6,304 tokens with the
+failing prompt. The server reported a hardware exception in the scalar MoE
+router before publishing an output token.
+
+The one-row MTP condition now gives attention the full KV history and the
+expert router one live activation. The focused ROCm regression
+`V2_Integration_QFNFixedMTPConditionRowReplay` passed on an MI50.
+On the repaired Release (`a2a31a9032d18df290547a8f0e0c7871a164a447a540489083fa85633f0d8168`)
+the four-card frozen-history panel reproduced every prior per-row metric.
+
+| Phase | Final-logit rows | Mean KL (nats) | Top-1 agreement | Mean top-5 overlap |
+| --- | ---: | ---: | ---: | ---: |
+| Prefill | 16 | 0.03150 | 93.75% | 92.50% |
+| Decode | 96 | 0.01928 | 95.83% | 91.67% |
+
+The full-model 64→65-token regression then exposed an independent position
+error. Serial catch-up always added one to the shifted KV row count before
+applying rotary position embedding to the predictor key. QFN already stores
+a row for position zero, so its next position was 64. The successor-only
+cache used by other models needs the extra one. The serial path now reads the
+model’s cache origin. On four MI50s the fresh-checkpoint and restored-checkpoint
+paths both matched serial state byte for byte, including the predictor keys.
+The CUDA and ROCm native replays separately passed for both cache origins
+at counts 0, 1, 64 and 13,248. The Release core for these checks was
+`12829f4013b6a96fa83d6f7c8fd5c73773f7c2361292b9295659e5f0467ddbf0`.
+
+On that same Release, the original failing HTTP request returned 200 after
+33.99 seconds on the automatic TP4 layout and shipped RCCL. The native server
+counted the same 13,249 input tokens. For this reproduction only the output
+limit changed to eight tokens; the server produced all eight and closed the
+event stream normally. Its isolated server and cache were retired before the
+ten-phase OpenCode session.
+
+The repaired Release completed all ten phases with stock OpenCode `1.18.34`
+in 71.0 minutes on that quartet. The stress gate passed through 15 compactions and 201 OpenCode
+requests. Including the initial smoke request, the server completed 202
+requests with zero failures or disconnects. It generated 141,976 tokens at
+69.20 tok/s and reused 86.15% of the 3,569,178 prompt tokens. Uncached prefill
+averaged 307.92 tok/s across these interactive requests.
+
+The Python app passed all 78 acceptance checks, including HTTP behavior,
+restart persistence and an independent run of its 95 authored unit tests.
+Two of 206 tool attempts failed because an edit's
+search text did not match the file (0.97%). The strict tool-instruction grade
+also records that OpenCode used shell commands to write and verify the exact
+three bytes `123` for the final sentinel. The requested `write` and `read`
+tool calls for that file were absent. The protocol grader recorded no errors.
+Native replay matched the smoke response and all 201 OpenCode responses,
+including all 206 tool calls. Qualification uses `1.18.34-llaminar.1`, which
+includes the terminal-stop compaction fix. The qualification entry point now
+rejects a stock client before admitting the model.
+
+The qualified OpenCode client completed ten phases in 47 minutes 40 seconds
+with zero execution errors in 151 tool calls and ten compactions. Its app
+passed all 78 acceptance checks and all 85 authored unit tests. For the final
+sentinel it used `bash` to write `123`, then `read` on the correct file. The
+three file bytes were correct. The strict grade requires the `write` tool
+followed by `read`, so that instruction remained unsatisfied.
+
+Across the seeded smoke and 141 OpenCode requests, the server recorded zero
+failures or disconnects. It generated 103,806 tokens at 69.55 tok/s and
+reused 86.39% of 2,415,269 prompt tokens. Uncached prefill averaged 309.29
+tok/s. Dynamic MTP accepted 51.29% of drafted tokens.
+
+The app session used the following command against the healthy TP4 server.
+Set `client` to the installed `1.18.34-llaminar.1` executable and `out` to
+a fresh results directory. The server and client both used a 40,640-token
+context. The 16,384-token reply reserve left room for OpenCode’s tool history.
+
+```bash
+python3 tests/v2/e2e/server/opencode_tool_stress.py \
+  --base-url http://127.0.0.1:19080 \
+  --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004 \
+  --opencode "$client" --context-length 40640 --max-tokens 32768 \
+  --gate stress --case webapp --webapp-phases 10 --iterations 1 --concurrency 1 \
+  --measure-prefix-reuse --output "$out" --reply-reserve-tokens 16384
+```
+
+To reproduce the campaign, start in the source checkout with the same four
+cards exposed to ROCm. Set `build` to the Release directory, `model` to the
+first UD-Q4_K_XL shard and `predictor` to the shared Q8_0 MTP GGUF. The
+following recreates all 9,058 original prompt bytes from the repository. The
+rankfile describes the 28 cores per socket on the measured machine.
+
+```bash
+bench=$(mktemp -d)
+python3 - "$bench" <<'PY'
+import hashlib, json, pathlib, subprocess, sys
+root = pathlib.Path(sys.argv[1])
+filename = 'scripts/ci/run_model_parity_benchmarks.py'
+source = subprocess.check_output(['git', 'show', f'e6dc6fe3768ba70d0341ae32eea2994c156d7fbe:{filename}'])
+prompt = ('Review this Python inference test tooling. Identify one concrete correctness defect '
+          'and propose a minimal repair with a regression. Explain your reasoning.\n\n'
+          f'File: {filename}\n```python\n') + source[:8843].decode()
+assert hashlib.sha256(prompt.encode()).hexdigest() == 'acece79e90a3f5e41dd25200a6c6a26eef9a0847f06e8fd6d2235003a8e7ad18'
+campaign = dict(schema='llaminar.benchmark-campaign.v1', output_directory=str(root / 'results'),
+                sampling=dict(temperature=0, top_k=1, top_p=1.0, seed=42),
+                prompts=[dict(id='code2048', partition='holdout', text=prompt)],
+                cells=[dict(id='code2048', prompt_id='code2048', mtp=dict(mode='dynamic',
+                            minimum_depth=1, maximum_depth=15, initial_depth=0))])
+(root / 'campaign.json').write_text(json.dumps(campaign))
+(root / 'rankfile').write_text('rank 0=localhost slot=0-27\nrank 1=localhost slot=28-55\n')
+PY
+mkdir "$bench/mpi"
+OMP_NUM_THREADS=28 OMP_PLACES=cores OMP_PROC_BIND=false OPENBLAS_NUM_THREADS=1 \
+LLAMINAR_BENCHMARK_ITERATIONS=2 LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1 \
+"$build/llaminar_mpi_session" --session-base "$bench/mpi" -- mpirun -np 2 \
+  --rankfile "$bench/rankfile" --bind-to core --report-bindings \
+  --mca mpi_leave_pinned 1 --mca orte_allowed_exit_without_sync 1 -- \
+  "$build/llaminar2" benchmark --auto --only-backends rocm --only-strategies tp \
+  --auto-device-counts rocm=4 --mpi-procs 2 --moe-routed-expert-compute auto \
+  --moe-residency-maintenance off --moe-sparse-gpu -m "$model" --mtp-model "$predictor" \
+  --mtp --mtp-depth-policy dynamic --plan-workload 2048,256 -n 256 \
+  --temperature 0 --top-k 1 --top-p 1 --seed 42 --benchmark-campaign "$bench/campaign.json"
+```
+
+For the control, use a fresh directory and change `--moe-routed-expert-compute`
+to `gate-up-owned-down-columns`.
 
 ## Matched workload
 
@@ -1095,6 +1250,16 @@ rates above measure throughput.
 [Stage attribution and common-clock intervals](/tmp/qfn-mi50-w-r3-verifier-cohort/fuller-code2048-target-breakdown.json)
 [Original layer launch counts and native kernel symbols](/tmp/qfn-mi50-w-r3-verifier-cohort/fuller-code2048-grouped-kernels.json)
 
+The subsequent counted HC-down reducer at `8b4e30bca` combined ordered
+reduction and activation publication. On the same code2048 fixed-depth
+workload, each participant recorded 1,838 verifier kernels per round,
+down from 1,935. Mean GPU-active verifier time fell from 23.233 to
+22.669 ms per round. The fork measured 18.222 ms on its own history.
+Unprofiled decode rose from 111.88 to 113.54 tokens/s, with all 256
+output tokens, 86 rounds and 344 target rows identical between the two
+Llaminar runs. These figures use the uneven routed-column partition.
+[Four-device traces and same-binary control](/tmp/qfn-mi50-hc-reducer-trace-sol62/REPORT.md)
+
 ### Moving route preparation out of the fixed-depth expert arithmetic
 
 The focused harness replayed four original layer-1 verifier rows with the
@@ -1168,6 +1333,32 @@ holdout selected the checked path. A six-row replay and an M4-to-M3 reset
 also retained their expected route handling. These are local parent times.
 [Reverse-order native timings and authority checks](/tmp/qfn-mi50-m4-ready-serving/REPORT.md)
 [Held-epoch, source holdout, six-row and reset qualification](/tmp/qfn-mi50-m4-ready-serving/promotion-native-gate.json)
+
+In a four-MI50 coding run on the same Release, enabling both operand
+policies changed fixed-depth decode from 111.95 to 111.80 tok/s (−0.14%
+paired). Prefill moved from 970.82 to 970.16 tok/s. All three generations
+matched the ordinary 256-token history and the control's 86 verifier
+rounds and 344 rows. Host I/O pressure was higher during the enabled arm.
+This experiment leaves the checked path in place.
+[Paired expert operand measurements](/tmp/qfn-mi50-m4-ready-serving/protected-model/comparison.json)
+
+The preceding code2048 control trace identifies which shard gates the next
+collective. The 256-column owner completed the local FFN after every
+128-column owner in 4,117 of 4,128 layer-round observations (99.73%).
+Across the 48 layer medians, the wide owner finished 31.36 µs later
+than the last narrow owner on the common clock. Measuring from each
+card's own preceding peer completion gave a 31.52 µs gap. This places the next
+throughput experiment on the wide shard.
+[Per-layer GPU arrival times from the original four-card trace](/tmp/qfn-mi50-hc-reducer-trace-sol62/arrivals-3c-control.json)
+
+One separate store experiment omitted the individual routed contributions,
+the routed and shared partial outputs, and the shared gate and up outputs.
+Those five writes total 496,640 bytes per four-row layer per participant.
+Computing the same combined output took 114.03 → 113.88 µs at 128 columns
+and 151.25 → 151.41 µs at 256. The treatment left all five test buffers
+untouched and reproduced serial output over 20 full, partial, empty and
+reset histories. The production path keeps the existing publications.
+[Same-binary store experiment and native event samples](/tmp/qfn-mi50-grouped-ffn-output-demand/bd-original-abba-r2/result.json)
 
 The HC up-projection can compute the four-branch residual read from its
 own live logits. With the grouped Down reducer enabled, this shortened

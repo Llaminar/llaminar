@@ -8,6 +8,9 @@
  * heterogeneous ticket boundary; no host readback is introduced here.
  */
 
+#ifdef HAVE_ROCM
+#include "kernels/rocm/moe/ROCmMoEKernel.h"
+#endif
 #include "MoERoutingStage.h"
 #include "../../../memory/CPURouterQ8StorageLayout.h"
 #include "../../../kernels/cpu/moe/CPUMoEKernel.h"
@@ -338,6 +341,8 @@ namespace llaminar2
 
     uint64_t MoERoutingStage::graphCaptureVariantSignature() const
     {
+        if(params_.verifier_kernel_policy!=LocalGPUExpertKernelPolicy::Generic)
+            return 0x47524f5550524f55ULL ^ static_cast<std::uint64_t>(params_.verifier_kernel_policy);
         const auto owner=params_.routed_pipeline_kernel_owner;
         if(!owner||!owner->router_q8_publication||!owner->router_q8_publication->requiredOriginalM1Source())return 0;
         if(moe_kernel_)(void)moe_kernel_->originalM1HiddenQ8BindingSignature();
@@ -584,7 +589,20 @@ namespace llaminar2
              * backend verifier contract so every runtime-M row uses serial-row
              * math while the backend still performs one grouped publication.
              */
-            if (!kernel->routeVerifierRowsDecodeEquivalent(
+            const auto route=[&](auto... operands) {
+                if(params_.verifier_kernel_policy!=LocalGPUExpertKernelPolicy::Generic) {
+#ifdef HAVE_ROCM
+                    auto* native=dynamic_cast<ROCmMoEKernel*>(kernel);
+                    if(!params_.device_id.is_rocm() || !native)
+                        throw std::logic_error("Qualified verifier router lost its original ROCm owner");
+                    return native->routeGroupedVerifierWithPolicy(params_.verifier_kernel_policy,operands...);
+#else
+                    throw std::logic_error("Qualified verifier router requires ROCm compilation");
+#endif
+                }
+                return kernel->routeVerifierRowsDecodeEquivalent(operands...);
+            };
+            if (!route(
                     full_input,
                     params_.gate_weights,
                     seq_len,

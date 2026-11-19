@@ -707,7 +707,7 @@ namespace llaminar2::test
                          ++phase)
                     {
                         economy.service_costs[
-                            (static_cast<std::size_t>(tier) * input.num_layers +
+                            (static_cast<std::size_t>(target) * input.num_layers +
                              layer) *
                                 kMoEOverlayDeviceControllerEconomyServicePhaseCount +
                             phase] = 10u + tier * 90u;

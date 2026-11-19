@@ -306,7 +306,7 @@ MoEIntermediateShardArenaGeometry intermediateShardArena(const ModelMemoryProfil
     const int retained_last = geometry.retained_mtp_candidate_rows > 0 && last == profile.mainLayerCount() - 1
         ? profile.totalLayerCount() - 1 : last;
     return MoEIntermediateShardArenaGeometry::resolve(profile, geometry.total_shards, geometry.shard_index,
-        geometry.shared_tp_assignment, geometry.first_layer, retained_last);
+        geometry.shared_tp_assignment, geometry.first_layer, retained_last, geometry.gpu_expert_intermediate_tiling);
 }
 }
 

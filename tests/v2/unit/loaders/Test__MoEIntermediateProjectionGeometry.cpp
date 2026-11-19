@@ -314,7 +314,7 @@ TEST(MoEIntermediateProjectionGeometry, SizingAndWorkUseExactLocalNKAndFullExper
         };
         const PlanningRoutedExpertWeightWork work{0, 512, 10,
             {operand(0), operand(1), operand(2)},
-            {PlanningExpertExecutionShare(PlanningExpertExecution::OwnedExperts, 128)}, ownership};
+            {PlanningExpertExecutionShare(PlanningExpertExecution::ReplicatedExperts, 512)}, ownership};
         for (size_t i = 0; i < roles.size(); ++i)
         {
             const auto projection = ownership.projection(roles[i]);

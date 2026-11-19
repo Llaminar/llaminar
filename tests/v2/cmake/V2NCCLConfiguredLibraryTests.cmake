@@ -98,6 +98,19 @@ if(V2_NCCL_PATH_ANY_SELECTED)
                 endif()
             endforeach()
         endforeach()
+        foreach(V2_NCCL_ABSOLUTE_VARIANT configured original)
+            if(NOT TARGET v2_unit_${V2_PATH_BACKEND_LOWER}_path_${V2_NCCL_ABSOLUTE_VARIANT})
+                continue()
+            endif()
+            set(V2_NCCL_ABSOLUTE_TEST "V2_Integration_${V2_PATH_BACKEND}AbsoluteLibraryPath_${V2_NCCL_ABSOLUTE_VARIANT}")
+            add_test(NAME ${V2_NCCL_ABSOLUTE_TEST}
+                COMMAND $<TARGET_FILE:v2_unit_${V2_PATH_BACKEND_LOWER}_path_${V2_NCCL_ABSOLUTE_VARIANT}>
+                    --gtest_filter=${V2_PATH_BACKEND}ConfiguredLibrary.NonabsoluteExplicitPathDoesNotSearch)
+            set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_${V2_NCCL_ABSOLUTE_TEST}
+                v2_unit_${V2_PATH_BACKEND_LOWER}_path_${V2_NCCL_ABSOLUTE_VARIANT})
+            set_tests_properties(${V2_NCCL_ABSOLUTE_TEST} PROPERTIES
+                LABELS "V2;Integration;ProductionTestPreflight;${V2_PATH_BACKEND};DeviceFree;Dependency;Regression" TIMEOUT 10)
+        endforeach()
         foreach(V2_NCCL_PARTIAL_VARIANT configured original)
             if(NOT TARGET v2_unit_${V2_PATH_BACKEND_LOWER}_path_${V2_NCCL_PARTIAL_VARIANT})
                 continue()

@@ -601,7 +601,8 @@ private:void* substitute_=nullptr;
  * @param format Original registry source; null retains the historical Q8_0 case.
  */
 void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC103Path path,
- HC103Observation observation=HC103Observation::Correctness,const test::QuantizedVerifierFormatCase *format=nullptr) {
+ HC103Observation observation=HC103Observation::Correctness,const test::QuantizedVerifierFormatCase *format=nullptr,
+ LocalGPUExpertKernelPolicy policy=LocalGPUExpertKernelPolicy::Generic) {
  const bool timing=observation==HC103Observation::Paired;
  const bool profiling=observation==HC103Observation::ProfileProduction||observation==HC103Observation::ProfileReference;
  const bool kPair=path==HC103Path::GroupedKPair;
@@ -738,7 +739,8 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
     .rows={m,Qwen4ExpIntInput{Qwen4ExpNativeIntInput{device,count,1}}},.hidden=hidden,.lowRank=lowRank,.epsilon=1e-6f,
     .arithmetic=ordinaryDown?Qwen4ExpProjectionArithmetic::Ordinary:Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,
     .projectionRows=ordinaryDown?std::nullopt:std::optional{rows},
-    .upOperandPrecision=QuantizedActivationOperandPrecision::TwoTermQ8,.upProjectionRows=rows};
+    .upOperandPrecision=QuantizedActivationOperandPrecision::TwoTermQ8,.upProjectionRows=rows,
+    .verifierKernelPolicy=policy};
    auto*raw=alias?activated[0].get():rawDown[0].get();
    const Qwen4ExpHyperconnectionReadBuffers buffers{F(branchInput,BufferId::RESIDUAL),F(normalized,BufferId::NORMALIZED),
     F(*raw,BufferId::GATE_PROJ),F(*activated[0],alias?BufferId::GATE_PROJ:BufferId::UP_PROJ),
@@ -1081,7 +1083,10 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
         hardware.native_wave_width==64;
     const bool fused=groupedReducer && side==0;
     EXPECT_EQ(has("qfn_hc_down_long_k_contributions"),fused||(mi50&&qfnGroupedHCDownLongKExperiment()));
-    EXPECT_EQ(has("projectHCGroupedShortK"),mi50&&qfnGroupedHCUpShortKExperiment());
+    const bool measured_default=side==0 && policy==LocalGPUExpertKernelPolicy::QFNMI50TP4;
+    EXPECT_EQ(has("projectHCGroupedShortK"),mi50&&qfnGroupedHCUpShortKExperiment(measured_default));
+    if(measured_default)
+     EXPECT_TRUE(has("projectHCGroupedShortKWide"));
     EXPECT_EQ(has("groupedHCDownReducePublish"),fused);
     EXPECT_EQ(has("publishHCResidualDown"),!fused);
    }
@@ -1779,6 +1784,19 @@ TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCDownReducePublishDefaultReplay)
     hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
  for(bool alias:{false,true})
   proveHC103Chain(DeviceId::rocm(0),4,2560,320,alias,HC103Path::GroupedReducer);
+}
+
+/** @test The admitted TP4 policy selects the measured HC-up without fusing branch read. */
+TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCUpQualifiedDefaultReplay)
+{
+ ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K"),nullptr);
+ auto* backend=getROCmBackend();
+ if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
+ const auto& hardware=rocmHardwareMetadata().at(0);
+ if(!hardware.isa_target.starts_with("gfx906")||hardware.compute_units!=60||
+    hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
+ proveHC103Chain(DeviceId::rocm(0),4,2560,320,false,HC103Path::GroupedReducer,
+    HC103Observation::Correctness,nullptr,LocalGPUExpertKernelPolicy::QFNMI50TP4);
 }
 
 /** @test Explicit 0 retains the separate reducer and publisher on eligible MI50. */

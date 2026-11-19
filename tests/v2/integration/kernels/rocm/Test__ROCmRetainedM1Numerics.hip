@@ -386,8 +386,7 @@ TEST(ROCmRetainedM1Numerics, CapturedPositiveHalfScaleMatchesCanonical)
 {
     auto lifetime = GPUDeviceProcessLifetime::acquireNativeContext();
     const int ordinal = nativeMI50();
-    if (ordinal < 0)
-        GTEST_SKIP() << "UNQUALIFIED: no visible gfx906 participant";
+    ASSERT_GE(ordinal, 0) << "Required gfx906 replay participant is absent";
     Replay replay(ordinal);
     auto cases = scaleCases();
     unsigned finite = 0;
@@ -462,8 +461,7 @@ TEST(ROCmRetainedM1Numerics, CapturedPackedQueueMatchesOriginal)
 {
     auto lifetime = GPUDeviceProcessLifetime::acquireNativeContext();
     const int ordinal = nativeMI50();
-    if (ordinal < 0)
-        GTEST_SKIP() << "UNQUALIFIED: no visible gfx906 participant";
+    ASSERT_GE(ordinal, 0) << "Required gfx906 replay participant is absent";
     Replay replay(ordinal);
     auto cases = routeCases();
     auto *input = replay.allocate<RouteInput>(cases.size());
@@ -516,7 +514,7 @@ TEST(ROCmRetainedM1Numerics, CapturedWaveAddressPreservesUnsignedHalves)
 {
     auto lifetime=GPUDeviceProcessLifetime::acquireNativeContext();
     const int ordinal=nativeMI50();
-    if(ordinal<0)GTEST_SKIP() << "UNQUALIFIED: no visible gfx906 participant";
+    ASSERT_GE(ordinal, 0) << "Required gfx906 replay participant is absent";
     Replay replay(ordinal);
     constexpr unsigned lanes=64;
     std::array<std::uint64_t,6> words{0,0x00007f007fffffff,0x00007f0080000000,

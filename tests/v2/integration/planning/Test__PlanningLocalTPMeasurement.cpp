@@ -465,7 +465,8 @@ void proveContextStorageLifetime(int columns, int rows)
             EXPECT_GT(bytes, 0u);
             retained.push_back(bytes);
             EXPECT_EQ(memory->plannedBytes(device, PhysicalMemoryOwner::NativeGraphExecutable),
-                2 * GPUGraphMemoryContract::reservationBytesPerExecutable(device));
+                PlanningExecutionMeasurement::kPreparedGraphCount *
+                    GPUGraphMemoryContract::reservationBytesPerExecutable(device));
         }
     }
     EXPECT_TRUE(setup_lifetime.expired());

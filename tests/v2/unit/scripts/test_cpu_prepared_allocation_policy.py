@@ -62,6 +62,13 @@ class CPUPreparedAllocationPolicyTests(unittest.TestCase):
                 self.assertTrue(scan_source(f"src/v2/{directory}/example.cpp","void owner(){"+expression+"}"))
 
 
+    def test_bounded_source_rejecting_override_cannot_hide_legacy_work(self):
+        path = "src/v2/loaders/BoundedGPUExpertSource.h"
+        declaration = "std::unique_ptr<ITensorGemm> createGemm() override "
+        self.assertEqual(scan_source(path, declaration + "{ reject(); }"), [])
+        self.assertEqual(len(scan_source(path, declaration + "{ return tensor->createGemm(); }")), 2)
+        self.assertTrue(scan_source(PATH, declaration + "{ reject(); }"))
+
     def test_comments_regular_raw_and_character_literals_are_ignored(self):
         source=r'''void owner(){
             // prepareExpertGemmLocal(tensor,device);

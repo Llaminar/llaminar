@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_native_test_module_selection.py
+#  @brief Verify generated native test commands and their hardware requirements across build modes.
 """Replay actual native test-module selection with CMake, without building binaries.
 
 The production selector and registration helpers own all mutations. Tiny fixture
@@ -27,6 +29,7 @@ class NativeTestModuleSelection(unittest.TestCase):
     ninja = "ninja"
     modules = (
         "V2LocalHotNativeForkTests.cmake", "V2PooledLocalHotNativeTests.cmake",
+        "V2PooledOriginalSourceSetupTests.cmake",
         "V2CPUFragmentResidencyTests.cmake", "V2CPUShardRouteCollectiveTests.cmake",
         "V2NativeCPUCollectiveProgramTests.cmake", "V2CPUExpertDomainLifecycleTests.cmake",
         "V2NativeCollectiveOwnedErrorTests.cmake",
@@ -179,6 +182,23 @@ endif()
                                     timeout=10, check=True)
             return configured, json.loads(listed.stdout)["tests"]
 
+    def assert_source_setup_requirements(self, tests, cuda, rocm):
+        """Only the compact ROCm fixture prepares storage for the mapped host ready word."""
+        labels = {test["name"]: set(prop["value"])
+                  for test in tests for prop in test["properties"] if prop["name"] == "LABELS"}
+        compact = "PooledCompactQueryDeclarationBeforeSeal"
+        for backend, present in (("CUDA", cuda), ("ROCm", rocm)):
+            for case in (compact, "PooledOriginalSourceC0Setup", "PooledOriginalSourcePositiveSetup"):
+                name = f"V2_Integration_{backend}_{case}"
+                self.assertEqual(name in labels, present, name)
+                if not present:
+                    continue
+                self.assertIn("ProductionTestPreflight", labels[name])
+                needs_atomics = backend == "ROCm" and case == compact
+                self.assertEqual("ROCmHostNativeAtomics" in labels[name], needs_atomics, name)
+                if needs_atomics:
+                    self.assertTrue({"HardwareOptional", "Devices1", "LocalHostDevices"} <= labels[name], name)
+
     def test_backend_matrix_preserves_selected_targets_and_aliases(self):
         """CPU/CUDA/ROCm/both retain original Integration cells and valid Release performance commands."""
         for performance in (True, False):
@@ -201,6 +221,7 @@ endif()
                                          "V2_Integration_CPUExpertSocketMembershipReplay",
                                          "V2_Integration_NativeCollectiveOwnedErrorReplay"):
                             self.assertIn(expected, names)
+                        self.assert_source_setup_requirements(tests, cuda, rocm)
                     for test in tests:
                         if "_PooledLocalHotNative_" in test["name"]:
                             target = ("v2_perf_pooled_local_hot_native" if performance

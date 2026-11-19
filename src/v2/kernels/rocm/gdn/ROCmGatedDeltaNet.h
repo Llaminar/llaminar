@@ -1287,7 +1287,8 @@ namespace llaminar2
             /** @return Backend, terminal and compiled scheduling identity. */
             std::uint64_t captureProgramIdentity() const noexcept override
             {
-                return 512ULL + (static_cast<std::uint64_t>(binding_.terminal_kind) << 4);
+                return 512ULL + (static_cast<std::uint64_t>(binding_.terminal_kind) << 4) +
+                    (static_cast<std::uint64_t>(binding_.verifier_kernel_policy) << 10);
             }
             /** @brief Authenticate complete immutable backend/source/workspace identity.
              * @param candidate Proposed reused invocation.
@@ -1334,7 +1335,8 @@ namespace llaminar2
                 const gdn::GDNDenseCompactAcceptedPrefixInput publication{input_.transaction, selection,
                     publicationDestination(), mirror};
                 rocmGDN_gpu_set_device(owner_.device_ordinal_);
-                if (!gdn::launchROCmDenseCompactAcceptedPrefix(publication, stream))
+                if (!gdn::launchROCmDenseCompactAcceptedPrefixWithPolicy(publication,stream,
+                        binding_.verifier_kernel_policy==LocalGPUExpertKernelPolicy::QFNMI50TP4))
                     return false;
                 return true;
             }

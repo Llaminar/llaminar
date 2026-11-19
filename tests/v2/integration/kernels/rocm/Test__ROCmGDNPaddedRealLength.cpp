@@ -4342,8 +4342,8 @@ TEST(Test__ROCmGDNPaddedRealLength, QFNK4VerifierAcceptedPrefixIgnoresUnpublishe
         grouped.bindVerifierStateCaptureWorkspace(snapshots.ptr, capacity, stateSize);
         grouped.bindSpeculativeStateWorkspace(speculative.ptr, stateSize);
         HipCapturedGraph verify(stream.stream, [&] {
-            return grouped.forwardWithEffectiveSeqLen(input.ptr, weights.ptr, nullptr, output.ptr,
-                nullptr, capacity, channels, taps, live.ptr, true);
+            return grouped.forwardCountedWithPolicy(LocalGPUExpertKernelPolicy::QFNMI50TP4,
+                input.ptr, weights.ptr, nullptr, output.ptr, nullptr, capacity, channels, taps, live.ptr, true);
         });
         std::size_t nodes = 1;
         hipGraphNode_t node = nullptr;

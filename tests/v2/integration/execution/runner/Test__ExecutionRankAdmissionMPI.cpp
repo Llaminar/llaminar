@@ -9,6 +9,7 @@
  * No weights or accelerators are opened; CTest supplies the usual 30-second
  * protocol bound through the existing initialization-lifecycle preflight group.
  */
+#include "app/ServerDiscoveryMembership.h"
 #include "utils/MPIContext.h"
 #include "tools/ModelKLDQFNContract.h"
 #include <unistd.h>
@@ -176,6 +177,22 @@ TEST(ExecutionRankAdmissionMPI, ContextRetainsDiscoveryOwnerUntilItsDerivedTopol
     EXPECT_FALSE(weak.expired());
     active.reset();
     EXPECT_TRUE(weak.expired());
+}
+
+/** @test Both original processes publish their authentic PID and the same narrowed selection. */
+TEST(ExecutionRankAdmissionMPI, ServerDiscoveryMembershipRetainsInactiveSibling)
+{
+    auto discovery = MPIContextFactory::global();
+    ASSERT_EQ(discovery->world_size(), 2);
+    const ExecutionRankSelection selection({1});
+    auto admitted = MPIContextFactory::selectRanks(discovery, selection.discoveryRanks());
+    const auto active = activeContext(admitted);
+    EXPECT_EQ(bool(active), discovery->rank() == 1);
+    if (active)
+        EXPECT_EQ(active->rank(), 0);
+    const auto expected = "[ServerDiscoveryMembership] schema=1 pid=" + std::to_string(::getpid()) +
+        " discovery_rank=" + std::to_string(discovery->rank()) + " discovery_size=2 selected=1";
+    EXPECT_EQ(serverDiscoveryMembership(*discovery, selection), expected);
 }
 
 /** @test Original artifact/terminal collectives survive inactive root and selected-root remapping. */

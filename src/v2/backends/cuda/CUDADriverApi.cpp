@@ -14,6 +14,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 
 namespace llaminar2
 {
@@ -68,6 +69,15 @@ const CUDADriverApi &CUDADriverApi::instance()
         return complete;
     }();
     return api;
+}
+
+CUDADriverBindingStatus CUDADriverApi::probeDriverBinding() noexcept
+{
+    // The exact production request: this authority owns the libcuda.so.1
+    // SONAME, and the shared native probe owns the one loader implementation.
+    constexpr std::string_view driverSoname = "libcuda.so.1";
+    const CUDADriverLoaderOutcome outcome = probeNativeLibraryBinding(driverSoname);
+    return classifyCUDADriverBinding(outcome.loadable, driverSoname, outcome.diagnostic);
 }
 
 #define LLAMINAR_CUDA_DRIVER_SYMBOL_TEXT_(symbol) #symbol

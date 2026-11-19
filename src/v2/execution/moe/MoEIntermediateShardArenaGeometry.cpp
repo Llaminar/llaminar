@@ -24,7 +24,7 @@ namespace llaminar2
 {
 MoEIntermediateShardArenaGeometry MoEIntermediateShardArenaGeometry::resolve(const ModelMemoryProfile &source,
     int participants, int participant, const std::optional<DeviceShardingAssignment> &shared_assignment,
-    int first_layer, int last_layer)
+    int first_layer, int last_layer, GPUExpertIntermediateTiling tiling)
 {
     if (participants <= 0 || participant < 0 || participant >= participants || source.d_model <= 0 ||
         source.expert_count <= 0 || source.expert_used_count <= 0 || source.expert_used_count > source.expert_count ||
@@ -87,7 +87,7 @@ MoEIntermediateShardArenaGeometry MoEIntermediateShardArenaGeometry::resolve(con
             const auto *native = floating ? nullptr : native_quantised_formats::forQuantType(tensor.quant_type);
             if (!floating && !native) throw std::invalid_argument("Intermediate-shard arena has an unsupported original down codebook");
             const int group = floating ? 1 : native->is_superblock ? Q4_KBlock::BLOCK_SIZE : Q4_0Block::BLOCK_SIZE;
-            const auto intervals = MoEExpertProjectionOwnership::nativeIntermediateIntervals(f, participants, group, tensor.layer_index);
+            const auto intervals = MoEExpertProjectionOwnership::nativeIntermediateIntervals(f, participants, group, tensor.layer_index, preferredIntermediateGrain(tiling));
             routed_max = std::max(routed_max, intervals[participant].columns);
         }
     }

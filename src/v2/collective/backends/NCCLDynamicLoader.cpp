@@ -210,7 +210,7 @@ namespace llaminar2
 
         /**
          * @brief Resolve the exact selected NCCL dependency without substitution.
-         * @param library_path Explicit nonempty diagnostic/deployment path, or null
+         * @param library_path Explicit absolute diagnostic path, or null
          *        for CMake's selected LLAMINAR_NCCL_LIBRARY/NCCL_LIBRARY path.
          * @return True when the same selection is already loaded or every required
          *         symbol resolves; false for an invalid/different selection or failure.
@@ -231,6 +231,13 @@ namespace llaminar2
             {
                 g_last_error = library_path ? "Explicit NCCL library path is empty" :
                     "No NCCL library configured; set LLAMINAR_NCCL_LIBRARY when configuring the build";
+                LOG_ERROR("NCCL Dynamic Loader: " << g_last_error);
+                return false;
+            }
+
+            if (*path != '/')
+            {
+                g_last_error = "NCCL library path must be absolute: '" + std::string(path) + "'";
                 LOG_ERROR("NCCL Dynamic Loader: " << g_last_error);
                 return false;
             }

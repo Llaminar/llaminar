@@ -287,7 +287,8 @@ Focused HTTP stability loops diagnose this lifecycle; release certification
 uses the testing skill's RC gate, with OpenCode supplying HTTP coverage.
 
 If the repair changes RCCL storage, prove the concrete connection kind through
-`V2_Integration_RCCLHostTransportStorage`, not correct output alone. Same-process
+`V2_Integration_RCCLHostTransportStorage_Clique2` and
+`V2_Integration_RCCLHostTransportStorage_Clique4`, not correct output alone. Same-process
 native pinned backing and cross-process file/cuMem IPC have different ownership
 contracts; a raw pointer must never be used as cross-process IPC. The passive
 receipt counts endpoint mappings, not unique physical allocations or admission

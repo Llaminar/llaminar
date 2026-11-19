@@ -8,6 +8,7 @@
  */
 
 #pragma once
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
@@ -187,6 +188,8 @@ namespace llaminar2
              * row replay; it selects the dedicated grouped verifier contract.
              */
             bool force_decode_equivalent_verifier_prefill = false;
+            LocalGPUExpertKernelPolicy verifier_kernel_policy = LocalGPUExpertKernelPolicy::Generic;
+
 
             /**
              * @brief Declare this router's grouped-verifier history role.

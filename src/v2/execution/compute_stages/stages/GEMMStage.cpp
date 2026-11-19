@@ -17,6 +17,9 @@
  */
 
 #include "GEMMStage.h"
+#ifdef HAVE_ROCM
+#include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
+#endif
 #include "kernels/common/HCDownOutputPublication.h"
 #include "kernels/common/HCBranchNormSingleQ8Publication.h"
 #include "kernels/common/HCDownProjectionInput.h"
@@ -743,6 +746,8 @@ namespace llaminar2
             mix(0x4843444f574e0001ULL);
             const auto& hc=*params_.hc_residual_down;
             mix(reinterpret_cast<std::uintptr_t>(hc.activated));mix(static_cast<uint64_t>(hc.buffer));
+            if(hc.verifier_kernel_policy!=LocalGPUExpertKernelPolicy::Generic)
+                mix(static_cast<uint64_t>(hc.verifier_kernel_policy));
             // This variant is immutable before/after arena materialization.
             // CaptureOnly preparation freezes exact native identity separately.
             // Its validation above throws on replacement, never mutates this
@@ -1145,8 +1150,20 @@ namespace llaminar2
                 std::optional<HCResidualShortKReadOutput> read;
                 if(params_.hc_short_k_read)read.emplace(HCResidualShortKReadOutput{
                     *params_.hc_short_k_read->normalized,*params_.hc_short_k_read->mixed});
-                gemm->multiply_q8_residual_corrected(HCResidualDownInput{*A_extent,*activated,read,params_.hc_prepublished_down},C_extent,
-                    rows,effective_n,params_.k,getWorkspace());
+                const HCResidualDownInput input{*A_extent,*activated,read,params_.hc_prepublished_down};
+                const auto verifier_policy=params_.hc_residual_down->verifier_kernel_policy;
+                if(verifier_policy==LocalGPUExpertKernelPolicy::Generic)
+                    gemm->multiply_q8_residual_corrected(input,C_extent,rows,effective_n,params_.k,getWorkspace());
+                else {
+#ifdef HAVE_ROCM
+                    auto* native=dynamic_cast<rocm::ROCmQuantisedGemmKernel*>(gemm);
+                    if(!params_.device_id.is_rocm()||!native)
+                        throw std::logic_error("Qualified grouped HC-up lost its original ROCm GEMM owner");
+                    native->multiplyHCResidualDownWithPolicy(verifier_policy,input,C_extent,rows,effective_n,params_.k,getWorkspace());
+#else
+                    throw std::logic_error("Qualified grouped HC-up requires ROCm compilation");
+#endif
+                }
                 if(!params_.hc_prepublished_down)publishStageOutput(activated);
                 traceOutput("HC_activated",activated);
                 if(params_.hc_short_k_read) {

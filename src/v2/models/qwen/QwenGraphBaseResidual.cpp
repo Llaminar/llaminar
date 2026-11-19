@@ -8,6 +8,7 @@
  * and publish H-wide rows, while residual and pipeline transport retain 4H.
  */
 #include "QwenGraphBase.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "../qwen4exp/Qwen4ExpConfig.h"
 #include "../qwen4exp/Qwen4ExpHCUpArithmetic.h"
 #include <stdexcept>
@@ -80,7 +81,9 @@ Qwen4ExpHyperconnectionContext mixerContext(const GraphConfig &config,
                               ? Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier
                               : Qwen4ExpProjectionArithmetic::Ordinary,
             .projectionRows = projectionRows, .readNodeName = terminal,
-            .upOperandPrecision = config.qfn_hc_up_activation};
+            .upOperandPrecision = config.qfn_hc_up_activation,
+            .verifierKernelPolicy = projectionRows && rows.capacity == 4 && config.moe.routed_expert_plan
+                ? config.moe.routed_expert_plan->local_gpu_expert_kernel_policy : LocalGPUExpertKernelPolicy::Generic};
 }
 } // namespace
 

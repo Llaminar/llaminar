@@ -44,12 +44,13 @@ namespace llaminar2
          * @param devices Devices participating in LOCAL TP (must be non-empty)
          * @param weights Work distribution weights (empty for equal distribution)
          * @param backend Backend type for collectives (AUTO to detect from devices)
+         * @param peer_quote Cold peer-transport ownership for the bound placement.
          * @throws std::invalid_argument if devices is empty or weights mismatch
          */
         LocalTPContext(
             std::vector<GlobalDeviceAddress> devices,
             std::vector<float> weights,
-            CollectiveBackendType backend);
+            CollectiveBackendType backend, RankOrderedQuotePolicy peer_quote = RankOrderedQuotePolicy::ExplicitOnly);
 
         ~LocalTPContext() override;
 
@@ -263,6 +264,8 @@ namespace llaminar2
 
         /** @copydoc ICollectiveBackend::rankOrderedResources */
         std::vector<RankOrderedNativeResources> rankOrderedResources() const override;
+        /** @copydoc ILocalTPContext::hasRankOrderedPeerPush */
+        bool hasRankOrderedPeerPush() const noexcept override;
         /** @copydoc ICollectiveBackend::rankOrderedFP32OnStream */
         bool rankOrderedFP32OnStream(const void *send, void *banks, void *output,
             const NativeCollectiveRows &rows, int participant, void *stream, const std::string &stage_name) override;
@@ -651,9 +654,10 @@ namespace llaminar2
          * Creates the appropriate backend based on backend_ type and initializes it.
          * Called at the end of constructor after devices_ and backend_ are set.
          *
+         * @param peer_quote Native transport admission of the original model placement.
          * @return true if backend was successfully initialized
          */
-        bool initializeBackend();
+        bool initializeBackend(RankOrderedQuotePolicy peer_quote);
         /** @brief Materialize exact fence leases while the setup mutex is held. */
         bool initializeGraphCaptureBoundaryDeviceWords(
             const std::shared_ptr<PhysicalMemoryAuthority> &memory_authority);

@@ -135,6 +135,10 @@ class NativeGinProof(unittest.TestCase):
         for fragment in ('apply "${nccl_gin_patch}"', '"${nccl_gin_probe}" compile',
                          '"${nccl_gin_probe}" verify', '"${nccl_gin_report}"'):
             self.assertIn(fragment, installer)
+        self.assertIn('source "${nccl_script_dir}/nccl-release.env"', installer)
+        self.assertIn("nccl-release.env", PROOF.source_identity())
+        self.assertLess(docker.index("scripts/docker/nccl-release.env"),
+                        docker.index("MODE=full /tmp/install-scripts/install-cuda.sh"))
         self.assertLess(docker.index("COPY scripts/docker/nccl-gin-selection/"),
                         docker.index("MODE=full /tmp/install-scripts/install-cuda.sh"))
         self.assertIn("V2_UNIT_GATE_TARGETS v2_nccl_gin_selection_proof", registration)

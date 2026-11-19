@@ -757,6 +757,7 @@ ActivationGraphMemoryGeometry continuationActivationGeometry(const ModelMemoryPr
             .shard_index = cfg.shard_index,
             .shared_tp_assignment = cfg.tensor_parallel_assignment,
             .routed_compute_policy = cfg.routed_compute_policy,
+            .gpu_expert_intermediate_tiling = cfg.gpu_expert_intermediate_tiling,
             .mtp_target_query_rows = cfg.mtp_target_query_rows,
             .retained_mtp_candidate_rows = cfg.mtp_enabled ? cfg.mtp_target_query_rows : 0,
             .mtp_terminal_logits_layout =
@@ -2557,7 +2558,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
         if (cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
             cfg.device.is_rocm() && profile.flash_next && cfg.first_layer < profile.mainLayerCount() &&
             cfg.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
-            useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNOptIn(),ForwardExecutionPhase::Decode,
+            useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNEnabled(cfg.usesQFNMI50TP4()),ForwardExecutionPhase::Decode,
                 ForwardExecutionRole::MainInference,1,cfg.batch_size))
         {
             // The same serial family backs all original graph shapes. Add the
@@ -2567,7 +2568,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 "QFN retained M1 serial-family workspace");
         }
         if (profile.flash_next && cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
-            usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionOptIn(), cfg.device,
+            usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionEnabled(cfg.usesQFNMI50TP4()), cfg.device,
                 cfg.routed_compute_policy, ForwardExecutionPhase::Decode,
                 ForwardExecutionRole::MainInference, 1, cfg.batch_size))
         {

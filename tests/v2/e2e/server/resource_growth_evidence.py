@@ -104,17 +104,57 @@ class RankBinding:
             raise ValueError('Duplicate GPU resource binding')
 
 
-def bind_native_ranks(perf: dict, observation: dict, cell: str) -> tuple[RankBinding, ...]:
-    """Join server-authored rank/PID/PCI identity to one sealed host observation.
+@dataclass(frozen=True)
+class DiscoveryBinding:
+    """Original MPI rank and complete observed process lifetime."""
 
-    Linux NSpid lists the host PID first and the innermost namespace PID last.
-    The server emits getpid() in that namespace, while the observer supplies the
-    start ticks. This also works for a singleton launched without mpirun. Neither
-    environment rank variables nor PID/GPU enumeration order select an owner.
-    """
-    size = natural(perf['world_size'], 'world size')
-    if not size:
-        raise ValueError('Missing execution communicator')
+    discovery_rank: int
+    namespace_pid: int
+    pid: int
+    start_ticks: int
+
+    def __post_init__(self) -> None:
+        natural(self.discovery_rank, 'discovery rank')
+        for field in ('namespace_pid', 'pid', 'start_ticks'):
+            if not natural(getattr(self, field), field):
+                raise ValueError('Missing discovery process lifetime')
+
+
+@dataclass(frozen=True)
+class DiscoveryMembership:
+    """Ordered execution selection plus all original discovery PIDs."""
+
+    selected: tuple[int, ...]
+    processes: tuple[DiscoveryBinding, ...]
+
+    def __post_init__(self) -> None:
+        if (not self.selected or not self.processes
+                or {row.discovery_rank for row in self.processes} != set(range(len(self.processes)))
+                or any(type(rank) is not int or not 0 <= rank < len(self.processes) for rank in self.selected)
+                or len(set(self.selected)) != len(self.selected)
+                or any(len({getattr(row, field) for row in self.processes}) != len(self.processes)
+                       for field in ('pid', 'namespace_pid'))):
+            raise ValueError('Incomplete or contradictory original discovery membership')
+
+    def inactive(self) -> tuple[DiscoveryBinding, ...]:
+        """Return discovery processes excluded by native execution selection."""
+        return tuple(row for row in self.processes if row.discovery_rank not in self.selected)
+
+    def require_execution_pids(self, identities: dict[int, int]) -> None:
+        """Cross-check the original selection against independent execution PerfStats."""
+        namespace = {row.discovery_rank: row.namespace_pid for row in self.processes}
+        if identities != {rank: namespace[original] for rank, original in enumerate(self.selected)}:
+            raise ValueError('Published discovery selection disagrees with native execution PIDs')
+
+
+def replay_discovery_membership(receipt: dict) -> DiscoveryMembership:
+    """Reconstruct the compact audit witness without a new OS observation."""
+    return DiscoveryMembership(tuple(receipt['selected']),
+                               tuple(DiscoveryBinding(**row) for row in receipt['processes']))
+
+
+def process_namespace(observation: dict, cell: str) -> dict:
+    """Index every serving child by its authenticated observed innermost namespace PID."""
     processes = [p for p in observation['cells'][cell]['processes'] if p['comm'] == 'llaminar2']
     namespace = {}
     for process in processes:
@@ -124,6 +164,40 @@ def bind_native_ranks(perf: dict, observation: dict, cell: str) -> tuple[RankBin
                 pids[0] != process['pid'] or pids[-1] in namespace):
             raise ValueError('Missing or ambiguous host PID namespace identity')
         namespace[pids[-1]] = process
+    return namespace
+
+
+def bind_discovery_membership(lines: Iterable[str], observation: dict, cell: str) -> DiscoveryMembership:
+    """Join each authenticated native discovery member to the immutable cgroup baseline."""
+    pattern = re.compile(r'\[ServerDiscoveryMembership\] schema=1 pid=([1-9][0-9]*) '
+                         r'discovery_rank=([0-9]+) discovery_size=([1-9][0-9]*) selected=([0-9]+(?:,[0-9]+)*)')
+    namespace = process_namespace(observation, cell)
+    rows = []
+    selection = None
+    for line in lines:
+        if '[ServerDiscoveryMembership]' not in line:
+            continue
+        match = pattern.fullmatch(line[line.index('[ServerDiscoveryMembership]'):].strip())
+        if match is None:
+            raise ValueError('Malformed native discovery membership observation')
+        namespace_pid, rank, size = (int(value) for value in match.groups()[:3])
+        selected = tuple(int(value) for value in match[4].split(','))
+        if selection is None:
+            selection = selected
+        if (size != len(namespace) or selected != selection or namespace_pid not in namespace):
+            raise ValueError('Native discovery membership differs from the sealed process roster')
+        process = namespace[namespace_pid]
+        rows.append(DiscoveryBinding(rank, namespace_pid, process['pid'], process['start_ticks']))
+    if selection is None or len(rows) != len(namespace):
+        raise ValueError('Missing native discovery receipt or unexplained serving process')
+    return DiscoveryMembership(selection, tuple(sorted(rows, key=lambda row: row.discovery_rank)))
+
+
+def native_resource_bindings(perf: dict) -> tuple[dict[int, int], dict[int, list[tuple[DeviceBinding, str]]]]:
+    """Extract typed rank PID and participant identities from startup PerfStats."""
+    size = natural(perf['world_size'], 'world size')
+    if not size:
+        raise ValueError('Missing execution communicator')
     identities, participants = {}, {}
     for row in perf['records']:
         if row.get('domain') != 'server' or row.get('name') not in ('process_identity', 'execution_participant'):
@@ -153,9 +227,33 @@ def bind_native_ranks(perf: dict, observation: dict, cell: str) -> tuple[RankBin
             raise ValueError('GPU inventory has no usable native UUID')
         if not re.fullmatch(r'[0-9a-f]{4,8}:[0-9a-f]{2}:[01][0-9a-f]\.[0-7]', pci):
             raise ValueError('GPU inventory has no complete canonical PCI endpoint')
-        if device.startswith('CUDA:'):
-            physical = 'GPU-' + '-'.join((uuid[:8], uuid[8:12], uuid[12:16], uuid[16:20], uuid[20:]))
-            inventory = [d for d in observation['cuda']['devices'] if d['uuid'] == physical]
+        physical = ('GPU-' + '-'.join((uuid[:8], uuid[8:12], uuid[12:16], uuid[16:20], uuid[20:]))
+                    if device.startswith('CUDA:') else pci)
+        participants.setdefault(rank, []).append((DeviceBinding(device, physical), pci))
+    if set(identities) != set(range(size)) or len(set(identities.values())) != size:
+        raise ValueError('Native process identity does not cover the authenticated ranks')
+    return identities, participants
+
+
+def bind_native_ranks(perf: dict, observation: dict, cell: str,
+                      discovery: DiscoveryMembership | None = None) -> tuple[RankBinding, ...]:
+    """Join server-authored rank/PID/PCI identity to one sealed host observation.
+
+    Linux NSpid lists the host PID first and the innermost namespace PID last.
+    The server emits getpid() in that namespace, while the observer supplies the
+    start ticks. This also works for a singleton launched without mpirun. Neither
+    environment rank variables nor PID/GPU enumeration order select an owner.
+    """
+    size = natural(perf['world_size'], 'world size')
+    if not size:
+        raise ValueError('Missing execution communicator')
+    namespace = process_namespace(observation, cell)
+    identities, participants = native_resource_bindings(perf)
+    for bindings in participants.values():
+        for binding, pci in bindings:
+            if not binding.device.startswith('CUDA:'):
+                continue
+            inventory = [d for d in observation['cuda']['devices'] if d['uuid'] == binding.physical_id]
             if len(inventory) != 1:
                 raise ValueError('Native UUID is absent from NVML inventory')
             # NVML pads the domain to eight digits; Linux normally uses four.
@@ -164,14 +262,38 @@ def bind_native_ranks(perf: dict, observation: dict, cell: str) -> tuple[RankBin
             address = f'{int(domain, 16):04x}:{endpoint}'
             if address != pci:
                 raise ValueError('Native UUID and NVML PCI endpoint disagree')
-        else:
-            physical = pci
-        participants.setdefault(rank, []).append(DeviceBinding(device, physical))
-    if set(identities) != set(range(size)) or set(identities.values()) != set(namespace) or len(namespace) != size:
+    if discovery:
+        discovery.require_execution_pids(identities)
+        observed = {(pid, row['pid'], row['start_ticks']) for pid, row in namespace.items()}
+        if observed != {(row.namespace_pid, row.pid, row.start_ticks) for row in discovery.processes}:
+            raise ValueError('Sealed discovery process lifetime changed')
+    elif set(identities.values()) != set(namespace) or len(namespace) != size:
         raise ValueError('Native process identity does not cover the authenticated ranks')
     return tuple(RankBinding(rank, namespace[identities[rank]]['pid'],
         namespace[identities[rank]]['start_ticks'],
-        tuple(sorted(participants.get(rank, []), key=lambda d: d.device))) for rank in range(size))
+        tuple(sorted((item for item, _ in participants.get(rank, [])), key=lambda item: item.device)))
+        for rank in range(size))
+
+
+def replay_native_ranks(perf: dict, saved: list[dict],
+                        discovery: DiscoveryMembership | None = None) -> tuple[RankBinding, ...]:
+    """Bind the compact host PID/start witnesses to exact native rank/device evidence."""
+    identities, participants = native_resource_bindings(perf)
+    ranks = tuple(RankBinding(row['rank'], row['pid'], row['start_ticks'],
+                    tuple(DeviceBinding(**device) for device in row['devices'])) for row in saved)
+    if (len(ranks) != len(identities) or {rank.rank for rank in ranks} != identities.keys()
+            or len({rank.pid for rank in ranks}) != len(ranks)):
+        raise ValueError('Saved resources do not cover exact native process ranks')
+    if discovery:
+        discovery.require_execution_pids(identities)
+        original = {row.discovery_rank: (row.pid, row.start_ticks) for row in discovery.processes}
+        if any((rank.pid, rank.start_ticks) != original[discovery.selected[rank.rank]] for rank in ranks):
+            raise ValueError('Saved execution rank differs from original discovery lifetime')
+    for rank in ranks:
+        native = [item for item, _ in participants.get(rank.rank, [])]
+        if len(rank.devices) != len(native) or set(rank.devices) != set(native):
+            raise ValueError('Saved resource device differs from native execution participant')
+    return ranks
 
 
 @dataclass(frozen=True)
@@ -197,16 +319,84 @@ class WorkloadWindow:
             raise ValueError('Resource observation requires the native page size')
 
 
-def observation_metrics(observation: dict, cell: str, ranks: tuple[RankBinding, ...]) -> tuple[dict, dict]:
+def replay_inactive_envelope(membership: DiscoveryMembership, baseline: dict, growth: dict,
+                             window: WorkloadWindow) -> set[str]:
+    """Authenticate every archived idle-rank metric and its zero-admission ceiling."""
+    idle = {row.discovery_rank for row in membership.inactive()}
+    host = {f'discovery/{rank}/anonymous_and_swap' for rank in idle}
+    if set(key for key in baseline if key.endswith('/anonymous_and_swap')) != host:
+        raise ValueError('Inactive discovery allocation baseline omitted a process')
+    for key, value in baseline.items():
+        parts = key.split('/')
+        if (len(parts) < 3 or parts[0] != 'discovery' or not parts[1].isdecimal()
+                or int(parts[1]) not in idle):
+            raise ValueError('Discovery resource belongs to an unknown or active rank')
+        kind = '/'.join(parts[2:])
+        if kind != 'anonymous_and_swap' and not re.fullmatch(
+                r'CUDA/GPU-[0-9a-fA-F-]{36}|ROCm/[0-9a-f]{4,8}:[0-9a-f]{2}:[01][0-9a-f]\.[0-7]/[0-9]+/(?:vram|gtt)|KFD/vram_[0-9]+',
+                kind):
+            raise ValueError('Unknown inactive discovery allocation metric')
+        resolution = 1024**2 if kind.startswith('CUDA/') else window.page_size_bytes
+        ceiling = natural(value, key) + resolution - 1
+        if growth['maximum_bytes'].get(key) != ceiling:
+            raise ValueError('Inactive discovery process received an execution growth allowance')
+    return set(baseline)
+
+
+def inactive_resource_metrics(observation: dict, process: dict, original_rank: int) -> dict[str, int]:
+    """Account for discovery startup backing without granting any execution PMA allowance."""
+    prefix = f'discovery/{original_rank}/'
+    status = process['status']
+    metrics = {prefix + 'anonymous_and_swap':
+               natural(status['RssAnon'], 'anonymous RSS') + natural(status['VmSwap'], 'process swap')}
+    clients = set()
+    for row in process['drm_clients']:
+        pci, client = row['drm-pdev'], row['drm-client-id']
+        if (not re.fullmatch(r'[0-9a-f]{4,8}:[0-9a-f]{2}:[01][0-9a-f]\.[0-7]', pci)
+                or not client.isdecimal() or (pci, client) in clients):
+            raise ValueError('Invalid discovery ROCm DRM observation')
+        clients.add((pci, client))
+        # Mapping aliases remain separate bounded metrics, never summed as physical bytes.
+        for field in ('vram', 'gtt'):
+            key = prefix + f'ROCm/{pci}/{client}/{field}'
+            metrics[key] = natural(row[f'drm-total-{field}_bytes'], key)
+    for counter, value in process.get('kfd', {}).items():
+        if re.fullmatch(r'vram_[0-9]+', counter):
+            key = prefix + 'KFD/' + counter
+            metrics[key] = natural(value, key)
+    for row in observation.get('cuda', {}).get('processes', []):
+        if row['pid'] != process['pid']:
+            continue
+        key = prefix + 'CUDA/' + row['gpu_uuid']
+        if key in metrics:
+            raise ValueError('Duplicate discovery NVML process/device observation')
+        metrics[key] = natural(row['used_gpu_memory_bytes'], key)
+    return metrics
+
+
+def observation_metrics(observation: dict, cell: str, ranks: tuple[RankBinding, ...],
+                        discovery: DiscoveryMembership | None = None) -> tuple[dict, dict]:
     """Read exact process/GPU measurements without summing shared host mappings."""
     row = observation['cells'][cell]
     if observation.get('schema_version') != 2 or observation.get('errors') or row.get('errors'):
         raise ValueError('OS resource observation failed or has an unknown schema')
     processes = [p for p in row['processes'] if p['comm'] == 'llaminar2']
-    if ({p['pid'] for p in processes} != {r.pid for r in ranks}
-            or len(processes) != len(ranks)):
+    expected = ([(row.pid, row.start_ticks) for row in discovery.processes] if discovery else
+                [(rank.pid, rank.start_ticks) for rank in ranks])
+    if {row['pid'] for row in processes} != {pid for pid, _ in expected} or len(processes) != len(expected):
         raise ValueError('Missing, replaced or duplicate inference process')
+    if {(row['pid'], row['start_ticks']) for row in processes} != set(expected):
+        raise ValueError('Inference PID was reused')
+    if discovery:
+        namespaces = process_namespace(observation, cell)
+        observed = {(pid, row['pid'], row['start_ticks']) for pid, row in namespaces.items()}
+        if observed != {(row.namespace_pid, row.pid, row.start_ticks) for row in discovery.processes}:
+            raise ValueError('Original discovery namespace binding changed')
     metrics, diagnostic = {}, {'processes': {}, 'archive': row.get('archive'), 'cgroup': row.get('ram')}
+    if discovery:
+        for owner in discovery.inactive():
+            process = next(p for p in processes if p['pid'] == owner.pid)
+            metrics.update(inactive_resource_metrics(observation, process, owner.discovery_rank))
     for rank in ranks:
         process = next(p for p in processes if p['pid'] == rank.pid)
         if process['start_ticks'] != rank.start_ticks:
@@ -245,7 +435,8 @@ def observation_metrics(observation: dict, cell: str, ranks: tuple[RankBinding, 
 
 def assess_observations(*, observations: Iterable[dict], perf: dict, cell: str,
                         container_id: str, boot_id: str,
-                        window: WorkloadWindow, cache_capacity: dict[str, int]) -> dict:
+                        window: WorkloadWindow, cache_capacity: dict[str, int],
+                        discovery: DiscoveryMembership | None = None) -> dict:
     """Replay a complete workload without changing its baseline or deleting failures.
 
     Native rank/PID/device binding comes from server startup and OS namespaces,
@@ -256,6 +447,7 @@ def assess_observations(*, observations: Iterable[dict], perf: dict, cell: str,
     failures, gate, previous, covered_finish = [], None, None, False
     ranks: tuple[RankBinding, ...] = ()
     diagnostic_peaks: dict[str, int] = {}
+    discovery_baseline: dict[str, int] = {}
     try:
         allowances = initialized_allowances(perf)
         if not re.fullmatch(r'[0-9a-f]{64}', container_id) or not boot_id:
@@ -285,11 +477,11 @@ def assess_observations(*, observations: Iterable[dict], perf: dict, cell: str,
                 if sample['boot_id'] != boot_id or row['container_id'] != container_id:
                     raise ValueError('Host boot or inference container changed')
                 if gate is None:
-                    ranks = bind_native_ranks(perf, sample, cell)
+                    ranks = bind_native_ranks(perf, sample, cell, discovery)
                     expected = {(r.rank, d.device) for r in ranks for d in r.devices}
                     if {key for key in allowances if not re.fullmatch(r'CPU(?::[0-9]+)?', key[1])} != expected:
                         raise ValueError('Native GPU binding differs from admitted allocator inventory')
-                metrics, diagnostic = observation_metrics(sample, cell, ranks)
+                metrics, diagnostic = observation_metrics(sample, cell, ranks, discovery)
                 if gate is None:
                     limits = {}
                     for rank in ranks:
@@ -301,9 +493,15 @@ def assess_observations(*, observations: Iterable[dict], perf: dict, cell: str,
                             limits[key] = GrowthLimit(metrics[key], allowances[(rank.rank, device.device)],
                                 1024**2 if device.device.startswith('CUDA:') else window.page_size_bytes,
                                 f'initialized PhysicalMemoryAuthority rank {rank.rank} allocator {device.device}')
+                    discovery_baseline = {key: value for key, value in metrics.items() if key.startswith('discovery/')}
+                    for key, value in discovery_baseline.items():
+                        resolution = 1024**2 if '/CUDA/' in key else window.page_size_bytes
+                        limits[key] = GrowthLimit(value, 0, resolution, 'sealed idle discovery allocation baseline')
                     gate = ResourceGrowthAssertions(identity={'boot': boot_id, 'container': container_id},
                         limits=limits, cache_capacity=cache_capacity,
                         maximum_sample_age_seconds=window.maximum_stats_age_seconds)
+                if {key for key in metrics if key.startswith('discovery/')} != discovery_baseline.keys():
+                    raise ValueError('Inactive discovery allocation roster changed')
                 gate.observe(observed=observed + timestamp(sample['collection_seconds'], 'probe duration'),
                     identity={'boot': sample['boot_id'], 'container': row['container_id']},
                     metrics=metrics, stats=row['stats_observation']['stats'], errors=[])
@@ -333,6 +531,8 @@ def assess_observations(*, observations: Iterable[dict], perf: dict, cell: str,
             'container_id': container_id, 'boot_id': boot_id,
             'window': asdict(window), 'ranks': [asdict(rank) for rank in ranks],
             'growth': result, 'observation_failures': failures,
+            **({'discovery_membership': asdict(discovery), 'discovery_baseline': discovery_baseline}
+               if discovery else {}),
             'diagnostic_peaks': diagnostic_peaks,
             'physical_archive_ownership_audit_required': True}
 

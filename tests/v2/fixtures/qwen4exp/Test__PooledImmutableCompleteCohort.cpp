@@ -9,6 +9,8 @@
  * does not certify captured native execution, traffic or a full model factory.
  */
 #include "PooledImmutableReadGraphFixture.h"
+#include "../../utils/IntentionalFaultProcess.h"
+#include <csignal>
 #include "execution/qwen4exp/PooledImmutableCompleteCohort.h"
 #include "collective/OriginalNativeGraphCaptureGroup.h"
 #include "mocks/MockLocalTPContext.h"
@@ -284,7 +286,7 @@ TEST(PooledImmutableCompleteCohort, MissingWrongOrStaleOriginalParticipantsRejec
 }
 TEST(PooledImmutableCompleteCohort, ExternalLastBindingCannotReleaseAnActiveOriginalCapture) {
     CohortPrograms programs({{{2},q::adaptive_lookup::None,DeviceType::CUDA,0,1}});
-    EXPECT_DEATH({CohortCase c({2});c.bind();c.admit(1);c.binding.reset();},"terminate");
+    EXPECT_EXIT({llaminar2::test::disableIntentionalFaultCoreDump();CohortCase c({2});c.bind();c.admit(1);c.binding.reset();},::testing::KilledBySignal(SIGABRT),"terminate");
     CohortCase c({2});c.bind();std::weak_ptr<SourceGraphCase> owner=c.original;auto alias=c.binding;
     c.binding.reset();c.admit(1);c.terminalJoin();c.original.reset();c.source={};c.remotes.clear();c.terminal={};
     EXPECT_FALSE(owner.expired());alias.reset();EXPECT_TRUE(owner.expired());
@@ -501,7 +503,7 @@ TEST(PooledImmutableCompleteCohort, ExpiredWeakOwnerCannotReplaceOriginalRetirem
 
 TEST(PooledImmutableCompleteCohort, FinalOwnerCannotBlockItsOriginalParticipatingWorker) {
     CohortPrograms programs({{{2},q::adaptive_lookup::None,DeviceType::CUDA,0,1}});
-    EXPECT_DEATH({CohortCase c({2});c.bind();auto worker=c.source.worker;worker->submitAndWait([&]{c.binding.reset();});},"terminate");
+    EXPECT_EXIT({llaminar2::test::disableIntentionalFaultCoreDump();CohortCase c({2});c.bind();auto worker=c.source.worker;worker->submitAndWait([&]{c.binding.reset();});},::testing::KilledBySignal(SIGABRT),"terminate");
 }
 
 TEST(PooledImmutableCompleteCohort, QueuedOppositeSourceAdmissionsAndFailureNeverWaitForPeers) {

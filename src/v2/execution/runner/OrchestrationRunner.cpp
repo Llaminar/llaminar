@@ -17920,7 +17920,9 @@ namespace llaminar2
         local_tp_ctx_ = createLocalTPContext(
             plan_.local_tp_devices,
             plan_.local_tp_weights,
-            plan_.local_tp_backend);
+            plan_.local_tp_backend,
+            config_.moe_routed_expert_plan && config_.moe_routed_expert_plan->usesQFNMI50TP4()
+                ? RankOrderedQuotePolicy::MeasuredDomain : RankOrderedQuotePolicy::ExplicitOnly);
         if (!local_tp_ctx_)
         {
             return setError("Failed to create LOCAL TP context");

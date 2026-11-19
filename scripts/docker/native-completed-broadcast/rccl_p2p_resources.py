@@ -27,7 +27,13 @@ def owned_record_files(allocation_root, library, architectures, producer):
             producer.get("resource_evidence_complete") is True and
             producer.get("architectures") == architectures,
             "Owned-entry audit changed its original final-allocation configuration")
-    require(Path(spec["library"]).resolve(strict=True) == library.resolve(strict=True) and
+    # Installation copies the authenticated DSO out of its linker output tree.
+    # Preserve that original path for partition ownership, and bind both files
+    # to the parent's exact byte identity instead of requiring one inode/path.
+    expected = producer.get("library_sha256")
+    require(isinstance(expected, str) and
+            hashlib.sha256(Path(spec["library"]).read_bytes()).hexdigest() == expected and
+            hashlib.sha256(library.read_bytes()).hexdigest() == expected and
             Path(spec["record_root"]).resolve(strict=True) == allocation_root.resolve(strict=True),
             "Owned-entry records belong to a different original output")
     artifact_path = Path(__file__).resolve().parents[1] / "llvm-lto-linker/artifact.py"

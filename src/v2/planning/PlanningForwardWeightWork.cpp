@@ -137,8 +137,8 @@ namespace llaminar2
         WeightRole role, size_t token_rows) const
     {
         (void)projectionMatrix(role); // Authenticate the semantic source before pricing its population.
-        if (projection_ownership && projection_ownership->projection(role).residence !=
-                MoEProjectionResidence::ExpertOwner)
+        if (projection_ownership && projection_ownership->hasMovableProjectionSet() &&
+            projection_ownership->projection(role).residence != MoEProjectionResidence::ExpertOwner)
             return PlanningExpertExecutionShare(PlanningExpertExecution::ReplicatedExperts, expert_count)
                 .uniformExpectation(expert_count, routes_per_token, token_rows);
         return uniformExpectation(token_rows);
@@ -157,7 +157,8 @@ namespace llaminar2
         std::vector<PlanningExpertExecutionShare> executionShares(
             const AdmittedOrchestrationCandidate &candidate, const DevicePlanConfig &device,
             const std::optional<AdmittedMoELayerView> &overlay, std::span<const MoEOverlayBoundTierParticipant> participants, int layer,
-            int model_experts, size_t ordinary_experts, PlanningMainForwardPhase phase)
+            int model_experts, size_t ordinary_experts, PlanningMainForwardPhase phase,
+            std::optional<MoEExpertProjectionOwnership> &projection_ownership)
         {
             if (!overlay)
             {
@@ -191,6 +192,32 @@ namespace llaminar2
                 if (domain->routed_compute_policy == RoutedExpertComputePolicy::Apportioned ||
                     domain->routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
                     result.emplace_back(PlanningExpertExecution::OwnedExperts, copies);
+                else if (domain->routed_compute_policy == RoutedExpertComputePolicy::TensorSharded)
+                {
+                    if (!device.device.is_gpu() || device.routed_compute_policy != domain->routed_compute_policy ||
+                        domain->scope != ExecutionDomainScope::RANK_LOCAL || domain->owner_rank != device.world_rank ||
+                        plan.routed_tiers.size() != 1 || tier.domain != plan.continuation_domain ||
+                        tier.domain != plan.shared_expert_domain ||
+                        candidate.config().moe_rebalance.mode != MoERebalanceRuntimeMode::Off ||
+                        copies != model_experts || copies != quota->live_experts_per_layer.at(layer_index) ||
+                        projection_ownership)
+                        throw std::logic_error("Static GPU tensor-shard work requires its complete original admitted cohort");
+                    const auto &cohort = quota->shard_cohorts.at(layer_index);
+                    const auto coordinate = participant.domain_participant_index;
+                    if (!cohort || cohort->source().layer_idx != layer ||
+                        cohort->participants().size() != domain->participants.size() ||
+                        coordinate < 0 || static_cast<size_t>(coordinate) >= cohort->participants().size())
+                        throw std::logic_error("Tensor-shard work has no original admitted layer fragment");
+                    const auto &member = cohort->participants()[coordinate];
+                    if (member.participant_id != participant.participant_id || member.world_rank != device.world_rank ||
+                        member.address != domain->participants[coordinate] || member.address.toLocalDeviceId() != device.device)
+                        throw std::logic_error("Tensor-shard work has a foreign admitted participant");
+                    projection_ownership = cohort->ownership(coordinate);
+                    // Each fragment executes every routed expert selected on
+                    // this row. Within-expert N/K, rather than row count, is
+                    // the partition represented by its physical admission.
+                    result.emplace_back(PlanningExpertExecution::ReplicatedExperts, copies);
+                }
                 else if (domain->routed_compute_policy == RoutedExpertComputePolicy::Replicated)
                 {
                     if (copies != quota->live_experts_per_layer.at(layer_index))
@@ -356,7 +383,14 @@ namespace llaminar2
                 if (!continuation) return;
                 if (role == WeightRole::Embedding && !device.owns_embedding) return;
                 if (planningTerminalWeight(role, tensor.layer_index) && !head) return;
-                const bool complete = role == WeightRole::Embedding ? full_embedding : role == WeightRole::LMHead ? full_head : full_decode;
+                // Static F-shard graphs bind the original shared triplet
+                // from their TP partition, including when dense decode uses
+                // full replicas for the other operands.
+                const bool shared_fragment = device.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
+                    (role == WeightRole::SharedExpertGate || role == WeightRole::SharedExpertUp ||
+                     role == WeightRole::SharedExpertDown);
+                const bool complete = role == WeightRole::Embedding ? full_embedding :
+                    role == WeightRole::LMHead ? full_head : full_decode && !shared_fragment;
                 work.ordinary.push_back(classify(operand(view, role, complete)));
             };
             // Global roles and each owned layer preserve their original local
@@ -379,11 +413,11 @@ namespace llaminar2
                 const auto &down = *triplet[2]->geometry.matrix();
                 if (gate != up || gate.rows != down.columns || gate.columns != down.rows)
                     throw std::invalid_argument("Incompatible routed FFN projection geometry at layer " + std::to_string(layer));
-                work.routed.push_back({layer, profile.expert_count, profile.expert_used_count,
-                    {std::move(*triplet[0]), std::move(*triplet[1]), std::move(*triplet[2])},
-                    executionShares(candidate, device, overlay, participants, layer, profile.expert_count,
-                        overlay ? 0 : ordinary_expert_counts.at(layer), phase)});
-                auto &routed_work = work.routed.back();
+                auto &routed_work = work.routed.emplace_back(layer, profile.expert_count, profile.expert_used_count,
+                    std::array{std::move(*triplet[0]), std::move(*triplet[1]), std::move(*triplet[2])});
+                routed_work.execution_shares = executionShares(candidate, device, overlay, participants, layer,
+                    profile.expert_count, overlay ? 0 : ordinary_expert_counts.at(layer), phase,
+                    routed_work.projection_ownership);
                 const auto *ownership = device.weight_residency.projectionOwnership();
                 if (device.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
                 {
@@ -411,6 +445,9 @@ namespace llaminar2
                     routed_work.projection_ownership = MoEExpertProjectionOwnership::gateUpOwnedDownColumns(
                         {profile.expert_count, static_cast<int>(gate.columns), static_cast<int>(gate.rows)},
                         endpoint->domain_participant_index, static_cast<int>(domain->participants.size()));
+                }
+                if (routed_work.projection_ownership)
+                {
                     if (ownership && *ownership != *routed_work.projection_ownership)
                         throw std::logic_error("Projection work and explicit prepared residency disagree");
                     for (auto role : {WeightRole::MoEExpertGate, WeightRole::MoEExpertUp, WeightRole::MoEExpertDown})

@@ -21,6 +21,7 @@
 #include "execution/global_pp/GlobalPPRankPlanBuilder.h"
 #include "config/OrchestrationConfigParser.h"
 #include "config/OrchestrationStartupPolicy.h"
+#include "utils/DebugEnv.h"
 #include <algorithm>
 #include <functional>
 #include <stdexcept>
@@ -28,6 +29,49 @@
 
 namespace llaminar2
 {
+    LocalGPUExpertKernelPolicy selectLocalGPUExpertKernelPolicy(
+        const MoERoutedExpertPlacementPlan &plan, const ModelMemoryProfile &model, const ClusterInventory &inventory,
+        bool whole_model, MoERebalanceRuntimeMode rebalance_mode, RoutedExpertComputePolicy requested_compute)
+    {
+        using Policy = LocalGPUExpertKernelPolicy;
+        if (!whole_model || rebalance_mode != MoERebalanceRuntimeMode::Off ||
+            !model.flash_next || model.d_model != 2560 || model.expert_count != 512 ||
+            model.expert_used_count != 10 || model.expert_feed_forward_length != 640 ||
+            model.expert_shared_feed_forward_length != 640 ||
+            plan.domains.size() != 1 || plan.routed_tiers.size() != 1 || plan.shared_expert_domain != plan.continuation_domain ||
+            plan.effectiveBaseModelDomain() != plan.continuation_domain ||
+            plan.routed_tiers.front().domain != plan.continuation_domain)
+            return Policy::Generic;
+
+        const auto domain = std::find_if(plan.domains.begin(), plan.domains.end(),
+            [&](const auto &entry) { return entry.name == plan.continuation_domain; });
+        const bool maySelectTensorSharded = requested_compute == RoutedExpertComputePolicy::TensorSharded ||
+            requested_compute == RoutedExpertComputePolicy::Automatic;
+        if (!maySelectTensorSharded || domain == plan.domains.end() || domain->scope != ExecutionDomainScope::RANK_LOCAL ||
+            (domain->routed_compute_policy != RoutedExpertComputePolicy::TensorSharded &&
+             (requested_compute != RoutedExpertComputePolicy::Automatic ||
+              domain->routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns)) ||
+            domain->owner_rank < 0 || static_cast<size_t>(domain->owner_rank) >= inventory.ranks.size() ||
+            domain->participants.size() != 4 || !domain->world_ranks.empty())
+            return Policy::Generic;
+
+        // Binding authenticates the devices of a rank-local domain against
+        // its single owner. Only cross-rank domains carry a participant map.
+        const auto &rank = inventory.getRank(domain->owner_rank);
+        const auto isMeasuredMI50 = [&](const auto &endpoint) {
+            const auto device = endpoint.toLocalDeviceId();
+            if (!device.is_rocm()) return false;
+            const auto gpu = std::find_if(rank.gpus.begin(), rank.gpus.end(), [&](const auto &candidate) {
+                return candidate.type == DeviceType::ROCm && candidate.local_device_id == device.ordinal;
+            });
+            if (gpu == rank.gpus.end() || gpu->compute_units != 60) return false;
+            const std::string_view target(gpu->native_isa);
+            return target.substr(0, target.find(':')) == "gfx906";
+        };
+        return std::all_of(domain->participants.begin(), domain->participants.end(), isMeasuredMI50)
+            ? Policy::QFNMI50TP4 : Policy::Generic;
+    }
+
     namespace
     {
         /**
@@ -49,15 +93,45 @@ namespace llaminar2
          * @param config Private working copy; the caller's request is never edited.
          * @param inventory Observed rank and device ownership in this namespace.
          * @param origin Explicit declaration or model-driven LocalTP synthesis.
+         * @param model Original model geometry.
+         * @param whole_model Whether this binds an unsplit model instead of a projected PP child.
          * @throws std::invalid_argument when binding or normalization fails.
          */
         void bindOverlay(OrchestrationConfig &config, const ClusterInventory &inventory,
-                         MoEExpertOverlayPlanInstallOrigin origin)
+                         MoEExpertOverlayPlanInstallOrigin origin,
+                         const ModelMemoryProfile &model, bool whole_model)
         {
             if (!config.moe_routed_expert_plan || !config.moe_routed_expert_plan->usesExpertOverlayAuthority())
                 return;
             auto bound = bindMoEExpertOverlayPlanToClusterInventory(*config.moe_routed_expert_plan, inventory,
                 resolvedMoEOverlayDiagnosticPrefillTransport());
+            using Compute = RoutedExpertComputePolicy;
+            const auto &requested = *config.moe_routed_expert_plan;
+            const auto requested_domain = std::find_if(requested.domains.begin(), requested.domains.end(),
+                [&](const auto &domain) { return domain.name == requested.continuation_domain; });
+            auto compute = requested_domain == requested.domains.end()
+                ? Compute::Unspecified : requested_domain->routed_compute_policy;
+            if (compute == Compute::Unspecified)
+                compute = config.routed_expert_compute_policy;
+            // Simple TP synthesis cannot author tensor-sharded residency.
+            // Keep the measured policy on its original, named tier authority.
+            bound->local_gpu_expert_kernel_policy = selectLocalGPUExpertKernelPolicy(
+                *bound, model, inventory,
+                origin == MoEExpertOverlayPlanInstallOrigin::UserDeclaredDomains &&
+                    whole_model && config.pp_degree == 1 && config.cpu_layers == 0,
+                config.moe_rebalance.mode, compute);
+            if (bound->usesQFNMI50TP4() && compute == Compute::Automatic)
+            {
+                for (auto &domain : bound->domains)
+                    if (domain.name == bound->continuation_domain)
+                        domain.routed_compute_policy = Compute::TensorSharded;
+                for (auto &domain : bound->dense_domains)
+                    if (domain.name == bound->continuation_domain)
+                        domain.routed_compute_policy = Compute::TensorSharded;
+            }
+            const int preferred = qfnGPUExpertPreferredIntermediateGrain(bound->usesQFNMI50TP4() ? 32 : 128);
+            bound->gpu_expert_intermediate_tiling = preferred == 32 ? GPUExpertIntermediateTiling::BalancedNativeK32
+                                                                   : GPUExpertIntermediateTiling::Coarse128;
             requireValid(installResolvedMoEExpertOverlayPlan(config, std::move(bound), origin),
                          "Cannot install hardware-resolved ExpertOverlay topology");
         }
@@ -294,7 +368,8 @@ namespace llaminar2
         auto config = requested;
         resolveMTPStartupPolicy(config, model.memoryProfile());
         const auto geometry = model.executionModelConfig();
-        bindOverlay(config, inventory, MoEExpertOverlayPlanInstallOrigin::UserDeclaredDomains);
+        bindOverlay(config, inventory, MoEExpertOverlayPlanInstallOrigin::UserDeclaredDomains,
+            model.memoryProfile(), true);
         requireValid(builder.validateConfig(config, geometry, inventory), "Configuration validation failed");
         auto rank_plan = builder.buildPlanForRank(config, geometry, inventory, rank);
         // Install authored output demand before immutable child rank projections.
@@ -393,7 +468,8 @@ namespace llaminar2
                 // an explicit domain override of the parent scalar setting.
                 stage_config.routed_expert_compute_policy =
                     stage_config.moe_routed_expert_plan->domains.front().routed_compute_policy;
-                bindOverlay(stage_config, inventory, MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP);
+                bindOverlay(stage_config, inventory, MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP,
+                    model.memoryProfile(), false);
                 auto execution = resolveMoEExpertOverlayExecutionPlan(stage_config.moe_routed_expert_plan,
                     {.current_world_rank = rank, .world_size = inventory.world_size});
                 applyOverlayRole(stage_rank, *stage_config.moe_routed_expert_plan, execution);
@@ -444,7 +520,8 @@ namespace llaminar2
                 // must not leak into child runtime/graph preparation.
                 stage_config.routed_expert_compute_policy =
                     stage_config.moe_routed_expert_plan->domains.front().routed_compute_policy;
-                bindOverlay(stage_config, inventory, MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP);
+                bindOverlay(stage_config, inventory, MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP,
+                    model.memoryProfile(), false);
                 auto execution = resolveMoEExpertOverlayExecutionPlan(stage_config.moe_routed_expert_plan,
                     {.current_world_rank = rank, .world_size = inventory.world_size});
                 applyOverlayRole(stage_rank, *stage_config.moe_routed_expert_plan, execution);
@@ -475,7 +552,8 @@ namespace llaminar2
         {
             // Synthesis changes the declarative domain inventory. Recompile
             // once before sealing; no consumer may retain the preliminary view.
-            bindOverlay(config, inventory, MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP);
+            bindOverlay(config, inventory, MoEExpertOverlayPlanInstallOrigin::SynthesizedSimpleTP,
+                model.memoryProfile(), true);
             requireValid(builder.validateConfig(config, geometry, inventory), "Implicit ExpertOverlay validation failed");
             rank_plan = builder.buildPlanForRank(config, geometry, inventory, rank);
             rank_plan.runtime.ordinary_terminal_projection = terminal_projection;

@@ -8,6 +8,7 @@
  * both the removed success conversion and the required fatal outcome. Normal
  * deliberate _exit(result) policy remains distinct from fault qualification.
  */
+#include "../../utils/IntentionalFaultProcess.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <csignal>
@@ -15,7 +16,7 @@
 #include <iterator>
 #include <regex>
 #include <string>
-#include <sys/resource.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 namespace
@@ -23,12 +24,6 @@ namespace
     /** @brief Original negative control: a teardown fault was reported as successful exit. */
     void originalCleanupSuccessHandler(int) { ::_exit(0); }
 
-    /** @brief Keep deliberate signal probes from generating filesystem core payloads. */
-    void disableCorePayload()
-    {
-        const rlimit limit{0, 0};
-        if (setrlimit(RLIMIT_CORE, &limit) != 0) ::_exit(98);
-    }
 }
 
 /** @test Actual canonical source ownership excludes every former signal interception path. */
@@ -65,16 +60,18 @@ TEST(GPUCleanupFailureQualification, RealSignalsCannotQualifyAsSuccessfulCleanup
     {
         SCOPED_TRACE(signal_number);
         EXPECT_EXIT({
-            disableCorePayload();
+            llaminar2::test::disableIntentionalFaultCoreDump();
             std::signal(signal_number, originalCleanupSuccessHandler);
             std::raise(signal_number);
             ::_exit(99);
         }, ::testing::ExitedWithCode(0), "");
         EXPECT_EXIT({
-            disableCorePayload();
+            llaminar2::test::disableIntentionalFaultCoreDump();
             std::signal(signal_number, SIG_DFL);
             std::raise(signal_number);
             ::_exit(99);
-        }, ::testing::KilledBySignal(signal_number), "");
+        }, [=](int status) {
+            return WIFSIGNALED(status) && WTERMSIG(status) == signal_number && !WCOREDUMP(status);
+        }, "");
     }
 }

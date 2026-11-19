@@ -268,6 +268,9 @@ void cudaHCResidualDownQ8Projection(const GPUHCResidualDownPublication& args,voi
  * @param tables Original cold generation-bound native IQ tables.
  */
 void rocmHCResidualDownQ8Projection(const GPUHCResidualDownPublication& args,void* stream,NativeEmbeddingIQTables tables);
+/** @brief Same native graph entry with a cold-admitted grouped HC-up default. */
+void rocmHCResidualDownQ8ProjectionWithPolicy(const GPUHCResidualDownPublication& args,void* stream,
+    NativeEmbeddingIQTables tables,bool grouped_short_k_default);
 /** @brief Launch CUDA publication and paired integer dots on an exact non-default stream.
  * @param args Prepared source, admitted scratch and borrowed live geometry.
  * @param stream Exact ordered native CUDA stream; null/default is rejected.

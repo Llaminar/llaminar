@@ -16,6 +16,7 @@
 
 #include "config/ExecutionDomainDefinition.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "execution/moe/MoEOverlayAuthorityExecution.h"
 #include "execution/moe/MoEOverlayNodeLocalRouteTransport.h"
 #include "execution/moe/MoEOverlayReplicaCacheCapacity.h"
@@ -408,6 +409,15 @@ namespace llaminar2
         std::optional<MoEOverlayNodeLocalRouteTransportPolicy> observed_route_transport;
         /** Typed startup diagnostic consumed when the same hardware binding was produced. */
         std::optional<MoEOverlayNodeLocalRouteTransport> observed_route_diagnostic;
+
+        /** @brief Original model and inventory-derived kernel qualification for the local cohort. */
+        LocalGPUExpertKernelPolicy local_gpu_expert_kernel_policy = LocalGPUExpertKernelPolicy::Generic;
+        /** @brief Effective source tiling, including the independent diagnostic override. */
+        GPUExpertIntermediateTiling gpu_expert_intermediate_tiling = GPUExpertIntermediateTiling::Coarse128;
+
+        /** @return Whether the complete immutable QFN MI50 TP4 domain was qualified. */
+        bool usesQFNMI50TP4() const noexcept
+        { return local_gpu_expert_kernel_policy == LocalGPUExpertKernelPolicy::QFNMI50TP4; }
 
         /** Setup-owned replica geometry; absent before admission or without a directory. */
         std::optional<MoEOverlayReplicaCacheCapacity> replica_cache_capacity;

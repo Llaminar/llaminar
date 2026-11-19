@@ -167,8 +167,10 @@ struct OriginalFFNFixtureGeometry {
     bool grouped_matrix_symbol_present=true; ///< Whether the selected production symbol must be present.
     int grouped_matrix_rows=4; ///< Captured physical width of a source-matrix replay.
     bool grouped_matrix_timing=false; ///< Measure the captured M4 parent after byte replay.
+    bool measured_f160_default=false; ///< Replay one device of the pre-admitted QFN MI50 TP4 policy.
     bool held_grouped_epoch=false; ///< Split the original producer/consumer recording at the epoch adversary.
     bool deferred_frontier_history=false; ///< Exercise the original accepted-prefix commit with the two-node publication.
+    bool fixed_condition_row=false; ///< Replay a fully active M1 condition with an unrelated mutable KV history.
     std::size_t frontier_sum_test_extent=0; ///< One deliberately undersized original input lease.
     std::size_t frontier_directory_test_extent=0; ///< Nonzero installs one intentionally invalid cold quote.
 };
@@ -654,7 +656,9 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
     }
     if(hidden_q8!=OriginalM1HiddenQ8FixturePolicy::CountedOriginal&&(rows!=1||grouped))
         throw std::invalid_argument("Original hidden Q8 fixture admits only fully-active ordinary M1");
-    const auto *count = hidden_q8==OriginalM1HiddenQ8FixturePolicy::CountedOriginal
+    const bool fixed_condition = shape.fixed_condition_row && grouped;
+    require(!fixed_condition || rows == 1, "retained condition requires one fully active row");
+    const auto *count = hidden_q8==OriginalM1HiddenQ8FixturePolicy::CountedOriginal && !fixed_condition
         ?static_cast<const int32_t *>(lane->active->gpu_data_ptr()):nullptr;
     lane->owner = std::make_shared<MoERoutedPipelineKernelOwner>();
     if(hidden_q8==OriginalM1HiddenQ8FixturePolicy::FullActiveReuse)
@@ -707,6 +711,8 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
     router.routed_row_execution_policy = RoutedExpertRowExecutionPolicy::IntermediateShardLocal;
     router.collect_device_runtime_histogram = !grouped; router.active_row_count_device = count;
     router.force_decode_equivalent_verifier_prefill = grouped;
+    if(grouped && shape.measured_f160_default)
+        router.verifier_kernel_policy=LocalGPUExpertKernelPolicy::QFNMI50TP4;
     router.force_grouped_verifier_prefill_for_decode = grouped && rows == 1;
     router.grouped_verifier_histogram_role =
         selectMoEGroupedVerifierHistogramRole(grouped,deferred);
@@ -721,6 +727,7 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
     local.family = source.fragment_family; local.runtime = lane->runtime.get(); local.kernel_owner = lane->owner;
     local.rows = rows; local.top_k = kTopK;
     local.row_mode = grouped ? MoEIntermediateShardRowMode::Grouped : MoEIntermediateShardRowMode::Decode;
+    local.verifier_kernel_policy=router.verifier_kernel_policy;
     local.gate_up_publication=gate_up_publication;
     local.down_publication=down_publication;
     local.phase = grouped ? MoEOverlayServicePhaseHint::GroupedVerifier : MoEOverlayServicePhaseHint::Decode;
@@ -799,7 +806,7 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
     // The original finalizer validates one row authority for the complete
     // compute declaration. A fully-active M1 has no counted receipt here.
     finish.final_sum.live_rows=NativeCollectiveRows(*local.live_rows,kH);
-    if(hidden_q8==OriginalM1HiddenQ8FixturePolicy::CountedOriginal)
+    if(count)
         finish.final_sum.live_rows=NativeCollectiveRows(*local.live_rows,kH).withPayloadReceipt(
             static_cast<unsigned long long*>(lane->receipt->gpu_data_ptr()));
     if(lane->sideband)
@@ -808,8 +815,12 @@ std::unique_ptr<Lane> makeLane(int rows, bool grouped, DeviceId device, int memb
             .name = "original_ffn_fixture_sideband"});
     // A source-matrix case declares the expected native symbol independently of the
     // width. Two GGUF sources can share a decoder ID and require different graphs.
-    const bool expectFrontier=shape.grouped_matrix_symbol.empty() && grouped && rows==4 && kH==2560 && (shape.routed==128 || (shape.routed==160 && qfnGroupedFFNEqualFrontierOptIn() && qfnGroupedFFNDirectBankExperiment())) && shared_f==160 &&
-        kExperts==512 && kTopK==10 && qfnGroupedFFNFrontierOptIn();
+    const bool measured_frontier = shape.measured_f160_default;
+    const bool equal_frontier = shape.routed == 160 &&
+        qfnGroupedFFNEqualFrontierOptIn(measured_frontier) && qfnGroupedFFNDirectBankExperiment(measured_frontier);
+    const bool expectFrontier = shape.grouped_matrix_symbol.empty() && grouped && rows == 4 && kH == 2560 &&
+        (shape.routed == 128 || equal_frontier) && shared_f == 160 && kExperts == 512 && kTopK == 10 &&
+        qfnGroupedFFNFrontierOptIn(measured_frontier);
     const bool expectFormatProgram=grouped && rows==shape.grouped_matrix_rows && !shape.grouped_matrix_symbol.empty() &&
         shape.grouped_matrix_symbol_present;
     if(execution==MoEIntermediateShardFFNExecution::Staged && !expectFrontier && !expectFormatProgram)
@@ -1257,8 +1268,9 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                 require(rejected,"one-byte-under acquired-bank scratch must fail before native recording");
             }
             const bool sums=affine_sum_tuple && require_frontier && rows==4 && shape.routed==160 &&
-                qfnGroupedFFNEqualFrontierOptIn() && qfnGroupedFFNDirectBankExperiment() &&
-                rocm::grouped_ffn::exactK32SumsOptIn();
+                qfnGroupedFFNEqualFrontierOptIn(shape.measured_f160_default) &&
+                qfnGroupedFFNDirectBankExperiment(shape.measured_f160_default) &&
+                rocm::grouped_ffn::exactK32SumsOptIn(shape.measured_f160_default);
             if(sums && shape.deferred_frontier_history) {
                 bool rejected=false;
                 try {
@@ -1272,6 +1284,15 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
             if (!shape.grouped_matrix_case.empty())
                 PerfStatsCollector::reset();
             auto candidate = build(rows, true);
+            if (shape.fixed_condition_row)
+            {
+                std::vector<GPUGraphKernelNodeInfo> nodes;
+                std::string error;
+                require(candidate->capture->inspectKernelNodes(nodes, &error), "inspect original condition capture: " + error);
+                require(std::count_if(nodes.begin(), nodes.end(), [](const auto &node) {
+                    return node.name_resolved && node.name.find("rocm_moe_softmax_topk_decode_independent_wave64_kernel") != std::string::npos;
+                }) == 1, "retained condition submits exactly one original independent scalar router");
+            }
 #ifdef HAVE_ROCM
             if(shape.verify_runtime_admission)
                 verifyGroupedFormatRuntimeAdmission(*candidate,*serial->runtime,device);
@@ -1286,12 +1307,16 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                     });
                 };
                 const auto expected=rows==4?1:0;
+                if(shape.measured_f160_default)
+                    require(countSymbol("qfn_grouped_fp16_router_fixed_rows")==1 &&
+                        countSymbol("qfn_grouped_softmax_register_selector_kernel")==1,
+                        "Qualified original FP16 router must select both measured native kernels by default");
                 require(countSymbol("rocm_moe_router_hidden_quantize_q8_rows_and_sums_kernel")==int(sums),
                     "Exact K32 sum router producer does not match cold graph demand");
                 require(countSymbol("groupedFFNPairedGatePublish")==expected &&
                     countSymbol("groupedFFNTokenDown")==expected &&
                     (!expected || (countSymbol("group_small_runtime_kernel")==
-                        (qfnGroupedFFNDirectBankExperiment()?0:1) &&
+                        (qfnGroupedFFNDirectBankExperiment(shape.measured_f160_default)?0:1) &&
                         countSymbol("moe_grouped_swiglu_quantize_prefill_kernel")==0 &&
                         countSymbol("moe_reduce_canonical_route_contributions_kernel")==0)),
                     "Grouped FFN native graph changed original plan multiplicity or selected the wrong geometry");
@@ -1548,7 +1573,8 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
             for (int replay = 0; replay < 20; ++replay)
             {
                 const std::array counts{rows, 0, rows > 1 ? rows - 1 : 0, std::min(1, rows), rows / 2, rows};
-                const int live = epoch && replay==1 ? rows : counts[replay % counts.size()];
+                const int live = shape.fixed_condition_row || (epoch && replay==1)
+                    ? rows : counts[replay % counts.size()];
                 if (replay == 7 || replay == 13)
                     for (const auto &name : candidate->graph.getExecutionOrder())
                         candidate->graph.getNode(name)->stage->resetSessionStatePreservingCapturedReplay();
@@ -1558,8 +1584,9 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                     require(backend->memset(tensor->gpu_data_ptr(), 0xa5, tensor->size_bytes(), device.ordinal, stream), "dirty prior activation bytes");
                 require(backend->hostToDeviceOnStream(candidate->hidden->gpu_data_ptr(), input.data(), input.size() * sizeof(float),
                     device.ordinal, stream), "publish recorded candidate input");
-                require(backend->hostToDeviceOnStream(candidate->active->gpu_data_ptr(), &live, sizeof(live),
-                    device.ordinal, stream), "publish sole device-owned live count");
+                const int row_or_history = shape.fixed_condition_row ? 64 + replay : live;
+                require(backend->hostToDeviceOnStream(candidate->active->gpu_data_ptr(), &row_or_history, sizeof(row_or_history),
+                    device.ordinal, stream), "publish the fixture's device row count or independent KV history");
                 require(backend->memset(candidate->receipt->gpu_data_ptr(), 0, candidate->receipt->size_bytes(),
                     device.ordinal, stream), "reset passive native outgoing-byte receipt");
                 const int sideband = member + 1;
@@ -1671,7 +1698,8 @@ void replayParticipant(DeviceId device, int member, ILocalTPContext &tp, std::ba
                 require(worker.synchronizeStreamChecked(stream), "terminal complete FFN observation join");
                 require(sideband_sum == tp.degree() * (tp.degree() + 1) / 2,
                     "same final FFN collective must preserve original sideband publication even for empty rows");
-                const auto expected_sent = static_cast<unsigned long long>(live) * hidden * sizeof(float) * (tp.degree() - 1);
+                const auto expected_sent = shape.fixed_condition_row ? 0ULL :
+                    static_cast<unsigned long long>(live) * hidden * sizeof(float) * (tp.degree() - 1);
                 require(sent == expected_sent, "one final native FFN sum must send exactly live H rows, including empty prefixes");
                 for (std::size_t element = 0; element < actual.size(); ++element)
                 {
@@ -2368,8 +2396,8 @@ void proveOriginalFinalization(const std::vector<DeviceId> &devices, bool single
                         constexpr std::array default_counts{1,3,kMaxRows};
                         constexpr std::array q8_down_counts{3,4};
                         const bool frontier=qualification==OriginalSourceQualification::GroupedFFNFrontierReplay;
-                        const std::array matrix_counts{shape.grouped_matrix_rows};
-                        const std::span<const int> capacities=(shape.held_grouped_epoch||!shape.grouped_matrix_case.empty())?std::span<const int>{matrix_counts}:
+                        const std::array matrix_counts{shape.fixed_condition_row ? 1 : shape.grouped_matrix_rows};
+                        const std::span<const int> capacities=(shape.fixed_condition_row||shape.held_grouped_epoch||!shape.grouped_matrix_case.empty())?std::span<const int>{matrix_counts}:
                             (frontier||qualification==OriginalSourceQualification::GroupedQ8DownReplay)?
                             std::span<const int>{q8_down_counts}:std::span<const int>{default_counts};
                         replayParticipant(devices[member],member,*tp,rendezvous,banks,original_members[member],
@@ -2554,11 +2582,11 @@ TEST(FullNativeHCFFN,ROCmGroupedFFNHeldEpochReplay)
     },"gfx906",address[0].empty()?std::span<const std::string_view>{}:std::span<const std::string_view>{address});
 }
 
-/** @test Capture the equal shard's three original tuples in static and deferred acceptance modes. */
-TEST(FullNativeHCFFN, ROCmEqualF160GroupedFFNFrontierByteReplay)
+/** @brief Capture all equal-shard original tuples in static and deferred acceptance modes. */
+static void replayEqualF160GroupedFFN(bool measured_default)
 {
-    require(qfnGroupedFFNFrontierOptIn() && qfnGroupedFFNDirectBankExperiment() &&
-        qfnGroupedFFNEqualFrontierOptIn(),"Equal F160 replay requires the three exact production policies");
+    require(qfnGroupedFFNFrontierOptIn(measured_default) && qfnGroupedFFNDirectBankExperiment(measured_default) &&
+        qfnGroupedFFNEqualFrontierOptIn(measured_default),"Equal F160 replay requires the exact production policies");
     const auto sources=sourceFormats(OriginalSourceQualification::ResidentFFN);
     const auto& formats=quantizedVerifierFormats();
     const auto q8=std::find_if(formats.begin(),formats.end(),[](const auto& f){return f.tensor_type==TensorType::Q8_0;});
@@ -2580,11 +2608,45 @@ TEST(FullNativeHCFFN, ROCmEqualF160GroupedFFNFrontierByteReplay)
             for(bool deferred:{false,true}) {
                 SCOPED_TRACE(::testing::Message()<<format.name<<" deferred="<<deferred);
                 const OriginalFFNFixtureGeometry shape{.hidden=2560,.routed=160,.shared=160,.experts=512,.top_k=10,
-                    .router_source=OriginalFFNRouterSource::Dense,.deferred_frontier_history=deferred};
+                    .router_source=OriginalFFNRouterSource::Dense,.measured_f160_default=measured_default,
+                    .deferred_frontier_history=deferred};
                 proveOriginalFinalization(devices,false,OriginalSourceQualification::GroupedFFNFrontierReplay,
                     &format,LocalFFNProgram::Original,shape);
             }
     },"gfx906",address[0].empty()?std::span<const std::string_view>{}:std::span<const std::string_view>{address});
+}
+
+/** @test Keep the explicit frontier and exact-sums diagnostic lanes. */
+TEST(FullNativeHCFFN, ROCmEqualF160GroupedFFNFrontierByteReplay)
+{
+    replayEqualF160GroupedFFN(false);
+}
+
+/** @test Replay the measured MI50 participant with all grouped diagnostics absent. */
+TEST(FullNativeHCFFN, ROCmEqualF160GroupedFFNDefaultByteReplay)
+{
+    for(const auto* option:{"LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER",
+            "LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK","LLAMINAR_QFN_ROCM_GROUPED_FFN_EQUAL_FRONTIER",
+            "LLAMINAR_QFN_ROCM_GROUPED_FFN_ALL_FORMATS","LLAMINAR_QFN_ROCM_GROUPED_FFN_AFFINE_SUMS",
+            "LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS","LLAMINAR_QFN_ROCM_GROUPED_TOPK_REGISTERS"})
+        ASSERT_EQ(std::getenv(option),nullptr);
+    replayEqualF160GroupedFFN(true);
+}
+
+/** @test The captured scalar condition keeps exact serial FFN bytes across history changes and reset. */
+TEST(FullNativeHCFFN, ROCmFixedConditionRowReplay)
+{
+    const auto format = nativeLayoutRouterFFNSource();
+    const OriginalFFNFixtureGeometry shape{
+        .hidden=2560, .routed=160, .shared=160, .experts=512, .top_k=10,
+        .router_source=OriginalFFNRouterSource::Dense, .fixed_condition_row=true,
+    };
+    const char *pci = std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_PCI");
+    const std::array<std::string_view, 1> address{pci ? pci : ""};
+    originalRankLocalReplay(DeviceType::ROCm, 1, [&](const auto &devices) {
+        proveOriginalFinalization(devices, false, OriginalSourceQualification::GroupedFFNSourceMatrix,
+            &format, LocalFFNProgram::Original, shape);
+    }, "gfx906", address[0].empty() ? std::span<const std::string_view>{} : std::span<const std::string_view>{address});
 }
 
 /** @test Both native Q8-down source families keep grouped byte equality through count/reset replay. */
@@ -2712,8 +2774,12 @@ TEST(FullNativeHCFFN, DISABLED_ROCmRetainedProductionTP4Epoch)
         const char* scope=std::getenv("LLAMINAR_TEST_RETAINED_HC_FFN_MOVEMENT_PCIS");
         require(scope&&*scope,"real TP4 epoch requires exact singleton, four-rank target, and singleton PCI groups");
         auto source=realProductionTPInputFromEnv();
-        const auto pci=originalRetainedClosedMovementPCIs(scope);
-        promoted23_replay::run(promoted23_replay::NumericalProgram::FullHCFFNEpoch,pci,
+        const auto mpi=MPIContextFactory::global();
+        require(mpi!=nullptr,"real TP4 movement uses its original MPI context");
+        const auto inventory=mpi->clusterInventory();
+        require(inventory!=nullptr,"real TP4 movement uses actual MPI rank inventory");
+        const auto pci=originalRetainedClosedMovementPCIs(scope,*inventory);
+        promoted23_replay::run(promoted23_replay::NumericalProgram::FullHCFFNEpoch,pci.views(),
             promoted23_replay::EpochSource::GPUNativeRealTP4,&source);
         if(::testing::Test::HasFailure())MPI_Abort(MPI_COMM_WORLD,2);
     } catch(const std::exception& error){ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}

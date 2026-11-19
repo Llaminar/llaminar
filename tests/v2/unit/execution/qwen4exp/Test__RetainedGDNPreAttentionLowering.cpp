@@ -17,6 +17,7 @@
 #include "execution/compute_stages/IGraphOutputDemand.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedGemmKernel.h"
 #include "memory/BufferArena.h"
+#include "utils/DebugEnv.h"
 #include "tensors/Tensors.h"
 #include <algorithm>
 
@@ -136,6 +137,21 @@ struct Fixture
         graph.setTerminalNode("injection");
     }
 };
+
+/** @test Two different participants in one process each retain the policy of their own placement. */
+TEST(RetainedGDNPreAttentionLowering, ParticipantDefaultsAndDiagnosticOverridesRemainIndependent)
+{
+    const auto expected = [](const char *name, bool measured) {
+        const char *value = std::getenv(name);
+        return value ? std::string_view(value) == "1" : measured;
+    };
+    for (const bool measured : {false, true, false, true}) {
+        EXPECT_EQ(qfnRetainedM1HCFFNEnabled(measured),
+                  expected("LLAMINAR_QFN_RETAINED_M1_HC_FFN_CANDIDATE", measured));
+        EXPECT_EQ(qfnRetainedGDNPreAttentionEnabled(measured),
+                  expected("LLAMINAR_QFN_RETAINED_GDN_PREATTENTION", measured));
+    }
+}
 
 /** @test The PMA quote and graph hook agree on phase, device, placement, and scalar geometry. */
 TEST(RetainedGDNPreAttentionLowering, SelectsOnlyTheMeasuredOrdinaryInvocation)

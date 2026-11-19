@@ -830,12 +830,10 @@ namespace
         __builtin_trap();
     }
 
+    // The reason is retained in the trap's debug location. A device printf would
+    // bind a hostcall buffer even when the fatal branch is never entered.
 #define FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(INVARIANT) \
-    do                                                \
-    {                                                 \
-        (void)sizeof(INVARIANT);                       \
-        fail_fast_incomplete_llep_transfer();          \
-    } while (false)
+    __builtin_verbose_trap("Llaminar MoE", INVARIANT)
 
     /**
      * @brief Terminate ROCm execution when verifier history has no route ledger.
@@ -1865,25 +1863,7 @@ namespace
         if (execution_bank <= 1u)
             return execution_bank;
 
-        const auto *const ticket = runtime
-                                       ? runtime->overlay_epoch_ticket
-                                       : nullptr;
-        const auto *const banks = runtime_durable_placement_banks(runtime);
-        printf("runtime_decode_invalid_overlay_ticket "
-               "participant=%u active_bank=%u active_epoch=%u "
-               "ticket_epoch=%llu ticket_selector=%llu "
-               "bank0_epoch=%u bank1_epoch=%u transient=%u\n",
-               runtime ? runtime->participant_id : 0u,
-               runtime ? runtime->active_bank : 0u,
-               runtime ? runtime->active_epoch : 0u,
-               static_cast<unsigned long long>(ticket ? ticket->epoch : 0u),
-               static_cast<unsigned long long>(ticket ? ticket->selector : 0u),
-               banks ? banks[0].epoch : 0u,
-               banks ? banks[1].epoch : 0u,
-               runtime
-                   ? runtime->current_batch_llep_transient_bank_active
-                   : 0u);
-        fail_fast_incomplete_llep_transfer();
+        FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("decode overlay epoch ticket does not select a live placement bank");
         return execution_bank;
     }
 
@@ -16916,11 +16896,11 @@ bool hipMoE_gate_logits_fp32_decode_equivalent_rows(
     return true;
 }
 
-bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
+bool hipMoE_gate_logits_fp16_decode_equivalent_rows_with_policy(
     const float *hidden, const void *gate_weights_fp16, float *logits,
     int seq_len, int d_model, int num_experts,
     int device_idx, void *stream,
-    const int *device_effective_seq_len)
+    const int *device_effective_seq_len, bool qualified_default)
 {
     if (!hidden || !gate_weights_fp16 || !logits || !stream ||
         seq_len <= 0 || d_model <= 0 || num_experts <= 0)
@@ -16935,7 +16915,7 @@ bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
 
     bool fixed_rows = false;
     if (device_effective_seq_len && seq_len >= 2 && seq_len <= 8 &&
-        d_model == 2560 && num_experts == 512 && llaminar2::qfnGroupedFP16RouterFixedRowsOptIn())
+        d_model == 2560 && num_experts == 512 && llaminar2::qfnGroupedFP16RouterFixedRowsOptIn(qualified_default))
     {
         const auto hardware = llaminar2::rocm::nativeQuantisedHardwareForDevice(device_idx);
         fixed_rows = llaminar2::native_quantised::selectVerifierDispatchTable(hardware) ==
@@ -16976,6 +16956,15 @@ bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
         {{"m", std::to_string(seq_len)}, {"d_model", std::to_string(d_model)}, {"num_experts", std::to_string(num_experts)},
          {"activation", "fp16_rne"}, {"weight", "fp16"}, {"accumulation", "fp32"}, {"output", "fp32"}, {"route", "grouped_fixed"}});
     return true;
+}
+
+bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
+    const float *hidden, const void *gate_weights_fp16, float *logits,
+    int seq_len, int d_model, int num_experts,
+    int device_idx, void *stream,
+    const int *device_effective_seq_len)
+{
+    return hipMoE_gate_logits_fp16_decode_equivalent_rows_with_policy(hidden, gate_weights_fp16, logits, seq_len, d_model, num_experts, device_idx, stream, device_effective_seq_len, false);
 }
 
 bool hipMoE_gate_logits_bf16_decode_equivalent_rows(
@@ -17769,14 +17758,14 @@ bool hipMoE_softmax_topk_decode_unique_owner_wave64(
     return true;
 }
 
-bool hipMoE_softmax_topk_decode_equivalent_rows(
+bool hipMoE_softmax_topk_decode_equivalent_rows_with_policy(
     float *logits,
     float *expert_indices, float *expert_weights,
     int seq_len, int num_experts, int top_k,
     bool normalize_weights,
     int device_idx, void *stream,
     const int *device_effective_seq_len,
-    void *deferred_selected_route_ledger)
+    void *deferred_selected_route_ledger, bool qualified_default)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
@@ -17796,7 +17785,7 @@ bool hipMoE_softmax_topk_decode_equivalent_rows(
     bool use_register_selector = false;
     if (device_effective_seq_len && seq_len >= 2 && seq_len <= 8 &&
         num_experts == kQFNRegisterSelectorExperts && top_k == kQFNRegisterSelectorTopK &&
-        llaminar2::qfnGroupedTopKRegisterOptIn())
+        llaminar2::qfnGroupedTopKRegisterOptIn(qualified_default))
     {
         const auto hardware = llaminar2::rocm::nativeQuantisedHardwareForDevice(device_idx);
         use_register_selector = llaminar2::native_quantised::selectVerifierDispatchTable(hardware) ==
@@ -17834,6 +17823,18 @@ bool hipMoE_softmax_topk_decode_equivalent_rows(
         llaminar2::PerfStatsCollector::addCounter("rocm_moe", "grouped_register_topk_calls", 1.0,
             "verifier", "ROCm:" + std::to_string(device_idx), {{"physical_rows", std::to_string(seq_len)}});
     return true;
+}
+
+bool hipMoE_softmax_topk_decode_equivalent_rows(
+    float *logits,
+    float *expert_indices, float *expert_weights,
+    int seq_len, int num_experts, int top_k,
+    bool normalize_weights,
+    int device_idx, void *stream,
+    const int *device_effective_seq_len,
+    void *deferred_selected_route_ledger)
+{
+    return hipMoE_softmax_topk_decode_equivalent_rows_with_policy(logits, expert_indices, expert_weights, seq_len, num_experts, top_k, normalize_weights, device_idx, stream, device_effective_seq_len, deferred_selected_route_ledger, false);
 }
 
 bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
@@ -19894,37 +19895,7 @@ __device__ __forceinline__ void rocm_publish_runtime_prefill_plan_block(
     {
         if (threadIdx.x == 0)
         {
-            const DeviceMoEPlacementBankView *const placement_banks =
-                runtime_durable_placement_banks(runtime);
-            const llaminar2::DeviceMoEOverlayEpochTicket *const ticket =
-                runtime ? runtime->overlay_epoch_ticket : nullptr;
-            const llaminar2::DeviceMoEOverlayEpochStatus *const status =
-                runtime ? runtime->overlay_epoch_status : nullptr;
-            printf(
-                "runtime_prefill_invalid_contract "
-                "runtime=%p gate=%p up=%p down=%p experts=%d "
-                "active_ids=%p max_active=%d expert_counts=%p "
-                "expected_format=%u execution_bank=%u active_bank=%u "
-                "active_epoch=%u transient=%u ticket=%p "
-                "ticket_epoch=%llu ticket_selector=%llu "
-                "status=%p status_code=%u status_operation=%u "
-                "status_epoch=%llu status_selector=%llu status_bank=%u "
-                "status_state=%u placement_banks=%p bank0_epoch=%u "
-                "bank1_epoch=%u\n",
-                runtime, gate_descs, up_descs, down_descs, num_experts, active_expert_ids,
-                max_active_experts, runtime ? runtime->expert_counts : nullptr,
-                static_cast<unsigned>(expected_format), execution_bank,
-                runtime ? runtime->active_bank : 0xffffffffu, runtime ? runtime->active_epoch : 0u,
-                runtime ? runtime->current_batch_llep_transient_bank_active : 0xffffffffu, ticket,
-                static_cast<unsigned long long>(ticket ? ticket->epoch : 0u),
-                static_cast<unsigned long long>(ticket ? ticket->selector : 0u), status,
-                status ? status->code : 0xffffffffu, status ? status->operation : 0xffffffffu,
-                static_cast<unsigned long long>(status ? status->epoch : 0u),
-                static_cast<unsigned long long>(status ? status->selector : 0u),
-                status ? status->bank : 0xffffffffu, status ? status->observed_state : 0xffffffffu,
-                placement_banks, placement_banks ? placement_banks[0].epoch : 0u,
-                placement_banks ? placement_banks[1].epoch : 0u);
-            fail_fast_incomplete_llep_transfer();
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("prefill publication has an invalid runtime or projection contract");
         }
         return;
     }
@@ -19964,33 +19935,7 @@ __device__ __forceinline__ void rocm_publish_runtime_prefill_plan_block(
         {
             if (threadIdx.x == 0)
             {
-                const int invalid_expert = scratch.first_invalid_expert;
-                const DeviceMoEExpertDescriptorView &desc = bank.experts[invalid_expert];
-                const DeviceMoEPlacementBankView *const durable_banks =
-                    runtime_durable_placement_banks(runtime);
-                const llaminar2::DeviceMoEOverlayEpochTicket *const ticket =
-                    runtime->overlay_epoch_ticket;
-                printf("runtime_prefill_active_expert_not_ready "
-                       "participant=%u expert=%d count=%d execution_bank=%u "
-                       "active_bank=%u active_epoch=%u bank0_epoch=%u "
-                       "bank1_epoch=%u local_mask=%u resident_mask=%u "
-                       "local_bit=%u local_slot=%d logical=%d owner=%d "
-                       "descriptor_flags=%u route_participant=%d "
-                       "external_banks=%u transient=%u ticket_epoch=%llu "
-                       "ticket_selector=%llu\\n",
-                       runtime->participant_id, invalid_expert,
-                       runtime->expert_counts[invalid_expert], execution_bank, runtime->active_bank,
-                       runtime->active_epoch, durable_banks ? durable_banks[0].epoch : 0u,
-                       durable_banks ? durable_banks[1].epoch : 0u,
-                       bank.local_compute_mask[invalid_expert],
-                       bank.resident_participant_mask[invalid_expert], local_bit, desc.local_slot,
-                       desc.logical_expert_id, desc.owner_participant, desc.flags,
-                       bank.overlay_route_participant[invalid_expert],
-                       runtime->overlay_placement_banks ? 1u : 0u,
-                       runtime->current_batch_llep_transient_bank_active,
-                       static_cast<unsigned long long>(ticket ? ticket->epoch : 0u),
-                       static_cast<unsigned long long>(ticket ? ticket->selector : 0u));
-                fail_fast_incomplete_llep_transfer();
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("prefill expert lacks admitted projection descriptors");
             }
             return;
         }
@@ -20066,22 +20011,7 @@ __global__ void rocm_moe_build_runtime_original_to_grouped_kernel(
         !runtime->expert_offsets ||
         !runtime->grouped_token_ids)
     {
-        if (expert == 0 && threadIdx.x == 0)
-        {
-            printf("rocm_runtime_original_to_grouped_invalid_contract "
-                   "current_slots=%d max_slots=%d num_experts=%d route_capacity=%u "
-                   "route_experts=%p route_participants=%p counts=%p offsets=%p grouped=%p\n",
-                   current_slots,
-                   max_slots,
-                   num_experts,
-                   runtime ? runtime->prefill_route_capacity : 0u,
-                   runtime ? runtime->route_expert_ids : nullptr,
-                   runtime ? runtime->route_participant_ids : nullptr,
-                   runtime ? runtime->expert_counts : nullptr,
-                   runtime ? runtime->expert_offsets : nullptr,
-                   runtime ? runtime->grouped_token_ids : nullptr);
-        }
-        fail_fast_incomplete_llep_transfer();
+        FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("original-to-grouped route table lacks its admitted storage or geometry");
         return;
     }
     if (expert >= num_experts)
@@ -20091,17 +20021,7 @@ __global__ void rocm_moe_build_runtime_original_to_grouped_kernel(
     const int offset = runtime->expert_offsets[expert];
     if (count < 0 || offset < 0 || offset + count > max_slots)
     {
-        if (threadIdx.x == 0)
-        {
-            printf("rocm_runtime_original_to_grouped_invalid_expert_range "
-                   "participant=%u expert=%d count=%d offset=%d max_slots=%d\n",
-                   runtime->participant_id,
-                   expert,
-                   count,
-                   offset,
-                   max_slots);
-        }
-        fail_fast_incomplete_llep_transfer();
+        FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("original-to-grouped expert span exceeds its admitted route capacity");
         return;
     }
 
@@ -20116,21 +20036,7 @@ __global__ void rocm_moe_build_runtime_original_to_grouped_kernel(
             runtime->route_expert_ids[route_slot] != expert ||
             runtime->route_participant_ids[route_slot] != local_participant)
         {
-            printf("rocm_runtime_original_to_grouped_invalid_row "
-                   "participant=%u expert=%d row=%d grouped_slot=%d route_slot=%d "
-                   "route_expert=%d route_participant=%d\n",
-                   runtime->participant_id,
-                   expert,
-                   row,
-                   grouped_slot,
-                   route_slot,
-                   (route_slot >= 0 && route_slot < max_slots)
-                       ? runtime->route_expert_ids[route_slot]
-                       : -1,
-                   (route_slot >= 0 && route_slot < max_slots)
-                       ? runtime->route_participant_ids[route_slot]
-                       : -1);
-            fail_fast_incomplete_llep_transfer();
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("original-to-grouped route maps a row to a foreign expert or participant");
             return;
         }
         original_to_grouped[route_slot] = grouped_slot;
@@ -20663,53 +20569,7 @@ void rocm_moe_prefill_group_small_runtime_kernel(
     {
         if (tid == 0)
         {
-            const auto *const ticket =
-                runtime ? runtime->overlay_epoch_ticket : nullptr;
-            const auto *const durable_banks =
-                runtime_durable_placement_banks(runtime);
-            printf("rocm_runtime_small_group_invalid_contract "
-                   "publish_inputs=%d complete_plan=%d current_slots=%d max_slots=%d "
-                   "num_experts=%d top_k=%d block=%u bank=%u "
-                   "runtime=%p indices=%p weights=%p inverse=%p "
-                   "route_capacity=%u route_ids=%p route_weights=%p route_participants=%p "
-                   "expert_counts=%p expert_offsets=%p grouped_ids=%p grouped_weights=%p "
-                   "retain_deferred=%d deferred_capacity=%u deferred_ids=%p deferred_participants=%p "
-                   "ticket=%p ticket_epoch=%llu ticket_selector=%llu durable_banks=%p "
-                   "bank0_epoch=%u bank1_epoch=%u active_bank=%u transient=%u overlay_banks=%p\\n",
-                   PublishRouterInputs ? 1 : 0,
-                   PublishCompletePlan ? 1 : 0,
-                   current_slots,
-                   max_slots,
-                   num_experts,
-                   top_k,
-                   static_cast<unsigned>(blockDim.x),
-                   execution_bank,
-                   runtime,
-                   routing_indices,
-                   routing_weights,
-                   original_to_grouped,
-                   runtime ? runtime->prefill_route_capacity : 0u,
-                   runtime ? runtime->route_expert_ids : nullptr,
-                   runtime ? runtime->route_weights : nullptr,
-                   runtime ? runtime->route_participant_ids : nullptr,
-                   runtime ? runtime->expert_counts : nullptr,
-                   runtime ? runtime->expert_offsets : nullptr,
-                   runtime ? runtime->grouped_token_ids : nullptr,
-                   runtime ? runtime->grouped_route_weights : nullptr,
-                   retain_routes_for_deferred_commit,
-                   runtime ? runtime->deferred_verifier_route_capacity : 0u,
-                   runtime ? runtime->deferred_verifier_route_expert_ids : nullptr,
-                   runtime ? runtime->deferred_verifier_route_participant_ids : nullptr,
-                   ticket,
-                   static_cast<unsigned long long>(ticket ? ticket->epoch : 0u),
-                   static_cast<unsigned long long>(ticket ? ticket->selector : 0u),
-                   durable_banks,
-                   durable_banks ? durable_banks[0].epoch : 0u,
-                   durable_banks ? durable_banks[1].epoch : 0u,
-                   runtime ? runtime->active_bank : 0u,
-                   runtime ? runtime->current_batch_llep_transient_bank_active : 0u,
-                   runtime ? runtime->overlay_placement_banks : nullptr);
-            fail_fast_incomplete_llep_transfer();
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("grouped prefill lacks its admitted runtime contract");
         }
         return;
     }
@@ -20937,30 +20797,7 @@ void rocm_moe_prefill_group_small_runtime_kernel(
         {
             if (tid == 0)
             {
-                const int invalid_expert =
-                    scan_scratch.first_invalid_expert;
-                const DeviceMoEPlacementBankView &bank =
-                    runtime_placement_banks(runtime)[execution_bank];
-                const DeviceMoEExpertDescriptorView &desc =
-                    bank.experts[invalid_expert];
-                const uint32_t local_bit =
-                    expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
-                    ? 0u : runtime_participant_bit(local_participant);
-                printf("runtime_prefill_active_expert_not_ready "
-                       "participant=%u expert=%d count=%d execution_bank=%u "
-                       "local_mask=%u resident_mask=%u local_bit=%u "
-                       "local_slot=%d logical=%d owner=%d\\n",
-                       runtime->participant_id,
-                       invalid_expert,
-                       runtime->expert_counts[invalid_expert],
-                       execution_bank,
-                       bank.local_compute_mask[invalid_expert],
-                       bank.resident_participant_mask[invalid_expert],
-                       local_bit,
-                       desc.local_slot,
-                       desc.logical_expert_id,
-                       desc.owner_participant);
-                fail_fast_incomplete_llep_transfer();
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("grouped prefill expert lacks admitted projection descriptors");
             }
             return;
         }
@@ -21022,16 +20859,7 @@ void rocm_moe_prefill_group_small_runtime_kernel(
                 : !original_to_grouped || published_grouped_slot == -1;
         if (!valid_mapping)
         {
-            printf("rocm_runtime_small_group_invalid_row "
-                   "participant=%d route_slot=%d grouped_slot=%d expert=%d "
-                   "route_participant=%d expected_grouped_slot=%d\\n",
-                   local_participant,
-                   tid,
-                   published_grouped_slot,
-                   expert_id,
-                   participant_id,
-                   expected_grouped_slot);
-            fail_fast_incomplete_llep_transfer();
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("grouped prefill route map disagrees with its selected expert");
             return;
         }
     }
@@ -21311,14 +21139,7 @@ __global__ void rocm_moe_prefill_group_scatter_deterministic_kernel(
     {
         if (threadIdx.x == 0)
         {
-            printf("rocm_runtime_group_scan_scatter_invalid_range "
-                   "participant=%u expert=%d prefix=%d count=%d max_slots=%d\\n",
-                   runtime->participant_id,
-                   expert,
-                   prefix,
-                   count,
-                   max_slots);
-            fail_fast_incomplete_llep_transfer();
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("prefill scan span exceeds its admitted route capacity");
         }
         return;
     }
@@ -21808,16 +21629,6 @@ __device__ __forceinline__ bool rocm_moe_prefill_llep_assignment_ready(
         assigned_participant < 0 ||
         static_cast<uint32_t>(assigned_participant) >= runtime->participant_count)
     {
-        if (threadIdx.x == 0)
-        {
-            printf("prefill_llep_invalid_assignment_participant "
-                   "participant=%u expert=%d row=%d assigned=%d participant_count=%u\\n",
-                   runtime ? runtime->participant_id : 0u,
-                   expert,
-                   row,
-                   assigned_participant,
-                   runtime ? runtime->participant_count : 0u);
-        }
         return false;
     }
 
@@ -21835,40 +21646,12 @@ __device__ __forceinline__ bool rocm_moe_prefill_llep_assignment_ready(
             runtime->participant_count);
     if ((resident_mask & assigned_bit) == 0u)
     {
-        if (threadIdx.x == 0)
-        {
-            printf("prefill_llep_assignment_not_resident "
-                   "participant=%u expert=%d row=%d assigned=%d assigned_bit=%u "
-                   "resident_mask=%u raw_resident_mask=%u owner=%d local_ready=%u\\n",
-                   runtime->participant_id,
-                   expert,
-                   row,
-                   assigned_participant,
-                   assigned_bit,
-                   resident_mask,
-                   active_bank.resident_participant_mask[expert],
-                   owner_participant,
-                   rocm_moe_prefill_llep_local_expert_ready(runtime, active_bank, expert) ? 1u : 0u);
-        }
         return false;
     }
 
     if (assigned_participant == static_cast<int32_t>(runtime->participant_id) &&
         !rocm_moe_prefill_llep_local_expert_ready(runtime, active_bank, expert))
     {
-        if (threadIdx.x == 0)
-        {
-            printf("prefill_llep_assignment_local_not_ready "
-                   "participant=%u expert=%d row=%d assigned=%d resident_mask=%u "
-                   "raw_resident_mask=%u owner=%d\\n",
-                   runtime->participant_id,
-                   expert,
-                   row,
-                   assigned_participant,
-                   resident_mask,
-                   active_bank.resident_participant_mask[expert],
-                   owner_participant);
-        }
         return false;
     }
     return true;
@@ -21920,115 +21703,13 @@ __global__ __launch_bounds__(256) void rocm_moe_prefill_llep_assign_routes_from_
         {
             /*
              * Transfer and apply status are request-wide publications observed
-             * identically by every expert block.  One designated witness emits
-             * the complete record and traps; all other lanes return because
+             * identically by every expert block.  One designated witness traps on
+             * the original status records. All other lanes return because
              * the HIP context is already irrecoverably failed.
              */
             if (expert == 0 && threadIdx.x == 0)
             {
-                int32_t duplicate_slot = -1;
-                int32_t duplicate_first_expert = -1;
-                int32_t duplicate_second_expert = -1;
-                if (execution_bank <= 1u)
-                {
-                    const auto &bank = runtime_placement_banks(runtime)[execution_bank];
-                    const uint32_t local_bit =
-                        runtime_participant_bit(
-                            static_cast<int>(runtime->participant_id));
-                    for (int32_t first = 0;
-                         first < num_experts &&
-                         duplicate_slot < 0;
-                         ++first)
-                    {
-                        const auto &first_desc = bank.experts[first];
-                        const bool first_live =
-                            bank.local_compute_mask[first] != 0u &&
-                            (bank.resident_participant_mask[first] &
-                             local_bit) != 0u &&
-                            (first_desc.flags & kDeviceMoEFlagTransferSlot) != 0u &&
-                            first_desc.local_slot >= 0;
-                        if (!first_live)
-                            continue;
-                        for (int32_t second = first + 1;
-                             second < num_experts;
-                             ++second)
-                        {
-                            const auto &second_desc = bank.experts[second];
-                            const bool second_live =
-                                bank.local_compute_mask[second] != 0u &&
-                                (bank.resident_participant_mask[second] &
-                                 local_bit) != 0u &&
-                                (second_desc.flags &
-                                 kDeviceMoEFlagTransferSlot) != 0u &&
-                                second_desc.local_slot >= 0;
-                            if (second_live &&
-                                second_desc.local_slot ==
-                                    first_desc.local_slot)
-                            {
-                                duplicate_slot = first_desc.local_slot;
-                                duplicate_first_expert = first;
-                                duplicate_second_expert = second;
-                                break;
-                            }
-                        }
-                    }
-                }
-                printf("prefill_llep_after_transfer_incomplete "
-                       "participant=%u expected_transfers=%llu expected_spans=%llu "
-                       "transfer_ok=%u transfer_magic=%u transfer_version=%u transfer_status=%u "
-                       "plan_overflow=%u payload_overflow=%u planned=%u projected=%llu "
-                       "transfer_count=%u span_count=%u capacity_limited=%u "
-                       "payload_requested=%u payload_bucket=%u "
-                       "duplicate_slot=%d duplicate_first=%d duplicate_second=%d\n",
-                       runtime->participant_id,
-                       static_cast<unsigned long long>(runtime->reserved_u64[3]),
-                       static_cast<unsigned long long>(runtime->reserved_u64[2]),
-                       transfer_complete ? 1u : 0u,
-                       transfer_status ? transfer_status->magic : 0u,
-                       transfer_status ? transfer_status->version : 0u,
-                       transfer_status ? transfer_status->status_code : 0u,
-                       transfer_status ? transfer_status->plan_overflow : 0u,
-                       transfer_status ? transfer_status->payload_bucket_overflow : 0u,
-                       transfer_status ? transfer_status->planned_arrivals : 0u,
-                       static_cast<unsigned long long>(
-                           transfer_status
-                               ? transfer_status->candidate_arrivals_considered
-                               : 0ULL),
-                       transfer_status ? transfer_status->llep_weight_transfer_count : 0u,
-                       transfer_status ? transfer_status->llep_assignment_span_count : 0u,
-                       transfer_status
-                           ? transfer_status->capacity_limited_candidates
-                           : 0u,
-                       transfer_status
-                           ? transfer_status->payload_bucket_requested_slots
-                           : 0u,
-                       transfer_status
-                           ? transfer_status->payload_bucket_slots
-                           : 0u,
-                       duplicate_slot,
-                       duplicate_first_expert,
-                       duplicate_second_expert);
-                printf("prefill_llep_after_apply_incomplete "
-                       "participant=%u apply_ok=%u apply_magic=%u apply_version=%u "
-                       "apply_status=%u seen=%u applied=%u required_local=%u "
-                       "ready_local=%u invalid=%u missing_src=%u missing_dst=%u "
-                       "mismatch=%u copy_incomplete=%u copied=%u\n",
-                       runtime->participant_id,
-                       apply_complete ? 1u : 0u,
-                       apply_status ? apply_status->magic : 0u,
-                       apply_status ? apply_status->version : 0u,
-                       apply_status ? apply_status->status_code : 0u,
-                       apply_status ? apply_status->plan_entries_seen : 0u,
-                       apply_status ? apply_status->applied_arrivals : 0u,
-                       apply_status ? apply_status->required_local_arrivals : 0u,
-                       apply_status ? apply_status->ready_local_arrivals : 0u,
-                       apply_status ? apply_status->invalid_plan_entries : 0u,
-                       apply_status ? apply_status->missing_source_descriptors : 0u,
-                       apply_status ? apply_status->missing_destination_slots : 0u,
-                       apply_status ? apply_status->descriptor_mismatches : 0u,
-                       apply_status ? apply_status->copy_incomplete : 0u,
-                       apply_status ? apply_status->copied_arrivals : 0u);
-                fail_fast_incomplete_llep_transfer();
+                FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("prefill route assignment requires a complete transfer and apply receipt");
             }
             return;
         }

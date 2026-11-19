@@ -12,6 +12,7 @@
 #include "backends/DeviceId.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "planning/ModelMemoryProfile.h"
 #include <cstddef>
 
@@ -48,6 +49,7 @@ struct ActivationGraphMemoryGeometry
     std::optional<DeviceShardingAssignment> shared_tp_assignment; ///< Original dense/shared source cut, never inferred from routed F.
     RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
         ///< Frozen physical expert layout; determines which publication banks exist.
+    GPUExpertIntermediateTiling gpu_expert_intermediate_tiling = GPUExpertIntermediateTiling::Coarse128;
     int mtp_target_query_rows = 2;  ///< Flattened maximum verifier-row capacity.
     int retained_mtp_candidate_rows = 0; ///< Explicit retained QSA target bank; zero when MTP capacity is absent.
     MTPTerminalLogitsLayout mtp_terminal_logits_layout =

@@ -2,7 +2,16 @@
 
 Status dashboard for 15 physical decoder specialisations. Limit 15,000 UTF-8 bytes.
 
-## Current Release on the original four-MI50 split
+## Shipping RCCL, four MI50s, automatic planning
+
+On code2048 with dynamic MTP, the new stationary TensorSharded layout measured
+**921.72 prefill / 79.91 decode tok/s**. GateUpOwnedDownColumns measured
+**939.02 / 64.48** on the same Release and shipped RCCL. The new layout gained
+23.92% decode and cost 1.84% prefill. Each arm repeated its own history twice.
+The arms first differed at output token 44 and performed 71 versus 65 verifier
+rounds. [Matched settings and results](QFN_MI50_STAGE_COMPARISON_20261118.md#shipping-rccl-and-automatic-planning)
+
+## Earlier measurements on the original four-MI50 split
 
 Checkpoint `7001788d8` used routed expert widths of 128/128/128/256,
 160 shared columns per GPU and the measured verifier switches. Both engines
@@ -20,17 +29,17 @@ also matched their own ordinary decode and all five verifier-work counters.
 Castagna generated different continuations and its throughput includes its
 own draft acceptance. The largest remaining fixed-depth stage deficit on
 code2048 is 3.08 ms/round in HC, projections, routing and experts.
-On code2048 the HC-down reducer alone reached 113.54 tok/s. Publishing
-expert Down operands in Gate alone reached 112.97 tok/s. Both reproduced
-the 111.88 tok/s control's token history and verifier work.
+On code2048 the HC-down reducer reached 113.54 tok/s with identical work.
+The 256-column shard finished last in 4,117/4,128 FFN comparisons. Tuning
+the 128-column selector and wide Gate together gave 111.95 → 111.80 tok/s.
 [Matched workload, numerical checks and phase timings](QFN_MI50_STAGE_COMPARISON_20261118.md#fixed-depth-verifier-after-the-counted-routing-and-hc-changes)
 
 ## Full-model throughput on four MI50s with equal-width Llaminar shards
 
-Both Release engines used the same four model shards, the same four cards
-behind one switch, an empty prompt cache, and the same exact input IDs.
-Each cell has three measured generations of 256 tokens following a warmup.
-Decode measures the 255 tokens after the first.
+These historical Llaminar timings used an experimental RCCL build. Both
+engines used identical inputs, model shards and GPUs, an empty prompt cache,
+and three timed 256-token generations after warmup. Decode covers the last
+255 tokens.
 
 | Mode and engine | Review prefill / decode tok/s | Code prefill / decode tok/s | Matches own ordinary history |
 | --- | ---: | ---: | --- |
@@ -59,18 +68,9 @@ Castagna measured 18.22 ms. Each profiler run matched its unprofiled
 control's tokens and work counts.
 [Phase measurements, run identities and commands](QFN_MI50_STAGE_COMPARISON_20261118.md)
 
-The counted four-row FFN can reuse exact K32 activation sums on the two
-measured affine format combinations that benefit. On the same MI50 and
-Release ELF, Q4_K/Q5_1 measured 150.23 → 135.36 µs, Q5_K/Q8_0
-150.14 → 145.89 µs, and Q4_K/Q8_0 kept its original path (135.02 →
-135.12 µs in that bracket). These labels are
-routed gate/up and down; the immutable shared expert used Q8_0 in all three.
-The four-MI50 full-model fixed-depth gate gained 2.35% and 2.65%
-on review512 and code2048. Dynamic MTP changed by less than 0.1%.
-On code2048, the matched fixed-depth verifier dispatch union fell from
-25.08 to 23.45 ms/round. The full four-card span fell from 26.64 to
-25.04 ms. The dominant gate/down leaves reached 59%/62% of the same-card
-geometry-matched read probe. Broader source formats remain under tuning.
+The four-row FFN reuses K32 activation sums for Q4_K/Q5_1 and Q5_K/Q8_0.
+The fixed-depth code2048 verifier fell from 25.08 to 23.45 ms/round. Gate
+and down reached 59% and 62% of the same-card read reference.
 [Matched runs and read calibration](QFN_MI50_STAGE_COMPARISON_20261118.md#counted-verifier-format-qualification)
 
 The counted four-row reader passed static and deferred replay across all
@@ -121,7 +121,8 @@ includes the fused GDN input projection.
 Direct peer push saved 1.87–1.96 ms per ordinary token over the earlier
 gather and ordered fold, removed 97 nodes per GPU and matched all six
 histories. Its isolated 10 KiB reduction took 12.15 versus 26.81 µs.
-This transport remains opt-in. Native replays cover partial and empty work,
+The stationary four-MI50 layout selects direct peer push on supported links.
+Native replays cover partial and empty work,
 abort and communicator reuse. A separate publication fusion reduced node
 count but slowed both prompts and remains outside the selected policy.
 [Transport and lifecycle measurements](QFN_MI50_STAGE_COMPARISON_20261118.md)
@@ -233,5 +234,4 @@ the graph variants. The server completed three measured 32-token generations
 after warmup. The same capture census found no retained M1 nodes in prefill
 or verifier graphs. A short-K projection and branch-mix fusion removed 49
 nodes per ordinary decode graph. The matched six histories stayed exact.
-Review improved from 68.03 to 68.22 tok/s, code from 64.67 to 64.89. The
-fusion remains experimental. The wider TP2 Q8-down shard remains a separate tuning target.
+The fusion remains experimental. The wider TP2 Q8-down shard remains a tuning target.

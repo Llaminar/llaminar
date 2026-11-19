@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include <array>
 #include <vector>
 #include "tensors/TensorType.h"
@@ -70,6 +71,7 @@ namespace llaminar2
         struct HCResidualDownPublication {
             TensorBase* activated; ///< Existing arena result, never a new allocation.
             BufferId buffer; ///< Exact output coherence authority.
+            LocalGPUExpertKernelPolicy verifier_kernel_policy=LocalGPUExpertKernelPolicy::Generic; ///< Host-only exact grouped schedule.
         };
         /** @brief Closed M1 HC up/read output declaration, validated with its original input transform. */
         /** @brief Existing activated output authored by the original down reducer. */

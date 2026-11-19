@@ -15,7 +15,7 @@
  * @date February 2026
  */
 
-#include "collective/RankOrderedPeerPushOptIn.h"
+#include "collective/RankOrderedNativeResources.h"
 #include "TPAllreduceStage.h"
 #include "../../../collective/AllreducePrecisionPolicy.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -931,7 +931,7 @@ namespace llaminar2
             throw std::logic_error("Canonical TP reduction requires complete logical rows");
         const std::size_t rows = effective_count / columns;
         const bool native_push = params_.device_id.is_rocm() &&
-            useNativeRankOrderedPush(rankOrderedPeerPushStartupOptIn(), rows, columns);
+            useNativeRankOrderedPush(local_tp->hasRankOrderedPeerPush(), rows, columns);
         const bool gathered = native_push
             ? local_tp->rankOrderedFP32OnStream(tensor_data, rank_banks, tensor_data,
                 params_.live_rows ? *params_.live_rows :

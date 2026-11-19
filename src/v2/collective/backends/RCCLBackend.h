@@ -56,11 +56,13 @@ namespace llaminar2
     public:
         /**
          * @brief Construct RCCLBackend
+         * @param peer_quote Original model ownership of measured native connector storage.
          * @param mpi_ctx Optional MPI context for multi-process initialization.
          *                If provided and world_size > 1, uses MPI to coordinate
          *                RCCL communicator creation across processes.
          */
-        explicit RCCLBackend(std::shared_ptr<IMPIContext> mpi_ctx = nullptr);
+        explicit RCCLBackend(std::shared_ptr<IMPIContext> mpi_ctx = nullptr,
+            RankOrderedQuotePolicy peer_quote = RankOrderedQuotePolicy::ExplicitOnly);
         ~RCCLBackend() override;
 
         // =====================================================================
@@ -327,6 +329,8 @@ namespace llaminar2
 
         /** @copydoc ICollectiveBackend::rankOrderedResources */
         std::vector<RankOrderedNativeResources> rankOrderedResources() const override;
+        /** @copydoc ICollectiveBackend::hasRankOrderedPeerPush */
+        bool hasRankOrderedPeerPush() const noexcept override;
         /** @copydoc ICollectiveBackend::prepareRankOrderedResources */
         bool prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory) override;
         /** @copydoc ICollectiveBackend::rankOrderedFP32OnStream */
@@ -454,6 +458,7 @@ namespace llaminar2
         int num_ranks_ = 0;
         int local_rank_ = 0;
         std::shared_ptr<IMPIContext> mpi_ctx_;     // Optional MPI context for multi-process
+        RankOrderedQuotePolicy peer_quote_; ///< Original caller owns this choice across communicator pooling.
         bool is_multi_gpu_single_process_ = false; // True if multi-GPU without MPI
         bool p2p_available_ = false;               // True if P2P available between all devices
 

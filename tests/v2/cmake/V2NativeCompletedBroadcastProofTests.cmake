@@ -16,6 +16,13 @@ file(GLOB V2_NATIVE_COMPLETED_INPUTS CONFIGURE_DEPENDS
     "${REPO_ROOT}/scripts/docker/native-completed-broadcast/*.cpp")
 
 foreach(V2_NATIVE_COMPLETED_BACKEND IN ITEMS nccl rccl)
+    set(V2_NATIVE_COMPLETED_TARGET "v2_${V2_NATIVE_COMPLETED_BACKEND}_completed_broadcast_proof")
+    # Read the dependency source only for its original proof target. A Release
+    # perf/serving build may consume an already published collective binary.
+    v2_test_target_selected("${V2_NATIVE_COMPLETED_TARGET}" V2_NATIVE_COMPLETED_SELECTED)
+    if(NOT V2_NATIVE_COMPLETED_SELECTED)
+        continue()
+    endif()
     if((V2_NATIVE_COMPLETED_BACKEND STREQUAL "nccl" AND HAVE_CUDA AND HAVE_NCCL) OR
        (V2_NATIVE_COMPLETED_BACKEND STREQUAL "rccl" AND HAVE_ROCM AND HAVE_RCCL))
         string(TOUPPER "${V2_NATIVE_COMPLETED_BACKEND}" V2_NATIVE_COMPLETED_LABEL)
@@ -85,7 +92,6 @@ foreach(V2_NATIVE_COMPLETED_BACKEND IN ITEMS nccl rccl)
                     "${RCCL_LIBRARY}" "${CMAKE_CXX_COMPILER}"
                 VERBATIM)
         endif()
-        set(V2_NATIVE_COMPLETED_TARGET "v2_${V2_NATIVE_COMPLETED_BACKEND}_completed_broadcast_proof")
         add_custom_target(${V2_NATIVE_COMPLETED_TARGET} DEPENDS "${V2_NATIVE_COMPLETED_REPORT}")
         set_property(TARGET ${V2_NATIVE_COMPLETED_TARGET} PROPERTY V2_RELEASE_NATIVE_PROOF_OWNER TRUE)
         set_property(GLOBAL APPEND PROPERTY V2_UNIT_GATE_TARGETS ${V2_NATIVE_COMPLETED_TARGET})
@@ -103,46 +109,10 @@ foreach(V2_NATIVE_COMPLETED_BACKEND IN ITEMS nccl rccl)
             if(V2_NATIVE_COMPLETED_SUITE STREQUAL "Integration")
                 set_property(TEST ${V2_NATIVE_COMPLETED_TEST} APPEND PROPERTY LABELS ProductionTestPreflight)
                 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_NATIVE_COMPLETED_TEST})
-                set(V2_NATIVE_P2P_ENTRY_TEST "V2_Integration_${V2_NATIVE_COMPLETED_LABEL}AddressedP2pOwnedEntryContract")
-                add_test(NAME ${V2_NATIVE_P2P_ENTRY_TEST}
-                    COMMAND ${Python3_EXECUTABLE} -B "${V2_NATIVE_COMPLETED_SCRIPT}" verify
-                        --backend "${V2_NATIVE_COMPLETED_BACKEND}" --report "${V2_NATIVE_COMPLETED_REPORT}"
-                        --library "${V2_NATIVE_COMPLETED_LIBRARY}" --receipt "${V2_NATIVE_COMPLETED_RECEIPT}")
-                set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_${V2_NATIVE_P2P_ENTRY_TEST}
-                    ${V2_NATIVE_COMPLETED_TARGET})
-                set_tests_properties(${V2_NATIVE_P2P_ENTRY_TEST} PROPERTIES
-                    LABELS "V2;Integration;ProductionTestPreflight;${V2_NATIVE_COMPLETED_LABEL};DeviceFree;Replay;Dependency;KernelResource;Regression" TIMEOUT 30)
-                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_NATIVE_P2P_ENTRY_TEST})
-                set(V2_NATIVE_HOST_BARRIER_TEST "V2_Integration_${V2_NATIVE_COMPLETED_LABEL}CompletedHostBarrierContract")
-                add_test(NAME ${V2_NATIVE_HOST_BARRIER_TEST}
-                    COMMAND ${Python3_EXECUTABLE} -B "${V2_NATIVE_COMPLETED_SCRIPT}" verify
-                        --backend "${V2_NATIVE_COMPLETED_BACKEND}" --report "${V2_NATIVE_COMPLETED_REPORT}"
-                        --library "${V2_NATIVE_COMPLETED_LIBRARY}" --receipt "${V2_NATIVE_COMPLETED_RECEIPT}")
-                set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_${V2_NATIVE_HOST_BARRIER_TEST}
-                    ${V2_NATIVE_COMPLETED_TARGET})
-                set_tests_properties(${V2_NATIVE_HOST_BARRIER_TEST} PROPERTIES
-                    LABELS "V2;Integration;ProductionTestPreflight;${V2_NATIVE_COMPLETED_LABEL};DeviceFree;Replay;Lifecycle;Regression" TIMEOUT 30)
-                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_NATIVE_HOST_BARRIER_TEST})
-                set(V2_NATIVE_RETIREMENT_TEST "V2_Integration_${V2_NATIVE_COMPLETED_LABEL}CompletedAbortRetirementContract")
-                add_test(NAME ${V2_NATIVE_RETIREMENT_TEST}
-                    COMMAND ${Python3_EXECUTABLE} -B "${V2_NATIVE_COMPLETED_SCRIPT}" verify
-                        --backend "${V2_NATIVE_COMPLETED_BACKEND}" --report "${V2_NATIVE_COMPLETED_REPORT}"
-                        --library "${V2_NATIVE_COMPLETED_LIBRARY}" --receipt "${V2_NATIVE_COMPLETED_RECEIPT}")
-                set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_${V2_NATIVE_RETIREMENT_TEST}
-                    ${V2_NATIVE_COMPLETED_TARGET})
-                set_tests_properties(${V2_NATIVE_RETIREMENT_TEST} PROPERTIES
-                    LABELS "V2;Integration;ProductionTestPreflight;${V2_NATIVE_COMPLETED_LABEL};DeviceFree;Replay;Lifecycle;Regression" TIMEOUT 30)
-                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_NATIVE_RETIREMENT_TEST})
-                set(V2_NATIVE_COUNT_ABORT_TEST "V2_Integration_${V2_NATIVE_COMPLETED_LABEL}CompletedCountAbortReplay")
-                add_test(NAME ${V2_NATIVE_COUNT_ABORT_TEST}
-                    COMMAND ${Python3_EXECUTABLE} -B "${V2_NATIVE_COMPLETED_SCRIPT}" verify
-                        --backend "${V2_NATIVE_COMPLETED_BACKEND}" --report "${V2_NATIVE_COMPLETED_REPORT}"
-                        --library "${V2_NATIVE_COMPLETED_LIBRARY}" --receipt "${V2_NATIVE_COMPLETED_RECEIPT}")
-                set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_${V2_NATIVE_COUNT_ABORT_TEST}
-                    ${V2_NATIVE_COMPLETED_TARGET})
-                set_tests_properties(${V2_NATIVE_COUNT_ABORT_TEST} PROPERTIES
-                    LABELS "V2;Integration;ProductionTestPreflight;${V2_NATIVE_COMPLETED_LABEL};DeviceFree;Replay;Lifecycle;Regression" TIMEOUT 30)
-                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${V2_NATIVE_COUNT_ABORT_TEST})
+                # This proof validates broadcast, addressed P2P, host barriers,
+                # abort retirement and counted-abort replay in one invocation.
+                set_property(TEST ${V2_NATIVE_COMPLETED_TEST} APPEND PROPERTY LABELS
+                    Dependency KernelResource Lifecycle)
             endif()
         endforeach()
     endif()

@@ -598,7 +598,7 @@ namespace llaminar2
     LocalTPContext::LocalTPContext(
         std::vector<GlobalDeviceAddress> devices,
         std::vector<float> weights,
-        CollectiveBackendType backend)
+        CollectiveBackendType backend, RankOrderedQuotePolicy peer_quote)
         : context_id_(next_context_id_.fetch_add(1, std::memory_order_relaxed)),
           devices_(std::move(devices))
     {
@@ -671,7 +671,7 @@ namespace llaminar2
         // Initialize backend for multi-device scenarios
         if (degree() > 1)
         {
-            if (!initializeBackend())
+            if (!initializeBackend(peer_quote))
             {
                 throw std::runtime_error(
                     std::string("LocalTPContext: Failed to initialize collective backend ") +
@@ -3514,6 +3514,9 @@ namespace llaminar2
         return true;
     }
 
+    bool LocalTPContext::hasRankOrderedPeerPush() const noexcept
+    { return backend_impl_ && backend_impl_->hasRankOrderedPeerPush(); }
+
     std::vector<RankOrderedNativeResources> LocalTPContext::rankOrderedResources() const
     { return backend_impl_ ? backend_impl_->rankOrderedResources() : std::vector<RankOrderedNativeResources>{}; }
 
@@ -5079,7 +5082,7 @@ namespace llaminar2
     // Backend Initialization and Helper Methods
     // =========================================================================
 
-    bool LocalTPContext::initializeBackend()
+    bool LocalTPContext::initializeBackend(RankOrderedQuotePolicy peer_quote)
     {
         // Build device group from devices_
         DeviceGroupBuilder builder;
@@ -5110,7 +5113,7 @@ namespace llaminar2
         case CollectiveBackendType::RCCL:
 #ifdef HAVE_ROCM
             LOG_DEBUG("LocalTPContext: Creating RCCL backend");
-            backend_impl_ = std::make_unique<RCCLBackend>();
+            backend_impl_ = std::make_unique<RCCLBackend>(nullptr, peer_quote);
 #else
             LOG_WARN("LocalTPContext: RCCL requested but ROCm not available, falling back to HOST");
             backend_impl_ = std::make_unique<HostBackend>();
@@ -5656,12 +5659,12 @@ namespace llaminar2
     std::unique_ptr<ILocalTPContext> createLocalTPContext(
         std::vector<GlobalDeviceAddress> devices,
         std::vector<float> weights,
-        CollectiveBackendType backend)
+        CollectiveBackendType backend, RankOrderedQuotePolicy peer_quote)
     {
         return std::make_unique<LocalTPContext>(
             std::move(devices),
             std::move(weights),
-            backend);
+            backend, peer_quote);
     }
 
 } // namespace llaminar2

@@ -88,15 +88,16 @@ public:
      * @param layer Original unsliced source metadata, including the down codebook.
      * @param participants Original domain width; no hardware-count specialization.
      * @param rotation Layer coordinate rotating the larger fragments.
+     * @param preferred_grain Bound source partition preference, always subordinate to source blocks.
      * @return Complete positive intervals, with no padding or requantization.
      * @throws std::invalid_argument For source geometry which cannot form legal fragments.
      */
     static std::vector<Interval> gpuIntervals(const MoEOverlayLayerWeightManifest &layer,
-        int participants, int rotation)
+        int participants, int rotation, int preferred_grain = qfnGPUExpertPreferredIntermediateGrain())
     {
         const auto axes = sourceAxes(layer);
         return MoEExpertProjectionOwnership::nativeIntermediateIntervals(axes.second, participants,
-            sourceBlock(projection(layer, ExpertTierWeightProjection::Down).format), rotation);
+            sourceBlock(projection(layer, ExpertTierWeightProjection::Down).format), rotation, preferred_grain);
     }
     /**
      * @brief Seal homogeneous GPU fragments owned by one original MPI rank.

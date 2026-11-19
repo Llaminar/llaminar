@@ -237,6 +237,33 @@ namespace
             EXPECT_EQ(observation.symbolCalls, 0u);
         }
     }
+    /** @test Only absolute explicit paths can reach dlopen or reuse a live handle. */
+    TEST_F(NCCLConfiguredLibrary, NonabsoluteExplicitPathDoesNotSearch)
+    {
+        for (const char *relative : {"libcollective.so", "./lib/libcollective.so"})
+        {
+            observation = {};
+            EXPECT_FALSE(loader::load(relative));
+#if defined(LLAMINAR_NCCL_TEST_ORIGINAL)
+            ASSERT_EQ(observation.paths, (std::vector<std::string>{relative}));
+            observation = {};
+#else
+            EXPECT_TRUE(observation.paths.empty());
+            EXPECT_NE(std::string(loader::getLastError()).find("must be absolute"), std::string::npos);
+#endif
+            EXPECT_EQ(observation.symbolCalls, 0u);
+            observation.admitSymbols = true;
+            ASSERT_TRUE(loader::load(selectedLibrary));
+#if defined(LLAMINAR_NCCL_TEST_ORIGINAL)
+            EXPECT_TRUE(loader::load(relative));
+#else
+            EXPECT_FALSE(loader::load(relative));
+#endif
+            EXPECT_EQ(observation.paths, (std::vector<std::string>{selectedLibrary}));
+            loader::unload();
+        }
+    }
+
     /** @test Retained selection identity cannot be replaced while its callbacks live. */
     TEST_F(NCCLConfiguredLibrary, LiveHandleRejectsDifferentSelectionUntilUnload)
     {

@@ -639,6 +639,35 @@ TEST(Test__TransferEngine_Reclamation, NativeContextOnlyRetirementResetsAndRepla
     }
 }
 
+/** @test A stale empty-ledger ticket cannot detach a successor or reset its runtime. */
+TEST(Test__TransferEngine_Reclamation, NativeContextOnlyStaleWorkerTicketPreservesSuccessor)
+{
+    llaminar2::testing::installHardwareFreeGPUContextFactories();
+    auto &pool = GPUDeviceContextPool::instance();
+    const auto device = DeviceId::cuda(63);
+    ReclamationBackendSpy backend;
+    backend.allocation_accounting = {.supported = true, .active_allocations = 0, .active_bytes = 0};
+    reclamation_backend_spy = &backend;
+    TransferEngine engine(&resolveReclamationBackend);
+
+    ASSERT_TRUE(pool.getContext(device).isInitialized());
+    const auto original = pool.retainExistingContextProvenance(device).generation();
+    auto stale = engine.beginExclusiveNativeContextRetirement(pool.retainExistingContextProvenance(device));
+    EXPECT_EQ(pool.retireExclusiveGeneration(device).retired_generation, original);
+    ASSERT_TRUE(pool.getContext(device).isInitialized());
+    const auto successor = pool.retainExistingContextProvenance(device).generation();
+    ASSERT_NE(successor, original);
+
+    EXPECT_THROW((void)engine.completeExclusiveModelRetirement(std::move(stale)), std::logic_error);
+    EXPECT_EQ(backend.runtime_reset_calls, 0);
+    EXPECT_EQ(pool.retainExistingContextProvenance(device).generation(), successor);
+    EXPECT_TRUE(pool.getContext(device).isInitialized());
+    auto current = engine.beginExclusiveNativeContextRetirement(pool.retainExistingContextProvenance(device));
+    EXPECT_EQ(engine.completeExclusiveModelRetirement(std::move(current)).retired_context_generation, successor);
+    EXPECT_EQ(backend.runtime_reset_calls, 1);
+    reclamation_backend_spy = nullptr;
+}
+
 /** @test Neither zero bytes nor zero owners alone proves an empty canonical ledger. */
 TEST(Test__TransferEngine_Reclamation, NativeContextOnlyRejectsUnknownOrLiveStorage)
 {

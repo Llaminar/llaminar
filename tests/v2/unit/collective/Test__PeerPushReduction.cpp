@@ -85,13 +85,16 @@ TEST(PeerPushReduction, TransportPolicyStaysFrozenAfterEnvironmentChange)
     constexpr const char *name = "LLAMINAR_RCCL_RANK_ORDERED_PUSH";
     const char *original = std::getenv(name);
     const auto saved = original ? std::optional{std::string(original)} : std::nullopt;
-    const bool selected = llaminar2::rankOrderedPeerPushStartupOptIn();
-    const int update = setenv(name, selected ? "0" : "1", 1);
-    const bool recorded = llaminar2::rankOrderedPeerPushStartupOptIn();
+    const auto selected = llaminar2::rankOrderedPeerPushRequest(llaminar2::RankOrderedQuotePolicy::MeasuredDomain);
+    const int update = setenv(name, selected == llaminar2::RankOrderedPeerPushRequest::Required ? "0" : "1", 1);
+    const auto recorded = llaminar2::rankOrderedPeerPushRequest(llaminar2::RankOrderedQuotePolicy::MeasuredDomain);
     const int restore = saved ? setenv(name, saved->c_str(), 1) : unsetenv(name);
     EXPECT_EQ(update, 0);
     EXPECT_EQ(restore, 0);
     EXPECT_EQ(recorded, selected);
+    using Request = llaminar2::RankOrderedPeerPushRequest;
+    EXPECT_EQ(llaminar2::rankOrderedPeerPushRequest(llaminar2::RankOrderedQuotePolicy::ExplicitOnly),
+              selected == Request::Automatic ? Request::Disabled : selected);
 }
 
 /** @test Direct-peer opt-in never infers visibility from partial or unqualified inventory. */
@@ -110,4 +113,26 @@ TEST(PeerPushReduction, OriginalCliqueAndQualifiedNativeISARequired)
     EXPECT_FALSE(rankOrderedPeerPushQualifiedISA("gfx9060"));
     EXPECT_FALSE(rankOrderedPeerPushQualifiedISA("gfx1100"));
     EXPECT_FALSE(rankOrderedPeerPushQualifiedISA(""));
+}
+
+/** @test Automatic transport is communicator-local and explicit requests retain their strict admission. */
+TEST(PeerPushReduction, AutomaticPushRequiresTheMeasuredCommunicatorAndEveryDirectedEdge)
+{
+    using namespace llaminar2;
+    using Request = RankOrderedPeerPushRequest;
+    const auto complete = PeerAccessCoverage::Complete;
+    for (const bool qualified : {false, true})
+        for (const bool measured : {false, true}) {
+            EXPECT_EQ(selectRankOrderedPeerPush(Request::Automatic, complete, qualified, measured),
+                      qualified && measured);
+            EXPECT_FALSE(selectRankOrderedPeerPush(Request::Disabled, complete, qualified, measured));
+            for (const auto coverage : {std::optional{PeerAccessCoverage::Partial},
+                    std::optional{PeerAccessCoverage::None}, std::optional<PeerAccessCoverage>{}}) {
+                EXPECT_FALSE(selectRankOrderedPeerPush(Request::Automatic, coverage, qualified, measured));
+                EXPECT_THROW(selectRankOrderedPeerPush(Request::Required, coverage, qualified, measured),
+                             std::invalid_argument);
+            }
+        }
+    EXPECT_TRUE(selectRankOrderedPeerPush(Request::Required, complete, true, false));
+    EXPECT_THROW(selectRankOrderedPeerPush(Request::Required, complete, false, true), std::invalid_argument);
 }

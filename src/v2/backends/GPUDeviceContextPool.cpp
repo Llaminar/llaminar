@@ -46,15 +46,30 @@ namespace llaminar2
 
     GPUContextProvenance GPUDeviceContextPool::retainExistingContextProvenance(DeviceId device)
     {
-        if(!device.is_gpu())throw std::invalid_argument("Existing pool provenance requires an exact native device");
-        std::lock_guard lock(mutex_);const auto ordinal=device.gpu_ordinal();
-        const auto& contexts=device.is_cuda()?nvidia_contexts_:amd_contexts_;
-        const auto& generations=device.is_cuda()?nvidia_generations_:amd_generations_;
-        const auto& retiring=device.is_cuda()?retiring_nvidia_contexts_:retiring_amd_contexts_;
-        const auto worker=contexts.find(ordinal);const auto generation=generations.find(ordinal);
-        if(retiring.contains(ordinal) || worker==contexts.end() || !worker->second || generation==generations.end() || !generation->second)
+        auto existing = findExistingContextProvenance(device);
+        if (!existing)
             throw std::logic_error("Exact original pool worker/backend/device/generation is not live");
-        return {device,generation->second,worker->second};
+        return std::move(*existing);
+    }
+
+    std::optional<GPUContextProvenance> GPUDeviceContextPool::findExistingContextProvenance(DeviceId device)
+    {
+        if (!device.is_gpu())
+            throw std::invalid_argument("Existing pool provenance requires an exact native device");
+        std::lock_guard lock(mutex_);
+        const auto ordinal = device.gpu_ordinal();
+        const auto &contexts = device.is_cuda() ? nvidia_contexts_ : amd_contexts_;
+        const auto &generations = device.is_cuda() ? nvidia_generations_ : amd_generations_;
+        const auto &retiring = device.is_cuda() ? retiring_nvidia_contexts_ : retiring_amd_contexts_;
+        const auto worker = contexts.find(ordinal);
+        const auto generation = generations.find(ordinal);
+        if (retiring.contains(ordinal))
+            throw std::logic_error("Cannot observe a retiring original GPU generation");
+        if (worker == contexts.end() && generation == generations.end())
+            return std::nullopt;
+        if (worker == contexts.end() || !worker->second || generation == generations.end() || !generation->second)
+            throw std::logic_error("Exact original pool worker/backend/device/generation is inconsistent");
+        return GPUContextProvenance(device, generation->second, worker->second);
     }
     std::shared_ptr<const NativeContextBirthKey> GPUContextProvenance::originalBirthKey()const
     {
@@ -677,6 +692,12 @@ namespace llaminar2
     ExclusiveGPUDeviceGenerationRetirement
     GPUDeviceContextPool::beginExclusiveGenerationRetirement(DeviceId device)
     {
+        return beginExclusiveGenerationRetirement(device, 0);
+    }
+
+    ExclusiveGPUDeviceGenerationRetirement
+    GPUDeviceContextPool::beginExclusiveGenerationRetirement(DeviceId device, std::uint64_t expected)
+    {
         const int ordinal = retirementDeviceOrdinal(device);
 
         std::shared_ptr<IWorkerGPUContext> retired_context;
@@ -698,6 +719,10 @@ namespace llaminar2
                     "[GPUDeviceContextPool] Device context generation is already retiring for " +
                     device.toString());
             }
+
+            if (expected && (!contexts.contains(ordinal) || !generations.contains(ordinal) ||
+                             generations.at(ordinal) != expected))
+                throw std::logic_error("Exclusive native retirement changed its original worker generation");
 
             /* Install exclusion even when no worker was materialized. The
              * backend runtime generation still exists and must not race a lazy

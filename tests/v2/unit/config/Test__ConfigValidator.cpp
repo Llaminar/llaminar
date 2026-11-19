@@ -171,13 +171,13 @@ TEST(Test__ConfigValidator, MoE_ReplicatedRoutedCompute_NoErrors)
     EXPECT_TRUE(noErrors(v, cfg));
 }
 
-TEST(Test__ConfigValidator, MoE_RoutedExpertTensorSharding_NotImplemented)
+TEST(Test__ConfigValidator, MoE_RoutedExpertTensorSharding_ValidRequestIntent)
 {
     auto v = ConfigValidator::createStandard();
     auto cfg = makeClean();
     cfg.routed_expert_compute_policy = RoutedExpertComputePolicy::TensorSharded;
 
-    EXPECT_TRUE(ruleFiresFor(v, "moe-routed-tensor-sharding-not-implemented", cfg));
+    EXPECT_TRUE(noErrors(v, cfg));
 }
 
 TEST(Test__ConfigValidator, StandardValidator_HasRules)

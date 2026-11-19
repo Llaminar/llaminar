@@ -968,10 +968,17 @@ int main(int argc, char **argv)
         [&] {
             auto mpi_session = llaminar2::MPIProcessSession::initialize(argc, argv);
             int result = 0;
-            constexpr std::string_view inventory_option = "--qfn-source-hardware-inventory=";
-            if (argc == 2 && std::string_view(argv[1]).starts_with(inventory_option))
+            const std::string_view option = argc == 2 ? argv[1] : "";
+            constexpr std::pair<std::string_view, HardwareInventoryScope> inventories[] = {
+                {"--qfn-source-hardware-inventory=", HardwareInventoryScope::SourceAdmission},
+                {"--preflight-hardware-inventory=", HardwareInventoryScope::DedicatedPreflight},
+                {"--shared-preflight-hardware-inventory=", HardwareInventoryScope::SharedPreflight}};
+            const auto inventory = std::ranges::find_if(inventories, [&](const auto& mode) {
+                return option.starts_with(mode.first);
+            });
+            if (inventory != std::end(inventories))
             {
-                try { exportQwen4ExpSourceHardware(std::string_view(argv[1]).substr(inventory_option.size())); }
+                try { exportQwen4ExpSourceHardware(option.substr(inventory->first.size()), inventory->second); }
                 catch (const std::exception &error) { std::cerr << error.what() << '\n'; result = 2; }
             }
             else

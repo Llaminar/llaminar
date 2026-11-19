@@ -36773,14 +36773,16 @@ namespace llaminar2
             return false;
         }
 
-        /*
-         * Shifted MTP KV row C is conditioned at absolute position C + 1.  The
-         * request transaction names the cache's authoritative device count, so
-         * compose that +1 in the backend input-normalization kernel and bind the
-         * captured sidecar to its persistent MTP_POSITION_IDS mailbox.  This
-         * keeps both dynamic inputs device-owned and gives every one-row KV-only
-         * sidecar the same physical position binding from its first capture.
-         */
+        const int shifted_position_offset =
+            mtpShiftedPrefixOffset(graph_builder_->config().mtpShiftedCacheOrigin());
+        if (shifted_position_offset < 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-target MTP shifted-row commit has an invalid cache origin");
+            return false;
+        }
+        // The input normalizer converts the authoritative shifted cache count
+        // into the RoPE position using the model's origin. QFN already counts
+        // its visible position-zero row, so that model uses no displacement.
         if (!executeMTPDepth0Batched(
                 /*draft_condition_tokens=*/nullptr,
                 /*token_count=*/1,
@@ -36806,7 +36808,7 @@ namespace llaminar2
                 /*draft_condition_token_stride=*/1,
                 /*draft_condition_ready_count=*/1,
                 /*draft_condition_ready_stride=*/1,
-                /*device_position_offset=*/1))
+                /*device_position_offset=*/shifted_position_offset))
         {
             return false;
         }

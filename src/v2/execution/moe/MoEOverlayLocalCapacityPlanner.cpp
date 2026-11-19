@@ -921,6 +921,8 @@ namespace llaminar2
                         if (domain.name == overlay_plan.continuation_domain)
                         {
                             config.routed_compute_policy = domain.routed_compute_policy;
+                            config.local_gpu_expert_kernel_policy = overlay_plan.local_gpu_expert_kernel_policy;
+                            config.gpu_expert_intermediate_tiling = overlay_plan.gpu_expert_intermediate_tiling;
                             if (domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
                             {
                                 if (domain.scope != ExecutionDomainScope::RANK_LOCAL || domain.owner_rank != inventory.rank)
@@ -1207,13 +1209,10 @@ namespace llaminar2
             for (const auto &device_plan : result.fixed_memory_plan.devices)
             {
                 resource_devices.insert(device_plan.device());
-                // Admission can reject a row before a completed physical plan
-                // exists. Keep its original per-owner contribution available at
-                // DEBUG in optimized builds: TRACE is compiled out there, which
-                // otherwise hides Auto/Apply ownership differences behind one
-                // aggregate fixed-byte count. This cold diagnostic reads the
-                // canonical BOM only; it creates no parallel accounting ledger.
-                LOG_DEBUG(
+                // Each proposed row quotes the canonical BOM. Keep per-device
+                // geometry at TRACE so rejected candidates cannot flood the
+                // definitive admission summary or its physical deficits.
+                LOG_TRACE(
                     "[MoEOverlayCapacity] fixed component BOM device="
                     << device_plan.device().toString()
                     << " weights=" << device_plan.weight_bytes()
@@ -1527,7 +1526,8 @@ namespace llaminar2
                         // This is the same passive source factory used by
                         // admission, never a second placement/owner map.
                         const auto cohort=MoEExpertShardCohort::checkedRankLocalGPU(source,profile.expert_count,members,
-                            MoEExpertShardCohort::gpuIntervals(source,int(members.size()),source.layer_idx));
+                            MoEExpertShardCohort::gpuIntervals(source,int(members.size()),source.layer_idx,
+                                preferredIntermediateGrain(input.overlay_plan->gpu_expert_intermediate_tiling)));
                         size_t concurrent_host=0;
                         for(size_t member=0;member<members.size();++member) {
                             const auto device=members[member].address.toLocalDeviceId();
@@ -1636,7 +1636,7 @@ namespace llaminar2
                     if (const auto *source = rank_plan.runtime.native_context_preparation->mandatoryBOM().find(
                             {rank_plan.rank, device}))
                         source_graph_bytes = source->bytes(PhysicalMemoryOwner::NativeGraphExecutable);
-                LOG_DEBUG("[MoEOverlayCapacity] captured inventory rank=" << rank_plan.rank
+                LOG_TRACE("[MoEOverlayCapacity] captured inventory rank=" << rank_plan.rank
                     << " device=" << device.toString()
                     << " identities=" << captured_inventory.model_graph_identity_count
                     << " variants=" << captured_inventory.model_graph_topology_variant_count

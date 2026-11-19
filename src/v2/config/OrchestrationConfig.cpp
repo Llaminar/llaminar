@@ -292,13 +292,18 @@ namespace llaminar2
         bool sameDomainIntentAfterHardwareBinding(
             const ExecutionDomainDefinition &requested,
             const ExecutionDomainDefinition &resolved,
-            std::size_t routed_tier_count)
+            std::size_t routed_tier_count,
+            bool qfn_mi50_tp4)
         {
             // Only automatic intent may become a different physical spelling.
             // Recompute its exact authorized result from the resolved topology;
             // accepting any concrete mode here would erase explicit intent.
             auto expected_compute = resolved;
             expected_compute.routed_compute_policy = requested.routed_compute_policy;
+            if (qfn_mi50_tp4 &&
+                (expected_compute.routed_compute_policy == RoutedExpertComputePolicy::Automatic ||
+                 expected_compute.routed_compute_policy == RoutedExpertComputePolicy::Unspecified))
+                expected_compute.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
             if (requested.name != resolved.name ||
                 requested.participants.size() != resolved.participants.size() ||
                 !sameWeights(requested.weights, resolved.weights) ||
@@ -871,7 +876,8 @@ namespace llaminar2
             if (!sameDomainIntentAfterHardwareBinding(
                     requested.toExecutionDomainDefinition(),
                     found->second->toExecutionDomainDefinition(),
-                    config.moe_routed_expert_plan->routed_tiers.size()))
+                    config.moe_routed_expert_plan->routed_tiers.size(),
+                    resolved_plan->usesQFNMI50TP4() && requested.name == resolved_plan->continuation_domain))
             {
                 errors.push_back(
                     "Hardware binding changed non-location intent for MoE overlay domain '" +
@@ -903,7 +909,8 @@ namespace llaminar2
             if (!sameDomainIntentAfterHardwareBinding(
                     existing->toExecutionDomainDefinition(),
                     resolved_definition,
-                    config.moe_routed_expert_plan->routed_tiers.size()))
+                    config.moe_routed_expert_plan->routed_tiers.size(),
+                    resolved_plan->usesQFNMI50TP4() && resolved.name == resolved_plan->continuation_domain))
             {
                 errors.push_back(
                     "Resolved MoE overlay domain '" + resolved.name +

@@ -1,10 +1,11 @@
 /**
  * @file RankOrderedPeerPushOptIn.h
- * @brief Process-lifetime policy for the original ROCm peer transport.
+ * @brief Startup and per-communicator policy for the original ROCm peer transport.
  */
 #pragma once
 
 #include "backends/PeerAccessCoverage.h"
+#include "collective/RankOrderedNativeResources.h"
 #include "utils/DebugEnv.h"
 #include <optional>
 #include <string_view>
@@ -32,15 +33,45 @@ namespace llaminar2
         return target.substr(0, target.find(':')) == "gfx906";
     }
 
+    /** @brief Immutable process request; automatic selection is evaluated for each original communicator. */
+    enum class RankOrderedPeerPushRequest { Automatic, Disabled, Required };
+
     /**
-     * @brief Freeze the peer selection before original communicator quotation.
-     * @return Whether explicit startup policy enables the admitted small route.
-     * @details Quotation and graph recording read the same immutable selection.
-     * A later environment change cannot mutate an original communicator or its captures.
+     * @param owner Native transport ownership of the actual model's LocalTP context.
+     * @return Frozen request used to authenticate original communicator creation and pooling.
      */
-    inline bool rankOrderedPeerPushStartupOptIn()
+    inline RankOrderedPeerPushRequest rankOrderedPeerPushRequest(RankOrderedQuotePolicy owner)
     {
-        static const bool selected = DebugEnv::isTruthyEnv("LLAMINAR_RCCL_RANK_ORDERED_PUSH");
-        return selected;
+        static const auto request = [] {
+            const auto *value = DebugEnv::envValue("LLAMINAR_RCCL_RANK_ORDERED_PUSH");
+            if (!value) return RankOrderedPeerPushRequest::Automatic;
+            if (DebugEnv::isTruthyEnvValue(value)) return RankOrderedPeerPushRequest::Required;
+            if (DebugEnv::isFalseyEnvValue(value)) return RankOrderedPeerPushRequest::Disabled;
+            throw std::invalid_argument("LLAMINAR_RCCL_RANK_ORDERED_PUSH requires a boolean value");
+        }();
+        return request == RankOrderedPeerPushRequest::Automatic && owner == RankOrderedQuotePolicy::ExplicitOnly
+            ? RankOrderedPeerPushRequest::Disabled : request;
+    }
+
+    /**
+     * @brief Select the measured rank-local transport before quoting any device storage.
+     * @param request Frozen startup override.
+     * @param coverage Directed peer data for exactly these participants.
+     * @param qualified_isa Whether every member supports the native program.
+     * @param measured_cohort Whether this is the benchmarked four-MI50 arrangement.
+     * @return Whether to quote and eventually prepare direct-push resources.
+     * @throws std::invalid_argument If an explicitly required transport is unavailable.
+     */
+    inline bool selectRankOrderedPeerPush(RankOrderedPeerPushRequest request,
+        std::optional<PeerAccessCoverage> coverage, bool qualified_isa, bool measured_cohort)
+    {
+        if (request == RankOrderedPeerPushRequest::Required) {
+            if (!qualified_isa)
+                throw std::invalid_argument("RCCL FP32 direct peer requires qualified gfx906 participants");
+            requireRankOrderedPeerPushClique(coverage);
+            return true;
+        }
+        return request == RankOrderedPeerPushRequest::Automatic && measured_cohort &&
+               qualified_isa && coverage == PeerAccessCoverage::Complete;
     }
 }

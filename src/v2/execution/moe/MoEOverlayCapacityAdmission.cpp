@@ -778,7 +778,8 @@ namespace llaminar2
                                           layer, static_cast<int>(members.size())))
                                 : MoEExpertShardCohort::checkedRankLocalGPU(layer, num_experts, members,
                                       MoEExpertShardCohort::gpuIntervals(
-                                          layer, static_cast<int>(members.size()), layer.layer_idx))));
+                                          layer, static_cast<int>(members.size()), layer.layer_idx,
+                                          preferredIntermediateGrain(plan.gpu_expert_intermediate_tiling)))));
                 if (tier.memory_budget_bytes != 0)
                     throw std::invalid_argument(
                         "Tensor-sharded tiers require physical PMA budgets, not an ambiguous aggregate tier byte cap");

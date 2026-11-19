@@ -3885,7 +3885,7 @@ bool rocmGDN_short_conv1d(
     return true;
 }
 
-bool rocmGDN_short_conv1d_effective(
+bool rocmGDN_short_conv1d_effective_with_policy(
     const float *input, const float *weight, const float *bias,
     float *output,
     const float *initial_conv_state,
@@ -3896,7 +3896,7 @@ bool rocmGDN_short_conv1d_effective(
     float *state_snapshots,
     int snapshot_stride_floats,
     int max_snapshot_rows,
-    int device_idx, void *stream)
+    int device_idx, void *stream, bool qualified_default)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
@@ -3911,7 +3911,7 @@ bool rocmGDN_short_conv1d_effective(
     if (complete_verifier_capture && seq_len >= 2 && seq_len <= 8 &&
         channels == convChannels && kernel_size == convTaps &&
         !bias && apply_silu && initial_conv_state && device_effective_seq_len &&
-        llaminar2::qfnGroupedGDNConvK4Experiment() &&
+        llaminar2::qfnGroupedGDNConvK4Experiment(qualified_default) &&
         [&] {
             const auto& hardware = llaminar2::rocmHardwareMetadata().at(device_idx);
             return hardware.native_wave_width == 64 && hardware.compute_units == 60 &&
@@ -3987,6 +3987,24 @@ bool rocmGDN_short_conv1d_effective(
         return false;
     }
     return true;
+}
+
+bool rocmGDN_short_conv1d_effective(
+    const float *input, const float *weight, const float *bias,
+    float *output,
+    const float *initial_conv_state,
+    float *updated_conv_state,
+    int seq_len, int channels, int kernel_size,
+    bool apply_silu,
+    const int *device_effective_seq_len,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int device_idx, void *stream)
+{
+    return rocmGDN_short_conv1d_effective_with_policy(input,weight,bias,output,initial_conv_state,
+        updated_conv_state,seq_len,channels,kernel_size,apply_silu,device_effective_seq_len,
+        state_snapshots,snapshot_stride_floats,max_snapshot_rows,device_idx,stream,false);
 }
 
 /**

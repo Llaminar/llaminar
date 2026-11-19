@@ -12,6 +12,7 @@
  * storage and remains ordered by the same original participant stream.
  */
 #include "collective/PeerPushReduction.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
 #include <hip/hip_runtime.h>
 
 namespace llaminar2
@@ -136,12 +137,13 @@ namespace llaminar2
     bool rocmPeerPushResidentCapacity(std::size_t &capacity)
     {
         capacity = 0;
-        int per_cu = 0, device = -1, compute_units = 0;
+        int per_cu = 0, device = -1;
         if (hipGetDevice(&device) != hipSuccess ||
-            hipDeviceGetAttribute(&compute_units, hipDeviceAttributeMultiprocessorCount, device) != hipSuccess ||
             hipOccupancyMaxActiveBlocksPerMultiprocessor(&per_cu, peerPushFP32Kernel, PeerPushLayout::threads, 0) != hipSuccess ||
-            per_cu <= 0 || compute_units <= 0) return false;
-        capacity = std::size_t(per_cu) * compute_units;
+            per_cu <= 0) return false;
+        // Occupancy belongs to this code object. The processor count belongs to
+        // the immutable device inventory captured before communicator admission.
+        capacity = std::size_t(per_cu) * rocmHardwareMetadata().at(device).compute_units;
         return true;
     }
 

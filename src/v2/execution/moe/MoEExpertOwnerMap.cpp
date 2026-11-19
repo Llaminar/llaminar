@@ -554,7 +554,8 @@ namespace llaminar2
                 const int degree = static_cast<int>(domain.participants.size());
                 auto cohort = std::make_shared<const MoEExpertShardCohort>(gpu
                     ? MoEExpertShardCohort::checkedRankLocalGPU(*source, static_cast<int>(experts), std::move(members),
-                        MoEExpertShardCohort::gpuIntervals(*source, degree, placement.layer))
+                        MoEExpertShardCohort::gpuIntervals(*source, degree, placement.layer,
+                            preferredIntermediateGrain(plan.gpu_expert_intermediate_tiling)))
                     : MoEExpertShardCohort::checked(*source, static_cast<int>(experts), std::move(members),
                         MoEExpertShardCohort::balancedIntervals(*source, degree)));
                 // Keep the source authority even with zero selected experts.

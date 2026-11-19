@@ -2382,14 +2382,12 @@ namespace llaminar2::test
 #endif
 
     /**
-     * @brief Check actual production order, original cutpoints and both CPU placements.
+     * @brief Check shared-FFN ordering and collective symmetry on both physical TP participants.
      * @param cuda Select CUDA endpoints when true, otherwise ROCm endpoints.
      */
-    void assertPrefillCPUTicketPrecedesSharedFFN(bool cuda)
+    void assertLocalTPPrefillCPUTicketPrecedesSharedFFN(bool cuda)
     {
         const auto endpoint = [&](int participant) { return cuda ? DeviceId::cuda(participant) : DeviceId::rocm(participant); };
-        assertCanonicalTicketGraphLowering(endpoint(0), CpuTicketPlacement::RankLocal,
-            CanonicalTicketContinuation::SingleGPU, CanonicalTicketSharedBranch::Present);
         for (const auto policy : {CanonicalTicketContinuation::NativeLocalTP,
                                  CanonicalTicketContinuation::MappedLocalTP,
                                  CanonicalTicketContinuation::MixedLocalTP})
@@ -2412,14 +2410,28 @@ namespace llaminar2::test
     /** @test Existing CUDA CPU-ticket publication precedes shared FFN only for ordinary prefill. */
     TEST(Test__Qwen35MoEGraphNativeProductionLowering, PrefillCPUTicketPrecedesSharedFFNCUDA)
     {
-        assertPrefillCPUTicketPrecedesSharedFFN(true);
+        assertCanonicalTicketGraphLowering(DeviceId::cuda(0), CpuTicketPlacement::RankLocal,
+            CanonicalTicketContinuation::SingleGPU, CanonicalTicketSharedBranch::Present);
+    }
+
+    /** @test Both CUDA TP participants preserve collective order across early CPU ticket publication. */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering, LocalTPPrefillCPUTicketPrecedesSharedFFNCUDA)
+    {
+        assertLocalTPPrefillCPUTicketPrecedesSharedFFN(true);
     }
 #endif
 #ifdef HAVE_ROCM
     /** @test Existing ROCm CPU-ticket publication precedes shared FFN only for ordinary prefill. */
     TEST(Test__Qwen35MoEGraphNativeProductionLowering, PrefillCPUTicketPrecedesSharedFFNROCm)
     {
-        assertPrefillCPUTicketPrecedesSharedFFN(false);
+        assertCanonicalTicketGraphLowering(DeviceId::rocm(0), CpuTicketPlacement::RankLocal,
+            CanonicalTicketContinuation::SingleGPU, CanonicalTicketSharedBranch::Present);
+    }
+
+    /** @test Both ROCm TP participants preserve collective order across early CPU ticket publication. */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering, LocalTPPrefillCPUTicketPrecedesSharedFFNROCm)
+    {
+        assertLocalTPPrefillCPUTicketPrecedesSharedFFN(false);
     }
 #endif
 

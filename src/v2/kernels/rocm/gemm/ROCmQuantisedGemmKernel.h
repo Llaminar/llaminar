@@ -97,6 +97,7 @@
 
 #pragma once
 
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "../../../tensors/TensorKernels.h"
 #include "kernels/rocm/gdn/ROCmGatedNormSingleQ8.h"
 #include "../../../tensors/BlockStructures.h"
@@ -748,6 +749,9 @@ namespace llaminar2
             /** @copydoc ITensorGemm::multiply_q8_residual_corrected(HCResidualDownInput,TensorBase*,DeviceRowRange,int,int,DeviceWorkspaceManager*) */
             void multiply_q8_residual_corrected(HCResidualDownInput input,TensorBase*output,
                 DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace) override;
+            /** @brief Use the admitted grouped HC-up leaf while retaining separate read publication. */
+            void multiplyHCResidualDownWithPolicy(LocalGPUExpertKernelPolicy policy,HCResidualDownInput input,
+                TensorBase*output,DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace);
 
             bool exportNativeQuantisedSourceIdentity(
                 NativeQuantisedSourceIdentity &out) const override;

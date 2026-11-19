@@ -1333,6 +1333,8 @@ namespace llaminar2
 
         /** @return Cold original-communicator resource quotes; empty for unselected policy. */
         virtual std::vector<RankOrderedNativeResources> rankOrderedResources() const { return {}; }
+        /** @return Whether the bound communicator owns a native direct-push quote, without copying its BOM. */
+        virtual bool hasRankOrderedPeerPush() const noexcept { return false; }
 
         /** @brief Admit and prepare original native peer edges before graph capture.
          * @param memory Original rank PMA; every native owner remains reserved through retirement.

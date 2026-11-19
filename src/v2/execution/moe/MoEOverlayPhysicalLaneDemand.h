@@ -278,7 +278,8 @@ inline std::vector<MoEOverlayPhysicalProjectionTarget> configuredMoEOverlayProje
             const int degree=static_cast<int>(members.size());
             const auto cohort=gpu
                 ? MoEExpertShardCohort::checkedRankLocalGPU(source,experts,std::move(declared),
-                    MoEExpertShardCohort::gpuIntervals(source,degree,source.layer_idx))
+                    MoEExpertShardCohort::gpuIntervals(source,degree,source.layer_idx,
+                        preferredIntermediateGrain(plan.gpu_expert_intermediate_tiling)))
                 : MoEExpertShardCohort::checked(source,experts,std::move(declared),
                     MoEExpertShardCohort::balancedIntervals(source,degree));
             for(size_t member=0;member<members.size();++member)

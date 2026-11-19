@@ -8,6 +8,7 @@
  * so reset, rollback and prefix archive share one lifecycle and frontier.
  */
 #include "Qwen4ExpGraph.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "Qwen4ExpEarlyCurrentInput.h"
 #include "execution/qwen4exp/PooledImmutableSourceRootBinding.h"
 #include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
@@ -72,8 +73,10 @@ void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph, const LayerComposi
     const auto &input=*forward_input_construction_;
     if(input.execution_phase!=ForwardExecutionPhase::Decode ||
        input.execution_role!=ForwardExecutionRole::MainInference || input.seq_len!=1 || input.batch_size!=1)return;
+    const bool qualified_domain = config_.moe.routed_expert_plan &&
+        config_.moe.routed_expert_plan->usesQFNMI50TP4();
 #ifdef HAVE_ROCM
-    if (usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionOptIn(), composition.device,
+    if (usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionEnabled(qualified_domain), composition.device,
             config_.moe.routed_compute_policy, input.execution_phase, input.execution_role,
             input.seq_len, input.batch_size) &&
         isGDNLayer(composition.layer))
@@ -84,7 +87,7 @@ void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph, const LayerComposi
 #endif
     const auto &internalBoundary = composition.attention_terminal;
     const auto *boundary=graph.getNode(internalBoundary);
-    if(useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNOptIn(),input.execution_phase,input.execution_role,input.seq_len,input.batch_size)) {
+    if(useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNEnabled(qualified_domain),input.execution_phase,input.execution_role,input.seq_len,input.batch_size)) {
         if(!boundary || !boundary->device.is_rocm())
             throw std::invalid_argument("QFN retained full HC/FFN requires original ROCm layer composition");
         if(config_.qfn_hc_norm_q8_candidate||

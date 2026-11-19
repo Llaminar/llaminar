@@ -556,14 +556,31 @@ namespace llaminar2
                 if (embedding_sharded) result.communication += reduction(continuation);
             }
             result.compute += planningIndependentSeconds(ordinary) + planningIndependentSeconds(experts);
-            result.communication += 2 * reduction(tp); // Attention and FFN row-parallel joins.
-            // The shared FFN retains a native sum/reduce-scatter volume proxy
-            // above. Projection mode additionally exchanges intermediates and
-            // assembles independent down columns; whole-expert mode does not.
-            const bool projection = std::any_of(continuation.begin(), continuation.end(), [&](size_t index) {
-                return local[index].routed[layer] && local[index].routed[layer]->projection_ownership.has_value();
-            });
-            if (projection) result.communication += projectionCommunication(continuation, layer);
+            result.communication += reduction(tp); // Attention row-parallel join.
+            const auto isStaticFragment = [&](size_t index) {
+                const auto *expert = local[index].routed[layer];
+                return expert && expert->projection_ownership &&
+                    !expert->projection_ownership->hasMovableProjectionSet();
+            };
+            const bool static_fragments = std::any_of(continuation.begin(), continuation.end(), isStaticFragment);
+            if (static_fragments)
+            {
+                if (!std::all_of(continuation.begin(), continuation.end(), isStaticFragment))
+                    throw std::logic_error("Static tensor-shard FFN sum requires every original continuation member");
+                // Routed and shared partials are combined locally, then the
+                // original cohort sums live FP32 rows once. Decode replicas
+                // may remove the attention TP join but never this FFN join.
+                result.communication += reduction(continuation);
+                result.qualifications.insert("static tensor-shard FFN uses one live FP32 sum across the original cohort; native reduction service proxy");
+            }
+            else
+            {
+                result.communication += reduction(tp); // Ordinary FFN/shared join.
+                const bool projection = std::any_of(continuation.begin(), continuation.end(), [&](size_t index) {
+                    return local[index].routed[layer] && local[index].routed[layer]->projection_ownership;
+                });
+                if (projection) result.communication += projectionCommunication(continuation, layer);
+            }
             // Ordinary TP replicas do not become a sparse overlay: their
             // row-parallel joins were already charged above. Overlay routing
             // uses its bound logical root, never vector order or discovery rank.

@@ -352,7 +352,7 @@ namespace
 
 #ifdef HAVE_ROCM
         /** @brief Use the same original runtime route publisher, then consume its exact grouped frontier. */
-        bool executeFrontier(const rocm::grouped_ffn::LocalPublication& publication,void* stream)
+        bool executeFrontier(const rocm::grouped_ffn::LocalPublication& publication,bool direct_bank,void* stream)
         {
             if(!prepared || prepared->stream!=stream || !params.kernel_owner->kernel ||
                 params.row_mode!=MoEIntermediateShardRowMode::Grouped ||
@@ -364,7 +364,7 @@ namespace
             if(!kernel)throw std::logic_error("Grouped FFN frontier requires the original ROCm runtime owner");
             kernel->setGPUStream(stream);
             auto* runtime=params.runtime->deviceLayerState(layer);
-            if(qfnGroupedFFNDirectBankExperiment()) {
+            if(direct_bank) {
                 auto direct=publication;
                 direct.directRouter={params.routing_indices.tensor,params.routing_weights.tensor,params.demand};
                 return requireOperation(kernel->executeGroupedFFNFrontierFromPublishedRuntimePlan(runtime,
@@ -937,28 +937,28 @@ MoEIntermediateShardFFNOutput finalizeMoEIntermediateShardFFN(ComputeGraph &grap
         return {sum_name,finalization.local_combined,p.family,p.live_rows,p.rows,routed.model_columns,p.phase};
     }
 #ifdef HAVE_ROCM
-    if(auto program=groupedFFNFrontierProgram(*binding,s,prepared))
+    const bool original_fp16_router=router &&
+        router->declaration().routed_pipeline_kernel_owner==p.kernel_owner &&
+        router->declaration().input==p.hidden.tensor && p.live_rows &&
+        router->declaration().active_row_count_device==p.live_rows->countOwner() &&
+        router->declaration().gate_weights && router->declaration().gate_weights->native_type()==TensorType::FP16;
+    if(auto selection=groupedFFNFrontierProgram(*binding,s,prepared,original_fp16_router))
     {
         const auto compute_name=p.prefix+"local_fragment_compute";
         const auto* node=graph.getNode(compute_name);
         const auto* compute=node?dynamic_cast<const Stage*>(node->stage.get()):nullptr;
         if(!compute || compute->binding()!=binding || compute->phase()!=Phase::Compute)
             throw std::logic_error("Grouped FFN frontier lost the original local compute producer");
-        if(frontier::usesExactK32Sums(*program)) {
-            const auto* routerNode=graph.getNode(p.router_node);
-            const auto* router=routerNode?dynamic_cast<const MoERoutingStage*>(routerNode->stage.get()):nullptr;
+        if(frontier::usesExactK32Sums(selection->program)) {
             auto& owner=*p.kernel_owner;
-            if(!router || router->declaration().routed_pipeline_kernel_owner!=p.kernel_owner ||
-               router->declaration().input!=p.hidden.tensor ||
-               router->declaration().active_row_count_device!=p.live_rows->countOwner() ||
-               !router->declaration().gate_weights || router->declaration().gate_weights->native_type()!=TensorType::FP16)
+            if(!original_fp16_router)
                 throw std::logic_error("Exact K32 sums need the original shared counted FP16 router owner");
             if(!owner.kernel)owner.kernel=llaminar::v2::kernels::KernelFactory::createMoEKernel(binding->device());
             if(!owner.kernel || !owner.kernel->bindRouterQ8HiddenPublication(owner.router_q8_publication,
                     MoERouterQ8PublicationAccess::ProducerAndConsumerWithExactK32Sums))
                 throw std::logic_error("Exact K32 sum publication failed cold binding");
         }
-        auto frontier=std::make_unique<GroupedFFNFrontierStage>(binding,s,prepared,std::move(*program),shared_gate,
+        auto frontier=std::make_unique<GroupedFFNFrontierStage>(binding,s,prepared,std::move(*selection),shared_gate,
             finalization.local_combined,finalization.shared_ffn_node);
         graph.replaceClosedLocalRegion({compute_name,routed.producer,finalization.shared_ffn_node},
             finalization.shared_ffn_node,std::move(frontier));

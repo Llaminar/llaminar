@@ -257,13 +257,13 @@ enum class HCGroupedShortKSchedule { Disabled, Column32, Column64 };
  * @param stream Exact non-null stream from operand and publication validation.
  * @return The admitted native schedule for this tuple and stream owner.
  */
-inline HCGroupedShortKSchedule selectHCGroupedShortK(const GPUQ8ResidualCorrectionArgs& a, hipStream_t stream)
+inline HCGroupedShortKSchedule selectHCGroupedShortK(const GPUQ8ResidualCorrectionArgs& a, hipStream_t stream,bool grouped_short_k_default)
 {
     const auto physical=a.rows.physicalRows();
     if(physical<2||physical>8||a.weights.n!=10240||a.weights.k!=320||
        a.weights.blocks_per_row!=10||a.weights.codebook_id!=19||!a.weights.source_identity_present||
        a.weights.source_codebook_id!=19||a.weights.source_is_superblock||
-       !qfnGroupedHCUpShortKExperiment())
+       !qfnGroupedHCUpShortKExperiment(grouped_short_k_default && physical==4))
         return HCGroupedShortKSchedule::Disabled;
     int ordinal=-1;
     if(const auto error=hipStreamGetDevice(stream, &ordinal);error!=hipSuccess)
@@ -647,7 +647,7 @@ inline void launchOrderedShortK(const GPUQ8ResidualCorrectionArgs &a,
  */
 template<bool SingleGroupReference=false,class Publication>
 static void submitQ8ResidualProjection(const GPUQ8ResidualCorrectionArgs &a, void *stream,
-                                       NativeEmbeddingIQTables tables,const Publication& publication)
+                                       NativeEmbeddingIQTables tables,const Publication& publication,bool grouped_short_k_default=false)
 {
 #if defined(Q8_RESIDUAL_CUDA)
     static_assert(!SingleGroupReference,"The original grouped reference belongs only to HIP");
@@ -679,7 +679,7 @@ static void submitQ8ResidualProjection(const GPUQ8ResidualCorrectionArgs &a, voi
     using Q8R_NAMESPACE::HCGroupedShortKSchedule;
     auto groupedHCShortK=HCGroupedShortKSchedule::Disabled;
     if constexpr (!SingleGroupReference && std::is_same_v<Publication,GPUHCResidualDownPublication>)
-        groupedHCShortK=Q8R_NAMESPACE::selectHCGroupedShortK(a,native);
+        groupedHCShortK=Q8R_NAMESPACE::selectHCGroupedShortK(a,native,grouped_short_k_default);
 #endif
     const auto grid = shortGeometry ? shortGeometry->blocks : geometry.blocks;
     if ((tasks + 7) / 8 > INT_MAX || grid > INT_MAX)
@@ -774,6 +774,12 @@ void Q8R_FACTORY(const GPUQ8ResidualCorrectionArgs& a,void* stream,NativeEmbeddi
 void Q8R_HC_FACTORY(const GPUHCResidualDownPublication& hc,void* stream,NativeEmbeddingIQTables tables) {
  submitQ8ResidualProjection(hc.projection,stream,tables,hc);
 }
+#if !defined(Q8_RESIDUAL_CUDA)
+void rocmHCResidualDownQ8ProjectionWithPolicy(const GPUHCResidualDownPublication& hc,void* stream,
+    NativeEmbeddingIQTables tables,bool grouped_short_k_default) {
+    submitQ8ResidualProjection(hc.projection,stream,tables,hc,grouped_short_k_default);
+}
+#endif
 /** @brief Submit only the sealed M1 signed-Q8 producer-shaped read candidate. */
 void Q8R_HC_SHORT_READ_FACTORY(const GPUHCResidualReadProjection& read,void* stream) {
  const auto& a=read.down.projection;

@@ -7,23 +7,27 @@
  */
 namespace frontier = rocm::grouped_ffn;
 
-/** @brief Admit the original width or the independently selected F160 program. */
-bool groupedFFNFrontierWidthEligible(int columns)
+/** @brief Freeze the measured implementation and its original route/bank producer. */
+struct GroupedFFNFrontierSelection
 {
-    return columns==frontier::routedWidth ||
-        (columns==frontier::routedColumns(frontier::RoutedGeometry::F160) &&
-         qfnGroupedFFNEqualFrontierOptIn() && qfnGroupedFFNDirectBankExperiment());
-}
+    frontier::Program program; ///< Exact physical numerical and workspace program.
+    bool direct_bank; ///< Borrow the router packet and its request-selected bank directly.
+};
 
-/** @return The cold-selected local program for a source-compatible counted ROCm verifier stage. */
-std::optional<frontier::Program> groupedFFNFrontierProgram(const Binding& binding,
-    const SharedExpertFFNStage::Params& shared,const DeviceMoEExpertDescriptor& source)
+/**
+ * @brief Choose the closed counted verifier program from already admitted plan and source.
+ * @param binding Original participant owner, complete row count and source declaration.
+ * @param shared Exact shared-stage source and scratch declaration.
+ * @param source Original prepared shared gate, up and down descriptors.
+ * @param original_fp16_router Whether the finalizer authenticated the original counted FP16 router.
+ * @return Local program and bank authority, or no replacement for the declared staged program.
+ */
+std::optional<GroupedFFNFrontierSelection> groupedFFNFrontierProgram(const Binding& binding,
+    const SharedExpertFFNStage::Params& shared,const DeviceMoEExpertDescriptor& source,bool original_fp16_router)
 {
     const auto& p=binding.params;
-    if(!qfnGroupedFFNFrontierOptIn() || !binding.device().is_rocm() ||
-       p.phase!=MoEOverlayServicePhaseHint::GroupedVerifier ||
+    if(!binding.device().is_rocm() || p.phase!=MoEOverlayServicePhaseHint::GroupedVerifier ||
        p.row_mode!=MoEIntermediateShardRowMode::Grouped || !frontier::supportsFormatRows(p.rows) ||
-       (p.rows!=frontier::capacity && !qfnGroupedFFNAllFormatsOptIn()) ||
        p.top_k!=frontier::topK || !p.live_rows || !p.live_rows->countOwner() ||
        binding.route_authority==RouteAuthority::PreparedService ||
        binding.original.modelColumns()!=frontier::hidden ||
@@ -32,18 +36,30 @@ std::optional<frontier::Program> groupedFFNFrontierProgram(const Binding& bindin
        source.weight_format!=DeviceMoEWeightFormat::NativeQuantised ||
        !shared.gate_scratch || !shared.up_scratch || !shared.required_router_q8_publication)
         return std::nullopt;
+    const bool formats=qfnGroupedFFNAllFormatsOptIn();
+    if(p.rows!=frontier::capacity && !formats)return std::nullopt;
     const int columns=binding.original.localIntermediateColumns();
-    if(qfnGroupedFFNAllFormatsOptIn()) {
-        if(!qfnGroupedFFNDirectBankExperiment())
+    const bool equal=columns==frontier::routedColumns(frontier::RoutedGeometry::F160);
+    const auto count=p.live_rows->captureIdentity();
+    const bool measured_default=p.verifier_kernel_policy==LocalGPUExpertKernelPolicy::QFNMI50TP4 &&
+        equal && shared.intermediate==frontier::sharedWidth && p.rows==frontier::capacity &&
+        count.count_capacity==p.rows && count.first_physical_row==0 && count.repeats_per_row==1;
+    if(!qfnGroupedFFNFrontierOptIn(measured_default))return std::nullopt;
+    const bool direct=qfnGroupedFFNDirectBankExperiment(measured_default);
+    const auto& declaration=binding.descriptor_declaration;
+    // An explicit all-format diagnostic keeps its portable source-aware program.
+    // The automatic F160 M4 lane uses the independently timed fixed schedules,
+    // so it can qualify the exact affine-sum producer/consumer jointly.
+    if(formats) {
+        if(!direct)
             throw std::invalid_argument("All-format grouped FFN requires the counted direct-bank router");
-        const auto& original=binding.descriptor_declaration.sourceFormats();
-        return frontier::SourceFormatProgram::prepare(frontier::declareSourceFormats(columns,shared.intermediate,
-            binding.descriptor_declaration.nativeGateUpEnvelope(),binding.descriptor_declaration.nativeDownEnvelope(),
-            {original[0].native_quantised,original[1].native_quantised,original[2].native_quantised},
-            {source.gate,source.up,source.down}));
+        const auto& original=declaration.sourceFormats();
+        return GroupedFFNFrontierSelection{frontier::SourceFormatProgram::prepare(
+            frontier::declareSourceFormats(columns,shared.intermediate,
+                declaration.nativeGateUpEnvelope(),declaration.nativeDownEnvelope(),
+                {original[0].native_quantised,original[1].native_quantised,original[2].native_quantised},
+                {source.gate,source.up,source.down})),true};
     }
-    // The legacy fixed-layout experiment was measured on MI50. The all-format
-    // program above admits portable ROCm capture independently of table coverage.
     const auto hardware=rocm::nativeQuantisedHardwareForDevice(binding.device().ordinal);
     if(native_quantised::selectVerifierDispatchTable(hardware)!=native_quantised::VerifierDispatchTable::MI50)
         return std::nullopt;
@@ -51,19 +67,19 @@ std::optional<frontier::Program> groupedFFNFrontierProgram(const Binding& bindin
         return m.valid() && m.n==n && m.k==k && m.codebook_id==19 &&
             m.source_identity_present && m.source_codebook_id==19;
     };
-    if(!groupedFFNFrontierWidthEligible(columns) || shared.intermediate!=frontier::sharedWidth ||
+    if((columns!=frontier::routedWidth && !(equal && direct && qfnGroupedFFNEqualFrontierOptIn(measured_default))) ||
+       shared.intermediate!=frontier::sharedWidth ||
        !exactShared(source.gate,frontier::sharedWidth,frontier::hidden) ||
        !exactShared(source.up,frontier::sharedWidth,frontier::hidden) ||
        !exactShared(source.down,frontier::hidden,frontier::sharedWidth))return std::nullopt;
-    const auto& declaration=binding.descriptor_declaration;
     if(const auto decoder=frontier::measuredDecoder(columns,declaration.nativeGateUpEnvelope(),
             declaration.nativeDownEnvelope(),declaration.sourceFormats())) {
         const auto geometry=static_cast<frontier::RoutedGeometry>(columns);
-        const bool sums=qfnGroupedFFNDirectBankExperiment() && frontier::exactK32SumsOptIn() &&
-            frontier::hasMeasuredSumLayout(geometry,*decoder,binding.descriptor_declaration.sourceFormats(),
+        const bool sums=direct && frontier::exactK32SumsOptIn(measured_default && original_fp16_router) &&
+            frontier::hasMeasuredSumLayout(geometry,*decoder,declaration.sourceFormats(),
                 {source.gate,source.up,source.down});
-        return frontier::MeasuredProgram{geometry,*decoder,sums?frontier::AffineSumSource::RouterPublication:
-            frontier::AffineSumSource::Inline};
+        return GroupedFFNFrontierSelection{frontier::MeasuredProgram{geometry,*decoder,
+            sums?frontier::AffineSumSource::RouterPublication:frontier::AffineSumSource::Inline},direct};
     }
     return std::nullopt;
 }
@@ -74,6 +90,7 @@ class GroupedFFNFrontierStage final : public IComputeStage, public IWorkspaceCon
     std::shared_ptr<Binding> binding_;
     SharedExpertFFNStage::Params shared_;
     frontier::LocalPublication publication_;
+    const bool direct_bank_;
     BufferId combined_id_;
     std::string name_;
     DeviceWorkspaceManager* workspace_=nullptr;
@@ -139,12 +156,13 @@ class GroupedFFNFrontierStage final : public IComputeStage, public IWorkspaceCon
 public:
     /** @brief Capture the original exact shared bindings and the original local plan owner. */
     GroupedFFNFrontierStage(std::shared_ptr<Binding> binding,const SharedExpertFFNStage::Params& shared,
-        const DeviceMoEExpertDescriptor& descriptor,frontier::Program program,TensorBase* gate,
+        const DeviceMoEExpertDescriptor& descriptor,GroupedFFNFrontierSelection selection,TensorBase* gate,
         MoEIntermediateShardTensorBinding combined,std::string name)
         : IComputeStage(binding->device()),binding_(std::move(binding)),shared_(shared),
         publication_{*binding_->params.live_rows,{descriptor.gate,descriptor.up,descriptor.down},gate,
             shared.gate_scratch,shared.up_scratch,dynamic_cast<TensorBase*>(binding_->params.output.tensor),
-            shared.output,dynamic_cast<TensorBase*>(combined.tensor),{},std::move(program)},combined_id_(combined.id),name_(std::move(name))
+            shared.output,dynamic_cast<TensorBase*>(combined.tensor),{},std::move(selection.program)},
+            direct_bank_(selection.direct_bank),combined_id_(combined.id),name_(std::move(name))
     {
         for(auto* tensor:extraOperands())
             if(!tensor || tensor->native_type()!=TensorType::FP32)
@@ -223,7 +241,7 @@ public:
         validateSeal();
         auto value=binding_->signature^0x46464e47524f5550ULL;
         const auto mix=[&](std::uint64_t part){value=(value^part)*kFNV1a64Prime;};
-        mix(qfnGroupedFFNDirectBankExperiment());
+        mix(direct_bank_);
         mix(frontier::usesExactK32Sums(publication_.program));
         mix(publication_.program.index());
         mix(publication_.rows.physicalRows());
@@ -280,7 +298,7 @@ public:
                !runtime.deferred_verifier_route_expert_ids || !runtime.deferred_verifier_route_participant_ids)
                 throw std::logic_error("Grouped FFN frontier requires the original full-capacity deferred route planes");
         }
-        if(qfnGroupedFFNDirectBankExperiment())
+        if(direct_bank_)
             publication_.boundSourceProgram=frontier::BoundSourceFormatProgram::prepare(
                 *binding_->params.runtime,binding_->layer,publication_.program,publication_.sharedWeights);
         const auto tensors=extraOperands();
@@ -320,7 +338,7 @@ public:
             execution.requirePreparedInput(input.tensor);
         execution.requirePreparedInput(publication_.sharedInputGate);
         for(const auto& output:outputs())execution.requirePreparedOutput(output.tensor);
-        if(!binding_->executeFrontier(publication_,execution.nativeStream()))return false;
+        if(!binding_->executeFrontier(publication_,direct_bank_,execution.nativeStream()))return false;
         for(const auto& output:outputs())execution.publish(output.tensor);
         return true;
     }

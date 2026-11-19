@@ -125,7 +125,7 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
             model,id,7,512,8,20);
         FAIL()<<"Unbound cold graph declaration unexpectedly succeeded";
     } catch(const std::logic_error& failure) {
-        EXPECT_EQ(std::string(failure.what()),"CPU joint graph lost its original prepared source: Prepared source has no original ModelContext binding");
+        EXPECT_EQ(std::string(failure.what()),"Joint graph lost its original prepared source: Prepared source has no original ModelContext binding");
     }
     EXPECT_FALSE(banks.admitInitialJointGraphSources({},&error));
     EXPECT_FALSE(banks.acquireOriginalPreparedSource(&error));

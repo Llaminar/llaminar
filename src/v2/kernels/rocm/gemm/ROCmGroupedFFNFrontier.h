@@ -3,6 +3,7 @@
  * @brief Device-bound publication and launch policy for a counted ROCm verifier FFN.
  */
 #pragma once
+#include "utils/DebugEnv.h"
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 #include "kernels/common/DeviceRowRange.h"
 #include "kernels/common/VerifierDispatchTable.h"
@@ -323,15 +324,16 @@ static_assert(sharedCodesBytes % alignof(ExactK32Sums)==0);
 inline constexpr auto k32SumWorkspaceBytes=sharedCodesBytes+sizeof(ExactK32Sums);
 
 /** @brief Consume a scoped opt-in during graph construction, before capture identity seals. */
-inline bool exactK32SumsOptIn()
+inline bool exactK32SumsOptIn(bool qualified_default=false)
 {
-    static const bool enabled=[] {
-        const char* mode=std::getenv("LLAMINAR_QFN_ROCM_GROUPED_FFN_AFFINE_SUMS");
-        if(!mode || std::strcmp(mode,"0")==0)return false;
+    static const std::optional<bool> enabled=[]() -> std::optional<bool> {
+        const char* mode=DebugEnv::envValue("LLAMINAR_QFN_ROCM_GROUPED_FFN_AFFINE_SUMS");
+        if(!mode)return std::nullopt;
+        if(std::strcmp(mode,"0")==0)return false;
         if(std::strcmp(mode,"1")==0)return true;
         throw std::invalid_argument("LLAMINAR_QFN_ROCM_GROUPED_FFN_AFFINE_SUMS accepts 0 or 1");
     }();
-    return enabled;
+    return enabled.value_or(qualified_default);
 }
 
 /** @brief Form the disjoint typed sum view after the caller validates its lease extent. */

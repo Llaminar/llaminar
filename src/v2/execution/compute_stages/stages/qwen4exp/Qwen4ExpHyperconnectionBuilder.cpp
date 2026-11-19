@@ -312,7 +312,8 @@ std::vector<PendingNode> readNodes(const Qwen4ExpHyperconnectionContext &c,
         nodes.push_back({shortRead?read:up,std::make_unique<GEMMStage>(GEMMStage::Params{
             .device_id=c.device,.mpi_ctx=c.mpi,.A=b.down.tensor,.B=w.up.tensor(),.C=b.readLogits.tensor,
             .hc_prepublished_down=downPublication,
-            .hc_residual_down=GEMMStage::HCResidualDownPublication{b.activatedDown.tensor,b.activatedDown.buffer},
+            .hc_residual_down=GEMMStage::HCResidualDownPublication{
+                b.activatedDown.tensor,b.activatedDown.buffer,c.verifierKernelPolicy},
             .hc_short_k_read=shortRead?std::optional{GEMMStage::HCResidualShortKRead{
                 b.normalized.tensor,b.normalized.buffer,b.mixed.tensor,b.mixed.buffer}}:std::nullopt,
             .m=c.rows.capacity,.n=4*c.hidden,.k=c.lowRank,.alpha=1.f,.beta=0.f,
