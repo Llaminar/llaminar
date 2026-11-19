@@ -28,47 +28,47 @@ target_link_libraries(v2_integration_cpu_attention_key_q8 PRIVATE GTest::gtest_m
 v2_add_core_free_test(V2_Unit_CPUAttentionKeyQ8 WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=-*AllWidthsISAsAndWorkerCountsMatchScalarBytes
-    LABELS V2 Unit CPU DeviceFree Attention KVCache Q8 AllHeadDims ByteExact)
+    LABELS V2 Unit CPU ARM DeviceFree Attention KVCache Q8 AllHeadDims ByteExact)
 v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8 WHOLE_TEAM
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 AllHeadDims ByteExact Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention KVCache Q8 AllHeadDims ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPUQ8AttentionValueProgram
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=CPUQ8AttentionValue.NativeOriginalCodesMatchIndependentCombinedWeightFMA
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 ByteExact Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention KVCache Q8 ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPUQ8AttentionValueAdmission
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=CPUQ8AttentionValue.CompleteNumeratorAndSourceAliasesRejectBeforeStores
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 Ownership Geometry Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention KVCache Q8 Ownership Geometry Regression)
 v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8OriginalDots
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=CPUAttentionKeyQ8Dot.OriginalQueriesMatchSerialAndPreviousPipeline
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 ByteExact Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention KVCache Q8 ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8DotRounding
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=CPUAttentionKeyQ8Dot.SeparateDecodeRoundingAndPublishedScales
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 ByteExact Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention KVCache Q8 ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8DotAuthentication
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=CPUAttentionKeyQ8Dot.PoisonedAuthenticationRejectsNoOpAndPartialWriters
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention KVCache Q8 Regression)
 v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8DotAdmission
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=CPUAttentionKeyQ8Dot.OriginalHeadGeometryAndUnavailableProgramsReject
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 ISA Geometry Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention KVCache Q8 ISA Geometry Regression)
 v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8StorageAliases
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=*SourceAnchorAndCompressedStorageAliasesRejectBeforeMutation
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention KVCache Q8 Regression)
 v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8AnchoredFailures
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=*AnchoredFailuresRejectBeforePublicationForEveryWidth
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention KVCache Q8 Regression)
 v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8ZeroResidual
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=*ZeroResidualRetainsAnchorsAndAuthorsEveryByte
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 AllHeadDims ByteExact Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention KVCache Q8 AllHeadDims ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPUAttentionKeyQ8RationalBoundaries
     COMMAND $<TARGET_FILE:v2_integration_cpu_attention_key_q8>
         --gtest_filter=*EveryRationalBoundaryMatchesScalarBytes:*FiniteExponentRangeMatchesScalarBytes:*EveryLegalCodeAndPhysicalScaleMatchesScalarBytes
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention KVCache Q8 AllHeadDims ByteExact Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention KVCache Q8 AllHeadDims ByteExact Regression)

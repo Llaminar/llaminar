@@ -87,12 +87,12 @@ v2_add_core_free_test(V2_Integration_CPUHostTopologyRejectUnknownGeometry
         CPUHostTopologyTests.test_missing_conflicting_and_unknown_identity_fail_closed
         CPUHostTopologyTests.test_capture_requires_complete_stable_original_affinity
         CPUHostTopologyTests.test_cmake_rejects_asymmetric_projection_and_noninteger_counts
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Topology Build Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Topology Build Regression)
 v2_add_core_free_test(V2_Integration_CPUHostTopologyReceiptRetirement
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_host_topology.py"
         CPUHostTopologyTests.test_actual_owner_retires_receipt_before_failed_readmission
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Topology Build Ownership Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Topology Build Ownership Regression)
 v2_add_core_free_test(V2_Unit_OneDNNBuildLifecycle
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_onednn_build_lifecycle.py"
@@ -328,7 +328,7 @@ v2_add_core_free_test(V2_Integration_OpenMPWorkshareRetainedDepth
 v2_add_core_free_test(V2_Integration_OpenMPTeamForkCounterContract
     COMMAND $<TARGET_FILE:v2_test_cpu_openmp_workshare>
         --gtest_filter=OpenMPWorkshare.TeamForkCounterCountsExactlyTheRealForks:OpenMPWorkshare.TeamForkCounterPublicationCostAndDefault:OpenMPWorkshare.TeamForkScopeAttributesExactlyUnderOverlapAndNesting:OpenMPWorkshare.TeamForkWorkerContextForksNeverReachOwnerCells:OpenMPWorkshare.TeamForkScopeStackRestoredAfterReverseTeardown
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree OpenMP Workshare Ownership Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree OpenMP Workshare Ownership Regression)
 v2_add_core_free_test(V2_Integration_OpenMPForkNoteSourcePolicy
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/scripts/check_cpu_openmp_fork_note_policy.py"
@@ -388,10 +388,10 @@ target_include_directories(v2_unit_mpi_context_header PRIVATE "${V2_CPU_ARCHITEC
 target_link_libraries(v2_unit_mpi_context_header PRIVATE GTest::gtest_main MPI::MPI_CXX OpenMP::OpenMP_CXX)
 v2_add_core_free_test(V2_Unit_MPIContextOwnershipHeader
     COMMAND $<TARGET_FILE:v2_unit_mpi_context_header>
-    LABELS V2 Unit CPU DeviceFree Interface Ownership MPI)
+    LABELS V2 Unit CPU ARM DeviceFree Interface Ownership MPI)
 v2_add_core_free_test(V2_Integration_MPIContextOwnershipHeader
     COMMAND $<TARGET_FILE:v2_unit_mpi_context_header>
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Interface Ownership MPI Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Interface Ownership MPI Regression)
 v2_add_core_free_test(V2_Integration_CPUCodegenTargetManifestMultiLanguage
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_codegen_target_manifest.py"
@@ -786,11 +786,11 @@ target_link_libraries(v2_test_cpu_qwen_sparse_attention PRIVATE GTest::gtest_mai
 v2_add_core_free_test(V2_Unit_CPUQwenSparseNativeEntries
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=QwenSparseAttention.ExplicitRepresentationAndStaticBindingValidation:QwenSparseAttention.OrdinaryTailNoOpAndExactAcceptedPrefix:QwenSparseAttention.NativeSelectedAttentionIsGroupedSerialByteEquivalent:CPUQwenSparseLifetime.CompleteOriginalExclusionsRejectBeforePublication:CPUQwenSparseLifetime.OriginalReplayIntervalRejectsBeforeAnyWordLoad:CPUQwenSparseLifetime.FullSameHeadQueryAliasMatchesOriginalNativeProgram:CPUQwenSparseLifetime.EmptyAndNonemptyCallsCompleteBeforeOuterJoin:CPUQwenSparseLifetime.CanonicalCounterOverflowIsFatalAtPublicPublication:CPUQwenSparseLifetime.ConsumedIndexerNumericCorruptionIsFatalNotClamped:CPUQwenSparseExactBasis.OriginalNonsymmetricBasisAndQueryAliasMatchOrderedFMABytes:CPUQwenSparseIndexerProgram.FP32MeanAndRopeCastEdgesCannotContractAfterInlining:QwenSparseAttention.ProvenNoRankingPreservesRequiredStateWithoutQueryBanks:CPUQwenSparseIndexerProgram.IndexerAnalyticElementariesCannotMerge:CPUQwenSparseIndexerProgram.NativeRankingScoresRetainOriginalHeadProgram
-    LABELS V2 Unit CPU DeviceFree Attention QwenSparse ByteExact)
+    LABELS V2 Unit CPU ARM DeviceFree Attention QwenSparse ByteExact)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseOriginalCacheProgram
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=QwenSparseAttention.NativeSelectedAttentionIsGroupedSerialByteEquivalent:QwenSparseAttention.InactiveRowsPreserveOutputAndTrafficAcrossDirtyReplays:QwenSparseAttention.EveryNativeCodecAndQ16BlockUsesCanonicalRingAndBasis
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention QwenSparse ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseAdmission
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseLifetime.CompleteOriginalExclusionsRejectBeforePublication
@@ -814,7 +814,7 @@ v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerScoreProgram
 v2_add_core_free_test(V2_Integration_CPUQwenSparseIndexerNoContraction
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseIndexerProgram.FP32MeanAndRopeCastEdgesCannotContractAfterInlining
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention QwenSparse ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseRepresentationCast
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_attention>
         --gtest_filter=CPUQwenSparseIndexerProgram.NativeRepresentationCastsRetainIndependentIEEEWordBoundaries
@@ -873,11 +873,11 @@ target_include_directories(v2_test_cpu_qwen_sparse_fp32 PRIVATE
 target_link_libraries(v2_test_cpu_qwen_sparse_fp32 PRIVATE GTest::gtest_main)
 v2_add_core_free_test(V2_Unit_CPUQwenSparseFP32
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_fp32>
-    LABELS V2 Unit CPU DeviceFree Attention QwenSparse ByteExact)
+    LABELS V2 Unit CPU ARM DeviceFree Attention QwenSparse ByteExact)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseFP32OriginalProgram
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_fp32>
         --gtest_filter=CPUQwenSparseFP32.OriginalRowsRetainDeclaredNativeFMAAndButterfly:CPUQwenSparseFP32.QsaButterflyIsNotGenericAttentionFold
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention QwenSparse ByteExact Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention QwenSparse ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPUQwenSparseFP32Admission
     COMMAND $<TARGET_FILE:v2_test_cpu_qwen_sparse_fp32>
         --gtest_filter=CPUQwenSparseFP32.ScalarAndForeignProgramsAreNotAdvertised
@@ -1340,10 +1340,10 @@ target_compile_features(v2_unit_portable_vector_primitives PRIVATE cxx_std_20)
 target_include_directories(v2_unit_portable_vector_primitives PRIVATE "${V2_CPU_ARCHITECTURE_ROOT}/src/v2")
 v2_add_core_free_test(V2_Unit_PortableVectorPrimitives
     COMMAND $<TARGET_FILE:v2_unit_portable_vector_primitives>
-    LABELS V2 Unit CPU DeviceFree Primitives)
+    LABELS V2 Unit CPU ARM DeviceFree Primitives)
 v2_add_core_free_test(V2_Integration_PortableVectorGroupedByteEquivalence
     COMMAND $<TARGET_FILE:v2_unit_portable_vector_primitives> --grouped
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Primitives Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Primitives Regression)
 
 foreach(scope IN ITEMS Unit Integration)
     set(labels V2 ${scope} CPU DeviceFree Build Regression)

@@ -39,9 +39,11 @@ The `ARM64 build and Unit + host` check runs on GitHub's standard
 `ubuntu-24.04-arm` runner for ready PRs into `develop`. It builds the
 `arm64-pr` Docker target with baseline NEON, pinned oneDNN and the Integration
 configuration. CMake derives the `ARM64PR` scope from the ARM and NEON
-registrations in Unit and production preflight. The shared PR driver runs that
-Unit subset and the corresponding canonical host subset in the CPU-only
-container, retaining both JUnit logs. The companion `ARM64 CUDA runtime build`
+registrations in Unit and production preflight. These cover NEON arithmetic
+and code generation, native grouped projections and GDN, quantized KV and
+sparse attention, and Linux OpenMP/MPI placement and loader behavior. The
+shared PR driver runs both subsets in the CPU-only container and retains their
+JUnit logs. The companion `ARM64 CUDA runtime build`
 check builds the Release container for GB10 and verifies application startup.
 Both run on [GitHub's standard ARM64 runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
