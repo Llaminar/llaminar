@@ -577,7 +577,7 @@ namespace
 
 TEST(Test__ExpertTierGpuPeerTransferROCm, RepeatedPreparationPreservesCapturedAuxiliaryReset)
 {
-    if(rocmDeviceCount()<2)GTEST_SKIP()<<"Requires two actual ROCm devices";
+    ASSERT_GE(rocmDeviceCount(), 2) << "Peer preparation requires two physical devices";
     const auto directed=findDirectedROCmPeerPair();
     const int source=directed ? directed->source : 0;
     const int destination=directed ? directed->destination : 1;
@@ -593,7 +593,7 @@ TEST(Test__ExpertTierGpuPeerTransferROCm, RepeatedPreparationPreservesCapturedAu
 TEST(Test__ExpertTierGpuPeerTransferROCm, PreparationPreservesUnrelatedPreexistingError)
 {
     const int count=rocmDeviceCount();
-    if(count<2)GTEST_SKIP()<<"Requires two actual ROCm devices";
+    ASSERT_GE(count, 2) << "Peer preparation requires two physical devices";
     std::thread worker([&]{
         ASSERT_EQ(hipSetDevice(0),hipSuccess);
         ASSERT_EQ(hipPeekAtLastError(),hipSuccess);

@@ -1457,6 +1457,32 @@ class ProductionParityCampaignTest(unittest.TestCase):
         self.assertFalse(campaigns.preflight_hardware_qualification(
             (local_name, remote_name), requirements, observed)["selected"])
 
+    def test_original_gpu_bootstrap_address_and_independent_reporters(self):
+        """A visible peer cannot supply ordinal zero's identity; independent reporters may share a NUMA node."""
+        lane = campaigns.PreflightExecutionLane.EXCLUSIVE
+        bootstrap = campaigns.PreflightRegistration("V2_Integration_Bootstrap", frozenset(
+            ("CUDA", "HardwareOptional", "Devices1", "NUMALocalOrdinal0")), 1, lane, 1)
+        reporters = campaigns.PreflightRegistration("V2_Integration_Reporters", frozenset(
+            ("CUDA", "ROCm", "HardwareOptional", "Devices2", "CUDADevices1", "ROCmDevices1",
+             "IndependentNUMAReporters")), 3, lane, 2)
+        requirements = campaigns.preflight_optional_hardware_requirements((bootstrap, reporters))
+        for cuda, rocm, selected in ((-1, -1, []), (-1, 11, ["V2_Integration_Reporters"]),
+                                     (7, 7, ["V2_Integration_Bootstrap", "V2_Integration_Reporters"]), (7, 11, ["V2_Integration_Bootstrap", "V2_Integration_Reporters"])):
+            hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+                {"backend": "cpu", "ordinal": 0, "numa_node": node} for node in (7, 11)] + [
+                {"backend": "cuda", "ordinal": 0, "numa_node": cuda},
+                {"backend": "cuda", "ordinal": 1, "numa_node": 7},
+                {"backend": "rocm", "ordinal": 0, "numa_node": rocm}]}
+            with self.subTest(cuda=cuda, rocm=rocm):
+                result = campaigns.preflight_hardware_qualification(("V2_Integration_Bootstrap", "V2_Integration_Reporters"), requirements, hardware)
+                self.assertEqual(result["selected"], selected)
+                if cuda == 7 and rocm == 11:
+                    # Two distinct active reporters consume both processes.
+                    busy = {**requirements["V2_Integration_Reporters"], "mpi_ranks": 2}
+                    self.assertIsNotNone(campaigns.optional_native_cohort_absence(busy, hardware))
+        with self.assertRaisesRegex(ValueError, "ordinal"):
+            campaigns.validate_optional_native_cohort_requirement({**requirements["V2_Integration_Bootstrap"], "ordinal": 1})
+
     def test_optional_rank_populations_preserve_distinct_original_owners(self):
         """Unequal native domains cannot borrow cards from another original NUMA owner."""
         name = "V2_Integration_OriginalUnequalRanks"
@@ -1480,6 +1506,20 @@ class ProductionParityCampaignTest(unittest.TestCase):
                             {"backend": "rocm", "degree": 6, "locality": "two-distinct-numa-local-ranks", "rank_sizes": [2, 4], "mpi_ranks": 1}):
             with self.assertRaises(ValueError):
                 campaigns.validate_optional_native_cohort_requirement(requirement)
+
+    def test_process_owned_cross_vendor_replay_uses_one_local_process(self):
+        """Direct cross-vendor runs qualify the real local pair with no MPI launcher."""
+        name = "V2_Integration_CrossVendorLocal"
+        args = ["llaminar_mpi_session", "--session-base", "/sessions", "--",
+                "python3", "run_cohort_original_cases.py", "/native", "--gtest_filter=Pair.*"]
+        labels = frozenset(("CUDA", "ROCm", "HardwareOptional", "LocalHostDevices",
+                            "Devices2", "CUDADevices1", "ROCmDevices1"))
+        ranks, lane = campaigns._preflight_execution_lane(name, labels, args, [])
+        self.assertIsNone(ranks)
+        row = campaigns.PreflightRegistration(name, labels, ranks, lane, 1)
+        self.assertEqual(campaigns.preflight_optional_hardware_requirements((row,))[name],
+                         {"locality": "local-host", "backend_degrees": {"cuda": 1, "rocm": 1},
+                          "mpi_ranks": 1})
 
     def test_optional_mixed_family_degrees_are_generic_and_fail_closed(self):
         """Positive per-family widths are exact; the legacy receipt arm remains strict."""
@@ -1675,6 +1715,53 @@ class ProductionParityCampaignTest(unittest.TestCase):
             self.assertEqual(qualified["selected"], [host.name])
             self.assertIn(name, qualified["unqualified"])
 
+    def test_hostcall_listener_qualifies_only_with_original_host_native_atomics(self):
+        """Hostcall capability qualifies its listener regression independently of ordinary compute."""
+        labels = {"ROCm", "HardwareOptional", "ROCmHostNativeAtomics", "LocalHostDevices", "Devices1"}
+        row = campaigns.PreflightRegistration("V2_Integration_HIPHostThreadStack", frozenset(labels),
+                                             1, campaigns.PreflightExecutionLane.ROCM_SOCKET, 1)
+        required = campaigns.preflight_optional_hardware_requirements([row])
+        device = {"backend": "rocm", "ordinal": 0, "numa_node": -1, "uuid": "original"}
+        hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [device]}
+        for capable in (False, True):
+            device["host_native_atomics"] = capable
+            result = campaigns.preflight_hardware_qualification((row.name,), required, hardware)
+            self.assertEqual(result["selected"], [row.name] if capable else [])
+            if not capable:
+                self.assertIs(result["unqualified"][row.name]["host_native_atomics"], False)
+        del device["host_native_atomics"]
+        with self.assertRaisesRegex(ValueError, "missing original ROCm host atomics"):
+            campaigns.preflight_hardware_qualification((row.name,), required, hardware)
+
+    def test_maximum_context_uses_the_original_ordinal_bom_and_shared_or_dedicated_capacity(self):
+        """Shortage is explicit per model/policy, and dedicated gates still require physically capable cards."""
+        cases = {"DenseOff": 12, "DenseMTP": 18, "MoEOff": 5, "MoEMTP": 9}
+        rows = tuple(campaigns.PreflightRegistration(
+            "V2_Integration_MaximumContextStateAllocation_CUDA_" + case,
+            frozenset(("CUDA", "HardwareOptional", "LocalHostDevices", "Devices1", "MaximumContext" + case)),
+            1, campaigns.PreflightExecutionLane.CUDA_SOCKET, index)
+            for index, case in enumerate(cases, 1))
+        names = tuple(row.name for row in rows)
+        for shared, capacity, eligible in ((True, 5, {"MoEOff"}), (False, 16, {"MoEOff", "MoEMTP", "DenseOff"})):
+            required = campaigns.preflight_optional_hardware_requirements(rows, shared_capacity=shared)
+            memory = {"basis": "free" if shared else "total", "capacity_bytes": capacity,
+                      "minimum_bytes": cases.copy()}
+            hardware = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
+                {"backend": "cuda", "ordinal": 1, "numa_node": -1, "uuid": "other", "total_memory_bytes": 64},
+                {"backend": "cuda", "ordinal": 0, "numa_node": -1, "uuid": "original", "total_memory_bytes": 16,
+                 "maximum_context": memory}]}
+            receipt = campaigns.preflight_hardware_qualification(names, required, hardware)
+            self.assertEqual(set(receipt["selected"]), {row.name for row in rows if row.name.split("_")[-1] in eligible})
+            for name, absence in receipt["unqualified"].items():
+                self.assertEqual((absence["uuid"], absence["required_bytes"], absence["observed_capacity_bytes"]),
+                                 ("original", cases[name.split("_")[-1]], capacity))
+            for tamper in ({"capacity_bytes": 17}, {"minimum_bytes": {"MoEOff": 5}},
+                           {"basis": "total" if shared else "free"}):
+                altered = {**hardware, "devices": [hardware["devices"][0], {**hardware["devices"][1],
+                           "maximum_context": {**memory, **tamper}}]}
+                with self.assertRaisesRegex(ValueError, "maximum-context"):
+                    campaigns.preflight_hardware_qualification(names, required, altered)
+
     def test_optional_native_geometry_accepts_positive_widths_and_rejects_bad_labels(self):
         """Original local widths are generic; optional declarations stay exact and fail closed."""
         name = "V2_Integration_ArbitraryNativeGeometry"
@@ -1750,7 +1837,7 @@ add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COM
             self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
             rows = campaigns.discover_production_test_preflight_registrations(build)
             requirements = campaigns.preflight_optional_hardware_requirements(rows)
-            self.assertEqual(len(rows), 131) # 128 exact bodies, two focused aliases and one odd probe.
+            self.assertEqual(len(rows), 81) # 80 representative bodies and one odd geometry probe.
             self.assertEqual(set(requirements), {row.name for row in rows})
             listing = json.loads(subprocess.check_output(
                 ["ctest", "--test-dir", str(build), "--show-only=json-v1"], text=True, timeout=10))
@@ -1769,7 +1856,29 @@ add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COM
                     self.assertFalse(any(character in expected for character in "*?:"))
                     self.assertNotIn(expected, exact_bodies)
                     exact_bodies.add(expected)
-            self.assertEqual(len(exact_bodies), 128)
+            self.assertEqual(len(exact_bodies), 80)
+            # Every topology keeps both actual native bodies and every pair of
+            # policy axes. The canonical balanced control retains all triples.
+            from itertools import combinations, product
+            axes = (("Ordinal", "Random"), ("Static", "Dynamic"),
+                    ("DisabledMTP", "Fixed1MTP", "Fixed3MTP", "DynamicMTP"))
+            coverage = {}
+            for test in listing["tests"]:
+                for role in filters:
+                    prefix = f"V2_Integration_MoEPipeline{role}_"
+                    if test["name"].startswith(prefix):
+                        topology, order, movement, lane = test["name"].removeprefix(prefix).rsplit("_", 3)
+                        coverage.setdefault((topology, role), set()).add((order, movement, lane))
+            self.assertEqual(len(coverage), 8)
+            for (topology, role), cases in coverage.items():
+                with self.subTest(topology=topology, role=role):
+                    if topology == "MI50_EP4_MI50_EP4":
+                        self.assertEqual(cases, set(product(*axes)))
+                    else:
+                        self.assertEqual(len(cases), 8)
+                        for first, second in combinations(range(3), 2):
+                            self.assertEqual({(case[first], case[second]) for case in cases},
+                                             set(product(axes[first], axes[second])))
             for row in rows:
                 widths = ([3, 1, 5] if row.name.endswith("OddGeometryProbe") else
                           [int(width) for width in re.findall(r"MI50_EP(\d+)", row.name)])
@@ -1789,13 +1898,16 @@ add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COM
         row = campaigns.PreflightRegistration(name, frozenset(("Integration", "HardwareOptional",
             "ROCm", "Devices2", "DistinctNUMARanks")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 2)
         mixed = campaigns.PreflightRegistration("V2_Integration_CapturedTransferRank_MixedCUDA_ROCm",
-            frozenset(("Integration", "CUDA", "ROCm")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 3)
+            frozenset(("Integration", "CUDA", "ROCm", "HardwareOptional", "Devices2",
+                       "CUDADevices1", "ROCmDevices1", "DistinctNUMARanks")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 3)
         local = campaigns.PreflightRegistration("V2_Integration_NativeCompleted_ROCm4",
             frozenset(("Integration", "ROCm", "Devices4")), 2, campaigns.PreflightExecutionLane.EXCLUSIVE, 4)
         tests = ("V2_Unit_A", name, mixed.name, local.name)
         requirements = campaigns.preflight_optional_hardware_requirements((row, mixed, local))
         self.assertEqual(requirements, {name: {"backend": "rocm", "degree": 2,
-            "locality": "two-distinct-numa-local-ranks"}})
+            "locality": "two-distinct-numa-local-ranks"},
+            mixed.name: {"backend_degrees": {"cuda": 1, "rocm": 1}, "mpi_ranks": 2,
+                         "locality": "two-distinct-numa-local-ranks"}})
         same_socket = {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks", "devices": [
             {"backend": "rocm", "ordinal": ordinal, "numa_node": 1} for ordinal in range(5)]}
         from production_artifacts import validate_preflight_qualification
@@ -1807,7 +1919,7 @@ add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COM
                 qualified = campaigns.preflight_hardware_qualification(tests, requirements, hardware)
                 self.assertEqual(name in qualified["selected"], eligible)
                 self.assertEqual(name in qualified["unqualified"], not eligible)
-                self.assertIn(mixed.name, qualified["selected"])
+                self.assertIn(mixed.name, qualified["unqualified"])
                 self.assertIn(local.name, qualified["selected"])
                 validate_preflight_qualification(list(tests), qualified)
                 forged = {**qualified, "selected": [test for test in tests if test != name] if eligible else list(tests),
@@ -1886,7 +1998,7 @@ add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COM
             def export(command, **kwargs):
                 self.assertEqual(command[0], str(binary.resolve()))
                 self.assertEqual(len(command), 2)
-                option = "--qfn-source-hardware-inventory="
+                option = "--preflight-hardware-inventory="
                 self.assertTrue(command[1].startswith(option))
                 output = Path(command[1][len(option):])
                 self.assertFalse(output.exists())

@@ -8,9 +8,11 @@ if(HAVE_CUDA AND HAVE_ROCM)
         foreach(_pooled_read_capacity C0 Positive)
             set(_pooled_read_test "V2_Integration_CrossVendor_PooledImmutable_${_pooled_read_direction}_${_pooled_read_capacity}_ReadAllFormatsReplay")
             add_v2_test(${_pooled_read_test}
-                COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
-                    --gtest_filter=PooledImmutableProviderSourceDevice.CrossVendorCaptured${_pooled_read_direction}${_pooled_read_capacity}ReadAllFormats
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py
+                    $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_filter=FormatGroups/CrossVendorCapturedReadFormats.${_pooled_read_direction}${_pooled_read_capacity}/*
                 LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;CrossVendor;Ngram;Source;Ownership;TraceReplay;Capture;Component;AllFormats;ByteExact;Regression"
+                CUDA_DEVICES 1 ROCM_DEVICES 1
                 MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "cuda_gpu_0;rocm_gpu_0"
                 ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=0")
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_pooled_read_test})
@@ -26,6 +28,7 @@ if(HAVE_CUDA AND HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
             COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                 --gtest_filter=PooledImmutableProviderSourceDevice.CrossVendor${_cold_direction}ColdPrefillFirstError
             LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;CrossVendor;Ngram;Source;Ownership;TraceReplay;Capture;Component;ByteExact;Regression"
+            CUDA_DEVICES 1 ROCM_DEVICES 1
             MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "cuda_gpu_0;rocm_gpu_0"
             ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=0")
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_cold_gate})
@@ -33,23 +36,30 @@ if(HAVE_CUDA AND HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
 endif()
 
 
-# Each actual topology/capacity trajectory has its own standard timeout. Missing
-# endpoints fail in the selected executable; they never become skipped passes.
+# Each original reader and owner is a distinct physical endpoint. The same
+# geometry supplies CTest's lock list and the qualification for all capacities.
 if(HAVE_CUDA AND HAVE_ROCM)
-    foreach(_pooled_topology CUDAConsumer2ROCmOwners CUDAConsumer4ROCmOwners ROCmConsumer2CUDAOwners)
-        if(_pooled_topology STREQUAL "CUDAConsumer2ROCmOwners")
-            set(_pooled_multi_locks "cuda_gpu_0;rocm_gpu_0;rocm_gpu_1")
-        elseif(_pooled_topology STREQUAL "CUDAConsumer4ROCmOwners")
-            set(_pooled_multi_locks "cuda_gpu_0;rocm_gpu_0;rocm_gpu_1;rocm_gpu_2;rocm_gpu_3")
-        else()
-            set(_pooled_multi_locks "rocm_gpu_0;cuda_gpu_0;cuda_gpu_1")
-        endif()
+    set(_pooled_readers CUDA CUDA ROCm)
+    set(_pooled_owners ROCm ROCm CUDA)
+    set(_pooled_widths 2 4 2)
+    foreach(_reader _owner _width IN ZIP_LISTS _pooled_readers _pooled_owners _pooled_widths)
+        set(_pooled_topology "${_reader}Consumer${_width}${_owner}Owners")
+        string(TOLOWER "${_reader}" _reader_family)
+        string(TOLOWER "${_owner}" _owner_family)
+        set(_pooled_${_reader_family}_devices 1)
+        set(_pooled_${_owner_family}_devices ${_width})
+        set(_pooled_multi_locks "${_reader_family}_gpu_0")
+        math(EXPR _last_owner "${_width} - 1")
+        foreach(_ordinal RANGE ${_last_owner})
+            list(APPEND _pooled_multi_locks "${_owner_family}_gpu_${_ordinal}")
+        endforeach()
         foreach(_pooled_capacity Positive MixedC0 AllC0)
             set(_pooled_multi_test "V2_Integration_CrossVendor_PooledImmutable_${_pooled_topology}_${_pooled_capacity}_Replay")
             add_v2_test(${_pooled_multi_test}
                 COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                     --gtest_filter=PooledImmutableProviderSourceDevice.CrossVendor${_pooled_topology}${_pooled_capacity}Replay
                 LABELS "V2;Integration;ProductionTestPreflight;CUDA;ROCm;CrossVendor;Ngram;Source;Ownership;TraceReplay;Capture;Component;MultiOwner;ByteExact;Regression"
+                CUDA_DEVICES ${_pooled_cuda_devices} ROCM_DEVICES ${_pooled_rocm_devices}
                 MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
                 RESOURCE_LOCK "${_pooled_multi_locks}"
                 ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=0")

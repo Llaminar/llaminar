@@ -9,8 +9,11 @@
  */
 #include "../NativeContextRuntimePolicy.h"
 #include "CUDAHardwareMetadata.h"
+#include "CUDADiscoveryAdmission.h"
+#include "CUDADriverApi.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "utils/DebugEnv.h"
+#include "utils/Logger.h"
 #include <cuda_runtime.h>
 #include <algorithm>
 #include <cstring>
@@ -27,8 +30,18 @@ namespace llaminar2
         }
         /**
          * @brief Enumerate one complete native visibility set without selecting a context.
-         * @return Exact ordered records; a genuine no-device result is empty.
+         * @return Exact ordered records; any genuine no-device result is empty.
          * @throws std::runtime_error On a failed native query, never publishing a partial set.
+         *
+         * Admission follows the typed discovery policy in CUDADiscoveryAdmission.h:
+         * only a positively driverless member (the loader finds no libcuda.so.1
+         * anywhere) may answer an insufficient-driver runtime status with an
+         * empty visibility set, because such a member has no CUDA capability at
+         * all and full-backend binaries must keep serving CPU-only cluster
+         * members. Any present driver installation that the runtime cannot use,
+         * a system driver mismatch, and every other query failure keep the
+         * original fatal fault; an explicit CUDA request still fails at
+         * admission with its own device diagnostic.
          */
         std::vector<CUDADeviceHardware> readHardware()
         {
@@ -39,6 +52,15 @@ namespace llaminar2
             int count = 0;
             const auto status = cudaGetDeviceCount(&count);
             if (status == cudaErrorNoDevice) return {};
+            if (status == cudaErrorInsufficientDriver &&
+                classifyCUDADiscovery(CUDADeviceCountStatus::InsufficientDriver,
+                    CUDADriverApi::probeDriverBinding()) == CUDADiscoveryDisposition::EmptyVisibility)
+            {
+                LOG_WARN("CUDA discovery found no installed NVIDIA driver ("
+                    << cudaGetErrorString(status)
+                    << "); this member publishes an empty CUDA visibility set");
+                return {};
+            }
             if (status != cudaSuccess)
                 throw std::runtime_error(std::string("CUDA hardware enumeration failed: ") + cudaGetErrorString(status));
             if (count < 0)

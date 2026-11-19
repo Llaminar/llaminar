@@ -516,7 +516,10 @@ TEST(PooledImmutableOwnerPinChain, ImmutableSetupCapacityUsesOriginalDisjointRoo
         CollectorScope() {
             if(const auto* old=std::getenv("LLAMINAR_PERF_STATS_JSON"))enabled=old;
             if(const auto* old=std::getenv("LLAMINAR_PERF_STATS_FILTER"))filter=old;
-            ::setenv("LLAMINAR_PERF_STATS_JSON","1",1);::setenv("LLAMINAR_PERF_STATS_FILTER","immutable_lookup_setup.*",1);
+            // Whole-domain filter: the collector's record-family grammar selects
+            // a domain or an exact "domain.name"; a "domain.*" name wildcard is
+            // not a supported filter form and silently drops every record.
+            ::setenv("LLAMINAR_PERF_STATS_JSON","1",1);::setenv("LLAMINAR_PERF_STATS_FILTER","immutable_lookup_setup",1);
             PerfStatsCollector::reloadConfigurationFromEnvironment();PerfStatsCollector::reset();
         }
         ~CollectorScope() {

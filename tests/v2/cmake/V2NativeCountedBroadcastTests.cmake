@@ -50,7 +50,7 @@ if(NOT V2_PERF_TESTS_ONLY OR
                         COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                             --gtest_filter=NativeCompletedCollective.${_bytes_backend}_${_bytes_shape}
                         LABELS "V2;Integration;ProductionTestPreflight;Collective;GraphCapture;LiveExtent;ByteExact;${_bytes_backend};Devices2;Regression"
-                        MPI_PROCS 2 NO_MODELS TIMEOUT 30)
+                        GPU_DEVICES 2 MPI_PROCS 2 NO_MODELS TIMEOUT 30)
                     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
                         V2_Integration_${_bytes_backend}NativeCompletedCollective_${_bytes_shape})
                 endforeach()
@@ -70,18 +70,12 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_integration_captured_transfer_channel)
                 math(EXPR _addressed_last "${_addressed_degree} - 1")
                 foreach(_addressed_source IN ITEMS 0 ${_addressed_last})
                     set(_addressed_case "${_addressed_backend}_Addressed${_addressed_degree}Source${_addressed_source}Replay")
-                    set(_addressed_optional "")
-                    # These authored wide geometries can be absent locally. Required
-                    # two-device and ROCm4 gates stay strict even if a board is lost.
-                    if((_addressed_backend STREQUAL "CUDA" AND _addressed_degree GREATER 2) OR
-                       (_addressed_backend STREQUAL "ROCm" AND _addressed_degree EQUAL 8))
-                        set(_addressed_optional ";HardwareOptional")
-                    endif()
+
                     add_v2_test(V2_Integration_NativeCompleted_${_addressed_case}
                         COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                             --gtest_filter=NativeCompletedCollective.${_addressed_case}
-                        LABELS "V2;Integration;ProductionTestPreflight;Collective;GraphCapture;LiveExtent;ByteExact;${_addressed_backend};Devices${_addressed_degree};TraceReplay;Regression${_addressed_optional}"
-                        MPI_PROCS 2 NO_MODELS TIMEOUT 30)
+                        LABELS "V2;Integration;ProductionTestPreflight;Collective;GraphCapture;LiveExtent;ByteExact;${_addressed_backend};Devices${_addressed_degree};TraceReplay;Regression"
+                        GPU_DEVICES ${_addressed_degree} MPI_PROCS 2 NO_MODELS TIMEOUT 30)
                     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeCompleted_${_addressed_case})
                 endforeach()
             endforeach()
@@ -98,7 +92,7 @@ if(NOT V2_PERF_TESTS_ONLY AND TARGET v2_integration_captured_transfer_channel)
                 COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
                     --gtest_filter=NativeCompletedCollective.${_progress_backend}_Addressed2LiveProgressReplay
                 LABELS "V2;Integration;ProductionTestPreflight;Collective;GraphCapture;LiveExtent;Economy;${_progress_backend};Devices2;TraceReplay;Regression"
-                MPI_PROCS 2 NO_MODELS TIMEOUT 30)
+                GPU_DEVICES 2 MPI_PROCS 2 NO_MODELS TIMEOUT 30)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeCompleted_${_progress_backend}_Addressed2LiveProgressReplay)
         endif()
     endforeach()

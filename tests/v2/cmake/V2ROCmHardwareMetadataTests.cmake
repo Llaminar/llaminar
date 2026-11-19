@@ -1,4 +1,5 @@
-# Pure publication and launch-policy replay links no driver/backend library.
+# @file V2ROCmHardwareMetadataTests.cmake
+# @brief Exercise backend capability publication and operation admission without creating a device.
 add_executable(v2_unit_rocm_hardware_metadata
     unit/backends/Test__ROCmHardwareMetadata.cpp)
 target_include_directories(v2_unit_rocm_hardware_metadata PRIVATE
@@ -16,6 +17,13 @@ add_v2_test(V2_Integration_ROCmHardwareMetadataReplay
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_ROCmHardwareMetadataReplay)
+
+add_v2_test(V2_Integration_ROCmMappedHostCompareExchangeAdmission
+    COMMAND $<TARGET_FILE:v2_unit_rocm_hardware_metadata>
+        --gtest_filter=ROCmHardwareMetadata.MappedHostCompareExchangeRequiresOriginalDeviceAtomics
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ROCm;HardwareMetadata;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMappedHostCompareExchangeAdmission)
 
 add_v2_test(V2_Integration_ROCmServiceWallClockBindingReplay
     COMMAND $<TARGET_FILE:v2_unit_rocm_hardware_metadata>

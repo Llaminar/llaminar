@@ -86,15 +86,17 @@ __device__ __forceinline__ void capturedTransferFail(
             *binding.device_extent = 0;
         return;
     }
+#if defined(__CUDA_ARCH__)
     printf("captured_transfer_channel_failure status=%u role=%u nonce=%llu key=%llu completed=%llu\n",
         static_cast<unsigned>(status), static_cast<unsigned>(binding.role),
         static_cast<unsigned long long>(binding.expected.nonce),
         static_cast<unsigned long long>(binding.message.key),
         static_cast<unsigned long long>(binding.cursor->completed_epoch));
-#if defined(__CUDA_ARCH__)
     asm volatile("trap;");
 #elif defined(__HIP_DEVICE_COMPILE__)
-    __builtin_trap();
+    // The abort epoch is already visible to the peer. A HIP device printf
+    // would require a PCIe hostcall buffer on every successful transfer.
+    __builtin_verbose_trap("Llaminar transfer", "captured channel published a terminal abort");
 #endif
 }
 
@@ -404,14 +406,14 @@ __global__ void pipelineActivationFanoutValidationKernel(PipelineActivationFanou
         binding.completion.matches(binding.allocation, binding.scope, state.header.epoch,
             state.header.message.bytes, binding.native_message, abort, error)) return;
     atomicCAS(&binding.state->first_error, 0, 1);
+#if defined(__CUDA_ARCH__)
     printf("pipeline_activation_fanout_failure key=%llu epoch=%llu bytes=%llu error=%d\n",
         static_cast<unsigned long long>(state.header.message.key),
         static_cast<unsigned long long>(state.header.epoch),
         static_cast<unsigned long long>(state.header.message.bytes), error);
-#if defined(__CUDA_ARCH__)
     asm volatile("trap;");
 #elif defined(__HIP_DEVICE_COMPILE__)
-    __builtin_trap();
+    __builtin_verbose_trap("Llaminar transfer", "pipeline fanout header or completion does not match the source");
 #endif
 #endif
 }

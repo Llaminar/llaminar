@@ -20,12 +20,26 @@ namespace llaminar2::test::parity
 {
     namespace
     {
-        /** @return Model-owned canonical definition, without reading its GGUF. */
+        /** @return Model-owned canonical definition, without reading its GGUF.
+         *
+         * Release eligibility lives in the bounded six-cell release matrix, not
+         * in these legacy model definitions; the remote certification tag is
+         * constructed here so the proofs below exercise the expansion and
+         * export machinery instead of depending on a blessed model tag that
+         * `qwen36MoEParityDefinition` deliberately does not carry.
+         */
         ModelParityDefinition remoteSource(GlobalDeviceAddress device = GlobalDeviceAddress::rocm(0))
         {
-            return qwen36::qwen36MoEParityDefinition(
+            auto definition = qwen36::qwen36MoEParityDefinition(
                 qwen36::qwen36SingleDeviceTopology("SourceGPU", std::move(device)),
                 "/reference", qwen36::qwen36MoESingleDeviceThresholds());
+            definition.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth}};
+            // Remote certification is model-owned and provider-independent.
+            // The source cell keeps its existing single-device numerical test;
+            // the E2E exporter adds both public routes for each remote pool.
+            definition.e2e_certifiable.front().remote_cpu_overlays = {
+                ModelParityRemoteCPUHosts{1}, ModelParityRemoteCPUHosts{2}};
+            return definition;
         }
 
         /** @return The real GoogleTest JSON boundary consumed by inventory discovery. */
@@ -175,7 +189,8 @@ namespace llaminar2::test::parity
             ModelParityRemoteCPUHosts{1}, ModelParityRemoteCPUHosts{1}};
         EXPECT_THROW((void)expandModelParityDefinition(definition), std::invalid_argument);
         auto cpu = qwen36::qwen36MoECPU2NodeTPParityDefinition();
-        cpu.e2e_certifiable.front().remote_cpu_overlays = {ModelParityRemoteCPUHosts{1}};
+        cpu.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth,
+            .remote_cpu_overlays = {ModelParityRemoteCPUHosts{1}}}};
         EXPECT_THROW((void)expandModelParityDefinition(cpu), std::invalid_argument);
         auto local_cpu = remoteSource(GlobalDeviceAddress::cpu());
         local_cpu.e2e_certifiable = {{.mtp = ModelParityMTP::DynamicDepth,
@@ -189,9 +204,36 @@ namespace llaminar2::test::parity
         const auto variants = qwen36::withOrnith15CertificationModels(definitions);
         ASSERT_EQ(variants.size(), 2u);
         EXPECT_EQ(variants.front().e2e_certifiable.front().remote_cpu_overlays.size(), 2u);
-        EXPECT_TRUE(variants.back().e2e_certifiable.front().remote_cpu_overlays.empty());
+        // The fine-tune exports no runtime eligibility profile of its own
+        // and inherits none from its source model, so it cannot reach remote
+        // overlay certification at all.
+        EXPECT_TRUE(variants.back().e2e_certifiable.empty());
         for (const auto &cell : expandModelParityDefinition(variants.back()))
             EXPECT_TRUE(record(cell).at("cross_host_e2e").empty());
+    }
+
+    TEST(ModelParityCrossHostE2E, LegacyDefinitionCarriesNoImplicitRemoteEligibility)
+    {
+        // Release eligibility lives in the bounded release matrix; these unit
+        // proofs must construct their remote tag explicitly. A legacy
+        // definition that silently regains a tag would reintroduce unchecked
+        // `.front()` assumptions in downstream projections.
+        const auto legacy = qwen36::qwen36MoEParityDefinition(
+            qwen36::qwen36SingleDeviceTopology("SourceGPU", GlobalDeviceAddress::rocm(0)),
+            "/reference", qwen36::qwen36MoESingleDeviceThresholds());
+        EXPECT_TRUE(legacy.e2e_certifiable.empty());
+        // Absent overlays must export no remote route on any expanded cell.
+        for (const auto &cell : expandModelParityDefinition(legacy))
+            EXPECT_TRUE(record(cell).at("cross_host_e2e").empty());
+        // Present overlays on the explicitly-tagged source keep both public
+        // routes for each remote pool without adding numerical cells.
+        const auto tagged = remoteSource();
+        ASSERT_FALSE(tagged.e2e_certifiable.empty());
+        EXPECT_EQ(tagged.e2e_certifiable.front().remote_cpu_overlays.size(), 2u);
+        std::size_t routes = 0;
+        for (const auto &cell : expandModelParityDefinition(tagged))
+            routes += record(cell).at("cross_host_e2e").size();
+        EXPECT_EQ(routes, 4u);
     }
 
     TEST(ModelParityCrossHostE2E, UntaggedAndInvalidProjectionCannotProduceAutomaticArguments)

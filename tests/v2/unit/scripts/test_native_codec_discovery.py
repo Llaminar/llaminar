@@ -104,6 +104,7 @@ class NativeCodecDiscovery(unittest.TestCase):
                 Path(command[4]).parent / 'literal "quote" and \\backslash'))
             self.assertEqual(props['TIMEOUT'], 120)
             self.assertEqual(props['TIMEOUT_SIGNAL_NAME'], 'SIGTERM')
+            self.assertEqual(props['TIMEOUT_SIGNAL_GRACE_PERIOD'], 36)
             self.assertIn('ProductionTestPreflight', props['LABELS'])
             self.assertIn('ProcessOwned', props['LABELS'])
             self.assertIn('FullDeviceInventory', props['LABELS'])

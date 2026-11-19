@@ -9,6 +9,7 @@
  * two-device limit. Host wall covers submission through complete native cohort completion. The
  * original service remains armed across frames and terminally joins afterward. No observed device value selects a workload or repairs its state.
  */
+#include "fixtures/qwen4exp/PooledFormatReplayGroup.h"
 #include "fixtures/backends/NativeGraphTimingEvents.h"
 #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
 #include "fixtures/execution/RetainedHostServiceFixture.h"

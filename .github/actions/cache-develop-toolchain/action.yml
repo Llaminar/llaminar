@@ -1,3 +1,5 @@
+# @file action.yml
+# @brief Restore and authenticate ISA-specific toolchains, reusing each runner's BuildKit cache.
 name: Cache develop toolchains
 description: Restore dependency-bound OCI toolchains before source compilation
 inputs:
@@ -36,7 +38,7 @@ runs:
     # warm image is consumed directly, without solving the toolchain stages.
     - name: Checkpoint shared CUDA and ROCm SDKs for cold toolchains
       if: >-
-        ((inputs.cpu-isa == 'AVX512' || inputs.cpu-isa == 'both') && steps.restore-avx512.outputs.cache-hit != 'true') ||
+        (inputs.cpu-isa == 'both' && steps.restore-avx512.outputs.cache-hit != 'true') ||
         ((inputs.cpu-isa == 'AVX2' || inputs.cpu-isa == 'both') && steps.restore-avx2.outputs.cache-hit != 'true')
       uses: docker/build-push-action@v7
       env:
@@ -53,7 +55,11 @@ runs:
           type=gha,scope=llaminar-gpu-sdk,version=2
           type=registry,ref=${{ steps.cache.outputs.image }}-avx512
           type=registry,ref=${{ steps.cache.outputs.image }}-avx2
-        cache-to: type=gha,scope=llaminar-gpu-sdk,mode=max,version=2
+        # A cache outage can cost a future rebuild. This job still requires
+        # a successful SDK build and a verified complete OCI toolchain.
+        cache-to: type=gha,scope=llaminar-gpu-sdk,mode=max,version=2,ignore-error=true
+    # This runner retains the named BuildKit worker. Its local layers and the
+    # registry import cover cold OCI misses without a second remote SDK solve.
     - name: Build complete AVX512 toolchain on a cache miss
       if: (inputs.cpu-isa == 'AVX512' || inputs.cpu-isa == 'both') && steps.restore-avx512.outputs.cache-hit != 'true'
       uses: docker/build-push-action@v7
@@ -71,9 +77,7 @@ runs:
         outputs: type=oci,dest=${{ steps.cache.outputs.path_avx512 }},tar=false
         provenance: false
         sbom: false
-        cache-from: |
-          type=gha,scope=llaminar-gpu-sdk,version=2
-          type=registry,ref=${{ steps.cache.outputs.image }}-avx512
+        cache-from: type=registry,ref=${{ steps.cache.outputs.image }}-avx512
     - name: Authenticate AVX512 toolchain bytes and inputs
       if: inputs.cpu-isa == 'AVX512' || inputs.cpu-isa == 'both'
       shell: bash

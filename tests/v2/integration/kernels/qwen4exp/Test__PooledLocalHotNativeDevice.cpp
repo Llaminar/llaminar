@@ -24,6 +24,7 @@
 #include "loaders/ImmutableLookupSetupObservation.h"
 #include "memory/CPUTensorStorageDeclaration.h"
 #include "utils/EmbeddingVerifierFormats.h"
+#include "fixtures/qwen4exp/PooledFormatReplayGroup.h"
 #include "utils/PooledNgramReplayTrace.h"
 #include "LocalHotRecordedResponse.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
@@ -105,9 +106,10 @@ enum class ReplayShape { SmallInventory, LargeRadixScan, LargeRadixWideKey, Next
  * @param slots Admitted local slots; the small-boundary sweep includes zero capacity.
  * @param wide Select the original sparse high-key-only inventory.
  * @param shape Immutable original query capacity and finite replay workload.
+ * @param group Formats sharing one process reservation in an all-format replay.
  */
 void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
-    ReplayShape shape=ReplayShape::SmallInventory)
+    ReplayShape shape=ReplayShape::SmallInventory, std::optional<PooledFormatReplayGroup> group=std::nullopt)
 {
     if(!hasCPUBackend())initCPUBackend(-1);
     const bool nextWindow=shape==ReplayShape::NextWindowCount;
@@ -121,11 +123,13 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
         (wide == largeWideKey || (smallBoundary && wide))),
         "Large native trace requires its exact original four-slot format inventory");
     std::vector<ReplayCase> cases;
+    std::size_t supported = 0;
     if(wide)cases.push_back({"UInt64_IQ4_NL",std::make_unique<ProviderFile>(),{7,101,102,ProviderFile::High,900},{}});
     else for(const auto& entry:embeddingVerifierFormats()) {
         const auto columns=entry.prepared_native_quantized?768u:257u;
         auto native=entry.create({97,columns},1701);const auto format=originalFormat(native->native_type());
         if(!format){requireProvider(native->native_type()==TensorType::Q8_1,"Canonical format has no original GGUF declaration");continue;}
+        if (group && !group->includes(supported++)) continue;
         if (large && *format != GGUFTensorType::F32 && *format != GGUFTensorType::IQ4_NL) continue;
         std::vector<std::uint64_t> keys{1,2,3,4,5};
         if (large) { keys.resize(64); std::iota(keys.begin(), keys.end(), 1); }
@@ -594,11 +598,13 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
     }
     session->requirePayloadRetired();worker.reset();session->retire();session->requireExactRetired();
 }
+/** @brief Exercise each local-hot format in one process with its original arena and graphs. */
+class LocalHotFormatReplay : public ::testing::TestWithParam<unsigned> {};
+INSTANTIATE_TEST_SUITE_P(FormatGroups, LocalHotFormatReplay, ::testing::Range(0u, PooledFormatReplayGroup::Count));
 #define LOCAL_HOT_NATIVE_TESTS(BACKEND,DEVICE) \
-TEST(PooledLocalHotNative,BACKEND##_AllFormatsC0){replayLocal(DEVICE,0,false);} \
-TEST(PooledLocalHotNative,BACKEND##_AllFormatsPositive){replayLocal(DEVICE,4,false);} \
+TEST_P(LocalHotFormatReplay,BACKEND##_AllFormatsC0){replayLocal(DEVICE,0,false,ReplayShape::SmallInventory,PooledFormatReplayGroup(GetParam()));} \
+TEST_P(LocalHotFormatReplay,BACKEND##_AllFormatsPositive){replayLocal(DEVICE,4,false,ReplayShape::SmallInventory,PooledFormatReplayGroup(GetParam()));} \
 TEST(PooledLocalHotNative,BACKEND##_WideKeyPositive){replayLocal(DEVICE,4,true);} \
-TEST(PooledLocalHotNative,BACKEND##_TerminalObservation){replayLocal(DEVICE,4,false);} \
 TEST(PooledLocalHotNative,BACKEND##_LargeRadixScan){replayLocal(DEVICE,4,false,ReplayShape::LargeRadixScan);} \
 TEST(PooledLocalHotNative,BACKEND##_LargeFutureAdoption){replayLocal(DEVICE,4,false,ReplayShape::LargeFutureAdoption);} \
 TEST(PooledLocalHotNative,BACKEND##_SmallProbeBoundary){replayLocal(DEVICE,4,false,ReplayShape::SmallProbeBoundary);} \
@@ -607,7 +613,7 @@ TEST(PooledLocalHotNative,BACKEND##_SmallProbeBoundaryWideKey){replayLocal(DEVIC
 TEST(PooledLocalHotNative,BACKEND##_SmallProbeBoundaryWideKeyC0){replayLocal(DEVICE,0,true,ReplayShape::SmallProbeBoundary);} \
 TEST(PooledLocalHotNative,BACKEND##_SmallProbeTiming){replayLocal(DEVICE,4,false,ReplayShape::SmallProbeTiming);} \
 TEST(PooledLocalHotNative,BACKEND##_LargeRadixWideKey){replayLocal(DEVICE,4,true,ReplayShape::LargeRadixWideKey);} \
-TEST(PooledLocalHotNative,BACKEND##_PrefillNextWindowCount){replayLocal(DEVICE,4,false,ReplayShape::NextWindowCount);}
+TEST_P(LocalHotFormatReplay,BACKEND##_PrefillNextWindowCount){replayLocal(DEVICE,4,false,ReplayShape::NextWindowCount,PooledFormatReplayGroup(GetParam()));}
 #ifdef HAVE_CUDA
 LOCAL_HOT_NATIVE_TESTS(CUDA,DeviceId::cuda(0))
 #endif

@@ -80,6 +80,8 @@ namespace llaminar2
                 if (clock_status != hipSuccess)
                     throw std::runtime_error("ROCm wall-clock frequency query failed at ordinal " +
                         std::to_string(ordinal) + ": " + hipGetErrorString(clock_status));
+                if (properties.hostNativeAtomicSupported != 0 && properties.hostNativeAtomicSupported != 1)
+                    throw std::runtime_error("Invalid ROCm host-native atomics observation for ordinal " + std::to_string(ordinal));
                 ROCmDeviceHardware hardware{
                     .ordinal = ordinal,
                     .name = properties.name,
@@ -95,6 +97,7 @@ namespace llaminar2
                         [](int *supported, int device) {
                             return hipDeviceGetAttribute(supported, hipDeviceAttributeCanUseStreamWaitValue, device);
                         }),
+                    .host_native_atomics = properties.hostNativeAtomicSupported != 0,
                     .wall_clock_rate_khz = wall_clock_rate_khz,
                     .lds_per_block = properties.sharedMemPerBlock,
                     .total_memory = properties.totalGlobalMem,

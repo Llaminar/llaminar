@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import argparse
 import copy
-from contextlib import contextmanager
+from contextlib import contextmanager, redirect_stdout
 import hashlib
+import io
 import json
 import multiprocessing
 import os
@@ -4414,9 +4415,16 @@ class ImageIdentityTests(unittest.TestCase):
         # generator. Keep exactly that small fixture closure; importing the
         # builder would conceal a missing dependency and turn the test image
         # back into a compiler image.
-        for package in ("build-essential", "cmake", "git", "jq"):
+        for package in ("build-essential", "git", "jq"):
             with self.subTest(package=package):
                 self.assertIn(package, test_runner)
+        self.assertIn(
+            "COPY --from=toolchain /usr/local/bin/cmake /usr/local/bin/ctest /usr/local/bin/cpack /usr/local/bin/",
+            test_runner,
+        )
+        apt_install = test_runner.split("apt-get install -y --no-install-recommends", 1)[1].split(
+            "&& rm -rf /var/lib/apt/lists/*", 1)[0]
+        self.assertNotIn("cmake", apt_install)
         self.assertIn(
             "COPY --from=toolchain /usr/local/bin/ninja /usr/local/bin/ninja",
             test_runner,
@@ -4814,6 +4822,27 @@ class ImageIdentityTests(unittest.TestCase):
 class InfrastructureTests(unittest.TestCase):
     def setUp(self):
         install_corpus_io_fixture(self, mock_stat=True)
+
+    def test_child_log_retains_interleaved_bytes_and_real_exit_status(self):
+        """Split rank output must survive the raw artifact and its console projection."""
+        payload = b"rank 0: \xe2[rank 1]\n[production-ci] rank \xff\n[model-parity-ok] finished\n"
+        with tempfile.TemporaryDirectory() as directory:
+            for status in (0, 8):
+                with self.subTest(status=status):
+                    log = Path(directory) / str(status)
+                    command = [sys.executable, "-c",
+                               f"import os, sys; os.write(2, {payload!r}); sys.exit({status})"]
+                    console = io.StringIO()
+                    with redirect_stdout(console):
+                        if status:
+                            with self.assertRaises(subprocess.CalledProcessError) as failure:
+                                pipeline.run(command, log)
+                            self.assertEqual(failure.exception.returncode, status)
+                        else:
+                            pipeline.run(command, log)
+                    self.assertEqual(log.read_bytes(), payload)
+                    self.assertEqual(console.getvalue().splitlines()[1:],
+                                     ["[production-ci] rank \ufffd", "[model-parity-ok] finished"])
 
     def test_all_isa_e2e_suites_precede_any_benchmark_and_certification(self):
         args = argparse.Namespace(output=Path("reports"), cpu_isas=list(pipeline.SHIPPING_ISAS),

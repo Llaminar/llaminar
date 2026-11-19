@@ -1,0 +1,8 @@
+backend,phase,format,codebook,execution_codebook,shape,category,m,variant,gflops,is_best,n,k,min_us,correctness_pass,weight_bytes,eff_bw_gbs,speedup_vs_int8,kb,target_waves
+rocm,prefill,Q4_1,5,5,qwen36_ffn_down_bucket,ffn_down,600,N128/MT32/MB1/U2,102.4,1,2048,4096,10.000,1,0,0,0,0,0
+rocm,prefill,Q5_1,7,7,qwen36_ffn_down_bucket,ffn_down,600,N128/MT32/MB1/U2,104.2,1,2048,4096,9.500,1,0,0,0,0,0
+rocm,prefill,Q8_0,19,19,qwen36_ffn_down_bucket,ffn_down,128,N64/MT32/MB1/U4,96.0,1,2048,4096,8.000,1,0,0,0,0,0
+rocm,prefill,Q8_1,20,19,qwen36_ffn_down_bucket,ffn_down,128,N64/MT32/MB1/U4,96.5,1,2048,4096,8.100,1,0,0,0,0,0
+rocm,prefill,Q8_K,21,19,qwen36_ffn_down_bucket,ffn_down,128,N64/MT32/MB1/U4,97.0,1,2048,4096,8.200,1,0,0,0,0,0
+rocm,prefill,IQ4_XS,4,24,qwen36_ffn_down_bucket,ffn_down,128,N64/MT32/MB1/U4,98.0,1,2048,4096,7.500,1,0,0,0,0,0
+rocm,prefill,IQ4_NL,4,4,qwen36_ffn_down_bucket,ffn_down,128,N64/MT32/MB1/U4,97.0,1,2048,4096,7.600,1,0,0,0,0,0

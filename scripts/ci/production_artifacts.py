@@ -62,6 +62,9 @@ def model_identities(manifest: dict) -> dict:
     return result
 
 
+MAXIMUM_CONTEXT_CASES = frozenset(("DenseOff", "DenseMTP", "MoEOff", "MoEMTP"))
+
+
 def validate_optional_native_cohort_requirement(requirement: dict) -> None:
     """Validate the typed optional geometry shared by registration and receipt readers."""
     if isinstance(requirement, dict) and "backend_degrees" in requirement:
@@ -69,26 +72,50 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
         if (set(requirement) != {"backend_degrees", "locality", "mpi_ranks"}
                 or not isinstance(degrees, dict) or set(degrees) != {"cuda", "rocm"}
                 or any(type(degree) is not int or degree <= 0 for degree in degrees.values())
-                or requirement["locality"] not in ("original-numa-local-rank", "two-distinct-numa-local-ranks")
+                or requirement["locality"] not in ("local-host", "original-numa-local-rank",
+                                                    "two-distinct-numa-local-ranks", "independent-numa-reporters")
                 or type(requirement["mpi_ranks"]) is not int or requirement["mpi_ranks"] <= 0
-                or (requirement["locality"] == "two-distinct-numa-local-ranks" and requirement["mpi_ranks"] != 2)):
+                or (requirement["locality"] == "two-distinct-numa-local-ranks" and requirement["mpi_ranks"] != 2)
+                or (requirement["locality"] == "independent-numa-reporters" and
+                    (requirement["mpi_ranks"] < 2 or degrees != {"cuda": 1, "rocm": 1}))):
             raise ValueError("invalid optional mixed-family preflight geometry")
         return
     required = {"backend", "degree", "locality"}
-    optional = {"native_isa", "stage_sizes", "rank_sizes", "mpi_ranks", "peer_access"}
+    optional = {"native_isa", "stage_sizes", "rank_sizes", "mpi_ranks", "peer_access", "maximum_context_case", "capacity_basis", "requires_host_native_atomics", "ordinal"}
     if (not isinstance(requirement, dict) or not required <= requirement.keys()
             or not requirement.keys() <= required | optional):
         raise ValueError("invalid optional preflight requirement")
     backend, degree, locality = (requirement[key] for key in ("backend", "degree", "locality"))
     if (backend not in ("cuda", "rocm") or type(degree) is not int or degree <= 0
-            or locality not in ("original-numa-local-rank", "two-distinct-numa-local-ranks")
+            or locality not in ("local-host", "original-numa-local-rank", "two-distinct-numa-local-ranks")
             or (locality == "two-distinct-numa-local-ranks" and degree != 2 and "rank_sizes" not in requirement)):
         raise ValueError("unsupported optional preflight geometry")
+    if "ordinal" in requirement:
+        if (set(requirement) != required | {"ordinal"} or locality != "original-numa-local-rank"
+                or type(requirement["ordinal"]) is not int or requirement["ordinal"] != 0 or degree != 1):
+            raise ValueError("invalid native bootstrap ordinal requirement")
+        return
+    if "requires_host_native_atomics" in requirement:
+        if (set(requirement) != required | {"requires_host_native_atomics"}
+                or requirement["requires_host_native_atomics"] is not True
+                or (backend, locality, degree) != ("rocm", "local-host", 1)):
+            raise ValueError("invalid native ROCm host atomics requirement")
+        return
+    if "maximum_context_case" in requirement or "capacity_basis" in requirement:
+        if (set(requirement) != required | {"maximum_context_case", "capacity_basis"}
+                or locality != "local-host" or degree != 1
+                or not isinstance(requirement["maximum_context_case"], str)
+                or requirement["maximum_context_case"] not in MAXIMUM_CONTEXT_CASES
+                or requirement["capacity_basis"] not in ("free", "total")):
+            raise ValueError("invalid maximum-context physical requirement")
+        return
     if "native_isa" in requirement:
         isa = requirement["native_isa"]
         syntax = r"gfx[0-9][0-9a-f]*" if backend == "rocm" else r"sm_?[0-9]+[a-z]?"
         if not isinstance(isa, str) or re.fullmatch(syntax, isa) is None:
             raise ValueError("invalid optional preflight native ISA")
+    if locality == "local-host" and set(requirement) != required:
+        raise ValueError("local device counts cannot replace a topology contract")
     if "peer_access" in requirement:
         if (requirement["peer_access"] not in ("directed-edge", "no-directed-pair") or degree < 2
                 or (requirement["peer_access"] == "no-directed-pair" and degree != 2)
@@ -127,6 +154,50 @@ def optional_native_cohort_absence(requirement: dict, hardware: dict) -> dict | 
         observed_pipeline_hardware_requirement, source_hardware_devices)
     observed = source_hardware_devices(hardware)
     absence = {"qualification": "hardware-ineligible-unqualified", "requirement": requirement}
+    if requirement["locality"] == "local-host":
+        # Local ordinal fixtures declare physical counts, not NUMA ownership.
+        # Linux legitimately reports -1 for PCI locality on single-socket hosts;
+        # never invent a NUMA node or use that absence to discard runnable cases.
+        needed = (requirement["backend_degrees"] if "backend_degrees" in requirement
+                  else {requirement["backend"]: requirement["degree"]})
+        counts = {}
+        for backend in needed:
+            devices = [device for address, device in observed.items() if address[0] == backend]
+            uuids = [device.get("uuid") for device in devices]
+            ordinals = [device["ordinal"] for device in devices]
+            if (any(not isinstance(uuid, str) or not uuid for uuid in uuids)
+                    or len(set(uuids)) != len(uuids) or len(set(ordinals)) != len(ordinals)):
+                raise ValueError("local physical counts require unique native GPU identities")
+            counts[backend] = len(devices)
+        if requirement.get("requires_host_native_atomics") and counts["rocm"]:
+            device = observed.get(("rocm", 0, -1), {})
+            capable = device.get("host_native_atomics")
+            if type(capable) is not bool:
+                raise ValueError("missing original ROCm host atomics observation")
+            if not capable:
+                return {**absence, "ordinal": 0, "uuid": device["uuid"], "host_native_atomics": False}
+        if "maximum_context_case" in requirement and counts[requirement["backend"]]:
+            # Native materialization always uses ordinal zero. Another card's
+            # free bytes or an unknown observation cannot certify its request.
+            device = observed.get((requirement["backend"], 0, -1))
+            sample = device.get("maximum_context") if device else None
+            total = device.get("total_memory_bytes") if device else None
+            if (not isinstance(sample, dict) or set(sample) != {"basis", "capacity_bytes", "minimum_bytes"}
+                    or sample["basis"] != requirement["capacity_basis"]
+                    or type(total) is not int or total <= 0
+                    or type(sample["capacity_bytes"]) is not int or not 0 <= sample["capacity_bytes"] <= total
+                    or (sample["basis"] == "total" and sample["capacity_bytes"] != total)
+                    or not isinstance(sample["minimum_bytes"], dict)
+                    or set(sample["minimum_bytes"]) != MAXIMUM_CONTEXT_CASES
+                    or any(type(size) is not int or size <= 0 for size in sample["minimum_bytes"].values())):
+                raise ValueError("incomplete original maximum-context physical BOM or capacity")
+            minimum = sample["minimum_bytes"][requirement["maximum_context_case"]]
+            if sample["capacity_bytes"] < minimum:
+                return {**absence, "ordinal": 0, "uuid": device["uuid"],
+                        "required_bytes": minimum, "observed_capacity_bytes": sample["capacity_bytes"]}
+        if all(counts[backend] >= degree for backend, degree in needed.items()):
+            return None
+        return {**absence, "observed_device_counts": counts}
     if "backend_degrees" in requirement:
         cohorts = {backend: {} for backend in requirement["backend_degrees"]}
         unknown = {backend: [] for backend in cohorts}
@@ -144,16 +215,33 @@ def optional_native_cohort_absence(requirement: dict, hardware: dict) -> dict | 
                               if numa in cpu_nodes and len(ordinals) >= requirement["backend_degrees"][backend]}
                     for backend, groups in cohorts.items()}
         cuda_nodes, rocm_nodes = eligible["cuda"], eligible["rocm"]
-        legal_owners = (bool(cuda_nodes & rocm_nodes) if requirement["locality"] == "original-numa-local-rank"
-                        else any(cuda != rocm for cuda in cuda_nodes for rocm in rocm_nodes))
-        if legal_owners and len(cpu_nodes) >= requirement["mpi_ranks"]:
-            return None
+        # The reporter test launches one extra process. GPUs on the same or
+        # different CPU nodes can report; the remaining process must stay idle.
+        if requirement["locality"] == "independent-numa-reporters":
+            reporter_nodes = cuda_nodes | rocm_nodes
+            if cuda_nodes and rocm_nodes and len(reporter_nodes) < requirement["mpi_ranks"]:
+                return None
+        else:
+            legal_owners = (bool(cuda_nodes & rocm_nodes) if requirement["locality"] == "original-numa-local-rank"
+                            else any(cuda != rocm for cuda in cuda_nodes for rocm in rocm_nodes))
+            if legal_owners and len(cpu_nodes) >= requirement["mpi_ranks"]:
+                return None
         return {**absence, "observed_cpu_discovery_nodes": sorted(cpu_nodes),
                 "observed_family_numa_cohorts": {backend: [
                     {"numa_node": numa, "ordinals": sorted(groups[numa])} for numa in sorted(groups)]
                     for backend, groups in cohorts.items()},
                 "unknown_locality_ordinals": {backend: sorted(ordinals) for backend, ordinals in unknown.items()}}
     backend, degree, locality = (requirement[key] for key in ("backend", "degree", "locality"))
+    if "ordinal" in requirement:
+        # The command pins ordinal zero before bootstrap. Another visible
+        # card with a known locality cannot supply its missing owner.
+        device = observed.get((backend, requirement["ordinal"], -1))
+        cpu_nodes = {device["numa_node"] for address, device in observed.items()
+                     if address[0] == "cpu" and device["numa_node"] >= 0}
+        if device and device["numa_node"] in cpu_nodes:
+            return None
+        return {**absence, "observed_ordinal_numa": device["numa_node"] if device else None,
+                "observed_cpu_discovery_nodes": sorted(cpu_nodes)}
     if "stage_sizes" in requirement and "native_isa" in requirement:
         # This is the same observed selector used for QFN source qualification.
         # The request has no invented addresses; runtime still binds the exact

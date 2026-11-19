@@ -158,6 +158,86 @@ class PreflightInventoryOwnershipTests(unittest.TestCase):
         cls.document = json.loads(subprocess.check_output(
             ["ctest", "--test-dir", str(BUILD), "--show-only=json-v1"], text=True, timeout=10))
 
+    def test_shared_weight_lifetime_qualifies_both_physical_consumers(self) -> None:
+        """Require both live GPUs for materialization and retain the pre-upload rejection on one GPU."""
+        available = {name for name in ("CUDA", "ROCm") if name.lower() in BACKENDS}
+        geometries = {name: {"Devices2"} for name in available}
+        if len(available) == 2:
+            geometries["Hybrid"] = {"Devices2", "CUDADevices1", "ROCmDevices1"}
+        tests = {row["name"]: row for row in self.document["tests"]}
+        for suffix, counts in geometries.items():
+            with self.subTest(suffix=suffix):
+                native = tests[f"V2_Integration_PreparedWeightSourceLifetime_{suffix}"]
+                rejection = tests[f"V2_Integration_PreparedWeightSourceRejection_{suffix}"]
+                native_labels = next(prop["value"] for prop in native["properties"] if prop["name"] == "LABELS")
+                rejection_labels = next(prop["value"] for prop in rejection["properties"] if prop["name"] == "LABELS")
+                self.assertTrue(counts | {"LocalHostDevices", "HardwareOptional"} <= set(native_labels))
+                self.assertNotIn("HardwareOptional", rejection_labels)
+
+    def test_ticket_cutpoints_qualify_physical_tp_peers_and_keep_single_gpu_prefill(self) -> None:
+        """The single-GPU shared FFN cutpoint remains mandatory independently of the TP peers."""
+        tests = {row["name"]: row for row in self.document["tests"]}
+        for backend in ("CUDA", "ROCm"):
+            if backend.lower() not in BACKENDS:
+                continue
+            for case in ("PrefillEarlyCPUTicket", "LocalTPNativeTicketCutpoint", "LocalTPPrefillEarlyCPUTicket"):
+                row = tests[f"V2_Integration_Qwen35MoE{case}_{backend}"]
+                labels = next(prop["value"] for prop in row["properties"] if prop["name"] == "LABELS")
+                with self.subTest(backend=backend, case=case):
+                    self.assertIn("ProductionTestPreflight", labels)
+                    if case.startswith("LocalTP"):
+                        self.assertTrue({"HardwareOptional", "Devices2", "LocalHostDevices"} <= set(labels))
+                    else:
+                        self.assertNotIn("HardwareOptional", labels)
+
+    def test_rccl_captured_storage_retains_both_retirement_orders_at_each_clique_width(self) -> None:
+        """Each required native clique has the exact matching address count and replay filter."""
+        tests = {row["name"]: row for row in self.document["tests"]}
+        if "V2_Integration_RCCLBackend" in tests:
+            for width in (2, 4):
+                row = tests[f"V2_Integration_RCCLHostTransportStorage_Clique{width}"]
+                labels = next(prop["value"] for prop in row["properties"] if prop["name"] == "LABELS")
+                self.assertTrue({"HardwareOptional", "LocalHostDevices", f"Devices{width}"} <= set(labels))
+                self.assertIn("--gtest_filter=NativeSharedHost/RCCLHostTransportStorageTest."
+                              f"NativePinnedOwnershipSurvivesCapturedReplay/Clique{width}*", row["command"])
+
+    def test_native_peer_preparation_and_foreign_finite_storage_require_two_originals(self) -> None:
+        """The rejection constructs the foreign graph, even when its attachment must fail."""
+        tests = {row["name"]: row for row in self.document["tests"]}
+        for family in ("CUDA", "ROCm"):
+            if family.lower() not in BACKENDS:
+                continue
+            for name in (f"PeerPreparationResetLifecycle_{family}", f"PeerPreparationErrorPreservation_{family}",
+                         f"{family}_FiniteStorage_RejectsOriginalForeignDevice", f"{family}_FiniteStorage_Live0"):
+                row = tests[f"V2_Integration_{name}"]
+                labels = next(prop["value"] for prop in row["properties"] if prop["name"] == "LABELS")
+                if name.endswith("Live0"):
+                    self.assertNotIn("HardwareOptional", labels)
+                else:
+                    self.assertTrue({family, "Devices2", "LocalHostDevices", "HardwareOptional"} <= set(labels))
+
+    def test_original_channel_and_pipeline_replays_require_their_physical_endpoints(self) -> None:
+        """Run each cohort only when the native selector can bind its actual participants."""
+        for row in self.document["tests"]:
+            labels = set(next((prop["value"] for prop in row["properties"] if prop["name"] == "LABELS"), ()))
+            if "ProductionTestPreflight" not in labels:
+                continue
+            name = row["name"]
+            expected = set()
+            for argument in row.get("command", []):
+                if argument.startswith("--pipeline-native-degree="):
+                    degree = int(argument.partition("=")[2])
+                    expected.add(f"Devices{degree}")
+            if name.startswith(("V2_Integration_CapturedChannelCancellation_",
+                                "V2_Integration_PipelineActivationCompletedFanout_")):
+                expected.add("Devices2")
+            if name == "V2_Integration_CapturedTransferRank_MixedCUDA_ROCm":
+                expected.update(("Devices2", "CUDADevices1", "ROCmDevices1", "DistinctNUMARanks"))
+            if expected:
+                with self.subTest(name=name):
+                    self.assertTrue(expected | {"HardwareOptional"} <= labels)
+                    self.assertNotIn("LocalHostDevices", labels)
+
     def test_every_filter_retains_complete_process_ownership(self) -> None:
         """CUDA, ROCm and performance filters inherit their executable's scope."""
         self.assertTrue(validate_inventory(self.document, BACKENDS))

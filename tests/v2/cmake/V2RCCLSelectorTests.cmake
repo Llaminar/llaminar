@@ -51,13 +51,6 @@ if(HAVE_ROCM AND HAVE_RCCL AND V2_RCCL_PROOF_SELECTED)
     endforeach()
     set_property(TEST V2_Integration_RCCLCollectiveSelectors APPEND PROPERTY LABELS
         ProductionTestPreflight)
-    # A named defect gate reuses the same builder-owned report and proof target.
-    add_test(NAME V2_Integration_RCCLP2PUserSelection
-        COMMAND ${Python3_EXECUTABLE} "${V2_RCCL_SELECTOR_SCRIPT}" verify
-            --report "${V2_RCCL_SELECTOR_PROOF}" --library "${RCCL_LIBRARY}")
-    set_property(GLOBAL PROPERTY V2_TEST_BUILD_TARGETS_V2_Integration_RCCLP2PUserSelection
-        v2_rccl_selector_taxonomy)
-    set_tests_properties(V2_Integration_RCCLP2PUserSelection PROPERTIES
-        LABELS "V2;Integration;ProductionTestPreflight;RCCL;DeviceFree;Replay;Regression"
-        TIMEOUT 30)
+    # One proof authenticates collective selectors and user P2P selection.
+    set_property(TEST V2_Integration_RCCLCollectiveSelectors APPEND PROPERTY LABELS Replay)
 endif()

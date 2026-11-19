@@ -333,7 +333,11 @@ namespace
 
     INSTANTIATE_TEST_SUITE_P(NativeSharedHost, RCCLHostTransportStorageTest,
         ::testing::Combine(::testing::Values(2u, 4u),
-            ::testing::Values(RetirementOrder::CreatorFirst, RetirementOrder::PeerFirst)));
+            ::testing::Values(RetirementOrder::CreatorFirst, RetirementOrder::PeerFirst)),
+        [](const auto& info) {
+            return "Clique" + std::to_string(std::get<0>(info.param)) +
+                (std::get<1>(info.param) == RetirementOrder::CreatorFirst ? "CreatorFirst" : "PeerFirst");
+        });
 }
 
 /** @brief Admit the explicit no-P2P storage contract before native runtime setup. */

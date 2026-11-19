@@ -26,22 +26,32 @@ if(HAVE_CUDA OR HAVE_ROCM)
     v2_bind_gpu_process_test_entry(${_v2_pooled_local_hot_native_target} v2_core_gtest_main)
     foreach(_backend CUDA ROCm)
         if((_backend STREQUAL "CUDA" AND HAVE_CUDA) OR (_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            set(_hot_requirements "")
             if(_backend STREQUAL "CUDA")
                 set(_env "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1")
                 set(_lock cuda_gpu_0)
             else()
                 set(_env "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
                 set(_lock rocm_gpu_0)
+                # Every replay opens the same mapped-host ready word with
+                # a system-scope CAS, including zero-cache and timing cells.
+                set(_hot_requirements "HardwareOptional;Devices1;LocalHostDevices;ROCmHostNativeAtomics")
             endif()
             if(NOT V2_PERF_TESTS_ONLY)
                 # Each source/PMA root has its own process lifetime. Register cache
                 # capacity and key-width cells separately instead of preparing an
                 # unrelated authority after a native runtime has already existed.
-                foreach(_case AllFormatsC0 AllFormatsPositive WideKeyPositive TerminalObservation LargeRadixScan LargeRadixWideKey PrefillNextWindowCount LargeFutureAdoption SmallProbeBoundary SmallProbeBoundaryC0 SmallProbeBoundaryWideKey SmallProbeBoundaryWideKeyC0)
+                foreach(_case AllFormatsC0 AllFormatsPositive WideKeyPositive LargeRadixScan LargeRadixWideKey PrefillNextWindowCount LargeFutureAdoption SmallProbeBoundary SmallProbeBoundaryC0 SmallProbeBoundaryWideKey SmallProbeBoundaryWideKeyC0)
+                    set(_local_hot_launcher "")
+                    set(_local_hot_filter PooledLocalHotNative.${_backend}_${_case})
+                    if(_case STREQUAL "AllFormatsC0" OR _case STREQUAL "AllFormatsPositive" OR _case STREQUAL "PrefillNextWindowCount")
+                        set(_local_hot_launcher ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py)
+                        set(_local_hot_filter FormatGroups/LocalHotFormatReplay.${_backend}_${_case}/*)
+                    endif()
                     add_v2_test(V2_Integration_${_backend}_PooledLocalHotNative_${_case}
-                        COMMAND $<TARGET_FILE:${_v2_pooled_local_hot_native_target}>
-                            --gtest_filter=PooledLocalHotNative.${_backend}_${_case}
-                        LABELS "V2;Integration;ProductionTestPreflight;GPU;${_backend};Ngram;Pooled;TraceReplay;Regression"
+                        COMMAND ${_local_hot_launcher} $<TARGET_FILE:${_v2_pooled_local_hot_native_target}>
+                            --gtest_filter=${_local_hot_filter}
+                        LABELS "V2;Integration;ProductionTestPreflight;GPU;${_backend};Ngram;Pooled;TraceReplay;Regression" ${_hot_requirements}
                         MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${_lock} TIMEOUT 120 ENVIRONMENT ${_env})
                     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${_backend}_PooledLocalHotNative_${_case})
                 endforeach()
@@ -50,7 +60,7 @@ if(HAVE_CUDA OR HAVE_ROCM)
             add_v2_test(V2_Perf_${_backend}_PooledLocalHotNative_SmallProbeTiming
                 COMMAND $<TARGET_FILE:${_v2_pooled_local_hot_native_target}>
                     --gtest_filter=PooledLocalHotNative.${_backend}_SmallProbeTiming
-                LABELS "V2;Performance;GPU;${_backend};Ngram;Pooled;NativeReplay;Diagnostic;Unprofiled"
+                LABELS "V2;Performance;GPU;${_backend};Ngram;Pooled;NativeReplay;Diagnostic;Unprofiled" ${_hot_requirements}
                 MPI_PROCS 1 NO_MPI NO_MODELS RESOURCE_LOCK ${_lock} TIMEOUT 120 ENVIRONMENT ${_env})
         endif()
     endforeach()

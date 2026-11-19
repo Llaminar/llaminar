@@ -5,7 +5,7 @@
 
 The real helper and native topology loops run in a language-free CMake project
 with imported executable placeholders. CTest's generated metadata proves both
-wide-hardware skip ownership and safe omission in Release. The actual ROCm
+physical-hardware qualification and safe omission in Release. The actual ROCm
 owner-partition cache/owning-TU blocks additionally prove Automatic/explicit mode
 configuration and conditional native-test registration. No compiler, model,
 GPU discovery, executable launch or replacement registration helper is involved.
@@ -82,8 +82,103 @@ set(Python3_EXECUTABLE "{sys.executable}")
                                     text=True, capture_output=True, check=True, timeout=10)
             return json.loads(result.stdout)['tests']
 
-    def test_integration_preserves_each_native_cell_and_exact_hardware_skip(self):
-        """Eight-device pipeline absence is qualified before launch, while legacy RCCL metadata stays exact."""
+    def test_physical_cardinality_interface_rejects_ambiguous_declarations(self):
+        """Execute the real CMake builder with local, mixed and malformed contracts."""
+        source = (SOURCE / 'tests/v2/CMakeLists.txt').read_text()
+        start = source.index('function(add_v2_test TEST_NAME)')
+        end = source.index('endfunction()', start) + len('endfunction()')
+        cases = (
+            ('LABELS CUDA GPU_DEVICES 2', {'CUDA', 'Devices2'}),
+            ('LABELS CUDA ROCm CUDA_DEVICES 1 ROCM_DEVICES 1', {'CUDADevices1', 'ROCmDevices1', 'Devices2'}),
+            ('LABELS CUDA GPU_DEVICES 0', None),
+            ('LABELS CUDA GPU_DEVICES', None),
+            ('LABELS CUDA ROCm GPU_DEVICES 2', None),
+            ('LABELS CUDA ROCm CUDA_DEVICES 1', None),
+            ('LABELS ROCm CUDA_DEVICES 2', None),
+            ('LABELS CUDA HardwareOptional GPU_DEVICES 2', None),
+            ('LABELS CUDA GPU_DEVICES 2 CUDA_DEVICES 2', None),
+        )
+        for declaration, expected in cases:
+            with self.subTest(declaration=declaration), tempfile.TemporaryDirectory(prefix='llaminar-count-contract-') as directory:
+                root = Path(directory)
+                root.joinpath('CMakeLists.txt').write_text(f"""cmake_minimum_required(VERSION 3.25)
+project(PhysicalCounts NONE)
+enable_testing()
+set(CMAKE_BUILD_TYPE Integration)
+set(V2_PERF_TESTS_ONLY OFF)
+set(V2_TEST_SOCKETS 1)
+set(V2_TEST_CORES_PER_SOCKET 2)
+set(DEFAULT_LOG_LEVEL ERROR)
+set(Python3_EXECUTABLE "{sys.executable}")
+include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")
+include("{SOURCE}/tests/v2/cmake/V2TestTargetSelection.cmake")
+""" + source[start:end] + f'\nadd_v2_test(V2_Integration_Count COMMAND "${{CMAKE_COMMAND}}" {declaration} MPI_PROCS 1 NO_MPI NO_MODELS)\n')
+                configured = subprocess.run(['cmake', '-S', str(root), '-B', str(root / 'build'),
+                    '-G', 'Ninja', '-DCMAKE_MAKE_PROGRAM=' + shutil.which('ninja')],
+                    capture_output=True, text=True, timeout=10)
+                if expected is None:
+                    self.assertNotEqual(configured.returncode, 0)
+                    self.assertIn('CMake Error', configured.stderr)
+                    continue
+                self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+                tests = json.loads(subprocess.check_output(['ctest', '--test-dir', str(root / 'build'),
+                    '--show-only=json-v1'], text=True, timeout=10))['tests']
+                labels = next(prop['value'] for prop in tests[0]['properties'] if prop['name'] == 'LABELS')
+                self.assertTrue(expected | {'HardwareOptional', 'LocalHostDevices'} <= set(labels))
+
+    def test_representative_identity_matrices_preserve_pairwise_and_boundary_coverage(self):
+        """Execute native registration and prove all interaction pairs and exact thresholds."""
+        from itertools import combinations, product
+        source = (SOURCE / 'tests/v2/CMakeLists.txt').read_text()
+        start = source.index('function(add_v2_test TEST_NAME)')
+        end = source.index('endfunction()', start) + len('endfunction()')
+        with tempfile.TemporaryDirectory(prefix='llaminar-identity-matrix-') as directory:
+            root = Path(directory)
+            root.joinpath('CMakeLists.txt').write_text(f"""cmake_minimum_required(VERSION 3.25)
+project(IdentityMatrix NONE)
+enable_testing()
+set(CMAKE_BUILD_TYPE Integration)
+set(V2_PERF_TESTS_ONLY OFF)
+set(V2_TEST_SOCKETS 1)
+set(V2_TEST_CORES_PER_SOCKET 2)
+set(DEFAULT_LOG_LEVEL ERROR)
+set(HAVE_CUDA ON)
+set(HAVE_ROCM ON)
+set(Python3_EXECUTABLE "{sys.executable}")
+add_executable(v2_test_qwen4exp_device_primitives IMPORTED GLOBAL)
+set_target_properties(v2_test_qwen4exp_device_primitives PROPERTIES IMPORTED_LOCATION "${{CMAKE_COMMAND}}")
+include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")
+include("{SOURCE}/tests/v2/cmake/V2TestTargetSelection.cmake")
+""" + source[start:end] + f'\ninclude("{SOURCE}/tests/v2/cmake/V2PooledExactIdentityNativeTests.cmake")\n')
+            configured = subprocess.run(['cmake', '-S', str(root), '-B', str(root / 'build'),
+                '-G', 'Ninja', '-DCMAKE_MAKE_PROGRAM=' + shutil.which('ninja')],
+                text=True, capture_output=True, timeout=10)
+            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+            tests = json.loads(subprocess.check_output(['ctest', '--test-dir', str(root / 'build'),
+                '--show-only=json-v1'], text=True, timeout=10))['tests']
+        self.assertEqual(len(tests), 64)  # formerly 88; no formats or dispatch thresholds removed
+        for backend in ('CUDA', 'ROCm'):
+            names = [test['name'].split(f'{backend}_PooledImmutable_')[1]
+                     for test in tests if f'{backend}_PooledImmutable_' in test['name']]
+            for family, axes in (
+                    ('CooperativeRejection', (('Pin', 'Free', 'Victim'), ('65', '257'), ('Row32', 'Row64'))),
+                    ('Record', (('PinSlotBounds', 'PinOrdinal', 'PinCommitFlags'), ('Early', 'Late'), ('Row32', 'Row64')))):
+                rows = [name.split('_')[1:] for name in names if name.startswith(family + '_')]
+                self.assertEqual(len(rows), 6)
+                for first, second in combinations(range(3), 2):
+                    self.assertEqual({(row[first], row[second]) for row in rows},
+                                     set(product(axes[first], axes[second])))
+            boundaries = {str(n) for n in (63, 64, 65, 127, 128, 129, 255, 256, 257, 513)}
+            for trace in ('Pin', 'RetainedPinsAndAllocation'):
+                self.assertEqual({name.split('_')[2] for name in names
+                                  if name.startswith('ExactIdentity_' + trace + '_')}, boundaries)
+        for test in tests:
+            labels = next(prop['value'] for prop in test['properties'] if prop['name'] == 'LABELS')
+            self.assertIn('ProductionTestPreflight', labels)
+            self.assertEqual(sum(arg.startswith('--gtest_filter=') for arg in test['command']), 1)
+
+    def test_integration_preserves_each_native_cell_and_exact_hardware_qualification(self):
+        """Every missing physical geometry is qualified before launch; native bodies remain strict."""
         tests = self.configure('Integration')
         self.assertEqual(len(tests), 49)
         optional = 0
@@ -95,7 +190,8 @@ set(Python3_EXECUTABLE "{sys.executable}")
             if 'Devices8' in labels:
                 optional += 1
                 if 'RCCLUnusedRetirement_' in test['name']:
-                    self.assertEqual(properties['SKIP_REGULAR_EXPRESSION'], ['Requires 8 ROCm devices'])
+                    self.assertTrue({'HardwareOptional', 'LocalHostDevices'} <= labels)
+                    self.assertNotIn('SKIP_REGULAR_EXPRESSION', properties)
                 else:
                     self.assertTrue({'HardwareOptional', 'DistinctNUMARanks', 'CUDADevices4', 'ROCmDevices4'} <= labels)
                     self.assertNotIn('SKIP_REGULAR_EXPRESSION', properties)
@@ -150,13 +246,10 @@ include("{selection}")
             self.assertNotIn('DISABLED', props)
             self.assertNotIn('SKIP_REGULAR_EXPRESSION', props)
             self.assertNotIn('SKIP_RETURN_CODE', props)
-            if 'HardwareOptional' in labels:
-                optional.add(test['name'])
-                self.assertTrue(('CUDA' in labels and bool({'Devices4', 'Devices8'} & labels))
-                    or ('ROCm' in labels and 'Devices8' in labels))
-            else:
-                self.assertTrue('Devices2' in labels or ('ROCm' in labels and 'Devices4' in labels))
-        self.assertEqual(len(optional), 6)
+            self.assertTrue({'HardwareOptional', 'LocalHostDevices'} <= labels)
+            self.assertTrue({'Devices2', 'Devices4', 'Devices8'} & labels)
+            optional.add(test['name'])
+        self.assertEqual(len(optional), 12)
 
     def test_original_mapped_components_partition_exact_native_cohorts(self):
         """Execute the real per-body registration, retaining honest local mixed eligibility."""
