@@ -39,6 +39,7 @@ class NativeTestModuleSelection(unittest.TestCase):
         "v2_unit_moe_overlay_residency_authority", "v2_unit_moe_overlay_physical_residency_fabric",
         "v2_test_expert_tier_weight_stream", "v2_unit_moe_overlay_capacity_resolver",
         "v2_integration_moe_overlay_residency_consensus_mpi", "v2_integration_global_tp_mpi",
+        "v2_integration_prefix_cache_shutdown_mpi",
         "v2_test_cpu_expert_shard_execution", "v2_test_moe_overlay_tier_migration_transport",
         "v2_unit_moe_overlay_distributed_residency_transport",
         "v2_unit_moe_overlay_economy_calibration_controller",
@@ -219,6 +220,7 @@ endif()
                         for expected in ("V2_Integration_CPUFragmentPayloadContract",
                                          "V2_Integration_NativeCPUCollectiveProgramReplay",
                                          "V2_Integration_CPUExpertSocketMembershipReplay",
+                                         "V2_Integration_PrefixCacheAfterCPUExpertRetirement_MPI",
                                          "V2_Integration_NativeCollectiveOwnedErrorReplay"):
                             self.assertIn(expected, names)
                         self.assert_source_setup_requirements(tests, cuda, rocm)
