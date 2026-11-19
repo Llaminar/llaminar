@@ -461,6 +461,101 @@ class DevelopImageGateTests(unittest.TestCase):
             publish.assert_not_called()
             self.assertFalse(json.loads((output / "develop-image-gate.json").read_text())["complete"])
 
+    def test_hosted_stage_builds_and_uploads_one_runtime(self):
+        """Staging has an ISA-specific receipt and leaves the develop aliases to the publisher."""
+        source = {"revision": "a" * 40, "tree": "tree", "dirty": False}
+        base = "ghcr.io/llaminar/llaminar:develop"
+        runtime = "sha256:" + "1" * 64
+        manifest = "sha256:" + "2" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "stage"
+            with patch.object(gate, "source_identity", return_value=source), \
+                 patch.object(gate, "build", return_value={"runtime": {"id": runtime}}) as build, \
+                 patch.object(gate, "require_image"), \
+                 patch.object(gate, "require_host_cpu_isa") as cpu, \
+                 patch.object(gate, "run_pr_tests") as tests, \
+                 patch.object(gate, "run") as run, \
+                 patch.object(gate, "remote_image_id", return_value=runtime) as remote, \
+                 patch.object(gate.subprocess, "check_output", return_value=json.dumps(manifest)):
+                self.assertEqual(gate.main(["--output", str(output), "--build-only", "--stage",
+                                            "--image", base, "--cpu-isa", "AVX2"]), 0)
+            self.assertEqual(build.call_args.args[0].cpu_isa, "AVX2")
+            self.assertEqual(build.call_args.kwargs["roles"], (gate.ImageRole.RUNTIME,))
+            cpu.assert_not_called()
+            tests.assert_not_called()
+            self.assertEqual([call.args[0] for call in run.call_args_list], [
+                ["docker", "tag", runtime, base + "-staging-avx2"],
+                ["docker", "push", base + "-staging-avx2"],
+            ])
+            remote.assert_called_once_with(base.rsplit(":", 1)[0] + "@" + manifest)
+            receipt = json.loads((output / "develop-image-gate.json").read_text())
+            self.assertTrue(receipt["complete"])
+            self.assertFalse(receipt["published"])
+            self.assertEqual(receipt["variants"], {"AVX2": {
+                "runtime_image": runtime, "staged_manifest": manifest}})
+
+    def test_hosted_publish_verifies_both_sources_before_copying_registry_manifests(self):
+        """A missing, stale, mislabeled or conflicting lane cannot publish either ISA."""
+        source = {"revision": "a" * 40, "tree": "tree", "dirty": False}
+        base = "ghcr.io/llaminar/llaminar:develop"
+        for defect in (None, "missing", "foreign-tree", "foreign-isa", "different-config", "pinned-conflict"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry, configs, expected = {}, {}, {}
+                for index, isa in enumerate(gate.SHIPPING_ISAS):
+                    if defect == "missing" and isa == "AVX2":
+                        continue
+                    manifest = "sha256:" + str(index + 1) * 64
+                    runtime = "sha256:" + str(index + 3) * 64
+                    ref = f"{base.rsplit(':', 1)[0]}@{manifest}"
+                    expected[isa] = runtime
+                    negative = defect if isa == "AVX2" else None
+                    registry[ref] = "sha256:" + "9" * 64 if negative == "different-config" else runtime
+                    configs[ref] = {"config": {"Labels": {
+                        "org.opencontainers.image.revision": source["revision"],
+                        "org.llaminar.source_tree": source["tree"],
+                        "org.llaminar.build_type": "Release", "org.llaminar.image_role": "runtime",
+                        "org.llaminar.cpu_isa": "AVX512" if negative == "foreign-isa" else isa,
+                        "org.llaminar.cuda": "ON", "org.llaminar.rocm": "ON",
+                    }}}
+                    if negative == "pinned-conflict":
+                        registry[gate.revision_tag(base, isa, source["revision"])] = "sha256:" + "f" * 64
+                    artifact = root / f"develop-stage-{isa}"
+                    artifact.mkdir()
+                    gate.write_json(artifact / "develop-image-gate.json", {
+                        "schema": 1, "source": {**source, "tree": "foreign"} if negative == "foreign-tree" else source,
+                        "image": base, "validation": "build-only", "complete": True, "published": False,
+                        "variants": {isa: {"runtime_image": runtime, "staged_manifest": manifest}},
+                    })
+
+                def copy(command, log):
+                    self.assertEqual(command[:5], ["docker", "buildx", "imagetools", "create", "--prefer-index=false"])
+                    registry[command[-2]] = registry[command[-1]]
+
+                output = root / "published"
+                with patch.object(gate, "source_identity", return_value=source), \
+                     patch.object(gate, "remote_image_id", side_effect=registry.get), \
+                     patch.object(gate.subprocess, "check_output", side_effect=lambda cmd, **_: json.dumps(configs[cmd[-1]])), \
+                     patch.object(gate, "run", side_effect=copy) as run, \
+                     patch.object(gate, "build") as build:
+                    args = ["--output", str(output), "--image", base, "--publish-staged", str(root)]
+                    if defect is not None:
+                        with self.assertRaises((ValueError, FileNotFoundError)):
+                            gate.main(args)
+                        run.assert_not_called()
+                    else:
+                        self.assertEqual(gate.main(args), 0)
+                        self.assertEqual([call.args[0][-2] for call in run.call_args_list], [
+                            *(gate.revision_tag(base, isa, source["revision"]) for isa in gate.SHIPPING_ISAS),
+                            *(gate.runtime_tag(base, isa) for isa in gate.SHIPPING_ISAS),
+                        ])
+                    build.assert_not_called()
+                receipt = json.loads((output / "develop-image-gate.json").read_text())
+                self.assertEqual(receipt["complete"], defect is None)
+                self.assertEqual(receipt["published"], defect is None)
+                if defect is None:
+                    self.assertEqual({isa: variant["runtime_image"] for isa, variant in receipt["variants"].items()}, expected)
+
     def test_ref_tag_is_immutable_and_published_before_mutable_branch(self):
         source = "a" * 40
         runtime = {"runtime": {"id": "sha256:" + "1" * 64}}
@@ -546,26 +641,43 @@ class DevelopImageGateTests(unittest.TestCase):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", workflow)
         policy = yaml.load(workflow, Loader=yaml.BaseLoader)
-        self.assertEqual(policy["jobs"]["develop-images"]["runs-on"],
-                         {"group": "Develop CI", "labels": "llaminar-develop-avx2"})
+        job = policy["jobs"]["develop-images"]
+        self.assertEqual(job["runs-on"], "ubuntu-24.04")
+        self.assertEqual(job["strategy"], {"fail-fast": "false", "matrix": {"cpu_isa": list(gate.SHIPPING_ISAS)}})
         self.assertEqual(policy["concurrency"], {
             "group": "llaminar-develop-images", "cancel-in-progress": "true"})
         self.assertIn("--build-only", workflow)
         self.assertNotIn("prerequisites/", workflow)
         self.assertNotIn("prune_docker_build_cache", workflow)
-        buildx = next(step for step in policy["jobs"]["develop-images"]["steps"]
-                      if step.get("uses") == "docker/setup-buildx-action@v4")
-        self.assertEqual(buildx["with"]["name"], "llaminar-develop")
-        self.assertEqual(buildx["with"]["keep-state"], "true")
-        self.assertNotIn("sudo", workflow)
+        steps = job["steps"]
+        buildx = next(step for step in steps if step.get("uses") == "docker/setup-buildx-action@v4")
+        self.assertEqual(buildx["with"]["driver"], "docker-container")
+        self.assertNotEqual(buildx["with"].get("keep-state"), "true")
+        cache = next(step for step in steps if step.get("uses") == "./.github/actions/cache-develop-toolchain")
+        self.assertEqual(cache["with"], {"cpu-isa": "${{ matrix.cpu_isa }}"})
+        staging = next(step for step in steps if "--stage" in step.get("run", ""))
+        self.assertLess(steps.index(cache), steps.index(staging))
+        self.assertEqual(staging["env"]["LLAMINAR_DOCKER_BUILD_CACHE_ACCESS"], "read-write")
+        self.assertIn(':build-cache-develop"', staging["run"])
+        self.assertIn('--cpu-isa "$CPU_ISA"', staging["run"])
+        self.assertIn("kernel.core_pattern=/proc/llaminar-core-disabled", workflow)
+        publisher = policy["jobs"]["publish"]
+        self.assertEqual(publisher["runs-on"], "ubuntu-24.04")
+        self.assertEqual(publisher["needs"], "develop-images")
+        self.assertTrue(any("--publish-staged" in step.get("run", "") for step in publisher["steps"]))
 
     def test_failed_job_logs_survive_a_killed_build_and_a_missing_sibling_log(self):
         """Replay a killed build's GitHub transcript without needing a live runner or network."""
         workflows = ROOT / ".github/workflows"
         for caller, build in (("develop-pr.yml", "unit"), ("ci.yml", "develop-images")):
             job = yaml.load((workflows / caller).read_text(), Loader=yaml.BaseLoader)["jobs"]["failed-job-logs"]
-            self.assertEqual(job["needs"], build)
-            self.assertEqual(job["if"], f"always() && (needs.{build}.result == 'failure' || needs.{build}.result == 'cancelled')")
+            if caller == "ci.yml":
+                self.assertEqual(job["needs"], [build, "publish"])
+                self.assertEqual(job["if"], "always() && (contains(needs.*.result, 'failure') || "
+                                 "contains(needs.*.result, 'cancelled'))")
+            else:
+                self.assertEqual(job["needs"], build)
+                self.assertEqual(job["if"], f"always() && (needs.{build}.result == 'failure' || needs.{build}.result == 'cancelled')")
             self.assertEqual(job["permissions"], {"actions": "read"})
             self.assertEqual(job["uses"], "./.github/workflows/failed-job-logs.yml")
         workflow = yaml.load((workflows / "failed-job-logs.yml").read_text(), Loader=yaml.BaseLoader)
@@ -732,14 +844,31 @@ esac
         self.assertEqual(set(workflow["on"]), {"pull_request_target"})
         self.assertEqual(workflow["on"]["pull_request_target"]["branches"], ["develop"])
         self.assertEqual(set(workflow["on"]["pull_request_target"]["types"]),
-                         {"opened", "reopened", "synchronize", "ready_for_review"})
+                         {"opened", "reopened", "synchronize", "ready_for_review", "edited"})
         self.assertEqual(workflow["permissions"],
                          {"contents": "read", "pull-requests": "read"})
-        self.assertEqual(set(workflow["jobs"]), {"arm"})
+        self.assertEqual(set(workflow["jobs"]), {"arm", "arm-owner"})
         job = workflow["jobs"]["arm"]
         self.assertIn("head.repo.full_name == github.repository", job["if"])
         self.assertIn("!github.event.pull_request.draft", job["if"])
+        self.assertIn("github.event.pull_request.user.id != 3513358", job["if"])
         self.assertEqual(len(job["steps"]), 1)
+        owner = workflow["jobs"]["arm-owner"]
+        self.assertIn("github.event.pull_request.user.id == 3513358", owner["if"])
+        self.assertIn("head.repo.full_name == github.repository", owner["if"])
+        self.assertIn("!github.event.pull_request.draft", owner["if"])
+        self.assertEqual(owner["environment"], "llaminar-bot")
+        mint, arm = owner["steps"]
+        self.assertRegex(mint["uses"], r"^actions/create-github-app-token@[0-9a-f]{40}$")
+        self.assertEqual(mint["with"], {
+            "client-id": "${{ vars.LLAMINAR_BOT_CLIENT_ID }}",
+            "private-key": "${{ secrets.LLAMINAR_BOT_PRIVATE_KEY }}",
+            "permission-contents": "write", "permission-pull-requests": "write"})
+        self.assertEqual(arm["env"]["GH_TOKEN"], "${{ steps.bot.outputs.token }}")
+        self.assertIn("--auto --squash", arm["run"])
+        self.assertIn('--match-head-commit "$PR_HEAD_SHA"', arm["run"])
+        self.assertNotIn("--admin", str(workflow))
+        self.assertNotIn("checkout", str(owner))
         step = job["steps"][0]
         self.assertEqual(step["env"]["GH_TOKEN"], "${{ secrets.DEVELOP_AUTOMERGE_TOKEN }}")
         self.assertEqual(step["env"]["PR_NUMBER"],
@@ -748,6 +877,41 @@ esac
         self.assertIn('gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash', step["run"])
         self.assertIn('--match-head-commit "$PR_HEAD_SHA"', step["run"])
         self.assertNotIn("checkout", str(job))
+
+    def test_owner_job_migrates_native_merge_identity_for_the_current_head(self):
+        """Execute the shipped workflow shell for new and previously armed PRs."""
+        workflow = yaml.load((ROOT / ".github/workflows/develop-auto-merge.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        command = workflow["jobs"]["arm-owner"]["steps"][-1]["run"]
+        repo = "Llaminar/llaminar"
+        sha = "a" * 40
+        arm = f"pr merge 64 --repo {repo} --auto --squash --match-head-commit {sha}"
+        disable = f"pr merge 64 --repo {repo} --disable-auto"
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            gh = directory / "gh"
+            gh.write_text('#!/bin/sh\nif [ "$1" = api ]; then cat "$PR_JSON"; '
+                          'else echo "$*" >> "$MERGE_LOG"; fi\n')
+            gh.chmod(0o755)
+            fixture, log = directory / "pr.json", directory / "calls"
+            for login, action, author, source, expected in [
+                    (None, "opened", 3513358, sha, [arm]),
+                    ("dbsanfte", "edited", 3513358, sha, [disable, arm]),
+                    (None, "edited", 3513358, sha, []),
+                    ("llaminar-bot[bot]", "synchronize", 3513358, sha, []),
+                    ("dbsanfte", "edited", 42, sha, []),
+                    ("dbsanfte", "edited", 3513358, "b" * 40, [])]:
+                with self.subTest(login=login, action=action, author=author, source=source):
+                    fixture.write_text(json.dumps({"head": {"sha": source, "repo": {"full_name": repo}},
+                        "base": {"ref": "develop"}, "user": {"id": author}, "draft": False,
+                        "state": "open", "auto_merge": {"enabled_by": {"login": login}} if login else None}))
+                    log.write_text("")
+                    result = subprocess.run(["bash", "-c", command], capture_output=True, text=True,
+                        env={**os.environ, "PATH": temp + os.pathsep + os.environ["PATH"],
+                             "PR_JSON": str(fixture), "MERGE_LOG": str(log), "GITHUB_REPOSITORY": repo,
+                             "PR_NUMBER": "64", "PR_HEAD_SHA": sha, "PR_EVENT_ACTION": action})
+                    self.assertEqual(result.returncode == 0, author == 3513358 and source == sha)
+                    self.assertEqual(log.read_text().splitlines(), expected)
 
     def test_all_host_ci_jobs_share_a_serial_non_discarding_queue(self):
         """Production certification jobs cannot contend for this host's GPUs."""

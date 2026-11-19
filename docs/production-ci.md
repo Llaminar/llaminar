@@ -18,8 +18,8 @@ Those optional tools do not add phases to RC certification.
 
 Ordinary work starts from current `develop` on a branch named
 `feat/short-feature-description`. Commit messages and PR titles use
-Conventional Commits. After both required Unit/host checks and owner approval pass, the feature PR
-squash-merges into `develop`. Only explicit user direction starts the separate
+Conventional Commits. Both Unit/host checks must pass for the up-to-date feature PR to squash-merge
+into `develop`. PRs by another contributor also require the owner’s review. Only explicit user direction starts the separate
 `rc/*`-to-`master` release PR and its full certification/release workflow.
 
 Documentation and CI/CD workflow maintenance may be committed and pushed
@@ -89,20 +89,18 @@ manual merges. Direct human pushes, force pushes and deletion remain rejected.
 `.github/workflows/develop-auto-merge.yml` arms GitHub's native
 auto-merge for same-repository, non-draft PRs. GitHub loads this
 `pull_request_target` policy from the trusted default branch, `master`, even
-when the PR targets `develop`. That installed copy uses the dedicated
-`DEVELOP_AUTOMERGE_TOKEN` repository secret; changing only the develop copy
-cannot repair the live policy. It does not check out PR code and cannot merge
-before the required image-bound check and review requirements succeed. The gate retains the same-repository PR policy; import a reviewed fork branch
-into this repository before requesting it.
+when the PR targets `develop`. Install workflow updates on the default branch
+before expecting them to arm new PRs. The workflow authenticates the event's
+head SHA and arms GitHub's native squash auto-merge.
 
-The automation secret is a fine-grained personal access token limited to
-`Llaminar/llaminar`, with Contents and Pull requests write permissions. It has
-no Administration permission. Native auto-merge waits for all required reviews
-and checks; the automation must never request an administrative merge override. The built-in
-`GITHUB_TOKEN` remains read-only: using it to merge would suppress the ordinary
-develop push workflow. A missing automation secret fails the arm job explicitly;
-there is no substitution of credentials. The command also authenticates the
-event's exact head SHA so a stale job cannot arm a changed candidate.
+For original PR author `dbsanfte` (GitHub user ID `3513358`), the workflow
+uses a short-lived installation token for the private `Llaminar/llaminar-bot`
+app. GitHub enforces both required checks and strict branch freshness for the
+app. Other authors use the existing `DEVELOP_AUTOMERGE_TOKEN` and require the
+owner's review. Re-running a job as the owner does not change the PR author.
+Editing an existing owner PR description migrates a request armed by the old
+maintainer token to the app at the same head. An edit leaves an explicitly
+disabled request alone and does not trigger either ISA test job.
 
 Create the token in GitHub's fine-grained token settings with resource owner
 `Llaminar` and only repository `llaminar`, then install or rotate it through
@@ -125,7 +123,7 @@ does not cancel the other. Each PR/ISA job has its own
 `llaminar-develop-pr-<number>-<ISA>` concurrency group with
 `cancel-in-progress: true`, so a new commit cancels obsolete work for that
 same PR and ISA without serializing its two hosts.
-Each host serializes its own jobs; AVX2 shares its queue with publication.
+Each host serializes its own PR jobs.
 Each job calls `run_develop_image_gate.py --cpu-isa <ISA>` without publication.
 An AVX2-only test job defaults to `--pr-gpus CUDA+ROCm`, including when the protected caller supplies only the ISA. AVX512 defaults to `none`.
 Before toolchain preparation, CPU admission checks every visible CPU against
@@ -199,30 +197,32 @@ preflight or numerical acceptance.
 ## Develop branch image publication
 
 `.github/workflows/ci.yml` runs on pushes to `develop` and explicit manual
-dispatches on `develop`. It uses the self-hosted `llaminar-develop-108` runner
-with label `llaminar-develop-avx2` in the `Develop CI` group. The group admits
-only this repository and `ci.yml` plus reusable `develop-pr-tests.yml`, both
-pinned to `refs/heads/develop`. Image publication has its own
+dispatches on `develop`. Its build matrix uses standard GitHub-hosted
+`ubuntu-24.04` x64 runners, one VM per ISA. Before restoring their toolchains,
+the jobs reclaim disk used by the runner's preinstalled Android and language
+SDKs. Image publication has its own
 `llaminar-develop-images` concurrency group with `cancel-in-progress: true`:
 at most one develop publication runs, and a newer merge cancels its predecessor.
-PRs retain separate per-PR groups; all development jobs share one host queue
-without occupying production accelerators or GitHub cloud runners.
+PR checks use the separate self-hosted queues.
 
-The job runs `scripts/ci/run_develop_image_gate.py --build-only --publish`.
-It builds only the full CPU/CUDA/ROCm Release runtime targets for AVX512 and
-AVX2, with Integration compilation disabled. It runs no Unit, integration,
+Each matrix job runs `scripts/ci/run_develop_image_gate.py --build-only --stage`
+with its own `--cpu-isa`. It builds the full CPU/CUDA/ROCm Release runtime for
+that ISA, with Integration compilation disabled. The workflow runs no Unit, integration,
 production-preflight, model, E2E or benchmark tests and attaches no certificate.
 Compiler resource/spill checks remain part of building production code.
 
-Both runtimes must build and authenticate successfully before either is
-published as `ghcr.io/llaminar/llaminar:develop` and `:develop-avx2`. Matching
+Each job uploads the verified image to its rolling GHCR staging tag and records
+the immutable registry manifest digest. The `--publish-staged` job downloads
+both staging receipts from the same workflow run. It verifies their source,
+ISA and registry image labels before writing `ghcr.io/llaminar/llaminar:develop`
+and `:develop-avx2`. Matching
 `develop-<40-character SHA>` and `develop-<40-character SHA>-avx2` tags identify
 the same bytes. A conflicting source-pinned tag is fatal; branch tags are
 movable. The build receipt explicitly records `validation: build-only` and
 contains no invented test result. These are development images, not certified
 release artifacts.
 
-The persistent development worker also imports registry-backed BuildKit caches selected by
+The publication worker imports and exports registry-backed BuildKit caches selected by
 `LLAMINAR_DOCKER_BUILD_CACHE_IMAGE`, with separate `-avx512` and `-avx2` tags.
 The workflow stores these under `ghcr.io/llaminar/llaminar:build-cache-develop`.
 Registry access defaults to `read-write` for publication; PRs explicitly select
@@ -249,23 +249,25 @@ hits. The builder declares its build arguments explicitly because an external
 image does not inherit in-file ARG state. Both development workflows pin Buildx and
 BuildKit to the same versions.
 
-On a complete OCI cache miss, the dedicated AVX512 PR runner builds the
-pinned toolchain directly with its persistent BuildKit worker and registry
-cache import. The AVX2 development host also checkpoints `gpu-sdk` through the GitHub Actions
-cache v2 backend in `mode=max` under `llaminar-gpu-sdk`. If the cache service
-rejects a layer upload, the job can use its locally built SDK. The complete toolchain
-then builds, exports as OCI and authenticates. It is saved before Llaminar
-compilation, so a later build/test failure retains the dependency image.
+On a complete OCI cache miss, the shared action checkpoints `gpu-sdk` through
+the GitHub Actions cache v2 backend in `mode=max` under `llaminar-gpu-sdk` when
+the AVX2 toolchain must be built or a both-ISA publication needs either
+toolchain. It also imports the ISA-specific registry layers. A cache upload
+failure leaves the successfully built SDK available to the job's BuildKit
+worker. The complete toolchain then builds, exports as OCI and authenticates.
+It is saved before Llaminar compilation, so a later build or test failure
+retains the dependency image.
 Old mutable ISA toolchain layer-cache indexes are no longer used. PR entries
 belong to their merge ref and cannot be
 restored by develop publication or another PR. They remain reusable across
 updates to that PR. Develop populates the same dependency keys for inbound PRs to read.
 The repository's cache storage limit is configured in GitHub Actions settings;
-GitHub owns eviction. These caches contain dependency images, not source
-builds or compiler-object cache mounts. The named `llaminar-develop` BuildKit worker uses `keep-state: true`; its
-local layers and ccache mounts survive job cleanup, failed builds and later
-commits. Each physical host retains its own worker, shared only by that host's
-serial jobs; compiler caches are not transferred between the hosts. Per-ISA `*-toolchain.json` receipts record restore/build status,
+GitHub owns eviction. GitHub Actions caches contain dependency images and SDK
+layers. GHCR carries reusable BuildKit layers between publication runs. The
+cloud jobs keep local layers and compiler-object mounts for their own build.
+The named `llaminar-develop` BuildKit worker on each self-hosted PR
+runner keeps its local layers and compiler-object caches across jobs. Per-ISA
+`*-toolchain.json` receipts record restore/build status,
 dependency fingerprint, image manifest, size and validation time. The canonical
 image driver still admits and builds the exact source snapshot. See
 [Docker's cache backend reference](https://docs.docker.com/build/cache/backends/gha/)
@@ -329,16 +331,31 @@ use it as an empty input. Workflow jobs do not change host kernel settings.
 
 ### Protected-branch approval
 
-The separate `Owner approval` repository ruleset covers `master`, `develop` and `rc/*`.
-It requires one approval from `@Llaminar/repository-approvers` for every file;
-that team's sole member is `@dbsanfte`. New reviewable commits dismiss stale
-approvals, and only `@dbsanfte` may dismiss reviews. Ordinary write access does
-not bypass these rules. The owner retains an explicit PR-only override for
-owner-authored changes; the existing release-evidence deploy-key exception
-preserves post-release evidence publication. The separate develop CI ruleset
-also permits an explicitly authorized PR-only administrator override; master
-CI requirements remain independent. Keep approver-team membership restricted to the owner.
-The check installer extends this independent approval ruleset to RC branches while preserving its reviewers and approval policy.
+The owner review rules require `@Llaminar/repository-approvers` (sole member
+`dbsanfte`) for all changed files. New reviewable commits dismiss stale
+approvals. The separate develop review rule grants `llaminar-bot` a review
+exception. The CI ruleset still enforces its required checks, and the original
+owner rule continues to cover `master` and `rc/*`.
+
+To provision the owner auto-merge app:
+
+1. Register the private `llaminar-bot` GitHub App under the Llaminar organization.
+   Disable its webhook, grant Contents and Pull requests write plus implicit
+   Metadata read, and install it on `Llaminar/llaminar` only. Upload the
+   [robot avatar](assets/llaminar-bot.png) in the app's display settings.
+2. Restrict the `llaminar-bot` Actions environment to a selected **branch**
+   named `master`. The trusted `pull_request_target` workflow runs from that
+   ref. Put the app client ID in the environment variable
+   `LLAMINAR_BOT_CLIENT_ID`. Generate a private key in GitHub and import it
+   into the environment secret through standard input:
+   `gh secret set LLAMINAR_BOT_PRIVATE_KEY --env llaminar-bot --repo Llaminar/llaminar < /path/to/app.pem`.
+3. Preview `python3 scripts/ci/apply_master_ruleset.py --owner-auto-merge-only`,
+   then apply the same command with `--apply`. It copies the current review
+   requirements into the develop rule and verifies them before it narrows the
+   original rule to release branches. It leaves the CI rulesets in place.
+4. On a same-repository owner PR, confirm that the native auto-merge enabler
+   is `llaminar-bot[bot]` and the merge waits for both image checks. On another
+   author's PR confirm that owner review remains required.
 
 ### ARC runner on the production host
 
@@ -346,7 +363,7 @@ Production-host image builds, tests and toolchain preparation share
 `llaminar-develop-image-gate` with `queue: max` and
 `cancel-in-progress: false`. The ARC scale set has `maxRunners: 1`, so those jobs
 cannot overlap GPU work or replace an older pending run. This queue is separate
-from develop PRs and image publication on the dedicated development host.
+from the develop PR hosts and the cloud image publication runner.
 
 The `llaminar-xeon` ARC scale set runs inside the host's Kubernetes cluster,
 but it deliberately uses the host's Docker Unix socket rather than a DIND

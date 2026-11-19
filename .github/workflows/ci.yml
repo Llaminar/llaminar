@@ -2,7 +2,7 @@
 # @brief Publish the develop images and retain build evidence and failed job transcripts.
 name: CI
 
-# Develop publishes both Release runtime images on the dedicated development host.
+# Develop builds the Release runtimes in parallel on standard hosted Ubuntu VMs.
 # Unit and host-preflight tests belong to the separate PR gate. This push job
 # only builds and publishes; complete certification remains production work.
 on:
@@ -23,10 +23,12 @@ jobs:
   develop-images:
     # Manual dispatches from another branch must not mutate the develop tag.
     if: github.ref == 'refs/heads/develop'
-    name: Build → Publish develop images
-    runs-on:
-      group: Develop CI
-      labels: llaminar-develop-avx2
+    name: Build develop runtime (${{ matrix.cpu_isa }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu_isa: [AVX512, AVX2]
     timeout-minutes: 240
     steps:
       - uses: actions/checkout@v6
@@ -34,13 +36,24 @@ jobs:
           submodules: false
           lfs: false
           persist-credentials: false
+      - name: Prepare the disposable build VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reclaim unused language SDKs before restoring multi-gigabyte OCI images.
+          for sdk in /usr/local/lib/android /usr/share/dotnet /usr/share/swift /usr/local/.ghcup; do
+            if [[ -d "$sdk" && ! -L "$sdk" ]]; then
+              sudo find "$sdk" -xdev -depth -delete
+            fi
+          done
+          df -h "$RUNNER_TEMP" "$(docker info --format '{{.DockerRootDir}}')"
+          # Procfs rejects core file creation without invoking Ubuntu's crash collector.
+          sudo sysctl -w kernel.core_pattern=/proc/llaminar-core-disabled
       - uses: docker/setup-buildx-action@v4
         with:
           version: v0.38.1
-          name: llaminar-develop
-          # Retain layers and compiler cache mounts on the dedicated host.
+          # OCI toolchains and registry layers provide reuse across ephemeral VMs.
           driver: docker-container
-          keep-state: true
           driver-opts: |
             network=host
             image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
@@ -52,23 +65,35 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: ./.github/actions/cache-develop-toolchain
         with:
-          cpu-isa: both
-      - name: Build and publish both develop runtime images
+          cpu-isa: ${{ matrix.cpu_isa }}
+      - name: Build and stage the Release runtime
         shell: bash
+        env:
+          CPU_ISA: ${{ matrix.cpu_isa }}
+          LLAMINAR_DOCKER_BUILD_CACHE_ACCESS: read-write
         run: |
           set -euo pipefail
           export LLAMINAR_DOCKER_BUILD_CACHE_IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:build-cache-develop"
           exec python3 scripts/ci/run_develop_image_gate.py \
             --build-only \
+            --cpu-isa "$CPU_ISA" \
             --output parity-results/develop-image-gate \
             --image "ghcr.io/${GITHUB_REPOSITORY,,}:develop" \
-            --publish
+            --stage
+      - name: Retain the staged runtime receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-stage-${{ matrix.cpu_isa }}
+          path: parity-results/develop-image-gate/develop-image-gate.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
       - name: Retain develop-image build evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
           # Compact build evidence; compiler/layer caches are not artifacts.
-          name: develop-image-gate-${{ github.run_id }}
+          name: develop-image-gate-${{ github.run_id }}-${{ matrix.cpu_isa }}
           # The per-ISA source snapshot is a Buildx input, not evidence. Its
           # identity is sealed in develop-image-gate.json and it can contain
           # hundreds of MiB of tracked diagnostic CSVs which Docker itself
@@ -78,8 +103,49 @@ jobs:
             parity-results/develop-image-gate/develop-image-gate.json
             parity-results/develop-image-gate/**/build-*.log
             parity-results/develop-image-gate/**/build-timeline.jsonl
-            parity-results/develop-image-gate/**/publish.log
+            parity-results/develop-image-gate/**/stage.log
           if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  publish:
+    name: Publish develop images
+    needs: develop-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+          lfs: false
+          persist-credentials: false
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: develop-stage-*
+          path: ${{ runner.temp }}/llaminar-staged-images
+      - name: Verify and publish the matching Release pair
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec python3 scripts/ci/run_develop_image_gate.py \
+            --publish-staged "$RUNNER_TEMP/llaminar-staged-images" \
+            --output parity-results/develop-image-gate \
+            --image "ghcr.io/${GITHUB_REPOSITORY,,}:develop"
+      - name: Retain paired develop publication evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-image-gate-${{ github.run_id }}
+          path: |
+            parity-results/develop-image-gate/develop-image-gate.json
+            parity-results/develop-image-gate/publish.log
+          if-no-files-found: error
+          overwrite: true
           retention-days: 30
 
   develop-arm64:
@@ -116,8 +182,8 @@ jobs:
           done
 
   failed-job-logs:
-    needs: develop-images
-    if: always() && (needs.develop-images.result == 'failure' || needs.develop-images.result == 'cancelled')
+    needs: [develop-images, publish]
+    if: always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
     permissions:
       actions: read
     uses: ./.github/workflows/failed-job-logs.yml

@@ -154,6 +154,71 @@ class ReleaseCandidateTests(unittest.TestCase):
         self.assertEqual(rules.proposed_owner_ruleset(original)['rules'], original['rules'])
         self.assertNotIn('refs/heads/rc/**', original['conditions']['ref_name']['include'])
 
+    def test_bot_receives_only_develop_review_exception(self):
+        """Review identity cannot exempt release branches, CI or generic Actions."""
+        owner = dict(name='Owner approval', target='branch', enforcement='active',
+                     bypass_actors=[], conditions={'ref_name': {'include': ['refs/heads/master',
+                         rules.DEVELOP_REF, 'refs/heads/rc/**'], 'exclude': []}},
+                     rules=[{'type': 'pull_request', 'parameters': {'required_approving_review_count': 1,
+                             'required_reviewers': [{'reviewer': {'type': 'Team', 'id': 1}}]}}])
+        clone = rules.develop_owner_policy(owner, 42)
+        self.assertEqual(clone['conditions']['ref_name'], {'include': [rules.DEVELOP_REF], 'exclude': []})
+        self.assertEqual(clone['rules'], owner['rules'])
+        self.assertEqual(clone['bypass_actors'], [{'actor_type': 'Integration', 'actor_id': 42,
+                                                   'bypass_mode': 'exempt'}])
+        with self.assertRaises(ValueError):
+            rules.develop_owner_policy(owner, rules.GITHUB_ACTIONS_APP_ID)
+        with self.assertRaises(ValueError):
+            rules.develop_owner_policy({**owner, 'rules': [*owner['rules'], {'type': 'required_status_checks'}]}, 42)
+        with self.assertRaises(ValueError):
+            rules.verify_policy({**clone, 'enforcement': 'disabled'}, clone)
+        self.assertEqual(owner['bypass_actors'], [])
+
+
+    def test_split_reads_active_develop_review_before_releasing_overlap(self):
+        """An API failure while creating the clone leaves the original protection in force."""
+        repo = 'Llaminar/llaminar'
+        endpoint = f'repos/{repo}/rulesets'
+        old = f'{endpoint}/{rules.OWNER_RULESET_ID}'
+        owner = dict(name='Owner approval', target='branch', enforcement='active', bypass_actors=[],
+                     conditions={'ref_name': {'include': ['refs/heads/master', rules.DEVELOP_REF,
+                                                          'refs/heads/rc/**'], 'exclude': []}},
+                     rules=[{'type': 'pull_request', 'parameters': {'required_approving_review_count': 1,
+                             'required_reviewers': [{'reviewer': {'type': 'Team', 'id': 1}}]}}])
+        state = {old: owner, endpoint: [], 'apps/llaminar-bot': {
+                     'id': 42, 'owner': {'login': 'Llaminar', 'type': 'Organization'}},
+                 'orgs/Llaminar/installations': {'installations': [{'app_slug': 'llaminar-bot',
+                      'app_id': 42, 'repository_selection': 'selected',
+                      'permissions': {'contents': 'write', 'pull_requests': 'write', 'metadata': 'read'}}]}}
+        def read(path, *fields):
+            return deepcopy(state[path])
+
+        def create(command, *, input, text):
+            self.assertEqual(command[3:5], ['POST', endpoint])
+            state[endpoint] = [{'id': 9, 'name': rules.DEVELOP_OWNER_RULESET_NAME}]
+            state[f'{endpoint}/9'] = {**json.loads(input), 'id': 9, 'enforcement': 'disabled'}
+            return '{"id":9}'
+
+        def update(command, *, input, **kwargs):
+            self.assertEqual(command[3:5], ['PUT', old])
+            state[old] = json.loads(input)
+
+        with patch.object(rules, 'github_json', side_effect=read), \
+             patch.object(rules.subprocess, 'check_output', side_effect=create) as creates, \
+             patch.object(rules.subprocess, 'run', side_effect=update) as updates, patch('builtins.print'):
+            with self.assertRaises(ValueError):
+                rules.owner_protection(repo, split=True, apply=True)
+            updates.assert_not_called()
+            self.assertIn(rules.DEVELOP_REF, state[old]['conditions']['ref_name']['include'])
+            state[f'{endpoint}/9']['enforcement'] = 'active'
+            rules.owner_protection(repo, split=True, apply=True)
+            self.assertEqual(state[old]['conditions']['ref_name']['include'],
+                             ['refs/heads/master', 'refs/heads/rc/**'])
+            rules.owner_protection(repo, split=True, apply=True)
+            creates.assert_called_once()
+            updates.assert_called_once()
+
+
 
 if __name__ == '__main__':
     unittest.main()

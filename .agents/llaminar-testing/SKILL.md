@@ -95,7 +95,7 @@ The two ISA jobs target distinct custom runner labels, allowing the
 organization-scoped AVX2 host and repository-scoped AVX512 host to participate
 without changing runner-group access. The matrix permits two simultaneous jobs
 and disables fail-fast, retaining both results. Each host serializes its own
-jobs; AVX2 shares its queue with develop publication. Per-PR/ISA concurrency groups
+jobs. Per-PR/ISA concurrency groups
 cancel obsolete commits without canceling another PR. Each host preserves its
 local named `llaminar-develop` BuildKit worker's state,
 including compiler cache mounts across failed and successful jobs. Complete,
@@ -133,14 +133,15 @@ when the user explicitly authorizes a manual merge. Native auto-merge must still
 wait for the required checks; an overridden check is not passing evidence.
 Never grant the general GitHub Actions app a ruleset bypass.
 
-The `develop` push workflow builds the full-backend AVX512 and AVX2 Release
-runtimes on the AVX2 development host with
-`run_develop_image_gate.py --build-only --publish`. It publishes branch and
-source-SHA tags after both builds authenticate. A standard GitHub ARM64
-runner builds the Release CUDA+CPU specialization and publishes
-`develop-arm64` and `sha-<commit>-arm64` after the runtime startup smoke test.
-Publication omits Integration compilation and grants no release certificate.
-A new develop merge cancels superseded publication jobs. Complete Unit and
+The `develop` push workflow runs `run_develop_image_gate.py --build-only --stage`
+on two standard GitHub-hosted Ubuntu 24.04 runners, one for each x86 ISA.
+Each restores its OCI toolchain and imports and exports its GHCR BuildKit
+layer cache. A separate `--publish-staged` job authenticates both full-backend
+Release images before writing the branch and source-SHA tags. The native ARM64
+job builds and smoke-tests the Release CUDA+CPU image and publishes
+`develop-arm64` and `sha-<commit>-arm64`. Publication omits Integration
+compilation and grants no release certificate. A new develop merge cancels
+superseded builds. Complete Unit and
 production preflight remain mandatory in the explicit production pipeline
 through `run_production_prerequisites.py`. Production hardware has its own queue.
 The release path is **develop → rc/* → master**. Only explicit user direction
