@@ -49,6 +49,7 @@ Options:
                            Build integration binaries too, matching the full
                            CI builder image behavior.
       --build-arg ARG      Extra Docker build arg, KEY=VALUE. Repeatable.
+      --build-context ARG  Named BuildKit context, NAME=VALUE. Repeatable.
       --label LABEL        Extra image label, KEY=VALUE. Repeatable.
       --platform PLATFORM  Optional docker buildx platform.
       --build-network MODE Optional network mode for Dockerfile RUN steps.
@@ -116,6 +117,7 @@ labels=()
 cache_from=()
 cache_to=()
 extra_build_args=()
+build_contexts=()
 output_mode="${LLAMINAR_IMAGE_OUTPUT:-load}"
 verify_mode="auto"
 dry_run=false
@@ -241,6 +243,11 @@ while (($#)); do
             extra_build_args+=("$2")
             shift 2
             ;;
+        --build-context)
+            [[ $# -ge 2 && "$2" == ?*=* ]] || die "$1 requires NAME=VALUE"
+            build_contexts+=("$2")
+            shift 2
+            ;;
         --label)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             labels+=("$2")
@@ -341,7 +348,7 @@ if [[ "${cpu_isa}" == "NEON" || "${platform}" == "linux/arm64" ]]; then
     [[ "${image_variant}" == "cpu" || "${image_variant}" == "cuda" ]] ||
         die "the ARM64 runtime requires --variant cpu or --variant cuda"
     [[ "${enable_rocm}" == "OFF" ]] || die "the pinned ROCm SDK does not support Linux ARM64"
-    [[ "${skip_integration}" == "1" ]] || die "build the separate arm64-pr target for ARM Unit and host tests"
+    [[ "${skip_integration}" == "1" ]] || die "build the test-runner target with the arm64-pr inventory for ARM Unit and host tests"
     if [[ "${enable_cuda}" == "ON" ]]; then
         : "${cuda_archs:=121}"
     fi
@@ -423,6 +430,9 @@ for tag in "${tags[@]}"; do
 done
 for label in "${labels[@]}"; do
     cmd+=(--label "${label}")
+done
+for context in "${build_contexts[@]}"; do
+    cmd+=(--build-context "${context}")
 done
 for cache_spec in "${cache_from[@]}"; do
     cmd+=(--cache-from "${cache_spec}")

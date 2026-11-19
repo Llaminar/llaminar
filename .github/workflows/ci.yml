@@ -160,18 +160,34 @@ jobs:
           lfs: false
           persist-credentials: false
       - uses: docker/setup-buildx-action@v4
-      - name: Build and smoke-test the DGX Spark runtime image
-        shell: bash
-        run: |
-          test "$(uname -m)" = aarch64
-          bash scripts/docker/build-runtime-image.sh --variant cuda --cpu-isa NEON \
-            --load --verify --tag llaminar-arm64-runtime:develop \
-            --build-arg "LLAMINAR_SOURCE_TREE=$(git rev-parse HEAD^{tree})"
+        with:
+          version: v0.38.1
+          driver: docker-container
+          driver-opts: |
+            image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+          cache-binary: false
       - uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: ./.github/actions/cache-develop-toolchain
+        id: toolchain
+        with:
+          cpu-isa: NEON
+      - name: Build and smoke-test the DGX Spark runtime image
+        shell: bash
+        env:
+          TOOLCHAIN_CONTEXT: ${{ steps.toolchain.outputs.neon-context }}
+          REGISTRY_CACHE: ${{ steps.toolchain.outputs.neon-registry-cache }}
+        run: |
+          test "$(uname -m)" = aarch64
+          exec bash scripts/docker/build-runtime-image.sh --variant cuda --cpu-isa NEON \
+            --load --verify --tag llaminar-arm64-runtime:develop \
+            --build-context "${TOOLCHAIN_CONTEXT:?missing admitted NEON toolchain}" \
+            --cache-from "type=registry,ref=${REGISTRY_CACHE:?missing develop NEON cache reference}" \
+            --cache-to "type=registry,ref=$REGISTRY_CACHE,mode=max,image-manifest=true,oci-mediatypes=true" \
+            --build-arg "LLAMINAR_SOURCE_TREE=$(git rev-parse HEAD^{tree})"
       - name: Publish the tested ARM64 runtime
         shell: bash
         run: |
@@ -180,6 +196,13 @@ jobs:
             docker tag llaminar-arm64-runtime:develop "$repository:$tag"
             docker push "$repository:$tag"
           done
+      - name: Retain ARM64 toolchain evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-arm64-toolchain-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/llaminar-toolchains/neon-toolchain.json
+          retention-days: 30
 
   failed-job-logs:
     needs: [develop-images, publish]

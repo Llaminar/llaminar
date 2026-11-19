@@ -214,7 +214,7 @@ the jobs reclaim disk used by the runner's preinstalled Android and language
 SDKs. Image publication has its own
 `llaminar-develop-images` concurrency group with `cancel-in-progress: true`:
 at most one develop publication runs, and a newer merge cancels its predecessor.
-PR checks use the separate self-hosted queues.
+The x86 PR checks use the separate self-hosted queues.
 
 Each matrix job runs `scripts/ci/run_develop_image_gate.py --build-only --stage`
 with its own `--cpu-isa`. It builds the full CPU/CUDA/ROCm Release runtime for
@@ -233,6 +233,16 @@ movable. The build receipt explicitly records `validation: build-only` and
 contains no invented test result. These are development images, not certified
 release artifacts.
 
+The ARM64 PR check and ARM64 publication job use the same OCI toolchain
+cache action and bind the verified NEON manifest to each source build. A
+cold ARM64 job checkpoints the CUDA SDK in the Actions cache under
+`llaminar-gpu-sdk-neon` and saves the complete OCI toolchain before compiling
+Llaminar. The ARM64 PR job also imports and exports its test-runner layers
+under `llaminar-build-neon-pr` on the PR merge ref. The runtime export reuses
+that job's local BuildKit layers. The ARM64 publication job imports and
+exports `ghcr.io/llaminar/llaminar:build-cache-develop-neon`. ARM64 PRs read
+that registry cache without writing to it.
+
 The publication worker imports and exports registry-backed BuildKit caches selected by
 `LLAMINAR_DOCKER_BUILD_CACHE_IMAGE`, with separate `-avx512` and `-avx2` tags.
 The workflow stores these under `ghcr.io/llaminar/llaminar:build-cache-develop`.
@@ -240,7 +250,7 @@ Registry access defaults to `read-write` for publication; PRs explicitly select
 `import-only`, with no registry cache export. Local host-path and registry cache
 authorities are mutually exclusive.
 
-Both development workflows first run `.github/actions/cache-develop-toolchain`.
+Development image builds first run `.github/actions/cache-develop-toolchain`.
 Llaminar test builds require CMake and CTest 4.0 or later. The toolchain and
 installed runner share the Kitware package pinned in `requirements.txt` so
 CTest reports each MPI owner’s timeout signal and grace period in its inventory.
@@ -257,8 +267,7 @@ image driver independently admits its dependency identity and passes the
 digest-pinned `toolchain=oci-layout://...` named context to Buildx. This replaces
 the toolchain stage directly, without depending on intermediate solver-cache
 hits. The builder declares its build arguments explicitly because an external
-image does not inherit in-file ARG state. Both development workflows pin Buildx and
-BuildKit to the same versions.
+image does not inherit in-file ARG state. The development workflows pin Buildx and BuildKit to the same versions.
 
 On a complete OCI cache miss, the shared action checkpoints `gpu-sdk` through
 the GitHub Actions cache v2 backend in `mode=max` under `llaminar-gpu-sdk` when
@@ -273,8 +282,9 @@ belong to their merge ref and cannot be
 restored by develop publication or another PR. They remain reusable across
 updates to that PR. Develop populates the same dependency keys for inbound PRs to read.
 The repository's cache storage limit is configured in GitHub Actions settings;
-GitHub owns eviction. GitHub Actions caches contain dependency images and SDK
-layers. GHCR carries reusable BuildKit layers between publication runs. The
+GitHub owns eviction. GitHub Actions caches contain dependency images, SDK
+layers and ARM64 PR image layers. GHCR carries reusable BuildKit layers between
+publication runs. The
 cloud jobs keep local layers and compiler-object mounts for their own build.
 The named `llaminar-develop` BuildKit worker on each self-hosted PR
 runner keeps its local layers and compiler-object caches across jobs. Per-ISA

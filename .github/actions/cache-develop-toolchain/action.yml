@@ -4,8 +4,15 @@ name: Cache develop toolchains
 description: Restore dependency-bound OCI toolchains before source compilation
 inputs:
   cpu-isa:
-    description: AVX512, AVX2, or both for runtime publication
+    description: AVX512, AVX2, NEON, or both x86 ISAs
     required: true
+outputs:
+  neon-context:
+    description: Digest-pinned BuildKit context for the admitted ARM64 toolchain
+    value: ${{ steps.verify-neon.outputs.build_context }}
+  neon-registry-cache:
+    description: Trusted develop ARM64 layer-cache reference
+    value: ${{ steps.cache.outputs.image }}-neon
 runs:
   using: composite
   steps:
@@ -132,6 +139,71 @@ runs:
       with:
         path: ${{ steps.cache.outputs.path_avx2 }}
         key: ${{ steps.cache.outputs.key_avx2 }}
+    - name: Restore complete NEON toolchain
+      id: restore-neon
+      if: inputs.cpu-isa == 'NEON'
+      uses: actions/cache/restore@v5
+      with:
+        path: ${{ steps.cache.outputs.path_neon }}
+        key: ${{ steps.cache.outputs.key_neon }}
+    - name: Checkpoint the ARM64 CUDA SDK for cold toolchains
+      if: inputs.cpu-isa == 'NEON' && steps.restore-neon.outputs.cache-hit != 'true'
+      uses: docker/build-push-action@v7
+      env:
+        DOCKER_BUILD_RECORD_UPLOAD: "false"
+        DOCKER_BUILD_SUMMARY: "false"
+      with:
+        context: ${{ steps.cache.outputs.context }}
+        platforms: linux/arm64
+        target: gpu-sdk
+        build-args: |
+          LLAMINAR_ENABLE_CUDA=ON
+          LLAMINAR_ENABLE_ROCM=OFF
+          LLAMINAR_CUDA_ARCHS=121
+        outputs: type=cacheonly
+        provenance: false
+        sbom: false
+        cache-from: |
+          type=gha,scope=llaminar-gpu-sdk-neon,version=2
+          type=registry,ref=${{ steps.cache.outputs.image }}-neon
+        cache-to: type=gha,scope=llaminar-gpu-sdk-neon,mode=max,version=2,ignore-error=true
+    - name: Build complete NEON toolchain on a cache miss
+      if: inputs.cpu-isa == 'NEON' && steps.restore-neon.outputs.cache-hit != 'true'
+      uses: docker/build-push-action@v7
+      env:
+        DOCKER_BUILD_RECORD_UPLOAD: "false"
+        DOCKER_BUILD_SUMMARY: "false"
+      with:
+        context: ${{ steps.cache.outputs.context }}
+        platforms: linux/arm64
+        target: toolchain
+        build-args: |
+          LLAMINAR_CPU_ISA=NEON
+          LLAMINAR_ENABLE_CUDA=ON
+          LLAMINAR_ENABLE_ROCM=OFF
+          LLAMINAR_CUDA_ARCHS=121
+        labels: |
+          org.llaminar.toolchain_inputs=${{ steps.cache.outputs.fingerprint_neon }}
+          org.llaminar.toolchain_isa=NEON
+        outputs: type=oci,dest=${{ steps.cache.outputs.path_neon }},tar=false
+        provenance: false
+        sbom: false
+    - name: Authenticate NEON toolchain bytes and inputs
+      id: verify-neon
+      if: inputs.cpu-isa == 'NEON'
+      shell: bash
+      env:
+        CACHE_HIT: ${{ steps.restore-neon.outputs.cache-hit }}
+      run: |
+        python3 scripts/ci/toolchain_cache.py verify \
+          --root "$RUNNER_TEMP/llaminar-toolchains" --cpu-isa NEON \
+          --cache-hit "${CACHE_HIT:-false}" --github-output "$GITHUB_OUTPUT"
+    - name: Save complete NEON toolchain before compiling Llaminar
+      if: inputs.cpu-isa == 'NEON' && steps.restore-neon.outputs.cache-hit != 'true'
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ steps.cache.outputs.path_neon }}
+        key: ${{ steps.cache.outputs.key_neon }}
     - name: Bind the source image driver to the admitted toolchains
       shell: bash
       run: |

@@ -113,7 +113,11 @@ Use the `arm64-pr` installed inventory for this check. The driver
 A skip in any selected test fails the check. The QFN registrations replay
 production CPU components with generated weights. Full-model QFN qualification
 requires the published checkpoint. The check also smoke-tests the sibling
-Release runtime. See [production CI](../../docs/production-ci.md).
+Release runtime. Both ARM64 jobs restore the verified NEON OCI toolchain
+through `cache-develop-toolchain` and save a cold toolchain before compiling
+Llaminar. ARM64 PRs retain BuildKit layers under `llaminar-build-neon-pr`
+on the PR merge ref and import trusted develop layers from GHCR.
+See [production CI](../../docs/production-ci.md).
 
 Start ordinary work from current `develop` on `feat/<description>`; push and
 open a PR into `develop`. Use Conventional Commit messages and PR titles. See
@@ -142,8 +146,9 @@ on two standard GitHub-hosted Ubuntu 24.04 runners, one for each x86 ISA.
 Each restores its OCI toolchain and imports and exports its GHCR BuildKit
 layer cache. A separate `--publish-staged` job authenticates both full-backend
 Release images before writing the branch and source-SHA tags. The native ARM64
-job builds and smoke-tests the Release CUDA+CPU image and publishes
-`develop-arm64` and `sha-<commit>-arm64`. Publication omits Integration
+job imports and exports the `build-cache-develop-neon` GHCR cache, builds
+and smoke-tests the Release CUDA+CPU image, and publishes `develop-arm64`
+and `sha-<commit>-arm64`. Publication omits Integration
 compilation and grants no release certificate. A new develop merge cancels
 superseded builds. Complete Unit and
 production preflight remain mandatory in the explicit production pipeline
