@@ -33710,6 +33710,12 @@ add_v2_test(V2_Integration_Q8ResidualCorrectionGDNCPU
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1"
         "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Q8ResidualCorrectionGDNCPU)
+add_v2_test(V2_Integration_Qwen4ExpCPUProjectionSmoke
+    COMMAND $<TARGET_FILE:v2_integration_q8_residual_correction_gdn_cpu>
+        --gtest_filter=Q8ResidualCorrectionGDNCPU.QFNSmallGroupedPrefillAndDecode
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ARM;Qwen4Exp;FA;GDN;ByteExact"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpCPUProjectionSmoke)
 # Append each alias before canonical inventory closure. Existing native target
 # already owns the extended Test__Q8ResidualCorrectionDevice.cpp source.
 foreach(V2_GDN_Q8_BACKEND IN ITEMS CUDA ROCm)
@@ -33912,13 +33918,19 @@ add_v2_test(V2_Integration_Qwen4ExpPLEVerifierRowsContract
 add_v2_test(V2_Integration_Qwen4ExpPLEPreparedVerifierCPU
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
         --gtest_filter=Qwen4ExpPLEBuilder.GroupedPreparedProjectionsUseOriginalQueryAndPreserveInactiveBytes
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;PLE;MTP;ByteExact;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ARM;Qwen4Exp;PLE;MTP;ByteExact;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
+add_v2_test(V2_Integration_Qwen4ExpCPUPLEPreparedGraphReplay
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
+        --gtest_filter=Qwen4ExpPLEBuilder.RAMAndMmapPreparedGraphsMatchIndependentEquations
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ARM;Qwen4Exp;PLE;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_Qwen4ExpPLEOriginalQueryBinding
     V2_Integration_Qwen4ExpPLEVerifierRowsContract
-    V2_Integration_Qwen4ExpPLEPreparedVerifierCPU)
+    V2_Integration_Qwen4ExpPLEPreparedVerifierCPU
+    V2_Integration_Qwen4ExpCPUPLEPreparedGraphReplay)
 
 add_v2_test(V2_Integration_Qwen4ExpPLEVerifierInvocationRole
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
@@ -35693,7 +35705,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseBoundedP
 add_v2_test(V2_Integration_QwenSparseCPUStageSelectorForwarding
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_primitives>
         --gtest_filter=QwenSparseAttentionStage.EveryCPUSelectorPolicyExecutesRetainedRows
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;Qwen4Exp;ByteExact;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ARM;Qwen4Exp;ByteExact;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QwenSparseCPUStageSelectorForwarding)

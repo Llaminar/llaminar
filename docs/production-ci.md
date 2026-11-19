@@ -47,6 +47,12 @@ JUnit logs. The companion `ARM64 CUDA runtime build`
 check builds the Release container for GB10 and verifies application startup.
 Both run on [GitHub's standard ARM64 runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
+The ARM host scope generates deterministic QFN fixture weights for bounded
+prefill and decode projection replay, sparse attention and per-layer embedding
+execution. These component tests check native arithmetic and retained state.
+End-to-end QFN inference still requires the full published checkpoint geometry
+and its real-model qualification.
+
 The `CI` workflow runs the same runtime build on pushes to `develop` and
 publishes `develop-arm64` and `sha-<commit>-arm64` after the startup smoke
 test. The ARM64 image contains CPU kernels and CUDA code for `sm_121`.
