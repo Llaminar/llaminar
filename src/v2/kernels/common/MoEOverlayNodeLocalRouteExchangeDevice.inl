@@ -43,6 +43,14 @@ namespace llaminar2::moe_node_local_route_device
         return assignment.participant_ids[slot];
     }
 
+    /** @return Whether the original participant contributes to this device-published slot. */
+    __device__ __forceinline__ bool ownsRouteSlot(
+        MoENodeLocalRouteOwnership ownership, std::int32_t assignment, std::int32_t participant) noexcept
+    {
+        return ownership == MoENodeLocalRouteOwnership::ContinuationCohort
+            ? assignment >= 0 : assignment == participant;
+    }
+
     /** @brief System-release store for a dynamically selected epoch value. */
     __device__ __forceinline__ void storeSystemRelease64(
         std::uint64_t *address,
@@ -206,8 +214,8 @@ namespace llaminar2::moe_node_local_route_device
              slot < launch.live_route_slots;
              slot += gridDim.x)
         {
-            if (routeParticipantForSlot(launch.domain_assignment, slot) !=
-                launch.lane.producer_participant)
+            if (!ownsRouteSlot(launch.ownership, routeParticipantForSlot(launch.domain_assignment, slot),
+                               launch.lane.producer_participant))
             {
                 continue;
             }
@@ -383,8 +391,8 @@ namespace llaminar2::moe_node_local_route_device
              slot < live_slots;
              slot += gridDim.x)
         {
-            if (routeParticipantForSlot(launch.domain_assignment, slot) !=
-                lane.producer_participant)
+            if (!ownsRouteSlot(launch.ownership, routeParticipantForSlot(launch.domain_assignment, slot),
+                               lane.producer_participant))
             {
                 continue;
             }
@@ -425,17 +433,20 @@ namespace llaminar2::moe_node_local_route_device
         }
         const std::int32_t participant =
             routeParticipantForSlot(launch.domain_assignment, slot);
-        if (participant < 0 || participant == launch.root_participant)
+        const bool joint = launch.ownership == MoENodeLocalRouteOwnership::ContinuationCohort;
+        const auto *exclusive_peer = joint || participant < 0 || participant == launch.root_participant
+            ? nullptr : peerForParticipant(launch, participant);
+        if (!joint && !exclusive_peer)
             return;
-        const auto *peer = peerForParticipant(launch, participant);
-        if (!peer)
-            return; // A heterogeneous/rank-remote participant is folded later.
-        const std::uint64_t expected =
-            loadSystemAcquire64(&peer->control->consumed_epoch) + 1u;
-        const std::uint64_t observed =
-            loadPeerPublished(peer->slot_epochs + slot);
-        if (observed != expected)
+        const auto *peers = joint ? launch.peers : exclusive_peer;
+        const auto count = joint ? launch.peer_count : 1u;
+        for (std::uint32_t index = 0u; index < count; ++index)
         {
+            const auto &peer = peers[index];
+            const std::uint64_t expected = loadSystemAcquire64(&peer.control->consumed_epoch) + 1u;
+            const bool published = loadPeerPublished(peer.slot_epochs + slot) == expected;
+            if (published == (participant >= 0))
+                continue;
 #if defined(__CUDA_ARCH__)
             atomicCAS(
                 reinterpret_cast<unsigned int *>(validation_status),
@@ -485,7 +496,27 @@ namespace llaminar2::moe_node_local_route_device
             const std::int32_t participant =
                 routeParticipantForSlot(launch.domain_assignment, slot);
             float contribution = 0.0f;
-            if (participant == launch.root_participant ||
+            if (launch.ownership == MoENodeLocalRouteOwnership::ContinuationCohort && participant >= 0)
+            {
+                const auto element = static_cast<std::size_t>(slot) * launch.d_model + column;
+                const float local = launch.root_canonical_route_contributions[element];
+                // The peer binding is in admitted participant order, excluding
+                // the root. Insert the root at its original rank coordinate.
+                bool added_root = false;
+                for (std::uint32_t index = 0u; index < launch.peer_count; ++index)
+                {
+                    const auto &peer = launch.peers[index];
+                    if (!added_root && launch.root_participant < peer.producer_participant)
+                    {
+                        contribution = __fadd_rn(contribution, local);
+                        added_root = true;
+                    }
+                    contribution = __fadd_rn(contribution, peer.route_payload[element]);
+                }
+                if (!added_root)
+                    contribution = __fadd_rn(contribution, local);
+            }
+            else if (participant == launch.root_participant ||
                 (participant < 0 &&
                  launch.external_route_source ==
                      MoEExternalCanonicalRouteSource::

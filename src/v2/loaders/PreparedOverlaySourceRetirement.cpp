@@ -15,6 +15,7 @@
 #include "WeightPlan.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "tensors/Tensors.h"
+#include "utils/Logger.h"
 
 #include <stdexcept>
 #include <unordered_set>
@@ -22,6 +23,47 @@
 
 namespace llaminar2
 {
+    std::size_t retireMaterializedParticipantSources(
+        const FrozenModelWeightSet &weights,
+        const WeightMetadataRegistry &metadata)
+    {
+        std::unordered_set<const TensorBase *> cpu_roots;
+        for (const auto &binding : weights.bindings())
+        {
+            if (!binding.tensor || binding.tensor->is_raw_data_released())
+                continue;
+            const auto residency = metadata.residency(binding.tensor);
+            if (binding.residency.host_policy == WeightHostPolicy::RequiredForCPUExecution ||
+                (residency && residency->host_policy == WeightHostPolicy::RequiredForCPUExecution))
+                cpu_roots.insert(binding.tensor->transferStorageOwner());
+        }
+
+        std::unordered_set<TensorBase *> visited;
+        std::size_t bytes = 0;
+        for (const auto &binding : weights.bindings())
+        {
+            auto *const tensor = binding.tensor_owner.get();
+            if (!tensor || tensor != binding.tensor || tensor->is_view() ||
+                tensor->is_raw_data_released() || tensor->transferStorageOwner() != tensor ||
+                cpu_roots.contains(tensor) || !visited.insert(tensor).second)
+                continue;
+
+            const auto size = tensor->size_bytes();
+            try
+            {
+                tensor->release_host_weight_data();
+                if (tensor->is_raw_data_released())
+                    bytes += size;
+            }
+            catch (const std::exception &error)
+            {
+                LOG_WARN("[MoEOverlayParticipantGraphRunner] Could not release "
+                         << binding.identity.canonical_name << ": " << error.what());
+            }
+        }
+        return bytes;
+    }
+
     std::size_t retirePreparedOverlaySources(
         const FrozenModelWeightSet &weights,
         const MoEExpertOverlayPreparationPlan &plan,

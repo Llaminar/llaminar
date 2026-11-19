@@ -2604,7 +2604,7 @@ namespace llaminar2
         const auto representation = PreparedWeightRepresentationContract::resolve(role,geometry.original_type,
             requirement.canonical_name,loader_.architecture(),debugEnv().gemm.gdn_projection_arithmetic,
             debugEnv().gemm.moe_router_arithmetic);
-        const auto operand = PreparedWeightRepresentationContract::operandPrecision(role,requirement.canonical_name,
+        const auto operand = PreparedWeightRepresentationContract::operandPrecision(role,geometry.original_type,requirement.canonical_name,
             loader_.architecture(),debugEnv().gemm.gdn_projection_arithmetic,debugEnv().gemm.moe_router_arithmetic);
         const auto precision = PreparedWeightRepresentationContract::resolveCPUWeightPrecision(
             role,geometry.original_type,weight_precision_,representation,operand);
@@ -2636,7 +2636,7 @@ namespace llaminar2
                 ?inferWeightRole(name):original_tied_source->role;
             const auto source_execution=PreparedWeightRepresentationContract::resolve(source_role,geometry.original_type,
                 name,loader_.architecture(),debugEnv().gemm.gdn_projection_arithmetic,debugEnv().gemm.moe_router_arithmetic);
-            const auto source_operand=PreparedWeightRepresentationContract::operandPrecision(source_role,name,
+            const auto source_operand=PreparedWeightRepresentationContract::operandPrecision(source_role,geometry.original_type,name,
                 loader_.architecture(),debugEnv().gemm.gdn_projection_arithmetic,debugEnv().gemm.moe_router_arithmetic);
             const auto source_precision=PreparedWeightRepresentationContract::resolveCPUWeightPrecision(
                 source_role,geometry.original_type,weight_precision_,source_execution,source_operand);
@@ -3235,7 +3235,7 @@ namespace llaminar2
             }
 
             const auto gdn_arithmetic = PreparedWeightRepresentationContract::effectiveGDNArithmetic(
-                binding.identity.role, requirement.canonical_name, loader_.architecture(),
+                binding.identity.role, gdn_source_type, requirement.canonical_name, loader_.architecture(),
                 debugEnv().gemm.gdn_projection_arithmetic);
             if (gdn_arithmetic != GDNProjectionArithmetic::Native)
             {
@@ -3270,7 +3270,7 @@ namespace llaminar2
                      {"prepared_bytes", std::to_string(tensor->size_bytes())}});
             }
             binding.floating_operand_precision = PreparedWeightRepresentationContract::operandPrecision(
-                binding.identity.role, requirement.canonical_name, loader_.architecture(),
+                binding.identity.role, gdn_source_type, requirement.canonical_name, loader_.architecture(),
                 debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic);
             binding.identity.instance_id = binding.binding_id;
 
@@ -6092,6 +6092,7 @@ namespace llaminar2
             TensorBase *tensor = nullptr;
             std::shared_ptr<TensorBase> owner;
             std::optional<WeightBinding> binding;
+            FloatingActivationOperandPrecision operand_precision = FloatingActivationOperandPrecision::Native;
         };
 
         std::vector<DenseGemmJob> gemm_weights;
@@ -6680,22 +6681,23 @@ namespace llaminar2
 
         for (auto &dense_job : gemm_weights)
         {
-            const WeightRole role = dense_job.binding.has_value()
-                                        ? dense_job.binding->identity.role
-                                        : inferWeightRole(dense_job.name);
-            WeightSliceSpec logical_slice;
-            WeightDerivationKind logical_derivation =
-                WeightDerivationKind::Source;
-            if (dense_job.binding.has_value())
+            // A frozen binding already owns its final scalar and operand policy.
+            // Reinterpreting a Q8 control's decoded FP32 bank as a new original
+            // source would round it a second time during GPU preparation.
+            if (dense_job.binding)
             {
-                logical_slice = dense_job.binding->slice;
-                logical_derivation =
-                    dense_job.binding->identity.derivation;
+                dense_job.operand_precision = dense_job.binding->floating_operand_precision;
+                continue;
             }
-            else if (weight_metadata_)
+            const auto role = inferWeightRole(dense_job.name);
+            dense_job.operand_precision = PreparedWeightRepresentationContract::operandPrecision(
+                role, dense_job.tensor->native_type(), dense_job.name, loader_.architecture(),
+                debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic);
+            WeightSliceSpec logical_slice;
+            WeightDerivationKind logical_derivation = WeightDerivationKind::Source;
+            if (weight_metadata_)
             {
-                if (const auto metadata =
-                        weight_metadata_->metadata(dense_job.tensor))
+                if (const auto metadata = weight_metadata_->metadata(dense_job.tensor))
                 {
                     logical_slice = metadata->slice;
                     logical_derivation = metadata->identity.derivation;
@@ -6716,18 +6718,6 @@ namespace llaminar2
 
             dense_job.owner = prepared_override;
             dense_job.tensor = prepared_override.get();
-            if (dense_job.binding.has_value())
-            {
-                dense_job.binding->tensor_owner = prepared_override;
-                dense_job.binding->tensor = prepared_override.get();
-                if (dense_job.binding->slice.source_rows == 0 &&
-                    dense_job.binding->slice.source_cols == 0 &&
-                    dense_job.binding->slice.row_count == 0 &&
-                    dense_job.binding->slice.col_count == 0)
-                {
-                    dense_job.binding->slice = fullSliceSpec(*prepared_override);
-                }
-            }
         }
 
         if (frozen_weights)
@@ -7410,6 +7400,7 @@ namespace llaminar2
                 std::lock_guard<std::mutex> lock(cache_mutex_);
                 binding.binding_id = next_pipeline_prepared_binding_id_++;
                 binding.identity = makeSourceWeightIdentity(name, {}, binding.binding_id);
+                binding.floating_operand_precision = dense_job.operand_precision;
                 if (weight_metadata_)
                 {
                     if (auto metadata = weight_metadata_->metadata(tensor))
@@ -7467,11 +7458,7 @@ namespace llaminar2
             // One backend/format binding path is shared with bounded startup samples.
             auto kernel = llaminar::v2::kernels::KernelFactory::createGemmFromGPUWeightPool(
                 *tensor, target_device, orchestrator, name, 0,
-                GPUPreparedWeightPoolLayout::SourceNative,
-                dense_job.binding ? dense_job.binding->floating_operand_precision :
-                    PreparedWeightRepresentationContract::operandPrecision(
-                        inferWeightRole(name), name, loader_.architecture(),
-                        debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic));
+                GPUPreparedWeightPoolLayout::SourceNative, dense_job.operand_precision);
 
             if (kernel)
             {

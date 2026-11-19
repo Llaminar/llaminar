@@ -88,7 +88,7 @@ void prove(GDNProjectionArithmetic gdn, MoERouterArithmetic router)
         const auto role = inferWeightRole(name);
         EXPECT_EQ(PreparedWeightRepresentationContract::resolve(role, TensorType::Q8_0, name, "qwen4exp", gdn, router),
                   ModelPreparedWeightRepresentation::SourceNative);
-        EXPECT_EQ(PreparedWeightRepresentationContract::operandPrecision(role, name, "qwen4exp", gdn, router),
+        EXPECT_EQ(PreparedWeightRepresentationContract::operandPrecision(role, TensorType::Q8_0, name, "qwen4exp", gdn, router),
                   FloatingActivationOperandPrecision::Native);
     }
     if (!hasCPUBackend())
@@ -142,7 +142,7 @@ void prove(GDNProjectionArithmetic gdn, MoERouterArithmetic router)
         const auto role = inferWeightRole(name);
         const auto representation = PreparedWeightRepresentationContract::resolve(
             role, original[i]->native_type(), name, "qwen4exp", gdn, router);
-        const auto operand = PreparedWeightRepresentationContract::operandPrecision(role, name, "qwen4exp", gdn, router);
+        const auto operand = PreparedWeightRepresentationContract::operandPrecision(role, original[i]->native_type(), name, "qwen4exp", gdn, router);
         const auto precision = PreparedWeightRepresentationContract::resolveCPUWeightPrecision(
             role, original[i]->native_type(), WeightPrecision::NATIVE, representation, operand);
         const auto classification = PreparedWeightIdentityContract::classifyOriginalMatrix(role, DeviceId::cpu());

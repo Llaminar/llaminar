@@ -578,25 +578,6 @@ namespace llaminar2
             pollAbortCleanup();
             return;
         }
-        if (evidence_exchange_active_)
-        {
-            MoEOverlayMigrationProfileResult ignored;
-            std::string error;
-            const auto progress =
-                config_.evidence_exchange->pollMigrationProfile(
-                    &ignored, &error);
-            if (progress == MoEOverlayResidencyWaveProgress::Pending)
-                return;
-            evidence_exchange_active_ = false;
-            if (progress != MoEOverlayResidencyWaveProgress::Ready)
-            {
-                fail(
-                    error.empty()
-                        ? "ExpertOverlay transfer-profile exchange failed while stopping"
-                        : std::move(error));
-                return;
-            }
-        }
         local_rows_.clear();
         state_.store(
             MoEOverlayEconomyCalibrationState::Stopped,
@@ -605,7 +586,11 @@ namespace llaminar2
 
     void MoEOverlayEconomyCalibrationController::requestStop() noexcept
     {
-        stop_requested_.store(true, std::memory_order_release);
+        // A distributed schedule is finite and each wave has exact MPI
+        // participants. Local cancellation cannot skip a wave or its evidence
+        // exchange. The enclosing certification owns the typed topology stop.
+        if (!config_.evidence_exchange)
+            stop_requested_.store(true, std::memory_order_release);
     }
 
     void MoEOverlayEconomyCalibrationController::fail(

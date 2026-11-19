@@ -82,6 +82,11 @@ namespace llaminar2
     class PrefixCacheShutdown final
     {
     public:
+        /** @brief Start a unique, initially empty shutdown transaction. */
+        PrefixCacheShutdown() = default;
+        PrefixCacheShutdown(const PrefixCacheShutdown &) = delete;
+        PrefixCacheShutdown &operator=(const PrefixCacheShutdown &) = delete;
+
         /**
          * @brief Retain one cache; repeated tree references name only one owner.
          * @param cache Participant-local cache, or null for an uninitialized tier.
@@ -90,20 +95,48 @@ namespace llaminar2
         void add(std::shared_ptr<PrefixStateCache> cache);
 
         /**
-         * @brief Seal, select and durably persist the highest-priority RAM entries.
-         * @param context Optional complete inference communicator; every rank enters.
-         * @return Actual local source and native-write evidence.
-         * @throws std::exception For stale lifecycle, inconsistent metadata or failed I/O.
+         * @brief Seal and select the exact original RAM leases for terminal publication.
+         * @param context Optional inference communicator; all members join metadata selection.
+         * @throws std::exception For stale lifecycle, active leases or inconsistent metadata.
          *
-         * Empty ranks exchange only framing. The coordinator receives candidate
-         * metadata and returns only each recipient's relevant archive selections.
-         * There is no post-write collective or full-payload communication.
+         * Selection releases the live cache owners. Only selected immutable RAM
+         * handles and their original disk archives survive graph teardown.
          */
-        PrefixCacheShutdownResult flush(const IMPIContext *context = nullptr);
+        void prepare(const IMPIContext *context = nullptr);
+
+        /**
+         * @brief Persist the selected local payloads after collective owners retire.
+         * @return Actual local source and native-write evidence.
+         * @throws std::exception For stale lifecycle or failed durable I/O.
+         *
+         * No MPI or graph references survive into this phase.
+         */
+        PrefixCacheShutdownResult persist();
+
+        /**
+         * @brief Prepare and persist when the caller has no intervening native retirement.
+         * @param context Optional complete MPI context for metadata selection.
+         * @return Actual byte and publication counts.
+         * @throws std::exception For invalid selection or failed durable I/O.
+         */
+        PrefixCacheShutdownResult flush(const IMPIContext *context = nullptr)
+        {
+            prepare(context);
+            return persist();
+        }
 
     private:
+        struct PreparedArchive
+        {
+            std::shared_ptr<DiskPrefixStorageBackend> archive;
+            std::vector<PrefixBlockHandle> selected;
+            PrefixShutdownArchivePlan plan;
+        };
+
         std::vector<std::shared_ptr<PrefixStateCache>> caches_;
-        enum class Phase { Collecting, Flushing, Complete };
+        std::vector<PreparedArchive> prepared_;
+        PrefixCacheShutdownResult result_;
+        enum class Phase { Collecting, Preparing, Ready, Persisting, Complete };
         Phase phase_ = Phase::Collecting;
     };
 }

@@ -119,6 +119,8 @@
 #include "../moe/MoEOverlayHostAuthorityDeviceBankPublisher.h"
 #include "../moe/MoEOverlayLocalCapacityPlanner.h"
 #include "../moe/MoEOverlayCPUServiceMeasurement.h"
+#include "../moe/MoEOverlayOriginalGPUCohortContexts.h"
+#include "planning/PlanningGPUExpertMeasurement.h"
 #include "../moe/MoEOverlayMigrationMeasurementExchange.h"
 #include "../moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "../moe/MoEOverlayResidencyAuthority.h"
@@ -2939,8 +2941,35 @@ namespace llaminar2
             shutdownMoEExpertOverlayResidencyMaintenance(
                 MoEOverlayMaintenanceDrainIntent::TerminalContextSeal);
         }
-        if (was_inference_ready)
-            flushPrefixCacheOnShutdown();
+        const auto uses_disk = [](const auto &prefix) {
+            return prefix.enabled && prefix.storage_mode == PrefixCacheStorageMode::Tiered &&
+                prefix.disk_budget_bytes > 0;
+        };
+        const bool persist_prefixes = was_inference_ready &&
+            (uses_disk(config_.prefix_cache) || uses_disk(plan_.runtime.prefix_cache));
+        PrefixCacheShutdown prefix_shutdown;
+        if (persist_prefixes)
+        {
+            try
+            {
+                if (prefix_shutdown_lifecycle_ != PrefixShutdownLifecycle::Pending)
+                    throw std::logic_error("prefix shutdown selection was reentered");
+                prefix_shutdown_lifecycle_ = PrefixShutdownLifecycle::Preparing;
+                // Every admitted rank joins metadata selection, including
+                // expert-only ranks with no RAM payloads of their own.
+                if (runner_)
+                    runner_->collectPrefixCacheShutdown(prefix_shutdown);
+                LOG_INFO("[PrefixCache] Selecting RAM entries for shutdown persistence");
+                prefix_shutdown.prepare(mpi_ctx_.get());
+                prefix_shutdown_lifecycle_ = PrefixShutdownLifecycle::Ready;
+            }
+            catch (const std::exception &error)
+            {
+                if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+                    terminateFailedMPIWorkerCommand("SHUTDOWN prefix selection", error.what());
+                throw;
+            }
+        }
 
         if (runner_)
         {
@@ -2993,8 +3022,6 @@ namespace llaminar2
          * runtime generation to destroy the event during member teardown.
          */
         retireMTPRequestContinuationState();
-        // Include terminal durable-cache publication in the saved native proof.
-        PerfStatsCollector::flushFromEnv();
 
         /*
          * Release participant-local runners directly. Every GPU runner's RAII
@@ -3062,6 +3089,28 @@ namespace llaminar2
         llaminar::v2::kernels::KernelFactory::clearCache();
         local_pp_ctx_.reset();
         local_tp_ctx_.reset();
+
+        std::exception_ptr prefix_persistence_failure;
+        if (persist_prefixes)
+        {
+            // This rank's graphs and collective domains have retired. The
+            // selected RAM may still own pinned backing from its original GPU
+            // context, so finish local writes before native context retirement.
+            try
+            {
+                const auto result = prefix_shutdown.persist();
+                prefix_shutdown_lifecycle_ = PrefixShutdownLifecycle::Complete;
+                LOG_INFO("[PrefixCache] Shutdown persisted " << result.selected << "/" << result.candidates
+                    << " RAM entries: " << result.written << " payload writes ("
+                    << result.payload_bytes_written << " bytes), " << result.reused << " existing backing reuses");
+            }
+            catch (const std::exception &error)
+            {
+                if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
+                    terminateFailedMPIWorkerCommand("SHUTDOWN prefix persistence", error.what());
+                prefix_persistence_failure = std::current_exception();
+            }
+        }
 
         /*
          * Every graph, stream-owning runner, overlay transport, migration bank,
@@ -3276,7 +3325,12 @@ namespace llaminar2
             model_context_reuse_seal_error_ = retired_storage_request_failure;
         }
         initialization_lifecycle_.retire();
+
+        // Include terminal durable-cache publication in the saved native proof.
+        PerfStatsCollector::flushFromEnv();
         LOG_DEBUG("OrchestrationRunner shut down");
+        if (prefix_persistence_failure)
+            std::rethrow_exception(prefix_persistence_failure);
     }
 
     // =========================================================================
@@ -17813,6 +17867,7 @@ namespace llaminar2
                         *stage.config().moe_routed_expert_plan, config_.moe_rebalance.mode);
                     if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
                         storage != MoEOverlayMigrationStorageKind::NoPeer &&
+                        storage != MoEOverlayMigrationStorageKind::StationaryTensorShard &&
                         storage != MoEOverlayMigrationStorageKind::DeviceTransferDirectory &&
                         !(storage == MoEOverlayMigrationStorageKind::PhysicalResidencyFabric &&
                           std::all_of(stage.config().moe_routed_expert_plan->domains.begin(),
@@ -19624,7 +19679,8 @@ namespace llaminar2
                         throw std::invalid_argument("CPU expert source does not match original physical NODE_LOCAL/NUMA inventory");
                     original_node=rank.node_id;members.push_back({member.world_rank,member.address});
                 }
-                program.emplace(NativeCPUCollectiveProgram::expertShardRoutePartials(domain_ordinal,domain.backend,std::move(members)));
+                program.emplace(NativeCPUCollectiveProgram::forBoundExpertShardDomain(
+                    domain_ordinal,domain.backend,std::move(members)));
                 return true;
             });
         if(!prepare)return false;
@@ -19831,6 +19887,18 @@ namespace llaminar2
             return true;
         }
 
+        if (moe_expert_overlay_residency_authority_->stationaryTensorShardResidency() &&
+            config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic)
+        {
+            if (!run_maintenance_phase("bindStationaryTensorShardServingGraphs", [&] {
+                    return bindMoEOverlayTransferProgressAndMaterializeServingGraphFamily();
+                }))
+                return false;
+            PerfStatsCollector::addCounter("moe_overlay_residency", "maintenance_not_started", 1.0,
+                "model_setup", perf_device, {{"runtime_mode", "dynamic"},
+                    {"reason", "single_fully_resident_tensor_shard_cohort"}, {"movement", "false"}});
+            return true;
+        }
         if(initial_snapshot->jointOwnerMap() && config_.moe_rebalance.mode==MoERebalanceRuntimeMode::Off) {
             if(config_.moe_rebalance.mode!=MoERebalanceRuntimeMode::Off ||
                moe_expert_overlay_residency_authority_->migrationEnabled() ||
@@ -19855,7 +19923,7 @@ namespace llaminar2
         std::vector<MoEOverlayPreparedTargetServiceTotals> prepared_target_service_measurements;
         if (config_.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic &&
             !local_cpu_host_maintenance &&
-            !run_maintenance_phase("measurePreparedExpertService", [&]
+            !run_maintenance_phase("declarePreparedExpertService", [&]
             {
                 // This setup thread has the same MPI/NUMA/OpenMP placement as
                 // CPU serving. Finish private observations before maintenance
@@ -19869,20 +19937,51 @@ namespace llaminar2
                     expertHistogramServingRegime(mtp), metadata.first_model_layer);
                 prepared_target_service_plan = MoEOverlayPreparedTargetServicePlan::checked(
                     initial_snapshot, catalog, topology);
-                // Graph construction transferred the original TP context to
-                // the rank runner. Borrow that live owner for dispatch policy;
-                // the setup member is now empty and cannot describe the domain.
-                const auto* rank_runner = dynamic_cast<const RankOrchestrator*>(runner_.get());
-                const auto& profile = planningModelMetadata().memoryProfile();
-                prepared_target_service_measurements = MoEOverlayCPUServiceMeasurement::measurePreparedTargets(
-                    *moe_expert_overlay_participant_residency_, *prepared_target_service_plan,
-                    {.d_model = metadata.d_model, .intermediate = metadata.routed_intermediate_size},
-                    cpu_expert_shard_ctx_, physical_memory_authority_,
-                    &profile, &cluster_inventory_.ranks.at(plan_.rank),
-                    rank_runner ? rank_runner->localTPContext() : nullptr, profile.expert_used_count);
                 return true;
             }))
             return false;
+
+        if (prepared_target_service_plan)
+        {
+            const auto* rank_runner=dynamic_cast<const RankOrchestrator*>(runner_.get());
+            const auto* local=rank_runner?rank_runner->localTPContext():nullptr;
+            const auto& profile=planningModelMetadata().memoryProfile();
+            const auto& inventory=cluster_inventory_.ranks.at(plan_.rank);
+            const auto& source_plan=*initial_snapshot->placement_plan;
+            const bool gpu_cohort=std::any_of(source_plan.domains.begin(),source_plan.domains.end(),
+                [](const auto &domain) {
+                    return domain.routed_compute_policy==RoutedExpertComputePolicy::TensorSharded &&
+                        !domain.participants.empty() && domain.participants.front().isGPU();
+                });
+            std::vector<PlanningGPUCohortServiceObservation> gpu_cohort_samples;
+            if (gpu_cohort && !run_maintenance_phase("measurePreparedGPUCohorts", [&] {
+                MoEOverlayOriginalGPUCohortContexts contexts;
+                for (const auto &domain : source_plan.domains)
+                {
+                    if (domain.routed_compute_policy!=RoutedExpertComputePolicy::TensorSharded ||
+                        domain.participants.empty() || !domain.participants.front().isGPU() ||
+                        domain.owner_rank!=plan_.rank)
+                        continue;
+                    if (domain.name!=source_plan.continuation_domain || !local)
+                        return setError("Prepared GPU cohort lost its original LocalTP continuation");
+                    contexts.addOriginalDomain(domain.name,*local);
+                }
+                gpu_cohort_samples=MoEOverlayCPUServiceMeasurement::measurePreparedGPUTargets(
+                    *moe_expert_overlay_participant_residency_,*prepared_target_service_plan,
+                    contexts,physical_memory_authority_,profile,inventory);
+                return true;
+            })) return false;
+
+            if (!run_maintenance_phase("measurePreparedExpertService", [&] {
+                const auto geometry=resolveMoERoutedExpertModelMetadataForModel(*model_ctx_,retainedMTPConfig());
+                prepared_target_service_measurements=MoEOverlayCPUServiceMeasurement::measurePreparedTargets(
+                    *moe_expert_overlay_participant_residency_,*prepared_target_service_plan,
+                    {.d_model=geometry.d_model,.intermediate=geometry.routed_intermediate_size},
+                    cpu_expert_shard_ctx_,physical_memory_authority_,
+                    &profile,&inventory,local,profile.expert_used_count,gpu_cohort_samples);
+                return true;
+            })) return false;
+        }
 
         if (local_cpu_host_maintenance)
         {
@@ -25585,9 +25684,7 @@ namespace llaminar2
                 "Only the coordinated request authority may drive inference preparation");
         }
 
-        std::uint64_t last_reported_completed =
-            std::numeric_limits<std::uint64_t>::max();
-        std::string last_reported_phase;
+        std::optional<InferenceMeasurementReadiness> last_report;
 
         while (true)
         {
@@ -25619,29 +25716,14 @@ namespace llaminar2
                     "Internal inference preparation reported an unbounded calibration corpus");
             }
 
-            const bool phase_changed =
-                readiness.phase != last_reported_phase;
-            const std::uint64_t report_stride =
-                std::max<std::uint64_t>(
-                    1u, readiness.required_work_units / 10u);
-            const bool first_report =
-                last_reported_completed ==
-                std::numeric_limits<std::uint64_t>::max();
-            const bool progress_milestone =
-                readiness.completed_work_units ==
-                    readiness.required_work_units ||
-                (!first_report &&
-                 readiness.completed_work_units / report_stride >
-                     last_reported_completed / report_stride);
-            if (first_report || phase_changed || progress_milestone)
+            if (!last_report || readiness.crossedProgressMilestone(*last_report))
             {
                 LOG_INFO(
                     "Preparing inference runtime: owner=" << readiness.owner
                     << " phase=" << readiness.phase << " work="
                     << readiness.completed_work_units << '/'
                     << readiness.required_work_units);
-                last_reported_completed = readiness.completed_work_units;
-                last_reported_phase = readiness.phase;
+                last_report = readiness;
             }
 
             if (readiness.inference_requested ||
@@ -25843,42 +25925,6 @@ namespace llaminar2
         return true;
     }
 
-    /** @copydoc OrchestrationRunner::flushPrefixCacheOnShutdown */
-    void OrchestrationRunner::flushPrefixCacheOnShutdown()
-    {
-        if (prefix_shutdown_lifecycle_ == PrefixShutdownLifecycle::Complete)
-            return;
-        if (prefix_shutdown_lifecycle_ != PrefixShutdownLifecycle::Pending)
-            throw std::logic_error("prefix shutdown persistence was re-entered after incomplete publication");
-        prefix_shutdown_lifecycle_ = PrefixShutdownLifecycle::Flushing;
-        try
-        {
-            const auto uses_disk = [](const auto &prefix) {
-                return prefix.enabled && prefix.storage_mode == PrefixCacheStorageMode::Tiered &&
-                    prefix.disk_budget_bytes > 0;
-            };
-            // Configuration is topology-wide. An expert-only or idle rank must
-            // still join metadata selection even when it owns no cache entries.
-            if (uses_disk(config_.prefix_cache) || uses_disk(plan_.runtime.prefix_cache))
-            {
-                PrefixCacheShutdown shutdown;
-                if (runner_) runner_->collectPrefixCacheShutdown(shutdown);
-                LOG_INFO("[PrefixCache] Selecting RAM entries for shutdown persistence");
-                const auto result = shutdown.flush(mpi_ctx_.get());
-                LOG_INFO("[PrefixCache] Shutdown persisted " << result.selected << "/" << result.candidates
-                    << " RAM entries: " << result.written << " payload writes ("
-                    << result.payload_bytes_written << " bytes), " << result.reused << " existing backing reuses");
-            }
-            prefix_shutdown_lifecycle_ = PrefixShutdownLifecycle::Complete;
-        }
-        catch (const std::exception &error)
-        {
-            if (mpi_ctx_ && mpi_ctx_->world_size() > 1)
-                terminateFailedMPIWorkerCommand("SHUTDOWN prefix persistence", error.what());
-            throw;
-        }
-    }
-
     void OrchestrationRunner::shutdownMPIWorkers()
     {
         /*
@@ -25895,14 +25941,12 @@ namespace llaminar2
             if (mpi_worker_command_lifecycle_ ==
                 MPIWorkerCommandLifecycle::ShutdownPublished)
             {
-                flushPrefixCacheOnShutdown();
                 return;
             }
             mpi_worker_command_lifecycle_ =
                 MPIWorkerCommandLifecycle::ShutdownPublished;
             shutdownMoEExpertOverlayResidencyMaintenance(
                 MoEOverlayMaintenanceDrainIntent::TerminalContextSeal);
-            flushPrefixCacheOnShutdown();
             return;
         }
 
@@ -25919,7 +25963,6 @@ namespace llaminar2
         if (mpi_worker_command_lifecycle_ ==
             MPIWorkerCommandLifecycle::ShutdownPublished)
         {
-            flushPrefixCacheOnShutdown();
             return;
         }
 
@@ -25939,7 +25982,6 @@ namespace llaminar2
             MPIWorkerCommandLifecycle::ShutdownPublished;
         shutdownMoEExpertOverlayResidencyMaintenance(
             MoEOverlayMaintenanceDrainIntent::TerminalContextSeal);
-        flushPrefixCacheOnShutdown();
     }
 
     void OrchestrationRunner::abortMPIWorkers(const std::string& reason)
@@ -26490,7 +26532,6 @@ namespace llaminar2
                     MPIWorkerCommandLifecycle::ShutdownPublished;
                 shutdownMoEExpertOverlayResidencyMaintenance(
                     MoEOverlayMaintenanceDrainIntent::TerminalContextSeal);
-                flushPrefixCacheOnShutdown();
                 return;
             }
 

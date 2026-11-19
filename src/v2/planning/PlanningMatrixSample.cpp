@@ -55,7 +55,7 @@ namespace llaminar2
     FloatingActivationOperandPrecision PlanningMatrixSamplePlan::operandPrecision() const
     {
         return PreparedWeightRepresentationContract::operandPrecision(inferWeightRole(request_.tensor_name),
-            request_.tensor_name, architecture_, arithmetic_, router_arithmetic_);
+            tensorType(), request_.tensor_name, architecture_, arithmetic_, router_arithmetic_);
     }
 
     std::string PlanningMatrixSamplePlan::executionFormat() const

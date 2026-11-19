@@ -690,8 +690,10 @@ namespace llaminar2
         DeviceId continuation_device,
         uint64_t workspace_generation,
         std::shared_ptr<MappedHostTransferRegion> contribution_region,
-        std::shared_ptr<MappedHostTransferArena> metadata_arena)
+        std::shared_ptr<MappedHostTransferArena> metadata_arena,
+        MoEOverlayCanonicalRouteTicketPayload payload)
     {
+        const bool contributor = payload == MoEOverlayCanonicalRouteTicketPayload::ContributorCompletion;
         if (intent != ForwardGraphSubmissionIntent::Execute &&
             intent != ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch &&
             intent != ForwardGraphSubmissionIntent::WorkspaceDeclaration)
@@ -707,8 +709,10 @@ namespace llaminar2
             !continuation_device.is_gpu() || workspace_generation == 0u ||
             route_capacity >
                 static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
-            !contribution_region || !contribution_region->isBound() ||
-            !contribution_region->hasDevice(continuation_device) ||
+            (contributor ? bool(contribution_region) :
+                payload != MoEOverlayCanonicalRouteTicketPayload::CanonicalRows ||
+                !contribution_region || !contribution_region->isBound() ||
+                !contribution_region->hasDevice(continuation_device)) ||
             (intent != ForwardGraphSubmissionIntent::WorkspaceDeclaration &&
              (!metadata_arena || metadata_arena->devices().size() != 1u ||
               metadata_arena->devices().front() != continuation_device)))
@@ -725,18 +729,19 @@ namespace llaminar2
             contribution_elements,
             sizeof(float),
             "canonical contribution bytes");
-        if (!contribution_region->contains(0u, contribution_bytes))
+        if (!contributor && !contribution_region->contains(0u, contribution_bytes))
         {
             throw std::invalid_argument(
                 "canonical route return contribution region is smaller than immutable ticket geometry");
         }
 
         const auto metadata = metadataLayout(route_capacity);
-        const auto offset = metadata.bytes;
+        const auto offset = contributor ? sizeof(MoEOverlayCanonicalRouteTicketControl) : metadata.bytes;
         original_route_slots_offset_ = metadata.original_route_slots_offset;
         compact_route_slots_offset_ = metadata.compact_route_slots_offset;
 
         construction_intent_ = intent;
+        payload_ = payload;
         contribution_region_ = contribution_region;
         continuation_device_ = continuation_device;
         layer_idx_ = layer_idx;
@@ -752,10 +757,13 @@ namespace llaminar2
         contribution_region_ = std::move(contribution_region);
         control_host_ = static_cast<MoEOverlayCanonicalRouteTicketControl *>(
             metadata_region_->mutableHostData());
-        original_route_slots_host_ = static_cast<int32_t *>(
-            metadata_region_->mutableHostData(original_route_slots_offset_));
-        compact_route_slots_host_ = static_cast<int32_t *>(
-            metadata_region_->mutableHostData(compact_route_slots_offset_));
+        if (!contributor)
+        {
+            original_route_slots_host_ = static_cast<int32_t *>(
+                metadata_region_->mutableHostData(original_route_slots_offset_));
+            compact_route_slots_host_ = static_cast<int32_t *>(
+                metadata_region_->mutableHostData(compact_route_slots_offset_));
+        }
         *control_host_ = MoEOverlayCanonicalRouteTicketControl{
             .magic = MoEOverlayCanonicalRouteTicketControl::kMagic,
             .abi_version =
@@ -877,7 +885,7 @@ namespace llaminar2
     {
         if (!hasValidBoundIdentity() ||
             producer_lifecycle_ != ProducerLifecycle::Armed ||
-            live_entry_count > route_capacity_ ||
+            (metadataOnly() ? live_entry_count != 0u : live_entry_count > route_capacity_) ||
             control_host_->residency_epoch == 0u || armed_sequence_ == 0u ||
             sequence != armed_sequence_)
         {
@@ -975,7 +983,8 @@ namespace llaminar2
                    static_cast<std::int32_t>(
                        MoEOverlayCanonicalRouteTicketStatus::Success) &&
                control_host_->residency_epoch != 0u &&
-               control_host_->live_entry_count <= route_capacity_;
+               (metadataOnly() ? control_host_->live_entry_count == 0u :
+                   control_host_->live_entry_count <= route_capacity_);
     }
 
     MoEOverlayCanonicalRouteSourceLayout MoEOverlayCanonicalRouteSourceLayout::originalSlots() noexcept
@@ -1275,7 +1284,8 @@ namespace llaminar2
                    static_cast<std::int32_t>(
                        MoEOverlayCanonicalRouteTicketStatus::Success) &&
                control_host_->residency_epoch == residency_epoch &&
-               control_host_->live_entry_count <= route_capacity_;
+               (metadataOnly() ? control_host_->live_entry_count == 0u :
+                    control_host_->live_entry_count <= route_capacity_);
     }
 
     bool MoEOverlayCanonicalRouteReturnTicketStorage::isWorkspaceDeclaration() const noexcept
@@ -1286,8 +1296,10 @@ namespace llaminar2
     bool MoEOverlayCanonicalRouteReturnTicketStorage::hasValidConstructionIdentity() const noexcept
     {
         return isWorkspaceDeclaration()
-            ? !metadata_region_ && !control_host_ && contribution_region_ &&
-                contribution_region_->isBound() && contribution_region_->hasDevice(continuation_device_) &&
+            ? !metadata_region_ && !control_host_ &&
+                (metadataOnly() ? !contribution_region_ :
+                    contribution_region_ && contribution_region_->isBound() &&
+                    contribution_region_->hasDevice(continuation_device_)) &&
                 continuation_device_.is_gpu() && layer_idx_ >= 0 && route_capacity_ > 0u &&
                 d_model_ > 0 && workspace_generation_ > 0u
             : hasValidBoundIdentity();
@@ -1298,15 +1310,16 @@ namespace llaminar2
     {
         return metadata_region_ && metadata_region_->isBound() &&
                metadata_region_->hasDevice(continuation_device_) &&
-               contribution_region_ && contribution_region_->isBound() &&
-               contribution_region_->hasDevice(continuation_device_) &&
+               (metadataOnly() ? !contribution_region_ && !original_route_slots_host_ && !compact_route_slots_host_ :
+                   contribution_region_ && contribution_region_->isBound() &&
+                   contribution_region_->hasDevice(continuation_device_) &&
+                   original_route_slots_host_ && compact_route_slots_host_) &&
                control_host_ && control_host_->valid() &&
                control_host_->workspace_generation == workspace_generation_ &&
                control_host_->layer_idx == layer_idx_ &&
                control_host_->route_capacity ==
                    static_cast<int32_t>(route_capacity_) &&
                control_host_->d_model == d_model_ &&
-               original_route_slots_host_ && compact_route_slots_host_ &&
                continuation_device_.is_gpu();
     }
 

@@ -68,7 +68,7 @@ namespace llaminar2
         MoEIntermediateShardTensorBinding routing_indices;
         MoEIntermediateShardTensorBinding routing_weights;
         MoEIntermediateShardTensorBinding route_partials; ///< FP32 [rows,top_k,H], not a wire payload.
-        MoEIntermediateShardTensorBinding output; ///< FP32 [rows,H], local F partial only.
+        MoEIntermediateShardTensorBinding output; ///< FP32 [rows,H] for a local fold; absent for route slots.
     };
 
     /**
@@ -133,6 +133,29 @@ namespace llaminar2
      * explicit graph invalidation retires the shared kernel metadata first.
      */
     MoEIntermediateShardLocalPartial appendMoEIntermediateShardPipeline(
+        ComputeGraph &graph, MoEIntermediateShardPipelineParams params,
+        const MoEOverlayParticipantLayerBank &source);
+
+    /** @brief Preweighted original route-slot partials for the tier-aware final reducer. */
+    struct MoEIntermediateShardRouteSlots
+    {
+        std::string producer;
+        MoEIntermediateShardTensorBinding partials;
+        std::shared_ptr<const MoEOverlayFragmentFamily> family;
+        std::optional<DeviceRowRange> live_rows;
+        int rows;
+        int top_k;
+        int model_columns;
+    };
+
+    /**
+     * @brief Append only the fragment producer when a later mixed-tier owner folds route slots.
+     * @param graph Participant-local graph containing its original router.
+     * @param params Frozen device runtime, original family and original-route workspace. Output must be absent.
+     * @param source Cold prepared original source used to seal native descriptor metadata.
+     * @return Exact root-reduction input, with no participant-local route fold.
+     */
+    MoEIntermediateShardRouteSlots appendMoEIntermediateShardRouteSlots(
         ComputeGraph &graph, MoEIntermediateShardPipelineParams params,
         const MoEOverlayParticipantLayerBank &source);
 

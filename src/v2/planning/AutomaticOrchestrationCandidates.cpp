@@ -20,6 +20,7 @@
 #include "config/TensorParallelConfig.h"
 #include "planning/TensorParallelSourceDeclaration.h"
 #include "execution/moe/MoEProjectionArenaGeometry.h"
+#include "execution/moe/MoEIntermediateShardStaticGraphAdmission.h"
 #include "planning/PlanningModelMetadata.h"
 #include "planning/RankHardwareOwnership.h"
 #include <algorithm>
@@ -420,7 +421,7 @@ namespace llaminar2
                     for (const int numa : numa_nodes)
                     {
                         Endpoint cpu{rank.rank, rank.node_id,
-                            GlobalDeviceAddress::fromLocalDeviceId(DeviceId(DeviceType::CPU, numa), rank.hostname, numa),
+                            GlobalDeviceAddress::cpu(numa, rank.hostname),
                             "cpu:" + std::to_string(numa)};
                         addPool(pools, {cpu});
                         // Repeated rank visibility is an alternate process owner,
@@ -468,15 +469,67 @@ namespace llaminar2
         }
 
         /**
+         * @brief Seal the joint intermediate shard choice on a normalized automatic overlay.
+         * @param config Automatic candidate carrying its original authored domains.
+         * @param profile Original model metadata, before preparation.
+         * @param pools Original endpoint pools, including physical node identity.
+         */
+        void selectAutomaticIntermediateShardLayout(OrchestrationConfig &config,
+            const ModelMemoryProfile &profile, const std::vector<Pool> &pools)
+        {
+            if (profile.expert_count <= 0 ||
+                config.routed_expert_compute_policy != RoutedExpertComputePolicy::Automatic)
+                return;
+            auto &plan = *config.moe_routed_expert_plan;
+            const auto &gpu = plan.domains.front();
+            if (pools.size() > 2 || gpu.name != plan.continuation_domain ||
+                gpu.scope != ExecutionDomainScope::RANK_LOCAL || gpu.participants.size() < 2 ||
+                !std::all_of(gpu.participants.begin(), gpu.participants.end(), [&](const auto &member) {
+                    return member.isGPU() && member.device_type == gpu.participants.front().device_type;
+                }))
+                return;
+            const auto uniform = [](const auto &domain) {
+                return domain.routed_phase_policy == RoutedExpertPhasePolicy::Uniform &&
+                       domain.routed_decode_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner &&
+                       domain.routed_prefill_assignment_policy == RoutedExpertAssignmentPolicy::StaticOwner;
+            };
+            if (!std::all_of(plan.domains.begin(), plan.domains.end(), uniform))
+                return;
+
+            auto sharded = plan;
+            for (auto &domain : sharded.domains)
+                domain.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+            if (pools.size() == 2)
+            {
+                // The counted mapped service is node-local and serves one
+                // request through the original all-phase GPU TP continuation.
+                if (config.batch_size != 1 || pools.front().front().node != pools.back().front().node ||
+                    !hasMappedGPUCPUIntermediateShardTopology(sharded))
+                    return;
+            }
+            if (!supportsGPUIntermediateShardMaintenance(config.moe_rebalance.mode, pools.size() == 2))
+                return;
+            sharded.continuation_dense_policy_intent = MoEContinuationDensePolicyIntent::Resolved;
+            sharded.continuation_domain_spec.setDensePolicy(DenseParallelPolicy::TensorParallel);
+
+            plan = std::move(sharded);
+            config.routed_expert_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+            for (auto &domain : config.domain_definitions)
+                domain.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+        }
+
+        /**
          * @brief Build explicit MoE domains without choosing a quota or physical reserve.
          * @param request Policy to retain, including Static/Dynamic and MTP capacity.
          * @param pools Continuation followed by optional expert-only domains; one pool expresses MoE TP.
          * @param membership Selected rank namespace.
+         * @param profile Original source model geometry.
+         * @param dense_policy Optional declared dense phase policy.
          * @return Existing normalized overlay config, ready for model-aware compilation.
          */
         OrchestrationConfig overlayConfig(const OrchestrationConfig &request,
             const std::vector<Pool> &pools, const ExecutionRankMembership &membership,
-            std::optional<DenseParallelPolicy> dense_policy = std::nullopt)
+            const ModelMemoryProfile &profile, std::optional<DenseParallelPolicy> dense_policy = std::nullopt)
         {
             auto config = explicitRequest(request);
             auto overlay = std::make_shared<MoERoutedExpertPlacementPlan>();
@@ -512,6 +565,7 @@ namespace llaminar2
                 for (const auto &error : errors) message += "\n  - " + error;
                 throw std::invalid_argument(message);
             }
+            selectAutomaticIntermediateShardLayout(config, profile, pools);
             return config;
         }
     }
@@ -535,6 +589,18 @@ namespace llaminar2
         // not the number of actual hosts; compare the observed identity sets.
         std::set<int> required_nodes;
         for (const auto &rank : inventory.ranks) required_nodes.insert(rank.node_id);
+        bool emitted = false;
+        std::optional<std::pair<bool, int>> rejected_shard_degree;
+        std::map<std::pair<bool, int>, bool> source_degree_support;
+        const auto rejectUnsliceableExactRequest = [&] {
+            if (!emitted && policy->options().device_counts && rejected_shard_degree)
+            {
+                const auto [gpu, degree] = *rejected_shard_degree;
+                throw std::invalid_argument(std::string("Original routed or shared expert sources cannot form ") +
+                    std::to_string(degree) + " positive native intermediate shards for the requested " +
+                    (gpu ? "GPU" : "CPU") + " tensor-parallel tier. Change the device count or explicitly choose another expert compute policy.");
+            }
+        };
         const auto publish = [&](AutomaticOrchestrationCandidate proposal) {
             // A positive stage-width request constrains topology, not merely a
             // ranking hint; no single-device/TP/overlay proposal may replace it.
@@ -547,12 +613,13 @@ namespace llaminar2
                     nodes.insert(inventory.ranks.at(rank).node_id);
                 if (nodes != required_nodes) return;
             }
+            emitted = true;
             visit(std::move(proposal));
         };
         const auto publishOverlay = [&](OrchestrationStrategy strategy,
                                         const std::vector<Pool> &domains,
                                         ExecutionRankMembership membership) {
-            auto default_config = overlayConfig(request, domains, membership);
+            auto default_config = overlayConfig(request, domains, membership, model.memoryProfile());
             const auto &placement = *default_config.moe_routed_expert_plan;
             for (const auto &domain : placement.domains)
             {
@@ -561,8 +628,38 @@ namespace llaminar2
                 // Never publish an impossible equal-column proposal and catch
                 // its compiler error as though it were a capacity rejection.
                 const auto declaration = domain.toExecutionDomainDefinition();
-                if (declaration.resolveRoutedComputePolicy(placement.routed_tiers.size()) ==
-                        RoutedExpertComputePolicy::GateUpOwnedDownColumns &&
+                const auto compute = declaration.resolveRoutedComputePolicy(placement.routed_tiers.size());
+                if (compute == RoutedExpertComputePolicy::TensorSharded)
+                {
+                    const bool cpu = declaration.participants.front().isCPU();
+                    const bool valid_scope = cpu
+                        ? declaration.participants.size() == 1 || declaration.scope == ExecutionDomainScope::NODE_LOCAL
+                        : declaration.scope == ExecutionDomainScope::RANK_LOCAL &&
+                            domain.name == placement.continuation_domain;
+                    if (!valid_scope || !declaration.supportsRoutedExpertTensorSharding())
+                        return;
+                    if (request.routed_expert_compute_policy == RoutedExpertComputePolicy::Automatic &&
+                        default_config.routed_expert_compute_policy == RoutedExpertComputePolicy::TensorSharded)
+                    {
+                        const auto key = std::pair{!cpu, static_cast<int>(declaration.participants.size())};
+                        auto [support, inserted] = source_degree_support.try_emplace(key, false);
+                        if (inserted)
+                        {
+                            support->second = supportsOriginalRoutedIntermediateShardDegree(model, key.second, key.first);
+                            if (support->second && key.first)
+                            {
+                                const auto shared_source = originalSharedExpertTPGeometry(model.memoryProfile(), request.mtp);
+                                support->second = shared_source && shared_source->supportsDegree(key.second);
+                            }
+                        }
+                        if (!support->second)
+                        {
+                            rejected_shard_degree = key;
+                            return;
+                        }
+                    }
+                }
+                if (compute == RoutedExpertComputePolicy::GateUpOwnedDownColumns &&
                     !MoEProjectionArenaGeometry::hasIntegralOutputPartition(
                         model.memoryProfile().d_model,
                         static_cast<int>(declaration.participants.size())))
@@ -578,7 +675,7 @@ namespace llaminar2
                 // physical BOM fits. Admit all-phase TP independently so the
                 // planner can choose it when replicas crowd out migration or
                 // expert residency; neither policy is a hidden runtime fallback.
-                auto tp_config = overlayConfig(request, domains, membership,
+                auto tp_config = overlayConfig(request, domains, membership, model.memoryProfile(),
                     DenseParallelPolicy::TensorParallel);
                 if(preservesModelShardOwnership(model.memoryProfile(),domains.front(),request.mtp,DenseParallelPolicy::TensorParallel,domains.size()==1))
                     publish({strategy, std::move(membership), std::move(tp_config)});
@@ -637,7 +734,11 @@ namespace llaminar2
         const bool overlays =
             routed_model &&
             policy->allows(OrchestrationStrategy::ExpertOverlay);
-        if (!pipelines && !overlays) return;
+        if (!pipelines && !overlays)
+        {
+            rejectUnsliceableExactRequest();
+            return;
+        }
         if (pipelines)
         {
             const auto& widths=policy->options().pipeline_stage_widths;
@@ -656,7 +757,25 @@ namespace llaminar2
                         auto domain=domainFor(stages[index],membership,"stage_"+std::to_string(index));
                         if(routed_model)
                         {
-                            domain.routed_compute_policy=request.routed_expert_compute_policy;
+                            domain.routed_compute_policy = request.routed_expert_compute_policy;
+                            // The existing CPU pipeline fragment service owns an
+                            // original node-local MPI cohort under Off. Dynamic
+                            // CPU pipeline maintenance still has a scalar
+                            // calibration contract and cannot admit this child.
+                            if (domain.routed_compute_policy == RoutedExpertComputePolicy::Automatic &&
+                                request.moe_rebalance.mode == MoERebalanceRuntimeMode::Off &&
+                                domain.scope == ExecutionDomainScope::NODE_LOCAL &&
+                                domain.participants.size() > 1 &&
+                                std::all_of(domain.participants.begin(), domain.participants.end(),
+                                    [](const auto &member) { return member.isCPU(); }))
+                            {
+                                const auto degree = static_cast<int>(domain.participants.size());
+                                auto [support, inserted] = source_degree_support.try_emplace(std::pair{false, degree}, false);
+                                if (inserted)
+                                    support->second = supportsOriginalRoutedIntermediateShardDegree(model, degree, false);
+                                if (support->second)
+                                    domain.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+                            }
                             const auto compute=domain.resolveRoutedComputePolicy(1);
                             // These are necessary physical-mode constraints,
                             // not a backend/card-count capability advertisement.
@@ -697,7 +816,11 @@ namespace llaminar2
                 groups(groups,0);
             }
         }
-        if(!overlays)return;
+        if (!overlays)
+        {
+            rejectUnsliceableExactRequest();
+            return;
+        }
         using PoolKey = std::vector<std::pair<int, std::string>>;
         std::set<std::vector<PoolKey>> emitted_overlays;
         const auto projectRemoteCPU = [](std::vector<Pool> &domains)
@@ -813,5 +936,6 @@ namespace llaminar2
             }
         };
         visitDeeper(visitDeeper);
+        rejectUnsliceableExactRequest();
     }
 }

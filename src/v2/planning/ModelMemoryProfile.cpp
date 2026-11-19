@@ -18,6 +18,7 @@
 #include <algorithm>
 
 #include "loaders/ModelLoader.h"
+#include "loaders/ModelContext.h"
 #include "execution/mtp/MTPLearnedBlockCount.h"
 #include <regex>
 #include <numeric>
@@ -505,6 +506,15 @@ namespace llaminar2
             {
                 profile.d_ff = static_cast<int>(ff_it->second.asUInt64());
             }
+            else if (profile.expert_count > 0 && profile.expert_shared_feed_forward_length > 0)
+            {
+                // Same declared shared width as ModelLoader::feedForwardLength.
+                profile.d_ff = profile.expert_shared_feed_forward_length;
+            }
+            else if (profile.expert_count > 0 && profile.expert_feed_forward_length > 0)
+            {
+                profile.d_ff = profile.expert_feed_forward_length;
+            }
             else
             {
                 // Estimate: for most models, d_ff is discoverable from tensor shapes
@@ -553,6 +563,15 @@ namespace llaminar2
                     appendNativeTensor(profile, source.tensor);
         validateFlashNextGeometry(profile);
         return profile;
+    }
+
+    ModelMemoryProfile ModelMemoryProfile::fromOriginalModelContext(const IModelContext &context)
+    {
+        const auto *original = dynamic_cast<const ModelContext *>(&context);
+        if (!original || !context.ggufDirectory() ||
+            context.ggufDirectory() != original->concreteLoader().ggufDirectory())
+            throw std::invalid_argument("Shared expert TP requires its original sealed GGUF model context");
+        return fromLoader(original->concreteLoader());
     }
 
     ModelMemoryProfile ModelMemoryProfile::fromLoader(const ModelLoader &loader)

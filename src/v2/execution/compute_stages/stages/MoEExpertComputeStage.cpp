@@ -11875,6 +11875,14 @@ namespace llaminar2
     {
         const bool uses_node_local_exchange =
             params_.node_local_route_exchange != nullptr;
+        if (!validMoENodeLocalRouteOwnership(params_.node_local_route_ownership) ||
+            (params_.node_local_route_ownership == MoENodeLocalRouteOwnership::ContinuationCohort &&
+             (!uses_node_local_exchange ||
+              params_.external_route_source != MoEExternalCanonicalRouteSource::RootCanonicalRouteBank)))
+        {
+            LOG_ERROR("[MoECanonicalRouteReduceStage] Cohort reduction requires the original mapped root bank");
+            return false;
+        }
         if (!ctx ||
             !params_.canonical_route_contributions ||
             !params_.output ||
@@ -12259,6 +12267,7 @@ namespace llaminar2
                         static_cast<std::uint32_t>(params_.seq_len),
                     .top_k = static_cast<std::uint32_t>(params_.top_k),
                     .d_model = static_cast<std::uint32_t>(params_.d_model),
+                    .ownership = params_.node_local_route_ownership,
                 };
                 if (!kernel->acquireNodeLocalCanonicalRoutes(
                         launch, consumption))
@@ -12300,6 +12309,7 @@ namespace llaminar2
                 .domain_assignment = domain_assignment,
                 .live_route_slots =
                     static_cast<std::uint32_t>(live_route_slots),
+                .ownership = params_.node_local_route_ownership,
             };
             if (!kernel->publishNodeLocalCanonicalRoutes(
                     launch, publication))
@@ -12330,6 +12340,11 @@ namespace llaminar2
         const StageGPUExecution execution = gpuExecution();
         execution.publish(params_.output);
         return true;
+    }
+
+    uint64_t MoECanonicalRouteReduceStage::graphCaptureVariantSignature() const
+    {
+        return static_cast<uint64_t>(params_.node_local_route_ownership);
     }
 
     size_t MoECanonicalRouteReduceStage::estimatedFlops() const

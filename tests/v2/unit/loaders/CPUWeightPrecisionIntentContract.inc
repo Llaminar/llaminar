@@ -26,7 +26,7 @@ TEST(CPUWeightPrecisionIntentContract, ImmutableOperatorRolesRetainFP32AcrossGlo
                 GDNProjectionArithmetic::FP16, MoERouterArithmetic::FP16);
             EXPECT_EQ(representation, source == TensorType::FP32 ? Representation::SourceNative : Representation::FP32);
             EXPECT_EQ(Contract::resolve(role, tensorTypeName(source)), representation);
-            const auto operand = Contract::operandPrecision(role, "operator.weight", "qwen4exp",
+            const auto operand = Contract::operandPrecision(role, source, "operator.weight", "qwen4exp",
                 GDNProjectionArithmetic::FP16, MoERouterArithmetic::FP16);
             ASSERT_EQ(operand, FloatingActivationOperandPrecision::Native);
             for (const auto requested : {WeightPrecision::NATIVE, WeightPrecision::CONVERT_TO_INT8,
@@ -45,14 +45,14 @@ TEST(CPUWeightPrecisionIntentContract, RegisteredAlreadyTypedAndConvertedSources
         for(const auto original:{TensorType::FP16,TensorType::FP32,TensorType::Q6_K}) {
             const auto half_execution=Contract::resolve(WeightRole::GDNAlphaBetaProjection,original,
                 "blk.0.ssm_alpha.weight","qwen35moe",GDNProjectionArithmetic::FP16,MoERouterArithmetic::Native);
-            const auto half_operand=Contract::operandPrecision(WeightRole::GDNAlphaBetaProjection,
+            const auto half_operand=Contract::operandPrecision(WeightRole::GDNAlphaBetaProjection, original,
                 "blk.0.ssm_alpha.weight","qwen35moe",GDNProjectionArithmetic::FP16,MoERouterArithmetic::Native);
             ASSERT_EQ(half_operand,Operand::FP16RNE);
             EXPECT_EQ(Contract::resolveCPUWeightPrecision(WeightRole::GDNAlphaBetaProjection,original,requested,half_execution,half_operand),
                 original==TensorType::FP16?WeightPrecision::NATIVE:WeightPrecision::CONVERT_TO_FP16);
             const auto float_execution=Contract::resolve(WeightRole::GDNAlphaBetaProjection,original,
                 "blk.0.ssm_alpha.weight","qwen35moe",GDNProjectionArithmetic::FP32,MoERouterArithmetic::Native);
-            const auto float_operand=Contract::operandPrecision(WeightRole::GDNAlphaBetaProjection,
+            const auto float_operand=Contract::operandPrecision(WeightRole::GDNAlphaBetaProjection, original,
                 "blk.0.ssm_alpha.weight","qwen35moe",GDNProjectionArithmetic::FP32,MoERouterArithmetic::Native);
             ASSERT_EQ(float_operand,Operand::FP32);
             EXPECT_EQ(Contract::resolveCPUWeightPrecision(WeightRole::GDNAlphaBetaProjection,original,requested,float_execution,float_operand),

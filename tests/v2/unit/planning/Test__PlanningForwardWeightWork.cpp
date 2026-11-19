@@ -11,6 +11,7 @@
 #include "planning/PlanningForwardWeightWork.h"
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "planning/WorkspaceMemoryEstimator.h"
+#include "planning/TensorParallelSourceDeclaration.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include "../../utils/PlanningHostServiceFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
@@ -834,6 +835,64 @@ TEST(PlanningForwardWeightWork, PreclassifiedGeometryMatchesCanonicalResolverAnd
 }
 
 /** @test Retained source facts preserve every canonical byte quote and reject foreign profile/lifetime reuse. */
+/** @test A logical dense FFN interval and an exact shared source interval quote the same original matrices. */
+TEST(PlanningForwardWeightWork, SharedFFNQuotesRetainTheirDeclaredAxis)
+{
+    using Fixture = test::PlanningGGUFFixture;
+    const Fixture file(true, false, GGUFTensorType::Q8_0, 256, std::nullopt, 8,
+        Fixture::Geometry::Directory, 2, 8, GGUFTensorType::Q8_0);
+    const PlanningModelSource source(file.path());
+    const auto &profile = source.metadata().memoryProfile();
+    const auto device = DeviceId::rocm(1);
+    const auto logical = TensorParallelConfig::equalSplit(2, profile.n_heads, profile.n_kv_heads, profile.d_ff,
+        profile.vocab_size, std::vector{DeviceId::rocm(0), device});
+    const auto native = bindOriginalSharedExpertTP(profile, MTPRuntimeConfig{}, logical);
+    const auto &shared = native.forRank(1);
+    ASSERT_TRUE(shared.native_shared_ffn_width);
+    ASSERT_LT(*shared.native_shared_ffn_width, profile.d_ff);
+    ASSERT_GT(logical.forRank(1).dFFEnd(), *shared.native_shared_ffn_width);
+    EXPECT_EQ(shared.dFFEnd(), *shared.native_shared_ffn_width);
+
+    const auto &dense = logical.forRank(1);
+    const auto quote = [&](const DeviceShardingAssignment &assignment) {
+        return WorkspaceMemoryEstimator::estimate(profile, WorkspaceMemoryGeometry{
+            .device = device, .device_compute_units = 64,
+            .resident_graph_rows = 1, .max_context_rows = 128,
+            .shard_index = 1, .has_exact_tensor_parallel_assignment = true,
+            .local_d_ff = assignment.d_ff_count, .local_d_ff_start = assignment.d_ff_start,
+            .native_shared_ffn_width = assignment.native_shared_ffn_width,
+            .local_query_head_start = assignment.head_start, .local_query_heads = assignment.head_count,
+            .local_kv_head_start = assignment.kv_head_start, .local_kv_heads = assignment.kv_head_count,
+            .local_vocab_start = assignment.vocab_start, .local_vocab = assignment.vocab_count,
+            .first_layer = 0, .last_layer = profile.mainLayerCount() - 1, .total_shards = 2,
+            .runtime_device_policy_available = true});
+    };
+    EXPECT_GT(quote(dense), 0u);
+    EXPECT_GT(quote(shared), 0u);
+    auto foreign = shared;
+    foreign.native_shared_ffn_width = *shared.native_shared_ffn_width + 32;
+    EXPECT_THROW(quote(foreign), std::invalid_argument);
+    const WeightShardGeometryResolver logical_resolver(profile, device, 1, 2, dense);
+    const WeightShardGeometryResolver native_resolver(profile, device, 1, 2, shared);
+    const WeightShardGeometryResolver mismatched_resolver(profile, device, 1, 2, foreign);
+    int shared_matrices = 0;
+    for (const auto &tensor : profile.tensors)
+    {
+        const auto role = inferWeightRole(tensor.name);
+        if (role != WeightRole::SharedExpertGate && role != WeightRole::SharedExpertUp &&
+            role != WeightRole::SharedExpertDown)
+            continue;
+        ++shared_matrices;
+        const auto expected = role == WeightRole::SharedExpertDown
+            ? WeightShardMatrix{static_cast<std::size_t>(profile.d_model), static_cast<std::size_t>(shared.d_ff_count), 1}
+            : WeightShardMatrix{static_cast<std::size_t>(shared.d_ff_count), static_cast<std::size_t>(profile.d_model), 1};
+        EXPECT_EQ(logical_resolver.resolve(tensor).matrix(), expected);
+        EXPECT_EQ(native_resolver.resolve(tensor).matrix(), expected);
+        EXPECT_THROW((void)mismatched_resolver.resolve(tensor), std::invalid_argument);
+    }
+    EXPECT_EQ(shared_matrices, 3 * profile.mainLayerCount());
+}
+
 TEST(PlanningForwardWeightWork, RetainedSourceWorkspaceAndWeightQuotesMatchCanonicalBytes) {
     test::PlanningGGUFFixture file(true,true,GGUFTensorType::Q4_0);
     PlanningModelSource source(file.path());const auto &model=source.metadata();const auto &profile=model.memoryProfile();

@@ -7,6 +7,7 @@
  * transport, readiness, model load, socket or native execution is invented.
  */
 #include "execution/moe/MoEOverlayPhysicalProjectionPieces.h"
+#include "execution/moe/MoEOverlayEconomyCalibrationPlanner.h"
 #include "execution/moe/MoEOverlayPhysicalRemotePieceOrdinals.h"
 #include "../../../utils/CPUJointSourceTestPlan.h"
 #include <gtest/gtest.h>
@@ -47,6 +48,62 @@ MoEOverlayTierMigration pieceEdge(MoEExpertOwner from, MoEExpertOwner to)
     return {.layer_idx = 7, .expert_id = from.expert_id,
         .source = std::move(from), .destination = std::move(to)};
 }
+}
+
+/** @test Only identical ordered native GPU/CPU cuts can reuse a representative's measurement. */
+TEST(MoEOverlayPhysicalCalibration, SeparatesRotatingCutsAndReusesExactPairs)
+{
+    auto plan = piecePlan(2);
+    auto &gpu = plan.domains.front();
+    gpu.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
+    gpu.backend = CollectiveBackendType::RCCL;
+    gpu.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+    plan.gpu_expert_intermediate_tiling = GPUExpertIntermediateTiling::Coarse128;
+
+    // Four physically ordered TP2 target layers sharing one source signature.
+    // Five native 128-column groups rotate 384+256 and 256+384.
+    const auto first_placement = plan.placements.front();
+    const auto q4 = ExpertWeightFormat::nativeQuantised({5u, true, true});
+    const auto q5 = ExpertWeightFormat::nativeQuantised({7u, false, true});
+    std::vector<MoEOverlayLayerWeightManifest> sources;
+    plan.placements.clear();
+    for (int layer = 7; layer < 11; ++layer)
+    {
+        auto placement = first_placement;
+        placement.layer = layer;
+        plan.placements.push_back(std::move(placement));
+        sources.push_back({.layer_idx = layer, .projections = {{
+            {.projection = ExpertTierWeightProjection::Gate, .N = 640, .K = 2560, .format = q4},
+            {.projection = ExpertTierWeightProjection::Up, .N = 640, .K = 2560, .format = q4},
+            {.projection = ExpertTierWeightProjection::Down, .N = 2560, .K = 640, .format = q5}}}});
+    }
+
+    const auto topology = MoEExpertOwnerMap::buildShardPlacement(plan, sources);
+    const MoEOverlayEconomyCalibrationLayerCatalog catalog(sources, &topology);
+    ASSERT_EQ(catalog.representativeLayers(), (std::vector{7, 8}));
+    ASSERT_EQ(catalog.groups()[0].member_layers, (std::vector{7, 9}));
+    ASSERT_EQ(catalog.groups()[1].member_layers, (std::vector{8, 10}));
+    EXPECT_EQ(MoEOverlayEconomyCalibrationLayerCatalog(sources).representativeLayers(),
+              (std::vector{7}));
+    EXPECT_NE(catalog.identity(), MoEOverlayEconomyCalibrationLayerCatalog(sources).identity());
+
+    // Compare the exact geometry emitted by production for both transfer directions.
+    auto geometry = [&](int layer, int from, int to) {
+        auto edge = pieceEdge(*topology.placementFor(layer, from), *topology.placementFor(layer, to));
+        edge.layer_idx = layer;
+        return makePhysicalMoEOverlayMeasurementGeometry(edge, sources.at(layer - 7), 512, topology);
+    };
+    for (const auto &[from, to] : {std::pair{0, 64}, std::pair{64, 0}})
+    {
+        EXPECT_FALSE(geometry(7, from, to)->sameIdentity(*geometry(8, from, to)));
+        EXPECT_TRUE(geometry(7, from, to)->sameIdentity(*geometry(9, from, to)));
+        EXPECT_TRUE(geometry(8, from, to)->sameIdentity(*geometry(10, from, to)));
+    }
+
+    // Equal cut sizes and source formats alone cannot admit exchanged member identities.
+    std::reverse(gpu.participants.begin(), gpu.participants.end());
+    const auto reordered = MoEExpertOwnerMap::buildShardPlacement(plan, sources);
+    EXPECT_NE(catalog.identity(), MoEOverlayEconomyCalibrationLayerCatalog(sources, &reordered).identity());
 }
 
 TEST(MoEOverlayPhysicalProjectionPieces, WholeAndCompleteCohortsNormalizeWithoutScalarAliases)

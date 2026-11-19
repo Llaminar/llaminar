@@ -1585,57 +1585,166 @@ TEST(PlanningRequestCostModel, TensorShardedGPUUsesAdmittedFragmentsAndOneFFNSum
     const auto observations = PlanningCommunicationService::acceptLocal(plan, cluster.world_size, borrow(encoded));
     PlanningGGUFFixture file(true, true, GGUFTensorType::Q8_0, 768);
     PlanningModelSource source(file.path());
-    const auto candidate = requestCandidate(source, cluster, backend, OrchestrationStrategy::TensorParallel,
-        MoERebalanceRuntimeMode::Off, policy);
-    ASSERT_EQ(candidate.devicePlans().size(), 2u);
-    constexpr std::array roles{WeightRole::MoEExpertGate, WeightRole::MoEExpertUp, WeightRole::MoEExpertDown};
-    for (auto phase : {PlanningMainForwardPhase::Prefill, PlanningMainForwardPhase::Decode})
+    for (const auto movement : {MoERebalanceRuntimeMode::Off, MoERebalanceRuntimeMode::Dynamic})
     {
-        const auto participants = compilePlanningForwardWeightWork(source.metadata(), candidate, phase);
-        ASSERT_EQ(participants.size(), 2u);
-        for (const auto &participant : participants)
+        SCOPED_TRACE(static_cast<int>(movement));
+        const auto candidate = requestCandidate(source, cluster, backend, OrchestrationStrategy::TensorParallel,
+            movement, policy);
+        EXPECT_EQ(candidate.config().moe_rebalance.mode, movement);
+        ASSERT_EQ(candidate.devicePlans().size(), 2u);
+        constexpr std::array roles{WeightRole::MoEExpertGate, WeightRole::MoEExpertUp, WeightRole::MoEExpertDown};
+        for (auto phase : {PlanningMainForwardPhase::Prefill, PlanningMainForwardPhase::Decode})
         {
-            ASSERT_EQ(participant.routed.size(), static_cast<size_t>(source.metadata().mainLayerCount()));
-            int shared_roles = 0;
-            for (const auto &operation : participant.ordinary)
-                if (const auto *projection = std::get_if<PlanningProjectionWeight>(&operation))
-                    switch (projection->weight.role)
-                    {
-                    case WeightRole::SharedExpertGate:
-                    case WeightRole::SharedExpertUp:
-                        EXPECT_EQ(projection->weight.geometry.matrix(), (WeightShardMatrix{128, 256, 1}));
-                        ++shared_roles;
-                        break;
-                    case WeightRole::SharedExpertDown:
-                        EXPECT_EQ(projection->weight.geometry.matrix(), (WeightShardMatrix{256, 128, 1}));
-                        ++shared_roles;
-                        break;
-                    default: break;
-                    }
-            EXPECT_EQ(shared_roles, 3 * source.metadata().mainLayerCount());
-            for (const auto &layer : participant.routed)
+            const auto participants = compilePlanningForwardWeightWork(source.metadata(), candidate, phase);
+            ASSERT_EQ(participants.size(), 2u);
+            for (const auto &participant : participants)
             {
-                ASSERT_TRUE(layer.projection_ownership);
-                EXPECT_FALSE(layer.projection_ownership->hasMovableProjectionSet());
-                EXPECT_EQ(layer.projectionMatrix(roles[0]), (WeightShardMatrix{384, 256, 1}));
-                EXPECT_EQ(layer.projectionMatrix(roles[1]), (WeightShardMatrix{384, 256, 1}));
-                EXPECT_EQ(layer.projectionMatrix(roles[2]), (WeightShardMatrix{256, 384, 1}));
-                for (auto role : roles)
-                    for (const size_t rows : {0, 1, 4, 64})
-                        EXPECT_DOUBLE_EQ(layer.projectionExpectation(role, rows).routed_rows,
-                            rows * layer.routes_per_token);
+                ASSERT_EQ(participant.routed.size(), static_cast<size_t>(source.metadata().mainLayerCount()));
+                int shared_roles = 0;
+                for (const auto &operation : participant.ordinary)
+                    if (const auto *projection = std::get_if<PlanningProjectionWeight>(&operation))
+                        switch (projection->weight.role)
+                        {
+                        case WeightRole::SharedExpertGate:
+                        case WeightRole::SharedExpertUp:
+                            EXPECT_EQ(projection->weight.geometry.matrix(), (WeightShardMatrix{128, 256, 1}));
+                            ++shared_roles;
+                            break;
+                        case WeightRole::SharedExpertDown:
+                            EXPECT_EQ(projection->weight.geometry.matrix(), (WeightShardMatrix{256, 128, 1}));
+                            ++shared_roles;
+                            break;
+                        default: break;
+                        }
+                EXPECT_EQ(shared_roles, 3 * source.metadata().mainLayerCount());
+                for (const auto &layer : participant.routed)
+                {
+                    ASSERT_TRUE(layer.projection_ownership);
+                    EXPECT_FALSE(layer.projection_ownership->hasMovableProjectionSet());
+                    EXPECT_EQ(layer.projectionMatrix(roles[0]), (WeightShardMatrix{384, 256, 1}));
+                    EXPECT_EQ(layer.projectionMatrix(roles[1]), (WeightShardMatrix{384, 256, 1}));
+                    EXPECT_EQ(layer.projectionMatrix(roles[2]), (WeightShardMatrix{256, 384, 1}));
+                    for (auto role : roles)
+                        for (const size_t rows : {0, 1, 4, 64})
+                            EXPECT_DOUBLE_EQ(layer.projectionExpectation(role, rows).routed_rows,
+                                rows * layer.routes_per_token);
+                }
+            }
+        }
+        const PlanningRequestCostModel costs(source.metadata(), cluster, requestWeights(source, cluster),
+            requestArithmetic(cluster), PlanningCommunicationCost(cluster, observations.native, {}, observations.host_device));
+        const auto result = costs.evaluate(candidate, {64, 16});
+        EXPECT_GT(result.requestSeconds(), 0);
+        EXPECT_NE(result.evidence().find("tensor-shard FFN uses one live FP32 sum"), std::string::npos);
+        EXPECT_EQ(result.evidence().find("counted gather"), std::string::npos);
+        const PlanningRequestCostModel missing_native(source.metadata(), cluster, requestWeights(source, cluster),
+            requestArithmetic(cluster), PlanningCommunicationCost(cluster, {}, {}, observations.host_device));
+        EXPECT_THROW(missing_native.evaluate(candidate, {64, 16}), std::invalid_argument);
+    }
+}
+
+/** @test Two GPU and two NUMA CPU members price their admitted native fragments and logical tier quotas. */
+TEST(PlanningRequestCostModel, MovableTensorShardedGpuCpuCohortsUseOriginalQuotas)
+{
+    auto cluster = requestInventory(true);
+    ASSERT_GE(cluster.ranks.size(), 2u);
+    cluster.ranks.resize(2);
+    cluster.world_size = 2;
+    auto &accelerator = cluster.ranks[0];
+    auto &host = cluster.ranks[1];
+    std::erase_if(accelerator.gpus, [](const auto &gpu) { return gpu.type != DeviceType::ROCm; });
+    ASSERT_EQ(accelerator.gpus.size(), 2u);
+    accelerator.p2p_cuda.clear();
+    accelerator.p2p_cuda_count = 0;
+    accelerator.p2p_rocm.assign(4, true);
+    accelerator.p2p_rocm_count = 2;
+    host.hostname = accelerator.hostname;
+    host.node_id = accelerator.node_id;
+    host.local_rank = 1;
+    host.cpu.numa_node = 1;
+    host.cpu_socket_info.front().numa_node = 1;
+    host.gpus.clear();
+    host.p2p_cuda.clear();
+    host.p2p_rocm.clear();
+    host.p2p_cuda_count = host.p2p_rocm_count = 0;
+    cluster.buildNodeAggregations();
+
+    PlanningGGUFFixture file(true, true, GGUFTensorType::Q8_0, 768);
+    PlanningModelSource source(file.path());
+    OrchestrationConfig request;
+    request.model_path = source.path();
+    request.max_seq_len = 8192;
+    request.prefill_max_bucket_size = 64;
+    request.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+    request.routed_expert_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+    request.automatic_planning.only_backends = std::vector{DeviceType::ROCm, DeviceType::CPU};
+    request.automatic_planning.only_strategies = std::vector{OrchestrationStrategy::ExpertOverlay};
+    request.automatic_planning.device_counts = {{DeviceType::ROCm, 2}, {DeviceType::CPU, 2}};
+    std::optional<AdmittedOrchestrationCandidate> admitted;
+    visitAutomaticOrchestrationCandidates(request, source.metadata(), cluster, [&](auto proposal)
+    {
+        if (admitted || proposal.membership.discoveryRanks() != std::vector<int>{0, 1}) return;
+        auto &plan = *proposal.config.moe_routed_expert_plan;
+        if (plan.routed_tiers.size() != 2 || plan.domains.size() != 2 ||
+            plan.domains[0].participants.size() != 2 || plan.domains[1].participants.size() != 2)
+            return;
+        // Guarantee meaningful positive work on both tiers without using its
+        // physical fragment count as the logical expert count.
+        plan.routed_tiers[0].max_experts_per_layer = 3;
+        admitted.emplace(AdmittedOrchestrationCandidate::admit(std::move(proposal), source,
+            {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
+             .maximum_cached_prefill_buckets = 8,
+             .retained_host_services = planningHostServiceBudgets(cluster.world_size)}));
+    });
+    ASSERT_TRUE(admitted) << "Automatic search omitted the original GPU TP2 + CPU TP2 topology";
+    EXPECT_EQ(admitted->config().moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+    ASSERT_EQ(std::count_if(admitted->devicePlans().begin(), admitted->devicePlans().end(),
+        [](const auto &device) {
+            return device.device.is_cpu() &&
+                device.execution_role == DeviceExecutionMemoryRole::RoutedExpertParticipant;
+        }), 2);
+    for (const auto phase : {PlanningMainForwardPhase::Prefill, PlanningMainForwardPhase::Decode})
+    {
+        const auto work = compilePlanningForwardWeightWork(source.metadata(), *admitted, phase);
+        ASSERT_EQ(work.size(), 4u);
+        for (const auto &endpoint : work)
+        {
+            ASSERT_FALSE(endpoint.routed.empty());
+            for (const auto &layer : endpoint.routed)
+            {
+                ASSERT_TRUE(layer.shard_work);
+                const auto &shard = *layer.shard_work;
+                ASSERT_EQ(shard.cohort->participants().size(), 2u);
+                EXPECT_EQ(shard.cohort->participants()[shard.member].world_rank, endpoint.execution_rank);
+                EXPECT_EQ(layer.projectionMatrix(WeightRole::MoEExpertGate), (WeightShardMatrix{384, 256, 1}));
+                EXPECT_EQ(layer.projectionMatrix(WeightRole::MoEExpertDown), (WeightShardMatrix{256, 384, 1}));
+                auto expectation = layer.projectionExpectation(WeightRole::MoEExpertDown, 4);
+                const int local_experts = endpoint.device.is_gpu() ? 3 : layer.expert_count - 3;
+                EXPECT_DOUBLE_EQ(expectation.routed_rows,
+                    4.0 * layer.routes_per_token * local_experts / layer.expert_count);
             }
         }
     }
+
+    const AutomaticOrchestrationRequest constraints(request.automatic_planning);
+    const auto sample_plan = PlanningCommunicationSamplePlan::resolve(cluster, constraints, 256, 64,
+        std::array{PlanningAllreducePrecision::FP32}, RoutedExpertComputePolicy::TensorSharded);
+    const auto encoded = nativeReceipts(sample_plan, cluster.world_size);
+    const auto observations = PlanningCommunicationService::acceptLocal(sample_plan, cluster.world_size, borrow(encoded));
     const PlanningRequestCostModel costs(source.metadata(), cluster, requestWeights(source, cluster),
         requestArithmetic(cluster), PlanningCommunicationCost(cluster, observations.native, {}, observations.host_device));
-    const auto result = costs.evaluate(candidate, {64, 16});
-    EXPECT_GT(result.requestSeconds(), 0);
-    EXPECT_NE(result.evidence().find("static tensor-shard FFN uses one live FP32 sum"), std::string::npos);
-    EXPECT_EQ(result.evidence().find("counted gather"), std::string::npos);
-    const PlanningRequestCostModel missing_native(source.metadata(), cluster, requestWeights(source, cluster),
-        requestArithmetic(cluster), PlanningCommunicationCost(cluster, {}, {}, observations.host_device));
-    EXPECT_THROW(missing_native.evaluate(candidate, {64, 16}), std::invalid_argument);
+    // The device-free fixture supplies complete local GPU observations, but
+    // it cannot complete the real cross-rank CPU gather. Cost admission must
+    // require the exact directed MPI measurement even on a single host.
+    try
+    {
+        (void)costs.evaluate(*admitted, {64, 16});
+        FAIL() << "Mixed cohort was priced without the original directed MPI service";
+    }
+    catch (const std::invalid_argument &error)
+    {
+        EXPECT_NE(std::string_view(error.what()).find("missing exact directed MPI basis"), std::string_view::npos);
+    }
 }
 
 /** @brief TP-only projection searches retain exact host first-touch scopes, unlike whole-expert TP. */

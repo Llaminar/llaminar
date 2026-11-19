@@ -1947,7 +1947,9 @@ namespace llaminar2
             .long_name = "--moe-routed-expert-compute",
             .category = "MoE Configuration",
             .value_label = "<policy>",
-            .description = "Routed-expert compute distribution: auto (default; projection ownership for one homogeneous LocalTP GPU tier, whole experts otherwise), apportioned, replicated, tensor-sharded, gate-up-owned-down-columns",
+            .description = "Routed-expert compute distribution: auto, apportioned, replicated, tensor-sharded, or gate-up-owned-down-columns. "
+                           "With --auto, MoE planning defaults to tensor-sharded on supported homogeneous GPU TP and same-node GPU TP plus CPU TP layouts, subject to original source geometry. "
+                           "Manually declared placement follows its domain policies and topology defaults. Explicit compute modes take precedence.",
             .valid_values = {"auto", "apportioned", "replicated", "tensor-sharded", "gate-up-owned-down-columns"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)

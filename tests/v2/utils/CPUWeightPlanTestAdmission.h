@@ -64,7 +64,7 @@ inline void admitCPUWeightPlansForTest(WeightManager& manager,IModelLoader& load
             const auto execution=PreparedWeightRepresentationContract::resolve(role,original.original_type,
                 requirement.canonical_name,loader.architecture(),debugEnv().gemm.gdn_projection_arithmetic,
                 debugEnv().gemm.moe_router_arithmetic);
-            const auto operand=PreparedWeightRepresentationContract::operandPrecision(role,requirement.canonical_name,
+            const auto operand=PreparedWeightRepresentationContract::operandPrecision(role,original.original_type,requirement.canonical_name,
                 loader.architecture(),debugEnv().gemm.gdn_projection_arithmetic,debugEnv().gemm.moe_router_arithmetic);
             const auto precision=PreparedWeightRepresentationContract::resolveCPUWeightPrecision(
                 role,original.original_type,WeightPrecision::NATIVE,execution,operand);

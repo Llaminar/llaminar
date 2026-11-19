@@ -1529,6 +1529,14 @@ namespace llaminar2
                                 *tp_ctx_, n_heads, n_kv_heads, d_ff, vocab_size));
                 }
 
+                if (tp_config && usesNativeSharedExpertTP(config_.moe_routed_expert_plan.get()))
+                {
+                    // The sealed loader owns both selected source directories
+                    // and whether the paired predictor can be materialized.
+                    *tp_config = bindOriginalSharedExpertTP(
+                        ModelMemoryProfile::fromOriginalModelContext(*model_ctx_), config_.mtp, *tp_config);
+                }
+
                 // Build unified WeightManagerConfig
                 WeightManagerConfig wm_config;
                 wm_config.tp_config = dense_tp_enabled ? tp_config : nullptr;

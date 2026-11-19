@@ -5279,6 +5279,10 @@ namespace llaminar2
             return false;
         }
 
+        if (moe.expert_overlay_residency_authority &&
+            moe.expert_overlay_residency_authority->stationaryTensorShardResidency())
+            return false;
+
         /* A one-participant tier has no peer to rebalance with. Treating its
          * Dynamic policy as active would require a collective maintenance
          * graph that cannot perform any movement and would turn an intentional

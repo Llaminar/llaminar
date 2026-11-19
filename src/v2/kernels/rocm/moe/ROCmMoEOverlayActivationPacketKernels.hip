@@ -181,10 +181,13 @@ extern "C" bool hipMoEOverlayConsumeCanonicalRouteTicket(
     hipLaunchKernelGGL(
         llaminar2::moe_activation_packet_device::awaitCanonicalRouteTicketKernel,
         dim3(1u), dim3(1u), 0u, hip_stream, *launch);
-    hipLaunchKernelGGL(
-        llaminar2::moe_activation_packet_device::
-            materializeCanonicalRouteTicketKernel,
-        dim3(blocks), dim3(kThreads), 0u, hip_stream, *launch);
+    if (!launch->metadataOnly())
+    {
+        hipLaunchKernelGGL(
+            llaminar2::moe_activation_packet_device::
+                materializeCanonicalRouteTicketKernel,
+            dim3(blocks), dim3(kThreads), 0u, hip_stream, *launch);
+    }
     /* A separate one-thread node cannot race the materialization blocks. Its
      * exact-stream release is the sole authority permitting host payload reuse. */
     hipLaunchKernelGGL(

@@ -17,6 +17,7 @@
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IGPUGraphCapture.h"
+#include "execution/local_execution/graph/ForwardGraphSubmissionIntent.h"
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "execution/moe/MoEOverlayNodeLocalRouteExchange.h"
 #include "OriginalMappedComponentResources.h"
@@ -116,7 +117,8 @@ namespace
             allocations.reserve(count);transfer_buffers.reserve(count);transfer_claims_.reserve(count);
             mapped_claims_.reserve(2);mapped_regions_.reserve(2);arenas_.reserve(1);graphs_.reserve(2);
             root_stream=source.stream(root);
-            producer_stream=source.stream(producer,producer==root);
+            producer_stream=source.stream(producer,producer==root &&
+                program_.kind!=OriginalMappedComponentProgram::Kind::TicketCompletion);
             root_terminal=source.event(root,0);producer_terminal=source.event(producer,producer==root?1:0);
         }
         ~SparseRouteExchangeResources() {
@@ -660,8 +662,10 @@ namespace
         std::uint32_t d_model = 512u,
         std::uint32_t epochs = 5u,
         bool replay_through_retained_graphs = false,
-        std::uint32_t sparse_owner_stride = 0u)
+        std::uint32_t sparse_owner_stride = 0u,
+        MoENodeLocalRouteOwnership ownership = MoENodeLocalRouteOwnership::ExclusiveParticipant)
     {
+        const bool joint = ownership == MoENodeLocalRouteOwnership::ContinuationCohort;
         constexpr std::uint32_t top_k = 8u;
         constexpr std::int32_t root_participant = 11;
         constexpr std::int32_t producer_participant = 37;
@@ -732,10 +736,11 @@ namespace
                 const bool producer_owns = sparse_owner_stride == 0u
                     ? ((slot + epoch) % 3u) != 0u
                     : epoch != 0u && ((slot + epoch) % sparse_owner_stride) == 0u;
+                const auto route_epoch = std::min(epoch, invariant_epoch_begin);
+                const bool cohort_owns = epoch != 0u && ((slot + route_epoch) % 3u) != 0u;
                 route_participant_epochs[epoch][slot] =
-                    producer_owns
-                        ? producer_participant
-                        : root_participant;
+                    joint ? (cohort_owns ? root_participant : -1)
+                          : (producer_owns ? producer_participant : root_participant);
                 for (std::uint32_t column = 0u; column < d_model; ++column)
                 {
                     const std::size_t route_index =
@@ -754,11 +759,12 @@ namespace
                         epoch < invariant_epoch_begin
                             ? base + 32.0f
                             : base;
+                    const float local = root_route_epochs[epoch][route_index];
+                    const float remote = producer_route_epochs[epoch][route_index];
+                    const float contribution = joint ? (cohort_owns ? (0.0f + local) + remote : local)
+                                                     : (producer_owns ? remote : local);
                     expected_epochs[epoch][
-                        static_cast<std::size_t>(slot / top_k) * d_model +
-                        column] += producer_owns
-                                       ? producer_route_epochs[epoch][route_index]
-                                       : root_route_epochs[epoch][route_index];
+                        static_cast<std::size_t>(slot / top_k) * d_model + column] += contribution;
                 }
             }
         }
@@ -771,7 +777,7 @@ namespace
             0)
             << "placement-invariance oracle changed canonical route order";
         for (std::uint32_t epoch = invariant_epoch_begin;
-             epoch < epochs;
+             !joint && epoch < epochs;
              ++epoch)
         {
             bool exposes_participant_grouping = false;
@@ -912,7 +918,8 @@ namespace
                 .capacity = route_slots,
             },
             .external_route_source =
-                MoEExternalCanonicalRouteSource::DeferredDenseMerge,
+                joint ? MoEExternalCanonicalRouteSource::RootCanonicalRouteBank
+                      : MoEExternalCanonicalRouteSource::DeferredDenseMerge,
             .dense_output = static_cast<float *>(output_device),
             .validation_status =
                 static_cast<std::int32_t *>(validation_device),
@@ -920,6 +927,7 @@ namespace
             .physical_rows = rows,
             .top_k = top_k,
             .d_model = d_model,
+            .ownership = ownership,
         };
         const MoENodeLocalRoutePublishLaunch publish{
             .lane = resources.exchange->producerBinding(producer_device),
@@ -932,6 +940,7 @@ namespace
                 .capacity = route_slots,
             },
             .live_route_slots = route_slots,
+            .ownership = ownership,
         };
         ASSERT_TRUE(consume.valid());
         ASSERT_TRUE(publish.valid());
@@ -1290,6 +1299,85 @@ namespace
             EXPECT_FLOAT_EQ(actual[index], expected[index]) << "index=" << index;
     }
 
+    /** @brief Replay the original contributor's exact control-only acquire and acknowledgement. */
+    void runCanonicalContributorCompletionReplay(OriginalMappedComponentSource &original,
+        DeviceId device, const OriginalMappedComponentProgram &program)
+    {
+        SparseRouteExchangeResources resources(original, program, device, device);
+        static_assert(sizeof(MoEOverlayCanonicalRouteTicketControl) == 64u);
+        auto metadata = resources.arena(std::array{device},
+            std::array{MappedHostTransferArena::AllocationRequest{64,64}});
+        MoEOverlayCanonicalRouteReturnTicketStorage storage;
+        storage.bindForGraphConstruction(ForwardGraphSubmissionIntent::MaterializeExecutableWithoutLaunch,
+            5,program.rows,static_cast<int>(program.width),device,17,nullptr,metadata,
+            MoEOverlayCanonicalRouteTicketPayload::ContributorCompletion);
+        ASSERT_TRUE(storage.hasValidBoundIdentity());
+        EXPECT_TRUE(storage.metadataOnly());
+        EXPECT_EQ(storage.originalRouteSlotsHost(), nullptr);
+        EXPECT_EQ(storage.compactRouteSlotsHost(), nullptr);
+        EXPECT_EQ(storage.contributionRowsHost(), nullptr);
+        EXPECT_EQ(storage.contributionRowsDeviceAlias(), nullptr);
+        metadata->requireDeclarationConsumed();
+        resources.requireDeclarationConsumed();
+
+        auto kernel = kernelFor(device);
+        ASSERT_NE(kernel,nullptr);
+        const MoEOverlayCanonicalRouteTicketConsumeLaunch ticket{
+            .control=storage.controlDeviceAlias(),.route_capacity=program.rows,
+            .d_model=static_cast<int>(program.width),
+            .payload=MoEOverlayCanonicalRouteTicketPayload::ContributorCompletion};
+        ASSERT_TRUE(ticket.valid());
+        auto &worker = GPUDeviceContextPool::instance().getContext(device);
+        auto owner = resources.graph(device,resources.root_stream);
+        auto &graph = RetainedParticipantGraphExecutableFixtureAccess::capture(owner);
+        worker.submitAndWait([&] {
+            ScopedBackendGraphCapture recording(worker,graph,"original canonical contributor completion");
+            ASSERT_TRUE(recording.begin());
+            ASSERT_TRUE(kernel->consumeMoEOverlayCanonicalRouteTicket(
+                MoEKernelLaunchContext{.stream=resources.root_stream},ticket));
+            recording.finish();
+            ASSERT_TRUE(graph.prepareRuntimeContextStorage(original.memory()));
+            ASSERT_TRUE(graph.instantiate());
+        });
+        ASSERT_TRUE(graph.hasExecutable());
+
+        bool pending = false;
+        const auto drain = [&](void *) {
+            if (pending && (!storage.publishAbort() ||
+                !resources.root_backend->synchronizeStream(resources.root_stream,device.ordinal)))
+                std::terminate();
+        };
+        std::unique_ptr<void,decltype(drain)> guard(&storage,drain);
+        for (std::size_t replay=0; replay<program.epochs; ++replay)
+        {
+            const auto epoch = std::uint64_t{101} + replay;
+            ASSERT_TRUE(resources.submit(owner));
+            pending = true;
+            ASSERT_TRUE(resources.root_backend->recordEvent(resources.root_terminal,device.ordinal,resources.root_stream));
+            bool completed = true;
+            ASSERT_TRUE(resources.root_backend->queryEvent(resources.root_terminal,device.ordinal,&completed));
+            EXPECT_FALSE(completed);
+            if (replay == 1)
+            {
+                ASSERT_TRUE(storage.publishAbort());
+                EXPECT_FALSE(storage.publicationSucceededFor(epoch));
+            }
+            else
+            {
+                auto publication = storage.arm(epoch);
+                ASSERT_TRUE(publication);
+                EXPECT_FALSE(publication.publish(1));
+                ASSERT_TRUE(publication.publish(0));
+                EXPECT_TRUE(storage.publicationSucceededFor(epoch));
+                EXPECT_FALSE(storage.publicationSucceededFor(epoch+1));
+            }
+            ASSERT_TRUE(awaitEvent(resources.root_backend,resources.root_terminal,std::chrono::seconds(5),device.ordinal));
+            ASSERT_TRUE(RetainedParticipantGraphExecutableFixtureAccess::observeTerminal(owner));
+            pending = false;
+            EXPECT_FALSE(storage.payloadReady());
+        }
+    }
+
     /** @brief One actual original source covers the full existing ticket geometry/policy roster. */
     void originalCanonicalTicketReplay(DeviceType family) {
         originalRankLocalReplay(family,1,[&](const auto& devices) {
@@ -1297,14 +1385,22 @@ namespace
             for(const auto [slots,width]:std::array<std::pair<std::size_t,std::size_t>,10>{{
                 {8,3072},{512,3072},{4800,3072},{19,67},{128,3072},{19,67},{19,257},{19,513},{640,2560},{4480,2560}}})
                 programs.push_back({OriginalMappedComponentProgram::Kind::Ticket,slots,width,20,true});
+            programs.push_back({OriginalMappedComponentProgram::Kind::TicketCompletion,4480,2560,4,true});
             OriginalMappedComponentSource original(devices,programs);
-            for(std::size_t profile=0;profile<programs.size();++profile)
+            runCanonicalContributorCompletionReplay(original,devices[0],programs.back());
+            for(std::size_t profile=0;profile+1<programs.size();++profile)
                 runCanonicalRouteTicketReuseProof(original,devices[0],programs[profile].rows,programs[profile].width,
                     profile<4?TicketRoutePattern::Full:TicketRoutePattern::Varying);
         });
     }
     /** @brief Original sparse row/stride record; runtime ownership still comes from real discovery. */
-    struct OriginalSparseProfile {std::uint32_t rows=64,width=512,epochs=5;bool retained=false;std::uint32_t stride=0;};
+    struct OriginalSparseProfile
+    {
+        std::uint32_t rows = 64, width = 512, epochs = 5;
+        bool retained = false;
+        std::uint32_t stride = 0;
+        MoENodeLocalRouteOwnership ownership = MoENodeLocalRouteOwnership::ExclusiveParticipant;
+    };
     /** @brief Admit one real local pair once and preserve each original sparse numerical program. */
     void originalSparseReplay(DeviceType first,DeviceType second,std::vector<OriginalSparseProfile> profiles) {
         const std::vector<NativeReplayFamily> families=first==second?std::vector<NativeReplayFamily>{{first,2}}:
@@ -1315,7 +1411,7 @@ namespace
                 profile.rows,profile.width,profile.epochs,profile.retained});
             OriginalMappedComponentSource original(devices,programs);
             for(const auto& profile:profiles)runSparseCanonicalRouteExchange(original,devices[0],devices[1],
-                profile.rows,profile.width,profile.epochs,profile.retained,profile.stride);
+                profile.rows,profile.width,profile.epochs,profile.retained,profile.stride,profile.ownership);
         });
     }
     /** @brief Dense publication stays rank-local on its two observed native owners. */
@@ -1419,6 +1515,18 @@ TEST(Test__MappedActivationPacketCUDAAndROCm,
      ROCmSparseCanonicalRoutesRetainVerifierBytesAcrossTwentyEpochs)
 {
     originalSparseReplay(DeviceType::ROCm,DeviceType::ROCm,{{16,3072,20,true,17},{16,3073,20,true,17}});
+}
+
+/** @brief Replay disjoint external rows and ordered local fragments over twenty retained epochs. */
+TEST(Test__MappedActivationPacketCUDAAndROCm, CUDACanonicalContinuationCohortRoutes)
+{
+    originalSparseReplay(DeviceType::CUDA,DeviceType::CUDA,{{4,257,20,true,0,MoENodeLocalRouteOwnership::ContinuationCohort}});
+}
+
+/** @brief Verify the same capture and root-only fold on HIP. */
+TEST(Test__MappedActivationPacketCUDAAndROCm, ROCmCanonicalContinuationCohortRoutes)
+{
+    originalSparseReplay(DeviceType::ROCm,DeviceType::ROCm,{{4,257,20,true,0,MoENodeLocalRouteOwnership::ContinuationCohort}});
 }
 
 TEST(Test__MappedActivationPacketCUDAAndROCm,

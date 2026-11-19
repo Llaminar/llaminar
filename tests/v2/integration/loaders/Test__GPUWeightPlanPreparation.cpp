@@ -10,9 +10,12 @@
 #include "backends/BackendManager.h"
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "loaders/GPUVramPreflight.h"
+#include "loaders/PreparedWeightRepresentationContract.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/WeightManager.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "tensors/TensorKernels.h"
+#include "utils/DebugEnv.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <optional>
@@ -23,7 +26,7 @@ using namespace llaminar2::test;
 namespace {
 /**
  * @brief Admit the fixture's actual final GPU matrices and maximum shared upload workspace.
- * @param loader Original in-memory FP32 fixture source.
+ * @param loader Original in-memory source for each final floating matrix.
  * @param plan Complete original binding inventory for this one native participant.
  * @param device Actual selected backend and ordinal, never an automatic substitute.
  * @return One authority consumed by Manager and its retained Store.
@@ -34,11 +37,17 @@ std::shared_ptr<PhysicalMemoryAuthority> sourceMemory(MockModelLoader &loader, c
     size_t maximum_source = 0;
     for (const auto &requirement : plan.requirements()) {
         const auto source = loader.loadTensor(requirement.canonical_name);
-        if (!source || source->native_type() != TensorType::FP32)
-            throw std::invalid_argument("GPU source fixture requires its declared original FP32 matrix");
+        if (!source)
+            throw std::invalid_argument("GPU source fixture requires its declared original matrix");
+        const auto representation = PreparedWeightRepresentationContract::resolve(
+            inferWeightRole(requirement.canonical_name), source->native_type(), requirement.canonical_name,
+            loader.architecture(), debugEnv().gemm.gdn_projection_arithmetic);
+        auto scalar = source->native_type();
+        if (representation == ModelPreparedWeightRepresentation::FP32) scalar = TensorType::FP32;
+        if (representation == ModelPreparedWeightRepresentation::FP16) scalar = TensorType::FP16;
         final_bytes += resolveExpertPreparedProjectionMemoryGeometry(source->rows(), source->cols(),
-            ExpertWeightFormat::floating(source->native_type())).gpu_live_bytes;
-        maximum_source = std::max(maximum_source, source->size_bytes());
+            ExpertWeightFormat::floating(scalar)).gpu_live_bytes;
+        maximum_source = std::max(maximum_source, source->numel() * (scalar == TensorType::FP32 ? 4u : 2u));
     }
     const auto staging = resolveGPUWeightLoadMemoryGeometry(maximum_source, configuredGPUWeightLoadMemoryPolicy());
     const PhysicalMemoryResource host{.world_rank=0,.device=DeviceId::cpu(),
@@ -165,6 +174,52 @@ TEST_P(GPUWeightPlanPreparation, GdnAlphaBetaProjectionBindingsArePreparedByStru
     ASSERT_TRUE(beta_prepared.has_value());
     EXPECT_EQ(alpha_prepared->binding_id, alpha_binding.binding_id);
     EXPECT_EQ(beta_prepared->binding_id, beta_binding.binding_id);
+}
+
+/** @test GPU packing preserves the source-selected precision of each frozen GDN control. */
+TEST_P(GPUWeightPlanPreparation, MixedMoEGDNControlsKeepOriginalOperandPolicyAfterPacking)
+{
+    const auto device = GetParam();
+    auto loader = MockModelLoaderBuilder().setArchitecture("qwen35moe")
+        .addQ8_0RandomTensor("blk.0.ssm_alpha.weight", {4, 256})
+        .addFP32RandomTensor("blk.0.ssm_beta.weight", {4, 256}).build();
+    WeightManager manager(*loader);
+    manager.setWeightShardingConfig(WeightShardingConfig{});
+    auto store = std::make_shared<PreparedWeightStore>(ModelContextId{911});
+    manager.setPreparedWeightStore(store);
+    InferenceStrategy strategy;
+    strategy.mode = WeightInferenceMode::SingleDevice;
+    strategy.model_id = store->modelId();
+    strategy.devices = {device};
+    WeightPlan plan(strategy);
+    for (const auto name : {"blk.0.ssm_alpha.weight", "blk.0.ssm_beta.weight"})
+    {
+        WeightRequirement requirement;
+        requirement.canonical_name = name;
+        requirement.layer = 0;
+        requirement.target_device = device;
+        requirement.lookup_device = device;
+        requirement.host_policy = WeightHostPolicy::RequiredUntilGraphMaterialized;
+        plan.add(requirement);
+    }
+    manager.installPhysicalMemoryAuthority(sourceMemory(*loader, plan, device));
+    const auto frozen = manager.materialize(plan);
+    ASSERT_TRUE(manager.prepareWeightsForDevice(frozen, device, false));
+    for (const auto suffix : {std::string_view{"ssm_alpha.weight"}, std::string_view{"ssm_beta.weight"}})
+    {
+        const bool quantized_original = suffix == "ssm_alpha.weight";
+        const auto operand = quantized_original ? FloatingActivationOperandPrecision::Native
+                                                : FloatingActivationOperandPrecision::FP16RNE;
+        const auto &binding = frozen.layer(0, std::string(suffix));
+        ASSERT_NE(binding.tensor, nullptr);
+        EXPECT_EQ(binding.tensor->native_type(), quantized_original ? TensorType::FP32 : TensorType::FP16);
+        EXPECT_EQ(binding.floating_operand_precision, operand);
+        const auto prepared = store->preparedRefForBinding(binding.binding_id, device);
+        ASSERT_TRUE(prepared);
+        const auto engine = store->gemmKernelLifetime(*prepared);
+        ASSERT_TRUE(engine);
+        EXPECT_EQ(engine->floatingActivationOperandPrecision(), operand);
+    }
 }
 
 #ifdef HAVE_CUDA

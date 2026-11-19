@@ -4,12 +4,12 @@ Status dashboard for 15 physical decoder specialisations. Limit 15,000 UTF-8 byt
 
 ## Shipping RCCL, four MI50s, automatic planning
 
-On code2048 with dynamic MTP, the new stationary TensorSharded layout measured
-**921.72 prefill / 79.91 decode tok/s**. GateUpOwnedDownColumns measured
-**939.02 / 64.48** on the same Release and shipped RCCL. The new layout gained
-23.92% decode and cost 1.84% prefill. Each arm repeated its own history twice.
-The arms first differed at output token 44 and performed 71 versus 65 verifier
-rounds. [Matched settings and results](QFN_MI50_STAGE_COMPARISON_20261118.md#shipping-rccl-and-automatic-planning)
+On code2048 the automatic serving defaults measured **918.20 prefill / 79.84
+decode tok/s**. Dynamic MTP and residency used one fully resident tensor-sharded
+tier. Both generations matched the maintenance-off control (**920.03 / 80.37**)
+in tokens and verifier work, with zero expert transfers. The earlier
+GateUpOwnedDownColumns control measured **939.02 / 64.48**.
+[Settings and results](QFN_MI50_STAGE_COMPARISON_20261118.md#serving-defaults-with-dynamic-residency-enabled)
 
 ## Earlier measurements on the original four-MI50 split
 

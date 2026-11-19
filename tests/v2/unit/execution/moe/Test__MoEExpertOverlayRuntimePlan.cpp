@@ -1702,6 +1702,44 @@ namespace llaminar2::test
 } // namespace llaminar2::test
 
 namespace llaminar2::test {
+/** @test A sharded GPU/CPU overlay quotes and restores the root's compact route join for every phase. */
+TEST(Test__MoEExpertOverlayRuntimePlan, MixedTensorCohortsBindCompactRoutesWithPeerAccess)
+{
+    using Transport = MoEOverlayNodeLocalRouteTransport;
+    for (const int members : {2, 3, 5})
+    {
+        SCOPED_TRACE(members);
+        auto inventory = syntheticTwoSocketInventory(/*cuda_rank=*/1, /*rocm_rank=*/0);
+        auto plan = layoutAPlan();
+        plan->continuation_domain_spec.setDensePolicy(DenseParallelPolicy::TensorParallel);
+        auto& rank = inventory.ranks.front();
+        plan->domains.front().participants.clear();
+        for (int member = 0; member < members; ++member)
+        {
+            if (member > 0)
+                rank.gpus.push_back(syntheticGpu(DeviceType::ROCm, member, rank.cpu.numa_node));
+            plan->domains.front().participants.push_back(GlobalDeviceAddress::rocm(member));
+        }
+        rank.p2p_rocm_count = members;
+        rank.p2p_rocm.assign(members * members, true);
+        inventory.buildNodeAggregations();
+        const auto bound = bindMoEExpertOverlayPlanToClusterInventory(*plan, inventory);
+        ASSERT_TRUE(bound->observed_route_transport);
+        EXPECT_EQ(bound->observed_route_transport->ordinary_prefill, Transport::MappedSparse);
+        EXPECT_EQ(bound->observed_route_transport->decode, Transport::MappedSparse);
+        EXPECT_TRUE(bound->observed_route_transport->requiresMappedExchange());
+        EXPECT_FALSE(bound->observed_route_diagnostic);
+        const auto rebound = bindMoEExpertOverlayPlanToClusterInventory(*bound, inventory);
+        EXPECT_EQ(rebound->observed_route_transport, bound->observed_route_transport);
+        EXPECT_THROW((bindMoEExpertOverlayPlanToClusterInventory(*plan, inventory,
+            Transport::NativeCollective)), std::invalid_argument);
+        plan->domains.front().routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+        const auto disjoint = bindMoEExpertOverlayPlanToClusterInventory(*plan, inventory);
+        ASSERT_TRUE(disjoint->observed_route_transport);
+        EXPECT_EQ(disjoint->observed_route_transport->decode, Transport::NativeCollective);
+    }
+}
+
 /** @test Apply retains saved typed intent but derives its policy again from the original peer publication. */
 TEST(Test__MoEExpertOverlayRuntimePlan, RestoredObservedRouteBindingAuthenticatesOriginalHardwareAndDiagnostic) {
     auto inventory=syntheticSingleRankTwoCudaInventory();

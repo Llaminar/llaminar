@@ -21,6 +21,7 @@
  */
 
 #include "../../utils/ScopedGDNProjectionArithmetic.h"
+#include "../../utils/PlanningGGUFFixture.h"
 #include <gtest/gtest.h>
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "models/qwen/LayerGraphIdentity.h"
@@ -2623,5 +2624,49 @@ TEST(Test__WorkspaceMemoryEstimator, FrozenPlanningPolicyDoesNotFollowLaterGloba
         EXPECT_GT(selected,native);
         frozen.planning_policy=WorkspacePlanningPolicy::current();
         EXPECT_EQ(WorkspaceMemoryEstimator::estimate(profile,frozen),selected);
+    }
+}
+
+/** @test Loader and PMA agree on the declared shared width, and workspaces use each source axis. */
+TEST(Test__WorkspaceMemoryEstimator, NativeSharedExpertWorkspaceUsesOriginalFFNAxis)
+{
+    using Fixture = llaminar2::test::PlanningGGUFFixture;
+    using Format = GGUFTensorType;
+    const Fixture file(true, true, Format::Q8_0, 512, std::nullopt, 8,
+        Fixture::Geometry::FullAttentionGraph, 2, 8, Format::Q8_0, std::nullopt,
+        Fixture::MoEDimensions{.hidden_columns = 2048, .shared_columns = 512,
+            .top_k = 2, .shared_ffn_metadata_only = true}, std::nullopt, Format::Q6_K);
+    ModelLoader loader;
+    loader.setUseMmap(false);
+    ASSERT_TRUE(loader.loadModel(file.path()));
+    EXPECT_FALSE(loader.getModel().metadata.contains("qwen35moe.feed_forward_length"));
+    const auto original = ModelMemoryProfile::fromLoader(loader);
+    EXPECT_EQ(original.d_ff, 512);
+    EXPECT_EQ(original.d_ff, loader.feedForwardLength());
+    ASSERT_EQ(original.mtp_layer_count, 1);
+
+    auto foreign_generic_width = original;
+    foreign_generic_width.d_ff = 1;
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        SCOPED_TRACE(deviceTypeToString(backend));
+        auto geometry = graphGeometry(DeviceId(backend, 1), 256, 2);
+        geometry.shard_index = 1;
+        geometry.runtime_device_policy_available = true;
+        geometry.last_layer = original.mainLayerCount() - 1;
+        geometry.has_exact_tensor_parallel_assignment = true;
+        geometry.local_query_head_start = 4;
+        geometry.local_query_heads = 4;
+        geometry.local_kv_head_start = 1;
+        geometry.local_kv_heads = 1;
+        geometry.local_d_ff_start = 256;
+        geometry.native_shared_ffn_width = loader.feedForwardLength();
+        geometry.local_vocab_start = 160;
+        geometry.local_vocab = 160;
+        const auto admitted = WorkspaceMemoryEstimator::estimate(original, geometry);
+        EXPECT_GT(admitted, 0u);
+        EXPECT_EQ(WorkspaceMemoryEstimator::estimate(foreign_generic_width, geometry), admitted);
+        geometry.local_d_ff_start = 257;
+        EXPECT_THROW((void)WorkspaceMemoryEstimator::estimate(original, geometry), std::runtime_error);
     }
 }

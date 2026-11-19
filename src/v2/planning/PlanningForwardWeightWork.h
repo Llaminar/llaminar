@@ -14,6 +14,7 @@
 #include "execution/moe/MoEExpertProjectionOwnership.h"
 #include <array>
 #include <cstddef>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -24,6 +25,7 @@ namespace llaminar2
 {
     class AdmittedOrchestrationCandidate;
     class PlanningModelMetadata;
+    class MoEExpertShardCohort;
 
     /** @brief Main-model invocation; retained sidecar capacity is not another phase. */
     enum class PlanningMainForwardPhase { Prefill, Decode };
@@ -134,6 +136,14 @@ namespace llaminar2
         int experts_, assignment_participants_;
     };
 
+    /** @brief A physical participant in an original logical expert shard cohort. */
+    struct PlanningRoutedShardWork
+    {
+        int tier_index; ///< Original logical tier coordinate.
+        std::shared_ptr<const MoEExpertShardCohort> cohort; ///< Capacity-bound source and ordered membership.
+        std::size_t member; ///< Original coordinate within that cohort.
+    };
+
     /**
      * @brief Source FFN geometry and projection-specific work at a routed layer.
      *
@@ -148,6 +158,7 @@ namespace llaminar2
         int routes_per_token;
         std::array<PlanningWeightOperand, 3> gate_up_down;
         std::vector<PlanningExpertExecutionShare> execution_shares; ///< Distinct logical tier bindings on this endpoint.
+        std::optional<PlanningRoutedShardWork> shard_work; ///< Present for an original jointly owned tensor shard.
         std::optional<MoEExpertProjectionOwnership> projection_ownership; ///< Borrowed-by-value admitted layout; absent for whole FFNs.
 
         /** @return Sum of owner-local populations; fixed down slices are priced separately. */

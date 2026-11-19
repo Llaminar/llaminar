@@ -15,6 +15,8 @@
 #include "PlanningForwardStateWork.h"
 #include "PlanningImmutableLookupWork.h"
 #include "execution/moe/MoEOverlayActivationPacketABI.h"
+#include "execution/moe/CanonicalMoERouteRecord.h"
+#include "execution/moe/MoEExpertShardCohort.h"
 #include "execution/moe/MoEOverlayCapacityAdmission.h"
 #include "execution/moe/MoEGroupedIntermediateExchangeABI.h"
 #include "collective/DeviceCountedAllGather.h"
@@ -557,27 +559,85 @@ namespace llaminar2
             }
             result.compute += planningIndependentSeconds(ordinary) + planningIndependentSeconds(experts);
             result.communication += reduction(tp); // Attention row-parallel join.
-            const auto isStaticFragment = [&](size_t index) {
-                const auto *expert = local[index].routed[layer];
-                return expert && expert->projection_ownership &&
-                    !expert->projection_ownership->hasMovableProjectionSet();
-            };
-            const bool static_fragments = std::any_of(continuation.begin(), continuation.end(), isStaticFragment);
-            if (static_fragments)
+            // Recover each original cohort in the reduction order admitted for
+            // this layer. A tier's logical quota is repeated across its physical
+            // fragments, but its final reduction belongs to the whole cohort.
+            std::map<int, std::vector<size_t>> shard_groups;
+            for (size_t index = 0; index < local.size(); ++index)
             {
-                if (!std::all_of(continuation.begin(), continuation.end(), isStaticFragment))
-                    throw std::logic_error("Static tensor-shard FFN sum requires every original continuation member");
-                // Routed and shared partials are combined locally, then the
-                // original cohort sums live FP32 rows once. Decode replicas
-                // may remove the attention TP join but never this FFN join.
-                result.communication += reduction(continuation);
-                result.qualifications.insert("static tensor-shard FFN uses one live FP32 sum across the original cohort; native reduction service proxy");
+                const auto *expert = local[index].routed[layer];
+                if (!expert || !expert->shard_work) continue;
+                const auto &shard = *expert->shard_work;
+                auto [group, inserted] = shard_groups.try_emplace(shard.tier_index,
+                    shard.cohort->participants().size(), local.size());
+                if ((!inserted && group->second.size() != shard.cohort->participants().size()) ||
+                    group->second.at(shard.member) != local.size())
+                    throw std::logic_error("Tensor-shard cost received a duplicate or foreign cohort member");
+                group->second[shard.member] = index;
             }
-            else
+            bool continuation_shards = false;
+            for (const auto &[tier, group] : shard_groups)
+            {
+                if (std::find(group.begin(), group.end(), local.size()) != group.end())
+                    throw std::logic_error("Tensor-shard cost requires its complete original cohort");
+                const auto &first = *local[group.front()].routed[layer];
+                const auto &cohort = first.shard_work->cohort;
+                for (const auto member : group)
+                {
+                    const auto &shard = *local[member].routed[layer]->shard_work;
+                    if (shard.cohort != cohort)
+                        throw std::logic_error("Tensor-shard work has conflicting original cohort bindings");
+                }
+                if (devices[group.front()].execution_role == DeviceExecutionMemoryRole::ContinuationGraph)
+                {
+                    if (continuation_shards || group.size() != continuation.size() ||
+                        !std::is_permutation(group.begin(), group.end(), continuation.begin()))
+                        throw std::logic_error("Tensor-shard FFN requires every original continuation member");
+                    const bool has_external_tier = std::any_of(local.begin(), local.end(), [&](const auto &endpoint) {
+                        const auto *expert = endpoint.routed[layer];
+                        return expert && (!expert->shard_work || expert->shard_work->tier_index != tier);
+                    });
+                    if (has_external_tier)
+                    {
+                        if (!overlay_root || std::find(group.begin(), group.end(), *overlay_root) == group.end())
+                            throw std::logic_error("Mixed tensor-shard FFN has no admitted continuation root");
+                        const auto routes = std::ceil(first.uniformExpectation(rows).routed_rows);
+                        const auto shard_bytes = payload(routes * profile.d_model * sizeof(float));
+                        for (const auto member : group)
+                            if (member != *overlay_root)
+                                result.communication += exchange(member, *overlay_root, shard_bytes, payload(0), true);
+                        // Shared/dense publication still uses its native service;
+                        // the only route exchange is the selected shard slots.
+                        result.communication += reduction(group);
+                        result.qualifications.insert("mixed tensor-shard FFN gathers live mapped cohort route slots at the continuation root");
+                    }
+                    else
+                    {
+                        result.communication += reduction(group);
+                        result.qualifications.insert("tensor-shard FFN uses one live FP32 sum across the original cohort; native reduction service proxy");
+                    }
+                    continuation_shards = true;
+                }
+                else if (work[group.front()].device.is_cpu())
+                {
+                    // CPU members emit a live, unweighted route record per
+                    // local contribution. Only member zero returns canonical
+                    // weighted rows to the continuation after the rooted gather.
+                    const auto records = std::ceil(first.uniformExpectation(rows).routed_rows);
+                    const auto bytes = payload(records *
+                        canonical_moe_route_record::recordWidth(profile.d_model) * sizeof(float));
+                    for (size_t member = 1; member < group.size(); ++member)
+                        result.communication += exchange(group[member], group.front(), bytes, payload(0), false);
+                    result.qualifications.insert("CPU tensor-shard cohort uses one rooted live-record gather; original directed host service proxy");
+                }
+                else throw std::logic_error("Tensor-sharded GPU experts require their original continuation cohort");
+            }
+            if (!continuation_shards)
             {
                 result.communication += reduction(tp); // Ordinary FFN/shared join.
                 const bool projection = std::any_of(continuation.begin(), continuation.end(), [&](size_t index) {
-                    return local[index].routed[layer] && local[index].routed[layer]->projection_ownership;
+                    return local[index].routed[layer] && local[index].routed[layer]->projection_ownership &&
+                        local[index].routed[layer]->projection_ownership->hasMovableProjectionSet();
                 });
                 if (projection) result.communication += projectionCommunication(continuation, layer);
             }
@@ -596,8 +656,9 @@ namespace llaminar2
                 const auto entries = static_cast<uint64_t>(std::ceil(expected.routed_rows));
                 const auto unique_rows = std::min<uint64_t>(rows, entries);
                 const auto dispatch = moeOverlayDispatchPayloadBytes(unique_rows, entries, profile.d_model);
-                const auto reply = moeOverlayReturnPayloadBytes(entries, profile.d_model);
-                if (entries && (!dispatch || !reply))
+                const auto return_entries = expert->shard_work && expert->shard_work->member != 0 ? 0 : entries;
+                const auto reply = moeOverlayReturnPayloadBytes(return_entries, profile.d_model);
+                if (entries && (!dispatch || (return_entries && !reply)))
                     throw std::overflow_error("Planning overlay traffic does not fit the production packet ABI");
                 result.communication += exchange(*overlay_root, index, payload(dispatch), payload(reply), true);
             }

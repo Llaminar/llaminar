@@ -38,6 +38,24 @@ namespace llaminar2
     namespace test { class NodeLocalRouteExchangeReplayAccess; }
     class MappedHostTransferRegion;
 
+    /**
+     * @brief Select the external-route contract for one continuation graph.
+     * @param ownership Original route assignment ownership shared by all participants.
+     * @param mapped_return Whether this graph materializes mapped external returns.
+     * @param canonical_ticket Whether this graph consumes rank-local canonical tickets.
+     * @return The canonical root bank for the entire mixed cohort, including passive peers.
+     * A peer has no CPU ingress node but must keep the same contract as the consuming root.
+     */
+    [[nodiscard]] constexpr MoEExternalCanonicalRouteSource
+    continuationExternalCanonicalRouteSource(
+        MoENodeLocalRouteOwnership ownership, bool mapped_return, bool canonical_ticket) noexcept
+    {
+        return ownership == MoENodeLocalRouteOwnership::ContinuationCohort ||
+                       mapped_return || canonical_ticket
+                   ? MoEExternalCanonicalRouteSource::RootCanonicalRouteBank
+                   : MoEExternalCanonicalRouteSource::DeferredDenseMerge;
+    }
+
     /** Logical participant and exact process-local accelerator endpoint. */
     struct MoENodeLocalRouteEndpoint
     {

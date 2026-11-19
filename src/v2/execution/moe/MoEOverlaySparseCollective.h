@@ -426,6 +426,7 @@ namespace llaminar2
          * @param workspace_generation Positive captured workspace identity.
          * @param contribution_region Existing admitted serial contribution bank.
          * @param metadata_arena Exact GPU metadata arena, unused for WorkspaceDeclaration.
+         * @param payload Original reduction root rows or a contributor completion with no matrix.
          * @throws std::invalid_argument For unknown purpose or invalid original geometry.
          * @throws std::logic_error For a second declaration/binding.
          */
@@ -433,7 +434,11 @@ namespace llaminar2
             int layer_idx, size_t route_capacity, int d_model,
             DeviceId continuation_device, uint64_t workspace_generation,
             std::shared_ptr<MappedHostTransferRegion> contribution_region,
-            std::shared_ptr<MappedHostTransferArena> metadata_arena);
+            std::shared_ptr<MappedHostTransferArena> metadata_arena,
+            MoEOverlayCanonicalRouteTicketPayload payload = MoEOverlayCanonicalRouteTicketPayload::CanonicalRows);
+        /** @return Whether this contributor publishes only completion metadata. */
+        [[nodiscard]] bool metadataOnly() const noexcept
+        { return payload_ == MoEOverlayCanonicalRouteTicketPayload::ContributorCompletion; }
         /** @return A bound identity or an explicitly typed non-executable declaration. */
         [[nodiscard]] bool hasValidConstructionIdentity() const noexcept;
         /** @return Whether this original construction purpose forbids execution. */
@@ -567,6 +572,7 @@ namespace llaminar2
 
         std::shared_ptr<MappedHostTransferRegion> metadata_region_;
         std::shared_ptr<MappedHostTransferRegion> contribution_region_;
+        MoEOverlayCanonicalRouteTicketPayload payload_ = MoEOverlayCanonicalRouteTicketPayload::CanonicalRows;
         MoEOverlayCanonicalRouteTicketControl *control_host_ = nullptr;
         int32_t *original_route_slots_host_ = nullptr;
         int32_t *compact_route_slots_host_ = nullptr;

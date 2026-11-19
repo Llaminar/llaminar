@@ -15,4 +15,20 @@ if(TARGET v2_unit_moe_overlay_capacity_resolver)
     if(TEST V2_Integration_CPUJointSerialGeometryContract)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointSerialGeometryContract)
     endif()
+    add_v2_test(V2_Integration_CPUJointColocatedReturnAuthority
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_capacity_resolver>
+            --gtest_filter=CPUJointSerialGeometry.ColocatedJointReturnKeepsOriginalRootAcrossRankOrders
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Transport;MemoryBOM;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    if(TEST V2_Integration_CPUJointColocatedReturnAuthority)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointColocatedReturnAuthority)
+    endif()
+    add_v2_test(V2_Integration_MixedContinuationCanonicalRouteBank
+        COMMAND $<TARGET_FILE:v2_unit_moe_overlay_capacity_resolver>
+            --gtest_filter=MixedContinuationRoutes.SameCanonicalBankOnRootAndPeerWithDifferentTicketIngress
+        LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Transport;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    if(TEST V2_Integration_MixedContinuationCanonicalRouteBank)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MixedContinuationCanonicalRouteBank)
+    endif()
 endif()

@@ -92,7 +92,7 @@ namespace llaminar2
                 (classification!=PreparedGemmClassification::RequiresSchema || !schema.isNonGemmWeight(semantic.name)));
             const auto execution=PreparedWeightRepresentationContract::resolve(role,*type,tensor.name,profile.architecture,
                 debugEnv().gemm.gdn_projection_arithmetic,debugEnv().gemm.moe_router_arithmetic);
-            const auto operand=PreparedWeightRepresentationContract::operandPrecision(role,tensor.name,profile.architecture,
+            const auto operand=PreparedWeightRepresentationContract::operandPrecision(role,*type,tensor.name,profile.architecture,
                 debugEnv().gemm.gdn_projection_arithmetic,debugEnv().gemm.moe_router_arithmetic);
             const auto destination=PreparedWeightRepresentationContract::resolveCPUWeightPrecision(role,*type,precision,execution,operand);
             const auto quote=quoteCPUWeightPreparation(*type,rows,columns,destination,

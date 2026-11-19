@@ -1118,7 +1118,10 @@ namespace llaminar2
                         throw std::invalid_argument("CPU joint producer changed its deferred canonical ticket identity");
                     // This is only the immutable scheduling/region borrow. The
                     // explicit rooted collective owns the mutable publication.
-                    (void)params_.serial_compact_buffer_arena->mappedCPUCanonicalRoutes(ticket.continuationDevice());
+                    if (ticket.metadataOnly() == params_.serial_compact_buffer_arena->cpuJointLayout()->isRoot())
+                        throw std::invalid_argument("CPU joint producer changed its original root or contributor return role");
+                    if (!ticket.metadataOnly())
+                        (void)params_.serial_compact_buffer_arena->mappedCPUCanonicalRoutes(ticket.continuationDevice());
                 }
             } else if(params_.cpu_joint_layer) {
                 throw std::invalid_argument("CPU joint fragment cannot publish an ordinary weighted/whole-expert return");

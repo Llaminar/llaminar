@@ -26,6 +26,13 @@ namespace llaminar2
     class NativeContextPreparation;
     class IMPIContext;
 
+    /** @brief Exact source-free evidence for a single compact rank of the candidate. */
+    struct MoEPipelinePlanningRankBudget
+    {
+        RetainedHostServiceBudgetProjection host = RetainedHostServiceBudgetProjection::installed({});
+        std::vector<PlanningNativeContextDeclaration> native_contexts;
+    };
+
     /** @brief Frozen setup policy shared by discovery and live runner admission. */
     struct MoEPipelineMemoryPolicy
     {
@@ -46,6 +53,8 @@ namespace llaminar2
         bool require_native_context_budgets=false;
         /** @brief Per-search original source declarations only; never shares physical admission or quotas. */
         PlanningAdmissionPreparation *source_preparation=nullptr;
+        /** @brief Compact-rank ordered budgets for source-free evaluation of the complete candidate. */
+        std::vector<MoEPipelinePlanningRankBudget> candidate_rank_budgets;
     };
 
     /**
@@ -126,7 +135,9 @@ namespace llaminar2
          * @throws std::logic_error Before mutation if publication would omit/replace an existing native source.
          */
         void publishRuntimeCapacity(RuntimeConfig &runtime) const;
-        /** @return Immutable ordered stages; no borrowed setup references survive. */
+        /** @return Complete original rank plan projections for automatic evaluation, when requested. */
+        const std::vector<RankExecutionPlan> &candidateRankPlans() const noexcept { return candidate_ranks_; }
+        /** @return Immutable ordered stages; source-free candidate results include every original rank. */
         const std::vector<AdmittedMoEPipelineStage> &stages() const noexcept { return stages_; }
         /** @return Sole aggregate admission behind every stage's quota evidence. */
         const std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> &physicalAdmission() const noexcept
@@ -138,6 +149,7 @@ namespace llaminar2
         RankExecutionPlan rank_plan_;
         std::optional<GlobalPPTopology> global_pipeline_;
         std::vector<AdmittedMoEPipelineStage> stages_;
+        std::vector<RankExecutionPlan> candidate_ranks_;
         std::shared_ptr<const PhysicalMemoryPlanAdmissionCertificate> admission_;
     };
 }

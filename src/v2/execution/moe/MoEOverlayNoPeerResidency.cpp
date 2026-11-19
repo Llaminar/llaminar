@@ -82,4 +82,84 @@ namespace llaminar2
             model.first_model_layer, model.num_layers, model.num_experts,
             model.main_inference_layer_count, plan.authority_execution);
     }
+    std::optional<MoEOverlayStationaryTensorShardResidency>
+    MoEOverlayStationaryTensorShardResidency::seal(
+        const MoERoutedExpertPlacementPlan &plan, const MoEExpertOwnerMap &owners,
+        const MoERoutedExpertModelMetadata &model)
+    {
+        if (!hasStationaryTensorShardTopology(plan)) return std::nullopt;
+        owners.requireLayerGeometry(model.num_layers, model.num_experts, model.first_model_layer);
+        const auto domain = std::find_if(plan.domains.begin(), plan.domains.end(),
+            [&](const auto &candidate) { return candidate.name == plan.continuation_domain; });
+        if (plan.first_model_layer != model.first_model_layer ||
+            plan.placements.size() != static_cast<std::size_t>(model.num_layers) ||
+            owners.participants().size() != domain->participants.size() ||
+            plan.authority_execution != resolveMoEOverlayAuthorityExecutionKind(plan))
+            throw std::invalid_argument("Stationary tensor-sharded residency requires the complete original source scope");
+        std::vector<bool> layers(static_cast<size_t>(model.num_layers));
+        for (const auto &placement : plan.placements)
+        {
+            const auto offset = static_cast<long long>(placement.layer) - model.first_model_layer;
+            if (offset < 0 || offset >= model.num_layers || layers[static_cast<size_t>(offset)] ||
+                placement.routed_expert_tier.size() != static_cast<size_t>(model.num_experts) ||
+                !std::all_of(placement.routed_expert_tier.begin(), placement.routed_expert_tier.end(),
+                    [](int tier) { return tier == 0; }))
+                throw std::invalid_argument("Stationary tensor-sharded residency cannot omit or move any logical expert");
+            layers[static_cast<size_t>(offset)] = true;
+        }
+        for (const auto &owner : owners.owners())
+        {
+            if (!owner.resident || owner.tier_idx != 0 || owner.domain_name != domain->name ||
+                !owner.shard_cohort || owner.owner_participant != -1 || owner.device.is_valid() ||
+                owner.shard_cohort->source().layer_idx != owner.layer_idx ||
+                owner.shard_cohort->participants().size() != domain->participants.size())
+                throw std::invalid_argument("Stationary tensor-sharded residency requires every original expert cohort");
+            const auto &cohort = *owner.shard_cohort;
+            for (size_t index = 0; index < cohort.participants().size(); ++index)
+            {
+                const auto &member = cohort.participants()[index];
+                const auto *participant = owners.participantForId(member.participant_id);
+                const auto &geometry = cohort.ownership(index).geometry();
+                if (!participant || participant->tier_idx != 0 ||
+                    participant->domain_participant_index != static_cast<int>(index) ||
+                    participant->domain_name != domain->name ||
+                    !participant->world_rank_known || participant->world_rank != domain->owner_rank ||
+                    member.world_rank != domain->owner_rank ||
+                    participant->address != member.address || member.address != domain->participants[index] ||
+                    geometry.experts != model.num_experts || geometry.model_columns != model.d_model ||
+                    geometry.intermediate_columns != model.routed_intermediate_size)
+                    throw std::invalid_argument("Stationary tensor-sharded residency changed original rank, source or member order");
+            }
+        }
+        const auto root = plan.continuation_domain_spec.logical_root_participant;
+        if (root < 0 || static_cast<std::size_t>(root) >= domain->participants.size())
+            throw std::invalid_argument("Stationary tensor-shard evidence lost its logical continuation root");
+        const auto root_device = domain->participants[static_cast<std::size_t>(root)].toLocalDeviceId();
+        std::vector<DeviceId> participants;
+        participants.reserve(domain->participants.size());
+        for (const auto &address : domain->participants)
+            participants.push_back(address.toLocalDeviceId());
+        return MoEOverlayStationaryTensorShardResidency(std::move(participants), root_device,
+            plan.authority_execution == MoEOverlayAuthorityExecutionKind::DeviceResident
+                ? MoEOptimizationAuthority::Device : MoEOptimizationAuthority::Host);
+    }
+
+    MoEOverlayStationaryTensorShardResidency::MoEOverlayStationaryTensorShardResidency(
+        std::vector<DeviceId> participants, DeviceId root, MoEOptimizationAuthority authority)
+        : participants_(std::move(participants)), root_(root), authority_(authority)
+    {
+    }
+
+    MoEOptimizationStatus MoEOverlayStationaryTensorShardResidency::statusFor(DeviceId device) const
+    {
+        if (std::find(participants_.begin(), participants_.end(), device) == participants_.end())
+            throw std::invalid_argument("Stationary tensor-shard evidence requested by a foreign device");
+        if (device != root_)
+            return {};
+        return {.authority = authority_,
+            .state = MoEOptimizationLifecycleState::MovementDisabled,
+            .activity = MoEOptimizationActivityState::Dormant,
+            .diagnostic = "Single fully resident tensor-sharded cohort has no alternate routed target"};
+    }
+
 }

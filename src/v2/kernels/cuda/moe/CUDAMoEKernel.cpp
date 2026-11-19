@@ -11551,7 +11551,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         const bool use_runtime_descriptors = moEDecodeUsesRuntimeDescriptors(descriptor_source);
 
         if (!input || gateup_table_id < 0 || down_table_id < 0 ||
-            top_k <= 0 || !output || d_model <= 0 || intermediate <= 0)
+            top_k <= 0 || (!output && !canonical_route_contributions) || d_model <= 0 || intermediate <= 0)
             return false;
         if (!d_expert_ids || !d_weights ||
             (use_runtime_descriptors && !runtime_layer))

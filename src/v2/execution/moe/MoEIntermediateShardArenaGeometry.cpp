@@ -24,7 +24,8 @@ namespace llaminar2
 {
 MoEIntermediateShardArenaGeometry MoEIntermediateShardArenaGeometry::resolve(const ModelMemoryProfile &source,
     int participants, int participant, const std::optional<DeviceShardingAssignment> &shared_assignment,
-    int first_layer, int last_layer, GPUExpertIntermediateTiling tiling)
+    int first_layer, int last_layer, GPUExpertIntermediateTiling tiling,
+    MTPShiftedKVHeadLayout predictor_layout)
 {
     if (participants <= 0 || participant < 0 || participant >= participants || source.d_model <= 0 ||
         source.expert_count <= 0 || source.expert_used_count <= 0 || source.expert_used_count > source.expert_count ||
@@ -36,7 +37,8 @@ MoEIntermediateShardArenaGeometry MoEIntermediateShardArenaGeometry::resolve(con
         throw std::invalid_argument("Intermediate-shard arena has a foreign retained source-layer interval");
     std::vector<std::array<bool, 3>> routed_seen(layers), shared_seen(layers);
     std::vector<int> original_routed_f(layers, 0);
-    int routed_max = 0, shared_source = 0;
+    const int main_layers = source.mainLayerCount();
+    int routed_max = 0, shared_source = 0, predictor_shared = 0;
     for (const auto &tensor : source.tensors)
     {
         if (tensor.layer_index < first_layer || tensor.layer_index > last_layer) continue;
@@ -63,7 +65,11 @@ MoEIntermediateShardArenaGeometry MoEIntermediateShardArenaGeometry::resolve(con
             if (shared_source && shared_source != f)
                 throw std::invalid_argument("Intermediate-shard shared source F varies outside its original dense TP assignment");
             shared_source = f;
-            if (down && shared_assignment)
+            const bool full_predictor = tensor.layer_index >= main_layers &&
+                predictor_layout == MTPShiftedKVHeadLayout::FullModelPerParticipant;
+            if (full_predictor)
+                predictor_shared = f;
+            if (down)
             {
                 const bool floating = tensor.quant_type == "F32" || tensor.quant_type == "FP32" ||
                     tensor.quant_type == "F16" || tensor.quant_type == "FP16" || tensor.quant_type == "BF16";
@@ -71,7 +77,10 @@ MoEIntermediateShardArenaGeometry MoEIntermediateShardArenaGeometry::resolve(con
                 if (!floating && !native)
                     throw std::invalid_argument("Intermediate-shard arena has unsupported original shared down codebook");
                 const int group = floating ? 1 : native->is_superblock ? Q4_KBlock::BLOCK_SIZE : Q4_0Block::BLOCK_SIZE;
-                if (shared_assignment->d_ff_start % group || shared_assignment->d_ff_count % group)
+                if (full_predictor && f % group)
+                    throw std::invalid_argument("Replicated shared predictor source splits a native down codebook group");
+                if (!full_predictor && shared_assignment &&
+                    (shared_assignment->d_ff_start % group || shared_assignment->d_ff_count % group))
                     throw std::invalid_argument("Intermediate-shard original shared TP cut splits a native down codebook group");
             }
         }
@@ -105,9 +114,13 @@ MoEIntermediateShardArenaGeometry MoEIntermediateShardArenaGeometry::resolve(con
             throw std::invalid_argument("Intermediate-shard arena has a foreign original shared source assignment");
         shared_local = a.d_ff_count;
     }
-    return {routed_max, shared_local, source.expert_used_count};
+    return {routed_max, shared_local, predictor_shared, source.expert_used_count};
 }
-int MoEIntermediateShardArenaGeometry::scratchIntermediate() const noexcept { return std::max(routed_, shared_); }
+int MoEIntermediateShardArenaGeometry::scratchIntermediate() const noexcept
+{
+    // Main and predictor use the same gate/up roots at disjoint times.
+    return std::max({routed_, shared_, predictor_shared_});
+}
 void MoEIntermediateShardArenaGeometry::bindResolver(GraphResolverConfig &resolver) const
 {
     resolver.custom_formulas["moe_top_k"] = std::size_t(slots_);

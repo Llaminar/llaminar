@@ -134,9 +134,22 @@ namespace llaminar2
                     (suffix == "ssm_alpha.weight" || suffix == "ssm_beta.weight"));
         }
 
+        /** @return Whether the loaded original is eligible for half MoE control operands. */
+        [[nodiscard]] static constexpr bool isFloatingSource(TensorType type) noexcept
+        {
+            return type == TensorType::FP16 || type == TensorType::BF16 || type == TensorType::FP32;
+        }
+
+        /** @return The same eligibility directly from the planner's original GGUF format. */
+        [[nodiscard]] static constexpr bool isFloatingSource(std::string_view format) noexcept
+        {
+            return format == "F32" || format == "FP32" || format == "F16" || format == "FP16" || format == "BF16";
+        }
+
         /**
          * @brief Resolve the setup policy for one authenticated source projection.
          * @param role Immutable semantic role assigned by the model schema.
+         * @param original Original GGUF format or loaded tensor type, before any conversion.
          * @param name Exact original GGUF tensor name.
          * @param architecture Registered schema owning the source name.
          * @param requested Process setup selection, including selective policies.
@@ -145,14 +158,16 @@ namespace llaminar2
          * Storage, operand arithmetic, workspace admission and setup counters
          * consume this decision so a selective policy cannot change wide GEMMs.
          */
+        template<class OriginalFormat>
         [[nodiscard]] static constexpr GDNProjectionArithmetic effectiveGDNArithmetic(
-            WeightRole role, std::string_view name, std::string_view architecture,
+            WeightRole role, const OriginalFormat &original, std::string_view name, std::string_view architecture,
             GDNProjectionArithmetic requested) noexcept
         {
             if (!isGDNProjectionSource(role, name, architecture))
                 return GDNProjectionArithmetic::Native;
             if (requested == GDNProjectionArithmetic::FP16MoEAlphaBeta)
-                return (architecture == "qwen35moe" || architecture == "qwen4exp") && role == WeightRole::GDNAlphaBetaProjection ?
+                return (architecture == "qwen35moe" || architecture == "qwen4exp") &&
+                    role == WeightRole::GDNAlphaBetaProjection && isFloatingSource(original) ?
                     GDNProjectionArithmetic::FP16 : GDNProjectionArithmetic::Native;
             if (requested == GDNProjectionArithmetic::FP16AlphaBeta)
                 return role == WeightRole::GDNAlphaBetaProjection ?
@@ -188,11 +203,10 @@ namespace llaminar2
             if (role == WeightRole::MoERouter && router_arithmetic == MoERouterArithmetic::FP16)
                 return source_type == TensorType::FP16 ? ModelPreparedWeightRepresentation::SourceNative :
                     ModelPreparedWeightRepresentation::FP16;
-            const auto effective = effectiveGDNArithmetic(role, name, architecture, arithmetic);
-            if ((arithmetic == GDNProjectionArithmetic::FP16AlphaBeta ||
-                 arithmetic == GDNProjectionArithmetic::FP16MoEAlphaBeta) &&
+            const auto effective = effectiveGDNArithmetic(role, source_type, name, architecture, arithmetic);
+            if (arithmetic == GDNProjectionArithmetic::FP16AlphaBeta &&
                 effective == GDNProjectionArithmetic::FP16 &&
-                source_type != TensorType::FP32 && source_type != TensorType::FP16 && source_type != TensorType::BF16)
+                !isFloatingSource(source_type))
                 throw std::invalid_argument("FP16 GDN alpha/beta requires original floating weights; quantized sources must stay native");
             if (effective == GDNProjectionArithmetic::FP16)
                 return source_type == TensorType::FP16 ? ModelPreparedWeightRepresentation::SourceNative :
@@ -230,12 +244,10 @@ namespace llaminar2
             if (role == WeightRole::MoERouter && router_arithmetic == MoERouterArithmetic::FP16)
                 return source_format == "F16" || source_format == "FP16" ?
                     ModelPreparedWeightRepresentation::SourceNative : ModelPreparedWeightRepresentation::FP16;
-            const auto effective = effectiveGDNArithmetic(role, name, architecture, arithmetic);
-            if ((arithmetic == GDNProjectionArithmetic::FP16AlphaBeta ||
-                 arithmetic == GDNProjectionArithmetic::FP16MoEAlphaBeta) &&
+            const auto effective = effectiveGDNArithmetic(role, source_format, name, architecture, arithmetic);
+            if (arithmetic == GDNProjectionArithmetic::FP16AlphaBeta &&
                 effective == GDNProjectionArithmetic::FP16 &&
-                source_format != "F32" && source_format != "FP32" &&
-                source_format != "F16" && source_format != "FP16" && source_format != "BF16")
+                !isFloatingSource(source_format))
                 throw std::invalid_argument("FP16 GDN alpha/beta requires original floating weights; quantized sources must stay native");
             if (effective == GDNProjectionArithmetic::FP16)
                 return source_format == "F16" || source_format == "FP16" ?
@@ -249,21 +261,23 @@ namespace llaminar2
         /**
          * @brief Bind activation arithmetic to the identical original-source scope.
          * @param role Immutable semantic role owning the prepared weight.
+         * @param original Original GGUF format or loaded tensor type, before any conversion.
          * @param name Original canonical GGUF source name.
          * @param architecture Registered owner schema, never inferred from shape.
          * @param arithmetic Immutable process startup GDN selection.
          * @param router_arithmetic Independent immutable router operand policy.
          * @return Explicit scoped mode; Native for every unrelated engine.
          */
+        template<class OriginalFormat>
         [[nodiscard]] static constexpr FloatingActivationOperandPrecision operandPrecision(
-            WeightRole role, std::string_view name, std::string_view architecture,
+            WeightRole role, const OriginalFormat &original, std::string_view name, std::string_view architecture,
             GDNProjectionArithmetic arithmetic,
             MoERouterArithmetic router_arithmetic = MoERouterArithmetic::ModelDefault)
         {
             router_arithmetic = resolveMoERouterArithmetic(router_arithmetic, architecture);
             if (role == WeightRole::MoERouter && router_arithmetic == MoERouterArithmetic::FP16)
                 return FloatingActivationOperandPrecision::FP16RNE;
-            const auto effective = effectiveGDNArithmetic(role, name, architecture, arithmetic);
+            const auto effective = effectiveGDNArithmetic(role, original, name, architecture, arithmetic);
             if (effective == GDNProjectionArithmetic::FP32)
                 return FloatingActivationOperandPrecision::FP32;
             if (effective == GDNProjectionArithmetic::FP16)

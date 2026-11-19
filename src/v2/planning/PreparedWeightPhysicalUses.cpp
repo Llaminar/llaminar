@@ -80,7 +80,7 @@ namespace llaminar2
         if (representation == ModelPreparedWeightRepresentation::FP32) type = TensorType::FP32;
         return PreparedWeightIdentityContract::completeOriginalMatrix(geometry.matrix()->rows,
             geometry.matrix()->columns, *type, PreparedWeightRepresentationContract::operandPrecision(role,
-                tensor.name, profile_.architecture, policy.gdn_projection_arithmetic, policy.moe_router_arithmetic));
+                tensor.quant_type, tensor.name, profile_.architecture, policy.gdn_projection_arithmetic, policy.moe_router_arithmetic));
     }
     PreparedWeightPhysicalUse PreparedWeightPhysicalUses::record(const ModelMemoryProfile &profile, DeviceId device,
         const TensorSizeInfo &tensor, const WeightShardGeometry &geometry, WeightSourceStorageView source_view,

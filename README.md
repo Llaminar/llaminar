@@ -742,17 +742,15 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 <details>
 <summary>2 CUDA GPUs · experts shared across both cards</summary>
 
-Spread Ornith's experts across two NVIDIA GPUs. Dynamic movement can rebalance
-the experts as the workload changes. The planner calls this same-vendor layout
-`tp`, which is why that option appears in the command.
+The planner splits each expert across both NVIDIA GPUs. The two cards
+work on every selected expert together. They form one resident tier, so
+there is no destination tier for a promotion or demotion.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
   -m /models/Ornith-1.5-35B-Q4_K_M.gguf --context-length 8192 \
   --auto --only-backends cuda --auto-device-counts cuda=2 \
-  --only-strategies tp --kv-cache-precision fp16 \
-  --mtp --mtp-depth-policy dynamic \
-  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+  --only-strategies tp --kv-cache-precision fp16
 ```
 
 </details>
@@ -760,16 +758,14 @@ docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
 <details>
 <summary>2 ROCm GPUs · experts shared across both cards</summary>
 
-Spread Ornith's experts across two AMD GPUs, with dynamic movement to rebalance
-their work. As in the NVIDIA example, the planner calls this layout `tp`.
+Both AMD GPUs hold a shard of each expert. As in the NVIDIA example, the
+planner enables dynamic MTP when the GGUF includes a complete predictor.
 
 ```bash
 docker run --rm "${COMMON_RUN[@]}" "${DEVICE_ARGS[@]}" "$LLAMINAR_IMAGE" serve \
   -m /models/Ornith-1.5-35B-Q4_K_M.gguf --context-length 8192 \
   --auto --only-backends rocm --auto-device-counts rocm=2 \
-  --only-strategies tp --kv-cache-precision fp16 \
-  --mtp --mtp-depth-policy dynamic \
-  --moe-routed-expert-owner-order ordinal --moe-residency-maintenance dynamic
+  --only-strategies tp --kv-cache-precision fp16
 ```
 
 </details>
@@ -802,8 +798,9 @@ processes on the same machine.
 ExpertOverlay lets different groups of devices hold different experts. The
 planner chooses which group runs the main model and generates the answer
 (the *continuation*), then uses the other groups for additional expert work.
-It also sets their memory budgets. Dynamic movement can move frequently used
-experts to faster groups and balance the load within each group.
+It also sets their memory budgets. Dynamic movement can promote frequently
+used experts to a faster tier. If a tier uses tensor sharding, its
+participants share the work of each expert placed there.
 
 <details>
 <summary>2 CUDA GPUs + 2 CPU NUMA nodes</summary>
@@ -1053,20 +1050,29 @@ or `observe` to collect demand information without moving them. The separate
 layout. Extra cached copies of experts are controlled by `--moe-hot-expert-cache`,
 which is off by default.
 
-On one homogeneous, rank-local multi-GPU tier, automatic compute normally
-uses `gate-up-owned-down-columns`. It keeps gate/up weights movable while
-splitting each expert's down-output columns across the GPUs. For Qwen Flash
-Next with 640 intermediate columns, four MI50s serving the complete model
-in one stationary tier (`--moe-residency-maintenance off`) automatically
-use `tensor-sharded`. Each GPU owns 160 routed and 160 shared expert
-columns. Small FP32 reductions use direct peer transfer when the driver
-confirms every directed peer link. CPU, heterogeneous and multi-tier layouts
-keep whole-expert ownership.
+With the default dynamic maintenance policy, automatic planning selects
+`tensor-sharded` for every MoE model on a
+homogeneous GPU TP group owned by one MPI rank when the weights can be
+split into native blocks. It also selects this layout for single-request
+serving with a GPU TP continuation and a CPU TP expert tier on the same
+host. Each tier splits every expert it owns across its participants.
+Dynamic maintenance can promote or demote a whole expert, repartitioning
+its weights for the destination tier. A single fully resident tier keeps
+its experts in place. Startup enables dynamic MTP when the model provides
+complete learned predictor weights, either embedded or in a supplied sidecar.
+CPU-only automatic TP currently distributes whole experts across sockets.
+If you select `observe`, a GPU/CPU plan can collect demand from the sharded
+continuation's routing tickets. A single GPU TP tier uses a layout with
+per-expert observation support.
+
+On the tuned four-MI50 Qwen Flash Next layout with 640 intermediate columns,
+each card owns 160 routed and 160 shared expert columns. Small FP32 reductions
+use direct peer transfer when the driver confirms every directed peer link.
+Manual placement continues to follow the declared domain policy.
 To compare against whole experts on the same GPU tier, use
 `--moe-routed-expert-compute apportioned` (or add `;expert_compute=apportioned`
-to that tier). Explicit layout choices always take precedence. Projection
-ownership currently requires rank-local GPUs from one backend; cross-rank and
-cross-tier projection execution are not yet supported.
+to that tier). The `gate-up-owned-down-columns` alternative requires GPUs
+from the same backend and MPI rank.
 
 Domain policy keys identify the expert work explicitly: `expert_compute` chooses
 the weight layout, `expert_phase` chooses phase behavior, and
@@ -1463,15 +1469,16 @@ because it built successfully.
 
 ### Projection arithmetic diagnostics
 
-Qwen GDN MoE alpha/beta projections use FP16 weights and activations with FP32
-accumulation by default. Dense models retain native arithmetic because matched
-canaries found higher decode KL with half alpha/beta operands. CUDA and ROCm
+Qwen GDN MoE alpha/beta projections with floating-point source weights use
+FP16 weights and activations with FP32 accumulation by default. Quantized
+controls keep their original arithmetic policy. For a Q8_0 control, that
+policy decodes the source into FP32 weights. Dense models retain native
+arithmetic because matched canaries found higher decode KL with half alpha/beta operands. CUDA and ROCm
 use the same model scope. The default policy is
 `LLAMINAR_GDN_PROJECTION_ARITHMETIC=fp16_moe_alpha_beta`.
 QKV, Z and output projections retain their native weights and arithmetic.
-The explicit `fp16_alpha_beta` policy selects half controls for both dense and
-MoE experiments. Both selective half policies require original floating
-alpha/beta weights and reject quantized sources where half operands are selected.
+The explicit `fp16_alpha_beta` policy requires floating alpha/beta weights
+and selects half controls for both dense and MoE experiments.
 Select `native` explicitly for the original arithmetic; `fp16` applies half
 operands to all GDN projections and `fp32` selects full floating operands.
 Router precision and Q8 expert GEMM stay unchanged. Planning, prepared engines

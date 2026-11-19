@@ -49,6 +49,85 @@ namespace llaminar2
             hash = fnv1a64(value.data(), value.size(), hash);
         }
 
+        /**
+         * @brief Form the exact physical key from the original ordered tier members.
+         * Whole targets keep the source rectangle on every layer. Only shard
+         * cohorts can vary their per-member rectangles with the layer.
+         * @param owners Immutable original map, available only for joint placement.
+         * @param manifest Authenticated source of this exact global layer.
+         * @return Ordered tier/member cuts. Empty for an all-whole plan.
+         */
+        std::vector<MoEOverlayPhysicalProjectionTarget> originalShardCuts(
+            const MoEExpertOwnerMap *owners, const MoEOverlayLayerWeightManifest &manifest)
+        {
+            std::vector<MoEOverlayPhysicalProjectionTarget> result;
+            if (!owners)
+                return result;
+            for (const auto &endpoint : owners->participants())
+            {
+                if (endpoint.domain_participant_index != 0)
+                    continue;
+                const auto cohort = owners->originalShardCohort(endpoint.tier_idx, manifest.layer_idx);
+                if (!cohort)
+                    continue;
+                if (cohort->source() != manifest)
+                    throw std::invalid_argument("Calibration layer changed its original cohort source");
+                MoEOverlayPhysicalProjectionTarget target{.tier_idx = endpoint.tier_idx};
+                const auto members = cohort->participants();
+                for (std::size_t i = 0; i < members.size(); ++i)
+                {
+                    const auto &member = members[i];
+                    const auto &ownership = cohort->ownership(i);
+                    target.members.push_back({
+                        .participant_id = member.participant_id,
+                        .world_rank = member.world_rank,
+                        .device = member.address.toLocalDeviceId(),
+                        .address = member.address,
+                        .projections = {
+                            ownership.projection(WeightRole::MoEExpertGate),
+                            ownership.projection(WeightRole::MoEExpertUp),
+                            ownership.projection(WeightRole::MoEExpertDown)}});
+                }
+                result.push_back(std::move(target));
+            }
+            return result;
+        }
+
+        /**
+         * @brief Bind the exact tier order, member endpoints and rectangles into retained calibration identity.
+         * @param hash Running identity of the complete catalog.
+         * @param cuts Original shard key from the representative of this exact class.
+         */
+        void hashShardCuts(std::uint64_t &hash,
+            const std::vector<MoEOverlayPhysicalProjectionTarget> &cuts) noexcept
+        {
+            hashUnsigned(hash, cuts.size());
+            for (const auto &tier : cuts)
+            {
+                hashUnsigned(hash, tier.tier_idx);
+                hashUnsigned(hash, tier.members.size());
+                for (const auto &member : tier.members)
+                {
+                    hashUnsigned(hash, member.participant_id);
+                    hashUnsigned(hash, member.world_rank);
+                    hashUnsigned(hash, static_cast<unsigned>(member.device.type));
+                    hashUnsigned(hash, member.device.ordinal);
+                    hashString(hash, member.address.hostname);
+                    hashUnsigned(hash, member.address.numa_node);
+                    for (const auto &projection : member.projections)
+                    {
+                        hashUnsigned(hash, static_cast<unsigned>(projection.residence));
+                        hashUnsigned(hash, projection.source_rows);
+                        hashUnsigned(hash, projection.source_columns);
+                        hashUnsigned(hash, projection.first_row);
+                        hashUnsigned(hash, projection.rows);
+                        hashUnsigned(hash, projection.first_column);
+                        hashUnsigned(hash, projection.columns);
+                    }
+                }
+            }
+        }
+
         /** @brief Render one inexpensive deterministic catalog digest. */
         std::string catalogIdentity(std::uint64_t hash)
         {
@@ -155,7 +234,8 @@ namespace llaminar2
 
     MoEOverlayEconomyCalibrationLayerCatalog::
         MoEOverlayEconomyCalibrationLayerCatalog(
-            const std::vector<MoEOverlayLayerWeightManifest> &manifest)
+            const std::vector<MoEOverlayLayerWeightManifest> &manifest,
+            const MoEExpertOwnerMap *original_shards)
     {
         if (manifest.empty())
         {
@@ -167,11 +247,14 @@ namespace llaminar2
             MoEOverlayCapacityResolver::preparedFootprints(manifest);
         first_model_layer_ = manifest.front().layer_idx;
         complete_expert_bytes_per_layer_.resize(manifest.size());
+        std::vector<std::vector<MoEOverlayPhysicalProjectionTarget>> cuts_by_layer;
+        cuts_by_layer.reserve(manifest.size());
         for (std::size_t layer = 0; layer < manifest.size(); ++layer)
         {
             // preparedFootprints authenticated the complete contiguous interval.
             // Catalog members retain model-global IDs; byte arrays stay compact.
             const int model_layer = manifest[layer].layer_idx;
+            cuts_by_layer.push_back(originalShardCuts(original_shards, manifest[layer]));
             const std::size_t complete_bytes = std::max(
                 footprints[layer].cpu_live_bytes,
                 footprints[layer].gpu_live_bytes);
@@ -185,11 +268,11 @@ namespace llaminar2
             auto group = std::find_if(
                 groups_.begin(),
                 groups_.end(),
-                [this, &manifest, layer](const auto &candidate)
+                [this, &manifest, &cuts_by_layer, layer](const auto &candidate)
                 {
-                    return manifest[storageIndexForModelLayer(
-                                        candidate.representative_layer)]
-                               .projections == manifest[layer].projections;
+                    const auto representative = storageIndexForModelLayer(candidate.representative_layer);
+                    return manifest[representative].projections == manifest[layer].projections &&
+                           cuts_by_layer[representative] == cuts_by_layer[layer];
                 });
             if (group == groups_.end())
             {
@@ -241,8 +324,10 @@ namespace llaminar2
             for (const int member : group.member_layers)
                 hashUnsigned(hash, static_cast<std::uint64_t>(member));
 
-            const auto &representative = manifest[storageIndexForModelLayer(
-                group.representative_layer)];
+            const auto index = storageIndexForModelLayer(group.representative_layer);
+            if (original_shards)
+                hashShardCuts(hash, cuts_by_layer[index]);
+            const auto &representative = manifest[index];
             for (const auto &projection : representative.projections)
             {
                 hashUnsigned(
@@ -482,7 +567,8 @@ namespace llaminar2
                     throw std::invalid_argument("Target expansion has no original cohort source manifest for a layer");
                 manifests.push_back(source->shard_cohort->source());
             }
-            const MoEOverlayEconomyCalibrationLayerCatalog original_catalog(manifests);
+            const MoEOverlayEconomyCalibrationLayerCatalog original_catalog(
+                manifests, &snapshot->originalOwnerMap());
             if (original_catalog.identity() != identity_)
                 throw std::invalid_argument("Target expansion catalog differs from original source formats or geometry");
             MoEOverlayEconomyCalibrationPlanner planner({.live_snapshot = snapshot,

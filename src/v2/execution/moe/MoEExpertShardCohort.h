@@ -22,6 +22,7 @@
 #include <span>
 #include <vector>
 #include <limits>
+#include <numeric>
 
 namespace llaminar2 {
 /** @brief Source-authenticated, immutable joint ownership of one layer's expert layout. */
@@ -56,6 +57,26 @@ public:
         for(int p=0;p<participants;++p){const int width=(blocks/participants+(p<blocks%participants))*unit;result.push_back({frontier,width});frontier+=width;}
         return result;
     }
+    /**
+     * @brief Check whether original down-K admits a positive shard for each member.
+     * @param intermediate_columns Full reduction extent of the original down projection.
+     * @param down_format Original down source identity before device packing.
+     * @param participants Original cohort degree.
+     * @param gpu Whether slices must also retain complete Q8 activation groups.
+     * @return True if an unpadded native partition exists independently of preferred tile size.
+     */
+    static bool supportsIntermediateDegree(std::size_t intermediate_columns,
+        const ExpertWeightFormat &down_format, int participants, bool gpu)
+    {
+        if (!down_format.valid() || participants < 2 ||
+            intermediate_columns > static_cast<std::size_t>(std::numeric_limits<int>::max()))
+            return false;
+        const auto block = sourceBlock(down_format);
+        const auto grain = static_cast<std::size_t>(gpu ? std::lcm(block, 32) : block);
+        return intermediate_columns % grain == 0 &&
+            intermediate_columns / grain >= static_cast<std::size_t>(participants);
+    }
+
     /**
      * @brief Seal original source and exact ordered CPU fragment membership.
      * @param layer Original, unsliced source layer metadata.

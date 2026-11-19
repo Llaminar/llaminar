@@ -50,6 +50,12 @@ namespace llaminar2
             const auto &moe = graph_builder_->config().moe;
             if (moe.expert_overlay_residency_authority)
             {
+                if (const auto &stationary = moe.expert_overlay_residency_authority->stationaryTensorShardResidency())
+                {
+                    if (!moe.routed_expert_plan || native_moe_movement_archive_ || nativeMoEMovementOwnerStage())
+                        throw std::logic_error("Stationary tensor shard residency conflicts with a movement owner");
+                    return stationary->statusFor(state_.device_id);
+                }
                 const auto &proof = moe.expert_overlay_residency_authority->noPeerResidency();
                 if (proof)
                 {

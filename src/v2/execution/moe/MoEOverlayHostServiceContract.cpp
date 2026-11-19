@@ -6,6 +6,7 @@
  * capture; its conservative pre-quota service reservation remains unchanged.
  */
 #include "MoEOverlayHostServiceContract.h"
+#include "MoEIntermediateShardStaticGraphAdmission.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
 #include "MoEOverlayRankBatchTransport.h"
 #include "MoEOverlayNodeLocalRankBatchTransport.h"
@@ -97,6 +98,7 @@ MoEOverlayHostServiceContract MoEOverlayHostServiceContract::resolveImpl(const M
         result.continuation_=ContinuationGeometry{domain->scope,domain->participants.size(),domain->routed_compute_policy};
     }
     if(!result.continuation_)return result;
+    result.mappedIntermediateShards_=hasMappedGPUCPUIntermediateShardTopology(plan);
     const auto source=std::find_if(participants.begin(),participants.end(),[&](const auto& p){return p.participant_id==result.rootParticipant_;});
     if(source==participants.end()||!source->world_rank_known||source->tier_idx!=result.continuationTier_)
         throw std::logic_error("Routed host service has no original continuation rank/root descriptor");
@@ -130,7 +132,7 @@ bool MoEOverlayHostServiceContract::requiresExecutorService(int rank,DeviceId de
     if(std::find_if(std::next(participant),continuationParticipants_.end(),[&](const auto& p){return p.world_rank==rank&&p.device==device;})!=continuationParticipants_.end())
         throw std::logic_error("Routed host service resolves duplicate continuation device");
     const bool single=continuation_->scope==ExecutionDomainScope::SINGLE&&continuation_->participants==1&&continuation_->compute!=RoutedExpertComputePolicy::TensorSharded;
-    const bool localTP=degree>1&&continuation_->scope==ExecutionDomainScope::RANK_LOCAL&&continuation_->compute==RoutedExpertComputePolicy::Apportioned&&continuation_->participants==static_cast<std::size_t>(degree);
+    const bool localTP=degree>1&&continuation_->scope==ExecutionDomainScope::RANK_LOCAL&&(continuation_->compute==RoutedExpertComputePolicy::Apportioned||mappedIntermediateShards_)&&continuation_->participants==static_cast<std::size_t>(degree);
     if(localTP&&participant->domain_participant_index!=index)throw std::logic_error("Routed host service LocalTP coordinate changed");
     return (single||localTP)&&(!distributed_||participant->participant_id==rootParticipant_);
 }

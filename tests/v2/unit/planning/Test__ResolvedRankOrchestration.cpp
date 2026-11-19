@@ -353,23 +353,22 @@ TEST(ResolvedRankOrchestration, QFNMI50LocalTPRequiresCompleteMeasuredDomain)
     source.expert_count = 512;
     source.expert_used_count = 10;
     source.expert_feed_forward_length = source.expert_shared_feed_forward_length = 640;
-    const auto select = [&](bool whole_model = true, MoERebalanceRuntimeMode mode = MoERebalanceRuntimeMode::Off)
+    const auto select = [&](bool whole_model = true)
     {
-        return selectLocalGPUExpertKernelPolicy(plan, source, hardware, whole_model, mode);
+        return selectLocalGPUExpertKernelPolicy(plan, source, hardware, whole_model);
     };
 
     EXPECT_EQ(select(), Policy::QFNMI50TP4);
     EXPECT_EQ(select(false), Policy::Generic);
-    EXPECT_EQ(select(true, MoERebalanceRuntimeMode::Dynamic), Policy::Generic);
     plan.domains.front().world_ranks = {0, 0, 0, 0};
     EXPECT_EQ(select(), Policy::Generic);
     plan.domains.front().world_ranks.clear();
 
     using Compute = RoutedExpertComputePolicy;
     plan.domains.front().routed_compute_policy = Compute::GateUpOwnedDownColumns;
-    EXPECT_EQ(selectLocalGPUExpertKernelPolicy(plan, source, hardware, true, MoERebalanceRuntimeMode::Off,
+    EXPECT_EQ(selectLocalGPUExpertKernelPolicy(plan, source, hardware, true,
                   Compute::Automatic), Policy::QFNMI50TP4);
-    EXPECT_EQ(selectLocalGPUExpertKernelPolicy(plan, source, hardware, true, MoERebalanceRuntimeMode::Off,
+    EXPECT_EQ(selectLocalGPUExpertKernelPolicy(plan, source, hardware, true,
                   Compute::GateUpOwnedDownColumns), Policy::Generic);
     plan.domains.front().routed_compute_policy = Compute::TensorSharded;
 
@@ -402,6 +401,24 @@ TEST(ResolvedRankOrchestration, QFNMI50LocalTPRequiresCompleteMeasuredDomain)
     source.d_ff = 640;
     source.vocab_size = 151936;
     source.max_seq_len = 4096;
+    // Source feasibility is part of automatic selection. All 48 blocks
+    // have separate routed and shared Down weights with a native K axis.
+    for (int layer = 0; layer < source.n_layers; ++layer)
+    {
+        for (const bool routed : {false, true})
+        {
+            const std::size_t elements = std::size_t(source.d_model) * source.d_ff *
+                (routed ? source.expert_count : 1);
+            source.tensors.push_back({
+                .name = "blk." + std::to_string(layer) + (routed ? ".ffn_down_exps.weight" : ".ffn_down_shexp.weight"),
+                .native_bytes = elements / 32 * 34,
+                .quant_type = "Q8_0",
+                .elements = elements,
+                .K = static_cast<std::size_t>(source.d_ff),
+                .layer_index = layer,
+            });
+        }
+    }
     // Automatic search authenticates original sparse K/V descriptors and GDN
     // head boundaries before publishing any TP proposal.
     for (int layer = 3; layer < source.n_layers; layer += 4)
@@ -469,9 +486,9 @@ TEST(ResolvedRankOrchestration, QFNMI50LocalTPRequiresCompleteMeasuredDomain)
             const auto resolved = ResolvedRankOrchestration::resolve(
                 candidate.config, model, candidate.membership.inventory(), builder, 0);
             const auto &sealed = *resolved.config().moe_routed_expert_plan;
-            EXPECT_EQ(sealed.usesQFNMI50TP4(), stationary);
+            EXPECT_TRUE(sealed.usesQFNMI50TP4());
             EXPECT_EQ(sealed.domains.front().routed_compute_policy,
-                stationary ? Compute::TensorSharded : Compute::GateUpOwnedDownColumns);
+                Compute::TensorSharded);
             EXPECT_EQ(resolved.config().moe_rebalance.mode,
                 stationary ? MoERebalanceRuntimeMode::Off : MoERebalanceRuntimeMode::Dynamic);
         });

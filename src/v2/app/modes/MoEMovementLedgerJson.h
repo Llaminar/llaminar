@@ -162,7 +162,7 @@ namespace llaminar2::movement_json_detail
             members.push_back({{"participant",member.participant_id},{"world_rank",member.world_rank},
                 {"address",member.address.toString()},{"numa_node",member.address.numa_node},{"projections",std::move(projections)}});
         }
-        return {{"kind","cpu_cohort"},{"tier",cohort.tier},{"layer",source.source().layer_idx},{"members",std::move(members)}};
+        return {{"kind",source.participants().front().address.isCPU() ? "cpu_cohort" : "gpu_cohort"},{"tier",cohort.tier},{"layer",source.source().layer_idx},{"members",std::move(members)}};
     }
 
     /**

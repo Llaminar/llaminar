@@ -62,6 +62,7 @@
 #include "execution/moe/MoEOverlayResidencyAuthority.h"
 #include "execution/moe/MoERuntimeTable.h"
 #include "loaders/ModelContext.h"
+#include "loaders/PreparedOverlaySourceRetirement.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/WeightManager.h"
 #include "memory/BufferArena.h"
@@ -2454,29 +2455,11 @@ namespace llaminar2
         if (!frozen_weights_)
             return;
 
-        size_t released_bytes = 0;
-        for (const auto &binding : frozen_weights_->bindings())
-        {
-            auto tensor = binding.tensor_owner;
-            if (!tensor || tensor->is_view() ||
-                tensor->is_raw_data_released())
-            {
-                continue;
-            }
-            const size_t bytes = tensor->size_bytes();
-            try
-            {
-                tensor->release_host_weight_data();
-                released_bytes += bytes;
-            }
-            catch (const std::exception &error)
-            {
-                LOG_WARN(
-                    "[MoEOverlayParticipantGraphRunner] Could not release "
-                    << binding.identity.canonical_name << ": "
-                    << error.what());
-            }
-        }
+        const auto manager = config_.model_context->concreteWeightManager();
+        const auto *metadata = manager->weightMetadataRegistry();
+        if (!metadata)
+            throw std::logic_error("Participant source retirement requires its original weight metadata");
+        const auto released_bytes = retireMaterializedParticipantSources(*frozen_weights_, *metadata);
 
         PerfStatsCollector::addCounter(
             "moe_overlay_participant_graph",
