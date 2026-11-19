@@ -70,6 +70,9 @@ uses a short-lived installation token for the private `Llaminar/llaminar-bot`
 app. GitHub enforces both required checks and strict branch freshness for the
 app. Other authors use the existing `DEVELOP_AUTOMERGE_TOKEN` and require the
 owner's review. Re-running a job as the owner does not change the PR author.
+Editing an existing owner PR description migrates a request armed by the old
+maintainer token to the app at the same head. An edit leaves an explicitly
+disabled request alone and does not trigger either ISA test job.
 
 Create the token in GitHub's fine-grained token settings with resource owner
 `Llaminar` and only repository `llaminar`, then install or rotate it through
