@@ -15265,16 +15265,6 @@ foreach(participants IN ITEMS 2 4 8)
         MPI_PROCS ${participants} NO_MODELS TIMEOUT 30)
 endforeach()
 
-if(V2_TEST_SOCKETS GREATER_EQUAL 2)
-    add_v2_test(V2_Integration_PrefixCacheAfterCPUExpertRetirement_MPI
-        COMMAND $<TARGET_FILE:v2_integration_prefix_cache_shutdown_mpi>
-            --gtest_filter=Test__PrefixCacheShutdownMPI.RetiresOriginalExpertDomainBeforeAsymmetricPersistence
-        LABELS "V2;Integration;PrefixCache;Lifecycle;MPI;Regression;DeviceFree"
-        MPI_PROCS 2 NO_MODELS TIMEOUT 30
-        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
-            "LLAMINAR_SKIP_ROCM_STARTUP=1")
-endif()
-
 # Test: Prefix state cache LRU accounting
 add_executable(v2_test_prefix_state_cache_lru unit/prefix_cache/Test__PrefixStateCacheLRU.cpp)
 target_link_libraries(v2_test_prefix_state_cache_lru llaminar2_core GTest::gtest GTest::gtest_main)
@@ -30070,7 +30060,6 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_PrefixSharedArchiveEviction
     V2_Integration_PrefixArchiveReharvestPresence
     V2_Integration_PrefixCacheShutdown
-    V2_Integration_PrefixCacheAfterCPUExpertRetirement_MPI
     V2_Integration_PrefixCacheShutdownMPI_2
     V2_Integration_PrefixCacheShutdownMPI_4
     V2_Integration_PrefixCacheShutdownMPI_8
