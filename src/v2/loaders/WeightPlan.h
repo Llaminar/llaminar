@@ -34,7 +34,7 @@ namespace llaminar2
     class TensorBase;
     struct GraphConfig;
 
-    class CPUExpertShardSourceSelection;
+    class ExpertShardSourceSelection;
 
     enum class PreparedWeightKind
     {
@@ -68,7 +68,7 @@ namespace llaminar2
         bool immutable = false;
         FloatingActivationOperandPrecision floating_operand_precision =
             FloatingActivationOperandPrecision::Native; ///< Sealed before preparation; part of reuse identity.
-        std::shared_ptr<const CPUExpertShardSourceSelection> cpu_joint_source; ///< Closed original CPU joint-fragment purpose; absence preserves existing full-E GPU sources.
+        std::shared_ptr<const ExpertShardSourceSelection> joint_source; ///< Closed original CPU joint-fragment purpose; absence preserves existing full-E GPU sources.
         std::optional<NativeWeightSourceProjection> native_source; ///< Original native source facts retained after committed final preparation; grants no ownership.
         std::optional<MoEExpertProjectionOwnership> projection_ownership; ///< Original static source partition; no topology permission.
         std::shared_ptr<TensorBase> projection_source_owner = {}; ///< Original compact3D source root for exact native staging/coalescing.
@@ -105,7 +105,7 @@ namespace llaminar2
         PreparedWeightKind expected_prepared_kind = PreparedWeightKind::None;
         WeightSliceSpec slice;
         std::optional<NativeWeightSourceAssembly> native_source_assembly; ///< Ordered original native stripes for a dense final consumer, never a compact source parent.
-        std::shared_ptr<const CPUExpertShardSourceSelection> cpu_joint_source; ///< Closed original CPU joint-fragment purpose; absence preserves existing full-E GPU sources.
+        std::shared_ptr<const ExpertShardSourceSelection> joint_source; ///< Closed original CPU joint-fragment purpose; absence preserves existing full-E GPU sources.
         std::optional<MoEExpertProjectionOwnership> projection_ownership; ///< When present, the plan derives the sole original-axis slice.
     };
 

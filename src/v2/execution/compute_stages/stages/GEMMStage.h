@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include <array>
 #include <vector>
 #include "tensors/TensorType.h"
@@ -36,6 +37,8 @@
 
 namespace llaminar2
 {
+    class HCDownOutputPublication;
+    class HCBranchNormSingleQ8Publication;
     class CapturedDeviceStorageLease;
 
     // Forward declarations
@@ -68,6 +71,19 @@ namespace llaminar2
         struct HCResidualDownPublication {
             TensorBase* activated; ///< Existing arena result, never a new allocation.
             BufferId buffer; ///< Exact output coherence authority.
+            LocalGPUExpertKernelPolicy verifier_kernel_policy=LocalGPUExpertKernelPolicy::Generic; ///< Host-only exact grouped schedule.
+        };
+        /** @brief Closed M1 HC up/read output declaration, validated with its original input transform. */
+        /** @brief Existing activated output authored by the original down reducer. */
+        struct HCDownReducerOutput {
+            std::shared_ptr<HCDownOutputPublication> publication; ///< Shared original source/bank seal.
+            BufferId activated_buffer; ///< Original explicit activated coherence role.
+        };
+        struct HCResidualShortKRead {
+            const TensorBase* normalized; ///< Original immutable normalized branches.
+            BufferId normalized_buffer; ///< Existing original read coherence authority.
+            TensorBase* mixed; ///< Existing independent mixed output.
+            BufferId mixed_buffer; ///< Existing public terminal coherence authority.
         };
         /** @brief Immutable gate/gain input for one retained FP32 normalization+projection. */
         struct GatedNormPublication {
@@ -84,7 +100,11 @@ namespace llaminar2
             const ITensor *A = nullptr; ///< Input activation tensor [m, k]
             const ITensor *B = nullptr; ///< Weight tensor [k, n] (may be quantized)
             ITensor *C = nullptr;       ///< Output tensor [m, n]
+            std::optional<HCDownReducerOutput> hc_down_output; ///< SingleQ8 original down-reducer publication.
+            std::shared_ptr<HCDownOutputPublication> hc_prepublished_down; ///< Required same reducer banks for TwoTerm up.
+            std::shared_ptr<HCBranchNormSingleQ8Publication> hc_branch_norm_input; ///< Required original norm-produced SingleQ8 input, ordinary GPU M1 only.
             std::optional<HCResidualDownPublication> hc_residual_down; ///< Typed raw-down input transform; valid only for TwoTermQ8.
+            std::optional<HCResidualShortKRead> hc_short_k_read; ///< Explicit GPU M1 producer-grid epilogue; requires HC transform.
             std::optional<GatedNormPublication> gated_norm; ///< Explicit ordinary scalar SingleQ8 input program.
             int m = 0, n = 0, k = 0;    ///< Matrix dimensions
             float alpha = 1.0f;         ///< Scale factor for A*B
@@ -226,7 +246,7 @@ namespace llaminar2
         /** @brief GPU metadata binds before capture; CPU query metadata binds before input observation. */
         GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override {
             if(params_.projection_row_work&&params_.device_id.is_cpu())return GraphLaunchPreparationPolicy::HostEntry;
-            return (params_.projection_row_work||params_.hc_residual_down||params_.gated_norm)&&params_.device_id.is_gpu()
+            return (params_.projection_row_work||params_.hc_residual_down||params_.hc_down_output||params_.hc_branch_norm_input||params_.gated_norm)&&params_.device_id.is_gpu()
                 ? GraphLaunchPreparationPolicy::CaptureOnly : GraphLaunchPreparationPolicy::None;
         }
         void resetSessionState() override;
@@ -260,24 +280,31 @@ namespace llaminar2
         Params params_;
         std::unique_ptr<ProjectionRowWorkBinding> projection_row_work_; ///< Cold original-owner binding, retained across request reset.
         /** @brief Exact address/geometry identity; contains no live GPU values. */
+        /** @return Original activated role for either HC input or output publication. */
+        TensorBase* hcActivatedOutput() const;
         struct HCNativePublicationIdentity {
-            std::array<const void*,7> pointers{}; ///< Raw A, activated, C, then the four consumed banks.
-            std::array<size_t,7> bytes{}; ///< Complete retained tensor/bank extents.
-            std::array<TensorType,3> types{}; ///< Original tensor storage representations.
+            std::array<const void*,9> pointers{}; ///< Raw A, activated, C, optional normalized/mixed, then four consumed banks.
+            std::array<size_t,9> bytes{}; ///< Complete retained tensor/bank extents.
+            std::array<TensorType,5> types{}; ///< Original tensor storage representations.
             std::array<const void*,4> weight_planes{}; ///< Prepared payload/scales/mins/emins.
             std::array<uint64_t,12> weight_geometry{}; ///< Every nonpointer native descriptor field.
             uint64_t workspace_id=0; ///< Original manager instance, never a new epoch counter.
             ITensorGemm* engine=nullptr; ///< Original prepared engine resolved from the store.
+            std::uint64_t hc_down_program=0; ///< Immutable purpose-specific producer enum.
+            std::array<const void*,2> hc_down_functions{}; ///< Exact cold producer/reducer code identities, when explicitly selected.
             friend bool operator==(const HCNativePublicationIdentity&,const HCNativePublicationIdentity&)=default;
         };
         /** @brief Immutable captured ownership, published once after allocation prebind. */
         struct HCNativePublicationBinding {
             HCNativePublicationIdentity identity;
-            std::array<std::vector<size_t>,3> shapes; ///< Exact complete tensor shapes, copied only at setup.
-            std::array<std::shared_ptr<const CapturedDeviceStorageLease>,3> operands; ///< Original mutable activation allocation borrows.
+            std::array<std::vector<size_t>,5> shapes; ///< Exact complete tensor shapes, copied only at setup.
+            std::array<std::shared_ptr<const CapturedDeviceStorageLease>,5> operands; ///< Original mutable activation allocation borrows.
             std::array<std::shared_ptr<const WorkspaceBufferLease>,4> banks; ///< Original PMA-owned allocation leases.
             void* stream=nullptr; ///< Exact recording stream; preparatory reentry cannot replace it.
         };
+        std::optional<DeviceNativeQuantisedMatrixDesc> hc_down_input_source_; ///< Original input-consumer source sealed after ordinary cold preparation.
+        /** @brief Verify the original prepared source without conversion or allocation. */
+        void requireHCDownInputSource() const;
         std::optional<HCNativePublicationBinding> hc_native_binding_; ///< Survives data reset; only stage destruction retires it.
         /** @brief Inspect immutable addresses/descriptors without GPU work or host value reads.
          * @return Complete consumed native identity; no ownership is created here.

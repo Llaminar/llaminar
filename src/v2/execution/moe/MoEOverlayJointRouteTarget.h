@@ -1,6 +1,6 @@
 /**
  * @file MoEOverlayJointRouteTarget.h
- * @brief Capture-stable CPU cohort geometry without frozen expert membership.
+ * @brief Capture-stable CPU/GPU cohort geometry without frozen expert membership.
  *
  * The acquired placement bank alone selects which experts occupy the fixed
  * cohort. This launch value retains only its original target/member identity.
@@ -16,12 +16,12 @@
 #endif
 namespace llaminar2
 {
-    /** @brief Original fixed local member of an externally computed CPU cohort. */
+    /** @brief Original fixed local member of a jointly computed CPU/GPU cohort. */
     class MoEOverlayJointRouteTarget final
     {
     public:
-        /** @brief Ordinary lane with no CPU cohort role. */
-        constexpr MoEOverlayJointRouteTarget() noexcept = default;
+        /** @brief Ordinary lane with no cohort role. */
+        LLAMINAR_JOINT_TARGET_HD constexpr MoEOverlayJointRouteTarget() noexcept = default;
         /**
          * @brief Retain original fixed cohort/member geometry for capture.
          * @param experts Original logical expert axis.
@@ -42,7 +42,7 @@ namespace llaminar2
             result.experts_ = experts;
             result.participant_ = participant;
             result.layer_ = layer;
-            result.cohort_ = MoEOverlayRouteTarget::cpuCohort(tier).word();
+            result.cohort_ = MoEOverlayRouteTarget::cohort(tier).word();
             return result;
         }
         /** @return Whether this lane has an original cohort role. */
@@ -50,10 +50,25 @@ namespace llaminar2
         {
             return experts_ != 0;
         }
+        /** @return Original global member ID, distinct from its domain-local compute coordinate. */
+        LLAMINAR_JOINT_TARGET_HD constexpr std::int32_t participantId() const noexcept
+        { return participant_; }
         /** @return Original immutable cohort tag, or absent for an ordinary lane. */
         LLAMINAR_JOINT_TARGET_HD constexpr std::int32_t cohortTarget() const noexcept
         {
             return cohort_;
+        }
+        /** @return Equality of the original layer, member, target and expert extent. */
+#if defined(__HIP_DEVICE_COMPILE__)
+        // Keep nested launch-identity checks in registers; a generic reference
+        // call would make the containing kernel argument record addressable.
+        __attribute__((always_inline))
+#endif
+        LLAMINAR_JOINT_TARGET_HD constexpr bool
+        sameIdentity(const MoEOverlayJointRouteTarget &other) const noexcept
+        {
+            return experts_ == other.experts_ && participant_ == other.participant_ &&
+                   layer_ == other.layer_ && cohort_ == other.cohort_;
         }
         /**
          * @param experts Original logical expert axis.

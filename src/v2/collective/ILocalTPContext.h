@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "collective/RankOrderedNativeResources.h"
+
 #include "LocalTPCaptureSourceDefinition.h"
 #include "NativeLocalTPContextBorrow.h"
 #include "../backends/GlobalDeviceAddress.h"
@@ -352,6 +354,25 @@ namespace llaminar2
             (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream; (void)stage_name;
             return false;
         }
+
+        /** @return Cold original-communicator resource quotes; empty for unselected policy. */
+        virtual std::vector<RankOrderedNativeResources> rankOrderedResources() const { return {}; }
+        /** @return Whether the bound communicator owns a native direct-push quote, without copying its BOM. */
+        virtual bool hasRankOrderedPeerPush() const noexcept { return false; }
+
+        /** @brief Publish the canonical ascending-rank FP32 sum in one native operation.
+         * @param send Original local contribution, possibly identical to output.
+         * @param banks Persistent arena bank per original rank.
+         * @param output Participant-local FP32 result bank.
+         * @param rows Original device live prefix or fixed complete rows.
+         * @param participant Original communicator coordinate.
+         * @param stream Exact producer/consumer stream; never a default stream.
+         * @param stage_name Original graph stage identity for attribution.
+         * @return Enqueue success; missing preparation or unsupported transport fails.
+         */
+        virtual bool rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+            const NativeCollectiveRows &rows, int participant, void *stream, const std::string &stage_name)
+        { (void)send; (void)banks; (void)output; (void)rows; (void)participant; (void)stream; (void)stage_name; return false; }
 
         /**
          * @brief Record a native equal-prefix collective on its producer stream.
@@ -1011,11 +1032,12 @@ namespace llaminar2
      * @param devices Devices participating in LOCAL TP
      * @param weights Work distribution weights (empty for equal distribution)
      * @param backend Backend type (AUTO to select based on device types)
+     * @param peer_quote Cold native transport ownership admitted by the calling planner.
      * @return Unique pointer to ILocalTPContext implementation
      */
     std::unique_ptr<ILocalTPContext> createLocalTPContext(
         std::vector<GlobalDeviceAddress> devices,
         std::vector<float> weights,
-        CollectiveBackendType backend);
+        CollectiveBackendType backend, RankOrderedQuotePolicy peer_quote = RankOrderedQuotePolicy::ExplicitOnly);
 
 } // namespace llaminar2

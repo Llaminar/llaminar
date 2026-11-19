@@ -10,6 +10,7 @@
  */
 #pragma once
 #include <hip/hip_runtime.h>
+#include <type_traits>
 #include "kernels/common/ROCmCompiledWaveContract.h"
 
 namespace llaminar2::rocm::moe_wave_contract
@@ -72,11 +73,13 @@ namespace llaminar2::rocm::moe_wave_contract
         }
         else if constexpr (off == 4)
         {
+            // The first move writes d before the final masked move still reads
+            // x. Early-clobber forbids destructive input/output register aliasing.
             asm volatile("v_mov_b32 %0, %1\n"
                          "s_nop 1\n"
                          "v_mov_b32_dpp %0, %1 row_shl:4 row_mask:0xf bank_mask:0x5\n"
                          "v_mov_b32_dpp %0, %1 row_shr:4 row_mask:0xf bank_mask:0xa\n"
-                         : "=v"(d)
+                         : "=&v"(d)
                          : "v"(x)
                          : "memory");
         }
@@ -112,6 +115,89 @@ namespace llaminar2::rocm::moe_wave_contract
         return __int_as_float(rocm_moe_dpp_xfer_xor_i32<16>(__float_as_int(x)));
     }
 #endif
+
+    /**
+     * @brief Transfer one exact32-bit word left inside its original16-lane row.
+     * @tparam Shift Original constant row distance,1/2/4/8/12.
+     * @tparam T Original float or int word; no numeric conversion takes place.
+     * @param value Original lane bits. @return Row-local source bits, zero out of row.
+     * @pre Every lane of the physical wave participates. Consumers must prove
+     * their required source stays in the same row; this is not a full-wave shuffle.
+     * @details This is the existing ordered-bank update_dpp primitive. Its empty
+     * value boundary prevents folding the bit move into source-swapped arithmetic.
+     * No memory fence, arithmetic, readiness promise or workgroup join is added.
+     */
+    template<unsigned Shift,class T>
+    __device__ __forceinline__ T rowShiftNativeBits(T value)
+    {
+        static_assert(Shift==1||Shift==2||Shift==4||Shift==8||Shift==12);
+        static_assert(sizeof(T)==4&&(std::is_same_v<T,float>||std::is_same_v<T,int>));
+        if(__builtin_amdgcn_is_invocable(__builtin_amdgcn_update_dpp))
+        {
+            const int bits=__builtin_bit_cast(int,value);
+            int moved=__builtin_amdgcn_update_dpp(0,bits,0x100+Shift,0xf,0xf,true);
+#if defined(__HIP_DEVICE_COMPILE__)
+            asm volatile("" : "+v"(moved));
+#endif
+            return __builtin_bit_cast(T,moved);
+        }
+        __builtin_trap();
+    }
+
+    /** @brief Internal transfer selection; numerical quantization has one body. */
+    enum class QuantizerXorPolicy { Indexed, TargetNative };
+
+    /**
+     * @brief Transfer one exact word inside its original32-lane XOR group.
+     * @tparam Mask Original descending partner mask, one of16,8,4,2,1.
+     * @tparam T Original float or int32 lane word; no numeric conversion occurs.
+     * @param value Current lane's exact bits. @return Original XOR partner bits.
+     * @pre Every source lane in the original32-lane group participates. Full64,
+     * lower32 and upper32 active masks are valid; partial32 groups are not.
+     * @details gfx906 reuses the canonical DPP/swizzle sequence. Other compiled
+     * targets keep their SDK-native shuffle and its invocability checks. This
+     * transfers bits only; it never combines/reorders floating operands.
+     */
+    template<int Mask,class T>
+    __device__ __forceinline__ T xor32NativeBits(T value)
+    {
+        static_assert(Mask==16||Mask==8||Mask==4||Mask==2||Mask==1);
+        static_assert(sizeof(T)==4&&(std::is_same_v<T,float>||std::is_same_v<T,int>));
+#if defined(LLAMINAR_ROCM_MOE_GFX906_DPP)
+        const int bits=__builtin_bit_cast(int,value);
+        return __builtin_bit_cast(T,rocm_moe_dpp_xfer_xor_i32<Mask>(bits));
+#else
+        return __shfl_xor(value,Mask,32);
+#endif
+    }
+
+    /**
+     * @brief Select the bit transfer used by the unchanged quantizer stage.
+     * @tparam Policy Existing indexed users or explicit NativeLayout native transfers.
+     * @tparam T Original float/int lane word. @param value Current original bits.
+     * @param mask Original loop mask16,8,4,2,1. @return Exact original partner bits.
+     * @details The canonical quantizer unrolls its original mask loop, so every
+     * native call resolves one constant arm. An invalid mask is fatal; no
+     * alternative numerical or runtime path is selected to handle it.
+     */
+    template<QuantizerXorPolicy Policy,class T>
+    __device__ __forceinline__ T quantizerXor32(T value,int mask)
+    {
+        static_assert(Policy==QuantizerXorPolicy::Indexed||Policy==QuantizerXorPolicy::TargetNative);
+        if constexpr(Policy==QuantizerXorPolicy::Indexed)return __shfl_xor(value,mask,32);
+        else
+        {
+            switch(mask)
+            {
+            case 16:return xor32NativeBits<16>(value);
+            case 8:return xor32NativeBits<8>(value);
+            case 4:return xor32NativeBits<4>(value);
+            case 2:return xor32NativeBits<2>(value);
+            case 1:return xor32NativeBits<1>(value);
+            default:__builtin_trap();
+            }
+        }
+    }
 
     /**
      * @brief Reduce a complete wave using the established adjacent-pair-first FP32 tree.

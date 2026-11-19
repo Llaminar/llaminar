@@ -8,6 +8,7 @@
  */
 
 #pragma once
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 
 #include "../IComputeStage.h"
 #include "../StageParamsBase.h"
@@ -187,6 +188,8 @@ namespace llaminar2
              * row replay; it selects the dedicated grouped verifier contract.
              */
             bool force_decode_equivalent_verifier_prefill = false;
+            LocalGPUExpertKernelPolicy verifier_kernel_policy = LocalGPUExpertKernelPolicy::Generic;
+
 
             /**
              * @brief Declare this router's grouped-verifier history role.
@@ -249,6 +252,13 @@ namespace llaminar2
         size_t estimatedFlops() const override;
 
         int layerIndex() const { return params_.layer_idx; }
+
+        /**
+         * @brief Inspect immutable graph configuration before reusable routed lowering.
+         * @return The original declaration, including kernel owner, arena roles and device-count address.
+         * @note This exposes configuration only; routing decisions and demand remain on device.
+         */
+        [[nodiscard]] const Params &declaration() const noexcept { return params_; }
 
         /** @inheritdoc IMoEGroupedVerifierHistogramPublisher */
         [[nodiscard]] MoEGroupedVerifierHistogramRole
@@ -320,6 +330,8 @@ namespace llaminar2
         bool supportsLazyPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillGraphCapturePreflight() const override;
         bool supportsPaddedPrefillRealLengthContract() const override;
+        /** @brief Validate optional original M1 publication seals while keeping its cold declaration identity stable. */
+        uint64_t graphCaptureVariantSignature() const override;
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override;
         GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
         {

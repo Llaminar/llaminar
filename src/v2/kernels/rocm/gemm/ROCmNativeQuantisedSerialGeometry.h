@@ -9,6 +9,8 @@
  * to one host construction thread. Ordinary inference keeps TN128/CPT1.
  * Receipts describe enqueued/captured topology, never live execution state or
  * replay counts. No API here allocates execution storage or installs a winner.
+ * An explicit cold load-schedule admission can compare a register-only two-K32
+ * lookahead producer; an absent scope always retains Original instructions.
  */
 #pragma once
 
@@ -26,13 +28,16 @@ enum class NativeQ8SerialGeometry : std::uint8_t
     TN64CPT1, TN128CPT1, TN256CPT1, TN128CPT2, TN256CPT2,
 };
 
+/** @brief Diagnostic producer schedule and cooperation; all scalar arithmetic remains ordered. */
+enum class NativeQ8SerialProducerLoads : std::uint8_t { Original, TwoK32Lookahead, K32ContributionTile4x32 };
+
 /** @brief Complete forceable geometry inventory; no nominal/no-op candidates. */
 inline constexpr std::array kNativeQ8SerialGeometries{
     NativeQ8SerialGeometry::TN64CPT1, NativeQ8SerialGeometry::TN128CPT1,
     NativeQ8SerialGeometry::TN256CPT1, NativeQ8SerialGeometry::TN128CPT2,
     NativeQ8SerialGeometry::TN256CPT2};
 
-/** @brief Physical geometry with an exact, derived workgroup width. */
+/** @brief Original scalar producer/ordered reducer geometry, with its exact workgroup width. */
 struct NativeQ8SerialGeometrySpec
 {
     int tile_columns; ///< Independent output columns per workgroup.
@@ -60,6 +65,40 @@ struct NativeQ8SerialGeometrySpec
     throw std::invalid_argument("unknown ROCm native-Q8 serial geometry");
 }
 
+/** @brief Actual producer ownership, distinct from the original ordered reducer geometry. */
+struct NativeQ8SerialProducerSpec
+{
+    int tile_columns; ///< Independent output columns in one physical CTA.
+    int columns_per_thread; ///< Scalar output ownership before K cooperation.
+    int k_contributors; ///< Independent K32 producer groups per output column.
+    int block_threads; ///< tile_columns / columns_per_thread * k_contributors.
+};
+/**
+ * @brief Resolve physical producer mapping without changing original reducer ownership.
+ * @param geometry Original scalar/reducer geometry; all five existing values retain their ABI.
+ * @param loads Explicit admitted producer program, including its K cooperation.
+ * @return Exact physical launch mapping; no resource or device access occurs.
+ * @throws std::invalid_argument For an unimplemented combination, never substitutes another program.
+ */
+[[nodiscard]] constexpr NativeQ8SerialProducerSpec nativeQ8SerialProducerSpec(
+    NativeQ8SerialGeometry geometry, NativeQ8SerialProducerLoads loads)
+{
+    const auto original=nativeQ8SerialGeometrySpec(geometry);
+    switch(loads)
+    {
+    case NativeQ8SerialProducerLoads::Original:
+        return {original.tile_columns,original.columns_per_thread,1,original.block_threads};
+    case NativeQ8SerialProducerLoads::TwoK32Lookahead:
+        if(geometry==NativeQ8SerialGeometry::TN64CPT1||geometry==NativeQ8SerialGeometry::TN128CPT1)
+            return {original.tile_columns,original.columns_per_thread,1,original.block_threads};
+        break;
+    case NativeQ8SerialProducerLoads::K32ContributionTile4x32:
+        if(geometry==NativeQ8SerialGeometry::TN128CPT1)return {32,1,4,128};
+        break;
+    }
+    throw std::invalid_argument("native-Q8 producer program has no admitted geometry combination");
+}
+
 /** @brief Loaded specialization resources observed outside captured execution. */
 struct NativeQ8SerialKernelResources
 {
@@ -79,20 +118,24 @@ class NativeQ8SerialGeometryAdmission;
  * @brief Authenticate both exact symbols before a diagnostic capture/timing run.
  * @param geometry Reviewed geometry to inspect.
  * @param device_ordinal Exact HIP device owning the loaded functions.
+ * @param producer_loads Explicit producer schedule; Original preserves every existing entry.
  * @return Sealed immutable resource proof, without launching any kernel.
  * @throws std::invalid_argument for unknown geometry or invalid device.
  * @throws std::logic_error during capture.
  * @throws std::runtime_error for incomplete, nonresident, or private-memory resources.
  */
 [[nodiscard]] NativeQ8SerialGeometryAdmission admitNativeQ8SerialGeometry(
-    NativeQ8SerialGeometry geometry, int device_ordinal);
+    NativeQ8SerialGeometry geometry, int device_ordinal,
+    NativeQ8SerialProducerLoads producer_loads=NativeQ8SerialProducerLoads::Original);
 
 /** @brief Only the successful native resource query can construct this capability. */
 class NativeQ8SerialGeometryAdmission final
 {
 public:
-    /** @return Authenticated geometry, unchanged when copied into a scope. */
+    /** @return Authenticated original scalar/reducer geometry; producerSpec owns physical K cooperation. */
     [[nodiscard]] NativeQ8SerialGeometry geometry() const noexcept { return geometry_; }
+    /** @return Exact producer schedule authenticated by its compiled symbol. */
+    [[nodiscard]] NativeQ8SerialProducerLoads producerLoads() const noexcept { return producer_loads_; }
     /** @return Device on which HIP authenticated both functions. */
     [[nodiscard]] int deviceOrdinal() const noexcept { return device_ordinal_; }
     /** @return Exact producer allocation and residency observation. */
@@ -101,18 +144,22 @@ public:
     [[nodiscard]] const NativeQ8SerialKernelResources &reducerResources() const noexcept { return reducer_; }
 
 private:
-    friend NativeQ8SerialGeometryAdmission admitNativeQ8SerialGeometry(NativeQ8SerialGeometry, int);
+    friend NativeQ8SerialGeometryAdmission admitNativeQ8SerialGeometry(
+        NativeQ8SerialGeometry,int,NativeQ8SerialProducerLoads);
     /**
      * @brief Seal complete resources after the sole native admission succeeds.
      * @param geometry Exact reviewed specialization pair.
      * @param device Native resource owner.
      * @param producer Authenticated producer allocation and residency.
      * @param reducer Authenticated ordered reducer allocation and residency.
+     * @param producer_loads Exact memory schedule of the inspected producer symbol.
      */
     NativeQ8SerialGeometryAdmission(NativeQ8SerialGeometry geometry, int device,
-        NativeQ8SerialKernelResources producer, NativeQ8SerialKernelResources reducer)
-        : geometry_(geometry), device_ordinal_(device), producer_(producer), reducer_(reducer) {}
+        NativeQ8SerialKernelResources producer, NativeQ8SerialKernelResources reducer,
+        NativeQ8SerialProducerLoads producer_loads)
+        : geometry_(geometry), producer_loads_(producer_loads), device_ordinal_(device), producer_(producer), reducer_(reducer) {}
     NativeQ8SerialGeometry geometry_;
+    NativeQ8SerialProducerLoads producer_loads_;
     int device_ordinal_;
     NativeQ8SerialKernelResources producer_;
     NativeQ8SerialKernelResources reducer_;
@@ -130,7 +177,8 @@ struct NativeQ8SerialKernelLaunch
 /** @brief Fixed-size immutable observation of one actual captured/enqueued operation. */
 struct NativeQ8SerialLaunch
 {
-    NativeQ8SerialGeometry geometry = NativeQ8SerialGeometry::TN128CPT1;
+    NativeQ8SerialGeometry geometry = NativeQ8SerialGeometry::TN128CPT1; ///< Original reducer geometry; producer receipt gives actual physical launch.
+    NativeQ8SerialProducerLoads producer_loads=NativeQ8SerialProducerLoads::Original; ///< Exact captured producer instruction schedule.
     int physical_n = 0; ///< Actual descriptor/output stride; never policy N.
     int arithmetic_policy_n = 0; ///< Source serial-partition selector width.
     int k = 0; ///< Full unchanged reduction width.

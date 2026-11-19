@@ -21,16 +21,14 @@
  *   6. Captured P4/H2560/M1 all-gather plus canonical ascending-rank FP32 sum
  *
  * **Target hardware**: AMD MI50 (gfx906), explicit two/four-device controls.
- * An isolated, single-test dependency experiment may select an absolute DSO
- * with LLAMINAR_RCCL_PERF_LIBRARY. It must be the process's first RCCL load;
- * ordinary tests retain the exact CMake-selected library. Selection never
- * substitutes a different library after an error or mutates a live runtime.
+ * Device admission uses the same configured RCCL dependency as production.
  *
  * @author GitHub Copilot
  * @date February 2026
  */
 
 #include <gtest/gtest.h>
+#include "../utils/PeerPushReplayValues.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -63,6 +61,15 @@
 #include "collective/backends/RCCLDynamicLoader.h"
 #include "kernels/common/ColumnShardAssemblyKernels.h"
 #include "kernels/common/TPRankOrderedReductionKernels.h"
+#include "collective/PeerPushReduction.h"
+#ifdef LLAMINAR_RCCL_NATIVE_REPLAY_OWNER
+#include "collective/LocalTPContext.h"
+#include "planning/CollectiveMemoryEstimator.h"
+#endif
+#include "collective/backends/ROCmPeerPushResources.h"
+#ifdef LLAMINAR_RCCL_NATIVE_REPLAY_OWNER
+#include "../utils/OriginalPeerPushReplayPlacement.h"
+#endif
 namespace rccl = llaminar2::rccl_dynamic;
 
 #define HIP_CHECK(call)                                                               \
@@ -175,6 +182,9 @@ namespace
     // Test Fixture
     // ============================================================================
 
+    /** @brief Keep unchanged-dependency timing separate from candidate replay qualification. */
+    enum class RankOrderedReplayMode { Functional, MixedPrefill, Abort, PairedTiming, ControlTiming, ControlProfile, FusedProfile };
+
     class Perf__RCCLAllreduceLatency : public ::testing::Test
     {
     protected:
@@ -192,6 +202,21 @@ namespace
         std::vector<rccl::ncclComm_t> comms_;
         int num_devices_ = 0;
         bool initialized_ = false;
+        bool inactive_owner_ = false; ///< Original discovery rank with no selected native participants.
+
+        /**
+         * @brief Share retained native-operation replay without mixing profiler candidates.
+         * @param mode Functional, unprofiled timing, or one explicit profiler arm.
+         * @param profileRows Positive exact row count for profiler modes; zero otherwise.
+         * @param tinyPush Select the retained peer-push kernel with its production storage owner.
+         */
+        void runRankOrderedReplay(RankOrderedReplayMode mode, int profileRows = 0, bool tinyPush = false);
+
+#ifdef LLAMINAR_RCCL_NATIVE_REPLAY_OWNER
+        /** @brief Capture, retire and reattach the native program under two real model PMAs. */
+        void replayOwnerReplacement(llaminar2::RankOrderedQuotePolicy quote_policy);
+#endif
+        static constexpr std::size_t ownerReplacementColumns = 33;
 
         // Maximum buffer size covers Ornith's canonical prefill publication:
         // 512 rows × (top-8 routes + four shared rank banks) × 2048 FP32.
@@ -207,12 +232,17 @@ namespace
             // Detect available ROCm devices
             int device_count = 0;
             hipError_t err = hipGetDeviceCount(&device_count);
+#ifdef LLAMINAR_RCCL_NATIVE_REPLAY_OWNER
+            ASSERT_EQ(err, hipSuccess);
+            ASSERT_GE(device_count, 2) << "Selected peer-push qualification requires two ROCm devices";
+#else
             if (err != hipSuccess || device_count < 2)
             {
                 GTEST_SKIP() << "Need at least 2 ROCm GPUs for allreduce benchmark (found "
                              << device_count << ")";
                 return;
             }
+#endif
 
             // Keep the historical two-device default, while allowing a focused
             // topology measurement to include every participant in a larger
@@ -230,42 +260,60 @@ namespace
                 num_devices_ = static_cast<int>(parsed);
             }
 
+            const std::string_view test_name = ::testing::UnitTest::GetInstance()->current_test_info()->name();
+            const bool ownerReplacement = test_name == "PeerPushCapturedOwnerReplacement" ||
+                                          test_name == "PeerPushAutomaticOwnerReplacement";
+            devices_.resize(num_devices_);
+#ifdef LLAMINAR_RCCL_NATIVE_REPLAY_OWNER
+            // The integration owner discovers the original MPI world. Select
+            // a real complete peer group without changing that world's ranks,
+            // CPU binding or visible physical inventory.
+            const auto selected = llaminar2::test::originalPeerPushReplayDevices(
+                std::size_t(num_devices_), llaminar2::DeviceType::ROCm,
+                test_name == "PeerPushAutomaticOwnerReplacement" ? "gfx906" : "");
+            if (selected.empty())
+            {
+                inactive_owner_ = true;
+                devices_.clear();
+                return; // Idle original ranks remain represented through MPI shutdown.
+            }
+            ASSERT_EQ(selected.size(), std::size_t(num_devices_));
+            for (int i = 0; i < num_devices_; ++i) devices_[i].ordinal = selected[i];
+#else
+            for (int i = 0; i < num_devices_; ++i) devices_[i].ordinal = i;
+#endif
+
             // Print current NCCL environment for reference
             printCurrentNCCLEnv();
 
-            // A dependency candidate owns a fresh, filtered test process. Refuse
-            // to mistake an already loaded DSO for the explicitly requested one.
-            if (const char *diagnostic_library = std::getenv("LLAMINAR_RCCL_PERF_LIBRARY"))
-            {
-                ASSERT_EQ(diagnostic_library[0], '/') << "Diagnostic RCCL DSO requires an absolute path";
-                ASSERT_FALSE(rccl::isLoaded()) << "Diagnostic RCCL DSO requires a fresh single-test process";
-                ASSERT_TRUE(rccl::load(diagnostic_library)) << rccl::getLastError();
-            }
-            else if (!rccl::isLoaded())
-            {
-                ASSERT_TRUE(rccl::load()) << "Failed to load RCCL: " << rccl::getLastError();
-            }
+            ASSERT_TRUE(rccl::load()) << "Failed to load RCCL: " << rccl::getLastError();
 
-            // Enable P2P access between devices
-            enableP2P();
+            if (!ownerReplacement)
+                ASSERT_NO_FATAL_FAILURE(enableP2P());
 
             // Allocate per-device resources
-            devices_.resize(num_devices_);
             for (int i = 0; i < num_devices_; ++i)
             {
-                devices_[i].ordinal = i;
-                HIP_CHECK(hipSetDevice(i));
-                HIP_CHECK(hipMalloc(&devices_[i].d_buffer, MAX_BUFFER_BYTES));
+                HIP_CHECK(hipSetDevice(devices_[i].ordinal));
+                HIP_CHECK(hipMalloc(&devices_[i].d_buffer, ownerReplacement ? (num_devices_ + 2) * ownerReplacementColumns * sizeof(float) : MAX_BUFFER_BYTES));
                 HIP_CHECK(hipStreamCreateWithFlags(&devices_[i].stream, hipStreamNonBlocking));
                 HIP_CHECK(hipEventCreateWithFlags(&devices_[i].start_event, hipEventDefault));
                 HIP_CHECK(hipEventCreateWithFlags(&devices_[i].stop_event, hipEventDefault));
 
+                if (ownerReplacement) continue; // This replay seeds only its exact host fixture inputs.
                 // Initialize buffer with device index (so allreduce produces known result)
                 std::vector<float> host_data(MAX_BUFFER_FLOATS, static_cast<float>(i + 1));
                 HIP_CHECK(hipMemcpy(devices_[i].d_buffer, host_data.data(),
                                     MAX_BUFFER_BYTES, hipMemcpyHostToDevice));
             }
 
+            // The owner-replacement fixture creates its communicator only
+            // through LocalTP, using the same original hardware discovery.
+            if (ownerReplacement)
+            {
+                initialized_ = true;
+                return;
+            }
             // Initialize RCCL communicators
             initRCCL();
 
@@ -349,16 +397,21 @@ namespace
         {
             for (int i = 0; i < num_devices_; ++i)
             {
-                HIP_CHECK(hipSetDevice(i));
+                ASSERT_EQ(hipSetDevice(devices_[i].ordinal), hipSuccess);
                 for (int j = 0; j < num_devices_; ++j)
                 {
                     if (i != j)
                     {
                         int can_access = 0;
-                        (void)hipDeviceCanAccessPeer(&can_access, i, j);
+                        ASSERT_EQ(hipDeviceCanAccessPeer(&can_access, devices_[i].ordinal, devices_[j].ordinal), hipSuccess);
+#ifdef LLAMINAR_RCCL_NATIVE_REPLAY_OWNER
+                        ASSERT_TRUE(can_access) << "Original peer capability changed before fixture materialization";
+#endif
                         if (can_access)
                         {
-                            (void)hipDeviceEnablePeerAccess(j, 0); // ignore already-enabled errors
+                            const auto result = hipDeviceEnablePeerAccess(devices_[j].ordinal, 0);
+                            ASSERT_TRUE(result == hipSuccess || result == hipErrorPeerAccessAlreadyEnabled);
+                            if (result == hipErrorPeerAccessAlreadyEnabled) (void)hipGetLastError();
                         }
                         else
                         {
@@ -372,17 +425,12 @@ namespace
         void initRCCL()
         {
             comms_.resize(num_devices_);
-
-            rccl::ncclUniqueId unique_id;
-            RCCL_CHECK(rccl::ncclGetUniqueId(&unique_id));
-
-            RCCL_CHECK(rccl::ncclGroupStart());
-            for (int i = 0; i < num_devices_; ++i)
-            {
-                HIP_CHECK(hipSetDevice(devices_[i].ordinal));
-                RCCL_CHECK(rccl::ncclCommInitRank(&comms_[i], num_devices_, unique_id, i));
-            }
-            RCCL_CHECK(rccl::ncclGroupEnd());
+            std::vector<int> ordinals;
+            for (const auto &device : devices_) ordinals.push_back(device.ordinal);
+            // Match production's completed original local clique. Native cost
+            // policies authenticated by InitAll must also apply in this probe;
+            // several individually initialized ranks cannot certify that policy.
+            RCCL_CHECK(rccl::ncclCommInitAll(comms_.data(),num_devices_,ordinals.data()));
 
             // Sync all devices after init
             for (int i = 0; i < num_devices_; ++i)
@@ -2197,6 +2245,165 @@ namespace
      * model, optional sidebands or claim of whole-model critical-path latency.
      * Protocol selection remains the original RCCL planner and process environment.
      */
+#include "RCCLRankOrderedReplay.inc"
+
+#ifdef LLAMINAR_RCCL_NATIVE_REPLAY_OWNER
+/** @test Two independent model PMAs reuse the same live RCCL clique after actual graph retirement. */
+TEST_F(Perf__RCCLAllreduceLatency, PeerPushCapturedOwnerReplacement)
+{
+    replayOwnerReplacement(llaminar2::RankOrderedQuotePolicy::ExplicitOnly);
+}
+
+/** @test The measured quartet uses the direct native graph without setting a transport diagnostic. */
+TEST_F(Perf__RCCLAllreduceLatency, PeerPushAutomaticOwnerReplacement)
+{
+    ASSERT_EQ(std::getenv("LLAMINAR_RCCL_RANK_ORDERED_PUSH"), nullptr);
+    replayOwnerReplacement(llaminar2::RankOrderedQuotePolicy::MeasuredDomain);
+}
+
+void Perf__RCCLAllreduceLatency::replayOwnerReplacement(llaminar2::RankOrderedQuotePolicy quote_policy)
+{
+    using namespace llaminar2;
+    if (inactive_owner_) return;
+    ASSERT_TRUE(initialized_);
+    ASSERT_EQ(devices_.size(), static_cast<size_t>(num_devices_));
+    const auto rank = test::originalPeerPushReplayWorldRank();
+    constexpr auto owner = PhysicalMemoryOwner::LocalCollective;
+    constexpr std::size_t columns = ownerReplacementColumns;
+    const auto bom = CollectiveMemoryEstimator::localTP(1, columns, CollectiveBackendType::RCCL);
+    std::vector<GlobalDeviceAddress> addresses;
+    for (const auto &d : devices_) addresses.push_back(GlobalDeviceAddress::rocm(d.ordinal));
+    std::vector<ncclLlaminarCompletionAuthority> previous;
+    std::shared_ptr<PhysicalMemoryAuthority> prior_memory;
+    for (int generation = 0; generation < 2; ++generation)
+    {
+        if (quote_policy == RankOrderedQuotePolicy::MeasuredDomain)
+        {
+            // Even after a prior generation releases its measured native communicator,
+            // a model without an admitted peer budget gets its own original transport.
+            const auto generic = createLocalTPContext(addresses, {}, CollectiveBackendType::RCCL);
+            ASSERT_FALSE(generic->hasRankOrderedPeerPush());
+            ASSERT_TRUE(generic->rankOrderedResources().empty());
+        }
+        auto tp = createLocalTPContext(addresses, {}, CollectiveBackendType::RCCL, quote_policy);
+        ASSERT_TRUE(tp->hasRankOrderedPeerPush());
+        const auto quote = tp->rankOrderedResources();
+        ASSERT_EQ(quote.size(), addresses.size());
+        PhysicalMemoryPlanBuilder plan;
+        std::size_t host = 0;
+        for (const auto &item : quote)
+        {
+            const auto bytes = item.device_bytes + bom.perDeviceBytes()
+                + CollectiveMemoryEstimator::nativePipelineBoundaryBytes(CollectiveBackendType::RCCL);
+            plan.add({rank, item.device, bytes, bytes}, owner, bytes);
+            host += item.hostBytes();
+        }
+        plan.add({rank, DeviceId::cpu(), host, host}, owner, host);
+        auto makeMemory = [&] {
+            return std::make_shared<PhysicalMemoryAuthority>(
+                std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(plan.build()), rank);
+        };
+        auto memory = makeMemory();
+        ASSERT_NE(memory, prior_memory);
+        ASSERT_TRUE(tp->reserveCollectiveResources(bom.backend_payload_capacity_bytes,
+            bom.fp16_scratch_elements, memory));
+        EXPECT_EQ(memory->reservedBytes(DeviceId::cpu(), owner), host);
+
+        // A new authority cannot replace the original while its attachment is live.
+        if (generation == 1)
+        {
+            auto foreign = makeMemory();
+            try
+            {
+                EXPECT_FALSE(tp->reserveCollectiveResources(bom.backend_payload_capacity_bytes,
+                    bom.fp16_scratch_elements, foreign));
+            }
+            catch (const std::logic_error &) {} // Closed by the earlier native control-word guard or attachment.
+            EXPECT_EQ(foreign->reservedBytes(DeviceId::cpu(), owner), 0u);
+        }
+
+        struct Executable
+        {
+            int ordinal;
+            hipGraph_t graph = nullptr;
+            hipGraphExec_t exec = nullptr;
+            ~Executable()
+            {
+                (void)hipSetDevice(ordinal);
+                if (exec) (void)hipGraphExecDestroy(exec);
+                if (graph) (void)hipGraphDestroy(graph);
+            }
+        };
+        std::vector<std::unique_ptr<Executable>> graphs;
+        for (std::size_t at = 0; at < devices_.size(); ++at)
+        {
+            const auto native = tp->nativeCompletionAuthority(at);
+            ASSERT_TRUE(native.valid());
+            const auto identity = native.binding();
+            if (generation == 0) previous.push_back(identity);
+            else
+            {
+                EXPECT_EQ(identity.abortFlag, previous[at].abortFlag);
+                EXPECT_EQ(identity.deviceCommunicator, previous[at].deviceCommunicator);
+            }
+
+            const auto &d = devices_[at];
+            auto graph = std::make_unique<Executable>();
+            graph->ordinal = d.ordinal;
+            ASSERT_EQ(hipSetDevice(d.ordinal), hipSuccess);
+            ASSERT_EQ(hipStreamBeginCapture(d.stream, hipStreamCaptureModeThreadLocal), hipSuccess);
+            const bool enqueued = tp->rankOrderedFP32OnStream(d.d_buffer, d.d_buffer + columns,
+                d.d_buffer, NativeCollectiveRows(DeviceRowRange::fullyActive(1), columns),
+                static_cast<int>(at), d.stream, "peer_attachment_lifecycle");
+            ASSERT_EQ(hipStreamEndCapture(d.stream, &graph->graph), hipSuccess);
+            ASSERT_TRUE(enqueued);
+            ASSERT_EQ(hipGraphInstantiate(&graph->exec, graph->graph, nullptr, nullptr, 0), hipSuccess);
+            graphs.push_back(std::move(graph));
+        }
+        for (int repeat = 0; repeat < 2; ++repeat)
+        {
+            const float base = static_cast<float>(generation * 10 + repeat * 3);
+            for (std::size_t at = 0; at < devices_.size(); ++at)
+            {
+                const auto &d = devices_[at];
+                std::array<float, columns> input;
+                input.fill(base + static_cast<float>(at));
+                ASSERT_EQ(hipSetDevice(d.ordinal), hipSuccess);
+                ASSERT_EQ(hipMemcpyAsync(d.d_buffer, input.data(), sizeof(input),
+                    hipMemcpyHostToDevice, d.stream), hipSuccess);
+                ASSERT_EQ(hipStreamSynchronize(d.stream), hipSuccess); // Fixture input ownership.
+                ASSERT_EQ(hipGraphLaunch(graphs[at]->exec, d.stream), hipSuccess);
+                ASSERT_EQ(hipEventRecord(d.stop_event, d.stream), hipSuccess);
+            }
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+            for (const auto &d : devices_)
+            {
+                ASSERT_EQ(hipSetDevice(d.ordinal), hipSuccess);
+                auto status = hipEventQuery(d.stop_event);
+                while (status == hipErrorNotReady && std::chrono::steady_clock::now() < deadline)
+                {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    status = hipEventQuery(d.stop_event);
+                }
+                if (status != hipSuccess) tp->requestAbort();
+                ASSERT_EQ(status, hipSuccess);
+                std::array<float, columns> output;
+                ASSERT_EQ(hipMemcpy(output.data(), d.d_buffer, sizeof(output), hipMemcpyDeviceToHost), hipSuccess);
+                float expected = 0;
+                for (std::size_t at = 0; at < devices_.size(); ++at) expected += base + static_cast<float>(at);
+                for (const auto value : output) EXPECT_EQ(value, expected);
+            }
+        }
+        graphs.clear(); // Exact terminal events retired before final captured reader release.
+        tp.reset(); // The peer attachment retires, the original RCCL coordinator is pooled.
+        EXPECT_EQ(memory->reservedBytes(DeviceId::cpu(), owner), 0u);
+        for (const auto &item : quote) EXPECT_EQ(memory->reservedBytes(item.device, owner), 0u);
+        prior_memory = std::move(memory);
+    }
+}
+#endif
+
+
     TEST_F(Perf__RCCLAllreduceLatency, A1CanonicalRankOrderP4H2560M1)
     {
         if (!initialized_) GTEST_SKIP();

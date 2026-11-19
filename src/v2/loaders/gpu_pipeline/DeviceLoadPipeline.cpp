@@ -102,7 +102,8 @@ namespace llaminar2
                     "coalesceContiguousWeightJobs requires a non-null immutable source identity for '" +
                     job.name + "'");
             }
-            if (job.bounded_source || !job.host_raw_data || job.raw_bytes == 0 || job.N <= 0 || job.K <= 0 ||
+            job.validateSource();
+            if (job.N <= 0 || job.K <= 0 ||
                 job.raw_bytes % static_cast<size_t>(job.N) != 0)
             {
                 throw std::invalid_argument(
@@ -140,10 +141,10 @@ namespace llaminar2
                 if (lhs_identity != rhs_identity)
                     return lhs_identity < rhs_identity;
 
-                const auto lhs_source = reinterpret_cast<uintptr_t>(
-                    jobs[lhs_index].host_raw_data);
-                const auto rhs_source = reinterpret_cast<uintptr_t>(
-                    jobs[rhs_index].host_raw_data);
+                const auto lhs_source = jobs[lhs_index].bounded_source ? jobs[lhs_index].source_offset_bytes :
+                    reinterpret_cast<uintptr_t>(jobs[lhs_index].host_raw_data);
+                const auto rhs_source = jobs[rhs_index].bounded_source ? jobs[rhs_index].source_offset_bytes :
+                    reinterpret_cast<uintptr_t>(jobs[rhs_index].host_raw_data);
                 return lhs_source < rhs_source;
             });
 
@@ -163,19 +164,20 @@ namespace llaminar2
                 const auto &previous = jobs[previous_index];
                 const size_t previous_bytes_per_row =
                     previous.raw_bytes / static_cast<size_t>(previous.N);
-                const auto previous_address = reinterpret_cast<uintptr_t>(
-                    previous.host_raw_data);
-                const auto source_address = reinterpret_cast<uintptr_t>(
-                    source.host_raw_data);
+                const auto previous_address = previous.bounded_source ? previous.source_offset_bytes :
+                    reinterpret_cast<uintptr_t>(previous.host_raw_data);
+                const auto source_address = source.bounded_source ? source.source_offset_bytes :
+                    reinterpret_cast<uintptr_t>(source.host_raw_data);
                 const bool previous_end_representable =
                     previous_address <=
                     std::numeric_limits<uintptr_t>::max() - previous.raw_bytes;
 
                 append =
                     source_identities[source_index] == source_identities[previous_index] &&
+                    source.bounded_source == previous.bounded_source &&
                     source.format == previous.format &&
                     source.N == previous.N &&
-                    source.K == previous.K &&
+                    source.K == previous.K && source.columns == previous.columns &&
                     source.is_asymmetric == previous.is_asymmetric &&
                     source.packed_payload_capacity_bytes_per_block ==
                         previous.packed_payload_capacity_bytes_per_block &&
@@ -1101,6 +1103,7 @@ namespace llaminar2
                     full_n, job.row_offset,
                     job.packed_group_rows,
                     static_cast<int>(allocated_payload_bytes_per_block),
+                    job.columns.value_or(NativeQuantisedRepackColumns::whole(job.K)),
                     repack_stream_);
 
                 if (!repack_ok)

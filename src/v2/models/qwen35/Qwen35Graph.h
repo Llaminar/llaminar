@@ -359,6 +359,13 @@ namespace llaminar2
 
     protected:
         /**
+         * @brief Read the original main-layer schedule used by the attention builder.
+         * @param layer_idx Absolute layer index in the model.
+         * @return True for a declared GDN layer.
+         */
+        bool isGDNLayer(int layer_idx) const;
+
+        /**
          * @brief Compose the real GDN Stage6 output projection from frozen source and query ownership.
          * @param graph Participant-local graph receiving the projection node.
          * @param prefix Original layer prefix, independent of arithmetic selection.
@@ -467,11 +474,6 @@ namespace llaminar2
             DeviceId device,
             const std::vector<int> *sequence_lengths,
             const int32_t *sequence_lengths_device);
-
-        /**
-         * @brief Check if a layer uses GDN (vs full attention)
-         */
-        bool isGDNLayer(int layer_idx) const;
 
         /** Graph-construction-only owner for depth-specific sidecar policy. */
         bool mtp_graph_context_active_ = false;

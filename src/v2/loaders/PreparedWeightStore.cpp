@@ -1,6 +1,6 @@
 #include "PreparedWeightStore.h"
 #include "tensors/PreparedCPUWeightTensor.h"
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 #include "loaders/PreparedWeightIdentityContract.h"
 #include "planning/PhysicalMemoryAuthority.h"
 #include "GPUVramPreflight.h"
@@ -227,8 +227,8 @@ namespace llaminar2
         validateBindingForStore(binding, model_id_, kind);
 
         auto requested_placement = CPUWeightStoragePlacement::local();
-        if(binding.cpu_joint_source) {
-            const auto& selection=*binding.cpu_joint_source;
+        if(binding.joint_source) {
+            const auto& selection=*binding.joint_source;
             const auto& member=selection.participant();
             if(device!=DeviceId::cpu() || !binding.projection_ownership ||
                selection.ownership()!=*binding.projection_ownership ||
@@ -253,7 +253,7 @@ namespace llaminar2
 
         using Factory=llaminar::v2::kernels::KernelFactory;
         std::shared_ptr<Factory::PreparedGemmHandle> owned;
-        if(binding.cpu_joint_source) {
+        if(binding.joint_source) {
             if(binding.floating_operand_precision!=FloatingActivationOperandPrecision::Native)
                 throw std::invalid_argument("CPU joint source requires its original native arithmetic");
             // The existing expert factory owns final floating bytes as well as

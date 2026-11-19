@@ -950,6 +950,23 @@ namespace llaminar2
         return true;
     }
 
+    bool AMDDeviceContext::recordCapturedTimingEventChecked(void *event, void *stream)
+    {
+        if (!event || reinterpret_cast<std::uintptr_t>(stream) <= 2)
+            throw std::invalid_argument("HIP captured timing requires an event and exact non-default stream");
+        if (!setAMDDeviceForResource(device_ordinal_, "recordCapturedTimingEventChecked"))
+            return false;
+        hipStreamCaptureStatus status = hipStreamCaptureStatusNone;
+        HIP_CHECK(hipStreamIsCapturing(static_cast<hipStream_t>(stream), &status));
+        if (status != hipStreamCaptureStatusActive)
+            throw std::logic_error("HIP captured timing requires its active original capture");
+        // External here means a retained event-record node, not an external
+        // coherence publication. The original graph owns its ordering edge.
+        HIP_CHECK(hipEventRecordWithFlags(static_cast<hipEvent_t>(event),
+            static_cast<hipStream_t>(stream), hipEventRecordExternal));
+        return true;
+    }
+
     void AMDDeviceContext::waitEvent(void *event, void *stream)
     {
         if (!event)

@@ -46,6 +46,13 @@
 #include "planning/ActivationMemoryEstimator.h"
 #include "planning/CollectiveMemoryEstimator.h"
 #include "planning/WorkspaceMemoryEstimator.h"
+#ifdef HAVE_ROCM
+#include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNWorkspace.h"
+#include "models/qwen4exp/Qwen4ExpRetainedM1HCFFNPolicy.h"
+#include "models/qwen4exp/Qwen4ExpRetainedGDNPreAttentionPolicy.h"
+#include "execution/compute_stages/stages/qwen4exp/RetainedGDNPreAttentionStage.h"
+#include "utils/DebugEnv.h"
+#endif
 #include "planning/PlanningMemoryQuoteReuse.h"
 #include "execution/compute_stages/stages/GDNLiveStateWorkspaceContract.h"
 #include "kernels/HybridGDNStateGeometry.h"
@@ -747,7 +754,10 @@ ActivationGraphMemoryGeometry continuationActivationGeometry(const ModelMemoryPr
             .first_layer = cfg.first_layer,
             .last_layer = cfg.last_layer >= 0 ? cfg.last_layer : profile.n_layers - 1,
             .total_shards = cfg.total_shards,
+            .shard_index = cfg.shard_index,
+            .shared_tp_assignment = cfg.tensor_parallel_assignment,
             .routed_compute_policy = cfg.routed_compute_policy,
+            .gpu_expert_intermediate_tiling = cfg.gpu_expert_intermediate_tiling,
             .mtp_target_query_rows = cfg.mtp_target_query_rows,
             .retained_mtp_candidate_rows = cfg.mtp_enabled ? cfg.mtp_target_query_rows : 0,
             .mtp_terminal_logits_layout =
@@ -2186,6 +2196,14 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                         *cfg.local_tp_backend)
                         .perDeviceBytes();
             }
+            if (cfg.rank_ordered_resources)
+            {
+                if (cfg.local_tp_backend != CollectiveBackendType::RCCL ||
+                    cfg.rank_ordered_resources->device != cfg.device || !cfg.device.is_rocm())
+                    throw std::invalid_argument("Native peer reduction BOM lost its original RCCL participant");
+                collective_bytes = checkedAdd(collective_bytes, cfg.rank_ordered_resources->device_bytes,
+                    "native rank-ordered connector backing");
+            }
             if (cfg.local_pipeline_backend.has_value())
                 collective_bytes += CollectiveMemoryEstimator::nativePipelineBoundaryBytes(*cfg.local_pipeline_backend);
         }
@@ -2309,6 +2327,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     .device_compute_units = cfg.device_compute_units,
                     .cpu_execution = cfg.cpu_execution,
                     .batch_size = cfg.batch_size,
+                    .gate_up_publication = cfg.gate_up_publication,
+                    .down_publication = cfg.down_publication,
                     .ordinary_terminal_projection = cfg.ordinary_terminal_projection,
                     .resident_graph_rows = activation_seq,
                     .max_context_rows = max_seq,
@@ -2394,6 +2414,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     .device_compute_units = cfg.device_compute_units,
                     .cpu_execution = cfg.cpu_execution,
                     .batch_size = cfg.batch_size,
+                    .gate_up_publication = cfg.gate_up_publication,
+                    .down_publication = cfg.down_publication,
                         .resident_graph_rows = activation_seq,
                         .max_context_rows = max_seq,
                         .owns_embedding = false,
@@ -2532,6 +2554,33 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             }
         }
 
+#ifdef HAVE_ROCM
+        if (cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+            cfg.device.is_rocm() && profile.flash_next && cfg.first_layer < profile.mainLayerCount() &&
+            cfg.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
+            useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNEnabled(cfg.usesQFNMI50TP4()),ForwardExecutionPhase::Decode,
+                ForwardExecutionRole::MainInference,1,cfg.batch_size))
+        {
+            // The same serial family backs all original graph shapes. Add the
+            // retained instance slots once, before PMA scales physical owners.
+            workspace_bytes = checkedAdd(workspace_bytes,
+                rocm::retainedM1HCFFNWorkspace().total_bytes_with_alignment(),
+                "QFN retained M1 serial-family workspace");
+        }
+        if (profile.flash_next && cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+            usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionEnabled(cfg.usesQFNMI50TP4()), cfg.device,
+                cfg.routed_compute_policy, ForwardExecutionPhase::Decode,
+                ForwardExecutionRole::MainInference, 1, cfg.batch_size))
+        {
+            const int last_main = std::min(last_layer, profile.mainLayerCount() - 1);
+            if (last_main >= cfg.first_layer &&
+                static_cast<size_t>(last_main - cfg.first_layer + 1) >
+                    profile.flashNextSparseLayerCount(cfg.first_layer, last_main))
+                workspace_bytes = checkedAdd(workspace_bytes,
+                    retainedGDNPreAttentionWorkspace().total_bytes_with_alignment(),
+                    "QFN retained GDN serial-family workspace");
+        }
+#endif
         // Distinct graph owners can reuse one serial family across shapes,
         // but cannot alias one physical block while they run concurrently.
         workspace_bytes = checkedMultiply(
@@ -2637,7 +2686,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
              prefix_cache_host_staging_bytes != 0u ||
              cfg.weight_load_staging.host_bytes != 0u || pipeline_host_bytes != 0u ||
              (native_table_bytes != 0u && !native_ngram_lookup) || immutable_lookup_host_bytes != 0u ||
-             mixed_source_table || mixed_source_staging))
+             mixed_source_table || mixed_source_staging ||
+             (cfg.rank_ordered_resources && cfg.rank_ordered_resources->hostBytes())))
         {
             if (!cfg.associated_host_memory.has_value() ||
                 !cfg.associated_host_memory->valid() ||
@@ -2670,6 +2720,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 PhysicalMemoryOwner::WeightLoadStaging,
                 cfg.weight_load_staging.host_bytes);
             host_builder.add(PhysicalMemoryOwner::ActivationTransportStaging, pipeline_host_bytes);
+            if (cfg.rank_ordered_resources)
+                host_builder.add(PhysicalMemoryOwner::LocalCollective, cfg.rank_ordered_resources->hostBytes());
             appendPhysicalPlan(
                 result,
                 DeviceMemoryPlan(

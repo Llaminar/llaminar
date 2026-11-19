@@ -66,7 +66,7 @@ namespace
             DeviceMoERebalanceCommandBufferHeader *, const DeviceMoEExpertDirectoryEntry *,
             uint32_t, const DeviceMoERebalanceConfig &, DeviceMoERebalanceApplyStatus *,
             DeviceMoERebalanceGraphControllerState *, int target_row, uint32_t,
-            const int32_t *, RoutedExpertRowExecutionPolicy) override
+            const int32_t *, RoutedExpertRowExecutionPolicy, const int32_t *) override
         {
             ++calls;
             rows = runtime_rows;

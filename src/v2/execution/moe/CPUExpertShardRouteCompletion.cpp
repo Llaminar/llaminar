@@ -4,7 +4,7 @@
  */
 #include "CPUExpertShardRouteCompletion.h"
 #include "collective/GlobalTPContext.h"
-#include "CPUExpertShardSourceSelection.h"
+#include "ExpertShardSourceSelection.h"
 #include "MoEOverlayRouteTarget.h"
 #include "MoEExpertOverlayPreparationPlan.h"
 #include "../../collective/IGlobalTPContext.h"
@@ -16,11 +16,11 @@ bool CPUExpertShardRouteCompletion::matches(const MoEOverlayActivationEpochContr
         prepared_->sourceSelection() != source_ || !bank_ ||
         bank_->participant_id != prepared_->participantId() ||
         !bank_->containsModelLayer(prepared_->layer()) ||
-        bank_->layerForModelLayer(prepared_->layer()).cpu_fragment_family != prepared_->family() ||
+        bank_->layerForModelLayer(prepared_->layer()).fragment_family != prepared_->family() ||
         bank_->layerForModelLayer(prepared_->layer())
-            .cpu_fragment_family.owner_before(prepared_->family()) ||
+            .fragment_family.owner_before(prepared_->family()) ||
         prepared_->family().owner_before(
-            bank_->layerForModelLayer(prepared_->layer()).cpu_fragment_family) ||
+            bank_->layerForModelLayer(prepared_->layer()).fragment_family) ||
         bank_->epoch != control.buffers[moeOverlayActivationBufferIndex(stage)]
                             .dispatch_descriptor.placement_epoch ||
         !native->authenticatesOriginalCPUExpertBorrow(context_) || control_ != &control ||
@@ -34,11 +34,11 @@ bool CPUExpertShardRouteCompletion::matches(const MoEOverlayActivationEpochContr
         source_->participantIndex() != static_cast<size_t>(context_->myIndex()) || root_ < 0 ||
         root_ >= context_->degree())
         return false;
-    const auto original_map = prepared_->family()->preparation()->cpuJointOwnerMap();
+    const auto original_map = prepared_->family()->preparation()->jointOwnerMap();
     const auto *member =
         original_map ? original_map->participantForId(prepared_->participantId()) : nullptr;
     if (!member ||
-        identity.cohort_target != MoEOverlayRouteTarget::cpuCohort(member->tier_idx).word())
+        identity.cohort_target != MoEOverlayRouteTarget::cohort(member->tier_idx).word())
         return false;
     const auto expected = source_->participantIndex() == static_cast<size_t>(root_)
                               ? MoEOverlayActivationReturnRole::JointRoot

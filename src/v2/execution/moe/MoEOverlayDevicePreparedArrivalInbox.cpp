@@ -12,6 +12,9 @@
 #include "MoEOverlayDevicePreparedArrivalInbox.h"
 
 #include "DeviceMoEExpertDescriptorBuilder.h"
+#include "MoEExpertShardCohort.h"
+#include "MoEIntermediateShardDescriptorDeclaration.h"
+#include "MoERuntimeTable.h"
 #include "backends/IBackend.h"
 #include "MoEOverlayDeviceTransportProtocol.h"
 #include "transfer/TransferEngine.h"
@@ -86,6 +89,10 @@ namespace llaminar2
             throw std::invalid_argument(
                 "device prepared-arrival inbox requires a complete GPU publication binding, positive capacity, and exact consumer stream");
         }
+        if (const auto *original = config_.runtime_binding.runtime_table_host;
+            original && !config_.runtime_binding.matchesLayerScope(
+                original->firstModelLayer(), static_cast<std::uint32_t>(original->layerCount())))
+            throw std::invalid_argument("device prepared-arrival inbox changed its original runtime layer scope");
 
         const int ordinal = config_.runtime_binding.device.gpu_ordinal();
         const std::size_t arrival_bytes =
@@ -163,6 +170,112 @@ namespace llaminar2
         };
     }
 
+    bool MoEOverlayDevicePreparedArrivalInbox::exportDestinationArrival(
+        const MoEOverlayTierMigration &migration,
+        std::span<const MoEOverlayParticipantDestinationArrival> arrivals,
+        std::uint64_t candidate_epoch, int participant_id,
+        const MoEIntermediateShardDescriptorDeclaration *source,
+        std::optional<DeviceMoEExpertDescriptor> &output,
+        std::string *error) noexcept
+    {
+        if (error)
+            error->clear();
+        const auto target = MoEExpertPlacementTarget::fromPlacement(migration.destination);
+        if (!target || candidate_epoch == 0u || participant_id < 0 ||
+            migration.layer_idx < 0 || migration.expert_id < 0 ||
+            migration.destination.layer_idx != migration.layer_idx ||
+            migration.destination.expert_id != migration.expert_id)
+            return reject(error, "device arrival has no exact original destination target");
+
+        bool is_local = false;
+        for (std::size_t member = 0; member < target->participantCount(); ++member)
+            is_local = is_local || target->participantId(member) == participant_id;
+        const MoEOverlayPreparedExpertArrival *local = nullptr;
+        for (std::size_t index = 0; index < arrivals.size(); ++index)
+        {
+            const auto &entry = arrivals[index];
+            bool belongs = false;
+            for (std::size_t member = 0; member < target->participantCount(); ++member)
+                belongs = belongs || target->participantId(member) == entry.participant_id;
+            if (!belongs || !entry.arrival ||
+                std::any_of(arrivals.begin(), arrivals.begin() + index,
+                    [&entry](const auto &previous) { return previous.participant_id == entry.participant_id; }))
+                return reject(error, "device arrival repeats or replaces an original destination member");
+            if (entry.arrival->isJointFragment() != target->isCohort())
+                return reject(error, "device arrival changed the original whole/cohort payload arm");
+            if (entry.participant_id == participant_id)
+                local = entry.arrival.get();
+        }
+        if (!is_local)
+        {
+            // The rank can retain incomplete sibling arrivals. This inbox owns
+            // no payload inspection or descriptor publication for those peers.
+            output.reset();
+            return true;
+        }
+        if (!local)
+            return reject(error, "device arrival is missing the exact local destination member");
+
+        DeviceMoEExpertDescriptor descriptor{};
+        if (target->isCohort())
+        {
+            MoEOverlayPreparedFragmentPayload fragment;
+            const auto *family = source ? source->originalFamily() : nullptr;
+            if (!family)
+                return reject(error, "device fragment arrival has no original runtime-bound family");
+            if (local->destinationEpoch() != candidate_epoch)
+                return reject(error, "device fragment arrival belongs to a different candidate epoch");
+            if (!local->completeFragment(fragment, error))
+                return false;
+            const auto &cohort = migration.destination.shard_cohort;
+            if (!family->accepts(fragment, migration.expert_id) ||
+                fragment.arrivalEpoch() != candidate_epoch)
+                return reject(error, "device fragment arrival replaced its original family, expert or arrival epoch");
+            if (fragment.cohort() != cohort || fragment.cohort().owner_before(cohort) ||
+                cohort.owner_before(fragment.cohort()) || cohort->source().layer_idx != migration.layer_idx)
+                return reject(error, "device fragment arrival replaced its original source cohort or model layer");
+            if (fragment.participantIndex() >= cohort->participants().size() ||
+                cohort->participants()[fragment.participantIndex()].participant_id != participant_id ||
+                !cohort->participants()[fragment.participantIndex()].address.isGPU())
+                return reject(error, "device fragment arrival changed its original global GPU member");
+            if (!exportDeviceMoEFragmentWeightDescriptors(fragment, descriptor))
+                return reject(error, "device fragment arrival has incomplete native projection geometry");
+            if (!matchesExportedFragment(*source, descriptor))
+                return reject(error, "device fragment arrival disagrees with its original source precision, physical planes or local geometry");
+            descriptor.logical_expert_id = migration.expert_id;
+            descriptor.owner_participant = -1;
+            descriptor.local_slot = migration.expert_id;
+            // Prepared bytes are not executable until candidate publication.
+            descriptor.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident);
+        }
+        else if (source)
+            return reject(error, "device whole arrival cannot occupy an original fragment lane");
+        else
+        {
+            MoEOverlayPreparedExpertPayload payload;
+            if (!local->completePayload(payload, error))
+                return false;
+            if (!exportArrival(payload, migration.expert_id, &descriptor))
+                return reject(error, "device whole arrival has no complete native destination payload");
+        }
+        output = descriptor;
+        return true;
+    }
+
+    bool MoEOverlayDevicePreparedArrivalInbox::matchesExportedFragment(
+        const MoEIntermediateShardDescriptorDeclaration &source,
+        const DeviceMoEExpertDescriptor &descriptor) noexcept
+    {
+        if (!source.valid() || descriptor.projection_set != DeviceMoEProjectionSet::IntermediateShard ||
+            descriptor.weight_format != source.weightFormat())
+            return false;
+        if (descriptor.weight_format == DeviceMoEWeightFormat::NativeQuantised)
+            return source.matchesPublishedNativeGateUp(descriptor.gate, descriptor.up) &&
+                source.matchesPublishedNativeDown(descriptor.down);
+        return source.matchesFloatingGateUp(descriptor.floating_gate, descriptor.floating_up) &&
+            source.matchesFloatingDown(descriptor.floating_down);
+    }
+
     bool MoEOverlayDevicePreparedArrivalInbox::stage(
         const MoEOverlayDevicePhysicalMovementBatch &batch,
         const MoEOverlayParticipantPreparedTransfers &prepared,
@@ -191,59 +304,22 @@ namespace llaminar2
                 "device prepared-arrival inbox rejected invalid or overlapping physical movement");
         }
 
-        std::fill_n(
-            prepared_arrivals_staging_,
-            batch.command_count,
-            DeviceMoEExpertDescriptor{});
+        std::fill_n(prepared_arrivals_staging_, batch.command_count, DeviceMoEExpertDescriptor{});
         std::uint32_t local_arrivals = 0u;
-        for (std::size_t ordinal = 0u;
-             ordinal < batch.migrations.size();
-             ++ordinal)
+        // Ready owns no captured reader of these pages. Failed staging never
+        // releases a transport receipt, so a rejected prefix is unpublished.
+        for (std::size_t ordinal = 0u; ordinal < batch.migrations.size(); ++ordinal)
         {
             const auto &migration = batch.migrations[ordinal];
             const auto &keyed = prepared.migrations[ordinal].destination_arrivals;
-            if (keyed.size() > 1u || (!keyed.empty() &&
-                (keyed.front().participant_id != migration.destination.owner_participant ||
-                 !keyed.front().arrival || keyed.front().arrival->isCPUJointFragment())))
-                return reject(error, "device inbox requires the exact whole-owner singleton arrival");
-            const auto arrival = keyed.empty() ? nullptr : keyed.front().arrival;
-            const bool local_destination =
-                migration.destination.owner_participant ==
-                config_.runtime_binding.overlay_participant_id;
-            if (!local_destination)
-            {
-                /*
-                 * `prepared` is process-local, not participant-filtered. A
-                 * rank with several GPU participants therefore retains the
-                 * sibling destination's lifetime in this same vector. Only
-                 * the matching inbox exports it; every other inbox leaves the
-                 * command ordinal zero so its apply graph cannot consume a
-                 * foreign descriptor. Rank ownership was already validated by
-                 * stageDevicePreparedTransfers before any inbox is enqueued.
-                 */
-                continue;
-            }
-            if (!arrival)
-            {
-                return reject(
-                    error,
-                    "device prepared-arrival inbox lost a local destination lifetime");
-            }
-            MoEOverlayPreparedExpertPayload payload;
-            std::string arrival_error;
-            if (!arrival->completePayload(payload, &arrival_error) ||
-                !exportArrival(
-                    payload,
-                    migration.expert_id,
-                    prepared_arrivals_staging_ + ordinal))
-            {
-                return reject(
-                    error,
-                    arrival_error.empty()
-                        ? "device prepared-arrival inbox could not export a complete local descriptor"
-                        : std::move(arrival_error));
-            }
-            ++local_arrivals;
+            const auto *source = config_.runtime_binding.runtime_table_host
+                ? config_.runtime_binding.runtime_table_host->fragmentDescriptorDeclaration(migration.layer_idx) : nullptr;
+            std::optional<DeviceMoEExpertDescriptor> descriptor;
+            if (!exportDestinationArrival(migration, keyed, batch.candidate_epoch,
+                    config_.runtime_binding.overlay_participant_id, source, descriptor, error))
+                return false;
+            prepared_arrivals_staging_[ordinal] = descriptor.value_or(DeviceMoEExpertDescriptor{});
+            local_arrivals += descriptor.has_value() ? 1u : 0u;
         }
 
         const std::size_t bytes =

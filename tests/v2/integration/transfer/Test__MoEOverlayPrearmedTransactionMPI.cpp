@@ -29,6 +29,7 @@
 #include "utils/MPIContext.h"
 
 #include "MoEOverlayDeviceRuntimePublicationFixture.h"
+#include "../../utils/MoEOverlayDynamicPolicyTestMemory.h"
 
 #include <gtest/gtest.h>
 #include <mpi.h>
@@ -189,6 +190,17 @@ namespace llaminar2::test
          * tier service prices. The topology remains non-trivial: four experts
          * reside in the continuation tier and twelve in the secondary tier.
          */
+        /** @brief Decode the fixture's recorded phase demand into its once-only global window. */
+        void retainRecordedSelectedDemand(MoEOverlayDevicePlacementPolicyInput &input)
+        {
+            if (!input.economy) throw std::logic_error("Recorded policy input has no complete phase evidence");
+            const auto plane = static_cast<std::size_t>(input.num_layers) * input.num_experts;
+            input.selected_demand.assign(plane, 0u);
+            for (std::uint32_t phase = 0; phase < kMoEOverlayDeviceControllerDemandPhaseCount; ++phase)
+                for (std::size_t row = 0; row < plane; ++row)
+                    input.selected_demand[row] += input.economy->phase_expert_demand.at(phase * plane + row);
+        }
+
         MoEOverlayDevicePlacementPolicyInput makeZeroDemandInput(
             const MoEOverlayDeviceControllerTopology &topology)
         {
@@ -201,7 +213,7 @@ namespace llaminar2::test
             input.command_capacity = 16u;
             input.dynamic_maximum_commands_per_wave = 16u;
             input.payload_bytes_per_layer.assign(kLayers, 4096u);
-            input.participants.reserve(topology.participants.size());
+            input.targets.reserve(topology.participants.size());
             for (const auto &participant : topology.participants)
             {
                 const auto *const group =
@@ -211,11 +223,11 @@ namespace llaminar2::test
                     throw std::logic_error(
                         "pre-armed topology participant has no controller group");
                 }
-                input.participants.push_back({
-                    .participant_id = static_cast<std::uint32_t>(
-                        participant.participant_id),
+                input.targets.push_back({
+                    .vertex_index = static_cast<std::uint32_t>(participant.participant_id),
                     .tier_priority = group->tier_priority,
                     .tier_index = participant.tier_idx,
+                    .target = MoEOverlayRouteTarget::whole(participant.participant_id),
                 });
             }
             input.collected_state.assign(
@@ -256,7 +268,7 @@ namespace llaminar2::test
                 kMoEOverlayDeviceControllerDemandPhaseCount * plane_words,
                 0u);
             economy.service_costs.assign(
-                static_cast<std::size_t>(economy.tier_count) * kLayers *
+                input.targets.size() * kLayers *
                     kMoEOverlayDeviceControllerEconomyServicePhaseCount,
                 10u);
             economy.migration_costs.assign(
@@ -290,22 +302,24 @@ namespace llaminar2::test
                 kMoEOverlayDeviceControllerNeverMovedGeneration);
             economy.payoff_horizon_tokens = 65'536u;
             input.economy = std::move(economy);
+            retainRecordedSelectedDemand(input);
             if (!input.valid())
             {
                 throw std::logic_error(
                     "pre-armed transaction fixture produced an invalid owner snapshot");
             }
+            retainRecordedSelectedDemand(input);
             return input;
         }
 
         /** Extract the exact immutable owner table represented by a snapshot. */
-        std::vector<std::uint32_t> initialOwners(
+        std::vector<MoEOverlayRouteTarget> initialOwners(
             const MoEOverlayDevicePlacementPolicyInput &input)
         {
-            std::vector<std::uint32_t> owners(
+            std::vector<MoEOverlayRouteTarget> owners(
                 static_cast<std::size_t>(input.num_layers) *
                     input.num_experts,
-                std::numeric_limits<std::uint32_t>::max());
+                MoEOverlayRouteTarget{});
             for (std::uint32_t layer = 0u; layer < input.num_layers; ++layer)
             {
                 for (std::uint32_t expert = 0u;
@@ -314,7 +328,7 @@ namespace llaminar2::test
                 {
                     std::uint32_t owner_count = 0u;
                     for (std::uint32_t participant = 0u;
-                         participant < input.participants.size();
+                         participant < input.targets.size();
                          ++participant)
                     {
                         const auto word = input.collected_state[
@@ -328,7 +342,7 @@ namespace llaminar2::test
                         {
                             owners[static_cast<std::size_t>(layer) *
                                        input.num_experts +
-                                   expert] = participant;
+                                   expert] = input.targets[participant].target;
                             ++owner_count;
                         }
                     }
@@ -395,8 +409,9 @@ namespace llaminar2::test
                         expert] = demand[expert];
                 }
             }
-            for (std::uint32_t tier = 0u; tier < economy.tier_count; ++tier)
+            for (std::uint32_t target = 0u; target < input.targets.size(); ++target)
             {
+                const auto tier = static_cast<std::uint32_t>(input.targets[target].tier_index);
                 for (std::uint32_t layer = 0u; layer < kLayers; ++layer)
                 {
                     for (std::uint32_t phase = 0u;
@@ -405,7 +420,7 @@ namespace llaminar2::test
                          ++phase)
                     {
                         economy.service_costs[
-                            (static_cast<std::size_t>(tier) * kLayers + layer) *
+                            (static_cast<std::size_t>(target) * kLayers + layer) *
                                 kMoEOverlayDeviceControllerEconomyServicePhaseCount +
                             phase] = tier == 0u ? 10u : 100u;
                     }
@@ -413,6 +428,7 @@ namespace llaminar2::test
             }
             if (!input.valid())
                 throw std::logic_error("adversarial pre-armed input is invalid");
+            retainRecordedSelectedDemand(input);
             return input;
         }
 
@@ -441,6 +457,15 @@ namespace llaminar2::test
                             : std::array<std::uint64_t, 3>{100u, 100u, 100u},
                     });
                 }
+            }
+            for (const auto &target : topology.logicalTargets())
+            {
+                if (!target.target.isWhole())
+                    throw std::logic_error("Pre-armed whole fixture has no genuine cohort service calibration");
+                const auto cost = target.tier_index == 0 ? 10u : 100u;
+                for (std::uint32_t layer = 0u; layer < kLayers; ++layer)
+                    service->target_costs.push_back({.target = target.target, .layer = static_cast<int>(layer),
+                        .nanoseconds_per_activation = {cost, cost, cost}});
             }
             auto migration =
                 std::make_shared<MoEOverlayMigrationCostProfile>();
@@ -491,6 +516,7 @@ namespace llaminar2::test
             PrearmedEndpoint(
                 MoEOverlayDeviceControllerParticipantBinding binding,
                 MoEOverlayDeviceRuntimePublicationFixture *fixture,
+                MoEOverlayDynamicPolicyShape policy_shape,
                 MoEOverlayDeviceDemandPhase demand_phase,
                 bool split_retirement = false,
                 bool direct_empty_decision = false)
@@ -533,21 +559,16 @@ namespace llaminar2::test
                         "pre-armed endpoint allocation failed");
                 }
 
+                if (binding_.authority_leader)
+                    policy_workspace_ = admitDynamicPolicyWorkspaceForTest(binding_.device, policy_shape, stream_);
+
                 const auto &runtime = fixture_->runtimeBinding();
-                const DeviceMoERebalanceConfig snapshot_config{
-                    .num_layers = runtime.layer_count,
-                    .num_experts = runtime.expert_count,
-                    .top_k = runtime.top_k,
-                    .participant_id = runtime.domain_participant_id,
-                    .participant_count = runtime.domain_participant_count,
-                    .root_participant = 0u,
-                    .window_size_tokens = 1u,
-                    .layer_window_start = 0u,
-                    .layer_window_count = runtime.layer_count,
-                    .layer_wave_count = runtime.layer_count,
-                };
-                if (!validateDeviceMoERebalanceConfig(snapshot_config))
-                    throw std::logic_error("invalid pre-armed snapshot geometry");
+                const MoEOverlayDeviceSnapshotBinding snapshot_config{
+                    .runtime_layers = runtime.runtime_layers_device,
+                    .layer_count = runtime.layer_count, .expert_count = runtime.expert_count,
+                    .top_k = runtime.top_k, .domain_participant_id = runtime.domain_participant_id,
+                    .domain_participant_count = runtime.domain_participant_count};
+                if (!snapshot_config.valid()) throw std::logic_error("Invalid original pre-armed snapshot geometry");
 
                 graph_ = context.createGraphCapture(stream_);
                 if (!graph_ || !graph_->beginCapture())
@@ -588,6 +609,8 @@ namespace llaminar2::test
                                 .policy_result = policy_action
                                                      ? policy_
                                                      : nullptr,
+                                .policy_workspace = policy_workspace_ ? policy_workspace_->binding()
+                                    : MoEOverlayDynamicPolicyWorkspaceBinding{},
                                 .runtime_publication = publication_action
                                     ? fixture_->publicationBinding()
                                     : MoEOverlayDeviceRuntimePublicationBinding{},
@@ -611,11 +634,10 @@ namespace llaminar2::test
                             demand_phase_);
                     }
                     captured = captured &&
-                        kernel_->packDeviceRebalanceHistograms(
-                            launch,
-                            runtime.runtime_layers_device,
-                            binding_.participant_collected_state,
-                            snapshot_config) &&
+                        kernel_->runMoEOverlayDeviceControllerAction(launch,
+                            {.binding = binding_.deviceBinding(),
+                                .action = MoEOverlayDeviceControllerAction::CollectRuntimeSnapshot,
+                                .snapshot = snapshot_config}) &&
                         action(
                             MoEOverlayDeviceControllerAction::
                                 PublishParticipantSnapshot);
@@ -768,6 +790,16 @@ namespace llaminar2::test
                 retirement_graph_.reset();
                 graph_.reset();
                 kernel_.reset();
+                if (policy_workspace_)
+                {
+                    // Diagnostic teardown only: the immutable header's async
+                    // setup upload and all graph consumers share this stream.
+                    // Retire it before the sole PMA owner releases its bytes.
+                    if (!backend_->recordEvent(terminal_, binding_.device.ordinal, stream_) ||
+                        !awaitEvent(backend_, binding_.device, terminal_, std::chrono::seconds(10)))
+                        std::terminate();
+                    policy_workspace_.reset();
+                }
                 if (policy_)
                     backend_->free(policy_, binding_.device.ordinal);
                 if (terminal_)
@@ -912,6 +944,7 @@ namespace llaminar2::test
             void *reader_stream_ = nullptr;
             void *reader_event_ = nullptr;
             MoEOverlayDeviceControllerPolicyResult *policy_ = nullptr;
+            std::unique_ptr<MoEOverlayDynamicPolicyWorkspaceOwner> policy_workspace_;
             std::unique_ptr<IGPUGraphCapture> graph_;
             std::unique_ptr<IGPUGraphCapture> retirement_graph_;
         };
@@ -954,7 +987,7 @@ namespace llaminar2::test
                 .initial_durable_epoch = kInitialEpoch,
                 .payload_bytes_per_layer =
                     policy_input.payload_bytes_per_layer,
-                .initial_owner_participants = initialOwners(policy_input),
+                .initial_route_targets = initialOwners(policy_input),
                 .minimum_window_activations = 1u,
                 .maximum_cycles_per_wave = 2u,
             });
@@ -981,6 +1014,9 @@ namespace llaminar2::test
             endpoints.push_back(std::make_unique<PrearmedEndpoint>(
                 binding,
                 fixtures.back().get(),
+                MoEOverlayDynamicPolicyShape{static_cast<std::uint32_t>(topology->participants.size()),
+                    static_cast<std::uint32_t>(topology->logicalTargets().size()),
+                    static_cast<std::uint32_t>(fabric->layout().header.tier_count), kExperts},
                 MoEOverlayDeviceDemandPhase::Prefill,
                 /*split_retirement=*/false,
                 /*direct_empty_decision=*/true));
@@ -1129,7 +1165,7 @@ namespace llaminar2::test
                 .initial_durable_epoch = kInitialEpoch,
                 .payload_bytes_per_layer =
                     policy_input.payload_bytes_per_layer,
-                .initial_owner_participants = initialOwners(policy_input),
+                .initial_route_targets = initialOwners(policy_input),
                 .minimum_window_activations = 1u,
                 .maximum_cycles_per_wave = 2u,
             });
@@ -1167,6 +1203,9 @@ namespace llaminar2::test
             endpoints.push_back(std::make_unique<PrearmedEndpoint>(
                 binding,
                 fixtures.back().get(),
+                MoEOverlayDynamicPolicyShape{static_cast<std::uint32_t>(topology->participants.size()),
+                    static_cast<std::uint32_t>(topology->logicalTargets().size()),
+                    static_cast<std::uint32_t>(fabric->layout().header.tier_count), kExperts},
                 MoEOverlayDeviceDemandPhase::Decode,
                 /*split_retirement=*/true));
         }

@@ -24,6 +24,7 @@
 #include "planning/RankHardwareOwnership.h"
 #include "planning/AutomaticPlanningStartup.h"
 #include "backends/GPUDeviceContextPool.h"
+#include "backends/NativeContextPreparation.h"
 #include "utils/MPIContext.h"
 #include "utils/Logger.h"
 #include "utils/DebugEnv.h"
@@ -282,8 +283,10 @@ namespace
                 OrchestrationStrategy::ExpertOverlay};
         size_t prices = 0;
         size_t multi_device_prices = 0, overlay_prices = 0;
+        std::vector<DeviceId> measured_devices;
         const auto result = AutomaticPlanningStartup::run(config, *inventory, mpi,
             [&](const AutomaticPlanningPreparation &context) -> std::optional<AutomaticOrchestrationPlanner::Evaluate> {
+                measured_devices = planningNativeContextDevices(context, mpi->rank());
                 auto service = AutomaticPlanningStartup::preparation()(context);
                 if (!context.isRoot())
                 {
@@ -371,6 +374,35 @@ namespace
         }
         else EXPECT_EQ(prices, 0u);
         EXPECT_TRUE(result.applied.execution_rank_selection);
+        acceptPlanningCostPreparation(mpi, [&] {
+            if (measured_devices.empty())
+                return;
+            const auto &observed = inventory->ranks.at(mpi->rank());
+            std::vector<PhysicalMemoryResource> resources{planningObservedResource(observed, DeviceId::cpu())};
+            for (const auto device : measured_devices)
+            {
+                EXPECT_THROW((void)GPUDeviceContextPool::instance().retainExistingContextProvenance(device),
+                             std::logic_error)
+                    << "Calibration must retire its original worker before publishing Apply";
+                resources.push_back(planningObservedResource(observed, device));
+            }
+            // Replay the runner's capacity observation from the same immutable
+            // observations. A surviving generic context would reject acquire
+            // as an unowned existing context, before the runner could load.
+            const auto next = NativeContextPreparation::create(resources, mpi->rank(), measured_devices);
+            try
+            {
+                for (const auto device : measured_devices)
+                    EXPECT_EQ(next->acquire(device).memory(), next->memory());
+                next->freezeForPlanning();
+            }
+            catch (...)
+            {
+                next->retireUnadmitted();
+                throw;
+            }
+            EXPECT_EQ(next->retireReleasedContexts(), measured_devices.size());
+        });
     }
 
     /**

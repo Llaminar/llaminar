@@ -16,7 +16,8 @@
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                 "-DCMAKE_CUDA_ARCHITECTURES=86",
                 "-DHAVE_CUDA=ON",
-                "-DHAVE_ROCM=ON"
+                "-DHAVE_ROCM=ON",
+                "-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=ON"
             ],
             "group": "build",
             "problemMatcher": [],
@@ -37,7 +38,8 @@
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                 "-DCMAKE_CUDA_ARCHITECTURES=86",
                 "-DHAVE_CUDA=ON",
-                "-DHAVE_ROCM=ON"
+                "-DHAVE_ROCM=ON",
+                "-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=ON"
             ],
             "group": "build",
             "problemMatcher": [],
@@ -58,7 +60,8 @@
                 "-DCMAKE_EXPORT_COMPILE_COMMANDS=ON",
                 "-DCMAKE_CUDA_ARCHITECTURES=86",
                 "-DHAVE_CUDA=ON",
-                "-DHAVE_ROCM=ON"
+                "-DHAVE_ROCM=ON",
+                "-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=ON"
             ],
             "group": "build",
             "problemMatcher": [],

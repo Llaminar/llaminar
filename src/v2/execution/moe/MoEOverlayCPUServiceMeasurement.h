@@ -23,6 +23,8 @@ namespace llaminar2
     struct RankInventory;
     class IGlobalTPContext;
     class ILocalTPContext;
+    class MoEOverlayOriginalGPUCohortContexts;
+    struct PlanningGPUCohortServiceObservation;
     /**
      * @brief Setup producer on the same rank-affined OpenMP execution as CPU serving.
      *
@@ -77,6 +79,34 @@ namespace llaminar2
             size_t host_bytes = 0; ///< Four actual CPUStorageRoot FP32 input/output/route banks.
             size_t device_bytes = 0; ///< Four GPU tensor copies plus original stage workspace.
         };
+        /** @brief Actual bounded roots shared by a complete GPU-cohort service probe. */
+        struct GPUJointStorageLayout {
+            GPUStorageLayout common;
+            CPUStorageRoot<float> canonical_routes, release, expected_output, observed_output;
+            CPUStorageRoot<int32_t> active_rows;
+            CPUStorageRoot<uint64_t> histogram_evidence;
+            /** @return Complete known host backing of these exact roots. */
+            size_t hostBytes() const;
+            /** @return Exact logical GPU copies; terminal evidence stays host-only. */
+            size_t deviceBytes() const;
+        };
+        /**
+         * @brief Declare private GPU-cohort probe roots without materializing them.
+         * @param geometry Original full H/F. @param experts Original complete E.
+         * @param rows Positive explicit service rows, not selected route capacity.
+         * @return Same root geometry later consumed by the actual probe.
+         */
+        static GPUJointStorageLayout gpuJointStorageLayout(Geometry geometry,int experts,int rows);
+        /**
+         * @brief Quote one private original GPU fragment service participant.
+         * @param geometry Original full H/F. @param experts Full original E.
+         * @param device Original GPU. @param invocation_bytes Merged actual compute/sum workspace.
+         * @return Exact tensor, private runtime metadata and workspace contributions.
+         * @note Original native context and graph-owner BOMs are contributed once separately.
+         */
+        static GPUAllocation gpuJointAllocationBytes(Geometry geometry,int experts,
+            DeviceId device,size_t invocation_bytes);
+
         /**
          * @brief Declare one serial GPU prepared-service scratch family before admission.
          * @param geometry Complete original expert dimensions.
@@ -173,6 +203,24 @@ namespace llaminar2
             const std::shared_ptr<IGlobalTPContext>& original_domain,
             const std::shared_ptr<PhysicalMemoryAuthority>& memory,
             std::span<float> diagnostic_output = {});
+
+        /**
+         * @brief Collect raw complete GPU target jobs with separate compute/frame communication units.
+         * @param registry Original source/family/member-keyed initial banks.
+         * @param plan Original checked target/class/phase sample declaration.
+         * @param contexts Same once-admitted per-domain native borrow roster.
+         * @param memory Original PMA. @param profile Original full source workspace metadata.
+         * @param inventory Actual original local GPU compute geometry.
+         * @return Locally rooted complete-cohort observations; no service price is installed.
+         * @note These observations must not be divided wholesale by expert activations.
+         * The existing target objective separately owns compute and once-frame occupancy.
+         */
+        static std::vector<PlanningGPUCohortServiceObservation> measurePreparedGPUTargets(
+            const MoEOverlayParticipantResidencyRegistry& registry,
+            const MoEOverlayPreparedTargetServicePlan& plan,
+            const MoEOverlayOriginalGPUCohortContexts& contexts,
+            const std::shared_ptr<PhysicalMemoryAuthority>& memory,
+            const ModelMemoryProfile& profile,const RankInventory& inventory);
 
         /**
          * @brief Execute deterministic original prepared-only target/class/phase jobs.

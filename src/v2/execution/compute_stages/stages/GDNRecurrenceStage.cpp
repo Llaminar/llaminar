@@ -63,6 +63,8 @@ namespace llaminar2
         auto identity = (0x47444e4c00000000ULL | static_cast<uint64_t>(layout)) ^ gdnQKCaptureIdentity(params_.qk_contract);
         if (params_.gpu_retained_workspace)
         {
+            if(params_.verifier_kernel_policy!=LocalGPUExpertKernelPolicy::Generic)
+                identity^=0x51464e47444e0001ULL;
             const auto &g = params_.gpu_retained_workspace->geometry();
             for (auto word : {std::uint64_t(g.requests()), std::uint64_t(g.rowsPerRequest()), std::uint64_t(g.heads()),
                     std::uint64_t(g.keyWidth()), std::uint64_t(g.valueWidth()), std::uint64_t(g.encoding()),
@@ -220,7 +222,7 @@ namespace llaminar2
             .terminal_kind = params_.gpu_retained_workspace->terminalKind(),
             .storage = {static_cast<float *>(pending.storage->data()), slots_bytes / sizeof(float)},
             .terminal = terminal, .workspace_owner_identity = pending.workspace_owner_identity,
-            .capture_stream = stream};
+            .capture_stream = stream, .verifier_kernel_policy=params_.verifier_kernel_policy};
         pending.invocation = params_.kernel->prepareRetainedInvocation(sources, binding);
         if (!pending.invocation) throw std::logic_error("Retained GDN backend did not prepare its selected native program");
         retained_gpu_.emplace(std::move(pending));

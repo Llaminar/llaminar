@@ -506,7 +506,7 @@ namespace llaminar2::test
 
         EXPECT_FALSE(result.ok());
         EXPECT_TRUE(hasErrorContaining(result, "expert_compute=tensor-sharded"));
-        EXPECT_TRUE(hasErrorContaining(result, "multi-participant collective domain"));
+        EXPECT_TRUE(hasErrorContaining(result, "no positive original domain-scoped TP membership"));
     }
 
     TEST(Test__MoERoutedExpertPlacementPlan, AcceptsSingleParticipantApportionmentAsDegenerateOwnership)

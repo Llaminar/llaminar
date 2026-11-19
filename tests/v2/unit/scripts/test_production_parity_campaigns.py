@@ -2005,9 +2005,11 @@ add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COM
                 self.assertEqual(kwargs["timeout"], 30)
                 for key in ("LLAMINAR_FORCE_CPU_ONLY_STARTUP", "LLAMINAR_SKIP_CUDA_STARTUP", "LLAMINAR_SKIP_ROCM_STARTUP"):
                     self.assertEqual(kwargs["env"][key], "0")
+                self.assertNotIn("HSA_OVERRIDE_GFX_VERSION", kwargs["env"])
                 output.write_text(json.dumps(hardware))
                 return subprocess.CompletedProcess(command, 0, "")
-            with mock.patch.object(campaigns.subprocess, "check_output", side_effect=ctest):
+            with mock.patch.dict(campaigns.os.environ, {"HSA_OVERRIDE_GFX_VERSION": "bogus"}), \
+                 mock.patch.object(campaigns.subprocess, "check_output", side_effect=ctest):
                 with mock.patch.object(campaigns.subprocess, "run", side_effect=export):
                     self.assertEqual(campaigns.observe_preflight_hardware(build, None), hardware)
                 with mock.patch.object(campaigns.subprocess, "run", side_effect=subprocess.CalledProcessError(2, [str(binary)])):
@@ -2212,12 +2214,17 @@ add_v2_test(V2_Integration_ObservedPipelineOddGeometryProbe COMMAND "${CMAKE_COM
         second = mock.Mock()
         second.poll.side_effect = [None, 0]
         with (
-            mock.patch.object(campaigns.subprocess, "Popen", side_effect=[first, second]),
+            mock.patch.dict(os.environ, {"HSA_OVERRIDE_GFX_VERSION": "9.0.6", "ROCR_VISIBLE_DEVICES": "2,3"}),
+            mock.patch.object(campaigns.subprocess, "Popen", side_effect=[first, second]) as launch,
             mock.patch.object(campaigns, "_terminate_process_group") as retire,
             mock.patch.object(campaigns.time, "sleep"),
         ):
             result = campaigns._run_preflight_parallel_processes(commands, None)
         self.assertEqual(result, {lanes.CUDA_SOCKET: 8, lanes.ROCM_SOCKET: 0})
+        self.assertEqual(launch.call_count, 2)
+        for call in launch.call_args_list:
+            self.assertNotIn("HSA_OVERRIDE_GFX_VERSION", call.kwargs["env"])
+            self.assertEqual(call.kwargs["env"]["ROCR_VISIBLE_DEVICES"], "2,3")
         retire.assert_not_called()
 
     def test_preflight_parallel_launch_failure_retires_started_peer(self) -> None:

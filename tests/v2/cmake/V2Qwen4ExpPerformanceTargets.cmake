@@ -109,3 +109,8 @@ if(HAVE_CUDA OR HAVE_ROCM)
         endif()
     endforeach()
 endif()
+
+if(HAVE_ROCM)
+    add_subdirectory("${_qfn_test_sources}/performance/kernels/rocm/roofline"
+        "${CMAKE_CURRENT_BINARY_DIR}/mi50-roofline")
+endif()

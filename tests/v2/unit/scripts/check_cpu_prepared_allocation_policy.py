@@ -340,6 +340,10 @@ def scan_source(path: str, raw: str) -> list[Violation]:
         if end+1 < len(tokens) and tokens[end+1].text == "{": continue
         if (path == "src/v2/kernels/KernelFactory.h" and interval is None and
             any("TensorBase" in text(arg) for arg in args)): continue
+        if (path == "src/v2/loaders/BoundedGPUExpertSource.h" and name == "createGemm" and not args
+                and [item.text for item in tokens[end + 1:end + 8]] ==
+                ["override", "{", "reject", "(", ")", ";", "}"]):
+            continue
         if name == "createGemm":
             if path.startswith(ROLES): reject("legacy createGemm bypasses prepared storage")
             continue

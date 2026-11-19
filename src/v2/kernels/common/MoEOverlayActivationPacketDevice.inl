@@ -951,7 +951,7 @@ namespace llaminar2::moe_activation_packet_device
         // owner or changing the original router-slot/weight publication order.
         // Metadata's existing complete-prefix validation also authenticates the
         // publisher's entire immutable union before any shared row is written.
-        if (MoEOverlayRouteTarget::fromWord(route_participant).isCPUCohort() &&
+        if (MoEOverlayRouteTarget::fromWord(route_participant).isCohort() &&
             moeOverlayJointRouteWeightIsZero(route_weight))
         {
             *participant = -1;

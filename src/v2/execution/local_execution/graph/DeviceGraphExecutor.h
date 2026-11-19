@@ -1041,6 +1041,20 @@ namespace llaminar2
             GraphSnapshotManifest *snapshot_manifest = nullptr);
 
         /**
+         * @brief Resolve opt-in publication demand through the existing snapshot selector.
+         * @param graph Complete cold graph with all numerical and diagnostic consumers.
+         * @details Runs before final storage/native preparation, never during
+         * recording or initialized replay. Only explicitly opting-in stages
+         * expose cold descriptors. The callback is not invoked, and neither
+         * payloads nor prepared device views are inspected. The stage owns one
+         * union with canonical outside reads; this executor keeps no new demand
+         * or binding cache. An opting-in stage requires the original BufferArena.
+         * @throws std::logic_error During capture or for a missing canonical arena.
+         * @throws std::invalid_argument For ambiguous semantic output names.
+         */
+        void sealGraphOutputDemands(ComputeGraph& graph);
+
+        /**
          * @brief Allocate stable arena addresses before launch preparation.
          *
          * Cold graph construction cannot assume an eager execution has already

@@ -17,6 +17,8 @@
  * aliases and dirty M512/M64 histories independently of installed Auto policy.
  */
 #include <gtest/gtest.h>
+#include "kernels/common/HCDownOutputPublication.h"
+#include "kernels/common/NativeEmbeddingIQTables.h"
 #include "qwen4exp/HC103OriginalGPU.h"
 #include "execution/compute_stages/stages/qwen4exp/Qwen4ExpHyperconnectionBuilder.h"
 #include "execution/local_execution/graph/ComputeGraph.h"
@@ -40,6 +42,11 @@
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "kernels/rocm/gemm/ROCmWeightPacker.h"
 #ifdef HAVE_ROCM
+#include "kernels/rocm/gemm/RetainedPreAttentionDevice.h"
+#include "kernels/rocm/gemm/ROCmFloatingPointGemmKernel.h"
+#include <iostream>
+#include <filesystem>
+#include <fstream>
 #include "backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"
 #include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.h"
@@ -566,7 +573,7 @@ void proveCancellationRead(DeviceId device)
 }
 /** @brief Freeze a complete original HC read chain before installing103. */
 /** @brief Original/typed fusion comparison or explicit fixed-tile K-pair staging. */
-enum class HC103Path {Control,Typed,GroupedKPair};
+enum class HC103Path {Control,Typed,GroupedKPair,GroupedReducer,GroupedReducerStaged};
 /** @brief Native replay, paired events, or one event-free retained profile variant. */
 enum class HC103Observation {Correctness,Paired,ProfileProduction,ProfileReference};
 /** @brief Test-only native-address substitution without transferring allocation ownership. */
@@ -594,10 +601,13 @@ private:void* substitute_=nullptr;
  * @param format Original registry source; null retains the historical Q8_0 case.
  */
 void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC103Path path,
- HC103Observation observation=HC103Observation::Correctness,const test::QuantizedVerifierFormatCase *format=nullptr) {
+ HC103Observation observation=HC103Observation::Correctness,const test::QuantizedVerifierFormatCase *format=nullptr,
+ LocalGPUExpertKernelPolicy policy=LocalGPUExpertKernelPolicy::Generic) {
  const bool timing=observation==HC103Observation::Paired;
  const bool profiling=observation==HC103Observation::ProfileProduction||observation==HC103Observation::ProfileReference;
  const bool kPair=path==HC103Path::GroupedKPair;
+ const bool groupedReducer=path==HC103Path::GroupedReducer;
+ const bool groupedReplay=groupedReducer||path==HC103Path::GroupedReducerStaged;
  const bool ordinaryDown=observation!=HC103Observation::Correctness;
  const bool typed=path!=HC103Path::Control;
  require(!kPair||(device.is_rocm()&&m>=32&&hidden>=16),"HC K-pair diagnostic requires its native ROCm grouped geometry");
@@ -729,7 +739,8 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
     .rows={m,Qwen4ExpIntInput{Qwen4ExpNativeIntInput{device,count,1}}},.hidden=hidden,.lowRank=lowRank,.epsilon=1e-6f,
     .arithmetic=ordinaryDown?Qwen4ExpProjectionArithmetic::Ordinary:Qwen4ExpProjectionArithmetic::DecodeEquivalentVerifier,
     .projectionRows=ordinaryDown?std::nullopt:std::optional{rows},
-    .upOperandPrecision=QuantizedActivationOperandPrecision::TwoTermQ8,.upProjectionRows=rows};
+    .upOperandPrecision=QuantizedActivationOperandPrecision::TwoTermQ8,.upProjectionRows=rows,
+    .verifierKernelPolicy=policy};
    auto*raw=alias?activated[0].get():rawDown[0].get();
    const Qwen4ExpHyperconnectionReadBuffers buffers{F(branchInput,BufferId::RESIDUAL),F(normalized,BufferId::NORMALIZED),
     F(*raw,BufferId::GATE_PROJ),F(*activated[0],alias?BufferId::GATE_PROJ:BufferId::UP_PROJ),
@@ -750,13 +761,36 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
    require(actualDown[0]&&actualUp[0],"HC103 actual builder lost prepared GEMM stages");
    ASSERT_TRUE(actualUp[0]->getParams().hc_residual_down.has_value());
    EXPECT_EQ(actualUp[0]->getParams().A,raw);EXPECT_EQ(actualUp[0]->getParams().hc_residual_down->activated,activated[0].get());
-   actualDown[0]->bindWorkspace(downWorkspace[0]->value.get());actualUp[0]->bindWorkspace(upWorkspace[0]->value.get());
+   if(path==HC103Path::GroupedReducerStaged) {
+    EXPECT_FALSE(actualDown[0]->getParams().hc_down_output);
+    EXPECT_FALSE(actualUp[0]->getParams().hc_prepublished_down);
+   }
+   if(groupedReducer) {
+    const auto& output=actualDown[0]->getParams().hc_down_output;
+    ASSERT_TRUE(output);
+    EXPECT_EQ(output->publication->producerProgram(),HCDownProducerProgram::GroupedM4Ordered);
+    EXPECT_EQ(output->publication,actualUp[0]->getParams().hc_prepublished_down);
+    auto requirements=actualDown[0]->getWorkspaceRequirements(m,lowRank,trunk);
+    requirements.merge(actualUp[0]->getWorkspaceRequirements(m,trunk,lowRank));
+    upStages[0]->unbindWorkspace();
+    upWorkspace[0]=std::make_unique<Workspace>(device,requirements);
+    // Control and treatment both reuse the down V4 primary prefix for
+    // up publication. Separate diagnostics keep their original workspaces.
+    downStages[1]->unbindWorkspace();
+    upStages[1]->unbindWorkspace();
+    upWorkspace[1]=std::make_unique<Workspace>(device,requirements);
+    downStages[1]->bindWorkspace(upWorkspace[1]->value.get());
+    upStages[1]->bindWorkspace(upWorkspace[1]->value.get());
+   }
+   actualDown[0]->bindWorkspace((groupedReducer?upWorkspace[0]:downWorkspace[0])->value.get());
+   actualUp[0]->bindWorkspace(upWorkspace[0]->value.get());
    for(const auto&name:builder->getExecutionOrder())builder->getNode(name)->stage->setGPUStream(s.stream);
    const auto before=actualUp[0]->graphCaptureVariantSignature();
    // Native addresses are materialized after the declarative signature exists.
    // First preparation seals those allocations without changing the cache key.
    prepareOperands();
    EXPECT_EQ(actualUp[0]->graphCaptureVariantSignature(),before);
+   if(groupedReducer)ASSERT_TRUE(actualDown[0]->prepareGraphLaunch(context.get(),s.stream));
    ASSERT_TRUE(actualUp[0]->prepareGraphLaunch(context.get(),s.stream));
    EXPECT_EQ(actualUp[0]->graphCaptureVariantSignature(),before);
    ASSERT_TRUE(actualUp[0]->prepareGraphLaunch(context.get(),s.stream));
@@ -828,7 +862,16 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
    }
    const auto contract=actualUp[0]->bufferContract();
    EXPECT_EQ(contract.prepared_weights.size(),1u);
-   EXPECT_EQ(contract.outputs.size(),alias?1u:2u);EXPECT_EQ(contract.inouts.size(),alias?1u:0u);
+   if(groupedReducer) {
+    const auto downContract=actualDown[0]->bufferContract();
+    EXPECT_EQ(contract.outputs.size(),1u);
+    EXPECT_EQ(contract.inouts.size(),0u);
+    EXPECT_EQ(contract.inputs.size(),alias?1u:2u);
+    EXPECT_EQ(downContract.outputs.size(),alias?1u:2u);
+   } else {
+    EXPECT_EQ(contract.outputs.size(),alias?1u:2u);
+    EXPECT_EQ(contract.inouts.size(),alias?1u:0u);
+   }
   }
   auto originalDown=[&](qwen4exp::ResidualDownArgs a) {
 #ifdef HAVE_CUDA
@@ -870,6 +913,19 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
    }
    require(downStages[side]->execute(context.get()),"HC103 prepared down rejected");
    const qwen4exp::RowExtent extent{m,count};
+#ifdef HAVE_ROCM
+   if(groupedReplay){
+    auto reference=referenceProjection(side);
+    reference.primary=static_cast<signed char*>(upWorkspace[side]->value->getBuffer(kGPUProjectionPrimaryQ8));
+    reference.residual=static_cast<signed char*>(upWorkspace[side]->value->getBuffer(kGPUProjectionResidualQ8));
+    reference.primaryScales=static_cast<float*>(upWorkspace[side]->value->getBuffer(kGPUProjectionPrimaryQ8Scales));
+    reference.residualScales=static_cast<float*>(upWorkspace[side]->value->getBuffer(kGPUProjectionResidualQ8Scales));
+    rocmHCResidualDownQ8Projection({reference,static_cast<float*>(activated[side]->gpu_data_ptr())},s.stream,{});
+    primitives->residualRead({extent,hidden,static_cast<const float*>(normalized.gpu_data_ptr()),
+     static_cast<const float*>(up[side]->gpu_data_ptr()),static_cast<float*>(read[side]->gpu_data_ptr())},s.stream);
+    return;
+   }
+#endif
    if(kPair){
 #ifdef HAVE_ROCM
     rocmHCResidualDownGroupedSingleGroupReference({referenceProjection(side),
@@ -1013,7 +1069,30 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
     <<",row_tile=32,column_tile=64,threads=256,warmup=8,observations=31,event_free=1\n";
    s.retire();referenceGraph.reset();return;
   }
-  if(typed&&!kPair) {
+#ifdef HAVE_ROCM
+  if(groupedReplay) {
+   ASSERT_EQ(inventory[0].size(),groupedReducer?6u:7u);
+   ASSERT_EQ(inventory[1].size(),7u);
+   for(int side=0;side<2;++side) {
+    const auto has=[&](std::string_view leaf) {
+     return std::any_of(inventory[side].begin(),inventory[side].end(),
+      [leaf](const GPUGraphKernelNodeInfo& node){return node.name.find(leaf)!=std::string::npos;});
+    };
+    const auto& hardware=rocmHardwareMetadata().at(device.ordinal);
+    const bool mi50=hardware.isa_target.starts_with("gfx906") && hardware.compute_units==60 &&
+        hardware.native_wave_width==64;
+    const bool fused=groupedReducer && side==0;
+    EXPECT_EQ(has("qfn_hc_down_long_k_contributions"),fused||(mi50&&qfnGroupedHCDownLongKExperiment()));
+    const bool measured_default=side==0 && policy==LocalGPUExpertKernelPolicy::QFNMI50TP4;
+    EXPECT_EQ(has("projectHCGroupedShortK"),mi50&&qfnGroupedHCUpShortKExperiment(measured_default));
+    if(measured_default)
+     EXPECT_TRUE(has("projectHCGroupedShortKWide"));
+    EXPECT_EQ(has("groupedHCDownReducePublish"),fused);
+    EXPECT_EQ(has("publishHCResidualDown"),!fused);
+   }
+  }
+#endif
+  if(typed&&!kPair&&!groupedReplay) {
    ASSERT_EQ(inventory[0].size()+copies,inventory[1].size());
    using Key=std::tuple<std::string,unsigned,unsigned,unsigned,unsigned,unsigned,unsigned>;
    std::array<std::map<Key,int>,2> remaining;
@@ -1055,7 +1134,8 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
   const auto retainedOwners=s.owners->size();
   const int replays=observation==HC103Observation::Correctness?20:1;
   for(int replay=0;replay<replays;++replay) {
-   const int live=timing||replay%4==0?m:replay%4==1?std::min(m,1):replay%4==2?0:std::max(0,m-1);
+   const int live=groupedReplay?std::array{m,2,0,1,3}[replay%5]:
+    timing||replay%4==0?m:replay%4==1?std::min(m,1):replay%4==2?0:std::max(0,m-1);
    SCOPED_TRACE(::testing::Message()<<"replay="<<replay<<" live="<<live);
    std::vector<float> input(std::size_t(m+1)*trunk);
    for(int row=0;row<=m;++row)for(int c=0;c<trunk;++c)input[std::size_t(row)*trunk+c]=row<live?
@@ -1086,14 +1166,33 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
    compare("activated",static_cast<float*>(activated[0]->gpu_data_ptr()),static_cast<float*>(activated[1]->gpu_data_ptr()),activated[0]->numel(),lowRank);
    compare("up",static_cast<float*>(up[0]->gpu_data_ptr()),static_cast<float*>(up[1]->gpu_data_ptr()),up[0]->numel(),trunk);
    compare("read",static_cast<float*>(read[0]->gpu_data_ptr()),static_cast<float*>(read[1]->gpu_data_ptr()),read[0]->numel(),hidden);
+   if(groupedReplay) {
+    for(const auto& name:{kGPUProjectionPrimaryQ8,kGPUProjectionResidualQ8}) {
+     const auto* candidate=static_cast<const signed char*>(upWorkspace[0]->value->getBuffer(name));
+     const auto* reference=static_cast<const signed char*>(upWorkspace[1]->value->getBuffer(name));
+     EXPECT_EQ(s.download(candidate,banks),s.download(reference,banks));
+    }
+    for(const auto& name:{kGPUProjectionPrimaryQ8Scales,kGPUProjectionResidualQ8Scales}) {
+     const auto* candidate=static_cast<const float*>(upWorkspace[0]->value->getBuffer(name));
+     const auto* reference=static_cast<const float*>(upWorkspace[1]->value->getBuffer(name));
+     const auto lhs=s.download(candidate,scales),rhs=s.download(reference,scales);
+     EXPECT_EQ(std::memcmp(lhs.data(),rhs.data(),scales*sizeof(float)),0);
+    }
+   }
    for(int side=0;side<2;++side) {
     for(auto bank:std::array{std::pair{kGPUProjectionPrimaryQ8,frozenPrimary},std::pair{kGPUProjectionResidualQ8,frozenResidual}}) {
      auto actual=s.download(static_cast<const signed char*>(upWorkspace[side]->value->getBuffer(bank.first)),banks),expected=s.download(bank.second,banks);
-     ASSERT_EQ(std::memcmp(actual.data(),expected.data(),banks),0);for(std::size_t i=std::size_t(live)*lowRank;i<banks;++i)ASSERT_EQ(actual[i],91);
+     const auto liveBytes=std::size_t(live)*lowRank;
+     const bool reused=groupedReducer&&bank.first==kGPUProjectionPrimaryQ8;
+     ASSERT_EQ(std::memcmp(actual.data(),expected.data(),reused?liveBytes:banks),0);
+     if(!reused)for(std::size_t i=liveBytes;i<banks;++i)ASSERT_EQ(actual[i],91);
     }
     for(auto bank:std::array{std::pair{kGPUProjectionPrimaryQ8Scales,frozenPrimaryScales},std::pair{kGPUProjectionResidualQ8Scales,frozenResidualScales}}) {
      auto actual=s.download(static_cast<const float*>(upWorkspace[side]->value->getBuffer(bank.first)),scales),expected=s.download(bank.second,scales);
-     ASSERT_EQ(std::memcmp(actual.data(),expected.data(),scales*sizeof(float)),0);for(std::size_t i=std::size_t(live)*lowRank/32;i<scales;++i)ASSERT_EQ(actual[i],poison);
+     const auto liveScales=std::size_t(live)*lowRank/32;
+     const bool reused=groupedReducer&&bank.first==kGPUProjectionPrimaryQ8Scales;
+     ASSERT_EQ(std::memcmp(actual.data(),expected.data(),(reused?liveScales:scales)*sizeof(float)),0);
+     if(!reused)for(std::size_t i=liveScales;i<scales;++i)ASSERT_EQ(actual[i],poison);
     }
    }
    for(int side=0;side<2;++side) {
@@ -1112,6 +1211,31 @@ void proveHC103Chain(DeviceId device,int m,int hidden,int lowRank,bool alias,HC1
     EXPECT_EQ(after.blocks_per_row,originalUp.blocks_per_row);
    }
    ASSERT_FALSE(::testing::Test::HasFailure());
+  }
+  if(groupedReplay) {
+   const auto snapshot=[&] {
+    std::vector<std::uint8_t> bytes;
+    const auto append=[&](const auto& plane) {
+     const auto* first=reinterpret_cast<const std::uint8_t*>(plane.data());
+     using Element=typename std::remove_cvref_t<decltype(plane)>::value_type;
+     bytes.insert(bytes.end(),first,first+plane.size()*sizeof(Element));
+    };
+    for(auto* tensor:{rawDown[0].get(),activated[0].get(),up[0].get(),read[0].get()})
+     append(s.download(static_cast<const float*>(tensor->gpu_data_ptr()),tensor->numel()));
+    for(const auto& name:{kGPUProjectionPrimaryQ8,kGPUProjectionResidualQ8})
+     append(s.download(static_cast<const signed char*>(upWorkspace[0]->value->getBuffer(name)),banks));
+    for(const auto& name:{kGPUProjectionPrimaryQ8Scales,kGPUProjectionResidualQ8Scales})
+     append(s.download(static_cast<const float*>(upWorkspace[0]->value->getBuffer(name)),scales));
+    return bytes;
+   };
+   s.upload(static_cast<float*>(branchInput.gpu_data_ptr()),std::vector<float>(branchInput.numel(),2.75f));
+   s.upload(count,std::vector<int32_t>{m});
+   require(s.graph->launch(),"Grouped HC accepted prefix replay failed");
+   const auto accepted=snapshot();
+   s.upload(static_cast<float*>(branchInput.gpu_data_ptr()),std::vector<float>(branchInput.numel(),-3.0f));
+   s.upload(count,std::vector<int32_t>{0});
+   require(s.graph->launch(),"Grouped HC empty reset replay failed");
+   EXPECT_EQ(snapshot(),accepted);
   }
   if(kPair){
    EXPECT_EQ(savedDownBytes,test::q8_all_formats::originalBytes(*downSource));
@@ -1625,5 +1749,80 @@ TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M512K10240TileEventsQ8_
 /** @test Opt-in identical physical comparisons through the original Q8_K source. */
 TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M512K10240TileEventsQ8_K) {
  proveNativeQ8PrefillTiles("Q8_K",512);
+}
+#endif
+
+#include "RetainedPreAttentionGDNReplay.inc"
+
+#include "GroupedHCUpShortKReplay.inc"
+
+#ifdef HAVE_ROCM
+/** @test Replay the actual prepared M4 builder and existing staged ROCm publication. */
+TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCDownReducePublishReplay)
+{
+ auto* backend=getROCmBackend();
+ if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
+ const auto& hardware=rocmHardwareMetadata().at(0);
+ if(!hardware.isa_target.starts_with("gfx906")||hardware.compute_units!=60||
+    hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
+ for(bool alias:{false,true})
+  proveHC103Chain(DeviceId::rocm(0),4,2560,320,alias,HC103Path::GroupedReducer);
+}
+#endif
+
+#ifdef HAVE_ROCM
+/** @test Automatic MI50 counted M4 reducer publication requires no experimental switches. */
+TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCDownReducePublishDefaultReplay)
+{
+ ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH"),nullptr);
+ ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_LONG_K"),nullptr);
+ ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K"),nullptr);
+ auto* backend=getROCmBackend();
+ if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
+ const auto& hardware=rocmHardwareMetadata().at(0);
+ if(!hardware.isa_target.starts_with("gfx906")||hardware.compute_units!=60||
+    hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
+ for(bool alias:{false,true})
+  proveHC103Chain(DeviceId::rocm(0),4,2560,320,alias,HC103Path::GroupedReducer);
+}
+
+/** @test The admitted TP4 policy selects the measured HC-up without fusing branch read. */
+TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCUpQualifiedDefaultReplay)
+{
+ ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K"),nullptr);
+ auto* backend=getROCmBackend();
+ if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
+ const auto& hardware=rocmHardwareMetadata().at(0);
+ if(!hardware.isa_target.starts_with("gfx906")||hardware.compute_units!=60||
+    hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
+ proveHC103Chain(DeviceId::rocm(0),4,2560,320,false,HC103Path::GroupedReducer,
+    HC103Observation::Correctness,nullptr,LocalGPUExpertKernelPolicy::QFNMI50TP4);
+}
+
+/** @test Explicit 0 retains the separate reducer and publisher on eligible MI50. */
+TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCDownReducePublishOffReplay)
+{
+ ASSERT_STREQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH"),"0");
+ auto* backend=getROCmBackend();
+ if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
+ const auto& hardware=rocmHardwareMetadata().at(0);
+ if(!hardware.isa_target.starts_with("gfx906")||hardware.compute_units!=60||
+    hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
+ proveHC103Chain(DeviceId::rocm(0),4,2560,320,false,HC103Path::GroupedReducerStaged);
+}
+
+/** @test A portable gfx1100 counted M4 capture retains the staged publication. */
+TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCDownReducePublishPortableReplay)
+{
+ ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH"),nullptr);
+ auto* backend=getROCmBackend();
+ if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
+ for(int ordinal=0; ordinal<backend->deviceCount(); ++ordinal) {
+  if(rocmHardwareMetadata().at(ordinal).isa_target.starts_with("gfx1100")) {
+   proveHC103Chain(DeviceId::rocm(ordinal),4,2560,320,false,HC103Path::GroupedReducerStaged);
+   return;
+  }
+ }
+ GTEST_SKIP()<<"Requires an actual gfx1100";
 }
 #endif

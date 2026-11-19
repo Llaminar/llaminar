@@ -27,6 +27,26 @@ bool launchVnniRepackCUDA(
     void* stream);
 
 /// Extended overload accepting d_emins for Q2_K format (8-param).
+/**
+ * @brief Repack only the selected original32-value groups into final K columns.
+ * @param columns Exact encoded source-cover width and selected execution interval.
+ * @note Decoder bytes and arithmetic remain those of the original source format.
+ */
+bool launchVnniRepackCUDA(
+    RepackFormat format,
+    const void* d_raw_blocks,
+    uint8_t* d_payload,
+    uint16_t* d_scales,
+    uint16_t* d_mins,
+    uint32_t* d_emins,
+    int N, int K,
+    int output_N,
+    int output_row_offset,
+    int packed_group_rows,
+    int allocation_payload_bytes_per_block,
+    NativeQuantisedRepackColumns columns,
+    void* stream);
+
 bool launchVnniRepackCUDA(
     RepackFormat format,
     const void* d_raw_blocks,

@@ -28,9 +28,9 @@ def positive_seconds(value: object) -> bool:
 
 
 def validate_app_report(report: dict, *, model: str, context_tokens: int,
-                        output_tokens: int = 32768,
+                        output_tokens: int = 32768, webapp_phases: int = 5,
                         reply_reserve_tokens: int | None = None) -> dict:
-    """Recompute one complete five-phase session's qualification and counts.
+    """Recompute qualification against the caller's authored session and context.
 
     Context must be the caller's proven PMA admission. No elapsed-time or
     inactivity limit participates in certification. The prompt sequence comes
@@ -44,6 +44,7 @@ def validate_app_report(report: dict, *, model: str, context_tokens: int,
             or report.get('opencode_version') != VERSION or report.get('gate') != 'stress'
             or report.get('model') != model or report.get('context_length') != context_tokens
             or report.get('max_tokens') != output_tokens
+            or report.get('webapp_phases', 5) != webapp_phases
             or type(observed_reserve) is not type(reply_reserve_tokens)
             or observed_reserve != reply_reserve_tokens
             or report.get('iterations') != 1 or report.get('concurrency') != 1
@@ -74,7 +75,7 @@ def validate_app_report(report: dict, *, model: str, context_tokens: int,
     verdict = assessment(result['protocol_errors'], result['task_errors'])
     if any(result.get(key) != value for key, value in verdict.items()):
         raise ValueError('OpenCode session verdict contradicts its original errors')
-    prompts = session_prompts('webapp', fixture_cases()['webapp'])
+    prompts = session_prompts('webapp', fixture_cases()['webapp'], webapp_phases)
     progress = result.get('phase_progress', {})
     phases = progress.get('phases')
     if (progress.get('expected') != len(prompts) or progress.get('completed') != len(prompts)

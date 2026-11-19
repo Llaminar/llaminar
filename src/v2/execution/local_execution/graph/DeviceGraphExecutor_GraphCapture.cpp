@@ -2871,6 +2871,15 @@ namespace llaminar2
             return false;
         }
 
+        // Publication demand participates in stage/source capture identity.
+        // Resolve a pristine or explicitly changed cold policy BEFORE any of
+        // those identities are computed. Same-policy initialized replay only
+        // compares the existing epoch/generation pair and performs no scan.
+        if(!segment_cache.initialized||
+            !segment_cache.snapshot_selection_identity.matches(
+                snapshot_configuration_epoch_,graph.topologyGeneration()))
+            sealGraphOutputDemands(graph);
+
         if(const auto& bound=segment_cache.participant_source_binding){
             const auto original=graph.retainedParticipantSourcePlan();
             if(!original || original->captureIdentity()!=bound->plan_identity ||

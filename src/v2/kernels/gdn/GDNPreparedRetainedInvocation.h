@@ -7,6 +7,7 @@
  * freezes borrowed pointer/policy/workspace-owner metadata before graph recording.
  */
 #pragma once
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "kernels/gdn/GDNDenseCompactSnapshots.h"
 #include <span>
 #include <memory>
@@ -24,6 +25,7 @@ struct GDNRetainedInvocationBinding final
     std::uint64_t
         workspace_owner_identity; ///< Stable existing manager id, NOT allocator/device generation.
     void *capture_stream;
+    LocalGPUExpertKernelPolicy verifier_kernel_policy=LocalGPUExpertKernelPolicy::Generic; ///< Original local TP4 eligibility.
 };
 /** @brief Stage-owned immutable capture program borrowing backend state and arena/source owners.
  * @details Kernel and all leased/source owners must outlive this object and every
@@ -206,7 +208,8 @@ inline bool sameGDNRetainedBindingViews(const GDNRetainedInvocationBinding &a,
     return a.storage.data() == b.storage.data() && a.storage.size() == b.storage.size() &&
            a.terminal.data() == b.terminal.data() && a.terminal.size() == b.terminal.size() &&
            a.workspace_owner_identity == b.workspace_owner_identity &&
-           a.capture_stream == b.capture_stream && a.terminal_kind == b.terminal_kind;
+           a.capture_stream == b.capture_stream && a.terminal_kind == b.terminal_kind &&
+           a.verifier_kernel_policy == b.verifier_kernel_policy;
 }
 /** @brief Authenticate a ROCm capture stream cold without exposing HIP headers to generic
  * consumers.

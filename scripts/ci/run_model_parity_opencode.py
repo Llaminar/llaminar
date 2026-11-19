@@ -66,7 +66,7 @@ def cell_evidence(directory: Path) -> dict:
              'reclamation': 'archive-reclamation.json',
              'observations': 'stats-webapp-observations.result.json',
              'context': 'context-admission.json', 'model_metadata': 'model-metadata.json',
-             'perf': 'perf/perf.json'}
+             'perf': 'perf/perf.json', 'collective_binding': 'collective-runtime-binding.json'}
     result = {name: json.loads((directory / suffix).read_text())
               for name, suffix in paths.items() if (directory / suffix).is_file()}
     result['admission_probes'] = [json.loads(path.read_text()) for path in sorted(directory.glob('admit-*.json'))]

@@ -345,6 +345,15 @@ namespace llaminar2
     }
 
     ExclusiveModelRetirementTicket
+    TransferEngine::beginExclusiveNativeContextRetirement(const GPUContextProvenance &original) const
+    {
+        original.requireWorker(original.worker());
+        auto ticket = beginExclusiveNativeContextRetirement(original.device());
+        ticket.expected_context_generation_ = original.generation();
+        return ticket;
+    }
+
+    ExclusiveModelRetirementTicket
     TransferEngine::beginExclusiveRetirement(
         const ModelDeviceMemoryRetention &retention,
         DeviceMemoryReclamationIntent intent) const
@@ -533,7 +542,7 @@ namespace llaminar2
             context_retirements.push_back(
                 GPUDeviceContextPool::instance()
                     .beginExclusiveGenerationRetirement(
-                        retirement.device));
+                        retirement.device, retirement.ticket->expected_context_generation_));
             context_receipts.push_back(
                 context_retirements.back().receipt());
         }

@@ -872,9 +872,16 @@ external dependency remain reported; project-owned kernels retain their fatal
 zero-spill guard. Ordinary host dependency links do not participate in the
 collective's native proof.
 
-The compiler builder and runtime install the same source-built RCCL at the same
-library path. Runtime loading uses CMake's exact `RCCL_LIBRARY` selection; it never
-guesses a checkout location or substitutes another packaged collective library.
+The builder, test runner and serving image use the same patched RCCL and NCCL
+artifacts. In a source checkout, configure against the canonical installations
+with their build evidence. For a benchmark or OpenCode run using files
+extracted from a published runtime, set
+`-DLLAMINAR_PUBLISHED_COLLECTIVE_IMAGE=ghcr.io/llaminar/llaminar@sha256:<manifest>`
+alongside the selected library and header locations. The image must be present
+in local Docker storage and its source commit accessible in Git. Configuration
+checks both the dependency inputs and the extracted bytes. The immutable-image
+OpenCode harness records the actual collective mappings for every rank that
+used a native communicator.
 
 ```bash
 bash scripts/ci/setup_production_parity_tmpfs.sh

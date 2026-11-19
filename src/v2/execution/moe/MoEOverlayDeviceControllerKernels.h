@@ -11,6 +11,7 @@
 #pragma once
 
 #include "DeviceMoEOverlayEpochABI.h"
+#include "MoEOverlayDynamicPolicyWorkspace.h"
 #include "MoEOverlayDeviceControllerFabricABI.h"
 
 #include <cstddef>
@@ -28,6 +29,7 @@
 
 namespace llaminar2
 {
+    static_assert(MoEOverlayDynamicPolicyWorkspaceHeader::kPhases == kMoEOverlayDeviceControllerDemandPhaseCount);
     struct DeviceMoEExpertDescriptor;
     struct DeviceMoELayerRuntime;
 
@@ -79,6 +81,8 @@ namespace llaminar2
         CompleteEmptyDynamicDecision = 24u,
         /** Author cycles back to the immutable loader-prepared owner table. */
         AuthorPreparedContextRestore = 25u,
+        /** Pack exact member residency and original-root global selected demand. */
+        CollectRuntimeSnapshot = 26u,
     };
 
     /** Exact arithmetic result of adding one phase-pure observation window. */
@@ -217,9 +221,33 @@ namespace llaminar2
                    expert_count <=
                        kMoEOverlayDeviceControllerFabricMaxExperts &&
                    domain_participant_count > 0u &&
-                   domain_participant_count <=
-                       kMoEOverlayDeviceControllerFabricMaxParticipants &&
                    domain_participant_id < domain_participant_count;
+        }
+    };
+
+    /**
+     * @brief Original runtime source and optional device-owned selected-counter baseline.
+     * Only the immutable continuation-root participant consumes the baseline.
+     * Siblings publish one residency plane; they neither sample local execution
+     * counts nor manufacture empty demand planes.
+     */
+    struct MoEOverlayDeviceSnapshotBinding
+    {
+        DeviceMoELayerRuntime *runtime_layers = nullptr;
+        std::uint64_t *previous_selected_counts = nullptr;
+        std::uint32_t layer_count = 0u;
+        std::uint32_t expert_count = 0u;
+        std::uint32_t top_k = 0u;
+        std::uint32_t domain_participant_id = 0u;
+        std::uint32_t domain_participant_count = 0u;
+        /** @param other Another captured source. @return Exact pointer, baseline and geometry identity. */
+        LLAMINAR_MOE_CONTROLLER_HD bool operator==(const MoEOverlayDeviceSnapshotBinding &other) const noexcept = default;
+        /** @return Whether the immutable local runtime geometry is addressable. */
+        LLAMINAR_MOE_CONTROLLER_HD bool valid() const noexcept
+        {
+            return runtime_layers && layer_count && expert_count &&
+                expert_count <= kMoEOverlayDeviceControllerFabricMaxExperts && top_k && top_k <= expert_count &&
+                domain_participant_count && domain_participant_id < domain_participant_count;
         }
     };
 
@@ -251,6 +279,7 @@ namespace llaminar2
         const MoEOverlayDeviceControllerParticipantMetadata *participants =
             nullptr;
         const MoEOverlayDeviceControllerFabricGroupLayout *groups = nullptr;
+        const MoEOverlayDeviceControllerLogicalTargetMetadata *logical_targets = nullptr;
         MoEOverlayDeviceControllerSharedHeader *controller = nullptr;
         /** Shared exact-epoch barrier used only by continuation-group members. */
         MoEOverlayDeviceControllerInferenceEpochRecord *inference_epoch_record =
@@ -259,7 +288,7 @@ namespace llaminar2
         MoEOverlayDeviceMovementCommand *command_entries = nullptr;
         const std::uint64_t *payload_bytes_per_layer = nullptr;
         /** Immutable setup-time target for reusable-context restoration. */
-        const std::uint32_t *initial_owner_participants = nullptr;
+        const MoEOverlayRouteTarget *initial_route_targets = nullptr;
         /** Persistent leader-authored history; no host policy can address it. */
         std::uint64_t *demand_history = nullptr;
         /** Host-measured immutable costs acquired before device policy reads. */
@@ -287,10 +316,10 @@ namespace llaminar2
         LLAMINAR_MOE_CONTROLLER_HD bool valid() const noexcept
         {
             return mapped_base != nullptr && mapped_bytes != 0u && layout &&
-                   participants && groups && controller &&
+                   participants && groups && logical_targets && controller &&
                    inference_epoch_record && command &&
                    command_entries && payload_bytes_per_layer &&
-                   initial_owner_participants &&
+                   initial_route_targets &&
                    demand_history && economy && economy_service_costs &&
                    economy_migration_costs && economy_last_moved &&
                    local_group &&
@@ -455,8 +484,11 @@ namespace llaminar2
             entry.version != kMoEOverlayDeviceMovementCommandVersion ||
             entry.ordinal != ordinal || entry.layer >= num_layers ||
             entry.expert >= num_experts ||
-            entry.source_participant >= participant_count ||
-            entry.destination_participant >= participant_count ||
+            entry.source_target.isAbsent() || entry.destination_target.isAbsent() ||
+            (entry.source_target.isWhole() &&
+             static_cast<std::uint32_t>(entry.source_target.word()) >= participant_count) ||
+            (entry.destination_target.isWhole() &&
+             static_cast<std::uint32_t>(entry.destination_target.word()) >= participant_count) ||
             !movement_axis_valid || entry.source_epoch != base_epoch ||
             entry.candidate_epoch != candidate_epoch)
         {
@@ -469,6 +501,11 @@ namespace llaminar2
                         DynamicPlacement ||
             kind == MoEOverlayDeviceControllerTransactionKind::
                         PreparedContextRestore;
+        // Transient LLEP retains its whole-resident contract. Durable commands
+        // carry one complete logical target at either end of a movement.
+        if (!durable_placement &&
+            (!entry.source_target.isWhole() || !entry.destination_target.isWhole()))
+            return false;
         if ((moeOverlayMovementCycle(entry.flags) != 0u) != durable_placement)
             return false;
         const bool physical_movement =
@@ -487,8 +524,7 @@ namespace llaminar2
                 movement_axis ==
                     MoEOverlayDeviceMovementAxis::ParticipantPlacement;
             return correct_kind && correct_axis &&
-                   entry.source_participant !=
-                       entry.destination_participant &&
+                   entry.source_target.word() != entry.destination_target.word() &&
                    entry.payload_slot == ordinal &&
                    entry.payload_bytes != 0u && entry.source_epoch != 0u &&
                    ((op == MoEOverlayDeviceMovementOp::DurableMove &&
@@ -503,7 +539,7 @@ namespace llaminar2
                op == MoEOverlayDeviceMovementOp::TransientAssignment &&
                movement_axis ==
                    MoEOverlayDeviceMovementAxis::ParticipantPlacement &&
-               entry.source_participant == entry.destination_participant &&
+               entry.source_target.word() == entry.destination_target.word() &&
                entry.payload_slot == kMoEOverlayDeviceInvalidSlot &&
                entry.payload_bytes == 0u && entry.source_epoch != 0u &&
                entry.candidate_epoch == entry.source_epoch;
@@ -515,11 +551,9 @@ namespace llaminar2
         const MoEOverlayDeviceMovementCommand &previous,
         const MoEOverlayDeviceMovementCommand &current) noexcept
     {
-        if (previous.destination_participant !=
-            current.destination_participant)
+        if (previous.destination_target.word() != current.destination_target.word())
         {
-            return previous.destination_participant <
-                   current.destination_participant;
+            return previous.destination_target.word() < current.destination_target.word();
         }
         if (previous.layer != current.layer)
             return previous.layer < current.layer;
@@ -549,7 +583,10 @@ namespace llaminar2
         MoEOverlayDeviceDemandPhase demand_phase =
             MoEOverlayDeviceDemandPhase::Invalid;
         MoEOverlayDeviceControllerPolicyResult *policy_result = nullptr;
+        /** Persistent sole-authority scratch; required only by the two policy authors. */
+        MoEOverlayDynamicPolicyWorkspaceBinding policy_workspace;
         MoEOverlayDeviceRuntimePublicationBinding runtime_publication;
+        MoEOverlayDeviceSnapshotBinding snapshot;
         MoEOverlayDeviceRetirementReadinessBinding retirement_readiness;
 
         /** @return Whether the action has every statically required binding. */
@@ -560,6 +597,8 @@ namespace llaminar2
             {
                 return false;
             }
+            if (action == MoEOverlayDeviceControllerAction::CollectRuntimeSnapshot)
+                return snapshot.valid();
             if (action ==
                 MoEOverlayDeviceControllerAction::BeginTransaction)
             {
@@ -584,14 +623,14 @@ namespace llaminar2
             if (action ==
                 MoEOverlayDeviceControllerAction::AuthorDynamicPolicy)
             {
-                return binding.authorityLeader() && policy_result != nullptr &&
+                return binding.authorityLeader() && policy_result != nullptr && policy_workspace.valid() &&
                        (demand_phase == MoEOverlayDeviceDemandPhase::Prefill ||
                         demand_phase == MoEOverlayDeviceDemandPhase::Decode);
             }
             if (action == MoEOverlayDeviceControllerAction::
                               AuthorPreparedContextRestore)
             {
-                return binding.authorityLeader() && policy_result != nullptr &&
+                return binding.authorityLeader() && policy_result != nullptr && policy_workspace.valid() &&
                        demand_phase == MoEOverlayDeviceDemandPhase::Invalid;
             }
             if (action ==

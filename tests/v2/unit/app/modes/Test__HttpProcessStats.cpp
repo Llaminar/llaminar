@@ -51,8 +51,10 @@ namespace
         /** @brief Create small independent text fixtures, never models or device contexts. */
         void SetUp() override
         {
-            char path[] = "/tmp/llaminar-process-stats-XXXXXX";
-            root = ::mkdtemp(path);
+            auto pattern = (std::filesystem::temp_directory_path() / "llaminar-process-stats-XXXXXX").string();
+            const char *created = ::mkdtemp(pattern.data());
+            ASSERT_NE(created, nullptr);
+            root = created;
             std::filesystem::create_directories(root / "proc/self/fd");
             std::filesystem::create_directories(root / "cgroup/work");
             write("proc/self/status", "Pid: 123\nVmRSS: 21 kB\nVmHWM: 30 kB\nVmSize: 80 kB\nRssAnon: 11 kB\nRssFile: 7 kB\nRssShmem: 3 kB\nVmSwap: 2 kB\nThreads: 4\n");
@@ -73,7 +75,11 @@ namespace
             write("cgroup/work/cpu.stat", "usage_usec 1000\n");
         }
         /** @brief Retire only this fixture's small metadata directory. */
-        void TearDown() override { std::filesystem::remove_all(root); }
+        void TearDown() override
+        {
+            if (!root.empty())
+                std::filesystem::remove_all(root);
+        }
         /** @brief Replace one explicit metadata fixture. */
         void write(const std::filesystem::path &name, const std::string &text)
         {

@@ -43,21 +43,21 @@ void proveCPUJointShadowCalibration()
             const auto members=edge.destination.shard_cohort->participants();
             if(std::none_of(members.begin(),members.end(),[id](const auto& member){return member.participant_id==id;}))continue;
             std::string error;
-            EXPECT_FALSE(original.registry->prepareCPUJointArrival(*transaction.candidate,id,
+            EXPECT_FALSE(original.registry->prepareJointArrival(*transaction.candidate,id,
                 edge.layer_idx,edge.expert_id,&error));
-            auto arrival=original.registry->prepareCPUJointCalibrationArrival(transaction,index,id,&error);
+            auto arrival=original.registry->prepareJointCalibrationArrival(transaction,index,id,&error);
             ASSERT_TRUE(arrival)<<error;
-            MoEOverlayPreparedCPUFragmentPayload incomplete;
-            EXPECT_FALSE(arrival->completeCPUFragment(incomplete,&error));
-            EXPECT_FALSE(original.registry->prepareCPUJointCalibrationArrival(transaction,index,original.whole,&error));
+            MoEOverlayPreparedFragmentPayload incomplete;
+            EXPECT_FALSE(arrival->completeFragment(incomplete,&error));
+            EXPECT_FALSE(original.registry->prepareJointCalibrationArrival(transaction,index,original.whole,&error));
             auto relabelled=transaction;
             relabelled.purpose=MoEOverlayResidencyTransactionPurpose::PlacementChange;
             EXPECT_FALSE(relabelled.valid());
-            EXPECT_FALSE(original.registry->prepareCPUJointCalibrationArrival(relabelled,index,id,&error));
+            EXPECT_FALSE(original.registry->prepareJointCalibrationArrival(relabelled,index,id,&error));
         }
     }
     std::string error;
-    EXPECT_FALSE(original.registry->prepareCPUJointCalibrationArrival(transaction,
+    EXPECT_FALSE(original.registry->prepareJointCalibrationArrival(transaction,
         transaction.migrations.size(),original.last_shard,&error));
     {
         ObservedCPUFabricFactory factory(original);
@@ -145,7 +145,7 @@ void proveCPUJointShadowCalibration()
         const auto members=transaction.migrations[index].destination.shard_cohort->participants();
         for(int id:original.registry->localParticipantIds()) {
             if(std::none_of(members.begin(),members.end(),[id](const auto& member){return member.participant_id==id;}))continue;
-            EXPECT_FALSE(original.registry->prepareCPUJointCalibrationArrival(transaction,index,id,&error));
+            EXPECT_FALSE(original.registry->prepareJointCalibrationArrival(transaction,index,id,&error));
             EXPECT_NE(error.find("expired"),std::string::npos)<<error;
         }
     }

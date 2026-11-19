@@ -16,6 +16,13 @@ file(GLOB V2_NATIVE_COMPLETED_INPUTS CONFIGURE_DEPENDS
     "${REPO_ROOT}/scripts/docker/native-completed-broadcast/*.cpp")
 
 foreach(V2_NATIVE_COMPLETED_BACKEND IN ITEMS nccl rccl)
+    set(V2_NATIVE_COMPLETED_TARGET "v2_${V2_NATIVE_COMPLETED_BACKEND}_completed_broadcast_proof")
+    # Read the dependency source only for its original proof target. A Release
+    # perf/serving build may consume an already published collective binary.
+    v2_test_target_selected("${V2_NATIVE_COMPLETED_TARGET}" V2_NATIVE_COMPLETED_SELECTED)
+    if(NOT V2_NATIVE_COMPLETED_SELECTED)
+        continue()
+    endif()
     if((V2_NATIVE_COMPLETED_BACKEND STREQUAL "nccl" AND HAVE_CUDA AND HAVE_NCCL) OR
        (V2_NATIVE_COMPLETED_BACKEND STREQUAL "rccl" AND HAVE_ROCM AND HAVE_RCCL))
         string(TOUPPER "${V2_NATIVE_COMPLETED_BACKEND}" V2_NATIVE_COMPLETED_LABEL)
@@ -85,7 +92,6 @@ foreach(V2_NATIVE_COMPLETED_BACKEND IN ITEMS nccl rccl)
                     "${RCCL_LIBRARY}" "${CMAKE_CXX_COMPILER}"
                 VERBATIM)
         endif()
-        set(V2_NATIVE_COMPLETED_TARGET "v2_${V2_NATIVE_COMPLETED_BACKEND}_completed_broadcast_proof")
         add_custom_target(${V2_NATIVE_COMPLETED_TARGET} DEPENDS "${V2_NATIVE_COMPLETED_REPORT}")
         set_property(TARGET ${V2_NATIVE_COMPLETED_TARGET} PROPERTY V2_RELEASE_NATIVE_PROOF_OWNER TRUE)
         set_property(GLOBAL APPEND PROPERTY V2_UNIT_GATE_TARGETS ${V2_NATIVE_COMPLETED_TARGET})

@@ -615,12 +615,17 @@ production preflight: the dependency builder replays the actual selector and
 the original failing code, while installed runners authenticate the resulting
 source/DSO-bound proof without an SDK or accelerator.
 
-RCCL runtime loading uses the exact `RCCL_LIBRARY` selected by CMake, without a
-second runtime search. Select the compatible library explicitly when configuring
-a local build. Container builders and Release images install the same source-
-built RCCL at the same stable path; moving a checkout must not change the DSO.
-Its project-patched source/ABI pin is separate from the SDK release pin; compile
-it against the selected SDK and prove its native capture/storage contracts.
+The server, OpenCode, numerical tests and benchmarks use the same canonical
+RCCL and NCCL dependencies. Build RCCL with the pinned upstream commit,
+patches, function set and MSCCL setting used by the shipping image. Use
+`LLAMINAR_BUILD_RCCL_FROM_SOURCE=ON` to build it locally. CMake verifies the
+producing installation's evidence before binding either library by absolute
+path. To use extracted shipping libraries in a local checkout, provide
+`LLAMINAR_PUBLISHED_COLLECTIVE_IMAGE` with the immutable GHCR manifest
+reference. Configuration compares each selected ELF with its image and checks
+the upstream pin and patch inputs. OpenCode records the mapped libraries on
+the ranks that performed native collectives. Keep the driver and SDK versions
+independent of this dependency selection.
 Both loaders retain their exact selection until unload and withdraw resolved
 callbacks before closing a partially admitted library.
 `V2_Integration_NCCLPartialAdmission` and

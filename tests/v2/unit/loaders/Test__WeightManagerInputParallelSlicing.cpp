@@ -119,8 +119,7 @@ namespace llaminar2
          *
          * Some real GGUF quantized formats can only slice columns on their packed
          * block boundary. Returning nullptr from loadTensorColumnSlice() lets the
-         * unit test exercise WeightManager's FP32 fallback without needing a GGUF
-         * fixture on disk.
+         * unit test observe rejection before a full FP32 weight load.
          */
         class FailingColumnSliceModelLoader : public MockModelLoader
         {
@@ -372,14 +371,14 @@ namespace llaminar2
         }
 
         /**
-         * @brief Regression: unaligned native INPUT_PARALLEL slices fall back to FP32
+         * @brief An unrepresentable native input-parallel shard fails before any FP32 materialization.
          *
          * Qwen3.6 shared-expert down weights can be IQ3_S with a 256-column packed
          * block, while ROCm 4-way TP asks each rank for a 128-column logical shard.
-         * The loader correctly refuses that native packed slice, so WeightManager
-         * must materialize a full FP32 tensor and copy only the rank-local columns.
+         * This fixture deliberately withholds a native slice. Materializing the
+         * full FP32 source would violate the requested native weight policy.
          */
-        TEST_F(Test__WeightManagerInputParallelSlicing, LoadInputParallelWeight_FallsBackToFP32WhenNativeSliceUnavailable)
+        TEST_F(Test__WeightManagerInputParallelSlicing, LoadInputParallelWeight_RejectsUnavailableNativeSlice)
         {
             constexpr size_t kRows = 16;
             constexpr size_t kColumns = 512;
@@ -410,15 +409,12 @@ namespace llaminar2
             wm.setTensorParallelConfig(tp_config);
 
             const auto &assignment = tp_config->forDevice(DeviceId::rocm(1));
-            auto shard = wm.getShardedWeightForAssignment(kWeightName, DeviceId::rocm(1), assignment, 0);
-
-            ASSERT_NE(shard, nullptr);
+            EXPECT_THROW(wm.getShardedWeightForAssignment(kWeightName, DeviceId::rocm(1), assignment, 0),
+                         std::runtime_error);
             EXPECT_EQ(loader->column_slice_attempts, 1);
-            EXPECT_EQ(loader->fp32_fallback_loads, 1);
+            EXPECT_EQ(loader->fp32_fallback_loads, 0);
             EXPECT_EQ(loader->last_col_start, 128);
             EXPECT_EQ(loader->last_col_end, 256);
-
-            verifySequentialSlice(shard.get(), kRows, 128, kColumns, 128);
         }
 
         // =============================================================================

@@ -2485,9 +2485,9 @@ namespace llaminar2::test
             node_ids.push_back(int(found-nodes.begin()));}
         const auto controller_topology=std::make_shared<const MoEOverlayDeviceControllerTopology>(
             resolveMoEOverlayDeviceControllerTopology(*plan,owner_map,{.world_rank_node_ids=node_ids}));
-        std::vector<uint32_t> initial_owner_participants;
+        std::vector<MoEOverlayRouteTarget> initial_route_targets;
         const auto initial_ownership=owner_map.layeredOwnership(1,kNumExperts);
-        for(int expert=0;expert<kNumExperts;++expert)initial_owner_participants.push_back(initial_ownership.owner(0,expert));
+        for(int expert=0;expert<kNumExperts;++expert)initial_route_targets.push_back(MoEOverlayRouteTarget::whole(initial_ownership.owner(0,expert)));
         auto model_ctx=ModelContext::createForTesting("test.gguf",nullptr,1,true);
         if(!model_ctx || !model_ctx->concreteWeightManager())throw std::runtime_error("Original lowering model directory is absent");
         const auto graph_family=resolveMoEOverlayInferenceGraphFamilyIdentity(model_ctx->concreteLoader(),
@@ -2508,7 +2508,7 @@ namespace llaminar2::test
         admission.checkpoint([&]{root_controller_fabric=std::make_shared<MoEOverlayNodeLocalDeviceControllerFabric>(
             MoEOverlayNodeLocalDeviceControllerFabric::Config{.mpi_ctx=overlay_mpi,.topology=controller_topology,
                 .num_layers=1,.num_experts=kNumExperts,.command_capacity=4,.initial_durable_epoch=1,
-                .payload_bytes_per_layer={4096},.initial_owner_participants=initial_owner_participants,
+                .payload_bytes_per_layer={4096},.initial_route_targets=initial_route_targets,
                 .minimum_window_activations=1,.maximum_cycles_per_wave=1});});
         admission.checkpoint([&]{if(!admission.source())return;
         model_ctx->concreteWeightManager()->installPhysicalMemoryAuthority(admission.memory());

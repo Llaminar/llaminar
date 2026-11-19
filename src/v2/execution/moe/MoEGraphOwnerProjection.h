@@ -87,7 +87,7 @@ namespace llaminar2
             if (placement)
                 owners[static_cast<size_t>(expert)] =
                     placement->shard_cohort
-                        ? MoEOverlayRouteTarget::cpuCohort(placement->tier_idx).word()
+                        ? MoEOverlayRouteTarget::cohort(placement->tier_idx).word()
                         : MoEOverlayRouteTarget::whole(placement->owner_participant).word();
         }
         return owners;

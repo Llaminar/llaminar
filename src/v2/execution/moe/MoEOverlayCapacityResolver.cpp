@@ -10,6 +10,8 @@
  * consulted, which keeps the same decision reproducible on every MPI rank.
  * Pipeline stages share the same typed physical BOM throughout admission;
  * compact stage quota/count metadata never becomes an independent byte budget.
+ * Joint expert cohorts charge every original member's exact fragment to that
+ * member's rank/device resource, including local-geometry shadow-bank sharing.
  */
 
 #include "MoEOverlayCapacityResolver.h"
@@ -813,9 +815,10 @@ namespace llaminar2
                             const auto budget=std::find_if(input.physical_budgets.begin(),input.physical_budgets.end(),
                                 [&](const auto& b){return b.resourceId()==endpoint.resource_id;});
                             const auto resource=budget->certificate().bom().resource();
-                            if(member.participant_id!=endpoint.participant_id || !resource.device.is_cpu() ||
+                            if(member.participant_id!=endpoint.participant_id ||
+                               resource.device!=member.address.toLocalDeviceId() ||
                                resource.world_rank!=member.world_rank)
-                                throw std::invalid_argument("Tensor-sharded capacity requires exact original CPU resources");
+                                throw std::invalid_argument("Tensor-sharded capacity requires each original rank/device resource");
                             state.fragment_footprints[p].push_back(MoEOverlayCapacityResolver::preparedFootprints({cohort->localManifest(p)}).front());
                         }
                     }

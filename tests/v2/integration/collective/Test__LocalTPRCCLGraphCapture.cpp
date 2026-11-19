@@ -4281,6 +4281,9 @@ TEST(Test__LocalTPRCCLGraphCapture,
      */
     constexpr std::size_t kAdmissionEpochOffset = 0u;
     constexpr std::size_t kAdmissionBarrierOffset = 64u;
+    constexpr std::uint64_t kAdmissionBarrierBytes =
+        MoEOverlayDeviceControllerInferenceEpochRecord::bytesForMembers(
+            kParticipants);
     const std::array<DeviceId, kParticipants> admission_devices{
         DeviceId::rocm(0),
         DeviceId::rocm(1),
@@ -4288,8 +4291,7 @@ TEST(Test__LocalTPRCCLGraphCapture,
         DeviceId::rocm(3)};
     auto admission_region =
         TransferEngine::instance().allocateMappedHostRegion(
-            kAdmissionBarrierOffset +
-                sizeof(MoEOverlayDeviceControllerInferenceEpochRecord),
+            kAdmissionBarrierOffset + kAdmissionBarrierBytes,
             admission_devices);
     ASSERT_NE(admission_region, nullptr);
     ASSERT_TRUE(admission_region->isBound());
@@ -4299,10 +4301,25 @@ TEST(Test__LocalTPRCCLGraphCapture,
         MoEOverlayDeviceControllerInferenceEpochRecord *>(
         admission_region->mutableHostData(kAdmissionBarrierOffset));
     *admission_record = MoEOverlayDeviceControllerInferenceEpochRecord{};
-    admission_record->participant_mask = 0b1111u;
+    admission_record->bindMemberExtent(kParticipants);
     admission_record->publisher_participant_id = 0u;
     admission_record->topology_fingerprint = 1u;
     admission_record->epoch = 1u;
+    // The real four-device membership occupies four roster-local lanes. The
+    // admitted tail is part of this retained mapping, including every arrival
+    // byte; a header-only allocation cannot certify a captured transaction.
+    auto *const admission_members = moeOverlayExtentArray<std::uint32_t>(
+        admission_record, kAdmissionBarrierBytes,
+        admission_record->member_ids_offset, kParticipants);
+    auto *const admission_arrivals =
+        admission_record->arrivals(kAdmissionBarrierBytes);
+    ASSERT_NE(admission_members, nullptr);
+    ASSERT_NE(admission_arrivals, nullptr);
+    for (std::uint32_t member = 0u; member < kParticipants; ++member)
+    {
+        admission_members[member] = member;
+        admission_arrivals[member] = 0u;
+    }
 
     std::array<float *, kParticipants> values{};
     std::array<float *, kParticipants> rank_banks{};
@@ -4400,6 +4417,7 @@ TEST(Test__LocalTPRCCLGraphCapture,
                                 kAdmissionBarrierOffset)),
                         .participant_id = static_cast<std::uint32_t>(
                             participant),
+                        .storage_bytes = kAdmissionBarrierBytes,
                     },
                 }));
         epoch_kernels[participant] =

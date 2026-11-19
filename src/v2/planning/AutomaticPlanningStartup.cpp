@@ -10,6 +10,8 @@
  */
 #include "planning/AutomaticPlanningStartup.h"
 #include "planning/PlanningPublication.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "transfer/TransferEngine.h"
 #include "planning/PlanningRequestCostModel.h"
 #include "execution/mtp/MTPWeightManifest.h"
 #include "loaders/ModelLoader.h"
@@ -33,7 +35,47 @@ namespace llaminar2
     {
         // Every discovery rank contributes before membership narrows. Both
         // frontends consume this one policy; only root retains the cost closure.
-        return PlanningRequestCostModel::prepare;
+        return [](const AutomaticPlanningPreparation &context) {
+            const auto rank = context.mpi() ? context.mpi()->rank() : 0;
+            auto &pool = GPUDeviceContextPool::instance();
+            std::vector<DeviceId> devices;
+            std::optional<AutomaticOrchestrationPlanner::Evaluate> evaluator;
+            std::exception_ptr error;
+            try
+            {
+                acceptPlanningCostPreparation(context.mpi(), [&] {
+                    auto measured = planningNativeContextDevices(context, rank);
+                    for (const auto device : measured)
+                        if (pool.findExistingContextProvenance(device))
+                            throw std::logic_error("Automatic calibration requires an untouched GPU worker: " +
+                                                   device.toString());
+                    devices = std::move(measured);
+                });
+                evaluator = PlanningRequestCostModel::prepare(context);
+            }
+            catch (...)
+            {
+                error = std::current_exception();
+            }
+
+            acceptPlanningCostPreparation(context.mpi(), [&] {
+                // Only workers created by this calibration can exist on the
+                // measured roster after the clean entry check. The evaluator
+                // retains host evidence only. The transfer authority verifies
+                // that calibration PMA allocations, collective handles, and
+                // graph borrows have retired before resetting those devices.
+                const auto &transfer = TransferEngine::instance();
+                std::vector<ExclusiveModelRetirementTicket> tickets;
+                for (const auto device : devices)
+                    if (const auto existing = pool.findExistingContextProvenance(device))
+                        tickets.push_back(transfer.beginExclusiveNativeContextRetirement(*existing));
+                if (!tickets.empty())
+                    (void)transfer.completeExclusiveModelRetirements(std::move(tickets));
+                if (error)
+                    std::rethrow_exception(error);
+            });
+            return evaluator;
+        };
     }
 
     AutomaticPlanningStartupResult AutomaticPlanningStartup::run(const OrchestrationConfig &request,

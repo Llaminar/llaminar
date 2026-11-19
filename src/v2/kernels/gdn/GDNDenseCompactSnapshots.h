@@ -869,6 +869,9 @@ bool launchROCmDenseCompactRecurrence(const GDNDenseCompactCaptureInput &input, 
  * @param stream Exact producer-ordered HIP stream through terminal retirement.
  * @return Cold admission/enqueue success; no original-state read or fallback. */
 bool launchROCmDenseCompactAcceptedPrefix(const GDNDenseCompactAcceptedPrefixInput &input, void *stream);
+/** @brief Submit accepted state with a cold-declared MI50 default on its actual published stream. */
+bool launchROCmDenseCompactAcceptedPrefixWithPolicy(const GDNDenseCompactAcceptedPrefixInput &input,
+    void *stream,bool qualified_default);
 static_assert(sizeof(float) == sizeof(std::uint32_t));
 static_assert(std::is_trivially_copyable_v<GDNDenseCompactTerminalOutput>);
 static_assert(std::is_standard_layout_v<GDNDenseCompactTerminalOutput>);

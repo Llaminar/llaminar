@@ -1208,7 +1208,7 @@ namespace llaminar2
             const auto runtime=resolveMoEExpertOverlayRuntimePlan(std::make_shared<const MoERoutedExpertPlacementPlan>(original),
                 {.current_world_rank=0});ASSERT_TRUE(runtime);
             const auto preparation=MoEExpertOverlayPreparationPlan::build(*runtime,*loader_).filteredForDevice(DeviceId::cpu());
-            ASSERT_FALSE(preparation.requests().empty());const auto selected=preparation.requests().front().cpu_joint_source;
+            ASSERT_FALSE(preparation.requests().empty());const auto selected=preparation.requests().front().joint_source;
             ASSERT_TRUE(selected);ASSERT_EQ(selected->expertIds().size(),448u);
             EXPECT_EQ(selected->ownership().geometry().experts,512);
             const auto placement=CPUStoragePlacement::onNode(selected->participant().address.numa_node);
@@ -1260,7 +1260,7 @@ namespace llaminar2
                 original.identity.overlay_domain=selected->participant().domain_name;
                 original.identity.overlay_participant_world_rank=selected->participant().world_rank;
                 original.identity.overlay_participant_index=original.identity.tp_rank_or_device_index=int(selected->participantIndex());
-                original.cpu_joint_source=selected;original.projection_ownership=selected->ownership();original.native_source=projections[ordinal];
+                original.joint_source=selected;original.projection_ownership=selected->ownership();original.native_source=projections[ordinal];
                 original.slice=requirement.slice;original.slice.row_start=range.first_row;original.slice.row_count=range.rows;
                 original.slice.col_start=range.first_column;original.slice.col_count=range.columns;
                 original.slice.expert_start=range.original_expert;original.slice.expert_count=1;

@@ -29,6 +29,22 @@ namespace llaminar2
     class PlanningModelMetadata;
     struct ClusterInventory;
     class ResolvedRankOrchestration;
+    struct ModelMemoryProfile;
+
+    /**
+     * @brief Resolve one measured local GPU model/domain policy from immutable planning inputs.
+     * @param plan Topology already bound to original rank/device inventory.
+     * @param model Validated model metadata from the original source.
+     * @param inventory Existing cluster inventory for each original endpoint.
+     * @param whole_model Whether this is the unsplit, GPU-only model graph.
+     * @param rebalance_mode Resolved expert maintenance mode for this graph.
+     * @param requested_compute Authored compute policy before inventory resolution.
+     * @return The measured QFN profile only when the complete original four-card contract holds.
+     */
+    LocalGPUExpertKernelPolicy selectLocalGPUExpertKernelPolicy(
+        const MoERoutedExpertPlacementPlan &plan, const ModelMemoryProfile &model, const ClusterInventory &inventory,
+        bool whole_model, MoERebalanceRuntimeMode rebalance_mode,
+        RoutedExpertComputePolicy requested_compute = RoutedExpertComputePolicy::TensorSharded);
 
     /**
      * @brief Immutable topology and BOM projection of one authored local PP stage.

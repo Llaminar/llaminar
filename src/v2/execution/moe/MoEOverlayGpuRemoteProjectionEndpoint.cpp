@@ -110,6 +110,30 @@ namespace llaminar2
                     descriptor.ptrs.d_emins != nullptr);
         }
 
+        /**
+         * @brief Authenticate a complete original GPU root independently of its compact wire overlap.
+         * @param descriptor Actual source or destination separated arrays.
+         * @param owned That endpoint's original allocation rectangle.
+         * @param manifest Already authenticated immutable wire and native execution format.
+         * @return Whether every physical array and native trait belongs to the declared root.
+         */
+        bool descriptorMatchesNativeManifest(const GpuExpertPackedDescriptor& descriptor,
+            const MoEExpertProjectionOwnership::Projection& owned,
+            const MoEOverlayRemoteProjectionManifest& manifest) noexcept
+        {
+            if (!descriptorPointersComplete(descriptor) || descriptor.n != owned.rows || descriptor.k != owned.columns ||
+                descriptor.blocks_per_row != owned.columns / 32 ||
+                manifest.gpu_codebook_id != descriptor.codebook_id ||
+                manifest.gpu_payload_bytes_per_block != descriptor.payload_bytes_per_block ||
+                manifest.gpu_is_asymmetric != descriptor.is_asymmetric || manifest.gpu_has_emins != descriptor.has_emins)
+                return false;
+            const auto blocks = std::uint64_t(owned.rows) * (owned.columns / 32);
+            return descriptor.vnni_bytes == blocks * descriptor.payload_bytes_per_block &&
+                descriptor.scales_bytes == blocks * sizeof(std::uint16_t) &&
+                descriptor.mins_bytes == (descriptor.is_asymmetric ? blocks * sizeof(std::uint16_t) : 0u) &&
+                descriptor.emins_bytes == (descriptor.has_emins ? blocks * sizeof(std::uint32_t) : 0u);
+        }
+
         /** @brief Compare the complete semantic chunk header. */
         bool sameChunkHeader(
             const MoEOverlayRemoteProjectionChunkHeader &left,
@@ -1196,20 +1220,7 @@ namespace llaminar2
         else if (manifest_.carriesGpuBytes())
         {
             if (!manifest_.identity.destination_device.is_gpu() ||
-                manifest_.N != source_.n || manifest_.K != source_.k ||
-                manifest_.blocks_per_row !=
-                    static_cast<std::int32_t>(source_.blocks_per_row) ||
-                manifest_.gpu_codebook_id != source_.codebook_id ||
-                manifest_.gpu_payload_bytes_per_block !=
-                    source_.payload_bytes_per_block ||
-                manifest_.gpu_is_asymmetric != source_.is_asymmetric ||
-                manifest_.gpu_has_emins != source_.has_emins ||
-                manifest_.region_bytes !=
-                    std::array<std::uint64_t, 4>{
-                        source_.vnni_bytes,
-                        source_.scales_bytes,
-                        source_.mins_bytes,
-                        source_.emins_bytes})
+                !descriptorMatchesNativeManifest(source_, manifest_.source_projection, manifest_))
             {
                 throw std::invalid_argument(
                     "Remote GPU blob source descriptor differs from its manifest");
@@ -1320,7 +1331,8 @@ namespace llaminar2
         default:
             return nullptr;
         }
-        return base ? base + region_offset_ : nullptr;
+        const auto range = manifest_.gpuRegionRange(region_, region_offset_, 1);
+        return base && range ? base + range->source_offset : nullptr;
     }
 
     bool MoEOverlayGpuRemoteProjectionSource::submitNextChunk(
@@ -1378,6 +1390,14 @@ namespace llaminar2
                (manifest_.source_projection.columns!=manifest_.K || manifest_.destination_projection.columns!=manifest_.K)) {
                 const size_t row_bytes=size_t(manifest_.K)*ExpertWeightFormat::floating(floating_source_.type).floatingElementBytes();
                 bytes=std::min(bytes,row_bytes-region_offset_%row_bytes);
+            }
+            if (manifest_.carriesGpuBytes()) {
+                const auto range = manifest_.gpuRegionRange(region_, region_offset_, bytes);
+                if (!range) {
+                    setGpuRemoteError(error, "Remote GPU source lost its original native byte range");
+                    return false;
+                }
+                bytes = range->bytes;
             }
             active_header_.region = static_cast<std::uint8_t>(region_);
             active_header_.region_offset = region_offset_;
@@ -1658,22 +1678,8 @@ namespace llaminar2
         else if (manifest.carriesGpuBytes())
         {
             const auto &descriptor = candidate.descriptor;
-            if (!descriptor.valid() ||
-                !manifest.identity.source_device.is_gpu() ||
-                manifest.N != descriptor.n || manifest.K != descriptor.k ||
-                manifest.blocks_per_row !=
-                    static_cast<std::int32_t>(descriptor.blocks_per_row) ||
-                manifest.gpu_codebook_id != descriptor.codebook_id ||
-                manifest.gpu_payload_bytes_per_block !=
-                    descriptor.payload_bytes_per_block ||
-                manifest.gpu_is_asymmetric != descriptor.is_asymmetric ||
-                manifest.gpu_has_emins != descriptor.has_emins ||
-                manifest.region_bytes !=
-                    std::array<std::uint64_t, 4>{
-                        descriptor.vnni_bytes,
-                        descriptor.scales_bytes,
-                        descriptor.mins_bytes,
-                        descriptor.emins_bytes})
+            if (!manifest.identity.source_device.is_gpu() ||
+                !descriptorMatchesNativeManifest(descriptor, manifest.destination_projection, manifest))
             {
                 setGpuRemoteError(
                     error,
@@ -1769,6 +1775,10 @@ namespace llaminar2
             if(manifest_->source_projection.columns!=manifest_->K || manifest_->destination_projection.columns!=manifest_->K)
                 range_valid=payload.size()<=row_bytes-header.region_offset%row_bytes;
         }
+        if (range_valid && manifest_->carriesGpuBytes()) {
+            const auto range = manifest_->gpuRegionRange(header.region, header.region_offset, payload.size());
+            range_valid = range && range->bytes == payload.size();
+        }
         if (!range_valid)
         {
             validator_->abort();
@@ -1828,7 +1838,13 @@ namespace llaminar2
             submitted = lane_->submitGpuBlobWrite(
                 this,
                 base + [&] {
-                    if(!manifest_->carriesFloatingBytes())return size_t(active_header_.region_offset);
+                    if (manifest_->carriesGpuBytes()) {
+                        // beginChunk authenticated this exact contiguous run;
+                        // neither the private manifest nor header can change
+                        // while the physical lane retains the payload.
+                        return size_t(manifest_->gpuRegionRange(active_header_.region,
+                            active_header_.region_offset, active_payload_.size())->destination_offset);
+                    }
                     const auto& owned=manifest_->destination_projection;const auto& source=manifest_->source_projection;
                     const ExpertWeightFormat format{.kind=manifest_->format_kind};const size_t element=format.floatingElementBytes(),row_bytes=size_t(manifest_->K)*element;
                     const size_t row=std::max(owned.first_row,source.first_row)-owned.first_row+active_header_.region_offset/row_bytes;

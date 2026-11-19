@@ -18,7 +18,7 @@
 #include "DeviceGroup.h"
 #include "backends/ShmemSpinBackend.h"
 #include "execution/runner/RankInitializationLifecycle.h"
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 #include "execution/moe/MoEOverlaySparseCollective.h"
 #include "../tensors/Tensors.h"
 #include "../utils/DebugEnv.h"
@@ -1018,7 +1018,7 @@ namespace llaminar2
     }
 
     bool GlobalTPContext::gatherReplicatedCPUExpertPrefillRoutesToRoot(
-        const CPUExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
+        const ExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
         const std::shared_ptr<IGlobalTPContext>& owner,const float* local,float* root,
         size_t capacity,int root_index,size_t& gathered,const std::string& stage,
         std::span<RootedFloatRecordRange> ranges,CPURootedPublicationTransport& selected)

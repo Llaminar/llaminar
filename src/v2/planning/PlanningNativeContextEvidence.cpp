@@ -15,10 +15,7 @@
 #include <nlohmann/json.hpp>
 #include <set>
 namespace llaminar2 {
-namespace {
-using Json = nlohmann::json;
-/** @return Only GPU observers allowed by the actual automatic request. */
-std::vector<DeviceId> devices(const AutomaticPlanningPreparation &c, int rank) {
+std::vector<DeviceId> planningNativeContextDevices(const AutomaticPlanningPreparation &c, int rank) {
   std::vector<DeviceId> result;
   const auto request = std::get<AutomaticOrchestrationRequest>(
       resolveOrchestrationIntent(c.request()));
@@ -28,6 +25,8 @@ std::vector<DeviceId> devices(const AutomaticPlanningPreparation &c, int rank) {
       result.push_back({gpu.type, gpu.local_device_id});
   return result;
 }
+namespace {
+using Json = nlohmann::json;
 /** @return Exact source-owned geometry, without provider or runtime identity
  * hashing. */
 Json encode(const PlanningNativeContextDeclaration &k) {
@@ -129,7 +128,7 @@ collectPlanningNativeContextBudgets(const AutomaticPlanningPreparation &c) {
           throw std::invalid_argument("Native birth request mismatch");
         const int rank = c.mpi() ? c.mpi()->rank() : 0;
         Json j = Json::array();
-        for (const auto device : devices(c, rank)) {
+        for (const auto device : planningNativeContextDevices(c, rank)) {
           const auto program = GPUWorkerStackProgram::originalDefaults();
           const auto object = PreparedGPUContextFactory::objectGeometry(device);
           const auto &rank_inventory = c.inventory().ranks.at(rank);
@@ -157,7 +156,7 @@ collectPlanningNativeContextBudgets(const AutomaticPlanningPreparation &c) {
             throw std::invalid_argument(
                 "Native birth discovery rank/extent mismatch");
           const auto j = Json::parse(samples[rank].bytes);
-          const auto expected = devices(c, rank);
+          const auto expected = planningNativeContextDevices(c, rank);
           if (!j.is_array() || j.size() != expected.size())
             throw std::invalid_argument(
                 "Native birth discovery omitted GPU evidence");

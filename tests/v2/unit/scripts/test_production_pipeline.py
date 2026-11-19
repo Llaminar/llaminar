@@ -4466,7 +4466,7 @@ class ImageIdentityTests(unittest.TestCase):
         toolchain = dockerfile.split("FROM ubuntu:24.04 AS gpu-sdk", 1)[1].split(
             "FROM toolchain AS builder", 1)[0]
         generic_install_end = toolchain.index("RUN rm -rf /tmp/install-scripts")
-        rccl = toolchain.index("ARG RCCL_ENABLE_MSCCL_KERNEL")
+        rccl = toolchain.index("COPY scripts/docker/rccl-functions.txt")
         cpu_isa = toolchain.index("ARG LLAMINAR_CPU_ISA")
         onednn = toolchain.index("ARG ONEDNN_GIT_REF")
         self.assertLess(generic_install_end, cpu_isa)
@@ -4565,7 +4565,7 @@ class ImageIdentityTests(unittest.TestCase):
         """Cold NCCL builds must not compile architectures absent from Llaminar."""
         installer = (ROOT / "scripts/docker/install-cuda.sh").read_text(encoding="utf-8")
         self.assertIn('local requested_architectures="${CUDAARCHS:-}"', installer)
-        self.assertIn('""|all|all-major|native)', installer)
+        self.assertIn("all|all-major|native)", installer)
         self.assertIn('gencodes+=("-gencode arch=compute_${architecture},code=sm_${architecture}")',
                       installer)
         self.assertIn('export NVCC_GENCODE="${gencodes[*]}"', installer)
@@ -4578,7 +4578,7 @@ class ImageIdentityTests(unittest.TestCase):
             "\n}\n\n# --- Register NVIDIA", 1)[0]
         invocation = (
             "configure_nccl_gencode() {" + function + "\n}\n"
-            "configure_nccl_gencode\nprintf '%s' \"${NVCC_GENCODE}\""
+            "configure_nccl_gencode && printf '%s' \"${NVCC_GENCODE}\""
         )
         result = subprocess.run(
             ["bash", "-c", invocation],
@@ -4593,6 +4593,15 @@ class ImageIdentityTests(unittest.TestCase):
             "-gencode arch=compute_86,code=sm_86 "
             "-gencode arch=compute_90,code=sm_90",
         )
+
+        for target in ("all", "all-major", "native", "90-virtual"):
+            with self.subTest(target=target):
+                result = subprocess.run(
+                    ["bash", "-c", invocation],
+                    env={**os.environ, "CUDAARCHS": target},
+                    capture_output=True, text=True,
+                )
+                self.assertNotEqual(result.returncode, 0)
 
     def test_both_shipping_pairs_require_every_declared_build_property(self):
         """Exercise both roles and both ISAs, including absent identity fields."""
@@ -5011,14 +5020,24 @@ class InfrastructureTests(unittest.TestCase):
             self.assertEqual(set(selections[operation][3].split("/")), {"Sum", "MinMax"})
             self.assertEqual(set(selections[operation][4].split("/")), {"i8", "i32", "f16", "f32", "bf16"})
         wrapper = ROOT / "scripts/docker/build-runtime-image.sh"
-        output = subprocess.check_output(["bash", str(wrapper), "--variant", "full", "--dry-run"], text=True)
-        self.assertIn("MinMax", output)
-        full = subprocess.check_output(["bash", str(wrapper), "--variant", "full", "--full-rccl-funcs", "--dry-run"], text=True)
-        self.assertIn("RCCL_ONLY_FUNCS=", full)
-        self.assertNotIn("MinMax", full)
+        base = ["bash", str(wrapper), "--variant", "full", "--dry-run"]
+        output = subprocess.check_output(
+            [*base, "--rocm-runtime-gpu-targets", "gfx906,gfx1100"], text=True)
+        self.assertIn(r"ROCM_RUNTIME_GPU_TARGETS=gfx906\;gfx1100", output)
+        for option in ("--no-rccl-from-source", "--full-rccl-funcs"):
+            with self.subTest(option=option):
+                self.assertNotEqual(
+                    subprocess.run([*base, option], capture_output=True).returncode, 0)
+        override = subprocess.run(
+            [*base, "--build-arg", "RCCL_GIT_REF=other"], capture_output=True, text=True)
+        self.assertNotEqual(override.returncode, 0)
+        self.assertIn("Unsupported collective dependency override", override.stderr)
         dockerfile = (ROOT / "Dockerfile").read_text()
         self.assertIn("COPY scripts/docker/rccl-functions.txt", dockerfile)
-        self.assertIn("ARG RCCL_ONLY_FUNCS=default", dockerfile)
+        self.assertIn('-DONLY_FUNCS="${rccl_build_funcs}"', dockerfile)
+        self.assertIn("-DENABLE_MSCCL_KERNEL=OFF", dockerfile)
+        self.assertIn('tar.gz/${LLAMINAR_RCCL_GIT_COMMIT}"', dockerfile)
+        self.assertEqual(dockerfile.count('-DCMAKE_HIP_ARCHITECTURES="${rocm_gpu_targets}"'), 2)
 
     def test_rccl_dependency_is_selected_once_for_builder_and_runtime(self):
         # Runtime search lists previously ignored the configured source-built

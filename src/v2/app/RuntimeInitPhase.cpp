@@ -15,6 +15,7 @@
  * Excluded discovery processes retire without acquiring an inference runner.
  */
 
+#include "app/ServerDiscoveryMembership.h"
 #include "app/RuntimeInitPhase.h"
 #include "app/MPIBootstrapPhase.h"
 #include "app/ChatTemplateResolver.h"
@@ -410,6 +411,12 @@ namespace llaminar2
             // It rejects asymmetric intent before splitting. The active context
             // retains discovery and its inventory; no second exchange occurs.
             auto admitted = MPIContextFactory::selectRanks(mpi_ctx, selection->discoveryRanks());
+            // The existing admission vote already authenticated this complete
+            // ordered roster. Publish the original process identity before an
+            // inactive discovery sibling exits to MPI finalization or an active
+            // sibling changes to the narrower execution rank namespace.
+            if (config.serve_mode)
+                LOG_INFO(serverDiscoveryMembership(*mpi_ctx, *selection));
             if (std::holds_alternative<InactiveMPIRank>(admitted))
                 return RuntimeInitExit::Completed;
             mpi_ctx = std::get<std::shared_ptr<MPIContext>>(std::move(admitted));

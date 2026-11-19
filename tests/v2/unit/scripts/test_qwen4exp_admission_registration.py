@@ -117,8 +117,10 @@ endif()
                     tp4_policies = ("Fixed1", "Fixed2", "Fixed3", "Fixed15", "Dynamic",
                                     "Fixed5", "Fixed6")
                     tp4_prefix = "V2_Integration_Qwen4ExpFullROCmTP4MTPAdmission_"
+                    bridge = "V2_Integration_Qwen4ExpTensorShardedRestoredPrefixMTP"
                     if rocm:
                         names.update(tp4_prefix + policy for policy in tp4_policies)
+                        names.add(bridge)
                     self.assertEqual({test["name"] for test in tests}, names)
                     self.assertEqual(len(tests), len(names))
                     for test in tests:
@@ -131,10 +133,8 @@ endif()
                         self.assertEqual(props["TIMEOUT"], 900)
                         self.assertNotIn("ProductionTestPreflight", props["LABELS"])
                         self.assertEqual("CUDA" in props["LABELS"], "CUDA" in test["name"])
-                        self.assertEqual("ROCm" in props["LABELS"], "ROCm" in test["name"])
-                        if test["name"].startswith(tp4_prefix):
-                            policy = test["name"].removeprefix(tp4_prefix)
-                            self.assertIn(policy, tp4_policies)
+                        self.assertEqual("ROCm" in props["LABELS"], "ROCm" in test["name"] or test["name"] == bridge)
+                        if test["name"].startswith(tp4_prefix) or test["name"] == bridge:
                             self.assertEqual(set(props["RESOURCE_LOCK"]), {
                                 "Integration_Serial", "rocm_gpu_0", "rocm_gpu_1",
                                 "rocm_gpu_2", "rocm_gpu_3"})
@@ -143,6 +143,14 @@ endif()
                             self.assertEqual(environment["LLAMINAR_SKIP_CUDA_STARTUP"], "1")
                             self.assertEqual(environment["LLAMINAR_SKIP_ROCM_STARTUP"], "0")
                             filters = [arg for arg in test["command"] if arg.startswith("--gtest_filter=")]
+                            if test["name"] == bridge:
+                                self.assertEqual(filters, [
+                                    "--gtest_filter=Qwen4ExpTensorShardedROCmTP4."
+                                    "Fixed3Retained3RestoredPrefixPlusOneMatchesSerialState"])
+                                self.assertIn("PrefixCache", props["LABELS"])
+                                continue
+                            policy = test["name"].removeprefix(tp4_prefix)
+                            self.assertIn(policy, tp4_policies)
                             self.assertEqual(filters, [
                                 "--gtest_filter=Qwen4ExpFullROCmTP4MTPAdmission/"
                                 "Qwen4ExpMTPAdmissionTest.PairedSourceInitializesWithoutReferencePack/"

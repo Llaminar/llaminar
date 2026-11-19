@@ -37,10 +37,8 @@ APT_OPTS=(
 # image has no kernels.  Apart from wasting a cold build, that makes the
 # collective library advertise a broader device set than the application.
 #
-# CMake's broad selectors intentionally remain broad: NCCL's upstream default
-# is the only equivalent representation for ``all``, ``all-major`` and
-# ``native``.  Concrete CUDA architectures may include a suffix such as 90a;
-# nvcc accepts that spelling in both compute and sm targets.
+# A packaged app uses concrete targets. Broad CMake aliases do not
+# correspond to one portable NCCL target list and therefore fail closed.
 configure_nccl_gencode() {
     local requested_architectures="${CUDAARCHS:-}"
     local architecture
@@ -48,20 +46,21 @@ configure_nccl_gencode() {
     local -a architectures=()
 
     case "${requested_architectures}" in
-        ""|all|all-major|native)
-            return 0
+        "") return 0 ;;
+        all|all-major|native)
+            echo "Choose concrete CUDAARCHS for the application and NCCL." >&2
+            return 1
             ;;
     esac
 
     IFS=';' read -r -a architectures <<< "${requested_architectures}"
     for architecture in "${architectures[@]}"; do
-        # CMake accepts 86-real/86-virtual spellings.  NCCL's Makefile needs
-        # the underlying compute capability because it constructs the exact
-        # SASS target itself.
-        architecture="${architecture%%-*}"
+        # Match the app's concrete SASS target. A virtual-only target
+        # is not a native NCCL target in the shipping image.
+        architecture="${architecture%-real}"
         if [[ ! "${architecture}" =~ ^[0-9]+[A-Za-z]?$ ]]; then
             echo "Unsupported CUDAARCHS entry '${architecture}' for NCCL. " \
-                 "Use concrete capabilities (for example 86 or 90a), or all/all-major/native." >&2
+                 "Use concrete capabilities (for example 86 or 90a)." >&2
             return 1
         fi
         gencodes+=("-gencode arch=compute_${architecture},code=sm_${architecture}")
@@ -92,12 +91,9 @@ if [[ "${MODE}" == "full" ]]; then
         cuda-nvcc-13-0 \
         cuda-cuobjdump-13-0 \
         cuda-cudart-dev-13-0 \
-        libcublas-dev-13-0 \
-        "libnccl2=*+cuda13.0" \
-        "libnccl-dev=*+cuda13.0"
+        libcublas-dev-13-0
 
-    # The package supplies tooling; production loads the separately named,
-    # pinned source build that supports repeated capture into a native parent.
+    # The patched source build supplies the only collective ABI and runtime.
     configure_nccl_gencode
     bash "$(dirname -- "${BASH_SOURCE[0]}")/install-nccl.sh"
 

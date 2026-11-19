@@ -29,6 +29,7 @@
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "execution/moe/MoEWorkspaceRequirements.h"
 #include "execution/moe/MoEOverlayCPUServiceMeasurement.h"
+#include "execution/compute_stages/stages/TPAllreduceStage.h"
 #include "execution/compute_stages/ComputeStageUtils.h"
 #include "interfaces/IWorkspaceConsumer.h"
 #include "kernels/common/FloatingPointGemmWorkspaceABI.h"
@@ -236,7 +237,7 @@ size_t exactMoEWorkspaceBytes(
             profile.d_model,
             profile.expert_feed_forward_length,
             profile.expert_count,
-            profile.expert_used_count);
+            profile.expert_used_count, geometry.gate_up_publication, geometry.down_publication);
     }
     else
     {
@@ -254,7 +255,7 @@ size_t exactMoEWorkspaceBytes(
             ? MoEWorkspaceBuffers::cudaMoE(compact_rows, profile.d_model,
                 profile.expert_feed_forward_length, profile.expert_count, 1)
             : MoEWorkspaceBuffers::rocmMoE(compact_rows, profile.d_model,
-                profile.expert_feed_forward_length, profile.expert_count, 1));
+                profile.expert_feed_forward_length, profile.expert_count, 1, geometry.gate_up_publication, geometry.down_publication));
     }
     return requirements.total_bytes_with_alignment();
 }
@@ -2489,11 +2490,19 @@ size_t WorkspaceMemoryEstimator::estimate(
 
 /** @brief One canonical compiler; callers provide only the two fixed source-owned service scopes. */
 static size_t estimateExpertServiceWorkspace(const ModelMemoryProfile& profile,
-    const WorkspaceMemoryGeometry& geometry,std::span<const ExpertHistogramSource> phases)
+    const WorkspaceMemoryGeometry& geometry,std::span<const ExpertHistogramSource> phases,
+    const MoEExpertProjectionOwnership* original_fragment=nullptr)
 {
     if (!geometry.device.is_gpu() || profile.expert_count <= 0 ||
         profile.d_model <= 0 || profile.expert_feed_forward_length <= 0)
         throw std::invalid_argument("Prepared GPU service requires original expert geometry");
+    if(original_fragment && (original_fragment->intermediateIntervals().empty() ||
+       original_fragment->geometry().experts!=profile.expert_count ||
+       original_fragment->geometry().model_columns!=profile.d_model ||
+       original_fragment->geometry().intermediate_columns!=profile.expert_feed_forward_length))
+        throw std::invalid_argument("Prepared GPU fragment service changed original source geometry");
+    const int intermediate=original_fragment
+        ? original_fragment->projection(WeightRole::MoEExpertUp).rows : profile.expert_feed_forward_length;
     const auto sharding = SchemaFactoryRegistry::getWeightShardingConfig(profile.architecture);
     WorkspaceRequirements requirements;
     bool found = false;
@@ -2502,15 +2511,23 @@ static size_t estimateExpertServiceWorkspace(const ModelMemoryProfile& profile,
         const int rows = MoEOverlayCPUServiceMeasurement::rowsForPhase(phase);
         auto current = geometry.device.is_cuda()
             ? MoEWorkspaceBuffers::cudaMoE(rows, profile.d_model,
-                  profile.expert_feed_forward_length, 1, 1)
+                  intermediate, original_fragment?profile.expert_count:1, 1)
             : MoEWorkspaceBuffers::rocmMoE(rows, profile.d_model,
-                  profile.expert_feed_forward_length, 1, 1);
+                  intermediate, original_fragment?profile.expert_count:1, 1, geometry.gate_up_publication, geometry.down_publication);
         for (const auto& tensor : profile.tensors)
         {
             if (!isRoutedExpertWeight(tensor.name) ||
                 !WorkspaceMemoryEstimator::ownsProjectionSource(tensor, profile, geometry))
                 continue;
-            const auto shape = localWorkspaceMatrixShape(tensor, profile, geometry, sharding, false);
+            auto shape = localWorkspaceMatrixShape(tensor, profile, geometry, sharding, false);
+            if(original_fragment) {
+                const auto source=routedExpertSourceMatrixShape(tensor,profile);
+                const auto local=original_fragment->projection(workspaceSourceRole(tensor,profile,geometry));
+                if(!source.valid() || local.source_rows!=source.output_columns ||
+                   local.source_columns!=source.input_columns)
+                    throw std::invalid_argument("Prepared GPU fragment service lost original projection axes");
+                shape={local.rows,local.columns};
+            }
             if (!shape.valid())
                 throw std::invalid_argument("Prepared GPU service has incomplete projection metadata");
             found = true;
@@ -2563,6 +2580,8 @@ static size_t estimateExpertServiceWorkspace(const ModelMemoryProfile& profile,
             if (gate)
                 addCudaConcurrentDecodeGemvSideStreamWorkspace(current, geometry.device, rows, 2);
         }
+        if(original_fragment)current.merge(TPAllreduceStage::canonicalRankWorkspaceRequirements(
+            size_t(rows)*profile.d_model,size_t(original_fragment->participants())));
         requirements.merge(current);
     }
     if (!found)
@@ -2576,6 +2595,14 @@ size_t WorkspaceMemoryEstimator::estimatePreparedExpertService(const ModelMemory
     constexpr std::array phases{ExpertHistogramSource::DecodeToken,ExpertHistogramSource::PrefillChunk,ExpertHistogramSource::GroupedVerifier};
     return estimateExpertServiceWorkspace(profile,geometry,phases);
 }
+size_t WorkspaceMemoryEstimator::estimatePreparedExpertService(const ModelMemoryProfile& profile,
+    const WorkspaceMemoryGeometry& geometry,const MoEExpertProjectionOwnership& original_fragment)
+{
+    constexpr std::array phases{ExpertHistogramSource::DecodeToken,ExpertHistogramSource::PrefillChunk,
+        ExpertHistogramSource::GroupedVerifier};
+    return estimateExpertServiceWorkspace(profile,geometry,phases,&original_fragment);
+}
+
 size_t WorkspaceMemoryEstimator::estimateStartupExpertService(const ModelMemoryProfile &profile,
     const WorkspaceMemoryGeometry &geometry)
 {
@@ -2656,13 +2683,13 @@ size_t WorkspaceMemoryEstimator::estimateRoutedExpertParticipant(
             profile.d_model,
             profile.expert_feed_forward_length,
             profile.expert_count,
-            profile.expert_used_count);
+            profile.expert_used_count, geometry.gate_up_publication, geometry.down_publication);
         compact_requirements = MoEWorkspaceBuffers::rocmMoE(
             compact_rows,
             profile.d_model,
             profile.expert_feed_forward_length,
             profile.expert_count,
-            /*top_k=*/1);
+            /*top_k=*/1, geometry.gate_up_publication, geometry.down_publication);
 
         /*
          * The MoE requirement factory owns routing/grouping scratch. Prepared

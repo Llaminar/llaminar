@@ -45,9 +45,13 @@
  */
 
 #include "kernels/rocm/common/ROCmSignedDot4.h"
+#include "kernels/rocm/common/ROCmQ4PairedDot.h"
+#include "kernels/rocm/common/ROCmWaveAddress.h"
+#include <bit>
 #include <hip/hip_runtime.h>
 #include "kernels/common/MoEGroupedDirectory.h"
 #include <hip/hip_fp16.h>
+#include "kernels/rocm/common/ROCmIQ3XXSLookupBatch.h"
 #include <algorithm>
 #include <cstdint>
 #include <type_traits>
@@ -503,7 +507,7 @@ void moe_prefill_hidden_quantize_rows_kernel(
 // Each thread computes one output element: output[slot, n] = dot(A_row, B_col_n)
 // ============================================================================
 
-template <NativeQuantisedFormatPrefill FMT, bool USE_STAGED_IQ2_S = false>
+template <NativeQuantisedFormatPrefill FMT, bool USE_STAGED_IQ2_S = false, bool BATCH_IQ3_XXS = false>
 __device__ __forceinline__ void moe_prefill_decode_groups(
     const uint8_t* __restrict__ payload,
     int32_t* packed_groups,
@@ -556,11 +560,16 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
             // IQ3_XXS: 8-byte qs + 4-byte signs = 12 bytes
             const uint32_t* pw = reinterpret_cast<const uint32_t*>(payload);
             const uint32_t w0 = pw[0], w1 = pw[1], w2 = pw[2];
+            uint32_t words[8];
+            if constexpr(BATCH_IQ3_XXS)
+                llaminar2::rocm::loadIQ3XXSGridBatch(w0,w1,d_pf_iq3xxs_grid,words);
             #pragma unroll
             for (int g = 0; g < 8; ++g) {
-                const uint32_t word = (g < 4) ? w0 : w1;
-                const int idx = (word >> ((g & 3) * 8)) & 0xFF;
-                const uint32_t grid4 = pf_iq3_grid_lookup<FMT>(idx);
+                const uint32_t grid4=[&] {
+                    if constexpr(BATCH_IQ3_XXS)return words[g];
+                    const uint32_t word = (g < 4) ? w0 : w1;
+                    return pf_iq3_grid_lookup<FMT>((word >> ((g & 3) * 8)) & 0xFF);
+                }();
                 const uint8_t sb = static_cast<uint8_t>(w2 >> ((g / 2) * 8));
                 const uint8_t sn = (g & 1) ? (sb >> 4) : (sb & 0xF);
                 packed_groups[g] = static_cast<int32_t>(pf_iq_apply_signs_4(grid4, sn));
@@ -808,7 +817,7 @@ __device__ __forceinline__ void moe_prefill_decode_groups(
  * @param acc Running FP32 accumulator for this row and output column.
  * @return The accumulator after exactly one serial-shaped K-block update.
  */
-template <NativeQuantisedFormatPrefill FMT>
+template <NativeQuantisedFormatPrefill FMT, bool UseExactSum=false>
 __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
     const DeviceNativeQuantisedMatrixDesc& desc,
     size_t linear,
@@ -816,7 +825,7 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
     const int32_t* __restrict__ packed_groups,
     const int32_t* __restrict__ a4,
     float scale_ab,
-    float acc)
+    float acc, int exactSum=0)
 {
     using Traits = PrefillNATIVE_QUANTISEDTraits<FMT>;
     const uint16_t* scale_base = static_cast<const uint16_t*>(desc.scales);
@@ -952,11 +961,14 @@ __device__ __forceinline__ float moe_prefill_accumulate_decoded_block(
                 FMT == NATIVE_QUANTISED_PF_IQ3_S ? min_base[linear] : uint16_t{0});
         if constexpr (Traits::is_asymmetric)
         {
-            constexpr int32_t ones = 0x01010101;
-            int32_t sum_a = 0;
+            int32_t sum_a = exactSum;
+            if constexpr(!UseExactSum) {
+                constexpr int32_t ones = 0x01010101;
+                sum_a = 0;
 #pragma unroll
-            for (int g = 0; g < 8; ++g)
-                sum_a = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a);
+                for (int g = 0; g < 8; ++g)
+                    sum_a = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], ones, sum_a);
+            }
 
             const uint16_t min_bits = min_base[linear];
             const float block_m =
@@ -5068,3 +5080,5 @@ bool rocmInitIQGridTables_moe_prefill(
 }
 
 } // extern "C"
+
+#include "ROCmGroupedFFNFrontier.hip.inc"

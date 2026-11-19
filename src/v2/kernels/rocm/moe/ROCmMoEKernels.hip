@@ -28,8 +28,18 @@
  * contract across gfx906 and gfx1100; lane ownership and reductions are unchanged.
  * Shared rank-bank publication uses uniform direct copy/zero stores so
  * peer-bank zeroing owns no addressable private zero-vector temporary.
+ * Independent decode slots share the serial normalization result and publish
+ * routes in parallel, retaining live acquired-bank fragment authentication.
+ * Decode descriptor publication touches only the selected packet; grouped
+ * prefill retains its complete descriptor/list publication contract.
+ * Explicit FP16 projection/router fusion retains two original128-lane dot
+ * teams per CTA. Only the last producer acquires the public logits and runs
+ * the original256-lane selection; other producers never spin.
  */
 
+#include "ROCmSharedExpertGateAddBody.cuh"
+#include "kernels/common/MoERuntimeDescriptorLaunch.h"
+#include "kernels/common/NativeTileCompletion.cuh"
 #include "kernels/rocm/common/ROCmSignedDot4.h"
 #include "kernels/rocm/moe/ROCmMoEWaveReduction.h"
 #include <hip/hip_runtime.h>
@@ -40,7 +50,10 @@
 #include <cstdio>
 #include <cfloat>
 #include <string>
+#include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
+#include "kernels/common/VerifierDispatchTable.h"
 
 #include "execution/moe/DeviceMoELLEPPlannerScratch.h"
 #include "execution/moe/DeviceMoERebalanceABI.h"
@@ -53,6 +66,9 @@
 #include "execution/moe/DeviceMoEOverlayEpochABI.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
+#include "kernels/common/MoEIntermediateShardRowExecution.h"
+#include "kernels/common/NativeQuantisedDescriptorValidation.h"
+#include "execution/config/RoutedExpertPolicy.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "kernels/common/DeviceRouterHadamardQ8.h"
 #include "kernels/common/RouterQ8Launch.h"
@@ -324,7 +340,11 @@ namespace
         const llaminar2::DeviceMoEOverlayEpochTicket *overlay_epoch_ticket;
         const DeviceMoEPlacementBankView *overlay_placement_banks;
         const llaminar2::DeviceMoEOverlayEpochStatus *overlay_epoch_status;
+        llaminar2::DeviceMoEIntermediateShardBinding intermediate_shard;
     };
+
+    static_assert(offsetof(DeviceMoELayerRuntimeView, intermediate_shard) ==
+                  llaminar2::moe_runtime_abi::kIntermediateShardBindingOffset);
 
     static_assert(
         sizeof(DeviceMoELayerRuntimeView) ==
@@ -3007,6 +3027,57 @@ namespace
         return static_cast<uint64_t>(max_load - min_load);
     }
 
+    /** @brief Resolve only the original member's complete fragment; broken admission traps before routing. */
+    __device__ __forceinline__ llaminar2::MoEIntermediateShardRowSelection
+    runtime_intermediate_shard_row(const DeviceMoELayerRuntimeView *runtime,
+        const DeviceMoEPlacementBankView &bank, int expert)
+    {
+        const auto selection = llaminar2::selectMoEIntermediateShardRow(
+            runtime->intermediate_shard, bank, expert, static_cast<int>(runtime->participant_id));
+        if (selection.disposition == llaminar2::MoEIntermediateShardRowDisposition::Invalid)
+        {
+            fail_fast_incomplete_llep_transfer();
+        }
+        return selection;
+    }
+
+    /**
+     * @brief Read the device-owned live count for a physical one-row route.
+     * @param active_row_count_device Optional stable captured INT32 address; null means one live row.
+     * @return Whether the row is live; values outside [0,1] are fatal before publication.
+     */
+    __device__ __forceinline__ bool runtime_decode_row_active(const int32_t *active_row_count_device)
+    {
+        const int32_t count = active_row_count_device ? *active_row_count_device : 1;
+        if (count < 0 || count > 1)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("one-row MoE routing received a live count outside [0,1]");
+            return false;
+        }
+        return count == 1;
+    }
+
+    /**
+     * @brief Authenticate the immutable execution policy even for an empty counted row.
+     * @param runtime Original captured runtime containing its closed source binding.
+     * @param row_execution_policy Captured row policy, which must agree with that binding.
+     */
+    __device__ __forceinline__ void runtime_require_decode_row_policy(
+        const DeviceMoELayerRuntimeView *runtime,
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy)
+    {
+        if ((row_execution_policy != llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
+             row_execution_policy != llaminar2::RoutedExpertRowExecutionPolicy::FullyReplicatedLocal &&
+             row_execution_policy != llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal) ||
+            runtime->intermediate_shard.enabled() !=
+                (row_execution_policy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal) ||
+            (runtime->intermediate_shard.enabled() && runtime->current_batch_llep_transient_bank_active != 0u))
+        {
+            fail_fast_incomplete_llep_transfer();
+            return;
+        }
+    }
+
     __device__ __forceinline__ void runtime_resolve_decode_dispatch(
         DeviceMoELayerRuntimeView *runtime,
         uint32_t execution_bank,
@@ -3014,7 +3085,7 @@ namespace
         int num_experts,
         int top_k,
         int32_t logical_position,
-        bool fully_replicated_local_rows,
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
         bool record_balance,
         bool *local_compute_flags,
         int *assigned_participants)
@@ -3028,6 +3099,8 @@ namespace
             return;
         }
 
+        runtime_require_decode_row_policy(runtime, row_execution_policy);
+
         for (int slot = 0; slot < top_k; ++slot)
         {
             local_compute_flags[slot] = false;
@@ -3037,6 +3110,18 @@ namespace
         const auto &bank = runtime_placement_banks(runtime)[execution_bank];
         const uint32_t participant_count = runtime->participant_count;
         const uint32_t participant_id = runtime->participant_id;
+        if (row_execution_policy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal)
+        {
+            for (int slot = 0; slot < top_k; ++slot)
+            {
+                if (selected_experts[slot] == -1) continue;
+                const auto selected = runtime_intermediate_shard_row(runtime, bank, selected_experts[slot]);
+                local_compute_flags[slot] = selected.disposition == llaminar2::MoEIntermediateShardRowDisposition::Local;
+                assigned_participants[slot] = selected.participant;
+            }
+            return;
+        }
+
         const bool valid_participants =
             participant_count > 0u &&
             participant_count <= static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
@@ -3047,7 +3132,7 @@ namespace
         // mirrored LocalTP/MTP sidecar deliberately executes every selected
         // expert on every participant; only participant-assigned LLEP rows
         // may use the replicated-placement table to choose one participant.
-        if (fully_replicated_local_rows || !has_multi_resident_experts)
+        if (row_execution_policy == llaminar2::RoutedExpertRowExecutionPolicy::FullyReplicatedLocal || !has_multi_resident_experts)
         {
             for (int slot = 0; slot < top_k; ++slot)
             {
@@ -3056,7 +3141,7 @@ namespace
                     continue;
                 const bool local =
                     bank.local_compute_mask[expert_id] != 0u;
-                assigned_participants[slot] = fully_replicated_local_rows
+                assigned_participants[slot] = row_execution_policy == llaminar2::RoutedExpertRowExecutionPolicy::FullyReplicatedLocal
                                                   ? static_cast<int>(participant_id)
                                                   : runtime_expert_owner(
                                                         bank, expert_id);
@@ -3206,9 +3291,14 @@ namespace
         float *legacy_weights,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
-        bool fully_replicated_local_rows,
-        int32_t logical_position)
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
+        int32_t logical_position,
+        const int32_t *active_row_count_device)
     {
+        // Inactive physical capacity publishes empty routes through this same
+        // acquired-bank transaction; it contributes no selected/local demand.
+        runtime_require_decode_row_policy(runtime, row_execution_policy);
+        const bool row_active = runtime_decode_row_active(active_row_count_device);
         /* Authenticate ownership before shape-gated route publication. */
         const uint32_t execution_bank =
             runtime_require_decode_execution_bank(runtime);
@@ -3223,7 +3313,7 @@ namespace
         }
         bool local_compute_flags[kDeviceMoEMaxTopK] = {};
         int assigned_participants[kDeviceMoEMaxTopK] = {};
-        if (shape_ok)
+        if (shape_ok && row_active)
         {
             runtime_resolve_decode_dispatch(
                 runtime,
@@ -3232,15 +3322,15 @@ namespace
                 num_experts,
                 top_k,
                 logical_position,
-                fully_replicated_local_rows,
+                row_execution_policy,
                 update_runtime_histogram,
                 local_compute_flags,
                 assigned_participants);
         }
         for (int slot = 0; slot < top_k; ++slot)
         {
-            const int expert_id = selected_ids[slot];
-            const float weight = selected_weights[slot];
+            const int expert_id = row_active ? selected_ids[slot] : -1;
+            const float weight = row_active ? selected_weights[slot] : 0.0f;
 
             if (shape_ok)
             {
@@ -3248,7 +3338,7 @@ namespace
                 runtime->topk_expert_ids[slot] = local_compute ? expert_id : -1;
                 runtime->topk_weights[slot] = local_compute ? weight : 0.0f;
                 runtime->route_participant_ids[slot] =
-                    assigned_participants[slot];
+                    row_active ? assigned_participants[slot] : -1;
             }
 
             if (write_legacy_outputs && legacy_indices && legacy_weights)
@@ -3258,7 +3348,7 @@ namespace
             }
         }
 
-        if (!update_runtime_histogram ||
+        if (!row_active || !update_runtime_histogram ||
             !runtime_histogram_admits_rows(*runtime))
             return;
 
@@ -3280,20 +3370,40 @@ namespace
     }
 
     /**
-     * @brief Publish a route when capacity admits exactly one resident/expert.
+     * @brief Publish independent selected slots for whole owners or acquired local fragments.
      *
-     * The graph chooses this contract only when no replica-cache slot exists.
+     * Whole-owner graphs require no replica-cache slot; fragment graphs instead
+     * authenticate each selected original intermediate slice against the live bank.
      * Keeping the implementation separate from replica-aware assignment lets
      * LLVM omit participant load arrays and their private-memory spills from
      * the overwhelmingly common static-owner decode kernel.  The active bank
      * is still read on every replay, so an atomic Dynamic owner swap remains
      * visible without recapture.
      *
+     * All CTA lanes enter after the top-k normalization publication barrier.
+     * Each selected slot has one writing lane. Top-k IDs are unique, so the
+     * integer histogram increments address different experts; parallelizing
+     * those publications changes no floating operation or reduction order.
+     * This removes a dependent chain of per-expert owner loads and histogram
+     * atomics from the single normalization lane.
+     *
+     * @tparam RowPolicy Immutable whole-owner or intermediate-fragment selection contract.
      * @tparam UpdateRuntimeHistogram Whether this graph owns demand evidence.
+     * @param runtime Original device runtime and active placement authority.
+     * @param selected_ids Fully published unique top-k expert IDs.
+     * @param selected_weights Fully published serially normalized weight bits.
+     * @param num_experts Original expert-axis extent.
+     * @param top_k Number of published slots, bounded by the launch contract.
+     * @param legacy_indices Optional original complete-route output.
+     * @param legacy_weights Optional original complete-weight output.
+     * @param write_legacy_outputs Whether both legacy outputs are required.
+     * @param active_row_count_device Optional device count for this physical row; zero clears all selected slots.
      */
-    template <bool UpdateRuntimeHistogram>
+    template <bool UpdateRuntimeHistogram,
+              llaminar2::RoutedExpertRowExecutionPolicy RowPolicy = llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned,
+              bool PublishDescriptors = false>
     __device__ __forceinline__ void
-    runtime_publish_unique_owner_decode_dispatch(
+    runtime_publish_independent_decode_dispatch(
         DeviceMoELayerRuntimeView *runtime,
         const int *selected_ids,
         const float *selected_weights,
@@ -3301,8 +3411,15 @@ namespace
         int top_k,
         float *legacy_indices,
         float *legacy_weights,
-        bool write_legacy_outputs)
+        bool write_legacy_outputs,
+        const int32_t *active_row_count_device,
+        llaminar2::MoEDecodeDescriptorPublication publication)
     {
+        static_assert(RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned ||
+                      RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal);
+        const int slot = static_cast<int>(threadIdx.x);
+        if (slot >= top_k)
+            return;
         const uint32_t execution_bank =
             runtime_require_decode_execution_bank(runtime);
         if (execution_bank > 1u)
@@ -3317,45 +3434,71 @@ namespace
         }
 
         const auto &bank = runtime_placement_banks(runtime)[execution_bank];
-        if (shape_ok && runtime_multi_resident_expert_count(bank) != 0u)
+        if (RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
+            shape_ok && runtime_multi_resident_expert_count(bank) != 0u)
         {
             FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
                 "unique-owner decode graph observed a replicated expert");
             return;
         }
 
+        runtime_require_decode_row_policy(runtime, RowPolicy);
+        const bool row_active = runtime_decode_row_active(active_row_count_device);
         const bool collect_histogram =
             UpdateRuntimeHistogram &&
             runtime_histogram_admits_rows(*runtime);
-        for (int slot = 0; slot < top_k; ++slot)
+        const int expert_id = row_active ? selected_ids[slot] : -1;
+        const float weight = row_active ? selected_weights[slot] : 0.0f;
+        bool local_compute = false;
+        if (shape_ok)
         {
-            const int expert_id = selected_ids[slot];
-            const float weight = selected_weights[slot];
-            bool local_compute = false;
-            if (shape_ok && expert_id >= 0 && expert_id < num_experts)
+            int participant = -1;
+            if constexpr (RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal)
             {
-                local_compute = bank.local_compute_mask[expert_id] != 0u;
-                runtime->topk_expert_ids[slot] =
-                    local_compute ? expert_id : -1;
-                runtime->topk_weights[slot] =
-                    local_compute ? weight : 0.0f;
-                runtime->route_participant_ids[slot] =
-                    runtime_expert_owner(bank, expert_id);
-            }
-
-            if (write_legacy_outputs && legacy_indices && legacy_weights)
-            {
-                legacy_indices[slot] = static_cast<float>(expert_id);
-                legacy_weights[slot] = weight;
-            }
-
-            if constexpr (UpdateRuntimeHistogram)
-            {
-                if (!collect_histogram || expert_id < 0 ||
-                    expert_id >= num_experts)
+                if (expert_id != -1)
                 {
-                    continue;
+                    const auto selection = runtime_intermediate_shard_row(runtime, bank, expert_id);
+                    local_compute = selection.disposition == llaminar2::MoEIntermediateShardRowDisposition::Local;
+                    participant = selection.participant;
                 }
+            }
+            else
+            {
+                const bool selected = expert_id >= 0 && expert_id < num_experts;
+                local_compute = selected && bank.local_compute_mask[expert_id] != 0u;
+                participant = selected ? runtime_expert_owner(bank, expert_id) : -1;
+            }
+            runtime->topk_expert_ids[slot] =
+                local_compute ? expert_id : -1;
+            runtime->topk_weights[slot] =
+                local_compute ? weight : 0.0f;
+            runtime->route_participant_ids[slot] =
+                participant;
+            if constexpr (PublishDescriptors)
+            {
+                if (local_compute)
+                {
+                    const auto &descriptor = bank.experts[expert_id];
+                    bool ready = descriptor.weight_format == publication.format;
+                    if constexpr (RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned)
+                        ready = ready && descriptor.local_slot >= 0 &&
+                            (bank.resident_participant_mask[expert_id] & runtime_participant_bit(runtime->participant_id)) &&
+                            llaminar2::deviceMoEExpertProjectionReady(descriptor, publication.projections);
+                    llaminar2::publishMoEDecodeDescriptor(publication, descriptor, expert_id, ready);
+                }
+            }
+        }
+
+        if (write_legacy_outputs && legacy_indices && legacy_weights)
+        {
+            legacy_indices[slot] = static_cast<float>(expert_id);
+            legacy_weights[slot] = weight;
+        }
+
+        if constexpr (UpdateRuntimeHistogram)
+        {
+            if (collect_histogram && expert_id >= 0 && expert_id < num_experts)
+            {
                 atomicAdd(
                     reinterpret_cast<unsigned long long *>(
                         &runtime_selected_histogram(*runtime, 0u)[expert_id]),
@@ -7562,6 +7705,19 @@ namespace
     {
         if (!llaminar2::deviceMoEProjectionPayloadValid(desc))
             return false;
+        // An original local-F transfer retains the ready-row producer promise.
+        // Retargeting preserves these source fields and checks destination spans
+        // before copying; its host-authority bank publication still authenticates
+        // the destination family/shape. Whole-expert/GateUp APIs stay unchanged.
+        if(desc.projection_set==llaminar2::DeviceMoEProjectionSet::IntermediateShard &&
+           desc.weight_format==llaminar2::DeviceMoEWeightFormat::NativeQuantised) {
+            const auto ready=[](const auto& matrix) {
+                return matrix.source_identity_present==1u &&
+                    llaminar2::NativeQuantisedDescriptorValidation::publishable(matrix);
+            };
+            if(!ready(desc.gate)||!ready(desc.up)||!ready(desc.down))return false;
+        }
+
         if (llaminar2::deviceMoEWeightFormatIsFloating(desc.weight_format))
             return llaminar2::deviceMoEFloatingExpertCopyReady(desc);
         return desc.weight_format ==
@@ -7888,7 +8044,7 @@ namespace
         rebalance_retarget_transfer_matrix(
             dst.descriptor.up,
             src.descriptor.up);
-        if (src.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::CompleteExpert)
+        if (llaminar2::deviceMoEProjectionSetHasDown(src.descriptor.projection_set))
             rebalance_retarget_transfer_matrix(
                 dst.descriptor.down,
                 src.descriptor.down);
@@ -10622,7 +10778,7 @@ namespace
         }
         return rebalance_projection_payload_bytes(entry.descriptor.gate, entry) +
                rebalance_projection_payload_bytes(entry.descriptor.up, entry) +
-               (entry.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::CompleteExpert
+               (llaminar2::deviceMoEProjectionSetHasDown(entry.descriptor.projection_set)
                     ? rebalance_projection_payload_bytes(entry.descriptor.down, entry) : 0ULL);
     }
 
@@ -10720,7 +10876,7 @@ namespace
         }
         offset += rebalance_pack_projection_to_payload(src.descriptor.gate, src, payload + offset);
         offset += rebalance_pack_projection_to_payload(src.descriptor.up, src, payload + offset);
-        if (src.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::CompleteExpert)
+        if (llaminar2::deviceMoEProjectionSetHasDown(src.descriptor.projection_set))
             offset += rebalance_pack_projection_to_payload(src.descriptor.down, src, payload + offset);
         return offset;
     }
@@ -10748,7 +10904,7 @@ namespace
         }
         offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.gate, dst);
         offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.up, dst);
-        if (dst.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::CompleteExpert)
+        if (llaminar2::deviceMoEProjectionSetHasDown(dst.descriptor.projection_set))
             offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.down, dst);
         return offset;
     }
@@ -11213,11 +11369,14 @@ namespace
              * runtime descriptor.
              *
              * Payload-only replication deliberately preserves the source owner.
+             * F fragments retain joint ownership: the directory's physical
+             * destination participant is never a scalar logical expert owner.
              * Both cases are derived from the immutable plan so no host mirror
              * or post-apply repair is involved.
              */
             dst.descriptor.owner_participant =
-                plan.op == kDeviceMoERebalancePlanOwnershipTransfer
+                src.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                    ? -1 : plan.op == kDeviceMoERebalancePlanOwnershipTransfer
                     ? static_cast<int32_t>(plan.destination_participant)
                     : src.descriptor.owner_participant;
             dst.descriptor.flags |= kDeviceMoEFlagTransferSlot;
@@ -13304,14 +13463,27 @@ namespace
         dst_b[i] = payload.mutable_ptrs_b[i];
     }
 
+    /**
+     * @brief Compare router candidates without divergent short-circuit branches.
+     * @param candidate_value Original probability bits, including unordered values.
+     * @param candidate_id Original expert ID used to resolve equal probabilities.
+     * @param best_value Current tournament probability.
+     * @param best_id Current tournament expert ID.
+     * @return Greater probability, or lower expert ID for an equal probability.
+     *
+     * All operands are already in registers and every comparison is pure. Use
+     * boolean bit operations so LLVM need not mask lanes between the comparisons
+     * in each tournament round. NaNs, signed zero and ID ties retain the same
+     * comparison results; no floating-point arithmetic or reduction is changed.
+     */
     __device__ __forceinline__ bool moe_topk_pair_better(
         float candidate_value,
         int candidate_id,
         float best_value,
         int best_id)
     {
-        return candidate_value > best_value ||
-               (candidate_value == best_value && candidate_id < best_id);
+        return (candidate_value > best_value) |
+               ((candidate_value == best_value) & (candidate_id < best_id));
     }
 
     // Both router logits and softmax consume one production arithmetic authority.
@@ -13399,8 +13571,12 @@ namespace
      * candidate" semantics by carrying the sentinel id.  Only thread zero
      * consumes the selected shared arrays after this helper, therefore no CTA
      * publication barrier is needed.
+     * @tparam Candidates Original four/eight candidates per wave lane.
+     * @tparam SelectQueueSwaps Use identical comparator decisions with bit-preserving
+     *         selects in the explicit fused candidate; the original control retains
+     *         its conditional swaps, including nonfinite and signed-zero behavior.
      */
-    template <int Candidates = 4>
+    template <int Candidates = 4, bool SelectQueueSwaps = false>
     __device__ __forceinline__ void
     moe_select_topk_probabilities_wave64_register_queue(
         const float *__restrict__ expert_probs,
@@ -13456,7 +13632,17 @@ namespace
 #define LLAMINAR_MOE_SORT_PAIR_DESC(A, B)                                    \
         do                                                                    \
         {                                                                     \
-            if (moe_topk_pair_better(value##B, id##B, value##A, id##A))       \
+            const bool replace = moe_topk_pair_better(value##B, id##B, value##A, id##A); \
+            if constexpr (SelectQueueSwaps)                                   \
+            {                                                                 \
+                const float original_value = value##A;                         \
+                const int original_id = id##A;                                 \
+                value##A = replace ? value##B : original_value;                 \
+                id##A = replace ? id##B : original_id;                           \
+                value##B = replace ? original_value : value##B;                 \
+                id##B = replace ? original_id : id##B;                           \
+            }                                                                 \
+            else if (replace)                                                 \
             {                                                                 \
                 const float swap_value = value##A;                            \
                 const int swap_id = id##A;                                    \
@@ -13844,13 +14030,10 @@ __global__ void rocm_moe_gate_logits_single_token_q8_weights_kernel(
  * changes a row's scale, rounding, or output address; the published bytes are
  * also consumed directly by routed and shared experts without requantization.
  */
-__global__ void rocm_moe_router_hidden_quantize_q8_rows_kernel(
-    const float *__restrict__ hidden,
-    int8_t *__restrict__ hidden_q8,
-    float *__restrict__ hidden_scales,
-    int seq_len,
-    int d_model,
-    const int *__restrict__ device_effective_seq_len)
+template<bool PublishSum>
+__device__ __forceinline__ void rocm_moe_router_hidden_quantize_q8_rows_body(
+    const float* hidden, int8_t* hidden_q8, float* hidden_scales, int seq_len,
+    int d_model,const int* device_effective_seq_len, std::int16_t* sums)
 {
     constexpr int BLOCK_SIZE = 32;
     const int block_idx = blockIdx.x * (blockDim.x / BLOCK_SIZE) + threadIdx.x / BLOCK_SIZE;
@@ -13881,8 +14064,31 @@ __global__ void rocm_moe_router_hidden_quantize_q8_rows_kernel(
         hidden_scales[static_cast<size_t>(row) * blocks_per_row + block_idx] = scale;
     }
 
-    hidden_q8[row_offset + k] =
-        rocm_moe_quantize_q8_decode_equivalent(value, scale);
+    const auto code=rocm_moe_quantize_q8_decode_equivalent(value, scale);
+    hidden_q8[row_offset + k] = code;
+    if constexpr(PublishSum) {
+        int sum=code;
+#pragma unroll
+        for(int mask=16;mask>0;mask>>=1)sum+=__shfl_xor(sum,mask,BLOCK_SIZE);
+        if(lane==0)sums[static_cast<std::size_t>(row)*blocks_per_row+block_idx]=static_cast<std::int16_t>(sum);
+    }
+}
+
+
+/** @brief Original launch identity over the same exact quantizer. */
+__global__ void rocm_moe_router_hidden_quantize_q8_rows_kernel(
+    const float* hidden, int8_t* hidden_q8, float* hidden_scales, int seq_len,
+    int d_model,const int* device_effective_seq_len)
+{
+    rocm_moe_router_hidden_quantize_q8_rows_body<false>(
+        hidden,hidden_q8,hidden_scales,seq_len,d_model,device_effective_seq_len,nullptr);
+}
+
+/** @brief Closed frontier's extra immutable integer plane, in the original quantizer node. */
+__global__ void rocm_moe_router_hidden_quantize_q8_rows_and_sums_kernel(
+    const float* hidden, int8_t* codes,float* scales,const int* live,std::int16_t* sums)
+{
+    rocm_moe_router_hidden_quantize_q8_rows_body<true>(hidden,codes,scales,4,2560,live,sums);
 }
 
 /**
@@ -14219,9 +14425,8 @@ void rocm_moe_gate_logits_fp32_grouped_verifier_kernel(
  * including the half2 loop for even K, while sharing each gate load across the
  * sixteen-row tile handled by the expert-owned block.
  */
-template<bool Partitioned = false>
-__global__ __launch_bounds__(128, 2)
-void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
+template<bool Partitioned, int FixedRows>
+__device__ __forceinline__ void groupedFP16RouterRows(
     const float *__restrict__ hidden,
     const __half *__restrict__ gate_weights,
     float *__restrict__ logits,
@@ -14238,72 +14443,112 @@ void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
         seq_len = rows.count;
         device_effective_seq_len = nullptr;
     }
-    constexpr int ROWS_PER_BLOCK = 16;
+    static_assert(!Partitioned || FixedRows == 0);
+    constexpr int ROWS_PER_BLOCK = FixedRows ? FixedRows : 16;
+    const int width = FixedRows ? 2560 : d_model;
+    const int experts = FixedRows ? 512 : num_experts;
     const int expert = blockIdx.x;
-    if (expert >= num_experts) return;
+    if (expert >= experts) return;
 
-    const int active_rows = device_effective_seq_len ? *device_effective_seq_len : seq_len;
+    const int active_rows = FixedRows
+        ? __builtin_amdgcn_readfirstlane(*device_effective_seq_len)
+        : (device_effective_seq_len ? *device_effective_seq_len : seq_len);
     if (active_rows < 0 || active_rows > seq_len) __builtin_trap();
-    const int row_base = static_cast<int>(blockIdx.y) * ROWS_PER_BLOCK;
+    const int row_base = FixedRows ? 0 : static_cast<int>(blockIdx.y) * ROWS_PER_BLOCK;
     const int rows_in_block = min(ROWS_PER_BLOCK, active_rows - row_base);
     if (rows_in_block <= 0) return;
 
-    const __half *w = gate_weights + static_cast<size_t>(expert) * d_model;
+    // Compare the original device-owned prefix before each row's input or output touch.
+    // A fixed tile can retain one independently ordered accumulator per row.
+    const auto visitRows = [rows_in_block](auto visit) {
+        if constexpr (FixedRows)
+        {
+#pragma unroll
+            for (int row = 0; row < ROWS_PER_BLOCK; ++row)
+                if (row < rows_in_block) visit(row);
+        }
+        else
+            for (int row = 0; row < rows_in_block; ++row)
+                visit(row);
+    };
+    const __half *w = gate_weights + static_cast<size_t>(expert) * width;
     float sums[ROWS_PER_BLOCK] = {};
 
-    if ((d_model & 1) == 0)
+    if ((width & 1) == 0)
     {
-        const int pair_count = d_model >> 1;
+        const int pair_count = width >> 1;
         const __half2 *w2 = reinterpret_cast<const __half2 *>(w);
         for (int i = threadIdx.x; i < pair_count; i += blockDim.x)
         {
             const float2 ww = __half22float2(w2[i]);
             const int h = i << 1;
-            for (int local_row = 0; local_row < rows_in_block; ++local_row)
+            visitRows([&](int local_row)
             {
                 const int row = row_base + local_row;
-                const float *row_hidden = hidden + static_cast<size_t>(row) * d_model;
+                const float *row_hidden = hidden + static_cast<size_t>(row) * width;
                 sums[local_row] += router_fp16_operand(row_hidden[h]) * ww.x + router_fp16_operand(row_hidden[h + 1]) * ww.y;
-            }
+            });
         }
     }
     else
     {
-        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+        for (int i = threadIdx.x; i < width; i += blockDim.x)
         {
             const float ww = __half2float(w[i]);
-            for (int local_row = 0; local_row < rows_in_block; ++local_row)
+            visitRows([&](int local_row)
             {
                 const int row = row_base + local_row;
-                sums[local_row] += router_fp16_operand(hidden[static_cast<size_t>(row) * d_model + i]) * ww;
-            }
+                sums[local_row] += router_fp16_operand(hidden[static_cast<size_t>(row) * width + i]) * ww;
+            });
         }
     }
 
     __shared__ float warp_sums[ROWS_PER_BLOCK][8];
     const int lane = threadIdx.x % warpSize;
     const int warp_id = threadIdx.x / warpSize;
-    for (int local_row = 0; local_row < rows_in_block; ++local_row)
+    visitRows([&](int local_row)
     {
         float reduced = rocm_moe_wave_reduce_sum_f32(sums[local_row]);
         if (lane == 0) warp_sums[local_row][warp_id] = reduced;
-    }
+    });
     __syncthreads();
 
     if (warp_id == 0)
     {
         const int nw = (blockDim.x + warpSize - 1) / warpSize;
-        for (int local_row = 0; local_row < rows_in_block; ++local_row)
+        visitRows([&](int local_row)
         {
             float reduced = (lane < nw) ? warp_sums[local_row][lane] : 0.0f;
             reduced = rocm_moe_wave_reduce_sum_f32(reduced);
             if (lane == 0)
             {
                 const int row = row_base + local_row;
-                logits[static_cast<size_t>(row) * num_experts + expert] = reduced;
+                logits[static_cast<size_t>(row) * experts + expert] = reduced;
             }
-        }
+        });
     }
+}
+
+/** @brief Preserve the original runtime-tiled grouped and partitioned entry. */
+template<bool Partitioned = false>
+__global__ __launch_bounds__(128, 2)
+void rocm_moe_gate_logits_fp16_grouped_verifier_kernel(
+    const float *__restrict__ hidden, const __half *__restrict__ gate_weights,
+    float *__restrict__ logits, int seq_len, int d_model, int num_experts,
+    const int *__restrict__ count, llaminar2::DeviceRowPartition partition = {})
+{
+    groupedFP16RouterRows<Partitioned, 0>(
+        hidden, gate_weights, logits, seq_len, d_model, num_experts, count, partition);
+}
+
+/** @brief Compile the original FP32 accumulation and wave order for one counted tile. */
+template<int Rows>
+__global__ __launch_bounds__(128, 2)
+void qfn_grouped_fp16_router_fixed_rows(
+    const float *__restrict__ hidden, const __half *__restrict__ gate_weights,
+    float *__restrict__ logits, const int *__restrict__ count, int capacity)
+{
+    groupedFP16RouterRows<false, Rows>(hidden, gate_weights, logits, capacity, 2560, 512, count);
 }
 
 /**
@@ -14624,7 +14869,7 @@ __global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_softmax_topk_de
     bool normalize_weights,
     bool write_legacy_outputs,
     bool update_runtime_histogram,
-    bool fully_replicated_local_rows,
+    llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
     const int32_t *__restrict__ absolute_position_ids,
     const DeviceMoERebalancePlanEntryView *__restrict__ rebalance_plan_entries,
     uint32_t rebalance_plan_capacity,
@@ -14635,7 +14880,8 @@ __global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_softmax_topk_de
     DeviceMoERebalanceApplyStatusView *__restrict__ rebalance_apply_status,
     DeviceMoERebalanceGraphControllerStateView *__restrict__ rebalance_controller_state,
     int rebalance_target_layer,
-    uint32_t rebalance_command_buffer_count)
+    uint32_t rebalance_command_buffer_count,
+        const int32_t *__restrict__ active_row_count_device)
 {
     if (!logits || !runtime || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
         top_k <= 0 || top_k > kDeviceMoEMaxTopK)
@@ -14767,8 +15013,8 @@ __global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_softmax_topk_de
             runtime, selected_ids, selected_weights, num_experts, top_k,
             legacy_indices, legacy_weights, write_legacy_outputs,
             update_runtime_histogram,
-            fully_replicated_local_rows,
-            absolute_position_ids ? absolute_position_ids[0] : -1);
+            row_execution_policy,
+            absolute_position_ids ? absolute_position_ids[0] : -1, active_row_count_device);
     }
 }
 
@@ -14792,7 +15038,7 @@ __global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_softmax_topk_de
     int num_experts, int top_k,
     bool normalize_weights,
     bool write_legacy_outputs,
-    bool fully_replicated_local_rows,
+    llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
     const int32_t *__restrict__ absolute_position_ids,
     const DeviceMoERebalancePlanEntryView *__restrict__ rebalance_plan_entries,
     uint32_t rebalance_plan_capacity,
@@ -14803,7 +15049,8 @@ __global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_softmax_topk_de
     DeviceMoERebalanceApplyStatusView *__restrict__ rebalance_apply_status,
     DeviceMoERebalanceGraphControllerStateView *__restrict__ rebalance_controller_state,
     int rebalance_target_layer,
-    uint32_t rebalance_command_buffer_count)
+    uint32_t rebalance_command_buffer_count,
+        const int32_t *__restrict__ active_row_count_device)
 {
     if (!logits || !runtime || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
         top_k <= 0 || top_k > kDeviceMoEMaxTopK)
@@ -14909,13 +15156,13 @@ __global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_softmax_topk_de
             runtime, selected_ids, selected_weights, num_experts, top_k,
             legacy_indices, legacy_weights, write_legacy_outputs,
             UpdateRuntimeHistogram,
-            fully_replicated_local_rows,
-            absolute_position_ids ? absolute_position_ids[0] : -1);
+            row_execution_policy,
+            absolute_position_ids ? absolute_position_ids[0] : -1, active_row_count_device);
     }
 }
 
 /**
- * @brief Minimal wave64 router for a graph-proven unique-owner resident set.
+ * @brief Minimal wave64 router for independently published owner or fragment slots.
  *
  * Unlike the replica-aware kernel, this entrypoint does not carry rebalance
  * pointers, position state, or participant load-balancing scratch in its HIP
@@ -14927,11 +15174,27 @@ __global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_softmax_topk_de
  * to @ref rocm_moe_softmax_topk_decode_runtime_wave64_kernel so selecting the
  * economical resident-set specialization cannot change routing arithmetic.
  *
+ * @tparam RowPolicy Original whole-owner or intermediate-fragment row contract.
  * @tparam UpdateRuntimeHistogram Whether the captured graph owns histogram
  *         publication for Dynamic maintenance.
+
+ * @tparam PublishDescriptors Publish original arena views in the authenticated route lane.
+ * @tparam SelectQueueSwaps Preserve exact queue comparisons using selected tuple writes.
+ * @param logits Original FP32 probabilities in place.
+ * @param runtime Original device-owned runtime and acquired bank.
+ * @param legacy_indices Complete selected IDs when requested.
+ * @param legacy_weights Complete selected weight bits when requested.
+ * @param num_experts Exact admitted source expert extent.
+ * @param top_k Exact selected packet width.
+ * @param normalize_weights Retain the original serial FP32 normalization.
+ * @param write_legacy_outputs Whether complete selected outputs are required.
+ * @param active_row_count_device Optional live count for this physical row.
+ * @param publication Original arena outputs; unused in the control specialization.
  */
-template <bool UpdateRuntimeHistogram>
-__global__ void rocm_moe_softmax_topk_decode_unique_owner_wave64_kernel(
+template <bool UpdateRuntimeHistogram,
+          llaminar2::RoutedExpertRowExecutionPolicy RowPolicy = llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned,
+          bool PublishDescriptors = false, bool SelectQueueSwaps = false>
+__device__ __forceinline__ void rocm_moe_softmax_topk_decode_independent_body(
     float *__restrict__ logits,
     DeviceMoELayerRuntimeView *__restrict__ runtime,
     float *__restrict__ legacy_indices,
@@ -14939,7 +15202,9 @@ __global__ void rocm_moe_softmax_topk_decode_unique_owner_wave64_kernel(
     int num_experts,
     int top_k,
     bool normalize_weights,
-    bool write_legacy_outputs)
+    bool write_legacy_outputs,
+        const int32_t *__restrict__ active_row_count_device,
+        llaminar2::MoEDecodeDescriptorPublication publication)
 {
     if (!logits || !runtime || num_experts <= 0 ||
         num_experts > kDeviceMoEMaxExperts || top_k <= 0 ||
@@ -15015,10 +15280,10 @@ __global__ void rocm_moe_softmax_topk_decode_unique_owner_wave64_kernel(
     __shared__ int selected_ids[kDeviceMoEMaxTopK];
     __shared__ float selected_weights[kDeviceMoEMaxTopK];
     if (num_experts > 256)
-        moe_select_topk_probabilities_wave64_register_queue<8>(
+        moe_select_topk_probabilities_wave64_register_queue<8, SelectQueueSwaps>(
             expert_probs, num_experts, top_k, selected_ids, selected_weights);
     else
-        moe_select_topk_probabilities_wave64_register_queue<4>(
+        moe_select_topk_probabilities_wave64_register_queue<4, SelectQueueSwaps>(
             expert_probs, num_experts, top_k, selected_ids, selected_weights);
 
     if (threadIdx.x == 0)
@@ -15035,18 +15300,230 @@ __global__ void rocm_moe_softmax_topk_decode_unique_owner_wave64_kernel(
                     selected_weights[slot] *= inv_topk_sum;
             }
         }
-
-        runtime_publish_unique_owner_decode_dispatch<
-            UpdateRuntimeHistogram>(
-            runtime,
-            selected_ids,
-            selected_weights,
-            num_experts,
-            top_k,
-            legacy_indices,
-            legacy_weights,
-            write_legacy_outputs);
     }
+    // Keep the serial FP32 normalization above unchanged. Every selected
+    // slot's lane must observe its final bits before publishing owner metadata
+    // and exact integer demand. Inactive lanes publish nothing.
+    __syncthreads();
+    runtime_publish_independent_decode_dispatch<UpdateRuntimeHistogram, RowPolicy, PublishDescriptors>(
+        runtime, selected_ids, selected_weights, num_experts, top_k,
+        legacy_indices, legacy_weights, write_legacy_outputs, active_row_count_device, publication);
+}
+
+/** @brief Original independent router entry; retains the control's exact kernel ABI. */
+template <bool UpdateRuntimeHistogram,
+          llaminar2::RoutedExpertRowExecutionPolicy RowPolicy = llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned>
+__global__ void rocm_moe_softmax_topk_decode_independent_wave64_kernel(
+    float *__restrict__ logits,
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    float *__restrict__ legacy_indices,
+    float *__restrict__ legacy_weights,
+    int num_experts,
+    int top_k,
+    bool normalize_weights,
+    bool write_legacy_outputs,
+        const int32_t *__restrict__ active_row_count_device)
+{
+    rocm_moe_softmax_topk_decode_independent_body<UpdateRuntimeHistogram, RowPolicy, false>(
+        logits, runtime, legacy_indices, legacy_weights, num_experts, top_k,
+        normalize_weights, write_legacy_outputs, active_row_count_device, {});
+}
+
+/** @brief Fused entry publishes arena descriptors from the same authenticated route lanes. */
+template <bool UpdateRuntimeHistogram,
+          llaminar2::RoutedExpertRowExecutionPolicy RowPolicy = llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned>
+__global__ void rocm_moe_softmax_topk_decode_descriptors_kernel(
+    float *__restrict__ logits,
+    DeviceMoELayerRuntimeView *__restrict__ runtime,
+    float *__restrict__ legacy_indices,
+    float *__restrict__ legacy_weights,
+    int num_experts,
+    int top_k,
+    bool normalize_weights,
+    bool write_legacy_outputs,
+        const int32_t *__restrict__ active_row_count_device,
+        llaminar2::MoEDecodeDescriptorPublication publication)
+{
+    rocm_moe_softmax_topk_decode_independent_body<UpdateRuntimeHistogram, RowPolicy, true>(
+        logits, runtime, legacy_indices, legacy_weights, num_experts, top_k,
+        normalize_weights, write_legacy_outputs, active_row_count_device, publication);
+}
+
+/**
+ * @brief Paired original FP16 dot teams followed by last-producer route publication.
+ * @tparam UpdateRuntimeHistogram Original integer demand-publication policy.
+ * @tparam RowPolicy Original independent placement/fragment execution contract.
+ * @param hidden Original FP32 hidden row. @param gate_weights Native FP16 rows.
+ * @param logits Original public logits/probabilities, unchanged in extent.
+ * @param runtime Original acquired device runtime.
+ * @param legacy_indices Original complete selected IDs. @param legacy_weights Original selected weights.
+ * @param d_model Original reduction width. @param num_experts Exact source expert extent.
+ * @param top_k Original selected width. @param normalize_weights Serial normalization policy.
+ * @param write_legacy_outputs Original complete-output publication policy.
+ * @param active_row_count_device Device row count; inactive rows still write probabilities.
+ * @param publication Original arena destinations and descriptor precision.
+ * @param completion One initialized exclusive counter for these physical producers.
+ * @details Each128-lane team keeps its original half2/scalar K stride and
+ * two-wave reduction. The odd final team reaches every CTA barrier. Release
+ * arrival publishes both logits; only the final producer acquires and enters
+ * the unchanged256-lane softmax body. Graph order separates counter epochs.
+ */
+template <bool UpdateRuntimeHistogram, llaminar2::RoutedExpertRowExecutionPolicy RowPolicy>
+__global__ void rocm_moe_fp16_projection_route_descriptors_kernel(
+    const float *__restrict__ hidden, const __half *__restrict__ gate_weights,
+    float *__restrict__ logits, DeviceMoELayerRuntimeView *__restrict__ runtime,
+    float *__restrict__ legacy_indices, float *__restrict__ legacy_weights,
+    int d_model, int num_experts, int top_k, bool normalize_weights,
+    bool write_legacy_outputs, const int32_t *__restrict__ active_row_count_device,
+    llaminar2::MoEDecodeDescriptorPublication publication,
+    llaminar2::NativeTileCompletionView completion)
+{
+    constexpr int TeamThreads = 128;
+    const int team = threadIdx.x / TeamThreads;
+    const int team_lane = threadIdx.x % TeamThreads;
+    const int expert = static_cast<int>(blockIdx.x) * 2 + team;
+    float sum = 0.0f;
+    if (expert < num_experts)
+    {
+        const __half *w = gate_weights + static_cast<size_t>(expert) * d_model;
+        if ((d_model & 1) == 0)
+        {
+            const int pair_count = d_model >> 1;
+            const __half2 *w2 = reinterpret_cast<const __half2 *>(w);
+            for (int i = team_lane; i < pair_count; i += TeamThreads)
+            {
+                const float2 ww = __half22float2(w2[i]);
+                const int h = i << 1;
+                sum += router_fp16_operand(hidden[h]) * ww.x + router_fp16_operand(hidden[h + 1]) * ww.y;
+            }
+        }
+        else
+        {
+            for (int i = team_lane; i < d_model; i += TeamThreads)
+                sum += router_fp16_operand(hidden[i]) * __half2float(w[i]);
+        }
+    }
+    sum = rocm_moe_wave_reduce_sum_f32(sum);
+    __shared__ float team_wave_sums[4];
+    const int lane = team_lane % warpSize;
+    const int team_wave = team_lane / warpSize;
+    if (lane == 0) team_wave_sums[team * 2 + team_wave] = sum;
+    __syncthreads();
+    if (team_wave == 0)
+    {
+        sum = lane < 2 ? team_wave_sums[team * 2 + lane] : 0.0f;
+        sum = rocm_moe_wave_reduce_sum_f32(sum);
+        if (lane == 0 && expert < num_experts) logits[expert] = sum;
+    }
+    // Every writer joins before arrival. No producer waits for blocks that
+    // might not yet be resident; their scheduling order cannot change math.
+    __syncthreads();
+    __shared__ llaminar2::NativeTileCompletionDecision decision;
+    if (threadIdx.x == 0)
+        decision = llaminar2::native_tile_completion::arriveForPublication(
+            completion.counters, completion.contributors);
+    __syncthreads();
+    if (decision == llaminar2::NativeTileCompletionDecision::Invalid) __builtin_trap();
+    if (decision != llaminar2::NativeTileCompletionDecision::Publish) return;
+    rocm_moe_softmax_topk_decode_independent_body<UpdateRuntimeHistogram, RowPolicy, true, true>(
+        logits, runtime, legacy_indices, legacy_weights, num_experts, top_k,
+        normalize_weights, write_legacy_outputs, active_row_count_device, publication);
+    // Publication returns for lanes without selected slots. The caller still
+    // joins every lane before resetting the counter and retiring this epoch.
+    __syncthreads();
+    if (threadIdx.x == 0) llaminar2::native_tile_completion::reset(completion.counters);
+}
+
+/** @brief Admitted native MI50 geometry for the measured QFN grouped selector. */
+constexpr int kQFNRegisterSelectorExperts = 512;
+constexpr int kQFNRegisterSelectorTopK = 10;
+
+/**
+ * @brief Merge four wave-local top-16 lists to select QFN's ten ordered experts.
+ * @param probabilities Softmax results in LDS, produced by the serial-equivalent reduction.
+ * @param selected_ids Shared output for the original IDs in descending probability order.
+ * @param selected_weights Shared output for the exact selected softmax probabilities.
+ *
+ * Four wave64s own 128 experts each. Keeping 16 from each wave covers every
+ * global top-ten candidate and fits the merge of the four lists in one wave.
+ * The comparison key ranks a nonnegative probability by its FP32 bits, then
+ * breaks ties by ascending expert ID. A zero key denotes a NaN probability.
+ * No arithmetic on the sorted keys modifies the original numeric weights.
+ */
+__device__ __forceinline__ void moe_grouped_topk_register_merge(
+    const float* __restrict__ probabilities, int* __restrict__ selected_ids,
+    float* __restrict__ selected_weights)
+{
+    using Key = unsigned long long;
+    constexpr int wave_width = 64;
+    constexpr int frontier_per_wave = 16;
+    constexpr int id_bits = 10;  // Includes the nonzero tie key of expert zero.
+    static_assert(kQFNRegisterSelectorExperts < (1u << id_bits));
+    const unsigned lane = threadIdx.x % wave_width;
+    const unsigned wave = threadIdx.x / wave_width;
+
+    const auto pack = [&](int id) -> Key {
+        const float probability = probabilities[id];
+        if (!(probability >= 0.0f)) return 0;
+        const unsigned bits = probability == 0.0f ? 0u : __float_as_uint(probability);
+        return (static_cast<Key>(bits) << id_bits) | static_cast<unsigned>(kQFNRegisterSelectorExperts - id);
+    };
+    const auto exchange = [&](Key key, int distance, bool keep_high) -> Key {
+        const Key other = __shfl_xor(key, distance, wave_width);
+        return keep_high ? max(key, other) : min(key, other);
+    };
+
+    Key first = pack(threadIdx.x);
+    Key second = pack(threadIdx.x + kQFNRegisterSelectorExperts / 2);
+    // Sorting the two runs in opposite directions forms one bitonic 128-key run.
+    #pragma unroll
+    for (int width = 2; width <= wave_width; width *= 2) {
+        #pragma unroll
+        for (int distance = width / 2; distance > 0; distance /= 2) {
+            const bool high = ((lane & width) == 0) == ((lane & distance) == 0);
+            first = exchange(first, distance, high);
+            second = exchange(second, distance, !high);
+        }
+    }
+    first = max(first, second);
+    #pragma unroll
+    for (int distance = wave_width / 2; distance > 0; distance /= 2)
+        first = exchange(first, distance, (lane & distance) == 0);
+
+    __shared__ Key frontiers[wave_width];
+    if (lane < frontier_per_wave) {
+        const unsigned in_run = (wave & 1) ? frontier_per_wave - 1 - lane : lane;
+        frontiers[wave * frontier_per_wave + in_run] = first;
+    }
+    __syncthreads();
+    if (wave == 0) {
+        Key key = frontiers[lane];
+        // Each adjacent pair is already bitonic. Two merges complete the sort.
+        #pragma unroll
+        for (int width = 2 * frontier_per_wave; width <= wave_width; width *= 2)
+            #pragma unroll
+            for (int distance = width / 2; distance > 0; distance /= 2)
+                key = exchange(key, distance, ((lane & width) == 0) == ((lane & distance) == 0));
+
+        const int id = key ? kQFNRegisterSelectorExperts - int(key & ((1u << id_bits) - 1))
+                           : kDeviceMoEMaxExperts;
+        int consumed_id = id;
+        if (__ballot(lane < kQFNRegisterSelectorTopK && !key)) {
+            // Serial selection marks each consumed score -infinity. If too few
+            // finite experts exist, its smallest consumed ID wins the remaining
+            // rounds; an all-NaN row retains the original sentinel.
+            consumed_id = lane < kQFNRegisterSelectorTopK ? id : kDeviceMoEMaxExperts;
+            #pragma unroll
+            for (int distance = wave_width / 2; distance > 0; distance /= 2)
+                consumed_id = min(consumed_id, __shfl_xor(consumed_id, distance, wave_width));
+        }
+        if (lane < kQFNRegisterSelectorTopK) {
+            selected_ids[lane] = key ? id : consumed_id;
+            selected_weights[lane] = key ? probabilities[id] : -INFINITY;
+        }
+    }
+    // The normalization and ledger publisher consumes all ten wave results.
+    __syncthreads();
 }
 
 /**
@@ -15059,8 +15536,8 @@ __global__ void rocm_moe_softmax_topk_decode_unique_owner_wave64_kernel(
  * rocm_moe_softmax_topk_decode_runtime_wave64_kernel's probability reduction,
  * top-k selection, and top-k renormalization order inside each block.
  */
-template<bool Partitioned = false>
-__global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
+template<bool Partitioned, bool RegisterSelector>
+__device__ __forceinline__ void grouped_softmax_rows_body(
     float *__restrict__ logits,                       // [seq_len, num_experts] IN logits, OUT probabilities
     float *__restrict__ expert_indices,               // [seq_len, top_k] OUT
     float *__restrict__ expert_weights,               // [seq_len, top_k] OUT
@@ -15086,7 +15563,8 @@ __global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
     }
     const int token = blockIdx.x;
     const int active_rows = device_effective_seq_len
-                                ? max(0, min(seq_len, *device_effective_seq_len))
+                                ? (seq_len == 1 ? (runtime_decode_row_active(device_effective_seq_len) ? 1 : 0)
+                                                : max(0, min(seq_len, *device_effective_seq_len)))
                                 : seq_len;
     if (!logits || (!Partitioned && (!expert_indices || !expert_weights)) ||
         token >= seq_len || num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
@@ -15196,7 +15674,10 @@ __global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
 
     __shared__ int selected_ids[kDeviceMoEMaxTopK];
     __shared__ float selected_weights[kDeviceMoEMaxTopK];
-    moe_select_topk_probabilities_block(expert_probs, num_experts, top_k, selected_ids, selected_weights);
+    if constexpr (RegisterSelector)
+        moe_grouped_topk_register_merge(expert_probs, selected_ids, selected_weights);
+    else
+        moe_select_topk_probabilities_block(expert_probs, num_experts, top_k, selected_ids, selected_weights);
 
     if (threadIdx.x == 0)
     {
@@ -15245,6 +15726,48 @@ __global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
     }
 }
 
+/** @brief Original grouped and partitioned softmax/top-k launch entry. */
+template<bool Partitioned = false>
+__global__ void rocm_moe_softmax_topk_decode_equivalent_rows_kernel(
+    float *__restrict__ logits,                       // [seq_len, num_experts] IN logits, OUT probabilities
+    float *__restrict__ expert_indices,               // [seq_len, top_k] OUT
+    float *__restrict__ expert_weights,               // [seq_len, top_k] OUT
+    int seq_len, int num_experts, int top_k,
+    bool normalize_weights,
+    const int *__restrict__ device_effective_seq_len,
+    DeviceMoELayerRuntimeView *__restrict__ deferred_selected_route_ledger,
+    llaminar2::DeviceRowPartition partition = {},
+    llaminar2::MoERouterSelectedRoute *selected_packet = nullptr,
+    std::uint64_t *selected_bytes = nullptr)
+{
+    grouped_softmax_rows_body<Partitioned, false>(logits, expert_indices, expert_weights, seq_len,
+        num_experts, top_k, normalize_weights, device_effective_seq_len,
+        deferred_selected_route_ledger, partition, selected_packet, selected_bytes);
+}
+
+/** @brief Qualified gfx906 register selector; all other arithmetic uses the common body. */
+__global__ void qfn_grouped_softmax_register_selector_kernel(
+    float *__restrict__ logits,                       // [seq_len, num_experts] IN logits, OUT probabilities
+    float *__restrict__ expert_indices,               // [seq_len, top_k] OUT
+    float *__restrict__ expert_weights,               // [seq_len, top_k] OUT
+    int seq_len, int num_experts, int top_k,
+    bool normalize_weights,
+    const int *__restrict__ device_effective_seq_len,
+    DeviceMoELayerRuntimeView *__restrict__ deferred_selected_route_ledger,
+    llaminar2::DeviceRowPartition partition = {},
+    llaminar2::MoERouterSelectedRoute *selected_packet = nullptr,
+    std::uint64_t *selected_bytes = nullptr)
+{
+#if !defined(__HIP_DEVICE_COMPILE__) || defined(__gfx906__)
+    grouped_softmax_rows_body<false, true>(logits, expert_indices, expert_weights, seq_len, num_experts,
+        top_k, normalize_weights, device_effective_seq_len, deferred_selected_route_ledger,
+        partition, selected_packet, selected_bytes);
+#else
+    // An incompatible code object can never be selected by the host.
+    __builtin_trap();
+#endif
+}
+
 __global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_router_kpart_reduce_softmax_topk_decode_runtime_kernel(
     const float *__restrict__ partials,                // [num_experts, k_partitions]
     float *__restrict__ router_probabilities,          // [num_experts] OUT
@@ -15256,7 +15779,7 @@ __global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_router_kpart_re
     bool normalize_weights,
     bool write_legacy_outputs,
     bool update_runtime_histogram,
-    bool fully_replicated_local_rows,
+    llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
     const int32_t *__restrict__ absolute_position_ids,
     const DeviceMoERebalancePlanEntryView *__restrict__ rebalance_plan_entries,
     uint32_t rebalance_plan_capacity,
@@ -15267,7 +15790,8 @@ __global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_router_kpart_re
     DeviceMoERebalanceApplyStatusView *__restrict__ rebalance_apply_status,
     DeviceMoERebalanceGraphControllerStateView *__restrict__ rebalance_controller_state,
     int rebalance_target_layer,
-    uint32_t rebalance_command_buffer_count)
+    uint32_t rebalance_command_buffer_count,
+        const int32_t *__restrict__ active_row_count_device)
 {
     if (!partials || !router_probabilities || !runtime ||
         num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
@@ -15379,8 +15903,8 @@ __global__ __launch_bounds__(kDeviceMoEMaxExperts) void rocm_moe_router_kpart_re
             runtime, selected_ids, selected_weights, num_experts, top_k,
             legacy_indices, legacy_weights, write_legacy_outputs,
             update_runtime_histogram,
-            fully_replicated_local_rows,
-            absolute_position_ids ? absolute_position_ids[0] : -1);
+            row_execution_policy,
+            absolute_position_ids ? absolute_position_ids[0] : -1, active_row_count_device);
     }
 }
 
@@ -15403,6 +15927,7 @@ __global__ __launch_bounds__(32) void rocm_moe_decode_route_select_runtime_kerne
     int num_experts, int top_k,
     bool write_legacy_outputs,
     bool update_runtime_histogram,
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
     const int32_t *__restrict__ absolute_position_ids)
 {
     if (threadIdx.x != 0 || !runtime) return;
@@ -15410,8 +15935,8 @@ __global__ __launch_bounds__(32) void rocm_moe_decode_route_select_runtime_kerne
         runtime, expert_indices, expert_weights, num_experts, top_k,
         legacy_indices, legacy_weights, write_legacy_outputs,
         update_runtime_histogram,
-        /*fully_replicated_local_rows=*/false,
-        absolute_position_ids ? absolute_position_ids[0] : -1);
+        row_execution_policy,
+        absolute_position_ids ? absolute_position_ids[0] : -1, nullptr);
 }
 
 // =========================================================================
@@ -15642,12 +16167,30 @@ __global__ void rocm_moe_shared_expert_gate_scale_kernel(
         gate_values[token], shared_output[idx]);
 }
 
+/**
+ * @brief Preserve scalar shared-gate arithmetic while honoring an optional device-owned live row.
+ * @param input Original full hidden row; unread when the clamped count is zero.
+ * @param gate_inp Prepared FP32 gate vector in the same original reduction order.
+ * @param shared_output In-place gated row; overwritten with positive zero when inactive.
+ * @param d_model Complete model width.
+ * @param device_effective_seq_len Optional stable device INT32; null is ordinary scalar decode.
+ */
 __global__ void rocm_moe_shared_expert_gate_decode_fused_kernel(
     const float *__restrict__ input,        // [d_model], token 0
     const float *__restrict__ gate_inp,     // [d_model]
     float *__restrict__ shared_output,      // [d_model], token 0
-    int d_model)
+    int d_model,
+    const int *__restrict__ device_effective_seq_len)
 {
+    // Preserve the established shared-gate clamp contract while keeping the
+    // live=1 dot/tree identical to uncounted scalar decode. Empty work never
+    // reads the hidden/gate row and overwrites prior shared bytes explicitly.
+    if (rocm_moe_clamp_effective_seq_len(1, device_effective_seq_len) == 0)
+    {
+        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
+            shared_output[i] = 0.0f;
+        return;
+    }
     float sum = 0.0f;
     if ((d_model & 3) == 0)
     {
@@ -15730,121 +16273,9 @@ __global__ void rocm_moe_shared_expert_gate_add_kernel(
     const int *__restrict__ device_effective_seq_len = nullptr,
     int output_columns = 0)
 {
-    const int token = blockIdx.x;
-    if (token >= seq_len) return;
-
-    const int columns = ColumnSlice ? output_columns : d_model;
-    const size_t row_offset = static_cast<size_t>(token) * columns;
-    const int effective_seq_len =
-        rocm_moe_clamp_effective_seq_len(seq_len, device_effective_seq_len);
-    if (token >= effective_seq_len)
-    {
-        if ((columns & 3) == 0)
-        {
-            const int d4 = columns >> 2;
-            float4 *__restrict__ shared4 =
-                reinterpret_cast<float4 *>(shared_output + row_offset);
-            float4 *__restrict__ combined4 =
-                reinterpret_cast<float4 *>(combined_output + row_offset);
-            const float4 zero = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-            for (int i = threadIdx.x; i < d4; i += blockDim.x)
-            {
-                shared4[i] = zero;
-                combined4[i] = zero;
-            }
-        }
-        else
-        {
-            for (int i = threadIdx.x; i < columns; i += blockDim.x)
-            {
-                shared_output[row_offset + i] = 0.0f;
-                combined_output[row_offset + i] = 0.0f;
-            }
-        }
-        return;
-    }
-    const float *x = input + static_cast<size_t>(token) * d_model;
-
-    float sum = 0.0f;
-    if ((d_model & 3) == 0)
-    {
-        const int d4 = d_model >> 2;
-        const float4 *__restrict__ x4 = reinterpret_cast<const float4 *>(x);
-        const float4 *__restrict__ gate4 = reinterpret_cast<const float4 *>(gate_inp);
-        for (int i = threadIdx.x; i < d4; i += blockDim.x)
-        {
-            const float4 xv = x4[i];
-            const float4 gv = gate4[i];
-            sum += xv.x * gv.x + xv.y * gv.y + xv.z * gv.z + xv.w * gv.w;
-        }
-    }
-    else
-    {
-        for (int i = threadIdx.x; i < d_model; i += blockDim.x)
-            sum += x[i] * gate_inp[i];
-    }
-
-    sum = rocm_moe_wave_reduce_sum_f32(sum);
-
-    __shared__ float warp_sums[16];
-    const int lane = threadIdx.x % warpSize;
-    const int warp_id = threadIdx.x / warpSize;
-    if (lane == 0) warp_sums[warp_id] = sum;
-    __syncthreads();
-
-    if (warp_id == 0)
-    {
-        const int num_warps = (blockDim.x + warpSize - 1) / warpSize;
-        float block_sum = (lane < num_warps) ? warp_sums[lane] : 0.0f;
-        block_sum = rocm_moe_wave_reduce_sum_f32(block_sum);
-        if (lane == 0)
-            warp_sums[0] = 1.0f / (1.0f + expf(-block_sum));
-    }
-    __syncthreads();
-
-    const float gate = warp_sums[0];
-    if ((columns & 3) == 0)
-    {
-        const int d4 = columns >> 2;
-        float4 *__restrict__ shared4 =
-            reinterpret_cast<float4 *>(shared_output + row_offset);
-        const float4 *__restrict__ routed4 =
-            reinterpret_cast<const float4 *>(routed_residual + row_offset);
-        float4 *__restrict__ combined4 =
-            reinterpret_cast<float4 *>(combined_output + row_offset);
-        for (int i = threadIdx.x; i < d4; i += blockDim.x)
-        {
-            const float4 s = shared4[i];
-            const float4 r = routed4[i];
-            const float4 gated = make_float4(
-                llaminar2::device_fp32_contract::multiply(gate, s.x),
-                llaminar2::device_fp32_contract::multiply(gate, s.y),
-                llaminar2::device_fp32_contract::multiply(gate, s.z),
-                llaminar2::device_fp32_contract::multiply(gate, s.w));
-            shared4[i] = gated;
-            // This specialization replaces two previously separate launches.
-            // Persist the product with the shared numerical contract: HIP's
-            // __fadd_rn alone is plain C++ addition in this toolchain and cannot
-            // prevent LLVM contracting the producer into an FMA. The retained
-            // register dependency adds no memory access or device barrier.
-            combined4[i] = make_float4(
-                llaminar2::device_fp32_contract::add(r.x, gated.x),
-                llaminar2::device_fp32_contract::add(r.y, gated.y),
-                llaminar2::device_fp32_contract::add(r.z, gated.z),
-                llaminar2::device_fp32_contract::add(r.w, gated.w));
-        }
-    }
-    else
-    {
-        for (int i = threadIdx.x; i < columns; i += blockDim.x)
-        {
-            const float gated_shared = llaminar2::device_fp32_contract::multiply(
-                gate, shared_output[row_offset + i]);
-            shared_output[row_offset + i] = gated_shared;
-            combined_output[row_offset + i] = llaminar2::device_fp32_contract::add(
-                routed_residual[row_offset + i], gated_shared);
-        }
-    }
+    llaminar2::rocm::moe_shared_gate::gateAdd<ColumnSlice>(input,gate_inp,shared_output,routed_residual,
+        combined_output,seq_len,d_model,int(blockIdx.x),
+        rocm_moe_clamp_effective_seq_len(seq_len,device_effective_seq_len),output_columns);
 }
 
 /**
@@ -16465,11 +16896,11 @@ bool hipMoE_gate_logits_fp32_decode_equivalent_rows(
     return true;
 }
 
-bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
+bool hipMoE_gate_logits_fp16_decode_equivalent_rows_with_policy(
     const float *hidden, const void *gate_weights_fp16, float *logits,
     int seq_len, int d_model, int num_experts,
     int device_idx, void *stream,
-    const int *device_effective_seq_len)
+    const int *device_effective_seq_len, bool qualified_default)
 {
     if (!hidden || !gate_weights_fp16 || !logits || !stream ||
         seq_len <= 0 || d_model <= 0 || num_experts <= 0)
@@ -16482,8 +16913,33 @@ bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
         return false;
     (void)hipGetLastError();
 
-    launch_fp16_router_rows<false>(hidden, static_cast<const __half *>(gate_weights_fp16), logits,
-        seq_len, seq_len, d_model, num_experts, device_effective_seq_len, {}, static_cast<hipStream_t>(stream));
+    bool fixed_rows = false;
+    if (device_effective_seq_len && seq_len >= 2 && seq_len <= 8 &&
+        d_model == 2560 && num_experts == 512 && llaminar2::qfnGroupedFP16RouterFixedRowsOptIn(qualified_default))
+    {
+        const auto hardware = llaminar2::rocm::nativeQuantisedHardwareForDevice(device_idx);
+        fixed_rows = llaminar2::native_quantised::selectVerifierDispatchTable(hardware) ==
+            llaminar2::native_quantised::VerifierDispatchTable::MI50;
+    }
+    if (fixed_rows)
+    {
+        if (reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            (reinterpret_cast<std::uintptr_t>(gate_weights_fp16) & 3u))
+            return false;
+        const auto native = static_cast<hipStream_t>(stream);
+        const auto *gate = static_cast<const __half *>(gate_weights_fp16);
+        // Size the register accumulator array for the admitted row capacity.
+        // The device count still bounds every load and store in the final tile.
+        if (seq_len <= 4)
+            hipLaunchKernelGGL(qfn_grouped_fp16_router_fixed_rows<4>, dim3(512), dim3(128), 0,
+                native, hidden, gate, logits, device_effective_seq_len, seq_len);
+        else
+            hipLaunchKernelGGL(qfn_grouped_fp16_router_fixed_rows<8>, dim3(512), dim3(128), 0,
+                native, hidden, gate, logits, device_effective_seq_len, seq_len);
+    }
+    else
+        launch_fp16_router_rows<false>(hidden, static_cast<const __half *>(gate_weights_fp16), logits,
+            seq_len, seq_len, d_model, num_experts, device_effective_seq_len, {}, static_cast<hipStream_t>(stream));
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -16492,11 +16948,23 @@ bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
                 hipGetErrorString(err));
         return false;
     }
+    if (fixed_rows)
+        llaminar2::PerfStatsCollector::addCounter("kernel", "qfn_grouped_fp16_router_fixed_rows_nodes", 1.0,
+            "router", "rocm:" + std::to_string(device_idx), {{"physical_rows", std::to_string(seq_len)}});
     llaminar2::PerfStatsCollector::addCounter("kernel", "rocm_moe_router_fp16_operand_calls", 1.0,
         "router", "rocm:" + std::to_string(device_idx),
         {{"m", std::to_string(seq_len)}, {"d_model", std::to_string(d_model)}, {"num_experts", std::to_string(num_experts)},
          {"activation", "fp16_rne"}, {"weight", "fp16"}, {"accumulation", "fp32"}, {"output", "fp32"}, {"route", "grouped_fixed"}});
     return true;
+}
+
+bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
+    const float *hidden, const void *gate_weights_fp16, float *logits,
+    int seq_len, int d_model, int num_experts,
+    int device_idx, void *stream,
+    const int *device_effective_seq_len)
+{
+    return hipMoE_gate_logits_fp16_decode_equivalent_rows_with_policy(hidden, gate_weights_fp16, logits, seq_len, d_model, num_experts, device_idx, stream, device_effective_seq_len, false);
 }
 
 bool hipMoE_gate_logits_bf16_decode_equivalent_rows(
@@ -16627,6 +17095,19 @@ bool hipMoE_gate_logits_single_token_q8_weights(
         if (hipGetLastError() != hipSuccess) return false;
     }
     return true;
+}
+
+/** @copydoc hipMoE_publish_original_hidden_q8_with_k32_sums */
+bool hipMoE_publish_original_hidden_q8_with_k32_sums(const float* hidden,std::int8_t* codes,
+    float* scales,std::int16_t* sums,int device,void* stream,const int* live_rows)
+{
+    if (!hidden || !codes || !scales || !sums || !live_rows ||
+        reinterpret_cast<std::uintptr_t>(stream)<=2u || device<0 ||
+        static_cast<hipError_t>(llaminar2::HipDeviceGuard::setDevice(device))!=hipSuccess)
+        return false;
+    hipLaunchKernelGGL(rocm_moe_router_hidden_quantize_q8_rows_and_sums_kernel,
+        dim3(80,4),dim3(32),0,static_cast<hipStream_t>(stream),hidden,codes,scales,live_rows,sums);
+    return hipGetLastError()==hipSuccess;
 }
 
 /** @copydoc hipMoE_publish_original_hidden_q8_rows */
@@ -16877,7 +17358,7 @@ bool hipMoE_softmax_topk_decode_runtime(
     bool normalize_weights,
     bool write_legacy_outputs,
     bool update_runtime_histogram,
-    bool fully_replicated_local_rows,
+    llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
     void *runtime_layers,
     const void *rebalance_plan_entries,
     uint32_t rebalance_plan_capacity,
@@ -16890,7 +17371,8 @@ bool hipMoE_softmax_topk_decode_runtime(
     int rebalance_target_layer,
     uint32_t rebalance_command_buffer_count,
     const int32_t *absolute_position_ids,
-    int device_idx, void *stream)
+    int device_idx, void *stream,
+        const int32_t *active_row_count_device)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
@@ -16919,7 +17401,7 @@ bool hipMoE_softmax_topk_decode_runtime(
         normalize_weights,
         write_legacy_outputs,
         update_runtime_histogram,
-        fully_replicated_local_rows,
+        row_execution_policy,
         absolute_position_ids,
         static_cast<const DeviceMoERebalancePlanEntryView *>(rebalance_plan_entries),
         rebalance_plan_capacity,
@@ -16930,7 +17412,7 @@ bool hipMoE_softmax_topk_decode_runtime(
         static_cast<DeviceMoERebalanceApplyStatusView *>(rebalance_apply_status),
         static_cast<DeviceMoERebalanceGraphControllerStateView *>(rebalance_controller_state),
         rebalance_target_layer,
-        rebalance_command_buffer_count);
+        rebalance_command_buffer_count, active_row_count_device);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -16950,7 +17432,7 @@ bool hipMoE_softmax_topk_decode_runtime_wave64(
     bool normalize_weights,
     bool write_legacy_outputs,
     bool update_runtime_histogram,
-    bool fully_replicated_local_rows,
+    llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
     void *runtime_layers,
     const void *rebalance_plan_entries,
     uint32_t rebalance_plan_capacity,
@@ -16963,7 +17445,8 @@ bool hipMoE_softmax_topk_decode_runtime_wave64(
     int rebalance_target_layer,
     uint32_t rebalance_command_buffer_count,
     const int32_t *absolute_position_ids,
-    int device_idx, void *stream)
+    int device_idx, void *stream,
+        const int32_t *active_row_count_device)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
@@ -16994,6 +17477,29 @@ bool hipMoE_softmax_topk_decode_runtime_wave64(
     if (any_rebalance_binding && !complete_rebalance_binding)
         return false;
 
+    // Fragment slots do not share replica load-balancing state. Reuse the
+    // independent-slot kernel while retaining each slot's acquired-bank proof.
+    // A ready-wave transaction still uses its explicitly fused apply kernel.
+    if (row_execution_policy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal &&
+        !apply_ready_rebalance)
+    {
+        if (!stream || top_k > num_experts) return false;
+#define LLAMINAR_LAUNCH_FRAGMENT_ROUTE(HISTOGRAM) \
+        hipLaunchKernelGGL(HIP_KERNEL_NAME( \
+            rocm_moe_softmax_topk_decode_independent_wave64_kernel<HISTOGRAM, \
+                llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal>), \
+            dim3(1), dim3(256), 0, static_cast<hipStream_t>(stream), \
+            logits, static_cast<DeviceMoELayerRuntimeView *>(runtime), \
+            legacy_indices, legacy_weights, num_experts, top_k, \
+            normalize_weights, write_legacy_outputs, active_row_count_device)
+        if (update_runtime_histogram)
+            LLAMINAR_LAUNCH_FRAGMENT_ROUTE(true);
+        else
+            LLAMINAR_LAUNCH_FRAGMENT_ROUTE(false);
+#undef LLAMINAR_LAUNCH_FRAGMENT_ROUTE
+        return hipGetLastError() == hipSuccess;
+    }
+
     const int threads = 256;
     DeviceMoERebalanceConfigView rebalance_cfg{};
     if (rebalance_config)
@@ -17012,7 +17518,7 @@ bool hipMoE_softmax_topk_decode_runtime_wave64(
         num_experts, top_k,                                                     \
         normalize_weights,                                                      \
         write_legacy_outputs,                                                   \
-        fully_replicated_local_rows,                                            \
+        row_execution_policy,                                            \
         absolute_position_ids,                                                  \
         static_cast<const DeviceMoERebalancePlanEntryView *>(                   \
             rebalance_plan_entries),                                            \
@@ -17028,7 +17534,7 @@ bool hipMoE_softmax_topk_decode_runtime_wave64(
         static_cast<DeviceMoERebalanceGraphControllerStateView *>(              \
             rebalance_controller_state),                                        \
         rebalance_target_layer,                                                 \
-        rebalance_command_buffer_count)
+        rebalance_command_buffer_count, active_row_count_device)
 
     if (update_runtime_histogram)
     {
@@ -17056,6 +17562,107 @@ bool hipMoE_softmax_topk_decode_runtime_wave64(
     return true;
 }
 
+    /**
+     * @brief Publish the exact decode route and its descriptors in one retained kernel.
+     * @param logits Original FP32 router logits, overwritten with probabilities.
+     * @param runtime Original device runtime retaining the acquired placement bank.
+     * @param legacy_indices Optional complete selected ID output.
+     * @param legacy_weights Optional complete selected weight output.
+     * @param num_experts Exact original source extent.
+     * @param top_k Exact selected packet width.
+     * @param normalize_weights Preserve the backend's original serial normalization.
+     * @param write_legacy_outputs Whether both complete selected outputs are bound.
+     * @param update_runtime_histogram Whether this graph owns demand evidence.
+     * @param row_policy Original independent whole-owner or local-fragment contract.
+     * @param publication Existing arena descriptor outputs with complete identity.
+     * @param device_idx Original rank-local device ordinal.
+     * @param stream Exact non-default producer and consumer stream.
+     * @param active_row_count_device Optional device-owned live row count.
+     * @return Whether validation and native submission succeeded.
+     */
+__attribute__((visibility("default"))) bool hipMoE_softmax_topk_decode_selected_descriptors(
+        float *logits, void *runtime, float *legacy_indices, float *legacy_weights,
+        int num_experts, int top_k, bool normalize_weights, bool write_legacy_outputs,
+        bool update_runtime_histogram, llaminar2::RoutedExpertRowExecutionPolicy row_policy,
+        llaminar2::MoEDecodeDescriptorPublication publication,
+        int device_idx, void *stream, const int32_t *active_row_count_device)
+{
+    using Policy = llaminar2::RoutedExpertRowExecutionPolicy;
+    using Projections = llaminar2::DeviceMoEProjectionSet;
+    if (!logits || !runtime || reinterpret_cast<std::uintptr_t>(stream) <= 2u ||
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK || top_k > num_experts ||
+        !publication.valid() || publication.expert_count != num_experts ||
+        (write_legacy_outputs && (!legacy_indices || !legacy_weights)) ||
+        (row_policy != Policy::ParticipantAssigned && row_policy != Policy::IntermediateShardLocal) ||
+        (row_policy == Policy::IntermediateShardLocal) != (publication.projections == Projections::IntermediateShard))
+        return false;
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+#define LLAMINAR_LAUNCH_ROUTE_DESCRIPTORS(HISTOGRAM, POLICY) \
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rocm_moe_softmax_topk_decode_descriptors_kernel<HISTOGRAM, POLICY>), \
+        dim3(1), dim3(256), 0, static_cast<hipStream_t>(stream), \
+        logits, static_cast<DeviceMoELayerRuntimeView *>(runtime), legacy_indices, legacy_weights, \
+        num_experts, top_k, normalize_weights, write_legacy_outputs, active_row_count_device, publication)
+    if (row_policy == Policy::IntermediateShardLocal)
+    {
+        if (update_runtime_histogram) LLAMINAR_LAUNCH_ROUTE_DESCRIPTORS(true, Policy::IntermediateShardLocal);
+        else LLAMINAR_LAUNCH_ROUTE_DESCRIPTORS(false, Policy::IntermediateShardLocal);
+    }
+    else
+    {
+        if (update_runtime_histogram) LLAMINAR_LAUNCH_ROUTE_DESCRIPTORS(true, Policy::ParticipantAssigned);
+        else LLAMINAR_LAUNCH_ROUTE_DESCRIPTORS(false, Policy::ParticipantAssigned);
+    }
+#undef LLAMINAR_LAUNCH_ROUTE_DESCRIPTORS
+    return hipGetLastError() == hipSuccess;
+}
+
+/** @copydoc hipMoE_fp16_projection_route_selected_descriptors */
+__attribute__((visibility("default"))) bool hipMoE_fp16_projection_route_selected_descriptors(
+    const float *hidden, const void *gate_weights, float *logits, void *runtime,
+    float *legacy_indices, float *legacy_weights, int d_model, int num_experts,
+    int top_k, bool normalize_weights, bool write_legacy_outputs,
+    bool update_runtime_histogram, llaminar2::RoutedExpertRowExecutionPolicy row_policy,
+    llaminar2::MoEDecodeDescriptorPublication publication,
+    llaminar2::NativeTileCompletionView completion,
+    int device_idx, void *stream, const int32_t *active_row_count_device)
+{
+    using Policy = llaminar2::RoutedExpertRowExecutionPolicy;
+    using Projections = llaminar2::DeviceMoEProjectionSet;
+    if (!hidden || !gate_weights || !logits || !runtime || d_model <= 0 ||
+        reinterpret_cast<std::uintptr_t>(stream) <= 2u || num_experts <= 0 ||
+        num_experts > kDeviceMoEMaxExperts || top_k <= 0 ||
+        top_k > kDeviceMoEMaxTopK || top_k > num_experts ||
+        !publication.valid() || publication.expert_count != num_experts ||
+        (write_legacy_outputs && (!legacy_indices || !legacy_weights)) ||
+        (row_policy != Policy::ParticipantAssigned && row_policy != Policy::IntermediateShardLocal) ||
+        (row_policy == Policy::IntermediateShardLocal) != (publication.projections == Projections::IntermediateShard) ||
+        !completion.counters || reinterpret_cast<std::uintptr_t>(completion.counters) % alignof(std::uint32_t) ||
+        completion.tiles != 1u || completion.routes != 1u ||
+        completion.contributors != static_cast<std::uint32_t>((num_experts + 1) / 2))
+        return false;
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+#define LLAMINAR_LAUNCH_FP16_ROUTE_COMPLETION(HISTOGRAM, POLICY) \
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(rocm_moe_fp16_projection_route_descriptors_kernel<HISTOGRAM, POLICY>), \
+        dim3(completion.contributors), dim3(256), 0, static_cast<hipStream_t>(stream), \
+        hidden, static_cast<const __half *>(gate_weights), logits, \
+        static_cast<DeviceMoELayerRuntimeView *>(runtime), legacy_indices, legacy_weights, \
+        d_model, num_experts, top_k, normalize_weights, write_legacy_outputs, \
+        active_row_count_device, publication, completion)
+    if (row_policy == Policy::IntermediateShardLocal)
+    {
+        if (update_runtime_histogram) LLAMINAR_LAUNCH_FP16_ROUTE_COMPLETION(true, Policy::IntermediateShardLocal);
+        else LLAMINAR_LAUNCH_FP16_ROUTE_COMPLETION(false, Policy::IntermediateShardLocal);
+    }
+    else
+    {
+        if (update_runtime_histogram) LLAMINAR_LAUNCH_FP16_ROUTE_COMPLETION(true, Policy::ParticipantAssigned);
+        else LLAMINAR_LAUNCH_FP16_ROUTE_COMPLETION(false, Policy::ParticipantAssigned);
+    }
+#undef LLAMINAR_LAUNCH_FP16_ROUTE_COMPLETION
+    return hipGetLastError() == hipSuccess;
+}
+
 /**
  * @brief Launch the spill-free unique-owner wave64 decode router.
  *
@@ -17075,7 +17682,8 @@ bool hipMoE_softmax_topk_decode_unique_owner_wave64(
     bool write_legacy_outputs,
     bool update_runtime_histogram,
     int device_idx,
-    void *stream)
+    void *stream,
+        const int32_t *active_row_count_device)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
@@ -17105,7 +17713,7 @@ bool hipMoE_softmax_topk_decode_unique_owner_wave64(
     {
         hipLaunchKernelGGL(
             HIP_KERNEL_NAME(
-                rocm_moe_softmax_topk_decode_unique_owner_wave64_kernel<true>),
+                rocm_moe_softmax_topk_decode_independent_wave64_kernel<true>),
             dim3(1),
             dim3(threads),
             0,
@@ -17117,13 +17725,13 @@ bool hipMoE_softmax_topk_decode_unique_owner_wave64(
             num_experts,
             top_k,
             normalize_weights,
-            write_legacy_outputs);
+            write_legacy_outputs, active_row_count_device);
     }
     else
     {
         hipLaunchKernelGGL(
             HIP_KERNEL_NAME(
-                rocm_moe_softmax_topk_decode_unique_owner_wave64_kernel<false>),
+                rocm_moe_softmax_topk_decode_independent_wave64_kernel<false>),
             dim3(1),
             dim3(threads),
             0,
@@ -17135,7 +17743,7 @@ bool hipMoE_softmax_topk_decode_unique_owner_wave64(
             num_experts,
             top_k,
             normalize_weights,
-            write_legacy_outputs);
+            write_legacy_outputs, active_row_count_device);
     }
 
     const hipError_t err = hipGetLastError();
@@ -17150,14 +17758,14 @@ bool hipMoE_softmax_topk_decode_unique_owner_wave64(
     return true;
 }
 
-bool hipMoE_softmax_topk_decode_equivalent_rows(
+bool hipMoE_softmax_topk_decode_equivalent_rows_with_policy(
     float *logits,
     float *expert_indices, float *expert_weights,
     int seq_len, int num_experts, int top_k,
     bool normalize_weights,
     int device_idx, void *stream,
     const int *device_effective_seq_len,
-    void *deferred_selected_route_ledger)
+    void *deferred_selected_route_ledger, bool qualified_default)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
@@ -17172,13 +17780,37 @@ bool hipMoE_softmax_topk_decode_equivalent_rows(
     }
 
     const int threads = 256;
-    hipLaunchKernelGGL(rocm_moe_softmax_topk_decode_equivalent_rows_kernel,
-        dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
-        logits, expert_indices, expert_weights,
-        seq_len, num_experts, top_k, normalize_weights,
-        device_effective_seq_len,
-        static_cast<DeviceMoELayerRuntimeView *>(
-            deferred_selected_route_ledger));
+    // This selection depends only on immutable graph geometry and discovery;
+    // the live count remains a device-owned input in the shared body.
+    bool use_register_selector = false;
+    if (device_effective_seq_len && seq_len >= 2 && seq_len <= 8 &&
+        num_experts == kQFNRegisterSelectorExperts && top_k == kQFNRegisterSelectorTopK &&
+        llaminar2::qfnGroupedTopKRegisterOptIn(qualified_default))
+    {
+        const auto hardware = llaminar2::rocm::nativeQuantisedHardwareForDevice(device_idx);
+        use_register_selector = llaminar2::native_quantised::selectVerifierDispatchTable(hardware) ==
+            llaminar2::native_quantised::VerifierDispatchTable::MI50;
+    }
+    if (use_register_selector)
+    {
+        hipLaunchKernelGGL(qfn_grouped_softmax_register_selector_kernel,
+            dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
+            logits, expert_indices, expert_weights,
+            seq_len, num_experts, top_k, normalize_weights,
+            device_effective_seq_len,
+            static_cast<DeviceMoELayerRuntimeView *>(
+                deferred_selected_route_ledger));
+    }
+    else
+    {
+        hipLaunchKernelGGL(rocm_moe_softmax_topk_decode_equivalent_rows_kernel,
+            dim3(seq_len), dim3(threads), 0, static_cast<hipStream_t>(stream),
+            logits, expert_indices, expert_weights,
+            seq_len, num_experts, top_k, normalize_weights,
+            device_effective_seq_len,
+            static_cast<DeviceMoELayerRuntimeView *>(
+                deferred_selected_route_ledger));
+    }
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -17187,7 +17819,22 @@ bool hipMoE_softmax_topk_decode_equivalent_rows(
                 hipGetErrorString(err));
         return false;
     }
+    if (use_register_selector)
+        llaminar2::PerfStatsCollector::addCounter("rocm_moe", "grouped_register_topk_calls", 1.0,
+            "verifier", "ROCm:" + std::to_string(device_idx), {{"physical_rows", std::to_string(seq_len)}});
     return true;
+}
+
+bool hipMoE_softmax_topk_decode_equivalent_rows(
+    float *logits,
+    float *expert_indices, float *expert_weights,
+    int seq_len, int num_experts, int top_k,
+    bool normalize_weights,
+    int device_idx, void *stream,
+    const int *device_effective_seq_len,
+    void *deferred_selected_route_ledger)
+{
+    return hipMoE_softmax_topk_decode_equivalent_rows_with_policy(logits, expert_indices, expert_weights, seq_len, num_experts, top_k, normalize_weights, device_idx, stream, device_effective_seq_len, deferred_selected_route_ledger, false);
 }
 
 bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
@@ -17200,7 +17847,7 @@ bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
     bool normalize_weights,
     bool write_legacy_outputs,
     bool update_runtime_histogram,
-    bool fully_replicated_local_rows,
+    llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
     void *runtime_layers,
     const void *rebalance_plan_entries,
     uint32_t rebalance_plan_capacity,
@@ -17213,7 +17860,8 @@ bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
     int rebalance_target_layer,
     uint32_t rebalance_command_buffer_count,
     const int32_t *absolute_position_ids,
-    int device_idx, void *stream)
+    int device_idx, void *stream,
+        const int32_t *active_row_count_device)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
@@ -17244,7 +17892,7 @@ bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
         normalize_weights,
         write_legacy_outputs,
         update_runtime_histogram,
-        fully_replicated_local_rows,
+        row_execution_policy,
         absolute_position_ids,
         static_cast<const DeviceMoERebalancePlanEntryView *>(rebalance_plan_entries),
         rebalance_plan_capacity,
@@ -17255,7 +17903,7 @@ bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
         static_cast<DeviceMoERebalanceApplyStatusView *>(rebalance_apply_status),
         static_cast<DeviceMoERebalanceGraphControllerStateView *>(rebalance_controller_state),
         rebalance_target_layer,
-        rebalance_command_buffer_count);
+        rebalance_command_buffer_count, active_row_count_device);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -17274,13 +17922,14 @@ bool hipMoE_decode_route_select_runtime(
     float *legacy_weights,
     int num_experts, int top_k,
     bool write_legacy_outputs,
-    bool update_runtime_histogram,
+    bool update_runtime_histogram, llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
     int device_idx, void *stream)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
 
-    if (!expert_indices || !expert_weights || !runtime || top_k <= 0 || top_k > kDeviceMoEMaxTopK)
+    if (!expert_indices || !expert_weights || !runtime || !stream || num_experts <= 0 ||
+        num_experts > kDeviceMoEMaxExperts || top_k <= 0 || top_k > kDeviceMoEMaxTopK)
         return false;
     if (write_legacy_outputs && (!legacy_indices || !legacy_weights))
         return false;
@@ -17294,7 +17943,7 @@ bool hipMoE_decode_route_select_runtime(
         num_experts, top_k,
         write_legacy_outputs,
         update_runtime_histogram,
-        /*absolute_position_ids=*/nullptr);
+        row_execution_policy, /*absolute_position_ids=*/nullptr);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -17493,12 +18142,23 @@ bool hipMoE_shared_expert_gate_effective_seq_len(
     return true;
 }
 
+/**
+ * @brief Enqueue the existing scalar tree with an optional borrowed live-count authority.
+ * @param input Resident full hidden row.
+ * @param gate_inp Resident FP32 gate vector.
+ * @param shared_output Resident in-place shared row.
+ * @param d_model Positive full hidden width.
+ * @param device_idx Original worker's HIP ordinal.
+ * @param stream Exact non-null ordered producer stream.
+ * @param device_effective_seq_len Optional stable device INT32, retaining the shared clamp contract.
+ * @return Whether the exact native launch was accepted.
+ */
 bool hipMoE_shared_expert_gate_decode_fused(
     const float *input, const float *gate_inp,
     float *shared_output, int d_model,
-    int device_idx, void *stream)
+    int device_idx, void *stream, const int *device_effective_seq_len)
 {
-    if (!input || !gate_inp || !shared_output || d_model <= 0)
+    if (!input || !gate_inp || !shared_output || d_model <= 0 || !stream)
     {
         fprintf(stderr, "HIP MoE shared_expert_gate_decode_fused invalid args\n");
         return false;
@@ -17510,7 +18170,7 @@ bool hipMoE_shared_expert_gate_decode_fused(
     const int threads = 256;
     hipLaunchKernelGGL(rocm_moe_shared_expert_gate_decode_fused_kernel,
         dim3(1), dim3(threads), 0, static_cast<hipStream_t>(stream),
-        input, gate_inp, shared_output, d_model);
+        input, gate_inp, shared_output, d_model, device_effective_seq_len);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -19044,7 +19704,7 @@ __device__ __forceinline__ void rocm_pad_active_expert_list(
  * @brief Shared state for one complete runtime grouped-plan publication.
  *
  * Descriptor readiness and active-list compaction are collective workgroup
- * operations. Keeping their state in one object lets descriptor-only decode
+ * operations. Keeping their state in one object lets complete descriptor
  * publication and fused verifier grouping share one exact implementation.
  */
 struct RuntimePrefillPlanPublicationScratch
@@ -19058,7 +19718,7 @@ struct RuntimePrefillPlanPublicationScratch
  *
  * Each lane owns exactly one expert id.  Separating descriptor publication
  * from active-list compaction lets the fused verifier transaction overlap it
- * with count/offset publication while descriptor-only decode continues to use
+ * with count/offset publication while selected decode continues to use
  * the same readiness and zero-fill contract.
  *
  * @param bank Active immutable placement bank selected by the caller.
@@ -19073,6 +19733,7 @@ struct RuntimePrefillPlanPublicationScratch
  * @return True when the expert is locally resident and compute-ready.
  */
 __device__ __forceinline__ bool rocm_publish_runtime_expert_descriptors_lane(
+    const DeviceMoELayerRuntimeView *runtime,
     const DeviceMoEPlacementBankView &bank,
     uint32_t local_bit,
     int expert,
@@ -19091,8 +19752,10 @@ __device__ __forceinline__ bool rocm_publish_runtime_expert_descriptors_lane(
     // column bank owns down; absence alone never selects split execution.
     const bool descriptor_ready =
         llaminar2::deviceMoEExpertProjectionReady(desc, expected_projections);
-    const bool local_ready =
-        bank.local_compute_mask[expert] != 0u &&
+    const bool local_ready = expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+        ? runtime_intermediate_shard_row(runtime, bank, expert).disposition ==
+              llaminar2::MoEIntermediateShardRowDisposition::Local && desc.weight_format == expected_format
+        : bank.local_compute_mask[expert] != 0u &&
         (bank.resident_participant_mask[expert] & local_bit) != 0u &&
         desc.local_slot >= 0 &&
         desc.weight_format == expected_format && descriptor_ready;
@@ -19133,6 +19796,63 @@ __device__ __forceinline__ bool rocm_publish_runtime_expert_descriptors_lane(
 }
 
 /**
+ * @brief Refresh only descriptors consumed by this exact one-row route packet.
+ *
+ * The arena retains a full expert-indexed table, but this invocation owns only
+ * its selected entries. Every later consumer uses the same immutable ID packet
+ * on this stream. Previously selected entries need no sweep: selecting them
+ * again necessarily refreshes them from the currently acquired placement bank.
+ * A selected remote expert is explicitly zeroed by the shared publisher.
+ *
+ * @param runtime Participant runtime whose acquired epoch owns the source bank.
+ * @param expert_ids Device-owned selected IDs, with -1 for inactive routes.
+ * @param gate_descs Existing graph-owned expert-indexed gate descriptor storage.
+ * @param up_descs Existing graph-owned expert-indexed up descriptor storage.
+ * @param down_descs Existing graph-owned expert-indexed down descriptor storage.
+ * @param num_experts Logical source/table extent, independent of launch size.
+ * @param top_k Exact route packet width; launch one lane per selected slot.
+ * @param format Original native or floating descriptor family.
+ * @param projections Exact admitted movable projection contract.
+ */
+__global__ void rocm_moe_materialize_runtime_selected_decode_descriptors_kernel(
+    const DeviceMoELayerRuntimeView *__restrict__ runtime,
+    const int *__restrict__ expert_ids,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ gate_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ up_descs,
+    DeviceNativeQuantisedMatrixDescView *__restrict__ down_descs,
+    int num_experts, int top_k, llaminar2::DeviceMoEWeightFormat format,
+    llaminar2::DeviceMoEProjectionSet projections)
+{
+    const uint32_t execution_bank = runtime_execution_bank(runtime);
+    if (!runtime || execution_bank > 1u ||
+        runtime->intermediate_shard.enabled() !=
+            (projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard))
+    {
+        if (threadIdx.x == 0) FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("selected decode descriptors require the acquired bank and projection contract");
+        return;
+    }
+    const int slot = static_cast<int>(threadIdx.x);
+    if (slot >= top_k) return;
+    const int expert = expert_ids[slot];
+    if (expert == -1) return;
+    if (expert < 0 || expert >= num_experts)
+    {
+        FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("selected decode descriptor ID lies outside the admitted source");
+        return;
+    }
+    // Ordinary top-k IDs are unique. An explicit packet may repeat an ID;
+    // its first slot alone owns publication, avoiding even identical-write races.
+    for (int earlier = 0; earlier < slot; ++earlier)
+        if (expert_ids[earlier] == expert) return;
+    const auto &bank = runtime_placement_banks(runtime)[execution_bank];
+    const uint32_t local_bit =
+        projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+            ? 0u : runtime_participant_bit(static_cast<int>(runtime->participant_id));
+    rocm_publish_runtime_expert_descriptors_lane(runtime, bank, local_bit, expert, num_experts,
+        gate_descs, up_descs, down_descs, format, projections);
+}
+
+/**
  * @brief Publish runtime descriptors and the stable local active-expert list.
  *
  * Every lane in the workgroup must call this function. Descriptor publication
@@ -19166,6 +19886,8 @@ __device__ __forceinline__ void rocm_publish_runtime_prefill_plan_block(
     if (!runtime || !gate_descs || !up_descs || !down_descs || num_experts <= 0 ||
         num_experts > kDeviceMoEMaxExperts || execution_bank > 1u ||
         !llaminar2::deviceMoEProjectionSetValid(expected_projections) ||
+            (runtime && runtime->intermediate_shard.enabled() !=
+                (expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard)) ||
         (expected_format != llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
          !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)) ||
         (publish_active_experts &&
@@ -19188,8 +19910,10 @@ __device__ __forceinline__ void rocm_publish_runtime_prefill_plan_block(
         const int expert = chunk + static_cast<int>(threadIdx.x);
         const DeviceMoEPlacementBankView &bank = runtime_placement_banks(runtime)[execution_bank];
         const uint32_t local_bit =
-            runtime_participant_bit(static_cast<int>(runtime->participant_id));
+            expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                    ? 0u : runtime_participant_bit(static_cast<int>(runtime->participant_id));
         const bool local_ready = rocm_publish_runtime_expert_descriptors_lane(
+            runtime,
             bank, local_bit, expert, num_experts, gate_descs, up_descs, down_descs, expected_format,
             expected_projections);
 
@@ -19744,6 +20468,9 @@ __device__ __forceinline__ bool rocm_moe_prefill_static_local_ready(
     const DeviceMoEPlacementBankView &bank =
         runtime_placement_banks(runtime)[execution_bank];
     const DeviceMoEExpertDescriptorView &desc = bank.experts[expert_id];
+    if (expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard)
+        return runtime_intermediate_shard_row(runtime, bank, expert_id).disposition ==
+            llaminar2::MoEIntermediateShardRowDisposition::Local;
     const uint32_t local_bit =
         runtime_participant_bit(static_cast<int>(runtime->participant_id));
     return bank.local_compute_mask[expert_id] != 0u &&
@@ -19819,6 +20546,8 @@ void rocm_moe_prefill_group_small_runtime_kernel(
         (PublishRouterInputs && (!routing_indices || !routing_weights)) ||
         execution_bank > 1u ||
         !llaminar2::deviceMoEProjectionSetValid(expected_projections) ||
+            (runtime && runtime->intermediate_shard.enabled() !=
+                (expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard)) ||
         runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots) ||
         !runtime->route_expert_ids || !runtime->route_weights ||
         !runtime->route_participant_ids || !runtime->expert_counts ||
@@ -19874,7 +20603,8 @@ void rocm_moe_prefill_group_small_runtime_kernel(
                     expert_id = -1;
                     route_weight = 0.0f;
                 }
-                else if (filter_to_local_runtime_experts != 0)
+                else if (filter_to_local_runtime_experts != 0 ||
+                    expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard)
                 {
                     /* StaticOwner publishes the same authoritative owner on
                      * every shard.  A remote owner is not an inactive route:
@@ -19882,7 +20612,9 @@ void rocm_moe_prefill_group_small_runtime_kernel(
                      * lane even though this shard performs no local GEMM. */
                     const DeviceMoEPlacementBankView &bank =
                         runtime_placement_banks(runtime)[execution_bank];
-                    participant_id = runtime_expert_owner(bank, expert_id);
+                    participant_id = expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                            ? runtime_intermediate_shard_row(runtime, bank, expert_id).participant
+                            : runtime_expert_owner(bank, expert_id);
                     if (participant_id !=
                             static_cast<int>(runtime->participant_id) ||
                         !rocm_moe_prefill_static_local_ready(
@@ -19995,7 +20727,8 @@ void rocm_moe_prefill_group_small_runtime_kernel(
             const DeviceMoEPlacementBankView &bank =
                 runtime_placement_banks(runtime)[execution_bank];
             const uint32_t local_bit =
-                runtime_participant_bit(local_participant);
+                expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                    ? 0u : runtime_participant_bit(local_participant);
             const bool is_active = count > 0;
 
             /*
@@ -20018,6 +20751,7 @@ void rocm_moe_prefill_group_small_runtime_kernel(
             if (is_active)
             {
                 local_ready = rocm_publish_runtime_expert_descriptors_lane(
+                    runtime,
                     bank,
                     local_bit,
                     tid,
@@ -20188,6 +20922,12 @@ __global__ void rocm_moe_prefill_group_cast_count_kernel(
     if (!runtime->route_expert_ids || !runtime->route_weights || !runtime->route_participant_ids) return;
     if (runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots)) return;
 
+        if (runtime->intermediate_shard.enabled() !=
+            (expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard))
+        {
+            fail_fast_incomplete_llep_transfer();
+            return;
+        }
     int expert_id = -1;
     float weight = 0.0f;
     int participant_id = -1;
@@ -20200,7 +20940,8 @@ __global__ void rocm_moe_prefill_group_cast_count_kernel(
             expert_id = -1;
             weight = 0.0f;
         }
-        else if (filter_to_local_runtime_experts != 0)
+        else if (filter_to_local_runtime_experts != 0 ||
+                    expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard)
         {
             /*
              * Keep the global StaticOwner assignment distinct from this
@@ -20210,7 +20951,9 @@ __global__ void rocm_moe_prefill_group_cast_count_kernel(
             const uint32_t execution_bank = runtime_execution_bank(runtime);
             const DeviceMoEPlacementBankView &bank =
                 runtime_placement_banks(runtime)[execution_bank];
-            participant_id = runtime_expert_owner(bank, expert_id);
+            participant_id = expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                            ? runtime_intermediate_shard_row(runtime, bank, expert_id).participant
+                            : runtime_expert_owner(bank, expert_id);
             if (participant_id !=
                     static_cast<int>(runtime->participant_id) ||
                 !rocm_moe_prefill_static_local_ready(
@@ -21115,8 +21858,8 @@ __global__ __launch_bounds__(256) void rocm_moe_prefill_llep_assign_routes_from_
  *
  * Grouped prefill needs both products from the same complete placement bank.
  * Producing them in ordered 256-id chunks within one block removes a redundant launch;
- * grouped decode passes no active-list destination and retains descriptor-only
- * publication through the same kernel.
+ * full-domain descriptor diagnostics omit the active-list destination. Decode
+ * instead publishes only its selected packet through the shared lane helper.
  * @param runtime Actual participant runtime with its retained selected placement bank.
  * @param gate_descs Full original gate descriptor output.
  * @param up_descs Full original up descriptor output.
@@ -21206,12 +21949,14 @@ __global__ void rocm_moe_materialize_runtime_floating_descriptor_tables_kernel(
     llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ gate_descs,
     llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ up_descs,
     llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ down_descs, int num_experts,
-    llaminar2::DeviceMoEWeightFormat expected_format)
+    llaminar2::DeviceMoEWeightFormat expected_format,
+    llaminar2::DeviceMoEProjectionSet expected_projections)
 {
     const uint32_t execution_bank = runtime_execution_bank(runtime);
     if (!runtime || !gate_descs || !up_descs || !down_descs || num_experts <= 0 ||
         num_experts > kDeviceMoEMaxExperts || execution_bank > 1u ||
-        !llaminar2::deviceMoEWeightFormatIsFloating(expected_format))
+        !llaminar2::deviceMoEWeightFormatIsFloating(expected_format) ||
+        runtime->intermediate_shard.enabled() != (expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard))
     {
         if (threadIdx.x == 0)
             fail_fast_incomplete_llep_transfer();
@@ -21226,8 +21971,11 @@ __global__ void rocm_moe_materialize_runtime_floating_descriptor_tables_kernel(
         const DeviceMoEPlacementBankView &bank = runtime_placement_banks(runtime)[execution_bank];
         const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
         const uint32_t local_bit =
-            runtime_participant_bit(static_cast<int>(runtime->participant_id));
-        const bool local_ready = bank.local_compute_mask[expert] != 0u &&
+            runtime->intermediate_shard.enabled() ? 0u : runtime_participant_bit(static_cast<int>(runtime->participant_id));
+        const bool local_ready = expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+            ? runtime_intermediate_shard_row(runtime, bank, expert).disposition ==
+                  llaminar2::MoEIntermediateShardRowDisposition::Local && desc.weight_format == expected_format
+            : bank.local_compute_mask[expert] != 0u &&
                                  (bank.resident_participant_mask[expert] & local_bit) != 0u &&
                                  desc.local_slot >= 0 && desc.weight_format == expected_format &&
                                  desc.floating_gate.valid() && desc.floating_up.valid() &&
@@ -22796,14 +23544,56 @@ bool hipMoE_assign_prefill_routes_from_llep_current_batch_plan_after_transfers(
     return true;
 }
 
+/**
+ * @brief Publish this decode packet's descriptors without scanning source capacity.
+ * @param runtime Device runtime retaining the acquired placement epoch.
+ * @param expert_ids Exact device ID packet also consumed by gate/up and down.
+ * @param gate_descs Stable full-domain gate storage; only selected IDs are written.
+ * @param up_descs Stable full-domain up storage; only selected IDs are written.
+ * @param down_descs Stable full-domain down storage; only selected IDs are written.
+ * @param num_experts Admitted logical table extent for bounds validation.
+ * @param top_k Actual packet width, not expert or workspace capacity.
+ * @param format Original descriptor scalar family; no conversion is performed.
+ * @param device_idx Original local device ordinal.
+ * @param stream Exact producer/consumer stream retained by capture.
+ * @param projections Original movable projection ownership contract.
+ * @return Whether admission and native submission succeeded.
+ */
+__attribute__((visibility("default"))) bool hipMoE_materialize_runtime_selected_decode_descriptors(
+    const void *runtime, const int *expert_ids,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs, llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs, int num_experts, int top_k,
+    llaminar2::DeviceMoEWeightFormat format, int device_idx, void *stream,
+    llaminar2::DeviceMoEProjectionSet projections)
+{
+    if (!runtime || !expert_ids || !gate_descs || !up_descs || !down_descs || !stream ||
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kDeviceMoEMaxTopK || top_k > num_experts ||
+        !llaminar2::deviceMoEProjectionSetValid(projections) ||
+        (format != llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
+         !llaminar2::deviceMoEWeightFormatIsFloating(format))) return false;
+    llaminar2::HipDeviceGuard::setDevice(device_idx);
+    hipLaunchKernelGGL(rocm_moe_materialize_runtime_selected_decode_descriptors_kernel, dim3(1), dim3(top_k), 0,
+        static_cast<hipStream_t>(stream),
+        static_cast<const DeviceMoELayerRuntimeView *>(runtime), expert_ids,
+        reinterpret_cast<DeviceNativeQuantisedMatrixDescView *>(gate_descs), reinterpret_cast<DeviceNativeQuantisedMatrixDescView *>(up_descs), reinterpret_cast<DeviceNativeQuantisedMatrixDescView *>(down_descs), num_experts, top_k, format, projections);
+    const hipError_t error = hipGetLastError();
+    if (error != hipSuccess)
+    {
+        fprintf(stderr, "HIP MoE selected decode descriptor publication failed: %s\n", hipGetErrorString(error));
+        return false;
+    }
+    return true;
+}
+
 __attribute__((visibility("default"))) bool hipMoE_materialize_runtime_prefill_descriptor_tables(
     const void *runtime,
-    DeviceNativeQuantisedMatrixDescView *gate_descs,
-    DeviceNativeQuantisedMatrixDescView *up_descs,
-    DeviceNativeQuantisedMatrixDescView *down_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+    llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
     int num_experts,
     int device_idx,
-    void *stream)
+    void *stream, llaminar2::DeviceMoEProjectionSet expected_projections)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
     (void)hipGetLastError();
@@ -22819,16 +23609,16 @@ __attribute__((visibility("default"))) bool hipMoE_materialize_runtime_prefill_d
     hipLaunchKernelGGL(rocm_moe_materialize_runtime_prefill_descriptor_tables_kernel,
         dim3(1), dim3(kActiveExpertThreads), 0, hip_stream,
         static_cast<DeviceMoELayerRuntimeView *>(const_cast<void *>(runtime)),
-        gate_descs,
-        up_descs,
-        down_descs,
+        reinterpret_cast<DeviceNativeQuantisedMatrixDescView *>(gate_descs),
+        reinterpret_cast<DeviceNativeQuantisedMatrixDescView *>(up_descs),
+        reinterpret_cast<DeviceNativeQuantisedMatrixDescView *>(down_descs),
         num_experts,
         /*active_expert_ids=*/nullptr,
         /*max_active_experts=*/0,
         /*current_slots=*/0,
         /*publish_prefill_histogram=*/0,
         llaminar2::DeviceMoEWeightFormat::NativeQuantised,
-        llaminar2::DeviceMoEProjectionSet::CompleteExpert);
+        expected_projections);
 
     hipError_t err = hipGetLastError();
     if (err != hipSuccess)
@@ -22850,7 +23640,7 @@ __attribute__((visibility("default"))) bool hipMoE_materialize_runtime_floating_
     int num_experts,
     llaminar2::DeviceMoEWeightFormat format,
     int device_idx,
-    void *stream)
+    void *stream, llaminar2::DeviceMoEProjectionSet expected_projections)
 {
     if (!runtime || !gate_descs || !up_descs || !down_descs || !stream ||
         num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
@@ -22873,7 +23663,7 @@ __attribute__((visibility("default"))) bool hipMoE_materialize_runtime_floating_
         up_descs,
         down_descs,
         num_experts,
-        format);
+        format, expected_projections);
 
     const hipError_t err = hipGetLastError();
     if (err != hipSuccess)

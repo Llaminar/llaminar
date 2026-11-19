@@ -57,7 +57,7 @@ namespace llaminar2
             throw std::invalid_argument("Pipeline expert binding requires one initial residency and histogram authority");
         const auto &prepared_owners = owners.residency->initialOwnerMap();
         const auto &initial_owners = snapshot->originalOwnerMap();
-        if (snapshot->ownershipKind() == MoEOverlayResidencyOwnershipKind::CPUJointFragments)
+        if (snapshot->ownershipKind() == MoEOverlayResidencyOwnershipKind::JointFragments)
         {
             // Joint banks borrow the same source-owned fragment map. The scalar
             // snapshot arm is deliberately empty and cannot certify these banks.

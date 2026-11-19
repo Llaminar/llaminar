@@ -10,6 +10,7 @@
  */
 #include "KernelFactory.h"
 #include "loaders/gpu_pipeline/LoadOrchestrator.h"
+#include "loaders/BoundedGPUExpertSource.h"
 #include "tensors/TensorClasses.h"
 #ifdef HAVE_CUDA
 #include "cuda/gemm/CUDAFloatingPointGemmKernel.h"
@@ -117,8 +118,7 @@ namespace llaminar::v2::kernels
         }
         else
         {
-            const auto *unpackable = dynamic_cast<const IINT8Unpackable *>(&tensor);
-            const auto *source = unpackable ? unpackable->vnniFormatInfo() : nullptr;
+            const auto *source = gpuWeightSourceFormat(tensor);
             if (!source || k % 32 != 0)
                 throw std::invalid_argument("GPU weight-pool GEMM requires a supported complete NativeQuantised matrix");
             const auto allocation = gpuPreparedWeightPoolAllocation(*source, layout);

@@ -218,6 +218,7 @@ TEST(AutomaticPlanningDiagnostics, CompleteAdmissionAndSelectionRetainAllWorkWit
             "Resolved domain '",
             "[TensorParallelConfig] GQA replication:",
             "[MoEOverlayCapacity] fixed component BOM device=",
+            "[MoEOverlayCapacity] captured inventory rank=",
             "[MoEExpertOverlayRuntimePlan] Resolved overlay topology:",
             "MoE expert overlay runtime plan:"})
         {

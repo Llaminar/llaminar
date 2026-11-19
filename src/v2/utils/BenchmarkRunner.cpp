@@ -601,6 +601,9 @@ nlohmann::json observeFixedNativePipelineTerminal(const IOrchestrationRunner& ru
             {"gdn_output", "normalization_submission"},
             {"kernel", "gdn_projection_route"},
             {"kernel", "hc_up_projection_submissions"},
+            // The grouped expert program publishes its selected reader and row
+            // geometry when recorded. Replaying the graph does not call the launcher.
+            {"kernel", "rocm_grouped_ffn_frontier_calls"},
             {"weight_loading", "gdn_projection_arithmetic_prepared_weight"},
             {"weight_loading", "moe_router_arithmetic_prepared_weight"},
             {"kernel", "cpu_moe_fp16_operand_router_calls"},

@@ -64,72 +64,103 @@ namespace llaminar2
                 "GPU blob chunk protocol requires non-zero staging capacity");
     }
 
-    bool ExpertTierGpuBlobChunkProtocol::begin(
-        const GpuExpertPackedDescriptor &source,
-        const GpuExpertPackedDescriptor &destination,
-        std::string *error) noexcept
+    void ExpertTierGpuBlobChunkProtocol::reset() noexcept
     {
         begun_ = false;
         region_bytes_.fill(0);
+        element_bytes_.fill(0);
+        intersection_.reset();
         region_index_ = 0;
         region_offset_ = 0;
         total_bytes_ = 0;
         submitted_bytes_ = 0;
         next_sequence_ = 0;
-
-        if (!gpuExpertPackedDescriptorsCompatible(source, destination) ||
-            !descriptorPointersCoverRegions(source) ||
-            !descriptorPointersCoverRegions(destination))
-        {
-            assignBlobTransferError(
-                error,
-                "GPU blob transfer requires byte-compatible complete descriptors");
-            return false;
-        }
-
-        region_bytes_ = {
-            source.vnni_bytes,
-            source.scales_bytes,
-            source.mins_bytes,
-            source.emins_bytes,
-        };
-        total_bytes_ = std::accumulate(
-            region_bytes_.begin(),
-            region_bytes_.end(),
-            std::size_t{0});
-        if (total_bytes_ == 0)
-        {
-            assignBlobTransferError(error, "GPU blob transfer is empty");
-            return false;
-        }
-
-        begun_ = true;
-        seekNextNonEmptyRegion();
-        return true;
     }
 
-    bool ExpertTierGpuBlobChunkProtocol::beginContiguous(
-        std::size_t bytes,
-        std::string *error) noexcept
+    bool ExpertTierGpuBlobChunkProtocol::begin(
+        const GpuExpertPackedDescriptor& source,
+        const GpuExpertPackedDescriptor& destination, std::string* error) noexcept
     {
-        begun_ = false;
-        region_bytes_.fill(0);
-        region_index_ = 0;
-        region_offset_ = 0;
-        total_bytes_ = 0;
-        submitted_bytes_ = 0;
-        next_sequence_ = 0;
-        if (bytes == 0)
-        {
-            assignBlobTransferError(
-                error,
-                "GPU blob contiguous transfer requires non-zero bytes");
+        reset();
+        if(!gpuExpertPackedDescriptorsCompatible(source,destination)) {
+            assignBlobTransferError(error,"GPU blob transfer requires compatible whole descriptors");
             return false;
         }
-        region_bytes_[regionIndex(ExpertTierGpuBlobRegion::Payload)] = bytes;
-        total_bytes_ = bytes;
-        begun_ = true;
-        return true;
+        try {
+            const MoEExpertProjectionOwnership::Projection whole{
+                MoEProjectionResidence::ExpertOwner,source.n,source.k,0,source.n,0,source.k};
+            return begin(source,destination,ExpertTierWeightProjectionIntersection::between(whole,whole),error);
+        } catch(const std::exception& exception) {
+            assignBlobTransferError(error,exception.what());return false;
+        }
+    }
+
+    bool ExpertTierGpuBlobChunkProtocol::begin(
+        const GpuExpertPackedDescriptor& source, const GpuExpertPackedDescriptor& destination,
+        const ExpertTierWeightProjectionIntersection& intersection, std::string* error) noexcept
+    {
+        reset();
+        if(!source.valid() || !destination.valid() || !descriptorPointersCoverRegions(source) ||
+            !descriptorPointersCoverRegions(destination) || source.codebook_id!=destination.codebook_id ||
+            source.payload_bytes_per_block!=destination.payload_bytes_per_block ||
+            source.is_asymmetric!=destination.is_asymmetric || source.has_emins!=destination.has_emins ||
+            source.n!=intersection.source().rows || source.k!=intersection.source().columns ||
+            destination.n!=intersection.destination().rows || destination.k!=intersection.destination().columns ||
+            source.k%32 || destination.k%32 || source.blocks_per_row!=unsigned(source.k/32) ||
+            destination.blocks_per_row!=unsigned(destination.k/32)) {
+            assignBlobTransferError(error,"GPU blob intersection requires compatible formats and original root geometry");
+            return false;
+        }
+        const std::array<std::size_t,4> elements{source.payload_bytes_per_block,sizeof(uint16_t),
+            source.is_asymmetric?sizeof(uint16_t):0u,source.has_emins?sizeof(uint32_t):0u};
+        const std::array source_bytes{source.vnni_bytes,source.scales_bytes,source.mins_bytes,source.emins_bytes};
+        const std::array destination_bytes{destination.vnni_bytes,destination.scales_bytes,destination.mins_bytes,destination.emins_bytes};
+        for(std::size_t region=0;region<elements.size();++region) {
+            if(elements[region] && !expertTierProjectionByteRange(intersection,
+                ExpertTierProjectionByteOrder::NativeGPUBlocks,elements[region],0,chunk_capacity_bytes_)) {
+                assignBlobTransferError(error,"GPU blob intersection is empty, unaligned or overflows its native root");
+                reset();return false;
+            }
+            if(source_bytes[region]!=source.blockCount()*elements[region] ||
+               destination_bytes[region]!=destination.blockCount()*elements[region]) {
+                assignBlobTransferError(error,"GPU blob plane bytes disagree with their original native root");
+                reset();return false;
+            }
+            region_bytes_[region]=std::size_t(intersection.rows())*(intersection.columns()/32)*elements[region];
+            if(region_bytes_[region]>std::numeric_limits<std::size_t>::max()-total_bytes_) {
+                assignBlobTransferError(error,"GPU blob compact byte total overflow");reset();return false;
+            }
+            total_bytes_+=region_bytes_[region];
+        }
+        intersection_=intersection;order_=ExpertTierProjectionByteOrder::NativeGPUBlocks;
+        element_bytes_=elements;begun_=true;seekNextNonEmptyRegion();
+        if(error)error->clear();return true;
+    }
+
+    bool ExpertTierGpuBlobChunkProtocol::beginFloating(
+        const ExpertTierWeightProjectionIntersection& intersection,
+        std::size_t element_bytes, std::string* error) noexcept
+    {
+        reset();
+        if((element_bytes!=2 && element_bytes!=4) || !expertTierProjectionByteRange(intersection,
+            ExpertTierProjectionByteOrder::FloatingRows,element_bytes,0,chunk_capacity_bytes_)) {
+            assignBlobTransferError(error,"GPU floating intersection requires a bounded FP16/BF16/FP32 rectangle");
+            return false;
+        }
+        intersection_=intersection;order_=ExpertTierProjectionByteOrder::FloatingRows;
+        element_bytes_[0]=element_bytes;
+        total_bytes_=region_bytes_[0]=std::size_t(intersection.rows())*intersection.columns()*element_bytes;
+        begun_=true;if(error)error->clear();return true;
+    }
+
+    bool ExpertTierGpuBlobChunkProtocol::beginContiguous(std::size_t bytes,std::string* error) noexcept
+    {
+        reset();
+        if(!bytes) {
+            assignBlobTransferError(error,"GPU blob contiguous transfer requires non-zero bytes");return false;
+        }
+        region_bytes_[0]=bytes;total_bytes_=bytes;begun_=true;
+        if(error)error->clear();return true;
     }
 
     void ExpertTierGpuBlobChunkProtocol::seekNextNonEmptyRegion() noexcept
@@ -145,16 +176,24 @@ namespace llaminar2
     std::optional<ExpertTierGpuBlobChunk>
     ExpertTierGpuBlobChunkProtocol::takeNext() noexcept
     {
-        if (exhausted())
+        if (!begun_ || exhausted())
             return std::nullopt;
 
         const std::size_t remaining =
             region_bytes_[region_index_] - region_offset_;
-        const std::size_t bytes =
-            std::min(chunk_capacity_bytes_, remaining);
+        auto range=std::optional<ExpertTierProjectionByteRange>{ExpertTierProjectionByteRange{
+            region_offset_,region_offset_,std::min(chunk_capacity_bytes_,remaining)}};
+        if(intersection_)range=expertTierProjectionByteRange(*intersection_,order_,
+            element_bytes_[region_index_],region_offset_,chunk_capacity_bytes_);
+        // begin() proved every root, stride and extent. Losing a range here is
+        // an internal protocol defect; it cannot silently truncate a transfer.
+        if(!range)std::terminate();
+        const auto bytes=range->bytes;
         ExpertTierGpuBlobChunk chunk{
             .region = static_cast<ExpertTierGpuBlobRegion>(region_index_),
             .region_offset = region_offset_,
+            .source_offset = range->source_offset,
+            .destination_offset = range->destination_offset,
             .bytes = bytes,
             .sequence = next_sequence_++,
         };
@@ -368,8 +407,25 @@ namespace llaminar2
     }
 
     bool ExpertTierGpuBlobTransferLane::start(
+        const GpuExpertPackedDescriptor& source,const GpuExpertPackedDescriptor& destination,
+        const ExpertTierSourceReadiness& source_readiness,std::string* error) noexcept
+    {
+        if(!gpuExpertPackedDescriptorsCompatible(source,destination)) {
+            assignBlobTransferError(error,"GPU blob transfer requires compatible whole descriptors");return false;
+        }
+        try {
+            const MoEExpertProjectionOwnership::Projection whole{
+                MoEProjectionResidence::ExpertOwner,source.n,source.k,0,source.n,0,source.k};
+            return start(source,destination,ExpertTierWeightProjectionIntersection::between(whole,whole),source_readiness,error);
+        } catch(const std::exception& exception) {
+            assignBlobTransferError(error,exception.what());return false;
+        }
+    }
+
+    bool ExpertTierGpuBlobTransferLane::start(
         const GpuExpertPackedDescriptor &source,
         const GpuExpertPackedDescriptor &destination,
+        const ExpertTierWeightProjectionIntersection& intersection,
         const ExpertTierSourceReadiness &source_readiness,
         std::string *error) noexcept
     {
@@ -388,7 +444,7 @@ namespace llaminar2
                 "GPU host-relay lane is already occupied");
             return false;
         }
-        if (!protocol_.begin(source, destination, error))
+        if (!protocol_.begin(source, destination, intersection, error))
             return false;
 
         source_ = source;
@@ -397,6 +453,29 @@ namespace llaminar2
         contiguous_destination_ = nullptr;
         carries_contiguous_projection_ = false;
         return beginTransfer(source_readiness, error);
+    }
+
+    bool ExpertTierGpuBlobTransferLane::startFloating(
+        const ContiguousFloatingPointWeightDescriptor& source,
+        const ContiguousFloatingPointWeightDescriptor& destination,
+        const ExpertTierWeightProjectionIntersection& intersection,
+        const ExpertTierSourceReadiness& source_readiness,std::string* error) noexcept
+    {
+        if(!materialized() || progress_==ExpertTierGpuBlobTransferProgress::Pending ||
+            progress_==ExpertTierGpuBlobTransferProgress::Failed) {
+            assignBlobTransferError(error,"GPU host-relay lane is unavailable or occupied");return false;
+        }
+        if(!source.valid() || !destination.valid() || source.type!=destination.type ||
+            source.n!=intersection.source().rows || source.k!=intersection.source().columns ||
+            destination.n!=intersection.destination().rows || destination.k!=intersection.destination().columns ||
+            !protocol_.beginFloating(intersection,source.type==TensorType::FP32?4:2,error)) {
+            assignBlobTransferError(error,"GPU floating relay disagrees with its original projection roots");return false;
+        }
+        source_={};destination_={};
+        contiguous_source_=static_cast<const std::uint8_t*>(source.data);
+        contiguous_destination_=static_cast<std::uint8_t*>(const_cast<void*>(destination.data));
+        carries_contiguous_projection_=true;
+        return beginTransfer(source_readiness,error);
     }
 
     bool ExpertTierGpuBlobTransferLane::startContiguous(
@@ -578,7 +657,7 @@ namespace llaminar2
         {
             return chunk.region == ExpertTierGpuBlobRegion::Payload &&
                            contiguous_source_
-                       ? contiguous_source_ + chunk.region_offset
+                       ? contiguous_source_ + chunk.source_offset
                        : nullptr;
         }
         const std::uint8_t *base = nullptr;
@@ -597,7 +676,7 @@ namespace llaminar2
             base = static_cast<const std::uint8_t *>(source_.ptrs.d_emins);
             break;
         }
-        return base ? base + chunk.region_offset : nullptr;
+        return base ? base + chunk.source_offset : nullptr;
     }
 
     std::uint8_t *ExpertTierGpuBlobTransferLane::destinationChunkPointer(
@@ -607,7 +686,7 @@ namespace llaminar2
         {
             return chunk.region == ExpertTierGpuBlobRegion::Payload &&
                            contiguous_destination_
-                       ? contiguous_destination_ + chunk.region_offset
+                       ? contiguous_destination_ + chunk.destination_offset
                        : nullptr;
         }
         std::uint8_t *base = nullptr;
@@ -626,7 +705,7 @@ namespace llaminar2
             base = static_cast<std::uint8_t *>(destination_.ptrs.d_emins);
             break;
         }
-        return base ? base + chunk.region_offset : nullptr;
+        return base ? base + chunk.destination_offset : nullptr;
     }
 
     bool ExpertTierGpuBlobTransferLane::enqueueSourceChunk(

@@ -13,6 +13,7 @@
 #include "backends/IWorkerGPUContext.h"
 #include "execution/compute_stages/stages/HiddenStateRowsSelectStage.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
+#include "execution/mtp/MTPShiftedCacheOrigin.h"
 #include "tensors/Tensors.h"
 #include "transfer/TransferEngine.h"
 
@@ -167,10 +168,75 @@ void proveVisibleBootstrap(DeviceId device)
         }
     });
 }
+
+/** @brief Replay the exact serial shifted-input normalizer for both immutable cache origins. */
+void proveShiftedTargetCachePosition(DeviceId device)
+{
+    auto *backend = getBackendFor(device);
+    if (!backend || backend->deviceCount() <= device.ordinal)
+        GTEST_SKIP() << "Requested backend unavailable";
+    if (!hasCPUBackend())
+        initCPUBackend(-1);
+    auto &worker = GPUDeviceContextPool::instance().getContext(device);
+    worker.submitAndWait([&] {
+        void *stream = worker.defaultStream();
+        ASSERT_NE(stream, nullptr);
+        INT32Tensor token({1}), cache({1}), emitted_token({1}), position({1});
+        for (auto *tensor : {&token, &cache, &emitted_token, &position})
+            TransferEngine::prepareDeviceInput(tensor, device, stream);
+        const auto address = [](INT32Tensor &tensor) { return static_cast<int32_t *>(tensor.gpu_data_ptr()); };
+        const std::array origins{
+            MTPShiftedCacheOrigin::VisibleZeroHiddenTokenZero,
+            MTPShiftedCacheOrigin::SuccessorPairsOnly,
+        };
+        const std::array expected_displacements{0, 1};
+        for (std::size_t index = 0; index < origins.size(); ++index)
+        {
+            SCOPED_TRACE(index);
+            const int displacement = mtpShiftedPrefixOffset(origins[index]);
+            ASSERT_EQ(displacement, expected_displacements[index]);
+            auto graph = worker.createGraphCapture(stream);
+            ASSERT_TRUE(graph);
+            {
+                ScopedBackendGraphCapture recording(worker, *graph, "shifted target cache position");
+                ASSERT_TRUE(recording.begin());
+                ASSERT_TRUE(backend->enqueuePrepareMTPBatchedSidecarInputs(
+                    address(token), 1, address(cache), displacement, 1, device.ordinal,
+                    stream, address(emitted_token), address(position)));
+                recording.finish();
+            }
+            ASSERT_EQ(graph->nodeCount(), 1u);
+            ASSERT_TRUE(graph->instantiate());
+            for (const int frontier : {64, 13248, 0, 1})
+            {
+                SCOPED_TRACE(frontier);
+                const int32_t cached = frontier;
+                const int32_t source = 200 + frontier;
+                int32_t observed_position = -1;
+                int32_t observed_token = -1;
+                ObservationRetirement retirement{backend, device, stream};
+                ASSERT_TRUE(backend->hostToDeviceOnStream(address(token), &source, sizeof(source), device.ordinal, stream));
+                ASSERT_TRUE(backend->hostToDeviceOnStream(address(cache), &cached, sizeof(cached), device.ordinal, stream));
+                ASSERT_TRUE(graph->launchOnStream(stream));
+                ASSERT_TRUE(backend->deviceToHostOnStream(&observed_token, address(emitted_token), sizeof(observed_token), device.ordinal, stream));
+                ASSERT_TRUE(backend->deviceToHostOnStream(&observed_position, address(position), sizeof(observed_position), device.ordinal, stream));
+                ASSERT_TRUE(backend->synchronizeStream(stream, device.ordinal));
+                EXPECT_EQ(observed_token, source);
+                EXPECT_EQ(observed_position, frontier + expected_displacements[index]);
+                EXPECT_EQ(graph->nodeCount(), 1u);
+            }
+        }
+    });
+}
 } // namespace
 
 /** @brief CUDA executes the actual QFN bootstrap transaction on a retained native graph. */
 TEST(Qwen4ExpVisibleBootstrapNative, CUDA){proveVisibleBootstrap(DeviceId::cuda(0));}
 /** @brief ROCm executes the same lifecycle and exact payload oracle on a retained native graph. */
 TEST(Qwen4ExpVisibleBootstrapNative, ROCm){proveVisibleBootstrap(DeviceId::rocm(0));}
+
+/** @test Captured CUDA serial shifted-input coordinates preserve both cache origins. */
+TEST(MTPShiftedTargetCachePositionNative, CUDA){proveShiftedTargetCachePosition(DeviceId::cuda(0));}
+/** @test Captured ROCm serial shifted-input coordinates preserve both cache origins. */
+TEST(MTPShiftedTargetCachePositionNative, ROCm){proveShiftedTargetCachePosition(DeviceId::rocm(0));}
 } // namespace llaminar2::test

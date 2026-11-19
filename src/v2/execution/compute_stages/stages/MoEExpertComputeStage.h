@@ -1,14 +1,13 @@
 /**
  * @file MoEExpertComputeStage.h
- * @brief Unified MoE FFN stage: route → expert SwiGLU → combine
+ * @brief Routed expert arithmetic and explicitly scoped shared-expert contributions.
  *
- * Implements the full MoE feed-forward block as a single stage:
- * 1. Router: hidden × gate_weights → softmax → top-k selection
- * 2. Expert FFN: per-expert SwiGLU (gate, up, down) with gather/scatter
- * 3. Combine: weighted sum of expert outputs
- *
- * This is implemented as a single stage because routing creates dynamic
- * control flow that cannot be expressed as a static compute graph.
+ * Reusable graph builders own routing, participant placement and collective
+ * edges. These stages bind prepared projection engines and graph-owned scratch
+ * to the selected backend arithmetic. Shared output is explicitly either an
+ * existing complete contribution or a participant-local F partial; the latter
+ * must pass through local gating/addition and the declared FFN sum before a
+ * graph may publish the complete FFN result.
  */
 
 #pragma once
@@ -425,7 +424,7 @@ namespace llaminar2
             // packed_*_lifetime keeps the shared GPU allocation alive.
             std::vector<std::shared_ptr<ITensorGemm>> moe_owned_kernels;
             /** Original selected source triplets and native engines; never a whole-owner alias. */
-            std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> cpu_joint_layer;
+            std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::JointLayer> cpu_joint_layer;
             std::shared_ptr<void> moe_packed_gate_lifetime;
             std::shared_ptr<void> moe_packed_up_lifetime;
             std::shared_ptr<void> moe_packed_down_lifetime;
@@ -779,7 +778,7 @@ namespace llaminar2
             /** Exact CPU-only hidden rows borrowed for this host packet. */
             CPUTransportedHiddenRows cpu_transported_hidden;
             /** Exact acquired fixed-family CPU fragment epoch; copied as an RCU reader until GEMM completes. */
-            const MoEOverlayParticipantResidencyRegistry::CPUJointLayer* cpu_joint_epoch=nullptr;
+            const MoEOverlayParticipantResidencyRegistry::JointLayer* cpu_joint_epoch=nullptr;
         };
 
         /**
@@ -2038,6 +2037,13 @@ namespace llaminar2
         std::vector<GpuDirectTransferCompletion> pending_gpu_direct_transfers_;
     };
 
+    /** @brief Numerical scope of a shared-expert H publication, independent of storage capacity. */
+    enum class SharedExpertOutputRole : uint8_t
+    {
+        CompleteContribution, ///< Existing complete shared output for this execution domain.
+        ParticipantLocalPartial ///< Local F contribution; requires the following explicit FFN sum.
+    };
+
     /**
      * @brief Shared expert FFN stage: always-active dense SwiGLU
      *
@@ -2077,6 +2083,8 @@ namespace llaminar2
             int seq_len = 0;
             int d_model = 0;
             int intermediate = 0;
+            SharedExpertOutputRole output_role = SharedExpertOutputRole::CompleteContribution;
+            MoEOverlayServicePhaseHint phase = MoEOverlayServicePhaseHint::Auto; ///< Required for a local-partial graph.
 
             BufferId input_buffer_id = BufferId::NORMALIZED;
             BufferId output_buffer_id = BufferId::MOE_SHARED_EXPERT_OUTPUT;
@@ -2125,7 +2133,17 @@ namespace llaminar2
             PreparedWeightStore *prepared_store = nullptr;
         };
 
+        /**
+         * @brief Bind original prepared shared projections and the declared publication scope.
+         * @param params Immutable source, arena, count and arithmetic policy.
+         * @throws std::invalid_argument For an unknown scope/phase or a local partial without an explicit GPU phase.
+         */
         explicit SharedExpertFFNStage(Params params);
+        /** @return Original immutable graph declaration, never live execution state. */
+        [[nodiscard]] const Params &declaration() const noexcept { return params_; }
+        /** @return Numerical publication role and explicit phase in captured graph identity. */
+        uint64_t graphCaptureVariantSignature() const override;
+
 
         bool execute(IDeviceContext *ctx) override;
         bool validatePreparedWeights(std::string *error) const override;
@@ -2405,7 +2423,7 @@ namespace llaminar2
          */
         enum class ExecutionRole
         {
-            ReplicatedOwner, ///< Every graph owns a complete shared row.
+            ReplicatedOwner, ///< Every graph owns its declared shared contribution and gate arithmetic.
             RootOwner,       ///< This graph owns the rooted reduction result.
             NonRootObserver  ///< Symmetric graph node with no tensor authority.
         };
@@ -2427,6 +2445,9 @@ namespace llaminar2
             TensorBase *combined_output = nullptr;
             int seq_len = 0;
             int d_model = 0;
+            SharedExpertOutputRole output_role = SharedExpertOutputRole::CompleteContribution;
+            MoEOverlayServicePhaseHint phase = MoEOverlayServicePhaseHint::Auto; ///< Same explicit phase as both local producers.
+
             /**
              * @brief Device-owned logical row count for variable-row GPU graphs.
              *
@@ -2449,10 +2470,15 @@ namespace llaminar2
         /**
          * @brief Construct the shared-expert sigmoid gate stage.
          * @param params Immutable weights, graph buffers, and device row geometry.
-         * @throws std::invalid_argument if a supplied input gate is not FP32;
-         *         model-weight preparation owns that normalization on every backend.
+         * @throws std::invalid_argument If the gate is not FP32, a device-owned count is bound to CPU,
+         *         or local-partial publication lacks a GPU owner, phase, fused outputs or local arithmetic role.
+         *         Model-weight preparation owns gate normalization on every backend.
          */
         explicit SharedExpertGateStage(Params params);
+        /** @return Numerical publication scope and phase in captured graph identity. */
+        uint64_t graphCaptureVariantSignature() const override;
+        /** @return Original immutable local arithmetic and arena declaration. */
+        [[nodiscard]] const Params &declaration() const noexcept { return params_; }
 
         bool execute(IDeviceContext *ctx) override;
         ComputeStageType type() const override { return ComputeStageType::MOE_SHARED_EXPERT_GATE; }

@@ -30,7 +30,7 @@ namespace llaminar2
     {
         /**
          * @brief Load the exact configured NCCL dependency with isolated symbols.
-         * @param library_path Explicit nonempty library path, or nullptr for the
+         * @param library_path Explicit absolute library path, or nullptr for the
          *        LLAMINAR_NCCL_LIBRARY/NCCL_LIBRARY path selected by CMake.
          * @return True if the same path is already loaded or all mandatory
          *         entrypoints resolve; false for invalid/different selection or failure.

@@ -31,7 +31,7 @@ namespace llaminar2
 {
     namespace test { struct CPURootedPublicationTransportReplayAccess; }
     class MoECPUExpertShardRouteStage;
-    class CPUExpertShardSourceSelection;
+    class ExpertShardSourceSelection;
     struct MoEOverlaySparseRows;
 
     /** Communication operation governed by the same-node rooted policy. */
@@ -356,7 +356,7 @@ namespace llaminar2
          * The stage authenticates the original prepared bank and packet epoch first.
          */
         bool gatherReplicatedCPUExpertPrefillRoutesToRoot(
-            const CPUExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
+            const ExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
             const std::shared_ptr<IGlobalTPContext>& owner,const float* local,float* root,
             size_t capacity,int root_index,size_t& gathered,const std::string& stage,
             std::span<RootedFloatRecordRange> ranges,CPURootedPublicationTransport& selected);

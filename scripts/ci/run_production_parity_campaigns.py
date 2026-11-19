@@ -1134,6 +1134,15 @@ def preflight_hardware_qualification(
     return result
 
 
+def native_hardware_environment(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    """Use the original hardware ISA regardless of developer shell overrides."""
+    environment = os.environ.copy()
+    if overrides:
+        environment.update(overrides)
+    environment.pop("HSA_OVERRIDE_GFX_VERSION", None)
+    return environment
+
+
 def observe_preflight_hardware(build_dir: Path, timeout: float | None, *, shared_capacity: bool = False) -> dict:
     """Reuse the original native exporter, including its MPI and backend retirement.
 
@@ -1157,9 +1166,9 @@ def observe_preflight_hardware(build_dir: Path, timeout: float | None, *, shared
         path = Path(directory).resolve() / "hardware.json"
         option = "--shared-preflight-hardware-inventory" if shared_capacity else "--preflight-hardware-inventory"
         completed = subprocess.run([str(binary.resolve(strict=True)), f"{option}={path}"], check=True,
-            env={**os.environ, "HWLOC_COMPONENTS": "-gl,-opencl",
+            env=native_hardware_environment({"HWLOC_COMPONENTS": "-gl,-opencl",
                 "LLAMINAR_FORCE_CPU_ONLY_STARTUP": "0", "LLAMINAR_SKIP_CUDA_STARTUP": "0",
-                "LLAMINAR_SKIP_ROCM_STARTUP": "0"},
+                "LLAMINAR_SKIP_ROCM_STARTUP": "0"}),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             timeout=limit)
         if completed.stdout:
@@ -3589,10 +3598,7 @@ def _run_process(
 
     # The registered native workload must observe real hardware ISA identity,
     # including when a developer shell inherited an old homogeneous-host spoof.
-    environment = os.environ.copy()
-    if environment_overrides:
-        environment.update(environment_overrides)
-    environment.pop("HSA_OVERRIDE_GFX_VERSION", None)
+    environment = native_hardware_environment(environment_overrides)
     process = subprocess.Popen(
         command,
         start_new_session=True,
@@ -3840,9 +3846,10 @@ def _run_preflight_parallel_processes(
     deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     results: dict[PreflightExecutionLane, int] = {}
     failed = False
+    environment = native_hardware_environment()
     try:
         for lane, command in commands.items():
-            processes[lane] = subprocess.Popen(command, start_new_session=True)
+            processes[lane] = subprocess.Popen(command, start_new_session=True, env=environment)
         while len(results) != len(processes):
             for lane, process in processes.items():
                 if lane in results:

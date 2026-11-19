@@ -23,7 +23,7 @@ public:
  /** @param source Actual loader-derived original member and cohort.
   * @param backend Original declared CPU communication family.
   * @param domain Original declaration ordinal; no communicator is created. */
- explicit PaddedRootPlanningContext(std::shared_ptr<const CPUExpertShardSourceSelection> source,CollectiveBackendType backend,int domain):source_(std::move(source)),backend_(backend),domain_(domain) {
+ explicit PaddedRootPlanningContext(std::shared_ptr<const ExpertShardSourceSelection> source,CollectiveBackendType backend,int domain):source_(std::move(source)),backend_(backend),domain_(domain) {
   for(const auto& member:source_->cohort()->participants())ranks_.push_back(member.world_rank);
  }
  /** @return Original declared cohort population. */
@@ -48,7 +48,7 @@ public:
  /** @return Exact original source rank order. */
  const std::vector<int>& worldRanks()const override{return ranks_;}
 private:
- std::shared_ptr<const CPUExpertShardSourceSelection> source_;
+ std::shared_ptr<const ExpertShardSourceSelection> source_;
  std::vector<int> ranks_;
  CollectiveBackendType backend_;int domain_;int gathers_=0;
 };
@@ -72,7 +72,7 @@ void rootedPaddedPrefillContract(DeviceId device) {
   {.current_world_rank=0,.validate_mvp_root_reachability=false});ASSERT_TRUE(runtime);
  const auto original=std::make_shared<const MoEExpertOverlayPreparationPlan>(MoEExpertOverlayPreparationPlan::build(*runtime,loader));
  const auto local=original->filteredForDevice(DeviceId::cpu());ASSERT_FALSE(local.requests().empty());
- const auto selected=local.requests().front().cpu_joint_source;ASSERT_TRUE(selected);
+ const auto selected=local.requests().front().joint_source;ASSERT_TRUE(selected);
  const auto manifest=selected->cohort()->localManifest(selected->participantIndex());
  const auto prepared_bytes=6*MoEOverlayCapacityResolver::preparedFootprints({manifest}).front().cpu_live_bytes;
  size_t staging_bytes=0;
@@ -98,9 +98,9 @@ void rootedPaddedPrefillContract(DeviceId device) {
  auto residency=std::make_shared<MoEOverlayParticipantResidencyRegistry>(MoEOverlayParticipantResidencyRegistry::Config{
   .local_participant_ids={selected->participant().participant_id},.num_layers=1,.num_experts=experts,.initial_epoch=1,
   .projection_preparation=original,.first_model_layer=0,.original_model=model});
- std::string error;ASSERT_TRUE(residency->registerInitialCPUJointBank(manager.expertGemmRegistry(),model,
+ std::string error;ASSERT_TRUE(residency->registerInitialJointBank(manager.expertGemmRegistry(),model,
   selected->participant().participant_id,&error))<<error;
- const auto layer=residency->initialCPUJointLayer(selected->participant().participant_id,0);ASSERT_TRUE(layer);
+ const auto layer=residency->initialJointLayer(selected->participant().participant_id,0);ASSERT_TRUE(layer);
  auto arena=std::make_shared<MoELocalExpertSerialBufferArena>(MoELocalExpertSerialBufferArena::Config{
   .device_id=DeviceId::cpu(),.row_capacity=rows,.row_capacity_buckets={rows},.d_model=hidden,.routing_top_k=top_k,
   .cpu_canonical_route_storage=MoELocalExpertSerialBufferArena::CPUCanonicalRouteStoragePolicy::RetainSerialMaximum,

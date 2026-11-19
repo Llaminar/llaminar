@@ -1053,11 +1053,15 @@ or `observe` to collect demand information without moving them. The separate
 layout. Extra cached copies of experts are controlled by `--moe-hot-expert-cache`,
 which is off by default.
 
-On one homogeneous, rank-local multi-GPU tier, the automatic compute default
-is `gate-up-owned-down-columns`. This
-keeps gate/up weights movable while splitting each expert's down-output
-columns across the GPUs. It is a separate compute layout, not a movement
-setting. CPU, heterogeneous and multi-tier layouts keep whole-expert ownership.
+On one homogeneous, rank-local multi-GPU tier, automatic compute normally
+uses `gate-up-owned-down-columns`. It keeps gate/up weights movable while
+splitting each expert's down-output columns across the GPUs. For Qwen Flash
+Next with 640 intermediate columns, four MI50s serving the complete model
+in one stationary tier (`--moe-residency-maintenance off`) automatically
+use `tensor-sharded`. Each GPU owns 160 routed and 160 shared expert
+columns. Small FP32 reductions use direct peer transfer when the driver
+confirms every directed peer link. CPU, heterogeneous and multi-tier layouts
+keep whole-expert ownership.
 To compare against whole experts on the same GPU tier, use
 `--moe-routed-expert-compute apportioned` (or add `;expert_compute=apportioned`
 to that tier). Explicit layout choices always take precedence. Projection
@@ -1427,8 +1431,8 @@ new develop merge cancels any older image build. See [the CI workflow](docs/prod
 ### Build from source
 
 The recommended development environment is the repository's
-[devcontainer](.devcontainer/README.md). It supplies the toolchains and the
-patched NCCL/RCCL dependencies required for capture. Open it in VS Code and run
+[devcontainer](.devcontainer/README.md). It supplies the toolchains and patched NCCL. The local build command below
+prepares RCCL from the same pinned sources and settings as the runtime image. Open it in VS Code and run
 the Build Release or Build Integration task, or follow the
 [terminal/SSH workflow](.devcontainer/SSH_CODEX.md).
 
@@ -1438,6 +1442,7 @@ For a Release build inside that environment:
 LLAMINAR_NINJA_BIN="$(command -v ninja)"
 cmake -B build_v2_release -S src/v2 -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMINAR_BUILD_RCCL_FROM_SOURCE=ON \
   -DCMAKE_MAKE_PROGRAM:FILEPATH="${LLAMINAR_NINJA_BIN}"
 cmake --build build_v2_release --parallel
 ```

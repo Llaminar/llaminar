@@ -25,6 +25,7 @@
 
 namespace llaminar2
 {
+class HCBranchNormSingleQ8Publication;
 /** @brief Required typed arena tensor view, including an explicit byte offset.
  * @tparam Type Native scalar type; no execution-time conversions are permitted.
  */
@@ -124,6 +125,7 @@ public:
         /** Optional read-only transaction input publication; requires disjoint original input/output. */
         DiagnosticInputPublication diagnostic_input_publication = DiagnosticInputPublication::None;
         BranchNormInputRole input_role = BranchNormInputRole::Ordinary; ///< Immutable zero-preserving semantic role.
+        std::shared_ptr<HCBranchNormSingleQ8Publication> single_q8; ///< Explicit original HC-down bank producer; ordinary GPU M1 only.
         /**
          * @brief Declare the predictor's zero-preserving original hidden normalization.
          * @param hidden Per-branch width from the checked predictor geometry.
@@ -164,6 +166,21 @@ public:
     {
         int hidden; ///< Compute width H.
         Qwen4ExpFloatBinding residual, block, gateLogits, output; ///< [M,4H], [M,H], [M,4], [M,4H].
+    };
+    /**
+     * @brief Explicit residual publication with the immediately following branch normalization.
+     * @details Both original write bytes and normalized bytes are graph outputs.
+     * Only output may alias residual exactly; normalized is always disjoint.
+     * The builder supplies the authenticated next read's gain/epsilon and removes
+     * that read's standalone normalization only when its input edge is identical.
+     */
+    struct ResidualWriteBranchRMSNorm
+    {
+        int hidden; ///< Per-branch compute width H.
+        float epsilon; ///< Original next-normalization epsilon.
+        Qwen4ExpFloatBinding residual, block, gateLogits, output; ///< Original write operands/destination.
+        Qwen4ExpImmutableWeightBinding gain; ///< Actual next-read [4H] branch gain.
+        Qwen4ExpFloatBinding normalized; ///< Distinct persistent [M,4H] next-read normalization.
     };
     /** @brief Exact suffix hash from INT32 token IDs into packed INT64 lookup IDs.
      * @details outputWords is INT32 [M,32] backing for INT64 [M,16], with an
@@ -207,7 +224,7 @@ public:
         Qwen4ExpIntBinding outputTokens; ///< Distinct next [2] suffix bank.
     };
     /** @brief Closed operation set; absent operands cannot be represented. */
-    using Operation = std::variant<BranchRMSNorm, ResidualExpand, ResidualDown, ResidualRead, ResidualWrite,
+    using Operation = std::variant<BranchRMSNorm, ResidualExpand, ResidualDown, ResidualRead, ResidualWrite, ResidualWriteBranchRMSNorm,
                                    NgramHash, PLEGate, PLEConv, CommitConvHistory, CommitTokenHistory>;
     /** @brief Immutable graph configuration; no backend-specific switch is exposed. */
     struct Params
@@ -239,7 +256,10 @@ public:
     bool prepareGraphLaunch(IDeviceContext *context,void* stream) override;
     /** @brief Hash storage preparation belongs to capture admission, never a token replay. */
     GraphLaunchPreparationPolicy graphLaunchPreparationPolicy() const override
-    { return hash_prepared_?GraphLaunchPreparationPolicy::CaptureOnly:GraphLaunchPreparationPolicy::None; }
+    {
+        const auto* norm=std::get_if<BranchRMSNorm>(&params_.operation);
+        return hash_prepared_||(norm&&norm->single_q8)?GraphLaunchPreparationPolicy::CaptureOnly:GraphLaunchPreparationPolicy::None;
+    }
     /**
      * @brief Authenticate the original typed hash output without observing device values.
      * @param root Original packed-ID allocation. @param buffer Original arena role.

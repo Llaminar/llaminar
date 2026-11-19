@@ -1800,7 +1800,7 @@ namespace llaminar2::test
             const std::string prefix = source.substr(helper_pos, helper_end - helper_pos);
             EXPECT_NE(
                 prefix.find(
-                    "if (fully_replicated_local_rows || !has_multi_resident_experts)"),
+                    "if (row_execution_policy == llaminar2::RoutedExpertRowExecutionPolicy::FullyReplicatedLocal || !has_multi_resident_experts)"),
                 std::string::npos)
                 << label
                 << " must return before hot-cache load simulation for fully replicated verifier rows and layers without replicas.";
@@ -10206,7 +10206,7 @@ namespace llaminar2::test
                   std::string::npos)
             << "Portable restore must not resurrect rolling transfer-slot "
                "payloads through a resolver after those bytes may be reused.";
-        EXPECT_NE(graph.find("constexpr uint32_t kMoEPrefixRuntimeVersion = 6;"),
+        EXPECT_NE(graph.find("constexpr uint32_t kMoEPrefixRuntimeVersion = 7;"),
                   std::string::npos)
             << "Changing the prefix ownership boundary requires an explicit "
                "portable schema version.";

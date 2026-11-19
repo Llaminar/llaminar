@@ -7,7 +7,7 @@
  * execution. The separate CPUExpertShardExecution native matrix replay owns
  * arithmetic. No GPU, communicator or serving readiness is manufactured here.
  */
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 #include "../../utils/NativeWeightSourceTestRead.h"
 #include "loaders/PreparedWeightIdentityContract.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
@@ -35,21 +35,21 @@ llaminar2::MoEOverlayLayerWeightManifest jointManifest() {
   {ExpertTierWeightProjection::Up,20,8,fp},{ExpertTierWeightProjection::Down,8,20,fp}}}};
 }
 /** @return Actual private original-map selection; never call the private constructor. */
-std::shared_ptr<const llaminar2::CPUExpertShardSourceSelection> jointSelection(int member) {
+std::shared_ptr<const llaminar2::ExpertShardSourceSelection> jointSelection(int member) {
  using namespace llaminar2;const auto map=MoEExpertOwnerMap::buildShardPlacement(jointSourcePlan(),{jointManifest()});
  for(const auto& p:map.participants())if(p.domain_name=="cpu_joint" && p.domain_participant_index==member)
-  return CPUExpertShardSourceSelection::fromOriginalPlacement(map,7,p.participant_id);
+  return ExpertShardSourceSelection::fromOriginalPlacement(map,7,p.participant_id);
  throw std::logic_error("Joint source test lost its canonical member");
 }
 /** @return Original member metadata with only the tested actor backed by this process's real NUMA node. */
-std::shared_ptr<const llaminar2::CPUExpertShardSourceSelection> localJointSelection(int member) {
+std::shared_ptr<const llaminar2::ExpertShardSourceSelection> localJointSelection(int member) {
  using namespace llaminar2;auto plan=jointSourcePlan();
  for(auto& domain:plan.domains)if(domain.name=="cpu_joint")
   for(size_t p=0;p<domain.participants.size();++p)
    domain.participants[p]=GlobalDeviceAddress::cpu(test::localNativeSourceTestNUMANode()+int((p+domain.participants.size()-size_t(member))%domain.participants.size()));
  const auto map=MoEExpertOwnerMap::buildShardPlacement(plan,{jointManifest()});
  for(const auto& p:map.participants())if(p.domain_name=="cpu_joint" && p.domain_participant_index==member)
-  return CPUExpertShardSourceSelection::fromOriginalPlacement(map,7,p.participant_id);
+  return ExpertShardSourceSelection::fromOriginalPlacement(map,7,p.participant_id);
  throw std::logic_error("Local source actor lost its original member");
 }
 /** @brief Real source/consumer owner retained explicitly beside the committed binding vector. */
@@ -74,7 +74,7 @@ struct JointSourceBindings:std::vector<llaminar2::WeightBinding> {
  * @return Actual GGUF→common reader→Manager/PMA/Store records for one local component actor.
  * @note Scripted rank metadata does not claim MPI/socket execution. Native integration owns that proof.
  */
-JointSourceBindings jointSources(std::shared_ptr<const llaminar2::CPUExpertShardSourceSelection> selected,
+JointSourceBindings jointSources(std::shared_ptr<const llaminar2::ExpertShardSourceSelection> selected,
  size_t arena_bytes=0,size_t workspace_bytes=0) {
  using namespace llaminar2;auto actor=std::make_shared<JointSourceActor>();
  static size_t serial=0;
@@ -127,7 +127,7 @@ TEST(CPUJointPreparedSource, ExactSelectedOriginalSourceAndSparseRegistryLease) 
   request.bypass_tensor_parallel=true;request.expected_prepared_kind=PreparedWeightKind::MoeExpertSlab;
   request.tp_rank_or_device_index=request.overlay_participant_index=member;
   request.overlay_participant_world_rank=selected->participant().world_rank;request.overlay_domain="cpu_joint";
-  request.cpu_joint_source=selected;request.projection_ownership=selected->ownership();
+  request.joint_source=selected;request.projection_ownership=selected->ownership();
   WeightPlan plan(InferenceStrategy{});plan.add(request);const auto& slice=plan.requirements().front().slice;
   EXPECT_EQ(slice.expert_ids,std::vector<int>(selected->expertIds().begin(),selected->expertIds().end()));
   EXPECT_EQ(slice.expert_count,448u);EXPECT_FALSE(slice.inner_is_presliced);
@@ -141,13 +141,13 @@ TEST(CPUJointPreparedSource, ExactSelectedOriginalSourceAndSparseRegistryLease) 
   ExpertGemmRegistry registry;const auto scope=ExpertGemmRegistry::staticProjectionScope(sources.front());
   EXPECT_FALSE(registry.acquireStaticProjectionLayer(scope,selected->ownership(),sources));
   sources.registerInto(registry);
-  const auto graph_lease=registry.acquireCPUJointLayer(sources.front().identity.model_id,selected->participant(),7);
-  ASSERT_TRUE(graph_lease);EXPECT_EQ(graph_lease->cpu_joint_source,selected);
-  EXPECT_THROW(registry.acquireCPUJointLayer(ModelContextId{156},selected->participant(),7),std::invalid_argument);
+  const auto graph_lease=registry.acquireJointLayer(sources.front().identity.model_id,selected->participant(),7);
+  ASSERT_TRUE(graph_lease);EXPECT_EQ(graph_lease->joint_source,selected);
+  EXPECT_THROW(registry.acquireJointLayer(ModelContextId{156},selected->participant(),7),std::invalid_argument);
   auto foreign_descriptor=selected->participant();foreign_descriptor.address.numa_node+=2;
-  EXPECT_THROW(registry.acquireCPUJointLayer(sources.front().identity.model_id,foreign_descriptor,7),std::invalid_argument);
+  EXPECT_THROW(registry.acquireJointLayer(sources.front().identity.model_id,foreign_descriptor,7),std::invalid_argument);
   auto lease=registry.acquireStaticProjectionLayer(scope,selected->ownership(),sources);ASSERT_TRUE(lease);
-  EXPECT_EQ(lease->cpu_joint_source,selected);ASSERT_EQ(lease->experts.size(),512u);
+  EXPECT_EQ(lease->joint_source,selected);ASSERT_EQ(lease->experts.size(),512u);
   for(int e=0;e<512;++e)EXPECT_EQ(lease->experts[size_t(e)].complete(),e>=64);
   EXPECT_THROW(registry.getEngineForParticipant(scope.domain_name,scope.device,scope.participant_world_rank,
     scope.participant_index,7,64,Role::DOWN),std::logic_error);
@@ -161,18 +161,18 @@ TEST(CPUJointPreparedSource, RejectsForeignWholeAndIncompletePurpose) {
  EXPECT_EQ(*selected,*same);EXPECT_NE(*selected,*foreign);
  auto sources=jointSources(selected);ExpertGemmRegistry registry;
  const auto scope=ExpertGemmRegistry::staticProjectionScope(sources.front());
- auto changed=sources.front();changed.cpu_joint_source.reset();
+ auto changed=sources.front();changed.joint_source.reset();
  EXPECT_THROW(ExpertGemmRegistry::staticProjectionScope(changed),std::invalid_argument);
- changed=sources.front();changed.cpu_joint_source=foreign;
+ changed=sources.front();changed.joint_source=foreign;
  EXPECT_THROW(ExpertGemmRegistry::staticProjectionScope(changed),std::invalid_argument);
  const auto identity=PreparedWeightIdentityContract::fromBinding(sources.front());ASSERT_TRUE(identity);
- changed=sources.front();changed.cpu_joint_source=selected;
+ changed=sources.front();changed.joint_source=selected;
  EXPECT_TRUE(identity->compatible(*PreparedWeightIdentityContract::fromBinding(changed)));
  // Structural equality is not authority to substitute a newly built cohort.
- changed.cpu_joint_source=same;
+ changed.joint_source=same;
  EXPECT_FALSE(identity->compatible(*PreparedWeightIdentityContract::fromBinding(changed)));
- changed.cpu_joint_source=foreign;EXPECT_FALSE(identity->compatible(*PreparedWeightIdentityContract::fromBinding(changed)));
- changed.cpu_joint_source.reset();EXPECT_FALSE(identity->compatible(*PreparedWeightIdentityContract::fromBinding(changed)));
+ changed.joint_source=foreign;EXPECT_FALSE(identity->compatible(*PreparedWeightIdentityContract::fromBinding(changed)));
+ changed.joint_source.reset();EXPECT_FALSE(identity->compatible(*PreparedWeightIdentityContract::fromBinding(changed)));
  auto missing=sources;missing.pop_back();
  EXPECT_THROW(registry.acquireStaticProjectionLayer(scope,selected->ownership(),missing),std::invalid_argument);
  auto duplicate=sources;duplicate.back()=duplicate.front();
@@ -181,7 +181,7 @@ TEST(CPUJointPreparedSource, RejectsForeignWholeAndIncompletePurpose) {
  EXPECT_THROW(registry.acquireStaticProjectionLayer(scope,selected->ownership(),wrong),std::invalid_argument);
  EXPECT_FALSE(registry.acquireStaticProjectionLayer(scope,selected->ownership(),sources));
  sources.registerInto(registry,0,1);
- EXPECT_THROW(registry.acquireCPUJointLayer(sources.front().identity.model_id,selected->participant(),7),std::logic_error);
+ EXPECT_THROW(registry.acquireJointLayer(sources.front().identity.model_id,selected->participant(),7),std::logic_error);
 }
 
 /** @test Source-free compilation cannot manufacture a full expert for a CPU shard cohort. */
@@ -281,13 +281,13 @@ TEST(CPUJointPreparedSource, ActualLoaderRetainsOriginalMapAndSelectedNativeByte
  for(size_t expert=0;expert<512;++expert)sparse_plan.placements.front().routed_expert_tier[expert]=expert%8==0?0:1;
  const auto runtime=resolveMoEExpertOverlayRuntimePlan(std::make_shared<const MoERoutedExpertPlacementPlan>(sparse_plan),
     {.current_world_rank=0});ASSERT_TRUE(runtime);
- const auto prepared=MoEExpertOverlayPreparationPlan::build(*runtime,loader);ASSERT_TRUE(prepared.cpuJointOwnerMap());
+ const auto prepared=MoEExpertOverlayPreparationPlan::build(*runtime,loader);ASSERT_TRUE(prepared.jointOwnerMap());
  const auto local=prepared.filteredForDevice(DeviceId::cpu());
- EXPECT_EQ(local.cpuJointOwnerMap(),prepared.cpuJointOwnerMap());
+ EXPECT_EQ(local.jointOwnerMap(),prepared.jointOwnerMap());
  ASSERT_EQ(local.requests().size(),448u*3);
- const auto selected=local.requests().front().cpu_joint_source;ASSERT_TRUE(selected);
- EXPECT_EQ(selected->cohort(),prepared.cpuJointOwnerMap()->placementFor(7,1)->shard_cohort);
- EXPECT_EQ(local.cpuShardSourceFor(7,selected->participant()),selected);
+ const auto selected=local.requests().front().joint_source;ASSERT_TRUE(selected);
+ EXPECT_EQ(selected->cohort(),prepared.jointOwnerMap()->placementFor(7,1)->shard_cohort);
+ EXPECT_EQ(local.shardSourceFor(7,selected->participant()),selected);
  const auto plan=local.sourceWeightPlan(loader,ModelContextId{175});ASSERT_EQ(plan.requirements().size(),3u);
  // Budget original raw staging and final prepared payload before any source load.
  size_t routed_bytes=0;
@@ -331,7 +331,7 @@ TEST(CPUJointPreparedSource, ActualLoaderRetainsOriginalMapAndSelectedNativeByte
  const auto frozen=manager.materialize(plan);EXPECT_GT(loader.calls-before_calls,3u);ASSERT_EQ(frozen.bindings().size(),448u*3);
  const auto matrices=frozen.projectedExpertMatrices();ASSERT_EQ(matrices.bindings().size(),448u*3);
  for(const auto& source:matrices.bindings()) {
-  EXPECT_EQ(source.cpu_joint_source,selected);ASSERT_TRUE(source.native_source);EXPECT_FALSE(source.projection_source_owner);
+  EXPECT_EQ(source.joint_source,selected);ASSERT_TRUE(source.native_source);EXPECT_FALSE(source.projection_source_owner);
   EXPECT_EQ(source.projection_ownership->geometry().experts,512);
   EXPECT_EQ(source.tensor->shape().size(),2u);
   EXPECT_FALSE(source.tensor->is_raw_data_released());ASSERT_NE(source.tensor->raw_data(),nullptr);
@@ -344,7 +344,7 @@ TEST(CPUJointPreparedSource, ActualLoaderRetainsOriginalMapAndSelectedNativeByte
  // Serving first authenticates already committed fragments in its dense pass,
  // then enters the exact scoped overlay preparation. Neither may reread them.
  const auto prepared_reads=loader.calls;
- const auto original_bank=manager.expertGemmRegistry().acquireCPUJointLayer(ModelContextId{175},selected->participant(),7);
+ const auto original_bank=manager.expertGemmRegistry().acquireJointLayer(ModelContextId{175},selected->participant(),7);
  ASSERT_TRUE(original_bank);
  ASSERT_TRUE(manager.prepareWeightsForDevice(aggregate,DeviceId::cpu(),/*include_expert_jobs=*/false));
  EXPECT_EQ(loader.calls,prepared_reads);
@@ -356,8 +356,8 @@ TEST(CPUJointPreparedSource, ActualLoaderRetainsOriginalMapAndSelectedNativeByte
   PhysicalMemoryMaterializationKind::NewAllocation),0u);
  EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::RoutedExpertWeights,
   PhysicalMemoryMaterializationKind::NewAllocation),routed_bytes);
- const auto lease=manager.expertGemmRegistry().acquireCPUJointLayer(ModelContextId{175},selected->participant(),7);
- ASSERT_TRUE(lease);EXPECT_EQ(lease->cpu_joint_source,selected);
+ const auto lease=manager.expertGemmRegistry().acquireJointLayer(ModelContextId{175},selected->participant(),7);
+ ASSERT_TRUE(lease);EXPECT_EQ(lease->joint_source,selected);
  EXPECT_EQ(loader.calls,prepared_reads);
  EXPECT_EQ(lease->experts[1].gate,original_bank->experts[1].gate);
  EXPECT_EQ(lease->experts[1].up,original_bank->experts[1].up);
@@ -382,7 +382,7 @@ TEST(CPUJointPreparedSource, ActualLoaderRetainsOriginalMapAndSelectedNativeByte
  // original registry cannot be published or repaired by the dense pass.
  manager.expertGemmRegistry().clear();
  EXPECT_THROW((void)manager.prepareWeightsForDevice(aggregate,DeviceId::cpu(),false),std::logic_error);
- EXPECT_FALSE(manager.expertGemmRegistry().acquireCPUJointLayer(ModelContextId{175},selected->participant(),7));
+ EXPECT_FALSE(manager.expertGemmRegistry().acquireJointLayer(ModelContextId{175},selected->participant(),7));
  manager.expertGemmRegistry().registerCommittedCPUProjection(matrices.bindings().front(),*manager.preparedWeightStore());
  EXPECT_THROW((void)manager.prepareWeightsForDevice(aggregate,DeviceId::cpu(),false),std::logic_error);
  EXPECT_EQ(loader.calls,prepared_reads);
@@ -408,7 +408,7 @@ TEST(CPUJointPreparedSource, ActualLoaderRetainsOriginalMapAndSelectedNativeByte
    EXPECT_FALSE(second_frozen.bindings()[i].tensor->is_raw_data_released());
    EXPECT_FALSE(second_frozen.bindings()[i].projection_source_owner);
   }
-  const auto second_lease=second.expertGemmRegistry().acquireCPUJointLayer(ModelContextId{175},selected->participant(),7);
+  const auto second_lease=second.expertGemmRegistry().acquireJointLayer(ModelContextId{175},selected->participant(),7);
   ASSERT_TRUE(second_lease);engine=second_lease->experts[1].gate.get();run();
   second.expertGemmRegistry().clear();second.preparedWeightStore()->clear();run();
  }
@@ -425,7 +425,7 @@ TEST(CPUJointPreparedSource, ActualLoaderRetainsOriginalMapAndSelectedNativeByte
   EXPECT_THROW(failing.materialize(plan),std::runtime_error);
   EXPECT_EQ(failed_memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::WeightLoadStaging,
    PhysicalMemoryMaterializationKind::NewAllocation),0u);
-  EXPECT_THROW(failing.expertGemmRegistry().acquireCPUJointLayer(ModelContextId{175},selected->participant(),7),
+  EXPECT_THROW(failing.expertGemmRegistry().acquireJointLayer(ModelContextId{175},selected->participant(),7),
    std::logic_error);
  }
  EXPECT_EQ(failed_memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::WeightLoadStaging,
@@ -447,7 +447,7 @@ TEST(CPUJointPreparedSource, BoundedWindowsRetainSparseOriginalIdsAndNativeCuts)
  const auto participant=std::find_if(original.participants().begin(),original.participants().end(),
   [](const auto& p){return p.domain_name=="cpu_joint" && p.domain_participant_index==0;});
  ASSERT_NE(participant,original.participants().end());
- const auto selected=CPUExpertShardSourceSelection::fromOriginalPlacement(original,7,participant->participant_id);
+ const auto selected=ExpertShardSourceSelection::fromOriginalPlacement(original,7,participant->participant_id);
  ASSERT_EQ(selected->expertIds().size(),448u);
  EXPECT_EQ(selected->ownership().geometry().experts,512);
  for(const auto role:{WeightRole::MoEExpertGate,WeightRole::MoEExpertUp,WeightRole::MoEExpertDown}) {

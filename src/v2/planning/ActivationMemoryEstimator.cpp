@@ -17,6 +17,7 @@
 #include "execution/mtp/GenerationRequestSeeds.h"
 #include "execution/mtp/MTPTerminalGatherGeometry.h"
 #include "execution/moe/MoEProjectionArenaGeometry.h"
+#include "execution/moe/MoEIntermediateShardArenaGeometry.h"
 #include "models/qwen4exp/Qwen4ExpBufferLayout.h"
 #include "models/qwen35moe/Qwen35MoESchema.h"
 #include "models/qwen/Qwen2Schema.h"
@@ -293,6 +294,20 @@ GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
         .terminal_hidden_rows = retained_mtp ? std::max(static_cast<size_t>(geometry.batch_size), target_rows) : 0,
         .terminal_hidden_columns = retained_mtp ? (profile.flash_next
             ? static_cast<size_t>(profile.flash_next->residual_width) : static_cast<size_t>(profile.d_model)) : 0});
+}
+
+namespace
+{
+/** @return Exact static GPU local-F arena metadata for the same retained source stage as execution. */
+MoEIntermediateShardArenaGeometry intermediateShardArena(const ModelMemoryProfile &profile,
+    const ActivationGraphMemoryGeometry &geometry)
+{
+    const int last = geometry.last_layer < 0 ? profile.mainLayerCount() - 1 : geometry.last_layer;
+    const int retained_last = geometry.retained_mtp_candidate_rows > 0 && last == profile.mainLayerCount() - 1
+        ? profile.totalLayerCount() - 1 : last;
+    return MoEIntermediateShardArenaGeometry::resolve(profile, geometry.total_shards, geometry.shard_index,
+        geometry.shared_tp_assignment, geometry.first_layer, retained_last, geometry.gpu_expert_intermediate_tiling);
+}
 }
 
 size_t ActivationMemoryEstimator::estimate(
@@ -589,9 +604,11 @@ size_t ActivationMemoryEstimator::estimate(
             static_cast<size_t>(profile.expert_used_count);
         const size_t canonical_participants =
             static_cast<size_t>(std::max(1, geometry.total_shards));
-        const size_t max_expert_intermediate = static_cast<size_t>(std::max(
-            profile.expert_feed_forward_length,
-            profile.expert_shared_feed_forward_length));
+        const bool local_fragments = geometry.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded && device.is_gpu();
+        const auto fragments = local_fragments ? std::optional{intermediateShardArena(profile, geometry)}
+                                              : std::optional<MoEIntermediateShardArenaGeometry>{};
+        const size_t max_expert_intermediate = fragments ? std::size_t(fragments->scratchIntermediate())
+            : static_cast<size_t>(std::max(profile.expert_feed_forward_length, profile.expert_shared_feed_forward_length));
 
         bytes = checkedAdd(bytes, fp32RootBytes(mtp_prefill_rows,
             {top_k, top_k, d_model, d_model, max_expert_intermediate, max_expert_intermediate},
@@ -606,7 +623,8 @@ size_t ActivationMemoryEstimator::estimate(
         }
         else
         {
-            const size_t slots = checkedAdd(top_k, canonical_participants, "MoE canonical publication slots");
+            const size_t slots = fragments ? std::size_t(fragments->routeSlots())
+                : checkedAdd(top_k, canonical_participants, "MoE canonical publication slots");
             bytes = checkedAdd(bytes, fp32RootBytes(mtp_prefill_rows,
                 {checkedMultiply(slots, d_model, "MoE canonical columns")},
                 device, "MoE canonical root"), "MoE canonical root");

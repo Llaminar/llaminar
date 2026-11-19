@@ -14,7 +14,7 @@
 #include "MoEExpertOverlayPreparationPlan.h"
 #include "loaders/ExpertGemmRegistry.h"
 #include "tensors/TensorKernels.h"
-#include "CPUExpertShardSourceSelection.h"
+#include "ExpertShardSourceSelection.h"
 #include <functional>
 #include <optional>
 #include <stdexcept>
@@ -24,49 +24,53 @@
 namespace llaminar2
 {
 /**
- * @brief Borrow only the authenticated immutable CPU source/family declaration for a lazy graph.
+ * @brief Borrow the original CPU/GPU fragment source declaration for graph construction.
  * @param residency Original source-bound participant registry, already published at setup.
  * @param registry SAME model-owned prepared registry; no engine table is borrowed.
  * @param model Actual original model identity.
- * @param participant Original local CPU member; no representative-member projection.
+ * @param participant Original local cohort member; no representative-member projection.
  * @param layer Original model-global layer.
  * @param experts Complete logical expert axis.
  * @param columns Original model width.
  * @param intermediate Original unsliced expert F width.
  * @return Cold family/source metadata owning no initial/current epoch reader or engine pointer.
+ *         A canonical empty selection retains complete original geometry with no payload.
  * @throws std::invalid_argument For a foreign source/model/member/preparation/geometry.
  * @throws std::logic_error For missing source publication or expired original owners.
- * @note The packet remains the sole execution-epoch authority. Initial bank
- * retirement never invalidates immutable source geometry or authorizes resurrection.
+ * @note This cold declaration retains no executable bank or weight pointers.
+ * The invocation's explicit bank lease remains the execution-epoch authority.
+ * Initial retirement never invalidates source geometry or authorizes resurrection.
+ * The source-bound cohort already validates CPU ranks or homogeneous rank-local
+ * GPU membership; this adapter must not reconstruct either topology.
  */
-inline std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer>
-adoptMoEOverlayCPUJointGraphDeclaration(const MoEOverlayParticipantResidencyRegistry &residency,
+inline std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::JointLayer>
+adoptMoEOverlayJointGraphDeclaration(const MoEOverlayParticipantResidencyRegistry &residency,
     const ExpertGemmRegistry &registry,ModelContextId model,int participant,int layer,
     int experts,int columns,int intermediate)
 {
     std::string error;
     const auto original=residency.acquireOriginalPreparedSource(&error);
-    if(!original)throw std::logic_error("CPU joint graph lost its original prepared source: "+error);
+    if(!original)throw std::logic_error("Joint graph lost its original prepared source: "+error);
     if(&original->registry()!=&registry || !model.value || residency.originalModel()!=model ||
-       !residency.isCPUJointParticipant(participant) || experts<=0 || columns<=0 || intermediate<=0)
-        throw std::invalid_argument("CPU joint graph changed its original model/registry/member geometry");
-    const auto declaration=residency.initialCPUJointLayer(participant,layer);
+       !residency.isJointParticipant(participant) || experts<=0 || columns<=0 || intermediate<=0)
+        throw std::invalid_argument("Joint graph changed its original model/registry/member geometry");
+    const auto declaration=residency.initialJointLayer(participant,layer);
     const auto source=declaration->sourceSelection();const auto family=declaration->family();
-    if(!source)throw std::invalid_argument("CPU joint graph requires an original selected source declaration; initially empty cohorts are not supported");
+    if(!source)throw std::invalid_argument("Joint graph requires its original source-proven selection declaration");
     const auto preparation=original->preparation();
     const auto* owner=residency.initialOwnerMap().participantForId(participant);
-    if(!family || !preparation || !owner || !owner->device.is_cpu() ||
-       !preparation->cpuJointOwnerMap() || preparation->cpuJointOwnerMap().get()!=&residency.initialOwnerMap() ||
+    if(!family || !preparation || !owner ||
+       !preparation->jointOwnerMap() || preparation->jointOwnerMap().get()!=&residency.initialOwnerMap() ||
        family->model()!=model || family->preparation()!=preparation ||
        family->preparation().owner_before(preparation) || preparation.owner_before(family->preparation()) ||
        family->cohort()!=source->cohort() || family->cohort().owner_before(source->cohort()) ||
        source->cohort().owner_before(family->cohort()) || family->participantIndex()!=source->participantIndex())
-        throw std::invalid_argument("CPU joint graph replaced its original source/preparation/family");
-    const auto expected=preparation->cpuShardSourceFor(layer,*owner);
+        throw std::invalid_argument("Joint graph replaced its original source/preparation/family");
+    const auto expected=preparation->shardSourceFor(layer,*owner);
     const auto& geometry=source->ownership().geometry();
     if(!expected || *source!=*expected || source->participant()!=*owner || source->layer()!=layer ||
        geometry.experts!=experts || geometry.model_columns!=columns || geometry.intermediate_columns!=intermediate)
-        throw std::invalid_argument("CPU joint graph changed its original source selection or projection");
+        throw std::invalid_argument("Joint graph changed its original source selection or projection");
     return declaration;
 }
 
@@ -98,7 +102,7 @@ struct MoEOverlayPreparedGraphBank
     std::vector<ITensorGemm *> down;
     std::vector<std::shared_ptr<ITensorGemm>> owners;
     /// Exact prepared/source lease; retains original native matrices and selected IDs.
-    std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> cpu_joint_layer;
+    std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::JointLayer> cpu_joint_layer;
     int local_intermediate = 0; ///< Explicit native fragment F, distinct from original model F.
 };
 
@@ -170,9 +174,9 @@ struct MoEOverlayPreparedGraphBank
         if (!request.device.is_cpu() || domain->scope!=ExecutionDomainScope::NODE_LOCAL ||
             !request.original_model.value || !request.original_owners)
             throw std::invalid_argument("CPU joint graph bank requires original model/source placement authority");
-        if (!request.original_residency || !request.original_residency->isCPUJointParticipant(selected->participant_id))
+        if (!request.original_residency || !request.original_residency->isJointParticipant(selected->participant_id))
             throw std::invalid_argument("CPU joint graph bank has no original fragment publication owner");
-        const auto published=request.original_residency->initialCPUJointLayer(selected->participant_id,request.layer);
+        const auto published=request.original_residency->initialJointLayer(selected->participant_id,request.layer);
         const auto acquired=published?published->acquireInitialConstruction():MoEOverlayParticipantBankLease{};
         const auto selected_source=published?published->sourceSelection():nullptr;
         if (!acquired || !selected_source || !published->family())
@@ -184,7 +188,7 @@ struct MoEOverlayPreparedGraphBank
         const auto &geometry=source.ownership().geometry();
         if (source.participant()!=*selected || geometry.experts!=request.experts ||
             geometry.model_columns!=request.d_model || geometry.intermediate_columns!=request.expert_intermediate ||
-            initial_layer.cpu_fragments.size()!=static_cast<size_t>(request.experts))
+            initial_layer.fragments.size()!=static_cast<size_t>(request.experts))
             throw std::invalid_argument("CPU joint graph bank changed original source/model/member geometry");
         MoEOverlayPreparedGraphBank bank;
         bank.gate.resize(request.experts,nullptr);bank.up.resize(request.experts,nullptr);bank.down.resize(request.experts,nullptr);
@@ -194,7 +198,7 @@ struct MoEOverlayPreparedGraphBank
                 throw std::invalid_argument("CPU joint graph bank changed original selected expert membership");
             if (!original)continue;
             const auto *row=request.original_owners->placementFor(request.layer,expert);
-            const auto &triplet=initial_layer.cpu_fragments[static_cast<size_t>(expert)];
+            const auto &triplet=initial_layer.fragments[static_cast<size_t>(expert)];
             if (!row || row->shard_cohort!=source.cohort() || !triplet.valid())
                 throw std::invalid_argument("CPU joint graph bank replaced its original source cohort or prepared triplet");
             bank.gate[expert]=triplet.gate().get();bank.up[expert]=triplet.up().get();bank.down[expert]=triplet.down().get();

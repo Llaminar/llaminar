@@ -20,11 +20,16 @@ import tempfile
 
 
 DOCKER = Path(__file__).resolve().parent.parent
-REVISION = "dbc86fd06e8b0c4517b95d8958a09ccacf9520c9"
+PIN_FILE = "nccl-release.env"
+_pin = re.search(r"^LLAMINAR_NCCL_GIT_COMMIT=([0-9a-f]{40})$",
+                 (DOCKER / PIN_FILE).read_text(encoding="utf-8"), re.MULTILINE)
+if _pin is None:
+    raise RuntimeError("Missing canonical NCCL source commit in nccl-release.env")
+REVISION = _pin.group(1)
 PATCHES = tuple("patches/" + name for name in (
     "nccl-capture-reentry.patch", "nccl-device-live-rows.patch",
     "nccl-gin-auto-selection.patch", "nccl-device-completed-broadcast.patch"))
-INPUTS = (*PATCHES, "nccl-gin-selection/probe.cpp", "nccl-gin-selection/proof.py",
+INPUTS = (PIN_FILE, *PATCHES, "nccl-gin-selection/probe.cpp", "nccl-gin-selection/proof.py",
           "patches/nccl-created-thread-ownership.patch", "nccl-thread-lifetime/probe.cpp",
           "nccl-thread-lifetime/proof.py", "patches/nccl-partial-file-cleanup.patch",
           "shared-file-lifecycle/probe.cpp", "shared-file-lifecycle/proof.py",

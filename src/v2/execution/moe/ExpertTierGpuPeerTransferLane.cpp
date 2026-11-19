@@ -9,6 +9,7 @@
  */
 
 #include "ExpertTierGpuPeerTransferLane.h"
+#include "ExpertTierGpuBlobTransferLane.h"
 #include "GPUExpertTransferBackend.h"
 #include "backends/NativePeerTransferEventOwnership.h"
 #include "backends/ReadAheadNativeResourceObligation.h"
@@ -356,67 +357,61 @@ namespace llaminar2
     }
 
     bool ExpertTierGpuPeerTransferLane::start(
-        const GpuExpertPackedDescriptor &source,
-        const GpuExpertPackedDescriptor &destination,
-        const ExpertTierSourceReadiness &source_readiness,
-        std::string *error) noexcept
+        const GpuExpertPackedDescriptor& source,const GpuExpertPackedDescriptor& destination,
+        const ExpertTierSourceReadiness& source_readiness,std::string* error) noexcept
     {
-        if (!gpuExpertPackedDescriptorsCompatible(source, destination))
-        {
-            assignPeerError(
-                error,
-                "GPU peer tier transfer descriptors are not byte-compatible");
-            return false;
+        ExpertTierGpuBlobChunkProtocol protocol(std::numeric_limits<std::size_t>::max());
+        if(!protocol.begin(source,destination,error))return false;
+        return startRegions(source.ptrs,destination.ptrs,protocol,source_readiness,error);
+    }
+
+    bool ExpertTierGpuPeerTransferLane::start(
+        const GpuExpertPackedDescriptor& source,const GpuExpertPackedDescriptor& destination,
+        const ExpertTierWeightProjectionIntersection& intersection,
+        const ExpertTierSourceReadiness& source_readiness,std::string* error) noexcept
+    {
+        ExpertTierGpuBlobChunkProtocol protocol(std::numeric_limits<std::size_t>::max());
+        if(!protocol.begin(source,destination,intersection,error))return false;
+        return startRegions(source.ptrs,destination.ptrs,protocol,source_readiness,error);
+    }
+
+    bool ExpertTierGpuPeerTransferLane::startFloating(
+        const ContiguousFloatingPointWeightDescriptor& source,
+        const ContiguousFloatingPointWeightDescriptor& destination,
+        const ExpertTierWeightProjectionIntersection& intersection,
+        const ExpertTierSourceReadiness& source_readiness,std::string* error) noexcept
+    {
+        ExpertTierGpuBlobChunkProtocol protocol(std::numeric_limits<std::size_t>::max());
+        if(!source.valid() || !destination.valid() || source.type!=destination.type ||
+            source.n!=intersection.source().rows || source.k!=intersection.source().columns ||
+            destination.n!=intersection.destination().rows || destination.k!=intersection.destination().columns ||
+            !protocol.beginFloating(intersection,source.type==TensorType::FP32?4:2,error)) {
+            assignPeerError(error,"GPU floating peer copy disagrees with its original projection roots");return false;
         }
-        return startRegions(
-            source.ptrs,
-            destination.ptrs,
-            source.vnni_bytes,
-            source.scales_bytes,
-            source.mins_bytes,
-            source.emins_bytes,
-            source_readiness,
-            error);
+        GPUExpertPointers source_regions,destination_regions;
+        source_regions.d_vnni=static_cast<uint8_t*>(const_cast<void*>(source.data));
+        destination_regions.d_vnni=static_cast<uint8_t*>(const_cast<void*>(destination.data));
+        return startRegions(source_regions,destination_regions,protocol,source_readiness,error);
     }
 
     bool ExpertTierGpuPeerTransferLane::startContiguous(
-        const void *source,
-        void *destination,
-        std::size_t bytes,
-        const ExpertTierSourceReadiness &source_readiness,
-        std::string *error) noexcept
+        const void* source,void* destination,std::size_t bytes,
+        const ExpertTierSourceReadiness& source_readiness,std::string* error) noexcept
     {
-        if (!source || !destination || bytes == 0)
-        {
-            assignPeerError(
-                error,
-                "GPU peer contiguous transfer requires two pointers and non-zero bytes");
-            return false;
+        ExpertTierGpuBlobChunkProtocol protocol(std::numeric_limits<std::size_t>::max());
+        if(!source || !destination || !protocol.beginContiguous(bytes,error)) {
+            assignPeerError(error,"GPU peer contiguous transfer requires two pointers and non-zero bytes");return false;
         }
-        GPUExpertPointers source_regions;
-        source_regions.d_vnni = static_cast<std::uint8_t *>(
-            const_cast<void *>(source));
-        GPUExpertPointers destination_regions;
-        destination_regions.d_vnni =
-            static_cast<std::uint8_t *>(destination);
-        return startRegions(
-            source_regions,
-            destination_regions,
-            bytes,
-            0,
-            0,
-            0,
-            source_readiness,
-            error);
+        GPUExpertPointers source_regions,destination_regions;
+        source_regions.d_vnni=static_cast<uint8_t*>(const_cast<void*>(source));
+        destination_regions.d_vnni=static_cast<uint8_t*>(destination);
+        return startRegions(source_regions,destination_regions,protocol,source_readiness,error);
     }
 
     bool ExpertTierGpuPeerTransferLane::startRegions(
         const GPUExpertPointers &source,
         const GPUExpertPointers &destination,
-        std::size_t payload_bytes,
-        std::size_t scales_bytes,
-        std::size_t mins_bytes,
-        std::size_t emins_bytes,
+        ExpertTierGpuBlobChunkProtocol& protocol,
         const ExpertTierSourceReadiness &source_readiness,
         std::string *error) noexcept
     {
@@ -466,18 +461,24 @@ namespace llaminar2
                 transfer_stream_);
         }
 
-        submitted_bytes_ = payload_bytes + scales_bytes + mins_bytes +
-                           emins_bytes;
-        bool copied = timing_started && GPUExpertTransfer::transferExpert(
-            source,
-            destination,
-            config_.source_device,
-            config_.destination_device,
-            payload_bytes,
-            scales_bytes,
-            mins_bytes,
-            emins_bytes,
-            transfer_stream_);
+        submitted_bytes_ = protocol.totalBytes();
+        bool copied=timing_started;
+        const std::array<const void*,4> source_regions{
+            source.d_vnni,source.d_scales,source.d_mins,source.d_emins};
+        const std::array<void*,4> destination_regions{
+            destination.d_vnni,destination.d_scales,destination.d_mins,destination.d_emins};
+        // One readiness edge and one completion fence cover every exact run.
+        // The same cursor drives host relay and MPI range mapping; no padded
+        // allocation extent becomes a peer-copy extent.
+        while(copied) {
+            const auto chunk=protocol.takeNext();if(!chunk)break;
+            const auto region=static_cast<std::size_t>(chunk->region);
+            GPUExpertPointers source_run,destination_run;
+            source_run.d_vnni=static_cast<uint8_t*>(const_cast<void*>(source_regions[region]))+chunk->source_offset;
+            destination_run.d_vnni=static_cast<uint8_t*>(destination_regions[region])+chunk->destination_offset;
+            copied=GPUExpertTransfer::transferExpert(source_run,destination_run,
+                config_.source_device,config_.destination_device,chunk->bytes,0,0,0,transfer_stream_);
+        }
         bool timing_stopped = true;
         if (config_.collect_timing_measurements)
         {

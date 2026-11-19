@@ -15,11 +15,11 @@ TEST(CPUJointMTPSourceContract, OriginalPredictorSourceRequiresCompleteOriginalC
     for(int rank=0;rank<2;++rank) {
         SCOPED_TRACE(rank);
         const auto original=staticJointOriginal(rank);
-        const auto &map=*original.preparation->cpuJointOwnerMap();
+        const auto &map=*original.preparation->jointOwnerMap();
         EXPECT_NO_THROW(requireMoEOverlayMTPSourceCoverage(map,original.preparation.get(),layers,512,rank));
         // Original local CPU requests are absent, despite the same retained map.
         const auto partial=original.preparation->filteredForDevice(DeviceId::rocm(0));
-        EXPECT_EQ(partial.cpuJointOwnerMap(),original.preparation->cpuJointOwnerMap());
+        EXPECT_EQ(partial.jointOwnerMap(),original.preparation->jointOwnerMap());
         EXPECT_THROW(requireMoEOverlayMTPSourceCoverage(map,&partial,layers,512,rank),std::invalid_argument);
         EXPECT_THROW(requireMoEOverlayMTPSourceCoverage(map,nullptr,layers,512,rank),std::invalid_argument);
         const auto foreign=staticJointOriginal(rank);

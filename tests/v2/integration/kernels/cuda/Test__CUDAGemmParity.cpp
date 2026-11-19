@@ -34,6 +34,7 @@
  * @date January 2026
  */
 
+#include "kernels/cuda/gemm/CUDANativeQuantisedArchitecture.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include "tensors/IQQuantTables.h"
@@ -4175,6 +4176,78 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesSpecializedNativeQuantisedR
     PerfStatsCollector::reset();
     cleanupWorkspaceIfNeeded(cuda_kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+/** @test Capture the public grouped projection and replay with dirty output. */
+TEST_F(Test__CUDAGemmParity, GroupedVerifierDispatchTableNativeReplay)
+{
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    constexpr int M = 4;
+    constexpr int N = 896;
+    constexpr int K = 768;
+    auto weights = TestTensorFactory::createQ4_KRandom({N, K}, 230);
+    auto *kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(kernel, M, N, K));
+
+    const auto inputs = randomFP32(M * K);
+    std::vector<float> reference(M * N);
+    for (int row = 0; row < M; ++row)
+    {
+        ASSERT_TRUE(cudaMultiplyViaTensor(
+            kernel, inputs.data() + row * K, reference.data() + row * N,
+            1, N, K, gpu_device_, workspace_.get()));
+    }
+
+    FP32Tensor input({M, K});
+    FP32Tensor output({M, N});
+    std::memcpy(input.mutable_data(), inputs.data(), inputs.size() * sizeof(float));
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    auto &device = GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal);
+    ScopedGPUStream stream_owner(gpu_device_);
+    auto stream = static_cast<cudaStream_t>(stream_owner.get());
+    ASSERT_TRUE(input.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(output.ensureOnDevice(gpu_device_, stream));
+    kernel->setGPUStream(stream);
+    TransferEngine::requireDeviceInput(&input, gpu_device_, stream);
+    TransferEngine::requireDeviceOutput(&output, gpu_device_, stream);
+    const std::vector<ITensorGemm::TensorProjectionDesc> projections{
+        {kernel, &output, N, nullptr, "lm_head"}};
+
+    PerfStatsCollector::reset();
+    auto graph_owner = device.createGraphCapture(stream);
+    auto &graph = dynamic_cast<CUDAGraphCapture &>(*graph_owner);
+    {
+        ScopedBackendGraphCapture recording(graph, "CUDA grouped verifier architecture replay");
+        ASSERT_TRUE(recording.begin());
+        ASSERT_TRUE(kernel->multiply_fused_verifier_rows_decode_equivalent(
+            &input, projections, M, K, nullptr, workspace_.get()));
+        recording.finish();
+    }
+    ASSERT_GT(graph.nodeCount(), 0u);
+    ASSERT_TRUE(graph.instantiate());
+
+    const auto hardware = llaminar2::cuda::nativeQuantisedHardwareForDevice(gpu_device_.ordinal);
+    const auto table = native_quantised::selectVerifierDispatchTable(hardware);
+    const auto expected = llaminar2::native_quantised::verifierDispatchTableName(table);
+    const auto records = PerfStatsCollector::snapshot({"kernel.cuda_native_quantised_gemv_dispatch"});
+    ASSERT_TRUE(std::any_of(records.begin(), records.end(), [&](const PerfStatRecord &record) {
+        return record.value > 0 && record.tags.contains("verifier_dispatch_table") &&
+               record.tags.at("verifier_dispatch_table") == expected &&
+               record.tags.at("semantic_contract") == "verifier_serial_m1_bitwise";
+    }));
+
+    std::vector<float> actual(M * N);
+    const auto bytes = actual.size() * sizeof(float);
+    for (const int dirty : {0, 0xa5, 0xff, 0x5a})
+    {
+        ASSERT_EQ(cudaMemsetAsync(output.gpu_data_ptr(), dirty, bytes, stream), cudaSuccess);
+        ASSERT_TRUE(graph.launch());
+        ASSERT_EQ(cudaMemcpyAsync(actual.data(), output.gpu_data_ptr(), bytes,
+                                 cudaMemcpyDeviceToHost, stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_EQ(std::memcmp(actual.data(), reference.data(), bytes), 0);
+    }
 }
 
 TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_M2MatchesTwoSingleRowDecodeGEMVs)

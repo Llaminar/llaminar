@@ -109,6 +109,34 @@ endforeach()
             configured.ninja_text = ninja_file.read_text() if ninja_file.exists() else ""
             return configured
 
+    def test_published_release_loads_source_only_for_the_selected_rccl_proof(self):
+        """A Release consumer can use the shipped ELF; the proof owner still requires its source."""
+        module = MODULE.with_name("V2NativeCompletedBroadcastProofTests.cmake")
+        with tempfile.TemporaryDirectory(prefix="collective-proof-owner-") as directory:
+            root = Path(directory)
+            (root / "CMakeLists.txt").write_text(f'''cmake_minimum_required(VERSION 3.27)
+project(CollectiveProofSelection LANGUAGES NONE)
+enable_testing()
+set(HAVE_ROCM ON)
+set(HAVE_RCCL ON)
+set(RCCL_PROTOCOL_BUILD_DIR "${{CMAKE_CURRENT_SOURCE_DIR}}/missing")
+include("{MODULE.as_posix()}")
+include("{module.as_posix()}")
+''')
+            for lane, selected in (("Release", ""), ("Integration", ""),
+                                   ("Release", "v2_rccl_completed_broadcast_proof")):
+                with self.subTest(lane=lane, selected=selected):
+                    result = subprocess.run([self.cmake, "-S", str(root), "-B", str(root / (lane + selected)),
+                        "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={self.ninja}",
+                        f"-DV2_PERF_TESTS_ONLY={'ON' if lane == 'Release' else 'OFF'}",
+                        f"-DLLAMINAR_RELEASE_NATIVE_TEST_TARGETS={selected}"],
+                        capture_output=True, text=True, timeout=15)
+                    if lane == "Release" and not selected:
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                    else:
+                        self.assertNotEqual(result.returncode, 0)
+                        self.assertIn("actual source-build authority", result.stderr)
+
     def test_explicit_release_native_owner_and_aliases(self):
         """Original owners and script aliases opt in without entering default all."""
         declaration = CMAKE_LISTS.read_text(encoding="utf-8")
@@ -645,6 +673,28 @@ add_executable(v2_test_memory_planner main.cpp)
 add_executable(v2_test_physical_memory_authority main.cpp)
 {performance_declarations}
 include("{QFN_PERFORMANCE.as_posix()}")
+if(HAVE_ROCM)
+    if(NOT TARGET v2_perf_rocm_mi50_roofline)
+        message(FATAL_ERROR "Lost explicit MI50 roofline target")
+    endif()
+    foreach(probe ReadBandwidth VectorIssue QfnRoutedPacketRead)
+        set(target v2_perf_rocm_mi50_${{probe}})
+        get_target_property(probe_source ${{target}} SOURCES)
+        get_target_property(probe_dir ${{target}} SOURCE_DIR)
+        get_target_property(standard ${{target}} HIP_STANDARD)
+        get_target_property(excluded ${{target}} EXCLUDE_FROM_ALL)
+        get_source_file_property(language "${{probe_dir}}/${{probe_source}}" TARGET_DIRECTORY ${{target}} LANGUAGE)
+        if(NOT probe_source STREQUAL "${{probe}}.hip" OR NOT language STREQUAL "HIP" OR
+           NOT standard EQUAL 20 OR NOT excluded)
+            message(FATAL_ERROR "Lost native or explicit-build roofline policy: ${{target}}")
+        endif()
+        # The device-free generator tests production metadata without a HIP SDK.
+        # Replace the body only after authenticating the actual declaration.
+        set_property(TARGET ${{target}} PROPERTY SOURCES "${{CMAKE_CURRENT_SOURCE_DIR}}/main.cpp")
+    endforeach()
+elseif(TARGET v2_perf_rocm_mi50_roofline)
+    message(FATAL_ERROR "ROCm roofline target registered without ROCm")
+endif()
 if(TARGET v2_perf_immutable_adaptive_lookup)
     message(FATAL_ERROR "Retired combined adaptive lookup performance entrypoint remains")
 endif()

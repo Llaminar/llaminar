@@ -10,6 +10,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "kernels/common/MoERuntimeDescriptorLaunch.h"
 #include "../../utils/TestTensorFactory.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -21,14 +22,10 @@
 #include <vector>
 
 #ifdef HAVE_CUDA
-extern "C" bool cudaMoE_softmax_topk_decode_unique_owner_runtime(
-    float *, void *, float *, float *, int, int, bool, bool, bool, int, void *);
 extern "C" bool cudaMoE_softmax_topk(
     float *, float *, float *, int, int, int, bool, int, void *, const int *, void *);
 #endif
 #ifdef HAVE_ROCM
-extern "C" bool hipMoE_softmax_topk_decode_unique_owner_wave64(
-    float *, void *, float *, float *, int, int, bool, bool, bool, int, void *);
 extern "C" bool hipMoE_softmax_topk_decode_equivalent_rows(
     float *, float *, float *, int, int, int, bool, int, void *, const int *, void *);
 #endif
@@ -96,13 +93,13 @@ namespace llaminar2::test
                         if (device.is_cuda())
                             ok = ok && cudaMoE_softmax_topk_decode_unique_owner_runtime(
                                 logits, runtime_storage->gpu_data_ptr(), ids, weights,
-                                experts, top_k, true, true, true, device.ordinal, stream);
+                                experts, top_k, true, true, true, device.ordinal, stream, nullptr);
 #endif
 #ifdef HAVE_ROCM
                         if (device.is_rocm())
                             ok = ok && hipMoE_softmax_topk_decode_unique_owner_wave64(
                                 logits, runtime_storage->gpu_data_ptr(), ids, weights,
-                                experts, top_k, true, true, true, device.ordinal, stream);
+                                experts, top_k, true, true, true, device.ordinal, stream, nullptr);
 #endif
                     }
 #ifdef HAVE_CUDA

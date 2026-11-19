@@ -1378,7 +1378,7 @@ namespace llaminar2::test
         EXPECT_EQ(state.grouped_verifier_histogram[511], 31u);
         EXPECT_EQ(sizeof(DeviceMoEPlacementBank), moe_runtime_abi::kPlacementBankBytes);
         EXPECT_EQ(sizeof(DeviceMoELayerRuntime), moe_runtime_abi::kLayerRuntimeBytes);
-        EXPECT_EQ(moe_runtime_abi::kRuntimeLayoutVersion, 2u);
+        EXPECT_EQ(moe_runtime_abi::kRuntimeLayoutVersion, 3u);
         EXPECT_THROW((void)MoERuntimeTable(DeviceId::cpu(), 1, 513, 10), std::invalid_argument);
     }
 
@@ -1513,31 +1513,31 @@ namespace llaminar2::test
         auto first = updateForEpoch(1, 4);
         first.overlay_route_participant = {17, 23, 17, 41};
         external(first, 1);
-        first.overlay_route_participant[1] = MoEOverlayRouteTarget::cpuCohort(4).word();
+        first.overlay_route_participant[1] = MoEOverlayRouteTarget::cohort(4).word();
         ASSERT_TRUE(table.prepareInactiveBank(0, first));
         ASSERT_TRUE(table.flipActiveBank(0, 1, nullptr));
         const auto original_bank = table.hostLayerState(0).active_bank;
         const auto &original = table.hostLayerState(0).banks[original_bank];
         EXPECT_EQ(original.overlay_route_participant[1],
-                  MoEOverlayRouteTarget::cpuCohort(4).word());
+                  MoEOverlayRouteTarget::cohort(4).word());
         EXPECT_EQ(original.experts[1].owner_participant, -1);
         EXPECT_EQ(original.local_compute_mask[1], 0u);
         EXPECT_EQ(original.resident_participant_mask[1], 0u);
         auto second = updateForEpoch(2, 4);
         second.overlay_route_participant = {17, 23, 17, 41};
         external(second, 2);
-        second.overlay_route_participant[2] = MoEOverlayRouteTarget::cpuCohort(4).word();
+        second.overlay_route_participant[2] = MoEOverlayRouteTarget::cohort(4).word();
         ASSERT_TRUE(table.prepareInactiveBank(0, second));
         ASSERT_TRUE(table.flipActiveBank(0, 2, nullptr));
         const auto &current = table.hostLayerState(0).banks[1u - original_bank];
         EXPECT_EQ(current.epoch, 2u);
         EXPECT_EQ(current.overlay_route_participant[1], 23);
-        EXPECT_EQ(current.overlay_route_participant[2], MoEOverlayRouteTarget::cpuCohort(4).word());
+        EXPECT_EQ(current.overlay_route_participant[2], MoEOverlayRouteTarget::cohort(4).word());
         EXPECT_EQ(original.epoch, 1u);
         EXPECT_EQ(original.overlay_route_participant[1],
-                  MoEOverlayRouteTarget::cpuCohort(4).word());
+                  MoEOverlayRouteTarget::cohort(4).word());
         auto invalid = updateForEpoch(3, 4);
-        invalid.overlay_route_participant = {17, 23, MoEOverlayRouteTarget::cpuCohort(4).word(),
+        invalid.overlay_route_participant = {17, 23, MoEOverlayRouteTarget::cohort(4).word(),
                                              41};
         EXPECT_THROW(table.prepareInactiveBank(0, invalid), std::invalid_argument);
     }

@@ -905,11 +905,11 @@ namespace llaminar2
                 }
                 PerfStatsCollector::addCounter(
                     "moe_overlay_residency",
-                    row.target.isCPUCohort()?"certified_target_service_ns_per_activation":"certified_participant_service_ns_per_activation",
+                    row.target.isCohort()?"certified_target_service_ns_per_activation":"certified_participant_service_ns_per_activation",
                     static_cast<double>(cost),
                     "maintenance",
                     config_.perf_device,
-                    {{row.target.isCPUCohort()?"target":"participant",
+                    {{row.target.isCohort()?"target":"participant",
                       std::to_string(row.target.word())},
                      {"layer", std::to_string(row.layer)},
                      {"source", serviceSourceName(phase)},

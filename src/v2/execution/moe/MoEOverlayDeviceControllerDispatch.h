@@ -25,6 +25,8 @@ bool dispatchMoEOverlayControllerAction(
     using Action = MoEOverlayDeviceControllerAction;
     switch (action)
     {
+    case Action::CollectRuntimeSnapshot:
+        return launch.template operator()<Action::CollectRuntimeSnapshot>();
     case Action::BeginTransaction:
         return launch.template operator()<Action::BeginTransaction>();
     case Action::PublishGroupSnapshot:

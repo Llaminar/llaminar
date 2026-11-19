@@ -329,6 +329,75 @@ include("{SOURCE}/tests/v2/cmake/V2TestTargetSelection.cmake")
         self.assertIn('DeviceFree', source_map)
         self.assertIn('NO_MPI', source_map)
 
+    def test_retained_mi50_registration_matches_native_preflight_scheduler(self):
+        """Run the production scheduler over native mandatory and optional CTest rows."""
+        source = (SOURCE / 'tests/v2/CMakeLists.txt').read_text()
+        begin = source.index('function(add_v2_test TEST_NAME)')
+        end = source.index('endfunction()', begin) + len('endfunction()')
+        helper = source[begin:end]
+        begin = source.index('        add_v2_test(V2_Integration_MoEGroupedFixedFP16RouterReplay_ROCm')
+        end = source.index('        add_v2_test(', begin + len('        add_v2_test('))
+        fixed_router = source[begin:end]
+        modules = SOURCE / 'tests/v2/cmake'
+        retained = (modules / 'V2RetainedM1HCFFNTests.cmake').read_text()
+        begin = retained.index('    add_v2_test(V2_Integration_ROCmGroupedFFNFormatProgramDemand')
+        end = retained.index('\nendif()\n\nif(NOT LLAMINAR_QFN_RETAINED_TP_GGUF', begin)
+        numerics = (modules / 'V2ROCmRetainedM1NumericsTests.cmake').read_text()
+        with tempfile.TemporaryDirectory(prefix='llaminar-retained-native-registration-') as work:
+            root = Path(work)
+            prefix = f'''cmake_minimum_required(VERSION 3.25)
+project(RetainedNativePreflight NONE)
+enable_testing()
+set(CMAKE_BUILD_TYPE Integration)
+set(V2_PERF_TESTS_ONLY OFF)
+set(V2_TEST_SOCKETS 2)
+set(V2_TEST_CORES_PER_SOCKET 2)
+set(DEFAULT_LOG_LEVEL ERROR)
+set(Python3_EXECUTABLE "{sys.executable}")
+include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")
+include("{modules}/V2TestTargetSelection.cmake")
+'''
+            for target in ('v2_integration_moe_intermediate_ffn_finalization',
+                           'v2_integration_rocm_retained_m1_numerics', 'v2_integration_moe_live_rows'):
+                prefix += f'add_executable({target} IMPORTED GLOBAL)\n'
+                prefix += f'set_target_properties({target} PROPERTIES IMPORTED_LOCATION "${{CMAKE_COMMAND}}")\n'
+            # Only executable placeholders; each add_v2_test call and its MPI
+            # wrapping run exactly as in the actual configured Integration tree.
+            (root / 'CMakeLists.txt').write_text('\n'.join(
+                (prefix, helper, fixed_router, retained[begin:end],
+                 numerics[numerics.index('set(qfn_wave_address_test '):])))
+            configured = subprocess.run(['cmake', '-S', str(root), '-B', str(root / 'build'), '-G', 'Ninja'],
+                                        capture_output=True, text=True, timeout=10)
+            self.assertEqual(configured.returncode, 0, configured.stdout + configured.stderr)
+            sys.path.insert(0, str(SOURCE / 'scripts/ci'))
+            try:
+                import run_production_parity_campaigns as campaigns
+                rows = campaigns.discover_production_test_preflight_registrations(root / 'build')
+                requirements = campaigns.preflight_optional_hardware_requirements(rows)
+            finally:
+                sys.path.pop(0)
+            document = subprocess.check_output(['ctest', '--test-dir', str(root / 'build'),
+                '--show-only=json-v1'], text=True, timeout=10)
+
+        self.assertEqual(len(requirements), 3)
+        self.assertTrue(all(req['native_isa'] == 'gfx906' and req['degree'] == 6
+                            for req in requirements.values()))
+        names = {row.name for row in rows}
+        self.assertTrue({
+            'V2_Integration_MoEGroupedFixedFP16RouterReplay_ROCm',
+            'V2_Integration_ROCmRetainedM1Numerics',
+            'V2_Integration_ROCmGroupedVerifierWaveAddressReplay',
+            'V2_Integration_FullNativeHCFFN_EqualF160GroupedFrontierDefaultReplay_ROCm',
+        } <= names - requirements.keys())
+        filters = [arg for row in json.loads(document)['tests']
+                   if row['name'].startswith('V2_Integration_GroupedM6IndexedGateReuse')
+                   for arg in row['command'] if arg.startswith('--gtest_filter=')]
+        self.assertEqual(len(filters), 2)
+        self.assertEqual({case for filt in filters for case in filt.removeprefix('--gtest_filter=').split(':')}, {
+            'OriginalSources/GroupedM6Family.Deferred/G09_*', 'OriginalSources/GroupedM6Family.Static/G10_*',
+            'OriginalSources/GroupedM6Family.Static/G11_*', 'OriginalSources/GroupedM6Family.Deferred/G12_*',
+        })
+
     def test_release_omits_native_tests_and_their_properties_together(self):
         """A performance-only build cannot attach metadata to nonexistent tests."""
         self.assertEqual(self.configure('Release'), [])

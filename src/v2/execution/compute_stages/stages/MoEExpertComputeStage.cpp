@@ -17,7 +17,7 @@
  */
 
 #include "MoEExpertComputeStage.h"
-#include "../../moe/CPUExpertShardSourceSelection.h"
+#include "../../moe/ExpertShardSourceSelection.h"
 #include "MoEDeviceRebalanceStage.h"
 #include "../ComputeStageUtils.h"
 #include "../../../backends/GPUDeviceContextPool.h"
@@ -54,6 +54,7 @@
 #include "../../../utils/Logger.h"
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/PerfStatsCollector.h"
+#include "../../../utils/FNV1a.h"
 #include <mpi.h>
 
 #ifdef HAVE_CUDA
@@ -1338,13 +1339,13 @@ namespace llaminar2
                 geometry.model_columns!=params_.d_model ||
                 source.ownership().projection(WeightRole::MoEExpertUp).rows!=params_.expert_intermediate ||
                 params_.expert_mask.size()!=static_cast<size_t>(params_.num_experts) ||
-                lease.cpu_fragments.size()!=static_cast<size_t>(params_.num_experts) ||
-                params_.prepared_gate_gemm.size()!=lease.cpu_fragments.size() ||
-                params_.prepared_up_gemm.size()!=lease.cpu_fragments.size() || params_.prepared_down_gemm.size()!=lease.cpu_fragments.size())
+                lease.fragments.size()!=static_cast<size_t>(params_.num_experts) ||
+                params_.prepared_gate_gemm.size()!=lease.fragments.size() ||
+                params_.prepared_up_gemm.size()!=lease.fragments.size() || params_.prepared_down_gemm.size()!=lease.fragments.size())
                 throw std::invalid_argument("CPU joint expert invocation changed original source/member geometry");
             for (int expert=0;expert<params_.num_experts;++expert) {
                 const auto index=static_cast<size_t>(expert);
-                const auto &engines=lease.cpu_fragments[index];
+                const auto &engines=lease.fragments[index];
                 if ((params_.expert_mask[index] && !source.contains(expert)) ||
                     params_.prepared_gate_gemm[index]!=engines.gate().get() ||
                     params_.prepared_up_gemm[index]!=engines.up().get() ||
@@ -9635,10 +9636,10 @@ namespace llaminar2
                 joint_bank=epoch->bankLease();
                 const auto& layer=joint_bank->layerForModelLayer(params_.layer_idx);
                 if(!invocation.expert_mask || *invocation.expert_mask!=layer.resident_mask ||
-                   invocation.gate_engines.size()!=layer.cpu_fragments.size() ||
-                   invocation.up_engines.size()!=layer.cpu_fragments.size() || invocation.down_engines.size()!=layer.cpu_fragments.size())return false;
-                for(size_t expert=0;expert<layer.cpu_fragments.size();++expert) {
-                    const auto& actual=layer.cpu_fragments[expert];
+                   invocation.gate_engines.size()!=layer.fragments.size() ||
+                   invocation.up_engines.size()!=layer.fragments.size() || invocation.down_engines.size()!=layer.fragments.size())return false;
+                for(size_t expert=0;expert<layer.fragments.size();++expert) {
+                    const auto& actual=layer.fragments[expert];
                     if(invocation.gate_engines[expert]!=actual.gate().get() || invocation.up_engines[expert]!=actual.up().get() ||
                        invocation.down_engines[expert]!=actual.down().get()) {
                         LOG_ERROR("CPU fragment invocation replaced a candidate bank engine");return false;
@@ -9906,9 +9907,31 @@ namespace llaminar2
     // SharedExpertFFNStage — Dense SwiGLU on shared expert
     // =========================================================================
 
+    namespace
+    {
+        /** @brief Validate the numerical scope without inspecting GPU data or allocating storage. */
+        void validateSharedPublication(SharedExpertOutputRole role, MoEOverlayServicePhaseHint phase, DeviceId device)
+        {
+            if ((role != SharedExpertOutputRole::CompleteContribution && role != SharedExpertOutputRole::ParticipantLocalPartial) ||
+                (phase != MoEOverlayServicePhaseHint::Auto && phase != MoEOverlayServicePhaseHint::Decode &&
+                 phase != MoEOverlayServicePhaseHint::Prefill && phase != MoEOverlayServicePhaseHint::GroupedVerifier) ||
+                (role == SharedExpertOutputRole::ParticipantLocalPartial && (!device.is_gpu() || phase == MoEOverlayServicePhaseHint::Auto)))
+                throw std::invalid_argument("Shared local-partial publication requires an explicit GPU numerical phase");
+        }
+        /** @brief Hash only immutable role/phase policy; zero preserves the existing complete-row identity. */
+        uint64_t sharedPublicationSignature(SharedExpertOutputRole role, MoEOverlayServicePhaseHint phase)
+        {
+            if (role == SharedExpertOutputRole::CompleteContribution && phase == MoEOverlayServicePhaseHint::Auto) return 0;
+            auto identity = (kFNV1a64OffsetBasis ^ static_cast<uint64_t>(role)) * kFNV1a64Prime;
+            identity = (identity ^ static_cast<uint64_t>(phase)) * kFNV1a64Prime;
+            return identity ? identity : 1;
+        }
+    }
+
     SharedExpertFFNStage::SharedExpertFFNStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        validateSharedPublication(params_.output_role, params_.phase, params_.device_id);
         scratch_gate_ = dynamic_cast<FP32Tensor *>(params_.gate_scratch);
         scratch_up_ = dynamic_cast<FP32Tensor *>(params_.up_scratch);
 
@@ -9948,6 +9971,39 @@ namespace llaminar2
                 scratch_gate_->shape()[0],
                 scratch_up_->shape()[0]));
         }
+    }
+
+    uint64_t SharedExpertFFNStage::graphCaptureVariantSignature() const
+    {
+        auto signature = sharedPublicationSignature(params_.output_role, params_.phase);
+        const bool original_m1=params_.required_router_q8_publication&&params_.required_router_q8_publication->requiredOriginalM1Source();
+        if(original_m1) {
+            if(moe_kernel_)(void)moe_kernel_->originalM1HiddenQ8BindingSignature();
+            signature=(signature^0x4d31513800000001ULL)*kFNV1a64Prime;
+        }
+        if (!signature) return 0;
+        const auto mix = [&](uint64_t value) { signature = (signature ^ value) * kFNV1a64Prime; };
+        mix(params_.seq_len); mix(params_.d_model); mix(params_.intermediate);
+        mix(params_.force_grouped_verifier_prefill_for_decode); mix(params_.force_decode_equivalent_verifier_prefill);
+        mix(params_.disable_grouped_decode_shortcut);
+        mix(reinterpret_cast<uintptr_t>(params_.active_row_count_device));
+        mix(reinterpret_cast<uintptr_t>(params_.required_router_q8_publication.get()));
+        mix(reinterpret_cast<uintptr_t>(params_.prepared_store));
+        mix(static_cast<uint64_t>(params_.device_id.type)); mix(params_.device_id.ordinal);
+        for (auto *tensor : {params_.input, params_.gate_w, params_.up_w, params_.down_w, params_.output,
+                params_.gate_scratch, params_.up_scratch})
+        {
+            mix(reinterpret_cast<uintptr_t>(tensor));
+            mix(reinterpret_cast<uintptr_t>(tensor ? tensor->gpu_data_ptr() : nullptr));
+        }
+        for (auto id : {params_.input_buffer_id, params_.output_buffer_id,
+                params_.gate_scratch_buffer_id, params_.up_scratch_buffer_id}) mix(static_cast<uint64_t>(id));
+        for (const auto &ref : {params_.prepared_ref_gate, params_.prepared_ref_up, params_.prepared_ref_down})
+            if (ref) {
+                mix(ref->model_id.value); mix(ref->binding_id); mix(static_cast<uint64_t>(ref->kind));
+                mix(static_cast<uint64_t>(ref->device.type)); mix(ref->device.ordinal);
+            }
+        return signature ? signature : 1;
     }
 
     bool SharedExpertFFNStage::validatePlannedScratch(
@@ -10671,9 +10727,8 @@ namespace llaminar2
             owned_moe_kernel_ = KernelFactory::createMoEKernel(params_.device_id);
             moe_kernel_ = owned_moe_kernel_.get();
         }
-        if (params_.device_id.is_gpu() &&
-            shouldUseGroupedVerifierPrefillRoute() &&
-            params_.required_router_q8_publication)
+        if (params_.device_id.is_gpu() && params_.required_router_q8_publication&&
+            (shouldUseGroupedVerifierPrefillRoute()||params_.required_router_q8_publication->requiredOriginalM1Source()))
         {
             if (!moe_kernel_ ||
                 !moe_kernel_->bindRouterQ8HiddenPublication(
@@ -10822,6 +10877,12 @@ namespace llaminar2
             return false;
         }
 
+        if(params_.required_router_q8_publication&&params_.required_router_q8_publication->requiredOriginalM1Source()) {
+            if(params_.seq_len!=1||params_.active_row_count_device||params_.phase!=MoEOverlayServicePhaseHint::Decode)
+                throw std::invalid_argument("Required original hidden Q8 shared reader supports only fully-active ordinary M1 Decode");
+            if(!kernel->prepareOriginalM1HiddenQ8Publication(dynamic_cast<const TensorBase*>(params_.input),DeviceRowRange::fullyActive(1)))
+                throw std::logic_error("Required original hidden Q8 shared reader preparation failed");
+        }
         grouped_decode_launch_state_prepared_ = true;
         return true;
     }
@@ -11017,6 +11078,8 @@ namespace llaminar2
     StageDumpInfo SharedExpertFFNStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
+        info.addScalarInt("shared_output_role", static_cast<int>(params_.output_role));
+        info.addScalarInt("shared_phase", static_cast<int>(params_.phase));
         if (params_.input)
             info.addInput("input", params_.input, params_.seq_len, params_.d_model);
         if (params_.gate_w)
@@ -11026,7 +11089,7 @@ namespace llaminar2
         if (params_.down_w)
             info.addWeight("down_w", params_.down_w);
         if (params_.output)
-            info.addOutput("output", params_.output, params_.seq_len, params_.d_model);
+            info.addOutput(params_.output_role == SharedExpertOutputRole::ParticipantLocalPartial ? "shared_local_partial" : "output", params_.output, params_.seq_len, params_.d_model);
         info.addScalarInt("seq_len", params_.seq_len);
         info.addScalarInt("d_model", params_.d_model);
         info.addScalarInt("intermediate", params_.intermediate);
@@ -11175,6 +11238,13 @@ namespace llaminar2
     SharedExpertGateStage::SharedExpertGateStage(Params params)
         : IComputeStage(params.device_id), params_(std::move(params))
     {
+        validateSharedPublication(params_.output_role, params_.phase, params_.device_id);
+        if (params_.output_role == SharedExpertOutputRole::ParticipantLocalPartial &&
+            (!params_.routed_residual || !params_.combined_output || params_.execution_role != ExecutionRole::ReplicatedOwner))
+            throw std::invalid_argument("Local FFN gating requires both local producers and participant-owned fused publication");
+        if (params_.active_row_count_device && !params_.device_id.is_gpu())
+            throw std::invalid_argument(
+                "[SharedExpertGateStage] Device-owned live rows require a GPU execution owner");
         if (!params_.gate_inp ||
             params_.gate_inp->native_type() == TensorType::FP32)
         {
@@ -11184,6 +11254,24 @@ namespace llaminar2
         throw std::invalid_argument(
             "[SharedExpertGateStage] Shared-expert input gate must be normalized "
             "to FP32 by model-weight preparation");
+    }
+
+    uint64_t SharedExpertGateStage::graphCaptureVariantSignature() const
+    {
+        auto signature = sharedPublicationSignature(params_.output_role, params_.phase);
+        if (!signature) return 0;
+        const auto mix = [&](uint64_t value) { signature = (signature ^ value) * kFNV1a64Prime; };
+        mix(params_.seq_len); mix(params_.d_model); mix(static_cast<uint64_t>(params_.execution_role));
+        mix(reinterpret_cast<uintptr_t>(params_.active_row_count_device));
+        mix(static_cast<uint64_t>(params_.device_id.type)); mix(params_.device_id.ordinal);
+        for (auto *tensor : {params_.input, params_.gate_inp, params_.shared_output, params_.routed_residual, params_.combined_output})
+        {
+            mix(reinterpret_cast<uintptr_t>(tensor));
+            mix(reinterpret_cast<uintptr_t>(tensor ? tensor->gpu_data_ptr() : nullptr));
+        }
+        for (auto id : {params_.input_buffer_id, params_.output_buffer_id, params_.residual_buffer_id, params_.combined_output_buffer_id})
+            mix(static_cast<uint64_t>(id));
+        return signature ? signature : 1;
     }
 
     void SharedExpertGateStage::invalidateKernelDynamicState()
@@ -11226,7 +11314,7 @@ namespace llaminar2
             }
         }
 
-        if (params_.seq_len > 1 && params_.active_row_count_device &&
+        if (params_.active_row_count_device &&
             PerfStatsCollector::isDomainEnabled("moe"))
         {
             PerfStatsCollector::addCounter(
@@ -11308,10 +11396,10 @@ namespace llaminar2
         }
 
         IMoEKernel *kernel = ensureMoEKernel();
-        const int32_t *device_active_rows =
-            params_.device_id.is_gpu() && seq_len > 1
-                ? params_.active_row_count_device
-                : nullptr;
+        // M=1 can be an empty retained transaction too. The stable device
+        // scalar, rather than physical width, owns whether gate math is live.
+        const int32_t *device_active_rows = params_.device_id.is_gpu()
+            ? params_.active_row_count_device : nullptr;
         if (device_active_rows &&
             PerfStatsCollector::isDomainEnabled("moe"))
         {
@@ -11582,6 +11670,9 @@ namespace llaminar2
     StageDumpInfo SharedExpertGateStage::buildDumpInfoImpl() const
     {
         StageDumpInfo info;
+        const bool local = params_.output_role == SharedExpertOutputRole::ParticipantLocalPartial;
+        info.addScalarInt("shared_output_role", static_cast<int>(params_.output_role));
+        info.addScalarInt("shared_phase", static_cast<int>(params_.phase));
         if (!ownsGateArithmetic())
         {
             info.addScalarInt(
@@ -11599,9 +11690,9 @@ namespace llaminar2
         if (params_.shared_output)
         {
             if (params_.routed_residual && params_.combined_output)
-                info.addOutput("shared_output", params_.shared_output, params_.seq_len, params_.d_model);
+                info.addOutput(local ? "shared_local_partial" : "shared_output", params_.shared_output, params_.seq_len, params_.d_model);
             else
-                info.addOutput("shared_output", params_.shared_output, params_.seq_len, params_.d_model);
+                info.addOutput(local ? "shared_local_partial" : "shared_output", params_.shared_output, params_.seq_len, params_.d_model);
         }
         if (params_.routed_residual)
         {
@@ -11616,10 +11707,10 @@ namespace llaminar2
              * existing pointer for the diagnostic manifest.
              */
             info.addInput("routed_residual", params_.routed_residual, params_.seq_len, params_.d_model);
-            info.addOutput("routed_output", params_.routed_residual, params_.seq_len, params_.d_model);
+            info.addOutput(local ? "routed_local_partial" : "routed_output", params_.routed_residual, params_.seq_len, params_.d_model);
         }
         if (params_.combined_output)
-            info.addOutput("combined_output", params_.combined_output, params_.seq_len, params_.d_model);
+            info.addOutput(local ? "ffn_local_partial" : "combined_output", params_.combined_output, params_.seq_len, params_.d_model);
         info.addScalarInt("seq_len", params_.seq_len);
         info.addScalarInt("d_model", params_.d_model);
         return info;

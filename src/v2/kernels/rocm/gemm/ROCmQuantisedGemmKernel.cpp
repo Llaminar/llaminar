@@ -35,11 +35,14 @@
  * or the enclosing whole HIP capture; no global ordinal resource pool survives.
  */
 
+#include "kernels/common/HCDownOutputPublication.h"
 #include "kernels/common/ProjectionWorkLaunch.h"
 #include "ROCmQuantisedActivationProducers.h"
 #include "kernels/rocm/gdn/ROCmGatedNormSingleQ8.h"
 #include "ROCmQuantisedEpilogues.h"
 #include "ROCmQuantisedGemmKernel.h"
+#include "kernels/common/HCDownProjectionInput.h"
+#include "kernels/common/HCBranchNormSingleQ8Publication.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
@@ -1493,11 +1496,113 @@ namespace llaminar2
             publishROCmTensorWrite(*output, rocm_device_id_, stream);
         }
 
+        /** @copydoc ITensorGemm::multiply_hc_down_projection */
+        bool ROCmQuantisedGemmKernel::multiply_hc_down_projection(const HCDownProjectionInput& input,
+            TensorBase* output,int n,int k,DeviceWorkspaceManager* workspace,const HCDownOutputPublication* output_publication)
+        {
+            if(output_publication&&output_publication->producerProgram()==HCDownProducerProgram::GroupedM4Ordered)
+            {
+                constexpr int rows=4, columns=320, width=10240, partitions=16;
+                const auto target=DeviceId::rocm(rocm_device_id_);
+                (void)ExplicitGPUStream(gpu_stream_);
+                if(input.publication||!workspace||workspace->device()!=target||!workspace->isAllocated()||
+                   !output||output->isMapped()||&input.normalized==output||n!=columns||k!=width||
+                   input.normalized.native_type()!=TensorType::FP32||output->native_type()!=TensorType::FP32||
+                   input.normalized.numel()<rows*width||output->numel()<rows*columns)
+                    throw std::invalid_argument("Grouped HC-down reducer requires the original counted M4 storage");
+                DeviceNativeQuantisedMatrixDesc weights;
+                if(!inspectPreparedNativeQuantisedMatrixDesc(weights)||weights.codebook_id!=19||
+                   !weights.source_identity_present||weights.source_codebook_id!=19||weights.source_is_superblock)
+                    throw std::logic_error("Grouped HC-down reducer lost the original signed-Q8 source");
+                (void)requireQ8ResidualNativeMatrix(weights,rows,n,k);
+                const auto publication=output_publication->deviceView(output,workspace,gpu_stream_);
+                const auto requireBank=[&](const auto& name,std::size_t bytes) {
+                    void* data=workspace->getBuffer(name);
+                    if(!data||workspace->getBufferSize(name)<bytes)
+                        throw std::logic_error("Grouped HC-down reducer lost the exact original scratch extent");
+                    return data;
+                };
+                auto* codes=static_cast<int8_t*>(requireBank(GemmWorkspaceBuffers::QUANT_A,rows*width));
+                auto* scales=static_cast<float*>(requireBank(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE,
+                    rows*(width/32)*sizeof(float)));
+                auto* sums=static_cast<int32_t*>(requireBank(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE,
+                    rows*(width/32)*sizeof(int32_t)));
+                auto* partials=static_cast<float*>(requireBank(scatterPartialBufferName(),
+                    partitions*rows*columns*sizeof(float)));
+                TransferEngine::requireDeviceInput(const_cast<TensorBase*>(&input.normalized),target,gpu_stream_);
+                TransferEngine::requireDeviceOutput(output,target,gpu_stream_);
+                auto mode=beginVerifierDecodeEquivalentScope(publication.rows);
+                if(!rocmQuantGemm_quantizeActivationsBlockwiseWithSums_rows(
+                    static_cast<const float*>(input.normalized.gpu_data_ptr()),codes,scales,sums,
+                    rows,width,rocm_device_id_,gpu_stream_,32,&publication.rows)||
+                   !rocm::enqueueGroupedHCDownReducePublish(codes,weights.payload,
+                    static_cast<const uint16_t*>(weights.scales),static_cast<float*>(output->gpu_data_ptr()),
+                    scales,sums,partials,rocm_device_id_,gpu_stream_,publication))
+                    return false;
+                PerfStatsCollector::addCounter("gemm","qfn_grouped_hc_down_reduce_publish_nodes",1.0,
+                    "gemm","rocm:"+std::to_string(rocm_device_id_));
+                output_publication->recordPublished();
+                publishROCmTensorWrite(*output,rocm_device_id_,gpu_stream_);
+                return true;
+            }
+            const auto target=DeviceId::rocm(rocm_device_id_);
+            (void)ExplicitGPUStream(gpu_stream_);
+            if(!workspace||workspace->device()!=target||!workspace->isAllocated()||!output||output->isMapped()||
+                input.normalized.native_type()!=TensorType::FP32||output->native_type()!=TensorType::FP32||
+                &input.normalized==output||n!=static_cast<int>(N_)||k!=static_cast<int>(K_)||k<=0||k%32||
+                input.normalized.numel()<static_cast<std::size_t>(k)||output->numel()<static_cast<std::size_t>(n))
+                throw std::invalid_argument("HC-down publication requires original prepared plain ordinary M1 operands");
+            const auto publication=output_publication
+                ?std::optional{output_publication->deviceView(output,workspace,gpu_stream_)}:std::nullopt;
+            DeviceNativeQuantisedMatrixDesc weights;
+            if(!inspectPreparedNativeQuantisedMatrixDesc(weights))
+                throw std::logic_error("HC-down publication requires its original already-prepared native source");
+            (void)requireQ8ResidualNativeMatrix(weights,1,n,k);
+            TransferEngine::requireDeviceInput(const_cast<TensorBase*>(&input.normalized),target,gpu_stream_);
+            TransferEngine::requireDeviceOutput(output,target,gpu_stream_);
+            auto* d_A_int8=static_cast<int8_t*>(workspace->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+            auto* blockscales=static_cast<float*>(workspace->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+            if(!d_A_int8||!blockscales||workspace->getBufferSize(GemmWorkspaceBuffers::QUANT_A)<static_cast<std::size_t>(k)||
+                workspace->getBufferSize(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE)<static_cast<std::size_t>(k/32)*sizeof(float))
+                throw std::logic_error("HC-down publication lost its original input scratch banks");
+            if(input.publication) {
+                input.publication->requireRead(input.normalized,*output,workspace,gpu_stream_);
+                if(input.publication->codes()!=d_A_int8||input.publication->scales()!=blockscales)
+                    throw std::logic_error("HC-down publication changed the original input bank binding");
+            } else {
+                if(!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
+                    static_cast<const float*>(input.normalized.gpu_data_ptr()),d_A_int8,blockscales,1,k,rocm_device_id_,gpu_stream_))
+                    return false;
+            }
+            auto* rowscale=static_cast<float*>(workspace->getBuffer(GemmWorkspaceBuffers::SCALES_A));
+            auto* partials=static_cast<float*>(workspace->getBuffer(scatterPartialBufferName()));
+            if(!rowscale||!partials)throw std::logic_error("HC-down publication lost original producer/reducer scratch");
+            const auto policy=requireNativeQuantisedArithmeticPolicyCodebook(weights.codebook_id,impl_->native_source_identity);
+            const bool success=publication
+                ?enqueueNativeM1HCDownProjection(d_A_int8,weights.payload,weights.scales,weights.mins,weights.emins,
+                    static_cast<float*>(output->gpu_data_ptr()),rowscale,partials,n,k,weights.codebook_id,policy,
+                    rocm_device_id_,gpu_stream_,blockscales,*publication,output_publication->preparedProducer())
+                :rocmGemv_native_quantised_fp32_with_policy(d_A_int8,weights.payload,
+                    weights.scales,weights.mins,weights.emins,static_cast<float*>(output->gpu_data_ptr()),
+                    rowscale,partials,n,k,weights.codebook_id,policy,rocm_device_id_,gpu_stream_,blockscales);
+            if(!success)return false;
+            if(output_publication)output_publication->recordPublished();
+            if(input.publication)input.publication->consumeRead();
+            publishROCmTensorWrite(*output,rocm_device_id_,gpu_stream_);
+            return true;
+        }
+
         /** @brief Retain original native source admission while fusing HC input publication. */
         void ROCmQuantisedGemmKernel::multiply_q8_residual_corrected(HCResidualDownInput hc,
                                                                      TensorBase *output, DeviceRowRange rows,
                                                                      int n, int k,
                                                                      DeviceWorkspaceManager *workspace)
+        {
+            multiplyHCResidualDownWithPolicy(LocalGPUExpertKernelPolicy::Generic,std::move(hc),output,rows,n,k,workspace);
+        }
+
+        void ROCmQuantisedGemmKernel::multiplyHCResidualDownWithPolicy(LocalGPUExpertKernelPolicy policy,
+            HCResidualDownInput hc,TensorBase* output,DeviceRowRange rows,int n,int k,DeviceWorkspaceManager* workspace)
         {
             const auto*input=&hc.raw;auto*activated=&hc.activated;
             validateHCResidualDownRows(rows,rows.physicalRows());
@@ -1528,8 +1633,20 @@ namespace llaminar2
             if(activated==output||activated->native_type()!=TensorType::FP32||activated->isMapped()||
                activated->numel()<static_cast<std::size_t>(rows.physicalRows())*k)
                 throw std::invalid_argument("HC GPU requires its retained prepared FP32 activation output");
-            TransferEngine::requireDeviceOutput(activated,target,stream);
+            if(hc.prepublished) {
+                hc.prepublished->requirePublished(*input,*activated,rows,workspace,stream);
+                TransferEngine::requireDeviceInput(activated,target,stream);
+            } else TransferEngine::requireDeviceOutput(activated,target,stream);
             TransferEngine::requireDeviceOutput(output, target, stream);
+            if(hc.short_k_read) {
+                const auto& read=*hc.short_k_read;
+                if(read.normalized.native_type()!=TensorType::FP32||read.mixed.native_type()!=TensorType::FP32||
+                   read.mixed.isMapped()||rows.physicalRows()!=1||n%4||
+                   read.normalized.numel()<static_cast<std::size_t>(n)||read.mixed.numel()<static_cast<std::size_t>(n/4))
+                    throw std::invalid_argument("HC short-K read requires complete original M1 FP32 branch/mixed operands");
+                TransferEngine::requireDeviceInput(const_cast<TensorBase*>(&read.normalized),target,stream);
+                TransferEngine::requireDeviceOutput(&read.mixed,target,stream);
+            }
             const auto values = static_cast<std::size_t>(rows.physicalRows()) * k,
                        scales = values / 32 * sizeof(float);
             const auto requireBank = [&](const std::string &name, std::size_t bytes) -> void * {
@@ -1539,17 +1656,26 @@ namespace llaminar2
                         "Two-term ROCm Q8 invocation lacks an admitted named activation bank");
                 return pointer;
             };
-            rocmHCResidualDownQ8Projection(
-                {{weights, rows, Q8ResidualQuantizerPolicy::ROCmFiniteHalfNativeReciprocal,
+            const GPUHCResidualDownPublication publication{
+                {weights, rows, Q8ResidualQuantizerPolicy::ROCmFiniteHalfNativeReciprocal,
                  static_cast<const float *>(input->gpu_data_ptr()),
                  static_cast<float *>(output->gpu_data_ptr()),
                  static_cast<signed char *>(requireBank(kGPUProjectionPrimaryQ8, values)),
                  static_cast<signed char *>(requireBank(kGPUProjectionResidualQ8, values)),
                  static_cast<float *>(requireBank(kGPUProjectionPrimaryQ8Scales, scales)),
                  static_cast<float *>(requireBank(kGPUProjectionResidualQ8Scales, scales))},
-                 static_cast<float*>(activated->gpu_data_ptr())},
-                stream, impl_->residual_iq_tables);
-            publishROCmTensorWrite(*activated, rocm_device_id_, stream);
+                 static_cast<float*>(activated->gpu_data_ptr()),
+                 hc.prepublished?HCDownQ8PublicationSource::OriginalReducer:HCDownQ8PublicationSource::Standalone};
+            if(hc.short_k_read) {
+                const auto& read=*hc.short_k_read;
+                rocmHCResidualShortKReadQ8Projection({publication,
+                    static_cast<const float*>(read.normalized.gpu_data_ptr()),
+                    static_cast<float*>(read.mixed.gpu_data_ptr())},stream);
+                publishROCmTensorWrite(read.mixed, rocm_device_id_, stream);
+            } else rocmHCResidualDownQ8ProjectionWithPolicy(publication,stream,impl_->residual_iq_tables,
+                policy==LocalGPUExpertKernelPolicy::QFNMI50TP4);
+            if(hc.prepublished)hc.prepublished->consume();
+            else publishROCmTensorWrite(*activated, rocm_device_id_, stream);
             publishROCmTensorWrite(*output, rocm_device_id_, stream);
         }
 
@@ -7118,3 +7244,25 @@ namespace llaminar2
 
     } // namespace rocm
 } // namespace llaminar2
+
+#include "ROCmPersistentHCRead.h"
+#include "ROCmFP32ProjectionLoadPolicy.h"
+namespace llaminar2::rocm {
+/** @copydoc resolvePersistentHCReadSources */
+void resolvePersistentHCReadSources(PersistentHCReadArgs& args,const ITensorGemm& down,
+ const ITensorGemm& up,const ITensorGemm* injection) {
+ if(isGraphCaptureActive()||!down.weights_converted()||!up.weights_converted()||
+    !down.inspectPreparedNativeQuantisedMatrixDesc(args.down_weights)||
+    !up.inspectPreparedNativeQuantisedMatrixDesc(args.up.weights))
+  throw std::invalid_argument("Persistent HC requires original already-prepared native source owners cold");
+ if(injection) {
+  ContiguousFloatingPointWeightDescriptor weights;
+  if(!injection->weights_converted()||!injection->exportContiguousFloatingPointWeights(weights)||
+     !weights.valid()||weights.type!=TensorType::FP32||weights.n!=4||weights.k!=args.down_weights.k)
+   throw std::invalid_argument("Persistent HC injection requires its original prepared contiguous FP32 four-row source");
+  args.injection.weights=static_cast<const float*>(weights.data);
+  args.injection.load_pairs=static_cast<int>(selectFP32ProjectionLoadPairs(1,4,1,weights.k));
+ } else if(args.injection.weights||args.injection.output)
+  throw std::invalid_argument("Persistent HC injection binding has no original prepared engine owner");
+}
+} // namespace llaminar2::rocm

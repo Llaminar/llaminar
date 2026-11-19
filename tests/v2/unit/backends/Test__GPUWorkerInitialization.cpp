@@ -7,13 +7,14 @@
  * do not reproduce a second native creation algorithm or query a driver.
  */
 #include "backends/GPUWorkerInitialization.h"
+#include "../../utils/IntentionalFaultProcess.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <cstddef>
+#include <csignal>
 #include <stdexcept>
 #include <thread>
 #include <vector>
-#include <sys/resource.h>
 #include <unistd.h>
 using namespace llaminar2;
 namespace
@@ -39,12 +40,6 @@ namespace
             while (!live.empty()) { released.push_back(live.back()); live.pop_back(); }
         }
     };
-    /** @brief Keep deliberate fatal probes from creating filesystem core payloads. */
-    void disableCorePayload()
-    {
-        const rlimit limit{0, 0};
-        if (setrlimit(RLIMIT_CORE, &limit) != 0) ::_exit(98);
-    }
     /** @brief Exception identity must survive rollback unchanged. */
     struct InitializationFailure final : std::runtime_error
     {
@@ -141,16 +136,16 @@ TEST(GPUWorkerInitialization, RollbackRunsOnInitializerWorker)
 /** @test Failed retirement cannot turn initialization failure into a recoverable result. */
 TEST(GPUWorkerInitialization, CleanupFailureIsFatalForFalseAndException)
 {
-    EXPECT_DEATH({
-        disableCorePayload();
+    EXPECT_EXIT({
+        llaminar2::test::disableIntentionalFaultCoreDump();
         (void)runGPUWorkerInitialization([] { return false; }, [] { throw std::runtime_error("cleanup false path"); });
-    }, "Native initialization rollback failed: cleanup false path");
-    EXPECT_DEATH({
-        disableCorePayload();
+    }, ::testing::KilledBySignal(SIGABRT), "Native initialization rollback failed: cleanup false path");
+    EXPECT_EXIT({
+        llaminar2::test::disableIntentionalFaultCoreDump();
         (void)runGPUWorkerInitialization([]() -> bool { throw InitializationFailure(1); }, [] { throw std::runtime_error("cleanup exception path"); });
-    }, "Native initialization rollback failed: cleanup exception path");
-    EXPECT_DEATH({
-        disableCorePayload();
+    }, ::testing::KilledBySignal(SIGABRT), "Native initialization rollback failed: cleanup exception path");
+    EXPECT_EXIT({
+        llaminar2::test::disableIntentionalFaultCoreDump();
         (void)runGPUWorkerInitialization([] { return false; }, [] { throw 1; });
-    }, "Native initialization rollback failed with an unknown exception");
+    }, ::testing::KilledBySignal(SIGABRT), "Native initialization rollback failed with an unknown exception");
 }

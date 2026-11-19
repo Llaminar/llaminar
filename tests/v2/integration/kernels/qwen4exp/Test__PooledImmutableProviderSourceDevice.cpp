@@ -252,7 +252,12 @@ TEST(PooledImmutableProviderSourceDevice,ProviderBackingUsesOwnedTemporaryRoot){
 /** @brief One original cache capacity and one disjoint group of source formats. */
 class ProviderFormatReplay : public ::testing::TestWithParam<std::tuple<unsigned, unsigned>> {};
 INSTANTIATE_TEST_SUITE_P(CapacityAndFormats, ProviderFormatReplay,
-    ::testing::Combine(::testing::Values(0u, 3u), ::testing::Range(0u, PooledFormatReplayGroup::Count)));
+    ::testing::Combine(::testing::Values(0u, 3u), ::testing::Range(0u, PooledFormatReplayGroup::Count)),
+    [](const ::testing::TestParamInfo<ProviderFormatReplay::ParamType>& info) {
+        const auto slots = std::get<0>(info.param);
+        const auto group = std::get<1>(info.param);
+        return std::string(slots == 0u ? "C0Group" : "PositiveGroup") + std::to_string(group);
+    });
 
 /** @brief Cold arena sealing retains all row envelopes for one original cache capacity. */
 class ProviderColdArenaSeal : public ::testing::TestWithParam<unsigned> {};

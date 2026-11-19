@@ -299,12 +299,12 @@ namespace llaminar2
                                 throw std::logic_error("Candidate arrival has no exact local participant owner");
                             auto& layer=local->bank.layerForModelLayer(migration.layer_idx);
                             std::string arrival_error;
-                            if(layer.cpu_fragment_family) {
-                                MoEOverlayPreparedCPUFragmentPayload fragment;
+                            if(layer.fragment_family) {
+                                MoEOverlayPreparedFragmentPayload fragment;
                                 if(destination.arrival->destinationEpoch()!=candidate_->epoch ||
-                                   !destination.arrival->completeCPUFragment(fragment,&arrival_error))
-                                    throw std::runtime_error(arrival_error.empty()?"Candidate CPU fragment arrival has no exact completed epoch":arrival_error);
-                                layer.setResidentCPUFragment(migration.expert_id,std::move(fragment));
+                                   !destination.arrival->completeFragment(fragment,&arrival_error))
+                                    throw std::runtime_error(arrival_error.empty()?"Candidate Expert fragment arrival has no exact completed epoch":arrival_error);
+                                layer.setResidentFragment(migration.expert_id,std::move(fragment));
                             } else {
                                 MoEOverlayPreparedExpertPayload payload;
                                 if(!destination.arrival->completePayload(payload,&arrival_error))
@@ -731,7 +731,7 @@ namespace llaminar2
         }
     } // namespace
 
-    bool MoEOverlayPreparedCPUFragmentPayload::validateRole(
+    bool MoEOverlayPreparedFragmentPayload::validateRole(
         const MoEExpertShardCohort &cohort, std::size_t member, ExpertTierWeightProjection role,
         const std::shared_ptr<ITensorGemm> &engine, std::string *error)
     {
@@ -744,13 +744,13 @@ namespace llaminar2
             return false;
         };
         if (member >= cohort.participants().size() || !engine || static_cast<unsigned>(role) > 2)
-            return reject("CPU fragment role requires its original member and actual local engine");
+            return reject("Expert fragment role requires its original member and actual local engine");
         const auto local = cohort.localManifest(member);
         const auto expected =
             std::find_if(local.projections.begin(), local.projections.end(),
                          [role](const auto &projection) { return projection.projection == role; });
         if (expected == local.projections.end())
-            return reject("CPU fragment role is absent from its original source manifest");
+            return reject("Expert fragment role is absent from its original source manifest");
         MoEOverlayPreparedWeightSource source;
         if (!resolveMoEOverlayPreparedWeightSource(
                 engine, cohort.participants()[member].address.toLocalDeviceId(), source,
@@ -762,20 +762,26 @@ namespace llaminar2
             rows = source.cpu_packed->N;
             columns = source.cpu_packed->K;
         }
-        else if (source.kind == MoEOverlayPreparedWeightSourceKind::CpuContiguousFloating)
+        else if (source.kind == MoEOverlayPreparedWeightSourceKind::GpuSeparatedNativeQuantised)
+        {
+            rows = source.gpu_packed.n;
+            columns = source.gpu_packed.k;
+        }
+        else if (source.kind == MoEOverlayPreparedWeightSourceKind::CpuContiguousFloating ||
+                 source.kind == MoEOverlayPreparedWeightSourceKind::GpuContiguousFloating)
         {
             rows = source.floating.n;
             columns = source.floating.k;
         }
         else
-            return reject("CPU fragment arrival cannot adopt a foreign GPU prepared engine");
+            return reject("Fragment arrival has an unsupported prepared source representation");
         if (rows != expected->N || columns != expected->K || source.format != expected->format)
-            return reject("CPU fragment engine differs from its original local projection "
+            return reject("Expert fragment engine differs from its original local projection "
                           "geometry/source format");
         return true;
     }
 
-    MoEOverlayPreparedCPUFragmentPayload::MoEOverlayPreparedCPUFragmentPayload(
+    MoEOverlayPreparedFragmentPayload::MoEOverlayPreparedFragmentPayload(
         ModelContextId model, std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation,
         std::shared_ptr<const MoEExpertShardCohort> cohort, std::size_t member, int expert,
         std::array<std::shared_ptr<ITensorGemm>, 3> engines,std::uint64_t arrival_epoch)
@@ -785,7 +791,7 @@ namespace llaminar2
         if (!model_.value || !preparation_ || !cohort_ ||
             member_ >= cohort_->participants().size() || expert_ < 0 ||
             expert_ >= cohort_->ownership(member_).geometry().experts)
-            throw std::invalid_argument("CPU fragment payload requires original "
+            throw std::invalid_argument("Expert fragment payload requires original "
                                         "model/preparation/cohort/member/expert provenance");
         for (std::size_t role = 0; role < engines_.size(); ++role)
         {
@@ -794,7 +800,7 @@ namespace llaminar2
                               engines_[role], &error))
                 throw std::invalid_argument(error);
         }
-        if(arrival_epoch_){
+        if(arrival_epoch_ && cohort_->participants()[member_].address.isCPU()){
             const auto& member=cohort_->participants()[member_];
             execution_evidence_.emplace(PerfStatsCollector::bindCounter("moe_overlay_residency",
                 "completed_cpu_fragment_execution","inference",member.address.toLocalDeviceId().toString(),
@@ -804,22 +810,24 @@ namespace llaminar2
         }
     }
 
-    void MoEOverlayPreparedCPUFragmentPayload::recordCompletedExecution(std::uint64_t invocation_epoch,std::uint64_t routes)const
+    void MoEOverlayPreparedFragmentPayload::recordCompletedExecution(std::uint64_t invocation_epoch,std::uint64_t routes)const
     {
         if(!arrival_epoch_ || !routes || !PerfStatsCollector::isDomainEnabled("moe_overlay_residency"))return;
+        if (!cohort_->participants()[member_].address.isCPU())
+            throw std::logic_error("GPU fragment execution requires device-owned completion evidence");
         if(!valid() || !execution_evidence_ || invocation_epoch<arrival_epoch_)
-            throw std::logic_error("CPU fragment execution must use its original completed arrival in an exact successor bank");
+            throw std::logic_error("Expert fragment execution must use its original completed arrival in an exact successor bank");
         PerfStatsCollector::addCounterWithSequence(*execution_evidence_,static_cast<double>(routes),
             {arrival_epoch_,invocation_epoch});
     }
 
-    bool MoEOverlayPreparedCPUFragmentPayload::valid() const noexcept
+    bool MoEOverlayPreparedFragmentPayload::valid() const noexcept
     {
         return model_.value && preparation_ && cohort_ && engines_[0] && engines_[1] && engines_[2];
     }
 
-    bool MoEOverlayPreparedCPUFragmentPayload::sameIdentity(
-        const MoEOverlayPreparedCPUFragmentPayload &other) const noexcept
+    bool MoEOverlayPreparedFragmentPayload::sameIdentity(
+        const MoEOverlayPreparedFragmentPayload &other) const noexcept
     {
         const auto same = [](const auto &a, const auto &b)
         { return a.get() == b.get() && !a.owner_before(b) && !b.owner_before(a); };
@@ -835,9 +843,9 @@ namespace llaminar2
         ModelContextId model, std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation,
         std::shared_ptr<const MoEExpertShardCohort> cohort, std::size_t member,
         uint64_t candidate_epoch, int expert)
-        : fragment_destination_(CPUFragmentDestination{
+        : fragment_destination_(FragmentDestination{
               model, std::move(preparation), std::move(cohort), member, candidate_epoch, expert}),
-          projections_(DeviceMoEProjectionSet::CompleteExpert)
+          projections_(DeviceMoEProjectionSet::IntermediateShard)
     {
         const auto &destination = *fragment_destination_;
         if (!destination.model.value || !destination.preparation || !destination.cohort ||
@@ -846,11 +854,11 @@ namespace llaminar2
             destination.expert >=
                 destination.cohort->ownership(destination.member).geometry().experts)
             throw std::invalid_argument(
-                "CPU fragment arrival requires its original fixed-cohort candidate destination");
+                "Expert fragment arrival requires its original fixed-cohort candidate destination");
     }
 
-    bool MoEOverlayPreparedExpertArrival::completeCPUFragment(
-        MoEOverlayPreparedCPUFragmentPayload &payload, std::string *error) const
+    bool MoEOverlayPreparedExpertArrival::completeFragment(
+        MoEOverlayPreparedFragmentPayload &payload, std::string *error) const
     {
         if (error)
             error->clear();
@@ -863,13 +871,13 @@ namespace llaminar2
                 *error =
                     !failure_.empty()
                         ? failure_
-                        : "CPU fragment arrival is wrong-arm or lacks its complete local triplet";
+                        : "Expert fragment arrival is wrong-arm or lacks its complete local triplet";
             return false;
         }
         const auto &destination = *fragment_destination_;
         try
         {
-            payload = MoEOverlayPreparedCPUFragmentPayload(
+            payload = MoEOverlayPreparedFragmentPayload(
                 destination.model, destination.preparation, destination.cohort, destination.member,
                 destination.expert, engines_,destination.epoch);
             return true;
@@ -913,7 +921,7 @@ namespace llaminar2
         }
         try
         {
-            if (fragment_destination_ && !MoEOverlayPreparedCPUFragmentPayload::validateRole(
+            if (fragment_destination_ && !MoEOverlayPreparedFragmentPayload::validateRole(
                 *fragment_destination_->cohort, fragment_destination_->member, projection, engine, error))
                 return false;
             auto &field = projectionField(engines_, projection);
@@ -962,7 +970,7 @@ namespace llaminar2
         }
         if (fragment_destination_)
         {
-            if (error) *error = "CPU fragment arrival cannot produce a whole-expert payload";
+            if (error) *error = "Expert fragment arrival cannot produce a whole-expert payload";
             payload = {};
             return false;
         }
@@ -993,7 +1001,7 @@ namespace llaminar2
             static_cast<unsigned>(projection_) >
                 static_cast<unsigned>(ExpertTierWeightProjection::Down) ||
             (projection_ == ExpertTierWeightProjection::Down &&
-             arrival_->projections() != DeviceMoEProjectionSet::CompleteExpert))
+             !deviceMoEProjectionSetHasDown(arrival_->projections())))
             throw std::invalid_argument(
                 "ExpertOverlay completion requires a known role, coverage and final engine owner");
         const auto &destination = intersections_.front().destination();
@@ -1322,8 +1330,8 @@ namespace llaminar2
                     if(local_arrival>=record.destination_arrivals.size() || record.destination_arrivals[local_arrival].participant_id!=id ||
                        !record.destination_arrivals[local_arrival].arrival){started_shape_ok=false;break;}
                     const auto& arrival=record.destination_arrivals[local_arrival++].arrival;
-                    if(arrival->isCPUJointFragment()!=config_.registry->isCPUJointParticipant(id) ||
-                       (arrival->isCPUJointFragment() && arrival->destinationEpoch()!=transaction.candidate->epoch)) {started_shape_ok=false;break;}
+                    if(arrival->isJointFragment()!=config_.registry->isJointParticipant(id) ||
+                       (arrival->isJointFragment() && arrival->destinationEpoch()!=transaction.candidate->epoch)) {started_shape_ok=false;break;}
                     for(size_t previous=0;previous+1<local_arrival;++previous)
                         if(record.destination_arrivals[previous].arrival.get()==arrival.get()){started_shape_ok=false;break;}
                     // Each required role has real/protocol work. Exact native

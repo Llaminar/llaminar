@@ -21,6 +21,7 @@
 #include "kernels/IMoEKernel.h"
 #include "kernels/KernelFactory.h"
 #include "kernels/common/FloatingExpertNumericalContract.h"
+#include "kernels/common/MoERuntimeDescriptorLaunch.h"
 #include "kernels/common/SamplingMath.h"
 #include "kernels/common/RouterQ8Launch.h"
 #include "kernels/common/DeviceQ8ActivationNumericalContract.h"
@@ -89,16 +90,6 @@
 #include <vector>
 
 #ifdef HAVE_CUDA
-extern "C" bool cudaMoE_materialize_runtime_floating_descriptor_tables(
-    const void *runtime,
-    llaminar2::DeviceMoEFloatingMatrixDesc *gate_descs,
-    llaminar2::DeviceMoEFloatingMatrixDesc *up_descs,
-    llaminar2::DeviceMoEFloatingMatrixDesc *down_descs,
-    int num_experts,
-    llaminar2::DeviceMoEWeightFormat expected_format,
-    int device_idx,
-    void *stream);
-
 extern "C" bool cudaMoE_query_row_major_grid(
     unsigned int column_blocks,
     int logical_rows,
@@ -217,15 +208,6 @@ extern "C" bool cudaMoE_softmax_topk(
     void *stream,
     const int *device_effective_seq_len,
     void *deferred_selected_route_ledger = nullptr);
-
-extern "C" bool cudaMoE_materialize_runtime_prefill_descriptor_tables(
-    const void *runtime,
-    llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
-    llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
-    llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
-    int num_experts,
-    int device_idx,
-    void *stream);
 
 extern "C" bool cudaMoE_materialize_runtime_prefill_plan(
     const void *runtime,
@@ -21192,7 +21174,8 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
               cudaSuccess);
     publicationGraph.emplace(stream, "complete runtime descriptor publication only");
     ASSERT_TRUE(cudaMoE_materialize_runtime_prefill_descriptor_tables(
-        device_runtime, device_gate, device_up, device_down, num_experts, 0, stream));
+        device_runtime, device_gate, device_up, device_down, num_experts, 0, stream,
+        llaminar2::DeviceMoEProjectionSet::CompleteExpert));
     ASSERT_TRUE(cudaMoE_materialize_runtime_prefill_plan(device_runtime, device_gate, device_up,
                                                         device_down, device_active, num_experts,
                                                         num_experts, 0, stream));
@@ -21215,7 +21198,8 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
                                                          device_down, device_active, num_experts,
                                                          num_experts, 0, nullptr));
     EXPECT_FALSE(cudaMoE_materialize_runtime_prefill_descriptor_tables(
-        device_runtime, device_gate, device_up, device_down, num_experts, 0, nullptr));
+        device_runtime, device_gate, device_up, device_down, num_experts, 0, nullptr,
+        llaminar2::DeviceMoEProjectionSet::CompleteExpert));
 
     ASSERT_EQ(cudaMemcpyAsync(actual_gate.data(), device_gate,
                              actual_gate.size() * sizeof(DeviceNativeQuantisedMatrixDesc),
@@ -21404,7 +21388,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeFloatingDescriptorPublication512ExpertsCaptur
         }
         graph.emplace(stream, "floating complete-domain descriptor publication only");
         ASSERT_TRUE(cudaMoE_materialize_runtime_floating_descriptor_tables(
-            nativeRuntime, gate, up, down, experts, format, 0, stream));
+            nativeRuntime, gate, up, down, experts, format, 0, stream,
+            llaminar2::DeviceMoEProjectionSet::CompleteExpert));
         ASSERT_TRUE(graph->finishAndInstantiate());
         for (int phase = 0; phase < 4; ++phase)
         {

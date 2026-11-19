@@ -25,7 +25,9 @@ from opencode_cell_runtime import DISK_MIB, OUTPUT_TOKENS, runtime_evidence
 from opencode_certification_evidence import validate_app_report, validate_native_coverage
 from opencode_context_admission import AdmissionOutcome, ContextPolicy, select_context
 from prefix_reuse_measurement import integer
-from resource_growth_evidence import WorkloadWindow
+from resource_growth_evidence import (WorkloadWindow, replay_discovery_membership,
+                                      replay_inactive_envelope, replay_native_ranks)
+from collective_runtime_binding import replay_collective_binding
 
 
 def validate_prefix_summary(reuse: dict, requests: int) -> None:
@@ -144,8 +146,10 @@ def validate_cell(report: dict, pair: dict, manifest: dict, correctness: dict, a
     resources, driver = evidence['resources'], evidence['driver']
     growth = resources['growth']
     window = WorkloadWindow(**resources['window'])
+    discovery = replay_discovery_membership(resources['discovery_membership'])
+    inactive_metrics = replay_inactive_envelope(discovery, resources['discovery_baseline'], growth, window)
     rank_count = integer(evidence['perf']['world_size'], 'native world size')
-    expected_metrics = {f'rank/{rank}/anonymous_and_swap' for rank in range(rank_count)}
+    expected_metrics = inactive_metrics | {f'rank/{rank}/anonymous_and_swap' for rank in range(rank_count)}
     expected_metrics.update(f"rank/{record['rank']}/{record['device']}"
         for record in evidence['perf']['records']
         if record.get('domain') == 'server' and record.get('name') == 'execution_participant'
@@ -172,6 +176,11 @@ def validate_cell(report: dict, pair: dict, manifest: dict, correctness: dict, a
             or integer(driver.get('snapshot_count'), 'driver snapshots') < 2
             or integer(driver.get('new_record_count'), 'driver records') < 0):
         raise ValueError('Coding driver window was incomplete or contained faults')
+    if 'collective_binding' not in evidence:
+        raise ValueError('Missing collective runtime binding receipt')
+    native_ranks = replay_native_ranks(evidence['perf'], resources['ranks'], discovery)
+    replay_collective_binding(evidence['collective_binding'], expected['image'],
+                              native_ranks, evidence['perf']['records'], discovery=discovery)
     observations = evidence['observations']
     if (observations.get('passed') is not True or observations.get('failed_polls') != 0
             or observations.get('error') is not None or integer(observations.get('snapshots'), 'stats snapshots') < 2
