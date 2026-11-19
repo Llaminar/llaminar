@@ -691,11 +691,13 @@ esac
         self.assertEqual(job["runs-on"], "${{ matrix.runner }}")
         self.assertEqual(job["strategy"], {"fail-fast": "false", "max-parallel": "2",
             "matrix": {"cpu_isa": ["AVX2", "AVX512"], "include": [
-                {"cpu_isa": "AVX2", "runner": "llaminar-develop-avx2", "pr_gpus": "CUDA+ROCm"},
-                {"cpu_isa": "AVX512", "runner": "llaminar-avx512", "pr_gpus": "none"}]}})
+                {"cpu_isa": "AVX2", "runner": "llaminar-develop-avx2", "pr_gpus": "CUDA+ROCm",
+                 "check_name": "Unit + hardware preflight (AVX2)"},
+                {"cpu_isa": "AVX512", "runner": "llaminar-avx512", "pr_gpus": "none",
+                 "check_name": "Unit + host (AVX512)"}]}})
         self.assertEqual(len({row["runner"] for row in job["strategy"]["matrix"]["include"]}), 2)
         self.assertEqual(f"{caller['name']} / {job['name']}",
-                         "Develop PR / Unit + host (${{ matrix.cpu_isa }})")
+                         "Develop PR / ${{ matrix.check_name }}")
         self.assertIn("github.event_name == 'pull_request'", job["if"])
         self.assertIn("github.base_ref == 'develop'", job["if"])
         self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", job["if"])

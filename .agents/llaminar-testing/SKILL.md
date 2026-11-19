@@ -111,10 +111,10 @@ open a PR into `develop`. Use Conventional Commit messages and PR titles. See
 documentation/CI-only maintenance exception. Use the current protected
 workflow definitions when working from an older feature checkout.
 
-The develop ruleset requires both `Develop PR / Unit + host (AVX2)` and
+The develop ruleset requires both `Develop PR / Unit + hardware preflight (AVX2)` and
 `Develop PR / Unit + host (AVX512)`, an up-to-date merge candidate and owner
-approval. The AVX2 context keeps its stable name while also requiring its GPU
-scope. The separate owner-approval ruleset uses only
+approval. The AVX2 context includes the hardware-qualified GPU scope.
+The separate owner-approval ruleset uses only
 `@Llaminar/repository-approvers` on `develop`, `rc/*` and `master`. Native squash
 auto-merge waits for reviews and checks. The owner's PR-only approval override
 and dedicated release-evidence deploy key retain their existing exceptions.
