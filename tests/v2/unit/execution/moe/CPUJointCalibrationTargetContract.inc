@@ -202,7 +202,7 @@ TEST(CPUJointCalibrationTargetContract, SourceBoundExpansionPreservesMeasuredLay
         std::vector<MoEOverlayLayerWeightManifest> manifests;
         for (int layer = first; layer < first + 2; ++layer)
             manifests.push_back(snapshot->placementOwnerMap().placementFor(layer, 1)->shard_cohort->source());
-        const MoEOverlayEconomyCalibrationLayerCatalog catalog(manifests);
+        const MoEOverlayEconomyCalibrationLayerCatalog catalog(manifests, &snapshot->originalOwnerMap());
         // Prove the actual source builder's rule, not a test-authored split:
         // one plan-level member order and balanced source-block intervals must
         // produce equal Gate/Up F rows and Down K columns in each class layer.
@@ -266,6 +266,8 @@ TEST(CPUJointCalibrationTargetContract, SourceBoundExpansionPreservesMeasuredLay
             if (row.measured_coordinate) EXPECT_EQ(*row.measured_coordinate, input->coordinate);
         }
         EXPECT_EQ(MoEOverlayEconomyProfileComposer::normalizeMigrationMeasurements(expanded.rows).size(), 4u);
+        const MoEOverlayEconomyCalibrationLayerCatalog whole_geometry_only(manifests);
+        EXPECT_THROW((void)whole_geometry_only.expand(measured, snapshot), std::invalid_argument);
         EXPECT_THROW((void)catalog.expand(expanded, snapshot), std::invalid_argument); // No projection chaining.
         EXPECT_THROW((void)catalog.expand(measured), std::invalid_argument); // Whole adapter remains strict.
         auto missing = measured; missing.rows.pop_back();
