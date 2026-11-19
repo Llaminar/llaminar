@@ -1,6 +1,6 @@
 ---
 name: llaminar-testing
-description: Run, maintain, and diagnose Llaminar's Unit/host and AVX2 hardware-qualified production preflight PR checks and RC release gates, including full production preflight, frozen-history numerical panels, OpenCode stress and benchmarks. Use for test selection, canonical matrix changes and focused parity or HTTP/MPI diagnostics. Kernel tuning and cross-engine comparisons have separate skills.
+description: Run, maintain, and diagnose Llaminar's Unit/host PR checks on x86 and ARM64, AVX2 hardware-qualified production preflight and RC release gates, including full production preflight, frozen-history numerical panels, OpenCode stress and benchmarks. Use for test selection, canonical matrix changes and focused parity or HTTP/MPI diagnostics. Kernel tuning and cross-engine comparisons have separate skills.
 ---
 
 # Llaminar Testing
@@ -103,7 +103,17 @@ dependency-bound OCI toolchains are restored before source compilation;
 a cold build checkpoints GPU SDK layers. Source builds admit their exact
 OCI digests, inputs and ISA. PR cache entries remain scoped to that merge ref;
 registry cache access is import-only. See `docs/production-ci.md` for host
-provisioning and cache ownership. These jobs do not use GitHub cloud runners.
+provisioning and cache ownership.
+
+`develop-pr-arm64.yml` builds the same `test-runner` and `runtime` Dockerfile
+targets on GitHub's `ubuntu-24.04-arm` runner with NEON and CUDA `sm_121`.
+Use the `arm64-pr` installed inventory for this check. The driver
+`run_develop_pr_tests.py --arm64` verifies its receipt and runs only CMake's
+`ARM64PR` Unit and host preflight registrations, without GPUs or model mounts.
+A skip in any selected test fails the check. The QFN registrations replay
+production CPU components with generated weights. Full-model QFN qualification
+requires the published checkpoint. The check also smoke-tests the sibling
+Release runtime. See [production CI](../../docs/production-ci.md).
 
 Start ordinary work from current `develop` on `feat/<description>`; push and
 open a PR into `develop`. Use Conventional Commit messages and PR titles. See
@@ -123,12 +133,14 @@ when the user explicitly authorizes a manual merge. Native auto-merge must still
 wait for the required checks; an overridden check is not passing evidence.
 Never grant the general GitHub Actions app a ruleset bypass.
 
-The `develop` push workflow remains on the AVX2 development host and
-`run_develop_image_gate.py --build-only --publish`. It compiles both full-backend
-AVX512 and AVX2 Release runtimes, omits Integration compilation, and publishes
-both branch and source-SHA tags only after both builds authenticate. It runs no
-tests and grants no certificate. Publication has one concurrency group and
-cancels a superseded build when a new develop merge arrives. Complete Unit and
+The `develop` push workflow builds the full-backend AVX512 and AVX2 Release
+runtimes on the AVX2 development host with
+`run_develop_image_gate.py --build-only --publish`. It publishes branch and
+source-SHA tags after both builds authenticate. A standard GitHub ARM64
+runner builds the Release CUDA+CPU specialization and publishes
+`develop-arm64` and `sha-<commit>-arm64` after the runtime startup smoke test.
+Publication omits Integration compilation and grants no release certificate.
+A new develop merge cancels superseded publication jobs. Complete Unit and
 production preflight remain mandatory in the explicit production pipeline
 through `run_production_prerequisites.py`. Production hardware has its own queue.
 The release path is **develop → rc/* → master**. Only explicit user direction

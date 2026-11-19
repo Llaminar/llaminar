@@ -35,17 +35,19 @@ triggers the required checks through `ready_for_review`. The master PR jobs,
 branch-policy check and PR-triggered Copilot setup use the same draft policy.
 GitHub can still show a skipped workflow entry for a draft event; no PR job runs.
 
-The `ARM64 build and Unit + host` check runs on GitHub's standard
-`ubuntu-24.04-arm` runner for ready PRs into `develop`. It builds the
-`arm64-pr` Docker target with baseline NEON, pinned oneDNN and the Integration
-configuration. CMake derives the `ARM64PR` scope from the ARM and NEON
+The `ARM64 build and Unit + host` check builds the shared Dockerfile
+`test-runner` and `runtime` targets on GitHub's standard `ubuntu-24.04-arm`
+runner for ready PRs into `develop`. Both images enable baseline NEON and
+CUDA for GB10 (`sm_121`). The `arm64-pr` test inventory builds Integration
+executables and seals them in the test-runner alongside the Release runtime
+closure. CMake derives the `ARM64PR` scope from the ARM and NEON
 registrations in Unit and production preflight. These cover NEON arithmetic
 and code generation, native grouped projections and GDN, quantized KV and
 sparse attention, and Linux OpenMP/MPI placement and loader behavior. The
-shared PR driver runs both subsets in the CPU-only container and retains their
-JUnit logs. The companion `ARM64 CUDA runtime build`
-check builds the Release container for GB10 and verifies application startup.
-Both run on [GitHub's standard ARM64 runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+shared PR driver verifies the installed receipt, runs both subsets without
+GPU devices or models, and retains JUnit logs. The check also starts the
+sibling Release application with `--help`.
+See [GitHub's standard ARM64 runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
 
 The ARM host scope generates deterministic QFN fixture weights for bounded
 prefill and decode projection replay, sparse attention and per-layer embedding

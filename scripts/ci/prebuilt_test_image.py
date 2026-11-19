@@ -5,8 +5,8 @@
 
 An installed test-runner image cannot incrementally rebuild: compiler-only
 objects are deliberately absent. This receipt changes only build preparation,
-not test execution. Unit-only PR images and complete production companions
-carry distinct scopes; a Unit receipt cannot admit production preflight.
+not test execution. Production, Unit-only and ARM64 PR companions carry
+distinct receipt scopes.
 The outer CI driver pins the immutable image ID and never overlays build/source
 files, while this receipt checks its installed CTest and executable inventory.
 """
@@ -23,9 +23,9 @@ import subprocess
 from production_artifacts import digest, file_digest, write_json
 from run_production_parity_campaigns import (
     PRODUCTION_CAMPAIGN_NAME, PRODUCTION_TEST_PREFLIGHT_LABEL,
-    PRODUCTION_PARITY_UNIT_LABEL, PRODUCTION_PARITY_UNIT_PREFIX,
+    PRODUCTION_PARITY_UNIT_LABEL, PRODUCTION_PARITY_UNIT_PREFIX, PreflightExecutionLane,
     discover_production_test_preflight_tests,
-    discover_production_parity_unit_tests,
+    discover_production_parity_unit_tests, discover_production_test_preflight_registrations,
     _as_string_list, _property_map,
 )
 
@@ -69,6 +69,12 @@ class InstalledTestScope(str, Enum):
 
     PRODUCTION = "production"
     UNIT = "unit"
+    ARM64_PR = "arm64-pr"
+
+    @property
+    def ctest_label(self) -> str | None:
+        """Return the additional CMake scope label, when this scope has one."""
+        return "ARM64PR" if self is InstalledTestScope.ARM64_PR else None
 
 
 def inventory(build: Path, scope: InstalledTestScope = InstalledTestScope.PRODUCTION) -> dict:
@@ -93,6 +99,11 @@ def inventory(build: Path, scope: InstalledTestScope = InstalledTestScope.PRODUC
                     or (scope is InstalledTestScope.PRODUCTION and (
                         PRODUCTION_TEST_PREFLIGHT_LABEL in labels
                         or PRODUCTION_CAMPAIGN_NAME.search(name))))
+        if scope is InstalledTestScope.ARM64_PR:
+            required = scope.ctest_label in labels
+            if required and set(labels) & {"CUDA", "ROCm", "Vulkan", "FullDeviceInventory",
+                                           "HardwareOptional"}:
+                raise ValueError(f"ARM64 PR receipt requires host-only tests: {name}")
         if not required:
             continue
         # CTest can omit the command entirely when it cannot resolve the test
@@ -134,10 +145,27 @@ def seal(path: Path, build: Path,
     """
     if not isinstance(scope, InstalledTestScope):
         raise TypeError("installed test sealing requires a typed scope")
-    discover_production_parity_unit_tests(build)
-    if scope is InstalledTestScope.PRODUCTION:
-        discover_production_test_preflight_tests(build)
-    write_json(path, {"schema": 1, "scope": scope.value, "inventory": inventory(build, scope)})
+    if scope is InstalledTestScope.ARM64_PR:
+        units = discover_production_parity_unit_tests(build, scope_label=scope.ctest_label)
+        registrations = discover_production_test_preflight_registrations(
+            build, scope_label=scope.ctest_label)
+        if not units or not registrations or any(
+                item.lane is not PreflightExecutionLane.HOST for item in registrations):
+            raise ValueError("ARM64 PR receipt requires nonempty Unit and host-only preflight")
+        installed = inventory(build, scope)
+        expected = set(units) | {item.name for item in registrations}
+        labeled = {
+            test["name"] for test in installed["tests"]
+            if scope.ctest_label in _as_string_list(_property_map(test).get("LABELS", []))
+        }
+        if labeled != expected:
+            raise ValueError("ARM64 PR receipt contains a registration outside Unit and host preflight")
+    else:
+        discover_production_parity_unit_tests(build)
+        if scope is InstalledTestScope.PRODUCTION:
+            discover_production_test_preflight_tests(build)
+        installed = inventory(build, scope)
+    write_json(path, {"schema": 1, "scope": scope.value, "inventory": installed})
 
 
 if __name__ == "__main__":

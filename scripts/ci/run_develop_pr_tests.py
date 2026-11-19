@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file run_develop_pr_tests.py
+#  @brief Validate and execute a sealed PR test inventory in its device-scoped container.
 """Run one explicitly isolated PR test scope in its native test container.
 
 CTest owns test selection, resource weights and timeouts. The canonical
@@ -112,9 +114,8 @@ def main(argv: list[str] | None = None) -> int:
     """Admit the build and retain the exact results of the requested PR scope."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--build-dir", type=Path, required=True)
-    scope = parser.add_mutually_exclusive_group(required=True)
-    scope.add_argument("--installed-build-receipt", type=Path)
-    scope.add_argument("--arm64", action="store_true")
+    parser.add_argument("--installed-build-receipt", type=Path, required=True)
+    parser.add_argument("--arm64", action="store_true")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--scope", type=PRTestScope, choices=[scope.value for scope in PRTestScope],
                         default=PRTestScope.HOST)
@@ -122,17 +123,17 @@ def main(argv: list[str] | None = None) -> int:
     build = args.build_dir.resolve(strict=True)
     output = args.output.resolve()
     output.mkdir(parents=True, exist_ok=False)
-    # The model-free companion contains Unit and all preflight executables.
-    # Admission authenticates installation; each scope selects its own lanes.
-    scope_label = None
+    # Admission authenticates the installed executable selection before CTest
+    # applies the requested host or accelerator execution policy.
+    installed_scope = InstalledTestScope.PRODUCTION
     if args.arm64:
         if platform.system() != "Linux" or platform.machine() != "aarch64":
             raise ValueError("the ARM64 PR scope requires a native Linux AArch64 host")
         if args.scope is not PRTestScope.HOST:
             raise ValueError("the ARM64 PR scope only admits Unit and host preflight")
-        scope_label = "ARM64PR"
-    else:
-        validate(args.installed_build_receipt, build, InstalledTestScope.PRODUCTION)
+        installed_scope = InstalledTestScope.ARM64_PR
+    validate(args.installed_build_receipt, build, installed_scope)
+    scope_label = installed_scope.ctest_label
     registrations = discover_production_test_preflight_registrations(build, scope_label=scope_label)
     inventory = json.loads(subprocess.run(
         ["ctest", "--test-dir", str(build), "--show-only=json-v1"],

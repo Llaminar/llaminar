@@ -18,7 +18,8 @@ function(v2_register_arm64_pr_gate tests)
         get_property(fixtures TEST ${test} PROPERTY FIXTURES_REQUIRED)
         get_property(files TEST ${test} PROPERTY REQUIRED_FILES)
         if(fixtures OR files OR "CUDA" IN_LIST labels OR "ROCm" IN_LIST labels OR
-           "FullDeviceInventory" IN_LIST labels OR "HardwareOptional" IN_LIST labels)
+           "Vulkan" IN_LIST labels OR "FullDeviceInventory" IN_LIST labels OR
+           "HardwareOptional" IN_LIST labels)
             message(FATAL_ERROR "ARM64 PR registration must be model-free and host-only: ${test}")
         endif()
         set_property(TEST ${test} APPEND PROPERTY LABELS ARM64PR)
@@ -109,7 +110,8 @@ function(v2_finalize_test_gates)
             DEPENDS ${V2_PREFLIGHT_GATE_TARGETS})
         if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
            LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$" AND
-           NOT (HAVE_CUDA OR HAVE_ROCM OR HAVE_VULKAN))
+           LLAMINAR_CPU_ISA_UPPER STREQUAL "NEON" AND
+           NOT (HAVE_ROCM OR HAVE_VULKAN))
             v2_register_arm64_pr_gate("${V2_CONFIGURED_TESTS}")
         endif()
     endif()

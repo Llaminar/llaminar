@@ -29,6 +29,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 
 import run_develop_image_gate as gate
+import prebuilt_test_image
 import run_develop_pr_tests as pr_runner
 
 
@@ -303,17 +304,38 @@ class DevelopImageGateTests(unittest.TestCase):
                     f'set_tests_properties({name} PROPERTIES LABELS "{labels}" TIMEOUT 30)',
                 ]
             (build / "CTestTestfile.cmake").write_text("\n".join(registrations) + "\n")
+            (build / "CMakeFiles").mkdir()
+            for name in ("compile_commands.json", "build.ninja", "CMakeFiles/rules.ninja"):
+                (build / name).write_text("fixture metadata")
+            mpi = root / "libmpi.so"
+            mpi.write_bytes(b"fixture MPI library")
+            (build / "CMakeCache.txt").write_text(f"MPI_mpi_LIBRARY:FILEPATH={mpi}\n")
+            receipt = root / "receipt.json"
+            scope = pr_runner.InstalledTestScope.ARM64_PR
+            prebuilt_test_image.seal(receipt, build, scope)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                prebuilt_test_image.validate(receipt, build, pr_runner.InstalledTestScope.PRODUCTION)
             output = root / "results"
             with patch.object(pr_runner.platform, "system", return_value="Linux"), \
                  patch.object(pr_runner.platform, "machine", return_value="aarch64"):
                 self.assertEqual(pr_runner.main([
                     "--arm64", "--build-dir", str(build), "--output", str(output),
+                    "--installed-build-receipt", str(receipt),
                 ]), 0)
             report = json.loads((output / "pr-tests.json").read_text())
             self.assertEqual(report["scope"], "arm64-unit-and-host")
             self.assertTrue(report["complete"])
             self.assertEqual(report["lanes"]["unit"]["tests"], ["V2_Unit_ARM"])
             self.assertEqual(report["lanes"]["host"]["tests"], ["V2_Integration_ARM"])
+
+            ctest_file = build / "CTestTestfile.cmake"
+            ctest_file.write_text(ctest_file.read_text() + "\n")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                prebuilt_test_image.validate(receipt, build, scope)
+            ctest_file.write_text(ctest_file.read_text().replace(
+                "Unit;ARM64PR", "Unit;ARM64PR;CUDA"))
+            with self.assertRaisesRegex(ValueError, "host-only"):
+                prebuilt_test_image.seal(receipt, build, scope)
 
     def test_pr_driver_rejects_an_empty_host_lane(self):
         """A GPU-only preflight inventory must not become a green host gate."""

@@ -178,27 +178,6 @@ RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
 # RCCL final-link certification below still consumes the staged linker helper.
 # Retire the shared installer tree only after that certificate is complete.
 
-# ARM64 PRs run a small subset of native tests on the same Ubuntu/GCC/CMake
-# base as the runtime builder. Build only the targets owned by that scope.
-FROM gpu-sdk AS arm64-pr
-ARG LLAMINAR_CPU_ISA
-ENV CCACHE_MAXSIZE=1G OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
-RUN test "$(dpkg --print-architecture):${LLAMINAR_CPU_ISA}:${LLAMINAR_ENABLE_CUDA}:${LLAMINAR_ENABLE_ROCM}" = "arm64:NEON:OFF:OFF" \
- && apt-get update \
- && apt-get install -y --no-install-recommends zlib1g-dev \
- && rm -rf /var/lib/apt/lists/*
-WORKDIR /src
-COPY . .
-RUN --mount=type=cache,id=llaminar-ccache-arm64-pr,target=/root/.ccache,sharing=locked \
-    cmake -S src/v2 -B build_arm64_pr -G Ninja \
-        -DCMAKE_MAKE_PROGRAM:FILEPATH="$(command -v ninja)" \
-        -DCMAKE_BUILD_TYPE=Integration -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
-        -DLLAMINAR_CPU_ISA=NEON -DLLAMINAR_SHARED_CORE=ON \
-        -DHAVE_CUDA=OFF -DHAVE_ROCM=OFF -DUSE_ONEDNN=ON \
- && cmake --build build_arm64_pr --parallel --target v2_arm64_pr_gate \
- && find build_arm64_pr -path '*/CMakeFiles/*.o' -type f -delete
-ENTRYPOINT ["python3", "scripts/ci/run_develop_pr_tests.py", "--arm64", "--build-dir", "build_arm64_pr"]
-
 # Cloud CI exports this completed SDK checkpoint before starting RCCL. A
 # later dependency proof or source compilation failure cannot discard it.
 FROM gpu-sdk AS toolchain
@@ -433,6 +412,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 
 FROM toolchain AS builder
 
+ARG TARGETARCH
+
 # An admitted OCI toolchain is an external image, so build arguments must be
 # declared here rather than relying on inheritance from an in-file stage.
 ARG LLAMINAR_BUILD_TYPE
@@ -454,6 +435,7 @@ ARG LLAMINAR_BUILD_MODEL_PARITY_MATRICES
 ARG LLAMINAR_TEST_RUNNER_INVENTORY
 RUN case "${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}:${LLAMINAR_TEST_RUNNER_INVENTORY}" in \
         ON:full-matrix|OFF:model-free|OFF:unit-only) ;; \
+        OFF:arm64-pr) test "${TARGETARCH}:${LLAMINAR_CPU_ISA}:${LLAMINAR_ENABLE_CUDA}:${LLAMINAR_ENABLE_ROCM}:${LLAMINAR_SKIP_INTEGRATION}" = "arm64:NEON:ON:OFF:0" ;; \
         *) echo "Invalid test-runner inventory: matrices=${LLAMINAR_BUILD_MODEL_PARITY_MATRICES}, inventory=${LLAMINAR_TEST_RUNNER_INVENTORY}" >&2; exit 1 ;; \
     esac
 
@@ -506,6 +488,11 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         echo "==> [integration] skipped (LLAMINAR_SKIP_INTEGRATION=1)"; \
     else \
         integration_started_epoch="$(date +%s)"; \
+        arm64_cmake_args=""; \
+        if [ "${TARGETARCH}" = "arm64" ]; then \
+            export CCACHE_MAXSIZE=1G; \
+            arm64_cmake_args="-DUSE_ONNX_HEURISTIC=OFF"; \
+        fi; \
         rocm_gpu_targets="$(bash scripts/docker/rocm-image-targets.sh "${ROCM_RUNTIME_GPU_TARGETS}")" || exit 1; \
         RCCL_CMAKE_ARGS=""; \
         if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ]; then \
@@ -522,11 +509,12 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
             -DLLAMINAR_SHARED_CORE=ON \
             -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
             -DCMAKE_HIP_ARCHITECTURES="${rocm_gpu_targets}" \
-            ${RCCL_CMAKE_ARGS} \
+            ${RCCL_CMAKE_ARGS} ${arm64_cmake_args} \
      && case "${LLAMINAR_TEST_RUNNER_INVENTORY}" in \
             full-matrix) integration_targets="v2_unit_gate v2_production_test_preflight_gate v2_model_parity_matrices" ;; \
             model-free) integration_targets="v2_unit_gate v2_production_test_preflight_gate" ;; \
             unit-only) integration_targets="v2_unit_gate" ;; \
+            arm64-pr) integration_targets="v2_arm64_pr_gate" ;; \
             *) echo "Unsupported test-runner inventory: ${LLAMINAR_TEST_RUNNER_INVENTORY}" >&2; exit 1 ;; \
         esac \
      && echo "==> [integration] cmake build (parallel; matrices=${LLAMINAR_BUILD_MODEL_PARITY_MATRICES})" \
@@ -540,12 +528,13 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
           | xargs -0 -r -P "$(nproc)" -n 32 strip --strip-debug 2>/dev/null || true; } \
      && echo "==> [integration] removing intermediates (.o/.d/.gch/CMakeFiles)" \
      && mv build_v2_integration/CMakeFiles/rules.ninja build_v2_integration/installed-rules.ninja \
+     # The NEON preflight re-disassembles the register-allocation witness.
      && find build_v2_integration \
+            ! -path '*/cpu_native_tile_registers/proof.o' \
             \( -name '*.o' -o -name '*.d' -o -name '*.gch' -o -name '*.cmake_pch.hxx' \) \
             -delete \
      && find build_v2_integration -depth -type d -name CMakeFiles -exec rm -rf {} + \
-     # Keep the small compiler-launcher receipt used by the build-contract
-     # Unit test. Objects remain discarded; this is evidence, not a rebuild tree.
+     # Retain the compiler-launcher rules used by the build-contract Unit test.
      && mkdir build_v2_integration/CMakeFiles \
      && mv build_v2_integration/installed-rules.ninja build_v2_integration/CMakeFiles/rules.ninja \
      && rm -rf build_v2_integration/Testing build_v2_integration/_deps/*-build/CMakeFiles \
@@ -555,8 +544,11 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
 # This receipt permits the campaign driver to use installed binaries without
 # reconstructing stripped objects. Its scope cannot substitute for broader gates.
 RUN if [ "${LLAMINAR_SKIP_INTEGRATION}" != "1" ]; then \
-      receipt_scope=production; \
-      if [ "${LLAMINAR_TEST_RUNNER_INVENTORY}" = "unit-only" ]; then receipt_scope=unit; fi; \
+      case "${LLAMINAR_TEST_RUNNER_INVENTORY}" in \
+          arm64-pr) receipt_scope=arm64-pr ;; \
+          unit-only) receipt_scope=unit ;; \
+          *) receipt_scope=production ;; \
+      esac; \
       python3 scripts/ci/prebuilt_test_image.py --build-dir build_v2_integration \
         --receipt /src/installed-tests.json --scope "$receipt_scope" --seal; \
     fi
@@ -820,6 +812,7 @@ CMD ["--help"]
 # second independent multi-gigabyte import.
 FROM runtime AS test-runner
 
+ARG TARGETARCH
 USER root
 
 ARG LLAMINAR_BUILD_TYPE
@@ -848,6 +841,13 @@ RUN apt-get update \
       build-essential \
       git \
       jq \
+ # The NEON register proof authenticates the GCC driver, compiler, assembler \
+ # and system headers before re-disassembling the retained witness. \
+ && if [ "${TARGETARCH}" = "arm64" ]; then \
+        apt-get install -y --no-install-recommends g++-14 \
+        && update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-14 100 \
+              --slave /usr/bin/g++ g++ /usr/bin/g++-14; \
+    fi \
  && rm -rf /var/lib/apt/lists/*
 
 # The compiler-stage annotations must also resolve when sealed test binaries

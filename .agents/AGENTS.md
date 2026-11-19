@@ -354,11 +354,14 @@ GPU container, including CUDA, ROCm, mixed-backend and exclusive work. Native
 hardware observation and explicit CMake requirements own eligibility; absent
 geometries remain unqualified in the receipt. Both GPUs are required, and
 failures or skips in selected tests block the gate. Both ISA checks must pass.
+The native GitHub ARM64 PR check builds the same `test-runner` and `runtime`
+targets with NEON and CUDA for GB10. It verifies the sealed `ARM64PR` Unit
+and host preflight results and checks Release startup.
 Production certification still requires its own complete hardware qualification.
-A successful develop merge
-builds and publishes both AVX512 and AVX2 runtime images on the AVX2 development host,
-without compiling or running test images.
-These images are development artifacts; this gate does not certify a release.
+A successful develop merge builds and publishes the AVX512 and AVX2 runtime
+images on the AVX2 development host and the ARM64 CUDA+CPU runtime on
+GitHub's standard ARM64 runner. Publication omits Integration compilation.
+These images are development artifacts.
 
 Only upon explicit user direction, cut a release candidate branch named
 `rc/<candidate>` from a develop commit whose AVX512 and AVX2 images have both
@@ -840,8 +843,9 @@ For ARM port work, `cmake/CPUInstructionSet.cmake` owns the architecture/ISA
 compiler envelope; `src/v2/utils/ARMCPUFeatures.h` owns native optional-instruction
 observations. The core-free `tests/v2/portability` project uses the normal CPU
 architecture regression registrations; see the README's AArch64 checks.
-Passing those checks does not certify inference: complete native kernels and
-OS lifecycle support are still required before advertising an ARM runtime.
+The native Linux ARM64 PR gate also exercises the production CPU paths and
+checks startup of the CUDA+CPU release image. Real-checkpoint inference and
+GPU execution require their own qualifications.
 
 The supported build types are `Debug`, `Release`, and `Integration`. CUDA and
 ROCm are both enabled by default. Disable an unavailable toolchain explicitly,

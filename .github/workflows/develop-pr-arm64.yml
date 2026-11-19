@@ -19,44 +19,6 @@ jobs:
     name: ARM64 build and Unit + host
     if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 180
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          submodules: false
-          lfs: false
-          persist-credentials: false
-      - uses: docker/setup-buildx-action@v4
-      - name: Configure and build Llaminar and the ARM64 test targets
-        shell: bash
-        run: |
-          test "$(uname -m)" = aarch64
-          evidence="$RUNNER_TEMP/llaminar-arm64-evidence"
-          mkdir -p "$evidence"
-          docker buildx build --platform linux/arm64 --progress plain --load \
-            --target arm64-pr --tag llaminar-arm64-pr:local \
-            --build-arg LLAMINAR_CPU_ISA=NEON \
-            --build-arg LLAMINAR_ENABLE_CUDA=OFF --build-arg LLAMINAR_ENABLE_ROCM=OFF \
-            . 2>&1 | tee "$evidence/build.log"
-      - name: Run ARM64 Unit and host preflight
-        shell: bash
-        run: |
-          docker run --rm --shm-size=1g --cap-add=SYS_NICE --cap-add=SYS_PTRACE \
-            --security-opt seccomp=unconfined \
-            --mount "type=bind,source=$RUNNER_TEMP/llaminar-arm64-evidence,target=/evidence" \
-            llaminar-arm64-pr:local --output /evidence/tests
-      - name: Retain ARM64 build and test evidence
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: develop-pr-arm64-${{ github.run_id }}-${{ github.run_attempt }}
-          path: ${{ runner.temp }}/llaminar-arm64-evidence/
-          retention-days: 30
-
-  runtime:
-    name: ARM64 CUDA runtime build
-    if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-24.04-arm
     timeout-minutes: 360
     steps:
       - uses: actions/checkout@v6
@@ -65,9 +27,50 @@ jobs:
           lfs: false
           persist-credentials: false
       - uses: docker/setup-buildx-action@v4
-      - name: Build and smoke-test the DGX Spark runtime image
+      - name: Build the ARM64 test-runner and runtime siblings
         shell: bash
         run: |
           test "$(uname -m)" = aarch64
-          bash scripts/docker/build-runtime-image.sh --variant cuda --cpu-isa NEON \
-            --load --verify --tag llaminar-arm64-runtime:pr
+          evidence="$RUNNER_TEMP/llaminar-arm64-evidence"
+          mkdir -p "$evidence"
+          args=(
+            --platform linux/arm64 --progress plain --load
+            --build-arg "VCS_REF=$(git rev-parse HEAD)"
+            --build-arg "LLAMINAR_SOURCE_TREE=$(git rev-parse HEAD^{tree})"
+            --build-arg LLAMINAR_CPU_ISA=NEON
+            --build-arg LLAMINAR_ENABLE_CUDA=ON --build-arg LLAMINAR_ENABLE_ROCM=OFF
+            --build-arg LLAMINAR_CUDA_ARCHS=121
+            --build-arg LLAMINAR_SKIP_INTEGRATION=0
+            --build-arg LLAMINAR_BUILD_MODEL_PARITY_MATRICES=OFF
+            --build-arg LLAMINAR_TEST_RUNNER_INVENTORY=arm64-pr
+            --build-arg "LLAMINAR_TEST_UID=$(id -u)"
+            --build-arg "LLAMINAR_TEST_GID=$(id -g)"
+          )
+          for target in test-runner runtime; do
+            docker buildx build "${args[@]}" --target "$target" \
+              --tag "llaminar-arm64-$target:pr" . 2>&1 | tee "$evidence/build-$target.log"
+          done
+      - name: Smoke-test the ARM64 CUDA runtime
+        shell: bash
+        run: |
+          docker run --rm --entrypoint /usr/local/bin/llaminar2 \
+            llaminar-arm64-runtime:pr --help
+      - name: Run ARM64 Unit and host preflight
+        shell: bash
+        run: |
+          image="$(docker image inspect --format '{{.Id}}' llaminar-arm64-test-runner:pr)"
+          docker run --rm --user "$(id -u):$(id -g)" --ulimit core=0:0 \
+            --network host --ipc private --shm-size=1g \
+            --cap-add=SYS_NICE --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            --env LLAMINAR_FORCE_CPU_ONLY_STARTUP=1 \
+            --mount "type=bind,source=$RUNNER_TEMP/llaminar-arm64-evidence,target=/evidence" \
+            "$image" python3 scripts/ci/run_develop_pr_tests.py --arm64 \
+              --build-dir build_v2_integration --installed-build-receipt /src/installed-tests.json \
+              --output /evidence/tests
+      - name: Retain ARM64 build and test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-pr-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/llaminar-arm64-evidence/
+          retention-days: 30

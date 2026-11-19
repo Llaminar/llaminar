@@ -79,7 +79,8 @@ if [[ "${MODE}" == "build" ]]; then
         python3 \
         python3-dev \
         python3-pip \
-        python3-venv
+        python3-venv \
+        zlib1g-dev
 
     # Ubuntu 24.04 ships Ninja 1.11 while the Python/reference environment
     # installs the newer PyPI Ninja binary. Mixing those executables against
