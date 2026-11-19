@@ -679,7 +679,7 @@ esac
         self.assertEqual(set(workflow["on"]), {"pull_request_target"})
         self.assertEqual(workflow["on"]["pull_request_target"]["branches"], ["develop"])
         self.assertEqual(set(workflow["on"]["pull_request_target"]["types"]),
-                         {"opened", "reopened", "synchronize", "ready_for_review"})
+                         {"opened", "reopened", "synchronize", "ready_for_review", "edited"})
         self.assertEqual(workflow["permissions"],
                          {"contents": "read", "pull-requests": "read"})
         self.assertEqual(set(workflow["jobs"]), {"arm", "arm-owner"})
@@ -712,6 +712,41 @@ esac
         self.assertIn('gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash', step["run"])
         self.assertIn('--match-head-commit "$PR_HEAD_SHA"', step["run"])
         self.assertNotIn("checkout", str(job))
+
+    def test_owner_job_migrates_native_merge_identity_for_the_current_head(self):
+        """Execute the shipped workflow shell for new and previously armed PRs."""
+        workflow = yaml.load((ROOT / ".github/workflows/develop-auto-merge.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        command = workflow["jobs"]["arm-owner"]["steps"][-1]["run"]
+        repo = "Llaminar/llaminar"
+        sha = "a" * 40
+        arm = f"pr merge 64 --repo {repo} --auto --squash --match-head-commit {sha}"
+        disable = f"pr merge 64 --repo {repo} --disable-auto"
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            gh = directory / "gh"
+            gh.write_text('#!/bin/sh\nif [ "$1" = api ]; then cat "$PR_JSON"; '
+                          'else echo "$*" >> "$MERGE_LOG"; fi\n')
+            gh.chmod(0o755)
+            fixture, log = directory / "pr.json", directory / "calls"
+            for login, action, author, source, expected in [
+                    (None, "opened", 3513358, sha, [arm]),
+                    ("dbsanfte", "edited", 3513358, sha, [disable, arm]),
+                    (None, "edited", 3513358, sha, []),
+                    ("llaminar-bot[bot]", "synchronize", 3513358, sha, []),
+                    ("dbsanfte", "edited", 42, sha, []),
+                    ("dbsanfte", "edited", 3513358, "b" * 40, [])]:
+                with self.subTest(login=login, action=action, author=author, source=source):
+                    fixture.write_text(json.dumps({"head": {"sha": source, "repo": {"full_name": repo}},
+                        "base": {"ref": "develop"}, "user": {"id": author}, "draft": False,
+                        "state": "open", "auto_merge": {"enabled_by": {"login": login}} if login else None}))
+                    log.write_text("")
+                    result = subprocess.run(["bash", "-c", command], capture_output=True, text=True,
+                        env={**os.environ, "PATH": temp + os.pathsep + os.environ["PATH"],
+                             "PR_JSON": str(fixture), "MERGE_LOG": str(log), "GITHUB_REPOSITORY": repo,
+                             "PR_NUMBER": "64", "PR_HEAD_SHA": sha, "PR_EVENT_ACTION": action})
+                    self.assertEqual(result.returncode == 0, author == 3513358 and source == sha)
+                    self.assertEqual(log.read_text().splitlines(), expected)
 
     def test_all_host_ci_jobs_share_a_serial_non_discarding_queue(self):
         """Production certification jobs cannot contend for this host's GPUs."""

@@ -8,7 +8,7 @@ name: Arm develop PR auto-merge
 on:
   pull_request_target:
     branches: [develop]
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
 
 permissions:
   # The dedicated repository credential owns merge authority. The built-in
@@ -21,7 +21,8 @@ jobs:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
       !github.event.pull_request.draft &&
-      github.event.pull_request.user.id != 3513358
+      github.event.pull_request.user.id != 3513358 &&
+      github.event.action != 'edited'
     runs-on: ubuntu-24.04
     steps:
       - name: Squash-merge automatically after the required check succeeds
@@ -43,7 +44,8 @@ jobs:
       github.repository == 'Llaminar/llaminar' &&
       github.event.pull_request.head.repo.full_name == github.repository &&
       !github.event.pull_request.draft &&
-      github.event.pull_request.user.id == 3513358
+      github.event.pull_request.user.id == 3513358 &&
+      (github.event.action != 'edited' || github.event.pull_request.auto_merge.enabled_by.login == 'dbsanfte')
     runs-on: ubuntu-24.04
     environment: llaminar-bot
     steps:
@@ -60,6 +62,24 @@ jobs:
           GH_TOKEN: ${{ steps.bot.outputs.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_EVENT_ACTION: ${{ github.event.action }}
+        shell: bash
         run: |
+          set -euo pipefail
+          # Old open PRs can already be armed by the common maintainer token.
+          # Bind the migration to the live PR and retire its previous request
+          # before arming as the dedicated app. An edit alone never re-enables
+          # auto-merge after the author has disabled it.
+          current=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")
+          jq -e --arg sha "$PR_HEAD_SHA" --arg repo "$GITHUB_REPOSITORY" '
+            .head.sha == $sha and .head.repo.full_name == $repo and
+            .user.id == 3513358 and .base.ref == "develop" and .state == "open" and (.draft | not)
+          ' <<< "$current" >/dev/null
+          armer=$(jq -r '.auto_merge.enabled_by.login // ""' <<< "$current")
+          if [[ "$armer" == 'llaminar-bot[bot]' ]]; then exit 0; fi
+          if [[ "$PR_EVENT_ACTION" == edited && "$armer" != dbsanfte ]]; then exit 0; fi
+          if [[ -n "$armer" ]]; then
+            gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --disable-auto
+          fi
           gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash \
             --match-head-commit "$PR_HEAD_SHA"
