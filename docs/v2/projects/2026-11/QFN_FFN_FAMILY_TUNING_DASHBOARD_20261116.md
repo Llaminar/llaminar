@@ -2,37 +2,31 @@
 
 Status dashboard for 15 physical decoder specialisations. Limit 15,000 UTF-8 bytes.
 
-## Shipping RCCL, four MI50s, automatic planning
+## Cold Release on the automatic four-MI50 plan
 
-On code2048 the automatic serving defaults measured **918.20 prefill / 79.84
-decode tok/s**. Dynamic MTP and residency used one fully resident tensor-sharded
-tier. Both generations matched the maintenance-off control (**920.03 / 80.37**)
-in tokens and verifier work, with zero expert transfers. The earlier
-GateUpOwnedDownColumns control measured **939.02 / 64.48**.
-[Settings and results](QFN_MI50_STAGE_COMPARISON_20261118.md#serving-defaults-with-dynamic-residency-enabled)
+Release `42a863411` used the published RCCL runtime and the
+automatic four-MI50 TensorSharded plan. Castagna was pinned to
+`3483d4627`. Values are median **prefill / decode
+tokens per second** across five 256-token generations after one warmup.
 
-## Earlier measurements on the original four-MI50 split
-
-Checkpoint `7001788d8` used routed expert widths of 128/128/128/256,
-160 shared columns per GPU and the measured verifier switches. Both engines
-ran the same input IDs on the same four cards. Entries are **prefill / decode
-tokens per second**, medians of three 256-token generations after warmup.
-
-| Mode | Review 512, Llaminar | Review 512, Castagna | Code 2048, Llaminar | Code 2048, Castagna |
+| Mode | Review 512 Llaminar | Review 512 Castagna | Code 2048 Llaminar | Code 2048 Castagna |
 | --- | ---: | ---: | ---: | ---: |
-| Off | 1040.78 / 86.80 | 874.62 / 85.76 | 1008.53 / 81.16 | 922.66 / 73.64 |
-| Fixed 3 | 1001.09 / 137.38 | 785.74 / 117.62 | 970.47 / 111.88 | 892.87 / 108.39 |
-| Dynamic / adaptive | 999.25 / 131.68 | 672.70 / 70.71 | 970.17 / 107.59 | 794.71 / 79.81 |
+| MTP off | 1,082.04 / 88.96 | 874.75 / 85.94 | 1,050.16 / 82.61 | 1,005.41 / 75.59 |
+| Fixed depth 3 | 1,040.25 / 124.94 | 782.91 / 116.81 | 1,007.63 / 124.14 | 884.47 / 107.04 |
+| Dynamic MTP | 1,039.80 / 101.39 | 670.21 / 72.53 | 1,007.76 / 112.29 | 810.73 / 82.96 |
 
-All 18 Llaminar histories matched the qualified control. Both MTP modes
-also matched their own ordinary decode and all five verifier-work counters.
-Castagna generated different continuations and its throughput includes its
-own draft acceptance. The largest remaining fixed-depth stage deficit on
-code2048 is 3.08 ms/round in HC, projections, routing and experts.
-On code2048 the HC-down reducer reached 113.54 tok/s with identical work.
-The 256-column shard finished last in 4,117/4,128 FFN comparisons. Tuning
-the 128-column selector and wide Gate together gave 111.95 → 111.80 tok/s.
-[Matched workload, numerical checks and phase timings](QFN_MI50_STAGE_COMPARISON_20261118.md#fixed-depth-verifier-after-the-counted-routing-and-hc-changes)
+Every Llaminar prefill and decode sample exceeded the corresponding
+Castagna sample range. Both Llaminar MTP modes reproduced all 256 serial
+output IDs in every trial. The bench default performs an uncached prefill.
+[Settings, guarded sample audit and serving evidence](QFN_MI50_STAGE_COMPARISON_20261118.md#cold-release-on-the-automatic-four-mi50-plan)
+
+## Earlier verifier profiling
+
+The retained fixed-depth trace found a 3.08 ms per-round gap in
+hyperconnections, projections, routing and experts on code2048.
+On the uneven shard layout, the 256-column participant finished last in
+4,117 of 4,128 FFN comparisons.
+[Historical stage timings and original shard work](QFN_MI50_STAGE_COMPARISON_20261118.md#fixed-depth-verifier-after-the-counted-routing-and-hc-changes)
 
 ## Full-model throughput on four MI50s with equal-width Llaminar shards
 

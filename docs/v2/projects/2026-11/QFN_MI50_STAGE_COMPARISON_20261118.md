@@ -10,6 +10,43 @@ passed the MTP own-history check in both modes on both prompts. The local four-r
 remains slower than Castagna. The comparisons below distinguish work per
 verification from output tokens per second.
 
+## Cold Release on the automatic four-MI50 plan
+
+Release `42a8634118f75b1a8befc1580740e9d1f155473c` ran on four MI50s with the published
+RCCL and an automatic plan constrained by backend and GPU count. The plan
+placed all 512 routed experts across one TensorSharded domain and used
+tensor-parallel dense prefill and decode. The engines received identical
+input token IDs from the same UD-Q4_K_XL GGUF and, for MTP, the same Q8_0
+predictor. They used FP16 KV, a 32,768-token context, greedy sampling and
+seed 42. The fixed and adaptive references were refreshed on the same host
+boot with Castagna `3483d462715d61f21ed5877836be35a724446359`.
+
+Each cell is median **prefill / decode tok/s** over five 256-token
+generations after warmup. All samples used cold prefixes. The decode
+denominator is the 255 tokens emitted after the first sample.
+
+| Mode | Review 512 Llaminar | Review 512 Castagna | Code 2048 Llaminar | Code 2048 Castagna |
+| --- | ---: | ---: | ---: | ---: |
+| MTP off | 1,082.04 / 88.96 | 874.75 / 85.94 | 1,050.16 / 82.61 | 1,005.41 / 75.59 |
+| Fixed depth 3 | 1,040.25 / 124.94 | 782.91 / 116.81 | 1,007.63 / 124.14 | 884.47 / 107.04 |
+| Dynamic MTP | 1,039.80 / 101.39 | 670.21 / 72.53 | 1,007.76 / 112.29 | 810.73 / 82.96 |
+
+Every Llaminar sample exceeded the corresponding Castagna range. Llaminar
+fixed and dynamic MTP matched all 256 output IDs from Llaminar's ordinary
+mode in every measured trial. Castagna's speculative outputs and draft
+acceptance differed, giving each engine its own completed verifier work.
+
+The benchmark command defaults to a cold prefill before model admission.
+Serving keeps prefix caching available. The fully sharded GDN layout moved
+the GPU archive from 149,346,312 to 31,676,424 bytes per participant per
+prefill block. On the Release HTTP server, exact and partial prefix restores
+reproduced the cold completions token for token.
+
+[All samples, exact comparison checks and verifier counters](/opt/llaminar-models/.llaminar-build-mi50-preflight-20261118/prefix-prefill-breakdown/production-bank-policy/performance-audit.json) ·
+[Native invocation, environment and cold startup receipt](/opt/llaminar-models/.llaminar-build-mi50-preflight-20261118/prefix-prefill-breakdown/production-bank-policy/fixed3-code2048/invocation.json) ·
+[Castagna invocation and executable pins](/opt/llaminar-models/.llaminar-build-mi50-preflight-20261118/prefix-prefill-breakdown/production-bank-policy/castagna-dynamic-fresh/invocation.json) ·
+[HTTP restore receipts](/opt/llaminar-models/.llaminar-build-mi50-preflight-20261118/prefix-prefill-breakdown/production-bank-policy/serving-restore.json)
+
 ## Shipping RCCL and automatic planning
 
 A Release built with the RCCL from the published develop image compared the
