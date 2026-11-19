@@ -173,8 +173,8 @@ RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
 # RCCL final-link certification below still consumes the staged linker helper.
 # Retire the shared installer tree only after that certificate is complete.
 
-# The named BuildKit worker reuses this SDK stage across both ISA builds.
-# No separate remote cache export is required to start the real toolchain.
+# Cloud CI exports this completed SDK checkpoint before starting RCCL. A
+# later dependency proof or source compilation failure cannot discard it.
 FROM gpu-sdk AS toolchain
 
 WORKDIR /src
