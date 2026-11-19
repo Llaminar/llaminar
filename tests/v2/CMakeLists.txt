@@ -12613,6 +12613,13 @@ add_v2_test(V2_Integration_CUDAHybridKVCacheReset
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added CUDA Hybrid KV Cache reset regression tests")
+add_v2_test(V2_Integration_CUDAShardedGDNPrefixReplay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_hybrid_kv_cache_reset>
+        --gtest_filter=Test__CUDAHybridKVCacheReset.ShardedPrefixReplaysOnlyLocalGDNBanks:Test__CUDAHybridKVCacheReset.HostStagedSuffixPrefillImportKeepsLocalAndFullGDNBanksDistinct
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;GDN;PrefixCache;Replay;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAShardedGDNPrefixReplay)
 add_v2_test(V2_Integration_CUDARecurrentOnlySequenceCheckpoint
     COMMAND $<TARGET_FILE:v2_integration_cuda_hybrid_kv_cache_reset>
             --gtest_filter=Test__CUDAHybridKVCacheReset.RecurrentOnlySequenceCheckpointGraphReplay
@@ -21895,6 +21902,13 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm Hybrid KV Cache reset regression tests")
+    add_v2_test(V2_Integration_ROCmShardedGDNPrefixReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_hybrid_kv_cache_reset>
+            --gtest_filter=Test__ROCmHybridKVCacheReset.ShardedPrefixReplaysOnlyLocalGDNBanks:Test__ROCmHybridKVCacheReset.HostStagedSuffixPrefillImportKeepsLocalAndFullGDNBanksDistinct
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GDN;PrefixCache;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    )
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmShardedGDNPrefixReplay)
     add_v2_test(V2_Integration_ROCmRecurrentOnlySequenceCheckpoint
         COMMAND $<TARGET_FILE:v2_integration_rocm_hybrid_kv_cache_reset>
                 --gtest_filter=Test__ROCmHybridKVCacheReset.RecurrentOnlySequenceCheckpointGraphReplay
@@ -29939,6 +29953,20 @@ endif()
 # invariant. The Python campaign driver discovers this label; it must not copy
 # these test names into a second manifest.
 if(NOT V2_PERF_TESTS_ONLY)
+add_v2_test(V2_Integration_BenchmarkPrefixCacheDefault
+    COMMAND $<TARGET_FILE:v2_test_prefix_mtp_config>
+        --gtest_filter=Test__PrefixMTPConfig.BenchmarkDefaultsToColdPrefill
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Benchmark;Config;PrefixCache;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_GDNPlannedDeviceBankOwnership
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.HybridGDNStateUsesTheExactModuloLinkedParticipantGeometry
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;GDN;PrefixCache;Admission;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_BenchmarkPrefixCacheDefault V2_Integration_GDNPlannedDeviceBankOwnership)
 add_v2_test(V2_Integration_GDNStateLayoutOwnerAndImportIdentity
     COMMAND $<TARGET_FILE:v2_test_hybrid_kvcache>
         --gtest_filter=Test__HybridGDNStateGeometry.RecurrenceLayoutPreservesOwnerFootprintAndRejectsUnknown:Test__HybridGDNStateGeometry.SnapshotBindingsRejectForeignLayoutBeforeMutation:Test__HybridGDNStateGeometry.DiagnosticCoordinatesPreserveRectangularStateBytes:Test__CPUHybridKVCache.HybridPrefixStateRejectsSameSizeForeignLayoutBeforeImport

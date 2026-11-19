@@ -961,7 +961,8 @@ namespace llaminar2
                             device_cursor,
                             stream))
                         return false;
-                    if (state.full_conv_state_size != state.local_conv_state_size &&
+                    if (state.full_conv_state_size > 0 &&
+                        state.full_conv_state_size != state.local_conv_state_size &&
                         !exportDeviceBank(
                             *state.conv_kernel,
                             state.full_conv_state_size,
@@ -979,7 +980,8 @@ namespace llaminar2
                             device_cursor,
                             stream))
                         return false;
-                    if (state.full_recurrence_state_size !=
+                    if (state.full_recurrence_state_size > 0 &&
+                        state.full_recurrence_state_size !=
                             state.local_recurrence_state_size &&
                         !exportDeviceBank(
                             *state.rec_kernel,
@@ -1055,7 +1057,8 @@ namespace llaminar2
                             device_cursor,
                             stream))
                         return false;
-                    if (state.full_conv_state_size != state.local_conv_state_size &&
+                    if (state.full_conv_state_size > 0 &&
+                        state.full_conv_state_size != state.local_conv_state_size &&
                         !importDeviceBank(
                             *state.conv_kernel,
                             state.full_conv_state_size,
@@ -1073,7 +1076,8 @@ namespace llaminar2
                             device_cursor,
                             stream))
                         return false;
-                    if (state.full_recurrence_state_size !=
+                    if (state.full_recurrence_state_size > 0 &&
+                        state.full_recurrence_state_size !=
                             state.local_recurrence_state_size &&
                         !importDeviceBank(
                             *state.rec_kernel,
@@ -1145,9 +1149,9 @@ namespace llaminar2
                 state.d_v = geometry.d_v;
                 state.conv_kernel_size = config.gdn_conv_kernel_size;
                 state.full_recurrence_state_size =
-                    geometry.full_recurrence_state_floats;
+                    geometry.deviceFullRecurrenceStateFloats();
                 state.full_conv_state_size =
-                    geometry.full_conv_state_floats;
+                    geometry.deviceFullConvStateFloats();
                 state.initializeShape(geometry.local_qkv_dim);
             }
 

@@ -12,6 +12,7 @@
 
 #include "backends/DeviceId.h"
 #include "execution/mtp/MTPCheckpointPolicy.h"
+#include "kernels/HybridGDNStateGeometry.h"
 #include "planning/KVCacheMemoryEstimator.h"
 
 #include <cstddef>
@@ -89,6 +90,7 @@ namespace llaminar2
          * @param kv_precision Runtime KV storage format.
          * @param mtp_role Main rollback and shifted predictor ownership. Pipeline
          *        followers retain the former without allocating the latter.
+         * @param device_banks Dense execution's planned GPU state consumers.
          */
         static PersistentStateEstimate estimate(
             const ModelMemoryProfile &profile,
@@ -102,6 +104,7 @@ namespace llaminar2
             int first_layer,
             int last_layer,
             const std::string &kv_precision,
-            MTPStateRole mtp_role);
+            MTPStateRole mtp_role,
+            GDNDeviceBankPolicy device_banks = GDNDeviceBankPolicy::LocalOnly);
     };
 }

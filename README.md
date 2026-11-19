@@ -1177,6 +1177,9 @@ Want to see how your own hardware performs? The `benchmark` command loads the
 model, warms it up, and measures prompt processing and answer generation.
 It uses the same production runtime as the server. Stop other inference jobs
 on the same devices before running it.
+Benchmarks default to a cold prefill with prefix caching disabled. Use
+`--prefix-cache` to measure cache overhead explicitly, or an explicitly enabled
+prefix-cache configuration when replaying a saved experiment.
 
 For an ordered prompt/MTP request sweep under one admitted runtime, use
 [`--benchmark-campaign`](docs/benchmark-campaigns.md). It retains one immutable

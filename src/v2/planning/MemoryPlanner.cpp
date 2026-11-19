@@ -1956,7 +1956,9 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     cfg.first_layer,
                     last_layer,
                     cfg.kv_precision,
-                    mtp_state_role);
+                    mtp_state_role,
+                    replicated_dense_decode ? GDNDeviceBankPolicy::LocalAndMirrored
+                                            : GDNDeviceBankPolicy::LocalOnly);
             kv_cache_bytes =
                 persistent_state.kv_cache_bytes;
             live_recurrent_state_bytes =

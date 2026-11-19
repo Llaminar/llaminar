@@ -730,7 +730,9 @@ TEST(Test__MemoryPlanner,
             profile.gdn_time_step_rank,
             profile.gdn_state_size,
             profile.gdn_inner_size,
-            profile.gdn_conv_kernel_size);
+            profile.gdn_conv_kernel_size,
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous,
+            GDNDeviceBankPolicy::LocalOnly);
     EXPECT_EQ(
         replicated->prefix_cache_staging_bytes(),
         main_prefix.totalBytes() + shifted_prefix.totalBytes() +
@@ -792,7 +794,9 @@ TEST(Test__MemoryPlanner,
             profile.gdn_time_step_rank,
             profile.gdn_state_size,
             profile.gdn_inner_size,
-            profile.gdn_conv_kernel_size);
+            profile.gdn_conv_kernel_size,
+            GDNRecurrenceStateLayout::KeyMajorValueContiguous,
+            GDNDeviceBankPolicy::LocalOnly);
     EXPECT_EQ(geometry.local_key_heads, 4);
     EXPECT_EQ(geometry.local_value_heads, 12);
     EXPECT_EQ(
@@ -807,13 +811,13 @@ TEST(Test__MemoryPlanner,
         geometry.localPayloadBytes(/*gdn_layers=*/48);
     const size_t terminal_hidden =
         static_cast<size_t>(profile.d_model) * sizeof(float);
-    ASSERT_GT(device_checkpoint_payload, host_checkpoint_payload)
-        << "TP-local and full banks must differ or this regression cannot "
-           "detect under-admission.";
+    EXPECT_EQ(device_checkpoint_payload,
+        48u * sizeof(float) * ((2u * 4u + 12u) * 128u * 3u + 12u * 128u * 128u));
+    EXPECT_EQ(geometry.deviceFullRecurrenceStateFloats(), 0);
     EXPECT_EQ(
         plan.devices.front().checkpoint_state_bytes(),
         4ULL * (device_checkpoint_payload + terminal_hidden))
-        << "ROCm rollback admission must include every distinct device bank.";
+        << "Tensor-parallel rollback owns the exact local banks.";
 
     DevicePlanConfig cuda_cfg = cfg;
     cuda_cfg.device = DeviceId::cuda(0);
@@ -823,6 +827,18 @@ TEST(Test__MemoryPlanner,
         cuda_plan.devices.front().checkpoint_state_bytes(),
         plan.devices.front().checkpoint_state_bytes())
         << "CUDA and ROCm serialize the same packed recurrent-state shape.";
+
+    DevicePlanConfig mirrored = cfg;
+    mirrored.additional_weight_sets = {AdditionalPersistentWeightSet::ReplicatedDenseDecode};
+    auto mirrored_geometry = geometry;
+    mirrored_geometry.device_banks = GDNDeviceBankPolicy::LocalAndMirrored;
+    const auto mirrored_plan = MemoryPlanner::plan(profile, {mirrored});
+    ASSERT_EQ(mirrored_plan.devices.size(), 1u);
+    EXPECT_GT(mirrored_geometry.deviceSerializedPayloadBytes(48), device_checkpoint_payload);
+    EXPECT_EQ(mirrored_plan.devices.front().live_recurrent_state_bytes(),
+        mirrored_geometry.deviceArenaBytes(48, cfg.batch_size));
+    EXPECT_EQ(mirrored_plan.devices.front().checkpoint_state_bytes(),
+        4ULL * (mirrored_geometry.deviceSerializedPayloadBytes(48) + terminal_hidden));
 
     DevicePlanConfig cpu_cfg = cfg;
     cpu_cfg.device = DeviceId::cpu();
@@ -3769,7 +3785,8 @@ TEST(Test__MemoryPlanner, NativeVocabularyPrefixAdmissionUsesPublishedRows)
         const auto recurrent = HybridGDNStateGeometry::resolve(profile.n_heads,
             0, 12, profile.gdn_group_count, profile.gdn_time_step_rank,
             profile.gdn_state_size, profile.gdn_inner_size,
-            profile.gdn_conv_kernel_size).deviceSerializedPayloadBytes(48);
+            profile.gdn_conv_kernel_size, GDNRecurrenceStateLayout::KeyMajorValueContiguous,
+            GDNDeviceBankPolicy::LocalOnly).deviceSerializedPayloadBytes(48);
         const size_t non_logit_payload = 16 * main_block.totalBytes() +
             shifted_block.totalBytes() + recurrent + profile.d_model * sizeof(float);
         for (const auto publication : {

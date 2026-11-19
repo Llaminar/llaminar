@@ -74,6 +74,7 @@ namespace llaminar2
          * decode. The host recurrence_state vector deliberately stores the
          * local logical state, so the full size must be tracked separately
          * instead of inferred from whichever GPU bank is currently active.
+         * Zero denotes a phase policy with only participant-local state.
          */
         int full_recurrence_state_size = 0;
 
@@ -83,7 +84,7 @@ namespace llaminar2
          * This is the qkv_dim_full * (kernel_size - 1) shape captured in
          * prefix payload device sections. Keeping it explicit lets restore
          * paths allocate and import the full bank even when the target cache is
-         * fresh and only has the local bank resident.
+         * fresh. Zero denotes a phase policy with only participant-local state.
          */
         int full_conv_state_size = 0;
 
@@ -213,6 +214,8 @@ namespace llaminar2
             GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Internal immutable cache format,
                                                                ///< not a CLI mode.
 
+        GDNDeviceBankPolicy device_banks = GDNDeviceBankPolicy::LocalAndMirrored; ///< Retained GPU phases.
+
         /// Returns true if this config represents a hybrid model
         bool isHybrid() const { return !layer_types.empty(); }
 
@@ -235,7 +238,8 @@ namespace llaminar2
                                                    gdn_state_size,
                                                    gdn_inner_size,
                                                    gdn_conv_kernel_size,
-                                                   recurrence_layout);
+                                                   recurrence_layout,
+                                                   device_banks);
         }
 
         /// Count the number of full-attention layers
