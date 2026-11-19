@@ -356,9 +356,10 @@ hardware observation and explicit CMake requirements own eligibility; absent
 geometries remain unqualified in the receipt. Both GPUs are required, and
 failures or skips in selected tests block the gate. Both ISA checks must pass.
 Production certification still requires its own complete hardware qualification.
-A successful develop merge
-builds and publishes both AVX512 and AVX2 runtime images on the AVX2 development host,
-without compiling or running test images.
+A successful develop merge builds the AVX512 and AVX2 runtime images in
+parallel on standard GitHub-hosted Ubuntu 24.04 runners. A separate job
+publishes the verified pair. The publication workflow builds only the Release
+runtime targets.
 These images are development artifacts; this gate does not certify a release.
 
 Only upon explicit user direction, cut a release candidate branch named

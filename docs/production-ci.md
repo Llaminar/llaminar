@@ -95,7 +95,7 @@ does not cancel the other. Each PR/ISA job has its own
 `llaminar-develop-pr-<number>-<ISA>` concurrency group with
 `cancel-in-progress: true`, so a new commit cancels obsolete work for that
 same PR and ISA without serializing its two hosts.
-Each host serializes its own jobs; AVX2 shares its queue with publication.
+Each host serializes its own PR jobs.
 Each job calls `run_develop_image_gate.py --cpu-isa <ISA>` without publication.
 An AVX2-only test job defaults to `--pr-gpus CUDA+ROCm`, including when the protected caller supplies only the ISA. AVX512 defaults to `none`.
 Before toolchain preparation, CPU admission checks every visible CPU against
@@ -169,30 +169,32 @@ preflight or numerical acceptance.
 ## Develop branch image publication
 
 `.github/workflows/ci.yml` runs on pushes to `develop` and explicit manual
-dispatches on `develop`. It uses the self-hosted `llaminar-develop-108` runner
-with label `llaminar-develop-avx2` in the `Develop CI` group. The group admits
-only this repository and `ci.yml` plus reusable `develop-pr-tests.yml`, both
-pinned to `refs/heads/develop`. Image publication has its own
+dispatches on `develop`. Its build matrix uses standard GitHub-hosted
+`ubuntu-24.04` x64 runners, one VM per ISA. Before restoring their toolchains,
+the jobs reclaim disk used by the runner's preinstalled Android and language
+SDKs. Image publication has its own
 `llaminar-develop-images` concurrency group with `cancel-in-progress: true`:
 at most one develop publication runs, and a newer merge cancels its predecessor.
-PRs retain separate per-PR groups; all development jobs share one host queue
-without occupying production accelerators or GitHub cloud runners.
+PR checks use the separate self-hosted queues.
 
-The job runs `scripts/ci/run_develop_image_gate.py --build-only --publish`.
-It builds only the full CPU/CUDA/ROCm Release runtime targets for AVX512 and
-AVX2, with Integration compilation disabled. It runs no Unit, integration,
+Each matrix job runs `scripts/ci/run_develop_image_gate.py --build-only --stage`
+with its own `--cpu-isa`. It builds the full CPU/CUDA/ROCm Release runtime for
+that ISA, with Integration compilation disabled. The workflow runs no Unit, integration,
 production-preflight, model, E2E or benchmark tests and attaches no certificate.
 Compiler resource/spill checks remain part of building production code.
 
-Both runtimes must build and authenticate successfully before either is
-published as `ghcr.io/llaminar/llaminar:develop` and `:develop-avx2`. Matching
+Each job uploads the verified image to its rolling GHCR staging tag and records
+the immutable registry manifest digest. The `--publish-staged` job downloads
+both staging receipts from the same workflow run. It verifies their source,
+ISA and registry image labels before writing `ghcr.io/llaminar/llaminar:develop`
+and `:develop-avx2`. Matching
 `develop-<40-character SHA>` and `develop-<40-character SHA>-avx2` tags identify
 the same bytes. A conflicting source-pinned tag is fatal; branch tags are
 movable. The build receipt explicitly records `validation: build-only` and
 contains no invented test result. These are development images, not certified
 release artifacts.
 
-The persistent development worker also imports registry-backed BuildKit caches selected by
+The publication worker imports and exports registry-backed BuildKit caches selected by
 `LLAMINAR_DOCKER_BUILD_CACHE_IMAGE`, with separate `-avx512` and `-avx2` tags.
 The workflow stores these under `ghcr.io/llaminar/llaminar:build-cache-develop`.
 Registry access defaults to `read-write` for publication; PRs explicitly select
@@ -219,23 +221,25 @@ hits. The builder declares its build arguments explicitly because an external
 image does not inherit in-file ARG state. Both development workflows pin Buildx and
 BuildKit to the same versions.
 
-On a complete OCI cache miss, the dedicated AVX512 PR runner builds the
-pinned toolchain directly with its persistent BuildKit worker and registry
-cache import. The AVX2 development host also checkpoints `gpu-sdk` through the GitHub Actions
-cache v2 backend in `mode=max` under `llaminar-gpu-sdk`. If the cache service
-rejects a layer upload, the job can use its locally built SDK. The complete toolchain
-then builds, exports as OCI and authenticates. It is saved before Llaminar
-compilation, so a later build/test failure retains the dependency image.
+On a complete OCI cache miss, the shared action checkpoints `gpu-sdk` through
+the GitHub Actions cache v2 backend in `mode=max` under `llaminar-gpu-sdk` when
+the AVX2 toolchain must be built or a both-ISA publication needs either
+toolchain. It also imports the ISA-specific registry layers. A cache upload
+failure leaves the successfully built SDK available to the job's BuildKit
+worker. The complete toolchain then builds, exports as OCI and authenticates.
+It is saved before Llaminar compilation, so a later build or test failure
+retains the dependency image.
 Old mutable ISA toolchain layer-cache indexes are no longer used. PR entries
 belong to their merge ref and cannot be
 restored by develop publication or another PR. They remain reusable across
 updates to that PR. Develop populates the same dependency keys for inbound PRs to read.
 The repository's cache storage limit is configured in GitHub Actions settings;
-GitHub owns eviction. These caches contain dependency images, not source
-builds or compiler-object cache mounts. The named `llaminar-develop` BuildKit worker uses `keep-state: true`; its
-local layers and ccache mounts survive job cleanup, failed builds and later
-commits. Each physical host retains its own worker, shared only by that host's
-serial jobs; compiler caches are not transferred between the hosts. Per-ISA `*-toolchain.json` receipts record restore/build status,
+GitHub owns eviction. GitHub Actions caches contain dependency images and SDK
+layers. GHCR carries reusable BuildKit layers between publication runs. The
+cloud jobs keep local layers and compiler-object mounts for their own build.
+The named `llaminar-develop` BuildKit worker on each self-hosted PR
+runner keeps its local layers and compiler-object caches across jobs. Per-ISA
+`*-toolchain.json` receipts record restore/build status,
 dependency fingerprint, image manifest, size and validation time. The canonical
 image driver still admits and builds the exact source snapshot. See
 [Docker's cache backend reference](https://docs.docker.com/build/cache/backends/gha/)
@@ -331,7 +335,7 @@ Production-host image builds, tests and toolchain preparation share
 `llaminar-develop-image-gate` with `queue: max` and
 `cancel-in-progress: false`. The ARC scale set has `maxRunners: 1`, so those jobs
 cannot overlap GPU work or replace an older pending run. This queue is separate
-from develop PRs and image publication on the dedicated development host.
+from the develop PR hosts and the cloud image publication runner.
 
 The `llaminar-xeon` ARC scale set runs inside the host's Kubernetes cluster,
 but it deliberately uses the host's Docker Unix socket rather than a DIND

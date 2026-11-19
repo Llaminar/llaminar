@@ -95,7 +95,7 @@ The two ISA jobs target distinct custom runner labels, allowing the
 organization-scoped AVX2 host and repository-scoped AVX512 host to participate
 without changing runner-group access. The matrix permits two simultaneous jobs
 and disables fail-fast, retaining both results. Each host serializes its own
-jobs; AVX2 shares its queue with develop publication. Per-PR/ISA concurrency groups
+jobs. Per-PR/ISA concurrency groups
 cancel obsolete commits without canceling another PR. Each host preserves its
 local named `llaminar-develop` BuildKit worker's state,
 including compiler cache mounts across failed and successful jobs. Complete,
@@ -123,10 +123,12 @@ when the user explicitly authorizes a manual merge. Native auto-merge must still
 wait for the required checks; an overridden check is not passing evidence.
 Never grant the general GitHub Actions app a ruleset bypass.
 
-The `develop` push workflow remains on the AVX2 development host and
-`run_develop_image_gate.py --build-only --publish`. It compiles both full-backend
-AVX512 and AVX2 Release runtimes, omits Integration compilation, and publishes
-both branch and source-SHA tags only after both builds authenticate. It runs no
+The `develop` push workflow runs `run_develop_image_gate.py --build-only --stage`
+on two standard GitHub-hosted Ubuntu 24.04 runners, one for each ISA. Each restores
+its OCI toolchain and imports and exports its GHCR BuildKit layer cache.
+The jobs compile the full-backend AVX512 and AVX2 Release runtimes. A separate
+`--publish-staged` job authenticates both staging receipts and registry manifests
+before writing the branch and source-SHA tags. The workflow runs no
 tests and grants no certificate. Publication has one concurrency group and
 cancels a superseded build when a new develop merge arrives. Complete Unit and
 production preflight remain mandatory in the explicit production pipeline

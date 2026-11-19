@@ -1421,8 +1421,8 @@ are required. AVX2 also runs every hardware-supported production preflight test 
 a separate GPU container, including CUDA, ROCm, mixed-backend and exclusive
 lanes. Explicit hardware requirements record unavailable topologies as
 unqualified; missing GPUs, selected-test failures and skips block the gate.
-After merge, the AVX2 development host builds and publishes the AVX512 and AVX2
-Release development images without running tests. Both workflows restore complete
+After merge, standard GitHub-hosted Ubuntu runners build the AVX512 and AVX2
+Release development images in parallel and publish the verified pair. Both workflows restore complete
 toolchain images keyed by dependency inputs and ISA. They save newly built
 toolchains before source compilation, so later failures retain them. Production validation and
 release certification remain separate. Different PRs can run concurrently; a
