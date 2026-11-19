@@ -1,3 +1,5 @@
+# @file develop-auto-merge.yml
+# @brief Select the native auto-merge identity from the immutable PR author.
 name: Arm develop PR auto-merge
 
 # This trusted default-branch workflow only enables GitHub's native auto-merge.
@@ -6,7 +8,7 @@ name: Arm develop PR auto-merge
 on:
   pull_request_target:
     branches: [develop]
-    types: [opened, reopened, synchronize, ready_for_review]
+    types: [opened, reopened, synchronize, ready_for_review, edited]
 
 permissions:
   # The dedicated repository credential owns merge authority. The built-in
@@ -18,7 +20,9 @@ jobs:
   arm:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository &&
-      !github.event.pull_request.draft
+      !github.event.pull_request.draft &&
+      github.event.pull_request.user.id != 3513358 &&
+      github.event.action != 'edited'
     runs-on: ubuntu-24.04
     steps:
       - name: Squash-merge automatically after the required check succeeds
@@ -30,5 +34,52 @@ jobs:
         run: |
           set -euo pipefail
           : "${GH_TOKEN:?Repository secret DEVELOP_AUTOMERGE_TOKEN is required for auto-merge and post-merge CI}"
+          gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash \
+            --match-head-commit "$PR_HEAD_SHA"
+
+  # Only dbsanfte-authored PRs can use the isolated review exception. The
+  # app has no exception on the independent, strict develop CI ruleset.
+  arm-owner:
+    if: >-
+      github.repository == 'Llaminar/llaminar' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      !github.event.pull_request.draft &&
+      github.event.pull_request.user.id == 3513358 &&
+      (github.event.action != 'edited' || github.event.pull_request.auto_merge.enabled_by.login == 'dbsanfte')
+    runs-on: ubuntu-24.04
+    environment: llaminar-bot
+    steps:
+      - name: Mint a token for this repository
+        id: bot
+        uses: actions/create-github-app-token@f418cff399f7aef4c2f0ad47e25ca7a6abbdd6fc # v3.4.0
+        with:
+          client-id: ${{ vars.LLAMINAR_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.LLAMINAR_BOT_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+      - name: Arm native squash auto-merge for the owner
+        env:
+          GH_TOKEN: ${{ steps.bot.outputs.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          PR_EVENT_ACTION: ${{ github.event.action }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Old open PRs can already be armed by the common maintainer token.
+          # Bind the migration to the live PR and retire its previous request
+          # before arming as the dedicated app. An edit alone never re-enables
+          # auto-merge after the author has disabled it.
+          current=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER")
+          jq -e --arg sha "$PR_HEAD_SHA" --arg repo "$GITHUB_REPOSITORY" '
+            .head.sha == $sha and .head.repo.full_name == $repo and
+            .user.id == 3513358 and .base.ref == "develop" and .state == "open" and (.draft | not)
+          ' <<< "$current" >/dev/null
+          armer=$(jq -r '.auto_merge.enabled_by.login // ""' <<< "$current")
+          if [[ "$armer" == 'llaminar-bot[bot]' ]]; then exit 0; fi
+          if [[ "$PR_EVENT_ACTION" == edited && "$armer" != dbsanfte ]]; then exit 0; fi
+          if [[ -n "$armer" ]]; then
+            gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --disable-auto
+          fi
           gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash \
             --match-head-commit "$PR_HEAD_SHA"
