@@ -1,7 +1,13 @@
 /**
  * @file SwiGLUPrimitives.cpp
- * @brief SwiGLU primitives implementation
- * @author GitHub Copilot
+ * @brief CPU SwiGLU programs over retained floating and typed block storage.
+ *
+ * Native ARM lanes share the accurate device exponential while ordinary CPU
+ * sigmoid uses hardware division and expert sigmoid retains the explicit
+ * CPU/CUDA/ROCm reciprocal dependency chain. Bounded tails use the same vector
+ * program, so row and workshare boundaries cannot change a live result. Typed
+ * blocks retain their scale/rounding ABI; all complete-block geometry is checked
+ * before dispatch. Callers own source/destination lifetimes and publication.
  */
 
 #include "SwiGLUPrimitives.h"
@@ -18,6 +24,11 @@
 #endif
 
 #include "../../../utils/CPUFeatures.h"
+#include "../../../tensors/TypedBlockGeometry.h"
+#if LLAMINAR_COMPILED_WITH_NEON
+#include "kernels/cpu/simd/NEONDeviceSwiGLU.h"
+#include "tensors/NEONTypedTensorOps.h"
+#endif
 
 // Libmvec declarations for vectorized exp
 #if defined(__GLIBC__)
@@ -51,6 +62,197 @@ namespace llaminar2::primitives
             output[i] = silu_scalar(gate[i]) * up[i];
         }
     }
+
+    /** @brief Certify complete elementwise storage before any ISA/workshare writes.
+     * @tparam Storage Original published storage element or block type.
+     * @tparam ElementsPerUnit Logical elements represented by each storage unit.
+     * @param gate Original input bank, nullable only for an empty operation.
+     * @param up Original multiplier bank, nullable only for an empty operation.
+     * @param output Destination bank, disjoint from or identical to each input.
+     * @param size Nonnegative logical count, including complete typed blocks.
+     * @throws std::invalid_argument On malformed geometry, missing storage or a partial alias.
+     */
+    template <typename Storage, int ElementsPerUnit = 1>
+    static void require_swiglu_buffers(const void *gate, const void *up, void *output, int size)
+    {
+        static_assert(ElementsPerUnit == 1 || ElementsPerUnit == 32);
+        if (size < 0 || (size > 0 && (!gate || !up || !output)))
+            throw std::invalid_argument("CPU SwiGLU received an invalid buffer or size");
+        if constexpr (ElementsPerUnit == 32)
+            simd::requireCompleteTypedBlocks(static_cast<std::size_t>(size));
+        const auto bytes = static_cast<std::size_t>(size / ElementsPerUnit) * sizeof(Storage);
+        const auto destination = reinterpret_cast<std::uintptr_t>(output);
+        for (const void *input : {gate, up})
+        {
+            const auto source = reinterpret_cast<std::uintptr_t>(input);
+            const auto distance = source < destination ? destination - source : source - destination;
+            // Difference comparisons never form an overflowing one-past pointer.
+            // Exact aliases are safe because each vector/block consumes both
+            // inputs completely before storing its own output region.
+            if (source != destination && distance < bytes)
+                throw std::invalid_argument("CPU SwiGLU requires identical or disjoint source/output storage");
+        }
+    }
+
+#if LLAMINAR_COMPILED_WITH_NEON
+    /** @brief Distinct numerical programs; placement invariance is never inferred from precision. */
+    enum class NativeSwiGLUProgram { Ordinary, DeviceExpert };
+    /** @brief Original 16-bit storage encodings, neither of which requires BF16 arithmetic hardware. */
+    enum class NativeSwiGLUStorage { Half, BFloat16 };
+
+    /** @brief Evaluate four lane-local SwiGLU chains without row-dependent arithmetic.
+     * @tparam Program Explicit ordinary or heterogeneous-expert numerical contract.
+     * @param gate Original gate lanes.
+     * @param up Original multiplier lanes.
+     * @return Four independent original-coordinate outputs.
+     */
+    template <NativeSwiGLUProgram Program>
+    [[gnu::always_inline]] static inline float32x4_t swiglu_neon_value(float32x4_t gate, float32x4_t up)
+    {
+        if constexpr (Program == NativeSwiGLUProgram::DeviceExpert)
+            return neon::device_swiglu(gate, up);
+        else
+        {
+            // Reuse the accurate split-ln2 exponential, not the HC channel
+            // approximation: its scaled-space cancellation misses SwiGLU's
+            // mathematical accuracy envelope for large negative gates.
+            const auto positive = vcgeq_f32(gate, vdupq_n_f32(0.0f));
+            const auto exponential = neon::device_exp_non_positive(vbslq_f32(positive, vnegq_f32(gate), gate));
+            const auto reciprocal = vdivq_f32(vdupq_n_f32(1.0f), vaddq_f32(vdupq_n_f32(1.0f), exponential));
+            const auto sigmoid = vbslq_f32(positive, reciprocal, vmulq_f32(exponential, reciprocal));
+            return vmulq_f32(vmulq_f32(gate, sigmoid), up);
+        }
+    }
+
+    /** @brief Execute native floating vectors, including a bounded same-program tail.
+     * @tparam Program Explicit arithmetic program, independent of task/row length.
+     * @param gate Readable gate bank for size elements.
+     * @param up Readable multiplier bank for size elements.
+     * @param output Writable result bank; exact source aliasing is supported.
+     * @param size Nonnegative admitted element count.
+     */
+    template <NativeSwiGLUProgram Program>
+    static void compute_swiglu_neon_program(const float *gate, const float *up, float *output, int size)
+    {
+        int element = 0;
+        for (; element <= size - 4; element += 4)
+            vst1q_f32(output + element, swiglu_neon_value<Program>(vld1q_f32(gate + element), vld1q_f32(up + element)));
+        if (element != size)
+        {
+            // These private fragments contain at most three live lanes, not a
+            // tensor mirror. Consume both sources before an exact in-place store.
+            float gate_tail[4] = {}, up_tail[4] = {}, result[4];
+            const auto bytes = static_cast<std::size_t>(size - element) * sizeof(float);
+            std::memcpy(gate_tail, gate + element, bytes);
+            std::memcpy(up_tail, up + element, bytes);
+            vst1q_f32(result, swiglu_neon_value<Program>(vld1q_f32(gate_tail), vld1q_f32(up_tail)));
+            std::memcpy(output + element, result, bytes);
+        }
+    }
+
+    /** @brief Canonical ARM ordinary leaf used by the shared CPU ISA dispatcher.
+     * @param gate Gate bank; @param up Multiplier bank; @param output Destination bank.
+     * @param size Nonnegative admitted number of elements.
+     */
+    static void compute_swiglu_neon(const float *gate, const float *up, float *output, int size)
+    { compute_swiglu_neon_program<NativeSwiGLUProgram::Ordinary>(gate, up, output, size); }
+
+    /** @brief Decode one native four-lane 16-bit storage fragment.
+     * @tparam Storage Original Half or BFloat16 encoding.
+     * @param words Four original storage words.
+     * @return Original-order binary32 values with portable nonfinite payloads.
+     */
+    template <NativeSwiGLUStorage Storage>
+    [[gnu::always_inline]] static inline float32x4_t swiglu_neon_widen(uint16x4_t words)
+    {
+        if constexpr (Storage == NativeSwiGLUStorage::Half) return neon_fp16::widen(words);
+        else return vreinterpretq_f32_u32(vshll_n_u16(words, 16));
+    }
+
+    /** @brief Encode four results through the original typed storage bit program.
+     * @tparam Storage Half uses portable truncation for subnormals; BFloat16 uses ties-even.
+     * @param values Four completed native arithmetic results.
+     * @return Four destination words without hardware-specific payload rewriting.
+     */
+    template <NativeSwiGLUStorage Storage>
+    [[gnu::always_inline]] static inline uint16x4_t swiglu_neon_narrow(float32x4_t values)
+    {
+        if constexpr (Storage == NativeSwiGLUStorage::Half) return neon_fp16::narrow(values);
+        else
+        {
+            const auto bits = vreinterpretq_u32_f32(values);
+            const auto rounding = vaddq_u32(vdupq_n_u32(0x7fffu), vandq_u32(vshrq_n_u32(bits, 16), vdupq_n_u32(1)));
+            return vmovn_u32(vshrq_n_u32(vaddq_u32(bits, rounding), 16));
+        }
+    }
+
+    /** @brief Workshare native typed nonlinear arithmetic without expanded tensor storage.
+     * @tparam Storage Original 16-bit encoding.
+     * @param gate Readable gate words; @param up Readable multiplier words.
+     * @param output Writable destination words, including exact source aliasing.
+     * @param size Nonnegative admitted element count; partial four-lane tails are bounded.
+     */
+    template <NativeSwiGLUStorage Storage>
+    static void compute_swiglu_storage_neon(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size)
+    {
+        constexpr int elements_per_task = 256;
+        const int tasks = size / elements_per_task + (size % elements_per_task != 0);
+        auto work = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int task = 0; task < tasks; ++task)
+            {
+                const int first = task * elements_per_task;
+                const int count = std::min(elements_per_task, size - first);
+                int element = 0;
+                for (; element <= count - 4; element += 4)
+                {
+                    const auto g = swiglu_neon_widen<Storage>(vld1_u16(gate + first + element));
+                    const auto u = swiglu_neon_widen<Storage>(vld1_u16(up + first + element));
+                    vst1_u16(output + first + element, swiglu_neon_narrow<Storage>(swiglu_neon_value<NativeSwiGLUProgram::Ordinary>(g, u)));
+                }
+                if (element != count)
+                {
+                    uint16_t g[4] = {}, u[4] = {}, result[4];
+                    const auto bytes = static_cast<std::size_t>(count - element) * sizeof(uint16_t);
+                    std::memcpy(g, gate + first + element, bytes);
+                    std::memcpy(u, up + first + element, bytes);
+                    vst1_u16(result, swiglu_neon_narrow<Storage>(swiglu_neon_value<NativeSwiGLUProgram::Ordinary>(
+                        swiglu_neon_widen<Storage>(vld1_u16(g)), swiglu_neon_widen<Storage>(vld1_u16(u)))));
+                    std::memcpy(output + first + element, result, bytes);
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(work);
+    }
+
+    /** @brief Execute complete native Q8 SwiGLU blocks with the established scale-threshold/RNE program.
+     * @param gate Original Q8 gate blocks; @param up Original Q8 multiplier blocks.
+     * @param output Whole output blocks; exact input aliasing is supported.
+     * @param size Admitted nonnegative multiple of 32 elements.
+     */
+    static void compute_swiglu_q8_1_neon(const void *gate, const void *up, void *output, int size)
+    {
+        const auto *g = static_cast<const Q8_1Block *>(gate);
+        const auto *u = static_cast<const Q8_1Block *>(up);
+        auto *out = static_cast<Q8_1Block *>(output);
+        auto work = [&]()
+        {
+#pragma omp for schedule(static)
+            for (int block = 0; block < size / 32; ++block)
+            {
+                const float gs = fp16_to_fp32(g[block].d), us = fp16_to_fp32(u[block].d);
+                simd::neon_typed::Values values;
+                for (int group = 0; group < 8; ++group)
+                    values[group] = swiglu_neon_value<NativeSwiGLUProgram::Ordinary>(
+                        vmulq_n_f32(simd::neon_typed::load4(g[block].qs + group * 4), gs),
+                        vmulq_n_f32(simd::neon_typed::load4(u[block].qs + group * 4), us));
+                simd::neon_typed::quantize8<simd::neon_typed::Q8Program::SwiGLUBlockRNE>(values, out[block]);
+            }
+        };
+        OMP_WORKSHARE_REGION(work);
+    }
+#endif
 
 #if defined(__AVX2__)
     // Fast exp approximation (AVX2)
@@ -471,13 +673,13 @@ namespace llaminar2::primitives
 #undef LLAMINAR_EXACT_SWIGLU_SIMD
 
 // Stubs for portability when ISA unavailable at compile time
-#if !defined(__AVX2__)
+#if !defined(__AVX2__) && !LLAMINAR_COMPILED_WITH_NEON
     static void compute_swiglu_avx2(const float *gate, const float *up, float *output, int size)
     {
         compute_swiglu_scalar(gate, up, output, size);
     }
 #endif
-#if !defined(__AVX512F__)
+#if !defined(__AVX512F__) && !LLAMINAR_COMPILED_WITH_NEON
     static void compute_swiglu_avx512(const float *gate, const float *up, float *output, int size)
     {
         compute_swiglu_avx2(gate, up, output, size);
@@ -497,6 +699,13 @@ namespace llaminar2::primitives
         float *output,
         int size)
     {
+#if LLAMINAR_COMPILED_WITH_NEON
+        if (activeISALevel() == ISALevel::NEON || activeISALevel() == ISALevel::NEONDotProd)
+        {
+            compute_swiglu_neon_program<NativeSwiGLUProgram::DeviceExpert>(gate, up, output, size);
+            return;
+        }
+#endif
 #if defined(__AVX512F__)
         if (activeISALevel() >= ISALevel::AVX512)
         {
@@ -522,9 +731,11 @@ namespace llaminar2::primitives
 
     void compute_swiglu(const float *gate, const float *up, float *output, int size)
     {
+        require_swiglu_buffers<float>(gate, up, output, size);
         // OpenMP parallelization
         // Use a chunk size that fits in L1/L2 cache and provides enough work
         const int chunk_size = 1024;
+        const int tasks = size / chunk_size + (size % chunk_size != 0);
 
         // Lambda for loop body - used by both parallel and worksharing paths
         auto process_chunk = [&](int i)
@@ -541,9 +752,9 @@ namespace llaminar2::primitives
         auto do_work = [&]()
         {
 #pragma omp for schedule(static)
-            for (int i = 0; i < size; i += chunk_size)
+            for (int task = 0; task < tasks; ++task)
             {
-                process_chunk(i);
+                process_chunk(task * chunk_size);
             }
         };
         OMP_WORKSHARE_REGION(do_work);
@@ -551,17 +762,19 @@ namespace llaminar2::primitives
 
     void compute_swiglu_serial(const float *gate, const float *up, float *output, int size)
     {
+        require_swiglu_buffers<float>(gate, up, output, size);
         // Same ISA dispatch as compute_swiglu, but without OMP parallelization.
         // For small sizes (e.g. MoE intermediate=512 at M=1), the OMP
         // fork/join overhead (~6µs) far exceeds the compute cost (~0.1µs).
         const int chunk_size = 1024;
-        for (int i = 0; i < size; i += chunk_size)
+        for (int i = 0; i < size;)
         {
             int current_chunk = std::min(chunk_size, size - i);
             const float *g_ptr = gate + i;
             const float *u_ptr = up + i;
             float *o_ptr = output + i;
             ISA_DISPATCH_VOID(compute_swiglu, g_ptr, u_ptr, o_ptr, current_chunk);
+            i += current_chunk;
         }
     }
 
@@ -571,9 +784,7 @@ namespace llaminar2::primitives
         float *output,
         int size)
     {
-        if (!gate || !up || !output || size < 0)
-            throw std::invalid_argument(
-                "GPU-aligned expert SwiGLU received an invalid buffer or size");
+        require_swiglu_buffers<float>(gate, up, output, size);
         compute_swiglu_gpu_aligned_expert_selected(
             gate, up, output, size);
     }
@@ -584,12 +795,10 @@ namespace llaminar2::primitives
         float *output,
         int size)
     {
-        if (!gate || !up || !output || size < 0)
-            throw std::invalid_argument(
-                "GPU-aligned expert SwiGLU received an invalid buffer or size");
+        require_swiglu_buffers<float>(gate, up, output, size);
         constexpr int kElementsPerTask = 256;
         const int task_count =
-            (size + kElementsPerTask - 1) / kElementsPerTask;
+            size / kElementsPerTask + (size % kElementsPerTask != 0);
         auto work = [&]()
         {
 #pragma omp for schedule(static)
@@ -610,6 +819,14 @@ namespace llaminar2::primitives
 
     void compute_swiglu_bf16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size)
     {
+        require_swiglu_buffers<uint16_t>(gate, up, output, size);
+#if LLAMINAR_COMPILED_WITH_NEON
+        if (activeISALevel() != ISALevel::Scalar)
+        {
+            compute_swiglu_storage_neon<NativeSwiGLUStorage::BFloat16>(gate, up, output, size);
+            return;
+        }
+#endif
         // Layer-fusion support: avoid nested parallel region if already parallel
         auto do_work = [&]()
         {
@@ -626,6 +843,14 @@ namespace llaminar2::primitives
 
     void compute_swiglu_fp16(const uint16_t *gate, const uint16_t *up, uint16_t *output, int size)
     {
+        require_swiglu_buffers<uint16_t>(gate, up, output, size);
+#if LLAMINAR_COMPILED_WITH_NEON
+        if (activeISALevel() != ISALevel::Scalar)
+        {
+            compute_swiglu_storage_neon<NativeSwiGLUStorage::Half>(gate, up, output, size);
+            return;
+        }
+#endif
         // Layer-fusion support: avoid nested parallel region if already parallel
         auto do_work = [&]()
         {
@@ -781,6 +1006,12 @@ namespace llaminar2::primitives
 #endif
 
 #if defined(__AVX512F__)
+    /** @brief Workshare AVX512 block pairs plus their bounded odd block exactly once.
+     * @param gate Original complete Q8 gate bank.
+     * @param up Original complete Q8 multiplier bank.
+     * @param output Disjoint or exactly aliased complete destination blocks.
+     * @param size Admitted nonnegative multiple of 32 elements.
+     */
     static void compute_swiglu_q8_1_avx512(const void *gate, const void *up, void *output, int size)
     {
         const Q8_1Block *g_blocks = static_cast<const Q8_1Block *>(gate);
@@ -794,228 +1025,243 @@ namespace llaminar2::primitives
         __m512 max_val_127 = _mm512_set1_ps(127.0f);
         __m512 min_val_neg127 = _mm512_set1_ps(-127.0f);
 
-        int b = 0;
-
-        // Process 2 blocks at a time to expose ILP (4 vectors in flight)
-        // AVX512 has 32 registers, so we can easily handle this without spilling.
-        for (; b < num_blocks - 1; b += 2)
+        auto work = [&]()
         {
-            // --- Block 0 ---
-            const Q8_1Block &gb0 = g_blocks[b];
-            const Q8_1Block &ub0 = u_blocks[b];
-            Q8_1Block &ob0 = o_blocks[b];
-
-            // --- Block 1 ---
-            const Q8_1Block &gb1 = g_blocks[b + 1];
-            const Q8_1Block &ub1 = u_blocks[b + 1];
-            Q8_1Block &ob1 = o_blocks[b + 1];
-
-            // Load scales
-            __m512 g_scale0 = _mm512_set1_ps(simd::fp16_to_fp32(gb0.d));
-            __m512 u_scale0 = _mm512_set1_ps(simd::fp16_to_fp32(ub0.d));
-            __m512 g_scale1 = _mm512_set1_ps(simd::fp16_to_fp32(gb1.d));
-            __m512 u_scale1 = _mm512_set1_ps(simd::fp16_to_fp32(ub1.d));
-
-            // Load Block 0 (Low/High)
-            __m128i bytes0_lo = _mm_loadu_si128((const __m128i *)gb0.qs);
-            __m512 g0_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0_lo));
-            bytes0_lo = _mm_loadu_si128((const __m128i *)ub0.qs);
-            __m512 u0_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0_lo));
-
-            __m128i bytes0_hi = _mm_loadu_si128((const __m128i *)(gb0.qs + 16));
-            __m512 g0_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0_hi));
-            bytes0_hi = _mm_loadu_si128((const __m128i *)(ub0.qs + 16));
-            __m512 u0_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0_hi));
-
-            // Load Block 1 (Low/High)
-            __m128i bytes1_lo = _mm_loadu_si128((const __m128i *)gb1.qs);
-            __m512 g1_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1_lo));
-            bytes1_lo = _mm_loadu_si128((const __m128i *)ub1.qs);
-            __m512 u1_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1_lo));
-
-            __m128i bytes1_hi = _mm_loadu_si128((const __m128i *)(gb1.qs + 16));
-            __m512 g1_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1_hi));
-            bytes1_hi = _mm_loadu_si128((const __m128i *)(ub1.qs + 16));
-            __m512 u1_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1_hi));
-
-            // Apply scales
-            g0_lo = _mm512_mul_ps(g0_lo, g_scale0);
-            g0_hi = _mm512_mul_ps(g0_hi, g_scale0);
-            u0_lo = _mm512_mul_ps(u0_lo, u_scale0);
-            u0_hi = _mm512_mul_ps(u0_hi, u_scale0);
-
-            g1_lo = _mm512_mul_ps(g1_lo, g_scale1);
-            g1_hi = _mm512_mul_ps(g1_hi, g_scale1);
-            u1_lo = _mm512_mul_ps(u1_lo, u_scale1);
-            u1_hi = _mm512_mul_ps(u1_hi, u_scale1);
-
-            // Compute SwiGLU (lambda for reuse)
-            // HuggingFace FFN formula: act_fn(gate_proj) * up_proj = silu(g) * u
-            auto swiglu_op = [&](__m512 g, __m512 u)
+            // Pair and odd-tail ownership are disjoint even for exact input/output
+            // aliases. The tail loop's completion edge releases both workshares,
+            // including an empty bank, without a separate per-pair-loop barrier.
+#pragma omp for schedule(static) nowait
+            for (int pair = 0; pair < num_blocks / 2; ++pair)
             {
-                __m512 neg_g = _mm512_sub_ps(zero, g);
-                __m512 exp_neg_g = fast_exp512(neg_g);
-                __m512 denom = _mm512_add_ps(one, exp_neg_g);
-                __m512 rcp = _mm512_rcp14_ps(denom);
-                __m512 term = _mm512_fnmadd_ps(denom, rcp, two);
-                __m512 sigmoid_g = _mm512_mul_ps(rcp, term);
-                __m512 silu_g = _mm512_mul_ps(g, sigmoid_g);
-                return _mm512_mul_ps(silu_g, u);
-            };
+                const int b = pair * 2;
+                // --- Block 0 ---
+                const Q8_1Block &gb0 = g_blocks[b];
+                const Q8_1Block &ub0 = u_blocks[b];
+                Q8_1Block &ob0 = o_blocks[b];
 
-            __m512 res0_lo = swiglu_op(g0_lo, u0_lo);
-            __m512 res0_hi = swiglu_op(g0_hi, u0_hi);
-            __m512 res1_lo = swiglu_op(g1_lo, u1_lo);
-            __m512 res1_hi = swiglu_op(g1_hi, u1_hi);
+                // --- Block 1 ---
+                const Q8_1Block &gb1 = g_blocks[b + 1];
+                const Q8_1Block &ub1 = u_blocks[b + 1];
+                Q8_1Block &ob1 = o_blocks[b + 1];
 
-            // Max abs (reduce locally first)
-            __m512 abs0 = _mm512_max_ps(_mm512_abs_ps(res0_lo), _mm512_abs_ps(res0_hi));
-            float max_abs0 = _mm512_reduce_max_ps(abs0);
+                // Load scales
+                __m512 g_scale0 = _mm512_set1_ps(simd::fp16_to_fp32(gb0.d));
+                __m512 u_scale0 = _mm512_set1_ps(simd::fp16_to_fp32(ub0.d));
+                __m512 g_scale1 = _mm512_set1_ps(simd::fp16_to_fp32(gb1.d));
+                __m512 u_scale1 = _mm512_set1_ps(simd::fp16_to_fp32(ub1.d));
 
-            __m512 abs1 = _mm512_max_ps(_mm512_abs_ps(res1_lo), _mm512_abs_ps(res1_hi));
-            float max_abs1 = _mm512_reduce_max_ps(abs1);
+                // Load Block 0 (Low/High)
+                __m128i bytes0_lo = _mm_loadu_si128((const __m128i *)gb0.qs);
+                __m512 g0_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0_lo));
+                bytes0_lo = _mm_loadu_si128((const __m128i *)ub0.qs);
+                __m512 u0_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0_lo));
 
-            // Requantize Block 0
+                __m128i bytes0_hi = _mm_loadu_si128((const __m128i *)(gb0.qs + 16));
+                __m512 g0_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0_hi));
+                bytes0_hi = _mm_loadu_si128((const __m128i *)(ub0.qs + 16));
+                __m512 u0_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0_hi));
+
+                // Load Block 1 (Low/High)
+                __m128i bytes1_lo = _mm_loadu_si128((const __m128i *)gb1.qs);
+                __m512 g1_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1_lo));
+                bytes1_lo = _mm_loadu_si128((const __m128i *)ub1.qs);
+                __m512 u1_lo = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1_lo));
+
+                __m128i bytes1_hi = _mm_loadu_si128((const __m128i *)(gb1.qs + 16));
+                __m512 g1_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1_hi));
+                bytes1_hi = _mm_loadu_si128((const __m128i *)(ub1.qs + 16));
+                __m512 u1_hi = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1_hi));
+
+                // Apply scales
+                g0_lo = _mm512_mul_ps(g0_lo, g_scale0);
+                g0_hi = _mm512_mul_ps(g0_hi, g_scale0);
+                u0_lo = _mm512_mul_ps(u0_lo, u_scale0);
+                u0_hi = _mm512_mul_ps(u0_hi, u_scale0);
+
+                g1_lo = _mm512_mul_ps(g1_lo, g_scale1);
+                g1_hi = _mm512_mul_ps(g1_hi, g_scale1);
+                u1_lo = _mm512_mul_ps(u1_lo, u_scale1);
+                u1_hi = _mm512_mul_ps(u1_hi, u_scale1);
+
+                // Compute SwiGLU (lambda for reuse)
+                // HuggingFace FFN formula: act_fn(gate_proj) * up_proj = silu(g) * u
+                auto swiglu_op = [&](__m512 g, __m512 u)
+                {
+                    __m512 neg_g = _mm512_sub_ps(zero, g);
+                    __m512 exp_neg_g = fast_exp512(neg_g);
+                    __m512 denom = _mm512_add_ps(one, exp_neg_g);
+                    __m512 rcp = _mm512_rcp14_ps(denom);
+                    __m512 term = _mm512_fnmadd_ps(denom, rcp, two);
+                    __m512 sigmoid_g = _mm512_mul_ps(rcp, term);
+                    __m512 silu_g = _mm512_mul_ps(g, sigmoid_g);
+                    return _mm512_mul_ps(silu_g, u);
+                };
+
+                __m512 res0_lo = swiglu_op(g0_lo, u0_lo);
+                __m512 res0_hi = swiglu_op(g0_hi, u0_hi);
+                __m512 res1_lo = swiglu_op(g1_lo, u1_lo);
+                __m512 res1_hi = swiglu_op(g1_hi, u1_hi);
+
+                // Max abs (reduce locally first)
+                __m512 abs0 = _mm512_max_ps(_mm512_abs_ps(res0_lo), _mm512_abs_ps(res0_hi));
+                float max_abs0 = _mm512_reduce_max_ps(abs0);
+
+                __m512 abs1 = _mm512_max_ps(_mm512_abs_ps(res1_lo), _mm512_abs_ps(res1_hi));
+                float max_abs1 = _mm512_reduce_max_ps(abs1);
+
+                // Requantize Block 0
+                {
+                    float d = max_abs0 / 127.0f;
+                    ob0.d = simd::fp32_to_fp16(d);
+                    float inv_d_f = (d > 1e-10f) ? 1.0f / d : 0.0f;
+                    __m512 inv_d = _mm512_set1_ps(inv_d_f);
+
+                    auto quant_op = [&](__m512 val)
+                    {
+                        val = _mm512_mul_ps(val, inv_d);
+                        val = _mm512_max_ps(min_val_neg127, _mm512_min_ps(max_val_127, val));
+                        return _mm512_cvtps_epi32(_mm512_roundscale_ps(val, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                    };
+
+                    __m512i q_lo = quant_op(res0_lo);
+                    __m512i q_hi = quant_op(res0_hi);
+
+                    _mm512_mask_cvtsepi32_storeu_epi8(ob0.qs, 0xFFFF, q_lo);
+                    _mm512_mask_cvtsepi32_storeu_epi8(ob0.qs + 16, 0xFFFF, q_hi);
+
+                    int32_t sum = _mm512_reduce_add_epi32(q_lo) + _mm512_reduce_add_epi32(q_hi);
+                    ob0.sum_qs = (int16_t)sum;
+                }
+
+                // Requantize Block 1
+                {
+                    float d = max_abs1 / 127.0f;
+                    ob1.d = simd::fp32_to_fp16(d);
+                    float inv_d_f = (d > 1e-10f) ? 1.0f / d : 0.0f;
+                    __m512 inv_d = _mm512_set1_ps(inv_d_f);
+
+                    auto quant_op = [&](__m512 val)
+                    {
+                        val = _mm512_mul_ps(val, inv_d);
+                        val = _mm512_max_ps(min_val_neg127, _mm512_min_ps(max_val_127, val));
+                        return _mm512_cvtps_epi32(_mm512_roundscale_ps(val, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                    };
+
+                    __m512i q_lo = quant_op(res1_lo);
+                    __m512i q_hi = quant_op(res1_hi);
+
+                    _mm512_mask_cvtsepi32_storeu_epi8(ob1.qs, 0xFFFF, q_lo);
+                    _mm512_mask_cvtsepi32_storeu_epi8(ob1.qs + 16, 0xFFFF, q_hi);
+
+                    int32_t sum = _mm512_reduce_add_epi32(q_lo) + _mm512_reduce_add_epi32(q_hi);
+                    ob1.sum_qs = (int16_t)sum;
+                }
+            }
+
+            // Exactly one worker owns the optional final block. Its implicit
+            // barrier also waits for every preceding pair owner before bank reuse.
+#pragma omp for schedule(static)
+            for (int b = (num_blocks / 2) * 2; b < num_blocks; ++b)
             {
-                float d = max_abs0 / 127.0f;
-                ob0.d = simd::fp32_to_fp16(d);
+                const Q8_1Block &gb = g_blocks[b];
+                const Q8_1Block &ub = u_blocks[b];
+                Q8_1Block &ob = o_blocks[b];
+
+                float g_scale_f = simd::fp16_to_fp32(gb.d);
+                float u_scale_f = simd::fp16_to_fp32(ub.d);
+
+                __m512 g_scale = _mm512_set1_ps(g_scale_f);
+                __m512 u_scale = _mm512_set1_ps(u_scale_f);
+
+                // Process 32 elements in 2 chunks of 16
+                __m512 res[2];
+                float max_abs = 0.0f;
+
+                // Unrolled inner loop
+                {
+                    // Chunk 0
+                    __m128i bytes0 = _mm_loadu_si128((const __m128i *)gb.qs);
+                    __m512 g0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0));
+                    bytes0 = _mm_loadu_si128((const __m128i *)ub.qs);
+                    __m512 u0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0));
+
+                    g0 = _mm512_mul_ps(g0, g_scale);
+                    u0 = _mm512_mul_ps(u0, u_scale);
+
+                    // silu(g) * u  [HuggingFace FFN formula: act_fn(gate_proj) * up_proj]
+                    __m512 neg_g0 = _mm512_sub_ps(zero, g0);
+                    __m512 exp_neg_g0 = fast_exp512(neg_g0);
+                    __m512 denom0 = _mm512_add_ps(one, exp_neg_g0);
+                    __m512 rcp0 = _mm512_rcp14_ps(denom0);
+                    __m512 term0 = _mm512_fnmadd_ps(denom0, rcp0, two);
+                    __m512 sigmoid_g0 = _mm512_mul_ps(rcp0, term0);
+                    __m512 silu_g0 = _mm512_mul_ps(g0, sigmoid_g0);
+                    res[0] = _mm512_mul_ps(silu_g0, u0);
+
+                    // Chunk 1
+                    __m128i bytes1 = _mm_loadu_si128((const __m128i *)(gb.qs + 16));
+                    __m512 g1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1));
+                    bytes1 = _mm_loadu_si128((const __m128i *)(ub.qs + 16));
+                    __m512 u1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1));
+
+                    g1 = _mm512_mul_ps(g1, g_scale);
+                    u1 = _mm512_mul_ps(u1, u_scale);
+
+                    // silu(g) * u  [HuggingFace FFN formula: act_fn(gate_proj) * up_proj]
+                    __m512 neg_g1 = _mm512_sub_ps(zero, g1);
+                    __m512 exp_neg_g1 = fast_exp512(neg_g1);
+                    __m512 denom1 = _mm512_add_ps(one, exp_neg_g1);
+                    __m512 rcp1 = _mm512_rcp14_ps(denom1);
+                    __m512 term1 = _mm512_fnmadd_ps(denom1, rcp1, two);
+                    __m512 sigmoid_g1 = _mm512_mul_ps(rcp1, term1);
+                    __m512 silu_g1 = _mm512_mul_ps(g1, sigmoid_g1);
+                    res[1] = _mm512_mul_ps(silu_g1, u1);
+                }
+
+                // Max abs
+                __m512 abs_res = _mm512_max_ps(_mm512_abs_ps(res[0]), _mm512_abs_ps(res[1]));
+                max_abs = _mm512_reduce_max_ps(abs_res);
+
+                float d = max_abs / 127.0f;
+                ob.d = simd::fp32_to_fp16(d);
                 float inv_d_f = (d > 1e-10f) ? 1.0f / d : 0.0f;
                 __m512 inv_d = _mm512_set1_ps(inv_d_f);
 
-                auto quant_op = [&](__m512 val)
+                int32_t sum = 0;
+
+                // Requantize
                 {
-                    val = _mm512_mul_ps(val, inv_d);
-                    val = _mm512_max_ps(min_val_neg127, _mm512_min_ps(max_val_127, val));
-                    return _mm512_cvtps_epi32(_mm512_roundscale_ps(val, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-                };
+                    // Chunk 0
+                    __m512 val0 = _mm512_mul_ps(res[0], inv_d);
+                    val0 = _mm512_max_ps(min_val_neg127, _mm512_min_ps(max_val_127, val0));
+                    __m512i q0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(val0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                    _mm512_mask_cvtsepi32_storeu_epi8(ob.qs, 0xFFFF, q0);
+                    sum += _mm512_reduce_add_epi32(q0);
 
-                __m512i q_lo = quant_op(res0_lo);
-                __m512i q_hi = quant_op(res0_hi);
-
-                _mm512_mask_cvtsepi32_storeu_epi8(ob0.qs, 0xFFFF, q_lo);
-                _mm512_mask_cvtsepi32_storeu_epi8(ob0.qs + 16, 0xFFFF, q_hi);
-
-                int32_t sum = _mm512_reduce_add_epi32(q_lo) + _mm512_reduce_add_epi32(q_hi);
-                ob0.sum_qs = (int16_t)sum;
+                    // Chunk 1
+                    __m512 val1 = _mm512_mul_ps(res[1], inv_d);
+                    val1 = _mm512_max_ps(min_val_neg127, _mm512_min_ps(max_val_127, val1));
+                    __m512i q1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(val1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                    _mm512_mask_cvtsepi32_storeu_epi8(ob.qs + 16, 0xFFFF, q1);
+                    sum += _mm512_reduce_add_epi32(q1);
+                }
+                ob.sum_qs = (int16_t)sum;
             }
-
-            // Requantize Block 1
-            {
-                float d = max_abs1 / 127.0f;
-                ob1.d = simd::fp32_to_fp16(d);
-                float inv_d_f = (d > 1e-10f) ? 1.0f / d : 0.0f;
-                __m512 inv_d = _mm512_set1_ps(inv_d_f);
-
-                auto quant_op = [&](__m512 val)
-                {
-                    val = _mm512_mul_ps(val, inv_d);
-                    val = _mm512_max_ps(min_val_neg127, _mm512_min_ps(max_val_127, val));
-                    return _mm512_cvtps_epi32(_mm512_roundscale_ps(val, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-                };
-
-                __m512i q_lo = quant_op(res1_lo);
-                __m512i q_hi = quant_op(res1_hi);
-
-                _mm512_mask_cvtsepi32_storeu_epi8(ob1.qs, 0xFFFF, q_lo);
-                _mm512_mask_cvtsepi32_storeu_epi8(ob1.qs + 16, 0xFFFF, q_hi);
-
-                int32_t sum = _mm512_reduce_add_epi32(q_lo) + _mm512_reduce_add_epi32(q_hi);
-                ob1.sum_qs = (int16_t)sum;
-            }
-        }
-
-        // Tail loop (1 block)
-        for (; b < num_blocks; ++b)
-        {
-            const Q8_1Block &gb = g_blocks[b];
-            const Q8_1Block &ub = u_blocks[b];
-            Q8_1Block &ob = o_blocks[b];
-
-            float g_scale_f = simd::fp16_to_fp32(gb.d);
-            float u_scale_f = simd::fp16_to_fp32(ub.d);
-
-            __m512 g_scale = _mm512_set1_ps(g_scale_f);
-            __m512 u_scale = _mm512_set1_ps(u_scale_f);
-
-            // Process 32 elements in 2 chunks of 16
-            __m512 res[2];
-            float max_abs = 0.0f;
-
-            // Unrolled inner loop
-            {
-                // Chunk 0
-                __m128i bytes0 = _mm_loadu_si128((const __m128i *)gb.qs);
-                __m512 g0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0));
-                bytes0 = _mm_loadu_si128((const __m128i *)ub.qs);
-                __m512 u0 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes0));
-
-                g0 = _mm512_mul_ps(g0, g_scale);
-                u0 = _mm512_mul_ps(u0, u_scale);
-
-                // silu(g) * u  [HuggingFace FFN formula: act_fn(gate_proj) * up_proj]
-                __m512 neg_g0 = _mm512_sub_ps(zero, g0);
-                __m512 exp_neg_g0 = fast_exp512(neg_g0);
-                __m512 denom0 = _mm512_add_ps(one, exp_neg_g0);
-                __m512 rcp0 = _mm512_rcp14_ps(denom0);
-                __m512 term0 = _mm512_fnmadd_ps(denom0, rcp0, two);
-                __m512 sigmoid_g0 = _mm512_mul_ps(rcp0, term0);
-                __m512 silu_g0 = _mm512_mul_ps(g0, sigmoid_g0);
-                res[0] = _mm512_mul_ps(silu_g0, u0);
-
-                // Chunk 1
-                __m128i bytes1 = _mm_loadu_si128((const __m128i *)(gb.qs + 16));
-                __m512 g1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1));
-                bytes1 = _mm_loadu_si128((const __m128i *)(ub.qs + 16));
-                __m512 u1 = _mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(bytes1));
-
-                g1 = _mm512_mul_ps(g1, g_scale);
-                u1 = _mm512_mul_ps(u1, u_scale);
-
-                // silu(g) * u  [HuggingFace FFN formula: act_fn(gate_proj) * up_proj]
-                __m512 neg_g1 = _mm512_sub_ps(zero, g1);
-                __m512 exp_neg_g1 = fast_exp512(neg_g1);
-                __m512 denom1 = _mm512_add_ps(one, exp_neg_g1);
-                __m512 rcp1 = _mm512_rcp14_ps(denom1);
-                __m512 term1 = _mm512_fnmadd_ps(denom1, rcp1, two);
-                __m512 sigmoid_g1 = _mm512_mul_ps(rcp1, term1);
-                __m512 silu_g1 = _mm512_mul_ps(g1, sigmoid_g1);
-                res[1] = _mm512_mul_ps(silu_g1, u1);
-            }
-
-            // Max abs
-            __m512 abs_res = _mm512_max_ps(_mm512_abs_ps(res[0]), _mm512_abs_ps(res[1]));
-            max_abs = _mm512_reduce_max_ps(abs_res);
-
-            float d = max_abs / 127.0f;
-            ob.d = simd::fp32_to_fp16(d);
-            float inv_d_f = (d > 1e-10f) ? 1.0f / d : 0.0f;
-            __m512 inv_d = _mm512_set1_ps(inv_d_f);
-
-            int32_t sum = 0;
-
-            // Requantize
-            {
-                // Chunk 0
-                __m512 val0 = _mm512_mul_ps(res[0], inv_d);
-                val0 = _mm512_max_ps(min_val_neg127, _mm512_min_ps(max_val_127, val0));
-                __m512i q0 = _mm512_cvtps_epi32(_mm512_roundscale_ps(val0, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-                _mm512_mask_cvtsepi32_storeu_epi8(ob.qs, 0xFFFF, q0);
-                sum += _mm512_reduce_add_epi32(q0);
-
-                // Chunk 1
-                __m512 val1 = _mm512_mul_ps(res[1], inv_d);
-                val1 = _mm512_max_ps(min_val_neg127, _mm512_min_ps(max_val_127, val1));
-                __m512i q1 = _mm512_cvtps_epi32(_mm512_roundscale_ps(val1, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-                _mm512_mask_cvtsepi32_storeu_epi8(ob.qs + 16, 0xFFFF, q1);
-                sum += _mm512_reduce_add_epi32(q1);
-            }
-            ob.sum_qs = (int16_t)sum;
-        }
+        };
+        OMP_WORKSHARE_REGION(work);
     }
 #endif
 
     void compute_swiglu_q8_1(const void *gate, const void *up, void *output, int size)
     {
+        require_swiglu_buffers<Q8_1Block, 32>(gate, up, output, size);
+#if LLAMINAR_COMPILED_WITH_NEON
+        if (activeISALevel() != ISALevel::Scalar)
+        {
+            compute_swiglu_q8_1_neon(gate, up, output, size);
+            return;
+        }
+#endif
 #if defined(__AVX512F__)
         compute_swiglu_q8_1_avx512(gate, up, output, size);
 #elif defined(__AVX2__)
@@ -1041,7 +1287,7 @@ namespace llaminar2::primitives
             float temp[Q8_1Block::BLOCK_SIZE];
             float max_abs = 0.0f;
 
-            for (int i = 0; i < Q8_1Block::BLOCK_SIZE; ++i)
+            for (std::size_t i = 0; i < Q8_1Block::BLOCK_SIZE; ++i)
             {
                 float g = g_scale * gb.qs[i];
                 float u = u_scale * ub.qs[i];
@@ -1056,7 +1302,7 @@ namespace llaminar2::primitives
             float inv_d = (d > 1e-10f) ? 1.0f / d : 0.0f;
             int32_t sum = 0;
 
-            for (int i = 0; i < Q8_1Block::BLOCK_SIZE; ++i)
+            for (std::size_t i = 0; i < Q8_1Block::BLOCK_SIZE; ++i)
             {
                 int8_t q = (int8_t)std::round(std::max(-127.0f, std::min(127.0f, temp[i] * inv_d)));
                 ob.qs[i] = q;

@@ -1158,6 +1158,7 @@ TEST_F(Test__Q16_VariableBlockRoPE, Dispatch_Block32_Matches_Legacy)
 // Variable Block Size Performance Tests
 // ============================================================================
 
+#if defined(__AVX2__)
 TEST_F(Test__Q16_VariableBlockRoPE, Block64_AVX2_Speedup_VsScalar)
 {
     constexpr int HEAD_DIM = 64;
@@ -1224,6 +1225,7 @@ TEST_F(Test__Q16_VariableBlockRoPE, Block64_AVX2_Speedup_VsScalar)
     // Note: Speedup varies significantly based on CPU load, virtualization, etc.
     // We just log the performance here for informational purposes.
 }
+#endif
 
 #if defined(__AVX512F__)
 TEST_F(Test__Q16_VariableBlockRoPE, Block128_AVX512_Speedup_VsScalar)

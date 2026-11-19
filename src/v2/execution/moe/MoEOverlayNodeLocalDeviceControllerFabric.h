@@ -10,6 +10,7 @@
 
 #pragma once
 
+#include "utils/HostPageSize.h"
 #include "DeviceMoERebalancePolicyShared.h"
 #include "MoEOverlayDeviceControllerKernels.h"
 #include "MoEOverlayDeviceControllerFabricABI.h"
@@ -271,7 +272,7 @@ namespace llaminar2
             std::uint32_t num_layers,
             std::uint32_t num_experts,
             std::uint32_t command_capacity,
-            std::size_t page_bytes = 4096u,
+            std::size_t page_bytes = hostPageBytes(),
             const std::vector<std::uint64_t> &payload_bytes_per_layer = {},
             std::uint64_t minimum_window_activations = 1u,
             std::uint32_t maximum_cycles_per_wave = 1u,

@@ -554,6 +554,8 @@ namespace llaminar2
         setenv("OMP_NESTED", "false", 1);
         setenv("OMP_DYNAMIC", "false", 1);
 
+        configureOpenMPWaitPolicy();
+
         // Intel KMP settings
         setenv("KMP_AFFINITY", "granularity=fine,compact,1,0", 1);
         setenv("KMP_BLOCKTIME", "0", 1);
@@ -571,6 +573,16 @@ namespace llaminar2
         // Log configuration
         LOG_DEBUG("[MPIBootstrap] OpenMP configured: " << omp_threads << " threads, "
                                                        << "places=" << config.omp_places << ", bind=" << config.omp_proc_bind);
+    }
+
+    void MPIBootstrap::configureOpenMPWaitPolicy()
+    {
+        // Preserve an explicit measurement value; otherwise install the
+        // measured bounded budget (see kOpenMPIdleSpinCount).
+        if (DebugEnv::envValue("GOMP_SPINCOUNT") == nullptr &&
+            setenv("GOMP_SPINCOUNT", kOpenMPIdleSpinCount, 0) != 0)
+            throw std::runtime_error(std::string("Cannot install the OpenMP idle-spin policy: ") + strerror(errno));
+        LOG_DEBUG("[MPIBootstrap] GOMP_SPINCOUNT=" << DebugEnv::envValue("GOMP_SPINCOUNT"));
     }
 
     // ========================================================================
@@ -736,15 +748,22 @@ namespace llaminar2
         // Linux hosts). A CLI override would disable that path and also defeat
         // an operator's inherited MCA setting. Preserve both sources of intent.
 
-        // Placement names are portable; remote ranks still observe their own
-        // allowed places and derive their numeric physical-worker budget.
-        // Name-only exports retain the selected value, including place syntax.
+        // Portable names only: remote ranks resolve their own worker geometry.
+        // This native launcher does not create a managed receipt or run its helper.
         for (const char *name : {"OMP_PLACES", "OMP_PROC_BIND"})
         {
             cmd.emplace_back("-x");
             cmd.emplace_back(name);
         }
         appendDiagnosticEnvironment(cmd);
+        // Runtime scheduling policy, not diagnostics: remote ranks load libgomp
+        // before main(), so the launcher-installed idle-spin budget must reach
+        // them by name. Local ranks inherit it; exporting it is identical.
+        if (DebugEnv::envValue("GOMP_SPINCOUNT") != nullptr)
+        {
+            cmd.emplace_back("-x");
+            cmd.emplace_back("GOMP_SPINCOUNT");
+        }
 
         // MPI owns this explicit option/application delimiter. The shared
         // session owner validates only that prefix, never opaque app flags.
@@ -791,11 +810,13 @@ namespace llaminar2
                                     const CPUTopology &topology,
                                     MPIBootstrapArgumentPolicy arguments)
     {
-        // Configure OpenMP environment before exec (inherited by child processes)
         if (config.hostfile.empty())
             configureOpenMPEnvironment(topology, config);
         else
+        {
             configureOpenMPPlacement(config); // Never export the launcher's numeric geometry.
+            configureOpenMPWaitPolicy(); // Remote ranks receive it through -x.
+        }
         configureLauncherEnvironment();
 
         MPISessionOwner::requireProcessOwner();

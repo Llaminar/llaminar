@@ -12,6 +12,7 @@
 #include "../../fixtures/transfer/ComponentTransferExecutionPoolFixtureAccess.h"
 #include "execution/moe/ExpertTierGpuPeerTransferLane.h"
 #include <limits>
+#include "utils/HostPageSize.h"
 
 #include "tensors/CoherenceState.h"
 #include "transfer/TransferEngine.h"
@@ -429,7 +430,15 @@ TEST(Test__TransferEngine_StagingSlab,
         ASSERT_EQ(slices.size(), kSliceCount);
         EXPECT_EQ(backend.pinned_allocations, 1u);
         EXPECT_EQ(backend.device_allocations, 1u);
-        EXPECT_EQ(backend.last_pinned_bytes, kSliceBytes * kSliceCount);
+        // The native pinned allocation rounds the requested slab up to whole
+        // host pages; the device allocation keeps the exact requested extent.
+        // On a 4 KiB host 49x4096 bytes already are whole pages, which is why
+        // the literal product matched there and only there.
+        const std::size_t host_page = llaminar2::hostPageBytes();
+        const std::size_t pinned_extent =
+            (kSliceBytes * kSliceCount + host_page - 1u) / host_page *
+            host_page;
+        EXPECT_EQ(backend.last_pinned_bytes, pinned_extent);
         EXPECT_EQ(backend.last_device_bytes, kSliceBytes * kSliceCount);
         EXPECT_EQ(backend.last_pinned_ordinal, 3);
         EXPECT_EQ(backend.last_device_ordinal, 3);

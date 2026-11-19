@@ -12,7 +12,11 @@
  * - Numerical accuracy vs FP32 reference
  * - Dynamic range preservation
  * - Quantization error bounds
- * - SIMD correctness (AVX512/AVX2 vs scalar)
+ * - SIMD correctness (admitted native execution vs explicit scalar diagnostics)
+ *
+ * Every standalone numeric receipt admits a real native profile before running;
+ * explicit scalar controls inside that profile do not advertise a scalar engine
+ * or let an empty/foreign native inventory pass this suite.
  *
  * @author David Sanftenberg
  * @date 2025-11-07
@@ -21,6 +25,8 @@
 #include <gtest/gtest.h>
 #include "kernels/cpu/primitives/RMSNormPrimitives.h"
 #include "utils/Logger.h"
+#include "utils/CPUFeatures.h"
+#include <stdexcept>
 #include <vector>
 #include <random>
 #include <cmath>
@@ -39,6 +45,17 @@ namespace
     {
     protected:
         std::mt19937 rng_{42}; // Fixed seed for reproducibility
+
+        /** @brief Admit the actual native profile before any independently filtered case.
+         * @throws std::runtime_error For a scalar, foreign or uncompiled native receipt.
+         */
+        void SetUp() override
+        {
+            const auto isa=llaminar2::activeISALevel();
+            if(isa==llaminar2::ISALevel::Scalar||
+                !llaminar2::isNativeCPUExecutionISAPair(llaminar2::compiledCPUISALevel(),isa))
+                throw std::runtime_error("INT32 RMS legacy conformance requires an admitted native ISA");
+        }
 
         /// Generate random INT32 activations (typical range from INT8×INT8 accumulation)
         std::vector<int32_t> generateRandomINT32(size_t rows, size_t cols, int32_t min_val = -100000, int32_t max_val = 100000)

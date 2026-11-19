@@ -29,6 +29,7 @@
 #include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/local_execution/graph/RequestInputPositionAdmission.h"
 #include <gtest/gtest.h>
+#include "utils/HostPageSize.h"
 #include <array>
 #include <atomic>
 #include <chrono>
@@ -82,7 +83,7 @@ auto geometry(const ReplayCase& c,DeviceId device,std::uint32_t slots,std::uint3
     auto layout=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(source.format,source.rows,source.rowBytes()),
         ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
         {{{gpu,ImmutableRowStorage::VRAM},0,0,{}},{{host,ImmutableRowStorage::RAM},0,0,{}}},{gpu},{},
-        {{host,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},{},{},16);
+        {{host,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),2)}},{},{},16);
     auto physical=q::PooledImmutablePhysicalOwnerGeometry::fromLayout(layout,std::array{gpu},gpu);
     auto policy=q::PooledImmutableCoordinatorGeometry::fromOwners(physical,{65536,1,2},maximumOriginal);
     auto cpu=CpuAdaptiveImmutableRowCacheGeometry::forSubordinateGPU(layout,host,gpu);

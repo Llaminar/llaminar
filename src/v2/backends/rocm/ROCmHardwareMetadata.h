@@ -41,6 +41,7 @@ namespace llaminar2
         bool can_use_stream_wait_value = false; ///< SDK-reported device/runtime support for 32/64-bit stream wait-value primitives.
         int wall_clock_rate_khz = 0; ///< Constant-frequency wall_clock64 clock, not the variable core clock.
         std::size_t lds_per_block = 0, total_memory = 0, last_level_cache = 0;
+        bool integrated = false; ///< Driver fact: an APU whose device memory is host memory.
         // Compatibility only: these preserve existing API answers and must not
         // select a native kernel, wave geometry or a future matrix implementation.
         ROCmLegacyPrecisionQueries legacy_precision;

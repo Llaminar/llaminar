@@ -5,6 +5,11 @@ if(NOT V2_PERF_TESTS_ONLY)
     add_executable(v2_test_pooled_native_program_diagnostic
         unit/backends/Test__PooledNativeProgramDiagnostic.cpp
         integration/core_gtest_main.cpp)
+    # Pooled immutable sources are CUDA/ROCm-native objects (no CPU
+    # implementation); every registration requires a GPU backend family.
+    if(TARGET v2_test_pooled_native_program_diagnostic)
+        set_target_properties(v2_test_pooled_native_program_diagnostic PROPERTIES V2_TEST_REQUIRED_BACKEND GPU)
+    endif()
     if(TARGET v2_test_pooled_native_program_diagnostic)
         target_compile_definitions(v2_test_pooled_native_program_diagnostic PRIVATE LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC=1)
         target_include_directories(v2_test_pooled_native_program_diagnostic PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")

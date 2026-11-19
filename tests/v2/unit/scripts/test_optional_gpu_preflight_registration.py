@@ -25,9 +25,27 @@ SOURCE = Path(__file__).resolve().parents[4]
 def registration_source() -> str:
     """Load executable CMake policy from its canonical source-owned boundaries."""
     source = (SOURCE / 'tests/v2/CMakeLists.txt').read_text()
+    # The canonical add_v2_test body consults the Release-mode selection
+    # functions from cmake/V2TestTargetSelection.cmake (included before the
+    # function definition in the real build). The synthetic project must
+    # carry the same authoritative definitions or every registration fails
+    # configuration with an unknown command.
+    selection = (SOURCE / 'tests/v2/cmake/V2TestTargetSelection.cmake').read_text()
+    # Complete canonical dependency closure: the CACHE declaration plus every
+    # selection function the declarations consult (target selection,
+    # registration selection), sliced from the canonical file so the
+    # synthetic project cannot drift from the real build's semantics. The
+    # include_guard and trailing validation helper stay out: include_guard is
+    # meaningless in an inlined top-level file and the validator is not part
+    # of the registration path under test.
+    start = selection.index('set(LLAMINAR_RELEASE_NATIVE_TEST_TARGETS')
+    end = selection.index('endfunction()',
+                          selection.index('function(v2_test_registration_selected', start))
+    end += len('endfunction()')
+    selection_functions = selection[start:end]
     start = source.index('function(add_v2_test TEST_NAME)')
     end = source.index('endfunction()', start) + len('endfunction()')
-    helper = source[start:end]
+    helper = selection_functions + '\n' + source[start:end]
     start = source.index('    foreach(_devices 2 4 8)')
     end = source.index('    message(STATUS "V2 Tests: Added RCCLCoordinator', start)
     rccl = source[start:end]

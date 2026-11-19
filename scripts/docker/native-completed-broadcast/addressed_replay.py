@@ -25,6 +25,12 @@ pre=r'''
 #include <unistd.h>
 #include <sys/wait.h>
 #include <csignal>
+// __builtin_trap() raises the host ISA's trap: ud2/SIGILL on x86-64, brk/SIGTRAP on AArch64.
+#if defined(__aarch64__)
+constexpr int kNativeTrapSignal=SIGTRAP;
+#else
+constexpr int kNativeTrapSignal=SIGILL;
+#endif
 #define __device__
 #define __forceinline__ inline
 #define __host__
@@ -173,7 +179,7 @@ int main(){
    if(defect==5)work.sendTransfer.capacityBytes=0;
    ncclShmem.channelId=0;(void)ncclLlaminarResolveP2p(&work,true);_exit(99);
   }
-  int status=0;assert(waitpid(child,&status,0)==child);assert(WIFSIGNALED(status)&&WTERMSIG(status)==SIGILL);
+  int status=0;assert(waitpid(child,&status,0)==child);assert(WIFSIGNALED(status)&&WTERMSIG(status)==kNativeTrapSignal);
  }
  puts("PASS actual addressed API/P2P bodies:20epochs,8rank edges,zero/partial/full,source slices,exact bytes,minimal live metadata steps,original completion and abort");
 }

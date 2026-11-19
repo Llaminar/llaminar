@@ -71,8 +71,12 @@ std::shared_ptr<PhysicalMemoryAuthority> bufferedCPUJointMemory(ModelLoader& loa
     const NativeWeightSourceWindow range{.original_expert=size_t(selection.expertIds().front()),
         .rows=size_t(projection.rows),.columns=size_t(projection.columns),
         .native_row_bytes=size_t(projection.columns)/native.native_group_elements*native.native_group_bytes};
+    // The staging authority is one whole host page: the onNode placement maps
+    // anonymous page-rounded roots, so the literal 4096 (one 4 KiB page) could
+    // not admit even one encoded unit on a 64 KiB host. One whole host page
+    // keeps the smallest-bounded-cap shape on every supported page size.
     const auto geometry=resolveNativeWeightLoadStaging(nativeReadRequestForTest(native,range),
-        CPUStoragePlacement::onNode(selection.participant().address.numa_node),size_t{4096});
+        CPUStoragePlacement::onNode(selection.participant().address.numa_node),llaminar2::hostPageBytes());
     PhysicalMemoryPlanBuilder builder;
     builder.add({0,selection.participant().device,geometry.physical_bytes,geometry.physical_bytes},
         PhysicalMemoryOwner::WeightLoadStaging,geometry.physical_bytes);
@@ -126,14 +130,15 @@ TEST(CPUJointBufferedSource, SplitOriginalBytesAndMappedPagesRemainUnfaulted) {
                 EXPECT_EQ(range.original_expert,size_t(selected->expertIds()[ordinal]));
                 const auto visits=visitNativeSourceForTest(loader,name,range,nativeReadRequestForTest(native,range),
                     CPUStoragePlacement::onNode(selected->participant().address.numa_node),memory,
-                    selected->participant().device,size_t{4096},[&](const auto& window,auto bytes,auto) {
+                    selected->participant().device,llaminar2::hostPageBytes(),[&](const auto& window,auto bytes,auto) {
                         const auto* data=reinterpret_cast<const float*>(bytes.data());
                         const size_t full_k=role==2?BufferedCPUJointFiles::F:BufferedCPUJointFiles::H;
                         for(size_t n=0;n<window.rows;++n)for(size_t k=0;k<window.columns;++k)
                             EXPECT_EQ(data[n*window.columns+k],BufferedCPUJointFiles::value(role,
                                 window.original_expert,(window.first_row+n)*full_k+window.first_column+k));
                         EXPECT_LE(memory->claimedBytes(selected->participant().device,PhysicalMemoryOwner::WeightLoadStaging,
-                            PhysicalMemoryMaterializationKind::NewAllocation),4096u);
+                            PhysicalMemoryMaterializationKind::NewAllocation),
+                            llaminar2::hostPageBytes());
                     });
                 EXPECT_GT(visits,0u);
                 EXPECT_EQ(memory->claimedBytes(selected->participant().device,PhysicalMemoryOwner::WeightLoadStaging,
@@ -161,7 +166,7 @@ TEST(CPUJointBufferedSource, TruncatedMainAndSplitReadReleaseOriginalStaging) {
             const auto range=projectNativeWeightSource(request,native).back().range;
             (void)visitNativeSourceForTest(loader,name,range,nativeReadRequestForTest(native,range),
                 CPUStoragePlacement::onNode(selected->participant().address.numa_node),memory,
-                selected->participant().device,size_t{4096},[](const auto&,auto,auto){});
+                selected->participant().device,llaminar2::hostPageBytes(),[](const auto&,auto,auto){});
             FAIL()<<"Truncated original source unexpectedly loaded";
         } catch(const std::runtime_error& failure) {
             EXPECT_NE(std::string(failure.what()).find("buffered"),std::string::npos)<<failure.what();

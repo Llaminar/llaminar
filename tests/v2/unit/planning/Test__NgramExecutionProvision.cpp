@@ -179,7 +179,8 @@ TEST(NgramExecutionProvision, WireRoundTripReauthenticatesSourceGeometryAndExact
         // arena bytes, but omit the lookup arena contribution. Decode must
         // rederive common+execution and reject this otherwise well-formed frame.
         auto underpriced=wire;const auto &fixed=q.execution_provision->requiredBase();
-        constexpr std::size_t record=28u+16u*PhysicalMemoryBOM::ownerCount();
+        constexpr std::size_t resource_header=40u; // rank,type,ordinal,total,available,backing,pool
+        constexpr std::size_t record=resource_header+16u*PhysicalMemoryBOM::ownerCount();
         const auto plan_start=underpriced.size()-(4u+record*fixed.resources().size());
         std::size_t resource_index=0;
         while(resource_index<fixed.resources().size() && fixed.resources()[resource_index].resource().device!=c.device)++resource_index;
@@ -190,7 +191,7 @@ TEST(NgramExecutionProvision, WireRoundTripReauthenticatesSourceGeometryAndExact
         const auto lookup_arena=bytes(q.execution_provision->executionPlan(),{0,c.device},PhysicalMemoryOwner::ActivationArena);
         ASSERT_GT(full_arena,lookup_arena);const auto common_arena=full_arena-lookup_arena;
         EXPECT_GT(common_arena,lookup_arena); // An execution-only coverage test would wrongly pass.
-        const auto offset=plan_start+4u+resource_index*record+28u+owner_index*16u;
+        const auto offset=plan_start+4u+resource_index*record+resource_header+owner_index*16u;
         ASSERT_LE(offset+8u,underpriced.size());
         for(std::size_t b=0;b<8u;++b)underpriced[offset+b]=static_cast<std::uint8_t>(static_cast<std::uint64_t>(common_arena)>>(8u*b));
         EXPECT_THROW((void)test::ImmutableRowTableAdmissionWireReplayAccess::parse(underpriced,0,&profile,q.native_ordering_events,q.retained_host_services),std::invalid_argument);
@@ -398,19 +399,36 @@ TEST(NgramExecutionProvision, AdaptiveFinalSlotsUseCanonicalFitsAfterAllFixedOwn
     // Author a fresh observed budget at one exact source-geometry boundary.
     // Production selection still delegates every candidate to complete PMA fits.
     c.associated_host_memory->admission_available_bytes=host->incrementalBytes()+g.storageBytes();
-    frozen=MemoryPlanner::plan(profile,{c}).physicalPlan();q=request(profile,{c});
-    const auto selected=ImmutableRowTablePlacementPlanner::select(q,frozen);
-    std::size_t expected=0;
-    for(std::size_t n=1;n<=31;++n)
-    {
+    const auto fits_slots=[&](std::size_t n) {
         const auto shape=CpuAdaptiveImmutableRowCacheGeometry::fromLayout(q.input.hostAdaptiveLayout(q.requested,n,maximum),
             {0,DeviceId::cpu()},maximum,q.requested.host_adaptive.policy);
         PhysicalMemoryPlanBuilder complete(frozen);const auto cache=shape.cacheBOM(q.input.host());
         for(const auto &line:cache.resources())complete.add(line);
-        if(complete.build().fits())expected=n;
+        return complete.build().fits();
+    };
+    // Seven and 31 rows can occupy the same physical page bucket. Keep the
+    // observed budget fixed and establish a genuinely nonfitting request ceiling
+    // through complete PMA plans, rather than assuming 4 KiB allocation geometry.
+    std::size_t ceiling=31;
+    for(;;)
+    {
+        c.ngram_execution_policy->host_adaptive.maximum_cache_rows=ceiling;
+        frozen=MemoryPlanner::plan(profile,{c}).physicalPlan();q=request(profile,{c});
+        ASSERT_EQ(q.execution_provision->maximumLiveIds(),maximum);
+        if(!fits_slots(ceiling))break;
+        const auto source_rows=static_cast<std::size_t>(q.input.extent().rows());
+        ASSERT_LT(ceiling,source_rows)
+            << "Fixture must expose a partial-fit boundary before the source is exhausted";
+        ceiling+=std::min(ceiling,source_rows-ceiling);
     }
+    const auto selected=ImmutableRowTablePlacementPlanner::select(q,frozen);
+    std::size_t expected=0;
+    for(std::size_t n=1;n<=ceiling;++n)
+        if(fits_slots(n))expected=n;
     EXPECT_EQ(selected.placement->hostAdaptiveLayout().owners().front().cache_rows,expected);
-    EXPECT_LT(expected,31u);EXPECT_GE(expected,7u);
+    EXPECT_LT(expected,ceiling);EXPECT_GE(expected,7u);
+    RecordProperty("requested_cache_row_ceiling",std::to_string(ceiling));
+    RecordProperty("fitting_cache_rows",std::to_string(expected));
     EXPECT_EQ(bytes(selected.physical_plan,{0,c.device},PhysicalMemoryOwner::RoutedExpertWeights),
         bytes(frozen,{0,c.device},PhysicalMemoryOwner::RoutedExpertWeights));
 }

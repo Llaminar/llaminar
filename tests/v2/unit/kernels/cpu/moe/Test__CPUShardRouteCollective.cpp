@@ -328,6 +328,8 @@ TEST(CPUShardRouteCollective, FusedFinalAddPreweightFiniteValidationIsExplicit) 
  * @test Authored compact shard records preserve both original outputs when the
  * worker preweights each completed final-add tile. This is numerical/lifecycle contract
  * coverage, not a recorded route trace, NUMA or captured-consumer certificate.
+ * The deliberate NaN/Inf corpus uses the diagnostic nonfinite-preserving policy;
+ * the independent policy test below proves normal publication still rejects it.
  */
 TEST(CPUShardRouteCollective, FusedFinalAddPreservesRawAndWeightedBytes) {
     // The source corpus intentionally includes NaN/Inf. Compare its exact
@@ -418,6 +420,54 @@ TEST(CPUShardRouteCollective, FusedFinalAddPreservesRawAndWeightedBytes) {
         EXPECT_EQ(failures,0);
         EXPECT_EQ(std::memcmp(raw.data(),expected_raw.data(),raw.size()*sizeof(float)),0);
         EXPECT_EQ(std::memcmp(weighted.data(),expected_weighted.data(),weighted.size()*sizeof(float)),0);
+    }
+}
+
+/** @test Nonfinite payload rejection is a validation policy, independent of workers or scalar width. */
+TEST(CPUShardRouteCollective, FusedFinalAddPreweightHonorsNonFiniteValidationPolicy) {
+    const int saved=omp_get_max_threads();
+    struct Restore {int value;~Restore(){omp_set_num_threads(value);}} restore{saved};
+    const bool original_policy=debugEnv().validation.fail_on_nan;
+    constexpr size_t live=9,capacity=10;
+    std::array<int32_t,live> slots{};
+    std::iota(slots.begin(),slots.end(),0);
+    std::array<float,live> weights;weights.fill(.5f);
+    MoEOverlaySparseRows input;
+    input.row_capacity=capacity;input.entry_capacity=capacity;input.d_model=1;input.top_k=1;
+    input.original_route_slots_host=slots.data();input.compact_route_slots_host=slots.data();
+    input.route_weights_host=weights.data();
+    for(const int threads:{1,3}) {
+        omp_set_num_threads(threads);
+        for(const bool reject_nonfinite:{false,true}) {
+            const ScopedRouteFiniteValidation policy(reject_nonfinite);
+            input.live_row_count=live;input.live_entry_count=live;
+            std::array<float,capacity> source,destination;
+            source.fill(4.0f);destination.fill(-993.0f);
+            const auto preweight=[&] {
+                return preweightMoEOverlayCanonicalRouteRows(input,source,
+                    MoEOverlayCanonicalRouteSourceLayout::originalSlots(),destination,
+                    MoEOverlayCanonicalRouteSourceIndex::CompactRouteSlot);
+            };
+            ASSERT_TRUE(preweight()); // Finite one-column work is valid under either policy.
+            EXPECT_EQ(destination[0],2.0f);
+            EXPECT_EQ(destination.back(),-993.0f);
+            for(const uint32_t bits:{0x7fc12345u,0x7f812345u,0x7f800000u,0xff800000u}) {
+                SCOPED_TRACE(::testing::Message()<<threads<<'/'<<reject_nonfinite<<'/'<<bits);
+                source[live-1]=std::bit_cast<float>(bits);
+                const auto original_source=source;
+                destination.fill(-993.0f);
+                EXPECT_EQ(preweight(),!reject_nonfinite);
+                EXPECT_EQ(destination[0],2.0f);
+                EXPECT_FALSE(std::isfinite(destination[live-1]));
+                EXPECT_EQ(destination.back(),-993.0f);
+                EXPECT_EQ(std::memcmp(source.data(),original_source.data(),sizeof(source)),0);
+            }
+            input.live_row_count=0;input.live_entry_count=0;
+            destination.fill(-993.0f);
+            ASSERT_TRUE(preweight()); // Inactive nonfinite storage is not published live data.
+            for(const auto value:destination)EXPECT_EQ(value,-993.0f);
+        }
+        EXPECT_EQ(debugEnv().validation.fail_on_nan,original_policy);
     }
 }
 

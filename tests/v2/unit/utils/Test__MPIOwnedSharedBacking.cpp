@@ -8,6 +8,7 @@
  * descriptor remains the authority through unlink, move and peer attachment.
  */
 #include "utils/MPISessionOwner.h"
+#include "utils/MPISessionEnvironment.h"
 #include <gtest/gtest.h>
 #include <atomic>
 #include <cerrno>
@@ -52,6 +53,28 @@ TEST(MPIOwnedSharedBacking, PeerRetiredOriginalAllowsSameNameSuccessorWithoutDel
     EXPECT_EQ(successor.identity(),successor_identity);EXPECT_NO_THROW(successor.requireExtent(256));
     creator.requireExtent(128);peer.requireExtent(128);
 }
+TEST(MPIOwnedSharedBacking, StaleSessionIdentityCannotReplaySameNamedSuccessorInode)
+{
+    // Stale session-replay negative: a previous session's creator identity
+    // (dev/ino/uid) must NOT attach to a same-named successor inode in the
+    // current session's owned directory. Exercises ACTUAL openExisting.
+    auto root=directory();const auto basename=name();auto creator=root.createExclusive(basename);
+    ASSERT_EQ(::ftruncate(creator.descriptor(),128),0);
+    const auto stale_identity=creator.identity();
+    creator.unlink(); // the original session's object retires
+    auto successor=root.createExclusive(basename); // same name, DIFFERENT inode
+    ASSERT_EQ(::ftruncate(successor.descriptor(),256),0);
+    EXPECT_NE(successor.identity(),stale_identity);
+    // The stale identity cannot attach to the successor under any extent.
+    EXPECT_THROW((void)root.openExisting(basename,stale_identity,256),std::runtime_error);
+    EXPECT_THROW((void)root.openExisting(basename,stale_identity,128),std::runtime_error);
+    // A never-existed basename cannot be opened at all (no ambient adoption).
+    EXPECT_THROW((void)root.openExisting(name(),stale_identity,128),std::runtime_error);
+    // Only the successor's own identity+extent attaches.
+    EXPECT_NO_THROW((void)root.openExisting(basename,successor.identity(),256));
+    successor.unlink();
+}
+
 TEST(MPIOwnedSharedBacking, PeerRejectsWrongOriginalIdentityAndExtentBeforeMapping)
 {
     auto root=directory();const auto basename=name();auto creator=root.createExclusive(basename);
@@ -200,4 +223,48 @@ int main(int argc,char **argv)
 {
     if(auto terminal=MPISessionOwner::enterProcess(argc,argv))return *terminal;
     ::testing::InitGoogleTest(&argc,argv);return RUN_ALL_TESTS();
+}
+
+TEST(MPIOwnedSharedBacking, OwnerLossThrowsThroughActualSharedDirectoryApi)
+{
+    // Blocker-B bound test: in an OWNED context, a missing/corrupt expected
+    // owner must THROW from the actual sharedDirectory() API — never return
+    // nullopt (which would invite an unowned/remote downgrade), never adopt
+    // anything. Two real loss modes are exercised in forked children (the
+    // borrow descriptor survives fork; only exec closes it):
+    auto root=directory();
+    const auto basename=name(); auto file=root.createExclusive(basename);
+    const std::string dir_path=root.path();
+    // Mode 1: the owned directory path no longer resolves (renamed away).
+    const std::string moved=dir_path+"-moved-"+std::to_string(::getpid());
+    ASSERT_EQ(::rename(dir_path.c_str(),moved.c_str()),0);
+    {
+        const pid_t pid=::fork();
+        if(pid==0)
+        {
+            try { (void)MPISessionOwner::sharedDirectory(); std::_Exit(0); }
+            catch(const std::exception&) { std::_Exit(3); } // threw = correct
+        }
+        int status=0; ::waitpid(pid,&status,0);
+        ASSERT_TRUE(WIFEXITED(status));
+        EXPECT_EQ(WEXITSTATUS(status),3);
+    }
+    ASSERT_EQ(::rename(moved.c_str(),dir_path.c_str()),0); // restore
+    // Mode 2: the original shared-directory path env disappeared.
+    {
+        const pid_t pid=::fork();
+        if(pid==0)
+        {
+            ::unsetenv(llaminar2::mpi_session::environmentName(
+                llaminar2::mpi_session::EnvironmentKey::VaderBackingDirectory));
+            try { (void)MPISessionOwner::sharedDirectory(); std::_Exit(0); }
+            catch(const std::exception&) { std::_Exit(3); }
+        }
+        int status=0; ::waitpid(pid,&status,0);
+        ASSERT_TRUE(WIFEXITED(status));
+        EXPECT_EQ(WEXITSTATUS(status),3);
+    }
+    // The restored directory still authenticates with its original identity.
+    EXPECT_NO_THROW((void)root.openExisting(basename,file.identity(),0));
+    file.unlink();
 }

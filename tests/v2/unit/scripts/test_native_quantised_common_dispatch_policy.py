@@ -506,17 +506,22 @@ class NativeQuantisedCommonDispatchPolicyTest(unittest.TestCase):
     ) -> None:
         """SMT siblings share one default process-pool worker slot."""
 
+        # (cpu, package, core label, kernel thread-sibling list)
         topology = (
-            (0, 0, 0),
-            (1, 0, 0),
-            (2, 0, 1),
-            (3, 0, 1),
-            (4, 1, 0),
-            (5, 1, 0),
+            (0, 0, 0, "0-1"),
+            (1, 0, 0, "0-1"),
+            (2, 0, 1, "2-3"),
+            (3, 0, 1, "2-3"),
+            (4, 1, 0, "4-5"),
+            (5, 1, 0, "4-5"),
+            # GB10-style hybrid clusters repeat core labels for distinct
+            # singleton cores; sibling sets, not labels, identify them.
+            (6, 2, 0, "6"),
+            (7, 2, 0, "7"),
         )
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            for cpu, package_id, core_id in topology:
+            for cpu, package_id, core_id, siblings in topology:
                 cpu_topology = root / f"cpu{cpu}" / "topology"
                 cpu_topology.mkdir(parents=True)
                 (cpu_topology / "physical_package_id").write_text(
@@ -525,6 +530,15 @@ class NativeQuantisedCommonDispatchPolicyTest(unittest.TestCase):
                 (cpu_topology / "core_id").write_text(
                     f"{core_id}\n", encoding="utf-8"
                 )
+                (cpu_topology / "thread_siblings_list").write_text(
+                    f"{siblings}\n", encoding="utf-8"
+                )
+            self.assertEqual(
+                segmented_policy._physical_core_worker_count(
+                    affinity=(6, 7), topology_root=root
+                ),
+                2,
+            )
 
             self.assertEqual(
                 segmented_policy._physical_core_worker_count(
@@ -541,7 +555,7 @@ class NativeQuantisedCommonDispatchPolicyTest(unittest.TestCase):
 
             # Incomplete topology fails conservatively to the visible logical
             # count instead of guessing an SMT width.
-            (root / "cpu5" / "topology" / "core_id").unlink()
+            (root / "cpu5" / "topology" / "thread_siblings_list").unlink()
             self.assertEqual(
                 segmented_policy._physical_core_worker_count(
                     affinity=range(6), topology_root=root
@@ -1981,6 +1995,11 @@ class NativeQuantisedCommonDispatchPolicyTest(unittest.TestCase):
         self.assertEqual(len(rocm_moe.entries), 12)
         self.assertEqual(len(rocm_decode.entries), 65)
         self.assertEqual(len(cpu_decode.entries), 5)
+        # The verifier registry's declared inventory is exactly the explicit
+        # policy enumeration below: completeness (the count matches the
+        # enumeration one-to-one) and explicitness (every entry names one of
+        # these policies) are the same invariant, so a future candidate can
+        # only enter by extending this enumeration.
         self.assertEqual(len(cpu.entries), 10)
         self.assertEqual(
             {entry.config_json["policy"] for entry in cpu.entries},
@@ -4627,6 +4646,7 @@ class NativeQuantisedCommonDispatchPolicyTest(unittest.TestCase):
                 policy_accelerators=(),
                 fit_cache=PolicyFitCache(Path(directory)),
                 profiler_feature_catalog=catalog,
+                profiler_surrogate_devices=("cpu",),
             )
 
         self.assertEqual(len(policy.cross_validation), 1)

@@ -365,9 +365,11 @@ Treat cache residency as a tournament parameter, not as a folklore percentage:
    count. A raw timing fluctuation without a mechanism is not enough to encode
    a new generic policy.
 
-The focused NativeQuantised cache-tile tournament is
+The focused x86 NativeQuantised cache-tile tournament is
 `v2_perf_cpu_native_quantised_dispatch_sweep`, test
-`CacheKTilesCoverAllPreparedFootprints`. Select geometry with
+`CacheKTilesCoverAllPreparedFootprints`; AArch64 builds do not register it
+because the register-K NEON ABI has no cache tiling (use
+`v2_perf_cpu_native_neon_exact_overlay` there). Select geometry with
 `LLAMINAR_CPU_NATIVE_QUANTISED_CACHE_TILE_M`, `_N`, and `_K`; select one exact profiler
 launch with `_FORMAT`, `_CANDIDATE`,
 `LLAMINAR_NATIVE_QUANTISED_PROFILE_REQUEST_ID`, and

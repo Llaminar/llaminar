@@ -733,10 +733,18 @@ namespace
      * column and reused across all valid rows. K work is processed partition by
      * partition in one CTA; no global partial buffer or cross-CTA reduction is
      * required, and the final FP32 tree is exactly the public serial-M1 tree.
+     * The narrow IQ4/IQ2S 12.x kernels retain ten resident CTAs per SM; this
+     * compiler scheduling bound limits live registers without changing storage
+     * or the integer/FP contribution order.
      */
     template <uint8_t CodebookId, int ColumnsPerBlock>
     __global__ __launch_bounds__(
         GroupedImmaGeometry<ColumnsPerBlock>::projection_threads,
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+        (ColumnsPerBlock == 32 &&
+         (llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>::is_iq4_lut ||
+          CodebookId == 13)) ? 10 :
+#endif
         GroupedImmaGeometry<ColumnsPerBlock>::
             projection_minimum_blocks_per_sm)
     void groupedImmaProjectionKernel(
@@ -1630,8 +1638,100 @@ namespace
                 }
                 else
                 {
-                    // Direct metadata loads reuse activation scales between
-                    // gate and up, so retain their element-interleaved fold.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+                    // Narrow the live range below the 64-register paired
+                    // budget: fold the complete gate dot pair and its
+                    // per-element contributions before the up dots exist, so
+                    // the kernel never holds both dot sets at once. Element
+                    // indices stay compile-time constants, so all four
+                    // accumulators remain registers.
+                    int32_t gate_dot_lo[4] = {0, 0, 0, 0};
+                    int32_t gate_dot_hi[4] = {0, 0, 0, 0};
+                    if constexpr (llaminar2::cuda_native_quantised::
+                                      CodebookTraits<CodebookId>::is_dual_scale)
+                    {
+                        const uint32_t gate_b_lo[2] = {
+                            gate_b_fragment[0], 0u};
+                        const uint32_t gate_b_hi[2] = {
+                            0u, gate_b_fragment[1]};
+                        mmaM16N8K32(gate_dot_lo, a_fragment, gate_b_lo);
+                        mmaM16N8K32(gate_dot_hi, a_fragment, gate_b_hi);
+                    }
+                    else
+                    {
+                        mmaM16N8K32(gate_dot_lo, a_fragment, gate_b_fragment);
+                    }
+#pragma unroll
+                    for (int element = 0; element < 4; ++element)
+                    {
+                        const int local_row = mmaFragmentRow(lane, element);
+                        const int column =
+                            column_base + mmaFragmentColumn(lane, element);
+                        if (local_row >= active_rows || column >= N)
+                            continue;
+                        const size_t linear =
+                            static_cast<size_t>(block) * N + column;
+                        const float activation_scale = scales_A[
+                            static_cast<size_t>(original_rows[local_row]) * blocks_per_row +
+                            block];
+                        gate_partial[element] = __fadd_rn(
+                            gate_partial[element],
+                            contributionFromMma<CodebookId>(
+                                shared_a + local_row * kQuantBlock,
+                                gate_dot_lo[element],
+                                gate_dot_hi[element],
+                                gate_payload_base + linear * kPayloadBytes,
+                                gate_scales,
+                                gate_mins,
+                                gate_emins,
+                                linear,
+                                activation_scale, gate_descriptor.codebook_id));
+                    }
+                    int32_t up_dot_lo[4] = {0, 0, 0, 0};
+                    int32_t up_dot_hi[4] = {0, 0, 0, 0};
+                    if constexpr (llaminar2::cuda_native_quantised::
+                                      CodebookTraits<CodebookId>::is_dual_scale)
+                    {
+                        const uint32_t up_b_lo[2] = {
+                            up_b_fragment[0], 0u};
+                        const uint32_t up_b_hi[2] = {
+                            0u, up_b_fragment[1]};
+                        mmaM16N8K32(up_dot_lo, a_fragment, up_b_lo);
+                        mmaM16N8K32(up_dot_hi, a_fragment, up_b_hi);
+                    }
+                    else
+                    {
+                        mmaM16N8K32(up_dot_lo, a_fragment, up_b_fragment);
+                    }
+#pragma unroll
+                    for (int element = 0; element < 4; ++element)
+                    {
+                        const int local_row = mmaFragmentRow(lane, element);
+                        const int column =
+                            column_base + mmaFragmentColumn(lane, element);
+                        if (local_row >= active_rows || column >= N)
+                            continue;
+                        const size_t linear =
+                            static_cast<size_t>(block) * N + column;
+                        const float activation_scale = scales_A[
+                            static_cast<size_t>(original_rows[local_row]) * blocks_per_row +
+                            block];
+                        up_partial[element] = __fadd_rn(
+                            up_partial[element],
+                            contributionFromMma<CodebookId>(
+                                shared_a + local_row * kQuantBlock,
+                                up_dot_lo[element],
+                                up_dot_hi[element],
+                                up_payload_base + linear * kPayloadBytes,
+                                up_scales,
+                                up_mins,
+                                up_emins,
+                                linear,
+                                activation_scale, up_descriptor.codebook_id));
+                    }
+#else
+                    // Original element-interleaved fold: direct metadata loads
+                    // reuse activation scales between gate and up.
                     int32_t gate_dot_lo[4] = {0, 0, 0, 0};
                     int32_t gate_dot_hi[4] = {0, 0, 0, 0};
                     int32_t up_dot_lo[4] = {0, 0, 0, 0};
@@ -1670,8 +1770,6 @@ namespace
                         const int local_row = mmaFragmentRow(lane, element);
                         const int column =
                             column_base + mmaFragmentColumn(lane, element);
-                        // Non-staged metadata is read directly from weights
-                        // and activations, so its loads require valid indices.
                         if (local_row >= active_rows || column >= N)
                             continue;
                         const size_t linear =
@@ -1704,6 +1802,7 @@ namespace
                                 linear,
                                 activation_scale, up_descriptor.codebook_id));
                     }
+#endif
                 }
                 __syncthreads();
             }

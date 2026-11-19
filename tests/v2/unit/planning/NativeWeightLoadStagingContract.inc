@@ -6,6 +6,7 @@
  * execution readiness. Source units model indivisible native blocks/rows.
  */
 #include "loaders/NativeWeightLoadStaging.h"
+#include "utils/HostPageSize.h"
 
 namespace llaminar2 {
 TEST(NativeWeightLoadStagingContract, SourceAndSimultaneousScratchShareOneExactPhysicalCap)
@@ -18,7 +19,13 @@ TEST(NativeWeightLoadStagingContract, SourceAndSimultaneousScratchShareOneExactP
             SCOPED_TRACE(native);
             SCOPED_TRACE(scratch);
             const NativeWeightLoadStagingRequest request{native,scratch,96,1000000};
-            const auto geometry=resolveNativeWeightLoadStaging(request,placement,8192);
+            // The cap is two whole host pages: the onNode placement maps
+            // anonymous page-rounded roots, so any cap below one host page
+            // (the literal 8192 on a 4 KiB host) could not admit even one
+            // indivisible unit there. Two pages preserve the original
+            // bounded-cap shape on every supported page size.
+            const size_t budget=2u*llaminar2::hostPageBytes();
+            const auto geometry=resolveNativeWeightLoadStaging(request,placement,budget);
             ASSERT_GT(geometry.maximum_units_per_window,0u);
             EXPECT_LT(geometry.maximum_units_per_window,request.maximum_units);
             EXPECT_EQ(geometry.native_bytes,native*geometry.maximum_units_per_window);
@@ -26,11 +33,11 @@ TEST(NativeWeightLoadStagingContract, SourceAndSimultaneousScratchShareOneExactP
             EXPECT_EQ(geometry.scratch_offset%64,0u);
             EXPECT_GE(geometry.scratch_offset,geometry.native_bytes);
             EXPECT_EQ(geometry.physical_bytes,placement.physicalBytes<uint8_t>(geometry.scratch_offset+geometry.scratch_bytes));
-            EXPECT_LE(geometry.physical_bytes,8192u);
+            EXPECT_LE(geometry.physical_bytes,budget);
             const auto one=resolveNativeWeightLoadStaging({native,scratch,96,1},placement,std::nullopt);
             EXPECT_THROW((void)resolveNativeWeightLoadStaging(request,placement,one.physical_bytes-1),std::invalid_argument);
             const auto next=resolveNativeWeightLoadStaging({native,scratch,96,geometry.maximum_units_per_window+1},placement,std::nullopt);
-            EXPECT_GT(next.physical_bytes,8192u);
+            EXPECT_GT(next.physical_bytes,budget);
         }
 }
 

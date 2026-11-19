@@ -5,7 +5,9 @@
  * The parent creates a local hostfile and calls the real parser/bootstrap.
  * MPI must use every declared slot without inheriting a launcher-local CPU
  * set. Children prove their full physical worker binding, then collectively
- * gather the canonical CPU inventory. Repeated rank-zero reads and topology
+ * gather the canonical CPU inventory. A bound single rank retains its measured
+ * NUMA ownership, just like a distributed rank; rank count is not locality.
+ * Repeated rank-zero reads and topology
  * construction must share that exact publication without another exchange.
  * Server evidence must project those same physical groups without a new probe
  * or collective, including when only the request authority reads the snapshot.
@@ -15,18 +17,24 @@
  * No model or accelerator is opened.
  * This proves a real multi-process node, not a remote-network deployment.
  * A separate unbound-runtime lifecycle check calls actual rank-worker admission without
- * MPI or devices, proving exact caller/child masks and retained worker binding
- * across automatic, partial and repeated teams and nested-call rejection.
+ * MPI or devices. Without original-entry native core admission, admission is
+ * rejected before any binding: the exact caller/child masks, unbound policy and
+ * unpinned workers survive automatic, partial and repeated requests, as well as
+ * nested-call rejection.
  *
  * The custom entry owns one lexical native GPU lifetime without probing a
  * device. Native workers/caches retire before process exit and MPI finalization.
  */
+#include <algorithm>
+#include <map>
+#include <numa.h>
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "fixtures/execution/RetainedHostServiceReplayAccess.h"
 #include "execution/local_execution/graph/RetainedParentTicketServiceWorker.h"
 #include "utils/ScopedOpenMPPartitionAffinity.h"
 #include "utils/ScopedCallerThreadAffinity.h"
 #include "utils/MPISessionOwner.h"
+#include "utils/NativeCPUPlacement.h"
 #include "app/MPIBootstrapPhase.h"
 #include "app/RuntimeInitPhase.h"
 #include "app/modes/ServerRankMembership.h"
@@ -40,6 +48,7 @@
 #include "utils/MPITopology.h"
 #include <mpi.h>
 #include <omp.h>
+#include <sys/syscall.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #include <vector>
@@ -69,19 +78,26 @@ namespace
     }
 
     /**
-     * @brief Check production rank admission with an initially unchanged partition mask.
-     * @return Zero only for restored caller/child masks and persistent worker placement.
+     * @brief Check that an unbound runtime cannot enter rank-worker binding.
+     * @return Zero only when every rejected request leaves caller, child and
+     *         worker masks exactly at the original rank partition.
      * @throws std::runtime_error For missing native geometry or any failed invariant.
      *
-     * Two distinct allowed physical cores expose the former master's singleton
-     * leak without depending on CPU IDs, NUMA labels, MPI ranks or accelerators.
-     * Only this test caller is narrowed; its original mask is restored on exit.
+     * Rank-worker configuration consumes original-entry native core admission.
+     * An unbound runtime (OMP_PROC_BIND=false) owns no such admission, so
+     * production rejects it before team binding could pin the master to a
+     * singleton that native control children would inherit. Two distinct
+     * physical cores make any leaked singleton observable without depending on
+     * CPU IDs, NUMA labels, MPI ranks or accelerators. Only this test caller is
+     * narrowed; its original mask is restored on exit.
      */
     int checkBootstrapCallerAffinity()
     {
         const ScopedCallerThreadAffinity restore_test_caller;
         if (omp_get_proc_bind() != omp_proc_bind_false)
             throw std::runtime_error("Bootstrap caller lifecycle requires pre-exec OMP_PROC_BIND=false");
+        if (NativeCPUPlacement::hasCoreAdmission())
+            throw std::runtime_error("Unbound runtime unexpectedly owns native core admission");
         const auto original = callerMask();
         std::map<int, int> physical;
         for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
@@ -89,13 +105,12 @@ namespace
                 physical.try_emplace(MPIBootstrapPhase::physicalRepresentativeForCpu(cpu), cpu);
         if (physical.size() < 2 || physical.contains(-1))
             throw std::runtime_error("Bootstrap caller lifecycle requires two admitted physical cores");
-        std::vector<int> cpus;
         cpu_set_t admitted{};
+        int selected = 0;
         for (const auto &[representative, cpu] : physical)
         {
-            cpus.push_back(cpu);
             CPU_SET(cpu, &admitted);
-            if (cpus.size() == 2) break;
+            if (++selected == 2) break;
         }
         if (sched_setaffinity(0, sizeof(admitted), &admitted) != 0)
             throw std::runtime_error("Cannot admit bootstrap lifecycle caller cores");
@@ -105,17 +120,25 @@ namespace
             if (!CPU_EQUAL(&admitted, &unchanged))
                 throw std::runtime_error("Unbound partition unexpectedly changed caller mask");
         }
+        const int team_before = omp_get_max_threads();
 
-        // Zero is production auto sizing. The one-worker request exercises a
-        // partial team; full/default admissions then reuse its original pool.
+        // Zero is production auto sizing; the remaining requests cover full,
+        // partial and repeated teams. Each must be rejected before binding.
         for (const int requested : {0, 2, 1, 2, 0})
         {
             OrchestrationConfig config;
             config.n_threads = requested;
-            MPIBootstrapPhase::configureClusterRankThreads(config);
-            const auto restored = callerMask();
-            if (!CPU_EQUAL(&admitted, &restored))
-                throw std::runtime_error("Production bootstrap leaked its master's singleton affinity");
+            bool rejected = false;
+            try { MPIBootstrapPhase::configureClusterRankThreads(config, NativeCPUPlacement::admission()); }
+            catch (const std::runtime_error &error)
+            {
+                rejected = std::string(error.what()).find("native CPU core admission") != std::string::npos;
+            }
+            if (!rejected)
+                throw std::runtime_error("Unbound runtime entered rank-worker binding without native core admission");
+            const auto retained = callerMask();
+            if (!CPU_EQUAL(&admitted, &retained))
+                throw std::runtime_error("Rejected bootstrap changed its caller's rank mask");
             bool child_inherited = false;
             std::thread child([&] {
                 cpu_set_t inherited{};
@@ -124,31 +147,35 @@ namespace
             });
             child.join();
             if (!child_inherited)
-                throw std::runtime_error("Native child lost the restored original rank mask");
-            const int expected = requested == 0 ? 2 : requested;
-            if (omp_get_max_threads() != expected || omp_get_dynamic() != 0 ||
-                omp_get_proc_bind() != omp_proc_bind_false)
-                throw std::runtime_error("Bootstrap changed the admitted runtime worker policy");
-            std::vector<cpu_set_t> masks(static_cast<std::size_t>(expected));
+                throw std::runtime_error("Native child lost the original rank mask");
+            if (omp_get_max_threads() != team_before || omp_get_proc_bind() != omp_proc_bind_false)
+                throw std::runtime_error("Rejected bootstrap changed the runtime worker policy");
+            const int width = 2;
+            std::vector<cpu_set_t> masks(static_cast<std::size_t>(width));
             int actual = 0, failed = 0;
-#pragma omp parallel reduction(| : failed)
+#pragma omp parallel num_threads(width) reduction(| : failed)
             {
 #pragma omp single
                 actual = omp_get_num_threads();
                 const int worker = omp_get_thread_num();
-                if (worker >= expected ||
+                if (worker >= width ||
                     sched_getaffinity(0, sizeof(cpu_set_t), &masks[worker]) != 0)
                     failed = 1;
             }
-            if (failed || actual != expected || !CPU_EQUAL(&admitted, &masks[0]))
-                throw std::runtime_error("Observed team changed its caller or worker geometry");
-            for (int worker = 1; worker < expected; ++worker)
-                if (CPU_COUNT(&masks[worker]) != 1 || !CPU_ISSET(cpus[worker], &masks[worker]))
-                    throw std::runtime_error("Retained OpenMP worker lost its original singleton binding");
+            if (failed || actual != width)
+                throw std::runtime_error("Observed team changed its requested geometry");
+            // Pool workers created before the fixture narrowed its caller keep
+            // their wider original mask; a bootstrap pin would be a singleton.
+            for (int worker = 0; worker < width; ++worker)
+            {
+                cpu_set_t covered{};
+                CPU_AND(&covered, &admitted, &masks[worker]);
+                if (!CPU_EQUAL(&admitted, &covered))
+                    throw std::runtime_error("Unbound OpenMP worker was pinned without native core admission");
+            }
         }
 
-        // The partition authority rejects nested callers before team binding.
-        // Actual exception unwinding must also preserve that caller's mask.
+        // A nested caller is rejected as well, and unwinding preserves its mask.
         bool rejected = false, exception_restored = false;
 #pragma omp parallel num_threads(1)
         {
@@ -157,10 +184,10 @@ namespace
             try
             {
                 const auto before = callerMask();
-                try { MPIBootstrapPhase::configureClusterRankThreads(OrchestrationConfig{}); }
+                try { MPIBootstrapPhase::configureClusterRankThreads(OrchestrationConfig{}, NativeCPUPlacement::admission()); }
                 catch (const std::runtime_error &error)
                 {
-                    rejected = std::string(error.what()).find("outer host thread") != std::string::npos;
+                    rejected = std::string(error.what()).find("native CPU core admission") != std::string::npos;
                     const auto after = callerMask();
                     exception_restored = CPU_EQUAL(&before, &after);
                 }
@@ -173,15 +200,142 @@ namespace
         }
         if (!rejected || !exception_restored)
             throw std::runtime_error("Nested bootstrap rejection lost exact caller ownership");
-        std::cout << "PASS bootstrap caller restoration: auto/full/partial/repeated/exception; retained workers; native child" << std::endl;
+        std::cout << "PASS unbound bootstrap rejection: auto/full/partial/repeated/nested; caller, child and workers retain the rank mask" << std::endl;
         return 0;
+    }
+
+    /**
+     * @brief CPU-bearing NUMA nodes of this host, via the same per-node CPU
+     * observation the production allocator applies before admitting compute
+     * placement. Memory-only nodes stay in the inventory as storage
+     * endpoints; they cannot host a launchable compute rank.
+     */
+    std::vector<int> cpuBearingNodes()
+    {
+        std::vector<int> nodes;
+        if (numa_available() < 0)
+            return nodes;
+        // The per-node CPU observation requires a bitmask sized for the CPU
+        // count, not the node count: numa_node_to_cpus rejects smaller masks.
+        auto *cpus = numa_bitmask_alloc(static_cast<unsigned int>(
+            std::max(numa_num_possible_cpus(), 1)));
+        if (!cpus)
+            return nodes;
+        for (int node = 0; node <= numa_max_node(); ++node)
+        {
+            if (numa_node_to_cpus(node, cpus) != 0)
+                continue;
+            if (numa_bitmask_weight(cpus) > 0)
+                nodes.push_back(node);
+        }
+        numa_bitmask_free(cpus);
+        return nodes;
+    }
+
+    inline std::atomic<int> diag_rank{0};
+    /**
+     * @brief Read-only OpenMP/OS place-state capture for collision attribution.
+     *
+     * Records the calling thread's OS affinity, libgomp logical place, that
+     * place's full processor-id list (duplicates and ordering included), the
+     * team configuration, and then runs one observation team with the same
+     * shape the verifier uses, reporting each worker's own mask. No affinity
+     * is changed and no team configuration is touched.
+     */
+    void capturePlaceState(const char *stage)
+    {
+        cpu_set_t mask;
+        CPU_ZERO(&mask);
+        const bool have_mask = sched_getaffinity(0, sizeof(mask), &mask) == 0;
+        const int place = omp_get_place_num();
+        std::string place_ids;
+        if (place >= 0)
+        {
+            const int size = omp_get_place_num_procs(place);
+            std::vector<int> ids(static_cast<std::size_t>(size));
+            omp_get_place_proc_ids(place, ids.data());
+            for (const int id : ids)
+                place_ids += " " + std::to_string(id);
+        }
+        std::fprintf(stderr,
+            "[place-diag] stage=%s rank=%d tid=%ld mask_count=%d place=%d "
+            "place_proc_count=%d place_proc_ids=[%s] max_threads=%d "
+            "num_places=%d proc_bind=%d dynamic=%d\n",
+            stage, diag_rank.load(), static_cast<long>(syscall(SYS_gettid)),
+            have_mask ? CPU_COUNT(&mask) : -1, place,
+            place >= 0 ? omp_get_place_num_procs(place) : -1,
+            place_ids.c_str(), omp_get_max_threads(), omp_get_num_places(),
+            omp_get_proc_bind(), omp_get_dynamic());
+        // Full place-list enumeration: every place's complete processor-id
+        // list in libgomp's own ordering, exposing any duplicate cpu across
+        // places or empty/mispopulated entries.
+        if (diag_rank.load() == 0)
+        {
+            const int places = omp_get_num_places();
+            for (int p = 0; p < places; ++p)
+            {
+                const int count = omp_get_place_num_procs(p);
+                std::vector<int> ids(static_cast<std::size_t>(count));
+                omp_get_place_proc_ids(p, ids.data());
+                std::string listed;
+                for (const int id : ids)
+                    listed += " " + std::to_string(id);
+                std::fprintf(stderr, "[place-list] place=%d procs=%d[%s]\n",
+                    p, count, listed.c_str());
+            }
+        }
+        if (have_mask)
+        {
+            std::string listed;
+            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+                if (CPU_ISSET(cpu, &mask))
+                    listed += " " + std::to_string(cpu);
+            std::fprintf(stderr, "[place-diag] stage=%s mask=[%s]\n",
+                stage, listed.c_str());
+        }
+        const int threads = omp_get_max_threads();
+        std::vector<int> current(static_cast<std::size_t>(threads), -1);
+        std::vector<cpu_set_t> masks(static_cast<std::size_t>(threads));
+#pragma omp parallel
+        {
+            const int tid = omp_get_thread_num();
+            current[static_cast<std::size_t>(tid)] = sched_getcpu();
+            if (sched_getaffinity(0, sizeof(cpu_set_t),
+                    &masks[static_cast<std::size_t>(tid)]) != 0)
+                CPU_ZERO(&masks[static_cast<std::size_t>(tid)]);
+        }
+        std::map<int, int> collision;
+        for (int tid = 0; tid < threads; ++tid)
+        {
+            const int rep = current[static_cast<std::size_t>(tid)] >= 0
+                ? MPIBootstrapPhase::physicalRepresentativeForCpu(
+                    current[static_cast<std::size_t>(tid)])
+                : -1;
+            ++collision[rep];
+            std::string listed;
+            for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+                if (CPU_ISSET(cpu, &masks[static_cast<std::size_t>(tid)]))
+                    listed += " " + std::to_string(cpu);
+            std::fprintf(stderr,
+                "[place-diag] stage=%s worker=%d current=%d mask_count=%d mask=[%s]\n",
+                stage, tid, current[static_cast<std::size_t>(tid)],
+                CPU_COUNT(&masks[static_cast<std::size_t>(tid)]), listed.c_str());
+        }
+        for (const auto &[rep, count] : collision)
+            if (count > 1)
+                std::fprintf(stderr,
+                    "[place-diag] stage=%s COLLISION representative=%d threads=%d\n",
+                    stage, rep, count);
     }
 
     /** @brief Own only the unique, small hostfile created by this test. */
     class Hostfile
     {
     public:
-        /** @brief Declare one MPI slot per discovered local NUMA endpoint. */
+        /**
+         * @brief Declare one MPI slot per launchable compute endpoint: a
+         * CPU-bearing NUMA node. Memory-only nodes cannot host a rank.
+         */
         explicit Hostfile(int slots)
         {
             char pattern[] = "/tmp/llaminar-inventory-hosts-XXXXXX";
@@ -218,6 +372,11 @@ namespace
         std::set<int> physical;
         for(int cpu=0;cpu<CPU_SETSIZE;++cpu)if(CPU_ISSET(cpu,&partition))
             physical.insert(MPIBootstrapPhase::physicalRepresentativeForCpu(cpu));
+        std::fprintf(stderr,"[cluster-diag] creator pid=%d omp_max_threads=%d "
+            "partition_count=%d places=%d proc_bind=%d dynamic=%d\n",
+            static_cast<int>(getpid()),omp_get_max_threads(),
+            CPU_COUNT(&partition),omp_get_num_places(),omp_get_proc_bind(),
+            omp_get_dynamic());
         const int expected=omp_get_max_threads();
         if(physical.empty()||physical.contains(-1)||expected!=static_cast<int>(physical.size()))
         {details="pre-main core place collapsed the rank's physical worker budget";return false;}
@@ -225,20 +384,40 @@ namespace
         auto memory=std::make_shared<PhysicalMemoryAuthority>(
             std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(program.bom(cpu)),cpu.world_rank);
         auto owner=PreparedRetainedHostService::materialize(test::RetainedHostServiceReplayAccess::claim(memory,program));
+        if(cpu.world_rank==0)capturePlaceState("after-retained-materialize");
         for(int repeat=0;repeat<2;++repeat)
         {
             struct Observation {int expected,maximum=0,dynamic=-1,actual=0;std::vector<cpu_set_t> masks;std::atomic<bool> failed{false};};
             Observation observed{expected,0,-1,0,std::vector<cpu_set_t>(static_cast<std::size_t>(expected))};
             const auto ticket=owner->worker().dispatch([](void* opaque){
                 auto& value=*static_cast<Observation*>(opaque);
+                cpu_set_t worker_mask;CPU_ZERO(&worker_mask);
+                const bool worker_affinity_ok=sched_getaffinity(0,sizeof(worker_mask),&worker_mask)==0;
+                std::fprintf(stderr,"[cluster-diag] retained_worker pid=%d tid=%ld "
+                    "affinity_ok=%d mask_count=%d omp_max_threads=%d places=%d proc_bind=%d dynamic=%d\n",
+                    static_cast<int>(getpid()),static_cast<long>(syscall(SYS_gettid)),
+                    worker_affinity_ok?1:0,CPU_COUNT(&worker_mask),
+                    omp_get_max_threads(),omp_get_num_places(),omp_get_proc_bind(),
+                    omp_get_dynamic());
                 value.maximum=omp_get_max_threads();value.dynamic=omp_get_dynamic();
 #pragma omp parallel
                 {
 #pragma omp single
-                    value.actual=omp_get_num_threads();
+                    {
+                        value.actual=omp_get_num_threads();
+                        std::fprintf(stderr,"[cluster-diag] retained_team threads=%d "
+                            "max=%d places=%d proc_bind=%d dynamic=%d\n",
+                            value.actual,omp_get_max_threads(),omp_get_num_places(),
+                            omp_get_proc_bind(),omp_get_dynamic());
+                    }
                     const int worker=omp_get_thread_num();
                     if(worker>=value.expected || sched_getaffinity(0,sizeof(cpu_set_t),&value.masks[worker])!=0)
                         value.failed.store(true,std::memory_order_relaxed);
+                    else
+                        std::fprintf(stderr,"[cluster-diag] retained_team tid=%d worker=%d "
+                            "current_cpu=%d place_num=%d mask_count=%d\n",
+                            static_cast<int>(syscall(SYS_gettid)),worker,sched_getcpu(),
+                            omp_get_place_num(),CPU_COUNT(&value.masks[worker]));
                 }
                 return !value.failed.load()&&value.maximum==value.expected&&value.actual==value.expected&&value.dynamic==0;
             },&observed);
@@ -270,7 +449,31 @@ namespace
     /** @brief Enter production MPI bootstrap and prove each child's inventory. */
     int probe(int argc, char **argv)
     {
-        auto config = OrchestrationConfigParser{}.parseArgs(argc, argv);
+        // The private fixture flag is consumed at THIS parser boundary only:
+        // the production parser never sees it, while the FULL original argv
+        // (flag included) is forwarded to the self-launch so the RANK keeps
+        // its intent (--placement-contract) and routes to the MPI rank path
+        // instead of re-entering the launcher default path.
+        std::vector<char *> parser_argv(argv, argv + argc);
+        int parser_argc = argc;
+        const bool fixture_flag = parser_argc > 1 &&
+            std::string(parser_argv[1]) == "--placement-contract";
+        if (fixture_flag)
+        {
+            parser_argv.erase(parser_argv.begin() + 1);
+            --parser_argc;
+        }
+        auto config = OrchestrationConfigParser{}.parseArgs(parser_argc,
+            parser_argv.data());
+        // Only the independent placement case requests a whole-host singleton.
+        // The ordinary inventory case must retain the real hostfile membership.
+        if (fixture_flag)
+        {
+            config.device_for_this_rank = llaminar2::GlobalDeviceAddress::cpu(0);
+            config.device_for_this_rank_numa_explicit = false;
+            config.cpu_global_tp_all_local = true;
+            config.mpi_procs = 1;
+        }
         const auto bootstrap = MPIBootstrapPhase{}.execute(config, argc, argv);
         if (bootstrap.action == BootstrapResult::Action::EXIT)
             return bootstrap.exit_code;
@@ -280,34 +483,130 @@ namespace
         int passed = provided >= MPI_THREAD_MULTIPLE;
         {
             auto context = MPIContextFactory::global();
+            const auto admitted_affinity = NUMATopology::detectLocalNUMANode();
+            diag_rank.store(context->rank());
+            if (context->rank() == 0) capturePlaceState("after-mpi-init");
             const auto inventory_owner = gatherClusterInventory(context, config.hostfile);
+            if (context->rank() == 0) capturePlaceState("after-gather");
             const auto &inventory = *inventory_owner;
             passed = passed && inventory_owner == context->clusterInventory();
+        if (!passed) std::fprintf(stderr, "[bisect] failed-at-or-before-inventory-ownership\n");
             const auto &local_observation = inventory.ranks.at(context->rank());
-            const NUMAInfo admitted_affinity{
-                .local_numa_node = local_observation.cpu.numa_node,
-                .total_numa_nodes = local_observation.numa_nodes,
-                .detection_succeeded = local_observation.cpu.numa_node >= 0,
-                .detection_method = "canonical-inventory"};
+            // Compare independent pre-discovery affinity with the canonical
+            // publication. One bound rank is not an unbound whole-host scope.
+            const int expected_numa = admitted_affinity.detection_succeeded
+                ? admitted_affinity.local_numa_node : -1;
+            if(local_observation.cpu.numa_node!=expected_numa) {
+                std::cerr<<"inventory_cpu_numa rank="<<context->rank()
+                         <<" actual="<<local_observation.cpu.numa_node
+                         <<" expected="<<expected_numa<<std::endl;
+                passed=false;
+            }
             // Exercise the serving specialization on the same observed rank
             // locality. MPI ordinal must not become an independent NUMA source.
             RuntimeInitPhase::resolveCPUShorthand(
                 config, context->rank(), context->world_size(), admitted_affinity);
             passed = passed && config.device_map.size() == 1 &&
                 config.device_map.front().first == context->rank() &&
-                config.device_map.front().second.numa_node == local_observation.cpu.numa_node;
+                config.device_map.front().second.numa_node == admitted_affinity.local_numa_node;
+            std::fprintf(stderr, "[bisect] device_map size=%zu first_numa=%d admitted_numa=%d\n",
+                config.device_map.size(),
+                config.device_map.empty() ? -1 : config.device_map.front().second.numa_node,
+                admitted_affinity.local_numa_node);
+        if (!passed) std::fprintf(stderr, "[bisect] failed-at-or-before-device_map\n");
             const auto topology = MPIBootstrap::detectCPUTopology();
+            if (context->rank() == 0) capturePlaceState("after-plan-building");
             std::string detail;
+            // READ-ONLY diagnosis for the startup-affinity attribution: no
+            // affinity or team startup is altered by any of these observations.
+            std::fprintf(stderr,
+                "[cluster-diag] rank=%d pid=%d omp_max_threads=%d num_places=%d "
+                "proc_bind=%d dynamic=%d\n",
+                context->rank(), static_cast<int>(getpid()),
+                omp_get_max_threads(), omp_get_num_places(),
+                omp_get_proc_bind(), omp_get_dynamic());
+            {
+                std::fprintf(stderr, "[cluster-diag] omp_env:");
+                for (const char *name : {"OMP_NUM_THREADS", "OMP_PLACES",
+                                          "OMP_PROC_BIND", "OMP_DYNAMIC",
+                                          "GOMP_SPINCOUNT"})
+                {
+                    const char *value = std::getenv(name);
+                    std::fprintf(stderr, " %s=%s", name, value ? value : "<unset>");
+                }
+                std::fprintf(stderr, "\n");
+                std::FILE *maps = std::fopen("/proc/self/maps", "r");
+                char line[512];
+                while (maps && std::fgets(line, sizeof(line), maps))
+                    if (std::strstr(line, "libgomp") || std::strstr(line, "libiomp"))
+                        std::fprintf(stderr, "[cluster-diag] omp_runtime %s", line);
+                if (maps) std::fclose(maps);
+                cpu_set_t process_mask;
+                CPU_ZERO(&process_mask);
+                if (sched_getaffinity(0, sizeof(process_mask), &process_mask) == 0)
+                {
+                    std::string listed;
+                    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+                        if (CPU_ISSET(cpu, &process_mask))
+                            listed += " " + std::to_string(cpu);
+                    std::fprintf(stderr, "[cluster-diag] process_affinity_count=%d%s\n",
+                        CPU_COUNT(&process_mask), listed.c_str());
+                }
+            }
             const bool affinity_ok = MPIBootstrapPhase::verifyStartupThreadAffinity(-1, true, detail);
+            std::fprintf(stderr, "[cluster-diag] startup_affinity_ok=%d detail=%s\n",
+                affinity_ok ? 1 : 0, detail.c_str());
+            if (context->rank() == 0) capturePlaceState("after-startup-verify");
+            {
+                // Independent read-only team observation (own omp parallel,
+                // same shape the verifier uses): per-thread current cpu and
+                // full affinity mask, then the physical representatives.
+                const int threads = omp_get_max_threads();
+                std::vector<int> current(threads, -1);
+                std::vector<cpu_set_t> masks(threads);
+#pragma omp parallel
+                {
+                    const int tid = omp_get_thread_num();
+                    current[tid] = sched_getcpu();
+                    if (sched_getaffinity(0, sizeof(cpu_set_t), &masks[tid]) != 0)
+                        CPU_ZERO(&masks[tid]);
+                }
+                std::map<int, int> representatives;
+                for (int tid = 0; tid < threads; ++tid)
+                {
+                    std::string listed;
+                    for (int cpu = 0; cpu < CPU_SETSIZE; ++cpu)
+                        if (CPU_ISSET(cpu, &masks[tid]))
+                            listed += " " + std::to_string(cpu);
+                    const int rep = current[tid] >= 0
+                        ? MPIBootstrapPhase::physicalRepresentativeForCpu(current[tid])
+                        : -1;
+                    ++representatives[rep];
+                    std::fprintf(stderr,
+                        "[cluster-diag] team tid=%d current_cpu=%d rep=%d mask_count=%d%s\n",
+                        tid, current[tid], rep,
+                        CPU_COUNT(&masks[tid]), listed.c_str());
+                }
+                for (const auto &[rep, count] : representatives)
+                    std::fprintf(stderr, "[cluster-diag] representative=%d threads=%d\n",
+                        rep, count);
+            }
             std::string retained_detail;
             const PhysicalMemoryResource observed_cpu{context->rank(),DeviceId::cpu(),
                 local_observation.cpu.memory_bytes,local_observation.cpu.free_memory_bytes};
             const bool retained_affinity_ok=verifyRetainedServiceTeam(observed_cpu,retained_detail);
+            std::fprintf(stderr,"[cluster-diag] retained_affinity_ok=%d detail=%s\n",
+                retained_affinity_ok?1:0,retained_detail.c_str());
             passed=passed&&retained_affinity_ok;
             if(!retained_affinity_ok)std::cerr<<"retained_team_affinity rank="<<context->rank()<<" "<<retained_detail<<std::endl;
-            passed = passed && inventory.world_size == topology.numa_nodes &&
+            // The launched membership covers exactly the launchable compute
+            // endpoints (CPU-bearing nodes); memory-only nodes remain in the
+            // topology as storage inventory and never host a rank.
+            const int expected_members = fixture_flag ? 1 : static_cast<int>(cpuBearingNodes().size());
+            passed = passed && inventory.world_size == expected_members &&
                 inventory.ranks.size() == static_cast<std::size_t>(context->world_size()) &&
                 inventory.node_count == 1 && inventory.total_gpus == 0 && affinity_ok;
+        if (!passed) std::fprintf(stderr, "[bisect] failed-at-or-before-inventory-world_size\n");
             for (int rank = 0; rank < context->world_size(); ++rank)
             {
                 const auto &observation = inventory.ranks.at(rank);
@@ -476,7 +775,7 @@ namespace
                       << " inventory_ranks=" << inventory.ranks.size()
                       << " nodes=" << inventory.node_count
                       << " gpus=" << inventory.total_gpus
-                      << " expected_ranks=" << topology.numa_nodes
+                      << " expected_ranks=" << cpuBearingNodes().size()
                       << " workers=" << omp_get_max_threads()
                       << " affinity=" << detail << std::endl;
         }
@@ -497,8 +796,35 @@ int main(int argc, char **argv)
     {
         if (argc == 2 && std::string(argv[1]) == "--caller-affinity")
             return checkBootstrapCallerAffinity();
-        if (argc > 1) return probe(argc, argv);
-        const Hostfile file(MPIBootstrap::detectCPUTopology().numa_nodes);
+        if (argc > 1)
+        {
+            const bool placement_contract = std::string(argv[1]) == "--placement-contract";
+            // The full argv (flag included) reaches probe: the flag is
+            // consumed at probe's parser boundary, and the self-launch
+            // forwards it to the rank so the rank's intent is preserved.
+            const int code = probe(argc, argv);
+            if (placement_contract && code == 0)
+                std::cout << "PLACEMENT-CONTRACT verified: persistent pool and the "
+                    "initial thread hold unique capacity-ordered places" << std::endl;
+            return code;
+        }
+        // Enumeration geometry coverage on the real host: this Station
+        // exposes memory-only NUMA nodes above its CPU-bearing nodes, so the
+        // CPU-bearing enumeration must be strictly smaller than the full node
+        // set here, and every launchable slot must name a CPU-bearing node.
+        // A host whose nodes all bear CPUs trivially satisfies both.
+        const auto launchable = cpuBearingNodes();
+        const int total_nodes = MPIBootstrap::detectCPUTopology().numa_nodes;
+        const bool enumeration_ok = !launchable.empty() &&
+            static_cast<int>(launchable.size()) <= total_nodes &&
+            std::all_of(launchable.begin(), launchable.end(),
+                        [](int node) { return node >= 0; });
+        if (!enumeration_ok)
+        {
+            std::cerr << "CPU-bearing enumeration exceeds the node set or names a negative node" << std::endl;
+            return 1;
+        }
+        const Hostfile file(static_cast<int>(launchable.size()));
         const auto child = fork();
         if (child < 0) throw std::runtime_error("Cannot fork inventory bootstrap");
         if (child == 0)

@@ -23,6 +23,7 @@
 #include "config/GDNHeadAssignment.h"
 #include "memory/GraphArenaStorageLayout.h"
 #include "execution/local_execution/graph/GraphResolver.h"
+#include "utils/Logger.h"
 
 #include <algorithm>
 #include <limits>
@@ -288,11 +289,18 @@ GraphArenaStorageLayout ActivationMemoryEstimator::declareCPUStorage(
         applyQwen4ExpBufferGeometry(resolver, *profile.flash_next, dimensions);
     }
     const bool retained_mtp = geometry.retained_mtp_candidate_rows > 0;
-    return GraphArenaStorageLayout::resolve(schema, resolver, {
+    auto layout = GraphArenaStorageLayout::resolve(schema, resolver, {
         .full_prefill_kv_handoff = geometry.replicated_dense_decode,
         .terminal_hidden_rows = retained_mtp ? std::max(static_cast<size_t>(geometry.batch_size), target_rows) : 0,
         .terminal_hidden_columns = retained_mtp ? (profile.flash_next
             ? static_cast<size_t>(profile.flash_next->residual_width) : static_cast<size_t>(profile.d_model)) : 0});
+    // Diagnostic mirror of DeviceGraphOrchestrator's arena registration log:
+    // admission and allocation must name one identical root inventory.
+    for (const auto &entry : layout.entries())
+        LOG_DEBUG("[ActivationMemoryEstimator] Admitted CPU arena root: '" << entry.descriptor.name
+            << "' [" << (entry.descriptor.shape.empty() ? 0 : entry.descriptor.shape[0]) << "x"
+            << (entry.descriptor.shape.size() < 2 ? 0 : entry.descriptor.shape[1]) << "]");
+    return layout;
 }
 
 size_t ActivationMemoryEstimator::estimate(

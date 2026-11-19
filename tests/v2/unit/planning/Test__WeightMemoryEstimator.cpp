@@ -1,10 +1,12 @@
 #include "../../utils/ScopedGDNProjectionArithmetic.h"
+#include <cstddef>
 #include <gtest/gtest.h>
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/WeightShardGeometry.h"
 #include "kernels/cpu/gemm/CPUWeightPreparationMemory.h"
 #include "memory/CPUStorageRoot.h"
 #include "planning/ModelMemoryProfile.h"
+#include "utils/HostPageSize.h"
 #include "loaders/WeightSlicer.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "backends/DeviceId.h"
@@ -1436,11 +1438,47 @@ TEST(Test__WeightMemoryEstimator, ContinuationResidencyCountsDenseSharedAndExact
     }
     EXPECT_EQ(estimate.native_bytes, expected_native);
     EXPECT_EQ(estimate.device_bytes, expected_final);
-    // The two 100×32 vocabulary matrices are 12,800 useful bytes each, but
-    // independently retained local roots have allocator-rounded capacity.
-    // Logical native inventory must never be mistaken for that live footprint.
-    EXPECT_GT(expected_final, expected_native);
+    // The two 100×32 vocabulary matrices are 12,800 useful bytes each, and
+    // independently retained local roots never hold fewer bytes than their
+    // logical inventory. Heap roots below the host base page round to the
+    // 64-byte allocation alignment; 12,800 is already a 64-byte multiple, so
+    // on hosts whose base page exceeds these roots (64 KiB) the allocator
+    // adds nothing and live physical equals logical. The invariant that
+    // holds on every host page size is therefore physical >= logical;
+    // strict inflation is proven separately below with an exact-byte
+    // negative that crosses a host-page boundary.
+    EXPECT_GE(expected_final, expected_native);
+    const std::size_t host_page = llaminar2::hostPageBytes();
+    // Exact-size and one-float-short boundary controls that hold on every
+    // supported page size: a root whose logical bytes are exactly one host
+    // page maps one whole page, a root one float (four bytes) short of that
+    // page still maps one whole page (never under-counting), and a root one
+    // float past it maps exactly two whole pages. All three boundaries are
+    // page-size independent because every supported page size is a
+    // multiple of sizeof(float); the byte-granular forms of the same three
+    // controls are asserted in CPULocalPlacementPageBoundaryByteControls.
+    const std::size_t one_page_floats = host_page / sizeof(float);
+    EXPECT_EQ(placement.physicalBytes<float>(one_page_floats), host_page);
+    EXPECT_EQ(placement.physicalBytes<float>(one_page_floats - 1u),
+        host_page);
+    EXPECT_EQ(placement.physicalBytes<float>(one_page_floats + 1u),
+        2u * host_page);
     EXPECT_LT(estimate.device_bytes, profile.total_native_bytes);
+}
+
+TEST(Test__WeightMemoryEstimator, CPULocalPlacementPageBoundaryByteControls)
+{
+    // Byte-granular exact-size and one-byte-short boundary controls for the
+    // local CPU placement contract, valid on every supported host page
+    // size: exactly one whole page maps one whole page, one byte less maps
+    // one whole page (never under-counting), and one byte past maps exactly
+    // two whole pages.
+    const auto placement = CPUStoragePlacement::local();
+    const std::size_t host_page = llaminar2::hostPageBytes();
+    EXPECT_EQ(placement.physicalBytes<std::byte>(host_page), host_page);
+    EXPECT_EQ(placement.physicalBytes<std::byte>(host_page - 1u), host_page);
+    EXPECT_EQ(placement.physicalBytes<std::byte>(host_page + 1u),
+        2u * host_page);
 }
 
 TEST(Test__WeightMemoryEstimator, ExpertOnlyResidencyExcludesEveryDenseAndSharedTensor)

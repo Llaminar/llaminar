@@ -19,6 +19,7 @@
 #include "backends/NativeOrderingEventGroup.h"
 #include "../../../utils/CPUActivationArenaFixture.h"
 #include <gtest/gtest.h>
+#include "utils/HostPageSize.h"
 #include <bit>
 #include <cmath>
 #include <cstdint>
@@ -516,13 +517,21 @@ void proveSigmoidGDN(DeviceId device)
 
 /** @brief Private exact ninety-byte IQ4_NL rows matching Flash Next's native source geometry. */
 struct LookupFile
-{
+    {
+        static constexpr std::size_t row_bytes=90; ///< 5 IQ4_NL blocks x 18 bytes.
     /** @brief Populate a tiny complete native table before immutable admission. */
     explicit LookupFile(std::size_t offset=0) : offset(offset)
     {
         char pattern[]="/tmp/llaminar-native-lookup-XXXXXX";fd=::mkstemp(pattern);
         if(fd<0)throw std::runtime_error("Native lookup fixture creation failed");path=pattern;
-        for(int row=0;row<97;++row)for(int block=0;block<5;++block)
+        // Page-relative row count: the source spans three whole host page
+        // windows measured from the 37-byte prefix, keeping the MemoryMapped
+        // seams and eviction pressure exercised on every supported page size
+        // (the historical 97 rows collapsed to one window on 64 KiB hosts).
+        const std::size_t rows=2u*((llaminar2::hostPageBytes()-offset+row_bytes-1)/row_bytes)+1u;
+        row_count=rows;
+        blocks.resize(rows*5);
+        for(std::size_t row=0;row<rows;++row)for(int block=0;block<5;++block)
         {
             auto &value=blocks[row*5+block];value.d=0x3c00;
             for(int c=0;c<16;++c)value.qs[c]=static_cast<std::uint8_t>(((row+block+c)%16)|(((row*3+block+c)%16)<<4));
@@ -530,14 +539,18 @@ struct LookupFile
         const std::vector<std::byte> prefix(offset);
         if(offset && ::write(fd,prefix.data(),prefix.size())!=static_cast<ssize_t>(prefix.size()))
             throw std::runtime_error("Native lookup fixture prefix write failed");
-        if(::write(fd,blocks.data(),sizeof(blocks))!=sizeof(blocks))throw std::runtime_error("Native lookup fixture write failed");
+        if(::write(fd,blocks.data(),blocks.size()*sizeof(blocks[0]))!=
+            static_cast<ssize_t>(blocks.size()*sizeof(blocks[0])))
+            throw std::runtime_error("Native lookup fixture write failed");
     }
     /** @brief Retire only this fixture after its immutable table owners. */
     ~LookupFile(){::close(fd);::unlink(path.c_str());}
     /** @brief Exact original native directory entry. */
     ImmutableRowTableSource source() const
-    {return {.path=path,.tensor_name="per_layer_token_embd.weight",.file_offset=offset,.rows=97,.row_elements=160,.format=GGUFTensorType::IQ4_NL};}
-    int fd=-1;std::string path;std::size_t offset;std::array<IQ4_NLBlock,97*5> blocks{};
+    {return {.path=path,.tensor_name="per_layer_token_embd.weight",.file_offset=offset,
+        .rows=row_count,.row_elements=160,.format=GGUFTensorType::IQ4_NL};}
+    std::size_t row_count=97;
+    int fd=-1;std::string path;std::size_t offset;std::vector<IQ4_NLBlock> blocks{};
 };
 
 /**
@@ -666,7 +679,8 @@ void proveResidentOwnerStage(DeviceId device)
         for(const int rows:{capacity,15,1,0,512,2,capacity})
         {
             SCOPED_TRACE(rows);const auto count=static_cast<std::size_t>(rows)*16;
-            for(std::size_t i=0;i<maxIds;++i)hostIds[i]=i<count?static_cast<std::int64_t>((i*31+i/16)%97):-1;
+            const std::int64_t id_space=static_cast<std::int64_t>(file.row_count);
+            for(std::size_t i=0;i<maxIds;++i)hostIds[i]=i<count?static_cast<std::int64_t>((i*31+i/16)%id_space):-1;
             storage.upload(ids,hostIds);storage.upload(live,std::vector{rows});storage.upload(output,poison);
             // Cold prefill owns no response-admission Ok flag yet. No host
             // health seed is required for this legitimate all-zero controller.
@@ -750,7 +764,7 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
             const std::size_t slots=mode==ImmutableRowStorage::RAM?0u:2u;
 
             const auto layout=ImmutableLookupLayout::create(maxIds,rowBytes);
-            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
+            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,llaminar2::hostPageBytes(),2);
             PhysicalMemoryPlanBuilder plan;
             const auto &resource = hostResource;
             std::optional<CpuAdaptiveImmutableRowCacheGeometry> cache;
@@ -761,7 +775,7 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
                 const auto geometry=ImmutableRowTableLayoutGeometry::checked(
                     ImmutableRowTableExtent::fromNative(src.format,src.rows,src.rowBytes()),ImmutableRowTableTiers::of(tiers),
                     ImmutableRowTableResidency::Adaptive,{{{host,ImmutableRowStorage::RAM},0,slots,{}}},{{0,device}},{},
-                    {{host,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},{},std::nullopt,maxIds);
+                    {{host,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),2)}},{},std::nullopt,maxIds);
                 cache=CpuAdaptiveImmutableRowCacheGeometry::fromLayout(geometry,host,maxIds);
                 const auto bom=cache->bom(resource);for(const auto &line:bom.resources())plan.add(line);
             }
@@ -784,7 +798,7 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
         for(const auto mode:{ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped})
         {
             const auto layout=ImmutableLookupLayout::create(maxIds,rowBytes);
-            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
+            const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,llaminar2::hostPageBytes(),2);
             const auto cache=caseBudget(mode).second;
             const std::size_t slots=mode==ImmutableRowStorage::RAM?0u:2u;
             auto table=adaptive?HostImmutableRowProvider::fromAdaptiveCache(CpuAdaptiveImmutableRowCache::create(file.source(),*cache,memory)):
@@ -806,7 +820,8 @@ void proveLookup(DeviceId device,bool adaptive=false,LookupFrontierProof frontie
             std::memset(stateTensor.raw_mutable_data(),0xa5,sizeof(ImmutableLookupDeviceState));
             *static_cast<int *>(liveTensor.raw_mutable_data())=capacity;
             std::vector<std::int64_t> hostIds(maxIds);
-            for(std::size_t i=0;i<hostIds.size();++i)hostIds[i]=(i*31+i/16)%97;
+            const std::int64_t id_space=static_cast<std::int64_t>(file.row_count);
+            for(std::size_t i=0;i<hostIds.size();++i)hostIds[i]=(i*31+i/16)%id_space;
             std::memcpy(idTensor.raw_mutable_data(),hostIds.data(),hostIds.size()*8);
             for(TensorBase *tensor:std::array<TensorBase *,5>{&stateTensor,&liveTensor,&idTensor,&nativeTensor,&outputTensor})
             {

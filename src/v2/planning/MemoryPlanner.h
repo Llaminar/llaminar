@@ -21,6 +21,7 @@
 #include "planning/GraphSnapshotMemoryCapacity.h"
 #include "planning/PipelineTransferMemory.h"
 #include "backends/PeerAccessCoverage.h"
+#include "backends/PhysicalMemoryBacking.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/KVCacheMemoryEstimator.h"
 #include "backends/DeviceId.h"
@@ -259,6 +260,41 @@ struct DevicePlanConfig
     DeviceId device;
     size_t device_total_bytes = 0;
     size_t device_free_bytes = 0;
+    /** Discovered backing; RankHostPool pools this GPU with its rank's CPU allocator. */
+    PhysicalMemoryBacking device_memory_backing = PhysicalMemoryBacking::Dedicated;
+    /** RankHostPool only: uncapped physical pool observation (see PhysicalMemoryResource). */
+    size_t device_pool_available_bytes = 0;
+
+    /**
+     * @return The complete observed allocator for @ref device. Every logical
+     *         plan line on this allocator uses this one value, so integrated
+     *         GPU backing and its pool observation cannot be dropped by one
+     *         contributor and make the physical merge disagree.
+     */
+    [[nodiscard]] PhysicalMemoryResource deviceResource() const noexcept
+    {
+        return {.world_rank = world_rank,
+                .device = device,
+                .total_bytes = device_total_bytes,
+                .admission_available_bytes = device_free_bytes,
+                .backing = device_memory_backing,
+                .pool_available_bytes = device_pool_available_bytes};
+    }
+
+    /**
+     * @brief Adopt one complete observation of @ref device's allocator.
+     * @param resource Observation of this config's rank and device.
+     * @throws std::invalid_argument When @p resource names another allocator.
+     */
+    void adoptDeviceResource(const PhysicalMemoryResource &resource)
+    {
+        if (resource.world_rank != world_rank || resource.device != device)
+            throw std::invalid_argument("Device plan cannot adopt another allocator's observation");
+        device_total_bytes = resource.total_bytes;
+        device_free_bytes = resource.admission_available_bytes;
+        device_memory_backing = resource.backing;
+        device_pool_available_bytes = resource.pool_available_bytes;
+    }
 
     /**
      * Host allocator that owns CPU-side state created by this execution graph.

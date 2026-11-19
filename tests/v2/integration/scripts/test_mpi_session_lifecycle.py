@@ -598,38 +598,46 @@ class Replay:
         fixture_digests = tuple(_sha256(source) for source in fixture_sources)
         helper_digest = _sha256(original_helper)
 
-        for with_sibling in (True, False):
-            name = "stage-ok" if with_sibling else "stage-no-helper"
+        # Omit exactly one asset per negative. The complete build layout stays
+        # available outside each stage but cannot stand in for a missing sibling.
+        for name, missing in (("stage-ok", None), ("stage-no-helper", "helper"),
+                              ("stage-no-module", "module")):
             stage = self.root / (name + "-bin")
             stage.mkdir(mode=0o700)
             frontend = stage / self.args.singleton.name
             helper = stage / helper_name
             native_module = stage / component_path
             native_module.parent.mkdir(mode=0o700)
-            for source, target, expected in zip(fixture_sources, (frontend, native_module), fixture_digests, strict=True):
-                shutil.copy2(source, target)
-                if _sha256(target) != expected:
-                    raise AssertionError(f"Staged native asset changed during copy: {target}")
-            if with_sibling:
-                shutil.copy2(original_helper, helper)
-                if _sha256(helper) != helper_digest:
-                    raise AssertionError("Staged sibling differs from the original PATH helper")
+            install = (("frontend", fixture_sources[0], frontend, fixture_digests[0]),
+                       ("module", component, native_module, fixture_digests[1]),
+                       ("helper", original_helper, helper, helper_digest))
+            for role, source, target, expected in install:
+                if role != missing:
+                    shutil.copy2(source, target)
+                    if _sha256(target) != expected:
+                        raise AssertionError(f"Staged native asset changed during copy: {target}")
             assets = {"frontend_sha256": fixture_digests[0], "module_sha256": fixture_digests[1],
-                      "module": str(native_module)}
+                      "module": str(native_module), "staged_module_present": missing != "module"}
             report = self.root / (name + ".json")
             process, directory = self.start(name, [str(frontend), "--observation", str(report), "inspect"],
                                             owned=False, environment=environment)
-            if not with_sibling:
-                diagnostic = "MPI session ownership: cannot prepare exact child spawn: No such file or directory"
+            if missing is not None:
+                absent = helper if missing == "helper" else native_module
+                diagnostic = ("MPI session ownership: cannot prepare exact child spawn: No such file or directory"
+                              if missing == "helper" else "Owned MPI native environment component is missing")
 
                 def require_rejection() -> None:
-                    """Do not let an unrelated loader failure or child report satisfy the negative."""
+                    """Require the exact native refusal with no rank observation and no replacement asset."""
                     if ((directory / "output.log").read_text().splitlines() != [diagnostic]
-                            or list(self.root.glob(report.name + "*")) or os.path.lexists(helper)):
+                            or list(self.root.glob(report.name + "*")) or os.path.lexists(absent)):
                         raise AssertionError("A missing exact sibling did not reject before MPI rank entry")
+                    for role, source, target, expected in install:
+                        if _sha256(source) != expected or (role != missing and _sha256(target) != expected):
+                            raise AssertionError(f"Staged rejection lost the exact {role} control")
 
                 self.finish(process, directory, 125, [], check_retirement=require_rejection)
                 self.results[-1].update(exact_diagnostic=diagnostic, path_helper=path_helper,
+                                        alternate_module=str(component), missing_asset=missing,
                                         frontend=str(frontend), **assets)
                 continue
 
@@ -710,6 +718,31 @@ class Replay:
                                         guardian_pid=owner_pid, guardian=str(helper), helper_sha256=helper_digest,
                                         original_roots=[receipt for _, _, _, receipt in roots], **assets)
 
+    def legacy_placement(self) -> None:
+        """Require the real frontend to reject old placement input before MPI entry."""
+        marker = "LLAMINAR_MANAGED_PLACEMENT"
+        receipt = "LLAMINAR_PLACEMENT_RECEIPT_V1"
+        if marker in os.environ or receipt in os.environ:
+            raise AssertionError("A clean parent is required for independent presence controls")
+        diagnostic = "Unexpected managed placement environment in native MPI bootstrap"
+        for name, environment in (("marker", {marker: "1"}),
+                                  ("receipt", {receipt: "stale"}),
+                                  ("empty-marker", {marker: ""}),
+                                  ("empty-receipt", {receipt: ""}),
+                                  ("pair", {marker: "1", receipt: "stale"})):
+            report = self.root / ("legacy-" + name + ".json")
+            process, directory = self.start("legacy-" + name,
+                [str(self.args.singleton), "--observation", str(report), "success"],
+                owned=False, environment=environment)
+
+            def require_refusal() -> None:
+                if ((directory / "output.log").read_text().splitlines() != [diagnostic]
+                        or list(self.root.glob(report.name + "*"))):
+                    raise AssertionError("Legacy placement did not reject before rank entry")
+
+            self.finish(process, directory, 125, [], check_retirement=require_refusal)
+            self.results[-1]["diagnostic"] = diagnostic
+
     def identity(self) -> None:
         """Distinguish fresh frontend entry from a broken original descriptor loan."""
         for mode in ("frontend-reuse", "frontend-fresh", "frontend-missing-location",
@@ -762,12 +795,12 @@ def main() -> None:
     parser.add_argument("--module", type=Path, help="Exact built native module for the staged singleton")
     parser.add_argument("--mpirun", type=Path, required=True)
     parser.add_argument("--case", choices=("launcher", "mpi", "native_options", "stubborn", "ctest_timeout",
-                                          "singleton", "staged_singleton", "identity", "retirement",
+                                          "singleton", "staged_singleton", "legacy_placement", "identity", "retirement",
                                           "root_retirement", "root_unlink", "root_identity", "all"), default="all")
     parser.add_argument("--root-side", choices=("both", "shared", "temporary"), default="both")
     parser.add_argument("--repeat", type=int, choices=range(1, 21), default=1)
     args = parser.parse_args()
-    if args.case in {"singleton", "staged_singleton", "identity", "all"} and args.singleton is None:
+    if args.case in {"singleton", "staged_singleton", "legacy_placement", "identity", "all"} and args.singleton is None:
         parser.error("Actual frontend ownership cases require --singleton")
     if args.case in {"staged_singleton", "all"} and args.module is None:
         parser.error("Staged singleton requires --module")
@@ -783,7 +816,7 @@ def main() -> None:
     try:
         selected = ((args.case,) if args.case != "all" else
                     ("launcher", "mpi", "native_options", "stubborn", "ctest_timeout", "singleton",
-                     "staged_singleton", "identity"))
+                     "staged_singleton", "legacy_placement", "identity"))
         for case in selected:
             if args.case in {case, "all"}:
                 try:

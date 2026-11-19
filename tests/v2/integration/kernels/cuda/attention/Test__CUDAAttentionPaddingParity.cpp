@@ -16,6 +16,7 @@
 #include "execution/local_execution/coherence/GpuCoherence.h"
 #include "execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "interfaces/IWorkspaceConsumer.h"
+#include "transfer/TransferEngine.h"
 #include "kernels/KernelFactory.h"
 #include "utils/MPIContext.h"
 #include "../../../../utils/PreparedWeightTestHarness.h"
@@ -407,18 +408,24 @@ namespace
         if (err != cudaSuccess)
             return fail(std::string("cudaMemset(output) failed: ") + cudaGetErrorString(err));
 
+        // Order the legacy-stream setup copies before the kernel stream.
+        err = cudaDeviceSynchronize();
+        if (err != cudaSuccess)
+            return fail(std::string("setup synchronize failed: ") + cudaGetErrorString(err));
         llaminar2::cuda::CUDAFlashAttentionKernelT<ActivationPrecision::FP32> kernel(cuda_ordinal);
+        ScopedGPUStream kernel_stream(DeviceId::cuda(cuda_ordinal));
+        kernel.setGPUStream(kernel_stream.get());
         const bool kernel_ok = kernel.compute(
             device_query, device_key, device_value, d_output,
             seq_len, n_heads, n_kv_heads, head_dim,
             causal, -1,
             nullptr, nullptr, nullptr, nullptr,
             false, &mpi_ctx, cuda_ordinal);
-        err = cudaDeviceSynchronize();
+        err = cudaStreamSynchronize(static_cast<cudaStream_t>(kernel_stream.get()));
         if (!kernel_ok)
             return fail("CUDA attention kernel returned false");
         if (err != cudaSuccess)
-            return fail(std::string("cudaDeviceSynchronize failed: ") + cudaGetErrorString(err));
+            return fail(std::string("kernel stream synchronize failed: ") + cudaGetErrorString(err));
 
         err = cudaMemcpy(result.output.data(), d_output, output_bytes, cudaMemcpyDeviceToHost);
         if (err != cudaSuccess)
@@ -531,6 +538,10 @@ TEST_F(Test__CUDAAttentionPaddingParity, LMHeadPaddedBucketUsesLastRealRowOnGPU)
     LMHeadStage stage(params);
     ScopedGPUStream producer_stream(device);
     stage.setGPUStream(producer_stream.get());
+    const auto stage_reqs = stage.getWorkspaceRequirements(bucket_seq_len, vocab_size, d_model);
+    DeviceWorkspaceManager stage_workspace(device, stage_reqs.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(stage_workspace.allocate(stage_reqs));
+    stage.bindWorkspace(&stage_workspace);
     stage.updatePrefillReplayParams(IComputeStage::PrefillReplayParams{
         real_seq_len,
         bucket_seq_len,
@@ -653,6 +664,8 @@ TEST_F(Test__CUDAAttentionPaddingParity, DecodeContinuationUsesRealKVLengthOnGPU
         cudaSuccess);
     ASSERT_TRUE(kv_cache->bindGraphAppendCountSource(
         0, 0, device_real_kv_len, bucket_kv_len, stream));
+    TransferEngine::prepareDeviceInput(key.get(), device, stream);
+    TransferEngine::prepareDeviceInput(value.get(), device, stream);
     ASSERT_TRUE(kv_cache->appendWithStream(0, 0, key.get(), value.get(), bucket_kv_len, stream));
     gpu_ctx.synchronizeStream(stream);
     ASSERT_EQ(kv_cache->get_cached_tokens(0, 0), real_kv_len);

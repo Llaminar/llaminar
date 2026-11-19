@@ -10,6 +10,7 @@
  */
 #include "loaders/CpuAdaptiveImmutableRowCache.h"
 #include "loaders/ModelLoader.h"
+#include "utils/HostPageSize.h"
 #include "../../utils/EmbeddingVerifierFormats.h"
 #include <gtest/gtest.h>
 #include <array>
@@ -34,14 +35,27 @@ using Id=PhysicalMemoryAllocatorIdentity;
 const Id Host{0,DeviceId::cpu()},GPU{0,DeviceId::cuda(0)};
 /** @brief Small distinguishable original-native file with a deliberately unaligned tensor offset. */
 struct File {
+    /** @brief Only explicit boundary fixtures extend authored rows before source publication. */
+    enum class RowExtent { Authored, ThroughFirstPageBoundary };
     int fd=-1;std::string path;std::vector<std::byte> original;ImmutableRowTableSource source;
-    /** @brief Write only fixture bytes, keeping arbitrary native payload bits verbatim. */
-    File(GGUFTensorType type=GGUFTensorType::IQ4_NL,std::size_t elements=160,std::size_t rows=128) {
+    /**
+     * @brief Write only fixture bytes, keeping arbitrary native payload bits verbatim.
+     * @param type Original encoded tensor format.
+     * @param elements Logical elements per native row.
+     * @param rows Authored row count, or its minimum for explicit boundary coverage.
+     * @param extent Whether the source must include a row crossing the first host page.
+     * @throws std::runtime_error If the private source cannot be created or written.
+     */
+    File(GGUFTensorType type=GGUFTensorType::IQ4_NL,std::size_t elements=160,std::size_t rows=128,
+         RowExtent extent=RowExtent::Authored) {
         char name[]="/tmp/llaminar-adaptive-row-XXXXXX";fd=::mkstemp(name);
         if(fd<0)throw std::runtime_error("Cannot create private native row file");
         path=name;
         source={.path=path,.tensor_name="fixture.ple",.file_offset=37,.rows=rows,.row_elements=elements,.format=type};
-        original.resize(37+rows*source.rowBytes());
+        if(extent==RowExtent::ThroughFirstPageBoundary)
+            source.rows=std::max<std::uint64_t>(rows,
+                (hostPageBytes()-source.file_offset)/source.rowBytes()+1);
+        original.resize(source.file_offset+source.tensorBytes());
         for(std::size_t i=0;i<original.size();++i)original[i]=std::byte((i*13+i/31)%251);
         if(::write(fd,original.data(),original.size())!=static_cast<ssize_t>(original.size()))throw std::runtime_error("Cannot populate native fixture");
     }
@@ -56,7 +70,7 @@ ImmutableRowTableLayoutGeometry layout(const File &f,std::size_t slots,bool host
     const std::vector<ImmutableRowTableLayoutOwner> owners{{{Host,Storage::RAM},0,slots,limit},{{GPU,Storage::VRAM},0,0,0}};
     return ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(f.source.format,f.source.rows,f.source.rowBytes()),
         ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,owners,{hosted?GPU:Host},{},
-        {{Host,ImmutableRowTableStoragePolicy::forStorage(Storage::MemoryMapped,4096,2)}},{},std::nullopt,maximum_inflight_rows);
+        {{Host,ImmutableRowTableStoragePolicy::forStorage(Storage::MemoryMapped,hostPageBytes(),2)}},{},std::nullopt,maximum_inflight_rows);
 }
 /** @return One topology certificate and sole rank materialization authority. */
 std::shared_ptr<PhysicalMemoryAuthority> authority(const Geometry &g) {
@@ -94,7 +108,7 @@ TEST(CpuAdaptiveImmutableRowCache, ConsumerLocalSubordinateGeometryKeepsExactPMA
                 std::vector<Storage> tiers{Storage::VRAM,Storage::RAM};
                 if(backing==Storage::MemoryMapped)tiers.push_back(backing);
                 const auto source_policy=backing==Storage::RAM?ImmutableRowTableStoragePolicy::forStorage(backing):
-                    ImmutableRowTableStoragePolicy::forStorage(backing,4096,2);
+                    ImmutableRowTableStoragePolicy::forStorage(backing,hostPageBytes(),2);
                 std::size_t source_bytes=0,previous_execution=0;
                 for(const std::size_t count:{1u,2u,4u,8u}) {
                     SCOPED_TRACE("backend="+std::to_string(int(backend))+" backing="+
@@ -270,14 +284,18 @@ TEST(CpuAdaptiveImmutableRowCache, FailedGatherCannotBeReauthenticatedForReuse) 
     EXPECT_EQ(c->sourceStats().source_metadata_checks,source.source_metadata_checks);
 }
 TEST(CpuAdaptiveImmutableRowCache, SourceScatterPreservesHolesAndCountsOnlySelectedNativeRows) {
-    File f;
+    File f(GGUFTensorType::IQ4_NL,160,128,File::RowExtent::ThroughFirstPageBoundary);
+    const auto crossing=static_cast<std::int64_t>((hostPageBytes()-f.source.file_offset)/f.source.rowBytes());
+    const auto start=f.source.file_offset+crossing*f.source.rowBytes();
+    ASSERT_LT(start,hostPageBytes());
+    ASSERT_GT(start+f.source.rowBytes(),hostPageBytes());
     for(auto storage:{Storage::RAM,Storage::MemoryMapped}) {
-        const auto policy=ImmutableRowTableStoragePolicy::forStorage(storage,4096,2);
+        const auto policy=ImmutableRowTableStoragePolicy::forStorage(storage,hostPageBytes(),2);
         PhysicalMemoryPlanBuilder b;b.add(host(),PhysicalMemoryOwner::ImmutableTableStorage,ImmutableRowTable::physicalBytes(f.source,policy));
         auto p=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(b.build()),0);
         ImmutableRowTable source(f.source,policy,DeviceId::cpu(),p,ImmutableRowTableHostPlacement::taskPolicy());
         std::array<std::byte,720> out;out.fill(std::byte{0x63});
-        const std::array<ImmutableRowTableScatterRow,3> rows{{{45,1},{3,4},{45,7}}};
+        const std::array<ImmutableRowTableScatterRow,3> rows{{{crossing,1},{3,4},{crossing,7}}};
         const auto before=source.stats();source.gatherScattered(rows,out);const auto after=source.stats();
         EXPECT_EQ(after.storage,storage);
         EXPECT_EQ(after.physical_budget_bytes,ImmutableRowTable::physicalBytes(f.source,policy));
@@ -286,14 +304,14 @@ TEST(CpuAdaptiveImmutableRowCache, SourceScatterPreservesHolesAndCountsOnlySelec
         EXPECT_EQ(after.rows-before.rows,3u);EXPECT_EQ(after.copied_bytes-before.copied_bytes,270u);
         for(std::size_t i=0;i<8;++i) {
             if(i==1 || i==4 || i==7) {
-                const auto id=i==4?3:45;
+                const auto id=i==4?3:crossing;
                 EXPECT_EQ(std::memcmp(out.data()+i*90,f.original.data()+37+id*90,90),0);
             } else for(auto byte:std::span(out).subspan(i*90,90))EXPECT_EQ(byte,std::byte{0x63});
         }
         const auto saved=out;const auto previous=source.stats();source.gatherScattered({},out);
         EXPECT_EQ(out,saved);EXPECT_EQ(source.stats().source_metadata_checks-previous.source_metadata_checks,2u);
         EXPECT_EQ(source.stats().copied_bytes,after.copied_bytes);
-        const std::array<ImmutableRowTableScatterRow,2> overlap{{{0,2},{1,2}}},reverse{{{0,4},{1,1}}},bad{{{0,0},{128,1}}};
+        const std::array<ImmutableRowTableScatterRow,2> overlap{{{0,2},{1,2}}},reverse{{{0,4},{1,1}}},bad{{{0,0},{static_cast<std::int64_t>(f.source.rows),1}}};
         EXPECT_THROW(source.gatherScattered(overlap,out),std::invalid_argument);
         EXPECT_THROW(source.gatherScattered(reverse,out),std::invalid_argument);
         EXPECT_THROW(source.gatherScattered(bad,out),std::out_of_range);
@@ -441,7 +459,7 @@ TEST(CpuAdaptiveImmutableRowCache, NativeMetadataBudgetAndHostDomainCannotBeBypa
     const auto gpuDomain=ImmutableRowTableLayoutGeometry::checked(ImmutableRowTableExtent::fromNative(f.source.format,128,90),
         ImmutableRowTableTiers::of(tier),ImmutableRowTableResidency::Adaptive,
         {{{Host,Storage::RAM},0,2,{}},{{GPU,Storage::VRAM},0,2,{}}},{GPU},{},
-        {{Host,ImmutableRowTableStoragePolicy::forStorage(Storage::MemoryMapped,4096,2)}},{},GPU,4);
+        {{Host,ImmutableRowTableStoragePolicy::forStorage(Storage::MemoryMapped,hostPageBytes(),2)}},{},GPU,4);
     EXPECT_THROW(Geometry::fromLayout(gpuDomain,Host,4),std::invalid_argument);
     EXPECT_THROW(Geometry::fromLayout(layout(f,2),Host,0),std::invalid_argument);
     const auto g=Geometry::fromLayout(layout(f,2),Host,4);auto wrong=host();wrong.world_rank=1;

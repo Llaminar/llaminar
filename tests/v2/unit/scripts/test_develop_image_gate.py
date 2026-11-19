@@ -46,6 +46,31 @@ def pr_report() -> dict:
 class DevelopImageGateTests(unittest.TestCase):
     """Keep develop publishing smaller than, and incapable of replacing, certification."""
 
+    def test_toolchain_action_binds_the_source_driver_only_after_local_verification(self):
+        """Exercise the composite's actual shell and its failure edge; cache services are not steps."""
+        action = yaml.load((ROOT / ".github/actions/cache-develop-toolchain/action.yml").read_text(),
+                           Loader=yaml.BaseLoader)
+        self.assertEqual(action["runs"]["using"], "composite")
+        step, = action["runs"]["steps"]
+        self.assertEqual(set(step), {"name", "shell", "env", "run"})
+        self.assertEqual(step["env"], {"CPU_ISA": "${{ inputs.cpu-isa }}"})
+        self.assertEqual(step["shell"], "bash")
+        for isa, rc in (("AVX512", 0), ("AVX2", 0), ("both", 0), ("AVX512", 19)):
+            with self.subTest(isa=isa, rc=rc), tempfile.TemporaryDirectory() as temp:
+                root = Path(temp)
+                (root / "scripts/ci").mkdir(parents=True)
+                (root / "scripts/ci/toolchain_cache.py").write_text(
+                    "import os,sys\n"
+                    "assert sys.argv[1:] == ['--root', os.environ['RUNNER_TEMP'] + '/llaminar-toolchains', "
+                    "'--cpu-isa', os.environ['CPU_ISA']]\nraise SystemExit(int(os.environ['PROOF_RC']))\n")
+                envfile = root / "env"
+                envfile.touch()
+                result = subprocess.run(["bash", "-c", step["run"]], cwd=root, env={**os.environ,
+                    "RUNNER_TEMP": temp, "GITHUB_ENV": str(envfile), "CPU_ISA": isa, "PROOF_RC": str(rc)})
+                self.assertEqual(result.returncode, rc)
+                self.assertEqual(envfile.read_text(), "" if rc else
+                    f"LLAMINAR_DOCKER_TOOLCHAIN_ROOT={temp}/llaminar-toolchains\n")
+
     def test_pr_driver_runs_exact_unit_and_host_inventories_and_rejects_skips(self):
         """Replay real CTest selection while poison accelerator cases stay unrun."""
         for unit_outcome, host_outcome in ((0, 0), (7, 0), (77, 0), (0, 7), (0, 77)):
@@ -419,6 +444,75 @@ class DevelopImageGateTests(unittest.TestCase):
                 self.assertEqual(receipt["validation"], "unit-and-host")
                 self.assertEqual(receipt["variants"][isa]["unit_test_count"], 1)
                 self.assertEqual(receipt["variants"][isa]["host_test_count"], 1)
+
+    def test_pr_job_admits_matrix_isa_before_toolchain(self):
+        """Each PR job admits its matrix ISA eligibility before toolchain work.
+
+        Honest-contract note: this branch's develop workflow runs two ISA
+        matrix jobs whose admission is CPU ISA ELIGIBILITY
+        (require_host_cpu_isa), not a model-QFN source-admission stage; the
+        project target architecture (one AVX512 PR job with a real QFN
+        source-admission stage) is a recorded workflow gap, tracked with the
+        reviewer — this test certifies the branch's actual contract only.
+        """
+        workflow = yaml.load((ROOT / ".github/workflows/develop-pr-tests.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        job = workflow["jobs"]["unit"]
+        names = [step.get("name", "") for step in job["steps"]]
+        # Source admission is the first named step: the requested ISA is
+        # rejected on the real host CPUs before buildx, toolchain cache or
+        # any compilation runs.
+        admission_index = next(i for i, step in enumerate(job["steps"])
+                               if "Admit the requested CPU ISA" in step.get("name", ""))
+        admission = job["steps"][admission_index]
+        self.assertEqual(admission["env"]["CPU_ISA"], "${{ matrix.cpu_isa }}")
+        self.assertIn("require_host_cpu_isa", admission["run"])
+        self.assertIn("from run_develop_image_gate import require_host_cpu_isa", admission["run"])
+        buildx_index = next(i for i, step in enumerate(job["steps"])
+                            if step.get("uses", "").startswith("docker/setup-buildx-action"))
+        self.assertLess(admission_index, buildx_index)
+        # One ISA per gate invocation: the build step forwards exactly the
+        # matrix value, never the whole matrix.
+        build_step = next(step for step in job["steps"]
+                          if "run_develop_image_gate.py" in str(step.get("run", "")))
+        self.assertIn("--cpu-isa \"$CPU_ISA\"", build_step["run"])
+        self.assertNotIn("--cpu-isa AVX2", build_step["run"].replace('--cpu-isa "$CPU_ISA"', ''))
+        self.assertNotIn("AVX512 \\", build_step["run"])
+        # The same admission ordering holds in the gate itself: every
+        # requested ISA is admitted before the evidence directory exists, and
+        # a pre-existing output directory aborts without touching evidence.
+        source = (ROOT / "scripts/ci/run_develop_image_gate.py").read_text()
+        import re as _re
+        admission = _re.search(r"for isa in args\.cpu_isas:\s*require_host_cpu_isa\(isa\)", source)
+        self.assertIsNotNone(admission)
+        output = source.index("args.output.mkdir(parents=True)")
+        self.assertLess(admission.start(), output)
+        self.assertIn("develop image gate output already exists", source)
+
+    def test_prerequisites_execute_in_exact_test_image_without_model_mounts(self):
+        """The PR's installed-model-free inventory runs inside its built image."""
+        source = (ROOT / "scripts/ci/run_develop_image_gate.py").read_text()
+        # The image built for a PR is the model-free TEST_RUNNER inventory, and
+        # the gate authenticates that exact inventory before running anything.
+        self.assertIn("roles=(ImageRole.TEST_RUNNER,)", source)
+        self.assertIn("test_inventory=TestRunnerInventory.MODEL_FREE", source)
+        # The model-free inventory is both built and independently
+        # authenticated: two MODEL_FREE declarations in the PR path.
+        self.assertEqual(source.count("test_inventory=TestRunnerInventory.MODEL_FREE"), 2)
+        # The only bind is the evidence directory: no model, corpus or host
+        # checkout mount exists in the PR test container.
+        self.assertIn("docker_paths.mounts([(directory, \"/ci-results\", False)])", source)
+        self.assertNotIn("--model", source.split("def run_pr_tests")[1].split("def publish_runtime")[0])
+        # Inside that image the receipt is validated as a production installed
+        # inventory and the two lanes (Unit and host preflight) run from the
+        # installed registrations, never from a host checkout.
+        pr_source = (ROOT / "scripts/ci/run_develop_pr_tests.py").read_text()
+        self.assertIn("validate(args.installed_build_receipt, build, InstalledTestScope.PRODUCTION)",
+                      pr_source)
+        self.assertIn("discover_production_parity_unit_tests(build)", pr_source)
+        self.assertIn("discover_production_test_preflight_registrations(build)", pr_source)
+        self.assertIn('"--installed-build-receipt", "/src/installed-tests.json"',
+                      (ROOT / "scripts/ci/run_develop_image_gate.py").read_text())
 
     def test_develop_auto_merge_waits_for_protected_pr_gate(self):
         """Only trusted, non-draft PRs arm native auto-merge; no PR code runs."""

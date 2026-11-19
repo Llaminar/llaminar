@@ -28,6 +28,7 @@
 #include "../../../utils/ExpertTierEncodedColumnOracle.h"
 
 #include <gtest/gtest.h>
+#include <cstring>
 
 #include <algorithm>
 #include <array>
@@ -289,6 +290,32 @@ namespace
                 projection.destination_bytes[byte] =
                     static_cast<std::uint8_t>(
                         seed + static_cast<std::uint8_t>(byte * 13u));
+            }
+            if (const auto *packed = projection.engine->exportCPUNativeQuantisedPackedWeights())
+            {
+                // Real prepared experts carry admitted source coefficients:
+                // clamp the seeded words into their encoding's domain, then
+                // admit the publication like a producer does.
+                const std::uint16_t permitted = packed->usesIQ3SExpandedSourceScale() ? 15
+                    : packed->usesNibbleLUTSourceScale() ? 63
+                    : packed->usesCompactMultiScale() && packed->codebook_id == 13 ? 255 : 0xffff;
+                if (permitted != 0xffff)
+                {
+                    const std::size_t units = std::size_t(packed->N_padded / 64) * std::size_t(packed->blocks_per_row);
+                    const std::size_t secondary = std::size_t(packed->data_stride) +
+                        (packed->usesInlineCompensation() ? 256u : 128u);
+                    for (std::size_t unit = 0; unit < units; ++unit)
+                        for (std::size_t column = 0; column < 64; ++column)
+                        {
+                            auto *word = projection.destination_bytes.data() +
+                                unit * std::size_t(packed->interleaved_block_stride) + secondary + column * 2;
+                            std::uint16_t value = 0;
+                            std::memcpy(&value, word, sizeof(value));
+                            value &= permitted;
+                            std::memcpy(word, &value, sizeof(value));
+                        }
+                }
+                projection.engine->admitCPUNativeQuantisedPublication();
             }
             switch (projection.projection)
             {

@@ -62,6 +62,8 @@ add_v2_test(V2_Integration_CPUShardPreparedPackedQFNClasses
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
         "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUShardPreparedPackedQFNClasses)
+# Two ranks on distinct NUMA sockets; single-socket hosts cannot form this cohort.
+if(V2_TEST_SOCKETS GREATER_EQUAL 2)
 add_v2_test(V2_Integration_CPUShardOriginalCohortStage
     COMMAND $<TARGET_FILE:v2_integration_global_tp_mpi>
         --gtest_filter=Test__GlobalTPContext_MPI.CPUShardStageUsesOriginalCohortAndUnweightedRows
@@ -70,6 +72,7 @@ add_v2_test(V2_Integration_CPUShardOriginalCohortStage
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
         "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUShardOriginalCohortStage)
+endif()
 
 # Metadata checks call the same source/owner-map and immutable return-role projections as serving.
 target_sources(v2_test_cpu_shard_route_collective PRIVATE unit/execution/moe/Test__CPUJointServingMetadata.cpp)
@@ -93,6 +96,8 @@ add_v2_test(V2_Integration_CPUShardPaddedCompactGatherEconomyContract
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUShardPaddedCompactGatherEconomyContract)
 
 # Actual original two-socket transport/stage; no prepared/ticket readiness is invented.
+# Two ranks on distinct NUMA sockets; single-socket hosts cannot form this cohort.
+if(V2_TEST_SOCKETS GREATER_EQUAL 2)
 add_v2_test(V2_Integration_CPUShardPaddedCompactGatherNativeEconomy
     COMMAND $<TARGET_FILE:v2_integration_global_tp_mpi>
         --gtest_filter=Test__GlobalTPContext_MPI.CPUShardStageUsesOriginalCohortAndUnweightedRows
@@ -100,6 +105,7 @@ add_v2_test(V2_Integration_CPUShardPaddedCompactGatherNativeEconomy
     MPI_PROCS 2 NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUShardPaddedCompactGatherNativeEconomy)
+endif()
 
 # Exercise the actual original-domain constructor's rejection before traffic.
 add_v2_test(V2_Integration_CPUJointPreparedComputeOriginalDomainContract
@@ -113,9 +119,27 @@ add_v2_test(V2_Integration_CPUJointPreparedComputeOriginalDomainContract
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointPreparedComputeOriginalDomainContract)
 
 
-# Replay the original copy-then-add oracle on each existing runtime ISA route.
-# This late module is included after the canonical preflight inventory is set.
-foreach(cpu_first_pair_isa IN ITEMS scalar avx2 avx512)
+# Replay the original copy-then-add oracle on each existing runtime ISA route:
+# scalar plus every native cell of the compiled envelope (avx2/avx512 on x86,
+# neon/neon_dotprod on ARM). Cell names stay lowercase; the environment uses
+# the LLAMINAR_ISA_LEVEL spelling. This late module is included after the
+# canonical preflight inventory is set.
+set(cpu_shard_route_isa_cells scalar)
+foreach(cpu_shard_route_cell IN LISTS V2_CPU_NATIVE_ISA_CELLS)
+    string(TOLOWER "${cpu_shard_route_cell}" cpu_shard_route_cell_name)
+    list(APPEND cpu_shard_route_isa_cells "${cpu_shard_route_cell_name}")
+endforeach()
+function(cpu_shard_route_runtime_isa cell output)
+    if(cell STREQUAL "scalar")
+        set(${output} scalar PARENT_SCOPE)
+    else()
+        string(TOUPPER "${cell}" upper)
+        v2_cpu_native_isa_runtime("${upper}" value)
+        set(${output} "${value}" PARENT_SCOPE)
+    endif()
+endfunction()
+foreach(cpu_first_pair_isa IN LISTS cpu_shard_route_isa_cells)
+    cpu_shard_route_runtime_isa("${cpu_first_pair_isa}" cpu_first_pair_runtime)
     set(cpu_first_pair_name "V2_Integration_CPUShardFirstPairDirectAdd_${cpu_first_pair_isa}Replay")
     add_v2_test(${cpu_first_pair_name}
         COMMAND $<TARGET_FILE:v2_test_cpu_shard_route_collective>
@@ -124,12 +148,13 @@ foreach(cpu_first_pair_isa IN ITEMS scalar avx2 avx512)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 10
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
             "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1"
-            "LLAMINAR_ISA_LEVEL=${cpu_first_pair_isa}")
+            "LLAMINAR_ISA_LEVEL=${cpu_first_pair_runtime}")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${cpu_first_pair_name})
 endforeach()
 
 # The authored controls use the same-worker combine/preweight implementation.
-foreach(cpu_fused_isa IN ITEMS scalar avx2 avx512)
+foreach(cpu_fused_isa IN LISTS cpu_shard_route_isa_cells)
+    cpu_shard_route_runtime_isa("${cpu_fused_isa}" cpu_fused_runtime)
     set(cpu_fused_name "V2_Integration_CPUShardFusedFinalAddPreweight_${cpu_fused_isa}")
     add_v2_test(${cpu_fused_name}
         COMMAND $<TARGET_FILE:v2_test_cpu_shard_route_collective>
@@ -138,6 +163,6 @@ foreach(cpu_fused_isa IN ITEMS scalar avx2 avx512)
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 10
         ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
             "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1"
-            "LLAMINAR_ISA_LEVEL=${cpu_fused_isa}")
+            "LLAMINAR_ISA_LEVEL=${cpu_fused_runtime}")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${cpu_fused_name})
 endforeach()

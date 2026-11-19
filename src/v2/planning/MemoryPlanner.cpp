@@ -193,7 +193,8 @@ void appendPhysicalPlan(
     if (!found->bom().resource().sameAllocator(incoming_resource))
     {
         throw std::invalid_argument(
-            "Logical memory plans disagree on one physical allocator observation");
+            "Logical memory plans disagree on one physical allocator observation: " +
+            found->bom().resource().observation() + " vs " + incoming_resource.observation());
     }
 
     PhysicalMemoryBOMBuilder combined(found->bom());
@@ -498,7 +499,7 @@ std::vector<PhysicalMemoryResource> ngramGPUResources(const DevicePlanConfig &cf
                 result.push_back(cfg.native_context_preparation->originalResource(consumer.device));
             return result;
         }
-        return {{cfg.world_rank,cfg.device,cfg.device_total_bytes,cfg.device_free_bytes}};
+        return {cfg.deviceResource()};
     }
     if(!cfg.native_context_preparation)throw std::invalid_argument("Declared GPU storage requires its original native source preparation");
     std::vector<PhysicalMemoryResource> result;
@@ -810,7 +811,7 @@ PhysicalMemoryPlan hostedLookupRuntimeBOM(const DevicePlanConfig& cfg,ImmutableR
     PhysicalMemoryPlanBuilder runtime(cfg.retained_host_services->bom({cfg.world_rank,ngramIOConsumer(cfg),RetainedHostServiceRole::ImmutableLookupIO},nativeHost));
     if(execution==ImmutableRowLookupExecution::HostProvider){
         const auto ordering=cfg.native_ordering_events.bom(NativeOrderingEventProgram::lookupSubmissionRetirement(),
-            nativeHost,{cfg.world_rank,cfg.device,cfg.device_total_bytes,cfg.device_free_bytes});
+            nativeHost,cfg.deviceResource());
         for(const auto& bom:ordering.resources())runtime.add(bom);
     }
     return runtime.build();
@@ -841,7 +842,7 @@ PhysicalMemoryPlan ngramExecutionArm(const ModelMemoryProfile &profile,const Dev
         requireGPUAdaptiveDomain(profile,cfg);execution=ImmutableRowLookupExecution::AdaptiveGPUCache;
     }
     const auto costs=ngramModeMemory(profile,cfg,execution);
-    const PhysicalMemoryResource resource{cfg.world_rank,cfg.device,cfg.device_total_bytes,cfg.device_free_bytes};
+    const PhysicalMemoryResource resource=cfg.deviceResource();
     PhysicalMemoryPlanBuilder builder;
     builder.add(resource,PhysicalMemoryOwner::ActivationArena,costs.arena)
         .add(resource,PhysicalMemoryOwner::NativeGraphExecutable,costs.terminal);
@@ -1090,7 +1091,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
             if(!shared.read_ahead_contexts.emplace(cfg.world_rank,cfg.device.toString()).second)
                 throw std::invalid_argument("Read-ahead planning has multiple unproven concurrent parent groups on one device");
             read_ahead_bom=ReadAheadNativeResourceFamily::bom(cfg.device,*cfg.associated_host_memory,
-                {cfg.world_rank,cfg.device,cfg.device_total_bytes,cfg.device_free_bytes});
+                cfg.deviceResource());
             break;
         }
         default:throw std::invalid_argument("Unknown immutable lookup scheduling policy before physical admission");
@@ -1229,7 +1230,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 }
                 else if(placement.isHostAdaptive())
                 {
-                    const auto &host=cfg.device.is_cpu()?PhysicalMemoryResource{cfg.world_rank,cfg.device,cfg.device_total_bytes,cfg.device_free_bytes}
+                    const auto &host=cfg.device.is_cpu()?cfg.deviceResource()
                         :cfg.associated_host_memory.value();
                     const auto geometry=CpuAdaptiveImmutableRowCacheGeometry::fromLayout(placement.hostAdaptiveLayout(),allocator,
                         placement.hostAdaptiveMaximumLiveRows(),placement.hostAdaptivePolicy());
@@ -1274,7 +1275,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
         }
         else if(ownsNgramLookup(profile,cfg) && cfg.ngram_execution_policy && cfg.ngram_execution_policy->isHostAdaptive())
         {
-            const auto host=cfg.device.is_cpu()?PhysicalMemoryResource{cfg.world_rank,cfg.device,cfg.device_total_bytes,cfg.device_free_bytes}
+            const auto host=cfg.device.is_cpu()?cfg.deviceResource()
                 :cfg.associated_host_memory.value();
             const auto key=std::pair{host.world_rank,host.device.toString()};
             if(shared.native_table_allocators.insert(key).second)
@@ -2545,12 +2546,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
          * Every named DeviceMemoryPlan accessor below is a view over these
          * typed lines, so no later planner can edit a parallel subtotal.
          */
-        PhysicalMemoryBOMBuilder bom_builder({
-            .world_rank = cfg.world_rank,
-            .device = cfg.device,
-            .total_bytes = cfg.device_total_bytes,
-            .admission_available_bytes = cfg.device_free_bytes,
-        });
+        PhysicalMemoryBOMBuilder bom_builder(cfg.deviceResource());
         bom_builder
             .add(PhysicalMemoryOwner::ImmutableLookupStaging,(cfg.device.is_cpu() || gpu_adaptive)?adaptive_request_bytes:0u,
                  (cfg.device.is_cpu() || gpu_adaptive)?adaptive_request_credit:0u)
@@ -2797,7 +2793,7 @@ std::vector<MemoryPlan> MemoryPlanner::planGroups(
     for(const auto &group:device_groups)for(const auto &cfg:group)
     {
         if(!ownsNgramLookup(profile,cfg) || !cfg.ngram_execution_policy || (!cfg.ngram_execution_policy->isHostAdaptive() && !cfg.ngram_execution_policy->isGPUAdaptive()) || cfg.ngram_table_placement)continue;
-        const auto host=cfg.device.is_cpu()?PhysicalMemoryResource{cfg.world_rank,cfg.device,cfg.device_total_bytes,cfg.device_free_bytes}
+        const auto host=cfg.device.is_cpu()?cfg.deviceResource()
             :cfg.associated_host_memory.value_or(PhysicalMemoryResource{});
         if(!host.valid() || !host.device.is_cpu() || host.world_rank!=cfg.world_rank)
             throw std::invalid_argument("Host adaptive consumers require their exact pre-quota CPU resource");
@@ -2809,7 +2805,7 @@ std::vector<MemoryPlan> MemoryPlanner::planGroups(
     for(const auto &[key,configs]:adaptive_consumers)
     {
         const auto &first=configs.front();const auto &policy=*first.ngram_execution_policy;
-        const auto host=first.device.is_cpu()?PhysicalMemoryResource{first.world_rank,first.device,first.device_total_bytes,first.device_free_bytes}
+        const auto host=first.device.is_cpu()?first.deviceResource()
             :first.associated_host_memory.value();
         std::size_t maximum=0;
         for(const auto &cfg:configs)
@@ -3048,7 +3044,7 @@ std::optional<ImmutableRowTablePlacementInput> MemoryPlanner::immutableRowTableP
         for (const auto &cfg : group)
             if (ownsNgramLookup(profile, cfg))
             {
-                const PhysicalMemoryResource r{cfg.world_rank, cfg.device, cfg.device_total_bytes, cfg.device_free_bytes};
+                const PhysicalMemoryResource r=cfg.deviceResource();
                 observations.add(r, PhysicalMemoryOwner::ImmutableTableStorage, 0u);
                 if (std::none_of(consumers.begin(), consumers.end(), [&](const auto &present) {
                     return present.world_rank == r.world_rank && present.device == r.device; })) consumers.push_back(r);
@@ -3136,7 +3132,7 @@ ImmutableRowTableModeContributions MemoryPlanner::immutableRowTableModeContribut
                 for(const auto& bom:ordering.resources())
                     contribution.add(bom);
                 const auto costs = ngramModeMemory(profile, cfg, immutableRowLookupExecution(storage));
-                const PhysicalMemoryResource resource{cfg.world_rank, cfg.device, cfg.device_total_bytes, cfg.device_free_bytes};
+                const PhysicalMemoryResource resource=cfg.deviceResource();
                 contribution.add(resource, PhysicalMemoryOwner::ActivationArena, costs.arena)
                     .add(resource, PhysicalMemoryOwner::NativeGraphExecutable, costs.terminal);
                 if (costs.mapped)
@@ -3204,8 +3200,7 @@ std::optional<ImmutableRowTableAdmissionRequest> MemoryPlanner::immutableRowTabl
             if (!cfg.ngram_execution_policy || *cfg.ngram_execution_policy != requested || cfg.ngram_table_placement)
                 throw std::invalid_argument("Final ngram request requires the unchanged pre-quota execution policy on every actual consumer");
             const auto resource = cfg.device.is_cpu()
-                ? std::optional{PhysicalMemoryResource{cfg.world_rank, cfg.device,
-                    cfg.device_total_bytes, cfg.device_free_bytes}}
+                ? std::optional{cfg.deviceResource()}
                 : cfg.associated_host_memory;
             if (!resource || !resource->valid() || !resource->device.is_cpu() ||
                 resource->world_rank != cfg.world_rank)
@@ -3231,7 +3226,7 @@ std::optional<ImmutableRowTableAdmissionRequest> MemoryPlanner::immutableRowTabl
         if(!ownsNgramLookup(profile,cfg))continue;
         const auto envelope=ngramExecutionEnvelope(profile,cfg);
         appendNgramExecution(execution, envelope, cfg, executionWorkers);
-        consumers.push_back({{cfg.world_rank,cfg.device,cfg.device_total_bytes,cfg.device_free_bytes},
+        consumers.push_back({cfg.deviceResource(),
             ngramActivationRows(profile,cfg),cfg.batch_size,cfg.max_seq_len>0?cfg.max_seq_len:profile.max_seq_len,
             cfg.tensor_parallel_assignment?cfg.tensor_parallel_assignment->head_count:
                 std::max(1,profile.n_heads/std::max(1,cfg.total_shards)),
@@ -3390,7 +3385,7 @@ std::shared_ptr<const ImmutableRowTableExecutionProvision> MemoryPlanner::restor
             (!a.replicated_dense_decode && a.local_n_heads!=identity.local_heads) || a.local_d_ff>profile.d_ff)
             throw std::invalid_argument("Remote ngram common descriptor contradicts canonical whole-storage/sharding geometry");
         DevicePlanConfig cfg;cfg.native_ordering_events=ordering;cfg.world_rank=identity.resource.world_rank;cfg.device=identity.resource.device;
-        cfg.device_total_bytes=identity.resource.total_bytes;cfg.device_free_bytes=identity.resource.admission_available_bytes;
+        cfg.adoptDeviceResource(identity.resource);
         cfg.ngram_execution_policy=requested;cfg.ngram_gpu_peer_access=input.gpuCachePeerAccess();cfg.ngram_reader_peer_access.assign(input.readerPeerAccess().begin(),input.readerPeerAccess().end());cfg.associated_host_memory=input.host();cfg.total_shards=identity.shards;
         const bool needsService=cfg.device.is_gpu()&&requested.storage!=ImmutableRowStoragePreference::VRAM;
         if(needsService){

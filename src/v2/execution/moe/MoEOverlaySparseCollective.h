@@ -217,6 +217,25 @@ namespace llaminar2
         bool isBound() const noexcept { return allocation_ != nullptr; }
         const DeviceId &sourceDevice() const noexcept { return source_device_; }
         size_t allocationBytes() const noexcept { return allocation_bytes_; }
+        /**
+         * @brief Host address of the isolated GPU-to-host publication word.
+         *
+         * Read-only diagnostic observation, not an authority: the returned
+         * pointer conveys no ownership, no lifetime and no write right. The
+         * publication cache line stays owned by @ref publication_region_
+         * exactly as before; layout proofs (for example proving the word
+         * lies outside a protected payload interior) need the actual address
+         * rather than a geometric inference about it. The observation never
+         * mutates state and is stable for the bound ticket's lifetime.
+         *
+         * @return Non-owning address of byte zero of the publication region,
+         *     or nullptr for declaration-only and host-owned CPU tickets,
+         *     which have no mapped publication word.
+         */
+        [[nodiscard]] const void *publicationTimelineAddress() const noexcept
+        {
+            return publication_timeline_;
+        }
         /** @return The physical ticket; declaration-only access is a fatal contract error. */
         MoEOverlayDispatchTicket &ticket();
         /** @return The physical ticket; declaration-only access is a fatal contract error. */

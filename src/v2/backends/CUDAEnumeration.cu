@@ -112,6 +112,8 @@ namespace llaminar2
                     throw std::runtime_error("CUDA capacity observation failed at ordinal " +
                         std::to_string(i) + ": " + cudaGetErrorString(memory_status));
                 dev.free_memory_bytes = free_bytes;
+                dev.memory_backing = prop.integrated ? PhysicalMemoryBacking::RankHostPool
+                                                     : PhysicalMemoryBacking::Dedicated;
 
                 // Feature detection based on compute capability
                 dev.supports_fp16 = (prop.sm_major >= 6); // Pascal (SM 6.0+)

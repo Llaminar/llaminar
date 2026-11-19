@@ -10,6 +10,7 @@
  * capture setup never dereferences a GPU pointer, independently of hardware.
  */
 
+#include "utils/HostPageSize.h"
 #include "execution/moe/MoEOverlayDeviceControllerTopology.h"
 #include "execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
 #include "execution/moe/MoEOverlayParticipantGraphRunner.h"
@@ -418,7 +419,7 @@ namespace llaminar2::test
                 /*command_capacity=*/32u);
 
         ASSERT_TRUE(layout.valid());
-        EXPECT_EQ(layout.page_bytes, 4096u);
+        EXPECT_EQ(layout.page_bytes, hostPageBytes());
         EXPECT_EQ(layout.leader_owned_begin, layout.page_bytes);
         EXPECT_EQ(layout.leader_owned_end % layout.page_bytes, 0u);
         EXPECT_EQ(

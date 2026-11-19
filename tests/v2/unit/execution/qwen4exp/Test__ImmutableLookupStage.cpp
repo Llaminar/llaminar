@@ -10,6 +10,7 @@
 #include "execution/local_execution/device/DeviceContext.h"
 #include "tensors/Tensors.h"
 #include "utils/OpenMPUtils.h"
+#include "utils/HostPageSize.h"
 #include "utils/PerfStatsCollector.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -66,7 +67,7 @@ struct Source
     /** @brief Admit only this table's exact physical demand. */
     std::shared_ptr<HostImmutableRowProvider> open(ImmutableRowStorage storage) const
     {
-        const auto policy=ImmutableRowTableStoragePolicy::forStorage(storage,4096,2);
+        const auto policy=ImmutableRowTableStoragePolicy::forStorage(storage,hostPageBytes(),2);
         PhysicalMemoryPlanBuilder plan;
         plan.add({.world_rank=0,.device=DeviceId::cpu(),.total_bytes=1u<<20,.admission_available_bytes=1u<<20},
             PhysicalMemoryOwner::ImmutableTableStorage,ImmutableRowTable::physicalBytes(source(),policy));
@@ -85,7 +86,7 @@ struct Source
             ImmutableRowTableExtent::fromNative(source().format,source().rows,source().rowBytes()),
             ImmutableRowTableTiers::of(tiers),ImmutableRowTableResidency::Adaptive,
             {{{owner,ImmutableRowStorage::RAM},0,slots,{}}},{owner},{},
-            {{owner,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},
+            {{owner,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,hostPageBytes(),2)}},
             {},std::nullopt,maximum_ids);
         const auto geometry=CpuAdaptiveImmutableRowCacheGeometry::fromLayout(layout,owner,maximum_ids);
         auto memory=std::make_shared<PhysicalMemoryAuthority>(

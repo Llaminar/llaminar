@@ -7,6 +7,8 @@
  * Exact-fit decisions use the canonical topology certificate, and projections
  * cover independent/co-located coordinators and zero-capacity physical owners.
  */
+#include <unistd.h>
+#include "utils/HostPageSize.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
 #include "fixtures/planning/RecordedNgramOrdering.h"
 #include "planning/PhysicalMemoryCapacityExhausted.h"
@@ -65,7 +67,7 @@ struct Cohort
             ImmutableRowTableExtent::fromNative(source.format, source.rows, source.rowBytes()),
             ImmutableRowTableTiers::of(tiers), ImmutableRowTableResidency::Adaptive,
             std::move(owners), {coordinator}, {},
-            {{host, ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped, 4096, 2)}},
+            {{host, ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),2)}},
             {}, positive ? std::optional(coordinator) : std::nullopt, maximum_ids);
     }
 

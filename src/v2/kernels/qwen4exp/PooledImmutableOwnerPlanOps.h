@@ -278,26 +278,43 @@ public:
         // Acceptance scratch is dead after both waves. Reuse its first bank for
         // an immutable permutation, keeping append-only accepted/grant records
         // in actual command order for cancellation and original observations.
+        // On sm_120/121, fixed-trip radix loops stay rolled. Full unrolling
+        // multiplies register pressure far beyond the 255-register kernel
+        // budget, and the owner phase is a rare one-thread lifecycle path, not
+        // a hot loop. Host builds and every other device target keep their
+        // original schedule; the loops index scratch memory, never registers.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1200
+#define LLAMINAR_OWNER_PLAN_RADIX_ROLLED _Pragma("unroll 1")
+#else
+#define LLAMINAR_OWNER_PLAN_RADIX_ROLLED
+#endif
+LLAMINAR_OWNER_PLAN_RADIX_ROLLED
         for (std::uint32_t i = 0; i < frame_.count; ++i)
             scratch_.keys_a[i] = (std::uint64_t{grants_[i].unique} << 32) | i;
         auto *input = scratch_.keys_a;
         auto *output = scratch_.keys_b;
+LLAMINAR_OWNER_PLAN_RADIX_ROLLED
         for (unsigned pass = 4; pass < 8; ++pass)
         {
+LLAMINAR_OWNER_PLAN_RADIX_ROLLED
             for (unsigned bin = 0; bin < 256; ++bin) scratch_.radix_counts[bin] = 0;
+LLAMINAR_OWNER_PLAN_RADIX_ROLLED
             for (std::uint32_t i = 0; i < frame_.count; ++i)
                 ++scratch_.radix_counts[(input[i] >> (pass * 8)) & 255];
             std::uint32_t cursor = 0;
+LLAMINAR_OWNER_PLAN_RADIX_ROLLED
             for (unsigned bin = 0; bin < 256; ++bin)
             {
                 const auto size = scratch_.radix_counts[bin];
                 scratch_.radix_counts[bin] = cursor;
                 cursor += size;
             }
+LLAMINAR_OWNER_PLAN_RADIX_ROLLED
             for (std::uint32_t i = 0; i < frame_.count; ++i)
                 output[scratch_.radix_counts[(input[i] >> (pass * 8)) & 255]++] = input[i];
             auto *swap = input; input = output; output = swap;
         }
+#undef LLAMINAR_OWNER_PLAN_RADIX_ROLLED
         if (!OwnerOperations<Slot>(owner_).sealReservations(frame_.lease.interval, source)) return false;
         frame_.phase = AllocationPhase::SourceSealed;
         return true;

@@ -15,6 +15,7 @@
  * @note Run with Release build: ctest -R V2_Perf_CPUNativeQuantised_Sweep
  */
 
+#include <stdexcept>
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <omp.h>
@@ -39,6 +40,7 @@
 #include "fort.hpp"
 
 #include "utils/TestTensorFactory.h"
+#include "utils/CPUProjectionTestWorkspace.h"
 
 using namespace llaminar2;
 using namespace llaminar2::cpu::native_quantised;
@@ -293,15 +295,24 @@ namespace
         auto A_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)K});
         std::memcpy(A_tensor->mutable_data(), A, (size_t)M * K * sizeof(float));
         auto C_tensor = std::make_unique<FP32Tensor>(std::vector<size_t>{(size_t)M, (size_t)N});
+        // Direct kernel calls receive the admitted arena a production stage
+        // would bind; it is sized by the kernel's own declaration, outside timing.
+        const llaminar2::test::CPUProjectionTestWorkspace workspace(
+            llaminar2::test::cpuProjectionTestRequirements(M, {kernel}));
+        const auto run = [&] {
+            if (!kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K, true, 1.0f, 0.0f,
+                    nullptr, nullptr, -1, workspace.get()))
+                throw std::runtime_error("Native VNNI sweep projection failed");
+        };
 
         for (int i = 0; i < warmup; ++i)
-            kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K);
+            run();
 
         std::vector<double> times(iters);
         for (int i = 0; i < iters; ++i)
         {
             auto t0 = std::chrono::high_resolution_clock::now();
-            kernel->multiply_tensor(A_tensor.get(), C_tensor.get(), M, N, K);
+            run();
             auto t1 = std::chrono::high_resolution_clock::now();
             times[i] = std::chrono::duration<double, std::micro>(t1 - t0).count();
         }

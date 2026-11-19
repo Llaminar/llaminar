@@ -152,6 +152,7 @@ TEST(Qwen4ExpPredictorProfile, WireRoundTripAuthenticatesPolicyAndRejectsUnknown
     const auto wire=p.serialize(); const auto restored=ModelMemoryProfile::deserialize(wire.data(),wire.size());
     EXPECT_EQ(restored.flash_next_predictor,p.flash_next_predictor); EXPECT_EQ(restored.flash_next,p.flash_next);
     EXPECT_EQ(restored.total_native_bytes,p.total_native_bytes); EXPECT_EQ(restored.tensors.size(),p.tensors.size());
+    EXPECT_GT(p.rope_dimension_count,0); EXPECT_EQ(restored.rope_dimension_count,p.rope_dimension_count);
     EXPECT_EQ(restored.flashNextLayerKind(48),Qwen4ExpLayerKind::Dense);
     auto stale=wire; const uint32_t oldVersion=3; std::memcpy(stale.data()+4,&oldVersion,sizeof(oldVersion));
     EXPECT_THROW(ModelMemoryProfile::deserialize(stale.data(),stale.size()),std::runtime_error);

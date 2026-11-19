@@ -6,6 +6,7 @@
  */
 
 #include "DeviceContext.h"
+#include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/Logger.h"
 #include <omp.h>
 #include <cstring>
@@ -228,6 +229,7 @@ namespace llaminar2
         else
         {
 // Create new parallel region
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel num_threads(num_threads_)
             {
                 work(omp_get_thread_num(), omp_get_num_threads());
@@ -252,6 +254,7 @@ namespace llaminar2
         else
         {
 // Create parallel for
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) num_threads(num_threads_)
             for (size_t i = start; i < end; ++i)
             {

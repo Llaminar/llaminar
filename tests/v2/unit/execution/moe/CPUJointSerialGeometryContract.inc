@@ -9,6 +9,7 @@
 #include "memory/CPUSerialExpertStorageLayout.h"
 #include "collective/NativeCPUCollectiveProgram.h"
 #include "collective/backends/ShmemSpinBackend.h"
+#include "utils/HostPageSize.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
 namespace llaminar2 {
 namespace {
@@ -99,7 +100,24 @@ TEST(CPUJointSerialGeometry, DomainPoolAndCreatorArenaAreExactAndNonmemberHasOnl
   PhysicalMemoryPlanBuilder builder;
   const auto arena=ShmemSpinArena::allocationGeometry(count);
   EXPECT_EQ(arena.logical_bytes,ShmemSpinArena::compute_size(count));EXPECT_GE(arena.mapped_bytes,arena.logical_bytes);
-  if(count==2)EXPECT_EQ(arena.mapped_bytes,8392704u);
+  if(count==2)
+  {
+   // Anonymous-page-mapping contract: the mapped extent is the logical
+   // arena rounded up to whole host pages (AlignedVector anonymous
+   // mappings force exactly page alignment). 8392704 was the 4 KiB-page
+   // shape (2049 pages); a 64 KiB host maps 129 pages of the same
+   // logical extent. Exact-size control: the mapped span equals the
+   // logical arena plus exactly the minimal whole-page padding. Exact
+   // padding control: when the logical extent is unaligned the padding
+   // is one byte short of a whole page at most, and the mapped span is
+   // then strictly larger than the logical arena.
+   const std::size_t page=llaminar2::hostPageBytes();
+   const std::size_t logical=ShmemSpinArena::compute_size(2);
+   EXPECT_EQ(arena.mapped_bytes,((logical+page-1)/page)*page);
+   const std::size_t padding=(page-logical%page)%page;
+   EXPECT_EQ(arena.mapped_bytes-arena.logical_bytes,padding);
+   if(padding!=0u)EXPECT_GT(arena.mapped_bytes,arena.logical_bytes);
+  }
   for(int rank=0;rank<=count;++rank) {
    PhysicalMemoryResource cpu{rank,DeviceId::cpu(),1u<<30,1u<<30};
    NativeCPUCollectiveProgram::contributeProcessPoolBOM(builder,cpu);

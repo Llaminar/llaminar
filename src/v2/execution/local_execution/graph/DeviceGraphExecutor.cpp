@@ -19,6 +19,8 @@
 #include "snapshots/SnapshotNativeSource.h"
 #include "snapshots/SnapshotStorageLayout.h"
 #include "../../../snapshots/SnapshotSemanticObservation.h"
+#include "utils/OpenMPUtils.h"
+#include "utils/OpenMPTeamForkEvidence.h"
 #include "DeviceGraphExecutor.h"
 #include "RetainedHostServiceProgram.h"
 #include "RetainedParentTicketServiceWorker.h"
@@ -3192,6 +3194,15 @@ namespace llaminar2
             const auto cpu_stage_start =
                 cpu_stage_timing_active ? PerfStatsCollector::Clock::now()
                                         : PerfStatsCollector::Clock::time_point{};
+            /* The stage's owner cell rides the same explicit gate that costs
+             * the clock read: stage timing serializes waves onto this
+             * executor thread, so the cell delta attributes the stage's forks
+             * exactly; concurrent executor scopes own their own cells and
+             * only the process total is shared. */
+            const std::optional<llaminar::v2::OpenMPTeamForkScope> openmp_forks_of_stage =
+                cpu_stage_timing_active
+                    ? std::optional<llaminar::v2::OpenMPTeamForkScope>{std::in_place}
+                    : std::nullopt;
             bool stage_ok = false;
             try
             {
@@ -3255,6 +3266,16 @@ namespace llaminar2
                         {"source", "device_graph_executor"},
                         {"stage_type", stage_type_name},
                         {"index", std::to_string(i)}});
+                /* The fork cell rides the same owned boundary as the clock
+                 * pair, so one gate costs both observations; the publisher
+                 * owns the family gate and the record shape. */
+                llaminar::v2::publishOpenMPTeamForkStage(
+                    *openmp_forks_of_stage,
+                    node->name,
+                    executionPhasePerfName(GraphExecutorStats::currentPhase()),
+                    ctx->deviceId(),
+                    i,
+                    stage_type_name);
             }
 
             if (debugEnv().vram_trace && ctx->isGPU())
@@ -4525,6 +4546,16 @@ namespace llaminar2
             const auto stage_begin =
                 cpu_stage_timing ? PerfStatsCollector::Clock::now()
                                  : PerfStatsCollector::Clock::time_point{};
+            /* CPU fork attribution rides the same gate as the clock read; a
+             * GPU stage executes no OpenMP fork and constructs no owner, so
+             * it publishes no fork record. Waves are serial while this family
+             * is active, so the cell belongs to exactly this entry even with
+             * mixed devices; concurrent executor scopes stay independent. */
+            const bool cpu_fork_attribution = cpu_stage_timing && entry.device.is_cpu();
+            const std::optional<llaminar::v2::OpenMPTeamForkScope> openmp_forks_of_stage =
+                cpu_fork_attribution
+                    ? std::optional<llaminar::v2::OpenMPTeamForkScope>{std::in_place}
+                    : std::nullopt;
             bool stage_ok = false;
             if (general_stage_controller)
             {
@@ -4576,6 +4607,17 @@ namespace llaminar2
                      {"index", std::to_string(index)},
                      {"stage_type",
                       computeStageTypeName(node->stage->type())}});
+                if (cpu_fork_attribution)
+                {
+                    llaminar::v2::publishOpenMPTeamForkStage(
+                        *openmp_forks_of_stage,
+                        node->name,
+                        executionPhasePerfName(
+                            GraphExecutorStats::currentPhase()),
+                        entry.device,
+                        index,
+                        computeStageTypeName(node->stage->type()));
+                }
             }
             return stage_ok;
         };

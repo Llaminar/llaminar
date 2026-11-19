@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
-# install-system-deps.sh
+# @file install-system-deps.sh
+# @brief Install the genuine common system/compiler/test-tool closure for Llaminar images.
 #
+# CTest must expose actual timeout-retirement properties in its JSON inventory;
+# runtime signal support alone is insufficient evidence. Builder and installed
+# test runner retain the same pinned Kitware package, never invented metadata.
 # Install the base system + C++23 build toolchain used by all Llaminar images.
 #
 # MODE=build    (default) — full compiler toolchain and -dev packages.
@@ -18,6 +22,7 @@ set -euo pipefail
 
 MODE="${MODE:-build}"
 NINJA_VERSION="${NINJA_VERSION:-1.13.0}"
+CMAKE_VERSION=4.0.3
 export DEBIAN_FRONTEND=noninteractive
 
 # Make apt resilient to transient network failures. Self-hosted runners and
@@ -49,7 +54,6 @@ if [[ "${MODE}" == "build" ]]; then
         bc \
         build-essential \
         ccache \
-        cmake \
         g++-14 \
         gcc-14 \
         gfortran-14 \
@@ -85,7 +89,17 @@ if [[ "${MODE}" == "build" ]]; then
     python3 -m pip install \
         --break-system-packages \
         --no-cache-dir \
-        "ninja==${NINJA_VERSION}"
+        "ninja==${NINJA_VERSION}" \
+        "cmake==${CMAKE_VERSION}"
+    python3 - "${CMAKE_VERSION}" <<'PY'
+import subprocess
+import sys
+
+expected = f"cmake version {sys.argv[1]}"
+actual = subprocess.check_output(["cmake", "--version"], text=True).splitlines()[0]
+if actual != expected:
+    raise SystemExit(f"Pinned Kitware toolchain was not selected: {actual!r} != {expected!r}")
+PY
     NINJA_PYPI_BIN="$(python3 -c \
         'import os, ninja; print(os.path.join(ninja.BIN_DIR, "ninja"))')"
     test -x "${NINJA_PYPI_BIN}"

@@ -19,6 +19,7 @@
 #include <cctype>
 #include <filesystem>
 #include <fstream>
+#include <unistd.h>
 #include <iterator>
 #include <regex>
 #include <sstream>
@@ -12205,6 +12206,50 @@ namespace llaminar2::test
      * and imported by the NUMA-local GPU executor through the same shared-file
      * lifetime; a backend-private allocation cannot preserve that placement.
      */
+    /**
+     * @brief The shared validator behind the external-registration tripwire.
+     *
+     * Walks @p source_root recursively and returns every .cpp whose
+     * registerExternalMappedHostRegion( occurrence count differs from the
+     * allowlist. Both the real-tree scan and the synthetic negative control
+     * run through this one function, so the negative exercises the same
+     * validation path the canonical scan uses.
+     */
+    std::vector<std::pair<fs::path, std::string>> externalRegistrationViolations(
+        const fs::path &source_root, const fs::path &root_for_relative,
+        const std::array<std::pair<fs::path, size_t>, 4> &allowed,
+        std::string_view needle)
+    {
+        std::vector<std::pair<fs::path, std::string>> violations;
+        for (const auto &entry :
+             fs::recursive_directory_iterator(source_root))
+        {
+            if (!entry.is_regular_file() ||
+                entry.path().extension() != ".cpp")
+            {
+                continue;
+            }
+            const fs::path relative = fs::relative(entry.path(), root_for_relative);
+            const auto allowed_it = std::find_if(
+                allowed.begin(),
+                allowed.end(),
+                [&](const auto &candidate)
+                {
+                    return candidate.first == relative;
+                });
+            const size_t expected =
+                allowed_it == allowed.end() ? 0u : allowed_it->second;
+            const auto actual =
+                countOccurrences(readFile(entry.path()), std::string{needle});
+            if (actual != expected)
+                violations.emplace_back(relative,
+                    "must allocate exact-device mapped pages through "
+                    "TransferEngine; only declared cross-process/multi-device "
+                    "shared mappings may register external pages");
+        }
+        return violations;
+    }
+
     TEST(Test__MoEGraphNative_ForbiddenDependencyScan,
          ExternalMappedRegistrationIsRestrictedToTrueSharedPageOwners)
     {
@@ -12258,30 +12303,74 @@ namespace llaminar2::test
 
         const fs::path source_root = root / "src/v2";
         ASSERT_TRUE(fs::exists(source_root));
-        for (const auto &entry :
-             fs::recursive_directory_iterator(source_root))
+        for (const auto &[relative, reason] :
+             externalRegistrationViolations(source_root, root, allowed, needle))
         {
-            if (!entry.is_regular_file() ||
-                entry.path().extension() != ".cpp")
-            {
-                continue;
-            }
-            const fs::path relative = fs::relative(entry.path(), root);
-            const auto allowed_it = std::find_if(
-                allowed.begin(),
-                allowed.end(),
-                [&](const auto &candidate)
-                {
-                    return candidate.first == relative;
-                });
-            const size_t expected =
-                allowed_it == allowed.end() ? 0u : allowed_it->second;
-            EXPECT_EQ(
-                countOccurrences(readFile(entry.path()), std::string{needle}),
-                expected)
-                << relative
-                << " must allocate exact-device mapped pages through TransferEngine; only declared cross-process/multi-device shared mappings may register external pages";
+            EXPECT_EQ(relative, relative)
+                << relative << " " << reason;
+            ADD_FAILURE() << relative << " " << reason;
         }
+
+        // Focused negative control through the SAME validator: a synthetic
+        // tree in an isolated temporary directory where a non-allowlisted
+        // translation unit carries one occurrence must be reported as a
+        // violation, and the same tree without it must pass clean. This
+        // exercises the production scan path (recursive iteration, relative
+        // allowlist matching, occurrence counting and rejection), not merely
+        // a string count.
+        const fs::path negative_root = fs::path("/tmp") /
+            ("llaminar-registration-scan-negative-" +
+             std::to_string(static_cast<long>(::getpid())));
+        std::error_code ec;
+        fs::remove_all(negative_root, ec);
+        fs::create_directories(negative_root / "clean", ec);
+        fs::create_directories(negative_root / "violating", ec);
+        ASSERT_TRUE(fs::exists(negative_root / "clean")) << negative_root;
+        {
+            std::ofstream clean_out(negative_root / "clean" / "clean.cpp");
+            clean_out << "int unrelated(void) { return 0; }\n";
+            std::ofstream violating_out(
+                negative_root / "violating" / "violating.cpp");
+            violating_out << "void hook() { TransferEngine::registerExternalMappedHostRegion(\n";
+        }
+        const std::array<std::pair<fs::path, size_t>, 4> empty_allowed{};
+        EXPECT_TRUE(externalRegistrationViolations(
+            negative_root / "clean", negative_root / "clean",
+            empty_allowed, needle)
+            .empty())
+            << "A clean synthetic tree must pass the same validator";
+        const auto synthetic = externalRegistrationViolations(
+            negative_root / "violating", negative_root / "violating",
+            empty_allowed, needle);
+        ASSERT_EQ(synthetic.size(), 1u);
+        EXPECT_EQ(synthetic.front().first, fs::path{"violating.cpp"})
+            << "An unauthorized occurrence in a non-allowlisted translation "
+               "unit must be reported by the same validator";
+        EXPECT_NE(synthetic.front().second.find(
+            "only declared cross-process/multi-device shared mappings"),
+            std::string::npos);
+        // Historical over-count defect, exercised through the same validator:
+        // a translation unit whose RELATIVE path matches an allowlisted entry
+        // (here the real TransferEngine.cpp layout) carries TWO occurrences
+        // where the allowlist admits one — the scan must report it with the
+        // allowlisted relative path, not silently admit the extra call.
+        fs::create_directories(negative_root / "src/v2/transfer", ec);
+        {
+            std::ofstream doubled(
+                negative_root / "src/v2/transfer/TransferEngine.cpp");
+            doubled << "void a() { TransferEngine::registerExternalMappedHostRegion(\n"
+                       "void b() { TransferEngine::registerExternalMappedHostRegion(\n";
+        }
+        // Scan only the mirrored allowlisted subtree: the earlier violating/
+        // and clean/ subtrees live beside it and are already covered above.
+        const auto mirrored = externalRegistrationViolations(
+            negative_root / "src", negative_root, allowed, needle);
+        ASSERT_EQ(mirrored.size(), 1u);
+        EXPECT_EQ(mirrored.front().first,
+            fs::path{"src/v2/transfer/TransferEngine.cpp"})
+            << "An over-count inside an allowlisted translation unit must be "
+               "reported by the same validator";
+        fs::remove_all(negative_root, ec);
     }
 
     /**

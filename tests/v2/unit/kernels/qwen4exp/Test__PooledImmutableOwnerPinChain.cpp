@@ -516,7 +516,10 @@ TEST(PooledImmutableOwnerPinChain, ImmutableSetupCapacityUsesOriginalDisjointRoo
         CollectorScope() {
             if(const auto* old=std::getenv("LLAMINAR_PERF_STATS_JSON"))enabled=old;
             if(const auto* old=std::getenv("LLAMINAR_PERF_STATS_FILTER"))filter=old;
-            ::setenv("LLAMINAR_PERF_STATS_JSON","1",1);::setenv("LLAMINAR_PERF_STATS_FILTER","immutable_lookup_setup.*",1);
+            // Whole-domain filter: the collector's record-family grammar selects
+            // a domain or an exact "domain.name"; a "domain.*" name wildcard is
+            // not a supported filter form and silently drops every record.
+            ::setenv("LLAMINAR_PERF_STATS_JSON","1",1);::setenv("LLAMINAR_PERF_STATS_FILTER","immutable_lookup_setup",1);
             PerfStatsCollector::reloadConfigurationFromEnvironment();PerfStatsCollector::reset();
         }
         ~CollectorScope() {
@@ -712,6 +715,8 @@ TEST(PooledImmutableCurrentDemand, ActualEndpointRolesRejectForgedPureReaderAndW
 }
 }
 
+#ifdef HAVE_CUDA
+// Uses the compiled CUDA native-kernel factory, like the production PLE builder.
 namespace llaminar2::test {
 /** @test Real factory allocations may differ while complete source/query geometry stays identical. */
 TEST(PooledImmutableCurrentDemand, RealFactoryRegenerationConsumesOriginalFrameAndRejectsPrecisionDrift){
@@ -753,6 +758,7 @@ TEST(PooledImmutableCurrentDemand, RealFactoryRegenerationConsumesOriginalFrameA
     EXPECT_LT(demandPosition(graph,"trunk/terminal"),demandPosition(graph,"L1_ple_gather"));
 }
 }
+#endif // HAVE_CUDA
 
 namespace llaminar2::test {
 /** @test Counted prefill retains original count, sixteen-head expansion and exact graph identity across partial/empty reset records. */

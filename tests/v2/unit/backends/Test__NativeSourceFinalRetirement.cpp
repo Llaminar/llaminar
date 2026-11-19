@@ -57,6 +57,18 @@ public:
    gpu.numa_node=observedNUMANode;
    gpu.free_memory_bytes=original.admission_available_bytes;observed.gpus.push_back(std::move(gpu));
   }
+  // Full-host discovery is visibility only: CUDA:232 is visible in the rank
+  // inventory but never declared by the original source, so the selected-
+  // membership rejection ("did not declare") is exercised against a device
+  // that passes the inventory-membership and locality gates first.
+  DeviceInfo visible;visible.type=DeviceType::CUDA;visible.local_device_id=232;
+  visible.memory_bytes=64u<<20;visible.free_memory_bytes=64u<<20;visible.numa_node=observedNUMANode;
+  observed.gpus.push_back(std::move(visible));
+ }
+ /** @brief Reduce one visible endpoint's NUMA identity to unknown for the separate locality negative. */
+ static void markVisibleEndpointLocalityUnknown(OrchestrationRunner& runner,DeviceId device){
+  for(auto& gpu:runner.cluster_inventory_.ranks.at(static_cast<std::size_t>(runner.plan_.rank)).gpus)
+   if(gpu.type==device.type&&gpu.local_device_id==device.ordinal)gpu.numa_node=-1;
  }
  /** @brief Substitute only the declared source, retaining its independently recorded original rank inventory. */
  static void replaceSource(OrchestrationRunner& runner,const std::shared_ptr<NativeContextPreparation>& source){
@@ -491,8 +503,18 @@ TEST(NativeSourceFinalRetirement, SelectedSourceMembershipAndRankRemainExactAcro
   EXPECT_TRUE(Access::prepareContexts(runner,{devices[0]}))<<runner.lastError();}
  {OrchestrationRunner runner(OrchestrationConfig{},nullptr);Access::sourceObservation(runner,source,ImmutableRowTablePolicy{.storage=ImmutableRowStoragePreference::RAM});
   EXPECT_FALSE(Access::prepareContexts(runner,{DeviceId::cuda(232)}));
-  EXPECT_NE(runner.lastError().find("selected GPU is absent from the original rank inventory"),std::string::npos)
-      << runner.lastError();}
+  EXPECT_NE(runner.lastError().find("did not declare"),std::string::npos);}
+ {OrchestrationRunner runner(OrchestrationConfig{},nullptr);Access::sourceObservation(runner,source,ImmutableRowTablePolicy{.storage=ImmutableRowStoragePreference::RAM});
+  // Separate absent-inventory negative: a device recorded nowhere (not even
+  // as visible discovery) must fail the membership gate with its own error.
+  EXPECT_FALSE(Access::prepareContexts(runner,{DeviceId::cuda(233)}));
+  EXPECT_NE(runner.lastError().find("absent from the original rank inventory"),std::string::npos);}
+ {OrchestrationRunner runner(OrchestrationConfig{},nullptr);Access::sourceObservation(runner,source,ImmutableRowTablePolicy{.storage=ImmutableRowStoragePreference::RAM});
+  // Separate unknown-locality negative: a visible endpoint whose NUMA
+  // identity is unknown must fail the ownership gate, not silently pass.
+  Access::markVisibleEndpointLocalityUnknown(runner,DeviceId::cuda(232));
+  EXPECT_FALSE(Access::prepareContexts(runner,{DeviceId::cuda(232)}));
+  EXPECT_NE(runner.lastError().find("GPU ownership requires matching observed NUMA locality"),std::string::npos);}
  {OrchestrationRunner runner(OrchestrationConfig{},nullptr);Access::sourceObservation(runner,source,ImmutableRowTablePolicy{.storage=ImmutableRowStoragePreference::RAM},1);
   EXPECT_FALSE(Access::prepareContexts(runner,{devices[0]}));
   EXPECT_NE(runner.lastError().find("crossed original physical ranks"),std::string::npos);}

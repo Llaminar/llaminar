@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include <utility>
 #include <vector>
 #include <unordered_map>
 #include <string>
@@ -27,7 +28,8 @@ namespace llaminar2
         int node_id;              ///< NUMA node ID (0-indexed)
         std::vector<int> cpu_ids; ///< CPUs in this NUMA node
         size_t memory_bytes;      ///< Total memory on this node
-        int socket_id;            ///< Physical socket this node belongs to
+        int socket_id;            ///< Dense socket index in [0, numSockets())
+        int physical_package_id = -1; ///< Raw sysfs physical_package_id (firmware numbering)
     };
 
     /**
@@ -70,6 +72,22 @@ namespace llaminar2
          */
         static std::vector<int> parseCPUListString(const std::string &cpu_list_str);
 
+        /**
+         * @brief Enumerate CPU-bearing NUMA nodes under one sysfs node root.
+         * @param node_root Directory holding nodeN entries, normally
+         *        /sys/devices/system/node.
+         * @return Nodes with at least one CPU, in ascending node id. CPU-less
+         *         memory nodes (GPU/CXL memory on Grace) are not CPU endpoints.
+         */
+        static std::vector<NUMANode> detectNUMANodesAt(const std::string &node_root);
+
+        /**
+         * @brief Replace raw firmware package ids with dense socket indices.
+         * @param nodes Detected NUMA nodes whose socket_id holds the raw sysfs
+         *        physical_package_id; on return socket_id is the rank of that id
+         *        among the distinct packages and physical_package_id keeps it.
+         */
+        static void densifySocketIds(std::vector<NUMANode> &nodes);
 
         /**
          * Create topology from explicit configuration (for testing)
@@ -95,10 +113,15 @@ namespace llaminar2
         int numCPUs() const { return total_cpus_; }
 
         /** @return All detected NUMA nodes */
-        const std::vector<NUMANode> &numaNodes() const { return numa_nodes_; }
+        // Lvalue topologies lend their node list; a temporary returns a copy.
+        // `for (auto &n : NodeTopology::detect().numaNodes())` would otherwise
+        // iterate a vector destroyed before the loop body (C++20 range-for).
+        const std::vector<NUMANode> &numaNodes() const & { return numa_nodes_; }
+        std::vector<NUMANode> numaNodes() && { return std::move(numa_nodes_); }
 
         /** @return All detected inter-socket links */
-        const std::vector<InterSocketLink> &interSocketLinks() const { return inter_socket_links_; }
+        const std::vector<InterSocketLink> &interSocketLinks() const & { return inter_socket_links_; }
+        std::vector<InterSocketLink> interSocketLinks() && { return std::move(inter_socket_links_); }
 
         // =========================================================================
         // Queries

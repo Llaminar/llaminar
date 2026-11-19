@@ -137,9 +137,7 @@ namespace llaminar2
                 require(observation.prepared_bytes > 0 && observation.phases.size() == kPlanningExpertStartupPhases.size(), "incomplete prepared service");
                 if constexpr (cpu)
                     require(observation.worker_threads > 0 &&
-                        observation.isa >= ISALevel::Scalar && observation.isa <= ISALevel::AVX512 &&
-                        observation.compiled_isa >= ISALevel::AVX2 && observation.compiled_isa <= ISALevel::AVX512 &&
-                        observation.isa <= observation.compiled_isa, "invalid CPU worker/ISA identity");
+                        isNativeCPUExecutionISAPair(observation.compiled_isa, observation.isa), "invalid CPU worker/ISA identity");
                 for (size_t i = 0; i < observation.phases.size(); ++i)
                 {
                     const auto &phase = observation.phases[i];
@@ -216,8 +214,8 @@ namespace llaminar2
                 require(scope.is_object() && scope.size() == 3, "invalid CPU execution scope");
                 result = PlanningCPUExpertObservations{device,
                     static_cast<int>(integer(scope.at("workers"), std::numeric_limits<int>::max())),
-                    static_cast<ISALevel>(integer(scope.at("isa"), int(ISALevel::AVX512))),
-                    static_cast<ISALevel>(integer(scope.at("compiled_isa"), int(ISALevel::AVX512))),
+                    static_cast<ISALevel>(integer(scope.at("isa"), int(ISALevel::NEONDotProd))),
+                    static_cast<ISALevel>(integer(scope.at("compiled_isa"), int(ISALevel::NEONDotProd))),
                     description.matrices[0].k, description.matrices[0].n, prepared, description.formats, plan.request(), {}};
             }
             require(wire.at("phases").is_array() && wire.at("phases").size() == kPlanningExpertStartupPhases.size(), "missing service phases");
@@ -240,7 +238,8 @@ namespace llaminar2
         Json cpuExecutionIdentity(const CPUExecutionGeometry &execution)
         {
             return Json::array({execution.cache.private_l2_bytes, execution.cache.shared_l3_bytes,
-                execution.cache.private_l2_ways, execution.cache.shared_l3_ways, execution.maximum_native_row_tile});
+                execution.cache.private_l2_ways, execution.cache.shared_l3_ways, execution.maximum_native_row_tile,
+                static_cast<uint32_t>(execution.projection_abi), int(execution.compiled_isa), int(execution.active_isa)});
         }
 
         /** @brief Authenticate the shared projection ABI without assigning a source identity. */
@@ -252,10 +251,9 @@ namespace llaminar2
             require(bool(value.cpu) == cpu && value.phases.size() == 2, "incomplete projection execution scope");
             if (cpu)
             {
-                require(value.cpu->workers > 0 && value.cpu->isa >= ISALevel::Scalar &&
-                    value.cpu->isa <= ISALevel::AVX512 && value.cpu->compiled_isa >= ISALevel::AVX2 &&
-                    value.cpu->compiled_isa <= ISALevel::AVX512 && value.cpu->isa <= value.cpu->compiled_isa,
-                    "invalid projection CPU workshare/ISA");
+                require(value.cpu->workers > 0 && isNativeCPUExecutionISAPair(value.cpu->compiled_isa, value.cpu->isa) &&
+                    value.cpu->execution.isValid() && value.cpu->compiled_isa == value.cpu->execution.compiled_isa &&
+                    value.cpu->isa == value.cpu->execution.active_isa, "invalid projection CPU workshare/ISA");
                 const bool floating = type == TensorType::FP32 || type == TensorType::FP16 || type == TensorType::BF16;
                 require(floating ? value.prepared_bytes == 0 : value.prepared_bytes > 0,
                     "CPU projection prepared ownership differs from its execution format");
@@ -371,15 +369,18 @@ namespace llaminar2
                 if (cpu)
                 {
                     const auto &scope = wire.at("cpu"), &geometry = scope.at("execution");
-                    require(scope.is_object() && scope.size() == 4 && geometry.is_array() && geometry.size() == 5,
+                    require(scope.is_object() && scope.size() == 4 && geometry.is_array() && geometry.size() == 8,
                         "incomplete projection CPU scope");
                     CPUExecutionGeometry execution{{integer(geometry[0]), integer(geometry[1]),
                         static_cast<uint32_t>(integer(geometry[2], UINT32_MAX)),
                         static_cast<uint32_t>(integer(geometry[3], UINT32_MAX))},
-                        static_cast<uint32_t>(integer(geometry[4], UINT32_MAX))};
+                        static_cast<uint32_t>(integer(geometry[4], UINT32_MAX)),
+                        static_cast<CPUProjectionScheduleABI>(integer(geometry[5], uint32_t(CPUProjectionScheduleABI::ARMRegisterK))),
+                        static_cast<ISALevel>(integer(geometry[6], int(ISALevel::NEONDotProd))),
+                        static_cast<ISALevel>(integer(geometry[7], int(ISALevel::NEONDotProd)))};
                     result.cpu = PlanningProjectionCPUObservation{static_cast<int>(integer(scope.at("workers"), INT_MAX)),
-                        static_cast<ISALevel>(integer(scope.at("isa"), int(ISALevel::AVX512))),
-                        static_cast<ISALevel>(integer(scope.at("compiled_isa"), int(ISALevel::AVX512))), execution};
+                        static_cast<ISALevel>(integer(scope.at("isa"), int(ISALevel::NEONDotProd))),
+                        static_cast<ISALevel>(integer(scope.at("compiled_isa"), int(ISALevel::NEONDotProd))), execution};
                 }
                 require(wire.at("phases").is_array() && wire.at("phases").size() == 2, "missing projection phases");
                 for (const auto &phase : wire.at("phases"))
@@ -472,13 +473,8 @@ namespace llaminar2
                             // Only geometry/workers contribute to scratch. ISA
                             // identity is read on the observing rank, not root.
                             if (device.is_cpu()) cpu = PlanningProjectionCPUObservation{
-                                observed.cpuWorkerThreads(), activeISALevel(),
-#if LLAMINAR_COMPILED_WITH_AVX512
-                                ISALevel::AVX512,
-#else
-                                ISALevel::AVX2,
-#endif
-                                observed.cpu_execution};
+                                observed.cpuWorkerThreads(), observed.cpu_execution.active_isa,
+                                observed.cpu_execution.compiled_isa, observed.cpu_execution};
                             if constexpr (std::is_same_v<std::decay_t<decltype(sample)>, PlanningProjectionServicePlan>)
                             {
                                 if(device.is_gpu())PlanningProjectionMeasurement::contributeGPUParticipantMemory(sample.matrix(),

@@ -10,6 +10,7 @@
 #include "execution/moe/CPUExpertShardSourceSelection.h"
 #include "../../utils/NativeWeightSourceTestRead.h"
 #include "loaders/PreparedWeightIdentityContract.h"
+#include "utils/HostPageSize.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/ExpertPreparedMemoryGeometry.h"
 #include "execution/moe/MoEOverlayPreparedWeightSource.h"
@@ -253,7 +254,11 @@ struct JointOriginalFile {
 /** @test Actual GGUF metadata/loader/frozen materializer retain the one original map and exact selected bytes. */
 TEST(CPUJointPreparedSource, ActualLoaderRetainsOriginalMapAndSelectedNativeBytes) {
  using namespace llaminar2;JointOriginalFile file;
- constexpr size_t H=64,F=80,local_elements=H*F/2,direct_cap=32768;
+ constexpr size_t H=64,F=80,local_elements=H*F/2;
+ // Direct read windows run under a bounded cap of eight whole host pages:
+ // the onNode placement maps anonymous page-rounded roots, so the literal
+ // 32768 (eight 4 KiB pages) could not admit even one unit on a 64 KiB host.
+ const size_t direct_cap=8u*llaminar2::hostPageBytes();
  struct OriginalStartupBudget {
   int previous=mutableDebugEnv().rocm.repack_budget_mb;
   OriginalStartupBudget(){mutableDebugEnv().rocm.repack_budget_mb=1;}
@@ -308,13 +313,29 @@ TEST(CPUJointPreparedSource, ActualLoaderRetainsOriginalMapAndSelectedNativeByte
  const auto direct_memory=std::make_shared<PhysicalMemoryAuthority>(
   std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(direct_budget.build()),0);
  loader.observed_memory=direct_memory;
+ // Bounded-window contract under the eight-whole-host-page cap: the staging
+ // window and its page-rounded physical root stay inside the cap, each
+ // projected expert range fits one staging window in this test's geometry
+ // (it already did under the literal 32768 cap), and the reader issues
+ // exactly the ceil(range/window) windows per projection — so a future cap
+ // or range change that silently alters the chunking fails here
+ // diagnostically. Multi-chunk reader pressure beyond one window per range
+ // is covered by the staged paths, not this direct loop.
+ const auto window_native_bytes=staging.native_bytes;
+ ASSERT_GT(window_native_bytes,0u);
+ ASSERT_LE(staging.physical_bytes,direct_cap);
+ const auto windows_for_front=(projected.front().range.nativeBytes()+window_native_bytes-1)/window_native_bytes;
+ size_t direct_window_calls=0;
  for(const auto& projection:projected) {
-  test::visitNativeSourceForTest(loader,"blk.7.ffn_gate_exps.weight",projection.range,input_quote,placement,
+  const auto windows_for_range=(projection.range.nativeBytes()+window_native_bytes-1)/window_native_bytes;
+  const auto range_calls=test::visitNativeSourceForTest(loader,"blk.7.ffn_gate_exps.weight",projection.range,input_quote,placement,
    direct_memory,DeviceId::cpu(),direct_cap,[&](const auto& window,auto bytes,auto) {
     ASSERT_EQ(bytes.size()%sizeof(float),0u);
     const auto* values=reinterpret_cast<const float*>(bytes.data());
     for(size_t i=0;i<bytes.size()/sizeof(float);++i)EXPECT_EQ(values[i],float(window.original_expert));
    });
+  ASSERT_EQ(range_calls,windows_for_range);
+  direct_window_calls+=range_calls;
   EXPECT_EQ(direct_memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::WeightLoadStaging,
    PhysicalMemoryMaterializationKind::NewAllocation),0u);
  }

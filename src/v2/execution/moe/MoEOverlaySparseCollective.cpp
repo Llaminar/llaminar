@@ -9,6 +9,7 @@
  */
 
 #include "execution/moe/MoEOverlaySparseCollective.h"
+#include "../../utils/OpenMPUtils.h"
 #include "execution/moe/MoEOverlayActivationPacketABI.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
 #include "execution/moe/DeviceMoEOverlayEpochABI.h"
@@ -1068,6 +1069,7 @@ namespace llaminar2
         };
         constexpr size_t parallel_entries=8;
         if(!omp_in_parallel() && count>=parallel_entries) {
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static)
             for(int64_t entry=0;entry<static_cast<int64_t>(count);++entry)write_entry(static_cast<size_t>(entry));
         } else for(size_t entry=0;entry<count;++entry)write_entry(entry);

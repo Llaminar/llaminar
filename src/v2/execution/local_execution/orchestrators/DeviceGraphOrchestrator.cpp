@@ -21,6 +21,7 @@
  */
 
 #include "execution/qwen4exp/PooledImmutableParticipantExecutionPolicy.h"
+#include "../../../utils/OpenMPUtils.h"
 #include "execution/qwen4exp/PooledImmutableLocalHotTransportGeometry.h"
 #include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
@@ -15313,9 +15314,11 @@ namespace llaminar2
         // queried independently below because it is not monotonic in M.
         hints.max_seq_len = workspace_seq_len > 0 ? workspace_seq_len : default_workspace_seq_len;
         hints.graph_family_policy = graph_family_policy;
-        if (graph_family_policy ==
-            WorkspaceGraphFamilyPolicy::
-                SerialDeviceFamilyLargestParticipant)
+        // Both serial-family participant policies publish the family's
+        // largest prefill rows: an exact decode participant may create
+        // generation one (prefix-hit warmup) and must not omit them.
+        if (graph_family_policy !=
+            WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
         {
             const int largest_bucket_rows =
                 state_.activation_seq_len > 0
@@ -61837,15 +61840,29 @@ namespace llaminar2
             TensorBase *gate_exps = legacyTensor(depth.fa_block.moe_gate_exps);
             TensorBase *up_exps = legacyTensor(depth.fa_block.moe_up_exps);
             TensorBase *down_exps = legacyTensor(depth.fa_block.moe_down_exps);
-            if (!gate_exps || !up_exps || !down_exps)
+            /*
+             * CPU model population commits every routed expert (including the
+             * nextn predictor layer) as exact per-expert prepared projections
+             * in the model's ExpertGemmRegistry, consumed through the frozen
+             * static per-expert bindings; no 3D parent remains bound. The
+             * prepared-registry path authenticates that bank instead of
+             * reading a raw parent. A raw parent set is only valid complete.
+             */
+            const auto concrete_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_);
+            const bool any_raw_parent = gate_exps || up_exps || down_exps;
+            if (any_raw_parent && (!gate_exps || !up_exps || !down_exps))
             {
                 LOG_ERROR("[DGO] MTP depth " << depth.depth_index
                                              << " has partial MoE expert tensor bindings; refusing lazy raw fallback");
                 return false;
             }
-
-            const auto &shape = gate_exps->shape();
-            if (shape.size() != 3 || shape[1] == 0)
+            if (!any_raw_parent && (!concrete_manager || cfg.moe.intermediate_size <= 0))
+            {
+                LOG_ERROR("[DGO] MTP depth " << depth.depth_index
+                                             << " has no raw MoE expert parents and no prepared CPU expert registry");
+                return false;
+            }
+            if (any_raw_parent && (gate_exps->shape().size() != 3 || gate_exps->shape()[1] == 0))
             {
                 LOG_ERROR("[DGO] MTP depth " << depth.depth_index
                                              << " MoE gate expert tensor must be 3D [cols, rows, experts]");
@@ -61859,7 +61876,9 @@ namespace llaminar2
             params.d_model = cfg.d_model;
             params.expert_intermediate = cfg.moe.intermediate_size > 0
                                              ? cfg.moe.intermediate_size
-                                             : static_cast<int>(shape[1]);
+                                             : static_cast<int>(gate_exps->shape()[1]);
+            if (concrete_manager)
+                params.expert_registry = &concrete_manager->expertGemmRegistry();
             params.layer_idx = depth.source_layer_index >= 0
                                    ? depth.source_layer_index
                                    : cfg.n_layers + depth.depth_index;
@@ -62100,6 +62119,7 @@ namespace llaminar2
         std::atomic<int> applied{0};
         const int n = static_cast<int>(moe_stages.size());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < n; ++i)
         {

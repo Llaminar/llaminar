@@ -241,7 +241,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/local_execution/device/DeviceContext.cpp", "ROCmDeviceContext::copyToDevice", "backend_sync_copy", 1),
         ("src/v2/execution/local_execution/device/DeviceContext.cpp", "ROCmDeviceContext::copyToHost", "backend_sync_copy", 1),
         ("src/v2/execution/local_execution/device/DeviceContext.cpp", "ROCmDeviceContext::synchronize", "backend_device", 1),
-        ("src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu", "cudaFlashAttn_synchronize", "raw_device", 1),
+        ("src/v2/kernels/cuda/attention/CUDAFlashAttentionShardImpl.cu.inc", "cudaFlashAttn_synchronize", "raw_device", 1),
         ("src/v2/kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu", "cudaGDN_stream_synchronize", "raw_stream", 1),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu", "cudaQuantGemm_streamSync", "raw_device", 1),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu", "cudaQuantGemm_streamSync", "raw_stream", 1),

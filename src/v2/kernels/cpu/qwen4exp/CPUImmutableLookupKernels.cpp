@@ -5,7 +5,10 @@
  * Immutable table gather remains the RAM/mmap I/O authority. This kernel only
  * widens live gathered native rows, parallelizing contiguous output blocks in
  * the caller's nested-safe CPU team. Each value is independent of batch size,
- * worker count, and output partitioning.
+ * worker count, and output partitioning. Floating/IQ4 SIMD leaves retain original
+ * source words/codebooks; incomplete logical rows never reinterpret physical
+ * padding as another row. Checked synchronous borrows do not prove capacity or
+ * extend storage leases, and empty retained invocations still complete their team.
  */
 #include "../../qwen4exp/ImmutableLookupKernels.h"
 #include "../../qwen4exp/ImmutableLookupDecode.h"
@@ -13,8 +16,14 @@
 #include "../../../utils/OpenMPUtils.h"
 #include "../../../utils/CPUFeatures.h"
 #include <algorithm>
+#include <bit>
 #include <cstring>
+#if LLAMINAR_COMPILED_WITH_NEON
+#include "../../../tensors/NEONFP16.h"
+#include "../../../tensors/NEONFP32.h"
+#elif defined(__AVX2__) || defined(__AVX512F__)
 #include <immintrin.h>
+#endif
 #include <limits>
 #include <stdexcept>
 
@@ -22,16 +31,36 @@ namespace llaminar2::qwen4exp
 {
 namespace
 {
-/** @brief Bind the canonical process-lifetime CPU IQ codebooks without copying them. */
+/** @brief Bind the canonical process-lifetime CPU IQ codebooks without copying them.
+ * @return Original immutable table roots, with no decoded or duplicated coefficient bank.
+ */
 NativeEmbeddingIQTables tables()
 {
     return {iq3s_grid,iq3xxs_grid,iq2s_grid,iq2xs_grid,iq2xxs_grid,iq1s_grid};
 }
-/** @brief Expand original floating rows in native vectors, preserving original NaN payload bits. */
+/** @brief Admit the canonical selected ISA without an automatic scalar substitution.
+ * @return Explicit diagnostic scalar or one native implementation compiled for this architecture.
+ * @throws std::runtime_error For a foreign or uncompiled native instruction program.
+ */
+ISALevel lookupISA()
+{
+    static_assert(std::endian::native==std::endian::little,
+        "Immutable lookup SIMD requires the original little-endian native source ABI");
+    const auto isa=activeISALevel();
+    if(isa!=ISALevel::Scalar&&!isNativeCPUExecutionISAPair(compiledCPUISALevel(),isa))
+        throw std::runtime_error("Immutable lookup CPU decode has no matching compiled native ISA");
+    return isa;
+}
+/** @brief Expand original floating rows in native vectors, preserving original NaN payload bits.
+ * @tparam Format Original FP32/FP16/BF16 physical representation.
+ * @param source Complete original tightly packed floating rows.
+ * @param size Exact live scalar count; physical row strides have already been authenticated.
+ * @param output Caller-owned disjoint FP32 publication, with no intermediate converted bank.
+ */
 template<TensorType Format>
 void floatingRows(const std::byte *source,std::size_t size,float *output)
 {
-    const auto isa=activeISALevel();
+    const auto isa=lookupISA();
     auto work=[&] {
 #pragma omp for schedule(static)
         for(std::size_t begin=0;begin<size;begin+=256)
@@ -45,6 +74,17 @@ void floatingRows(const std::byte *source,std::size_t size,float *output)
             else
             {
                 const auto *words=reinterpret_cast<const std::uint16_t *>(source);
+#if LLAMINAR_COMPILED_WITH_NEON
+                if(isa==ISALevel::NEON||isa==ISALevel::NEONDotProd)
+                    for(;index+4<=end;index+=4)
+                    {
+                        const auto packed=vld1_u16(words+index);
+                        if constexpr(Format==TensorType::BF16)
+                            vst1q_f32(output+index,vreinterpretq_f32_u32(vshlq_n_u32(vmovl_u16(packed),16)));
+                        else
+                            vst1q_f32(output+index,neon_fp16::widen(packed));
+                    }
+#endif
 #if defined(__AVX512F__)
                 if(isa==ISALevel::AVX512)
                     for(;index+16<=end;index+=16)
@@ -93,52 +133,112 @@ void floatingRows(const std::byte *source,std::size_t size,float *output)
     };
     OMP_WORKSHARE_REGION(work);
 }
-/** @brief Decode a complete IQ4_NL block once, amortizing original scale widening across thirty-two values.
- * @details Byte shuffles select the exact signed integer source grid. AVX2 and
- * AVX512 widen those same integers before one binary32 multiplication; SIMD
- * boundaries never change a value's arithmetic or depend on grouped row count.
+/** @brief Decode original IQ4 blocks without publishing padded coordinates as live rows.
+ * @param source Contiguous complete physical source blocks, including each row's final padding.
+ * @param width Original logical elements per row, not a rounded block capacity.
+ * @param stride Authenticated complete original row bytes.
+ * @param count Exact live row count.
+ * @param output Disjoint requested live FP32 rows; no decoded intermediate is retained.
+ * @details Register byte lookups select the original signed grid. Each coordinate
+ * receives one FP32 product. Whole physical blocks distribute independently, so
+ * even one long row can use the retained team. Partial rows keep original row
+ * coordinates; scalar remainders are bounded below the native vector width.
  */
-void iq4Rows(const std::byte *source,std::size_t blockCount,float *output)
+void iq4Rows(const std::byte *source,int width,std::size_t stride,std::size_t count,float *output)
 {
-    const auto isa=activeISALevel();const auto *blocks=reinterpret_cast<const IQ4_NLBlock *>(source);
+    const auto isa=lookupISA();const auto *blocks=reinterpret_cast<const IQ4_NLBlock *>(source);
+    const auto blocksPerRow=stride/sizeof(IQ4_NLBlock);
+    const auto blockCount=count*blocksPerRow;
+    const bool completeRows=width%32==0;
     auto work=[&] {
 #pragma omp for schedule(static)
         for(std::size_t b=0;b<blockCount;++b)
         {
-            const auto &block=blocks[b];auto *destination=output+b*32;
+            // The common complete-row path needs no row division. A partial
+            // physical final block never spills its padded codes into the next
+            // logical row, including widths smaller than one source block.
+            const auto column=completeRows?0:(b%blocksPerRow)*32;
+            const int valid=completeRows?32:std::min<std::size_t>(32,std::size_t(width)-column);
+            auto *destination=output+(completeRows?b*32:(b/blocksPerRow)*width+column);
+            const auto &block=blocks[b];
             const float scale=native_embedding::half(block.d);
-            const auto grid=_mm_setr_epi8(-127,-104,-83,-65,-49,-35,-22,-10,1,13,25,38,53,69,89,113);
-            const auto packed=_mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
-            const auto mask=_mm_set1_epi8(15);
-            const auto low=_mm_shuffle_epi8(grid,_mm_and_si128(packed,mask));
-            const auto high=_mm_shuffle_epi8(grid,_mm_and_si128(_mm_srli_epi16(packed,4),mask));
-#if defined(__AVX512F__)
-            if(isa==ISALevel::AVX512)
+#if LLAMINAR_COMPILED_WITH_NEON
+            if(isa==ISALevel::NEON||isa==ISALevel::NEONDotProd)
             {
-                const auto d=_mm512_set1_ps(scale);
-                _mm512_storeu_ps(destination,_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(low)),d));
-                _mm512_storeu_ps(destination+16,_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(high)),d));
+                const auto packed=vld1q_u8(block.qs),mask=vdupq_n_u8(15);
+                const auto grid=vld1q_s8(kvalues_iq4nl_i8);
+                auto low=vqtbl1q_s8(grid,vandq_u8(packed,mask));
+                auto high=vqtbl1q_s8(grid,vshrq_n_u8(packed,4));
+                const auto d=vdupq_n_f32(scale);
+                int c=0;
+                for(;c+4<=valid;c+=4)
+                {
+                    const auto codes=c<16?low:high;
+                    const auto integers=vmovl_s16(vget_low_s16(vmovl_s8(vget_low_s8(codes))));
+                    vst1q_f32(destination+c,neon_fp32::multiply(d,vcvtq_f32_s32(integers)));
+                    if(c<16)low=vextq_s8(low,low,4);else high=vextq_s8(high,high,4);
+                }
+                for(;c<valid;++c)destination[c]=native_embedding::decode<TensorType::IQ4_NL>(&block,c,{});
                 continue;
             }
+#endif
+#if defined(__AVX2__) || defined(__AVX512F__)
+            if(isa==ISALevel::AVX2||isa==ISALevel::AVX512)
+            {
+                const auto grid=_mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl_i8));
+                const auto packed=_mm_loadu_si128(reinterpret_cast<const __m128i *>(block.qs));
+                const auto mask=_mm_set1_epi8(15);
+                const auto low=_mm_shuffle_epi8(grid,_mm_and_si128(packed,mask));
+                const auto high=_mm_shuffle_epi8(grid,_mm_and_si128(_mm_srli_epi16(packed,4),mask));
+#if defined(__AVX512F__)
+                if(isa==ISALevel::AVX512)
+                {
+                    const auto d=_mm512_set1_ps(scale);
+                    const auto first=static_cast<__mmask16>(valid>=16?0xffffu:(1u<<valid)-1u);
+                    _mm512_mask_storeu_ps(destination,first,_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(low)),d));
+                    if(valid>16)
+                    {
+                        const auto last=static_cast<__mmask16>((1u<<(valid-16))-1u);
+                        _mm512_mask_storeu_ps(destination+16,last,_mm512_mul_ps(_mm512_cvtepi32_ps(_mm512_cvtepi8_epi32(high)),d));
+                    }
+                    continue;
+                }
 #endif
 #if defined(__AVX2__)
-            if(isa>=ISALevel::AVX2)
-            {
                 const auto d=_mm256_set1_ps(scale);
-                _mm256_storeu_ps(destination,_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(low)),d));
-                _mm256_storeu_ps(destination+8,_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(low,8))),d));
-                _mm256_storeu_ps(destination+16,_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(high)),d));
-                _mm256_storeu_ps(destination+24,_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(high,8))),d));
+                const auto write=[&]<int Offset>(__m128i codes)
+                {
+                    if(valid<=Offset)return;
+                    const auto result=_mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(codes)),d);
+                    if(valid>=Offset+8)_mm256_storeu_ps(destination+Offset,result);
+                    else
+                    {
+                        const auto lanes=_mm256_setr_epi32(0,1,2,3,4,5,6,7);
+                        const auto live=_mm256_cmpgt_epi32(_mm256_set1_epi32(valid-Offset),lanes);
+                        _mm256_maskstore_ps(destination+Offset,live,result);
+                    }
+                };
+                write.template operator()<0>(low);
+                write.template operator()<8>(_mm_srli_si128(low,8));
+                write.template operator()<16>(high);
+                write.template operator()<24>(_mm_srli_si128(high,8));
                 continue;
+#endif
             }
 #endif
-            for(int column=0;column<32;++column)
+            // Only explicit scalar intent reaches a complete scalar block.
+            for(int column=0;column<valid;++column)
                 destination[column]=native_embedding::decode<TensorType::IQ4_NL>(&block,column,{});
         }
     };
     OMP_WORKSHARE_REGION(work);
 }
-/** @brief Distribute contiguous requested output blocks through the existing CPU team. */
+/** @brief Distribute original coordinates for formats with the shared scalar source decoder.
+ * @tparam Format Unchanged original quantized representation.
+ * @param width Exact live row elements; @param stride Complete physical row bytes.
+ * @param rows Caller-owned original rows; @param count Live row count.
+ * @param output Disjoint requested FP32 rows, not a cached decoded mirror.
+ */
 template<TensorType Format>
 void decodeRows(int width,std::size_t stride,const std::byte *rows,std::size_t count,float *output)
 {
@@ -152,6 +252,15 @@ void decodeRows(int width,std::size_t stride,const std::byte *rows,std::size_t c
     OMP_WORKSHARE_REGION(work);
 }
 } // namespace
+/** @brief Authenticate original row publications, then execute their declared CPU decoder.
+ * @param format Original source encoding; @param width Positive logical row elements.
+ * @param stride Exact complete physical row bytes, including a partial final source block.
+ * @param rows Caller-owned original live rows; @param count Exact live row count.
+ * @param output Caller-owned disjoint FP32 publication.
+ * @throws std::invalid_argument For malformed geometry, missing/wrapping extents or intersections.
+ * @details All checks precede retained-team admission/completion. Zero work
+ * rendezvous creates no standalone team; no source/output scan follows release.
+ */
 void decodeCPUImmutableLookupRows(TensorType format,int width,std::size_t stride,
     const std::byte *rows,std::size_t count,float *output)
 {
@@ -160,18 +269,20 @@ void decodeCPUImmutableLookupRows(TensorType format,int width,std::size_t stride
        count>std::numeric_limits<std::size_t>::max()/stride||(!rows&&count)||(!output&&count)||
        (reinterpret_cast<const void *>(rows)==output&&count))
         throw std::invalid_argument("Immutable lookup CPU decode has invalid live extent or aliased storage");
-    if(!count)return;
     const auto nativeBytes=count*stride,outputBytes=count*static_cast<std::size_t>(width)*sizeof(float);
     const auto nativeAddress=reinterpret_cast<std::uintptr_t>(rows),outputAddress=reinterpret_cast<std::uintptr_t>(output);
     if(nativeAddress>std::numeric_limits<std::uintptr_t>::max()-nativeBytes||
        outputAddress>std::numeric_limits<std::uintptr_t>::max()-outputBytes||
        (nativeAddress<outputAddress+outputBytes&&outputAddress<nativeAddress+nativeBytes))
         throw std::invalid_argument("Immutable lookup native source and decoded output overlap");
+    // Reject malformed geometry/aliases before the completion edge; never
+    // inspect caller-owned publications again after the team releases them.
+    if(!::llaminar::v2::beginWorkshare(count!=0))return;
     const auto size=count*static_cast<std::size_t>(width);
     if(format==TensorType::FP32)return floatingRows<TensorType::FP32>(rows,size,output);
     if(format==TensorType::FP16)return floatingRows<TensorType::FP16>(rows,size,output);
     if(format==TensorType::BF16)return floatingRows<TensorType::BF16>(rows,size,output);
-    if(format==TensorType::IQ4_NL)return iq4Rows(rows,size/32,output);
+    if(format==TensorType::IQ4_NL)return iq4Rows(rows,width,stride,count,output);
     switch(format)
     {
 #define QFN_DECODE_CASE(F) case TensorType::F:return decodeRows<TensorType::F>(width,stride,rows,count,output);

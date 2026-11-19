@@ -18,18 +18,23 @@ def owned_record_files(allocation_root, library, architectures, producer):
     """Reuse original output-derived paths and bind every partition to its proof.
 
     The parent has authenticated the final-allocation report against this DSO
-    and receipt. This narrower audit must consume the same configuration and
-    all eight object partitions per target; neither legacy names nor unrelated
-    matching files can substitute for a missing current output.
+    and receipt. An installed DSO is a copy, not a pathname alias of the linker
+    output: bind both files to the parent's exact digest while retaining the
+    original configuration and all eight object partitions per target. Neither
+    legacy names nor unrelated files may replace missing current evidence.
     """
     spec = json.loads((allocation_root / "configuration.json").read_text())
     require(spec.get("schema") == 1 and spec.get("architectures") == architectures and
             producer.get("resource_evidence_complete") is True and
             producer.get("architectures") == architectures,
             "Owned-entry audit changed its original final-allocation configuration")
-    require(Path(spec["library"]).resolve(strict=True) == library.resolve(strict=True) and
-            Path(spec["record_root"]).resolve(strict=True) == allocation_root.resolve(strict=True),
+    require(Path(spec["record_root"]).resolve(strict=True) == allocation_root.resolve(strict=True),
             "Owned-entry records belong to a different original output")
+    expected_digest = producer.get("library_sha256")
+    require(isinstance(expected_digest, str) and re.fullmatch(r"[0-9a-f]{64}", expected_digest) and
+            hashlib.sha256(Path(spec["library"]).read_bytes()).hexdigest() == expected_digest and
+            hashlib.sha256(library.read_bytes()).hexdigest() == expected_digest,
+            "Owned-entry original and selected libraries differ from the authenticated output")
     artifact_path = Path(__file__).resolve().parents[1] / "llvm-lto-linker/artifact.py"
     entry = importlib.util.spec_from_file_location("owned_rccl_record_authority", artifact_path)
     artifact = importlib.util.module_from_spec(entry)

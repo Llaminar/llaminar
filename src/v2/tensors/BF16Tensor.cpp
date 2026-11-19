@@ -8,6 +8,7 @@
  */
 
 #include "TensorClasses.h"
+#include "../utils/OpenMPUtils.h"
 #include "../kernels/KernelFactory.h"
 #include "../utils/Logger.h"
 #include "../utils/BFloat16.h"
@@ -306,6 +307,7 @@ namespace llaminar2
         }
 
         // Convert BF16 → FP32 with OpenMP parallelization for large tensors
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (count > 10000)
         for (size_t i = 0; i < count; ++i)
         {
@@ -418,6 +420,7 @@ namespace llaminar2
         const size_t chunk_size = 4096;
         const size_t num_chunks = (count + chunk_size - 1) / chunk_size;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < num_chunks; ++i)
         {
@@ -440,6 +443,7 @@ namespace llaminar2
         const uint16_t *src = bf16_data();
 
 // BF16 → FP32 → FP16 (two-step conversion)
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -457,6 +461,7 @@ namespace llaminar2
 
         const size_t num_blocks = (total_elements + block_size - 1) / block_size;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
         {
@@ -633,6 +638,7 @@ namespace llaminar2
 
         const uint16_t *src_data = bf16_data();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel
         {
             // Per-thread buffer to avoid repeated allocations
@@ -733,6 +739,7 @@ namespace llaminar2
 
         uint16_t *dst = is_view_ ? (parent_data_ptr_->data() + view_offset_) : host_bf16_data_.data();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel
         {
             std::vector<float> row_buffer(static_cast<size_t>(cols));
@@ -838,6 +845,7 @@ namespace llaminar2
         Q8_1Block *all_blocks = reinterpret_cast<Q8_1Block *>(q8_1_buffer);
         const uint16_t *bf16_data = host_bf16_data_.data();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel
         {
             // Parallelize over rows for large M, or collapse(2) for small M

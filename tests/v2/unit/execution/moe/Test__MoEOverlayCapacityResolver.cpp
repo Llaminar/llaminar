@@ -29,6 +29,8 @@
 #include "tensors/NativeQuantisedFormatInfo.h"
 
 #include <gtest/gtest.h>
+#include "utils/HostPageSize.h"
+#include <unistd.h>
 
 #include <algorithm>
 #include <array>
@@ -102,8 +104,7 @@ namespace llaminar2
     namespace
     {
         constexpr std::size_t kGpuAlignment = 256;
-        constexpr std::size_t kCpuCacheLine = 64;
-        constexpr std::size_t kCpuPage = 4096;
+        const std::size_t kCpuPage = llaminar2::hostPageBytes();
 
         /** @return `value` rounded to one power-of-two test alignment. */
         [[nodiscard]] constexpr std::size_t testAlignUp(
@@ -215,9 +216,11 @@ namespace llaminar2
             const std::size_t units =
                 (padded_n / 64) * static_cast<std::size_t>(spec.K / 32);
             const std::size_t logical = units * expectedCpuStride(format);
-            return testAlignUp(
-                logical,
-                logical >= kCpuPage ? kCpuPage : kCpuCacheLine);
+            // Production cpuProjectionBytes passes hostPageBytes() as the
+            // minimum AlignedVector alignment of every CPU expert projection
+            // (NUMAAllocator::externalRangeAlignment), so even a projection
+            // below one host page rounds up to a whole host page.
+            return testAlignUp(logical, kCpuPage);
         }
 
         /** @return Independently expected separated GPU projection allocation. */
@@ -651,10 +654,20 @@ namespace llaminar2
             if (source.quant_type == "IQ4_XS")
             {
                 // N/K are gate96x64, up80x96, down64x128. Independent64-row
-                // CPU padding/page rounding gives8192+12288+8192 bytes.
-                // Independent256-byte GPU region alignment gives4096+4864+5120.
-                EXPECT_EQ(expected.cpu_live_bytes, 28672u);
-                EXPECT_EQ(expected.cpu_shadow_bytes, 28672u);
+                // CPU padding gives superblock-stride 1408 logical bytes of
+                // gate 4x1408=5632, up 6x1408=8448, down 4x1408=5632; the
+                // production CPU contract passes hostPageBytes() as every
+                // projection's minimum AlignedVector alignment, so each
+                // rounds up to whole host pages (8192+12288+8192 on a
+                // 4 KiB host, one page each on a 64 KiB host). The
+                // independent 256-byte GPU region alignment is page-size
+                // independent and stays 4096+4864+5120.
+                const auto page_round = [](std::size_t logical)
+                { return testAlignUp(logical, kCpuPage); };
+                EXPECT_EQ(expected.cpu_live_bytes,
+                    page_round(4u * 1408u) + page_round(6u * 1408u) +
+                    page_round(4u * 1408u));
+                EXPECT_EQ(expected.cpu_shadow_bytes, expected.cpu_live_bytes);
                 EXPECT_EQ(expected.gpu_live_bytes, 14080u);
             }
             EXPECT_EQ(actual[0].layer_idx, 0);
@@ -1908,6 +1921,9 @@ namespace llaminar2
 
     }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
     TEST(MoEOverlayLocalCapacityPlanner,
          NodeLocalActivationBOMPricesExactRootTargetAndMTPFamilyLanes)
     {
@@ -2189,6 +2205,7 @@ namespace llaminar2
             budgetFor(DeviceId::cuda(1)).fixedBytes(),
             captured_graph_bytes);
     }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
     TEST(MoEOverlayLocalCapacityPlanner,
          HostAuthoritySeparatesCompilationUnitsFromResidentExecutables)
@@ -2526,6 +2543,9 @@ namespace llaminar2
                 .empty());
     }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
     /**
      * @brief Reproduce the replicated-dense preflight/runtime byte mismatch.
      *
@@ -2731,6 +2751,7 @@ namespace llaminar2
             }
         }
     }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
     /**
      * @test Setup probes must not interpret source matrices owned by another stage.
@@ -2861,6 +2882,9 @@ namespace llaminar2
 
     }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
     TEST(MoEOverlayLocalCapacityPlanner,
          GroupsContinuationAndEndpointFixedBytesByBoundPhysicalResource)
     {
@@ -3125,6 +3149,7 @@ namespace llaminar2
 
 
     }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
     TEST(MoEOverlayLocalCapacityPlanner,
          ColocatedCpuWorkspaceCountsEveryConcurrentGpuGraphOwner)
@@ -3397,6 +3422,9 @@ namespace llaminar2
         EXPECT_FALSE(one_byte_short.fits());
     }
 
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
     TEST(MoEOverlayLocalCapacityPlanner,
          SmallerCapturedGraphCandidateCanRestoreCompleteExpertCoverage)
     {
@@ -3582,6 +3610,7 @@ namespace llaminar2
             (std::vector<int>{3, 3}));
 
     }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 
     /** @brief Bulk mandatory quotas match an independent per-copy cyclic billing oracle. */
     TEST(MoEOverlayCapacityResolver, BulkMandatoryPrefixMatchesSerialBillingOracle)

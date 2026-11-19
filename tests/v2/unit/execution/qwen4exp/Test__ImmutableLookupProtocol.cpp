@@ -12,6 +12,7 @@
 #include "kernels/qwen4exp/ImmutableLookupDecode.h"
 #include "loaders/ModelLoader.h"
 #include "utils/OpenMPUtils.h"
+#include "utils/HostPageSize.h"
 #include <gtest/gtest.h>
 #include <algorithm>
 #include <array>
@@ -134,7 +135,7 @@ TEST(ImmutableLookupProtocol, RAMAndMmapExactLiveBytesAcrossRetainedGenerations)
     FixtureFile file;
     for(auto mode:{ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped})
     {
-        const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
+        const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,hostPageBytes(),2);
         auto memory=tableAuthority(ImmutableRowTable::physicalBytes(file.source(),policy));
         WholeProtocolSource table(file.source(),policy, DeviceId::cpu(),memory,ImmutableRowTableHostPlacement::taskPolicy());Lane lane(table);
         std::uint64_t sequence=0,idsTotal=0;
@@ -168,7 +169,7 @@ TEST(ImmutableLookupProtocol, RAMAndMmapExactLiveBytesAcrossRetainedGenerations)
 /** @test Every authenticated field rejects corruption before payload becomes consumable. */
 TEST(ImmutableLookupProtocol, AuthenticationAndExactExtentRejectCorruption)
 {
-    FixtureFile file;const auto policy=ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,4096,2);
+    FixtureFile file;const auto policy=ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,hostPageBytes(),2);
     auto memory=tableAuthority(ImmutableRowTable::physicalBytes(file.source(),policy));
     WholeProtocolSource table(file.source(),policy, DeviceId::cpu(),memory,ImmutableRowTableHostPlacement::taskPolicy());Lane lane(table);
     const std::array<std::int64_t,2> ids{1,2};lane.publish(1,7,ids);
@@ -195,7 +196,7 @@ TEST(ImmutableLookupProtocol, AuthenticationAndExactExtentRejectCorruption)
 /** @test Missing/future ack and premature close cannot free a still-live response slot. */
 TEST(ImmutableLookupProtocol, AckCloseAndInvalidIdsFailClosed)
 {
-    FixtureFile file;const auto policy=ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,4096,2);
+    FixtureFile file;const auto policy=ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,hostPageBytes(),2);
     auto memory=tableAuthority(ImmutableRowTable::physicalBytes(file.source(),policy));
     WholeProtocolSource table(file.source(),policy, DeviceId::cpu(),memory,ImmutableRowTableHostPlacement::taskPolicy());
     {
@@ -362,15 +363,20 @@ struct WindowFile
         char pattern[]="/tmp/qfn-window-observation-XXXXXX";fd=::mkstemp(pattern);
         if(fd<0)throw std::runtime_error("Window observation fixture creation failed");path=pattern;
         for(std::size_t i=0;i<values.size();++i)values[i]=static_cast<float>(i)/32;
-        if(::write(fd,values.data(),sizeof(values))!=sizeof(values))
+        const auto bytes=values.size()*sizeof(float);
+        if(::write(fd,values.data(),bytes)!=static_cast<ssize_t>(bytes))
         {::close(fd);::unlink(path.c_str());throw std::runtime_error("Window observation fixture write failed");}
     }
     /** @brief Remove this source after all ordinary table/mapping owners retire. */
     ~WindowFile(){::close(fd);::unlink(path.c_str());}
-    /** @return Original32-byte F32 rows in three separate4KiB windows. */
+    /** @return Original 32-byte F32 rows spanning three actual host-page windows. */
     ImmutableRowTableSource source() const
-    {return {.path=path,.tensor_name="window.fixture",.rows=257,.row_elements=8,.format=GGUFTensorType::F32};}
-    int fd=-1;std::string path;std::array<float,257*8> values{};
+    {return {.path=path,.tensor_name="window.fixture",.rows=static_cast<std::uint64_t>(2*rowsPerWindow+1),.row_elements=8,.format=GGUFTensorType::F32};}
+    int fd=-1;std::string path;
+    // Preserve three distinct mappings and the partial final window. Scaling
+    // only the mapping policy would collapse the eviction/failure controls.
+    const std::int64_t rowsPerWindow=static_cast<std::int64_t>(hostPageBytes()/32);
+    std::vector<float> values=std::vector<float>(static_cast<std::size_t>(2*rowsPerWindow+1)*8);
 };
 /** @brief Scope only the existing bounded immutable-lookup PerfStats domain. */
 struct WindowEvidence
@@ -399,14 +405,14 @@ TEST(ImmutableLookupProtocol, WindowGatherObservationsDistinguishRAMAndMmapWork)
     WindowFile file;
     for(auto mode:{ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped})
     {
-        const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,1);
+        const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,hostPageBytes(),1);
         WholeProtocolSource table(file.source(),policy,DeviceId::cpu(),tableAuthority(ImmutableRowTable::physicalBytes(file.source(),policy)),ImmutableRowTableHostPlacement::taskPolicy());
-        const std::array<std::int64_t,5> ids{0,0,128,128,256};std::array<std::byte,5*32> destination;
+        const std::array<std::int64_t,5> ids{0,0,file.rowsPerWindow,file.rowsPerWindow,2*file.rowsPerWindow};std::array<std::byte,5*32> destination;
         const auto first=table.gather(ids,destination);
         EXPECT_EQ(first.windowHits,mode==ImmutableRowStorage::RAM?0u:2u);
         EXPECT_EQ(first.windowMisses,mode==ImmutableRowStorage::RAM?0u:3u);
         EXPECT_EQ(first.windowEvictions,mode==ImmutableRowStorage::RAM?0u:2u);
-        const std::array<std::int64_t,1> last{256};std::array<std::byte,32> one;
+        const std::array<std::int64_t,1> last{2*file.rowsPerWindow};std::array<std::byte,32> one;
         const auto next=table.gather(last,one);
         EXPECT_EQ(next.windowHits,mode==ImmutableRowStorage::RAM?0u:1u);
         EXPECT_EQ(next.windowMisses,0u);EXPECT_EQ(next.windowEvictions,0u);
@@ -423,7 +429,7 @@ TEST(ImmutableLookupProtocol, WindowGatherObservationsDistinguishRAMAndMmapWork)
 /** @test Concurrent independent host lanes charge each successful mapping resolution once. */
 TEST(ImmutableLookupProtocol, WindowConcurrentSharedTableWorkBelongsToExactlyOneService)
 {
-    WindowFile file;const auto policy=ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,1);
+    WindowFile file;const auto policy=ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,hostPageBytes(),1);
     WholeProtocolSource table(file.source(),policy,DeviceId::cpu(),tableAuthority(ImmutableRowTable::physicalBytes(file.source(),policy)),ImmutableRowTableHostPlacement::taskPolicy());
     Lane a(table),b(table);std::barrier start(3);std::array<std::exception_ptr,2> failures{};
     const auto serve=[&](Lane &lane,int index,std::int64_t row)
@@ -444,7 +450,7 @@ TEST(ImmutableLookupProtocol, WindowConcurrentSharedTableWorkBelongsToExactlyOne
         }
         catch(...){failures[index]=std::current_exception();}
     };
-    std::thread first(serve,std::ref(a),0,0),second(serve,std::ref(b),1,128);
+    std::thread first(serve,std::ref(a),0,0),second(serve,std::ref(b),1,file.rowsPerWindow);
     start.arrive_and_wait();first.join();second.join();
     for(const auto &failure:failures)if(failure)std::rethrow_exception(failure);
     const auto sa=a.host.stats(),sb=b.host.stats();const auto global=table.stats();
@@ -465,9 +471,9 @@ TEST(ImmutableLookupProtocol, WindowTerminalIntervalsResetWithoutRecountingOther
         RetainedStorageCPUOutcome::Completed,WholeImmutableRowGatherObservation{ImmutableRowStorage::RAM,1,32,{1,0,0}}),std::invalid_argument);
     EXPECT_THROW(recordCPUImmutableLookup(HostImmutableRowMode::WholeMemoryMapped,DeviceId::cpu(),0,0,
         RetainedStorageCPUOutcome::Failed,WholeImmutableRowGatherObservation{ImmutableRowStorage::MemoryMapped,0,0,{0,1,0}}),std::invalid_argument);
-    const auto policy=ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,1);
+    const auto policy=ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,hostPageBytes(),1);
     WholeProtocolSource table(file.source(),policy,DeviceId::cpu(),tableAuthority(ImmutableRowTable::physicalBytes(file.source(),policy)),ImmutableRowTableHostPlacement::taskPolicy());
-    Lane a(table),b(table);const std::array<std::int64_t,2> zero{0,0},middle{128,128},last{256,256};
+    Lane a(table),b(table);const std::array<std::int64_t,2> zero{0,0},middle{file.rowsPerWindow,file.rowsPerWindow},last{2*file.rowsPerWindow,2*file.rowsPerWindow};
     a.publish(1,1,zero);ASSERT_EQ(a.host.poll(1),ImmutableLookupPoll::Completed);a.ack(1);a.close(1);ASSERT_TRUE(a.host.closed(1));
     b.publish(1,1,middle);ASSERT_EQ(b.host.poll(1),ImmutableLookupPoll::Completed);b.ack(1);b.close(1);ASSERT_TRUE(b.host.closed(1));
     RetainedStoragePerfStats pa,pb;
@@ -505,7 +511,7 @@ TEST(ImmutableLookupProtocol, WindowTerminalIntervalsResetWithoutRecountingOther
  *
  * Only the death-test child limits its address space after warming one of two
  * slots and preallocating the channel. Cached row0 copies first; mapping the
- * next4KiB window must fail under RLIMIT_AS. The limit is restored before
+ * next host-page window must fail under RLIMIT_AS. The limit is restored before
  * assertions and ordinary owner destruction. No production fault hook or OS
  * physical-I/O claim is introduced; this is an actual mapping-failure boundary.
  */
@@ -525,11 +531,11 @@ TEST(ImmutableLookupProtocol, WindowFailedPartialGatherDoesNotClaimZeroTableWork
     {
         const auto verify=[]
         {
-            WindowFile file;const auto policy=ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2);
+            WindowFile file;const auto policy=ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,hostPageBytes(),2);
             WholeProtocolSource table(file.source(),policy,DeviceId::cpu(),tableAuthority(ImmutableRowTable::physicalBytes(file.source(),policy)),ImmutableRowTableHostPlacement::taskPolicy());
             std::array<std::byte,32> warm;const std::array<std::int64_t,1> first{0};
             (void)table.gather(first,warm);Lane lane(table);
-            const std::array<std::int64_t,2> ids{0,128};lane.publish(1,1,ids);
+            const std::array<std::int64_t,2> ids{0,file.rowsPerWindow};lane.publish(1,1,ids);
             rlimit saved{};
             if(::getrlimit(RLIMIT_AS,&saved)!=0)throw std::runtime_error("Cannot inspect child RLIMIT_AS");
             auto *file_state=std::fopen("/proc/self/statm","r");unsigned long long pages=0;
@@ -569,7 +575,7 @@ std::shared_ptr<HostImmutableRowProvider> adaptiveProtocolProvider(const Fixture
         ImmutableRowTableExtent::fromNative(src.format,src.rows,src.rowBytes()),ImmutableRowTableTiers::of(tiers),
         ImmutableRowTableResidency::Adaptive,{{{id,ImmutableRowStorage::RAM},0,slots,{}}},
         {id,{0,DeviceId::cuda(0)},{0,DeviceId::rocm(0)}},{},
-        {{id,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,4096,2)}},{},std::nullopt,64);
+        {{id,ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,hostPageBytes(),2)}},{},std::nullopt,64);
     const auto geometry=CpuAdaptiveImmutableRowCacheGeometry::fromLayout(layout,id,64);
     auto memory=std::make_shared<PhysicalMemoryAuthority>(std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(geometry.bom(host)),0);
     return HostImmutableRowProvider::fromAdaptiveCache(CpuAdaptiveImmutableRowCache::create(src,geometry,memory));

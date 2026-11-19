@@ -57,6 +57,9 @@ TEST(PooledImmutableDirectedOwnerProgram,ResetPartialAndPlacementClassReplay){
             EXPECT_NE(original.captureIdentity(),other.captureIdentity());EXPECT_EQ(original.qualificationClass(),other.qualificationClass());
         }
 }
+// Requires a compiled CUDA/ROCm backend family: its subject prices or
+// constructs GPU-native objects that do not exist in a CPU-only build.
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 /** @test Homogeneous owners retain exact native-General semantics and can never mint mapped flat scope. */
 TEST(PooledImmutableDirectedOwnerProgram, NativeGeneralPreservesOriginalGeometryWithoutFlatCertificate)
 {
@@ -92,6 +95,7 @@ TEST(PooledImmutableDirectedOwnerProgram, NativeGeneralPreservesOriginalGeometry
         EXPECT_THROW(q::PooledImmutableDirectedOwnerProgram::declareStorage(unobserved,unobservedPolicy,1),std::invalid_argument);
     }
 }
+#endif // defined(HAVE_CUDA) || defined(HAVE_ROCM)
 TEST(PooledImmutableDirectedOwnerProgram,CompiledRowKeyABIChangesPortableScope){
     const auto [small,smallPolicy]=declare(DeviceId::cuda(0),DeviceId::rocm(0),16,4096);
     const auto [large,largePolicy]=declare(DeviceId::cuda(0),DeviceId::rocm(0),16,0x100000100ULL);

@@ -105,7 +105,7 @@ std::unique_ptr<IImmutableLookupKernels> createROCmImmutableLookupKernels(Device
  * @param rowElements Exact logical elements per native row.
  * @param rowBytes Exact bytes per complete original row.
  * @param nativeRows Caller-owned contiguous live native rows.
- * @param count Exact live lookup row count; zero performs no payload work.
+ * @param count Exact live lookup row count; zero completes the retained team without payload work.
  * @param output Caller-owned FP32 output, count*rowElements elements.
  */
 void decodeCPUImmutableLookupRows(TensorType format,int rowElements,std::size_t rowBytes,

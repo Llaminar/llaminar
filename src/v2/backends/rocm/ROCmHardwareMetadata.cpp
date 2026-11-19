@@ -99,6 +99,7 @@ namespace llaminar2
                     .lds_per_block = properties.sharedMemPerBlock,
                     .total_memory = properties.totalGlobalMem,
                     .last_level_cache = static_cast<std::size_t>(std::max(properties.l2CacheSize, 0)),
+                    .integrated = properties.integrated != 0,
                     .legacy_precision = legacyPrecision(properties.gcnArchName),
                 };
                 static_assert(sizeof(properties.uuid.bytes) == 16);

@@ -18,6 +18,7 @@
  */
 
 #include <gtest/gtest.h>
+#include "utils/HostPageSize.h"
 #include "loaders/ModelLoader.h"
 #include "../../utils/NativeWeightSourceTestRead.h"
 #include "loaders/NativeWeightLoadStaging.h"

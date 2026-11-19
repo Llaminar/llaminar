@@ -7,6 +7,7 @@
  * crossing mapping boundaries, eviction and concurrent clients. Mutation and
  * malformed admission fail before a destination can become partially valid.
  */
+#include "../../utils/HostNUMANodes.h"
 #include "loaders/ImmutableRowTable.h"
 #include "loaders/ModelContext.h"
 #include "planning/ImmutableRowTablePlacementPlanner.h"
@@ -16,6 +17,8 @@
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include "transfer/TransferEngine.h"
 #include <gtest/gtest.h>
+#include "utils/HostPageSize.h"
+#include "../../fixtures/qwen4exp/PooledImmutableFixtureSourceGeometry.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -130,7 +133,7 @@ TEST(ImmutableRowTable, ContiguousGatherRejectsAliasedIdsBeforeAnyMutation)
     for(const auto mode:{ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped})
     {
         SCOPED_TRACE(static_cast<int>(mode));
-        const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
+        const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,llaminar2::hostPageBytes(),2);
         ImmutableRowTable table(src,policy,DeviceId::cpu(),authority(ImmutableRowTable::physicalBytes(src,policy)),
             ImmutableRowTableHostPlacement::taskPolicy());
         for(const std::size_t offset:{0u,8u})
@@ -156,7 +159,7 @@ TEST(ImmutableRowTable, ContiguousGatherAcceptsDisjointAdjacentAndEmptySpans)
     for(const auto mode:{ImmutableRowStorage::RAM,ImmutableRowStorage::MemoryMapped})
     {
         SCOPED_TRACE(static_cast<int>(mode));
-        const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,4096,2);
+        const auto policy=ImmutableRowTableStoragePolicy::forStorage(mode,llaminar2::hostPageBytes(),2);
         ImmutableRowTable table(src,policy,DeviceId::cpu(),authority(ImmutableRowTable::physicalBytes(src,policy)),
             ImmutableRowTableHostPlacement::taskPolicy());
         std::array<std::byte,Rows*RowBytes> disjoint{};table.gather(ids,disjoint);expectRows(file,RowBytes,ids,disjoint);
@@ -209,7 +212,7 @@ TEST(ImmutableRowTable, EveryNativeFormatPreservesBytesInBothModes)
             SCOPED_TRACE(static_cast<int>(format));
             SCOPED_TRACE(static_cast<int>(mode));
             const auto src = source(file, 97, format, 256);
-            const auto policy = ImmutableRowTableStoragePolicy::forStorage(mode, 4096, 2);
+            const auto policy = ImmutableRowTableStoragePolicy::forStorage(mode,llaminar2::hostPageBytes(),2);
             auto memory = authority(ImmutableRowTable::physicalBytes(src, policy));
             ImmutableRowTable table(src, policy, DeviceId::cpu(), memory,ImmutableRowTableHostPlacement::taskPolicy());
             const std::array<std::int64_t, 8> ids{96, 0, 48, 3, 96, 4, 47, 95};
@@ -218,7 +221,11 @@ TEST(ImmutableRowTable, EveryNativeFormatPreservesBytesInBothModes)
             expectRows(file, row_bytes, ids, output);
             EXPECT_EQ(table.stats().copied_bytes, output.size());
             EXPECT_EQ(table.stats().rows, ids.size());
-            EXPECT_LE(table.stats().mapped_virtual_bytes, 8192u);
+            // Each resident window maps at most one whole host page, so the
+            // resident virtual extent is bounded by the policy's window slot
+            // count times the host base page on every supported page size.
+            EXPECT_LE(table.stats().mapped_virtual_bytes,
+                policy.windowCount()*llaminar2::hostPageBytes());
         }
     }
 }
@@ -338,21 +345,30 @@ TEST(ImmutableRowTable, IndexedWindowDirectoryReplaysExactLruAndPhysicalOwnershi
 
 TEST(ImmutableRowTable, MmapCrossWindowRowsAndLruEvictionStayBounded)
 {
-    RowFile file(90, 500);
-    const auto src = source(file, 500);
-    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped, 4096, 2);
+    // The source spans more than two whole host pages of 90-byte codec rows,
+    // so more windows exist than the two LRU slots hold and eviction pressure
+    // is exercised on every supported page size (the literal 500-row source
+    // only crossed one 64 KiB window and could never evict there). Row
+    // IDs stay derived from the page-relative row count.
+    const std::size_t rows=2u*llaminar2::hostPageBytes()/90u+8u;
+    RowFile file(90, rows);
+    const auto src = source(file, rows);
+    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),2);
     const auto planned = ImmutableRowTable::physicalBytes(src, policy);
     auto memory = authority(planned);
     {
         ImmutableRowTable table(src, policy, DeviceId::cpu(), memory,ImmutableRowTableHostPlacement::taskPolicy());
         EXPECT_EQ(table.stats().mapped_virtual_bytes, 0u);
-        const std::array<std::int64_t, 8> ids{45, 0, 45, 200, 499, 45, 1, 200};
+        const std::int64_t a=static_cast<std::int64_t>(rows)/8, b=static_cast<std::int64_t>(rows)/2;
+        const std::array<std::int64_t, 8> ids{a, 0, a, b, static_cast<std::int64_t>(rows)-1, a, 1, b};
         std::vector<std::byte> output(ids.size() * 90);
         for (int replay = 0; replay < 20; ++replay)
         {
             table.gather(ids, output);
             expectRows(file, 90, ids, output);
-            EXPECT_LE(table.stats().mapped_virtual_bytes, 8192u);
+            // Two LRU slots: the resident virtual extent is at most two
+            // whole host pages on every supported page size.
+            EXPECT_LE(table.stats().mapped_virtual_bytes, 2u*llaminar2::hostPageBytes());
         }
         EXPECT_GT(table.stats().window_hits, 0u);
         EXPECT_GT(table.stats().window_evictions, 0u);
@@ -368,7 +384,7 @@ TEST(ImmutableRowTable, InvalidIdsAndExtentsCannotPartiallyPublish)
 {
     RowFile file(90, 4);
     const auto src = source(file, 4);
-    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped, 4096, 1);
+    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),1);
     ImmutableRowTable table(src, policy, DeviceId::cpu(), authority(ImmutableRowTable::physicalBytes(src, policy)),ImmutableRowTableHostPlacement::taskPolicy());
     std::vector<std::byte> output(180, std::byte{0x6a});
     const auto before = output;
@@ -391,7 +407,7 @@ TEST(ImmutableRowTable, ChangedTruncatedAndReplacedFilesFailBeforeReading)
         {
             RowFile file(90, 20);
             const auto src = source(file, 20);
-            const auto policy = ImmutableRowTableStoragePolicy::forStorage(mode, 4096, 1);
+            const auto policy = ImmutableRowTableStoragePolicy::forStorage(mode,llaminar2::hostPageBytes(),1);
             ImmutableRowTable table(src, policy, DeviceId::cpu(), authority(ImmutableRowTable::physicalBytes(src, policy)),ImmutableRowTableHostPlacement::taskPolicy());
             const std::array<std::int64_t, 1> ids{19};
             std::array<std::byte, 90> output{};
@@ -420,7 +436,7 @@ TEST(ImmutableRowTable, AdmissionGeometryAndFileExtentAreAuthenticated)
 {
     RowFile file(90, 20);
     auto src = source(file, 20);
-    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped, 4096, 1);
+    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),1);
     const auto planned = ImmutableRowTable::physicalBytes(src, policy);
     EXPECT_THROW(ImmutableRowTable(src, policy, DeviceId::cpu(), nullptr,ImmutableRowTableHostPlacement::taskPolicy()), std::invalid_argument);
     EXPECT_THROW(ImmutableRowTable(src, policy, DeviceId::cpu(), authority(planned - 1),ImmutableRowTableHostPlacement::taskPolicy()), std::exception);
@@ -437,7 +453,7 @@ TEST(ImmutableRowTable, AdmissionGeometryAndFileExtentAreAuthenticated)
     src = source(file, 20);
     EXPECT_THROW(ImmutableRowTable::physicalBytes(src, ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped, 4097, 1)),
         std::invalid_argument);
-    EXPECT_THROW(ImmutableRowTable::physicalBytes(src, ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped, 4096, 0)),
+    EXPECT_THROW(ImmutableRowTable::physicalBytes(src, ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),0)),
         std::invalid_argument);
 }
 
@@ -445,7 +461,7 @@ TEST(ImmutableRowTable, ConcurrentClientsCannotEvictAnActiveCopy)
 {
     RowFile file(90, 500);
     const auto src = source(file, 500);
-    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped, 4096, 1);
+    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),1);
     ImmutableRowTable table(src, policy, DeviceId::cpu(), authority(ImmutableRowTable::physicalBytes(src, policy)),ImmutableRowTableHostPlacement::taskPolicy());
     std::vector<std::thread> clients;
     for (int client = 0; client < 4; ++client)
@@ -463,7 +479,10 @@ TEST(ImmutableRowTable, ConcurrentClientsCannotEvictAnActiveCopy)
         client.join();
     EXPECT_EQ(table.stats().requests, 80u);
     EXPECT_EQ(table.stats().rows, 240u);
-    EXPECT_LE(table.stats().mapped_virtual_bytes, 4096u);
+    // Single-slot policy: the resident window maps at most one whole host
+    // page on every supported page size.
+    EXPECT_LE(table.stats().mapped_virtual_bytes,
+        policy.windowCount()*llaminar2::hostPageBytes());
 }
 
 /** @test The model/rank facade shares one admitted table and rejects implicit storage changes. */
@@ -479,7 +498,7 @@ TEST(ImmutableRowTable, ModelContextOwnsOneTypedTableAcrossAllLocalConsumers)
     directory.tensors.push_back({.name = "per_layer_token_embd.weight",
         .dimensions = {3, 160}, .type = GGUFTensorType::IQ4_NL,
         .offset = 0, .size_bytes = 270, .split_idx = 0});
-    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped, 4096, 2);
+    const auto policy = ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::MemoryMapped,llaminar2::hostPageBytes(),2);
     const auto selected=hostPlacement(source(file,3),policy);
     auto memory=std::make_shared<PhysicalMemoryAuthority>(
         std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(selected.physical_plan),0);
@@ -494,7 +513,7 @@ TEST(ImmutableRowTable, ModelContextOwnsOneTypedTableAcrossAllLocalConsumers)
     std::array<std::byte,270> output;
     first->gather(ids,output); expectRows(file,90,ids,output);
     const auto other=hostPlacement(source(file,3),
-        ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,4096,2));
+        ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,llaminar2::hostPageBytes(),2));
     EXPECT_THROW(context->prepareImmutableRowTable(*other.placement,memory,{},transfers),std::logic_error);
     // A different locality is a different sealed setup identity even when its
     // mode, source, allocator and every physical byte are otherwise identical.
@@ -510,7 +529,7 @@ TEST(ImmutableRowTable, ModelContextOwnsOneTypedTableAcrossAllLocalConsumers)
 TEST(ImmutableRowTable, WholeHostTaskPolicyPreservesCanonicalAllocator)
 {
     RowFile file(90,3); const auto src=source(file,3);
-    const auto policy=ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,4096,2);
+    const auto policy=ImmutableRowTableStoragePolicy::forStorage(ImmutableRowStorage::RAM,llaminar2::hostPageBytes(),2);
     const auto bytes=ImmutableRowTable::physicalBytes(src,policy);
     auto memory=authority(bytes,DeviceId::cpu());
     ImmutableRowTable table(src,policy,DeviceId::cpu(),memory,
@@ -531,13 +550,14 @@ TEST(ImmutableRowTable, ExplicitNumaPlacementPreservesCanonicalPhysicalOwnership
     for (const auto mode : {ImmutableRowStorage::RAM, ImmutableRowStorage::MemoryMapped})
     {
         const auto src = source(file, 3);
-        const auto policy = ImmutableRowTableStoragePolicy::forStorage(mode, 4096, 2);
+        const auto policy = ImmutableRowTableStoragePolicy::forStorage(mode,llaminar2::hostPageBytes(),2);
         const auto planned = ImmutableRowTable::physicalBytes(src, policy);
         auto memory = authority(planned, DeviceId::cpu());
         {
-            ImmutableRowTable table(src, policy, DeviceId::cpu(), memory,ImmutableRowTableHostPlacement::onNode(1));
+            const int node = llaminar2::test::hostLastNUMANode();
+            ImmutableRowTable table(src, policy, DeviceId::cpu(), memory,ImmutableRowTableHostPlacement::onNode(node));
             EXPECT_EQ(table.hostDevice(), DeviceId::cpu());
-            EXPECT_EQ(table.hostPlacement(), ImmutableRowTableHostPlacement::onNode(1));
+            EXPECT_EQ(table.hostPlacement(), ImmutableRowTableHostPlacement::onNode(node));
             EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ImmutableTableStorage,
                 PhysicalMemoryMaterializationKind::NewAllocation), planned);
             const std::array<std::int64_t, 2> ids{2, 0};
@@ -547,7 +567,11 @@ TEST(ImmutableRowTable, ExplicitNumaPlacementPreservesCanonicalPhysicalOwnership
         }
         EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ImmutableTableStorage,
             PhysicalMemoryMaterializationKind::NewAllocation), 0u);
-        EXPECT_THROW(ImmutableRowTable(src, policy, DeviceId{DeviceType::CPU, 1}, memory,ImmutableRowTableHostPlacement::onNode(1)), std::exception);
+        // The negative node is one past the highest CPU-bearing node: on
+        // every host that node either does not exist or carries no CPU, so
+        // the allocator must reject it regardless of topology shape (a
+        // literal node 1 only rejects on hosts where node 1 has no CPUs).
+        EXPECT_THROW(ImmutableRowTable(src, policy, DeviceId{DeviceType::CPU, 1}, memory,ImmutableRowTableHostPlacement::onNode(llaminar2::test::hostLastNUMANode()+1)), std::exception);
         EXPECT_THROW(ImmutableRowTable(src, policy, DeviceId::cuda(0), memory,ImmutableRowTableHostPlacement::onNode(1)), std::invalid_argument);
     }
 }
@@ -560,6 +584,63 @@ TEST(ImmutableRowTable, ExplicitNumaPlacementPreservesCanonicalPhysicalOwnership
  * are hit/evicted/remapped under one- and two-slot policies without changing
  * the existing descriptor-directory admission or admitting page padding as data.
  */
+/** @test The pooled read-graph fixture geometry forces window eviction on every host page size. */
+TEST(ImmutableRowTable, PooledFixtureGeometryForcesWindowEviction)
+{
+    // Exact pooled-fixture source geometry, taken from the shared authority
+    // PooledImmutableFixtureSourceGeometry.h that the fixture itself uses
+    // for its file sizing, descriptor and window-slot count — this test
+    // cannot drift from the fixture declaration because neither side
+    // restates the values. The 37-prefix + 1000x90-byte source spans two
+    // whole-host-page windows against one slot on every supported page
+    // size, so alternating accesses between the two windows must miss,
+    // evict and remap — asserted with the table's own counters, not
+    // inferred from source-extent arithmetic.
+    using Geometry = llaminar2::test::PooledImmutableFixtureSourceGeometry;
+    static_assert(Geometry::kRowBytes == 90);
+    RowFile file(Geometry::kRowBytes, Geometry::kRows);
+    const auto src = source(file, Geometry::kRows,
+        Geometry::kFormat, Geometry::kRowElements);
+    // Codec binding: the fixture descriptor's row extent must equal the
+    // shared constant, so a codec change cannot desynchronize the mirror.
+    ASSERT_EQ(src.rowBytes(), Geometry::kRowBytes);
+    ASSERT_EQ(src.file_offset, Geometry::kPrefixBytes);
+    const auto policy = ImmutableRowTableStoragePolicy::forStorage(
+        ImmutableRowStorage::MemoryMapped, llaminar2::hostPageBytes(),
+        Geometry::kWindowSlots);
+    const auto planned = ImmutableRowTable::physicalBytes(src, policy);
+    auto memory = authority(planned);
+    ImmutableRowTable table(src, policy, DeviceId::cpu(), memory,
+        ImmutableRowTableHostPlacement::taskPolicy());
+    EXPECT_EQ(table.stats().mapped_virtual_bytes, 0u);
+    // Two window-spanning rows plus a repeat hit and a return, replayed:
+    // per replay one miss on each window, one hit on the repeated row, and
+    // one eviction per window switch after the first.
+    const std::array<std::int64_t, 4> ids{0, 0, 999, 0};
+    std::vector<std::byte> output(ids.size() * 90u);
+    for (int replay = 0; replay < 5; ++replay)
+    {
+        table.gather(ids, output);
+        expectRows(file, 90, ids, output);
+        // One resident slot: the mapped virtual extent is one whole host
+        // page on every supported page size.
+        EXPECT_EQ(table.stats().mapped_virtual_bytes,
+            llaminar2::hostPageBytes());
+    }
+    // Exact replay accounting: the first replay starts with an empty slot
+    // (three misses, one repeat hit, two evictions); every later replay
+    // starts with window zero still resident from the previous replay's
+    // final row-zero access (two misses, two hits, two evictions).
+    EXPECT_EQ(table.stats().window_misses, 11u);
+    EXPECT_EQ(table.stats().window_hits, 9u);
+    EXPECT_EQ(table.stats().window_evictions, 10u);
+    EXPECT_EQ(table.stats().rows, ids.size() * 5);
+    EXPECT_EQ(table.stats().copied_bytes, ids.size() * 5 * 90u);
+    EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(),
+        PhysicalMemoryOwner::ImmutableTableStorage,
+        PhysicalMemoryMaterializationKind::NewAllocation), planned);
+}
+
 TEST(ImmutableRowTable, EndOfFileWindowReportsPageRoundedVirtualExtentWithoutReadablePadding)
 {
     const auto native_page=::sysconf(_SC_PAGESIZE);
@@ -614,7 +695,7 @@ ImmutableRowTablePlacementSelection contextAdaptivePlacement(const ModelMemoryPr
     // geometry even though this source/provider test never executes a GEMM.
     c.device_compute_units=8;c.cpu_execution=test::kSyntheticCPUExecutionGeometry;
     c.max_seq_len=64;c.activation_seq_len=2;c.first_layer=0;c.last_layer=47;
-    c.ngram_execution_policy=ImmutableRowTablePolicy{ImmutableRowStoragePreference::HostAdaptiveRAMSSD,4096,2};
+    c.ngram_execution_policy=ImmutableRowTablePolicy{ImmutableRowStoragePreference::HostAdaptiveRAMSSD,llaminar2::hostPageBytes(),2};
     c.ngram_execution_policy->host_adaptive={maximum_rows,cache_bytes,{.aging_accesses=aging}};
     const std::vector<std::vector<DevicePlanConfig>> groups{{c}};
     const auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,*c.ngram_execution_policy,groups,{},

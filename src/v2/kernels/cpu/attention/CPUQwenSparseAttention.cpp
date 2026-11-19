@@ -7,6 +7,8 @@
  * arithmetic order for every positive worker count and grouped query geometry.
  * The heap stores only 512 block indices; attention reads at most 2051 native
  * cache rows rather than scanning a dense bank and testing a sparse mask.
+ * CPUQwenSparseExecution seals original bindings and executes native fragments;
+ * no selected cache head or weighted-value row is decoded into a FP32 mirror.
  */
 #include "kernels/qwen4exp/QwenSparseQueryRowWork.h"
 #include "../../qwen4exp/QwenSparseReplay.h"
@@ -14,12 +16,14 @@
 #include "kernels/qwen4exp/QwenSparseMath.h"
 #include "kernels/qwen4exp/QwenSparseBoundedSelection.h"
 #include "utils/OpenMPUtils.h"
-#include <atomic>
+#include "CPUQwenSparseExecution.h"
+#include "CPUQwenSparseIndexerProgram.h"
 #include "utils/CPUFeatures.h"
 #include <algorithm>
 #include <array>
 #include <cmath>
-#include <immintrin.h>
+#include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 
@@ -27,86 +31,126 @@ namespace llaminar2::qwen4exp
 {
 namespace
 {
-/** @brief Validate CPU-owned dynamic replay metadata before entering worksharing. */
-void validateReplay(const QwenSparseReplay &r, int rows, int tokens)
+using cpu_sparse::validateReplay;
+using cpu_sparse::validateReplayRoot;
+
+/** @brief Fail canonical counter corruption without throwing through an OpenMP single/barrier.
+ * @param stage Original publication whose checked terminal counter overflowed.
+ */
+[[noreturn]] void counterOverflow(const char*stage)noexcept
 {
-    if (r.prefix_tokens < 0 || r.live_rows < 0 || r.live_rows > rows ||
-        static_cast<std::int64_t>(r.prefix_tokens) + r.live_rows > tokens || r.position_origin < 0 ||
-        static_cast<std::int64_t>(r.position_origin) + r.prefix_tokens + r.live_rows > std::numeric_limits<int>::max())
-        throw std::invalid_argument("CPU Qwen sparse replay: invalid causal prefix or live row count");
+    std::fputs("ERROR: CPU QSA canonical counter overflow in ",stderr);std::fputs(stage,stderr);std::fputc('\n',stderr);std::abort();
 }
 
-/** @brief Fixed AVX lane reduction, independent of the number of query rows. */
-float dot(const float *a, const float *b, int dim, ISALevel isa)
+/** @brief Reject consumed numeric corruption without masking it through ReLU/selection or a collective exception.
+ * @param stage Original producer whose declared finite arithmetic domain failed.
+ */
+[[noreturn]] void invalidNumeric(const char*stage)noexcept
 {
-#if defined(__AVX512F__)
-    if (isa == ISALevel::AVX512)
-    {
-    __m512 sum = _mm512_setzero_ps();
-    for (int d = 0; d < dim; d += 16)
-        sum = _mm512_fmadd_ps(_mm512_loadu_ps(a + d), _mm512_loadu_ps(b + d), sum);
-    alignas(64) float lanes[16];
-    _mm512_store_ps(lanes, sum);
-    for (int width = 8; width; width /= 2)
-        for (int lane = 0; lane < width; ++lane) lanes[lane] += lanes[lane + width];
-    return lanes[0];
-    }
-#endif
-#if defined(__AVX2__)
-    __m256 sum = _mm256_setzero_ps();
-    for (int d = 0; d < dim; d += 8)
-        sum = _mm256_fmadd_ps(_mm256_loadu_ps(a + d), _mm256_loadu_ps(b + d), sum);
-    alignas(32) float lanes[8];
-    _mm256_store_ps(lanes, sum);
-    for (int width = 4; width; width /= 2)
-        for (int lane = 0; lane < width; ++lane) lanes[lane] += lanes[lane + width];
-    return lanes[0];
-#else
-#error "CPU Qwen sparse attention requires the project's AVX2 or AVX512 production ISA"
-#endif
+    std::fputs("ERROR: CPU QSA invalid consumed numeric data in ",stderr);std::fputs(stage,stderr);std::fputc('\n',stderr);std::abort();
 }
 
-/** @brief Resolve the production ISA once per entrypoint; scalar execution is not advertised. */
+/** @brief Resolve the production ISA once per entrypoint; scalar execution is not advertised.
+ * @return Original available compiled/runtime native program.
+ * @throws std::invalid_argument For Scalar, foreign or unavailable execution.
+ */
 ISALevel nativeISA()
 {
     const auto isa = activeISALevel();
-    if (isa != ISALevel::AVX2 && isa != ISALevel::AVX512)
-        throw std::invalid_argument("CPU Qwen sparse attention requires an available AVX2 or AVX512 ISA");
+    ::llaminar2::cpu::qsa_native::requireNativeProgram(isa);
     return isa;
 }
 
-/** @brief Prepare one rounded indexer head with fixed-tree RMSNorm and split-half RoPE. */
+/** @brief Prepare one rounded indexer head with fixed-tree RMSNorm and split-half RoPE.
+ * @param input Original128-coordinate projection or produced pool.
+ * @param weight Original converted128-coordinate normalization weights.
+ * @param position Original absolute RoPE position; @param p Admitted representation/factor policy.
+ * @param output Exclusive prepared head; full same-head input reuse is permitted.
+ * @details Cast boundaries and the128-element FP32 butterfly remain the declared
+ * indexer program. Its produced representation stages are not decoded KV rows.
+ */
 void prepare(const float *input, const float *weight, int position,
              const QwenSparseIndexer &p, float *output)
 {
-    float rounded[128], squares[128], normalized[128];
-    for (int d = 0; d < 128; ++d)
+    // The representation is dispatched once, never once per coordinate. Every
+    // admitted mode owns the same original 128-square tree and cast boundaries.
+    switch(p.representation)
     {
-        rounded[d] = detail::roundRepresentation(input[d], p.representation);
-        squares[d] = rounded[d] * rounded[d];
+    case QwenSparseScalar::FP32:return ::llaminar2::cpu::qsa_native::indexer::prepare<QwenSparseScalar::FP32>(input,weight,position,p,output);
+    case QwenSparseScalar::FP16:return ::llaminar2::cpu::qsa_native::indexer::prepare<QwenSparseScalar::FP16>(input,weight,position,p,output);
+    case QwenSparseScalar::BF16:return ::llaminar2::cpu::qsa_native::indexer::prepare<QwenSparseScalar::BF16>(input,weight,position,p,output);
     }
-    for (int width = 64; width; width /= 2)
-        for (int d = 0; d < width; ++d) squares[d] += squares[d + width];
-    const float inverse = 1.0f / std::sqrt(squares[0] / 128.0f + p.norm_epsilon);
-    for (int d = 0; d < 128; ++d)
-        normalized[d] = detail::roundRepresentation((rounded[d] * inverse) * weight[d], p.representation);
-    const int half = p.rotary_dim / 2;
-    for (int d = 0; d < 128; ++d)
-    {
-        if (d >= p.rotary_dim) { output[d] = normalized[d]; continue; }
-        const int pair = d % half;
-        float cosine,sine;
-        detail::rotaryFactors(p.rotary_source,p.cosine,p.sine,position,pair,p.rotary_dim,p.rope_theta,cosine,sine,p.inverse_frequencies.data());
-        const float c = detail::roundRepresentation(cosine, p.representation);
-        const float s = detail::roundRepresentation(sine, p.representation);
-        const float partner = d < half ? -normalized[d + half] : normalized[d - half];
-        const float first = detail::roundRepresentation(normalized[d] * c, p.representation);
-        const float second = detail::roundRepresentation(partner * s, p.representation);
-        output[d] = detail::roundRepresentation(first + second, p.representation);
-    }
+    ::llaminar2::cpu::qsa_native::rejectProgram();
 }
 
-/** @brief Resolve a transaction-relative raw key without touching future rows. */
+/** @brief Dispatch one original four-row pool to the exact native representation program.
+ * @param raw Original raw128-coordinate roots; no projected operand is copied.
+ * @param weight Original converted key normalization weights.
+ * @param position Original block-start RoPE position; @param p Original admitted policy.
+ * @param output Exclusive prepared128-coordinate pool.
+ */
+void preparePool(const std::array<const float*,4>&raw,const float*weight,int position,const QwenSparseIndexer&p,float*output)noexcept
+{
+    switch(p.representation)
+    {
+    case QwenSparseScalar::FP32:return ::llaminar2::cpu::qsa_native::indexer::preparePool<QwenSparseScalar::FP32>(raw,weight,position,p,output);
+    case QwenSparseScalar::FP16:return ::llaminar2::cpu::qsa_native::indexer::preparePool<QwenSparseScalar::FP16>(raw,weight,position,p,output);
+    case QwenSparseScalar::BF16:return ::llaminar2::cpu::qsa_native::indexer::preparePool<QwenSparseScalar::BF16>(raw,weight,position,p,output);
+    }
+    ::llaminar2::cpu::qsa_native::rejectProgram();
+}
+/** @brief Tie original pool loads to the completed preceding head without changing the root.
+ * @param original Original admitted128-coordinate pool root.
+ * @param completed Completed preceding head sum, or positive zero before head0.
+ * @return The identical original pointer bits, with a compiler-only dependency.
+ * @details Streaming each head's fragments bounds vector liveness instead of
+ * retaining the entire pool across heads. This identity copies no operand and
+ * establishes no allocation, lease, publication or runtime synchronization.
+ */
+[[gnu::always_inline]] inline const float* followScoreHead(const float*original,float completed)noexcept
+{
+#if defined(__aarch64__)
+    asm volatile("" : "+r"(original) : "w"(completed));
+#elif defined(__x86_64__)
+    asm volatile("" : "+r"(original) : "x"(completed));
+#else
+#error "CPU QSA score-head ordering requires a native AArch64 or x86-64 GNU-compatible register ABI"
+#endif
+    return original;
+}
+/** @brief Score the complete original pool frontier for one already-admitted ranking row.
+ * @param query Original produced four-head query row, exactly4*128 coordinates.
+ * @param pools Original persistent128-coordinate pool rows; never a decoded mirror.
+ * @param scores Exclusive original output row for the declared complete pools.
+ * @param blocks Original visible complete-pool count, strictly greater than512.
+ * @param isa Original execution-admitted native arithmetic program.
+ * @details One call covers every block/head in this score phase, not a complete
+ * M1 indexer operation. Keeping its original roots/geometry in value arguments
+ * bounds GPR liveness independently of the caller's selection heap and policy.
+ * No per-dot call, operand copy, allocation or new collective edge is introduced.
+ * Every head retains the declared ordered native FMA chains/fold, finite check,
+ * ReLU, increasing-head addition and final separate FP32 scale.
+ */
+[[gnu::noinline]] void scorePools(const float*query,const float*pools,float*scores,int blocks,ISALevel isa)noexcept
+{
+    for(int block=0;block<blocks;++block)
+    {
+        float score=0.0f;const float*headPool=pools+std::size_t(block)*128;
+        for(int head=0;head<4;++head)
+        {
+            headPool=followScoreHead(headPool,score);
+            const auto value=::llaminar2::cpu::qsa_native::dot<128>(query+std::size_t(head)*128,headPool,isa);
+            if(!std::isfinite(value))invalidNumeric("indexer native score");
+            score+=std::max(0.0f,value);
+        }
+        if(!std::isfinite(score))invalidNumeric("indexer head-score sum");
+        scores[block]=score*0.08838834764831844055f;
+    }
+}
+/** @brief Resolve a transaction-relative raw key without touching future rows.
+ * @param p Original tail/current-projection roots and replay.
+ * @param token Original logical token; @return Exact original raw128-coordinate row.
+ */
 const float *rawKey(const QwenSparseIndexer &p, int token)
 {
     const int prefix = p.replay->prefix_tokens;
@@ -115,101 +159,6 @@ const float *rawKey(const QwenSparseIndexer &p, int token)
         : p.raw_keys + std::size_t(token - prefix) * 128;
 }
 
-/** @brief Decode one selected head with eight-wide native SIMD and canonical packed codes. */
-void readHead(const QwenSparseNativeBank &bank, int physical, int head, detail::BankRole role, float *output)
-{
-    const auto *bytes = static_cast<const unsigned char *>(bank.data) +
-        std::size_t(physical) * bank.token_stride_bytes + std::size_t(head) * bank.head_stride_bytes;
-    switch (bank.codec)
-    {
-    case TensorType::FP32:
-        std::copy_n(reinterpret_cast<const float *>(bytes), 256, output); return;
-    case TensorType::FP16:
-        for (int d = 0; d < 256; d += 8)
-            _mm256_storeu_ps(output + d, _mm256_cvtph_ps(_mm_loadu_si128(reinterpret_cast<const __m128i *>(bytes + d * 2))));
-        return;
-    case TensorType::BF16:
-        for (int d = 0; d < 256; d += 8)
-            _mm256_storeu_ps(output + d, _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(
-                _mm_loadu_si128(reinterpret_cast<const __m128i *>(bytes + d * 2))), 16)));
-        return;
-    case TensorType::Q8_1:
-        for (int block_index = 0; block_index < 8; ++block_index)
-        {
-            const auto &block = reinterpret_cast<const Q8_1Block *>(bytes)[block_index];
-            const auto scale = _mm256_set1_ps(detail::decodeHalf(block.d));
-            for (int d = 0; d < 32; d += 8)
-                _mm256_storeu_ps(output + block_index * 32 + d, _mm256_mul_ps(scale, _mm256_cvtepi32_ps(
-                    _mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.qs + d))))));
-        }
-        return;
-    case TensorType::Q16_1:
-        for (int base = 0; base < 256; base += bank.q16_block_size)
-        {
-            const auto *block = bytes + std::size_t(base / bank.q16_block_size) * (8 + 2 * bank.q16_block_size);
-            const auto scale = _mm256_set1_ps(*reinterpret_cast<const float *>(block));
-            for (int d = 0; d < bank.q16_block_size; d += 8)
-                _mm256_storeu_ps(output + base + d, _mm256_mul_ps(scale, _mm256_cvtepi32_ps(
-                    _mm256_cvtepi16_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i *>(block + 8 + d * 2))))));
-        }
-        return;
-    case TensorType::AQ8:
-    {
-        const auto &block = *reinterpret_cast<const AttentionKeyQ8Block<256> *>(bytes);
-        const auto scale = _mm256_set1_ps(block.quadratic_scale);
-        const auto sign = _mm256_set1_ps(-0.0f);
-        for (int d = 0; d < 256; d += 8)
-        {
-            const auto codes = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(block.codes + d))));
-            const auto residual = _mm256_mul_ps(_mm256_mul_ps(scale, codes), _mm256_andnot_ps(sign, codes));
-            _mm256_storeu_ps(output + d, _mm256_add_ps(residual, _mm256_loadu_ps(bank.anchor + head * 256 + d)));
-        }
-        return;
-    }
-    case TensorType::TQ8: case TensorType::TQ4:
-    {
-        const float source_norm = *reinterpret_cast<const float *>(bytes);
-        if (source_norm < 1e-30f) { std::fill_n(output, 256, 0.0f); return; }
-        const float radius = role == detail::BankRole::Key ? source_norm : reinterpret_cast<const float *>(bytes)[1];
-        const auto scale = _mm256_set1_ps(radius * 0.0625f);
-        for (int d = 0; d < 256; d += 8)
-        {
-            __m256i indices;
-            if (bank.codec == TensorType::TQ8)
-                indices = _mm256_cvtepu8_epi32(_mm_loadl_epi64(reinterpret_cast<const __m128i *>(bytes + 8 + d)));
-            else
-            {
-                std::uint8_t low[8];
-                tq3_unpack_8(bytes + 8 + (d / 8) * 3, low);
-                const unsigned high = bytes[8 + 96 + d / 8];
-                alignas(32) std::int32_t expanded[8];
-                for (int lane = 0; lane < 8; ++lane) expanded[lane] = low[lane] | (((high >> lane) & 1u) << 3);
-                indices = _mm256_load_si256(reinterpret_cast<const __m256i *>(expanded));
-            }
-            _mm256_storeu_ps(output + d, _mm256_mul_ps(_mm256_i32gather_ps(bank.centroids, indices, sizeof(float)), scale));
-        }
-        return;
-    }
-    default: __builtin_unreachable(); // Static admission has already rejected non-KV codecs.
-    }
-}
-
-/** @brief Accumulate one selected value head with a fixed SIMD FMA order. */
-void accumulate(float *output, const float *value, float probability, ISALevel isa)
-{
-#if defined(__AVX512F__)
-    if (isa == ISALevel::AVX512)
-    {
-    const auto scale = _mm512_set1_ps(probability);
-    for (int d = 0; d < 256; d += 16)
-        _mm512_storeu_ps(output + d, _mm512_fmadd_ps(scale, _mm512_loadu_ps(value + d), _mm512_loadu_ps(output + d)));
-        return;
-    }
-#endif
-    const auto scale = _mm256_set1_ps(probability);
-    for (int d = 0; d < 256; d += 8)
-        _mm256_storeu_ps(output + d, _mm256_fmadd_ps(scale, _mm256_loadu_ps(value + d), _mm256_loadu_ps(output + d)));
-}
 /**
  * @brief Select one actual row, preserving the installed heap and exact tail writes.
  * @param p Original persistent score/replay/output bindings.
@@ -225,7 +174,9 @@ bool selectRow(const QwenSparseIndexer &p, int row)
     const int blocks = visible / QwenSparsePool;
     const int keep = std::min(blocks, QwenSparseBlocks);
     auto *selected = p.selected + std::size_t(row) * QwenSparseSelected;
-    const auto *scores = p.scores + std::size_t(row) * p.block_capacity;
+    // No-ranking replay intentionally owns no score bank. Even forming a
+    // nonzero offset from its null root is UB, despite never reading a score.
+    const auto *scores = blocks>QwenSparseBlocks ? p.scores+std::size_t(row)*p.block_capacity : nullptr;
     std::array<std::int32_t, QwenSparseBlocks> heap;
     if (blocks <= QwenSparseBlocks)
         for (int block = 0; block < blocks; ++block) heap[block] = block;
@@ -275,7 +226,10 @@ bool selectRow(const QwenSparseIndexer &p, int row)
     p.selected_count[row] = keep * QwenSparsePool + visible % QwenSparsePool;
     return true;
 }
-/** @brief Fail a stale no-ranking program before any CPU-owned output publication. */
+/** @brief Fail a stale no-ranking program before any CPU-owned output publication.
+ * @param p Original admitted query program and replay.
+ * @throws std::invalid_argument If the original no-ranking horizon is exceeded.
+ */
 void validateQueryProgramReplay(const QwenSparseIndexer &p)
 {
     if (p.query_demand == QwenSparseQueryDemand::ProvenNoRanking &&
@@ -284,8 +238,16 @@ void validateQueryProgramReplay(const QwenSparseIndexer &p)
 }
 } // namespace
 
+/** @brief Prepare original causal pools/queries and select sorted native cache rows.
+ * @param p Existing host-owned replay and admitted projection/pool/selection bindings.
+ * @throws std::invalid_argument Before worksharing for unsupported static policy,
+ * ISA, replay geometry or a stale no-ranking query program.
+ * @details Consumed numeric corruption is fatal inside its owner; it cannot be
+ * masked by ReLU or reported through a worker-local flag after release.
+ */
 void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
 {
+    validateReplayRoot(p.replay);
     validateQwenSparseIndexer(p);
     const auto isa = nativeISA();
     validateReplay(*p.replay, p.row_capacity, p.token_capacity);
@@ -310,16 +272,8 @@ void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
 #pragma omp for schedule(static)
         for (int block = first_block; block < complete_blocks; ++block)
         {
-            float pooled[128];
-            for (int d = 0; d < 128; ++d)
-            {
-                float sum = detail::roundRepresentation(rawKey(p, block * 4)[d], p.representation);
-                for (int member = 1; member < 4; ++member)
-                    sum += detail::roundRepresentation(rawKey(p, block * 4 + member)[d], p.representation);
-                pooled[d] = detail::roundRepresentation(sum * 0.25f, p.representation);
-            }
-            prepare(pooled, p.key_norm, replay.position_origin + block * 4, p,
-                    p.pooled_keys + std::size_t(block) * 128);
+            const std::array<const float*,4>raw{rawKey(p,block*4),rawKey(p,block*4+1),rawKey(p,block*4+2),rawKey(p,block*4+3)};
+            preparePool(raw,p.key_norm,replay.position_origin+block*4,p,p.pooled_keys+std::size_t(block)*128);
         }
 #pragma omp for schedule(static)
         for (int row_head = queryHeads.first; row_head < queryHeads.end; ++row_head)
@@ -329,7 +283,6 @@ void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
     };
     OMP_WORKSHARE_REGION(preparation);
 
-    std::atomic<bool> valid{true};
     auto selection = [&]()
     {
 #pragma omp for schedule(static)
@@ -339,25 +292,24 @@ void cpuQwenSparseIndexer(const QwenSparseIndexer &p)
             {
                 const int blocks = (replay.prefix_tokens + row + 1) / QwenSparsePool;
                 if (!noRanking && blocks > QwenSparseBlocks)
-                    for (int block = 0; block < blocks; ++block)
-                    {
-                        float score = 0.0f;
-                        for (int head = 0; head < 4; ++head)
-                            score += std::max(0.0f, dot(p.prepared_query + (std::size_t(row) * 4 + head) * 128,
-                                                       p.pooled_keys + std::size_t(block) * 128, 128, isa));
-                        p.scores[std::size_t(row) * p.block_capacity + block] = score * 0.08838834764831844055f;
-                    }
+                    scorePools(p.prepared_query+std::size_t(row)*4*128,p.pooled_keys,
+                        p.scores+std::size_t(row)*p.block_capacity,blocks,isa);
             }
-            if (!selectRow(p, row)) valid.store(false, std::memory_order_relaxed);
+            if(!selectRow(p,row))invalidNumeric("indexer bounded selection");
         }
     };
     OMP_WORKSHARE_REGION(selection);
-    if (!valid.load(std::memory_order_relaxed))
-        throw std::invalid_argument("CPU QSA bounded selection consumed an invalid finite/nonnegative score frontier");
 }
 
+/** @brief Select original CPU score frontiers without changing their arithmetic.
+ * @param p Existing score/replay roots and exclusive selected/count/diagnostic outputs.
+ * @throws std::invalid_argument Before stores for malformed geometry or consumed scores.
+ * @details Only live ranking rows are inspected; inactive/nonranking score poison
+ * is not an authored input and must not be scanned after collective completion.
+ */
 void cpuQwenSparseSelectPools(const QwenSparseIndexer &p)
 {
+    validateReplayRoot(p.replay);
     validateQwenSparseSelection(p);
     validateReplay(*p.replay, p.row_capacity, p.token_capacity);
     validateQueryProgramReplay(p);
@@ -371,117 +323,40 @@ void cpuQwenSparseSelectPools(const QwenSparseIndexer &p)
             if (!bounded_selection::validScoreBits(detail::floatBits(p.scores[std::size_t(row) * p.block_capacity + block])))
                 throw std::invalid_argument("CPU QSA selection requires finite nonnegative live scores");
     }
-    std::atomic<bool> valid{true};
     auto selection = [&]()
     {
 #pragma omp for schedule(static)
-        for (int row = 0; row < p.row_capacity; ++row)
-            if (!selectRow(p, row)) valid.store(false, std::memory_order_relaxed);
+        for(int row=0;row<p.row_capacity;++row)
+            if(!selectRow(p,row))invalidNumeric("selected frontier changed after admission");
     };
     OMP_WORKSHARE_REGION(selection);
-    if (!valid.load(std::memory_order_relaxed))
-        throw std::logic_error("CPU QSA bounded selection frontier failed after validation");
 }
 
+/** @brief Execute the admitted original-cache CPU QSA program with one owner per row/head.
+ * @param p Existing arena/cache bindings and original host-owned replay.
+ * @throws std::invalid_argument Before worksharing for invalid policy, ISA,
+ * replay, selected mappings, byte geometry or publication exclusions.
+ */
 void cpuQwenSparseAttention(const QwenSparseAttention &p)
 {
-    validateQwenSparseAttentionArithmetic(p.arithmetic,DeviceType::CPU);
-    validateQwenSparseAttention(p);
-    const auto isa = nativeISA();
-    validateReplay(*p.replay, p.row_capacity, p.token_capacity);
-    if (p.kv.key_policy.encoding != attention::AttentionKeyCacheEncoding::PostRotary)
-        throw std::invalid_argument("CPU Qwen sparse attention requires canonical post-RoPE cache publication");
-    // Validate all consumed addresses before parallel work to keep failures fatal
-    // and diagnostic without exceptions escaping an OpenMP worksharing region.
-    for (int row = 0; row < p.replay->live_rows; ++row)
-    {
-        const int count = p.selected_count[row];
-        int origin = 0, capacity = 0;
-        if (!detail::resolveMapping(p.kv, *p.replay, row, p.token_capacity, origin, capacity))
-            throw std::invalid_argument("CPU Qwen sparse attention: stale or invalid canonical ring mapping");
-        if (count <= 0 || count > QwenSparseSelected)
-            throw std::invalid_argument("CPU Qwen sparse attention: invalid selected live count");
-        int previous = -1;
-        for (int i = 0; i < count; ++i)
-        {
-            const int token = p.selected[std::size_t(row) * QwenSparseSelected + i];
-            if (token <= previous || token >= p.replay->prefix_tokens + row + 1)
-                throw std::invalid_argument("CPU Qwen sparse attention: noncausal, repeated, or unsorted selected index");
-            previous = token;
-        }
-    }
-    auto attention = [&]()
+    const auto invocation=cpu_sparse::Invocation::bind(p);
+    const auto attention=[&]()
     {
 #pragma omp for schedule(static)
-        // Capacity owns storage; the canonical replay owns this invocation's
-        // writes. Inactive output and traffic records may belong to another
-        // request or an earlier retained transaction and must remain untouched.
-        for (int row_head = 0; row_head < p.replay->live_rows * p.query_heads; ++row_head)
-        {
-            float *output = p.output + std::size_t(row_head) * 256;
-            const int row = row_head / p.query_heads;
-            const int head = row_head % p.query_heads;
-            const int kv_head = (p.query_head_start + head) / 12 - p.kv_head_start;
-            const int count = p.selected_count[row];
-            const float *query = p.query + std::size_t(row_head) * 256;
-            float rotated_query[256];
-            if (detail::isRotated(p.kv.keys))
-            {
-                for (int d = 0; d < 256; ++d) rotated_query[d] = dot(p.kv.keys.rotations[kv_head] + d * 256, query, 256, isa);
-                query = rotated_query;
-            }
-            const auto *selected = p.selected + std::size_t(row) * QwenSparseSelected;
-            int origin = 0, capacity = 0;
-            (void)detail::resolveMapping(p.kv, *p.replay, row, p.token_capacity, origin, capacity);
-            float logits[QwenSparseSelected];
-            float native[256];
-            float maximum = -INFINITY;
-            std::uint64_t key_reads = 0, value_reads = 0;
-            for (int index = 0; index < count; ++index)
-            {
-                const int physical = detail::physicalRow(selected[index], origin, capacity);
-                readHead(p.kv.keys, physical, kv_head, detail::BankRole::Key, native);
-                key_reads += 256;
-                logits[index] = dot(query, native, 256, isa) * 0.0625f;
-                maximum = std::max(maximum, logits[index]);
-            }
-            float denominator = 0.0f;
-            for (int index = 0; index < count; ++index)
-            {
-                logits[index] = std::exp(logits[index] - maximum);
-                denominator += logits[index];
-            }
-            std::fill_n(output, 256, 0.0f);
-            for (int index = 0; index < count; ++index)
-            {
-                const float probability = logits[index] / denominator;
-                const int physical = detail::physicalRow(selected[index], origin, capacity);
-                readHead(p.kv.values, physical, kv_head, detail::BankRole::Value, native);
-                accumulate(output, native, probability, isa);
-                value_reads += 256;
-            }
-            if (detail::isRotated(p.kv.values))
-            {
-                std::copy_n(output, 256, native);
-                for (int d = 0; d < 256; ++d)
-                {
-                    float result = 0.0f;
-                    for (int coordinate = 0; coordinate < 256; ++coordinate)
-                        result = std::fma(p.kv.values.rotations[kv_head][coordinate * 256 + d], native[coordinate], result);
-                    output[d] = result;
-                }
-            }
-            if (p.gate)
-                for (int d = 0; d < 256; ++d)
-                    output[d] *= 1.0f / (1.0f + std::exp(-p.gate[std::size_t(row_head) * 256 + d]));
-            if (p.observations) p.observations[row_head] = {key_reads, value_reads, static_cast<std::uint32_t>(count)};
-        }
+        for(int rowHead=0;rowHead<invocation.rowHeads();++rowHead)invocation.execute(rowHead);
     };
+    // The empty loop still participates in the retained team's completion edge.
     OMP_WORKSHARE_REGION(attention);
 }
 
+/** @brief Publish the exact original replay/raw-tail snapshot under one retained-team owner.
+ * @param p Original CPU replay/tail and distinct admitted snapshot/traffic/counter outputs.
+ * @throws std::invalid_argument Before worksharing for invalid original bindings/replay.
+ * @details Counter corruption is always fatal, never an exception through a collective.
+ */
 void cpuQwenSparseSnapshotPrior(const QwenSparsePriorSnapshot& p)
 {
+    validateReplayRoot(p.replay);
     validateQwenSparsePriorSnapshot(p);
     validateReplay(*p.replay,p.row_capacity,p.token_capacity);
     const int tail_rows=p.replay->live_rows ? p.replay->prefix_tokens%4 : 0;
@@ -491,13 +366,20 @@ void cpuQwenSparseSnapshotPrior(const QwenSparsePriorSnapshot& p)
         *p.traffic={16u,static_cast<std::uint32_t>(tail_rows*128*sizeof(float))};
         if(p.work_counters.bound() && !addQwenSparseHostCounters(p.work_counters.control,p.work_counters.words,
             {16u,std::uint64_t(tail_rows)*128*sizeof(float),0,0}))
-            throw std::overflow_error("QSA original-tail terminal counter overflow");
+            counterOverflow("original-tail snapshot");
     };
     OMP_SINGLE(snapshot);
 }
 
+/** @brief Commit the accepted original raw-tail suffix without changing its canonical frontier.
+ * @param p Original replay/tail/candidates, canonical accepted-prefix authority and output.
+ * @throws std::invalid_argument Before worksharing for invalid bindings or acceptance.
+ * @details All potential overlapping raw sources are retained before the one
+ * publication; no-write calls still complete the retained team's lexical edge.
+ */
 void cpuQwenSparseCommitPartial(const QwenSparsePartialCommit &p)
 {
+    validateReplayRoot(p.replay);
     validateQwenSparsePartialCommit(p);
     validateReplay(*p.replay,p.acceptance.candidates().rowsPerRequest(),p.transaction_prior ? p.token_capacity : std::numeric_limits<int>::max());
     if(p.transaction_prior && p.transaction_prior->row_capacity!=p.acceptance.candidates().rowsPerRequest())
@@ -505,9 +387,11 @@ void cpuQwenSparseCommitPartial(const QwenSparsePartialCommit &p)
     const int accepted=p.acceptance.resolveNative(0);
     if (accepted < 0 || accepted > p.replay->live_rows)
         throw std::invalid_argument("CPU Qwen sparse partial commit: acceptance exceeds live rows");
-    if(p.replay->live_rows==0 || (accepted==0 && !p.transaction_prior))return;
+    const bool publish=p.replay->live_rows!=0 && (accepted!=0 || p.transaction_prior);
     auto commit = [&]()
     {
+        // A no-write request still retires through the lexical single/barrier.
+        if(!publish)return;
         const int total = p.replay->prefix_tokens + accepted;
         const int begin = (total / 4) * 4;
         float pending[4 * 128];
@@ -522,7 +406,7 @@ void cpuQwenSparseCommitPartial(const QwenSparsePartialCommit &p)
         std::copy_n(pending, (total % 4) * 128, p.partial_keys);
         if(p.work_counters.bound() && !addQwenSparseHostCounters(p.work_counters.control,p.work_counters.words,
             {0,0,0,std::uint64_t(total%4)*128*sizeof(float)}))
-            throw std::overflow_error("QSA accepted-tail terminal counter overflow");
+            counterOverflow("accepted-tail commit");
     };
     OMP_SINGLE(commit);
 }
@@ -537,18 +421,21 @@ public:
     /** @copydoc IQwenSparseAttentionKernels::attention */
     void attention(const QwenSparseAttention &p, void *) const override { cpuQwenSparseAttention(p); }
     /** @copydoc IQwenSparseAttentionKernels::prepareReplay */
-    void prepareReplay(const QwenSparsePrepareReplay &p,void *stream) const override { cpuQwenSparsePrepareReplay(p); }
+    void prepareReplay(const QwenSparsePrepareReplay &p,void *) const override { cpuQwenSparsePrepareReplay(p); }
     /** @copydoc IQwenSparseAttentionKernels::snapshotPrior */
     void snapshotPrior(const QwenSparsePriorSnapshot& p,void*) const override { cpuQwenSparseSnapshotPrior(p); }
     /** @copydoc IQwenSparseAttentionKernels::commitPartial */
     void commitPartial(const QwenSparsePartialCommit &p, void *) const override { cpuQwenSparseCommitPartial(p); }
     /** @copydoc IQwenSparseAttentionKernels::retainCandidates */
-    void retainCandidates(const QwenSparseCandidateRetention &p,void *stream) const override
+    void retainCandidates(const QwenSparseCandidateRetention &p,void *) const override
     {
         cpuQwenStateTransfer(qwenSparseCandidateTransfer(p));
     }
 };
 }
+/** @brief Construct the existing allocation-free-invocation CPU primitive bundle during setup.
+ * @return One RAII-owned native bundle; no cache/workspace allocation occurs in its calls.
+ */
 std::unique_ptr<IQwenSparseAttentionKernels> createCPUQwenSparseAttentionKernels()
 {
     return std::make_unique<CPUQwenSparseAttentionKernels>();

@@ -10,6 +10,11 @@ endif()
 add_executable(v2_test_pooled_complete_cohort
     fixtures/qwen4exp/Test__PooledImmutableCompleteCohort.cpp
     unit/backends/Test__GPUExistingContextBorrow.cpp)
+# Pooled immutable sources are CUDA/ROCm-native objects (no CPU
+# implementation); every registration requires a GPU backend family.
+if(TARGET v2_test_pooled_complete_cohort)
+    set_target_properties(v2_test_pooled_complete_cohort PROPERTIES V2_TEST_REQUIRED_BACKEND GPU)
+endif()
 target_include_directories(v2_test_pooled_complete_cohort PRIVATE "${REPO_ROOT}/src/v2" "${CMAKE_CURRENT_SOURCE_DIR}")
 target_link_libraries(v2_test_pooled_complete_cohort PRIVATE llaminar2_core GTest::gtest_main)
 target_compile_features(v2_test_pooled_complete_cohort PRIVATE cxx_std_23)

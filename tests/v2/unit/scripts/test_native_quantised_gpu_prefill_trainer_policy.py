@@ -18,6 +18,55 @@ TRAINER_SOURCES = {
 }
 
 
+EVENT_WAIT = {
+    "cuda": "cudaEventSynchronize(",
+    "rocm": "hipEventSynchronize(",
+}
+STREAM_WAIT = {
+    "cuda": "cudaStreamSynchronize(",
+    "rocm": "hipStreamSynchronize(",
+}
+TIMED_REGION_START = "for (int iteration = 0; iteration < bench_runs; ++iteration)"
+TIMED_REGION_END = "result.min_us = "
+
+
+def assert_batched_timing_contract(backend: str, source: str) -> None:
+    """Reject any per-sample host bounce in the candidate measurement.
+
+    The timed region is bounded by the bench event-record loop and the
+    post-processing aggregate: inside it, every sample records its start and
+    stop events on the stream and exactly one batched event wait drains the
+    whole run; a stream synchronization there would bounce the host after
+    every sample. Checked stream waits outside the region (warmup checker,
+    isolated replay completion) are separate call scopes, and exactly one
+    void-cast destructor drain is allowed per trainer.
+    """
+    event_wait = EVENT_WAIT[backend]
+    stream_wait = STREAM_WAIT[backend]
+    start = source.find(TIMED_REGION_START)
+    end = source.find(TIMED_REGION_END, start)
+    if start < 0 or end < 0:
+        raise AssertionError("trainer lacks the recorded bench timing region")
+    region = source[start:end]
+    if stream_wait in region:
+        raise AssertionError(
+            f"{backend} trainer synchronizes the stream inside the timed "
+            "candidate region; samples must batch on events only")
+    if region.count(event_wait) != 1:
+        raise AssertionError(
+            f"{backend} trainer must wait once on the batched stop events, "
+            f"found {region.count(event_wait)}")
+    void_drain = "(void)" + stream_wait
+    if source.count(void_drain) != 1:
+        raise AssertionError(
+            f"{backend} trainer must keep exactly one void-cast teardown "
+            f"drain, found {source.count(void_drain)}")
+    if source.count(event_wait) != 1:
+        raise AssertionError(
+            f"{backend} trainer must keep exactly one event wait in total, "
+            f"found {source.count(event_wait)}")
+
+
 class NativeQuantisedGPUPrefillTrainerPolicyTest(unittest.TestCase):
     """Keep candidate timing persistent, stream-local, and device-certified."""
 
@@ -62,6 +111,8 @@ class NativeQuantisedGPUPrefillTrainerPolicyTest(unittest.TestCase):
 
         for backend, path in TRAINER_SOURCES.items():
             with self.subTest(backend=backend):
+                assert_batched_timing_contract(
+                    backend, path.read_text(encoding="utf-8"))
                 source = path.read_text(encoding="utf-8")
                 event_wait = (
                     "cudaEventSynchronize("
@@ -95,6 +146,25 @@ class NativeQuantisedGPUPrefillTrainerPolicyTest(unittest.TestCase):
                 self.assertIn("start_events_.reserve", source)
                 self.assertIn("stop_events_.reserve", source)
                 self.assertIn("times_us_.resize", source)
+
+    def test_injected_hot_path_stream_wait_is_rejected(self) -> None:
+        """The same validator must reject an extra hot-path wait, not count text."""
+
+        for backend, path in TRAINER_SOURCES.items():
+            with self.subTest(backend=backend):
+                source = path.read_text(encoding="utf-8")
+                stream_wait = STREAM_WAIT[backend]
+                start = source.index(TIMED_REGION_START)
+                end = source.index(TIMED_REGION_END, start)
+                injected = (
+                    source[:end]
+                    + f"    requireHip({stream_wait}stream_), \"injected host bounce\");\n"
+                    + source[end:]
+                )
+                with self.assertRaisesRegex(
+                    AssertionError, "synchronizes the stream inside the timed"
+                ):
+                    assert_batched_timing_contract(backend, injected)
 
     def test_trainers_require_explicit_non_default_streams(self) -> None:
         """Every setup, launch, comparison, and terminal copy shares one stream."""

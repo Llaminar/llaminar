@@ -61,7 +61,7 @@ namespace llaminar2
         /** @brief Stable marker preceding every serialized memory profile. */
         constexpr uint32_t kProfileWireMagic = 0x4C4D5032U; // "LMP2"
         /** @brief Current profile layout, including exact MoE geometry. */
-        constexpr uint32_t kProfileWireVersion = 6U;
+        constexpr uint32_t kProfileWireVersion = 7U;
 
         /** Exact stable order of fixed-width Flash Next geometry scalars. */
         constexpr std::array<uint32_t Qwen4ExpMemoryGeometry::*, 18> kFlashNextFields{
@@ -425,6 +425,7 @@ namespace llaminar2
             profile.n_heads = config.sparseAttention().query_heads;
             profile.n_kv_heads = config.sparseAttention().kv_heads;
             profile.head_dim = config.sparseAttention().head_dimension;
+            profile.rope_dimension_count = static_cast<int>(config.sparseAttention().rotary_dimension);
             profile.vocab_size = config.vocabularySize();
             profile.max_seq_len = config.contextLength();
             profile.expert_count = config.experts().count;
@@ -471,6 +472,9 @@ namespace llaminar2
             profile.full_attention_interval = firstPositiveMetadataInt(
                 model,
                 {model.architecture + ".full_attention_interval"});
+            profile.rope_dimension_count = firstPositiveMetadataInt(
+                model,
+                {model.architecture + ".rope.dimension_count"});
             profile.gdn_conv_kernel_size = firstPositiveMetadataInt(
                 model,
                 {model.architecture + ".ssm.conv_kernel"});
@@ -497,33 +501,12 @@ namespace llaminar2
                 profile.head_dim = static_cast<int>(model.embedding_length / model.head_count);
             }
 
-            // d_ff: try metadata, else estimate as 4 * d_model (common default)
-            auto ff_it = model.metadata.find("llama.feed_forward_length");
-            if (ff_it == model.metadata.end())
-                ff_it = model.metadata.find(model.architecture + ".feed_forward_length");
-            if (ff_it != model.metadata.end())
-            {
-                profile.d_ff = static_cast<int>(ff_it->second.asUInt64());
-            }
-            else
-            {
-                // Estimate: for most models, d_ff is discoverable from tensor shapes
-                // Look for ffn_gate or ffn_up weight to infer d_ff
-                for (const auto &t : model.tensors)
-                {
-                    if ((t.name.find("ffn_gate") != std::string::npos ||
-                         t.name.find("ffn_up") != std::string::npos) &&
-                        t.dimensions.size() == 2)
-                    {
-                        profile.d_ff = static_cast<int>(t.dimensions[0]);
-                        break;
-                    }
-                }
-                if (profile.d_ff == 0)
-                {
-                    profile.d_ff = profile.d_model * 4; // Fallback heuristic
-                }
-            }
+            // d_ff has one source authority shared with graph configuration;
+            // the graph builders apply the same 4*d_model default when the
+            // source declares no FFN width.
+            profile.d_ff = static_cast<int>(ggufFeedForwardLength(model));
+            if (profile.d_ff == 0)
+                profile.d_ff = profile.d_model * 4;
 
         }
 
@@ -722,6 +705,7 @@ namespace llaminar2
         writeVal<int32_t>(buf, n_heads);
         writeVal<int32_t>(buf, n_kv_heads);
         writeVal<int32_t>(buf, head_dim);
+        writeVal<int32_t>(buf, rope_dimension_count);
         writeVal<int32_t>(buf, vocab_size);
         writeVal<int32_t>(buf, max_seq_len);
         writeVal<int32_t>(buf, expert_count);
@@ -808,6 +792,7 @@ namespace llaminar2
         p.n_heads = readVal<int32_t>(ptr, end);
         p.n_kv_heads = readVal<int32_t>(ptr, end);
         p.head_dim = readVal<int32_t>(ptr, end);
+        p.rope_dimension_count = readVal<int32_t>(ptr, end);
         p.vocab_size = readVal<int32_t>(ptr, end);
         p.max_seq_len = readVal<int32_t>(ptr, end);
         p.expert_count = readVal<int32_t>(ptr, end);

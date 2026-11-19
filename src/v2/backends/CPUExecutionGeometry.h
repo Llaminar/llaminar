@@ -10,6 +10,7 @@
  */
 #pragma once
 #include <cstdint>
+#include "utils/CPUFeatures.h"
 
 namespace llaminar2
 {
@@ -29,21 +30,47 @@ namespace llaminar2
         bool operator==(const CPUCacheGeometry &) const = default;
     };
 
+    /** @brief Physical reduction-storage program, independent of arithmetic source policy. */
+    enum class CPUProjectionScheduleABI : std::uint32_t
+    {
+        Unknown = 0, ///< No admitted native projection implementation observation.
+        X86SharedK = 1, ///< AVX2/AVX512 may use admitted shared ordered-K partials.
+        ARMRegisterK = 2, ///< Native ARM owns full-K/canonical trees in bounded registers.
+    };
+
     /** @brief Process-selected CPU execution geometry; workers remain rank-plan owned. */
     struct CPUExecutionGeometry
     {
         CPUCacheGeometry cache;
-        std::uint32_t maximum_native_row_tile = 0; ///< Two for AVX2, four for AVX512.
+        std::uint32_t maximum_native_row_tile = 0; ///< Two for AVX2, four for AVX512/native ARM.
+        CPUProjectionScheduleABI projection_abi = CPUProjectionScheduleABI::Unknown; ///< Exact participant implementation identity.
+        ISALevel compiled_isa = ISALevel::Scalar; ///< Participant's actual compiled architecture/envelope.
+        ISALevel active_isa = ISALevel::Scalar; ///< Participant's immutable selected runtime ISA.
         /** @return Whether NativeQuantised can price and execute this exact observation. */
         constexpr bool isValid() const noexcept
         {
-            return cache.isValid() && (maximum_native_row_tile == 2 || maximum_native_row_tile == 4);
+            if (!isNativeCPUExecutionISAPair(compiled_isa, active_isa)) return false;
+            switch (projection_abi)
+            {
+            case CPUProjectionScheduleABI::X86SharedK:
+                return (compiled_isa == ISALevel::AVX2 || compiled_isa == ISALevel::AVX512) &&
+                    cache.isValid() && maximum_native_row_tile == (active_isa == ISALevel::AVX512 ? 4u : 2u);
+            case CPUProjectionScheduleABI::ARMRegisterK:
+                // This implementation never partitions from cache geometry or
+                // allocates shared K partials. Unknown cache observations stay
+                // unknown; other cache-dependent services must validate them.
+                return (compiled_isa == ISALevel::NEON || compiled_isa == ISALevel::NEONDotProd) &&
+                    maximum_native_row_tile == 4;
+            case CPUProjectionScheduleABI::Unknown:
+                return false;
+            }
+            return false;
         }
         /** @return Exact policy observation equality, not a physical-node comparison. */
         bool operator==(const CPUExecutionGeometry &) const = default;
         /**
          * @brief Read the observing process's one immutable CPU policy record.
-         * @return Real CPUID cache dimensions and selected ISA; unknown fields stay zero.
+         * @return Actual native projection ABI and selected ISA; unobserved cache fields stay zero.
          *
          * Detection is cached once, before execution. Unsupported/incomplete
          * NativeQuantised geometry is rejected by its requirement/dispatch boundary;

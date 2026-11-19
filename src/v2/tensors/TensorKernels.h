@@ -928,6 +928,31 @@ namespace llaminar2
         }
 
         /**
+         * @brief Open a new publication generation of an acquired overlay slot.
+         *
+         * Infrastructure-only, like @ref exportRetiredCPUNativeQuantisedStorage. It
+         * is called when a residency epoch acquires the slot, before any byte is
+         * rewritten; until @ref admitCPUNativeQuantisedPublication succeeds, native
+         * execution over the slot is rejected.
+         *
+         * @return The engine's final byte range, or empty for non-NativeQuantised engines.
+         */
+        virtual std::span<std::uint8_t> beginRetiredCPUNativeQuantisedRewrite() noexcept
+        {
+            return {};
+        }
+
+        /**
+         * @brief Seal completely written CPU NativeQuantised bytes before publication.
+         * @throws std::invalid_argument For reserved metadata bits.
+         * @throws std::logic_error For an engine without CPU NativeQuantised weights.
+         */
+        virtual void admitCPUNativeQuantisedPublication()
+        {
+            throw std::logic_error("Engine has no CPU NativeQuantised publication to admit");
+        }
+
+        /**
          * @brief Borrow an immutable contiguous floating-point weight matrix.
          *
          * CPU and GPU floating GEMM engines override this with their exact live

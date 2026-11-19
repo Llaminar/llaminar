@@ -284,6 +284,16 @@ class EmptyGTestGateTests(unittest.TestCase):
     def test_stale_filter_cannot_report_a_green_gate(self) -> None:
         """Brief, ordinary and colorized empty GTest runs fail despite exit 0."""
         source = (REPO_ROOT / "tests/v2/CMakeLists.txt").read_text(encoding="utf-8")
+        # The canonical add_v2_test body consults the Release-mode selection
+        # functions; the synthetic project carries the same authoritative
+        # block from cmake/V2TestTargetSelection.cmake (cache declaration
+        # plus both selection functions) so registration semantics cannot
+        # drift from the real build.
+        selection = (REPO_ROOT / "tests/v2/cmake/V2TestTargetSelection.cmake").read_text(encoding="utf-8")
+        selection_begin = selection.index("set(LLAMINAR_RELEASE_NATIVE_TEST_TARGETS")
+        selection_end = selection.index("endfunction()",
+            selection.index("function(v2_test_registration_selected", selection_begin))
+        selection_end += len("endfunction()")
         begin = source.index("function(add_v2_test TEST_NAME)")
         end = source.index("endfunction()", begin) + len("endfunction()")
         # Exercise the installed registration function, not a copied regex.
@@ -309,7 +319,8 @@ class EmptyGTestGateTests(unittest.TestCase):
             (root / "CMakeLists.txt").write_text(
                 "cmake_minimum_required(VERSION 3.20)\nproject(EmptyGTestGate NONE)\n"
                 "enable_testing()\nset(V2_TEST_CORES_PER_SOCKET 1)\nset(V2_TEST_SOCKETS 1)\n"
-                + native_mpi_helper_target() + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
+                + native_mpi_helper_target() + selection[selection_begin:selection_end]
+                + "\n" + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
             )
             configured = subprocess.run(
                 ["cmake", "-S", str(root), "-B", str(root / "build")],
@@ -335,6 +346,16 @@ class EmptyGTestGateTests(unittest.TestCase):
         classifies the declared backend and finalized gate alias.
         """
         source = (REPO_ROOT / "tests/v2/CMakeLists.txt").read_text(encoding="utf-8")
+        # The canonical add_v2_test body consults the Release-mode selection
+        # functions; the synthetic project carries the same authoritative
+        # block from cmake/V2TestTargetSelection.cmake (cache declaration
+        # plus both selection functions) so registration semantics cannot
+        # drift from the real build.
+        selection = (REPO_ROOT / "tests/v2/cmake/V2TestTargetSelection.cmake").read_text(encoding="utf-8")
+        selection_begin = selection.index("set(LLAMINAR_RELEASE_NATIVE_TEST_TARGETS")
+        selection_end = selection.index("endfunction()",
+            selection.index("function(v2_test_registration_selected", selection_begin))
+        selection_end += len("endfunction()")
         begin = source.index("function(add_v2_test TEST_NAME)")
         end = source.index("endfunction()", begin) + len("endfunction()")
         cases = [
@@ -385,7 +406,8 @@ class EmptyGTestGateTests(unittest.TestCase):
             (root / "CMakeLists.txt").write_text(
                 "cmake_minimum_required(VERSION 3.20)\nproject(NativeGTestGate NONE)\n"
                 "enable_testing()\nset(V2_TEST_CORES_PER_SOCKET 1)\nset(V2_TEST_SOCKETS 1)\n"
-                + native_mpi_helper_target() + source[begin:end] + "\n"
+                + native_mpi_helper_target() + selection[selection_begin:selection_end]
+                + "\n" + source[begin:end] + "\n"
                 + "\n".join(declarations), encoding="utf-8",
             )
             configured = subprocess.run(
@@ -429,8 +451,29 @@ class DeviceInventoryGateTests(unittest.TestCase):
         same startup ownership, irrespective of their selected kernel backend.
         """
         source = (REPO_ROOT / "tests/v2/CMakeLists.txt").read_text(encoding="utf-8")
+        # The canonical add_v2_test body consults the Release-mode selection
+        # functions; the synthetic project carries the same authoritative
+        # block from cmake/V2TestTargetSelection.cmake (cache declaration
+        # plus both selection functions) so registration semantics cannot
+        # drift from the real build.
+        selection = (REPO_ROOT / "tests/v2/cmake/V2TestTargetSelection.cmake").read_text(encoding="utf-8")
+        selection_begin = selection.index("set(LLAMINAR_RELEASE_NATIVE_TEST_TARGETS")
+        selection_end = selection.index("endfunction()",
+            selection.index("function(v2_test_registration_selected", selection_begin))
+        selection_end += len("endfunction()")
         begin = source.index("function(add_v2_test TEST_NAME)")
         end = source.index("endfunction()", begin) + len("endfunction()")
+
+        # The canonical add_v2_test body consults the Release-mode selection
+        # functions; the synthetic project carries the same authoritative
+        # block from cmake/V2TestTargetSelection.cmake (cache declaration
+        # plus both selection functions) so registration semantics cannot
+        # drift from the real build.
+        selection = (REPO_ROOT / "tests/v2/cmake/V2TestTargetSelection.cmake").read_text(encoding="utf-8")
+        selection_begin = selection.index("set(LLAMINAR_RELEASE_NATIVE_TEST_TARGETS")
+        selection_end = selection.index("endfunction()",
+            selection.index("function(v2_test_registration_selected", selection_begin))
+        selection_end += len("endfunction()")
         registrations = [
             f'add_v2_test(V2_Integration_Inventory_{backend} '
             f'COMMAND $<TARGET_FILE:inventory_probe> --filter={backend} '
@@ -444,7 +487,8 @@ class DeviceInventoryGateTests(unittest.TestCase):
             "add_executable(inventory_probe IMPORTED)\n"
             f'set_target_properties(inventory_probe PROPERTIES IMPORTED_LOCATION "{sys.executable}" '
             f'V2_TEST_DEVICE_SCOPE "{scope}")\n'
-            + native_mpi_helper_target() + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
+            + native_mpi_helper_target() + selection[selection_begin:selection_end]
+            + "\n" + source[begin:end] + "\n" + "\n".join(registrations), encoding="utf-8"
         )
         return subprocess.run(
             ["cmake", "-S", str(directory), "-B", str(directory / "build")],
