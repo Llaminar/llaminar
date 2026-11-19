@@ -16979,6 +16979,17 @@ add_v2_test(V2_Unit_ValidationConfig
     MPI_PROCS 1
 )
 
+# Test: ServingCapacity (typed serving-capacity contract, continuous batching design §9.4)
+# Tests exact-or-reject resolution of resident S / response R / queue Q ownership counts
+# against the qualified envelope, the invariant R >= S + Q, and the hard admission bound.
+add_executable(v2_test_serving_capacity unit/execution/config/Test__ServingCapacity.cpp)
+target_link_libraries(v2_test_serving_capacity llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_ServingCapacity
+    COMMAND $<TARGET_FILE:v2_test_serving_capacity>
+    LABELS "V2;Unit;Execution;Validation;ServingCapacity;ContinuousBatching;Configuration"
+    MPI_PROCS 1
+)
+
 # Test: StreamingEnv (weight streaming environment variables and configuration)
 # Tests LLAMINAR_WEIGHT_STREAMING, LLAMINAR_STREAM_MEMORY_MB, LLAMINAR_STREAM_PREFETCH_DEPTH,
 # LLAMINAR_STREAM_EVICTION_POLICY, LLAMINAR_STREAM_VERBOSE.
