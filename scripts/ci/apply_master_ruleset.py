@@ -191,9 +191,9 @@ def owner_protection(repository: str, *, split: bool, apply: bool) -> dict:
         return owner
     installations = github_json(f"orgs/{repository.split('/')[0]}/installations", 'per_page=100')
     apps = [app for app in installations['installations'] if app['app_slug'] == 'llaminar-bot']
-    if (len(apps) != 1 or apps[0].get('suspended_at') or apps[0]['repository_selection'] != 'selected'
+    if (len(apps) != 1 or apps[0].get('suspended_at') or apps[0]['repository_selection'] not in ('selected', 'all')
             or apps[0]['permissions'] != {'contents': 'write', 'pull_requests': 'write', 'metadata': 'read'}):
-        raise ValueError('install the private llaminar-bot on the selected repository with the documented permissions')
+        raise ValueError('install the private llaminar-bot with the documented repository permissions')
     app = github_json('apps/llaminar-bot')
     if (app['id'] != apps[0]['app_id'] or app['owner']['type'] != 'Organization'
             or app['owner']['login'].lower() != repository.split('/')[0].lower()):
