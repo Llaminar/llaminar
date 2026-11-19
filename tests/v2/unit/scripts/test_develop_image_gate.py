@@ -28,6 +28,7 @@ import yaml
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 
+import apply_master_ruleset as ruleset
 import run_develop_image_gate as gate
 import prebuilt_test_image
 import run_develop_pr_tests as pr_runner
@@ -284,6 +285,18 @@ class DevelopImageGateTests(unittest.TestCase):
                 self.assertEqual(report["lanes"]["unit"]["tests"], ["V2_Unit_Contract"])
                 if unit_outcome == 0:
                     self.assertEqual(report["lanes"]["host"]["tests"], ["V2_Integration_HostContract"])
+
+    def test_required_arm64_context_runs_for_ready_develop_prs(self):
+        """Keep the ARM64 job name and merge-rule context bound to each other."""
+        workflow = yaml.load((ROOT / ".github/workflows/develop-pr-arm64.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        self.assertEqual(workflow["on"]["pull_request"], {
+            "branches": ["develop"],
+            "types": ["opened", "synchronize", "reopened", "ready_for_review"]})
+        job = workflow["jobs"]["arm64"]
+        self.assertIn(job["name"], ruleset.DEVELOP_REQUIRED_CHECKS)
+        self.assertEqual(job["runs-on"], "ubuntu-24.04-arm")
+        self.assertEqual(job["if"], "${{ !github.event.pull_request.draft }}")
 
     def test_arm64_pr_driver_runs_only_scoped_unit_and_host_tests(self):
         """Execute real CTest with unrelated cases around the selected indices."""
@@ -744,11 +757,13 @@ esac
         self.assertEqual(job["runs-on"], "${{ matrix.runner }}")
         self.assertEqual(job["strategy"], {"fail-fast": "false", "max-parallel": "2",
             "matrix": {"cpu_isa": ["AVX2", "AVX512"], "include": [
-                {"cpu_isa": "AVX2", "runner": "llaminar-develop-avx2", "pr_gpus": "CUDA+ROCm"},
-                {"cpu_isa": "AVX512", "runner": "llaminar-avx512", "pr_gpus": "none"}]}})
+                {"cpu_isa": "AVX2", "runner": "llaminar-develop-avx2", "pr_gpus": "CUDA+ROCm",
+                 "check_name": "Unit + hardware preflight (AVX2)"},
+                {"cpu_isa": "AVX512", "runner": "llaminar-avx512", "pr_gpus": "none",
+                 "check_name": "Unit + host (AVX512)"}]}})
         self.assertEqual(len({row["runner"] for row in job["strategy"]["matrix"]["include"]}), 2)
         self.assertEqual(f"{caller['name']} / {job['name']}",
-                         "Develop PR / Unit + host (${{ matrix.cpu_isa }})")
+                         "Develop PR / ${{ matrix.check_name }}")
         self.assertIn("github.event_name == 'pull_request'", job["if"])
         self.assertIn("github.base_ref == 'develop'", job["if"])
         self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", job["if"])

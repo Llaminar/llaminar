@@ -27,10 +27,12 @@ jobs:
           - cpu_isa: AVX2
             runner: llaminar-develop-avx2
             pr_gpus: CUDA+ROCm
+            check_name: Unit + hardware preflight (AVX2)
           - cpu_isa: AVX512
             runner: llaminar-avx512
             pr_gpus: none
-    name: Unit + host (${{ matrix.cpu_isa }})
+            check_name: Unit + host (AVX512)
+    name: ${{ matrix.check_name }}
     # Each ISA replaces its own obsolete work independently, while different
     # PRs retain separate queues on their respective dedicated hosts.
     concurrency:

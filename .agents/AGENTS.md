@@ -354,9 +354,10 @@ complete hardware-qualified `ProductionTestPreflight` inventory in a separate
 GPU container, including CUDA, ROCm, mixed-backend and exclusive work. Native
 hardware observation and explicit CMake requirements own eligibility; absent
 geometries remain unqualified in the receipt. Both GPUs are required, and
-failures or skips in selected tests block the gate. Both ISA checks must pass.
-The native GitHub ARM64 PR check builds the same `test-runner` and `runtime`
-targets with NEON and CUDA for GB10. It verifies the sealed `ARM64PR` Unit
+failures or skips in selected tests block the gate. The AVX2, AVX512 and
+ARM64 checks are required. The native GitHub ARM64 PR check builds the same
+`test-runner` and `runtime` targets with NEON and CUDA for GB10. It verifies
+the sealed `ARM64PR` Unit
 and host preflight results and checks Release startup.
 Production certification still requires its own complete hardware qualification.
 A successful develop merge builds the AVX512 and AVX2 runtime images in

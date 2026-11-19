@@ -121,10 +121,14 @@ open a PR into `develop`. Use Conventional Commit messages and PR titles. See
 documentation/CI-only maintenance exception. Use the current protected
 workflow definitions when working from an older feature checkout.
 
-The develop ruleset requires both `Develop PR / Unit + host (AVX2)` and
-`Develop PR / Unit + host (AVX512)`, an up-to-date merge candidate and owner
-approval. The AVX2 context keeps its stable name while also requiring its GPU
-scope. The separate owner-approval ruleset uses only
+The develop ruleset requires `Develop PR / Unit + hardware preflight (AVX2)`,
+`Develop PR / Unit + host (AVX512)` and `ARM64 build and Unit + host` on an
+up-to-date merge candidate. Keep the context names bound to their GitHub
+Actions job names. Preview the CI ruleset with
+`python3 scripts/ci/apply_master_ruleset.py --develop-only`. With repository
+admin authorization, add `--apply` after confirming the context appears
+on a ready PR.
+The separate owner-approval ruleset uses only
 `@Llaminar/repository-approvers` on `develop`, `rc/*` and `master`. Native squash
 auto-merge waits for reviews and checks. The owner's PR-only approval override
 and dedicated release-evidence deploy key retain their existing exceptions.

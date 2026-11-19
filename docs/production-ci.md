@@ -18,8 +18,10 @@ Those optional tools do not add phases to RC certification.
 
 Ordinary work starts from current `develop` on a branch named
 `feat/short-feature-description`. Commit messages and PR titles use
-Conventional Commits. Both Unit/host checks must pass for the up-to-date feature PR to squash-merge
-into `develop`. PRs by another contributor also require the owner’s review. Only explicit user direction starts the separate
+Conventional Commits. The AVX2, AVX512 and ARM64 checks must pass on the
+up-to-date feature PR before it can squash-merge into `develop`. PRs by
+another contributor also require the owner’s review. Only explicit user
+direction starts the separate
 `rc/*`-to-`master` release PR and its full certification/release workflow.
 
 Documentation and CI/CD workflow maintenance may be committed and pushed
@@ -80,10 +82,19 @@ turns a selected-test failure or skip into a pass. This is PR validation, not
 release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
-The active `develop` ruleset requires both `Develop PR / Unit + host (AVX2)`
-and `Develop PR / Unit + host (AVX512)`, an up-to-date PR, and squash merge.
-The AVX2 check retains its stable required-context name while also requiring
-the hardware-qualified production preflight scope.
+The `develop` ruleset requires an up-to-date PR, squash merge, and these
+GitHub Actions checks.
+
+- `Develop PR / Unit + hardware preflight (AVX2)`
+- `Develop PR / Unit + host (AVX512)`
+- `ARM64 build and Unit + host`
+
+Repository administrators can preview the CI ruleset with
+`python3 scripts/ci/apply_master_ruleset.py --develop-only` and install it
+with `--develop-only --apply`. Verify that the ARM64 job appears on a ready PR
+before activating the required context. Open PRs whose branches lack the
+ARM64 workflow must bring in a `develop` revision that contains it.
+The AVX2 check requires the hardware-qualified production preflight scope.
 Repository administrators have an explicit PR-only bypass for authorized
 manual merges. Direct human pushes, force pushes and deletion remain rejected.
 `.github/workflows/develop-auto-merge.yml` arms GitHub's native
@@ -95,7 +106,7 @@ head SHA and arms GitHub's native squash auto-merge.
 
 For original PR author `dbsanfte` (GitHub user ID `3513358`), the workflow
 uses a short-lived installation token for the private `Llaminar/llaminar-bot`
-app. GitHub enforces both required checks and strict branch freshness for the
+app. GitHub enforces all three required checks and strict branch freshness for the
 app. Other authors use the existing `DEVELOP_AUTOMERGE_TOKEN` and require the
 owner's review. Re-running a job as the owner does not change the PR author.
 Editing an existing owner PR description migrates a request armed by the old
@@ -592,8 +603,8 @@ The master ruleset requires each named phase and final eligibility, with strict
 up-to-date master semantics and squash-only merge. `apply_master_ruleset.py`
 projects those requirements, protects RC updates and extends the existing sole-
 owner approval ruleset without changing approver membership or exceptions.
-Develop keeps its existing two ISA Unit/host checks, deletion and force-push
-guards. The general GitHub Actions app receives no bypass.
+Develop requires its AVX2 hardware preflight and AVX512 host checks and
+enforces deletion and force-push guards. The general GitHub Actions app receives no bypass.
 
 `release_accuracy_panels.py` reuses the canonical parity inventory and its
 registered CPU/FP32 PyTorch reference implementations. It reads the original
