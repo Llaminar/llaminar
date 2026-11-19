@@ -4,18 +4,24 @@
  *
  * Tests that exercise an explicit, non-default NUMA node must name a node that
  * exists on the executing host. Single-node hosts (GB10, desktop x86) expose
- * only node 0; dual-socket servers expose node 1 as well. The last online node
+ * one node. The last online node
  * keeps the original dual-socket behaviour while remaining valid everywhere.
  */
 #pragma once
 
 #include <numa.h>
+#include <stdexcept>
 
 namespace llaminar2::test
 {
-    /** @return Highest NUMA node id of this host, or 0 when libnuma reports none. */
+    /**
+     * @return Highest online NUMA node for a test using a physical placement.
+     * @throws std::runtime_error when the host cannot supply an explicit node.
+     */
     inline int hostLastNUMANode()
     {
-        return numa_available() < 0 ? 0 : numa_max_node();
+        if (numa_available() < 0)
+            throw std::runtime_error("Explicit test placement requires an online NUMA node");
+        return numa_max_node();
     }
 } // namespace llaminar2::test

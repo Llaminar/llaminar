@@ -1608,7 +1608,7 @@ TEST(MoEGlobalPipelineMemory, OriginalCPUStageCapacityExchangePreservesUnequalOr
         const auto& owners = head_binding.owners();
         const auto snapshot = owners.authority->snapshot();
         ASSERT_TRUE(snapshot);
-        ASSERT_EQ(snapshot->ownershipKind(), MoEOverlayResidencyOwnershipKind::CPUJointFragments);
+        ASSERT_EQ(snapshot->ownershipKind(), MoEOverlayResidencyOwnershipKind::JointFragments);
         EXPECT_EQ(snapshot->jointOwnerMap().get(), &owners.residency->initialOwnerMap());
         EXPECT_EQ(&snapshot->originalOwnerMap(), &owners.residency->initialOwnerMap());
         const auto& local = owners.residency->localParticipantIds();

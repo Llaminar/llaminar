@@ -69,7 +69,7 @@ TEST(CPUJointDispatchContract, OriginalLeaseTargetsEverySourceCohortAndKeepsWhol
     auto authority=std::make_shared<MoEOverlayResidencyAuthority>(staticJointConfig(original));
     const auto snapshot=authority->snapshot();ASSERT_TRUE(snapshot);ASSERT_TRUE(snapshot->valid());
     ASSERT_TRUE(snapshot->owner_map.owners().empty());
-    ASSERT_EQ(&snapshot->originalOwnerMap(),original.preparation->cpuJointOwnerMap().get());
+    ASSERT_EQ(&snapshot->originalOwnerMap(),original.preparation->jointOwnerMap().get());
     const auto members=staticJointMembers(original);ASSERT_EQ(members.size(),2u);
     const auto* whole=snapshot->originalOwnerMap().placementFor(7,0);ASSERT_NE(whole,nullptr);
     ASSERT_FALSE(whole->shard_cohort);ASSERT_GE(whole->owner_participant,0);
@@ -136,7 +136,7 @@ TEST(CPUJointDispatchContract, OriginalLeaseTargetsEverySourceCohortAndKeepsWhol
         }
     }
     // Authentic source map alone is not a joint dispatch lease; no snapshot field is manufactured.
-    auto missing=params;missing.residency_authority.reset();missing.owner_map=original.preparation->cpuJointOwnerMap();
+    auto missing=params;missing.residency_authority.reset();missing.owner_map=original.preparation->jointOwnerMap();
     MoEExpertDispatchOutput rejected;missing.output=&rejected;
     MoEExpertDispatchStage missingLease(missing);EXPECT_FALSE(missingLease.execute(&ctx));EXPECT_FALSE(rejected.residency_lease);
     auto wrongEpoch=params;MoEExpertDispatchStage staleProducer(wrongEpoch);

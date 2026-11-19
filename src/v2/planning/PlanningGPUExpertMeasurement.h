@@ -14,6 +14,8 @@
 #include "PhysicalMemoryAuthority.h"
 #include "OrchestrationPerformanceEvidence.h"
 #include "execution/moe/ExpertHistogramSource.h"
+#include "execution/moe/MoEOverlayRouteTarget.h"
+#include "collective/NativeLocalTPContextBorrow.h"
 #include <span>
 
 namespace llaminar2
@@ -22,6 +24,7 @@ namespace llaminar2
     class MoEOverlayFixedDownProjectionBank;
     class RetainedParticipantGraphExecutable;
     class ILocalTPContext;
+    class MoEOverlayCPUServiceMeasurement;
     /** @brief Borrow actual immutable owner-domain facts through one calibration transaction. */
     struct PlanningPreparedOwnerDispatch
     {
@@ -54,6 +57,30 @@ namespace llaminar2
         std::array<std::string, 3> formats;
         PlanningExpertSampleRequest source;
         std::vector<PlanningGPUExpertPhaseObservation> phases;
+    };
+
+    class MoEExpertShardCohort;
+    class MoEOverlayParticipantResidencyRegistry;
+    struct RankInventory;
+    /**
+     * @brief Original complete-cohort observations with deliberately separate units.
+     *
+     * Complete service is a root-native interval for the actual captured cohort.
+     * Compute is the sum of concurrent member maxima, not summed member timings.
+     * Communication is measured once per input-ready frame at its explicit H-row
+     * extent, with empty control measured independently. None is implicitly
+     * convertible to an expert activation rate or a migration transfer price.
+     */
+    struct PlanningGPUCohortServiceObservation {
+        MoEOverlayRouteTarget target;
+        int layer=-1,expert=-1;
+        ExpertHistogramSource phase=ExpertHistogramSource::DecodeToken;
+        uint64_t rows_per_frame=0,measured_frames=0;
+        uint64_t complete_service_nanoseconds=0;
+        uint64_t concurrent_compute_nanoseconds=0;
+        uint64_t live_frame_communication_nanoseconds=0;
+        uint64_t empty_frame_communication_nanoseconds=0;
+        size_t participants=0;
     };
 
     /** @brief One bounded setup transaction on the exact device's normal worker. */
@@ -129,6 +156,32 @@ namespace llaminar2
             std::shared_ptr<const MoEOverlayFixedDownProjectionBank> fixed_down = {}, int source_expert = -1,
             PlanningPreparedOwnerDispatch owner_dispatch = {});
 
+    private:
+        friend class MoEOverlayCPUServiceMeasurement;
+        /**
+         * @brief Observe one genuine complete original GPU cohort without serving mutation.
+         * @param registry Same model/source-bound initial banks; all member readers span capture/replay.
+         * @param epoch Original installed initial epoch.
+         * @param cohort Same original source cohort retained by every member family.
+         * @param layer Original global layer. @param expert Same original resident expert on every member.
+         * @param phase Explicit original arithmetic phase, independent of capacity.
+         * @param native Original once-per-domain native borrow; singleton is an identity.
+         * @param memory Sole original PMA. @param profile Original complete source workspace metadata.
+         * @param inventory Same rank's physical GPU compute geometry.
+         * @param calibrations One same-source cold calibration owner per original ordered member.
+         * @return Separate complete, concurrent compute and per-frame communication observations.
+         * @throws std::exception For incomplete/foreign sources, domains, admission or native progress.
+         * @note No serving runtime, histogram, placement bank or communicator is created or mutated.
+         */
+        static PlanningGPUCohortServiceObservation measurePreparedCohort(
+            const MoEOverlayParticipantResidencyRegistry& registry,uint64_t epoch,
+            const std::shared_ptr<const MoEExpertShardCohort>& cohort,int layer,int expert,
+            ExpertHistogramSource phase,const NativeLocalTPContextBorrow& native,
+            const std::shared_ptr<PhysicalMemoryAuthority>& memory,const ModelMemoryProfile& profile,
+            const RankInventory& inventory,
+            std::span<const std::shared_ptr<RetainedParticipantGraphExecutable>> calibrations);
+
+    public:
         /**
          * @brief Prepare once and measure the retained decode and prefill graphs used by startup ranking.
          * @param source Same retained source used for admission.

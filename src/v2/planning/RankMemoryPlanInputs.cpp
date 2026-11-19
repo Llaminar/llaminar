@@ -804,6 +804,7 @@ namespace llaminar2
         for (auto &input : device_configs){
             if (request.native_source_placement) input.native_source_placement=*request.native_source_placement;
             input.native_context_preparation=request.plan.runtime.native_context_preparation;
+            input.rank_ordered_resources=rankOrderedResourcesForDevice(request.plan.runtime.rank_ordered_resources,input.device);
             input.retained_host_services=request.plan.runtime.retained_host_services;
             if(input.native_context_preparation){
                 const auto& original=input.native_context_preparation->mandatoryBOM();

@@ -4,6 +4,8 @@
  *
  * A placement plan names the tier containing every expert; this type resolves
  * that logical placement to one whole owner or an explicit joint fragment cohort.
+ * Original per-tier/layer cohort control blocks survive an empty selection;
+ * source provenance does not imply physical bytes or execution readiness.
  * Ordinary graph execution accessors reject joint placement until its real
  * prepared/collective path exists; no participant is chosen as a false whole
  * owner. Initial whole-expert maps use
@@ -165,6 +167,8 @@ namespace llaminar2
          * @note Explicit CPU TP1 retains its policy identity and uses full-matrix ordinary storage.
          */
         [[nodiscard]] static bool usesCPUJointFragments(const MoERoutedExpertPlacementPlan& plan) noexcept;
+        /** @return Whether an original routed tier contains a complete CPU or GPU shard cohort. */
+        [[nodiscard]] static bool usesJointFragments(const MoERoutedExpertPlacementPlan& plan) noexcept;
 
         /**
          * @brief Observe actual cold canonical constructor entries, including failures.
@@ -186,8 +190,8 @@ namespace llaminar2
             const MoEExpertOwnerMapBuildOptions &options = {});
 
         /**
-         * @brief Resolve source-native CPU shard cohorts in the canonical placement authority.
-         * @param plan Complete original logical tier placements and bound CPU node-TP membership.
+         * @brief Resolve source-native shard cohorts in the canonical placement authority.
+         * @param plan Original tier placements and bound CPU node-local or GPU rank-local membership.
          * @param manifest Exact original owned layer source contracts, retaining global IDs.
          * @return One logical placement row per expert, with either a whole owner or a joint cohort.
          * @throws std::invalid_argument For missing/foreign source, endpoints or unsupported native cuts.
@@ -217,6 +221,18 @@ namespace llaminar2
                                                       const MoEExpertOwnerMap &previous,
                                                       const MoEExpertOwnerMap &original,
                                                       std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes = {});
+
+        /**
+         * @brief Borrow the original source-proven cohort independently of live expert selection.
+         * @param tier_index Exact original routed tier coordinate.
+         * @param layer_idx Exact model-global source layer.
+         * @return The SAME block created by buildShardPlacement, including an initially empty
+         *         tier; null for whole targets, negative coordinates or an absent source layer.
+         * @note Original placement rows and every successor borrow these blocks. This source
+         *       provenance owns no expert payload, readiness, capacity or live placement mirror.
+         */
+        [[nodiscard]] std::shared_ptr<const MoEExpertShardCohort> originalShardCohort(
+            int tier_index, int layer_idx) const noexcept;
 
         /**
          * @param layer_idx Original model-global layer.
@@ -376,8 +392,16 @@ namespace llaminar2
             const MoEExpertOwnerMapBuildOptions &options,
             const MoEExpertOwnerMap *previous);
 
+        /** @brief Canonical source family created once even when the tier initially owns no experts. */
+        struct OriginalShardCohort
+        {
+            int tier_index;
+            std::shared_ptr<const MoEExpertShardCohort> cohort;
+        };
         std::vector<MoEExpertOwner> owners_;
         std::vector<MoEExpertOwnerParticipant> participants_;
+        /** Source authority only; owner rows borrow the SAME blocks, never a rebuilt family. */
+        std::vector<OriginalShardCohort> original_shard_cohorts_;
     };
 
 } // namespace llaminar2

@@ -17,9 +17,9 @@ TEST(CPUJointReusableRegistryContract, PreservesCommittedSourceAndConsumesReplac
     const ModelContextId model{reinterpret_cast<std::uint64_t>(context.get())};
     auto manager=context->concreteWeightManager();
     const int id=staticJointMembers(original).front();
-    const auto *participant=original.preparation->cpuJointOwnerMap()->participantForId(id);
+    const auto *participant=original.preparation->jointOwnerMap()->participantForId(id);
     ASSERT_TRUE(participant);
-    const auto selected=original.preparation->cpuShardSourceFor(7,*participant);
+    const auto selected=original.preparation->shardSourceFor(7,*participant);
     ASSERT_TRUE(selected);
     const int expert=selected->expertIds().front();ASSERT_EQ(expert,64);
     InferenceStrategy strategy{.model_id=model};
@@ -62,9 +62,9 @@ TEST(CPUJointReusableRegistryContract, PreservesCommittedSourceAndConsumesReplac
         .projection_preparation=original.preparation,.first_model_layer=7,.original_model=model});
     std::string error;
     ASSERT_TRUE(banks.bindOriginalPreparedContext(context,original.preparation,&error))<<error;
-    ASSERT_TRUE(banks.registerInitialCPUJointBank(registry,model,id,&error))<<error;
+    ASSERT_TRUE(banks.registerInitialJointBank(registry,model,id,&error))<<error;
     auto installed=banks.endpoint(id)->acquire(1);ASSERT_TRUE(installed);
-    const auto before=registry.acquireCPUJointLayer(model,*participant,7);ASSERT_TRUE(before);
+    const auto before=registry.acquireJointLayer(model,*participant,7);ASSERT_TRUE(before);
     const auto incoming=manager->materialize(destination_plan);
     ASSERT_EQ(incoming.bindings().size(),3u);
     std::array<std::shared_ptr<ITensorGemm>,3> engines;
@@ -73,20 +73,20 @@ TEST(CPUJointReusableRegistryContract, PreservesCommittedSourceAndConsumesReplac
         engines[role]=manager->preparedWeightStore()->gemmKernelLifetime(*binding.prepared);
     }
     ASSERT_NE(engines[0],before->experts[expert].gate);
-    auto arrival=banks.prepareCPUJointArrivalFromInstalledBank(installed,id,7,expert,&error);
+    auto arrival=banks.prepareJointArrivalFromInstalledBank(installed,id,7,expert,&error);
     ASSERT_TRUE(arrival)<<error;
     for(std::size_t role=0;role<3;++role)
         ASSERT_TRUE(arrival->publish(static_cast<ExpertTierWeightProjection>(role),engines[role],&error))<<error;
-    MoEOverlayPreparedCPUFragmentPayload replacement;
-    ASSERT_TRUE(arrival->completeCPUFragment(replacement,&error))<<error;
+    MoEOverlayPreparedFragmentPayload replacement;
+    ASSERT_TRUE(arrival->completeFragment(replacement,&error))<<error;
     auto component=*installed;
-    component.layers[0].setResidentCPUFragment(expert,replacement);
+    component.layers[0].setResidentFragment(expert,replacement);
     ASSERT_TRUE(component.layers[0].experts.empty());
     // This is deliberately only private component map validation. No physical
     // seal is constructed and no participant bank/capture becomes ready here.
     for(int replay=0;replay<20;++replay) {
         ASSERT_TRUE(test::ExpertGemmRegistryResidencyTestAccess::replaceCPUFragmentBank(registry,banks,component,&error))<<error;
-        const auto acquired=registry.acquireCPUJointLayer(model,*participant,7);ASSERT_TRUE(acquired);
+        const auto acquired=registry.acquireJointLayer(model,*participant,7);ASSERT_TRUE(acquired);
         EXPECT_EQ(acquired->experts[expert].gate,engines[0]);
         EXPECT_EQ(acquired->experts[expert].up,engines[1]);EXPECT_EQ(acquired->experts[expert].down,engines[2]);
         ASSERT_EQ(acquired->sources.size(),before->sources.size());
@@ -95,7 +95,7 @@ TEST(CPUJointReusableRegistryContract, PreservesCommittedSourceAndConsumesReplac
             EXPECT_EQ(now.binding_id,old.binding_id);ASSERT_TRUE(now.prepared);ASSERT_TRUE(old.prepared);
             EXPECT_EQ(now.prepared->model_id,old.prepared->model_id);EXPECT_EQ(now.prepared->binding_id,old.prepared->binding_id);
             EXPECT_EQ(now.prepared->device,old.prepared->device);EXPECT_EQ(now.prepared->kind,old.prepared->kind);
-            EXPECT_EQ(now.native_source,old.native_source);EXPECT_EQ(now.cpu_joint_source,old.cpu_joint_source);
+            EXPECT_EQ(now.native_source,old.native_source);EXPECT_EQ(now.joint_source,old.joint_source);
             EXPECT_EQ(now.tensor,old.tensor);EXPECT_EQ(now.tensor_owner,old.tensor_owner);
             EXPECT_FALSE(now.tensor_owner.owner_before(old.tensor_owner));EXPECT_FALSE(old.tensor_owner.owner_before(now.tensor_owner));
         }
@@ -105,11 +105,11 @@ TEST(CPUJointReusableRegistryContract, PreservesCommittedSourceAndConsumesReplac
     }
     for(int mutation=0;mutation<3;++mutation) {
         auto bad=component;
-        if(mutation==0)bad.layers[0].cpu_fragment_family.reset();
-        if(mutation==1)bad.layers[0].cpu_fragments[expert]={};
+        if(mutation==0)bad.layers[0].fragment_family.reset();
+        if(mutation==1)bad.layers[0].fragments[expert]={};
         if(mutation==2)bad.participant_id=staticJointMembers(original).back();
         EXPECT_FALSE(test::ExpertGemmRegistryResidencyTestAccess::replaceCPUFragmentBank(registry,banks,bad,&error));
-        const auto unchanged=registry.acquireCPUJointLayer(model,*participant,7);ASSERT_TRUE(unchanged);
+        const auto unchanged=registry.acquireJointLayer(model,*participant,7);ASSERT_TRUE(unchanged);
         EXPECT_EQ(unchanged->experts[expert].gate,engines[0]);
     }
 }

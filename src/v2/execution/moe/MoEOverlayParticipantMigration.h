@@ -55,8 +55,8 @@ namespace llaminar2
         explicit MoEOverlayPreparedExpertArrival(
             DeviceMoEProjectionSet projections = DeviceMoEProjectionSet::CompleteExpert);
 
-        /** @return Whether this arrival has registry-authenticated CPU fragment provenance. */
-        bool isCPUJointFragment() const noexcept
+        /** @return Whether this arrival has registry-authenticated Expert fragment provenance. */
+        bool isJointFragment() const noexcept
         {
             return fragment_destination_.has_value();
         }
@@ -69,16 +69,16 @@ namespace llaminar2
          * @brief Seal a completed local fragment without representing it as a whole expert.
          * @param payload Receives genuine completed engines and fixed original cohort provenance.
          * @param error Precise wrong-arm, incomplete or failed-arrival diagnostic.
-         * @return True only for a complete registry-issued CPU fragment arrival.
+         * @return True only for a complete registry-issued Expert fragment arrival.
          */
-        bool completeCPUFragment(MoEOverlayPreparedCPUFragmentPayload &payload,
+        bool completeFragment(MoEOverlayPreparedFragmentPayload &payload,
                                  std::string *error = nullptr) const;
 
         /**
          * @return Required physical role set for this transfer transaction.
-         * @note CompleteExpert names gate/up/down roles only for a fragment arrival;
-         * it grants no whole-owner payload. isCPUJointFragment() distinguishes ownership,
-         * and completePayload() rejects that fragment arm.
+         * @note IntermediateShard requires all three local projections while
+         * retaining partial-output semantics. Only the source-bound registry
+         * may create this arm; completePayload() rejects it as a whole expert.
          */
         [[nodiscard]] DeviceMoEProjectionSet projections() const noexcept
         {
@@ -114,7 +114,7 @@ namespace llaminar2
         friend class MoEOverlayParticipantResidencyRegistry;
         /** @brief Immutable candidate identity issued only by the original source-bound registry.
          */
-        struct CPUFragmentDestination
+        struct FragmentDestination
         {
             ModelContextId model;
             std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation;
@@ -138,7 +138,7 @@ namespace llaminar2
             std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation,
             std::shared_ptr<const MoEExpertShardCohort> cohort, std::size_t member,
             uint64_t candidate_epoch, int expert);
-        const std::optional<CPUFragmentDestination> fragment_destination_;
+        const std::optional<FragmentDestination> fragment_destination_;
         mutable std::mutex mutex_;
         const DeviceMoEProjectionSet projections_;
         std::array<std::shared_ptr<ITensorGemm>, 3> engines_{};

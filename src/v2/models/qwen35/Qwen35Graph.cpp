@@ -14,6 +14,7 @@
  */
 
 #include "Qwen35Graph.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "execution/mtp/MTPForwardConstruction.h"
 #include "execution/compute_stages/stages/GDNSpeculativeWorkspaceContract.h"
 #include "execution/compute_stages/stages/GDNLiveStateWorkspaceContract.h"
@@ -1514,6 +1515,8 @@ namespace llaminar2
         conv_params.layer_idx = layer_idx;
         conv_params.workspace_namespace = workspace_namespace;
         conv_params.verifier_state_capture_rows = verifier_state_capture_rows;
+        if(force_decode_equivalent_gdn_verifier_prefill && batch_size==1 && config_.moe.routed_expert_plan)
+            conv_params.verifier_kernel_policy=config_.moe.routed_expert_plan->local_gpu_expert_kernel_policy;
         conv_params.speculative_state_slot_rows = verifier_state_capture_rows;
 
         // Use kernel instance from hybrid cache (lifetime tied to cache)
@@ -1574,6 +1577,7 @@ namespace llaminar2
         rec_params.chunk_size = 64;
         rec_params.use_qk_l2norm = true;
         rec_params.verifier_state_capture_rows = verifier_state_capture_rows;
+        rec_params.verifier_kernel_policy=conv_params.verifier_kernel_policy;
         rec_params.speculative_state_slot_rows = verifier_state_capture_rows;
         if (verifier_state_capture_supported && device.is_gpu())
         {

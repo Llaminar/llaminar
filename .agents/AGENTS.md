@@ -348,8 +348,14 @@ non-draft feature PRs enable native squash auto-merge, which must wait for every
 required gate, owner approval and an up-to-date merge candidate. The canonical
 PR workflow builds AVX2 and AVX512 full-backend model-free test images in
 parallel on separate self-hosted runners. Each runs complete device-free `Unit`
-plus the canonical preflight `host` lane, and both checks must pass. CUDA, ROCm and
-exclusive preflight lanes remain production gates. A successful develop merge
+plus the canonical preflight `host` lane. AVX2 additionally requires the
+complete hardware-qualified `ProductionTestPreflight` inventory in a separate
+GPU container, including CUDA, ROCm, mixed-backend and exclusive work. Native
+hardware observation and explicit CMake requirements own eligibility; absent
+geometries remain unqualified in the receipt. Both GPUs are required, and
+failures or skips in selected tests block the gate. Both ISA checks must pass.
+Production certification still requires its own complete hardware qualification.
+A successful develop merge
 builds and publishes both AVX512 and AVX2 runtime images on the AVX2 development host,
 without compiling or running test images.
 These images are development artifacts; this gate does not certify a release.
@@ -618,12 +624,17 @@ production preflight: the dependency builder replays the actual selector and
 the original failing code, while installed runners authenticate the resulting
 source/DSO-bound proof without an SDK or accelerator.
 
-RCCL runtime loading uses the exact `RCCL_LIBRARY` selected by CMake, without a
-second runtime search. Select the compatible library explicitly when configuring
-a local build. Container builders and Release images install the same source-
-built RCCL at the same stable path; moving a checkout must not change the DSO.
-Its project-patched source/ABI pin is separate from the SDK release pin; compile
-it against the selected SDK and prove its native capture/storage contracts.
+The server, OpenCode, numerical tests and benchmarks use the same canonical
+RCCL and NCCL dependencies. Build RCCL with the pinned upstream commit,
+patches, function set and MSCCL setting used by the shipping image. Use
+`LLAMINAR_BUILD_RCCL_FROM_SOURCE=ON` to build it locally. CMake verifies the
+producing installation's evidence before binding either library by absolute
+path. To use extracted shipping libraries in a local checkout, provide
+`LLAMINAR_PUBLISHED_COLLECTIVE_IMAGE` with the immutable GHCR manifest
+reference. Configuration compares each selected ELF with its image and checks
+the upstream pin and patch inputs. OpenCode records the mapped libraries on
+the ranks that performed native collectives. Keep the driver and SDK versions
+independent of this dependency selection.
 Both loaders retain their exact selection until unload and withdraw resolved
 callbacks before closing a partially admitted library.
 `V2_Integration_NCCLPartialAdmission` and
@@ -703,8 +714,8 @@ container-scoped retirement even when a shared PID namespace exposes other jobs.
 Same-process SHM connections use native mapped pinned backing; cross-process
 connections retain real IPC, never an exported raw process pointer. The required
 passive storage ABI observes endpoint mappings, not unique physical bytes, and
-must never become a second admission ledger. `V2_Integration_RCCLHostTransportStorage`
-proves captured replay and both endpoint retirement orders; dependency admission
+must never become a second admission ledger. `V2_Integration_RCCLHostTransportStorage_Clique2`
+and `V2_Integration_RCCLHostTransportStorage_Clique4` each prove captured replay and both endpoint retirement orders; dependency admission
 and source-bound packaging regressions also belong to `ProductionTestPreflight`.
 
 ROCm graph execution also requires the canonical HIP runtime built by
@@ -749,7 +760,9 @@ segment still publishes a requested native completion signal, including child
 graphs and cross-stream consumers. A reserved signal without a producer is a
 fatal native lifecycle defect, not permission to add a host synchronization.
 `V2_Integration_HIPHostThreadStack` proves retained diagnostic/timeline graphs
-admit a client with large initial ELF TLS. Native pthread stack admission owns
+admit a client with large initial ELF TLS on a link with native host atomics.
+Production MoE kernels publish epoch failure status and trap on fatal routing
+contracts without requiring a hostcall listener. Native pthread stack admission owns
 that layout; never cap worker stacks below valid client TLS or add retries and
 environment overrides to hide a rejected thread. The installer backports the
 upstream stack repair when absent from its pinned release.
@@ -1227,7 +1240,8 @@ The registered pre-commit hook builds only `v2_unit_gate` and
 E2E, broader integration selections, or benchmarks. Register the tracked hooks
 with `git config --local core.hooksPath .githooks`; see `.githooks/README.md`.
 The [branch and release workflow](#branch-and-release-workflow) owns the CI
-sequence: Unit/host checks on feature PRs, build-only develop publication, then
+sequence: Unit/host checks plus AVX2 hardware-qualified production preflight on feature PRs,
+build-only develop publication, then
 the RC gate on the Xeon runner. `.github/workflows/master-pr-certification.yml`
 uses `run_published_image_suite.py` for complete preflight, numerical panels,
 OpenCode and benchmarks. `certify_release_candidate.py` joins their evidence;

@@ -169,7 +169,7 @@ namespace llaminar2
             int K,
             std::uint32_t maximum_chunk_bytes)
         {
-            if (!identity.valid() || !source_identity.present || N <= 0 ||
+            if (!identity.valid() || !source_identity.present || N <= 0 || N > std::numeric_limits<int32_t>::max() - 63 ||
                 K <= 0 || (K % 32) != 0 || maximum_chunk_bytes == 0)
             {
                 throw std::invalid_argument(
@@ -371,6 +371,48 @@ namespace llaminar2
         return seal(result);
     }
 
+    MoEOverlayRemoteProjectionManifest MoEOverlayRemoteProjectionManifest::forGPUIntersection(
+        const ExpertTierWeightProjectionIntersection& intersection) const
+    {
+        if (!valid() || !carriesGpuBytes() || intersection.empty() ||
+            intersection.source().rows != source_projection.rows ||
+            intersection.source().columns != source_projection.columns ||
+            intersection.source().columns % 32 || intersection.destination().columns % 32 ||
+            intersection.firstColumn() % 32 || intersection.columns() % 32 ||
+            intersection.sourceColumnOrigin() % 32 || intersection.destinationColumnOrigin() % 32)
+            throw std::invalid_argument("Native GPU remote intersection changed its original source or native K groups");
+        auto result = *this;
+        result.source_projection = intersection.source();
+        result.destination_projection = intersection.destination();
+        result.N = intersection.rows();
+        result.K = intersection.columns();
+        result.N_padded = (result.N + 63) / 64 * 64;
+        result.blocks_per_row = result.K / 32;
+        const auto blocks = std::uint64_t(result.N) * result.blocks_per_row;
+        result.region_bytes = {blocks * gpu_payload_bytes_per_block,
+            blocks * sizeof(std::uint16_t), gpu_is_asymmetric ? blocks * sizeof(std::uint16_t) : 0u,
+            gpu_has_emins ? blocks * sizeof(std::uint32_t) : 0u};
+        return seal(std::move(result));
+    }
+
+    std::optional<ExpertTierProjectionByteRange> MoEOverlayRemoteProjectionManifest::gpuRegionRange(
+        std::size_t region, std::uint64_t wire_offset, std::uint64_t capacity) const noexcept
+    {
+        if (!carriesGpuBytes() || region >= region_bytes.size() || !capacity ||
+            wire_offset >= region_bytes[region] || N <= 0 || K <= 0)
+            return std::nullopt;
+        const std::array<std::uint64_t, 4> block_bytes{gpu_payload_bytes_per_block,
+            sizeof(std::uint16_t), gpu_is_asymmetric ? sizeof(std::uint16_t) : 0u,
+            gpu_has_emins ? sizeof(std::uint32_t) : 0u};
+        try {
+            return expertTierProjectionByteRange(
+                ExpertTierWeightProjectionIntersection::between(source_projection,destination_projection),
+                ExpertTierProjectionByteOrder::NativeGPUBlocks,block_bytes[region],wire_offset,capacity);
+        } catch (const std::invalid_argument&) {
+            return std::nullopt;
+        }
+    }
+
     bool MoEOverlayRemoteProjectionManifest::matchesGpuDestinationProjection(
         const ExpertTierWeightProjectionIntersection &original,
         ExpertWeightFormat destination_format,
@@ -450,7 +492,7 @@ namespace llaminar2
         }
         else
         {
-            if (format_kind != ExpertWeightFormatKind::NativeQuantised ||
+            if (format_kind != ExpertWeightFormatKind::NativeQuantised || N > std::numeric_limits<int32_t>::max() - 63 ||
                 (K % 32) != 0 ||
                 N_padded != ((N + 63) / 64) * 64 ||
                 blocks_per_row != K / 32)
@@ -538,6 +580,10 @@ namespace llaminar2
             }
             else if (carriesGpuBytes())
             {
+            const auto overlap = ExpertTierWeightProjectionIntersection::between(source_projection, destination_projection);
+            if (source_projection.columns % 32 || destination_projection.columns % 32 ||
+                overlap.firstColumn() % 32 || overlap.sourceColumnOrigin() % 32 || overlap.destinationColumnOrigin() % 32)
+                return reject(error, "Native GPU roots must preserve original 32-element K groups");
             if (cpu_wire_columns_per_unit != 0 || !identity.source_device.is_gpu() ||
                 !identity.destination_device.is_gpu() ||
                 !validGpuExecutionFormat(*this, *source))

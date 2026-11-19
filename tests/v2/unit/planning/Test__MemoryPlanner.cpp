@@ -2062,6 +2062,88 @@ TEST(Test__MemoryPlanner,
         << "Protocol payload capacity is not a second physical GPU buffer";
 }
 
+/** @test Original native device roots and opaque host metadata enter the SAME BOM. */
+TEST(Test__MemoryPlanner, NativeRankOrderedConnectorStorageHasOnePhysicalBOM)
+{
+    const auto profile = createTestProfile();
+    DevicePlanConfig cfg;
+    cfg.device = DeviceId::rocm(3); cfg.world_rank = 0;
+    cfg.device_compute_units = 60; // Recorded MI50 geometry, with no runtime discovery.
+    cfg.device_total_bytes = cfg.device_free_bytes = 32ull << 30;
+    cfg.max_seq_len = 512; cfg.activation_seq_len = 64;
+    cfg.local_tp_backend = CollectiveBackendType::RCCL;
+    cfg.associated_host_memory = PhysicalMemoryResource{0, DeviceId::cpu(), 128ull << 30, 128ull << 30};
+    const auto control = MemoryPlanner::plan(profile, {cfg});
+    const RankOrderedNativeResources resource{cfg.device, 96u << 20, 32};
+    cfg.rank_ordered_resources = resource;
+    const auto candidate = MemoryPlanner::plan(profile, {cfg});
+    const auto *before = control.physicalPlan().find({0, cfg.device});
+    const auto *after = candidate.physicalPlan().find({0, cfg.device});
+    const auto *host = candidate.physicalPlan().find({0, DeviceId::cpu()});
+    ASSERT_NE(before, nullptr); ASSERT_NE(after, nullptr); ASSERT_NE(host, nullptr);
+    EXPECT_EQ(after->bytes(PhysicalMemoryOwner::LocalCollective) -
+        before->bytes(PhysicalMemoryOwner::LocalCollective), resource.device_bytes);
+    EXPECT_EQ(host->bytes(PhysicalMemoryOwner::LocalCollective), resource.hostBytes());
+    auto certificate = std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(candidate.physicalPlan());
+    PhysicalMemoryAuthority authority(certificate, 0);
+    {
+        auto device_reservation = authority.reserveNewAllocations(cfg.device,
+            PhysicalMemoryOwner::LocalCollective, resource.device_bytes);
+        auto host_reservation = authority.reserveNewAllocations(DeviceId::cpu(),
+            PhysicalMemoryOwner::LocalCollective, resource.hostBytes());
+        EXPECT_EQ(authority.reservedBytes(cfg.device, PhysicalMemoryOwner::LocalCollective), resource.device_bytes);
+        EXPECT_THROW((void)authority.reserveNewAllocations(DeviceId::cpu(),
+            PhysicalMemoryOwner::LocalCollective, 1u), std::logic_error);
+    }
+    EXPECT_EQ(authority.reservedBytes(cfg.device, PhysicalMemoryOwner::LocalCollective), 0u);
+    EXPECT_EQ(authority.reservedBytes(DeviceId::cpu(), PhysicalMemoryOwner::LocalCollective), 0u);
+    // A quote is a physical owner declaration, never a request to charge some
+    // similarly numbered CUDA device or a rank-global weight shard.
+    cfg.local_tp_backend = CollectiveBackendType::NCCL;
+    EXPECT_THROW((void)MemoryPlanner::plan(profile, {cfg}), std::invalid_argument);
+    cfg.local_tp_backend = CollectiveBackendType::RCCL;
+    cfg.rank_ordered_resources->device = DeviceId::rocm(2);
+    EXPECT_THROW((void)MemoryPlanner::plan(profile, {cfg}), std::invalid_argument);
+}
+
+/** @test Missing owners, duplicate identities, overflow and unmeasured large banks reject. */
+TEST(Test__MemoryPlanner, NativeRankOrderedConnectorPolicyAndProjection)
+{
+    for (const int degree : {1, 2, 3, 4, 8, 16})
+    {
+        std::vector<RankOrderedNativeResources> quotes;
+        for (int rank = 0; rank < degree; ++rank)
+            quotes.push_back({DeviceId::rocm(rank), std::size_t(rank + 1) << 20, std::size_t(rank)});
+        for (const auto &quote : quotes)
+            EXPECT_EQ(rankOrderedResourcesForDevice(quotes, quote.device), quote);
+        EXPECT_FALSE(rankOrderedResourcesForDevice(quotes, DeviceId::cuda(0)));
+        quotes.push_back(quotes.front());
+        EXPECT_THROW((void)rankOrderedResourcesForDevice(quotes, DeviceId::rocm(0)), std::invalid_argument);
+    }
+    EXPECT_EQ((RankOrderedNativeResources{DeviceId::rocm(0), 0, 0}).hostBytes(), 0u);
+    const RankOrderedNativeResources overflowing{DeviceId::rocm(0), 0, std::numeric_limits<std::size_t>::max()};
+    EXPECT_THROW((void)overflowing.hostBytes(), std::overflow_error);
+    for (const std::size_t elements : {1u, 33u, 2560u, 3u * 2560u, 8192u})
+    {
+        EXPECT_TRUE(useNativeRankOrderedPush(true, 1, elements));
+        EXPECT_FALSE(useNativeRankOrderedPush(false, 1, elements));
+    }
+    for (const std::size_t elements : {0u, 262145u, 129u * 2560u})
+        EXPECT_FALSE(useNativeRankOrderedPush(true, 1, elements));
+    for (const std::size_t columns : {33u, 2560u, 4096u})
+    {
+        EXPECT_TRUE(useNativeRankOrderedPush(true, 63, columns));
+        EXPECT_FALSE(useNativeRankOrderedPush(true, 64, columns));
+        EXPECT_FALSE(useNativeRankOrderedPush(true, 65, columns));
+    }
+    EXPECT_TRUE(useNativeRankOrderedPush(true, 32, 8192));
+    EXPECT_FALSE(useNativeRankOrderedPush(true, 33, 8192));
+    EXPECT_TRUE(useNativeRankOrderedPush(true, 1, rankOrderedPushMaxElements));
+    EXPECT_FALSE(useNativeRankOrderedPush(true, 0, 2560));
+    EXPECT_FALSE(useNativeRankOrderedPush(true, 1, 0));
+    EXPECT_FALSE(useNativeRankOrderedPush(true, SIZE_MAX, SIZE_MAX));
+}
+
 /** @test Native PP owns only its fence; it does not borrow TP conversion capacity. */
 TEST(Test__MemoryPlanner, NativePipelineFenceAccountingIsBackendSymmetric)
 {

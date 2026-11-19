@@ -31,6 +31,7 @@
 #pragma once
 
 #include "collective/NativeCollectiveBytes.h"
+#include "planning/PhysicalMemoryAuthority.h"
 
 #include "ICollectiveCoordinator.h"
 #include "../ICollectiveBackend.h" // For CollectiveDataType, CollectiveOp
@@ -46,6 +47,8 @@
 
 namespace llaminar2
 {
+    enum class RankOrderedPeerPushRequest;
+    class ROCmPeerPushResources;
 
     /**
      * @brief Dedicated coordinator thread for RCCL collective operations
@@ -61,6 +64,10 @@ namespace llaminar2
     {
     public:
         RCCLCoordinator();
+        /** @brief Bind the original model's admitted native transport selection before communicator creation. */
+        explicit RCCLCoordinator(RankOrderedPeerPushRequest request);
+        /** @return Immutable startup policy used to authenticate reuse of a pooled communicator. */
+        RankOrderedPeerPushRequest rankOrderedPushRequest() const noexcept { return rank_ordered_request_; }
         ~RCCLCoordinator() override;
 
         // Non-copyable, non-movable (owns thread state)
@@ -343,6 +350,21 @@ namespace llaminar2
         NativeCollectiveEnqueueResult nativeBroadcastBytesOnStream(const void* send, void* receive,
             const NativeCollectiveBytes& bytes, int root, int participant, void* stream);
 
+        /** @copydoc ICollectiveBackend::rankOrderedResources */
+        std::vector<RankOrderedNativeResources> rankOrderedResources() const;
+        /** @return Whether this original communicator quoted the prepared small-row transport. */
+        bool hasRankOrderedPeerPush() const noexcept { return !rank_ordered_resources_.empty(); }
+        /** @copydoc ICollectiveBackend::prepareRankOrderedResources */
+        bool prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory);
+        /** @brief Retire the original model's peer attachment after its graph owner releases all readers. */
+        void retireRankOrderedAttachmentAfterGraphRelease() noexcept;
+        /** @return Whether this coordinator may be parked without carrying a model-owned attachment. */
+        bool rankOrderedAttachmentAllowsPooling() const noexcept;
+
+        /** @copydoc ICollectiveBackend::rankOrderedFP32OnStream */
+        bool rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+            const NativeCollectiveRows &rows, int participant, void *stream);
+
         /** @copydoc ICollectiveBackend::nativeRowsOnStream */
         bool nativeRowsOnStream(
             NativeRowCollective operation, const void *send, void *receive,
@@ -576,6 +598,14 @@ namespace llaminar2
 
         // RCCL state (owned by coordinator thread)
         // Stored as void* to avoid including rccl.h in public header
+        const RankOrderedPeerPushRequest rank_ordered_request_; ///< Part of the pooled native communicator identity.
+        bool rank_ordered_push_selected_ = false; ///< Fixed for the original communicator before its worker starts.
+        std::vector<RankOrderedNativeResources> rank_ordered_resources_; ///< Original cold quote; never resampled after preparation.
+        struct RankOrderedAttachment;
+        std::unique_ptr<RankOrderedAttachment> rank_ordered_attachment_; ///< One model's unpooled PMA and native inboxes.
+        /** @brief Cold native creation is one-shot; failure can only retire the communicator. */
+        enum class RankOrderedPreparationState { Unselected, Quoted, Preparing, Ready, Failed, Retired };
+        RankOrderedPreparationState rank_ordered_state_ = RankOrderedPreparationState::Unselected;
         std::vector<void *> comms_;             // rcclComm_t[]
         std::vector<void *> streams_;           // hipStream_t[] - one per device
         std::vector<void *> completion_events_; // hipEvent_t[] - signaled after each collective

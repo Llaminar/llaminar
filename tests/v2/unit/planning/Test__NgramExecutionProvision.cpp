@@ -27,6 +27,10 @@
 #include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include <gtest/gtest.h>
+#ifdef HAVE_ROCM
+#include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNWorkspace.h"
+#include "utils/DebugEnv.h"
+#endif
 using namespace llaminar2;
 namespace {
 /** @return One observed PLE consumer with explicit backend-specific execution and shared host authority. */
@@ -1114,3 +1118,94 @@ TEST(NgramExecutionProvision, PipelineFixedHeadFinalAdmissionPricesAllOriginalSt
     EXPECT_THROW((void)ImmutableRowTablePlacementPlanner::select(request(short_groups), short_base),
         PhysicalMemoryCapacityExhausted);
 }
+
+/** @test Startup wire replay retains each real TP4 fragment coordinate used by the activation arena. */
+TEST(NgramExecutionProvision, TensorShardedTP4WireRetainsOriginalSharedAssignment)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    auto profile=source.metadata().memoryProfile();
+    // The generic QFN fixture records square-compatible projection metadata.
+    // Give its non-square shared triplet the exact current native K axes.
+    for(auto& tensor:profile.tensors)
+    {
+        if(tensor.name.ends_with("ffn_gate_shexp.weight") ||
+           tensor.name.ends_with("ffn_up_shexp.weight"))
+            tensor.K=profile.d_model;
+        if(tensor.name.ends_with("ffn_down_shexp.weight"))
+            tensor.K=profile.expert_shared_feed_forward_length;
+    }
+    auto configs=fixedHeadConsumers(profile,DeviceType::ROCm,4,false,
+        resolveGPUWeightLoadMemoryGeometry(maximumGGUFTensorPayloadBytes(source.loader().getModel()),{}));
+    for(auto& config:configs)
+    {
+        config.routed_compute_policy=RoutedExpertComputePolicy::TensorSharded;
+        config.ngram_execution_policy->distribution=ImmutableRowTableDistribution::Replicated;
+    }
+    const auto original=request(profile,configs);
+    const std::array requests{original};
+    const auto frame=ImmutableRowTableAdmissionSendFrame::prepare(requests,0,&profile);
+    const auto parsed=test::ImmutableRowTableAdmissionWireReplayAccess::parse(
+        frame.bytes(),0,&profile,original.native_ordering_events,original.retained_host_services);
+    ASSERT_EQ(parsed.size(),1u);
+    const auto& consumers=parsed.front().execution_provision->consumers();
+    ASSERT_EQ(consumers.size(),4u);
+    for(const auto& consumer:consumers)
+    {
+        const auto position=consumer.activation.shard_index;
+        ASSERT_GE(position,0);
+        ASSERT_LT(position,4);
+        const auto& config=configs.at(position);
+        EXPECT_EQ(consumer.resource.device,config.device);
+        EXPECT_EQ(consumer.activation.shared_tp_assignment,config.tensor_parallel_assignment);
+        ASSERT_TRUE(consumer.activation.shared_tp_assignment);
+        EXPECT_EQ(consumer.activation.shared_tp_assignment->d_ff_start,position*160);
+        EXPECT_EQ(consumer.activation.shared_tp_assignment->d_ff_count,160);
+    }
+    auto absent=configs;
+    absent.back().tensor_parallel_assignment.reset();
+    EXPECT_THROW((void)request(profile,absent),std::invalid_argument);
+}
+#ifdef HAVE_ROCM
+/** @test PMA includes the same exact retained serial-family requirement declared by the graph. */
+TEST(RetainedM1WorkspaceAdmission, OriginalTP4ContinuationPricesSealedWorkspace)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    auto profile=source.metadata().memoryProfile();
+    for(auto& tensor:profile.tensors)
+    {
+        if(tensor.name.ends_with("ffn_gate_shexp.weight") ||
+           tensor.name.ends_with("ffn_up_shexp.weight"))
+            tensor.K=profile.d_model;
+        if(tensor.name.ends_with("ffn_down_shexp.weight"))
+            tensor.K=profile.expert_shared_feed_forward_length;
+    }
+    auto configs=fixedHeadConsumers(profile,DeviceType::ROCm,4,false,
+        resolveGPUWeightLoadMemoryGeometry(maximumGGUFTensorPayloadBytes(source.loader().getModel()),{}));
+    for(auto& config:configs)
+    {
+        config.routed_compute_policy=RoutedExpertComputePolicy::TensorSharded;
+        config.ngram_execution_policy->distribution=ImmutableRowTableDistribution::Replicated;
+    }
+    const auto requirement=rocm::retainedM1HCFFNWorkspace();
+    ASSERT_NE(requirement.find(MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER),nullptr);
+    const auto extent=requirement.total_bytes_with_alignment();
+    ASSERT_GT(extent,0u);
+    const auto plan=MemoryPlanner::plan(profile,configs).physicalPlan();
+    auto fixture_without_fragments=configs;
+    for(auto& config:fixture_without_fragments)
+        config.routed_compute_policy=RoutedExpertComputePolicy::Replicated;
+    const auto staged=MemoryPlanner::plan(profile,fixture_without_fragments).physicalPlan();
+    for(const auto& config:configs)
+    {
+        const auto* retained=plan.find({config.world_rank,config.device});
+        const auto* ordinary=staged.find({config.world_rank,config.device});
+        ASSERT_NE(retained,nullptr);
+        ASSERT_NE(ordinary,nullptr);
+        EXPECT_EQ(retained->bytes(PhysicalMemoryOwner::ExecutionWorkspace),
+            ordinary->bytes(PhysicalMemoryOwner::ExecutionWorkspace)+
+                (qfnRetainedM1HCFFNEnabled(false)?extent:0));
+    }
+}
+#endif

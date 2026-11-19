@@ -1,6 +1,6 @@
 # =============================================================================
 # @file V2ParityTestDiscovery.cmake
-# @brief Canonical model-parity discovery and original native process-world registration.
+# @brief Generate exact CTest registrations from the linked executable in script mode.
 #
 # POST_BUILD helper script: runs a GTest binary with --gtest_list_tests
 # (no mpirun), parses the output, and generates a CTest include file with
@@ -46,6 +46,10 @@
 #   <BACKEND>_MODEL_FILES_SERIALIZED - Additional inputs for that backend
 # =============================================================================
 
+# A cmake -P process starts with its own policy scope. Use the same floor
+# that provides CTest timeout signals and grace periods for native MPI owners.
+cmake_minimum_required(VERSION 3.27)
+
 # A selected preflight-only placeholder must fail, while CTest inventory and
 # unrelated label selections remain usable before this target's first build.
 if(NATIVE_DISCOVERY_REQUIRED)
@@ -59,9 +63,6 @@ set(_production_campaign_completion_timeout_seconds 21600)
 
 # The original owner and builder namespace are mandatory registration inputs.
 # No runtime search or global /tmp directory may substitute for either one.
-if(CMAKE_VERSION VERSION_LESS "3.27")
-    message(FATAL_ERROR "Parity MPI ownership requires CMake/CTest >= 3.27 timeout signal grace")
-endif()
 if(NOT IS_ABSOLUTE "${MPI_SESSION_HELPER}" OR NOT EXISTS "${MPI_SESSION_HELPER}" OR IS_DIRECTORY "${MPI_SESSION_HELPER}")
     message(FATAL_ERROR "Parity discovery requires its exact built MPI_SESSION_HELPER")
 endif()

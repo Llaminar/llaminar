@@ -121,8 +121,8 @@ namespace llaminar2
                     .ordinal = 0u,
                     .layer = 1u,
                     .expert = 3u,
-                    .source_participant = 0u,
-                    .destination_participant = 1u,
+                    .source_target = MoEOverlayRouteTarget::whole(0u),
+                    .destination_target = MoEOverlayRouteTarget::whole(1u),
                     .payload_slot = 0u,
                     .flags = moeOverlayMovementFlags(
                         MoEOverlayDeviceMovementAxis::ParticipantPlacement, 1u),
@@ -227,6 +227,9 @@ namespace llaminar2
         fixture.binding.group_id = 1;
         fixture.binding.root_world_rank = 1;
         fixture.binding.group_record_count = 2u;
+        fixture.binding.group_records.resize(2u);
+        fixture.binding.topology_participant_records.resize(2u);
+        fixture.binding.topology_participant_record_counts.resize(2u);
         fixture.binding.group_records[1] = &follower_group;
         fixture.binding.topology_participant_records[1] =
             follower_participants.data();
@@ -659,8 +662,8 @@ namespace llaminar2
             .ordinal = 0u,
             .layer = 1u,
             .expert = 3u,
-            .source_participant = 0u,
-            .destination_participant = 1u,
+            .source_target = MoEOverlayRouteTarget::whole(0u),
+            .destination_target = MoEOverlayRouteTarget::whole(1u),
             .payload_slot = 0u,
             .payload_bytes = 4096u,
             .source_epoch = 7u,
@@ -863,6 +866,9 @@ namespace llaminar2
         remote_participants[0].topology_fingerprint = kFingerprint;
         fixture.layout.group_count = 2u;
         fixture.layout.participant_count = 3u;
+        fixture.binding.group_records.resize(2u);
+        fixture.binding.topology_participant_records.resize(2u);
+        fixture.binding.topology_participant_record_counts.resize(2u);
         fixture.binding.group_records[1] = &remote_group;
         fixture.binding.topology_participant_records[1] =
             remote_participants.data();

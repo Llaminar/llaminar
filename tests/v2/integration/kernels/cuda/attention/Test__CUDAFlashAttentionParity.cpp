@@ -9854,15 +9854,12 @@ TEST_F(Test__CUDAFlashAttentionParity, SafeguardedFP16TensorPrefillAutomaticLarg
     ASSERT_TRUE(plan.usesDeviceAdaptiveParallelism());
     EXPECT_EQ(plan.summary_capacity, 32);
     EXPECT_EQ(plan.max_context_partitions, logical_partitions);
-    ScopedCUDAAllocation q, k, v, output, reference, partial, maxima, denominators, params, count;
+    ScopedCUDAAllocation q, k, v, output, reference, params, count;
     ASSERT_TRUE(q.allocate(elements * sizeof(float)));
     ASSERT_TRUE(k.allocate(kv_elements * sizeof(uint16_t)));
     ASSERT_TRUE(v.allocate(kv_elements * sizeof(uint16_t)));
     ASSERT_TRUE(output.allocate(elements * sizeof(float)));
     ASSERT_TRUE(reference.allocate(elements * sizeof(float)));
-    ASSERT_TRUE(partial.allocate(plan.partial_output_bytes));
-    ASSERT_TRUE(maxima.allocate(plan.partial_m_bytes));
-    ASSERT_TRUE(denominators.allocate(plan.partial_l_bytes));
     ASSERT_TRUE(params.allocate(sizeof(attention::AttentionDeviceParams)));
     ASSERT_TRUE(count.allocate(sizeof(int)));
     auto queries = randomFP32(elements), key_values = randomFP32(kv_elements), value_values = randomFP32(kv_elements);
@@ -9887,9 +9884,6 @@ TEST_F(Test__CUDAFlashAttentionParity, SafeguardedFP16TensorPrefillAutomaticLarg
         std::pair{llaminar2::cuda::AttentionWorkspaceBuffers::PARTIAL_M, plan.partial_m_bytes},
         std::pair{llaminar2::cuda::AttentionWorkspaceBuffers::PARTIAL_L, plan.partial_l_bytes}})
         for (auto &buffer : requirements.buffers) if (buffer.name == name) buffer.size_bytes = bytes;
-    DeviceWorkspaceManager workspace(gpu_device_, requirements.total_bytes_with_alignment() + 4096);
-    ASSERT_TRUE(workspace.allocate(requirements));
-    kernel.bindWorkspace(&workspace);
     const auto compute = [&](auto &selected_kernel) {
         return selected_kernel.compute_tensor(&query, &key, &value, &result, 1, rows, 8192,
             heads, kv_heads, width, true, -1, nullptr, nullptr, &mpi_ctx_, cuda_ordinal_,
@@ -9907,6 +9901,17 @@ TEST_F(Test__CUDAFlashAttentionParity, SafeguardedFP16TensorPrefillAutomaticLarg
         ASSERT_TRUE(rejected.prepareDynamicAttnParams(8192, 8192 - rows, 1, attention_stream_, capacity));
         EXPECT_FALSE(compute(rejected));
     }
+    // The rejection and retained graphs never run concurrently. Retire the
+    // small arena before admitting the full production workspace.
+    DeviceWorkspaceManager workspace(gpu_device_, requirements.total_bytes_with_alignment() + 4096);
+    ASSERT_TRUE(workspace.allocate(requirements));
+    kernel.bindWorkspace(&workspace);
+    auto *partial = static_cast<float *>(workspace.getBuffer(llaminar2::cuda::AttentionWorkspaceBuffers::PARTIAL_OUTPUT));
+    auto *maxima = static_cast<float *>(workspace.getBuffer(llaminar2::cuda::AttentionWorkspaceBuffers::PARTIAL_M));
+    auto *denominators = static_cast<float *>(workspace.getBuffer(llaminar2::cuda::AttentionWorkspaceBuffers::PARTIAL_L));
+    ASSERT_NE(partial, nullptr);
+    ASSERT_NE(maxima, nullptr);
+    ASSERT_NE(denominators, nullptr);
     ASSERT_TRUE(kernel.prepareDynamicAttnParams(8192, 8192 - rows, 1, attention_stream_, capacity));
     ASSERT_TRUE(compute(kernel));
     ASSERT_EQ(cudaStreamSynchronize(attention_stream_), cudaSuccess);
@@ -9932,8 +9937,14 @@ TEST_F(Test__CUDAFlashAttentionParity, SafeguardedFP16TensorPrefillAutomaticLarg
         attention::AttentionDeviceParams live{.kv_len = visible, .kv_stride = capacity,
             .position_offset = visible - rows, .mask_stride = capacity};
         ASSERT_EQ(cudaMemcpyAsync(params.get(), &live, sizeof(live), cudaMemcpyHostToDevice, attention_stream_), cudaSuccess);
+        // The stream orders the independent reference after the production
+        // replay. Poison all shared scratch so the reference has to rebuild its
+        // own partials; the two output buffers remain physically distinct.
+        ASSERT_EQ(cudaMemsetAsync(partial, 0xff, plan.partial_output_bytes, attention_stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemsetAsync(maxima, 0xff, plan.partial_m_bytes, attention_stream_), cudaSuccess);
+        ASSERT_EQ(cudaMemsetAsync(denominators, 0xff, plan.partial_l_bytes, attention_stream_), cudaSuccess);
         ASSERT_EQ(cudaFlashAttn_prefill_fa2_fp16kv_context_parallel(q.as<float>(), k.get(), v.get(), reference.as<float>(),
-            partial.as<float>(), maxima.as<float>(), denominators.as<float>(), 1, rows, capacity, heads, kv_heads,
+            partial, maxima, denominators, 1, rows, capacity, heads, kv_heads,
             width, true, -1, 0, params.as<attention::AttentionDeviceParams>(), nullptr, 256, logical_partitions,
             4, 0, 1, nullptr, attention_stream_, cuda_ordinal_, 0, 0), 0);
         ASSERT_EQ(cudaMemcpyAsync(actual.data(), output.get(), elements * sizeof(float), cudaMemcpyDeviceToHost, attention_stream_), cudaSuccess);

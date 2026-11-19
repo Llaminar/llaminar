@@ -6,14 +6,20 @@
  * Projection-distributed tables retain immutable down slices while ordinary
  * placement banks publish only gate/up payloads. Portable request restore
  * rehydrates the declared family without rebinding model-owned graph weights.
+ * GPU F-shard tables retain closed source geometry without pinning an initial
+ * execution bank. Live cohort targets replace scalar ownership/replica masks.
  */
 
 #include "MoERuntimeTable.h"
+#include "MoEIntermediateShardDescriptorDeclaration.h"
 
 #include "DecodeExpertHistogram.h"
 #include "DeviceMoEOverlayEpochArena.h"
 #include "MoEOverlayEconomyCalibrationPlanner.h"
 #include "MoEOverlayFixedDownProjectionBank.h"
+#include "MoEOverlayParticipantResidency.h"
+#include "MoEExpertOverlayPreparationPlan.h"
+#include "MoEExpertShardCohort.h"
 #include "../../backends/BackendManager.h"
 #include "../../utils/Logger.h"
 #include "../../utils/PerfStatsCollector.h"
@@ -95,6 +101,7 @@ namespace llaminar2
 
                 if (saved.logical_expert_id != live_logical_expert ||
                     saved.owner_participant != live.owner_participant ||
+                    saved.overlay_route_participant != bank.overlay_route_participant[expert] ||
                     saved.local_compute !=
                         (bank.local_compute_mask[expert] != 0u ? 1u : 0u) ||
                     saved.replica_role != bank.replica_role[expert] ||
@@ -472,6 +479,10 @@ namespace llaminar2
         {
             if (!update.resident_participant_mask.empty())
                 return update.resident_participant_mask[expert];
+            // A fragment is one member of a cohort, not a whole-expert replica.
+            // Its immutable family and acquired target replace the finite mask.
+            if (update.experts[expert].projection_set == DeviceMoEProjectionSet::IntermediateShard)
+                return 0u;
             return synthesizedResidentParticipantMask(update, expert);
         }
 
@@ -876,9 +887,65 @@ namespace llaminar2
             "[DeviceMoESerialRouteScratchArena] free");
     }
 
+    size_t DeviceMoESerialRouteScratchArena::plannedAllocationBytes(const Config& config)
+    {
+        if(!config.device_id.is_gpu() || config.num_experts<=0 ||
+           config.num_experts>int(kDeviceMoEMaxExperts) || config.top_k<=0 ||
+           config.top_k>int(kDeviceMoEMaxTopK) || config.token_capacity<=0)
+            throw std::invalid_argument("MoE route scratch quote requires its original valid geometry");
+        DeviceMoEPrefillRouteScratchBindings planned;
+        planned.route_capacity=checkedRouteCapacity(config.token_capacity,config.top_k);
+        planned.expert_capacity=uint32_t(config.num_experts);
+        planned.llep_plan_capacity=uint32_t(config.num_experts)*kDeviceMoEMaxParticipants;
+        return prefillRouteScratchBindingBytes(planned);
+    }
+
+    DeviceMoERuntimeTable::PreparedServiceStorageGeometry
+    DeviceMoERuntimeTable::preparedFragmentServiceStorageGeometry(DeviceId device,int experts,int rows)
+    {
+        const auto route=DeviceMoESerialRouteScratchArena::plannedAllocationBytes({device,experts,1,rows});
+        constexpr size_t templates=kStateTemplateCopies*sizeof(DeviceMoELayerRuntime);
+        return {sizeof(DeviceMoERuntimeTable)+templates+2u*sizeof(uint8_t)+
+                    sizeof(DeviceMoEPrefillRouteScratchBindings)+
+                    sizeof(std::shared_ptr<const MoEOverlayFragmentFamily>),
+                templates+route};
+    }
+
     size_t DeviceMoESerialRouteScratchArena::allocationBytes() const noexcept
     {
         return prefillRouteScratchBindingBytes(bindings_);
+    }
+
+    DeviceMoEIntermediateShardBinding DeviceMoEIntermediateShardBinding::fromOriginalFamily(
+        const MoEOverlayFragmentFamily &family)
+    {
+        const auto &preparation = family.preparation();
+        const auto &cohort = family.cohort();
+        if (!family.model().value || !preparation || !preparation->jointOwnerMap() || !cohort ||
+            family.participantIndex() >= cohort->participants().size())
+            throw std::invalid_argument("GPU fragment binding requires the original prepared family");
+        const auto &member = cohort->participants()[family.participantIndex()];
+        const auto *original = preparation->jointOwnerMap()->participantForId(member.participant_id);
+        const auto &ownership = cohort->ownership(family.participantIndex());
+        const auto &geometry = ownership.geometry();
+        const auto source = original ? preparation->shardSourceFor(cohort->source().layer_idx, *original)
+                                     : nullptr;
+        if (!original || !original->device.is_gpu() || !member.address.isGPU() ||
+            original->address != member.address || original->world_rank != member.world_rank ||
+            !source || source->cohort() != cohort || source->cohort().owner_before(cohort) ||
+            cohort.owner_before(source->cohort()) || source->participantIndex() != family.participantIndex() ||
+            source->ownership() != ownership || geometry.experts <= 0 ||
+            geometry.experts > static_cast<int>(moe_runtime_abi::kMaxExperts))
+            throw std::invalid_argument("GPU fragment binding changed its original source/member geometry");
+        const auto &interval = ownership.intermediateIntervals()[family.participantIndex()];
+        DeviceMoEIntermediateShardBinding result;
+        result.target_ = MoEOverlayJointRouteTarget::fromOriginalCohort(
+            geometry.experts, member.participant_id, cohort->source().layer_idx, original->tier_idx);
+        result.model_columns_ = geometry.model_columns;
+        result.intermediate_columns_ = geometry.intermediate_columns;
+        result.first_intermediate_column_ = interval.first_column;
+        result.local_intermediate_columns_ = interval.columns;
+        return result;
     }
 
     DeviceMoERuntimeTable::DeviceMoERuntimeTable(Config config)
@@ -917,6 +984,34 @@ namespace llaminar2
                                         std::to_string(kDeviceMoEMaxTopK) + "]");
         if (mirror_to_device_ && !device_id_.is_gpu())
             throw std::runtime_error("[MoERuntimeTable] device mirroring requires a GPU device");
+        if (!config.fragment_families.empty())
+        {
+            if (!device_id_.is_gpu() || !fixed_down_banks_.empty() ||
+                config.fragment_families.size() != static_cast<size_t>(num_layers_))
+                throw std::invalid_argument("[MoERuntimeTable] fragment execution requires one original GPU family per layer and no fixed down bank");
+            fragment_descriptor_declarations_.reserve(num_layers_);
+            for (int row = 0; row < num_layers_; ++row)
+            {
+                const auto &family = config.fragment_families[row];
+                if (!family)
+                    throw std::invalid_argument("[MoERuntimeTable] fragment family is absent");
+                auto declaration = MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(family);
+                const auto &cohort = *family->cohort();
+                const auto &member = cohort.participants()[family->participantIndex()];
+                const auto *original = family->preparation()->jointOwnerMap()->participantForId(member.participant_id);
+                const auto &first = *config.fragment_families.front();
+                const auto &first_member = first.cohort()->participants()[first.participantIndex()];
+                if (original->device != device_id_ || cohort.source().layer_idx != firstModelLayer() + row ||
+                    cohort.ownership(family->participantIndex()).geometry().experts != num_experts_ ||
+                    family->model() != first.model() || family->preparation() != first.preparation() ||
+                    family->preparation().owner_before(first.preparation()) ||
+                    first.preparation().owner_before(family->preparation()) ||
+                    member != first_member || family->participantIndex() != first.participantIndex() ||
+                    !std::ranges::equal(cohort.participants(), first.cohort()->participants()))
+                    throw std::invalid_argument("[MoERuntimeTable] fragment families changed original model/layer/member identity");
+                fragment_descriptor_declarations_.push_back(std::move(declaration));
+            }
+        }
         if (!fixed_down_banks_.empty())
         {
             if (!device_id_.is_gpu() || fixed_down_banks_.size() != static_cast<size_t>(num_layers_))
@@ -1077,6 +1172,16 @@ namespace llaminar2
                 if (!source || !fixed_down_banks_[static_cast<size_t>(layer)]->sameIdentity(*source))
                     throw std::invalid_argument("[MoERuntimeTable] child and canonical table require identical fixed down bindings");
             }
+            for (int layer = 0; !fragment_descriptor_declarations_.empty() && layer < num_layers_; ++layer)
+            {
+                const auto *source = overlay_placement_source_->fragmentFamily(firstModelLayer() + layer);
+                const auto &family = *fragment_descriptor_declarations_[layer].originalFamily();
+                if (!source || family.model() != source->model() ||
+                    family.preparation() != source->preparation() || family.cohort() != source->cohort() ||
+                    family.cohort().owner_before(source->cohort()) || source->cohort().owner_before(family.cohort()) ||
+                    family.participantIndex() != source->participantIndex())
+                    throw std::invalid_argument("[MoERuntimeTable] child and canonical table require the same original fragment family");
+            }
             if (grouped_verifier_histogram_publication_ !=
                 GroupedVerifierHistogramPublicationMode::Disabled)
             {
@@ -1117,7 +1222,7 @@ namespace llaminar2
         for (int layer_idx = firstModelLayer(); layer_idx < endModelLayer(); ++layer_idx)
         {
             auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
-            resetLayer(state);
+            resetLayer(state, layer_idx);
             if (overlay_placement_source_)
             {
                 state.overlay_placement_banks =
@@ -2360,7 +2465,7 @@ namespace llaminar2
             const RuntimePersistentBindings scratch =
                 captureRuntimePersistentBindings(state);
 
-            resetLayer(state);
+            resetLayer(state, layer_idx);
             restoreRuntimePersistentBindings(state, scratch);
         }
     }
@@ -2590,6 +2695,17 @@ namespace llaminar2
             if (snapshot.expert_count != static_cast<uint32_t>(num_experts_) ||
                 snapshot.top_k != static_cast<uint32_t>(top_k_) || snapshot.active_bank > 1u)
                 throw std::invalid_argument(layerPrefix(firstModelLayer() + layer) + "runtime snapshot metadata mismatch");
+            const auto *fragment = fragmentFamily(firstModelLayer() + layer);
+            const auto expected_fragment = fragment ? DeviceMoEIntermediateShardBinding::fromOriginalFamily(*fragment)
+                                                    : DeviceMoEIntermediateShardBinding{};
+            if (snapshot.overlay_epoch_ticket != overlayEpochTicket() || snapshot.overlay_epoch_status != overlayEpochStatus())
+                throw std::invalid_argument(layerPrefix(firstModelLayer() + layer) + "snapshot cannot replace original epoch ticket/status aliases");
+            if (!snapshot.intermediate_shard.sameIdentity(expected_fragment))
+                throw std::invalid_argument(layerPrefix(firstModelLayer() + layer) + "snapshot cannot replace the original fragment binding");
+            if (const auto *family = fragmentFamily(firstModelLayer() + layer))
+                if (snapshot.participant_id != family->participantIndex() ||
+                    snapshot.participant_count != family->cohort()->participants().size())
+                    throw std::invalid_argument(layerPrefix(firstModelLayer() + layer) + "snapshot changed original fragment member coordinates");
             if (snapshot.active_epoch == 0u) continue;
             if (snapshot.banks[snapshot.active_bank].epoch != snapshot.active_epoch)
                 throw std::invalid_argument(layerPrefix(firstModelLayer() + layer) + "runtime snapshot active bank epoch mismatch");
@@ -2604,10 +2720,16 @@ namespace llaminar2
                 if (bank.epoch == 0u) continue;
                 if (bank.expert_count != static_cast<uint32_t>(num_experts_))
                     throw std::invalid_argument(layerPrefix(firstModelLayer() + layer) + "runtime snapshot bank geometry mismatch");
-                for (int expert = 0; expert < num_experts_; ++expert)
-                    if (bank.experts[expert].projection_set != movableProjections() ||
-                        !deviceMoEProjectionPayloadValid(bank.experts[expert]))
-                        throw std::invalid_argument(layerPrefix(firstModelLayer() + layer) + "snapshot cannot replace the movable projection family");
+                MoEPlacementUpdate contents{
+                    .epoch = bank.epoch, .expert_count = bank.expert_count,
+                    .participant_id = snapshot.participant_id, .participant_count = snapshot.participant_count,
+                    .experts = {bank.experts, bank.experts + num_experts_},
+                    .local_compute_mask = {bank.local_compute_mask, bank.local_compute_mask + num_experts_},
+                    .replica_role = {bank.replica_role, bank.replica_role + num_experts_},
+                    .resident_participant_mask = {bank.resident_participant_mask, bank.resident_participant_mask + num_experts_},
+                    .overlay_route_participant = {bank.overlay_route_participant, bank.overlay_route_participant + num_experts_},
+                    .transient_placement_observed = bank.transient_placement_observed != 0u};
+                validatePlacementContents(firstModelLayer() + layer, contents);
             }
         }
 
@@ -2800,6 +2922,7 @@ namespace llaminar2
                 dst.flags = portableMoEExpertFlags(desc.flags);
                 dst.local_compute = bank.local_compute_mask[static_cast<size_t>(expert)] != 0u ? 1u : 0u;
                 dst.replica_role = bank.replica_role[static_cast<size_t>(expert)];
+                dst.overlay_route_participant = bank.overlay_route_participant[static_cast<size_t>(expert)];
                 dst.resident_participant_mask =
                     bank.resident_participant_mask[static_cast<size_t>(expert)];
                 if (initial_state)
@@ -3079,6 +3202,7 @@ namespace llaminar2
                 static_cast<size_t>(num_experts_),
                 static_cast<uint8_t>(DeviceMoEReplicaRole::None));
             update.resident_participant_mask.assign(static_cast<size_t>(num_experts_), 0u);
+            update.overlay_route_participant.assign(static_cast<size_t>(num_experts_), -1);
 
             for (int expert = 0; expert < num_experts_; ++expert)
             {
@@ -3193,6 +3317,7 @@ namespace llaminar2
                 update.local_compute_mask[static_cast<size_t>(expert)] =
                     saved.local_compute != 0u ? 1u : 0u;
                 update.replica_role[static_cast<size_t>(expert)] = saved.replica_role;
+                update.overlay_route_participant[static_cast<size_t>(expert)] = saved.overlay_route_participant;
                 update.resident_participant_mask[static_cast<size_t>(expert)] =
                     saved.resident_participant_mask;
             }
@@ -3324,7 +3449,7 @@ namespace llaminar2
             auto &staging_state = host_layers_[layer];
             const RuntimePersistentBindings scratch =
                 captureRuntimePersistentBindings(staging_state);
-            resetLayer(staging_state);
+            resetLayer(staging_state, layer_idx);
             restoreRuntimePersistentBindings(staging_state, scratch);
         }
 
@@ -3408,6 +3533,20 @@ namespace llaminar2
         return fixed_down_banks_.empty() ? nullptr : fixed_down_banks_[storageIndexForModelLayer(layer_idx)].get();
     }
 
+    const MoEOverlayFragmentFamily *DeviceMoERuntimeTable::fragmentFamily(int layer_idx) const
+    {
+        const auto *source = fragmentDescriptorDeclaration(layer_idx);
+        return source ? source->originalFamily() : nullptr;
+    }
+
+    const MoEIntermediateShardDescriptorDeclaration *DeviceMoERuntimeTable::fragmentDescriptorDeclaration(
+        int layer_idx) const
+    {
+        validateLayerIndex(layer_idx);
+        return fragment_descriptor_declarations_.empty() ? nullptr :
+            &fragment_descriptor_declarations_[storageIndexForModelLayer(layer_idx)];
+    }
+
     void DeviceMoERuntimeTable::validateUpdate(int layer_idx, const MoEPlacementUpdate &update) const
     {
         if (update.epoch == 0)
@@ -3415,13 +3554,25 @@ namespace llaminar2
         const auto &state = host_layers_[storageIndexForModelLayer(layer_idx)];
         if (update.epoch <= state.active_epoch)
             throw std::invalid_argument(layerPrefix(layer_idx) + "placement update epoch must be newer than active epoch");
+        validatePlacementContents(layer_idx, update);
+    }
+
+    void DeviceMoERuntimeTable::validatePlacementContents(int layer_idx, const MoEPlacementUpdate &update) const
+    {
         if (update.expert_count != static_cast<uint32_t>(num_experts_))
             throw std::invalid_argument(layerPrefix(layer_idx) + "placement update expert_count must match table expert_count");
-        if (update.participant_count == 0 || update.participant_count > kDeviceMoEMaxParticipants)
+        const auto *source_declaration = fragmentDescriptorDeclaration(layer_idx);
+        const auto *fragment = source_declaration ? source_declaration->originalFamily() : nullptr;
+        if (update.participant_count == 0 || (!fragment && update.participant_count > kDeviceMoEMaxParticipants))
             throw std::invalid_argument(layerPrefix(layer_idx) + "participant_count must be in [1, " +
                                         std::to_string(kDeviceMoEMaxParticipants) + "]");
         if (update.participant_id >= update.participant_count)
             throw std::invalid_argument(layerPrefix(layer_idx) + "participant_id must be less than participant_count");
+        if (fragment && (update.participant_id != fragment->participantIndex() ||
+                         update.participant_count != fragment->cohort()->participants().size() ||
+                         update.overlay_route_participant.size() != update.expert_count ||
+                         update.transient_placement_observed))
+            throw std::invalid_argument(layerPrefix(layer_idx) + "fragment publication changed original member geometry or entered whole-expert LLEP");
         if (const auto *fixed = fixedDownProjectionBank(layer_idx))
         {
             if (update.participant_id != static_cast<uint32_t>(fixed->ownership().participant()) ||
@@ -3439,7 +3590,7 @@ namespace llaminar2
             throw std::invalid_argument(layerPrefix(layer_idx) + "placement update vectors must match expert_count");
         }
 
-        const uint32_t valid_participant_mask = participantMaskLimit(update.participant_count);
+        const uint32_t valid_participant_mask = fragment ? 0u : participantMaskLimit(update.participant_count);
         for (uint32_t expert = 0; expert < update.expert_count; ++expert)
         {
             const auto &desc = update.experts[expert];
@@ -3455,12 +3606,50 @@ namespace llaminar2
                 throw std::invalid_argument(layerPrefix(layer_idx) + "replica_role entries must be valid DeviceMoEReplicaRole values");
             const auto route_target =
                 MoEOverlayRouteTarget::fromWord(overlayRouteParticipantForUpdate(update, expert));
-            if (route_target.isCPUCohort() &&
+            if (fragment)
+            {
+                const auto &binding = source_declaration->originalBinding();
+                // A published fragment bank is complete for every expert, even
+                // rows owned by another cohort. Reject a missing destination or
+                // a whole-owner alias of this cohort member at the producer,
+                // before either physical bank can be changed. Consumers may
+                // then rely on the same immutable acquired ownership facts.
+                std::int32_t resolved_participant = -1;
+                if (route_target.isAbsent() ||
+                    !binding.target().resolve(static_cast<std::int32_t>(expert), route_target.word(),
+                                              &resolved_participant))
+                    throw std::invalid_argument(layerPrefix(layer_idx) +
+                        "fragment publication requires a complete destination without a whole/cohort member conflict");
+                const bool selected = route_target.word() == binding.target().cohortTarget();
+                const bool local = update.local_compute_mask[expert] != 0u;
+                if (desc.owner_participant != -1 || residentParticipantMaskForUpdate(update, expert) != 0u ||
+                    update.replica_role[expert] != static_cast<uint8_t>(DeviceMoEReplicaRole::None) ||
+                    hasMoEExpertFlag(desc.flags, DeviceMoEExpertFlags::Replicated) ||
+                    hasMoEExpertFlag(desc.flags, DeviceMoEExpertFlags::PreferredOwner) ||
+                    hasMoEExpertFlag(desc.flags, DeviceMoEExpertFlags::TransferSlot) || selected != local ||
+                    (!local && desc.flags != 0u))
+                    throw std::invalid_argument(layerPrefix(layer_idx) + "fragment membership must match its acquired cohort without a whole owner, replica or LLEP slot");
+                if (local)
+                {
+                    if (desc.logical_expert_id != static_cast<int32_t>(expert) || desc.local_slot < 0 ||
+                        !deviceMoEIntermediateShardFlagsValid(desc.flags) ||
+                        !descriptorReady(desc, DeviceMoEProjectionSet::IntermediateShard) ||
+                        desc.weight_format != source_declaration->weightFormat() ||
+                        !(desc.weight_format == DeviceMoEWeightFormat::NativeQuantised
+                            ? (source_declaration->matchesPublishedNativeGateUp(desc.gate,desc.up) &&
+                               source_declaration->matchesPublishedNativeDown(desc.down))
+                            : (source_declaration->matchesFloatingGateUp(desc.floating_gate,desc.floating_up) &&
+                               source_declaration->matchesFloatingDown(desc.floating_down))))
+                        throw std::invalid_argument(layerPrefix(layer_idx) + "fragment descriptor disagrees with original source precision/format or local geometry");
+                }
+                continue;
+            }
+            if (route_target.isCohort() &&
                 (desc.owner_participant >= 0 || update.local_compute_mask[expert] != 0u ||
                  residentParticipantMaskForUpdate(update, expert) != 0u))
                 throw std::invalid_argument(
                     layerPrefix(layer_idx) +
-                    "CPU cohort target cannot name a GPU-domain compute owner or resident mask");
+                    "External cohort target cannot name a GPU-domain compute owner or resident mask");
 
             const uint32_t resident_mask = residentParticipantMaskForUpdate(update, expert);
             if ((resident_mask & ~valid_participant_mask) != 0u)
@@ -3487,18 +3676,27 @@ namespace llaminar2
         }
     }
 
-    void DeviceMoERuntimeTable::resetLayer(DeviceMoELayerRuntime &state) const
+    void DeviceMoERuntimeTable::resetLayer(DeviceMoELayerRuntime &state, int layer_idx) const
     {
         state = DeviceMoELayerRuntime{};
         state.expert_count = static_cast<uint32_t>(num_experts_);
         state.top_k = static_cast<uint32_t>(top_k_);
         state.participant_id = 0;
         state.participant_count = 1;
+        if (const auto *family = fragmentFamily(layer_idx))
+        {
+            state.intermediate_shard = DeviceMoEIntermediateShardBinding::fromOriginalFamily(*family);
+            state.participant_id = static_cast<uint32_t>(family->participantIndex());
+            state.participant_count = static_cast<uint32_t>(family->cohort()->participants().size());
+        }
         state.banks[0].expert_count = static_cast<uint32_t>(num_experts_);
         state.banks[1].expert_count = static_cast<uint32_t>(num_experts_);
         for (auto &bank : state.banks)
-            for (auto &descriptor : bank.experts)
-                descriptor.projection_set = movableProjections();
+            for (uint32_t expert = 0; expert < kDeviceMoEMaxExperts; ++expert)
+            {
+                bank.experts[expert].projection_set = movableProjections();
+                bank.overlay_route_participant[expert] = MoEOverlayRouteTarget{}.word();
+            }
         /* The ticket address is model topology. Request reset clears routed
          * data but must never unbind the captured residency authority. */
         state.overlay_epoch_ticket = overlayEpochTicket();
@@ -3613,7 +3811,7 @@ namespace llaminar2
          */
         const auto scratch = captureRuntimePersistentBindings(state);
         auto &empty = empty_host_layers_[storageIndexForModelLayer(layer_idx)];
-        resetLayer(empty);
+        resetLayer(empty, layer_idx);
         restoreRuntimePersistentBindings(empty, scratch);
         if (initial_layer_captured_[storageIndexForModelLayer(layer_idx)] != 0u)
         {
@@ -3740,7 +3938,7 @@ namespace llaminar2
 
             const auto bindings = captureRuntimePersistentBindings(state);
             auto &empty = empty_host_layers_[storageIndexForModelLayer(layer_idx)];
-            resetLayer(empty);
+            resetLayer(empty, layer_idx);
             restoreRuntimePersistentBindings(empty, bindings);
             if (initial_layer_captured_[storageIndexForModelLayer(layer_idx)] != 0u)
             {
@@ -3775,12 +3973,11 @@ namespace llaminar2
         const size_t bytes = host_layers_.size() * sizeof(DeviceMoELayerRuntime);
         try
         {
-            device_layers_ = static_cast<DeviceMoELayerRuntime *>(
-                allocateMirror(device_id_, bytes, "[MoERuntimeTable] runtime table mirror allocation"));
-            device_initial_layers_ = static_cast<DeviceMoELayerRuntime *>(
-                allocateMirror(device_id_, bytes, "[MoERuntimeTable] initial runtime template allocation"));
-            device_empty_layers_ = static_cast<DeviceMoELayerRuntime *>(
-                allocateMirror(device_id_, bytes, "[MoERuntimeTable] empty runtime template allocation"));
+            const std::array<DeviceMoELayerRuntime**,kStateTemplateCopies> templates{
+                &device_layers_,&device_initial_layers_,&device_empty_layers_};
+            for(auto** destination:templates)
+                *destination=static_cast<DeviceMoELayerRuntime*>(allocateMirror(
+                    device_id_,bytes,"[MoERuntimeTable] runtime state/template allocation"));
         }
         catch (...)
         {

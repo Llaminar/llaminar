@@ -549,7 +549,7 @@ namespace
 
 TEST(Test__ExpertTierGpuPeerTransferCUDA, RepeatedPreparationPreservesCapturedAuxiliaryReset)
 {
-    if(cudaDeviceCount()<2)GTEST_SKIP()<<"Requires two actual CUDA devices";
+    ASSERT_GE(cudaDeviceCount(), 2) << "Peer preparation requires two physical devices";
     const int source=0,destination=1;
     const bool direct_peer=cudaPeerLaneEdgeAvailable();
     RecordProperty("direct_peer_available",direct_peer ? 1 : 0);
@@ -563,7 +563,7 @@ TEST(Test__ExpertTierGpuPeerTransferCUDA, RepeatedPreparationPreservesCapturedAu
 TEST(Test__ExpertTierGpuPeerTransferCUDA, PreparationPreservesUnrelatedPreexistingError)
 {
     const int count=cudaDeviceCount();
-    if(count<2)GTEST_SKIP()<<"Requires two actual CUDA devices";
+    ASSERT_GE(count, 2) << "Peer preparation requires two physical devices";
     std::thread worker([&]{
         ASSERT_EQ(cudaSetDevice(0),cudaSuccess);
         ASSERT_EQ(cudaPeekAtLastError(),cudaSuccess);

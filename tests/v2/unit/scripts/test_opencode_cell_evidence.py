@@ -21,6 +21,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / 'scripts/ci'))
 sys.path.insert(0, str(Path(__file__).parent))
 import opencode_evidence as evidence
+from run_model_parity_opencode import cell_evidence
 import run_opencode_matrix as matrix_cli
 import yaml
 from production_artifacts import digest
@@ -88,12 +89,27 @@ class CodingEvidenceTests(unittest.TestCase):
                                                  'retired_container': native}],
                            'native': {'complete': True, 'passed': True, 'joined_responses': 15,
                                       'verified_native_calls': 21, 'changed_responses': 0, 'changes': []},
-                           'perf': {'world_size': 1, 'records': [{'domain': 'server',
-                               'name': 'execution_participant', 'rank': 0, 'device': 'CUDA:0'}]},
+                           'perf': {'world_size': 1, 'records': [
+                               {'domain': 'server', 'name': 'process_identity', 'rank': 0,
+                                'phase': 'startup', 'kind': 'counter', 'value': 1,
+                                'tags': {'schema': '1', 'identity_source': 'native_pid_namespace', 'pid': '9'}},
+                               {'domain': 'server', 'name': 'execution_participant', 'rank': 0,
+                                'phase': 'startup', 'kind': 'counter', 'value': 1, 'device': 'CUDA:0',
+                                'tags': {'schema': '1', 'identity_source': 'communicator_cluster_inventory',
+                                         'source': 'resolved_execution_plan', 'backend': 'CUDA',
+                                         'physical_id': '1' * 32, 'pci_bus_address': '0000:3f:00.0'}}]},
+                           'collective_binding': {'schema': 'llaminar.collective_runtime_binding.v1',
+                               'image': control['image'], 'passed': True, 'native_communicators': [],
+                               'processes': [{'pid': 80, 'start_ticks': 91, 'mappings': {}, 'shipped': {}}]},
                            'runtime': deepcopy(self.runtime),
                            'resources': {'schema_version': 1, 'passed': True, 'container_id': 'f' * 64,
                                'boot_id': 'fixture-boot', 'observation_failures': [],
-                               'ranks': [{'rank': 0}],
+                               'discovery_membership': {'selected': [0], 'processes': [
+                                   {'discovery_rank': 0, 'namespace_pid': 9, 'pid': 80, 'start_ticks': 91}]},
+                               'discovery_baseline': {},
+                               'ranks': [{'rank': 0, 'pid': 80, 'start_ticks': 91,
+                                          'devices': [{'device': 'CUDA:0',
+                                              'physical_id': 'GPU-11111111-1111-1111-1111-111111111111'}]}],
                                'window': {'baseline': 19, 'started': 20, 'finished': 90,
                                           'maximum_sample_gap_seconds': 20,
                                           'maximum_stats_age_seconds': 10, 'page_size_bytes': 4096},
@@ -155,6 +171,54 @@ class CodingEvidenceTests(unittest.TestCase):
             del self.report['evidence'][key]
             with self.subTest(key=key), self.assertRaises((KeyError, ValueError)):
                 self.validate()
+
+    def test_compact_cell_preserves_collective_receipt(self):
+        """The publisher consumes the same raw witness saved by serving."""
+        receipt = self.report['evidence']['collective_binding']
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory)
+            (path / 'collective-runtime-binding.json').write_text(json.dumps(receipt))
+            self.assertEqual(cell_evidence(path)['collective_binding'], receipt)
+
+    def test_compact_cell_rejects_stale_or_contradictory_collective_witness(self):
+        """Outer green flags cannot authenticate a shadowed DSO or stale process."""
+        original = deepcopy(self.report)
+        mutations = [
+            lambda r: r['collective_binding'].update(image='sha256:' + '0' * 64),
+            lambda r: r['collective_binding']['processes'][0].update(start_ticks=92),
+            lambda r: r['collective_binding'].update(native_communicators=[{'rank': 0, 'backend': 'cuda'}]),
+            lambda r: r['resources']['ranks'][0]['devices'][0].update(
+                physical_id='GPU-22222222-2222-2222-2222-222222222222'),
+        ]
+        for index, mutate in enumerate(mutations):
+            self.report = deepcopy(original)
+            mutate(self.report['evidence'])
+            with self.subTest(index=index), self.assertRaises(ValueError):
+                self.validate()
+
+    def test_compact_cell_replays_narrowed_discovery_and_its_idle_resource_limit(self):
+        cell = self.report['evidence']
+        resources = cell['resources']
+        membership = resources['discovery_membership']
+        membership['processes'][0]['discovery_rank'] = 1
+        membership['processes'].insert(0, {'discovery_rank': 0, 'namespace_pid': 8, 'pid': 79,
+                                           'start_ticks': 90})
+        membership['selected'] = [1]
+        metric = 'discovery/0/anonymous_and_swap'
+        resources['discovery_baseline'][metric] = 8192
+        resources['growth']['peak_bytes'][metric] = 8192
+        resources['growth']['maximum_bytes'][metric] = 12287
+        cell['collective_binding']['processes'].append(
+            {'pid': 79, 'start_ticks': 90, 'mappings': {}, 'shipped': {}})
+        self.assertTrue(self.validate()['app']['gate_passed'])
+        # Same idle PID and map do not prove an executable role or admit growth.
+        membership['selected'] = [0]
+        with self.assertRaises(ValueError):
+            self.validate()
+        membership['selected'] = [1]
+        resources['growth']['maximum_bytes'][metric] += 1
+        with self.assertRaisesRegex(ValueError, 'execution growth allowance'):
+            self.validate()
 
     def test_stale_source_image_or_preceding_gate_cannot_be_relabelled_green(self):
         for key in ('source_revision', 'image', 'manifest_digest', 'images_digest',

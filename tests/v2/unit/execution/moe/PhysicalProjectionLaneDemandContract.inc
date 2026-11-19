@@ -103,8 +103,20 @@ TEST(MoEOverlayPhysicalPieceDemand, TwoCUDAFourROCmTwoCPUDeclaredTargetsRemainEx
         for(const auto device:{DeviceId::cuda(0),DeviceId::cuda(1),DeviceId::rocm(0),DeviceId::rocm(1),DeviceId::rocm(2),DeviceId::rocm(3)})
             EXPECT_EQ(pieceDemandCount(counts,MoEOverlayPhysicalLaneKind::RemoteSource,0,device,DeviceId::invalid(),role),2u);
     }
-    auto unsupported=plan;unsupported.domains.front().routed_compute_policy=RoutedExpertComputePolicy::TensorSharded;
-    EXPECT_THROW((void)configuredMoEOverlayLaneDemand(unsupported,source,512,3,1,1),std::invalid_argument);
+    auto sharded=plan;
+    sharded.domains.front().routed_compute_policy=RoutedExpertComputePolicy::TensorSharded;
+    const auto sharded_targets=configuredMoEOverlayProjectionTargets(sharded,source.front(),512);
+    ASSERT_EQ(sharded_targets.size(),6u);
+    const auto& cuda=sharded_targets.front().members;
+    ASSERT_EQ(cuda.size(),2u);
+    for(size_t member=0;member<cuda.size();++member) {
+        EXPECT_EQ(cuda[member].device,DeviceId::cuda(static_cast<int>(member)));
+        EXPECT_EQ(cuda[member].projections[0].rows,4096);
+        EXPECT_EQ(cuda[member].projections[2].columns,4096);
+    }
+    EXPECT_NO_THROW((void)configuredMoEOverlayLaneDemand(sharded,source,512,3,1,1));
+    sharded.domains.front().scope=ExecutionDomainScope::NODE_LOCAL;
+    EXPECT_THROW((void)configuredMoEOverlayLaneDemand(sharded,source,512,3,1,1),std::invalid_argument);
 }
 /** @test Retained setup ports are explicit capacities, never fictitious remote traffic. */
 TEST(MoEOverlayPhysicalPieceDemand, RetainedPortsPreserveWholeOwnerBOMWithoutTrafficClaims) {

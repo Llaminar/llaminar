@@ -121,30 +121,18 @@ namespace llaminar2
                 return false;
             }
             auto &record = *barrier.record;
-            constexpr std::uint32_t kParticipantCount =
-                kMoEOverlayDeviceControllerInferenceEpochMaxParticipants;
-            constexpr std::uint32_t kValidMask =
-                (1u << kParticipantCount) - 1u;
             const std::uint32_t participant = barrier.participant_id;
-            const std::uint32_t mask = record.participant_mask;
-            const std::uint32_t publisher =
-                record.publisher_participant_id;
-            if (record.magic !=
-                    kMoEOverlayDeviceControllerInferenceEpochMagic ||
-                record.version !=
-                    kMoEOverlayDeviceControllerInferenceEpochVersion ||
-                record.topology_fingerprint == 0u || mask == 0u ||
-                (mask & ~kValidMask) != 0u ||
-                participant >= kParticipantCount ||
-                publisher >= kParticipantCount ||
-                (mask & (1u << participant)) == 0u ||
-                (mask & (1u << publisher)) == 0u)
+            const std::uint32_t publisher = record.publisher_participant_id;
+            const auto lane = record.memberIndex(participant, barrier.storage_bytes);
+            auto *const arrivals = record.arrivals(barrier.storage_bytes);
+            if (!arrivals || lane == UINT32_MAX ||
+                record.memberIndex(publisher, barrier.storage_bytes) == UINT32_MAX)
             {
                 return false;
             }
 
             auto own_arrival = std::atomic_ref<std::uint64_t>(
-                record.arrival_sequence[participant]);
+                arrivals[lane]);
             const std::uint64_t previous = own_arrival.load(
                 std::memory_order_acquire);
             if (previous == std::numeric_limits<std::uint64_t>::max())
@@ -157,13 +145,11 @@ namespace llaminar2
             if (participant == publisher)
             {
                 for (std::uint32_t member = 0u;
-                     member < kParticipantCount;
+                     member < record.member_count;
                      ++member)
                 {
-                    if ((mask & (1u << member)) == 0u)
-                        continue;
                     auto arrival = std::atomic_ref<std::uint64_t>(
-                        record.arrival_sequence[member]);
+                        arrivals[member]);
                     while (arrival.load(std::memory_order_acquire) < sequence)
                         std::this_thread::yield();
                 }
@@ -264,7 +250,7 @@ namespace llaminar2
             (!parent->ticket.valid() || parent->ticket.parent_generation))valid=false;
         std::uint64_t admitted_epoch=finite_epoch;
         if(synchronized)valid=valid && resolveSynchronizedAdmission(external_admission_epoch,admission_barrier,&admitted_epoch,finite_epoch);
-        else if(admission_barrier.participant_id!=0xffffffffu)valid=false;
+        else if(!admission_barrier.empty())valid=false;
         else if(!finite_epoch && external_admission_epoch)
             admitted_epoch=std::atomic_ref<std::uint64_t>(*const_cast<std::uint64_t*>(external_admission_epoch)).load(std::memory_order_acquire);
         const auto acquired=valid ? (finite?protocol.tryAcquireFiniteChild(*parent,admitted_epoch):protocol.tryAcquireAdmitted(admitted_epoch)):std::nullopt;

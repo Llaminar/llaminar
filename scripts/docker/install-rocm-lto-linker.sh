@@ -6,6 +6,17 @@
 set -euo pipefail
 lto_script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 source "${lto_script_dir}/rocm-release.env"
+# This compiler proves every shipping target even for a single-architecture
+# RCCL build. A wider explicit image also needs compiler evidence for its
+# additional targets before the dependency can consume the linker.
+image_targets="$(bash "${lto_script_dir}/rocm-image-targets.sh" "${ROCM_IMAGE_GPU_TARGETS:-}")"
+IFS=';' read -r -a requested <<< "${image_targets}"
+compiler_targets="${LLAMINAR_ROCM_GPU_TARGETS}"
+for target in "${requested[@]}"; do
+    if [[ ";${compiler_targets};" != *";${target};"* ]]; then
+        compiler_targets+=";${target}"
+    fi
+done
 python3 "${lto_script_dir}/llvm-lto-linker/build.py" build \
     --sdk "${LLAMINAR_ROCM_ACTIVE_PREFIX}" \
     --prefix "${LLAMINAR_ROCM_LTO_LINKER_PREFIX}" \
@@ -17,4 +28,4 @@ python3 "${lto_script_dir}/llvm-lto-linker/build.py" build \
     --gvn-patch "${lto_script_dir}/patches/llvm-gvn-filtered-remarks.patch" \
     --patch "${lto_script_dir}/patches/llvm-parallel-lto-remarks.patch" \
     --spill-guard "${lto_script_dir}/../build/gpu_spill_guard.py" \
-    --architectures "${LLAMINAR_ROCM_GPU_TARGETS}"
+    --architectures "${compiler_targets}"

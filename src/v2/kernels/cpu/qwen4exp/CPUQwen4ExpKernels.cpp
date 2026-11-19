@@ -69,6 +69,64 @@ void channelBlocks(int rows, int width, Function function)
     };
     OMP_WORKSHARE_REGION(work);
 }
+/**
+ * @brief Normalize one already-rounded branch through the original SIMD 256-lane tree.
+ * @param hidden Branch width. @param epsilon Authenticated positive RMS epsilon.
+ * @param input Original published branch bytes. @param gain Actual branch gain.
+ * @param output Normalized destination. @param vectorWidth Selected native CPU SIMD width.
+ * @details Segment traversal, FMA lanes, ascending tree and gain order are shared
+ * by standalone normalization and fused write/next-norm, including scalar tails.
+ */
+void normalizeBranch(int hidden,float epsilon,const float *input,const float *gain,float *output,int vectorWidth)
+{
+    alignas(64) float partial[256]{};
+    for (int segment = 0; segment < hidden; segment += 256)
+    {
+        const int count = std::min(256, hidden - segment);
+        int lane = 0;
+#if defined(__AVX512F__)
+        if (vectorWidth == 16)
+            for (; lane + 16 <= count; lane += 16)
+            {
+                const auto value = _mm512_loadu_ps(input + segment + lane);
+                _mm512_store_ps(partial + lane, _mm512_fmadd_ps(value, value, _mm512_load_ps(partial + lane)));
+            }
+#endif
+#if defined(__AVX2__)
+        if (vectorWidth >= 8)
+            for (; lane + 8 <= count; lane += 8)
+            {
+                const auto value = _mm256_loadu_ps(input + segment + lane);
+                _mm256_store_ps(partial + lane, _mm256_fmadd_ps(value, value, _mm256_load_ps(partial + lane)));
+            }
+#endif
+        for (; lane < count; ++lane)
+        {
+            const auto value = input[segment + lane];
+            partial[lane] = std::fma(value, value, partial[lane]);
+        }
+    }
+    for (int stride = 128; stride > 0; stride /= 2)
+        for (int lane = 0; lane < stride; ++lane) partial[lane] += partial[lane + stride];
+    const float inverse = 1.0f / std::sqrt(partial[0] / static_cast<float>(hidden) + epsilon);
+    int channel = 0;
+#if defined(__AVX512F__)
+    if (vectorWidth == 16)
+        for (; channel + 16 <= hidden; channel += 16)
+            _mm512_storeu_ps(output + channel, _mm512_mul_ps(
+                _mm512_mul_ps(_mm512_loadu_ps(input + channel), _mm512_set1_ps(inverse)),
+                _mm512_loadu_ps(gain + channel)));
+#endif
+#if defined(__AVX2__)
+    if (vectorWidth >= 8)
+        for (; channel + 8 <= hidden; channel += 8)
+            _mm256_storeu_ps(output + channel, _mm256_mul_ps(
+                _mm256_mul_ps(_mm256_loadu_ps(input + channel), _mm256_set1_ps(inverse)),
+                _mm256_loadu_ps(gain + channel)));
+#endif
+    for (; channel < hidden; ++channel)
+        output[channel] = (input[channel] * inverse) * gain[channel];
+}
 /** @brief Stateless CPU bundle; graph-owned persistent buffers carry all state. */
 class CPUQwen4ExpKernels final : public IQwen4ExpKernels
 {
@@ -84,54 +142,8 @@ public:
             for (std::size_t task = 0; task < static_cast<std::size_t>(rows) * 4; ++task)
             {
                 const auto base = task * a.hidden;
-                alignas(64) float partial[256]{};
-                for (int segment = 0; segment < a.hidden; segment += 256)
-                {
-                    const int count = std::min(256, a.hidden - segment);
-                    int lane = 0;
-#if defined(__AVX512F__)
-                    if (vectorWidth == 16)
-                        for (; lane + 16 <= count; lane += 16)
-                        {
-                            const auto value = _mm512_loadu_ps(a.input + base + segment + lane);
-                            _mm512_store_ps(partial + lane, _mm512_fmadd_ps(value, value, _mm512_load_ps(partial + lane)));
-                        }
-#endif
-#if defined(__AVX2__)
-                    if (vectorWidth >= 8)
-                        for (; lane + 8 <= count; lane += 8)
-                        {
-                            const auto value = _mm256_loadu_ps(a.input + base + segment + lane);
-                            _mm256_store_ps(partial + lane, _mm256_fmadd_ps(value, value, _mm256_load_ps(partial + lane)));
-                        }
-#endif
-                    for (; lane < count; ++lane)
-                    {
-                        const auto value = a.input[base + segment + lane];
-                        partial[lane] = std::fma(value, value, partial[lane]);
-                    }
-                }
-                for (int stride = 128; stride > 0; stride /= 2)
-                    for (int lane = 0; lane < stride; ++lane) partial[lane] += partial[lane + stride];
-                const float inverse = 1.0f / std::sqrt(partial[0] / static_cast<float>(a.hidden) + a.epsilon);
-                const auto gainBase = (task % 4) * a.hidden;
-                int channel = 0;
-#if defined(__AVX512F__)
-                if (vectorWidth == 16)
-                    for (; channel + 16 <= a.hidden; channel += 16)
-                        _mm512_storeu_ps(a.output + base + channel, _mm512_mul_ps(
-                            _mm512_mul_ps(_mm512_loadu_ps(a.input + base + channel), _mm512_set1_ps(inverse)),
-                            _mm512_loadu_ps(a.gain + gainBase + channel)));
-#endif
-#if defined(__AVX2__)
-                if (vectorWidth >= 8)
-                    for (; channel + 8 <= a.hidden; channel += 8)
-                        _mm256_storeu_ps(a.output + base + channel, _mm256_mul_ps(
-                            _mm256_mul_ps(_mm256_loadu_ps(a.input + base + channel), _mm256_set1_ps(inverse)),
-                            _mm256_loadu_ps(a.gain + gainBase + channel)));
-#endif
-                for (; channel < a.hidden; ++channel)
-                    a.output[base + channel] = (a.input[base + channel] * inverse) * a.gain[gainBase + channel];
+                normalizeBranch(a.hidden,a.epsilon,a.input + base,a.gain + (task % 4) * a.hidden,
+                                a.output + base,vectorWidth);
             }
         };
         OMP_WORKSHARE_REGION(work);
@@ -243,6 +255,32 @@ public:
                     const float update = std::fma(gate, a.block[row * hidden + channel], 0.0f);
                     a.output[offset] = a.residual[offset] + update;
                 }
+            }
+        };
+        OMP_WORKSHARE_REGION(work);
+    }
+    /** @copydoc IQwen4ExpKernels::residualWriteBranchRMSNorm */
+    void residualWriteBranchRMSNorm(const ResidualWriteBranchRMSNormArgs &a, void *) const override
+    {
+        detail::validate(a);
+        const int rows = liveRows(a.extent);
+        const int vectorWidth = cpu_detail::vectorWidth();
+        auto work = [&]() {
+#pragma omp for schedule(static)
+            for (std::size_t task = 0; task < static_cast<std::size_t>(rows) * 4; ++task)
+            {
+                const auto base = task * a.hidden;
+                const auto blockBase = (task / 4) * a.hidden;
+                const float gate = 2.0f * sigmoid(a.gateLogits[task] * 0.25f);
+                for (int channel = 0; channel < a.hidden; ++channel)
+                {
+                    // The original CPU write uses an explicit zero FMA for the
+                    // product, then a separate rounded residual addition.
+                    const float update = std::fma(gate,a.block[blockBase + channel],0.0f);
+                    a.output[base + channel] = a.residual[base + channel] + update;
+                }
+                normalizeBranch(a.hidden,a.epsilon,a.output + base,a.gain + (task % 4) * a.hidden,
+                                a.normalized + base,vectorWidth);
             }
         };
         OMP_WORKSHARE_REGION(work);

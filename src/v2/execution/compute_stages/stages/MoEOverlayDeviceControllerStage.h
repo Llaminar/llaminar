@@ -53,6 +53,10 @@ namespace llaminar2
             /** Immutable phase identity for Dynamic policy authoring. */
             MoEOverlayDeviceDemandPhase demand_phase =
                 MoEOverlayDeviceDemandPhase::Invalid;
+            /** Original persistent owner binding, required only by a policy author. */
+            MoEOverlayDynamicPolicyWorkspaceBinding policy_workspace;
+            /** Exact original runtime and selected-counter baseline for snapshot capture. */
+            MoEOverlayDeviceSnapshotBinding snapshot;
             std::string workspace_name = "moe_overlay_device_controller";
             std::string stage_name = "moe_overlay_device_controller";
         };

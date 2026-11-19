@@ -10,6 +10,7 @@
 #include "backends/GPUDeviceProcessLifetime.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "mocks/MockWorkerGPUContext.h"
+#include "../../utils/IntentionalFaultProcess.h"
 #include <gtest/gtest.h>
 #include <cerrno>
 #include <csignal>
@@ -21,7 +22,6 @@
 #include <stdexcept>
 #include <string>
 #include <vector>
-#include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -108,8 +108,7 @@ namespace
     /** @brief Execute one isolated scenario; no child initializes a GPU runtime. */
     int runChild(const std::string &mode)
     {
-        const rlimit no_core{0, 0};
-        (void)setrlimit(RLIMIT_CORE, &no_core);
+        llaminar2::test::disableIntentionalFaultCoreDump();
         alarm(10); // A broken retirement lock fails this bounded device-free replay.
         if (std::atexit(verifyCallbacks) != 0) childFailure("cannot register final callback proof");
         if (mode == "late-cuda-first") lateAdmissions(true);

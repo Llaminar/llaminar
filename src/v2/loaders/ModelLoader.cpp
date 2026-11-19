@@ -21,6 +21,7 @@
 #include "../utils/PerfStatsCollector.h"
 #include "../utils/OpenMPUtils.h"
 #include "ModelLoader.h"
+#include "BoundedGPUExpertSource.h"
 #include "WeightIdentity.h"
 #include "../models/qwen4exp/Qwen4ExpSidecarManifest.h"
 #include "../tensors/Tensors.h"
@@ -2457,6 +2458,14 @@ namespace llaminar2
         size_t slice_cols = col_end - col_start;
         size_t block_size = info->getBlockSize();
         size_t type_size = info->getTypeSize();
+
+        // GPU preparation selects exact logical K32 blocks from an original
+        // source-aligned cover. Only the existing bounded upload ring reads
+        // those native bytes; no host dequantization or requantization occurs.
+        if (device.is_gpu() && weight_precision == WeightPrecision::NATIVE && block_size > 32 &&
+            (col_start % block_size || col_end % block_size))
+            return BoundedGPUExpertSource::declareColumns(*this, tensor_name,
+                nativeWeightSourceGeometry(tensor_name), col_start, slice_cols, device);
 
         // For quantized tensors, validate block alignment
         if (block_size > 0)

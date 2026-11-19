@@ -51,9 +51,9 @@ checked byte for byte.
 Native GPU events measure the slowest participant, including amortized arrival
 skew from host submissions. This fixture has no interlayer computation or
 optional sidebands; its total cannot simply be subtracted from a model's time.
-Protocol selection stays in the native RCCL planner. A fresh filtered process
-can explicitly load an isolated dependency through
-`LLAMINAR_RCCL_PERF_LIBRARY`; ordinary tests retain CMake's exact selection.
+Protocol selection stays in the native RCCL planner. This historical comparison
+used an experimental library override. Current benchmarks load the same
+canonical RCCL as the serving binary.
 
 The [complete component record](../../../../parity-results/qwen-flash-next/canonical70-analysis/report.json)
 retains all nine unprofiled observations and three separate kernel traces.

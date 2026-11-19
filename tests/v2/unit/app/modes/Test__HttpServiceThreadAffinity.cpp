@@ -20,12 +20,16 @@
 #include "httplib.h"
 
 #include <gtest/gtest.h>
+#include <chrono>
+#include <condition_variable>
 #include <filesystem>
 #include <future>
+#include <mutex>
 #include <set>
 #include <thread>
 #include <vector>
 #include <cstdlib>
+#include <unistd.h>
 
 using namespace llaminar2;
 
@@ -67,6 +71,29 @@ namespace
         for (const auto &entry : std::filesystem::directory_iterator("/proc/self/task"))
             result.insert(static_cast<pid_t>(std::stol(entry.path().filename().string())));
         return result;
+    }
+
+    /**
+     * @brief Wait for procfs to publish retirement of the already joined worker identities.
+     * @param remaining Exact TIDs captured while the original workers were live.
+     * @param budget Maximum time for the kernel to remove those task entries.
+     * @return Original task IDs still visible after the deadline, if any.
+     *
+     * Linux can wake pthread_join through clear_child_tid before removing the
+     * dead task from procfs. Retain the hard leak check after that observation edge.
+     */
+    std::set<pid_t> observeTaskRetirement(std::set<pid_t> remaining,
+                                          std::chrono::steady_clock::duration budget)
+    {
+        const auto deadline = std::chrono::steady_clock::now() + budget;
+        do
+        {
+            const auto visible = taskIds();
+            std::erase_if(remaining, [&](pid_t tid) { return !visible.contains(tid); });
+            if (remaining.empty() || std::chrono::steady_clock::now() >= deadline)
+                return remaining;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } while (true);
     }
 
     /** @brief Own one exclusively created temporary archive directory through worker retirement. */
@@ -147,9 +174,28 @@ TEST(PrefixArchiveWorkerAffinity, ProductionWriterAndMaintenanceUsePartitionAndR
         }
         const auto after_retirement = observedMask();
         EXPECT_TRUE(CPU_EQUAL(&after_retirement, &original));
-        const auto remaining = taskIds();
-        for (const pid_t tid : workers) EXPECT_FALSE(remaining.contains(tid));
+        EXPECT_TRUE(observeTaskRetirement(workers, std::chrono::seconds(2)).empty());
     }
+}
+
+/** @test A bounded procfs observation must still report an original live worker. */
+TEST(PrefixArchiveWorkerAffinity, RetirementObservationRejectsLiveWorker)
+{
+    std::promise<pid_t> identity;
+    auto started = identity.get_future();
+    std::mutex mutex;
+    std::condition_variable_any changed;
+    std::jthread worker([&](std::stop_token stop) {
+        identity.set_value(::gettid());
+        std::unique_lock lock(mutex);
+        changed.wait(lock, stop, [] { return false; });
+    });
+    ASSERT_EQ(started.wait_for(std::chrono::seconds(2)), std::future_status::ready);
+    const std::set<pid_t> expected{started.get()};
+    EXPECT_EQ(observeTaskRetirement(expected, std::chrono::milliseconds(10)), expected);
+    worker.request_stop();
+    worker.join();
+    EXPECT_TRUE(observeTaskRetirement(expected, std::chrono::seconds(2)).empty());
 }
 
 TEST(HttpServiceThreadAffinity, HttpChildrenUseAdmittedPartitionWhileInferenceKeepsItsPlacement)

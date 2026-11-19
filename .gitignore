@@ -57,6 +57,7 @@ Thumbs.db
 !tests/v2/performance/kernels/fixtures/*.csv
 !tests/v2/performance/kernels/cuda/gemm/fixtures/
 !tests/v2/performance/kernels/cuda/gemm/fixtures/*.csv
+# These three authored trainer fixtures contain synthetic timing labels.
 !tests/v2/performance/kernels/rocm/fixtures/rocm_native_quantised_prefill_alias_smoke.csv
 !tests/v2/performance/kernels/rocm/fixtures/rocm_native_quantised_decode_alias_smoke.csv
 !tests/v2/performance/kernels/rocm/fixtures/rocm_native_quantised_batched_decode_smoke.csv

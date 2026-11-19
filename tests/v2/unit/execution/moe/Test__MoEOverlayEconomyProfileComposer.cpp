@@ -334,7 +334,7 @@ namespace llaminar2::test
         ASSERT_EQ(service.target_costs.size(), whole_service.size());
         EXPECT_EQ(service.participantCosts()[1].nanoseconds_per_activation,
                   whole_service[1].nanoseconds_per_activation);
-        service.target_costs[1].target = MoEOverlayRouteTarget::cpuCohort(1);
+        service.target_costs[1].target = MoEOverlayRouteTarget::cohort(1);
         EXPECT_THROW((void)service.participantCosts(), std::invalid_argument);
         EXPECT_EQ(service.target_costs.size(), 2u);
         MoEOverlayMigrationCostProfile movement;
@@ -343,7 +343,7 @@ namespace llaminar2::test
         movement.setWholeCosts(whole_movement);
         ASSERT_EQ(movement.costs.size(), 1u);
         EXPECT_EQ(movement.wholeCosts()[0].transfer_and_repack_ns, 19u);
-        movement.costs[0].coordinate.destination_target = MoEOverlayRouteTarget::cpuCohort(1);
+        movement.costs[0].coordinate.destination_target = MoEOverlayRouteTarget::cohort(1);
         EXPECT_THROW((void)movement.wholeCosts(), std::invalid_argument);
         EXPECT_EQ(movement.costs.size(), 1u);
     }

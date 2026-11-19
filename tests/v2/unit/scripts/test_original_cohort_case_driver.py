@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file test_original_cohort_case_driver.py
+#  @brief Exercise original replay process ownership, filters and exit propagation.
 """Exercise the original cohort launcher with small, device-free child processes."""
 import itertools
 import json
@@ -28,6 +30,9 @@ import os
 import sys
 
 arguments = sys.argv[1:]
+if "COHORT_FIXTURE_LOAN" in os.environ:
+    actual = os.fstat(int(os.environ["COHORT_FIXTURE_LOAN"]))
+    assert actual.st_ino == int(os.environ["COHORT_FIXTURE_INODE"])
 record = dict(pid=os.getpid(), parent=os.getppid(), arguments=arguments,
               original=os.environ.get("COHORT_FIXTURE_ORIGINAL"),
               order=os.environ.get("COHORT_FIXTURE_ORDER"),
@@ -50,6 +55,17 @@ else:
             "COHORT_FIXTURE_FAULT": "inherited fault",
             "COHORT_FIXTURE_EXIT": "0",
         }
+
+    def test_owner_descriptor_survives_listing_and_every_original_child(self):
+        """A launcher-provided inheritable file keeps its original identity in every exec."""
+        with tempfile.TemporaryFile() as loan:
+            env = {**self.environment, "COHORT_FIXTURE_LOAN": str(loan.fileno()),
+                   "COHORT_FIXTURE_INODE": str(os.fstat(loan.fileno()).st_ino)}
+            run = subprocess.run([sys.executable, str(DRIVER), str(self.child),
+                                  "--gtest_filter=Backends/Replay.First/*"],
+                                 pass_fds=(loan.fileno(),), capture_output=True, text=True, env=env)
+            self.assertEqual(run.returncode, 0, run.stderr)
+            self.assertEqual(len(self.invocations()), 3)
 
     def launch(self, *arguments):
         """Execute the real driver with the fixture as its ordinary binary argument."""

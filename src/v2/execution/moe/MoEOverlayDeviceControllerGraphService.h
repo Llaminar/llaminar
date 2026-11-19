@@ -34,6 +34,7 @@
 namespace llaminar2
 {
     class IMPIContext;
+    class PhysicalMemoryAuthority;
     class MoEOverlayDeviceControllerTopology;
     class MoEOverlayNodeLocalDeviceControllerFabric;
     class MoEOverlayPhysicalResidencyFabric;
@@ -348,6 +349,8 @@ namespace llaminar2
             std::shared_ptr<const MoEOverlayDeviceControllerTopology> topology;
             /** Empty only on a world rank with no participant in this cell. */
             std::shared_ptr<MoEOverlayNodeLocalDeviceControllerFabric> fabric;
+            /** Same rank allocation authority admitted by the original local-capacity BOM. */
+            std::shared_ptr<PhysicalMemoryAuthority> physical_memory_authority;
             /** Exact model-owned runtime table for every local participant. */
             std::vector<MoEOverlayDeviceControllerRuntimeBinding>
                 runtime_bindings;

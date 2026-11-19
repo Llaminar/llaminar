@@ -1,4 +1,7 @@
-# Actual native-thread state binding and frozen original-body controls, with no runtime.
+## @file V2NativeDeviceBindingTests.cmake
+## @brief Register device-free binding replay and physical two-device alternation.
+# Native alternation retains its actual two-ordinal requirement independently
+# of the device-free negative controls and the number of MPI processes.
 add_executable(v2_unit_native_device_binding
     unit/backends/Test__NativeDeviceBinding.cpp
     unit/backends/Test__NativeDeviceBindingAbsentROCm.cpp)
@@ -20,7 +23,8 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeDeviceBindin
 add_v2_gpu_backend_test(v2_integration_native_device_binding
     integration/backends/Test__NativeDeviceBindingNative.cpp
     V2_Integration_NativeDeviceBindingNativeReplay
-    "V2;Integration;ProductionTestPreflight;Collective;Ownership;Replay;Regression")
+    "V2;Integration;ProductionTestPreflight;Collective;Ownership;Replay;Regression"
+    GPU_DEVICES 2)
 foreach(_binding_backend CUDA ROCm)
     if(TEST V2_Integration_NativeDeviceBindingNativeReplay_${_binding_backend})
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS

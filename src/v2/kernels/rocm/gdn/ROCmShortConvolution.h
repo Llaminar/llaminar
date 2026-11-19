@@ -12,6 +12,7 @@
 
 #pragma once
 
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include <limits>
 #include "../../../tensors/TensorKernels.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
@@ -45,6 +46,19 @@ extern "C"
         int snapshot_stride_floats,
         int max_snapshot_rows,
         int device_idx, void *stream);
+
+    bool rocmGDN_short_conv1d_effective_with_policy(
+        const float *input, const float *weight, const float *bias,
+        float *output,
+        const float *initial_conv_state,
+        float *updated_conv_state,
+        int seq_len, int channels, int kernel_size,
+        bool apply_silu,
+        const int *device_effective_seq_len,
+        float *state_snapshots,
+        int snapshot_stride_floats,
+        int max_snapshot_rows,
+        int device_idx, void *stream, bool qualified_default);
 
     bool rocmGDN_short_conv1d_batched(
         const float *input, const float *weight, const float *bias,
@@ -423,6 +437,18 @@ namespace llaminar2
             const int *device_effective_seq_len,
             bool apply_silu = true) override
         {
+            return forwardCountedWithPolicy(LocalGPUExpertKernelPolicy::Generic,input,weight,bias,output,conv_state,
+                seq_len,channels,kernel_size,device_effective_seq_len,apply_silu);
+        }
+
+        /** @brief Submit the original counted verifier convolution with its admitted local topology. */
+        bool forwardCountedWithPolicy(LocalGPUExpertKernelPolicy policy,
+            const float *input, const float *weight, const float *bias,
+            float *output, float *conv_state,
+            int seq_len, int channels, int kernel_size,
+            const int *device_effective_seq_len,
+            bool apply_silu)
+        {
             rocmGDN_gpu_set_device(device_ordinal_);
             const int required_state_size = channels * (kernel_size - 1);
             float *live_state = requireState(
@@ -451,7 +477,7 @@ namespace llaminar2
                 effective_output = scratchPointer();
             }
 
-            const bool ok = rocmGDN_short_conv1d_effective(
+            const bool ok = rocmGDN_short_conv1d_effective_with_policy(
                 input, weight, bias, effective_output,
                 live_state, updated_state,
                 seq_len, channels, kernel_size, apply_silu,
@@ -459,7 +485,7 @@ namespace llaminar2
                 verifier_state_capture_,
                 verifier_state_capture_size_,
                 verifier_state_capture_rows_,
-                device_ordinal_, stream_);
+                device_ordinal_, stream_,policy==LocalGPUExpertKernelPolicy::QFNMI50TP4);
             if (!ok)
                 return false;
 

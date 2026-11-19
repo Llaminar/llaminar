@@ -22,9 +22,10 @@ from opencode_tool_stress import (assessment, campaign_assessment, fixture_cases
                                   required_tools, session_prompts)
 
 
-def finished_report(*, errors: int = 0, attempts: int = 21, task_errors: list | None = None) -> dict:
+def finished_report(*, errors: int = 0, attempts: int = 21, task_errors: list | None = None,
+                    webapp_phases: int = 5) -> dict:
     """Retain declared real prompts with synthetic call and timing metadata."""
-    prompts = session_prompts('webapp', fixture_cases()['webapp'])
+    prompts = session_prompts('webapp', fixture_cases()['webapp'], webapp_phases)
     phases = []
     for index, prompt in enumerate(prompts):
         digest = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
@@ -73,6 +74,20 @@ class OpenCodeCertificationEvidenceTests(unittest.TestCase):
             report['gate_passed'] = True
             with self.assertRaises(ValueError):
                 validate(report)
+
+    def test_ten_turns_require_their_own_authored_prompts_and_complete_history(self):
+        report = finished_report(webapp_phases=10)
+        report['webapp_phases'] = 10
+        options = dict(model=report['model'], context_tokens=report['context_length'], webapp_phases=10)
+        self.assertEqual(validate_app_report(report, **options)['completed_phases'], 10)
+        with self.assertRaises(ValueError):
+            validate(report)
+        with self.assertRaises(ValueError):
+            validate_app_report(finished_report(), **options)
+        phases = report['results'][0]['phase_progress']['phases']
+        phases[6]['prompt'] = phases[5]['prompt']
+        with self.assertRaisesRegex(ValueError, 'phase 6'):
+            validate_app_report(report, **options)
 
     def test_missing_duplicated_changed_or_interrupted_phase_is_fatal(self):
         mutations = [lambda p: p.pop(), lambda p: p.__setitem__(2, deepcopy(p[1])),

@@ -15,10 +15,30 @@
  * Grouped down output starts with unspecified bytes. Checked live extents and
  * successful complete writers precede every output publication, including
  * zero contributions for inactive routes; gate/up alone owns no down output.
+ * Decode refreshes only its selected expert descriptors from the acquired
+ * bank; prefill continues to publish the complete grouped descriptor plan.
+ * Complete HC/router/FFN preparation reuses this same source/table owner and
+ * seals the original stage-owned HC phase binding with one full-function
+ * admission. Named temporary reuse is permitted only after its proved grid
+ * retirement; public sources, controller tables and counts remain protected.
  */
 
+#include "kernels/common/MoERuntimeDescriptorLaunch.h"
 #include "kernels/common/RouterQ8Launch.h"
+#include "kernels/common/OriginalM1HiddenQ8Publication.h"
 #include "ROCmMoEKernel.h"
+#include "kernels/rocm/gemm/ROCmGroupedFFNFrontier.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
+#include "kernels/rocm/gemm/ROCmGroupedFFNFormatSelection.h"
+#include "kernels/common/NativeQuantisedDescriptorValidation.h"
+#include "../gemm/ROCmResidentMoEFFN.h"
+#include "../gemm/ROCmNativeLayoutRouterFFN.h"
+#include "../gemm/ROCmFullNativeHCFFN.h"
+#include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNDevice.h"
+#include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNBinding.h"
+#include "kernels/common/FullNativeHCFFNBarrierLayout.h"
+#include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
+#include "utils/FNV1a.h"
 #include "kernels/common/MoEGroupedFloatingPrefillKernels.h"
 #include "kernels/common/MoEGroupedIntermediateExchangeKernels.h"
 #include "kernels/common/MoEGroupingInitialization.h"
@@ -30,10 +50,12 @@
 #include "../gemm/ROCmMoEGroupedPrefillKernels.h"
 #include "../gemm/ROCmMoERouteOwnedTuning.h"
 #include "../../../execution/moe/MoERuntimeTable.h"
+#include "../../../execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
 #include "../../../execution/moe/MoEWorkspaceRequirements.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 #include "../../../backends/GPUDeviceContextPool.h"
+#include "../../../backends/rocm/ROCmHardwareMetadata.h"
 #include "../../../backends/DeviceId.h"
 #include "../../../tensors/ITensor.h"
 #include "../../../tensors/TensorClasses.h"
@@ -46,6 +68,9 @@
 
 #include <hip/hip_runtime.h>
 #include <algorithm>
+#include <bit>
+#include <span>
+#include <string_view>
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
@@ -151,7 +176,8 @@ namespace
         const llaminar2::DeviceNativeQuantisedMatrixDesc *secondary,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        llaminar2::MoEDecodeDescriptorSource descriptor_source)
     {
         llaminar2::PersistentWorkspacePublicationKey key{
             .word0 = static_cast<std::uint64_t>(
@@ -160,7 +186,7 @@ namespace
                 static_cast<std::uint32_t>(d_model)),
             .word2 = static_cast<std::uint64_t>(
                 static_cast<std::uint32_t>(intermediate)),
-            .word3 = secondary ? 2U : 1U,
+            .word3 = (secondary ? 2U : 1U) | (static_cast<std::uint64_t>(descriptor_source) << 16U),
         };
         key.identity_words.reserve(
             static_cast<std::size_t>(num_experts) *
@@ -191,7 +217,8 @@ namespace
         llaminar2::DeviceMoEWeightFormat format,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        llaminar2::MoEDecodeDescriptorSource descriptor_source)
     {
         llaminar2::PersistentWorkspacePublicationKey key{
             .word0 = static_cast<std::uint64_t>(
@@ -201,6 +228,7 @@ namespace
             .word2 = static_cast<std::uint64_t>(
                 static_cast<std::uint32_t>(intermediate)),
             .word3 = 0x100U | (secondary ? 2U : 1U) |
+                     (static_cast<std::uint64_t>(descriptor_source) << 16U) |
                      (static_cast<std::uint64_t>(format) << 32U),
         };
         key.identity_words.reserve(
@@ -632,6 +660,12 @@ extern "C"
         int device_idx, void *stream,
         const int *device_effective_seq_len = nullptr);
 
+    bool hipMoE_gate_logits_fp16_decode_equivalent_rows_with_policy(
+        const float *hidden, const void *gate_weights_fp16, float *logits,
+        int seq_len, int d_model, int num_experts,
+        int device_idx, void *stream,
+        const int *device_effective_seq_len, bool qualified_default);
+
     bool hipMoE_gate_logits_bf16_decode_equivalent_rows(
         const float *hidden, const void *gate_weights_bf16, float *logits,
         int seq_len, int d_model, int num_experts,
@@ -653,7 +687,7 @@ extern "C"
         bool normalize_weights,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
-        bool fully_replicated_local_rows,
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
         void *runtime_layers,
         const void *rebalance_plan_entries,
         uint32_t rebalance_plan_capacity,
@@ -666,7 +700,8 @@ extern "C"
         int rebalance_target_layer,
         uint32_t rebalance_command_buffer_count,
         const int32_t *absolute_position_ids,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const int32_t *active_row_count_device);
 
     bool hipMoE_softmax_topk_decode_runtime_wave64(
         float *logits,
@@ -677,7 +712,7 @@ extern "C"
         bool normalize_weights,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
-        bool fully_replicated_local_rows,
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
         void *runtime_layers,
         const void *rebalance_plan_entries,
         uint32_t rebalance_plan_capacity,
@@ -690,7 +725,8 @@ extern "C"
         int rebalance_target_layer,
         uint32_t rebalance_command_buffer_count,
         const int32_t *absolute_position_ids,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const int32_t *active_row_count_device);
 
     bool hipMoE_softmax_topk_decode_unique_owner_wave64(
         float *logits,
@@ -703,7 +739,8 @@ extern "C"
         bool write_legacy_outputs,
         bool update_runtime_histogram,
         int device_idx,
-        void *stream);
+        void *stream,
+        const int32_t *active_row_count_device);
 
     bool hipMoE_softmax_topk_decode_equivalent_rows(
         float *logits,
@@ -713,6 +750,15 @@ extern "C"
         int device_idx, void *stream,
         const int *device_effective_seq_len = nullptr,
         void *deferred_selected_route_ledger = nullptr);
+
+    bool hipMoE_softmax_topk_decode_equivalent_rows_with_policy(
+        float *logits,
+        float *expert_indices, float *expert_weights,
+        int seq_len, int num_experts, int top_k,
+        bool normalize_weights,
+        int device_idx, void *stream,
+        const int *device_effective_seq_len,
+        void *deferred_selected_route_ledger, bool qualified_default);
 
     bool hipMoE_router_kpart_reduce_softmax_topk_decode_runtime(
         const float *partials,
@@ -724,7 +770,7 @@ extern "C"
         bool normalize_weights,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
-        bool fully_replicated_local_rows,
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
         void *runtime_layers,
         const void *rebalance_plan_entries,
         uint32_t rebalance_plan_capacity,
@@ -737,7 +783,8 @@ extern "C"
         int rebalance_target_layer,
         uint32_t rebalance_command_buffer_count,
         const int32_t *absolute_position_ids,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const int32_t *active_row_count_device);
 
     bool hipMoE_decode_route_select_runtime(
         const int *expert_indices,
@@ -747,7 +794,7 @@ extern "C"
         float *legacy_weights,
         int num_experts, int top_k,
         bool write_legacy_outputs,
-        bool update_runtime_histogram,
+        bool update_runtime_histogram, llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
         int device_idx, void *stream);
 
     bool hipMoE_device_rebalance_controller(
@@ -1027,7 +1074,7 @@ extern "C"
     bool hipMoE_shared_expert_gate_decode_fused(
         const float *input, const float *gate_inp,
         float *shared_output, int d_model,
-        int device_idx, void *stream);
+        int device_idx, void *stream, const int *device_effective_seq_len = nullptr);
 
     bool hipMoE_shared_expert_gate_add(
         const float *input, const float *gate_inp,
@@ -1236,25 +1283,6 @@ extern "C"
         const void *apply_status,
         int device_idx, void *stream);
 
-    bool hipMoE_materialize_runtime_prefill_descriptor_tables(
-        const void *runtime,
-        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
-        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
-        int num_experts,
-        int device_idx,
-        void *stream);
-
-    bool hipMoE_materialize_runtime_floating_descriptor_tables(
-        const void *runtime,
-        llaminar2::DeviceMoEFloatingMatrixDesc *gate_descs,
-        llaminar2::DeviceMoEFloatingMatrixDesc *up_descs,
-        llaminar2::DeviceMoEFloatingMatrixDesc *down_descs,
-        int num_experts,
-        llaminar2::DeviceMoEWeightFormat format,
-        int device_idx,
-        void *stream);
-
     bool hipMoE_prefill_gather_expert_runtime(
         const void *runtime,
         const float *hidden,
@@ -1304,7 +1332,8 @@ extern "C"
         uint8_t codebook_id,
         uint32_t policy_codebook_mask,
         int device_idx,
-        void *stream);
+        void *stream,
+        const llaminar2::NativeDownCompletionView* completion=nullptr);
 
     bool rocmMoE_grouped_swiglu_down_floating_decode_table(
         const float *const *d_gate_ptrs,
@@ -1343,7 +1372,8 @@ extern "C"
         uint8_t codebook_id,
         uint32_t policy_codebook_mask,
         int device_idx,
-        void *stream);
+        void *stream,
+        const llaminar2::NativeTileCompletionView* completion=nullptr);
 
     bool rocmMoE_grouped_gate_up_floating_decode_table(
         const float *d_hidden,
@@ -1730,6 +1760,52 @@ namespace
         }
     }
 
+}
+
+namespace llaminar2::rocm::grouped_ffn
+{
+/** @copydoc BoundSourceFormatProgram::prepare */
+BoundSourceFormatProgram BoundSourceFormatProgram::prepare(
+    DeviceMoERuntimeTable& table,int modelLayer,const Program& program,
+    const std::array<DeviceNativeQuantisedMatrixDesc,3>& shared)
+{
+    const auto* source=table.fragmentDescriptorDeclaration(modelLayer);
+    const auto device=table.deviceId();
+    if(!source || !device.is_rocm() || !table.isMirroredToDevice() ||
+       source->weightFormat()!=DeviceMoEWeightFormat::NativeQuantised ||
+       !source->validFor(device,experts,hidden,routedColumns(program)))
+        throw std::invalid_argument("Grouped FFN format program requires its original native ROCm runtime layer");
+    const auto& original=source->sourceFormats();
+    if(const auto* measured=std::get_if<MeasuredProgram>(&program)) {
+        if(measuredDecoder(routedColumns(measured->geometry),source->nativeGateUpEnvelope(),
+                source->nativeDownEnvelope(),original)!=measured->decoder)
+            throw std::invalid_argument("Measured grouped FFN disagrees with the original runtime source");
+        if(measured->sums==AffineSumSource::RouterPublication &&
+           !hasMeasuredSumLayout(measured->geometry,measured->decoder,original,shared))
+            throw std::invalid_argument("Measured grouped FFN runtime cannot consume the captured K32 sums");
+    } else {
+        const auto& format=std::get<SourceFormatProgram>(program);
+        const auto matchesEnvelope=[](const auto& actual,const auto& expected) {
+            return actual.execution_codebook_mask==expected.execution_codebook_mask &&
+                actual.policy_codebook_mask==expected.policy_codebook_mask;
+        };
+        const std::array sources{original[0].native_quantised,original[1].native_quantised,
+            original[2].native_quantised};
+        if(sources!=format.routedSources() ||
+           !matchesEnvelope(source->nativeGateUpEnvelope(),format.formats().routedGateUp) ||
+           !matchesEnvelope(source->nativeDownEnvelope(),format.formats().routedDown))
+            throw std::invalid_argument("Grouped FFN format program disagrees with the original runtime source");
+    }
+    auto* runtime=table.deviceLayerState(modelLayer);
+    if(!runtime)throw std::invalid_argument("Grouped FFN format program requires admitted device storage");
+    return BoundSourceFormatProgram(program,runtime,nativeQuantisedHardwareForDevice(device.ordinal));
+}
+
+/** @copydoc prepareFormatTables */
+bool prepareFormatTables(const WeightFormats& formats,int device)
+{
+    return !groupedPrefillMaskNeedsIQTables(formats.executionMask()) || ensureIQGridTablesInitialized(device);
+}
 }
 
 namespace llaminar2
@@ -2296,6 +2372,12 @@ namespace llaminar2
 
     void ROCmMoEKernel::clearWorkspaceScratchBindings() noexcept
     {
+        if(original_m1_hidden_q8_read_)
+            original_m1_hidden_q8_read_lifecycle_=OriginalM1HiddenQ8ReadLifecycle::Invalidated;
+        original_m1_hidden_q8_read_.reset();
+        gate_up_last_producer_.clear();
+        down_last_producer_.clear();
+        paired_router_descriptors_.reset();
         grouped_prefill_grouping_.invalidate();
         d_write_heads_ = nullptr;
         d_staging_indices_ = nullptr;
@@ -2415,6 +2497,13 @@ namespace llaminar2
             return false;
         }
 
+        // Source2 consumes live descriptors from its runtime bank. An empty
+        // original template needs local initialization only: allocation E is
+        // not an H2D communication extent. Keep the same slot and ready event.
+        const bool empty_original_image = table.original_family.valid() &&
+            (floating ? (std::all_of(table.host_floating_descs.begin(),table.host_floating_descs.end(),isBlankGroupedFloatingDesc))
+                      : (std::all_of(table.host_descs.begin(),table.host_descs.end(),isBlankGroupedDesc)));
+
         if (floating)
         {
             const size_t desc_bytes =
@@ -2429,7 +2518,7 @@ namespace llaminar2
                         table.weight_format,
                         table.num_experts,
                         table.d_model,
-                        table.intermediate),
+                        table.intermediate, table.descriptor_source),
                     MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                     [&](std::size_t slot) -> std::shared_ptr<void>
                     {
@@ -2474,12 +2563,9 @@ namespace llaminar2
                                     }
                                     delete value;
                                 });
-                        err = hipMemcpyAsync(
-                            device_descs,
-                            table.host_floating_descs.data(),
-                            desc_bytes,
-                            hipMemcpyHostToDevice,
-                            stream);
+                        err = empty_original_image
+                            ? hipMemsetAsync(device_descs,0,desc_bytes,stream)
+                            : hipMemcpyAsync(device_descs,table.host_floating_descs.data(),desc_bytes,hipMemcpyHostToDevice,stream);
                         if (err != hipSuccess)
                             return {};
                         err = hipEventRecord(ready_event, stream);
@@ -2520,7 +2606,7 @@ namespace llaminar2
                     nullptr,
                     table.num_experts,
                     table.d_model,
-                    table.intermediate),
+                    table.intermediate, table.descriptor_source),
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                 [&](std::size_t slot) -> std::shared_ptr<void>
                 {
@@ -2568,12 +2654,9 @@ namespace llaminar2
                                 delete value;
                             });
 
-                    err = hipMemcpyAsync(
-                        device_descs,
-                        table.host_descs.data(),
-                        desc_bytes,
-                        hipMemcpyHostToDevice,
-                        stream);
+                    err = empty_original_image
+                            ? hipMemsetAsync(device_descs,0,desc_bytes,stream)
+                            : hipMemcpyAsync(device_descs,table.host_descs.data(),desc_bytes,hipMemcpyHostToDevice,stream);
                     if (err != hipSuccess)
                     {
                         LOG_ERROR("[ROCmMoEKernel] Grouped down descriptor "
@@ -2649,6 +2732,15 @@ namespace llaminar2
             return false;
         }
 
+        // Source2 consumes live descriptors from its runtime bank. An empty
+        // original template needs local initialization only: allocation E is
+        // not an H2D communication extent. Keep the same slot and ready event.
+        const bool empty_original_image = table.original_family.valid() &&
+            (floating ? (std::all_of(table.host_floating_gate_descs.begin(),table.host_floating_gate_descs.end(),isBlankGroupedFloatingDesc) &&
+               std::all_of(table.host_floating_up_descs.begin(),table.host_floating_up_descs.end(),isBlankGroupedFloatingDesc))
+                      : (std::all_of(table.host_gate_descs.begin(),table.host_gate_descs.end(),isBlankGroupedDesc) &&
+               std::all_of(table.host_up_descs.begin(),table.host_up_descs.end(),isBlankGroupedDesc)));
+
         if (floating)
         {
             const size_t desc_bytes =
@@ -2663,7 +2755,7 @@ namespace llaminar2
                         table.weight_format,
                         table.num_experts,
                         table.d_model,
-                        table.intermediate),
+                        table.intermediate, table.descriptor_source),
                     MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                     [&](std::size_t slot) -> std::shared_ptr<void>
                     {
@@ -2719,20 +2811,14 @@ namespace llaminar2
                                     }
                                     delete value;
                                 });
-                        err = hipMemcpyAsync(
-                            device_gate_descs,
-                            table.host_floating_gate_descs.data(),
-                            desc_bytes,
-                            hipMemcpyHostToDevice,
-                            stream);
+                        err = empty_original_image
+                            ? hipMemsetAsync(device_gate_descs,0,desc_bytes,stream)
+                            : hipMemcpyAsync(device_gate_descs,table.host_floating_gate_descs.data(),desc_bytes,hipMemcpyHostToDevice,stream);
                         if (err != hipSuccess)
                             return {};
-                        err = hipMemcpyAsync(
-                            device_up_descs,
-                            table.host_floating_up_descs.data(),
-                            desc_bytes,
-                            hipMemcpyHostToDevice,
-                            stream);
+                        err = empty_original_image
+                            ? hipMemsetAsync(device_up_descs,0,desc_bytes,stream)
+                            : hipMemcpyAsync(device_up_descs,table.host_floating_up_descs.data(),desc_bytes,hipMemcpyHostToDevice,stream);
                         if (err != hipSuccess)
                             std::terminate();
                         err = hipEventRecord(ready_event, stream);
@@ -2777,7 +2863,7 @@ namespace llaminar2
                     table.host_up_descs.data(),
                     table.num_experts,
                     table.d_model,
-                    table.intermediate),
+                    table.intermediate, table.descriptor_source),
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                 [&](std::size_t slot) -> std::shared_ptr<void>
                 {
@@ -2835,12 +2921,9 @@ namespace llaminar2
                                 delete value;
                             });
 
-                    err = hipMemcpyAsync(
-                        device_gate_descs,
-                        table.host_gate_descs.data(),
-                        desc_bytes,
-                        hipMemcpyHostToDevice,
-                        stream);
+                    err = empty_original_image
+                            ? hipMemsetAsync(device_gate_descs,0,desc_bytes,stream)
+                            : hipMemcpyAsync(device_gate_descs,table.host_gate_descs.data(),desc_bytes,hipMemcpyHostToDevice,stream);
                     if (err != hipSuccess)
                     {
                         LOG_ERROR("[ROCmMoEKernel] Grouped gate descriptor "
@@ -2848,12 +2931,9 @@ namespace llaminar2
                                   << hipGetErrorString(err));
                         return {};
                     }
-                    err = hipMemcpyAsync(
-                        device_up_descs,
-                        table.host_up_descs.data(),
-                        desc_bytes,
-                        hipMemcpyHostToDevice,
-                        stream);
+                    err = empty_original_image
+                            ? hipMemsetAsync(device_up_descs,0,desc_bytes,stream)
+                            : hipMemcpyAsync(device_up_descs,table.host_up_descs.data(),desc_bytes,hipMemcpyHostToDevice,stream);
                     if (err != hipSuccess)
                     {
                         LOG_ERROR("[ROCmMoEKernel] Grouped up descriptor H2D "
@@ -3217,13 +3297,56 @@ namespace llaminar2
         return true;
     }
 
+    bool ROCmMoEKernel::prepareOriginalM1HiddenQ8Publication(const TensorBase* hidden,DeviceRowRange rows)
+    {
+        const auto identity=rows.captureIdentity();auto& publication=router_q8_hidden_publication_;
+        if(isGraphCaptureActive()||!publication||!publication->requiredOriginalM1Source()||
+           hidden!=publication->requiredOriginalM1Source()||identity!=DeviceRowRange::fullyActive(1).captureIdentity()||!workspace_)
+            throw std::invalid_argument("Original M1 hidden Q8 requires its cold declared fully-active source");
+        const auto stream=getStream();const int width=publication->requiredOriginalM1Width();
+        if(router_q8_publication_access_!=MoERouterQ8PublicationAccess::RequiredConsumer) {
+            if(!publication->original_m1_binding)
+                publication->original_m1_binding=std::make_shared<OriginalM1HiddenQ8Binding>(
+                    DeviceId::rocm(device_ordinal_),*hidden,width,stream,*workspace_,OriginalM1HiddenQ8Bank::RouterROCm);
+            publication->original_m1_binding->validate(*hidden,stream,workspace_);
+        } else {
+            if(!publication->original_m1_binding)throw std::logic_error("Original M1 hidden Q8 producer must prepare before its required reader");
+            if(original_m1_hidden_q8_read_lifecycle_==OriginalM1HiddenQ8ReadLifecycle::Invalidated)
+                throw std::logic_error("Original M1 hidden Q8 reader was retired by hard scratch reset");
+            if(!original_m1_hidden_q8_read_)
+                original_m1_hidden_q8_read_=std::make_shared<OriginalM1HiddenQ8ReadView>(
+                    publication->original_m1_binding,*hidden,stream,*workspace_);
+            original_m1_hidden_q8_read_->validate(*hidden,stream,workspace_);
+            original_m1_hidden_q8_read_lifecycle_=OriginalM1HiddenQ8ReadLifecycle::Prepared;
+        }
+        return true;
+    }
+
+    std::uint64_t ROCmMoEKernel::originalM1HiddenQ8BindingSignature() const
+    {
+        if(!router_q8_hidden_publication_||!router_q8_hidden_publication_->requiredOriginalM1Source())return 0;
+        const auto& publication=*router_q8_hidden_publication_;
+        if(publication.original_m1_binding) {
+            const auto stream=ExplicitGPUStream(gpu_stream_).get();
+            if(original_m1_hidden_q8_read_lifecycle_==OriginalM1HiddenQ8ReadLifecycle::Invalidated)
+                throw std::logic_error("Original M1 hidden Q8 reader lost its prepared scratch lifetime");
+            if(router_q8_publication_access_!=MoERouterQ8PublicationAccess::RequiredConsumer)
+                publication.original_m1_binding->validate(*publication.requiredOriginalM1Source(),stream,workspace_);
+            else if(original_m1_hidden_q8_read_)
+                original_m1_hidden_q8_read_->validate(*publication.requiredOriginalM1Source(),stream,workspace_);
+        }
+        // Declaration identity stays stable before/after first cold preparation;
+        // leases independently authenticate every embedded pointer on replay.
+        return 0x4d31513800000001ULL;
+    }
+
     bool ROCmMoEKernel::prepareRequiredRouterQ8Hidden(int rows, int width, int top_k)
     {
         (void)top_k;
         if (!router_q8_hidden_publication_ ||
             !router_q8_hidden_publication_->hasRequiredConsumer())
             return true;
-        if (router_q8_publication_access_ != MoERouterQ8PublicationAccess::ProducerAndConsumer ||
+        if (router_q8_publication_access_ == MoERouterQ8PublicationAccess::RequiredConsumer ||
             !router_q8_hidden_publication_->acceptsProducerRows(rows, width))
         {
             LOG_ERROR("[ROCmMoEKernel] required Q8 producer geometry/access mismatch");
@@ -3238,8 +3361,18 @@ namespace llaminar2
         if (!router_q8_hidden_publication_ ||
             !router_q8_hidden_publication_->hasRequiredConsumer())
             return true;
-        if (!prepareRequiredRouterQ8Hidden(rows, width, top_k) ||
-            !hipMoE_publish_original_hidden_q8_rows(source, d_router_q8_hidden_,
+        if (!prepareRequiredRouterQ8Hidden(rows, width, top_k)) return false;
+        const bool affine=router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumerWithExactK32Sums;
+        if (affine) {
+            namespace frontier=llaminar2::rocm::grouped_ffn;
+            auto* raw=workspace_?workspace_->getBuffer(MoEWorkspaceBuffers::PREFILL_A_INT8):nullptr;
+            if(!raw || rows!=frontier::capacity || width!=frontier::hidden || top_k!=frontier::topK || !live_rows ||
+               workspace_->getBufferSize(MoEWorkspaceBuffers::PREFILL_A_INT8)<frontier::k32SumWorkspaceBytes)
+                throw std::logic_error("Exact K32 sum router lost its admitted counted workspace");
+            if(!hipMoE_publish_original_hidden_q8_with_k32_sums(source,d_router_q8_hidden_,
+                d_router_q8_hidden_scales_,frontier::exactK32Sums(raw)->hiddenRows,device_ordinal_,getStream(),live_rows))
+                return false;
+        } else if(!hipMoE_publish_original_hidden_q8_rows(source, d_router_q8_hidden_,
                 d_router_q8_hidden_scales_, rows, width, device_ordinal_, getStream(), live_rows))
             return false;
         publishRouterQ8Hidden(source, rows,
@@ -3252,8 +3385,8 @@ namespace llaminar2
 
     void ROCmMoEKernel::invalidateRouterQ8HiddenPublication() noexcept
     {
-        if (router_q8_publication_access_ ==
-                MoERouterQ8PublicationAccess::ProducerAndConsumer &&
+        if (router_q8_publication_access_ !=
+                MoERouterQ8PublicationAccess::RequiredConsumer &&
             router_q8_hidden_publication_)
         {
             router_q8_hidden_publication_->clearPayload();
@@ -3283,6 +3416,16 @@ namespace llaminar2
 
         publication->backend = DeviceType::ROCm;
         publication->device_ordinal = device_ordinal_;
+        if(router_q8_hidden_publication_&&router_q8_hidden_publication_->original_m1_binding&&
+           (publication!=router_q8_hidden_publication_||access!=router_q8_publication_access_))
+            throw std::logic_error("Captured original M1 hidden Q8 publication/access cannot be rebound");
+        // The original routing stage reaffirms producer access on the same
+        // shared owner. It cannot erase an exact graph-local demand.
+        if(router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumerWithExactK32Sums) {
+            if(router_q8_hidden_publication_!=publication || access==MoERouterQ8PublicationAccess::RequiredConsumer)
+                throw std::logic_error("Exact K32 sum publication cannot rebind its router owner");
+            return true;
+        }
         router_q8_hidden_publication_ = std::move(publication);
         router_q8_publication_access_ = access;
         return true;
@@ -3294,8 +3437,8 @@ namespace llaminar2
         bool recorded_during_capture,
         RouterQ8Basis router_basis) noexcept
     {
-        if (router_q8_publication_access_ !=
-                MoERouterQ8PublicationAccess::ProducerAndConsumer ||
+        if (router_q8_publication_access_ ==
+                MoERouterQ8PublicationAccess::RequiredConsumer ||
             !router_q8_hidden_publication_)
         {
             LOG_ERROR("[ROCmMoEKernel::publishRouterQ8Hidden] consumer-only kernel attempted publication");
@@ -3330,8 +3473,19 @@ namespace llaminar2
     bool ROCmMoEKernel::canReuseRouterQ8Hidden(
         const float *source,
         int rows,
-        int d_model) const noexcept
+        int d_model) const
     {
+        if(router_q8_hidden_publication_&&router_q8_hidden_publication_->requiredOriginalM1Source()) {
+            const auto& p=*router_q8_hidden_publication_;const auto& binding=p.original_m1_binding;
+            if(!binding||rows!=1||d_model!=p.requiredOriginalM1Width()||source!=binding->source())
+                throw std::logic_error("Required original M1 hidden Q8 source/row geometry is absent");
+            (void)originalM1HiddenQ8BindingSignature();
+            if(p.backend!=DeviceType::ROCm||p.device_ordinal!=device_ordinal_||p.d_model_capacity<d_model||p.blocks_per_row_capacity<d_model/32||
+               p.source_rows!=source||p.quantized_rows!=binding->codes()||p.row_scales!=binding->scales()||p.published_rows!=1||
+               (p.capture_recorded&&!isGraphCaptureActive()))
+                throw std::logic_error("Required original M1 hidden Q8 payload/provenance is absent");
+            return true;
+        }
         if (!debugEnv().rocm.moe_reuse_router_q8_hidden ||
             !router_q8_hidden_publication_ ||
             rows <= 0 ||
@@ -4966,6 +5120,19 @@ namespace llaminar2
         const int *device_effective_seq_len,
         DeviceMoELayerRuntime *deferred_selected_route_ledger)
     {
+        return routeGroupedVerifierWithPolicy(LocalGPUExpertKernelPolicy::Generic,hidden,gate_weights,
+            seq_len,d_model,num_experts,top_k,normalize_weights,output_indices,output_weights,
+            device_effective_seq_len,deferred_selected_route_ledger);
+    }
+
+    bool ROCmMoEKernel::routeGroupedVerifierWithPolicy(LocalGPUExpertKernelPolicy policy,
+        ITensor *hidden, ITensor *gate_weights,
+        int seq_len, int d_model, int num_experts, int top_k,
+        bool normalize_weights,
+        ITensor *output_indices, ITensor *output_weights,
+        const int *device_effective_seq_len,
+        DeviceMoELayerRuntime *deferred_selected_route_ledger)
+    {
         constexpr const char *kContext = "ROCmMoEKernel::routeVerifierRowsDecodeEquivalent";
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -5046,6 +5213,9 @@ namespace llaminar2
         const auto &rocm_env = debugEnv().rocm;
         const bool gate_is_fp32 =
             gate_weights->native_type() == TensorType::FP32;
+        const bool qualified_default=policy==LocalGPUExpertKernelPolicy::QFNMI50TP4 &&
+            d_model==2560 && num_experts==512 && top_k==10 &&
+            gate_weights->native_type()==TensorType::FP16;
         const bool q8_router_requested = gate_is_fp32 && rocm_env.moe_router_q8;
         if (q8_router_requested && (d_model % 32) != 0)
         {
@@ -5127,7 +5297,7 @@ namespace llaminar2
         }
         else if (gate_weights->native_type() == TensorType::FP16)
         {
-            if (!hipMoE_gate_logits_fp16_decode_equivalent_rows(
+            if (!hipMoE_gate_logits_fp16_decode_equivalent_rows_with_policy(
                     d_hidden,
                     d_gate,
                     d_route_logits_,
@@ -5136,7 +5306,7 @@ namespace llaminar2
                     num_experts,
                     device_ordinal_,
                     getStream(),
-                    device_effective_seq_len))
+                    device_effective_seq_len,qualified_default))
             {
                 LOG_ERROR("[" << kContext << "] grouped FP16 verifier logits failed");
                 return false;
@@ -5167,7 +5337,7 @@ namespace llaminar2
             return false;
         }
 
-        if (!hipMoE_softmax_topk_decode_equivalent_rows(
+        if (!hipMoE_softmax_topk_decode_equivalent_rows_with_policy(
                 d_route_logits_,
                 d_idx,
                 d_wt,
@@ -5178,7 +5348,7 @@ namespace llaminar2
                 device_ordinal_,
                 getStream(),
                 device_effective_seq_len,
-                static_cast<void *>(deferred_selected_route_ledger)))
+                static_cast<void *>(deferred_selected_route_ledger),qualified_default))
         {
             LOG_ERROR("[" << kContext << "] grouped decode-equivalent softmax/top-k failed");
             return false;
@@ -5214,7 +5384,8 @@ namespace llaminar2
         bool write_legacy_outputs,
         bool update_runtime_histogram,
         const int32_t *absolute_position_ids_device,
-        RoutedExpertRowExecutionPolicy row_execution_policy)
+        RoutedExpertRowExecutionPolicy row_execution_policy,
+        const int32_t *active_row_count_device)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -5229,6 +5400,13 @@ namespace llaminar2
                                                                                        << " num_experts=" << num_experts
                                                                                        << " top_k=" << top_k);
             return false;
+        }
+
+        if (paired_router_descriptors_)
+        {
+            requirePairedRouterDescriptors(runtime_layer, num_experts, top_k);
+            if (row_execution_policy != RoutedExpertRowExecutionPolicy::IntermediateShardLocal)
+                throw std::logic_error("Paired descriptor router changed its original local-fragment policy");
         }
 
         // The runtime table is a graph-build invariant validated by the MoE
@@ -5274,13 +5452,17 @@ namespace llaminar2
 
         bool logits_ready = false;
         bool runtime_ready = false;
-        const bool fully_replicated_local_rows =
-            row_execution_policy ==
-            RoutedExpertRowExecutionPolicy::FullyReplicatedLocal;
         const auto &rocm_env = debugEnv().rocm;
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
         invalidateRouterQ8HiddenPublication();
         const bool q8_router_requested = gate_is_fp32 && rocm_env.moe_router_q8;
+        // M1 restored-prefix verification uses runtime routing but a grouped
+        // shared consumer. Floating router math must still publish that
+        // consumer's original-basis Q8 rows on this exact captured stream.
+        // The cold demand contract makes ordinary no-consumer decode a no-op.
+        if (!q8_router_requested && !publishRequiredRouterQ8Hidden(
+                h, /*rows=*/1, d_model, top_k, active_row_count_device))
+            return false;
         if (q8_router_requested && (d_model % 32) != 0)
         {
             LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] Q8 router requires d_model to be a multiple of 32, got "
@@ -5352,7 +5534,7 @@ namespace llaminar2
                 normalize_weights,
                 write_legacy_outputs,
                 update_runtime_histogram,
-                fully_replicated_local_rows,
+                row_execution_policy,
                 nullptr,
                 nullptr,
                 0u,
@@ -5366,7 +5548,8 @@ namespace llaminar2
                 1u,
                 absolute_position_ids_device,
                 device_ordinal_,
-                getStream());
+                getStream(),
+                active_row_count_device);
             if (!runtime_ready)
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] fused K-part router runtime kernel failed");
@@ -5384,8 +5567,25 @@ namespace llaminar2
             return false;
         }
 
+        if (paired_router_descriptors_)
+        {
+            if (runtime_ready)
+                throw std::logic_error("Paired descriptor router selected a different prepared producer");
+            runtime_ready = hipMoE_softmax_topk_decode_selected_descriptors(
+                d_route_logits_, runtime_layer, legacy_indices, legacy_weights,
+                num_experts, top_k, normalize_weights, write_legacy_outputs,
+                update_runtime_histogram, row_execution_policy,
+                paired_router_descriptors_->outputs, device_ordinal_, getStream(), active_row_count_device);
+            if (!runtime_ready)
+                throw std::runtime_error("Paired ROCm router/descriptor publication failed");
+            PerfStatsCollector::addCounter("moe", "router_selected_descriptors_enqueued", 1.0,
+                "graph_capture", DeviceId::rocm(device_ordinal_).toString(),
+                {{"descriptor_source", "original_intermediate_shard"}});
+        }
+
         if (!runtime_ready && rocm_env.moe_router_wave_topk &&
             num_experts <= static_cast<int>(kDeviceMoEMaxExperts) &&
+            row_execution_policy == RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
             prepared_decode_resident_set_policy_ ==
                 RoutedExpertResidentSetPolicy::UniqueOwner)
         {
@@ -5401,7 +5601,8 @@ namespace llaminar2
                     write_legacy_outputs,
                     update_runtime_histogram,
                     device_ordinal_,
-                    getStream());
+                    getStream(),
+                    active_row_count_device);
             if (!runtime_ready)
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] unique-owner "
@@ -5422,7 +5623,7 @@ namespace llaminar2
                 normalize_weights,
                 write_legacy_outputs,
                 update_runtime_histogram,
-                fully_replicated_local_rows,
+                row_execution_policy,
                 nullptr,
                 nullptr,
                 0u,
@@ -5436,7 +5637,8 @@ namespace llaminar2
                 1u,
                 absolute_position_ids_device,
                 device_ordinal_,
-                getStream());
+                getStream(),
+                active_row_count_device);
             if (!runtime_ready)
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] wave64 decode softmax/top-k runtime kernel failed");
@@ -5454,7 +5656,7 @@ namespace llaminar2
                                   normalize_weights,
                                   write_legacy_outputs,
                                   update_runtime_histogram,
-                                  fully_replicated_local_rows,
+                                  row_execution_policy,
                                   nullptr,
                                   nullptr,
                                   0u,
@@ -5468,7 +5670,8 @@ namespace llaminar2
                                   1u,
                                   absolute_position_ids_device,
                                   device_ordinal_,
-                                  getStream()))
+                                  getStream(),
+                                  active_row_count_device))
         {
             LOG_ERROR("[ROCmMoEKernel::decodeRouteSelect] decode softmax/top-k runtime kernel failed");
             return false;
@@ -5504,7 +5707,8 @@ namespace llaminar2
         int rebalance_target_layer,
         uint32_t rebalance_command_buffer_count,
         const int32_t *absolute_position_ids_device,
-        RoutedExpertRowExecutionPolicy row_execution_policy)
+        RoutedExpertRowExecutionPolicy row_execution_policy,
+        const int32_t *active_row_count_device)
     {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
@@ -5571,13 +5775,17 @@ namespace llaminar2
 
         bool logits_ready = false;
         bool runtime_ready = false;
-        const bool fully_replicated_local_rows =
-            row_execution_policy ==
-            RoutedExpertRowExecutionPolicy::FullyReplicatedLocal;
         const auto &rocm_env = debugEnv().rocm;
         const bool gate_is_fp32 = (gate_type == TensorType::FP32);
         invalidateRouterQ8HiddenPublication();
         const bool q8_router_requested = gate_is_fp32 && rocm_env.moe_router_q8;
+        // M1 restored-prefix verification uses runtime routing but a grouped
+        // shared consumer. Floating router math must still publish that
+        // consumer's original-basis Q8 rows on this exact captured stream.
+        // The cold demand contract makes ordinary no-consumer decode a no-op.
+        if (!q8_router_requested && !publishRequiredRouterQ8Hidden(
+                h, /*rows=*/1, d_model, top_k, active_row_count_device))
+            return false;
         if (q8_router_requested && (d_model % 32) != 0)
         {
             LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] Q8 router requires d_model to be a multiple of 32, got "
@@ -5649,7 +5857,7 @@ namespace llaminar2
                 normalize_weights,
                 write_legacy_outputs,
                 update_runtime_histogram,
-                fully_replicated_local_rows,
+                row_execution_policy,
                 runtime_layers,
                 rebalance_plan_entries,
                 rebalance_plan_capacity,
@@ -5663,7 +5871,8 @@ namespace llaminar2
                 rebalance_command_buffer_count,
                 absolute_position_ids_device,
                 device_ordinal_,
-                getStream());
+                getStream(),
+                active_row_count_device);
             if (!runtime_ready)
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] fused K-part router runtime kernel failed");
@@ -5693,7 +5902,7 @@ namespace llaminar2
                 normalize_weights,
                 write_legacy_outputs,
                 update_runtime_histogram,
-                fully_replicated_local_rows,
+                row_execution_policy,
                 runtime_layers,
                 rebalance_plan_entries,
                 rebalance_plan_capacity,
@@ -5707,7 +5916,8 @@ namespace llaminar2
                 rebalance_command_buffer_count,
                 absolute_position_ids_device,
                 device_ordinal_,
-                getStream());
+                getStream(),
+                active_row_count_device);
             if (!runtime_ready)
             {
                 LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] wave64 decode softmax/top-k runtime kernel failed");
@@ -5725,7 +5935,7 @@ namespace llaminar2
                                   normalize_weights,
                                   write_legacy_outputs,
                                   update_runtime_histogram,
-                                  fully_replicated_local_rows,
+                                  row_execution_policy,
                                   runtime_layers,
                                   rebalance_plan_entries,
                                   rebalance_plan_capacity,
@@ -5739,7 +5949,8 @@ namespace llaminar2
                                   rebalance_command_buffer_count,
                                   absolute_position_ids_device,
                                   device_ordinal_,
-                                  getStream()))
+                                  getStream(),
+                                  active_row_count_device))
         {
             LOG_ERROR("[ROCmMoEKernel::decodeRouteSelectWithReadyRebalanceApply] decode softmax/top-k runtime kernel failed");
             return false;
@@ -6864,7 +7075,12 @@ namespace llaminar2
 
         if (seq_len == 1)
         {
-            sharedExpertGateFromTensors(input, gate_inp, shared_output, seq_len, d_model);
+            // Keep the existing fused M1 reduction tree; its optional count
+            // suppresses dot work and overwrites the shared row when empty.
+            if (!hipMoE_shared_expert_gate_decode_fused(in, gi, so, d_model,
+                    device_ordinal_, stream, device_effective_seq_len))
+                return false;
+            markDeviceWritten(shared_output, device, stream);
             return true;
         }
 
@@ -7020,8 +7236,15 @@ namespace llaminar2
         int num_experts,
         int d_model,
         int intermediate,
-        MoEDecodeDescriptorSource descriptor_source)
+        MoEDecodeDescriptorSource descriptor_source,
+        const MoEIntermediateShardDescriptorDeclaration *original_family)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return -1;
+        if (original_family &&
+            (descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable ||
+             !original_family->validFor(DeviceId::rocm(device_ordinal_),num_experts,d_model,intermediate) ||
+             original_family->weightFormat() != DeviceMoEWeightFormat::NativeQuantised)) return -1;
+
         if (!down_descs || num_experts <= 0 || d_model <= 0 ||
             intermediate <= 0 || (intermediate % 32) != 0)
         {
@@ -7037,20 +7260,21 @@ namespace llaminar2
             return -1;
 
         const bool runtime_mutable =
-            descriptor_source ==
-            MoEDecodeDescriptorSource::RuntimePlacementTable;
+            moEDecodeUsesRuntimeDescriptors(descriptor_source);
         if (!runtime_mutable &&
             descriptor_source !=
                 MoEDecodeDescriptorSource::StaticDescriptorTable)
         {
             return -1;
         }
-        NativeQuantisedExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope = original_family
+            ? original_family->nativeDownEnvelope() : NativeQuantisedExecutionFormatEnvelope{};
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
             if (isBlankGroupedDesc(desc))
                 continue;
+            if (original_family && !original_family->matchesNativeDown(desc)) return -1;
 
             if (!desc.valid())
             {
@@ -7065,7 +7289,7 @@ namespace llaminar2
                           << expert_id);
                 return -1;
             }
-            if (!addNativeQuantisedExecutionFormat(
+            if (!original_family && !addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
                     NativeQuantisedSourceIdentity{
@@ -7123,6 +7347,7 @@ namespace llaminar2
         {
             const auto &existing = grouped_down_desc_tables_[index];
             if (!existing.valid ||
+                !existing.original_family.sameIdentity(original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{}) ||
                 existing.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
                 !existing.device_descs ||
                 existing.num_experts != num_experts ||
@@ -7149,6 +7374,7 @@ namespace llaminar2
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
         table.descriptor_source = descriptor_source;
+        table.original_family = original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{};
         table.weight_format = DeviceMoEWeightFormat::NativeQuantised;
         table.valid = true;
         if (!publishGroupedDownDescriptorTable(
@@ -7171,7 +7397,7 @@ namespace llaminar2
         auto &table = grouped_gateup_desc_tables_[table_id];
         if (!table.valid || !table.deviceReady()) throw std::logic_error("owner gate/up table is not prepared");
         const bool selected = rows == 1 && table.weight_format == DeviceMoEWeightFormat::NativeQuantised &&
-            table.descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
+            (table.descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable);
         if (!selected)
         {
             if (expected_intent) throw std::logic_error("owner gate/up intent names an unsupported physical operation");
@@ -7211,7 +7437,7 @@ namespace llaminar2
         const auto &table = grouped_gateup_desc_tables_[table_id];
         if (!table.valid || !table.deviceReady()) throw std::logic_error("owner gate/up capture binding lost its prepared storage");
         const bool selected = rows == 1 && table.weight_format == DeviceMoEWeightFormat::NativeQuantised &&
-            table.descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable;
+            (table.descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable);
         if (!selected) return 0;
         if (table.owner_m1_admission.has_value() != (table.owner_m1_intent != 0))
             throw std::logic_error("owner gate/up table lost its complete immutable capability");
@@ -7267,8 +7493,15 @@ namespace llaminar2
         int num_experts,
         int d_model,
         int intermediate,
-        MoEDecodeDescriptorSource descriptor_source)
+        MoEDecodeDescriptorSource descriptor_source,
+        const MoEIntermediateShardDescriptorDeclaration *original_family)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return -1;
+        if (original_family &&
+            (descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable ||
+             !original_family->validFor(DeviceId::rocm(device_ordinal_),num_experts,d_model,intermediate) ||
+             original_family->weightFormat() != DeviceMoEWeightFormat::NativeQuantised)) return -1;
+
         if (!gate_descs || !up_descs || num_experts <= 0 || d_model <= 0 ||
             intermediate <= 0 || (d_model % 32) != 0)
         {
@@ -7284,15 +7517,15 @@ namespace llaminar2
             return -1;
 
         const bool runtime_mutable =
-            descriptor_source ==
-            MoEDecodeDescriptorSource::RuntimePlacementTable;
+            moEDecodeUsesRuntimeDescriptors(descriptor_source);
         if (!runtime_mutable &&
             descriptor_source !=
                 MoEDecodeDescriptorSource::StaticDescriptorTable)
         {
             return -1;
         }
-        NativeQuantisedExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope = original_family
+            ? original_family->nativeGateUpEnvelope() : NativeQuantisedExecutionFormatEnvelope{};
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -7308,6 +7541,7 @@ namespace llaminar2
                 return -1;
             }
 
+            if (original_family && !original_family->matchesNativeGateUp(gate_desc,up_desc)) return -1;
             if (!gate_desc.valid() || !up_desc.valid())
             {
                 LOG_DEBUG("[ROCmMoEKernel::uploadGroupedExpertGateUpDescriptorTables] Incomplete descriptor pair for expert "
@@ -7345,7 +7579,7 @@ namespace llaminar2
                     },
                     runtime_mutable);
             };
-            if (!add_descriptor(gate_desc) || !add_descriptor(up_desc))
+            if (!original_family && (!add_descriptor(gate_desc) || !add_descriptor(up_desc)))
             {
                 return -1;
             }
@@ -7389,6 +7623,7 @@ namespace llaminar2
         {
             const auto &existing = grouped_gateup_desc_tables_[index];
             if (!existing.valid ||
+                !existing.original_family.sameIdentity(original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{}) ||
                 existing.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
                 !existing.device_gate_descs ||
                 !existing.device_up_descs ||
@@ -7419,6 +7654,7 @@ namespace llaminar2
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
         table.descriptor_source = descriptor_source;
+        table.original_family = original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{};
         table.weight_format = DeviceMoEWeightFormat::NativeQuantised;
         table.valid = true;
         if (!publishGroupedGateUpDescriptorTable(
@@ -7436,8 +7672,16 @@ namespace llaminar2
         DeviceMoEWeightFormat weight_format,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source,
+        const MoEIntermediateShardDescriptorDeclaration *original_family)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return -1;
+        if (original_family &&
+            (descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable ||
+             !original_family->validFor(DeviceId::rocm(device_ordinal_),num_experts,d_model,intermediate) ||
+             original_family->weightFormat() != weight_format)) return -1;
+
         if (!down_descs ||
             !deviceMoEWeightFormatIsFloating(weight_format) ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0)
@@ -7459,11 +7703,12 @@ namespace llaminar2
             const auto &desc = down_descs[expert];
             if (isBlankGroupedFloatingDesc(desc))
                 continue;
+            if (original_family && !original_family->matchesFloatingDown(desc)) return -1;
             if (!validateGroupedFloatingDesc(desc, d_model, intermediate))
                 return -1;
             any_live = true;
         }
-        if (!any_live)
+        if (!any_live && !original_family)
             return -1;
 
         const size_t desc_bytes =
@@ -7472,11 +7717,13 @@ namespace llaminar2
         for (size_t index = 0; index < grouped_down_desc_tables_.size(); ++index)
         {
             const auto &existing = grouped_down_desc_tables_[index];
-            if (!existing.valid || existing.weight_format != weight_format ||
+            if (!existing.valid ||
+                !existing.original_family.sameIdentity(original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{}) || existing.weight_format != weight_format ||
                 !existing.device_floating_descs ||
                 existing.num_experts != num_experts ||
                 existing.d_model != d_model ||
                 existing.intermediate != intermediate ||
+                existing.descriptor_source != descriptor_source ||
                 existing.host_floating_descs.size() !=
                     static_cast<size_t>(num_experts))
             {
@@ -7498,6 +7745,8 @@ namespace llaminar2
         table.d_model = d_model;
         table.intermediate = intermediate;
         table.weight_format = weight_format;
+        table.descriptor_source = descriptor_source;
+        table.original_family = original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{};
         table.valid = true;
         if (!publishGroupedDownDescriptorTable(
                 table,
@@ -7515,8 +7764,16 @@ namespace llaminar2
         DeviceMoEWeightFormat weight_format,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source,
+        const MoEIntermediateShardDescriptorDeclaration *original_family)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return -1;
+        if (original_family &&
+            (descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable ||
+             !original_family->validFor(DeviceId::rocm(device_ordinal_),num_experts,d_model,intermediate) ||
+             original_family->weightFormat() != weight_format)) return -1;
+
         if (!gate_descs || !up_descs ||
             !deviceMoEWeightFormatIsFloating(weight_format) ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0)
@@ -7543,6 +7800,7 @@ namespace llaminar2
                     continue;
                 return -1;
             }
+            if (original_family && !original_family->matchesFloatingGateUp(gate_descs[expert],up_descs[expert])) return -1;
             if (!validateGroupedFloatingDesc(
                     gate_descs[expert], intermediate, d_model) ||
                 !validateGroupedFloatingDesc(
@@ -7552,7 +7810,7 @@ namespace llaminar2
             }
             any_live = true;
         }
-        if (!any_live)
+        if (!any_live && !original_family)
             return -1;
 
         const size_t desc_bytes =
@@ -7561,12 +7819,14 @@ namespace llaminar2
         for (size_t index = 0; index < grouped_gateup_desc_tables_.size(); ++index)
         {
             const auto &existing = grouped_gateup_desc_tables_[index];
-            if (!existing.valid || existing.weight_format != weight_format ||
+            if (!existing.valid ||
+                !existing.original_family.sameIdentity(original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{}) || existing.weight_format != weight_format ||
                 !existing.device_floating_gate_descs ||
                 !existing.device_floating_up_descs ||
                 existing.num_experts != num_experts ||
                 existing.d_model != d_model ||
                 existing.intermediate != intermediate ||
+                existing.descriptor_source != descriptor_source ||
                 existing.host_floating_gate_descs.size() !=
                     static_cast<size_t>(num_experts) ||
                 existing.host_floating_up_descs.size() !=
@@ -7596,6 +7856,8 @@ namespace llaminar2
         table.d_model = d_model;
         table.intermediate = intermediate;
         table.weight_format = weight_format;
+        table.descriptor_source = descriptor_source;
+        table.original_family = original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{};
         table.valid = true;
         if (!publishGroupedGateUpDescriptorTable(
                 table,
@@ -7642,17 +7904,18 @@ namespace llaminar2
         }
 
         const bool runtime_mutable =
-            table.descriptor_source ==
-            MoEDecodeDescriptorSource::RuntimePlacementTable;
-        NativeQuantisedExecutionFormatEnvelope format_envelope;
+            moEDecodeUsesRuntimeDescriptors(table.descriptor_source);
+        NativeQuantisedExecutionFormatEnvelope format_envelope = table.original_family.valid()
+            ? table.original_family.nativeDownEnvelope() : NativeQuantisedExecutionFormatEnvelope{};
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
             if (isBlankGroupedDesc(desc))
                 continue;
+            if (table.original_family.valid() && !table.original_family.matchesNativeDown(desc)) return false;
             if (!desc.valid() || !validateGroupedDownDesc(desc, d_model, intermediate))
                 return false;
-            if (!addNativeQuantisedExecutionFormat(
+            if (!table.original_family.valid() && !addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
                     NativeQuantisedSourceIdentity{
@@ -7697,7 +7960,7 @@ namespace llaminar2
                     nullptr,
                     num_experts,
                     d_model,
-                    intermediate),
+                    intermediate, table.descriptor_source),
                 table.workspace_publication,
                 table.workspace_slot,
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
@@ -7775,9 +8038,9 @@ namespace llaminar2
         }
 
         const bool runtime_mutable =
-            table.descriptor_source ==
-            MoEDecodeDescriptorSource::RuntimePlacementTable;
-        NativeQuantisedExecutionFormatEnvelope format_envelope;
+            moEDecodeUsesRuntimeDescriptors(table.descriptor_source);
+        NativeQuantisedExecutionFormatEnvelope format_envelope = table.original_family.valid()
+            ? table.original_family.nativeGateUpEnvelope() : NativeQuantisedExecutionFormatEnvelope{};
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -7790,6 +8053,7 @@ namespace llaminar2
                     continue;
                 return false;
             }
+            if (table.original_family.valid() && !table.original_family.matchesNativeGateUp(gate_desc,up_desc)) return false;
             if (!gate_desc.valid() || !up_desc.valid() ||
                 !areNativeQuantisedGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
                 !validateGroupedGateUpDesc(gate_desc, d_model, intermediate) ||
@@ -7812,7 +8076,7 @@ namespace llaminar2
                     },
                     runtime_mutable);
             };
-            if (!add_descriptor(gate_desc) || !add_descriptor(up_desc))
+            if (!table.original_family.valid() && (!add_descriptor(gate_desc) || !add_descriptor(up_desc)))
             {
                 return false;
             }
@@ -7847,7 +8111,7 @@ namespace llaminar2
                     up_descs,
                     num_experts,
                     d_model,
-                    intermediate),
+                    intermediate, table.descriptor_source),
                 table.workspace_publication,
                 table.workspace_slot,
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
@@ -7966,7 +8230,7 @@ namespace llaminar2
                     weight_format,
                     num_experts,
                     d_model,
-                    intermediate),
+                    intermediate, table.descriptor_source),
                 table.workspace_publication,
                 table.workspace_slot,
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
@@ -8072,7 +8336,7 @@ namespace llaminar2
                     weight_format,
                     num_experts,
                     d_model,
-                    intermediate),
+                    intermediate, table.descriptor_source),
                 table.workspace_publication,
                 table.workspace_slot,
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
@@ -8135,6 +8399,9 @@ namespace llaminar2
             return false;
 
         const auto &table = grouped_gateup_desc_tables_[descriptor_table_id];
+        if (table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         const bool floating =
             deviceMoEWeightFormatIsFloating(table.weight_format);
         if (!table.valid || !table.deviceReady() || table.num_experts <= 0 ||
@@ -8233,6 +8500,33 @@ namespace llaminar2
         /* Table decode shares stable metadata/pointer publications between
          * packed and contiguous formats; dispatch only selects the arithmetic
          * kernel appropriate for the descriptor family. */
+        const bool reuse_required_hidden=router_q8_hidden_publication_&&router_q8_hidden_publication_->requiredOriginalM1Source();
+        int8_t* original_hidden_codes=d_grouped_hidden_int8_;
+        float* original_hidden_scales=d_grouped_hidden_scales_;
+        if(reuse_required_hidden) {
+            const auto& publication=*router_q8_hidden_publication_;
+            if(floating)throw std::logic_error("Required M1 hidden Q8 reader has incompatible floating projection arithmetic");
+            if(router_q8_publication_access_!=MoERouterQ8PublicationAccess::RequiredConsumer) {
+                if(!canReuseRouterQ8Hidden(d_hidden,1,d_model))throw std::logic_error("Required M1 routed hidden Q8 reader is absent");
+                original_hidden_codes=publication.original_m1_binding->codes();
+                original_hidden_scales=publication.original_m1_binding->scales();
+            } else {
+            if(!original_m1_hidden_q8_read_||publication.backend!=DeviceType::ROCm||publication.device_ordinal!=device_ordinal_||
+               publication.d_model_capacity<d_model||publication.blocks_per_row_capacity<d_model/32)
+                throw std::logic_error("Required M1 shared hidden Q8 reader was not cold prepared on its exact participant/width");
+            original_m1_hidden_q8_read_->validate(*input,getStream(),workspace_);
+            original_m1_hidden_q8_read_->requirePayload(publication.source_rows,publication.quantized_rows,publication.row_scales,
+                publication.published_rows,
+                publication.capture_recorded?OriginalM1HiddenQ8Use::CaptureRecording:OriginalM1HiddenQ8Use::OrderedEager,
+                isGraphCaptureActive()?OriginalM1HiddenQ8Use::CaptureRecording:OriginalM1HiddenQ8Use::OrderedEager);
+            // The original low-level ABI combines writable independent scratch
+            // with prequantized input. Only this sealed read view selects true;
+            // that arm never writes codes/scales. No caller supplies raw reuse.
+            original_hidden_codes=const_cast<int8_t*>(original_m1_hidden_q8_read_->codes());
+            original_hidden_scales=const_cast<float*>(original_m1_hidden_q8_read_->scales());
+            }
+        }
+
         const bool ok = floating
             ? rocmMoE_grouped_gate_up_floating_decode_table(
                   d_hidden,
@@ -8257,11 +8551,11 @@ namespace llaminar2
                   d_up_output_ptrs,
                   nullptr,
                   nullptr,
-                  d_grouped_hidden_int8_,
-                  d_grouped_hidden_scales_,
+                  original_hidden_codes,
+                  original_hidden_scales,
                   d_grouped_gateup_gate_partials_,
                   d_grouped_gateup_up_partials_,
-                  false,
+                  reuse_required_hidden,
                   num_active,
                   intermediate,
                   d_model,
@@ -8312,6 +8606,9 @@ namespace llaminar2
             return false;
 
         const auto &table = grouped_gateup_desc_tables_[descriptor_table_id];
+        if (table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         if (!table.valid || !table.device_gate_descs || !table.device_up_descs || table.num_experts <= 0 ||
             table.d_model != d_model || table.intermediate != intermediate)
         {
@@ -8485,6 +8782,9 @@ namespace llaminar2
             return false;
 
         const auto &table = grouped_gateup_desc_tables_[descriptor_table_id];
+        if (table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         if (!table.valid || !table.device_gate_descs || !table.device_up_descs || table.num_experts <= 0 ||
             table.d_model != d_model || table.intermediate != intermediate)
         {
@@ -8599,8 +8899,11 @@ namespace llaminar2
         const uint8_t *expert_mask,
         ITensor *canonical_route_contributions,
         DeviceMoELayerRuntime *runtime_layer,
-        MoEDecodeDescriptorSource descriptor_source)
+        MoEDecodeDescriptorSource descriptor_source,
+        MoEExplicitRouteDemand demand)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source) || !validMoEExplicitRouteDemand(demand)) return false;
+
         if (!input || !routing_indices || !routing_weights ||
             gateup_descriptor_table_id < 0 || down_descriptor_table_id < 0 ||
             top_k <= 0 || !output || d_model <= 0 || intermediate <= 0)
@@ -8616,6 +8919,15 @@ namespace llaminar2
 
         const auto &gateup_table =
             grouped_gateup_desc_tables_[gateup_descriptor_table_id];
+        if (static_cast<size_t>(down_descriptor_table_id) >= grouped_down_desc_tables_.size()) return false;
+        const auto &down_table = grouped_down_desc_tables_[down_descriptor_table_id];
+        if (!down_table.valid ||
+            (gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) ||
+            (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable))
+            return false;
+
         if (!gateup_table.valid || gateup_table.num_experts <= 0)
         {
             LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRouting] "
@@ -8623,8 +8935,7 @@ namespace llaminar2
             return false;
         }
         const bool use_runtime_descriptors =
-            descriptor_source ==
-            MoEDecodeDescriptorSource::RuntimePlacementTable;
+            moEDecodeUsesRuntimeDescriptors(descriptor_source);
         if ((use_runtime_descriptors && (!runtime_layer || expert_mask)) ||
             (!use_runtime_descriptors && runtime_layer))
         {
@@ -8733,7 +9044,9 @@ namespace llaminar2
                     gateup_table.num_experts,
                     top_k,
                     /*write_legacy_outputs=*/false,
-                    /*update_runtime_histogram=*/true,
+                    /*update_runtime_histogram=*/demand == MoEExplicitRouteDemand::PublishDecode,
+                    descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable
+                        ? RoutedExpertRowExecutionPolicy::IntermediateShardLocal : RoutedExpertRowExecutionPolicy::ParticipantAssigned,
                     device_ordinal_,
                     stream))
             {
@@ -8754,10 +9067,77 @@ namespace llaminar2
             intermediate,
             resolved_expert_ids,
             resolved_weights,
-            use_runtime_descriptors,
+            descriptor_source,
             /*allow_router_q8_reuse=*/false,
-            use_runtime_descriptors ? "routing_runtime" : "routing",
+            descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable
+                ? "runtime_intermediate_shard" : use_runtime_descriptors ? "routing_runtime" : "routing",
             canonical_route_contributions);
+    }
+
+    const ROCmMoEKernel::PairedRouterDescriptors &ROCmMoEKernel::requirePairedRouterDescriptors(
+        DeviceMoELayerRuntime *runtime, int num_experts, int top_k) const
+    {
+        if (!paired_router_descriptors_)
+            throw std::logic_error("Missing original paired router descriptor preparation");
+        const auto &binding = *paired_router_descriptors_;
+        if (runtime != binding.runtime || workspace_ != binding.workspace || !workspace_ ||
+            workspace_->id() != binding.workspace_id || getStream() != binding.stream ||
+            num_experts != binding.outputs.expert_count || top_k != binding.top_k)
+            throw std::logic_error("Paired router descriptors changed runtime, workspace, stream or geometry");
+        return binding;
+    }
+
+    MoEDecodeDescriptorPublisher ROCmMoEKernel::preparePairedRouterDecodeDescriptors(
+        DeviceMoELayerRuntime *runtime, int gateup_id, int down_id, int top_k)
+    {
+        if (isGraphCaptureActive() || !workspace_ || !runtime ||
+            reinterpret_cast<std::uintptr_t>(getStream()) <= 2 ||
+            gateup_id < 0 || down_id < 0 || top_k <= 0 || top_k > int(kDeviceMoEMaxTopK) ||
+            gateup_id >= int(grouped_gateup_desc_tables_.size()) || down_id >= int(grouped_down_desc_tables_.size()))
+            throw std::logic_error("Paired router descriptors require complete cold graph preparation");
+        const auto &gate = grouped_gateup_desc_tables_[gateup_id];
+        const auto &down = grouped_down_desc_tables_[down_id];
+        if (!gate.valid || !gate.deviceReady() || !down.valid || !down.deviceReady() ||
+            gate.descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable ||
+            down.descriptor_source != gate.descriptor_source || gate.weight_format != down.weight_format ||
+            gate.num_experts != down.num_experts || gate.d_model != down.d_model ||
+            gate.intermediate != down.intermediate || top_k > gate.num_experts)
+            throw std::logic_error("Paired router descriptors require the same original fragment family");
+        const bool ordinary=rocm::currentResidentMoEFFNProgram()==rocm::ResidentMoEFFNProgram::OrdinaryPhases||
+            rocm::currentResidentMoEFFNProgram()==rocm::ResidentMoEFFNProgram::NativeLayoutRouter;
+        const auto &policy = debugEnv().rocm;
+        if(ordinary&&(!policy.moe_router_wave_topk||policy.moe_router_kpart_decode||
+            gate.num_experts>int(kDeviceMoEMaxExperts)))
+            throw std::invalid_argument("Ordinary FFN requires the original paired wave-topK descriptor publisher");
+        if (paired_router_descriptors_)
+        {
+            const auto &original = requirePairedRouterDescriptors(runtime, gate.num_experts, top_k);
+            if (original.gateup_table != gateup_id || original.down_table != down_id)
+                throw std::logic_error("Paired router descriptors changed original table handles");
+            return MoEDecodeDescriptorPublisher::Router;
+        }
+        // This is a cold performance-policy choice, not recovery after a failed
+        // operation. The ordinary FFN candidate explicitly consumes this
+        // publication on every HIP target; defaults retain the measured gfx906
+        // selection and other architectures' independent two-node operation.
+        if (!ordinary&&(!rocmHardwareMetadata().at(device_ordinal_).isa_target.starts_with("gfx906") ||
+            !policy.moe_router_wave_topk || policy.moe_router_kpart_decode ||
+            gate.num_experts > int(kDeviceMoEMaxExperts)))
+            return MoEDecodeDescriptorPublisher::ExpertConsumer;
+        MoEDecodeDescriptorPublication outputs{
+            .expert_count = gate.num_experts,
+            .format = gate.weight_format,
+            .projections = DeviceMoEProjectionSet::IntermediateShard};
+        if (!bindGroupedDescriptorTableSlot(MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
+                gate.workspace_slot, gate.num_experts, &outputs.gate, "paired router gate descriptors") ||
+            !bindGroupedDescriptorTableSlot(MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,
+                gate.workspace_slot, gate.num_experts, &outputs.up, "paired router up descriptors") ||
+            !bindGroupedDescriptorTableSlot(MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+                down.workspace_slot, down.num_experts, &outputs.down, "paired router down descriptors") || !outputs.valid())
+            throw std::logic_error("Paired router descriptors lack the original admitted arena destinations");
+        paired_router_descriptors_ = PairedRouterDescriptors{
+            runtime, workspace_, workspace_->id(), getStream(), gateup_id, down_id, top_k, outputs};
+        return MoEDecodeDescriptorPublisher::Router;
     }
 
     bool ROCmMoEKernel::prepareGroupedRuntimeDecodeLaunchState(
@@ -8768,6 +9148,8 @@ namespace llaminar2
         int intermediate,
         MoEDecodeDescriptorSource descriptor_source)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return false;
+
         void *stream = getStream();
         if (!stream)
         {
@@ -8793,6 +9175,12 @@ namespace llaminar2
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_table_id];
+        if ((gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) ||
+            (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable))
+            return false;
+
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
@@ -8817,8 +9205,7 @@ namespace llaminar2
             return false;
         }
 
-        if (descriptor_source ==
-            MoEDecodeDescriptorSource::RuntimePlacementTable)
+        if (moEDecodeUsesRuntimeDescriptors(descriptor_source))
         {
             DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
             DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
@@ -8922,7 +9309,13 @@ namespace llaminar2
         }
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
+        if (gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         const auto &down_table = grouped_down_desc_tables_[down_table_id];
+        if (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
@@ -9047,6 +9440,8 @@ namespace llaminar2
         MoEDecodeDescriptorSource descriptor_source,
         ITensor *canonical_route_contributions)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return false;
+
         if (!runtime_layer)
             return false;
 
@@ -9061,9 +9456,10 @@ namespace llaminar2
             intermediate,
             runtimeTopKExpertIdsDevice(runtime_layer),
             runtimeTopKWeightsDevice(runtime_layer),
-            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable,
+            descriptor_source,
             /*allow_router_q8_reuse=*/true,
-            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable
+            descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable
+                ? "runtime_intermediate_shard" : moEDecodeUsesRuntimeDescriptors(descriptor_source)
                 ? "runtime_compact_table"
                 : "runtime_static_table",
             canonical_route_contributions);
@@ -9080,11 +9476,15 @@ namespace llaminar2
         int intermediate,
         const int *d_expert_ids,
         const float *d_weights,
-        bool use_runtime_descriptors,
+        MoEDecodeDescriptorSource descriptor_source,
         bool allow_router_q8_reuse,
         const char *counter_source,
         ITensor *canonical_route_contributions)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return false;
+
+        const bool use_runtime_descriptors = moEDecodeUsesRuntimeDescriptors(descriptor_source);
+
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_FFN, static_cast<hipStream_t>(getStream()));
 
         if (!input || gateup_descriptor_table_id < 0 ||
@@ -9112,6 +9512,12 @@ namespace llaminar2
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_descriptor_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_descriptor_table_id];
+        if ((gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) ||
+            (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable))
+            return false;
+
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
@@ -9201,32 +9607,33 @@ namespace llaminar2
                           "failed to bind graph-owned runtime descriptor slots");
                 return false;
             }
-            const bool materialized = floating
-                ? hipMoE_materialize_runtime_floating_descriptor_tables(
-                      runtime_layer,
-                      reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
-                          runtime_gate_descs),
-                      reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
-                          runtime_up_descs),
-                      reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
-                          runtime_down_descs),
-                      gateup_table.num_experts,
-                      gateup_table.weight_format,
-                      device_ordinal_,
-                      stream)
-                : hipMoE_materialize_runtime_prefill_descriptor_tables(
-                      runtime_layer,
-                      runtime_gate_descs,
-                      runtime_up_descs,
-                      runtime_down_descs,
-                      gateup_table.num_experts,
-                      device_ordinal_,
-                      stream);
-            if (!materialized)
+            // External route packets deliberately own their selected IDs and
+            // descriptor publication, even when this kernel instance also
+            // prepared an original-router graph. Only the original runtime
+            // route entry can consume that router's paired publication.
+            if (paired_router_descriptors_ && allow_router_q8_reuse)
             {
-                LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
-                          "failed to materialize compact runtime descriptor tables");
-                return false;
+                const auto &binding = requirePairedRouterDescriptors(runtime_layer, gateup_table.num_experts, top_k);
+                if (descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable ||
+                    binding.gateup_table != gateup_descriptor_table_id || binding.down_table != down_descriptor_table_id ||
+                    binding.outputs.gate != runtime_gate_descs || binding.outputs.up != runtime_up_descs ||
+                    binding.outputs.down != runtime_down_descs || binding.outputs.format != gateup_table.weight_format ||
+                    d_expert_ids != runtimeTopKExpertIdsDevice(runtime_layer) || d_weights != runtimeTopKWeightsDevice(runtime_layer))
+                    throw std::logic_error("Paired descriptor consumer changed its original producer/table contract");
+            }
+            else
+            {
+                const bool materialized = hipMoE_materialize_runtime_selected_decode_descriptors(
+                    runtime_layer, d_expert_ids, runtime_gate_descs, runtime_up_descs,
+                    runtime_down_descs, gateup_table.num_experts, top_k,
+                    gateup_table.weight_format, device_ordinal_, stream,
+                    moEDecodeProjectionSet(descriptor_source));
+                if (!materialized)
+                {
+                    LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] "
+                              "failed to materialize compact runtime descriptor tables");
+                    return false;
+                }
             }
             decode_gate_descs = runtime_gate_descs;
             decode_up_descs = runtime_up_descs;
@@ -9274,6 +9681,9 @@ namespace llaminar2
             d_publication_output = static_cast<float *>(
                 publication_output->gpu_data_ptr());
         }
+        const auto* down_completion=downCompletionForCall(down_descriptor_table_id,top_k);
+        if(down_completion&&(!canonical_route_contributions||floating))
+            throw std::logic_error("Down completion requires both original canonical route and routed output planes");
         float *d_output = canonical_route_contributions
                               ? nullptr
                               : d_publication_output;
@@ -9287,6 +9697,13 @@ namespace llaminar2
         {
             LOG_ERROR("[ROCmMoEKernel::groupedExpertDecodeFromRuntime] missing runtime/output device pointer");
             return false;
+        }
+
+        if(down_completion)
+        {
+            d_output=static_cast<float*>(output->gpu_data_ptr());
+            if(!d_output||d_output==d_canonical_route_contributions)
+                throw std::logic_error("Down completion lost its distinct materialized original routed output");
         }
 
         const int max_dim = std::max(d_model, intermediate);
@@ -9372,7 +9789,7 @@ namespace llaminar2
                   gateup_table.codebook_id,
                   gateup_table.policy_codebook_mask,
                   device_ordinal_,
-                  stream);
+                  stream,gateUpCompletionForCall(gateup_descriptor_table_id,top_k));
         if (!gateup_ok)
             return false;
 
@@ -9427,7 +9844,7 @@ namespace llaminar2
                   down_table.codebook_id,
                   down_table.policy_codebook_mask,
                   device_ordinal_,
-                  stream);
+                  stream,down_completion);
         if (!down_ok)
             return false;
 
@@ -9471,6 +9888,9 @@ namespace llaminar2
             return false;
 
         const auto &table = grouped_down_desc_tables_[descriptor_table_id];
+        if (table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         const bool floating =
             deviceMoEWeightFormatIsFloating(table.weight_format);
         if (!table.valid || !table.deviceReady() || table.num_experts <= 0 ||
@@ -9628,6 +10048,9 @@ namespace llaminar2
             return false;
 
         const auto &table = grouped_down_desc_tables_[descriptor_table_id];
+        if (table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         if (!table.valid || !table.device_descs || table.num_experts <= 0 ||
             table.d_model != d_model || table.intermediate != intermediate)
         {
@@ -9776,6 +10199,9 @@ namespace llaminar2
             return false;
 
         const auto &table = grouped_down_desc_tables_[descriptor_table_id];
+        if (table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         if (!table.valid || !table.device_descs || table.num_experts <= 0 ||
             table.d_model != d_model || table.intermediate != intermediate)
         {
@@ -10107,6 +10533,12 @@ namespace llaminar2
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if ((gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (expected_projections == DeviceMoEProjectionSet::IntermediateShard) ||
+            (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (expected_projections == DeviceMoEProjectionSet::IntermediateShard))
+            return false;
+
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
             !down_table.valid || !down_table.deviceReady() ||
             gateup_table.weight_format != down_table.weight_format ||
@@ -10226,6 +10658,12 @@ namespace llaminar2
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if ((gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (expected_projections == DeviceMoEProjectionSet::IntermediateShard) ||
+            (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (expected_projections == DeviceMoEProjectionSet::IntermediateShard))
+            return false;
+
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
             !down_table.valid || !down_table.deviceReady() ||
             gateup_table.weight_format != down_table.weight_format ||
@@ -11563,6 +12001,16 @@ namespace llaminar2
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
+        if (execution.isIntermediateShard() ||
+            (gateup_desc_table_id >= 0 && static_cast<size_t>(gateup_desc_table_id) < grouped_gateup_desc_tables_.size() &&
+             grouped_gateup_desc_tables_[gateup_desc_table_id].descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) ||
+            (down_desc_table_id >= 0 && static_cast<size_t>(down_desc_table_id) < grouped_down_desc_tables_.size() &&
+             grouped_down_desc_tables_[down_desc_table_id].descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable))
+        {
+            LOG_ERROR("Intermediate-shard partial execution requires the acquired runtime plan and original cohort binding");
+            return false;
+        }
+
         const auto *owner_admission = ownerGateUpAdmissionForCall(gateup_desc_table_id, seq_len, execution,
             {.output_columns = intermediate, .reduction_columns = d_model});
         rocm::MoERouteOwnedGateUpLaunchSet owner_completed{};
@@ -11925,6 +12373,41 @@ namespace llaminar2
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
+        return executeGroupedRuntimeProjection(device_runtime_layer,runtime_host_layer,hidden,output,
+            gateup_desc_table_id,down_desc_table_id,seq_len,d_model,intermediate,num_experts,top_k,execution,
+            canonical_route_contributions,nullptr);
+    }
+
+    /** @copydoc ROCmMoEKernel::executeGroupedFFNFrontierFromPublishedRuntimePlan */
+    bool ROCmMoEKernel::executeGroupedFFNFrontierFromPublishedRuntimePlan(DeviceMoELayerRuntime* runtime,
+        const DeviceMoELayerRuntime& host,ITensor* hidden,int gate_id,int down_id,ITensor* route_partials,
+        const rocm::grouped_ffn::LocalPublication& publication)
+    {
+        namespace geometry=rocm::grouped_ffn;
+        return executeGroupedRuntimeProjection(runtime,host,hidden,nullptr,gate_id,down_id,
+            publication.rows.physicalRows(),geometry::hidden,geometry::routedColumns(publication.program),geometry::experts,geometry::topK,
+            MoEPrefillProjectionExecution::intermediateShard(geometry::hidden),route_partials,&publication);
+    }
+
+    bool ROCmMoEKernel::executeGroupedRuntimeProjection(
+        DeviceMoELayerRuntime *device_runtime_layer,
+        const DeviceMoELayerRuntime &runtime_host_layer,
+        ITensor *hidden, ITensor *output,
+        int gateup_desc_table_id,
+        int down_desc_table_id,
+        int seq_len, int d_model, int intermediate,
+        int num_experts, int top_k,
+        const MoEPrefillProjectionExecution &execution,
+        ITensor *canonical_route_contributions,
+        const rocm::grouped_ffn::LocalPublication* frontier)
+    {
+        if (execution.isIntermediateShard() != runtime_host_layer.intermediate_shard.enabled() ||
+            (execution.isIntermediateShard() &&
+             (runtime_host_layer.intermediate_shard.modelColumns() != static_cast<uint32_t>(d_model) ||
+              runtime_host_layer.intermediate_shard.localIntermediateColumns() != static_cast<uint32_t>(intermediate) ||
+              !canonical_route_contributions)))
+            return false;
+
         const auto *owner_admission = ownerGateUpAdmissionForCall(gateup_desc_table_id, seq_len, execution,
             {.output_columns = intermediate, .reduction_columns = d_model});
         rocm::MoERouteOwnedGateUpLaunchSet owner_completed{};
@@ -11983,6 +12466,12 @@ namespace llaminar2
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if ((gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (execution.isIntermediateShard()) ||
+            (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (execution.isIntermediateShard()))
+            return false;
+
         rocm::validateMoERouteOwnedGateUpCodebook(gateup_table.codebook_mask, gateup_table.policy_codebook_mask, owner_admission);
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
@@ -12104,6 +12593,9 @@ namespace llaminar2
 
         group_active_expert_slots_ = active_expert_slots;
 
+        if(frontier && floating)
+            throw std::logic_error("Retained grouped FFN lost its original native quantised source");
+
         if (floating)
         {
             const bool ok = execution.overwriteOutputThenPublish(
@@ -12160,7 +12652,7 @@ namespace llaminar2
                 {{"seq_len", std::to_string(seq_len)},
                  {"top_k", std::to_string(top_k)},
                  {"active_expert_slots", std::to_string(active_expert_slots)},
-                 {"descriptor_source", "runtime_table"},
+                 {"descriptor_source", execution.isIntermediateShard() ? "runtime_intermediate_shard" : "runtime_table"},
                  {"weight_format", std::to_string(static_cast<uint32_t>(
                                        gateup_table.weight_format))}});
             return true;
@@ -12168,6 +12660,94 @@ namespace llaminar2
 
         const bool reuse_router_q8_hidden = execution.executesGateUp() &&
             canReuseRouterQ8Hidden(d_hidden, seq_len, d_model);
+        if(frontier) {
+            namespace program=rocm::grouped_ffn;
+            const auto [gate_format,down_format]=program::routedFormats(frontier->program);
+            if(!reuse_router_q8_hidden || owner_admission || !execution.isIntermediateShard() ||
+               gateup_table.codebook_mask!=gate_format.execution_codebook_mask ||
+               gateup_table.policy_codebook_mask!=gate_format.policy_codebook_mask ||
+               down_table.codebook_mask!=down_format.execution_codebook_mask ||
+               down_table.policy_codebook_mask!=down_format.policy_codebook_mask ||
+               frontier->rows.physicalRows()!=seq_len || !frontier->rows.countOwner() ||
+               !workspace_ || !d_prefill_A_int8_ || !d_prefill_A_scales_ ||
+               d_prefill_A_int8_==d_router_q8_hidden_ || d_prefill_A_scales_==d_router_q8_hidden_scales_ ||
+               workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_SHARED_GATE)<std::size_t(seq_len)*sizeof(float))
+                throw std::logic_error("Retained grouped FFN requires its original Q8/router descriptor contract:"
+                    " reuse_q8="+std::to_string(reuse_router_q8_hidden)+
+                    " gateup_owned="+std::to_string(owner_admission!=nullptr)+
+                    " intermediate_shard="+std::to_string(execution.isIntermediateShard())+
+                    " gate_mask="+std::to_string(gateup_table.codebook_mask)+
+                    "/"+std::to_string(gate_format.execution_codebook_mask)+
+                    " gate_policy="+std::to_string(gateup_table.policy_codebook_mask)+
+                    "/"+std::to_string(gate_format.policy_codebook_mask)+
+                    " down_mask="+std::to_string(down_table.codebook_mask)+
+                    "/"+std::to_string(down_format.execution_codebook_mask)+
+                    " down_policy="+std::to_string(down_table.policy_codebook_mask)+
+                    "/"+std::to_string(down_format.policy_codebook_mask)+
+                    " rows="+std::to_string(frontier->rows.physicalRows())+
+                    "/"+std::to_string(seq_len)+
+                    " publication="+std::to_string(router_q8_hidden_publication_?router_q8_hidden_publication_->published_rows:0)+
+                    " shared_gate_bytes="+std::to_string(workspace_?workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_SHARED_GATE):0));
+            if(!requireTensorOnDevice(frontier->sharedInputGate,device,stream,"shared input gate","grouped FFN frontier"))
+                return false;
+            const std::array outputs{frontier->sharedGateScratch,frontier->sharedUpScratch,frontier->routedOutput,
+                frontier->sharedOutput,frontier->combined};
+            for(auto* result:outputs)
+                if(!requireOutputOnDevice(result,device,stream,"original local FFN output","grouped FFN frontier"))
+                    return false;
+            const program::RoutePlan plan{frontier->rows.countOwner(),d_group_original_to_grouped_,
+                runtime_host_layer.route_expert_ids,runtime_host_layer.grouped_route_weights,d_router_q8_hidden_,
+                d_router_q8_hidden_scales_,d_hidden,runtime_gate_descs,runtime_up_descs,runtime_down_descs};
+            const auto address=[](TensorBase* tensor){return static_cast<float*>(tensor->gpu_data_ptr());};
+            const program::Output publication{d_prefill_swiglu_int8_,d_prefill_swiglu_scales_,
+                d_prefill_A_int8_,d_prefill_A_scales_,
+                static_cast<float*>(workspace_->getBuffer(MoEWorkspaceBuffers::ROCM_SHARED_GATE)),
+                address(frontier->sharedInputGate),
+                address(frontier->sharedGateScratch),address(frontier->sharedUpScratch),address(frontier->routedOutput),
+                address(frontier->sharedOutput),address(frontier->combined),d_canonical_route_contributions};
+            program::DirectBankInput direct;
+            if(frontier->directRouter.indices) {
+                const auto& router=frontier->directRouter;
+                if((router.demand!=MoEGroupedPlanDemand::None && router.demand!=MoEGroupedPlanDemand::DeferredAcceptedRows) ||
+                   !requireTensorOnDevice(router.indices,device,stream,"original router indices","grouped FFN direct bank") ||
+                   !requireTensorOnDevice(router.weights,device,stream,"original router weights","grouped FFN direct bank") ||
+                   !d_prefill_work_directory_ ||
+                   workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY)<program::bankIdentityBytes)
+                    return false;
+                direct={device_runtime_layer,static_cast<const float*>(router.indices->gpu_data_ptr()),
+                    static_cast<const float*>(router.weights->gpu_data_ptr()),router.demand,
+                    reinterpret_cast<std::uint64_t*>(d_prefill_work_directory_)};
+                if(router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumerWithExactK32Sums) {
+                    const auto* raw=workspace_->getBuffer(MoEWorkspaceBuffers::PREFILL_A_INT8);
+                    if(!program::usesExactK32Sums(frontier->program) || raw!=d_prefill_A_int8_ ||
+                       workspace_->getBufferSize(MoEWorkspaceBuffers::PREFILL_A_INT8)<program::k32SumWorkspaceBytes)
+                        throw std::logic_error("Exact K32 sum consumer lost the original router workspace");
+                    direct.affineSums=program::exactK32Sums(d_prefill_A_int8_);
+                }
+            }
+            const auto* formats=std::get_if<program::SourceFormatProgram>(&frontier->program);
+            if(formats) {
+                if(!frontier->boundSourceProgram ||
+                   !program::launchFormatProgram(plan,frontier->rows,frontier->sharedWeights,publication,device_ordinal_,stream,
+                        direct,*frontier->boundSourceProgram))
+                    return false;
+            } else {
+                const auto& measured=std::get<program::MeasuredProgram>(frontier->program);
+                if(!program::launch(plan,frontier->sharedWeights,publication,device_ordinal_,stream,direct,
+                        measured.geometry,measured.decoder,
+                        frontier->boundSourceProgram?&*frontier->boundSourceProgram:nullptr))
+                    return false;
+            }
+            markDeviceWritten(publication_output,device,stream);
+            for(auto* result:outputs)markDeviceWritten(result,device,stream);
+            PerfStatsCollector::addCounter("kernel","rocm_grouped_ffn_frontier_calls",1.0,"moe",device.toString(),
+                {{"physical_rows",std::to_string(seq_len)},{"routed_width",std::to_string(intermediate)},
+                 {"shared_width",std::to_string(program::sharedColumns(frontier->program))},
+                 {"verifier_dispatch_table",formats?native_quantised::verifierDispatchTableName(
+                     frontier->boundSourceProgram->dispatchTable()):"fixed"},
+                 {"program",formats?"all_formats":"fixed"},{"decoder_family",formats?std::to_string(formats->family()):"1"}});
+            return true;
+        }
         const bool ok = execution.overwriteOutputThenPublish(
             execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
             execution.executesDown() ? publication_output->size_bytes() : 0u,
@@ -12239,7 +12819,7 @@ namespace llaminar2
                 DeviceId::rocm(device_ordinal_).to_string(),
                 {{"seq_len", std::to_string(seq_len)},
                  {"top_k", std::to_string(top_k)},
-                 {"descriptor_source", "runtime_table"}});
+                 {"descriptor_source", execution.isIntermediateShard() ? "runtime_intermediate_shard" : "runtime_table"}});
         }
 
             if (PerfStatsCollector::isDomainEnabled("kernel") &&
@@ -12558,5 +13138,888 @@ namespace llaminar2
              {"participants", std::to_string(participant_count)}});
         return true;
     }
+
+namespace
+{
+/** @brief One retained existing named arena interval, never an allocation authority. */
+struct ResidentFFNScratchBinding
+{
+    const char* name=nullptr;
+    void* pointer=nullptr;
+    std::shared_ptr<const WorkspaceBufferLease> lease;
+    std::size_t bytes=0;
+};
+/** @brief Existing immutable singleton table handles and exact captured descriptor leases. */
+struct ResidentFFNSharedTables
+{
+    int gate_up=-1,down=-1;
+    std::array<std::shared_ptr<const WorkspaceBufferLease>,3> leases;
+};
+}
+/** @brief Immutable borrowed counter/table/scratch seal; the arena remains allocation authority. */
+struct ROCmMoEKernel::GateUpLastProducerBinding
+{
+    rocm::GateUpProducerLoads loads;
+    DeviceWorkspaceManager* workspace;
+    std::uint64_t generation;
+    void* stream;
+    int table,top_k,hidden,intermediate,experts;
+    std::uint32_t execution_mask,policy_mask;
+    NativeTileCompletionView view;
+    std::size_t counter_bytes;
+    std::shared_ptr<const WorkspaceBufferLease> lease;
+    std::shared_ptr<GroupedDescriptorWorkspacePublication> publication;
+    const void* original_gate;
+    const void* original_up;
+    std::size_t descriptor_slot;
+    MoEIntermediateShardDescriptorDeclaration original;
+    struct ScratchSeal
+    {
+        const char* name;
+        const void* pointer;
+        std::size_t bytes;
+        std::shared_ptr<const WorkspaceBufferLease> lease;
+    };
+    std::vector<ScratchSeal> scratch;
+    std::uint64_t signature;
+};
+
+/** @copydoc IMoEKernel::prepareGateUpPublication */
+std::uint64_t ROCmMoEKernel::prepareGateUpPublication(int table,int top_k,MoEGateUpPublicationPolicy policy)
+{
+    if(::llaminar2::isGraphCaptureActive()||!workspace_||reinterpret_cast<std::uintptr_t>(getStream())<=2||
+        table<0||table>=int(grouped_gateup_desc_tables_.size())||top_k<=0||top_k>int(kDeviceMoEMaxTopK))
+        throw std::logic_error("Gate/up publication requires cold original table/stream/workspace admission");
+    if(policy==MoEGateUpPublicationPolicy::Staged)
+    {
+        if(gate_up_last_producer_.contains(table))
+            throw std::logic_error("A prepared last-producer gate/up owner cannot become Staged behind its captured graph");
+        return 0;
+    }
+    if(policy!=MoEGateUpPublicationPolicy::LastProducer)
+        throw std::invalid_argument("Unknown gate/up publication policy");
+    // Binding a borrowed manager does not select a HIP device on this host
+    // thread. Reuse the canonical backend/device guard before setup traffic.
+    if(!validateROCmWorkspaceBinding(workspace_,device_ordinal_,"prepareGateUpPublication") ||
+        !setMoEDevice(device_ordinal_,"prepareGateUpPublication"))
+        throw std::logic_error("Last-producer gate/up lost its original ROCm workspace/device");
+    if(gate_up_last_producer_.contains(table))
+    {
+        if(gate_up_last_producer_.at(table)->loads!=rocm::currentGateUpProducerLoads())
+            throw std::logic_error("Prepared gate/up producer loads cannot be reselected");
+        return gateUpPublicationSignature(table,top_k);
+    }
+    const auto& source=grouped_gateup_desc_tables_[table];
+    if(!source.valid||!source.deviceReady()||source.weight_format!=DeviceMoEWeightFormat::NativeQuantised||
+        top_k>source.num_experts||!source.workspace_publication)
+        throw std::invalid_argument("Last-producer gate/up requires an original native M1 descriptor table");
+    const auto plan=rocm::gateUpLastProducerPlan(source.intermediate,source.d_model,top_k,source.policy_codebook_mask);
+    auto* counters=static_cast<std::uint32_t*>(workspace_->getBuffer(MoEWorkspaceBuffers::GATEUP_TILE_COMPLETION));
+    if(!counters||workspace_->getBufferSize(MoEWorkspaceBuffers::GATEUP_TILE_COMPLETION)<plan.bytes())
+        throw std::invalid_argument("Last-producer gate/up has no sufficient named PMA counter bank");
+    auto binding=std::make_shared<GateUpLastProducerBinding>(GateUpLastProducerBinding{
+        rocm::currentGateUpProducerLoads(),workspace_,workspace_->id(),getStream(),table,top_k,source.d_model,source.intermediate,source.num_experts,
+        source.codebook_mask,source.policy_codebook_mask,plan.bind(counters),plan.bytes(),
+        workspace_->retainBuffer(MoEWorkspaceBuffers::GATEUP_TILE_COMPLETION,0,plan.bytes()),source.workspace_publication,
+        source.device_gate_descs,source.device_up_descs,source.workspace_slot,source.original_family,{},{}});
+    for(const auto* name:std::array{MoEWorkspaceBuffers::DECODE_HIDDEN_INT8,MoEWorkspaceBuffers::DECODE_HIDDEN_SCALES,
+        MoEWorkspaceBuffers::GATEUP_GATE_PARTIALS,MoEWorkspaceBuffers::GATEUP_UP_PARTIALS,
+        MoEWorkspaceBuffers::DECODE_SWIGLU_INT8,MoEWorkspaceBuffers::DECODE_SWIGLU_SCALES,
+        MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,
+        MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES,MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES})
+    {
+        const auto* pointer=workspace_->getBuffer(name);
+        if(!pointer)throw std::logic_error("Last-producer gate/up original scratch/table preparation is incomplete");
+        const auto bytes=workspace_->getBufferSize(name);
+        binding->scratch.push_back({name,pointer,bytes,workspace_->retainBuffer(name,0,bytes)});
+    }
+    // Source tensors, partial banks and counters are distinct admitted names.
+    // The public cold metadata boundary proves completion of this exact setup
+    // copy before host staging retires. A retained leaf may later be imported
+    // into a parent launched on another stream, so capture-stream order alone
+    // is insufficient. Only this one-time publication waits on its own event;
+    // every subsequent reset remains device-owned in the last producer CTA.
+    const std::vector<std::byte> initial_counters(plan.bytes(),std::byte{0});
+    TransferEngine::instance().initializeWorkspaceMetadata(*binding->lease,initial_counters,getStream());
+    std::uint64_t signature=kFNV1a64OffsetBasis;
+    const auto mix=[&](std::uint64_t value){signature=(signature^value)*kFNV1a64Prime;};
+    for(const auto* pointer:std::array<const void*,7>{workspace_,getStream(),counters,source.device_gate_descs,
+        source.device_up_descs,source.workspace_publication.get(),rocm::gateUpLastProducerKernelFunction()})
+        mix(reinterpret_cast<std::uintptr_t>(pointer));
+    mix(workspace_->id());mix(static_cast<std::uint64_t>(binding->loads));mix(table);mix(top_k);mix(source.d_model);mix(source.intermediate);mix(source.num_experts);
+    mix(source.codebook_mask);mix(source.policy_codebook_mask);mix(source.workspace_slot);
+    mix(plan.tiles());mix(plan.contributors());mix(plan.bytes());
+    for(const auto& seal:binding->scratch){mix(reinterpret_cast<std::uintptr_t>(seal.pointer));mix(seal.bytes);}
+    binding->signature=signature?signature:1;
+    gate_up_last_producer_.emplace(table,std::move(binding));
+    return gateUpPublicationSignature(table,top_k);
+}
+
+/** @copydoc IMoEKernel::gateUpPublicationSignature */
+std::uint64_t ROCmMoEKernel::gateUpPublicationSignature(int table,int top_k) const
+{
+    const auto found=gate_up_last_producer_.find(table);
+    if(found==gate_up_last_producer_.end())return 0;
+    const auto& binding=*found->second;
+    if(!workspace_||workspace_!=binding.workspace||workspace_->id()!=binding.generation||getStream()!=binding.stream||
+        table!=binding.table||top_k!=binding.top_k||table<0||table>=int(grouped_gateup_desc_tables_.size()))
+        throw std::logic_error("Last-producer gate/up changed its original owner/generation/stream/table");
+    const auto& source=grouped_gateup_desc_tables_[table];
+    if(!source.valid||!source.deviceReady()||source.weight_format!=DeviceMoEWeightFormat::NativeQuantised||
+        source.d_model!=binding.hidden||source.intermediate!=binding.intermediate||source.num_experts!=binding.experts||
+        source.codebook_mask!=binding.execution_mask||source.policy_codebook_mask!=binding.policy_mask||
+        source.workspace_slot!=binding.descriptor_slot||source.workspace_publication!=binding.publication||
+        source.device_gate_descs!=binding.original_gate||source.device_up_descs!=binding.original_up||
+        !source.original_family.sameIdentity(binding.original))
+        throw std::logic_error("Last-producer gate/up changed its original descriptor/source publication");
+    if(workspace_->getBuffer(MoEWorkspaceBuffers::GATEUP_TILE_COMPLETION)!=binding.view.counters||
+        workspace_->getBufferSize(MoEWorkspaceBuffers::GATEUP_TILE_COMPLETION)<binding.counter_bytes)
+        throw std::logic_error("Last-producer gate/up counter bank was rebound or released");
+    for(const auto& seal:binding.scratch)
+        if(workspace_->getBuffer(seal.name)!=seal.pointer||workspace_->getBufferSize(seal.name)<seal.bytes)
+            throw std::logic_error("Last-producer gate/up original scratch/table storage changed");
+    return binding.signature;
+}
+
+/** @copydoc gateUpCompletionForCall */
+const NativeTileCompletionView* ROCmMoEKernel::gateUpCompletionForCall(int table,int top_k) const
+{
+    const auto signature=gateUpPublicationSignature(table,top_k);
+    if(signature&&gate_up_last_producer_.at(table)->loads!=rocm::currentGateUpProducerLoads())
+        throw std::logic_error("Prepared gate/up producer loads cannot change behind retained capture identity");
+    return signature?&gate_up_last_producer_.at(table)->view:nullptr;
+}
+
+/** @brief Immutable borrowed counter/table/scratch seal; the arena remains allocation authority. */
+struct ROCmMoEKernel::DownLastProducerBinding
+{
+    DeviceWorkspaceManager* workspace;
+    std::uint64_t generation;
+    void* stream;
+    int table,top_k,hidden,intermediate,experts;
+    std::uint32_t execution_mask,policy_mask;
+    NativeDownCompletionView view;
+    std::size_t counter_bytes;
+    std::shared_ptr<const WorkspaceBufferLease> lease;
+    std::shared_ptr<GroupedDescriptorWorkspacePublication> publication;
+    const void* original_down;
+    std::size_t descriptor_slot;
+    MoEIntermediateShardDescriptorDeclaration original;
+    struct ScratchSeal
+    {
+        const char* name;
+        const void* pointer;
+        std::size_t bytes;
+        std::shared_ptr<const WorkspaceBufferLease> lease;
+    };
+    std::vector<ScratchSeal> scratch;
+    std::uint64_t signature;
+};
+
+/** @copydoc IMoEKernel::prepareDownPublication */
+std::uint64_t ROCmMoEKernel::prepareDownPublication(int table,int top_k,MoEDownPublicationPolicy policy)
+{
+    if(::llaminar2::isGraphCaptureActive()||!workspace_||reinterpret_cast<std::uintptr_t>(getStream())<=2||
+        table<0||table>=int(grouped_down_desc_tables_.size())||top_k<=0||top_k>int(kDeviceMoEMaxTopK))
+        throw std::logic_error("Down/route publication requires cold original table/stream/workspace admission");
+    if(policy==MoEDownPublicationPolicy::Staged)
+    {
+        if(down_last_producer_.contains(table))
+            throw std::logic_error("A prepared last-producer down/route owner cannot become Staged behind its captured graph");
+        return 0;
+    }
+    if(policy!=MoEDownPublicationPolicy::LastProducerRouteFold)
+        throw std::invalid_argument("Unknown down/route publication policy");
+    // Binding a borrowed manager does not select a HIP device on this host
+    // thread. Reuse the canonical backend/device guard before setup traffic.
+    if(!validateROCmWorkspaceBinding(workspace_,device_ordinal_,"prepareDownPublication") ||
+        !setMoEDevice(device_ordinal_,"prepareDownPublication"))
+        throw std::logic_error("Last-producer down/route lost its original ROCm workspace/device");
+    if(down_last_producer_.contains(table))return downPublicationSignature(table,top_k);
+    const auto& source=grouped_down_desc_tables_[table];
+    if(!source.valid||!source.deviceReady()||source.weight_format!=DeviceMoEWeightFormat::NativeQuantised||
+        top_k>source.num_experts||!source.workspace_publication)
+        throw std::invalid_argument("Last-producer down/route requires an original native M1 descriptor table");
+    const auto plan=rocm::downLastProducerPlan(source.d_model,source.intermediate,top_k,source.policy_codebook_mask);
+    auto* counters=static_cast<std::uint32_t*>(workspace_->getBuffer(MoEWorkspaceBuffers::DOWN_TILE_COMPLETION));
+    if(!counters||workspace_->getBufferSize(MoEWorkspaceBuffers::DOWN_TILE_COMPLETION)<plan.bytes())
+        throw std::invalid_argument("Last-producer down/route has no sufficient named PMA counter bank");
+    auto binding=std::make_shared<DownLastProducerBinding>(DownLastProducerBinding{
+        workspace_,workspace_->id(),getStream(),table,top_k,source.d_model,source.intermediate,source.num_experts,
+        source.codebook_mask,source.policy_codebook_mask,plan.bind(counters),plan.bytes(),
+        workspace_->retainBuffer(MoEWorkspaceBuffers::DOWN_TILE_COMPLETION,0,plan.bytes()),source.workspace_publication,
+        source.device_descs,source.workspace_slot,source.original_family,{},{}});
+    for(const auto* name:std::array{MoEWorkspaceBuffers::DECODE_SWIGLU_INT8,MoEWorkspaceBuffers::DECODE_SWIGLU_SCALES,
+        MoEWorkspaceBuffers::DOWN_PARTIALS,MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE,
+        MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES})
+    {
+        const auto* pointer=workspace_->getBuffer(name);
+        if(!pointer)throw std::logic_error("Last-producer down/route original scratch/table preparation is incomplete");
+        const auto bytes=workspace_->getBufferSize(name);
+        binding->scratch.push_back({name,pointer,bytes,workspace_->retainBuffer(name,0,bytes)});
+    }
+    // Source tensors, partial banks and counters are distinct admitted names.
+    // The public cold metadata boundary proves completion of this exact setup
+    // copy before host staging retires. A retained leaf may later be imported
+    // into a parent launched on another stream, so capture-stream order alone
+    // is insufficient. Only this one-time publication waits on its own event;
+    // every subsequent reset remains device-owned in the last producer CTA.
+    const std::vector<std::byte> initial_counters(plan.bytes(),std::byte{0});
+    TransferEngine::instance().initializeWorkspaceMetadata(*binding->lease,initial_counters,getStream());
+    std::uint64_t signature=kFNV1a64OffsetBasis;
+    const auto mix=[&](std::uint64_t value){signature=(signature^value)*kFNV1a64Prime;};
+    for(const auto* pointer:std::array<const void*,6>{workspace_,getStream(),counters,source.device_descs,
+        source.workspace_publication.get(),rocm::downLastProducerKernelFunction()})
+        mix(reinterpret_cast<std::uintptr_t>(pointer));
+    mix(workspace_->id());mix(table);mix(top_k);mix(source.d_model);mix(source.intermediate);mix(source.num_experts);
+    mix(source.codebook_mask);mix(source.policy_codebook_mask);mix(source.workspace_slot);
+    mix(plan.partitions().tiles());mix(plan.partitions().contributors());mix(plan.bytes());
+    for(const auto& seal:binding->scratch){mix(reinterpret_cast<std::uintptr_t>(seal.pointer));mix(seal.bytes);}
+    binding->signature=signature?signature:1;
+    down_last_producer_.emplace(table,std::move(binding));
+    return downPublicationSignature(table,top_k);
+}
+
+/** @copydoc IMoEKernel::downPublicationSignature */
+std::uint64_t ROCmMoEKernel::downPublicationSignature(int table,int top_k) const
+{
+    const auto found=down_last_producer_.find(table);
+    if(found==down_last_producer_.end())return 0;
+    const auto& binding=*found->second;
+    if(!workspace_||workspace_!=binding.workspace||workspace_->id()!=binding.generation||getStream()!=binding.stream||
+        table!=binding.table||top_k!=binding.top_k||table<0||table>=int(grouped_down_desc_tables_.size()))
+        throw std::logic_error("Last-producer down/route changed its original owner/generation/stream/table");
+    const auto& source=grouped_down_desc_tables_[table];
+    if(!source.valid||!source.deviceReady()||source.weight_format!=DeviceMoEWeightFormat::NativeQuantised||
+        source.d_model!=binding.hidden||source.intermediate!=binding.intermediate||source.num_experts!=binding.experts||
+        source.codebook_mask!=binding.execution_mask||source.policy_codebook_mask!=binding.policy_mask||
+        source.workspace_slot!=binding.descriptor_slot||source.workspace_publication!=binding.publication||
+        source.device_descs!=binding.original_down||
+        !source.original_family.sameIdentity(binding.original))
+        throw std::logic_error("Last-producer down/route changed its original descriptor/source publication");
+    if(workspace_->getBuffer(MoEWorkspaceBuffers::DOWN_TILE_COMPLETION)!=binding.view.partitions.counters||
+        workspace_->getBufferSize(MoEWorkspaceBuffers::DOWN_TILE_COMPLETION)<binding.counter_bytes)
+        throw std::logic_error("Last-producer down/route counter bank was rebound or released");
+    for(const auto& seal:binding.scratch)
+        if(workspace_->getBuffer(seal.name)!=seal.pointer||workspace_->getBufferSize(seal.name)<seal.bytes)
+            throw std::logic_error("Last-producer down/route original scratch/table storage changed");
+    return binding.signature;
+}
+
+/** @copydoc downCompletionForCall */
+const NativeDownCompletionView* ROCmMoEKernel::downCompletionForCall(int table,int top_k) const
+{
+    const auto signature=downPublicationSignature(table,top_k);
+    return signature?&down_last_producer_.at(table)->view:nullptr;
+}
+
+#include "ROCmFullNativeHCFFNOwner.inc"
+
+/** @brief Sealed native program plus original tensor/workspace lifetime observations. */
+class ROCmMoEKernel::PreparedResidentFFN final : public PreparedResidentMoEFFN
+{
+public:
+    /**
+     * @brief Retain original FFN authority and one exact already-admitted native program.
+     * @param owner Original backend source/table/workspace authority.
+     * @param request Original tensor/source declaration retained by the stage.
+     * @param args Complete admitted FFN argument snapshot.
+     * @param admission Actual standalone or full function's immutable resource/admission evidence.
+     * @param stream Exact original non-default submission stream.
+     * @param scratch Existing named FFN leases and consumed byte extents.
+     * @param shared_tables Original immutable shared descriptor publication handles.
+     * @param router Optional original router/suffix snapshot.
+     * @param router_tensors Original router/ID/weight tensor identity observations.
+     * @param barrier_slot Existing exclusive instance slot, retained until graph retirement.
+     * @param prefix Optional admitted HC phase; its original stage retains and validates physical leases.
+     */
+    PreparedResidentFFN(ROCmMoEKernel& owner,ResidentMoEFFNRequest request,rocm::ResidentMoEFFNArgs args,
+        rocm::PreparedMoEFFNProgram admission,void* stream,std::vector<ResidentFFNScratchBinding> scratch,
+        ResidentFFNSharedTables shared_tables,std::optional<rocm::NativeLayoutRouterFFNArgs> router={},
+        std::array<TensorBase*,3> router_tensors={},
+        std::shared_ptr<PersistentWorkspaceSlotLease> barrier_slot={},
+        std::optional<rocm::FullNativeHCFFNPrefixArgs> prefix={})
+        :owner_(&owner),request_(std::move(request)),args_(args),admission_(admission),stream_(stream),
+         workspace_(owner.getWorkspace()),workspace_id_(workspace_->id()),scratch_(std::move(scratch)),
+         shared_tables_(std::move(shared_tables)),gate_publication_(owner.grouped_gateup_desc_tables_.at(request_.gate_up_table).workspace_publication),
+         down_publication_(owner.grouped_down_desc_tables_.at(request_.down_table).workspace_publication),
+         shared_gate_publication_(owner.grouped_gateup_desc_tables_.at(shared_tables_.gate_up).workspace_publication),
+         shared_down_publication_(owner.grouped_down_desc_tables_.at(shared_tables_.down).workspace_publication),
+         barrier_slot_(std::move(barrier_slot)),native_router_(std::move(router)),full_prefix_(std::move(prefix)),router_tensors_(router_tensors),router_publication_((admission.evidence().kind==ResidentMoEFFNLaunchKind::OrdinaryPhases||native_router_)
+            ?owner.paired_router_descriptors_:std::nullopt)
+    {
+        const auto mix=[&](std::uint64_t value){signature_=(signature_^value)*kFNV1a64Prime;};
+        for(const void* pointer:std::array<const void*,23>{args_.runtime,args_.hidden,args_.gates,args_.ups,args_.downs,
+            args_.shared_gate,args_.shared_up,args_.shared_down,
+            args_.shared_input_gate,args_.hidden_q8,args_.hidden_scales,args_.gate_partials,args_.up_partials,args_.down_partials,
+            args_.swiglu_q8,args_.swiglu_scales,args_.route_contributions,args_.routed_output,args_.shared_output,args_.combined_output,
+            args_.shared_gate_output,args_.shared_up_output,stream_})mix(reinterpret_cast<std::uintptr_t>(pointer));
+        for(const auto& matrix:std::array{request_.shared.gate,request_.shared.up,request_.shared.down})
+        {
+            for(const void* pointer:std::array<const void*,4>{matrix.payload,matrix.scales,matrix.mins,matrix.emins})
+                mix(reinterpret_cast<std::uintptr_t>(pointer));
+            mix(matrix.n);mix(matrix.k);mix(matrix.blocks_per_row);mix(matrix.codebook_id);
+            mix(matrix.source_identity_present);mix(matrix.source_codebook_id);mix(matrix.source_is_superblock);
+            mix(matrix.allocation_payload_bytes_per_block);mix(matrix.allocation_has_mins);mix(matrix.allocation_has_emins);
+        }
+        const auto rows=args_.rows.captureIdentity();
+        mix(reinterpret_cast<std::uintptr_t>(rows.count));mix(rows.count_capacity);mix(rows.first_physical_row);
+        mix(rows.physical_rows);mix(rows.repeats_per_row);mix(rows.schema_version);
+        mix(args_.hidden_columns);mix(args_.routed_columns);mix(args_.shared_columns);mix(args_.experts);mix(args_.top_k);mix(args_.resident_grid);
+        mix(args_.execution.routed_gate);mix(args_.execution.routed_down);
+        mix(args_.execution.shared_gate);mix(args_.execution.shared_down);
+        mix(args_.original.firstIntermediateColumn());mix(args_.original.intermediateColumns());
+        mix(args_.original.target().participantId());mix(args_.original.target().cohortTarget());
+        const auto& evidence=admission_.evidence();
+        sealRetainedModelReceipt();
+        mix(static_cast<std::uint64_t>(evidence.kind));mix(evidence.generation);mix(evidence.nativeEntries().size());
+        mix(static_cast<std::uint64_t>(evidence.device.type));mix(evidence.device.ordinal);
+        for(const auto& entry:evidence.nativeEntries())
+        {
+            mix(reinterpret_cast<std::uintptr_t>(entry.function));mix(entry.grid);mix(entry.threads);mix(entry.dynamic_shared_bytes);
+            mix(entry.resources.registers_per_thread);mix(entry.resources.maximum_threads_per_block);
+            mix(entry.resources.blocks_per_processor);mix(entry.resources.private_bytes);mix(entry.resources.static_shared_bytes);
+        }
+        if(router_publication_)
+        {
+            mix(router_publication_->gateup_table);mix(router_publication_->down_table);
+            mix(static_cast<unsigned>(router_publication_->outputs.format));
+            mix(static_cast<unsigned>(router_publication_->outputs.projections));
+        }
+        for(const auto& binding:scratch_)
+        {mix(reinterpret_cast<std::uintptr_t>(binding.pointer));mix(binding.bytes);}
+        mix(workspace_id_);
+        mix(shared_tables_.gate_up);mix(shared_tables_.down);
+        for(const auto& p:std::array{args_.routed_gate_policy,args_.routed_down_policy,args_.shared_gate_policy,args_.shared_down_policy})
+        {mix(p.p0);mix(p.p1);mix(p.p2);mix(p.p3);mix(p.maximum);}
+        if(native_router_)
+        {
+            mix(reinterpret_cast<std::uintptr_t>(native_router_->barrier_state));
+            for(std::size_t i=0;i<router_tensors_.size();++i)
+            {
+                if(!router_tensors_[i])throw std::logic_error("Native-layout router tensor owner is absent");
+                router_shapes_[i]=router_tensors_[i]->shape();
+                mix(reinterpret_cast<std::uintptr_t>(router_tensors_[i]));
+                for(const auto extent:router_shapes_[i])mix(extent);
+            }
+            mix(reinterpret_cast<std::uintptr_t>(native_router_->router_weights));
+            mix(reinterpret_cast<std::uintptr_t>(native_router_->router_logits));
+            mix(reinterpret_cast<std::uintptr_t>(native_router_->router_indices));
+            mix(reinterpret_cast<std::uintptr_t>(native_router_->router_weights_output));
+            mix(native_router_->normalize_router_weights);mix(native_router_->write_router_outputs);
+            // Full-entry windows are immutable captured policy, independent of
+            // current row count or routes. Standalone entries retain zero fields.
+            mix(native_router_->full_entry_panel.rows);mix(native_router_->full_entry_panel.blocks);
+        }
+        if(full_prefix_)
+        {
+            if(!native_router_)throw std::logic_error("Full native HC requires its existing router/FFN owner");
+            validateFullNativeHCFFNPrefixBinding(*full_prefix_,*native_router_);
+            mixFullNativeHCFFNPrefix(*full_prefix_,mix);
+        }
+        if(!signature_)signature_=1;
+    }
+    /** @copydoc PreparedResidentMoEFFN::programEvidence */
+    const ResidentMoEFFNProgramEvidence& programEvidence() const noexcept override {return admission_.evidence();}
+    /** @copydoc PreparedResidentMoEFFN::captureSignature */
+    std::uint64_t captureSignature() const noexcept override {return signature_;}
+    /** @copydoc PreparedResidentMoEFFN::validateBinding */
+    void validateBinding() const override
+    {
+        if(owner_->getStream()!=stream_||owner_->getWorkspace()!=workspace_||workspace_->id()!=workspace_id_)
+            throw std::logic_error("Resident FFN changed its original stream/workspace owner");
+        for(const auto& binding:scratch_)
+            if(workspace_->getBuffer(binding.name)!=binding.pointer||workspace_->getBufferSize(binding.name)<binding.bytes)
+                throw std::logic_error("Resident FFN original scratch storage was rebound");
+        if(request_.gate_up_table>=int(owner_->grouped_gateup_desc_tables_.size())||
+            request_.down_table>=int(owner_->grouped_down_desc_tables_.size())||
+            shared_tables_.gate_up>=int(owner_->grouped_gateup_desc_tables_.size())||
+            shared_tables_.down>=int(owner_->grouped_down_desc_tables_.size()))
+            throw std::logic_error("Resident FFN original descriptor table retired");
+        const auto& gate=owner_->grouped_gateup_desc_tables_[request_.gate_up_table];
+        const auto& down=owner_->grouped_down_desc_tables_[request_.down_table];
+        if(!gate.valid||!down.valid||gate.workspace_publication!=gate_publication_||
+            down.workspace_publication!=down_publication_||((!router_publication_||native_router_)&&gate.device_gate_descs!=args_.gates)||
+            ((!router_publication_||native_router_)&&(gate.device_up_descs!=args_.ups||down.device_descs!=args_.downs))||
+            !gate.original_family.sameIdentity(request_.original)||!down.original_family.sameIdentity(request_.original)||
+            gate.codebook_mask!=args_.execution.routed_gate||down.codebook_mask!=args_.execution.routed_down||
+            gate.codebook_mask!=request_.original.nativeGateUpEnvelope().execution_codebook_mask||
+            down.codebook_mask!=request_.original.nativeDownEnvelope().execution_codebook_mask||
+            gate.policy_codebook_mask!=request_.original.nativeGateUpEnvelope().policy_codebook_mask||
+            down.policy_codebook_mask!=request_.original.nativeDownEnvelope().policy_codebook_mask||
+            gate.num_experts!=args_.experts||down.num_experts!=args_.experts||gate.d_model!=args_.hidden_columns||
+            down.d_model!=args_.hidden_columns||gate.intermediate!=args_.routed_columns||down.intermediate!=args_.routed_columns)
+            throw std::logic_error("Resident FFN original descriptor storage or source family changed");
+        if(router_publication_&&!native_router_)
+        {
+            const auto& original=*router_publication_;
+            const auto& current=owner_->requirePairedRouterDescriptors(request_.runtime,args_.experts,args_.top_k);
+            if(current.gateup_table!=original.gateup_table||current.down_table!=original.down_table||
+                current.gateup_table!=request_.gate_up_table||current.down_table!=request_.down_table||
+                current.outputs.gate!=args_.gates||current.outputs.up!=args_.ups||current.outputs.down!=args_.downs||
+                current.outputs.format!=DeviceMoEWeightFormat::NativeQuantised||
+                current.outputs.projections!=DeviceMoEProjectionSet::IntermediateShard)
+                throw std::logic_error("Ordinary FFN original router descriptor publication changed");
+        }
+        if(native_router_)
+        {
+            const auto barrier_bytes=full_prefix_?rocm::fullNativeHCFFNSlotBytes(full_prefix_->implementation):NativeLayoutBarrierLayout::bytes;
+            auto* barrier_base=barrier_slot_?static_cast<std::uint32_t*>(workspace_->getPersistentSlotBuffer(
+                MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER,MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+                barrier_slot_->slot(),barrier_bytes)):nullptr;
+            if(!barrier_base||native_router_->barrier_state!=barrier_base+
+                (full_prefix_?FullNativeHCFFNBarrierLayout::suffix_word_offset:0))
+                throw std::logic_error("Native-layout barrier slot binding changed");
+            if(full_prefix_)
+            {
+                if(full_prefix_->barrier_state!=barrier_base)
+                    throw std::logic_error("Full native HC prefix barrier slot binding changed");
+                validateFullNativeHCFFNPrefixBinding(*full_prefix_,*native_router_);
+            }
+            const std::array<const void*,3> expected{native_router_->router_weights,native_router_->router_indices,native_router_->router_weights_output};
+            for(std::size_t i=0;i<router_tensors_.size();++i)
+                if(router_tensors_[i]->gpu_data_ptr()!=expected[i]||router_tensors_[i]->shape()!=router_shapes_[i])
+                    throw std::logic_error("Native-layout router tensor storage or shape changed");
+            const auto& publisher=owner_->requirePairedRouterDescriptors(request_.runtime,args_.experts,args_.top_k);
+            if(!router_publication_||publisher.runtime!=router_publication_->runtime||
+                publisher.workspace!=router_publication_->workspace||publisher.workspace_id!=router_publication_->workspace_id||
+                publisher.stream!=router_publication_->stream||publisher.outputs.gate!=router_publication_->outputs.gate||
+                publisher.outputs.up!=router_publication_->outputs.up||publisher.outputs.down!=router_publication_->outputs.down)
+                throw std::logic_error("Native-layout router publication owner changed");
+            if(publisher.gateup_table!=request_.gate_up_table||publisher.down_table!=request_.down_table||
+                publisher.outputs.expert_count!=native_router_->router_publication.expert_count||
+                publisher.outputs.format!=native_router_->router_publication.format||
+                publisher.outputs.projections!=native_router_->router_publication.projections||
+                publisher.outputs.gate!=native_router_->router_publication.gate||publisher.outputs.up!=native_router_->router_publication.up||
+                publisher.outputs.down!=native_router_->router_publication.down||owner_->d_route_logits_!=native_router_->router_logits)
+                throw std::logic_error("Native-layout FFN original router publication changed");
+        }
+        const auto& shared_gate=owner_->grouped_gateup_desc_tables_[shared_tables_.gate_up];
+        const auto& shared_down=owner_->grouped_down_desc_tables_[shared_tables_.down];
+        // Immutable source metadata is checked field by field, never by a live
+        // source-data digest or a device readback. Table rewrites must reject
+        // even when their publication object and device addresses survive.
+        const auto same=[](const DeviceNativeQuantisedMatrixDesc& a,const DeviceNativeQuantisedMatrixDesc& b) {
+            return a.payload==b.payload && a.scales==b.scales && a.mins==b.mins && a.emins==b.emins &&
+                a.n==b.n && a.k==b.k && a.blocks_per_row==b.blocks_per_row && a.codebook_id==b.codebook_id &&
+                a.allocation_payload_bytes_per_block==b.allocation_payload_bytes_per_block &&
+                a.allocation_has_mins==b.allocation_has_mins && a.allocation_has_emins==b.allocation_has_emins &&
+                a.source_codebook_id==b.source_codebook_id && a.source_is_superblock==b.source_is_superblock &&
+                a.source_identity_present==b.source_identity_present && a.reserved==b.reserved && a.reserved_tail==b.reserved_tail;
+        };
+        if(!shared_gate.valid||!shared_down.valid||shared_gate.num_experts!=1||shared_down.num_experts!=1||
+            shared_gate.weight_format!=DeviceMoEWeightFormat::NativeQuantised||shared_down.weight_format!=DeviceMoEWeightFormat::NativeQuantised||
+            shared_gate.descriptor_source!=MoEDecodeDescriptorSource::StaticDescriptorTable||
+            shared_down.descriptor_source!=MoEDecodeDescriptorSource::StaticDescriptorTable||
+            shared_gate.workspace_publication!=shared_gate_publication_||shared_down.workspace_publication!=shared_down_publication_||
+            shared_gate.device_gate_descs!=args_.shared_gate||shared_gate.device_up_descs!=args_.shared_up||
+            shared_gate.codebook_mask!=args_.execution.shared_gate||shared_down.codebook_mask!=args_.execution.shared_down||
+            shared_down.device_descs!=args_.shared_down||shared_gate.d_model!=args_.hidden_columns||
+            shared_down.d_model!=args_.hidden_columns||shared_gate.intermediate!=args_.shared_columns||shared_down.intermediate!=args_.shared_columns||
+            shared_gate.host_gate_descs.size()!=1||shared_gate.host_up_descs.size()!=1||shared_down.host_descs.size()!=1||
+            !same(shared_gate.host_gate_descs[0],request_.shared.gate)||!same(shared_gate.host_up_descs[0],request_.shared.up)||
+            !same(shared_down.host_descs[0],request_.shared.down))
+            throw std::logic_error("Resident FFN original immutable shared descriptor publication changed");
+        // Re-evaluate the arena's exact named table intervals. Retained leases
+        // preserve old bytes after growth, but never authorize replaying them.
+        const auto tableMatches=[&](const char* name,std::size_t slot,const void* pointer,std::size_t experts) {
+            const auto available=workspace_->getBufferSize(name);
+            const auto stride=(available/MoEWorkspaceBuffers::kGroupedDescriptorTableSlots/
+                sizeof(DeviceNativeQuantisedMatrixDesc))*sizeof(DeviceNativeQuantisedMatrixDesc);
+            const auto base=reinterpret_cast<std::uintptr_t>(workspace_->getBuffer(name));
+            return base && slot<MoEWorkspaceBuffers::kGroupedDescriptorTableSlots &&
+                stride>=experts*sizeof(DeviceNativeQuantisedMatrixDesc) &&
+                (slot+1)*stride<=available &&
+                reinterpret_cast<std::uintptr_t>(pointer)==base+slot*stride;
+        };
+        if(router_publication_&&!native_router_&&(
+            !tableMatches(MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,gate.workspace_slot,args_.gates,args_.experts)||
+            !tableMatches(MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,gate.workspace_slot,args_.ups,args_.experts)||
+            !tableMatches(MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE,down.workspace_slot,args_.downs,args_.experts)))
+            throw std::logic_error("Ordinary FFN original router descriptor arena changed");
+        if(!tableMatches(MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES,gate.workspace_slot,gate.device_gate_descs,args_.experts)||
+            !tableMatches(MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES,gate.workspace_slot,gate.device_up_descs,args_.experts)||
+            !tableMatches(MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES,down.workspace_slot,down.device_descs,args_.experts)||
+            !tableMatches(MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES,shared_gate.workspace_slot,args_.shared_gate,1)||
+            !tableMatches(MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES,shared_gate.workspace_slot,args_.shared_up,1)||
+            !tableMatches(MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES,shared_down.workspace_slot,args_.shared_down,1))
+            throw std::logic_error("Resident FFN original named descriptor arena changed");
+        const auto tensors=std::array<ITensor*,7>{request_.hidden,request_.shared_input_gate,request_.route_contributions,
+            request_.routed_output,request_.shared_output,request_.combined_output,request_.shared_gate_scratch};
+        const auto addresses=std::array<const void*,7>{args_.hidden,args_.shared_input_gate,args_.route_contributions,
+            args_.routed_output,args_.shared_output,args_.combined_output,args_.shared_gate_output};
+        for(std::size_t i=0;i<tensors.size();++i)
+            if(addresses[i]&&(!tensors[i]||tensors[i]->gpu_data_ptr()!=addresses[i]))
+                throw std::logic_error("Resident FFN public tensor storage changed");
+        if(args_.shared_up_output&&(!request_.shared_up_scratch||request_.shared_up_scratch->gpu_data_ptr()!=args_.shared_up_output))
+            throw std::logic_error("Resident FFN shared up storage changed");
+    }
+    /** @copydoc PreparedResidentMoEFFN::enqueue */
+    void enqueue(void* stream) const override
+    {
+        if(stream!=stream_)throw std::logic_error("Resident FFN submission changed its original stream");
+        validateBinding();
+        if(full_prefix_)
+        {
+            const rocm::FullNativeHCFFNArgs full{*native_router_,*full_prefix_};
+            if(full_prefix_->implementation==rocm::FullNativeHCFFNImplementation::RetainedGFX906M1) {
+                const auto& evidence=admission_.evidence();
+                const auto histogram=rocm::retainedM1NativeHistogramPolicy(request_.model_main_inference?
+                    request_.model_main_inference->histogram_producer:MoERuntimeHistogramProducerRole::ProductionDecode);
+                if(evidence.generation!=workspace_id_||evidence.nativeEntries().size()!=1||
+                   evidence.nativeEntries().front().function!=rocm::retainedM1HCFFNKernelFunction(full.prefix.output_demand,
+                       full.prefix.selected_descriptor_demand,full.suffix.ffn.execution,histogram))
+                    throw std::logic_error("Retained M1 HC/FFN lost its exact prepared function");
+                rocm::launchRetainedM1HCFFNDevice(full,request_.shared.gate,request_.shared.up,request_.shared.down,
+                    rocm::retainedM1HCFFNScratch(full_prefix_->barrier_state),workspace_id_,stream,histogram);
+                if(!retained_model_receipt_.empty()&&::llaminar2::isGraphCaptureActive())
+                    PerfStatsCollector::addCounter("gpu_graph_inventory","retained_m1_layer_binding",1.0,
+                        "graph_setup",evidence.device.toString(),retained_model_receipt_);
+            } else rocm::launchFullNativeHCFFN(admission_,full,stream,workspace_id_);
+            PerfStatsCollector::addCounter("kernel","rocm_full_native_hc_ffn_calls",1.0,"moe",
+                admission_.evidence().device.toString(),{{"resident_grid",std::to_string(args_.resident_grid)}});
+        }
+        else if(native_router_)rocm::launchNativeLayoutRouterFFN(admission_,*native_router_,stream,workspace_id_);
+        else rocm::launchResidentMoEFFN(admission_,args_,stream,workspace_id_);
+        PerfStatsCollector::addCounter("kernel","rocm_resident_moe_ffn_calls",1.0,"moe",admission_.evidence().device.toString(),
+            {{"top_k",std::to_string(args_.top_k)},{"routed_f",std::to_string(args_.routed_columns)},
+             {"shared_f",std::to_string(args_.shared_columns)},{"resident_grid",std::to_string(args_.resident_grid)},{"native_launches",std::to_string(admission_.evidence().nativeEntries().size())}});
+    }
+private:
+    /**
+     * @brief Seal an opt-in diagnostic census from original model, detector and prepared launch owners.
+     * @pre The exact registered HIP entry and its stream were admitted cold by the original backend.
+     * @details Captured replay never resolves function names or constructs tags.
+     */
+    void sealRetainedModelReceipt()
+    {
+        if(!request_.model_main_inference ||
+           !PerfStatsCollector::isRecordFamilyEnabled("gpu_graph_inventory","retained_m1_layer_binding"))return;
+        if(!full_prefix_ || full_prefix_->implementation!=rocm::FullNativeHCFFNImplementation::RetainedGFX906M1)
+            throw std::logic_error("Retained model receipt requires its original retained preparation");
+
+        const auto sourceName=[](const ExpertWeightFormat& role) -> const char* {
+            const auto source=role.native_quantised;
+            if(role.isNativeQuantised() && source.present) {
+                if(source.codebook_id==5 && source.is_superblock)return "Q4_K";
+                if(source.codebook_id==7)return source.is_superblock?"Q5_K":"Q5_1";
+                if(source.codebook_id==19 && !source.is_superblock)return "Q8_0";
+            }
+            throw std::logic_error("Retained model receipt lost its original GGUF source identity");
+        };
+        const auto& mode=*request_.model_main_inference;
+        const auto& sources=request_.original.sourceFormats();
+        const auto& evidence=admission_.evidence();
+        const auto& entry=evidence.nativeEntries().front();
+        const auto* symbol=hipKernelNameRefByPtr(entry.function,static_cast<hipStream_t>(stream_));
+        if(!symbol||!*symbol||mode.source_layer<0||!barrier_slot_)
+            throw std::logic_error("Retained model receipt requires its resolved HIP kernel and source layer");
+        const auto& hardware=rocmHardwareMetadata().at(evidence.device.ordinal);
+        retained_model_receipt_={
+            {"layer",std::to_string(mode.source_layer)},
+            {"h",std::to_string(args_.hidden_columns)},{"r",std::to_string(full_prefix_->hc.publication.columns)},
+            {"f",std::to_string(args_.routed_columns)},{"s",std::to_string(args_.shared_columns)},
+            {"experts",std::to_string(args_.experts)},{"top_k",std::to_string(args_.top_k)},
+            {"f_start",std::to_string(args_.original.firstIntermediateColumn())},
+            {"s_start",std::to_string(mode.shared_source_first_column)},
+            {"gate",sourceName(sources[0])},{"up",sourceName(sources[1])},{"down",sourceName(sources[2])},
+            {"pci",hardware.pci_address},{"phase","decode"},{"role","main_inference"},
+            {"rows",std::to_string(args_.rows.physicalRows())},{"requests","1"},
+            {"scratch_slot",std::to_string(barrier_slot_->slot())},
+            {"kernel",symbol},{"grid",std::to_string(entry.grid)+"x1x1"},{"block",std::to_string(entry.threads)+"x1x1"},
+        };
+    }
+
+    ROCmMoEKernel* owner_;
+    const ResidentMoEFFNRequest request_;
+    PerfStatsCollector::Tags retained_model_receipt_; ///< Cold optional model census; no device state is cached here.
+    const rocm::ResidentMoEFFNArgs args_;
+    const rocm::PreparedMoEFFNProgram admission_;
+    const std::shared_ptr<PersistentWorkspaceSlotLease> barrier_slot_; ///< Exclusive barrier bytes until graph retirement.
+    const std::optional<rocm::NativeLayoutRouterFFNArgs> native_router_;
+    const std::optional<rocm::FullNativeHCFFNPrefixArgs> full_prefix_; ///< Original stage-owned phase snapshot, not another source/table owner.
+    const std::array<TensorBase*,3> router_tensors_;
+    std::array<std::vector<std::size_t>,3> router_shapes_;
+    void* const stream_;
+    DeviceWorkspaceManager* const workspace_;
+    const std::uint64_t workspace_id_;
+    const std::vector<ResidentFFNScratchBinding> scratch_;
+    const ResidentFFNSharedTables shared_tables_;
+    const std::optional<PairedRouterDescriptors> router_publication_; ///< Same original router's existing borrowed destinations.
+    const std::shared_ptr<GroupedDescriptorWorkspacePublication> gate_publication_,down_publication_,
+        shared_gate_publication_,shared_down_publication_;
+    std::uint64_t signature_=kFNV1a64OffsetBasis;
+};
+
+/** @copydoc IResidentMoEFFNPreparation::prepareResidentMoEFFN */
+std::unique_ptr<PreparedResidentMoEFFN> ROCmMoEKernel::prepareResidentMoEFFN(
+    const ResidentMoEFFNRequest& request,void* stream)
+{
+    return prepareResidentMoEFFNImpl(request,stream,nullptr,nullptr,nullptr,false);
+}
+
+/** @copydoc ROCmMoEKernel::prepareNativeLayoutRouterFFN */
+std::unique_ptr<PreparedResidentMoEFFN> ROCmMoEKernel::prepareNativeLayoutRouterFFN(
+    const ResidentMoEFFNRequest& request,TensorBase* router,TensorBase* indices,TensorBase* weights,bool normalize,void* stream)
+{
+    if(!router||router->native_type()!=TensorType::FP16||!indices||!weights||
+        indices->native_type()!=TensorType::FP32||weights->native_type()!=TensorType::FP32)
+        throw std::invalid_argument("Native-layout router FFN requires the original prepared FP16 router and public outputs");
+    const rocm::ScopedResidentMoEFFNProgram selection(rocm::ResidentMoEFFNProgram::NativeLayoutRouter);
+    preparePairedRouterDecodeDescriptors(request.runtime,request.gate_up_table,request.down_table,request.top_k);
+    return prepareResidentMoEFFNImpl(request,stream,router,indices,weights,normalize);
+}
+
+/** @copydoc ROCmMoEKernel::prepareFullNativeHCFFN */
+std::unique_ptr<PreparedResidentMoEFFN> ROCmMoEKernel::prepareFullNativeHCFFN(
+    const ResidentMoEFFNRequest& request,TensorBase* router,TensorBase* indices,TensorBase* weights,
+    bool normalize,const rocm::FullNativeHCFFNPrefixArgs& prefix,void* stream)
+{
+    if(!router||router->native_type()!=TensorType::FP16||!indices||!weights||
+        indices->native_type()!=TensorType::FP32||weights->native_type()!=TensorType::FP32||prefix.barrier_state)
+        throw std::invalid_argument("Full native HC requires original FP16 router outputs and an unbound barrier");
+    const rocm::ScopedResidentMoEFFNProgram selection(rocm::ResidentMoEFFNProgram::NativeLayoutRouter);
+    preparePairedRouterDecodeDescriptors(request.runtime,request.gate_up_table,request.down_table,request.top_k);
+    return prepareResidentMoEFFNImpl(request,stream,router,indices,weights,normalize,&prefix);
+}
+
+/** @brief Share the original source/table/arena resolver without preparing another native program. */
+std::unique_ptr<PreparedResidentMoEFFN> ROCmMoEKernel::prepareResidentMoEFFNImpl(
+    const ResidentMoEFFNRequest& request,void* stream,TensorBase* router,TensorBase* indices,TensorBase* weights,bool normalize,
+    const rocm::FullNativeHCFFNPrefixArgs* prefix)
+{
+    const auto device=DeviceId::rocm(device_ordinal_);
+    if(!workspace_||!stream||stream!=getStream()||::llaminar2::isGraphCaptureActive())
+        throw std::logic_error("Resident FFN preparation requires its original workspace/stream outside capture");
+    const auto& original=request.original.originalBinding();
+    const int H=int(original.modelColumns()),F=int(original.localIntermediateColumns());
+    if(!request.original.valid()||request.original.weightFormat()!=DeviceMoEWeightFormat::NativeQuantised||
+        request.rows.physicalRows()!=1||request.rows.capacity()!=1||!request.runtime||!request.hidden||request.top_k<=0||
+        request.top_k>int(kDeviceMoEMaxTopK)||request.gate_up_table<0||request.down_table<0||
+        request.gate_up_table>=int(grouped_gateup_desc_tables_.size())||request.down_table>=int(grouped_down_desc_tables_.size()))
+        throw std::invalid_argument("Resident FFN requires an original native-quantised ordinary M1 source declaration");
+    const auto& gate=grouped_gateup_desc_tables_[request.gate_up_table];
+    const auto& down=grouped_down_desc_tables_[request.down_table];
+    if(!gate.valid||!down.valid||!gate.deviceReady()||!down.deviceReady()||gate.num_experts!=down.num_experts||
+        gate.d_model!=H||down.d_model!=H||gate.intermediate!=F||down.intermediate!=F||
+        gate.descriptor_source!=MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable||
+        down.descriptor_source!=MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable||
+        !gate.original_family.sameIdentity(request.original)||!down.original_family.sameIdentity(request.original)||
+        !request.original.validFor(device,gate.num_experts,H,F))
+        throw std::invalid_argument("Resident FFN changed original private table/family identities");
+    const auto routed_gate_envelope=request.original.nativeGateUpEnvelope();
+    const auto routed_down_envelope=request.original.nativeDownEnvelope();
+    if(!routed_gate_envelope.valid()||!routed_down_envelope.valid()||
+        gate.codebook_mask!=routed_gate_envelope.execution_codebook_mask||
+        down.codebook_mask!=routed_down_envelope.execution_codebook_mask||
+        gate.policy_codebook_mask!=routed_gate_envelope.policy_codebook_mask||
+        down.policy_codebook_mask!=routed_down_envelope.policy_codebook_mask)
+        throw std::invalid_argument("Resident FFN table masks do not match the complete original source envelopes");
+    const int shared_f=request.shared.gate.n;
+    if(request.shared.weight_format!=DeviceMoEWeightFormat::NativeQuantised||shared_f<=0||shared_f%32||
+        !validateGroupedGateUpDesc(request.shared.gate,H,shared_f)||!validateGroupedGateUpDesc(request.shared.up,H,shared_f)||
+        !validateGroupedDownDesc(request.shared.down,H,shared_f))
+        throw std::invalid_argument("Resident FFN shared source has invalid original native projection geometry");
+    // The original prepared owner seals physical validity before these SAME
+    // immutable shared tables become available to a full-entry consumer. This
+    // does not certify allocation spans independently of the prepared owner.
+    for(const auto& descriptor:std::array{request.shared.gate,request.shared.up,request.shared.down})
+        if(!NativeQuantisedDescriptorValidation::publishable(descriptor))
+            throw std::invalid_argument("Resident FFN shared publication has incomplete native physical planes");
+    NativeQuantisedExecutionFormatEnvelope shared_gate,shared_down;
+    const auto add=[](NativeQuantisedExecutionFormatEnvelope& envelope,const DeviceNativeQuantisedMatrixDesc& desc){
+        return addNativeQuantisedExecutionFormat(envelope,desc.codebook_id,
+            {.codebook_id=desc.source_codebook_id,.is_superblock=bool(desc.source_is_superblock),.present=bool(desc.source_identity_present)},false);
+    };
+    if(!add(shared_gate,request.shared.gate)||!add(shared_gate,request.shared.up)||!add(shared_down,request.shared.down))
+        throw std::invalid_argument("Resident FFN shared source has no original arithmetic-policy identity");
+    const auto pointer=[](ITensor* tensor,std::size_t elements)->float* {
+        if(!tensor||tensor->native_type()!=TensorType::FP32||tensor->size_bytes()/sizeof(float)<elements||!tensor->gpu_data_ptr())
+            throw std::invalid_argument("Resident FFN requires original materialized FP32 tensor storage");
+        return static_cast<float*>(tensor->gpu_data_ptr());
+    };
+    rocm::ResidentMoEFFNArgs args;
+    args.runtime=request.runtime;args.original=original;args.rows=request.rows;
+    args.hidden=pointer(request.hidden,H);args.shared_input_gate=pointer(request.shared_input_gate,H);
+    args.gates=gate.device_gate_descs;args.ups=gate.device_up_descs;args.downs=down.device_descs;
+    const bool ordinary=rocm::currentResidentMoEFFNProgram()==rocm::ResidentMoEFFNProgram::OrdinaryPhases;
+    if(ordinary)
+    {
+        const auto& publisher=requirePairedRouterDescriptors(request.runtime,gate.num_experts,request.top_k);
+        if(publisher.gateup_table!=request.gate_up_table||publisher.down_table!=request.down_table||
+            publisher.outputs.format!=DeviceMoEWeightFormat::NativeQuantised||
+            publisher.outputs.projections!=DeviceMoEProjectionSet::IntermediateShard)
+            throw std::logic_error("Ordinary FFN requires its exact original router descriptor producer");
+        args.gates=publisher.outputs.gate;args.ups=publisher.outputs.up;args.downs=publisher.outputs.down;
+    }
+    args.hidden_columns=H;args.routed_columns=F;args.shared_columns=shared_f;args.experts=gate.num_experts;args.top_k=request.top_k;
+    const auto output_demand=prefix?prefix->output_demand:FullNativeHCFFNOutputDemand::all();
+    const auto output=[&](FullNativeHCFFNOutputRole role,ITensor* tensor,std::size_t elements) {
+        return output_demand.contains(role)?pointer(tensor,elements):nullptr;
+    };
+    args.route_contributions=output(FullNativeHCFFNOutputRole::RouteContributions,request.route_contributions,size_t(request.top_k)*H);
+    args.routed_output=output(FullNativeHCFFNOutputRole::Routed,request.routed_output,H);
+    args.shared_output=output(FullNativeHCFFNOutputRole::Shared,request.shared_output,H);
+    args.combined_output=pointer(request.combined_output,H);
+    args.shared_gate_output=output(FullNativeHCFFNOutputRole::SharedGate,request.shared_gate_scratch,shared_f);
+    args.shared_up_output=output(FullNativeHCFFNOutputRole::SharedUp,request.shared_up_scratch,shared_f);
+    struct Span{const void* pointer;std::size_t bytes;};
+    const std::array public_reads{Span{args.hidden,size_t(H)*sizeof(float)},Span{args.shared_input_gate,size_t(H)*sizeof(float)}};
+    const auto publication=[](const void* pointer,std::size_t bytes){return Span{pointer,pointer?bytes:0};};
+    const std::array public_writes{publication(args.route_contributions,size_t(request.top_k)*H*sizeof(float)),
+        publication(args.routed_output,size_t(H)*sizeof(float)),publication(args.shared_output,size_t(H)*sizeof(float)),
+        publication(args.combined_output,size_t(H)*sizeof(float)),publication(args.shared_gate_output,size_t(shared_f)*sizeof(float)),
+        publication(args.shared_up_output,size_t(shared_f)*sizeof(float))};
+    const auto disjoint=[](Span a,Span b){const auto x=reinterpret_cast<std::uintptr_t>(a.pointer),y=reinterpret_cast<std::uintptr_t>(b.pointer);
+        return !a.bytes||!b.bytes||(a.bytes<=std::numeric_limits<std::uintptr_t>::max()-x&&b.bytes<=std::numeric_limits<std::uintptr_t>::max()-y&&
+            (x+a.bytes<=y||y+b.bytes<=x));};
+    for(size_t i=0;i<public_writes.size();++i)
+    {
+        for(const auto& read:public_reads)if(!disjoint(public_writes[i],read))throw std::invalid_argument("Resident FFN output aliases an original input");
+        for(size_t j=0;j<i;++j)if(!disjoint(public_writes[i],public_writes[j]))throw std::invalid_argument("Resident FFN public outputs alias");
+    }
+    std::vector<ResidentFFNScratchBinding> scratch;
+    const auto bind=[&](const char* name,size_t bytes)->void* {
+        auto* value=workspace_->getBuffer(name);
+        if(!value||bytes>workspace_->getBufferSize(name))throw std::invalid_argument(std::string("Resident FFN original arena is insufficient: ")+name);
+        const Span span{value,bytes};
+        for(const auto& read:public_reads)if(!disjoint(span,read))throw std::invalid_argument("Resident FFN scratch aliases an original input");
+        for(const auto& output:public_writes)if(!disjoint(span,output))throw std::invalid_argument("Resident FFN scratch aliases a public output");
+        scratch.push_back({name,value,workspace_->retainBuffer(name,0,bytes),bytes});return value;
+    };
+    if(ordinary)
+    {
+        // These are the existing expert-indexed producer destinations, not a
+        // second table or a new allocation. Retain their original named bytes.
+        bind(MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE));
+        bind(MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE));
+        bind(MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE,workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE));
+    }
+    const size_t intermediate_values=std::max(size_t(request.top_k)*F,size_t(shared_f));
+    args.hidden_q8=static_cast<int8_t*>(bind(MoEWorkspaceBuffers::DECODE_HIDDEN_INT8,H));
+    args.hidden_scales=static_cast<float*>(bind(MoEWorkspaceBuffers::DECODE_HIDDEN_SCALES,size_t(H/32)*sizeof(float)));
+    args.gate_partials=static_cast<float*>(bind(MoEWorkspaceBuffers::GATEUP_GATE_PARTIALS,
+        intermediate_values*NativeQuantisedGroupedDecodePolicy::maximum_k_partitions*sizeof(float)));
+    args.up_partials=static_cast<float*>(bind(MoEWorkspaceBuffers::GATEUP_UP_PARTIALS,
+        intermediate_values*NativeQuantisedGroupedDecodePolicy::maximum_k_partitions*sizeof(float)));
+    args.down_partials=static_cast<float*>(bind(MoEWorkspaceBuffers::DOWN_PARTIALS,
+        size_t(request.top_k)*H*NativeQuantisedGroupedDecodePolicy::maximum_k_partitions*sizeof(float)));
+    args.swiglu_q8=static_cast<int8_t*>(bind(MoEWorkspaceBuffers::DECODE_SWIGLU_INT8,intermediate_values));
+    args.swiglu_scales=static_cast<float*>(bind(MoEWorkspaceBuffers::DECODE_SWIGLU_SCALES,intermediate_values/32*sizeof(float)));
+    const rocm::ResidentMoEFFNPolicyMasks masks{
+        .routed_gate=gate.policy_codebook_mask,.routed_down=down.policy_codebook_mask,
+        .shared_gate=shared_gate.policy_codebook_mask,.shared_down=shared_down.policy_codebook_mask,
+        .execution={routed_gate_envelope.execution_codebook_mask,routed_down_envelope.execution_codebook_mask,
+            shared_gate.execution_codebook_mask,shared_down.execution_codebook_mask}};
+    // Reuse the original immutable descriptor publication infrastructure and
+    // admitted slots. These are the same singleton shared tables the staged
+    // SharedExpertFFNStage prepares; neither weights nor allocation authority
+    // are duplicated. Appending these host vectors can invalidate gate/down
+    // references above, so all original scalars/pointers are already copied.
+    ResidentFFNSharedTables shared_tables;
+    shared_tables.gate_up=uploadGroupedExpertGateUpDescriptorTables(&request.shared.gate,&request.shared.up,1,H,shared_f);
+    shared_tables.down=uploadGroupedExpertDownDescriptorTable(&request.shared.down,1,H,shared_f);
+    if(shared_tables.gate_up<0||shared_tables.down<0)
+        throw std::runtime_error("Resident FFN could not publish its original immutable shared descriptors");
+    const auto& shared_gate_table=grouped_gateup_desc_tables_[shared_tables.gate_up];
+    const auto& shared_down_table=grouped_down_desc_tables_[shared_tables.down];
+    args.shared_gate=shared_gate_table.device_gate_descs;args.shared_up=shared_gate_table.device_up_descs;
+    args.shared_down=shared_down_table.device_descs;
+    const auto retain=[&](const char* name,std::size_t slot) {
+        const auto bytes=workspace_->getBufferSize(name);
+        const auto stride=(bytes/MoEWorkspaceBuffers::kGroupedDescriptorTableSlots/sizeof(DeviceNativeQuantisedMatrixDesc))*
+            sizeof(DeviceNativeQuantisedMatrixDesc);
+        if(stride<sizeof(DeviceNativeQuantisedMatrixDesc)||slot>=MoEWorkspaceBuffers::kGroupedDescriptorTableSlots)
+            throw std::logic_error("Resident FFN original immutable descriptor slot is incomplete");
+        return workspace_->retainBuffer(name,slot*stride,sizeof(DeviceNativeQuantisedMatrixDesc));
+    };
+    shared_tables.leases={retain(MoEWorkspaceBuffers::ROCM_GROUPED_GATE_DESC_TABLES,shared_gate_table.workspace_slot),
+        retain(MoEWorkspaceBuffers::ROCM_GROUPED_UP_DESC_TABLES,shared_gate_table.workspace_slot),
+        retain(MoEWorkspaceBuffers::ROCM_GROUPED_DOWN_DESC_TABLES,shared_down_table.workspace_slot)};
+    if(router)
+    {
+        // Shared descriptor registration above may grow the owning vectors.
+        // Use the already copied geometry, never the earlier gate-table reference.
+        const auto& publication=requirePairedRouterDescriptors(request.runtime,args.experts,request.top_k);
+        if(!ensureRouteBufferCapacity(args.experts))throw std::logic_error("Native-layout router logits arena is unavailable");
+        bind(MoEWorkspaceBuffers::ROUTE_LOGITS,std::size_t(args.experts)*sizeof(float));
+        for(const auto* name:{MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_GATE_DESC_TABLE,
+            MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_UP_DESC_TABLE,MoEWorkspaceBuffers::ROCM_RUNTIME_PREFILL_DOWN_DESC_TABLE})
+            bind(name,workspace_->getBufferSize(name));
+        rocm::NativeLayoutRouterFFNArgs combined;
+        auto barrier_slot=workspace_->acquirePersistentSlot(MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER,MoEWorkspaceBuffers::kGroupedDescriptorTableSlots);
+        if(!barrier_slot)throw std::logic_error("Native-layout barrier already has a retained owner");
+        const auto barrier_bytes=prefix?rocm::fullNativeHCFFNSlotBytes(prefix->implementation):NativeLayoutBarrierLayout::bytes;
+        const auto barrier_bank_bytes=workspace_->getBufferSize(MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER);
+        if(barrier_bank_bytes<barrier_bytes*MoEWorkspaceBuffers::kGroupedDescriptorTableSlots)
+            throw std::invalid_argument("Native-layout barrier bank is smaller than its admitted slot payloads");
+        // Slot addresses use the actual merged bank stride, not this caller's
+        // payload width. A standalone 16-byte owner can occupy a late slot in a
+        // bank enlarged for 56-byte full owners, so retain the actual named extent.
+        bind(MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER,barrier_bank_bytes);
+        auto* barrier_base=static_cast<std::uint32_t*>(workspace_->getPersistentSlotBuffer(
+            MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER,MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
+            barrier_slot->slot(),barrier_bytes));
+        if(!barrier_base)throw std::logic_error("Native-layout barrier slot is unavailable");
+        combined.barrier_state=barrier_base+(prefix?FullNativeHCFFNBarrierLayout::suffix_word_offset:0);
+        const auto barrier_offset=reinterpret_cast<const std::byte*>(barrier_base)-
+            static_cast<const std::byte*>(workspace_->getBuffer(MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER));
+        const auto barrier_lease=workspace_->retainBuffer(MoEWorkspaceBuffers::NATIVE_LAYOUT_BARRIER,barrier_offset,barrier_bytes);
+        if(!prefix)TransferEngine::instance().initializeWorkspaceMetadata(*barrier_lease,
+            std::vector<std::byte>(barrier_bytes,std::byte{0}),stream);
+        combined.ffn=args;combined.router_weights=router->gpu_data_ptr();combined.router_logits=d_route_logits_;
+        combined.router_indices=static_cast<float*>(indices->gpu_data_ptr());
+        combined.router_weights_output=static_cast<float*>(weights->gpu_data_ptr());
+        combined.router_publication=publication.outputs;combined.normalize_router_weights=normalize;combined.write_router_outputs=true;
+        if(router->size_bytes()!=std::size_t(args.experts)*H*sizeof(uint16_t)||
+            indices->size_bytes()<std::size_t(request.top_k)*sizeof(float)||weights->size_bytes()<std::size_t(request.top_k)*sizeof(float)||
+            !combined.router_weights||!combined.router_indices||!combined.router_weights_output)
+            throw std::invalid_argument("Native-layout router original tensor extents are invalid");
+        const std::array router_writes{Span{combined.router_indices,std::size_t(request.top_k)*sizeof(float)},
+            Span{combined.router_weights_output,std::size_t(request.top_k)*sizeof(float)},
+            Span{combined.router_logits,std::size_t(args.experts)*sizeof(float)}};
+        for(std::size_t i=0;i<router_writes.size();++i)
+        {
+            if(!disjoint(router_writes[i],Span{combined.router_weights,router->size_bytes()}))
+                throw std::invalid_argument("Native-layout router output aliases its original router weights");
+            for(const auto& read:public_reads)if(!disjoint(router_writes[i],read))
+                throw std::invalid_argument("Native-layout router output aliases original input");
+            for(const auto& output:public_writes)if(!disjoint(router_writes[i],output))
+                throw std::invalid_argument("Native-layout router output aliases FFN output");
+            for(std::size_t j=0;j<i;++j)if(!disjoint(router_writes[i],router_writes[j]))
+                throw std::invalid_argument("Native-layout router public outputs alias");
+        }
+        for(const auto& output:public_writes)
+            if(!disjoint(output,Span{combined.router_weights,router->size_bytes()}))
+                throw std::invalid_argument("Native-layout FFN output aliases original router weights");
+        // Original source-policy tables are resolved by the same native authority.
+        // The full branch admits only the actual complete function, never a
+        // standalone HC or suffix function before replacing that admission.
+        if(prefix)
+        {
+            rocm::FullNativeHCFFNArgs full{combined,*prefix};
+            full.prefix.barrier_state=barrier_base;
+            if(full.prefix.implementation==rocm::FullNativeHCFFNImplementation::RetainedGFX906M1)
+                (void)rocm::ROCmRetainedM1HCFFNBinding::resolve(full,request.shared,masks);
+            const auto admission=full.prefix.implementation==rocm::FullNativeHCFFNImplementation::RetainedGFX906M1
+                ?rocm::prepareRetainedM1HCFFN(device,full,masks,workspace_->id(),
+                    rocm::retainedM1NativeHistogramPolicy(request.model_main_inference?
+                        request.model_main_inference->histogram_producer:MoERuntimeHistogramProducerRole::ProductionDecode))
+                :rocm::prepareFullNativeHCFFN(device,full,masks,workspace_->id());
+            validateFullNativeHCFFNPrefixBinding(full.prefix,full.suffix);
+            validateFullNativeHCFFNStorage(full.prefix,full.suffix,scratch,*workspace_);
+            TransferEngine::instance().initializeWorkspaceMetadata(*barrier_lease,
+                std::vector<std::byte>(barrier_bytes,std::byte{0}),stream);
+            return std::make_unique<PreparedResidentFFN>(*this,request,full.suffix.ffn,admission,stream,std::move(scratch),
+                std::move(shared_tables),full.suffix,std::array<TensorBase*,3>{router,indices,weights},
+                std::move(barrier_slot),full.prefix);
+        }
+        const auto admission=rocm::prepareNativeLayoutRouterFFN(device,combined,masks,workspace_->id());
+        return std::make_unique<PreparedResidentFFN>(*this,request,combined.ffn,admission,stream,std::move(scratch),
+            std::move(shared_tables),combined,std::array<TensorBase*,3>{router,indices,weights},std::move(barrier_slot));
+    }
+    const auto admission=rocm::prepareResidentMoEFFN(device,args,masks,workspace_->id());
+    return std::make_unique<PreparedResidentFFN>(*this,request,args,admission,stream,std::move(scratch),std::move(shared_tables));
+}
 
 } // namespace llaminar2

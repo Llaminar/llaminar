@@ -25,6 +25,7 @@
 #include "MoEControllerMovementPerfStats.h"
 
 #include "MoEOverlayDeviceControllerKernels.h"
+#include "MoEOverlayDynamicPolicyWorkspaceOwner.h"
 #include "MoEOverlayEconomyCertificationController.h"
 #include "MoEOverlayDevicePhysicalMovement.h"
 #include "MoEOverlayDevicePreparedArrivalInbox.h"
@@ -351,7 +352,7 @@ namespace llaminar2
     {
         MoEOverlayDeviceControllerParticipantBinding binding;
         MoEOverlayDeviceControllerRuntimeBinding runtime_binding;
-        DeviceMoERebalanceConfig snapshot_config;
+        MoEOverlayDeviceSnapshotBinding snapshot_config;
         IWorkerGPUContext *worker = nullptr;
         IBackend *backend = nullptr;
         std::unique_ptr<IMoEKernel> kernel;
@@ -405,6 +406,8 @@ namespace llaminar2
         void *stream = nullptr;
         void *terminal_event = nullptr;
         MoEOverlayDeviceControllerPolicyResult *policy_result = nullptr;
+        /** One exact PMA-owned tail shared by serial prefill/decode/restore policy graphs. */
+        std::unique_ptr<MoEOverlayDynamicPolicyWorkspaceOwner> policy_workspace;
         /** Phase-pure decode, prefill, and verifier cumulative baselines. */
         std::uint64_t *histogram_phase_baselines = nullptr;
         std::size_t histogram_baseline_words = 0u;
@@ -869,24 +872,15 @@ namespace llaminar2
                     "Device controller graph resolved inconsistent participant roles");
             }
 
-            endpoint->snapshot_config = DeviceMoERebalanceConfig{
-                .num_layers = runtime.layer_count,
-                .num_experts = runtime.expert_count,
+            endpoint->snapshot_config = MoEOverlayDeviceSnapshotBinding{
+                .runtime_layers = runtime.runtime_layers_device,
+                .layer_count = runtime.layer_count,
+                .expert_count = runtime.expert_count,
                 .top_k = runtime.top_k,
-                .participant_id = runtime.domain_participant_id,
-                .participant_count = runtime.domain_participant_count,
-                .root_participant = 0u,
-                .window_size_tokens = 1u,
-                .layer_window_start = 0u,
-                .layer_window_count = runtime.layer_count,
-                .layer_wave_count = runtime.layer_count,
-            };
-            if (!validateDeviceMoERebalanceConfig(
-                    endpoint->snapshot_config))
-            {
-                throw std::logic_error(
-                    "Device controller could not derive a valid full-model snapshot configuration");
-            }
+                .domain_participant_id = runtime.domain_participant_id,
+                .domain_participant_count = runtime.domain_participant_count};
+            if (!endpoint->snapshot_config.valid())
+                throw std::logic_error("Device controller requires the original full-model snapshot geometry");
             materializeEndpoint(*endpoint);
             endpoints_.push_back(std::move(endpoint));
         }
@@ -1328,7 +1322,7 @@ namespace llaminar2
                 endpoint.stream = endpoint.worker->getOrCreateAuxiliaryStream(
                     streamName(endpoint.binding));
                 endpoint.terminal_event = endpoint.worker->createEvent();
-                if (!endpoint.stream ||
+                if (!endpoint.stream || !endpoint.terminal_event ||
                     !endpoint.runtime_binding.initial_runtime_publisher ||
                     !endpoint.runtime_binding.initial_runtime_publisher
                          ->publishMoEOverlayDeviceInitialRuntime(
@@ -1348,11 +1342,19 @@ namespace llaminar2
                 }
                 if (config_.execution_mode == ExecutionMode::Dynamic)
                 {
+                    if (endpoint.binding.authority_leader)
+                    {
+                        const auto &layout = config_.fabric->layout().header;
+                        endpoint.policy_workspace = std::make_unique<MoEOverlayDynamicPolicyWorkspaceOwner>(
+                            config_.physical_memory_authority, endpoint.binding.device,
+                            MoEOverlayDynamicPolicyShape{layout.participant_count, layout.logical_target_count, layout.tier_count, layout.num_experts},
+                            endpoint.stream);
+                    }
                     endpoint.histogram_baseline_words =
                         static_cast<std::size_t>(
-                            endpoint.snapshot_config.num_layers) *
+                            endpoint.snapshot_config.layer_count) *
                         static_cast<std::size_t>(
-                            endpoint.snapshot_config.num_experts);
+                            endpoint.snapshot_config.expert_count);
                     if (endpoint.histogram_baseline_words == 0u ||
                         endpoint.histogram_baseline_words >
                             std::numeric_limits<std::size_t>::max() /
@@ -1439,6 +1441,8 @@ namespace llaminar2
                                 .policy_result = policy_action
                                                      ? endpoint.policy_result
                                                      : nullptr,
+                                .policy_workspace = endpoint.policy_workspace
+                                    ? endpoint.policy_workspace->binding() : MoEOverlayDynamicPolicyWorkspaceBinding{},
                                 .runtime_publication =
                                     publication_action &&
                                             endpoint.arrival_inbox
@@ -1454,40 +1458,17 @@ namespace llaminar2
                             });
                 };
 
-                const auto pack_snapshot = [
-                                               &endpoint,
-                                               &launch](
-                                               std::uint64_t *baseline)
+                const auto pack_snapshot = [&endpoint, &launch](std::uint64_t *baseline)
                 {
-                    // Packing and publication share the participant's exact
-                    // retained stream. The mapped participant record is the
-                    // release edge consumed by the group root.
-                    const auto plane_words = static_cast<std::size_t>(
-                        endpoint.snapshot_config.num_layers) *
-                        endpoint.snapshot_config.num_experts;
-                    // Histogram ABI and economy use the same source order.
-                    // All planes are packed before the single release edge;
-                    // no host histogram or additional collective is involved.
-                    static_assert(moe_runtime_abi::kHistogramSourceCount ==
-                                  kMoEOverlayDeviceControllerDemandPhaseCount);
-                    for (std::uint32_t phase = 0u;
-                         phase < kMoEOverlayDeviceControllerDemandPhaseCount;
-                         ++phase)
-                    {
-                        const auto offset = phase * plane_words;
-                        if (!endpoint.kernel->packDeviceRebalanceHistograms(
-                                launch,
-                                endpoint.runtime_binding.runtime_layers_device,
-                                endpoint.binding.participant_collected_state + offset,
-                                endpoint.snapshot_config,
-                                /*wave_state=*/nullptr,
-                                /*controller_state=*/nullptr,
-                                /*command_buffer_count=*/1u,
-                                1u << phase,
-                                baseline ? baseline + offset : nullptr))
-                            return false;
-                    }
-                    return true;
+                    // This action reads selected global routes only on the
+                    // original continuation root, even when its local bank is empty.
+                    // The following existing publication is the sole release edge.
+                    auto source = endpoint.snapshot_config;
+                    source.previous_selected_counts = baseline;
+                    return endpoint.kernel->runMoEOverlayDeviceControllerAction(launch,
+                        {.binding = endpoint.binding.deviceBinding(),
+                            .action = MoEOverlayDeviceControllerAction::CollectRuntimeSnapshot,
+                            .snapshot = source});
                 };
 
                 const auto capture = [&](std::unique_ptr<IGPUGraphCapture> &graph,
@@ -2163,6 +2144,12 @@ namespace llaminar2
 
             const auto &group_layout = config_.fabric->layout().groups.at(
                 static_cast<std::size_t>(endpoint.binding.group_id));
+            // Host validation consumes the original immutable roster, never a
+            // device alias of the extent-sized mapped layout.
+            const auto &group_members = config_.topology->groups.at(
+                static_cast<std::size_t>(endpoint.binding.group_id)).participant_ids;
+            if (participant_records.size() != group_members.size())
+                return fail(error, "Captured controller participant snapshot changed its original group extent");
             for (std::size_t member = 0u;
                  member < participant_records.size();
                  ++member)
@@ -2173,7 +2160,7 @@ namespace llaminar2
                     record.version !=
                         kMoEOverlayDeviceControllerFabricVersion ||
                     record.participant_id !=
-                        group_layout.participant_ids[member] ||
+                        group_members[member] ||
                     record.group_id != group_layout.group_id ||
                     record.topology_fingerprint !=
                         config_.topology->topology_fingerprint ||
@@ -4837,11 +4824,13 @@ namespace llaminar2
         {
             const auto &migration = batch.migrations[migration_index];
             const auto *const source_group =
-                owner->config_.topology->groupForParticipant(
-                    migration.source.owner_participant);
+                owner->config_.topology->groupForTarget(migration.source.shard_cohort
+                    ? MoEOverlayRouteTarget::cohort(migration.source.tier_idx)
+                    : MoEOverlayRouteTarget::whole(migration.source.owner_participant));
             const auto *const destination_group =
-                owner->config_.topology->groupForParticipant(
-                    migration.destination.owner_participant);
+                owner->config_.topology->groupForTarget(migration.destination.shard_cohort
+                    ? MoEOverlayRouteTarget::cohort(migration.destination.tier_idx)
+                    : MoEOverlayRouteTarget::whole(migration.destination.owner_participant));
             if (!source_group || !destination_group ||
                 cycle_index_by_migration[migration_index] ==
                     std::numeric_limits<std::size_t>::max() ||
@@ -4874,8 +4863,8 @@ namespace llaminar2
                 .cycle_size = cycle_size_by_migration[migration_index],
                 .direction = direction,
                 .axis = migration.axis,
-                .source = MoEOptimizationMovementEndpoint::whole(migration.source.owner_participant, migration.source.device, (migration.source.owner_world_rank_known) ? std::optional<int>{migration.source.owner_world_rank} : std::nullopt),
-                .destination = MoEOptimizationMovementEndpoint::whole(migration.destination.owner_participant, migration.destination.device, (migration.destination.owner_world_rank_known) ? std::optional<int>{migration.destination.owner_world_rank} : std::nullopt),
+                .source = MoEOptimizationMovementEndpoint::fromOwner(migration.source),
+                .destination = MoEOptimizationMovementEndpoint::fromOwner(migration.destination),
                 .source_priority = source_group->tier_priority,
                 .destination_priority = destination_group->tier_priority,
                 .estimated_weight_bytes =
@@ -5063,7 +5052,7 @@ namespace llaminar2
          * The additional transaction is the mandatory zero-command proof. */
         const std::uint64_t owner_words =
             owner->config_.fabric->layout().header
-                .initial_owner_participants_words;
+                .initial_route_targets_words;
         if (owner_words == 0u)
         {
             return fail(
@@ -5166,6 +5155,20 @@ namespace llaminar2
                     endpoint.dynamic_acknowledge_retired_graph.reset();
                     endpoint.dynamic_complete_graph.reset();
                     endpoint.arrival_inbox.reset();
+                    if (endpoint.policy_workspace)
+                    {
+                        // Teardown only: all retained users have retired above.
+                        // This original-stream event also closes a setup-only
+                        // header upload when activation never began, keeping
+                        // its host source and PMA lease alive through completion.
+                        if (!endpoint.worker->recordEventChecked(endpoint.terminal_event, endpoint.stream) ||
+                            !endpoint.worker->synchronizeEventChecked(endpoint.terminal_event))
+                        {
+                            LOG_ERROR("Device policy scratch retirement lost its exact stream completion");
+                            std::terminate();
+                        }
+                        endpoint.policy_workspace.reset();
+                    }
                     endpoint.kernel.reset();
                     if (endpoint.terminal_event)
                     {

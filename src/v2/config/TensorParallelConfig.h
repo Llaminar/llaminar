@@ -76,6 +76,12 @@ namespace llaminar2
         int local_rank = 0;
 
         /**
+         * @param other Original device assignment used by a graph/admission identity.
+         * @return Whether every immutable shard coordinate and policy value agrees.
+         */
+        bool operator==(const DeviceShardingAssignment &other) const = default;
+
+        /**
          * @brief Check if this assignment is valid (non-empty)
          */
         bool isValid() const

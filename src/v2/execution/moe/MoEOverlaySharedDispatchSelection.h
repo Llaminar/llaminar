@@ -103,7 +103,7 @@ namespace llaminar2 {
             const auto expert = static_cast<std::int32_t>(value);
             if (static_cast<float>(expert) != value)
                 return MoEOverlaySharedRowDecision::Invalid;
-            if (MoEOverlayRouteTarget::fromWord(routes[expert]).isCPUCohort() &&
+            if (MoEOverlayRouteTarget::fromWord(routes[expert]).isCohort() &&
                 moeOverlayJointRouteWeightIsZero(weight))
                 continue;
             if (launch.shared_row_target_count == 0u)

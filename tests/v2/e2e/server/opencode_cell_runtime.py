@@ -23,9 +23,11 @@ import uuid
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / 'scripts/ci'))
 import docker_paths
+from install_opencode_client import VERSION as QUALIFIED_CLIENT_VERSION
 from production_artifacts import write_json
 from run_model_parity_benchmarks import benchmark_profile
 from run_model_parity_e2e import readiness_timeout_seconds
+from collective_runtime_binding import NATIVE_CALL_DOMAINS, require_native_owners
 from attention_execution_perf_policy import validate_attention_execution_policy
 from gpu_host_transfer_perf_policy import validate_gpu_host_transfer_policy
 from graph_capture_perf_policy import DecodeGraphRequirement, validate_graph_capture_policy
@@ -38,7 +40,8 @@ from opencode_stress_policy import app_archive_compaction_assessment
 from opencode_tool_stress import wait_for_client
 from prefix_reuse_measurement import integer
 from ranked_perf_artifacts import collect_and_publish_ranked_perf_stats, validate_memory_authority
-from resource_growth_evidence import WorkloadWindow, assess_observations
+from resource_growth_evidence import (WorkloadWindow, assess_observations, bind_discovery_membership,
+                                      bind_native_ranks)
 from runtime_feature_perf_policy import MovementEvidence, validate_runtime_feature_policy
 from runtime_stats_observer import RuntimeStatsObserver
 from server_execution_contract import (automatic_selection_policy, validate_automatic_selection,
@@ -59,6 +62,7 @@ PERF_STATS_FAMILIES = (
     'backend', 'heterogeneous_collective', 'prefix_cache', 'prefix_archive',
     'moe_rebalance', 'moe_overlay_controller', 'moe_overlay_residency',
     'moe_overlay_activation_epoch', 'moe_routed_execution', 'moe_placement',
+    *(domain + '.calls' for domain in sorted(NATIVE_CALL_DOMAINS)),
 )
 
 
@@ -207,6 +211,44 @@ def retire_owned(name: str) -> dict:
     return require_retired(name)
 
 
+def automatic_overlay_capacity(output: str) -> bool:
+    """Recognize an automatic planner rejection caused by a physical expert-tier deficit.
+
+    Placement charges all affected resources. A single limiting owner prevents
+    admission even when its peers can fit their shards. A logical expert cap,
+    incomplete quotation or error from another startup phase cannot justify a retry.
+    """
+    selection = ("Planning publication step threw: 'planning-selection.select': "
+                 "No automatic candidate fits the complete physical admission: "
+                 "No complete ExpertOverlay candidate graph fits: ")
+    freeze = ("Failed to freeze MoE expert overlay plan from model metadata: ExpertOverlay has "
+              "no resident captured-prefill shape with complete expert coverage under the physical BOM: "
+              "ExpertOverlay capacity step threw: 'overlay-candidate.complete-bom': ")
+    # Serving can echo the exact owner diagnostic in its dry-run summary.
+    # Conflicting diagnostics are not one authenticated capacity rejection.
+    quotes = {line.split(marker, 1)[1] for line in output.splitlines()
+              for marker in (selection, freeze) if marker in line}
+    if len(quotes) != 1:
+        return False
+    line, = quotes
+    if (not line.startswith("ExpertOverlay tier '")
+            or "under the complete physical BOM; resource='" not in line
+            or '; resolved tier maximum=' in line):
+        return False
+    fields = line.split("; resource='")[1:]
+    limited = False
+    for field in fields:
+        quote = re.match(r"[^']+' device=\S+ requires_additional_bytes=(\d+) remaining_bytes=(\d+) "
+                         r"usable_bytes=(\d+)(?=\s|$)", field)
+        if quote is None:
+            return False
+        required, remaining, usable = map(int, quote.groups())
+        if remaining > usable:
+            return False
+        limited = limited or required > remaining
+    return limited
+
+
 def admission_outcome(returncode: int, output: str) -> AdmissionOutcome:
     """Only a controlled native capacity rejection may probe a smaller context."""
     if returncode == 0 and '--dry-run complete: preflight validation passed' in output:
@@ -224,9 +266,7 @@ def admission_outcome(returncode: int, output: str) -> AdmissionOutcome:
             total >= incremental > available and deficit == incremental - available
             for total, incremental, available, deficit in
             (map(int, quote) for quote in quotes))
-    capacity = ('Memory plan validation failed' in output or (
-        'ExpertOverlay has no resident captured-prefill shape with complete expert coverage under the physical BOM'
-        in output and 'requires_additional_bytes=' in output) or fixed_head_capacity)
+    capacity = ('Memory plan validation failed' in output or fixed_head_capacity or automatic_overlay_capacity(output))
     if returncode == 1 and capacity:
         return AdmissionOutcome.CAPACITY_REJECTED
     raise ValueError('Unexpected native admission outcome; context was not retried')
@@ -387,6 +427,10 @@ def run_app(cell: CodingCell) -> dict:
     completion flag is published only after observer closure and every audit,
     so a queued successor cannot mistake intermediate retirement for success.
     """
+    client_version = command([cell.opencode, '--version']).strip()
+    if client_version != QUALIFIED_CLIENT_VERSION:
+        raise ValueError(f'OpenCode cell requires {QUALIFIED_CLIENT_VERSION}, '
+                         f'but {cell.opencode} reported {client_version!r}')
     cell.output.mkdir(parents=True, exist_ok=False)
     archive, perf_dir = cell.output / 'archive', cell.output / 'perf'
     archive.mkdir()
@@ -405,7 +449,7 @@ def run_app(cell: CodingCell) -> dict:
     server_created = observer_created = driver_started = False
     owners = ContainerOwners()
     logger = logfile = None
-    baseline = window = stats_final = None
+    baseline = window = stats_final = collective_binding = None
     interrupted = None
 
     def publish() -> None:
@@ -477,6 +521,11 @@ def run_app(cell: CodingCell) -> dict:
         with RuntimeStatsObserver(lambda: metadata(url), cell.output / 'stats-webapp-observations.jsonl'):
             baseline = fresh_observation(cell.output, state['container_id'])
             write_json(cell.output / 'sealed-baseline.json', baseline)
+            processes = [{key: row[key] for key in ('pid', 'start_ticks')}
+                         for row in baseline['cells']['app']['processes'] if row['comm'] == 'llaminar2']
+            collective_binding = json.loads(command(['docker', 'exec', observer_name, 'python3',
+                '/scripts/collective_runtime_binding.py', json.dumps(processes)]))
+            write_json(cell.output / 'collective-runtime-binding.json', collective_binding)
             stats = baseline['cells']['app']['stats_observation']['stats']
             if (stats['configuration']['context_tokens'] != admission['context_tokens']
                     or stats['configuration']['prefix_cache']['ram_budget_bytes_per_participant'] != RAM_MIB * 1024**2
@@ -576,7 +625,20 @@ def run_app(cell: CodingCell) -> dict:
                     write_json(cell.output / 'runtime-policies.json', value)
                     return value
                 audit('runtime policies', runtime_audit)
-                if window is not None:
+                def discovery_audit():
+                    """Read the startup role witness after the native log owner has retired."""
+                    with (cell.output / 'server.log').open() as stream:
+                        return bind_discovery_membership(stream, baseline, 'app')
+                discovery = audit('original discovery membership', discovery_audit)
+                def collective_audit():
+                    """Join cold loader observation to exact native backend owners."""
+                    used = require_native_owners(collective_binding, bind_native_ranks(perf, baseline, 'app', discovery),
+                                                 perf['records'], discovery=discovery)
+                    write_json(cell.output / 'collective-runtime-binding.json',
+                               dict(collective_binding, image=cell.image, native_communicators=used, passed=True))
+                if collective_binding is not None and discovery is not None:
+                    audit('collective runtime binding', collective_audit)
+                if window is not None and discovery is not None:
                     def resources():
                         """Reconcile every host sample with sealed baseline and native PMA ownership."""
                         capacity = {tier: stats_final['prefix_cache']['storage']['tiers'][tier]['capacity_bytes']
@@ -584,7 +646,7 @@ def run_app(cell: CodingCell) -> dict:
                         with (cell.output / 'resources/observations.jsonl').open() as stream:
                             value = assess_observations(observations=(json.loads(line) for line in stream),
                                 perf=perf, cell='app', container_id=state['container_id'], boot_id=baseline['boot_id'],
-                                window=window, cache_capacity=capacity)
+                                window=window, cache_capacity=capacity, discovery=discovery)
                         write_json(cell.output / 'resource-growth.json', value)
                         return value
                     audit('resource growth', resources)

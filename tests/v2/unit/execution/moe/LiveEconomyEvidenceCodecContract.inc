@@ -105,10 +105,10 @@ TEST(LiveEconomyEvidenceCodec, CompleteCohortIdentityRejectsRepresentativeMember
     auto rows=liveCodecRows(*context,0);
     MoEOverlayMigrationProfileEvidence evidence{
         .profile_sequence=3,
-        .coordinate={MoEOverlayRouteTarget::cpuCohort(1),MoEOverlayRouteTarget::whole(0),7},
+        .coordinate={MoEOverlayRouteTarget::cohort(1),MoEOverlayRouteTarget::whole(0),7},
         .local_measurements=rows,.context=context};
     ASSERT_TRUE(evidence.valid());
-    evidence.coordinate.source_target=MoEOverlayRouteTarget::cpuCohort(2);
+    evidence.coordinate.source_target=MoEOverlayRouteTarget::cohort(2);
     EXPECT_FALSE(evidence.valid());
     // The previous member-based coordinate check admitted this exact alias.
     evidence.context=original;evidence.local_measurements=liveCodecRows(*original,0);

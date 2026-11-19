@@ -164,7 +164,7 @@ TEST(Test__MappedActivationPacketCUDAAndROCm, JointRecordedSourceMapEpochAndZero
                 for(int expert=0;expert<kExpertCount;++expert) {
                     const auto* placement=owners->placementFor(layer,expert);ASSERT_NE(placement,nullptr);
                     bank.overlay_route_participant[expert]=placement->shard_cohort?
-                        MoEOverlayRouteTarget::cpuCohort(placement->tier_idx).word():
+                        MoEOverlayRouteTarget::cohort(placement->tier_idx).word():
                         MoEOverlayRouteTarget::whole(placement->owner_participant).word();
                 }
                 MoEOverlayActivationDispatchPackLaunch launch;

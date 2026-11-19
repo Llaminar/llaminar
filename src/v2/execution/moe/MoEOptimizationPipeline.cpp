@@ -107,7 +107,7 @@ namespace llaminar2
                         return whole.participant>=0 && static_cast<size_t>(whole.participant)<participants.size() &&
                             whole.device==participants[whole.participant].toLocalDeviceId();
                     }
-                    if(!endpoint.isCPUCohort())return false;
+                    if(!endpoint.isCohort())return false;
                     for(const auto& member:endpoint.cohort().original->participants())
                         if(member.participant_id<0 || static_cast<size_t>(member.participant_id)>=participants.size() ||
                             member.address!=participants[member.participant_id])return false;

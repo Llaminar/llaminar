@@ -204,12 +204,26 @@ namespace
 #define MEMBERS(X) X(decode)
     RECORD(MoEOverlayNodeLocalRouteTransportPolicy, ordinary_prefill, MEMBERS)
 #undef MEMBERS
-#define MEMBERS(X) X(topology) X(continuation_domain) X(base_model_domain) X(shared_expert_domain) \
+#define MEMBERS(X, DERIVED) X(topology) X(continuation_domain) X(base_model_domain) X(shared_expert_domain) \
     X(continuation_domain_spec) X(residency_policy) X(authority_execution) \
-    X(observed_route_transport) X(observed_route_diagnostic) X(replica_cache_capacity) \
+    X(observed_route_transport) X(observed_route_diagnostic) \
+    DERIVED(local_gpu_expert_kernel_policy) DERIVED(gpu_expert_intermediate_tiling) X(replica_cache_capacity) \
     X(owner_order) X(dense_domains) X(domains) X(routed_tiers) X(initial_layer_order_overrides) \
     X(placements) X(continuation_dense_policy_intent) X(first_model_layer)
-    RECORD(MoERoutedExpertPlacementPlan, enabled, MEMBERS)
+#define SKIP_DERIVED(name) (void)name;
+    /**
+     * @brief Visit document fields while checking the full placement-plan layout.
+     *
+     * The local kernel policy and tiling are resolved from the model and actual
+     * device inventory at bind time. The archive neither accepts nor emits them.
+     */
+    template<class T, class Archive> requires std::same_as<std::remove_const_t<T>, MoERoutedExpertPlacementPlan>
+    void fields(T &value, Archive &visitor)
+    {
+        auto &[enabled MEMBERS(COMMA, COMMA)] = value;
+        VISIT(enabled) MEMBERS(VISIT, SKIP_DERIVED)
+    }
+#undef SKIP_DERIVED
 #undef MEMBERS
 #define MEMBERS(X) X(automatic_planning) X(execution_rank_selection) X(dry_run) X(explain_placement) X(show_topology) X(show_numa) \
     X(validate_only) X(device_mode) X(device_for_this_rank) X(device_for_this_rank_numa_explicit) \

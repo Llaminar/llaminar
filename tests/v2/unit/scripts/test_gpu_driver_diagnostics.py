@@ -306,6 +306,23 @@ class GPUDriverWindowTests(unittest.TestCase):
         self.assertEqual(terminal['state'], 'retired')
         return state, terminal['outcome'], passed
 
+    def test_final_journal_visibility_does_not_wait_for_storage_sync(self):
+        """Retire after publishing the final read even if the backing store cannot sync."""
+        original = record('existing driver log row', timestamp=10)
+        teardown = record('late clean driver log row', timestamp=11)
+        before = snapshot(original)
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(driver.os, 'fsync', side_effect=TimeoutError('backing-store barrier stalled')) as synchronize:
+                _, evidence, passed = self.run_collector(root, before,
+                    [before, snapshot(original, teardown)])
+            self.assertTrue(passed, evidence)
+            synchronize.assert_not_called()
+            self.assertEqual(evidence['snapshot_count'], 2)
+            self.assertEqual(evidence['new_record_count'], 1)
+            driver.publish(root / 'cell.driver-diagnostics.json', evidence)
+            driver.validate_evidence(root)
+
     def test_busy_batches_poll_buffered_close_and_preserve_all_original_bytes(self):
         """Large consecutive batches never idle; buffered close adds a final read."""
         rows = tuple(record('busy kernel row ' + str(index), timestamp=index % 17)

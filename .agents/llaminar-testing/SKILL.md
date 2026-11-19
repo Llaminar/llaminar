@@ -1,6 +1,6 @@
 ---
 name: llaminar-testing
-description: Run, maintain, and diagnose Llaminar's Unit/host PR checks and RC release gates, including full production preflight, frozen-history numerical panels, OpenCode stress and benchmarks. Use for test selection, canonical matrix changes and focused parity or HTTP/MPI diagnostics. Kernel tuning and cross-engine comparisons have separate skills.
+description: Run, maintain, and diagnose Llaminar's Unit/host and AVX2 hardware-qualified production preflight PR checks and RC release gates, including full production preflight, frozen-history numerical panels, OpenCode stress and benchmarks. Use for test selection, canonical matrix changes and focused parity or HTTP/MPI diagnostics. Kernel tuning and cross-engine comparisons have separate skills.
 ---
 
 # Llaminar Testing
@@ -58,12 +58,38 @@ companion; the repository runner labeled `llaminar-avx512` builds AVX512. These
 full-backend `model-free` transactions run in parallel. Each runs complete
 device-free `Unit` and
 the production-preflight `host` lane selected by the canonical scheduler.
-CUDA, ROCm and exclusive preflight lanes do not run; no GPU devices or model
-mounts are exposed. Each job calls `run_develop_image_gate.py --cpu-isa <ISA>`
+The Unit/host container exposes no GPU devices or model mounts.
+Each job calls `run_develop_image_gate.py --cpu-isa <ISA>`
 without `--build-only` or `--publish`. CPU admission rejects unsupported
 hardware before compiling. Every discovered Unit and host test must run
 without skips. Unit uses unrestricted parallelism; host retains canonical
-serial scheduling. The `unit-and-host` receipt does not certify full preflight.
+serial scheduling. AVX2 adds `--pr-gpus CUDA+ROCm`; AVX512 selects `none`.
+The AVX2 driver then opens a separate GPU container and runs every supported
+CUDA, ROCm and exclusive test in the canonical `ProductionTestPreflight`
+inventory. The production scheduler and native hardware observation own
+selection, including mixed-backend and multi-rank cases. CUDA, ROCm and
+exclusive lanes run sequentially on this host's one CPU package. Both vendors
+are required. Missing declared geometry produces a pre-launch JUnit skip in
+`pr-tests/gpu/hardware-skips.xml` with the original observations. Failures and
+runtime skips in selected tests fail the gate. Never infer GPU counts from
+MPI width or test names. CMake `GPU_DEVICES`, or `CUDA_DEVICES` and
+`ROCM_DEVICES`, declare local physical counts. Original NUMA, native ISA and
+peer requirements retain their stricter canonical labels; unknown PCI NUMA
+location cannot establish those contracts. The maximum-context allocation
+receipt records independent production BOMs for dense/MoE and MTP off/on.
+Shared-runner qualification uses sampled free VRAM on ordinal zero. Dedicated
+preflight qualifies against total VRAM and requires the selected physical
+allocations to succeed. `pr-tests/pr-validation.json` binds Unit,
+host, accelerator and exclusive receipts to the complete qualification under
+`unit-and-hardware-preflight`. This validates only the observed hardware, not
+absent topologies or a release.
+
+Consolidate duplicate device launches at their CMake registration owner, keeping
+one explicit preflight registration for each regression contract. Representative
+matrices must preserve all backends, dispatch boundaries, formats and distinct
+lifecycle paths. Use pairwise interaction coverage only for orthogonal fixture
+axes; prove the retained pairs from generated CTest metadata. Do not remove a
+failing case or replace an all-format numerical sweep with representative codecs.
 
 The two ISA jobs target distinct custom runner labels, allowing the
 organization-scoped AVX2 host and repository-scoped AVX512 host to participate
@@ -87,7 +113,8 @@ workflow definitions when working from an older feature checkout.
 
 The develop ruleset requires both `Develop PR / Unit + host (AVX2)` and
 `Develop PR / Unit + host (AVX512)`, an up-to-date merge candidate and owner
-approval. The separate owner-approval ruleset uses only
+approval. The AVX2 context keeps its stable name while also requiring its GPU
+scope. The separate owner-approval ruleset uses only
 `@Llaminar/repository-approvers` on `develop`, `rc/*` and `master`. Native squash
 auto-merge waits for reviews and checks. The owner's PR-only approval override
 and dedicated release-evidence deploy key retain their existing exceptions.

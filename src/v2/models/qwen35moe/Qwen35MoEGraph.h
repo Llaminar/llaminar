@@ -16,6 +16,7 @@
 #include "../../execution/moe/MoERuntimeTable.h"
 #include "../../execution/moe/MoEOverlayReturnLayout.h"
 #include "../../execution/moe/MoEProjectionArenaGeometry.h"
+#include "../../execution/moe/MoEIntermediateShardArenaGeometry.h"
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -147,11 +148,34 @@ namespace llaminar2
 
         /** Metadata-sealed arena replacement, present only for the explicit projection mode. */
         std::optional<MoEProjectionArenaGeometry> projection_arena_;
+        std::optional<MoEIntermediateShardArenaGeometry> intermediate_shard_arena_; ///< Original source-only local-F activation BOM.
 
         /** @brief Bind source-derived geometry at the existing model-context injection boundary. */
         void bindProjectionArena();
         /** @return The admitted projection layout, or null for whole-expert modes; throws before binding. */
         const MoEProjectionArenaGeometry *projectionArena() const;
+        /** @return The original GPU F-shard layout, or null for another physical policy. */
+        const MoEIntermediateShardArenaGeometry *intermediateShardArena() const;
+        /**
+         * @brief Declare the static original homogeneous GPU FFN using reusable local/collective builders.
+         * @param layer Actual source-bound model or predictor layer weights.
+         * @param buffers Existing admitted per-device activation roles.
+         * @param identity Original source layer and immutable workload identity.
+         * @param rows Exact physical query rows; the optional count owns the live prefix.
+         * @param device Original native participant, preserving its global/cohort coordinates.
+         * @param stream Exact cold publication stream.
+         * @param count Sole device-owned live prefix, or null for a fully active declaration.
+         * @param positions Original absolute positions used by the router contract.
+         * @param predictor Existing QFN HC/residual owner for a shared predictor, when present.
+         * @param phase Explicit arithmetic/service phase, independent of row count.
+         * @return Participant-local norm/routed/shared/sum/residual graph with one FFN sum.
+         * @throws std::invalid_argument For unsupported scope/phase, missing original source or foreign arena/TP.
+         */
+        ComputeGraph buildIntermediateShardFFNGraphForLayer(const LayerWeights &layer, ActivationBuffers &buffers,
+            const LayerGraphSourceIdentity &identity, int rows, DeviceId device, void *stream,
+            const int32_t *count, const int32_t *positions, const Qwen4ExpPredictorResidualBinding *predictor,
+            MoEOverlayServicePhaseHint phase);
+
 
     public:
         /// Construct with full model context

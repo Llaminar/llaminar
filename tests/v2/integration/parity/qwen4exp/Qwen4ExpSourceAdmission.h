@@ -42,7 +42,7 @@
 #include "loaders/ModelContext.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/ExpertGemmRegistry.h"
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 #include "execution/moe/MoEPipelinePreparedPlan.h"
 #include "models/qwen4exp/Qwen4ExpSidecarManifest.h"
 #include "models/qwen4exp/Qwen4ExpConfig.h"
@@ -1331,8 +1331,8 @@ inline void expectQwen4ExpCPUJointSourceFragments(int rank,const ModelContextReu
     for(const auto& participant:participants) {
         if(participant.world_rank!=rank || !qwen4ExpOriginalCPUJointParticipant(*plan,participant))continue;
         for(const auto& layer:plan->placements) {
-            const auto lease=registry.acquireCPUJointLayer(store->modelId(),participant,layer.layer);
-            ASSERT_TRUE(lease);ASSERT_TRUE(lease->cpu_joint_source);const auto& source=*lease->cpu_joint_source;
+            const auto lease=registry.acquireJointLayer(store->modelId(),participant,layer.layer);
+            ASSERT_TRUE(lease);ASSERT_TRUE(lease->joint_source);const auto& source=*lease->joint_source;
             EXPECT_EQ(source.participant(),participant);EXPECT_EQ(source.layer(),layer.layer);
             ASSERT_TRUE(source.cohort());EXPECT_EQ(source.cohort()->source().layer_idx,layer.layer);
             EXPECT_EQ(source.ownership().geometry().experts,512);
@@ -1350,8 +1350,8 @@ inline void expectQwen4ExpCPUJointSourceFragments(int rank,const ModelContextReu
                 EXPECT_EQ(bool(engine.gate),selected);EXPECT_EQ(bool(engine.up),selected);EXPECT_EQ(bool(engine.down),selected);
             }
             for(const auto& binding:lease->sources) {
-                EXPECT_EQ(binding.identity.model_id,store->modelId());ASSERT_TRUE(binding.cpu_joint_source);
-                EXPECT_EQ(*binding.cpu_joint_source,source);ASSERT_TRUE(binding.projection_ownership);
+                EXPECT_EQ(binding.identity.model_id,store->modelId());ASSERT_TRUE(binding.joint_source);
+                EXPECT_EQ(*binding.joint_source,source);ASSERT_TRUE(binding.projection_ownership);
                 EXPECT_EQ(*binding.projection_ownership,source.ownership());
             }
             ++observed;

@@ -13,6 +13,9 @@
  */
 
 #include "ShortConv1dStage.h"
+#ifdef HAVE_ROCM
+#include "kernels/rocm/gdn/ROCmShortConvolution.h"
+#endif
 #include "kernels/common/CPURequestStateBankView.h"
 #include "GDNSpeculativeWorkspaceContract.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -835,7 +838,20 @@ namespace llaminar2
                  * The backend reads it on device and commits only those rows
                  * into the primary live state; no request-bank handoff exists.
                  */
-                ok = params_.kernel->forwardWithEffectiveSeqLen(
+                const auto forward=[&](auto... operands) {
+                    if(params_.verifier_kernel_policy!=LocalGPUExpertKernelPolicy::Generic) {
+#ifdef HAVE_ROCM
+                        auto* native=dynamic_cast<ROCmShortConvolution*>(params_.kernel);
+                        if(!device().is_rocm()||!native)
+                            throw std::logic_error("Qualified verifier convolution lost its original ROCm owner");
+                        return native->forwardCountedWithPolicy(params_.verifier_kernel_policy,operands...);
+#else
+                        throw std::logic_error("Qualified verifier convolution requires ROCm compilation");
+#endif
+                    }
+                    return params_.kernel->forwardWithEffectiveSeqLen(operands...);
+                };
+                ok = forward(
                     d_input, d_weight, d_bias,
                     d_output, params_.conv_state,
                     params_.seq_len, params_.channels, params_.kernel_size,

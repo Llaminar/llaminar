@@ -128,8 +128,7 @@ namespace
     {
         auto *backend = getBackendFor(first_device);
         ASSERT_NE(backend, nullptr);
-        if (backend->deviceCount() < static_cast<int>(degree))
-            GTEST_SKIP() << "Requires " << degree << " devices for " << first_device.toString();
+        ASSERT_GE(backend->deviceCount(), static_cast<int>(degree)) << "Requires " << degree << " devices for " << first_device.toString();
 
         TransferEngine transfers;
         std::vector<GlobalDeviceAddress> addresses;

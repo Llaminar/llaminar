@@ -16,6 +16,7 @@
 
 #include "config/ExecutionDomainDefinition.h"
 #include "execution/config/RuntimeConfig.h"
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "execution/moe/MoEOverlayAuthorityExecution.h"
 #include "execution/moe/MoEOverlayNodeLocalRouteTransport.h"
 #include "execution/moe/MoEOverlayReplicaCacheCapacity.h"
@@ -208,11 +209,12 @@ namespace llaminar2
             return std::nullopt;
         }
 
-        /** @return Logical tensor partition geometry, including the exact full-matrix CPU TP1 case. */
+        /** @return Canonical original domain geometry, including CPU TP1 and rank-local GPU TP1. */
         bool supportsRoutedExpertTensorSharding() const
         {
-            return (participants.size()==1 && participants.front().isCPU()) ||
-                (isCollectiveDomain() && hasMultipleParticipants());
+            // The public domain declaration owns this rule. Duplicating it
+            // here previously rejected GPU TP1 after its canonical admission.
+            return toExecutionDomainDefinition().supportsRoutedExpertTensorSharding();
         }
 
         bool supportsWholeExpertApportionment() const
@@ -407,6 +409,15 @@ namespace llaminar2
         std::optional<MoEOverlayNodeLocalRouteTransportPolicy> observed_route_transport;
         /** Typed startup diagnostic consumed when the same hardware binding was produced. */
         std::optional<MoEOverlayNodeLocalRouteTransport> observed_route_diagnostic;
+
+        /** @brief Original model and inventory-derived kernel qualification for the local cohort. */
+        LocalGPUExpertKernelPolicy local_gpu_expert_kernel_policy = LocalGPUExpertKernelPolicy::Generic;
+        /** @brief Effective source tiling, including the independent diagnostic override. */
+        GPUExpertIntermediateTiling gpu_expert_intermediate_tiling = GPUExpertIntermediateTiling::Coarse128;
+
+        /** @return Whether the complete immutable QFN MI50 TP4 domain was qualified. */
+        bool usesQFNMI50TP4() const noexcept
+        { return local_gpu_expert_kernel_policy == LocalGPUExpertKernelPolicy::QFNMI50TP4; }
 
         /** Setup-owned replica geometry; absent before admission or without a directory. */
         std::optional<MoEOverlayReplicaCacheCapacity> replica_cache_capacity;
@@ -1209,7 +1220,7 @@ namespace llaminar2
             if (domain.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded && !domain.supportsRoutedExpertTensorSharding())
             {
                 addError("routed expert domain '" + domain.name +
-                         "' uses expert_compute=tensor-sharded but is neither CPU TP1 nor a multi-participant collective domain");
+                         "' uses expert_compute=tensor-sharded but has no positive original domain-scoped TP membership");
             }
         }
 

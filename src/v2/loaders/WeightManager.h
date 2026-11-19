@@ -199,7 +199,7 @@ namespace llaminar2
          * @param admission Whether to create exact prepared engines or adopt a
          *        complete set certified by the model-context reuse lifecycle.
          *        Certified adoption never falls back to source materialization.
-         * @param original_preparation SAME retained setup source authority; mandatory for CPU joint mode.
+         * @param original_preparation SAME retained setup source authority; mandatory for joint fragments.
          * @return true after all scoped requests have been prepared.
          */
         bool prepareMoEExpertOverlayWeights(
@@ -218,7 +218,7 @@ namespace llaminar2
          * @param frozen_weights Exact immutable graph source bindings.
          * @param execution_plan Optional rank authority applied before logical scope.
          * @param admission Explicit allocate or certified-reuse lifecycle.
-         * @param original_preparation SAME retained setup source authority; mandatory for CPU joint mode.
+         * @param original_preparation SAME retained setup source authority; mandatory for joint fragments.
          * @return True after every selected request is prepared; missing bindings fail.
          * @throws std::invalid_argument For foreign source or endpoint scope.
          */
@@ -1019,7 +1019,7 @@ namespace llaminar2
          * @param execution_plan Optional current-rank authority.
          * @param admission Allocation or certified-reuse lifecycle.
          * @param graph_scope Exact graph scope, or explicit existing device-wide operation.
-         * @param original_preparation Retained setup source authority, mandatory only for CPU joint mode.
+         * @param original_preparation Retained setup source authority, mandatory for CPU/GPU joint fragments.
          * @return True after the shared preparation backend completes every request.
          */
         bool prepareMoEExpertOverlayWeightsWithScope(

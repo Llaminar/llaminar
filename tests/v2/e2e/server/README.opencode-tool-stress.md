@@ -16,8 +16,15 @@ server. OpenCode supplies its own system prompt, tool schemas, argument
 validation, tool execution, and continuation messages. The harness records the
 client version and relays its request bodies and JSON/SSE responses unchanged.
 
+The image qualification runs that client against Llaminar’s Release server.
+Its `collective-runtime-binding.json` records the shipped RCCL and NCCL file
+identities, the ranks that mapped them and the native collective calls those
+ranks made. A different library mapped under the same name fails the cell.
+
 The qualified client is OpenCode `1.18.34-llaminar.1`, with the terminal-stop
-compaction repair described below. The published-suite controller builds pinned
+compaction repair described below. A qualification cell checks its client
+version before model admission and checks the recorded version again when
+grading the completed session. The published-suite controller builds pinned
 source with `scripts/ci/install_opencode_client.py` and verifies the actual native
 CLI lifecycle before publication. Build tools remain in a separate Docker stage.
 For local installation, provide C++/make, Python, git, patch and pkg-config,
@@ -133,7 +140,7 @@ auxiliary requests as `compaction_requests`, and native audits include their
 tokens and reasoning even when the request omits `tools`. OpenCode's
 [compaction implementation](https://github.com/anomalyco/opencode/blob/v1.18.34/packages/opencode/src/session/compaction.ts)
 owns this history transition.
-The live workload is the ten-phase app development session. Device-free parser
+The live workload is a single app development session. Device-free parser
 fixtures retain primitive string, Unicode and error cases; the live harness does
 not schedule separate primitive sessions. The final app sentinel checks exact
 JSON-looking file bytes through authenticated `write` and `read` calls.
@@ -174,7 +181,7 @@ record `reply_reserve_tokens`; each session publishes `client-context-policy.jso
 and the same `client_context_policy` in its result. An override must be explicitly
 expected by the evidence consumer; it cannot silently certify the default policy.
 
-Ten turns share one OpenCode session. Coding turns have no default elapsed-time,
+All coding turns share one OpenCode session. Coding turns have no default elapsed-time,
 socket-inactivity or agent-step limit. Prefill and a buffered tool call can keep
 generating work without publishing SSE bytes; exact token traces remain useful
 during those quiet intervals. The client provider explicitly sets `timeout`,
@@ -188,7 +195,9 @@ An explicitly supplied `--session-timeout` is an operator stop limit; reaching i
 records a harness interruption and incomplete evidence, not a proven model or
 protocol defect. The agent builds a standard-library
 Python/SQLite task app, then adds CRUD, HTML, emoji handling, input validation,
-filtering, pagination, persistence and concurrent requests. Each turn has its
+persistence and concurrent requests. The release gate uses five turns. For the
+extended local exercise, pass `--webapp-phases 10` to test filtering and
+pagination across ten turns. Each turn has its
 own prompt and client events. Independent HTTP acceptance checks launch the
 generated CLI, verify the API and exact Unicode bytes, exercise twelve concurrent
 creates and restart persistence, then run the authored tests. Configure the
@@ -323,18 +332,17 @@ and swap. No process environment or model/cache payload is needed for this join.
 The resource receipt reports process/GPU growth and cache capacity; physical
 archive ownership still needs its separate metadata-only retirement audit.
 
-`opencode_certification_evidence.py` authenticates the complete ten-phase app
-receipt for CI. It recomputes the stress verdict and checks uninterrupted phase
+`opencode_certification_evidence.py` authenticates the configured five- or ten-phase app
+receipt. It recomputes the stress verdict and checks uninterrupted phase
 order, exact authored prompt identities, one continuing session, unique tool
 counts and full native-audit coverage. It requires the pinned client, admitted
 context, reasoning output budget and absence of generation deadlines. Failed
-app acceptance remains visible independently of engine qualification. The
-published suite and release publisher share benchmark-bundle admission so the
-coding gate cannot consume stale, partial or failed benchmark evidence.
+app acceptance remains visible independently of engine qualification.
 
-The master PR workflow runs the canonical coding matrix only after both
-published benchmark lanes pass. `scripts/ci/run_opencode_matrix.py` derives
-every blessed E2E cell on both ISAs; `run_model_parity_opencode.py` consumes one
+The master PR workflow runs six five-phase AVX512 sessions on the images that
+passed preflight and numerical validation. The AVX512 and AVX2 benchmark
+jobs consume the completed coding evidence.
+`scripts/ci/run_opencode_matrix.py` derives the blessed cells from the model definitions and `run_model_parity_opencode.py` consumes one
 exact case without creating a separate model/topology list. `opencode_cell_runtime.py`
 owns context probes, serving, the real app, observers, native retirement and
 retired cache reclamation. Production placement and MTP intent come from that
@@ -350,6 +358,6 @@ the next admission.
 
 `scripts/ci/opencode_evidence.py` independently replays the complete app/context
 and runtime validators and requires every resource, driver, archive and cleanup
-receipt. The final matrix cannot omit an ISA or a canonical case. Its compact
+receipt. The final matrix requires all six coding cases. Its compact
 JSON retains all validator inputs, prefix measurements and app-quality results;
 the release publisher revalidates it before promoting the benchmarked images.

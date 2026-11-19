@@ -1,5 +1,15 @@
+/**
+ * @file MoEWorkspaceRequirements.h
+ * @brief Canonical named-byte requirements for routing and expert programs.
+ *
+ * These declarations feed the same PhysicalMemoryAuthority-backed estimator
+ * and runtime workspace planner. Disposable arithmetic scratch may overlay
+ * serial participants; initialize-once completion epochs explicitly retain
+ * SerialGraphFamily stored-byte lifetime through every intervening graph.
+ */
 #pragma once
 
+#include "kernels/common/NativeTileCompletion.h"
 #include "../local_execution/device/WorkspaceDescriptor.h"
 #include "../../tensors/TensorKernels.h"
 #include "../../kernels/common/NativeQuantisedGroupedDecodePolicy.h"
@@ -39,6 +49,9 @@ namespace llaminar2
         constexpr const char *DECODE_HIDDEN_SCALES = "moe_decode_hidden_scales";
         constexpr const char *GATEUP_GATE_PARTIALS = "moe_grouped_gateup_gate_partials";
         constexpr const char *GATEUP_UP_PARTIALS = "moe_grouped_gateup_up_partials";
+        constexpr const char *GATEUP_TILE_COMPLETION = "moe_gateup_tile_completion";
+        constexpr const char *NATIVE_LAYOUT_BARRIER = "moe_native_layout_barrier";
+        constexpr const char *DOWN_TILE_COMPLETION = "moe_down_tile_completion";
         constexpr const char *DOWN_PARTIALS = "moe_grouped_down_partials";
         constexpr const char *DECODE_SWIGLU_INT8 = "moe_decode_swiglu_int8";
         constexpr const char *DECODE_SWIGLU_SCALES = "moe_decode_swiglu_scales";
@@ -178,11 +191,17 @@ namespace llaminar2
             return 2u + capacity(12u) + capacity(16u);
         }
 
-        inline void add(WorkspaceRequirements &reqs, const char *name, std::size_t bytes)
+        /**
+         * @brief Declare one exact named region with its stored-byte lifetime.
+         * @param reqs Canonical requirement owner. @param name Stable workspace ABI name.
+         * @param bytes Exact physical byte count. @param lifetime Whether bytes survive serial participants.
+         */
+        inline void add(WorkspaceRequirements &reqs,const char *name,std::size_t bytes,
+            WorkspaceContentLifetime lifetime=WorkspaceContentLifetime::ParticipantExecution)
         {
             if (bytes == 0)
                 return;
-            reqs.buffers.push_back({name, bytes, 256, true});
+            reqs.buffers.push_back({name,bytes,256,true,WorkspaceExecutionRegime::Any,lifetime});
         }
 
         inline WorkspaceRequirements routing(int max_seq_len, int num_experts)
@@ -420,13 +439,31 @@ namespace llaminar2
             int d_model,
             int intermediate,
             int num_experts,
-            int top_k)
+            int top_k,
+            MoEGateUpPublicationPolicy gate_up_publication=MoEGateUpPublicationPolicy::Staged,
+            MoEDownPublicationPolicy down_publication=MoEDownPublicationPolicy::Staged)
         {
             WorkspaceRequirements reqs = rocmRouting(max_seq_len, d_model, num_experts);
             reqs.merge(expertExecution(max_seq_len, d_model, intermediate, num_experts, top_k));
             max_seq_len = std::max(1, max_seq_len);
             num_experts = std::max(1, num_experts);
             top_k = std::max(1, top_k);
+
+            // These device-owned counters initialize once before capture and
+            // reset only from the final producer. Their zero epoch survives
+            // prefill/verifier graph execution even when those graphs omit the
+            // candidate, so no serial participant may overlay their bytes.
+            if(gate_up_publication==MoEGateUpPublicationPolicy::LastProducer)
+                add(reqs,GATEUP_TILE_COMPLETION,NativeTileCompletionPlan::make(std::max(1,intermediate),top_k,1).bytes(),
+                    WorkspaceContentLifetime::SerialGraphFamily);
+            else if(gate_up_publication!=MoEGateUpPublicationPolicy::Staged)
+                throw std::invalid_argument("ROCm MoE workspace has an unknown gate/up publication policy");
+
+            if(down_publication==MoEDownPublicationPolicy::LastProducerRouteFold)
+                add(reqs,DOWN_TILE_COMPLETION,NativeDownCompletionPlan::make(std::max(1,d_model),top_k,1).bytes(),
+                    WorkspaceContentLifetime::SerialGraphFamily);
+            else if(down_publication!=MoEDownPublicationPolicy::Staged)
+                throw std::invalid_argument("ROCm MoE workspace has an unknown down publication policy");
 
             const std::size_t decode_slots = static_cast<std::size_t>(top_k);
             const std::size_t prefill_slots =

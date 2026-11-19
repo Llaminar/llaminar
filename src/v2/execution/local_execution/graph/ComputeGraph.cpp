@@ -9,6 +9,8 @@
  * declaration can never become a retained executable by losing its input tag.
  * Merging retains a source fragment's storage lifetime together with its
  * participant metadata; query-only fragments never acquire a source lane.
+ * Region contraction validates every exported completion edge and the entire
+ * proposed DAG before retiring stages, including independent output branches.
  */
 
 #include "ComputeGraph.h"
@@ -67,6 +69,226 @@ namespace llaminar2
         execution_stages_dirty_ = true;
         fast_schedule_.clear();
         noteTopologyMutation();
+        return *this;
+    }
+
+    ComputeGraph &ComputeGraph::replaceClosedLocalRegion(const std::vector<std::string> &region,
+        const std::string &terminal,std::unique_ptr<IComputeStage> replacement)
+    {
+        return replaceClosedLocalRegion(region,terminal,std::move(replacement),{});
+    }
+
+    ComputeGraph &ComputeGraph::replaceClosedLocalRegion(const std::vector<std::string> &region,
+        const std::string &terminal,std::unique_ptr<IComputeStage> replacement,
+        std::span<const LocalRegionExport> exports)
+    {
+        const auto require=[](bool condition,const char *message) {
+            if(!condition)throw std::invalid_argument(message);
+        };
+        const std::unordered_set<std::string> members(region.begin(),region.end());
+        auto *sink=getNode(terminal);
+        require(region.size()>1 && members.size()==region.size() && members.contains(terminal) &&
+            sink && sink->stage && replacement && replacement->device()==sink->device &&
+            !replacement->isCollectiveStage(),
+            "Local region fusion requires distinct original nodes, one retained sink and a local replacement");
+        require(fast_schedule_.empty() && !native_transaction_capture_contract_ &&
+            !participant_source_plan_ && participant_source_variants_.empty(),
+            "Local region fusion requires cold unsealed construction");
+        require(topology_generation_!=std::numeric_limits<std::uint64_t>::max(),
+            "Local region fusion topology generation exhausted");
+        const auto touched=[&](const std::string &name){return members.contains(name);};
+        const auto changesCompletion=[&](const std::string &name) {
+            return touched(name) || std::any_of(exports.begin(),exports.end(),[&](const auto &output) {
+                return std::find(output.consumers.begin(),output.consumers.end(),name)!=output.consumers.end();
+            });
+        };
+        if(read_ahead_branch_)
+        {
+            const auto &branch=*read_ahead_branch_;
+            require(!changesCompletion(branch.fork_node) && !changesCompletion(branch.producer_node) &&
+                !changesCompletion(branch.consume_node) && !changesCompletion(branch.join_node),
+                "Local region fusion cannot absorb a declared read-ahead frontier");
+        }
+        if(participant_auxiliary_range_)
+        {
+            const auto &range=*participant_auxiliary_range_;
+            require(!changesCompletion(range.probe_ready) && !changesCompletion(range.ready_publication) &&
+                !changesCompletion(range.main_read) && !changesCompletion(range.retirement) &&
+                std::none_of(range.nodes.begin(),range.nodes.end(),changesCompletion),
+                "Local region fusion cannot absorb a retained auxiliary frontier");
+        }
+        for(const auto &name:region)
+        {
+            const auto *node=getNode(name);
+            require(node && node->stage && node->device==sink->device &&
+                node->stage->device()==node->device && !node->stage->isCollectiveStage(),
+                "Local region fusion cannot absorb missing stages, foreign participants or collectives");
+            require(!node->completed && !node->weights_cohered && !node->is_final_output &&
+                !node->graph_capture_wave && !node->heterogeneous_ticket_unit_contract && name!=terminal_node_,
+                "Local region fusion cannot absorb live stages or sealed capture/output metadata");
+        }
+        std::unordered_map<std::string,std::unordered_set<std::string>> published;
+        for(const auto &output:exports)
+        {
+            require(touched(output.producer) && output.producer!=terminal &&
+                !output.consumers.empty() && !published.contains(output.producer),
+                "Local region fusion has an invalid or duplicate exported producer");
+            auto &readers=published[output.producer];
+            for(const auto &name:output.consumers)
+            {
+                const auto *reader=getNode(name);
+                require(!touched(name) && reader && reader->stage &&
+                    reader->device==sink->device && reader->stage->device()==sink->device &&
+                    !reader->completed && !reader->weights_cohered &&
+                    !reader->graph_capture_wave && !reader->heterogeneous_ticket_unit_contract &&
+                    readers.insert(name).second &&
+                    std::find(reader->dependencies.begin(),reader->dependencies.end(),output.producer)!=reader->dependencies.end(),
+                    "Local region fusion export requires an exact distinct outside reader on this participant");
+            }
+        }
+        // Public tensors remain owned by the replacement. Only explicitly
+        // declared readers may acquire its later complete-region publication.
+        for(const auto &node:nodes_)
+            if(!touched(node->name))
+                for(const auto &dependency:node->dependencies)
+                    require(!touched(dependency) || dependency==terminal ||
+                        (published.contains(dependency) && published.at(dependency).contains(node->name)),
+                        "Local region fusion has an external consumer of an interior output");
+        std::unordered_set<std::string> ancestors;
+        std::vector<std::string> pending{terminal};
+        for(const auto &output:exports)pending.push_back(output.producer);
+        while(!pending.empty())
+        {
+            auto name=std::move(pending.back());pending.pop_back();
+            if(!ancestors.insert(name).second)continue;
+            for(const auto &dependency:getNode(name)->dependencies)
+                if(touched(dependency))pending.push_back(dependency);
+        }
+        require(ancestors.size()==members.size(),
+            "Local region fusion contains work disconnected from its declared publications");
+        // Validate the original DAG before constructing the replacement edge
+        // set; folding must never accidentally turn a broken graph into a valid one.
+        (void)getExecutionOrder();
+        std::vector<std::string> dependencies;
+        std::unordered_map<std::string,std::size_t> index;
+        index.reserve(nodes_.size()-region.size()+1);
+        std::vector<std::unique_ptr<ComputeNode>> retained;
+        retained.reserve(nodes_.size()-region.size()+1);
+        std::vector<std::pair<ComputeNode*,std::vector<std::string>>> rewritten;
+        rewritten.reserve(nodes_.size()-region.size());
+        for(const auto &node:nodes_)
+        {
+            if(touched(node->name))
+                for(const auto &dependency:node->dependencies)
+                    if(!touched(dependency) &&
+                        std::find(dependencies.begin(),dependencies.end(),dependency)==dependencies.end())
+                        dependencies.push_back(dependency);
+            if(!touched(node->name) || node.get()==sink)
+                index.emplace(node->name,index.size());
+            if(!touched(node->name))
+            {
+                std::vector<std::string> edges;
+                edges.reserve(node->dependencies.size());
+                for(const auto &dependency:node->dependencies)
+                {
+                    const auto &producer=touched(dependency)?terminal:dependency;
+                    if(std::find(edges.begin(),edges.end(),producer)==edges.end())edges.push_back(producer);
+                }
+                rewritten.emplace_back(node.get(),std::move(edges));
+            }
+        }
+        // Exact exports alone do not prove safe contraction: an exported
+        // reader could feed another member through an arbitrarily long path.
+        // Validate the proposed whole DAG before changing any original edge.
+        std::vector<std::vector<std::size_t>> consumers(index.size());
+        std::vector<std::size_t> predecessors(index.size(),0);
+        const auto addEdges=[&](const std::string &name,const std::vector<std::string> &edges) {
+            const auto consumer=index.at(name);
+            for(const auto &producer:edges)
+            {
+                require(index.contains(producer),"Local region fusion has a missing external producer");
+                consumers[index.at(producer)].push_back(consumer);
+                ++predecessors[consumer];
+            }
+        };
+        addEdges(terminal,dependencies);
+        for(const auto &[node,edges]:rewritten)addEdges(node->name,edges);
+        std::vector<std::size_t> ready;
+        ready.reserve(index.size());
+        for(std::size_t i=0;i<predecessors.size();++i)if(predecessors[i]==0)ready.push_back(i);
+        for(std::size_t i=0;i<ready.size();++i)
+            for(const auto consumer:consumers[ready[i]])if(--predecessors[consumer]==0)ready.push_back(consumer);
+        require(ready.size()==index.size(),"Local region fusion would create a cycle through an outside consumer");
+        // Every potentially throwing validation/allocation is complete. The
+        // sink keeps its identity and outside edges while removed stages retire.
+        sink->stage=std::move(replacement);
+        sink->dependencies.swap(dependencies);
+        for(auto &[node,edges]:rewritten)node->dependencies.swap(edges);
+        for(auto &node:nodes_)
+            if(!touched(node->name) || node.get()==sink)retained.push_back(std::move(node));
+        nodes_.swap(retained);node_index_.swap(index);
+        cached_order_.clear();order_dirty_=true;cached_execution_stages_.clear();execution_stages_dirty_=true;
+        fast_schedule_.clear();noteTopologyMutation();
+        return *this;
+    }
+
+    ComputeGraph &ComputeGraph::replaceProducerAndBypassSuccessor(const std::string &producer,
+        const std::string &successor,std::unique_ptr<IComputeStage> replacement)
+    {
+        auto *first=getNode(producer),*last=getNode(successor);
+        const auto fail=[](bool condition,const char *message){if(!condition)throw std::invalid_argument(message);};
+        fail(first && last && first!=last && first->stage && last->stage && replacement &&
+             first->device==last->device && replacement->device()==first->device,
+             "Graph fusion requires two original stages and a matching replacement participant");
+        fail(last->dependencies==std::vector<std::string>{producer},
+             "Graph fusion successor must have exactly the original producer dependency");
+        fail(fast_schedule_.empty() && !first->completed && !last->completed &&
+             !first->weights_cohered && !last->weights_cohered && !first->is_final_output && !last->is_final_output,
+             "Graph fusion is permitted only during cold construction before execution planning");
+        fail(!first->graph_capture_wave && !last->graph_capture_wave &&
+             !first->heterogeneous_ticket_unit_contract && !last->heterogeneous_ticket_unit_contract &&
+             !native_transaction_capture_contract_ && successor!=terminal_node_ &&
+             !participant_source_plan_ && participant_source_variants_.empty(),
+             "Graph fusion cannot replace sealed capture, source or terminal metadata");
+        const auto touched=[&](const std::string &name){return name==producer || name==successor;};
+        if(read_ahead_branch_)
+        {
+            const auto &branch=*read_ahead_branch_;
+            fail(!touched(branch.fork_node) && !touched(branch.producer_node) &&
+                 !touched(branch.consume_node) && !touched(branch.join_node),
+                 "Graph fusion cannot replace a declared read-ahead frontier");
+        }
+        if(participant_auxiliary_range_)
+        {
+            const auto &range=*participant_auxiliary_range_;
+            fail(!touched(range.probe_ready) && !touched(range.ready_publication) &&
+                 !touched(range.main_read) && !touched(range.retirement) &&
+                 std::none_of(range.nodes.begin(),range.nodes.end(),touched),
+                 "Graph fusion cannot replace a retained auxiliary frontier");
+        }
+        fail(topology_generation_!=std::numeric_limits<std::uint64_t>::max(),
+             "Graph fusion topology generation exhausted");
+        // Allocate every replacement descriptor first. Any validation/allocation
+        // failure leaves the original graph, stage pointers and caches intact.
+        std::vector<std::vector<std::string>> rewired;rewired.reserve(nodes_.size());
+        std::unordered_map<std::string,std::size_t> index;index.reserve(node_index_.size()-1);
+        for(const auto &node:nodes_)
+        {
+            if(node.get()==last)continue;
+            auto edges=node->dependencies;
+            for(auto &edge:edges)if(edge==successor)edge=producer;
+            std::vector<std::string> unique;unique.reserve(edges.size());
+            for(auto &edge:edges)
+                if(std::find(unique.begin(),unique.end(),edge)==unique.end())unique.push_back(std::move(edge));
+            index.emplace(node->name,rewired.size());rewired.push_back(std::move(unique));
+        }
+        const auto removed=node_index_.at(successor);
+        first->stage=std::move(replacement);
+        nodes_.erase(nodes_.begin()+static_cast<std::ptrdiff_t>(removed));
+        node_index_.swap(index);
+        for(std::size_t i=0;i<nodes_.size();++i)nodes_[i]->dependencies.swap(rewired[i]);
+        cached_order_.clear();order_dirty_=true;cached_execution_stages_.clear();execution_stages_dirty_=true;
+        fast_schedule_.clear();noteTopologyMutation();
         return *this;
     }
 

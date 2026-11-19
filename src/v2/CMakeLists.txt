@@ -278,8 +278,24 @@ if(HAVE_CUDA)
     endif()
     message(STATUS "V2: CUDA architectures: ${CMAKE_CUDA_ARCHITECTURES}")
     
-    # Enable nvcc multi-threaded compilation (auto-detect optimal thread count)
-    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -t 0")
+    set(LLAMINAR_NVCC_THREADS 0)
+    if(CMAKE_GENERATOR MATCHES "Ninja")
+        include(ProcessorCount)
+        include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/CUDABuildParallelism.cmake")
+        ProcessorCount(_build_processors)
+        cmake_host_system_information(RESULT _build_memory_mib QUERY TOTAL_PHYSICAL_MEMORY)
+        if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND EXISTS "/sys/fs/cgroup/memory.max")
+            file(STRINGS "/sys/fs/cgroup/memory.max" _cgroup_memory_bytes LIMIT_COUNT 1)
+            if(_cgroup_memory_bytes MATCHES "^[0-9]+$")
+                math(EXPR _cgroup_memory_mib "${_cgroup_memory_bytes} / 1048576")
+                if(_cgroup_memory_mib LESS _build_memory_mib)
+                    set(_build_memory_mib "${_cgroup_memory_mib}")
+                endif()
+            endif()
+        endif()
+        llaminar_configure_cuda_ninja_pools("${_build_memory_mib}" "${_build_processors}")
+    endif()
+    set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -t ${LLAMINAR_NVCC_THREADS}")
     
     # CUDA optimization flags for Release builds
     # --use_fast_math: Enable fast math intrinsics (~10-30% speedup, slight precision loss)
@@ -288,24 +304,6 @@ if(HAVE_CUDA)
     # --prec-div=false: Fast division (slightly less accurate, negligible for inference)
     # --prec-sqrt=false: Fast sqrt (slightly less accurate)
     set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} --use_fast_math --ftz=true --prec-div=false --prec-sqrt=false")
-    
-    # NOTE: CUDA_SEPARABLE_COMPILATION is set on cuda_backend rather than
-    # globally. Combined with CUDA_RESOLVE_DEVICE_SYMBOLS,
-    # this resolves device symbols at library build time. Without this, every downstream
-    # executable (580+ test binaries) gets its own nvcc device-link step, adding ~19MB
-    # per executable and massive link time. With per-library resolution, only the GPU
-    # libraries need device linking — executables link normally.
-    #
-    # The nvlink_pool job limit is no longer needed (library device links vs 580+
-    # executable device links), but we keep a small pool as a safety net.
-    if(CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(GLOBAL APPEND PROPERTY JOB_POOLS nvlink_pool=8)
-        # Limit concurrent host linking — each ld.lld uses 1-2 GB RSS.
-        # Without this, 500+ test executables link simultaneously causing
-        # severe I/O wait and memory pressure.
-        set_property(GLOBAL APPEND PROPERTY JOB_POOLS link_pool=24)
-        set(CMAKE_JOB_POOL_LINK link_pool)
-    endif()
 endif()
 
 # =============================================================================
@@ -369,6 +367,7 @@ message(STATUS "V2: Found Python3: ${Python3_EXECUTABLE}")
 # Register allocation is a build invariant, including standalone test kernels.
 # Install the policy before targets inherit their compiler launchers/options.
 include(${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/GpuSpillGuard.cmake)
+include("${CMAKE_CURRENT_SOURCE_DIR}/../../cmake/CanonicalCollective.cmake")
 
 # CUDA backend (separate .cu compilation unit)
 if(HAVE_CUDA)
@@ -532,7 +531,7 @@ if(HAVE_CUDA)
         CUDA_EXTENSIONS ON
     )
     if(CMAKE_GENERATOR MATCHES "Ninja")
-        set_property(TARGET cuda_backend PROPERTY JOB_POOL_LINK nvlink_pool)
+        set_property(TARGET cuda_backend PROPERTY JOB_POOL_LINK "${LLAMINAR_CUDA_DEVICE_LINK_POOL}")
     endif()
     target_include_directories(cuda_backend PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
     
@@ -630,19 +629,10 @@ if(HAVE_CUDA)
     # =========================================================================
     # NCCL provides optimized multi-GPU and multi-node collective operations.
     # Used by NCCLBackend for AllReduce, AllGather, etc. in tensor parallelism.
-    find_library(LLAMINAR_NCCL_LIBRARY llaminar_nccl
-        HINTS
-            ${CUDAToolkit_LIBRARY_DIR}
-            ${CUDA_TOOLKIT_ROOT_DIR}/lib64
-            ${CUDA_TOOLKIT_ROOT_DIR}/lib
-        PATHS
-            /usr/lib/x86_64-linux-gnu
-            /usr/lib64
-            /usr/local/lib
-            /opt/nccl/lib
-            /usr/local/cuda/lib64
-    )
-    
+    # The canonical installer publishes a private SONAME. An explicitly
+    # relocated installation must supply the same producer evidence.
+    find_library(LLAMINAR_NCCL_LIBRARY llaminar_nccl PATHS /usr/local/lib NO_DEFAULT_PATH)
+
     if(LLAMINAR_NCCL_LIBRARY)
         set(NCCL_LIBRARY "${LLAMINAR_NCCL_LIBRARY}")
         set(HAVE_NCCL ON CACHE BOOL "NCCL library found")
@@ -650,6 +640,9 @@ if(HAVE_CUDA)
         # a relocated lib-only symlink must not select an unrelated system ABI.
         get_filename_component(_nccl_abi_dso "${NCCL_LIBRARY}" REALPATH)
         get_filename_component(_nccl_abi_libdir "${_nccl_abi_dso}" DIRECTORY)
+        llaminar_verify_collective(nccl "${NCCL_LIBRARY}"
+            "${_nccl_abi_libdir}/../share/llaminar-nccl/gin-selection.json"
+            "${_nccl_abi_libdir}/llaminar-nccl-build.txt")
         find_file(_nccl_abi_header NAMES llaminar-nccl/nccl.h nccl.h
             HINTS "${_nccl_abi_libdir}/../include" "${_nccl_abi_libdir}/include"
             NO_DEFAULT_PATH NO_CACHE)
@@ -745,9 +738,12 @@ if(HAVE_ROCM)
         kernels/rocm/attention/ROCmQwen4ExpStateIO.hip
         kernels/rocm/attention/ROCmQwen4ExpPLERetained.hip
         kernels/rocm/attention/ROCmQwen4ExpBranchConcat.hip
+        kernels/rocm/ops/ROCmPeerPushReductionKernels.hip # Lossless small-payload direct peer reduction
         kernels/rocm/ops/ROCmTPRankOrderedReductionKernels.hip # Batch-invariant rank-ordered TP sums
         # MoE (Mixture of Experts) kernels
         kernels/rocm/moe/ROCmMoEKernels.hip                  # MoE routing, gather, scatter, gate, swiglu
+        kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNDevice.hip
+        kernels/rocm/gemm/retained_hc_ffn/RetainedPreAttentionDevice.hip
         kernels/rocm/moe/ROCmMoEOverlayActivationPacketKernels.hip # Device-owned node-local sparse activation packets
         kernels/rocm/moe/ROCmMoEOverlayDeviceControllerKernels.hip # Node-local sole-controller lifecycle
         backends/rocm/PlanningGPUClockMarker.hip # Bounded startup fixed-clock timing
@@ -784,6 +780,7 @@ if(HAVE_ROCM)
         backends/rocm/HIPGraphCapture.cpp
         backends/ROCmEnumeration.cpp
         collective/backends/HostBackendROCm.cpp              # HIP-specific host memory registration
+        collective/backends/ROCmPeerPushResources.cpp        # PMA-owned small direct-peer collective storage
         collective/backends/RCCLBackend.cpp                  # RCCL backend (MUST be here, not in llaminar2_core)
         collective/backends/RCCLDynamicLoader.cpp            # Dynamic loader for RCCL (dlopen/dlsym)
         collective/backends/RCCLBackendHIP.cpp               # HIP runtime wrappers for RCCL backend
@@ -896,22 +893,9 @@ if(HAVE_ROCM)
     # =========================================================================
     # RCCL Auto-Clone and Build for ROCm Multi-GPU Support
     # =========================================================================
-    # The Ubuntu-packaged RCCL has no usable gfx906 (MI50/MI60) kernel binaries.
-    # When using multi-GPU on these architectures,
-    # the library crashes with SIGSEGV in ihipLaunchKernel() because the GPU
-    # kernels fail to load (hipErrorNoBinaryForGpu).
-    #
-    # Workaround: Build RCCL from source with explicit GPU_TARGETS for gfx906.
-    # See: https://github.com/ROCm/rocm-systems/issues/2805
-    #
-    # This is OPT-IN for local source builds because building RCCL from source
-    # takes 30-60+ minutes and requires hipcc (so it can't share the C++23
-    # compiler we use for llaminar). The Docker release image enables it by
-    # default so releasable ROCm multi-GPU containers do not fall back to the
-    # broken packaged gfx906 binaries.
-    option(LLAMINAR_BUILD_RCCL_FROM_SOURCE
-           "Clone and build RCCL from source (workaround for broken gfx906 binaries in packaged RCCL)"
-           OFF)
+    # Developer builds may produce the same patched dependency as the shipping
+    # image or consume its completed installation. ROCm always requires it.
+    option(LLAMINAR_BUILD_RCCL_FROM_SOURCE "Build the canonical Llaminar RCCL dependency" OFF)
 
     # Discovery must know the local dependency location even when it is
     # already built and nested dependency compilation is disabled. Runtime
@@ -935,13 +919,22 @@ if(HAVE_ROCM)
     set(RCCL_GIT_URL "https://github.com/ROCm/rccl.git")
     # Our collective source ABI includes live-row and host-storage extensions.
     # It is pinned independently, but always rebuilt against the active SDK.
-    set(RCCL_GIT_REF "rocm-7.2.4")
+    file(STRINGS "${REPO_ROOT}/scripts/docker/rocm-release.env" _rccl_pin_lines
+        REGEX "^LLAMINAR_RCCL_GIT_(REF|COMMIT)=")
+    foreach(_pin IN LISTS _rccl_pin_lines)
+        if(_pin MATCHES "^LLAMINAR_RCCL_GIT_(REF|COMMIT)=([A-Za-z0-9.-]+)$")
+            set(RCCL_GIT_${CMAKE_MATCH_1} "${CMAKE_MATCH_2}")
+        endif()
+    endforeach()
+    if(NOT RCCL_GIT_REF OR NOT RCCL_GIT_COMMIT)
+        message(FATAL_ERROR "The canonical RCCL upstream revision is missing")
+    endif()
     set(RCCL_C_COMPILER "${ROCM_PATH}/bin/amdclang" CACHE FILEPATH
         "C compiler used for the nested RCCL source build")
     set(RCCL_CXX_COMPILER "${ROCM_PATH}/bin/hipcc" CACHE FILEPATH
         "C++ compiler used for the nested RCCL source build")
-    set(RCCL_ONLY_FUNCS "" CACHE STRING
-        "Optional RCCL ONLY_FUNCS generator pattern for nested source builds")
+    file(READ "${REPO_ROOT}/scripts/docker/rccl-functions.txt" _rccl_shipping_functions)
+    string(STRIP "${_rccl_shipping_functions}" _rccl_shipping_functions)
     
     if(NOT EXISTS "${REPO_ROOT}/external")
         file(MAKE_DIRECTORY "${REPO_ROOT}/external")
@@ -990,8 +983,10 @@ if(HAVE_ROCM)
         file(READ "${RCCL_SOURCE_REF_FILE}" RCCL_COMMIT_RAW)
         string(STRIP "${RCCL_COMMIT_RAW}" RCCL_COMMIT)
     else()
-        set(RCCL_COMMIT "${RCCL_GIT_REF}")
-        message(STATUS "V2: RCCL source is not a git checkout and has no ref marker; using ${RCCL_COMMIT} for cache validation")
+        message(FATAL_ERROR "RCCL source has no pinned checkout or archive identity")
+    endif()
+    if(NOT RCCL_COMMIT STREQUAL RCCL_GIT_COMMIT)
+        message(FATAL_ERROR "RCCL checkout ${RCCL_COMMIT} differs from the pinned ${RCCL_GIT_COMMIT}")
     endif()
 
     # A pinned upstream ref alone is not a complete runtime identity: the HIP
@@ -1047,9 +1042,9 @@ if(HAVE_ROCM)
     file(SHA256 "${RCCL_LTO_ARTIFACT_SCRIPT}" RCCL_LTO_PRODUCER_HASH)
     set(RCCL_BUILD_ID "${RCCL_COMMIT}-smi-${RCCL_SMI_PATCH_HASH}-completed-${RCCL_COMPLETED_PATCH_HASH}-capture-${RCCL_CAPTURE_PATCH_HASH}-rows-${RCCL_ROWS_PATCH_HASH}-storage-${RCCL_HOST_STORAGE_PATCH_HASH}-shm-${RCCL_SHM_PATCH_HASH}-selector-${RCCL_SELECTOR_PATCH_HASH}-thread-${RCCL_THREAD_PATCH_HASH}-protocol-${RCCL_PROTOCOL_PATCH_HASH}-smallag-${RCCL_SMALL_ALLGATHER_PATCH_HASH}")
     
-    # A changed requested target set requires new actual device binaries even
-    # when the pinned patched source is unchanged.
-    string(SHA256 RCCL_TARGET_POLICY_HASH "${RCCL_GPU_TARGETS}")
+    # The same patched source can generate different collective kernels. Bind
+    # the effective generation inputs when the library leaves its build tree.
+    string(SHA256 RCCL_TARGET_POLICY_HASH "${RCCL_GPU_TARGETS}\nOFF\n${_rccl_shipping_functions}")
     # Compiler metadata precedes the strict thread/protocol/smallAG repair suffix.
     string(PREPEND RCCL_BUILD_ID "targets-${RCCL_TARGET_POLICY_HASH}-llvm-lto-${RCCL_LTO_RECEIPT_HASH}-producer-${RCCL_LTO_PRODUCER_HASH}-")
     string(PREPEND RCCL_BUILD_ID "p2p-${RCCL_USER_P2P_PATCH_HASH}-")
@@ -1072,13 +1067,18 @@ if(HAVE_ROCM)
         set(RCCL_REBUILD_REQUIRED ON)
     endif()
     
+    if(EXISTS "${RCCL_BUILD_DIR}/CMakeCache.txt")
+        load_cache("${RCCL_BUILD_DIR}" READ_WITH_PREFIX _built_rccl_ ONLY_FUNCS ENABLE_MSCCL_KERNEL)
+        if(NOT _built_rccl_ONLY_FUNCS STREQUAL _rccl_shipping_functions OR
+           NOT DEFINED _built_rccl_ENABLE_MSCCL_KERNEL OR _built_rccl_ENABLE_MSCCL_KERNEL)
+            set(RCCL_REBUILD_REQUIRED ON)
+        endif()
+    endif()
+
     # Build RCCL if needed
     if(NOT EXISTS "${RCCL_BUILD_DIR}/librccl.so" OR RCCL_REBUILD_REQUIRED)
         message(STATUS "V2: Building RCCL (${RCCL_GIT_URL}@${RCCL_GIT_REF} @ ${RCCL_COMMIT}) from source...")
         message(STATUS "V2: RCCL GPU targets: ${RCCL_GPU_TARGETS}")
-        if(RCCL_ONLY_FUNCS)
-            message(STATUS "V2: RCCL ONLY_FUNCS: ${RCCL_ONLY_FUNCS}")
-        endif()
         message(STATUS "V2: NOTE: This may take 30-60+ minutes on first build")
 
         # Preserve the entire target list as one subprocess argument. HIP's
@@ -1099,10 +1099,9 @@ if(HAVE_ROCM)
             "-DGPU_TARGETS=${RCCL_GPU_TARGETS_ARGUMENT}"
             "-DGPU_BUILD_TARGETS=${RCCL_GPU_TARGETS_ARGUMENT}"
             -DBUILD_TESTS=OFF
+            -DENABLE_MSCCL_KERNEL=OFF
+            "-DONLY_FUNCS=${_rccl_shipping_functions}"
         )
-        if(RCCL_ONLY_FUNCS)
-            list(APPEND RCCL_CONFIG_ARGS "-DONLY_FUNCS=${RCCL_ONLY_FUNCS}")
-        endif()
         
         # Configure RCCL
         execute_process(
@@ -1156,42 +1155,44 @@ if(HAVE_ROCM)
     if(NOT RCCL_LTO_VERIFY_RESULT EQUAL 0)
         message(FATAL_ERROR "RCCL build artifact has no current complete resource evidence: ${RCCL_LTO_VERIFY_ERROR}")
     endif()
+    # A source-mode reconfigure owns all of these outputs. A discovery cache
+    # from a previous SDK or installation must not displace the build just verified.
+    set(RCCL_LIBRARY "${RCCL_BUILD_DIR}/librccl.so.1" CACHE FILEPATH "Canonical RCCL library" FORCE)
+    set(RCCL_INCLUDE_DIR "${RCCL_BUILD_DIR}/include" CACHE PATH "Canonical RCCL headers" FORCE)
+    set(RCCL_PROTOCOL_BUILD_DIR "${RCCL_BUILD_DIR}" CACHE PATH "Canonical RCCL protocol source build" FORCE)
+    set(RCCL_FINAL_ALLOCATION_REPORT "${RCCL_BUILD_DIR}/llaminar-final-allocation.json"
+        CACHE FILEPATH "Canonical RCCL build proof" FORCE)
+    set(RCCL_FINAL_ALLOCATION_RECEIPT "${RCCL_VERSION_FILE}" CACHE FILEPATH "Canonical RCCL build receipt" FORCE)
     endif() # LLAMINAR_BUILD_RCCL_FROM_SOURCE
     
     # =========================================================================
     # RCCL Detection (ROCm Collective Communications Library)
     # =========================================================================
-    # Search for RCCL - prioritize our local build over system packages
-    # (system packages may have broken GPU binaries for certain architectures)
-    find_path(RCCL_INCLUDE_DIR rccl/rccl.h rccl.h
-        HINTS
-            ${RCCL_BUILD_DIR}/include        # Our local build (highest priority)
-            ${RCCL_EXTERNAL_DIR}/src/include # RCCL source headers
-            ${ROCM_PATH}/include
-            ${ROCM_PATH}/rccl/include
-        PATHS
-            /opt/rocm/include
-            /opt/rocm/rccl/include
-            /usr/include
-            /usr/local/include
-        NO_DEFAULT_PATH
-    )
-    find_library(RCCL_LIBRARY rccl
-        HINTS
-            ${RCCL_BUILD_DIR}                # Our local build (highest priority)
-            ${ROCM_PATH}/lib
-            ${ROCM_PATH}/rccl/lib
-        PATHS
-            /opt/rocm/lib
-            /opt/rocm/rccl/lib
-            /usr/lib/x86_64-linux-gnu
-            /usr/lib64
-            /usr/local/lib
-        NO_DEFAULT_PATH
-    )
-    
+    # The stock ROCm SDK exports the same SONAME but lacks Llaminar's ABI.
+    # Select only the two canonical installation layouts. Relocated builds
+    # are accepted via an explicit path after authenticating the artifact.
+    find_library(RCCL_LIBRARY rccl PATHS "${RCCL_BUILD_DIR}" /usr/local/lib NO_DEFAULT_PATH)
+    if(RCCL_LIBRARY)
+        get_filename_component(_rccl_abi_dso "${RCCL_LIBRARY}" REALPATH)
+        get_filename_component(_rccl_abi_libdir "${_rccl_abi_dso}" DIRECTORY)
+        find_path(RCCL_INCLUDE_DIR NAMES rccl/rccl.h rccl.h
+            PATHS "${_rccl_abi_libdir}/include" "${_rccl_abi_libdir}/../include" NO_DEFAULT_PATH)
+    endif()
     if(RCCL_INCLUDE_DIR AND RCCL_LIBRARY)
-        set(HAVE_RCCL ON CACHE BOOL "RCCL library found")
+        set(HAVE_RCCL ON CACHE BOOL "Canonical RCCL library found" FORCE)
+        if(NOT RCCL_FINAL_ALLOCATION_REPORT)
+            if(EXISTS "${_rccl_abi_libdir}/llaminar-final-allocation.json")
+                set(_rccl_proof_dir "${_rccl_abi_libdir}")
+                set(RCCL_FINAL_ALLOCATION_REPORT "${_rccl_proof_dir}/llaminar-final-allocation.json")
+                set(RCCL_FINAL_ALLOCATION_RECEIPT "${_rccl_proof_dir}/.llaminar-rccl-commit")
+            else()
+                set(_rccl_proof_dir "${_rccl_abi_libdir}/../share/llaminar-rccl")
+                set(RCCL_FINAL_ALLOCATION_REPORT "${_rccl_proof_dir}/final-allocation.json")
+                set(RCCL_FINAL_ALLOCATION_RECEIPT "${_rccl_proof_dir}/build.txt")
+            endif()
+        endif()
+        llaminar_verify_collective(rccl "${RCCL_LIBRARY}"
+            "${RCCL_FINAL_ALLOCATION_REPORT}" "${RCCL_FINAL_ALLOCATION_RECEIPT}")
         # This is the actual configured RCCL compilation header, not a runtime search.
         find_file(_rccl_abi_header NAMES rccl/rccl.h rccl.h
             HINTS "${RCCL_INCLUDE_DIR}" NO_DEFAULT_PATH NO_CACHE)
@@ -1210,25 +1211,10 @@ if(HAVE_ROCM)
         set_property(SOURCE collective/backends/RCCLDynamicLoader.cpp APPEND
             PROPERTY COMPILE_DEFINITIONS "LLAMINAR_RCCL_LIBRARY_PATH=\"${RCCL_LIBRARY}\"")
         
-        # Check if we're using our local build or system RCCL
-        string(FIND "${RCCL_LIBRARY}" "${RCCL_BUILD_DIR}" RCCL_IS_LOCAL)
-        if(NOT RCCL_IS_LOCAL EQUAL -1)
-            message(STATUS "V2: RCCL found (locally built for ${RCCL_GPU_TARGETS})")
-        else()
-            message(STATUS "V2: RCCL found (system)")
-            message(WARNING "V2: Using system RCCL - may have broken GPU binaries for gfx906")
-        endif()
-        message(STATUS "V2:   Include: ${RCCL_INCLUDE_DIR}")
-        message(STATUS "V2:   Library: ${RCCL_LIBRARY}")
+        message(STATUS "V2: Canonical RCCL: ${RCCL_LIBRARY} (headers: ${RCCL_INCLUDE_DIR})")
     else()
-        set(HAVE_RCCL OFF CACHE BOOL "RCCL library not found")
-        message(WARNING "V2: RCCL not found - RCCLBackend will be disabled")
-        if(NOT RCCL_INCLUDE_DIR)
-            message(WARNING "V2:   rccl.h not found in standard paths")
-        endif()
-        if(NOT RCCL_LIBRARY)
-            message(WARNING "V2:   librccl.so not found in standard paths")
-        endif()
+        message(FATAL_ERROR "ROCm requires the canonical patched RCCL library and its headers. "
+            "Set LLAMINAR_BUILD_RCCL_FROM_SOURCE=ON or select a completed canonical installation.")
     endif()
 endif()
 
@@ -1503,6 +1489,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/SendActivationsStage.cpp
     execution/compute_stages/stages/ReceiveActivationsStage.cpp
     execution/compute_stages/stages/MoEExpertComputeStage.cpp
+    execution/compute_stages/stages/MoEIntermediateShardPipeline.cpp
     execution/compute_stages/stages/MoECPUExpertShardRouteStage.cpp
     execution/compute_stages/stages/MoEOverlayPinnedRouteEvidenceViews.cpp
     execution/compute_stages/stages/MoEExpertDispatchStage.cpp
@@ -1521,6 +1508,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/compute_stages/stages/AttentionOutputGateStage.cpp
     execution/compute_stages/stages/GatedRMSNormStage.cpp
     execution/compute_stages/stages/GDNProjectionStage.cpp
+    execution/compute_stages/stages/qwen4exp/RetainedGDNPreAttentionStage.cpp
     execution/compute_stages/stages/ShortConv1dStage.cpp
     execution/compute_stages/stages/GDNRecurrenceStage.cpp
     execution/compute_stages/stages/GDNLiveStateAllGatherStage.cpp
@@ -1621,7 +1609,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/MoEGraphRoleRunner.cpp
     execution/moe/MoEOverlayParticipantGraphRunner.cpp
     execution/moe/MoEExpertOverlayPreparationPlan.cpp
-    execution/moe/CPUExpertShardSourceSelection.cpp
+    execution/moe/ExpertShardSourceSelection.cpp
+    execution/moe/MoEOverlayNoPeerResidency.cpp
     execution/moe/MoEExpertOverlayProfiler.cpp
     execution/moe/MoEExpertOverlayRuntimePlan.cpp
     execution/moe/MoEOverlayInferenceTransaction.cpp
@@ -1639,6 +1628,8 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     execution/moe/SocketAwareRebalancer.cpp
     execution/moe/MoERebalanceController.cpp
     execution/moe/MoERuntimeTable.cpp
+    execution/moe/MoEIntermediateShardArenaGeometry.cpp
+    execution/moe/MoEIntermediateShardRuntimeBinding.cpp
     execution/moe/DeviceMoERebalanceWorkspaceContract.cpp
     execution/moe/DeviceMoETransferSlotDirectory.cpp
     execution/moe/GpuExpertSlotPool.cpp
@@ -1831,6 +1822,7 @@ add_library(llaminar2_core ${LLAMINAR2_CORE_LIBRARY_TYPE}
     planning/PlanningPCIeCommunicationCost.cpp
     planning/PlanningCPUExpertMeasurement.cpp
     planning/PlanningGPUExpertMeasurement.cpp
+    planning/PlanningGPUCohortServiceMeasurement.cpp
     planning/PlanningModelSample.cpp
     planning/PlanningExpertSample.cpp
     planning/PlanningMatrixSample.cpp

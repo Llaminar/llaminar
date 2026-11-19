@@ -48,6 +48,7 @@
 #include "execution/local_execution/graph/DeviceGraphExecutor.h"
 #include "transfer/TransferEngine.h"
 #include "utils/EmbeddingVerifierFormats.h"
+#include "fixtures/qwen4exp/PooledFormatReplayGroup.h"
 #include "utils/PooledNgramReplayTrace.h"
 #include "fixtures/qwen4exp/PooledImmutableNativeSourceFixture.h"
 #include "execution/compute_stages/stages/qwen4exp/PooledImmutableNativePhaseStage.h"
@@ -102,7 +103,7 @@ void providerFailureReplay(DeviceId device){
 #include "PooledCrossVendorMultiOwnerReplay.inc"
 
 /** @brief Cross the canonical original-native inventory through the new actual pooled source consumer on one backend. */
-void providerAllFormatsReplay(DeviceId device,bool productionPLE=false){
+void providerAllFormatsReplay(DeviceId device, bool productionPLE, unsigned slots, PooledFormatReplayGroup group){
     if(!hasCPUBackend())initCPUBackend(-1);std::vector<ProviderReplaySpec> specs;std::vector<std::string> labels;
     std::size_t supported=0,unsupported=0;
     for(const auto& entry:embeddingVerifierFormats()){
@@ -111,8 +112,9 @@ void providerAllFormatsReplay(DeviceId device,bool productionPLE=false){
         if(!format){requireProvider(original->native_type()==TensorType::Q8_1,"Canonical embedding format has no supported original GGUF provider descriptor");
             EXPECT_THROW((void)ggufToTensorType(static_cast<GGUFTensorType>(9)),std::invalid_argument);
             std::cout<<"POOLED_PROVIDER_FORMAT_UNSUPPORTED format="<<entry.label<<" reason=no_original_GGUF_provider_descriptor\n";++unsupported;continue;}
-        ++supported;
-        for(auto slots:{0u,3u}){specs.push_back({std::make_shared<ProviderFile>(*original,*format,columns),productionPLE?64u:33u,slots,slots?2u:0u,productionPLE?n::OriginalIdWidth::UInt64:n::OriginalIdWidth::UInt32,productionPLE});labels.emplace_back(entry.label);}
+        if (!group.includes(supported++)) continue;
+        specs.push_back({std::make_shared<ProviderFile>(*original,*format,columns),productionPLE?64u:33u,slots,slots?2u:0u,productionPLE?n::OriginalIdWidth::UInt64:n::OriginalIdWidth::UInt32,productionPLE});
+        labels.emplace_back(entry.label);
     }
     ProviderReplayPrograms programs(specs);programs.prepare(device);
     for(std::size_t i=0;i<specs.size();++i)programs.run(i,[&](ProviderReplay& replay){auto& file=replay.file;const auto columns=file.columns,slots=std::size_t(replay.slots);const auto& label=labels[i];
@@ -201,9 +203,9 @@ void pooledACKReadyCancellation(DeviceId device){
  * @note C0 and positive cache ownership share the real RAM/SSD provider. Full,
  * partial, empty and repeated request resets reuse the same retained graph.
  */
-void productionColdArenaSealReplay(DeviceId device){
+void productionColdArenaSealReplay(DeviceId device, unsigned slots){
     if(!hasCPUBackend())initCPUBackend(-1);std::vector<ProviderReplaySpec> specs;
-    for(auto slots:{0u,4u})for(auto maximum:{16u,64u,256u,1024u})specs.push_back({std::make_shared<ProviderFile>(),maximum,slots,slots?2u:0u,n::OriginalIdWidth::UInt64,true,OwnerAdmission::Original,ACKInterleaving::None,ActivationPreparation::ColdGraph});
+    for(auto maximum:{16u,64u,256u,1024u})specs.push_back({std::make_shared<ProviderFile>(),maximum,slots,slots?2u:0u,n::OriginalIdWidth::UInt64,true,OwnerAdmission::Original,ACKInterleaving::None,ActivationPreparation::ColdGraph});
     ProviderReplayPrograms programs(specs);programs.prepare(device);
     for(std::size_t i=0;i<specs.size();++i)programs.run(i,[&](ProviderReplay& replay){const auto maximum=replay.maximum;
         std::vector<std::uint64_t> large(maximum,ProviderFile::High),small(16,700);
@@ -247,24 +249,53 @@ TEST(PooledImmutableProviderSourceDevice,ProviderBackingUsesOwnedTemporaryRoot){
         EXPECT_TRUE(std::filesystem::exists(path));EXPECT_EQ(file.descriptor().path,path);}
     EXPECT_FALSE(std::filesystem::exists(path));
 }
+/** @brief One original cache capacity and one disjoint group of source formats. */
+class ProviderFormatReplay : public ::testing::TestWithParam<std::tuple<unsigned, unsigned>> {};
+INSTANTIATE_TEST_SUITE_P(CapacityAndFormats, ProviderFormatReplay,
+    ::testing::Combine(::testing::Values(0u, 3u), ::testing::Range(0u, PooledFormatReplayGroup::Count)),
+    [](const ::testing::TestParamInfo<ProviderFormatReplay::ParamType>& info) {
+        const auto slots = std::get<0>(info.param);
+        const auto group = std::get<1>(info.param);
+        return std::string(slots == 0u ? "C0Group" : "PositiveGroup") + std::to_string(group);
+    });
+
+/** @brief Cold arena sealing retains all row envelopes for one original cache capacity. */
+class ProviderColdArenaSeal : public ::testing::TestWithParam<unsigned> {};
+INSTANTIATE_TEST_SUITE_P(Capacity, ProviderColdArenaSeal, ::testing::Values(0u, 4u));
 #ifdef HAVE_CUDA
-TEST(PooledImmutableProviderSourceDevice,CUDACapturedRealProviderAllFormatsReplay){providerAllFormatsReplay(DeviceId::cuda(0));}
+TEST_P(ProviderFormatReplay, CUDACapturedRealProviderAllFormatsReplay) {
+    const auto [slots, group] = GetParam();
+    providerAllFormatsReplay(DeviceId::cuda(0), false, slots, PooledFormatReplayGroup(group));
+}
 TEST(PooledImmutableProviderSourceDevice,CUDACapturedRealProviderFailureReplay){providerFailureReplay(DeviceId::cuda(0));}
 TEST(PooledImmutableProviderSourceDevice,CUDACapturedRealProviderResetReplay){providerReplay(DeviceId::cuda(0));}
 TEST(PooledImmutableProviderSourceDevice,CUDAProductionPLEInt64RepeatedTokenReplay){productionPLELookupReplay(DeviceId::cuda(0));}
-TEST(PooledImmutableProviderSourceDevice,CUDAProductionPLEAllFormatsReplay){providerAllFormatsReplay(DeviceId::cuda(0),true);}
+TEST_P(ProviderFormatReplay, CUDAProductionPLEAllFormatsReplay) {
+    const auto [slots, group] = GetParam();
+    providerAllFormatsReplay(DeviceId::cuda(0), true, slots, PooledFormatReplayGroup(group));
+}
 TEST(PooledImmutableProviderSourceDevice,CUDAACKReadyCancellationReplay){pooledACKReadyCancellation(DeviceId::cuda(0));}
-TEST(PooledImmutableProviderSourceDevice,CUDAProductionColdArenaSealReplay){productionColdArenaSealReplay(DeviceId::cuda(0));}
+TEST_P(ProviderColdArenaSeal, CUDAProductionColdArenaSealReplay) {
+    productionColdArenaSealReplay(DeviceId::cuda(0), GetParam());
+}
 TEST(PooledImmutableProviderSourceDevice,CUDAProductionSourceAuthorityRejection){productionSourceAuthorityRejection(DeviceId::cuda(0));}
 #endif
 #ifdef HAVE_ROCM
-TEST(PooledImmutableProviderSourceDevice,ROCmCapturedRealProviderAllFormatsReplay){providerAllFormatsReplay(DeviceId::rocm(0));}
+TEST_P(ProviderFormatReplay, ROCmCapturedRealProviderAllFormatsReplay) {
+    const auto [slots, group] = GetParam();
+    providerAllFormatsReplay(DeviceId::rocm(0), false, slots, PooledFormatReplayGroup(group));
+}
 TEST(PooledImmutableProviderSourceDevice,ROCmCapturedRealProviderFailureReplay){providerFailureReplay(DeviceId::rocm(0));}
 TEST(PooledImmutableProviderSourceDevice,ROCmCapturedRealProviderResetReplay){providerReplay(DeviceId::rocm(0));}
 TEST(PooledImmutableProviderSourceDevice,ROCmProductionPLEInt64RepeatedTokenReplay){productionPLELookupReplay(DeviceId::rocm(0));}
-TEST(PooledImmutableProviderSourceDevice,ROCmProductionPLEAllFormatsReplay){providerAllFormatsReplay(DeviceId::rocm(0),true);}
+TEST_P(ProviderFormatReplay, ROCmProductionPLEAllFormatsReplay) {
+    const auto [slots, group] = GetParam();
+    providerAllFormatsReplay(DeviceId::rocm(0), true, slots, PooledFormatReplayGroup(group));
+}
 TEST(PooledImmutableProviderSourceDevice,ROCmACKReadyCancellationReplay){pooledACKReadyCancellation(DeviceId::rocm(0));}
-TEST(PooledImmutableProviderSourceDevice,ROCmProductionColdArenaSealReplay){productionColdArenaSealReplay(DeviceId::rocm(0));}
+TEST_P(ProviderColdArenaSeal, ROCmProductionColdArenaSealReplay) {
+    productionColdArenaSealReplay(DeviceId::rocm(0), GetParam());
+}
 TEST(PooledImmutableProviderSourceDevice,ROCmProductionSourceAuthorityRejection){productionSourceAuthorityRejection(DeviceId::rocm(0));}
 #endif
 #ifdef HAVE_CUDA
@@ -282,10 +313,23 @@ TEST(PooledImmutableProviderSourceDevice,NoPeerCapturedROCmConsumerROCmStoragePo
 TEST(PooledImmutableProviderSourceDevice,CrossVendorCUDAConsumerROCmStorageColdPrefillFirstError){crossVendorColdPrefillLifecycle(DeviceId::cuda(0),DeviceId::rocm(0));}
 /** @test Symmetric actual ROCm source/CUDA owner first-error lifecycle. */
 TEST(PooledImmutableProviderSourceDevice,CrossVendorROCmConsumerCUDAStorageColdPrefillFirstError){crossVendorColdPrefillLifecycle(DeviceId::rocm(0),DeviceId::cuda(0));}
-TEST(PooledImmutableProviderSourceDevice,CrossVendorCapturedCUDAConsumerROCmStorageC0ReadAllFormats){crossVendorReadFormats(DeviceId::cuda(0),DeviceId::rocm(0),0);}
-TEST(PooledImmutableProviderSourceDevice,CrossVendorCapturedCUDAConsumerROCmStoragePositiveReadAllFormats){crossVendorReadFormats(DeviceId::cuda(0),DeviceId::rocm(0),3);}
-TEST(PooledImmutableProviderSourceDevice,CrossVendorCapturedROCmConsumerCUDAStorageC0ReadAllFormats){crossVendorReadFormats(DeviceId::rocm(0),DeviceId::cuda(0),0);}
-TEST(PooledImmutableProviderSourceDevice,CrossVendorCapturedROCmConsumerCUDAStoragePositiveReadAllFormats){crossVendorReadFormats(DeviceId::rocm(0),DeviceId::cuda(0),3);}
+/** @brief Each process admits and retires the original graph population for its format group. */
+class CrossVendorCapturedReadFormats : public ::testing::TestWithParam<unsigned> {};
+
+TEST_P(CrossVendorCapturedReadFormats, CUDAConsumerROCmStorageC0) {
+    crossVendorReadFormats(DeviceId::cuda(0), DeviceId::rocm(0), 0, GetParam());
+}
+TEST_P(CrossVendorCapturedReadFormats, CUDAConsumerROCmStoragePositive) {
+    crossVendorReadFormats(DeviceId::cuda(0), DeviceId::rocm(0), 3, GetParam());
+}
+TEST_P(CrossVendorCapturedReadFormats, ROCmConsumerCUDAStorageC0) {
+    crossVendorReadFormats(DeviceId::rocm(0), DeviceId::cuda(0), 0, GetParam());
+}
+TEST_P(CrossVendorCapturedReadFormats, ROCmConsumerCUDAStoragePositive) {
+    crossVendorReadFormats(DeviceId::rocm(0), DeviceId::cuda(0), 3, GetParam());
+}
+INSTANTIATE_TEST_SUITE_P(FormatGroups, CrossVendorCapturedReadFormats,
+                         ::testing::Range(0u, PooledFormatReplayGroup::Count));
 /** @test Actual CUDA Pin live identity threshold 63, retained capture/reset and exact owner evidence. */
 TEST(PooledImmutableProviderSourceDevice,ExactIdentityCUDAPin63){exactIdentityNativeBoundary(DeviceId::cuda(0),63,ExactIdentityBoundaryTrace::Pin);}
 /** @test Actual CUDA Pin live identity threshold 64, retained capture/reset and exact owner evidence. */

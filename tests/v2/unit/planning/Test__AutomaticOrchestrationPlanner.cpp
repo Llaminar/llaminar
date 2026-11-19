@@ -14,6 +14,8 @@
 #include "planning/AutomaticOrchestrationCandidates.h"
 #include "planning/AutomaticPlanningStartup.h"
 #include "backends/PreparedGPUWorkerThread.h"
+#include "backends/GPUDeviceContextPool.h"
+#include "../../mocks/MockWorkerGPUContext.h"
 #include "planning/PhysicalMemoryCapacityExhausted.h"
 #include "config/OrchestrationConfigDocument.h"
 #include "../../utils/PlanningGGUFFixture.h"
@@ -161,6 +163,34 @@ TEST(AutomaticOrchestrationPlanner, MissingMTPWeightsFailBeforeEvidencePreparati
             EXPECT_EQ(serializeOrchestrationConfig(config), original);
         }
     }
+}
+
+/** @test An existing unrelated worker must survive rejection at the real default planner entry. */
+TEST(AutomaticOrchestrationPlanner, DefaultCalibrationRejectsExistingWorkerWithoutRetiringIt)
+{
+    llaminar2::testing::installHardwareFreeGPUContextFactories();
+    test::PlanningGGUFFixture file;
+    const PlanningModelSource source(file.path());
+    const auto config = request(source, DeviceType::CUDA);
+    const auto observed = inventory(DeviceType::CUDA);
+    auto &pool = GPUDeviceContextPool::instance();
+    const auto device = DeviceId::cuda(2);
+    ASSERT_TRUE(pool.getContext(device).isInitialized());
+    const auto generation = pool.retainExistingContextProvenance(device).generation();
+
+    try
+    {
+        (void)AutomaticPlanningStartup::run(config, observed, {});
+        ADD_FAILURE() << "Automatic calibration admitted the unrelated worker";
+    }
+    catch (const std::runtime_error &error)
+    {
+        EXPECT_NE(std::string_view(error.what()).find("Automatic calibration requires an untouched GPU worker"),
+                  std::string_view::npos) << error.what();
+    }
+    EXPECT_EQ(pool.retainExistingContextProvenance(device).generation(), generation);
+    EXPECT_TRUE(pool.getContext(device).isInitialized());
+    EXPECT_EQ(pool.retireExclusiveGeneration(device).retired_generation, generation);
 }
 
 TEST(AutomaticOrchestrationPlanner, StartupSearchSharesPolicyAndPreservesDiscoveryWithoutMutatingRequest)

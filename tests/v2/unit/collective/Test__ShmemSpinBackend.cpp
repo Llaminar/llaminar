@@ -201,7 +201,7 @@ namespace
 /** Public callers must not manufacture a replicated-count or transport override. */
 template<class Context>
 concept PublicReplicatedPrefillGather = requires(Context& context,
-    const CPUExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
+    const ExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
     const std::shared_ptr<IGlobalTPContext>& owner,const float* local,float* root,
     size_t capacity,int root_index,size_t& gathered,const std::string& stage,
     std::span<RootedFloatRecordRange> ranges,CPURootedPublicationTransport& selected)
@@ -255,11 +255,11 @@ TEST(Test__ShmemSpinBackend, ReplicatedPrefillCohortSelectionIsDegreeIndependent
                 const auto lane=MoEOverlayJointRouteTarget::fromOriginalCohort(8,participant,9,4);
                 for(size_t route=0;route<live_routes+4u;++route)
                 {
-                    int word=MoEOverlayRouteTarget::cpuCohort(4).word();
+                    int word=MoEOverlayRouteTarget::cohort(4).word();
                     float weight=1.0f;
                     if(route==live_routes)weight=0.0f;
                     if(route==live_routes+1u)weight=-0.0f;
-                    if(route==live_routes+2u)word=MoEOverlayRouteTarget::cpuCohort(5).word();
+                    if(route==live_routes+2u)word=MoEOverlayRouteTarget::cohort(5).word();
                     if(route==live_routes+3u)word=MoEOverlayRouteTarget::whole(0).word();
                     int selected=-99;
                     ASSERT_TRUE(lane.resolve(3,word,&selected));

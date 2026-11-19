@@ -1,3 +1,5 @@
+# @file ci.yml
+# @brief Publish the develop images and retain build evidence and failed job transcripts.
 name: CI
 
 # Develop publishes both Release runtime images on the dedicated development host.
@@ -112,3 +114,10 @@ jobs:
             docker tag llaminar-arm64-runtime:develop "$repository:$tag"
             docker push "$repository:$tag"
           done
+
+  failed-job-logs:
+    needs: develop-images
+    if: always() && (needs.develop-images.result == 'failure' || needs.develop-images.result == 'cancelled')
+    permissions:
+      actions: read
+    uses: ./.github/workflows/failed-job-logs.yml

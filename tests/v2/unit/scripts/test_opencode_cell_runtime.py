@@ -116,6 +116,53 @@ class ContainerOwnershipTests(unittest.TestCase):
             with self.subTest(code=code, log=log), self.assertRaises(ValueError):
                 runtime.admission_outcome(code, log)
 
+    def test_auto_overlay_capacity_requires_a_limited_physical_resource(self):
+        """Replay a TP4 context rejection, including a mix of fitting and limiting owners."""
+        phase = "Planning publication step threw: 'planning-selection.select': "
+        reason = ("No automatic candidate fits the complete physical admission: "
+                  "No complete ExpertOverlay candidate graph fits: ExpertOverlay tier 'tier_0' "
+                  "cannot admit its fallback remainder for layer 29: requested 512 experts under the complete physical BOM")
+        quote = ("; resource='overlay-rank=0;device=ROCm:0' device=ROCm:0"
+                 " requires_additional_bytes=972800 remaining_bytes=402712 usable_bytes=34261172224")
+        peer = quote.replace('ROCm:0', 'ROCm:1').replace('remaining_bytes=402712', 'remaining_bytes=1000000')
+        message = phase + reason + quote
+        for line in (message, message + peer):
+            self.assertEqual(runtime.admission_outcome(1, '[ERROR] [0] ' + line),
+                             runtime.AdmissionOutcome.CAPACITY_REJECTED)
+        for code, log in ((139, message), (1, reason + quote), (1, phase + reason + peer),
+                          (1, phase + reason), (1, message + peer.replace(' usable_bytes=', ' missing=')),
+                          (1, message.replace('usable_bytes=34261172224', 'usable_bytes=7')),
+                          (1, message.replace('planning-selection.select', 'device.prepare')),
+                          (1, phase + reason + '; resolved tier maximum=8 experts' + quote)):
+            with self.subTest(code=code, log=log), self.assertRaises(ValueError):
+                runtime.admission_outcome(code, log)
+
+    def test_frozen_overlay_capacity_requires_the_typed_complete_bom(self):
+        """Replay the physical rejection at the R12 40,704-token adjacent context."""
+        marker = ("Failed to freeze MoE expert overlay plan from model metadata: ExpertOverlay has no "
+                  "resident captured-prefill shape with complete expert coverage under the physical BOM: "
+                  "ExpertOverlay capacity step threw: 'overlay-candidate.complete-bom': ")
+        reason = ("ExpertOverlay tier 'tier_0' cannot admit its fallback remainder for layer 48: "
+                  "requested 512 experts under the complete physical BOM")
+        quote = ("; resource='overlay-rank=0;device=ROCm:0' device=ROCm:0 requires_additional_bytes=1305600 "
+                 "remaining_bytes=150744 usable_bytes=34261172224 fixed_bytes=9005277480")
+        peer = quote.replace('ROCm:0', 'ROCm:1').replace('remaining_bytes=150744', 'remaining_bytes=1400000')
+        message = marker + reason + quote + peer
+        echoed = '[ERROR] [0] ' + message + '\n[ERROR] [0] --dry-run preflight failed: ' + message
+        for log in (message, echoed):
+            self.assertEqual(runtime.admission_outcome(1, log), runtime.AdmissionOutcome.CAPACITY_REJECTED)
+        for code, log in ((137, echoed), (1, marker + reason),
+                          (1, marker + reason + peer),
+                          (1, message.replace('overlay-candidate.complete-bom', 'device.initialize')),
+                          (1, message.replace('remaining_bytes=150744', 'remaining_bytes=1305600')),
+                          (1, message.replace('usable_bytes=34261172224', 'usable_bytes=7')),
+                          (1, message + quote.replace(' usable_bytes=', ' missing=')),
+                          (1, marker + reason + '; resolved tier maximum=8 experts' + quote),
+                          (1, message + '\n' + message.replace('requires_additional_bytes=1305600',
+                                                                  'requires_additional_bytes=1400000'))):
+            with self.subTest(code=code, log=log), self.assertRaises(ValueError):
+                runtime.admission_outcome(code, log)
+
     def test_failed_helper_retirement_cannot_replace_operator_cancellation(self):
         owners = runtime.ContainerOwners()
         interrupted = KeyboardInterrupt('cancelled')
@@ -216,7 +263,8 @@ class CellLifetimeTests(unittest.TestCase):
         self.cell = runtime.CodingCell('sha256:' + 'a' * 64, configuration(), 'ROCm',
                                       Path(temporary) / 'model.gguf', self.output)
         self.containers, self.events = {}, []
-        self.client_error = self.stop_error = self.create_error = self.admission_error = None
+        self.client_version = runtime.QUALIFIED_CLIENT_VERSION
+        self.client_error = self.stop_error = self.create_error = self.admission_error = self.collective_error = None
         self.stats = {'model': 'Qwen-fixture',
                       'configuration': {'context_tokens': 131072, 'prefix_cache': {
                           'ram_budget_bytes_per_participant': runtime.RAM_MIB * 1024**2,
@@ -234,7 +282,15 @@ class CellLifetimeTests(unittest.TestCase):
         self.stack.enter_context(patch.object(runtime.docker_paths, 'inspect_owned_container',
             side_effect=lambda name: {'Id': 'a' * 64} if name in self.containers else None))
         self.stack.enter_context(patch.object(runtime, 'RuntimeStatsObserver', return_value=nullcontext()))
-        self.stack.enter_context(patch.object(runtime, 'collect_and_publish_ranked_perf_stats', return_value={}))
+        participant = SimpleNamespace(device='ROCm:0')
+        rank = SimpleNamespace(rank=0, pid=123, start_ticks=45, devices=[participant])
+        calls = [{'domain': 'tp_raw_allgather_runtime', 'name': 'calls', 'rank': 0,
+                  'value': 1, 'device': 'ROCm:0', 'tags': {'backend': 'rccl', 'degree': '2'}}]
+        self.stack.enter_context(patch.object(runtime, 'bind_native_ranks', return_value=(rank,)))
+        self.stack.enter_context(patch.object(runtime, 'bind_discovery_membership',
+            return_value=SimpleNamespace(processes=(rank,))))
+        self.stack.enter_context(patch.object(runtime, 'collect_and_publish_ranked_perf_stats',
+                                            return_value={'records': calls}))
         self.stack.enter_context(patch.object(runtime.subprocess, 'run', side_effect=self.process))
         self.stack.enter_context(patch.object(runtime.subprocess, 'Popen', side_effect=self.launch))
         self.stack.enter_context(patch.object(runtime, 'urlopen', side_effect=self.shutdown))
@@ -242,6 +298,8 @@ class CellLifetimeTests(unittest.TestCase):
     def command(self, args, **kwargs):
         """Model native Docker state independently from the controller's flags."""
         self.events.append(tuple(args))
+        if args == [self.cell.opencode, '--version']:
+            return self.client_version + '\n'
         if args[0] != 'docker':
             return ''  # Independent driver diagnostics are covered separately.
         action = args[1]
@@ -252,6 +310,15 @@ class CellLifetimeTests(unittest.TestCase):
             if self.create_error:
                 raise self.create_error
             return ('b' if name.endswith('-resources') else 'a') * 64
+        if action == 'exec':
+            self.assertTrue(args[2].endswith('-resources'))
+            self.assertTrue(self.containers[args[2]]['Running'])
+            self.assertEqual(args[3:5], ['python3', '/scripts/collective_runtime_binding.py'])
+            self.assertEqual(json.loads(args[5]), [{'pid': 123, 'start_ticks': 45}])
+            if self.collective_error is not None:
+                raise self.collective_error
+            return json.dumps({'processes': [
+                {'pid': 123, 'start_ticks': 45, 'mappings': {'rocm': ['fixture executable map']}}]})
         name = args[-1]
         if action == 'inspect':
             return json.dumps([{'State': self.containers[name]}])
@@ -292,7 +359,8 @@ class CellLifetimeTests(unittest.TestCase):
         resource.mkdir(exist_ok=True)
         (resource / 'observations.jsonl').write_text('{}\n')
         return {'observed': time.time(), 'boot_id': 'fixture', 'cells': {
-            'app': {'stats_observation': {'stats': self.stats}}}}
+            'app': {'stats_observation': {'stats': self.stats},
+                    'processes': [{'comm': 'llaminar2', 'pid': 123, 'start_ticks': 45}]}}}
 
     def metadata(self, url, route='/stats'):
         """The mock transport exposes the same admitted model/cache identity."""
@@ -336,6 +404,22 @@ class CellLifetimeTests(unittest.TestCase):
         response = BytesIO(b'{"status":"shutting_down"}')
         response.status = 202
         return response
+
+    def test_stock_client_rejected_before_device_or_model_admission(self):
+        self.client_version = '1.18.34'
+        with self.assertRaisesRegex(ValueError, 'OpenCode cell requires'):
+            runtime.run_app(self.cell)
+        self.assertEqual(self.events, [(self.cell.opencode, '--version')])
+        runtime.admit_context.assert_not_called()
+        self.assertFalse(self.output.exists())
+
+    def test_collective_observer_error_preserved_through_retirement(self):
+        self.collective_error = ValueError('foreign RCCL mapping')
+        result = runtime.run_app(self.cell)
+        self.assertTrue(result['native_retired'] and result['observer_retired'])
+        self.assertFalse(result['passed'])
+        self.assertIn("workload: ValueError('foreign RCCL mapping')", result['errors'])
+        self.assertFalse(any('collective runtime binding:' in error for error in result['errors']))
 
     def test_complete_only_after_native_and_observer_retirement(self):
         result = runtime.run_app(self.cell)

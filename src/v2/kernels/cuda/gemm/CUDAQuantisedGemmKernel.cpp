@@ -44,11 +44,14 @@
  * accesses; physical matrix strides and each row's reduction order stay fixed.
  */
 
+#include "kernels/common/HCDownOutputPublication.h"
 #include "kernels/common/ProjectionWorkLaunch.h"
 #include "CUDAQuantisedActivationProducers.h"
 #include "kernels/common/NativeEmbeddingIQTables.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "CUDAQuantisedGemmKernel.h"
+#include "kernels/common/HCDownProjectionInput.h"
+#include "kernels/common/HCBranchNormSingleQ8Publication.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
 #include "backends/BackendManager.h"
 #include "CUDAQuantisedGemmWorkspaceContract.h"
@@ -1552,12 +1555,62 @@ namespace llaminar2
             publishCUDATensorWrite(*output, cuda_device_id_, stream);
         }
 
+        /** @copydoc ITensorGemm::multiply_hc_down_projection */
+        bool CUDAQuantisedGemmKernel::multiply_hc_down_projection(const HCDownProjectionInput& input,
+            TensorBase* output,int n,int k,DeviceWorkspaceManager* workspace,const HCDownOutputPublication* output_publication)
+        {
+            const auto target=DeviceId::cuda(cuda_device_id_);
+            (void)ExplicitGPUStream(gpu_stream_);
+            if(!workspace||workspace->device()!=target||!workspace->isAllocated()||!output||output->isMapped()||
+                input.normalized.native_type()!=TensorType::FP32||output->native_type()!=TensorType::FP32||
+                &input.normalized==output||n!=static_cast<int>(N_)||k!=static_cast<int>(K_)||k<=0||k%32||
+                input.normalized.numel()<static_cast<std::size_t>(k)||output->numel()<static_cast<std::size_t>(n))
+                throw std::invalid_argument("HC-down publication requires original prepared plain ordinary M1 operands");
+            if(output_publication)
+                throw std::logic_error("HC-down reducer-output publication requires its separately installed typed implementation");
+            DeviceNativeQuantisedMatrixDesc weights;
+            if(!inspectPreparedNativeQuantisedMatrixDesc(weights))
+                throw std::logic_error("HC-down publication requires its original already-prepared native source");
+            (void)requireQ8ResidualNativeMatrix(weights,1,n,k);
+            TransferEngine::requireDeviceInput(const_cast<TensorBase*>(&input.normalized),target,gpu_stream_);
+            TransferEngine::requireDeviceOutput(output,target,gpu_stream_);
+            auto* d_A_int8=static_cast<int8_t*>(workspace->getBuffer(GemmWorkspaceBuffers::QUANT_A));
+            auto* blockscales=static_cast<float*>(workspace->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE));
+            if(!d_A_int8||!blockscales||workspace->getBufferSize(GemmWorkspaceBuffers::QUANT_A)<static_cast<std::size_t>(k)||
+                workspace->getBufferSize(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE)<static_cast<std::size_t>(k/32)*sizeof(float))
+                throw std::logic_error("HC-down publication lost its original input scratch banks");
+            if(input.publication) {
+                input.publication->requireRead(input.normalized,*output,workspace,gpu_stream_);
+                if(input.publication->codes()!=d_A_int8||input.publication->scales()!=blockscales)
+                    throw std::logic_error("HC-down publication changed the original input bank binding");
+            } else {
+                if(!cudaQuantGemm_quantizeActivationsBlockwiseScoped(
+                    static_cast<const float*>(input.normalized.gpu_data_ptr()),d_A_int8,blockscales,1,k,cuda_device_id_,gpu_stream_))
+                    return false;
+            }
+            if(!useCanonicalM1Decode())throw std::logic_error("HC-down SingleQ8 requires its original canonical CUDA M1 program");
+            // The existing canonical method consumes the original explicit workspace.
+            // Restore that borrowed host binding on every return/exception path.
+            struct WorkspaceScope {
+                DeviceWorkspaceManager*& slot;DeviceWorkspaceManager* previous;
+                ~WorkspaceScope(){slot=previous;}
+            } scope{workspace_,workspace_};
+            workspace_=workspace;
+            const bool success=multiply_quantized_m1_decode_gemv(d_A_int8,blockscales,
+                static_cast<float*>(output->gpu_data_ptr()),nullptr,n,k,1.f,0.f,gpu_stream_);
+            if(!success)return false;
+            if(input.publication)input.publication->consumeRead();
+            publishCUDATensorWrite(*output,cuda_device_id_,gpu_stream_);
+            return true;
+        }
+
         /** @brief Retain original native source admission while fusing HC input publication. */
         void CUDAQuantisedGemmKernel::multiply_q8_residual_corrected(HCResidualDownInput hc,
                                                                      TensorBase *output, DeviceRowRange rows,
                                                                      int n, int k,
                                                                      DeviceWorkspaceManager *workspace)
         {
+            if(hc.prepublished)throw std::invalid_argument("HC reducer publication requires its original ROCm participant");
             const auto*input=&hc.raw;auto*activated=&hc.activated;
             validateHCResidualDownRows(rows,rows.physicalRows());
             validateQ8ResidualCorrectionGeometry(rows.physicalRows(), n, k);
@@ -1589,6 +1642,15 @@ namespace llaminar2
                 throw std::invalid_argument("HC GPU requires its retained prepared FP32 activation output");
             TransferEngine::requireDeviceOutput(activated,target,stream);
             TransferEngine::requireDeviceOutput(output, target, stream);
+            if(hc.short_k_read) {
+                const auto& read=*hc.short_k_read;
+                if(read.normalized.native_type()!=TensorType::FP32||read.mixed.native_type()!=TensorType::FP32||
+                   read.mixed.isMapped()||rows.physicalRows()!=1||n%4||
+                   read.normalized.numel()<static_cast<std::size_t>(n)||read.mixed.numel()<static_cast<std::size_t>(n/4))
+                    throw std::invalid_argument("HC short-K read requires complete original M1 FP32 branch/mixed operands");
+                TransferEngine::requireDeviceInput(const_cast<TensorBase*>(&read.normalized),target,stream);
+                TransferEngine::requireDeviceOutput(&read.mixed,target,stream);
+            }
             const auto values = static_cast<std::size_t>(rows.physicalRows()) * k,
                        scales = values / 32 * sizeof(float);
             const auto requireBank = [&](const std::string &name, std::size_t bytes) -> void * {
@@ -1598,16 +1660,22 @@ namespace llaminar2
                         "Two-term CUDA Q8 invocation lacks an admitted named activation bank");
                 return pointer;
             };
-            cudaHCResidualDownQ8Projection(
-                {{weights, rows, Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal,
+            const GPUHCResidualDownPublication publication{
+                {weights, rows, Q8ResidualQuantizerPolicy::CUDAFloatScaleNativeReciprocal,
                  static_cast<const float *>(input->gpu_data_ptr()),
                  static_cast<float *>(output->gpu_data_ptr()),
                  static_cast<signed char *>(requireBank(kGPUProjectionPrimaryQ8, values)),
                  static_cast<signed char *>(requireBank(kGPUProjectionResidualQ8, values)),
                  static_cast<float *>(requireBank(kGPUProjectionPrimaryQ8Scales, scales)),
                  static_cast<float *>(requireBank(kGPUProjectionResidualQ8Scales, scales))},
-                 static_cast<float*>(activated->gpu_data_ptr())},
-                stream, impl_->residual_iq_tables);
+                 static_cast<float*>(activated->gpu_data_ptr())};
+            if(hc.short_k_read) {
+                const auto& read=*hc.short_k_read;
+                cudaHCResidualShortKReadQ8Projection({publication,
+                    static_cast<const float*>(read.normalized.gpu_data_ptr()),
+                    static_cast<float*>(read.mixed.gpu_data_ptr())},stream);
+                publishCUDATensorWrite(read.mixed, cuda_device_id_, stream);
+            } else cudaHCResidualDownQ8Projection(publication,stream,impl_->residual_iq_tables);
             publishCUDATensorWrite(*activated, cuda_device_id_, stream);
             publishCUDATensorWrite(*output, cuda_device_id_, stream);
         }

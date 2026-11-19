@@ -17,6 +17,7 @@
 
 #pragma once
 
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "../IComputeStage.h"
 #include "GDNPreparedQKBinding.h"
 #include "../StageParamsBase.h"
@@ -92,6 +93,7 @@ namespace llaminar2
              * reserved for the main inference graph.
              */
             std::string workspace_namespace;
+            LocalGPUExpertKernelPolicy verifier_kernel_policy=LocalGPUExpertKernelPolicy::Generic;
             int verifier_state_capture_rows = 0; ///< Compatibility spelling for speculative state slots.
             int speculative_state_slot_rows = 0; ///< Phase 13.8 temporary state slots for MTP verifier rows.
 
@@ -111,7 +113,11 @@ namespace llaminar2
         bool execute(IDeviceContext *ctx) override;
         /** @return Added immutable activation/program identity; raw retains its original zero. */
         uint64_t graphCaptureVariantSignature() const override
-        { return gdnQKCaptureIdentity(params_.qk_contract); }
+        {
+            const auto identity=gdnQKCaptureIdentity(params_.qk_contract);
+            return params_.verifier_kernel_policy==LocalGPUExpertKernelPolicy::Generic?
+                identity:identity^0x51464e434f4e5601ULL;
+        }
         ComputeStageType type() const override { return ComputeStageType::SHORT_CONV1D; }
         size_t estimatedFlops() const override;
         size_t estimatedMemoryBytes() const override;

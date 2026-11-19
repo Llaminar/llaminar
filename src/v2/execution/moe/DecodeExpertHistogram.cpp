@@ -68,7 +68,7 @@ namespace llaminar2
                     throw std::invalid_argument("Histogram complete ownership omitted a logical expert");
                 if (owner->shard_cohort)
                 {
-                    loads.try_emplace(MoEOverlayRouteTarget::cpuCohort(owner->tier_idx).word(), 0);
+                    loads.try_emplace(MoEOverlayRouteTarget::cohort(owner->tier_idx).word(), 0);
                     for (const auto &member : owner->shard_cohort->participants())
                         fragments.insert(member.participant_id);
                 }
@@ -80,7 +80,7 @@ namespace llaminar2
             {
                 const auto *owner = map.placementFor(layer, expert);
                 const auto target = owner->shard_cohort
-                    ? MoEOverlayRouteTarget::cpuCohort(owner->tier_idx)
+                    ? MoEOverlayRouteTarget::cohort(owner->tier_idx)
                     : MoEOverlayRouteTarget::whole(owner->owner_participant);
                 loads.at(target.word()) += count(expert);
             }

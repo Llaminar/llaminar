@@ -39,7 +39,7 @@ TEST(Test__DecodeExpertHistogram, CompleteTargetOwnershipPublicationReplay)
     for(int width=2;width<=8;++width) {
         SCOPED_TRACE(width);
         auto source=std::make_shared<HistogramJointSource>(width);
-        const auto original=std::shared_ptr<const MoEExpertOwnerMap>(source,source->preparation->cpuJointOwnerMap().get());
+        const auto original=std::shared_ptr<const MoEExpertOwnerMap>(source,source->preparation->jointOwnerMap().get());
         auto plan=source->plan;std::swap(plan.placements[0].routed_expert_tier[0],plan.placements[0].routed_expert_tier[1]);
         struct Candidate {std::shared_ptr<HistogramJointSource> source;MoEExpertOwnerMap map;};
         auto candidate_owner=std::make_shared<Candidate>(Candidate{source,MoEExpertOwnerMap::buildShardTransition(plan,*original,*original)});
@@ -54,7 +54,7 @@ TEST(Test__DecodeExpertHistogram, CompleteTargetOwnershipPublicationReplay)
         EXPECT_THROW(histogram.updateOwnership(makeOwnership(1,2,{0,1,0,1})),std::logic_error);
         auto mixed=cfg;mixed.sockets={DeviceId::cpu()};EXPECT_THROW(DecodeExpertHistogram{mixed},std::invalid_argument);
         auto foreign=std::make_shared<HistogramJointSource>(width==8?2:width+1);
-        EXPECT_THROW(histogram.updatePlacementOwnership(std::shared_ptr<const MoEExpertOwnerMap>(foreign,foreign->preparation->cpuJointOwnerMap().get())),std::invalid_argument);
+        EXPECT_THROW(histogram.updatePlacementOwnership(std::shared_ptr<const MoEExpertOwnerMap>(foreign,foreign->preparation->jointOwnerMap().get())),std::invalid_argument);
         const int routes[]{0,1,1,2,1,3,1,2};std::array<uint64_t,4> scratch{};
         const RoutedExpertHistogramMerge batch{.source=ExpertHistogramSource::PrefillChunk,.layer_idx=7,
             .real_token_count=4,.bucket_token_count=4,.top_k=2,.route_stride=2,.count_window_tokens=true};
@@ -71,7 +71,7 @@ TEST(Test__DecodeExpertHistogram, CompleteTargetOwnershipPublicationReplay)
                 EXPECT_EQ(histogram.layerHistogram(7),counts);
                 const auto loads=histogram.targetLoads(7);ASSERT_EQ(loads.size(),2u);
                 uint64_t total=0;
-                for(const auto& load:loads){total+=load.activations;EXPECT_EQ(load.activations,changed?4u:load.target.isCPUCohort()?7u:1u);}
+                for(const auto& load:loads){total+=load.activations;EXPECT_EQ(load.activations,changed?4u:load.target.isCohort()?7u:1u);}
                 EXPECT_EQ(total,8u);
                 const auto imbalance=histogram.currentPlacementImbalance();ASSERT_TRUE(imbalance.valid);
                 EXPECT_EQ(imbalance.total_activations,8u);

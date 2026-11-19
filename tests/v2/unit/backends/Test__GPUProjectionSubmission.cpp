@@ -7,9 +7,11 @@
  * not physical memory accounting or an alternative production execution path.
  */
 #include "backends/GPUProjectionSubmission.h"
+#include "../../utils/IntentionalFaultProcess.h"
 #include <gtest/gtest.h>
 #include <atomic>
 #include <cstdint>
+#include <csignal>
 #include <future>
 #include <set>
 using namespace llaminar2;
@@ -153,7 +155,13 @@ TEST(GPUProjectionSubmission, IncompleteRetirementIsFatal)
             bool destroyProjectionStream(void *) noexcept override { return false; }
             bool destroyProjectionEvent(void *) noexcept override { return false; }
         };
-        EXPECT_DEATH({ FailedDestroy ops; GPUProjectionResources owner(nullptr, population); owner.prepare(ops); owner.retire(ops); }, "");
+        EXPECT_EXIT({
+            llaminar2::test::disableIntentionalFaultCoreDump();
+            FailedDestroy ops;
+            GPUProjectionResources owner(nullptr, population);
+            owner.prepare(ops);
+            owner.retire(ops);
+        }, ::testing::KilledBySignal(SIGABRT), "");
     }
 }
 

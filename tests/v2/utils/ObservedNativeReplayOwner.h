@@ -10,6 +10,7 @@
 #pragma once
 #include "planning/RankHardwareOwnership.h"
 #include <array>
+#include <algorithm>
 #include <functional>
 #include <optional>
 #include <span>
@@ -24,6 +25,7 @@ namespace llaminar2::test {
         DeviceType family; ///< Original CUDA or ROCm device family.
         size_t degree; ///< Positive number of distinct devices owned by one original rank.
         std::string_view native_isa = {}; ///< Optional exact original ISA before target suffixes.
+        std::span<const std::string_view> pci_addresses = {}; ///< Optional exact PCI cohort in requested coordinate order.
     };
 
 /** @brief An original discovery owner and its authored positive family population. */
@@ -48,15 +50,38 @@ inline std::optional<ObservedNativeReplayOwner> selectObservedNativeReplayOwner(
     for(const auto &entry:families)
         if(!entry.degree || (entry.family!=DeviceType::CUDA && entry.family!=DeviceType::ROCm))
             throw std::invalid_argument("Invalid original replay family request");
+    for(const auto &entry:families) {
+        if(!entry.pci_addresses.empty() && entry.pci_addresses.size()!=entry.degree)
+            throw std::invalid_argument("PCI replay cohort cardinality differs from family degree");
+        for(size_t index=0;index<entry.pci_addresses.size();++index)
+            if(entry.pci_addresses[index].empty() ||
+                std::find(entry.pci_addresses.begin(),entry.pci_addresses.begin()+index,entry.pci_addresses[index])!=entry.pci_addresses.begin()+index)
+                throw std::invalid_argument("PCI replay cohort requires nonempty unique identities");
+    }
     for(const auto &rank:inventory.ranks) {
         std::vector<DeviceId> devices;
         bool complete=true;
         for(const auto &entry:families) {
             std::vector<DeviceId> owned;
-            for(const auto &gpu:rank.gpus)
-                if(gpu.type==entry.family && rankOwnsGPUDevice(rank,gpu) &&
-                    (entry.native_isa.empty() || std::string_view(gpu.native_isa).substr(0,gpu.native_isa.find(':'))==entry.native_isa))
-                    owned.emplace_back(entry.family,gpu.local_device_id);
+            const auto eligible = [&](const auto &gpu) {
+                return gpu.type==entry.family && rankOwnsGPUDevice(rank,gpu) &&
+                    (entry.native_isa.empty() || std::string_view(gpu.native_isa).substr(0,gpu.native_isa.find(':'))==entry.native_isa);
+            };
+            if(entry.pci_addresses.empty()) {
+                for(const auto &gpu:rank.gpus)
+                    if(eligible(gpu)) owned.emplace_back(entry.family,gpu.local_device_id);
+            } else {
+                for(const auto pci:entry.pci_addresses) {
+                    const DeviceInfo *match=nullptr;
+                    for(const auto &gpu:rank.gpus)
+                        if(eligible(gpu) && gpu.pci_bus_address==pci) {
+                            if(match) throw std::invalid_argument("Duplicate observed PCI replay identity");
+                            match=&gpu;
+                        }
+                    if(!match) break;
+                    owned.emplace_back(entry.family,match->local_device_id);
+                }
+            }
             if(owned.size()<entry.degree) {complete=false;break;}
             devices.insert(devices.end(),owned.begin(),owned.begin()+entry.degree);
         }

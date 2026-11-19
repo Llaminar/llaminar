@@ -77,7 +77,7 @@ TEST(CPUJointWholeGPUAuthorityReplay, RuntimeConstructorPeerSwapCommitResetAndRe
         const int experts = 3 * gpus + 3;
         JointPlacementOriginal original(members, gpus, experts, 1, 0, false, backend);
         DecodeExpertHistogram histogram({.num_layers = 1, .num_experts = experts, .top_k = 1,
-            .window_size = 1, .placement_ownership = original.preparation->cpuJointOwnerMap()});
+            .window_size = 1, .placement_ownership = original.preparation->jointOwnerMap()});
         auto config = original.config();
         config.maintenance_mode = MoERebalanceRuntimeMode::Dynamic;
         config.histogram = &histogram;
@@ -169,7 +169,7 @@ TEST(CPUJointWholeGPUAuthorityReplay, PreparedTargetEconomyComposesPromotedPeerM
         for (const auto &coordinate : planner.requiredTargetCoordinates())
             movement->costs.push_back({coordinate, 1, 1});
         DecodeExpertHistogram histogram({.num_layers = 1, .num_experts = 9, .top_k = 1,
-            .window_size = 1, .placement_ownership = original.preparation->cpuJointOwnerMap()});
+            .window_size = 1, .placement_ownership = original.preparation->jointOwnerMap()});
         auto config = original.config();
         config.maintenance_mode = MoERebalanceRuntimeMode::Dynamic;
         config.histogram = &histogram;
@@ -187,7 +187,7 @@ TEST(CPUJointWholeGPUAuthorityReplay, PreparedTargetEconomyComposesPromotedPeerM
         // Each rank/authority owns its own histogram admission lifecycle. The
         // first pre-certified constructor has already activated its histogram.
         DecodeExpertHistogram peer_histogram({.num_layers = 1, .num_experts = 9, .top_k = 1,
-            .window_size = 1, .placement_ownership = original.preparation->cpuJointOwnerMap()});
+            .window_size = 1, .placement_ownership = original.preparation->jointOwnerMap()});
         auto peer_config = config;
         peer_config.histogram = &peer_histogram;
         MoEOverlayResidencyAuthority peer(peer_config);
@@ -204,11 +204,11 @@ TEST(CPUJointWholeGPUAuthorityReplay, PreparedTargetEconomyComposesPromotedPeerM
             if (price.layer == 0) targets.push_back(price.target);
         std::sort(targets.begin(), targets.end(), [](auto a, auto b) { return a.word() < b.word(); });
         ASSERT_EQ(targets.size(), 3u);
-        ASSERT_TRUE(targets.front().isCPUCohort());
+        ASSERT_TRUE(targets.front().isCohort());
         std::vector<int32_t> owners(9);
         for (const auto &row : source->placementOwnerMap().placementsForLayer(0))
         {
-            const auto target = row.shard_cohort ? MoEOverlayRouteTarget::cpuCohort(row.tier_idx)
+            const auto target = row.shard_cohort ? MoEOverlayRouteTarget::cohort(row.tier_idx)
                                                 : MoEOverlayRouteTarget::whole(row.owner_participant);
             const auto found = std::find_if(targets.begin(), targets.end(),
                 [&](auto candidate) { return candidate.word() == target.word(); });
@@ -276,7 +276,7 @@ TEST(CPUJointWholeGPUAuthorityReplay, PreparedTargetEconomyComposesPromotedPeerM
         EXPECT_NE(changed[0].first->expert_id, changed[1].first->expert_id);
         const auto target_word = [](const MoEExpertOwner &row)
         {
-            return (row.shard_cohort ? MoEOverlayRouteTarget::cpuCohort(row.tier_idx)
+            return (row.shard_cohort ? MoEOverlayRouteTarget::cohort(row.tier_idx)
                                      : MoEOverlayRouteTarget::whole(row.owner_participant)).word();
         };
         EXPECT_EQ(target_word(*changed[0].first), target_word(*changed[1].second));

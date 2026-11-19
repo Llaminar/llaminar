@@ -17,10 +17,10 @@ endif()
 if(NOT CMAKE_HIP_ARCHITECTURES)
     message(FATAL_ERROR "HIP device-code targets must be explicit and nonempty")
 endif()
-# RCCL must cover the same selected devices, independent of the configure host.
-if(NOT DEFINED RCCL_GPU_TARGETS)
-    set(RCCL_GPU_TARGETS "${CMAKE_HIP_ARCHITECTURES}" CACHE STRING "RCCL device-code targets")
-endif()
+# Derive the collective target list on every configure. Older build trees
+# cached it separately and kept the old list when the application targets changed.
+unset(RCCL_GPU_TARGETS CACHE)
+set(RCCL_GPU_TARGETS "${CMAKE_HIP_ARCHITECTURES}")
 # Existing production reduction trees require fixed 64-lane arithmetic order
 # on both CDNA and RDNA. Apply that existing-kernel contract to current HIP
 # targets, including standalone tests; RDNA wave32 compilation would silently

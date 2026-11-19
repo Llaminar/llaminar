@@ -60,6 +60,8 @@ namespace llaminar2
     // Forward declarations
     class ITensor; // Device-agnostic tensor interface
     class TensorBase;
+    struct HCDownProjectionInput;
+    class HCDownOutputPublication;
     struct PreparedEmbeddingHandle;
     struct Q8_1Block;
     class IDeviceContext; // For kernel execute() interface
@@ -1925,6 +1927,20 @@ namespace llaminar2
             DeviceRowRange rows,int n,int k,DeviceWorkspaceManager*workspace)
         { (void)input;(void)output;(void)rows;(void)n;(void)k;(void)workspace;
           throw std::logic_error("Selected prepared GEMM does not implement two-term Q8 arithmetic"); }
+
+        /** @brief Execute original ordinary M1 HC-down with independently declared input/output publications.
+         * @param input Original normalized FP32 and optional required norm-produced SingleQ8 view.
+         * @param output Original FP32 down destination.
+         * @param n Exact prepared output width.
+         * @param k Exact prepared native K32 reduction width.
+         * @param workspace Original consumer workspace; no allocation or rebinding is permitted.
+         * @param output_publication Optional independently checked original reducer-output publication.
+         * @return Success of the exact original selected producer/reducer program.
+         * @throws std::logic_error Unless this engine implements the explicit publication operation.
+         */
+        virtual bool multiply_hc_down_projection(const HCDownProjectionInput&,TensorBase*,int,int,
+            DeviceWorkspaceManager*,const HCDownOutputPublication* =nullptr)
+        {throw std::logic_error("Selected prepared GEMM does not implement original HC-down publications");}
 
         /** @brief Original HC /4 SiLU, paired-Q8 publication and native projection.
          * @param input Raw bottleneck and retained activated FP32 destination.

@@ -10,7 +10,7 @@ TEST(TargetMigrationNormalization, CompleteTargetIdentityRejectsSingletonAndMemb
     const auto whole=recordedTargetLedgerDeclaration(1,1,format);
     ASSERT_TRUE(MoEOverlayTargetLayerMigrationMeasurement::geometryMatches(whole.coordinate,*whole.geometry));
     auto alias=whole;
-    alias.coordinate.source_target=MoEOverlayRouteTarget::cpuCohort(0);
+    alias.coordinate.source_target=MoEOverlayRouteTarget::cohort(0);
     EXPECT_FALSE(MoEOverlayTargetLayerMigrationMeasurement::geometryMatches(alias.coordinate,*alias.geometry));
     EXPECT_THROW((MoEOverlayMigrationMeasurementLedger({.required_target_measurements={alias},
         .measurement_identity="singleton-cohort-alias"})),std::invalid_argument);

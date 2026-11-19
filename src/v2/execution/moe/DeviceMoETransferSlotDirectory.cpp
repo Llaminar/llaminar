@@ -150,8 +150,8 @@ namespace llaminar2
             DeviceMoEProjectionSet projections,
             int layer_index = -1)
         {
-            const bool complete = projections == DeviceMoEProjectionSet::CompleteExpert;
-            if (!deviceMoEProjectionSetValid(projections) || specs.size() != (complete ? 3u : 2u))
+            const bool requires_down = deviceMoEProjectionSetHasDown(projections);
+            if (!deviceMoEProjectionSetValid(projections) || specs.size() != (requires_down ? 3u : 2u))
                 throw std::invalid_argument("DeviceMoETransferSlotDirectory requires exactly its movable projection set");
 
             bool has_gate = false;
@@ -179,7 +179,7 @@ namespace llaminar2
                 }
             }
 
-            if (!has_gate || !has_up || has_down != complete)
+            if (!has_gate || !has_up || has_down != requires_down)
                 throw std::invalid_argument("DeviceMoETransferSlotDirectory projection labels differ from its ownership contract");
 
             const bool mixed = std::any_of(specs.begin(), specs.end(), [&](const auto &spec) {
@@ -768,7 +768,11 @@ namespace llaminar2
             entry.participant = participant_id;
             entry.slot_index = slot;
             entry.descriptor.logical_expert_id = -1;
-            entry.descriptor.owner_participant = static_cast<int32_t>(participant_id);
+            // The directory participant owns physical storage. An F shard
+            // never names that participant as a whole logical expert owner.
+            entry.descriptor.owner_participant =
+                format_profile.projection_set == DeviceMoEProjectionSet::IntermediateShard
+                    ? -1 : static_cast<int32_t>(participant_id);
             entry.descriptor.local_slot = static_cast<int32_t>(slot);
             entry.descriptor.flags = toMoEExpertFlags(DeviceMoEExpertFlags::Valid |
                                                       DeviceMoEExpertFlags::TransferSlot);

@@ -1,4 +1,5 @@
-# Explicit raw original-worker diagnostic, never a production certificate.
+# @file V2NativeContextBirthCalibration.cmake
+# @brief Register original-worker measurements and prove the installed SDK provider identity.
 include("${CMAKE_CURRENT_LIST_DIR}/../../../cmake/NativeSourceFingerprint.cmake")
 set(_native_birth_source_inputs "")
 foreach(_native_birth_file
@@ -98,6 +99,21 @@ foreach(_native_source_probe_file IN LISTS _native_source_probe_files)
     string(APPEND _native_source_probe_inputs "${_native_source_probe_file}:${_native_source_probe_hash};")
 endforeach()
 string(SHA256 _native_source_probe_sha "${_native_source_probe_inputs}")
+# Keep the configured SDK directory (which may be relocated through a stable
+# alias) and bind the versioned runtime payload. An installed runtime carries
+# the provider ELF even when the SDK's unversioned linker symlink is absent.
+function(v2_native_source_provider_payload provider output)
+    if(NOT EXISTS "${provider}")
+        message(FATAL_ERROR "Missing configured native source provider: ${provider}")
+    endif()
+    file(REAL_PATH "${provider}" payload)
+    get_filename_component(filename "${payload}" NAME)
+    get_filename_component(directory "${provider}" DIRECTORY)
+    if(NOT EXISTS "${directory}/${filename}")
+        message(FATAL_ERROR "Configured native source provider has no adjacent runtime payload: ${provider}")
+    endif()
+    set(${output} "${directory}/${filename}" PARENT_SCOPE)
+endfunction()
 add_executable(v2_perf_native_context_source_probe EXCLUDE_FROM_ALL integration/backends/NativeContextSourceProbe.cpp)
 if(TARGET v2_perf_native_context_source_probe)
     target_include_directories(v2_perf_native_context_source_probe PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/../../external/vendor")
@@ -116,20 +132,25 @@ if(TARGET v2_perf_native_context_source_probe)
         target_link_libraries(v2_perf_native_context_source_probe PRIVATE -Wl,--end-group)
     endif()
     if(HAVE_CUDA)
+        get_target_property(_native_cublas CUDA::cublas IMPORTED_LOCATION)
+        get_target_property(_native_cublaslt CUDA::cublasLt IMPORTED_LOCATION)
+        v2_native_source_provider_payload("${_native_cublas}" _native_cublas_payload)
+        v2_native_source_provider_payload("${_native_cublaslt}" _native_cublaslt_payload)
         target_sources(v2_perf_native_context_source_probe PRIVATE integration/backends/NativeContextSourceProbeCUDA.cpp)
         target_compile_definitions(v2_perf_native_context_source_probe PRIVATE
-            NATIVE_SOURCE_EXPECTED_CUDA_BLAS="$<TARGET_FILE:CUDA::cublas>"
-            NATIVE_SOURCE_EXPECTED_CUDA_LT="$<TARGET_FILE:CUDA::cublasLt>")
+            NATIVE_SOURCE_EXPECTED_CUDA_BLAS="${_native_cublas_payload}"
+            NATIVE_SOURCE_EXPECTED_CUDA_LT="${_native_cublaslt_payload}")
     endif()
     if(HAVE_ROCM)
+        v2_native_source_provider_payload("${ROCM_PATH}/lib/libhipblaslt.so" _native_hipblaslt_payload)
         target_sources(v2_perf_native_context_source_probe PRIVATE integration/backends/NativeContextSourceProbeROCm.cpp)
         # The observer directly references these providers. The core's private
         # dependency closure does not satisfy the executable's own ELF imports.
         target_link_libraries(v2_perf_native_context_source_probe PRIVATE
             roc::hipblas "${ROCM_PATH}/lib/libhipblaslt.so")
         target_compile_definitions(v2_perf_native_context_source_probe PRIVATE
-            NATIVE_SOURCE_EXPECTED_ROCM_BLAS="$<TARGET_FILE:roc::hipblas>"
-            NATIVE_SOURCE_EXPECTED_ROCM_LT="${ROCM_PATH}/lib/libhipblaslt.so")
+            NATIVE_SOURCE_EXPECTED_ROCM_BLAS="${ROCM_PATH}/lib/$<TARGET_FILE_NAME:roc::hipblas>"
+            NATIVE_SOURCE_EXPECTED_ROCM_LT="${_native_hipblaslt_payload}")
     endif()
 endif()
 foreach(_native_source_backend IN ITEMS CUDA ROCm)

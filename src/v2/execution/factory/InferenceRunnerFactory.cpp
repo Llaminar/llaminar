@@ -22,8 +22,11 @@
  * of inheriting another stage's retained tensor-parallel assignment.
  */
 
+#include "execution/moe/MoEIntermediateShardStaticGraphAdmission.h"
 #include "execution/moe/MoEGraphOwnerProjection.h"
 #include "InferenceRunnerFactory.h"
+#include "GraphWeightBindingPreparation.h"
+#include "GraphExpertSourceAdmission.h"
 #include "ImmutableRowTableParticipantRole.h"
 #include "execution/moe/MoEOverlayRankBatchTransport.h"
 #include "DenseDecodeWeightSelection.h"
@@ -2446,13 +2449,13 @@ namespace llaminar2
     }
 
     /**
-     * @brief Configure ordinary static expert IDs or authenticate original CPU fragment ownership.
+     * @brief Configure static expert IDs or authenticate original CPU/GPU source-fragment ownership.
      * @param graph_config Graph after its exact dense TP assignment and overlay binding.
      * @param config Original runner policy, including the immutable pipeline scope.
      * @param device Execution device selected for this graph.
      * @return True for a supported assignment. False for incomplete or unsupported tensor sharding.
      */
-    static bool configureStaticMoEExpertRange(GraphConfig &graph_config,
+    bool configureStaticMoEExpertRange(GraphConfig &graph_config,
         const InferenceRunnerConfig &config, DeviceId device)
     {
         graph_config.moe.local_expert_start = 0;
@@ -2465,6 +2468,43 @@ namespace llaminar2
 
         if (graph_config.moe.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded)
         {
+            if (device.is_gpu())
+            {
+                try
+                {
+                    const auto &authority = graph_config.moe.expert_overlay_residency_authority;
+                    const auto &residency = graph_config.moe.expert_overlay_participant_residency;
+                    const auto snapshot = authority ? authority->snapshot() : nullptr;
+                    const auto &plan = graph_config.moe.routed_expert_plan;
+                    const auto *local = dynamic_cast<const ILocalTPContext *>(graph_config.tp_ctx);
+                    const auto &world = graph_config.moe.overlay_mpi_ctx;
+                    if (!snapshot || !snapshot->valid() || !residency || !plan || !local || !world ||
+                        graph_config.moe.rebalance_config.mode != MoERebalanceRuntimeMode::Off ||
+                        snapshot->ownershipKind() != MoEOverlayResidencyOwnershipKind::JointFragments ||
+                        snapshot->originalProjectionPreparation() != residency->projectionPreparation() ||
+                        &snapshot->originalOwnerMap() != &residency->initialOwnerMap() ||
+                        snapshot->firstModelLayer() != graph_config.pp_layer_offset)
+                        throw std::invalid_argument("Static GPU F-shard factory lost original source preparation, registry, stage scope, or rebalance-Off policy");
+                    // Residency freezes a value copy of the authored plan.
+                    // Source identity is the shared preparation and owner map
+                    // above; validate the graph declaration against those exact
+                    // owners below instead of comparing unrelated plan addresses.
+                    const auto &participant = requireOriginalStaticGPUIntermediateShardGraph(*plan,
+                        residency->initialOwnerMap(), *local, device, graph_config.tp_device_idx, world->rank(),
+                        graph_config.pp_layer_offset, plan->placementLayerCapacity(graph_config.n_layers),
+                        graph_config.moe.num_experts);
+                    graph_config.moe.owner_participant_index = participant.domain_participant_index;
+                    graph_config.moe.owner_participant_count = local->degree();
+                    // Full expert IDs are family-owned fragments. A whole-expert
+                    // ordinal range would erase the remaining F intervals.
+                    return true;
+                }
+                catch (const std::exception &error)
+                {
+                    LOG_ERROR("[InferenceRunner] Static GPU tensor-sharded graph admission failed: " << error.what());
+                    return false;
+                }
+            }
             const auto& original = graph_config.moe.expert_overlay_cpu_joint_context;
             const auto& parent = graph_config.moe.overlay_mpi_ctx;
             const auto* native = dynamic_cast<const GlobalTPContext*>(original.get());
@@ -2483,7 +2523,7 @@ namespace llaminar2
             const int index = original->myIndex();
             const auto& ranks = original->worldRanks();
             if (!snapshot || !snapshot->valid() || !residency ||
-                snapshot->ownershipKind() != MoEOverlayResidencyOwnershipKind::CPUJointFragments ||
+                snapshot->ownershipKind() != MoEOverlayResidencyOwnershipKind::JointFragments ||
                 snapshot->originalProjectionPreparation() != residency->projectionPreparation() ||
                 &snapshot->originalOwnerMap() != &residency->initialOwnerMap() ||
                 snapshot->firstModelLayer() != config.pp_stage_config->first_layer ||
@@ -3708,12 +3748,17 @@ namespace llaminar2
             config.moe_overlay_cpu_preparation->afterLocalPreparation();
         }
         if (const auto &residency = graph_config.moe.expert_overlay_participant_residency;
-            residency && (!config.pp_stage_config || original_cpu_joint_stage))
+            residency && (!config.pp_stage_config || original_cpu_joint_stage ||
+                (device.is_gpu() && graph_config.moe.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded)))
         {
             std::string error;
-            if (!residency->admitInitialCPUJointGraphSources(
-                    std::dynamic_pointer_cast<ModelContext>(model_ctx), &error))
-                throw std::runtime_error("CPU joint cold graph admission failed: " + error);
+            const auto runtime = graph_config.moe.expert_overlay_runtime_plan;
+            if (!runtime)
+                throw std::logic_error("Original joint cold graph admission requires its preparation runtime");
+            if (!admitGraphLocalJointSources(*residency,
+                    std::dynamic_pointer_cast<ModelContext>(model_ctx), *runtime,
+                    graphOverlayPreparationScope(*runtime, graph_config, device), &error))
+                throw std::runtime_error("Original CPU/GPU joint cold graph admission failed: " + error);
         }
 
         prepareParticipantImmutableRowTable(model_ctx, graph_config);
@@ -3925,7 +3970,7 @@ namespace llaminar2
         {
             ScopedWeightLoadTimer load_timer(WeightLoadPhase::TENSOR_LOAD);
             ScopedWeightLoadDetailTimer materialize_timer("weights.binding_materialization");
-            return weight_mgr->materialize(weight_plan);
+            return projectGraphExpertSourceBindings(weight_mgr->materialize(weight_plan));
         }();
         auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
         auto legacy_weights = toLegacyModelWeights(weight_bindings);
@@ -4047,7 +4092,7 @@ namespace llaminar2
                 });
             if (!installPreparedWeightStoreForPlan(*weight_mgr, config, decode_weight_plan, "[InferenceRunner] decode replicated dense"))
                 return false;
-            auto decode_frozen_weights = weight_mgr->materialize(decode_weight_plan);
+            auto decode_frozen_weights = projectGraphExpertSourceBindings(weight_mgr->materialize(decode_weight_plan));
             if (!weight_mgr->prepareWeightsForDevice(
                     decode_frozen_weights,
                     device,
@@ -4492,7 +4537,7 @@ namespace llaminar2
                 config.prepared_weight_admission);
             if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] PP stage"))
                 return nullptr;
-            auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
+            auto frozen_weights = projectGraphExpertSourceBindings(concrete_weight_mgr->materialize(weight_plan));
             auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
             auto legacy_weights = toLegacyModelWeights(weight_bindings);
 
@@ -4619,7 +4664,7 @@ namespace llaminar2
                     return nullptr;
                 }
 
-                auto decode_frozen_weights = concrete_weight_mgr->materialize(decode_weight_plan);
+                auto decode_frozen_weights = projectGraphExpertSourceBindings(concrete_weight_mgr->materialize(decode_weight_plan));
                 if (!concrete_weight_mgr->prepareWeightsForDevice(
                         decode_frozen_weights,
                         device,
@@ -4716,7 +4761,7 @@ namespace llaminar2
                     config.prepared_weight_admission);
                 if (!installPreparedWeightStoreForPlan(*concrete_weight_mgr, config, weight_plan, "[InferenceRunner] LocalTP"))
                     return nullptr;
-                auto frozen_weights = concrete_weight_mgr->materialize(weight_plan);
+                auto frozen_weights = projectGraphExpertSourceBindings(concrete_weight_mgr->materialize(weight_plan));
                 auto weight_bindings = makeModelWeightBindings(frozen_weights, device);
                 auto legacy_weights = toLegacyModelWeights(weight_bindings);
 
@@ -4848,7 +4893,7 @@ namespace llaminar2
                             return nullptr;
                         }
 
-                        auto decode_frozen_weights = concrete_weight_mgr->materialize(decode_weight_plan);
+                        auto decode_frozen_weights = projectGraphExpertSourceBindings(concrete_weight_mgr->materialize(decode_weight_plan));
                         if (!concrete_weight_mgr->prepareWeightsForDevice(
                                 decode_frozen_weights,
                                 device,
@@ -4952,12 +4997,17 @@ namespace llaminar2
             config.moe_overlay_cpu_preparation->afterLocalPreparation();
         }
         if (const auto &residency = graph_config.moe.expert_overlay_participant_residency;
-            residency && (!config.pp_stage_config || original_cpu_joint_stage))
+            residency && (!config.pp_stage_config || original_cpu_joint_stage ||
+                (device.is_gpu() && graph_config.moe.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded)))
         {
             std::string error;
-            if (!residency->admitInitialCPUJointGraphSources(
-                    std::dynamic_pointer_cast<ModelContext>(model_ctx), &error))
-                throw std::runtime_error("CPU joint cold graph admission failed: " + error);
+            const auto runtime = graph_config.moe.expert_overlay_runtime_plan;
+            if (!runtime)
+                throw std::logic_error("Original joint cold graph admission requires its preparation runtime");
+            if (!admitGraphLocalJointSources(*residency,
+                    std::dynamic_pointer_cast<ModelContext>(model_ctx), *runtime,
+                    graphOverlayPreparationScope(*runtime, graph_config, device), &error))
+                throw std::runtime_error("Original CPU/GPU joint cold graph admission failed: " + error);
         }
 
         prepareParticipantImmutableRowTable(model_ctx, graph_config);

@@ -2,8 +2,9 @@
  * @file ImmutableRowTableAdmissionWire.cpp
  * @brief Authenticate bounded setup-only table candidate metadata with no payload reads.
  *
- * Version18 adds each allocator physical backing; Version17 carries explicit independent
- * local-hot intent; older frames cannot silently
+ * Version20 binds allocator physical backing alongside the common arena assignment
+ * and GPU intermediate tiling. Earlier frames cannot restore that combined geometry.
+ * Version17 introduced independent local-hot intent and cannot silently
  * supply SSD defaults. Predictor head ownership remains beside resolved arithmetic and
  * the original attention schedule. Unknown values reject before narrowing; reloadable debug
  * state is never consulted when restoring an admitted remote provision.
@@ -13,6 +14,8 @@
 #include "ImmutableRowTableAdmissionWire.h"
 #include "MemoryPlanner.h"
 #include <limits>
+#include <bit>
+#include <cmath>
 #include <array>
 #include <stdexcept>
 #include <type_traits>
@@ -20,7 +23,7 @@ namespace llaminar2
 {
 namespace
 {
-    constexpr std::uint32_t Magic = 0x4e475231u, Version = 18; // 18 adds allocator physical backing
+    constexpr std::uint32_t Magic = 0x4e475231u, Version = 20;
     /** @brief Exact typed QFN layout words carried by this schema, without native padding. */
     constexpr std::array QfnLayoutWords{
         &Qwen4ExpMemoryGeometry::residual_width,
@@ -299,10 +302,33 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
                                         static_cast<int>(a.mtp_terminal_logits_layout),
                                         static_cast<int>(a.attention_phase_schedule),
                                         static_cast<int>(a.attention_arithmetic),
-                                        static_cast<int>(a.mtp_shifted_kv_head_layout)})
+                                        static_cast<int>(a.mtp_shifted_kv_head_layout),
+                                        static_cast<int>(a.gpu_expert_intermediate_tiling)})
                 {
                     if(value<0)throw std::invalid_argument("Ngram common activation geometry must be nonnegative");
                     append(out,static_cast<std::uint32_t>(value));
+                }
+                // The tier request must reprice the same original common arena after
+                // transport. Preserve the original shared FFN interval and its device.
+                if(a.shard_index<0 || a.shard_index>=a.total_shards)
+                    throw std::invalid_argument("Ngram wire common arena shard index is invalid");
+                append(out,std::uint32_t(a.shard_index));
+                append(out,std::uint32_t(a.shared_tp_assignment.has_value()));
+                if(a.shared_tp_assignment)
+                {
+                    const auto& assignment=*a.shared_tp_assignment;
+                    if(assignment.device!=c.resource.device ||
+                       !std::isfinite(assignment.work_fraction) ||
+                       assignment.work_fraction<0.0f || assignment.work_fraction>1.0f)
+                        throw std::invalid_argument("Ngram wire activation assignment has a foreign owner");
+                    for(const int value:{assignment.head_start,assignment.head_count,
+                        assignment.kv_head_start,assignment.kv_head_count,assignment.d_ff_start,
+                        assignment.d_ff_count,assignment.vocab_start,assignment.vocab_count,assignment.local_rank})
+                    {
+                        if(value<0)throw std::invalid_argument("Ngram wire activation assignment has a negative coordinate");
+                        append(out,std::uint32_t(value));
+                    }
+                    append(out,std::bit_cast<std::uint32_t>(assignment.work_fraction));
                 }
                 hashIdentity(out,c.host_service_resource_identity);hashIdentity(out,c.host_service_live_identity);
                 const bool service=!c.host_service_resource_identity.empty()||!c.host_service_live_identity.empty();
@@ -492,7 +518,7 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
                     kvStart > static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
                     assignedKVHeads > static_cast<std::uint32_t>(std::numeric_limits<int>::max()))
                     throw std::invalid_argument("Ngram wire head coordinate exceeds native range");
-                int common[10];
+                int common[11];
                 for(int &field:common)
                 {
                     const auto value=in.read<std::uint32_t>();
@@ -502,7 +528,8 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
                 }
                 if(common[4]>1 || common[5]>static_cast<int>(RoutedExpertComputePolicy::GateUpOwnedDownColumns) ||
                     common[6]>static_cast<int>(MTPTerminalLogitsLayout::VocabularyShardPerParticipant) ||
-                    common[9]>static_cast<int>(MTPShiftedKVHeadLayout::FullModelPerParticipant))
+                    common[9]>static_cast<int>(MTPShiftedKVHeadLayout::FullModelPerParticipant) ||
+                    common[10]>static_cast<int>(GPUExpertIntermediateTiling::BalancedNativeK32))
                     throw std::invalid_argument("Ngram wire common activation policy is invalid");
                 if(common[7]!=static_cast<int>(qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform) &&
                    common[7]!=static_cast<int>(qwen4exp::QwenSparseAttentionPhaseSchedule::Prefill8Decode33))
@@ -524,6 +551,30 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
                      arithmetic != qwen4exp::QwenSparseAttentionArithmetic::TileFP16WithFP32Totals))
                     throw std::invalid_argument(
                         "Ngram wire QSA policy is unresolved or conflicting");
+                const auto shard=in.read<std::uint32_t>();
+                const auto assigned=in.read<std::uint32_t>();
+                if(shard>=std::uint32_t(fields[6]) || assigned>1)
+                    throw std::invalid_argument("Ngram wire common activation owner is invalid");
+                std::optional<DeviceShardingAssignment> original;
+                if(assigned)
+                {
+                    original.emplace();
+                    auto& assignment=*original;
+                    assignment.device=r.device;
+                    for(auto* field:{&assignment.head_start,&assignment.head_count,&assignment.kv_head_start,
+                        &assignment.kv_head_count,&assignment.d_ff_start,&assignment.d_ff_count,&assignment.vocab_start,
+                        &assignment.vocab_count,&assignment.local_rank})
+                    {
+                        const auto value=in.read<std::uint32_t>();
+                        if(value>std::uint32_t(std::numeric_limits<int>::max()))
+                            throw std::invalid_argument("Ngram wire activation assignment exceeds native coordinates");
+                        *field=static_cast<int>(value);
+                    }
+                    assignment.work_fraction=std::bit_cast<float>(in.read<std::uint32_t>());
+                    if(!std::isfinite(assignment.work_fraction) ||
+                       assignment.work_fraction<0.0f || assignment.work_fraction>1.0f)
+                        throw std::invalid_argument("Ngram wire activation assignment fraction is invalid");
+                }
                 ActivationGraphMemoryGeometry activation{
                     .batch_size = fields[1],
                     .resident_graph_rows = fields[0],
@@ -536,7 +587,10 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
                     .first_layer = fields[4],
                     .last_layer = fields[5],
                     .total_shards = fields[6],
+                    .shard_index = static_cast<int>(shard),
+                    .shared_tp_assignment = original,
                     .routed_compute_policy = static_cast<RoutedExpertComputePolicy>(common[5]),
+                    .gpu_expert_intermediate_tiling = static_cast<GPUExpertIntermediateTiling>(common[10]),
                     .mtp_target_query_rows = fields[7],
                     .retained_mtp_candidate_rows = fields[8],
                     .mtp_terminal_logits_layout = static_cast<MTPTerminalLogitsLayout>(common[6]),

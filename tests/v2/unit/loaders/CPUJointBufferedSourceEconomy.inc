@@ -87,9 +87,9 @@ TEST(CPUJointBufferedSource, RealisticStridedReadUsesBufferedSyscallsAndExactByt
     const auto runtime=resolveMoEExpertOverlayRuntimePlan(std::make_shared<const MoERoutedExpertPlacementPlan>(plan),
         {.current_world_rank=0,.validate_mvp_root_reachability=false});
     const auto preparation=MoEExpertOverlayPreparationPlan::build(*runtime,loader);
-    std::shared_ptr<const CPUExpertShardSourceSelection> selected;
-    for(const auto& request:preparation.requests())if(request.cpu_joint_source &&
-        request.cpu_joint_source->participant().world_rank==0) {selected=request.cpu_joint_source;break;}
+    std::shared_ptr<const ExpertShardSourceSelection> selected;
+    for(const auto& request:preparation.requests())if(request.joint_source &&
+        request.joint_source->participant().world_rank==0) {selected=request.joint_source;break;}
     ASSERT_TRUE(selected);ASSERT_EQ(selected->expertIds().front(),1);
     const size_t row_bytes=file.sourceRowBytes()/2, payload_bytes=row_bytes*2560;
     const auto placement=CPUStoragePlacement::onNode(selected->participant().address.numa_node);

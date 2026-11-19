@@ -2382,14 +2382,12 @@ namespace llaminar2::test
 #endif
 
     /**
-     * @brief Check actual production order, original cutpoints and both CPU placements.
+     * @brief Check shared-FFN ordering and collective symmetry on both physical TP participants.
      * @param cuda Select CUDA endpoints when true, otherwise ROCm endpoints.
      */
-    void assertPrefillCPUTicketPrecedesSharedFFN(bool cuda)
+    void assertLocalTPPrefillCPUTicketPrecedesSharedFFN(bool cuda)
     {
         const auto endpoint = [&](int participant) { return cuda ? DeviceId::cuda(participant) : DeviceId::rocm(participant); };
-        assertCanonicalTicketGraphLowering(endpoint(0), CpuTicketPlacement::RankLocal,
-            CanonicalTicketContinuation::SingleGPU, CanonicalTicketSharedBranch::Present);
         for (const auto policy : {CanonicalTicketContinuation::NativeLocalTP,
                                  CanonicalTicketContinuation::MappedLocalTP,
                                  CanonicalTicketContinuation::MixedLocalTP})
@@ -2412,14 +2410,28 @@ namespace llaminar2::test
     /** @test Existing CUDA CPU-ticket publication precedes shared FFN only for ordinary prefill. */
     TEST(Test__Qwen35MoEGraphNativeProductionLowering, PrefillCPUTicketPrecedesSharedFFNCUDA)
     {
-        assertPrefillCPUTicketPrecedesSharedFFN(true);
+        assertCanonicalTicketGraphLowering(DeviceId::cuda(0), CpuTicketPlacement::RankLocal,
+            CanonicalTicketContinuation::SingleGPU, CanonicalTicketSharedBranch::Present);
+    }
+
+    /** @test Both CUDA TP participants preserve collective order across early CPU ticket publication. */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering, LocalTPPrefillCPUTicketPrecedesSharedFFNCUDA)
+    {
+        assertLocalTPPrefillCPUTicketPrecedesSharedFFN(true);
     }
 #endif
 #ifdef HAVE_ROCM
     /** @test Existing ROCm CPU-ticket publication precedes shared FFN only for ordinary prefill. */
     TEST(Test__Qwen35MoEGraphNativeProductionLowering, PrefillCPUTicketPrecedesSharedFFNROCm)
     {
-        assertPrefillCPUTicketPrecedesSharedFFN(false);
+        assertCanonicalTicketGraphLowering(DeviceId::rocm(0), CpuTicketPlacement::RankLocal,
+            CanonicalTicketContinuation::SingleGPU, CanonicalTicketSharedBranch::Present);
+    }
+
+    /** @test Both ROCm TP participants preserve collective order across early CPU ticket publication. */
+    TEST(Test__Qwen35MoEGraphNativeProductionLowering, LocalTPPrefillCPUTicketPrecedesSharedFFNROCm)
+    {
+        assertLocalTPPrefillCPUTicketPrecedesSharedFFN(false);
     }
 #endif
 
@@ -2473,9 +2485,9 @@ namespace llaminar2::test
             node_ids.push_back(int(found-nodes.begin()));}
         const auto controller_topology=std::make_shared<const MoEOverlayDeviceControllerTopology>(
             resolveMoEOverlayDeviceControllerTopology(*plan,owner_map,{.world_rank_node_ids=node_ids}));
-        std::vector<uint32_t> initial_owner_participants;
+        std::vector<MoEOverlayRouteTarget> initial_route_targets;
         const auto initial_ownership=owner_map.layeredOwnership(1,kNumExperts);
-        for(int expert=0;expert<kNumExperts;++expert)initial_owner_participants.push_back(initial_ownership.owner(0,expert));
+        for(int expert=0;expert<kNumExperts;++expert)initial_route_targets.push_back(MoEOverlayRouteTarget::whole(initial_ownership.owner(0,expert)));
         auto model_ctx=ModelContext::createForTesting("test.gguf",nullptr,1,true);
         if(!model_ctx || !model_ctx->concreteWeightManager())throw std::runtime_error("Original lowering model directory is absent");
         const auto graph_family=resolveMoEOverlayInferenceGraphFamilyIdentity(model_ctx->concreteLoader(),
@@ -2496,7 +2508,7 @@ namespace llaminar2::test
         admission.checkpoint([&]{root_controller_fabric=std::make_shared<MoEOverlayNodeLocalDeviceControllerFabric>(
             MoEOverlayNodeLocalDeviceControllerFabric::Config{.mpi_ctx=overlay_mpi,.topology=controller_topology,
                 .num_layers=1,.num_experts=kNumExperts,.command_capacity=4,.initial_durable_epoch=1,
-                .payload_bytes_per_layer={4096},.initial_owner_participants=initial_owner_participants,
+                .payload_bytes_per_layer={4096},.initial_route_targets=initial_route_targets,
                 .minimum_window_activations=1,.maximum_cycles_per_wave=1});});
         admission.checkpoint([&]{if(!admission.source())return;
         model_ctx->concreteWeightManager()->installPhysicalMemoryAuthority(admission.memory());

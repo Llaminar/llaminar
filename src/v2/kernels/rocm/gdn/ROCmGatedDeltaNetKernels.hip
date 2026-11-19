@@ -47,6 +47,7 @@
 #include "kernels/gdn/GDNDenseCompactSnapshots.h"
 #include "kernels/gdn/GDNPreparedQK.h"
 #include "kernels/gdn/GDNPlanarRecurrence.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
 
 namespace {
 
@@ -2129,6 +2130,60 @@ __global__ void rocm_short_conv1d_small_m_kernel(
     }
 }
 
+/** @brief Exact QFN TP4 verifier convolution shape and borrowed producer/state owners. */
+inline constexpr int convChannels = 2560;
+inline constexpr int convTaps = 4;
+inline constexpr int convHistory = convTaps - 1;
+
+/** @brief Borrow complete existing GDN QKV, state, and output planes. */
+struct ConvBindings
+{
+    const float* input;
+    const float* weight;
+    const float* initial;
+    const int* liveRows;
+    float* output;
+    float* snapshots;
+    int snapshotStride;
+    int capacity;
+};
+
+/** @brief One wave64 CTA spans contiguous channels and reuses every tap across live rows. */
+__global__ __launch_bounds__(64) void qfn_short_conv1d_k4_verifier(ConvBindings args)
+{
+    const int channel = int(blockIdx.x) * 64 + int(threadIdx.x);
+    const int published = __builtin_amdgcn_readfirstlane(*args.liveRows);
+    const int live = published < 1 ? 1 : (published > args.capacity ? args.capacity : published);
+    const auto* weight = args.weight + channel * convTaps;
+    const float w0 = weight[0], w1 = weight[1], w2 = weight[2], w3 = weight[3];
+    const auto* initial = args.initial + channel * convHistory;
+    float h0 = initial[0], h1 = initial[1], h2 = initial[2];
+
+    // Each register is the exact original source for the corresponding tap.
+    // Shift their ownership after the multiply chain and publish immutable
+    // per-prefix history directly from those same values.
+    for (int row = 0; row < live; ++row)
+    {
+        const float input = args.input[row * convChannels + channel];
+        float sum = 0.0f;
+        sum += h0 * w0;
+        sum += h1 * w1;
+        sum += h2 * w2;
+        sum += input * w3;
+        args.output[row * convChannels + channel] = sum / (1.0f + expf(-sum));
+
+        auto* snapshot = args.snapshots + row * args.snapshotStride + channel * convHistory;
+        snapshot[0] = h1;
+        snapshot[1] = h2;
+        snapshot[2] = input;
+        h0 = h1;
+        h1 = h2;
+        h2 = input;
+    }
+    for (int row = live; row < args.capacity; ++row)
+        args.output[row * convChannels + channel] = 0.0f;
+}
+
 __global__ void rocm_short_conv1d_state_update_kernel(
     const float *__restrict__ input,
     const float *initial_conv_state,
@@ -3830,7 +3885,7 @@ bool rocmGDN_short_conv1d(
     return true;
 }
 
-bool rocmGDN_short_conv1d_effective(
+bool rocmGDN_short_conv1d_effective_with_policy(
     const float *input, const float *weight, const float *bias,
     float *output,
     const float *initial_conv_state,
@@ -3841,7 +3896,7 @@ bool rocmGDN_short_conv1d_effective(
     float *state_snapshots,
     int snapshot_stride_floats,
     int max_snapshot_rows,
-    int device_idx, void *stream)
+    int device_idx, void *stream, bool qualified_default)
 {
     llaminar2::HipDeviceGuard::setDevice(device_idx);
 
@@ -3850,6 +3905,29 @@ bool rocmGDN_short_conv1d_effective(
         state_snapshots != nullptr &&
         snapshot_stride_floats >= required_snapshot_stride &&
         max_snapshot_rows >= seq_len;
+
+    // This leaf borrows an already initialized history and a published device count.
+    // The original optional bindings have different source ownership and use the canonical entry.
+    if (complete_verifier_capture && seq_len >= 2 && seq_len <= 8 &&
+        channels == convChannels && kernel_size == convTaps &&
+        !bias && apply_silu && initial_conv_state && device_effective_seq_len &&
+        llaminar2::qfnGroupedGDNConvK4Experiment(qualified_default) &&
+        [&] {
+            const auto& hardware = llaminar2::rocmHardwareMetadata().at(device_idx);
+            return hardware.native_wave_width == 64 && hardware.compute_units == 60 &&
+                (hardware.isa_target == "gfx906" || hardware.isa_target.starts_with("gfx906:"));
+        }())
+    {
+        if (reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+            !input || !weight || !output)
+            return false;
+        constexpr int threads = 64;
+        hipLaunchKernelGGL(qfn_short_conv1d_k4_verifier, dim3(convChannels / threads),
+            dim3(threads), 0, static_cast<hipStream_t>(stream),
+            (ConvBindings{input, weight, initial_conv_state, device_effective_seq_len,
+                output, state_snapshots, snapshot_stride_floats, seq_len}));
+        return hipGetLastError() == hipSuccess;
+    }
 
     if (complete_verifier_capture) {
         int threads = 256;
@@ -3909,6 +3987,24 @@ bool rocmGDN_short_conv1d_effective(
         return false;
     }
     return true;
+}
+
+bool rocmGDN_short_conv1d_effective(
+    const float *input, const float *weight, const float *bias,
+    float *output,
+    const float *initial_conv_state,
+    float *updated_conv_state,
+    int seq_len, int channels, int kernel_size,
+    bool apply_silu,
+    const int *device_effective_seq_len,
+    float *state_snapshots,
+    int snapshot_stride_floats,
+    int max_snapshot_rows,
+    int device_idx, void *stream)
+{
+    return rocmGDN_short_conv1d_effective_with_policy(input,weight,bias,output,initial_conv_state,
+        updated_conv_state,seq_len,channels,kernel_size,apply_silu,device_effective_seq_len,
+        state_snapshots,snapshot_stride_floats,max_snapshot_rows,device_idx,stream,false);
 }
 
 /**

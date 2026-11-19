@@ -80,11 +80,13 @@ namespace llaminar2::test {
      * @param degree Positive participant count.
      * @param replay Fixture body on the actual owning rank.
      * @param native_isa Optional exact native ISA before target feature suffixes.
+     * @param pci_addresses Optional exact PCI cohort, in replay coordinate order; borrowed during selection only.
      */
     template<class Replay>
-    void originalRankLocalReplay(DeviceType family, size_t degree, Replay replay, std::string_view native_isa = {})
+    void originalRankLocalReplay(DeviceType family, size_t degree, Replay replay, std::string_view native_isa = {},
+        std::span<const std::string_view> pci_addresses = {})
     {
-        const std::array families{NativeReplayFamily{family, degree, native_isa}};
+        const std::array families{NativeReplayFamily{family, degree, native_isa, pci_addresses}};
         originalRankLocalReplay(std::span<const NativeReplayFamily>(families), std::move(replay));
     }
 

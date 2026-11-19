@@ -183,7 +183,7 @@ namespace llaminar2
 
         /**
          * @brief Resolve and retain the exact selected RCCL dependency.
-         * @param library_path Explicit nonempty diagnostic dependency, or null for
+         * @param library_path Explicit absolute diagnostic dependency, or null for
          *        CMake's selected RCCL_LIBRARY. No alternate path is attempted.
          * @return True for the same retained path or successful required-symbol
          *         resolution; false for invalid/different selection or load failure.
@@ -207,6 +207,13 @@ namespace llaminar2
             {
                 g_last_error = library_path ? "Explicit RCCL library path is empty" :
                     "No RCCL library configured; set RCCL_LIBRARY when configuring the build";
+                LOG_ERROR("RCCL Dynamic Loader: " << g_last_error);
+                return false;
+            }
+
+            if (*path != '/')
+            {
+                g_last_error = "RCCL library path must be absolute: '" + std::string(path) + "'";
                 LOG_ERROR("RCCL Dynamic Loader: " << g_last_error);
                 return false;
             }

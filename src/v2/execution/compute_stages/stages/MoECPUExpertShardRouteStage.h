@@ -18,7 +18,7 @@
 #include <optional>
 #include <memory>
 namespace llaminar2 {
-class CPUExpertShardSourceSelection;
+class ExpertShardSourceSelection;
 struct MoEOverlaySparseRows;
 struct MoEOverlayReturnRows;
 class MoEOverlayActivationEpochProtocol;
@@ -80,7 +80,7 @@ public:
     enum class OriginalReturnPublication {EndpointProtocol,CanonicalHostRows};
     /** @brief Immutable bindings; mutable spans borrow original graph/PMA arena roots. */
     struct Params {
-        std::shared_ptr<const CPUExpertShardSourceSelection> original_source;
+        std::shared_ptr<const ExpertShardSourceSelection> original_source;
         IGlobalTPContext *tp=nullptr;
         TensorBase *packed_records=nullptr;
         TensorBase *route_indices=nullptr;
@@ -95,7 +95,7 @@ public:
         float *original_preweighted_routes=nullptr; ///< Root-only original mapped canonical return bank.
         size_t original_return_route_capacity=0;
         const MoEOverlaySparseRows *original_sparse_routes=nullptr; ///< Original consumed sparse packet; excludes dense router tensors.
-        std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::CPUJointLayer> original_prepared_layer; ///< Closed original model source publication, mandatory for channel completion.
+        std::shared_ptr<const MoEOverlayParticipantResidencyRegistry::JointLayer> original_prepared_layer; ///< Closed original model source publication, mandatory for channel completion.
         std::shared_ptr<IGlobalTPContext> original_tp_owner; ///< Required retained native owner for channel-bound completion.
         std::shared_ptr<MoEOverlayCanonicalRouteReturnTicketStorage> original_canonical_ticket; ///< Sole original local ticket publication authority after the explicit fragment gather.
         DeviceId original_continuation_device=DeviceId::invalid(); ///< Exact GPU ticket owner or explicit CPU canonical-row owner; never inferred from the fragment member.

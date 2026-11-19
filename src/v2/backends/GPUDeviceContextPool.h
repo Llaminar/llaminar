@@ -28,6 +28,7 @@
 #include "DeviceId.h"
 #include "NativeContextRetirement.h"
 #include "IWorkerGPUContext.h"
+#include <optional>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -224,6 +225,13 @@ namespace llaminar2
         PreparedGPUContextUsePermit retainPreparedContext(std::shared_ptr<PreparedGPUContextBirth>);
         /** @brief Borrow original existing worker provenance without discovery, registration, creation or PMA accounting. */
         GPUContextProvenance retainExistingContextProvenance(DeviceId);
+        /** @brief Inspect and borrow the exact live worker without materializing one.
+         * @param device Exact process-local native device.
+         * @return Existing worker provenance, or nullopt for an untouched device.
+         * @throws std::logic_error When the original worker is retiring or its
+         * generation is inconsistent.
+         */
+        std::optional<GPUContextProvenance> findExistingContextProvenance(DeviceId);
 
         /** @brief Borrow exact already-published source worker; never discover, register or create a context. */
         PreparedGPUContextUsePermit retainExistingPreparedContext(DeviceId,const std::shared_ptr<PhysicalMemoryAuthority>&);
@@ -448,6 +456,9 @@ namespace llaminar2
         beginExclusiveGenerationRetirement(DeviceId device);
 
     private:
+        friend class TransferEngine;
+        /** @brief Atomically exclude and retire only the expected original generation when nonzero. */
+        ExclusiveGPUDeviceGenerationRetirement beginExclusiveGenerationRetirement(DeviceId, std::uint64_t expected);
         friend class NativeContextPreparation;
         friend class PreparedGPUContextUsePermit;
         /** @brief Publish one actual selected birth's calibration holder, then borrow off-lock.

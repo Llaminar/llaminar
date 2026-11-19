@@ -100,6 +100,7 @@ namespace
             "cudaFree(",
             "cudaFreeAsync(",
             "hipMalloc(",
+            "hipExtMallocWithFlags(",
             "hipMallocAsync(",
             "hipFree(",
             "hipFreeAsync(",
@@ -121,6 +122,7 @@ namespace
             "cudaFree(",
             "cudaFreeAsync(",
             "hipMalloc(",
+            "hipExtMallocWithFlags(",
             "hipMallocAsync(",
             "hipFree(",
             "hipFreeAsync(",
@@ -394,6 +396,23 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RawGpuMallocCallsStayInSanctionedSource
         const auto source = readFile(entry.path());
         if (!hasRawGpuAllocationCall(source))
             continue;
+        if (relative == "src/v2/collective/backends/ROCmPeerPushResources.cpp")
+        {
+            // The original collective owns both admitted allocations until
+            // its captured consumers retire. Reject any other raw operation.
+            auto remaining = removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+            for (const std::string call : {
+                     "hipExtMallocWithFlags(&owner->slab_,owner->slab_lease_.bytes(),hipDeviceMallocUncached)",
+                     "hipMalloc(&owner->table_,owner->table_lease_.bytes())",
+                     "hipFree(table_)", "hipFree(slab_)"})
+            {
+                const auto position = remaining.find(call);
+                ASSERT_NE(position, std::string::npos) << call;
+                remaining.erase(position, call.size());
+            }
+            EXPECT_FALSE(hasRawGpuAllocationCall(remaining));
+            continue;
+        }
         if (sanctioned.find(relative) == sanctioned.end())
             failures.push_back(relative);
     }
@@ -1160,7 +1179,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RuntimePrefillDescriptorsUseRetainedGra
     const auto rocm_runtime_execution = sliceBetween(
         rocm_source,
         "bool ROCmMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan(",
-        "\n} // namespace llaminar2");
+        "bool ROCmMoEKernel::reduceCanonicalRouteContributions(");
 
     for (const auto &[backend, execution] : {
              std::pair{"CUDA", &cuda_runtime_execution},
@@ -3123,9 +3142,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
                   "transaction.state->cachedTokensForDepth(/*depth=*/0)"),
               std::string::npos)
         << "Device-target shifted commits must source positions from the canonical transaction count.";
-    EXPECT_NE(device_target_body.find("/*device_position_offset=*/1"),
+    EXPECT_NE(device_target_body.find("mtpShiftedPrefixOffset(graph_builder_->config().mtpShiftedCacheOrigin())"),
+              std::string::npos);
+    EXPECT_NE(device_target_body.find("/*device_position_offset=*/shifted_position_offset"),
               std::string::npos)
-        << "The shifted-cache position transform must be composed on device.";
+        << "The device position must use the exact model's shifted-cache origin.";
     const auto host_resolved_target_publication_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::stageStochasticTargetTokenForDeviceSampling(",

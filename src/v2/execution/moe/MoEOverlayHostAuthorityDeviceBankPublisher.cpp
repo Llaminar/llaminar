@@ -11,6 +11,7 @@
 
 #include "MoEOverlayHostAuthorityDeviceBankPublisher.h"
 #include "MoEOverlayRouteTarget.h"
+#include "MoEOverlayHostAuthorityBankRecipe.h"
 
 #include "DeviceMoEExpertDescriptorBuilder.h"
 #include "MoEOverlayDeviceControllerRuntimeBinding.h"
@@ -504,6 +505,8 @@ namespace llaminar2
                      * reserve a bank. A validation failure therefore leaves no
                      * partially submitted device transaction to guess about.
                      */
+                    requireMoEOverlayHostAuthorityGPUCohortBindings(
+                        *candidate_, state_->config.runtime_bindings);
                     for (auto &endpoint : endpoints_)
                         buildHostRecipes(endpoint);
                     for (auto &endpoint : endpoints_)
@@ -853,155 +856,16 @@ namespace llaminar2
             }
 
         private:
-            /** Build one complete placement update for one endpoint/layer. */
+            /** Export the candidate's original whole or fragment payload arm. */
             [[nodiscard]] MoEPlacementUpdate buildPlacementUpdate(
                 const DeviceBankEndpointWave &endpoint,
                 const MoEExpertOwnerParticipant &participant,
                 int layer) const
             {
-                const auto &binding = endpoint.endpoint->binding;
-                const auto &bank = *endpoint.candidate_bank;
-                MoEPlacementUpdate update;
-                update.epoch = static_cast<std::uint32_t>(candidate_->epoch);
-                update.expert_count = binding.expert_count;
-                update.participant_id = binding.domain_participant_id;
-                update.participant_count =
-                    binding.domain_participant_count;
-                update.experts.resize(binding.expert_count);
-                update.local_compute_mask.assign(binding.expert_count, 0u);
-                update.replica_role.assign(
-                    binding.expert_count,
-                    static_cast<std::uint8_t>(
-                        DeviceMoEReplicaRole::None));
-                update.resident_participant_mask.assign(
-                    binding.expert_count,
-                    0u);
-                update.overlay_route_participant.assign(
-                    binding.expert_count,
-                    -1);
-
-                const auto &local_layer = bank.layerForModelLayer(layer);
-                for (std::uint32_t expert = 0u;
-                     expert < binding.expert_count;
-                     ++expert)
-                {
-                    const auto &live_owners = candidate_->placementOwnerMap();
-                    const auto *placement = live_owners.placementFor(layer, static_cast<int>(expert));
-                    if (placement && placement->shard_cohort)
-                    {
-                        // A CPU cohort outside this GPU domain is a genuine
-                        // nonlocal route, never a synthetic whole-owner entry.
-                        for (const auto &member : placement->shard_cohort->participants())
-                        {
-                            const auto *original_member = live_owners.participantForId(member.participant_id);
-                            if (!original_member || !original_member->device.is_cpu() ||
-                                original_member->domain_name == participant.domain_name)
-                                throw std::logic_error("GPU placement publication rejects a local or non-CPU shard cohort");
-                        }
-                        if (local_layer.resident_mask[expert])
-                            throw std::logic_error("GPU placement publication cannot retain a CPU cohort payload");
-                        auto &descriptor = update.experts[expert];
-                        descriptor.logical_expert_id = static_cast<std::int32_t>(expert);
-                        descriptor.owner_participant = -1;
-                        update.overlay_route_participant[expert] =
-                            MoEOverlayRouteTarget::cpuCohort(placement->tier_idx).word();
-                        continue;
-                    }
-                    const auto *const owner =
-                        live_owners.ownerFor(
-                            layer,
-                            static_cast<int>(expert));
-                    if (!owner || owner->owner_participant < 0)
-                    {
-                        throw std::logic_error(
-                            endpointPrefix(
-                                binding.overlay_participant_id,
-                                binding.device) +
-                            "candidate owner map has an unowned expert");
-                    }
-
-                    auto &descriptor = update.experts[expert];
-                    descriptor.logical_expert_id =
-                        static_cast<std::int32_t>(expert);
-                    update.overlay_route_participant[expert] =
-                        owner->owner_participant;
-
-                    /*
-                     * Domain-local owner masks cannot use global overlay IDs.
-                     * Only owners in this exact named execution domain receive
-                     * a dense bit; another tier/domain remains an explicit
-                     * sparse route with no local descriptor.
-                     */
-                    if (owner->domain_name == participant.domain_name)
-                    {
-                        if (owner->domain_participant_index < 0 ||
-                            static_cast<std::uint32_t>(
-                                owner->domain_participant_index) >=
-                                update.participant_count)
-                        {
-                            throw std::logic_error(
-                                endpointPrefix(
-                                    binding.overlay_participant_id,
-                                    binding.device) +
-                                "candidate owner has an invalid domain-local identity");
-                        }
-                        descriptor.owner_participant =
-                            owner->domain_participant_index;
-                        update.resident_participant_mask[expert] =
-                            1u << static_cast<std::uint32_t>(
-                                owner->domain_participant_index);
-                    }
-                    else
-                    {
-                        descriptor.owner_participant = -1;
-                    }
-
-                    if (!local_layer.resident_mask[expert])
-                        continue;
-                    if (owner->owner_participant !=
-                        binding.overlay_participant_id)
-                    {
-                        throw std::logic_error(
-                            endpointPrefix(
-                                binding.overlay_participant_id,
-                                binding.device) +
-                            "candidate bank residency disagrees with the global owner map");
-                    }
-
-                    const auto &triplet = local_layer.experts[expert];
-                    if (!triplet.complete() ||
-                        !exportDeviceMoEExpertWeightDescriptors(
-                            triplet.gate().get(),
-                            triplet.up().get(),
-                            triplet.down().get(),
-                            descriptor))
-                    {
-                        throw std::runtime_error(
-                            endpointPrefix(
-                                binding.overlay_participant_id,
-                                binding.device) +
-                            "could not export a complete NativeQuantised/FP16/BF16/FP32 expert descriptor");
-                    }
-                    descriptor.logical_expert_id =
-                        static_cast<std::int32_t>(expert);
-                    descriptor.owner_participant =
-                        static_cast<std::int32_t>(
-                            binding.domain_participant_id);
-                    descriptor.local_slot =
-                        static_cast<std::int32_t>(expert);
-                    descriptor.flags = toMoEExpertFlags(
-                        DeviceMoEExpertFlags::Valid |
-                        DeviceMoEExpertFlags::Resident |
-                        DeviceMoEExpertFlags::LocalCompute |
-                        DeviceMoEExpertFlags::PreferredOwner);
-                    update.local_compute_mask[expert] = 1u;
-                    update.replica_role[expert] =
-                        static_cast<std::uint8_t>(
-                            DeviceMoEReplicaRole::Primary);
-                    update.resident_participant_mask[expert] |=
-                        1u << binding.domain_participant_id;
-                }
-                return update;
+                if(participant.participant_id!=endpoint.endpoint->binding.overlay_participant_id)
+                    throw std::logic_error("GPU candidate recipe changed its original participant");
+                return buildMoEOverlayHostAuthorityDeviceLayerUpdate(
+                    *candidate_, *endpoint.candidate_bank, endpoint.endpoint->binding, layer);
             }
 
             /** Resolve candidate leases and stage every immutable bank recipe. */

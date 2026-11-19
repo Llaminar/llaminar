@@ -12,6 +12,7 @@
 
 #include "RCCLBackend.h"
 #include "../coordinators/RCCLCoordinator.h"
+#include "collective/RankOrderedPeerPushOptIn.h"
 #include "../../utils/Logger.h"
 
 #include <algorithm>
@@ -334,8 +335,8 @@ namespace llaminar2
     // Constructor / Destructor
     // =========================================================================
 
-    RCCLBackend::RCCLBackend(std::shared_ptr<IMPIContext> mpi_ctx)
-        : mpi_ctx_(std::move(mpi_ctx))
+    RCCLBackend::RCCLBackend(std::shared_ptr<IMPIContext> mpi_ctx, RankOrderedQuotePolicy peer_quote)
+        : mpi_ctx_(std::move(mpi_ctx)), peer_quote_(peer_quote)
     {
         LOG_DEBUG("RCCLBackend: Created" << (mpi_ctx_ ? " with MPI context (world_size=" + std::to_string(mpi_ctx_->world_size()) + ")" : ""));
     }
@@ -561,7 +562,8 @@ namespace llaminar2
                 device_ordinals_.push_back(device.ordinal);
             }
 
-            // Create and initialize the coordinator (or reuse from pool)
+            const auto peer_request = rankOrderedPeerPushRequest(peer_quote_);
+            // The immutable admission choice is part of the original communicator identity.
             {
                 std::lock_guard<std::mutex> pool_lock(coordinator_pool_mutex_);
                 const std::string pool_key = makePoolKey(device_ordinals_);
@@ -569,7 +571,8 @@ namespace llaminar2
                     coordinator_pool_.begin(),
                     coordinator_pool_.end(),
                     [&](const PooledCoordinatorEntry &entry)
-                    { return entry.device_ordinals == device_ordinals_; });
+                    { return entry.device_ordinals == device_ordinals_ && entry.coordinator &&
+                             entry.coordinator->rankOrderedPushRequest() == peer_request; });
                 if (pooled != coordinator_pool_.end() &&
                     pooled->coordinator)
                 {
@@ -580,7 +583,7 @@ namespace llaminar2
             }
             if (!coordinator_)
             {
-                coordinator_ = std::make_shared<RCCLCoordinator>();
+                coordinator_ = std::make_shared<RCCLCoordinator>(peer_request);
                 if (!coordinator_->initialize(device_ordinals_))
                 {
                     last_error_ = "RCCLCoordinator initialization failed: " + coordinator_->lastError();
@@ -620,6 +623,14 @@ namespace llaminar2
         }
     }
 
+    void RCCLBackend::retireRankOrderedAttachmentAfterGraphRelease() noexcept
+    {
+#ifdef HAVE_RCCL
+        if (coordinator_)
+            coordinator_->retireRankOrderedAttachmentAfterGraphRelease();
+#endif
+    }
+
     void RCCLBackend::shutdown()
     {
 #ifdef HAVE_RCCL
@@ -644,6 +655,13 @@ namespace llaminar2
             // instances reuse it without an init/destroy cycle.
             if (coordinator_)
             {
+                if (!coordinator_->rankOrderedAttachmentAllowsPooling())
+                {
+                    // Unretired or failed attachment lifetimes cannot cross
+                    // to a different model. Use the existing abort owner.
+                    abort();
+                    return;
+                }
                 std::lock_guard<std::mutex> pool_lock(coordinator_pool_mutex_);
                 const std::string pool_key = makePoolKey(device_ordinals_);
                 unregisterActiveCoordinatorOwnerLocked();
@@ -1934,6 +1952,46 @@ namespace llaminar2
 #else
         (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream;
         return NativeCollectiveEnqueueResult::failure("RCCL not available");
+#endif
+    }
+
+    bool RCCLBackend::hasRankOrderedPeerPush() const noexcept
+    {
+#ifdef HAVE_RCCL
+        return coordinator_ && coordinator_->hasRankOrderedPeerPush();
+#else
+        return false;
+#endif
+    }
+
+    std::vector<RankOrderedNativeResources> RCCLBackend::rankOrderedResources() const
+    {
+#ifdef HAVE_RCCL
+        return coordinator_ ? coordinator_->rankOrderedResources() : std::vector<RankOrderedNativeResources>{};
+#else
+        return {};
+#endif
+    }
+
+    bool RCCLBackend::prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_ && coordinator_->prepareRankOrderedResources(memory);
+#else
+        (void)memory;
+        return false;
+#endif
+    }
+
+    bool RCCLBackend::rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+        const NativeCollectiveRows &rows, int participant, void *stream)
+    {
+#ifdef HAVE_RCCL
+        return initialized_ && coordinator_ && is_multi_gpu_single_process_ &&
+            coordinator_->rankOrderedFP32OnStream(send, banks, output, rows, participant, stream);
+#else
+        (void)send; (void)banks; (void)output; (void)rows; (void)participant; (void)stream;
+        return false;
 #endif
     }
 

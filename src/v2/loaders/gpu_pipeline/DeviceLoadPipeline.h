@@ -11,6 +11,7 @@
 
 #include "loaders/gpu_pipeline/RepackFormat.h"
 
+#include <optional>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
@@ -83,6 +84,8 @@ namespace llaminar2
         int N = 0;                 ///< Number of output features (rows in weight matrix)
         int K = 0;                 ///< Number of input features (columns)
         bool is_asymmetric = false; ///< True if format has mins (Q4_K etc.)
+        /** Original source-cover columns and exact final K32 selection; absence selects whole K. */
+        std::optional<NativeQuantisedRepackColumns> columns;
 
         /**
          * Chunk coordinates for bounded staging.
@@ -131,6 +134,8 @@ namespace llaminar2
          */
         void validateSource() const
         {
+            if (columns && (format == RepackFormat::RAW_FP || columns->columns() != K))
+                throw std::invalid_argument("Weight job column selection disagrees with native output geometry: " + name);
             if (!raw_bytes || static_cast<bool>(host_raw_data) == static_cast<bool>(bounded_source) ||
                 (!bounded_source && source_offset_bytes != 0) ||
                 (bounded_source && (source_offset_bytes > bounded_source->sizeBytes() ||
@@ -175,8 +180,10 @@ namespace llaminar2
      * resident MoE layer from hundreds of tiny transactions to one bounded,
      * row-chunked transaction per contiguous parent range.
      *
-     * Input jobs may be in graph discovery order. The helper orders them by
-     * identity and source address while retaining original indices in the member
+     * Input jobs may be in graph discovery order. Bounded readers coalesce by
+     * the same reader identity and adjacent native offsets, without materializing
+     * a compact parent. The helper orders jobs by identity and source address or
+     * reader offset while retaining original indices in the member
      * map. Pre-chunked jobs are rejected because coalescing is a planning
      * operation that must happen before LoadOrchestrator applies its staging
      * budget.

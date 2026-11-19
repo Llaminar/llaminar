@@ -41,6 +41,13 @@
  * TN128/CPT1 launch. Thread-local receipts observe construction topology;
  * they never mirror live device state or count captured graph replays.
  *
+ * Participant-local routed decode keeps original split-K partitions in CTA-owned
+ * LDS and fuses their ordered publication into one native launch per projection.
+ * Source-policy partition counts and public route fragments remain unchanged.
+ *
+ * An opt-in gfx906 HC-down contributor reuses each original physical Q8 block
+ * across up to four device-admitted verifier rows and preserves the staged reducer.
+ *
  * Split from ROCmGemvKernel.hip.
  *
  * @see ROCmGemvKernel_INT8_VNNI.hip for INT8 VNNI kernels
@@ -54,6 +61,12 @@
 
 #include "kernels/rocm/common/ROCmSignedDot4.h"
 #include "kernels/common/ProjectionWorkLaunch.h"
+#include "kernels/common/NativeQuantisedPackedBits.h"
+#include "kernels/common/NativeTileCompletion.cuh"
+#include "kernels/common/NativeCooperativeKernel.cuh"
+#include "kernels/common/GPUQ8ResidualNative.h"
+#include <hip/hip_cooperative_groups.h>
+#include <optional>
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
 #include <algorithm>
@@ -68,6 +81,7 @@
 #include <string>
 
 #include "../../../backends/rocm/HipDeviceGuard.h"
+#include "../../../backends/rocm/ROCmHardwareMetadata.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
 #include "kernels/rocm/gemm/ROCmNativeM1Reduction.h"
 #include "../../../utils/DebugEnv.h"
@@ -75,6 +89,8 @@
 #include "../../../utils/PrefillGraphBucketDefaults.h"
 #include "execution/moe/DeviceMoEOverlayEpochABI.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
+#include "execution/moe/DeviceMoEIntermediateShardBinding.h"
+#include "kernels/common/MoEIntermediateShardRowExecution.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 #include "kernels/common/NativeQuantisedDispatchCache.h"
 #include "kernels/common/DeviceRowWorkGrid.h"
@@ -84,12 +100,40 @@
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include "ROCmNativeQuantisedDecodeEquivalentMath.h"
 #include "ROCmNativeQuantisedSerialGeometry.h"
+#include "ROCmResidentMoEFFN.h"
+#include "kernels/common/GPUHCDownPublication.cuh"
+#include "ROCmGateUpLastProducer.h"
+#include "ROCmDownLastProducer.h"
+#include "kernels/common/DeviceOrderedRouteFold.h"
+#include "kernels/common/NativeCooperativeKernel.cuh"
+#include "kernels/rocm/moe/ROCmSharedExpertGateAddBody.cuh"
+#include <hip/hip_cooperative_groups.h>
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include <exception>
 #include <utility>
 #include "../ops/ROCmSwiGLUDecodeEquivalentMath.h"
 
 #include <atomic>
+#include <stdexcept>
+
+namespace llaminar2::rocm
+{
+namespace { thread_local GateUpProducerLoads gate_up_producer_loads=GateUpProducerLoads::Original; }
+/** @copydoc currentGateUpProducerLoads */
+GateUpProducerLoads currentGateUpProducerLoads() noexcept {return gate_up_producer_loads;}
+/** @copydoc ScopedGateUpProducerLoads::ScopedGateUpProducerLoads */
+ScopedGateUpProducerLoads::ScopedGateUpProducerLoads(GateUpProducerLoads loads):previous_(gate_up_producer_loads)
+{
+    if(llaminar2::isGraphCaptureActive())throw std::logic_error("Gate/up operand loads must be selected before capture");
+    if(loads!=GateUpProducerLoads::Original&&loads!=GateUpProducerLoads::PairedK32)
+        throw std::invalid_argument("Unknown gate/up operand load policy");
+    gate_up_producer_loads=loads;
+}
+/** @copydoc ScopedGateUpProducerLoads::~ScopedGateUpProducerLoads */
+ScopedGateUpProducerLoads::~ScopedGateUpProducerLoads(){gate_up_producer_loads=previous_;}
+
+
+}
 
 // ============================================================================
 // Runtime tuning overrides for native-quantised GEMV dispatch.
@@ -1504,8 +1548,14 @@ __device__ __forceinline__ void iq_decode_accumulate_block(
 //
 // Output is FP32 with scale_A applied inline — no epilogue kernel needed.
 // ============================================================================
+/**
+ * @brief Original scalar NativeQuantised producer with explicit logical tile/partition/lane ownership.
+ * @details This is the former kernel body unchanged in arithmetic. Standalone
+ * and resident entries share it, so physical grid virtualization cannot invent
+ * another decoder, dot loop, K partition boundary or partial publication order.
+ */
 template <int TILE_N, int CPT, NativeQuantisedFormat FMT, bool HasWork = false>
-__global__ void gemv_native_quantised_kernel_t(
+__device__ __forceinline__ void nativeM1ColumnsBody(
     const int8_t*    __restrict__ d_A_int8,       // [K] quantized activations (INT8)
     const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × payload_bytes] payload
     const uint16_t*  __restrict__ d_block_scales,  // [blocks_per_row × N] FP16 scale (d)
@@ -1515,7 +1565,8 @@ __global__ void gemv_native_quantised_kernel_t(
     float*           __restrict__ d_partial_fp32,  // [KB × N] partials, used when kblocks>1
     const float*     __restrict__ d_scale_A,       // [1] per-row activation scale (CK fallback, used when d_scale_A_blockwise==nullptr)
     const float*     __restrict__ d_scale_A_blockwise, // [blocks_per_row] per-block activation scales
-    int N, int K, int kblocks, llaminar2::ProjectionRowWork work)
+    int N, int K, int kblocks, llaminar2::ProjectionRowWork work,
+    unsigned logical_tile,unsigned logical_partition,unsigned logical_lane)
 {
     if constexpr(HasWork)
     if(!llaminar2::projectionWorkRowIsActiveUniform(work,0))return; // Same ordinary M1 route; no unauthored reads/writes.
@@ -1523,9 +1574,9 @@ __global__ void gemv_native_quantised_kernel_t(
     using Traits = NATIVE_QUANTISEDTraits<FMT>;
     static_assert(CPT == 1 || CPT == 2, "native-quantised supports CPT in {1,2}");
 
-    const int n_base = blockIdx.x * TILE_N + threadIdx.x * CPT;
+    const int n_base = logical_tile * TILE_N + logical_lane * CPT;
     const bool active = (n_base < N);
-    const int kb = blockIdx.y;
+    const int kb = logical_partition;
 
     const int blocks_per_row = K / 32;
     const int b_per = (blocks_per_row + kblocks - 1) / kblocks;
@@ -2233,29 +2284,146 @@ __global__ void gemv_native_quantised_kernel_t(
     }
 }
 
-struct DeviceNativeQuantisedMatrixDesc
+template <int TILE_N, int CPT, NativeQuantisedFormat FMT, bool HasWork = false>
+__global__ void gemv_native_quantised_kernel_t(
+    const int8_t*    __restrict__ d_A_int8,       // [K] quantized activations (INT8)
+    const uint8_t*   __restrict__ d_payload,      // [blocks_per_row × N × payload_bytes] payload
+    const uint16_t*  __restrict__ d_block_scales,  // [blocks_per_row × N] FP16 scale (d)
+    const uint16_t*  __restrict__ d_block_mins,    // [blocks_per_row × N] FP16 min (m), NULL for symmetric
+    const uint32_t*  __restrict__ d_block_emins,   // [blocks_per_row × N] packed {lo,hi} emins (Q2_K only, else nullptr)
+    float*           __restrict__ d_C_fp32,        // [N] output (FP32), used when kblocks=1
+    float*           __restrict__ d_partial_fp32,  // [KB × N] partials, used when kblocks>1
+    const float*     __restrict__ d_scale_A,       // [1] per-row activation scale (CK fallback, used when d_scale_A_blockwise==nullptr)
+    const float*     __restrict__ d_scale_A_blockwise, // [blocks_per_row] per-block activation scales
+    int N, int K, int kblocks, llaminar2::ProjectionRowWork work)
 {
-    const uint8_t* payload;
-    const void* scales;
-    const void* mins;
-    const void* emins;
-    int n;
-    int k;
-    uint32_t blocks_per_row;
-    uint8_t codebook_id;
-    uint8_t allocation_payload_bytes_per_block;
-    uint8_t allocation_has_mins;
-    uint8_t allocation_has_emins;
-    uint8_t source_codebook_id;
-    uint8_t source_is_superblock;
-    uint8_t source_identity_present;
-    uint8_t reserved;
-    uint32_t reserved_tail;
-};
+    nativeM1ColumnsBody<TILE_N,CPT,FMT,HasWork>(d_A_int8,d_payload,d_block_scales,d_block_mins,d_block_emins,
+        d_C_fp32,d_partial_fp32,d_scale_A,d_scale_A_blockwise,N,K,kblocks,work,blockIdx.x,blockIdx.y,threadIdx.x);
+}
 
-static_assert(
-    sizeof(DeviceNativeQuantisedMatrixDesc) == 56,
-    "ROCm NativeQuantised descriptor must match the shared device ABI");
+/**
+ * @brief Retain the original eight increasing-word signed dot4 operations.
+ * @param a_low Original activation words0..3. @param a_high Original words4..7.
+ * @param w_low Original prepared Q8 words0..3. @param w_high Original words4..7.
+ * @return Exact original complete K32 integer dot, with no saturation/reassociation.
+ */
+__device__ __forceinline__ int32_t nativeQ8SerialOrderedDot(
+    int4 a_low,int4 a_high,int4 w_low,int4 w_high)
+{
+    int32_t dot=0;
+    dot=::llaminar2::rocm_integer_contract::signedDot4(a_low.x,w_low.x,dot);
+    dot=::llaminar2::rocm_integer_contract::signedDot4(a_low.y,w_low.y,dot);
+    dot=::llaminar2::rocm_integer_contract::signedDot4(a_low.z,w_low.z,dot);
+    dot=::llaminar2::rocm_integer_contract::signedDot4(a_low.w,w_low.w,dot);
+    dot=::llaminar2::rocm_integer_contract::signedDot4(a_high.x,w_high.x,dot);
+    dot=::llaminar2::rocm_integer_contract::signedDot4(a_high.y,w_high.y,dot);
+    dot=::llaminar2::rocm_integer_contract::signedDot4(a_high.z,w_high.z,dot);
+    return ::llaminar2::rocm_integer_contract::signedDot4(a_high.w,w_high.w,dot);
+}
+
+/**
+ * @brief Prefetch two independent Q8 K32 blocks before their original ascending commits.
+ * @tparam TILE_N Existing64/128 independent-column geometry; one column per lane.
+ * @tparam HasWork Exact original immutable row-work mode.
+ * @details This diagnostic entry changes no decoder, partition, accumulation,
+ * destination or work extent. Prefetch values are register-only scalars/int4s;
+ * no local aggregate address escapes, LDS/counter is introduced, or native
+ * operation is added. The original producer remains a separate unchanged symbol.
+ * @param A Original signed-Q8 activation bytes. @param payload Original prepared Q8 bytes.
+ * @param scales Original FP16 weight scales. @param output Original direct output whenP1.
+ * @param partials Original partition-major FP32 bank whenP>1. @param row_scale Original optional row activation scale.
+ * @param block_scales Original optional K32 activation scales. @param N Exact columns. @param K Exact reduction width.
+ * @param partitions Unchanged original source-policy partition count. @param work Original borrowed row authority.
+ */
+template<int TILE_N,bool HasWork>
+__global__ __launch_bounds__(TILE_N) void gemv_native_q8_two_k32_lookahead_kernel_t(
+    const int8_t* __restrict__ A,const uint8_t* __restrict__ payload,
+    const uint16_t* __restrict__ scales,float* __restrict__ output,float* __restrict__ partials,
+    const float* __restrict__ row_scale,const float* __restrict__ block_scales,
+    int N,int K,int partitions,llaminar2::ProjectionRowWork work)
+{
+    static_assert(TILE_N==64||TILE_N==128);
+    if constexpr(HasWork)if(!llaminar2::projectionWorkRowIsActiveUniform(work,0))return;
+    const unsigned n=blockIdx.x*TILE_N+threadIdx.x;
+    if(n>=static_cast<unsigned>(N))return;
+    const int partition=blockIdx.y,blocks=K/32;
+    const int per=(blocks+partitions-1)/partitions;
+    int b=partition*per;
+    const int end=min(b+per,blocks);
+    float acc=0.0f;
+    for(;b+1<end;b+=2)
+    {
+        const size_t linear0=static_cast<size_t>(b)*N+static_cast<size_t>(n);
+        const size_t linear1=static_cast<size_t>(b+1)*N+static_cast<size_t>(n);
+        const auto* w0=reinterpret_cast<const int32_t*>(payload+linear0*32);
+        const auto* w1=reinterpret_cast<const int32_t*>(payload+linear1*32);
+        const int4 w0_low=make_int4(w0[0],w0[1],w0[2],w0[3]);
+        const int4 w0_high=make_int4(w0[4],w0[5],w0[6],w0[7]);
+        const int4 w1_low=make_int4(w1[0],w1[1],w1[2],w1[3]);
+        const int4 w1_high=make_int4(w1[4],w1[5],w1[6],w1[7]);
+        const uint16_t scale0=scales[linear0],scale1=scales[linear1];
+        const auto* a0=reinterpret_cast<const int32_t*>(A+b*32);
+        const auto* a1=reinterpret_cast<const int32_t*>(A+(b+1)*32);
+        const int4 a0_low=make_int4(a0[0],a0[1],a0[2],a0[3]);
+        const int4 a0_high=make_int4(a0[4],a0[5],a0[6],a0[7]);
+        const int4 a1_low=make_int4(a1[0],a1[1],a1[2],a1[3]);
+        const int4 a1_high=make_int4(a1[4],a1[5],a1[6],a1[7]);
+        const float activation0=block_scales?block_scales[b]:1.0f;
+        const float activation1=block_scales?block_scales[b+1]:1.0f;
+        const int32_t dot0=nativeQ8SerialOrderedDot(a0_low,a0_high,w0_low,w0_high);
+        acc=rocm_native_quantised_commit_single_scale_block(acc,dot0,
+            rocm_native_quantised_load_single_weight_scale<NATIVE_QUANTISED_Q8_0>(scale0,0),activation0);
+        // The preceding RN add must remain before this second block's RN add.
+        // No pair sum, fused accumulator or partition-dependent reassociation.
+        const int32_t dot1=nativeQ8SerialOrderedDot(a1_low,a1_high,w1_low,w1_high);
+        acc=rocm_native_quantised_commit_single_scale_block(acc,dot1,
+            rocm_native_quantised_load_single_weight_scale<NATIVE_QUANTISED_Q8_0>(scale1,0),activation1);
+    }
+    if(b<end)
+    {
+        const size_t linear=static_cast<size_t>(b)*N+static_cast<size_t>(n);
+        const auto* w=reinterpret_cast<const int32_t*>(payload+linear*32);
+        const auto* a=reinterpret_cast<const int32_t*>(A+b*32);
+        const int32_t dot=nativeQ8SerialOrderedDot(
+            make_int4(a[0],a[1],a[2],a[3]),make_int4(a[4],a[5],a[6],a[7]),
+            make_int4(w[0],w[1],w[2],w[3]),make_int4(w[4],w[5],w[6],w[7]));
+        acc=rocm_native_quantised_commit_single_scale_block(acc,dot,
+            rocm_native_quantised_load_single_weight_scale<NATIVE_QUANTISED_Q8_0>(scales[linear],0),
+            block_scales?block_scales[b]:1.0f);
+    }
+    const float result=acc*(block_scales?1.0f:row_scale[0]);
+    if(partitions==1)output[n]=result;
+    else partials[static_cast<size_t>(partition)*N+static_cast<size_t>(n)]=result;
+}
+
+/**
+ * @brief Use the canonical descriptor type for ordinary and resident helpers.
+ *
+ * The original TU maintained a byte-identical global mirror. A canonical alias
+ * makes pointers from typed prepared resident arguments and runtime descriptor
+ * views the SAME C++ type; no aliasing cast or per-thread descriptor copy is
+ * required. Pin every original byte offset as well as the existing expert/bank
+ * ABI assertions below so this change cannot alter native launch/runtime layout.
+ */
+using DeviceNativeQuantisedMatrixDesc=llaminar2::DeviceNativeQuantisedMatrixDesc;
+static_assert(sizeof(DeviceNativeQuantisedMatrixDesc)==56 && alignof(DeviceNativeQuantisedMatrixDesc)==8);
+static_assert(offsetof(DeviceNativeQuantisedMatrixDesc,payload)==0 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,scales)==8 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,mins)==16 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,emins)==24 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,n)==32 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,k)==36 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,blocks_per_row)==40 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,codebook_id)==44 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,allocation_payload_bytes_per_block)==45 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,allocation_has_mins)==46 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,allocation_has_emins)==47 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,source_codebook_id)==48 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,source_is_superblock)==49 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,source_identity_present)==50 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,reserved)==51 &&
+    offsetof(DeviceNativeQuantisedMatrixDesc,reserved_tail)==52,
+    "Canonical NativeQuantised descriptor must retain every original ROCm ABI field");
 
 constexpr int kDeviceMoEMaxExperts = llaminar2::moe_runtime_abi::kMaxExperts;
 constexpr int kDeviceMoEMaxTopK = 16;
@@ -2268,15 +2436,9 @@ struct DeviceMoEExpertDescriptorView
     DeviceNativeQuantisedMatrixDesc gate;
     DeviceNativeQuantisedMatrixDesc up;
     DeviceNativeQuantisedMatrixDesc down;
-    const void *floating_gate_data;
-    int32_t floating_gate_n;
-    int32_t floating_gate_k;
-    const void *floating_up_data;
-    int32_t floating_up_n;
-    int32_t floating_up_k;
-    const void *floating_down_data;
-    int32_t floating_down_n;
-    int32_t floating_down_k;
+    llaminar2::DeviceMoEFloatingMatrixDesc floating_gate;
+    llaminar2::DeviceMoEFloatingMatrixDesc floating_up;
+    llaminar2::DeviceMoEFloatingMatrixDesc floating_down;
     int32_t logical_expert_id;
     int32_t owner_participant;
     int32_t local_slot;
@@ -2290,6 +2452,10 @@ static_assert(
     sizeof(DeviceMoEExpertDescriptorView) == 240,
     "ROCm GEMV expert descriptor view must match the shared runtime ABI");
 
+static_assert(offsetof(DeviceMoEExpertDescriptorView, floating_gate) == 168);
+static_assert(offsetof(DeviceMoEExpertDescriptorView, floating_up) == 184);
+static_assert(offsetof(DeviceMoEExpertDescriptorView, floating_down) == 200);
+static_assert(offsetof(DeviceMoEExpertDescriptorView, logical_expert_id) == 216);
 static_assert(offsetof(DeviceMoEExpertDescriptorView, weight_format) == 232);
 static_assert(offsetof(DeviceMoEExpertDescriptorView, floating_allocation_format) == 234);
 static_assert(offsetof(DeviceMoEExpertDescriptorView, projection_set) == 236);
@@ -2367,8 +2533,11 @@ struct DeviceMoELayerRuntimeView
     const llaminar2::DeviceMoEOverlayEpochTicket *overlay_epoch_ticket;
     const DeviceMoEPlacementBankView *overlay_placement_banks;
     const llaminar2::DeviceMoEOverlayEpochStatus *overlay_epoch_status;
+    llaminar2::DeviceMoEIntermediateShardBinding intermediate_shard;
 };
 
+static_assert(offsetof(DeviceMoELayerRuntimeView, intermediate_shard) ==
+    llaminar2::moe_runtime_abi::kIntermediateShardBindingOffset);
 static_assert(
     sizeof(DeviceMoELayerRuntimeView) ==
     llaminar2::moe_runtime_abi::kLayerRuntimeBytes);
@@ -2476,6 +2645,27 @@ __device__ __forceinline__ uint32_t moe_runtime_execution_bank(
     return bank;
 }
 
+/** @brief Authenticate original fragment execution before any direct runtime GEMV descriptor load. */
+__device__ __forceinline__ bool moe_runtime_native_descriptor_selected(
+    const DeviceMoELayerRuntimeView *runtime, const DeviceMoEPlacementBankView &bank, int expert)
+{
+    if (!runtime->intermediate_shard.enabled())
+    {
+        if (bank.experts[expert].projection_set != llaminar2::DeviceMoEProjectionSet::IntermediateShard)
+            return true;
+    }
+    else
+    {
+        const auto selection = llaminar2::selectMoEIntermediateShardRow(runtime->intermediate_shard,
+            bank, expert, static_cast<int>(runtime->participant_id));
+        if (selection.disposition != llaminar2::MoEIntermediateShardRowDisposition::Invalid)
+            return selection.disposition == llaminar2::MoEIntermediateShardRowDisposition::Local;
+    }
+    printf("native_quantised_runtime_fragment_invalid participant=%u expert=%d\n", runtime->participant_id, expert);
+    __builtin_trap();
+    return false;
+}
+
 template <NativeQuantisedFormat FMT>
 __device__ __forceinline__ bool native_quantised_desc_shape_ok(
     const DeviceNativeQuantisedMatrixDesc& desc,
@@ -2543,297 +2733,224 @@ __global__ void moe_grouped_swiglu_quantize_blockwise_kernel(
     }
 }
 
-template <NativeQuantisedFormat FMT>
-__device__ __forceinline__ void moe_decode_native_quantised_groups(
-    const uint8_t* __restrict__ payload,
-    int32_t* packed_groups)
+/**
+ * @brief Decode one canonical Q4 four-code group from one packed nibble word.
+ * @tparam FMT Q4_0 or Q4_1 physical decoder.
+ * @param raw Original four nibble-pairs, without scale/minimum metadata.
+ * @param high Select original elements16..31 rather than0..15.
+ * @return Four original signed/unsigned int8 codes packed in one int32.
+ */
+template<NativeQuantisedFormat FMT>
+__device__ __forceinline__ int32_t moe_decode_q4_group(uint32_t raw,bool high)
 {
-    using Traits = NATIVE_QUANTISEDTraits<FMT>;
+    static_assert(FMT==NATIVE_QUANTISED_Q4_0 || FMT==NATIVE_QUANTISED_Q4_1);
+    const uint32_t nibbles=(high?raw>>4:raw)&0x0F0F0F0Fu;
+    if constexpr(NATIVE_QUANTISEDTraits<FMT>::center_4bit==8)
+        return static_cast<int32_t>((nibbles+0x78787878u)^0x80808080u);
+    else return static_cast<int32_t>(nibbles);
+}
+/**
+ * @brief Decode one canonical Q5 four-code group, retaining original centering.
+ * @tparam FMT Q5_0 or Q5_1 physical decoder.
+ * @param raw Original four nibble-pairs.
+ * @param high_bits Original32-bit fifth-bit plane.
+ * @param group Original group index0..7; indices4..7 select high nibbles.
+ * @return Four original signed/unsigned int8 codes packed in one int32.
+ */
+template<NativeQuantisedFormat FMT>
+__device__ __forceinline__ int32_t moe_decode_q5_group(uint32_t raw,uint32_t high_bits,unsigned group)
+{
+    static_assert(FMT==NATIVE_QUANTISED_Q5_0 || FMT==NATIVE_QUANTISED_Q5_1);
+    const uint32_t nibbles=(group>=4?raw>>4:raw)&0x0F0F0F0Fu;
+    const uint32_t hb4=(high_bits>>(group*4))&0xFu;
+    // Share the exact four-bit deposit; keep group selection and Q5 centering
+    // unchanged while avoiding four independently live shift/mask terms.
+    const uint32_t hb=::llaminar2::native_quantised::q5HighBitsToPackedBytes(hb4);
+    uint32_t value=nibbles|hb;
+    if constexpr(NATIVE_QUANTISEDTraits<FMT>::center_5bit==16)
+    {value^=0x80808080u;value-=0x10101010u;value^=0x80808080u;}
+    return static_cast<int32_t>(value);
+}
+
+/**
+ * @brief Load one packed input word at the current ordered integer-dot boundary.
+ * @tparam Ordered NativeLayout's scheduling-only raw-input dependency; false for legacy callers.
+ * @param payload Original canonical payload. @param offset Original byte offset.
+ * @param previous_dot Prior integer dot; never changes loaded bits.
+ * @return Original word, with no allocation, fence or numerical operation.
+ */
+template<bool Ordered>
+__device__ __forceinline__ uint32_t moe_native_group_word(const uint8_t* payload,unsigned offset,int32_t previous_dot)
+{
+    uint32_t raw=*reinterpret_cast<const uint32_t*>(payload+offset);
+    if constexpr(Ordered)asm volatile("" : "+v"(raw) : "v"(previous_dot));
+    return raw;
+}
+/**
+ * @brief Load one bounded packed byte at the current integer-dot boundary.
+ * @tparam Ordered Whether to retain the scheduling-only dependency.
+ * @param payload Original payload. @param offset In-bounds original byte offset.
+ * @param previous_dot Prior integer dot. @return Original byte widened without sign extension.
+ */
+template<bool Ordered>
+__device__ __forceinline__ uint32_t moe_native_group_byte(const uint8_t* payload,unsigned offset,int32_t previous_dot)
+{
+    uint32_t raw=payload[offset];
+    if constexpr(Ordered)asm volatile("" : "+v"(raw) : "v"(previous_dot));
+    return raw;
+}
+/**
+ * @brief Default immutable device-table lookup authority for canonical IQ decode.
+ * @details Explicit full-entry views may borrow byte-identical phase-local LDS;
+ * all existing owners retain these original module-table reads by default.
+ */
+struct NativeQuantisedGridLookup {
+    /** @brief Read the original four-code IQ3 entry. @tparam FMT Original format. @param index Original decoded index. @return Unchanged packed bytes. */
+    template<NativeQuantisedFormat FMT> __device__ __forceinline__ uint32_t iq3(unsigned index) const {return iq3_grid_lookup<FMT>(index);}
+    /** @brief Read the original eight-code IQ2 entry. @tparam FMT Original format. @param index Original decoded index. @return Unchanged packed bytes. */
+    template<NativeQuantisedFormat FMT> __device__ __forceinline__ uint64_t iq2(unsigned index) const {return iq2_grid_lookup<FMT>(index);}
+    /** @brief Read the original IQ1 entry. @param index Original decoded index. @return Unchanged packed bytes. */
+    __device__ __forceinline__ uint64_t iq1(unsigned index) const {return iq1_grid_lookup(index);}
+};
+/**
+ * @brief Decode exactly one original four-code group, without expanding future groups.
+ * @tparam FMT Canonical physical codebook from the existing supported inventory.
+ * @tparam Ordered Apply NativeLayout's register-only dependency to every raw packed input.
+ * @tparam Grid Explicit immutable lookup view; existing owners use original device tables.
+ * @param payload Original canonical block, including original IQ sign/tail bytes.
+ * @param group Original output group0..7. @param previous_dot Prior integer result, unchanged by decode.
+ * @param table_view Lookup authority with byte-identical entries, valid for this complete consumer.
+ * @return The identical four signed/unsigned int8 codes packed in one integer word.
+ * @details The legacy eight-group API delegates here with Ordered=false. Ordered
+ * mode delays raw inputs before mapping, rather than serializing already-expanded
+ * values. Grid lookups and bit mappings are the original canonical operations.
+ */
+template<NativeQuantisedFormat FMT,bool Ordered=false,class Grid=NativeQuantisedGridLookup>
+__device__ __forceinline__ int32_t moe_decode_native_quantised_group(
+    const uint8_t* __restrict__ payload,unsigned group,int32_t previous_dot=0,Grid table_view={})
+{
+    using Traits=NATIVE_QUANTISEDTraits<FMT>;
     static_assert(NATIVE_QUANTISEDGroupedMoESupported<FMT>::value,
-                  "Grouped MoE decode requires a supported native-quantised format");
-
-    if constexpr (Traits::uses_lut)
+        "Grouped MoE decode requires a supported native-quantised format");
+    if constexpr(Traits::uses_lut)
     {
-        constexpr uint32_t CB_LO_A = 0xBFAD9881u;
-        constexpr uint32_t CB_LO_B = 0xF6EADDCFu;
-        constexpr uint32_t CB_HI_A = 0x26190D01u;
-        constexpr uint32_t CB_HI_B = 0x71594535u;
-        constexpr uint32_t MUX_IDENTITY = 0x03020100u;
-        constexpr uint32_t MUX_BIT3_MASK = 0x04040404u;
-
-        #pragma unroll
-        for (int g = 0; g < 4; ++g)
-        {
-            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
-            const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
-            const uint32_t lo_sel = lo_nibs & 0x07070707u;
-            const uint32_t lo_r0 = __builtin_amdgcn_perm(CB_LO_B, CB_LO_A, lo_sel);
-            const uint32_t lo_r1 = __builtin_amdgcn_perm(CB_HI_B, CB_HI_A, lo_sel);
-            const uint32_t lo_mux = MUX_IDENTITY | ((lo_nibs >> 1) & MUX_BIT3_MASK);
-            packed_groups[g] = static_cast<int32_t>(__builtin_amdgcn_perm(lo_r1, lo_r0, lo_mux));
-
-            const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
-            const uint32_t hi_sel = hi_nibs & 0x07070707u;
-            const uint32_t hi_r0 = __builtin_amdgcn_perm(CB_LO_B, CB_LO_A, hi_sel);
-            const uint32_t hi_r1 = __builtin_amdgcn_perm(CB_HI_B, CB_HI_A, hi_sel);
-            const uint32_t hi_mux = MUX_IDENTITY | ((hi_nibs >> 1) & MUX_BIT3_MASK);
-            packed_groups[g + 4] = static_cast<int32_t>(__builtin_amdgcn_perm(hi_r1, hi_r0, hi_mux));
-        }
+        constexpr uint32_t CB_LO_A=0xBFAD9881u,CB_LO_B=0xF6EADDCFu;
+        constexpr uint32_t CB_HI_A=0x26190D01u,CB_HI_B=0x71594535u;
+        constexpr uint32_t MUX_IDENTITY=0x03020100u,MUX_BIT3_MASK=0x04040404u;
+        const uint32_t raw=moe_native_group_word<Ordered>(payload,(group%4)*4,previous_dot);
+        const uint32_t nibbles=(group>=4?raw>>4:raw)&0x0F0F0F0Fu;
+        const uint32_t sel=nibbles&0x07070707u;
+        const uint32_t r0=__builtin_amdgcn_perm(CB_LO_B,CB_LO_A,sel);
+        const uint32_t r1=__builtin_amdgcn_perm(CB_HI_B,CB_HI_A,sel);
+        const uint32_t mux=MUX_IDENTITY|((nibbles>>1)&MUX_BIT3_MASK);
+        return static_cast<int32_t>(__builtin_amdgcn_perm(r1,r0,mux));
     }
-    else if constexpr (Traits::is_5bit)
+    else if constexpr(Traits::is_5bit)
     {
-        const uint32_t qh_bits = *reinterpret_cast<const uint32_t*>(payload + 16);
-
-        #pragma unroll
-        for (int g = 0; g < 4; ++g)
-        {
-            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
-
-            const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
-            const uint32_t hb4_lo = (qh_bits >> (g * 4)) & 0xFu;
-            const uint32_t hb_lo = ((hb4_lo & 1u) << 4) | ((hb4_lo & 2u) << 11)
-                                 | ((hb4_lo & 4u) << 18) | ((hb4_lo & 8u) << 25);
-            uint32_t val_lo = lo_nibs | hb_lo;
-
-            const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
-            const uint32_t hb4_hi = (qh_bits >> (g * 4 + 16)) & 0xFu;
-            const uint32_t hb_hi = ((hb4_hi & 1u) << 4) | ((hb4_hi & 2u) << 11)
-                                 | ((hb4_hi & 4u) << 18) | ((hb4_hi & 8u) << 25);
-            uint32_t val_hi = hi_nibs | hb_hi;
-
-            if constexpr (Traits::center_5bit == 16)
-            {
-                val_lo ^= 0x80808080u;
-                val_lo -= 0x10101010u;
-                val_lo ^= 0x80808080u;
-                val_hi ^= 0x80808080u;
-                val_hi -= 0x10101010u;
-                val_hi ^= 0x80808080u;
-            }
-
-            packed_groups[g] = static_cast<int32_t>(val_lo);
-            packed_groups[g + 4] = static_cast<int32_t>(val_hi);
-        }
+        const uint32_t raw=moe_native_group_word<Ordered>(payload,(group%4)*4,previous_dot);
+        const uint32_t high=moe_native_group_word<Ordered>(payload,16,previous_dot);
+        return moe_decode_q5_group<FMT>(raw,high,group);
     }
-    else if constexpr (Traits::is_3bit)
+    else if constexpr(Traits::is_3bit)
     {
-        constexpr uint32_t BIT_SPREAD = 0x00204081u;
-        const uint32_t hbit_word = *reinterpret_cast<const uint32_t*>(payload + 8);
-
-        #pragma unroll
-        for (int half = 0; half < 2; ++half)
-        {
-            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + half * 4);
-            #pragma unroll
-            for (int g = 0; g < 4; ++g)
-            {
-                const uint32_t low2_4 = (raw >> (g * 2)) & 0x03030303u;
-                const uint32_t hb4 = (hbit_word >> ((half * 4 + g) * 4)) & 0xFu;
-                const uint32_t hb = ((hb4 * BIT_SPREAD) & 0x01010101u) << 2;
-                uint32_t val = (low2_4 | hb) ^ 0x80808080u;
-                val -= 0x04040404u;
-                val ^= 0x80808080u;
-                packed_groups[half * 4 + g] = static_cast<int32_t>(val);
-            }
-        }
+        constexpr uint32_t BIT_SPREAD=0x00204081u;
+        const uint32_t raw=moe_native_group_word<Ordered>(payload,(group/4)*4,previous_dot);
+        const uint32_t high=moe_native_group_word<Ordered>(payload,8,previous_dot);
+        const uint32_t low2=(raw>>((group%4)*2))&0x03030303u;
+        const uint32_t hb4=(high>>(group*4))&0xFu;
+        const uint32_t hb=((hb4*BIT_SPREAD)&0x01010101u)<<2;
+        uint32_t value=(low2|hb)^0x80808080u;
+        value-=0x04040404u;value^=0x80808080u;
+        return static_cast<int32_t>(value);
     }
-    else if constexpr (Traits::is_2bit)
+    else if constexpr(Traits::is_2bit)
     {
-        #pragma unroll
-        for (int half = 0; half < 2; ++half)
-        {
-            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + half * 4);
-            const int bg = half * 4;
-            packed_groups[bg] = static_cast<int32_t>(raw & 0x03030303u);
-            packed_groups[bg + 1] = static_cast<int32_t>((raw >> 2) & 0x03030303u);
-            packed_groups[bg + 2] = static_cast<int32_t>((raw >> 4) & 0x03030303u);
-            packed_groups[bg + 3] = static_cast<int32_t>((raw >> 6) & 0x03030303u);
-        }
+        const uint32_t raw=moe_native_group_word<Ordered>(payload,(group/4)*4,previous_dot);
+        return static_cast<int32_t>((raw>>((group%4)*2))&0x03030303u);
     }
-    else if constexpr (Traits::is_6bit)
+    else if constexpr(Traits::is_6bit)
     {
-        const uint8_t* qh_p = payload + 16;
-
-        #pragma unroll
-        for (int g = 0; g < 4; ++g)
-        {
-            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
-            const uint32_t h_lo = qh_p[g];
-            const uint32_t h_hi = qh_p[g + 4];
-
-            const uint32_t lo_nibs = raw & 0x0F0F0F0Fu;
-            // The grouped verifier keeps the direct deposits: on gfx906 its
-            // larger live-row state schedules this form 2.7% faster than the
-            // serial kernel's bit-dilation identity.  Both forms are exhaustive
-            // integer identities over all 256 possible packed high-bit bytes.
-            const uint32_t hb_lo = ((h_lo & 0x03u) << 4)  | ((h_lo & 0x0Cu) << 10)
-                                 | ((h_lo & 0x30u) << 16) | ((h_lo & 0xC0u) << 22);
-            uint32_t val_lo = (lo_nibs | hb_lo) ^ 0x80808080u;
-            val_lo -= 0x20202020u;
-            val_lo ^= 0x80808080u;
-            packed_groups[g] = static_cast<int32_t>(val_lo);
-
-            const uint32_t hi_nibs = (raw >> 4) & 0x0F0F0F0Fu;
-            const uint32_t hb_hi = ((h_hi & 0x03u) << 4)  | ((h_hi & 0x0Cu) << 10)
-                                 | ((h_hi & 0x30u) << 16) | ((h_hi & 0xC0u) << 22);
-            uint32_t val_hi = (hi_nibs | hb_hi) ^ 0x80808080u;
-            val_hi -= 0x20202020u;
-            val_hi ^= 0x80808080u;
-            packed_groups[g + 4] = static_cast<int32_t>(val_hi);
-        }
+        const uint32_t raw=moe_native_group_word<Ordered>(payload,(group%4)*4,previous_dot);
+        // Q6's24-byte payload has two complete aligned high-bit words.
+        // Keep that word, rather than its extracted byte, behind the current
+        // dot boundary; byte extraction and dilation then remain group-local.
+        const uint32_t high_word=moe_native_group_word<Ordered>(payload,16+(group/4)*4,previous_dot);
+        const uint32_t high=(high_word>>((group%4)*8))&0xFFu;
+        const uint32_t nibbles=(group>=4?raw>>4:raw)&0x0F0F0F0Fu;
+        const uint32_t hb=rocm_native_quantised_expand_q6_high_fields(high);
+        uint32_t value=(nibbles|hb)^0x80808080u;
+        value-=0x20202020u;value^=0x80808080u;
+        return static_cast<int32_t>(value);
     }
-    else if constexpr (Traits::is_iq_grid)
+    else if constexpr(Traits::is_iq3_grid)
     {
-        if constexpr (Traits::is_iq3_grid && !Traits::has_qh)
+        const uint32_t qs=moe_native_group_word<Ordered>(payload,(group/4)*4,previous_dot);
+        const uint32_t signs=moe_native_group_word<Ordered>(payload,8,previous_dot);
+        int idx=(qs>>((group%4)*8))&0xFF;
+        uint8_t sign_byte;
+        if constexpr(Traits::has_qh)
         {
-            const uint32_t* words = reinterpret_cast<const uint32_t*>(payload);
-            const uint32_t qs0 = words[0];
-            const uint32_t qs1 = words[1];
-            const uint32_t signs = words[2];
-
-            #pragma unroll
-            for (int g = 0; g < 8; ++g)
-            {
-                const uint32_t word = (g < 4) ? qs0 : qs1;
-                const int idx = (word >> ((g & 3) * 8)) & 0xFF;
-                const uint32_t grid4 = iq3_grid_lookup<FMT>(idx);
-                const uint8_t sign_byte = static_cast<uint8_t>(signs >> ((g / 2) * 8));
-                const uint8_t sign_nibble = (g & 1) ? (sign_byte >> 4) : (sign_byte & 0xF);
-                packed_groups[g] = static_cast<int32_t>(iq_apply_signs_4(grid4, sign_nibble));
-            }
+            idx|=static_cast<int>((signs>>group)&1)<<8;
+            sign_byte=group<6?static_cast<uint8_t>(signs>>((group/2+1)*8)):
+                static_cast<uint8_t>(moe_native_group_byte<Ordered>(payload,12,previous_dot));
         }
-        else if constexpr (Traits::is_iq3_grid)
-        {
-            const uint32_t* words = reinterpret_cast<const uint32_t*>(payload);
-            const uint32_t qs0 = words[0];
-            const uint32_t qs1 = words[1];
-            const uint32_t qh_signs = words[2];
-            const uint8_t signs3 = payload[12];
-
-            #pragma unroll
-            for (int g = 0; g < 8; ++g)
-            {
-                const uint32_t word = (g < 4) ? qs0 : qs1;
-                int idx = (word >> ((g & 3) * 8)) & 0xFF;
-                idx |= (static_cast<int>((qh_signs >> g) & 1) << 8);
-                const uint32_t grid4 = iq3_grid_lookup<FMT>(idx);
-                const uint8_t sign_byte = (g < 6)
-                    ? static_cast<uint8_t>(qh_signs >> ((g / 2 + 1) * 8))
-                    : signs3;
-                const uint8_t sign_nibble = (g & 1) ? (sign_byte >> 4) : (sign_byte & 0xF);
-                packed_groups[g] = static_cast<int32_t>(iq_apply_signs_4(grid4, sign_nibble));
-            }
-        }
-        else if constexpr (Traits::is_iq2_grid && !Traits::has_qh)
-        {
-            const uint32_t* words = reinterpret_cast<const uint32_t*>(payload);
-            const uint32_t qs = words[0];
-            const uint32_t signs = words[1];
-
-            #pragma unroll
-            for (int g = 0; g < 4; ++g)
-            {
-                const int idx = (qs >> (g * 8)) & 0xFF;
-                const uint64_t grid8 = iq2_grid_lookup<FMT>(idx);
-                const uint32_t grid_lo = static_cast<uint32_t>(grid8);
-                const uint32_t grid_hi = static_cast<uint32_t>(grid8 >> 32);
-                const uint8_t sign_byte = static_cast<uint8_t>(signs >> (g * 8));
-                packed_groups[g * 2] = static_cast<int32_t>(iq_apply_signs_4(grid_lo, sign_byte & 0xF));
-                packed_groups[g * 2 + 1] = static_cast<int32_t>(iq_apply_signs_4(grid_hi, sign_byte >> 4));
-            }
-        }
-        else
-        {
-            const uint32_t* words = reinterpret_cast<const uint32_t*>(payload);
-            const uint32_t qs = words[0];
-            const uint32_t qh_signs = words[1];
-            const uint8_t signs3 = payload[8];
-
-            #pragma unroll
-            for (int g = 0; g < 4; ++g)
-            {
-                int idx = (qs >> (g * 8)) & 0xFF;
-                if constexpr (Traits::qh_bits_per_lookup == 1)
-                    idx |= (static_cast<int>((qh_signs >> g) & 1) << 8);
-                else if constexpr (Traits::qh_bits_per_lookup == 2)
-                    idx |= (static_cast<int>((qh_signs >> (2 * g)) & 3) << 8);
-                const uint64_t grid8 = iq2_grid_lookup<FMT>(idx);
-                const uint32_t grid_lo = static_cast<uint32_t>(grid8);
-                const uint32_t grid_hi = static_cast<uint32_t>(grid8 >> 32);
-                const uint8_t sign_byte = (g < 3)
-                    ? static_cast<uint8_t>(qh_signs >> ((g + 1) * 8))
-                    : signs3;
-                packed_groups[g * 2] = static_cast<int32_t>(iq_apply_signs_4(grid_lo, sign_byte & 0xF));
-                packed_groups[g * 2 + 1] = static_cast<int32_t>(iq_apply_signs_4(grid_hi, sign_byte >> 4));
-            }
-        }
+        else sign_byte=static_cast<uint8_t>(signs>>((group/2)*8));
+        const uint8_t sign_nibble=group&1?sign_byte>>4:sign_byte&0xF;
+        return static_cast<int32_t>(iq_apply_signs_4(table_view.template iq3<FMT>(idx),sign_nibble));
     }
-    else if constexpr (Traits::is_iq1_grid)
+    else if constexpr(Traits::is_iq2_grid)
     {
-        if constexpr (FMT == NATIVE_QUANTISED_IQ1_S)
+        const unsigned lookup=group/2;
+        const uint32_t qs=moe_native_group_word<Ordered>(payload,0,previous_dot);
+        const uint32_t signs=moe_native_group_word<Ordered>(payload,4,previous_dot);
+        int idx=(qs>>(lookup*8))&0xFF;
+        uint8_t sign_byte;
+        if constexpr(Traits::has_qh)
         {
-            const uint16_t qh_word = static_cast<uint16_t>(payload[4]) |
-                                     (static_cast<uint16_t>(payload[5]) << 8);
-            #pragma unroll
-            for (int g = 0; g < 4; ++g)
-            {
-                const int idx = payload[g] | (((qh_word >> (3 * g)) & 7) << 8);
-                const uint64_t grid8 = iq1_grid_lookup(idx);
-                packed_groups[g * 2] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
-                packed_groups[g * 2 + 1] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
-            }
+            if constexpr(Traits::qh_bits_per_lookup==1)idx|=static_cast<int>((signs>>lookup)&1)<<8;
+            else idx|=static_cast<int>((signs>>(2*lookup))&3)<<8;
+            sign_byte=lookup<3?static_cast<uint8_t>(signs>>((lookup+1)*8)):
+                static_cast<uint8_t>(moe_native_group_byte<Ordered>(payload,8,previous_dot));
         }
-        else
-        {
-            const uint8_t qh0 = payload[4];
-            const uint8_t qh1 = payload[5];
-            const int idx0 = payload[0] | ((qh0 & 0x07) << 8);
-            const int idx1 = payload[1] | (((qh0 >> 4) & 0x07) << 8);
-            const int idx2 = payload[2] | ((qh1 & 0x07) << 8);
-            const int idx3 = payload[3] | (((qh1 >> 4) & 0x07) << 8);
-
-            uint64_t grid8 = iq1_grid_lookup(idx0);
-            packed_groups[0] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
-            packed_groups[1] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
-            grid8 = iq1_grid_lookup(idx1);
-            packed_groups[2] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
-            packed_groups[3] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
-            grid8 = iq1_grid_lookup(idx2);
-            packed_groups[4] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
-            packed_groups[5] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
-            grid8 = iq1_grid_lookup(idx3);
-            packed_groups[6] = static_cast<int32_t>(static_cast<uint32_t>(grid8));
-            packed_groups[7] = static_cast<int32_t>(static_cast<uint32_t>(grid8 >> 32));
-        }
+        else sign_byte=static_cast<uint8_t>(signs>>(lookup*8));
+        const uint64_t grid=table_view.template iq2<FMT>(idx);
+        const uint32_t word=group&1?static_cast<uint32_t>(grid>>32):static_cast<uint32_t>(grid);
+        const uint8_t sign_nibble=group&1?sign_byte>>4:sign_byte&0xF;
+        return static_cast<int32_t>(iq_apply_signs_4(word,sign_nibble));
     }
-    else if constexpr (Traits::is_8bit)
+    else if constexpr(Traits::is_iq1_grid)
     {
-        #pragma unroll
-        for (int g = 0; g < 8; ++g)
-            packed_groups[g] = *reinterpret_cast<const int32_t*>(payload + g * 4);
-    }
-    else
-    {
-        constexpr uint32_t NIBBLE_MASK = 0x0F0F0F0Fu;
-
-        #pragma unroll
-        for (int g = 0; g < 4; ++g)
+        const unsigned lookup=group/2;
+        const uint32_t qs=moe_native_group_byte<Ordered>(payload,lookup,previous_dot);
+        unsigned high;
+        if constexpr(FMT==NATIVE_QUANTISED_IQ1_S)
         {
-            const uint32_t raw = *reinterpret_cast<const uint32_t*>(payload + g * 4);
-            if constexpr (Traits::center_4bit == 8)
-            {
-                constexpr uint32_t SWAR_ADD = 0x78787878u;
-                constexpr uint32_t SWAR_XOR = 0x80808080u;
-                packed_groups[g] = static_cast<int32_t>(((raw & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
-                packed_groups[g + 4] = static_cast<int32_t>((((raw >> 4) & NIBBLE_MASK) + SWAR_ADD) ^ SWAR_XOR);
-            }
-            else
-            {
-                packed_groups[g] = static_cast<int32_t>(raw & NIBBLE_MASK);
-                packed_groups[g + 4] = static_cast<int32_t>((raw >> 4) & NIBBLE_MASK);
-            }
+            const unsigned h0=moe_native_group_byte<Ordered>(payload,4,previous_dot);
+            const unsigned h1=moe_native_group_byte<Ordered>(payload,5,previous_dot);
+            high=((h0|(h1<<8))>>(3*lookup))&7;
         }
+        else high=(moe_native_group_byte<Ordered>(payload,4+lookup/2,previous_dot)>>((lookup%2)*4))&7;
+        const uint64_t grid=table_view.iq1(qs|(high<<8));
+        return group&1?static_cast<int32_t>(static_cast<uint32_t>(grid>>32)):
+            static_cast<int32_t>(static_cast<uint32_t>(grid));
     }
+    else if constexpr(Traits::is_8bit)
+        return static_cast<int32_t>(moe_native_group_word<Ordered>(payload,group*4,previous_dot));
+    else return moe_decode_q4_group<FMT>(moe_native_group_word<Ordered>(payload,(group%4)*4,previous_dot),group>=4);
+}
+
+/**
+ * @brief Decode the original eight groups through the canonical single-group mapping.
+ * @tparam FMT Existing supported physical decoder.
+ * @param payload Original canonical block. @param packed_groups Receives groups0..7 unchanged.
+ */
+template<NativeQuantisedFormat FMT>
+__device__ __forceinline__ void moe_decode_native_quantised_groups(
+    const uint8_t* __restrict__ payload,int32_t* packed_groups)
+{
+    #pragma unroll
+    for(unsigned group=0;group<8;++group)
+        packed_groups[group]=moe_decode_native_quantised_group<FMT>(payload,group);
 }
 
 template <NativeQuantisedFormat FMT>
@@ -3363,6 +3480,12 @@ __global__ void moe_grouped_native_quantised_gate_up_runtime_kernel_t(
     }
     const DeviceMoEPlacementBankView &bank =
         moe_runtime_placement_banks(runtime)[execution_bank];
+    if (!moe_runtime_native_descriptor_selected(runtime, bank, expert_id))
+    {
+        gate_outputs[slot][n] = 0.0f;
+        up_outputs[slot][n] = 0.0f;
+        return;
+    }
     const DeviceNativeQuantisedMatrixDesc gate_desc = bank.experts[expert_id].gate;
     const DeviceNativeQuantisedMatrixDesc up_desc = bank.experts[expert_id].up;
     if (!native_quantised_desc_shape_ok<FMT>(gate_desc, N, K) ||
@@ -3427,6 +3550,12 @@ __global__ void moe_grouped_native_quantised_gate_up_runtime_kpart_kernel_t(
     }
     const DeviceMoEPlacementBankView &bank =
         moe_runtime_placement_banks(runtime)[execution_bank];
+    if (!moe_runtime_native_descriptor_selected(runtime, bank, expert_id))
+    {
+        gate_partials[partial_index] = 0.0f;
+        up_partials[partial_index] = 0.0f;
+        return;
+    }
     const DeviceNativeQuantisedMatrixDesc gate_desc = bank.experts[expert_id].gate;
     const DeviceNativeQuantisedMatrixDesc up_desc = bank.experts[expert_id].up;
     if (!native_quantised_desc_shape_ok<FMT>(gate_desc, N, K) ||
@@ -3498,6 +3627,11 @@ __global__ void moe_grouped_native_quantised_down_runtime_route_kernel_t(
     const int blocks_per_row = K / 32;
     const DeviceMoEPlacementBankView &bank =
         moe_runtime_placement_banks(runtime)[execution_bank];
+    if (!moe_runtime_native_descriptor_selected(runtime, bank, expert_id))
+    {
+        route_output[output_index] = 0.0f;
+        return;
+    }
     const DeviceNativeQuantisedMatrixDesc desc = bank.experts[expert_id].down;
     if (!native_quantised_desc_shape_ok<FMT>(desc, N, K))
     {
@@ -3558,6 +3692,11 @@ __global__ void moe_grouped_native_quantised_down_runtime_kpart_kernel_t(
     }
     const DeviceMoEPlacementBankView &bank =
         moe_runtime_placement_banks(runtime)[execution_bank];
+    if (!moe_runtime_native_descriptor_selected(runtime, bank, expert_id))
+    {
+        partials[partial_index] = 0.0f;
+        return;
+    }
     const DeviceNativeQuantisedMatrixDesc desc = bank.experts[expert_id].down;
     if (!native_quantised_desc_shape_ok<FMT>(desc, N, K))
     {
@@ -3645,11 +3784,13 @@ __device__ __forceinline__ int moe_native_quantised_descriptor_k_partitions(
 
 /**
  * @brief Decode one descriptor using its physical execution codebook.
+ * @tparam DecoderMask Cold immutable compiled decoder family; original generic callers retain the complete mask.
  *
  * The switch is uniform for every lane in a `(route, K-partition)` block.  It
  * therefore preserves the specialized decoder bodies while allowing a single
  * captured graph to consume compact and streamed-expanded expert slots.
  */
+template<std::uint32_t DecoderMask=llaminar2::rocm::ResidentMoEFFNDecoderProgram::all_decoders>
 __device__ __forceinline__ float moe_native_quantised_dot_desc_range_dynamic(
     const DeviceNativeQuantisedMatrixDesc* desc,
     int n,
@@ -3660,70 +3801,332 @@ __device__ __forceinline__ float moe_native_quantised_dot_desc_range_dynamic(
     int b_start,
     int b_end)
 {
+    static_assert(DecoderMask!=0&&(DecoderMask&~llaminar2::rocm::ResidentMoEFFNDecoderProgram::all_decoders)==0);
     if (!desc)
         return 0.0f;
     switch (static_cast<NativeQuantisedFormat>(desc->codebook_id))
     {
     case NATIVE_QUANTISED_Q4_0:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q4_0>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_Q4_0))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q4_0>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_IQ4_NL:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ4_NL>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_IQ4_NL))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ4_NL>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_IQ4_XS_SOURCE:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ4_XS_SOURCE>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_IQ4_XS_SOURCE))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ4_XS_SOURCE>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_Q4_1:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q4_1>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_Q4_1))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q4_1>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_Q5_0:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q5_0>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_Q5_0))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q5_0>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_Q5_1:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q5_1>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_Q5_1))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q5_1>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_Q6_K:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q6_K>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_Q6_K))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q6_K>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_Q3_K:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q3_K>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_Q3_K))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q3_K>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_Q2_K:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q2_K>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_Q2_K))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q2_K>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_IQ3_S:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ3_S>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_IQ3_S))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ3_S>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_IQ3_XXS:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ3_XXS>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_IQ3_XXS))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ3_XXS>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_IQ2_S:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ2_S>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_IQ2_S))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ2_S>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_IQ2_XS:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ2_XS>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_IQ2_XS))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ2_XS>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_IQ2_XXS:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ2_XXS>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_IQ2_XXS))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ2_XXS>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_IQ1_S:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ1_S>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_IQ1_S))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ1_S>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_IQ1_M:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ1_M>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_IQ1_M))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_IQ1_M>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_Q8_0:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q8_0>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_Q8_0))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_Q8_0>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     case NATIVE_QUANTISED_EXPANDED_INT8_MIN:
-        return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_EXPANDED_INT8_MIN>(
-            *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        if constexpr((DecoderMask&(1u<<NATIVE_QUANTISED_EXPANDED_INT8_MIN))!=0)
+            return moe_native_quantised_dot_desc_range<NATIVE_QUANTISED_EXPANDED_INT8_MIN>(
+                *desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+        break;
     default:
-        // Descriptor publication validates this before the graph can observe it.
-        __builtin_trap();
-        return 0.0f;
+        break;
+    }
+    // Both unknown physical formats and formats excluded by this admitted
+    // compiled family are fatal; no wider decoder recovery is available.
+    __builtin_trap();
+    return 0.0f;
+}
+
+/**
+ * @brief List exactly the emitted paired programs, not a second format policy.
+ * @details The proof below exhausts the existing execution-decoder inventory
+ * and canonical gate/up compatibility predicate. Extending either authority
+ * without extending this closed emitted registry fails compilation.
+ */
+#define LLAMINAR_MOE_PAIRED_K32_PROGRAMS(Apply) \
+    Apply(NATIVE_QUANTISED_Q4_0,NATIVE_QUANTISED_Q4_0) \
+    Apply(NATIVE_QUANTISED_IQ4_NL,NATIVE_QUANTISED_IQ4_NL) \
+    Apply(NATIVE_QUANTISED_IQ4_XS_SOURCE,NATIVE_QUANTISED_IQ4_XS_SOURCE) \
+    Apply(NATIVE_QUANTISED_Q4_1,NATIVE_QUANTISED_Q4_1) \
+    Apply(NATIVE_QUANTISED_Q5_0,NATIVE_QUANTISED_Q5_0) \
+    Apply(NATIVE_QUANTISED_Q5_1,NATIVE_QUANTISED_Q5_1) \
+    Apply(NATIVE_QUANTISED_Q6_K,NATIVE_QUANTISED_Q6_K) \
+    Apply(NATIVE_QUANTISED_Q3_K,NATIVE_QUANTISED_Q3_K) \
+    Apply(NATIVE_QUANTISED_Q2_K,NATIVE_QUANTISED_Q2_K) \
+    Apply(NATIVE_QUANTISED_IQ3_S,NATIVE_QUANTISED_IQ3_S) \
+    Apply(NATIVE_QUANTISED_IQ3_XXS,NATIVE_QUANTISED_IQ3_XXS) \
+    Apply(NATIVE_QUANTISED_IQ2_S,NATIVE_QUANTISED_IQ2_S) \
+    Apply(NATIVE_QUANTISED_IQ2_XS,NATIVE_QUANTISED_IQ2_XS) \
+    Apply(NATIVE_QUANTISED_IQ2_XXS,NATIVE_QUANTISED_IQ2_XXS) \
+    Apply(NATIVE_QUANTISED_IQ1_S,NATIVE_QUANTISED_IQ1_S) \
+    Apply(NATIVE_QUANTISED_IQ1_M,NATIVE_QUANTISED_IQ1_M) \
+    Apply(NATIVE_QUANTISED_Q8_0,NATIVE_QUANTISED_Q8_0) \
+    Apply(NATIVE_QUANTISED_EXPANDED_INT8_MIN,NATIVE_QUANTISED_EXPANDED_INT8_MIN) \
+    Apply(NATIVE_QUANTISED_IQ4_NL,NATIVE_QUANTISED_IQ4_XS_SOURCE) \
+    Apply(NATIVE_QUANTISED_IQ4_XS_SOURCE,NATIVE_QUANTISED_IQ4_NL)
+
+/** @return Whether the emitted programs exactly cover the canonical supported compatibility matrix. */
+constexpr bool moePairedK32RegistryMatchesCanonical() noexcept
+{
+#define LLAMINAR_MOE_PAIRED_K32_RECORD(Gate,Up) std::array<unsigned,2>{unsigned(Gate),unsigned(Up)},
+    constexpr std::array programs{LLAMINAR_MOE_PAIRED_K32_PROGRAMS(LLAMINAR_MOE_PAIRED_K32_RECORD)};
+#undef LLAMINAR_MOE_PAIRED_K32_RECORD
+    constexpr auto supported=llaminar2::rocm::ResidentMoEFFNDecoderProgram::all_decoders;
+    unsigned gate_inventory=0,up_inventory=0;
+    for(const auto& program:programs)
+    {
+        if(program[0]>=32||program[1]>=32)return false;
+        gate_inventory|=1u<<program[0];up_inventory|=1u<<program[1];
+    }
+    if(gate_inventory!=supported||up_inventory!=supported)return false;
+    for(unsigned gate=0;gate<32;++gate)
+    for(unsigned up=0;up<32;++up)
+    {
+        unsigned matches=0;
+        for(const auto& program:programs)matches+=(program[0]==gate&&program[1]==up);
+        const bool canonical=(supported&(1u<<gate))&&(supported&(1u<<up))&&
+            llaminar2::areNativeQuantisedGateUpCodebooksCompatible(static_cast<uint8_t>(gate),static_cast<uint8_t>(up));
+        if(matches!=(canonical?1u:0u))return false;
+    }
+    return true;
+}
+static_assert(moePairedK32RegistryMatchesCanonical(),
+    "Paired K32 programs must exactly cover the canonical decoder/compatibility inventory");
+
+/**
+ * @brief Consume one role's unchanged decoder and rounded K32 contribution.
+ * @tparam FMT Original physical decoder, independent of the other role.
+ * @param desc Original descriptor; original source-policy arithmetic stays outside execution dispatch.
+ * @param linear Exact original [K32,N] coordinate.
+ * @param a4 Once-loaded original eight activation words for this K32.
+ * @param scale Original published FP32 activation scale.
+ * @param sum Exact original eight-dot4 activation sum, shared only as an integer value.
+ * @param accumulator This role's original increasing-block FP32 chain.
+ * @note Only one decoded8word weight operand is live at a time. No local aggregate
+ * address escapes this force-inlined call, and no new scratch allocation exists.
+ */
+template<NativeQuantisedFormat FMT>
+__device__ __forceinline__ void moePairedK32Commit(const DeviceNativeQuantisedMatrixDesc& desc,size_t linear,
+    const int32_t* a4,float scale,int32_t sum,float& accumulator)
+{
+    const auto* payload=desc.payload+linear*NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
+    int32_t groups[8];
+    moe_decode_native_quantised_groups<FMT>(payload,groups);
+    native_quantised_small_m_accumulate_decoded_block<FMT>(accumulator,a4,groups,payload,
+        static_cast<const uint16_t*>(desc.scales),static_cast<const uint16_t*>(desc.mins),
+        static_cast<const uint32_t*>(desc.emins),linear,scale,sum);
+}
+/**
+ * @brief Commit the unchanged canonical block from immutable planes captured before the loop.
+ * @tparam FMT Original independently admitted execution decoder.
+ * @param payload_base Original prepared payload plane; no descriptor aggregate copy.
+ * @param scales Original primary metadata plane. @param mins Original secondary metadata plane.
+ * @param emins Original dual-minimum plane. @param linear Original [K32,N] coordinate.
+ * @param a4 Shared once-loaded activation words. @param scale Original FP32 sidecar value.
+ * @param sum Shared exact integer sum. @param accumulator Original role-owned ascending chain.
+ * @note The caller reads these pointers once before any rounded commit. Keeping
+ * scalar plane values separate avoids descriptor rereads across numerical
+ * compiler barriers without introducing another live allocation or byte authority.
+ */
+template<NativeQuantisedFormat FMT>
+__device__ __forceinline__ void moePairedK32CommitPlanes(const uint8_t* payload_base,
+    const uint16_t* scales,const uint16_t* mins,const uint32_t* emins,size_t linear,
+    const int32_t* a4,float scale,int32_t sum,float& accumulator)
+{
+    const auto* payload=payload_base+linear*NATIVE_QUANTISEDTraits<FMT>::payload_bytes;
+    int32_t groups[8];
+    moe_decode_native_quantised_groups<FMT>(payload,groups);
+    native_quantised_small_m_accumulate_decoded_block<FMT>(accumulator,a4,groups,payload,
+        scales,mins,emins,linear,scale,sum);
+}
+/**
+ * @brief Walk only the union of two original partition ranges, sharing identical activations.
+ * @tparam Gate Original gate physical format selected once before the K32 loop.
+ * @tparam Up Original up physical format selected by the same canonical compatibility registry.
+ * @param gate Original gate descriptor. @param up Original up descriptor.
+ * @param n Original column lane. @param input Original Q8 hidden row.
+ * @param scales Original FP32 block scales. @param N Original column count.
+ * @param K Original reduction width. @param gate_begin Gate's original first K32.
+ * @param gate_end Gate's original exclusive last K32. @param up_begin Up's original first K32.
+ * @param up_end Up's original exclusive last K32. @param gate_acc Original gate partial result.
+ * @param up_acc Original up partial result.
+ * @details Each role sees exactly its original ascending block subsequence and
+ * canonical per-format contribution helper. Gaps are skipped before any input
+ * load. Invalid original shapes contribute+0 exactly as the original range dot.
+ * Integer sum sharing does not change IQ dual-half/subgroup correction helpers.
+ */
+template<NativeQuantisedFormat Gate,NativeQuantisedFormat Up>
+__device__ __forceinline__ void moePairedK32RangeTyped(const DeviceNativeQuantisedMatrixDesc& gate,
+    const DeviceNativeQuantisedMatrixDesc& up,int n,const int8_t* input,const float* scales,int N,int K,
+    int gate_begin,int gate_end,int up_begin,int up_end,float& gate_acc,float& up_acc)
+{
+    static_assert(llaminar2::areNativeQuantisedGateUpCodebooksCompatible(uint8_t(Gate),uint8_t(Up)));
+    gate_acc=0.0f;up_acc=0.0f;
+    if(!input||!scales||n<0||n>=N||K<=0||K%32)return;
+    const bool valid_gate=native_quantised_desc_shape_ok<Gate>(gate,N,K);
+    const bool valid_up=native_quantised_desc_shape_ok<Up>(up,N,K);
+    if(valid_gate&&valid_up&&gate_begin==up_begin&&gate_end==up_end)
+    {
+        // Authenticate the equality once. Each role still owns its original
+        // range; equal ranges permit unconditional commits to independent chains.
+        // Read immutable plane addresses before the loop, rather than requesting
+        // descriptor fields again after a canonical rounded-operation barrier.
+        const uint8_t* gate_payload=gate.payload;
+        const uint16_t* gate_scales=static_cast<const uint16_t*>(gate.scales);
+        const uint16_t* gate_mins=static_cast<const uint16_t*>(gate.mins);
+        const uint32_t* gate_emins=static_cast<const uint32_t*>(gate.emins);
+        const uint8_t* up_payload=up.payload;
+        const uint16_t* up_scales=static_cast<const uint16_t*>(up.scales);
+        const uint16_t* up_mins=static_cast<const uint16_t*>(up.mins);
+        const uint32_t* up_emins=static_cast<const uint32_t*>(up.emins);
+        #pragma unroll 1
+        for(int b=gate_begin;b<gate_end;++b)
+        {
+            const auto* source=reinterpret_cast<const int32_t*>(input+size_t(b)*32u);
+            int32_t activation[8];
+            #pragma unroll
+            for(int word=0;word<8;++word)activation[word]=source[word];
+            const float scale=scales[b];
+            int32_t sum=0;
+            if constexpr(NATIVE_QUANTISEDTraits<Gate>::is_asymmetric||NATIVE_QUANTISEDTraits<Up>::is_asymmetric)
+            {
+                #pragma unroll
+                for(int word=0;word<8;++word)
+                    sum=::llaminar2::rocm_integer_contract::signedDot4(activation[word],0x01010101,sum);
+            }
+            const size_t linear=size_t(b)*size_t(N)+size_t(n);
+            moePairedK32CommitPlanes<Gate>(gate_payload,gate_scales,gate_mins,gate_emins,
+                linear,activation,scale,sum,gate_acc);
+            moePairedK32CommitPlanes<Up>(up_payload,up_scales,up_mins,up_emins,
+                linear,activation,scale,sum,up_acc);
+        }
+        return;
+    }
+    // Unequal ranges or one invalid original role retain the existing exact
+    // union walk, including skipped gaps, role-specific+0 and source metadata.
+    const int first=min(gate_begin,up_begin),last=max(gate_end,up_end);
+    #pragma unroll 1
+    for(int b=first;b<last;++b)
+    {
+        const bool active_gate=valid_gate&&b>=gate_begin&&b<gate_end;
+        const bool active_up=valid_up&&b>=up_begin&&b<up_end;
+        if(!active_gate&&!active_up)continue; // No activation read or padded contribution in a gap.
+        const auto* source=reinterpret_cast<const int32_t*>(input+size_t(b)*32u);
+        int32_t activation[8];
+        #pragma unroll
+        for(int word=0;word<8;++word)activation[word]=source[word];
+        const float scale=scales[b];
+        const bool needs_sum=(active_gate&&NATIVE_QUANTISEDTraits<Gate>::is_asymmetric)||
+            (active_up&&NATIVE_QUANTISEDTraits<Up>::is_asymmetric);
+        int32_t sum=0;
+        if(needs_sum)
+        {
+            #pragma unroll
+            for(int word=0;word<8;++word)
+                sum=::llaminar2::rocm_integer_contract::signedDot4(activation[word],0x01010101,sum);
+        }
+        const size_t linear=size_t(b)*size_t(N)+size_t(n);
+        if(active_gate)moePairedK32Commit<Gate>(gate,linear,activation,scale,sum,gate_acc);
+        if(active_up)moePairedK32Commit<Up>(up,linear,activation,scale,sum,up_acc);
     }
 }
+/**
+ * @brief Select exactly one admitted format pair before entering the original K32 partition walk.
+ * @param gate Original gate descriptor. @param up Original up descriptor.
+ * @param n Original column lane. @param input Original Q8 hidden row.
+ * @param scales Original FP32 block scales. @param N Original column count.
+ * @param K Original reduction width. @param gate_begin Gate's original first K32.
+ * @param gate_end Gate's original exclusive last K32. @param up_begin Up's original first K32.
+ * @param up_end Up's original exclusive last K32. @param gate_acc Original gate partial result.
+ * @param up_acc Original up partial result.
+ * @note The registry is compile-time checked against the existing canonical
+ * predicate. An unknown or incompatible pair traps; no per-block dispatcher,
+ * wider Cartesian family or automatic generic recovery exists.
+ */
+__device__ __forceinline__ void moePairedK32Range(const DeviceNativeQuantisedMatrixDesc& gate,
+    const DeviceNativeQuantisedMatrixDesc& up,int n,const int8_t* input,const float* scales,int N,int K,
+    int gate_begin,int gate_end,int up_begin,int up_end,float& gate_acc,float& up_acc)
+{
+    const unsigned key=(unsigned(gate.codebook_id)<<8)|unsigned(up.codebook_id);
+    switch(key)
+    {
+#define LLAMINAR_MOE_PAIRED_K32_CASE(Gate,Up) \
+    case (unsigned(Gate)<<8)|unsigned(Up): \
+        moePairedK32RangeTyped<Gate,Up>(gate,up,n,input,scales,N,K,gate_begin,gate_end,up_begin,up_end,gate_acc,up_acc);return;
+        LLAMINAR_MOE_PAIRED_K32_PROGRAMS(LLAMINAR_MOE_PAIRED_K32_CASE)
+#undef LLAMINAR_MOE_PAIRED_K32_CASE
+    default:__builtin_trap();return;
+    }
+}
+#undef LLAMINAR_MOE_PAIRED_K32_PROGRAMS
 
 /**
  * @brief Load gate/up descriptors from a static table or the active runtime bank.
@@ -3748,6 +4151,7 @@ __device__ __forceinline__ bool moe_native_quantised_load_gate_up_descriptors(
             return false;
         const DeviceMoEPlacementBankView& bank =
             moe_runtime_placement_banks(runtime)[execution_bank];
+        if (!moe_runtime_native_descriptor_selected(runtime, bank, expert_id)) return false;
         gate_desc = &bank.experts[expert_id].gate;
         up_desc = &bank.experts[expert_id].up;
     }
@@ -3778,6 +4182,7 @@ __device__ __forceinline__ bool moe_native_quantised_load_down_descriptor(
             return false;
         const DeviceMoEPlacementBankView& bank =
             moe_runtime_placement_banks(runtime)[execution_bank];
+        if (!moe_runtime_native_descriptor_selected(runtime, bank, expert_id)) return false;
         down_desc = &bank.experts[expert_id].down;
     }
     else
@@ -3790,8 +4195,13 @@ __device__ __forceinline__ bool moe_native_quantised_load_down_descriptor(
 /**
  * @brief Produce descriptor-local gate/up split-K partials for a stable graph.
  */
-template <bool RUNTIME_TABLE>
-__global__ void moe_grouped_native_quantised_gate_up_descriptor_kpart_kernel(
+/**
+ * @brief Execute one original indexed64-column split-K producer task.
+ * @details Original wrapper and last-producer entry share the exact body;
+ * physical completion metadata cannot change source-policy arithmetic.
+ */
+template <bool RUNTIME_TABLE,bool PairedK32=false>
+__device__ __forceinline__ void moeGateUpOriginalPartialTask(
     const int8_t* __restrict__ A_int8,
     const float* __restrict__ scales_A_blockwise,
     const DeviceNativeQuantisedMatrixDesc* __restrict__ gate_descs,
@@ -3808,12 +4218,13 @@ __global__ void moe_grouped_native_quantised_gate_up_descriptor_kpart_kernel(
     uint64_t policy_partitions_8_15,
     uint64_t policy_partitions_16_23,
     uint64_t policy_partitions_24_31,
-    int maximum_k_partitions)
+    int maximum_k_partitions,
+    unsigned logical_tile,unsigned logical_route,unsigned logical_part,unsigned logical_lane)
 {
     constexpr int TILE_N = 64;
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int route = blockIdx.y;
-    const int k_part = blockIdx.z;
+    const int n = logical_tile * TILE_N + logical_lane;
+    const int route = logical_route;
+    const int k_part = logical_part;
     if (route >= num_active || n >= N ||
         k_part >= maximum_k_partitions)
     {
@@ -3857,6 +4268,19 @@ __global__ void moe_grouped_native_quantised_gate_up_descriptor_kpart_kernel(
     }
 
     const int blocks_per_row = K / 32;
+    if constexpr(PairedK32)
+    {
+        const int gate_count=(blocks_per_row+gate_partitions-1)/gate_partitions;
+        const int up_count=(blocks_per_row+up_partitions-1)/up_partitions;
+        const int gate_begin=k_part<gate_partitions?min(blocks_per_row,k_part*gate_count):blocks_per_row;
+        const int up_begin=k_part<up_partitions?min(blocks_per_row,k_part*up_count):blocks_per_row;
+        float gate_acc=0.f,up_acc=0.f;
+        moePairedK32Range(*gate_desc,*up_desc,n,A_int8,scales_A_blockwise,N,K,
+            gate_begin,min(blocks_per_row,gate_begin+gate_count),
+            up_begin,min(blocks_per_row,up_begin+up_count),gate_acc,up_acc);
+        gate_partials[partial_index]=gate_acc;up_partials[partial_index]=up_acc;
+        return;
+    }
     if (k_part < gate_partitions)
     {
         const int blocks_per_part =
@@ -3890,6 +4314,31 @@ __global__ void moe_grouped_native_quantised_gate_up_descriptor_kpart_kernel(
     {
         up_partials[partial_index] = 0.0f;
     }
+}
+
+template <bool RUNTIME_TABLE>
+__global__ void moe_grouped_native_quantised_gate_up_descriptor_kpart_kernel(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ gate_descs,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ up_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    float* __restrict__ gate_partials,
+    float* __restrict__ up_partials,
+    int num_active,
+    int N,
+    int K,
+    int num_experts,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31,
+    int maximum_k_partitions)
+{
+    moeGateUpOriginalPartialTask<RUNTIME_TABLE>(
+        A_int8, scales_A_blockwise, gate_descs, up_descs, runtime, expert_ids, gate_partials, up_partials, num_active, N, K, num_experts, policy_partitions_0_7, policy_partitions_8_15, policy_partitions_16_23, policy_partitions_24_31, maximum_k_partitions,
+        blockIdx.x,blockIdx.y,blockIdx.z,threadIdx.x);
 }
 
 /**
@@ -3993,6 +4442,50 @@ __global__ void moe_grouped_native_quantised_gate_up_descriptor_reduce_kernel(
     up_outputs[route][n] = up_sum;
 }
 
+/** @brief Closed fold load scheduling: staged arithmetic remains the original one-part loop. */
+enum class MoEGateUpFoldLoads {Original,TwoPartialLookahead};
+/**
+ * @brief Load two independent partials before executing their original ordered additions.
+ * @param partials Original immutable source-policy partial bank after publication.
+ * @param partitions Authenticated positive original descriptor-local partition count.
+ * @param num_active Exact original route count used by every producer.
+ * @param route Original route index, unchanged by load scheduling.
+ * @param columns Original output width/producer bank stride.
+ * @param column Original active column index.
+ * @return Bit-identical direct partial for P1, otherwise the original ascending-partition RN sum.
+ * @details At most two partial values are pending. The odd final partition is
+ * loaded only when in bounds; no padding or another source policy is consumed.
+ * Each addition still depends on the immediately preceding accumulator. These
+ * independent memory loads do not authorize reassociation or a wider reduction.
+ */
+__device__ __forceinline__ float moeGateUpTwoPartialLookaheadSum(
+    const float* __restrict__ partials,int partitions,int num_active,int route,int columns,int column)
+{
+    const size_t first=static_cast<size_t>(route)*static_cast<size_t>(columns)+static_cast<size_t>(column);
+    if(partitions==1)return partials[first]; // Preserve the original signed-zero direct publication.
+    float sum=0.0f;
+    int part=0;
+    #pragma unroll 1
+    for(;part+1<partitions;part+=2)
+    {
+        const size_t first_index=(static_cast<size_t>(part)*static_cast<size_t>(num_active)+
+            static_cast<size_t>(route))*static_cast<size_t>(columns)+static_cast<size_t>(column);
+        const size_t second_index=(static_cast<size_t>(part+1)*static_cast<size_t>(num_active)+
+            static_cast<size_t>(route))*static_cast<size_t>(columns)+static_cast<size_t>(column);
+        const float first_value=partials[first_index];
+        const float second_value=partials[second_index];
+        sum=rocm_native_quantised_accumulate_rn(sum,first_value);
+        sum=rocm_native_quantised_accumulate_rn(sum,second_value);
+    }
+    if(part<partitions)
+    {
+        const size_t tail_index=(static_cast<size_t>(part)*static_cast<size_t>(num_active)+
+            static_cast<size_t>(route))*static_cast<size_t>(columns)+static_cast<size_t>(column);
+        sum=rocm_native_quantised_accumulate_rn(sum,partials[tail_index]);
+    }
+    return sum;
+}
+
 /**
  * @brief Reduce gate/up partials and publish the exact Q8 SwiGLU row in-place.
  *
@@ -4010,9 +4503,8 @@ __global__ void moe_grouped_native_quantised_gate_up_descriptor_reduce_kernel(
  * untouched: the down kernel authenticates the same negative expert id before
  * reading that scratch and publishes a zero canonical route row.
  */
-template <bool RUNTIME_TABLE>
-__global__ void
-moe_grouped_native_quantised_gate_up_descriptor_reduce_swiglu_q8_kernel(
+template <bool RUNTIME_TABLE,MoEGateUpFoldLoads Loads=MoEGateUpFoldLoads::Original>
+__device__ __forceinline__ void moeGateUpOriginalFoldSwiGLUQ8Task(
     const float* __restrict__ gate_partials,
     const float* __restrict__ up_partials,
     const DeviceNativeQuantisedMatrixDesc* __restrict__ gate_descs,
@@ -4027,12 +4519,14 @@ moe_grouped_native_quantised_gate_up_descriptor_reduce_swiglu_q8_kernel(
     uint64_t policy_partitions_0_7,
     uint64_t policy_partitions_8_15,
     uint64_t policy_partitions_16_23,
-    uint64_t policy_partitions_24_31)
+    uint64_t policy_partitions_24_31,
+    unsigned logical_tile,unsigned logical_route,unsigned logical_lane)
 {
+    static_assert(Loads==MoEGateUpFoldLoads::Original||Loads==MoEGateUpFoldLoads::TwoPartialLookahead);
     constexpr int TILE_N = 64;
     constexpr int Q8_BLOCK = 32;
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int route = blockIdx.y;
+    const int n = logical_tile * TILE_N + logical_lane;
+    const int route = logical_route;
     if (route >= num_active)
         return;
 
@@ -4074,40 +4568,48 @@ moe_grouped_native_quantised_gate_up_descriptor_reduce_swiglu_q8_kernel(
          * Preserve the one-partition signed-zero rule and the exact
          * increasing-partition FP32 addition order of the standalone reducer.
          */
-        const size_t first_partial_index =
-            static_cast<size_t>(route) * static_cast<size_t>(N) +
-            static_cast<size_t>(n);
-        gate_sum = gate_partials[first_partial_index];
-        if (gate_partitions > 1)
+        if constexpr(Loads==MoEGateUpFoldLoads::TwoPartialLookahead)
         {
-            gate_sum = 0.0f;
-            #pragma unroll 1
-            for (int part = 0; part < gate_partitions; ++part)
-            {
-                const size_t partial_index =
-                    (static_cast<size_t>(part) *
-                         static_cast<size_t>(num_active) +
-                     static_cast<size_t>(route)) * static_cast<size_t>(N) +
-                    static_cast<size_t>(n);
-                gate_sum = rocm_native_quantised_accumulate_rn(
-                    gate_sum, gate_partials[partial_index]);
-            }
+            gate_sum=moeGateUpTwoPartialLookaheadSum(gate_partials,gate_partitions,num_active,route,N,n);
+            up_sum=moeGateUpTwoPartialLookaheadSum(up_partials,up_partitions,num_active,route,N,n);
         }
-
-        up_sum = up_partials[first_partial_index];
-        if (up_partitions > 1)
+        else
         {
-            up_sum = 0.0f;
-            #pragma unroll 1
-            for (int part = 0; part < up_partitions; ++part)
+            const size_t first_partial_index =
+                static_cast<size_t>(route) * static_cast<size_t>(N) +
+                static_cast<size_t>(n);
+            gate_sum = gate_partials[first_partial_index];
+            if (gate_partitions > 1)
             {
-                const size_t partial_index =
-                    (static_cast<size_t>(part) *
-                         static_cast<size_t>(num_active) +
-                     static_cast<size_t>(route)) * static_cast<size_t>(N) +
-                    static_cast<size_t>(n);
-                up_sum = rocm_native_quantised_accumulate_rn(
-                    up_sum, up_partials[partial_index]);
+                gate_sum = 0.0f;
+                #pragma unroll 1
+                for (int part = 0; part < gate_partitions; ++part)
+                {
+                    const size_t partial_index =
+                        (static_cast<size_t>(part) *
+                             static_cast<size_t>(num_active) +
+                         static_cast<size_t>(route)) * static_cast<size_t>(N) +
+                        static_cast<size_t>(n);
+                    gate_sum = rocm_native_quantised_accumulate_rn(
+                        gate_sum, gate_partials[partial_index]);
+                }
+            }
+
+            up_sum = up_partials[first_partial_index];
+            if (up_partitions > 1)
+            {
+                up_sum = 0.0f;
+                #pragma unroll 1
+                for (int part = 0; part < up_partitions; ++part)
+                {
+                    const size_t partial_index =
+                        (static_cast<size_t>(part) *
+                             static_cast<size_t>(num_active) +
+                         static_cast<size_t>(route)) * static_cast<size_t>(N) +
+                        static_cast<size_t>(n);
+                    up_sum = rocm_native_quantised_accumulate_rn(
+                        up_sum, up_partials[partial_index]);
+                }
             }
         }
     }
@@ -4129,7 +4631,7 @@ moe_grouped_native_quantised_gate_up_descriptor_reduce_swiglu_q8_kernel(
     const float scale =
         llaminar2::rocm::decode_equivalent::q8Scale(block_abs_max);
     const int q8_block = n / Q8_BLOCK;
-    const int lane = threadIdx.x & (Q8_BLOCK - 1);
+    const int lane = logical_lane & (Q8_BLOCK - 1);
     if (lane == 0)
     {
         swiglu_scales[
@@ -4143,11 +4645,168 @@ moe_grouped_native_quantised_gate_up_descriptor_reduce_swiglu_q8_kernel(
                 swiglu, scale));
 }
 
+template <bool RUNTIME_TABLE>
+__global__ void
+moe_grouped_native_quantised_gate_up_descriptor_reduce_swiglu_q8_kernel(
+    const float* __restrict__ gate_partials,
+    const float* __restrict__ up_partials,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ gate_descs,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ up_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    int8_t* __restrict__ swiglu_int8,
+    float* __restrict__ swiglu_scales,
+    int num_active,
+    int N,
+    int num_experts,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31)
+{
+    moeGateUpOriginalFoldSwiGLUQ8Task<RUNTIME_TABLE>(
+        gate_partials, up_partials, gate_descs, up_descs, runtime, expert_ids, swiglu_int8, swiglu_scales, num_active, N, num_experts, policy_partitions_0_7, policy_partitions_8_15, policy_partitions_16_23, policy_partitions_24_31,
+        blockIdx.x,blockIdx.y,threadIdx.x);
+}
+
+/**
+ * @brief Keep the original64-thread split-K grid and publish each tile from its last completed producer.
+ * @details Integer acquire/release tickets order the existing global partial
+ * stores. Every nonfinal CTA retires immediately; no spinning, cooperative
+ * launch, global residency bound, floating atomic or altered fold is involved.
+ */
+template<bool PairedK32>
+__device__ __forceinline__ void moeGateUpLastProducerBody(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ gate_descs,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ up_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    float* __restrict__ gate_partials,
+    float* __restrict__ up_partials,
+    int num_active,
+    int N,
+    int K,
+    int num_experts,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31,
+    int maximum_k_partitions,
+    int8_t* swiglu_int8,float* swiglu_scales,llaminar2::NativeTileCompletionView completion)
+{
+    using llaminar2::NativeTileCompletionDecision;
+    const unsigned tiles=(static_cast<unsigned>(N)+63u)/64u;
+    if(!completion.counters||completion.tiles!=tiles||completion.routes!=static_cast<unsigned>(num_active)||
+        completion.contributors!=static_cast<unsigned>(maximum_k_partitions)||blockDim.x!=64u||
+        blockIdx.x>=tiles||blockIdx.y>=completion.routes||blockIdx.z>=completion.contributors)__builtin_trap();
+    moeGateUpOriginalPartialTask<false,PairedK32>(
+        A_int8, scales_A_blockwise, gate_descs, up_descs, runtime, expert_ids, gate_partials, up_partials, num_active, N, K, num_experts, policy_partitions_0_7, policy_partitions_8_15, policy_partitions_16_23, policy_partitions_24_31, maximum_k_partitions,
+        blockIdx.x,blockIdx.y,blockIdx.z,threadIdx.x);
+    // A full CTA joins all original partial writers before its leader releases
+    // them into the modification-order chain. Tail lanes never return here.
+    __syncthreads();
+    __shared__ unsigned decision;
+    auto* counter=completion.counters+size_t(blockIdx.y)*completion.tiles+blockIdx.x;
+    if(threadIdx.x==0)
+    {
+        const auto result=llaminar2::native_tile_completion::arriveForPublication(
+            counter,completion.contributors);
+        if(result==NativeTileCompletionDecision::Invalid)__builtin_trap();
+        decision=static_cast<unsigned>(result);
+    }
+    // This distributes the final leader's acquired global payload to every
+    // original consumer lane before it reads the unchanged ordered bank.
+    __syncthreads();
+    if(decision!=static_cast<unsigned>(NativeTileCompletionDecision::Publish))return;
+    moeGateUpOriginalFoldSwiGLUQ8Task<false,MoEGateUpFoldLoads::TwoPartialLookahead>(
+        gate_partials,up_partials,gate_descs,up_descs,nullptr,expert_ids,
+        swiglu_int8,swiglu_scales,num_active,N,num_experts,
+        policy_partitions_0_7,policy_partitions_8_15,policy_partitions_16_23,policy_partitions_24_31,
+        blockIdx.x,blockIdx.y,threadIdx.x);
+    // Invalid routes still discharge and reset their protocol without reading
+    // stale Q8 bytes. All valid publication writes finish before reset/reuse.
+    __syncthreads();
+    if(threadIdx.x==0)llaminar2::native_tile_completion::reset(counter);
+}
+
+/** @brief Original last-producer arithmetic and load policy; oracle remains independently retained. */
+__global__ __launch_bounds__(64) void moe_grouped_native_quantised_gate_up_last_producer_kernel(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ gate_descs,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ up_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    float* __restrict__ gate_partials,
+    float* __restrict__ up_partials,
+    int num_active,
+    int N,
+    int K,
+    int num_experts,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31,
+    int maximum_k_partitions,
+    int8_t* swiglu_int8,float* swiglu_scales,llaminar2::NativeTileCompletionView completion)
+{
+    moeGateUpLastProducerBody<false>(A_int8,scales_A_blockwise,gate_descs,up_descs,runtime,expert_ids,gate_partials,up_partials,
+        num_active,N,K,num_experts,policy_partitions_0_7,policy_partitions_8_15,
+        policy_partitions_16_23,policy_partitions_24_31,maximum_k_partitions,swiglu_int8,swiglu_scales,completion);
+}
+
+/** @brief Same exact original64-thread completion with paired K32 activation/sum consumption. */
+__global__ __launch_bounds__(64) void moe_grouped_native_quantised_gate_up_paired_k32_last_producer_kernel(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ gate_descs,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ up_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    float* __restrict__ gate_partials,
+    float* __restrict__ up_partials,
+    int num_active,
+    int N,
+    int K,
+    int num_experts,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31,
+    int maximum_k_partitions,
+    int8_t* swiglu_int8,float* swiglu_scales,llaminar2::NativeTileCompletionView completion)
+{
+    moeGateUpLastProducerBody<true>(A_int8,scales_A_blockwise,gate_descs,up_descs,runtime,expert_ids,gate_partials,up_partials,
+        num_active,N,K,num_experts,policy_partitions_0_7,policy_partitions_8_15,
+        policy_partitions_16_23,policy_partitions_24_31,maximum_k_partitions,swiglu_int8,swiglu_scales,completion);
+}
+
 /**
  * @brief Produce descriptor-local down partials for table or runtime routing.
+ * @param A_int8 Original route-major Q8 down input.
+ * @param scales_A_blockwise Original route-major Q8 scales.
+ * @param down_descs Original compact immutable/runtime-published descriptor table.
+ * @param runtime Original runtime bank for the original runtime-table specialization.
+ * @param expert_ids Original selected slot IDs, including invalid/empty slots.
+ * @param partials Original partition-major [part,route,H] publication.
+ * @param num_active Original selected slot extent.
+ * @param N Original H output width.
+ * @param K Original participant-local F reduction width.
+ * @param num_experts Original descriptor table extent.
+ * @param policy_partitions_0_7 Original source-policy partition entries0..7.
+ * @param policy_partitions_8_15 Original source-policy partition entries8..15.
+ * @param policy_partitions_16_23 Original source-policy partition entries16..23.
+ * @param policy_partitions_24_31 Original source-policy partition entries24..31.
+ * @param maximum_k_partitions Original physical grid-Z extent, including zero partial obligations.
+ * @param logical_tile Original64-column grid-X coordinate.
+ * @param logical_route Original selected-slot grid-Y coordinate.
+ * @param logical_part Original split-K grid-Z coordinate.
+ * @param logical_lane Original64-thread column lane.
  */
 template <bool RUNTIME_TABLE>
-__global__ void moe_grouped_native_quantised_down_descriptor_kpart_kernel(
+__device__ __forceinline__ void moeDownOriginalPartialTask(
     const int8_t* __restrict__ A_int8,
     const float* __restrict__ scales_A_blockwise,
     const DeviceNativeQuantisedMatrixDesc* __restrict__ down_descs,
@@ -4162,12 +4821,13 @@ __global__ void moe_grouped_native_quantised_down_descriptor_kpart_kernel(
     uint64_t policy_partitions_8_15,
     uint64_t policy_partitions_16_23,
     uint64_t policy_partitions_24_31,
-    int maximum_k_partitions)
+    int maximum_k_partitions,
+    int logical_tile,int logical_route,int logical_part,int logical_lane)
 {
     constexpr int TILE_N = 64;
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int route = blockIdx.y;
-    const int k_part = blockIdx.z;
+    const int n = logical_tile * TILE_N + logical_lane;
+    const int route = logical_route;
+    const int k_part = logical_part;
     if (route >= num_active || n >= N ||
         k_part >= maximum_k_partitions)
     {
@@ -4220,11 +4880,96 @@ __global__ void moe_grouped_native_quantised_down_descriptor_kpart_kernel(
         : 0.0f;
 }
 
+template <bool RUNTIME_TABLE>
+__global__ void moe_grouped_native_quantised_down_descriptor_kpart_kernel(
+    const int8_t* __restrict__ A_int8,
+    const float* __restrict__ scales_A_blockwise,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ down_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    float* __restrict__ partials,
+    int num_active,
+    int N,
+    int K,
+    int num_experts,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31,
+    int maximum_k_partitions)
+{
+    moeDownOriginalPartialTask<RUNTIME_TABLE>(A_int8,scales_A_blockwise,down_descs,runtime,expert_ids,partials,num_active,N,K,num_experts,policy_partitions_0_7,policy_partitions_8_15,policy_partitions_16_23,policy_partitions_24_31,maximum_k_partitions,blockIdx.x,blockIdx.y,blockIdx.z,threadIdx.x);
+}
+
+/**
+ * @brief Evaluate one original partition without changing its dot expression.
+ * @param descriptor Original admitted source/execution descriptor.
+ * @param n Participant-local output column.
+ * @param activation Exact published Q8 row.
+ * @param scales Original per-block Q8 scales.
+ * @param N Original output width.
+ * @param K Original reduction width.
+ * @param part Original serial-M1 partition index.
+ * @param partitions Original descriptor-local partition count.
+ * @return Byte-identical original split-K partial, including empty partitions.
+ */
+template<std::uint32_t DecoderMask=llaminar2::rocm::ResidentMoEFFNDecoderProgram::all_decoders>
+__device__ __forceinline__ float moe_native_quantised_block_partial(
+    const DeviceNativeQuantisedMatrixDesc* descriptor, int n,
+    const int8_t* activation, const float* scales, int N, int K,
+    int part, int partitions)
+{
+    const int blocks = K / 32;
+    const int width = (blocks + partitions - 1) / partitions;
+    const int first = part * width;
+    const int end = min(blocks, first + width);
+    return first < end
+        ? moe_native_quantised_dot_desc_range_dynamic<DecoderMask>(
+              descriptor, n, activation, scales, N, K, first, end)
+        : 0.0f;
+}
+
+/**
+ * @brief Fold CTA-owned original partitions with the serial signed-zero rule.
+ * @param partials Shared partition-major plane written before the CTA barrier.
+ * @param column Original column within the 32-column publication tile.
+ * @param partitions Exact descriptor-local arithmetic partition count.
+ * @return Original increasing-partition explicit-RN result.
+ */
+__device__ __forceinline__ float moe_native_quantised_block_fold(
+    const float* partials, int column, int partitions)
+{
+    if (partitions == 1)
+        return partials[column];
+    float value = 0.0f;
+    #pragma unroll 1
+    for (int part = 0; part < partitions; ++part)
+        value = rocm_native_quantised_accumulate_rn(
+            value, partials[part * 32 + column]);
+    return value;
+}
+
 /**
  * @brief Reduce one route's descriptor-local K tree, then apply router weight.
+ * @param partials Original partition-major partial plane.
+ * @param down_descs Original compact descriptor table.
+ * @param runtime Original runtime bank for the runtime-table specialization.
+ * @param expert_ids Original selected route IDs.
+ * @param route_weights Original selected route weights; invalid descriptors never read them.
+ * @param route_output Original public route-major weighted contribution plane.
+ * @param num_active Original selected slot extent.
+ * @param N Original H width.
+ * @param num_experts Original descriptor table extent.
+ * @param policy_partitions_0_7 Original source-policy partition entries0..7.
+ * @param policy_partitions_8_15 Original source-policy partition entries8..15.
+ * @param policy_partitions_16_23 Original source-policy partition entries16..23.
+ * @param policy_partitions_24_31 Original source-policy partition entries24..31.
+ * @param logical_tile Original64-column output tile.
+ * @param logical_route Original selected slot, without compaction or reordering.
+ * @param logical_lane Original64-thread column lane.
  */
 template <bool RUNTIME_TABLE>
-__global__ void moe_grouped_native_quantised_down_descriptor_reduce_kernel(
+__device__ __forceinline__ void moeDownOriginalWeightedFoldTask(
     const float* __restrict__ partials,
     const DeviceNativeQuantisedMatrixDesc* __restrict__ down_descs,
     const DeviceMoELayerRuntimeView* __restrict__ runtime,
@@ -4237,11 +4982,12 @@ __global__ void moe_grouped_native_quantised_down_descriptor_reduce_kernel(
     uint64_t policy_partitions_0_7,
     uint64_t policy_partitions_8_15,
     uint64_t policy_partitions_16_23,
-    uint64_t policy_partitions_24_31)
+    uint64_t policy_partitions_24_31,
+    int logical_tile,int logical_route,int logical_lane)
 {
     constexpr int TILE_N = 64;
-    const int n = blockIdx.x * TILE_N + threadIdx.x;
-    const int route = blockIdx.y;
+    const int n = logical_tile * TILE_N + logical_lane;
+    const int route = logical_route;
     if (route >= num_active || n >= N)
         return;
 
@@ -4289,6 +5035,606 @@ __global__ void moe_grouped_native_quantised_down_descriptor_reduce_kernel(
         route_weights[route], expert_sum);
 }
 
+template <bool RUNTIME_TABLE>
+__global__ void moe_grouped_native_quantised_down_descriptor_reduce_kernel(
+    const float* __restrict__ partials,
+    const DeviceNativeQuantisedMatrixDesc* __restrict__ down_descs,
+    const DeviceMoELayerRuntimeView* __restrict__ runtime,
+    const int* __restrict__ expert_ids,
+    const float* __restrict__ route_weights,
+    float* __restrict__ route_output,
+    int num_active,
+    int N,
+    int num_experts,
+    uint64_t policy_partitions_0_7,
+    uint64_t policy_partitions_8_15,
+    uint64_t policy_partitions_16_23,
+    uint64_t policy_partitions_24_31)
+{
+    moeDownOriginalWeightedFoldTask<RUNTIME_TABLE>(partials,down_descs,runtime,expert_ids,route_weights,route_output,num_active,N,num_experts,policy_partitions_0_7,policy_partitions_8_15,policy_partitions_16_23,policy_partitions_24_31,blockIdx.x,blockIdx.y,threadIdx.x);
+}
+
+/**
+ * @brief Complete original down partitions, then weighted canonical routes, without waiting for an unscheduled CTA.
+ * @details Physical128-thread CTAs own two adjacent ORIGINAL64-column tasks.
+ * Each lane passes the exact original virtual tile/lane to unchanged helpers;
+ * the source-policy grid-Z and every per-column partial/fold remain unchanged.
+ * One whole-CTA barrier joins both original tasks before each release arrival.
+ * The first unique publisher owns only one(tile,route); the second owns only one output tile. No CTA serializes H or
+ * recomputes another producer. Invalid descriptors still publish original +0
+ * and discharge both counter obligations. Both public planes survive unchanged.
+ * All local lanes join before each device-scope release arrival and after each
+ * unique acquire; nonfinal CTAs retire immediately. Stream order separates
+ * epochs, and only the unique owner resets each counter before kernel retirement.
+ */
+__global__ __launch_bounds__(llaminar2::NativeDownCompletionPlan::columns_per_tile) void moe_grouped_native_quantised_down_last_producer_kernel(
+    const int8_t* A,const float* scales,const DeviceNativeQuantisedMatrixDesc* descriptors,
+    const int* expert_ids,const float* weights,float* partials,float* contributions,float* output,
+    int routes,int N,int K,int experts,std::uint64_t p0,std::uint64_t p1,std::uint64_t p2,std::uint64_t p3,
+    int maximum_partitions,llaminar2::NativeDownCompletionView completion)
+{
+    constexpr unsigned PhysicalColumns=llaminar2::NativeDownCompletionPlan::columns_per_tile;
+    static_assert(PhysicalColumns==128);
+    const unsigned tiles=static_cast<unsigned>(N)/PhysicalColumns+(static_cast<unsigned>(N)%PhysicalColumns!=0);
+    const int original_tile=static_cast<int>(blockIdx.x)*2+static_cast<int>(threadIdx.x)/64;
+    const int original_lane=static_cast<int>(threadIdx.x)%64;
+    if(!completion.partitions.counters||!completion.routes||completion.partitions.tiles!=tiles||
+        completion.partitions.routes!=static_cast<unsigned>(routes)||
+        completion.partitions.contributors!=static_cast<unsigned>(maximum_partitions)||blockDim.x!=PhysicalColumns||
+        blockIdx.x>=tiles||blockIdx.y>=completion.partitions.routes||blockIdx.z>=completion.partitions.contributors)
+        __builtin_trap();
+    moeDownOriginalPartialTask<false>(A,scales,descriptors,nullptr,expert_ids,partials,
+        routes,N,K,experts,p0,p1,p2,p3,maximum_partitions,original_tile,blockIdx.y,blockIdx.z,original_lane);
+    __syncthreads();
+    __shared__ llaminar2::NativeTileCompletionDecision decision;
+    auto* const partition_counter=completion.partitions.counters+
+        static_cast<std::size_t>(blockIdx.y)*completion.partitions.tiles+blockIdx.x;
+    if(threadIdx.x==0)
+    {
+        decision=llaminar2::native_tile_completion::arriveForPublication(partition_counter,completion.partitions.contributors);
+        if(decision==llaminar2::NativeTileCompletionDecision::Invalid)__builtin_trap();
+    }
+    __syncthreads();
+    if(decision!=llaminar2::NativeTileCompletionDecision::Publish)return;
+    moeDownOriginalWeightedFoldTask<false>(partials,descriptors,nullptr,expert_ids,weights,contributions,
+        routes,N,experts,p0,p1,p2,p3,original_tile,blockIdx.y,original_lane);
+    __syncthreads();
+    if(threadIdx.x==0)
+    {
+        llaminar2::native_tile_completion::reset(partition_counter);
+        decision=llaminar2::native_tile_completion::arriveForPublication(
+            completion.routes+blockIdx.x,completion.partitions.routes);
+        if(decision==llaminar2::NativeTileCompletionDecision::Invalid)__builtin_trap();
+    }
+    __syncthreads();
+    if(decision!=llaminar2::NativeTileCompletionDecision::Publish)return;
+    const int n=original_tile*64+original_lane;
+    if(n<N)
+        output[n]=llaminar2::device_ordered_route_fold::sum(contributions+n,static_cast<std::size_t>(N),routes);
+    __syncthreads();
+    if(threadIdx.x==0)llaminar2::native_tile_completion::reset(completion.routes+blockIdx.x);
+}
+
+/**
+ * @brief Original descriptor partial fold indexed independently of a native grid.
+ * @param partials Original partition-major [part,route,column] plane.
+ * @param route Original selected slot, never a compacted ordinal.
+ * @param column Original output column.
+ * @param routes Exact original selected slot count.
+ * @param columns Original physical column stride.
+ * @param partitions Original descriptor-local serial-M1 arithmetic count.
+ * @return Existing increasing-partition RN result, including one-part signed zero.
+ */
+__device__ __forceinline__ float residentMoEOrderedPartial(const float* partials,int route,int column,
+    int routes,int columns,int partitions)
+{
+    const auto first=static_cast<size_t>(route)*columns+column;
+    if(partitions==1)return partials[first];
+    float sum=0.f;
+    #pragma unroll 1
+    for(int part=0;part<partitions;++part)
+        sum=rocm_native_quantised_accumulate_rn(sum,partials[(static_cast<size_t>(part)*routes+route)*columns+column]);
+    return sum;
+}
+
+/** @brief Authenticate the exact physical role envelope and original source-policy entry; absence is fatal. */
+__device__ __forceinline__ int residentMoEPartitions(const DeviceNativeQuantisedMatrixDesc* desc,
+    llaminar2::rocm::ResidentMoEPartitionPolicy policy,std::uint32_t execution_mask)
+{
+    if(!desc||!llaminar2::rocm::residentMoEFFNDecoderAllows(execution_mask,desc->codebook_id))__builtin_trap();
+    const int count=moe_native_quantised_descriptor_k_partitions(desc,policy.p0,policy.p1,policy.p2,policy.p3);
+    if(count<=0||count>int(policy.maximum))__builtin_trap();
+    return count;
+}
+
+/**
+ * @brief Complete post-router local routed/shared FFN under native grid ordering.
+ * @tparam TaskIndex Cold-selected uint32 or uint64 task scheduling, never tensor address arithmetic.
+ * @tparam DecoderMask Complete immutable execution-envelope group union, independent of source arithmetic policy.
+ * @param a Original source-authenticated descriptor/runtime and persistent arena views.
+ * @details All CTAs reach every grid.sync. Each numerical task keeps its original
+ * K partition and scalar contribution helper; changing physical resident workers
+ * changes scheduling only. Four independent 64-column teams retain the original
+ * producer wave layout inside each physical 256-thread CTA. Routed scratch dies
+ * before the shared branch reuses it, matching the original nonconcurrent arena plan. Public intermediate
+ * tensors and canonical route contributions retain their original values.
+ */
+// Shared descriptor addresses name original immutable arena tables. No helper
+// takes an address into this by-value argument, avoiding a private kernarg copy.
+template<class TaskIndex,std::uint32_t DecoderMask>
+__global__ __launch_bounds__(256,1) void rocmResidentMoEFFNKernel(const llaminar2::rocm::ResidentMoEFFNArgs a)
+{
+    static_assert(DecoderMask!=0&&(DecoderMask&~llaminar2::rocm::ResidentMoEFFNDecoderProgram::all_decoders)==0);
+    const auto grid=cooperative_groups::this_grid();
+    if(!grid.is_valid())__builtin_trap();
+    const unsigned lane=threadIdx.x;
+    const unsigned team_lane=lane%64;
+    // Shipping kernels compile with the original wave64 contract. The team is
+    // uniform within that wave, allowing descriptor/task division in scalar
+    // registers while four waves retain independent projection tasks.
+    const auto team=static_cast<unsigned>(__builtin_amdgcn_readfirstlane(static_cast<int>(lane/64)));
+    const TaskIndex first_task=TaskIndex(blockIdx.x)*4+team;
+    const TaskIndex task_stride=TaskIndex(gridDim.x)*4;
+    using llaminar2::rocm::residentMoEFFNNextTask;
+    using llaminar2::rocm::residentMoEFFNTaskCoordinates;
+    const auto* runtime=reinterpret_cast<const DeviceMoELayerRuntimeView*>(a.runtime);
+    const int H=a.hidden_columns;
+    const bool live=a.rows.activeRows()!=0;
+    if(!live)
+    {
+        for(size_t i=size_t(blockIdx.x)*256+lane;i<size_t(a.top_k)*H;i+=size_t(gridDim.x)*256)
+            a.route_contributions[i]=0.f;
+        for(size_t n=size_t(blockIdx.x)*256+lane;n<size_t(H);n+=size_t(gridDim.x)*256)
+        {a.routed_output[n]=0.f;}
+    }
+    if(live&&(!runtime||runtime->expert_count!=unsigned(a.experts)||runtime->top_k!=unsigned(a.top_k)||
+        !runtime->intermediate_shard.sameIdentity(a.original)||
+        moe_runtime_execution_bank(runtime)==kInvalidMoERuntimeExecutionBank))__builtin_trap();
+
+    // The same original blockwise publisher serves both nonconcurrent branches.
+    // Every Q8 group remains a complete original32-lane XOR maximum reduction.
+    for(size_t block=size_t(blockIdx.x)*8+lane/32;block<size_t(H/32);block+=size_t(gridDim.x)*8)
+    {
+        const size_t n=block*32+lane%32;
+        const float value=a.hidden[n];float maximum=fabsf(value);
+        #pragma unroll
+        for(int mask=16;mask>0;mask>>=1)maximum=fmaxf(maximum,__shfl_xor(maximum,mask));
+        const float scale=llaminar2::rocm::decode_equivalent::q8Scale(maximum);
+        a.hidden_q8[n]=static_cast<int8_t>(llaminar2::rocm::decode_equivalent::quantizeQ8FromScale(value,scale));
+        if((lane%32)==0)a.hidden_scales[block]=scale;
+    }
+    grid.sync();
+    // Two source-declared branches execute sequentially because their original
+    // arena planes are shared, never concurrent. This is not serial row replay.
+    for(int shared=0;shared<2;++shared)
+    {
+        // Ordinary shared-table M1 computes its public FP32 gate/up planes
+        // even when the final gate epilogue masks an inactive row. Retain that
+        // publication while never dereferencing inactive routed slot state.
+        if(!shared&&!live)continue;
+        const int F=shared?a.shared_columns:a.routed_columns;
+        const int routes=shared?1:a.top_k;
+        const auto gate_policy=shared?a.shared_gate_policy:a.routed_gate_policy;
+        const auto down_policy=shared?a.shared_down_policy:a.routed_down_policy;
+        const auto gate_execution=shared?a.execution.shared_gate:a.execution.routed_gate;
+        const auto down_execution=shared?a.execution.shared_down:a.execution.routed_down;
+        const TaskIndex gate_tiles=(static_cast<unsigned>(F)+63u)/64u;
+        const TaskIndex route_count=static_cast<unsigned>(routes);
+        const TaskIndex gate_tasks=gate_tiles*route_count*gate_policy.maximum;
+        for(TaskIndex task=first_task;task<gate_tasks;task=residentMoEFFNNextTask(task,gate_tasks,task_stride))
+        {
+            const auto coordinate=residentMoEFFNTaskCoordinates(task,gate_tiles,route_count);
+            const int route=int(coordinate.route),part=int(coordinate.partition);
+            const size_t n=size_t(coordinate.tile)*64+team_lane;
+            const DeviceNativeQuantisedMatrixDesc *gate=nullptr,*up=nullptr;
+            const bool ready=shared?(gate=a.shared_gate,up=a.shared_up,true):
+                moe_native_quantised_load_gate_up_descriptors<true>(nullptr,nullptr,runtime,
+                    runtime->topk_expert_ids[route],a.experts,gate,up);
+            if(n<F)
+            {
+                const auto index=(size_t(part)*routes+route)*F+n;
+                // Keep one all-format decoder callsite and retire each scalar
+                // partial before the next projection. This phase alone writes
+                // both original arena banks; consumers wait at the unchanged
+                // following grid.sync. Only the accumulator live range changes.
+                #pragma unroll 1
+                for(int projection=0;projection<2;++projection)
+                {
+                    const auto* descriptor=projection?up:gate;
+                    float value=0.f;
+                    if(ready)
+                    {
+                        const int partitions=residentMoEPartitions(descriptor,gate_policy,gate_execution);
+                        if(part<partitions)value=moe_native_quantised_block_partial<DecoderMask>(
+                            descriptor,n,a.hidden_q8,a.hidden_scales,F,H,part,partitions);
+                    }
+                    (projection?a.up_partials:a.gate_partials)[index]=value;
+                }
+            }
+        }
+        grid.sync();
+        const TaskIndex fold_tasks=gate_tiles*route_count;
+        for(TaskIndex task=first_task;task<fold_tasks;task=residentMoEFFNNextTask(task,fold_tasks,task_stride))
+        {
+            const auto coordinate=residentMoEFFNTaskCoordinates(task,gate_tiles,route_count);
+            const int route=int(coordinate.route);
+            const size_t n=size_t(coordinate.tile)*64+team_lane;
+            const DeviceNativeQuantisedMatrixDesc *gate=nullptr,*up=nullptr;
+            const bool ready=shared?(gate=a.shared_gate,up=a.shared_up,true):
+                moe_native_quantised_load_gate_up_descriptors<true>(nullptr,nullptr,runtime,
+                    runtime->topk_expert_ids[route],a.experts,gate,up);
+            float value=0.f;
+            if(ready&&n<F)
+            {
+                const float g=residentMoEOrderedPartial(a.gate_partials,route,n,routes,F,residentMoEPartitions(gate,gate_policy,gate_execution));
+                const float u=residentMoEOrderedPartial(a.up_partials,route,n,routes,F,residentMoEPartitions(up,gate_policy,gate_execution));
+                if(shared){a.shared_gate_output[n]=g;a.shared_up_output[n]=u;}
+                value=llaminar2::rocm::decode_equivalent::swigluValue(g,u);
+            }
+            float maximum=fabsf(value);
+            #pragma unroll
+            for(int mask=16;mask>0;mask>>=1)maximum=fmaxf(maximum,__shfl_xor(maximum,mask));
+            if(ready&&n<F)
+            {
+                const float scale=llaminar2::rocm::decode_equivalent::q8Scale(maximum);
+                const auto index=size_t(route)*F+n;
+                a.swiglu_q8[index]=static_cast<int8_t>(llaminar2::rocm::decode_equivalent::quantizeQ8FromScale(value,scale));
+                if((lane%32)==0)a.swiglu_scales[size_t(route)*(F/32)+n/32]=scale;
+            }
+        }
+        grid.sync();
+        const TaskIndex down_tiles=(static_cast<unsigned>(H)+63u)/64u;
+        const TaskIndex down_tasks=down_tiles*route_count*down_policy.maximum;
+        for(TaskIndex task=first_task;task<down_tasks;task=residentMoEFFNNextTask(task,down_tasks,task_stride))
+        {
+            const auto coordinate=residentMoEFFNTaskCoordinates(task,down_tiles,route_count);
+            const int route=int(coordinate.route),part=int(coordinate.partition);
+            const size_t n=size_t(coordinate.tile)*64+team_lane;
+            const DeviceNativeQuantisedMatrixDesc* down=nullptr;
+            const bool ready=shared?(down=a.shared_down,true):moe_native_quantised_load_down_descriptor<true>(
+                nullptr,runtime,runtime->topk_expert_ids[route],a.experts,down);
+            if(n<H)
+            {
+                float value=0.f;
+                if(ready)
+                {
+                    const int parts=residentMoEPartitions(down,down_policy,down_execution);
+                    if(part<parts)value=moe_native_quantised_block_partial<DecoderMask>(down,n,a.swiglu_q8+size_t(route)*F,
+                        a.swiglu_scales+size_t(route)*(F/32),H,F,part,parts);
+                }
+                a.down_partials[(size_t(part)*routes+route)*H+n]=value;
+            }
+        }
+        grid.sync();
+        for(TaskIndex task=first_task;task<down_tiles;task=residentMoEFFNNextTask(task,down_tiles,task_stride))
+        {
+            const size_t n=size_t(task)*64+team_lane;
+            if(n<H)
+            {
+                float total=0.f;
+                for(int route=0;route<routes;++route)
+                {
+                    const DeviceNativeQuantisedMatrixDesc* down=nullptr;
+                    const bool ready=shared?(down=a.shared_down,true):moe_native_quantised_load_down_descriptor<true>(
+                        nullptr,runtime,runtime->topk_expert_ids[route],a.experts,down);
+                    float value=0.f;
+                    if(ready)value=rocm_native_quantised_weight_route_rn(shared?1.f:runtime->topk_weights[route],
+                        residentMoEOrderedPartial(a.down_partials,route,n,routes,H,residentMoEPartitions(down,down_policy,down_execution)));
+                    if(!shared)a.route_contributions[size_t(route)*H+n]=value;
+                    total=rocm_native_quantised_accumulate_rn(total,value);
+                }
+                if(shared)a.shared_output[n]=total;else a.routed_output[n]=total;
+            }
+        }
+        grid.sync(); // Close the original scratch lifetime before reusing it.
+    }
+    if(blockIdx.x==0)llaminar2::rocm::moe_shared_gate::gateAdd<false>(a.hidden,a.shared_input_gate,a.shared_output,
+        a.routed_output,a.combined_output,1,H,0,live?1:0);
+}
+
+#include "ROCmPersistentMoEFFNBody.hip.inc"
+#include "ROCmOrdinaryMoEFFNBody.hip.inc"
+
+namespace llaminar2::rocm
+{
+namespace
+{
+thread_local ResidentMoEFFNProgram g_resident_moe_ffn_program=ResidentMoEFFNProgram::Original;
+/** @brief Name both exact scheduler entries for one explicit decoder-structure union. */
+template<unsigned Groups>
+const void* residentMoEFFNFunctionForWidth(ResidentMoEFFNSchedulerWidth width)
+{
+    constexpr auto mask=ResidentMoEFFNDecoderProgram::familyMask<Groups>();
+    switch(width)
+    {
+    case ResidentMoEFFNSchedulerWidth::UInt32:
+        return reinterpret_cast<const void*>(&rocmResidentMoEFFNKernel<std::uint32_t,mask>);
+    case ResidentMoEFFNSchedulerWidth::UInt64:
+        return reinterpret_cast<const void*>(&rocmResidentMoEFFNKernel<std::uint64_t,mask>);
+    }
+    throw std::invalid_argument("Resident FFN decoder program has an invalid scheduler width");
+}
+}
+/** @copydoc currentResidentMoEFFNProgram */
+ResidentMoEFFNProgram currentResidentMoEFFNProgram() noexcept {return g_resident_moe_ffn_program;}
+/** @copydoc ScopedResidentMoEFFNProgram::ScopedResidentMoEFFNProgram */
+ScopedResidentMoEFFNProgram::ScopedResidentMoEFFNProgram(ResidentMoEFFNProgram program)
+    :previous_(g_resident_moe_ffn_program)
+{
+    if(::llaminar2::isGraphCaptureActive())throw std::logic_error("Resident FFN program must be selected before capture");
+    if(program!=ResidentMoEFFNProgram::Original&&program!=ResidentMoEFFNProgram::PartitionLocal&&
+       program!=ResidentMoEFFNProgram::OrdinaryPhases&&program!=ResidentMoEFFNProgram::NativeLayoutRouter)
+        throw std::invalid_argument("Resident FFN program selection is unknown");
+    g_resident_moe_ffn_program=program;
+}
+ScopedResidentMoEFFNProgram::~ScopedResidentMoEFFNProgram(){g_resident_moe_ffn_program=previous_;}
+
+/** @copydoc residentMoEFFNKernelFunction */
+const void* residentMoEFFNKernelFunction(ResidentMoEFFNDecoderProgram program,ResidentMoEFFNSchedulerWidth width)
+{
+    if(currentResidentMoEFFNProgram()==ResidentMoEFFNProgram::PartitionLocal)
+    {
+        if(program.groups()!=1)
+            throw std::invalid_argument("Partition-local FFN diagnostic requires the complete affine/byte execution envelope {5,7,19,23}");
+        if(width!=ResidentMoEFFNSchedulerWidth::UInt32&&width!=ResidentMoEFFNSchedulerWidth::UInt64)
+            throw std::invalid_argument("Partition-local FFN diagnostic scheduler width is unknown");
+        return width==ResidentMoEFFNSchedulerWidth::UInt32
+            ?reinterpret_cast<const void*>(&rocmPersistentMoEFFNKernel<std::uint32_t>)
+            :reinterpret_cast<const void*>(&rocmPersistentMoEFFNKernel<std::uint64_t>);
+    }
+    if(currentResidentMoEFFNProgram()==ResidentMoEFFNProgram::OrdinaryPhases)
+        throw std::invalid_argument("Ordinary FFN has two native entries; use its exact ordinary program identity");
+    // All fifteen source-envelope unions are real compiled entries. No admission
+    // failure, current route or current physical residency changes this choice.
+    switch(program.groups())
+    {
+    case 1:return residentMoEFFNFunctionForWidth<1>(width);
+    case 2:return residentMoEFFNFunctionForWidth<2>(width);
+    case 3:return residentMoEFFNFunctionForWidth<3>(width);
+    case 4:return residentMoEFFNFunctionForWidth<4>(width);
+    case 5:return residentMoEFFNFunctionForWidth<5>(width);
+    case 6:return residentMoEFFNFunctionForWidth<6>(width);
+    case 7:return residentMoEFFNFunctionForWidth<7>(width);
+    case 8:return residentMoEFFNFunctionForWidth<8>(width);
+    case 9:return residentMoEFFNFunctionForWidth<9>(width);
+    case 10:return residentMoEFFNFunctionForWidth<10>(width);
+    case 11:return residentMoEFFNFunctionForWidth<11>(width);
+    case 12:return residentMoEFFNFunctionForWidth<12>(width);
+    case 13:return residentMoEFFNFunctionForWidth<13>(width);
+    case 14:return residentMoEFFNFunctionForWidth<14>(width);
+    case 15:return residentMoEFFNFunctionForWidth<15>(width);
+    }
+    throw std::invalid_argument("Resident FFN decoder program is not in its complete registry");
+}
+namespace
+{
+/** @brief Resolve exactly the existing serial-M1 source-policy authority for either submission mechanism. */
+void resolveResidentMoEFFNPolicies(ResidentMoEFFNArgs& args,ResidentMoEFFNPolicyMasks masks)
+{
+    const auto policy=[](int N,int K,std::uint32_t mask) {
+        ROCmMoESerialM1PolicyTable original{};
+        if(!buildROCmMoESerialM1PolicyTable(N,K,mask,original))
+            throw std::invalid_argument("Resident FFN has no complete original serial-M1 partition policy");
+        return ResidentMoEPartitionPolicy{original.k_partitions_0_7,original.k_partitions_8_15,
+            original.k_partitions_16_23,original.k_partitions_24_31,original.maximum_k_partitions};
+    };
+    if(!args.runtime||!args.hidden||!args.shared_gate||!args.shared_up||!args.shared_down||
+        !args.original.enabled()||args.rows.physicalRows()!=1||
+        args.hidden_columns<=0||args.routed_columns<=0||args.shared_columns<=0||args.experts<=0||args.top_k<=0||
+        args.top_k>kDeviceMoEMaxTopK||args.hidden_columns%32||args.routed_columns%32||args.shared_columns%32)
+        throw std::invalid_argument("Resident FFN requires an original native M1 fragment and complete aligned geometry");
+    if(!masks.execution.routed_gate||!masks.execution.routed_down||
+        !masks.execution.shared_gate||!masks.execution.shared_down)
+        throw std::invalid_argument("Resident FFN requires every original physical role envelope");
+    args.execution=masks.execution;
+    args.routed_gate_policy=policy(args.routed_columns,args.hidden_columns,masks.routed_gate);
+    args.routed_down_policy=policy(args.hidden_columns,args.routed_columns,masks.routed_down);
+    args.shared_gate_policy=policy(args.shared_columns,args.hidden_columns,masks.shared_gate);
+    args.shared_down_policy=policy(args.hidden_columns,args.shared_columns,masks.shared_down);
+}
+/** @brief Cold exact ordinary function/geometry observation; residency is evidence, never a grid clamp. */
+ResidentMoEFFNEntryEvidence prepareOrdinaryMoEFFNEntry(DeviceId device,const void* function,
+    std::uint64_t grid,std::size_t dynamic_shared)
+{
+    const auto& hardware=rocmHardwareMetadata().at(device.ordinal);
+    constexpr unsigned threads=256;
+    // HSA dispatch packet work-item dimensions are uint32. The useful grid is
+    // never padded or clamped to occupancy; an unrepresentable launch rejects.
+    if(!function||!grid||grid>std::numeric_limits<unsigned>::max()/threads||
+        hardware.maximum_threads_per_block<int(threads)||dynamic_shared>hardware.lds_per_block)
+        throw std::invalid_argument("Ordinary FFN exceeds its exact native grid/CTA/LDS extent");
+    int current=-1;
+    if(hipGetDevice(&current)!=hipSuccess||current!=device.ordinal)
+        throw std::logic_error("Ordinary FFN preparation has a foreign current worker");
+    hipFuncAttributes attributes{};int resident_blocks=0;
+    if(hipFuncGetAttributes(&attributes,function)!=hipSuccess||
+        hipOccupancyMaxActiveBlocksPerMultiprocessor(&resident_blocks,function,threads,dynamic_shared)!=hipSuccess||
+        attributes.numRegs<=0||attributes.maxThreadsPerBlock<int(threads)||resident_blocks<=0||
+        attributes.localSizeBytes!=0||attributes.sharedSizeBytes>hardware.lds_per_block-dynamic_shared)
+        throw std::invalid_argument("Ordinary FFN function has invalid compiler resources or exact dynamic LDS residency");
+    return {.function=function,.grid=unsigned(grid),.threads=threads,.dynamic_shared_bytes=dynamic_shared,
+        .resources={unsigned(attributes.numRegs),unsigned(attributes.maxThreadsPerBlock),unsigned(resident_blocks),
+            attributes.localSizeBytes,attributes.sharedSizeBytes}};
+}
+/** @brief Bind two useful ordinary work grids and exact local activation/fold storage from original policies. */
+ResidentMoEFFNProgramEvidence prepareOrdinaryMoEFFNEvidence(DeviceId device,const ResidentMoEFFNArgs& args,
+    ResidentMoEFFNDecoderProgram program,std::uint64_t generation)
+{
+    const auto tiles=[](int columns,unsigned parts) {
+        if(!parts||parts>unsigned(NativeQuantisedGroupedDecodePolicy::maximum_k_partitions))
+            throw std::invalid_argument("Ordinary FFN source policy exceeds its original supported partition inventory");
+        const auto width=256/parts;
+        return (std::uint64_t(columns)+width-1)/width;
+    };
+    const auto grid_a=tiles(args.routed_columns,args.routed_gate_policy.maximum)*unsigned(args.top_k)+
+        tiles(args.shared_columns,args.shared_gate_policy.maximum);
+    const auto grid_b=(std::uint64_t(args.hidden_columns)+31)/32;
+    const auto hidden=std::uint64_t(args.hidden_columns),values=std::uint64_t(args.top_k)*args.routed_columns+args.shared_columns;
+    const auto dynamic_a=hidden+8*(hidden/32);
+    const unsigned workers=std::min(8u,args.routed_down_policy.maximum);
+    if(!workers||!args.shared_down_policy.maximum||
+        args.routed_down_policy.maximum>unsigned(NativeQuantisedGroupedDecodePolicy::maximum_k_partitions)||
+        args.shared_down_policy.maximum>unsigned(NativeQuantisedGroupedDecodePolicy::maximum_k_partitions))
+        throw std::invalid_argument("Ordinary FFN down source policy is incomplete");
+    const auto partial_rows=std::max((8/workers)*args.routed_down_policy.maximum,args.shared_down_policy.maximum);
+    const auto dynamic_b=values+8*(values/32)+std::uint64_t(32)*partial_rows*sizeof(float)+
+        std::uint64_t(args.top_k)*32*sizeof(float);
+    if(dynamic_a>std::numeric_limits<std::size_t>::max()||dynamic_b>std::numeric_limits<std::size_t>::max())
+        throw std::overflow_error("Ordinary FFN exact dynamic LDS exceeds the native address type");
+    const auto functions=ordinaryMoEFFNKernelFunctions(program);
+    ResidentMoEFFNProgramEvidence evidence{.kind=ResidentMoEFFNLaunchKind::OrdinaryPhases,.device=device,.generation=generation};
+    evidence.entries[0]=prepareOrdinaryMoEFFNEntry(device,functions[0],grid_a,std::size_t(dynamic_a));
+    evidence.entries[1]=prepareOrdinaryMoEFFNEntry(device,functions[1],grid_b,std::size_t(dynamic_b));
+    return evidence;
+}
+}
+
+namespace
+{
+/** @brief Reuse the existing finite source-envelope registry for both ordinary phases. */
+template<unsigned Groups>
+std::array<const void*,2> ordinaryMoEFFNFunctionsForFamily()
+{
+    constexpr auto mask=ResidentMoEFFNDecoderProgram::familyMask<Groups>();
+    return {reinterpret_cast<const void*>(&rocmOrdinaryMoEFFNGateUpKernel<mask>),
+        reinterpret_cast<const void*>(&rocmOrdinaryMoEFFNDownKernel<mask>)};
+}
+}
+/** @copydoc ordinaryMoEFFNKernelFunctions */
+std::array<const void*,2> ordinaryMoEFFNKernelFunctions(ResidentMoEFFNDecoderProgram program)
+{
+    if(!program.requiredMask()||(program.requiredMask()&~ResidentMoEFFNDecoderProgram::all_decoders))
+        throw std::invalid_argument("Ordinary FFN requires a complete supported immutable execution envelope");
+    switch(program.groups())
+    {
+    case 1:return ordinaryMoEFFNFunctionsForFamily<1>();
+    case 2:return ordinaryMoEFFNFunctionsForFamily<2>();
+    case 3:return ordinaryMoEFFNFunctionsForFamily<3>();
+    case 4:return ordinaryMoEFFNFunctionsForFamily<4>();
+    case 5:return ordinaryMoEFFNFunctionsForFamily<5>();
+    case 6:return ordinaryMoEFFNFunctionsForFamily<6>();
+    case 7:return ordinaryMoEFFNFunctionsForFamily<7>();
+    case 8:return ordinaryMoEFFNFunctionsForFamily<8>();
+    case 9:return ordinaryMoEFFNFunctionsForFamily<9>();
+    case 10:return ordinaryMoEFFNFunctionsForFamily<10>();
+    case 11:return ordinaryMoEFFNFunctionsForFamily<11>();
+    case 12:return ordinaryMoEFFNFunctionsForFamily<12>();
+    case 13:return ordinaryMoEFFNFunctionsForFamily<13>();
+    case 14:return ordinaryMoEFFNFunctionsForFamily<14>();
+    case 15:return ordinaryMoEFFNFunctionsForFamily<15>();
+    }
+    throw std::invalid_argument("Ordinary FFN source-envelope family is invalid");
+}
+
+/** @copydoc PreparedMoEFFNProgram::PreparedMoEFFNProgram */
+PreparedMoEFFNProgram::PreparedMoEFFNProgram(ResidentMoEFFNProgramEvidence evidence,
+    std::optional<NativeCooperativeKernelAdmission> cooperative)
+    :evidence_(evidence),cooperative_(std::move(cooperative))
+{
+    if((evidence_.kind!=ResidentMoEFFNLaunchKind::Cooperative&&evidence_.kind!=ResidentMoEFFNLaunchKind::OrdinaryPhases&&evidence_.kind!=ResidentMoEFFNLaunchKind::OrdinaryResident)||
+        !evidence_.device.is_rocm()||evidence_.device.ordinal<0||!evidence_.generation)
+        throw std::invalid_argument("Prepared FFN has an incomplete typed native program identity");
+    for(const auto& entry:evidence_.nativeEntries())
+        if(!entry.function||!entry.grid||(entry.threads!=256&&entry.threads!=1024)||!entry.resources.registers_per_thread||
+            entry.resources.maximum_threads_per_block<entry.threads||!entry.resources.blocks_per_processor||entry.resources.private_bytes)
+            throw std::invalid_argument("Prepared FFN has incomplete native entry/geometry/resource evidence");
+    if(evidence_.kind!=ResidentMoEFFNLaunchKind::OrdinaryPhases)
+    {
+        const auto& entry=evidence_.entries[0];
+        if(!cooperative_||cooperative_->device()!=evidence_.device||cooperative_->generation()!=evidence_.generation||
+            cooperative_->function()!=entry.function||cooperative_->threads()!=entry.threads||
+            cooperative_->dynamicSharedBytes()!=entry.dynamic_shared_bytes||entry.grid>cooperative_->maximumGrid()||
+            evidence_.entries[1].function)
+            throw std::invalid_argument("Prepared FFN cooperative observations do not match its actual admission");
+    }
+    else if(cooperative_||evidence_.entries[0].function==evidence_.entries[1].function)
+        throw std::invalid_argument("Prepared ordinary FFN must retain two real entries and no cooperative admission");
+}
+
+/** @copydoc prepareResidentMoEFFN */
+PreparedMoEFFNProgram prepareResidentMoEFFN(DeviceId device,ResidentMoEFFNArgs& args,
+    ResidentMoEFFNPolicyMasks masks,std::uint64_t generation)
+{
+    if(!device.is_rocm()||!generation||isGraphCaptureActive())
+        throw std::logic_error("FFN preparation requires its native owner generation outside capture");
+    resolveResidentMoEFFNPolicies(args,masks);
+    const auto program=ResidentMoEFFNDecoderProgram::fromExecutionMask(masks.execution.combined());
+    if(currentResidentMoEFFNProgram()==ResidentMoEFFNProgram::OrdinaryPhases)
+    {
+        args.resident_grid=0; // Ordinary useful grids belong to the typed entry evidence.
+        return PreparedMoEFFNProgram(prepareOrdinaryMoEFFNEvidence(device,args,program,generation),std::nullopt);
+    }
+    // Producer maxima bound folds/SwiGLU and output folds as every original
+    // policy has at least one partition. Hidden quantization needs eight Q8
+    // groups/CTA, no more than ceil(H/64)/4 CTAs. No live count is read here.
+    const std::array phases{
+        ResidentMoEFFNTaskGeometry::projection(args.routed_columns,args.top_k,args.routed_gate_policy.maximum),
+        ResidentMoEFFNTaskGeometry::projection(args.hidden_columns,args.top_k,args.routed_down_policy.maximum),
+        ResidentMoEFFNTaskGeometry::projection(args.shared_columns,1,args.shared_gate_policy.maximum),
+        ResidentMoEFFNTaskGeometry::projection(args.hidden_columns,1,args.shared_down_policy.maximum)};
+    const auto& geometry=*std::max_element(phases.begin(),phases.end(),
+        [](const auto& left,const auto& right){return left.tasks()<right.tasks();});
+    std::uint64_t structural_tasks=0;
+    if(currentResidentMoEFFNProgram()==ResidentMoEFFNProgram::PartitionLocal)
+    {
+        const auto tiles=[](int columns,unsigned partitions)->std::uint64_t {
+            if(!partitions||partitions>NativeQuantisedGroupedDecodePolicy::maximum_k_partitions||partitions>256)
+                throw std::invalid_argument("Partition-local FFN has an invalid original partition policy");
+            const auto width=256/partitions;
+            return (std::uint64_t(columns)+width-1)/width;
+        };
+        const auto gate=tiles(args.routed_columns,args.routed_gate_policy.maximum)*args.top_k+
+            tiles(args.shared_columns,args.shared_gate_policy.maximum);
+        const auto down=tiles(args.hidden_columns,args.routed_down_policy.maximum)*args.top_k+
+            tiles(args.hidden_columns,args.shared_down_policy.maximum);
+        const auto values=std::uint64_t(args.top_k)*args.routed_columns+args.shared_columns;
+        const auto quant=(values+255)/256;
+        const auto hidden=(std::uint64_t(args.hidden_columns)+255)/256;
+        structural_tasks=std::max({gate,down,quant,hidden});
+    }
+    // Select the exact useful-CTA scheduler width BEFORE admitting its native
+    // function. H/F/topK are positive signed32 source axes: their products and
+    // summed routed/shared task counts fit uint64; no tensor address narrows.
+    const auto width=structural_tasks?residentMoEFFNSchedulerWidthForExtent(structural_tasks):
+        geometry.uses32BitScheduler()?ResidentMoEFFNSchedulerWidth::UInt32:ResidentMoEFFNSchedulerWidth::UInt64;
+    const void* function=residentMoEFFNKernelFunction(program,width);
+    const auto admission=NativeCooperativeKernelBoundary<NativeCooperativeBackend::ROCm>::prepare(device,
+        function,256,0,generation);
+    args.resident_grid=structural_tasks
+        ?static_cast<unsigned>(std::min(std::uint64_t(admission.maximumGrid()),structural_tasks))
+        :geometry.grid(admission.maximumGrid());
+    ResidentMoEFFNProgramEvidence evidence{.kind=ResidentMoEFFNLaunchKind::Cooperative,.device=device,.generation=generation};
+    evidence.entries[0]={admission.function(),args.resident_grid,admission.threads(),
+        admission.dynamicSharedBytes(),admission.resources()};
+    return PreparedMoEFFNProgram(evidence,admission);
+}
+/** @copydoc launchResidentMoEFFN */
+void launchResidentMoEFFN(const PreparedMoEFFNProgram& program,const ResidentMoEFFNArgs& args,
+    void* stream,std::uint64_t generation)
+{
+    const auto native=static_cast<hipStream_t>(stream);
+    if(!native||native==hipStreamLegacy||native==hipStreamPerThread)
+        throw std::invalid_argument("FFN program requires its exact non-default native stream");
+    if(generation!=program.evidence_.generation)
+        throw std::logic_error("FFN program owner generation changed before native submission");
+    ResidentMoEFFNArgs copied=args;void* parameters[]{&copied};
+    if(program.evidence_.kind==ResidentMoEFFNLaunchKind::Cooperative)
+    {
+        if(args.resident_grid!=program.evidence_.entries[0].grid)
+            throw std::logic_error("Cooperative FFN changed its sealed native grid");
+        NativeCooperativeKernelBoundary<NativeCooperativeBackend::ROCm>::launch(*program.cooperative_,parameters,
+            args.resident_grid,stream,generation);
+        return;
+    }
+    for(const auto& entry:program.evidence_.nativeEntries())
+    {
+        const auto status=hipLaunchKernel(entry.function,dim3(entry.grid),dim3(entry.threads),parameters,
+            entry.dynamic_shared_bytes,native);
+        if(status!=hipSuccess)throw std::runtime_error(std::string("ordinary FFN native phase launch failed: ")+hipGetErrorString(status));
+    }
+}
+}
+
 // ============================================================================
 // Reduce kernel: sum K-partitions from scatter buffer to final output.
 // Simple summation — no per-column scales or bias (handled externally).
@@ -4306,6 +5652,18 @@ __global__ void moe_grouped_native_quantised_down_descriptor_reduce_kernel(
  * @param tile Projection-local output tile.
  * @param lane Original workgroup lane.
  */
+/** @brief One original increasing-partition RN reducer result. @param partials Original plane.
+ * @param n Original output column. @param N Original column stride. @param kblocks Exact original partitions. @return Original bits. */
+__device__ __forceinline__ float nativeM1FoldColumnValue(const float* partials,int n,int N,int kblocks) {
+        float sum = 0.0f;
+        #pragma unroll 16
+        for (int kb = 0; kb < kblocks; ++kb)
+            sum = rocm_native_quantised_accumulate_rn(
+                sum,
+                partials[static_cast<size_t>(kb) * N + n]);
+
+ return sum;
+}
 template <int TILE_N, int CPT>
 __device__ __forceinline__ void nativeM1FoldColumns(const float *d_partial_fp32,
     float *d_C_fp32,int N,int kblocks,unsigned tile,unsigned lane)
@@ -4318,13 +5676,7 @@ __device__ __forceinline__ void nativeM1FoldColumns(const float *d_partial_fp32,
         const int n = n_base + c;
         if (n >= N) return;
 
-        float sum = 0.0f;
-        #pragma unroll 16
-        for (int kb = 0; kb < kblocks; ++kb)
-            sum = rocm_native_quantised_accumulate_rn(
-                sum,
-                d_partial_fp32[static_cast<size_t>(kb) * N + n]);
-
+        const float sum=nativeM1FoldColumnValue(d_partial_fp32,n,N,kblocks);
         d_C_fp32[n] = sum;
     }
 }
@@ -4337,6 +5689,26 @@ __global__ void gemv_native_quantised_reduce_kernel_t(const float *__restrict__ 
     if(!llaminar2::projectionWorkRowIsActiveUniform(work,0))return; // Same ordinary M1 route; no unauthored reads/writes.
 
     nativeM1FoldColumns<TILE_N,CPT>(partials,output,N,partitions,blockIdx.x,threadIdx.x);
+}
+
+/**
+ * @brief Keep the original128-column reducer grid and publish its original HC output locally.
+ * @tparam HasWork Exact original projection work mode.
+ * @param partials Original partition bank. @param output Public raw-down output.
+ * @param N Original output width. @param partitions Unchanged source partitions.
+ * @param work Original projection work, independent of publisher count0.
+ * @param publication Existing activated and four Q8 bank destinations.
+ */
+template<bool HasWork>
+__global__ __launch_bounds__(128) void nativeM1HCDownReducePublish(const float* partials,float* output,
+ int N,int partitions,llaminar2::ProjectionRowWork work,llaminar2::GPUHCDownOutputView publication) {
+ if constexpr(HasWork)if(!llaminar2::projectionWorkRowIsActiveUniform(work,0))return;
+ const unsigned n=blockIdx.x*128+threadIdx.x;
+ // N is a multiple of32: each tail subgroup is wholly absent or wholly active.
+ if(n>=static_cast<unsigned>(N))return;
+ const float raw=nativeM1FoldColumnValue(partials,n,N,partitions);
+ output[n]=raw;
+ if(publication.rows.activeRows()!=0)llaminar2::hc_down_publication::publish(raw,publication,n);
 }
 
 /** @brief Concatenate original live reducer tiles without extending any projection. */
@@ -4393,6 +5765,79 @@ void finishNativeM1Producer(float *partials,float *output,int n,int kb,int devic
 
 
 
+/**
+ * @brief Compute independent original Q8 K32 contributions in bounded CTA-owned windows.
+ * @tparam HasWork Borrowed original device row authority; false retains the plain M1 ABI.
+ * @param A Original quantized input. @param payload Canonical block-major native Q8 bytes.
+ * @param scales Original FP16 weight scales. @param output Original public output for P1.
+ * @param partials Original [P][N] partial bank. @param scale_a Original optional row scale.
+ * @param block_scales Original optional FP32 K32 scales. @param N Physical output width.
+ * @param K Original reduction width. @param partitions Exact source-resolved partition count.
+ * @param work Original immutable row-work binding, copied into the retained graph.
+ *
+ * Four contributor groups own32 adjacent columns each. A lane computes complete
+ * original signed-dot8 chains and the SAME rounded K32 contribution helper as
+ * nativeM1ColumnsBody. Owner group0 folds each real contribution in ascending K
+ * order, retaining its accumulator across windows. Never sum contributor-local
+ * FP32 accumulators: that would change the source's expression tree. The second
+ * local barrier retires every LDS reader before the next window overwrites it.
+ *
+ * The bounded32x32 FP32 array is explicit4KiB LDS, never per-thread/private
+ * storage. Arbitrarily long admitted K partitions use repeated windows. Tail
+ * columns and empty partition planes reach the identical barrier structure;
+ * empty planes retain the original positive-zero initialization and final scale
+ * multiply. No synthetic zero contribution enters an active owner's fold.
+ */
+template<bool HasWork>
+__global__ __launch_bounds__(128) void gemv_native_q8_k32_contribution_tile_kernel_t(
+    const int8_t* __restrict__ A,const uint8_t* __restrict__ payload,
+    const uint16_t* __restrict__ scales,float* __restrict__ output,float* __restrict__ partials,
+    const float* __restrict__ scale_a,const float* __restrict__ block_scales,
+    int N,int K,int partitions,llaminar2::ProjectionRowWork work)
+{
+    if constexpr(HasWork)
+        if(!llaminar2::projectionWorkRowIsActiveUniform(work,0))return;
+    constexpr int Columns=32,Contributors=4,WindowBlocks=32;
+    __shared__ float contributions[WindowBlocks][Columns];
+    const unsigned group=threadIdx.x/Columns,column=threadIdx.x%Columns;
+    const int n=static_cast<int>(blockIdx.x)*Columns+static_cast<int>(column);
+    const int blocks=K/32,per=(blocks+partitions-1)/partitions;
+    const int first=static_cast<int>(blockIdx.y)*per,last=min(first+per,blocks);
+    float accumulator=0.0f;
+    for(int begin=first;begin<last;begin+=WindowBlocks)
+    {
+        const int count=min(WindowBlocks,last-begin);
+        for(int offset=static_cast<int>(group);offset<count;offset+=Contributors)
+        {
+            if(n<N)
+            {
+                const int b=begin+offset;
+                const auto linear=static_cast<size_t>(b)*static_cast<size_t>(N)+static_cast<size_t>(n);
+                const auto* weights=reinterpret_cast<const int32_t*>(payload+linear*32);
+                const auto* activation=reinterpret_cast<const int32_t*>(A+b*32);
+                int32_t dot=0;
+#pragma unroll
+                for(int word=0;word<8;++word)
+                    dot=::llaminar2::rocm_integer_contract::signedDot4(activation[word],weights[word],dot);
+                const float scale=rocm_native_quantised_load_single_weight_scale<NATIVE_QUANTISED_Q8_0>(scales[linear],uint16_t{0});
+                contributions[offset][column]=::llaminar2::device_native_quantised_contract::singleScaleBlock(
+                    dot,scale,block_scales?block_scales[b]:1.0f);
+            }
+        }
+        __syncthreads();
+        if(group==0&&n<N)
+            for(int offset=0;offset<count;++offset)
+                accumulator=rocm_native_quantised_accumulate_rn(accumulator,contributions[offset][column]);
+        __syncthreads();
+    }
+    if(group==0&&n<N)
+    {
+        const float result=accumulator*(block_scales?1.0f:scale_a[0]);
+        if(partitions==1)output[n]=result;
+        else partials[static_cast<size_t>(blockIdx.y)*N+n]=result;
+    }
+}
+
 namespace
 {
 /** @brief Exact loaded producer/reducer pair for one existing template geometry. */
@@ -4437,21 +5882,58 @@ NativeQ8SerialSymbols nativeQ8SerialSymbols()
 }
 
 /**
+ * @brief Resolve a diagnostic load schedule while retaining the existing reducer symbol.
+ * @tparam TN Original independent-column tile. @tparam CPT Original columns per lane.
+ * @tparam HasWork Exact original row-work mode. @param loads Explicit cold memory schedule.
+ * @return Original pair or the admitted lookahead producer with the SAME reducer.
+ * @throws std::invalid_argument For an unknown/unimplemented diagnostic tuple.
+ */
+template<int TN,int CPT,bool HasWork>
+NativeQ8SerialSymbols nativeQ8SerialSymbols(llaminar2::rocm::NativeQ8SerialProducerLoads loads)
+{
+    using Loads=llaminar2::rocm::NativeQ8SerialProducerLoads;
+    auto result=nativeQ8SerialSymbols<TN,CPT,HasWork>();
+    if(loads==Loads::Original)return result;
+    if(loads==Loads::K32ContributionTile4x32)
+    {
+        if constexpr(TN==128&&CPT==1)
+        {
+            result.producer=reinterpret_cast<const void*>(gemv_native_q8_k32_contribution_tile_kernel_t<HasWork>);
+            result.producer_name=HasWork?"gemv_native_q8_k32_contribution_tile_kernel_t<true>":"gemv_native_q8_k32_contribution_tile_kernel_t<false>";
+            return result; // Original128-column reducer remains the same symbol.
+        }
+        throw std::invalid_argument("native-Q8 K32 contribution tile requires original128 CPT1 reducer geometry");
+    }
+    if(loads!=Loads::TwoK32Lookahead)
+        throw std::invalid_argument("unknown native-Q8 producer load schedule");
+    if constexpr(CPT==1&&(TN==64||TN==128))
+    {
+        result.producer=reinterpret_cast<const void*>(gemv_native_q8_two_k32_lookahead_kernel_t<TN,HasWork>);
+        if constexpr(TN==64)result.producer_name=HasWork?"gemv_native_q8_two_k32_lookahead_kernel_t<64,true>":"gemv_native_q8_two_k32_lookahead_kernel_t<64,false>";
+        else result.producer_name=HasWork?"gemv_native_q8_two_k32_lookahead_kernel_t<128,true>":"gemv_native_q8_two_k32_lookahead_kernel_t<128,false>";
+        return result;
+    }
+    throw std::invalid_argument("native-Q8 lookahead requires admitted64/128 CPT1 geometry");
+}
+
+/**
  * @brief Select one exact compiled pair; unknown enum values fail before HIP calls.
  * @param geometry Typed requested geometry.
+ * @param loads Exact cold-admitted producer schedule.
  * @return The function pair shared with the actual launch dispatch.
  */
-NativeQ8SerialSymbols nativeQ8SerialSymbols(llaminar2::rocm::NativeQ8SerialGeometry geometry)
+NativeQ8SerialSymbols nativeQ8SerialSymbols(llaminar2::rocm::NativeQ8SerialGeometry geometry,
+    llaminar2::rocm::NativeQ8SerialProducerLoads loads)
 {
     return llaminar2::dispatchProjectionWorkMode(1,[&]<bool HasWork>() {
     using G = llaminar2::rocm::NativeQ8SerialGeometry;
     switch (geometry)
     {
-    case G::TN64CPT1: return nativeQ8SerialSymbols<64, 1, HasWork>();
-    case G::TN128CPT1: return nativeQ8SerialSymbols<128, 1, HasWork>();
-    case G::TN256CPT1: return nativeQ8SerialSymbols<256, 1, HasWork>();
-    case G::TN128CPT2: return nativeQ8SerialSymbols<128, 2, HasWork>();
-    case G::TN256CPT2: return nativeQ8SerialSymbols<256, 2, HasWork>();
+    case G::TN64CPT1: return nativeQ8SerialSymbols<64, 1, HasWork>(loads);
+    case G::TN128CPT1: return nativeQ8SerialSymbols<128, 1, HasWork>(loads);
+    case G::TN256CPT1: return nativeQ8SerialSymbols<256, 1, HasWork>(loads);
+    case G::TN128CPT2: return nativeQ8SerialSymbols<128, 2, HasWork>(loads);
+    case G::TN256CPT2: return nativeQ8SerialSymbols<256, 2, HasWork>(loads);
     }
     throw std::invalid_argument("unknown ROCm native-Q8 serial geometry");
     });
@@ -4515,22 +5997,66 @@ void launchNativeQuantisedSerialGeometry(
     const float *scale_a, const float *block_scales, int N, int K, int kb,
     uint8_t arithmetic_policy, int device, void *stream,
     llaminar2::rocm::NativeQ8SerialGeometry geometry,
-    llaminar2::rocm::NativeM1ReductionTicket *deferred=nullptr)
+    llaminar2::rocm::NativeM1ReductionTicket *deferred=nullptr,
+    const llaminar2::rocm::NativeQ8SerialGeometryAdmission *prepared=nullptr)
 {
     static_assert(CPT == 1 || CPT == 2);
     static_assert(TN % CPT == 0);
-    const int grid_n = 1 + (N - 1) / TN;
+    using Loads=llaminar2::rocm::NativeQ8SerialProducerLoads;
+    const auto loads=prepared?prepared->producerLoads():
+        g_native_q8_serial_scope?g_native_q8_serial_scope->admission().producerLoads():Loads::Original;
+    const auto producer_spec=llaminar2::rocm::nativeQ8SerialProducerSpec(geometry,loads);
+    const int grid_n = 1 + (N - 1) / (FMT==NATIVE_QUANTISED_Q8_0?producer_spec.tile_columns:TN);
     const dim3 block(TN / CPT, 1, 1);
     const auto work=llaminar2::projectionWorkForLaunch(1);
     return llaminar2::dispatchProjectionWorkMode(1,[&]<bool HasWork>() {
-        hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_quantised_kernel_t<TN,CPT,FMT,HasWork>),
-        dim3(grid_n,kb,1),block,0,static_cast<hipStream_t>(stream),
-        A,payload,scales,mins,emins,output,partials,scale_a,block_scales,N,K,kb,work);
+        if(prepared) {
+            // Cold owner admission, not a capture-time scope or hardware query.
+            // Exact function comparison also authenticates the original row-work
+            // mode: a false-mode certificate cannot launch a counted program.
+            const auto symbols=nativeQ8SerialSymbols<TN,CPT,HasWork>(loads);
+            if(g_native_q8_serial_scope||FMT!=NATIVE_QUANTISED_Q8_0||TN!=128||CPT!=1||
+                prepared->deviceOrdinal()!=device||prepared->geometry()!=geometry||loads!=Loads::TwoK32Lookahead||
+                prepared->producerResources().function!=symbols.producer||
+                prepared->reducerResources().function!=symbols.reducer||
+                prepared->producerResources().block_threads!=TN/CPT)
+                throw std::logic_error("HC lookahead producer changed its exact cold program/device/work geometry");
+        }
+
+        if constexpr(FMT==NATIVE_QUANTISED_Q8_0&&CPT==1&&(TN==64||TN==128))
+        {
+            if(loads==Loads::K32ContributionTile4x32)
+            {
+                if constexpr(TN==128)
+                    hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_q8_k32_contribution_tile_kernel_t<HasWork>),
+                        dim3(grid_n,kb,1),dim3(producer_spec.block_threads),0,static_cast<hipStream_t>(stream),
+                        A,payload,scales,output,partials,scale_a,block_scales,N,K,kb,work);
+                else throw std::invalid_argument("native-Q8 K32 contribution tile requires original128 CPT1 reducer geometry");
+            }
+            else if(loads==Loads::TwoK32Lookahead)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_q8_two_k32_lookahead_kernel_t<TN,HasWork>),
+                    dim3(grid_n,kb,1),block,0,static_cast<hipStream_t>(stream),
+                    A,payload,scales,output,partials,scale_a,block_scales,N,K,kb,work);
+            else if(loads==Loads::Original)
+                hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_quantised_kernel_t<TN,CPT,FMT,HasWork>),
+                    dim3(grid_n,kb,1),block,0,static_cast<hipStream_t>(stream),
+                    A,payload,scales,mins,emins,output,partials,scale_a,block_scales,N,K,kb,work);
+            else throw std::invalid_argument("unknown native-Q8 producer load schedule");
+        }
+        else
+        {
+            if(loads!=Loads::Original)throw std::invalid_argument("native-Q8 lookahead requires admitted64/128 CPT1 source");
+            hipLaunchKernelGGL(HIP_KERNEL_NAME(gemv_native_quantised_kernel_t<TN,CPT,FMT,HasWork>),
+                dim3(grid_n,kb,1),block,0,static_cast<hipStream_t>(stream),
+                A,payload,scales,mins,emins,output,partials,scale_a,block_scales,N,K,kb,work);
+        }
     if (g_native_q8_serial_scope && hipPeekAtLastError() != hipSuccess)
     {
         g_native_q8_serial_launch.reset();
         throw std::runtime_error("native-quantised serial producer submission failed");
     }
+    // TN/CPT retain the original source/reducer ticket geometry. K-cooperative
+    // producer ownership is independently authenticated by its physical receipt.
     finishNativeM1Producer<TN,CPT,HasWork>(partials,output,N,kb,device,stream,deferred,work);
     if (g_native_q8_serial_scope && hipPeekAtLastError() != hipSuccess)
     {
@@ -4539,17 +6065,17 @@ void launchNativeQuantisedSerialGeometry(
     }
     if constexpr (FMT == NATIVE_QUANTISED_Q8_0)
     {
-        const auto symbols = nativeQ8SerialSymbols<TN,CPT,HasWork>();
+        const auto symbols = nativeQ8SerialSymbols<TN,CPT,HasWork>(loads);
         const int b_per = 1 + (K / 32 - 1) / kb;
         const int nonempty = 1 + (K / 32 - 1) / b_per;
-        const auto launch = [&](const void *function, const char *name, int grid_y)
+        const auto launch = [&](const void *function, const char *name, int grid_x,int grid_y,int threads)
         {
             return llaminar2::rocm::NativeQ8SerialKernelLaunch{
-                function, name, grid_n, grid_y, 1, TN / CPT, 1, 1};
+                function, name, grid_x, grid_y, 1, threads, 1, 1};
         };
         // Publish topology only. Replays never update this host observation.
         g_native_q8_serial_launch = llaminar2::rocm::NativeQ8SerialLaunch{
-            .geometry = geometry, .physical_n = N,
+            .geometry = geometry, .producer_loads=loads, .physical_n = N,
             .arithmetic_policy_n = g_native_quantised_serial_partition_n > 0
                 ? g_native_quantised_serial_partition_n : N,
             .k = K, .device_ordinal = device, .execution_codebook = 19,
@@ -4557,8 +6083,8 @@ void launchNativeQuantisedSerialGeometry(
             .blocks_per_partition = b_per, .nonempty_partitions = nonempty,
             .partial_elements = kb > 1 ? std::size_t(kb) * N : 0u,
             .stream = stream,
-            .producer = launch(symbols.producer, symbols.producer_name, kb),
-            .reducer = kb > 1 && !deferred ? launch(symbols.reducer, symbols.reducer_name, 1)
+            .producer = launch(symbols.producer, symbols.producer_name,grid_n,kb,producer_spec.block_threads),
+            .reducer = kb > 1 && !deferred ? launch(symbols.reducer, symbols.reducer_name,1+(N-1)/TN,1,TN/CPT)
                 : llaminar2::rocm::NativeQ8SerialKernelLaunch{}};
     }
     });
@@ -4566,10 +6092,12 @@ void launchNativeQuantisedSerialGeometry(
 } // namespace
 
 llaminar2::rocm::NativeQ8SerialGeometryAdmission
-llaminar2::rocm::admitNativeQ8SerialGeometry(NativeQ8SerialGeometry geometry, int device_ordinal)
+llaminar2::rocm::admitNativeQ8SerialGeometry(NativeQ8SerialGeometry geometry,int device_ordinal,
+    NativeQ8SerialProducerLoads producer_loads)
 {
     const auto spec = nativeQ8SerialGeometrySpec(geometry);
-    const auto symbols = nativeQ8SerialSymbols(geometry);
+    const auto producer_spec=nativeQ8SerialProducerSpec(geometry,producer_loads);
+    const auto symbols = nativeQ8SerialSymbols(geometry,producer_loads);
     if (device_ordinal < 0)
         throw std::invalid_argument("native-Q8 serial resource admission needs an exact device");
     if (llaminar2::isGraphCaptureActive())
@@ -4577,8 +6105,8 @@ llaminar2::rocm::admitNativeQ8SerialGeometry(NativeQ8SerialGeometry geometry, in
     if (llaminar2::HipDeviceGuard::setDevice(device_ordinal) != 0)
         throw std::runtime_error("native-Q8 serial resource admission could not select device");
     return {geometry, device_ordinal,
-        inspectNativeQ8SerialSymbol(symbols.producer, symbols.producer_name, spec.block_threads),
-        inspectNativeQ8SerialSymbol(symbols.reducer, symbols.reducer_name, spec.block_threads)};
+        inspectNativeQ8SerialSymbol(symbols.producer, symbols.producer_name, producer_spec.block_threads),
+        inspectNativeQ8SerialSymbol(symbols.reducer, symbols.reducer_name, spec.block_threads),producer_loads};
 }
 
 /**
@@ -4624,6 +6152,104 @@ __global__ void gemv_native_quantised_reduce_small_m_kernel_t(
         }
     }
 }
+
+namespace
+{
+constexpr int kHCDownColumns = 320;
+constexpr int kHCDownReduction = 10240;
+constexpr int kHCDownPartitions = 16;
+constexpr int kHCDownPackedBlocks = kHCDownReduction / 32;
+constexpr int kHCDownWindow = kHCDownPackedBlocks / kHCDownPartitions;
+constexpr int kHCDownTileRows = 4;
+constexpr int kHCDownTileColumns = 32;
+
+/** @brief Existing counted row owner and persistent prepared GEMV storage. */
+struct HCDownLongKArgs
+{
+    const int8_t *activation;
+    const uint8_t *payload;
+    const uint16_t *weight_scales;
+    const float *activation_scales;
+    float *partials;
+    llaminar2::DeviceRowRange rows;
+};
+
+/**
+ * @brief Produce the original FP32 K32 × 20 terms for one [partition,row,column] tile.
+ *
+ * Every lane decodes one physical Q8 block, reuses it across the live row
+ * tile and publishes one typed single-scale term per live row. Four lanes
+ * fold those terms in increasing original block order. The unchanged public
+ * reducer consumes ascending partitions with the existing physical row stride.
+ */
+__global__ __launch_bounds__(kHCDownTileColumns * kHCDownWindow)
+void qfn_hc_down_long_k_contributions(HCDownLongKArgs args)
+{
+    const int row_base = int(blockIdx.z) * kHCDownTileRows;
+    const int width = min(kHCDownTileRows, args.rows.activeRows() - row_base);
+    if (width <= 0)
+        return;
+
+    const int thread = int(threadIdx.x);
+    const int local_group = thread / kHCDownTileColumns;
+    const int local_col = thread % kHCDownTileColumns;
+    const int group = int(blockIdx.y) * kHCDownWindow + local_group;
+    const int col = int(blockIdx.x) * kHCDownTileColumns + local_col;
+    const int weight_index = group * kHCDownColumns + col;
+    const auto *packed = reinterpret_cast<const int4 *>(args.payload + weight_index * 32);
+    const int4 lo = packed[0], hi = packed[1];
+    const int weight[] = {lo.x, lo.y, lo.z, lo.w, hi.x, hi.y, hi.z, hi.w};
+    const float scale = __half2float(__ushort_as_half(args.weight_scales[weight_index]));
+    __shared__ float terms[kHCDownTileRows][kHCDownWindow][kHCDownTileColumns];
+#pragma unroll
+    for (int row = 0; row < kHCDownTileRows; ++row)
+    {
+        if (row >= width)
+            break;
+        const int input_index = (row_base + row) * kHCDownPackedBlocks + group;
+        const auto *input = reinterpret_cast<const int *>(args.activation + input_index * 32);
+        int dot = 0;
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+            dot = llaminar2::rocm_integer_contract::signedDot4(input[i], weight[i], dot);
+        terms[row][local_group][local_col] =
+            llaminar2::device_native_quantised_contract::singleScaleBlock(
+                dot, scale, args.activation_scales[input_index]);
+    }
+    __syncthreads();
+
+    // Each live scratch word has one writer. Inactive words remain dirty.
+    if (local_group < width)
+    {
+        float sum = 0.0f;
+#pragma unroll
+        for (int group_offset = 0; group_offset < kHCDownWindow; ++group_offset)
+            sum = llaminar2::device_native_quantised_contract::accumulate(
+                sum, terms[local_group][group_offset][local_col]);
+        const auto plane = int(blockIdx.y) * args.rows.physicalRows() + row_base + local_group;
+        args.partials[plane * kHCDownColumns + col] = sum;
+    }
+}
+
+/** @brief Preserve all serial-rounded terms and publish original SiLU/Q8 planes locally. */
+__global__ void groupedHCDownReducePublish(
+    const float* partials, float* raw, llaminar2::GPUHCDownOutputView publication)
+{
+    const int column = int(blockIdx.x) * 64 + int(threadIdx.x);
+    const int row = int(blockIdx.y);
+    if (row >= publication.rows.activeRows())
+        return;
+    const int offset = row * kHCDownColumns + column;
+    float sum = 0.0f;
+#pragma unroll
+    for (int partition = 0; partition < kHCDownPartitions; ++partition)
+        sum = llaminar2::device_native_quantised_contract::accumulate(
+            sum, partials[partition * publication.rows.physicalRows() * kHCDownColumns + offset]);
+    raw[offset] = sum;
+    llaminar2::hc_down_publication::publish(sum, publication, offset);
+}
+
+} // namespace
 
 constexpr int NATIVE_QUANTISED_SMALL_M_MAX_BATCH = 8;
 constexpr int NATIVE_QUANTISED_SMALL_M_GRAPH_SAFE_KB_CAP =
@@ -4769,7 +6395,86 @@ __device__ __forceinline__ int32_t native_quantised_activation_sum_a(
 }
 
 /**
- * Accumulates one decoded native-quantised weight block into a small-M GEMV row.
+ * @brief Commit one completed single-scale integer dot using the original FP32 order.
+ * @tparam FMT Original single-scale decoder.
+ * @param f_acc Original running partition accumulator.
+ * @param block_acc Exact complete32-code signed integer dot.
+ * @param scale_bits Original primary metadata bits. @param secondary_bits Original secondary metadata bits.
+ * @param scale_ab Original activation scale. @param sum_a Exact activation code sum.
+ */
+template<NativeQuantisedFormat FMT>
+__device__ __forceinline__ void native_quantised_small_m_commit_single_dot_bits(float& f_acc,int32_t block_acc,
+    uint16_t scale_bits,uint16_t secondary_bits,float scale_ab,int32_t sum_a)
+{
+    using Traits=NATIVE_QUANTISEDTraits<FMT>;
+    static_assert(!Traits::is_dual_scale);
+    const float block_d = rocm_native_quantised_load_single_weight_scale<FMT>(
+        scale_bits, (FMT == NATIVE_QUANTISED_IQ3_S || FMT == NATIVE_QUANTISED_IQ4_XS_SOURCE) ? secondary_bits : uint16_t{0});
+    if constexpr (Traits::is_asymmetric)
+    {
+        const uint16_t min_bits = secondary_bits;
+        const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
+        f_acc = rocm_native_quantised_commit_corrected_single_scale_block(
+            f_acc,
+            block_acc,
+            block_d,
+            sum_a,
+            block_m,
+            scale_ab);
+    }
+    else
+    {
+        f_acc = rocm_native_quantised_commit_single_scale_block(
+            f_acc, block_acc, block_d, scale_ab);
+    }
+}
+
+/**
+ * @brief Preserve the original pointer API while sharing one scalar-bit commit body.
+ * @tparam FMT Original single-scale decoder.
+ * @param f_acc Original running partition accumulator. @param block_acc Exact integer dot.
+ * @param scale_base Original primary plane. @param min_base Original secondary plane.
+ * @param linear Original metadata index. @param scale_ab Original activation scale.
+ * @param sum_a Exact signed activation sum.
+ */
+template<NativeQuantisedFormat FMT>
+__device__ __forceinline__ void native_quantised_small_m_commit_single_dot(float& f_acc,int32_t block_acc,
+    const uint16_t* scale_base,const uint16_t* min_base,size_t linear,float scale_ab,int32_t sum_a)
+{
+    using Traits=NATIVE_QUANTISEDTraits<FMT>;
+    const uint16_t primary=scale_base[linear];
+    const uint16_t secondary=Traits::requires_secondary_metadata?min_base[linear]:uint16_t{0};
+    native_quantised_small_m_commit_single_dot_bits<FMT>(f_acc,block_acc,primary,secondary,scale_ab,sum_a);
+}
+
+/**
+ * @brief Construct the original IQ1_M signed one-eighth from its source sign bit.
+ * @tparam SignBit Original sign position, three or seven, in the packed qh byte.
+ * @param qh Original packed high/sign byte; all unrelated bits are ignored.
+ * @return Bit-identical positive or negative0.125f, without FP selection/arithmetic.
+ * @details Keep the exact IEEE binary32 exponent/mantissa as integer bits and
+ * insert only the original sign. This avoids retaining both FP constants
+ * across unrelated format phases; the canonical commit order is unchanged.
+ */
+template<unsigned SignBit>
+__device__ __forceinline__ float native_quantised_iq1_m_delta_bits(uint8_t qh)
+{
+    static_assert(SignBit==3 || SignBit==7);
+    const uint32_t bits=0x3e000000u|((uint32_t(qh)&(1u<<SignBit))<<(31-SignBit));
+    return __builtin_bit_cast(float,bits);
+}
+
+/**
+ * @brief Commit original integer dots with the single canonical FP32 arithmetic body.
+ * @tparam FMT Original independent physical decoder.
+ * @param f_acc Original increasing-K32 partition sum.
+ * @param a4 Original activation words, used only for the unchanged correction terms.
+ * @param acc_lo Original groups0..3 dot, or groups0..7 dot for single-scale formats.
+ * @param acc_hi Original groups4..7 dot for dual-scale formats, otherwise zero.
+ * @param payload Original packed block, retaining IQ1_M correction bits.
+ * @param primary_bits Original primary half bits. @param secondary_bits Original secondary half bits.
+ * @param extended_bits Original packed extended minima, zero when the format has none.
+ * @param scale_ab Original activation scale. @param sum_a Exact signed activation sum.
  *
  * This helper intentionally mirrors the M=1 decode kernel's FP32 addition
  * order.  Do not combine the base dot product and asymmetric/dual-scale
@@ -4778,15 +6483,15 @@ __device__ __forceinline__ int32_t native_quantised_activation_sum_a(
  * can amplify through Qwen3.6 recurrent state.
  */
 template <NativeQuantisedFormat FMT>
-__device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_block(
+__device__ __forceinline__ void native_quantised_small_m_commit_integer_dots_bits(
     float& f_acc,
     const int32_t* __restrict__ a4,
-    const int32_t* __restrict__ packed_groups,
+    int32_t acc_lo,
+    int32_t acc_hi,
     const uint8_t* __restrict__ payload,
-    const uint16_t* __restrict__ scale_base,
-    const uint16_t* __restrict__ min_base,
-    const uint32_t* __restrict__ emin_base,
-    size_t linear,
+    uint16_t primary_bits,
+    uint16_t secondary_bits,
+    uint32_t extended_bits,
     float scale_ab,
     int32_t sum_a)
 {
@@ -4794,17 +6499,8 @@ __device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_bloc
 
     if constexpr (Traits::is_dual_scale)
     {
-        int32_t acc_lo = 0;
-        int32_t acc_hi = 0;
-        #pragma unroll
-        for (int g = 0; g < 4; ++g)
-            acc_lo = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_lo);
-        #pragma unroll
-        for (int g = 4; g < 8; ++g)
-            acc_hi = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], acc_hi);
-
         const auto weight_scales = rocm_native_quantised_load_dual_weight_scales<FMT>(
-            scale_base[linear], min_base[linear]);
+            primary_bits, secondary_bits);
         const float scale_lo = weight_scales.low;
         const float scale_hi = weight_scales.high;
         // Corrected formats form one complete block contribution before the
@@ -4826,7 +6522,7 @@ __device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_bloc
             float min_hi;
             if constexpr (Traits::needs_emin_array)
             {
-                const uint32_t emin_packed = emin_base[linear];
+                const uint32_t emin_packed = extended_bits;
                 const uint16_t emin_lo_bits = static_cast<uint16_t>(emin_packed);
                 const uint16_t emin_hi_bits = static_cast<uint16_t>(emin_packed >> 16);
                 min_lo = __half2float(*reinterpret_cast<const __half*>(&emin_lo_bits));
@@ -4852,7 +6548,6 @@ __device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_bloc
 
         else if constexpr (FMT == NATIVE_QUANTISED_IQ1_M)
         {
-            constexpr float IQ1S_DELTA = 0.125f;
             constexpr int32_t ones = 0x01010101;
             const uint8_t qh0 = payload[4];
             const uint8_t qh1 = payload[5];
@@ -4866,10 +6561,10 @@ __device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_bloc
             const int32_t sa_g3 = ::llaminar2::rocm_integer_contract::signedDot4(
                 a4[7], ones, ::llaminar2::rocm_integer_contract::signedDot4(a4[6], ones, 0));
 
-            const float d0 = (qh0 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-            const float d1 = (qh0 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
-            const float d2 = (qh1 & 0x08) ? -IQ1S_DELTA : IQ1S_DELTA;
-            const float d3 = (qh1 & 0x80) ? -IQ1S_DELTA : IQ1S_DELTA;
+            const float d0 = native_quantised_iq1_m_delta_bits<3>(qh0);
+            const float d1 = native_quantised_iq1_m_delta_bits<7>(qh0);
+            const float d2 = native_quantised_iq1_m_delta_bits<3>(qh1);
+            const float d3 = native_quantised_iq1_m_delta_bits<7>(qh1);
 
             f_acc = rocm_native_quantised_commit_iq1_m_block(
                 f_acc,
@@ -4900,32 +6595,68 @@ __device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_bloc
     }
     else
     {
-        int32_t block_acc = 0;
-        #pragma unroll
-        for (int g = 0; g < 8; ++g)
-            block_acc = ::llaminar2::rocm_integer_contract::signedDot4(a4[g], packed_groups[g], block_acc);
-
-        const uint16_t scale_bits = scale_base[linear];
-        const float block_d = rocm_native_quantised_load_single_weight_scale<FMT>(
-            scale_bits, (FMT == NATIVE_QUANTISED_IQ3_S || FMT == NATIVE_QUANTISED_IQ4_XS_SOURCE) ? min_base[linear] : uint16_t{0});
-        if constexpr (Traits::is_asymmetric)
-        {
-            const uint16_t min_bits = min_base[linear];
-            const float block_m = __half2float(*reinterpret_cast<const __half*>(&min_bits));
-            f_acc = rocm_native_quantised_commit_corrected_single_scale_block(
-                f_acc,
-                block_acc,
-                block_d,
-                sum_a,
-                block_m,
-                scale_ab);
-        }
-        else
-        {
-            f_acc = rocm_native_quantised_commit_single_scale_block(
-                f_acc, block_acc, block_d, scale_ab);
-        }
+        native_quantised_small_m_commit_single_dot_bits<FMT>(
+            f_acc,acc_lo,primary_bits,secondary_bits,scale_ab,sum_a);
     }
+}
+
+/**
+ * @brief Accumulate the original decoded array then delegate to the shared FP32 commit.
+ * @tparam FMT Original physical decoder.
+ * @param f_acc Increasing-K32 partition sum. @param a4 Original activation words.
+ * @param packed_groups Original decoded groups0..7. @param payload Original IQ correction bits.
+ * @param primary_bits Original primary metadata. @param secondary_bits Original secondary metadata.
+ * @param extended_bits Original extended minima. @param scale_ab Original activation scale.
+ * @param sum_a Original signed activation sum.
+ */
+template<NativeQuantisedFormat FMT>
+__device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_block_bits(
+    float& f_acc,const int32_t* __restrict__ a4,const int32_t* __restrict__ packed_groups,
+    const uint8_t* __restrict__ payload,uint16_t primary_bits,uint16_t secondary_bits,
+    uint32_t extended_bits,float scale_ab,int32_t sum_a)
+{
+    int32_t acc_lo=0,acc_hi=0;
+    if constexpr(NATIVE_QUANTISEDTraits<FMT>::is_dual_scale)
+    {
+        #pragma unroll
+        for(unsigned group=0;group<4;++group)
+            acc_lo=::llaminar2::rocm_integer_contract::signedDot4(a4[group],packed_groups[group],acc_lo);
+        #pragma unroll
+        for(unsigned group=4;group<8;++group)
+            acc_hi=::llaminar2::rocm_integer_contract::signedDot4(a4[group],packed_groups[group],acc_hi);
+    }
+    else
+    {
+        #pragma unroll
+        for(unsigned group=0;group<8;++group)
+            acc_lo=::llaminar2::rocm_integer_contract::signedDot4(a4[group],packed_groups[group],acc_lo);
+    }
+    native_quantised_small_m_commit_integer_dots_bits<FMT>(f_acc,a4,acc_lo,acc_hi,payload,
+        primary_bits,secondary_bits,extended_bits,scale_ab,sum_a);
+}
+
+/**
+ * @brief Preserve every original decoded-block caller with one shared scalar-bit arithmetic body.
+ * @tparam FMT Original independent physical format.
+ * @param f_acc Running original partition sum. @param a4 Original eight activation words.
+ * @param packed_groups Original decoded weight words. @param payload Original packed block.
+ * @param scale_base Primary metadata plane. @param min_base Secondary metadata plane.
+ * @param emin_base Extended metadata plane. @param linear Original K32-major index.
+ * @param scale_ab Original activation scale. @param sum_a Exact original activation sum.
+ */
+template<NativeQuantisedFormat FMT>
+__device__ __forceinline__ void native_quantised_small_m_accumulate_decoded_block(
+    float& f_acc,const int32_t* __restrict__ a4,const int32_t* __restrict__ packed_groups,
+    const uint8_t* __restrict__ payload,const uint16_t* __restrict__ scale_base,
+    const uint16_t* __restrict__ min_base,const uint32_t* __restrict__ emin_base,
+    size_t linear,float scale_ab,int32_t sum_a)
+{
+    using Traits=NATIVE_QUANTISEDTraits<FMT>;
+    const uint16_t primary=scale_base[linear];
+    const uint16_t secondary=Traits::requires_secondary_metadata?min_base[linear]:uint16_t{0};
+    const uint32_t extended=Traits::needs_emin_array?emin_base[linear]:uint32_t{0};
+    native_quantised_small_m_accumulate_decoded_block_bits<FMT>(f_acc,a4,packed_groups,payload,
+        primary,secondary,extended,scale_ab,sum_a);
 }
 
 /**
@@ -5481,8 +7212,14 @@ __global__ void gemv_native_quantised_small_m_kernel_t(
 // Otherwise identical to the main kernel: sdot4 accumulation, FP16 scales,
 // dual-scale, asymmetric min correction, scatter+reduce K-partitioning.
 // ============================================================================
+/**
+ * @brief Original IQ-LDS producer with explicit logical tile and original K partition.
+ * @details The original256-thread preload, decoder and arithmetic are shared
+ * with resident execution. Every physical lane participates in its CTA barriers;
+ * callers fence shared reuse between successive logical producer tasks.
+ */
 template <int IQ_TN, NativeQuantisedFormat FMT, bool HasWork = false>
-__global__ void gemv_iq_lds_kernel_t(
+__device__ __forceinline__ void nativeM1IQLDSBody(
     const int8_t*    __restrict__ d_A_int8,
     const uint8_t*   __restrict__ d_payload,
     const uint16_t*  __restrict__ d_block_scales,
@@ -5492,7 +7229,8 @@ __global__ void gemv_iq_lds_kernel_t(
     float*           __restrict__ d_partial_fp32,
     const float*     __restrict__ d_scale_A,
     const float*     __restrict__ d_scale_A_blockwise,
-    int N, int K, int kblocks, llaminar2::ProjectionRowWork work)
+    int N, int K, int kblocks, llaminar2::ProjectionRowWork work,
+    unsigned logical_tile,unsigned logical_partition)
 {
     if constexpr(HasWork)
     if(!llaminar2::projectionWorkRowIsActiveUniform(work,0))return; // Same ordinary M1 route; no unauthored reads/writes.
@@ -5529,9 +7267,9 @@ __global__ void gemv_iq_lds_kernel_t(
     __syncthreads();
 
     // ---- Main GEMV logic ----
-    const int n = blockIdx.x * IQ_TN + threadIdx.x;
+    const int n = logical_tile * IQ_TN + threadIdx.x;
     const bool active = (n < N);
-    const int kb = blockIdx.y;
+    const int kb = logical_partition;
 
     const int blocks_per_row = K / 32;
     const int b_per = (blocks_per_row + kblocks - 1) / kblocks;
@@ -5581,6 +7319,23 @@ __global__ void gemv_iq_lds_kernel_t(
     }
 }
 
+template <int IQ_TN, NativeQuantisedFormat FMT, bool HasWork = false>
+__global__ void gemv_iq_lds_kernel_t(
+    const int8_t*    __restrict__ d_A_int8,
+    const uint8_t*   __restrict__ d_payload,
+    const uint16_t*  __restrict__ d_block_scales,
+    const uint16_t*  __restrict__ d_block_mins,
+    const uint32_t*  __restrict__ d_block_emins,
+    float*           __restrict__ d_C_fp32,
+    float*           __restrict__ d_partial_fp32,
+    const float*     __restrict__ d_scale_A,
+    const float*     __restrict__ d_scale_A_blockwise,
+    int N, int K, int kblocks, llaminar2::ProjectionRowWork work)
+{
+    nativeM1IQLDSBody<IQ_TN,FMT,HasWork>(d_A_int8,d_payload,d_block_scales,d_block_mins,d_block_emins,
+        d_C_fp32,d_partial_fp32,d_scale_A,d_scale_A_blockwise,N,K,kblocks,work,blockIdx.x,blockIdx.y);
+}
+
 
 extern "C" {
 
@@ -5614,7 +7369,8 @@ bool rocmMoE_grouped_gate_up_native_quantised_decode_table(
     uint8_t codebook_id,
     uint32_t policy_codebook_mask,
     int device_id,
-    void* stream)
+    void* stream,
+    const llaminar2::NativeTileCompletionView* completion)
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
@@ -5669,6 +7425,35 @@ bool rocmMoE_grouped_gate_up_native_quantised_decode_table(
         }
     }
 
+    if(completion)
+    {
+        if(!fused_swiglu_publication||!completion->counters||
+            completion->tiles!=(static_cast<unsigned>(N)+63u)/64u||completion->routes!=unsigned(num_active)||
+            completion->contributors!=policy_table.maximum_k_partitions)
+            throw std::logic_error("Last-producer gate/up changed its exact prepared counter/partition geometry");
+        if(llaminar2::rocm::currentGateUpProducerLoads()==llaminar2::rocm::GateUpProducerLoads::PairedK32)
+        {
+        hipLaunchKernelGGL(moe_grouped_native_quantised_gate_up_paired_k32_last_producer_kernel,
+            dim3(completion->tiles,num_active,policy_table.maximum_k_partitions),dim3(64),0,hip_stream,
+            d_hidden_int8,d_hidden_scales,d_gate_desc_table,d_up_desc_table,
+            static_cast<const DeviceMoELayerRuntimeView*>(nullptr),d_expert_ids,d_gate_partials,d_up_partials,
+            num_active,N,K,num_experts,policy_table.k_partitions_0_7,policy_table.k_partitions_8_15,
+            policy_table.k_partitions_16_23,policy_table.k_partitions_24_31,int(policy_table.maximum_k_partitions),
+            d_fused_swiglu_int8,d_fused_swiglu_scales,*completion);
+        }
+        else
+        {
+        hipLaunchKernelGGL(moe_grouped_native_quantised_gate_up_last_producer_kernel,
+            dim3(completion->tiles,num_active,policy_table.maximum_k_partitions),dim3(64),0,hip_stream,
+            d_hidden_int8,d_hidden_scales,d_gate_desc_table,d_up_desc_table,
+            static_cast<const DeviceMoELayerRuntimeView*>(nullptr),d_expert_ids,d_gate_partials,d_up_partials,
+            num_active,N,K,num_experts,policy_table.k_partitions_0_7,policy_table.k_partitions_8_15,
+            policy_table.k_partitions_16_23,policy_table.k_partitions_24_31,int(policy_table.maximum_k_partitions),
+            d_fused_swiglu_int8,d_fused_swiglu_scales,*completion);
+        }
+        return hipGetLastError()==hipSuccess;
+    }
+
     constexpr int TN = 64;
     dim3 output_grid((N + TN - 1) / TN, num_active);
     dim3 partial_grid(
@@ -5703,20 +7488,13 @@ bool rocmMoE_grouped_gate_up_native_quantised_decode_table(
     if (fused_swiglu_publication)
     {
         hipLaunchKernelGGL(
-            HIP_KERNEL_NAME(
-                moe_grouped_native_quantised_gate_up_descriptor_reduce_swiglu_q8_kernel<false>),
-            output_grid, block, 0, hip_stream,
-            d_gate_partials, d_up_partials,
-            d_gate_desc_table, d_up_desc_table,
-            static_cast<const DeviceMoELayerRuntimeView*>(nullptr),
-            d_expert_ids,
-            d_fused_swiglu_int8,
-            d_fused_swiglu_scales,
-            num_active, N, num_experts,
-            policy_table.k_partitions_0_7,
-            policy_table.k_partitions_8_15,
-            policy_table.k_partitions_16_23,
-            policy_table.k_partitions_24_31);
+            HIP_KERNEL_NAME(moe_grouped_native_quantised_gate_up_descriptor_reduce_swiglu_q8_kernel<false>),
+            output_grid,block,0,hip_stream,d_gate_partials,d_up_partials,
+            d_gate_desc_table,d_up_desc_table,
+            static_cast<const DeviceMoELayerRuntimeView*>(nullptr),d_expert_ids,
+            d_fused_swiglu_int8,d_fused_swiglu_scales,num_active,N,num_experts,
+            policy_table.k_partitions_0_7,policy_table.k_partitions_8_15,
+            policy_table.k_partitions_16_23,policy_table.k_partitions_24_31);
     }
     else
     {
@@ -6116,7 +7894,8 @@ bool rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
     uint8_t codebook_id,
     uint32_t policy_codebook_mask,
     int device_id,
-    void* stream)
+    void* stream,
+    const llaminar2::NativeDownCompletionView* completion)
 {
     llaminar2::HipDeviceGuard::setDevice(device_id);
 
@@ -6126,7 +7905,7 @@ bool rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
         ((!d_gate_ptrs || !d_up_ptrs) && !swiglu_prequantized) ||
         !d_desc_table ||
         !d_expert_ids || !d_weights || !d_swiglu_int8 || !d_swiglu_scales ||
-        (static_cast<bool>(d_output) == canonical_publication) ||
+        (completion ? (!d_output || !canonical_publication) : (static_cast<bool>(d_output) == canonical_publication)) ||
         !d_ordered_down_partials ||
         num_active <= 0 || N <= 0 || K <= 0 || num_experts <= 0 ||
         (K % 32) != 0)
@@ -6165,60 +7944,52 @@ bool rocmMoE_grouped_swiglu_down_native_quantised_decode_table(
     }
     hipError_t err = hipSuccess;
 
+    if(completion)
+    {
+        const auto expected=llaminar2::NativeDownCompletionPlan::make(N,num_active,policy_table.maximum_k_partitions);
+        if(!completion->partitions.counters||!completion->routes||
+            completion->partitions.tiles!=expected.partitions().tiles()||
+            completion->partitions.routes!=expected.partitions().routes()||
+            completion->partitions.contributors!=expected.partitions().contributors()||
+            completion->routes!=completion->partitions.counters+expected.partitions().counters())
+            return false;
+        hipLaunchKernelGGL(moe_grouped_native_quantised_down_last_producer_kernel,
+            dim3(expected.partitions().tiles(),num_active,policy_table.maximum_k_partitions),
+            dim3(llaminar2::NativeDownCompletionPlan::columns_per_tile),0,hip_stream,
+            d_swiglu_int8,d_swiglu_scales,d_desc_table,d_expert_ids,d_weights,d_ordered_down_partials,
+            d_canonical_route_contributions,d_output,num_active,N,K,num_experts,
+            policy_table.k_partitions_0_7,policy_table.k_partitions_8_15,
+            policy_table.k_partitions_16_23,policy_table.k_partitions_24_31,
+            static_cast<int>(policy_table.maximum_k_partitions),*completion);
+        return hipGetLastError()==hipSuccess;
+    }
+
     constexpr int TN = 64;
     float* const route_contributions = canonical_publication
                                            ? d_canonical_route_contributions
                                            : d_ordered_down_partials;
-    dim3 route_grid((N + TN - 1) / TN, num_active);
-    dim3 partial_grid(
-        (N + TN - 1) / TN,
-        num_active,
-        policy_table.maximum_k_partitions);
     dim3 block(TN);
-
+    const dim3 partial_grid((N+TN-1)/TN,num_active,policy_table.maximum_k_partitions);
+    const dim3 route_grid((N+TN-1)/TN,num_active);
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(
-            moe_grouped_native_quantised_down_descriptor_kpart_kernel<false>),
-        partial_grid, block, 0, hip_stream,
-        d_swiglu_int8, d_swiglu_scales, d_desc_table,
-        static_cast<const DeviceMoELayerRuntimeView*>(nullptr),
-        d_expert_ids, d_ordered_down_partials,
-        num_active, N, K, num_experts,
-        policy_table.k_partitions_0_7,
-        policy_table.k_partitions_8_15,
-        policy_table.k_partitions_16_23,
-        policy_table.k_partitions_24_31,
+        HIP_KERNEL_NAME(moe_grouped_native_quantised_down_descriptor_kpart_kernel<false>),
+        partial_grid,block,0,hip_stream,d_swiglu_int8,d_swiglu_scales,d_desc_table,
+        static_cast<const DeviceMoELayerRuntimeView*>(nullptr),d_expert_ids,
+        d_ordered_down_partials,num_active,N,K,num_experts,
+        policy_table.k_partitions_0_7,policy_table.k_partitions_8_15,
+        policy_table.k_partitions_16_23,policy_table.k_partitions_24_31,
         static_cast<int>(policy_table.maximum_k_partitions));
-
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr, "[rocmMoE_grouped_swiglu_down_native_quantised_decode_table] route launch failed: %s\n",
-                hipGetErrorString(err));
+    if (hipGetLastError() != hipSuccess)
         return false;
-    }
-
     hipLaunchKernelGGL(
-        HIP_KERNEL_NAME(
-            moe_grouped_native_quantised_down_descriptor_reduce_kernel<false>),
-        route_grid, block, 0, hip_stream,
-        d_ordered_down_partials, d_desc_table,
-        static_cast<const DeviceMoELayerRuntimeView*>(nullptr),
-        d_expert_ids, d_weights, route_contributions,
-        num_active, N, num_experts,
-        policy_table.k_partitions_0_7,
-        policy_table.k_partitions_8_15,
-        policy_table.k_partitions_16_23,
-        policy_table.k_partitions_24_31);
-    err = hipGetLastError();
-    if (err != hipSuccess)
-    {
-        fprintf(stderr,
-                "[rocmMoE_grouped_swiglu_down_native_quantised_decode_table] "
-                "descriptor-local K-partition reduce launch failed: %s\n",
-                hipGetErrorString(err));
+        HIP_KERNEL_NAME(moe_grouped_native_quantised_down_descriptor_reduce_kernel<false>),
+        route_grid,block,0,hip_stream,d_ordered_down_partials,d_desc_table,
+        static_cast<const DeviceMoELayerRuntimeView*>(nullptr),d_expert_ids,d_weights,
+        route_contributions,num_active,N,num_experts,
+        policy_table.k_partitions_0_7,policy_table.k_partitions_8_15,
+        policy_table.k_partitions_16_23,policy_table.k_partitions_24_31);
+    if (hipGetLastError() != hipSuccess)
         return false;
-    }
 
     if (!canonical_publication)
     {
@@ -6397,7 +8168,8 @@ bool rocmLaunch_native_quantised_small_m_fp32(
     int M, int N, int K,
     int device_id, void* stream,
     uint8_t arithmetic_policy_codebook_id,
-    const llaminar2::DeviceRowRange *row_range)
+    const llaminar2::DeviceRowRange *row_range,
+    const llaminar2::GPUHCDownOutputView* publication = nullptr)
 {
     const auto rows = row_range
         ? *row_range : llaminar2::DeviceRowRange::fullyActive(M);
@@ -6495,12 +8267,45 @@ bool rocmLaunch_native_quantised_small_m_fp32(
         return false;
     }
 
+    bool hc_down_long_k = false;
+    if constexpr (FMT == NATIVE_QUANTISED_Q8_0)
+    {
+        if (decode_equivalent && generated_cfg.has_generated &&
+            generated_cfg.kb == kHCDownPartitions && kb == kHCDownPartitions &&
+            arithmetic_policy_codebook_id == static_cast<uint8_t>(NATIVE_QUANTISED_Q8_0) &&
+            N == kHCDownColumns && K == kHCDownReduction && M >= 2 && M <= 8 &&
+            row_range && row_range->countOwner() && !d_block_mins && !d_block_emins &&
+            !llaminar2::currentProjectionRowWork(M) &&
+            (publication || llaminar2::qfnGroupedHCDownLongKExperiment()))
+        {
+            const auto &hardware = llaminar2::rocmHardwareMetadata().at(device_id);
+            hc_down_long_k = (hardware.isa_target == "gfx906" || hardware.isa_target.starts_with("gfx906:")) &&
+                hardware.compute_units == 60 && hardware.native_wave_width == 64 &&
+                hardware.maximum_threads_per_block >= kHCDownTileColumns * kHCDownWindow;
+            if (hc_down_long_k &&
+                (reinterpret_cast<std::uintptr_t>(stream) <= 2 ||
+                 (reinterpret_cast<std::uintptr_t>(d_payload) & 15u) ||
+                 (reinterpret_cast<std::uintptr_t>(d_A_int8) & 3u)))
+            {
+                fprintf(stderr, "[rocmGemv_native_quantised_small_m_fp32] invalid exact HC-down alignment or stream\n");
+                return false;
+            }
+        }
+    }
+
+    if (publication && (!hc_down_long_k || M != kHCDownTileRows ||
+        publication->columns != kHCDownColumns ||
+        publication->rows.captureIdentity() != rows.captureIdentity() ||
+        !publication->activated || !publication->primary || !publication->residual ||
+        !publication->primaryScales || !publication->residualScales))
+        return false;
+
     recordNativeQuantisedSmallMLaunch(
         M,
         N,
         K,
         static_cast<unsigned>(FMT),
-        grid_n,
+        hc_down_long_k ? N / kHCDownTileColumns : grid_n,
         kb,
         target_waves_per_cu,
         false,
@@ -6538,7 +8343,18 @@ bool rocmLaunch_native_quantised_small_m_fp32(
         float* tile_c =
             d_C_fp32 + static_cast<size_t>(row_base) * N;
 
-        if (tile_rows_per_group == NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE)
+        if (hc_down_long_k)
+        {
+            static_assert(llaminar2::kDefaultNativeQuantisedVerifierRowCapacity >= 8);
+            const dim3 grid(N / kHCDownTileColumns, kb, (tile_m + kHCDownTileRows - 1) / kHCDownTileRows);
+            constexpr int threads = kHCDownTileColumns * kHCDownWindow;
+            hipLaunchKernelGGL(qfn_hc_down_long_k_contributions, grid, dim3(threads), 0,
+                static_cast<hipStream_t>(stream),
+                (HCDownLongKArgs{tile_a, d_payload, d_block_scales, tile_scales, d_partial_fp32, tile_rows}));
+            llaminar2::PerfStatsCollector::addCounter("gemm", "qfn_grouped_hc_down_long_k_nodes", 1.0,
+                "gemm", "rocm:" + std::to_string(device_id));
+        }
+        else if (tile_rows_per_group == NATIVE_QUANTISED_VERIFIER_SHORT_ROWS_PER_TILE)
         {
             llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
         hipLaunchKernelGGL(
@@ -6574,7 +8390,12 @@ bool rocmLaunch_native_quantised_small_m_fp32(
             return false;
         }
 
-        if (kb > 1)
+        if (publication)
+        {
+            hipLaunchKernelGGL(groupedHCDownReducePublish, dim3(grid_n, tile_m), dim3(THREADS), 0,
+                static_cast<hipStream_t>(stream), d_partial_fp32, tile_c, *publication);
+        }
+        else if (kb > 1)
         {
             llaminar2::dispatchProjectionWorkMode(M,[&]<bool HasWork>() {
         hipLaunchKernelGGL(
@@ -7185,6 +9006,23 @@ bool rocmLaunch_native_quantised_small_m_batched_mixed_fp32(
     return true;
 }
 
+namespace llaminar2::rocm {
+bool enqueueGroupedHCDownReducePublish(
+    const int8_t* activation, const uint8_t* weights, const uint16_t* weight_scales,
+    float* raw, const float* activation_scales, const int32_t* activation_sums,
+    float* partials, int device, void* stream, const GPUHCDownOutputView& publication)
+{
+    if (reinterpret_cast<std::uintptr_t>(stream) <= 2 || !activation || !weights ||
+        !weight_scales || !raw || !activation_scales || !activation_sums || !partials)
+        return false;
+    HipDeviceGuard::setDevice(device);
+    return rocmLaunch_native_quantised_small_m_fp32<NATIVE_QUANTISED_Q8_0>(
+        activation, weights, weight_scales, nullptr, nullptr, raw, activation_scales, activation_sums,
+        partials, kHCDownTileRows, kHCDownColumns, kHCDownReduction, device, stream,
+        static_cast<uint8_t>(NATIVE_QUANTISED_Q8_0), &publication.rows, &publication);
+}
+} // namespace llaminar2::rocm
+
 extern "C" {
 
 /**
@@ -7727,6 +9565,18 @@ bool rocmGemv_native_quantised_small_m_batched_mixed_fp32_with_sums(
 
 
 /**
+ * @brief Retain the original ordinary-M1 IQ-LDS selection exactly for every caller.
+ * @param execution Actual physical decoder codebook. @param n Output columns. @param k Reduction width.
+ * @return The existing native source route; this does not select a resident grid or change K partitions.
+ */
+static bool nativeM1UsesIQLDS(std::uint8_t execution,int n,int k)
+{
+    constexpr int original_cus=60,iq_tile=256;
+    const int tiles=(n+iq_tile-1)/iq_tile;
+    return execution>=11 && execution<=17 &&
+        (tiles>=original_cus/2 || (k>=4.0f*n && tiles>=original_cus/10));
+}
+/**
  * @brief Execute serial NativeQuantised GEMV with an explicit arithmetic policy.
  *
  * The execution codebook owns physical decoding; the arithmetic policy
@@ -7747,10 +9597,16 @@ static bool nativeM1WithReduction(
     uint8_t arithmetic_policy_codebook_id,
     int device_id, void* stream,
     const float* d_scale_A_blockwise,
-    llaminar2::rocm::NativeM1ReductionTicket *deferred)
+    llaminar2::rocm::NativeM1ReductionTicket *deferred,
+    const llaminar2::rocm::NativeQ8SerialGeometryAdmission *prepared=nullptr)
 {
     if(reinterpret_cast<std::uintptr_t>(stream)<=2 || device_id<0 || N<=0 || K<=0 || !d_A_int8 || !d_payload || !d_block_scales || !d_C_fp32)
         throw std::invalid_argument("Native M1 submission requires exact non-null operands, device and stream");
+    if(prepared&&(g_native_q8_serial_scope||codebook_id!=NATIVE_QUANTISED_Q8_0||
+        arithmetic_policy_codebook_id!=19||!d_scale_A_blockwise||g_native_quantised_serial_partition_n!=0||
+        prepared->deviceOrdinal()!=device_id||prepared->geometry()!=llaminar2::rocm::NativeQ8SerialGeometry::TN128CPT1||
+        prepared->producerLoads()!=llaminar2::rocm::NativeQ8SerialProducerLoads::TwoK32Lookahead))
+        throw std::logic_error("Prepared HC lookahead requires its original native19/blockwise/source arithmetic purpose");
     if(deferred)llaminar2::rocm::NativeM1ReductionIssuer::requireEmpty(*deferred);
     llaminar2::rocm::clearNativeQ8SerialLaunch();
     if (g_native_q8_serial_scope)
@@ -7850,13 +9706,10 @@ static bool nativeM1WithReduction(
     // All thresholds are ratio-based or hardware-relative — no hardcoded
     // row/column counts — so they scale to arbitrary model dimensions.
     // =========================================================================
-    const bool is_iq_format = (codebook_id >= 11 && codebook_id <= 17);
 
     // Strategy 1: CU-saturation check — need enough N-blocks for the wider tile
     constexpr int IQ_LDS_TN = 256;
-    constexpr int IQ_LDS_MIN_N_BLOCKS = NUM_CUS / 2;  // Hardware-relative: half the CU count
     const int grid_n_lds = (N + IQ_LDS_TN - 1) / IQ_LDS_TN;
-    const bool n_saturated = (grid_n_lds >= IQ_LDS_MIN_N_BLOCKS);
 
     // Strategy 2: K-heavy aspect ratio — long K-loops benefit most from LDS grid
     // cache because they do many grid lookups per thread.  Uses two ratio-based
@@ -7865,12 +9718,8 @@ static bool nativeM1WithReduction(
     //   - grid_n_lds >= 6 (~10% of CUs): minimum parallelism for LDS kernel's
     //     256-thread workgroups.  Shapes with fewer N-blocks (e.g., 0.5B FFN_Dn
     //     with grid_n=4) don't have enough work for the wider tile.
-    constexpr float IQ_K_HEAVY_RATIO = 4.0f;          // Aspect ratio threshold
-    constexpr int IQ_K_HEAVY_MIN_GRID_N = NUM_CUS / 10;  // ~10% of CUs
-    const bool is_k_heavy = (K >= IQ_K_HEAVY_RATIO * N) &&
-                            (grid_n_lds >= IQ_K_HEAVY_MIN_GRID_N);
 
-    const bool use_iq_lds = is_iq_format && (n_saturated || is_k_heavy);
+    const bool use_iq_lds = nativeM1UsesIQLDS(codebook_id,N,K);
 
     if (use_iq_lds)
     {
@@ -8002,7 +9851,7 @@ static bool nativeM1WithReduction(
         constexpr int TN = 128;
         constexpr int CPT = 1;
 
-        const auto serial_geometry = g_native_q8_serial_scope
+        const auto serial_geometry = prepared?prepared->geometry():g_native_q8_serial_scope
             ? g_native_q8_serial_scope->admission().geometry()
             : llaminar2::rocm::NativeQ8SerialGeometry::TN128CPT1;
         const auto serial_spec = llaminar2::rocm::nativeQ8SerialGeometrySpec(serial_geometry);
@@ -8048,7 +9897,7 @@ static bool nativeM1WithReduction(
             if (kb > blocks_per_row) kb = blocks_per_row;
         }
 
-        if (g_native_q8_serial_scope && kb !=
+        if ((g_native_q8_serial_scope||prepared) && kb !=
             llaminar2::MoEProjectionNumericalContract::orderedKPartitionsForWidth(K))
             throw std::logic_error("native-Q8 serial geometry cannot change the production K-partition tree");
 
@@ -8068,7 +9917,7 @@ static bool nativeM1WithReduction(
             launchNativeQuantisedSerialGeometry<TN, CPT, FMT_TAG>( \
                 d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, \
                 d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, kb, \
-                arithmetic_policy_codebook_id, device_id, stream, serial_geometry,deferred)
+                arithmetic_policy_codebook_id, device_id, stream, serial_geometry,deferred,prepared)
 
         switch (static_cast<NativeQuantisedFormat>(codebook_id))
         {
@@ -8096,7 +9945,7 @@ static bool nativeM1WithReduction(
             launchNativeQuantisedSerialGeometry<TILE, COLUMNS, NATIVE_QUANTISED_Q8_0>( \
                 d_A_int8, d_payload, d_scales_u16, d_mins_u16, d_emins_u32, \
                 d_C_fp32, d_partial_fp32, d_scale_A, d_scale_A_blockwise, N, K, kb, \
-                arithmetic_policy_codebook_id, device_id, stream, serial_geometry,deferred)
+                arithmetic_policy_codebook_id, device_id, stream, serial_geometry,deferred,prepared)
             switch (serial_geometry)
             {
             case G::TN64CPT1: LAUNCH_NATIVE_Q8_GEOMETRY(64, 1); break;
@@ -8259,6 +10108,39 @@ bool enqueueNativeM1Producer(NativeM1ReductionTicket &ticket,const std::int8_t *
         n,k,execution,policy,device,stream,block_scales,&ticket);
 }
 
+/** @copydoc enqueueNativeM1HCDownProjection */
+bool enqueueNativeM1HCDownProjection(const std::int8_t *A,const std::uint8_t *payload,
+    const void *scales,const void *mins,const void *emins,float *output,const float *scale_a,
+    float *partials,int n,int k,std::uint8_t execution,std::uint8_t policy,int device,void *stream,
+    const float *block_scales,const GPUHCDownOutputView &publication,
+    const NativeQ8SerialGeometryAdmission *prepared)
+{
+ if(execution!=19||policy!=19||n<64||n>512||n%32||k<=32||k%32||
+    publication.columns!=n||publication.rows.physicalRows()!=1||!publication.activated||
+    !publication.primary||!publication.residual||!publication.primaryScales||!publication.residualScales||
+    !partials||!block_scales||reinterpret_cast<std::uintptr_t>(stream)<=2||device<0||
+    g_native_q8_serial_scope||g_native_quantised_kb_override.load(std::memory_order_relaxed)>0||
+    g_native_quantised_target_waves_override.load(std::memory_order_relaxed)>0||
+    debugEnv().rocm.native_quantised_gemv_kb>0||debugEnv().rocm.native_quantised_gemv_target_waves>0)
+    throw std::invalid_argument("HC down epilogue requires original native19 M1 reducer policy and sealed complete banks");
+ NativeM1ReductionTicket ticket;
+ if(!nativeM1WithReduction(A,payload,scales,mins,emins,output,scale_a,partials,
+    n,k,execution,policy,device,stream,block_scales,&ticket,prepared))
+    throw std::runtime_error("Original HC down producer enqueue failed");
+ const auto& shape=ticket.producerShape();
+ if(ticket.state_!=NativeM1ReductionTicket::State::Pending||shape.tile_columns!=128||shape.columns_per_thread!=1)
+    throw std::logic_error("HC down epilogue has no original pending128-column reducer");
+ if(ticket.has_work_)
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(nativeM1HCDownReducePublish<true>),dim3((n+127)/128),dim3(128),0,
+        static_cast<hipStream_t>(stream),ticket.partials_,ticket.output_,n,shape.partitions,ticket.work_,publication);
+ else
+    hipLaunchKernelGGL(HIP_KERNEL_NAME(nativeM1HCDownReducePublish<false>),dim3((n+127)/128),dim3(128),0,
+        static_cast<hipStream_t>(stream),ticket.partials_,ticket.output_,n,shape.partitions,ticket.work_,publication);
+ if(hipGetLastError()!=hipSuccess)throw std::runtime_error("Original HC reducer epilogue enqueue failed");
+ ticket.state_=NativeM1ReductionTicket::State::Consumed;
+ return true;
+}
+
 bool submitNativeM1Reductions(std::span<NativeM1ReductionTicket> tickets,int device,void *stream)
 {
     if(reinterpret_cast<std::uintptr_t>(stream)<=2 || device<0 || tickets.empty() || tickets.size()>4)
@@ -8334,3 +10216,245 @@ bool submitNativeM1Reductions(std::span<NativeM1ReductionTicket> tickets,int dev
     return true;
 }
 }
+
+namespace llaminar2::rocm
+{
+/** @copydoc downLastProducerPlan */
+NativeDownCompletionPlan downLastProducerPlan(int columns,int reduction,int routes,std::uint32_t policy_mask)
+{
+    ROCmMoESerialM1PolicyTable policy{};
+    if(columns<=0||reduction<=0||routes<=0||columns%32||reduction%32||
+        !buildROCmMoESerialM1PolicyTable(columns,reduction,policy_mask,policy))
+        throw std::invalid_argument("Last-producer down has no original serial-M1 partition policy");
+    return NativeDownCompletionPlan::make(columns,routes,policy.maximum_k_partitions);
+}
+/** @copydoc downLastProducerKernelFunction */
+const void* downLastProducerKernelFunction() noexcept
+{return reinterpret_cast<const void*>(moe_grouped_native_quantised_down_last_producer_kernel);}
+
+/** @copydoc gateUpLastProducerPlan */
+NativeTileCompletionPlan gateUpLastProducerPlan(int columns,int reduction,int routes,std::uint32_t policy_mask)
+{
+    ROCmMoESerialM1PolicyTable original{};
+    if(columns<=0||reduction<=0||routes<=0||columns%32||reduction%32||
+        !buildROCmMoESerialM1PolicyTable(columns,reduction,policy_mask,original))
+        throw std::invalid_argument("Last-producer gate/up requires its complete original M1 source policy");
+    return NativeTileCompletionPlan::make(columns,routes,original.maximum_k_partitions);
+}
+/** @return Exact original-grid last-producer program identity, without device resource queries. */
+const void* gateUpLastProducerKernelFunction() noexcept
+{
+    return currentGateUpProducerLoads()==GateUpProducerLoads::PairedK32
+        ?reinterpret_cast<const void*>(&moe_grouped_native_quantised_gate_up_paired_k32_last_producer_kernel)
+        :reinterpret_cast<const void*>(&moe_grouped_native_quantised_gate_up_last_producer_kernel);
+}
+/** @copydoc gateUpLastProducerKernelFunction(GateUpProducerLoads) */
+const void* gateUpLastProducerKernelFunction(GateUpProducerLoads loads)
+{
+    if(loads==GateUpProducerLoads::Original)
+        return reinterpret_cast<const void*>(&moe_grouped_native_quantised_gate_up_last_producer_kernel);
+    if(loads==GateUpProducerLoads::PairedK32)
+        return reinterpret_cast<const void*>(&moe_grouped_native_quantised_gate_up_paired_k32_last_producer_kernel);
+    throw std::invalid_argument("Unknown gate/up producer loads for native function identity");
+}
+}
+
+#include "ROCmPersistentHCReadBody.hip.inc"
+
+namespace llaminar2::rocm {
+/** @brief Validate the borrowed original physical phase bindings without reading live GPU state. */
+static void validatePersistentHCRead(const PersistentHCReadArgs& a,bool ctaOwned=false,
+ FullNativeHCFFNOutputDemand output_demand=FullNativeHCFFNOutputDemand::all()) {
+ const int H=a.norm.hidden,R=a.down_weights.n;
+ if(a.norm.extent.rows!=1||H<=0||(ctaOwned?H%8:H%32)||static_cast<std::int64_t>(H)*4!=a.down_weights.k||
+    R<64||R>512||R%32||!std::isfinite(a.norm.epsilon)||a.norm.epsilon<=0.0f||
+    !a.norm.input||!a.norm.gain||!a.norm.output||!a.input_codes||!a.input_scales||
+    !a.down_partials||!a.raw_down||!a.mixed||
+    (output_demand.contains(FullNativeHCFFNOutputRole::HCActivated)&&!a.publication.activated)||
+    a.down_weights.codebook_id!=19||a.up.weights.codebook_id!=19||
+    !a.down_weights.source_identity_present||!a.up.weights.source_identity_present||
+    a.publication.columns!=R||a.up.weights.k!=R||a.up.weights.n!=4*H||
+    a.up.rows.physicalRows()!=1||a.publication.rows.physicalRows()!=1||
+    a.up.rows.captureIdentity()!=a.publication.rows.captureIdentity()||
+    a.up.primary!=a.publication.primary||a.up.residual!=a.publication.residual||
+    a.up.primaryScales!=a.publication.primaryScales||a.up.residualScales!=a.publication.residualScales||
+    a.up.quantizer!=Q8ResidualQuantizerPolicy::ROCmFiniteHalfNativeReciprocal||
+    (output_demand.contains(FullNativeHCFFNOutputRole::HCUp)&&!a.up.output)||
+    a.publication.primary!=a.input_codes||a.publication.primaryScales!=a.input_scales||
+    (a.injection.weights==nullptr)!=(a.injection.output==nullptr)||
+    (a.injection.weights&&(a.injection.rows.physicalRows()!=1||
+      (a.injection.load_pairs!=1&&a.injection.load_pairs!=4&&a.injection.load_pairs!=8))))
+  throw std::invalid_argument("Persistent HC requires exact original M1 branch/native19/publication bindings");
+ (void)requireQ8ResidualNativeMatrix(a.down_weights,1,R,4*H);
+ (void)requireQ8ResidualNativeMatrix(a.up.weights,1,4*H,R);
+ const std::size_t K=static_cast<std::size_t>(4)*H;
+ // Each phase is checked separately: the original full input code/scale bank
+ // deliberately becomes the shorter two-term primary prefix after down retires.
+ const std::array normWrites{Q8ResidualStorageSpan{a.norm.output,K*sizeof(float),alignof(float)}};
+ const std::array normReads{Q8ResidualStorageSpan{a.norm.gain,K*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.norm.input,a.norm.input==a.norm.output?0:K*sizeof(float),alignof(float)}};
+ validateQ8ResidualStorage(normWrites,normReads);
+ const std::array downWrites{Q8ResidualStorageSpan{a.input_codes,K,16},
+  Q8ResidualStorageSpan{a.input_scales,K/32*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.down_partials,static_cast<std::size_t>(a.partitions)*R*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.injection.output,a.injection.output?4*sizeof(float):0,alignof(float)}};
+ const std::array downReads{Q8ResidualStorageSpan{a.norm.output,K*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.norm.input,a.norm.input==a.norm.output?0:K*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.norm.gain,K*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.down_weights.payload,K/32*R*32,16},
+  Q8ResidualStorageSpan{a.down_weights.scales,K/32*R*sizeof(std::uint16_t),alignof(std::uint16_t)},
+  Q8ResidualStorageSpan{a.injection.weights,a.injection.weights?4*K*sizeof(float):0,alignof(float)}};
+ validateQ8ResidualStorage(downWrites,downReads);
+ const std::array endWrites{Q8ResidualStorageSpan{a.raw_down,static_cast<std::size_t>(R)*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.publication.activated,
+   output_demand.contains(FullNativeHCFFNOutputRole::HCActivated)&&a.publication.activated!=a.raw_down?
+    static_cast<std::size_t>(R)*sizeof(float):0,alignof(float)},
+  Q8ResidualStorageSpan{a.publication.primary,static_cast<std::size_t>(R),16},
+  Q8ResidualStorageSpan{a.publication.residual,static_cast<std::size_t>(R),16},
+  Q8ResidualStorageSpan{a.publication.primaryScales,static_cast<std::size_t>(R)/32*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.publication.residualScales,static_cast<std::size_t>(R)/32*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.up.output,output_demand.contains(FullNativeHCFFNOutputRole::HCUp)?K*sizeof(float):0,alignof(float)},
+  Q8ResidualStorageSpan{a.mixed,static_cast<std::size_t>(H)*sizeof(float),alignof(float)}};
+ const std::array endReads{Q8ResidualStorageSpan{a.norm.output,K*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.norm.input,a.norm.input==a.norm.output?0:K*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.norm.gain,K*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.down_partials,static_cast<std::size_t>(a.partitions)*R*sizeof(float),alignof(float)},
+  Q8ResidualStorageSpan{a.down_weights.payload,K/32*R*32,16},
+  Q8ResidualStorageSpan{a.down_weights.scales,K/32*R*sizeof(std::uint16_t),alignof(std::uint16_t)},
+  Q8ResidualStorageSpan{a.up.weights.payload,K/32*R*32,16},
+  Q8ResidualStorageSpan{a.up.weights.scales,K/32*R*sizeof(std::uint16_t),alignof(std::uint16_t)},
+  Q8ResidualStorageSpan{a.injection.output,a.injection.output?4*sizeof(float):0,alignof(float)}};
+ validateQ8ResidualStorage(endWrites,endReads);
+}
+/** @copydoc resolvePersistentHCReadPolicy */
+void resolvePersistentHCReadPolicy(PersistentHCReadArgs& args,FullNativeHCFFNOutputDemand output_demand) {
+ if(isGraphCaptureActive())
+  throw std::invalid_argument("Persistent HC source-policy resolution requires cold preparation");
+ const auto& env=debugEnv().rocm;
+ if(g_native_q8_serial_scope||g_native_quantised_kb_override.load(std::memory_order_relaxed)>0||
+    g_native_quantised_target_waves_override.load(std::memory_order_relaxed)>0||
+    env.native_quantised_gemv_kb>0||env.native_quantised_gemv_target_waves>0)
+  throw std::invalid_argument("Persistent HC cannot replace an explicitly overridden original arithmetic policy");
+ if(args.down_weights.codebook_id!=19||!args.down_weights.source_identity_present)
+  throw std::invalid_argument("Persistent HC lost original signed-Q8 source policy");
+ args.partitions=resolveNativeQuantisedSerialM1KPartitionsForPolicy(
+  canonicalDeviceVnniCodebookId(args.down_weights.source_codebook_id),args.down_weights.n,args.down_weights.k);
+ if(args.partitions<=0)throw std::invalid_argument("Persistent HC original split-K source policy is absent");
+ validatePersistentHCRead(args,false,output_demand);
+}
+/** @copydoc preparePersistentHCRead */
+NativeCooperativeKernelAdmission preparePersistentHCRead(DeviceId device,PersistentHCReadArgs& args,
+ std::uint64_t generation) {
+ if(!device.is_rocm()||!generation||isGraphCaptureActive())
+  throw std::invalid_argument("Persistent HC admission requires its original native owner cold");
+ resolvePersistentHCReadPolicy(args);
+ const auto admission=NativeCooperativeKernelBoundary<NativeCooperativeBackend::ROCm>::prepare(device,
+  reinterpret_cast<const void*>(persistentHCReadKernel),256,0,generation);
+ const unsigned downTasks=static_cast<unsigned>((args.down_weights.n+63)/64)*args.partitions+
+  (args.injection.weights?4u:0u);
+ const unsigned liveTasks=std::max({4u,static_cast<unsigned>((args.down_weights.k/32+7)/8),downTasks,
+  static_cast<unsigned>((args.down_weights.n+255)/256),static_cast<unsigned>((args.norm.hidden+7)/8)});
+ unsigned bound=admission.maximumGrid();
+ if(args.grid_policy==PersistentHCGridPolicy::OnePerProcessor)
+  bound=std::min(bound,static_cast<unsigned>(rocmHardwareMetadata().at(device.ordinal).compute_units));
+ else if(args.grid_policy!=PersistentHCGridPolicy::MaximumResident)
+  throw std::invalid_argument("Persistent HC grid policy is not declared");
+ args.resident_grid=std::min(bound,liveTasks);
+ return admission;
+}
+/** @copydoc launchPersistentHCRead */
+void launchPersistentHCRead(const NativeCooperativeKernelAdmission& admission,const PersistentHCReadArgs& args,
+ void* stream,std::uint64_t generation) {
+ if(admission.function()!=reinterpret_cast<const void*>(persistentHCReadKernel)||admission.threads()!=256||
+    !args.resident_grid||args.resident_grid>admission.maximumGrid())
+  throw std::invalid_argument("Persistent HC exact prepared program/grid changed");
+ void* parameters[]{const_cast<PersistentHCReadArgs*>(&args)};
+ NativeCooperativeKernelBoundary<NativeCooperativeBackend::ROCm>::launch(admission,parameters,
+  args.resident_grid,stream,generation);
+}
+} // namespace llaminar2::rocm
+
+#include "ROCmCTAOwnedHCReadBody.hip.inc"
+namespace llaminar2::rocm {
+/** @copydoc prepareCTAOwnedHCRead */
+CTAOwnedHCReadProgram prepareCTAOwnedHCRead(DeviceId device,PersistentHCReadArgs& args,std::uint64_t generation) {
+ if(!device.is_rocm()||!generation||isGraphCaptureActive())
+  throw std::invalid_argument("CTA-owned HC requires its exact original native owner cold");
+ int currentDevice=-1;
+ if(hipGetDevice(&currentDevice)!=hipSuccess||currentDevice!=device.ordinal)
+  throw std::invalid_argument("CTA-owned HC cold resource admission has a foreign current native device");
+ const auto& env=debugEnv().rocm;
+ if(g_native_q8_serial_scope||g_native_quantised_kb_override.load(std::memory_order_relaxed)>0||
+    g_native_quantised_target_waves_override.load(std::memory_order_relaxed)>0||
+    env.native_quantised_gemv_kb>0||env.native_quantised_gemv_target_waves>0)
+  throw std::invalid_argument("CTA-owned HC cannot replace an overridden original arithmetic policy");
+ args.partitions=resolveNativeQuantisedSerialM1KPartitionsForPolicy(
+  canonicalDeviceVnniCodebookId(args.down_weights.source_codebook_id),args.down_weights.n,args.down_weights.k);
+ requireCTAOwnedHCTailGeometry(args.norm.hidden,args.partitions,args.raw_down==args.publication.activated);
+ // The complete storage validator is shared with the original implementation;
+ // its H%32 restriction belongs to that cooperative program, not this tail.
+ validatePersistentHCRead(args,true);
+ CTAOwnedHCReadProgram result;result.device_=device;result.generation_=generation;
+ result.hidden_=args.norm.hidden;result.rank_=args.down_weights.n;result.partitions_=args.partitions;
+ const auto select=[&]<unsigned G>() {return inspectNativeQ8SerialSymbol(
+  reinterpret_cast<const void*>(ctaOwnedHCTailKernel<G>),"ctaOwnedHCTailKernel",1024);};
+ switch(args.down_weights.n/32) {
+ case 2:result.resources_=select.template operator()<2>();break;
+ case 3:result.resources_=select.template operator()<3>();break;
+ case 4:result.resources_=select.template operator()<4>();break;
+ case 5:result.resources_=select.template operator()<5>();break;
+ case 6:result.resources_=select.template operator()<6>();break;
+ case 7:result.resources_=select.template operator()<7>();break;
+ case 8:result.resources_=select.template operator()<8>();break;
+ case 9:result.resources_=select.template operator()<9>();break;
+ case 10:result.resources_=select.template operator()<10>();break;
+ case 11:result.resources_=select.template operator()<11>();break;
+ case 12:result.resources_=select.template operator()<12>();break;
+ case 13:result.resources_=select.template operator()<13>();break;
+ case 14:result.resources_=select.template operator()<14>();break;
+ case 15:result.resources_=select.template operator()<15>();break;
+ case 16:result.resources_=select.template operator()<16>();break;
+
+ default:throw std::invalid_argument("CTA-owned HC has no complete original short-K group specialization");
+ }
+ return result;
+}
+/** @copydoc launchCTAOwnedHCRead */
+void launchCTAOwnedHCRead(const CTAOwnedHCReadProgram& program,const PersistentHCReadArgs& args,
+ void* stream,std::uint64_t generation) {
+ if(reinterpret_cast<std::uintptr_t>(stream)<=2||program.generation_!=generation||!generation||
+    !program.device_.is_rocm()||program.hidden_!=args.norm.hidden||program.rank_!=args.down_weights.n||
+    program.partitions_!=args.partitions||!program.resources_.function)
+  throw std::invalid_argument("CTA-owned HC exact prepared program/workspace geometry changed");
+ if(!rocmQuantGemm_quantizeActivationsBlockwise(args.norm.output,args.input_codes,args.input_scales,
+    1,args.down_weights.k,program.device_.ordinal,stream,32))
+  throw std::runtime_error("CTA-owned HC original SingleQ8 producer failed");
+ NativeM1ReductionTicket ticket;
+ if(!enqueueNativeM1Producer(ticket,args.input_codes,args.down_weights.payload,args.down_weights.scales,
+    args.down_weights.mins,args.down_weights.emins,args.raw_down,nullptr,args.down_partials,
+    args.down_weights.n,args.down_weights.k,args.down_weights.codebook_id,
+    canonicalDeviceVnniCodebookId(args.down_weights.source_codebook_id),program.device_.ordinal,stream,args.input_scales))
+  throw std::runtime_error("CTA-owned HC original down producer failed");
+ CTAOwnedHCTicketConsumer::submit(ticket,program,args,program.device_.ordinal,stream);
+}
+}
+
+#include "ROCmNativeLayoutRouterFFNBody.hip.inc"
+#include "ROCmNativeLayoutRouterFFNLaunch.hip.inc"
+#include "ROCmFullNativeHCFFNBody.hip.inc"
+#include "ROCmFullNativeHCFFNLaunch.hip.inc"
+
+#if !defined(__HIP_DEVICE_COMPILE__)
+#include "ROCmRoutedGridDonation.h"
+
+namespace llaminar2::rocm {
+/** @copydoc inspectRoutedGridDonation */
+RoutedGridDonation inspectRoutedGridDonation(std::uint32_t routed_formats, unsigned prefix_bytes,
+    std::size_t hidden_bytes, std::size_t panel_and_records_bytes) noexcept {
+    const auto after_hidden = prefix_bytes > hidden_bytes ? unsigned(prefix_bytes - hidden_bytes) : 0u;
+    const auto available = after_hidden > panel_and_records_bytes ? after_hidden - panel_and_records_bytes : 0;
+    const auto layout = routedGridLayout(routed_formats, available);
+    return {layout.iq2_entries, layout.iq3_small_entries, layout.iq3_extra_small_entries};
+}
+}
+#endif

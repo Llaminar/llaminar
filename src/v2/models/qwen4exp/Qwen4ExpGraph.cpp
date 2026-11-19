@@ -8,6 +8,7 @@
  * so reset, rollback and prefix archive share one lifecycle and frontier.
  */
 #include "Qwen4ExpGraph.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
 #include "Qwen4ExpEarlyCurrentInput.h"
 #include "execution/qwen4exp/PooledImmutableSourceRootBinding.h"
 #include "execution/qwen4exp/PooledImmutableRetainedParticipants.h"
@@ -20,6 +21,8 @@
 #include "../../execution/prefix_cache/PrefixCacheFingerprint.h"
 #include "Qwen4ExpBufferLayout.h"
 #include "Qwen4ExpTrunkBinding.h"
+#include "Qwen4ExpRetainedM1HCFFNPolicy.h"
+#include "execution/compute_stages/stages/MoEIntermediateShardPipeline.h"
 #include "../../execution/compute_stages/stages/qwen4exp/Qwen4ExpPLEBuilder.h"
 #include "../../execution/compute_stages/stages/qwen4exp/Qwen4ExpSparseAttentionBuilder.h"
 #include "../../execution/local_execution/graph/GraphResolver.h"
@@ -30,6 +33,10 @@
 #include "../../tensors/Tensors.h"
 #include "../../transfer/TransferEngine.h"
 #include "../../utils/DebugEnv.h"
+#ifdef HAVE_ROCM
+#include "execution/compute_stages/stages/qwen4exp/RetainedGDNPreAttentionStage.h"
+#include "models/qwen4exp/Qwen4ExpRetainedGDNPreAttentionPolicy.h"
+#endif
 #include <algorithm>
 #include <limits>
 #include <stdexcept>
@@ -60,6 +67,37 @@ namespace llaminar2
             throw std::invalid_argument(
                 "QSA prefill8_decode33 requires explicit fp16_tile and the canonical single-request graph family");
     }
+void Qwen4ExpGraph::postLayerComposition(ComputeGraph &graph, const LayerComposition &composition)
+{
+    if(!forward_input_construction_)return;
+    const auto &input=*forward_input_construction_;
+    if(input.execution_phase!=ForwardExecutionPhase::Decode ||
+       input.execution_role!=ForwardExecutionRole::MainInference || input.seq_len!=1 || input.batch_size!=1)return;
+    const bool qualified_domain = config_.moe.routed_expert_plan &&
+        config_.moe.routed_expert_plan->usesQFNMI50TP4();
+#ifdef HAVE_ROCM
+    if (usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionEnabled(qualified_domain), composition.device,
+            config_.moe.routed_compute_policy, input.execution_phase, input.execution_role,
+            input.seq_len, input.batch_size) &&
+        isGDNLayer(composition.layer))
+    {
+        lowerRetainedQwenGDNPreAttention(graph, "layer" + std::to_string(composition.layer) + "_gdn_proj",
+                                         composition.input_boundary);
+    }
+#endif
+    const auto &internalBoundary = composition.attention_terminal;
+    const auto *boundary=graph.getNode(internalBoundary);
+    if(useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNEnabled(qualified_domain),input.execution_phase,input.execution_role,input.seq_len,input.batch_size)) {
+        if(!boundary || !boundary->device.is_rocm())
+            throw std::invalid_argument("QFN retained full HC/FFN requires original ROCm layer composition");
+        if(config_.qfn_hc_norm_q8_candidate||
+           config_.qfn_hc_short_k_read_candidate||config_.qfn_hc_down_publish_candidate||
+           config_.qfn_hidden_q8_reuse_candidate)
+            throw std::invalid_argument("QFN retained full HC/FFN requires the original staged HC and router declarations");
+        lowerRetainedM1HCFFNMainInference(graph,internalBoundary);
+        return;
+    }
+}
 void Qwen4ExpGraph::appendPrefixCacheFingerprintMaterial(PrefixFingerprintMaterial &material) const
 {
     Qwen35MoEGraph::appendPrefixCacheFingerprintMaterial(material);

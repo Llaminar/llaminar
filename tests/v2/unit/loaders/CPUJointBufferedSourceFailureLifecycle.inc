@@ -53,19 +53,19 @@ struct BufferedCPUJointFiles {
     }
 };
 /** @return One canonical loader-derived original sparse selection (no fabricated source authority). */
-std::shared_ptr<const CPUExpertShardSourceSelection> bufferedCPUJointSelection(ModelLoader& loader) {
+std::shared_ptr<const ExpertShardSourceSelection> bufferedCPUJointSelection(ModelLoader& loader) {
     auto plan=localCPUJointSourceTestPlan();
     for(size_t expert=0;expert<512;++expert)plan.placements.front().routed_expert_tier[expert]=expert%8==0?0:1;
     const auto runtime=resolveMoEExpertOverlayRuntimePlan(std::make_shared<const MoERoutedExpertPlacementPlan>(plan),
         {.current_world_rank=0});
     if(!runtime)throw std::runtime_error("Original buffered source plan is absent");
     const auto prepared=MoEExpertOverlayPreparationPlan::build(*runtime,loader).filteredForDevice(DeviceId::cpu());
-    if(prepared.requests().empty() || !prepared.requests().front().cpu_joint_source)
+    if(prepared.requests().empty() || !prepared.requests().front().joint_source)
         throw std::runtime_error("Original buffered source selection is absent");
-    return prepared.requests().front().cpu_joint_source;
+    return prepared.requests().front().joint_source;
 }
 /** @return Original PMA staging authority quoted by the production allocator geometry. */
-std::shared_ptr<PhysicalMemoryAuthority> bufferedCPUJointMemory(ModelLoader& loader,const CPUExpertShardSourceSelection& selection) {
+std::shared_ptr<PhysicalMemoryAuthority> bufferedCPUJointMemory(ModelLoader& loader,const ExpertShardSourceSelection& selection) {
     const auto native=loader.nativeWeightSourceGeometry(BufferedCPUJointFiles::name(0));
     const auto projection=selection.ownership().projection(WeightRole::MoEExpertGate);
     const NativeWeightSourceWindow range{.original_expert=size_t(selection.expertIds().front()),

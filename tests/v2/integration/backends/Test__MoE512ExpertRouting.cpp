@@ -10,6 +10,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "execution/moe/MoERuntimeTable.h"
+#include "kernels/common/MoERuntimeDescriptorLaunch.h"
 #include "../../utils/TestTensorFactory.h"
 #include <gtest/gtest.h>
 #include <algorithm>
@@ -21,14 +22,10 @@
 #include <vector>
 
 #ifdef HAVE_CUDA
-extern "C" bool cudaMoE_softmax_topk_decode_unique_owner_runtime(
-    float *, void *, float *, float *, int, int, bool, bool, bool, int, void *);
 extern "C" bool cudaMoE_softmax_topk(
     float *, float *, float *, int, int, int, bool, int, void *, const int *, void *);
 #endif
 #ifdef HAVE_ROCM
-extern "C" bool hipMoE_softmax_topk_decode_unique_owner_wave64(
-    float *, void *, float *, float *, int, int, bool, bool, bool, int, void *);
 extern "C" bool hipMoE_softmax_topk_decode_equivalent_rows(
     float *, float *, float *, int, int, int, bool, int, void *, const int *, void *);
 #endif
@@ -96,13 +93,13 @@ namespace llaminar2::test
                         if (device.is_cuda())
                             ok = ok && cudaMoE_softmax_topk_decode_unique_owner_runtime(
                                 logits, runtime_storage->gpu_data_ptr(), ids, weights,
-                                experts, top_k, true, true, true, device.ordinal, stream);
+                                experts, top_k, true, true, true, device.ordinal, stream, nullptr);
 #endif
 #ifdef HAVE_ROCM
                         if (device.is_rocm())
                             ok = ok && hipMoE_softmax_topk_decode_unique_owner_wave64(
                                 logits, runtime_storage->gpu_data_ptr(), ids, weights,
-                                experts, top_k, true, true, true, device.ordinal, stream);
+                                experts, top_k, true, true, true, device.ordinal, stream, nullptr);
 #endif
                     }
 #ifdef HAVE_CUDA
@@ -140,10 +137,12 @@ namespace llaminar2::test
                         for (int expert = 0; expert < experts; ++expert)
                             input[row * experts + expert] = replay % 2 == 0 ? 0.f :
                                 std::sin(float(expert * 17 + row * 31 + replay));
-                    // Never leave the upper half unexercised, even for a tied
-                    // row: the final expert wins each transaction and histogram.
+                    // Alternate the winning expert on the same retained graph.
+                    // A dropped device launch or stale captured result must be
+                    // observable even when both routing outputs still agree.
+                    const int winner = replay % 2 == 0 ? experts - 1 : 0;
                     for (int row = 0; row < rows; ++row)
-                        input[row * experts + experts - 1] = 8.f;
+                        input[row * experts + winner] = 8.f;
                     std::fill_n(runtime->decode_histogram, kDeviceMoEMaxExperts, uint64_t{0});
                     std::fill_n(runtime->decode_local_histogram, kDeviceMoEMaxExperts, uint64_t{0});
                     ASSERT_TRUE(backend->hostToDeviceOnStream(serial_logits->gpu_data_ptr(), input.data(), input.size() * sizeof(float), device.ordinal, stream));
@@ -162,9 +161,9 @@ namespace llaminar2::test
                     for (size_t route = 0; route < route_count; ++route)
                         EXPECT_EQ(std::bit_cast<uint32_t>(weights[route]), std::bit_cast<uint32_t>(grouped_w[route])) << route;
                     for (int row = 0; row < rows; ++row)
-                        EXPECT_EQ(ids[row * top_k], experts - 1);
-                    EXPECT_EQ(after->decode_histogram[experts - 1], rows);
-                    EXPECT_EQ(after->decode_local_histogram[experts - 1], rows);
+                        EXPECT_EQ(ids[row * top_k], winner);
+                    EXPECT_EQ(after->decode_histogram[winner], rows);
+                    EXPECT_EQ(after->decode_local_histogram[winner], rows);
                     EXPECT_EQ(std::accumulate(std::begin(after->decode_histogram), std::end(after->decode_histogram), uint64_t{0}), route_count);
                 }
             }

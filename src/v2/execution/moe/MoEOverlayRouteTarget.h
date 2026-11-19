@@ -2,7 +2,7 @@
  * @file MoEOverlayRouteTarget.h
  * @brief Typed target encoded in the existing acquired placement-bank word.
  *
- * Whole participants and fixed CPU cohort tiers occupy disjoint encodings.
+ * Whole participants and fixed CPU/GPU cohort tiers occupy disjoint encodings.
  * This value owns no storage or membership authority: expert membership is
  * determined only by its word in the acquired versioned placement bank.
  */
@@ -36,16 +36,16 @@ namespace llaminar2
             return fromWord(participant);
         }
         /**
-         * @brief Encode an original fixed CPU cohort without selecting a scalar representative.
-         * @param tier Original canonical fixed CPU cohort tier.
+         * @brief Encode an original fixed CPU/GPU cohort without selecting a scalar representative.
+         * @param tier Original canonical fixed CPU/GPU cohort tier.
          * @return Its checked target.
          * @throws std::invalid_argument For a negative or unencodable tier.
          */
-        static MoEOverlayRouteTarget cpuCohort(std::int32_t tier)
+        static MoEOverlayRouteTarget cohort(std::int32_t tier)
         {
             if (tier < 0 || tier > std::numeric_limits<std::int32_t>::max() - 1)
                 throw std::invalid_argument(
-                    "CPU cohort route target has an unencodable original tier");
+                    "CPU/GPU cohort route target has an unencodable original tier");
             return fromWord(static_cast<std::int32_t>(-std::int64_t(tier) - 2));
         }
         /** @brief Interpret an existing bank word. @param word Placement encoding. @return Its
@@ -60,13 +60,15 @@ namespace llaminar2
         {
             return word_;
         }
+        /** @param other Original typed target. @return Equality of the complete encoded alternative. */
+        LLAMINAR_ROUTE_TARGET_HD constexpr bool operator==(const MoEOverlayRouteTarget &other) const noexcept = default;
         /** @return Whether this target selects one whole participant. */
         LLAMINAR_ROUTE_TARGET_HD constexpr bool isWhole() const noexcept
         {
             return word_ >= 0;
         }
-        /** @return Whether this target selects a fixed complete CPU cohort. */
-        LLAMINAR_ROUTE_TARGET_HD constexpr bool isCPUCohort() const noexcept
+        /** @return Whether this target selects a fixed complete CPU/GPU cohort. */
+        LLAMINAR_ROUTE_TARGET_HD constexpr bool isCohort() const noexcept
         {
             return word_ < -1;
         }

@@ -24,6 +24,8 @@
 
 namespace llaminar2
 {
+    class ExpertTierWeightProjectionIntersection;
+    class ExpertTierGpuBlobChunkProtocol;
     class IBackend;
     class NativePeerTransferEventOwnership;
     class IWorkerGPUContext;
@@ -128,6 +130,34 @@ namespace llaminar2
             std::string *error = nullptr) noexcept;
 
         /**
+         * @brief Copy only original native block intersections on the retained peer stream.
+         * @param source Immutable original source arrays.
+         * @param destination Preallocated final arrays with independent strides.
+         * @param intersection Checked original-coordinate overlap.
+         * @param source_readiness Exact event or installed-bank authority.
+         * @param error Optional exact validation/submission failure.
+         * @return Whether compact work has a destination completion fence.
+         */
+        bool start(const GpuExpertPackedDescriptor& source,
+            const GpuExpertPackedDescriptor& destination,
+            const ExpertTierWeightProjectionIntersection& intersection,
+            const ExpertTierSourceReadiness& source_readiness,std::string* error = nullptr) noexcept;
+
+        /**
+         * @brief Copy a floating rectangle without transferring unrelated rows or columns.
+         * @param source Original source allocation and precision.
+         * @param destination Original receiving allocation and precision.
+         * @param intersection Checked original-coordinate overlap.
+         * @param source_readiness Exact event or installed-bank authority.
+         * @param error Optional exact validation/submission failure.
+         * @return Whether compact work has a destination completion fence.
+         */
+        bool startFloating(const ContiguousFloatingPointWeightDescriptor& source,
+            const ContiguousFloatingPointWeightDescriptor& destination,
+            const ExpertTierWeightProjectionIntersection& intersection,
+            const ExpertTierSourceReadiness& source_readiness,std::string* error = nullptr) noexcept;
+
+        /**
          * @brief Submit one raw FP16/BF16/FP32 projection blob copy.
          * @param source Immutable contiguous source device bytes.
          * @param destination Preallocated contiguous destination device bytes.
@@ -196,14 +226,19 @@ namespace llaminar2
             const std::string &message,
             std::string *error) noexcept;
 
-        /** @brief Submit up to four byte regions through one ordered event edge. */
+        /**
+         * @brief Submit authenticated compact runs through one ordered event edge.
+         * @param source Original source plane roots, retained by the operation.
+         * @param destination Original writable destination plane roots.
+         * @param protocol Validated, unconsumed cursor with exact live byte geometry.
+         * @param source_readiness Producer event or installed immutable bank proof.
+         * @param error Optional exact event or copy submission diagnostic.
+         * @return Whether all accepted work has a retained completion fence.
+         */
         bool startRegions(
             const GPUExpertPointers &source,
             const GPUExpertPointers &destination,
-            std::size_t payload_bytes,
-            std::size_t scales_bytes,
-            std::size_t mins_bytes,
-            std::size_t emins_bytes,
+            ExpertTierGpuBlobChunkProtocol& protocol,
             const ExpertTierSourceReadiness &source_readiness,
             std::string *error) noexcept;
 

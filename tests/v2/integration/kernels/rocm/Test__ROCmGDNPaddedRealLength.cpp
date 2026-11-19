@@ -23,6 +23,7 @@
 
 #ifdef HAVE_ROCM
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
+#include "backends/rocm/ROCmHardwareMetadata.h"
 #include "ROCmGDNHistoricalRecurrentOracle.h"
 #include "kernels/rocm/gdn/ROCmShortConvolution.h"
 #include <hip/hip_runtime.h>
@@ -4297,6 +4298,242 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicatio
                 oracle_state,
                 0,
                 replay_state.size());
+        }
+    }
+}
+
+
+/**
+ * @test Replay the QFN TP4 K4 verifier through the production short-conv owner.
+ *
+ * Change rejected and inactive inputs while retaining the graph, then compare
+ * the accepted state and continuation to the production serial path. The
+ * physical zero-count shim evaluates one row but must not publish it.
+ */
+TEST(Test__ROCmGDNPaddedRealLength, QFNK4VerifierAcceptedPrefixIgnoresUnpublishedRows)
+{
+    if (!hasROCm()) GTEST_SKIP() << "No ROCm device available";
+    initializeROCmHardwareMetadata();
+    const auto& hardware = rocmHardwareMetadata().at(0);
+    if (hardware.native_wave_width != 64 || hardware.compute_units != 60 ||
+        !(hardware.isa_target == "gfx906" || hardware.isa_target.starts_with("gfx906:")))
+        GTEST_SKIP() << "QFN K4 opt-in requires native 60-CU gfx906 wave64";
+    checkHip(hipSetDevice(0), "bind ROCm QFN K4 replay participant");
+    constexpr int channels = 2560;
+    constexpr int taps = 4;
+    constexpr int stateSize = channels * (taps - 1);
+    constexpr int maxRows = 8;
+    constexpr float guard = -91.5f;
+    const auto weight = makeShortConvWeights(channels, taps);
+    const auto initial = makeInitialState(stateSize, 0.005f);
+    const auto continuation = makeSequenceRows(1, channels, 1, 1, 0.011f, 0.0f, 0.011f);
+    HipFloatBuffer weights(weight), continuationInput(continuation), groupedNext(channels), serialNext(channels);
+    HipFloatBuffer input(maxRows * channels), output(maxRows * channels), serialOutput(channels);
+    HipFloatBuffer snapshots(maxRows * stateSize), speculative(stateSize);
+    HipIntBuffer live(0), accepted(-1);
+    HipStreamHandle stream;
+    ROCmShortConvolution grouped(0), serial(0);
+    HipGDNStateOwner groupedOwner(grouped, stateSize), serialOwner(serial, stateSize);
+    grouped.setGPUStream(stream.stream);
+    serial.setGPUStream(stream.stream);
+
+    for (int capacity = 2; capacity <= maxRows; ++capacity)
+    {
+        grouped.bindVerifierStateCaptureWorkspace(snapshots.ptr, capacity, stateSize);
+        grouped.bindSpeculativeStateWorkspace(speculative.ptr, stateSize);
+        HipCapturedGraph verify(stream.stream, [&] {
+            return grouped.forwardCountedWithPolicy(LocalGPUExpertKernelPolicy::QFNMI50TP4,
+                input.ptr, weights.ptr, nullptr, output.ptr, nullptr, capacity, channels, taps, live.ptr, true);
+        });
+        std::size_t nodes = 1;
+        hipGraphNode_t node = nullptr;
+        checkHip(hipGraphGetNodes(verify.graph, &node, &nodes), "inspect verifier graph");
+        ASSERT_EQ(nodes, 1u);
+        hipKernelNodeParams native{};
+        checkHip(hipGraphKernelNodeGetParams(node, &native), "inspect verifier native leaf");
+        ASSERT_EQ(native.gridDim.x, channels / 64);
+        ASSERT_EQ(native.blockDim.x, 64u);
+        ASSERT_EQ(native.sharedMemBytes, 0u);
+        const auto* name = hipKernelNameRefByPtr(native.func, stream.stream);
+        ASSERT_NE(name, nullptr);
+        ASSERT_NE(std::string(name).find("qfn_short_conv1d_k4_verifier"), std::string::npos);
+        HipCapturedGraph publish(stream.stream, [&] {
+            return grouped.restoreVerifierStateCaptureRowFromDeviceIndex(nullptr, accepted.ptr, stream.stream);
+        });
+        grouped.bindVerifierStateCaptureWorkspace(nullptr, 0, stateSize);
+        grouped.bindSpeculativeStateWorkspace(nullptr, stateSize);
+        HipCapturedGraph next(stream.stream, [&] {
+            return grouped.forward(continuationInput.ptr, weights.ptr, nullptr, groupedNext.ptr,
+                nullptr, 1, channels, taps, true);
+        });
+
+        for (int length : {capacity, 0, 1, capacity - 1, capacity, 0})
+        {
+            const int selected = length == 0 ? -1 : (length - 1) / 2;
+            SCOPED_TRACE("capacity=" + std::to_string(capacity) + " live=" + std::to_string(length));
+            checkHip(hipMemcpyAsync(live.ptr, &length, sizeof(length), hipMemcpyHostToDevice,
+                stream.stream), "publish device verifier count");
+            checkHip(hipMemcpyAsync(accepted.ptr, &selected, sizeof(selected), hipMemcpyHostToDevice,
+                stream.stream), "publish device accepted row");
+            for (const float suffix : {13.0f, -90.0f})
+            {
+                const auto mixed = makeSequenceRows(maxRows, channels, selected + 1, maxRows, 0.009f, suffix, 0.0f);
+                input.copyFrom(mixed);
+                output.fill(guard);
+                snapshots.fill(guard);
+                speculative.fill(guard);
+                ASSERT_TRUE(grouped.importState(initial.data(), nullptr, stream.stream));
+                ASSERT_TRUE(serial.importState(initial.data(), nullptr, stream.stream));
+                verify.launch(stream.stream);
+                checkHip(hipStreamSynchronize(stream.stream), "retire verifier output");
+                const auto prefixes = snapshots.toHost();
+                const auto rows = output.toHost();
+                const int physicallyLive = std::max(length, 1);
+                for (int row = physicallyLive; row < capacity; ++row)
+                {
+                    ASSERT_TRUE(std::all_of(prefixes.begin() + row * stateSize,
+                        prefixes.begin() + (row + 1) * stateSize, [](float v) { return v == guard; }));
+                    ASSERT_TRUE(std::all_of(rows.begin() + row * channels,
+                        rows.begin() + (row + 1) * channels, [](float v) { return v == 0.0f; }));
+                }
+                const auto scratch = speculative.toHost();
+                ASSERT_TRUE(std::all_of(scratch.begin(), scratch.end(), [](float v) { return v == guard; }));
+                publish.launch(stream.stream);
+                for (int row = 0; row <= selected; ++row)
+                {
+                    ASSERT_TRUE(serial.forward(input.ptr + row * channels, weights.ptr, nullptr,
+                        serialOutput.ptr, nullptr, 1, channels, taps, true));
+                    checkHip(hipStreamSynchronize(stream.stream), "retire serial oracle row");
+                    const auto reference = serialOutput.toHost();
+                    const std::vector<float> groupedRow(rows.begin() + row * channels,
+                        rows.begin() + (row + 1) * channels);
+                    expectByteExactEquivalent("published verifier row", groupedRow, reference, 0, channels);
+                }
+                std::vector<float> groupedState(stateSize), serialState(stateSize);
+                ASSERT_TRUE(grouped.exportState(groupedState.data(), nullptr, nullptr));
+                ASSERT_TRUE(serial.exportState(serialState.data(), nullptr, nullptr));
+                expectByteExactEquivalent("accepted history, including negative selector",
+                    groupedState, serialState, 0, stateSize);
+
+                next.launch(stream.stream);
+                ASSERT_TRUE(serial.forward(continuationInput.ptr, weights.ptr, nullptr, serialNext.ptr,
+                    nullptr, 1, channels, taps, true));
+                checkHip(hipStreamSynchronize(stream.stream), "retire accepted continuation");
+                expectByteExactEquivalent("accepted continuation", groupedNext.toHost(),
+                    serialNext.toHost(), 0, channels);
+            }
+        }
+    }
+}
+
+
+/**
+ * @test The public convolution accepts independently absent history and count.
+ *
+ * Compare each canonical optional binding to the measured specialization with
+ * identical explicit state/count values. Retained outputs and full snapshots,
+ * including untouched padding and the separate terminal buffer, must agree.
+ */
+TEST(Test__ROCmGDNPaddedRealLength, QFNK4VerifierPreservesOptionalBindings)
+{
+    if (!hasROCm()) GTEST_SKIP() << "No ROCm device available";
+    initializeROCmHardwareMetadata();
+    const auto& hardware = rocmHardwareMetadata().at(0);
+    if (hardware.native_wave_width != 64 || hardware.compute_units != 60 ||
+        !(hardware.isa_target == "gfx906" || hardware.isa_target.starts_with("gfx906:")))
+        GTEST_SKIP() << "QFN K4 opt-in requires native 60-CU gfx906 wave64";
+
+    constexpr int channels = 2560;
+    constexpr int taps = 4;
+    constexpr int history = channels * (taps - 1);
+    constexpr int stride = history + 13;
+    constexpr int maxRows = 8;
+    constexpr float guard = -91.5f;
+    HipFloatBuffer weights(makeShortConvWeights(channels, taps));
+    HipFloatBuffer input(maxRows * channels), emptyHistory(std::vector<float>(history, 0.0f));
+    HipFloatBuffer cleanHistory(makeInitialState(history, 0.005f));
+    HipIntBuffer count(0);
+    HipStreamHandle stream;
+    HipFloatBuffer referenceOutput(maxRows * channels), actualOutput(maxRows * channels);
+    HipFloatBuffer referenceSnapshots((maxRows + 1) * stride), actualSnapshots((maxRows + 1) * stride);
+    HipFloatBuffer referenceTerminal(history), actualTerminal(history);
+
+    for (const int capacity : {2, 4, 7, 8})
+    {
+        for (const auto [nullHistory, nullCount] :
+             {std::pair{true, false}, std::pair{false, true}, std::pair{true, true}})
+        {
+            SCOPED_TRACE("capacity=" + std::to_string(capacity) +
+                         " nullHistory=" + std::to_string(nullHistory) +
+                         " nullCount=" + std::to_string(nullCount));
+            const auto* explicitHistory = nullHistory ? emptyHistory.ptr : cleanHistory.ptr;
+            HipCapturedGraph reference(stream.stream, [&] {
+                return rocmGDN_short_conv1d_effective(input.ptr, weights.ptr, nullptr,
+                    referenceOutput.ptr, explicitHistory, referenceTerminal.ptr, capacity,
+                    channels, taps, true, count.ptr, referenceSnapshots.ptr, stride, maxRows + 1,
+                    0, stream.stream);
+            });
+            HipCapturedGraph actual(stream.stream, [&] {
+                return rocmGDN_short_conv1d_effective(input.ptr, weights.ptr, nullptr,
+                    actualOutput.ptr, nullHistory ? nullptr : explicitHistory, actualTerminal.ptr,
+                    capacity, channels, taps, true, nullCount ? nullptr : count.ptr,
+                    actualSnapshots.ptr, stride, maxRows + 1, 0, stream.stream);
+            });
+            const auto verifyLeaf = [&](hipGraph_t graph, const char* expected, unsigned threads) {
+                std::size_t nodes = 1;
+                hipGraphNode_t node = nullptr;
+                checkHip(hipGraphGetNodes(graph, &node, &nodes), "inspect optional verifier binding");
+                ASSERT_EQ(nodes, 1u);
+                hipKernelNodeParams native{};
+                checkHip(hipGraphKernelNodeGetParams(node, &native), "inspect optional verifier leaf");
+                EXPECT_EQ(native.gridDim.x, channels / threads);
+                EXPECT_EQ(native.blockDim.x, threads);
+                EXPECT_EQ(native.sharedMemBytes, 0u);
+                const auto* name = hipKernelNameRefByPtr(native.func, stream.stream);
+                ASSERT_NE(name, nullptr);
+                EXPECT_NE(std::string(name).find(expected), std::string::npos);
+            };
+            verifyLeaf(reference.graph, "qfn_short_conv1d_k4_verifier", 64);
+            verifyLeaf(actual.graph, "rocm_short_conv1d_small_m_kernel", 256);
+
+            for (const int length : {capacity, 0, 1, capacity - 1, capacity})
+            {
+                SCOPED_TRACE("published count=" + std::to_string(length));
+                const int physicalRows = nullCount ? capacity : std::max(length, 1);
+                const int referenceCount = nullCount ? capacity : length;
+                input.copyFrom(makeSequenceRows(maxRows, channels, physicalRows, maxRows,
+                    0.009f + static_cast<float>(length) * 0.003f, 23.0f, 0.0f));
+                referenceOutput.fill(guard);
+                actualOutput.fill(guard);
+                referenceSnapshots.fill(guard);
+                actualSnapshots.fill(guard);
+                referenceTerminal.fill(guard);
+                actualTerminal.fill(guard);
+                checkHip(hipMemcpyAsync(count.ptr, &referenceCount, sizeof(referenceCount),
+                    hipMemcpyHostToDevice, stream.stream), "publish optional verifier count");
+                reference.launch(stream.stream);
+                if (nullCount)
+                    checkHip(hipMemcpyAsync(count.ptr, &length, sizeof(length), hipMemcpyHostToDevice,
+                        stream.stream), "dirty count not bound by null-count verifier");
+                actual.launch(stream.stream);
+                checkHip(hipStreamSynchronize(stream.stream), "observe retained optional bindings");
+
+                const auto output = actualOutput.toHost();
+                const auto snapshots = actualSnapshots.toHost();
+                expectByteExactEquivalent("optional output", output, referenceOutput.toHost(),
+                    0, output.size());
+                expectByteExactEquivalent("optional snapshots", snapshots, referenceSnapshots.toHost(),
+                    0, snapshots.size());
+                for (int row = 0; row <= maxRows; ++row)
+                {
+                    const int used = row < physicalRows ? history : 0;
+                    ASSERT_TRUE(std::all_of(snapshots.begin() + row * stride + used,
+                        snapshots.begin() + (row + 1) * stride, [](float value) { return value == guard; }));
+                }
+                for (const auto& terminal : {actualTerminal.toHost(), referenceTerminal.toHost()})
+                    ASSERT_TRUE(std::all_of(terminal.begin(), terminal.end(),
+                        [](float value) { return value == guard; }));
+            }
         }
     }
 }

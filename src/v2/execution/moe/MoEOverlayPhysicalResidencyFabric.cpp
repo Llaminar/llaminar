@@ -9,6 +9,8 @@
  * runtime stream/staging allocation.
  * Completed lifecycle diagnostics fold epoch identities into bounded evidence;
  * an indefinitely reused fabric cannot accumulate one statistics key per wave.
+ * Device-owned whole/cohort waves retain member-typed payloads in one physical
+ * ledger. Terminal compaction borrows that inventory instead of stale host banks.
  */
 
 #include "MoEOverlayPhysicalResidencyFabric.h"
@@ -62,6 +64,7 @@
 #include <numeric>
 #include <pthread.h>
 #include <sched.h>
+#include <set>
 #include <span>
 #include <stdexcept>
 #include <tuple>
@@ -398,10 +401,10 @@ namespace llaminar2
             const MoEOverlayParticipantLayerBank &layer, std::size_t expert,
             ExpertTierWeightProjection projection)
         {
-            if (!layer.cpu_fragment_family)
+            if (!layer.fragment_family)
                 return projectionEngine(layer.experts.at(expert), projection);
-            const auto &fragment = layer.cpu_fragments.at(expert);
-            if (!layer.cpu_fragment_family->accepts(fragment, static_cast<int>(expert)))
+            const auto &fragment = layer.fragments.at(expert);
+            if (!layer.fragment_family->accepts(fragment, static_cast<int>(expert)))
                 throw std::invalid_argument("Physical source fragment changed its original member family");
             switch (projection)
             {
@@ -409,7 +412,7 @@ namespace llaminar2
             case ExpertTierWeightProjection::Up: return fragment.up();
             case ExpertTierWeightProjection::Down: return fragment.down();
             }
-            throw std::invalid_argument("Unknown original CPU fragment projection role");
+            throw std::invalid_argument("Unknown original fragment projection role");
         }
 
         /** @brief Original authored full-model dimensions; no scalar owner shadow. */
@@ -440,12 +443,12 @@ namespace llaminar2
             const auto &registered = config.registry->projectionPreparation();
             if (!source || !registered || source.get() != registered.get() ||
                 source.owner_before(registered) || registered.owner_before(source) ||
-                !source->cpuJointOwnerMap())
-                throw std::invalid_argument("Physical CPU cohort fabric lost its same original preparation or full source plan");
+                !source->jointOwnerMap())
+                throw std::invalid_argument("Physical cohort fabric lost its same original preparation or full source plan");
             // The snapshot's sealed original definition owns geometry; the
             // fabric authenticates its registry binding rather than reparsing
             // a second live placement into a parallel shape authority.
-            source->cpuJointOwnerMap()->requireLayerGeometry(
+            source->jointOwnerMap()->requireLayerGeometry(
                 geometry.layers, geometry.experts, geometry.first_layer);
             return geometry;
         }
@@ -1893,9 +1896,11 @@ namespace llaminar2
                 GpuExpertPackedDescriptor destination,
                 ExpertTierSourceReadiness source_readiness,
                 std::shared_ptr<ITensorGemm> source_engine,
-                std::shared_ptr<ITensorGemm> destination_engine)
+                std::shared_ptr<ITensorGemm> destination_engine,
+                ExpertTierWeightProjectionIntersection intersection)
                 : source_(source),
                   destination_(destination),
+                  intersection_(intersection),
                   source_readiness_(source_readiness),
                   source_engine_(std::move(source_engine)),
                   destination_engine_(std::move(destination_engine))
@@ -1922,9 +1927,11 @@ namespace llaminar2
                 ContiguousFloatingPointWeightDescriptor destination,
                 ExpertTierSourceReadiness source_readiness,
                 std::shared_ptr<ITensorGemm> source_engine,
-                std::shared_ptr<ITensorGemm> destination_engine)
+                std::shared_ptr<ITensorGemm> destination_engine,
+                ExpertTierWeightProjectionIntersection intersection)
                 : floating_source_(source),
                   floating_destination_(destination),
+                  intersection_(intersection),
                   source_readiness_(source_readiness),
                   source_engine_(std::move(source_engine)),
                   destination_engine_(std::move(destination_engine)),
@@ -1933,9 +1940,10 @@ namespace llaminar2
                 if (!lane_pool || !floating_source_.valid() ||
                     !floating_destination_.valid() ||
                     floating_source_.type != floating_destination_.type ||
-                    floating_source_.n != floating_destination_.n ||
-                    floating_source_.k != floating_destination_.k ||
-                    floating_source_.bytes != floating_destination_.bytes ||
+                    floating_source_.n != intersection_.source().rows ||
+                    floating_source_.k != intersection_.source().columns ||
+                    floating_destination_.n != intersection_.destination().rows ||
+                    floating_destination_.k != intersection_.destination().columns ||
                     !source_engine_ || !destination_engine_)
                 {
                     throw std::invalid_argument(
@@ -1979,16 +1987,16 @@ namespace llaminar2
                 {
                     std::string start_error;
                     const bool started = floating_
-                        ? lane_->lane()->startContiguous(
-                              floating_source_.data,
-                              const_cast<void *>(
-                                  floating_destination_.data),
-                              floating_source_.bytes,
+                        ? lane_->lane()->startFloating(
+                              floating_source_,
+                              floating_destination_,
+                              intersection_,
                               source_readiness_,
                               &start_error)
                         : lane_->lane()->start(
                               source_,
                               destination_,
+                              intersection_,
                               source_readiness_,
                               &start_error);
                     if (!started)
@@ -2094,6 +2102,7 @@ namespace llaminar2
             GpuExpertPackedDescriptor destination_;
             ContiguousFloatingPointWeightDescriptor floating_source_;
             ContiguousFloatingPointWeightDescriptor floating_destination_;
+            ExpertTierWeightProjectionIntersection intersection_;
             ExpertTierSourceReadiness source_readiness_;
             std::shared_ptr<ITensorGemm> source_engine_;
             std::shared_ptr<ITensorGemm> destination_engine_;
@@ -2120,9 +2129,11 @@ namespace llaminar2
                 GpuExpertPackedDescriptor destination,
                 ExpertTierSourceReadiness source_readiness,
                 std::shared_ptr<ITensorGemm> source_engine,
-                std::shared_ptr<ITensorGemm> destination_engine)
+                std::shared_ptr<ITensorGemm> destination_engine,
+                ExpertTierWeightProjectionIntersection intersection)
                 : source_(source),
                   destination_(destination),
+                  intersection_(intersection),
                   source_readiness_(source_readiness),
                   source_engine_(std::move(source_engine)),
                   destination_engine_(std::move(destination_engine))
@@ -2149,9 +2160,11 @@ namespace llaminar2
                 ContiguousFloatingPointWeightDescriptor destination,
                 ExpertTierSourceReadiness source_readiness,
                 std::shared_ptr<ITensorGemm> source_engine,
-                std::shared_ptr<ITensorGemm> destination_engine)
+                std::shared_ptr<ITensorGemm> destination_engine,
+                ExpertTierWeightProjectionIntersection intersection)
                 : floating_source_(source),
                   floating_destination_(destination),
+                  intersection_(intersection),
                   source_readiness_(source_readiness),
                   source_engine_(std::move(source_engine)),
                   destination_engine_(std::move(destination_engine)),
@@ -2160,9 +2173,10 @@ namespace llaminar2
                 if (!lane_pool || !floating_source_.valid() ||
                     !floating_destination_.valid() ||
                     floating_source_.type != floating_destination_.type ||
-                    floating_source_.n != floating_destination_.n ||
-                    floating_source_.k != floating_destination_.k ||
-                    floating_source_.bytes != floating_destination_.bytes ||
+                    floating_source_.n != intersection_.source().rows ||
+                    floating_source_.k != intersection_.source().columns ||
+                    floating_destination_.n != intersection_.destination().rows ||
+                    floating_destination_.k != intersection_.destination().columns ||
                     !source_engine_ || !destination_engine_)
                 {
                     throw std::invalid_argument(
@@ -2206,16 +2220,16 @@ namespace llaminar2
                 {
                     std::string start_error;
                     const bool started = floating_
-                        ? lane_->lane()->startContiguous(
-                              floating_source_.data,
-                              const_cast<void *>(
-                                  floating_destination_.data),
-                              floating_source_.bytes,
+                        ? lane_->lane()->startFloating(
+                              floating_source_,
+                              floating_destination_,
+                              intersection_,
                               source_readiness_,
                               &start_error)
                         : lane_->lane()->start(
                               source_,
                               destination_,
+                              intersection_,
                               source_readiness_,
                               &start_error);
                     if (!started)
@@ -2321,6 +2335,7 @@ namespace llaminar2
             GpuExpertPackedDescriptor destination_;
             ContiguousFloatingPointWeightDescriptor floating_source_;
             ContiguousFloatingPointWeightDescriptor floating_destination_;
+            ExpertTierWeightProjectionIntersection intersection_;
             ExpertTierSourceReadiness source_readiness_;
             std::shared_ptr<ITensorGemm> source_engine_;
             std::shared_ptr<ITensorGemm> destination_engine_;
@@ -4054,8 +4069,9 @@ namespace llaminar2
                 int,
                 MoEOverlayParticipantBankLease>
                 initial_banks;
-            std::vector<MoEOverlayDeviceInitialPhysicalSlot>
-                initial_device_slots;
+            std::vector<MoEOverlayDeviceInitialPhysicalSlot> initial_device_slots;
+            std::vector<MoEOverlayDeviceFragmentPhysicalSlot> initial_fragment_slots;
+            std::vector<MoEOverlayDevicePhysicalSlotLedger::FragmentFamily> original_fragment_families;
 
             const auto ownership = originalFabricGeometry(config);
             if (!config.layer_weight_manifest.empty())
@@ -4127,23 +4143,25 @@ namespace llaminar2
                 {
                     const auto &layer = bank->layerForModelLayer(layer_idx);
                     std::optional<MoEOverlayLayerWeightManifest> local_fragment;
-                    if (layer.cpu_fragment_family)
+                    if (layer.fragment_family)
                     {
-                        const auto &family = *layer.cpu_fragment_family;
+                        const auto &family = *layer.fragment_family;
                         const auto source_preparation = config.initial_snapshot->originalProjectionPreparation();
                         const auto &prepared = family.preparation();
-                        if (!endpoint->device().is_cpu() || !source_preparation ||
+                        if (!source_preparation ||
                             prepared.get() != source_preparation.get() ||
                             prepared.owner_before(source_preparation) || source_preparation.owner_before(prepared) ||
                             !family.cohort() || family.participantIndex() >= family.cohort()->participants().size() ||
                             family.cohort()->participants()[family.participantIndex()].participant_id != participant_id ||
                             family.cohort()->source().layer_idx != layer_idx ||
                             family.cohort()->ownership(family.participantIndex()).geometry().experts != ownership.expertCount())
-                            throw std::invalid_argument("Physical initial CPU fragment bank lost its original preparation/member geometry");
+                            throw std::invalid_argument("Physical initial fragment bank lost its original preparation/member geometry");
                         for (const auto &projection : family.cohort()->source().projections)
                             mergeProjectionSignature(model_signatures, layer_idx, projection.projection,
                                 {.N = projection.N, .K = projection.K, .format = projection.format});
                         local_fragment = family.cohort()->localManifest(family.participantIndex());
+                        original_fragment_families.push_back({.participant_id = participant_id,
+                            .layer_idx = layer_idx, .family = layer.fragment_family});
                     }
                     for (std::size_t expert = 0; expert < layer.resident_mask.size(); ++expert)
                     {
@@ -4154,6 +4172,12 @@ namespace llaminar2
                                     .expert_id = static_cast<int>(expert)},
                                 .entered_epoch = config.initial_snapshot->epoch,
                                 .bootstrap_allocation = true, .payload = layer.experts.at(expert)});
+                        else
+                            initial_fragment_slots.push_back({
+                                .key = {.participant_id = participant_id, .layer_idx = layer_idx,
+                                    .expert_id = static_cast<int>(expert)},
+                                .entered_epoch = config.initial_snapshot->epoch,
+                                .bootstrap_allocation = true, .payload = layer.fragments.at(expert)});
                         for (const auto projection : kProjections)
                         {
                             MoEOverlayPreparedWeightSource source;
@@ -4203,19 +4227,15 @@ namespace llaminar2
              * The registry remains available solely to the distinct host-RCU
              * authority path.
              */
-            impl.device_slot_ledger =
-                std::make_unique<MoEOverlayDevicePhysicalSlotLedger>(
-                    MoEOverlayDevicePhysicalSlotLedger::Config{
-                        .initial_epoch = config.initial_snapshot->epoch,
-                        .local_participant_ids = local_ids,
-                        .initial_slots = std::move(initial_device_slots),
-                        .first_model_layer =
-                            ownership.firstModelLayer(),
-                        .num_layers = static_cast<std::uint32_t>(
-                            ownership.layerCount()),
-                        .num_experts = static_cast<std::uint32_t>(
-                            ownership.expertCount()),
-                    });
+            impl.device_slot_ledger = MoEOverlayDevicePhysicalSlotLedger::createMixed({
+                .whole = {.initial_epoch = config.initial_snapshot->epoch,
+                    .local_participant_ids = local_ids,
+                    .initial_slots = std::move(initial_device_slots),
+                    .first_model_layer = ownership.firstModelLayer(),
+                    .num_layers = static_cast<std::uint32_t>(ownership.layerCount()),
+                    .num_experts = static_cast<std::uint32_t>(ownership.expertCount())},
+                .families = std::move(original_fragment_families),
+                .initial_fragments = std::move(initial_fragment_slots)});
 
             /*
              * Pass two groups layers by their exact gate/up/down allocation
@@ -4254,9 +4274,9 @@ namespace llaminar2
                 {
                     auto signatures = requireLayerSignatures(model_signatures, layer_idx);
                     const auto &member_layer = bank_found->second->layerForModelLayer(layer_idx);
-                    if (member_layer.cpu_fragment_family)
+                    if (member_layer.fragment_family)
                     {
-                        const auto &family = *member_layer.cpu_fragment_family;
+                        const auto &family = *member_layer.fragment_family;
                         const auto local = family.cohort()->localManifest(family.participantIndex());
                         for (const auto &projection : local.projections)
                             signatures[projectionIndex(projection.projection)] = {
@@ -5194,9 +5214,12 @@ namespace llaminar2
             throw std::invalid_argument(
                 "ExpertOverlay physical fabric requires the rank-bound memory authority, registry, and valid initial snapshot");
         }
-        if (config.initial_snapshot->ownershipKind() == MoEOverlayResidencyOwnershipKind::CPUJointFragments &&
-            config.inventory_authority != MoEOverlayPhysicalInventoryAuthority::ParticipantRegistry)
-            throw std::invalid_argument("CPU cohort fabric requires its original participant-registry physical authority");
+        if (config.initial_snapshot->ownershipKind() == MoEOverlayResidencyOwnershipKind::JointFragments &&
+            config.inventory_authority != MoEOverlayPhysicalInventoryAuthority::ParticipantRegistry &&
+            std::any_of(config.initial_snapshot->placementOwnerMap().participants().begin(),
+                config.initial_snapshot->placementOwnerMap().participants().end(),
+                [](const auto &participant) { return participant.device.is_cpu(); }))
+            throw std::invalid_argument("CPU-involved cohort fabric requires its original participant-registry physical authority");
         if (config.registry->initialEpoch() !=
                 config.initial_snapshot->epoch ||
             !config.registry->allInitialBanksReady())
@@ -5495,7 +5518,7 @@ namespace llaminar2
         }
         else if (has_cohort && purpose != MoEOverlayResidencyTransactionPurpose::PlacementChange &&
                  purpose != MoEOverlayResidencyTransactionPurpose::PreparedContextRestoration)
-            return fail("CPU cohort physical movement has an unsupported transaction purpose");
+            return fail("Cohort physical movement has an unsupported transaction purpose");
 
         try
         {
@@ -5544,14 +5567,6 @@ namespace llaminar2
                     return fail("ExpertOverlay local participant registry disagrees with distributed rank ownership");
                 has_remote_migrations = has_remote_migrations || source.world_rank != destination.world_rank;
             }
-
-        // The current device-only physical ledger contains complete GPU/CPU
-        // owners, not CPU fragment payloads. Heterogeneous CPU-cohort plans use
-        // their original host participant-registry authority; never manufacture
-        // a scalar owner or a host mirror to enter a different policy.
-        if (device_batch && std::any_of(migrations.begin(), migrations.end(), [](const auto &edge) {
-                return edge.source.shard_cohort || edge.destination.shard_cohort; }))
-            return fail("Device physical ledger does not carry a CPU fragment ownership arm");
 
         if (migration_cycles.size() >
             config_.maximum_concurrent_cycles)
@@ -5779,13 +5794,16 @@ namespace llaminar2
                     if (migration.destination.shard_cohort)
                     {
                         std::string arrival_error;
-                        if (!candidate || candidate->epoch != candidate_epoch)
-                            throw std::invalid_argument("CPU fragment reservation requires its actual original candidate epoch");
-                        if (purpose == MoEOverlayResidencyTransactionPurpose::EconomyCalibration)
-                            arrival = config_.registry->prepareCPUJointCalibrationArrival(*original_transaction,
+                        if (device_batch)
+                            arrival = config_.registry->prepareJointDeviceArrival(*device_batch,
+                                migration_index, participant, &arrival_error);
+                        else if (!candidate || candidate->epoch != candidate_epoch)
+                            throw std::invalid_argument("Fragment reservation requires its actual original candidate epoch");
+                        else if (purpose == MoEOverlayResidencyTransactionPurpose::EconomyCalibration)
+                            arrival = config_.registry->prepareJointCalibrationArrival(*original_transaction,
                                 migration_index, participant, &arrival_error);
                         else
-                            arrival = config_.registry->prepareCPUJointArrival(*candidate, participant,
+                            arrival = config_.registry->prepareJointArrival(*candidate, participant,
                                 migration.layer_idx, migration.expert_id, &arrival_error);
                         if (!arrival) throw std::invalid_argument(arrival_error);
                     }
@@ -5806,13 +5824,13 @@ namespace llaminar2
                             migration.expert_id >= source->endpoint->numExperts())
                             throw std::invalid_argument("Physical wave cannot retain its exact original source member epoch");
                         const auto &layer = source->bank->layerForModelLayer(migration.layer_idx);
-                        if (bool(layer.cpu_fragment_family) != bool(migration.source.shard_cohort))
+                        if (bool(layer.fragment_family) != bool(migration.source.shard_cohort))
                             throw std::invalid_argument("Physical source bank has a different whole/cohort ownership arm");
-                        if (layer.cpu_fragment_family)
+                        if (layer.fragment_family)
                         {
-                            const auto &actual = layer.cpu_fragment_family->cohort();
+                            const auto &actual = layer.fragment_family->cohort();
                             const auto &expected = migration.source.shard_cohort;
-                            const auto member = layer.cpu_fragment_family->participantIndex();
+                            const auto member = layer.fragment_family->participantIndex();
                             if (!actual || actual.get() != expected.get() || actual.owner_before(expected) ||
                                 expected.owner_before(actual) || member >= actual->participants().size() ||
                                 actual->participants()[member].participant_id != participant)
@@ -5937,15 +5955,31 @@ namespace llaminar2
                         [&](const auto &previous) { return previous.projection == projection &&
                             previous.destination_participant == piece.destination_participant; }));
                     std::optional<MoEOverlayPreparedExpertPayload> device_source_payload;
+                    std::optional<MoEOverlayPreparedFragmentPayload> device_source_fragment;
                     const auto source_engine_for_role = [&]() -> std::shared_ptr<ITensorGemm>
                     {
                         if (!source_local) throw std::logic_error("A nonlocal physical source has no local engine permit");
                         if (!device_batch)
                             return source_members[migration_index].at(piece.source_participant)->engines[projection_index];
                         std::string source_error;
+                        const MoEOverlayDevicePhysicalSlotKey source_key{
+                            .participant_id = piece.source_participant, .layer_idx = migration.layer_idx,
+                            .expert_id = migration.expert_id};
+                        if (migration.source.shard_cohort)
+                        {
+                            device_source_fragment = impl_->device_slot_ledger->sourceFragmentPayload(
+                                *device_batch, source_key, &source_error);
+                            if (!device_source_fragment) throw std::invalid_argument(source_error);
+                            switch (projection)
+                            {
+                            case ExpertTierWeightProjection::Gate: return device_source_fragment->gate();
+                            case ExpertTierWeightProjection::Up: return device_source_fragment->up();
+                            case ExpertTierWeightProjection::Down: return device_source_fragment->down();
+                            }
+                            throw std::invalid_argument("Device fragment source received an unknown projection");
+                        }
                         device_source_payload = impl_->device_slot_ledger->sourcePayload(*device_batch,
-                            {.participant_id = piece.source_participant, .layer_idx = migration.layer_idx,
-                                .expert_id = migration.expert_id}, &source_error);
+                            source_key, &source_error);
                         if (!device_source_payload) throw std::invalid_argument(source_error);
                         return projectionEngine(*device_source_payload, projection);
                     };
@@ -6157,7 +6191,7 @@ namespace llaminar2
                                             source.gpu_packed,
                                             source.format.native_quantised,
                                             static_cast<std::uint32_t>(
-                                                config_.staging_capacity_bytes));
+                                                config_.staging_capacity_bytes)).forGPUIntersection(piece.intersection);
                                     ++local_remote_gpu_blob_operations;
                                 }
                                 const auto readiness =
@@ -6680,7 +6714,7 @@ namespace llaminar2
                                         ExpertTierSourceReadiness::publishedResidencyBank(
                                             expected_epoch),
                                         source_engine,
-                                        destination_engine);
+                                        destination_engine, piece.intersection);
                                 ++local_same_backend_gpu_operations;
                             }
                             else
@@ -6698,7 +6732,7 @@ namespace llaminar2
                                         ExpertTierSourceReadiness::publishedResidencyBank(
                                             expected_epoch),
                                         source_engine,
-                                        destination_engine);
+                                        destination_engine, piece.intersection);
                                 if (source_participant.device.type ==
                                     destination_participant.device.type)
                                 {
@@ -6774,8 +6808,8 @@ namespace llaminar2
                             destination_descriptor =
                                 makeGpuDestinationDescriptor(
                                     destination_slot,
-                                    source.gpu_packed.n,
-                                    source.gpu_packed.k,
+                                    destination_slot.spec.N,
+                                    destination_slot.spec.K,
                                     source.gpu_packed.codebook_id,
                                     source.gpu_packed
                                         .payload_bytes_per_block,
@@ -6798,7 +6832,7 @@ namespace llaminar2
                                         ExpertTierSourceReadiness::publishedResidencyBank(
                                             expected_epoch),
                                         source_engine,
-                                        destination_engine);
+                                        destination_engine, piece.intersection);
                                 ++local_same_backend_gpu_operations;
                             }
                             else
@@ -6816,7 +6850,7 @@ namespace llaminar2
                                         ExpertTierSourceReadiness::publishedResidencyBank(
                                             expected_epoch),
                                         source_engine,
-                                        destination_engine);
+                                        destination_engine, piece.intersection);
                                 if (source_participant.device.type ==
                                     destination_participant.device.type)
                                 {
@@ -6974,74 +7008,66 @@ namespace llaminar2
         try
         {
             const auto local_ids = config_.registry->localParticipantIds();
-            std::vector<MoEOverlayDeviceStagedPhysicalArrival> arrivals;
-            arrivals.reserve(batch.migrations.size());
-            for (std::size_t index = 0u;
-                 index < batch.migrations.size();
-                 ++index)
+            std::vector<MoEOverlayDevicePreparedPhysicalArrival> arrivals;
+            for (std::size_t index = 0u; index < batch.migrations.size(); ++index)
             {
                 const auto &migration = batch.migrations[index];
-                const bool local_destination = std::binary_search(
-                    local_ids.begin(),
-                    local_ids.end(),
-                    migration.destination.owner_participant);
-                const auto &keyed = prepared.migrations[index].destination_arrivals;
-                if (keyed.size() != (local_destination ? 1u : 0u) ||
-                    (local_destination &&
-                     (keyed.front().participant_id != migration.destination.owner_participant ||
-                      !keyed.front().arrival || keyed.front().arrival->isCPUJointFragment())))
+                const auto target = MoEExpertPlacementTarget::fromPlacement(migration.destination);
+                if (!target)
                 {
-                    if (error) *error = "ExpertOverlay whole-device staging requires its exact singleton arrival";
+                    if (error) *error = "ExpertOverlay device staging lost the complete original target";
                     return false;
                 }
-                const auto arrival = local_destination ? keyed.front().arrival : nullptr;
-                if (!local_destination)
+                std::set<int> expected;
+                for (std::size_t member = 0; member < target->participantCount(); ++member)
+                    if (std::binary_search(local_ids.begin(), local_ids.end(), target->participantId(member)))
+                        expected.insert(target->participantId(member));
+                const auto &keyed = prepared.migrations[index].destination_arrivals;
+                if (keyed.size() != expected.size())
                 {
-                    if (arrival)
+                    if (error) *error = "ExpertOverlay device staging requires every exact local target member";
+                    return false;
+                }
+                for (const auto &member : keyed)
+                {
+                    if (!expected.erase(member.participant_id) || !member.arrival ||
+                        member.arrival->isJointFragment() != bool(migration.destination.shard_cohort))
                     {
-                        if (error)
-                            *error =
-                                "ExpertOverlay device staging received a local lifetime for a remote destination";
+                        if (error) *error = "ExpertOverlay device staging rejected a duplicate, foreign or wrong-arm member";
                         return false;
                     }
-                    continue;
-                }
-                if (!arrival)
-                {
-                    if (error)
-                        *error =
-                            "ExpertOverlay device staging lost a local destination arrival";
-                    return false;
-                }
-
-                MoEOverlayPreparedExpertPayload payload;
-                std::string arrival_error;
-                if (!arrival->completePayload(payload, &arrival_error))
-                {
-                    if (error)
+                    MoEOverlayDevicePreparedPhysicalArrival arrival{
+                        .key = {.participant_id = member.participant_id, .layer_idx = migration.layer_idx,
+                            .expert_id = migration.expert_id}};
+                    std::string arrival_error;
+                    if (migration.destination.shard_cohort)
                     {
-                        *error = arrival_error.empty()
-                            ? "ExpertOverlay device staging observed an incomplete destination payload"
-                            : std::move(arrival_error);
+                        MoEOverlayPreparedFragmentPayload fragment;
+                        if (member.arrival->destinationEpoch() != batch.candidate_epoch ||
+                            !member.arrival->completeFragment(fragment, &arrival_error))
+                        {
+                            if (error) *error = arrival_error.empty()
+                                ? "ExpertOverlay device staging requires a complete candidate-epoch fragment" : arrival_error;
+                            return false;
+                        }
+                        arrival.payload = std::move(fragment);
                     }
-                    return false;
+                    else
+                    {
+                        MoEOverlayPreparedExpertPayload whole;
+                        if (!member.arrival->completePayload(whole, &arrival_error))
+                        {
+                            if (error) *error = arrival_error;
+                            return false;
+                        }
+                        arrival.payload = std::move(whole);
+                    }
+                    arrivals.push_back(std::move(arrival));
                 }
-                arrivals.push_back({
-                    .key = {
-                        .participant_id =
-                            migration.destination.owner_participant,
-                        .layer_idx = migration.layer_idx,
-                        .expert_id = migration.expert_id,
-                    },
-                    .payload = std::move(payload),
-                });
             }
-
-            if (!impl_->device_slot_ledger->stage(
-                    batch, std::move(arrivals), error))
-            {
-                return false;
-            }
+            // One ledger checks the complete mixed member set before accepting
+            // any destination. The original receipt/ACK edge still releases it.
+            if (!impl_->device_slot_ledger->stagePrepared(batch, std::move(arrivals), error)) return false;
             recordMoEPhysicalWave(MoEPhysicalWaveEvent::DestinationsStaged,
                 batch.transaction_id, batch.base_epoch, batch.candidate_epoch,
                 batch.migrations.size(), config_.perf_device);
@@ -7091,8 +7117,8 @@ namespace llaminar2
                     "ExpertOverlay device retirement lost its slot ledger";
             return false;
         }
-        std::vector<MoEOverlayDeviceRetiredPhysicalSlot> retired;
-        if (!impl_->device_slot_ledger->retire(batch, &retired, error))
+        std::vector<MoEOverlayDevicePreparedPhysicalSlot> retired;
+        if (!impl_->device_slot_ledger->retirePrepared(batch, &retired, error))
             return false;
 
         /*
@@ -7266,6 +7292,7 @@ namespace llaminar2
             // physical compaction/completion/drain below. It is not a new
             // inference ticket or a host mirror of global selection.
             std::map<int, MoEOverlayParticipantBankLease> seal_source_banks;
+            std::optional<MoEOverlayDevicePreparedPhysicalInventory> seal_device_inventory;
 
             /*
              * Materialize the exact terminal inventory from its typed owner.
@@ -7313,9 +7340,9 @@ namespace llaminar2
                         "ExpertOverlay reusable-context seal lost its device physical inventory authority");
                 }
                 std::string inventory_error;
-                const auto inventory = impl_->device_slot_ledger->snapshot(
+                seal_device_inventory = impl_->device_slot_ledger->preparedSnapshot(
                     published_epoch, &inventory_error);
-                if (!inventory || !inventory->valid())
+                if (!seal_device_inventory)
                 {
                     return fail(
                         inventory_error.empty()
@@ -7347,20 +7374,21 @@ namespace llaminar2
                     };
                     bank.layers.resize(
                         static_cast<std::size_t>(endpoint->numLayers()));
-                    for (auto &layer : bank.layers)
+                    for (int layer_idx = endpoint->firstModelLayer(); layer_idx < endpoint->endModelLayer(); ++layer_idx)
                     {
-                        layer.resident_mask.assign(
-                            static_cast<std::size_t>(endpoint->numExperts()),
-                            false);
-                        layer.experts.resize(
-                            static_cast<std::size_t>(endpoint->numExperts()));
+                        auto &layer = bank.layerForModelLayer(layer_idx);
+                        layer.resident_mask.assign(static_cast<std::size_t>(endpoint->numExperts()), false);
+                        layer.fragment_family = impl_->device_slot_ledger->fragmentFamily(participant_id, layer_idx);
+                        if (layer.fragment_family)
+                            layer.fragments.resize(static_cast<std::size_t>(endpoint->numExperts()));
+                        else layer.experts.resize(static_cast<std::size_t>(endpoint->numExperts()));
                     }
                     bank_index_by_participant.emplace(
                         participant_id, result.local_banks.size());
                     result.local_banks.push_back(std::move(bank));
                 }
 
-                for (const auto &slot : inventory->slots)
+                for (const auto &slot : seal_device_inventory->slots)
                 {
                     const auto bank_index = bank_index_by_participant.find(
                         slot.key.participant_id);
@@ -7373,7 +7401,7 @@ namespace llaminar2
                     if (!bank.containsModelLayer(slot.key.layer_idx) ||
                         slot.key.expert_id < 0 ||
                         static_cast<std::size_t>(slot.key.expert_id) >=
-                            bank.layerForModelLayer(slot.key.layer_idx).experts.size())
+                            bank.layerForModelLayer(slot.key.layer_idx).resident_mask.size())
                     {
                         return fail(
                             "ExpertOverlay device physical inventory contains an out-of-range expert coordinate");
@@ -7385,8 +7413,10 @@ namespace llaminar2
                         return fail(
                             "ExpertOverlay device physical inventory contains a duplicate expert coordinate");
                     }
-                    layer.setResidentExpert(
-                        slot.key.expert_id, slot.payload);
+                    if (const auto *whole = std::get_if<MoEOverlayPreparedExpertPayload>(&slot.payload))
+                        layer.setResidentExpert(slot.key.expert_id, *whole);
+                    else layer.setResidentFragment(slot.key.expert_id,
+                        std::get<MoEOverlayPreparedFragmentPayload>(slot.payload));
                 }
             }
             else
@@ -7463,8 +7493,8 @@ namespace llaminar2
                         {
                             continue;
                         }
-                        const bool complete = layer.cpu_fragment_family
-                            ? layer.cpu_fragment_family->accepts(layer.cpu_fragments.at(size_t(expert_id)), expert_id)
+                        const bool complete = layer.fragment_family
+                            ? layer.fragment_family->accepts(layer.fragments.at(size_t(expert_id)), expert_id)
                             : layer.experts.at(size_t(expert_id)).complete();
                         if (!complete)
                         {
@@ -7660,7 +7690,7 @@ namespace llaminar2
                         std::array<std::shared_ptr<ITensorGemm>, 3> source_engines;
                         for (const auto role : kProjections)
                             source_engines[projectionIndex(role)] = projectionEngine(layer, size_t(expert_id), role);
-                        const auto projection_set = layer.cpu_fragment_family ? DeviceMoEProjectionSet::CompleteExpert
+                        const auto projection_set = layer.fragment_family ? DeviceMoEProjectionSet::IntermediateShard
                             : layer.experts.at(size_t(expert_id)).projections();
                         std::array<std::shared_ptr<ITensorGemm>, 3> destination_engines{};
                         std::vector<std::unique_ptr<
@@ -7738,8 +7768,8 @@ namespace llaminar2
                                 {
                                     const auto *packed = target.engine->exportCPUNativeQuantisedPackedWeights();
                                     if (!packed) return fail("Canonical CPU compaction changed original native storage");
-                                    const auto owned = layer.cpu_fragment_family
-                                        ? layer.cpu_fragment_family->cohort()->ownership(layer.cpu_fragment_family->participantIndex())
+                                    const auto owned = layer.fragment_family
+                                        ? layer.fragment_family->cohort()->ownership(layer.fragment_family->participantIndex())
                                             .projection(projection == ExpertTierWeightProjection::Gate ? WeightRole::MoEExpertGate
                                                 : projection == ExpertTierWeightProjection::Up ? WeightRole::MoEExpertUp : WeightRole::MoEExpertDown)
                                         : wholeProjectionIntersection(source.cpu_packed->N, source.cpu_packed->K).source();
@@ -7795,6 +7825,13 @@ namespace llaminar2
                                         "ExpertOverlay reusable-context GPU compaction lane was not materialized at setup");
                                 }
 
+                                const auto signature=signatureFor(source);
+                                const auto owned=layer.fragment_family
+                                    ? layer.fragment_family->cohort()->ownership(layer.fragment_family->participantIndex())
+                                        .projection(projection==ExpertTierWeightProjection::Gate?WeightRole::MoEExpertGate:
+                                            projection==ExpertTierWeightProjection::Up?WeightRole::MoEExpertUp:WeightRole::MoEExpertDown)
+                                    : wholeProjectionIntersection(signature.N,signature.K).source();
+                                const auto intersection=ExpertTierWeightProjectionIntersection::between(owned,owned);
                                 std::shared_ptr<ITensorGemm> target_engine;
                                 if (source.format.isFloating())
                                 {
@@ -7816,7 +7853,7 @@ namespace llaminar2
                                                 publishedResidencyBank(
                                                     published_epoch),
                                             source_engine,
-                                            target_engine));
+                                            target_engine,intersection));
                                 }
                                 else
                                 {
@@ -7846,7 +7883,7 @@ namespace llaminar2
                                                 publishedResidencyBank(
                                                     published_epoch),
                                             source_engine,
-                                            target_engine));
+                                            target_engine,intersection));
                                 }
                                 set_projection(
                                     destination_engines,
@@ -7857,13 +7894,20 @@ namespace llaminar2
 
                         std::string operation_error;
                         std::shared_ptr<MoEOverlayPreparedExpertArrival> arrival;
-                        if (layer.cpu_fragment_family)
+                        if (layer.fragment_family)
                         {
-                            const auto borrow = seal_source_banks.find(bank.participant_id);
-                            if (borrow == seal_source_banks.end())
-                                return fail("CPU fragment terminal compaction lost its original published-bank borrow");
-                            arrival = config_.registry->prepareCPUJointArrivalFromInstalledBank(borrow->second,
-                                bank.participant_id, layer_idx, expert_id, &operation_error);
+                            if (seal_device_inventory)
+                                arrival = config_.registry->prepareJointDeviceInventoryArrival(*seal_device_inventory,
+                                    {.participant_id = bank.participant_id, .layer_idx = layer_idx,
+                                        .expert_id = expert_id}, &operation_error);
+                            else
+                            {
+                                const auto borrow = seal_source_banks.find(bank.participant_id);
+                                if (borrow == seal_source_banks.end())
+                                    return fail("Fragment terminal compaction lost its original published-bank borrow");
+                                arrival = config_.registry->prepareJointArrivalFromInstalledBank(borrow->second,
+                                    bank.participant_id, layer_idx, expert_id, &operation_error);
+                            }
                             if (!arrival) return fail(operation_error);
                         }
                         else arrival = std::make_shared<MoEOverlayPreparedExpertArrival>(projection_set);
@@ -7874,8 +7918,8 @@ namespace llaminar2
                             if (!resolveMoEOverlayPreparedWeightSource(source_engines[index], bank.device,
                                     original, &operation_error)) return fail(operation_error);
                             const auto signature = signatureFor(original);
-                            const auto owned = layer.cpu_fragment_family
-                                ? layer.cpu_fragment_family->cohort()->ownership(layer.cpu_fragment_family->participantIndex())
+                            const auto owned = layer.fragment_family
+                                ? layer.fragment_family->cohort()->ownership(layer.fragment_family->participantIndex())
                                     .projection(role == ExpertTierWeightProjection::Gate ? WeightRole::MoEExpertGate
                                         : role == ExpertTierWeightProjection::Up ? WeightRole::MoEExpertUp : WeightRole::MoEExpertDown)
                                 : wholeProjectionIntersection(signature.N, signature.K).source();
@@ -7886,11 +7930,11 @@ namespace llaminar2
                                 std::move(operations[index]), std::move(completion), 0);
                         }
                         if (!complete_operations(operations, &operation_error)) return fail(operation_error);
-                        if (layer.cpu_fragment_family)
+                        if (layer.fragment_family)
                         {
-                            MoEOverlayPreparedCPUFragmentPayload fragment;
-                            if (!arrival->completeCPUFragment(fragment, &operation_error)) return fail(operation_error);
-                            layer.setResidentCPUFragment(expert_id, std::move(fragment));
+                            MoEOverlayPreparedFragmentPayload fragment;
+                            if (!arrival->completeFragment(fragment, &operation_error)) return fail(operation_error);
+                            layer.setResidentFragment(expert_id, std::move(fragment));
                         }
                         else
                         {

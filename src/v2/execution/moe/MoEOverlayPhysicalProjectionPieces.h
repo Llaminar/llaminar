@@ -7,6 +7,8 @@
  * This passive geometry carries no source readiness, allocation, epoch or
  * capacity authority. Fabric reservations and operations consume the same
  * records; neither a cohort nor a transport relay becomes a scalar owner.
+ * CPU and homogeneous rank-local GPU cohorts retain the same original member
+ * addresses and source cuts; transport choice cannot change those coordinates.
  */
 #pragma once
 
@@ -114,9 +116,9 @@ namespace llaminar2
                 if (owner.shard_cohort)
                 {
                     const auto &original = owner.shard_cohort->participants()[index];
-                    if (!member->device.is_cpu() || !member->world_rank_known ||
+                    if (!member->world_rank_known || member->device != original.address.toLocalDeviceId() ||
                         member->world_rank != original.world_rank || member->address != original.address)
-                        throw std::invalid_argument("Physical CPU cohort member changed original rank or endpoint");
+                        throw std::invalid_argument("Physical cohort member changed original rank or endpoint");
                 }
                 else if (member->device != owner.device || member->address != owner.address ||
                          member->world_rank_known != owner.owner_world_rank_known ||

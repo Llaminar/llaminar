@@ -17,7 +17,8 @@ import unittest
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / 'tests/v2/e2e/server'))
 from resource_growth_evidence import (
-    DeviceBinding, RankBinding, WorkloadWindow, assess_observations, initialized_allowances, bind_native_ranks)
+    DeviceBinding, RankBinding, WorkloadWindow, assess_observations, initialized_allowances,
+    bind_discovery_membership, bind_native_ranks, replay_inactive_envelope)
 from resource_process_identity import read_process_status
 
 UUID = 'GPU-12345678-1234-1234-1234-123456789abc'
@@ -213,6 +214,62 @@ class ResourceEvidenceTests(unittest.TestCase):
         self.assertEqual([(r.rank, r.pid, r.start_ticks) for r in ranks], [(0, 100, 50), (1, 200, 51)])
         self.assertEqual(ranks[0].devices, (DeviceBinding('CUDA:0', UUID),))
         self.assertEqual(ranks[1].devices, (DeviceBinding('ROCm:0', '0000:01:00.0'),))
+        lines = [f'[ServerDiscoveryMembership] schema=1 pid={7 + rank} discovery_rank={rank} '
+                 'discovery_size=2 selected=0,1' for rank in range(2)]
+        discovery = bind_discovery_membership(lines, observation, 'coding')
+        self.assertEqual(bind_native_ranks(proof(), observation, 'coding', discovery), ranks)
+        self.assertEqual(discovery.inactive(), ())
+
+    def test_two_native_discovery_processes_one_executor_preserves_both_lifetimes(self):
+        perf = proof()
+        # Only the original ROCm process becomes rank zero. The original CUDA
+        # sibling can still have stable startup mappings but owns no allocation budget.
+        perf['world_size'] = 1
+        perf['records'] = [row for row in perf['records'] if row['rank'] == 1]
+        for row in perf['records']:
+            row['rank'] = 0
+            if 'rank' in row['tags']:
+                row['tags']['rank'] = '0'
+            if row.get('name') == 'rank_membership':
+                row['tags']['world_size'] = '1'
+        lines = [
+            '[ServerDiscoveryMembership] schema=1 pid=7 discovery_rank=0 discovery_size=2 selected=1',
+            '[ServerDiscoveryMembership] schema=1 pid=8 discovery_rank=1 discovery_size=2 selected=1',
+        ]
+        samples = [sample(i) for i in (9, 10, 11)]
+        membership = bind_discovery_membership(reversed(lines), samples[0], 'coding')
+        active = bind_native_ranks(perf, samples[0], 'coding', membership)
+        self.assertEqual([(r.rank, r.pid) for r in active], [(0, 200)])
+        self.assertEqual([(r.discovery_rank, r.pid) for r in membership.inactive()], [(0, 100)])
+        result = self.assess(samples, perf=perf, discovery=membership)
+        self.assertTrue(result['passed'], result)
+        expected = {'discovery/0/anonymous_and_swap', f'discovery/0/CUDA/{UUID}'}
+        self.assertEqual(replay_inactive_envelope(membership, result['discovery_baseline'],
+                         result['growth'], arguments()['window']), expected)
+        result['growth']['maximum_bytes']['discovery/0/anonymous_and_swap'] += 1
+        with self.assertRaisesRegex(ValueError, 'execution growth allowance'):
+            replay_inactive_envelope(membership, result['discovery_baseline'],
+                                     result['growth'], arguments()['window'])
+        for mutation in ('stale', 'extra', 'allocation'):
+            changed = deepcopy(samples)
+            processes = changed[1]['cells']['coding']['processes']
+            if mutation == 'stale':
+                processes[0]['start_ticks'] += 1
+            elif mutation == 'extra':
+                processes.append(dict(processes[0], pid=999, namespace_pids=[999, 99]))
+            else:
+                changed[1]['cuda']['processes'][0]['used_gpu_memory_bytes'] *= 2
+            with self.subTest(mutation=mutation):
+                self.assertFalse(self.assess(changed, perf=perf, discovery=membership)['passed'])
+        with self.assertRaisesRegex(ValueError, 'unexplained'):
+            bind_discovery_membership(lines[:1], samples[0], 'coding')
+        with self.assertRaisesRegex(ValueError, 'sealed process roster'):
+            bind_discovery_membership([lines[0], lines[1].replace('selected=1', 'selected=0')],
+                                      samples[0], 'coding')
+        wrong = bind_discovery_membership([line.replace('selected=1', 'selected=0') for line in lines],
+                                          samples[0], 'coding')
+        with self.assertRaisesRegex(ValueError, 'native execution PIDs'):
+            bind_native_ranks(perf, samples[0], 'coding', wrong)
 
     def test_native_pid_namespace_missing_alias_or_wrong_host_is_fatal(self):
         for namespace in ([], [101, 7], [100, 8], [100, True], [100, 0]):

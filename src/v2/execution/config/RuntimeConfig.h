@@ -17,6 +17,8 @@
 
 #pragma once
 
+#include "collective/RankOrderedNativeResources.h"
+
 #include "../../backends/ComputeBackend.h"
 #include "../../utils/CPUFeatures.h"
 #include "../../utils/DebugEnv.h"
@@ -2166,6 +2168,7 @@ namespace llaminar2
     {
         /** Original selected-worker source owner; immutable mandatory BOM precedes all optional quotas. */
         std::shared_ptr<NativeContextPreparation> native_context_preparation;
+        std::vector<RankOrderedNativeResources> rank_ordered_resources; ///< Original LocalTP's cold native connector quote.
 
         /// Optional startup intent resolved before participant BOMs; never a live DebugEnv
         /// reference.

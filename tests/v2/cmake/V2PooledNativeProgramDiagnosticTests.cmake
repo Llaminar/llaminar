@@ -28,7 +28,8 @@ if(NOT V2_PERF_TESTS_ONLY)
             InvalidPrimaryAndPreparingSourceRejectBeforeAnyCreator
             GeneralOriginalAllowanceEnforcesPlannedSlotsAndZeroAttemptCleanup
             GeneralHostBOMRejectsMissingForeignAndOverflowBeforeNative
-            GeneralAttemptedHostAndDeviceBackingSurviveOriginalReset
+            GeneralAttemptedCUDAAndHostBackingSurviveOriginalReset
+            GeneralAttemptedROCmAndHostBackingSurviveOriginalReset
             GeneralAttemptedBackingRemainsProcessRetainedAcrossActualReset
             GeneralLiveReadersRejectTeardownBeforeActualCaptureDestruction
             RecordingFacadeRejectsUntrackedDuplicateAndResetLaunches

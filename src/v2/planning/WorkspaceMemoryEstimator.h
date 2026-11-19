@@ -10,6 +10,7 @@
 
 #pragma once
 #include "backends/DeviceId.h"
+#include "kernels/common/NativeTileCompletion.h"
 #include "backends/CPUExecutionGeometry.h"
 #include "execution/config/RuntimeConfig.h"
 #include "planning/ModelMemoryProfile.h"
@@ -56,6 +57,8 @@ struct WorkspaceMemoryGeometry
     int device_compute_units = 0;
     CPUExecutionGeometry cpu_execution; ///< Exact participant cache/ISA observation for CPU admission.
     int batch_size = 1; ///< Ordinary/prefill graph batch, independent of verifier request capacity.
+    MoEGateUpPublicationPolicy gate_up_publication=MoEGateUpPublicationPolicy::Staged; ///< Same explicit ordinary-M1 publication policy as the declared native local stage.
+    MoEDownPublicationPolicy down_publication=MoEDownPublicationPolicy::Staged; ///< Exact ordinary-M1 down/route completion policy declared by the local stage.
     /** Maximum authored ordinary output demand; independent of retained MTP. */
     OrdinaryTerminalProjectionCapacity ordinary_terminal_projection;
     int resident_graph_rows = 1; ///< Largest token-row capture bucket.
@@ -241,6 +244,17 @@ public:
     static size_t estimatePreparedExpertService(
         const ModelMemoryProfile& profile,
         const WorkspaceMemoryGeometry& geometry);
+    /**
+     * @brief Compile prepared-service workspace for one original GPU F fragment.
+     * @param profile Original complete source metadata and native codebooks.
+     * @param geometry Actual GPU and original owned model-layer interval.
+     * @param original_fragment Original gate/up N and down K ownership.
+     * @return Exact serial-phase workspace union for one route over this member.
+     * @throws std::invalid_argument For foreign source axes, device or arithmetic.
+     */
+    static size_t estimatePreparedExpertService(const ModelMemoryProfile& profile,
+        const WorkspaceMemoryGeometry& geometry,const MoEExpertProjectionOwnership& original_fragment);
+
 
     /**
      * @brief Compile the fixed decode/prefill startup witness with the live kernel formulas.

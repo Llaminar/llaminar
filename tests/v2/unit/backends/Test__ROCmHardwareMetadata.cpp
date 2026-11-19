@@ -7,6 +7,8 @@
  * GPU library is linked; native preferred wave32 is distinct from compiled64.
  */
 #include "backends/rocm/ROCmHardwareMetadata.h"
+#include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
+#include "kernels/common/VerifierDispatchTable.h"
 #include "kernels/rocm/attention/ROCmFlashAttentionLaunchPolicy.h"
 #include "kernels/qwen4exp/ImmutableLookupHardwareBinding.h"
 #include "kernels/common/ColumnShardAssemblyKernels.h"
@@ -48,7 +50,48 @@ namespace llaminar2::test
         }
         return result;
     }
+    /** @test Mixed visible ordinals select their own verifier table on every lookup. */
+    TEST(ROCmHardwareMetadata, VerifierTableFollowsPhysicalArchitectureAndComputeUnits)
+    {
+        using native_quantised::VerifierDispatchTable;
+        auto cards = records(4);
+        cards[0].isa_target = "gfx1100";
+        cards[0].native_wave_width = 32;
+        cards[0].compute_units = 48; // The 7900 XTX exposes 48 workgroup processors to HIP.
+        cards[1].isa_target = "gfx906:sramecc+:xnack-";
+        cards[1].native_wave_width = 64;
+        cards[1].compute_units = 60;
+        cards[2].isa_target = "gfx906";
+        cards[2].native_wave_width = 64;
+        cards[2].compute_units = 64;
+        cards[3].isa_target = "gfx90a";
+        cards[3].native_wave_width = 64;
+        cards[3].compute_units = 60;
+
+        ROCmHardwareInventory inventory(std::move(cards));
+        const auto select = [&](int ordinal) {
+            const auto hardware = rocm::nativeQuantisedHardware(inventory.at(ordinal));
+            return native_quantised::selectVerifierDispatchTable(hardware);
+        };
+        EXPECT_EQ(select(1), VerifierDispatchTable::MI50);
+        EXPECT_EQ(select(0), VerifierDispatchTable::Portable);
+        EXPECT_EQ(select(2), VerifierDispatchTable::Portable);
+        EXPECT_EQ(select(3), VerifierDispatchTable::Portable);
+        EXPECT_EQ(select(1), VerifierDispatchTable::MI50);
+        EXPECT_THROW(native_quantised::selectVerifierDispatchTable({}), std::invalid_argument);
+    }
+
     /** @test Neither construction nor unadmitted lookup invokes a hardware source. */
+    /** @test Only the exact GPU issuing a system CAS may authorize its mapped host access. */
+    TEST(ROCmHardwareMetadata, MappedHostCompareExchangeRequiresOriginalDeviceAtomics)
+    {
+        auto devices = records(2);
+        devices[1].host_native_atomics = true;
+        const ROCmHardwareInventory inventory(std::move(devices));
+        EXPECT_THROW(requireROCmMappedHostCompareExchange(inventory.at(0)), std::runtime_error);
+        EXPECT_NO_THROW(requireROCmMappedHostCompareExchange(inventory.at(1)));
+    }
+
     TEST(ROCmHardwareMetadata, CPUOnlyConstructionAndUnadmittedReadNeverEnumerate)
     {
         ROCmHardwareAuthority authority;

@@ -2,7 +2,9 @@
  * @brief Actual observer failure selector preserves native backend/ordinal ordering without SDK calls.
  */
 #include "integration/backends/PooledNativeProgramObservation.h"
+#include "utils/IntentionalFaultProcess.h"
 #include <gtest/gtest.h>
+#include <csignal>
 #include <cstdlib>
 #include <optional>
 namespace llaminar2::test {
@@ -25,11 +27,28 @@ TEST(PooledDiagnosticInstantiationSelector,SourceBackendFirstSucceedsBeforeExact
         EXPECT_FALSE(rejectInstantiation(1,source));EXPECT_TRUE(rejectInstantiation(1,remote));EXPECT_FALSE(rejectInstantiation(2,remote));}
 }
 TEST(PooledDiagnosticInstantiationSelector,MalformedOrAmbiguousQualifiedControlFailsBeforeAnyNativeCall){
-    GTEST_FLAG_SET(death_test_style,"threadsafe");Environment env;using pooled_program_observation::rejectInstantiation;
-    setenv(env.backend,"CUDA",1);EXPECT_DEATH((void)rejectInstantiation(1,"CUDA"),"");
-    setenv(env.ordinal,"1",1);EXPECT_DEATH((void)rejectInstantiation(1),"");
-    EXPECT_DEATH((void)rejectInstantiation(1,"OpenCL"),"");
-    for(const auto* bad:{"","cuda","ROCM","CUDA:0","CUDA,ROCm"}){setenv(env.backend,bad,1);EXPECT_DEATH((void)rejectInstantiation(1,"CUDA"),"");}
-    setenv(env.backend,"CUDA",1);for(const auto* bad:{"0","1x","-1","18446744073709551616"}){setenv(env.ordinal,bad,1);EXPECT_DEATH((void)rejectInstantiation(1,"ROCm"),"");}
+    GTEST_FLAG_SET(death_test_style, "threadsafe");
+    Environment env;
+    const auto expectAbort = [](const char* backend) {
+        EXPECT_EXIT({
+            disableIntentionalFaultCoreDump();
+            (void)pooled_program_observation::rejectInstantiation(1, backend);
+        }, ::testing::KilledBySignal(SIGABRT), "");
+    };
+
+    setenv(env.backend, "CUDA", 1);
+    expectAbort("CUDA");
+    setenv(env.ordinal, "1", 1);
+    expectAbort(nullptr);
+    expectAbort("OpenCL");
+    for (const auto* bad : {"", "cuda", "ROCM", "CUDA:0", "CUDA,ROCm"}) {
+        setenv(env.backend, bad, 1);
+        expectAbort("CUDA");
+    }
+    setenv(env.backend, "CUDA", 1);
+    for (const auto* bad : {"0", "1x", "-1", "18446744073709551616"}) {
+        setenv(env.ordinal, bad, 1);
+        expectAbort("ROCm");
+    }
 }
 }

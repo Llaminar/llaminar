@@ -6,6 +6,7 @@
 #include "execution/moe/DeviceMoERebalancePolicyShared.h"
 #include "execution/moe/MoEOverlayDeviceControllerKernels.h"
 #include "execution/moe/MoEOverlayDevicePlacementPolicy.h"
+#include "execution/moe/MoEOverlayLogicalTargetPolicy.h"
 #include "execution/moe/MoEOverlayCycleSearch.h"
 
 #include <gtest/gtest.h>
@@ -118,13 +119,13 @@ namespace llaminar2::test
             if (!input)
                 throw std::invalid_argument("test economy input is null");
             std::vector<std::int32_t> priorities;
-            for (const auto &participant : input->participants)
+            for (const auto &participant : input->targets)
                 priorities.push_back(participant.tier_priority);
             std::sort(priorities.begin(), priorities.end());
             priorities.erase(
                 std::unique(priorities.begin(), priorities.end()),
                 priorities.end());
-            for (auto &participant : input->participants)
+            for (auto &participant : input->targets)
             {
                 participant.tier_index = static_cast<std::int32_t>(
                     std::lower_bound(
@@ -144,6 +145,7 @@ namespace llaminar2::test
             economy.phase_expert_demand.assign(
                 kMoEOverlayDeviceControllerDemandPhaseCount * plane_words,
                 0u);
+            input->selected_demand.assign(plane_words, 0u);
             for (std::uint32_t layer = 0u;
                  layer < input->num_layers;
                  ++layer)
@@ -154,7 +156,7 @@ namespace llaminar2::test
                 {
                     std::uint64_t demand = 0u;
                     for (std::uint32_t participant = 0u;
-                         participant < input->participants.size();
+                         participant < input->targets.size();
                          ++participant)
                     {
                         demand += moe_rebalance_policy::
@@ -166,6 +168,7 @@ namespace llaminar2::test
                                         input->num_experts +
                                     expert]);
                     }
+                    input->selected_demand[static_cast<std::size_t>(layer) * input->num_experts + expert] = demand;
                     economy.phase_expert_demand[
                         (static_cast<std::size_t>(
                              kMoEOverlayDeviceControllerEconomyPrefillPhase) *
@@ -176,12 +179,13 @@ namespace llaminar2::test
                 }
             }
             economy.service_costs.assign(
-                static_cast<std::size_t>(economy.tier_count) *
+                input->targets.size() *
                     input->num_layers *
                     kMoEOverlayDeviceControllerEconomyServicePhaseCount,
                 0u);
-            for (std::uint32_t tier = 0u; tier < economy.tier_count; ++tier)
+            for (std::uint32_t target = 0u; target < input->targets.size(); ++target)
             {
+                const auto tier = static_cast<std::uint32_t>(input->targets[target].tier_index);
                 for (std::uint32_t layer = 0u;
                      layer < input->num_layers;
                      ++layer)
@@ -192,7 +196,7 @@ namespace llaminar2::test
                          ++phase)
                     {
                         economy.service_costs[
-                            (static_cast<std::size_t>(tier) *
+                            (static_cast<std::size_t>(target) *
                                  input->num_layers +
                              layer) *
                                 kMoEOverlayDeviceControllerEconomyServicePhaseCount +
@@ -201,15 +205,15 @@ namespace llaminar2::test
                 }
             }
             economy.migration_costs.assign(
-                input->participants.size() * input->participants.size() *
+                input->targets.size() * input->targets.size() *
                     input->num_layers,
                 {});
             for (std::uint32_t source = 0u;
-                 source < input->participants.size();
+                 source < input->targets.size();
                  ++source)
             {
                 for (std::uint32_t destination = 0u;
-                     destination < input->participants.size();
+                     destination < input->targets.size();
                      ++destination)
                 {
                     if (source == destination)
@@ -220,7 +224,7 @@ namespace llaminar2::test
                     {
                         economy.migration_costs[
                             (static_cast<std::size_t>(source) *
-                                 input->participants.size() +
+                                 input->targets.size() +
                              destination) *
                                 input->num_layers +
                             layer] = {
@@ -253,9 +257,10 @@ namespace llaminar2::test
                  participant < priorities.size();
                  ++participant)
             {
-                result.participants.push_back({
-                    .participant_id = participant,
+                result.targets.push_back({
+                    .vertex_index = participant,
                     .tier_priority = priorities[participant],
+                    .target = MoEOverlayRouteTarget::whole(static_cast<std::int32_t>(participant)),
                 });
             }
             result.collected_state.assign(
@@ -290,8 +295,8 @@ namespace llaminar2::test
             std::int32_t participant)
         {
             return static_cast<std::size_t>(std::count(
-                plan.candidate_owner.begin(),
-                plan.candidate_owner.end(),
+                plan.candidate_vertex.begin(),
+                plan.candidate_vertex.end(),
                 participant));
         }
 
@@ -313,8 +318,10 @@ namespace llaminar2::test
                 EXPECT_EQ(command.payload_bytes, 4096u);
                 EXPECT_EQ(command.source_epoch, 7u);
                 EXPECT_EQ(command.candidate_epoch, 8u);
-                EXPECT_NE(command.source_participant,
-                          command.destination_participant);
+                ASSERT_TRUE(command.source_target.isWhole());
+                ASSERT_TRUE(command.destination_target.isWhole());
+                EXPECT_NE(command.source_target.word(),
+                          command.destination_target.word());
                 EXPECT_GE(moeOverlayMovementCycle(command.flags), 1u);
                 EXPECT_LE(moeOverlayMovementCycle(command.flags),
                           plan.evidence.accepted_cycles);
@@ -329,10 +336,10 @@ namespace llaminar2::test
                     continue;
                 const auto &previous = plan.commands[index - 1u];
                 EXPECT_TRUE(
-                    previous.destination_participant <
-                        command.destination_participant ||
-                    (previous.destination_participant ==
-                         command.destination_participant &&
+                    previous.destination_target.word() <
+                        command.destination_target.word() ||
+                    (previous.destination_target.word() ==
+                         command.destination_target.word() &&
                      (previous.layer < command.layer ||
                       (previous.layer == command.layer &&
                        previous.expert < command.expert))));
@@ -515,7 +522,7 @@ namespace llaminar2::test
             /*maximum_cycles=*/2u);
         policy_input.num_layers = 2u;
         policy_input.collected_state.assign(
-            policy_input.participants.size() * policy_input.num_layers *
+            policy_input.targets.size() * policy_input.num_layers *
                 policy_input.num_experts,
             0u);
         for (std::uint32_t layer = 0u;
@@ -860,9 +867,9 @@ namespace llaminar2::test
         policy_input.num_layers = kLayers;
         policy_input.payload_bytes_per_layer.assign(kLayers, 4096u);
         policy_input.collected_state.assign(
-            policy_input.participants.size() * kLayers * experts, 0u);
+            policy_input.targets.size() * kLayers * experts, 0u);
         for (std::size_t participant = 0u;
-             participant < policy_input.participants.size();
+             participant < policy_input.targets.size();
              ++participant)
         {
             for (std::uint32_t layer = 0u; layer < kLayers; ++layer)
@@ -985,4 +992,7 @@ namespace llaminar2::test
         EXPECT_EQ(saturated.updated_phase_count, kMaximum);
         EXPECT_EQ(saturated.combined_count, kMaximum);
     }
+    /** @brief Recorded global demand remains once-only when every selected expert is external to the root. */
+    /** @brief A source-proven singleton cohort obeys complete-fragment receipts rather than whole-cache rules. */
+    /** @brief The original heuristic emits original cohort tags and consumes distinct complete-target prices. */
 } // namespace llaminar2::test

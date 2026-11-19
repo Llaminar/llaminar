@@ -47,11 +47,15 @@ namespace llaminar2
      * GateUp is a complete movable pair, never an incomplete whole expert.
      * Its down projection belongs to a separate, immutable participant slice
      * bank and must not be copied, retired or priced by expert migration.
+     * IntermediateShard owns local gate/up rows and the matching down columns.
+     * It moves all three projections but produces only a partial expert result;
+     * a complete-FFN consumer must reject it even when all matrices are ready.
      */
     enum class DeviceMoEProjectionSet : std::uint32_t
     {
         CompleteExpert = 0,
         GateUp = 1,
+        IntermediateShard = 2,
     };
 
     /** @return Whether a device payload carries a supported ownership contract. */
@@ -59,7 +63,16 @@ namespace llaminar2
     deviceMoEProjectionSetValid(DeviceMoEProjectionSet projections) noexcept
     {
         return projections == DeviceMoEProjectionSet::CompleteExpert ||
-               projections == DeviceMoEProjectionSet::GateUp;
+               projections == DeviceMoEProjectionSet::GateUp ||
+               projections == DeviceMoEProjectionSet::IntermediateShard;
+    }
+
+    /** @return Whether this declared family owns and transfers a down projection. */
+    [[nodiscard]] LLAMINAR_MOE_HOST_DEVICE constexpr bool
+    deviceMoEProjectionSetHasDown(DeviceMoEProjectionSet projections) noexcept
+    {
+        return projections == DeviceMoEProjectionSet::CompleteExpert ||
+               projections == DeviceMoEProjectionSet::IntermediateShard;
     }
 
     /** @return Whether @p format names a contiguous floating-point payload. */
@@ -120,14 +133,17 @@ namespace llaminar2
     }
 
     /**
-     * @brief Authenticate a projection-set tag and the absence of fixed-bank pointers.
+     * @brief Authenticate projection ownership and the absence of fixed-bank pointers.
      * @param expert Host or device view of the same compact descriptor ABI.
-     * @return False for unknown sets or any down storage in a movable pair.
+     * @return False for unknown sets, scalar ownership of a fragment, or down
+     * storage in a movable pair.
      */
     template <typename ExpertDescriptor>
     [[nodiscard]] LLAMINAR_MOE_HOST_DEVICE constexpr bool
     deviceMoEProjectionPayloadValid(const ExpertDescriptor &expert) noexcept
     {
+        if (expert.projection_set == DeviceMoEProjectionSet::IntermediateShard)
+            return expert.owner_participant == -1;
         if (expert.projection_set == DeviceMoEProjectionSet::CompleteExpert)
             return true;
         return expert.projection_set == DeviceMoEProjectionSet::GateUp &&
@@ -159,10 +175,15 @@ namespace llaminar2
         if (expert.logical_expert_id < 0 || expert.projection_set != expected_projections ||
             !deviceMoEProjectionPayloadValid(expert))
             return false;
-        const bool needs_down = expected_projections == DeviceMoEProjectionSet::CompleteExpert;
+        const bool needs_down = deviceMoEProjectionSetHasDown(expected_projections);
+        const bool fragment = expected_projections == DeviceMoEProjectionSet::IntermediateShard;
         if (deviceMoEWeightFormatIsFloating(expert.weight_format))
             return expert.floating_gate.valid() && expert.floating_up.valid() &&
-                (!needs_down || expert.floating_down.valid());
+                (!needs_down || expert.floating_down.valid()) &&
+                (!fragment || (expert.floating_gate.n == expert.floating_up.n &&
+                    expert.floating_gate.n == expert.floating_down.k &&
+                    expert.floating_gate.k == expert.floating_up.k &&
+                    expert.floating_gate.k == expert.floating_down.n));
         if (expert.weight_format != DeviceMoEWeightFormat::NativeQuantised)
             return false;
         // The compact CUDA/HIP views and the host descriptor share these ABI
@@ -172,7 +193,9 @@ namespace llaminar2
             expert.up.payload && expert.up.scales && expert.up.n > 0 &&
             expert.up.k > 0 && expert.up.blocks_per_row > 0 &&
             (!needs_down || (expert.down.payload && expert.down.scales &&
-                expert.down.n > 0 && expert.down.k > 0 && expert.down.blocks_per_row > 0));
+                expert.down.n > 0 && expert.down.k > 0 && expert.down.blocks_per_row > 0)) &&
+            (!fragment || (expert.gate.n == expert.up.n && expert.gate.n == expert.down.k &&
+                expert.gate.k == expert.up.k && expert.gate.k == expert.down.n));
     }
 
     /**

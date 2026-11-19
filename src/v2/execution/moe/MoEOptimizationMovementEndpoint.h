@@ -26,7 +26,7 @@ public:
         bool operator==(const Whole&) const = default;
     };
     /** @brief Original complete cohort, in its canonical reduction/member order. */
-    struct CPUCohort {
+    struct Cohort {
         int tier;
         std::shared_ptr<const MoEExpertShardCohort> original;
     };
@@ -41,12 +41,12 @@ public:
     static MoEOptimizationMovementEndpoint fromOwner(const MoEExpertOwner& owner);
     /** @return Whether this endpoint is an original whole participant. */
     bool isWhole() const noexcept {return std::holds_alternative<Whole>(value_);}
-    /** @return Whether this endpoint is one complete original CPU cohort. */
-    bool isCPUCohort() const noexcept {return std::holds_alternative<CPUCohort>(value_);}
+    /** @return Whether this endpoint is one complete original CPU/GPU cohort. */
+    bool isCohort() const noexcept {return std::holds_alternative<Cohort>(value_);}
     /** @return Checked scalar projection. @throws std::logic_error For absent or cohort ownership. */
     const Whole& whole() const;
     /** @return Complete original metadata. @throws std::logic_error For absent or whole ownership. */
-    const CPUCohort& cohort() const;
+    const Cohort& cohort() const;
     /** @return Same canonical typed route alternative; unbound remains absent. */
     MoEOverlayRouteTarget target() const noexcept;
     /** @return Whether the immutable alternative is complete and originally bound. */
@@ -59,7 +59,7 @@ private:
     /** @brief Seal one checked alternative without exposing mutable scalar arms. */
     explicit MoEOptimizationMovementEndpoint(Whole value):value_(std::move(value)){}
     /** @brief Seal the original immutable cohort borrow after source checks. */
-    explicit MoEOptimizationMovementEndpoint(CPUCohort value):value_(std::move(value)){}
-    std::variant<std::monostate,Whole,CPUCohort> value_;
+    explicit MoEOptimizationMovementEndpoint(Cohort value):value_(std::move(value)){}
+    std::variant<std::monostate,Whole,Cohort> value_;
 };
 }

@@ -27,6 +27,12 @@ using PlanningNativeContextBudgets =
 const std::vector<PlanningNativeContextDeclaration> &
 projectPlanningNativeContextBudget(const PlanningNativeContextBudgets &,
                                    const ExecutionRankMembership &, int);
+/** @brief Project the original owned GPU observers allowed by this request.
+ * @param context Published automatic request and original discovery inventory.
+ * @param rank Original discovery rank, before execution membership narrows.
+ * @return Exact rank-local GPU endpoints for measurement and budget evidence.
+ */
+std::vector<DeviceId> planningNativeContextDevices(const AutomaticPlanningPreparation &context, int rank);
 /** @brief Exchange original stack/object geometry without native work or
  * provider hashing. */
 PlanningNativeContextBudgets

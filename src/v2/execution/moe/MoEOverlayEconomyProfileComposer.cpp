@@ -521,11 +521,19 @@ namespace llaminar2
     {
         const auto matches=[](MoEOverlayRouteTarget tag,const MoEOverlayPhysicalProjectionTarget &target) {
             if(tag.isWhole())return target.members.size()==1 && target.members.front().participant_id==tag.word();
-            // Canonical CPU shard cohorts retain every original source-bounded participant;
+            // Canonical shard cohorts retain every original source-bounded participant;
             // TP1 is a whole target, never an alias for a one-member cohort.
-            if(!tag.isCPUCohort() || target.members.size()<2 || target.members.size()>static_cast<size_t>(std::numeric_limits<int>::max()) ||
+            if(!tag.isCohort() || target.members.size()<2 || target.members.size()>static_cast<size_t>(std::numeric_limits<int>::max()) ||
                 std::int64_t(target.tier_idx)!=-std::int64_t(tag.word())-2)return false;
-            return std::all_of(target.members.begin(),target.members.end(),[](const auto &member){return member.device.is_cpu();});
+            const auto &first = target.members.front();
+            return std::all_of(target.members.begin(), target.members.end(), [&](const auto &member) {
+                // GPU domains retain one native communicator on their original
+                // rank. Cross-vendor/rank movement joins complete domains; it
+                // must never manufacture a mixed native cohort from its pieces.
+                return member.device.is_valid() && member.device.type == first.device.type &&
+                    member.address.toLocalDeviceId() == member.device &&
+                    (member.device.is_cpu() || (member.world_rank >= 0 && member.world_rank == first.world_rank));
+            });
         };
         return coordinate.valid() && matches(coordinate.source_target,geometry.targets().first) &&
             matches(coordinate.destination_target,geometry.targets().second);
@@ -1032,7 +1040,7 @@ namespace llaminar2
         std::shared_ptr<const MoEExpertShardCohort> preparedServiceCohort(
             const MoEExpertOwnerMap& map,MoEOverlayTargetServiceCoordinate key)
         {
-            if(!key.target.isCPUCohort())return {};
+            if(!key.target.isCohort())return {};
             const int tier=-int64_t(key.target.word())-2;
             for(const auto& owner:map.owners())
                 if(owner.layer_idx==key.layer && owner.tier_idx==tier && owner.shard_cohort)
@@ -1050,7 +1058,7 @@ namespace llaminar2
             int selected=-1;
             for(const auto& owner:map.owners())
                 if(owner.layer_idx==key.layer &&
-                    (key.target.isCPUCohort()?owner.shard_cohort &&
+                    (key.target.isCohort()?owner.shard_cohort &&
                         owner.tier_idx==-int64_t(key.target.word())-2:
                         !owner.shard_cohort && owner.owner_participant==key.target.word()))
                     if(selected<0 || owner.expert_id<selected)selected=owner.expert_id;
@@ -1107,12 +1115,14 @@ namespace llaminar2
             std::map<int,std::pair<int,std::vector<const MoEExpertOwnerParticipant*>>> targets;
             std::set<int> fragment_ids;
             for(const auto& owner:map.owners())if(owner.layer_idx==layer && owner.shard_cohort) {
-                const auto target=MoEOverlayRouteTarget::cpuCohort(owner.tier_idx);
+                const auto target=MoEOverlayRouteTarget::cohort(owner.tier_idx);
                 auto& descriptor=targets[target.word()];descriptor.first=owner.tier_idx;
                 if(descriptor.second.empty())for(const auto& member:owner.shard_cohort->participants()) {
                     const auto* actual=map.participantForId(member.participant_id);
                     if(!actual || !actual->world_rank_known || actual->world_rank!=member.world_rank ||
-                        actual->address!=member.address || !actual->device.is_cpu())
+                        actual->address!=member.address || actual->device!=member.address.toLocalDeviceId() ||
+                        actual->tier_idx!=owner.tier_idx ||
+                        actual->domain_participant_index!=int(descriptor.second.size()))
                         throw std::invalid_argument("Prepared service cohort differs from original member inventory");
                     descriptor.second.push_back(actual);fragment_ids.insert(actual->participant_id);
                 }
@@ -1124,8 +1134,9 @@ namespace llaminar2
                 // its initial source/cuts are absent. No cohort is rebuilt from quota.
                 const auto domain=std::find_if(snapshot->placement_plan->domains.begin(),snapshot->placement_plan->domains.end(),
                     [&](const auto& value){return value.name==member.domain_name;});
-                if(domain!=snapshot->placement_plan->domains.end() && member.device.is_cpu() &&
-                    domain->routed_compute_policy==RoutedExpertComputePolicy::TensorSharded && domain->participants.size()>1)
+                if(domain!=snapshot->placement_plan->domains.end() &&
+                    domain->routed_compute_policy==RoutedExpertComputePolicy::TensorSharded &&
+                    (domain->participants.size()>1 || member.device.is_gpu()))
                     throw std::invalid_argument("Prepared service joint tier lacks original cohort source geometry");
                 targets.emplace(MoEOverlayRouteTarget::whole(member.participant_id).word(),
                     std::pair{member.tier_idx,std::vector<const MoEExpertOwnerParticipant*>{&member}});

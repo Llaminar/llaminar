@@ -743,7 +743,7 @@ namespace
                     if (owner->shard_cohort)
                     {
                         if (!result.residency_lease ||
-                            (**result.residency_lease).ownershipKind() != MoEOverlayResidencyOwnershipKind::CPUJointFragments ||
+                            (**result.residency_lease).ownershipKind() != MoEOverlayResidencyOwnershipKind::JointFragments ||
                             &(**result.residency_lease).placementOwnerMap() != effective_owner_map)
                         {
                             LOG_ERROR("[MoEExpertDispatchStage] CPU joint dispatch lacks its original residency lease");

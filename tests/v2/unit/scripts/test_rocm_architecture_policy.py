@@ -49,6 +49,22 @@ class ROCmArchitecturePolicyTests(unittest.TestCase):
                 result=run(args,env=env);self.assertEqual(result.returncode,0,result.stdout+result.stderr)
                 self.assertEqual((Path(tmp)/'build/targets.txt').read_text(),expected+'\n'+expected)
 
+    def test_warm_build_and_stale_collective_override_follow_application_targets(self):
+        """Reconfigure one existing tree through the same target changes a developer makes."""
+        with tempfile.TemporaryDirectory() as tmp:
+            source = Path(tmp)
+            build = source / 'build'
+            (source / 'CMakeLists.txt').write_text(
+                'cmake_minimum_required(VERSION 3.27)\nproject(CanonicalTargets NONE)\n'
+                f'include("{ROOT}/cmake/ROCmArchitectures.cmake")\n'
+                'file(WRITE "${CMAKE_BINARY_DIR}/targets.txt" "${RCCL_GPU_TARGETS}")\n')
+            configure = ['cmake', '-S', str(source), '-B', str(build), '-G', 'Ninja']
+            for targets, old_option in [('gfx906', ['-DRCCL_GPU_TARGETS:STRING=gfx1100']),
+                                        ('gfx906;gfx1100', []), ('gfx1100', [])]:
+                result = run([*configure, '-DCMAKE_HIP_ARCHITECTURES=' + targets, *old_option])
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((build / 'targets.txt').read_text(), targets)
+
     def test_actual_rocm_configuration_binds_before_language_discovery(self):
         """Execute the production ROCm block, intercepting only SDK discovery."""
         text=(ROOT/'src/v2/CMakeLists.txt').read_text()

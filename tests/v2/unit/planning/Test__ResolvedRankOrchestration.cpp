@@ -14,7 +14,9 @@
  * execution, activation transport and model-context reuse are not impersonated.
  */
 #include "planning/ResolvedRankOrchestration.h"
+#include "planning/AutomaticOrchestrationCandidates.h"
 #include "execution/global/GlobalStageTPValidation.h"
+#include "execution/moe/MoEExpertProjectionOwnership.h"
 #include "../../mocks/MockModelContext.h"
 #include "execution/runner/OrchestrationRunner.h"
 #include "execution/runner/PreparedWeightAuthorityIdentity.h"
@@ -320,6 +322,183 @@ TEST(ResolvedRankOrchestration, ImplicitMoELocalTPSealsOneAuthorityWithoutMutati
                 EXPECT_EQ(repeated.rankPlan().toString(), resolved.rankPlan().toString());
                 EXPECT_EQ(repeated.config().domain_definitions.size(), 1u);
             }
+}
+
+TEST(ResolvedRankOrchestration, QFNMI50LocalTPRequiresCompleteMeasuredDomain)
+{
+    using Policy = LocalGPUExpertKernelPolicy;
+    std::vector<DeviceInfo> devices;
+    RoutedExpertDomain cohort;
+    cohort.name = "tp";
+    cohort.scope = ExecutionDomainScope::RANK_LOCAL;
+    cohort.owner_rank = 0;
+    cohort.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+    for (int ordinal : {7, 2, 9, 4})
+    {
+        auto gpu = card(DeviceType::ROCm, ordinal, 7);
+        gpu.native_isa = "gfx906:sramecc+:xnack-";
+        devices.push_back(std::move(gpu));
+        cohort.participants.push_back(GlobalDeviceAddress::fromLocalDeviceId(
+            DeviceId(DeviceType::ROCm, ordinal), "node", 7));
+    }
+    auto hardware = inventory(1, devices);
+    MoERoutedExpertPlacementPlan plan;
+    plan.continuation_domain = plan.base_model_domain = plan.shared_expert_domain = "tp";
+    plan.domains.push_back(cohort);
+    plan.routed_tiers.emplace_back().domain = "tp";
+
+    ModelMemoryProfile source;
+    source.flash_next.emplace();
+    source.d_model = 2560;
+    source.expert_count = 512;
+    source.expert_used_count = 10;
+    source.expert_feed_forward_length = source.expert_shared_feed_forward_length = 640;
+    const auto select = [&](bool whole_model = true, MoERebalanceRuntimeMode mode = MoERebalanceRuntimeMode::Off)
+    {
+        return selectLocalGPUExpertKernelPolicy(plan, source, hardware, whole_model, mode);
+    };
+
+    EXPECT_EQ(select(), Policy::QFNMI50TP4);
+    EXPECT_EQ(select(false), Policy::Generic);
+    EXPECT_EQ(select(true, MoERebalanceRuntimeMode::Dynamic), Policy::Generic);
+    plan.domains.front().world_ranks = {0, 0, 0, 0};
+    EXPECT_EQ(select(), Policy::Generic);
+    plan.domains.front().world_ranks.clear();
+
+    using Compute = RoutedExpertComputePolicy;
+    plan.domains.front().routed_compute_policy = Compute::GateUpOwnedDownColumns;
+    EXPECT_EQ(selectLocalGPUExpertKernelPolicy(plan, source, hardware, true, MoERebalanceRuntimeMode::Off,
+                  Compute::Automatic), Policy::QFNMI50TP4);
+    EXPECT_EQ(selectLocalGPUExpertKernelPolicy(plan, source, hardware, true, MoERebalanceRuntimeMode::Off,
+                  Compute::GateUpOwnedDownColumns), Policy::Generic);
+    plan.domains.front().routed_compute_policy = Compute::TensorSharded;
+
+    hardware.ranks[0].gpus.back().native_isa = "gfx1100";
+    EXPECT_EQ(select(), Policy::Generic);
+    hardware.ranks[0].gpus.back().native_isa = "gfx906";
+    hardware.ranks[0].gpus.back().compute_units = 64;
+    EXPECT_EQ(select(), Policy::Generic);
+    hardware.ranks[0].gpus.back().compute_units = 60;
+    EXPECT_EQ(select(), Policy::QFNMI50TP4);
+
+    plan.domains.front().participants.pop_back();
+    EXPECT_EQ(select(), Policy::Generic);
+    plan.domains.front().participants = cohort.participants;
+    plan.shared_expert_domain = "remote";
+    EXPECT_EQ(select(), Policy::Generic);
+    plan.shared_expert_domain = "tp";
+    source.flash_next.reset();
+    EXPECT_EQ(select(), Policy::Generic);
+
+    // Bind the actual named, stationary single-tier authority before admission.
+    source.flash_next.emplace();
+    source.architecture = "qwen4exp";
+    source.n_layers = 48;
+    source.n_heads = 24;
+    source.n_kv_heads = 2;
+    source.head_dim = 256;
+    source.gdn_group_count = 16;
+    source.gdn_time_step_rank = 48;
+    source.d_ff = 640;
+    source.vocab_size = 151936;
+    source.max_seq_len = 4096;
+    // Automatic search authenticates original sparse K/V descriptors and GDN
+    // head boundaries before publishing any TP proposal.
+    for (int layer = 3; layer < source.n_layers; layer += 4)
+    {
+        source.flash_next->sparse_decoder_layers.push_back(layer);
+        for (const auto *role : {"attn_k.weight", "attn_v.weight"})
+            source.tensors.push_back({
+                .name = "blk." + std::to_string(layer) + "." + role,
+                .native_bytes = 2560ull * 512 / 32 * 34,
+                .quant_type = "Q8_0",
+                .elements = 2560ull * 512,
+                .K = 2560,
+                .layer_index = layer,
+            });
+    }
+    PlanningModelMetadata model(source, source.n_layers);
+    ExecutionPlanBuilder builder;
+    for (const auto intent : {Compute::Automatic, Compute::TensorSharded, Compute::GateUpOwnedDownColumns})
+    {
+        const auto config = parse({
+            "--moe-routed-expert-placement", "tiered-overlay",
+            "--moe-routed-expert-continuation-domain", "tp",
+            "--moe-routed-expert-shared-domain", "tp",
+            "--moe-routed-expert-domain", std::string("tp=node:7:rocm:7,node:7:rocm:2,node:7:rocm:9,node:7:rocm:4;"
+                "scope=rank_local;backend=rccl;owner=0;expert_compute=") + routedExpertComputePolicyToString(intent),
+            "--moe-routed-expert-tier", "all_gpu@tp;priority=0",
+            "--moe-residency-maintenance", "off",
+        });
+        const auto resolved = ResolvedRankOrchestration::resolve(config, model, hardware, builder, 0);
+        const auto &sealed = *resolved.config().moe_routed_expert_plan;
+        EXPECT_EQ(sealed.usesQFNMI50TP4(), intent != Compute::GateUpOwnedDownColumns);
+        EXPECT_EQ(sealed.domains.front().routed_compute_policy, intent == Compute::Automatic ? Compute::TensorSharded : intent);
+        const char *override = std::getenv("LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES");
+        const bool expected_balanced = override ? std::string_view(override) == "1"
+                                                : intent != Compute::GateUpOwnedDownColumns;
+        EXPECT_EQ(sealed.gpu_expert_intermediate_tiling, expected_balanced
+            ? GPUExpertIntermediateTiling::BalancedNativeK32 : GPUExpertIntermediateTiling::Coarse128);
+    }
+
+    OrchestrationConfig simple;
+    simple.tp_devices = cohort.participants;
+    simple.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+    const auto generic = ResolvedRankOrchestration::resolve(simple, model, hardware, builder, 0);
+    EXPECT_FALSE(generic.config().moe_routed_expert_plan->usesQFNMI50TP4());
+    EXPECT_EQ(generic.config().routed_expert_compute_policy, Compute::GateUpOwnedDownColumns);
+    const auto rebound = ResolvedRankOrchestration::resolve(generic.config(), model, hardware, builder, 0);
+    EXPECT_FALSE(rebound.config().moe_routed_expert_plan->usesQFNMI50TP4());
+    simple.routed_expert_compute_policy = Compute::TensorSharded;
+    EXPECT_THROW(ResolvedRankOrchestration::resolve(simple, model, hardware, builder, 0), std::invalid_argument);
+
+    for (const auto *maintenance : {"off", "dynamic"})
+    {
+        const bool stationary = std::string_view(maintenance) == "off";
+        const auto request = parse({"--auto", "--only-strategies", "tp", "--only-backends", "rocm",
+            "--no-mtp", "--auto-device-counts", "rocm=4", "--moe-residency-maintenance", maintenance});
+        bool saw_all_phase_tp = false;
+        visitAutomaticOrchestrationCandidates(request, model, hardware, [&](const auto &candidate)
+        {
+            ASSERT_EQ(candidate.strategy, OrchestrationStrategy::TensorParallel);
+            ASSERT_TRUE(candidate.config.moe_routed_expert_plan);
+            if (candidate.config.moe_routed_expert_plan->continuation_domain_spec.effectiveDensePolicy() !=
+                DenseParallelPolicy::TensorParallel)
+                return;
+            saw_all_phase_tp = true;
+            const auto resolved = ResolvedRankOrchestration::resolve(
+                candidate.config, model, candidate.membership.inventory(), builder, 0);
+            const auto &sealed = *resolved.config().moe_routed_expert_plan;
+            EXPECT_EQ(sealed.usesQFNMI50TP4(), stationary);
+            EXPECT_EQ(sealed.domains.front().routed_compute_policy,
+                stationary ? Compute::TensorSharded : Compute::GateUpOwnedDownColumns);
+            EXPECT_EQ(resolved.config().moe_rebalance.mode,
+                stationary ? MoERebalanceRuntimeMode::Off : MoERebalanceRuntimeMode::Dynamic);
+        });
+        EXPECT_TRUE(saw_all_phase_tp);
+    }
+
+    const auto partition = [](GPUExpertIntermediateTiling tiling, int layer)
+    {
+        return MoEExpertProjectionOwnership::nativeIntermediateIntervals(640, 4, 32, layer,
+            preferredIntermediateGrain(tiling));
+    };
+    for (int layer : {0, 1, 48})
+    {
+        const auto balanced = partition(GPUExpertIntermediateTiling::BalancedNativeK32, layer);
+        const auto coarse = partition(GPUExpertIntermediateTiling::Coarse128, layer);
+        ASSERT_EQ(balanced.size(), 4u);
+        ASSERT_EQ(coarse.size(), 4u);
+        int first = 0;
+        for (const auto &interval : balanced)
+        {
+            EXPECT_EQ(interval.first_column, first);
+            EXPECT_EQ(interval.columns, 160);
+            first += interval.columns;
+        }
+        EXPECT_EQ(coarse.at((layer + 3) % 4).columns, 256);
+        EXPECT_EQ(first, 640);
+    }
 }
 
 TEST(ResolvedRankOrchestration, CompactOverlayUsesObservedOwnerAndKeepsFollowerOutOfDenseTP)

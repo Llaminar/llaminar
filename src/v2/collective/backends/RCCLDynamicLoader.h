@@ -33,7 +33,7 @@ namespace llaminar2
     {
         /**
          * @brief Load the exact selected RCCL dependency with isolated symbols.
-         * @param library_path Explicit diagnostic DSO path, or nullptr for the
+         * @param library_path Explicit absolute diagnostic DSO path, or nullptr for the
          *        exact RCCL_LIBRARY selected by CMake. No alternate DSO is tried.
          * @return True for the same retained path or complete required-symbol
          *         admission; false for invalid/different selection or load failure.

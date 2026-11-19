@@ -26,7 +26,7 @@ TEST(MoEOptimizationMovementEndpoint, OriginalCohortLifetimeAndLosslessExportRep
         MoEExpertOwner owner{.layer_idx=3,.expert_id=1,.tier_idx=1,.owner_participant=-1,
             .device=DeviceId::invalid(),.shard_cohort=original};
         auto endpoint=MoEOptimizationMovementEndpoint::fromOwner(owner);
-        EXPECT_TRUE(endpoint.valid());EXPECT_TRUE(endpoint.isCPUCohort());
+        EXPECT_TRUE(endpoint.valid());EXPECT_TRUE(endpoint.isCohort());
         // Public default moves leave a cohort arm with an empty shared borrow.
         auto moved_from=endpoint;
         auto moved_to=std::move(moved_from);
@@ -42,7 +42,7 @@ TEST(MoEOptimizationMovementEndpoint, OriginalCohortLifetimeAndLosslessExportRep
         moved_from=endpoint;
         EXPECT_TRUE(moved_from.valid());
         EXPECT_TRUE(moved_from==endpoint);
-        EXPECT_EQ(endpoint.target().word(),MoEOverlayRouteTarget::cpuCohort(1).word());
+        EXPECT_EQ(endpoint.target().word(),MoEOverlayRouteTarget::cohort(1).word());
         EXPECT_EQ(endpoint.cohort().original,original);
         EXPECT_THROW(endpoint.whole(),std::logic_error);
         auto alias=owner;alias.owner_participant=members.front().participant_id;alias.device=DeviceId::cpu();
