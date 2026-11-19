@@ -1,0 +1,73 @@
+# @file develop-pr-arm64.yml
+# @brief Build native Linux ARM64 Llaminar and run its model-free PR test scope.
+name: Develop PR — ARM64
+
+on:
+  pull_request:
+    branches: [develop]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: develop-pr-arm64-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  arm64:
+    name: ARM64 build and Unit + host
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+          lfs: false
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Configure and build Llaminar and the ARM64 test targets
+        shell: bash
+        run: |
+          test "$(uname -m)" = aarch64
+          evidence="$RUNNER_TEMP/llaminar-arm64-evidence"
+          mkdir -p "$evidence"
+          docker buildx build --platform linux/arm64 --progress plain --load \
+            --target arm64-pr --tag llaminar-arm64-pr:local \
+            --build-arg LLAMINAR_CPU_ISA=NEON \
+            --build-arg LLAMINAR_ENABLE_CUDA=OFF --build-arg LLAMINAR_ENABLE_ROCM=OFF \
+            . 2>&1 | tee "$evidence/build.log"
+      - name: Run ARM64 Unit and host preflight
+        shell: bash
+        run: |
+          docker run --rm --shm-size=1g --cap-add=SYS_NICE --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --mount "type=bind,source=$RUNNER_TEMP/llaminar-arm64-evidence,target=/evidence" \
+            llaminar-arm64-pr:local --output /evidence/tests
+      - name: Retain ARM64 build and test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-pr-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/llaminar-arm64-evidence/
+          retention-days: 30
+
+  runtime:
+    name: ARM64 CUDA runtime build
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+          lfs: false
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+      - name: Build and smoke-test the DGX Spark runtime image
+        shell: bash
+        run: |
+          test "$(uname -m)" = aarch64
+          bash scripts/docker/build-runtime-image.sh --variant cuda --cpu-isa NEON \
+            --load --verify --tag llaminar-arm64-runtime:pr

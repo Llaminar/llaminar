@@ -66,6 +66,7 @@ ARG LLAMINAR_SOURCE_TREE=
 # =============================================================================
 FROM ubuntu:24.04 AS gpu-sdk
 
+ARG TARGETARCH
 ARG CUTLASS_VERSION
 ARG NINJA_VERSION
 ARG LLAMINAR_BUILD_TYPE
@@ -75,6 +76,12 @@ ARG LLAMINAR_ENABLE_ROCM
 ARG LLAMINAR_BUILD_RCCL_FROM_SOURCE
 ARG RCCL_GIT_REF
 ARG RCCL_GPU_TARGETS
+
+# The pinned ROCm packages require an amd64 host architecture.
+RUN if [ "${TARGETARCH}:${LLAMINAR_ENABLE_ROCM}" = "arm64:ON" ]; then \
+        echo "The pinned ROCm SDK has no Linux ARM64 packages; select the CUDA or CPU build explicitly." >&2; \
+        exit 1; \
+    fi
 
 ENV DEBIAN_FRONTEND=noninteractive \
     CUDAARCHS=${LLAMINAR_CUDA_ARCHS} \
@@ -172,6 +179,27 @@ RUN if [ "${LLAMINAR_ENABLE_CUDA}" = "ON" ]; then \
     fi
 # RCCL final-link certification below still consumes the staged linker helper.
 # Retire the shared installer tree only after that certificate is complete.
+
+# ARM64 PRs run a small subset of native tests on the same Ubuntu/GCC/CMake
+# base as the runtime builder. Build only the targets owned by that scope.
+FROM gpu-sdk AS arm64-pr
+ARG LLAMINAR_CPU_ISA
+ENV CCACHE_MAXSIZE=1G OMPI_ALLOW_RUN_AS_ROOT=1 OMPI_ALLOW_RUN_AS_ROOT_CONFIRM=1
+RUN test "$(dpkg --print-architecture):${LLAMINAR_CPU_ISA}:${LLAMINAR_ENABLE_CUDA}:${LLAMINAR_ENABLE_ROCM}" = "arm64:NEON:OFF:OFF" \
+ && apt-get update \
+ && apt-get install -y --no-install-recommends zlib1g-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN --mount=type=cache,id=llaminar-ccache-arm64-pr,target=/root/.ccache,sharing=locked \
+    cmake -S src/v2 -B build_arm64_pr -G Ninja \
+        -DCMAKE_MAKE_PROGRAM:FILEPATH="$(command -v ninja)" \
+        -DCMAKE_BUILD_TYPE=Integration -DCMAKE_EXPORT_COMPILE_COMMANDS=ON \
+        -DLLAMINAR_CPU_ISA=NEON -DLLAMINAR_SHARED_CORE=ON \
+        -DHAVE_CUDA=OFF -DHAVE_ROCM=OFF -DUSE_ONEDNN=ON \
+ && cmake --build build_arm64_pr --parallel --target v2_arm64_pr_gate \
+ && find build_arm64_pr -path '*/CMakeFiles/*.o' -type f -delete
+ENTRYPOINT ["python3", "scripts/ci/run_develop_pr_tests.py", "--arm64", "--build-dir", "build_arm64_pr"]
 
 # Cloud CI exports this completed SDK checkpoint before starting RCCL. A
 # later dependency proof or source compilation failure cannot discard it.
@@ -369,6 +397,9 @@ RUN rm -rf /tmp/install-scripts
 ARG LLAMINAR_CPU_ISA
 ARG ONEDNN_GIT_REF=v3.11.3
 RUN set -e; \
+    # ARM64 builds oneDNN through its native CMake ISA/build receipt owner
+    # during application configuration.
+    if [ "${TARGETARCH}" = "arm64" ]; then exit 0; fi; \
     onednn_started_epoch="$(date +%s)"; \
     case "${LLAMINAR_CPU_ISA}" in \
         AVX512) ONEDNN_ISA_SUFFIX=avx512; ONEDNN_CPU_FLAGS="-msse4.1 -mavx -mavx2 -mfma -mf16c -mbmi -mbmi2 -mpopcnt -mavx512f -mavx512bw -mavx512dq -mavx512vl -mavx512vnni" ;; \
@@ -422,7 +453,7 @@ RUN set -e; \
 # invalidate it.
 COPY requirements.txt ./requirements.txt
 RUN --mount=type=cache,target=/root/.cache/pip \
-    pip install --break-system-packages -r requirements.txt
+    if [ "${TARGETARCH}" != "arm64" ]; then pip install --break-system-packages -r requirements.txt; fi
 
 FROM toolchain AS builder
 
@@ -556,6 +587,11 @@ RUN if [ "${LLAMINAR_SKIP_INTEGRATION}" != "1" ]; then \
 # only the llaminar2 target (skip test binaries). Same in-RUN cleanup.
 RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
     release_started_epoch="$(date +%s)"; \
+    arm64_cmake_args=""; \
+    if [ "${TARGETARCH}" = "arm64" ]; then \
+        export CCACHE_MAXSIZE=1G; \
+        arm64_cmake_args="-DUSE_ONNX_HEURISTIC=OFF"; \
+    fi; \
     RCCL_CMAKE_ARGS="-DLLAMINAR_BUILD_RCCL_FROM_SOURCE=OFF"; \
     if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ "${LLAMINAR_BUILD_RCCL_FROM_SOURCE}" = "ON" ]; then \
         RCCL_CMAKE_ARGS="${RCCL_CMAKE_ARGS} -DRCCL_INCLUDE_DIR=/src/external/rccl/build/include -DRCCL_LIBRARY=/usr/local/lib/librccl.so.1 -DRCCL_FINAL_ALLOCATION_REPORT=/src/rccl-allocation-evidence/final-allocation.json -DRCCL_FINAL_ALLOCATION_RECEIPT=/src/rccl-allocation-evidence/build.txt"; \
@@ -570,7 +606,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         -DLLAMINAR_SHARED_CORE=ON \
         -DLLAMINAR_BUILD_TESTS=OFF \
         -DCMAKE_CUDA_ARCHITECTURES="${LLAMINAR_CUDA_ARCHS}" \
-        ${RCCL_CMAKE_ARGS} \
+        ${RCCL_CMAKE_ARGS} ${arm64_cmake_args} \
  && echo "==> [release] cmake build --target llaminar2 (parallel)" \
  && cmake --build build_v2_release --parallel --target llaminar2 \
  && if [ "${LLAMINAR_ENABLE_ROCM}" = "ON" ] && [ ! -e external/rccl/build/librccl.so.1.0 ]; then \
@@ -687,6 +723,7 @@ RUN set -e; \
 # =============================================================================
 FROM ubuntu:24.04 AS runtime
 
+ARG TARGETARCH
 ARG LLAMINAR_BUILD_TYPE
 ARG LLAMINAR_ENABLE_CUDA=ON
 ARG LLAMINAR_ENABLE_ROCM=ON
@@ -769,13 +806,14 @@ ARG VCS_REF
 ARG VERSION=dev
 ARG LLAMINAR_SOURCE_TREE
 LABEL org.opencontainers.image.title="Llaminar" \
-      org.opencontainers.image.description="High-performance LLM inference engine (CUDA + ROCm)" \
+      org.opencontainers.image.description="Llaminar LLM inference runtime" \
       org.opencontainers.image.source="https://github.com/llaminar/llaminar" \
       org.opencontainers.image.licenses="AGPL-3.0-only" \
       org.opencontainers.image.version="${VERSION}" \
       org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.created="${BUILD_DATE}" \
       org.llaminar.image_role="runtime" \
+      org.llaminar.architecture="${TARGETARCH}" \
       org.llaminar.cpu_isa="${LLAMINAR_CPU_ISA}" \
       org.llaminar.source_tree="${LLAMINAR_SOURCE_TREE}" \
       org.llaminar.build_type="${LLAMINAR_BUILD_TYPE}" \

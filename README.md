@@ -1453,15 +1453,30 @@ scripts/docker/build-runtime-image.sh --cpu-isa AVX512 --tag llaminar:local
 Use `--cpu-isa AVX2` for an AVX2 image. A local image is not CI-certified merely
 because it built successfully.
 
-### AArch64 portability checks (not inference)
+### Linux ARM64 runtime
 
-The native ARM port is incomplete: `llaminar2` does **not** yet run on macOS.
+On DGX Spark, use the native ARM64 CPU and CUDA image. The runtime includes
+CUDA code for GB10 (`sm_121`) and baseline NEON CPU kernels.
+
+```bash
+docker pull ghcr.io/llaminar/llaminar:develop-arm64
+docker run --rm --gpus all ghcr.io/llaminar/llaminar:develop-arm64 --help
+```
+
+To build the same runtime locally on an ARM64 host:
+
+```bash
+scripts/docker/build-runtime-image.sh --variant cuda --cpu-isa NEON --tag llaminar:spark
+```
+
+### AArch64 portability checks
+
+The native macOS inference runtime is incomplete.
 The compiler envelope selects NEON on AArch64 without x86 flags. Native vector,
 SwiGLU, RoPE and anchored AQ8 key primitives have focused numerical tests;
 grouped prepared projections cover the quantized source catalog. Complete
 factory/arena wiring, other attention/kernel families and the Linux-specific
-memory, topology and MPI lifecycle still need porting.
-Published images remain x86-64 only.
+memory, topology and MPI lifecycle still need porting to macOS.
 
 To build the focused device-free checks on an Apple Silicon Mac with Xcode
 Command Line Tools, CMake/CTest 4 or newer, Ninja, Python 3, GoogleTest, OpenMP,

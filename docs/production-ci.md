@@ -33,6 +33,24 @@ gate skip drafts before allocating runners. Marking a draft ready for review
 triggers the required checks through `ready_for_review`. The master PR jobs,
 branch-policy check and PR-triggered Copilot setup use the same draft policy.
 GitHub can still show a skipped workflow entry for a draft event; no PR job runs.
+
+The `ARM64 build and Unit + host` check runs on GitHub's standard
+`ubuntu-24.04-arm` runner for ready PRs into `develop`. It builds the
+`arm64-pr` Docker target with baseline NEON, pinned oneDNN and the Integration
+configuration. CMake derives the `ARM64PR` scope from the ARM and NEON
+registrations in Unit and production preflight. The shared PR driver runs that
+Unit subset and the corresponding canonical host subset in the CPU-only
+container, retaining both JUnit logs. The companion `ARM64 CUDA runtime build`
+check builds the Release container for GB10 and verifies application startup.
+Both run on [GitHub's standard ARM64 runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+
+The `CI` workflow runs the same runtime build on pushes to `develop` and
+publishes `develop-arm64` and `sha-<commit>-arm64` after the startup smoke
+test. The ARM64 image contains CPU kernels and CUDA code for `sm_121`.
+It shares the canonical CUDA/NCCL installer and serves on DGX Spark with
+the NVIDIA Container Toolkit. GPU execution requires a separate hardware
+qualification. The pinned ROCm SDK remains on the x86-64 images.
+
 Separate self-hosted runners build AVX2 and AVX512 full-backend
 `model-free` test images in parallel. Each image executes complete device-free
 `Unit` plus the

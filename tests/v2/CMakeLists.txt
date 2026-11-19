@@ -3150,7 +3150,7 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_OpenMPForkEvidence
 add_v2_test(V2_Integration_OpenMPCapacityOrderedCorePlaces
     COMMAND $<TARGET_FILE:v2_unit_mpi_bootstrap>
         --gtest_filter=Test__MPIBootstrap.CorePlacesFollowCapacityWithinTheRankMask:Test__MPIBootstrap.ClusterWorkersOrderFastCoresFirst
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CPU;Bootstrap;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MPI;CPU;ARM;Bootstrap;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
 # Original native launch command owner: exact observed NUMA mapping, no GPU work.
@@ -3175,7 +3175,7 @@ add_executable(v2_integration_cpu_startup_affinity
 target_link_libraries(v2_integration_cpu_startup_affinity llaminar2_core)
 add_v2_test(V2_Integration_CPUStartupAffinity
     COMMAND $<TARGET_FILE:v2_integration_cpu_startup_affinity>
-    LABELS "V2;Integration;CPU;MPI;Bootstrap;Regression"
+    LABELS "V2;Integration;CPU;ARM;MPI;Bootstrap;Regression"
     MPI_PROCS 1
     NO_MPI NO_MODELS
     TIMEOUT 60
@@ -3187,7 +3187,7 @@ if(V2_TEST_HOST_PHYSICAL_CORES GREATER_EQUAL 2)
     add_v2_test(V2_Integration_CPUClusterPermanentMasterPlacement
         COMMAND $<TARGET_FILE:v2_integration_cpu_startup_affinity>
             --cluster-master-placement-contract
-        LABELS "V2;Integration;ProductionTestPreflight;CPU;Bootstrap;Contract;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CPU;ARM;Bootstrap;Contract;Regression"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
         ENVIRONMENT "OMP_PLACES=cores" "OMP_PROC_BIND=close" "OMP_DYNAMIC=false"
             "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
@@ -3262,7 +3262,7 @@ add_v2_test(V2_Integration_MPIBootstrapCallerAffinity
     COMMAND ${CMAKE_COMMAND} -E env "OMP_PROC_BIND=false" "OMP_DYNAMIC=false"
         "KMP_AFFINITY=disabled"
         $<TARGET_FILE:v2_integration_cluster_inventory_bootstrap> --caller-affinity
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MPI;Bootstrap;OpenMP;Lifecycle;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;ARM;MPI;Bootstrap;OpenMP;Lifecycle;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 
 add_v2_test(V2_Integration_MPIBootstrapOpenMPPlacement
@@ -5330,6 +5330,7 @@ add_test(NAME V2_Integration_DevelopPRGateContract
             ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_develop_image_gate.py
             DevelopImageGateTests.test_develop_pr_runs_both_isas_on_separate_dedicated_runners
             DevelopImageGateTests.test_pr_executes_in_exact_test_image_without_devices_or_models
+            DevelopImageGateTests.test_arm64_pr_driver_runs_only_scoped_unit_and_host_tests
             DevelopImageGateTests.test_develop_auto_merge_waits_for_protected_pr_gate
 )
 set_tests_properties(V2_Integration_DevelopPRGateContract PROPERTIES
@@ -8957,11 +8958,11 @@ add_executable(v2_test_host_page_size unit/utils/Test__HostPageSize.cpp)
 target_link_libraries(v2_test_host_page_size llaminar2_core GTest::gtest GTest::gtest_main)
 add_v2_test(V2_Unit_HostPageSize
     COMMAND $<TARGET_FILE:v2_test_host_page_size>
-    LABELS "V2;Unit;Memory;NUMA;DeviceFree;Regression"
+    LABELS "V2;Unit;ARM;Memory;NUMA;DeviceFree;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_HostPageSizeOwners
     COMMAND $<TARGET_FILE:v2_test_host_page_size>
-    LABELS "V2;Integration;ProductionTestPreflight;Memory;NUMA;DeviceFree;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;ARM;Memory;NUMA;DeviceFree;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 # Procfs NUMA detection parses node cpulists exactly over every node; the old
 # substring match misplaced CPUs ("10-19" vs CPU 1) and stopped at node 7.
@@ -8987,7 +8988,7 @@ add_test(NAME V2_Integration_HostPageLiteralPolicy
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_host_page_literals.py
             --repo-root ${CMAKE_SOURCE_DIR}/../..)
 set_tests_properties(V2_Integration_HostPageLiteralPolicy PROPERTIES
-    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;SourcePolicy;Memory;Regression"
+    LABELS "V2;Integration;ProductionTestPreflight;ARM;DeviceFree;SourcePolicy;Memory;Regression"
     TIMEOUT 30)
 
 # This test certifies physical page ownership, rather than a policy request.

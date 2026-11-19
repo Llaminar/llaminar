@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Device-free contracts for model-free develop PR and image-publication gates.
 
-The PR workflow consumes the same image driver in independent AVX512 and AVX2
-jobs without publication. Its actual matrix command is parsed and exercised
-here so ISA coverage, model exclusion and read-only cache access stay explicit.
+The x86 PR workflow consumes the shared image driver in independent ISA jobs.
+The native ARM64 PR workflow uses the same CTest execution and evidence
+contracts with its own label-scoped inventory.
 """
 from __future__ import annotations
 
@@ -88,6 +88,37 @@ class DevelopImageGateTests(unittest.TestCase):
                 self.assertEqual(report["lanes"]["unit"]["tests"], ["V2_Unit_Contract"])
                 if unit_outcome == 0:
                     self.assertEqual(report["lanes"]["host"]["tests"], ["V2_Integration_HostContract"])
+
+    def test_arm64_pr_driver_runs_only_scoped_unit_and_host_tests(self):
+        """Execute real CTest with unrelated cases around the selected indices."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = root / "build"
+            build.mkdir()
+            registrations = []
+            for name, labels, outcome in (
+                ("V2_Unit_Unrelated", "Unit", 99),
+                ("V2_Integration_Unrelated", "Integration;ProductionTestPreflight", 99),
+                ("V2_Unit_ARM", "Unit;ARM64PR", 0),
+                ("V2_Integration_ARM", "Integration;ProductionTestPreflight;ARM64PR", 0),
+                ("V2_Integration_Model", "Integration;FullModel", 99),
+            ):
+                registrations += [
+                    f'add_test({name} "{sys.executable}" "-c" "raise SystemExit({outcome})")',
+                    f'set_tests_properties({name} PROPERTIES LABELS "{labels}" TIMEOUT 30)',
+                ]
+            (build / "CTestTestfile.cmake").write_text("\n".join(registrations) + "\n")
+            output = root / "results"
+            with patch.object(pr_runner.platform, "system", return_value="Linux"), \
+                 patch.object(pr_runner.platform, "machine", return_value="aarch64"):
+                self.assertEqual(pr_runner.main([
+                    "--arm64", "--build-dir", str(build), "--output", str(output),
+                ]), 0)
+            report = json.loads((output / "pr-tests.json").read_text())
+            self.assertEqual(report["scope"], "arm64-unit-and-host")
+            self.assertTrue(report["complete"])
+            self.assertEqual(report["lanes"]["unit"]["tests"], ["V2_Unit_ARM"])
+            self.assertEqual(report["lanes"]["host"]["tests"], ["V2_Integration_ARM"])
 
     def test_pr_driver_rejects_an_empty_host_lane(self):
         """A GPU-only preflight inventory must not become a green host gate."""

@@ -74,13 +74,13 @@ endforeach()
 v2_add_core_free_test(V2_Unit_CPUHostTopology
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_host_topology.py"
-    LABELS V2 Unit CPU DeviceFree Topology Build)
+    LABELS V2 Unit CPU ARM DeviceFree Topology Build)
 v2_add_core_free_test(V2_Integration_CPUHybridTopologyAdmission
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_host_topology.py"
         CPUHostTopologyTests.test_hybrid_single_package_has_twenty_distinct_sibling_groups
         CPUHostTopologyTests.test_actual_cmake_gate_ignores_multiline_presentation_geometry
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Topology Build Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Topology Build Regression)
 v2_add_core_free_test(V2_Integration_CPUHostTopologyRejectUnknownGeometry
     COMMAND "${Python3_EXECUTABLE}" -B
         "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/cmake/test_cpu_host_topology.py"
@@ -476,30 +476,30 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     target_link_libraries(v2_test_neon_attention_math PRIVATE GTest::gtest_main OpenMP::OpenMP_CXX)
     v2_add_core_free_test(V2_Unit_NEONAttentionMath
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math>
-        LABELS V2 Unit CPU DeviceFree Attention ByteExact)
+        LABELS V2 Unit CPU NEON DeviceFree Attention ByteExact)
     v2_add_core_free_test(V2_Integration_NEONAttentionMath
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math>
-        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention ByteExact)
+        LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention ByteExact)
     v2_add_core_free_test(V2_Integration_NEONAttentionFloatingRows
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*FloatingOriginalCacheRowsRetainSerialBytes
-        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention ByteExact)
+        LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention ByteExact)
     # The row programs that trust admitted geometry are private to the owning
     # kernel (compile-time witness) and the integer width guard is fatal.
     v2_add_core_free_test(V2_Integration_NEONAttentionAdmittedRowsBoundary
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*PrivateIntegerRowsRejectUnprovenWidths
-        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention Regression)
+        LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention Regression)
     # Int32 accumulation is exact only under the typed Q16 reduction bound:
     # equality with int64 sums, closed-form worst cases and fatal rejection.
     v2_add_core_free_test(V2_Integration_NEONAttentionQ16Int32Bound
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math>
             --gtest_filter=*IntegerOriginalRowsAccumulateExactlyUnderTheTypedBound:*Q16BoundWorstCaseWitnessesStayExact:*Q16BoundRejectsUnprovenReductions:*Q16BoundRejectsInvalidTailCodesBeforeTailArithmetic
-        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention ByteExact Regression)
+        LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention ByteExact Regression)
     v2_add_core_free_test(V2_Integration_NEONAttentionQueryQuantization
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*OriginalQueryQuantizationProgram
-        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention ByteExact)
+        LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention ByteExact)
     v2_add_core_free_test(V2_Integration_NEONAttentionStorageAdmission
         COMMAND $<TARGET_FILE:v2_test_neon_attention_math> --gtest_filter=*OriginalStorageAndDomainAdmission:*NonfiniteWeightIsFatalBeforeAnySharedNumeratorWrite
-        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention Regression)
+        LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Attention Regression)
 endif()
 add_executable(v2_unit_cpu_isa_profile
     "${V2_CPU_ARCHITECTURE_ROOT}/tests/v2/unit/utils/Test__CPUISAProfile.cpp")
@@ -597,16 +597,19 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
         DEPENDS "${V2_CPU_TILE_REGISTER_PROOF}" ${V2_CPU_TILE_REGISTER_ARTIFACTS})
     add_dependencies(v2_unit_cpu_isa_profile v2_cpu_native_tile_register_proof)
     foreach(scope IN ITEMS Unit Integration)
-        set(labels V2 ${scope} CPU DeviceFree ISA Build Regression)
+        set(labels V2 ${scope} CPU ARM DeviceFree ISA Build Regression)
         if(scope STREQUAL "Integration")
             list(APPEND labels ProductionTestPreflight)
         endif()
         v2_add_core_free_test(V2_${scope}_CPUNativeNEONTileRegisters
             COMMAND "${Python3_EXECUTABLE}" "${V2_CPU_TILE_REGISTER_CHECKER}" verify ${V2_CPU_TILE_REGISTER_ARGS}
             LABELS ${labels})
+        set_property(GLOBAL APPEND PROPERTY
+            V2_TEST_BUILD_TARGETS_V2_${scope}_CPUNativeNEONTileRegisters
+            v2_cpu_native_tile_register_proof)
     endforeach()
     foreach(scope IN ITEMS Unit Integration)
-        set(labels V2 ${scope} CPU DeviceFree ISA Build Regression)
+        set(labels V2 ${scope} CPU ARM DeviceFree ISA Build Regression)
         if(scope STREQUAL "Integration")
             list(APPEND labels ProductionTestPreflight)
         endif()
@@ -618,15 +621,17 @@ if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
                 "--mode=${LLAMINAR_CPU_ISA_UPPER}" "--signature=${V2_CPU_CODEGEN_SIGNATURE}"
                 "--proof=${V2_CPU_CODEGEN_PROOF}"
             LABELS ${labels})
+        set_property(GLOBAL APPEND PROPERTY
+            V2_TEST_BUILD_TARGETS_V2_${scope}_CPUCodegenEnvelope v2_cpu_codegen_envelope_proof)
     endforeach()
 endif()
 
 v2_add_core_free_test(V2_Unit_CPUISAProfile
     COMMAND $<TARGET_FILE:v2_unit_cpu_isa_profile>
-    LABELS V2 Unit CPU DeviceFree ISA)
+    LABELS V2 Unit CPU ARM DeviceFree ISA)
 v2_add_core_free_test(V2_Integration_CPUISAProfile
     COMMAND $<TARGET_FILE:v2_unit_cpu_isa_profile>
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree ISA Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree ISA Regression)
 
 v2_add_core_free_test(V2_Integration_CPUCacheObservationNoInventedCapacity
     COMMAND $<TARGET_FILE:v2_unit_cpu_isa_profile> --gtest_filter=CPUCacheObservation.*
@@ -681,13 +686,13 @@ v2_add_core_free_test(V2_Integration_CPUSoftmaxEmptyCompletion
 if(LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$")
     v2_add_core_free_test(V2_Integration_NEONSoftmaxOrderedRows
         COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=NEONSoftmax.OrderedOriginalRowsAllStorage
-        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax ByteExact)
+        LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Softmax ByteExact)
     v2_add_core_free_test(V2_Integration_NEONSoftmaxExpAccuracy
         COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=NEONSoftmax.ExponentialAccuracyAndSubnormalProgram
-        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax NumericalContract)
+        LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Softmax NumericalContract)
     v2_add_core_free_test(V2_Integration_NEONSoftmaxNumericAdmission
         COMMAND $<TARGET_FILE:v2_test_cpu_softmax> --gtest_filter=NEONSoftmax.ActiveNumericFailuresRejectBeforeMutation
-        LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Softmax Regression)
+        LABELS V2 Integration ProductionTestPreflight CPU NEON DeviceFree Softmax Regression)
 endif()
 
 add_executable(v2_test_cpu_tq_rotation
@@ -1073,7 +1078,7 @@ v2_add_core_free_test(V2_Integration_CPUFA2NativeISAAdmission
 v2_add_core_free_test(V2_Integration_CPUFA2ARMCanonicalSpanPolicy
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
         --gtest_filter=*ARMCanonicalSpanDoesNotBorrowX86CacheEvidence
-    LABELS V2 Integration ProductionTestPreflight CPU DeviceFree Attention ByteExact Regression)
+    LABELS V2 Integration ProductionTestPreflight CPU ARM DeviceFree Attention ByteExact Regression)
 v2_add_core_free_test(V2_Integration_CPUFA2CheckedGeometry
     COMMAND $<TARGET_FILE:v2_test_cpu_flash_attention_launch_policy>
         --gtest_filter=*WorkingSetOverflowRejectsWithoutNarrowing:*ParallelGeometryBoundsPrecedeMultiplication

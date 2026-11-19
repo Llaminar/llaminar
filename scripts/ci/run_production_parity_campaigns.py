@@ -715,6 +715,8 @@ def _as_string_list(value: Any) -> list[str]:
 
 def discover_production_parity_unit_tests(
     build_dir: Path,
+    *,
+    scope_label: str | None = None,
 ) -> tuple[str, ...]:
     """Discover and validate the complete device-free unit prerequisite.
 
@@ -723,6 +725,7 @@ def discover_production_parity_unit_tests(
     a ``V2_Unit_*`` entry without the Unit label, or a Unit-labelled entry
     outside the canonical namespace.  CMake's ``v2_unit_gate`` owns executable
     construction; Python never copies its target list.
+    A scope label restricts validation to a CMake-declared subset.
     """
 
     completed = subprocess.run(
@@ -748,6 +751,8 @@ def discover_production_parity_unit_tests(
         name = str(test.get("name", ""))
         properties = _property_map(test)
         labels = _as_string_list(properties.get("LABELS", []))
+        if scope_label is not None and scope_label not in labels:
+            continue
         has_unit_name = name.startswith(PRODUCTION_PARITY_UNIT_PREFIX)
         has_unit_label = PRODUCTION_PARITY_UNIT_LABEL in labels
         if has_unit_name != has_unit_label:
@@ -933,6 +938,8 @@ def _preflight_execution_lane(
 
 def discover_production_test_preflight_registrations(
     build_dir: Path,
+    *,
+    scope_label: str | None = None,
 ) -> tuple[PreflightRegistration, ...]:
     """Discover and validate the model-free integration preflight from CTest.
 
@@ -941,6 +948,7 @@ def discover_production_test_preflight_registrations(
     required file, and has a short per-test timeout before it executes the
     label. This prevents a future registration edit from turning preflight into
     another model campaign or an unbounded wait.
+    A scope label restricts validation without changing native CTest indices.
     """
 
     completed = subprocess.run(
@@ -969,6 +977,8 @@ def discover_production_test_preflight_registrations(
         properties = _property_map(test)
         labels = frozenset(_as_string_list(properties.get("LABELS", [])))
         if PRODUCTION_TEST_PREFLIGHT_LABEL not in labels:
+            continue
+        if scope_label is not None and scope_label not in labels:
             continue
         if not name.startswith("V2_Integration_") or "Integration" not in labels:
             raise RuntimeError(
