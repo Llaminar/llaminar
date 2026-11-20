@@ -6306,23 +6306,24 @@ class InfrastructureTests(unittest.TestCase):
         self.assertNotIn('--cuda-driver-required', harness)
         self.assertIn('if docker_args_need_cuda "${args_ref[@]}"; then', harness)
 
-    def test_develop_workflow_has_one_build_only_driver_and_no_certification_axes(self):
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+    def test_develop_workflow_has_only_the_isa_build_axis_and_no_certification_drivers(self):
+        workflow_dir = ROOT / ".github/workflows"
+        workflow = "\n".join((workflow_dir / name).read_text() for name in ("ci.yml", "develop-image-isa.yml"))
         self.assertIn("scripts/ci/run_develop_image_gate.py", workflow)
         self.assertNotIn("scripts/ci/run_production_pipeline.py", workflow)
         self.assertNotIn("run_benchmark_check.sh", workflow)
         self.assertNotIn("run_model_parity", workflow)
         self.assertNotIn("azure", workflow.lower())
-        self.assertNotIn("matrix:", workflow)
+        self.assertIn("cpu_isa: [AVX512, AVX2]", workflow)
         self.assertIn("branches: [develop]", workflow)
-        self.assertIn("--publish", workflow)
+        self.assertIn("--publish-staged", workflow)
         self.assertIn("submodules: false", workflow)
         self.assertIn("lfs: false", workflow)
         self.assertIn("actions/upload-artifact@v4", workflow)
         self.assertIn("parity-results/develop-image-gate/develop-image-gate.json", workflow)
         self.assertIn("parity-results/develop-image-gate/**/build-timeline.jsonl", workflow)
         self.assertIn("--build-only", workflow)
-        self.assertIn("parity-results/develop-image-gate/**/publish.log", workflow)
+        self.assertIn("parity-results/develop-image-gate/publish.log", workflow)
         self.assertNotIn("parity-results/develop-image-gate/**/prerequisites/**", workflow)
         self.assertNotIn("path: parity-results/develop-image-gate\n", workflow)
 

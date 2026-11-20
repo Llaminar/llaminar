@@ -6,6 +6,7 @@
 This intentionally small gate is distinct from the full production
 certification pipeline. The develop push selects build-only publication of
 AVX512 and AVX2 full-backend runtimes without compiling or running test images.
+Hosted jobs stage one verified image each. A final job publishes both by digest.
 The separate PR gate runs the complete CMake-owned Unit inventory and the
 canonical host preflight lane inside a device-free container. AVX2 PRs also
 require every hardware-qualified production preflight test in a separate GPU container.
@@ -198,6 +199,71 @@ def publish_runtime(images: dict, isa: str, base: str, revision: str,
     return {"tag": tag, "ref_tag": pinned, "image": runtime["id"]}
 
 
+def stage_runtime(runtime: str, isa: str, base: str, directory: Path) -> str:
+    """Upload one admitted image to a rolling scratch tag and capture its manifest digest."""
+    tag = runtime_tag(f"{base}-staging", isa)
+    run(["docker", "tag", runtime, tag], directory / "stage.log")
+    run(["docker", "push", tag], directory / "stage.log")
+    manifest = json.loads(subprocess.check_output(
+        ["docker", "buildx", "imagetools", "inspect", "--format", "{{json .Manifest.Digest}}", tag],
+        text=True))
+    if not isinstance(manifest, str) or not re.fullmatch(r"sha256:[0-9a-f]{64}", manifest):
+        raise ValueError("develop staging tag has no immutable manifest digest")
+    if remote_image_id(f"{base.rsplit(':', 1)[0]}@{manifest}") != runtime:
+        raise ValueError("staged manifest does not contain the admitted runtime")
+    return manifest
+
+
+def publish_staged_pair(staging: Path, source: dict, base: str, directory: Path) -> dict:
+    """Admit both immutable registry images before writing any public develop alias."""
+    images = {}
+    repository = base.rsplit(":", 1)[0]
+    log = directory / "publish.log"
+    for isa in SHIPPING_ISAS:
+        lane = json.loads((staging / f"develop-stage-{isa}" / "develop-image-gate.json").read_text())
+        variants = lane.get("variants", {})
+        if (lane.get("schema") != 1 or lane.get("source") != source or lane.get("image") != base
+                or lane.get("validation") != "build-only" or lane.get("complete") is not True
+                or lane.get("published") is not False or set(variants) != {isa}):
+            raise ValueError(f"invalid develop staging receipt for {isa}")
+        variant = variants[isa]
+        runtime, manifest = (variant.get(key) for key in ("runtime_image", "staged_manifest"))
+        if not all(isinstance(value, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", value)
+                   for value in (runtime, manifest)):
+            raise ValueError(f"invalid develop staging digest for {isa}")
+        ref = f"{repository}@{manifest}"
+        if remote_image_id(ref) != runtime:
+            raise ValueError(f"staged manifest does not contain the admitted {isa} runtime")
+        image = json.loads(subprocess.check_output(
+            ["docker", "buildx", "imagetools", "inspect", "--format", "{{json .Image}}", ref],
+            text=True))
+        require_image({"labels": image.get("config", {}).get("Labels")}, source, isa, ImageRole.RUNTIME)
+        pinned = revision_tag(base, isa, source["revision"])
+        present = remote_image_id(pinned)
+        if present is not None and present != runtime:
+            raise ValueError("source-pinned develop tag already names different image bytes")
+        images[isa] = (ref, runtime, pinned, present)
+    if source_identity() != source:
+        raise ValueError("source changed before develop image publication")
+
+    # Keep the original single-platform manifest when copying a registry tag.
+    def copy(ref: str, alias: str, runtime: str) -> None:
+        run(["docker", "buildx", "imagetools", "create", "--prefer-index=false", "-t", alias, ref], log)
+        if remote_image_id(alias) != runtime:
+            raise ValueError(f"develop publication tag {alias} names unexpected image bytes")
+
+    for ref, runtime, pinned, present in images.values():
+        if present is None:
+            copy(ref, pinned, runtime)
+    result = {}
+    for isa, (ref, runtime, pinned, _) in images.items():
+        tag = runtime_tag(base, isa)
+        copy(ref, tag, runtime)
+        result[isa] = {"runtime_image": runtime,
+                       "publication": {"tag": tag, "ref_tag": pinned, "image": runtime}}
+    return result
+
+
 def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     """Parse only the small explicit surface supported by the develop gate."""
     parser = argparse.ArgumentParser(description=__doc__)
@@ -206,8 +272,13 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
     parser.add_argument("--image", help="AVX512 develop runtime tag; AVX2 appends -avx2")
     parser.add_argument("--build-only", action="store_true",
                         help="build runtime images without compiling or executing Unit/preflight tests")
-    parser.add_argument("--publish", action="store_true",
-                        help="push both runtime images after both selected ISA transactions succeed")
+    publication = parser.add_mutually_exclusive_group()
+    publication.add_argument("--publish", action="store_true",
+                             help="push both runtime images after both local builds succeed")
+    publication.add_argument("--stage", action="store_true",
+                             help="push one runtime image to its staging tag for CI publication")
+    publication.add_argument("--publish-staged", type=Path,
+                             help="publish a pair from the two CI staging receipt directories")
     parser.add_argument("--cpu-isa", choices=SHIPPING_ISAS, action="append", dest="cpu_isas",
                         help="explicit local diagnostic ISA subset; publication requires both")
     parser.add_argument("--pr-gpus", type=PRGPUCoverage,
@@ -227,8 +298,12 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
         parser.error("--publish requires --image and both AVX512 and AVX2 gates")
     if args.publish and not args.build_only:
         parser.error("--publish requires --build-only; PR validation never publishes")
-    if args.build_only and args.pr_gpus is not PRGPUCoverage.NONE:
-        parser.error("--pr-gpus cannot be combined with --build-only")
+    if args.stage and (not args.build_only or not args.image or len(args.cpu_isas) != 1):
+        parser.error("--stage requires --build-only, --image and one explicit --cpu-isa")
+    if args.publish_staged and (args.build_only or not args.image or set(args.cpu_isas) != set(SHIPPING_ISAS)):
+        parser.error("--publish-staged requires --image and both ISA receipts without a build")
+    if (args.build_only or args.publish_staged) and args.pr_gpus is not PRGPUCoverage.NONE:
+        parser.error("--pr-gpus requires a PR validation run")
     args.output = args.output.resolve()
     return args
 
@@ -236,7 +311,7 @@ def parse_arguments(argv: list[str] | None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     """Finish both admitted ISA transactions before publishing either runtime."""
     args = parse_arguments(argv)
-    if not args.build_only:
+    if not args.build_only and not args.publish_staged:
         for isa in args.cpu_isas:
             require_host_cpu_isa(isa)
     if args.output.exists():
@@ -245,8 +320,13 @@ def main(argv: list[str] | None = None) -> int:
     source = source_identity()
     receipt = {"schema": 1, "source": source, "complete": False, "published": False,
                "variants": {}, "image": args.image,
-               "validation": "build-only" if args.build_only else args.pr_gpus.validation}
+               "validation": "build-only" if args.build_only or args.publish_staged else args.pr_gpus.validation}
     write_json(args.output / "develop-image-gate.json", receipt)
+    if args.publish_staged:
+        receipt["variants"] = publish_staged_pair(args.publish_staged, source, args.image, args.output)
+        receipt["complete"] = receipt["published"] = True
+        write_json(args.output / "develop-image-gate.json", receipt)
+        return 0
     for isa in args.cpu_isas:
         if source_identity() != source:
             raise ValueError("source changed after develop image gate admission")
@@ -259,6 +339,8 @@ def main(argv: list[str] | None = None) -> int:
                            test_inventory=TestRunnerInventory.UNIT_ONLY)
             require_image(images[ImageRole.RUNTIME.value], source, isa, ImageRole.RUNTIME)
             variant = {"runtime_image": images[ImageRole.RUNTIME.value]["id"]}
+            if args.stage:
+                variant["staged_manifest"] = stage_runtime(variant["runtime_image"], isa, args.image, directory)
         else:
             images = build(build_args, source, directory,
                            roles=(ImageRole.TEST_RUNNER,),
