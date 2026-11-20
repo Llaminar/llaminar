@@ -49,11 +49,16 @@ foreach(V2_NATIVE_COMPLETED_BACKEND IN ITEMS nccl rccl)
         else()
             set(V2_NATIVE_COMPLETED_LIBRARY "${RCCL_LIBRARY}")
             set(V2_NATIVE_COMPLETED_RECEIPT "${RCCL_PROTOCOL_BUILD_DIR}/.llaminar-rccl-commit")
-            file(STRINGS "${RCCL_PROTOCOL_BUILD_DIR}/CMakeCache.txt" V2_NATIVE_COMPLETED_SOURCE_ENTRY
+            set(V2_NATIVE_COMPLETED_BUILD_CACHE "${RCCL_PROTOCOL_BUILD_DIR}/CMakeCache.txt")
+            if(NOT EXISTS "${V2_NATIVE_COMPLETED_BUILD_CACHE}")
+                message(FATAL_ERROR "Completed RCCL proof requires its actual source-build authority")
+            endif()
+            file(STRINGS "${V2_NATIVE_COMPLETED_BUILD_CACHE}" V2_NATIVE_COMPLETED_SOURCE_ENTRY
                 REGEX "^CMAKE_HOME_DIRECTORY:INTERNAL=")
             string(REGEX REPLACE "^CMAKE_HOME_DIRECTORY:INTERNAL=" ""
                 V2_NATIVE_COMPLETED_SOURCE "${V2_NATIVE_COMPLETED_SOURCE_ENTRY}")
-            if(NOT IS_DIRECTORY "${V2_NATIVE_COMPLETED_SOURCE}/src")
+            if(NOT IS_ABSOLUTE "${V2_NATIVE_COMPLETED_SOURCE}" OR
+               NOT IS_DIRECTORY "${V2_NATIVE_COMPLETED_SOURCE}/src")
                 message(FATAL_ERROR "Completed RCCL proof requires its actual source-build authority")
             endif()
             list(JOIN CMAKE_HIP_ARCHITECTURES "," V2_NATIVE_COMPLETED_ARCHITECTURE)
@@ -66,7 +71,7 @@ foreach(V2_NATIVE_COMPLETED_BACKEND IN ITEMS nccl rccl)
                 DEPENDS ${V2_NATIVE_COMPLETED_INPUTS}
                     "${REPO_ROOT}/scripts/docker/patches/rccl-device-completed-broadcast.patch"
                     "${REPO_ROOT}/scripts/docker/patches/rccl-user-p2p-override.patch"
-                    "${RCCL_PROTOCOL_BUILD_DIR}/CMakeCache.txt" "${V2_NATIVE_COMPLETED_RECEIPT}"
+                    "${V2_NATIVE_COMPLETED_BUILD_CACHE}" "${V2_NATIVE_COMPLETED_RECEIPT}"
                     "${V2_NATIVE_COMPLETED_SOURCE}/src/collectives.cc"
                     "${V2_NATIVE_COMPLETED_SOURCE}/src/enqueue.cc"
                     "${V2_NATIVE_COMPLETED_SOURCE}/src/init.cc"

@@ -79,6 +79,33 @@ class ToolchainCacheTests(unittest.TestCase):
                  "-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture")
         return self.git("rev-parse", "HEAD^{tree}").decode().strip()
 
+    def test_split_jobs_resolve_the_existing_toolchain_cache_keys(self):
+        """Run the workflow shell steps against a committed dependency fixture for both ISAs."""
+        workflow = ROOT / ".github/workflows/develop-image-isa.yml"
+        jobs = yaml.safe_load(workflow.read_text())["jobs"]
+        commands = [next(step["run"] for step in job["steps"] if step.get("id") == "toolchain-cache")
+                    for job in jobs.values()]
+        self.assertEqual(commands[0], commands[1])
+        script = Path(cache.__file__).read_text()
+        (self.repo / "scripts/ci/toolchain_cache.py").write_text(script)
+        self.commit()
+        for isa in cache.ISAS:
+            with self.subTest(isa=isa):
+                runner = self.root / isa
+                runner.mkdir()
+                outputs = runner / "workflow-outputs"
+                env = dict(os.environ, RUNNER_TEMP=str(runner), TMPDIR=str(runner),
+                           GITHUB_OUTPUT=str(outputs), CPU_ISA=isa)
+                ran = subprocess.run(["bash", "-c", commands[0]], env=env, cwd=self.repo,
+                                     text=True, capture_output=True, timeout=10)
+                self.assertEqual(ran.returncode, 0, ran.stderr)
+                original_outputs = runner / "original-outputs"
+                cache.prepare(runner / "llaminar-toolchains", isa, original_outputs)
+                expected = dict(line.split("=", 1) for line in original_outputs.read_text().splitlines())
+                self.assertEqual(dict(line.split("=", 1) for line in outputs.read_text().splitlines()), {
+                    "key": expected[f"key_{isa.lower()}"], "path": expected[f"path_{isa.lower()}"],
+                })
+
     def test_sdk_cache_upload_failure_is_independent_of_toolchain_build_status(self):
         """Only publishing intermediate layers can fail independently of the build."""
         action = yaml.safe_load((ROOT / ".github/actions/cache-develop-toolchain/action.yml").read_text())

@@ -141,16 +141,18 @@ when the user explicitly authorizes a manual merge. Native auto-merge must still
 wait for the required checks; an overridden check is not passing evidence.
 Never grant the general GitHub Actions app a ruleset bypass.
 
-The `develop` push workflow runs `run_develop_image_gate.py --build-only --stage`
-on two standard GitHub-hosted Ubuntu 24.04 runners, one for each x86 ISA.
-Each restores its OCI toolchain and imports and exports its GHCR BuildKit
-layer cache. A separate `--publish-staged` job authenticates both full-backend
-Release images before writing the branch and source-SHA tags. The native ARM64
-job imports and exports the `build-cache-develop-neon` GHCR cache, builds
-and smoke-tests the Release CUDA+CPU image, and publishes `develop-arm64`
-and `sha-<commit>-arm64`. Publication omits Integration
-compilation and grants no release certificate. A new develop merge cancels
-superseded builds. Complete Unit and
+The `develop` push workflow gives each x86 ISA separate toolchain preparation and
+Release build jobs on standard GitHub-hosted Ubuntu 24.04 runners. Each job has
+a four-hour limit. The Release job verifies its prepared OCI cache entry, then
+runs `run_develop_image_gate.py --build-only --stage` using its GHCR BuildKit layer cache.
+The jobs compile the full-backend AVX512 and AVX2 Release runtimes. A separate
+`--publish-staged` job authenticates both staging receipts and registry manifests
+before writing the branch and source-SHA tags. The native ARM64 job imports and
+exports the `build-cache-develop-neon` GHCR cache, builds and smoke-tests the
+Release CUDA+CPU image, and publishes `develop-arm64` and `sha-<commit>-arm64`.
+Publication omits Integration compilation and grants no release certificate.
+Publication has one concurrency group and
+cancels a superseded build when a new develop merge arrives. Complete Unit and
 production preflight remain mandatory in the explicit production pipeline
 through `run_production_prerequisites.py`. Production hardware has its own queue.
 The release path is **develop → rc/* → master**. Only explicit user direction

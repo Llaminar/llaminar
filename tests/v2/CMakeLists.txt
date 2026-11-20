@@ -971,11 +971,17 @@ function(discover_v2_parity_tests TARGET)
             "add_test(\"${ARG_TEST_PREFIX}_DiscoveryRequired\" \"$<TARGET_FILE:llaminar_mpi_session>\" --session-base \"${_quoted_missing_session}\" -- \"${_quotedCMAKE_COMMAND}\" -DNATIVE_DISCOVERY_REQUIRED=${TARGET} -P \"${_quoted_discovery_script}\")\nset_tests_properties(\"${ARG_TEST_PREFIX}_DiscoveryRequired\" PROPERTIES LABELS \"V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;ProcessOwned;Regression\" TIMEOUT 30 TIMEOUT_SIGNAL_NAME SIGTERM TIMEOUT_SIGNAL_GRACE_PERIOD 36)\n")
     endif()
 
-    # Parity keeps its existing placeholder; native owns a selectable sentinel.
-    if(NOT EXISTS "${_ctest_file}")
+    # Refresh a native placeholder that may still name a previous
+    # configuration. Preserve the inventory emitted by post-build discovery.
+    set(_discovery_include_header "")
+    if(ARG_MODEL_FREE_NATIVE AND EXISTS "${_ctest_file}")
+        file(STRINGS "${_ctest_file}" _discovery_include_header LIMIT_COUNT 1)
+    endif()
+    if(NOT EXISTS "${_ctest_file}" OR _discovery_include_header STREQUAL "if(CTEST_CONFIGURATION_TYPE)")
         if(ARG_MODEL_FREE_NATIVE)
-            file(WRITE "${_ctest_file}"
-                "if(CTEST_CONFIGURATION_TYPE)\n include(\"${_fallback_stem}_\${CTEST_CONFIGURATION_TYPE}.cmake\")\nelse()\n include(\"${_fallback_stem}_${_fallback_default}.cmake\")\nendif()\n")
+            file(CONFIGURE OUTPUT "${_ctest_file}" CONTENT
+                "if(CTEST_CONFIGURATION_TYPE)\n include(\"${_fallback_stem}_\${CTEST_CONFIGURATION_TYPE}.cmake\")\nelse()\n include(\"${_fallback_stem}_${_fallback_default}.cmake\")\nendif()\n"
+                @ONLY)
         else()
             file(WRITE "${_ctest_file}" "# Placeholder — tests will be discovered after building ${TARGET}\n")
         endif()
@@ -1224,10 +1230,14 @@ if(HAVE_CUDA OR HAVE_ROCM)
             MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK rocm_gpu_0)
         foreach(case IN ITEMS Default Off Portable)
             set(test_name V2_Integration_ROCmGroupedHCDownReducePublish${case})
+            set(hc_down_geometry "")
+            if(case STREQUAL "Portable")
+                set(hc_down_geometry "HardwareOptional;LocalHostDevices;Devices1;NativeISA-gfx1100")
+            endif()
             add_v2_test(${test_name}
                 COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
                     --gtest_filter=Q8ResidualCorrectionDevice.ROCmGroupedHCDownReducePublish${case}Replay
-                LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;MTP;Capture;ByteExact;Replay;Regression"
+                LABELS "V2;Integration;ProductionTestPreflight;ROCm;Qwen4Exp;MTP;Capture;ByteExact;Replay;Regression;${hc_down_geometry}"
                 ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0"
                 MPI_PROCS 1 NO_MODELS TIMEOUT 60 RESOURCE_LOCK rocm_gpu_0)
             set_property(TEST ${test_name} APPEND PROPERTY ENVIRONMENT_MODIFICATION
@@ -23011,7 +23021,7 @@ if(HAVE_ROCM)
             add_v2_test(V2_Integration_ROCmPeerPushCaptured${peer_push_case}
                 COMMAND $<TARGET_FILE:v2_integration_rocm_peer_push>
                     --gtest_filter=Perf__RCCLAllreduceLatency.PeerPushCaptured${peer_push_case}
-                LABELS "V2;Integration;ProductionTestPreflight;ROCm;RCCL;GraphCapture;Replay;Regression"
+                LABELS "V2;Integration;ProductionTestPreflight;ROCm;RCCL;GraphCapture;Replay;Regression;HardwareOptional;Devices2;CompletePeerAccess"
                 MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
                 ENVIRONMENT "LLAMINAR_RCCL_PERF_DEVICE_COUNT=2;LLAMINAR_RCCL_RANK_ORDERED_PUSH=1")
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmPeerPushCaptured${peer_push_case})
@@ -23019,7 +23029,7 @@ if(HAVE_ROCM)
         add_v2_test(V2_Integration_ROCmPeerPushAutomaticOwnerReplacement
             COMMAND $<TARGET_FILE:v2_integration_rocm_peer_push>
                 --gtest_filter=Perf__RCCLAllreduceLatency.PeerPushAutomaticOwnerReplacement
-            LABELS "V2;Integration;ProductionTestPreflight;HardwareOptional;Devices4;NativeISA-gfx906;ROCm;RCCL;GraphCapture;Replay;Regression"
+            LABELS "V2;Integration;ProductionTestPreflight;HardwareOptional;Devices4;NativeISA-gfx906;CompletePeerAccess;ROCm;RCCL;GraphCapture;Replay;Regression"
             MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
             ENVIRONMENT "LLAMINAR_RCCL_PERF_DEVICE_COUNT=4")
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmPeerPushAutomaticOwnerReplacement)
@@ -24873,7 +24883,9 @@ foreach(planning_sample_backend IN ITEMS CUDA ROCm)
             CompleteSourceAndExecutionEvidence BoundedRequestCostPreparation)
             set(planning_service_test V2_Integration_PlanningMPIService_${planning_sample_backend}_${planning_service_contract})
             set(_service_geometry "")
-            if(planning_service_contract MATCHES "^(HostDeviceSameRankRolesWithIdlePeer|PreparedArithmeticPhaseLifecycle|PreparedSourceCollectionReplay|CompleteSourceAndExecutionEvidence|BoundedRequestCostPreparation)$")
+            if(planning_service_contract STREQUAL "BoundedRequestCostPreparation")
+                set(_service_geometry "HardwareOptional;Devices2")
+            elseif(planning_service_contract MATCHES "^(HostDeviceSameRankRolesWithIdlePeer|PreparedArithmeticPhaseLifecycle|PreparedSourceCollectionReplay|CompleteSourceAndExecutionEvidence)$")
                 set(_service_geometry "HardwareOptional;Devices1")
             endif()
             add_v2_test(${planning_service_test}
@@ -24887,7 +24899,7 @@ foreach(planning_sample_backend IN ITEMS CUDA ROCm)
         add_v2_test(${planning_handoff_test}
             COMMAND $<TARGET_FILE:v2_integration_planning_mpi_transfers>
                 --gtest_filter=PlanningKernelServiceCatalogMPI.${planning_sample_backend}_BoundedRequestCostPreparation
-            LABELS "V2;Integration;ProductionTestPreflight;Planning;MPI;Lifecycle;${planning_sample_backend};Regression"
+            LABELS "V2;Integration;ProductionTestPreflight;Planning;MPI;Lifecycle;${planning_sample_backend};Regression;HardwareOptional;Devices2"
             MPI_PROCS ${V2_TEST_SOCKETS} TIMEOUT 60 NO_MODELS)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${planning_handoff_test})
     endif()

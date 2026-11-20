@@ -361,10 +361,11 @@ the sealed `ARM64PR` Unit
 and host preflight results and checks Release startup.
 Production certification still requires its own complete hardware qualification.
 A successful develop merge builds the AVX512 and AVX2 runtime images in
-parallel on standard GitHub-hosted Ubuntu 24.04 runners. A separate job
-publishes the verified pair. The native ARM64 job builds and smoke-tests the
-CUDA+CPU runtime before publishing its ARM64 tags. Publication builds only
-Release runtime targets. These images are development artifacts.
+parallel on standard GitHub-hosted Ubuntu 24.04 runners. Each ISA prepares its
+cached toolchain and compiles the Release runtime in separate jobs. A final
+job publishes the verified pair. The native ARM64 job builds and smoke-tests the
+CUDA+CPU runtime before publishing its ARM64 tags.
+These images are development artifacts; this gate does not certify a release.
 
 Only upon explicit user direction, cut a release candidate branch named
 `rc/<candidate>` from a develop commit whose AVX512 and AVX2 images have both

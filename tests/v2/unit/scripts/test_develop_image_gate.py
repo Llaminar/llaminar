@@ -650,30 +650,51 @@ class DevelopImageGateTests(unittest.TestCase):
                     else:
                         os.killpg(child_pid, signal.SIGKILL)
 
-    def test_ci_replaces_the_step_shell_with_the_cancellable_driver(self):
+    def test_ci_stages_each_isa_after_its_own_toolchain_job(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", workflow)
         policy = yaml.load(workflow, Loader=yaml.BaseLoader)
         job = policy["jobs"]["develop-images"]
-        self.assertEqual(job["runs-on"], "ubuntu-24.04")
         self.assertEqual(job["strategy"], {"fail-fast": "false", "matrix": {"cpu_isa": list(gate.SHIPPING_ISAS)}})
+        self.assertEqual(job["uses"], "./.github/workflows/develop-image-isa.yml")
+        self.assertEqual(job["with"], {"cpu-isa": "${{ matrix.cpu_isa }}"})
         self.assertEqual(policy["concurrency"], {
             "group": "llaminar-develop-images", "cancel-in-progress": "true"})
-        self.assertIn("--build-only", workflow)
-        self.assertNotIn("prerequisites/", workflow)
-        self.assertNotIn("prune_docker_build_cache", workflow)
-        steps = job["steps"]
+        reusable_path = ROOT / job["uses"]
+        reusable = yaml.load(reusable_path.read_text(), Loader=yaml.BaseLoader)["jobs"]
+        preparation, runtime = reusable["toolchain"], reusable["runtime"]
+        self.assertEqual(runtime["needs"], "toolchain")
+        for phase in (preparation, runtime):
+            self.assertEqual(phase["runs-on"], "ubuntu-24.04")
+            self.assertEqual(phase["timeout-minutes"], "240")
+            self.assertEqual(phase["steps"][0]["with"]["ref"], "${{ github.sha }}")
+        prepare_steps, steps = preparation["steps"], runtime["steps"]
         buildx = next(step for step in steps if step.get("uses") == "docker/setup-buildx-action@v4")
         self.assertEqual(buildx["with"]["driver"], "docker-container")
         self.assertNotEqual(buildx["with"].get("keep-state"), "true")
-        cache = next(step for step in steps if step.get("uses") == "./.github/actions/cache-develop-toolchain")
-        self.assertEqual(cache["with"], {"cpu-isa": "${{ matrix.cpu_isa }}"})
+        cold_build, = [step for step in prepare_steps if step.get("uses") == "./.github/actions/cache-develop-toolchain"]
+        self.assertEqual(cold_build["with"], {"cpu-isa": "${{ inputs.cpu-isa }}"})
+        self.assertEqual(cold_build["if"], "steps.lookup.outputs.cache-hit != 'true'")
+        first_lookup, ready = [step for step in prepare_steps if step.get("uses") == "actions/cache/restore@v5"]
+        restore, = [step for step in steps if step.get("uses") == "actions/cache/restore@v5"]
+        handoff = {"key": "${{ steps.toolchain-cache.outputs.key }}",
+                   "path": "${{ steps.toolchain-cache.outputs.path }}"}
+        self.assertEqual(first_lookup["with"], {**handoff, "lookup-only": "true"})
+        self.assertEqual(ready["with"], {**handoff, "lookup-only": "true", "fail-on-cache-miss": "true"})
+        self.assertLess(prepare_steps.index(first_lookup), prepare_steps.index(cold_build))
+        self.assertLess(prepare_steps.index(cold_build), prepare_steps.index(ready))
+        self.assertEqual(restore["with"], {**handoff, "fail-on-cache-miss": "true"})
+        verify = next(step for step in steps if "toolchain_cache.py verify" in step.get("run", ""))
         staging = next(step for step in steps if "--stage" in step.get("run", ""))
-        self.assertLess(steps.index(cache), steps.index(staging))
+        self.assertLess(steps.index(restore), steps.index(verify))
+        self.assertLess(steps.index(verify), steps.index(staging))
+        self.assertIn("LLAMINAR_DOCKER_TOOLCHAIN_ROOT", verify["run"])
+        self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", staging["run"])
+        self.assertIn("--build-only", staging["run"])
         self.assertEqual(staging["env"]["LLAMINAR_DOCKER_BUILD_CACHE_ACCESS"], "read-write")
         self.assertIn(':build-cache-develop"', staging["run"])
         self.assertIn('--cpu-isa "$CPU_ISA"', staging["run"])
-        self.assertIn("kernel.core_pattern=/proc/llaminar-core-disabled", workflow)
+        self.assertIn("kernel.core_pattern=/proc/llaminar-core-disabled", reusable_path.read_text())
         publisher = policy["jobs"]["publish"]
         self.assertEqual(publisher["runs-on"], "ubuntu-24.04")
         self.assertEqual(publisher["needs"], "develop-images")

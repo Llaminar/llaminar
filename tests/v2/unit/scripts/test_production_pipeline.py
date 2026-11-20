@@ -5741,15 +5741,24 @@ class InfrastructureTests(unittest.TestCase):
         context = "toolchain=oci-layout:///tmp/neon@sha256:" + "a" * 64
         registry = "type=registry,ref=ghcr.io/llaminar/llaminar:build-cache-develop-neon"
         export = registry + ",mode=max,image-manifest=true,oci-mediatypes=true"
+        # The installed x86 test runner exports its own build flags. The ARM64
+        # publication command runs on a separate host with wrapper defaults.
+        environment = dict(pipeline.os.environ)
+        for option in ("LLAMINAR_ENABLE_CUDA", "LLAMINAR_ENABLE_ROCM",
+                       "LLAMINAR_SKIP_INTEGRATION", "LLAMINAR_CUDA_ARCHS"):
+            environment.pop(option, None)
         output = subprocess.check_output([
             "bash", str(ROOT / "scripts/docker/build-runtime-image.sh"), "--variant", "cuda",
             "--cpu-isa", "NEON", "--build-context", context, "--cache-from", registry,
-            "--cache-to", export, "--dry-run"], text=True)
+            "--cache-to", export, "--dry-run"], text=True, env=environment)
         command = shlex.split(output)
         for option, value in (("--target", "runtime"), ("--platform", "linux/arm64"),
                               ("--build-context", context), ("--cache-from", registry),
                               ("--cache-to", export)):
             self.assertEqual(command[command.index(option) + 1], value)
+        self.assertIn("LLAMINAR_ENABLE_ROCM=OFF", command)
+        self.assertIn("LLAMINAR_SKIP_INTEGRATION=1", command)
+        self.assertIn("LLAMINAR_CUDA_ARCHS=121", command)
 
     def test_official_result_commit_is_scoped_and_parented_to_tested_source(self):
         # A real private Git remote exercises the publication transaction. Docker
@@ -6375,7 +6384,8 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn('if docker_args_need_cuda "${args_ref[@]}"; then', harness)
 
     def test_develop_workflow_has_only_the_isa_build_axis_and_no_certification_drivers(self):
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        workflow_dir = ROOT / ".github/workflows"
+        workflow = "\n".join((workflow_dir / name).read_text() for name in ("ci.yml", "develop-image-isa.yml"))
         self.assertIn("scripts/ci/run_develop_image_gate.py", workflow)
         self.assertNotIn("scripts/ci/run_production_pipeline.py", workflow)
         self.assertNotIn("run_benchmark_check.sh", workflow)

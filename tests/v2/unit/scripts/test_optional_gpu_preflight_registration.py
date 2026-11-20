@@ -338,6 +338,15 @@ include("{SOURCE}/tests/v2/cmake/V2TestTargetSelection.cmake")
         begin = source.index('        add_v2_test(V2_Integration_MoEGroupedFixedFP16RouterReplay_ROCm')
         end = source.index('        add_v2_test(', begin + len('        add_v2_test('))
         fixed_router = source[begin:end]
+        begin = source.index('        foreach(case IN ITEMS Default Off Portable)')
+        end = source.index('        endforeach()', begin) + len('        endforeach()')
+        hc_down = source[begin:end]
+        begin = source.index('        foreach(peer_push_case IN ITEMS Replay')
+        end = source.index('        # Use the original rank-owned native fixture', begin)
+        peer_push = source[begin:end]
+        begin = source.index('foreach(planning_sample_backend IN ITEMS CUDA ROCm)')
+        end = source.index('\nendforeach()', begin) + len('\nendforeach()')
+        planning = source[begin:end]
         modules = SOURCE / 'tests/v2/cmake'
         retained = (modules / 'V2RetainedM1HCFFNTests.cmake').read_text()
         begin = retained.index('    add_v2_test(V2_Integration_ROCmGroupedFFNFormatProgramDemand')
@@ -352,19 +361,23 @@ set(CMAKE_BUILD_TYPE Integration)
 set(V2_PERF_TESTS_ONLY OFF)
 set(V2_TEST_SOCKETS 2)
 set(V2_TEST_CORES_PER_SOCKET 2)
+set(HAVE_CUDA ON)
+set(HAVE_ROCM ON)
 set(DEFAULT_LOG_LEVEL ERROR)
 set(Python3_EXECUTABLE "{sys.executable}")
 include("{SOURCE}/tests/v2/fixtures/cmake/NativeMPISessionOwner.cmake")
 include("{modules}/V2TestTargetSelection.cmake")
 '''
             for target in ('v2_integration_moe_intermediate_ffn_finalization',
-                           'v2_integration_rocm_retained_m1_numerics', 'v2_integration_moe_live_rows'):
+                           'v2_integration_rocm_retained_m1_numerics', 'v2_integration_moe_live_rows',
+                           'v2_test_qwen4exp_device_primitives', 'v2_integration_rocm_peer_push',
+                           'v2_integration_planning_mpi_transfers'):
                 prefix += f'add_executable({target} IMPORTED GLOBAL)\n'
                 prefix += f'set_target_properties({target} PROPERTIES IMPORTED_LOCATION "${{CMAKE_COMMAND}}")\n'
             # Only executable placeholders; each add_v2_test call and its MPI
             # wrapping run exactly as in the actual configured Integration tree.
             (root / 'CMakeLists.txt').write_text('\n'.join(
-                (prefix, helper, fixed_router, retained[begin:end],
+                (prefix, helper, fixed_router, hc_down, peer_push, planning, retained[begin:end],
                  numerics[numerics.index('set(qfn_wave_address_test '):])))
             configured = subprocess.run(['cmake', '-S', str(root), '-B', str(root / 'build'), '-G', 'Ninja'],
                                         capture_output=True, text=True, timeout=10)
@@ -379,16 +392,60 @@ include("{modules}/V2TestTargetSelection.cmake")
             document = subprocess.check_output(['ctest', '--test-dir', str(root / 'build'),
                 '--show-only=json-v1'], text=True, timeout=10)
 
-        self.assertEqual(len(requirements), 3)
-        self.assertTrue(all(req['native_isa'] == 'gfx906' and req['degree'] == 6
-                            for req in requirements.values()))
+        singleton = {'backend': 'rocm', 'degree': 1, 'locality': 'original-numa-local-rank',
+                     'native_isa': 'gfx906'}
+        retained_replays = {name for name, req in requirements.items() if req == singleton}
+        self.assertTrue({
+            'V2_Integration_ROCmGroupedFFNFormatProgramDemand',
+            'V2_Integration_FullNativeHCFFN_EqualF160GroupedFrontierDefaultReplay_ROCm',
+            'V2_Integration_QFNFixedMTPConditionRowReplay',
+        } <= retained_replays)
         names = {row.name for row in rows}
         self.assertTrue({
             'V2_Integration_MoEGroupedFixedFP16RouterReplay_ROCm',
             'V2_Integration_ROCmRetainedM1Numerics',
             'V2_Integration_ROCmGroupedVerifierWaveAddressReplay',
-            'V2_Integration_FullNativeHCFFN_EqualF160GroupedFrontierDefaultReplay_ROCm',
+            'V2_Integration_ROCmGroupedHCDownReducePublishDefault',
+            'V2_Integration_ROCmGroupedHCDownReducePublishOff',
         } <= names - requirements.keys())
+
+        def hardware(rocm_nodes, rocm_isas, peer_access):
+            return {
+                'qfn_source_hardware_schema': 2, 'scope': 'local-host-all-ranks',
+                'devices': [
+                    {'backend': 'cpu', 'ordinal': 0, 'numa_node': node} for node in (0, 1)
+                ] + [
+                    {'backend': 'rocm', 'ordinal': ordinal, 'numa_node': numa,
+                     'native_isa': isa, 'uuid': f'rocm-{ordinal}'}
+                    for ordinal, (numa, isa) in enumerate(zip(rocm_nodes, rocm_isas, strict=True))
+                ] + [{'backend': 'cuda', 'ordinal': 0, 'numa_node': -1, 'uuid': 'cuda-0'}],
+                'directed_peer_access': [
+                    {'backend': 'rocm', 'accessor': a, 'peer': b, 'available': (a, b) in peer_access}
+                    for a in range(len(rocm_nodes)) for b in range(len(rocm_nodes)) if a != b
+                ],
+            }
+
+        def qualified(observation):
+            return {name for name, requirement in requirements.items()
+                    if campaigns.optional_native_cohort_absence(requirement, observation) is None}
+
+        peer = 'V2_Integration_ROCmPeerPushCapturedReplay'
+        portable = 'V2_Integration_ROCmGroupedHCDownReducePublishPortable'
+        planning_rocm = 'V2_Integration_AutomaticPlanningNativeContextHandoff_ROCm'
+        planning_cuda = 'V2_Integration_AutomaticPlanningNativeContextHandoff_CUDA'
+        self.assertFalse(qualified(hardware([-1], ['gfx906:sramecc+:xnack-'], set())))
+        self.assertEqual(qualified(hardware([0], ['gfx906'], set())), retained_replays)
+        self.assertEqual(qualified(hardware([-1], ['gfx1100'], set())), {portable})
+        one_way = hardware([0, 0], ['gfx906'] * 2, {(0, 1)})
+        self.assertEqual(qualified(one_way), retained_replays | {planning_rocm})
+        two_way = hardware([0, 0], ['gfx906'] * 2, {(0, 1), (1, 0)})
+        self.assertIn(peer, qualified(two_way))
+        self.assertNotIn(planning_cuda, qualified(two_way))
+        self.assertNotIn(peer, qualified(hardware([0, 1], ['gfx906'] * 2, {(0, 1), (1, 0)})))
+        replacement = 'V2_Integration_ROCmPeerPushAutomaticOwnerReplacement'
+        links = {(a, b) for a in range(1, 5) for b in range(1, 5) if a != b}
+        self.assertIn(replacement, qualified(hardware([0] * 5, ['gfx906'] * 5, links)))
+        self.assertNotIn(replacement, qualified(hardware([0] * 5, ['gfx906'] * 5, links - {(1, 4)})))
         filters = [arg for row in json.loads(document)['tests']
                    if row['name'].startswith('V2_Integration_GroupedM6IndexedGateReuse')
                    for arg in row['command'] if arg.startswith('--gtest_filter=')]

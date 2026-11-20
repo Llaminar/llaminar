@@ -170,10 +170,10 @@ class NativeCodecDiscovery(unittest.TestCase):
                     'TEST_PREFIX Native LABELS Integration MPI_PROCS 1 TIMEOUT 120)\n'
                     'get_property(owners GLOBAL PROPERTY V2_DISCOVERED_PREFLIGHT_GATE_TARGETS)\n'
                     'file(WRITE "${CMAKE_BINARY_DIR}/owners" "${owners}")\n')
-                result = subprocess.run([self.cmake, '-S', str(root), '-B', str(root / 'build'),
+                configure = [self.cmake, '-S', str(root), '-B', str(root / 'build'),
                     '-G', 'Ninja', f'-DCMAKE_MAKE_PROGRAM={self.ninja}',
-                    '-DCMAKE_BUILD_TYPE=Integration'], capture_output=True,
-                    text=True, timeout=20)
+                    '-DCMAKE_BUILD_TYPE=Integration']
+                result = subprocess.run(configure, capture_output=True, text=True, timeout=20)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 owners = (root / 'build/owners').read_text()
                 self.assertEqual(bool(owners), selected)
@@ -193,6 +193,11 @@ class NativeCodecDiscovery(unittest.TestCase):
                     self.assertIn('_undiscovered_Integration.cmake',
                                   (root / 'build/native_discovered_tests.cmake').read_text())
                     self.assertTrue((root / 'build/native_undiscovered_Integration.cmake').is_file())
+                    discovery = root / 'build/native_discovered_tests.cmake'
+                    discovery.write_text(discovery.read_text().replace('_Integration.cmake', '_Debug.cmake'))
+                    result = subprocess.run(configure, capture_output=True, text=True, timeout=20)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn('_undiscovered_Integration.cmake', discovery.read_text())
                     ctest = str(Path(shutil.which(self.cmake)).with_name('ctest'))
                     unit = subprocess.run([ctest, '--test-dir', str(root / 'build'),
                         '-L', '^Unit$', '--output-on-failure'], capture_output=True,

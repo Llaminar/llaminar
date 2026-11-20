@@ -208,15 +208,19 @@ preflight or numerical acceptance.
 ## Develop branch image publication
 
 `.github/workflows/ci.yml` runs on pushes to `develop` and explicit manual
-dispatches on `develop`. Its build matrix uses standard GitHub-hosted
-`ubuntu-24.04` x64 runners, one VM per ISA. Before restoring their toolchains,
-the jobs reclaim disk used by the runner's preinstalled Android and language
-SDKs. Image publication has its own
+dispatches on `develop`. Its AVX512 and AVX2 lanes run in parallel on standard
+GitHub-hosted `ubuntu-24.04` x64 runners. Each ISA's reusable workflow gives
+toolchain preparation and Release compilation separate VMs and a four-hour
+limit each. The jobs reclaim disk used by the runner's preinstalled Android
+and language SDKs. Image publication has its own
 `llaminar-develop-images` concurrency group with `cancel-in-progress: true`:
 at most one develop publication runs, and a newer merge cancels its predecessor.
 The x86 PR checks use the separate self-hosted queues.
 
-Each matrix job runs `scripts/ci/run_develop_image_gate.py --build-only --stage`
+The preparation job checks for the exact OCI cache entry and builds and saves
+it on a miss. The dependent build job restores that entry, verifies the OCI
+image against the committed dependencies and ISA, and fails early if the
+handoff is missing. The build job runs `scripts/ci/run_develop_image_gate.py --build-only --stage`
 with its own `--cpu-isa`. It builds the full CPU/CUDA/ROCm Release runtime for
 that ISA, with Integration compilation disabled. The workflow runs no Unit, integration,
 production-preflight, model, E2E or benchmark tests and attaches no certificate.
@@ -250,7 +254,8 @@ Registry access defaults to `read-write` for publication; PRs explicitly select
 `import-only`, with no registry cache export. Local host-path and registry cache
 authorities are mutually exclusive.
 
-Development image builds first run `.github/actions/cache-develop-toolchain`.
+PR checks, cold x86 publication toolchain jobs, and the ARM64 publication job use
+`.github/actions/cache-develop-toolchain`.
 Llaminar test builds require CMake and CTest 4.0 or later. The toolchain and
 installed runner share the Kitware package pinned in `requirements.txt` so
 CTest reports each MPI owner’s timeout signal and grace period in its inventory.
