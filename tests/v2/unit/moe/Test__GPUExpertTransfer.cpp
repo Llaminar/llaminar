@@ -105,6 +105,7 @@ TEST(Test__GPUExpertTransfer, CUDAROCmHostPackersProduceBitwiseIdenticalNativeQu
         {"Q4_1", [] { return test::TestTensorFactory::createQ4_1Random({16, 128}); }},
         {"IQ3_S", [] { return test::TestTensorFactory::createIQ3_SRandom({16, 256}); }},
         {"Q2_K", [] { return test::TestTensorFactory::createQ2_KRandom({16, 256}); }},
+        {"MXFP4", [] { return test::TestTensorFactory::createMXFP4Random({16, 128}); }},
     };
 
     for (const auto &tc : cases)

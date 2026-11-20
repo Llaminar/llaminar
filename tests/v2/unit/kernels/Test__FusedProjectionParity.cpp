@@ -44,7 +44,7 @@ protected:
     };
 
     /// Create a quantized weight tensor of the given type with the given shape.
-    /// Supported: "Q4_0", "Q8_0", "IQ4_NL"
+    /// Supported: "Q4_0", "Q8_0", "IQ4_NL", "MXFP4"
     static std::unique_ptr<TensorBase> createWeights(
         const std::string &type, size_t n, size_t k, uint32_t seed)
     {
@@ -55,6 +55,8 @@ protected:
             return TestTensorFactory::createQ8_0Random(shape, seed);
         if (type == "IQ4_NL")
             return TestTensorFactory::createIQ4_NLRandom(shape, seed);
+        if (type == "MXFP4")
+            return TestTensorFactory::createMXFP4Random(shape, seed);
         return nullptr;
     }
 
