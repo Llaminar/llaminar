@@ -117,6 +117,9 @@ Release runtime. Both ARM64 jobs restore the verified NEON OCI toolchain
 through `cache-develop-toolchain` and save a cold toolchain before compiling
 Llaminar. ARM64 PRs retain BuildKit layers under `llaminar-build-neon-pr`
 on the PR merge ref and import trusted develop layers from GHCR.
+The PR check also restores the Dockerfile ccache mount from the latest
+cache for its admitted NEON toolchain manifest. A source tree that
+completes the gate can save its compiler objects on the same merge ref.
 See [production CI](../../docs/production-ci.md).
 
 Start ordinary work from current `develop` on `feat/<description>`; push and

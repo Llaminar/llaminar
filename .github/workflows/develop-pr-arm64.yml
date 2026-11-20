@@ -46,10 +46,15 @@ jobs:
           test "$(uname -m)" = aarch64
           : "${TOOLCHAIN_CONTEXT:?missing admitted NEON toolchain}"
           mkdir -p "$RUNNER_TEMP/llaminar-arm64-evidence"
+          source_tree=$(git rev-parse HEAD^{tree})
+          toolchain_digest=${TOOLCHAIN_CONTEXT##*@sha256:}
+          [[ "$toolchain_digest" =~ ^[0-9a-f]{64}$ ]]
           {
+            echo "ccache-prefix=llaminar-ccache-v1-neon-$toolchain_digest-"
+            echo "source-tree=$source_tree"
             echo 'args<<BUILD_ARGS'
             echo "VCS_REF=$(git rev-parse HEAD)"
-            echo "LLAMINAR_SOURCE_TREE=$(git rev-parse HEAD^{tree})"
+            echo "LLAMINAR_SOURCE_TREE=$source_tree"
             echo 'LLAMINAR_CPU_ISA=NEON'
             echo 'LLAMINAR_ENABLE_CUDA=ON'
             echo 'LLAMINAR_ENABLE_ROCM=OFF'
@@ -61,6 +66,18 @@ jobs:
             echo "LLAMINAR_TEST_GID=$(id -g)"
             echo BUILD_ARGS
           } >> "$GITHUB_OUTPUT"
+      - name: Restore ARM64 compiler objects
+        id: ccache
+        uses: actions/cache/restore@v5
+        with:
+          path: ${{ runner.temp }}/llaminar-neon-ccache
+          key: ${{ steps.build.outputs.ccache-prefix }}${{ steps.build.outputs.source-tree }}
+          restore-keys: ${{ steps.build.outputs.ccache-prefix }}
+      - name: Seed the BuildKit compiler cache mount
+        if: steps.ccache.outputs.cache-matched-key != ''
+        continue-on-error: true
+        shell: bash
+        run: bash scripts/ci/transfer_arm64_ccache.sh restore
       - name: Build the sealed ARM64 test-runner
         uses: docker/build-push-action@v7
         env:
@@ -108,6 +125,18 @@ jobs:
             "$image" python3 scripts/ci/run_develop_pr_tests.py --arm64 \
               --build-dir build_v2_integration --installed-build-receipt /src/installed-tests.json \
               --output /evidence/tests
+      - name: Export the BuildKit compiler cache mount
+        id: export-ccache
+        if: steps.ccache.outputs.cache-hit != 'true'
+        continue-on-error: true
+        shell: bash
+        run: bash scripts/ci/transfer_arm64_ccache.sh save
+      - name: Save ARM64 compiler objects
+        if: steps.export-ccache.outcome == 'success'
+        uses: actions/cache/save@v5
+        with:
+          path: ${{ runner.temp }}/llaminar-neon-ccache
+          key: ${{ steps.build.outputs.ccache-prefix }}${{ steps.build.outputs.source-tree }}
       - name: Retain ARM64 build and test evidence
         if: always()
         uses: actions/upload-artifact@v4
