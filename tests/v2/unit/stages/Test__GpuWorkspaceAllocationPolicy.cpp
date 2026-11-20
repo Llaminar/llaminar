@@ -4370,6 +4370,39 @@ TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedFusedVerifierRowsPin
            "parameter exists.";
 }
 
+/**
+ * @test Both CUDA NativeQuantised trainers build MXFP4 weights deterministically.
+ * @details MXFP4 leads with an E8M0 exponent, so the generic half-scale
+ * builders cannot serve it; each trainer has a dedicated O(weight_bytes)
+ * builder with an admitted exponent and never falls back to the random
+ * quantizer in its format table.
+ */
+TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedTrainersBuildDeterministicMXFP4Weights)
+{
+    struct Trainer { const char *path; const char *builder; const char *table_end; };
+    const std::array<Trainer, 2> trainers{{
+        {"tests/v2/performance/kernels/cuda/gemm/Perf__CUDABlockwiseTensorCoreGemmSweep.cpp",
+         "createFastSweepMXFP4Tensor", "const NativeQuantisedFormatInfo &requireNativeQuantisedInfo"},
+        {"tests/v2/performance/kernels/cuda/gemm/Perf__CUDANativeQuantisedDecodeTrainer.cpp",
+         "createTrainerMXFP4Tensor", "using Shape = native_quantised_dispatch::NativeQuantisedShapeSpec;"},
+    }};
+    for (const auto &trainer : trainers)
+    {
+        SCOPED_TRACE(trainer.path);
+        const auto source = readFile(repoRoot() / trainer.path);
+        const auto builder = sliceBetween(source,
+            std::string("std::unique_ptr<TensorBase> ") + trainer.builder + "(", "const std::vector<FormatSpec> kFormats");
+        EXPECT_NE(builder.find("dst[0] = 127;"), std::string::npos)
+            << "MXFP4 trainer weights must carry an admitted E8M0 exponent (127, scale 1.0).";
+        EXPECT_EQ(builder.find("TestTensorFactory"), std::string::npos);
+        const auto table = sliceBetween(source, "const std::vector<FormatSpec> kFormats", trainer.table_end);
+        EXPECT_NE(table.find(std::string("{ return ") + trainer.builder + "(n, k); }"), std::string::npos)
+            << "The MXFP4 entry must use the deterministic builder.";
+        EXPECT_EQ(table.find("TestTensorFactory::create"), std::string::npos)
+            << "Trainer format tables must not use random quantizers.";
+    }
+}
+
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedDispatchSweepUsesFastDeterministicWeights)
 {
     const auto source =

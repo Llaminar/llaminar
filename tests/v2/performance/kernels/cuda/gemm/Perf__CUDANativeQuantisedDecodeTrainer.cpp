@@ -189,11 +189,32 @@ namespace
             std::vector<size_t>{n, k}, raw);
     }
 
+    /**
+     * @brief Deterministic MXFP4 trainer weights: E8M0 exponent 127 (scale 1.0).
+     * @details The generic builder's leading half scale would be the E8M0 zero
+     * marker beside nonzero codes, which admission rejects.
+     */
+    std::unique_ptr<TensorBase> createTrainerMXFP4Tensor(size_t n, size_t k)
+    {
+        const size_t blocks_per_row = (k + MXFP4Block::BLOCK_SIZE - 1) / MXFP4Block::BLOCK_SIZE;
+        std::vector<uint8_t> raw(n * blocks_per_row * sizeof(MXFP4Block), 0);
+        for (size_t block = 0; block < n * blocks_per_row; ++block)
+        {
+            uint8_t *dst = raw.data() + block * sizeof(MXFP4Block);
+            dst[0] = 127;
+            for (size_t byte = 1; byte < sizeof(MXFP4Block); ++byte)
+                dst[byte] = static_cast<uint8_t>(((block * 17u) + (byte * 13u)) & 0x3u);
+        }
+        return std::make_unique<MXFP4Tensor>(std::vector<size_t>{n, k}, raw);
+    }
+
     const std::vector<FormatSpec> kFormats = {
         {"Q4_0", [](size_t n, size_t k)
          { return createTrainerTensor<Q4_0Tensor, Q4_0Block>(n, k); }},
         {"IQ4_NL", [](size_t n, size_t k)
          { return createTrainerTensor<IQ4_NLTensor, IQ4_NLBlock>(n, k); }},
+        {"MXFP4", [](size_t n, size_t k)
+         { return createTrainerMXFP4Tensor(n, k); }},
         {"IQ4_XS", [](size_t n, size_t k)
          { return createTrainerTensor<IQ4_XSTensor, IQ4_XSBlock>(n, k); }},
         {"Q4_1", [](size_t n, size_t k)

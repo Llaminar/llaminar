@@ -46,7 +46,7 @@ same depth as peer formats. Confirmed users (spot-checked, 11 files):
 |---|---|
 | Dense GEMV decode M1, grouped MTP M2..16/M31, prefill (CPU x86 AVX2/512, CUDA, ROCm) | Covered where the suite iterates `quantizedVerifierFormats()` (e.g. `Test__CPUNativeQuantised_GEMV`, `CPUNativeVNNI*` post-#38). Perf gates below still miss MXFP4. |
 | Serial-row byte equivalence of grouped rows | Covered by `Test__CPUNativeQuantised_GEMV` inventory sweeps and the MoE verifier perf tests that use the inventory. |
-| MoE routed FFN, shared expert, paired gate/up, combined top-k | `Perf__MoEVerifierPrefill` CUDA/ROCm `M1234_*`, `M4M9M31_CombinedTop9*` use the hardcoded `sharedExpertPreparedFormatCases()` which has NO MXFP4 -> **GAP**. The `CUDA_ProductionCandidatesAreSerialRowByteInvariant` path uses the inventory loops (covered). |
+| MoE routed FFN, shared expert, paired gate/up, combined top-k | `Perf__MoEVerifierPrefill` CUDA/ROCm `M1234_*`, `M4M9M31_CombinedTop9*` iterate `quantizedVerifierFormats()` (inventory, covered) in their equal-bytes loops; the hardcoded `sharedExpertPreparedFormatCases()` list lacked MXFP4 (fixed in `31b263ba7`). `CUDA_ProductionCandidatesAreSerialRowByteInvariant` walks the FIXED `exact_overlay_formats` tuple list (IQ2_S/IQ4_XS, IQ2_S/Q6_K, IQ3_S/Q6_K, IQ2_S/IQ3_S, ~line 3235), which mirrors the installed grouped-IMMA regimes; it intentionally gains MXFP4/Q5_K and MXFP4/Q6_K only when an MXFP4 grouped regime is installed. Decision pending from the sm_86 tournament (task A). |
 | CPU fused verifier / fused expert members | `Test__CPUNativeQuantisedVerifierWorkers` covered. `Test__FusedProjectionParity` hardcoded [Q4_0, Q8_0, IQ4_NL] -> **GAP**. |
 | QuantizedVerifierFormats, kAllSourceFormats users | Covered (above). |
 | Mixed-format expert tuples as in real GGUFs (MXFP4 gate/up + Q5_K/Q6_K down) | `MixedFormatExpertTransactionPreservesEveryProjection` (CPU, registry cycle) and `runMixedFormatExpertTransferPublication` (CUDA/ROCm, registry-derived specs) cover all pairings including MXFP4-mixed. The patterns manifest `qwen_moe_gguf_codebook_patterns_v1.json` has MXFP4 variants; per instruction the tuning corpus is untouched. |
@@ -69,7 +69,8 @@ Class B: perf/tuning trainers, add MXFP4 (owner runs them; not accuracy gates bu
 - `Perf__CPUMoEExpertVerifierRows.cpp`, `Perf__GPUExpertPipeline.cpp`, `Perf__ROCmMoEVerifierPrefill.cpp` (inventory loops already; verify shared cases lists)
 - `Perf__AVX2vsAVX512.cpp`, `Perf__CPUNativeQuantised_Sweep.cpp`, `Perf__CPUNativeQuantised_GEMV.cpp` (MTP_SMALL_M_FORMATS), `Perf__CPUNativeQuantised_DispatchSweep.cpp`, `Perf__OneDNN_Reference.cpp`
 - `Perf__CUDABlockwiseTensorCoreGemm.cpp` (+Sweep), `Perf__CUDANativeQuantisedDecodeTrainer.cpp`
-- `Perf__BlockwiseNativeQuantised.cpp`, `Perf__NativeQuantised_GEMM.cpp`, `Microbench__IQDecodeLab.hip`, `Perf__IINT8Unpackable.cpp`
+- `Perf__NativeQuantised_GEMM.cpp` (added MXFP4, bpw 4.25), `Perf__CUDABlockwiseTensorCoreGemm.cpp`, `Perf__CUDABlockwiseTensorCoreGemmSweep.cpp`, `Perf__CUDANativeQuantisedDecodeTrainer.cpp` (all added MXFP4 via TestTensorFactory, so the E8M0 exponent bytes are valid)
+- NOT added (unverified in those microkernels, or format-inapplicable): `Perf__BlockwiseNativeQuantised.cpp`, `Microbench__IQDecodeLab.hip`, `Perf__IINT8Unpackable.cpp`
 
 Class C: representativeness samples, not coverage claims; leave as-is (note only):
 
