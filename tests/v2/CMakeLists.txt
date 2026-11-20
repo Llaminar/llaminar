@@ -8444,6 +8444,26 @@ if(NOT V2_PERF_TESTS_ONLY)
         PROCESSORS ${V2_CPU_GEMM_PARITY_MAX_THREADS})
 endif()
 
+# Test: MXFP4 OCP-spec reference oracle through the CPU NativeQuantised kernel
+add_executable(v2_test_mxfp4_native_quantised_oracle
+    unit/kernels/Test__MXFP4NativeQuantisedOracle.cpp)
+target_link_libraries(v2_test_mxfp4_native_quantised_oracle
+    llaminar2_core
+    GTest::gtest
+    GTest::gtest_main
+)
+add_v2_test(V2_Unit_MXFP4NativeQuantisedOracle
+    COMMAND $<TARGET_FILE:v2_test_mxfp4_native_quantised_oracle>
+    LABELS "V2;Unit;Kernels;GEMM;GEMV;MXFP4;Quantization;OCP;ByteExact;Regression"
+    MPI_PROCS 1
+)
+add_v2_test(V2_Integration_MXFP4NativeQuantisedOracle
+    COMMAND $<TARGET_FILE:v2_test_mxfp4_native_quantised_oracle>
+        --gtest_filter=MXFP4NativeQuantisedOracle.*
+    LABELS "V2;Integration;ProductionTestPreflight;CPU;NativeQuantised;MXFP4;OCP;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+
 # Test: AVX2 vs AVX512-VNNI parity (emulated dpbusd, chunk GEMV, full GEMV/GEMM)
 # x86 leaves only; ARM NativeQuantised programs have their own NEON byte gates.
 if(V2_CPU_TARGET_X86)
@@ -31521,7 +31541,6 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MTPReplicatedSidecarKVPublicationLifecycle
     V2_Integration_MTPSidecarWorkspaceRows
     V2_Integration_AssignmentAwareFusedQKVTP2ThroughTP8
-    V2_Integration_DynamicConvergenceFiniteHorizonLifecycle
     V2_Integration_DynamicConvergenceProtectedTraffic
     V2_Integration_Qwen122DynamicWaveGeometry
     V2_Integration_DynamicMovementAxisGeometry
@@ -31539,6 +31558,12 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MoEOverlayTicketRoutingWork
     V2_Integration_PrefixRestoreGDNMovementEpochContract
 )
+# The convergence lifecycle preflight member is bound to the 35B node
+# expert-overlay parity matrix; a CPU-only tree does not define that matrix.
+if(TARGET v2_integration_parity_qwen35moe_35b_node_expert_overlay_matrix)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+        V2_Integration_DynamicConvergenceFiniteHorizonLifecycle)
+endif()
 # Explicit inventory members registered earlier in this file; appended after the
 # list is (re)initialized above so they are not overwritten.
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
