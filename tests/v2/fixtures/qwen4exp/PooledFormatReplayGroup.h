@@ -13,22 +13,23 @@
 
 namespace llaminar2::test
 {
-    /** @brief One of six disjoint subsets of the canonical embedding inventory. */
+    /** @brief One of the disjoint subsets of the canonical embedding inventory. */
     class PooledFormatReplayGroup
     {
     public:
-        static constexpr unsigned Count = 6; ///< At most four original formats per process.
+        static constexpr unsigned Count = 6; ///< Default group count for provider replay.
 
         /** @brief Bind an explicit inventory group, rejecting indices outside the sweep. */
-        explicit PooledFormatReplayGroup(unsigned group) : group_(group)
+        explicit PooledFormatReplayGroup(unsigned group, unsigned count = Count) : group_(group), count_(count)
         {
-            if (group >= Count) throw std::out_of_range("Invalid pooled format replay group");
+            if (group >= count) throw std::out_of_range("Invalid pooled format replay group");
         }
 
         /** @return Whether this process owns the format at its original supported ordinal. */
-        [[nodiscard]] bool includes(std::size_t ordinal) const noexcept { return ordinal % Count == group_; }
+        [[nodiscard]] bool includes(std::size_t ordinal) const noexcept { return ordinal % count_ == group_; }
 
     private:
         unsigned group_; ///< A group names a process partition, independent of device and cache capacity.
+        unsigned count_; ///< Number of processes required for this source inventory.
     };
 }

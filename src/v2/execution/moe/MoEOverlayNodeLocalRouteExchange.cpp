@@ -9,6 +9,7 @@
  * this file contains no inference-time polling, copying, or synchronization.
  */
 
+#include "utils/HostPageSize.h"
 #include "MoEOverlayNodeLocalRouteExchange.h"
 
 #include "transfer/TransferEngine.h"
@@ -32,7 +33,6 @@ namespace llaminar2
     namespace
     {
         constexpr std::size_t kCacheLineBytes = 64u;
-        constexpr std::size_t kPageBytes = 4096u;
 
         /** @return `value` rounded up to `alignment`, rejecting overflow. */
         std::size_t checkedAlignUp(
@@ -208,7 +208,7 @@ namespace llaminar2
     {
         if (host.world_rank != root_gpu.world_rank || !host.device.is_cpu() || root_gpu.device != root_)
             throw std::invalid_argument("Node-local route storage BOM changed original host/root resource");
-        const std::array requests{MappedHostTransferArena::AllocationRequest{mapping_bytes_, kPageBytes}};
+        const std::array requests{MappedHostTransferArena::AllocationRequest{mapping_bytes_, hostPageBytes()}};
         PhysicalMemoryPlanBuilder result;
         result.add(host, PhysicalMemoryOwner::ActivationTransportStaging, MappedHostTransferArena::backingBytes(requests));
         result.add(root_gpu, PhysicalMemoryOwner::ActivationTransportStaging,
@@ -257,7 +257,7 @@ namespace llaminar2
 
         for (std::size_t lane_index = 0; lane_index + 1 < participants; ++lane_index)
         {
-            cursor = checkedAlignUp(cursor, kPageBytes);
+            cursor = checkedAlignUp(cursor, hostPageBytes());
             LaneLayout layout;
             layout.control_offset = cursor;
             cursor = checkedAdd(
@@ -267,7 +267,7 @@ namespace llaminar2
             layout.slot_epochs_offset = cursor;
             cursor = checkedAdd(
                 cursor, slot_epoch_bytes, "slot-epoch layout");
-            cursor = checkedAlignUp(cursor, kPageBytes);
+            cursor = checkedAlignUp(cursor, hostPageBytes());
             layout.payload_offset = cursor;
             cursor = checkedAdd(cursor, payload_bytes, "payload layout");
             layout.root_staging_offset = checkedMultiply(
@@ -283,7 +283,7 @@ namespace llaminar2
          * overwrite that bank only after every peer has acknowledged the prior
          * epoch on device.
          */
-        cursor = checkedAlignUp(cursor, kPageBytes);
+        cursor = checkedAlignUp(cursor, hostPageBytes());
         const std::size_t dense_control_offset = cursor;
         cursor = checkedAdd(
             cursor,
@@ -297,7 +297,7 @@ namespace llaminar2
             "dense publication peer acknowledgements");
         cursor = checkedAdd(
             cursor, dense_peers_bytes, "dense publication peer layout");
-        cursor = checkedAlignUp(cursor, kPageBytes);
+        cursor = checkedAlignUp(cursor, hostPageBytes());
         const std::size_t dense_payload_offset = cursor;
         const std::size_t dense_element_capacity = checkedMultiply(
             static_cast<std::size_t>(max_rows),
@@ -309,7 +309,7 @@ namespace llaminar2
             "dense publication payload bytes");
         cursor = checkedAdd(
             cursor, dense_payload_bytes, "dense publication payload layout");
-        const std::size_t mapping_bytes = checkedAlignUp(cursor, kPageBytes);
+        const std::size_t mapping_bytes = checkedAlignUp(cursor, hostPageBytes());
 
         const auto root_bytes = checkedMultiply(payload_bytes, layouts.size(), "root staging bytes");
         return {std::move(layouts), route_capacity, mapping_bytes, root_bytes, dense_control_offset,
@@ -436,9 +436,9 @@ namespace llaminar2
             std::vector<PreparedGPUContextUsePermit> originals;
             for (const auto device : config_.devices)
                 originals.push_back(GPUDeviceContextPool::instance().retainExistingPreparedContext(device, memory_));
-            const std::array requests{MappedHostTransferArena::AllocationRequest{mapping_bytes, kPageBytes}};
+            const std::array requests{MappedHostTransferArena::AllocationRequest{mapping_bytes, hostPageBytes()}};
             auto arena = transfer_engine.createMappedHostArena(config_.devices, memory_, requests);
-            region = arena->allocate(mapping_bytes, kPageBytes);
+            region = arena->allocate(mapping_bytes, hostPageBytes());
             arena->requireDeclarationConsumed();
             const auto schema = routeRootWorkspace(root_staging_bytes);
             workspace = std::make_unique<DeviceWorkspaceManager>(config_.root_device,

@@ -35,8 +35,24 @@
 #include <immintrin.h>
 #endif
 
+#if LLAMINAR_COMPILED_WITH_NEON
+#include <arm_neon.h>
+#endif
 namespace llaminar2::cpu_gdn_epoch
 {
+#if LLAMINAR_COMPILED_WITH_NEON
+    struct Probe128 {
+        using Value = float32x4_t;
+        static constexpr int width=4;
+        static Value zero() { return vdupq_n_f32(0); }
+        static Value broadcast(float v) { return vdupq_n_f32(v); }
+        static Value load(const float *p) { return vld1q_f32(p); }
+        static void store(float *p, Value v) { vst1q_f32(p,v); }
+        static Value mul(Value a,Value b) { return vmulq_f32(a,b); }
+        static Value sub(Value a,Value b) { return vsubq_f32(a,b); }
+        static Value fma(Value a,Value b,Value c) { return vfmaq_f32(c,a,b); }
+    };
+#endif
 #if defined(__AVX2__)
     /** @brief AVX2 lanes own independent values; key reductions remain ordered. */
     struct SIMD256
@@ -195,6 +211,13 @@ namespace llaminar2::cpu_gdn_epoch
                 projectTile<SIMD256, Rows, 1, Retain>(layout, matrix, history, x, c, phase, vi, output, stride, retained);
         }
 #endif
+#if LLAMINAR_COMPILED_WITH_NEON
+        constexpr int nz = Rows <= 2 ? 8 : 4;
+        for (; vi+nz*4 <= layout.valueWidth(); vi+=nz*4)
+            projectTile<Probe128,Rows,nz,Retain>(layout,matrix,history,x,c,phase,vi,output,stride,retained);
+        for (; vi+4 <= layout.valueWidth(); vi+=4)
+            projectTile<Probe128,Rows,1,Retain>(layout,matrix,history,x,c,phase,vi,output,stride,retained);
+#endif
         for (; vi < layout.valueWidth(); ++vi)
             for (int r = 0; r < Rows; ++r)
             {
@@ -330,6 +353,12 @@ namespace llaminar2::cpu_gdn_epoch
             for (; vi + 32 <= layout.valueWidth(); vi += 32) flushTile<SIMD256, 4>(layout, matrix, history, vi, initial_source);
             for (; vi + 8 <= layout.valueWidth(); vi += 8) flushTile<SIMD256, 1>(layout, matrix, history, vi, initial_source);
         }
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+        for (; vi+16 <= layout.valueWidth(); vi+=16)
+            flushTile<Probe128,4>(layout,matrix,history,vi,initial_source);
+        for (; vi+4 <= layout.valueWidth(); vi+=4)
+            flushTile<Probe128,1>(layout,matrix,history,vi,initial_source);
 #endif
         for (; vi < layout.valueWidth(); ++vi)
         {

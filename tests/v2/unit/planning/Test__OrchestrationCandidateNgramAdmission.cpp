@@ -136,6 +136,23 @@ void expectCompleteTable(const AdmittedOrchestrationCandidate &admitted,Immutabl
     EXPECT_GT(placements,0u);
 }
 }
+/** @test A nonfitting mandatory plan is a capacity rejection, never an optional-table contract violation. */
+TEST(OrchestrationCandidateNgramAdmission, MandatoryBaseCapacityRejectsBeforeOptionalTableSelection)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    for (const auto backend : {DeviceType::CPU, DeviceType::CUDA, DeviceType::ROCm})
+    {
+        SCOPED_TRACE(deviceTypeToString(backend));
+        auto candidate = ngramCandidate(source, backend);
+        if (backend == DeviceType::CPU) candidate.config.max_cpu_memory_mb = 1;
+        else candidate.config.max_gpu_memory_mb = 1;
+        candidate.config.ngram_table_policy.storage = ImmutableRowStoragePreference::MemoryMapped;
+        EXPECT_THROW((void)AdmittedOrchestrationCandidate::admit(candidate, source, ngramPolicy(candidate)),
+            PhysicalMemoryCapacityExhausted);
+    }
+}
+
 /** @test Hosted workers are mandatory CPU0 owners and retain the session actually admitted. */
 TEST(OrchestrationCandidateNgramAdmission, HostedServiceBOMPrecedesOptionalPlacement)
 {

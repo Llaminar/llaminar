@@ -1,0 +1,297 @@
+{
+  "provenance": {
+    "evidence_archive_sha256": "15497193eeb13213c06c0d202ac031f59e2a24776b38a9bc25c72a0a57362c67",
+    "scope": "2026-11-05 native Spark build-only configure failure; minimal device-free recorded topology fixture, not inference/performance evidence"
+  },
+  "affinity_cpus": [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    19
+  ],
+  "sysfs_cpus": [
+    {
+      "cpu_id": 0,
+      "package_id": 36,
+      "core_id": 0,
+      "thread_siblings": "0",
+      "cluster_id": 56
+    },
+    {
+      "cpu_id": 1,
+      "package_id": 36,
+      "core_id": 1,
+      "thread_siblings": "1",
+      "cluster_id": 56
+    },
+    {
+      "cpu_id": 2,
+      "package_id": 36,
+      "core_id": 2,
+      "thread_siblings": "2",
+      "cluster_id": 56
+    },
+    {
+      "cpu_id": 3,
+      "package_id": 36,
+      "core_id": 3,
+      "thread_siblings": "3",
+      "cluster_id": 56
+    },
+    {
+      "cpu_id": 4,
+      "package_id": 36,
+      "core_id": 4,
+      "thread_siblings": "4",
+      "cluster_id": 56
+    },
+    {
+      "cpu_id": 5,
+      "package_id": 36,
+      "core_id": 5,
+      "thread_siblings": "5",
+      "cluster_id": 56
+    },
+    {
+      "cpu_id": 6,
+      "package_id": 36,
+      "core_id": 6,
+      "thread_siblings": "6",
+      "cluster_id": 56
+    },
+    {
+      "cpu_id": 7,
+      "package_id": 36,
+      "core_id": 7,
+      "thread_siblings": "7",
+      "cluster_id": 56
+    },
+    {
+      "cpu_id": 8,
+      "package_id": 36,
+      "core_id": 8,
+      "thread_siblings": "8",
+      "cluster_id": 56
+    },
+    {
+      "cpu_id": 9,
+      "package_id": 36,
+      "core_id": 9,
+      "thread_siblings": "9",
+      "cluster_id": 56
+    },
+    {
+      "cpu_id": 10,
+      "package_id": 36,
+      "core_id": 10,
+      "thread_siblings": "10",
+      "cluster_id": 1144
+    },
+    {
+      "cpu_id": 11,
+      "package_id": 36,
+      "core_id": 11,
+      "thread_siblings": "11",
+      "cluster_id": 1144
+    },
+    {
+      "cpu_id": 12,
+      "package_id": 36,
+      "core_id": 12,
+      "thread_siblings": "12",
+      "cluster_id": 1144
+    },
+    {
+      "cpu_id": 13,
+      "package_id": 36,
+      "core_id": 13,
+      "thread_siblings": "13",
+      "cluster_id": 1144
+    },
+    {
+      "cpu_id": 14,
+      "package_id": 36,
+      "core_id": 14,
+      "thread_siblings": "14",
+      "cluster_id": 1144
+    },
+    {
+      "cpu_id": 15,
+      "package_id": 36,
+      "core_id": 15,
+      "thread_siblings": "15",
+      "cluster_id": 1144
+    },
+    {
+      "cpu_id": 16,
+      "package_id": 36,
+      "core_id": 16,
+      "thread_siblings": "16",
+      "cluster_id": 1144
+    },
+    {
+      "cpu_id": 17,
+      "package_id": 36,
+      "core_id": 17,
+      "thread_siblings": "17",
+      "cluster_id": 1144
+    },
+    {
+      "cpu_id": 18,
+      "package_id": 36,
+      "core_id": 18,
+      "thread_siblings": "18",
+      "cluster_id": 1144
+    },
+    {
+      "cpu_id": 19,
+      "package_id": 36,
+      "core_id": 19,
+      "thread_siblings": "19",
+      "cluster_id": 1144
+    }
+  ],
+  "legacy_lscpu_cpu_socket_core_node": [
+    [
+      0,
+      0,
+      0,
+      0
+    ],
+    [
+      1,
+      0,
+      1,
+      0
+    ],
+    [
+      2,
+      0,
+      2,
+      0
+    ],
+    [
+      3,
+      0,
+      3,
+      0
+    ],
+    [
+      4,
+      0,
+      4,
+      0
+    ],
+    [
+      5,
+      0,
+      0,
+      0
+    ],
+    [
+      6,
+      0,
+      1,
+      0
+    ],
+    [
+      7,
+      0,
+      2,
+      0
+    ],
+    [
+      8,
+      0,
+      3,
+      0
+    ],
+    [
+      9,
+      0,
+      4,
+      0
+    ],
+    [
+      10,
+      0,
+      5,
+      0
+    ],
+    [
+      11,
+      0,
+      6,
+      0
+    ],
+    [
+      12,
+      0,
+      7,
+      0
+    ],
+    [
+      13,
+      0,
+      8,
+      0
+    ],
+    [
+      14,
+      0,
+      9,
+      0
+    ],
+    [
+      15,
+      0,
+      5,
+      0
+    ],
+    [
+      16,
+      0,
+      6,
+      0
+    ],
+    [
+      17,
+      0,
+      7,
+      0
+    ],
+    [
+      18,
+      0,
+      8,
+      0
+    ],
+    [
+      19,
+      0,
+      9,
+      0
+    ]
+  ],
+  "legacy_summary": {
+    "sockets": "1\n1",
+    "cores_per_socket": "10\n10",
+    "threads_per_core": "1\n1"
+  }
+}

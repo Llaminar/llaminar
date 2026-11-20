@@ -137,6 +137,16 @@ include("{module.as_posix()}")
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn("actual source-build authority", result.stderr)
 
+            # A cache without its source-root entry cannot inherit /src from
+            # the surrounding image when the proof target owns compilation.
+            (root / "missing").mkdir()
+            (root / "missing" / "CMakeCache.txt").touch()
+            result = subprocess.run([self.cmake, "-S", str(root), "-B", str(root / "empty-cache"),
+                "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={self.ninja}", "-DV2_PERF_TESTS_ONLY=OFF"],
+                capture_output=True, text=True, timeout=15)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("actual source-build authority", result.stderr)
+
     def test_explicit_release_native_owner_and_aliases(self):
         """Original owners and script aliases opt in without entering default all."""
         declaration = CMAKE_LISTS.read_text(encoding="utf-8")
@@ -1135,10 +1145,19 @@ if(NOT V2_PERF_TESTS_ONLY)
     if(NOT _cohort_original_unit_cases)
         message(FATAL_ERROR "Cohort module declares no original Unit cases")
     endif()
+    # Pooled sources are CUDA/ROCm-native: without a compiled GPU family the
+    # cohort executable declares REQUIRES_BACKEND and every case is omitted
+    # and counted, never registered to fail on "not compiled".
+    get_property(omitted GLOBAL PROPERTY V2_BACKEND_OMITTED_TESTS)
     foreach(case IN LISTS _cohort_original_unit_cases)
         string(REPLACE "." "_" case_id "${{case}}")
-        if(NOT "V2_Unit_PooledOriginal_${{case_id}}" IN_LIST tests)
-            message(FATAL_ERROR "Missing original cohort Unit registration: ${{case}}")
+        if(HAVE_CUDA OR HAVE_ROCM)
+            if(NOT "V2_Unit_PooledOriginal_${{case_id}}" IN_LIST tests)
+                message(FATAL_ERROR "Missing original cohort Unit registration: ${{case}}")
+            endif()
+        elseif("V2_Unit_PooledOriginal_${{case_id}}" IN_LIST tests OR
+               NOT "V2_Unit_PooledOriginal_${{case_id}}" IN_LIST omitted)
+            message(FATAL_ERROR "CPU-only build must omit and count cohort case: ${{case}}")
         endif()
     endforeach()
 endif()
@@ -1179,7 +1198,10 @@ endif()
 
                         self.assertNotIn("V2_Integration_PooledImmutableMixedLocalGraphReplay",
                                          [entry["name"] for entry in tests])
-                        expected = set() if performance_only else {prefix + case + "Replay" for case in mixed_cases}
+                        # The owner-pin executable requires a compiled GPU
+                        # family; CPU-only builds omit (and count) its cases.
+                        expected = (set() if performance_only or not (cuda or rocm)
+                                    else {prefix + case + "Replay" for case in mixed_cases})
                         self.assertEqual({entry["name"] for entry in actual}, expected)
                         self.assertEqual(len(actual), len(expected), "Mixed-local registration duplicate")
                         for entry in actual:
@@ -1202,7 +1224,11 @@ endif()
                                 r"add_v2_test\((V2_[A-Za-z0-9_]+)(?=[\s)])",
                                 COHORT_REGISTRATION.read_text(encoding="utf-8")))
                             self.assertTrue(cohort_names)
-                            self.assertTrue(cohort_names <= names, cohort_names - names)
+                            if cuda or rocm:
+                                self.assertTrue(cohort_names <= names, cohort_names - names)
+                            else:
+                                # The cohort executable requires a GPU family.
+                                self.assertFalse(cohort_names & names, cohort_names & names)
                             self.assertNotIn("V2_Unit_", names)
                             self.assertNotIn("V2_Integration_", names)
                             required = {"V2_Integration_MPINativeDaemonDiagnosticLifetime",
@@ -1210,8 +1236,8 @@ endif()
                                         "V2_Integration_MPIRetirementDiagnostics",
                                         "V2_Integration_MPIRootRetirementBody"}
                             self.assertTrue(required <= names, required - names)
-                            self.assertTrue(any(name.startswith("V2_Unit_PooledOriginal_")
-                                                for name in names))
+                            self.assertEqual(any(name.startswith("V2_Unit_PooledOriginal_")
+                                                 for name in names), cuda or rocm)
                             for test in tests:
                                 properties = {p["name"]: p["value"] for p in test["properties"]}
                                 self.assertIn("ProcessOwned", properties["LABELS"])

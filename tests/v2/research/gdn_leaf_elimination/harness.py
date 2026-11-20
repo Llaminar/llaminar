@@ -519,8 +519,9 @@ def physical_workers():
     for cpu in cpus:
         directory = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
         if directory.is_dir():
+            # Thread-sibling sets identify cores; GB10 repeats core_id across clusters.
             cores.add(((directory / "physical_package_id").read_text().strip(),
-                       (directory / "core_id").read_text().strip()))
+                       (directory / "thread_siblings_list").read_text().strip()))
         else:
             cores.add((0, cpu))
     return max(1, len(cores))

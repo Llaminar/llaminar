@@ -72,7 +72,7 @@ CPUNativeQuantisedPackedWeights buildTestPacked(
     if (interleaved_sz > 0)
     {
         packed.native_interleaved.resize_uninitialized(interleaved_sz);
-        fillPattern(packed.native_interleaved.data(), interleaved_sz);
+        fillPattern(packed.native_interleaved.beginRewrite().data(), interleaved_sz);
     }
     if (payload_sz > 0)
     {

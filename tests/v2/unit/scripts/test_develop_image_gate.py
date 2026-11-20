@@ -3,9 +3,9 @@
 #  @brief Exercise PR and image publication commands, hardware scope and failure evidence.
 """Device-free contracts for model-free develop PR and image-publication gates.
 
-The PR workflow consumes the same image driver in independent AVX512 and AVX2
-jobs without publication. Its actual matrix command is parsed and exercised
-here so ISA coverage, model exclusion and read-only cache access stay explicit.
+The x86 PR workflow consumes the shared image driver in independent ISA jobs.
+The native ARM64 PR workflow uses the same CTest execution and evidence
+contracts with its own label-scoped inventory.
 """
 from __future__ import annotations
 
@@ -28,7 +28,9 @@ import yaml
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 
+import apply_master_ruleset as ruleset
 import run_develop_image_gate as gate
+import prebuilt_test_image
 import run_develop_pr_tests as pr_runner
 
 
@@ -283,6 +285,70 @@ class DevelopImageGateTests(unittest.TestCase):
                 self.assertEqual(report["lanes"]["unit"]["tests"], ["V2_Unit_Contract"])
                 if unit_outcome == 0:
                     self.assertEqual(report["lanes"]["host"]["tests"], ["V2_Integration_HostContract"])
+
+    def test_required_arm64_context_runs_for_ready_develop_prs(self):
+        """Keep the ARM64 job name and merge-rule context bound to each other."""
+        workflow = yaml.load((ROOT / ".github/workflows/develop-pr-arm64.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        self.assertEqual(workflow["on"]["pull_request"], {
+            "branches": ["develop"],
+            "types": ["opened", "synchronize", "reopened", "ready_for_review"]})
+        job = workflow["jobs"]["arm64"]
+        self.assertIn(job["name"], ruleset.DEVELOP_REQUIRED_CHECKS)
+        self.assertEqual(job["runs-on"], "ubuntu-24.04-arm")
+        self.assertEqual(job["if"], "${{ !github.event.pull_request.draft }}")
+
+    def test_arm64_pr_driver_runs_only_scoped_unit_and_host_tests(self):
+        """Execute real CTest with unrelated cases around the selected indices."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = root / "build"
+            build.mkdir()
+            registrations = []
+            for name, labels, outcome in (
+                ("V2_Unit_Unrelated", "Unit", 99),
+                ("V2_Integration_Unrelated", "Integration;ProductionTestPreflight", 99),
+                ("V2_Unit_ARM", "Unit;ARM64PR", 0),
+                ("V2_Integration_ARM", "Integration;ProductionTestPreflight;ARM64PR", 0),
+                ("V2_Integration_Model", "Integration;FullModel", 99),
+            ):
+                registrations += [
+                    f'add_test({name} "{sys.executable}" "-c" "raise SystemExit({outcome})")',
+                    f'set_tests_properties({name} PROPERTIES LABELS "{labels}" TIMEOUT 30)',
+                ]
+            (build / "CTestTestfile.cmake").write_text("\n".join(registrations) + "\n")
+            (build / "CMakeFiles").mkdir()
+            for name in ("compile_commands.json", "build.ninja", "CMakeFiles/rules.ninja"):
+                (build / name).write_text("fixture metadata")
+            mpi = root / "libmpi.so"
+            mpi.write_bytes(b"fixture MPI library")
+            (build / "CMakeCache.txt").write_text(f"MPI_mpi_LIBRARY:FILEPATH={mpi}\n")
+            receipt = root / "receipt.json"
+            scope = pr_runner.InstalledTestScope.ARM64_PR
+            prebuilt_test_image.seal(receipt, build, scope)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                prebuilt_test_image.validate(receipt, build, pr_runner.InstalledTestScope.PRODUCTION)
+            output = root / "results"
+            with patch.object(pr_runner.platform, "system", return_value="Linux"), \
+                 patch.object(pr_runner.platform, "machine", return_value="aarch64"):
+                self.assertEqual(pr_runner.main([
+                    "--arm64", "--build-dir", str(build), "--output", str(output),
+                    "--installed-build-receipt", str(receipt),
+                ]), 0)
+            report = json.loads((output / "pr-tests.json").read_text())
+            self.assertEqual(report["scope"], "arm64-unit-and-host")
+            self.assertTrue(report["complete"])
+            self.assertEqual(report["lanes"]["unit"]["tests"], ["V2_Unit_ARM"])
+            self.assertEqual(report["lanes"]["host"]["tests"], ["V2_Integration_ARM"])
+
+            ctest_file = build / "CTestTestfile.cmake"
+            ctest_file.write_text(ctest_file.read_text() + "\n")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                prebuilt_test_image.validate(receipt, build, scope)
+            ctest_file.write_text(ctest_file.read_text().replace(
+                "Unit;ARM64PR", "Unit;ARM64PR;CUDA"))
+            with self.assertRaisesRegex(ValueError, "host-only"):
+                prebuilt_test_image.seal(receipt, build, scope)
 
     def test_pr_driver_rejects_an_empty_host_lane(self):
         """A GPU-only preflight inventory must not become a green host gate."""
@@ -583,6 +649,28 @@ class DevelopImageGateTests(unittest.TestCase):
                         pass
                     else:
                         os.killpg(child_pid, signal.SIGKILL)
+
+    def test_ci_replaces_the_step_shell_with_the_cancellable_driver(self):
+        """The selected CI steps deliver cancellation directly to the image gate."""
+        workflows = ROOT / ".github/workflows"
+        driver = "python3 scripts/ci/run_develop_image_gate.py"
+        for workflow, job in (
+            ("develop-pr-tests.yml", "unit"),
+            ("develop-image-isa.yml", "runtime"),
+            ("ci.yml", "publish"),
+        ):
+            with self.subTest(workflow=workflow, job=job):
+                policy = yaml.load((workflows / workflow).read_text(), Loader=yaml.BaseLoader)
+                commands = [
+                    step["run"]
+                    for step in policy["jobs"][job]["steps"]
+                    if driver in step.get("run", "")
+                ]
+                self.assertEqual(len(commands), 1)
+                self.assertTrue(
+                    any(line.startswith(f"exec {driver} ") for line in commands[0].splitlines()),
+                    "the image gate must replace its step shell",
+                )
 
     def test_ci_stages_each_isa_after_its_own_toolchain_job(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()

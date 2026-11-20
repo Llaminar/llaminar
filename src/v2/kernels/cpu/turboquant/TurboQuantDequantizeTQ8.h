@@ -24,6 +24,10 @@
 #include <immintrin.h>
 #endif
 
+#if LLAMINAR_COMPILED_WITH_NEON
+#include <arm_neon.h>
+#endif
+
 #if defined(__AVX2__)
 #include "../simd/AVX2Helpers.h"
 #endif
@@ -120,6 +124,37 @@ namespace llaminar2
             _mm512_storeu_ps(
                 scratch + i,
                 _mm512_mul_ps(vcentroids, vreconstruction_scale));
+        }
+        apply_rotation_transpose(ctx.rotation(), scratch, output);
+    }
+#endif
+
+#if LLAMINAR_COMPILED_WITH_NEON
+    /// NEON dequantize: TQ8 → FP32 (four-lane gather + scale, scalar per-element program)
+    template <int D>
+    inline void turboquant_dequantize_tq8_neon(
+        const TQ8Block<D> &block,
+        const TurboQuantContext &ctx,
+        float *output,
+        float *scratch)
+    {
+        static_assert(D % 4 == 0, "D must be a multiple of 4 for NEON");
+        if (block.norm < 1e-30f)
+        {
+            for (int i = 0; i < D; ++i)
+                output[i] = 0.0f;
+            return;
+        }
+        const float reconstruction_scale =
+            block.reconstruction_norm / std::sqrt(static_cast<float>(D));
+        const float32x4_t vreconstruction_scale = vdupq_n_f32(reconstruction_scale);
+        for (int i = 0; i < D; i += 4)
+        {
+            // Original-codebook gather then the single original scale multiply.
+            float words[4];
+            for (int j = 0; j < 4; ++j)
+                words[j] = TQ8_CENTROIDS[block.indices[i + j]];
+            vst1q_f32(scratch + i, vmulq_f32(vld1q_f32(words), vreconstruction_scale));
         }
         apply_rotation_transpose(ctx.rotation(), scratch, output);
     }

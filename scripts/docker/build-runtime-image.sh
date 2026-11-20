@@ -29,7 +29,9 @@ Options:
       --build-type TYPE    LLAMINAR_BUILD_TYPE build arg. Default: Release.
       --variant VARIANT    Backend/runtime variant: full, cpu, cuda, rocm.
                            Default: full.
-      --cpu-isa ISA        LLAMINAR_CPU_ISA build arg: AVX512 or AVX2.
+      --cpu-isa ISA        LLAMINAR_CPU_ISA build arg: AVX512, AVX2 or NEON.
+                           NEON selects linux/arm64 with the cpu or cuda variant.
+                           On ARM64 the CUDA default is 121 (NVIDIA GB10).
                            Dockerfile default if unset.
       --cpu-only           Alias for --variant cpu.
       --cuda-only          Alias for --variant cuda.
@@ -47,6 +49,7 @@ Options:
                            Build integration binaries too, matching the full
                            CI builder image behavior.
       --build-arg ARG      Extra Docker build arg, KEY=VALUE. Repeatable.
+      --build-context ARG  Named BuildKit context, NAME=VALUE. Repeatable.
       --label LABEL        Extra image label, KEY=VALUE. Repeatable.
       --platform PLATFORM  Optional docker buildx platform.
       --build-network MODE Optional network mode for Dockerfile RUN steps.
@@ -114,6 +117,7 @@ labels=()
 cache_from=()
 cache_to=()
 extra_build_args=()
+build_contexts=()
 output_mode="${LLAMINAR_IMAGE_OUTPUT:-load}"
 verify_mode="auto"
 dry_run=false
@@ -239,6 +243,11 @@ while (($#)); do
             extra_build_args+=("$2")
             shift 2
             ;;
+        --build-context)
+            [[ $# -ge 2 && "$2" == ?*=* ]] || die "$1 requires NAME=VALUE"
+            build_contexts+=("$2")
+            shift 2
+            ;;
         --label)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             labels+=("$2")
@@ -298,8 +307,8 @@ esac
 if [[ -n "${cpu_isa}" ]]; then
     cpu_isa="${cpu_isa^^}"
     case "${cpu_isa}" in
-        AVX512|AVX2) ;;
-        *) die "unsupported --cpu-isa '${cpu_isa}' (expected AVX512 or AVX2)" ;;
+        AVX512|AVX2|NEON) ;;
+        *) die "unsupported --cpu-isa '${cpu_isa}' (expected AVX512, AVX2, or NEON)" ;;
     esac
 fi
 
@@ -331,6 +340,19 @@ case "${image_variant}" in
 esac
 enable_cuda="$(normalize_bool_arg "${enable_cuda}")" || die "LLAMINAR_ENABLE_CUDA must be ON or OFF"
 enable_rocm="$(normalize_bool_arg "${enable_rocm}")" || die "LLAMINAR_ENABLE_ROCM must be ON or OFF"
+if [[ "${cpu_isa}" == "NEON" || "${platform}" == "linux/arm64" ]]; then
+    : "${platform:=linux/arm64}"
+    : "${cpu_isa:=NEON}"
+    [[ "${platform}" == "linux/arm64" && "${cpu_isa}" == "NEON" ]] ||
+        die "the NEON runtime requires --platform linux/arm64"
+    [[ "${image_variant}" == "cpu" || "${image_variant}" == "cuda" ]] ||
+        die "the ARM64 runtime requires --variant cpu or --variant cuda"
+    [[ "${enable_rocm}" == "OFF" ]] || die "the pinned ROCm SDK does not support Linux ARM64"
+    [[ "${skip_integration}" == "1" ]] || die "build the test-runner target with the arm64-pr inventory for ARM Unit and host tests"
+    if [[ "${enable_cuda}" == "ON" ]]; then
+        : "${cuda_archs:=121}"
+    fi
+fi
 if [[ "${enable_rocm}" == "OFF" ]]; then
     rocm_runtime_gpu_targets=""
 elif [[ -n "${rocm_runtime_gpu_targets}" ]]; then
@@ -408,6 +430,9 @@ for tag in "${tags[@]}"; do
 done
 for label in "${labels[@]}"; do
     cmd+=(--label "${label}")
+done
+for context in "${build_contexts[@]}"; do
+    cmd+=(--build-context "${context}")
 done
 for cache_spec in "${cache_from[@]}"; do
     cmd+=(--cache-from "${cache_spec}")

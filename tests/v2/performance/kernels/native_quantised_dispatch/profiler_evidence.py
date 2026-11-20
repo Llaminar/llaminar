@@ -38,6 +38,7 @@ from functools import cached_property
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Sequence
 
+from .host_cores import physical_core_count
 from .candidate_observation import (
     read_observation_csv,
     read_observation_rows,
@@ -462,22 +463,9 @@ def _read_canonical_manifest_document(
 
 
 def _physical_core_count() -> int:
-    """Return the affinity-visible physical-core count for offline hashing."""
+    """Return affinity-visible physical cores (one worker per core; see ``host_cores``)."""
 
-    try:
-        visible_cpus = tuple(sorted(os.sched_getaffinity(0)))
-    except AttributeError:
-        visible_cpus = tuple(range(os.cpu_count() or 1))
-    physical = set()
-    for cpu in visible_cpus:
-        topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
-        try:
-            package = (topology / "physical_package_id").read_text().strip()
-            core = (topology / "core_id").read_text().strip()
-        except OSError:
-            return max(1, len(visible_cpus))
-        physical.add((package, core))
-    return max(1, len(physical))
+    return physical_core_count()
 
 
 def _offline_worker_count(

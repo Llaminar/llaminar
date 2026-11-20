@@ -126,7 +126,9 @@ def find_violations(repo_root: pathlib.Path) -> list[str]:
                         f"entrypoint {entrypoint} is forbidden"
                     )
             if path.name in {
-                "CUDANativeQuantisedPrefillKernels.cu",
+                "CUDANativeQuantisedPrefillShardImpl.cu.inc",
+                "CUDANativeQuantisedPrefillDispatch.cu",
+                "CUDANativeQuantisedPrefillHostPolicy.h",
                 "CUDANativeQuantisedPrefillDevice.cuh",
             }:
                 for token in NATIVE_QUANTISED_PREFILL_FORBIDDEN_REDUCTIONS:
@@ -244,7 +246,7 @@ def run_self_test() -> int:
 
         unsafe_prefill = (
             root
-            / "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu"
+            / "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillShardImpl.cu.inc"
         )
         unsafe_prefill.write_text(
             "void bad(float *p) { atomicAdd(p, 1.0f); }\n",

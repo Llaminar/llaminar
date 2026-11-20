@@ -330,6 +330,22 @@ TEST_P(CrossVendorCapturedReadFormats, ROCmConsumerCUDAStoragePositive) {
 }
 INSTANTIATE_TEST_SUITE_P(FormatGroups, CrossVendorCapturedReadFormats,
                          ::testing::Range(0u, PooledFormatReplayGroup::Count));
+#endif
+
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
+using RejectionFault = identity_fixture::IdentityFault;
+/** @brief Pin identities can duplicate a row, unique index or slot in the captured request. */
+class CooperativePinRejection : public ::testing::TestWithParam<RejectionFault> {};
+/** @brief Allocation identities can also name a foreign owner or interval. */
+class CooperativeAllocationRejection : public ::testing::TestWithParam<RejectionFault> {};
+INSTANTIATE_TEST_SUITE_P(OriginalFaults, CooperativePinRejection,
+    ::testing::Values(RejectionFault::DuplicateRow, RejectionFault::DuplicateUnique,
+                      RejectionFault::DuplicateSlot));
+INSTANTIATE_TEST_SUITE_P(OriginalFaults, CooperativeAllocationRejection,
+    ::testing::Values(RejectionFault::DuplicateRow, RejectionFault::DuplicateUnique,
+                      RejectionFault::ForeignOwner, RejectionFault::ForeignInterval));
+
+#ifdef HAVE_CUDA
 /** @test Actual CUDA Pin live identity threshold 63, retained capture/reset and exact owner evidence. */
 TEST(PooledImmutableProviderSourceDevice,ExactIdentityCUDAPin63){exactIdentityNativeBoundary(DeviceId::cuda(0),63,ExactIdentityBoundaryTrace::Pin);}
 /** @test Actual CUDA Pin live identity threshold 64, retained capture/reset and exact owner evidence. */
@@ -342,6 +358,8 @@ TEST(PooledImmutableProviderSourceDevice,ExactIdentityCUDARetainedPinsAndAllocat
 TEST(PooledImmutableProviderSourceDevice,ExactIdentityCUDARetainedPinsAndAllocation64){exactIdentityNativeBoundary(DeviceId::cuda(0),64,ExactIdentityBoundaryTrace::RetainedPinsAndAllocation);}
 /** @test Actual CUDA RetainedPinsAndAllocation live identity threshold 65, retained capture/reset and exact owner evidence. */
 TEST(PooledImmutableProviderSourceDevice,ExactIdentityCUDARetainedPinsAndAllocation65){exactIdentityNativeBoundary(DeviceId::cuda(0),65,ExactIdentityBoundaryTrace::RetainedPinsAndAllocation);}
+#endif
+#ifdef HAVE_ROCM
 /** @test Actual ROCm Pin live identity threshold 63, retained capture/reset and exact owner evidence. */
 TEST(PooledImmutableProviderSourceDevice,ExactIdentityROCmPin63){exactIdentityNativeBoundary(DeviceId::rocm(0),63,ExactIdentityBoundaryTrace::Pin);}
 /** @test Actual ROCm Pin live identity threshold 64, retained capture/reset and exact owner evidence. */
@@ -355,6 +373,8 @@ TEST(PooledImmutableProviderSourceDevice,ExactIdentityROCmRetainedPinsAndAllocat
 /** @test Actual ROCm RetainedPinsAndAllocation live identity threshold 65, retained capture/reset and exact owner evidence. */
 TEST(PooledImmutableProviderSourceDevice,ExactIdentityROCmRetainedPinsAndAllocation65){exactIdentityNativeBoundary(DeviceId::rocm(0),65,ExactIdentityBoundaryTrace::RetainedPinsAndAllocation);}
 
+#endif
+#ifdef HAVE_CUDA
 /** @test Actual CUDA cooperative identity live127, original capture/reset and complete owner evidence. */
 TEST(PooledImmutableProviderSourceDevice,ExactIdentityCUDAPin127){exactIdentityNativeBoundary(DeviceId::cuda(0),127,ExactIdentityBoundaryTrace::Pin);}
 /** @test Actual CUDA cooperative identity live128, original capture/reset and complete owner evidence. */
@@ -383,6 +403,8 @@ TEST(PooledImmutableProviderSourceDevice,ExactIdentityCUDARetainedPinsAndAllocat
 TEST(PooledImmutableProviderSourceDevice,ExactIdentityCUDARetainedPinsAndAllocation257){exactIdentityNativeBoundary(DeviceId::cuda(0),257,ExactIdentityBoundaryTrace::RetainedPinsAndAllocation);}
 /** @test Actual CUDA cooperative identity live513, original capture/reset and complete owner evidence. */
 TEST(PooledImmutableProviderSourceDevice,ExactIdentityCUDARetainedPinsAndAllocation513){exactIdentityNativeBoundary(DeviceId::cuda(0),513,ExactIdentityBoundaryTrace::RetainedPinsAndAllocation);}
+#endif
+#ifdef HAVE_ROCM
 /** @test Actual ROCm cooperative identity live127, original capture/reset and complete owner evidence. */
 TEST(PooledImmutableProviderSourceDevice,ExactIdentityROCmPin127){exactIdentityNativeBoundary(DeviceId::rocm(0),127,ExactIdentityBoundaryTrace::Pin);}
 /** @test Actual ROCm cooperative identity live128, original capture/reset and complete owner evidence. */
@@ -412,55 +434,63 @@ TEST(PooledImmutableProviderSourceDevice,ExactIdentityROCmRetainedPinsAndAllocat
 /** @test Actual ROCm cooperative identity live513, original capture/reset and complete owner evidence. */
 TEST(PooledImmutableProviderSourceDevice,ExactIdentityROCmRetainedPinsAndAllocation513){exactIdentityNativeBoundary(DeviceId::rocm(0),513,ExactIdentityBoundaryTrace::RetainedPinsAndAllocation);}
 
+#endif
+#ifdef HAVE_CUDA
 /** @test Actual captured CUDA Pin malformed65 identities, physical Row32, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionCUDAPin65Row32){exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,false);}
+TEST_P(CooperativePinRejection, CUDAPin65Row32){exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,false,GetParam());}
 /** @test Actual captured CUDA Pin malformed65 identities, physical Row64, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionCUDAPin65Row64){exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,true);}
+TEST_P(CooperativePinRejection, CUDAPin65Row64){exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::Pin,true,GetParam());}
 /** @test Actual captured CUDA Pin malformed257 identities, physical Row32, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionCUDAPin257Row32){exactIdentityNativeRejection(DeviceId::cuda(0),257,n::OwnerAction::Pin,false);}
+TEST_P(CooperativePinRejection, CUDAPin257Row32){exactIdentityNativeRejection(DeviceId::cuda(0),257,n::OwnerAction::Pin,false,GetParam());}
 /** @test Actual captured CUDA Pin malformed257 identities, physical Row64, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionCUDAPin257Row64){exactIdentityNativeRejection(DeviceId::cuda(0),257,n::OwnerAction::Pin,true);}
+TEST_P(CooperativePinRejection, CUDAPin257Row64){exactIdentityNativeRejection(DeviceId::cuda(0),257,n::OwnerAction::Pin,true,GetParam());}
 /** @test Actual captured CUDA Free malformed65 identities, physical Row32, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionCUDAFree65Row32){exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::AcceptFree,false);}
+TEST_P(CooperativeAllocationRejection, CUDAFree65Row32){exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::AcceptFree,false,GetParam());}
 /** @test Actual captured CUDA Free malformed65 identities, physical Row64, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionCUDAFree65Row64){exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::AcceptFree,true);}
+TEST_P(CooperativeAllocationRejection, CUDAFree65Row64){exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::AcceptFree,true,GetParam());}
 /** @test Actual captured CUDA Free malformed257 identities, physical Row32, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionCUDAFree257Row32){exactIdentityNativeRejection(DeviceId::cuda(0),257,n::OwnerAction::AcceptFree,false);}
+TEST_P(CooperativeAllocationRejection, CUDAFree257Row32){exactIdentityNativeRejection(DeviceId::cuda(0),257,n::OwnerAction::AcceptFree,false,GetParam());}
 /** @test Actual captured CUDA Free malformed257 identities, physical Row64, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionCUDAFree257Row64){exactIdentityNativeRejection(DeviceId::cuda(0),257,n::OwnerAction::AcceptFree,true);}
+TEST_P(CooperativeAllocationRejection, CUDAFree257Row64){exactIdentityNativeRejection(DeviceId::cuda(0),257,n::OwnerAction::AcceptFree,true,GetParam());}
 /** @test Actual captured CUDA Victim malformed65 identities, physical Row32, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionCUDAVictim65Row32){exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::AcceptVictim,false);}
+TEST_P(CooperativeAllocationRejection, CUDAVictim65Row32){exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::AcceptVictim,false,GetParam());}
 /** @test Actual captured CUDA Victim malformed65 identities, physical Row64, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionCUDAVictim65Row64){exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::AcceptVictim,true);}
+TEST_P(CooperativeAllocationRejection, CUDAVictim65Row64){exactIdentityNativeRejection(DeviceId::cuda(0),65,n::OwnerAction::AcceptVictim,true,GetParam());}
 /** @test Actual captured CUDA Victim malformed257 identities, physical Row32, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionCUDAVictim257Row32){exactIdentityNativeRejection(DeviceId::cuda(0),257,n::OwnerAction::AcceptVictim,false);}
+TEST_P(CooperativeAllocationRejection, CUDAVictim257Row32){exactIdentityNativeRejection(DeviceId::cuda(0),257,n::OwnerAction::AcceptVictim,false,GetParam());}
 /** @test Actual captured CUDA Victim malformed257 identities, physical Row64, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionCUDAVictim257Row64){exactIdentityNativeRejection(DeviceId::cuda(0),257,n::OwnerAction::AcceptVictim,true);}
+TEST_P(CooperativeAllocationRejection, CUDAVictim257Row64){exactIdentityNativeRejection(DeviceId::cuda(0),257,n::OwnerAction::AcceptVictim,true,GetParam());}
+#endif
+#ifdef HAVE_ROCM
 /** @test Actual captured ROCm Pin malformed65 identities, physical Row32, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionROCmPin65Row32){exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,false);}
+TEST_P(CooperativePinRejection, ROCmPin65Row32){exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,false,GetParam());}
 /** @test Actual captured ROCm Pin malformed65 identities, physical Row64, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionROCmPin65Row64){exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,true);}
+TEST_P(CooperativePinRejection, ROCmPin65Row64){exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::Pin,true,GetParam());}
 /** @test Actual captured ROCm Pin malformed257 identities, physical Row32, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionROCmPin257Row32){exactIdentityNativeRejection(DeviceId::rocm(0),257,n::OwnerAction::Pin,false);}
+TEST_P(CooperativePinRejection, ROCmPin257Row32){exactIdentityNativeRejection(DeviceId::rocm(0),257,n::OwnerAction::Pin,false,GetParam());}
 /** @test Actual captured ROCm Pin malformed257 identities, physical Row64, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionROCmPin257Row64){exactIdentityNativeRejection(DeviceId::rocm(0),257,n::OwnerAction::Pin,true);}
+TEST_P(CooperativePinRejection, ROCmPin257Row64){exactIdentityNativeRejection(DeviceId::rocm(0),257,n::OwnerAction::Pin,true,GetParam());}
 /** @test Actual captured ROCm Free malformed65 identities, physical Row32, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionROCmFree65Row32){exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::AcceptFree,false);}
+TEST_P(CooperativeAllocationRejection, ROCmFree65Row32){exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::AcceptFree,false,GetParam());}
 /** @test Actual captured ROCm Free malformed65 identities, physical Row64, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionROCmFree65Row64){exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::AcceptFree,true);}
+TEST_P(CooperativeAllocationRejection, ROCmFree65Row64){exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::AcceptFree,true,GetParam());}
 /** @test Actual captured ROCm Free malformed257 identities, physical Row32, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionROCmFree257Row32){exactIdentityNativeRejection(DeviceId::rocm(0),257,n::OwnerAction::AcceptFree,false);}
+TEST_P(CooperativeAllocationRejection, ROCmFree257Row32){exactIdentityNativeRejection(DeviceId::rocm(0),257,n::OwnerAction::AcceptFree,false,GetParam());}
 /** @test Actual captured ROCm Free malformed257 identities, physical Row64, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionROCmFree257Row64){exactIdentityNativeRejection(DeviceId::rocm(0),257,n::OwnerAction::AcceptFree,true);}
+TEST_P(CooperativeAllocationRejection, ROCmFree257Row64){exactIdentityNativeRejection(DeviceId::rocm(0),257,n::OwnerAction::AcceptFree,true,GetParam());}
 /** @test Actual captured ROCm Victim malformed65 identities, physical Row32, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionROCmVictim65Row32){exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::AcceptVictim,false);}
+TEST_P(CooperativeAllocationRejection, ROCmVictim65Row32){exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::AcceptVictim,false,GetParam());}
 /** @test Actual captured ROCm Victim malformed65 identities, physical Row64, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionROCmVictim65Row64){exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::AcceptVictim,true);}
+TEST_P(CooperativeAllocationRejection, ROCmVictim65Row64){exactIdentityNativeRejection(DeviceId::rocm(0),65,n::OwnerAction::AcceptVictim,true,GetParam());}
 /** @test Actual captured ROCm Victim malformed257 identities, physical Row32, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionROCmVictim257Row32){exactIdentityNativeRejection(DeviceId::rocm(0),257,n::OwnerAction::AcceptVictim,false);}
+TEST_P(CooperativeAllocationRejection, ROCmVictim257Row32){exactIdentityNativeRejection(DeviceId::rocm(0),257,n::OwnerAction::AcceptVictim,false,GetParam());}
 /** @test Actual captured ROCm Victim malformed257 identities, physical Row64, original scalar oracle. */
-TEST(PooledImmutableProviderSourceDevice,CooperativeRejectionROCmVictim257Row64){exactIdentityNativeRejection(DeviceId::rocm(0),257,n::OwnerAction::AcceptVictim,true);}
+TEST_P(CooperativeAllocationRejection, ROCmVictim257Row64){exactIdentityNativeRejection(DeviceId::rocm(0),257,n::OwnerAction::AcceptVictim,true,GetParam());}
 
+#endif
+#endif
+
+#if defined(HAVE_CUDA) && defined(HAVE_ROCM)
 /** @test Complete actual cross-vendor 2-owner Positive trajectory; hardware absence fails explicitly. */
 TEST(PooledImmutableProviderSourceDevice,CrossVendorCUDAConsumer2ROCmOwnersPositiveReplay){crossVendorMultiOwnerTrajectory(DeviceId::cuda(0),{DeviceId::rocm(1),DeviceId::rocm(0)},{3,3});}
 /** @test Complete actual cross-vendor 2-owner MixedC0 trajectory; hardware absence fails explicitly. */

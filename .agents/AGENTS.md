@@ -354,12 +354,17 @@ complete hardware-qualified `ProductionTestPreflight` inventory in a separate
 GPU container, including CUDA, ROCm, mixed-backend and exclusive work. Native
 hardware observation and explicit CMake requirements own eligibility; absent
 geometries remain unqualified in the receipt. Both GPUs are required, and
-failures or skips in selected tests block the gate. Both ISA checks must pass.
+failures or skips in selected tests block the gate. The AVX2, AVX512 and
+ARM64 checks are required. The native GitHub ARM64 PR check builds the same
+`test-runner` and `runtime` targets with NEON and CUDA for GB10. It verifies
+the sealed `ARM64PR` Unit
+and host preflight results and checks Release startup.
 Production certification still requires its own complete hardware qualification.
 A successful develop merge builds the AVX512 and AVX2 runtime images in
 parallel on standard GitHub-hosted Ubuntu 24.04 runners. Each ISA prepares its
 cached toolchain and compiles the Release runtime in separate jobs. A final
-job publishes the verified pair.
+job publishes the verified pair. The native ARM64 job builds and smoke-tests the
+CUDA+CPU runtime before publishing its ARM64 tags.
 These images are development artifacts; this gate does not certify a release.
 
 Only upon explicit user direction, cut a release candidate branch named
@@ -535,6 +540,15 @@ compiler-resource changes, compile the complete architecture set declared by
 the canonical image build, not only the locally installed GPU's target. Record
 the target set with the validation evidence. Passing native-device runtime
 tests does not prove register allocation on the other shipped targets.
+
+Spill evidence must also be reproducible. nvcc `--split-compile` partitions a
+module nondeterministically, so identical compiles can allocate registers
+differently and flip the spill verdict. It is forbidden on every project
+target. Large kernel families get compile throughput from persistent
+translation-unit shards instead, as CUDA NativeQuantised decode/prefill and
+flash attention do. `V2_Integration_DeterministicGPUCompilation` in
+`ProductionTestPreflight` checks every CMake declaration and the build's
+actual device compile commands.
 
 Parallel full-LTO RCCL builds use the builder-owned fixed linker installed by
 `scripts/docker/install-rocm-lto-linker.sh`. Its source/patch pins belong to
@@ -828,6 +842,14 @@ cmake -B build_v2_integration -S src/v2 -G Ninja \
   -DCMAKE_MAKE_PROGRAM:FILEPATH="${LLAMINAR_NINJA_BIN}"
 cmake --build build_v2_integration --parallel
 ```
+
+For ARM port work, `cmake/CPUInstructionSet.cmake` owns the architecture/ISA
+compiler envelope; `src/v2/utils/ARMCPUFeatures.h` owns native optional-instruction
+observations. The core-free `tests/v2/portability` project uses the normal CPU
+architecture regression registrations; see the README's AArch64 checks.
+The native Linux ARM64 PR gate also exercises the production CPU paths and
+checks startup of the CUDA+CPU release image. Real-checkpoint inference and
+GPU execution require their own qualifications.
 
 The supported build types are `Debug`, `Release`, and `Integration`. CUDA and
 ROCm are both enabled by default. Disable an unavailable toolchain explicitly,

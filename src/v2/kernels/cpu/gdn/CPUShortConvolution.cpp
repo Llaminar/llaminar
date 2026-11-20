@@ -29,6 +29,9 @@
 #endif
 
 #include "../simd/AVX2Helpers.h"
+#if LLAMINAR_COMPILED_WITH_NEON
+#include "../simd/NEONHelpers.h"
+#endif
 
 namespace llaminar2
 {
@@ -58,10 +61,14 @@ namespace llaminar2
         float *state = conv_state + static_cast<size_t>(channel) * state_len;
         const float current_input = input_row[channel];
 
+        // Explicit FMA chain in increasing tap order, the same program as the
+        // SIMD prefill leaves. Implicit `sum += w * x` left contraction and SLP
+        // vectorization of the products to each inlining site, so the serial
+        // and verifier callers of this helper could round differently.
         float sum = bias ? bias[channel] : 0.0f;
         for (int k = 0; k < state_len; ++k)
-            sum += w[k] * state[k];
-        sum += w[state_len] * current_input;
+            sum = std::fma(w[k], state[k], sum);
+        sum = std::fma(w[state_len], current_input, sum);
 
         for (int k = 0; k < state_len - 1; ++k)
             state[k] = state[k + 1];
@@ -793,10 +800,11 @@ namespace llaminar2
                     for (int k = 0; k < kernel_size; ++k)
                     {
                         const int input_t = t - state_len + k;
+                        // Explicit FMA in increasing tap order, as in the SIMD leaves.
                         if (input_t >= 0)
-                            sum += w[k] * input[input_t * channels + c];
+                            sum = std::fma(w[k], input[input_t * channels + c], sum);
                         else if (conv_state)
-                            sum += w[k] * conv_state[c * state_len + state_len + input_t];
+                            sum = std::fma(w[k], conv_state[c * state_len + state_len + input_t], sum);
                     }
                     if (apply_silu)
                     {
@@ -1074,6 +1082,144 @@ namespace llaminar2
     }
 #endif
 
+#if LLAMINAR_COMPILED_WITH_NEON
+    /** @brief Native four-lane causal short-conv prefill program.
+     * @param input Original prompt rows [seq_len, channels]; @param weight [channels, kernel_size].
+     * @param bias Optional per-channel augmentation; @param output Original [seq_len, channels].
+     * @param conv_state Optional tail history [channels, kernel_size-1]; @param seq_len Prompt length.
+     * @param channels Per-row depth; @param kernel_size Causal window; @param apply_silu Whether to activate.
+     * @details Lane-for-lane replication of the AVX2 prefill program: weights are
+     * pre-transposed to k-major (wt[k*channels+c]) and each accumulated output is
+     * an FMA in increasing k order (vfmaq_f32, same operand order as _mm256_fmadd_ps).
+     * Boundary history gathers the same channel-strided state values; complete
+     * four-lane blocks use the shared CPU polynomial SiLU (NEONHelpers fast_silu),
+     * while partial channel tails retain the scalar tail program exactly as AVX2.
+     * Every lane is independent of t and workshare ownership.
+     */
+    static void shortconv_prefill_neon(
+        const float *input, const float *weight, const float *bias,
+        float *output, float *conv_state,
+        int seq_len, int channels, int kernel_size,
+        bool apply_silu)
+    {
+        const int state_len = kernel_size - 1;
+
+        std::vector<float> wt(static_cast<size_t>(kernel_size) * channels);
+        for (int k = 0; k < kernel_size; ++k)
+            for (int c = 0; c < channels; ++c)
+                wt[k * channels + c] = weight[c * kernel_size + k];
+
+        auto do_work = [&]()
+        {
+            const int n_blocks = (channels + 3) / 4;
+
+#pragma omp for schedule(static)
+            for (int blk = 0; blk < n_blocks; ++blk)
+            {
+                const int c_start = blk * 4;
+                const int c_width = (c_start + 4 <= channels) ? 4 : (channels - c_start);
+
+                if (c_width == 4)
+                {
+                    const float32x4_t vbias = bias
+                                                  ? vld1q_f32(bias + c_start)
+                                                  : vdupq_n_f32(0.0f);
+
+                    float32x4_t vw[8];
+                    for (int k = 0; k < kernel_size && k < 8; ++k)
+                        vw[k] = vld1q_f32(&wt[k * channels + c_start]);
+
+                    for (int t = seq_len - 1; t >= 0; --t)
+                    {
+                        float32x4_t vsum = vbias;
+
+                        for (int k = 0; k < kernel_size; ++k)
+                        {
+                            const int input_t = t - state_len + k;
+                            if (input_t >= 0)
+                            {
+                                const float32x4_t vin = vld1q_f32(&input[input_t * channels + c_start]);
+                                vsum = vfmaq_f32(vsum, vw[k], vin);
+                            }
+                            else if (conv_state)
+                            {
+                                alignas(16) float hist[4];
+                                const int state_idx = state_len + input_t;
+                                for (int lane = 0; lane < 4; ++lane)
+                                    hist[lane] = conv_state[(c_start + lane) * state_len + state_idx];
+                                const float32x4_t vh = vld1q_f32(hist);
+                                vsum = vfmaq_f32(vsum, vw[k], vh);
+                            }
+                        }
+
+                        if (apply_silu)
+                            vsum = llaminar2::neon::fast_silu(vsum);
+
+                        vst1q_f32(&output[t * channels + c_start], vsum);
+                    }
+
+                    if (conv_state)
+                    {
+                        for (int ci = 0; ci < c_width; ++ci)
+                        {
+                            const int c = c_start + ci;
+                            float *state = conv_state + c * state_len;
+                            for (int s = 0; s < state_len; ++s)
+                            {
+                                const int src_t = seq_len - state_len + s;
+                                state[s] = (src_t >= 0) ? input[src_t * channels + c]
+                                                         : state[state_len + src_t];
+                            }
+                        }
+                    }
+                }
+                else
+                {
+                    for (int ci = 0; ci < c_width; ++ci)
+                    {
+                        const int c = c_start + ci;
+                        const float b = bias ? bias[c] : 0.0f;
+
+                        for (int t = seq_len - 1; t >= 0; --t)
+                        {
+                            float sum = b;
+                            for (int k = 0; k < kernel_size; ++k)
+                            {
+                                const int input_t = t - state_len + k;
+                                if (input_t >= 0)
+                                    sum += wt[k * channels + c] * input[input_t * channels + c];
+                                else if (conv_state)
+                                    sum += wt[k * channels + c] * conv_state[c * state_len + state_len + input_t];
+                            }
+                            if (apply_silu)
+                            {
+                                const float sig = 1.0f / (1.0f + std::exp(-sum));
+                                output[t * channels + c] = sum * sig;
+                            }
+                            else
+                            {
+                                output[t * channels + c] = sum;
+                            }
+                        }
+
+                        if (conv_state)
+                        {
+                            float *state = conv_state + c * state_len;
+                            for (int s = 0; s < state_len; ++s)
+                            {
+                                const int src_t = seq_len - state_len + s;
+                                state[s] = (src_t >= 0) ? input[src_t * channels + c]
+                                                         : state[state_len + src_t];
+                            }
+                        }
+                    }
+                }
+            }
+        };
+        OMP_WORKSHARE_REGION(do_work);
+    }
+#endif
+
 // Stubs for when ISA is unavailable at compile time
 #if !defined(__AVX2__)
     static void shortconv_prefill_avx2(
@@ -1102,6 +1248,10 @@ namespace llaminar2
         int seq_len, int channels, int kernel_size,
         bool apply_silu)
     {
+        // The SIMD prefill leaves retain at most eight per-tap weight
+        // vectors; a larger causal window would read unwritten registers.
+        if (kernel_size < 1 || kernel_size > kMaxSIMDPrefillKernelSize)
+            return false;
         ISA_DISPATCH_VOID(shortconv_prefill, input, weight, bias, output, conv_state, seq_len, channels, kernel_size, apply_silu);
         return true;
     }
@@ -1182,6 +1332,52 @@ namespace llaminar2
                 const int c_width = c_end - c_start;
 
                 alignas(64) float sums[16];
+                for (int ci = 0; ci < c_width; ++ci)
+                {
+                    const int c = c_start + ci;
+                    sums[ci] = shortconv_decode_sum_and_update_channel(
+                        input, weight, bias, conv_state, c, kernel_size);
+                }
+
+                shortconv_store_decode_block(
+                    sums, output + c_start, c_width, apply_silu);
+            }
+        };
+        OMP_WORKSHARE_REGION(do_work);
+    }
+#endif
+
+#if LLAMINAR_COMPILED_WITH_NEON
+    /** @brief Native four-lane causal short-conv decode serving program.
+     * @param input Original one-token row [channels]; @param weight [channels, kernel_size].
+     * @param bias Optional per-channel augmentation; @param output One-token result [channels].
+     * @param conv_state Required history [channels, kernel_size-1]; @param channels Depth.
+     * @param kernel_size Causal window; @param apply_silu Whether to activate.
+     * @details Mirrors the AVX2 decode serving structure exactly: each channel
+     * run uses the shared scalar sum/state-update program (identical to AVX2's
+     * per-channel sums), four channels are gathered per block, and the existing
+     * block store applies the same SIMD SiLU policy for full blocks and the
+     * scalar SiLU for partial tails. Per-channel arithmetic is independent of
+     * the block width, so every lane matches the AVX2 per-element bytes.
+     */
+    static void shortconv_decode_neon(
+        const float *input, const float *weight, const float *bias,
+        float *output, float *conv_state,
+        int channels, int kernel_size,
+        bool apply_silu)
+    {
+        auto do_work = [&]()
+        {
+            const int n_blocks = (channels + 3) / 4;
+
+#pragma omp for schedule(static)
+            for (int blk = 0; blk < n_blocks; ++blk)
+            {
+                const int c_start = blk * 4;
+                const int c_end = (c_start + 4 <= channels) ? c_start + 4 : channels;
+                const int c_width = c_end - c_start;
+
+                alignas(16) float sums[4];
                 for (int ci = 0; ci < c_width; ++ci)
                 {
                     const int c = c_start + ci;

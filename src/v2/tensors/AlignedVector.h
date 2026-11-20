@@ -31,6 +31,7 @@
 #include <cstdlib> // aligned_alloc, free
 #include <cstdint> // uintptr_t
 #include <cstring> // memcpy
+#include <exception> // terminate; do not rely on a caller's transitive headers
 #include <stdexcept>
 #include <algorithm>
 #include <initializer_list>
@@ -721,6 +722,12 @@ namespace llaminar2
          * tooling never rounds into a neighboring allocation. Anonymous
          * mappings inherently begin on a runtime page boundary and cannot
          * promise a stronger alignment without an over-allocation owner.
+         * @param logical_bytes Logical payload bytes used by the Linux page policy.
+         * @param minimum_alignment Required power-of-two address boundary.
+         * @param storage_kind Actual heap or dedicated mapping implementation.
+         * @return Exact address alignment used by both admission and allocation.
+         * @throws std::invalid_argument For an impossible alignment.
+         * @throws std::runtime_error For an unimplemented mapping platform.
          */
         static size_t effectiveAllocationAlignment(
             size_t logical_bytes,
@@ -752,6 +759,7 @@ namespace llaminar2
                 allocation_alignment = page_size;
             }
 #else
+            (void)logical_bytes; // Non-Linux heap alignment has no NUMA page policy.
             if (storage_kind == StorageKind::AnonymousPageMapping)
             {
                 throw std::runtime_error(

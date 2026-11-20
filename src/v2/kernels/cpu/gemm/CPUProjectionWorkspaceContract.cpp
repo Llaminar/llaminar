@@ -9,7 +9,7 @@
  */
 #include "CPUProjectionWorkspaceContract.h"
 #include "CPUNativeQuantisedTileConfig.h"
-#include "CPUNativeQuantisedWeightPacker.h"
+#include "CPUNativeQuantisedEncoding.h"
 #include "kernels/cpu/CPUInvocationWorkspace.h"
 #include <climits>
 #include <stdexcept>
@@ -44,13 +44,31 @@ namespace llaminar2
         requireGeometry(geometry);
         if (geometry.workers <= 0 || !geometry.execution.isValid())
             throw std::invalid_argument("CPU projection workspace requires participant-owned worker/cache/ISA geometry");
+        if (!footprint.isValid() ||
+            (geometry.numerical_policy != CPUProjectionNumericalPolicy::BackendNative &&
+             geometry.numerical_policy != CPUProjectionNumericalPolicy::GPUAlignedExpert))
+            throw std::invalid_argument("CPU projection workspace requires a known prepared footprint and arithmetic policy");
+        if (geometry.execution.projection_abi == CPUProjectionScheduleABI::ARMRegisterK)
+        {
+            if (!MoEProjectionNumericalContract::ownsOrderedKPartitionTree(codebook) ||
+                (geometry.numerical_policy == CPUProjectionNumericalPolicy::GPUAlignedExpert && geometry.k % 32 != 0))
+                throw std::invalid_argument("Native ARM projection workspace requires a supported source and complete expert K blocks");
+            // The same registered implementation owns both ordinary full-K and
+            // canonical expert trees in registers. No x86 shared-K slab or
+            // anonymous capacity reserve is charged to the native participant.
+            return cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
+        }
         const auto config = cpu::native_quantised::serialTileConfigForPreparedProjection(footprint,
             codebook, geometry.numerical_policy, geometry.serial_n > 0 ? geometry.serial_n : geometry.n,
             geometry.k, geometry.workers, geometry.execution.cache);
         auto requirements = cpuProjectionQ8WorkspaceRequirements(geometry.rows, geometry.k);
-        requirements.merge(cpuProjectionPartialWorkspaceRequirements(cpuProjectionPartialEnvelopeFloats(
+        const auto partials = cpuProjectionPartialWorkspaceRequirements(cpuProjectionPartialEnvelopeFloats(
             geometry.rows, geometry.n, config.k_tiles, geometry.workers,
-            static_cast<int>(geometry.execution.maximum_native_row_tile))));
+            static_cast<int>(geometry.execution.maximum_native_row_tile)));
+        // These are distinct canonical projection names (Q8 versus partials),
+        // not grouped-MoE root-layout merges. Keep this pure BOM independent of
+        // the unrelated storage-layout materialization/composition machinery.
+        requirements.buffers.insert(requirements.buffers.end(), partials.buffers.begin(), partials.buffers.end());
         return requirements;
     }
 

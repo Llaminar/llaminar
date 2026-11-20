@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 from enum import Enum
+from itertools import combinations, permutations
 import json
 import math
 import os
@@ -114,10 +115,10 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
         syntax = r"gfx[0-9][0-9a-f]*" if backend == "rocm" else r"sm_?[0-9]+[a-z]?"
         if not isinstance(isa, str) or re.fullmatch(syntax, isa) is None:
             raise ValueError("invalid optional preflight native ISA")
-    if locality == "local-host" and set(requirement) != required:
+    if locality == "local-host" and not set(requirement) <= required | {"native_isa"}:
         raise ValueError("local device counts cannot replace a topology contract")
     if "peer_access" in requirement:
-        if (requirement["peer_access"] not in ("directed-edge", "no-directed-pair") or degree < 2
+        if (requirement["peer_access"] not in ("directed-edge", "complete", "no-directed-pair") or degree < 2
                 or (requirement["peer_access"] == "no-directed-pair" and degree != 2)
                 or locality != "original-numa-local-rank"
                 or "stage_sizes" in requirement or "rank_sizes" in requirement
@@ -168,7 +169,9 @@ def optional_native_cohort_absence(requirement: dict, hardware: dict) -> dict | 
             if (any(not isinstance(uuid, str) or not uuid for uuid in uuids)
                     or len(set(uuids)) != len(uuids) or len(set(ordinals)) != len(ordinals)):
                 raise ValueError("local physical counts require unique native GPU identities")
-            counts[backend] = len(devices)
+            isa = requirement.get("native_isa")
+            counts[backend] = sum(isa is None or device.get("native_isa", "").split(":", 1)[0] == isa
+                                  for device in devices)
         if requirement.get("requires_host_native_atomics") and counts["rocm"]:
             device = observed.get(("rocm", 0, -1), {})
             capable = device.get("host_native_atomics")
@@ -288,11 +291,18 @@ def optional_native_cohort_absence(requirement: dict, hardware: dict) -> dict | 
             raise ValueError("incomplete or foreign original directed peer matrix")
         cpu_nodes = {device["numa_node"] for address, device in observed.items()
                      if address[0] == "cpu" and device["numa_node"] >= 0}
+        peer_access = requirement["peer_access"]
+
+        def matches_peer_access(ordinals: list[int]) -> bool:
+            if peer_access == "complete":
+                return any(all(facts[(backend, a, b)] for a, b in permutations(group, 2))
+                           for group in combinations(ordinals, degree))
+            return any(facts[(backend, a, b)] if peer_access == "directed-edge"
+                       else not facts[(backend, a, b)] and not facts[(backend, b, a)]
+                       for a, b in permutations(ordinals, 2))
+
         eligible = len(cpu_nodes) >= requirement["mpi_ranks"] and any(
-            numa in cpu_nodes and len(ordinals) >= degree
-            and any((facts[(backend, destination, source)] if requirement["peer_access"] == "directed-edge"
-                     else not facts[(backend, destination, source)] and not facts[(backend, source, destination)])
-                    for source in ordinals for destination in ordinals if source != destination)
+            numa in cpu_nodes and len(ordinals) >= degree and matches_peer_access(ordinals)
             for numa, ordinals in cohorts.items())
         absence["observed_cpu_discovery_nodes"] = sorted(cpu_nodes)
         absence["observed_directed_peer_access"] = matrix
@@ -375,6 +385,19 @@ def digest(value: object) -> str:
     """Authenticate small structured metadata using a deterministic encoding."""
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"),
                                      allow_nan=False).encode()).hexdigest()
+
+
+def file_digest(path: Path) -> str:
+    """Authenticate exact file bytes by streaming SHA256, without a second copy.
+
+    Large native libraries never load into memory at once: the digest streams
+    one-megabyte blocks so sealing an installed artifact stays bounded.
+    """
+    stream_digest = hashlib.sha256()
+    with Path(path).open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            stream_digest.update(block)
+    return stream_digest.hexdigest()
 
 
 def write_json(path: Path, value: object) -> None:

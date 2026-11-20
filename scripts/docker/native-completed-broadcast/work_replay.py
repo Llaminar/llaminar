@@ -25,6 +25,12 @@ for backend in [os.environ['LLAMINAR_NATIVE_REPLAY_BACKEND']]:
 #include <sys/wait.h>
 #include <unistd.h>
 #include <csignal>
+// __builtin_trap() raises the host ISA's trap: ud2/SIGILL on x86-64, brk/SIGTRAP on AArch64.
+#if defined(__aarch64__)
+constexpr int kNativeTrapSignal=SIGTRAP;
+#else
+constexpr int kNativeTrapSignal=SIGILL;
+#endif
 using std::min;
 #define __device__
 #define __forceinline__ inline
@@ -77,7 +83,7 @@ int main(){
    for(uint32_t p=0;p<sizeof(original)/16;++p)loadPack(linear,{offset,ncclDevWorkTypeColl},0,sizeof(original),p,&observed);
    _exit(0);
   }
-  int status=0;assert(waitpid(pid,&status,0)==pid && WIFSIGNALED(status) && WTERMSIG(status)==SIGILL);
+  int status=0;assert(waitpid(pid,&status,0)==pid && WIFSIGNALED(status) && WTERMSIG(status)==kNativeTrapSignal);
  }
  std::cout<<"actual parameter/FIFO native loader PASS, including independently wrapping geometry/tag words, abort-stale count zero, nonabort malformed count traps\n";
 }

@@ -6,11 +6,15 @@
  * accumulation). General projections retain their per-format numerical gates;
  * grouped MTP and ExpertOverlay additionally require serial-row byte identity.
  * Compact-format ordered reductions have an independent scalar decoder oracle
- * for one-block, multi-block and trailing-empty partitions on both CPU ISAs.
+ * for one-block, multi-block and trailing-empty partitions on both x86 CPU ISAs.
+ * Opaque source words must reject reserved bits instead of masking them into
+ * valid coefficients. Rejection is fatal, not rollback of earlier vector stores;
+ * the outer stage may publish only a successfully completed operation.
  *
  * @note Run with Integration build: ctest -R V2_Integration_CPUNativeQuantised_GEMV
  */
 #include "../../../../utils/NativeQuantisedTestPartialStorage.h"
+#include <bit>
 #include <gtest/gtest.h>
 #include <mpi.h>
 #include <omp.h>
@@ -47,6 +51,7 @@
 #include "utils/NativeQuantisedEquivalenceInventory.h"
 #include "utils/VerifierRowTestInventory.h"
 #include "utils/CPUProjectionTestWorkspace.h"
+#include "utils/NativeQuantisedPreparedByteFixture.h"
 
 using namespace llaminar2;
 using namespace llaminar2::cpu::native_quantised;
@@ -54,6 +59,175 @@ using namespace llaminar2::test;
 
 namespace
 {
+#if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
+    /** @test Every x86 vector/lane rejects corrupt source words without hiding partial writes. */
+    TEST(CPUNativeSourceMetadata, ReservedBitsRejectAtEveryVectorLane)
+    {
+        NativeQuantisedPreparedByteFixture fixture(native_quantised_formats::IQ2_S, 64, 32);
+        fixture.seedPayloadAndMetadata();
+        // x86 kernels consume the owner type, not a sealed view: the owner
+        // retains the per-block reserved-bit checks this test certifies.
+        const auto layout = fixture.view();
+        CPUNativeQuantisedPackedWeights packed;
+        packed.N = layout.N; packed.K = layout.K; packed.N_padded = layout.N_padded;
+        packed.blocks_per_row = layout.blocks_per_row; packed.payload_bytes = layout.source_payload_bytes;
+        packed.codebook_id = layout.codebook_id; packed.is_superblock = layout.is_superblock;
+        packed.is_asymmetric = layout.is_asymmetric; packed.encoding = layout.encoding;
+        packed.numerical_policy = layout.numerical_policy; packed.data_stride = layout.data_stride;
+        packed.interleaved_block_stride = layout.interleaved_block_stride;
+        packed.native_interleaved.resize(fixture.bytes.size());
+        const auto owned = packed.native_interleaved.beginRewrite();
+        std::copy(fixture.bytes.begin(), fixture.bytes.end(), owned.begin());
+        Q8_1Block activation{};
+        activation.d = 0x3c00;
+        activation.sum_qs = 32;
+        std::fill(std::begin(activation.qs), std::end(activation.qs), std::int8_t{1});
+        const std::array<const Q8_1Block *, 1> input{&activation};
+        const auto verify = [&]<int Lanes>() {
+            std::array<float, 64> result;
+            const std::array<float *, 1> output{result.data()};
+            multi_scale::dispatch<Lanes, 1>(packed, input, output, 0, 0, 1, false);
+            const auto reference = result;
+            for (int bad_column = 0; bad_column < 64; ++bad_column)
+            {
+                SCOPED_TRACE(::testing::Message() << "lanes=" << Lanes << " bad_column=" << bad_column);
+                auto *word = owned.data() + packed.data_stride + 128 + bad_column * 2;
+                std::uint16_t original = 0;
+                std::memcpy(&original, word, sizeof(original));
+                const std::uint16_t invalid = 0xffff;
+                std::memcpy(word, &invalid, sizeof(invalid));
+                result.fill(123.0f);
+                EXPECT_THROW((multi_scale::dispatch<Lanes, 1>(packed, input, output, 0, 0, 1, false)), std::invalid_argument);
+                const int failed_vector = bad_column / Lanes * Lanes;
+                for (int column = 0; column < 64; ++column)
+                    if (column < failed_vector)
+                        EXPECT_EQ(std::bit_cast<std::uint32_t>(result[column]), std::bit_cast<std::uint32_t>(reference[column]));
+                    else
+                        EXPECT_EQ(result[column], 123.0f);
+                std::memcpy(word, &original, sizeof(original));
+            }
+        };
+        verify.template operator()<8>();
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+        verify.template operator()<16>();
+#endif
+        // IQ4_XS source-scale owners must reject all ten reserved bits as well;
+        // the historic SIMD accessors masked them into a plausible coefficient.
+        CPUNativeQuantisedPackedWeights source_scale;
+        source_scale.codebook_id = native_quantised_formats::IQ4_XS.codebook_id;
+        source_scale.is_superblock = true;
+        source_scale.encoding = CPUNativeQuantisedEncoding::NibbleLUTSourceScale;
+        alignas(64) std::array<std::uint16_t, 128> words;
+        words.fill(0x3c00);
+        std::fill(words.begin() + 64, words.end(), 32);
+        for (int bit = 6; bit < 16; ++bit)
+            for (int lane = 0; lane < 8; ++lane)
+            {
+                words[64 + lane] = std::uint16_t(32 | (1u << bit));
+                EXPECT_THROW((void)source_scale.loadScales256(words.data()), std::invalid_argument);
+                words[64 + lane] = 32;
+            }
+#if defined(__AVX512F__)
+        for (int bit = 6; bit < 16; ++bit)
+            for (int lane = 0; lane < 16; ++lane)
+            {
+                words[64 + lane] = std::uint16_t(32 | (1u << bit));
+                EXPECT_THROW((void)source_scale.loadScales512(words.data()), std::invalid_argument);
+                words[64 + lane] = 32;
+            }
+#endif
+    }
+
+
+    /**
+     * @test x86 readers load whole 64-column vectors, so a partial final chunk's
+     * padding is part of the publication contract. Two complementary fixtures:
+     * an owner whose padding words are raw poison, and an owner of the same
+     * bytes after producer normalization. Each compiled reader (IQ2_S dispatch
+     * at 8 and 16 lanes, IQ3_S/IQ4_XS scale loaders at 8 and 16 lanes) is
+     * invoked separately on the padding-bearing vector of every block: every
+     * one rejects the raw owner and accepts the normalized one; the seal agrees.
+     */
+    TEST(CPUNativeSourceMetadata, PartialChunkPaddingIsNormalizedForX86Readers)
+    {
+        for (const auto *source : {&native_quantised_formats::IQ2_S, &native_quantised_formats::IQ3_S, &native_quantised_formats::IQ4_XS})
+            for (const int n : {33, 61, 97})
+            {
+                SCOPED_TRACE(::testing::Message() << "codebook=" << int(source->codebook_id) << " n=" << n);
+                constexpr int k = 64;
+                NativeQuantisedPreparedByteFixture fixture(*source, n, k);
+                fixture.seedPayloadAndMetadata();
+                const auto layout = fixture.view();
+                const int last = layout.N_padded / 64 - 1, live = n % 64;
+                const auto make = [&](bool normalized, int poisoned_block = -1) {
+                    CPUNativeQuantisedPackedWeights packed;
+                    packed.N = layout.N; packed.K = layout.K; packed.N_padded = layout.N_padded;
+                    packed.blocks_per_row = layout.blocks_per_row; packed.payload_bytes = layout.source_payload_bytes;
+                    packed.codebook_id = layout.codebook_id; packed.is_superblock = layout.is_superblock;
+                    packed.is_asymmetric = layout.is_asymmetric; packed.encoding = layout.encoding;
+                    packed.numerical_policy = layout.numerical_policy; packed.data_stride = layout.data_stride;
+                    packed.interleaved_block_stride = layout.interleaved_block_stride;
+                    packed.native_interleaved.resize(fixture.bytes.size());
+                    const auto owned = packed.native_interleaved.beginRewrite();
+                    std::copy(fixture.bytes.begin(), fixture.bytes.end(), owned.begin());
+                    const std::size_t secondary = std::size_t(layout.data_stride) + (layout.usesInlineCompensation() ? 256 : 128);
+                    for (int block = 0; block < layout.blocks_per_row; ++block)
+                        for (int column = live; column < 64; ++column)
+                        {
+                            if (poisoned_block >= 0 && block != poisoned_block)
+                                continue;
+                            const std::uint16_t poison = 0xffff;
+                            std::memcpy(owned.data() + (std::size_t(last) * layout.blocks_per_row + block) *
+                                layout.interleaved_block_stride + secondary + std::size_t(column) * 2, &poison, sizeof(poison));
+                        }
+                    if (normalized) packed.normalizePaddingMetadata();
+                    return packed;
+                };
+                auto raw = make(false);
+                auto normalized = make(true);
+                EXPECT_THROW(raw.sealPublication(), std::invalid_argument);
+                EXPECT_NO_THROW(normalized.sealPublication());
+
+                Q8_1Block activation[k / 32]{};
+                for (auto &a : activation) { a.d = 0x3c00; std::fill(std::begin(a.qs), std::end(a.qs), std::int8_t{1}); a.sum_qs = 32; }
+                std::array<float, 64> result{};
+                const std::array<const Q8_1Block *, 1> input{activation};
+                const std::array<float *, 1> output{result.data()};
+                if (source == &native_quantised_formats::IQ2_S)
+                {
+                    // Dispatch walks blocks in order, so each block is poisoned
+                    // alone: rejection is proved at every K block, not the first.
+                    for (int block = 0; block < layout.blocks_per_row; ++block)
+                    {
+                        SCOPED_TRACE(block);
+                        const auto single = make(false, block);
+                        EXPECT_THROW((multi_scale::dispatch<8, 1>(single, input, output, last, 0, layout.blocks_per_row, false)), std::invalid_argument);
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+                        EXPECT_THROW((multi_scale::dispatch<16, 1>(single, input, output, last, 0, layout.blocks_per_row, false)), std::invalid_argument);
+#endif
+                    }
+                    EXPECT_NO_THROW((multi_scale::dispatch<8, 1>(normalized, input, output, last, 0, layout.blocks_per_row, false)));
+#if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
+                    EXPECT_NO_THROW((multi_scale::dispatch<16, 1>(normalized, input, output, last, 0, layout.blocks_per_row, false)));
+#endif
+                    continue;
+                }
+                for (int block = 0; block < layout.blocks_per_row; ++block)
+                {
+                    SCOPED_TRACE(block);
+                    EXPECT_THROW((void)raw.loadScales256(raw.chunkScales(last, block) + live / 8 * 8), std::invalid_argument);
+                    EXPECT_NO_THROW((void)normalized.loadScales256(normalized.chunkScales(last, block) + live / 8 * 8));
+#if defined(__AVX512F__)
+                    EXPECT_THROW((void)raw.loadScales512(raw.chunkScales(last, block) + live / 16 * 16), std::invalid_argument);
+                    EXPECT_NO_THROW((void)normalized.loadScales512(normalized.chunkScales(last, block) + live / 16 * 16));
+#endif
+                }
+            }
+    }
+#endif
+
+#if !defined(__aarch64__)
+    // x86 VNNI consumes unsigned activation words; ARM signed dots need no packing.
     /** Prove integer activation packing independently of serial/grouped kernel agreement. */
     TEST(CPUActivationWordPacking, AllSignedBytesAndOffsetsMatchScalar)
     {
@@ -83,6 +257,7 @@ namespace
             ASSERT_EQ(std::memcmp(&block, &before, sizeof(block)), 0);
         }
     }
+#endif
 
     std::filesystem::path qwen36DenseModelPath()
     {
@@ -483,6 +658,12 @@ namespace
     // Test fixture
     // =========================================================================
 
+#if defined(__aarch64__)
+    constexpr int kCompactLanes = 4; ///< One NEON quad per compact multi-scale step.
+#else
+    constexpr int kCompactLanes = 8; ///< AVX2 compact multi-scale width.
+#endif
+
     class CPUNativeQuantisedGemvTest : public ::testing::Test
     {
     protected:
@@ -492,6 +673,33 @@ namespace
     // Correctness test: Q4_0 small matrix
     // =========================================================================
 
+#if defined(__aarch64__)
+    /** Exhaust the signed-byte dot domain for each compiled NEON instruction family. */
+    template <class Ops>
+    void verifyNEONCompactDot()
+    {
+        for (int weight = -127; weight <= 127; ++weight)
+        {
+            const auto w = std::bit_cast<typename Ops::I>(vdupq_n_s8(static_cast<int8_t>(weight)));
+            for (int activation = -128; activation <= 127; ++activation)
+            {
+                const auto a = std::bit_cast<typename Ops::I>(vdupq_n_s8(static_cast<int8_t>(activation)));
+                const auto result = Ops::dot(typename Ops::I{} + 37, w, a);
+                for (int lane = 0; lane < 4; ++lane)
+                    ASSERT_EQ(result[lane], 37 + 4 * weight * activation)
+                        << "weight=" << weight << " activation=" << activation << " lane=" << lane;
+            }
+        }
+    }
+
+    TEST_F(CPUNativeQuantisedGemvTest, CompactMultiScaleNEONDotExhaustiveSignedByteDomain)
+    {
+        verifyNEONCompactDot<multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::ASIMD>>();
+#if defined(__ARM_FEATURE_DOTPROD)
+        verifyNEONCompactDot<multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::DotProd>>();
+#endif
+    }
+#else
     TEST_F(CPUNativeQuantisedGemvTest, CompactMultiScaleAVX2DotExhaustiveSignedByteDomain)
     {
         using Ops = multi_scale::SIMD<8>;
@@ -510,12 +718,12 @@ namespace
             }
         }
     }
+#endif
 
     /** Compare every immutable lookup entry against direct scalar byte loads. */
-    template <int Lanes, std::size_t Entries>
+    template <int Lanes, std::size_t Entries, class Ops = multi_scale::SIMD<Lanes>>
     void verifyCompactGridPairs(const std::uint64_t (&table)[Entries])
     {
-        using Ops = multi_scale::SIMD<Lanes>;
         for (std::size_t entry = 0; entry < Entries; ++entry)
         {
             typename Ops::I indices{}, low{}, high{};
@@ -536,9 +744,16 @@ namespace
     /** Both physical widths retain every immutable IQ1/IQ2 lookup byte. */
     TEST_F(CPUNativeQuantisedGemvTest, CompactGridPairsMatchEveryScalarEntry)
     {
+#if defined(__aarch64__)
+        using ASIMD = multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::ASIMD>;
+        verifyCompactGridPairs<4, std::size(iq2s_grid), ASIMD>(iq2s_grid);
+        verifyCompactGridPairs<4, std::size(iq2xs_grid), ASIMD>(iq2xs_grid);
+        verifyCompactGridPairs<4, std::size(iq1s_grid), ASIMD>(iq1s_grid);
+#else
         verifyCompactGridPairs<8>(iq2s_grid);
         verifyCompactGridPairs<8>(iq2xs_grid);
         verifyCompactGridPairs<8>(iq1s_grid);
+#endif
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
         verifyCompactGridPairs<16>(iq2s_grid);
         verifyCompactGridPairs<16>(iq2xs_grid);
@@ -547,10 +762,9 @@ namespace
     }
 
     /** Exhaust the eight sign bits and byte offsets independently of table decoding. */
-    template <int Lanes, int Byte>
+    template <int Lanes, int Byte, class Ops = multi_scale::SIMD<Lanes>>
     void verifyCompactGridSigns()
     {
-        using Ops = multi_scale::SIMD<Lanes>;
         for (int pattern = 0; pattern < 256; ++pattern)
         {
             typename Ops::I metadata{}, weights{};
@@ -581,10 +795,18 @@ namespace
     /** Sign application is an integer-only permutation for AVX2 and AVX512. */
     TEST_F(CPUNativeQuantisedGemvTest, CompactGridSignsMatchEveryByteMask)
     {
+#if defined(__aarch64__)
+        using ASIMD = multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::ASIMD>;
+        verifyCompactGridSigns<4, 0, ASIMD>();
+        verifyCompactGridSigns<4, 1, ASIMD>();
+        verifyCompactGridSigns<4, 2, ASIMD>();
+        verifyCompactGridSigns<4, 3, ASIMD>();
+#else
         verifyCompactGridSigns<8, 0>();
         verifyCompactGridSigns<8, 1>();
         verifyCompactGridSigns<8, 2>();
         verifyCompactGridSigns<8, 3>();
+#endif
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
         verifyCompactGridSigns<16, 0>();
         verifyCompactGridSigns<16, 1>();
@@ -1325,6 +1547,15 @@ namespace
                 SCOPED_TRACE(rows);
                 FusedVerifierRowsDesc descriptor{.packed = &packed, .N = 64, .ldc = 64, .rows = rows};
                 const auto decode = planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7);
+#if defined(__aarch64__)
+                // ARM shared-row tiles follow only the verifier schedule, never the purpose.
+                descriptor.purpose = ProjectionRowsPurpose::Prefill;
+                const auto prefill = planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7);
+                EXPECT_EQ(prefill.tiles[0], decode.tiles[0]);
+                EXPECT_EQ(prefill.sharedPartialFloats(), 0u);
+                descriptor.purpose = static_cast<ProjectionRowsPurpose>(-1);
+                EXPECT_THROW(planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7), std::invalid_argument);
+#else
                 const auto expected_decode = selectVerifierRowsPolicy(packed, rows, 64, 2048,
                     activeISALevel(), 7, decode.projections[0].k_tiles);
                 EXPECT_EQ(decode.projections[0].effective_verifier_schedule, expected_decode);
@@ -1342,6 +1573,7 @@ namespace
                     .projections[0].effective_verifier_schedule, VerifierRowsPolicy::Pairwise);
                 descriptor.purpose = static_cast<ProjectionRowsPurpose>(-1);
                 EXPECT_THROW(planNativeQuantisedFusedRows({&descriptor, 1}, rows, 7), std::invalid_argument);
+#endif
             }
         }
     }
@@ -1413,10 +1645,18 @@ namespace
                             outputs[row] = actual.data() + row * 64;
                         }
                         actual.fill(-12345.0f);
-                        multi_scale::dispatchOrdered<8, Rows>(packed, inputs, outputs,
+                        multi_scale::dispatchOrdered<kCompactLanes, Rows>(packed, inputs, outputs,
                             0, blocks, partitions, span);
                         expectBitwiseEqualFloatRows(format.label,
                             actual.data(), expected.data(), Rows * 64, 64);
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+                        actual.fill(-12345.0f);
+                        multi_scale::dispatchOrdered<4, Rows,
+                            multi_scale::NEONMultiScaleOps<multi_scale::NEONByteDot::DotProd>>(
+                            packed, inputs, outputs, 0, blocks, partitions, span);
+                        expectBitwiseEqualFloatRows(format.label,
+                            actual.data(), expected.data(), Rows * 64, 64);
+#endif
 #if defined(__AVX512F__) && defined(__AVX512BW__) && defined(__AVX512VNNI__)
                         actual.fill(-12345.0f);
                         multi_scale::dispatchOrdered<16, Rows>(packed, inputs, outputs,
@@ -1430,7 +1670,7 @@ namespace
                     prove_rows.template operator()<3>();
                     prove_rows.template operator()<4>();
                     const auto invalid = [&](int length, int count, int width) {
-                        multi_scale::dispatchOrdered<8, 2>(packed,
+                        multi_scale::dispatchOrdered<kCompactLanes, 2>(packed,
                             {activation.data(), activation.data() + blocks},
                             {actual.data(), actual.data() + 64}, 0, length, count, width);
                     };
@@ -1440,6 +1680,48 @@ namespace
                     EXPECT_THROW(invalid(blocks, 1, 1), std::invalid_argument);
                 }
             }
+        }
+    }
+
+    /**
+     * Fixed-count K tiles leave empty trailing tiles on a short K: their start
+     * lies at or beyond the matrix while the clamped end does not. Such a span
+     * must publish zero (or retain the accumulator) without a weight read;
+     * a nonempty span outside the matrix remains fatal.
+     */
+    TEST_F(CPUNativeQuantisedGemvTest, CompactEmptyTrailingKTilePublishesWithoutReading)
+    {
+        for (const auto &format : quantizedMoEVerifierFormats())
+        {
+            auto weights = format.create({64u, 768u}, 0xE47Fu);
+            CPUNativeQuantisedGemmKernel kernel(weights.get(), 0, -1,
+                CPUProjectionNumericalPolicy::GPUAlignedExpert);
+            const auto &packed = kernel.packedWeights();
+            if (!packed.usesCompactMultiScale())
+                continue;
+            SCOPED_TRACE(format.label);
+            const int blocks = packed.blocks_per_row;
+            std::vector<Q8_1Block> activation(static_cast<size_t>(blocks));
+            std::array<float, 64> output{};
+            const auto run = [&](int begin, int end, bool accumulate) {
+                multi_scale::dispatch<kCompactLanes>(packed,
+                    std::array<const Q8_1Block *, 1>{activation.data()},
+                    std::array<float *, 1>{output.data()}, 0, begin, end, accumulate);
+            };
+            // A 24-block K split into 16 tiles of 2 yields tiles [26, 24) etc.
+            for (const int begin : {blocks, blocks + 2, blocks + 6})
+            {
+                output.fill(-7.0f);
+                ASSERT_NO_THROW(run(begin, blocks, false));
+                for (const float value : output)
+                    ASSERT_EQ(std::bit_cast<uint32_t>(value), 0u);
+                output.fill(-7.0f);
+                ASSERT_NO_THROW(run(begin, blocks, true));
+                for (const float value : output)
+                    ASSERT_EQ(value, -7.0f);
+            }
+            EXPECT_THROW(run(blocks - 1, blocks + 1, false), std::invalid_argument);
+            EXPECT_THROW(run(-1, 1, false), std::invalid_argument);
         }
     }
 
@@ -1655,8 +1937,11 @@ namespace
                         static_cast<float>((static_cast<int>(i % 17) - 8)) /
                         32.0f;
                     actual.mutable_data()[i] = prior[i];
+                    // Canonical epilogue: fma(alpha, product, round(beta*prior)),
+                    // then the separately rounded bias pass.
+                    volatile float scaled_prior = beta * prior[i];
                     expected[i] =
-                        alpha * product.data()[i] + beta * prior[i] +
+                        std::fma(alpha, product.data()[i], scaled_prior) +
                         bias.data()[i % static_cast<size_t>(N)];
                 }
 
@@ -1964,7 +2249,21 @@ namespace
                 const std::string &task_grid = record.tags.at("task_grid");
                 const int row_tile =
                     std::stoi(record.tags.at("physical_row_tile"));
-                if (route == "grouped_full_k_row_chunk_grid")
+                if (route.rfind("grouped_neon_", 0) == 0)
+                {
+                    // ARM native shared-row tiles (two or four physical rows).
+                    // An I8MM build must prove its automatic row-pair SMMLA ran.
+                    const std::string family =
+                        LLAMINAR_COMPILED_WITH_NEON_I8MM && activeISALevel() == ISALevel::NEONDotProd
+                        ? "grouped_neon_i8mm_" : "grouped_neon_full_k_";
+                    EXPECT_EQ(task_grid, "row_tile_n_block");
+                    EXPECT_EQ(route, family + (row_tile == 2 ? "pair_rows" : "four_rows"));
+                    EXPECT_EQ(record.tags.at("isa"),
+                              family == "grouped_neon_i8mm_" ? "NEON_I8MM"
+                              : activeISALevel() == ISALevel::NEONDotProd ? "NEON_DOTPROD" : "NEON");
+                    EXPECT_TRUE(row_tile == 2 || row_tile == 4) << row_tile;
+                }
+                else if (route == "grouped_full_k_row_chunk_grid")
                 {
                     EXPECT_EQ(task_grid, "row_n_chunk");
                     EXPECT_EQ(row_tile, 1);
@@ -2006,6 +2305,8 @@ namespace
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Prove every forceable full-K fused task grid is serial-row exact.
      *
@@ -2308,6 +2609,7 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
     /**
      * @test Prove a replicated MTP head matches uneven serial TP shards.
@@ -2507,6 +2809,8 @@ namespace
             }
         }
 
+#if !defined(__aarch64__)
+        // x86 decode/verifier launch telemetry; the bytes above are ISA-neutral.
         bool saw_mirrored_decode = false;
         bool saw_mirrored_grouped = false;
         for (const auto &record : PerfStatsCollector::snapshot({
@@ -2531,11 +2835,14 @@ namespace
         }
         EXPECT_TRUE(saw_mirrored_decode);
         EXPECT_TRUE(saw_mirrored_grouped);
+#endif
 
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Four-row prefill retains every serial byte and padded-row guard.
      *
@@ -2626,7 +2933,10 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Prove production full-K prefill candidates are batch invariant.
      *
@@ -2867,6 +3177,7 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
     /**
      * @test Production wave balancing is byte-exact for all formats and row tails.
@@ -2938,6 +3249,8 @@ namespace
         }
     }
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Prove every cache-tile boundary preserves serial-row FP32 bytes.
      *
@@ -3109,6 +3422,7 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
     /**
      * @test Prove CPU production prefill is serial-row exact over canonical M.
      *
@@ -3231,6 +3545,8 @@ namespace
             }
         }
 
+#if !defined(__aarch64__)
+        // x86 prefill launch telemetry; the byte-exact sweep above is ISA-neutral.
         uint64_t observed_prefill_launches = 0;
         for (const auto &record : PerfStatsCollector::snapshot(
                  {"kernel.cpu_native_quantised_prefill_gemm_launch"}))
@@ -3257,10 +3573,13 @@ namespace
             << "Every CPU all-format M-totality cell must execute one real "
                "production grouped prefill route";
 
+        #endif
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Prove partial 64-column chunks remain inside each logical output row.
      *
@@ -3460,7 +3779,10 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
+#if !defined(__aarch64__)
+    // x86 serial K partitioning; ARM native rows own full-K trees (see the NEON batch gates).
     /**
      * @test Prove grouped prefill inherits production serial K partitioning.
      *
@@ -3649,7 +3971,10 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Prove the bounded wide-row tile over every runtime M and format.
      *
@@ -3795,7 +4120,10 @@ namespace
         run_k_tile_regime(/*K=*/256, /*forced_k_tiles=*/1);
         run_k_tile_regime(/*K=*/4096, /*forced_k_tiles=*/4);
     }
+#endif // x86 NativeQuantised scheduler contract
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     TEST_F(CPUNativeQuantisedGemvTest, MTP_FusedVerifierKParallel_AllFormatsMatchSerialDecodeRows)
     {
         constexpr int K = 4096;
@@ -3978,7 +4306,10 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     /**
      * @test Prove every forceable K-partitioned fused row tile is byte exact.
      *
@@ -4192,6 +4523,7 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
 #ifdef HAVE_ONEDNN
     TEST_F(CPUNativeQuantisedGemvTest, MTP_FP32FloatingVerifierRowsMatchSerialDecodeAndUseGroupedCounters)
@@ -5004,11 +5336,19 @@ namespace
         {
             SCOPED_TRACE(::testing::Message() << "threads=" << threads);
             omp_set_num_threads(threads);
+#if defined(__aarch64__)
+            // ARM native planning is total for every positive team width.
+            FusedVerifierRowsDesc descriptor{.packed = &packed, .N = N, .ldc = N, .rows = M};
+            EXPECT_NO_THROW((void)planNativeQuantisedFusedRows({&descriptor, 1}, M, threads));
+#else
             EXPECT_NO_THROW((void)selectVerifierRowsPolicy(packed, M, N, K));
+#endif
         }
         omp_set_num_threads(original_threads);
     }
 
+#if !defined(__aarch64__)
+    // Forces or inspects x86 schedules/telemetry; ARM native rows are covered by the NEON gates.
     TEST_F(CPUNativeQuantisedGemvTest, MTP_VerifierRoutePublishesBuildAndRuntimeISA)
     {
         /**
@@ -5097,6 +5437,7 @@ namespace
         PerfStatsCollector::reset();
         unsetenv("LLAMINAR_PERF_STATS_JSON");
     }
+#endif // x86 NativeQuantised scheduler contract
 
     TEST_F(CPUNativeQuantisedGemvTest, MTP_FusedProjectionWithActivationRotationMatchesSerialDecodeRows)
     {
@@ -5661,6 +6002,10 @@ namespace
                     // This public verifier entry does not widen the inner
                     // multi-row policy inventory. The actual M1 primitive is
                     // selected before that table, whose own guard stays strict.
+#if !defined(__aarch64__)
+                    // x86 keeps its learned multi-row table strict. ARM's
+                    // grouped entry has no table: every native row tile owns the
+                    // same full-K tree, so it is total for M >= 1.
                     if (M == 1)
                     {
                         std::vector<Q8_1Block> q8(K / 32);
@@ -5670,6 +6015,7 @@ namespace
                             kernel.packedWeights(), q8.data(), grouped.mutable_data(), {}, 1, N), std::invalid_argument);
                         EXPECT_EQ(std::memcmp(grouped.data(), before_inner.data(), before_inner.size() * sizeof(float)), 0);
                     }
+#endif
 
                     // Physical M0/-1 is invalid on CPU. Rejection precedes any
                     // output or admitted workspace access, even with a valid engine.

@@ -2,6 +2,7 @@
 #include <cstddef>
 #include <cstdint>
 #include "BlockStructures.h"
+#include "../utils/CPUFeatures.h"
 
 namespace llaminar2::detail
 {
@@ -23,6 +24,12 @@ namespace llaminar2::detail
 #if defined(__AVX512F__)
     void q8_0_requantize_avx512(const Q8_0Block *row_blocks, size_t blocks_per_row,
                                 float inv_row_scale, int8_t *output);
+#endif
+
+#if LLAMINAR_COMPILED_WITH_NEON
+    float q8_0_find_max_abs_neon(const Q8_0Block *row_blocks, size_t blocks_per_row);
+    void q8_0_requantize_neon(const Q8_0Block *row_blocks, size_t blocks_per_row,
+                              float inv_row_scale, int8_t *output);
 #endif
 
 } // namespace llaminar2::detail

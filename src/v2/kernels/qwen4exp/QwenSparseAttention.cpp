@@ -4,8 +4,11 @@
  *
  * Device replay counts are deliberately not inspected here. Native kernels own
  * dynamic validation, making retained graph replay independent of a host shadow.
+ * Native-bank byte geometry is shared with original-storage CPU readers; static
+ * checks prove address/layout validity, never a second physical capacity ledger.
  */
 #include "QwenSparseAttention.h"
+#include "QwenSparseNativeBankContract.h"
 #include <limits>
 #include <cmath>
 #include <stdexcept>
@@ -36,35 +39,14 @@ void validateRepresentation(QwenSparseScalar representation)
     }
     throw std::invalid_argument("Qwen sparse attention: unsupported native representation");
 }
-/** @brief Validate the admitted complete native head without reading its payload. */
+/** @brief Validate the one shared original-head geometry without reading payload.
+ * @param bank Original setup-owned roots; @param key Existing internal key/value selector.
+ * @param heads Original local KV heads; @param tokens Physical row capacity.
+ * @throws std::invalid_argument For incomplete or unrepresentable native bindings.
+ */
 void validateBank(const QwenSparseNativeBank &bank, bool key, int heads, int tokens)
 {
-    std::size_t bytes = 0, alignment = 4;
-    switch (bank.codec)
-    {
-    case TensorType::FP32: bytes = 1024; break;
-    case TensorType::FP16: case TensorType::BF16: bytes = 512; alignment = 2; break;
-    case TensorType::Q8_1: bytes = 8 * 36; break;
-    case TensorType::Q16_1:
-        if (bank.q16_block_size != 32 && bank.q16_block_size != 64 && bank.q16_block_size != 128)
-            throw std::invalid_argument("Qwen sparse attention: unsupported native Q16 block size");
-        bytes = std::size_t(256 / bank.q16_block_size) * (8 + 2 * bank.q16_block_size); break;
-    case TensorType::AQ8:
-        if (!key || !bank.anchor) throw std::invalid_argument("Qwen sparse attention: AQ8 requires an immutable key anchor");
-        bytes = 260; break;
-    case TensorType::TQ4: case TensorType::TQ8:
-        if (!bank.centroids) throw std::invalid_argument("Qwen sparse attention: TurboQuant requires its canonical codebook");
-        for (int head = 0; head < heads; ++head)
-            if (!bank.rotations[head]) throw std::invalid_argument("Qwen sparse attention: TurboQuant requires each canonical KV-head rotation");
-        bytes = bank.codec == TensorType::TQ4 ? 136 : 264; break;
-    default: throw std::invalid_argument("Qwen sparse attention: unsupported native cache codec");
-    }
-    const bool token_major = bank.layout == QwenSparseNativeLayout::TokenMajor &&
-        bank.head_stride_bytes >= bytes && bank.token_stride_bytes >= std::size_t(heads - 1) * bank.head_stride_bytes + bytes;
-    const bool head_major = bank.layout == QwenSparseNativeLayout::HeadMajor &&
-        bank.token_stride_bytes >= bytes && bank.head_stride_bytes >= std::size_t(tokens - 1) * bank.token_stride_bytes + bytes;
-    if (!bank.data || (!token_major && !head_major) || bank.head_stride_bytes % alignment || bank.token_stride_bytes % alignment)
-        throw std::invalid_argument("Qwen sparse attention: invalid native bank geometry");
+    (void)native_bank::Binding::bind(bank,key?detail::BankRole::Key:detail::BankRole::Value,heads,tokens);
 }
 }
 QwenSparsePowerFrequencies makeQwenSparsePowerFrequencies(float theta,int dimension)
@@ -249,10 +231,12 @@ void validateQwenSparseAttention(const QwenSparseAttention &p)
     (void)qwenSparseAttentionArithmeticName(p.arithmetic);
     if (!p.replay || !p.query || !p.selected || !p.selected_count || !p.output || p.row_capacity <= 0 || p.token_capacity <= 0)
         throw std::invalid_argument("Qwen sparse attention: invalid native cache or selected-index binding");
-    if (p.query_heads <= 0 || p.kv_heads <= 0 || p.query_head_start < 0 || p.kv_head_start < 0 ||
-        p.query_head_start + p.query_heads > 24 || p.kv_head_start + p.kv_heads > 2 ||
+    if (p.query_heads <= 0 || p.query_heads > 24 || p.kv_heads <= 0 || p.kv_heads > 2 || p.query_head_start < 0 || p.kv_head_start < 0 ||
+        p.query_head_start > 24 - p.query_heads || p.kv_head_start > 2 - p.kv_heads ||
         p.query_head_start / 12 < p.kv_head_start || (p.query_head_start + p.query_heads - 1) / 12 >= p.kv_head_start + p.kv_heads)
         throw std::invalid_argument("Qwen sparse attention: invalid participant-local GQA ownership");
+    if (p.row_capacity > std::numeric_limits<int>::max() / p.query_heads)
+        throw std::invalid_argument("Qwen sparse attention: original row/head grid overflows native coordinates");
     validateBank(p.kv.keys, true, p.kv_heads, p.token_capacity); validateBank(p.kv.values, false, p.kv_heads, p.token_capacity);
     switch (p.kv.addressing)
     {
@@ -276,7 +260,8 @@ void validateQwenSparseAttention(const QwenSparseAttention &p)
     case attention::AttentionKeyCacheEncoding::PreRotaryDeviceTransform:
         if (p.kv.keys.codec == TensorType::TQ4 || p.kv.keys.codec == TensorType::TQ8)
             throw std::invalid_argument("Qwen sparse attention: pre-RoPE rotated TurboQuant keys require a spatial-basis codec");
-        if (p.kv.key_rotary_dim <= 0 || p.kv.key_rotary_dim > 256 || p.kv.key_rotary_dim % 2 ||
+        if (!std::isfinite(p.kv.key_policy.partial_rotary_factor) || p.kv.key_policy.partial_rotary_factor <= 0.0f ||
+            p.kv.key_policy.partial_rotary_factor > 1.0f || p.kv.key_rotary_dim <= 0 || p.kv.key_rotary_dim > 256 || p.kv.key_rotary_dim % 2 ||
             int(256 * p.kv.key_policy.partial_rotary_factor) != p.kv.key_rotary_dim)
             throw std::invalid_argument("Qwen sparse attention: incomplete selected-key RoPE bindings");
         if(p.kv.key_rotary_source==QwenSparseRotarySource::TablePlanes) {

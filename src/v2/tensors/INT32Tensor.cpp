@@ -14,6 +14,7 @@
  */
 
 #include "TensorClasses.h"
+#include "../utils/OpenMPUtils.h"
 #include "../utils/Logger.h"
 #include <cmath>
 #include <algorithm>
@@ -50,6 +51,7 @@ namespace llaminar2
         float *row_scales,
         size_t m, size_t n)
     {
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (m > 100)
         for (size_t i = 0; i < m; ++i)
         {
@@ -92,6 +94,7 @@ namespace llaminar2
         float scale,
         size_t count)
     {
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (count > 10000)
         for (size_t i = 0; i < count; ++i)
         {
@@ -114,6 +117,7 @@ namespace llaminar2
         size_t count)
     {
         float inv_scale = 1.0f / scale;
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (count > 10000)
         for (size_t i = 0; i < count; ++i)
         {

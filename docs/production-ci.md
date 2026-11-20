@@ -18,8 +18,10 @@ Those optional tools do not add phases to RC certification.
 
 Ordinary work starts from current `develop` on a branch named
 `feat/short-feature-description`. Commit messages and PR titles use
-Conventional Commits. Both Unit/host checks must pass for the up-to-date feature PR to squash-merge
-into `develop`. PRs by another contributor also require the owner’s review. Only explicit user direction starts the separate
+Conventional Commits. The AVX2, AVX512 and ARM64 checks must pass on the
+up-to-date feature PR before it can squash-merge into `develop`. PRs by
+another contributor also require the owner’s review. Only explicit user
+direction starts the separate
 `rc/*`-to-`master` release PR and its full certification/release workflow.
 
 Documentation and CI/CD workflow maintenance may be committed and pushed
@@ -34,6 +36,34 @@ gate skip drafts before allocating runners. Marking a draft ready for review
 triggers the required checks through `ready_for_review`. The master PR jobs,
 branch-policy check and PR-triggered Copilot setup use the same draft policy.
 GitHub can still show a skipped workflow entry for a draft event; no PR job runs.
+
+The `ARM64 build and Unit + host` check builds the shared Dockerfile
+`test-runner` and `runtime` targets on GitHub's standard `ubuntu-24.04-arm`
+runner for ready PRs into `develop`. Both images enable baseline NEON and
+CUDA for GB10 (`sm_121`). The `arm64-pr` test inventory builds Integration
+executables and seals them in the test-runner alongside the Release runtime
+closure. CMake derives the `ARM64PR` scope from the ARM and NEON
+registrations in Unit and production preflight. These cover NEON arithmetic
+and code generation, native grouped projections and GDN, quantized KV and
+sparse attention, and Linux OpenMP/MPI placement and loader behavior. The
+shared PR driver verifies the installed receipt, runs both subsets without
+GPU devices or models, and retains JUnit logs. The check also starts the
+sibling Release application with `--help`.
+See [GitHub's standard ARM64 runners](https://docs.github.com/en/actions/reference/runners/github-hosted-runners).
+
+The ARM host scope generates deterministic QFN fixture weights for bounded
+prefill and decode projection replay, sparse attention and per-layer embedding
+execution. These component tests check native arithmetic and retained state.
+End-to-end QFN inference still requires the full published checkpoint geometry
+and its real-model qualification.
+
+The `CI` workflow runs the same runtime build on pushes to `develop` and
+publishes `develop-arm64` and `sha-<commit>-arm64` after the startup smoke
+test. The ARM64 image contains CPU kernels and CUDA code for `sm_121`.
+It shares the canonical CUDA/NCCL installer and serves on DGX Spark with
+the NVIDIA Container Toolkit. GPU execution requires a separate hardware
+qualification. The pinned ROCm SDK remains on the x86-64 images.
+
 Separate self-hosted runners build AVX2 and AVX512 full-backend
 `model-free` test images in parallel. Each image executes complete device-free
 `Unit` plus the
@@ -52,8 +82,18 @@ turns a selected-test failure or skip into a pass. This is PR validation, not
 release certification. The checkout is the PR merge ref, so the tests
 include the proposed integration with `develop`.
 
-The active `develop` ruleset requires both `Develop PR / Unit + hardware preflight (AVX2)`
-and `Develop PR / Unit + host (AVX512)`, an up-to-date PR, and squash merge.
+The `develop` ruleset requires an up-to-date PR, squash merge, and these
+GitHub Actions checks.
+
+- `Develop PR / Unit + hardware preflight (AVX2)`
+- `Develop PR / Unit + host (AVX512)`
+- `ARM64 build and Unit + host`
+
+Repository administrators can preview the CI ruleset with
+`python3 scripts/ci/apply_master_ruleset.py --develop-only` and install it
+with `--develop-only --apply`. Verify that the ARM64 job appears on a ready PR
+before activating the required context. Open PRs whose branches lack the
+ARM64 workflow must bring in a `develop` revision that contains it.
 The AVX2 check requires the hardware-qualified production preflight scope.
 Repository administrators have an explicit PR-only bypass for authorized
 manual merges. Direct human pushes, force pushes and deletion remain rejected.
@@ -66,7 +106,7 @@ head SHA and arms GitHub's native squash auto-merge.
 
 For original PR author `dbsanfte` (GitHub user ID `3513358`), the workflow
 uses a short-lived installation token for the private `Llaminar/llaminar-bot`
-app. GitHub enforces both required checks and strict branch freshness for the
+app. GitHub enforces all three required checks and strict branch freshness for the
 app. Other authors use the existing `DEVELOP_AUTOMERGE_TOKEN` and require the
 owner's review. Re-running a job as the owner does not change the PR author.
 Editing an existing owner PR description migrates a request armed by the old
@@ -175,7 +215,7 @@ limit each. The jobs reclaim disk used by the runner's preinstalled Android
 and language SDKs. Image publication has its own
 `llaminar-develop-images` concurrency group with `cancel-in-progress: true`:
 at most one develop publication runs, and a newer merge cancels its predecessor.
-PR checks use the separate self-hosted queues.
+The x86 PR checks use the separate self-hosted queues.
 
 The preparation job checks for the exact OCI cache entry and builds and saves
 it on a miss. The dependent build job restores that entry, verifies the OCI
@@ -197,6 +237,16 @@ movable. The build receipt explicitly records `validation: build-only` and
 contains no invented test result. These are development images, not certified
 release artifacts.
 
+The ARM64 PR check and ARM64 publication job use the same OCI toolchain
+cache action and bind the verified NEON manifest to each source build. A
+cold ARM64 job checkpoints the CUDA SDK in the Actions cache under
+`llaminar-gpu-sdk-neon` and saves the complete OCI toolchain before compiling
+Llaminar. The ARM64 PR job also imports and exports its test-runner layers
+under `llaminar-build-neon-pr` on the PR merge ref. The runtime export reuses
+that job's local BuildKit layers. The ARM64 publication job imports and
+exports `ghcr.io/llaminar/llaminar:build-cache-develop-neon`. ARM64 PRs read
+that registry cache without writing to it.
+
 The publication worker imports and exports registry-backed BuildKit caches selected by
 `LLAMINAR_DOCKER_BUILD_CACHE_IMAGE`, with separate `-avx512` and `-avx2` tags.
 The workflow stores these under `ghcr.io/llaminar/llaminar:build-cache-develop`.
@@ -204,7 +254,7 @@ Registry access defaults to `read-write` for publication; PRs explicitly select
 `import-only`, with no registry cache export. Local host-path and registry cache
 authorities are mutually exclusive.
 
-PR checks and cold publication toolchain jobs use
+PR checks, cold x86 publication toolchain jobs, and the ARM64 publication job use
 `.github/actions/cache-develop-toolchain`.
 Llaminar test builds require CMake and CTest 4.0 or later. The toolchain and
 installed runner share the Kitware package pinned in `requirements.txt` so
@@ -222,8 +272,7 @@ image driver independently admits its dependency identity and passes the
 digest-pinned `toolchain=oci-layout://...` named context to Buildx. This replaces
 the toolchain stage directly, without depending on intermediate solver-cache
 hits. The builder declares its build arguments explicitly because an external
-image does not inherit in-file ARG state. Both development workflows pin Buildx and
-BuildKit to the same versions.
+image does not inherit in-file ARG state. The development workflows pin Buildx and BuildKit to the same versions.
 
 On a complete OCI cache miss, the shared action checkpoints `gpu-sdk` through
 the GitHub Actions cache v2 backend in `mode=max` under `llaminar-gpu-sdk` when
@@ -238,8 +287,9 @@ belong to their merge ref and cannot be
 restored by develop publication or another PR. They remain reusable across
 updates to that PR. Develop populates the same dependency keys for inbound PRs to read.
 The repository's cache storage limit is configured in GitHub Actions settings;
-GitHub owns eviction. GitHub Actions caches contain dependency images and SDK
-layers. GHCR carries reusable BuildKit layers between publication runs. The
+GitHub owns eviction. GitHub Actions caches contain dependency images, SDK
+layers and ARM64 PR image layers. GHCR carries reusable BuildKit layers between
+publication runs. The
 cloud jobs keep local layers and compiler-object mounts for their own build.
 The named `llaminar-develop` BuildKit worker on each self-hosted PR
 runner keeps its local layers and compiler-object caches across jobs. Per-ISA

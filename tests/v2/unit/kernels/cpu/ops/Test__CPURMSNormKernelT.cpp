@@ -29,6 +29,7 @@
 #include <numeric>
 #include <algorithm>
 #include <random>
+#include <stdexcept>
 
 namespace llaminar2
 {
@@ -993,6 +994,83 @@ namespace llaminar2
         {
             EXPECT_NEAR(val, 0.0f, Q8_1_TOLERANCE);
         }
+    }
+
+    // =========================================================================
+    // Decoded-row stack scratch bound (no heap path)
+    // =========================================================================
+
+    /**
+     * @test Hidden 5120 rows convert through stack scratch in serial and workshared runs.
+     *
+     * Widths above the former 4096-float bound previously allocated per call;
+     * they now stay on the bounded stack row with unchanged arithmetic.
+     */
+    TEST_F(CPURMSNormKernelTTest, DecodedRowScratchCoversHidden5120)
+    {
+        constexpr int cols = 5120;
+        for (int rows : {2, 9})
+        {
+            const auto fp32_input = generate_random_fp32(rows * cols);
+            const auto gamma = generate_random_fp32(cols, 0.5f, 1.5f);
+
+            std::vector<uint16_t> bf16_input(rows * cols), bf16_output(rows * cols);
+            simd::convert_fp32_to_bf16(fp32_input.data(), bf16_input.data(), rows * cols);
+            CPURMSNormKernelT<ActivationPrecision::BF16> bf16;
+            ASSERT_TRUE(bf16.apply_typed(bf16_input.data(), gamma.data(), bf16_output.data(), rows, cols, EPSILON));
+            std::vector<float> decoded(rows * cols), observed(rows * cols), expected(rows * cols);
+            simd::convert_bf16_to_fp32(bf16_input.data(), decoded.data(), rows * cols);
+            simd::convert_bf16_to_fp32(bf16_output.data(), observed.data(), rows * cols);
+            reference_rmsnorm(decoded.data(), gamma.data(), expected.data(), rows, cols, EPSILON);
+            EXPECT_LT(max_abs_diff(observed.data(), expected.data(), rows * cols), BF16_TOLERANCE) << "rows=" << rows;
+
+            const size_t blocks = static_cast<size_t>(rows) * cols / 32;
+            std::vector<Q8_1Block> q8_input(blocks), q8_output(blocks);
+            simd::quantize_fp32_to_q8_1_blocks(fp32_input.data(), q8_input.data(), rows * cols);
+            CPURMSNormKernelT<ActivationPrecision::Q8_1> q8;
+            ASSERT_TRUE(q8.apply_typed(q8_input.data(), gamma.data(), q8_output.data(), rows, cols, EPSILON));
+            simd::dequantize_q8_1_to_fp32(q8_input.data(), decoded.data(), rows * cols);
+            simd::dequantize_q8_1_to_fp32(q8_output.data(), observed.data(), rows * cols);
+            reference_rmsnorm(decoded.data(), gamma.data(), expected.data(), rows, cols, EPSILON);
+            EXPECT_LT(max_abs_diff(observed.data(), expected.data(), rows * cols), Q8_1_TOLERANCE) << "rows=" << rows;
+        }
+    }
+
+    /**
+     * @test Rows wider than the stack bound are rejected before any store.
+     *
+     * Only the decoded-row conversion paths own stack scratch: native ARM
+     * BF16/FP16 rows and the AVX512 pure-integer Q8_1 path have no row bank
+     * and keep accepting any width.
+     */
+    TEST_F(CPURMSNormKernelTTest, DecodedRowScratchRejectsRowsBeyondTheStackBound)
+    {
+        constexpr int rows = 2;
+        constexpr int cols = 8192 + 32;
+        const std::vector<float> gamma(cols, 1.0f);
+        const uint16_t sentinel = 0x5a5a;
+        [[maybe_unused]] std::vector<uint16_t> half_input(rows * cols, 0x3c00), half_output(rows * cols, sentinel);
+#if !(defined(__aarch64__) && defined(__ARM_NEON))
+        CPURMSNormKernelT<ActivationPrecision::BF16> bf16;
+        EXPECT_THROW((void)bf16.apply_typed(half_input.data(), gamma.data(), half_output.data(), rows, cols, EPSILON),
+                     std::invalid_argument);
+        EXPECT_TRUE(std::all_of(half_output.begin(), half_output.end(), [&](uint16_t word) { return word == sentinel; }));
+        CPURMSNormKernelT<ActivationPrecision::FP16> fp16;
+        EXPECT_THROW((void)fp16.apply_typed(half_input.data(), gamma.data(), half_output.data(), rows, cols, EPSILON),
+                     std::invalid_argument);
+        EXPECT_TRUE(std::all_of(half_output.begin(), half_output.end(), [&](uint16_t word) { return word == sentinel; }));
+#endif
+#if !defined(__AVX512F__)
+        const std::vector<float> ones(rows * cols, 1.0f);
+        std::vector<Q8_1Block> q8_input(rows * cols / 32), q8_output(rows * cols / 32);
+        simd::quantize_fp32_to_q8_1_blocks(ones.data(), q8_input.data(), rows * cols);
+        std::memset(q8_output.data(), 0x5a, q8_output.size() * sizeof(Q8_1Block));
+        const auto untouched = q8_output;
+        CPURMSNormKernelT<ActivationPrecision::Q8_1> q8;
+        EXPECT_THROW((void)q8.apply_typed(q8_input.data(), gamma.data(), q8_output.data(), rows, cols, EPSILON),
+                     std::invalid_argument);
+        EXPECT_EQ(std::memcmp(q8_output.data(), untouched.data(), q8_output.size() * sizeof(Q8_1Block)), 0);
+#endif
     }
 
 } // namespace llaminar2

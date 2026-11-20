@@ -171,6 +171,7 @@ namespace llaminar2
             gpu.local_device_id = device.device_id;
             gpu.memory_bytes = device.total_memory_bytes;
             gpu.free_memory_bytes = device.free_memory_bytes;
+            gpu.memory_backing = device.memory_backing;
             gpu.compute_units = device.compute_units;
             gpu.last_level_cache_bytes = device.last_level_cache_bytes;
             gpu.name = device.name;

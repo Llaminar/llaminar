@@ -168,16 +168,7 @@ namespace
     /** @return Typed policy ISA matching the runtime-dispatched kernel path. */
     [[nodiscard]] CPUFA2VectorISA activePolicyISA() noexcept
     {
-        switch (activeISALevel())
-        {
-        case ISALevel::Scalar:
-            return CPUFA2VectorISA::Scalar;
-        case ISALevel::AVX2:
-            return CPUFA2VectorISA::AVX2;
-        case ISALevel::AVX512:
-            return CPUFA2VectorISA::AVX512;
-        }
-        return CPUFA2VectorISA::Invalid;
+        return cpuFA2VectorISAFor(activeISALevel());
     }
 
     inline constexpr std::array<NativeKVFormat, 9> kNativeKVFormats{
@@ -1358,9 +1349,9 @@ namespace
     {
         prepareBenchmarkCPUBackend();
         const TournamentFilter filter = TournamentFilter::fromEnvironment();
-        const CacheInfo &cache = cache_info();
-        ASSERT_GT(cache.l2_size, 0U);
-        ASSERT_GT(cache.cache_line, 0U);
+        const auto cache = observedCPUFA2PolicyCache();
+        if (!cpuFA2UsesCanonicalSpanPolicy(compiledCPUFA2CodegenISA()))
+            ASSERT_TRUE(cache.valid());
 
         const std::vector<ParticipantAttentionGeometry> catalog =
             buildDistinctParticipantGeometries();
@@ -1428,12 +1419,7 @@ namespace
                         .kv_rows = point.kv_len,
                         .key_head_row_bytes = invocation.keyHeadRowBytes(),
                         .value_head_row_bytes = invocation.valueHeadRowBytes(),
-                        .cache = {
-                            .private_l1d_bytes = cache.l1_size,
-                            .private_l2_bytes = cache.l2_size,
-                            .shared_l3_bytes = cache.l3_size,
-                            .cache_line_bytes = cache.cache_line,
-                        },
+                        .cache = cache,
                     };
                     const int policy_tile = selectCPUFA2KVTile(tile_geometry);
                     ASSERT_GT(policy_tile, 0);

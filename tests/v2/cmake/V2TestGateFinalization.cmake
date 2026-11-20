@@ -1,8 +1,37 @@
-# Complete directory-owned gate inventory and physical-core normalization.
+# @file V2TestGateFinalization.cmake
+# @brief Complete directory-owned gate inventories and physical-core normalization.
 # Defer exactly once until every registration, including late included modules,
 # exists. CTest labels and add_v2_test target metadata remain the only authorities;
 # late targets cannot silently escape CI builds or CPU scheduling budgets.
 include_guard(DIRECTORY)
+
+# @brief Derive the ARM64 PR build and CTest scope from the same registrations.
+# @param tests Final configure-time test inventory for this directory.
+function(v2_register_arm64_pr_gate tests)
+    set(targets llaminar2)
+    foreach(test IN LISTS tests)
+        get_property(labels TEST ${test} PROPERTY LABELS)
+        if(NOT labels MATCHES "(^|;)(ARM|NEON|NEON_DOTPROD|NEON_I8MM)(;|$)" OR
+           NOT ("Unit" IN_LIST labels OR "ProductionTestPreflight" IN_LIST labels))
+            continue()
+        endif()
+        get_property(fixtures TEST ${test} PROPERTY FIXTURES_REQUIRED)
+        get_property(files TEST ${test} PROPERTY REQUIRED_FILES)
+        if(fixtures OR files OR "CUDA" IN_LIST labels OR "ROCm" IN_LIST labels OR
+           "Vulkan" IN_LIST labels OR "FullDeviceInventory" IN_LIST labels OR
+           "HardwareOptional" IN_LIST labels)
+            message(FATAL_ERROR "ARM64 PR registration must be model-free and host-only: ${test}")
+        endif()
+        set_property(TEST ${test} APPEND PROPERTY LABELS ARM64PR)
+        # A native test's GTest skip must fail even when its process exits zero.
+        set_property(TEST ${test} APPEND PROPERTY FAIL_REGULAR_EXPRESSION
+            "\\[ *SKIPPED *\\]")
+        get_property(build_targets GLOBAL PROPERTY "V2_TEST_BUILD_TARGETS_${test}")
+        list(APPEND targets ${build_targets})
+    endforeach()
+    list(REMOVE_DUPLICATES targets)
+    add_custom_target(v2_arm64_pr_gate DEPENDS ${targets})
+endfunction()
 
 # Finalize this directory only after all of its test declarations have executed.
 function(v2_finalize_test_gates)
@@ -79,6 +108,12 @@ function(v2_finalize_test_gates)
         endif()
         add_custom_target(v2_production_test_preflight_gate
             DEPENDS ${V2_PREFLIGHT_GATE_TARGETS})
+        if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND
+           LLAMINAR_CPU_TARGET_PROCESSOR MATCHES "^(arm64|aarch64|ARM64|AARCH64)$" AND
+           LLAMINAR_CPU_ISA_UPPER STREQUAL "NEON" AND
+           NOT (HAVE_ROCM OR HAVE_VULKAN))
+            v2_register_arm64_pr_gate("${V2_CONFIGURED_TESTS}")
+        endif()
     endif()
 endfunction()
 

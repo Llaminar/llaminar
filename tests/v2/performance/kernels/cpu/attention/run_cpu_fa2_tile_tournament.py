@@ -124,12 +124,15 @@ def parse_cpu_list(text: str) -> list[int]:
 def discover_single_socket_physical_cpus() -> list[int]:
     """Choose one allowed hardware thread per core on one physical package."""
 
-    packages: dict[int, dict[int, int]] = {}
+    packages: dict[int, dict[str, int]] = {}
     for cpu in sorted(os.sched_getaffinity(0)):
         topology = Path(f"/sys/devices/system/cpu/cpu{cpu}/topology")
         try:
             package = int((topology / "physical_package_id").read_text().strip())
-            core = int((topology / "core_id").read_text().strip())
+            # Thread-sibling sets identify cores; GB10 repeats core_id across clusters.
+            core = (topology / "thread_siblings_list").read_text().strip()
+            if not core:
+                raise ValueError("empty thread_siblings_list")
         except (OSError, ValueError) as error:
             raise RuntimeError(
                 f"cannot authenticate physical topology for CPU {cpu}: {error}"

@@ -10,6 +10,7 @@
 #include <gtest/gtest.h>
 #include "kernels/cpu/attention/CPUAttentionKeyQ8.h"
 #include "../AttentionKeyQ8DeviceTestCommon.h"
+#include "utils/CPUExplicitRoundingOracle.h"
 
 #include <array>
 #include <cstring>
@@ -21,15 +22,27 @@ namespace
 {
 using cpu::attention_key_q8::ISA;
 
-/** @brief Enumerate every available explicit implementation plus runtime dispatch. */
+/** @brief Enumerate compiled native implementations without advertising foreign leaves.
+ * @return Every available explicit route plus canonical automatic dispatch.
+ */
 std::vector<ISA> implementations()
 {
-    std::vector<ISA> result{ISA::Automatic, ISA::AVX2};
+    std::vector<ISA> result{ISA::Automatic};
+#if LLAMINAR_COMPILED_WITH_NEON
+    if (cpu_supports_neon()) result.push_back(ISA::NEON);
+#endif
+#if defined(__AVX2__)
+    if (cpu_supports_avx2()) result.push_back(ISA::AVX2);
+#endif
+#if defined(__AVX512F__)
     if (cpu_supports_avx512()) result.push_back(ISA::AVX512);
+#endif
     return result;
 }
 
-/** @brief Prove all head bytes and reconstruction bytes independently of scheduling. */
+/** @brief Prove all head bytes and reconstruction bytes independently of scheduling.
+ * @tparam D Complete production physical head width.
+ */
 template <int D>
 void conformance()
 {
@@ -57,15 +70,22 @@ void conformance()
                              << " isa=" << static_cast<int>(isa) << " workers=" << workers);
                 std::vector<AttentionKeyQ8Block<D>> blocks(heads);
                 std::vector<float> actual(source.size());
-#pragma omp parallel for num_threads(workers) schedule(static)
-                for (int head = 0; head < heads; ++head)
+                int observed_workers = 0;
+#pragma omp parallel num_threads(workers)
                 {
-                    const auto anchor = std::span<const float, D>(anchors.data() + head * D, D);
-                    cpu::attention_key_q8::quantize<D>(
-                        std::span<const float, D>(source.data() + head * D, D), anchor, blocks[head], isa);
-                    cpu::attention_key_q8::dequantize<D>(
-                        blocks[head], anchor, std::span<float, D>(actual.data() + head * D, D), isa);
+#pragma omp single
+                    observed_workers = omp_get_num_threads();
+#pragma omp for schedule(static)
+                    for (int head = 0; head < heads; ++head)
+                    {
+                        const auto anchor = std::span<const float, D>(anchors.data() + head * D, D);
+                        cpu::attention_key_q8::quantize<D>(
+                            std::span<const float, D>(source.data() + head * D, D), anchor, blocks[head], isa);
+                        cpu::attention_key_q8::dequantize<D>(
+                            blocks[head], anchor, std::span<float, D>(actual.data() + head * D, D), isa);
+                    }
                 }
+                ASSERT_EQ(observed_workers, workers);
                 ASSERT_EQ(std::memcmp(blocks.data(), expected.data(), blocks.size() * sizeof(blocks[0])), 0);
                 ASSERT_EQ(std::memcmp(actual.data(), decoded.data(), actual.size() * sizeof(float)), 0);
             }
@@ -73,11 +93,13 @@ void conformance()
     }
 }
 
-/** @brief SIMD lane searches must agree at and immediately beside every bin boundary. */
+/** @brief SIMD lane searches must agree at and immediately beside every bin boundary.
+ * @tparam D Complete production physical head width.
+ */
 template <int D>
 void boundaries()
 {
-    std::array<float, D> anchor{}, source{}, residual{};
+    std::array<float, D> anchor{}, source{};
     for (const float scale : {0.0001f, 1.0f, 130.0f, 8192.0f})
     {
         for (int bin = 0; bin < 127; ++bin)
@@ -113,7 +135,9 @@ TEST(CPUAttentionKeyQ8, EveryRationalBoundaryMatchesScalarBytes)
     boundaries<64>(); boundaries<128>(); boundaries<256>();
 }
 
-/** @brief Finite FP32 exponent extremes preserve the rational oracle's decisions. */
+/** @brief Finite FP32 exponent extremes preserve the rational oracle's decisions.
+ * @tparam D Complete production physical head width.
+ */
 template <int D>
 void exponentExtremes()
 {
@@ -164,12 +188,146 @@ TEST(CPUAttentionKeyQ8, InvalidInputCannotPublishPartOfABlock)
     }
 }
 
+/** @brief Exercise the complete zero-residual production branch with retained nonzero/signed-zero anchors.
+ * @tparam D Actual complete physical key-head width.
+ */
+template <int D> void zeroResiduals()
+{
+    for (int variant = 0; variant < 3; ++variant)
+    {
+        std::array<float, D> source{}, anchor{}, expected_decoded{}, actual_decoded{};
+        for (int coordinate = 0; coordinate < D; ++coordinate)
+        {
+            anchor[coordinate] = variant == 0 ? float(coordinate % 17 - 8) * 0.03125f
+                : std::copysign(0.0f, coordinate % 2 ? -1.0f : 1.0f);
+            source[coordinate] = variant == 2 ? -anchor[coordinate] : anchor[coordinate];
+            expected_decoded[coordinate] = memoryRoundedAdd(0.0f, anchor[coordinate]);
+        }
+        const auto original_source = source, original_anchor = anchor;
+        const AttentionKeyQ8Block<D> expected{};
+        for (const ISA isa : implementations())
+        {
+            AttentionKeyQ8Block<D> actual;
+            std::memset(&actual, 0xa5, sizeof(actual));
+            actual_decoded.fill(919.25f);
+            cpu::attention_key_q8::quantize<D>(source, anchor, actual, isa);
+            EXPECT_EQ(std::memcmp(&actual, &expected, sizeof(actual)), 0);
+            cpu::attention_key_q8::dequantize<D>(actual, anchor, actual_decoded, isa);
+            EXPECT_EQ(std::memcmp(actual_decoded.data(), expected_decoded.data(), sizeof(actual_decoded)), 0);
+            EXPECT_EQ(std::memcmp(source.data(), original_source.data(), sizeof(source)), 0);
+            EXPECT_EQ(std::memcmp(anchor.data(), original_anchor.data(), sizeof(anchor)), 0);
+        }
+    }
+}
+
+/** @test Exactly zero residuals author every byte, including positive-zero scale and all-zero codes. */
+TEST(CPUAttentionKeyQ8, ZeroResidualRetainsAnchorsAndAuthorsEveryByte)
+{
+    zeroResiduals<64>(); zeroResiduals<128>(); zeroResiduals<256>();
+}
+
+/** @brief Validate every original coordinate before any block publication, including anchor/overflow errors.
+ * @tparam D Actual complete cache-head geometry.
+ */
+template <int D> void anchoredFailures()
+{
+    std::array<float, D> source{}, anchor{};
+    for (const ISA isa : implementations())
+        for (int coordinate = 0; coordinate < D; ++coordinate)
+            for (int invalid_case = 0; invalid_case < 4; ++invalid_case)
+            {
+                source.fill(0); anchor.fill(0);
+                if (invalid_case == 0) anchor[coordinate] = std::numeric_limits<float>::infinity();
+                if (invalid_case == 1) anchor[coordinate] = std::numeric_limits<float>::quiet_NaN();
+                if (invalid_case == 2)
+                { source[coordinate] = std::numeric_limits<float>::max(); anchor[coordinate] = -std::numeric_limits<float>::max(); }
+                if (invalid_case == 3)
+                { source[coordinate] = -std::numeric_limits<float>::max(); anchor[coordinate] = std::numeric_limits<float>::max(); }
+                AttentionKeyQ8Block<D> output;
+                std::memset(&output, 0x5a, sizeof(output)); const auto before = output;
+                EXPECT_THROW(cpu::attention_key_q8::quantize<D>(source, anchor, output, isa), std::domain_error);
+                EXPECT_EQ(std::memcmp(&before, &output, sizeof(output)), 0);
+            }
+}
+
+/** @test Corrupt anchors and finite subtraction overflow cannot partially author a physical block. */
+TEST(CPUAttentionKeyQ8, AnchoredFailuresRejectBeforePublicationForEveryWidth)
+{
+    anchoredFailures<64>(); anchoredFailures<128>(); anchoredFailures<256>();
+}
+
+/** @test Codec outputs preserve both original cache authorities before any access through aliased spans. */
+TEST(CPUAttentionKeyQ8, SourceAnchorAndCompressedStorageAliasesRejectBeforeMutation)
+{
+    std::array<float, 65> source{}, anchor{};
+    source.fill(0.125f); anchor.fill(0.25f);
+    const auto original_source = source, original_anchor = anchor;
+    AttentionKeyQ8Block<64> block;
+    std::memset(&block, 0x5a, sizeof(block)); const auto original_block = block;
+    for (const ISA isa : implementations())
+    {
+        const auto compressed_as_source = std::span<const float, 64>(reinterpret_cast<const float *>(&block), 64);
+        const auto compressed_as_output = std::span<float, 64>(reinterpret_cast<float *>(&block), 64);
+        EXPECT_THROW(cpu::attention_key_q8::quantize<64>(compressed_as_source, std::span<const float, 64>(anchor.data(), 64), block, isa), std::invalid_argument);
+        EXPECT_THROW(cpu::attention_key_q8::quantize<64>(std::span<const float, 64>(source.data(), 64), compressed_as_source, block, isa), std::invalid_argument);
+        EXPECT_THROW(cpu::attention_key_q8::dequantize<64>(block, std::span<const float, 64>(anchor.data(), 64), compressed_as_output, isa), std::invalid_argument);
+        EXPECT_THROW(cpu::attention_key_q8::dequantize<64>(block, std::span<const float, 64>(anchor.data(), 64), std::span<float, 64>(anchor.data(), 64), isa), std::invalid_argument);
+        EXPECT_THROW(cpu::attention_key_q8::dequantize<64>(block, std::span<const float, 64>(anchor.data(), 64), std::span<float, 64>(anchor.data() + 1, 64), isa), std::invalid_argument);
+        EXPECT_EQ(std::memcmp(&block, &original_block, sizeof(block)), 0);
+        EXPECT_EQ(std::memcmp(source.data(), original_source.data(), sizeof(source)), 0);
+        EXPECT_EQ(std::memcmp(anchor.data(), original_anchor.data(), sizeof(anchor)), 0);
+    }
+}
+
+/** @brief Check every legal signed code and representative physical scale without a SIMD-derived oracle.
+ * @tparam D Actual physical cache-head width.
+ */
+template <int D> void codeDomains()
+{
+    std::array<float, D> anchor{}, expected{}, actual{};
+    AttentionKeyQ8Block<D> block{};
+    for (int exponent : {-149, -126, -16, 0, 16, 112})
+        for (int start = 0; start < 255; start += D)
+        {
+            block.quadratic_scale = std::ldexp(1.0f, exponent);
+            for (int coordinate = 0; coordinate < D; ++coordinate)
+            {
+                block.codes[coordinate] = static_cast<std::int8_t>((start + coordinate) % 255 - 127);
+                anchor[coordinate] = float(coordinate % 13 - 6) * 0.03125f;
+            }
+            attentionKeyQ8DequantizeReference<D>(block, expected);
+            for (int coordinate = 0; coordinate < D; ++coordinate) expected[coordinate] += anchor[coordinate];
+            for (const ISA isa : implementations())
+            {
+                actual.fill(919.25f);
+                cpu::attention_key_q8::dequantize<D>(block, anchor, actual, isa);
+                EXPECT_EQ(std::memcmp(actual.data(), expected.data(), sizeof(actual)), 0);
+            }
+        }
+}
+
+/** @test Every legal signed byte decodes in the shared two-multiply/add program. */
+TEST(CPUAttentionKeyQ8, EveryLegalCodeAndPhysicalScaleMatchesScalarBytes)
+{
+    codeDomains<64>(); codeDomains<128>(); codeDomains<256>();
+}
+
 TEST(CPUAttentionKeyQ8, AutomaticDispatchHonorsTheCanonicalISAPolicy)
 {
-    const ISA expected = activeISALevel() == ISALevel::AVX512 ? ISA::AVX512 : ISA::AVX2;
+    ISA expected = ISA::Automatic;
+    switch (activeISALevel())
+    {
+    case ISALevel::AVX512: expected = ISA::AVX512; break;
+    case ISALevel::AVX2: expected = ISA::AVX2; break;
+    case ISALevel::NEON:
+    case ISALevel::NEONDotProd: expected = ISA::NEON; break;
+    default: FAIL() << "AQ8 production conformance requires a native ISA";
+    }
     EXPECT_EQ(cpu::attention_key_q8::resolveISA(ISA::Automatic), expected);
-    if (!cpu_supports_avx512())
-        EXPECT_THROW(cpu::attention_key_q8::resolveISA(ISA::AVX512), std::invalid_argument);
+    const auto available = implementations();
+    for (ISA requested : {ISA::AVX2, ISA::AVX512, ISA::NEON, static_cast<ISA>(255)})
+        if (std::find(available.begin(), available.end(), requested) == available.end())
+            EXPECT_THROW(cpu::attention_key_q8::resolveISA(requested), std::invalid_argument);
 }
 } // namespace
 } // namespace llaminar2::test

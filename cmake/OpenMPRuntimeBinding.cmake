@@ -1,31 +1,49 @@
 # @file OpenMPRuntimeBinding.cmake
-# @brief Seal the selected CPU OpenMP runtime's native ELF identity for preflight.
+# @brief Seal the selected CPU OpenMP runtime's ELF or Mach-O identity.
 #
 # The compiler's OpenMP target owns runtime selection. A GPU SDK search path
 # must not replace that runtime with a same-filename compatibility alias. Record
-# its SONAME, not a builder-only absolute path, so installed test runners can
-# verify the actual loader closure without a compiler SDK or matching symlinks.
+# its ELF SONAME or Mach-O install name, so the configured dependency identity
+# comes from the library itself rather than a guessed filename. Installed ELF
+# test runners can verify that closure without a compiler SDK or matching symlinks.
 include_guard(GLOBAL)
 
 # @brief Read the one dynamic runtime selected by FindOpenMP for C++.
-# @param output_variable Caller variable receiving the runtime's ELF SONAME.
+# @param output_variable Caller variable receiving the ELF SONAME or Mach-O install name.
 # @throws Fatal configuration error for missing or ambiguous runtime identity.
 function(llaminar_openmp_runtime_soname output_variable)
-    if(NOT CMAKE_READELF)
+    if(APPLE)
+        if(CMAKE_OTOOL)
+            set(runtime_reader "${CMAKE_OTOOL}")
+        else()
+            find_program(LLAMINAR_OTOOL_EXECUTABLE NAMES otool REQUIRED)
+            set(runtime_reader "${LLAMINAR_OTOOL_EXECUTABLE}")
+        endif()
+    elseif(NOT CMAKE_READELF)
         message(FATAL_ERROR "OpenMP runtime binding requires the configured ELF reader")
     endif()
     set(runtime_sonames)
     foreach(library IN LISTS OpenMP_CXX_LIBRARIES)
         # FindOpenMP also includes pthread. Only shared libraries can own the
         # dynamic OpenMP ABI whose resolution the installed gate must prove.
-        if(NOT library MATCHES "lib(gomp|omp|iomp5)\\.so")
-            continue()
+        if(APPLE)
+            if(NOT library MATCHES "lib(gomp|omp|iomp5)(\\.[0-9]+)*\\.dylib$")
+                continue()
+            endif()
+            execute_process(COMMAND "${runtime_reader}" -D "${library}"
+                RESULT_VARIABLE result OUTPUT_VARIABLE dynamic_section
+                ERROR_VARIABLE diagnostic OUTPUT_STRIP_TRAILING_WHITESPACE)
+            set(identity_pattern "^[^\n]+:\n([^\n]+)$")
+        else()
+            if(NOT library MATCHES "lib(gomp|omp|iomp5)\\.so")
+                continue()
+            endif()
+            execute_process(COMMAND "${CMAKE_READELF}" -d "${library}"
+                RESULT_VARIABLE result OUTPUT_VARIABLE dynamic_section
+                ERROR_VARIABLE diagnostic)
+            set(identity_pattern "\\(SONAME\\)[^\n]*\\[([^]]+)\\]")
         endif()
-        execute_process(COMMAND "${CMAKE_READELF}" -d "${library}"
-            RESULT_VARIABLE result OUTPUT_VARIABLE dynamic_section
-            ERROR_VARIABLE diagnostic)
-        if(NOT result EQUAL 0 OR
-           NOT dynamic_section MATCHES "\\(SONAME\\)[^\n]*\\[([^]]+)\\]")
+        if(NOT result EQUAL 0 OR NOT dynamic_section MATCHES "${identity_pattern}")
             message(FATAL_ERROR
                 "Cannot authenticate selected OpenMP runtime '${library}': ${diagnostic}")
         endif()
