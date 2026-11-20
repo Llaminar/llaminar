@@ -602,6 +602,24 @@ namespace llaminar2::cpu::native_quantised
                                     else consume<Ops>(centered, block, group, high);
                                 }
                             }
+                            else if constexpr (nibble && kPowerOfTwoBF16Scales<Map>)
+                            {
+                                // Lane-indexed dots on each row's once-loaded block: broadcasting
+                                // every row/group activation word lets GCC hoist 24 broadcasts and
+                                // spill the row accumulators. Integer dots are exact in any order.
+                                const auto blocks = activationBlocks<Ops>(block);
+                                forEachGroup<4>([&]<int Group>() __attribute__((always_inline)) {
+                                    const auto raw = vld1q_u8(unit + Group * 256 + column * 4);
+                                    const auto low_nibbles = std::bit_cast<I>(nibbles<Map>(vandq_u8(raw, vdupq_n_u8(15))));
+                                    const auto high_nibbles = std::bit_cast<I>(nibbles<Map>(vshrq_n_u8(raw, 4)));
+#pragma GCC unroll 4
+                                    for (std::size_t row = 0; row < Rows; ++row)
+                                    {
+                                        low[row] = Ops::template dotLane<Group>(low[row], low_nibbles, blocks[row]);
+                                        low[row] = Ops::template dotLane<Group + 4>(low[row], high_nibbles, blocks[row]);
+                                    }
+                                });
+                            }
                             else if constexpr (nibble)
                             {
 #pragma GCC unroll 4
