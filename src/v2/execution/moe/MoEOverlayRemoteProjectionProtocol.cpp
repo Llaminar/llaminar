@@ -4,6 +4,7 @@
  */
 
 #include "MoEOverlayRemoteProjectionProtocol.h"
+#include "tensors/NativeQuantisedScalePlane.h"
 
 #include <algorithm>
 #include <cstring>
@@ -389,9 +390,9 @@ namespace llaminar2
         result.N_padded = (result.N + 63) / 64 * 64;
         result.blocks_per_row = result.K / 32;
         const auto blocks = std::uint64_t(result.N) * result.blocks_per_row;
-        result.region_bytes = {blocks * gpu_payload_bytes_per_block,
-            blocks * sizeof(std::uint16_t), gpu_is_asymmetric ? blocks * sizeof(std::uint16_t) : 0u,
-            gpu_has_emins ? blocks * sizeof(std::uint32_t) : 0u};
+        const auto planes = NativeQuantisedMetadataPlaneBytes::of(
+            blocks, gpu_codebook_id, gpu_is_asymmetric, gpu_has_emins);
+        result.region_bytes = {blocks * gpu_payload_bytes_per_block, planes.scales, planes.secondary, planes.emins};
         return seal(std::move(result));
     }
 
@@ -401,9 +402,10 @@ namespace llaminar2
         if (!carriesGpuBytes() || region >= region_bytes.size() || !capacity ||
             wire_offset >= region_bytes[region] || N <= 0 || K <= 0)
             return std::nullopt;
+        const auto planes = NativeQuantisedMetadataPlaneBytes::of(
+            1u, gpu_codebook_id, gpu_is_asymmetric, gpu_has_emins);
         const std::array<std::uint64_t, 4> block_bytes{gpu_payload_bytes_per_block,
-            sizeof(std::uint16_t), gpu_is_asymmetric ? sizeof(std::uint16_t) : 0u,
-            gpu_has_emins ? sizeof(std::uint32_t) : 0u};
+            planes.scales, planes.secondary, planes.emins};
         try {
             return expertTierProjectionByteRange(
                 ExpertTierWeightProjectionIntersection::between(source_projection,destination_projection),
@@ -595,11 +597,13 @@ namespace llaminar2
             const std::uint64_t blocks =
                 static_cast<std::uint64_t>(N) *
                 static_cast<std::uint64_t>(blocks_per_row);
+            const auto planes = NativeQuantisedMetadataPlaneBytes::of(
+                blocks, gpu_codebook_id, gpu_is_asymmetric, gpu_has_emins);
             const std::array<std::uint64_t, 4> expected{
                 blocks * gpu_payload_bytes_per_block,
-                blocks * sizeof(std::uint16_t),
-                gpu_is_asymmetric ? blocks * sizeof(std::uint16_t) : 0u,
-                gpu_has_emins ? blocks * sizeof(std::uint32_t) : 0u,
+                planes.scales,
+                planes.secondary,
+                planes.emins,
             };
             if (region_bytes != expected)
             {
