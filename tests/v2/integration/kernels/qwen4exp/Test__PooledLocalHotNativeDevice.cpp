@@ -98,6 +98,16 @@ auto geometry(const ReplayCase& c,DeviceId device,std::uint32_t slots,std::uint3
         PhysicalMemoryOwner::ActivationArena,DeviceId::cpu());
     return std::tuple{std::move(layout),std::move(physical),std::move(policy),std::move(cpu),std::move(channel),std::move(local),std::move(declarations)};
 }
+/** @brief Bound each process to two formats, each of which retains five General graph slots. */
+constexpr unsigned kLocalHotFormatsPerProcess = 2;
+
+/** @return Group count for all original GGUF formats, excluding the internal Q8_1 case. */
+unsigned localHotReplayGroupCount()
+{
+    const auto supported = embeddingVerifierFormats().size() - 1;
+    return static_cast<unsigned>((supported + kLocalHotFormatsPerProcess - 1) / kLocalHotFormatsPerProcess);
+}
+
 /** @brief Existing inventory, low-key scan pressure, or full-width large-radix correctness. */
 enum class ReplayShape { SmallInventory, LargeRadixScan, LargeRadixWideKey, NextWindowCount, LargeFutureAdoption, SmallProbeBoundary, SmallProbeTiming };
 /**
@@ -150,6 +160,12 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
     requireProvider(!largeWideKey || cases.size()==1,
         "Wide large-radix trace lost its original sparse IQ4_NL source");
     for(auto& c:cases)for(auto key:c.keys){const auto row=c.file->original(key);c.native.insert(c.native.end(),row.begin(),row.end());}
+    if(group) {
+        requireProvider(supported + 1 == embeddingVerifierFormats().size(),
+            "Local-hot replay must cover every original GGUF format");
+        requireProvider(!cases.empty() && cases.size() <= kLocalHotFormatsPerProcess,
+            "Local-hot replay group exceeds its process-owned graph population");
+    }
     const std::array devices{device};auto session=PreparedNativeLookupFixture::prepare(devices);
     const auto memory=session->memory();const auto gpu=session->resource(device),host=session->resource(DeviceId::cpu());
     const auto io=RetainedHostServiceProgram::original(RetainedHostServiceRole::ImmutableLookupIO);
@@ -600,10 +616,10 @@ void replayLocal(DeviceId device,std::uint32_t slots,bool wide,
 }
 /** @brief Exercise each local-hot format in one process with its original arena and graphs. */
 class LocalHotFormatReplay : public ::testing::TestWithParam<unsigned> {};
-INSTANTIATE_TEST_SUITE_P(FormatGroups, LocalHotFormatReplay, ::testing::Range(0u, PooledFormatReplayGroup::Count));
+INSTANTIATE_TEST_SUITE_P(FormatGroups, LocalHotFormatReplay, ::testing::Range(0u, localHotReplayGroupCount()));
 #define LOCAL_HOT_NATIVE_TESTS(BACKEND,DEVICE) \
-TEST_P(LocalHotFormatReplay,BACKEND##_AllFormatsC0){replayLocal(DEVICE,0,false,ReplayShape::SmallInventory,PooledFormatReplayGroup(GetParam()));} \
-TEST_P(LocalHotFormatReplay,BACKEND##_AllFormatsPositive){replayLocal(DEVICE,4,false,ReplayShape::SmallInventory,PooledFormatReplayGroup(GetParam()));} \
+TEST_P(LocalHotFormatReplay,BACKEND##_AllFormatsC0){replayLocal(DEVICE,0,false,ReplayShape::SmallInventory,PooledFormatReplayGroup(GetParam(),localHotReplayGroupCount()));} \
+TEST_P(LocalHotFormatReplay,BACKEND##_AllFormatsPositive){replayLocal(DEVICE,4,false,ReplayShape::SmallInventory,PooledFormatReplayGroup(GetParam(),localHotReplayGroupCount()));} \
 TEST(PooledLocalHotNative,BACKEND##_WideKeyPositive){replayLocal(DEVICE,4,true);} \
 TEST(PooledLocalHotNative,BACKEND##_LargeRadixScan){replayLocal(DEVICE,4,false,ReplayShape::LargeRadixScan);} \
 TEST(PooledLocalHotNative,BACKEND##_LargeFutureAdoption){replayLocal(DEVICE,4,false,ReplayShape::LargeFutureAdoption);} \
@@ -613,7 +629,7 @@ TEST(PooledLocalHotNative,BACKEND##_SmallProbeBoundaryWideKey){replayLocal(DEVIC
 TEST(PooledLocalHotNative,BACKEND##_SmallProbeBoundaryWideKeyC0){replayLocal(DEVICE,0,true,ReplayShape::SmallProbeBoundary);} \
 TEST(PooledLocalHotNative,BACKEND##_SmallProbeTiming){replayLocal(DEVICE,4,false,ReplayShape::SmallProbeTiming);} \
 TEST(PooledLocalHotNative,BACKEND##_LargeRadixWideKey){replayLocal(DEVICE,4,true,ReplayShape::LargeRadixWideKey);} \
-TEST_P(LocalHotFormatReplay,BACKEND##_PrefillNextWindowCount){replayLocal(DEVICE,4,false,ReplayShape::NextWindowCount,PooledFormatReplayGroup(GetParam()));}
+TEST_P(LocalHotFormatReplay,BACKEND##_PrefillNextWindowCount){replayLocal(DEVICE,4,false,ReplayShape::NextWindowCount,PooledFormatReplayGroup(GetParam(),localHotReplayGroupCount()));}
 #ifdef HAVE_CUDA
 LOCAL_HOT_NATIVE_TESTS(CUDA,DeviceId::cuda(0))
 #endif
