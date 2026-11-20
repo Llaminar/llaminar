@@ -6307,7 +6307,8 @@ class InfrastructureTests(unittest.TestCase):
         self.assertIn('if docker_args_need_cuda "${args_ref[@]}"; then', harness)
 
     def test_develop_workflow_has_only_the_isa_build_axis_and_no_certification_drivers(self):
-        workflow = (ROOT / ".github/workflows/ci.yml").read_text()
+        workflow_dir = ROOT / ".github/workflows"
+        workflow = "\n".join((workflow_dir / name).read_text() for name in ("ci.yml", "develop-image-isa.yml"))
         self.assertIn("scripts/ci/run_develop_image_gate.py", workflow)
         self.assertNotIn("scripts/ci/run_production_pipeline.py", workflow)
         self.assertNotIn("run_benchmark_check.sh", workflow)

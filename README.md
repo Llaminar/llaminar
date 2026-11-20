@@ -1422,9 +1422,10 @@ a separate GPU container, including CUDA, ROCm, mixed-backend and exclusive
 lanes. Explicit hardware requirements record unavailable topologies as
 unqualified; missing GPUs, selected-test failures and skips block the gate.
 After merge, standard GitHub-hosted Ubuntu runners build the AVX512 and AVX2
-Release development images in parallel and publish the verified pair. Both workflows restore complete
-toolchain images keyed by dependency inputs and ISA. They save newly built
-toolchains before source compilation, so later failures retain them. Production validation and
+Release development images in parallel and publish the verified pair. Each ISA
+prepares its toolchain cache in a separate job before building the runtime.
+Both workflows cache complete toolchain images keyed by dependency inputs and
+ISA. Production validation and
 release certification remain separate. Different PRs can run concurrently; a
 new develop merge cancels any older image build. See [the CI workflow](docs/production-ci.md).
 

@@ -1,0 +1,161 @@
+# @file develop-image-isa.yml
+# @brief Prepare the cached toolchain and build one source-bound develop runtime.
+name: Develop image by ISA
+
+on:
+  workflow_call:
+    inputs:
+      cpu-isa:
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  toolchain:
+    name: Prepare develop toolchain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - &checkout
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ github.sha }}
+          submodules: false
+          lfs: false
+          persist-credentials: false
+      - &prepare-vm
+        name: Prepare the disposable build VM
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Reclaim unused language SDKs before restoring multi-gigabyte OCI images.
+          for sdk in /usr/local/lib/android /usr/share/dotnet /usr/share/swift /usr/local/.ghcup; do
+            if [[ -d "$sdk" && ! -L "$sdk" ]]; then
+              sudo find "$sdk" -xdev -depth -delete
+            fi
+          done
+          df -h "$RUNNER_TEMP" "$(docker info --format '{{.DockerRootDir}}')"
+          # Procfs rejects core file creation without invoking Ubuntu's crash collector.
+          sudo sysctl -w kernel.core_pattern=/proc/llaminar-core-disabled
+      - &buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          version: v0.38.1
+          driver: docker-container
+          driver-opts: |
+            network=host
+            image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+          cache-binary: false
+      - &registry-login
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - &cache-identity
+        name: Resolve the exact toolchain cache entry
+        id: toolchain-cache
+        shell: bash
+        env:
+          CPU_ISA: ${{ inputs.cpu-isa }}
+        run: |
+          set -euo pipefail
+          metadata=$(mktemp)
+          python3 scripts/ci/toolchain_cache.py prepare \
+            --root "$RUNNER_TEMP/toolchain-cache-identity" --cpu-isa "$CPU_ISA" \
+            --github-output "$metadata"
+          key=$(sed -n "s/^key_${CPU_ISA,,}=//p" "$metadata")
+          test -n "$key"
+          printf 'key=%s\npath=%s/llaminar-toolchains/%s\n' \
+            "$key" "$RUNNER_TEMP" "${CPU_ISA,,}" >> "$GITHUB_OUTPUT"
+      - name: Check for an exact handoff cache hit
+        id: lookup
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ steps.toolchain-cache.outputs.key }}
+          path: ${{ steps.toolchain-cache.outputs.path }}
+          lookup-only: true
+      - uses: ./.github/actions/cache-develop-toolchain
+        if: steps.lookup.outputs.cache-hit != 'true'
+        with:
+          cpu-isa: ${{ inputs.cpu-isa }}
+      - name: Confirm the prepared toolchain is available for the build job
+        if: steps.lookup.outputs.cache-hit != 'true'
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ steps.toolchain-cache.outputs.key }}
+          path: ${{ steps.toolchain-cache.outputs.path }}
+          lookup-only: true
+          fail-on-cache-miss: true
+
+  runtime:
+    name: Build develop runtime
+    needs: toolchain
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    steps:
+      - *checkout
+      - *prepare-vm
+      - *buildx
+      - *registry-login
+      - *cache-identity
+      - name: Restore the prepared toolchain
+        uses: actions/cache/restore@v5
+        with:
+          key: ${{ steps.toolchain-cache.outputs.key }}
+          path: ${{ steps.toolchain-cache.outputs.path }}
+          fail-on-cache-miss: true
+      - name: Authenticate the restored OCI image before compiling
+        shell: bash
+        env:
+          CPU_ISA: ${{ inputs.cpu-isa }}
+        run: |
+          set -euo pipefail
+          root="$RUNNER_TEMP/llaminar-toolchains"
+          python3 scripts/ci/toolchain_cache.py verify \
+            --root "$root" --cpu-isa "$CPU_ISA" --cache-hit true
+          printf 'LLAMINAR_DOCKER_TOOLCHAIN_ROOT=%s\n' "$root" >> "$GITHUB_ENV"
+      - name: Build and stage the Release runtime
+        shell: bash
+        env:
+          CPU_ISA: ${{ inputs.cpu-isa }}
+          LLAMINAR_DOCKER_BUILD_CACHE_ACCESS: read-write
+        run: |
+          set -euo pipefail
+          export LLAMINAR_DOCKER_BUILD_CACHE_IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:build-cache-develop"
+          exec python3 scripts/ci/run_develop_image_gate.py \
+            --build-only \
+            --cpu-isa "$CPU_ISA" \
+            --output parity-results/develop-image-gate \
+            --image "ghcr.io/${GITHUB_REPOSITORY,,}:develop" \
+            --stage
+      - name: Retain the staged runtime receipt
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-stage-${{ inputs.cpu-isa }}
+          path: parity-results/develop-image-gate/develop-image-gate.json
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+      - name: Retain develop-image build evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          # Compact build evidence; compiler/layer caches are not artifacts.
+          name: develop-image-gate-${{ github.run_id }}-${{ inputs.cpu-isa }}
+          # The per-ISA source snapshot is a Buildx input, not evidence. Its
+          # identity is sealed in develop-image-gate.json and it can contain
+          # hundreds of MiB of tracked diagnostic CSVs which Docker itself
+          # excludes. Upload build/publication logs and identity receipts only.
+          path: |
+            ${{ runner.temp }}/llaminar-toolchains/*-toolchain.json
+            parity-results/develop-image-gate/develop-image-gate.json
+            parity-results/develop-image-gate/**/build-*.log
+            parity-results/develop-image-gate/**/build-timeline.jsonl
+            parity-results/develop-image-gate/**/stage.log
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
