@@ -55,7 +55,7 @@ std::vector<M4SourceCase> groupedM4Cases()
         cases.push_back({family.name,M4SourceRole::Family,{},family});
         if(family.groups==13)
             cases.push_back({"G13_IQ3_XXS_wide_direct_tiles",M4SourceRole::WideFamily,{},family});
-        if(family.groups==15)
+        if(family.groups==15 && std::string_view(family.gate)=="IQ3_XXS")
             cases.push_back({"G15_IQ3_XXS_wide_direct_tiles",M4SourceRole::WideFamily,{},family});
     }
     return cases;
