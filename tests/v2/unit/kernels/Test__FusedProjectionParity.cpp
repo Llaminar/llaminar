@@ -271,6 +271,49 @@ TEST_F(FusedProjectionParity, IQ4_NL_FusedQKV_M1_Decode)
 }
 
 // ============================================================================
+// MXFP4 fused projection parity (nibble-LUT sibling of IQ4_NL, codebook 25)
+// ============================================================================
+
+TEST_F(FusedProjectionParity, MXFP4_FusedQKV_M1_Decode)
+{
+    constexpr int K = 896;
+
+    float max_diff = runFusedVsSequentialParity(
+        "MXFP4",
+        {{896, "Q_proj"}, {128, "K_proj"}, {128, "V_proj"}},
+        1, K);
+
+    EXPECT_LT(max_diff, PARITY_TOLERANCE)
+        << "MXFP4 fused QKV (M=1) diverges from sequential";
+}
+
+TEST_F(FusedProjectionParity, MXFP4_FusedGateUp_M1_Decode)
+{
+    constexpr int K = 896;
+
+    float max_diff = runFusedVsSequentialParity(
+        "MXFP4",
+        {{4864, "gate"}, {4864, "up"}},
+        1, K);
+
+    EXPECT_LT(max_diff, PARITY_TOLERANCE)
+        << "MXFP4 fused gate/up (M=1) diverges from sequential";
+}
+
+TEST_F(FusedProjectionParity, MXFP4_FusedQKV_M64_Prefill)
+{
+    constexpr int K = 896;
+
+    float max_diff = runFusedVsSequentialParity(
+        "MXFP4",
+        {{896, "Q_proj"}, {128, "K_proj"}, {128, "V_proj"}},
+        64, K);
+
+    EXPECT_LT(max_diff, PARITY_TOLERANCE)
+        << "MXFP4 fused QKV (M=64) diverges from sequential";
+}
+
+// ============================================================================
 // Edge case: single projection (fused with 1 element = degenerate case)
 // ============================================================================
 

@@ -195,6 +195,8 @@ namespace
             return TestTensorFactory::createQ4_0Random({N, K});
         if (fmt == "Q4_1")
             return TestTensorFactory::createQ4_1Random({N, K});
+        if (fmt == "MXFP4")
+            return TestTensorFactory::createMXFP4Random({N, K});
         if (fmt == "Q5_0")
             return TestTensorFactory::createQ5_0Random({N, K});
         if (fmt == "Q5_1")
@@ -1022,6 +1024,51 @@ namespace
         }
 
         renderSummaryTable("Q4_0 PREFILL (M>1) DISPATCH SWEEP — Qwen 7B", all);
+    }
+
+    // -----------------------------------------------------------------------
+    // DECODE (M=1): MXFP4 nibble-LUT path with the native E8M0 scale byte
+    // -----------------------------------------------------------------------
+    TEST_F(CPUNativeQuantisedDispatchSweepTest, MXFP4_Decode_7B)
+    {
+        auto shapes = qwen7BShapes();
+        std::vector<SweepResult> all;
+        bool header = false;
+
+        for (const auto &shape : shapes)
+        {
+            auto results = runDispatchSweep({"MXFP4", true}, shape, 1, header);
+            header = true;
+            all.insert(all.end(), results.begin(), results.end());
+        }
+
+        renderSummaryTable("MXFP4 DECODE (M=1) DISPATCH SWEEP — Qwen 7B", all);
+    }
+
+    // -----------------------------------------------------------------------
+    // PREFILL: MXFP4 sweep for key FFN shapes
+    // -----------------------------------------------------------------------
+    TEST_F(CPUNativeQuantisedDispatchSweepTest, MXFP4_Prefill_7B)
+    {
+        std::vector<GEMMShape> prefill_shapes = {
+            {"FFN_Gate", "FFN", 18944, 3584},
+            {"FFN_Down", "FFN", 3584, 18944},
+        };
+
+        std::vector<SweepResult> all;
+        bool header = false;
+
+        for (int M : PREFILL_M_VALUES)
+        {
+            for (const auto &shape : prefill_shapes)
+            {
+                auto results = runDispatchSweep({"MXFP4", true}, shape, M, header);
+                header = true;
+                all.insert(all.end(), results.begin(), results.end());
+            }
+        }
+
+        renderSummaryTable("MXFP4 PREFILL (M>1) DISPATCH SWEEP — Qwen 7B", all);
     }
 
     // -----------------------------------------------------------------------

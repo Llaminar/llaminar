@@ -87,6 +87,9 @@ static const std::vector<FormatDesc> ALL_FORMATS = {
     {"IQ4_XS", "Nibble-LUT",
      [](int N, int K, uint32_t s)
      { return std::unique_ptr<TensorBase>(TestTensorFactory::createIQ4_XSRandom({(size_t)N, (size_t)K}, s).release()); }},
+    {"MXFP4", "Nibble-LUT",
+     [](int N, int K, uint32_t s)
+     { return std::unique_ptr<TensorBase>(TestTensorFactory::createMXFP4Random({(size_t)N, (size_t)K}, s).release()); }},
 
     // INT8 pre-decoded (per-block, 32-element)
     {"Q5_0", "INT8",
