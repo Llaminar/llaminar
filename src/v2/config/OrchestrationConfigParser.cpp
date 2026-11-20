@@ -1309,6 +1309,7 @@ namespace llaminar2
         // Preserve the order in which categories appear in --help.
         spec.addCategory("Model Configuration")
             .addCategory("Inference Configuration")
+            .addCategory("Serving Configuration")
             .addCategory("Sampling Configuration")
             .addCategory("Chat Configuration")
             .addCategory("Benchmark Configuration")
@@ -1495,6 +1496,42 @@ namespace llaminar2
             .value_label = "<n>",
             .description = "Batch size (default: 1)",
             .setter = setters::parseInt(&OrchestrationConfig::batch_size, "--batch-size"),
+        });
+        spec.add({
+            .long_name = "--serving-resident-slots",
+            .category = "Serving Configuration",
+            .value_label = "<n>",
+            .description = "Authored resident execution slots S (design §9.4). Exact, never auto-reduced. Supply with --serving-response-leases and --serving-queue-capacity, or omit all three for automatic resolution. Not yet exposable: authored intent is rejected until the detached response-lease lifetime is installed; omit all three for the preserved automatic pool.",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &config, const std::string &value)
+                {
+                    config.serving_resident_slots = parsePositiveIntValue(
+                        value, "--serving-resident-slots");
+                }),
+        });
+        spec.add({
+            .long_name = "--serving-response-leases",
+            .category = "Serving Configuration",
+            .value_label = "<n>",
+            .description = "Authored maximum response/output leases R (design §9.4). Exact, never auto-reduced. Supply with --serving-resident-slots and --serving-queue-capacity, or omit all three for automatic resolution. Not yet exposable: authored intent is rejected until the detached response-lease lifetime is installed; omit all three for the preserved automatic pool.",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &config, const std::string &value)
+                {
+                    config.serving_response_leases = parsePositiveIntValue(
+                        value, "--serving-response-leases");
+                }),
+        });
+        spec.add({
+            .long_name = "--serving-queue-capacity",
+            .category = "Serving Configuration",
+            .value_label = "<n>",
+            .description = "Authored queue/preparing capacity Q (design §9.4, zero allowed). Exact, never auto-reduced. Supply with --serving-resident-slots and --serving-response-leases, or omit all three for automatic resolution. Not yet exposable: authored intent is rejected until the detached response-lease lifetime is installed; omit all three for the preserved automatic pool.",
+            .setter = setters::custom<OrchestrationConfig>(
+                [](OrchestrationConfig &config, const std::string &value)
+                {
+                    config.serving_queue_capacity = parseNonNegativeIntValue(
+                        value, "--serving-queue-capacity");
+                }),
         });
         spec.add({
             .long_name = "--threads",
@@ -3745,6 +3782,18 @@ namespace llaminar2
             else if (key == "batch_size")
             {
                 config.batch_size = parsePositiveIntValue(value, key);
+            }
+            else if (key == "serving_resident_slots")
+            {
+                config.serving_resident_slots = parsePositiveIntValue(value, key);
+            }
+            else if (key == "serving_response_leases")
+            {
+                config.serving_response_leases = parsePositiveIntValue(value, key);
+            }
+            else if (key == "serving_queue_capacity")
+            {
+                config.serving_queue_capacity = parseNonNegativeIntValue(value, key);
             }
             else if (key == "hostfile" || key == "mpi_hostfile")
             {

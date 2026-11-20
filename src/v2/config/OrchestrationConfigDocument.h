@@ -8,8 +8,9 @@
  * Optional policy values remain optional instead of becoming today's defaults.
  * The current version carries ordered discovery-rank selection, explicit
  * host-participation intent, optional planning workload and exact physical
- * backend-device counts, native ngram storage/window policies, and an optional
- * explicit shared predictor source and benchmark campaign input identity.
+ * backend-device counts, native ngram storage/window policies, an optional
+ * explicit shared predictor source and benchmark campaign input identity,
+ * and the typed serving-capacity intent axes (§9.4).
  * Resolved node-local route transport and diagnostic binding are retained
  * losslessly and revalidated against the original inventory on apply.
  * Older documents are rejected rather
@@ -24,7 +25,7 @@
 namespace llaminar2
 {
     /** @brief Exact field schema shared by the writer and fail-closed reader. */
-    inline constexpr int kOrchestrationConfigDocumentSchemaVersion = 13;
+    inline constexpr int kOrchestrationConfigDocumentSchemaVersion = 14;
 
     /**
      * @brief Encode every supported configuration field without normalization.

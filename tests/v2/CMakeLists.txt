@@ -17963,6 +17963,14 @@ add_v2_test(V2_Unit_HttpRuntimeStats
     COMMAND $<TARGET_FILE:v2_test_http_runtime_stats>
     LABELS "V2;Unit;Server;Observability;Threading"
     MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+
+# Test: SerializedInferenceExecutor (typed serving admission R/Q at the response-lease boundary)
+add_executable(v2_test_serialized_inference_executor unit/app/modes/Test__SerializedInferenceExecutor.cpp)
+target_link_libraries(v2_test_serialized_inference_executor llaminar2_core GTest::gtest GTest::gtest_main)
+add_v2_test(V2_Unit_SerializedInferenceExecutor
+    COMMAND $<TARGET_FILE:v2_test_serialized_inference_executor>
+    LABELS "V2;Unit;HTTP;Serving;ContinuousBatching;Admission;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_HTTPRuntimeStatsHandlerLifecycle
     COMMAND $<TARGET_FILE:v2_test_chat_completion_handler>
         --gtest_filter=Test__ChatCompletionHandler.RuntimeStats*:Test__ChatCompletionHandler.RuntimeSummaryNeverProbesLiveInferenceState

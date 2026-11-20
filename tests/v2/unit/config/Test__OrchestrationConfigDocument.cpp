@@ -585,7 +585,7 @@ namespace
 
 TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeRoundTripsLosslesslyAtCurrentSchema)
 {
-    static_assert(kOrchestrationConfigDocumentSchemaVersion == 13);
+    static_assert(kOrchestrationConfigDocumentSchemaVersion == 14);
     for (const auto width : {MTPVerifierPhysicalWidthPolicy::BoundedLogicalBucket,
                              MTPVerifierPhysicalWidthPolicy::DynamicDeviceEnvelope,
                              MTPVerifierPhysicalWidthPolicy::ExactLogicalRows})
@@ -600,7 +600,7 @@ TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeRoundTripsLosslesslyAtCurre
         EXPECT_EQ(decoded.mtp.depth_policy.scope, internal.mtp.depth_policy.scope);
         EXPECT_EQ(serializeOrchestrationConfig(decoded), document);
         const auto json = Json::parse(document);
-        EXPECT_EQ(json.at("schema_version"), 13);
+        EXPECT_EQ(json.at("schema_version"), 14);
         const auto &scope = json.at("configuration").at("mtp").at("depth_policy").at("scope");
         EXPECT_EQ(scope.size(), 10);
         EXPECT_TRUE(scope.at("verifier_width_policy").is_string());
@@ -696,9 +696,13 @@ TEST(OrchestrationConfigDocument, FrozenMTPDepthScopeCannotAuthorStartupOrReques
 TEST(OrchestrationConfigDocument, AdaptiveFullRAMBackingRejectsOldSchemaAndMissingField){
     OrchestrationConfig config;config.ngram_table_policy.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD;
     config.ngram_table_policy.gpu_adaptive.source_backing=AdaptiveImmutableRowBacking::RAM;
-    const auto valid=nlohmann::json::parse(serializeOrchestrationConfig(config));EXPECT_EQ(valid.at("schema_version"),13);
+    const auto valid=nlohmann::json::parse(serializeOrchestrationConfig(config));EXPECT_EQ(valid.at("schema_version"),14);
     EXPECT_EQ(deserializeOrchestrationConfig(valid.dump()).ngram_table_policy,config.ngram_table_policy);
     auto old=valid;old["schema_version"]=11;EXPECT_THROW(deserializeOrchestrationConfig(old.dump()),std::invalid_argument);
+    // Schema 14 adds the typed serving-capacity intent axes (design §9.4). The
+    // fail-closed older-document policy rejects v13 whole-document rather than
+    // silently defaulting the new axes.
+    auto v13=valid;v13["schema_version"]=13;EXPECT_THROW(deserializeOrchestrationConfig(v13.dump()),std::invalid_argument);
     auto missing=valid;missing["configuration"]["ngram_table_policy"]["gpu_adaptive"].erase("source_backing");
     EXPECT_THROW(deserializeOrchestrationConfig(missing.dump()),std::invalid_argument);
     auto foreign=valid;foreign["configuration"]["ngram_table_policy"]["gpu_adaptive"]["source_backing"]="Foreign";
@@ -752,7 +756,7 @@ TEST(OrchestrationConfigDocument, ObservedRouteBindingRoundTripsLosslesslyAtCurr
     EXPECT_EQ(restored.moe_routed_expert_plan->observed_route_transport,plan.observed_route_transport);
     EXPECT_EQ(restored.moe_routed_expert_plan->observed_route_diagnostic,plan.observed_route_diagnostic);
     EXPECT_EQ(serializeOrchestrationConfig(restored),text);EXPECT_NE(text,unbound);
-    const auto json=Json::parse(text);EXPECT_EQ(json.at("schema_version"),13);
+    const auto json=Json::parse(text);EXPECT_EQ(json.at("schema_version"), kOrchestrationConfigDocumentSchemaVersion);
     EXPECT_EQ(json.at("configuration").at("moe_routed_expert_plan").at("observed_route_transport").at("decode"),"NativeCollective");
 }
 /** @test New required binding fields have strict types/enums and cannot enter through an old schema. */
