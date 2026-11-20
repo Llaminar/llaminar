@@ -29,7 +29,7 @@ namespace llaminar2
         printSplash();
 
         // Parse all orchestration flags (device, TP, PP, model, etc.)
-        OrchestrationConfigParser parser;
+        OrchestrationConfigParser parser(OrchestrationConfigParser::Defaults::Benchmark);
         OrchestrationConfig config;
         try
         {
@@ -46,9 +46,6 @@ namespace llaminar2
             std::cout << OrchestrationConfigParser::getHelpText() << std::endl;
             return 0;
         }
-
-        // Force benchmark mode — this is the whole point of this subcommand
-        config.benchmark_mode = true;
 
         if (!command_validation::printConfigErrors(config))
         {

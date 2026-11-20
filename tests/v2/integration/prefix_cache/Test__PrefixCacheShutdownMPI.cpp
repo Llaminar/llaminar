@@ -7,6 +7,9 @@
  * global selection respects each physical archive's capacity. A native MPI
  * observer counts the exact metadata bytes and rejects padded transmission.
  */
+#include "backends/HostMemoryCapacity.h"
+#include "collective/GlobalTPContext.h"
+#include "collective/NativeCPUCollectiveProgram.h"
 #include "execution/prefix_cache/PrefixCacheShutdown.h"
 #include "execution/prefix_cache/PrefixStateCache.h"
 #include "execution/prefix_cache/RamPrefixStorageBackend.h"
@@ -485,4 +488,84 @@ TEST(Test__PrefixCacheShutdownMPI, DuplicateKeysRetainTheHighestPriorityIncarnat
 TEST(Test__PrefixCacheShutdownMPI, FreshLargeToSmallCohortsDoNotTransmitOldCapacity)
 {
     runFreshLargeToSmallCohorts();
+}
+
+
+/** @test An asymmetric archive writer does no disk I/O before original expert-domain retirement. */
+TEST(Test__PrefixCacheShutdownMPI, RetiresOriginalExpertDomainBeforeAsymmetricPersistence)
+{
+    const int rank = mpiWorldRank();
+    ASSERT_EQ(mpiWorldSize(), 2);
+    const auto inventory = MPIContextFactory::global()->clusterInventory();
+    ASSERT_TRUE(inventory);
+    ASSERT_EQ(inventory->ranks.size(), 2u);
+    ASSERT_NE(inventory->ranks[0].cpu.numa_node, inventory->ranks[1].cpu.numa_node);
+    std::vector<NativeCPUCollectiveProgram::Participant> members;
+    for (const auto &original : inventory->ranks)
+    {
+        ASSERT_GE(original.cpu.numa_node, 0);
+        members.push_back({original.rank,
+            GlobalDeviceAddress::cpu(original.cpu.numa_node, original.hostname)});
+    }
+    const auto program = NativeCPUCollectiveProgram::expertShardRoutePartials(
+        27, CollectiveBackendType::MPI, members);
+    const auto capacity = observeSystemMemoryCapacity();
+    const PhysicalMemoryResource cpu{
+        rank, DeviceId::cpu(), capacity.total_bytes, capacity.admission_available_bytes};
+    PhysicalMemoryPlanBuilder bom;
+    program.contributeDomainBOM(bom, cpu, rank);
+    NativeCPUCollectiveProgram::contributeProcessPoolBOM(bom, cpu);
+    auto memory = std::make_shared<PhysicalMemoryAuthority>(
+        std::make_shared<const PhysicalMemoryPlanAdmissionCertificate>(bom.build()), rank);
+    auto domain = GlobalTPContext::createAdmittedCPUExpertDomain(
+        MPI_COMM_WORLD, program, program.admit(memory, rank));
+    ASSERT_TRUE(domain);
+
+    const auto root = sharedDirectory();
+    const auto path = root / (std::string(kModelIdentity) + ".kvcache");
+    const auto key = makePrefixCacheKey(19, 0, 0, 0, {81});
+    PrefixCacheShutdown shutdown;
+    std::weak_ptr<PrefixStateCache> graph_cache;
+    if (rank == 0)
+    {
+        auto disk = std::make_shared<DiskPrefixStorageBackend>(path, kBlockBytes, kModelIdentity);
+        ASSERT_TRUE(disk->ready()) << disk->initializationError();
+        auto ram = std::make_shared<RamPrefixStorageBackend>(kBlockBytes);
+        auto cache = std::make_shared<PrefixStateCache>(kBlockBytes, ram, disk);
+        ASSERT_TRUE(cache->insert(initializedBlock(*ram, key, 0x5a)));
+        graph_cache = cache;
+        shutdown.add(std::move(cache));
+    }
+
+    ObservedContext context;
+    shutdown.prepare(&context);
+    EXPECT_TRUE(graph_cache.expired()) << "Disk persistence must not retain the graph cache";
+    if (rank == 0)
+    {
+        DiskPrefixStorageBackend before(path, kBlockBytes, kModelIdentity);
+        ASSERT_TRUE(before.ready()) << before.initializationError();
+        EXPECT_EQ(before.usedBytes(), 0u) << "Selection must not publish payloads";
+    }
+    {
+        // Release the same original graph/domain borrow as runner teardown.
+        auto borrow = std::shared_ptr<IGlobalTPContext>(domain);
+        EXPECT_THROW(domain->retireOriginalCPUExpertDomain(), std::logic_error);
+    }
+    ASSERT_TRUE(domain->retireOriginalCPUExpertDomain());
+    domain.reset();
+    EXPECT_EQ(memory->reservedBytes(DeviceId::cpu(), PhysicalMemoryOwner::NativeCPUCollectiveDomain), 0u);
+
+    const auto metadata_bytes = context.sent_bytes;
+    const auto result = shutdown.persist();
+    EXPECT_EQ(context.sent_bytes, metadata_bytes);
+    EXPECT_EQ(result.written, rank == 0 ? 1u : 0u);
+    EXPECT_EQ(result.payload_bytes_written, rank == 0 ? kBlockBytes : 0u);
+    EXPECT_THROW(shutdown.persist(), std::logic_error);
+    if (rank == 0)
+    {
+        DiskPrefixStorageBackend restored(path, kBlockBytes, kModelIdentity);
+        ASSERT_TRUE(restored.ready()) << restored.initializationError();
+        expectRestoredBytes(restored, key, 0x5a);
+        std::filesystem::remove_all(root);
+    }
 }

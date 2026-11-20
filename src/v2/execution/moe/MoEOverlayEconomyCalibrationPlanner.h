@@ -94,11 +94,13 @@ namespace llaminar2
         /**
          * @brief Build a complete exact partition from contiguous layer metadata.
          * @param manifest Authenticated gate/up/down contracts in layer order.
+         * @param original_shards Original owner map when a tier uses fixed-cut fragments.
          * @throws std::invalid_argument For malformed or non-contiguous input.
          * @throws std::overflow_error When a complete expert footprint overflows.
          */
         explicit MoEOverlayEconomyCalibrationLayerCatalog(
-            const std::vector<MoEOverlayLayerWeightManifest> &manifest);
+            const std::vector<MoEOverlayLayerWeightManifest> &manifest,
+            const MoEExpertOwnerMap *original_shards = nullptr);
 
         /** @return Stable lightweight identity over the complete partition. */
         [[nodiscard]] const std::string &identity() const noexcept

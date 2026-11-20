@@ -15,6 +15,8 @@
 #include "execution/moe/MoEOverlayDistributedResidencyTransport.h"
 #include "execution/moe/MoEOverlayMPIResidencyConsensus.h"
 #include "execution/moe/MoEOverlayMPIEconomyEvidenceExchange.h"
+#include "execution/moe/MoEOverlayOriginalGPUCohortContexts.h"
+#include "planning/PlanningGPUExpertMeasurement.h"
 
 namespace llaminar2::test {
 namespace {
@@ -29,22 +31,34 @@ namespace {
 std::shared_ptr<const MoERoutedTierServiceProfile> measureJoinedGPUCPUService(
     FabricOriginal& original,std::shared_ptr<const MoEOverlayEconomyCalibrationLayerCatalog> catalog,
     const ExpertHistogramProductionTopology& topology,
-    const std::shared_ptr<MoEOverlayMPIEconomyEvidenceExchange>& evidence)
+    const std::shared_ptr<MoEOverlayMPIEconomyEvidenceExchange>& evidence,
+    bool joint_gpu=false)
 {
     using Service=MoEOverlayCPUServiceMeasurement;
     const auto initial=original.authority->snapshot();
     const auto declaration=MoEOverlayPreparedTargetServicePlan::checked(initial,std::move(catalog),topology);
     if(declaration->entries().size()!=2 || !original.service_domain)
-        throw std::logic_error("Joined calibration requires original GPUwhole and complete CPUcohort");
-    bool saw_whole=false,saw_cohort=false;
+        throw std::logic_error("Joined calibration requires original GPU and complete CPU targets");
+    bool saw_gpu=false,saw_cohort=false;
+    const MoEOverlayPreparedTargetServicePlan::Entry* gpu_entry=nullptr;
     for(const auto& entry:declaration->entries()) {
-        if(entry.coordinate.target.isWhole()) {
+        const auto cohort=declaration->cohort(entry);
+        const bool gpu=entry.coordinate.target.isWhole() ||
+            (cohort && cohort->participants().front().address.isGPU());
+        if(gpu) {
             if(entry.root_world_rank!=original.whole_owner)throw std::logic_error("Joined original GPU target root changed");
-            saw_whole=true;
-            EXPECT_EQ(entry.coordinate.target.word(),original.whole);
+            saw_gpu=true;
+            gpu_entry=&entry;
+            EXPECT_EQ(entry.coordinate.target.isWhole(),!joint_gpu);
+            if(joint_gpu) {
+                if(!cohort || cohort->participants().size()!=2)
+                    throw std::logic_error("Joined service requires both original GPU members");
+                const auto* owner=initial->placementOwnerMap().placementFor(0,0);
+                EXPECT_TRUE(owner && owner->shard_cohort==cohort);
+                for(const auto& member:cohort->participants())EXPECT_EQ(member.world_rank,original.whole_owner);
+            } else EXPECT_EQ(entry.coordinate.target.word(),original.whole);
         } else {
             saw_cohort=true;
-            const auto cohort=declaration->cohort(entry);
             const auto* owner=initial->placementOwnerMap().placementFor(0,2);
             if(!owner || !owner->shard_cohort)throw std::logic_error("Joined original expert lost cohort ownership");
             EXPECT_EQ(cohort,owner->shard_cohort);
@@ -59,7 +73,7 @@ std::shared_ptr<const MoERoutedTierServiceProfile> measureJoinedGPUCPUService(
             }
         }
     }
-    if(!saw_whole || !saw_cohort)throw std::logic_error("Joined target vector aliased an original member");
+    if(!saw_gpu || !saw_cohort || !gpu_entry)throw std::logic_error("Joined target vector aliased an original member");
     const int rank=original.mpi->rank();
     if(rank==original.whole_owner) {
         const auto endpoint=original.registry->endpoint(original.whole);
@@ -69,9 +83,53 @@ std::shared_ptr<const MoERoutedTierServiceProfile> measureJoinedGPUCPUService(
             original.context->nativeContextPreparation()!=original.service_native_source)
             throw std::logic_error("Joined GPU service lost original prepared bank/source/PMA");
     }
+    std::vector<PlanningGPUCohortServiceObservation> gpu_samples;
+    if(joint_gpu) {
+        MoEOverlayOriginalGPUCohortContexts original_contexts;
+        if(rank==original.whole_owner) {
+            if(!original.service_gpu_domain)throw std::logic_error("GPU root lost the prepared native domain");
+            original_contexts.addOriginalDomain("whole",*original.service_gpu_domain);
+        }
+        gpu_samples=Service::measurePreparedGPUTargets(*original.registry,*declaration,original_contexts,
+            original.memory,original.service_profile,original.service_inventory);
+        EXPECT_EQ(gpu_samples.size(),rank==original.whole_owner?kExpertHistogramProductionSourceCount:0u);
+        size_t phase=0;
+        for(const auto& sample:gpu_samples) {
+            EXPECT_EQ(sample.target,gpu_entry->coordinate.target);
+            EXPECT_EQ(sample.layer,gpu_entry->coordinate.layer);
+            EXPECT_EQ(sample.expert,declaration->sampleExpert(*gpu_entry,phase));
+            EXPECT_EQ(sample.rows_per_frame,gpu_entry->sample_rows[phase]);
+            EXPECT_EQ(sample.measured_frames,Service::kMeasuredSamples);
+            EXPECT_EQ(sample.participants,2u);
+            EXPECT_GT(sample.complete_service_nanoseconds,0u);
+            EXPECT_GT(sample.concurrent_compute_nanoseconds,0u);
+            EXPECT_GT(sample.live_frame_communication_nanoseconds,0u);
+            EXPECT_GT(sample.empty_frame_communication_nanoseconds,0u);
+            ++phase;
+        }
+        // Match production's stage boundary. Don't park the CPU cohort in a
+        // measured collective while another rank records GPU kernels.
+        if(MPI_Barrier(MPI_COMM_WORLD)!=MPI_SUCCESS)
+            throw std::runtime_error("Original GPU service measurement boundary failed");
+    }
     const auto before=evidence->stats();
-    const auto local=Service::measurePreparedTargets(*original.registry,*declaration,{kH,kF},
-        original.service_domain,original.memory,&original.service_profile,&original.service_inventory);
+    const auto local=joint_gpu
+        ? Service::measurePreparedTargets(*original.registry,*declaration,{kH,kF},
+              original.service_domain,original.memory,&original.service_profile,&original.service_inventory,
+              nullptr,0,gpu_samples)
+        : Service::measurePreparedTargets(*original.registry,*declaration,{kH,kF},
+              original.service_domain,original.memory,&original.service_profile,&original.service_inventory);
+    if(joint_gpu && rank==original.whole_owner) {
+        const auto joined=std::find_if(local.begin(),local.end(),[&](const auto& row) {
+            return row.coordinate==gpu_entry->coordinate;
+        });
+        if(joined==local.end())throw std::logic_error("Mixed service lost root-owned original GPU sample");
+        for(size_t phase=0;phase<gpu_samples.size();++phase) {
+            EXPECT_EQ(joined->total_nanoseconds[phase],gpu_samples[phase].complete_service_nanoseconds);
+            EXPECT_EQ(joined->sample_count[phase],gpu_samples[phase].measured_frames);
+            EXPECT_EQ(joined->activation_count[phase],gpu_samples[phase].rows_per_frame*gpu_samples[phase].measured_frames);
+        }
+    }
     const size_t local_targets=std::count_if(declaration->entries().begin(),declaration->entries().end(),
         [&](const auto& entry){return entry.root_world_rank==rank;});
     EXPECT_EQ(local.size(),local_targets);
@@ -311,7 +369,7 @@ void proveCPUJointCalibrationController(DeviceId whole_device=DeviceId::cpu(),bo
     }
     original.fabric.reset();original.registry.reset();original.remote.reset();original.context.reset();
     if(original.service_native_source) {
-        original.service_native_use.reset();
+        original.service_native_uses.clear();
         EXPECT_EQ(original.service_native_source->retireReleasedContexts(),1u);
         original.service_native_source.reset();
     }
@@ -324,6 +382,32 @@ void proveCPUJointCalibrationController(DeviceId whole_device=DeviceId::cpu(),bo
         PhysicalMemoryMaterializationKind::NewAllocation),0u);
     EXPECT_EQ(original.memory->claimedBytes(DeviceId::cpu(),PhysicalMemoryOwner::ExpertShadowSlots,
         PhysicalMemoryMaterializationKind::NewAllocation),0u);
+}
+/** @brief Run both real cohort service programs with the same initial bank and evidence lane. */
+void proveMixedJointCalibration(DeviceId backend)
+{
+    FabricOriginal original(backend,true,true);
+    try {
+        const auto initial=original.authority->snapshot();
+        const auto topology=ExpertHistogramProductionTopology::uniform(1,kAllExpertHistogramProductionSources);
+        auto evidence=std::make_shared<MoEOverlayMPIEconomyEvidenceExchange>(
+            MoEOverlayMPIEconomyEvidenceExchange::Config{.mpi_context=original.mpi,
+                .owner_map=initial->placementOwnerMap(),.production_topology=topology,
+                .perf_device="native-gpu-cpu-joint-service"});
+        const auto profile=measureJoinedGPUCPUService(original,
+            std::make_shared<const MoEOverlayEconomyCalibrationLayerCatalog>(original.manifests),topology,evidence,true);
+        EXPECT_EQ(profile->prepared_plan->snapshot(),initial);
+        EXPECT_EQ(original.authority->snapshot(),initial);
+        EXPECT_FALSE(original.authority->migrationEnabled());
+        EXPECT_TRUE(evidence->idle());
+    } catch (const std::exception &failure) {
+        // The other rank can still be in the GPU-to-CPU stage barrier or
+        // service evidence exchange. Report before collective RAII teardown.
+        std::cerr << "Original GPU/CPU calibration failed on rank " << original.mpi->rank()
+                  << ": " << failure.what() << std::endl;
+        MPI_Abort(MPI_COMM_WORLD, 2);
+        throw;
+    }
 }
 } // namespace
 /** @test Existing controller alone warms, measures, drains, exchanges and seals genuine CPU targets. */
@@ -339,12 +423,22 @@ TEST(MoEOverlayGPUCPUJointCalibration, CUDAJoinedOriginalPreparedServiceAndMovem
     try { proveCPUJointCalibrationController(DeviceId::cuda(0),true); }
     catch(const std::exception& error) {ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
 }
+TEST(MoEOverlayGPUCPUJointCalibration, CUDAJoinedOriginalGPUAndCPUShardPreparedService)
+{
+    try { proveMixedJointCalibration(DeviceId::cuda(0)); }
+    catch(const std::exception& error) {ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
+}
 #endif
 #ifdef HAVE_ROCM
 /** @test One native ROCm whole owner uses no RCCL communicator for original CPU2 measurements. */
 TEST(MoEOverlayGPUCPUJointCalibration, ROCmJoinedOriginalPreparedServiceAndMovement)
 {
     try { proveCPUJointCalibrationController(DeviceId::rocm(0),true); }
+    catch(const std::exception& error) {ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
+}
+TEST(MoEOverlayGPUCPUJointCalibration, ROCmJoinedOriginalGPUAndCPUShardPreparedService)
+{
+    try { proveMixedJointCalibration(DeviceId::rocm(0)); }
     catch(const std::exception& error) {ADD_FAILURE()<<error.what();MPI_Abort(MPI_COMM_WORLD,2);throw;}
 }
 #endif

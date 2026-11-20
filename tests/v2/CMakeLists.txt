@@ -981,6 +981,18 @@ add_v2_test(V2_Unit_Qwen4ExpMetadata
     MPI_PROCS 1
     NO_MODELS
 )
+add_v2_test(V2_Integration_QFNRetainedGDNSourceFormatSelection
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
+        --gtest_filter=Qwen4ExpConfig.SelectsRetainedGDNPerOriginalSourcesAndArithmetic
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Regression"
+    MPI_PROCS 1
+    NO_MODELS)
+add_v2_test(V2_Integration_QFNRetainedM1HCFFNSourceFormatSelection
+    COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata>
+        --gtest_filter=Qwen4ExpConfig.SelectsRetainedM1HCFFNPerOriginalSource
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Regression"
+    MPI_PROCS 1
+    NO_MODELS)
 add_v2_test(V2_Integration_Qwen4ExpMetadataContracts
     COMMAND $<TARGET_FILE:v2_test_qwen4exp_metadata> --gtest_brief=1
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Qwen4Exp;Loaders;Regression"
@@ -1430,11 +1442,17 @@ add_v2_test(V2_Integration_MoEPreparedArrivalNativeDescriptorRejects
 # independently prepared residents may legitimately outlive those sources.
 add_v2_test(V2_Integration_PreparedOverlaySourceRetirement
     COMMAND $<TARGET_FILE:v2_unit_weight_manager_moe_expert_overlay_preparation>
-        --gtest_filter=PreparedOverlaySourceRetirement.*
+        --gtest_filter=PreparedOverlaySourceRetirement.*-PreparedOverlaySourceRetirement.MaterializedParticipantRetainsLiveCPUStorage
         --gtest_brief=1
     LABELS "V2;Integration;ProductionTestPreflight;Loaders;MoE;ExpertOverlay;PreparedWeights;Lifecycle;Regression"
     MPI_PROCS 1
     NO_MODELS
+)
+add_v2_test(V2_Integration_ParticipantFinalCPUWeightRetirement
+    COMMAND $<TARGET_FILE:v2_unit_weight_manager_moe_expert_overlay_preparation>
+        --gtest_filter=PreparedOverlaySourceRetirement.MaterializedParticipantRetainsLiveCPUStorage
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Loaders;MoE;ExpertOverlay;PreparedWeights;Lifecycle;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 30
 )
 add_v2_test(V2_Integration_ColocatedCpuOverlayFrozenParentBinding
     COMMAND $<TARGET_FILE:v2_unit_weight_manager_moe_expert_overlay_preparation>
@@ -1941,6 +1959,12 @@ add_v2_routed_expert_policy_unit(
     v2_unit_moe_overlay_economy_calibration_controller
     V2_Unit_MoEOverlayEconomyCalibrationController
     unit/execution/moe/Test__MoEOverlayEconomyCalibrationController.cpp
+)
+add_v2_test(V2_Integration_InferencePreparationProgressMilestones
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_economy_calibration_controller>
+        --gtest_filter=InferencePreparationProgress.SealingACalibrationReportsTheFinalSampleOnce
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;MoE;Calibration;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS
 )
 add_v2_test(V2_Integration_MoEPipelineStageCalibration
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_economy_calibration_controller>
@@ -5493,6 +5517,7 @@ add_test(NAME V2_Integration_MovementTransportHistoryEvidence
             MovementLedgerTests.test_http_journal_is_bound_to_the_completed_transport_edge_identities
             MovementLedgerTests.test_transport_history_rejects_missing_interior_wave_with_equal_bounds_and_totals
             MovementLedgerTests.test_transport_history_accepts_later_terminal_waves_without_losing_http_cutoff
+            CompleteCohortMovementTests.test_gpu_cohort_preserves_same_rank_and_distinct_native_devices
             MovementLedgerTests.test_transport_history_keeps_adjacent_uint64_publications_distinct)
 set_tests_properties(V2_Integration_MovementTransportHistoryEvidence PROPERTIES
     LABELS "V2;Integration;ProductionTestPreflight;MoE;PerfStats;Regression"
@@ -10333,6 +10358,13 @@ add_v2_test(V2_Integration_GDNProjectionArithmeticPolicy
     NO_MODELS
     TIMEOUT 30
 )
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GDNProjectionArithmeticPolicy)
+add_v2_test(V2_Integration_MoEGDNControlSourceArithmetic
+    COMMAND $<TARGET_FILE:v2_unit_weight_plan>
+        --gtest_filter=Test__GDNProjectionArithmetic.DefaultHalfMoEAlphaBetaPreservesDenseNative
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Loaders;MoE;GDN;Regression"
+    NO_MPI MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEGDNControlSourceArithmetic)
 add_v2_test(V2_Integration_ReplicatedDenseWeightBindingOwnership
     COMMAND $<TARGET_FILE:v2_unit_weight_plan>
         --gtest_filter=Test__WeightManagerMaterialize.ReplicatedDenseGraphsKeepRawOperandsDeviceQualified
@@ -12581,6 +12613,13 @@ add_v2_test(V2_Integration_CUDAHybridKVCacheReset
     MPI_PROCS 1
 )
 message(STATUS "V2 Tests: Added CUDA Hybrid KV Cache reset regression tests")
+add_v2_test(V2_Integration_CUDAShardedGDNPrefixReplay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_hybrid_kv_cache_reset>
+        --gtest_filter=Test__CUDAHybridKVCacheReset.ShardedPrefixReplaysOnlyLocalGDNBanks:Test__CUDAHybridKVCacheReset.HostStagedSuffixPrefillImportKeepsLocalAndFullGDNBanksDistinct
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;GDN;PrefixCache;Replay;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 60
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAShardedGDNPrefixReplay)
 add_v2_test(V2_Integration_CUDARecurrentOnlySequenceCheckpoint
     COMMAND $<TARGET_FILE:v2_integration_cuda_hybrid_kv_cache_reset>
             --gtest_filter=Test__CUDAHybridKVCacheReset.RecurrentOnlySequenceCheckpointGraphReplay
@@ -12839,6 +12878,7 @@ if(ZLIB_FOUND)
         "${WORKSPACE_ROOT_PARITY}/models/Qwen3.5-122B-A10B-UD-Q8_K_XL-00004-of-00004.gguf")
     set(V2_PARITY_MODEL_QWEN36_MOE
         "${WORKSPACE_ROOT_PARITY}/models/Qwen3.6-35B-A3B-UD-IQ3_S.gguf")
+    include(cmake/V2AutomaticMoETP2PlanTests.cmake)
     set(V2_PARITY_MODEL_QWEN_FLASH_NEXT
         "/opt/llaminar-models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf"
         "/opt/llaminar-models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00002-of-00004.gguf"
@@ -13825,6 +13865,7 @@ if(ZLIB_FOUND)
                 RESOURCE_LOCK "rocm_gpu_0;rocm_gpu_1;rocm_gpu_2;rocm_gpu_3"
                 ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
         endforeach()
+        include(cmake/V2QFNActiveTensorShardedTests.cmake)
         add_v2_test(V2_Integration_Qwen4ExpTensorShardedRestoredPrefixMTP
             COMMAND $<TARGET_FILE:v2_integration_qwen4exp_mtp_admission>
                 --gtest_filter=Qwen4ExpTensorShardedROCmTP4.Fixed3Retained3RestoredPrefixPlusOneMatchesSerialState
@@ -15226,6 +15267,7 @@ target_link_libraries(v2_integration_prefix_cache_shutdown_mpi llaminar2_core GT
 foreach(participants IN ITEMS 2 4 8)
     add_v2_test(V2_Integration_PrefixCacheShutdownMPI_${participants}
         COMMAND $<TARGET_FILE:v2_integration_prefix_cache_shutdown_mpi>
+            --gtest_filter=-Test__PrefixCacheShutdownMPI.RetiresOriginalExpertDomainBeforeAsymmetricPersistence
         LABELS "V2;Integration;ProductionTestPreflight;PrefixCache;Lifecycle;MPI;Regression;DeviceFree"
         MPI_PROCS ${participants} NO_MODELS TIMEOUT 30)
 endforeach()
@@ -16436,7 +16478,7 @@ add_v2_test(V2_Integration_AutomaticMixedVendorOverlayRankBoundary
     MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
 add_v2_test(V2_Integration_AutomaticMoEPipelineCandidates
     COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
-        --gtest_filter=AutomaticOrchestrationCandidates.DefaultMoESearchIncludesStageOwnedPipelineCandidates:AutomaticOrchestrationCandidates.PipelineWidths*:AutomaticOrchestrationCandidates.RoutedPipelineWidthsRetainGateUpStorageAndDynamicMTP:AutomaticOrchestrationCandidates.PipelineWidthInfeasibilityNeverPublishesAnotherTopology:AutomaticOrchestrationCandidates.CardinalPipelineLayerCountsCoverOddAndUnequalStages:AutomaticOrchestrationCandidates.PipelinesKeepCardinalContiguousLayersInBothDirections
+        --gtest_filter=AutomaticOrchestrationCandidates.DefaultMoESearchIncludesStageOwnedPipelineCandidates:AutomaticOrchestrationCandidates.PipelineWidths*:AutomaticOrchestrationCandidates.RoutedPipelineWidthsRetainGateUpStorageAndDynamicMTP:AutomaticOrchestrationCandidates.PipelineWidthInfeasibilityNeverPublishesAnotherTopology:AutomaticOrchestrationCandidates.CardinalPipelineLayerCountsCoverOddAndUnequalStages:AutomaticOrchestrationCandidates.PipelinesKeepCardinalContiguousLayersInBothDirections:AutomaticOrchestrationCandidates.StaticAutomaticCPUPipelineSelectsOriginalTensorShards
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Pipeline;MoE;MTP;Ownership;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_AutomaticMoEPipelineCandidates)
@@ -16455,6 +16497,16 @@ add_v2_test(V2_Integration_AutomaticMoEComputeResolution
         --gtest_filter=ResolvedRankOrchestration.AutomaticHomogeneousMoEComputeDefaultIsSealedAndIdempotent:ResolvedRankOrchestration.AutomaticMixedAndMultiTierComputeRemainsWholeExpert:ResolvedRankOrchestration.ImplicitMoELocalTPSealsOneAuthorityWithoutMutatingTheRequest:ResolvedRankOrchestration.CompactOverlayUsesObservedOwnerAndKeepsFollowerOutOfDenseTP:ResolvedRankOrchestration.NodeTPContinuationPreservesShardAndSparseCPUIdentity
     LABELS "V2;Integration;ProductionTestPreflight;Config;Planning;ExpertOverlay;CPU;CUDA;ROCm;Regression"
     MPI_PROCS 1 TIMEOUT 30 NO_MODELS)
+add_v2_test(V2_Integration_MoEIntermediateShardPredictorArena
+    COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+        --gtest_filter=AutomaticOrchestrationCandidates.IntermediateShardArenaUsesOwnedPredictorSharedWidth
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MoE;MTP;Workspace;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+add_v2_test(V2_Integration_AutomaticMoEIntermediateShardLayout
+    COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+        --gtest_filter=AutomaticOrchestrationCandidates.QFNAutomaticTensorShardsHonorTopologyAndOptOuts:AutomaticOrchestrationCandidates.MultiTierOverlayQwen35MoEUsesTensorShardCapability:AutomaticOrchestrationCandidates.MultiTierOverlayChecksOriginalDownNativeBlocks:AutomaticOrchestrationCandidates.OriginalSharedExpertTPKeepsNativeBlocksAcrossMTP:AutomaticOrchestrationCandidates.OriginalSharedExpertTPUsesOnlyMaterializedPairedPredictor:AutomaticOrchestrationCandidates.OriginalSharedExpertTPBindsThroughProductionLoaderAdapter
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;ExpertOverlay;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_QFNMI50ExpertIntermediateLayout
     COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
         --gtest_filter=ResolvedRankOrchestration.QFNMI50LocalTPRequiresCompleteMeasuredDomain
@@ -20707,12 +20759,20 @@ target_link_libraries(v2_integration_moe_overlay_residency_consensus_mpi
 )
 add_v2_test(V2_Integration_MoEOverlayResidencyConsensus_MPI
     COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
-        --gtest_filter=-MoEOverlayCPUCohortFabric.*:MoEOverlayGPUCPUCohortFabric.*:MoEOverlayCPUCohortMeasurement.*:MoEOverlayCPUJointCalibration.*:MoEOverlayGPUCPUJointCalibration.*
+        --gtest_filter=-MoEOverlayCPUCohortFabric.*:MoEOverlayGPUCPUCohortFabric.*:MoEOverlayCPUCohortMeasurement.*:MoEOverlayCPUJointCalibration.*:MoEOverlayGPUCPUJointCalibration.*:Test__MoEOverlayMPIResidencyConsensus.DistributedColdStopRetiresPeerCalibrationBeforeReadiness
     LABELS "V2;Integration;CPU;MoE;Overlay;Residency;Async;TypedLifecycle;MPI;PerfStats;ByteExact;NoBlocking"
     MPI_PROCS 2
     TIMEOUT 60
     NO_MODELS
 )
+
+add_v2_test(V2_Integration_ExpertOverlayColdCalibrationStop_MPI
+    COMMAND $<TARGET_FILE:v2_integration_moe_overlay_residency_consensus_mpi>
+        --gtest_filter=Test__MoEOverlayMPIResidencyConsensus.DistributedColdStopRetiresPeerCalibrationBeforeReadiness
+    LABELS "V2;Integration;CPU;MoE;Overlay;MPI;Lifecycle;Regression"
+    MPI_PROCS 2 NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1"
+        "LLAMINAR_SKIP_ROCM_STARTUP=1" "OMP_NUM_THREADS=1")
 
 if(V2_TEST_SOCKETS AND V2_TEST_SOCKETS GREATER_EQUAL 2)
     add_v2_test(V2_Integration_MoEOverlayCPUCohortPhysicalStagingAbort
@@ -21842,6 +21902,13 @@ if(HAVE_ROCM)
         MPI_PROCS 1
     )
     message(STATUS "V2 Tests: Added ROCm Hybrid KV Cache reset regression tests")
+    add_v2_test(V2_Integration_ROCmShardedGDNPrefixReplay
+        COMMAND $<TARGET_FILE:v2_integration_rocm_hybrid_kv_cache_reset>
+            --gtest_filter=Test__ROCmHybridKVCacheReset.ShardedPrefixReplaysOnlyLocalGDNBanks:Test__ROCmHybridKVCacheReset.HostStagedSuffixPrefillImportKeepsLocalAndFullGDNBanksDistinct
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GDN;PrefixCache;Replay;Regression"
+        MPI_PROCS 1 NO_MODELS TIMEOUT 60
+    )
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmShardedGDNPrefixReplay)
     add_v2_test(V2_Integration_ROCmRecurrentOnlySequenceCheckpoint
         COMMAND $<TARGET_FILE:v2_integration_rocm_hybrid_kv_cache_reset>
                 --gtest_filter=Test__ROCmHybridKVCacheReset.RecurrentOnlySequenceCheckpointGraphReplay
@@ -28296,6 +28363,11 @@ add_v2_test(V2_Unit_WorkspaceMemoryEstimator
     LABELS "V2;Unit;Planning;WorkspaceMemoryEstimator;Workspace"
     MPI_PROCS 1
 )
+add_v2_test(V2_Integration_NativeSharedExpertWorkspaceAxis
+    COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
+        --gtest_filter=Test__WorkspaceMemoryEstimator.NativeSharedExpertWorkspaceUsesOriginalFFNAxis
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MoE;Workspace;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_CPUSharedGDNWorkspaceAdmission
     COMMAND $<TARGET_FILE:v2_test_workspace_memory_estimator>
         --gtest_filter=Test__WorkspaceMemoryEstimator.CPUSharedGDNSnapshotPerLayerWorkspace*
@@ -28493,7 +28565,7 @@ add_v2_test(V2_Integration_PlanningSameClassComputeMedian
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningSameClassComputeMedian)
 add_v2_test(V2_Integration_PlanningSourceClassification
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
-        --gtest_filter=PlanningForwardWeightWork.RetainedClassificationIsSourceBoundAndIndexesOwnedLayers:PlanningForwardWeightWork.PreclassifiedGeometryMatchesCanonicalResolverAndRejectsForeignViews:PlanningForwardWeightWork.RetainedSourceWorkspaceAndWeightQuotesMatchCanonicalBytes:PlanningForwardWeightWork.RetainedSourceWeightQuotesIncludeAppendedSidecarLayers
+        --gtest_filter=PlanningForwardWeightWork.RetainedClassificationIsSourceBoundAndIndexesOwnedLayers:PlanningForwardWeightWork.PreclassifiedGeometryMatchesCanonicalResolverAndRejectsForeignViews:PlanningForwardWeightWork.RetainedSourceWorkspaceAndWeightQuotesMatchCanonicalBytes:PlanningForwardWeightWork.RetainedSourceWeightQuotesIncludeAppendedSidecarLayers:PlanningForwardWeightWork.SharedFFNQuotesRetainTheirDeclaredAxis
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Weights;Economy;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_PlanningSourceClassification)
@@ -28540,7 +28612,7 @@ add_v2_test(V2_Integration_AutomaticMoEProjectionWorkCost
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
 add_v2_test(V2_Integration_AutomaticTensorShardedExpertWorkCost
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
-        --gtest_filter=PlanningRequestCostModel.TensorShardedGPUUsesAdmittedFragmentsAndOneFFNSum
+        --gtest_filter=PlanningRequestCostModel.TensorShardedGPUUsesAdmittedFragmentsAndOneFFNSum:PlanningRequestCostModel.MovableTensorShardedGpuCpuCohortsUseOriginalQuotas
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MoE;Projection;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_AutomaticTensorShardedExpertWorkCost)
@@ -28637,6 +28709,11 @@ add_v2_test(V2_Integration_AutomaticOverlayAdaptiveQuota
         --gtest_filter=OrchestrationCandidateAdmission.AutomaticOverlayKeepsLiveExpertQuotaAdaptive
     LABELS "V2;Integration;ProductionTestPreflight;Planning;ExpertOverlay;ROCm;PhysicalMemoryAuthority;Regression"
     MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+add_v2_test(V2_Integration_AutomaticCountsOnlyGlobalMoEPipeline
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=OrchestrationCandidateAdmission.CountsOnlyAdmitsGlobalMoEPipelineAlongsideOverlay
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;Pipeline;ExpertOverlay;PhysicalMemoryAuthority;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_AutomaticMultiTierOverlayAdmission
     COMMAND $<TARGET_FILE:v2_test_memory_planner>
         --gtest_filter=AutomaticOrchestrationPlanner.MultiTierOverlayAdmissionAndSelection
@@ -29876,6 +29953,20 @@ endif()
 # invariant. The Python campaign driver discovers this label; it must not copy
 # these test names into a second manifest.
 if(NOT V2_PERF_TESTS_ONLY)
+add_v2_test(V2_Integration_BenchmarkPrefixCacheDefault
+    COMMAND $<TARGET_FILE:v2_test_prefix_mtp_config>
+        --gtest_filter=Test__PrefixMTPConfig.BenchmarkDefaultsToColdPrefill
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Benchmark;Config;PrefixCache;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+add_v2_test(V2_Integration_GDNPlannedDeviceBankOwnership
+    COMMAND $<TARGET_FILE:v2_test_memory_planner>
+        --gtest_filter=Test__MemoryPlanner.HybridGDNStateUsesTheExactModuloLinkedParticipantGeometry
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;GDN;PrefixCache;Admission;Regression"
+    MPI_PROCS 1 NO_MODELS
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_BenchmarkPrefixCacheDefault V2_Integration_GDNPlannedDeviceBankOwnership)
 add_v2_test(V2_Integration_GDNStateLayoutOwnerAndImportIdentity
     COMMAND $<TARGET_FILE:v2_test_hybrid_kvcache>
         --gtest_filter=Test__HybridGDNStateGeometry.RecurrenceLayoutPreservesOwnerFootprintAndRejectsUnknown:Test__HybridGDNStateGeometry.SnapshotBindingsRejectForeignLayoutBeforeMutation:Test__HybridGDNStateGeometry.DiagnosticCoordinatesPreserveRectangularStateBytes:Test__CPUHybridKVCache.HybridPrefixStateRejectsSameSizeForeignLayoutBeforeImport
@@ -29926,6 +30017,12 @@ add_v2_test(V2_Integration_GDNStateLayoutCliqueIdentity
 )
 
 set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_AutomaticCountsOnlyGlobalMoEPipeline
+    V2_Integration_InferencePreparationProgressMilestones
+    V2_Integration_ParticipantFinalCPUWeightRetirement
+    V2_Integration_MoEIntermediateShardPredictorArena
+    V2_Integration_NativeSharedExpertWorkspaceAxis
+    V2_Integration_AutomaticMoEIntermediateShardLayout
     V2_Integration_InstalledCompanionCancellationOwner
     V2_Integration_release_candidate
     V2_Integration_release_accuracy_panels
@@ -30130,6 +30227,7 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_TransferEngine_CopyActivation
     V2_Integration_OrchestrationRunner
     ${V2_PIPELINE_MTP_STATE_TESTS}
+    V2_Integration_ExpertOverlayColdCalibrationStop_MPI
     V2_Integration_MoEOverlayResidencyConsensus_MPI
     V2_Integration_MoEOverlaySparseTransport_MPI
     V2_Integration_OriginalRankAsyncCompletionReplay_MPI
@@ -31744,6 +31842,8 @@ if(NOT V2_PERF_TESTS_ONLY)
 endif()
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CPUHalfOperands_AVX2
+    V2_Integration_QFNRetainedGDNSourceFormatSelection
+    V2_Integration_QFNRetainedM1HCFFNSourceFormatSelection
     V2_Integration_Qwen4ExpMetadataContracts)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_Qwen4ExpCPUContracts)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoE512ExpertContracts)
@@ -32262,7 +32362,7 @@ add_v2_test(V2_Integration_QwenSparseSnapshotReferenceAdmission
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_MoEPipelineNoPeerResidency
     COMMAND $<TARGET_FILE:v2_test_moe_pipeline_stage_binding>
-        --gtest_filter=Test__MoEOverlayPipelineStageBinding.NoPeerKeepsDynamicAuthorityAndZeroMovementStorage:Test__MoEOverlayPipelineStageBinding.NoPeerRejectsMissingForeignOrNonresidentMembership:Test__MoEOverlayPipelineStageBinding.RankAcceptsIndependentNoPeerLociAndRejectsLaterDisagreement:Test__MoEOverlayPipelineStageBinding.RankDoesNotExemptMovableMissingMaintenance
+        --gtest_filter=Test__MoEOverlayPipelineStageBinding.NoPeerKeepsDynamicAuthorityAndZeroMovementStorage:Test__MoEOverlayPipelineStageBinding.TensorShardStorageSeparatesStationaryAndMovableTiers:Test__MoEOverlayPipelineStageBinding.NoPeerRejectsMissingForeignOrNonresidentMembership:Test__MoEOverlayPipelineStageBinding.RankAcceptsIndependentNoPeerLociAndRejectsLaterDisagreement:Test__MoEOverlayPipelineStageBinding.RankDoesNotExemptMovableMissingMaintenance
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;MoE;Pipeline;Ownership;Regression"
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=1"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
@@ -42609,7 +42709,7 @@ add_v2_test(V2_Integration_MoERouteConfigDocumentReplay
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 add_v2_test(V2_Integration_MoERouteRestoredBindingReplay
     COMMAND $<TARGET_FILE:v2_unit_moe_expert_overlay_runtime_plan>
-        --gtest_filter=Test__MoEExpertOverlayRuntimePlan.RestoredObservedRouteBindingAuthenticatesOriginalHardwareAndDiagnostic
+        --gtest_filter=Test__MoEExpertOverlayRuntimePlan.RestoredObservedRouteBindingAuthenticatesOriginalHardwareAndDiagnostic:Test__MoEExpertOverlayRuntimePlan.MixedTensorCohortsBindCompactRoutesWithPeerAccess
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Config;Planning;MoE;Transport;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
@@ -42643,6 +42743,8 @@ if(HAVE_CUDA AND HAVE_ROCM AND TARGET v2_integration_captured_transfer_channel)
         "V2_Integration_CanonicalRoutes_ROCm2_Async|SparseCanonicalRoutesAcrossTwoROCmDevicesAreExactAndAsync|ROCm|2"
         "V2_Integration_CanonicalRoutes_CUDA2_Verifier|CUDASparseCanonicalRoutesRetainVerifierBytesAcrossTwentyEpochs|CUDA|2"
         "V2_Integration_CanonicalRoutes_ROCm2_Verifier|ROCmSparseCanonicalRoutesRetainVerifierBytesAcrossTwentyEpochs|ROCm|2"
+        "V2_Integration_CanonicalRoutes_CUDA2_Cohort|CUDACanonicalContinuationCohortRoutes|CUDA|2"
+        "V2_Integration_CanonicalRoutes_ROCm2_Cohort|ROCmCanonicalContinuationCohortRoutes|ROCm|2"
         "V2_Integration_CanonicalRoutes_LocalCUDA1ROCm1_Async|SparseCanonicalRoutesAcrossCUDAAndROCmAreExactAndAsync|Mixed|2"
         "V2_Integration_CanonicalRoutes_CUDA2_Prefill|CUDASparseCanonicalRoutesRetainPrefillBytesAcrossTwentyEpochs|CUDA|2"
         "V2_Integration_CanonicalRoutes_ROCm2_Prefill|ROCmSparseCanonicalRoutesRetainPrefillBytesAcrossTwentyEpochs|ROCm|2"

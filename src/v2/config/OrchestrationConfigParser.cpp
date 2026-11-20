@@ -1947,7 +1947,9 @@ namespace llaminar2
             .long_name = "--moe-routed-expert-compute",
             .category = "MoE Configuration",
             .value_label = "<policy>",
-            .description = "Routed-expert compute distribution: auto (default; projection ownership for one homogeneous LocalTP GPU tier, whole experts otherwise), apportioned, replicated, tensor-sharded, gate-up-owned-down-columns",
+            .description = "Routed-expert compute distribution: auto, apportioned, replicated, tensor-sharded, or gate-up-owned-down-columns. "
+                           "With --auto, MoE planning defaults to tensor-sharded on supported homogeneous GPU TP and same-node GPU TP plus CPU TP layouts, subject to original source geometry. "
+                           "Manually declared placement follows its domain policies and topology defaults. Explicit compute modes take precedence.",
             .valid_values = {"auto", "apportioned", "replicated", "tensor-sharded", "gate-up-owned-down-columns"},
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &v)
@@ -2850,7 +2852,7 @@ namespace llaminar2
         spec.add({
             .long_name = "--prefix-cache",
             .category = "Prefix Cache",
-            .description = "Enable cross-request prefix-state caching (default)",
+            .description = "Enable cross-request prefix-state caching (default for inference, opt-in for benchmarks)",
             .setter = setters::custom<OrchestrationConfig>(
                 [](OrchestrationConfig &c, const std::string &)
                 {
@@ -3475,6 +3477,17 @@ namespace llaminar2
     // parseArgs
     // =========================================================================
 
+    OrchestrationConfig OrchestrationConfigParser::initialConfig() const
+    {
+        OrchestrationConfig config;
+        if (defaults_ == Defaults::Benchmark)
+        {
+            config.benchmark_mode = true;
+            config.prefix_cache.enabled = false;
+        }
+        return config;
+    }
+
     OrchestrationConfig OrchestrationConfigParser::parseArgs(int argc, char **argv)
     {
         return parseCommandArgs(argc, argv, {});
@@ -3497,7 +3510,7 @@ namespace llaminar2
         // First pass: if --config <path> was supplied, load the YAML file as
         // the base config. The second pass (full CLI parse) will override any
         // individual fields specified on the command line.
-        OrchestrationConfig config;
+        auto config = initialConfig();
         for (size_t i = 0; i < args.size(); ++i)
         {
             if (args[i] == "--config" && i + 1 < args.size())
@@ -3522,6 +3535,8 @@ namespace llaminar2
 
         // Second pass: apply every flag through the structured spec.
         spec.parse(args, config);
+        if (defaults_ == Defaults::Benchmark)
+            config.benchmark_mode = true;
         config.ngram_table_policy.validate();
 
         // Cross-flag validation that doesn't fit cleanly into per-option setters.
@@ -3583,7 +3598,7 @@ namespace llaminar2
             publishOrchestrationStartupPolicy(config);
             return config;
         }
-        OrchestrationConfig config;
+        auto config = initialConfig();
 
         parseMoERoutedExpertPlacementYamlBlock(yaml, config);
 

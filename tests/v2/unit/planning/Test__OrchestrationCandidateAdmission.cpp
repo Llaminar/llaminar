@@ -7,6 +7,7 @@
  * fixture payloads are not numerical model or graph-execution certification.
  */
 #include "../../utils/PlanningHostServiceFixture.h"
+#include "../../utils/CPUExecutionTestGeometry.h"
 #include "planning/OrchestrationCandidateAdmission.h"
 #include "planning/RankMemoryPlanInputs.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
@@ -308,4 +309,74 @@ TEST(OrchestrationCandidateAdmission, BoundPhysicalBudgetIdentityPreservesCpuNum
     }
     EXPECT_THROW(MoEOverlayLocalCapacityPlanner::physicalResourceId(-1,DeviceId::cpu()),std::invalid_argument);
     EXPECT_THROW(MoEOverlayLocalCapacityPlanner::physicalResourceId(0,DeviceId::invalid()),std::invalid_argument);
+}
+
+/** @test Counts-only MoE search quotes original multi-rank pipeline alternatives through one PMA. */
+TEST(OrchestrationCandidateAdmission, CountsOnlyAdmitsGlobalMoEPipelineAlongsideOverlay)
+{
+    test::PlanningGGUFFixture file(true, false, GGUFTensorType::Q4_0, 256, std::nullopt, 8,
+        test::PlanningGGUFFixture::Geometry::Directory, 4);
+    PlanningModelSource source(file.path());
+    auto observed = inventory(DeviceType::CUDA, 1);
+    auto &gpus = observed.ranks.front().gpus;
+    auto second = gpus.front();
+    second.local_device_id = 5;
+    second.uuid = "second-observed-card";
+    gpus.push_back(second);
+    observed.ranks.front().p2p_cuda_count = 2;
+    observed.ranks.front().p2p_cuda = {true, true, true, true};
+    observed.ranks.back().node_id = observed.ranks.front().node_id;
+    observed.ranks.back().hostname = observed.ranks.front().hostname;
+    observed.ranks.back().local_rank = 1;
+    observed.ranks.back().cpu.numa_node = 7;
+    for (auto &rank : observed.ranks)
+        rank.cpu_execution = test::kSyntheticCPUExecutionGeometry;
+    observed.buildNodeAggregations();
+
+    OrchestrationConfig request;
+    request.model_path = source.path();
+    request.max_seq_len = 128;
+    request.mtp.enabled = false;
+    request.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+    request.automatic_planning.only_backends = {DeviceType::CUDA, DeviceType::CPU};
+    request.automatic_planning.device_counts = {{DeviceType::CUDA, 2}, {DeviceType::CPU, 2}};
+    auto memory = policy();
+    memory.retained_host_services = test::planningHostServiceBudgets(2);
+    std::optional<AutomaticOrchestrationCandidate> pipeline;
+    std::optional<AutomaticOrchestrationCandidate> overlay;
+    visitAutomaticOrchestrationCandidates(request, source.metadata(), observed, [&](auto value) {
+        if (value.membership.discoveryRanks().size() != 2u)
+            return;
+        if (!pipeline && value.strategy == OrchestrationStrategy::PipelineParallel)
+            pipeline = std::move(value);
+        else if (!overlay && value.strategy == OrchestrationStrategy::ExpertOverlay)
+            overlay = std::move(value);
+    });
+    ASSERT_TRUE(pipeline);
+    ASSERT_TRUE(overlay);
+
+    const auto admitted = AdmittedOrchestrationCandidate::admit(*pipeline, source, memory);
+    ASSERT_TRUE(admitted.pipelineMemory());
+    ASSERT_TRUE(admitted.pipelineMemory()->globalPipeline());
+    ASSERT_EQ(admitted.rankPlans().size(), 2u);
+    std::set<int> physical_ranks;
+    for (const auto &device : admitted.devicePlans())
+    {
+        physical_ranks.insert(device.world_rank);
+        EXPECT_GT(device.activation_seq_len, 0);
+        EXPECT_NE(admitted.physicalAdmission().plan().find({device.world_rank, device.device}), nullptr);
+    }
+    EXPECT_EQ(physical_ranks, (std::set{0, 1}));
+    EXPECT_EQ(admitted.rankPlans()[0].rank, 0);
+    EXPECT_EQ(admitted.rankPlans()[1].rank, 1);
+    for (int layer = 0; layer < source.metadata().mainLayerCount(); ++layer)
+        EXPECT_TRUE(admitted.expertLayer(layer));
+    EXPECT_TRUE(AdmittedOrchestrationCandidate::admit(*overlay, source, memory).overlayCapacity());
+
+    auto too_small = pipeline->membership.inventory();
+    too_small.ranks[1].cpu.free_memory_bytes = 1024;
+    too_small.buildNodeAggregations();
+    pipeline->membership = ExecutionRankMembership(too_small, pipeline->membership.discoveryRanks());
+    EXPECT_THROW((void)AdmittedOrchestrationCandidate::admit(*pipeline, source, memory),
+                 PhysicalMemoryCapacityExhausted);
 }

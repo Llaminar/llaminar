@@ -408,6 +408,28 @@ TEST(Test__PrefixMTPConfig, CommandLineCanExplicitlyDisableDefaultPrefixRestore)
         kDefaultPrefixCacheDiskBudgetBytes);
 }
 
+/** @brief Ordinary benchmark initialization avoids building or populating the prefix tiers. */
+TEST(Test__PrefixMTPConfig, BenchmarkDefaultsToColdPrefill)
+{
+    using Defaults = OrchestrationConfigParser::Defaults;
+    const auto parse = [](Defaults defaults, std::initializer_list<const char *> arguments) {
+        ArgvHelper args(arguments);
+        return OrchestrationConfigParser(defaults).parseArgs(args.argc(), args.argv());
+    };
+
+    const auto benchmark = parse(Defaults::Benchmark, {"llaminar2"});
+    EXPECT_TRUE(benchmark.benchmark_mode);
+    EXPECT_FALSE(benchmark.prefix_cache.enabled);
+    EXPECT_TRUE(parse(Defaults::Inference, {"llaminar2"}).prefix_cache.enabled);
+    EXPECT_TRUE(parse(Defaults::Benchmark, {"llaminar2", "--prefix-cache"}).prefix_cache.enabled);
+    EXPECT_FALSE(parse(Defaults::Benchmark,
+        {"llaminar2", "--prefix-cache-storage", "ram"}).prefix_cache.enabled);
+
+    OrchestrationConfigParser parser(Defaults::Benchmark);
+    EXPECT_FALSE(parser.parseYamlString("prefix_cache:\n  storage_mode: ram\n").prefix_cache.enabled);
+    EXPECT_TRUE(parser.parseYamlString("prefix_cache:\n  enabled: true\n").prefix_cache.enabled);
+}
+
 TEST(Test__PrefixMTPConfig, ROCmTopKSmallKPartialBlockOverrideIsValidated)
 {
     ScopedEnvVar override_env("LLAMINAR_ROCM_TOPK_SMALLK_PARTIAL_BLOCKS");

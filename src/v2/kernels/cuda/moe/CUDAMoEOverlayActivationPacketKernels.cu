@@ -185,9 +185,12 @@ extern "C" bool cudaMoEOverlayConsumeCanonicalRouteTicket(
     const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream);
     llaminar2::moe_activation_packet_device::awaitCanonicalRouteTicketKernel
         <<<1u, 1u, 0u, cuda_stream>>>(*launch);
-    llaminar2::moe_activation_packet_device::
-        materializeCanonicalRouteTicketKernel
-        <<<blocks, kThreads, 0u, cuda_stream>>>(*launch);
+    if (!launch->metadataOnly())
+    {
+        llaminar2::moe_activation_packet_device::
+            materializeCanonicalRouteTicketKernel
+            <<<blocks, kThreads, 0u, cuda_stream>>>(*launch);
+    }
     /* A separate one-thread node cannot race the materialization blocks. Its
      * exact-stream release is the sole authority permitting host payload reuse. */
     llaminar2::moe_activation_packet_device::

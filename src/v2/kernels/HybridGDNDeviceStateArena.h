@@ -189,9 +189,9 @@ namespace llaminar2
                     state.recurrence_layout != geometry.recurrence_layout ||
                     state.d_k != geometry.d_k || state.d_v != geometry.d_v ||
                     state.local_conv_state_size != geometry.local_conv_state_floats ||
-                    state.full_conv_state_size != geometry.full_conv_state_floats ||
+                    state.full_conv_state_size != geometry.deviceFullConvStateFloats() ||
                     state.local_recurrence_state_size != geometry.local_recurrence_state_floats ||
-                    state.full_recurrence_state_size != geometry.full_recurrence_state_floats)
+                    state.full_recurrence_state_size != geometry.deviceFullRecurrenceStateFloats())
                 {
                     throw std::logic_error(
                         "Hybrid GDN runtime state does not match canonical geometry");

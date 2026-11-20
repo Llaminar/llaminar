@@ -219,9 +219,12 @@ namespace
                     runtime->deviceLayerState(0), hidden.get(), router.get(),
                     d_model, 1, 1, true, nullptr, nullptr, false, false, nullptr,
                     RoutedExpertRowExecutionPolicy::ParticipantAssigned);
+                // Only the reducer owns the folded output. Capturing the
+                // producer with no binding prevents a phantom output-plane
+                // dependency on participants that only publish route slots.
                 const bool computed = kernel->groupedExpertDecodeFromRuntime(
                     runtime->deviceLayerState(0), hidden.get(), gate_table, down_table,
-                    1, output.get(), d_model, intermediate,
+                    1, nullptr, d_model, intermediate,
                     MoEDecodeDescriptorSource::RuntimePlacementTable, routes.get());
                 const bool reduced = kernel->reduceCanonicalRouteContributions(
                     routes.get(), output.get(), 1, 1, d_model);

@@ -91,6 +91,16 @@ public:
      */
     [[nodiscard]] static NativeCPUCollectiveProgram expertShardRoutePartials(
         int domain_id, CollectiveBackendType backend, std::vector<Participant> ordered_members);
+    /**
+     * @brief Select the native backend for one already bound CPU expert domain.
+     * @param domain_id Original authored domain identity.
+     * @param authored_backend Original AUTO, UPI, or MPI declaration.
+     * @param ordered_members Exact source cohort in its original reduction order.
+     * @return One resolved program shared by the fixed-memory quote and native startup.
+     * @throws std::invalid_argument If the member geometry or resolved backend is invalid.
+     */
+    [[nodiscard]] static NativeCPUCollectiveProgram forBoundExpertShardDomain(
+        int domain_id, CollectiveBackendType authored_backend, std::vector<Participant> ordered_members);
     /** @return Exact original program identity, including ordered rank/NUMA membership and backend. */
     bool operator==(const NativeCPUCollectiveProgram&) const = default;
     /** @return Original authored domain identity. */

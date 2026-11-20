@@ -345,10 +345,11 @@ namespace llaminar2
             {
                 // MPI may modify argv. Preserve command intent across parsing;
                 // malformed local input must reach consensus before discovery.
-                const bool benchmark = config.benchmark_mode;
+                const auto defaults = config.benchmark_mode
+                    ? OrchestrationConfigParser::Defaults::Benchmark
+                    : OrchestrationConfigParser::Defaults::Inference;
                 const bool serve = config.serve_mode;
-                config = OrchestrationConfigParser{}.parseArgs(argc, argv);
-                config.benchmark_mode = config.benchmark_mode || benchmark;
+                config = OrchestrationConfigParser(defaults).parseArgs(argc, argv);
                 config.serve_mode = config.serve_mode || serve;
                 if (config.model_path.empty())
                     throw std::invalid_argument("Model path required (-m)");

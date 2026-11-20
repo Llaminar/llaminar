@@ -98,4 +98,32 @@ TEST(MoEOptimizationMovementEndpoint, OriginalCohortLifetimeAndLosslessExportRep
     EXPECT_THROW(MoEOptimizationMovementEndpoint::whole(0,DeviceId::cpu(),-1),std::invalid_argument);
     EXPECT_TRUE(movement_json_detail::endpointRecord(MoEOptimizationMovementEndpoint::whole(0,DeviceId::cpu())).at("world_rank").is_null());
 }
+
+/** @test Same-rank GPU fragments export all physical members and their distinct native intervals. */
+TEST(MoEOptimizationMovementEndpoint, RankLocalGPUCohortLosslessExportReplay)
+{
+    const auto format = ExpertWeightFormat::floating(TensorType::FP32);
+    const MoEOverlayLayerWeightManifest source{.layer_idx = 3, .projections = {{
+        {ExpertTierWeightProjection::Gate, 256, 32, format},
+        {ExpertTierWeightProjection::Up, 256, 32, format},
+        {ExpertTierWeightProjection::Down, 32, 256, format}}}};
+    const auto original = std::make_shared<const MoEExpertShardCohort>(
+        MoEExpertShardCohort::checkedRankLocalGPU(source, 4,
+            {{1, 0, GlobalDeviceAddress::rocm(0)}, {3, 0, GlobalDeviceAddress::rocm(1)}},
+            MoEExpertShardCohort::gpuIntervals(source, 2, 3)));
+    const MoEExpertOwner owner{.layer_idx = 3, .expert_id = 1, .tier_idx = 1,
+        .owner_participant = -1, .device = DeviceId::invalid(), .shard_cohort = original};
+    const auto json = movement_json_detail::endpointRecord(MoEOptimizationMovementEndpoint::fromOwner(owner));
+    EXPECT_EQ(json.at("kind"), "gpu_cohort");
+    ASSERT_EQ(json.at("members").size(), 2u);
+    for (std::size_t index = 0; index < original->participants().size(); ++index)
+    {
+        const auto &row = json.at("members").at(index);
+        EXPECT_EQ(row.at("world_rank"), 0);
+        EXPECT_EQ(row.at("address"), original->participants()[index].address.toString());
+        EXPECT_EQ(row.at("projections").at(2).at("first_column"),
+            original->ownership(index).projection(WeightRole::MoEExpertDown).first_column);
+    }
+}
+
 }

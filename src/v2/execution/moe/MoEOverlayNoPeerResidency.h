@@ -126,4 +126,56 @@ namespace llaminar2
         int main_end_;
         MoEOverlayAuthorityExecutionKind authority_;
     };
+    /**
+     * @brief Recognize the only routed target of a homogeneous GPU shard cohort.
+     *
+     * This shape excludes movement storage at capacity admission. The runtime
+     * separately authenticates complete resident source rows after quotas seal.
+     */
+    [[nodiscard]] inline bool hasStationaryTensorShardTopology(
+        const MoERoutedExpertPlacementPlan &plan) noexcept
+    {
+        if (!plan.usesExpertOverlayAuthority() || plan.routed_tiers.size() != 1 ||
+            plan.routed_tiers.front().domain != plan.continuation_domain ||
+            plan.shared_expert_domain != plan.continuation_domain)
+            return false;
+        const auto domain = std::find_if(plan.domains.begin(), plan.domains.end(),
+            [&](const auto &candidate) { return candidate.name == plan.continuation_domain; });
+        if (domain == plan.domains.end() || domain->participants.size() < 2 ||
+            domain->scope != ExecutionDomainScope::RANK_LOCAL || domain->owner_rank < 0 ||
+            domain->routed_compute_policy != RoutedExpertComputePolicy::TensorSharded ||
+            domain->routed_phase_policy != RoutedExpertPhasePolicy::Uniform ||
+            domain->routed_decode_assignment_policy != RoutedExpertAssignmentPolicy::StaticOwner ||
+            domain->routed_prefill_assignment_policy != RoutedExpertAssignmentPolicy::StaticOwner)
+            return false;
+        const auto backend = domain->participants.front().device_type;
+        return std::all_of(domain->participants.begin(), domain->participants.end(), [&](const auto &participant) {
+            return participant.isGPU() && participant.device_type == backend;
+        });
+    }
+
+    /** @brief Authenticate complete original sharded residency with no alternate routed target. */
+    class MoEOverlayStationaryTensorShardResidency final
+    {
+    public:
+        /** @return A proof for an exact, fully resident single sharded cohort, or no proof for other shapes. */
+        [[nodiscard]] static std::optional<MoEOverlayStationaryTensorShardResidency> seal(
+            const MoERoutedExpertPlacementPlan &plan, const MoEExpertOwnerMap &owners,
+            const MoERoutedExpertModelMetadata &model);
+        /**
+         * @brief Project zero movement once from the original continuation root.
+         * @param device Exact graph participant whose status is requested.
+         * @return The root's stationary status or an empty follower status.
+         * @throws std::invalid_argument For a foreign device.
+         */
+        [[nodiscard]] MoEOptimizationStatus statusFor(DeviceId device) const;
+    private:
+        /** @brief Store the admitted participant order and its declared logical root. */
+        MoEOverlayStationaryTensorShardResidency(std::vector<DeviceId> participants,
+            DeviceId root, MoEOptimizationAuthority authority);
+        std::vector<DeviceId> participants_;
+        DeviceId root_;
+        MoEOptimizationAuthority authority_;
+    };
+
 }

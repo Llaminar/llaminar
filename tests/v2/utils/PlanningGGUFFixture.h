@@ -33,6 +33,7 @@ namespace llaminar2::test
             uint32_t hidden_columns; ///< Source row width and model embedding dimension.
             uint32_t shared_columns; ///< Original shared intermediate source width.
             uint32_t top_k; ///< Original source metadata's routed selected-slot count.
+            bool shared_ffn_metadata_only = false; ///< Publish shared FFN metadata without a general FFN key.
         };
         /** @return Exact GGUF encoding for a source tensor; runtime-only formats are rejected. */
         static GGUFTensorType sourceType(TensorType type)
@@ -238,6 +239,11 @@ namespace llaminar2::test
                 {arch + ".expert_used_count", moe ? (dimensions?dimensions->top_k:std::min(2u,expert_count)) : 0u},
                 {arch + ".expert_feed_forward_length", moe ? expert_width : 0u},
                 {arch + ".nextn_predict_layers", mtp ? 1u : 0u}};
+            if (dimensions && dimensions->shared_ffn_metadata_only)
+            {
+                std::erase_if(metadata, [&](const auto &entry) { return entry.first == arch + ".feed_forward_length"; });
+                metadata.emplace_back(arch + ".expert_shared_feed_forward_length", dimensions->shared_columns);
+            }
             if (geometry == Geometry::FullAttentionGraph)
                 metadata.insert(metadata.end(), {
                     {arch + ".expert_shared_count", moe ? 1u : 0u},

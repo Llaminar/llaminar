@@ -32,10 +32,10 @@ inline bool usesRetainedGDNPreAttention(bool selected, DeviceId device, RoutedEx
 
 /**
  * @brief Resolve retained ordinary GDN at the graph and PMA boundaries.
- * @param qualified_domain Whether this participant belongs to the measured MI50 TP4 placement.
- * @return The explicit diagnostic selection or the placement's ordinary default.
+ * @param qualified Whether the participant placement and original projection formats qualify.
+ * @return The explicit diagnostic selection or the qualified ordinary default.
  */
-inline bool qfnRetainedGDNPreAttentionEnabled(bool qualified_domain)
+inline bool qfnRetainedGDNPreAttentionEnabled(bool qualified)
 {
     static const std::optional<bool> selected = []() -> std::optional<bool> {
         const char *value = DebugEnv::envValue("LLAMINAR_QFN_RETAINED_GDN_PREATTENTION");
@@ -44,6 +44,6 @@ inline bool qfnRetainedGDNPreAttentionEnabled(bool qualified_domain)
         if (std::string_view(value) == "1") return true;
         throw std::invalid_argument("LLAMINAR_QFN_RETAINED_GDN_PREATTENTION requires 0 or 1");
     }();
-    return selected.value_or(qualified_domain);
+    return selected.value_or(qualified);
 }
 } // namespace llaminar2

@@ -77,7 +77,7 @@ def _whole_field(edge: dict, field: str):
         prefix = side + "_"
         if field.startswith(prefix) and field[len(prefix):] in ("participant", "device", "world_rank"):
             if edge[side]["kind"] != "whole":
-                raise ValueError("whole movement evidence cannot project a complete CPU cohort")
+                raise ValueError("whole movement evidence cannot project a complete shard cohort")
             return edge[side][field[len(prefix):]]
     return edge[field]
 
@@ -95,15 +95,16 @@ def _validate_endpoint(endpoint: dict, layer: int) -> None:
         if endpoint["world_rank"] is not None:
             _integer(endpoint, "world_rank", 0, _I32_MAX)
         return
-    if endpoint.get("kind") != "cpu_cohort" or set(endpoint) != {"kind", "tier", "layer", "members"}:
+    gpu = endpoint.get("kind") == "gpu_cohort"
+    if endpoint.get("kind") not in ("cpu_cohort", "gpu_cohort") or set(endpoint) != {"kind", "tier", "layer", "members"}:
         raise ValueError("invalid complete movement endpoint alternative")
     _integer(endpoint, "tier", 0, _I32_MAX - 1)
     if _integer(endpoint, "layer", 0, _I32_MAX) != layer:
         raise ValueError("cohort endpoint changed original source layer")
     members = endpoint["members"]
-    if not isinstance(members, list) or not 2 <= len(members) <= 8:
+    if not isinstance(members, list) or len(members) < (1 if gpu else 2) or (not gpu and len(members) > 8):
         raise ValueError("complete cohort requires every original member")
-    seen_ids, seen_ranks, seen_numa = set(), set(), set()
+    seen_ids, seen_ranks, seen_numa, seen_ordinals, seen_backends = set(), set(), set(), set(), set()
     originals = {}
     frontiers = [0, 0, 0]
     for member in members:
@@ -111,12 +112,21 @@ def _validate_endpoint(endpoint: dict, layer: int) -> None:
             raise ValueError("cohort member has missing or foreign ownership fields")
         participant = _integer(member, "participant", 0, _I32_MAX)
         rank = _integer(member, "world_rank", 0, _I32_MAX)
-        numa = _integer(member, "numa_node", 0, _I32_MAX)
-        if participant in seen_ids or rank in seen_ranks or numa in seen_numa:
-            raise ValueError("cohort repeats an original physical member")
-        seen_ids.add(participant); seen_ranks.add(rank); seen_numa.add(numa)
-        if not isinstance(member["address"], str) or not re.fullmatch(r".+:" + str(numa) + r":cpu:0", member["address"]):
-            raise ValueError("cohort member changed its original CPU NUMA address")
+        numa = _integer(member, "numa_node", -1 if gpu else 0, _I32_MAX)
+        address = member["address"]
+        if not isinstance(address, str) or participant in seen_ids:
+            raise ValueError("cohort repeats or omits an original physical member")
+        if gpu:
+            match = re.fullmatch(r".+:" + str(numa) + r":(cuda|rocm):([0-9]+)", address)
+            if not match or int(match.group(2)) in seen_ordinals:
+                raise ValueError("cohort member changed its original GPU address")
+            seen_backends.add(match.group(1))
+            seen_ordinals.add(int(match.group(2)))
+        elif rank in seen_ranks or numa in seen_numa or not re.fullmatch(r".+:" + str(numa) + r":cpu:0", address):
+            raise ValueError("cohort repeats or changes an original CPU rank or NUMA address")
+        seen_ids.add(participant)
+        seen_ranks.add(rank)
+        seen_numa.add(numa)
         projections = member["projections"]
         if not isinstance(projections, list) or len(projections) != 3:
             raise ValueError("cohort member omits a source projection")
@@ -141,6 +151,8 @@ def _validate_endpoint(endpoint: dict, layer: int) -> None:
             frontiers[role] += width; intervals.append((first, width))
         if intervals[0] != intervals[1] or intervals[0] != intervals[2]:
             raise ValueError("cohort gate/up/down disagree on original intermediate cuts")
+    if gpu and (len(seen_backends) != 1 or len(seen_ranks) != 1):
+        raise ValueError("GPU cohort requires one original homogeneous rank")
     if (originals[0][:2] != originals[1][:2] or originals[0][0] != originals[2][1] or
             originals[0][1] != originals[2][0] or frontiers != [originals[0][0], originals[1][0], originals[2][1]]):
         raise ValueError("cohort does not retain complete original gate/up/down coverage")
@@ -186,11 +198,12 @@ def _scoped_edges(identity: dict, journal: dict) -> None:
             members = ([endpoint] if endpoint["kind"] == "whole" else endpoint["members"])
             for member in members:
                 participant = member["participant"]
-                device = member.get("device", "CPU").lower()
+                device = (member["device"] if endpoint["kind"] == "whole"
+                          else ":".join(member["address"].split(":")[-2:])).lower()
                 if device == "cpu": device = "cpu:0"
                 if not 0 <= participant < len(devices) or device != devices[participant]:
                     raise ValueError("movement edge escaped its stage participant domain")
-                if endpoint["kind"] == "cpu_cohort" and member["address"] != identity["participants"][participant]:
+                if endpoint["kind"] != "whole" and member["address"] != identity["participants"][participant]:
                     raise ValueError("cohort member escaped its original stage physical address")
 
 
@@ -897,7 +910,7 @@ def _validate_cohort_transport(edge: dict, records: Iterable[Mapping[str, Any]])
     This consumer validates its supplied intersections/coverage; it does not plan
     transfers or infer protocol extents from allocated capacity.
     """
-    cohort = next(endpoint for endpoint in (edge["source"], edge["destination"]) if endpoint["kind"] == "cpu_cohort")
+    cohort = next(endpoint for endpoint in (edge["source"], edge["destination"]) if endpoint["kind"] != "whole")
     source_projections = cohort["members"][0]["projections"]
     members = {}
     for side in ("source", "destination"):
@@ -1061,7 +1074,7 @@ def validate_movement_transport_mirrors(ledger: dict, records: Iterable[Mapping[
         if all(isinstance(value, str) for value in projected):
             observed.add((authority, *projected))
     for edge in ledger["edges"]:
-        if any(edge[side]["kind"] == "cpu_cohort" for side in ("source", "destination")):
+        if any(edge[side]["kind"] != "whole" for side in ("source", "destination")):
             _validate_cohort_transport(edge, records)
             continue
         identity = (edge["authority"], str(edge["transaction"]), *(str(_whole_field(edge, field)) for field in fields))

@@ -50,6 +50,8 @@
 #include "kernels/rocm/gemm/retained_hc_ffn/ROCmRetainedM1HCFFNWorkspace.h"
 #include "models/qwen4exp/Qwen4ExpRetainedM1HCFFNPolicy.h"
 #include "models/qwen4exp/Qwen4ExpRetainedGDNPreAttentionPolicy.h"
+#include "models/qwen4exp/Qwen4ExpConfig.h"
+#include "planning/PlanningModelMetadata.h"
 #include "execution/compute_stages/stages/qwen4exp/RetainedGDNPreAttentionStage.h"
 #include "utils/DebugEnv.h"
 #endif
@@ -1954,7 +1956,9 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     cfg.first_layer,
                     last_layer,
                     cfg.kv_precision,
-                    mtp_state_role);
+                    mtp_state_role,
+                    replicated_dense_decode ? GDNDeviceBankPolicy::LocalAndMirrored
+                                            : GDNDeviceBankPolicy::LocalOnly);
             kv_cache_bytes =
                 persistent_state.kv_cache_bytes;
             live_recurrent_state_bytes =
@@ -2342,6 +2346,9 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                                 cfg.tensor_parallel_assignment.has_value()
                             ? cfg.tensor_parallel_assignment->d_ff_start
                             : 0,
+                    .native_shared_ffn_width =
+                        !replicated_dense_decode && cfg.tensor_parallel_assignment
+                            ? cfg.tensor_parallel_assignment->native_shared_ffn_width : std::nullopt,
                     .local_query_head_start =
                         replicated_dense_decode
                             ? 0
@@ -2427,6 +2434,8 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                             cfg.tensor_parallel_assignment.has_value()
                                 ? cfg.tensor_parallel_assignment->d_ff_start
                                 : 0,
+                        .native_shared_ffn_width = cfg.tensor_parallel_assignment
+                            ? cfg.tensor_parallel_assignment->native_shared_ffn_width : std::nullopt,
                         .local_query_head_start =
                             cfg.tensor_parallel_assignment.has_value()
                                 ? cfg.tensor_parallel_assignment->head_start
@@ -2555,30 +2564,60 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
         }
 
 #ifdef HAVE_ROCM
+        const auto matches_source = [&](const std::string &name, GGUFTensorType format) {
+            const std::string_view expected = tensorTypeName(ggufToTensorType(format));
+            const auto matches_format = [&](std::string_view actual) {
+                return actual == expected || (format == GGUFTensorType::F16 && actual == "F16") ||
+                    (format == GGUFTensorType::F32 && actual == "F32");
+            };
+            if (const auto &index = weight_source_policy.source_tensor_index) {
+                const auto *tensor = index->findTensor(name);
+                return tensor && matches_format(tensor->quant_type);
+            }
+            return std::any_of(profile.tensors.begin(), profile.tensors.end(), [&](const auto &tensor) {
+                return tensor.name == name && matches_format(tensor.quant_type);
+            });
+        };
+        const int last_main = std::min(last_layer, profile.mainLayerCount() - 1);
         if (cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
-            cfg.device.is_rocm() && profile.flash_next && cfg.first_layer < profile.mainLayerCount() &&
+            cfg.device.is_rocm() && profile.flash_next && cfg.first_layer <= last_main &&
             cfg.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
-            useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNEnabled(cfg.usesQFNMI50TP4()),ForwardExecutionPhase::Decode,
-                ForwardExecutionRole::MainInference,1,cfg.batch_size))
-        {
-            // The same serial family backs all original graph shapes. Add the
-            // retained instance slots once, before PMA scales physical owners.
-            workspace_bytes = checkedAdd(workspace_bytes,
-                rocm::retainedM1HCFFNWorkspace().total_bytes_with_alignment(),
-                "QFN retained M1 serial-family workspace");
-        }
-        if (profile.flash_next && cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
-            usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionEnabled(cfg.usesQFNMI50TP4()), cfg.device,
-                cfg.routed_compute_policy, ForwardExecutionPhase::Decode,
+            useQwen4ExpRetainedM1HCFFN(qfnRetainedM1HCFFNEnabled(cfg.usesQFNMI50TP4()), ForwardExecutionPhase::Decode,
                 ForwardExecutionRole::MainInference, 1, cfg.batch_size))
         {
-            const int last_main = std::min(last_layer, profile.mainLayerCount() - 1);
-            if (last_main >= cfg.first_layer &&
-                static_cast<size_t>(last_main - cfg.first_layer + 1) >
-                    profile.flashNextSparseLayerCount(cfg.first_layer, last_main))
+            // All serial layers share one slot. Only the owned layers with a
+            // matching original source tuple participate in the automatic program.
+            for (int layer = cfg.first_layer; layer <= last_main; ++layer)
+            {
+                if (!qfnRetainedM1HCFFNEnabled(cfg.usesQFNMI50TP4() &&
+                        hasQwen4ExpRetainedM1HCFFNSources(layer, matches_source)))
+                    continue;
+                workspace_bytes = checkedAdd(workspace_bytes,
+                    rocm::retainedM1HCFFNWorkspace().total_bytes_with_alignment(),
+                    "QFN retained M1 serial-family workspace");
+                break;
+            }
+        }
+        if (profile.flash_next && cfg.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+            usesRetainedGDNPreAttention(qfnRetainedGDNPreAttentionEnabled(cfg.usesQFNMI50TP4()),
+                cfg.device, cfg.routed_compute_policy, ForwardExecutionPhase::Decode,
+                ForwardExecutionRole::MainInference, 1, cfg.batch_size))
+        {
+            // Serial layers share one slot. Charge it only if some owned layer selects
+            // the native program. Use original source types and the same
+            // setup arithmetic already frozen above for prepared weight pricing.
+            for (int layer = cfg.first_layer; layer <= last_main; ++layer)
+            {
+                if (profile.flashNextSparseLayerCount(layer, layer) ||
+                    !qfnRetainedGDNPreAttentionEnabled(cfg.usesQFNMI50TP4() &&
+                        qwen4ExpRetainedGDNSources(layer, matches_source).supports(
+                            weight_source_policy.gdn_projection_arithmetic)))
+                    continue;
                 workspace_bytes = checkedAdd(workspace_bytes,
                     retainedGDNPreAttentionWorkspace().total_bytes_with_alignment(),
                     "QFN retained GDN serial-family workspace");
+                break;
+            }
         }
 #endif
         // Distinct graph owners can reuse one serial family across shapes,

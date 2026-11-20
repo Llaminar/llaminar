@@ -24,6 +24,13 @@
 
 namespace llaminar2
 {
+    /** @brief Physical GPU banks required by the retained dense execution phases. */
+    enum class GDNDeviceBankPolicy
+    {
+        LocalOnly,        ///< Every transaction uses the participant's assigned geometry.
+        LocalAndMirrored, ///< Decode may consume a separate full-width geometry.
+    };
+
     /**
      * @brief Fully resolved GDN state shape for one execution participant.
      *
@@ -48,6 +55,21 @@ namespace llaminar2
         int local_recurrence_state_floats = 0; ///< Local recurrent matrix bank.
         GDNRecurrenceStateLayout recurrence_layout =
             GDNRecurrenceStateLayout::KeyMajorValueContiguous; ///< Fixed persistent bank format.
+        GDNDeviceBankPolicy device_banks = GDNDeviceBankPolicy::LocalAndMirrored; ///< Planned GPU consumers.
+
+        /** @brief Optional full-width GPU convolution bank in FP32 elements. */
+        [[nodiscard]] int deviceFullConvStateFloats() const noexcept
+        {
+            return device_banks == GDNDeviceBankPolicy::LocalAndMirrored
+                ? full_conv_state_floats : 0;
+        }
+
+        /** @brief Optional full-width GPU recurrence bank in FP32 elements. */
+        [[nodiscard]] int deviceFullRecurrenceStateFloats() const noexcept
+        {
+            return device_banks == GDNDeviceBankPolicy::LocalAndMirrored
+                ? full_recurrence_state_floats : 0;
+        }
 
         /** Stable byte alignment used by HybridGDNDeviceStateArena. */
         static constexpr std::size_t kDeviceBankAlignment = 256u;
@@ -66,6 +88,7 @@ namespace llaminar2
          *        `value_heads * state_size`.
          * @param conv_kernel_size Causal convolution kernel width.
          * @param recurrence_layout Immutable persistent matrix format; no conversion is performed.
+         * @param device_banks Physical state consumed by captured GPU phases.
          * @throws std::invalid_argument for incomplete or non-integral geometry.
          * @throws std::overflow_error when the kernel ABI cannot represent it.
          */
@@ -79,7 +102,8 @@ namespace llaminar2
                 int inner_size,
                 int conv_kernel_size,
                 GDNRecurrenceStateLayout recurrence_layout =
-                    GDNRecurrenceStateLayout::KeyMajorValueContiguous)
+                    GDNRecurrenceStateLayout::KeyMajorValueContiguous,
+                GDNDeviceBankPolicy device_banks = GDNDeviceBankPolicy::LocalAndMirrored)
         {
             if (!validGDNRecurrenceStateLayout(recurrence_layout))
                 throw std::invalid_argument("Unknown persistent GDN recurrence layout");
@@ -97,6 +121,7 @@ namespace llaminar2
 
             HybridGDNStateGeometry result;
             result.recurrence_layout = recurrence_layout;
+            result.device_banks = device_banks;
             result.full_key_heads =
                 group_count > 0 ? group_count : attention_heads;
             result.full_value_heads =
@@ -275,20 +300,20 @@ namespace llaminar2
                 static_cast<std::size_t>(local_conv_state_floats),
                 static_cast<std::size_t>(local_recurrence_state_floats),
                 "serialized local GDN state");
-            if (full_conv_state_floats != local_conv_state_floats)
+            const int full_conv = deviceFullConvStateFloats();
+            if (full_conv > 0 && full_conv != local_conv_state_floats)
             {
                 floats = checkedSum(
                     floats,
-                    static_cast<std::size_t>(full_conv_state_floats),
+                    static_cast<std::size_t>(full_conv),
                     "serialized full convolution state");
             }
-            if (full_recurrence_state_floats !=
-                local_recurrence_state_floats)
+            const int full_recurrence = deviceFullRecurrenceStateFloats();
+            if (full_recurrence > 0 && full_recurrence != local_recurrence_state_floats)
             {
                 floats = checkedSum(
                     floats,
-                    static_cast<std::size_t>(
-                        full_recurrence_state_floats),
+                    static_cast<std::size_t>(full_recurrence),
                     "serialized full recurrence state");
             }
             return checkedProduct(
@@ -326,12 +351,12 @@ namespace llaminar2
                 appendDeviceKernelBanks(
                     offset,
                     local_conv_state_floats,
-                    full_conv_state_floats,
+                    deviceFullConvStateFloats(),
                     request_capacity);
                 appendDeviceKernelBanks(
                     offset,
                     local_recurrence_state_floats,
-                    full_recurrence_state_floats,
+                    deviceFullRecurrenceStateFloats(),
                     request_capacity);
             }
             return offset;

@@ -231,6 +231,91 @@ namespace llaminar2::test
         }
     }
 
+    /** @test Dynamic preserves exact tier mobility independently of native shard count. */
+    TEST(Test__MoEOverlayPipelineStageBinding, TensorShardStorageSeparatesStationaryAndMovableTiers)
+    {
+        using Storage = MoEOverlayMigrationStorageKind;
+        for (const auto backend : {CollectiveBackendType::RCCL, CollectiveBackendType::NCCL})
+        {
+            const bool rocm = backend == CollectiveBackendType::RCCL;
+            MoERoutedExpertPlacementPlan plan;
+            plan.enabled = true;
+            plan.continuation_domain = plan.shared_expert_domain = "gpu";
+            plan.authority_execution = MoEOverlayAuthorityExecutionKind::DeviceResident;
+            plan.routed_tiers.push_back({.name = "native", .domain = "gpu", .fallback = true});
+            RoutedExpertDomain gpu;
+            gpu.name = "gpu";
+            gpu.scope = ExecutionDomainScope::RANK_LOCAL;
+            gpu.backend = backend;
+            gpu.owner_rank = 0;
+            gpu.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+            gpu.routed_phase_policy = RoutedExpertPhasePolicy::Uniform;
+            gpu.routed_decode_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+            gpu.routed_prefill_assignment_policy = RoutedExpertAssignmentPolicy::StaticOwner;
+            gpu.participants = rocm
+                ? std::vector{GlobalDeviceAddress::rocm(0, 0), GlobalDeviceAddress::rocm(1, 0)}
+                : std::vector{GlobalDeviceAddress::cuda(0, 0), GlobalDeviceAddress::cuda(1, 0)};
+            // Original rank order need not match device ordinal order.
+            std::reverse(gpu.participants.begin(), gpu.participants.end());
+            plan.domains.push_back(gpu);
+            plan.topology = RoutedExpertPlacementTopology::SingleDomain;
+            plan.base_model_domain = "gpu";
+            plan.continuation_domain_spec.domain = "gpu";
+            plan.continuation_domain_spec.setDensePolicy(
+                defaultMoEContinuationDensePolicy(gpu.scope, gpu.participants.size()));
+            plan.continuation_domain_spec.logical_root_participant = 1;
+            plan.placements = {{.layer = 0, .routed_expert_tier = {0, 0, 0, 0}}};
+            EXPECT_TRUE(hasStationaryTensorShardTopology(plan));
+            EXPECT_FALSE(MoEOverlayNoPeerResidency::hasNoPeerTopology(plan));
+            const auto stationary = MoEOverlayCapacityAdmission::selectMigrationStorage(
+                plan, MoERebalanceRuntimeMode::Dynamic);
+            EXPECT_EQ(stationary, Storage::StationaryTensorShard);
+            EXPECT_FALSE((MoEOverlayCapacityAdmissionPolicy{.migration_storage = stationary}).migrationEnabled());
+            EXPECT_EQ(MoEOverlayCapacityAdmission::selectMigrationStorage(plan, MoERebalanceRuntimeMode::Off),
+                Storage::Disabled);
+
+            const auto format = ExpertWeightFormat::floating(TensorType::FP32);
+            const MoEOverlayLayerWeightManifest source{.layer_idx = 0, .projections = {{
+                {ExpertTierWeightProjection::Gate, 256, 32, format},
+                {ExpertTierWeightProjection::Up, 256, 32, format},
+                {ExpertTierWeightProjection::Down, 32, 256, format}}}};
+            const MoERoutedExpertModelMetadata model{
+                .num_layers = 1, .num_experts = 4, .d_model = 32, .routed_intermediate_size = 256};
+            const auto owners = MoEExpertOwnerMap::buildShardPlacement(plan, {source});
+            const auto proof = MoEOverlayStationaryTensorShardResidency::seal(plan, owners, model);
+            ASSERT_TRUE(proof);
+            const auto root = proof->statusFor(gpu.participants.back().toLocalDeviceId());
+            EXPECT_EQ(root.authority, MoEOptimizationAuthority::Device);
+            EXPECT_EQ(root.state, MoEOptimizationLifecycleState::MovementDisabled);
+            EXPECT_EQ(root.published_movement_waves, 0u);
+            EXPECT_EQ(root.completed_movement.physical_bytes, 0u);
+            EXPECT_EQ(root.completed_decision_windows, 0u);
+            EXPECT_EQ(proof->statusFor(gpu.participants.front().toLocalDeviceId()).authority,
+                MoEOptimizationAuthority::None);
+            EXPECT_THROW((void)proof->statusFor(DeviceId::cpu()), std::invalid_argument);
+            auto foreign_root = plan;
+            foreign_root.continuation_domain_spec.logical_root_participant = 2;
+            EXPECT_THROW((void)MoEOverlayStationaryTensorShardResidency::seal(foreign_root, owners, model),
+                std::invalid_argument);
+
+            plan.routed_tiers.front().fallback = false;
+            plan.routed_tiers.push_back({.name = "host", .domain = "cpu", .priority = 1, .fallback = true});
+            RoutedExpertDomain cpu;
+            cpu.name = "cpu";
+            cpu.scope = ExecutionDomainScope::NODE_LOCAL;
+            cpu.backend = CollectiveBackendType::UPI;
+            cpu.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+            cpu.participants = {GlobalDeviceAddress::cpu(0), GlobalDeviceAddress::cpu(1)};
+            cpu.world_ranks = {0, 1};
+            plan.domains.push_back(cpu);
+            EXPECT_FALSE(hasStationaryTensorShardTopology(plan));
+            EXPECT_FALSE(MoEOverlayStationaryTensorShardResidency::seal(plan, owners, model));
+            const auto movable = MoEOverlayCapacityAdmission::selectMigrationStorage(plan, MoERebalanceRuntimeMode::Dynamic);
+            EXPECT_EQ(movable, Storage::PhysicalResidencyFabric);
+            EXPECT_TRUE((MoEOverlayCapacityAdmissionPolicy{.migration_storage = movable}).migrationEnabled());
+        }
+    }
+
     /** @test Native scalar tail ownership rejects absent, movable and foreign proofs. */
     TEST(Test__MoEOverlayPipelineStageBinding, NativePipelineSamplerRequiresExactNoPeerTail)
     {

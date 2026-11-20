@@ -63,6 +63,8 @@ namespace
 {
     /** @brief Two sequential local phases sharing the original router's kernel/workspace. */
     enum class Phase { Compute, Fold };
+    /** @brief Immutable publication owned by the participant-local pipeline. */
+    enum class LocalResult { FoldedPartial, RouteSlots };
     /** @brief Distinct original route authorities; cold service cannot enter through a serving flag. */
     enum class RouteAuthority {OriginalRouter,OriginalRouterWithRebalance,PreparedService};
 
@@ -72,8 +74,9 @@ namespace
     public:
         /** @brief Validate original family, runtime geometry and every external tensor before graph mutation. */
         Binding(MoEIntermediateShardPipelineParams declaration, const MoEOverlayParticipantLayerBank &source,
-            RouteAuthority original_route=RouteAuthority::OriginalRouter)
-            : params(std::move(declaration)),route_authority(original_route)
+            RouteAuthority original_route=RouteAuthority::OriginalRouter,
+            LocalResult result=LocalResult::FoldedPartial)
+            : params(std::move(declaration)),route_authority(original_route),local_result(result)
         {
             if (!params.family || !params.runtime || !params.kernel_owner || params.rows <= 0 ||
                 params.top_k <= 0 || params.rows > std::numeric_limits<int>::max() / params.top_k ||
@@ -119,9 +122,12 @@ namespace
             requireBuffer(params.routing_indices, route_bytes);
             requireBuffer(params.routing_weights, route_bytes);
             requireBuffer(params.route_partials, h_bytes * params.top_k);
-            requireBuffer(params.output, h_bytes);
+            if (local_result == LocalResult::FoldedPartial)
+                requireBuffer(params.output, h_bytes);
+            else if (params.output.tensor || params.down_publication != MoEDownPublicationPolicy::Staged)
+                throw std::invalid_argument("Intermediate-shard route slots require a staged producer and no local fold output");
             const auto tensors = bindings();
-            for (std::size_t i = 0; i < tensors.size(); ++i)
+            for (std::size_t i = 0; i < tensors.size() && tensors[i].tensor; ++i)
                 for (std::size_t j = 0; j < i; ++j)
                     if (tensors[i].tensor == tensors[j].tensor || tensors[i].id == tensors[j].id ||
                         (tensors[i].tensor->gpu_data_ptr() && tensors[i].tensor->gpu_data_ptr() == tensors[j].tensor->gpu_data_ptr()))
@@ -164,6 +170,7 @@ namespace
             mix(reinterpret_cast<std::uintptr_t>(params.runtime->deviceLayerState(layer)));
             mix(reinterpret_cast<std::uintptr_t>(params.kernel_owner.get()));
             mix(static_cast<uint64_t>(route_authority));
+            mix(static_cast<unsigned>(local_result));
             mix(params.rows); mix(params.top_k); mix(original.modelColumns()); mix(original.localIntermediateColumns());
             mix(original.firstIntermediateColumn()); mix(static_cast<unsigned>(params.row_mode));
             mix(static_cast<unsigned>(params.row_policy)); mix(static_cast<unsigned>(params.demand));
@@ -218,9 +225,18 @@ namespace
         std::array<MoEIntermediateShardTensorBinding, 5> bindings() const
         { return {params.hidden, params.routing_indices, params.routing_weights, params.route_partials, params.output}; }
 
+        /** @return Required storage for ordinary phases of this exact local result. */
+        FullNativeHCFFNOutputDemand stageOutputDemand() const noexcept
+        {
+            const auto demand = FullNativeHCFFNOutputDemand::all();
+            return local_result == LocalResult::RouteSlots
+                ? demand.without(FullNativeHCFFNOutputRole::Routed)
+                : demand;
+        }
+
         /** @brief Materialize original runtime tables and seal only consumed tensor addresses.
          * @param workspace Existing admitted workspace. @param stream Exact cold stream.
-         * @param output_demand Complete local fusion's sealed demand; standalone phases require all outputs.
+         * @param output_demand Complete local fusion's sealed demand; standalone phases use stageOutputDemand().
          */
         void prepare(DeviceWorkspaceManager *workspace, void *stream,
             FullNativeHCFFNOutputDemand output_demand=FullNativeHCFFNOutputDemand::all())
@@ -305,7 +321,7 @@ namespace
         /** @brief Enqueue actual production fragment math or its deterministic local slot fold. */
         bool execute(Phase phase, void *stream)
         {
-            if (!prepared || prepared->output_demand!=FullNativeHCFFNOutputDemand::all() ||
+            if (!prepared || prepared->output_demand != stageOutputDemand() ||
                 !stream || prepared->stream != stream || !params.kernel_owner->kernel)
                 throw std::logic_error("Intermediate-shard execution lacks its exact prepared stream/kernel");
             requireTensorAddresses();
@@ -331,9 +347,8 @@ namespace
                 // The authenticated router already published placement-filtered
                 // device top-k state and demand. Consume that publication
                 // directly: an explicit-packet selector would count it twice.
-                // The legacy API retains the later reducer's tensor identity;
-                // canonical_route_contributions is its sole write/coherence
-                // target, so the reducer output is neither read nor published.
+                // Canonical route slots are the sole write target here.
+                // Only a local folded-partial pipeline can own routed storage.
                 return requireOperation(kernel.groupedExpertDecodeFromRuntime(runtime,
                     dynamic_cast<TensorBase *>(params.hidden.tensor), prepared->gate, prepared->down,
                     params.top_k, params.output.tensor, h, f,
@@ -397,6 +412,7 @@ namespace
         };
         const MoEIntermediateShardPipelineParams params;
         const RouteAuthority route_authority;
+        const LocalResult local_result;
         DeviceMoEIntermediateShardBinding original;
         int layer = -1;
         DeviceId device_id = DeviceId::invalid();
@@ -495,7 +511,7 @@ namespace
         bool prepareGraphLaunch(IDeviceContext *ctx, void *stream) override
         {
             if (!ctx || ctx->deviceId() != binding_->device() || !stream) return false;
-            binding_->prepare(workspace_, stream);
+            binding_->prepare(workspace_, stream, binding_->stageOutputDemand());
             setGPUStream(stream);
             return true;
         }
@@ -616,10 +632,11 @@ namespace
         return {names[1], p.output, p.family, p.live_rows, p.rows, int(binding->original.modelColumns()), p.phase};
     }
 
-}
 
-MoEIntermediateShardLocalPartial appendMoEIntermediateShardPipeline(ComputeGraph &graph,
-    MoEIntermediateShardPipelineParams params, const MoEOverlayParticipantLayerBank &source)
+/** @brief Seal both local-fold and mixed-tier route-slot graphs against the same router. */
+std::shared_ptr<Binding> bindOriginalRouter(ComputeGraph &graph,
+    MoEIntermediateShardPipelineParams params, const MoEOverlayParticipantLayerBank &source,
+    LocalResult result=LocalResult::FoldedPartial)
 {
     // Validate every declaration before mutating topology. No device interaction
     // occurs here, and the caller's source borrow ends at this function boundary.
@@ -628,7 +645,7 @@ MoEIntermediateShardLocalPartial appendMoEIntermediateShardPipeline(ComputeGraph
         ? dynamic_cast<const MoERoutingStage *>(original_router->stage.get()) : nullptr;
     const auto authority = original_router_stage && original_router_stage->declaration().device_rebalance_route_apply
         ? RouteAuthority::OriginalRouterWithRebalance : RouteAuthority::OriginalRouter;
-    auto binding = std::make_shared<Binding>(std::move(params), source, authority);
+    auto binding = std::make_shared<Binding>(std::move(params), source, authority, result);
     const auto &p = binding->params;
     const auto *router = graph.getNode(p.router_node);
     const auto *router_stage = router ? dynamic_cast<const MoERoutingStage *>(router->stage.get()) : nullptr;
@@ -658,7 +675,30 @@ MoEIntermediateShardLocalPartial appendMoEIntermediateShardPipeline(ComputeGraph
         (p.row_mode == MoEIntermediateShardRowMode::Grouped && p.rows == 1 &&
          !r.force_grouped_verifier_prefill_for_decode && !r.force_decode_equivalent_verifier_prefill))
         throw std::invalid_argument("Intermediate-shard router changed its original owner, arena, live rows or execution policy");
-    return appendLocalPhases(graph,binding);
+    return binding;
+}
+}
+
+MoEIntermediateShardLocalPartial appendMoEIntermediateShardPipeline(ComputeGraph &graph,
+    MoEIntermediateShardPipelineParams params, const MoEOverlayParticipantLayerBank &source)
+{
+    return appendLocalPhases(graph, bindOriginalRouter(graph, std::move(params), source));
+}
+
+MoEIntermediateShardRouteSlots appendMoEIntermediateShardRouteSlots(
+    ComputeGraph &graph, MoEIntermediateShardPipelineParams params,
+    const MoEOverlayParticipantLayerBank &source)
+{
+    auto binding = bindOriginalRouter(graph, std::move(params), source, LocalResult::RouteSlots);
+    const auto &p = binding->params;
+    const std::string name = p.prefix + "local_fragment_compute";
+    if (graph.getNode(name))
+        throw std::logic_error("Intermediate-shard node identity already exists");
+    auto stage = std::make_unique<Stage>(binding, Phase::Compute, name);
+    graph.addNode(name, std::move(stage), binding->device());
+    graph.addDependency(name, p.router_node);
+    return {name, p.route_partials, p.family, p.live_rows, p.rows, p.top_k,
+        static_cast<int>(binding->original.modelColumns())};
 }
 
 bool MoEIntermediateShardPreparedServiceRoute::authenticates(

@@ -693,7 +693,8 @@ namespace llaminar2
                             &probe.conv_local_device_hash,
                             &local_conv_values);
 
-                    if (state->full_conv_state_size !=
+                    if (state->full_conv_state_size > 0 &&
+                        state->full_conv_state_size !=
                         state->local_conv_state_size)
                     {
                         has_full_bank = true;
@@ -707,6 +708,7 @@ namespace llaminar2
                     }
                     else
                     {
+                        // The decode consumer shares the participant-local bank.
                         has_full_bank = true;
                         probe.conv_device_bytes =
                             probe.conv_local_device_bytes;
@@ -729,7 +731,8 @@ namespace llaminar2
                             &probe.recurrence_local_device_hash,
                             &local_recurrence_values);
 
-                    if (state->full_recurrence_state_size !=
+                    if (state->full_recurrence_state_size > 0 &&
+                        state->full_recurrence_state_size !=
                         state->local_recurrence_state_size)
                     {
                         has_full_bank = true;

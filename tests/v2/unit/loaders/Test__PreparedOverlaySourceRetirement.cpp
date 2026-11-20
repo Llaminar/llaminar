@@ -10,6 +10,9 @@
 #include <gtest/gtest.h>
 
 #include "loaders/PreparedOverlaySourceRetirement.h"
+#include "execution/moe/MoEOverlayPreparedWeightSource.h"
+#include "kernels/cpu/gemm/FloatingPointGemmKernel.h"
+#include "tensors/TensorSlice.h"
 #include "loaders/WeightMetadataRegistry.h"
 #include "loaders/WeightManager.h"
 #include "loaders/WeightPlan.h"
@@ -279,4 +282,76 @@ TEST(PreparedOverlaySourceRetirement, RetainsCPUAndGraphConsumersAndRejectsTornR
         EXPECT_FALSE(binding.tensor->is_raw_data_released());
     }
 }
+TEST(PreparedOverlaySourceRetirement, MaterializedParticipantRetainsLiveCPUStorage)
+{
+    const auto bind = [](std::shared_ptr<TensorBase> tensor, DeviceId device,
+                         WeightHostPolicy policy)
+    {
+        WeightBinding binding;
+        binding.tensor_owner = std::move(tensor);
+        binding.tensor = binding.tensor_owner.get();
+        binding.identity.canonical_name = "blk.46.ffn_gate_exps.weight";
+        binding.residency.home_device = device;
+        binding.residency.host_policy = policy;
+        return binding;
+    };
+
+    const auto cpu = DeviceId::cpu();
+    const auto required = WeightHostPolicy::RequiredForCPUExecution;
+    const auto transient = WeightHostPolicy::RequiredUntilGraphMaterialized;
+    for (const auto &format : embeddingVerifierFormats())
+    {
+        if (format.prepared_native_quantized)
+            continue;
+        std::shared_ptr<TensorBase> final = format.create({32, 32}, 71);
+        const auto type = final->native_type();
+        SCOPED_TRACE(format.label);
+
+        std::shared_ptr<TensorBase> detached = format.create({32, 32}, 72);
+        std::shared_ptr<TensorBase> uploaded = format.create({32, 32}, 73);
+        auto retained_engine = gemm::FloatingPointGemmKernel::fromFinalCPUStorage(final);
+        auto detached_engine = std::make_shared<gemm::FloatingPointGemmKernel>(detached);
+        ASSERT_FALSE(retained_engine->canReleaseSourceWeightTensor());
+        ASSERT_TRUE(detached_engine->canReleaseSourceWeightTensor());
+        const void *const retained_data = final->raw_data();
+        const auto release_bytes = detached->size_bytes() + uploaded->size_bytes();
+
+        // Deliberately put the transient alias before its CPU consumer.
+        auto view = std::make_shared<TensorSlice>(final, SliceMetadata{});
+        const auto gpu = DeviceId::rocm(0);
+        FrozenModelWeightSet frozen({}, {
+            bind(final, gpu, transient),
+            bind(detached, cpu, transient),
+            bind(uploaded, gpu, transient),
+            bind(view, cpu, required),
+            bind(uploaded, gpu, transient),
+        });
+        WeightMetadataRegistry metadata;
+        ASSERT_EQ(retireMaterializedParticipantSources(frozen, metadata), release_bytes);
+        EXPECT_TRUE(detached->is_raw_data_released());
+        EXPECT_TRUE(uploaded->is_raw_data_released());
+        EXPECT_EQ(retireMaterializedParticipantSources(frozen, metadata), 0u);
+
+        MoEOverlayPreparedWeightSource actual;
+        std::string error;
+        ASSERT_TRUE(resolveMoEOverlayPreparedWeightSource(retained_engine, cpu, actual, &error))
+            << error;
+        EXPECT_EQ(actual.floating.data, retained_data);
+        EXPECT_EQ(actual.floating.type, type);
+        EXPECT_TRUE(resolveMoEOverlayPreparedWeightSource(detached_engine, cpu, actual, &error))
+            << error;
+
+        // The original manager's stronger policy also protects a consumer
+        // outside the frozen participant graph.
+        const auto alias = bind(final, gpu, transient);
+        const auto cpu_binding = bind(final, cpu, required);
+        EXPECT_EQ(retireMaterializedParticipantSources(
+            FrozenModelWeightSet({}, {cpu_binding}), metadata), 0u);
+        registerPolicy(metadata, cpu_binding);
+        registerPolicy(metadata, alias);
+        EXPECT_EQ(retireMaterializedParticipantSources(FrozenModelWeightSet({}, {alias}), metadata), 0u);
+        EXPECT_EQ(final->raw_data(), retained_data);
+    }
+}
+
 }

@@ -6,7 +6,7 @@ add_v2_routed_expert_policy_unit(v2_unit_moe_movement_endpoint V2_Unit_MoEMoveme
     unit/execution/moe/Test__MoEOptimizationMovementEndpoint.cpp)
 add_v2_test(V2_Integration_MoEMovementEndpointOriginalCohortReplay
     COMMAND $<TARGET_FILE:v2_unit_moe_movement_endpoint>
-        --gtest_filter=MoEOptimizationMovementEndpoint.OriginalCohortLifetimeAndLosslessExportReplay
+        --gtest_filter=MoEOptimizationMovementEndpoint.OriginalCohortLifetimeAndLosslessExportReplay:MoEOptimizationMovementEndpoint.RankLocalGPUCohortLosslessExportReplay
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;ExpertOverlay;Ownership;Replay;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MoEMovementEndpointOriginalCohortReplay)

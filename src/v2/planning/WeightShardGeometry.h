@@ -33,6 +33,18 @@ namespace llaminar2
         bool operator==(const WeightShardMatrix &) const = default;
     };
 
+    /**
+     * @brief Identify the original shared intermediate axis of one source matrix.
+     * @param role Original schema weight role.
+     * @param rows Complete logical output dimension.
+     * @param columns Complete logical input dimension.
+     * @param native_shared_ffn_width Axis authenticated by the original native TP binder, if present.
+     * @return Native axis for a bound shared projection, or no override for a logical FFN interval.
+     * @throws std::invalid_argument If a shared source matrix disagrees with the bound axis.
+     */
+    [[nodiscard]] std::optional<int> originalSharedFFNWidth(WeightRole role, size_t rows, size_t columns,
+        std::optional<int> native_shared_ffn_width);
+
     /** @brief Validated participant-local geometry, with no memory-admission authority. */
     class WeightShardGeometry final
     {

@@ -18,6 +18,7 @@
 #include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
 #include "execution/global/NamedDomainGraphBuilder.h"
+#include "execution/moe/MoEIntermediateShardStaticGraphAdmission.h"
 #include "execution/global_pp/GlobalPPRankPlanBuilder.h"
 #include "config/OrchestrationConfigParser.h"
 #include "config/OrchestrationStartupPolicy.h"
@@ -31,10 +32,13 @@ namespace llaminar2
 {
     LocalGPUExpertKernelPolicy selectLocalGPUExpertKernelPolicy(
         const MoERoutedExpertPlacementPlan &plan, const ModelMemoryProfile &model, const ClusterInventory &inventory,
-        bool whole_model, MoERebalanceRuntimeMode rebalance_mode, RoutedExpertComputePolicy requested_compute)
+        bool whole_model, RoutedExpertComputePolicy requested_compute)
     {
         using Policy = LocalGPUExpertKernelPolicy;
-        if (!whole_model || rebalance_mode != MoERebalanceRuntimeMode::Off ||
+        // With a single complete tensor-sharded tier, every logical expert spans
+        // this same cohort. Enabling the movement controller cannot change its
+        // ownership. A second tier must qualify its own kernels and bank lifetime.
+        if (!whole_model ||
             !model.flash_next || model.d_model != 2560 || model.expert_count != 512 ||
             model.expert_used_count != 10 || model.expert_feed_forward_length != 640 ||
             model.expert_shared_feed_forward_length != 640 ||
@@ -118,8 +122,9 @@ namespace llaminar2
             bound->local_gpu_expert_kernel_policy = selectLocalGPUExpertKernelPolicy(
                 *bound, model, inventory,
                 origin == MoEExpertOverlayPlanInstallOrigin::UserDeclaredDomains &&
-                    whole_model && config.pp_degree == 1 && config.cpu_layers == 0,
-                config.moe_rebalance.mode, compute);
+                    whole_model && config.pp_degree == 1 && config.cpu_layers == 0 &&
+                    supportsGPUIntermediateShardMaintenance(config.moe_rebalance.mode, /*mapped_ticket=*/false),
+                compute);
             if (bound->usesQFNMI50TP4() && compute == Compute::Automatic)
             {
                 for (auto &domain : bound->domains)

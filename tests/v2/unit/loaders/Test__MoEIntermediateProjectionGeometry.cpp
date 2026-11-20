@@ -312,9 +312,11 @@ TEST(MoEIntermediateProjectionGeometry, SizingAndWorkUseExactLocalNKAndFullExper
             return PlanningWeightOperand{tensors[i].name, roles[i], 0, tensors[i].quant_type,
                 ModelPreparedWeightRepresentation::SourceNative, full.resolve(tensors[i], 1)};
         };
-        const PlanningRoutedExpertWeightWork work{0, 512, 10,
-            {operand(0), operand(1), operand(2)},
-            {PlanningExpertExecutionShare(PlanningExpertExecution::ReplicatedExperts, 512)}, ownership};
+        const PlanningRoutedExpertWeightWork work{
+            .layer = 0, .expert_count = 512, .routes_per_token = 10,
+            .gate_up_down = {operand(0), operand(1), operand(2)},
+            .execution_shares = {PlanningExpertExecutionShare(PlanningExpertExecution::ReplicatedExperts, 512)},
+            .projection_ownership = ownership};
         for (size_t i = 0; i < roles.size(); ++i)
         {
             const auto projection = ownership.projection(roles[i]);

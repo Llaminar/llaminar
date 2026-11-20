@@ -2738,7 +2738,8 @@ namespace llaminar2::moe_activation_packet_device
             control.route_capacity !=
                 static_cast<std::int32_t>(launch.route_capacity) ||
             control.d_model != launch.d_model ||
-            control.live_entry_count > launch.route_capacity ||
+            (launch.metadataOnly() ? control.live_entry_count != 0u :
+                control.live_entry_count > launch.route_capacity) ||
             (success_payload && control.residency_epoch == 0u) ||
             (abort_payload &&
              (control.residency_epoch != 0u ||

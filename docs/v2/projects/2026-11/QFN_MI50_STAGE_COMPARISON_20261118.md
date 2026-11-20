@@ -10,6 +10,43 @@ passed the MTP own-history check in both modes on both prompts. The local four-r
 remains slower than Castagna. The comparisons below distinguish work per
 verification from output tokens per second.
 
+## Cold Release on the automatic four-MI50 plan
+
+Release `42a8634118f75b1a8befc1580740e9d1f155473c` ran on four MI50s with the published
+RCCL and an automatic plan constrained by backend and GPU count. The plan
+placed all 512 routed experts across one TensorSharded domain and used
+tensor-parallel dense prefill and decode. The engines received identical
+input token IDs from the same UD-Q4_K_XL GGUF and, for MTP, the same Q8_0
+predictor. They used FP16 KV, a 32,768-token context, greedy sampling and
+seed 42. The fixed and adaptive references were refreshed on the same host
+boot with Castagna `3483d462715d61f21ed5877836be35a724446359`.
+
+Each cell is median **prefill / decode tok/s** over five 256-token
+generations after warmup. All samples used cold prefixes. The decode
+denominator is the 255 tokens emitted after the first sample.
+
+| Mode | Review 512 Llaminar | Review 512 Castagna | Code 2048 Llaminar | Code 2048 Castagna |
+| --- | ---: | ---: | ---: | ---: |
+| MTP off | 1,082.04 / 88.96 | 874.75 / 85.94 | 1,050.16 / 82.61 | 1,005.41 / 75.59 |
+| Fixed depth 3 | 1,040.25 / 124.94 | 782.91 / 116.81 | 1,007.63 / 124.14 | 884.47 / 107.04 |
+| Dynamic MTP | 1,039.80 / 101.39 | 670.21 / 72.53 | 1,007.76 / 112.29 | 810.73 / 82.96 |
+
+Every Llaminar sample exceeded the corresponding Castagna range. Llaminar
+fixed and dynamic MTP matched all 256 output IDs from Llaminar's ordinary
+mode in every measured trial. Castagna's speculative outputs and draft
+acceptance differed, giving each engine its own completed verifier work.
+
+The benchmark command defaults to a cold prefill before model admission.
+Serving keeps prefix caching available. The fully sharded GDN layout moved
+the GPU archive from 149,346,312 to 31,676,424 bytes per participant per
+prefill block. On the Release HTTP server, exact and partial prefix restores
+reproduced the cold completions token for token.
+
+[All samples, exact comparison checks and verifier counters](/opt/llaminar-models/.llaminar-build-mi50-preflight-20261118/prefix-prefill-breakdown/production-bank-policy/performance-audit.json) ·
+[Native invocation, environment and cold startup receipt](/opt/llaminar-models/.llaminar-build-mi50-preflight-20261118/prefix-prefill-breakdown/production-bank-policy/fixed3-code2048/invocation.json) ·
+[Castagna invocation and executable pins](/opt/llaminar-models/.llaminar-build-mi50-preflight-20261118/prefix-prefill-breakdown/production-bank-policy/castagna-dynamic-fresh/invocation.json) ·
+[HTTP restore receipts](/opt/llaminar-models/.llaminar-build-mi50-preflight-20261118/prefix-prefill-breakdown/production-bank-policy/serving-restore.json)
+
 ## Shipping RCCL and automatic planning
 
 A Release built with the RCCL from the published develop image compared the
@@ -161,6 +198,40 @@ LLAMINAR_BENCHMARK_ITERATIONS=2 LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1 \
 
 For the control, use a fresh directory and change `--moe-routed-expert-compute`
 to `gate-up-owned-down-columns`.
+
+### Serving defaults with dynamic residency enabled
+
+On four MI50s, the automatic serving layout kept all 512 experts jointly
+resident in each of the 48 main layers and the predictor. Across two measured
+Q4_K_XL generations, the placement epoch stayed at 1, with zero movement
+commands and zero transferred expert bytes. The full 256-token output and
+all 142 verifier rounds matched the earlier explicit maintenance-off control.
+The count-only planner also selected this layout with the strategy unrestricted.
+
+| Release configuration, code2048 | Prefill tok/s | Decode tok/s, 255 post-prefill tokens |
+| --- | ---: | ---: |
+| Q4_K_XL, automatic tensor sharding, dynamic maintenance | 918.20 | 79.84 |
+| Q4_K_XL, tensor sharding with maintenance off, control | 920.03 | 80.37 |
+| IQ3_XXS, automatic tensor sharding, dynamic maintenance | 874.05 | 80.23 |
+
+To reproduce the automatic arm, use the four-card visibility, Release build,
+rankfile, Q4 model, predictor and `campaign.json` created above. Each arm uses
+a fresh cache and an independent output file.
+
+```bash
+python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["prompts"][0]["text"], end="")' \
+  "$bench/campaign.json" > "$bench/code2048.txt"
+OMP_NUM_THREADS=28 OMP_PLACES=cores OMP_PROC_BIND=false OPENBLAS_NUM_THREADS=1 \
+LLAMINAR_BENCHMARK_ITERATIONS=2 LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1 \
+"$build/llaminar_mpi_session" --session-base "$bench/mpi" -- mpirun -np 2 \
+  --rankfile "$bench/rankfile" --bind-to core --report-bindings \
+  --mca mpi_leave_pinned 1 --mca orte_allowed_exit_without_sync 1 -- \
+  "$build/llaminar2" benchmark --auto --only-backends rocm --only-strategies tp \
+  --auto-device-counts rocm=4 --mpi-procs 2 -m "$model" --mtp-model "$predictor" \
+  --plan-workload 2048,256 --prefix-cache-disk-dir "$bench/auto-cache" -n 256 \
+  --temperature 0 --top-k 1 --top-p 1 --seed 42 --prompt-file "$bench/code2048.txt" \
+  --benchmark-json-output "$bench/auto-result.json"
+```
 
 ## Matched workload
 

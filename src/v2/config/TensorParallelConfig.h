@@ -64,6 +64,8 @@ namespace llaminar2
         // FFN sharding
         int d_ff_start = 0; // Start index in FFN dimension
         int d_ff_count = 0; // FFN slice size
+        // Present only when these coordinates were bound directly to the shared native source axis.
+        std::optional<int> native_shared_ffn_width;
 
         // LM Head sharding
         int vocab_start = 0; // Start index in vocabulary
@@ -160,6 +162,13 @@ namespace llaminar2
         // =========================================================================
 
         const std::vector<DeviceShardingAssignment> &assignments() const { return assignments_; }
+        /**
+         * @brief Preserve participant order and assign positive whole shared-FFN source blocks.
+         * @param columns Complete original shared intermediate width.
+         * @param group Common native Down K block width across the retained source family.
+         * @return Same TP assignment with only its FFN intervals replaced.
+         */
+        [[nodiscard]] TensorParallelConfig withNativeSharedFFN(int columns, int group) const;
         /**
          * @brief Select a shard by an unambiguous storage-device identity.
          * @param device Exact storage address space to find.

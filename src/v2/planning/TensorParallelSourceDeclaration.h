@@ -12,14 +12,81 @@
 #include "execution/config/RuntimeConfig.h"
 #include "execution/local_execution/graph/SchemaFactoryRegistry.h"
 #include "models/qwen4exp/Qwen4ExpConfig.h"
+#include "execution/moe/MoERoutedExpertPlacementPlan.h"
+#include "loaders/WeightIdentity.h"
+#include "tensors/BlockStructures.h"
 #include "planning/ModelMemoryProfile.h"
 #include "tensors/NativeQuantisedFormatInfo.h"
 #include <span>
 #include <algorithm>
+#include <limits>
 #include <stdexcept>
 
 namespace llaminar2
 {
+/** @brief One shared source width and its common native Down K block alignment. */
+struct OriginalSharedExpertTPGeometry
+{
+    int columns;
+    int group;
+
+    /** @return Whether every member can own at least one complete original block. */
+    bool supportsDegree(int degree) const noexcept
+    { return degree > 0 && columns % group == 0 && columns / group >= degree; }
+};
+
+/** @return Shared source geometry if every retained main and predictor block has an original Down. */
+inline std::optional<OriginalSharedExpertTPGeometry> originalSharedExpertTPGeometry(
+    const ModelMemoryProfile &profile, const MTPRuntimeConfig &mtp)
+{
+    OriginalSharedExpertTPGeometry geometry{0, 1};
+    const int layers = retainsMTPGraphCapacity(mtp) ? profile.totalLayerCount() : profile.mainLayerCount();
+    std::vector<bool> found(layers);
+    for (const auto &tensor : profile.tensors)
+    {
+        if (inferWeightRole(tensor.name) != WeightRole::SharedExpertDown || tensor.layer_index < 0 ||
+            tensor.layer_index >= layers)
+            continue;
+        if (found[tensor.layer_index] || tensor.K == 0 || tensor.K > std::size_t(std::numeric_limits<int>::max()) ||
+            (geometry.columns && geometry.columns != static_cast<int>(tensor.K)))
+            throw std::invalid_argument("Original shared expert Down source has inconsistent or repeated intermediate geometry");
+        found[tensor.layer_index] = true;
+        geometry.columns = static_cast<int>(tensor.K);
+        const auto *native = native_quantised_formats::forQuantType(tensor.quant_type);
+        if (native)
+            geometry.group = std::max(geometry.group, static_cast<int>(native->is_superblock
+                ? Q4_KBlock::BLOCK_SIZE : Q4_0Block::BLOCK_SIZE));
+        else if (tensor.quant_type != "F16" && tensor.quant_type != "FP16" &&
+                 tensor.quant_type != "F32" && tensor.quant_type != "FP32" && tensor.quant_type != "BF16")
+            throw std::invalid_argument("Original shared expert Down source uses an unsupported native codebook");
+    }
+    if (!geometry.columns || !std::all_of(found.begin(), found.end(), [](bool present) { return present; }))
+        return std::nullopt;
+    return geometry;
+}
+
+/** @return Whether the prepared continuation binds one original shared shard per GPU. */
+inline bool usesNativeSharedExpertTP(const MoERoutedExpertPlacementPlan *plan)
+{
+    if (!plan) return false;
+    const auto continuation = std::find_if(plan->domains.begin(), plan->domains.end(), [&](const auto &domain) {
+        return domain.name == plan->continuation_domain;
+    });
+    return continuation != plan->domains.end() &&
+        continuation->routed_compute_policy == RoutedExpertComputePolicy::TensorSharded &&
+        continuation->participants.size() > 1 && continuation->participants.front().isGPU();
+}
+
+/** @return Original shared source partition applied to the exact selected TP membership. */
+inline TensorParallelConfig bindOriginalSharedExpertTP(
+    const ModelMemoryProfile &profile, const MTPRuntimeConfig &mtp, const TensorParallelConfig &assignment)
+{
+    const auto source = originalSharedExpertTPGeometry(profile, mtp);
+    if (!source)
+        throw std::invalid_argument("Original shared expert Down source must cover every main and predictor block");
+    return assignment.withNativeSharedFFN(source->columns, source->group);
+}
+
 /** @brief Authenticated existing placement scope; it never derives locality from an ordinal/hostname. */
 enum class TensorParallelMainPlacement { FullMainRankLocal, OtherDeclared };
 /** @brief Original source arithmetic family selected before assignment; this is not a runtime recovery path. */

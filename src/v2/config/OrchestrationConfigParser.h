@@ -31,10 +31,12 @@ namespace llaminar2
     class OrchestrationConfigParser : public IOrchestrationConfigParser
     {
     public:
-        /**
-         * @brief Construct parser with default settings
-         */
-        OrchestrationConfigParser() = default;
+        /** @brief Select defaults for fields absent from the command and authored YAML. */
+        enum class Defaults { Inference, Benchmark };
+
+        /** @brief Bind the command's defaults for parsing before and after MPI startup. */
+        explicit OrchestrationConfigParser(Defaults defaults = Defaults::Inference)
+            : defaults_(defaults) {}
 
         /**
          * @brief Parse from command line arguments
@@ -80,6 +82,11 @@ namespace llaminar2
         static std::string getHelpText();
 
     private:
+        Defaults defaults_;
+
+        /** @brief Base configuration before file and explicit CLI settings are applied. */
+        [[nodiscard]] OrchestrationConfig initialConfig() const;
+
         /**
          * @brief Parse device list from comma-separated string
          * @param spec Comma-separated device specs (e.g., "cuda:0,cuda:1")

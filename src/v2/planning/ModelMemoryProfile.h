@@ -23,6 +23,7 @@ namespace llaminar2
     // Forward declarations
     struct GGUFModel;
     class ModelLoader;
+    class IModelContext;
     class Qwen4ExpConfig;
 
     struct TensorSizeInfo
@@ -180,6 +181,14 @@ namespace llaminar2
          * @return Metadata with unchanged main boundaries and explicit predictor policy.
          */
         static ModelMemoryProfile fromLoader(const ModelLoader &loader);
+
+        /**
+         * @brief Project the original source sealed by a production model context.
+         * @param context Graph owner of the original target and optional predictor loader.
+         * @return Same metadata used by original weight and graph assignment.
+         * @throws std::invalid_argument If no original GGUF source owner can be authenticated.
+         */
+        static ModelMemoryProfile fromOriginalModelContext(const IModelContext &context);
 
         /**
          * @brief Build an exact planning profile from parsed GGUF metadata.

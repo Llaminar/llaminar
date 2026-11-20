@@ -158,7 +158,8 @@ namespace llaminar2
             const AdmittedOrchestrationCandidate &candidate, const DevicePlanConfig &device,
             const std::optional<AdmittedMoELayerView> &overlay, std::span<const MoEOverlayBoundTierParticipant> participants, int layer,
             int model_experts, size_t ordinary_experts, PlanningMainForwardPhase phase,
-            std::optional<MoEExpertProjectionOwnership> &projection_ownership)
+            std::optional<MoEExpertProjectionOwnership> &projection_ownership,
+            std::optional<PlanningRoutedShardWork> &shard_work)
         {
             if (!overlay)
             {
@@ -194,24 +195,39 @@ namespace llaminar2
                     result.emplace_back(PlanningExpertExecution::OwnedExperts, copies);
                 else if (domain->routed_compute_policy == RoutedExpertComputePolicy::TensorSharded)
                 {
-                    if (!device.device.is_gpu() || device.routed_compute_policy != domain->routed_compute_policy ||
-                        domain->scope != ExecutionDomainScope::RANK_LOCAL || domain->owner_rank != device.world_rank ||
-                        plan.routed_tiers.size() != 1 || tier.domain != plan.continuation_domain ||
-                        tier.domain != plan.shared_expert_domain ||
-                        candidate.config().moe_rebalance.mode != MoERebalanceRuntimeMode::Off ||
-                        copies != model_experts || copies != quota->live_experts_per_layer.at(layer_index) ||
-                        projection_ownership)
-                        throw std::logic_error("Static GPU tensor-shard work requires its complete original admitted cohort");
-                    const auto &cohort = quota->shard_cohorts.at(layer_index);
                     const auto coordinate = participant.domain_participant_index;
+                    const int logical_experts = quota->live_experts_per_layer.at(layer_index);
+                    if (copies != logical_experts || copies < 0 || copies > model_experts ||
+                        coordinate < 0 || static_cast<size_t>(coordinate) >= domain->participants.size())
+                        throw std::logic_error("Tensor-shard work requires the exact admitted tier population");
+                    if (device.device.is_cpu() && domain->participants.size() == 1)
+                    {
+                        // Capacity admits CPU TP1 as an ordinary complete owner.
+                        if (!quota->shard_cohorts.empty())
+                            throw std::logic_error("CPU TP1 unexpectedly owns a fragmented source");
+                        result.emplace_back(PlanningExpertExecution::OwnedExperts, copies);
+                        continue;
+                    }
+                    // The fixed DevicePlanConfig only names a projection policy
+                    // on continuation graphs. Routed-only endpoints receive their
+                    // policy and fragment geometry from the admitted tier.
+                    if ((device.execution_role == DeviceExecutionMemoryRole::ContinuationGraph &&
+                         device.routed_compute_policy != domain->routed_compute_policy) ||
+                        (device.device.is_gpu() &&
+                         (domain->scope != ExecutionDomainScope::RANK_LOCAL ||
+                          domain->owner_rank != device.world_rank)) ||
+                        (device.device.is_cpu() && domain->scope != ExecutionDomainScope::NODE_LOCAL) ||
+                        projection_ownership || !result.empty())
+                        throw std::logic_error("Tensor-shard work requires one admitted cohort per physical endpoint");
+                    const auto &cohort = quota->shard_cohorts.at(layer_index);
                     if (!cohort || cohort->source().layer_idx != layer ||
-                        cohort->participants().size() != domain->participants.size() ||
-                        coordinate < 0 || static_cast<size_t>(coordinate) >= cohort->participants().size())
+                        cohort->participants().size() != domain->participants.size())
                         throw std::logic_error("Tensor-shard work has no original admitted layer fragment");
                     const auto &member = cohort->participants()[coordinate];
                     if (member.participant_id != participant.participant_id || member.world_rank != device.world_rank ||
                         member.address != domain->participants[coordinate] || member.address.toLocalDeviceId() != device.device)
                         throw std::logic_error("Tensor-shard work has a foreign admitted participant");
+                    shard_work = PlanningRoutedShardWork{participant.tier_index, cohort, static_cast<size_t>(coordinate)};
                     projection_ownership = cohort->ownership(coordinate);
                     // Each fragment executes every routed expert selected on
                     // this row. Within-expert N/K, rather than row count, is
@@ -232,7 +248,8 @@ namespace llaminar2
                 }
                 else throw std::logic_error("Overlay whole-expert work has an unsupported compute policy");
             }
-            if (result.empty()) throw std::logic_error("Routed work endpoint is absent from its admitted tier topology");
+            if (result.empty() || (shard_work && result.size() != 1))
+                throw std::logic_error("Routed work endpoint has absent or overlapping tensor-shard tier ownership");
             return result;
         }
 
@@ -342,7 +359,7 @@ namespace llaminar2
                     PreparedWeightRepresentationContract::resolve(role, tensor.quant_type, tensor.name, profile.architecture,
                         debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic),
                     std::move(geometry), PreparedWeightRepresentationContract::operandPrecision(
-                        role, tensor.name, profile.architecture, debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic)};
+                        role, tensor.quant_type, tensor.name, profile.architecture, debugEnv().gemm.gdn_projection_arithmetic, debugEnv().gemm.moe_router_arithmetic)};
             };
             const auto appendTensor = [&](size_t tensor_index) {
                 const auto view = model.classifiedTensor(tensor_index);
@@ -417,7 +434,7 @@ namespace llaminar2
                     std::array{std::move(*triplet[0]), std::move(*triplet[1]), std::move(*triplet[2])});
                 routed_work.execution_shares = executionShares(candidate, device, overlay, participants, layer,
                     profile.expert_count, overlay ? 0 : ordinary_expert_counts.at(layer), phase,
-                    routed_work.projection_ownership);
+                    routed_work.projection_ownership, routed_work.shard_work);
                 const auto *ownership = device.weight_residency.projectionOwnership();
                 if (device.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
                 {

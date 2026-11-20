@@ -50,6 +50,7 @@ class Qwen4ExpAdmissionRegistration(unittest.TestCase):
         """Generate CTest declarations with imported, never-executed placeholders."""
         with tempfile.TemporaryDirectory(prefix="llaminar-qfn-registration-") as directory:
             root = Path(directory)
+            (root / "cmake").symlink_to(SOURCE / "tests/v2/cmake", target_is_directory=True)
             sources = [f"/not-loaded/main shard {index}.gguf" for index in range(main_shards)]
             source_list = " ".join(f'"{path}"' for path in sources)
             target = """
@@ -118,9 +119,18 @@ endif()
                                     "Fixed5", "Fixed6")
                     tp4_prefix = "V2_Integration_Qwen4ExpFullROCmTP4MTPAdmission_"
                     bridge = "V2_Integration_Qwen4ExpTensorShardedRestoredPrefixMTP"
+                    active_shards = {
+                        "V2_Integration_QFNTP4DynamicTensorShardedStationaryReplay": (
+                            "Qwen4ExpTensorShardedROCmTP4.DynamicResidencyOneCohortRetainsEpochAcrossGroupedReplay",
+                            4, 1),
+                        "V2_Integration_QFNROCmTP2CPUTP2DynamicTensorShardedMovementReplay": (
+                            "Qwen4ExpMixedTensorShardedTP2.DynamicResidencyPublishesCompleteCohortSwapBeforeGroupedReplay",
+                            2, 2),
+                    }
                     if rocm:
                         names.update(tp4_prefix + policy for policy in tp4_policies)
                         names.add(bridge)
+                        names.update(active_shards)
                     self.assertEqual({test["name"] for test in tests}, names)
                     self.assertEqual(len(tests), len(names))
                     for test in tests:
@@ -133,7 +143,19 @@ endif()
                         self.assertEqual(props["TIMEOUT"], 900)
                         self.assertNotIn("ProductionTestPreflight", props["LABELS"])
                         self.assertEqual("CUDA" in props["LABELS"], "CUDA" in test["name"])
-                        self.assertEqual("ROCm" in props["LABELS"], "ROCm" in test["name"] or test["name"] == bridge)
+                        self.assertEqual("ROCm" in props["LABELS"], "ROCm" in test["name"]
+                                         or test["name"] == bridge or test["name"] in active_shards)
+                        if test["name"] in active_shards:
+                            case, devices, ranks = active_shards[test["name"]]
+                            self.assertTrue({"HardwareOptional", "NativeISA-gfx906", f"Devices{devices}"}
+                                            <= set(props["LABELS"]))
+                            self.assertEqual("DistinctNUMARanks" in props["LABELS"], ranks > 1)
+                            self.assertEqual(set(props["RESOURCE_LOCK"]), {
+                                "Integration_Serial", *(f"rocm_gpu_{ordinal}" for ordinal in range(devices))})
+                            command = test["command"]
+                            self.assertEqual(command[command.index("-np") + 1], str(ranks))
+                            self.assertEqual([arg for arg in command if arg.startswith("--gtest_filter=")],
+                                             [f"--gtest_filter={case}"])
                         if test["name"].startswith(tp4_prefix) or test["name"] == bridge:
                             self.assertEqual(set(props["RESOURCE_LOCK"]), {
                                 "Integration_Serial", "rocm_gpu_0", "rocm_gpu_1",

@@ -13,19 +13,26 @@
  * constraints, independently of physical NUMA IDs or local GPU cardinality.
  */
 #include "planning/AutomaticOrchestrationCandidates.h"
+#include "loaders/ModelContext.h"
 #include "planning/PlanningModelMetadata.h"
 #include "planning/TensorParallelSourceDeclaration.h"
+#include "planning/WeightShardGeometry.h"
 #include "planning/MoEOverlayMemoryPlanInputs.h"
 #include "planning/MoEOverlayPlanningInputs.h"
 #include "../../utils/CPUExecutionTestGeometry.h"
 #include "planning/ResolvedRankOrchestration.h"
 #include "app/RuntimeInitPhase.h"
 #include "config/OrchestrationConfigDocument.h"
+#include "config/OrchestrationStartupPolicy.h"
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
 #include "execution/moe/MoEProjectionArenaGeometry.h"
+#include "execution/moe/MoEIntermediateShardArenaGeometry.h"
+#include "execution/local_execution/graph/GraphResolver.h"
+#include "execution/moe/MoEOverlayPhysicalLaneDemand.h"
 #include "utils/NUMATopology.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include "../../utils/Qwen4ExpPlanningGGUFFixture.h"
+#include "../models/qwen4exp/Qwen4ExpSidecarFixture.h"
 #include "../../utils/PlanningHostServiceFixture.h"
 #include "../../fixtures/backends/NativeOrderingEventGroupReplayAccess.h"
 #include <gtest/gtest.h>
@@ -242,7 +249,8 @@ TEST(AutomaticOrchestrationCandidates, ProjectionCandidatesPreserveIntegralSourc
         profile.d_model = columns;
         profile.n_heads = columns / profile.head_dim;
         const PlanningModelMetadata source(std::move(profile), 4);
-        const auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
+        auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
+        config.routed_expert_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
         std::set<std::size_t> degrees;
         visitAutomaticOrchestrationCandidates(config, source, inventory, [&](const auto &proposal) {
             ASSERT_TRUE(proposal.config.moe_routed_expert_plan);
@@ -253,7 +261,7 @@ TEST(AutomaticOrchestrationCandidates, ProjectionCandidatesPreserveIntegralSourc
             EXPECT_TRUE(MoEProjectionArenaGeometry::hasIntegralOutputPartition(columns, degree));
             EXPECT_EQ(declaration.resolveRoutedComputePolicy(placement.routed_tiers.size()),
                 RoutedExpertComputePolicy::GateUpOwnedDownColumns);
-            EXPECT_EQ(proposal.config.routed_expert_compute_policy, RoutedExpertComputePolicy::Automatic);
+            EXPECT_EQ(proposal.config.routed_expert_compute_policy, RoutedExpertComputePolicy::GateUpOwnedDownColumns);
             degrees.insert(degree);
         });
         const std::set<std::size_t> expected = columns == 512
@@ -271,7 +279,6 @@ TEST(AutomaticOrchestrationCandidates, ProjectionGeometryRejectionPreservesExpli
         cards(inventory, 0, backend, 3);
         auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
         config.automatic_planning.device_counts = {{backend, 3}};
-        EXPECT_TRUE(candidates(config, inventory, true).empty());
         config.routed_expert_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
         EXPECT_TRUE(candidates(config, inventory, true).empty());
         config.routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
@@ -313,6 +320,8 @@ TEST(AutomaticOrchestrationCandidates, LocalMoETPCompilesWithOneOverlayAuthority
         else cards(inventory, 0, backend, 2);
         auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
         config.moe_rebalance.mode = mode;
+        config.routed_expert_compute_policy = backend == DeviceType::CPU
+            ? RoutedExpertComputePolicy::Apportioned : RoutedExpertComputePolicy::GateUpOwnedDownColumns;
         const auto proposals = candidates(config, inventory, true);
         ASSERT_EQ(proposals.size(), 2u);
         const std::array policies{
@@ -399,6 +408,7 @@ TEST(AutomaticOrchestrationCandidates,
                           {OrchestrationStrategy::ExpertOverlay});
     config.automatic_planning.device_counts =
         {{DeviceType::CUDA, 2}, {DeviceType::CPU, 2}};
+    config.routed_expert_compute_policy = RoutedExpertComputePolicy::Apportioned;
     const auto proposals = candidates(config, inventory, true);
     ASSERT_EQ(proposals.size(), 2u);
     const std::array policies{
@@ -562,6 +572,50 @@ TEST(AutomaticOrchestrationCandidates,
         ASSERT_EQ(domains.size(), 2u);
         EXPECT_NE(domains[0].owner_rank, domains[1].owner_rank);
         compile(proposal, true);
+    }
+}
+
+/** @test A node-local CPU cohort retains NUMA separately from the logical CPU ordinal. */
+TEST(AutomaticOrchestrationCandidates, MultiTierOverlayTensorShardedCPUUsesCanonicalEndpoints)
+{
+    auto inventory = hosts(2);
+    inventory.ranks[0].cpu.numa_node = 0;
+    inventory.ranks[1].cpu.numa_node = 1;
+    inventory.ranks[1].node_id = inventory.ranks[0].node_id;
+    inventory.ranks[1].hostname = inventory.ranks[0].hostname;
+    inventory.ranks[1].local_rank = 1;
+    cards(inventory, 0, DeviceType::ROCm, 2);
+    auto config = request({DeviceType::CPU, DeviceType::ROCm}, {OrchestrationStrategy::ExpertOverlay});
+    config.automatic_planning.device_counts = {{DeviceType::CPU, 2}, {DeviceType::ROCm, 2}};
+    config.routed_expert_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+    config.moe_rebalance.mode = MoERebalanceRuntimeMode::Dynamic;
+
+    const auto proposals = candidates(config, inventory, true);
+    ASSERT_FALSE(proposals.empty());
+    const auto &q5 = native_quantised_formats::Q5_1;
+    const auto format = ExpertWeightFormat::nativeQuantised({q5.codebook_id, q5.is_superblock, true});
+    const MoEOverlayLayerWeightManifest source{.layer_idx = 0, .projections = {{
+        {ExpertTierWeightProjection::Gate, 640, 512, format},
+        {ExpertTierWeightProjection::Up, 640, 512, format},
+        {ExpertTierWeightProjection::Down, 512, 640, format}}}};
+    for (const auto &proposal : proposals)
+    {
+        ExecutionPlanBuilder builder;
+        const auto resolved = ResolvedRankOrchestration::resolve(
+            proposal.config, model(true), proposal.membership.inventory(), builder, 0);
+        const auto &plan = *resolved.config().moe_routed_expert_plan;
+        const auto targets = configuredMoEOverlayProjectionTargets(plan, source, 32);
+        const auto cpu = std::find_if(targets.begin(), targets.end(), [](const auto &target) {
+            return target.members.front().device.is_cpu();
+        });
+        ASSERT_NE(cpu, targets.end());
+        ASSERT_EQ(cpu->members.size(), 2u);
+        for (int member = 0; member < 2; ++member)
+        {
+            EXPECT_EQ(cpu->members[member].world_rank, member);
+            EXPECT_EQ(cpu->members[member].address,
+                      GlobalDeviceAddress::cpu(member, inventory.ranks[member].hostname));
+        }
     }
 }
 
@@ -823,6 +877,63 @@ TEST(AutomaticOrchestrationCandidates, PipelineWidthsRemainGeneralWithoutSwitchO
     }
 }
 
+/** @test The native CPU TP child retains its original ranks under supported automatic PP. */
+TEST(AutomaticOrchestrationCandidates, StaticAutomaticCPUPipelineSelectsOriginalTensorShards)
+{
+    auto inventory = hosts(3);
+    inventory.ranks[1].hostname = inventory.ranks[0].hostname;
+    inventory.ranks[1].node_id = inventory.ranks[0].node_id;
+    inventory.ranks[1].local_rank = 1;
+    cards(inventory, 2, DeviceType::ROCm, 1);
+
+    auto config = request({DeviceType::CPU, DeviceType::ROCm},
+        {OrchestrationStrategy::PipelineParallel});
+    config.automatic_planning.pipeline_stage_widths = std::vector<int>{2, 1};
+    config.automatic_planning.device_counts = {{DeviceType::CPU, 2}, {DeviceType::ROCm, 1}};
+    const test::PlanningGGUFFixture native_weights(true, false, GGUFTensorType::Q8_0, 256);
+    const test::PlanningGGUFFixture indivisible_weights(true, false, GGUFTensorType::Q4_K, 256);
+    const PlanningModelSource native(native_weights.path());
+    const PlanningModelSource indivisible(indivisible_weights.path());
+    using Compute = RoutedExpertComputePolicy;
+    using Maintenance = MoERebalanceRuntimeMode;
+    const auto check = [&](const PlanningModelSource &source, Compute requested,
+                           Maintenance mode, Compute expected) {
+        config.routed_expert_compute_policy = requested;
+        config.moe_rebalance.mode = mode;
+        std::size_t seen = 0;
+        visitAutomaticOrchestrationCandidates(config, source.metadata(), inventory,
+            [&](const auto &proposal) {
+                ++seen;
+                ASSERT_EQ(proposal.membership.discoveryRanks(), (std::vector<int>{0, 1, 2}));
+                ASSERT_EQ(proposal.config.domain_definitions.size(), 2u);
+                const auto cpu = proposal.config.domain_definitions.front().toExecutionDomainDefinition();
+                EXPECT_EQ(cpu.scope, ExecutionDomainScope::NODE_LOCAL);
+                EXPECT_EQ(cpu.ranks, (std::vector<int>{0, 1}));
+                EXPECT_EQ(cpu.resolveRoutedComputePolicy(1), expected);
+                EXPECT_NE(proposal.config.domain_definitions.back().routed_compute_policy, Compute::TensorSharded);
+                EXPECT_EQ(proposal.config.moe_rebalance.mode, mode);
+                if (expected == Compute::TensorSharded)
+                    for (const int rank : {0, 1})
+                    {
+                        ExecutionPlanBuilder builder;
+                        const auto resolved = ResolvedRankOrchestration::resolve(proposal.config,
+                            source.metadata(), proposal.membership.inventory(), builder, rank);
+                        ASSERT_EQ(resolved.pipelineStages().size(), 1u);
+                        const auto &stage = resolved.pipelineStages().front();
+                        ASSERT_TRUE(stage.config().moe_routed_expert_plan);
+                        const auto &domain = stage.config().moe_routed_expert_plan->domains.front();
+                        EXPECT_EQ(domain.routed_compute_policy, Compute::TensorSharded);
+                        EXPECT_EQ(domain.world_ranks, (std::vector<int>{0, 1}));
+                    }
+            });
+        EXPECT_GT(seen, 0u);
+    };
+    check(native, Compute::Automatic, Maintenance::Off, Compute::TensorSharded);
+    check(native, Compute::Apportioned, Maintenance::Off, Compute::Apportioned);
+    check(native, Compute::Automatic, Maintenance::Dynamic, Compute::Apportioned);
+    check(indivisible, Compute::Automatic, Maintenance::Off, Compute::Apportioned);
+}
+
 /** @test MoE GPU PP preserves original rank/NUMA, explicit hybrid arithmetic, fixed-head storage and full15 MTP. */
 TEST(AutomaticOrchestrationCandidates, RoutedPipelineWidthsRetainGateUpStorageAndDynamicMTP)
 {
@@ -1074,6 +1185,7 @@ TEST(AutomaticOrchestrationCandidates, QueryConsumerSourceUsesCanonicalAssignmen
         auto config=request({backend},{OrchestrationStrategy::TensorParallel});
         config.mtp.enabled=false;config.mtp.graph_capacity_draft_tokens=0;
         config.moe_rebalance.mode=MoERebalanceRuntimeMode::Off;
+        config.routed_expert_compute_policy=RoutedExpertComputePolicy::GateUpOwnedDownColumns;
         config.ngram_table_policy.storage=ImmutableRowStoragePreference::RAM;
         config.automatic_planning.device_counts={{backend,degree}};
         std::size_t proposed=0;
@@ -1234,4 +1346,382 @@ TEST(AutomaticOrchestrationCandidates, CardinalPipelineLayerCountsCoverOddAndUne
     EXPECT_THROW(automaticPipelineLayerCounts(3,std::vector<int>{1,0}),std::invalid_argument);
     EXPECT_THROW(automaticPipelineLayerCounts(3,std::vector<int>{1,-1}),std::invalid_argument);
     EXPECT_THROW(automaticPipelineLayerCounts(1,std::vector<int>{1,1}),std::invalid_argument);
+}
+
+/** @test Qwen3.5/3.6 MoE uses its registered graph capability on each native GPU backend. */
+TEST(AutomaticOrchestrationCandidates, MultiTierOverlayQwen35MoEUsesTensorShardCapability)
+{
+    for (const bool with_predictor : {false, true})
+    {
+        SCOPED_TRACE(::testing::Message() << "predictor=" << with_predictor);
+        const test::PlanningGGUFFixture file(/*moe=*/true, with_predictor);
+        const auto source = readPlanningModelMetadata(file.path());
+        ASSERT_EQ(source.memoryProfile().architecture, "qwen35moe");
+        ASSERT_FALSE(source.memoryProfile().flash_next);
+        for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+            for (const bool mixed : {false, true})
+            for (const auto mode : {MoERebalanceRuntimeMode::Off,
+                                    MoERebalanceRuntimeMode::Observe,
+                                    MoERebalanceRuntimeMode::Dynamic})
+            {
+                SCOPED_TRACE(::testing::Message() << deviceTypeToString(backend)
+                    << " mixed=" << mixed << " mode=" << static_cast<int>(mode));
+                const bool sharded = mixed || mode != MoERebalanceRuntimeMode::Observe;
+                const auto expected = sharded ? RoutedExpertComputePolicy::TensorSharded
+                                              : RoutedExpertComputePolicy::GateUpOwnedDownColumns;
+                auto inventory = hosts(mixed ? 2 : 1);
+                inventory.ranks[0].cpu.numa_node = 0;
+                if (mixed)
+                {
+                    auto &remote = inventory.ranks[1];
+                    remote.cpu.numa_node = 1;
+                    remote.node_id = inventory.ranks[0].node_id;
+                    remote.hostname = inventory.ranks[0].hostname;
+                    remote.local_rank = 1;
+                }
+                cards(inventory, 0, backend, 2);
+                auto config = request(mixed ? std::vector{backend, DeviceType::CPU} : std::vector{backend},
+                    {mixed ? OrchestrationStrategy::ExpertOverlay : OrchestrationStrategy::TensorParallel});
+                config.automatic_planning.device_counts = {{backend, 2}};
+                config.moe_rebalance.mode = mode;
+                if (mixed)
+                    config.automatic_planning.device_counts->emplace_back(DeviceType::CPU, 2);
+
+                int candidates = 0;
+                visitAutomaticOrchestrationCandidates(config, source, inventory, [&](const auto &candidate) {
+                    ++candidates;
+                    const auto &authored = *candidate.config.moe_routed_expert_plan;
+                    ASSERT_EQ(authored.domains.size(), mixed ? 2u : 1u);
+                    if (sharded)
+                        EXPECT_EQ(authored.continuation_domain_spec.effectiveDensePolicy(),
+                                  DenseParallelPolicy::TensorParallel);
+                    EXPECT_EQ(candidate.config.moe_rebalance.mode, mode);
+                    ExecutionPlanBuilder builder;
+                    const auto resolved = ResolvedRankOrchestration::resolve(
+                        candidate.config, source, candidate.membership.inventory(), builder, 0);
+                    EXPECT_EQ(resolved.rankPlan().runtime.mtp.enabled, with_predictor);
+                    if (with_predictor)
+                    {
+                        EXPECT_EQ(resolved.rankPlan().runtime.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
+                        auto ordinary = candidate.config;
+                        ordinary.mtp_activation_policy = MTPActivationPolicy::Disabled;
+                        const auto without_mtp = ResolvedRankOrchestration::resolve(
+                            ordinary, source, candidate.membership.inventory(), builder, 0);
+                        EXPECT_FALSE(without_mtp.rankPlan().runtime.mtp.enabled);
+                        EXPECT_EQ(without_mtp.config().moe_routed_expert_plan->domains.front().routed_compute_policy,
+                                  expected);
+                    }
+                    const auto &bound = *resolved.config().moe_routed_expert_plan;
+                    for (const auto &domain : bound.domains)
+                    {
+                        EXPECT_EQ(domain.routed_compute_policy, expected);
+                        EXPECT_EQ(domain.participants.size(), 2u);
+                    }
+                });
+                EXPECT_EQ(candidates, sharded ? 1 : 2);
+            }
+    }
+}
+
+/** @test Non-QFN routed down-K keeps complete source-native blocks at every layer. */
+TEST(AutomaticOrchestrationCandidates, MultiTierOverlayChecksOriginalDownNativeBlocks)
+{
+    const test::PlanningGGUFFixture file(/*moe=*/true, /*mtp=*/false);
+    const auto source = readPlanningModelMetadata(file.path());
+    auto profile = source.memoryProfile();
+    std::vector<std::size_t> down_indices;
+    for (std::size_t i = 0; i < profile.tensors.size(); ++i)
+        if (source.classifiedTensor(i).role() == WeightRole::MoEExpertDown)
+            down_indices.push_back(i);
+    ASSERT_GE(down_indices.size(), 2u);
+    for (const auto i : down_indices)
+    {
+        profile.tensors[i].K = 512;
+        profile.tensors[i].quant_type = "Q8_0";
+    }
+    const PlanningModelMetadata q8(profile, source.mainLayerCount());
+    EXPECT_TRUE(supportsOriginalRoutedIntermediateShardDegree(q8, 4, true));
+
+    // One layer with 256-value source blocks bounds the whole retained graph family.
+    profile.tensors[down_indices.back()].quant_type = "IQ4_XS";
+    const PlanningModelMetadata mixed(profile, source.mainLayerCount());
+    for (const bool gpu : {false, true})
+    {
+        EXPECT_TRUE(supportsOriginalRoutedIntermediateShardDegree(mixed, 2, gpu));
+        EXPECT_FALSE(supportsOriginalRoutedIntermediateShardDegree(mixed, 4, gpu));
+    }
+    auto inventory = hosts(1);
+    cards(inventory, 0, DeviceType::ROCm, 4);
+    auto config = request({DeviceType::ROCm}, {OrchestrationStrategy::TensorParallel});
+    config.automatic_planning.device_counts = {{DeviceType::ROCm, 4}};
+    config.routed_expert_compute_policy = RoutedExpertComputePolicy::Automatic;
+    int emitted = 0;
+    EXPECT_THROW(visitAutomaticOrchestrationCandidates(config, mixed, inventory,
+        [&](const auto &) { ++emitted; }), std::invalid_argument);
+    EXPECT_EQ(emitted, 0);
+}
+
+/** @test Original shared Down blocks bind the same positive intervals for every retained layer. */
+TEST(AutomaticOrchestrationCandidates, OriginalSharedExpertTPKeepsNativeBlocksAcrossMTP)
+{
+    using Format = GGUFTensorType;
+    const test::PlanningGGUFFixture file(true, true, Format::Q8_0, 512, std::nullopt,
+        8, test::PlanningGGUFFixture::Geometry::FullAttentionGraph, 2, 8,
+        Format::Q8_0, std::nullopt, std::nullopt, std::nullopt, Format::Q6_K);
+    const auto source = readPlanningModelMetadata(file.path());
+    auto profile = source.memoryProfile();
+    profile.d_ff = 1; // A generic metadata heuristic cannot size the shared matrix.
+    ASSERT_EQ(profile.mtp_layer_count, 1);
+    ASSERT_EQ(profile.totalLayerCount(), 3);
+    OrchestrationConfig config_with_mtp;
+    resolveMTPStartupPolicy(config_with_mtp, profile);
+    const auto geometry = originalSharedExpertTPGeometry(profile, config_with_mtp.mtp);
+    ASSERT_TRUE(geometry);
+    EXPECT_EQ(geometry->columns, 512);
+    EXPECT_EQ(geometry->group, 256);
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        const std::vector devices{DeviceId(backend, 7), DeviceId(backend, 3)};
+        const auto original = TensorParallelConfig::proportionalSplit(devices, {0.625f, 0.375f},
+            profile.n_heads, profile.n_kv_heads, 2048, profile.vocab_size);
+        const auto plan = bindOriginalSharedExpertTP(profile, config_with_mtp.mtp, original);
+        for (int participant = 0; participant < 2; ++participant)
+        {
+            const auto &interval = plan.forRank(participant);
+            EXPECT_EQ(interval.device, devices[participant]);
+            EXPECT_EQ(interval.head_count, original.forRank(participant).head_count);
+            EXPECT_EQ(interval.d_ff_start, participant * 256);
+            EXPECT_EQ(interval.d_ff_count, 256);
+            for (int layer = 0; layer < profile.totalLayerCount(); ++layer)
+                EXPECT_NO_THROW(MoEIntermediateShardArenaGeometry::resolve(profile, 2, participant,
+                    interval, layer, layer));
+            const WeightShardGeometryResolver priced(profile, devices[participant], participant, 2, interval);
+            int priced_shared_roles = 0;
+            for (const auto &tensor : profile.tensors)
+            {
+                const auto role = inferWeightRole(tensor.name);
+                const bool down = role == WeightRole::SharedExpertDown;
+                if (!down && role != WeightRole::SharedExpertGate && role != WeightRole::SharedExpertUp)
+                    continue;
+                const auto local = priced.resolve(tensor);
+                ASSERT_TRUE(local.matrix());
+                EXPECT_EQ(down ? local.matrix()->columns : local.matrix()->rows, 256u);
+                EXPECT_EQ(down ? local.matrix()->rows : local.matrix()->columns, profile.d_model);
+                ++priced_shared_roles;
+            }
+            EXPECT_EQ(priced_shared_roles, profile.totalLayerCount() * 3);
+        }
+
+        auto inventory = hosts(1);
+        cards(inventory, 0, backend, 4);
+        auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
+        config.automatic_planning.device_counts = {{backend, 4}};
+        EXPECT_THROW(visitAutomaticOrchestrationCandidates(config, source, inventory,
+            [&](auto) { ADD_FAILURE() << "Published an indivisible shared Down partition"; }), std::invalid_argument);
+    }
+}
+
+/** @test A real ModelContext loader adapter still exposes the original shared routes to TP preparation. */
+TEST(AutomaticOrchestrationCandidates, OriginalSharedExpertTPBindsThroughProductionLoaderAdapter)
+{
+    const test::Qwen4ExpPlanningGGUFFixture file;
+    ModelContextConfig configuration;
+    configuration.use_mmap = false;
+    auto original = ModelContext::create(file.path(), configuration);
+    ASSERT_NE(original, nullptr);
+    IModelContext &interface = *original;
+    ASSERT_NE(interface.loader(), nullptr);
+    EXPECT_EQ(std::dynamic_pointer_cast<ModelLoader>(interface.loader()), nullptr);
+    const auto profile = ModelMemoryProfile::fromOriginalModelContext(interface);
+    EXPECT_EQ(profile.architecture, "qwen4exp");
+    const auto &main = original->concreteLoader();
+    const auto parsed = ModelMemoryProfile::fromLoader(main);
+    OrchestrationConfig off;
+    off.mtp_activation_policy = MTPActivationPolicy::Disabled;
+    resolveMTPStartupPolicy(off, profile);
+    const std::vector devices{DeviceId::rocm(1), DeviceId::rocm(0)};
+    const auto original_tp = TensorParallelConfig::proportionalSplit(
+        devices, {0.5f, 0.5f}, profile.n_heads, profile.n_kv_heads, 640, profile.vocab_size);
+    const auto shared = bindOriginalSharedExpertTP(profile, off.mtp, original_tp);
+    EXPECT_EQ(shared.assignments(), bindOriginalSharedExpertTP(parsed, off.mtp, original_tp).assignments());
+    EXPECT_EQ(shared.forRank(0).d_ff_count, 320);
+    EXPECT_EQ(shared.forRank(1).dFFEnd(), 640);
+}
+
+/** @test Paired shared source grain follows retained materialization rather than discovery. */
+TEST(AutomaticOrchestrationCandidates, OriginalSharedExpertTPUsesOnlyMaterializedPairedPredictor)
+{
+    using Format = GGUFTensorType;
+    test::Qwen4ExpSidecarFixture fixture;
+    constexpr uint32_t width = 640;
+    for (int layer = 0; layer < 48; ++layer)
+    {
+        auto &down = fixture.main.tensors.emplace_back(GGUFTensorInfo{
+            .name = "blk." + std::to_string(layer) + ".ffn_down_shexp.weight",
+            .dimensions = {2560, width}, .type = Format::Q8_0});
+        test::Qwen4ExpSidecarFixture::sealBytes(down);
+    }
+    const auto compatible = ModelMemoryProfile::fromGGUF(fixture.main, fixture.predictor,
+        SharedPredictorMaterialization::Active);
+    auto &predictor_down = *std::find_if(fixture.predictor.tensors.begin(), fixture.predictor.tensors.end(),
+        [](const auto &tensor) { return tensor.name.ends_with("ffn_down_shexp.weight"); });
+    predictor_down.type = Format::Q6_K;
+    test::Qwen4ExpSidecarFixture::sealBytes(predictor_down);
+
+    const auto inactive = ModelMemoryProfile::fromGGUF(fixture.main, fixture.predictor,
+        SharedPredictorMaterialization::Inactive);
+    const auto active = ModelMemoryProfile::fromGGUF(fixture.main, fixture.predictor,
+        SharedPredictorMaterialization::Active);
+    ASSERT_EQ(inactive.mtp_layer_count, 1);
+    ASSERT_EQ(inactive.totalLayerCount(), active.totalLayerCount());
+    OrchestrationConfig off, on;
+    off.mtp_activation_policy = MTPActivationPolicy::Disabled;
+    resolveMTPStartupPolicy(off, inactive);
+    resolveMTPStartupPolicy(on, active);
+    ASSERT_FALSE(retainsMTPGraphCapacity(off.mtp));
+    ASSERT_TRUE(retainsMTPGraphCapacity(on.mtp));
+    const auto off_geometry = originalSharedExpertTPGeometry(inactive, off.mtp);
+    const auto active_source_off = originalSharedExpertTPGeometry(active, off.mtp);
+    const auto on_geometry = originalSharedExpertTPGeometry(active, on.mtp);
+    ASSERT_TRUE(off_geometry);
+    ASSERT_TRUE(active_source_off);
+    ASSERT_TRUE(on_geometry);
+    EXPECT_EQ(off_geometry->group, 32);
+    EXPECT_EQ(active_source_off->group, off_geometry->group);
+    EXPECT_TRUE(off_geometry->supportsDegree(4));
+    EXPECT_EQ(on_geometry->group, 256);
+    EXPECT_FALSE(on_geometry->supportsDegree(4));
+    EXPECT_FALSE(originalSharedExpertTPGeometry(inactive, on.mtp));
+
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        const std::vector devices{DeviceId(backend, 7), DeviceId(backend, 3)};
+        const auto original = TensorParallelConfig::proportionalSplit(devices, {0.5f, 0.5f},
+            active.n_heads, active.n_kv_heads, width, active.vocab_size);
+        const auto serial = bindOriginalSharedExpertTP(inactive, off.mtp, original);
+        EXPECT_EQ(serial.assignments(), bindOriginalSharedExpertTP(active, off.mtp, original).assignments());
+        EXPECT_EQ(serial.forRank(0).d_ff_count, 320);
+        const auto retained = bindOriginalSharedExpertTP(compatible, on.mtp, original);
+        EXPECT_EQ(retained.forRank(0).device, devices.front());
+        EXPECT_EQ(retained.forRank(1).device, devices.back());
+        EXPECT_EQ(retained.forRank(1).dFFEnd(), width);
+        EXPECT_EQ(retained.assignments(), serial.assignments());
+        EXPECT_THROW((void)bindOriginalSharedExpertTP(active, on.mtp, original), std::invalid_argument);
+    }
+}
+
+/** @test The same serial MoE roots cover the actually materialized shared predictor. */
+TEST(AutomaticOrchestrationCandidates, IntermediateShardArenaUsesOwnedPredictorSharedWidth)
+{
+    using Fixture = test::PlanningGGUFFixture;
+    const Fixture file(true, true, GGUFTensorType::Q8_0, 640, std::nullopt, 8,
+        Fixture::Geometry::FullAttentionGraph, 2, 8, GGUFTensorType::Q8_0,
+        std::nullopt, Fixture::MoEDimensions{.hidden_columns = 2560, .shared_columns = 640, .top_k = 2});
+    const auto metadata = readPlanningModelMetadata(file.path());
+    const auto &source = metadata.memoryProfile();
+    ASSERT_EQ(source.mainLayerCount(), 2);
+    ASSERT_EQ(source.totalLayerCount(), 3);
+    for (const auto vendor : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        const auto policy = TensorParallelConfig::proportionalSplit(
+            {DeviceId(vendor, 3), DeviceId(vendor, 0)}, {0.6f, 0.4f},
+            source.n_heads, source.n_kv_heads, 640, source.vocab_size);
+        const auto &shared = policy.forRank(0);
+        ASSERT_EQ(shared.d_ff_count, 384);
+        const auto exactWidth = [&](int first, int last, MTPShiftedKVHeadLayout layout) {
+            const auto geometry = MoEIntermediateShardArenaGeometry::resolve(source, 2, 0, shared,
+                first, last, GPUExpertIntermediateTiling::Coarse128, layout);
+            GraphResolverConfig resolver;
+            geometry.bindResolver(resolver);
+            EXPECT_EQ(resolver.custom_formulas.at("moe_ffn_intermediate_max"), geometry.scratchIntermediate());
+            EXPECT_EQ(geometry.sharedIntermediate(), 384);
+            EXPECT_LE(geometry.routedIntermediate(), 384);
+            EXPECT_EQ(geometry.routeSlots(), source.expert_used_count);
+            return geometry.scratchIntermediate();
+        };
+        const auto replicated = MTPShiftedKVHeadLayout::FullModelPerParticipant;
+        const auto sharded = MTPShiftedKVHeadLayout::PrimaryTensorParallelShard;
+        EXPECT_EQ(exactWidth(0, 2, replicated), 640);
+        EXPECT_EQ(exactWidth(2, 2, replicated), 640); // PP child owning the retained predictor.
+        EXPECT_EQ(exactWidth(0, 1, replicated), 384); // Another PP child cannot price its roots.
+        EXPECT_EQ(exactWidth(0, 2, sharded), 384); // The sharded policy retains local arithmetic.
+    }
+}
+
+/** @test No layout flags are needed to select the original QFN shard cohorts. */
+TEST(AutomaticOrchestrationCandidates, QFNAutomaticTensorShardsHonorTopologyAndOptOuts)
+{
+    test::Qwen4ExpPlanningGGUFFixture file;
+    PlanningModelSource source(file.path());
+    const auto &qfn = source.metadata();
+    OrchestrationConfig without_predictor;
+    resolveMTPStartupPolicy(without_predictor, qfn.memoryProfile());
+    EXPECT_FALSE(without_predictor.mtp.enabled);
+    OrchestrationConfig with_predictor;
+    const auto predictor = model(true);
+    resolveMTPStartupPolicy(with_predictor, predictor.memoryProfile());
+    EXPECT_TRUE(with_predictor.mtp.enabled);
+    EXPECT_EQ(with_predictor.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
+    OrchestrationConfig disabled;
+    disabled.mtp_activation_policy = MTPActivationPolicy::Disabled;
+    resolveMTPStartupPolicy(disabled, predictor.memoryProfile());
+    EXPECT_FALSE(disabled.mtp.enabled);
+
+    for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
+    {
+        for (const int degree : {2, 3, 4, 8})
+        {
+            auto inventory = hosts(1);
+            cards(inventory, 0, backend, degree);
+            auto config = request({backend}, {OrchestrationStrategy::TensorParallel});
+            config.automatic_planning.device_counts = {{backend, degree}};
+            int selected = 0;
+            visitAutomaticOrchestrationCandidates(config, qfn, inventory, [&](const auto &candidate) {
+                ++selected;
+                const auto &plan = *candidate.config.moe_routed_expert_plan;
+                ASSERT_EQ(plan.domains.size(), 1u);
+                EXPECT_EQ(plan.domains.front().participants.size(), degree);
+                EXPECT_EQ(plan.domains.front().routed_compute_policy, RoutedExpertComputePolicy::TensorSharded);
+                EXPECT_EQ(plan.continuation_domain_spec.effectiveDensePolicy(), DenseParallelPolicy::TensorParallel);
+                EXPECT_EQ(candidate.config.moe_rebalance.mode, MoERebalanceRuntimeMode::Dynamic);
+                EXPECT_EQ(plan.residency_policy, RoutedExpertResidencyPolicy::RoutedTierRebalanced);
+            });
+            EXPECT_EQ(selected, 1) << degree;
+        }
+    }
+
+    auto inventory = hosts(2);
+    inventory.ranks[0].cpu.numa_node = 0;
+    inventory.ranks[1].cpu.numa_node = 1;
+    inventory.ranks[1].node_id = inventory.ranks[0].node_id;
+    inventory.ranks[1].hostname = inventory.ranks[0].hostname;
+    inventory.ranks[1].local_rank = 1;
+    cards(inventory, 0, DeviceType::ROCm, 2);
+    auto config = request({DeviceType::CPU, DeviceType::ROCm}, {OrchestrationStrategy::ExpertOverlay});
+    config.automatic_planning.device_counts = {{DeviceType::CPU, 2}, {DeviceType::ROCm, 2}};
+    for (const auto compute : {RoutedExpertComputePolicy::Automatic, RoutedExpertComputePolicy::Apportioned})
+    {
+        config.routed_expert_compute_policy = compute;
+        if (compute == RoutedExpertComputePolicy::Apportioned)
+        {
+            config.mtp_activation_policy = MTPActivationPolicy::Disabled;
+            config.moe_rebalance.mode = MoERebalanceRuntimeMode::Off;
+        }
+        int selected = 0;
+        visitAutomaticOrchestrationCandidates(config, qfn, inventory, [&](const auto &candidate) {
+            ++selected;
+            const auto &plan = *candidate.config.moe_routed_expert_plan;
+            ASSERT_EQ(plan.domains.size(), 2u);
+            const bool automatic = compute == RoutedExpertComputePolicy::Automatic;
+            EXPECT_EQ(plan.residency_policy, automatic ? RoutedExpertResidencyPolicy::RoutedTierRebalanced
+                                                       : RoutedExpertResidencyPolicy::StaticById);
+            EXPECT_EQ(candidate.config.mtp_activation_policy, config.mtp_activation_policy);
+            for (const auto &domain : plan.domains)
+            {
+                EXPECT_EQ(domain.participants.size(), 2u);
+                EXPECT_EQ(domain.routed_compute_policy, automatic ? RoutedExpertComputePolicy::TensorSharded : compute);
+            }
+        });
+        EXPECT_GT(selected, 0);
+    }
 }

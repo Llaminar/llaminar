@@ -13,6 +13,7 @@
 #include <gtest/gtest.h>
 
 #include "execution/moe/MoEOverlayEconomyProfileComposer.h"
+#include "execution/compute_stages/stages/MoERoutingStage.h"
 #include "execution/moe/MoEGroupedVerifierHistogramBoundarySet.h"
 
 #include <array>
@@ -182,6 +183,54 @@ namespace llaminar2::test
         EXPECT_EQ(resolution.publishers[0], &layer_zero);
         EXPECT_EQ(resolution.publishers[1], &layer_one);
         EXPECT_EQ(resolution.publication_stream, stream);
+    }
+
+    /** @brief Mapped verifier replays leave executed-row demand to the original root. */
+    TEST(MoEGroupedVerifierHistogramBoundarySet, MappedVerifierUsesOnlyTheOriginalDispatchRoot)
+    {
+        for (const auto mode : {MoERebalanceRuntimeMode::Off,
+                                MoERebalanceRuntimeMode::Observe,
+                                MoERebalanceRuntimeMode::Dynamic})
+        {
+            const bool collect = mode != MoERebalanceRuntimeMode::Off;
+            EXPECT_EQ(selectMappedMoEVerifierHistogramRole(false, collect),
+                      MoEGroupedVerifierHistogramRole::NotOwner);
+            for (const auto device : {DeviceId::cuda(0), DeviceId::rocm(0)})
+            {
+                for (int width : {2, 4, 2})
+                {
+                    int ticket_publishers = 0;
+                    for (int participant : {2, 5})
+                    {
+                        // Nonzero original root and peer each get a complete
+                        // verifier graph without a local expert FFN stage.
+                        ticket_publishers += collect &&
+                            selectMoEContinuationHistogramProducerRole(participant, 5) ==
+                                MoERuntimeHistogramProducerRole::ProductionDecode;
+                        MoERoutingStage::Params params;
+                        params.device_id = device;
+                        params.seq_len = width;
+                        params.layer_idx = 46;
+                        params.grouped_verifier_histogram_role =
+                            selectMappedMoEVerifierHistogramRole(true, collect);
+                        MoERoutingStage router(std::move(params));
+                        EXPECT_EQ(router.groupedVerifierHistogramRole(), collect
+                            ? MoEGroupedVerifierHistogramRole::MappedTicketNoAcceptedPublication
+                            : MoEGroupedVerifierHistogramRole::StaticNoPublication);
+
+                        MoEGroupedVerifierHistogramBoundarySet boundaries;
+                        MoEGroupedVerifierHistogramBoundaryResolution resolution;
+                        std::string error;
+                        ASSERT_TRUE(boundaries.registerRoutedLayer(46, "mapped_router", &error));
+                        ASSERT_TRUE(boundaries.registerStage(&router, "mapped_router", &error));
+                        ASSERT_TRUE(boundaries.resolve(resolution, &error)) << error;
+                        EXPECT_TRUE(resolution.publishers.empty());
+                        EXPECT_EQ(resolution.publication_stream, nullptr);
+                    }
+                    EXPECT_EQ(ticket_publishers, collect ? 1 : 0);
+                }
+            }
+        }
     }
 
     /**

@@ -9,6 +9,7 @@
  * preparation must not borrow a price from another format or participant.
  */
 
+#include "execution/InferenceMeasurementReadiness.h"
 #include "execution/moe/MoEOverlayEconomyCalibrationController.h"
 #include "execution/moe/MoEOverlayEconomyCertificationController.h"
 #include "execution/moe/MoEOverlayEconomyEvidenceExchange.h"
@@ -1547,3 +1548,28 @@ namespace llaminar2::test
 } // namespace llaminar2::test
 
 #include "CalibrationCoordinateIdentityContract.inc"
+
+/** @test Replay asynchronous progress, including repeated terminal counts before publication. */
+TEST(InferencePreparationProgress, SealingACalibrationReportsTheFinalSampleOnce)
+{
+    using namespace llaminar2;
+    InferenceMeasurementReadiness current{.state = InferenceMeasurementReadinessState::Calibrating,
+        .required_work_units = 103, .owner = "expert_overlay_economy", .phase = "calibrating_movement"};
+    auto reported = current;
+    current.completed_work_units = 9;
+    EXPECT_FALSE(current.crossedProgressMilestone(reported));
+    current.completed_work_units = 10;
+    EXPECT_TRUE(current.crossedProgressMilestone(reported));
+    reported.completed_work_units = 100;
+    current.completed_work_units = 103;
+    EXPECT_TRUE(current.crossedProgressMilestone(reported));
+    reported = current;
+    for (int poll = 0; poll < 32; ++poll)
+        EXPECT_FALSE(current.crossedProgressMilestone(reported));
+    EXPECT_FALSE(current.ready());
+    current.phase = "publishing";
+    EXPECT_TRUE(current.crossedProgressMilestone(reported));
+    reported = current;
+    current.required_work_units = 104;
+    EXPECT_TRUE(current.crossedProgressMilestone(reported));
+}

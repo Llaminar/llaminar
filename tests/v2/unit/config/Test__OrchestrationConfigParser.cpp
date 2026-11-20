@@ -1692,6 +1692,10 @@ TEST(Test__OrchestrationConfigParser, GetHelpText_ContainsKeyOptions)
     EXPECT_TRUE(help.find("--backend") != std::string::npos);
     EXPECT_TRUE(help.find("--config") != std::string::npos);
     EXPECT_TRUE(help.find("--moe-routed-expert-compute") != std::string::npos);
+    EXPECT_NE(help.find("With --auto, MoE planning defaults to tensor-sharded"), std::string::npos);
+    EXPECT_NE(help.find("same-node GPU TP plus CPU TP"), std::string::npos);
+    EXPECT_NE(help.find("Manually declared placement follows its domain policies"), std::string::npos);
+    EXPECT_EQ(help.find("projection ownership for one homogeneous LocalTP GPU tier"), std::string::npos);
     EXPECT_TRUE(help.find("--moe-routed-expert-owner-order") != std::string::npos);
     EXPECT_TRUE(help.find("--moe-routed-expert-placement") != std::string::npos);
     EXPECT_TRUE(help.find("--moe-routed-expert-domain") != std::string::npos);

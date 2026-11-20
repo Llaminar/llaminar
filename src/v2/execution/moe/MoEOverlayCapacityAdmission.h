@@ -215,6 +215,7 @@ namespace llaminar2
         DeviceTransferDirectory,
         PhysicalResidencyFabric,
         NoPeer, ///< Dynamic is retained; singleton geometry owns no movement storage.
+        StationaryTensorShard, ///< A complete GPU cohort is the only routed placement target.
     };
 
     /** @return Stable diagnostic name for one migration storage lifecycle. */
@@ -227,6 +228,8 @@ namespace llaminar2
             return "disabled";
         case MoEOverlayMigrationStorageKind::NoPeer:
             return "no_peer";
+        case MoEOverlayMigrationStorageKind::StationaryTensorShard:
+            return "stationary_tensor_shard";
         case MoEOverlayMigrationStorageKind::DeviceTransferDirectory:
             return "device_transfer_directory";
         case MoEOverlayMigrationStorageKind::PhysicalResidencyFabric:

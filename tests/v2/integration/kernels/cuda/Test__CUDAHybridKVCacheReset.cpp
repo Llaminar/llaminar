@@ -32,6 +32,7 @@
 #include "kernels/KernelFactory.h"
 #include "kernels/cuda/kvcache/CUDARingKVCache.h"
 #include "planning/PhysicalMemoryAuthority.h"
+#include "transfer/TransferEngine.h"
 #include "tensors/SIMDHelpers.h"
 #include "tensors/TensorKernels.h"
 #include "tensors/Tensors.h"
@@ -951,6 +952,55 @@ TEST(Test__CUDAHybridKVCacheReset, HostStagedHybridPrefixStateSerializesOnlyDevi
         staged_payload.begin()));
 }
 
+/** @brief Replay a saved sharded prefix and verify its exact contiguous device extent. */
+TEST(Test__CUDAHybridKVCacheReset, ShardedPrefixReplaysOnlyLocalGDNBanks)
+{
+    if (!hasCUDA())
+        GTEST_SKIP() << "CUDA not available";
+
+    auto config = makeShardedHybridConfig();
+    config.device_banks = llaminar2::GDNDeviceBankPolicy::LocalOnly;
+    auto source = createHybridCache(config);
+    auto target = createHybridCache(config);
+    const auto geometry = config.gdnStateGeometry();
+    const auto metadata = source.hybrid->hybridPrefixStateMetadata();
+    const size_t expected_bytes = config.countGDNLayers() * sizeof(float) *
+        (geometry.local_conv_state_floats + geometry.local_recurrence_state_floats);
+    ASSERT_GT(expected_bytes, 0u);
+    ASSERT_EQ(metadata.device_bytes, expected_bytes);
+    ASSERT_EQ(source.hybrid->gdnMemoryBytes(), geometry.deviceArenaBytes(config.countGDNLayers(), 1));
+
+    CudaStream stream;
+    const auto *state = source.hybrid->getGDNState(0);
+    ASSERT_NE(state, nullptr);
+    EXPECT_EQ(state->full_conv_state_size, 0);
+    EXPECT_EQ(state->full_recurrence_state_size, 0);
+    const auto conv = statePattern(geometry.local_conv_state_floats, 100.0f);
+    const auto recurrence = statePattern(geometry.local_recurrence_state_floats, 200.0f);
+    ASSERT_TRUE(state->conv_kernel->importStateForSize(
+        geometry.local_conv_state_floats, conv.data(), nullptr, stream.opaque()));
+    ASSERT_TRUE(state->rec_kernel->importStateForSize(
+        geometry.local_recurrence_state_floats, recurrence.data(), nullptr, stream.opaque()));
+
+    llaminar2::HybridPrefixStateDescriptor desc;
+    desc.logical_token_count = 4;
+    desc.include_host_state = false;
+    desc.stream = stream.opaque();
+    std::vector<uint8_t> archive(expected_bytes + 256u, 0xCD);
+    ASSERT_TRUE(source.hybrid->exportHybridPrefixState(desc, archive.data(), nullptr));
+    EXPECT_TRUE(std::all_of(archive.begin() + expected_bytes, archive.end(),
+        [](uint8_t value) { return value == 0xCD; }));
+    for (int replay = 0; replay < 2; ++replay)
+    {
+        ASSERT_TRUE(target.owner->resetRequestState(
+            llaminar2::IKVCache::StateResetContext::testReinitialization(stream.opaque())));
+        ASSERT_TRUE(target.hybrid->importHybridPrefixState(desc, archive.data(), nullptr));
+        std::vector<uint8_t> restored(expected_bytes);
+        ASSERT_TRUE(target.hybrid->exportHybridPrefixState(desc, restored.data(), nullptr));
+        EXPECT_TRUE(std::equal(restored.begin(), restored.end(), archive.begin()));
+    }
+}
+
 TEST(Test__CUDAHybridKVCacheReset, AsyncDeviceOnlyHybridPrefixStateRoundTripRestoresAfterExplicitStreamSync)
 {
     if (!hasCUDA())
@@ -1346,15 +1396,11 @@ TEST(Test__CUDAHybridKVCacheReset, ConvertedResidentReadAllFormatsUsesCompressed
             max_seq_len,
             n_kv_heads,
             head_dim);
-        llaminar::v2::kernels::KVCacheConfig oracle_config;
-        oracle_config.precision = precision;
-        oracle_config.device = llaminar2::DeviceId::cuda(0);
-        oracle_config.num_layers = 1;
-        oracle_config.batch_size = 1;
-        oracle_config.max_seq_len = max_seq_len;
-        oracle_config.n_kv_heads = n_kv_heads;
-        oracle_config.head_dim = head_dim;
-        auto oracle_cache = KernelFactory::createKVCache(oracle_config);
+        // Match the native hybrid storage format. The generic nonhybrid
+        // factory interprets Q8_1 as a request for TurboQuant.
+        auto oracle_cache = llaminar2::createCUDARingKVCache(
+            precision, /*n_layers=*/1, /*batch_size=*/1, max_seq_len,
+            n_kv_heads, head_dim, /*device_id=*/0);
         ASSERT_NE(oracle_cache, nullptr);
 
         auto *workspace_consumer =
@@ -1397,6 +1443,12 @@ TEST(Test__CUDAHybridKVCacheReset, ConvertedResidentReadAllFormatsUsesCompressed
         auto fourth_v_tensor = makeNativeCacheTensor(
             precision, fourth_v, token_count, n_kv_heads * head_dim);
         CudaStream stream;
+        // The cache consumes resident K/V on the producer stream. Prepare
+        // the fixture inputs before exercising the actual append contract.
+        const auto device = llaminar2::DeviceId::cuda(0);
+        for (auto *input : {first_k_tensor.get(), first_v_tensor.get(),
+                            fourth_k_tensor.get(), fourth_v_tensor.get()})
+            llaminar2::TransferEngine::prepareDeviceInput(input, device, stream.opaque());
 
         ASSERT_TRUE(cache.owner->appendWithStream(
             global_first_fa_layer,

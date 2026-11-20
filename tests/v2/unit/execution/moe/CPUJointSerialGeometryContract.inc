@@ -10,6 +10,8 @@
 #include "collective/NativeCPUCollectiveProgram.h"
 #include "collective/backends/ShmemSpinBackend.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
+#include "execution/moe/MoEOverlayActivationPacketABI.h"
+#include "execution/moe/MoEOverlayNodeLocalRouteExchange.h"
 namespace llaminar2 {
 namespace {
 ExpertWeightFormat serialSourceFormat(const char* name) {
@@ -31,6 +33,25 @@ std::vector<MoEOverlayLayerWeightManifest> serialActualClasses() {
  return {serialSourceLayer(0,"Q4_K","Q5_1"),serialSourceLayer(1,"Q4_K","Q8_0"),serialSourceLayer(2,"Q5_K","Q8_0")};
 }
 }
+/** @test Mapped CPU ingress exists only at the canonical root of a mixed cohort. */
+TEST(MixedContinuationRoutes, SameCanonicalBankOnRootAndPeerWithDifferentTicketIngress)
+{
+    using Source = MoEExternalCanonicalRouteSource;
+    using Ownership = MoENodeLocalRouteOwnership;
+    EXPECT_EQ(continuationExternalCanonicalRouteSource(Ownership::ContinuationCohort, true, false),
+              Source::RootCanonicalRouteBank);
+    EXPECT_EQ(continuationExternalCanonicalRouteSource(Ownership::ContinuationCohort, false, true),
+              Source::RootCanonicalRouteBank);
+    EXPECT_EQ(continuationExternalCanonicalRouteSource(Ownership::ContinuationCohort, false, false),
+              Source::RootCanonicalRouteBank);
+    EXPECT_EQ(continuationExternalCanonicalRouteSource(Ownership::ExclusiveParticipant, false, false),
+              Source::DeferredDenseMerge);
+    EXPECT_EQ(continuationExternalCanonicalRouteSource(Ownership::ExclusiveParticipant, true, false),
+              Source::RootCanonicalRouteBank);
+    EXPECT_EQ(continuationExternalCanonicalRouteSource(Ownership::ExclusiveParticipant, false, true),
+              Source::RootCanonicalRouteBank);
+}
+
 TEST(CPUJointSerialGeometry, ActualMixedClassesRetainNativeUnequalPiecesAndNUMARootsThroughEight) {
  const auto layers=serialActualClasses();
  for(int count=2;count<=8;++count) {
@@ -208,7 +229,7 @@ TEST(CPUJointSerialGeometry, OriginalJointRootPublishesOneMappedBankUnderExactCo
   EXPECT_LE(smaller->physicalBytes(),mapped->physicalBytes());EXPECT_LE(smaller->workspaceBytes(),mapped->workspaceBytes());
  }
 }
-/** @test Contributors retain only local partial records; missing metadata-only GPU return never creates another matrix. */
+/** @test Colocated contributors use the original local roots and never allocate mapped canonical output. */
 TEST(CPUJointSerialGeometry, JointContributorCannotDuplicateRootMappedPublication) {
  const auto layers=serialActualClasses();
  for(const int count:{2,3,4,8}) {
@@ -222,8 +243,14 @@ TEST(CPUJointSerialGeometry, JointContributorCannotDuplicateRootMappedPublicatio
    EXPECT_FALSE(layout->jointRoutes()->ranges());EXPECT_FALSE(layout->jointRoutes()->maps());EXPECT_FALSE(layout->jointRoutes()->required());
    EXPECT_EQ(layout->jointRoutes()->packed().capacity(),1u+8u*8u*2561u);
    for(const auto consumer:{DeviceId::cuda(0),DeviceId::rocm(0)}) {
-    try{(void)local.forController(consumer);FAIL()<<"A contributor cannot own a duplicate mapped matrix";}
-    catch(const std::invalid_argument& error){EXPECT_NE(std::string(error.what()).find("metadata-only ticket"),std::string::npos);}
+    const auto contributor = local.forController(consumer);
+    EXPECT_FALSE(contributor->canonical());
+    EXPECT_FALSE(contributor->mappedCanonical());
+    EXPECT_EQ(contributor->physicalBytes(), layout->physicalBytes());
+    EXPECT_EQ(contributor->jointRoutes(), layout->jointRoutes());
+    const auto materialized = local.projectLocal(8, 1, std::nullopt);
+    EXPECT_EQ(materialized->physicalBytes(), contributor->physicalBytes());
+    EXPECT_THROW((void)local.projectLocal(8, 1, consumer), std::invalid_argument);
    }
   }
   const CPUJointExpertRouteStorageLayout root(cohort,0,8,8);
@@ -391,4 +418,74 @@ TEST(CPUJointSerialGeometry, DynamicShadowBOMUsesOriginalMemberCutsForEveryForma
         }
     }
 }
+/** @test Automatic native CPU backend selection retains original cross-socket order. */
+TEST(CPUJointSerialGeometry, BoundAutoCPUExpertDomainMatchesNativeQuoteInBothRankOrders)
+{
+    for (const bool reverse : {false,true})
+    {
+        const std::vector<NativeCPUCollectiveProgram::Participant> members{
+            {reverse ? 1 : 0, GlobalDeviceAddress::cpu(0,"original-node")},
+            {reverse ? 0 : 1, GlobalDeviceAddress::cpu(1,"original-node")}};
+        const auto automatic = NativeCPUCollectiveProgram::forBoundExpertShardDomain(
+            1, CollectiveBackendType::AUTO, members);
+        EXPECT_EQ(automatic, NativeCPUCollectiveProgram::expertShardRoutePartials(
+            1, CollectiveBackendType::MPI, members));
+        EXPECT_EQ(automatic.participants().front().world_rank, members.front().world_rank);
+        EXPECT_EQ(automatic.participants().front().address.numa_node, 0);
+        for (const auto backend : {CollectiveBackendType::UPI,CollectiveBackendType::MPI})
+            EXPECT_EQ(NativeCPUCollectiveProgram::forBoundExpertShardDomain(1,backend,members),
+                      NativeCPUCollectiveProgram::expertShardRoutePartials(1,backend,members));
+        EXPECT_THROW(NativeCPUCollectiveProgram::forBoundExpertShardDomain(
+            1, CollectiveBackendType::HOST, members), std::invalid_argument);
+    }
+}
+
+/** @test Each physical GPU rank sees the original CPU role, including reversed socket order. */
+TEST(CPUJointSerialGeometry, ColocatedJointReturnKeepsOriginalRootAcrossRankOrders)
+{
+    const auto layers = serialActualClasses();
+    for (const bool reverse : {false, true})
+    {
+        auto members = serialMembers(2);
+        for (int member = 0; member < 2; ++member)
+            members[member].world_rank = reverse ? 1 - member : member;
+        const auto cohort = CPUJointExpertRouteStorageLayout::checkedSerialCohort(layers, {512,2560,640}, members);
+        for (const auto gpu : {DeviceId::cuda(0), DeviceId::rocm(0)})
+            for (int gpu_rank = 0; gpu_rank < 2; ++gpu_rank)
+            {
+                SCOPED_TRACE(::testing::Message() << reverse << "/" << gpu.toString() << "/" << gpu_rank);
+                const auto local_member = static_cast<size_t>(reverse ? 1 - gpu_rank : gpu_rank);
+                const CPUJointExpertRouteStorageLayout joint(cohort, local_member, 8, 8);
+                auto envelope = std::make_shared<const CPUSerialExpertStorageEnvelope>(
+                    DeviceId::cpu(), 8, 1, 2560, 8, std::vector<int>{8}, 1, 8, joint.isRoot(),
+                    CPUSerialExpertFamilyPolicy::LocalPowerOfTwo, joint.intermediate(), 512, joint);
+                const CPUSerialExpertStorageAdmission admission{
+                    .allocator = {gpu_rank, DeviceId::cpu()},
+                    .participant_ids = {members[local_member].participant_id},
+                    .controller_devices = {gpu},
+                    .envelope = envelope};
+                const auto layout = envelope->projectLocal(8, 1,
+                    joint.isRoot() ? std::optional{gpu} : std::nullopt);
+                EXPECT_EQ(admission.physicalBytes(), layout->physicalBytes());
+                EXPECT_EQ(bool(layout->canonical()), joint.isRoot());
+                EXPECT_EQ(bool(layout->mappedCanonical()), joint.isRoot());
+                ASSERT_TRUE(layout->jointRoutes());
+                EXPECT_EQ(layout->jointRoutes()->rootMember(), 0u);
+                EXPECT_EQ(layout->jointRoutes()->member(), local_member);
+            }
+    }
+
+    MoEOverlayCanonicalRouteTicketControl control;
+    MoEOverlayCanonicalRouteTicketConsumeLaunch completion{
+        .control = &control, .route_capacity = 32, .d_model = 2560,
+        .payload = MoEOverlayCanonicalRouteTicketPayload::ContributorCompletion};
+    EXPECT_TRUE(completion.valid());
+    float forbidden_payload = 0.f;
+    completion.compact_preweighted_contributions_fp32 = &forbidden_payload;
+    EXPECT_FALSE(completion.valid());
+    completion.compact_preweighted_contributions_fp32 = nullptr;
+    completion.payload = MoEOverlayCanonicalRouteTicketPayload::CanonicalRows;
+    EXPECT_FALSE(completion.valid());
+}
+
 } // namespace llaminar2

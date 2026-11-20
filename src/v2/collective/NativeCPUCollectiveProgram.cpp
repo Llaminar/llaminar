@@ -8,6 +8,7 @@
  */
 #include "collective/NativeCPUCollectiveProgram.h"
 #include "app/MPIProcessSession.h"
+#include "config/BackendSelector.h"
 #include <algorithm>
 #include <stdexcept>
 #include <utility>
@@ -94,6 +95,14 @@ NativeCPUCollectiveProgram NativeCPUCollectiveProgram::expertShardRoutePartials(
     }
     return NativeCPUCollectiveProgram(domain,backend,std::move(members));
 }
+NativeCPUCollectiveProgram NativeCPUCollectiveProgram::forBoundExpertShardDomain(
+    int domain, CollectiveBackendType backend, std::vector<Participant> members)
+{
+    const std::vector<DeviceId> devices(members.size(), DeviceId::cpu());
+    return expertShardRoutePartials(domain, BackendSelector::resolve(backend, devices),
+        std::move(members));
+}
+
 void NativeCPUCollectiveProgram::contributeDomainBOM(PhysicalMemoryPlanBuilder& plan,const PhysicalMemoryResource& cpu,int rank) const {
     if(!cpu.valid() || cpu.world_rank!=rank || cpu.device!=DeviceId::cpu() ||
        std::none_of(participants_.begin(),participants_.end(),[&](const auto& p){return p.world_rank==rank;}))

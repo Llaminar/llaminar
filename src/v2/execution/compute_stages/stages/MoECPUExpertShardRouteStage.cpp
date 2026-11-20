@@ -123,7 +123,8 @@ MoECPUExpertShardRouteStage::MoECPUExpertShardRouteStage(Params params)
     if(p.original_tp_owner && p.original_tp_owner.get()!=p.tp)
         throw std::invalid_argument("CPU shard gather has a foreign retained context owner");
     if(p.original_canonical_ticket && (!sparse || !p.original_prepared_layer || !p.original_tp_owner ||
-       p.original_preweighted_routes || !p.original_canonical_ticket->hasValidConstructionIdentity() ||
+       p.original_preweighted_routes || p.original_canonical_ticket->metadataOnly() == root ||
+       !p.original_canonical_ticket->hasValidConstructionIdentity() ||
        p.original_canonical_ticket->layerIndex()!=p.original_source->layer() ||
        p.original_canonical_ticket->dModel()!=p.columns || !p.original_continuation_device.is_gpu() ||
        p.original_canonical_ticket->continuationDevice()!=p.original_continuation_device ||

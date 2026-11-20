@@ -203,6 +203,8 @@ namespace llaminar2
         // Geometry already proves there is no second payload endpoint to price.
         if (MoEOverlayNoPeerResidency::hasNoPeerTopology(plan))
             return MoEOverlayMigrationStorageKind::NoPeer;
+        if (hasStationaryTensorShardTopology(plan))
+            return MoEOverlayMigrationStorageKind::StationaryTensorShard;
 
         if (plan.authority_execution !=
                 MoEOverlayAuthorityExecutionKind::DeviceResident ||
@@ -427,7 +429,8 @@ namespace llaminar2
                  MoEOverlayMigrationStorageKind::DeviceTransferDirectory &&
              policy.migration_storage !=
                  MoEOverlayMigrationStorageKind::PhysicalResidencyFabric &&
-             policy.migration_storage != MoEOverlayMigrationStorageKind::NoPeer))
+             policy.migration_storage != MoEOverlayMigrationStorageKind::NoPeer &&
+             policy.migration_storage != MoEOverlayMigrationStorageKind::StationaryTensorShard))
         {
             throw std::invalid_argument(
                 "ExpertOverlay capacity admission received an invalid migration storage policy");
@@ -435,6 +438,9 @@ namespace llaminar2
         if (policy.migration_storage == MoEOverlayMigrationStorageKind::NoPeer &&
             !MoEOverlayNoPeerResidency::hasNoPeerTopology(plan))
             throw std::invalid_argument("No-peer admission cannot exempt a movable topology");
+        if (policy.migration_storage == MoEOverlayMigrationStorageKind::StationaryTensorShard &&
+            !hasStationaryTensorShardTopology(plan))
+            throw std::invalid_argument("Stationary sharded admission cannot exempt a movable topology");
         if (policy.usesPhysicalResidencyFabric() &&
             (policy.shadow_slots_per_endpoint_layer == 0 ||
              policy.staging_capacity_bytes == 0 ||

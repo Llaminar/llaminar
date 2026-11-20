@@ -177,6 +177,21 @@ namespace llaminar2
         RootCanonicalRouteBank = 2u, ///< Read the materialized root canonical slot.
     };
 
+    /** @brief Which original local participants contribute to an assigned route. */
+    enum class MoENodeLocalRouteOwnership : std::uint32_t
+    {
+        ExclusiveParticipant = 0u, ///< Only the member named by the route assignment.
+        ContinuationCohort = 1u, ///< Every member of the original continuation cohort.
+    };
+
+    /** @return Whether a launch encodes one of the original route ownership policies. */
+    [[nodiscard]] LLAMINAR_MOE_NODE_LOCAL_ROUTE_HD constexpr bool
+    validMoENodeLocalRouteOwnership(MoENodeLocalRouteOwnership policy) noexcept
+    {
+        return policy == MoENodeLocalRouteOwnership::ExclusiveParticipant ||
+               policy == MoENodeLocalRouteOwnership::ContinuationCohort;
+    }
+
     /**
      * @brief Producer launch for sparse mapped route publication.
      *
@@ -192,6 +207,7 @@ namespace llaminar2
         const float *canonical_route_contributions = nullptr;
         MoEDomainRouteAssignmentLedger domain_assignment{};
         std::uint32_t live_route_slots = 0u;
+        MoENodeLocalRouteOwnership ownership = MoENodeLocalRouteOwnership::ExclusiveParticipant;
 
         /** @return Whether the fixed-capacity producer launch is complete. */
         [[nodiscard]] LLAMINAR_MOE_NODE_LOCAL_ROUTE_HD constexpr bool
@@ -199,6 +215,7 @@ namespace llaminar2
         {
             return lane.valid() && canonical_route_contributions != nullptr &&
                    domain_assignment.validFor(live_route_slots) &&
+                   validMoENodeLocalRouteOwnership(ownership) &&
                    live_route_slots <= lane.route_capacity;
         }
     };
@@ -225,6 +242,7 @@ namespace llaminar2
         std::uint32_t physical_rows = 0u;
         std::uint32_t top_k = 0u;
         std::uint32_t d_model = 0u;
+        MoENodeLocalRouteOwnership ownership = MoENodeLocalRouteOwnership::ExclusiveParticipant;
 
         /** @return Whether the root launch has a complete immutable geometry. */
         [[nodiscard]] LLAMINAR_MOE_NODE_LOCAL_ROUTE_HD constexpr bool
@@ -236,6 +254,9 @@ namespace llaminar2
                 validation_status == nullptr ||
                 external_route_source ==
                     MoEExternalCanonicalRouteSource::Unspecified ||
+                !validMoENodeLocalRouteOwnership(ownership) ||
+                (ownership == MoENodeLocalRouteOwnership::ContinuationCohort &&
+                    external_route_source != MoEExternalCanonicalRouteSource::RootCanonicalRouteBank) ||
                 root_participant < 0 || physical_rows == 0u || top_k == 0u ||
                 d_model == 0u)
             {

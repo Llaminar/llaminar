@@ -99,6 +99,7 @@ private:
     int continuationTier_=-1,rootParticipant_=-1;
     std::vector<int> local_,external_;
     bool allExternalNodeLocal_=true,distributed_=false;
+    bool mappedIntermediateShards_=false; ///< The same original mixed topology required by local graph lowering.
     bool rankLocalCrossVendor_=false; ///< Immutable explicit heterogeneous GPU boundary; no CPU service is invented.
 };
 }

@@ -60,9 +60,11 @@ namespace llaminar2
         const bool has_dense_ticket = params_.ticket_storage != nullptr;
         const bool has_canonical_ticket =
             params_.canonical_route_ticket_storage != nullptr;
+        const bool metadata_only = has_canonical_ticket && params_.canonical_route_ticket_storage->metadataOnly();
         if (!params_.device_id.is_gpu() || params_.layer_idx < 0 ||
             params_.bucket_rows <= 0 || params_.d_model <= 0 ||
-            !params_.output || params_.output->native_type() != TensorType::FP32 ||
+            (metadata_only ? params_.output != nullptr :
+                !params_.output || params_.output->native_type() != TensorType::FP32) ||
             has_dense_ticket == has_canonical_ticket)
         {
             return false;
@@ -75,18 +77,16 @@ namespace llaminar2
                 static_cast<size_t>(params_.bucket_rows) *
                 static_cast<size_t>(params_.top_k);
             return params_.top_k > 0 && moe_kernel_ &&
-                   params_.output->numel() >=
-                       route_capacity *
-                           static_cast<size_t>(params_.d_model) &&
+                   (metadata_only || params_.output->numel() >=
+                       route_capacity * static_cast<size_t>(params_.d_model)) &&
                    ticket.hasValidBoundIdentity() &&
                    ticket.continuationDevice() == params_.device_id &&
                    ticket.layerIndex() == params_.layer_idx &&
                    ticket.routeCapacity() == route_capacity &&
                    ticket.dModel() == params_.d_model &&
                    ticket.controlDeviceAlias() &&
-                   ticket.originalRouteSlotsDeviceAlias() &&
-                   ticket.compactRouteSlotsDeviceAlias() &&
-                   ticket.contributionRowsDeviceAlias();
+                   (metadata_only || (ticket.originalRouteSlotsDeviceAlias() &&
+                   ticket.compactRouteSlotsDeviceAlias() && ticket.contributionRowsDeviceAlias()));
         }
 
         if (params_.output->numel() <
@@ -107,7 +107,8 @@ namespace llaminar2
 
     bool MoEOverlayTicketConsumeStage::hasFixedTicketContract() const noexcept
     {
-        return hasStaticTicketContract() && params_.output->gpu_data_ptr();
+        return hasStaticTicketContract() &&
+            (!params_.output || params_.output->gpu_data_ptr());
     }
 
     bool MoEOverlayTicketConsumeStage::execute(IDeviceContext *ctx)
@@ -138,15 +139,17 @@ namespace llaminar2
             MoEOverlayCanonicalRouteTicketConsumeLaunch launch{
                 .control = storage.controlDeviceAlias(),
                 .original_route_slots =
-                    storage.originalRouteSlotsDeviceAlias(),
+                    storage.metadataOnly() ? nullptr : storage.originalRouteSlotsDeviceAlias(),
                 .compact_route_slots =
-                    storage.compactRouteSlotsDeviceAlias(),
+                    storage.metadataOnly() ? nullptr : storage.compactRouteSlotsDeviceAlias(),
                 .compact_preweighted_contributions_fp32 =
                     storage.contributionRowsDeviceAlias(),
                 .canonical_route_contributions_fp32 =
-                    static_cast<float *>(params_.output->gpu_data_ptr()),
+                    params_.output ? static_cast<float *>(params_.output->gpu_data_ptr()) : nullptr,
                 .route_capacity = storage.routeCapacity(),
                 .d_model = params_.d_model,
+                .payload = storage.metadataOnly() ? MoEOverlayCanonicalRouteTicketPayload::ContributorCompletion
+                                                  : MoEOverlayCanonicalRouteTicketPayload::CanonicalRows,
             };
             if (!moe_kernel_ ||
                 !moe_kernel_->consumeMoEOverlayCanonicalRouteTicket(
@@ -155,7 +158,8 @@ namespace llaminar2
                 LOG_ERROR("[MoEOverlayTicketConsumeStage] Failed to enqueue canonical-route ticket materialization");
                 return false;
             }
-            gpuExecution().publish(params_.output);
+            if (params_.output)
+                gpuExecution().publish(params_.output);
             /* This host-side record is emitted while the immutable kernel node
              * is installed into a native graph (or during an explicit direct
              * diagnostic invocation). Replays execute wholly on device; their

@@ -76,7 +76,8 @@ namespace llaminar2
             WeightDimensionType dimension,
             const ModelMemoryProfile &profile,
             const DeviceShardingAssignment &assignment,
-            const std::string &tensor_name)
+            const std::string &tensor_name,
+            std::optional<int> source_ffn = std::nullopt)
         {
             const auto checked = [&tensor_name](
                                      int start,
@@ -119,7 +120,7 @@ namespace llaminar2
                 return checked(
                     assignment.d_ff_start,
                     assignment.d_ff_count,
-                    profile.d_ff,
+                    source_ffn.value_or(profile.d_ff),
                     "FFN");
             case WeightDimensionType::Vocab:
                 return checked(
@@ -272,6 +273,19 @@ namespace llaminar2
         }
     }
 
+    std::optional<int> originalSharedFFNWidth(WeightRole role, size_t rows, size_t columns,
+        std::optional<int> native_shared_ffn_width)
+    {
+        if (!native_shared_ffn_width ||
+            (role != WeightRole::SharedExpertGate && role != WeightRole::SharedExpertUp &&
+             role != WeightRole::SharedExpertDown))
+            return std::nullopt;
+        const size_t width = role == WeightRole::SharedExpertDown ? columns : rows;
+        if (*native_shared_ffn_width <= 0 || width != static_cast<size_t>(*native_shared_ffn_width))
+            throw std::invalid_argument("Native shared FFN assignment changed its original source axis");
+        return native_shared_ffn_width;
+    }
+
     WeightShardGeometryResolver::WeightShardGeometryResolver(
         const ModelMemoryProfile &profile, DeviceId device, int shard_index, int total_shards,
         const std::optional<DeviceShardingAssignment> &assignment)
@@ -399,8 +413,11 @@ namespace llaminar2
         if (expert)
             throw std::invalid_argument("Whole expert ownership cannot be replaced by N/K sharding");
 
+        const auto source_ffn = assignment && dimension == WeightDimensionType::FFNHidden && matrix
+            ? originalSharedFFNWidth(role, matrix->rows, matrix->columns, assignment->native_shared_ffn_width)
+            : std::nullopt;
         const auto interval = assignment
-            ? logicalShardInterval(dimension, profile, *assignment, tensor.name)
+            ? logicalShardInterval(dimension, profile, *assignment, tensor.name, source_ffn)
             : equalSchemaInterval(dimension, profile, shard_index, total_shards, tensor.name);
         if (dimension == WeightDimensionType::FusedQKVHeads)
         {

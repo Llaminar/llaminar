@@ -68,6 +68,7 @@ struct WorkspaceMemoryGeometry
     bool has_exact_tensor_parallel_assignment = false; ///< Local ranges below are authoritative.
     int local_d_ff = 0; ///< Dense FFN output width owned locally.
     int local_d_ff_start = 0; ///< First global dense-FFN column owned locally.
+    std::optional<int> native_shared_ffn_width; ///< Exact source axis for an explicitly native shared assignment.
     int local_query_head_start = 0; ///< First global query head owned locally.
     int local_query_heads = 0; ///< Exact participant-local query heads.
     int local_kv_head_start = 0; ///< First global KV head owned locally.

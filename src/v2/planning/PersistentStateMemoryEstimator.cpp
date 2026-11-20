@@ -111,7 +111,8 @@ namespace llaminar2
         int first_layer,
         int last_layer,
         const std::string &kv_precision,
-        MTPStateRole mtp_role)
+        MTPStateRole mtp_role,
+        GDNDeviceBankPolicy device_banks)
     {
         if (mtp_role != MTPStateRole::Disabled &&
             mtp_role != MTPStateRole::MainModelFollower &&
@@ -215,7 +216,9 @@ namespace llaminar2
                 profile.gdn_time_step_rank,
                 profile.gdn_state_size,
                 profile.gdn_inner_size,
-                profile.gdn_conv_kernel_size);
+                profile.gdn_conv_kernel_size,
+                GDNRecurrenceStateLayout::KeyMajorValueContiguous,
+                device_banks);
             if (device.is_gpu())
             {
                 result.live_recurrent_state_bytes =

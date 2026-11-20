@@ -18,6 +18,7 @@
 #include "planning/PhysicalMemoryAuthority.h"
 #include "execution/mpi_orchestration/IExecutionPlanBuilder.h"
 #include "execution/mtp/MTPWeightManifest.h"
+#include "execution/moe/MoEExpertShardCohort.h"
 #include "loaders/ModelLoader.h"
 #include "loaders/WeightIdentity.h"
 #include "loaders/NativeWeightLoadStaging.h"
@@ -110,6 +111,33 @@ namespace llaminar2
 
     std::span<const size_t> PlanningModelMetadata::layerTensorIndices(int layer) const
     { return source_index_->layerTensorIndices(layer); }
+
+    bool supportsOriginalRoutedIntermediateShardDegree(
+        const PlanningModelMetadata &model, int degree, bool gpu)
+    {
+        const auto &profile = model.memoryProfile();
+        bool has_original_down = false;
+        for (std::size_t i = 0; i < profile.tensors.size(); ++i)
+        {
+            const auto original = model.classifiedTensor(i);
+            if (original.role() != WeightRole::MoEExpertDown)
+                continue;
+            const auto &tensor = original.tensor();
+            ExpertWeightFormat format;
+            if (const auto *native = native_quantised_formats::forQuantType(tensor.quant_type))
+                format = ExpertWeightFormat::nativeQuantised({native->codebook_id, native->is_superblock, true});
+            else if (tensor.quant_type == "F32")
+                format = ExpertWeightFormat::floating(TensorType::FP32);
+            else if (tensor.quant_type == "F16" || tensor.quant_type == "FP16")
+                format = ExpertWeightFormat::floating(TensorType::FP16);
+            else if (tensor.quant_type == "BF16")
+                format = ExpertWeightFormat::floating(TensorType::BF16);
+            if (!MoEExpertShardCohort::supportsIntermediateDegree(tensor.K, format, degree, gpu))
+                return false;
+            has_original_down = true;
+        }
+        return has_original_down;
+    }
 
     std::optional<size_t> PlanningModelMetadata::firstTensorWithRole(WeightRole role) const noexcept
     { return source_index_->firstTensorWithRole(role); }

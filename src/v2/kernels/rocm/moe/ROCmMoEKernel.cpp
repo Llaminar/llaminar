@@ -9488,7 +9488,7 @@ namespace llaminar2
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::GEMM_FFN, static_cast<hipStream_t>(getStream()));
 
         if (!input || gateup_descriptor_table_id < 0 ||
-            down_descriptor_table_id < 0 || top_k <= 0 || !output ||
+            down_descriptor_table_id < 0 || top_k <= 0 || (!output && !canonical_route_contributions) ||
             d_model <= 0 || intermediate <= 0)
         {
             return false;
@@ -9682,7 +9682,7 @@ namespace llaminar2
                 publication_output->gpu_data_ptr());
         }
         const auto* down_completion=downCompletionForCall(down_descriptor_table_id,top_k);
-        if(down_completion&&(!canonical_route_contributions||floating))
+        if(down_completion&&(!output||!canonical_route_contributions||floating))
             throw std::logic_error("Down completion requires both original canonical route and routed output planes");
         float *d_output = canonical_route_contributions
                               ? nullptr

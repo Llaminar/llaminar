@@ -5279,6 +5279,10 @@ namespace llaminar2
             return false;
         }
 
+        if (moe.expert_overlay_residency_authority &&
+            moe.expert_overlay_residency_authority->stationaryTensorShardResidency())
+            return false;
+
         /* A one-participant tier has no peer to rebalance with. Treating its
          * Dynamic policy as active would require a collective maintenance
          * graph that cannot perform any movement and would turn an intentional
@@ -16517,6 +16521,9 @@ namespace llaminar2
                 hybrid_config_storage->recurrence_layout = gdnRecurrenceStateLayoutForDevice(
                     device, debugEnv().execution.cuda_gdn_state_layout,
                     debugEnv().execution.rocm_gdn_state_layout);
+                hybrid_config_storage->device_banks = use_replicated_attention_state_cache
+                    ? GDNDeviceBankPolicy::LocalAndMirrored
+                    : GDNDeviceBankPolicy::LocalOnly;
                 hybrid_config_storage->first_layer_index = kv_config.first_layer_index;
                 const int first_layer = std::max(0, kv_config.first_layer_index);
                 const int layer_count = std::max(0, kv_config.num_layers);
