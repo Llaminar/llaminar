@@ -242,7 +242,11 @@ cache action and bind the verified NEON manifest to each source build. A
 cold ARM64 job checkpoints the CUDA SDK in the Actions cache under
 `llaminar-gpu-sdk-neon` and saves the complete OCI toolchain before compiling
 Llaminar. The ARM64 PR job also imports and exports its test-runner layers
-under `llaminar-build-neon-pr` on the PR merge ref. The runtime export reuses
+under `llaminar-build-neon-pr` on the PR merge ref. A separate Actions
+cache transfers the shared 5 GB ccache mount across revisions of the
+same PR with the same verified NEON toolchain. The cache key identifies
+the source tree and its restore prefix identifies the toolchain manifest.
+The runtime export reuses
 that job's local BuildKit layers. The ARM64 publication job imports and
 exports `ghcr.io/llaminar/llaminar:build-cache-develop-neon`. ARM64 PRs read
 that registry cache without writing to it.

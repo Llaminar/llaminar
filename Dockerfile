@@ -490,7 +490,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
         integration_started_epoch="$(date +%s)"; \
         arm64_cmake_args=""; \
         if [ "${TARGETARCH}" = "arm64" ]; then \
-            export CCACHE_MAXSIZE=1G; \
+            export CCACHE_MAXSIZE=5G; \
             arm64_cmake_args="-DUSE_ONNX_HEURISTIC=OFF"; \
         fi; \
         rocm_gpu_targets="$(bash scripts/docker/rocm-image-targets.sh "${ROCM_RUNTIME_GPU_TARGETS}")" || exit 1; \
@@ -559,7 +559,7 @@ RUN --mount=type=cache,id=llaminar-ccache,target=/root/.ccache,sharing=locked \
     release_started_epoch="$(date +%s)"; \
     arm64_cmake_args=""; \
     if [ "${TARGETARCH}" = "arm64" ]; then \
-        export CCACHE_MAXSIZE=1G; \
+        export CCACHE_MAXSIZE=5G; \
         arm64_cmake_args="-DUSE_ONNX_HEURISTIC=OFF"; \
     fi; \
     rocm_gpu_targets="$(bash scripts/docker/rocm-image-targets.sh "${ROCM_RUNTIME_GPU_TARGETS}")" || exit 1; \
