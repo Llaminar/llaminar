@@ -2138,6 +2138,16 @@ add_v2_routed_expert_policy_unit(
     V2_Unit_MoEOverlayDistributedResidencyProtocol
     unit/execution/moe/Test__MoEOverlayDistributedResidencyProtocol.cpp
 )
+# MXFP4 remote GPU blobs carry exactly one E8M0 byte per block.
+add_v2_test(V2_Integration_MXFP4RemoteGpuProjectionPlanes
+    COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_protocol>
+        --gtest_filter=Test__MoEOverlayDistributedResidencyProtocol.RemoteGpuBlobManifestCarriesTheOneBytePrimaryPlaneOfMXFP4
+    LABELS "V2;Integration;CPU;DeviceFree;ExpertOverlay;Protocol;MXFP4;Regression;ProductionTestPreflight"
+    MPI_PROCS 1
+    NO_MODELS
+    TIMEOUT 30
+)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MXFP4RemoteGpuProjectionPlanes)
 add_v2_test(V2_Integration_MoEPipelineStageResidencyProposal
     COMMAND $<TARGET_FILE:v2_unit_moe_overlay_distributed_residency_protocol>
         --gtest_filter=Test__MoEOverlayDistributedResidencyProtocol.PipelineStageProposalRoundTripAuthenticatesOrigin
