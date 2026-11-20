@@ -180,4 +180,47 @@ namespace llaminar2::test
         EXPECT_EQ(ServingCapacityRequest::authored(1, 1, 0), ServingCapacityRequest::authored(1, 1, 0));
         EXPECT_NE(ServingCapacityRequest::authored(1, 1, 0), ServingCapacityRequest::authored(1, 2, 0));
     }
+
+// =========================================================================
+    // Installed qualification envelope and serve-boundary enforcement (§9.4)
+    // =========================================================================
+
+    TEST(ServingCapacity, InstalledEnvelopePreservesResponsePoolSemantics)
+    {
+        const auto envelope = ServingCapacityQualificationOwner::installedEnvelope();
+        EXPECT_TRUE(envelope.isSelfConsistent());
+        EXPECT_EQ(envelope.maxResidentSlots(), 1);
+        EXPECT_EQ(envelope.maxResponseLeases(), 32);
+        EXPECT_EQ(envelope.maxQueueCapacity(), 31); // Q = R - S: active + queued <= 32
+    }
+
+    TEST(ServingCapacity, InstalledResolutionPreservesAutomaticSemantics)
+    {
+        const auto resolved = resolveInstalledServingCapacity(ServingCapacityRequest::automatic());
+        EXPECT_EQ(resolved.residentSlots(), 1);
+        EXPECT_EQ(resolved.responseLeases(), 32);
+        EXPECT_EQ(resolved.queueCapacity(), 31);
+        // Active + queued totals inside the preserved pool:
+        EXPECT_TRUE(resolved.admits(31, 1, 0));   // 31 queued + 1 attached = 32
+        EXPECT_TRUE(resolved.admits(0, 1, 31));   // detached deliveries use leases too
+        EXPECT_FALSE(resolved.admits(31, 1, 1));  // total 33 exceeds pool
+        EXPECT_FALSE(resolved.admits(32, 0, 0));  // queue axis exceeds Q
+    }
+
+    TEST(ServingCapacity, InstalledResolutionAcceptsExactAuthoredWithinEnvelope)
+    {
+        const auto resolved = resolveInstalledServingCapacity(ServingCapacityRequest::authored(1, 32, 31));
+        EXPECT_EQ(resolved.responseLeases(), 32);
+        EXPECT_EQ(resolved.queueCapacity(), 31);
+    }
+
+    TEST(ServingCapacity, InstalledResolutionRejectsUnqualifiedAuthoring)
+    {
+        EXPECT_THROW(resolveInstalledServingCapacity(ServingCapacityRequest::authored(2, 33, 31)),
+                     ServingCapacityUnqualified); // resident > 1
+        EXPECT_THROW(resolveInstalledServingCapacity(ServingCapacityRequest::authored(1, 64, 0)),
+                     ServingCapacityUnqualified); // response leases > pool
+        EXPECT_THROW(resolveInstalledServingCapacity(ServingCapacityRequest::authored(1, 41, 40)),
+                     ServingCapacityUnqualified); // queue > Q bound
+    }
 } // namespace llaminar2::test

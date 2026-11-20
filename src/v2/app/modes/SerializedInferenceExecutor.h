@@ -23,6 +23,8 @@
 #include <type_traits>
 #include <utility>
 
+#include "execution/config/ServingCapacity.h" // kServingResponsePoolCeiling
+
 namespace llaminar2
 {
     /** @brief Bound network waiters without allowing concurrent model execution. */
@@ -31,9 +33,12 @@ namespace llaminar2
         /** @brief Host request ownership only; no model or device state is stored. */
         struct State
         {
-            /** @brief Fix the admission capacity before exposing the worker. */
-            explicit State(std::size_t limit) : capacity(limit) {}
+            /** @brief Fix admission bounds before exposing the worker. */
+            explicit State(std::size_t limit, std::size_t queue_limit)
+                : capacity(limit), queue_capacity(queue_limit) {}
             const std::size_t capacity;
+            /** @brief Maximum accepted responses that are not currently executing. */
+            const std::size_t queue_capacity;
             std::mutex mutex;
             std::condition_variable ready;
             std::deque<std::function<void()>> jobs;
@@ -45,15 +50,25 @@ namespace llaminar2
 
     public:
         /** @brief Maximum accepted generation responses, including queued clients. */
-        static constexpr std::size_t kDefaultCapacity = 32;
+        static constexpr std::size_t kDefaultCapacity = kDefaultServingResponsePool;
+        /**
+         * @brief Default maximum non-executing accepted responses (queue/preparing).
+         *
+         * The qualified capacity-one envelope resolves to Q = R - S: with one
+         * execution-attached response, at most R - S others may be preparing or
+         * queued, preserving the existing "accepted including active and queued
+         * <= R" admission semantics.
+         */
+        static constexpr std::size_t kDefaultQueueCapacity = kDefaultCapacity - 1;
 
         /** @brief Coherent request-executor counters, independent of GPU execution state. */
         struct Snapshot
         {
-            std::size_t capacity;
-            std::size_t admitted;
-            std::size_t queued;
-            bool active;
+            std::size_t capacity;       ///< Response-lease total bound R.
+            std::size_t queue_capacity; ///< Queue/preparing bound Q.
+            std::size_t admitted;       ///< Accepted responses (attached + queued + preparing).
+            std::size_t queued;         ///< Submitted, not yet started.
+            bool active;                ///< The single worker is executing a response.
         };
 
         /** @brief Own one admitted HTTP response and at most one inference submission. */
@@ -105,10 +120,13 @@ namespace llaminar2
 
         /**
          * @brief Start the sole inference thread with explicit bounded admission.
-         * @param capacity Number of accepted generation responses, including active and queued.
+         * @param capacity Number of accepted generation responses (R), including active and queued.
+         * @param queue_capacity Maximum accepted responses that are not currently
+         *        executing (Q); zero allows only the response occupying the worker.
          */
-        explicit SerializedInferenceExecutor(std::size_t capacity = kDefaultCapacity)
-            : state_(std::make_shared<State>(checkedCapacity(capacity))),
+        explicit SerializedInferenceExecutor(std::size_t capacity = kDefaultCapacity,
+                                             std::size_t queue_capacity = kDefaultQueueCapacity)
+            : state_(std::make_shared<State>(checkedCapacity(capacity), checkedQueueCapacity(queue_capacity))),
               worker_([state = state_] { serve(state); }) {}
         /** @brief Drain accepted submissions before model ownership can be released. */
         ~SerializedInferenceExecutor() { shutdown(); }
@@ -117,12 +135,21 @@ namespace llaminar2
 
         /**
          * @brief Reserve one network waiter without blocking an HTTP worker.
+         *
+         * Admission enforces both typed axes: the response-lease total (R) and
+         * the queue/preparing bound (Q). The execution slot occupant (S = 1) is
+         * never counted against Q, so an authored Q = 0 still admits the single
+         * response occupying the worker while refusing additional accepted
+         * responses. With the qualified automatic envelope Q = R - 1 the extra
+         * bound coincides exactly with the total bound, preserving the existing
+         * "accepted including active and queued <= R" behavior.
          * @return Its shared response lifetime, or null for an explicit overload/shutdown response.
          */
         [[nodiscard]] std::shared_ptr<Reservation> tryReserve()
         {
             std::lock_guard lock(state_->mutex);
-            if (state_->stopping || state_->reserved == state_->capacity)
+            if (state_->stopping || state_->reserved >= state_->capacity ||
+                state_->reserved >= 1 + state_->queue_capacity)
                 return {};
             auto result = std::make_shared<Reservation>(Reservation::ConstructionKey{}, state_);
             ++state_->reserved;
@@ -136,7 +163,8 @@ namespace llaminar2
         [[nodiscard]] Snapshot snapshot() const
         {
             std::lock_guard lock(state_->mutex);
-            return {state_->capacity, state_->reserved, state_->jobs.size(), state_->active};
+            return {state_->capacity, state_->queue_capacity, state_->reserved, state_->jobs.size(),
+                    state_->active};
         }
 
         /** @brief Reject new submissions and join all previously submitted work. */
@@ -155,9 +183,19 @@ namespace llaminar2
         /** @brief Reject invalid capacity before constructing any worker or pool. */
         static std::size_t checkedCapacity(std::size_t capacity)
         {
-            if (capacity == 0 || capacity > 1024)
-                throw std::invalid_argument("HTTP inference capacity must be between 1 and 1024");
+            if (capacity == 0 || capacity > static_cast<std::size_t>(kServingResponsePoolCeiling))
+                throw std::invalid_argument(
+                    "HTTP inference capacity must be between 1 and the installed ceiling (1024)");
             return capacity;
+        }
+
+        /** @brief Reject an invalid queue bound before constructing the worker. */
+        static std::size_t checkedQueueCapacity(std::size_t queue_capacity)
+        {
+            if (queue_capacity > static_cast<std::size_t>(kServingResponsePoolCeiling))
+                throw std::invalid_argument(
+                    "HTTP inference queue capacity must be at most the installed ceiling (1024)");
+            return queue_capacity;
         }
 
         /** @brief Execute FIFO jobs on one thread, retaining ownership through exceptions. */

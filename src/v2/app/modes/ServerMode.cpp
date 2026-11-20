@@ -702,7 +702,26 @@ namespace llaminar2
         std::string model_name = std::filesystem::path(config.model_path).stem().string();
 
         ChatCompletionHandler handler(*runner, *tokenizer, model_name);
-        SerializedInferenceExecutor inference_executor;
+        // Adopted §9.4: one resolved serving capacity backs the execution response
+        // pool. Automatic intent preserves the existing accepted-response
+        // semantics (active + queued <= kDefaultCapacity); authored intent is
+        // exact and rejected when the installed envelope cannot serve it.
+        std::size_t executor_capacity = SerializedInferenceExecutor::kDefaultCapacity;
+        std::size_t executor_queue_capacity = SerializedInferenceExecutor::kDefaultQueueCapacity;
+        try
+        {
+            const auto resolved = resolveInstalledServingCapacity(config.servingCapacityRequest());
+            executor_capacity = static_cast<std::size_t>(resolved.responseLeases());
+            executor_queue_capacity = static_cast<std::size_t>(resolved.queueCapacity());
+        }
+        catch (const std::invalid_argument &error)
+        {
+            std::cerr << "Serving capacity admission failed: " << error.what() << "\n";
+            runner->shutdownMPIWorkers();
+            runner->shutdown();
+            return 1;
+        }
+        SerializedInferenceExecutor inference_executor(executor_capacity, executor_queue_capacity);
         httplib::Server svr;
         g_server_ptr = &svr;
         RequestLogState request_log_state;

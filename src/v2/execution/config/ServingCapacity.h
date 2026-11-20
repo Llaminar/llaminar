@@ -40,6 +40,12 @@
 
 namespace llaminar2
 {
+    /** @brief Canonical preserved serving response pool (accepted including active and queued). */
+    inline constexpr int kDefaultServingResponsePool = 32;
+
+    /** @brief Shared installed serving response-pool ceiling (executor and qualification agree). */
+    inline constexpr int kServingResponsePoolCeiling = 1024;
+
     /** @brief Typed rejection of a structurally valid but unqualified capacity request. */
     class ServingCapacityUnqualified : public std::invalid_argument
     {
@@ -138,13 +144,12 @@ namespace llaminar2
     /**
      * @brief Qualified envelope the implementation is admitted to serve.
      *
-     * The only public factory is `capacityOnePreset()`. There is no public
-     * factory to mint an envelope from arithmetic alone: envelope issuance
-     * belongs to the qualification-policy owner (Phase A-2 wiring), not to a
-     * constructor. The preset is a minimal self-consistent fixture
-     * (S = 1, R = 1, Q = 0) used by the A-1 contract tests; it is not the
-     * current HTTP admission envelope (32 accepted responses including active
-     * and queued), and this file asserts no native/gate certification.
+     * Only the qualification owner may mint a production envelope: a general
+     * public arithmetic factory is deliberately absent. `capacityOnePreset()`
+     * is a minimal self-consistent fixture (S = 1, R = 1, Q = 0) used by the
+     * A-1 contract tests; the installed production envelope is issued through
+     * `ServingCapacityQualificationOwner`. This file asserts no native/gate
+     * certification.
      */
     class ServingCapacityCapability final
     {
@@ -180,13 +185,15 @@ namespace llaminar2
         ServingCapacityCapability &operator=(ServingCapacityCapability &&) = delete;
 
     private:
-        /** @brief Only the preset factory may create an envelope; see capacityOnePreset(). */
+        /** @brief Only the preset and the qualification owner may create an envelope. */
         constexpr explicit ServingCapacityCapability(int max_resident_slots, int max_response_leases,
                                                      int max_queue_capacity) noexcept
             : max_resident_slots_(max_resident_slots), max_response_leases_(max_response_leases),
               max_queue_capacity_(max_queue_capacity)
         {
         }
+
+        friend struct ServingCapacityQualificationOwner;
 
         /** @brief Overflow-checked S + Q for the self-consistency invariant. */
         [[nodiscard]] static constexpr std::int64_t checkedSum(int left, int right) noexcept
@@ -197,6 +204,33 @@ namespace llaminar2
         int max_resident_slots_;
         int max_response_leases_;
         int max_queue_capacity_;
+    };
+
+    /**
+     * @brief Sole owner of the installed qualified serving envelope (Phase A).
+     *
+     * Issuance of a production envelope is restricted to this qualification
+     * owner: the envelope encodes the current implementation's resident-one
+     * bound together with a preserved accepted-response pool (active + queued
+     * total), i.e. the existing HTTP admission semantics. No other general
+     * arithmetic factory exists.
+     */
+    struct ServingCapacityQualificationOwner final
+    {
+        /**
+         * @brief Install the Phase-A envelope for the preserved response pool.
+         *
+         * No arithmetic factory exists: the installed envelope is derived only
+         * from the canonical preserved pool constant (active + queued total of
+         * the existing HTTP executor), so an ordinary caller cannot mint an
+         * envelope for a pool that was never served.
+         * @return S = 1, R = kDefaultServingResponsePool, Q = R - S.
+         */
+        [[nodiscard]] static ServingCapacityCapability installedEnvelope() noexcept
+        {
+            return ServingCapacityCapability(1, kDefaultServingResponsePool,
+                                             kDefaultServingResponsePool - 1);
+        }
     };
 
     /**
@@ -339,5 +373,24 @@ namespace llaminar2
                                              std::to_string(capability.maxResponseLeases()) + ")");
 
         return ResolvedServingCapacity(resident, responses, queue);
+    }
+    /**
+     * @brief Resolve intent against the installed envelope for a preserved pool.
+     *
+     * This is the single enforcement entry: automatic intent resolves to the
+     * installed envelope (behaviour-preserving), authored intent is exact and
+     * is rejected with `ServingCapacityUnqualified` when the installed
+     * envelope cannot serve it (never clamped).
+     *
+     * @param request Immutable authored or automatic intent.
+     * @param http_response_pool Positive preserved accepted-response pool.
+     * @return Immutable resolved ownership counts.
+     * @throws std::invalid_argument For structurally invalid intent or a
+     *         nonpositive pool.
+     * @throws ServingCapacityUnqualified For valid intent outside the envelope.
+     */
+    inline ResolvedServingCapacity resolveInstalledServingCapacity(const ServingCapacityRequest &request)
+    {
+        return resolveServingCapacity(request, ServingCapacityQualificationOwner::installedEnvelope());
     }
 } // namespace llaminar2

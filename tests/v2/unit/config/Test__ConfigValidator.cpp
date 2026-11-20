@@ -873,3 +873,87 @@ TEST(Test__ConfigValidator, NgramHostAdaptiveRamSsdTypedPolicyIsBoundedAndExplic
         EXPECT_TRUE(std::any_of(errors.begin(),errors.end(),[](const auto &e){return e.rule_id=="ngram-storage-policy";}))<<mutation;
     }
 }
+
+// ============================================================================
+// Serving Capacity (§9.4) validation rules
+// ============================================================================
+
+TEST(Test__ConfigValidator, ServingCapacityAbsentIsAutomaticAndValid)
+{
+    const auto validator = ConfigValidator::createStandard();
+    OrchestrationConfig config;
+    const auto errors = validator.validate(config);
+    EXPECT_FALSE(std::any_of(errors.begin(), errors.end(), [](const auto &e) {
+        return e.rule_id == "serving-capacity-all-or-none" || e.rule_id == "serving-capacity-coherent";
+    }));
+}
+
+TEST(Test__ConfigValidator, ServingCapacityPartialAuthoringIsRejected)
+{
+    const auto validator = ConfigValidator::createStandard();
+    for (int axis : {0, 1, 2})
+    {
+        OrchestrationConfig config;
+        if (axis != 0) config.serving_resident_slots = 1;
+        if (axis != 1) config.serving_response_leases = 2;
+        if (axis != 2) config.serving_queue_capacity = 0;
+        const auto errors = validator.validate(config);
+        EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &e) {
+            return e.rule_id == "serving-capacity-all-or-none";
+        })) << "axis=" << axis;
+    }
+}
+
+TEST(Test__ConfigValidator, ServingCapacityAuthoredIntentFailsClosedUntilLeaseLifetime)
+{
+    // §9.4 defines R through detached delivery; until the typed publication
+    // lease (design §4/§10.1) is installed, authored exposure must fail closed
+    // at the shared validation boundary rather than silently ignore selectable
+    // policy (reviewer seq 148-152 dispositions).
+    const auto validator = ConfigValidator::createStandard();
+    OrchestrationConfig config;
+    config.serving_resident_slots = 1;
+    config.serving_response_leases = 1;
+    config.serving_queue_capacity = 0;
+    const auto errors = validator.validate(config);
+    EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &e) {
+        return e.rule_id == "serving-capacity-lease-lifetime";
+    }));
+    EXPECT_FALSE(std::any_of(errors.begin(), errors.end(), [](const auto &e) {
+        return e.rule_id == "serving-capacity-all-or-none" || e.rule_id == "serving-capacity-coherent";
+    }));
+
+    // Automatic intent stays valid.
+    OrchestrationConfig automatic;
+    const auto automatic_errors = validator.validate(automatic);
+    EXPECT_FALSE(std::any_of(automatic_errors.begin(), automatic_errors.end(), [](const auto &e) {
+        return e.rule_id == "serving-capacity-lease-lifetime";
+    }));
+}
+
+TEST(Test__ConfigValidator, ServingCapacityIncoherentEnvelopeIsRejected)
+{
+    const auto validator = ConfigValidator::createStandard();
+    OrchestrationConfig config;
+    config.serving_resident_slots = 2;
+    config.serving_response_leases = 3;
+    config.serving_queue_capacity = 2; // R < S + Q
+    const auto errors = validator.validate(config);
+    EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &e) {
+        return e.rule_id == "serving-capacity-coherent";
+    }));
+}
+
+TEST(Test__ConfigValidator, ServingCapacityPartialAuthoringFiresStructuralAndServeOnly)
+{
+    const auto validator = ConfigValidator::createStandard();
+    OrchestrationConfig config;
+    config.serving_resident_slots = 1; // only one axis; serve mode off
+    const auto errors = validator.validate(config);
+    EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &e) {
+        return e.rule_id == "serving-capacity-lease-lifetime";
+    }));
+    EXPECT_TRUE(std::any_of(errors.begin(), errors.end(), [](const auto &e) {
+        return e.rule_id == "serving-capacity-all-or-none";
+    }));
+}
