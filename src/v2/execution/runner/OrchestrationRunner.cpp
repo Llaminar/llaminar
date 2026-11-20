@@ -15279,8 +15279,8 @@ namespace llaminar2
                 if (result.error.empty()) result.error = "Original rank generation follower failed";
                 return result;
             }
-            if (!decode_transaction_planning_position_ ||
-                *decode_transaction_planning_position_ != terminal.admission_base ||
+            if (!slot_handoff_.decode_transaction_planning_position_ ||
+                *slot_handoff_.decode_transaction_planning_position_ != terminal.admission_base ||
                 !sampling_math::valid_device_generation_leading_row_disposition(terminal.next_leading_row_disposition) ||
                 !publishDecodeTransactionPlanningPositionAfterMTPCommit(terminal.admission_base,
                     terminal.published_state_commit_count, "original_rank_generation_terminal"))
@@ -15290,11 +15290,11 @@ namespace llaminar2
             }
             // Keep only completed scheduler/accounting observations. No source
             // outcome or remote logical-state handle becomes execution input.
-            ready_mtp_condition_.reset();
-            pending_mtp_condition_token_.reset();
-            pending_mtp_condition_params_.reset();
-            pending_mtp_condition_resident_state_.reset();
-            prefill_logits_ready_ = !terminal.model_stopped;
+            slot_handoff_.ready_mtp_condition_.reset();
+            slot_handoff_.pending_mtp_condition_token_.reset();
+            slot_handoff_.pending_mtp_condition_params_.reset();
+            slot_handoff_.pending_mtp_condition_resident_state_.reset();
+            slot_handoff_.prefill_logits_ready_ = !terminal.model_stopped;
             result.is_complete = terminal.model_stopped;
             decode_command_failure_abort.markCompleted();
             return result;
@@ -15316,11 +15316,11 @@ namespace llaminar2
         } original_command{original_global && original_global->originalRankGenerationSource() ? original_global : nullptr};
         if (original_command.owner)
         {
-            if (!decode_transaction_planning_position_ ||
+            if (!slot_handoff_.decode_transaction_planning_position_ ||
                 moe_overlay_inference_command_sequence_ == std::numeric_limits<uint64_t>::max() ||
                 !original_command.owner->beginOriginalRankGenerationCommand(
                     original_command.owner->originalRankCommandIdentity(++moe_overlay_inference_command_sequence_),
-                    *decode_transaction_planning_position_, active_sampling_params_.is_greedy() ?
+                    *slot_handoff_.decode_transaction_planning_position_, active_sampling_params_.is_greedy() ?
                         DeviceGenerationSamplingMode::Greedy : DeviceGenerationSamplingMode::Stochastic))
             {
                 result.error = "Original rank generation source could not admit its exact request/command/placement identity";
@@ -15328,7 +15328,7 @@ namespace llaminar2
             }
         }
         const auto terminal_leading = [&] {
-            return ready_mtp_condition_ && ready_mtp_condition_->wasAlreadyEmitted() ?
+            return slot_handoff_.ready_mtp_condition_ && slot_handoff_.ready_mtp_condition_->wasAlreadyEmitted() ?
                 sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted :
                 sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
         };
@@ -16113,19 +16113,19 @@ namespace llaminar2
                 if (result.error.empty()) result.error = "Original forced-command follower failed";
                 return result;
             }
-            if (!decode_transaction_planning_position_ ||
-                *decode_transaction_planning_position_ != terminal.admission_base ||
+            if (!slot_handoff_.decode_transaction_planning_position_ ||
+                *slot_handoff_.decode_transaction_planning_position_ != terminal.admission_base ||
                 !publishDecodeTransactionPlanningPositionAfterMTPCommit(terminal.admission_base,
                     terminal.published_state_commit_count, "original_rank_forced_terminal"))
             {
                 result.error = "Original forced terminal differs from its admitted scheduler boundary";
                 return result;
             }
-            ready_mtp_condition_.reset();
-            pending_mtp_condition_token_.reset();
-            pending_mtp_condition_params_.reset();
-            pending_mtp_condition_resident_state_.reset();
-            prefill_logits_ready_ = !terminal.model_stopped;
+            slot_handoff_.ready_mtp_condition_.reset();
+            slot_handoff_.pending_mtp_condition_token_.reset();
+            slot_handoff_.pending_mtp_condition_params_.reset();
+            slot_handoff_.pending_mtp_condition_resident_state_.reset();
+            slot_handoff_.prefill_logits_ready_ = !terminal.model_stopped;
             result.is_complete = terminal.model_stopped;
             result.returned_token_commit = terminal.model_stopped ? ReturnedTokenCommitState::NoModelRow : ReturnedTokenCommitState::Pending;
             force_command_failure_abort.markCompleted();
@@ -16139,11 +16139,11 @@ namespace llaminar2
             /** @brief Cancel original directions before the outer MPI abort fence destroys owners. */
             ~OriginalRankForceCommandGuard() { if (owner && !completed) owner->abortOriginalRankGenerationCommand(); }
         } original_force{original_global && original_global->originalRankGenerationSource() ? original_global : nullptr};
-        if (original_force.owner && (!decode_transaction_planning_position_ ||
+        if (original_force.owner && (!slot_handoff_.decode_transaction_planning_position_ ||
             moe_overlay_inference_command_sequence_ == std::numeric_limits<uint64_t>::max() ||
             !original_force.owner->beginOriginalRankGenerationCommand(
                 original_force.owner->originalRankCommandIdentity(++moe_overlay_inference_command_sequence_),
-                *decode_transaction_planning_position_, active_sampling_params_.is_greedy() ?
+                *slot_handoff_.decode_transaction_planning_position_, active_sampling_params_.is_greedy() ?
                     DeviceGenerationSamplingMode::Greedy : DeviceGenerationSamplingMode::Stochastic)))
         {
             result.error = "Original forced-command source lost its exact request/command admission";
@@ -16622,7 +16622,7 @@ namespace llaminar2
         }
         if (original_force.owner)
         {
-            const auto leading = ready_mtp_condition_ && ready_mtp_condition_->wasAlreadyEmitted() ?
+            const auto leading = slot_handoff_.ready_mtp_condition_ && slot_handoff_.ready_mtp_condition_->wasAlreadyEmitted() ?
                 sampling_math::DeviceGenerationLeadingRowDisposition::AlreadyEmitted :
                 sampling_math::DeviceGenerationLeadingRowDisposition::PendingResponse;
             if (!original_force.owner->completeOriginalRankGenerationCommand(token_is_stop, leading))
