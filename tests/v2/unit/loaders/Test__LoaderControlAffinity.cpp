@@ -13,6 +13,7 @@
  * partially constructed worker retires before its referenced lane storage.
  */
 #include "utils/ScopedOpenMPPartitionAffinity.h"
+#include "tensors/MXFP4Format.h"
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -149,10 +150,14 @@ struct MmapFileReader {
         fail("unexpected file algorithm in control-affinity fixture");
     }
 };
+/** @brief Only the MXFP4 reader-thread admission branch inspects the repack format. */
+enum class RepackFormat : std::uint8_t { Q4_0, MXFP4 };
 struct WeightJob {
     std::shared_ptr<BoundedSource> bounded_source;
     std::size_t source_offset_bytes = 0, raw_bytes = 32;
     const void *host_raw_data = nullptr;
+    std::string name = "authored";
+    RepackFormat format = RepackFormat::Q4_0; ///< Non-MXFP4: authored bytes are not E8M0 blocks.
 };
 /** @brief Renderer/model collaborators are unused operands, not alternate loading implementations. */
 struct WeightLoadProgress {
