@@ -1030,14 +1030,20 @@ def preflight_optional_hardware_requirements(
 ) -> dict[str, dict]:
     """Compile declared optional geometry from the original CMake labels and MPI command."""
     requirements = {}
+    peer_contracts = {"DirectedPeerEdge": "directed-edge", "CompletePeerAccess": "complete",
+                      "NoDirectedPeerPair": "no-directed-pair"}
     for row in registrations:
+        peer_labels = row.labels & peer_contracts.keys()
         isa_labels = sorted(label for label in row.labels if label.startswith("NativeISA"))
         stage_labels = sorted(label for label in row.labels if label.startswith("StageSizes"))
         rank_labels = sorted(label for label in row.labels if label.startswith("RankSizes"))
         context_cases = [label.removeprefix("MaximumContext") for label in row.labels
                          if label.startswith("MaximumContext")]
         if "HardwareOptional" not in row.labels:
-            if context_cases or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair", "LocalHostDevices", "ROCmHostNativeAtomics", "IndependentNUMAReporters", "NUMALocalOrdinal0"} or isa_labels or stage_labels or rank_labels or any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels):
+            if (context_cases or isa_labels or stage_labels or rank_labels or peer_labels or
+                    row.labels & {"LocalHostDevices", "ROCmHostNativeAtomics",
+                                  "IndependentNUMAReporters", "NUMALocalOrdinal0"} or
+                    any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels)):
                 raise RuntimeError("optional ISA/stage labels require HardwareOptional: " + row.name)
             continue
         device_labels = sorted(label for label in row.labels if label.startswith("Devices"))
@@ -1051,15 +1057,14 @@ def preflight_optional_hardware_requirements(
         independent_reporters = "IndependentNUMAReporters" in row.labels
         if independent_reporters and (backends != {"CUDA", "ROCm"} or "DistinctNUMARanks" in row.labels):
             raise RuntimeError("independent reporters require both native families: " + row.name)
-        if local_host and (isa_labels or stage_labels or rank_labels or
-                           row.labels & {"DistinctNUMARanks", "DirectedPeerEdge", "NoDirectedPeerPair",
-                                         "IndependentNUMAReporters", "NUMALocalOrdinal0"}):
+        if local_host and (stage_labels or rank_labels or peer_labels or
+                           row.labels & {"DistinctNUMARanks", "IndependentNUMAReporters", "NUMALocalOrdinal0"}):
             raise RuntimeError("local device counts cannot replace a topology contract: " + row.name)
         family_labels = sorted(label for label in row.labels
                                if label.startswith(("CUDADevices", "ROCmDevices")))
         if family_labels:
             if (row.labels & {"ROCmHostNativeAtomics", "NUMALocalOrdinal0"} or context_cases or backends != {"CUDA", "ROCm"} or len(family_labels) != 2
-                    or len(device_labels) != 1 or isa_labels or stage_labels or rank_labels or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"}
+                    or len(device_labels) != 1 or isa_labels or stage_labels or rank_labels or peer_labels
                     or any(re.fullmatch(r"(?:CUDA|ROCm)Devices[1-9][0-9]*", label) is None for label in family_labels)):
                 raise RuntimeError("ambiguous optional mixed-family geometry: " + row.name)
             degrees = {label.split("Devices")[0].lower(): int(label.split("Devices")[1])
@@ -1096,11 +1101,10 @@ def preflight_optional_hardware_requirements(
                     raise ValueError("ambiguous maximum-context physical requirement")
                 requirement["maximum_context_case"] = context_cases[0]
                 requirement["capacity_basis"] = "free" if shared_capacity else "total"
-            peer_labels = row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"}
             if len(peer_labels) > 1:
                 raise ValueError("conflicting optional directed peer geometry")
             if peer_labels:
-                requirement["peer_access"] = "directed-edge" if "DirectedPeerEdge" in peer_labels else "no-directed-pair"
+                requirement["peer_access"] = peer_contracts[next(iter(peer_labels))]
                 requirement["mpi_ranks"] = row.mpi_ranks
             if isa_labels:
                 requirement["native_isa"] = isa_labels[0].removeprefix("NativeISA-")

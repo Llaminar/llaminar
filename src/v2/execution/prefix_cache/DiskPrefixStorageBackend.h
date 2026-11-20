@@ -494,6 +494,8 @@ namespace llaminar2
             int archive_fd,
             const PrefixCacheKey &key,
             std::string *error);
+        /** @brief Test the stale-history budget against the current index under mutex_. */
+        [[nodiscard]] bool exceedsCompactionThresholdLocked(uint64_t physical_bytes) const;
         /** @brief Schedule stale-history reclamation, never copy under the lock. */
         bool compactIfNeededLocked(int archive_fd, std::string *error);
         /** @brief Wake the sole worker; mutex_ must already be held. */

@@ -137,6 +137,16 @@ include("{module.as_posix()}")
                         self.assertNotEqual(result.returncode, 0)
                         self.assertIn("actual source-build authority", result.stderr)
 
+            # A cache without its source-root entry cannot inherit /src from
+            # the surrounding image when the proof target owns compilation.
+            (root / "missing").mkdir()
+            (root / "missing" / "CMakeCache.txt").touch()
+            result = subprocess.run([self.cmake, "-S", str(root), "-B", str(root / "empty-cache"),
+                "-G", "Ninja", f"-DCMAKE_MAKE_PROGRAM={self.ninja}", "-DV2_PERF_TESTS_ONLY=OFF"],
+                capture_output=True, text=True, timeout=15)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("actual source-build authority", result.stderr)
+
     def test_explicit_release_native_owner_and_aliases(self):
         """Original owners and script aliases opt in without entering default all."""
         declaration = CMAKE_LISTS.read_text(encoding="utf-8")

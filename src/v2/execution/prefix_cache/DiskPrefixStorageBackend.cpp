@@ -2548,19 +2548,21 @@ namespace llaminar2
         return entries;
     }
 
+    bool DiskPrefixStorageBackend::exceedsCompactionThresholdLocked(
+        uint64_t physical_bytes) const
+    {
+        const uint64_t threshold = std::max<uint64_t>(
+            64ull * 1024ull,
+            kArchiveHeaderBytes + active_record_bytes_ * 2);
+        return physical_bytes > threshold;
+    }
+
     bool DiskPrefixStorageBackend::compactIfNeededLocked(
         int archive_fd,
         std::string *error)
     {
-        const uint64_t physical_bytes = fileSize(archive_fd);
-        const uint64_t threshold = std::max<uint64_t>(
-            64ull * 1024ull,
-            kArchiveHeaderBytes + active_record_bytes_ * 2);
-        if (physical_bytes <= threshold)
-        {
-            return true;
-        }
-        return scheduleCompactionLocked(error);
+        return !exceedsCompactionThresholdLocked(fileSize(archive_fd)) ||
+            scheduleCompactionLocked(error);
     }
 
     bool DiskPrefixStorageBackend::scheduleCompactionLocked(std::string *error)
@@ -2641,7 +2643,11 @@ namespace llaminar2
             }
             if (stop.stop_requested())
                 break;
-            compaction_status_.state = CompactionState::Idle;
+            // The finite tail and writes after publication can add stale
+            // records. The current index already includes both under mutex_.
+            compaction_status_.state = outcome == CompactionOutcome::Published &&
+                exceedsCompactionThresholdLocked(scan_offset_)
+                ? CompactionState::Scheduled : CompactionState::Idle;
             compaction_changed_.notify_all();
         }
         compaction_status_.state = CompactionState::Stopping;
