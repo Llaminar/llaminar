@@ -112,6 +112,7 @@ namespace
         {"Q4_1", true},
         {"IQ4_NL", true},
         {"IQ4_XS", true},
+        {"Q5_0", false},        {"MXFP4", true},
         {"Q5_0", false},
         {"Q5_1", false},
         {"Q6_K", false},
@@ -132,6 +133,7 @@ namespace
     static const std::vector<FormatSpec> KEY_FORMATS = {
         {"Q4_0", true},
         {"IQ4_NL", true},
+        {"Q4_1", true},        {"MXFP4", true},
         {"Q4_1", true},
         {"Q5_0", false},
         {"Q6_K", false},
@@ -148,6 +150,8 @@ namespace
             return TestTensorFactory::createQ4_0Random({N, K});
         if (fmt == "IQ4_NL")
             return TestTensorFactory::createIQ4_NLRandom({N, K});
+        if (fmt == "MXFP4")
+            return TestTensorFactory::createMXFP4Random({N, K});
         if (fmt == "Q4_1")
             return TestTensorFactory::createQ4_1Random({N, K});
         if (fmt == "IQ4_XS")
