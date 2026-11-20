@@ -23,6 +23,7 @@
 #include "loaders/gpu_pipeline/PinnedRingBuffer.h"
 #include "loaders/gpu_pipeline/LoadOrchestrator.h"
 #include "loaders/gpu_pipeline/RepackFormat.h"
+#include "loaders/gpu_pipeline/NativeQuantisedRepackColumns.h"
 #include "backends/BackendManager.h"
 #include "tensors/BlockStructures.h"
 #include "tensors/MXFP4Format.h"
@@ -804,6 +805,103 @@ namespace
     }
 
     /**
+     * @brief Repack selected MXFP4 source columns into exact compact destinations.
+     *
+     * Each selection is loaded after a guard weight planned immediately behind
+     * it, so a launch that traverses unselected source blocks or indexes them
+     * before the selected origin overwrites the guard instead of passing.
+     * Interior, prefix and suffix selections cover a nonzero first source
+     * block, a destination shorter than the source row and the row end.
+     * @param backend CUDA or ROCm backend selected by the caller.
+     * @param device Device owning the verification stream.
+     */
+    void expectMXFP4SelectedColumnsAreExact(IBackend *backend, DeviceId device)
+    {
+        backend->setDevice(0);
+        test::ScopedGPUStream verification_stream(device);
+        constexpr int N = 67, source_K = 224, source_blocks = source_K / 32;
+        constexpr size_t kBlock = mxfp4::kSourceBlockBytes;
+        const auto host = mxfp4PipelineSource(N, source_blocks);
+        const auto guard_host = mxfp4PipelineSource(N + 1, source_blocks);
+        const size_t row_bytes = static_cast<size_t>(source_blocks) * kBlock;
+        const auto read = [&](const WeightVRAMPool::WeightSlot &slot, size_t count)
+        {
+            std::pair<std::vector<uint8_t>, std::vector<uint8_t>> planes{
+                std::vector<uint8_t>(count * 16), std::vector<uint8_t>(count)};
+            EXPECT_TRUE(backend->deviceToHost(planes.first.data(), slot.d_native_quantised_payload,
+                                              planes.first.size(), 0, verification_stream.get()));
+            EXPECT_TRUE(backend->deviceToHost(planes.second.data(), slot.d_native_quantised_scales,
+                                              planes.second.size(), 0, verification_stream.get()));
+            return planes;
+        };
+        for (const auto selection : {NativeQuantisedRepackColumns::slice(source_K, 64, 96),
+                                     NativeQuantisedRepackColumns::slice(source_K, 0, 64),
+                                     NativeQuantisedRepackColumns::slice(source_K, 160, 64)})
+        {
+            SCOPED_TRACE(::testing::Message() << "first=" << selection.firstColumn()
+                                              << " columns=" << selection.columns());
+            const int blocks = selection.blocks();
+            LoadOrchestrator orch(backend, kTestOnlyUnadmittedGPUAllocation);
+            orch.addDevice(0);
+            orch.planWeight(0, "mxfp4_selected", N, selection.columns(), 16, false, false,
+                            NativeQuantisedScalePlaneWidth::E8M0Byte, host.size());
+            orch.planWeight(0, "mxfp4_guard", N + 1, source_K, 16, false, false,
+                            NativeQuantisedScalePlaneWidth::E8M0Byte, guard_host.size());
+            orch.allocate(16 * row_bytes, 2);
+
+            WeightJob guard;
+            guard.name = "mxfp4_guard";
+            guard.host_raw_data = guard_host.data();
+            guard.raw_bytes = guard_host.size();
+            guard.format = RepackFormat::MXFP4;
+            guard.N = N + 1;
+            guard.K = source_K;
+            guard.is_asymmetric = false;
+            orch.addWeightJob(0, guard);
+            WeightJob job;
+            job.name = "mxfp4_selected";
+            job.host_raw_data = host.data();
+            job.raw_bytes = host.size();
+            job.format = RepackFormat::MXFP4;
+            job.N = N;
+            job.K = selection.columns();
+            job.columns = selection;
+            job.is_asymmetric = false;
+            orch.addWeightJob(0, job);
+            ASSERT_NO_THROW(orch.load());
+
+            auto slot = orch.getPool(0)->getSlot(job.name);
+            auto guard_slot = orch.getPool(0)->getSlot(guard.name);
+            ASSERT_TRUE(slot.has_value());
+            ASSERT_TRUE(guard_slot.has_value());
+            const size_t count = static_cast<size_t>(N) * blocks;
+            ASSERT_EQ(slot->scales_bytes, count);
+            const auto [payload, scales] = read(*slot, count);
+            for (int n = 0; n < N; ++n)
+                for (int b = 0; b < blocks; ++b)
+                {
+                    const uint8_t *source = host.data() +
+                        (static_cast<size_t>(n) * source_blocks + selection.firstBlock() + b) * kBlock;
+                    const size_t linear = static_cast<size_t>(b) * N + n;
+                    EXPECT_EQ(scales[linear], mxfp4::preparedNativeE8M0Byte(source[0])) << n << ',' << b;
+                    EXPECT_EQ(std::memcmp(payload.data() + linear * 16, source + 1, 16), 0) << n << ',' << b;
+                }
+            const size_t guard_count = static_cast<size_t>(N + 1) * source_blocks;
+            const auto [guard_payload, guard_scales] = read(*guard_slot, guard_count);
+            for (int n = 0; n <= N; ++n)
+                for (int b = 0; b < source_blocks; ++b)
+                {
+                    const uint8_t *source = guard_host.data() +
+                        (static_cast<size_t>(n) * source_blocks + b) * kBlock;
+                    const size_t linear = static_cast<size_t>(b) * (N + 1) + n;
+                    EXPECT_EQ(guard_scales[linear], mxfp4::preparedNativeE8M0Byte(source[0])) << "guard " << n << ',' << b;
+                    EXPECT_EQ(std::memcmp(guard_payload.data() + linear * 16, source + 1, 16), 0) << "guard " << n << ',' << b;
+                }
+            orch.release();
+        }
+    }
+
+    /**
      * @brief A nonzero block outside the native E8M0 range fails the load on the reader thread.
      * @param exponent Rejected exponent: 0/1 (FP32 subnormal), 253/254 (weights overflow), 255 (NaN).
      */
@@ -1215,3 +1313,27 @@ TEST_F(Test__DeviceLoadPipeline, EmptyJobsSucceeds)
 }
 
 } // namespace llaminar2
+
+TEST(Test__DeviceLoadPipelineMXFP4, ROCmSelectedSourceColumnsRepackExactly)
+{
+#ifdef HAVE_ROCM
+    auto *backend = getROCmBackend();
+    if (!backend)
+        GTEST_SKIP() << "ROCm backend unavailable";
+    expectMXFP4SelectedColumnsAreExact(backend, DeviceId::rocm(0));
+#else
+    GTEST_SKIP() << "HAVE_ROCM not defined";
+#endif
+}
+
+TEST(Test__DeviceLoadPipelineMXFP4, CUDASelectedSourceColumnsRepackExactly)
+{
+#ifdef HAVE_CUDA
+    auto *backend = getCUDABackend();
+    if (!backend)
+        GTEST_SKIP() << "CUDA backend unavailable";
+    expectMXFP4SelectedColumnsAreExact(backend, DeviceId::cuda(0));
+#else
+    GTEST_SKIP() << "HAVE_CUDA not defined";
+#endif
+}

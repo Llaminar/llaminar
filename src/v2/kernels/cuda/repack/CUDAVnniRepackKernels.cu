@@ -244,8 +244,9 @@ __global__ void cuda_repack_mxfp4_to_vnni(
     PackedVnniDestination destination)
 {
     const int n = blockIdx.x * blockDim.x + threadIdx.x;
-    const int b = blockIdx.y;
-    if (n >= N || b >= blocks_per_row) return;
+    const int b = destination.first_source_block + blockIdx.y;
+    if (n >= N || b >= blocks_per_row ||
+        b - destination.first_source_block >= destination.blocks_per_row) return;
 
     const uint8_t* blk = d_raw + (static_cast<size_t>(n) * blocks_per_row + b) * llaminar2::mxfp4::kSourceBlockBytes;
     const size_t linear = packedVnniLinearIndex(n, b, destination);
@@ -1204,7 +1205,7 @@ bool launchVnniRepackCUDA(
     }
     case RepackFormat::MXFP4: {
         dim3 block(256, 1);
-        dim3 grid((N + 255) / 256, blocks_per_row);
+        dim3 grid((N + 255) / 256, columns.blocks());
         cuda_repack_mxfp4_to_vnni<<<grid, block, 0, cuda_stream>>>(
             static_cast<const uint8_t*>(d_raw_blocks),
             d_payload, d_scales, N, blocks_per_row, destination);

@@ -30890,6 +30890,13 @@ foreach(_mxfp4_backend CUDA ROCm)
                 --gtest_filter=Test__DeviceLoadPipelineMXFP4.${_mxfp4_backend}RowChunkedSourceIsExactAndInexactScalesFail
             LABELS "V2;Integration;ProductionTestPreflight;WeightLoading;GpuPipeline;${_mxfp4_backend};MXFP4;Regression"
             MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        # Selected source columns: nonzero first block, prefix and suffix
+        # selections write exactly their compact destination.
+        add_v2_test(V2_Integration_MXFP4SelectedColumnRepack_${_mxfp4_backend}
+            COMMAND $<TARGET_FILE:v2_integration_device_load_pipeline>
+                --gtest_filter=Test__DeviceLoadPipelineMXFP4.${_mxfp4_backend}SelectedSourceColumnsRepackExactly
+            LABELS "V2;Integration;ProductionTestPreflight;WeightLoading;GpuPipeline;${_mxfp4_backend};MXFP4;Regression"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     endif()
 endforeach()
 
