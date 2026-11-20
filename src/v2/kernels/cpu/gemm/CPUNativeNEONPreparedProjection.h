@@ -48,9 +48,14 @@ namespace llaminar2::cpu::native_quantised
          *
          * MXFP4 is a distinct map (doubled OCP E2M1 magnitudes with a sign bit),
          * never IQ4_NL's grid, although both are sixteen-entry signed tables.
+         * Its primary words are BF16 powers of two; admission guarantees that
+         * every NibbleLUT MXFP4 publication carries PowerOfTwoBF16 scales.
          */
         enum class NibbleMap { Centered, Unsigned, NonLinear, MXFP4 };
         using ScaleWords = CPUNativeQuantisedScaleEncoding;
+
+        /** @brief Whether this nibble map's primary scale words are BF16 powers of two. */
+        template <NibbleMap Map> static constexpr bool kPowerOfTwoBF16Scales = Map == NibbleMap::MXFP4;
 
     public:
         /**
@@ -122,7 +127,9 @@ namespace llaminar2::cpu::native_quantised
                 implemented = true;
                 break;
             case Encoding::NibbleLUT:
-                implemented = weights.codebook_id == 0 || weights.codebook_id == 4 || weights.codebook_id == 5;
+                implemented = weights.codebook_id == 0 || weights.codebook_id == 4 || weights.codebook_id == 5 ||
+                    (weights.codebook_id == kNativeQuantisedMXFP4Codebook &&
+                     weights.scaleEncoding() == ScaleWords::PowerOfTwoBF16);
                 break;
             case Encoding::CompactMultiScale:
                 switch (weights.codebook_id)
@@ -335,8 +342,7 @@ namespace llaminar2::cpu::native_quantised
                     // rotated MXFP4 is ExpandedInt8 with FP16 scales (case above).
                     if (weights_.scaleEncoding() != ScaleWords::PowerOfTwoBF16)
                         break;
-                    return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::MXFP4, false, Strips,
-                               ScaleWords::PowerOfTwoBF16>();
+                    return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::MXFP4, false, Strips>();
                 }
                 break;
             case Encoding::CompactMultiScale:
@@ -534,11 +540,9 @@ namespace llaminar2::cpu::native_quantised
          * @tparam Physical One of the five non-compact execution encodings.
          * @tparam Map Nibble decoder, used only by nibble encodings.
          * @tparam WithMinimum Whether the source owns an additive minimum vector.
-         * @tparam Scale Primary scale-word interpretation of this prepared identity.
          */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
-                  NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false, int Strips = 0,
-                  ScaleWords Scale = ScaleWords::FP16>
+                  NibbleMap Map = NibbleMap::Centered, bool WithMinimum = false, int Strips = 0>
         LLAMINAR_NEON_PROJECTION_EXACT void run() const noexcept
         {
             constexpr int S = Strips > 0 ? Strips : panelStrips<Ops, Physical, WithMinimum>();
@@ -549,7 +553,7 @@ namespace llaminar2::cpu::native_quantised
                 // Panels cover the whole chunk: a final panel may extend into the
                 // chunk's sealed padding columns, which it computes but never stores.
                 for (int column = 0; column < columns_; column += 4 * S)
-                    panel<Ops, Policy, Physical, Map, WithMinimum, S, Scale>(column);
+                    panel<Ops, Policy, Physical, Map, WithMinimum, S>(column);
             }
             else
             {
@@ -617,7 +621,7 @@ namespace llaminar2::cpu::native_quantised
                             }
                             // BF16 power-of-two words widen by placement alone (exact),
                             // matching the x86 loaders and the scalar view.
-                            F scale0 = Scale == ScaleWords::PowerOfTwoBF16
+                            F scale0 = kPowerOfTwoBF16Scales<Map>
                                 ? Ops::bf16(weights_.admittedScales(chunk_, block) + column)
                                 : Ops::half(weights_.admittedScales(chunk_, block) + column);
                             F scale1{};
@@ -730,7 +734,7 @@ namespace llaminar2::cpu::native_quantised
          * chains are interleaved and each activation group/scale is read once.
          */
         template <typename Ops, CPUProjectionNumericalPolicy Policy, Encoding Physical,
-                  NibbleMap Map, bool WithMinimum, int S, ScaleWords Scale>
+                  NibbleMap Map, bool WithMinimum, int S>
         [[gnu::always_inline]] LLAMINAR_NEON_PROJECTION_EXACT inline void panel(int column0) const noexcept
         {
 #if defined(__clang__)
@@ -817,7 +821,7 @@ namespace llaminar2::cpu::native_quantised
                     for (int strip = 0; strip < S; ++strip)
                     {
                         const int column = column0 + 4 * strip;
-                        F scale0 = Scale == ScaleWords::PowerOfTwoBF16
+                        F scale0 = kPowerOfTwoBF16Scales<Map>
                             ? Ops::bf16(weights_.admittedScales(chunk_, block) + column)
                             : Ops::half(weights_.admittedScales(chunk_, block) + column);
                         F scale1{};
