@@ -76,6 +76,8 @@ namespace llaminar2::test::native_quantised_gemm_perf
          { return TestTensorFactory::createIQ4_NLRandom({n, k}); }},
         {"IQ4_XS", 4, [](size_t n, size_t k)
          { return TestTensorFactory::createIQ4_XSRandom({n, k}); }, kNativeQuantisedIQ4XSSourceScaleCodebook},
+        {"MXFP4", kNativeQuantisedMXFP4Codebook, [](size_t n, size_t k)
+         { return TestTensorFactory::createMXFP4Random({n, k}); }},
         {"Q4_1", 5, [](size_t n, size_t k)
          { return TestTensorFactory::createQ4_1Random({n, k}); }},
         {"Q4_K", 5, [](size_t n, size_t k)

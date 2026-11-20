@@ -155,7 +155,7 @@ namespace
     TEST(CUDANativeQuantisedGemmPerfOffline, FormatListCodebookIdsMatchTensorMetadata)
     {
         const std::set<std::string> expected_formats = {
-            "Q4_0", "IQ4_NL", "IQ4_XS", "Q4_1", "Q4_K", "Q5_0", "Q5_1",
+            "Q4_0", "IQ4_NL", "IQ4_XS", "MXFP4", "Q4_1", "Q4_K", "Q5_0", "Q5_1",
             "Q5_K", "Q6_K", "Q3_K", "Q2_K", "IQ3_S", "IQ3_XXS", "IQ2_S",
             "IQ2_XS", "IQ2_XXS", "IQ1_S", "IQ1_M", "Q8_0", "Q8_1", "Q8_K"};
         std::set<std::string> observed_formats;
