@@ -20,6 +20,7 @@
 
 #include "tensors/Tensors.h"
 #include "tensors/NativeQuantisedIQ4XSScale.h"
+#include "kernels/common/NativeQuantisedDescriptorValidation.h"
 #include "kernels/cpu/gemm/CPUNativeQuantisedWeightPacker.h"
 #include "../../utils/TestTensorFactory.h"
 
@@ -411,6 +412,32 @@ TEST(Test__NativeQuantisedFormatInfo, MigrationStableAndReusableFormatsCoverEver
         EXPECT_GE(
             allocation.payload_bytes_per_block,
             migrated.payload_bytes_per_block);
+    }
+}
+
+/**
+ * @test Every physical decoder a source format can reach is publishable.
+ *
+ * The descriptor validator keeps its own numeric inventory for device code.
+ * Each canonical and migration-stable physical codebook must be supported and
+ * must agree with the canonical secondary-plane presence; otherwise MoE
+ * publication silently rejects an otherwise implemented format.
+ */
+TEST(Test__NativeQuantisedFormatInfo, DescriptorValidationCoversEveryReachablePhysicalDecoder)
+{
+    for (const NativeQuantisedSourceFormat &entry : native_quantised_formats::kAllSourceFormats)
+    {
+        SCOPED_TRACE(entry.quant_type);
+        const auto canonical = canonicalDeviceVnniFormat(*entry.metadata);
+        const auto migrated = migrationStableDeviceVnniFormat(*entry.metadata);
+        for (const auto &[codebook, secondary] :
+             {std::pair{canonical.codebook_id, canonical.is_asymmetric},
+              std::pair{migrated.codebook_id, migrated.is_asymmetric}})
+        {
+            SCOPED_TRACE(static_cast<int>(codebook));
+            EXPECT_TRUE(NativeQuantisedDescriptorValidation::supported(codebook));
+            EXPECT_EQ(NativeQuantisedDescriptorValidation::secondary(codebook), secondary);
+        }
     }
 }
 
