@@ -1,3 +1,14 @@
+/**
+ * @file Perf__MoEVerifierPrefill.cpp
+ * @brief CUDA MoE routed and shared-expert verifier/prefill candidates: resources, byte invariance and timing.
+ *
+ * Covers the production prefill launch candidates for every supported expert
+ * format (including MXFP4): spill-free register evidence, serial-row byte
+ * invariance of grouped candidates, M=1..4 decode equivalence of routed and
+ * shared expert FFNs, and the mixed-format GGUF candidate trainer that times
+ * candidates and checks them bit-exact. Shared-expert fixtures pair each gate/up
+ * format with its production down projection.
+ */
 #include "backends/GPUDeviceContextPool.h"
 #include <gtest/gtest.h>
 #include "transfer/TransferEngine.h"
@@ -158,6 +169,8 @@ namespace
              { return TestTensorFactory::createQ6_KRandom(shape, seed); }},
             {"IQ4_NL", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
              { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }},
+            {"MXFP4", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createMXFP4Random(shape, seed); }},
             {"IQ4_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
              { return TestTensorFactory::createIQ4_XSRandom(shape, seed); }},
             {"IQ3_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
