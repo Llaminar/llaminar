@@ -17,6 +17,7 @@
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
 #include "../utils/Logger.h"
+#include "../utils/OpenMPUtils.h"
 #include "SIMDHelpers.h"
 
 #include <algorithm>
@@ -140,6 +141,7 @@ namespace llaminar2
             const size_t rows = rows2d();
             const size_t cols = cols2d();
             dequant_cache_.resize(rows * cols);
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (rows > 4)
             for (size_t r = 0; r < rows; ++r)
                 to_fp32_row(r, dequant_cache_.data() + r * cols);
@@ -197,6 +199,7 @@ namespace llaminar2
     void MXFP4Tensor::to_bf16(uint16_t *dst) const
     {
         const size_t rows = rows2d(), cols = cols2d();
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (rows > 4)
         for (size_t r = 0; r < rows; ++r)
         {
@@ -210,6 +213,7 @@ namespace llaminar2
     void MXFP4Tensor::to_fp16(uint16_t *dst) const
     {
         const size_t rows = rows2d(), cols = cols2d();
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (rows > 4)
         for (size_t r = 0; r < rows; ++r)
         {
@@ -230,6 +234,7 @@ namespace llaminar2
             if (!data_ptr) throw std::runtime_error("Native tensor raw source was retired");
             const auto *all = reinterpret_cast<const MXFP4Block *>(data_ptr);
             const size_t blocks = total / MXFP4Block::BLOCK_SIZE;
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (blocks > 1024)
             for (size_t b = 0; b < blocks; ++b)
             {
