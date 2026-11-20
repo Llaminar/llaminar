@@ -1312,8 +1312,6 @@ TEST_F(Test__DeviceLoadPipeline, EmptyJobsSucceeds)
 #endif
 }
 
-} // namespace llaminar2
-
 TEST(Test__DeviceLoadPipelineMXFP4, ROCmSelectedSourceColumnsRepackExactly)
 {
 #ifdef HAVE_ROCM
@@ -1337,3 +1335,5 @@ TEST(Test__DeviceLoadPipelineMXFP4, CUDASelectedSourceColumnsRepackExactly)
     GTEST_SKIP() << "HAVE_CUDA not defined";
 #endif
 }
+
+} // namespace llaminar2
