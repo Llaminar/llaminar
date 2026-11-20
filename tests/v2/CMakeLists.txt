@@ -32014,6 +32014,15 @@ add_v2_test(V2_Integration_CPUNativeQuantisedSlotReuseAdmission
     TIMEOUT 60 NO_MODELS MPI_PROCS 1)
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUNativeQuantisedSlotReuseAdmission)
 
+# Every physical decoder reachable from a source format, including MXFP4,
+# passes the shared descriptor validator used by MoE publication.
+add_v2_test(V2_Integration_NativeQuantisedDescriptorValidationInventory
+    COMMAND $<TARGET_FILE:v2_test_native_quantised_format_info>
+        --gtest_filter=Test__NativeQuantisedFormatInfo.DescriptorValidationCoversEveryReachablePhysicalDecoder
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CPU;NativeQuantised;MXFP4;Metadata;Regression"
+    TIMEOUT 60 NO_MODELS MPI_PROCS 1)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_NativeQuantisedDescriptorValidationInventory)
+
 # IQ4_XS source-tuple mapping, movement, serialization and arithmetic-generation fences.
 add_v2_test(V2_Integration_IQ4XSTupleFormatContract
     COMMAND $<TARGET_FILE:v2_test_native_quantised_format_info>
