@@ -636,16 +636,10 @@ namespace llaminar2
                                 // [2, 252] fails the load instead of being decoded on device.
                                 // All-zero blocks (ggml writes e = 0) publish the zero marker.
                                 const auto *bytes = static_cast<const uint8_t *>(result.payload);
-                                for (size_t offset = 0; offset < job.raw_bytes;
-                                     offset += mxfp4::kSourceBlockBytes)
-                                {
-                                    if (!mxfp4::blockFitsNativeE8M0(bytes[offset], bytes + offset + 1))
-                                    {
-                                        result.error = "MXFP4 block exponent " + std::to_string(bytes[offset]) +
-                                                       " in '" + job.name + "' is outside the native E8M0 range [2, 252]";
-                                        break;
-                                    }
-                                }
+                                const size_t rejected = mxfp4::firstInadmissibleNativeE8M0Block(bytes, job.raw_bytes);
+                                if (rejected + mxfp4::kSourceBlockBytes <= job.raw_bytes)
+                                    result.error = "MXFP4 block exponent " + std::to_string(bytes[rejected]) +
+                                                   " in '" + job.name + "' is outside the native E8M0 range [2, 252]";
                             }
                         }
                         result.read_ms =

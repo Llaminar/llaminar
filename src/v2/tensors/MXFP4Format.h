@@ -31,6 +31,7 @@
 #include <cuda_runtime.h>
 #endif
 
+#include <cstddef>
 #include <cstdint>
 
 #if defined(__CUDACC__) || defined(__HIPCC__)
@@ -156,6 +157,42 @@ namespace llaminar2::mxfp4
     LLAMINAR_MXFP4_HD constexpr bool blockFitsNativeE8M0(uint8_t e, const uint8_t *qs) noexcept
     {
         return exponentFitsNativeE8M0(e) || codesAllZero(qs);
+    }
+
+    /**
+     * @brief Locate the first block of a contiguous MXFP4 source run that the native plane rejects.
+     * @param bytes Whole 17-byte source blocks.
+     * @param size Byte length; a trailing partial block is not inspected.
+     * @return Byte offset of the first block failing blockFitsNativeE8M0(), or the
+     *         offset just past the last whole block when every block is admitted.
+     *
+     * Load-time screen run once per streamed chunk. Eight exponent bytes are
+     * range-checked per branch (e in [2, 252] <=> uint8(e - 2) <= 250); only a
+     * flagged group repeats the exact per-block test, including the all-zero
+     * code exemption. The result is identical to testing every block in order.
+     */
+    inline std::size_t firstInadmissibleNativeE8M0Block(const uint8_t *bytes, std::size_t size) noexcept
+    {
+        constexpr std::size_t kBlock = kSourceBlockBytes;
+        constexpr std::size_t kGroup = 8;
+        constexpr unsigned kSpan = kMaxNativeE8M0Exponent - kMinNormalFP32Exponent;
+        const std::size_t whole = size / kBlock * kBlock;
+        std::size_t offset = 0;
+        for (; offset + kGroup * kBlock <= whole; offset += kGroup * kBlock)
+        {
+            unsigned flagged = 0;
+            for (std::size_t block = 0; block < kGroup; ++block)
+                flagged |= static_cast<unsigned>(
+                    static_cast<uint8_t>(bytes[offset + block * kBlock] - kMinNormalFP32Exponent) > kSpan);
+            if (flagged)
+                for (std::size_t block = 0; block < kGroup; ++block)
+                    if (!blockFitsNativeE8M0(bytes[offset + block * kBlock], bytes + offset + block * kBlock + 1))
+                        return offset + block * kBlock;
+        }
+        for (; offset < whole; offset += kBlock)
+            if (!blockFitsNativeE8M0(bytes[offset], bytes + offset + 1))
+                return offset;
+        return whole;
     }
 
     /**
