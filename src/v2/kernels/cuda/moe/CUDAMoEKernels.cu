@@ -18,8 +18,13 @@
  * retain the measured lower-latency single-expert launch without new storage.
  * Shared rank-bank publication uses uniform direct copy/zero stores so
  * peer-bank zeroing owns no addressable private zero-vector temporary.
+ * Independent decode slots share the serial normalization result and publish
+ * routes in parallel, retaining live acquired-bank fragment authentication.
+ * Decode descriptor publication touches only the selected packet; grouped
+ * prefill retains its complete descriptor/list publication contract.
  */
 
+#include "kernels/common/MoERuntimeDescriptorLaunch.h"
 #include "CUDARouterQ8Prefill.h"
 #include <cuda_runtime.h>
 #include <cuda_bf16.h>
@@ -29,6 +34,9 @@
 #include "kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh"
 #include "kernels/cuda/gemm/CUDAMoEGroupedPrefillKernels.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
+#include "kernels/common/MoEIntermediateShardRowExecution.h"
+#include "kernels/common/NativeQuantisedDescriptorValidation.h"
+#include "execution/config/RoutedExpertPolicy.h"
 #include "kernels/common/DeviceFP32NumericalContract.h"
 #include "kernels/common/DeviceRouterHadamardQ8.h"
 #include "kernels/common/RouterQ8Launch.h"
@@ -366,7 +374,11 @@ namespace
         const llaminar2::DeviceMoEOverlayEpochTicket *overlay_epoch_ticket;
         const DeviceMoEPlacementBankView *overlay_placement_banks;
         const llaminar2::DeviceMoEOverlayEpochStatus *overlay_epoch_status;
+        llaminar2::DeviceMoEIntermediateShardBinding intermediate_shard;
     };
+
+    static_assert(offsetof(DeviceMoELayerRuntimeView, intermediate_shard) ==
+                  llaminar2::moe_runtime_abi::kIntermediateShardBindingOffset);
 
     static_assert(
         sizeof(DeviceMoELayerRuntimeView) ==
@@ -3029,6 +3041,57 @@ namespace
         return static_cast<uint64_t>(max_load - min_load);
     }
 
+    /** @brief Resolve only the original member's complete fragment; broken admission traps before routing. */
+    __device__ __forceinline__ llaminar2::MoEIntermediateShardRowSelection
+    runtime_intermediate_shard_row(const DeviceMoELayerRuntimeView *runtime,
+        const DeviceMoEPlacementBankView &bank, int expert)
+    {
+        const auto selection = llaminar2::selectMoEIntermediateShardRow(
+            runtime->intermediate_shard, bank, expert, static_cast<int>(runtime->participant_id));
+        if (selection.disposition == llaminar2::MoEIntermediateShardRowDisposition::Invalid)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("original intermediate shard row has invalid family, route or local payload");
+        }
+        return selection;
+    }
+
+    /**
+     * @brief Read the device-owned live count for a physical one-row route.
+     * @param active_row_count_device Optional stable captured INT32 address; null means one live row.
+     * @return Whether the row is live; values outside [0,1] are fatal before publication.
+     */
+    __device__ __forceinline__ bool runtime_decode_row_active(const int32_t *active_row_count_device)
+    {
+        const int32_t count = active_row_count_device ? *active_row_count_device : 1;
+        if (count < 0 || count > 1)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("one-row MoE routing received a live count outside [0,1]");
+            return false;
+        }
+        return count == 1;
+    }
+
+    /**
+     * @brief Authenticate the immutable execution policy even for an empty counted row.
+     * @param runtime Original captured runtime containing its closed source binding.
+     * @param row_execution_policy Captured row policy, which must agree with that binding.
+     */
+    __device__ __forceinline__ void runtime_require_decode_row_policy(
+        const DeviceMoELayerRuntimeView *runtime,
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy)
+    {
+        if ((row_execution_policy != llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
+             row_execution_policy != llaminar2::RoutedExpertRowExecutionPolicy::FullyReplicatedLocal &&
+             row_execution_policy != llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal) ||
+            runtime->intermediate_shard.enabled() !=
+                (row_execution_policy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal) ||
+            (runtime->intermediate_shard.enabled() && runtime->current_batch_llep_transient_bank_active != 0u))
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("decode row execution policy conflicts with the original fragment binding");
+            return;
+        }
+    }
+
     __device__ __forceinline__ void runtime_resolve_decode_dispatch(
         DeviceMoELayerRuntimeView *runtime,
         uint32_t execution_bank,
@@ -3036,7 +3099,7 @@ namespace
         int num_experts,
         int top_k,
         int32_t logical_position,
-        bool fully_replicated_local_rows,
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
         bool record_balance,
         bool *local_compute_flags,
         int *assigned_participants)
@@ -3050,6 +3113,8 @@ namespace
             return;
         }
 
+        runtime_require_decode_row_policy(runtime, row_execution_policy);
+
         for (int slot = 0; slot < top_k; ++slot)
         {
             local_compute_flags[slot] = false;
@@ -3059,13 +3124,25 @@ namespace
         const auto &bank = runtime_placement_banks(runtime)[execution_bank];
         const uint32_t participant_count = runtime->participant_count;
         const uint32_t participant_id = runtime->participant_id;
+        if (row_execution_policy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal)
+        {
+            for (int slot = 0; slot < top_k; ++slot)
+            {
+                if (selected_experts[slot] == -1) continue;
+                const auto selected = runtime_intermediate_shard_row(runtime, bank, selected_experts[slot]);
+                local_compute_flags[slot] = selected.disposition == llaminar2::MoEIntermediateShardRowDisposition::Local;
+                assigned_participants[slot] = selected.participant;
+            }
+            return;
+        }
+
         const bool valid_participants =
             participant_count > 0u &&
             participant_count <= static_cast<uint32_t>(kDeviceMoEMaxParticipants) &&
             participant_id < participant_count;
         const bool has_multi_resident_experts =
             runtime_multi_resident_expert_count(bank) != 0u;
-        if (fully_replicated_local_rows || !has_multi_resident_experts)
+        if (row_execution_policy == llaminar2::RoutedExpertRowExecutionPolicy::FullyReplicatedLocal || !has_multi_resident_experts)
         {
             /*
              * A fully replicated graph owns complete local expert payloads and
@@ -3080,7 +3157,7 @@ namespace
                     continue;
                 const bool local =
                     bank.local_compute_mask[expert_id] != 0u;
-                assigned_participants[slot] = fully_replicated_local_rows
+                assigned_participants[slot] = row_execution_policy == llaminar2::RoutedExpertRowExecutionPolicy::FullyReplicatedLocal
                                                   ? static_cast<int>(participant_id)
                                                   : runtime_expert_owner(
                                                         bank, expert_id);
@@ -7304,6 +7381,19 @@ namespace
     {
         if (!llaminar2::deviceMoEProjectionPayloadValid(desc))
             return false;
+        // An original local-F transfer retains the ready-row producer promise.
+        // Retargeting preserves these source fields and checks destination spans
+        // before copying; its host-authority bank publication still authenticates
+        // the destination family/shape. Whole-expert/GateUp APIs stay unchanged.
+        if(desc.projection_set==llaminar2::DeviceMoEProjectionSet::IntermediateShard &&
+           desc.weight_format==llaminar2::DeviceMoEWeightFormat::NativeQuantised) {
+            const auto ready=[](const auto& matrix) {
+                return matrix.source_identity_present==1u &&
+                    llaminar2::NativeQuantisedDescriptorValidation::publishable(matrix);
+            };
+            if(!ready(desc.gate)||!ready(desc.up)||!ready(desc.down))return false;
+        }
+
         if (llaminar2::deviceMoEWeightFormatIsFloating(desc.weight_format))
             return llaminar2::deviceMoEFloatingExpertCopyReady(desc);
         return desc.weight_format ==
@@ -7631,7 +7721,7 @@ namespace
         rebalance_retarget_transfer_matrix(
             dst.descriptor.up,
             src.descriptor.up);
-        if (src.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::CompleteExpert)
+        if (llaminar2::deviceMoEProjectionSetHasDown(src.descriptor.projection_set))
             rebalance_retarget_transfer_matrix(
                 dst.descriptor.down,
                 src.descriptor.down);
@@ -10371,7 +10461,7 @@ namespace
         }
         return rebalance_projection_payload_bytes(entry.descriptor.gate, entry) +
                rebalance_projection_payload_bytes(entry.descriptor.up, entry) +
-               (entry.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::CompleteExpert
+               (llaminar2::deviceMoEProjectionSetHasDown(entry.descriptor.projection_set)
                     ? rebalance_projection_payload_bytes(entry.descriptor.down, entry) : 0ULL);
     }
 
@@ -10469,7 +10559,7 @@ namespace
         }
         offset += rebalance_pack_projection_to_payload(src.descriptor.gate, src, payload + offset);
         offset += rebalance_pack_projection_to_payload(src.descriptor.up, src, payload + offset);
-        if (src.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::CompleteExpert)
+        if (llaminar2::deviceMoEProjectionSetHasDown(src.descriptor.projection_set))
             offset += rebalance_pack_projection_to_payload(src.descriptor.down, src, payload + offset);
         return offset;
     }
@@ -10497,7 +10587,7 @@ namespace
         }
         offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.gate, dst);
         offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.up, dst);
-        if (dst.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::CompleteExpert)
+        if (llaminar2::deviceMoEProjectionSetHasDown(dst.descriptor.projection_set))
             offset += rebalance_unpack_projection_from_payload(payload + offset, dst.descriptor.down, dst);
         return offset;
     }
@@ -10958,11 +11048,14 @@ namespace
              * runtime descriptor.
              *
              * Payload-only replication deliberately preserves the source owner.
+             * F fragments retain joint ownership: the directory's physical
+             * destination participant is never a scalar logical expert owner.
              * Both cases are derived from the immutable plan so no host mirror
              * or post-apply repair is involved.
              */
             dst.descriptor.owner_participant =
-                plan.op == kDeviceMoERebalancePlanOwnershipTransfer
+                src.descriptor.projection_set == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                    ? -1 : plan.op == kDeviceMoERebalancePlanOwnershipTransfer
                     ? static_cast<int32_t>(plan.destination_participant)
                     : src.descriptor.owner_participant;
             dst.descriptor.flags |= kDeviceMoEFlagTransferSlot;
@@ -14248,7 +14341,9 @@ namespace
             const int raw_effective = *effective_seq_len_ptr;
             // Zero is an ordinary empty retained replay, not a minimum batch
             // of one. This also protects every gate format using this kernel.
-            effective_seq_len = raw_effective < 0 ? 0 : (raw_effective > seq_len ? seq_len : raw_effective);
+            effective_seq_len = seq_len == 1
+                ? (runtime_decode_row_active(effective_seq_len_ptr) ? 1 : 0)
+                : (raw_effective < 0 ? 0 : (raw_effective > seq_len ? seq_len : raw_effective));
         }
         if (token >= effective_seq_len)
         {
@@ -14403,7 +14498,7 @@ namespace
         int num_experts, int top_k,
         bool normalize_weights,
         bool write_legacy_outputs,
-        bool fully_replicated_local_rows,
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
         const int32_t *__restrict__ absolute_position_ids,
         const DeviceMoERebalancePlanEntryView *rebalance_plan_entries,
         uint32_t rebalance_plan_capacity,
@@ -14414,7 +14509,8 @@ namespace
         DeviceMoERebalanceApplyStatusView *rebalance_apply_status,
         DeviceMoERebalanceGraphControllerStateView *rebalance_controller_state,
         int rebalance_target_layer,
-        uint32_t rebalance_command_buffer_count)
+        uint32_t rebalance_command_buffer_count,
+        const int32_t *__restrict__ active_row_count_device)
     {
         __shared__ float values[kMaxExperts];
         __shared__ float reductions[kThreads];
@@ -14480,6 +14576,8 @@ namespace
 
         if (threadIdx.x == 0)
         {
+            runtime_require_decode_row_policy(runtime, row_execution_policy);
+            const bool row_active = runtime_decode_row_active(active_row_count_device);
             const uint32_t execution_bank =
                 runtime_require_decode_execution_bank(runtime);
             if (execution_bank > 1u)
@@ -14498,7 +14596,7 @@ namespace
 
             bool local_compute_flags[kMaxTopK] = {};
             int assigned_participants[kMaxTopK] = {};
-            if (shape_ok)
+            if (shape_ok && row_active)
             {
                 runtime_resolve_decode_dispatch(
                     runtime,
@@ -14509,7 +14607,7 @@ namespace
                     absolute_position_ids
                         ? absolute_position_ids[0]
                         : -1,
-                    fully_replicated_local_rows,
+                    row_execution_policy,
                     UpdateRuntimeHistogram,
                     local_compute_flags,
                     assigned_participants);
@@ -14525,17 +14623,17 @@ namespace
                     runtime->topk_expert_ids[k] = local_compute ? selected[k] : -1;
                     runtime->topk_weights[k] = local_compute ? weight : 0.0f;
                     runtime->route_participant_ids[k] =
-                        assigned_participants[k];
+                        row_active ? assigned_participants[k] : -1;
                 }
                 if (write_legacy_outputs)
                 {
-                    legacy_indices[k] = static_cast<float>(selected[k]);
-                    legacy_weights[k] = weight;
+                    legacy_indices[k] = row_active ? static_cast<float>(selected[k]) : -1.0f;
+                    legacy_weights[k] = row_active ? weight : 0.0f;
                 }
             }
             if constexpr (UpdateRuntimeHistogram)
             {
-                if (!runtime_histogram_admits_rows(*runtime))
+                if (!row_active || !runtime_histogram_admits_rows(*runtime))
                     return;
                 for (int k = 0; k < top_k; ++k)
                 {
@@ -14557,7 +14655,7 @@ namespace
     }
 
     /**
-     * @brief Minimal decode router for a graph-proven unique-owner resident set.
+     * @brief Minimal decode router for independently published owner or fragment slots.
      *
      * Replica-aware scheduling carries participant load arrays and maintenance
      * arguments that a capacity-proven single-resident graph cannot consume.
@@ -14566,11 +14664,30 @@ namespace
      * production router.  The active runtime bank remains device-owned and is
      * authenticated on every replay.
      *
+     * Selected slots retain the serial normalization order, then each lane
+     * authenticates its current owner or complete intermediate fragment. Integer
+     * histogram increments touch unique expert IDs and preserve exact demand.
+     *
+     * @tparam RowPolicy Original whole-owner or intermediate-fragment row contract.
      * @tparam UpdateRuntimeHistogram Whether this graph publishes Dynamic
      *         residency evidence.
-     */
-    template <bool UpdateRuntimeHistogram>
-    __global__ void softmax_topk_decode_unique_owner_runtime_kernel(
+
+     * @tparam PublishDescriptors Publish original arena views in the authenticated route lane.
+     * @param logits Original FP32 probabilities in place.
+     * @param runtime Original device-owned runtime and acquired bank.
+     * @param legacy_indices Complete selected IDs when requested.
+     * @param legacy_weights Complete selected weight bits when requested.
+     * @param num_experts Exact admitted source expert extent.
+     * @param top_k Exact selected packet width.
+     * @param normalize_weights Retain the original serial FP32 normalization.
+     * @param write_legacy_outputs Whether complete selected outputs are required.
+     * @param active_row_count_device Optional live count for this physical row.
+     * @param publication Original arena outputs; unused in the control specialization.
+ */
+    template <bool UpdateRuntimeHistogram,
+              llaminar2::RoutedExpertRowExecutionPolicy RowPolicy = llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned,
+          bool PublishDescriptors = false>
+    __device__ __forceinline__ void softmax_topk_decode_independent_body(
         float *__restrict__ logits,
         DeviceMoELayerRuntimeView *__restrict__ runtime,
         float *legacy_indices,
@@ -14578,7 +14695,9 @@ namespace
         int num_experts,
         int top_k,
         bool normalize_weights,
-        bool write_legacy_outputs)
+        bool write_legacy_outputs,
+        const int32_t *__restrict__ active_row_count_device,
+        llaminar2::MoEDecodeDescriptorPublication publication)
     {
         __shared__ float values[kMaxExperts];
         __shared__ float reductions[kThreads];
@@ -14640,8 +14759,22 @@ namespace
             reductions,
             red_idx);
 
-        if (threadIdx.x != 0)
-            return;
+        static_assert(RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned ||
+                      RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal);
+        if (threadIdx.x == 0)
+        {
+            float topk_sum = 0.0f;
+            for (int slot = 0; slot < top_k; ++slot)
+                topk_sum += selected_weights[slot];
+            if (normalize_weights && topk_sum > 0.0f)
+                for (int slot = 0; slot < top_k; ++slot)
+                    selected_weights[slot] = selected_weights[slot] / topk_sum;
+        }
+        // Only metadata publication is parallel: preserve the serial FP32
+        // sum/division and make its exact bits visible to every selected lane.
+        __syncthreads();
+        const int slot = static_cast<int>(threadIdx.x);
+        if (slot >= top_k) return;
 
         const uint32_t execution_bank =
             runtime_require_decode_execution_bank(runtime);
@@ -14656,47 +14789,72 @@ namespace
             return;
         }
         const auto &bank = runtime_placement_banks(runtime)[execution_bank];
-        if (shape_ok && runtime_multi_resident_expert_count(bank) != 0u)
+        if (RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
+            shape_ok && runtime_multi_resident_expert_count(bank) != 0u)
         {
             FAIL_FAST_INCOMPLETE_LLEP_TRANSFER(
                 "unique-owner decode graph observed a replicated expert");
             return;
         }
 
-        float topk_sum = 0.0f;
-        for (int slot = 0; slot < top_k; ++slot)
-            topk_sum += selected_weights[slot];
+        runtime_require_decode_row_policy(runtime, RowPolicy);
+        const bool row_active = runtime_decode_row_active(active_row_count_device);
         const bool collect_histogram =
             UpdateRuntimeHistogram &&
             runtime_histogram_admits_rows(*runtime);
-        for (int slot = 0; slot < top_k; ++slot)
         {
-            const int expert_id = selected[slot];
-            const float weight = normalize_weights && topk_sum > 0.0f
-                                     ? selected_weights[slot] / topk_sum
-                                     : selected_weights[slot];
+            const int expert_id = row_active ? selected[slot] : -1;
+            const float weight = selected_weights[slot];
             bool local_compute = false;
-            if (shape_ok && expert_id >= 0 && expert_id < num_experts)
+            if (shape_ok)
             {
-                local_compute = bank.local_compute_mask[expert_id] != 0u;
+                int participant = -1;
+                if constexpr (RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal)
+                {
+                    if (expert_id != -1)
+                    {
+                        const auto selection = runtime_intermediate_shard_row(runtime, bank, expert_id);
+                        local_compute = selection.disposition == llaminar2::MoEIntermediateShardRowDisposition::Local;
+                        participant = selection.participant;
+                    }
+                }
+                else
+                {
+                    const bool selected = expert_id >= 0 && expert_id < num_experts;
+                    local_compute = selected && bank.local_compute_mask[expert_id] != 0u;
+                    participant = selected ? runtime_expert_owner(bank, expert_id) : -1;
+                }
                 runtime->topk_expert_ids[slot] =
                     local_compute ? expert_id : -1;
                 runtime->topk_weights[slot] =
                     local_compute ? weight : 0.0f;
                 runtime->route_participant_ids[slot] =
-                    runtime_expert_owner(bank, expert_id);
+                    participant;
+                if constexpr (PublishDescriptors)
+                {
+                    if (local_compute)
+                    {
+                        const auto &descriptor = bank.experts[expert_id];
+                        bool ready = descriptor.weight_format == publication.format;
+                        if constexpr (RowPolicy == llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned)
+                            ready = ready && descriptor.local_slot >= 0 &&
+                                (bank.resident_participant_mask[expert_id] & runtime_participant_bit(runtime->participant_id)) &&
+                                llaminar2::deviceMoEExpertProjectionReady(descriptor, publication.projections);
+                        llaminar2::publishMoEDecodeDescriptor(publication, descriptor, expert_id, ready);
+                    }
+                }
             }
             if (write_legacy_outputs)
             {
                 legacy_indices[slot] = static_cast<float>(expert_id);
-                legacy_weights[slot] = weight;
+                legacy_weights[slot] = row_active ? weight : 0.0f;
             }
             if constexpr (UpdateRuntimeHistogram)
             {
                 if (!collect_histogram || expert_id < 0 ||
                     expert_id >= num_experts)
                 {
-                    continue;
+                    return;
                 }
                 atomicAdd(
                     reinterpret_cast<unsigned long long *>(
@@ -14713,6 +14871,45 @@ namespace
         }
     }
 
+/** @brief Original independent router entry; retains the control's exact kernel ABI. */
+template <bool UpdateRuntimeHistogram,
+          llaminar2::RoutedExpertRowExecutionPolicy RowPolicy = llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned>
+__global__ void softmax_topk_decode_independent_runtime_kernel(
+        float *__restrict__ logits,
+        DeviceMoELayerRuntimeView *__restrict__ runtime,
+        float *legacy_indices,
+        float *legacy_weights,
+        int num_experts,
+        int top_k,
+        bool normalize_weights,
+        bool write_legacy_outputs,
+        const int32_t *__restrict__ active_row_count_device)
+    {
+    softmax_topk_decode_independent_body<UpdateRuntimeHistogram, RowPolicy, false>(
+        logits, runtime, legacy_indices, legacy_weights, num_experts, top_k,
+        normalize_weights, write_legacy_outputs, active_row_count_device, {});
+}
+
+/** @brief Fused entry publishes arena descriptors from the same authenticated route lanes. */
+template <bool UpdateRuntimeHistogram,
+          llaminar2::RoutedExpertRowExecutionPolicy RowPolicy = llaminar2::RoutedExpertRowExecutionPolicy::ParticipantAssigned>
+__global__ void softmax_topk_decode_descriptors_kernel(
+        float *__restrict__ logits,
+        DeviceMoELayerRuntimeView *__restrict__ runtime,
+        float *legacy_indices,
+        float *legacy_weights,
+        int num_experts,
+        int top_k,
+        bool normalize_weights,
+        bool write_legacy_outputs,
+        const int32_t *__restrict__ active_row_count_device,
+        llaminar2::MoEDecodeDescriptorPublication publication)
+    {
+    softmax_topk_decode_independent_body<UpdateRuntimeHistogram, RowPolicy, true>(
+        logits, runtime, legacy_indices, legacy_weights, num_experts, top_k,
+        normalize_weights, write_legacy_outputs, active_row_count_device, publication);
+}
+
     __global__ void decode_route_select_runtime_kernel(
         const int *__restrict__ expert_indices,
         const float *__restrict__ expert_weights,
@@ -14723,6 +14920,7 @@ namespace
         int top_k,
         bool write_legacy_outputs,
         bool update_runtime_histogram,
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
         const int32_t *__restrict__ absolute_position_ids)
     {
         if (threadIdx.x != 0)
@@ -14753,7 +14951,7 @@ namespace
                 absolute_position_ids
                     ? absolute_position_ids[0]
                     : -1,
-                /*fully_replicated_local_rows=*/false,
+                row_execution_policy,
                 update_runtime_histogram,
                 local_compute_flags,
                 assigned_participants);
@@ -15403,7 +15601,7 @@ namespace
      *
      * Descriptor readiness and active-list compaction are collective block
      * operations. Keeping their shared state in one explicit object lets both
-     * the descriptor-only decode publisher and the fused verifier grouping
+     * the complete descriptor publisher and the fused verifier grouping
      * publisher invoke exactly the same device implementation.
      */
     struct RuntimePrefillPlanPublicationScratch
@@ -15418,7 +15616,7 @@ namespace
      * Each lane owns exactly one expert id.  Keeping this operation separate
      * from active-list compaction allows the fused verifier transaction to
      * overlap descriptor publication with its count/offset publication while
-     * the descriptor-only decode transaction continues to use the same exact
+     * the selected decode transaction continues to use the same exact
      * readiness and zero-fill contract.
      *
      * @param bank Active immutable placement bank selected by the caller.
@@ -15433,6 +15631,7 @@ namespace
      * @return True when the expert is locally resident and compute-ready.
      */
     __device__ __forceinline__ bool publish_runtime_expert_descriptors_lane(
+        const DeviceMoELayerRuntimeView *runtime,
         const DeviceMoEPlacementBankView &bank,
         uint32_t local_bit,
         int expert,
@@ -15451,8 +15650,10 @@ namespace
         // column bank owns down; absence alone never selects split execution.
         const bool descriptor_ready =
             llaminar2::deviceMoEExpertProjectionReady(desc, expected_projections);
-        const bool local_ready =
-            bank.local_compute_mask[expert] != 0u &&
+        const bool local_ready = expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+            ? runtime_intermediate_shard_row(runtime, bank, expert).disposition ==
+                  llaminar2::MoEIntermediateShardRowDisposition::Local && desc.weight_format == expected_format
+            : bank.local_compute_mask[expert] != 0u &&
             (bank.resident_participant_mask[expert] & local_bit) != 0u &&
             desc.local_slot >= 0 &&
             desc.weight_format == expected_format && descriptor_ready;
@@ -15494,6 +15695,63 @@ namespace
     }
 
     /**
+     * @brief Refresh only descriptors consumed by this exact one-row route packet.
+     *
+     * The arena retains a full expert-indexed table, but this invocation owns only
+     * its selected entries. Every later consumer uses the same immutable ID packet
+     * on this stream. Previously selected entries need no sweep: selecting them
+     * again necessarily refreshes them from the currently acquired placement bank.
+     * A selected remote expert is explicitly zeroed by the shared publisher.
+     *
+     * @param runtime Participant runtime whose acquired epoch owns the source bank.
+     * @param expert_ids Device-owned selected IDs, with -1 for inactive routes.
+     * @param gate_descs Existing graph-owned expert-indexed gate descriptor storage.
+     * @param up_descs Existing graph-owned expert-indexed up descriptor storage.
+     * @param down_descs Existing graph-owned expert-indexed down descriptor storage.
+     * @param num_experts Logical source/table extent, independent of launch size.
+     * @param top_k Exact route packet width; launch one lane per selected slot.
+     * @param format Original native or floating descriptor family.
+     * @param projections Exact admitted movable projection contract.
+     */
+    __global__ void materialize_runtime_selected_decode_descriptors_kernel(
+        const DeviceMoELayerRuntimeView *__restrict__ runtime,
+        const int *__restrict__ expert_ids,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ gate_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ up_descs,
+        DeviceNativeQuantisedMatrixDesc *__restrict__ down_descs,
+        int num_experts, int top_k, llaminar2::DeviceMoEWeightFormat format,
+        llaminar2::DeviceMoEProjectionSet projections)
+    {
+        const uint32_t execution_bank = runtime_execution_bank(runtime);
+        if (!runtime || execution_bank > 1u ||
+            runtime->intermediate_shard.enabled() !=
+                (projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard))
+        {
+            if (threadIdx.x == 0) FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("selected decode descriptors require the acquired bank and projection contract");
+            return;
+        }
+        const int slot = static_cast<int>(threadIdx.x);
+        if (slot >= top_k) return;
+        const int expert = expert_ids[slot];
+        if (expert == -1) return;
+        if (expert < 0 || expert >= num_experts)
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("selected decode descriptor ID lies outside the admitted source");
+            return;
+        }
+        // Ordinary top-k IDs are unique. An explicit packet may repeat an ID;
+        // its first slot alone owns publication, avoiding even identical-write races.
+        for (int earlier = 0; earlier < slot; ++earlier)
+            if (expert_ids[earlier] == expert) return;
+        const auto &bank = runtime_placement_banks(runtime)[execution_bank];
+        const uint32_t local_bit =
+            projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                ? 0u : runtime_participant_bit(static_cast<int>(runtime->participant_id));
+        publish_runtime_expert_descriptors_lane(runtime, bank, local_bit, expert, num_experts,
+            gate_descs, up_descs, down_descs, format, projections);
+    }
+
+    /**
      * @brief Materialize descriptor tables and the stable local active list.
      *
      * Every lane in the block must call this function. Ascending block-sized
@@ -15523,6 +15781,8 @@ namespace
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
             execution_bank > 1u ||
             !llaminar2::deviceMoEProjectionSetValid(expected_projections) ||
+            (runtime && runtime->intermediate_shard.enabled() !=
+                (expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard)) ||
             (expected_format !=
                  llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
              !llaminar2::deviceMoEWeightFormatIsFloating(expected_format)) ||
@@ -15589,7 +15849,8 @@ namespace
         const DeviceMoEPlacementBankView &bank =
             runtime_placement_banks(runtime)[execution_bank];
         const uint32_t local_bit =
-            runtime_participant_bit(static_cast<int>(runtime->participant_id));
+            expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                    ? 0u : runtime_participant_bit(static_cast<int>(runtime->participant_id));
         if (publish_active_experts)
             initialize_active_expert_compaction(scratch.active_experts);
 
@@ -15601,6 +15862,7 @@ namespace
         {
             const int expert = chunk + static_cast<int>(threadIdx.x);
             const bool local_ready = publish_runtime_expert_descriptors_lane(
+                runtime,
                 bank,
                 local_bit,
                 expert,
@@ -16147,7 +16409,10 @@ namespace
         const DeviceMoEPlacementBankView &bank =
             runtime_placement_banks(runtime)[execution_bank];
         const DeviceMoEExpertDescriptorView &desc = bank.experts[expert_id];
-        const uint32_t local_bit =
+        if (expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard)
+        return runtime_intermediate_shard_row(runtime, bank, expert_id).disposition ==
+            llaminar2::MoEIntermediateShardRowDisposition::Local;
+    const uint32_t local_bit =
             runtime_participant_bit(static_cast<int>(runtime->participant_id));
         return bank.local_compute_mask[expert_id] != 0u &&
                (bank.resident_participant_mask[expert_id] & local_bit) != 0u &&
@@ -16216,6 +16481,8 @@ namespace
             (PublishRouterInputs && (!routing_indices || !routing_weights)) ||
             execution_bank > 1u ||
             !llaminar2::deviceMoEProjectionSetValid(expected_projections) ||
+            (runtime && runtime->intermediate_shard.enabled() !=
+                (expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard)) ||
             runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots) ||
             !runtime->route_expert_ids || !runtime->route_weights ||
             !runtime->route_participant_ids || !runtime->expert_counts ||
@@ -16318,7 +16585,8 @@ namespace
                         expert_id = -1;
                         route_weight = 0.0f;
                     }
-                    else if (filter_to_local_runtime_experts != 0)
+                    else if (filter_to_local_runtime_experts != 0 ||
+                    expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard)
                     {
                         /* StaticOwner still publishes one globally canonical
                          * participant ledger on every shard.  Local grouping
@@ -16327,8 +16595,9 @@ namespace
                          * valid peer route for a heterogeneous/no-op route. */
                         const DeviceMoEPlacementBankView &bank =
                             runtime_placement_banks(runtime)[execution_bank];
-                        participant_id =
-                            runtime_expert_owner(bank, expert_id);
+                        participant_id = expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                            ? runtime_intermediate_shard_row(runtime, bank, expert_id).participant
+                            : runtime_expert_owner(bank, expert_id);
                         if (participant_id !=
                                 static_cast<int>(runtime->participant_id) ||
                             !prefill_static_local_runtime_ready(
@@ -16443,7 +16712,8 @@ namespace
                 const DeviceMoEPlacementBankView &bank =
                     runtime_placement_banks(runtime)[execution_bank];
                 const uint32_t local_bit =
-                    runtime_participant_bit(local_participant);
+                    expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                    ? 0u : runtime_participant_bit(local_participant);
                 const bool is_active = count > 0;
 
                 /*
@@ -16456,6 +16726,7 @@ namespace
                 if (is_active)
                 {
                     local_ready = publish_runtime_expert_descriptors_lane(
+                        runtime,
                         bank,
                         local_bit,
                         tid,
@@ -16508,7 +16779,8 @@ namespace
                     const DeviceMoEExpertDescriptorView &desc =
                         bank.experts[invalid_expert];
                     const uint32_t local_bit =
-                        runtime_participant_bit(local_participant);
+                        expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                    ? 0u : runtime_participant_bit(local_participant);
                     const DeviceMoEPlacementBankView *const durable_banks =
                         runtime_durable_placement_banks(runtime);
                     const llaminar2::DeviceMoEOverlayEpochTicket *const ticket =
@@ -16637,6 +16909,12 @@ namespace
         if (runtime->prefill_route_capacity < static_cast<uint32_t>(max_slots))
             return;
 
+        if (runtime->intermediate_shard.enabled() !=
+            (expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard))
+        {
+            FAIL_FAST_INCOMPLETE_LLEP_TRANSFER("scalable grouping has the wrong original fragment projection arm");
+            return;
+        }
         int expert_id = -1;
         float weight = 0.0f;
         int participant_id = -1;
@@ -16649,7 +16927,8 @@ namespace
             expert_id = -1;
             weight = 0.0f;
         }
-        else if (filter_to_local_runtime_experts != 0)
+        else if (filter_to_local_runtime_experts != 0 ||
+                    expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard)
         {
             /*
              * Preserve the authoritative StaticOwner participant even on a
@@ -16660,7 +16939,9 @@ namespace
             const uint32_t execution_bank = runtime_execution_bank(runtime);
             const DeviceMoEPlacementBankView &bank =
                 runtime_placement_banks(runtime)[execution_bank];
-            participant_id = runtime_expert_owner(bank, expert_id);
+            participant_id = expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                            ? runtime_intermediate_shard_row(runtime, bank, expert_id).participant
+                            : runtime_expert_owner(bank, expert_id);
             if (participant_id !=
                     static_cast<int>(runtime->participant_id) ||
                 !prefill_static_local_runtime_ready(
@@ -17912,13 +18193,15 @@ namespace
         llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ up_descs,
         llaminar2::DeviceMoEFloatingMatrixDesc *__restrict__ down_descs,
         int num_experts,
-        llaminar2::DeviceMoEWeightFormat expected_format)
+        llaminar2::DeviceMoEWeightFormat expected_format,
+    llaminar2::DeviceMoEProjectionSet expected_projections)
     {
         const uint32_t execution_bank = runtime_execution_bank(runtime);
         if (!runtime || !gate_descs || !up_descs || !down_descs ||
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
             execution_bank > 1u ||
-            !llaminar2::deviceMoEWeightFormatIsFloating(expected_format))
+            !llaminar2::deviceMoEWeightFormatIsFloating(expected_format) ||
+        runtime->intermediate_shard.enabled() != (expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard))
         {
             if (threadIdx.x == 0)
             {
@@ -17930,15 +18213,17 @@ namespace
         const DeviceMoEPlacementBankView &bank =
             runtime_placement_banks(runtime)[execution_bank];
         const uint32_t local_bit =
-            runtime_participant_bit(static_cast<int>(runtime->participant_id));
+            runtime->intermediate_shard.enabled() ? 0u : runtime_participant_bit(static_cast<int>(runtime->participant_id));
         // Every admitted descriptor is overwritten on each replay, including
         // remote entries and logical experts above the fixed launch width.
         for (int expert = static_cast<int>(threadIdx.x); expert < num_experts;
              expert += static_cast<int>(blockDim.x))
         {
             const DeviceMoEExpertDescriptorView &desc = bank.experts[expert];
-            const bool local_ready =
-                bank.local_compute_mask[expert] != 0u &&
+            const bool local_ready = expected_projections == llaminar2::DeviceMoEProjectionSet::IntermediateShard
+                ? runtime_intermediate_shard_row(runtime, bank, expert).disposition ==
+                      llaminar2::MoEIntermediateShardRowDisposition::Local && desc.weight_format == expected_format
+                : bank.local_compute_mask[expert] != 0u &&
                 (bank.resident_participant_mask[expert] & local_bit) != 0u &&
                 desc.local_slot >= 0 &&
                 desc.weight_format == expected_format &&
@@ -21793,7 +22078,7 @@ extern "C"
                                              float *legacy_indices, float *legacy_weights,
                                              int num_experts, int top_k, bool normalize_weights,
                                              bool write_legacy_outputs, bool update_runtime_histogram,
-                                             bool fully_replicated_local_rows,
+                                             llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
                                              void *runtime_layers,
                                              const void *rebalance_plan_entries,
                                              uint32_t rebalance_plan_capacity,
@@ -21806,7 +22091,8 @@ extern "C"
                                              int rebalance_target_layer,
                                              uint32_t rebalance_command_buffer_count,
                                              const int32_t *absolute_position_ids,
-                                             int device_idx, void *stream)
+                                             int device_idx, void *stream,
+        const int32_t *active_row_count_device)
     {
         if (!runtime_layer ||
             num_experts <= 0 ||
@@ -21833,6 +22119,28 @@ extern "C"
         if (any_rebalance_binding && !complete_rebalance_binding)
             return false;
 
+        // The immutable fragment policy has independent selected slots and
+        // needs no replica scheduler state or maintenance ABI in its kernel.
+        if (row_execution_policy == llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal &&
+            !apply_ready_rebalance)
+        {
+            if (!logits || !stream ||
+                (write_legacy_outputs && (!legacy_indices || !legacy_weights))) return false;
+#define LLAMINAR_LAUNCH_FRAGMENT_ROUTE(HISTOGRAM) \
+            softmax_topk_decode_independent_runtime_kernel<HISTOGRAM, \
+                llaminar2::RoutedExpertRowExecutionPolicy::IntermediateShardLocal> \
+                <<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>( \
+                    logits, static_cast<DeviceMoELayerRuntimeView *>(runtime_layer), \
+                    legacy_indices, legacy_weights, num_experts, top_k, \
+                    normalize_weights, write_legacy_outputs, active_row_count_device)
+            if (update_runtime_histogram)
+                LLAMINAR_LAUNCH_FRAGMENT_ROUTE(true);
+            else
+                LLAMINAR_LAUNCH_FRAGMENT_ROUTE(false);
+#undef LLAMINAR_LAUNCH_FRAGMENT_ROUTE
+            return finishLaunch("cudaMoE_softmax_topk_decode_intermediate_shard_runtime");
+        }
+
         DeviceMoERebalanceConfigView rebalance_cfg{};
         if (rebalance_config)
             rebalance_cfg = *static_cast<const DeviceMoERebalanceConfigView *>(rebalance_config);
@@ -21843,7 +22151,7 @@ extern "C"
                 logits, static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),             \
                 static_cast<DeviceMoELayerRuntimeView *>(runtime_layers),                    \
                 legacy_indices, legacy_weights, num_experts, top_k, normalize_weights,       \
-                write_legacy_outputs, fully_replicated_local_rows, absolute_position_ids,    \
+                write_legacy_outputs, row_execution_policy, absolute_position_ids,    \
                 static_cast<const DeviceMoERebalancePlanEntryView *>(rebalance_plan_entries),\
                 rebalance_plan_capacity,                                                     \
                 static_cast<DeviceMoERebalanceCommandBufferHeaderView *>(                    \
@@ -21854,7 +22162,7 @@ extern "C"
                 static_cast<DeviceMoERebalanceApplyStatusView *>(rebalance_apply_status),     \
                 static_cast<DeviceMoERebalanceGraphControllerStateView *>(                   \
                     rebalance_controller_state),                                             \
-                rebalance_target_layer, rebalance_command_buffer_count)
+                rebalance_target_layer, rebalance_command_buffer_count, active_row_count_device)
 
         if (update_runtime_histogram)
         {
@@ -21875,7 +22183,61 @@ extern "C"
         return finishLaunch("cudaMoE_softmax_topk_decode_runtime");
     }
 
-    /**
+        /**
+     * @brief Publish the exact decode route and its descriptors in one retained kernel.
+     * @param logits Original FP32 router logits, overwritten with probabilities.
+     * @param runtime Original device runtime retaining the acquired placement bank.
+     * @param legacy_indices Optional complete selected ID output.
+     * @param legacy_weights Optional complete selected weight output.
+     * @param num_experts Exact original source extent.
+     * @param top_k Exact selected packet width.
+     * @param normalize_weights Preserve the backend's original serial normalization.
+     * @param write_legacy_outputs Whether both complete selected outputs are bound.
+     * @param update_runtime_histogram Whether this graph owns demand evidence.
+     * @param row_policy Original independent whole-owner or local-fragment contract.
+     * @param publication Existing arena descriptor outputs with complete identity.
+     * @param device_idx Original rank-local device ordinal.
+     * @param stream Exact non-default producer and consumer stream.
+     * @param active_row_count_device Optional device-owned live row count.
+     * @return Whether validation and native submission succeeded.
+     */
+__attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected_descriptors(
+        float *logits, void *runtime, float *legacy_indices, float *legacy_weights,
+        int num_experts, int top_k, bool normalize_weights, bool write_legacy_outputs,
+        bool update_runtime_histogram, llaminar2::RoutedExpertRowExecutionPolicy row_policy,
+        llaminar2::MoEDecodeDescriptorPublication publication,
+        int device_idx, void *stream, const int32_t *active_row_count_device)
+{
+    using Policy = llaminar2::RoutedExpertRowExecutionPolicy;
+    using Projections = llaminar2::DeviceMoEProjectionSet;
+    if (!logits || !runtime || reinterpret_cast<std::uintptr_t>(stream) <= 2u ||
+        num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+        top_k <= 0 || top_k > kMaxTopK || top_k > num_experts ||
+        !publication.valid() || publication.expert_count != num_experts ||
+        (write_legacy_outputs && (!legacy_indices || !legacy_weights)) ||
+        (row_policy != Policy::ParticipantAssigned && row_policy != Policy::IntermediateShardLocal) ||
+        (row_policy == Policy::IntermediateShardLocal) != (publication.projections == Projections::IntermediateShard))
+        return false;
+    if (cudaSetDevice(device_idx) != cudaSuccess) return false;
+#define LLAMINAR_LAUNCH_ROUTE_DESCRIPTORS(HISTOGRAM, POLICY) \
+    softmax_topk_decode_descriptors_kernel<HISTOGRAM, POLICY><<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>( \
+        logits, static_cast<DeviceMoELayerRuntimeView *>(runtime), legacy_indices, legacy_weights, \
+        num_experts, top_k, normalize_weights, write_legacy_outputs, active_row_count_device, publication)
+    if (row_policy == Policy::IntermediateShardLocal)
+    {
+        if (update_runtime_histogram) LLAMINAR_LAUNCH_ROUTE_DESCRIPTORS(true, Policy::IntermediateShardLocal);
+        else LLAMINAR_LAUNCH_ROUTE_DESCRIPTORS(false, Policy::IntermediateShardLocal);
+    }
+    else
+    {
+        if (update_runtime_histogram) LLAMINAR_LAUNCH_ROUTE_DESCRIPTORS(true, Policy::ParticipantAssigned);
+        else LLAMINAR_LAUNCH_ROUTE_DESCRIPTORS(false, Policy::ParticipantAssigned);
+    }
+#undef LLAMINAR_LAUNCH_ROUTE_DESCRIPTORS
+    return finishLaunch("cudaMoE_softmax_topk_decode_selected_descriptors");
+}
+
+/**
      * @brief Launch the minimal unique-owner CUDA decode router.
      *
      * The device kernel traps if the active runtime bank contains a replica;
@@ -21892,7 +22254,8 @@ extern "C"
         bool write_legacy_outputs,
         bool update_runtime_histogram,
         int device_idx,
-        void *stream)
+        void *stream,
+        const int32_t *active_row_count_device)
     {
         if (!logits || !runtime_layer || !stream || num_experts <= 0 ||
             num_experts > kDeviceMoEMaxExperts || top_k <= 0 ||
@@ -21904,7 +22267,7 @@ extern "C"
         cudaSetDevice(device_idx);
         if (update_runtime_histogram)
         {
-            softmax_topk_decode_unique_owner_runtime_kernel<true>
+            softmax_topk_decode_independent_runtime_kernel<true>
                 <<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
                     logits,
                     static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),
@@ -21913,11 +22276,11 @@ extern "C"
                     num_experts,
                     top_k,
                     normalize_weights,
-                    write_legacy_outputs);
+                    write_legacy_outputs, active_row_count_device);
         }
         else
         {
-            softmax_topk_decode_unique_owner_runtime_kernel<false>
+            softmax_topk_decode_independent_runtime_kernel<false>
                 <<<1, kThreads, 0, static_cast<cudaStream_t>(stream)>>>(
                     logits,
                     static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),
@@ -21926,7 +22289,7 @@ extern "C"
                     num_experts,
                     top_k,
                     normalize_weights,
-                    write_legacy_outputs);
+                    write_legacy_outputs, active_row_count_device);
         }
         return finishLaunch(
             "cudaMoE_softmax_topk_decode_unique_owner_runtime");
@@ -21936,16 +22299,17 @@ extern "C"
                                              void *runtime_layer,
                                              float *legacy_indices, float *legacy_weights,
                                              int num_experts, int top_k, bool write_legacy_outputs,
-                                             bool update_runtime_histogram, int device_idx, void *stream)
+                                             bool update_runtime_histogram, llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy, int device_idx, void *stream)
     {
-        if (!runtime_layer || num_experts > kDeviceMoEMaxExperts || top_k > kMaxTopK)
+        if (!runtime_layer || !expert_indices || !expert_weights || !stream ||
+            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts || top_k <= 0 || top_k > kMaxTopK)
             return false;
         cudaSetDevice(device_idx);
         decode_route_select_runtime_kernel<<<1, kMaxTopK, 0, static_cast<cudaStream_t>(stream)>>>(
             expert_indices, expert_weights, static_cast<DeviceMoELayerRuntimeView *>(runtime_layer),
             legacy_indices, legacy_weights, num_experts, top_k,
             write_legacy_outputs, update_runtime_histogram,
-            /*absolute_position_ids=*/nullptr);
+            row_execution_policy, /*absolute_position_ids=*/nullptr);
         return finishLaunch("cudaMoE_decode_route_select_runtime");
     }
 
@@ -23762,14 +24126,50 @@ extern "C"
         return finishGroupedPrefillLaunch("cudaMoE_prefill_llep_after_transfers_assign_routes_from_spans", cuda_stream);
     }
 
+    /**
+     * @brief Publish this decode packet's descriptors without scanning source capacity.
+     * @param runtime Device runtime retaining the acquired placement epoch.
+     * @param expert_ids Exact device ID packet also consumed by gate/up and down.
+     * @param gate_descs Stable full-domain gate storage; only selected IDs are written.
+     * @param up_descs Stable full-domain up storage; only selected IDs are written.
+     * @param down_descs Stable full-domain down storage; only selected IDs are written.
+     * @param num_experts Admitted logical table extent for bounds validation.
+     * @param top_k Actual packet width, not expert or workspace capacity.
+     * @param format Original descriptor scalar family; no conversion is performed.
+     * @param device_idx Original local device ordinal.
+     * @param stream Exact producer/consumer stream retained by capture.
+     * @param projections Original movable projection ownership contract.
+     * @return Whether admission and native submission succeeded.
+     */
+    __attribute__((visibility("default"))) bool cudaMoE_materialize_runtime_selected_decode_descriptors(
+        const void *runtime, const int *expert_ids,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs, llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs, int num_experts, int top_k,
+        llaminar2::DeviceMoEWeightFormat format, int device_idx, void *stream,
+        llaminar2::DeviceMoEProjectionSet projections)
+    {
+        if (!runtime || !expert_ids || !gate_descs || !up_descs || !down_descs || !stream ||
+            num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
+            top_k <= 0 || top_k > kMaxTopK || top_k > num_experts ||
+            !llaminar2::deviceMoEProjectionSetValid(projections) ||
+            (format != llaminar2::DeviceMoEWeightFormat::NativeQuantised &&
+             !llaminar2::deviceMoEWeightFormatIsFloating(format))) return false;
+        if (cudaSetDevice(device_idx) != cudaSuccess) return false;
+        materialize_runtime_selected_decode_descriptors_kernel<<<1, top_k, 0, static_cast<cudaStream_t>(stream)>>>(
+            static_cast<const DeviceMoELayerRuntimeView *>(runtime), expert_ids,
+            reinterpret_cast<DeviceNativeQuantisedMatrixDesc *>(gate_descs), reinterpret_cast<DeviceNativeQuantisedMatrixDesc *>(up_descs), reinterpret_cast<DeviceNativeQuantisedMatrixDesc *>(down_descs), num_experts, top_k, format, projections);
+        return finishGroupedPrefillLaunch("cudaMoE_materialize_runtime_selected_decode_descriptors",
+            static_cast<cudaStream_t>(stream));
+    }
+
     __attribute__((visibility("default"))) bool cudaMoE_materialize_runtime_prefill_descriptor_tables(
         const void *runtime,
-        DeviceNativeQuantisedMatrixDesc *gate_descs,
-        DeviceNativeQuantisedMatrixDesc *up_descs,
-        DeviceNativeQuantisedMatrixDesc *down_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
+        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
         int num_experts,
         int device_idx,
-        void *stream)
+        void *stream, llaminar2::DeviceMoEProjectionSet expected_projections)
     {
         if (!runtime || !gate_descs || !up_descs || !down_descs || !stream ||
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts)
@@ -23782,16 +24182,16 @@ extern "C"
                                                                static_cast<cudaStream_t>(stream)>>>(
             static_cast<DeviceMoELayerRuntimeView *>(
                 const_cast<void *>(runtime)),
-            gate_descs,
-            up_descs,
-            down_descs,
+            reinterpret_cast<DeviceNativeQuantisedMatrixDesc *>(gate_descs),
+            reinterpret_cast<DeviceNativeQuantisedMatrixDesc *>(up_descs),
+            reinterpret_cast<DeviceNativeQuantisedMatrixDesc *>(down_descs),
             num_experts,
             /*active_expert_ids=*/nullptr,
             /*max_active_experts=*/0,
             /*current_slots=*/0,
             /*publish_prefill_histogram=*/0,
             llaminar2::DeviceMoEWeightFormat::NativeQuantised,
-            llaminar2::DeviceMoEProjectionSet::CompleteExpert);
+            expected_projections);
         return finishGroupedPrefillLaunch(
             "cudaMoE_materialize_runtime_prefill_descriptor_tables",
             static_cast<cudaStream_t>(stream));
@@ -23933,7 +24333,7 @@ extern "C"
         int num_experts,
         llaminar2::DeviceMoEWeightFormat format,
         int device_idx,
-        void *stream)
+        void *stream, llaminar2::DeviceMoEProjectionSet expected_projections)
     {
         if (!d_runtime_layer || !d_gate_descs || !d_up_descs || !d_down_descs ||
             num_experts <= 0 || num_experts > kDeviceMoEMaxExperts ||
@@ -23956,7 +24356,7 @@ extern "C"
                 d_up_descs,
                 d_down_descs,
                 num_experts,
-                format);
+                format, expected_projections);
         return finishLaunch(
             "cudaMoE_materialize_runtime_floating_descriptor_tables");
     }
@@ -25524,8 +25924,8 @@ namespace llaminar2::cuda
         const auto native_stream = static_cast<cudaStream_t>(stream);
         if (launch.format == MoERouterPreparedFormat::BlockQ8)
         {
-            // Publish every local expert input in its original basis, including
-            // empty owners. Only this participant's logits/top-k are computed.
+            // Expert consumers borrow every live local input, even if this
+            // participant owns no logits or top-k rows.
             const dim3 quant_grid(launch.width / 32, launch.capacity);
             if (rows > 0 && launch.q8_basis == RouterQ8Basis::SignedHadamard32)
             {
@@ -25535,7 +25935,8 @@ namespace llaminar2::cuda
             else
             {
                 grouped_hidden_quantize_blockwise_rows_kernel<<<quant_grid, 32, 0, native_stream>>>(
-                    launch.hidden, launch.hidden_q8, launch.hidden_scales, launch.capacity, launch.width);
+                    launch.hidden, launch.hidden_q8, launch.hidden_scales, launch.capacity,
+                    launch.width, launch.live_rows);
                 if (!finishLaunch("cudaMoE_owned_q8_hidden")) return false;
             }
             if (rows > 0)
@@ -25550,7 +25951,8 @@ namespace llaminar2::cuda
                 if (launch.q8_basis == RouterQ8Basis::SignedHadamard32)
                 {
                     grouped_hidden_quantize_blockwise_rows_kernel<<<quant_grid, 32, 0, native_stream>>>(
-                        launch.hidden, launch.hidden_q8, launch.hidden_scales, launch.capacity, launch.width);
+                        launch.hidden, launch.hidden_q8, launch.hidden_scales, launch.capacity,
+                        launch.width, launch.live_rows);
                     if (!finishLaunch("cudaMoE_owned_q8_original_publication")) return false;
                 }
             }

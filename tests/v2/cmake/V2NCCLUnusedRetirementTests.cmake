@@ -1,4 +1,5 @@
-# Native immediate-retirement coverage for the actual CUDA readiness race.
+## @file V2NCCLUnusedRetirementTests.cmake
+## @brief Register native two-card retirement coverage for the CUDA readiness race.
 # The deterministic source replay remains device-free and independently registered.
 if(HAVE_CUDA)
     add_executable(v2_integration_nccl_unused_communicator_retirement
@@ -9,7 +10,7 @@ if(HAVE_CUDA)
         COMMAND $<TARGET_FILE:v2_integration_nccl_unused_communicator_retirement>
             --gtest_filter=NCCLUnusedCommunicatorRetirement.DirectOwnerRetiresTwentyUnusedCliques
         LABELS "V2;Integration;ProductionTestPreflight;NCCL;CUDA;Admission;Teardown;Devices2;Replay;Regression"
-        MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+        GPU_DEVICES 2 MPI_PROCS 1 NO_MODELS TIMEOUT 120)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
         V2_Integration_NCCLUnusedRetirement_DirectOwnerRetiresTwentyUnusedCliques_2Devices)
 endif()

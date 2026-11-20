@@ -7,6 +7,7 @@
  * crossing mapping boundaries, eviction and concurrent clients. Mutation and
  * malformed admission fail before a destination can become partially valid.
  */
+#include "../../utils/HostNUMANodes.h"
 #include "loaders/ImmutableRowTable.h"
 #include "loaders/ModelContext.h"
 #include "planning/ImmutableRowTablePlacementPlanner.h"
@@ -524,9 +525,10 @@ TEST(ImmutableRowTable, WholeHostTaskPolicyPreservesCanonicalAllocator)
     table.gather(ids,output);expectRows(file,90,ids,output);
 }
 
-/** @test Explicit NUMA1 locality never changes the canonical CPU0 physical ledger. */
+/** @test Exact physical NUMA placement retains CPU0 as the canonical memory ledger owner. */
 TEST(ImmutableRowTable, ExplicitNumaPlacementPreservesCanonicalPhysicalOwnership)
 {
+    const auto placement = ImmutableRowTableHostPlacement::onNode(llaminar2::test::hostLastNUMANode());
     RowFile file(90, 3);
     for (const auto mode : {ImmutableRowStorage::RAM, ImmutableRowStorage::MemoryMapped})
     {
@@ -535,9 +537,9 @@ TEST(ImmutableRowTable, ExplicitNumaPlacementPreservesCanonicalPhysicalOwnership
         const auto planned = ImmutableRowTable::physicalBytes(src, policy);
         auto memory = authority(planned, DeviceId::cpu());
         {
-            ImmutableRowTable table(src, policy, DeviceId::cpu(), memory,ImmutableRowTableHostPlacement::onNode(1));
+            ImmutableRowTable table(src, policy, DeviceId::cpu(), memory, placement);
             EXPECT_EQ(table.hostDevice(), DeviceId::cpu());
-            EXPECT_EQ(table.hostPlacement(), ImmutableRowTableHostPlacement::onNode(1));
+            EXPECT_EQ(table.hostPlacement(), placement);
             EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ImmutableTableStorage,
                 PhysicalMemoryMaterializationKind::NewAllocation), planned);
             const std::array<std::int64_t, 2> ids{2, 0};
@@ -547,8 +549,8 @@ TEST(ImmutableRowTable, ExplicitNumaPlacementPreservesCanonicalPhysicalOwnership
         }
         EXPECT_EQ(memory->claimedBytes(DeviceId::cpu(), PhysicalMemoryOwner::ImmutableTableStorage,
             PhysicalMemoryMaterializationKind::NewAllocation), 0u);
-        EXPECT_THROW(ImmutableRowTable(src, policy, DeviceId{DeviceType::CPU, 1}, memory,ImmutableRowTableHostPlacement::onNode(1)), std::exception);
-        EXPECT_THROW(ImmutableRowTable(src, policy, DeviceId::cuda(0), memory,ImmutableRowTableHostPlacement::onNode(1)), std::invalid_argument);
+        EXPECT_THROW(ImmutableRowTable(src, policy, DeviceId{DeviceType::CPU, 1}, memory, placement), std::exception);
+        EXPECT_THROW(ImmutableRowTable(src, policy, DeviceId::cuda(0), memory, placement), std::invalid_argument);
     }
 }
 

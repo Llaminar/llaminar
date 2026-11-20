@@ -95,6 +95,6 @@ originalCPUExpertShardCohortTarget(const MoEExpertOwnerMap *source,
     }
     if (!tier)
         throw std::invalid_argument("CPU cohort channel has no original tier identity");
-    return MoEOverlayRouteTarget::cpuCohort(*tier).word();
+    return MoEOverlayRouteTarget::cohort(*tier).word();
 }
 } // namespace llaminar2

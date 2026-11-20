@@ -314,6 +314,20 @@ namespace llaminar2
         }
 
         /**
+         * @brief Execute one original local F fragment and publish its full-H partial output.
+         * @param model_columns Original unchanged hidden/output width H.
+         * @return A distinct partial transaction; it cannot certify whole-expert measurements.
+         * @note Runtime grouping must separately authenticate the original cohort and local F geometry.
+         */
+        [[nodiscard]] static MoEPrefillProjectionExecution intermediateShard(int model_columns)
+        {
+            return {Phase::IntermediateShard, model_columns, 0, model_columns};
+        }
+
+        /** @return Whether the declared publication still requires its original cohort reduction. */
+        [[nodiscard]] bool isIntermediateShard() const noexcept { return phase_ == Phase::IntermediateShard; }
+
+        /**
          * @brief Stop after ordinary grouped SwiGLU publication.
          *
          * The caller retains the existing activation representation and route
@@ -452,7 +466,7 @@ namespace llaminar2
 
     private:
         /** @brief Closed transaction kinds; callers construct only valid cases. */
-        enum class Phase { Complete, GateUp, Down };
+        enum class Phase { Complete, GateUp, Down, IntermediateShard };
 
         /** @brief Reject invalid or overflowing ranges before capture begins. */
         MoEPrefillProjectionExecution(

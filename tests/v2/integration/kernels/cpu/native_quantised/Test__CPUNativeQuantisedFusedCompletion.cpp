@@ -38,6 +38,10 @@ namespace llaminar2::test
 namespace
 {
 using namespace cpu::native_quantised;
+#if defined(__aarch64__)
+/** @brief ARM native programs own full-K register trees: only one storage route exists. */
+enum class NativeQuantisedFusedPartialRoute { FullK };
+#endif
 
 /** @brief Restore the caller's worker and arithmetic-partition test controls. */
 class FusedCompletionScope final
@@ -96,8 +100,12 @@ void proveFusedCompletion(NativeQuantisedFusedPartialRoute route)
     constexpr int k = 512;
     constexpr int workers = 7;
     constexpr float guard = -12345.0f;
+#if defined(__aarch64__)
+    const int n0 = 257, n1 = 321;
+#else
     const int n0 = route == NativeQuantisedFusedPartialRoute::SharedBank ? 31 : 257;
     const int n1 = route == NativeQuantisedFusedPartialRoute::SharedBank ? 61 : 321;
+#endif
     FusedCompletionScope runtime(workers,
         route == NativeQuantisedFusedPartialRoute::FullK ? 1 : 16);
     const auto &formats = quantizedVerifierFormats();
@@ -117,8 +125,10 @@ void proveFusedCompletion(NativeQuantisedFusedPartialRoute route)
 
         for (int rows : {1, 2, 3, 15, 31})
         {
+#if !defined(__aarch64__)
             if (route == NativeQuantisedFusedPartialRoute::SharedBank && rows > 3)
                 continue; // More row tiles legitimately select local ownership.
+#endif
             SCOPED_TRACE("rows=" + std::to_string(rows));
             std::vector<float> source(size_t(rows) * k);
             for (size_t value = 0; value < source.size(); ++value)
@@ -165,7 +175,11 @@ void proveFusedCompletion(NativeQuantisedFusedPartialRoute route)
                         .rows = rows,
                         .verifier_schedule = rows == 1 ? VerifierRowsPolicy::Auto : VerifierRowsPolicy::Pairwise};
                 const auto plan = planNativeQuantisedFusedRows(descriptors, rows, workers, ISAPath::AUTO);
+#if defined(__aarch64__)
+                ASSERT_EQ(plan.sharedPartialFloats(), 0u);
+#else
                 ASSERT_EQ(plan.partial_route, route);
+#endif
                 NativeQuantisedTestPartialStorage partials(plan.sharedPartialFloats());
                 auto invoke = [&]() {
                     return gemm_native_quantised_fused_verifier_rows_preq(input.data(),
@@ -213,6 +227,7 @@ TEST(CPUNativeQuantisedFusedCompletion, FullK)
     proveFusedCompletion(NativeQuantisedFusedPartialRoute::FullK);
 }
 
+#if !defined(__aarch64__)
 /** @test Per-output ordered trees need only the real optional bias dependency. */
 TEST(CPUNativeQuantisedFusedCompletion, OutputTileLocal)
 {
@@ -224,17 +239,46 @@ TEST(CPUNativeQuantisedFusedCompletion, SharedBank)
 {
     proveFusedCompletion(NativeQuantisedFusedPartialRoute::SharedBank);
 }
+#else
+/**
+ * @test The native ARM schedule owns output N itself. Auto and Current name that
+ * mapping; explicit x86 job layouts are rejected by name, never reinterpreted,
+ * and an out-of-range enum value is rejected before any payload write.
+ */
+TEST(CPUNativeQuantisedFusedCompletion, NativeARMOutputJobOwnershipAdmission)
+{
+    using namespace cpu::native_quantised;
+    EXPECT_NO_THROW(requireNativeNEONFusedOutputJobOwnership(FusedOutputJobOwnership::Auto));
+    EXPECT_NO_THROW(requireNativeNEONFusedOutputJobOwnership(FusedOutputJobOwnership::Current));
+    EXPECT_THROW(requireNativeNEONFusedOutputJobOwnership(FusedOutputJobOwnership::Contiguous), std::invalid_argument);
+    EXPECT_THROW(requireNativeNEONFusedOutputJobOwnership(FusedOutputJobOwnership::PanelBlocks), std::invalid_argument);
+    EXPECT_THROW(requireNativeNEONFusedOutputJobOwnership(static_cast<FusedOutputJobOwnership>(2)), std::invalid_argument);
+}
+#endif
 } // namespace llaminar2::test
 
 #include "CPUNativeQuantisedFusedPerfIdentity.inc"
 
 #include "CPUNativeQuantisedOrderedNibbleReplay.inc"
+// Execution-exact overlays key on the x86 build/runtime ISA pair; ARM has no
+// execution-exact table (its NEON overlays are retired).
+#if !defined(__aarch64__)
 #include "CPUNativeQuantisedExecutionExactPolicy.inc"
+#endif
 
+// The live-plan prefix lifecycle drives the x86 fused-rows planner directly.
+#if !defined(__aarch64__)
 #include "CPUNativeQuantisedFusedLivePrefixLifecycle.inc"
+#endif
 
 #include "CPUNativeQuantisedUnsignedWeightDotLifecycle.inc"
 
+// Same-panel pair runs are a job layout of the x86 fused-rows planner.
+#if !defined(__aarch64__)
 #include "CPUNativeQuantisedSamePanelPairRunReplay.inc"
+#endif
 
+// OrderedThreeRows is an x86 (AVX512) Prefill schedule of the x86 planner.
+#if !defined(__aarch64__)
 #include "CPUNativeQuantisedOrderedThreeRowNibbleLifecycle.inc"
+#endif

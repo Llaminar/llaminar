@@ -6,7 +6,7 @@
  * pair. Fixed down-output slices have model lifetime and never travel through
  * this value. Empty values represent non-resident slots; partially assembled
  * arrivals belong to the transfer builder, not to a publishable residency bank.
- * Whole payloads own engine lifetimes only. A distinct closed CPU-fragment
+ * Whole payloads own engine lifetimes only. A distinct closed fragment
  * payload additionally retains its SAME original fixed cohort geometry and
  * preparation, never a second placement map or physical memory ledger.
  */
@@ -36,18 +36,18 @@ namespace llaminar2
     enum class ExpertTierWeightProjection : std::uint8_t;
 
     /**
-     * @brief Closed CPU fragment retaining original fixed source geometry and actual engines.
+     * @brief Closed CPU/GPU fragment retaining original source geometry and actual engines.
      *
      * A complete local triplet is not a whole expert. This type cannot convert
      * to the whole-owner payload or manufacture an initial static source layer.
      * Epoch belongs to its containing RCU bank; unchanged engines can survive
      * bank replacement without rewriting source provenance or original IDs.
      */
-    class MoEOverlayPreparedCPUFragmentPayload final
+    class MoEOverlayPreparedFragmentPayload final
     {
     public:
         /** @brief Construct an empty nonresident fragment slot. */
-        MoEOverlayPreparedCPUFragmentPayload() noexcept = default;
+        MoEOverlayPreparedFragmentPayload() noexcept = default;
         /** @return Whether this is an empty nonresident slot. */
         bool empty() const noexcept
         {
@@ -80,8 +80,10 @@ namespace llaminar2
         /** @brief Record only completed use of these genuine incoming engines.
          * @param invocation_epoch Exact containing bank selected by the retained invocation lease.
          * @param routes Positive number of completed logical expert routes.
-         * @throws std::logic_error For an invocation older than its actual arrival.
-         * Static source payloads and disabled evidence publish nothing. Metadata keys are cold-bound.
+         * @throws std::logic_error For an invocation older than its actual arrival or
+         * an attempted GPU completion publication through this host-only counter.
+         * Static source payloads and disabled evidence publish nothing. GPU completion
+         * belongs to device-owned runtime counters; metadata keys here are cold-bound.
          */
         void recordCompletedExecution(std::uint64_t invocation_epoch,std::uint64_t routes)const;
         /** @return SAME original preparation shared control block. */
@@ -106,13 +108,13 @@ namespace llaminar2
         }
         /** @param other Another fragment slot. @return Exact provenance and shared-engine ownership
          * equality. */
-        bool sameIdentity(const MoEOverlayPreparedCPUFragmentPayload &other) const noexcept;
+        bool sameIdentity(const MoEOverlayPreparedFragmentPayload &other) const noexcept;
         /**
          * @brief Validate physical geometry/format without minting model or source authority.
          * @param cohort Original fixed source geometry.
          * @param member Exact original member coordinate.
          * @param role Semantic projection being completed.
-         * @param engine Actual final local CPU engine.
+         * @param engine Actual final local CPU/GPU engine.
          * @param error Precise physical mismatch diagnostic.
          * @return True only for exact local N/K and original source format.
          */
@@ -135,7 +137,7 @@ namespace llaminar2
          * @param arrival_epoch Existing authenticated destination epoch; zero only for initial source construction.
          * @throws std::invalid_argument For absent provenance or incompatible physical engines.
          */
-        MoEOverlayPreparedCPUFragmentPayload(
+        MoEOverlayPreparedFragmentPayload(
             ModelContextId model,
             std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation,
             std::shared_ptr<const MoEExpertShardCohort> cohort, std::size_t member, int expert,

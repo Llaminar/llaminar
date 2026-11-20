@@ -316,9 +316,10 @@ class Cell final
             "rocm_gdn_dense_compact_accepted_prefix_kernel") != std::string::npos,
             "Dense compact graph selected foreign native function");
         require(p.kernelParams && p.kernelParams[0], "Dense compact argument absent");
+        const bool vector = !capturing && std::string(name).find("kernel_vector4") != std::string::npos;
         require(p.gridDim.x == unsigned(requests * heads) && p.gridDim.z == 1 &&
-            p.gridDim.y == unsigned(capturing ? (dv + 31) / 32 : geometry.matrixTileCount(4096)) &&
-            p.blockDim.x == unsigned(capturing ? 128 : 256) && p.blockDim.y == 1 && p.blockDim.z == 1 &&
+            p.gridDim.y == unsigned(capturing ? (dv + 31) / 32 : geometry.matrixTileCount(vector ? 2048 : 4096)) &&
+            p.blockDim.x == unsigned(capturing || vector ? 128 : 256) && p.blockDim.y == 1 && p.blockDim.z == 1 &&
             p.sharedMemBytes == unsigned(capturing ? (dk == 64 ? 1552 : 7184) : 0),
             "Dense compact launch geometry differs");
         if (capturing)
@@ -2549,6 +2550,201 @@ TEST(Test__ROCmGDNPaddedRealLength, DensePreparedRetainedInvocationNoOpMirrors)
     if (!hasROCm())
         GTEST_SKIP() << "No ROCm device available";
     rocm_dense_compact_test::conditionalMirrorReplay(true);
+}
+
+/** @test Actual H12 ValueMajor compact producer, publication and following reader at each width. */
+/**
+ * @brief Replay accepted H12 state for the diagnostic and admitted default paths.
+ * @param measured_default Request the qualified default publication program.
+ * @param ordinal Physical participant shared by both retained graphs.
+ */
+static void verifyQFNAcceptedVectorPublication(bool measured_default, int ordinal)
+{
+    ASSERT_TRUE(hasROCm());
+    checkHip(hipSetDevice(ordinal), "bind native accepted publication participant");
+    using namespace rocm_dense_compact_test;
+    for (int capacity : {2, 3, 4, 5, 6, 7, 8})
+    {
+        Cell cell(12, 4, 128, 128, 1, capacity, Layout::ValueMajorKeyContiguous,
+            true, false, false, {}, GDNDenseCompactTerminalKind::RetainedPrefixesOnly, ordinal);
+        cell.run({{capacity}, {capacity - 1}, {0}, {1}, {capacity}});
+        Cell actual(12, 4, 128, 128, 1, capacity, Layout::ValueMajorKeyContiguous,
+            true, false, false, {}, GDNDenseCompactTerminalKind::RetainedPrefixesOnly, ordinal,
+            GDNDenseAcceptedSelectionKind::OwnRequestFlattenedRows);
+        HipFloatBuffer mirror(actual.initial_host.size(), Cell::Poison);
+        HipCapturedGraph publish(actual.stream.stream, [&] {
+            return launchROCmDenseCompactAcceptedPrefixWithPolicy({actual.transaction(),
+                actual.acceptedSelection(), actual.initial.ptr,
+                GDNDenseCompactRequestZeroMirror::borrow(actual.geometry, mirror.ptr, mirror.count)},
+                actual.stream.stream,measured_default);
+        });
+        const char* mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_GDN_ACCEPTED_VECTOR4");
+        const bool requested = mode ? std::string_view(mode) == "1" : measured_default;
+        const auto nodes = eventLeaf(publish);
+        const char* name = hipKernelNameRefByPtr(nodes.func, actual.stream.stream);
+        ASSERT_NE(name, nullptr);
+        const bool selected = std::string(name).find("kernel_vector4") != std::string::npos;
+        ASSERT_EQ(selected, requested);
+        std::cout << "QFN_ACCEPT_CAPTURE M=" << capacity << " selected=" << name
+            << " grid=" << nodes.gridDim.x << ',' << nodes.gridDim.y
+            << " block=" << nodes.blockDim.x << '\n';
+
+        for (int live : {capacity, capacity - 1, 0, 1, capacity})
+        {
+            actual.reset();
+            mirror.fill(Cell::Poison);
+            actual.live_host[0] = live;
+            actual.accepted_host[0] = -1;
+            actual.publishCounts();
+            actual.capture->launch(actual.stream.stream);
+            actual.dense->launch(actual.stream.stream);
+            actual.finish();
+            auto state = actual.initial_host;
+            auto mirror_state = std::vector<float>(mirror.count, Cell::Poison);
+            const auto snapshots = actual.snapshots.toHost();
+            auto retained = actual.compact.toHost();
+            for (int selected_row : {-1, live - 1, -1, live > 0 ? 0 : -1})
+            {
+                actual.accepted_host[0] = selected_row;
+                actual.publishCounts();
+                publish.launch(actual.stream.stream);
+                actual.finish();
+                if (selected_row >= 0)
+                {
+                    std::copy_n(snapshots.begin() + std::size_t(selected_row) * actual.state_stride,
+                        actual.state_stride, state.begin());
+                    std::copy_n(state.begin(), actual.state_stride, mirror_state.begin());
+                }
+                equal(actual.initial.toHost(), state, "original flattened acceptance with in-place state");
+                equal(mirror.toHost(), mirror_state, "optional request-zero state ownership");
+            }
+            equal(actual.compact.toHost(), retained, "immutable corrections and checkpoints");
+        }
+    }
+}
+
+/** @test A float-aligned destination or mirror uses scalar publication and preserves padding. */
+/** @test Preserve the explicit native accepted-vector diagnostic. */
+TEST(Test__ROCmGDNPaddedRealLength, QFNAcceptedVectorPublication)
+{
+    verifyQFNAcceptedVectorPublication(false, 0);
+}
+
+/** @test The original qualified MI50 plan uses aligned accepted-state publication without an override. */
+TEST(Test__ROCmGDNPaddedRealLength, QFNAcceptedVectorPublicationDefault)
+{
+    ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_GDN_ACCEPTED_VECTOR4"),nullptr);
+    ASSERT_TRUE(hasROCm());
+    const int ordinal = llaminar2::test::findQFNMI50ReplayDevice();
+    if (ordinal < 0)
+        GTEST_SKIP() << "Requires an original 60-CU gfx906 participant";
+    verifyQFNAcceptedVectorPublication(true, ordinal);
+}
+
+TEST(Test__ROCmGDNPaddedRealLength, QFNAcceptedVectorUnalignedOutputs)
+{
+    ASSERT_TRUE(hasROCm());
+    checkHip(hipSetDevice(0), "bind accepted-state alignment replay participant");
+    using namespace rocm_dense_compact_test;
+    constexpr int rows = 4;
+    Cell cell(12, 4, 128, 128, 1, rows, Layout::ValueMajorKeyContiguous,
+        true, false, false, {}, GDNDenseCompactTerminalKind::RetainedPrefixesOnly, 0,
+        GDNDenseAcceptedSelectionKind::OwnRequestFlattenedRows);
+    cell.reset();
+    cell.live_host[0] = rows;
+    cell.accepted_host[0] = rows - 1;
+    cell.publishCounts();
+    cell.capture->launch(cell.stream.stream);
+    cell.dense->launch(cell.stream.stream);
+    cell.finish();
+    const auto snapshots = cell.snapshots.toHost();
+    const auto source = snapshots.begin() + (rows - 1) * cell.state_stride;
+    for (const std::size_t destination_offset : {0U, 1U})
+    {
+        const auto mirror_offset = 1U - destination_offset;
+        HipFloatBuffer destination(cell.state_stride + 2, Cell::Poison);
+        HipFloatBuffer mirror(cell.state_stride + 2, Cell::Poison);
+        HipCapturedGraph graph(cell.stream.stream, [&] {
+            return launchROCmDenseCompactAcceptedPrefix({cell.transaction(), cell.acceptedSelection(),
+                destination.ptr + destination_offset, GDNDenseCompactRequestZeroMirror::borrow(
+                    cell.geometry, mirror.ptr + mirror_offset, mirror.count - mirror_offset)}, cell.stream.stream);
+        });
+        const auto node = eventLeaf(graph);
+        const char* native = hipKernelNameRefByPtr(node.func, cell.stream.stream);
+        ASSERT_NE(native, nullptr);
+        ASSERT_NE(std::string_view(native).find("rocm_gdn_dense_compact_accepted_prefix_kernel"),
+            std::string_view::npos);
+        ASSERT_EQ(std::string_view(native).find("kernel_vector4"), std::string_view::npos);
+        graph.launch(cell.stream.stream);
+        cell.finish();
+        auto expected = std::vector<float>(destination.count, Cell::Poison);
+        std::copy_n(source, cell.state_stride, expected.begin() + destination_offset);
+        equal(destination.toHost(), expected, "unaligned accepted state and guard bytes");
+        expected.assign(mirror.count, Cell::Poison);
+        std::copy_n(source, cell.state_stride, expected.begin() + mirror_offset);
+        equal(mirror.toHost(), expected, "unaligned request mirror and guard bytes");
+    }
+}
+
+/** @test Time the actual 36-layer native publication sequence independently of capture and oracle. */
+TEST(Test__ROCmGDNPaddedRealLength, DISABLED_QFNAcceptedVectorPublicationEvents)
+{
+    ASSERT_TRUE(hasROCm());
+    checkHip(hipSetDevice(0), "bind native accepted publication event participant");
+    using namespace rocm_dense_compact_test;
+    constexpr int layers = 36;
+    constexpr int graphRepeats = 12;
+    for (int capacity : {4, 7, 8})
+    {
+        std::vector<std::unique_ptr<Cell>> owners;
+        std::vector<std::unique_ptr<HipFloatBuffer>> mirrors;
+        HipStreamHandle stream;
+        for (int layer = 0; layer < layers; ++layer)
+        {
+            auto cell = std::make_unique<Cell>(12, 4, 128, 128, 1, capacity,
+                Layout::ValueMajorKeyContiguous, true, false, false, GDNDenseRetentionProgram{},
+                GDNDenseCompactTerminalKind::RetainedPrefixesOnly, 0,
+                GDNDenseAcceptedSelectionKind::OwnRequestFlattenedRows);
+            cell->publishCounts();
+            cell->capture->launch(cell->stream.stream);
+            cell->finish();
+            mirrors.push_back(std::make_unique<HipFloatBuffer>(cell->initial_host.size(), Cell::Poison));
+            owners.push_back(std::move(cell));
+        }
+        for (bool mirror : {false, true})
+        {
+            HipCapturedGraph whole(stream.stream, [&] {
+                for (int repeat = 0; repeat < graphRepeats; ++repeat)
+                    for (int layer = 0; layer < layers; ++layer)
+                    {
+                        const auto& cell = *owners[layer];
+                        const auto second = mirror ?
+                            GDNDenseCompactRequestZeroMirror::borrow(cell.geometry, mirrors[layer]->ptr,
+                                mirrors[layer]->count) : GDNDenseCompactRequestZeroMirror::none();
+                        if (!launchROCmDenseCompactAcceptedPrefix({cell.transaction(),
+                                    cell.acceptedSelection(), cell.initial.ptr, second}, stream.stream))
+                            return false;
+                    }
+                return true;
+            });
+            for (int prefix : {0, 1, capacity / 2, capacity})
+            {
+                for (const auto& cell : owners)
+                {
+                    cell->accepted_host[0] = prefix - 1;
+                    cell->publishCounts();
+                    cell->finish();
+                }
+                gdn_paired_perf::Events events;
+                for (int i = -4; i < 20; ++i)
+                {
+                    const auto usec = events.measure(whole, stream.stream, graphRepeats);
+                    if (i >= 0) std::cout << "QFN_ACCEPT_EVENTS M=" << capacity << " accepted=" << prefix
+                        << " mirror=" << mirror << " sample=" << i << " layer_us=" << usec / layers << '\n';
+                }
+            }
+        }
+    }
 }
 
 #endif

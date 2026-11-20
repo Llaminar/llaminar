@@ -3,7 +3,8 @@ name: Develop Unit and host gate
 # Runner-group access is pinned to this workflow on develop. The caller keeps
 # the pull_request event, so checkout still tests its proposed merge commit.
 # Dedicated AVX2 and AVX512 hosts run complete Unit plus host preflight in
-# parallel. CPU admission rejects unsupported hardware before compilation.
+# parallel. AVX2 then requires every supported production preflight test in a
+# separate GPU container. CPU admission rejects unsupported hardware before compiling.
 on:
   workflow_call:
 
@@ -25,9 +26,13 @@ jobs:
         include:
           - cpu_isa: AVX2
             runner: llaminar-develop-avx2
+            pr_gpus: CUDA+ROCm
+            check_name: Unit + hardware preflight (AVX2)
           - cpu_isa: AVX512
             runner: llaminar-avx512
-    name: Unit + host (${{ matrix.cpu_isa }})
+            pr_gpus: none
+            check_name: Unit + host (AVX512)
+    name: ${{ matrix.check_name }}
     # Each ISA replaces its own obsolete work independently, while different
     # PRs retain separate queues on their respective dedicated hosts.
     concurrency:
@@ -71,18 +76,20 @@ jobs:
       - uses: ./.github/actions/cache-develop-toolchain
         with:
           cpu-isa: ${{ matrix.cpu_isa }}
-      - name: Build ${{ matrix.cpu_isa }} test inventory and run Unit plus host tests
+      - name: Build ${{ matrix.cpu_isa }} inventory and run its required PR scopes
         shell: bash
         env:
           CPU_ISA: ${{ matrix.cpu_isa }}
+          PR_GPUS: ${{ matrix.pr_gpus }}
           LLAMINAR_DOCKER_BUILD_CACHE_ACCESS: import-only
         run: |
           set -euo pipefail
           export LLAMINAR_DOCKER_BUILD_CACHE_IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:build-cache-develop"
           exec python3 scripts/ci/run_develop_image_gate.py \
             --cpu-isa "$CPU_ISA" \
+            --pr-gpus "$PR_GPUS" \
             --output "$RUNNER_TEMP/llaminar-develop-pr-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
-      - name: Retain image-bound Unit and host evidence
+      - name: Retain image-bound CPU and GPU PR evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:

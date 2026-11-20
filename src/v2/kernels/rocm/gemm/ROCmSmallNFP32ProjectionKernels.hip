@@ -27,6 +27,7 @@
 
 #include "../../../execution/local_execution/graph/GraphCaptureGuard.h"
 
+#include "ROCmSmallNFP32ProjectionBody.hip.inc"
 namespace
 {
     constexpr int SMALL_N_FP32_BLOCK = 256;
@@ -143,28 +144,8 @@ namespace
      * the first wave then execute every shuffle; only original owning lanes
      * perform additions. No multiply or rounded partial is reassociated.
      */
-    __device__ __forceinline__ float reduceFloating256(float value, float *scratch)
-    {
-        const unsigned lane = threadIdx.x;
-        scratch[lane] = value;
-        __syncthreads();
-        for (unsigned stride = 128; stride >= 64; stride >>= 1)
-        {
-            if (lane < stride) scratch[lane] += scratch[lane + stride];
-            __syncthreads();
-        }
-        if (lane < 64)
-        {
-            value = scratch[lane];
-#pragma unroll
-            for (unsigned stride = 32; stride; stride >>= 1)
-            {
-                const float partner = __shfl_down(value, stride, 64);
-                if (lane < stride) value += partner;
-            }
-        }
-        return value;
-    }
+    __device__ __forceinline__ float reduceFloating256(float value,float* scratch)
+    {return llaminar2::rocm::floating_projection_native::reduce(value,scratch);}
 
     __global__ void fp32_stage_batched_projection_pointers_kernel(
         const Fp32BatchedProjectionPointers ptrs,
@@ -217,51 +198,11 @@ namespace
         if (!A || !B || !C)
             return;
 
-        static_assert(LOAD_PAIRS == 1 || LOAD_PAIRS == 4 || LOAD_PAIRS == 8);
-        float sum = 0.0f;
-        if constexpr (LOAD_PAIRS == 1)
-        {
-            for (int k = static_cast<int>(threadIdx.x); k < K; k += SMALL_N_FP32_BLOCK)
-            {
-                sum += A[static_cast<size_t>(m) * K + k] *
-                       B[static_cast<size_t>(n) * K + k];
-            }
-        }
-        else
-        {
-            const float *input_row = A + static_cast<size_t>(m) * K;
-            const float *weight_row = B + static_cast<size_t>(n) * K;
-            int k = static_cast<int>(threadIdx.x);
-            constexpr int LOAD_GROUP = LOAD_PAIRS * SMALL_N_FP32_BLOCK;
-            const int grouped_end = K - K % LOAD_GROUP;
-            for (; k < grouped_end; k += LOAD_GROUP)
-            {
-                float input[LOAD_PAIRS];
-                float weight[LOAD_PAIRS];
-#pragma unroll
-                for (int pair = 0; pair < LOAD_PAIRS; ++pair)
-                {
-                    input[pair] = input_row[k + pair * SMALL_N_FP32_BLOCK];
-                    weight[pair] = weight_row[k + pair * SMALL_N_FP32_BLOCK];
-                }
-                // One ordered chain, not independent partial accumulators: grouped rows
-                // and serial decode must retain every original FP32 rounding step.
-#pragma unroll
-                for (int pair = 0; pair < LOAD_PAIRS; ++pair)
-                    sum += input[pair] * weight[pair];
-            }
-            for (; k < K; k += SMALL_N_FP32_BLOCK)
-            {
-                sum += input_row[k] * weight_row[k];
-            }
-        }
-
         __shared__ float scratch[SMALL_N_FP32_BLOCK];
-        const float reduced = reduceFloating256(sum, scratch);
-
-        if (threadIdx.x == 0)
-            C[static_cast<size_t>(m) * N + n] = reduced;
-    }
+        const float reduced=llaminar2::rocm::floating_projection_native::row<LOAD_PAIRS>(
+            A+static_cast<size_t>(m)*K,B+static_cast<size_t>(n)*K,K,scratch);
+        if(threadIdx.x==0)C[static_cast<size_t>(m)*N+n]=reduced;
+}
 
     /**
      * @brief Fixed-order projection with 16-bit weights and original FP32 A.

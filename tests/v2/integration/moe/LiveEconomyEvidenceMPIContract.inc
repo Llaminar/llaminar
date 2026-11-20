@@ -71,7 +71,7 @@ TEST(Test__MoEOverlayMPIResidencyConsensus, LiveEconomyEvidenceCountsPayloadAndE
         const auto coordinate=members==1
             ? recordedWholeMigrationCoordinate(0,empty?1:2,0)
             : MoEOverlayMigrationTargetCoordinate{
-                MoEOverlayRouteTarget::cpuCohort(2),MoEOverlayRouteTarget::whole(0),0};
+                MoEOverlayRouteTarget::cohort(2),MoEOverlayRouteTarget::whole(0),0};
         MoEOverlayMigrationProfileEvidence profile{.profile_sequence=sequence++,
             .coordinate=coordinate,.local_measurements=rows,.context=context};
         std::string error;ASSERT_TRUE(exchange.beginMigrationProfile(profile,&error))<<error;

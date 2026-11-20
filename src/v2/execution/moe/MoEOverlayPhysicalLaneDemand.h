@@ -2,7 +2,7 @@
  * @file MoEOverlayPhysicalLaneDemand.h
  * @brief Passive original-piece demand shared by staging BOM and physical lane setup.
  *
- * A canonical closed cycle visits each complete placement target once. A CPU
+ * A canonical closed cycle visits each complete placement target once. A CPU or GPU
  * cohort is one target with several real projection endpoints. Bounds count
  * the actual nonempty intersections, never allocated columns or a scalar -1
  * owner. This is immutable BOM geometry; PMA remains the only byte authority.
@@ -244,7 +244,7 @@ inline void requireFitsMoEOverlayLaneDemand(const MoEOverlayPhysicalLaneDemandPl
  * @param plan Bound original topology, including tiers that initially own no experts.
  * @param source Full original native layer manifest.
  * @param experts Full original expert axis.
- * @return Whole participant targets or one complete fixed CPU cohort per tier.
+ * @return Whole participant targets or one complete original CPU/GPU cohort per tier.
  * @note No owner map, selected expert IDs, source lease or execution token is constructed.
  */
 inline std::vector<MoEOverlayPhysicalProjectionTarget> configuredMoEOverlayProjectionTargets(
@@ -262,14 +262,26 @@ inline std::vector<MoEOverlayPhysicalProjectionTarget> configuredMoEOverlayProje
             .participant_id=entry.participant_id,.world_rank=entry.world_rank,.device=entry.device,
             .address=domain->participants.at(size_t(entry.domain_participant_index))});
         if(members.empty())throw std::invalid_argument("Configured projection tier has no original members");
-        if(domain->routed_compute_policy==RoutedExpertComputePolicy::TensorSharded && members.size()>1) {
+        if(domain->routed_compute_policy==RoutedExpertComputePolicy::TensorSharded &&
+            !(members.size()==1 && members.front().device.is_cpu())) {
+            if(members.size()>size_t(std::numeric_limits<int>::max()))
+                throw std::invalid_argument("Configured physical cohort member count exceeds its source index type");
+            const bool gpu=std::all_of(members.begin(),members.end(),[](const auto& member){return member.device.is_gpu();});
+            if(gpu ? (domain->scope!=ExecutionDomainScope::RANK_LOCAL || domain->owner_rank<0)
+                   : (domain->scope!=ExecutionDomainScope::NODE_LOCAL || domain->world_ranks.size()!=members.size()))
+                throw std::invalid_argument("Configured physical cohort requires its original GPU rank-local or CPU node-local domain");
             std::vector<MoEExpertShardCohort::Participant> declared;
-            for(const auto& member:members) {
-                if(!member.device.is_cpu())throw std::invalid_argument("Configured physical GPU cohort demand is not implemented");
+            for(const auto& member:members)
                 declared.push_back({member.participant_id,member.world_rank,member.address});
-            }
-            const auto cohort=MoEExpertShardCohort::checked(source,experts,std::move(declared),
-                MoEExpertShardCohort::balancedIntervals(source,int(members.size())));
+            // Match the original owner-map source-native partition exactly,
+            // including the model-layer rotation of larger GPU fragments.
+            const int degree=static_cast<int>(members.size());
+            const auto cohort=gpu
+                ? MoEExpertShardCohort::checkedRankLocalGPU(source,experts,std::move(declared),
+                    MoEExpertShardCohort::gpuIntervals(source,degree,source.layer_idx,
+                        preferredIntermediateGrain(plan.gpu_expert_intermediate_tiling)))
+                : MoEExpertShardCohort::checked(source,experts,std::move(declared),
+                    MoEExpertShardCohort::balancedIntervals(source,degree));
             for(size_t member=0;member<members.size();++member)
                 for(const auto& projection:source.projections) {
                     const auto role=projection.projection==ExpertTierWeightProjection::Gate?WeightRole::MoEExpertGate:

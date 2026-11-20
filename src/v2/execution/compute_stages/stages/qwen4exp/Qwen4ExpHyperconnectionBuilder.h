@@ -10,10 +10,14 @@
  * write handle. All graph nodes retain one explicit participant device.
  */
 #pragma once
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "Qwen4ExpPrimitiveStage.h"
 #include "../../../../loaders/WeightPlan.h"
 #include "../../../../kernels/common/DeviceRowRange.h"
+#include "../../../../kernels/common/HCDownOutputPublicationArgs.h"
+#include "../../../../kernels/common/FullNativeHCFFNOutputDemand.h"
 #include <optional>
+#include <array>
 #include <string>
 #include <vector>
 
@@ -21,6 +25,10 @@ namespace llaminar2
 {
 class ComputeGraph;
 class PreparedWeightStore;
+class DeviceWorkspaceManager;
+class IDeviceContext;
+struct WorkspaceRequirements;
+namespace rocm { struct FullNativeHCFFNPrefixArgs; }
 
 /** @brief Exact frozen matrix and prepared store identity validated before graph mutation. */
 class Qwen4ExpPreparedProjection final
@@ -57,6 +65,18 @@ enum class Qwen4ExpProjectionArithmetic
     Ordinary, ///< Existing ordinary prefill/decode projection policy.
     DecodeEquivalentVerifier, ///< Existing grouped verifier serial-byte arithmetic policy.
 };
+/** @brief Explicit original branch-norm publication policy. */
+enum class Qwen4ExpHCBranchNormExecution { Staged, PublishOriginalSingleQ8 };
+/** @brief Explicit complete HC read launch policy; defaults preserve original graph. */
+enum class Qwen4ExpHCReadExecution {
+    Staged, ProducerGridShortK,
+    CTAOwnedOriginalTail, ///< Original norm/injection nodes plus ordinary original producer and CTA-owned completion.
+    PersistentOriginalPhases ///< Explicit ROCm ordinary-M1 HC read+original injection, one admitted cooperative program.
+};
+/** @brief Original reducer may author the existing HC publisher without another launch. */
+enum class Qwen4ExpHCDownPublication { Staged, ReducerEpilogue };
+/** @brief Exact cold resident-grid economy policy; neither value changes arithmetic. */
+enum class Qwen4ExpHCPersistentGrid { OnePerProcessor, MaximumResident };
 /** @brief Immutable participant, geometry and arithmetic identity for one mixer. */
 struct Qwen4ExpHyperconnectionContext
 {
@@ -72,6 +92,12 @@ struct Qwen4ExpHyperconnectionContext
     std::string readNodeName; ///< Optional exact public terminal name; empty selects prefix+read.
     QuantizedActivationOperandPrecision upOperandPrecision=QuantizedActivationOperandPrecision::SingleQ8; ///< Frozen quantized HC-up policy; floating up sources retain native floating GEMM.
     std::optional<DeviceRowRange> upProjectionRows; ///< Explicit TwoTerm up-only original query authority; down/inject retain their existing dispatch.
+    Qwen4ExpHCDownPublication downPublication=Qwen4ExpHCDownPublication::Staged; ///< Explicit original reducer/publisher scope.
+    HCDownProducerProgram downProducerProgram=HCDownProducerProgram::Original; ///< Explicit cold-admitted program, only with the declared HC reducer publication.
+    Qwen4ExpHCBranchNormExecution branchNormExecution=Qwen4ExpHCBranchNormExecution::Staged; ///< Independent original norm-to-down SingleQ8 publication candidate.
+    Qwen4ExpHCReadExecution readExecution=Qwen4ExpHCReadExecution::Staged; ///< GPU ordinary M1 candidate, explicit and source-checked.
+    LocalGPUExpertKernelPolicy verifierKernelPolicy=LocalGPUExpertKernelPolicy::Generic; ///< Qualified original TP4 verifier schedule only.
+    Qwen4ExpHCPersistentGrid persistentGrid=Qwen4ExpHCPersistentGrid::OnePerProcessor; ///< Immutable occupancy-bounded persistent program grid.
 };
 /** @brief Read weights, including already-converted distinct norm gains. */
 struct Qwen4ExpHyperconnectionReadWeights
@@ -101,6 +127,53 @@ struct Qwen4ExpHyperconnectionWriteBuffers
     Qwen4ExpFloatBinding block; ///< [M,H] completed attention/MoE output.
     Qwen4ExpFloatBinding injectionLogits; ///< [M,4] raw prepared injection projection.
     Qwen4ExpFloatBinding outputTrunk; ///< [M,4H], may exactly alias the retained original trunk.
+};
+
+/** @brief Which original producer owns the trunk consumed by HC normalization. */
+enum class Qwen4ExpHCTrunkSource { PreviousWrite, PublishedTrunk };
+
+/** @brief Whether a composed local kernel absorbs the original injection projection. */
+enum class Qwen4ExpHCInjectionOwnership { DiscoverInRegion, KeepOriginalStage };
+
+/** @brief Exact original declarations forming one native HC read region. */
+struct Qwen4ExpFullNativeHCRegion {
+    Qwen4ExpHyperconnectionContext context; ///< Original immutable arithmetic/row declaration.
+    std::string previous_write,branch_norm,down,up,read,injection; ///< Exact existing nodes, no graph search.
+};
+/**
+ * @brief Retain the original HC binding authority without admitting a standalone kernel.
+ * @details One existing HC owner retains source/count/tensor/workspace leases.
+ * Full execution is submitted only by the native resident FFN owner.
+ */
+class Qwen4ExpHCReadPhaseOwner {
+public:
+    virtual ~Qwen4ExpHCReadPhaseOwner()=default;
+    /** @return Original declaration's public buffer/weight and diagnostic contracts. */
+    virtual const IComputeStage& phaseDeclaration() const=0;
+    /** @brief Bind the existing admitted workspace. @param workspace Original executor owner. */
+    virtual void bindPhaseWorkspace(DeviceWorkspaceManager* workspace)=0;
+    /** @brief Prepare original leases/arguments only. @param ctx Exact worker. @param stream Exact cold stream. */
+    virtual void preparePhaseBindings(IDeviceContext* ctx,void* stream)=0;
+    /** @brief Validate retained storage. @param stream Exact prepared stream. */
+    virtual void validatePhaseBindings(void* stream) const=0;
+    /** @return Exact original HC named-bank quote in its original merge order. */
+    virtual WorkspaceRequirements phaseWorkspaceRequirements() const=0;
+    /** @return Complete unbound prefix; the backend supplies its original barrier lease. */
+    virtual rocm::FullNativeHCFFNPrefixArgs fullPrefixArguments() const=0;
+    /** @return Original external tensor inputs, excluding internally produced trunk/mixed values. */
+    virtual std::vector<Qwen4ExpFloatBinding> phaseInputs() const=0;
+    /** @return Every original public output, including independent injection. */
+    virtual std::vector<Qwen4ExpFloatBinding> phaseOutputs() const=0;
+    /** @brief Freeze actual full-region materializations before allocating or retaining storage.
+     * @param demand Original graph readers plus requested observations. Standalone HC owns all outputs.
+     */
+    virtual void sealFullOutputDemand(FullNativeHCFFNOutputDemand demand)=0;
+    /** @return Original optional activated/up bindings, independent of the sealed store policy. */
+    virtual std::array<Qwen4ExpFloatBinding,2> optionalPhaseOutputs() const=0;
+    /** @brief Retire phase borrows after the enclosing native program retires. */
+    virtual void invalidatePhaseBindings()=0;
+    /** @return Exact original source kind, never inferred from nullable kernel operands. */
+    virtual Qwen4ExpHCTrunkSource trunkSource() const noexcept { return Qwen4ExpHCTrunkSource::PreviousWrite; }
 };
 
 /** @brief Reusable graph composition with a single-use paired-write capability. */
@@ -149,6 +222,49 @@ public:
      */
     static std::string appendWrite(ComputeGraph &graph,BlockRead &&read,
         const Qwen4ExpHyperconnectionWriteBuffers &buffers,const std::vector<std::string> &blockDependencies);
+    /**
+     * @brief Lower one explicit already-composed write/next-normalization boundary.
+     * @param graph Cold participant-local graph after the two block fragments are merged.
+     * @param writeProducer Exact original first block terminal supplied by the layer composer.
+     * @return True after one original write and its direct normalization successor become one operation.
+     * @throws std::invalid_argument For missing/foreign stages, row ownership, hazards or capture metadata.
+     * @details Only the named direct edge is considered. All original write
+     * consumers remain connected. No inter-layer/PLE/PP search or execution is
+     * performed, and no inferred normalized capability escapes the builder.
+     */
+    static bool lowerAdjacentWriteNorm(ComputeGraph &graph,const std::string &writeProducer);
+    /**
+     * @brief Retain exact existing HC declarations for full-region composition only.
+     * @param graph Original cold participant-local graph.
+     * @param region Explicit write/norm/down/up/read/injection nodes and original context.
+     * @return One preparation-only owner; no standalone function is admitted.
+     */
+    /**
+     * @brief Resolve only the named original read's direct typed HC producers.
+     * @param graph Cold participant-local graph. @param previous_write Exact previous write terminal.
+     * @param read Exact original residual-read terminal.
+     * @return Validated original region; injection is absent for an original final read.
+     */
+    static Qwen4ExpFullNativeHCRegion describeFullNativeReadRegion(
+        ComputeGraph& graph,const std::string& previous_write,const std::string& read);
+    /**
+     * @brief Resolve original direct HC edges with explicit injection ownership.
+     * @param graph Original participant graph.
+     * @param previous_write Exact prior write name, or empty for a separately published trunk.
+     * @param read Exact original residual read.
+     * @param injection Policy for the original independent four-logit projection.
+     * @return Cold region declarations with all opted-in stage identities.
+     */
+    static Qwen4ExpFullNativeHCRegion describeFullNativeReadRegion(
+        ComputeGraph& graph,const std::string& previous_write,const std::string& read,
+        Qwen4ExpHCInjectionOwnership injection);
+    /** @return Original preparation-only root preserving the exact source/row/workspace leases. */
+    static std::shared_ptr<Qwen4ExpHCReadPhaseOwner> retainFullNativeReadPhase(
+        ComputeGraph& graph,const Qwen4ExpFullNativeHCRegion& region);
+    /** @brief Retain the original read and its explicit distinct trunk publication authority. */
+    static std::shared_ptr<Qwen4ExpHCReadPhaseOwner> retainFullNativeReadPhase(
+        ComputeGraph& graph,const Qwen4ExpFullNativeHCRegion& region,Qwen4ExpHCTrunkSource source);
+
     /** @brief Append a final read-only mixer; no write capability is created.
      * @param graph Existing participant-local graph.
      * @param context Complete final-mixer geometry and arithmetic policy.

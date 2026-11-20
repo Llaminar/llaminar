@@ -1,0 +1,1740 @@
+# Four-MI50 QFN inference phases against Castagna Veloce
+
+With 160 routed and 160 shared expert columns per GPU, Llaminar leads the
+pinned Castagna build in whole-model prefill and decode on both prompts
+with MTP off, at fixed depth three and with adaptive MTP in the historical
+equal-width experiment. That experiment used a local RCCL build with
+different library bytes from the published develop image. Its throughput
+applies to that build. Llaminar also
+passed the MTP own-history check in both modes on both prompts. The local four-row HC/FFN body
+remains slower than Castagna. The comparisons below distinguish work per
+verification from output tokens per second.
+
+## Shipping RCCL and automatic planning
+
+A Release built with the RCCL from the published develop image compared the
+two expert layouts on the same four MI50s, original GGUF and 2,048 input token
+IDs. The model used 512 GPU-resident experts, RAM ngrams, native FP16 KV and
+dynamic MTP (initial depth 5, range 1–15). Sampling was greedy, seed 42.
+The enabled prefix cache supplied zero tokens in both arms. The table gives
+medians of two unprofiled 256-token generations after warmup. Decode measures
+the 255 tokens after the first.
+
+| Stationary expert placement | Prefill tok/s | Decode tok/s | Verifier rounds | Rows verified | Drafted / accepted / rejected |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Automatic TensorSharded, 160 routed and shared columns per participant | 921.72 | 79.91 | 71 | 430 | 359 / 185 / 49 |
+| Explicit GateUpOwnedDownColumns | 939.02 | 64.48 | 65 | 394 | 329 / 190 / 42 |
+
+Each arm repeated its own output tokens and speculative work exactly. Their
+outputs first differed at zero-based token 44. The measured 23.92% decode
+gain and 1.84% prefill cost describe the complete requests. The historical
+134.75 tok/s dynamic result below also had a different output history and
+used a different RCCL library.
+
+Both runs used Llaminar core SHA256
+`a35559e26f8befd78432487d499ab54640f2d988861d918122ed1cb4b926c5c4`
+and RCCL SHA256
+`43a7472719749bab95b6b08127953679af37f1d37a4f4c576d5174a0f15b230b`.
+The native invocation, exact input token IDs, iterations and counts are in the
+[automatic benchmark](/tmp/qfn-mi50-opencode-tp4-sol62/terminal-r10-open-code/coding-benchmark/)
+and [former-layout control](/tmp/qfn-mi50-opencode-tp4-sol62/terminal-r10-http/coding-benchmark-former-policy/).
+
+The subsequent ten-phase OpenCode run completed seven phases. Its 131st
+HTTP request reached a new prefix checkpoint at 13,248 tokens and left one
+token to process. Replaying the original chat templates reproduced all 130
+OpenCode prompt lengths and their logged token-ID prefixes. Earlier requests,
+including their generated tokens, shared at most 6,304 tokens with the
+failing prompt. The server reported a hardware exception in the scalar MoE
+router before publishing an output token.
+
+The one-row MTP condition now gives attention the full KV history and the
+expert router one live activation. The focused ROCm regression
+`V2_Integration_QFNFixedMTPConditionRowReplay` passed on an MI50.
+On the repaired Release (`a2a31a9032d18df290547a8f0e0c7871a164a447a540489083fa85633f0d8168`)
+the four-card frozen-history panel reproduced every prior per-row metric.
+
+| Phase | Final-logit rows | Mean KL (nats) | Top-1 agreement | Mean top-5 overlap |
+| --- | ---: | ---: | ---: | ---: |
+| Prefill | 16 | 0.03150 | 93.75% | 92.50% |
+| Decode | 96 | 0.01928 | 95.83% | 91.67% |
+
+The full-model 64→65-token regression then exposed an independent position
+error. Serial catch-up always added one to the shifted KV row count before
+applying rotary position embedding to the predictor key. QFN already stores
+a row for position zero, so its next position was 64. The successor-only
+cache used by other models needs the extra one. The serial path now reads the
+model’s cache origin. On four MI50s the fresh-checkpoint and restored-checkpoint
+paths both matched serial state byte for byte, including the predictor keys.
+The CUDA and ROCm native replays separately passed for both cache origins
+at counts 0, 1, 64 and 13,248. The Release core for these checks was
+`12829f4013b6a96fa83d6f7c8fd5c73773f7c2361292b9295659e5f0467ddbf0`.
+
+On that same Release, the original failing HTTP request returned 200 after
+33.99 seconds on the automatic TP4 layout and shipped RCCL. The native server
+counted the same 13,249 input tokens. For this reproduction only the output
+limit changed to eight tokens; the server produced all eight and closed the
+event stream normally. Its isolated server and cache were retired before the
+ten-phase OpenCode session.
+
+The repaired Release completed all ten phases with stock OpenCode `1.18.34`
+in 71.0 minutes on that quartet. The stress gate passed through 15 compactions and 201 OpenCode
+requests. Including the initial smoke request, the server completed 202
+requests with zero failures or disconnects. It generated 141,976 tokens at
+69.20 tok/s and reused 86.15% of the 3,569,178 prompt tokens. Uncached prefill
+averaged 307.92 tok/s across these interactive requests.
+
+The Python app passed all 78 acceptance checks, including HTTP behavior,
+restart persistence and an independent run of its 95 authored unit tests.
+Two of 206 tool attempts failed because an edit's
+search text did not match the file (0.97%). The strict tool-instruction grade
+also records that OpenCode used shell commands to write and verify the exact
+three bytes `123` for the final sentinel. The requested `write` and `read`
+tool calls for that file were absent. The protocol grader recorded no errors.
+Native replay matched the smoke response and all 201 OpenCode responses,
+including all 206 tool calls. Qualification uses `1.18.34-llaminar.1`, which
+includes the terminal-stop compaction fix. The qualification entry point now
+rejects a stock client before admitting the model.
+
+The qualified OpenCode client completed ten phases in 47 minutes 40 seconds
+with zero execution errors in 151 tool calls and ten compactions. Its app
+passed all 78 acceptance checks and all 85 authored unit tests. For the final
+sentinel it used `bash` to write `123`, then `read` on the correct file. The
+three file bytes were correct. The strict grade requires the `write` tool
+followed by `read`, so that instruction remained unsatisfied.
+
+Across the seeded smoke and 141 OpenCode requests, the server recorded zero
+failures or disconnects. It generated 103,806 tokens at 69.55 tok/s and
+reused 86.39% of 2,415,269 prompt tokens. Uncached prefill averaged 309.29
+tok/s. Dynamic MTP accepted 51.29% of drafted tokens.
+
+The app session used the following command against the healthy TP4 server.
+Set `client` to the installed `1.18.34-llaminar.1` executable and `out` to
+a fresh results directory. The server and client both used a 40,640-token
+context. The 16,384-token reply reserve left room for OpenCode’s tool history.
+
+```bash
+python3 tests/v2/e2e/server/opencode_tool_stress.py \
+  --base-url http://127.0.0.1:19080 \
+  --model Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004 \
+  --opencode "$client" --context-length 40640 --max-tokens 32768 \
+  --gate stress --case webapp --webapp-phases 10 --iterations 1 --concurrency 1 \
+  --measure-prefix-reuse --output "$out" --reply-reserve-tokens 16384
+```
+
+To reproduce the campaign, start in the source checkout with the same four
+cards exposed to ROCm. Set `build` to the Release directory, `model` to the
+first UD-Q4_K_XL shard and `predictor` to the shared Q8_0 MTP GGUF. The
+following recreates all 9,058 original prompt bytes from the repository. The
+rankfile describes the 28 cores per socket on the measured machine.
+
+```bash
+bench=$(mktemp -d)
+python3 - "$bench" <<'PY'
+import hashlib, json, pathlib, subprocess, sys
+root = pathlib.Path(sys.argv[1])
+filename = 'scripts/ci/run_model_parity_benchmarks.py'
+source = subprocess.check_output(['git', 'show', f'e6dc6fe3768ba70d0341ae32eea2994c156d7fbe:{filename}'])
+prompt = ('Review this Python inference test tooling. Identify one concrete correctness defect '
+          'and propose a minimal repair with a regression. Explain your reasoning.\n\n'
+          f'File: {filename}\n```python\n') + source[:8843].decode()
+assert hashlib.sha256(prompt.encode()).hexdigest() == 'acece79e90a3f5e41dd25200a6c6a26eef9a0847f06e8fd6d2235003a8e7ad18'
+campaign = dict(schema='llaminar.benchmark-campaign.v1', output_directory=str(root / 'results'),
+                sampling=dict(temperature=0, top_k=1, top_p=1.0, seed=42),
+                prompts=[dict(id='code2048', partition='holdout', text=prompt)],
+                cells=[dict(id='code2048', prompt_id='code2048', mtp=dict(mode='dynamic',
+                            minimum_depth=1, maximum_depth=15, initial_depth=0))])
+(root / 'campaign.json').write_text(json.dumps(campaign))
+(root / 'rankfile').write_text('rank 0=localhost slot=0-27\nrank 1=localhost slot=28-55\n')
+PY
+mkdir "$bench/mpi"
+OMP_NUM_THREADS=28 OMP_PLACES=cores OMP_PROC_BIND=false OPENBLAS_NUM_THREADS=1 \
+LLAMINAR_BENCHMARK_ITERATIONS=2 LLAMINAR_BENCHMARK_WARMUP_ITERATIONS=1 \
+"$build/llaminar_mpi_session" --session-base "$bench/mpi" -- mpirun -np 2 \
+  --rankfile "$bench/rankfile" --bind-to core --report-bindings \
+  --mca mpi_leave_pinned 1 --mca orte_allowed_exit_without_sync 1 -- \
+  "$build/llaminar2" benchmark --auto --only-backends rocm --only-strategies tp \
+  --auto-device-counts rocm=4 --mpi-procs 2 --moe-routed-expert-compute auto \
+  --moe-residency-maintenance off --moe-sparse-gpu -m "$model" --mtp-model "$predictor" \
+  --mtp --mtp-depth-policy dynamic --plan-workload 2048,256 -n 256 \
+  --temperature 0 --top-k 1 --top-p 1 --seed 42 --benchmark-campaign "$bench/campaign.json"
+```
+
+For the control, use a fresh directory and change `--moe-routed-expert-compute`
+to `gate-up-owned-down-columns`.
+
+## Matched workload
+
+Both engines ran the original four UD-Q4_K_XL shards of Qwen3.8-Flash-Next
+and, for speculation, the shared Q8_0 predictor. They ran tensor sharding on
+the same four 60-CU gfx906 cards behind one switch (PCI buses 8c, 91, 97, 9a)
+with FP16 KV, RAM ngrams, an empty prompt cache, greedy generation and exact
+matched input IDs. Reported throughput is the median of three unprofiled
+256-token generations after warmup. Decode counts the 255 tokens after the
+first. Native timings come from separate rocprofv3 traces.
+
+The initial Llaminar core SHA256 is
+`731498df6d777a77372aa68dcff49b9ad67fb26e5f3822744057e2c45f4c800b`.
+Castagna is revision `3483d462715d61f21ed5877836be35a724446359`.
+Each profile reproduced its own unprofiled token history and draft work.
+The two engines generate different histories even without MTP. At fixed
+depth Llaminar matched all six of its ordinary histories. Castagna diverged
+from its own ordinary decoded history at review token 224 and code token 14
+(zero-based). Routed work can therefore differ between engines.
+
+## Fixed depth three on review
+
+The table gives mean per-device native time in milliseconds. For the two
+phase totals, overlapping dispatch intervals on one device count once. Stage
+breakdowns sum named kernel durations. Each number uses its own physical
+per-round or per-draft count. All four devices contribute equally.
+
+| Boundary | Llaminar | Castagna | Llaminar minus Castagna |
+| --- | ---: | ---: | ---: |
+| Complete verifier, per four target rows | 25.056 | 16.970 | +8.086 |
+| HC, projections, activation preparation, routing and experts | 19.221 | 12.616 | +6.605 |
+| Target peer reductions | 2.886 | 2.539 | +0.347 |
+| Gated delta net and convolution | 1.357 | 0.962 | +0.395 |
+| Attention, indexer and RoPE | 0.707 | 0.234 | +0.473 |
+| Target vocabulary projection | 0.284 | 0.313 | −0.028 |
+| Draft prediction, per proposed token | 0.988 | 0.977 | +0.010 |
+| Accepted-state publication, per verification | 1.133 | — | — |
+
+Llaminar completed 74 verifier rounds, proposed 222 tokens and accepted 182.
+Castagna completed 76 rounds, proposed 228 and accepted 181. All 76 native
+target head boundaries contained exactly 96 peer reductions on each card.
+Castagna issues those reductions outside its captured compute graphs.
+Counting only the repeated captured portion gives 14.35 ms for the target
+and 0.61 ms for the draft, substantially understating its cost. The complete
+target column includes the two eager rounds. The complete draft column
+includes all work on the fork's draft queue between target boundaries.
+Llaminar's retained graph markers identify verification, draft and accepted
+state publication separately. The fork trace has no independently verified
+accepted-state publication interval.
+
+The previous Llaminar verifier took 28.75 ms. The selected group of changes
+saved 3.70 ms (12.9%). Its HC/projection/router/expert subtotal dropped from
+23.21 to 19.22 ms. Ordinary projection kernels, routed experts, and grouped
+routing still use 4.92, 5.10 and 4.14 ms respectively per verifier. Castagna
+fuses these roles, so comparison below the combined subtotal requires a matched
+operator replay. Each Llaminar captured verifier issues 2,295 dispatches
+versus 485 in Castagna’s captured target compute. The complete Castagna target
+queue issues 588 dispatches per round on PCI 8c.
+
+For the 512-token prefill, the first-to-last observed device work spanned
+510.04 ms in Llaminar and 607.08 ms in Castagna. Mean dispatch interval
+unions were 508.61 and 349.04 ms. Castagna used physical input batches of
+320, 188 and 4. Llaminar used one 512-row prefill. The profiler perturbs host
+submission and device overlap. Use the unprofiled throughput for end-to-end
+speed comparisons and separate native intervals for attribution.
+
+## Ordinary decode on review
+
+Each trace has all 255 post-prefill vocabulary boundaries on all four devices.
+The table gives mean device-active milliseconds per token for each stage.
+The 36 fused GDN input projections per token are charged to the
+HC/projection group. Their native symbol contains the word “attention”.
+
+| Stage | Llaminar | Castagna | Llaminar minus Castagna |
+| --- | ---: | ---: | ---: |
+| HC, projections, activation preparation, routing and experts | 8.219 | 6.747 | +1.472 |
+| Attention, indexer and RoPE | 0.650 | 0.204 | +0.446 |
+| Gated delta net and convolution | 0.745 | 0.600 | +0.145 |
+| Vocabulary projection | 0.247 | 0.232 | +0.015 |
+| Communication | 1.969 | 2.439 | −0.470 |
+
+This identifies two distinct tuning opportunities. The verifier and ordinary
+decode both spend more GPU time on HC/projection/routed expert computation.
+Ordinary decode already leads on interconnect kernel time. For the 512-token
+prefill, 49 gather kernels, 48 ordered folds and 49 FP16 reductions account
+for most of Llaminar's 81.57 ms of communication kernel activity. Castagna's
+communication kernels take 10.43 ms. The pinned fork defaults to 16-bit staging for large reductions and enables
+peer DMA. Both ordinary kernel traces omit copy records. Compare actual wire
+formats, copy events and payloads before interpreting the 71 ms gap as
+communication latency.
+
+## Unprofiled comparison
+
+Each pair of numbers is prefill / decode in tokens per second.
+
+| Mode and prompt | Llaminar | Castagna first control | Castagna quiet repeat |
+| --- | ---: | ---: | ---: |
+| Off, review 512 | 1038.42 / 86.92 | 878.32 / 86.17 | 876.82 / 86.38 |
+| Off, code 2048 | 1008.12 / 80.63 | 1003.65 / 75.93 | 1003.40 / 75.48 |
+| Fixed 3, review 512 | 999.16 / 118.68 | 774.28 / 114.89 | 785.74 / 117.62 |
+| Fixed 3, code 2048 | 970.95 / 97.16 | 888.35 / 106.31 | 892.87 / 108.39 |
+| Dynamic, review 512 | 1002.89 / 116.99 | — | — |
+| Dynamic, code 2048 | 970.22 / 95.08 | — | — |
+
+The first Llaminar fixed-depth run measured 108.91 and 95.05 decode tok/s.
+Its code prefill samples of 683, 643 and 968 tok/s overlapped the Release
+build. After the build finished, the same executable and settings produced
+970.17, 970.95 and 971.00 tok/s with identical histories and draft work.
+The table uses this repeat. A separate Castagna run during the build measured 85.71 and 82.16 decode
+tok/s. The quiet fork repeat recovered to 117.62 and 108.39. Against that
+repeat Llaminar leads by 0.90% on review decode and trails by 10.36% on
+code decode. With the verifier improvements disabled on the same quiet
+Llaminar ELF, decode measured 105.96 and 87.72 tok/s. The two
+ordinary Castagna controls agree within 0.6% on all four rates. The ordinary
+code prefill lead is about 0.5%, so a distribution over independent runs is
+especially important there. The fork's fixed-depth code requests required
+78–81 verification rounds versus Llaminar's 86. Report both per-round
+kernel cost and total rounds for this prompt.
+
+## Fixed-depth follow-up
+
+A second Release image compares three additional changes on top of the complete
+previous verifier policy. It uses register-based router top-K, a fused short-context
+identity-indexer preparation, and vector GDN accepted-state publication. The
+two arms loaded the same executable and core
+`23fc618630bad1dc69b7b816e67248295ecf5c600504cebd43a3ecc5460f16e0`.
+All six measured outputs matched the ordinary same-image generations. All
+five draft and verifier work counters matched the fixed-depth control in each
+iteration. Both arms passed driver and retirement checks before the host reboot.
+
+| Fixed 3, unprofiled | Control prefill / decode | Candidate prefill / decode | Castagna prefill / decode |
+| --- | ---: | ---: | ---: |
+| Review 512 | 1002.48 / 119.20 | 1002.74 / 122.94 | 785.74 / 117.62 |
+| Code 2048 | 970.54 / 97.96 | 970.94 / 100.20 | 892.87 / 108.39 |
+
+The candidate gained 3.14% and 2.29% in decode over its control. Review is
+4.53% above the quiet fork median. Code is 7.55% below it and needs another
+8.17% throughput gain to reach parity. The control and treatment executed
+74 review and 86 code verifications per generation. After reboot an independent, unprofiled, same-boot pair measured
+119.56 → 123.22 decode tok/s on review and 97.65 → 100.13 on code.
+Its prefill rates were 1001.64 → 1000.68 and 969.79 → 970.06 tok/s.
+Both fixed-depth arms reproduced all six same-layout serial histories and
+all five MTP-work counters per generation.
+
+The post-reboot dynamic comparison also retired cleanly. Review prefill/decode
+moved from 1000.95/115.85 to 1001.90/119.30 tok/s. Code moved from
+969.63/94.23 to 969.79/97.02 tok/s. All six generated histories and all five
+work counters matched. Review executed 58 verifications and 294 draft steps,
+and code executed 69 verifications and 345 draft steps. The corresponding
+unprofiled evidence is in `boot3-r1-dynamic-{control,phase}` beside the fixed
+evidence. A matched dynamic fork measurement remains unavailable.
+
+Four fresh ROCProfiler captures passed admission, token-history, verifier-work,
+driver and retirement checks. The profiler accepted both original input lengths.
+All timings below are milliseconds, averaged over four physical participants.
+The verifier and accepted-state columns each count dispatch overlap once per
+device per round. Draft time uses each engine’s actual number of proposals.
+
+| Prompt and engine | Verifier | HC, projections, router and experts | Draft per proposal | Accepted-state publication |
+| --- | ---: | ---: | ---: | ---: |
+| Review control | 24.961 | 19.119 | 0.990 | 1.132 |
+| Review candidate | 24.782 | 18.881 | 0.997 | 0.562 |
+| Review Castagna | 16.970 | 12.616 | 0.977 | — |
+| Code control | 26.545 | 19.439 | 1.036 | 1.073 |
+| Code candidate | 26.391 | 19.171 | 1.039 | 0.546 |
+| Code Castagna | 18.222 | 13.033 | 1.208 | — |
+
+Every Llaminar participant executed 48 router top-K kernels and 36 GDN
+accepted-state updates per round in both arms. Register top-K reduced native
+time for those 48 calls from 1.037 to 0.779 ms on review and 1.029 to
+0.783 ms on code. Vector GDN publication reduced the 36 updates from 0.901
+to 0.331 ms on review and 0.843 to 0.317 ms on code. The candidate launched
+12 fused short-context indexer preparations per review round and zero on code.
+The two Llaminar arms executed 74 review rounds and 86 code rounds. The
+corresponding Castagna traces contain 76 and 81 rounds. The largest
+remaining verifier subtotal on code is HC, projection, router and experts,
+with a 6.14 ms gap.
+
+The 2048-token prefill dispatch unions were 2109.4 ms for the candidate
+and 1249.2 ms for Castagna. These are GPU-active times under instrumentation.
+The independent unprofiled comparison above measures prefill as users
+experience it. The fork’s 672 large reduce-and-distribute operations on
+each card include 4,032 runtime copy kernels. Counting those kernels gives
+35.32 ms of visible collective work per card. The elapsed spans of its large
+transactions averaged 329.63 ms per card. Llaminar’s visible collective
+kernels took 330.27 ms per card. Kernel duration and transaction spans
+measure different things. Neither trace records copy-engine counters.
+The source algorithms imply 15.426 GB of directed collective payload for
+Llaminar and 6.052 GB for Castagna. Llaminar transports exact FP32 rank
+inputs for its ordered expert fold. Castagna rounds its large reduction
+inputs and final owner shards to BF16. These byte counts exclude transport
+overhead and additional host legs.
+
+On ordinary review decode each Llaminar GPU executes 12 attention producers
+per token, while each Castagna GPU executes six. The pinned fork rotates pairs
+of whole GQA-group owners. Llaminar divides query heads across four participants
+in each layer. Both perform 72 query-head/layer instances per GPU. Mean
+device-active time therefore answers a different question from elapsed time
+across the active participants. [Source comparison and ownership](../2026-10/QFN_CASTAGNA_STAGE_COMPARISON.md)
+
+## Which TP participant finishes each FFN layer last
+
+The retained review trace joins each layer's last FFN producer on the common
+rocprof clock across all four cards. A verifier marker closes each round. The
+join authenticated 48 FFN completions per card in each of 74 rounds. The
+physical GGUF shard inventory identifies one 256-column routed shard and three
+128-column shards per layer. The wide owner rotates between cards.
+
+**The 256-column owner published last in all 3,552 comparisons, with no ties.**
+For each layer we took the median difference between its completion and the
+latest 128-column completion across the 74 rounds. Those medians range from
+20.80 to 40.59 µs. Their median is 38.01 µs. Subtracting each participant's
+own preceding peer-reduction end before comparing widths gives 38.04 µs.
+This identifies the participant to accelerate before the following collective.
+It does not establish the savings a particular kernel will deliver.
+
+The narrower FFN fusion reached 31, 34, 32 and 32 layers on the four cards.
+The other unselected 128-column sites use different weight formats. On a
+separate same-ELF whole-model test with only the grouped HC-up and convolution
+policies already enabled, the fusion removed 217–238 native graph nodes per
+M4 verification. Review decode changed from 107.32 to 107.19 tok/s and code
+from 88.47 to 88.79 tok/s. All six token histories and work counters matched.
+
+A paired native review trace measured 1.76–1.91 ms less work per verification
+on each card in the selected narrow FFN suffixes, a 38.1–38.8% reduction.
+Before fusion the wide participant was last in 3,546 of 3,552 layer-rounds;
+afterwards it was last in 3,550. The typical wide-to-last-narrow gap grew
+from 17.25 to 74.43 µs. This is the same narrow-only A/B and has its own
+control, distinct from the later 38.01 µs baseline above. Cutting work on
+the earlier arrivals explains how an isolated speedup can leave request
+throughput nearly unchanged.
+
+A fusion on the 256-column Q4_K/Q5_1 slice measured 227.85 µs staged and
+227.73–227.80 µs fused in the complete local FFN graph. It left the widest
+participant with the same amount of work. All three original
+expert format pairs in this model use Q5_1 or Q8_0 down weights with
+32-column source groups. Four 160-column
+intervals therefore cover the original 640 columns exactly.
+
+The same MI50 measured complete local operations on the original wide
+participant and on its proposed 160-column interval. Each layout passed
+serial-row byte equivalence on its own original weights and routes.
+
+| Original layer and routed gate/up, down | Retained ordinary, F256 → F160 (µs) | Staged four-row verifier, F256 → F160 (µs) |
+| --- | ---: | ---: |
+| L1 Q4_K, Q5_1 | 69.854 → 62.822 | 212.350 → 178.703 |
+| L2 Q5_K, Q8_0 | 71.419 → 65.522 | 256.133 → 231.298 |
+| L4 Q4_K, Q8_0 | 68.779 → 60.322 | 209.851 → 174.223 |
+
+The other three participants gain 32 columns each under the proposed layout.
+The complete four-card measurement must account for those increases, peer
+waits, and any change in routing caused by regrouping the FP32 partial sums.
+Each layout needs an independent frozen-history accuracy panel and an ordinary
+generation control for its own MTP output.
+
+The native-byte source test checked 401,100,800 bytes at each of TP1, TP2,
+TP4 and TP8 for both layouts. It compared routed and shared gate, up and
+down slices with the original GGUF, sampling one routed expert per layer.
+Both layouts passed. Candidate TP2 uses two 320-column intervals, TP4 uses
+four 160-column intervals, and TP8 retains rotating 64/96-column intervals
+to preserve whole native blocks.
+
+The four-MI50 Release PyTorch panels also passed independently on the same
+16 frozen histories, covering 16 prefill and 96 teacher-forced decode rows.
+Each row compares all 248,320 final logits. All 48 layers reported the
+expected routed column widths on all four physical participants. The
+candidate includes modified grouped verifier kernels, which teacher-forced
+ordinary decode does not exercise.
+
+| Layout and phase | Mean KL, nats | Top-1 agreement | Mean top-5 overlap |
+| --- | ---: | ---: | ---: |
+| Original, prefill | 0.01432 | 93.75% | 96.25% |
+| Equal width, prefill | 0.03150 | 93.75% | 92.50% |
+| Original, decode | 0.02211 | 94.79% | 91.04% |
+| Equal width, decode | 0.01928 | 95.83% | 91.67% |
+
+Ordinary review attention also illustrates the importance of measuring across
+participants. The union across GPUs is 0.738 ms/token for Llaminar and 0.598
+for Castagna. Attention was the only active kernel category for 0.565 and
+0.008 ms/token respectively. In Castagna, attention overlapped peer pushes
+alone for 0.337 ms/token. GPU intervals cannot distinguish a peer kernel
+moving useful data from one waiting for an arrival.
+
+## Equal-width Release qualification
+
+The same Llaminar Release ran the original and equal-width policies on the
+same quartet. Both passed the two accuracy gates above. Prefill and decode
+throughput below are in tokens per second. The fixed and adaptive Llaminar
+arms each matched all three 256-token histories from their own layout's
+ordinary decode on both prompts. Equal-width code fixed-3 took 73 rounds
+with 183 accepted draft tokens. The original split took 86 rounds with 170
+accepts. Review used 76 versus 74 rounds with 180 versus 182 accepts.
+The different work explains part of the change in delivered throughput.
+
+| Engine and policy | Review prefill / decode | Code prefill / decode |
+| --- | ---: | ---: |
+| Llaminar original, off | 1039.52 / 86.79 | 1008.07 / 81.47 |
+| Llaminar equal, off | 1082.65 / 88.71 | 1051.46 / 82.49 |
+| Castagna off, fresh quiet control | 870.45 / 85.59 | 1003.97 / 75.03 |
+| Llaminar original, fixed 3 | 998.76 / 121.50 | 969.40 / 99.85 |
+| Llaminar equal, fixed 3 | 1042.02 / 134.08 | 1009.10 / 132.14 |
+| Castagna fixed 3 | 785.74 / 117.62 | 892.87 / 108.39 |
+| Llaminar original, dynamic | 999.96 / 119.15 | 968.52 / 96.82 |
+| Llaminar equal, dynamic | 1040.70 / 120.95 | 1009.24 / 134.75 |
+| Castagna adaptive | 672.70 / 70.71 | 794.71 / 79.81 |
+
+Both adaptive controllers were allowed 1–15 draft tokens. Castagna used
+its native time-based depth policy. Its six measured adaptive outputs
+differed from its own MTP-off outputs. Each controller's timing includes
+its actual selected depths, proposed tokens and accepted work.
+[Adaptive comparator and per-request first difference](/tmp/qfn-mi50-fork-dynamic/quiet-r1.json)
+
+The equal-width reference core is
+`baa2b17af74a2711a37b16c97c6a30c11c60922ff4b262e40310bbac194a72ce`.
+It includes the experimental native gate/up, route, router and identity-indexer
+policies in its admission receipt. This is the tested binary. A clean build
+of the feature branch needs its own throughput result. The original accepted
+files, MPI teardown, driver window and physical VRAM retirement passed for
+each timing arm. The first fixed-3 candidate run failed the comparator artifact
+check; only its clean repeat contributes to the table.
+
+The standalone cohort runner takes a fresh run name and its frozen Release
+directory. It holds the physical roster for the numerical panel, own-Off
+controls and both MTP modes. On this benchmark host the full invocation is
+
+```bash
+cohort=/tmp/qfn-mi50-f160-frontier-balanced-sol62
+lock=/tmp/qfn-mi50-retained-real-tp4/r7-all-tp-live/full-model/grouped-mtp-suite.lock
+cd "$cohort/parity"
+flock -x "$lock" bash run-layout-cohort.sh execute checkpoint-r2 "$cohort/frozen-release"
+```
+
+[Matched controls and exact sample histories](/tmp/qfn-mi50-f160-frontier-balanced-sol62/parity/combined-boot3-r1-summary.json) ·
+[Feature switches and reproduction commands](/tmp/qfn-mi50-f160-frontier-balanced-sol62/DISPATCH.md)
+
+## Four-row HC and FFN on one MI50
+
+The shipping Castagna kernel can be measured independently of its source
+rebuild. On the wide slice of layer 1 it used 60 blocks of 1,024 threads,
+64 VGPRs per lane and 51,240 bytes of shared memory per block, with zero
+private memory. It executed the local HC and FFN together. Across all 81
+verifier rounds of code2048, layers 1–47 used that fused path followed by
+a separate peer reduction. Layer 0 issued separate routed kernels. Using
+layer 0 as the timing reference would omit expert work.
+
+The harness used original QFN layer-1 weights, 256 routed columns, 192
+shared columns and identical seeded input rows. Times are microseconds per
+complete captured operation. Each timing arm had 16 samples of 32 operations.
+
+| Implementation | Three rows | Four rows |
+| --- | ---: | ---: |
+| Castagna deployed gfx906 object | — | 156.27 |
+| Castagna source rebuild in the paired harness | 126.36 | 156.71 |
+| Llaminar, reuse a loaded weight for two rows selecting the same expert | 221.72 | 256.42 |
+| Llaminar, assign work directly to the selected route slots | 206.25 | 269.66 |
+| Llaminar, load 16 adjacent weight columns and transpose partials before the ordered fold | 234.22 | 268.19 |
+
+The two Castagna entries agreed byte-for-byte on all five output planes.
+Each Llaminar variant passed 40 comparisons against its own serial oracle
+across 12 output planes. The paired fixture selected 26 distinct experts in
+40 slots. The separate 160-column native fixtures selected 35–39 across three
+layers. A second matched input came from the canonical PyTorch model at layer 1,
+using four teacher-forced rows following the original nine-token prompt.
+Castagna selected 30 distinct experts across 40 slots. Its deployed body
+took 161.45 µs and Llaminar took 263.61 µs. Packing affine scale and minimum
+together in advance increased Llaminar time to 284.35 µs. All 40 native
+comparisons passed on each arm. [Reference input planes and provenance](/tmp/qfn-mi50-real-m4-activations/manifest.json)
+
+Both microbenchmarks have a single resident layer.
+The wide serving rank took 188.48 µs for the Castagna operation in its trace.
+Actual model traffic and layer transitions matter. The previously attained
+68 µs result belongs to single-row decode.
+
+With equal routed and shared widths of 160, Llaminar's captured four-row
+FFN took 150.02 µs for Q4_K/Q5_1, 138.17 µs for Q4_K/Q8_0, and 152.79 µs
+for Q5_K/Q8_0. The corresponding staged controls took 179.00, 178.43 and
+235.64 µs. These intervals include the router and FFN. They exclude the HC
+prefix and four-device communication. Castagna's original program requires
+widths divisible by 64. Its 256-column result measures a different operation
+from these 160-column intervals.
+
+The routed gate/up phase on matched IDs took 77.36 µs in Llaminar versus
+27.12 µs in the fork on the original wide fixture. The next grid join took
+12.56 and 12.96 µs. Llaminar stages native affine coefficients through LDS and
+synchronizes the participating threads before using them. The next layout
+experiment moves lossless coefficient packing into weight preparation and
+keeps the ordered FP32 reduction. Its admission contract must preserve the
+single authoritative expert bank when weights migrate.
+
+[Shipping binary, source slices and paired replays](/tmp/qfn-mi50-fork-m4-native/REPORT.md) ·
+[Matched routed-phase census](/tmp/qfn-castagna-family-sprints-r61/G08/experiments/12-retained-body-grouped/e15-matched-gu/RESULT.md) ·
+[Native 160-column timings and traffic counters](/tmp/qfn-mi50-f160-roofline-c2-sol62/REPORT.md)
+
+## Counted verifier format qualification
+
+The code2048 fixed-three trace of the equal-width Release above completed
+73 verifier rounds with 183 accepted tokens and reproduced all 256 generated
+IDs from both of its own ordinary and fixed-depth controls. Per GPU the
+complete target occupied 22.94 ms per four-row round. The earlier layout
+took 26.39 ms. The fork occupied 18.22 ms across its 81 rounds. The
+equal-width draft occupied 1.026 ms per proposed token versus 1.208 ms
+for the fork. The original source inventory and native launch geometry
+confirmed 43 Q4_K/Q5_1, four Q4_K/Q8_0 and one Q5_K/Q8_0 leaf pair per
+participant per round.
+[Native target/draft timing](/tmp/qfn-mi50-current-stage-pair/qualified-f160-code-candidate.json)
+[Per-layer native census](/tmp/qfn-mi50-f160-fixed3-profile/boot3-r3-candidate-census.json)
+
+The fixed-row FP16 router selects its M4, M7 or M8 program during graph
+preparation. The kernel consumes the original device-owned live count, with
+the same half rounding and FP32 reduction tree as counted M1. On one MI50
+with the original layer-1 weights and F160/S160, the local M4 graph measured
+147.6635, 139.4655, 139.4585 and 147.6790 µs across control, candidate,
+candidate and control. The projection fell from 26.08 to 17.76 µs at the
+same 512×128 launch geometry. Both arms used the same register top-K kernel.
+The production preflight replays passed with partial and zero live rows,
+deferred publication and dirty inactive buffers on the exact Release core.
+These measurements cover one participant's graph. The switch
+`LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS=1` selects the candidate.
+[Native source, paired windows and run commands](/tmp/qfn-mi50-fixed-router-canonical-sol62/canonical/REPORT.md)
+
+The exact K32 reuse experiment used original-source four-row F160/S160
+fixtures on MI50 PCI c2. Each row below is a median in microseconds.
+Its two control windows bracket the treatment in the same Release.
+Each replay compared the live results with serial M1, including deferred
+routing and replacement of the expert bank. This candidate does not alter
+quantized weights, scales or floating-point partial order.
+
+| Original routed gate/up and down | Control 1 | Selected path | Control 2 |
+| --- | ---: | ---: | ---: |
+| Q4_K and Q5_1 | 150.230 | 135.361 | 150.294 |
+| Q5_K and Q8_0 | 150.139 | 145.894 | 150.081 |
+| Q4_K and Q8_0, ordinary sum path | 135.024 | 135.119 | 134.821 |
+
+The third case uses the original producer. Its separate wave-register
+candidate rose from 136.36 to 138.76 µs. The immutable experiment core
+was `6f9f21a8a59ef5eddb2110b37b2cb9265ea090f862b61b0fab90ff028882b1d4`.
+The full-model and benchmark-only source combinations are distinct scopes.
+[Native fixture qualification](/tmp/qfn-mi50-f160-affine-sums-sol62/frozen-release-narrow-c2/qualification.json)
+
+The four-MI50 full-model A/B changed only
+`LLAMINAR_QFN_ROCM_GROUPED_FFN_AFFINE_SUMS` in the same Release. Each
+cell contains the median decode throughput after prefill across three
+256-token generations, in tokens/s. All six arms retired cleanly. Both
+policies produced the same tokens on both prompts and matched the verifier
+work counters at each MTP setting.
+
+| MTP | Review, 512 tokens, off → on | Code, 2,048 tokens, off → on |
+| --- | ---: | ---: |
+| Off | 87.824 → 87.810 | 82.399 → 82.440 |
+| Fixed depth 3 | 133.935 → 137.055 | 131.859 → 135.338 |
+| Dynamic | 121.091 → 121.158 | 134.684 → 134.592 |
+
+The same-ELF timestamp pair on code2048 fixed depth 3 contains 73 verifier
+rounds per arm, with 183 accepted drafts and identical 256-token histories.
+The dispatch union per device fell from 25.077 to 23.450 ms per round.
+The span from the earliest dispatch to the last completion across the four
+cards fell from 26.640 to 25.040 ms. Gate/up fell from 2.816 to 2.779 ms
+and down/fold from 2.582 to 2.025 ms. Of the 0.928 ms decrease in peer
+kernel residence, 0.922 ms occurred before the last participating GPU
+entered the matching transfer. These observations share a timeline and
+must not be added to the independently measured end-to-end improvement.
+Castagna's earlier code2048 dispatch-union reference was 18.222 ms.
+[Matched timestamp pair and per-PCI attribution](/tmp/qfn-mi50-k32-affine-model-gate/timestamp-trace/c2-code2048-same-elf-pair-r1.json)
+
+The fixed-depth improvement measures 2.35% and 2.65% on paired trials.
+Dynamic MTP changed by less than 0.1% on both prompts. The standalone
+branch regression exercised all three source combinations, both static
+and deferred routing, and the expert bank epoch change in 108.11 s.
+[Matched full-model results](/tmp/qfn-mi50-k32-affine-model-gate/affine-k32-c2-r1-summary.json)
+[Registered replay result](/tmp/qfn-mi50-verifier-roofline/k32-branch-replay.json)
+
+On the dominant Q4_K/Q5_1 layer the gate and down leaves measured 56.48
+and 38.40 µs. Separate counter runs on the same card measured 19,938.0
+and 11,876.625 KiB of physical fetches. A four-bank packet read using
+the same geometry sustained 611.78 and 514.79 GB/s. Applying those rates
+to the measured fetches gives 33.37 and 23.62 µs, or 59.1% and 61.5% of
+the read-only probe's bandwidth. The full operations also perform format
+decode, ordered arithmetic and publication. A 256 MiB linear stream
+sustained 873.24 GB/s on this card. Cache-resident throughput and physical
+fetch throughput use different byte counts.
+[Physical counter calibration](/tmp/qfn-mi50-generic-m4-route-groups-c2/roofline-counters/counter-roofline-c2.json)
+
+The Q5_K/Q8_0 gate and down measured 64.32 and 41.12 µs.
+Their physical fetch rates reached 63.6% and 67.1% of their respective
+packet probes. For Q4_K/Q5_1 the 120- and 160-workgroup issue probes used
+the native 256 threads per workgroup and sustained 85.71 and 80.19 billion
+vector wave instructions per second. At those rates the measured gate
+and down instruction counts take 10.50 and 14.10 µs. The probes issue
+independent packed dots. Real work also includes dependent floating-point
+operations, address generation and synchronization.
+[Measurement procedure](../../../../tests/v2/performance/kernels/qwen4exp/verifier-roofline.md)
+[Per-resource results](/tmp/qfn-mi50-verifier-roofline/physical-resources.csv)
+
+### Original shard widths and verifier preparation
+
+The counted four-row reader resolves six serial-M1 reduction schedules from
+the original weights during graph preparation. The shared gate, up and down
+keep independent schedules, as do the three routed projections. A published
+expert can change address or physical encoding when it moves. Its source
+identity and reduction order remain fixed for the captured program.
+
+The table gives median microseconds per captured local operation on MI50
+`0000:ba:00.0`. Each run timed 12 windows of 32 replays. Each row used
+the original QFN GGUF shard, four rows and 160 shared columns. Both readers
+passed the serial byte comparison. The run order was separate, paired,
+paired, separate; each table cell is the median of its two runs.
+
+| Original routed gate/up, down | Routed columns | Separate reads (µs) | Paired gate/up (µs) |
+| --- | ---: | ---: | ---: |
+| L1 Q4_K, Q5_1 | 128 | 164.25 | 146.53 |
+| L1 Q4_K, Q5_1 | 256 | 238.78 | 214.34 |
+| L2 Q5_K, Q8_0 | 128 | 165.58 | 173.10 |
+| L2 Q5_K, Q8_0 | 256 | 244.60 | 263.92 |
+| L4 Q4_K, Q8_0 | 128 | 155.96 | 139.78 |
+| L4 Q4_K, Q8_0 | 256 | 229.46 | 200.48 |
+
+The graph selects paired reads for the measured physical Q4_1 gate/up and
+Q8_0 shared projections when each pair has equal partition counts. The Q5_K
+shards retain separate reads. Moving partition lookup to preparation alone
+changed the L1 wide parent by less than 1 µs in a separate bracket.
+[Timing receipts](/tmp/qfn-mi50-verifier-roofline)
+[Source-window fixture](../../../../tests/v2/integration/loaders/GroupedFFNM4SourceMatrix.inc)
+
+A separate same-ELF comparison covered 15 generated source families. The
+direct reader reduced local parent time against the staged graph by a median
+9.23%, with individual gains of 0.81%–26.10%. G02 (plain Q4_0) and G13
+(IQ3_XXS/Q5_1 with IQ2_S shared) each gained less than 1%. G15 measured
+326.94 → 271.18 µs. Static and deferred captures matched serial bytes for
+all 15. These are local verifier timings; the four-device model measurements
+above describe the separate equal-width, K32-sum experiment.
+[Family timing CSV](/tmp/qfn-mi50-m4-source-matrix/parent-readers-families-abba-r1/result.csv)
+[Captured replay results](/tmp/qfn-mi50-m4-source-matrix/parent-readers-families-parity-bd-r1/result.json)
+
+The same reader passed 80 independent static captures, varying 20 encodable
+original GGUF formats across routed gate/up, routed down, shared gate/up and
+shared down. A separate prepared Q8_1 shared-down fixture retained source ID
+20 with execution ID 19, and passed static and deferred replay. The fixture
+also checks the existing rejection of Q8_1 as an original routed GGUF tensor.
+[Complete independent source and role results](/tmp/qfn-mi50-m4-source-matrix/parent-readers-qualified-matrix.json)
+
+Timestamp-only wide-layer traces attributed the format split to gate/up.
+For Q4_K it took 126.88 → 105.44 µs, and for Q5_K it took 141.28 → 164.16
+µs. All four recorded gate symbols used zero private scratch. The paired Q5_K
+kernel used 80 VGPRs versus 84 separately, despite taking longer.
+[Captured stage medians](/tmp/qfn-mi50-verifier-roofline/prepared-graph-stage-traces.json)
+
+The packet probe also covered both original TP widths and each calibrated
+format's secondary weight planes. On PCI c2, the separate gate/up reader
+reached 48.5%–52.9% of its matched physical-read rate across the six original
+shards. Q5_1 down reached 48.0%–54.4% and Q8_0 down reached 69.9%–85.2%.
+In G15, IQ3_XXS routed gate/up with IQ2_S shared reached 36.9%, and Q6_K
+down with Q8_0 shared reached 49.0%. For L1 wide gate/up the read-only probe
+fetched 32,056.6 KiB versus 32,156.9 KiB in the numeric kernel. The probe
+omits arithmetic, activation reads and publication. The raw cache-resident
+control and the 256 MiB streaming control used independent physical counters.
+[Packet benchmark procedure](../../../../tests/v2/performance/kernels/rocm/roofline/README.md)
+[Measurements by PCI, geometry and source format](/tmp/qfn-mi50-parent-roofline-c2/score.json)
+
+### Full-model fixed-depth result on the original TP4 shards
+
+Release checkpoint `8e11d8880` used four MI50s, RAM ngrams and the original
+128/128/128/256 routed split with 160 shared columns. The control and reader
+used the same executable and model. Each performed one warmup followed by
+three measured 256-token generations per prompt. Only
+`LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER` changed between arms.
+
+| Fixed depth 3 | Staged decode (tok/s) | Prepared reader decode (tok/s) | Paired change | Prepared reader prefill (tok/s) |
+| --- | ---: | ---: | ---: | ---: |
+| Review 512 | 114.892 | 124.581 | +8.44% | 1,002.452 |
+| Code 2048 | 94.655 | 102.513 | +8.34% | 970.566 |
+
+All six generated histories matched their own ordinary controls and both arms
+agreed on all five verifier counters. Review took 74 rounds with 182 accepted
+tokens. Code took 86 rounds with 170 accepted tokens. With speculation off,
+the paired decode changes were −0.17% and +0.61%, respectively. The fork ran
+the same input IDs but generated different histories and verifier work.
+[Original per-trial counts and timings](/tmp/qfn-mi50-w-readers-model-gate/w-readers-r1-fixed3-summary.json)
+[Cross-engine work comparison](/tmp/qfn-mi50-w-readers-model-gate/w-readers-r1-staged-historical-fork.json)
+
+Dynamic MTP in the same two Release arms measured 116.077 → 116.221 tok/s on
+review and 94.817 → 94.641 on code. Paired prefill changed by less than 0.3%.
+The arms generated identical tokens and performed identical verifier work on
+each prompt. At fixed depth, a separate native capture found 192 gate/up and
+192 down reader nodes per GPU across four verifier graphs. The wider and
+narrower source shards both executed the selected reader. The paired captures
+retained the same peer-push count. [Dynamic per-trial results](/tmp/qfn-mi50-w-readers-model-gate/w-readers-r1-dynamic-summary.json)
+[Native node and width inventory](/tmp/qfn-mi50-w-readers-model-gate/w-readers-r1-qualified-native-pair.json)
+
+### Transferring the single-row loop to grouped verification
+
+The single-row F256/S192 HC/FFN checkpoint measured 69.62–69.72 µs on three
+runs. Its gate/up wave computes four output columns and sixteen independent
+K partitions. Each lane appends five K32 blocks in order. Only the eight
+packed dot operations *within* a K32 block are unrolled per projection. The
+fold obtains later partition values as it consumes them. The verifier instead
+works on sixteen columns and four partitions at a time across each wave,
+with four visits to cover the same sixteen partitions. Both layouts can
+produce identical serial sums. They differ in contiguous weight access,
+exchange instructions and register lifetimes.
+[Single-row contract and timings](QFN_MI50_RETAINED_HC_FFN.md)
+
+The gfx906 scalar and vector instructions explain an opportunity beyond
+integer dot throughput. In the closed single-row Q4 path, the gate role
+borrows its original descriptor fields before the K loop. The up role still
+has scalar field loads in the loop. Hidden codes and coefficients come from
+the block's already populated LDS panels. In the four-row Q4 path, vector
+loads fetch the routed plane pointers in the loop before their dependent
+payload and scale loads. Each active wave uses one acquired expert slot.
+Its plane pointers can therefore be captured in registers for the duration
+of that job. The acquisition must repeat when the launched graph sees a
+new bank epoch. Its immutable shared-expert descriptors arrive by value.
+
+| Complete captured four-row parent on MI50, µs | F128/S160 | F256/S160 |
+| --- | ---: | ---: |
+| Typed reader at `d50b74c9a` | 140.26 | 207.65 |
+| Physical codebook checks moved to publication | 142.77 | 210.84 |
+| Prepared width/partition arithmetic plus preceding change | 141.98 | 210.92 |
+| Paired packed gate/up words plus publication-time checks | 140.29 | 207.45 |
+
+Each value is the average of the two process medians from a mirrored run
+order on PCI ba. Each process timed 12 batches of 32 complete operations
+from the original QFN L1 source. All arms passed the native byte checks. In
+the routed Q4 inline-sum K32 loop, the paired reader reduces 32 static
+`v_dot4_i32_i8` instructions to 24, including eight for the shared activation
+sum. The same loop grows from seven to eleven static `s_waitcnt`
+instructions. These counts describe compiler output; they do not measure
+cycles spent stalled. The complete gate entry uses 62 VGPRs in the typed
+and paired variants, versus 84 in the width/partition variant. All three
+have zero private scratch. The paired reader showed no repeatable advantage
+over the typed program across both widths.
+[Mirrored timings and native receipt paths](/tmp/qfn-mi50-verifier-roofline/typed-verifier-abba.json)
+
+Borrowing both routed descriptors' payload, scale and minimum pointers once
+per wave was a larger improvement. On PCI 8c the complete Q4 parent took
+141.35 → 133.03 µs at F128 and 207.88 → 191.12 µs at F256. The treatment
+moved four scalar memory instructions before the K loop. In the inline-sum
+backedge it removed two vector four-word and two vector two-word loads and
+reduced static waits from eleven to eight. It allocated 70 VGPRs versus 62,
+with 104 SGPRs and zero private scratch in both. Static and deferred native
+replays passed on the original weights. This experimental build is separate
+from the four-card throughput run.
+An ordinary C++ field copy hoisted the same loads and used 86 VGPRs. It
+improved the parent by only 0.49% at F128 and 0.54% at F256.
+[Scalar and ordinary C++ field-borrow brackets](/tmp/qfn-mi50-q4-wave-field-borrow/RUN.md)
+
+The initial hand-written address helper sign-extended the low 32 bits
+returned by `readfirstlane`. The first experimental GPU run faulted and was
+excluded. Explicit unsigned halves preserve all 64 pointer bits. A fresh
+original control passed after the fault. The published bank can move between
+executions, so the wave must obtain its pointers again after each acquire.
+At F128 and F256, native replay relocated six actual planes over epochs 2,
+3 and 4, changing the selected bank 0 → 1 → 0. Poisoning the retired
+fixture allocations left serial byte equivalence intact.
+[F128 relocation receipt](/tmp/qfn-mi50-q4-wave-field-borrow/moved-scalar-r2-f128/result.json)
+[F256 relocation receipt](/tmp/qfn-mi50-q4-wave-field-borrow/moved-scalar-r2-f256/result.json)
+
+Changing who owns a Q8 output block produced opposite results at the two
+TP widths. Giving one wave all 32 columns kept SwiGLU values in registers
+through quantization. It removed the two per-tile CTA barriers, reduced LDS
+from 320 to 64 bytes and retained 62 VGPRs. The complete parent went from
+206.98 to 199.13 µs at F256 and from 140.31 to 162.13 µs at F128. For
+four live rows the new mapping supplies 85 and 45 workgroups respectively
+on the 60-CU MI50. That smaller grid is a possible contributor to the
+narrow-shard regression. A simpler owner-relative fold removed six static
+cross-lane permutes and seven static waits, but changed full time by less
+than 0.2% on either shard. Both experiments passed their serial byte checks.
+[Wave-local publication bracket](/tmp/qfn-mi50-verifier-roofline/wave-retry-abba.json)
+[Output-owner fold bracket](/tmp/qfn-mi50-verifier-roofline/owner-fold-pinned-abba.json)
+
+The two layout changes also ran together on PCI ba. With the scalar pointer
+borrow already active, wave-local publication increased complete time from
+190.30 to 194.43 µs at F256 and from 132.54 to 161.85 µs at F128. The
+selected paired Q4 program retains the two-wave publication tile at both
+widths. All eight arms passed the same serial byte oracle.
+[Same-card combined-change bracket](/tmp/qfn-mi50-verifier-roofline/dual-q4-abba.json)
+
+Integrating the scalar borrow into the existing paired projection loop
+against `5709b071f` on PCI c2 reduced time from 142.77 to 134.36 µs at
+F128 and from 211.35 to 193.30 µs at F256. The eight native windows had
+the same source tensors, five captured nodes, exact selected gate symbol
+and serial row bytes. Sharing the per-word dot operation keeps the retained
+single-row HC/FFN and pre-attention instruction bytes identical on gfx906
+and gfx1100. The integrated gfx906 gate uses 71 VGPRs, 104 SGPRs and
+320 bytes of LDS per workgroup. The compiler stores 51 scalar values in
+vector register lanes and emits no private-memory spills. The scalar-borrow
+prototype above used 70 VGPRs. [Integrated timing bracket](/tmp/qfn-mi50-q4-wave-integration-c2/abba-score.json)
+[Single-row code identity](/tmp/qfn-mi50-q4-wave-integration-c2/narrow-code.sha256)
+
+On F256, a separate native trace took the gate/up leaf from 104.32 to
+84.96 µs. Both counter arms fetched 32,143.06 KiB and launched 480 waves.
+The numeric kernel attained 315.52 → 387.41 GB/s, or 63.69% → 78.20% of
+the 495.39 GB/s measured by the same-card, same-shape read-only probe.
+All 40 route IDs matched the calibration, including the two repeated
+expert selections. VALU instructions fell from 1,487,602 to 1,461,522
+per dispatch. The larger timing improvement relative to the instruction
+count is consistent with eliminating a dependent pointer lookup per K32.
+The read-only probe omits dot products and publication. [Counter, trace
+and calibration receipts](/tmp/qfn-mi50-q4-wave-integration-c2/profile-score.json)
+
+Five focused production-preflight tests passed on the canonical Release,
+including captured high-bit addresses, moving bank publications, counted
+replay and retained single-row numerics. The gfx906 and gfx1100 Release
+objects passed the spill guard. The Release core used for the native tests has SHA-256
+`ff44736ca064c57d3d1c982bc537e313c412f735ac051cb714b6a36e86318cfd`.
+[Focused native test log](/tmp/qfn-mi50-fixed-bank-proof/canonical-wave/wave-r1/run.log)
+
+The gate and up descriptor loads each have one wait before entering the
+loop. Issuing all four scalar loads before one wait changed the four-row
+parent from 134.81 to 134.62 µs at F128 and 193.39 to 193.79 µs at F256.
+The compiler used the same registers and the arithmetic instructions
+matched. All eight timing runs passed the byte checks. The integrated
+kernel keeps the existing load schedule.
+[Single-wait timing and ISA comparison](/tmp/qfn-mi50-q4-one-wait-c2/REPORT.md)
+
+On gfx906 the inspected Q5_K reader already hoists its role-plane addresses.
+The K loop in `groupedFFNFormatProgramGate<1,-1,160>` reads packed weights,
+activation data and coefficients. The IQ1_M branch in the runtime-dispatched
+`groupedFFNFormatProgramGate<15,-1,0>` also retains its plane addresses.
+Its additional dependent loads index the IQ lookup table from a wave-uniform
+base. Neither loop repeats the descriptor loads removed from routed Q4.
+
+The current four-row FFN leaves have different distances from their
+same-card read-only references. Each row below uses the original layer 1
+routes and coefficients, H2560, ten selected experts, S160 and the same
+MI50 on PCI c2. Each reference reads the corresponding set of native
+weight planes using the same launch geometry. Separate profiling passes
+measure kernel timestamps and physical fetch bytes.
+
+| Original routed width | Gate/up, µs | Gate/up read rate | Down, µs | Down read rate |
+| ---: | ---: | ---: | ---: | ---: |
+| 128 (participant 3) | 46.40 | 356.01 GB/s, 75.34% | 36.48 | 269.24 GB/s, 50.37% |
+| 256 (participant 0) | 84.64 | 388.88 GB/s, 78.50% | 56.80 | 340.73 GB/s, 56.43% |
+
+On the wider shard Down fetched 18,899.81 KiB and wrote 317.50 KiB. Its
+VALU issue rate was 38.37% of the separate packed-dot calibration. The
+complete windows used the original counted router. A capture on PCI ba
+with the serving fixed-row router and register top-K selectors enabled
+measured 4.16 µs for activation quantization, 16.96 µs for router logits,
+12.80 µs for top-K, 46.08 µs for gate/up and 36.32 µs for Down at F128.
+[Leaf counters, read ceilings and route IDs](/tmp/qfn-mi50-q4-k32-pipeline-c2/baseline-score.json)
+
+In the four-MI50 serving comparison, `c237ef9da` and its parent
+`5709b071f` used the original 128/128/128/256 routed split, RAM ngrams
+and identical runtime flags. Each prompt had three warmed generations of
+256 tokens. All 18 pairs produced identical generated tokens. Both MTP
+modes did the same verification work in each pair.
+
+| Mode | Review 512 decode, tok/s | Code 2048 decode, tok/s | Median paired decode change, review / code |
+| --- | ---: | ---: | ---: |
+| Off | 86.35 → 86.91 | 81.25 → 81.55 | +0.28% / +0.37% |
+| Fixed depth three | 126.46 → 130.72 | 103.68 → 107.28 | +3.37% / +3.49% |
+| Dynamic | 116.49 → 116.08 | 94.58 → 94.74 | −0.25% / +0.29% |
+
+Fixed-depth review used 296 target rows in 74 verifier calls and code used
+344 in 86, exactly four rows per call. Dynamic review used 352 in 58 calls
+and code used 414 in 69. At that revision, the optimized FFN program selected only the
+four-row capture. The largest absolute paired prefill change was 0.13%.
+[Full-model timings and matched work](/tmp/qfn-mi50-w-q4-borrow-model/comparison.json)
+
+A fresh run of the pinned Castagna fork with speculation off used the
+same quartet, GGUF and prompt token IDs. On review, `c237ef9da` decoded
+at 86.91 tok/s and Castagna at 85.76 (+1.34% for Llaminar). On code the
+rates were 81.55 and 73.65 (+10.73%). Prefill was 1,038.53 versus 874.62
+tok/s on review and 1,008.71 versus 922.66 on code. Each engine completed
+three 256-token outputs per prompt. Output histories diverged at generated
+index 0 on review and 44 on code, so each engine routed its own continuation.
+[Independent samples, token checks and retirement](/tmp/qfn-mi50-w-q4-borrow-model/ordinary-fork-comparison.json)
+
+The matched Q4 experiment also tested computing the exact signed K32 sums
+in the existing router quantizer and publishing intermediate sums alongside
+the routed activation. That helps the previously measured equal-width fixed
+program. In this source-format program the complete F128/S160 parent took
+140.31 → 141.44 µs, and F256/S160 took 207.30 → 210.62 µs. The trace shows
+both arms executed five nodes and used their intended quantizer. In the wide
+shard, Down took 56.48 → 59.84 µs despite the cheaper dot expression. The
+source-format program continues to compute its sums inline.
+[Same-binary timing arms](/tmp/qfn-mi50-verifier-roofline/uneven-activation-abba.json)
+[Per-stage kernel inventory](/tmp/qfn-mi50-verifier-roofline/affine-c2/symbols.json)
+
+The fixed-format Down kernel provided a stronger transfer from single-row
+decode. Capture preparation certifies the original format, width and planes.
+The current grouped route publication still authenticates the acquired bank
+and epoch. The projection can then enter its native one-block-per-partition
+loop directly. On real F160 shards the isolated change took 146.33 → 143.89
+µs on L1, 162.25 → 148.28 µs on L2 and 151.07 → 136.69 µs on L4 for the
+whole captured operation. L2's Down dispatch alone fell from 48.0 to 34.4
+µs. All arms checked serial bytes and original expert routing.
+[Fixed-pitch measurements and stage attribution](/tmp/qfn-mi50-fixed-bank-proof/REPORT.md)
+
+With the separate Q5_K gate/up reader, specializing the pitch and original
+five-block partition increased register use from 70 to 110–111 VGPRs and
+still improved the complete parent at F128, F160 and F256. In the wide
+case, physical fetches stayed within 0.01% and VALU wave instructions fell
+3.75%. Both shipped architectures compiled with zero private scratch.
+These measurements make register lifetime and dependent loads worth tracking
+alongside allocation count. [Independent Q5_K receipts](/tmp/qfn-mi50-q5-fixed-span-c2/typed-w/REPORT.md)
+
+A Release combining the fixed Down change with the separate Q5_K pitch
+reader replayed both paths against the actual QFN weights on PCI c2.
+F128/S160 L1 in the fixed program measured 149.78 → 136.50 µs. F256/S160
+L2 in the source-format program measured 232.25 → 223.28 µs. Each bracket
+used fresh processes in control, treatment, treatment, control order. Source
+intervals were checked on every arm because the wide shard rotates by layer.
+The control was `d50b74c9a` and the combined core SHA256 was
+`2f2a80d37cf62422425c7380a1f0b7f3bbefe58a32c7c241a42697c36d254376`.
+All ten focused production-preflight registrations passed on this combined
+core. The two 160-column replays used private tmpfs for generated fixtures
+and the registered 120-second limit. They took 97.52 and 101.06 seconds.
+[Complete operation and byte-replay receipts](/tmp/qfn-mi50-verifier-roofline/combined-original-abba.json)
+[Registered native gates and ELF identities](/tmp/qfn-mi50-fixed-bank-proof/canonical-w/combined-r1/qualified.json)
+
+### Verifier tile assignment and packet scheduling
+
+The original QFN layer 1 on four MI50s has 128- and 256-column routed
+shards and a 160-column shared shard. The timings below use the serving
+FP16 router and register top-K selector. Each event times 32 complete
+captured four-row router and expert-FFN operations on one participant.
+Each process contributes 12 event samples. Controls and candidates run in
+mirrored order on the same device. The native fixture also compares every
+live row with serial decode. HC and peer reduction have separate timing
+scopes.
+
+| Q4_K gate/up schedule | F128/S160, µs | F256/S160, µs |
+| --- | ---: | ---: |
+| Original grid, two wave pairs per block with tile reuse | 118.81 | 177.20 |
+| One output tile per wave pair, 16 columns per wave | 116.98 | 158.22 |
+| One tile per block, 8 columns per wave | 114.66 | 167.72 |
+| One tile per block, 4 columns per wave | 129.92 | 202.66 |
+
+The 16-column layout launches 90 and 170 workgroups respectively. Giving
+each wave pair its own output tile removes a barrier that protected LDS
+reuse. The four-column layout reproduces the single-row mapping of 16
+concurrent K partitions but loses on both four-row widths. The source
+arithmetic and ordered expert folds stay the same across these experiments.
+[Two wave pairs per block](/tmp/qfn-mi50-single-tile-ba/abba-score.json)
+[Eight columns per wave](/tmp/qfn-mi50-partition-8-ba/abba-score.json)
+[Four columns per wave](/tmp/qfn-mi50-partition-4-ba/abba-score.json)
+
+On PCI c2, the wide single-tile gate fetched 31,383.56 KiB in 66.08 µs.
+Its 486.31 GB/s was **87.51%** of the independently calibrated 555.72 GB/s
+read-only packet rate at 170 workgroups. The wide down projection reached
+57.12% of its own reference. Issuing pairs of K32 reads raised the gate
+fraction to 90.19%, while the complete wide parent rose by 1.00 µs in that
+bracket. Whole-parent timing decides the schedule.
+[Matched rates, counter scopes and replay receipts](/tmp/qfn-mi50-q4-k32-pipeline-c2/REPORT.md)
+
+The original Q5_1 down reader benefits from loading several packets before
+folding them. At F128, reading four packets instead of two reduced the
+down dispatch from 32.16 to 30.88 µs. Its external 64-byte read requests
+changed by 0.10%. At F256 four-packet reads increased the down time from
+49.12 to 51.20 µs. The width-specific program uses four at F128 and two at
+F256. Native replay moved all three weight planes between banks, poisoned
+the retired storage and verified serial bytes and deferred acceptance after
+each publication.
+[Down packet profiles and production replay](/tmp/qfn-mi50-q51-down-c5/REPORT.md)
+
+The combined Release ran on PCI bd against the previous Release, in A/B/B/A
+order, with the same model bytes, routes, router and graph scope on each arm.
+These are complete four-row router and expert-FFN times on one participant.
+The TP degree selects the real column slice used by that participant.
+
+| TP degree | Routed / shared columns | Previous, µs | Combined, µs | Change |
+| ---: | ---: | ---: | ---: | ---: |
+| 1 | 640 / 640 | 313.83 | 296.75 | −5.44% |
+| 2 | 384 / 320 | 225.91 | 217.39 | −3.77% |
+| 4 | 128 / 160 | 119.20 | 114.12 | −4.26% |
+| 4 | 256 / 160 | 178.30 | 151.10 | −15.25% |
+| 8 | 64 / 96 | 98.32 | 98.74 | +0.43% |
+
+All nine focused preflight cases passed on the checkpoint. Original three-way
+source windows also passed native serial-byte replay on all three participants.
+On those held-out windows, issuing one K32 packet per step was 0.78–1.25%
+faster than issuing two. The final-round occupancy alone did not predict
+the winner. Both shipped ROCm targets passed the compile-time spill guard.
+The retained single-row kernel loadable segments matched the control on both.
+[Original model window timings](/tmp/qfn-mi50-gate-packet-holdout-final-bd/comparison-original-a.json)
+[Three-way packet comparison](/tmp/qfn-mi50-gate-packet-holdout-final-bd/comparison-single-a.json)
+[Preflight results](/tmp/qfn-mi50-fixed-bank-proof/canonical-tile-packets/tile-r1/ctest.xml)
+
+To reproduce the original four-row layer-1 window inside a single-MI50
+Release test container, supply the actual GGUF shard and set participant 0
+for the 256-column shard or 1 for the 128-column shard. Each invocation
+checks serial bytes and records twelve 32-operation event samples.
+
+```bash
+export LLAMINAR_TEST_CASTAGNA_GGUF=/opt/llaminar-models/Qwen3.8-Flash-Next-GGUF/UD-Q4_K_XL/Qwen3.8-Flash-Next-UD-Q4_K_XL-00001-of-00004.gguf
+export LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16 LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES=0
+export LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER=1 LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK=1
+export LLAMINAR_QFN_ROCM_GROUPED_FFN_EQUAL_FRONTIER=1 LLAMINAR_QFN_ROCM_GROUPED_FFN_ALL_FORMATS=1
+export LLAMINAR_QFN_ROCM_GROUPED_FFN_AFFINE_SUMS=0 LLAMINAR_QFN_ROCM_GROUPED_TOPK_REGISTERS=1
+export LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS=1 LLAMINAR_TEST_GROUPED_M4_PROGRAM=all_formats
+export LLAMINAR_TEST_GROUPED_M4_DEMAND=static LLAMINAR_TEST_QFN_WINDOW_EVENTS=1 LLAMINAR_TEST_QFN_SOURCE_LAYER=1
+export LLAMINAR_TEST_QFN_SOURCE_ROCM_ORDINALS=0,1,2,3 LLAMINAR_TEST_QFN_SOURCE_PARTICIPANT=0
+export LLAMINAR_TEST_GROUPED_M4_REQUIRED_SYMBOL=groupedFFNFormatProgramGateILj1ELi5ELi0
+export LLAMINAR_TEST_GROUPED_M4_SYMBOL_PRESENT=1 LLAMINAR_PERF_STATS_SUMMARY=1
+export LLAMINAR_PERF_STATS_FILTER=kernel.rocm_grouped_ffn_frontier_calls
+mpirun -np 1 --bind-to none "$BUILD/tests/v2/v2_integration_moe_intermediate_ffn_finalization" \
+  --gtest_also_run_disabled_tests --gtest_filter=GroupedM4SourceWindow.DISABLED_OriginalQFN
+```
+
+### Six-row dynamic verifier on the original TP4 shards
+
+The six-row captured FFN ran a full generation on four MI50s with the
+original 128/128/128/256 partition and RAM ngrams. Control and candidate
+used the same private Release core, `7edc20278a65`. Only the six-row FFN
+selection changed. Each prompt had three warmed 256-token trials.
+
+| Prompt | Dynamic prefill, control → six-row (tok/s) | Dynamic decode, control → six-row (tok/s) | Median paired decode gain | Verifier calls / target rows |
+| --- | ---: | ---: | ---: | ---: |
+| Review, 512 tokens | 1000.62 → 1000.26 | 115.92 → 126.91 | +9.51% | 58 / 352 |
+| Code, 2048 tokens | 970.11 → 969.56 | 94.43 → 103.81 | +10.18% | 69 / 414 |
+
+All generated token IDs matched each run's ordinary decode. The two
+dynamic arms matched all five counts for proposals, acceptance, rejection,
+verifier calls and verified rows. Ordinary decode changed by less than
+0.3% in both prompts. Storage stalls overlapped the staged control window.
+The earlier independently measured c237 rates of 116.08 and 94.74 tok/s
+were within 0.4% of the fresh control.
+[Serving trials](/tmp/qfn-mi50-m6-counted-frontier-evidence/serving/native-r2-comparison.json)
+[Independent history and counter comparison](/tmp/qfn-mi50-m6-counted-frontier-evidence/serving/native-r2-c237-history.json)
+
+Each affected six-row capture removed eight local FFN dispatches in each
+of the 48 layers, or 384 native nodes per GPU. Four of the 60 retained
+captures per participant changed. At physical six rows the isolated
+router and FFN fell from 268.28 to 173.05 µs at F128 and from 321.60 to
+241.09 µs at F256. Empty, partial, full and moved-bank replays matched
+serial decode bytes. These trials isolate the six-row change ahead of
+qualifying it together with the four-row tile and packet changes.
+[Native capture inventory](/tmp/qfn-mi50-m6-counted-frontier-evidence/serving/native-r2-capture-delta.json)
+[Original source windows](/tmp/qfn-mi50-m6-counted-frontier-evidence/pci8c-real-r2-battery-comparison.json)
+
+The four-row packet-depth check also compared one and two outstanding K32
+reads with the *same* dedicated tile grid and projection code. Two packets
+reduced the complete parent from 98.43 to 94.57 µs on the underfilled
+F64/S96 grid and from 229.93 to 218.46 µs at F384/S320. They cost 4.10%
+at F640/S640. On both original TP4 widths and the three held-out TP3
+widths, the single-packet parent was faster. The dispatch experiment
+therefore selects two packets for less than one workgroup per CU or a
+sparse final round after at least two complete rounds.
+[Seven original windows on PCI bd](/tmp/qfn-mi50-original-packet-dispatch-bd/comparison-single-a.json)
+[Held-out three-way windows](/tmp/qfn-mi50-gate-packet-holdout-final-bd/comparison-single-a.json)
+
+### Combined counted verifier across original widths and formats
+
+On PCI bd, a second comparison held the counted FFN active in *both* arms
+for four and six rows. The previous six-row candidate used the original
+c237 tile/packet schedule. The combined Release used dedicated tiles on
+wide mixed-format gates, packet-depth selection and the width-specific
+Q5_1 down reader. The same original source windows and live routes passed
+serial byte replay. The table gives µs per complete captured router and
+expert FFN. The measurements exclude HC and peer reduction.
+
+| Rows | TP degree | Routed / shared width | Routed gate / down | Previous counted | Combined counted | Change |
+| ---: | ---: | ---: | --- | ---: | ---: | ---: |
+| 4 | 4 | 128 / 160 | Q4_K / Q5_1 | 121.53 | 113.75 | -6.41% |
+| 4 | 4 | 256 / 160 | Q4_K / Q5_1 | 180.12 | 152.98 | -15.07% |
+| 4 | 8 | 64 / 96 | Q4_K / Q5_1 | 99.09 | 93.68 | -5.46% |
+| 6 | 4 | 128 / 160 | Q4_K / Q5_1 | 165.64 | 150.14 | -9.36% |
+| 6 | 4 | 256 / 160 | Q4_K / Q5_1 | 233.65 | 217.57 | -6.88% |
+| 6 | 4 | 128 / 160 | Q5_K / Q8_0 | 183.46 | 170.70 | -6.96% |
+| 6 | 4 | 256 / 160 | Q5_K / Q8_0 | 273.24 | 270.19 | -1.12% |
+
+All four arms used the prepared source, serving register top-K and twelve
+32-operation samples per width. A host NVMe stall delayed container
+retirement in the control bracket. These values come from native GPU
+events during replay. The all-format experiment on PCI c2 independently
+covered 15 generated source families at four rows and F256/S256. All
+15 improved in both directions of the A/B/B/A bracket. The median
+reduction in complete local time was 22.01%, ranging from 9.94% on
+G01 to 33.87% on G07. Hardware-counter inspection of the original
+wide Q5_K gate measured 459.58 GB/s, or 78.82% of its independently
+calibrated 170-workgroup packet-read reference.
+[Combined real-shard A/B samples](/tmp/qfn-mi50-combined-rows-bd/comparison-previous-a2.json)
+[Per-family source identities and timings](/tmp/qfn-mi50-all-readers-c2/batch-catalog-r1/catalog-score.csv)
+[Q5_K physical counter scope and calibration](/tmp/qfn-mi50-all-readers-c2/REPORT.md)
+
+All 13 focused preflight cases passed on the combined ELF. The first
+pass exposed three test registrations that started their single MPI rank
+on socket 0 while the test MI50 belonged to socket 1. Using the existing
+one-rank-per-socket registration let the NUMA-local rank run each test.
+An existing bank-rejection case timed out during a host NVMe write stall.
+It passed at the original 120-second limit on the same binary. Both
+shipped ROCm targets passed the spill guard.
+[Per-test native receipts on the same ELF](/tmp/qfn-mi50-fixed-bank-proof/canonical-counted-m6-tiles/qualified.json)
+
+For G15, the wide gate fell from 224.80 to 153.60 µs. Its physical read
+rate rose from 104.87 to 145.97 GB/s, reaching 26.83% of the 543.99 GB/s
+matched packet-read reference. The receipt verifies all 40 ordered route
+IDs. This gap leaves the indexed decoder's instruction and dependency
+costs to be quantified before assigning the remaining time to memory.
+[G15 route, physical fetch and issue counters](/tmp/qfn-mi50-all-readers-c2/g15-score.json)
+
+### Original TP4 full-model checkpoint
+
+Release `117b1d9d9` used the original 128/128/128/256 routed shard widths.
+Each result is the median of three 256-token generations on the same four
+MI50s after warmup. Both prompts used the same token IDs and empty prefix
+cache. Ordinary, fixed-depth-3 and dynamic Llaminar matched all 256 ordinary
+output tokens on each trial. The fixed and dynamic comparisons with the
+previous Llaminar build matched all five measured verifier work counters.
+
+| Mode | Review prefill / decode (tok/s) | Code prefill / decode (tok/s) |
+| --- | ---: | ---: |
+| Ordinary Llaminar | 1040.54 / 86.41 | 1009.22 / 81.18 |
+| Ordinary Castagna | 874.62 / 85.76 | 922.66 / 73.64 |
+| Fixed-depth-3 Llaminar | 1001.58 / 136.83 | 970.02 / 112.71 |
+| Fixed-depth-3 Castagna | 785.74 / 117.62 | 892.87 / 108.39 |
+
+Against the previous Llaminar fixed-depth release the median paired decode
+gains were 4.88% and 4.86%, with prefill within 0.08%. Ordinary decode was
+0.66% and 0.59% slower during these trials. Host I/O pressure overlapped
+the code prompt. The external measurements used the same input IDs and
+diverged during generation. Castagna fixed-depth also diverged from its
+own ordinary history.
+[Fixed-depth and ordinary same-work comparisons](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-comparison.json)
+[Ordinary fork reference](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-fork-off-reference.json)
+[Fixed-depth fork reference](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-fork-fixed3-reference.json)
+
+Dynamic decode reached 129.52 tok/s on review and 106.30 on code. The
+same-boot staged control measured 115.92 and 94.43. Paired improvements
+were 11.76% and 12.69%. Prefill stayed within 0.23% across the controls.
+[Three complete dynamic comparisons](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-dynamic-comparison.json)
+
+### Fixed-depth verifier on the original TP4 split, code2048
+
+A Release trace of `117b1d9d9` reproduced its unprofiled 256-token
+generation, with 86 verification rounds and 344 verified rows. Castagna
+completed 81 rounds on the same prompt IDs. Each engine's per-round
+measurements use its own completed work. The four-card native target
+dispatch union fell to 23.169 ms per round, from 26.391 ms in the earlier
+original-split run. Castagna measured 18.222 ms. Llaminar's first-to-last
+target dispatch span across the four devices was 23.616 ms per round.
+
+| Boundary | Llaminar | Castagna | Unit |
+| --- | ---: | ---: | --- |
+| Complete target verifier | 23.169 | 18.222 | active ms per round per GPU |
+| Hyperconnections, projections, activation preparation, routing and experts | 16.112 | 13.033 | summed ms per round per GPU |
+| Attention, indexer and RoPE | 1.322 | 0.495 | summed ms per round per GPU |
+| GDN and convolution state | 1.357 | 0.966 | summed ms per round per GPU |
+| Peer push | 2.886 | 2.486 | summed ms per round per GPU |
+| Draft prediction | 1.045 | 1.208 | active ms per proposal per GPU |
+| Prompt prefill | 2107.3 | 1249.2 | profiled active ms per GPU for the full prompt |
+
+Llaminar's largest subtotal includes 5.210 ms of other projections, 3.781 ms
+of hyperconnections, 2.324 ms of grouped gate/up and 1.863 ms of grouped
+down/fold. On the shared four-device clock, 2.368 ms of communication
+overlapped compute and 1.718 ms had only communication running. GPU-active
+prefill timing was measured under the profiler. The full prompt dispatch
+window averaged 2113.18 ms per GPU in Llaminar and 2148.44 ms in Castagna.
+Recorded kernels occupied 99.72% and 58.15% of those windows respectively.
+The fork spent 899.21 ms of its prompt window outside recorded kernel
+intervals. This accounts for the difference between its short active-kernel
+time and the end-to-end prefill result. The unprofiled throughput table
+above gives user-visible rates.
+[Per-device dispatch intervals](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-code2048-phases.json)
+[Per-stage time and overlap across the four cards](/tmp/qfn-mi50-w-r3-verifier-cohort/checkpoint-r3-code2048-target-breakdown.json)
+
+### Fixed-depth verifier after the counted routing and HC changes
+
+The Release at `7001788d8` verified the same 344 target rows in 86
+rounds on code2048. Its four-MI50 mean target GPU-active time was 23.233
+ms per round. The pinned fork remained at 18.222 ms over 81 rounds of
+its own generated history. The largest remaining group comprised
+hyperconnections, projections, activation preparation, routing and
+experts at 16.109 ms against 13.033 ms. Attention/indexing took 1.320
+ms against 0.495 ms, GDN/convolution took 1.365 ms against 0.966 ms,
+and peer push took 2.976 ms against 2.486 ms. Each fork participant ran
+94 instances of the four-row persistent HC kernel with its fused work
+enabled and two instances of its other HC variant per round. Together
+they occupied 10.48 ms per GPU. That scope includes work split among
+multiple Llaminar kernels in the table below.
+
+| Llaminar target operation | Launches per round per card | Mean ms per round per card |
+| --- | ---: | ---: |
+| HC up-projection | 97 | 1.248 |
+| HC down-projection contributions | 97 | 1.108 |
+| HC down residual publication | 97 | 0.569 |
+| Router FP16 projection | 48 | 0.886 |
+| Router softmax and top-k | 48 | 0.859 |
+| Expert gate/up, SwiGLU and Q8 publication | 48 | 2.344 |
+| Expert down-projection and ordered fold | 48 | 1.873 |
+
+HC up-projection saved 0.102 ms across 97 launches against the preceding
+trace. The whole verifier changed by 0.065 ms. Host I/O pressure was high
+during the trace. These figures describe device dispatches. The unprofiled
+rates above measure throughput.
+[Stage attribution and common-clock intervals](/tmp/qfn-mi50-w-r3-verifier-cohort/fuller-code2048-target-breakdown.json)
+[Original layer launch counts and native kernel symbols](/tmp/qfn-mi50-w-r3-verifier-cohort/fuller-code2048-grouped-kernels.json)
+
+The subsequent counted HC-down reducer at `8b4e30bca` combined ordered
+reduction and activation publication. On the same code2048 fixed-depth
+workload, each participant recorded 1,838 verifier kernels per round,
+down from 1,935. Mean GPU-active verifier time fell from 23.233 to
+22.669 ms per round. The fork measured 18.222 ms on its own history.
+Unprofiled decode rose from 111.88 to 113.54 tokens/s, with all 256
+output tokens, 86 rounds and 344 target rows identical between the two
+Llaminar runs. These figures use the uneven routed-column partition.
+[Four-device traces and same-binary control](/tmp/qfn-mi50-hc-reducer-trace-sol62/REPORT.md)
+
+### Moving route preparation out of the fixed-depth expert arithmetic
+
+The focused harness replayed four original layer-1 verifier rows with the
+admitted TP4 widths. In each layer three MI50s own 128 routed columns and
+the fourth owns 256. The wide shard rotates between participants across
+layers. Each owns 160 shared columns. The timed parent includes the router,
+selection and the complete local expert operation. Each candidate used its
+own same-card control. The table reports GPU-event times in microseconds.
+
+| Change | 128 columns, control → candidate | 256 columns, control → candidate |
+| --- | ---: | ---: |
+| Publish the native Down operands from the existing gate launch | 114.75 → 113.25 | 150.14 → 148.50 |
+| Prepare all expert operands in a separate graph node | 115.63 → 118.76 | 151.37 → 161.10 |
+| Give one workgroup ownership of an entire selected expert row | 114.89 → 113.71 | 150.73 → 158.29 |
+
+Publishing the Down operands removed repeated native-source and route checks
+from the output tiles. On the wide shard the compiled Down kernel used 48
+vector and 64 scalar registers, against 56 and 80 previously, with zero
+private bytes in both. A single matched hardware-counter sample measured
+18,794 versus 18,802 KiB fetched. The saving came with almost unchanged
+off-chip traffic. Both original-operand candidates passed serial byte replay.
+Preparing all operands in its own launch added a dependency to the captured
+parent. Giving each selected expert row to one workgroup left only 44
+workgroups on a 60-CU MI50 at the wide shard. Retaining enough independent
+output tiles matters even with forty routed slots available.
+[Original-shard Down preparation and timings](/tmp/qfn-mi50-m4-published-down-c5/comparison.json)
+[All 15 families across four- and six-row static and deferred replay](/tmp/qfn-mi50-m4-published-down-c5/all-format-qualified.json)
+[Separate preparation timings](/tmp/qfn-mi50-m4-route-operands-c5/comparison.json)
+[Original-row fusion and workgroup profile](/tmp/qfn-mi50-cta-route-fused/REPORT.md)
+
+On four MI50s, publishing the Down operands from the existing gate raised
+median fixed-depth decode on code2048 from 111.88 to 112.97 tok/s.
+The median paired gains were 0.97% for decode and −0.21% for prefill.
+Ordinary decode changed by 0.01%. Both Releases produced the identical
+256 output tokens in each of three generations, with 86 verifier rounds
+and 344 target rows per fixed-depth generation. Additional local timings
+on original layer 2 (Q5_K gate/up and Q8_0 Down) and layer 4 (Q4_K gate/up
+and Q8_0 Down) changed by less than 0.5% at both widths. The improvement
+on layer 1 depends on its weight formats as well as its width.
+[Four-MI50 model throughput, histories and verifier work](/tmp/qfn-mi50-w-r3-verifier-cohort/prepared-down-comparison.json)
+[Original layers 2 and 4 at both TP widths](/tmp/qfn-mi50-m4-published-down-c5/heldout-layers/comparison.json)
+
+The preflight regression publishes a newer expert bank on a maintenance
+stream between captured route preparation and expert computation. The
+first four-row verifier finishes on the held bank. It blocks reclamation
+until Down releases its lease. The next four-row verifier reads the new
+bank and its relocated Down scales. Twenty histories check serial output
+bytes and deferred accepted-prefix accounting under reset, partial and
+zero live rows. The fixture uses a single MI50 and generated original-format
+weights. The model throughput measurements above use four MI50s.
+[Held-epoch fixture and independent reader checks](/tmp/qfn-held-grouped-c2/README.md)
+[Release preflight replay](/tmp/qfn-mi50-fixed-bank-proof/canonical-held-epoch/native-1/ctest.xml)
+
+The next Release prepared Gate, Up and Down operands in the existing
+softmax/top-k selector for eligible 128-column shards. Ten lanes issued
+the original selected slots together. A serial lane-zero prototype spent
+68.80 µs in selection, compared with 11.36 µs in the control. The
+lane-parallel version uses a separate selector entry so ordinary verifier
+capacities retain their own compiled kernel. On the 256-column shard the
+existing Gate launch publishes the Down operands. The measured four-row
+parent includes the router projection, selector and both expert launches.
+
+| Original layer 1, held Q4_K/Q5_1 expert weights | Checked control (µs) | Prepared operands (µs) |
+| --- | ---: | ---: |
+| 128 routed, 160 shared columns | 118.52 | 109.76 |
+| 256 routed, 160 shared columns | 155.08 | 155.85 |
+
+The 128-column path requires the original paired physical formats and a
+held durable bank. A captured verifier using the original layer-2 Q5_K
+holdout selected the checked path. A six-row replay and an M4-to-M3 reset
+also retained their expected route handling. These are local parent times.
+[Reverse-order native timings and authority checks](/tmp/qfn-mi50-m4-ready-serving/REPORT.md)
+[Held-epoch, source holdout, six-row and reset qualification](/tmp/qfn-mi50-m4-ready-serving/promotion-native-gate.json)
+
+In a four-MI50 coding run on the same Release, enabling both operand
+policies changed fixed-depth decode from 111.95 to 111.80 tok/s (−0.14%
+paired). Prefill moved from 970.82 to 970.16 tok/s. All three generations
+matched the ordinary 256-token history and the control's 86 verifier
+rounds and 344 rows. Host I/O pressure was higher during the enabled arm.
+This experiment leaves the checked path in place.
+[Paired expert operand measurements](/tmp/qfn-mi50-m4-ready-serving/protected-model/comparison.json)
+
+The preceding code2048 control trace identifies which shard gates the next
+collective. The 256-column owner completed the local FFN after every
+128-column owner in 4,117 of 4,128 layer-round observations (99.73%).
+Across the 48 layer medians, the wide owner finished 31.36 µs later
+than the last narrow owner on the common clock. Measuring from each
+card's own preceding peer completion gave a 31.52 µs gap. This places the next
+throughput experiment on the wide shard.
+[Per-layer GPU arrival times from the original four-card trace](/tmp/qfn-mi50-hc-reducer-trace-sol62/arrivals-3c-control.json)
+
+One separate store experiment omitted the individual routed contributions,
+the routed and shared partial outputs, and the shared gate and up outputs.
+Those five writes total 496,640 bytes per four-row layer per participant.
+Computing the same combined output took 114.03 → 113.88 µs at 128 columns
+and 151.25 → 151.41 µs at 256. The treatment left all five test buffers
+untouched and reproduced serial output over 20 full, partial, empty and
+reset histories. The production path keeps the existing publications.
+[Same-binary store experiment and native event samples](/tmp/qfn-mi50-grouped-ffn-output-demand/bd-original-abba-r2/result.json)
+
+The HC up-projection can compute the four-branch residual read from its
+own live logits. With the grouped Down reducer enabled, this shortened
+the captured local HC parent from six launches to five and saved
+2.0–2.7 µs in two independent timing windows. The same-Release four-MI50
+test used the identical prompt, sampled history and verifier work. Across
+three generations, median decode fell from 113.83 to 113.20 tok/s with
+the extra fusion. Its complete-model result leaves the read staged.
+[Exact captured HC tests and reverse-order timings](/tmp/qfn-mi50-hcup-read-c2/REPORT.md)
+[Four-card same-Release throughput and accepted-token counts](/tmp/qfn-mi50-w-r3-verifier-cohort/hc-read-admission-comparison.json)
+
+With the residual read staged, enabling the grouped HC-down reducer on
+the same Release removed 97 launches from the selected four-row verifier
+on every MI50. Its captured size fell from 1,935 to 1,838 native nodes.
+Median decode rose from 111.88 to 113.54 tok/s on code2048 (+1.49%
+paired). Prefill changed by +0.04% paired. All token IDs and work
+counters matched. Host I/O pressure was lower during the treatment.
+[Same-binary HC-down reducer timing, graph counts and I/O pressure](/tmp/qfn-mi50-w-r3-verifier-cohort/fuller-hc-reducer-comparison.json)
+
+The automatic policy selects the measured contributor and reducer while building
+a counted four-row verifier graph for an MI50 with original Q8 down and up
+weights. The reducer folds the same 16 partitions in order and writes the
+activation bank consumed by the next projection. A diagnostic value of `0`
+for `LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH` selects the staged
+path. The up-projection and residual read keep their own dispatch.
+
+With the tuning switches unset, an original layer-3 replay measured the
+complete HC parent at **86.76 → 73.67 µs** with four live rows. Two live rows
+took 68.19 → 58.24 µs and one took 59.41 → 50.96 µs. Empty replay took
+16.34 → 16.26 µs. Each pair used 32 interleaved event samples per live count
+and 48 complete graph replays per sample. The partials, published banks,
+serial outputs and retained state matched byte for byte. This comparison
+includes selecting the long-K contributor. The four-card run above had
+already selected that contributor in both arms and isolates publication.
+[Layer-3 event timings](/tmp/qfn-mi50-hc-reducer-default/native-bd-timing-no-env-v1/result.json)
+[MI50 and gfx1100 qualification](/tmp/qfn-mi50-hc-reducer-default/qualified.json)
+[Six registered Release regressions, including automatic, forced-off and portable dispatch](/tmp/qfn-mi50-hc-reducer-default/ctest-qualified.json)
+
+### Physical read limits on the six-row TP4 verifier
+
+The Release build at `117b1d9d9` ran layer 1 from the original QFN GGUF on
+the 256-column routed, 160-column shared shard. Its six full verifier rows
+selected 60 expert slots and 55 distinct experts. At each full-live replay
+the ordered IDs and FP32 route weights matched. The gate and down probes
+read the same ordered IDs and original role formats on the same MI50.
+
+| Operation | Timed native dispatch | Native physical fetch | Read-only calibration | Fraction of measured read bandwidth |
+| --- | ---: | ---: | ---: | ---: |
+| Q4_K gate/up plus shared Q8_0 | 101.44 µs | 491.42 GB/s | 578.43 GB/s | 85.0% |
+| Q5_1 down plus shared Q8_0 | 60.64 µs | 470.67 GB/s | 642.15 GB/s | 73.3% |
+
+Timings cover the final 512 full-live dispatches. Each physical count comes
+from a separate warm dispatch. The gate used 255 blocks and down used 40
+blocks across each of six rows. Both used 256 threads per block. The
+four-bank calibration verified each output lane and used 39 unprofiled
+samples per role. The percentages measure bandwidth for this specific
+access pattern. Production also decodes weights, computes projections,
+and publishes outputs.
+[Original route tape, physical counters and calibration](/tmp/qfn-mi50-m6-roofline-bd/physical-score.json)
+
+### Register router for intermediate verifier capacities
+
+The MI50 router used its fixed-row FP16 projection at physical capacities
+4, 7 and 8. Capacities 2, 3, 5 and 6 can use the same two compiled entries.
+At six rows, projection time fell from 40.12 to 26.15 µs. Projection and
+top-K together fell from 54.27 to 40.67 µs. The eight-row register entry
+used 19 VGPRs, versus 43 in the previous projection. Both had zero spills.
+The replay compared the FP32 logit bytes, routing IDs and weights across
+live counts, including zero.
+
+| Six-row original TP4 shard | Previous router + FFN | Register router + FFN |
+| --- | ---: | ---: |
+| Q4_K, F128/S160 | 149.38 µs | 138.34 µs |
+| Q4_K, F256/S160 | 215.31 µs | 202.08 µs |
+| Q5_K, F256/S160 | 267.89 µs | 256.74 µs |
+
+The unchanged four-row Q4_K control measured 113.43 and 113.16 µs in the
+same repeated bracket. All five focused production preflight tests passed,
+including fixed-row capture for every capacity 2–8 and retained single-row
+numerics. The retained HC/FFN loadable sections matched on gfx906 and gfx1100.
+In the four-MI50 Release run, dynamic decode rose from 129.52 to 131.75
+tok/s on review and from 106.30 to 108.37 on code. All six generations and
+five verifier counters matched their controls. Prefill changed by −0.37% and
+−0.15%. Short-window host I/O pressure reached 8–13% during this candidate.
+[Matched four-MI50 Release comparison](/tmp/qfn-mi50-w-r3-verifier-cohort/router-buckets-comparison.json)
+[Router and selector timings](/tmp/qfn-mi50-router-buckets-49/matched.json)
+[Original shard timings](/tmp/qfn-mi50-router-buckets-49/window/comparison-control-a2.json)
+[Canonical Release qualification](/tmp/qfn-mi50-fixed-bank-proof/canonical-router-buckets/qualified.json)
+
+### Six-row down-projection scheduling
+
+On a single MI50, the original TP4 layer-one Q4_K/Q5_1 shard with 256
+routed and 160 shared columns took 204.40 µs for the complete captured
+router and local FFN with four waves per down-projection workgroup. Six
+waves took 227.80 µs and eleven took 239.65 µs. Both halves of the mirrored
+run reproduced that ordering. Each arm replayed the same five captured
+nodes and checked the selected down kernel and its output against serial
+decode. The four-wave schedule stays selected.
+
+Publishing the routed Q8 activation sum in the gate for reuse by the down
+projection saved 1.11 µs at 256 routed columns and 0.24 µs at 128. These
+are complete local verifier timings on the original GGUF. The experiment
+adds an intermediate per route and K32 block. The production path
+continues to compute the sum in the down projection.
+[Mirrored timing brackets and captured kernel identities](/tmp/qfn-mi50-m6-roofline-bd/m6-down-schedule-comparison.json)
+
+### Indexed weight formats on MI50
+
+The six-row sweep covered all 15 original-format recipes at 256 routed
+and 256 shared columns. Four recipes were slower with a separate wave
+pair for each gate tile. Reusing gate workgroups on MI50 reduced the
+complete local verifier time on those recipes as follows. Values are
+the mean of the two arm medians from the mirrored timing sequence.
+
+| Routed gate/up | Shared gate/up | Routed down | Dedicated tiles, µs | Reused tiles, µs |
+| --- | --- | --- | ---: | ---: |
+| IQ2_S | Q8_0 | IQ2_S | 343.05 | 326.68 |
+| IQ2_S | Q4_0 | Q4_0 | 341.80 | 326.14 |
+| IQ2_S | Q8_0 | Q6_K | 345.17 | 326.50 |
+| IQ3_S | IQ4_NL | IQ2_S | 513.30 | 496.53 |
+
+All four deferred captures also matched serial output bytes. In the
+private run the driver observer timed out during shutdown. Its completed
+journal contained zero GPU findings and the card returned to its initial
+VRAM usage. The raw observer failure and the subsequent journal check
+are retained together.
+[Four-format timing and byte receipts](/tmp/qfn-mi50-m6-family-qualification/batch-repair-r1-adjudicated/score.csv)
+[Original observer result](/tmp/qfn-mi50-m6-family-qualification/batch-repair-r1/result.json)
+[Journal check](/tmp/qfn-mi50-m6-family-qualification/batch-repair-r1/driver-independent-adjudication.json)
+
+For IQ3_XXS routed gate/up and IQ2_S shared gate/up, issuing eight
+independent codebook reads together removed six waits from the MI50
+instruction sequence. With Q6_K routed down and Q8_0 shared down,
+four-row verifier time fell from 246.69 to 216.28 µs and six-row time
+from 403.71 to 324.75 µs. The gate used 81 vector registers, 104 scalar
+registers and 320 bytes of LDS with zero spills. The six-row gate reached
+27.6% of the measured read-only reference for its packet layout.
+These are local timings on generated original-format fixtures.
+[Gate and complete-parent timings, resource counts and read calibration](/tmp/qfn-mi50-g15-canonical-c2/REPORT.md)
+
+G13 uses the same routed and shared gate/up readers as G15, with Q5_1
+routed down and IQ2_S shared down. The down projection runs in a separate
+launch. Choosing the gate reader from its four actual gate/up operands
+gave G13 the same batched lookup. On the same Release binary the complete
+four-row verifier fell from 250.10 to 217.47 µs and the six-row verifier
+from 437.70 to 359.86 µs. The six-row gate itself fell from 293.28 to
+217.28 µs. Each row count had eight interleaved quiet measurements,
+identical ordered expert IDs, serial-byte checks and separate deferred
+capture checks. The selected gate requires singleton native arithmetic and
+physical formats for the routed operands and the original shared formats.
+[G13 captured native leaves, route identities and timings](/tmp/qfn-mi50-g13-canonical-c2/REPORT.md)
+
+### Verifier schedules by GPU
+
+The ROCm and CUDA grouped verifier recorders select a launch schedule
+from the owning ordinal's admitted hardware metadata. MI50 uses the
+60-CU gfx906 table. The 7900 XTX used the portable ROCm readers for
+Q4_K/Q5_1 at four and six rows and for the mixed IQ3_XXS family at six.
+Captured gate grids were 90, 96 and 96 workgroups respectively. HIP
+reports 48 workgroup processors on that card. The portable grid uses
+at most two workgroups per reported multiprocessor. On one rank with
+both AMD cards visible, each card selected its own kernels and matched
+its serial output bytes.
+[Native captures and physical device identities](/tmp/qfn-mi50-portable-architecture-replay/qualified.json)
+
+The RTX 3090 selected the SM86 grouped schedule and reproduced serial
+Q4_K output bytes on four dirty replays. A separate diagnostic forced
+the portable two-row DP4A kernel on this same GPU. It reproduced serial
+bytes and preserved inactive output for 0–16 active rows. With four
+active rows, it took 126.33 µs at N17408/K5120 and 115.98 µs at
+N5120/K17408. The tuned SM86 schedule took 88.17–88.71 µs and
+91.32–91.70 µs respectively. The shipped SM80, SM86, SM89 and SM90
+targets compiled. Native CUDA measurements here cover SM86.
+[CUDA capture, tuning controls and device checks](/tmp/qfn-mi50-cuda-verifier-table/REPORT.md)
+
+The combined Release core `80e786c6` passed six device-free metadata and
+table-binding tests, thirteen focused format, router and retained-M1
+registrations on MI50, eight native architecture cases across the two AMD
+cards, and the registered RTX 3090 capture replay. The shipped gfx906,
+gfx1100, SM80, SM86, SM89 and SM90 targets compiled with spill checking.
+The retained single-row HC/FFN and pre-attention loadable code matched the
+control on both AMD targets.
+[Combined Release receipts](/tmp/qfn-mi50-fixed-bank-proof/canonical-combined-tables/qualified.json)
+
+The four-card original-split Release at `261abf958` cleared all three
+modes across review512 and code2048 with the kernel tuning switches enabled.
+All 18 generated histories matched the earlier qualified Release. Both MTP
+modes matched fresh ordinary decode and reproduced all five speculative work
+counters. The dashboard lists the full prefill and decode rates alongside
+the fork for each mode. The fork's adaptive control proposed 408 and 360
+tokens per request on review and code respectively, accepting 199 on each.
+Its API exposes proposed and accepted tokens. Its verifier-round and target-row
+counts are unavailable.
+[Matched full-model throughput and retained receipts](/tmp/qfn-mi50-w-r3-verifier-cohort/final-tables-serving-summary.json)
+
+### Four-row hyperconnection projection and grouped router selection
+
+On MI50, one entire wave can share a K32 activation packet across 64
+Q8_0 output columns in the hyperconnection up-projection. On original
+layer 0 the complete four-row publication and projection fell from 15.860
+to 14.210 µs. An independent layer 3 run measured 15.860 to 14.205 µs.
+The measured cell has 10,240 outputs, K320 and two Q8 activation terms.
+The wide launch owns ten wave64s and 20 KiB of LDS. Both kernels retain
+the per-output K32 fold order. Across four original role fixtures all
+28 row-capacity tests matched serial bytes, including dirty and empty
+replay. Unmeasured row capacities retained their existing schedules.
+[Projection event brackets, input roles and captured geometry](/tmp/qfn-mi50-hcup-wave64-bd/REPORT.md)
+
+Selecting ten experts from 512 grouped softmax probabilities took
+16.175 µs at four rows with the existing MI50 selector. Merging four
+register-sorted lists took 13.695 µs. Six rows measured 16.190 to
+13.693 µs. Each timing is the median of 32 paired windows. Every
+window replays 32 original-logit restores and 32 selections in one
+captured graph. A separate single-dispatch profile measured 15.04 and
+12.48 µs. Both launched 16 wavefronts at M4 with 34 VGPRs, 44 SGPRs
+and zero spills. The merge occupied four waves per row for selection,
+used 512 extra LDS bytes, and increased the profiled VALU instruction
+metric from 375.25 to 658.75 per wave. Parallel selection reduced elapsed
+time even with the extra instructions. Probability bytes, IDs, normalized
+weights and the optional route ledger agreed on the recorded inputs and
+on ties, nonfinite logits, zero live rows and repeated dirty replay.
+[Single-dispatch and batched event timings and ISA](/tmp/qfn-mi50-router-merge-counted-c5/score.json)
+[Profiled candidate dispatch](/tmp/qfn-mi50-router-merge-profile-c5/merge-probe/3cd9f562a1d1/7_results.json)
+
+With the G13 and G15 gate inputs already proven at graph preparation,
+their loop can call the two admitted readers directly. Relative to the
+batched IQ3_XXS checkpoint, six-row complete verifier time went from
+356.52 to 328.51 µs on G13 and 323.81 to 294.67 µs on G15.
+Four-row time improved by 1.44% and 1.74% respectively. Six-row gate
+time fell from 216.32 to about 184.3 µs on both. Register use fell from
+81 to 62 VGPRs and 104 to 98 SGPRs. LDS stayed at 320 bytes with zero
+private bytes. These are generated fixtures with their original native
+weight formats. The real TP4 code2048 prompt exercises different weights.
+[Direct-reader static, deferred, routing and event checks](/tmp/qfn-mi50-iq3-direct-c2/REPORT.md)
+
+### Checking local improvements against the complete verifier
+
+The code2048 depth-three campaign isolated the wider HC projection and the
+indexed reader changes before enabling the new selector. Three runs per
+mode reproduced the control's generated IDs. Each fixed-depth run verified
+344 rows across 86 rounds. Median decode changed from 112.437 to 112.370
+tok/s. Median prefill changed from 970.545 to 970.533 tok/s. The faster HC
+projection had little effect on this model-wide result. The deployed model's
+original routed operands do not exercise the G13/G15 indexed-reader improvement.
+[Matched Release runs and accepted work](/tmp/qfn-mi50-w-r3-verifier-cohort/twoleaves-code-comparison.json)
+
+The local five-node router and expert replay includes the new selector but
+excludes HC. Gate/up uses the original Q4_K layer-one weights and down uses
+Q5_1. All four arms used the same MI50, original routed width, shared width
+160, and serial byte check. Values are means of the two process medians in
+control, candidate, candidate, control order. Each process median covers
+12 native event windows of 32 operations.
+
+| Live rows | Routed width | Previous, µs | Candidate, µs |
+| ---: | ---: | ---: | ---: |
+| 4 | 128 | 113.69 | 114.72 |
+| 4 | 256 | 151.27 | 150.10 |
+| 6 | 128 | 139.23 | 138.44 |
+| 6 | 256 | 197.14 | 195.78 |
+
+The standalone selector improved by 2.48 µs at four rows. The complete
+local operation was 1.03 µs slower on the narrow shard and 1.17 µs faster
+on the wide shard. Their individual dispatch savings cannot be summed to
+predict the verifier round.
+[Original-shard inputs, matched timings and replay](/tmp/qfn-mi50-topk-real-shards-c5/comparison.json)
+
+The Release containing all three changes (`3c2861e7`) reproduced its
+predecessor's histories and verifier work in all 18 generations. Fixed
+depth 3 measured 137.38 tok/s on review512 and 111.88 on code2048,
+compared with 137.00 and 112.44 previously. The paired changes across
+all three modes were between −0.43% and +0.39% for decode and within
+0.19% for prefill. The integrated result supports the component gains
+and gives no evidence of improved end-to-end throughput on this model.
+Six targeted MI50 regressions passed on this Release. A 7900 XTX and
+an RTX 3090 each passed the replay for its selected schedule.
+[Full-model histories and throughput](/tmp/qfn-mi50-w-r3-verifier-cohort/fuller-comparison.json)
+[Native replay and Release identity](/tmp/qfn-mi50-fixed-bank-proof/canonical-verifier-merge/qualified.json)
+
+
+## Reproduction
+
+On a Release build with the focused native fixtures enabled, the following
+command runs the card-selection and indexed-reader regressions. Run the
+hardware-specific registrations on workers that own the corresponding cards.
+
+```bash
+ctest --test-dir "$build" -C Release --no-tests=error --output-on-failure \
+  -R '^V2_Integration_(CUDAVerifierDispatchTableNativeReplay|ROCmGroupedFFNNativeArchitecture_(gfx906|gfx1100)|GroupedM6(IndexedGateReuse|MixedReader)Replay_ROCm|GroupedM4WideDecoderTiles_ROCm)$'
+```
+
+To time the combined G13 gate and local FFN on one exposed MI50, run the
+compiled source fixture on the GPU's socket. Set `build` to the absolute
+Release build directory and `mpi_base` to an existing temporary directory.
+The fixture checks the native gate symbol and
+serial output bytes before emitting event durations. The experiment above
+used alternating control and candidate arms on one instrumented binary.
+
+```bash
+export LLAMINAR_MOE_ROUTER_ARITHMETIC=fp16
+export LLAMINAR_QFN_ROCM_GROUPED_FFN_FRONTIER=1
+export LLAMINAR_QFN_ROCM_GROUPED_FFN_DIRECT_BANK=1
+export LLAMINAR_QFN_ROCM_GROUPED_FFN_ALL_FORMATS=1
+export LLAMINAR_QFN_ROCM_GROUPED_FP16_ROUTER_FIXED_ROWS=1
+export LLAMINAR_QFN_ROCM_GROUPED_TOPK_REGISTERS=1
+export LLAMINAR_PERF_STATS_SUMMARY=1
+export LLAMINAR_PERF_STATS_FILTER=kernel.rocm_grouped_ffn_frontier_calls
+export LLAMINAR_TEST_GROUPED_M4_PROGRAM=all_formats
+export LLAMINAR_TEST_GROUPED_M4_REQUIRED_SYMBOL=groupedFFNFormatProgramGateILj15ELi12ELi0ELi1ELb1EE
+export LLAMINAR_TEST_GROUPED_M4_SYMBOL_PRESENT=1
+export LLAMINAR_TEST_GROUPED_M4_DEMAND=static
+"$build/llaminar_mpi_session" --session-base "$mpi_base" -- \
+  mpirun -np 1 --bind-to none "$build/tests/v2/v2_integration_moe_intermediate_ffn_finalization" \
+  --gtest_also_run_disabled_tests \
+  --gtest_filter='OriginalSources/GroupedM6Family.DISABLED_Events/G13_IQ3_XXS_DownQ5_1_SharedIQ2_S'
+```
+
+The local evidence root for native phase attribution is
+`/tmp/qfn-mi50-current-stage-pair`. It contains the read-only SQLite readers,
+per-device classified results, native queue bounds and timing receipts. The
+two original model trace roots retain the device mapping, loader, source,
+token and GPU retirement receipts. Re-run analysis on those receipts with:
+
+```bash
+P=/tmp/qfn-mi50-current-stage-pair
+D=/tmp/qfn-mi50-grouped-stack-final-r1
+M=/tmp/qfn-mi50-retained-real-tp4/r7-all-tp-live/full-model
+python3 "$P/phase-queues.py" review512 "$D/quartet-r1-fixed3-trace" \
+  "$M/trace-fork-fixed3-r1" "$P/review-complete-replay.json"
+```
+
+The three-change unprofiled reproduction uses the frozen source and archive
+members recorded beside the Release image. A fresh cohort name is required.
+
+```bash
+X=/tmp/qfn-mi50-phase-tuning-r2
+flock -x "$M/grouped-mtp-suite.lock" bash "$X/run-phases.sh" execute replay-01
+```
+
+The clean pre-reboot evidence is under `$X/quartet-r1-fixed3-{control,phase}`.
+The matching ordinary arm is `$X/quartet-r1-off`. The resumed dynamic
+comparison used `$X/boot3-r1-{off,dynamic-control,dynamic-phase}`.
+The independent fixed-depth pair used `$X/boot3-r1-fixed3-{control,phase}`.
+The six measured generations and five verifier-work counters matched their
+controls. The four new ROCProfiler runs can be reanalyzed with the same
+per-round denominator and fork inputs used in the table.
+
+```bash
+for arm in baseline treatment; do
+  for prompt in review512 code2048; do
+    fork="$M/trace-fork-fixed3-r1"
+    if [[ "$prompt" == code2048 ]]; then fork="$P/code-fork-r1"; fi
+    python3 "$P/phase-queues.py" "$prompt" "$X/phase-native-boot3-$arm-$prompt" \
+      "$fork" "$P/replay-$arm-$prompt.json"
+  done
+done
+```
+
+The repository analyzer reads the original ROCProfiler database, measured
+verification count and authenticated physical PCI admission from each window.
+It derives the final prefill and target graph boundaries directly from native
+dispatches. Supply the matching per-PCI ordered source inventory for the run.
+
+```bash
+F=/tmp/qfn-mi50-grouped-ffn-frontier/quartet
+layout=/tmp/qfn-mi50-ffn-other-sol62/per-pci-mapping.json
+analyze=tests/v2/performance/kernels/qwen4exp/ffn_arrivals.py
+python3 "$analyze" "$D/quartet-r1-fixed3-trace" "$layout"
+python3 "$analyze" "$F/native-k4-control-review512" "$layout"
+python3 "$analyze" "$F/native-k4-treatment-review512" "$layout"
+```
+
+The F160 component results, matched F256 measurements and harness commands
+are in `/tmp/qfn-mi50-f160-sol62/REPORT.md`. The complete balanced Release,
+source ownership contract and run commands are recorded in
+`/tmp/qfn-mi50-f160-frontier-balanced-sol62/DISPATCH.md`. Its
+`parity/combined-boot3-r1-panel-gate.json` ties both full-vocabulary panels
+to the same core, measured widths, original GGUF and PyTorch references.
+The prefill transport census and read-only trace queries are in
+`/tmp/qfn-mi50-code2048-comm-attribution/REPORT.md`.

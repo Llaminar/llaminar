@@ -102,6 +102,8 @@ namespace llaminar2
         int n_heads = 0;
         int n_kv_heads = 0;
         int head_dim = 0;
+        /** @brief Source RoPE width (`<arch>.rope.dimension_count`); 0 when undeclared. */
+        int rope_dimension_count = 0;
         int vocab_size = 0;
         int max_seq_len = 0;
 
@@ -126,6 +128,15 @@ namespace llaminar2
          */
         int mtp_layer_count = 0;
         /** @return Main decoder blocks under the architecture's explicit GGUF block-count contract. */
+        /**
+         * @brief Rotated width of a full-attention head, as RoPE stages execute it.
+         * @return The declared RoPE width when it is a proper prefix of the head,
+         *         otherwise the complete head width (full rotation).
+         */
+        [[nodiscard]] int effectiveRotaryDimension() const noexcept
+        {
+            return rope_dimension_count > 0 && rope_dimension_count < head_dim ? rope_dimension_count : head_dim;
+        }
         [[nodiscard]] int mainLayerCount() const;
         /** @return Main plus separately declared trailing predictor blocks, without double counting. */
         [[nodiscard]] int totalLayerCount() const;

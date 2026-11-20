@@ -8,10 +8,17 @@
 # MODE=full     (default) — minimal builder set: nvcc + CUDA runtime,
 #                            cuobjdump, cuBLAS/NCCL headers and shared libraries.
 # MODE=runtime             — shared libraries only. Slim runtime stage.
+# MODE=profilers           — only the CUDA-series-matched profiler set below,
+#                            for an image whose toolkit was installed by another
+#                            owner (for example a copied NGC /usr/local/cuda).
 # INSTALL_CUDA_PROFILERS=1 — additionally install the CUDA-series-matched
 #                            Nsight Compute, Nsight Systems, and CUPTI packages.
 #                            Development images enable this; release builders
 #                            remain deliberately lean.
+#
+# The NVIDIA repository is selected from the image's own Ubuntu release and
+# Debian architecture: amd64 uses x86_64 and arm64 uses sbsa (for example
+# GB10). Any other combination fails before apt is touched.
 #
 # The host driver is injected at container run time via
 # `--gpus=all` + nvidia-container-toolkit; we never install drivers inside
@@ -37,10 +44,8 @@ APT_OPTS=(
 # image has no kernels.  Apart from wasting a cold build, that makes the
 # collective library advertise a broader device set than the application.
 #
-# CMake's broad selectors intentionally remain broad: NCCL's upstream default
-# is the only equivalent representation for ``all``, ``all-major`` and
-# ``native``.  Concrete CUDA architectures may include a suffix such as 90a;
-# nvcc accepts that spelling in both compute and sm targets.
+# A packaged app uses concrete targets. Broad CMake aliases do not
+# correspond to one portable NCCL target list and therefore fail closed.
 configure_nccl_gencode() {
     local requested_architectures="${CUDAARCHS:-}"
     local architecture
@@ -48,20 +53,21 @@ configure_nccl_gencode() {
     local -a architectures=()
 
     case "${requested_architectures}" in
-        ""|all|all-major|native)
-            return 0
+        "") return 0 ;;
+        all|all-major|native)
+            echo "Choose concrete CUDAARCHS for the application and NCCL." >&2
+            return 1
             ;;
     esac
 
     IFS=';' read -r -a architectures <<< "${requested_architectures}"
     for architecture in "${architectures[@]}"; do
-        # CMake accepts 86-real/86-virtual spellings.  NCCL's Makefile needs
-        # the underlying compute capability because it constructs the exact
-        # SASS target itself.
-        architecture="${architecture%%-*}"
+        # Match the app's concrete SASS target. A virtual-only target
+        # is not a native NCCL target in the shipping image.
+        architecture="${architecture%-real}"
         if [[ ! "${architecture}" =~ ^[0-9]+[A-Za-z]?$ ]]; then
             echo "Unsupported CUDAARCHS entry '${architecture}' for NCCL. " \
-                 "Use concrete capabilities (for example 86 or 90a), or all/all-major/native." >&2
+                 "Use concrete capabilities (for example 86 or 90a)." >&2
             return 1
         fi
         gencodes+=("-gencode arch=compute_${architecture},code=sm_${architecture}")
@@ -76,13 +82,58 @@ configure_nccl_gencode() {
 }
 
 # --- Register NVIDIA apt repo --------------------------------------------
+## Print NVIDIA's repository path for one Ubuntu release and Debian architecture.
+# Arguments: Ubuntu VERSION_ID (22.04 or 24.04), dpkg architecture (amd64/arm64).
+cuda_repository_path() {
+    local ubuntu_release="$1"
+    local debian_architecture="$2"
+    local distribution
+    local repository_architecture
+    case "${ubuntu_release}" in
+        22.04|24.04) distribution="ubuntu${ubuntu_release/./}" ;;
+        *)
+            echo "Unsupported Ubuntu release '${ubuntu_release}' for the CUDA repository" >&2
+            return 1
+            ;;
+    esac
+    case "${debian_architecture}" in
+        amd64) repository_architecture="x86_64" ;;
+        arm64) repository_architecture="sbsa" ;;
+        *)
+            echo "Unsupported architecture '${debian_architecture}' for the CUDA repository" >&2
+            return 1
+            ;;
+    esac
+    printf '%s/%s\n' "${distribution}" "${repository_architecture}"
+}
+
+case "${MODE}" in
+    full|runtime|profilers) ;;
+    *)
+        echo "Unsupported MODE='${MODE}'; use full, runtime or profilers" >&2
+        exit 1
+        ;;
+esac
+
+# shellcheck disable=SC1091
+UBUNTU_RELEASE="$(. /etc/os-release && printf '%s' "${VERSION_ID}")"
+CUDA_REPOSITORY="$(cuda_repository_path "${UBUNTU_RELEASE}" "$(dpkg --print-architecture)")"
 curl -fsSL --retry 5 --retry-delay 5 -o /tmp/cuda-keyring.deb \
-    https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+    "https://developer.download.nvidia.com/compute/cuda/repos/${CUDA_REPOSITORY}/cuda-keyring_1.1-1_all.deb"
 dpkg -i /tmp/cuda-keyring.deb
 rm /tmp/cuda-keyring.deb
 apt-get "${APT_OPTS[@]}" update
 
-if [[ "${MODE}" == "full" ]]; then
+install_cuda_profilers() {
+    apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
+        cuda-cupti-13-0 \
+        cuda-nsight-compute-13-0 \
+        cuda-nsight-systems-13-0
+}
+
+if [[ "${MODE}" == "profilers" ]]; then
+    install_cuda_profilers
+elif [[ "${MODE}" == "full" ]]; then
     # Build-minimal CUDA: avoid cuda-toolkit-13-0, which also pulls Nsight,
     # OpenJDK, GTK, profilers, docs, and other tools not needed to compile
     # Llaminar. Native NCCL resource certification uses cuobjdump before the
@@ -92,20 +143,14 @@ if [[ "${MODE}" == "full" ]]; then
         cuda-nvcc-13-0 \
         cuda-cuobjdump-13-0 \
         cuda-cudart-dev-13-0 \
-        libcublas-dev-13-0 \
-        "libnccl2=*+cuda13.0" \
-        "libnccl-dev=*+cuda13.0"
+        libcublas-dev-13-0
 
-    # The package supplies tooling; production loads the separately named,
-    # pinned source build that supports repeated capture into a native parent.
+    # The patched source build supplies the only collective ABI and runtime.
     configure_nccl_gencode
     bash "$(dirname -- "${BASH_SOURCE[0]}")/install-nccl.sh"
 
     if [[ "${INSTALL_CUDA_PROFILERS}" == "1" ]]; then
-        apt-get "${APT_OPTS[@]}" install -y --no-install-recommends \
-            cuda-cupti-13-0 \
-            cuda-nsight-compute-13-0 \
-            cuda-nsight-systems-13-0
+        install_cuda_profilers
     fi
 else
     # Runtime libraries only. These are the minimum a dynamically-linked

@@ -16,6 +16,7 @@
 #include <array>
 #include <atomic>
 #include <condition_variable>
+#include "backends/PeerAccessCoverage.h"
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -28,6 +29,7 @@
 #include <semaphore>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 #include <pthread.h>
@@ -147,7 +149,8 @@ enum ncclResult_t { ncclSuccess, ncclInvalidArgument, ncclUnhandledCudaError };
 /** @brief Native abort collaborator observes actual helper/descendant masks without loading a runtime. */
 ncclResult_t ncclCommAbort(ncclComm_t comm) { ++comm->calls; observeControl(comm->schedule); return ncclSuccess; }
 bool isLoaded() { return true; }
-bool load() { fail("unexpected native loader call"); }
+/** @brief Both coordinators revalidate the canonical dependency on admission. */
+bool load() { return isLoaded(); }
 bool isCommFinalizeAvailable() { return true; }
 const char *getLastError() { return "device-free source replay"; }
 }
@@ -168,6 +171,25 @@ namespace llaminar2 {
 void initializeCUDAHardwareMetadata() {}
 const std::vector<int> &cudaHardwareMetadata() { static const std::vector<int> facts(16); return facts; }
 bool installNCCLGraphOrderingPolicy(std::string &) { return true; }
+
+/** @brief This fixture runs original readiness against a disabled peer transport. */
+enum class RankOrderedQuotePolicy { ExplicitOnly };
+enum class RankOrderedPeerPushRequest { Automatic, Disabled, Required };
+RankOrderedPeerPushRequest rankOrderedPeerPushRequest(RankOrderedQuotePolicy) {
+    return RankOrderedPeerPushRequest::Disabled;
+}
+
+/** @brief Peer transport is tested separately and must never query hardware here. */
+struct ROCmReplayHardware { std::string isa_target; int compute_units; };
+const std::vector<ROCmReplayHardware> &rocmHardwareMetadata() {
+    fail("RCCL readiness replay queried native peer hardware");
+}
+bool rankOrderedPeerPushQualifiedISA(std::string_view) {
+    fail("RCCL readiness replay evaluated peer hardware");
+}
+bool selectRankOrderedPeerPush(RankOrderedPeerPushRequest, std::optional<PeerAccessCoverage>, bool, bool) {
+    fail("RCCL readiness replay selected a peer transport");
+}
 
 /**
  * @brief Replay operands for the actual owner methods; no lifecycle algorithm is reproduced here.
@@ -194,9 +216,17 @@ void RCCLCoordinator::cleanupOnThread() { ++schedule.retires; }
 /** @brief Explicit fixture participant identity; no inventory or GPU count is queried. */
 struct DeviceId {
     int ordinal = 0;
+    static DeviceId rocm(int ordinal) { return {ordinal}; }
     int gpu_ordinal() const { return ordinal; }
     bool is_gpu() const { return true; }
     std::string toString() const { return "authored-participant:" + std::to_string(ordinal); }
+};
+/** @brief Native peer discovery is outside the device-free fixture. */
+struct DeviceManager {
+    static DeviceManager &instance() { fail("RCCL readiness replay contacted device manager"); }
+    std::optional<PeerAccessCoverage> peerAccessCoverage(const std::vector<DeviceId> &) {
+        fail("RCCL readiness replay queried directed peer coverage");
+    }
 };
 /** @brief Hardware allocation collaborators observe placement without allocating devices. */
 struct ControlResourceBackend {

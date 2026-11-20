@@ -15,6 +15,7 @@
  * @date February 2026
  */
 
+#include "collective/RankOrderedNativeResources.h"
 #include "TPAllreduceStage.h"
 #include "../../../collective/AllreducePrecisionPolicy.h"
 #include "../../../execution/local_execution/device/DeviceWorkspaceManager.h"
@@ -753,6 +754,13 @@ namespace llaminar2
         const size_t effective_count =
             params_.count > 0 ? params_.count : params_.tensor->numel();
         const size_t degree = static_cast<size_t>(params_.tp_ctx->degree());
+        return canonicalRankWorkspaceRequirements(effective_count,degree);
+    }
+
+    WorkspaceRequirements TPAllreduceStage::canonicalRankWorkspaceRequirements(
+        size_t effective_count,size_t degree)
+    {
+        WorkspaceRequirements requirements;
         if (effective_count == 0 || degree < 2 ||
             effective_count >
                 std::numeric_limits<size_t>::max() / degree / sizeof(float))
@@ -918,7 +926,18 @@ namespace llaminar2
 
         const std::string collective_name =
             params_.stage_name + "_canonical_rank_banks";
-        const bool gathered = params_.live_rows
+        const std::size_t columns = params_.live_rows ? params_.live_rows->elementsPerRow() : params_.tensor->cols();
+        if (!columns || effective_count % columns)
+            throw std::logic_error("Canonical TP reduction requires complete logical rows");
+        const std::size_t rows = effective_count / columns;
+        const bool native_push = params_.device_id.is_rocm() &&
+            useNativeRankOrderedPush(local_tp->hasRankOrderedPeerPush(), rows, columns);
+        const bool gathered = native_push
+            ? local_tp->rankOrderedFP32OnStream(tensor_data, rank_banks, tensor_data,
+                params_.live_rows ? *params_.live_rows :
+                    NativeCollectiveRows(DeviceRowRange::fullyActive(rows), columns),
+                params_.sideband_device_index, stage_stream, collective_name)
+            : params_.live_rows
             ? local_tp->nativeRowsOnStream(NativeRowCollective::AllGather, tensor_data,
                 rank_banks, *params_.live_rows, CollectiveDataType::FLOAT32,
                 CollectiveOp::ALLGATHER, params_.sideband_device_index, stage_stream, collective_name)
@@ -932,7 +951,7 @@ namespace llaminar2
                 collective_name);
         if (!gathered)
         {
-            LOG_ERROR("TPAllreduceStage: canonical rank-bank allgather failed"
+            LOG_ERROR("TPAllreduceStage: canonical rank-order transport failed, peer_push=" << native_push
                       << " stage_name=" << (params_.stage_name.empty() ? "(none)" : params_.stage_name));
             return false;
         }
@@ -952,8 +971,8 @@ namespace llaminar2
             }
         }
 
-        bool folded = false;
-        if (params_.device_id.is_cuda())
+        bool folded = native_push;
+        if (!native_push && params_.device_id.is_cuda())
         {
 #ifdef HAVE_CUDA
             folded = params_.live_rows
@@ -963,7 +982,7 @@ namespace llaminar2
                     degree, params_.device_id.toKernelDeviceIndex(), stage_stream);
 #endif
         }
-        else if (params_.device_id.is_rocm())
+        else if (!native_push && params_.device_id.is_rocm())
         {
 #ifdef HAVE_ROCM
             folded = params_.live_rows
@@ -990,7 +1009,7 @@ namespace llaminar2
             {{"stage", params_.stage_name.empty() ? "unnamed" : params_.stage_name},
              {"degree", std::to_string(degree)},
              {"elements", std::to_string(effective_count)},
-             {"transport", "native_allgather"},
+             {"transport", native_push ? "native_peer_push" : "native_allgather"},
              {"arithmetic", "device_rank_order"},
              {"capture_mode", isGraphCaptureActive() ? "graph_capture" : "direct"}});
         return true;

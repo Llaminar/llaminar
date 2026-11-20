@@ -4,14 +4,21 @@
 #include <cstdlib> // std::getenv for LLAMINAR_ISA_LEVEL
 #include <cstdio>
 #include <algorithm> // For std::min, std::max in AttentionCacheConfig
+#include <stdexcept>
+#include "CPUCacheObservation.h"
+#if defined(__aarch64__)
+#include "ARMCPUFeatures.h"
+#endif
 
 /**
  * @file CPUFeatures.h
  * @brief CPU SIMD feature detection for v2 architecture
  * @author David Sanftenberg
  *
- * Detects AVX512, AVX2, AVX, SSE4.1 at runtime via CPUID.
- * Used to select optimal SIMD decode paths for quantized tensors.
+ * Detects x86 SIMD through CPUID and AArch64 features through native OS
+ * observations. Shared typed dispatch exposes native NEON/DotProd without
+ * making an ARM translation unit name x86 implementations. Explicit
+ * incompatible overrides fail rather than silently selecting scalar code.
  */
 
 namespace llaminar2
@@ -31,6 +38,382 @@ namespace llaminar2
 #else
 #define LLAMINAR_COMPILED_WITH_AVX512 0
 #endif
+#endif
+
+
+#ifndef LLAMINAR_COMPILED_WITH_NEON
+#if defined(__aarch64__) && defined(__ARM_NEON)
+#define LLAMINAR_COMPILED_WITH_NEON 1
+#else
+#define LLAMINAR_COMPILED_WITH_NEON 0
+#endif
+#endif
+
+#ifndef LLAMINAR_COMPILED_WITH_NEON_DOTPROD
+#if defined(__aarch64__) && defined(__ARM_FEATURE_DOTPROD)
+#define LLAMINAR_COMPILED_WITH_NEON_DOTPROD 1
+#else
+#define LLAMINAR_COMPILED_WITH_NEON_DOTPROD 0
+#endif
+#endif
+
+#ifndef LLAMINAR_COMPILED_WITH_NEON_I8MM
+#if defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
+#define LLAMINAR_COMPILED_WITH_NEON_I8MM 1
+#else
+#define LLAMINAR_COMPILED_WITH_NEON_I8MM 0
+#endif
+#endif
+
+// The I8MM build envelope is DotProd plus the Int8 matrix-multiply extension.
+// A declared envelope that its compiler does not implement, or the reverse,
+// would make the startup admission below authenticate the wrong instructions.
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM && \
+    (!LLAMINAR_COMPILED_WITH_NEON_DOTPROD || !defined(__ARM_FEATURE_MATMUL_INT8))
+#error "LLAMINAR_COMPILED_WITH_NEON_I8MM requires a DotProd envelope compiled with __ARM_FEATURE_MATMUL_INT8"
+#endif
+#if !LLAMINAR_COMPILED_WITH_NEON_I8MM && defined(__aarch64__) && defined(__ARM_FEATURE_MATMUL_INT8)
+#error "The compiler enables I8MM outside the declared NEON_I8MM envelope"
+#endif
+
+    /** @return Whether native AArch64 ASIMD is available on the executing host. */
+    inline bool cpu_supports_neon()
+    {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        return cpu::ARMCPUCapabilities::native().supports(cpu::ARMCPUFeature::ASIMD);
+#else
+        return false;
+#endif
+    }
+
+    /** @return Whether the native OS advertises ARM signed dot-product instructions. */
+    inline bool cpu_supports_neon_dotprod()
+    {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        return cpu::ARMCPUCapabilities::native().supports(cpu::ARMCPUFeature::DotProd);
+#else
+        return false;
+#endif
+    }
+
+    /** @return Whether the native OS advertises ARM Int8 matrix-multiply (SMMLA) instructions. */
+    inline bool cpu_supports_neon_i8mm()
+    {
+#if defined(__aarch64__) && defined(__ARM_NEON)
+        return cpu::ARMCPUCapabilities::native().supports(cpu::ARMCPUFeature::IntegerMatMul);
+#else
+        return false;
+#endif
+    }
+
+    // =========================================================================
+    // ISA Level: shared runtime dispatch with architecture-specific native leaves
+    // =========================================================================
+
+    /**
+     * @brief ISA level for runtime SIMD dispatch
+     *
+     * Resolved once at startup from hardware detection, overridable via
+     * LLAMINAR_ISA_LEVEL=scalar|avx2|avx512|neon|neon-dotprod for diagnostics.
+     */
+    enum class ISALevel : uint8_t
+    {
+        Scalar = 0,
+        AVX2 = 1,
+        AVX512 = 2,
+        NEON = 3,
+        NEONDotProd = 4
+    };
+
+    /**
+     * @brief Return the stable display name for one runtime SIMD level.
+     *
+     * This helper deliberately accepts an explicit value rather than reading
+     * the process singleton.  Callers that report the active execution policy
+     * pass `activeISALevel()`, while device-free tests can prove every enum
+     * spelling without mutating the process environment or cached dispatch.
+     *
+     * @param level Runtime SIMD level selected by dispatch.
+     * @return Static human-readable name suitable for logs and diagnostics.
+     */
+    inline constexpr const char *isaLevelName(ISALevel level)
+    {
+        switch (level)
+        {
+        case ISALevel::Scalar:
+            return "Scalar";
+        case ISALevel::AVX2:
+            return "AVX2";
+        case ISALevel::AVX512:
+            return "AVX-512";
+        case ISALevel::NEON:
+            return "NEON";
+        case ISALevel::NEONDotProd:
+            return "NEON+DotProd";
+        }
+        return "Unknown";
+    }
+
+    /** @brief Return the actual instruction envelope compiled for this CPU target.
+     * @return Native architecture ISA; no architecture is inferred from enum ordering.
+     */
+    inline constexpr ISALevel compiledCPUISALevel() noexcept
+    {
+#if LLAMINAR_COMPILED_WITH_NEON_DOTPROD
+        return ISALevel::NEONDotProd;
+#elif LLAMINAR_COMPILED_WITH_NEON
+        return ISALevel::NEON;
+#elif LLAMINAR_COMPILED_WITH_AVX512
+        return ISALevel::AVX512;
+#elif LLAMINAR_COMPILED_WITH_AVX2
+        return ISALevel::AVX2;
+#else
+        return ISALevel::Scalar;
+#endif
+    }
+
+    /** @brief Authenticate one native CPU execution/compiler provenance pair.
+     * @param compiled Actual binary instruction envelope from its participant.
+     * @param active Actual selected native implementation from that participant.
+     * @return Whether the pair belongs to one architecture and a compiled route.
+     * @details Legacy x86 scalar diagnostics retain their explicit identity;
+     * native ARM production projections do not select a scalar implementation.
+     */
+    inline constexpr bool isNativeCPUExecutionISAPair(ISALevel compiled, ISALevel active) noexcept
+    {
+        switch (compiled)
+        {
+        case ISALevel::AVX2: return active == ISALevel::Scalar || active == ISALevel::AVX2;
+        case ISALevel::AVX512: return active == ISALevel::Scalar || active == ISALevel::AVX2 || active == ISALevel::AVX512;
+        case ISALevel::NEON: return active == ISALevel::NEON;
+        case ISALevel::NEONDotProd: return active == ISALevel::NEON || active == ISALevel::NEONDotProd;
+        case ISALevel::Scalar: return false;
+        }
+        return false;
+    }
+
+    // Forward declarations for activeISALevel()
+    inline bool cpu_supports_avx2();
+    inline bool cpu_supports_avx512();
+
+    /**
+     * @brief Resolve a requested CPU ISA against the real compiled/native capabilities.
+     * @param env Null/empty for automatic native selection, otherwise an explicit ISA name.
+     * @return Admitted native ISA, or explicitly selected scalar diagnostics.
+     * @throws std::invalid_argument For unknown or unavailable explicit ISA names.
+     * @throws std::runtime_error For an incompatible compiled instruction envelope.
+     * @details This read-only resolver is independently testable without changing
+     * process environment or spoofing CPU capabilities. No runtime state is cached here.
+     */
+    inline ISALevel resolveCPUISALevel(const char *env = nullptr)
+    {
+        const auto eq = [](const char *left, const char *right)
+        {
+            for (; *left && *right; ++left, ++right)
+                if ((*left | 0x20) != (*right | 0x20))
+                    return false;
+            return *left == *right;
+        };
+#if LLAMINAR_COMPILED_WITH_NEON_DOTPROD
+        // A DotProd compiler envelope may emit SDOT outside an explicit
+        // leaf too. Validate the machine before accepting any override.
+        if (!cpu_supports_neon_dotprod())
+            throw std::runtime_error("The NEON_DOTPROD binary requires native ARM DotProd support");
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON_I8MM
+        // I8MM changes only the projection leaf instructions, never the
+        // arithmetic level: SMMLA and SDOT publish identical exact INT32 sums.
+        // The machine must still execute every instruction in the envelope.
+        if (!cpu_supports_neon_i8mm())
+            throw std::runtime_error("The NEON_I8MM binary requires native ARM I8MM support");
+#endif
+        if (env && *env)
+        {
+            if (eq(env, "scalar"))
+                return ISALevel::Scalar;
+            if (eq(env, "avx2") && cpu_supports_avx2())
+                return ISALevel::AVX2;
+            if (eq(env, "avx512") && cpu_supports_avx512())
+                return ISALevel::AVX512;
+            if (eq(env, "neon") && cpu_supports_neon())
+                return ISALevel::NEON;
+#if LLAMINAR_COMPILED_WITH_NEON_DOTPROD
+            if (eq(env, "neon-dotprod") && cpu_supports_neon_dotprod())
+                return ISALevel::NEONDotProd;
+#endif
+            throw std::invalid_argument("LLAMINAR_ISA_LEVEL names an unknown or unavailable native ISA");
+        }
+#if LLAMINAR_COMPILED_WITH_NEON_DOTPROD
+        return ISALevel::NEONDotProd;
+#elif LLAMINAR_COMPILED_WITH_NEON
+        if (!cpu_supports_neon())
+            throw std::runtime_error("The NEON binary requires native AArch64 ASIMD support");
+        return ISALevel::NEON;
+#else
+        if (cpu_supports_avx512())
+            return ISALevel::AVX512;
+        if (cpu_supports_avx2())
+            return ISALevel::AVX2;
+#if LLAMINAR_COMPILED_WITH_AVX2 || LLAMINAR_COMPILED_WITH_AVX512
+        throw std::runtime_error("The compiled x86 CPU ISA is unavailable on this machine");
+#else
+        return ISALevel::Scalar;
+#endif
+#endif
+    }
+
+    /**
+     * @brief Return the process's admitted CPU ISA, resolving the diagnostic override once.
+     * @return Immutable runtime ISA selected from native features and explicit intent.
+     * @throws std::invalid_argument For an invalid explicit override.
+     * @throws std::runtime_error For an incompatible compiled instruction envelope.
+     * @details This one getenv boundary avoids the DebugEnv/CPUFeatures circular include.
+     */
+    inline ISALevel activeISALevel()
+    {
+        // The admission is bound INSIDE the cached initializer: one complete
+        // declared-envelope check per process, never per hot dispatch.
+        static const ISALevel level = []()
+        {
+            const ISALevel resolved = resolveCPUISALevel(std::getenv("LLAMINAR_ISA_LEVEL"));
+#if defined(__aarch64__)
+            // Ordinary process admission binds the COMPLETE declared compiler
+            // envelope (including FP16FML on the I8MM envelope) against the
+            // observed machine once, at ISA resolution — explicit Scalar
+            // selection included, since the binary still carries envelope code
+            // that native routes may reach.
+            ::llaminar2::cpu::ARMCPUCapabilities::native().requireCompiledEnvelope();
+#endif
+            return resolved;
+        }();
+        return level;
+    }
+
+// ---------------------------------------------------------------------------
+// ISA_DISPATCH macros — runtime dispatch to _scalar / _avx2 / _avx512 variants
+//
+// Usage:
+//   ISA_DISPATCH_VOID(fused_fp32_residual_add, out, a, b, n);
+//   float result; ISA_DISPATCH_RET(result, activation_row_max_abs, row, len);
+//   double val = ISA_DISPATCH_RETVAL(compute_sumsq, data, count);
+//
+// The compiled binary controls the maximum ISA that may be referenced. AVX2
+// builds intentionally avoid naming _avx512 variants so those translation units
+// can omit AVX512 stubs entirely.
+// ---------------------------------------------------------------------------
+
+#if LLAMINAR_COMPILED_WITH_NEON
+/// Native ARM dispatch never mentions an x86 leaf or invents an absent NEON implementation.
+#define ISA_DISPATCH_RETVAL(name, ...) \
+    [&]() -> decltype(name##_scalar(__VA_ARGS__)) { \
+        switch (::llaminar2::activeISALevel()) { \
+        case ::llaminar2::ISALevel::NEON: \
+        case ::llaminar2::ISALevel::NEONDotProd: \
+            return name##_neon(__VA_ARGS__); \
+        case ::llaminar2::ISALevel::Scalar: \
+            return name##_scalar(__VA_ARGS__); \
+        default: \
+            throw std::logic_error("Native ARM primitive received an incompatible ISA"); \
+        } }()
+#define ISA_DISPATCH_VOID(name, ...) \
+    do { ISA_DISPATCH_RETVAL(name, __VA_ARGS__); } while (0)
+#define ISA_DISPATCH_RET(lhs, name, ...) \
+    do { lhs = ISA_DISPATCH_RETVAL(name, __VA_ARGS__); } while (0)
+
+#elif LLAMINAR_COMPILED_WITH_AVX512
+/// Dispatch a void-returning function: name##_scalar / _avx2 / _avx512
+#define ISA_DISPATCH_VOID(name, ...)           \
+    do                                         \
+    {                                          \
+        switch (::llaminar2::activeISALevel()) \
+        {                                      \
+        case ::llaminar2::ISALevel::AVX512:    \
+            name##_avx512(__VA_ARGS__);        \
+            break;                             \
+        case ::llaminar2::ISALevel::AVX2:      \
+            name##_avx2(__VA_ARGS__);          \
+            break;                             \
+        default:                               \
+            name##_scalar(__VA_ARGS__);        \
+            break;                             \
+        }                                      \
+    } while (0)
+
+/// Dispatch and assign: lhs = name##_{scalar|avx2|avx512}(...)
+#define ISA_DISPATCH_RET(lhs, name, ...)       \
+    do                                         \
+    {                                          \
+        switch (::llaminar2::activeISALevel()) \
+        {                                      \
+        case ::llaminar2::ISALevel::AVX512:    \
+            lhs = name##_avx512(__VA_ARGS__);  \
+            break;                             \
+        case ::llaminar2::ISALevel::AVX2:      \
+            lhs = name##_avx2(__VA_ARGS__);    \
+            break;                             \
+        default:                               \
+            lhs = name##_scalar(__VA_ARGS__);  \
+            break;                             \
+        }                                      \
+    } while (0)
+
+/// Dispatch and return the value directly (for use inside a return statement
+/// context or initializer).  Expands to an immediately-invoked lambda.
+#define ISA_DISPATCH_RETVAL(name, ...) \
+    [&]() -> decltype(name##_scalar(__VA_ARGS__)) {              \
+        switch (::llaminar2::activeISALevel())                   \
+        {                                                        \
+        case ::llaminar2::ISALevel::AVX512:                      \
+            return name##_avx512(__VA_ARGS__);                   \
+        case ::llaminar2::ISALevel::AVX2:                        \
+            return name##_avx2(__VA_ARGS__);                     \
+        default:                                                 \
+            return name##_scalar(__VA_ARGS__);                   \
+        } }()
+
+#else
+
+/// Dispatch a void-returning function: name##_scalar / _avx2
+#define ISA_DISPATCH_VOID(name, ...)           \
+    do                                         \
+    {                                          \
+        switch (::llaminar2::activeISALevel()) \
+        {                                      \
+        case ::llaminar2::ISALevel::AVX2:      \
+            name##_avx2(__VA_ARGS__);          \
+            break;                             \
+        default:                               \
+            name##_scalar(__VA_ARGS__);        \
+            break;                             \
+        }                                      \
+    } while (0)
+
+/// Dispatch and assign: lhs = name##_{scalar|avx2}(...)
+#define ISA_DISPATCH_RET(lhs, name, ...)       \
+    do                                         \
+    {                                          \
+        switch (::llaminar2::activeISALevel()) \
+        {                                      \
+        case ::llaminar2::ISALevel::AVX2:      \
+            lhs = name##_avx2(__VA_ARGS__);    \
+            break;                             \
+        default:                               \
+            lhs = name##_scalar(__VA_ARGS__);  \
+            break;                             \
+        }                                      \
+    } while (0)
+
+/// Dispatch and return the value directly for AVX2-only builds.
+#define ISA_DISPATCH_RETVAL(name, ...) \
+    [&]() -> decltype(name##_scalar(__VA_ARGS__)) {              \
+        switch (::llaminar2::activeISALevel())                   \
+        {                                                        \
+        case ::llaminar2::ISALevel::AVX2:                        \
+            return name##_avx2(__VA_ARGS__);                     \
+        default:                                                 \
+            return name##_scalar(__VA_ARGS__);                   \
+        } }()
+
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -311,207 +694,6 @@ namespace llaminar2
         return false;
 #endif
     }
-
-    // =========================================================================
-    // ISA Level: runtime dispatch for refactored _scalar/_avx2/_avx512 variants
-    // =========================================================================
-
-    /**
-     * @brief ISA level for runtime SIMD dispatch
-     *
-     * Resolved once at startup from hardware detection, overridable via
-     * LLAMINAR_ISA_LEVEL=scalar|avx2|avx512 for testing.
-     */
-    enum class ISALevel : uint8_t
-    {
-        Scalar = 0,
-        AVX2 = 1,
-        AVX512 = 2
-    };
-
-    /**
-     * @brief Return the stable display name for one runtime SIMD level.
-     *
-     * This helper deliberately accepts an explicit value rather than reading
-     * the process singleton.  Callers that report the active execution policy
-     * pass `activeISALevel()`, while device-free tests can prove every enum
-     * spelling without mutating the process environment or cached dispatch.
-     *
-     * @param level Runtime SIMD level selected by dispatch.
-     * @return Static human-readable name suitable for logs and diagnostics.
-     */
-    inline constexpr const char *isaLevelName(ISALevel level)
-    {
-        switch (level)
-        {
-        case ISALevel::Scalar:
-            return "Scalar";
-        case ISALevel::AVX2:
-            return "AVX2";
-        case ISALevel::AVX512:
-            return "AVX-512";
-        }
-        return "Unknown";
-    }
-
-    // Forward declarations for activeISALevel()
-    inline bool cpu_supports_avx2();
-    inline bool cpu_supports_avx512();
-
-    /**
-     * @brief Get the active ISA level (cached singleton)
-     *
-     * Resolution order:
-     *   1. LLAMINAR_ISA_LEVEL env var (scalar / avx2 / avx512)
-     *   2. Hardware detection via CPUID
-     *
-     * @note Result is cached on first call — zero overhead on subsequent calls.
-     *       The env var is read with std::getenv to avoid a circular dependency
-     *       on DebugEnv.h (which includes CPUFeatures.h).
-     */
-    inline ISALevel activeISALevel()
-    {
-        static const ISALevel level = []
-        {
-            const char *env = std::getenv("LLAMINAR_ISA_LEVEL");
-            if (env)
-            {
-                // Case-insensitive compare without <strings.h>
-                auto eq = [](const char *a, const char *b) -> bool
-                {
-                    for (; *a && *b; ++a, ++b)
-                        if ((*a | 0x20) != (*b | 0x20))
-                            return false;
-                    return *a == *b;
-                };
-                if (eq(env, "scalar"))
-                    return ISALevel::Scalar;
-                if (eq(env, "avx2"))
-                    return cpu_supports_avx2() ? ISALevel::AVX2 : ISALevel::Scalar;
-                if (eq(env, "avx512"))
-                {
-                    if (cpu_supports_avx512())
-                        return ISALevel::AVX512;
-                    return cpu_supports_avx2() ? ISALevel::AVX2 : ISALevel::Scalar;
-                }
-            }
-            if (cpu_supports_avx512())
-                return ISALevel::AVX512;
-            if (cpu_supports_avx2())
-                return ISALevel::AVX2;
-            return ISALevel::Scalar;
-        }();
-        return level;
-    }
-
-// ---------------------------------------------------------------------------
-// ISA_DISPATCH macros — runtime dispatch to _scalar / _avx2 / _avx512 variants
-//
-// Usage:
-//   ISA_DISPATCH_VOID(fused_fp32_residual_add, out, a, b, n);
-//   float result; ISA_DISPATCH_RET(result, activation_row_max_abs, row, len);
-//   double val = ISA_DISPATCH_RETVAL(compute_sumsq, data, count);
-//
-// The compiled binary controls the maximum ISA that may be referenced. AVX2
-// builds intentionally avoid naming _avx512 variants so those translation units
-// can omit AVX512 stubs entirely.
-// ---------------------------------------------------------------------------
-
-#if LLAMINAR_COMPILED_WITH_AVX512
-/// Dispatch a void-returning function: name##_scalar / _avx2 / _avx512
-#define ISA_DISPATCH_VOID(name, ...)           \
-    do                                         \
-    {                                          \
-        switch (::llaminar2::activeISALevel()) \
-        {                                      \
-        case ::llaminar2::ISALevel::AVX512:    \
-            name##_avx512(__VA_ARGS__);        \
-            break;                             \
-        case ::llaminar2::ISALevel::AVX2:      \
-            name##_avx2(__VA_ARGS__);          \
-            break;                             \
-        default:                               \
-            name##_scalar(__VA_ARGS__);        \
-            break;                             \
-        }                                      \
-    } while (0)
-
-/// Dispatch and assign: lhs = name##_{scalar|avx2|avx512}(...)
-#define ISA_DISPATCH_RET(lhs, name, ...)       \
-    do                                         \
-    {                                          \
-        switch (::llaminar2::activeISALevel()) \
-        {                                      \
-        case ::llaminar2::ISALevel::AVX512:    \
-            lhs = name##_avx512(__VA_ARGS__);  \
-            break;                             \
-        case ::llaminar2::ISALevel::AVX2:      \
-            lhs = name##_avx2(__VA_ARGS__);    \
-            break;                             \
-        default:                               \
-            lhs = name##_scalar(__VA_ARGS__);  \
-            break;                             \
-        }                                      \
-    } while (0)
-
-/// Dispatch and return the value directly (for use inside a return statement
-/// context or initializer).  Expands to an immediately-invoked lambda.
-#define ISA_DISPATCH_RETVAL(name, ...) \
-    [&]() -> decltype(name##_scalar(__VA_ARGS__)) {              \
-        switch (::llaminar2::activeISALevel())                   \
-        {                                                        \
-        case ::llaminar2::ISALevel::AVX512:                      \
-            return name##_avx512(__VA_ARGS__);                   \
-        case ::llaminar2::ISALevel::AVX2:                        \
-            return name##_avx2(__VA_ARGS__);                     \
-        default:                                                 \
-            return name##_scalar(__VA_ARGS__);                   \
-        } }()
-
-#else
-
-/// Dispatch a void-returning function: name##_scalar / _avx2
-#define ISA_DISPATCH_VOID(name, ...)           \
-    do                                         \
-    {                                          \
-        switch (::llaminar2::activeISALevel()) \
-        {                                      \
-        case ::llaminar2::ISALevel::AVX2:      \
-            name##_avx2(__VA_ARGS__);          \
-            break;                             \
-        default:                               \
-            name##_scalar(__VA_ARGS__);        \
-            break;                             \
-        }                                      \
-    } while (0)
-
-/// Dispatch and assign: lhs = name##_{scalar|avx2}(...)
-#define ISA_DISPATCH_RET(lhs, name, ...)       \
-    do                                         \
-    {                                          \
-        switch (::llaminar2::activeISALevel()) \
-        {                                      \
-        case ::llaminar2::ISALevel::AVX2:      \
-            lhs = name##_avx2(__VA_ARGS__);    \
-            break;                             \
-        default:                               \
-            lhs = name##_scalar(__VA_ARGS__);  \
-            break;                             \
-        }                                      \
-    } while (0)
-
-/// Dispatch and return the value directly for AVX2-only builds.
-#define ISA_DISPATCH_RETVAL(name, ...) \
-    [&]() -> decltype(name##_scalar(__VA_ARGS__)) {              \
-        switch (::llaminar2::activeISALevel())                   \
-        {                                                        \
-        case ::llaminar2::ISALevel::AVX2:                        \
-            return name##_avx2(__VA_ARGS__);                     \
-        default:                                                 \
-            return name##_scalar(__VA_ARGS__);                   \
-        } }()
-
-#endif
 
     /**
      * @brief Check if CPU supports AVX2
@@ -858,7 +1040,8 @@ namespace llaminar2
     }
 
 #else
-    // Non-x86 platforms: no SIMD support, no vendor detection
+    // Non-x86 targets expose no x86 features. Native ARM ISA queries above
+    // remain independent; cache/topology observation is a separate contract.
     inline bool cpu_supports_avx512() { return false; }
     inline bool cpu_supports_avx2() { return false; }
     inline bool cpu_supports_avx() { return false; }
@@ -880,7 +1063,33 @@ namespace llaminar2
 #endif
 
     /**
-     * @brief Cache hierarchy information for tiling/batching decisions
+     * @brief Return the process's immutable genuine x86 cache observation.
+     * @return Checked CPUID/topology fields, or unknown zeros on other targets.
+     * @details Admission and measured cache-derived policies use this record,
+     * not the legacy convenience capacities exposed by CacheInfo.
+     */
+    inline const cpu::CPUCacheObservation &cpu_cache_observation()
+    {
+        static const cpu::CPUCacheObservation observation = [] {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+            return cpu::observeX86CacheGeometry([](std::uint32_t leaf, std::uint32_t sub) {
+                std::array<std::uint32_t, 4> registers{};
+                cpuid(leaf, sub, registers.data());
+                return registers;
+            });
+#else
+            return cpu::CPUCacheObservation{};
+#endif
+        }();
+        return observation;
+    }
+
+    /**
+     * @brief Legacy cache convenience values for existing non-admission tiling callers.
+     * @warning Missing observations can produce historical convenience defaults.
+     * Use cpu_cache_observation() for admission or measured-policy evidence.
+     *
+     * Cache hierarchy information for tiling/batching decisions
      *
      * Provides detected cache sizes and computes optimal batch sizes
      * for operations like Wo projection that benefit from batching

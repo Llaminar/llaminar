@@ -5,6 +5,8 @@
  * LOCAL TP = multiple devices within a single MPI rank, decoupled from MPI world_size.
  * This enables tensor parallelism across GPUs owned by one rank, using high-bandwidth
  * backends like NCCL, RCCL, or HOST instead of cross-node MPI.
+ * Shared ITPContext operations are explicit overrides: local-only geometry must
+ * not accidentally create a second virtual dispatch contract during native builds.
  *
  * Key concepts:
  * - LOCAL TP degree can be different from MPI world_size
@@ -16,6 +18,8 @@
  */
 
 #pragma once
+
+#include "collective/RankOrderedNativeResources.h"
 
 #include "LocalTPCaptureSourceDefinition.h"
 #include "NativeLocalTPContextBorrow.h"
@@ -163,7 +167,7 @@ namespace llaminar2
          *
          * @return CollectiveBackendType
          */
-        virtual CollectiveBackendType backend() const = 0;
+        virtual CollectiveBackendType backend() const override = 0;
 
         /**
          * @brief Get total TP degree (number of devices)
@@ -211,7 +215,7 @@ namespace llaminar2
          *              set to actual_seq_len * hidden_dim, not the full buffer size.
          * @return true on success, false on error
          */
-        virtual bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) = 0;
+        virtual bool allreduce(TensorBase *tensor, const std::string &stage_name, size_t count = 0) override = 0;
 
         /**
          * @brief All-reduce across LOCAL devices (out-of-place)
@@ -352,6 +356,25 @@ namespace llaminar2
             (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream; (void)stage_name;
             return false;
         }
+
+        /** @return Cold original-communicator resource quotes; empty for unselected policy. */
+        virtual std::vector<RankOrderedNativeResources> rankOrderedResources() const { return {}; }
+        /** @return Whether the bound communicator owns a native direct-push quote, without copying its BOM. */
+        virtual bool hasRankOrderedPeerPush() const noexcept { return false; }
+
+        /** @brief Publish the canonical ascending-rank FP32 sum in one native operation.
+         * @param send Original local contribution, possibly identical to output.
+         * @param banks Persistent arena bank per original rank.
+         * @param output Participant-local FP32 result bank.
+         * @param rows Original device live prefix or fixed complete rows.
+         * @param participant Original communicator coordinate.
+         * @param stream Exact producer/consumer stream; never a default stream.
+         * @param stage_name Original graph stage identity for attribution.
+         * @return Enqueue success; missing preparation or unsupported transport fails.
+         */
+        virtual bool rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+            const NativeCollectiveRows &rows, int participant, void *stream, const std::string &stage_name)
+        { (void)send; (void)banks; (void)output; (void)rows; (void)participant; (void)stream; (void)stage_name; return false; }
 
         /**
          * @brief Record a native equal-prefix collective on its producer stream.
@@ -811,12 +834,12 @@ namespace llaminar2
          * collectives. The request is idempotent and may be published by any
          * participant that observes the fatal failure first.
          */
-        virtual void requestAbort() = 0;
+        virtual void requestAbort() override = 0;
 
         /**
          * @brief Check if abort has been requested by any device thread.
          */
-        virtual bool isAbortRequested() const = 0;
+        virtual bool isAbortRequested() const override = 0;
 
         // =====================================================================
         // Device Management
@@ -974,7 +997,10 @@ namespace llaminar2
          * @throws std::logic_error If this implementation cannot own the typed exchange.
          */
         virtual bool graphCaptureBoundaryRendezvous(const std::string& name,int participant,int timeout_ms,LocalTPCaptureSourceDefinition& definition)
-        {throw std::logic_error("LocalTP has no typed source-definition rendezvous");}
+        {
+            (void)name;(void)participant;(void)timeout_ms;(void)definition;
+            throw std::logic_error("LocalTP has no typed source-definition rendezvous");
+        }
         /**
          * @brief Carry the definition through the original existing stream fence/rendezvous.
          * @param name Original matched capture-end phase.
@@ -986,7 +1012,10 @@ namespace llaminar2
          * @throws std::logic_error If this implementation cannot own the typed exchange.
          */
         virtual bool graphCaptureBoundaryOnStream(const std::string& name,int participant,void* stream,int timeout_ms,LocalTPCaptureSourceDefinition& definition)
-        {throw std::logic_error("LocalTP has no typed source-definition stream boundary");}
+        {
+            (void)name;(void)participant;(void)stream;(void)timeout_ms;(void)definition;
+            throw std::logic_error("LocalTP has no typed source-definition stream boundary");
+        }
 
         /** @brief Record only the named original producer/consumer byte edge.
          * @param payload Original local endpoint bank. @param bytes Borrowed count/slice authority.
@@ -1011,11 +1040,12 @@ namespace llaminar2
      * @param devices Devices participating in LOCAL TP
      * @param weights Work distribution weights (empty for equal distribution)
      * @param backend Backend type (AUTO to select based on device types)
+     * @param peer_quote Cold native transport ownership admitted by the calling planner.
      * @return Unique pointer to ILocalTPContext implementation
      */
     std::unique_ptr<ILocalTPContext> createLocalTPContext(
         std::vector<GlobalDeviceAddress> devices,
         std::vector<float> weights,
-        CollectiveBackendType backend);
+        CollectiveBackendType backend, RankOrderedQuotePolicy peer_quote = RankOrderedQuotePolicy::ExplicitOnly);
 
 } // namespace llaminar2

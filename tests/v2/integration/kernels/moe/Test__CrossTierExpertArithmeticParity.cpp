@@ -286,19 +286,39 @@ TEST(Test__CrossTierExpertArithmeticParity, CPUAndROCmFloatingExpertDecodeIsByte
     runFloatingCrossTierDecodeParity(device, stream.get());
 }
 
-/** @test Prove all quantized GPU-aligned experts are CPU/ROCm byte-identical. */
-TEST(
-    Test__CrossTierExpertArithmeticParity,
-    CPUAndROCmAllQuantizedExpertFormatsAreByteExactAcrossM)
+namespace
+{
+    constexpr std::size_t kROCmArithmeticFormatGroups = 3;
+
+    /** @brief Run a bounded slice of the complete CPU/ROCm arithmetic matrix. */
+    class ROCmCrossTierExpertArithmeticParity : public ::testing::TestWithParam<std::size_t>
+    {
+    };
+}
+
+/** @test Preserve original format operands and prove CPU/ROCm byte equality for every M in this slice. */
+TEST_P(ROCmCrossTierExpertArithmeticParity, QuantizedExpertFormatsAreByteExactAcrossM)
 {
     const auto device = llaminar2::DeviceId::rocm(0);
     auto *backend = llaminar2::getBackendFor(device);
     if (!backend || backend->deviceCount() <= 0)
         GTEST_SKIP() << "No ROCm device available";
     ScopedBackendStream stream(device);
+    const auto formats = llaminar2::test::native_quantised_transfer_parity_detail::crossTierArithmeticFormats();
+    const auto group = GetParam();
+    const llaminar2::test::CrossTierArithmeticFormatRange range{
+        .begin = formats.size() * group / kROCmArithmeticFormatGroups,
+        .end = formats.size() * (group + 1) / kROCmArithmeticFormatGroups,
+    };
     llaminar2::test::runCPUToGPUAllFormatExpertArithmeticParity(
         "ROCm",
         device,
-        stream.get());
+        stream.get(),
+        formats,
+        1.0f,
+        range);
 }
+
+INSTANTIATE_TEST_SUITE_P(FormatGroups, ROCmCrossTierExpertArithmeticParity,
+    ::testing::Range(std::size_t{0}, kROCmArithmeticFormatGroups));
 #endif

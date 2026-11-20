@@ -108,7 +108,7 @@ namespace llaminar2
         bool ncclGetUniqueIdWrapper(void *id_out)
         {
             // Ensure NCCL is loaded
-            if (!nccl::isLoaded() && !nccl::load())
+            if (!nccl::load())
             {
                 return false;
             }
@@ -143,7 +143,7 @@ namespace llaminar2
             NCCLCommunicatorPolicy policy,
             std::string &error_out)
         {
-            if (!nccl::isLoaded() && !nccl::load())
+            if (!nccl::load())
             {
                 error_out = nccl::getLastError();
                 *comm_out = nullptr;

@@ -322,8 +322,10 @@ def collect(state: Path) -> bool:
                 journal_line(stream, {'kind': 'end', 'window_id': saved['window_id'],
                     'complete': complete, 'new_record_count': count,
                     'snapshot_count': snapshots, 'cursor': cursor})
+                # The same-boot finisher validates the flushed journal after
+                # native process exit. Physical writeback is outside this
+                # visibility handshake and can wait on unrelated filesystem I/O.
                 stream.flush()
-                os.fsync(stream.fileno())
             except (OSError, ValueError) as failure:
                 complete = False
                 error = str(failure)

@@ -6,6 +6,7 @@
  * This model-free component replay does not admit a serving topology or claim
  * NUMA placement/throughput; original rank/socket integration remains separate.
  */
+#include "utils/HostPageSize.h"
 #include "kernels/cpu/moe/CPUCanonicalRouteReducer.h"
 #include "execution/moe/MoEExpertShardCohort.h"
 #include "execution/moe/MoEOverlayPreparedWeightSource.h"
@@ -254,8 +255,12 @@ void preparedNativeMatrix(const std::array<QuantizedVerifierWeightCreator,3>& cr
             if(physical.cpu_packed) {
                 const auto& packed=*physical.cpu_packed;
                 const auto actual=packed.native_interleaved.allocationBytes()+packed.payload.allocationBytes()+packed.int8_flat.allocationBytes();
+                // The geometry is the page-aligned slot bound. Heap-packed
+                // fragments below one host page round to cache lines, so the
+                // bound exceeds them by less than one page (4-64 KiB hosts).
                 const auto expected=resolveExpertPreparedProjectionMemoryGeometry(rectangle.rows,rectangle.columns,format[projection]).cpu_bytes;
-                EXPECT_EQ(actual,expected);
+                EXPECT_LE(actual,expected);
+                EXPECT_LT(expected-actual,hostPageBytes());
                 observedBytes[participant][expert]+=actual;
             }
             EXPECT_EQ(std::memcmp(source->raw_data(),original.data(),original.size()),0);

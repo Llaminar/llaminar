@@ -656,6 +656,62 @@ class PublishedImageSuiteTests(unittest.TestCase):
             self.assertFalse(receipt["complete"])
             self.assertEqual(receipt["reports"], {})
 
+    def test_published_accuracy_collects_both_isas_before_reporting_red_panel(self):
+        """A red AVX512 numerical panel still runs AVX2 and seals both retirements.
+
+        This exercises the real run_accuracy collector, not admission: the first
+        ISA's panel fails, yet the second ISA is still attempted, its evidence is
+        collected, both outer-driver retirements are validated and sealed into
+        the receipt, and the phase failure is raised only after both ISAs ran.
+        """
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            pair = image_pair()
+            write_preflight_bundle(root, pair)
+            prior = json.loads((root / "preflight-receipt.json").read_text())
+            companions = {isa: prior["prerequisites"][isa]["test_runner_image"] for isa in suite.ISAS}
+            accuracy = root / "accuracy"
+            accuracy.mkdir()
+
+            def companion(build_args, source, work):
+                return {"test-runner": companions[work.name.upper()]}
+
+            def panels(_args, _driver, _command, lane, _log):
+                isa = lane.name.upper()
+                # The outer driver always retires before a panel failure surfaces.
+                write_json(lane / "outer-cleanup.json", {
+                    "complete": True, "passed": True, "errors": [], "unexpected_live": [],
+                    "owner": "llaminar-suite-driver-" + "0" * 32,
+                    "driver_retirement": {"Running": False, "Pid": 0, "Status": "absent"},
+                    "retired": {"f" * 64: {"Running": False, "Pid": 0, "Status": "exited"}}})
+                if isa == suite.ISAS[0]:
+                    raise subprocess.CalledProcessError(1, "numerical panel")
+                write_json(lane / "panel/panel.json", {"synthetic_panel": isa, "rows": []})
+
+            with patch.object(suite, "build_driver", return_value="tools") as build, \
+                 patch.object(suite, "inventory_companion", side_effect=companion), \
+                 patch.object(suite, "run_in_driver", side_effect=panels) as run, \
+                 patch.object(suite, "admit_accuracy") as admit:
+                with self.assertRaisesRegex(ValueError, "release accuracy panel failures"):
+                    suite.run_accuracy(SimpleNamespace(preflight_bundle=root, models=root / "models",
+                                                       model_ramdisk_root=root), pair, accuracy)
+            build.assert_called_once()
+            # Both ISAs were attempted; the failure was raised only after both.
+            self.assertEqual([call.args[3].name for call in run.call_args_list],
+                             [isa.lower() for isa in suite.ISAS])
+            admit.assert_not_called()
+            receipt = json.loads((accuracy / "accuracy-receipt.json").read_text())
+            self.assertFalse(receipt["complete"])
+            self.assertEqual(set(receipt["failures"]), {suite.ISAS[0]})
+            # Both outer-driver retirements are validated and sealed, including
+            # the red ISA's, before the phase failure is reported.
+            self.assertEqual(set(receipt["retirement_reports"]), set(suite.ISAS))
+            self.assertEqual(set(receipt["test_companions"]), set(suite.ISAS))
+            # The green second ISA's panel evidence is still collected.
+            self.assertEqual(set(receipt["reports"]), {suite.ISAS[1]})
+            self.assertEqual(json.loads((accuracy / suite.ISAS[1].lower() / "panel" / "panel.json").read_text())["synthetic_panel"],
+                             suite.ISAS[1])
+
     def test_model_free_gate_cannot_shadow_full_matrix_inventory_tag(self):
         """Same source and ISA still have disjoint typed test-runner identities."""
         source = image_pair()["source"]
@@ -1464,9 +1520,11 @@ class PublishedImageSuiteTests(unittest.TestCase):
                       if rule["type"] == "required_status_checks")["parameters"]
         self.assertTrue(checks["strict_required_status_checks_policy"])
         self.assertEqual(checks["required_status_checks"], [
-            {"context": "Develop PR / Unit + host (AVX2)",
+            {"context": "Develop PR / Unit + hardware preflight (AVX2)",
              "integration_id": 15368},
             {"context": "Develop PR / Unit + host (AVX512)",
+             "integration_id": 15368},
+            {"context": "ARM64 build and Unit + host",
              "integration_id": 15368}])
         self.assertEqual(master_ruleset.proposed_develop_ruleset(proposed), proposed)
         for previous in ([], master_ruleset.RELEASE_DEPLOY_KEY_BYPASS,
@@ -1486,6 +1544,37 @@ class PublishedImageSuiteTests(unittest.TestCase):
                 proposed["bypass_actors"] = [actor]
                 with self.assertRaisesRegex(ValueError, "unrelated bypass actor"):
                     master_ruleset.proposed_develop_ruleset(proposed)
+
+    def test_develop_only_install_checks_the_live_required_contexts(self):
+        """Verify the actual ruleset readback and avoid release-policy writes."""
+        endpoint = f"repos/Llaminar/llaminar/rulesets/{master_ruleset.DEVELOP_RULESET_ID}"
+        proposed = master_ruleset.proposed_develop_ruleset({
+            "name": "develop", "target": "branch", "enforcement": "active",
+            "conditions": {"ref_name": {"include": ["refs/heads/develop"], "exclude": []}},
+            "rules": [{"type": "deletion"}, {"type": "non_fast_forward"}],
+        })
+        without_arm = deepcopy(proposed)
+        checks = next(rule["parameters"]["required_status_checks"] for rule in without_arm["rules"]
+                      if rule["type"] == "required_status_checks")
+        checks[:] = [check for check in checks if check["context"] != "ARM64 build and Unit + host"]
+        for installed in (proposed, without_arm):
+            with self.subTest(installed=installed is proposed), \
+                 patch("builtins.print"), \
+                 patch.object(master_ruleset, "github_json",
+                              side_effect=[without_arm, installed]) as request, \
+                 patch.object(master_ruleset, "require_dedicated_release_key"), \
+                 patch.object(master_ruleset.subprocess, "run") as put:
+                if installed is proposed:
+                    self.assertEqual(master_ruleset.main(["--develop-only", "--apply"]), 0)
+                else:
+                    with self.assertRaisesRegex(ValueError, "installed policy differs from develop"):
+                        master_ruleset.main(["--develop-only", "--apply"])
+                self.assertEqual([call.args for call in request.call_args_list],
+                                 [(endpoint,), (endpoint,)])
+                put.assert_called_once()
+                self.assertEqual(put.call_args.args[0],
+                                 ["gh", "api", "--method", "PUT", endpoint, "--input", "-"])
+                self.assertEqual(json.loads(put.call_args.kwargs["input"]), proposed)
 
     def test_release_bypass_rejects_any_other_writable_deploy_key(self):
         with patch.object(master_ruleset, "github_json", return_value=[

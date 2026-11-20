@@ -11,8 +11,16 @@
 
 #pragma once
 
+#include "MoEOverlayExtent.h"
+#include "MoEOverlayRouteTarget.h"
 #include <cstdint>
 #include <type_traits>
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define LLAMINAR_MOE_EXTENT_RECORD_HD __host__ __device__
+#else
+#define LLAMINAR_MOE_EXTENT_RECORD_HD
+#endif
 
 namespace llaminar2
 {
@@ -21,11 +29,7 @@ namespace llaminar2
         0x43454f4du;
 
     /** Version of every fixed-width controller record in this header. */
-    inline constexpr std::uint32_t kMoEOverlayDeviceControllerVersion = 9u;
-
-    /** Maximum participants represented by one node-local inference epoch barrier. */
-    inline constexpr std::uint32_t
-        kMoEOverlayDeviceControllerInferenceEpochMaxParticipants = 8u;
+    inline constexpr std::uint32_t kMoEOverlayDeviceControllerVersion = 10u;
 
     /** Binary identity of one continuation-transaction epoch record (`MOIT`). */
     inline constexpr std::uint32_t
@@ -33,7 +37,7 @@ namespace llaminar2
 
     /** Version of @ref MoEOverlayDeviceControllerInferenceEpochRecord. */
     inline constexpr std::uint32_t
-        kMoEOverlayDeviceControllerInferenceEpochVersion = 1u;
+        kMoEOverlayDeviceControllerInferenceEpochVersion = 2u;
 
     /**
      * @brief Device-owned exact epoch handoff for one symmetric continuation graph.
@@ -44,8 +48,8 @@ namespace llaminar2
      * record turns admission into a two-phase, monotonically sequenced barrier.
      *
      * Each member first increments its participant-local RCU acquisition guard,
-     * then release-publishes the next value in its disjoint `arrival_sequence`
-     * lane. The immutable publisher waits until every bit in `participant_mask`
+     * then release-publishes the next value in its disjoint roster-local arrival
+     * lane. The immutable publisher waits until every lane in its exact member roster
      * has arrived, snapshots the live admission epoch once, and release-publishes
      * `publication_sequence`. Followers acquire that sequence and therefore see
      * the exact `epoch`. Keeping the local guard raised while waiting prevents a
@@ -63,8 +67,8 @@ namespace llaminar2
             kMoEOverlayDeviceControllerInferenceEpochMagic;
         std::uint32_t version =
             kMoEOverlayDeviceControllerInferenceEpochVersion;
-        /** Dense global participant-id bits belonging to continuation. */
-        std::uint32_t participant_mask = 0u;
+        /** Exact number of continuation members; IDs need not be contiguous. */
+        std::uint32_t member_count = 0u;
         /** Sole participant allowed to write epoch/publication sequence. */
         std::uint32_t publisher_participant_id = 0u;
         /** Frozen topology identity shared with the surrounding controller. */
@@ -73,10 +77,84 @@ namespace llaminar2
         std::uint64_t epoch = 0u;
         /** Monotonic release edge authenticating @ref epoch. */
         std::uint64_t publication_sequence = 0u;
-        /** Disjoint system-release arrival lane indexed by global participant id. */
-        std::uint64_t arrival_sequence
-            [kMoEOverlayDeviceControllerInferenceEpochMaxParticipants] = {};
-        std::uint64_t reserved[3] = {};
+        /** Immutable record-relative offset of the ascending original member IDs. */
+        std::uint64_t member_ids_offset = 0u;
+        /** Immutable record-relative offset of disjoint system-release arrival lanes. */
+        std::uint64_t arrival_sequences_offset = 0u;
+        /** Complete admitted record and tail extent, authenticated by the launch binding. */
+        std::uint64_t storage_bytes = 0u;
+        std::uint64_t reserved[8] = {};
+
+        /** @brief Compute the exact record/tail BOM from admitted membership.
+         * @param count Positive roster cardinality. @return Required bytes, zero for no members. */
+        LLAMINAR_MOE_EXTENT_RECORD_HD static constexpr std::uint64_t bytesForMembers(std::uint32_t count) noexcept
+        {
+            return count ? ((sizeof(MoEOverlayDeviceControllerInferenceEpochRecord) +
+                std::uint64_t(count) * sizeof(std::uint32_t) + 7u) & ~std::uint64_t{7u}) +
+                std::uint64_t(count) * sizeof(std::uint64_t) : 0u;
+        }
+
+        /** @brief Bind immutable tail geometry before publication, without allocating.
+         * @param count Exact roster cardinality. */
+        LLAMINAR_MOE_EXTENT_RECORD_HD void bindMemberExtent(std::uint32_t count) noexcept
+        {
+            member_count = count;
+            member_ids_offset = sizeof(*this);
+            arrival_sequences_offset = (member_ids_offset + std::uint64_t(count) * sizeof(std::uint32_t) + 7u) & ~std::uint64_t{7u};
+            storage_bytes = bytesForMembers(count);
+        }
+
+        /**
+         * @brief Authenticate exact roster and arrival ranges before resolving aliases.
+         * @param admitted_bytes Immutable storage extent retained by the graph owner.
+         * @return True for the exact version, separated ranges and positive membership.
+         */
+        LLAMINAR_MOE_EXTENT_RECORD_HD bool validStorage(std::uint64_t admitted_bytes) const noexcept
+        {
+            return magic == kMoEOverlayDeviceControllerInferenceEpochMagic &&
+                   version == kMoEOverlayDeviceControllerInferenceEpochVersion &&
+                   member_count != 0u && topology_fingerprint != 0u &&
+                   storage_bytes == admitted_bytes && member_ids_offset >= sizeof(*this) &&
+                   moeOverlayExtentContains<std::uint32_t>(admitted_bytes, member_ids_offset, member_count) &&
+                   arrival_sequences_offset >= member_ids_offset + std::uint64_t(member_count) * sizeof(std::uint32_t) &&
+                   moeOverlayExtentContains<std::uint64_t>(admitted_bytes, arrival_sequences_offset, member_count);
+        }
+
+        /** @brief Resolve original member IDs within the admitted immutable extent.
+         * @param admitted_bytes Graph-owned exact extent. @return Null for malformed storage. */
+        LLAMINAR_MOE_EXTENT_RECORD_HD const std::uint32_t *memberIds(std::uint64_t admitted_bytes) const noexcept
+        {
+            return validStorage(admitted_bytes) ? moeOverlayExtentArray<std::uint32_t>(this,
+                admitted_bytes, member_ids_offset, member_count) : nullptr;
+        }
+
+        /** @brief Resolve mutable arrival lanes inside their admitted extent.
+         * @param admitted_bytes Graph-owned exact extent. @return Null for malformed storage. */
+        LLAMINAR_MOE_EXTENT_RECORD_HD std::uint64_t *arrivals(std::uint64_t admitted_bytes) noexcept
+        {
+            return validStorage(admitted_bytes) ? moeOverlayExtentArray<std::uint64_t>(this,
+                admitted_bytes, arrival_sequences_offset, member_count) : nullptr;
+        }
+
+        /**
+         * @brief Resolve a global participant to its unique roster-local arrival lane.
+         * @param participant Original global identity, never a bit position.
+         * @param admitted_bytes Graph-owned exact storage extent.
+         * @return Member-local lane, or UINT32_MAX for malformed/absent identity.
+         */
+        LLAMINAR_MOE_EXTENT_RECORD_HD std::uint32_t memberIndex(
+            std::uint32_t participant, std::uint64_t admitted_bytes) const noexcept
+        {
+            const auto *ids = memberIds(admitted_bytes);
+            if (!ids) return UINT32_MAX;
+            std::uint32_t result = UINT32_MAX;
+            for (std::uint32_t member = 0u; member < member_count; ++member)
+            {
+                if (member && ids[member - 1u] >= ids[member]) return UINT32_MAX;
+                if (ids[member] == participant) result = member;
+            }
+            return result;
+        }
     };
 
     /** Sole policy operation represented by one controller transaction. */
@@ -165,7 +243,7 @@ namespace llaminar2
 
     /** Version of @ref MoEOverlayDeviceMovementCommand. */
     inline constexpr std::uint32_t kMoEOverlayDeviceMovementCommandVersion =
-        4u;
+        5u;
 
     /** Sentinel used when an action has no physical source or destination slot. */
     inline constexpr std::uint32_t kMoEOverlayDeviceInvalidSlot =
@@ -194,8 +272,10 @@ namespace llaminar2
         std::uint32_t ordinal = 0u;
         std::uint32_t layer = 0u;
         std::uint32_t expert = 0u;
-        std::uint32_t source_participant = 0u;
-        std::uint32_t destination_participant = 0u;
+        /** Original whole participant or complete cohort; never a member alias. */
+        MoEOverlayRouteTarget source_target;
+        /** Exact logical destination; original membership is immutable topology. */
+        MoEOverlayRouteTarget destination_target;
         std::uint32_t payload_slot = kMoEOverlayDeviceInvalidSlot;
         /** Low two bits encode axis; upper bits hold the 1-based durable cycle. */
         std::uint32_t flags = 0u;
@@ -406,7 +486,11 @@ namespace llaminar2
     static_assert(
         sizeof(MoEOverlayDeviceMovementCommand) == 64u,
         "Each parallel movement command must occupy exactly one cache line");
+    static_assert(sizeof(MoEOverlayRouteTarget) == sizeof(std::int32_t),
+        "Whole/cohort targets retain the original signed route-word ABI");
     static_assert(
         sizeof(MoEOverlayDeviceControllerInferenceEpochRecord) == 128u,
-        "The continuation admission barrier must occupy two cache lines");
+        "The continuation admission header must occupy two cache lines before its admitted tail");
 } // namespace llaminar2
+
+#undef LLAMINAR_MOE_EXTENT_RECORD_HD

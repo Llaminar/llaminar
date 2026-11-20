@@ -421,6 +421,47 @@ class ModelKLDLifecycleTests(unittest.TestCase):
 
 class ModelKLDCITests(unittest.TestCase):
     """Master-only integration keeps both ISA evidence and native owner cleanup."""
+    def test_admission_rejects_red_numerics_while_holding_both_isa_reports(self):
+        """Admission (not collection) rejects a red numerical cell precisely.
+
+        The real collector behaviour is covered by
+        test_published_accuracy_collects_both_isas_before_reporting_red_panel;
+        this contract keeps the admission side: a complete both-ISA bundle is
+        admitted, a red numerical cell is still collected for BOTH ISAs but is
+        rejected precisely with the KL phase-failure verdict.
+        """
+        from types import SimpleNamespace
+        import tempfile,json
+        import run_published_image_suite as suite
+        from test_published_image_suite import image_pair,write_e2e_bundle
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);pair=image_pair();write_e2e_bundle(root,pair)
+            # The current RC validates the published-image KL canary pair through
+            # admit_e2e, not a run_e2e KLD lane. A complete both-ISA bundle is
+            # admitted; a red numerical cell is still collected for BOTH ISAs but
+            # is rejected precisely with the KL phase-failure verdict.
+            suite.admit_e2e(root,pair,require_model_kld=True)
+            receipt=json.loads((root/'e2e-receipt.json').read_text())
+            self.assertEqual(set(receipt['model_kld_reports']),set(suite.ISAS))
+            # Redden one ISA's numerical cell and re-seal its report digest so the
+            # collection still holds both ISAs while admission rejects the failure.
+            from test_model_kld_canary import canary_report
+            from production_artifacts import write_json,digest
+            approval=json.loads((suite.ROOT/'scripts/ci/approved_model_kld_corpus.json').read_text())
+            isa=suite.ISAS[0]
+            report=canary_report(pair['source']['revision'],pair['images'][isa]['id'],isa,approval['manifest_digest'])
+            cell=report['cells'][0]
+            data=rows('dense',prefill=1.)
+            metrics=policy.evaluate_rows(data,model='dense',backend='cuda')
+            metrics.update(rows=data,corpus_manifest_digest=approval['manifest_digest'],full_vocabulary=True)
+            cell.update(metrics=metrics,phases=metrics['phases'],passed=False);report['passed']=False
+            write_json(root/isa.lower()/'kld/kld-canaries.json',report)
+            receipt['model_kld_reports'][isa]=digest(report)
+            write_json(root/'e2e-receipt.json',receipt)
+            with self.assertRaisesRegex(ValueError,'KL phase failures'):
+                suite.admit_e2e(root,pair,require_model_kld=True)
+            # Both ISA canaries are still collected even though one is red.
+            self.assertEqual(set(receipt['model_kld_reports']),set(suite.ISAS))
     def test_master_cannot_omit_kl_or_accept_changed_report(self):
         import tempfile,json
         import run_published_image_suite as suite
@@ -435,6 +476,21 @@ class ModelKLDCITests(unittest.TestCase):
             receipt['model_kld_required']=True;write_json(root/'e2e-receipt.json',receipt)
             report=root/'avx2/kld/kld-canaries.json';data=json.loads(report.read_text());data['cpu_isa']='AVX512';write_json(report,data)
             with self.assertRaises(ValueError):suite.admit_e2e(root,pair,require_model_kld=True)
+    def test_outer_driver_labels_and_retires_numerical_children_on_cancel(self):
+        from unittest.mock import patch
+        from types import SimpleNamespace
+        import tempfile
+        import run_published_image_suite as suite
+        with tempfile.TemporaryDirectory() as temp:
+            root=Path(temp);(root/'cache').mkdir();lane=root/'kld';lane.mkdir();socket=root/'docker.sock';socket.touch()
+            args=SimpleNamespace(output=root,models=root,model_ramdisk_root=root,e2e_bundle=None,suite='accuracy')
+            with patch.dict(suite.os.environ,{'DOCKER_HOST':'unix://'+str(socket)}),patch.object(suite.docker_paths,'device_args',return_value=[]),patch.object(suite.docker_paths,'mounts',return_value=[]),patch.object(suite.pipeline,'run',side_effect=KeyboardInterrupt) as run,patch.object(suite,'retire_coding_children') as retire,patch.object(suite,'restore_lane_ownership'):
+                with self.assertRaises(KeyboardInterrupt):suite.run_in_driver(args,'tools',['python','canary.py'],lane,'kld.log')
+            command=run.call_args.args[0];owner=command[command.index('--name')+1]
+            self.assertIn(suite.docker_paths.CODING_DRIVER_ENV+'='+owner,command)
+            self.assertIn(suite.docker_paths.CODING_OWNER_LABEL+'='+owner,command)
+            retire.assert_called_once_with(owner,lane/'outer-cleanup.json')
+            self.assertTrue(lane.stat().st_mode & 0o020)
 
 
 class ModelKLDPackagingTests(unittest.TestCase):
@@ -463,8 +519,12 @@ class ModelKLDPackagingTests(unittest.TestCase):
             registration={'tests':[dict(name='V2_Integration_ModelKLDCanaryCLI',command=[str(binary),'--help'],properties={'LABELS':['ProductionTestPreflight']})]}
             with patch.object(installed.subprocess,'check_output',return_value=json.dumps(registration)):
                 with self.assertRaisesRegex(ValueError,'executable is missing'):installed.inventory(root)
-                for name in ['CMakeCache.txt','compile_commands.json','build.ninja','CMakeFiles/rules.ninja','CTestTestfile.cmake']:
+                mpi_library=root/'usr/lib/openmpi/lib/libmpi.so'
+                mpi_library.parent.mkdir(parents=True)
+                mpi_library.write_bytes(b'fixture MPI runtime library')
+                for name in ['compile_commands.json','build.ninja','CMakeFiles/rules.ninja','CTestTestfile.cmake']:
                     path=root/name;path.parent.mkdir(exist_ok=True);path.write_text('fixture')
+                (root/'CMakeCache.txt').write_text(f'MPI_mpi_LIBRARY:FILEPATH={mpi_library}\n')
                 binary.write_bytes(b'placeholder native observer')
                 inventory=installed.inventory(root);self.assertIn(binary.name,inventory['files'])
                 receipt=root/'receipt.json';receipt.write_text(json.dumps(dict(

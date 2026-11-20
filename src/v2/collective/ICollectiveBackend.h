@@ -22,6 +22,8 @@
 
 #pragma once
 
+#include "collective/RankOrderedNativeResources.h"
+
 #include "collective/NativeCollectiveBytes.h"
 
 #include "../backends/DeviceId.h"
@@ -40,6 +42,7 @@
 
 namespace llaminar2
 {
+    class PhysicalMemoryAuthority;
 
     class ICollectiveBackend;
 
@@ -1327,6 +1330,31 @@ namespace llaminar2
             (void)send; (void)receive; (void)bytes; (void)root; (void)participant; (void)stream;
             return NativeCollectiveEnqueueResult::failure("Original backend does not support native byte Broadcast");
         }
+
+        /** @return Cold original-communicator resource quotes; empty for unselected policy. */
+        virtual std::vector<RankOrderedNativeResources> rankOrderedResources() const { return {}; }
+        /** @return Whether the bound communicator owns a native direct-push quote, without copying its BOM. */
+        virtual bool hasRankOrderedPeerPush() const noexcept { return false; }
+
+        /** @brief Admit and prepare original native peer edges before graph capture.
+         * @param memory Original rank PMA; every native owner remains reserved through retirement.
+         * @return Success only for a complete supported native preparation.
+         */
+        virtual bool prepareRankOrderedResources(const std::shared_ptr<PhysicalMemoryAuthority> &memory)
+        { (void)memory; return false; }
+
+        /** @brief Publish the canonical ascending-rank FP32 sum in one native operation.
+         * @param send Original local contribution, possibly identical to output.
+         * @param banks Persistent arena bank per original rank.
+         * @param output Participant-local FP32 result bank.
+         * @param rows Original device live prefix or fixed complete rows.
+         * @param participant Original communicator coordinate.
+         * @param stream Exact producer/consumer stream; never a default stream.
+         * @return Enqueue success; missing preparation or unsupported transport fails.
+         */
+        virtual bool rankOrderedFP32OnStream(const void *send, void *banks, void *output,
+            const NativeCollectiveRows &rows, int participant, void *stream)
+        { (void)send; (void)banks; (void)output; (void)rows; (void)participant; (void)stream; return false; }
 
         /**
          * @brief Submit equal-prefix rows without communicating inactive capacity.

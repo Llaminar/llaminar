@@ -1,5 +1,24 @@
 # Python Environment Setup for Llaminar Devcontainer
 
+## GPU builds
+
+The CUDA-enabled devcontainer installs the repository's pinned NCCL. The V2
+Debug, Integration and Release configure tasks build the repository's pinned
+RCCL when ROCm is enabled. For a terminal build with the ROCm SDK enabled, use
+the same source-build setting:
+
+```bash
+cmake -S src/v2 -B build_v2_release -G Ninja \
+  -DCMAKE_MAKE_PROGRAM:FILEPATH="$(command -v ninja)" \
+  -DCMAKE_BUILD_TYPE=Release -DHAVE_ROCM=ON \
+  -DLLAMINAR_BUILD_RCCL_FROM_SOURCE=ON
+cmake --build build_v2_release --parallel
+```
+
+The first configure builds RCCL for both shipping gfx targets. Later builds
+reuse the validated source build. A prepared installation must include the
+canonical libraries and their source-bound evidence.
+
 ## Overview
 
 This document describes the automated Python environment setup for the Llaminar development container.

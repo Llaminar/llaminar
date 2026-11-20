@@ -6,6 +6,7 @@
  */
 
 #include "TensorClasses.h"
+#include "../utils/OpenMPUtils.h"
 #include "../kernels/KernelFactory.h"
 #include "../utils/Logger.h"
 #include "../utils/DebugEnv.h"
@@ -520,6 +521,7 @@ namespace llaminar2
         const size_t chunk_size = 4096;
         const size_t num_chunks = (count + chunk_size - 1) / chunk_size;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < num_chunks; ++i)
         {
@@ -538,6 +540,7 @@ namespace llaminar2
         const size_t chunk_size = 4096;
         const size_t num_chunks = (count + chunk_size - 1) / chunk_size;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < num_chunks; ++i)
         {
@@ -553,6 +556,7 @@ namespace llaminar2
         const size_t num_blocks = (total_elements + block_size - 1) / block_size;
         const float *src = data();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
         {
@@ -726,6 +730,7 @@ namespace llaminar2
 
         const float *src_data = data();
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (int m = 0; m < rows; ++m)
         {
@@ -908,6 +913,7 @@ namespace llaminar2
         // Check if K is a multiple of 32 (enables fast path with no bounds checking)
         const bool k_aligned = (k % 32 == 0);
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel
         {
             // Parallelize over rows for large M, or collapse(2) for small M

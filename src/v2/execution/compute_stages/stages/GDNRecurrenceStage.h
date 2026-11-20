@@ -25,6 +25,7 @@
 
 #pragma once
 
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "../IComputeStage.h"
 #include "GDNPreparedQKBinding.h"
 #include "GDNSpeculativeWorkspaceContract.h"
@@ -151,6 +152,7 @@ namespace llaminar2
              * its historical workspace keys.
              */
             std::string workspace_namespace;
+            LocalGPUExpertKernelPolicy verifier_kernel_policy=LocalGPUExpertKernelPolicy::Generic;
             int verifier_state_capture_rows = 0; ///< Compatibility spelling for speculative state slots.
             int speculative_state_slot_rows = 0; ///< Phase 13.8 temporary state slots for MTP verifier rows.
 

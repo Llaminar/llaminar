@@ -1,6 +1,8 @@
+# @file ci.yml
+# @brief Publish the develop images and retain build evidence and failed job transcripts.
 name: CI
 
-# Develop publishes both Release runtime images on the dedicated development host.
+# Develop builds the Release runtimes in parallel on standard hosted Ubuntu VMs.
 # Unit and host-preflight tests belong to the separate PR gate. This push job
 # only builds and publishes; complete certification remains production work.
 on:
@@ -21,11 +23,60 @@ jobs:
   develop-images:
     # Manual dispatches from another branch must not mutate the develop tag.
     if: github.ref == 'refs/heads/develop'
-    name: Build → Publish develop images
-    runs-on:
-      group: Develop CI
-      labels: llaminar-develop-avx2
-    timeout-minutes: 240
+    name: Develop images (${{ matrix.cpu_isa }})
+    strategy:
+      fail-fast: false
+      matrix:
+        cpu_isa: [AVX512, AVX2]
+    uses: ./.github/workflows/develop-image-isa.yml
+    with:
+      cpu-isa: ${{ matrix.cpu_isa }}
+
+  publish:
+    name: Publish develop images
+    needs: develop-images
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+          lfs: false
+          persist-credentials: false
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: develop-stage-*
+          path: ${{ runner.temp }}/llaminar-staged-images
+      - name: Verify and publish the matching Release pair
+        shell: bash
+        run: |
+          set -euo pipefail
+          exec python3 scripts/ci/run_develop_image_gate.py \
+            --publish-staged "$RUNNER_TEMP/llaminar-staged-images" \
+            --output parity-results/develop-image-gate \
+            --image "ghcr.io/${GITHUB_REPOSITORY,,}:develop"
+      - name: Retain paired develop publication evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-image-gate-${{ github.run_id }}
+          path: |
+            parity-results/develop-image-gate/develop-image-gate.json
+            parity-results/develop-image-gate/publish.log
+          if-no-files-found: error
+          overwrite: true
+          retention-days: 30
+
+  develop-arm64:
+    if: github.ref == 'refs/heads/develop'
+    name: Build and publish develop ARM64 CUDA runtime
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
     steps:
       - uses: actions/checkout@v6
         with:
@@ -35,12 +86,8 @@ jobs:
       - uses: docker/setup-buildx-action@v4
         with:
           version: v0.38.1
-          name: llaminar-develop
-          # Retain layers and compiler cache mounts on the dedicated host.
           driver: docker-container
-          keep-state: true
           driver-opts: |
-            network=host
             image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
           cache-binary: false
       - uses: docker/login-action@v4
@@ -49,33 +96,41 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: ./.github/actions/cache-develop-toolchain
+        id: toolchain
         with:
-          cpu-isa: both
-      - name: Build and publish both develop runtime images
+          cpu-isa: NEON
+      - name: Build and smoke-test the DGX Spark runtime image
+        shell: bash
+        env:
+          TOOLCHAIN_CONTEXT: ${{ steps.toolchain.outputs.neon-context }}
+          REGISTRY_CACHE: ${{ steps.toolchain.outputs.neon-registry-cache }}
+        run: |
+          test "$(uname -m)" = aarch64
+          exec bash scripts/docker/build-runtime-image.sh --variant cuda --cpu-isa NEON \
+            --load --verify --tag llaminar-arm64-runtime:develop \
+            --build-context "${TOOLCHAIN_CONTEXT:?missing admitted NEON toolchain}" \
+            --cache-from "type=registry,ref=${REGISTRY_CACHE:?missing develop NEON cache reference}" \
+            --cache-to "type=registry,ref=$REGISTRY_CACHE,mode=max,image-manifest=true,oci-mediatypes=true" \
+            --build-arg "LLAMINAR_SOURCE_TREE=$(git rev-parse HEAD^{tree})"
+      - name: Publish the tested ARM64 runtime
         shell: bash
         run: |
-          set -euo pipefail
-          export LLAMINAR_DOCKER_BUILD_CACHE_IMAGE="ghcr.io/${GITHUB_REPOSITORY,,}:build-cache-develop"
-          exec python3 scripts/ci/run_develop_image_gate.py \
-            --build-only \
-            --output parity-results/develop-image-gate \
-            --image "ghcr.io/${GITHUB_REPOSITORY,,}:develop" \
-            --publish
-      - name: Retain develop-image build evidence
+          repository="ghcr.io/${GITHUB_REPOSITORY,,}"
+          for tag in "sha-$GITHUB_SHA-arm64" develop-arm64; do
+            docker tag llaminar-arm64-runtime:develop "$repository:$tag"
+            docker push "$repository:$tag"
+          done
+      - name: Retain ARM64 toolchain evidence
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          # Compact build evidence; compiler/layer caches are not artifacts.
-          name: develop-image-gate-${{ github.run_id }}
-          # The per-ISA source snapshot is a Buildx input, not evidence. Its
-          # identity is sealed in develop-image-gate.json and it can contain
-          # hundreds of MiB of tracked diagnostic CSVs which Docker itself
-          # excludes. Upload build/publication logs and identity receipts only.
-          path: |
-            ${{ runner.temp }}/llaminar-toolchains/*-toolchain.json
-            parity-results/develop-image-gate/develop-image-gate.json
-            parity-results/develop-image-gate/**/build-*.log
-            parity-results/develop-image-gate/**/build-timeline.jsonl
-            parity-results/develop-image-gate/**/publish.log
-          if-no-files-found: error
+          name: develop-arm64-toolchain-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/llaminar-toolchains/neon-toolchain.json
           retention-days: 30
+
+  failed-job-logs:
+    needs: [develop-images, publish]
+    if: always() && (contains(needs.*.result, 'failure') || contains(needs.*.result, 'cancelled'))
+    permissions:
+      actions: read
+    uses: ./.github/workflows/failed-job-logs.yml

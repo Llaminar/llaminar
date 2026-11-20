@@ -39,9 +39,9 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
     const auto ids = staticJointMembers(original);
     ASSERT_FALSE(ids.empty());
     const int id = ids.front();
-    const auto *participant = original.preparation->cpuJointOwnerMap()->participantForId(id);
+    const auto *participant = original.preparation->jointOwnerMap()->participantForId(id);
     ASSERT_TRUE(participant);
-    const auto selected = original.preparation->cpuShardSourceFor(7, *participant);
+    const auto selected = original.preparation->shardSourceFor(7, *participant);
     ASSERT_TRUE(selected);
     const int local_intermediate=selected->ownership().projection(WeightRole::MoEExpertUp).rows;
     MoEOverlayResidencyAuthority authority(staticJointConfig(original));
@@ -58,7 +58,7 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
     {
         const auto name = std::string("blk.")+std::to_string(layer)+".ffn_" +
             (role==WeightRole::MoEExpertGate?"gate":role==WeightRole::MoEExpertUp?"up":"down") + "_exps.weight";
-        plan.add(test::nativeJointRequirementForTest(original.preparation->cpuShardSourceFor(layer,*participant),role,name));
+        plan.add(test::nativeJointRequirementForTest(original.preparation->shardSourceFor(layer,*participant),role,name));
     }
     // Destination roots are prepared as a component setup oracle before movement.
     // This does not exercise or claim the native physical fanout transport.
@@ -89,7 +89,7 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
     }
     std::shared_ptr<const MoEExpertShardCohort> arena_cohort=selected->cohort();
     if(serial_layers) {
-        const auto earlier=original.preparation->cpuShardSourceFor(6,*participant);
+        const auto earlier=original.preparation->shardSourceFor(6,*participant);
         ASSERT_TRUE(earlier);ASSERT_NE(earlier->cohort(),selected->cohort());
         ASSERT_NE(earlier->cohort()->source().layer_idx,selected->cohort()->source().layer_idx);
         const std::array manifests{earlier->cohort()->source(),selected->cohort()->source()};
@@ -121,22 +121,22 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
     EXPECT_FALSE(banks.acquireOriginalPreparedSource(&error));
     EXPECT_NE(error.find("no original ModelContext binding"),std::string::npos)<<error;
     try {
-        (void)adoptMoEOverlayCPUJointGraphDeclaration(banks,manager->expertGemmRegistry(),
+        (void)adoptMoEOverlayJointGraphDeclaration(banks,manager->expertGemmRegistry(),
             model,id,7,512,8,20);
         FAIL()<<"Unbound cold graph declaration unexpectedly succeeded";
     } catch(const std::logic_error& failure) {
-        EXPECT_EQ(std::string(failure.what()),"CPU joint graph lost its original prepared source: Prepared source has no original ModelContext binding");
+        EXPECT_EQ(std::string(failure.what()),"Joint graph lost its original prepared source: Prepared source has no original ModelContext binding");
     }
-    EXPECT_FALSE(banks.admitInitialCPUJointGraphSources({},&error));
+    EXPECT_FALSE(banks.admitInitialJointGraphSources({},&error));
     EXPECT_FALSE(banks.acquireOriginalPreparedSource(&error));
-    ASSERT_TRUE(banks.admitInitialCPUJointGraphSources(context,&error))<<error;
-    ASSERT_TRUE(banks.admitInitialCPUJointGraphSources(context,&error))<<error;
-    ASSERT_TRUE(adoptMoEOverlayCPUJointGraphDeclaration(banks,manager->expertGemmRegistry(),
+    ASSERT_TRUE(banks.admitInitialJointGraphSources(context,&error))<<error;
+    ASSERT_TRUE(banks.admitInitialJointGraphSources(context,&error))<<error;
+    ASSERT_TRUE(adoptMoEOverlayJointGraphDeclaration(banks,manager->expertGemmRegistry(),
         model,id,7,512,8,20));
-    const auto cold=banks.initialCPUJointLayer(id,7);
+    const auto cold=banks.initialJointLayer(id,7);
     ASSERT_TRUE(cold); ASSERT_FALSE(cold->bankLease());
     auto old=cold->acquireEpoch(1); ASSERT_TRUE(old);
-    std::weak_ptr<ITensorGemm> departed=old->bankLease()->layerForModelLayer(7).cpu_fragments[64].gate();
+    std::weak_ptr<ITensorGemm> departed=old->bankLease()->layerForModelLayer(7).fragments[64].gate();
     // The cold source is authenticated before this component oracle prepares
     // candidate-only roots. They are not members of its original selection.
     const auto incoming=manager->materialize(incoming_plan);
@@ -147,31 +147,31 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
         destination_engines[role]=manager->preparedWeightStore()->gemmKernelLifetime(*incoming.bindings()[role].prepared);
         ASSERT_TRUE(destination_engines[role]);
     }
-    auto arrival=banks.prepareCPUJointArrival(*candidate,id,7,1,&error);
+    auto arrival=banks.prepareJointArrival(*candidate,id,7,1,&error);
     ASSERT_TRUE(arrival)<<error;
-    EXPECT_TRUE(arrival->isCPUJointFragment()); EXPECT_EQ(arrival->destinationEpoch(),2u);
-    EXPECT_FALSE(banks.prepareCPUJointArrival(*candidate,ids.back(),7,1,&error));
-    EXPECT_FALSE(banks.prepareCPUJointArrival(*candidate,id,7,64,&error));
+    EXPECT_TRUE(arrival->isJointFragment()); EXPECT_EQ(arrival->destinationEpoch(),2u);
+    EXPECT_FALSE(banks.prepareJointArrival(*candidate,ids.back(),7,1,&error));
+    EXPECT_FALSE(banks.prepareJointArrival(*candidate,id,7,64,&error));
     ASSERT_TRUE(arrival->publish(ExpertTierWeightProjection::Gate,destination_engines[0],&error))<<error;
     ASSERT_TRUE(arrival->publish(ExpertTierWeightProjection::Up,destination_engines[1],&error))<<error;
     ASSERT_TRUE(arrival->publish(ExpertTierWeightProjection::Down,destination_engines[2],&error))<<error;
     MoEOverlayPreparedExpertPayload whole;
     EXPECT_FALSE(arrival->completePayload(whole,&error));
-    MoEOverlayPreparedCPUFragmentPayload fragment;
-    ASSERT_TRUE(arrival->completeCPUFragment(fragment,&error))<<error;
+    MoEOverlayPreparedFragmentPayload fragment;
+    ASSERT_TRUE(arrival->completeFragment(fragment,&error))<<error;
     EXPECT_EQ(fragment.arrivalEpoch(),2u);
     EXPECT_EQ(fragment.model(),model); EXPECT_EQ(fragment.cohort(),selected->cohort());
     EXPECT_EQ(fragment.preparation(),original.preparation); EXPECT_EQ(fragment.expertId(),1);
-    EXPECT_EQ(old->bankLease()->layerForModelLayer(7).cpu_fragments[64].arrivalEpoch(),0u);
+    EXPECT_EQ(old->bankLease()->layerForModelLayer(7).fragments[64].arrivalEpoch(),0u);
     EXPECT_THROW(fragment.recordCompletedExecution(1,1),std::logic_error);
     auto next=*old->bankLease(); next.epoch=2;
     next.layerForModelLayer(7).clearExpert(64);
-    next.layerForModelLayer(7).setResidentCPUFragment(1,fragment);
+    next.layerForModelLayer(7).setResidentFragment(1,fragment);
     auto endpoint=banks.endpoint(id); ASSERT_TRUE(endpoint);
     auto foreign_family=next;
-    const auto canonical_family=foreign_family.layerForModelLayer(7).cpu_fragment_family;
-    foreign_family.layerForModelLayer(7).cpu_fragment_family=
-        std::shared_ptr<const MoEOverlayCPUFragmentFamily>(canonical_family.get(),[](const auto*){});
+    const auto canonical_family=foreign_family.layerForModelLayer(7).fragment_family;
+    foreign_family.layerForModelLayer(7).fragment_family=
+        std::shared_ptr<const MoEOverlayFragmentFamily>(canonical_family.get(),[](const auto*){});
     EXPECT_FALSE(endpoint->prepareReadyBank(std::move(foreign_family),&error));
     auto alias_config=staticJointConfig(original);
     alias_config.projection_preparation=std::shared_ptr<const MoEExpertOverlayPreparationPlan>(
@@ -179,28 +179,28 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
     MoEOverlayResidencyAuthority alias_authority(std::move(alias_config));
     auto alias_candidate=test::MoEOverlayJointPlacementCandidateTestAccess::prepare(
         alias_authority,candidate->placement_plan->placements);
-    EXPECT_FALSE(banks.prepareCPUJointArrival(*alias_candidate,id,7,1,&error));
+    EXPECT_FALSE(banks.prepareJointArrival(*alias_candidate,id,7,1,&error));
     auto prepared=endpoint->prepareReadyBank(std::move(next),&error); ASSERT_TRUE(prepared)<<error;
     ASSERT_EQ(endpoint->installReadyBank(std::move(*prepared),&error),MoEOverlayParticipantBankInstallStatus::Installed)<<error;
     auto active=cold->acquireEpoch(2); ASSERT_TRUE(active);
     EXPECT_EQ(active->bankLease()->epoch,2u); EXPECT_EQ(old->bankLease()->epoch,1u);
-    EXPECT_EQ(active->bankLease()->layerForModelLayer(7).cpu_fragments[1].gate(),destination_engines[0]);
+    EXPECT_EQ(active->bankLease()->layerForModelLayer(7).fragments[1].gate(),destination_engines[0]);
     EXPECT_EQ(cold->sourceSelection(),selected);
     EXPECT_FALSE(active->bankLease()->layerForModelLayer(7).resident_mask[64]);
     EXPECT_TRUE(old->bankLease()->layerForModelLayer(7).resident_mask[64]);
     EXPECT_FALSE(old->bankLease()->layerForModelLayer(7).resident_mask[1]);
-    EXPECT_FALSE(old->bankLease()->layerForModelLayer(7).cpu_fragments[1].valid());
+    EXPECT_FALSE(old->bankLease()->layerForModelLayer(7).fragments[1].valid());
     // Installed candidate2 is authentic physical storage while global authority remains1.
-    auto terminal_arrival = banks.prepareCPUJointArrivalFromInstalledBank(
+    auto terminal_arrival = banks.prepareJointArrivalFromInstalledBank(
         active->bankLease(), id, 7, 1, &error);
     ASSERT_TRUE(terminal_arrival) << error;
     EXPECT_EQ(terminal_arrival->destinationEpoch(), 2u);
-    MoEOverlayPreparedCPUFragmentPayload unready_terminal;
-    EXPECT_FALSE(terminal_arrival->completeCPUFragment(unready_terminal, &error));
-    EXPECT_FALSE(banks.prepareCPUJointArrivalFromInstalledBank({}, id, 7, 1, &error));
-    EXPECT_FALSE(banks.prepareCPUJointArrivalFromInstalledBank(active->bankLease(), ids.back(), 7, 1, &error));
-    EXPECT_FALSE(banks.prepareCPUJointArrivalFromInstalledBank(active->bankLease(), id, 8, 1, &error));
-    EXPECT_FALSE(banks.prepareCPUJointArrivalFromInstalledBank(active->bankLease(), id, 7, 64, &error));
+    MoEOverlayPreparedFragmentPayload unready_terminal;
+    EXPECT_FALSE(terminal_arrival->completeFragment(unready_terminal, &error));
+    EXPECT_FALSE(banks.prepareJointArrivalFromInstalledBank({}, id, 7, 1, &error));
+    EXPECT_FALSE(banks.prepareJointArrivalFromInstalledBank(active->bankLease(), ids.back(), 7, 1, &error));
+    EXPECT_FALSE(banks.prepareJointArrivalFromInstalledBank(active->bankLease(), id, 8, 1, &error));
+    EXPECT_FALSE(banks.prepareJointArrivalFromInstalledBank(active->bankLease(), id, 7, 64, &error));
     // A separate installed physical node is not a global epoch3 publication.
     auto retired_copy = *active->bankLease();
     retired_copy.epoch = 3;
@@ -211,12 +211,12 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
     auto retired_borrow = endpoint->acquire(3);
     ASSERT_TRUE(retired_borrow);
     ASSERT_TRUE(endpoint->retire(3));
-    EXPECT_FALSE(banks.prepareCPUJointArrivalFromInstalledBank(retired_borrow, id, 7, 1, &error));
+    EXPECT_FALSE(banks.prepareJointArrivalFromInstalledBank(retired_borrow, id, 7, 1, &error));
     EXPECT_NE(error.find("retired bank node"), std::string::npos);
     retired_borrow.reset();
     (void)endpoint->retire(3);
     EXPECT_EQ(authority.snapshot()->epoch,1u); // No fabricated global commit.
-    EXPECT_FALSE(banks.prepareCPUJointArrival(*authority.snapshot(),id,7,71,&error));
+    EXPECT_FALSE(banks.prepareJointArrival(*authority.snapshot(),id,7,71,&error));
     if(late) {
         manager->preparedWeightStore()->clear();manager->expertGemmRegistry().clear();
     // Actual original bootstrap bytes retire before lazy graph setup. Initial
@@ -242,17 +242,17 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
     EXPECT_EQ(memory->claimedBytes(participant->device,PhysicalMemoryOwner::RoutedExpertWeights,
         PhysicalMemoryMaterializationKind::NewAllocation),before_retirement-departed_bytes);
 
-        EXPECT_FALSE(banks.admitInitialCPUJointGraphSources(context,&error));
+        EXPECT_FALSE(banks.admitInitialJointGraphSources(context,&error));
         EXPECT_NE(error.find("retired or absent"),std::string::npos)<<error;
-        EXPECT_FALSE(banks.registerInitialCPUJointBank(manager->expertGemmRegistry(),model,id,&error));
+        EXPECT_FALSE(banks.registerInitialJointBank(manager->expertGemmRegistry(),model,id,&error));
         EXPECT_NE(error.find("retired or absent"),std::string::npos);
-        const auto declaration=adoptMoEOverlayCPUJointGraphDeclaration(banks,manager->expertGemmRegistry(),model,id,7,512,8,20);
+        const auto declaration=adoptMoEOverlayJointGraphDeclaration(banks,manager->expertGemmRegistry(),model,id,7,512,8,20);
         EXPECT_EQ(declaration,cold);EXPECT_FALSE(declaration->bankLease());
         EXPECT_FALSE(declaration->acquireInitialConstruction());
         ExpertGemmRegistry foreign_registry;
-        EXPECT_THROW(adoptMoEOverlayCPUJointGraphDeclaration(banks,foreign_registry,model,id,7,512,8,20),std::invalid_argument);
-        EXPECT_THROW(adoptMoEOverlayCPUJointGraphDeclaration(banks,manager->expertGemmRegistry(),ModelContextId{model.value+1},id,7,512,8,20),std::invalid_argument);
-        EXPECT_THROW(adoptMoEOverlayCPUJointGraphDeclaration(banks,manager->expertGemmRegistry(),model,ids.back(),7,512,8,20),std::invalid_argument);
+        EXPECT_THROW(adoptMoEOverlayJointGraphDeclaration(banks,foreign_registry,model,id,7,512,8,20),std::invalid_argument);
+        EXPECT_THROW(adoptMoEOverlayJointGraphDeclaration(banks,manager->expertGemmRegistry(),ModelContextId{model.value+1},id,7,512,8,20),std::invalid_argument);
+        EXPECT_THROW(adoptMoEOverlayJointGraphDeclaration(banks,manager->expertGemmRegistry(),model,ids.back(),7,512,8,20),std::invalid_argument);
     }
  {
  const auto arena=std::make_shared<MoELocalExpertSerialBufferArena>(MoELocalExpertSerialBufferArena::Config{
@@ -292,7 +292,7 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
   MoEOverlayParticipantResidencyRegistry other_banks({.local_participant_ids={staticJointMembers(other).front()},
    .num_layers=1,.num_experts=512,.initial_epoch=1,.projection_preparation=other.preparation,.first_model_layer=7,.original_model=model});
   // A packet-view cannot become a cold graph declaration or retain an RCU node for its lifetime.
-  foreign.cpu_joint_layer=banks.cpuJointLayer(id,7,2);
+  foreign.cpu_joint_layer=banks.jointLayer(id,7,2);
   EXPECT_THROW((void)MoELocalExpertStage(foreign),std::invalid_argument);
   foreign=params;
   PhysicalMemoryPlanBuilder empty_budget;
@@ -352,7 +352,7 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
   active=cold->acquireEpoch(4);ASSERT_TRUE(active);
   auto empty=*active->bankLease();empty.epoch=5;
   auto &empty_layer=empty.layerForModelLayer(7);
-  const auto leaving=empty_layer.cpu_fragment_expert_ids;
+  const auto leaving=empty_layer.fragment_expert_ids;
   for(int expert:leaving)empty_layer.clearExpert(expert);
   auto empty_ready=endpoint->prepareReadyBank(std::move(empty),&error);ASSERT_TRUE(empty_ready)<<error;
   ASSERT_EQ(endpoint->installReadyBank(std::move(*empty_ready),&error),MoEOverlayParticipantBankInstallStatus::Installed);
@@ -376,14 +376,14 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
  ASSERT_EQ(completed.size(),1u);EXPECT_EQ(completed.front().tags.at("expert"),"1");
  EXPECT_GT(completed.front().value,0.0);EXPECT_EQ(completed.front().sequence_minimum_words,(std::vector<uint64_t>{2,2}));
  EXPECT_EQ(completed.front().sequence_maximum_words,(std::vector<uint64_t>{2u,late?6u:2u}));
- EXPECT_EQ(active->bankLease()->layerForModelLayer(7).cpu_fragments[1].arrivalEpoch(),2u);
+ EXPECT_EQ(active->bankLease()->layerForModelLayer(7).fragments[1].arrivalEpoch(),2u);
 
  } // The fixed executor retires before its setup registry owner.
     std::weak_ptr<ModelContext> original_context=context;
     manager.reset(); context.reset();
     EXPECT_TRUE(original_context.expired());
-    EXPECT_FALSE(banks.prepareCPUJointArrival(*candidate,id,7,1,&error));
-    const auto actual_gate=active->bankLease()->layerForModelLayer(7).cpu_fragments[1].gate();
+    EXPECT_FALSE(banks.prepareJointArrival(*candidate,id,7,1,&error));
+    const auto actual_gate=active->bankLease()->layerForModelLayer(7).fragments[1].gate();
     test::CPUProjectionTestWorkspace retained_workspace(1,8,test::cpuProjectionTestRequirements(1,{actual_gate.get()}));
     FP32Tensor retained_input({1,8}),retained_output({1,size_t(local_intermediate)});
     std::fill_n(retained_input.mutable_data(),8,0.25f);
@@ -420,7 +420,7 @@ void exerciseOriginalCPUFragmentGraphLifecycle(bool late,int members=2,bool seri
     auto foreign=staticJointOriginal();
     MoEOverlayResidencyAuthority foreign_authority(staticJointConfig(foreign));
     auto foreign_candidate=test::MoEOverlayJointPlacementCandidateTestAccess::prepare(foreign_authority,foreign.plan->placements);
-    EXPECT_FALSE(banks.prepareCPUJointArrival(*foreign_candidate,id,7,71,&error));
+    EXPECT_FALSE(banks.prepareJointArrival(*foreign_candidate,id,7,71,&error));
 }
 
 } // namespace

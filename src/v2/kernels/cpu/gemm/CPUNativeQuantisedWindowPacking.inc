@@ -65,7 +65,7 @@ inline void initializeNativeWindowOutput(const NativeQuantisedFormatInfo& format
     const auto chunks=size_t(out.N_padded/64),blocks=size_t(out.blocks_per_row);
     if(blocks && chunks>std::numeric_limits<size_t>::max()/blocks/out.interleaved_block_stride)
         throw std::overflow_error("Native weight final extent overflows");
-    out.native_interleaved=placement.allocate<uint8_t>(chunks*blocks*out.interleaved_block_stride);
+    out.native_interleaved.replace(placement.allocate<uint8_t>(chunks*blocks*out.interleaved_block_stride));
 }
 
 /**
@@ -117,6 +117,8 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
         reinterpret_cast<uintptr_t>(scratch.data())%alignof(uint32_t))
         throw std::invalid_argument("Native weight append source/destination/scratch mismatch");
     const int first_chunk=destination_row/64,last_chunk=(destination_row+rows-1)/64;
+    // Each window rewrites part of the publication; the producer seals after the last window.
+    const auto interleaved=out.native_interleaved.beginRewrite();
 #pragma omp parallel for collapse(2) schedule(static)
     for(int chunk=first_chunk;chunk<=last_chunk;++chunk)for(int group=0;group<groups;++group) {
         const int first=std::max(destination_row,chunk*64);
@@ -127,7 +129,7 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
         // A destination unit is first touched exactly when its original row0
         // arrives. Later partial windows preserve already-written sibling rows.
         if(first==chunk*64)for(int b=0;b<count;++b)
-            std::memset(out.native_interleaved.data()+(size_t(chunk)*out.blocks_per_row+output_first+b)*out.interleaved_block_stride,
+            std::memset(interleaved.data()+(size_t(chunk)*out.blocks_per_row+output_first+b)*out.interleaved_block_stride,
                 0,out.interleaved_block_stride);
         for(int row=first;row<end;++row) {
             const int local_row=row-destination_row,column=row%64;
@@ -161,7 +163,7 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                 mins[b]=source.get_block_min(actual_row,input_first+b);
             }
             for(int b=0;b<count;++b) {
-                auto* target=out.native_interleaved.data()+(size_t(chunk)*out.blocks_per_row+output_first+b)*out.interleaved_block_stride;
+                auto* target=interleaved.data()+(size_t(chunk)*out.blocks_per_row+output_first+b)*out.interleaved_block_stride;
                 const auto* input=payload+size_t(b)*format.payload_bytes;
                 if(out.usesCompactMultiScale()) {
                     for(int byte=0;byte<format.payload_bytes;++byte)

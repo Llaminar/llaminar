@@ -8831,6 +8831,12 @@ namespace llaminar2
         /** @return The immutable model-forward family admitted for that ownership. */
         MTPVerifierGraphFamily mtpVerifierGraphFamily() const;
         /**
+         * @brief Bind the retained hosted verifier to its canonical device-count row.
+         * @param rows Immutable physical rows in this grouped verifier recording.
+         * @return Exact hosted extent for a controller-owned graph, or the guarded-capacity identity.
+         */
+        CapturedVerifierExtent retainedMTPVerifierExtent(int rows) const;
+        /**
          * @brief Authenticate an original setup-produced key without editing shape fields.
          * @param rows Exact admitted physical row member.
          * @param outcome Immutable greedy or disabled terminal topology.

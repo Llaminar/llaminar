@@ -44,6 +44,7 @@
 #include <array>
 #include <cstring>
 #include <cstdlib>
+#include <exception>
 #include <optional>
 #include <limits>
 #include <set>
@@ -1241,12 +1242,29 @@ namespace
     TEST_F(CapturedTransferChannelBindingTest, ColdInitializationQueryFailureIsFatalBeforeUnprovableCleanup)
     {
         GTEST_FLAG_SET(death_test_style,"threadsafe");
-        EXPECT_DEATH({
+        EXPECT_EXIT({
+            // Catch the exact production terminate boundary in the child.
+            // A core-dump handler can block the MPI test's output pipes and
+            // cannot establish that the original query caused termination.
+            std::set_terminate([] {
+                try
+                {
+                    if (const auto error = std::current_exception())
+                        std::rethrow_exception(error);
+                }
+                catch (const std::runtime_error &error)
+                {
+                    if (std::strcmp(error.what(), "recorded cold query failure") == 0)
+                        std::_Exit(77);
+                }
+                catch (...) {}
+                std::_Exit(78);
+            });
             auto authority=admission(DeviceId::cuda(0),DeviceId::rocm(0),256);
             cuda.track_initialization_lifetime=rocm.track_initialization_lifetime=true;
             cuda.throw_cold_query=true;cuda.forbid_early_retirement=true;rocm.forbid_early_retirement=true;
             (void)transfer.createCapturedTransferChannel(*authority,DeviceId::cpu(),DeviceId::cuda(0),producer_stream,DeviceId::rocm(0),consumer_stream,256);
-        },"recorded cold query failure");
+        }, ::testing::ExitedWithCode(77), "");
     }
 
     TEST_F(CapturedTransferChannelBindingTest, ColdInitializationRequiresExistingOriginalWorkersBeforePhysicalCreation)

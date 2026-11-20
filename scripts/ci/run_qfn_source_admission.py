@@ -197,9 +197,13 @@ def observed_native_isa_cohorts(observed: dict, backend: str, native_isa: str) -
         uuid = device.get('uuid')
         numa = device.get('numa_node')
         if (not isinstance(uuid, str) or not uuid or uuid in uuids
-                or type(numa) is not int or numa < 0):
+                or type(numa) is not int or numa < -1):
             raise ValueError('missing or duplicate observed pipeline UUID/NUMA authority')
         uuids.add(uuid)
+        if numa == -1:
+            # Unknown PCI locality is a valid observation, but cannot establish
+            # an original NUMA-owned pipeline cohort. Leave it unqualified.
+            continue
         by_numa.setdefault(numa, []).append(device)
     return by_numa
 

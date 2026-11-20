@@ -229,11 +229,7 @@ namespace llaminar2
             input.position_ids_device = mtp_verifier_position_ids_dev_;
             input.sequence_lengths_device = static_cast<const int32_t *>(mtp_verifier_request_lengths_dev_);
             input.seq_len = geometry.verifier_rows;
-            if (mtpVerifierGraphFamily() == MTPVerifierGraphFamily::ExactRows &&
-                mtpVerifierExecutionRole() == MTPVerifierExecutionRole::HostedCapturedTransactions &&
-                mtp_graph_owner_plan_.ownsControllerExecutables())
-                input.captured_verifier_extent = CapturedVerifierExtent::exactHostedRequest(
-                    input.device, DeviceRowRange::deviceCounted(input.seq_len, input.sequence_lengths_device));
+            input.captured_verifier_extent = retainedMTPVerifierExtent(input.seq_len);
             input.real_seq_len = geometry.draft_depth + 1;
             input.bucket_seq_len = input.real_seq_len < input.seq_len ? input.seq_len : 0;
             input.position_offset = input.token_offset = 1;

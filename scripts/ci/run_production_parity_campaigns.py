@@ -715,6 +715,8 @@ def _as_string_list(value: Any) -> list[str]:
 
 def discover_production_parity_unit_tests(
     build_dir: Path,
+    *,
+    scope_label: str | None = None,
 ) -> tuple[str, ...]:
     """Discover and validate the complete device-free unit prerequisite.
 
@@ -723,6 +725,7 @@ def discover_production_parity_unit_tests(
     a ``V2_Unit_*`` entry without the Unit label, or a Unit-labelled entry
     outside the canonical namespace.  CMake's ``v2_unit_gate`` owns executable
     construction; Python never copies its target list.
+    A scope label restricts validation to a CMake-declared subset.
     """
 
     completed = subprocess.run(
@@ -748,6 +751,8 @@ def discover_production_parity_unit_tests(
         name = str(test.get("name", ""))
         properties = _property_map(test)
         labels = _as_string_list(properties.get("LABELS", []))
+        if scope_label is not None and scope_label not in labels:
+            continue
         has_unit_name = name.startswith(PRODUCTION_PARITY_UNIT_PREFIX)
         has_unit_label = PRODUCTION_PARITY_UNIT_LABEL in labels
         if has_unit_name != has_unit_label:
@@ -933,6 +938,8 @@ def _preflight_execution_lane(
 
 def discover_production_test_preflight_registrations(
     build_dir: Path,
+    *,
+    scope_label: str | None = None,
 ) -> tuple[PreflightRegistration, ...]:
     """Discover and validate the model-free integration preflight from CTest.
 
@@ -941,6 +948,7 @@ def discover_production_test_preflight_registrations(
     required file, and has a short per-test timeout before it executes the
     label. This prevents a future registration edit from turning preflight into
     another model campaign or an unbounded wait.
+    A scope label restricts validation without changing native CTest indices.
     """
 
     completed = subprocess.run(
@@ -969,6 +977,8 @@ def discover_production_test_preflight_registrations(
         properties = _property_map(test)
         labels = frozenset(_as_string_list(properties.get("LABELS", [])))
         if PRODUCTION_TEST_PREFLIGHT_LABEL not in labels:
+            continue
+        if scope_label is not None and scope_label not in labels:
             continue
         if not name.startswith("V2_Integration_") or "Integration" not in labels:
             raise RuntimeError(
@@ -1026,16 +1036,24 @@ def discover_production_test_preflight_registrations(
 
 
 def preflight_optional_hardware_requirements(
-    registrations: Iterable[PreflightRegistration],
+    registrations: Iterable[PreflightRegistration], *, shared_capacity: bool = False,
 ) -> dict[str, dict]:
     """Compile declared optional geometry from the original CMake labels and MPI command."""
     requirements = {}
+    peer_contracts = {"DirectedPeerEdge": "directed-edge", "CompletePeerAccess": "complete",
+                      "NoDirectedPeerPair": "no-directed-pair"}
     for row in registrations:
+        peer_labels = row.labels & peer_contracts.keys()
         isa_labels = sorted(label for label in row.labels if label.startswith("NativeISA"))
         stage_labels = sorted(label for label in row.labels if label.startswith("StageSizes"))
         rank_labels = sorted(label for label in row.labels if label.startswith("RankSizes"))
+        context_cases = [label.removeprefix("MaximumContext") for label in row.labels
+                         if label.startswith("MaximumContext")]
         if "HardwareOptional" not in row.labels:
-            if row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"} or isa_labels or stage_labels or rank_labels or any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels):
+            if (context_cases or isa_labels or stage_labels or rank_labels or peer_labels or
+                    row.labels & {"LocalHostDevices", "ROCmHostNativeAtomics",
+                                  "IndependentNUMAReporters", "NUMALocalOrdinal0"} or
+                    any(label.startswith(("CUDADevices", "ROCmDevices")) for label in row.labels)):
                 raise RuntimeError("optional ISA/stage labels require HardwareOptional: " + row.name)
             continue
         device_labels = sorted(label for label in row.labels if label.startswith("Devices"))
@@ -1045,19 +1063,30 @@ def preflight_optional_hardware_requirements(
                 or any(not re.fullmatch(r"RankSizes[1-9][0-9]*x[1-9][0-9]*", label) for label in rank_labels)):
             raise RuntimeError("malformed optional native geometry: " + row.name)
         backends = row.labels & {"CUDA", "ROCm"}
+        local_host = "LocalHostDevices" in row.labels
+        independent_reporters = "IndependentNUMAReporters" in row.labels
+        if independent_reporters and (backends != {"CUDA", "ROCm"} or "DistinctNUMARanks" in row.labels):
+            raise RuntimeError("independent reporters require both native families: " + row.name)
+        if local_host and (stage_labels or rank_labels or peer_labels or
+                           row.labels & {"DistinctNUMARanks", "IndependentNUMAReporters", "NUMALocalOrdinal0"}):
+            raise RuntimeError("local device counts cannot replace a topology contract: " + row.name)
         family_labels = sorted(label for label in row.labels
                                if label.startswith(("CUDADevices", "ROCmDevices")))
         if family_labels:
-            if (backends != {"CUDA", "ROCm"} or len(family_labels) != 2
-                    or len(device_labels) != 1 or isa_labels or stage_labels or rank_labels or row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"}
+            if (row.labels & {"ROCmHostNativeAtomics", "NUMALocalOrdinal0"} or context_cases or backends != {"CUDA", "ROCm"} or len(family_labels) != 2
+                    or len(device_labels) != 1 or isa_labels or stage_labels or rank_labels or peer_labels
                     or any(re.fullmatch(r"(?:CUDA|ROCm)Devices[1-9][0-9]*", label) is None for label in family_labels)):
                 raise RuntimeError("ambiguous optional mixed-family geometry: " + row.name)
             degrees = {label.split("Devices")[0].lower(): int(label.split("Devices")[1])
                        for label in family_labels}
             if set(degrees) != {"cuda", "rocm"} or sum(degrees.values()) != int(device_labels[0][7:]):
                 raise RuntimeError("inconsistent optional mixed-family geometry: " + row.name)
-            requirement = {"backend_degrees": degrees, "mpi_ranks": row.mpi_ranks,
-                "locality": "two-distinct-numa-local-ranks" if "DistinctNUMARanks" in row.labels
+            # NO_MPI runs a single process that can own both local devices.
+            # Keep rank-qualified geometries tied to their actual MPI launch.
+            ranks = 1 if local_host and row.mpi_ranks is None else row.mpi_ranks
+            requirement = {"backend_degrees": degrees, "mpi_ranks": ranks,
+                "locality": "local-host" if local_host else "independent-numa-reporters" if independent_reporters
+                            else "two-distinct-numa-local-ranks" if "DistinctNUMARanks" in row.labels
                             else "original-numa-local-rank"}
             try:
                 validate_optional_native_cohort_requirement(requirement)
@@ -1072,12 +1101,20 @@ def preflight_optional_hardware_requirements(
             raise RuntimeError("unsupported optional native geometry: " + row.name)
         try:
             requirement = {"backend": next(iter(backends)).lower(), "degree": int(device_labels[0][7:]),
-                "locality": "two-distinct-numa-local-ranks" if distinct_ranks else "original-numa-local-rank"}
-            peer_labels = row.labels & {"DirectedPeerEdge", "NoDirectedPeerPair"}
+                "locality": "local-host" if local_host else "two-distinct-numa-local-ranks" if distinct_ranks else "original-numa-local-rank"}
+            if "NUMALocalOrdinal0" in row.labels:
+                requirement["ordinal"] = 0
+            if "ROCmHostNativeAtomics" in row.labels:
+                requirement["requires_host_native_atomics"] = True
+            if context_cases:
+                if len(context_cases) != 1:
+                    raise ValueError("ambiguous maximum-context physical requirement")
+                requirement["maximum_context_case"] = context_cases[0]
+                requirement["capacity_basis"] = "free" if shared_capacity else "total"
             if len(peer_labels) > 1:
                 raise ValueError("conflicting optional directed peer geometry")
             if peer_labels:
-                requirement["peer_access"] = "directed-edge" if "DirectedPeerEdge" in peer_labels else "no-directed-pair"
+                requirement["peer_access"] = peer_contracts[next(iter(peer_labels))]
                 requirement["mpi_ranks"] = row.mpi_ranks
             if isa_labels:
                 requirement["native_isa"] = isa_labels[0].removeprefix("NativeISA-")
@@ -1111,7 +1148,16 @@ def preflight_hardware_qualification(
     return result
 
 
-def observe_preflight_hardware(build_dir: Path, timeout: float | None) -> dict:
+def native_hardware_environment(overrides: dict[str, str] | None = None) -> dict[str, str]:
+    """Use the original hardware ISA regardless of developer shell overrides."""
+    environment = os.environ.copy()
+    if overrides:
+        environment.update(overrides)
+    environment.pop("HSA_OVERRIDE_GFX_VERSION", None)
+    return environment
+
+
+def observe_preflight_hardware(build_dir: Path, timeout: float | None, *, shared_capacity: bool = False) -> dict:
     """Reuse the original native exporter, including its MPI and backend retirement.
 
     Native/query/parse failure is fatal, never an empty physical inventory.
@@ -1132,11 +1178,11 @@ def observe_preflight_hardware(build_dir: Path, timeout: float | None) -> dict:
     binary = Path(binaries.pop()).resolve(strict=True)
     with tempfile.TemporaryDirectory(prefix="preflight-native-hardware-") as directory:
         path = Path(directory).resolve() / "hardware.json"
-        completed = subprocess.run([str(binary.resolve(strict=True)),
-            f"--qfn-source-hardware-inventory={path}"], check=True,
-            env={**os.environ, "HWLOC_COMPONENTS": "-gl,-opencl",
+        option = "--shared-preflight-hardware-inventory" if shared_capacity else "--preflight-hardware-inventory"
+        completed = subprocess.run([str(binary.resolve(strict=True)), f"{option}={path}"], check=True,
+            env=native_hardware_environment({"HWLOC_COMPONENTS": "-gl,-opencl",
                 "LLAMINAR_FORCE_CPU_ONLY_STARTUP": "0", "LLAMINAR_SKIP_CUDA_STARTUP": "0",
-                "LLAMINAR_SKIP_ROCM_STARTUP": "0"},
+                "LLAMINAR_SKIP_ROCM_STARTUP": "0"}),
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
             timeout=limit)
         if completed.stdout:
@@ -3566,10 +3612,7 @@ def _run_process(
 
     # The registered native workload must observe real hardware ISA identity,
     # including when a developer shell inherited an old homogeneous-host spoof.
-    environment = os.environ.copy()
-    if environment_overrides:
-        environment.update(environment_overrides)
-    environment.pop("HSA_OVERRIDE_GFX_VERSION", None)
+    environment = native_hardware_environment(environment_overrides)
     process = subprocess.Popen(
         command,
         start_new_session=True,
@@ -3817,9 +3860,10 @@ def _run_preflight_parallel_processes(
     deadline = None if timeout_seconds is None else time.monotonic() + timeout_seconds
     results: dict[PreflightExecutionLane, int] = {}
     failed = False
+    environment = native_hardware_environment()
     try:
         for lane, command in commands.items():
-            processes[lane] = subprocess.Popen(command, start_new_session=True)
+            processes[lane] = subprocess.Popen(command, start_new_session=True, env=environment)
         while len(results) != len(processes):
             for lane, process in processes.items():
                 if lane in results:

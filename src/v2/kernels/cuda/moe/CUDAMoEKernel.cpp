@@ -16,9 +16,13 @@
  * IQ4_XS physical format 24 preserves the original half base and raw six-bit
  * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
  * schedule are unchanged; the coefficient is storage metadata, never a minimum.
+ * Decode refreshes only its selected expert descriptors from the acquired
+ * bank; prefill continues to publish the complete grouped descriptor plan.
  */
 
+#include "kernels/common/MoERuntimeDescriptorLaunch.h"
 #include "kernels/common/RouterQ8Launch.h"
+#include "kernels/common/OriginalM1HiddenQ8Publication.h"
 #include "CUDAMoEKernel.h"
 #include "CUDARouterQ8Prefill.h"
 #include "kernels/common/MoEGroupedFloatingPrefillKernels.h"
@@ -145,7 +149,8 @@ namespace
         const llaminar2::DeviceNativeQuantisedMatrixDesc *secondary,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        llaminar2::MoEDecodeDescriptorSource descriptor_source)
     {
         llaminar2::PersistentWorkspacePublicationKey key{
             .word0 = static_cast<std::uint64_t>(
@@ -154,7 +159,7 @@ namespace
                 static_cast<std::uint32_t>(d_model)),
             .word2 = static_cast<std::uint64_t>(
                 static_cast<std::uint32_t>(intermediate)),
-            .word3 = secondary ? 2U : 1U,
+            .word3 = (secondary ? 2U : 1U) | (static_cast<std::uint64_t>(descriptor_source) << 16U),
         };
         key.identity_words.reserve(
             static_cast<std::size_t>(num_experts) *
@@ -191,7 +196,8 @@ namespace
         llaminar2::DeviceMoEWeightFormat format,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        llaminar2::MoEDecodeDescriptorSource descriptor_source)
     {
         llaminar2::PersistentWorkspacePublicationKey key{
             .word0 = static_cast<std::uint64_t>(
@@ -201,6 +207,7 @@ namespace
             .word2 = static_cast<std::uint64_t>(
                 static_cast<std::uint32_t>(intermediate)),
             .word3 = 0x100U | (secondary ? 2U : 1U) |
+                     (static_cast<std::uint64_t>(descriptor_source) << 16U) |
                      (static_cast<std::uint64_t>(format) << 32U),
         };
         key.identity_words.reserve(
@@ -1261,7 +1268,7 @@ extern "C"
         float *legacy_indices, float *legacy_weights,
         int num_experts, int top_k, bool normalize_weights,
         bool write_legacy_outputs, bool update_runtime_histogram,
-        bool fully_replicated_local_rows,
+        llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy,
         void *runtime_layers,
         const void *rebalance_plan_entries,
         uint32_t rebalance_plan_capacity,
@@ -1274,7 +1281,8 @@ extern "C"
         int rebalance_target_layer,
         uint32_t rebalance_command_buffer_count,
         const int32_t *absolute_position_ids,
-        int device_idx, void *stream);
+        int device_idx, void *stream,
+        const int32_t *active_row_count_device);
 
     bool cudaMoE_softmax_topk_decode_unique_owner_runtime(
         float *logits,
@@ -1287,14 +1295,15 @@ extern "C"
         bool write_legacy_outputs,
         bool update_runtime_histogram,
         int device_idx,
-        void *stream);
+        void *stream,
+        const int32_t *active_row_count_device);
 
     bool cudaMoE_decode_route_select_runtime(
         const int *expert_indices, const float *expert_weights,
         void *runtime_layer,
         float *legacy_indices, float *legacy_weights,
         int num_experts, int top_k, bool write_legacy_outputs,
-        bool update_runtime_histogram, int device_idx, void *stream);
+        bool update_runtime_histogram, llaminar2::RoutedExpertRowExecutionPolicy row_execution_policy, int device_idx, void *stream);
 
     bool cudaMoE_device_rebalance_controller(
         void *runtime_layers,
@@ -1774,25 +1783,6 @@ extern "C"
         int top_k,
         const void *transfer_status,
         const void *apply_status,
-        int device_idx,
-        void *stream);
-
-    bool cudaMoE_materialize_runtime_prefill_descriptor_tables(
-        const void *runtime,
-        llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
-        llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
-        llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
-        int num_experts,
-        int device_idx,
-        void *stream);
-
-    bool cudaMoE_materialize_runtime_floating_descriptor_tables(
-        const void *runtime,
-        llaminar2::DeviceMoEFloatingMatrixDesc *gate_descs,
-        llaminar2::DeviceMoEFloatingMatrixDesc *up_descs,
-        llaminar2::DeviceMoEFloatingMatrixDesc *down_descs,
-        int num_experts,
-        llaminar2::DeviceMoEWeightFormat format,
         int device_idx,
         void *stream);
 
@@ -2610,6 +2600,9 @@ namespace llaminar2
 
     void CUDAMoEKernel::clearWorkspaceScratchBindings() noexcept
     {
+        if(original_m1_hidden_q8_read_)
+            original_m1_hidden_q8_read_lifecycle_=OriginalM1HiddenQ8ReadLifecycle::Invalidated;
+        original_m1_hidden_q8_read_.reset();
         grouped_prefill_grouping_.invalidate();
         d_staging_indices_ = nullptr;
         d_staging_weights_ = nullptr;
@@ -2719,6 +2712,13 @@ namespace llaminar2
             return false;
         }
 
+        // Source2 consumes live descriptors from its runtime bank. An empty
+        // original template needs local initialization only: allocation E is
+        // not an H2D communication extent. Keep the same slot and ready event.
+        const bool empty_original_image = table.original_family.valid() &&
+            (floating ? (std::all_of(table.host_floating_descs.begin(),table.host_floating_descs.end(),isBlankGroupedFloatingDesc))
+                      : (std::all_of(table.host_descs.begin(),table.host_descs.end(),isBlankGroupedDesc)));
+
         if (floating)
         {
             const size_t desc_bytes =
@@ -2733,7 +2733,7 @@ namespace llaminar2
                         table.weight_format,
                         table.num_experts,
                         table.d_model,
-                        table.intermediate),
+                        table.intermediate, table.descriptor_source),
                     MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                     [&](std::size_t slot) -> std::shared_ptr<void>
                     {
@@ -2773,12 +2773,9 @@ namespace llaminar2
                                     }
                                     delete value;
                                 });
-                        err = cudaMemcpyAsync(
-                            device_descs,
-                            table.host_floating_descs.data(),
-                            desc_bytes,
-                            cudaMemcpyHostToDevice,
-                            stream);
+                        err = empty_original_image
+                            ? cudaMemsetAsync(device_descs,0,desc_bytes,stream)
+                            : cudaMemcpyAsync(device_descs,table.host_floating_descs.data(),desc_bytes,cudaMemcpyHostToDevice,stream);
                         if (err != cudaSuccess)
                             return {};
                         err = cudaEventRecord(ready_event, stream);
@@ -2819,7 +2816,7 @@ namespace llaminar2
                     nullptr,
                     table.num_experts,
                     table.d_model,
-                    table.intermediate),
+                    table.intermediate, table.descriptor_source),
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                 [&](std::size_t slot) -> std::shared_ptr<void>
                 {
@@ -2867,12 +2864,9 @@ namespace llaminar2
                                 delete value;
                             });
 
-                    err = cudaMemcpyAsync(
-                        device_descs,
-                        table.host_descs.data(),
-                        desc_bytes,
-                        cudaMemcpyHostToDevice,
-                        stream);
+                    err = empty_original_image
+                            ? cudaMemsetAsync(device_descs,0,desc_bytes,stream)
+                            : cudaMemcpyAsync(device_descs,table.host_descs.data(),desc_bytes,cudaMemcpyHostToDevice,stream);
                     if (err != cudaSuccess)
                     {
                         LOG_ERROR("[CUDAMoEKernel] Grouped down descriptor "
@@ -2953,6 +2947,15 @@ namespace llaminar2
             return false;
         }
 
+        // Source2 consumes live descriptors from its runtime bank. An empty
+        // original template needs local initialization only: allocation E is
+        // not an H2D communication extent. Keep the same slot and ready event.
+        const bool empty_original_image = table.original_family.valid() &&
+            (floating ? (std::all_of(table.host_floating_gate_descs.begin(),table.host_floating_gate_descs.end(),isBlankGroupedFloatingDesc) &&
+               std::all_of(table.host_floating_up_descs.begin(),table.host_floating_up_descs.end(),isBlankGroupedFloatingDesc))
+                      : (std::all_of(table.host_gate_descs.begin(),table.host_gate_descs.end(),isBlankGroupedDesc) &&
+               std::all_of(table.host_up_descs.begin(),table.host_up_descs.end(),isBlankGroupedDesc)));
+
         if (floating)
         {
             const size_t desc_bytes =
@@ -2967,7 +2970,7 @@ namespace llaminar2
                         table.weight_format,
                         table.num_experts,
                         table.d_model,
-                        table.intermediate),
+                        table.intermediate, table.descriptor_source),
                     MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                     [&](std::size_t slot) -> std::shared_ptr<void>
                     {
@@ -3017,20 +3020,14 @@ namespace llaminar2
                                     }
                                     delete value;
                                 });
-                        err = cudaMemcpyAsync(
-                            device_gate_descs,
-                            table.host_floating_gate_descs.data(),
-                            desc_bytes,
-                            cudaMemcpyHostToDevice,
-                            stream);
+                        err = empty_original_image
+                            ? cudaMemsetAsync(device_gate_descs,0,desc_bytes,stream)
+                            : cudaMemcpyAsync(device_gate_descs,table.host_floating_gate_descs.data(),desc_bytes,cudaMemcpyHostToDevice,stream);
                         if (err != cudaSuccess)
                             return {};
-                        err = cudaMemcpyAsync(
-                            device_up_descs,
-                            table.host_floating_up_descs.data(),
-                            desc_bytes,
-                            cudaMemcpyHostToDevice,
-                            stream);
+                        err = empty_original_image
+                            ? cudaMemsetAsync(device_up_descs,0,desc_bytes,stream)
+                            : cudaMemcpyAsync(device_up_descs,table.host_floating_up_descs.data(),desc_bytes,cudaMemcpyHostToDevice,stream);
                         if (err != cudaSuccess)
                             std::terminate();
                         err = cudaEventRecord(ready_event, stream);
@@ -3074,7 +3071,7 @@ namespace llaminar2
                     table.host_up_descs.data(),
                     table.num_experts,
                     table.d_model,
-                    table.intermediate),
+                    table.intermediate, table.descriptor_source),
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
                 [&](std::size_t slot) -> std::shared_ptr<void>
                 {
@@ -3132,12 +3129,9 @@ namespace llaminar2
                                 delete value;
                             });
 
-                    err = cudaMemcpyAsync(
-                        device_gate_descs,
-                        table.host_gate_descs.data(),
-                        desc_bytes,
-                        cudaMemcpyHostToDevice,
-                        stream);
+                    err = empty_original_image
+                            ? cudaMemsetAsync(device_gate_descs,0,desc_bytes,stream)
+                            : cudaMemcpyAsync(device_gate_descs,table.host_gate_descs.data(),desc_bytes,cudaMemcpyHostToDevice,stream);
                     if (err != cudaSuccess)
                     {
                         LOG_ERROR("[CUDAMoEKernel] Grouped gate descriptor "
@@ -3145,12 +3139,9 @@ namespace llaminar2
                                   << cudaGetErrorString(err));
                         return {};
                     }
-                    err = cudaMemcpyAsync(
-                        device_up_descs,
-                        table.host_up_descs.data(),
-                        desc_bytes,
-                        cudaMemcpyHostToDevice,
-                        stream);
+                    err = empty_original_image
+                            ? cudaMemsetAsync(device_up_descs,0,desc_bytes,stream)
+                            : cudaMemcpyAsync(device_up_descs,table.host_up_descs.data(),desc_bytes,cudaMemcpyHostToDevice,stream);
                     if (err != cudaSuccess)
                     {
                         LOG_ERROR("[CUDAMoEKernel] Grouped up descriptor H2D "
@@ -3732,6 +3723,49 @@ namespace llaminar2
         return true;
     }
 
+    bool CUDAMoEKernel::prepareOriginalM1HiddenQ8Publication(const TensorBase* hidden,DeviceRowRange rows)
+    {
+        const auto identity=rows.captureIdentity();auto& publication=router_q8_hidden_publication_;
+        if(isGraphCaptureActive()||!publication||!publication->requiredOriginalM1Source()||
+           hidden!=publication->requiredOriginalM1Source()||identity!=DeviceRowRange::fullyActive(1).captureIdentity()||!workspace_)
+            throw std::invalid_argument("Original M1 hidden Q8 requires its cold declared fully-active source");
+        const auto stream=getStream();const int width=publication->requiredOriginalM1Width();
+        if(router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumer) {
+            if(!publication->original_m1_binding)
+                publication->original_m1_binding=std::make_shared<OriginalM1HiddenQ8Binding>(
+                    DeviceId::cuda(device_ordinal_),*hidden,width,stream,*workspace_,OriginalM1HiddenQ8Bank::OriginalCUDA);
+            publication->original_m1_binding->validate(*hidden,stream,workspace_);
+        } else {
+            if(!publication->original_m1_binding)throw std::logic_error("Original M1 hidden Q8 producer must prepare before its required reader");
+            if(original_m1_hidden_q8_read_lifecycle_==OriginalM1HiddenQ8ReadLifecycle::Invalidated)
+                throw std::logic_error("Original M1 hidden Q8 reader was retired by hard scratch reset");
+            if(!original_m1_hidden_q8_read_)
+                original_m1_hidden_q8_read_=std::make_shared<OriginalM1HiddenQ8ReadView>(
+                    publication->original_m1_binding,*hidden,stream,*workspace_);
+            original_m1_hidden_q8_read_->validate(*hidden,stream,workspace_);
+            original_m1_hidden_q8_read_lifecycle_=OriginalM1HiddenQ8ReadLifecycle::Prepared;
+        }
+        return true;
+    }
+
+    std::uint64_t CUDAMoEKernel::originalM1HiddenQ8BindingSignature() const
+    {
+        if(!router_q8_hidden_publication_||!router_q8_hidden_publication_->requiredOriginalM1Source())return 0;
+        const auto& publication=*router_q8_hidden_publication_;
+        if(publication.original_m1_binding) {
+            const auto stream=ExplicitGPUStream(gpu_stream_).get();
+            if(original_m1_hidden_q8_read_lifecycle_==OriginalM1HiddenQ8ReadLifecycle::Invalidated)
+                throw std::logic_error("Original M1 hidden Q8 reader lost its prepared scratch lifetime");
+            if(router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumer)
+                publication.original_m1_binding->validate(*publication.requiredOriginalM1Source(),stream,workspace_);
+            else if(original_m1_hidden_q8_read_)
+                original_m1_hidden_q8_read_->validate(*publication.requiredOriginalM1Source(),stream,workspace_);
+        }
+        // Declaration identity stays stable before/after first cold preparation;
+        // leases independently authenticate every embedded pointer on replay.
+        return 0x4d31513800000001ULL;
+    }
+
     bool CUDAMoEKernel::prepareRequiredRouterQ8Hidden(int rows, int width, int top_k)
     {
         if (!router_q8_hidden_publication_ ||
@@ -3794,6 +3828,9 @@ namespace llaminar2
 
         publication->backend = DeviceType::CUDA;
         publication->device_ordinal = device_ordinal_;
+        if(router_q8_hidden_publication_&&router_q8_hidden_publication_->original_m1_binding&&
+           (publication!=router_q8_hidden_publication_||access!=router_q8_publication_access_))
+            throw std::logic_error("Captured original M1 hidden Q8 publication/access cannot be rebound");
         router_q8_hidden_publication_ = std::move(publication);
         router_q8_publication_access_ = access;
         return true;
@@ -3840,8 +3877,19 @@ namespace llaminar2
     bool CUDAMoEKernel::canReuseRouterQ8Hidden(
         const float *source,
         int rows,
-        int d_model) const noexcept
+        int d_model) const
     {
+        if(router_q8_hidden_publication_&&router_q8_hidden_publication_->requiredOriginalM1Source()) {
+            const auto& p=*router_q8_hidden_publication_;const auto& binding=p.original_m1_binding;
+            if(!binding||rows!=1||d_model!=p.requiredOriginalM1Width()||source!=binding->source())
+                throw std::logic_error("Required original M1 hidden Q8 source/row geometry is absent");
+            (void)originalM1HiddenQ8BindingSignature();
+            if(p.backend!=DeviceType::CUDA||p.device_ordinal!=device_ordinal_||p.d_model_capacity<d_model||p.blocks_per_row_capacity<d_model/32||
+               p.source_rows!=source||p.quantized_rows!=binding->codes()||p.row_scales!=binding->scales()||p.published_rows!=1||
+               (p.capture_recorded&&!isGraphCaptureActive()))
+                throw std::logic_error("Required original M1 hidden Q8 payload/provenance is absent");
+            return true;
+        }
         return routerQ8HiddenReuseBlockReason(source, rows, d_model) == nullptr;
     }
 
@@ -5401,7 +5449,8 @@ namespace llaminar2
                                           bool write_legacy_outputs,
                                           bool update_runtime_histogram,
                                           const int32_t *absolute_position_ids_device,
-                                          RoutedExpertRowExecutionPolicy row_execution_policy)
+                                          RoutedExpertRowExecutionPolicy row_execution_policy,
+        const int32_t *active_row_count_device)
     {
         void *stream = requireStream("CUDAMoEKernel::decodeRouteSelect");
         const DeviceId device = deviceId();
@@ -5481,6 +5530,12 @@ namespace llaminar2
                     {{"m", "1"}, {"k", std::to_string(d_model)},
                      {"weight", "fp16"}, {"activation", "fp16_rne"}, {"accumulation", "fp32"}});
             invalidateRouterQ8HiddenPublication();
+            // Runtime M1 can serve the grouped MTP bridge. Preserve floating
+            // router arithmetic while honoring its cold shared-consumer Q8
+            // demand; ordinary decode with no such consumer launches nothing.
+            if (!publishRequiredRouterQ8Hidden(d_hidden, /*rows=*/1, d_model,
+                    top_k, active_row_count_device))
+                return false;
             const bool route_ok = gate_is_fp32
                                       ? cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
                                                              /*seq_len=*/1, d_model, num_experts,
@@ -5495,6 +5550,7 @@ namespace llaminar2
                 return false;
         }
         const bool unique_owner_route =
+            row_execution_policy == RoutedExpertRowExecutionPolicy::ParticipantAssigned &&
             prepared_decode_resident_set_policy_ ==
             RoutedExpertResidentSetPolicy::UniqueOwner;
         const bool route_ready = unique_owner_route
@@ -5509,7 +5565,8 @@ namespace llaminar2
                                            write_legacy_outputs,
                                            update_runtime_histogram,
                                            device_ordinal_,
-                                           stream)
+                                           stream,
+                                           active_row_count_device)
                                      : cudaMoE_softmax_topk_decode_runtime(
                                            d_route_logits_,
                                            runtime_layer,
@@ -5520,8 +5577,7 @@ namespace llaminar2
                                            normalize_weights,
                                            write_legacy_outputs,
                                            update_runtime_histogram,
-                                           row_execution_policy ==
-                                               RoutedExpertRowExecutionPolicy::FullyReplicatedLocal,
+                                           row_execution_policy,
                                            nullptr,
                                            nullptr,
                                            0u,
@@ -5535,7 +5591,8 @@ namespace llaminar2
                                            1u,
                                            absolute_position_ids_device,
                                            device_ordinal_,
-                                           stream);
+                                           stream,
+                                           active_row_count_device);
         if (!route_ready)
             return false;
 
@@ -5567,7 +5624,8 @@ namespace llaminar2
         int rebalance_target_layer,
         uint32_t rebalance_command_buffer_count,
         const int32_t *absolute_position_ids_device,
-        RoutedExpertRowExecutionPolicy row_execution_policy)
+        RoutedExpertRowExecutionPolicy row_execution_policy,
+        const int32_t *active_row_count_device)
     {
         void *stream = requireStream("CUDAMoEKernel::decodeRouteSelectWithReadyRebalanceApply");
         const DeviceId device = deviceId();
@@ -5655,6 +5713,12 @@ namespace llaminar2
                     {{"m", "1"}, {"k", std::to_string(d_model)},
                      {"weight", "fp16"}, {"activation", "fp16_rne"}, {"accumulation", "fp32"}});
             invalidateRouterQ8HiddenPublication();
+            // Runtime M1 can serve the grouped MTP bridge. Preserve floating
+            // router arithmetic while honoring its cold shared-consumer Q8
+            // demand; ordinary decode with no such consumer launches nothing.
+            if (!publishRequiredRouterQ8Hidden(d_hidden, /*rows=*/1, d_model,
+                    top_k, active_row_count_device))
+                return false;
             const bool route_ok = gate_is_fp32
                                       ? cudaMoE_route_logits(d_hidden, static_cast<const float *>(d_gate), d_route_logits_,
                                                              /*seq_len=*/1, d_model, num_experts,
@@ -5674,8 +5738,7 @@ namespace llaminar2
                 legacy_indices, legacy_weights,
                 num_experts, top_k, normalize_weights,
                 write_legacy_outputs, update_runtime_histogram,
-                row_execution_policy ==
-                    RoutedExpertRowExecutionPolicy::FullyReplicatedLocal,
+                row_execution_policy,
                 runtime_layers,
                 rebalance_plan_entries,
                 rebalance_plan_capacity,
@@ -5688,7 +5751,8 @@ namespace llaminar2
                 rebalance_target_layer,
                 rebalance_command_buffer_count,
                 absolute_position_ids_device,
-                device_ordinal_, stream))
+                device_ordinal_, stream,
+                active_row_count_device))
             return false;
 
         if (write_legacy_outputs)
@@ -7002,6 +7066,12 @@ namespace llaminar2
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if ((gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (expected_projections == DeviceMoEProjectionSet::IntermediateShard) ||
+            (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (expected_projections == DeviceMoEProjectionSet::IntermediateShard))
+            return false;
+
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
             !down_table.valid || !down_table.deviceReady() ||
             gateup_table.weight_format != down_table.weight_format ||
@@ -7105,6 +7175,12 @@ namespace llaminar2
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if ((gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (expected_projections == DeviceMoEProjectionSet::IntermediateShard) ||
+            (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (expected_projections == DeviceMoEProjectionSet::IntermediateShard))
+            return false;
+
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
             !down_table.valid || !down_table.deviceReady() ||
             gateup_table.weight_format != down_table.weight_format ||
@@ -7518,8 +7594,15 @@ namespace llaminar2
         int num_experts,
         int d_model,
         int intermediate,
-        MoEDecodeDescriptorSource descriptor_source)
+        MoEDecodeDescriptorSource descriptor_source,
+        const MoEIntermediateShardDescriptorDeclaration *original_family)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return -1;
+        if (original_family &&
+            (descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable ||
+             !original_family->validFor(DeviceId::cuda(device_ordinal_),num_experts,d_model,intermediate) ||
+             original_family->weightFormat() != DeviceMoEWeightFormat::NativeQuantised)) return -1;
+
         if (!down_descs || num_experts <= 0 || d_model <= 0 || intermediate <= 0 || (intermediate % 32) != 0)
             return -1;
         if (rejectCudaPersistentMetadataMutationDuringCapture(
@@ -7531,20 +7614,21 @@ namespace llaminar2
             return -1;
 
         const bool runtime_mutable =
-            descriptor_source ==
-            MoEDecodeDescriptorSource::RuntimePlacementTable;
+            moEDecodeUsesRuntimeDescriptors(descriptor_source);
         if (!runtime_mutable &&
             descriptor_source !=
                 MoEDecodeDescriptorSource::StaticDescriptorTable)
         {
             return -1;
         }
-        NativeQuantisedExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope = original_family
+            ? original_family->nativeDownEnvelope() : NativeQuantisedExecutionFormatEnvelope{};
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
             if (isBlankGroupedDesc(desc))
                 continue;
+            if (original_family && !original_family->matchesNativeDown(desc)) return -1;
 
             if (!validateCudaGroupedDescShape(desc, d_model, intermediate))
             {
@@ -7552,7 +7636,7 @@ namespace llaminar2
                           << expert_id);
                 return -1;
             }
-            if (!addNativeQuantisedExecutionFormat(
+            if (!original_family && !addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
                     NativeQuantisedSourceIdentity{
@@ -7609,6 +7693,7 @@ namespace llaminar2
         {
             const auto &existing = grouped_down_desc_tables_[index];
             if (!existing.valid ||
+                !existing.original_family.sameIdentity(original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{}) ||
                 existing.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
                 !existing.device_descs ||
                 existing.num_experts != num_experts ||
@@ -7637,6 +7722,7 @@ namespace llaminar2
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
         table.descriptor_source = descriptor_source;
+        table.original_family = original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{};
         table.weight_format = DeviceMoEWeightFormat::NativeQuantised;
         table.valid = true;
         if (!publishGroupedDownDescriptorTable(
@@ -7655,8 +7741,15 @@ namespace llaminar2
         int num_experts,
         int d_model,
         int intermediate,
-        MoEDecodeDescriptorSource descriptor_source)
+        MoEDecodeDescriptorSource descriptor_source,
+        const MoEIntermediateShardDescriptorDeclaration *original_family)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return -1;
+        if (original_family &&
+            (descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable ||
+             !original_family->validFor(DeviceId::cuda(device_ordinal_),num_experts,d_model,intermediate) ||
+             original_family->weightFormat() != DeviceMoEWeightFormat::NativeQuantised)) return -1;
+
         if (!gate_descs || !up_descs || num_experts <= 0 || d_model <= 0 || intermediate <= 0 || (d_model % 32) != 0)
             return -1;
         if (rejectCudaPersistentMetadataMutationDuringCapture(
@@ -7668,15 +7761,15 @@ namespace llaminar2
             return -1;
 
         const bool runtime_mutable =
-            descriptor_source ==
-            MoEDecodeDescriptorSource::RuntimePlacementTable;
+            moEDecodeUsesRuntimeDescriptors(descriptor_source);
         if (!runtime_mutable &&
             descriptor_source !=
                 MoEDecodeDescriptorSource::StaticDescriptorTable)
         {
             return -1;
         }
-        NativeQuantisedExecutionFormatEnvelope format_envelope;
+        NativeQuantisedExecutionFormatEnvelope format_envelope = original_family
+            ? original_family->nativeGateUpEnvelope() : NativeQuantisedExecutionFormatEnvelope{};
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -7692,6 +7785,7 @@ namespace llaminar2
                 return -1;
             }
 
+            if (original_family && !original_family->matchesNativeGateUp(gate_desc,up_desc)) return -1;
             if (!gate_desc.valid() || !up_desc.valid() ||
                 !areNativeQuantisedGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
                 !validateCudaGroupedDescShape(gate_desc, intermediate, d_model) ||
@@ -7716,7 +7810,7 @@ namespace llaminar2
                     },
                     runtime_mutable);
             };
-            if (!add_descriptor(gate_desc) || !add_descriptor(up_desc))
+            if (!original_family && (!add_descriptor(gate_desc) || !add_descriptor(up_desc)))
             {
                 return -1;
             }
@@ -7762,6 +7856,7 @@ namespace llaminar2
         {
             const auto &existing = grouped_gateup_desc_tables_[index];
             if (!existing.valid ||
+                !existing.original_family.sameIdentity(original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{}) ||
                 existing.weight_format != DeviceMoEWeightFormat::NativeQuantised ||
                 !existing.device_gate_descs ||
                 !existing.device_up_descs ||
@@ -7794,6 +7889,7 @@ namespace llaminar2
         table.codebook_mask = codebook_mask;
         table.policy_codebook_mask = policy_codebook_mask;
         table.descriptor_source = descriptor_source;
+        table.original_family = original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{};
         table.weight_format = DeviceMoEWeightFormat::NativeQuantised;
         table.valid = true;
         if (!publishGroupedGateUpDescriptorTable(
@@ -7811,8 +7907,16 @@ namespace llaminar2
         DeviceMoEWeightFormat weight_format,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source,
+        const MoEIntermediateShardDescriptorDeclaration *original_family)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return -1;
+        if (original_family &&
+            (descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable ||
+             !original_family->validFor(DeviceId::cuda(device_ordinal_),num_experts,d_model,intermediate) ||
+             original_family->weightFormat() != weight_format)) return -1;
+
         if (!down_descs ||
             !deviceMoEWeightFormatIsFloating(weight_format) ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0)
@@ -7834,11 +7938,12 @@ namespace llaminar2
             const auto &desc = down_descs[expert];
             if (isBlankGroupedFloatingDesc(desc))
                 continue;
+            if (original_family && !original_family->matchesFloatingDown(desc)) return -1;
             if (!validateGroupedFloatingDesc(desc, d_model, intermediate))
                 return -1;
             any_live = true;
         }
-        if (!any_live)
+        if (!any_live && !original_family)
             return -1;
 
         const size_t desc_bytes =
@@ -7847,11 +7952,13 @@ namespace llaminar2
         for (size_t index = 0; index < grouped_down_desc_tables_.size(); ++index)
         {
             const auto &existing = grouped_down_desc_tables_[index];
-            if (!existing.valid || existing.weight_format != weight_format ||
+            if (!existing.valid ||
+                !existing.original_family.sameIdentity(original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{}) || existing.weight_format != weight_format ||
                 !existing.device_floating_descs ||
                 existing.num_experts != num_experts ||
                 existing.d_model != d_model ||
                 existing.intermediate != intermediate ||
+                existing.descriptor_source != descriptor_source ||
                 existing.host_floating_descs.size() !=
                     static_cast<size_t>(num_experts))
             {
@@ -7873,6 +7980,8 @@ namespace llaminar2
         table.d_model = d_model;
         table.intermediate = intermediate;
         table.weight_format = weight_format;
+        table.descriptor_source = descriptor_source;
+        table.original_family = original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{};
         table.valid = true;
         if (!publishGroupedDownDescriptorTable(
                 table,
@@ -7890,8 +7999,16 @@ namespace llaminar2
         DeviceMoEWeightFormat weight_format,
         int num_experts,
         int d_model,
-        int intermediate)
+        int intermediate,
+        MoEDecodeDescriptorSource descriptor_source,
+        const MoEIntermediateShardDescriptorDeclaration *original_family)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return -1;
+        if (original_family &&
+            (descriptor_source != MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable ||
+             !original_family->validFor(DeviceId::cuda(device_ordinal_),num_experts,d_model,intermediate) ||
+             original_family->weightFormat() != weight_format)) return -1;
+
         if (!gate_descs || !up_descs ||
             !deviceMoEWeightFormatIsFloating(weight_format) ||
             num_experts <= 0 || d_model <= 0 || intermediate <= 0)
@@ -7918,6 +8035,7 @@ namespace llaminar2
                     continue;
                 return -1;
             }
+            if (original_family && !original_family->matchesFloatingGateUp(gate_descs[expert],up_descs[expert])) return -1;
             if (!validateGroupedFloatingDesc(
                     gate_descs[expert], intermediate, d_model) ||
                 !validateGroupedFloatingDesc(
@@ -7927,7 +8045,7 @@ namespace llaminar2
             }
             any_live = true;
         }
-        if (!any_live)
+        if (!any_live && !original_family)
             return -1;
 
         const size_t desc_bytes =
@@ -7936,12 +8054,14 @@ namespace llaminar2
         for (size_t index = 0; index < grouped_gateup_desc_tables_.size(); ++index)
         {
             const auto &existing = grouped_gateup_desc_tables_[index];
-            if (!existing.valid || existing.weight_format != weight_format ||
+            if (!existing.valid ||
+                !existing.original_family.sameIdentity(original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{}) || existing.weight_format != weight_format ||
                 !existing.device_floating_gate_descs ||
                 !existing.device_floating_up_descs ||
                 existing.num_experts != num_experts ||
                 existing.d_model != d_model ||
                 existing.intermediate != intermediate ||
+                existing.descriptor_source != descriptor_source ||
                 existing.host_floating_gate_descs.size() !=
                     static_cast<size_t>(num_experts) ||
                 existing.host_floating_up_descs.size() !=
@@ -7971,6 +8091,8 @@ namespace llaminar2
         table.d_model = d_model;
         table.intermediate = intermediate;
         table.weight_format = weight_format;
+        table.descriptor_source = descriptor_source;
+        table.original_family = original_family ? *original_family : MoEIntermediateShardDescriptorDeclaration{};
         table.valid = true;
         if (!publishGroupedGateUpDescriptorTable(
                 table,
@@ -8017,17 +8139,18 @@ namespace llaminar2
         }
 
         const bool runtime_mutable =
-            table.descriptor_source ==
-            MoEDecodeDescriptorSource::RuntimePlacementTable;
-        NativeQuantisedExecutionFormatEnvelope format_envelope;
+            moEDecodeUsesRuntimeDescriptors(table.descriptor_source);
+        NativeQuantisedExecutionFormatEnvelope format_envelope = table.original_family.valid()
+            ? table.original_family.nativeDownEnvelope() : NativeQuantisedExecutionFormatEnvelope{};
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &desc = down_descs[expert_id];
             if (isBlankGroupedDesc(desc))
                 continue;
+            if (table.original_family.valid() && !table.original_family.matchesNativeDown(desc)) return false;
             if (!validateCudaGroupedDescShape(desc, d_model, intermediate))
                 return false;
-            if (!addNativeQuantisedExecutionFormat(
+            if (!table.original_family.valid() && !addNativeQuantisedExecutionFormat(
                     format_envelope,
                     desc.codebook_id,
                     NativeQuantisedSourceIdentity{
@@ -8073,7 +8196,7 @@ namespace llaminar2
                     nullptr,
                     num_experts,
                     d_model,
-                    intermediate),
+                    intermediate, table.descriptor_source),
                 table.workspace_publication,
                 table.workspace_slot,
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
@@ -8151,9 +8274,9 @@ namespace llaminar2
         }
 
         const bool runtime_mutable =
-            table.descriptor_source ==
-            MoEDecodeDescriptorSource::RuntimePlacementTable;
-        NativeQuantisedExecutionFormatEnvelope format_envelope;
+            moEDecodeUsesRuntimeDescriptors(table.descriptor_source);
+        NativeQuantisedExecutionFormatEnvelope format_envelope = table.original_family.valid()
+            ? table.original_family.nativeGateUpEnvelope() : NativeQuantisedExecutionFormatEnvelope{};
         for (int expert_id = 0; expert_id < num_experts; ++expert_id)
         {
             const auto &gate_desc = gate_descs[expert_id];
@@ -8166,6 +8289,7 @@ namespace llaminar2
                     continue;
                 return false;
             }
+            if (table.original_family.valid() && !table.original_family.matchesNativeGateUp(gate_desc,up_desc)) return false;
             if (!gate_desc.valid() || !up_desc.valid() ||
                 !areNativeQuantisedGateUpCodebooksCompatible(gate_desc.codebook_id, up_desc.codebook_id) ||
                 !validateCudaGroupedDescShape(gate_desc, intermediate, d_model) ||
@@ -8188,7 +8312,7 @@ namespace llaminar2
                     },
                     runtime_mutable);
             };
-            if (!add_descriptor(gate_desc) || !add_descriptor(up_desc))
+            if (!table.original_family.valid() && (!add_descriptor(gate_desc) || !add_descriptor(up_desc)))
             {
                 return false;
             }
@@ -8224,7 +8348,7 @@ namespace llaminar2
                     up_descs,
                     num_experts,
                     d_model,
-                    intermediate),
+                    intermediate, table.descriptor_source),
                 table.workspace_publication,
                 table.workspace_slot,
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
@@ -8343,7 +8467,7 @@ namespace llaminar2
                     weight_format,
                     num_experts,
                     d_model,
-                    intermediate),
+                    intermediate, table.descriptor_source),
                 table.workspace_publication,
                 table.workspace_slot,
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
@@ -8449,7 +8573,7 @@ namespace llaminar2
                     weight_format,
                     num_experts,
                     d_model,
-                    intermediate),
+                    intermediate, table.descriptor_source),
                 table.workspace_publication,
                 table.workspace_slot,
                 MoEWorkspaceBuffers::kGroupedDescriptorTableSlots,
@@ -8962,6 +9086,16 @@ namespace llaminar2
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
+        if (execution.isIntermediateShard() ||
+            (gateup_desc_table_id >= 0 && static_cast<size_t>(gateup_desc_table_id) < grouped_gateup_desc_tables_.size() &&
+             grouped_gateup_desc_tables_[gateup_desc_table_id].descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) ||
+            (down_desc_table_id >= 0 && static_cast<size_t>(down_desc_table_id) < grouped_down_desc_tables_.size() &&
+             grouped_down_desc_tables_[down_desc_table_id].descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable))
+        {
+            LOG_ERROR("Intermediate-shard partial execution requires the acquired runtime plan and original cohort binding");
+            return false;
+        }
+
 if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top_k <= 0 ||
             seq_len > std::numeric_limits<int>::max() / top_k ||
             execution.modelColumns() != d_model)
@@ -9401,6 +9535,13 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         const MoEPrefillProjectionExecution &execution,
         ITensor *canonical_route_contributions)
     {
+        if (execution.isIntermediateShard() != runtime_host_layer.intermediate_shard.enabled() ||
+            (execution.isIntermediateShard() &&
+             (runtime_host_layer.intermediate_shard.modelColumns() != static_cast<uint32_t>(d_model) ||
+              runtime_host_layer.intermediate_shard.localIntermediateColumns() != static_cast<uint32_t>(intermediate) ||
+              !canonical_route_contributions)))
+            return false;
+
         grouped_prefill_grouping_.invalidate();
         if (!device_runtime_layer)
             return false;
@@ -9446,6 +9587,12 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_desc_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_desc_table_id];
+        if ((gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (execution.isIntermediateShard()) ||
+            (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (execution.isIntermediateShard()))
+            return false;
+
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
@@ -9580,7 +9727,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                 {{"seq_len", std::to_string(seq_len)},
                  {"top_k", std::to_string(top_k)},
                  {"active_expert_slots", std::to_string(active_expert_slots)},
-                 {"descriptor_source", "runtime_table"},
+                 {"descriptor_source", execution.isIntermediateShard() ? "runtime_intermediate_shard" : "runtime_table"},
                  {"weight_format", std::to_string(static_cast<uint32_t>(
                                        gateup_table.weight_format))}});
             return true;
@@ -9752,7 +9899,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                 device.to_string(),
                 {{"seq_len", std::to_string(seq_len)},
                  {"top_k", std::to_string(top_k)},
-                 {"descriptor_source", "runtime_table"},
+                 {"descriptor_source", execution.isIntermediateShard() ? "runtime_intermediate_shard" : "runtime_table"},
                  {"reason", active_expert_slots <= 0
                                 ? "no_active_experts"
                                 : (router_q8_reuse_block_reason
@@ -9857,7 +10004,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                 device.to_string(),
                 {{"seq_len", std::to_string(seq_len)},
                  {"top_k", std::to_string(top_k)},
-                 {"descriptor_source", "runtime_table"}});
+                 {"descriptor_source", execution.isIntermediateShard() ? "runtime_intermediate_shard" : "runtime_table"}});
         }
 
         recordGroupedPrefillCounters(
@@ -10137,6 +10284,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
 
         const auto &table = grouped_gateup_desc_tables_[table_id];
+        if (table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         const bool floating =
             deviceMoEWeightFormatIsFloating(table.weight_format);
         if (!table.valid || !table.deviceReady() || table.num_experts <= 0 ||
@@ -10286,6 +10436,33 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
 
         /* Both descriptor families use the same graph-owned expert-id and
          * output-pointer publications. Only the arithmetic kernel differs. */
+        const bool reuse_required_hidden=router_q8_hidden_publication_&&router_q8_hidden_publication_->requiredOriginalM1Source();
+        int8_t* original_hidden_codes=d_decode_hidden_int8_;
+        float* original_hidden_scales=d_decode_hidden_scales_;
+        if(reuse_required_hidden) {
+            const auto& publication=*router_q8_hidden_publication_;
+            if(floating)throw std::logic_error("Required M1 hidden Q8 reader has incompatible floating projection arithmetic");
+            if(router_q8_publication_access_==MoERouterQ8PublicationAccess::ProducerAndConsumer) {
+                if(!canReuseRouterQ8Hidden(d_hidden,1,d_model))throw std::logic_error("Required M1 routed hidden Q8 reader is absent");
+                original_hidden_codes=publication.original_m1_binding->codes();
+                original_hidden_scales=publication.original_m1_binding->scales();
+            } else {
+            if(!original_m1_hidden_q8_read_||publication.backend!=DeviceType::CUDA||publication.device_ordinal!=device_ordinal_||
+               publication.d_model_capacity<d_model||publication.blocks_per_row_capacity<d_model/32)
+                throw std::logic_error("Required M1 shared hidden Q8 reader was not cold prepared on its exact participant/width");
+            original_m1_hidden_q8_read_->validate(*input,getStream(),workspace_);
+            original_m1_hidden_q8_read_->requirePayload(publication.source_rows,publication.quantized_rows,publication.row_scales,
+                publication.published_rows,
+                publication.capture_recorded?OriginalM1HiddenQ8Use::CaptureRecording:OriginalM1HiddenQ8Use::OrderedEager,
+                isGraphCaptureActive()?OriginalM1HiddenQ8Use::CaptureRecording:OriginalM1HiddenQ8Use::OrderedEager);
+            // The original low-level ABI combines writable independent scratch
+            // with prequantized input. Only this sealed read view selects true;
+            // that arm never writes codes/scales. No caller supplies raw reuse.
+            original_hidden_codes=const_cast<int8_t*>(original_m1_hidden_q8_read_->codes());
+            original_hidden_scales=const_cast<float*>(original_m1_hidden_q8_read_->scales());
+            }
+        }
+
         const bool ok = floating
             ? cudaMoE_grouped_gate_up_floating_decode_table(
                   d_hidden,
@@ -10308,9 +10485,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                   fixed_device_expert_ids,
                   d_gate_ptrs,
                   d_up_ptrs,
-                  d_decode_hidden_int8_,
-                  d_decode_hidden_scales_,
-                  false,
+                  original_hidden_codes,
+                  original_hidden_scales,
+                  reuse_required_hidden,
                   d_grouped_gateup_gate_partials_,
                   d_grouped_gateup_up_partials_,
                   num_active,
@@ -10357,6 +10534,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
 
         const auto &table = grouped_down_desc_tables_[table_id];
+        if (table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         const bool floating =
             deviceMoEWeightFormatIsFloating(table.weight_format);
         if (!table.valid || !table.deviceReady() || table.num_experts <= 0 ||
@@ -10509,6 +10689,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
 
         const auto &table = grouped_gateup_desc_tables_[table_id];
+        if (table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         if (!table.valid || !table.device_gate_descs || !table.device_up_descs ||
             table.d_model != d_model || table.intermediate != intermediate)
         {
@@ -10700,6 +10883,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
 
         const auto &table = grouped_down_desc_tables_[table_id];
+        if (table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         if (!table.valid || !table.device_descs ||
             table.d_model != d_model || table.intermediate != intermediate)
         {
@@ -10858,8 +11044,11 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         const uint8_t *expert_mask,
         ITensor *canonical_route_contributions,
         DeviceMoELayerRuntime *runtime_layer,
-        MoEDecodeDescriptorSource descriptor_source)
+        MoEDecodeDescriptorSource descriptor_source,
+        MoEExplicitRouteDemand demand)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source) || !validMoEExplicitRouteDemand(demand)) return false;
+
         if (!input || !routing_indices || !routing_weights ||
             gateup_table_id < 0 || down_table_id < 0 || top_k <= 0 ||
             !output || d_model <= 0 || intermediate <= 0)
@@ -10873,6 +11062,15 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         }
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
+        if (static_cast<size_t>(down_table_id) >= grouped_down_desc_tables_.size()) return false;
+        const auto &down_table = grouped_down_desc_tables_[down_table_id];
+        if (!down_table.valid ||
+            (gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) ||
+            (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable))
+            return false;
+
         if (!gateup_table.valid || gateup_table.num_experts <= 0)
         {
             LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRouting] "
@@ -10880,8 +11078,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
         }
         const bool use_runtime_descriptors =
-            descriptor_source ==
-            MoEDecodeDescriptorSource::RuntimePlacementTable;
+            moEDecodeUsesRuntimeDescriptors(descriptor_source);
         if ((use_runtime_descriptors && (!runtime_layer || expert_mask)) ||
             (!use_runtime_descriptors && runtime_layer))
         {
@@ -10959,7 +11156,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
              * The explicit packet remains the route-value producer, while the
              * epoch-pinned runtime bank is the sole placement authority. This
              * existing selector drops non-local experts, publishes compact
-             * runtime top-k state, and increments selected/local histograms in
+             * runtime top-k state, and publishes selected/local histograms only when this packet owns demand in
              * the same captured stream transaction.
              */
             if (!cudaMoE_decode_route_select_runtime(
@@ -10971,7 +11168,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                     gateup_table.num_experts,
                     top_k,
                     /*write_legacy_outputs=*/false,
-                    /*update_runtime_histogram=*/true,
+                    /*update_runtime_histogram=*/demand == MoEExplicitRouteDemand::PublishDecode,
+                    descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable
+                        ? RoutedExpertRowExecutionPolicy::IntermediateShardLocal : RoutedExpertRowExecutionPolicy::ParticipantAssigned,
                     device_ordinal_,
                     stream))
             {
@@ -10992,9 +11191,10 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             intermediate,
             resolved_expert_ids,
             resolved_weights,
-            use_runtime_descriptors,
+            descriptor_source,
             /*allow_router_q8_reuse=*/false,
-            use_runtime_descriptors ? "routing_runtime" : "routing",
+            descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable
+                ? "runtime_intermediate_shard" : use_runtime_descriptors ? "routing_runtime" : "routing",
             canonical_route_contributions);
     }
 
@@ -11006,6 +11206,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         int intermediate,
         MoEDecodeDescriptorSource descriptor_source)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return false;
+
         void *stream = requireStream(
             "CUDAMoEKernel::prepareGroupedRuntimeDecodeLaunchState");
         if (isCudaMoEDecodeCaptureActive(stream))
@@ -11025,6 +11227,12 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         }
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_table_id];
+        if ((gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) ||
+            (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable))
+            return false;
+
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
@@ -11061,8 +11269,7 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
         }
 
-        if (descriptor_source ==
-            MoEDecodeDescriptorSource::RuntimePlacementTable)
+        if (moEDecodeUsesRuntimeDescriptors(descriptor_source))
         {
             DeviceNativeQuantisedMatrixDesc *runtime_gate_descs = nullptr;
             DeviceNativeQuantisedMatrixDesc *runtime_up_descs = nullptr;
@@ -11160,7 +11367,13 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
         }
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
+        if (gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         const auto &down_table = grouped_down_desc_tables_[down_table_id];
+        if (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
@@ -11293,6 +11506,8 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         MoEDecodeDescriptorSource descriptor_source,
         ITensor *canonical_route_contributions)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return false;
+
         if (!runtime_layer)
             return false;
 
@@ -11307,9 +11522,10 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             intermediate,
             runtimeTopKExpertIdsDevice(runtime_layer),
             runtimeTopKWeightsDevice(runtime_layer),
-            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable,
+            descriptor_source,
             /*allow_router_q8_reuse=*/true,
-            descriptor_source == MoEDecodeDescriptorSource::RuntimePlacementTable
+            descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable
+                ? "runtime_intermediate_shard" : moEDecodeUsesRuntimeDescriptors(descriptor_source)
                 ? "runtime"
                 : "runtime_static_table",
             canonical_route_contributions);
@@ -11326,11 +11542,15 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
         int intermediate,
         const int *d_expert_ids,
         const float *d_weights,
-        bool use_runtime_descriptors,
+        MoEDecodeDescriptorSource descriptor_source,
         bool allow_router_q8_reuse,
         const char *counter_source,
         ITensor *canonical_route_contributions)
     {
+        if (!validMoEDecodeDescriptorSource(descriptor_source)) return false;
+
+        const bool use_runtime_descriptors = moEDecodeUsesRuntimeDescriptors(descriptor_source);
+
         if (!input || gateup_table_id < 0 || down_table_id < 0 ||
             top_k <= 0 || !output || d_model <= 0 || intermediate <= 0)
             return false;
@@ -11347,6 +11567,12 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
 
         const auto &gateup_table = grouped_gateup_desc_tables_[gateup_table_id];
         const auto &down_table = grouped_down_desc_tables_[down_table_id];
+        if ((gateup_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) ||
+            (down_table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable) !=
+                (descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable))
+            return false;
+
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
@@ -11443,27 +11669,11 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
                           "failed to bind graph-owned runtime descriptor slots");
                 return false;
             }
-            const bool materialized = floating
-                ? cudaMoE_materialize_runtime_floating_descriptor_tables(
-                      runtime_layer,
-                      reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
-                          runtime_gate_descs),
-                      reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
-                          runtime_up_descs),
-                      reinterpret_cast<DeviceMoEFloatingMatrixDesc *>(
-                          runtime_down_descs),
-                      gateup_table.num_experts,
-                      gateup_table.weight_format,
-                      device_ordinal_,
-                      stream)
-                : cudaMoE_materialize_runtime_prefill_descriptor_tables(
-                      runtime_layer,
-                      runtime_gate_descs,
-                      runtime_up_descs,
-                      runtime_down_descs,
-                      gateup_table.num_experts,
-                      device_ordinal_,
-                      stream);
+            const bool materialized = cudaMoE_materialize_runtime_selected_decode_descriptors(
+                runtime_layer, d_expert_ids, runtime_gate_descs, runtime_up_descs,
+                runtime_down_descs, gateup_table.num_experts, top_k,
+                gateup_table.weight_format, device_ordinal_, stream,
+                moEDecodeProjectionSet(descriptor_source));
             if (!materialized)
             {
                 LOG_ERROR("[CUDAMoEKernel::groupedExpertDecodeFromRuntime] "
@@ -11694,6 +11904,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
 
         const auto &table = grouped_gateup_desc_tables_[table_id];
+        if (table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         if (!table.valid || !table.device_gate_descs || !table.device_up_descs ||
             table.num_experts <= 0 || table.d_model != d_model ||
             table.intermediate != intermediate)
@@ -11847,6 +12060,9 @@ if (seq_len <= 0 || d_model <= 0 || intermediate <= 0 || num_experts <= 0 || top
             return false;
 
         const auto &table = grouped_down_desc_tables_[table_id];
+        if (table.descriptor_source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable)
+            return false; // This legacy split/static API has no authenticated fragment-row contract.
+
         if (!table.valid || !table.device_descs || table.num_experts <= 0 ||
             table.d_model != d_model || table.intermediate != intermediate)
         {

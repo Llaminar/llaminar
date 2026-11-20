@@ -2,21 +2,23 @@
  * @file Test__Qwen4Exp_MTP_Admission.cpp
  * @brief Real paired-source serving admission without numerical reference setup.
  *
- * Plain GoogleTest fixtures enter the same production runner factory, startup
- * policy, PMA and initialization as serving. They never inherit parity SetUp,
- * resolve a gold pack, enable snapshots or execute model inference. The existing
+ * Plain GoogleTest fixtures use the production runner factory, startup policy,
+ * PMA and initialization without a golden pack. A focused retained-graph
+ * replay compares the public prefix bridge with the serial continuation. The
  * MPI integration main retires collective/GPU owners after runner destruction.
  */
 #include "Qwen4ExpMTPAdmissionCases.h"
 #include "config/OrchestrationConfigDocument.h"
 #include "config/OrchestrationConfigParser.h"
 #include "utils/TestOrchestrationHelper.h"
+#include "utils/PerfStatsCollector.h"
 #include "backends/BackendManager.h"
 #include "config/OrchestrationStartupPolicy.h"
 #include "execution/moe/MoEPipelinePreparedPlan.h"
 #include "execution/moe/MoEOverlayPhysicalResidencyFabric.h"
 #include "tensors/TensorKernels.h"
 #include "execution/mtp/MTPWeightManifest.h"
+#include "execution/mtp/MTPStateTransaction.h"
 #include "loaders/ModelContext.h"
 #include "loaders/PreparedWeightStore.h"
 #include "models/qwen4exp/Qwen4ExpSidecarManifest.h"
@@ -402,6 +404,96 @@ class Qwen4ExpMTPAdmissionTest : public ::testing::TestWithParam<Qwen4ExpMTPAdmi
 /** @test The declared R1 paired source and depth are prepared under the serving contract. */
 TEST_P(Qwen4ExpMTPAdmissionTest, PairedSourceInitializesWithoutReferencePack)
 { admitPairedSource(GetParam(), Qwen4ExpMTPAdmissionExecution::Active); }
+
+/** @test Replay a retained QFN MTP bridge whose absolute cache position is larger than one. */
+#ifdef HAVE_ROCM
+TEST(Qwen4ExpTensorShardedROCmTP4, Fixed3Retained3RestoredPrefixPlusOneMatchesSerialState)
+{
+    const auto &cases = qwen4ExpFullROCmTP4MTPAdmissionCases();
+    const auto fixed3 = std::find_if(cases.begin(), cases.end(), [](const auto &cell) {
+        return cell.policy == ModelParityMTP::Depth3;
+    });
+    ASSERT_NE(fixed3, cases.end());
+    auto cell = *fixed3;
+    // This fixed-depth regression exercises the one-row bridge. Retaining
+    // deeper, unreachable verifier graphs would dominate its setup time.
+    cell.retained_depth = cell.requestedDepth();
+    ASSERT_TRUE(cell.main.topology.expert_overlay_plan);
+    auto placement = std::make_shared<MoERoutedExpertPlacementPlan>(*cell.main.topology.expert_overlay_plan);
+    ASSERT_EQ(placement->domains.size(), 1u);
+    ASSERT_EQ(placement->domains.front().participants.size(), 4u);
+    placement->domains.front().routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+    placement->dense_domains = {placement->domains.front().toExecutionDomainDefinition()};
+    cell.main.topology.expert_overlay_plan = std::move(placement);
+    auto config = cell.config(Qwen4ExpMTPAdmissionExecution::Active,
+        Qwen4ExpMTPAdmissionPurpose::ProductionServing);
+    config.routed_expert_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+    config.prefix_cache.enabled = true;
+    config.prefix_cache.storage_mode = PrefixCacheStorageMode::Ram;
+    config.prefix_cache.block_size = 64;
+    config.prefix_cache.terminal_state = PrefixCacheTerminalStateMode::Auto;
+    publishOrchestrationStartupPolicy(config);
+    auto runner = TestOrchestrationHelper::create(config);
+    ASSERT_NE(runner, nullptr);
+    runner->disableSnapshotCapture();
+    ASSERT_TRUE(runner->initialize()) << runner->lastError();
+
+    std::vector<int32_t> prefix(config.prefix_cache.block_size);
+    for (std::size_t i = 0; i < prefix.size(); ++i)
+        prefix[i] = static_cast<int32_t>(100 + i);
+    const int32_t next_token = 200;
+    std::vector<int32_t> extended = prefix;
+    extended.push_back(next_token);
+    const PrefixProbeCapturePolicy state_capture{
+        .hash_full_kv_payloads = true,
+        .hash_gdn_device_state = true,
+        .hash_terminal_state = true,
+        .capture_device_logical_state = true,
+    };
+
+    ASSERT_TRUE(runner->prefill(prefix)) << runner->lastError();
+    const auto committed = runner->forceDecodeToken(next_token);
+    ASSERT_TRUE(committed.success()) << committed.error;
+    ASSERT_EQ(committed.returned_token_commit, ReturnedTokenCommitState::Committed);
+    const auto serial = runner->prefixStateProbe(state_capture);
+    ASSERT_EQ(serial.current_position, static_cast<int>(extended.size()));
+    ASSERT_FALSE(serial.kv_caches.empty());
+    ASSERT_FALSE(serial.mtp_kv_caches.empty());
+
+    // The native counter is published by replay, independently of whether the
+    // checkpoint was already cached or harvested by this request.
+    const auto bridge_count = [] {
+        std::uint64_t count = 0;
+        for (const auto &record : PerfStatsCollector::snapshot({"mtp"}))
+            if (record.name == "restored_prefix_decode_bridge_transactions")
+                count += record.count;
+        return count;
+    };
+    ASSERT_TRUE(runner->purgePrefixCache()) << runner->lastError();
+    runner->clearCache();
+    const auto before_cold = bridge_count();
+    ASSERT_TRUE(runner->prefill(extended)) << runner->lastError();
+    const auto cold = runner->prefixStateProbe(state_capture);
+    ASSERT_EQ(cold.prefix_request.matched_tokens, 0);
+    EXPECT_GT(bridge_count(), before_cold);
+    const auto cold_comparison = compareMTPRuntimeStateSnapshots(serial, cold);
+    EXPECT_TRUE(cold_comparison) << cold_comparison.reason;
+
+    ASSERT_TRUE(runner->purgePrefixCache()) << runner->lastError();
+    runner->clearCache();
+    ASSERT_TRUE(runner->prefill(prefix)) << runner->lastError();
+    runner->clearCache();
+    const auto before_restored = bridge_count();
+    ASSERT_TRUE(runner->prefill(extended)) << runner->lastError();
+    const auto restored = runner->prefixStateProbe(state_capture);
+    ASSERT_TRUE(restored.prefix_request.partial_hit);
+    EXPECT_EQ(restored.prefix_request.matched_tokens, static_cast<int>(prefix.size()));
+    EXPECT_EQ(restored.current_position, serial.current_position);
+    EXPECT_GT(bridge_count(), before_restored);
+    const auto comparison = compareMTPRuntimeStateSnapshots(serial, restored);
+    EXPECT_TRUE(comparison) << comparison.reason;
+}
+#endif
 INSTANTIATE_TEST_SUITE_P(Qwen4ExpMTPAdmission, Qwen4ExpMTPAdmissionTest,
     ::testing::ValuesIn(qwen4ExpMTPAdmissionCases()),
     [](const ::testing::TestParamInfo<Qwen4ExpMTPAdmissionCase> &info) { return info.param.testName(); });

@@ -11,11 +11,11 @@
 #include "integration/parity/ModelParityReleaseTopologies.h"
 #include "integration/parity/qwen36/Qwen36ModelParityDefinitions.h"
 #include "integration/parity/qwen38/Qwen38ModelParityDefinitions.h"
+#include "integration/parity/qwen4exp/Qwen4ExpReleaseCases.h"
 #include "config/OrchestrationConfigParser.h"
 
 #include <gtest/gtest.h>
 #include <nlohmann/json.hpp>
-#include <set>
 
 namespace llaminar2::test::parity
 {
@@ -30,83 +30,73 @@ namespace llaminar2::test::parity
             return OrchestrationConfigParser{}.parseArgs(argv.size(), argv.data());
         }
 
-        /** @return Existing dense/MoE definitions across CPU and both GPU vendors. */
-        std::vector<ModelParityDefinition> benchmarkDefinitions()
+        /** @return The same three dense and three QFN cells used by release certification. */
+        std::vector<ModelParityCase> benchmarkCells()
         {
-            auto definitions = qwen38::qwen38DenseMultiDeviceDefinitions();
-            definitions.push_back(qwen36::qwen36MoECPU2NodeTPParityDefinition());
-            for (const auto device : {GlobalDeviceAddress::cuda(0), GlobalDeviceAddress::rocm(0)})
-                definitions.push_back(qwen38::qwen38DenseParityDefinition(
-                    qwen36::qwen36SingleDeviceTopology("single", device), "/references"));
-            return definitions;
+            auto cases = qwen4exp::qwen4ExpReleaseCases();
+            for (const auto &definition : qwen38::qwen38DenseMultiDeviceDefinitions())
+                for (auto cell : expandModelParityDefinition(definition))
+                    if (cell.e2e_certification)
+                        cases.push_back(std::move(cell));
+            return cases;
         }
     }
 
     TEST(ModelParityBenchmarkProjection, PreservesIntentButUsesProductionDefaults)
     {
         const auto defaults = parseBenchmarkIntent({"--mtp", "--mtp-depth-policy", "dynamic"});
-        std::set<std::string> expected_topologies;
-        for (const auto &topology : modelParityReleaseTopologies())
-            expected_topologies.insert(topology.test_id);
-        ASSERT_FALSE(expected_topologies.empty());
-        std::set<std::string> tagged_topologies;
-        for (const auto &definition : benchmarkDefinitions())
-            for (const auto &cell : expandModelParityDefinition(definition))
-            {
-                if (!cell.e2e_certification)
-                {
-                    EXPECT_FALSE(expected_topologies.contains(cell.topology.test_id) &&
-                                 cell.mtp == ModelParityMTP::DynamicDepth);
-                    continue;
-                }
-                SCOPED_TRACE(cell.testName());
-                EXPECT_TRUE(tagged_topologies.insert(cell.topology.test_id).second);
-                const auto args = modelParityBenchmarkArguments(cell);
-                const auto config = parseBenchmarkIntent(args);
-                const auto intent = resolveOrchestrationIntent(config);
-                ASSERT_TRUE(std::holds_alternative<AutomaticOrchestrationRequest>(intent));
-                std::vector<DeviceType> devices;
-                for (const auto &participant : cell.topology.participants)
-                    devices.push_back(participant.address.device_type);
-                const auto &automatic = std::get<AutomaticOrchestrationRequest>(intent);
-                EXPECT_TRUE(automatic.allows(modelParityAutomaticStrategy(cell), devices));
-                devices.pop_back();
-                EXPECT_FALSE(automatic.allows(modelParityAutomaticStrategy(cell), devices));
-                EXPECT_EQ(config.activation_precision, "fp32");
-                EXPECT_EQ(config.kv_cache_precision, "fp16");
-                EXPECT_TRUE(config.prefix_cache.enabled);
-                EXPECT_TRUE(config.mtp.enabled);
+        const auto cells = benchmarkCells();
+        // Both release model families must exercise every code-owned topology.
+        ASSERT_EQ(cells.size(), 2 * modelParityReleaseTopologies().size());
+        for (const auto &cell : cells)
+        {
+            SCOPED_TRACE(cell.testName());
+            const auto args = modelParityBenchmarkArguments(cell);
+            const auto config = parseBenchmarkIntent(args);
+            const auto intent = resolveOrchestrationIntent(config);
+            ASSERT_TRUE(std::holds_alternative<AutomaticOrchestrationRequest>(intent));
+            std::vector<DeviceType> devices;
+            for (const auto &participant : cell.topology.participants)
+                devices.push_back(participant.address.device_type);
+            const auto &automatic = std::get<AutomaticOrchestrationRequest>(intent);
+            EXPECT_TRUE(automatic.allows(modelParityAutomaticStrategy(cell), devices));
+            devices.pop_back();
+            EXPECT_FALSE(automatic.allows(modelParityAutomaticStrategy(cell), devices));
+            EXPECT_EQ(config.activation_precision, "fp32");
+            EXPECT_EQ(config.kv_cache_precision, "fp16");
+            EXPECT_TRUE(config.prefix_cache.enabled);
+            EXPECT_EQ(config.mtp.enabled, cell.mtpEnabled());
+            if (cell.mtpEnabled())
                 EXPECT_EQ(config.mtp.depth_policy.mode, MTPDepthPolicyMode::Dynamic);
-                EXPECT_EQ(config.mtp.verify_mode, defaults.mtp.verify_mode);
-                EXPECT_EQ(config.mtp.draft_tokens, defaults.mtp.draft_tokens);
-                EXPECT_EQ(config.mtp.graph_capacity_draft_tokens, defaults.mtp.graph_capacity_draft_tokens);
-                EXPECT_EQ(config.mtp.depth_policy.initial_depth, defaults.mtp.depth_policy.initial_depth);
-                EXPECT_EQ(config.mtp.depth_policy.min_depth, defaults.mtp.depth_policy.min_depth);
-                EXPECT_EQ(config.mtp.depth_policy.max_depth, defaults.mtp.depth_policy.max_depth);
-                EXPECT_EQ(config.mtp.depth_policy.window_size, defaults.mtp.depth_policy.window_size);
-                EXPECT_EQ(config.mtp.depth_policy.min_samples, defaults.mtp.depth_policy.min_samples);
-                EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, defaults.mtp.depth_policy.cooldown_steps);
-                EXPECT_EQ(config.mtp.depth_policy.promote_consecutive_windows,
-                          defaults.mtp.depth_policy.promote_consecutive_windows);
-                EXPECT_EQ(config.moe_rebalance.window_size, defaults.moe_rebalance.window_size);
-                EXPECT_EQ(config.moe_rebalance.migration_transfer_slots, defaults.moe_rebalance.migration_transfer_slots);
-                EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, defaults.moe_rebalance.dynamic_max_swaps_per_layer);
-                EXPECT_EQ(config.moe_rebalance.device_min_maintenance_period_tokens,
-                          defaults.moe_rebalance.device_min_maintenance_period_tokens);
-                EXPECT_EQ(config.moe_routed_prefill.overlay_segment_rows, defaults.moe_routed_prefill.overlay_segment_rows);
+            EXPECT_EQ(config.mtp.verify_mode, defaults.mtp.verify_mode);
+            EXPECT_EQ(config.mtp.draft_tokens, defaults.mtp.draft_tokens);
+            EXPECT_EQ(config.mtp.graph_capacity_draft_tokens, defaults.mtp.graph_capacity_draft_tokens);
+            EXPECT_EQ(config.mtp.depth_policy.initial_depth, defaults.mtp.depth_policy.initial_depth);
+            EXPECT_EQ(config.mtp.depth_policy.min_depth, defaults.mtp.depth_policy.min_depth);
+            EXPECT_EQ(config.mtp.depth_policy.max_depth, defaults.mtp.depth_policy.max_depth);
+            EXPECT_EQ(config.mtp.depth_policy.window_size, defaults.mtp.depth_policy.window_size);
+            EXPECT_EQ(config.mtp.depth_policy.min_samples, defaults.mtp.depth_policy.min_samples);
+            EXPECT_EQ(config.mtp.depth_policy.cooldown_steps, defaults.mtp.depth_policy.cooldown_steps);
+            EXPECT_EQ(config.mtp.depth_policy.promote_consecutive_windows,
+                      defaults.mtp.depth_policy.promote_consecutive_windows);
+            EXPECT_EQ(config.moe_rebalance.window_size, defaults.moe_rebalance.window_size);
+            EXPECT_EQ(config.moe_rebalance.migration_transfer_slots, defaults.moe_rebalance.migration_transfer_slots);
+            EXPECT_EQ(config.moe_rebalance.dynamic_max_swaps_per_layer, defaults.moe_rebalance.dynamic_max_swaps_per_layer);
+            EXPECT_EQ(config.moe_rebalance.device_min_maintenance_period_tokens,
+                      defaults.moe_rebalance.device_min_maintenance_period_tokens);
+            EXPECT_EQ(config.moe_routed_prefill.overlay_segment_rows, defaults.moe_routed_prefill.overlay_segment_rows);
 
-                std::ostringstream out;
-                PrintTo(cell, &out);
-                const auto exported = nlohmann::json::parse(out.str());
-                EXPECT_EQ(exported["benchmark"]["schema"], 1);
-                EXPECT_EQ(exported["benchmark"]["policy"], "production_defaults");
-                EXPECT_EQ(exported["benchmark"]["args"], args);
-                EXPECT_EQ(exported["benchmark"]["context_length"], cell.e2e_certification->context_length);
-                EXPECT_EQ(exported["e2e"]["server_args"], modelParityServerArguments(
-                    cell, ModelParityRuntimePlacementProjection::AutomaticCell));
-                EXPECT_NE(exported["benchmark"]["args"], exported["e2e"]["server_args"]);
-            }
-        EXPECT_EQ(tagged_topologies, expected_topologies);
+            std::ostringstream out;
+            PrintTo(cell, &out);
+            const auto exported = nlohmann::json::parse(out.str());
+            EXPECT_EQ(exported["benchmark"]["schema"], 1);
+            EXPECT_EQ(exported["benchmark"]["policy"], "production_defaults");
+            EXPECT_EQ(exported["benchmark"]["args"], args);
+            EXPECT_EQ(exported["benchmark"]["context_length"], cell.e2e_certification->context_length);
+            EXPECT_EQ(exported["e2e"]["server_args"], modelParityServerArguments(
+                cell, ModelParityRuntimePlacementProjection::AutomaticCell));
+            EXPECT_NE(exported["benchmark"]["args"], exported["e2e"]["server_args"]);
+        }
     }
 
     TEST(ModelParityBenchmarkProjection, StressEconomicsCannotChangeTimingPolicy)

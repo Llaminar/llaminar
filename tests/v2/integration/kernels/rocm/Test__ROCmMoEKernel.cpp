@@ -39,6 +39,7 @@
 #include "utils/Assertions.h"
 #include "kernels/common/SamplingMath.h"
 #include "kernels/common/FloatingExpertNumericalContract.h"
+#include "kernels/common/MoERuntimeDescriptorLaunch.h"
 
 #ifdef HAVE_ROCM
 #include <hip/hip_runtime.h>
@@ -196,32 +197,6 @@ extern "C" bool hipMoE_softmax_topk_decode_equivalent_rows(
     int device_idx, void *stream,
     const int *device_effective_seq_len,
     void *deferred_selected_route_ledger = nullptr);
-
-extern "C" bool hipMoE_materialize_runtime_prefill_descriptor_tables(
-    const void *runtime,
-    llaminar2::DeviceNativeQuantisedMatrixDesc *gate_descs,
-    llaminar2::DeviceNativeQuantisedMatrixDesc *up_descs,
-    llaminar2::DeviceNativeQuantisedMatrixDesc *down_descs,
-    int num_experts,
-    int device_idx,
-    void *stream);
-
-/**
- * @brief Publish the original floating descriptor family into exact admitted tables.
- * @param runtime Actual immutable runtime placement bank selector.
- * @param gate Full gate descriptor output, retained through replay.
- * @param up Full up descriptor output, retained through replay.
- * @param down Full down descriptor output, retained through replay.
- * @param experts Complete original routed expert count.
- * @param format Original floating source scalar discriminator.
- * @param device Exact native endpoint ordinal.
- * @param stream Exact non-default publication stream.
- * @return Whether the checked production launch was submitted.
- */
-extern "C" bool hipMoE_materialize_runtime_floating_descriptor_tables(
-    const void *runtime, llaminar2::DeviceMoEFloatingMatrixDesc *gate,
-    llaminar2::DeviceMoEFloatingMatrixDesc *up, llaminar2::DeviceMoEFloatingMatrixDesc *down,
-    int experts, llaminar2::DeviceMoEWeightFormat format, int device, void *stream);
 
 extern "C" bool hipMoE_materialize_runtime_prefill_plan(
     const void *runtime,
@@ -2861,7 +2836,8 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
               hipSuccess);
     publicationGraph.emplace(0, stream, "complete runtime descriptor publication only");
     ASSERT_TRUE(hipMoE_materialize_runtime_prefill_descriptor_tables(
-        device_runtime, device_gate, device_up, device_down, num_experts, 0, stream));
+        device_runtime, device_gate, device_up, device_down, num_experts, 0, stream,
+        llaminar2::DeviceMoEProjectionSet::CompleteExpert));
     ASSERT_TRUE(hipMoE_materialize_runtime_prefill_plan(device_runtime, device_gate, device_up,
                                                         device_down, device_active, num_experts,
                                                         num_experts, 0, stream));
@@ -2884,7 +2860,8 @@ template <int num_experts> void proveRuntimeDescriptorPublicationCompleteDomain(
                                                          device_down, device_active, num_experts,
                                                          num_experts, 0, nullptr));
     EXPECT_FALSE(hipMoE_materialize_runtime_prefill_descriptor_tables(
-        device_runtime, device_gate, device_up, device_down, num_experts, 0, nullptr));
+        device_runtime, device_gate, device_up, device_down, num_experts, 0, nullptr,
+        llaminar2::DeviceMoEProjectionSet::CompleteExpert));
 
     ASSERT_EQ(hipMemcpyAsync(actual_gate.data(), device_gate,
                              actual_gate.size() * sizeof(DeviceNativeQuantisedMatrixDesc),
@@ -3045,7 +3022,8 @@ TEST(Test__ROCmMoEKernel, RuntimeFloatingDescriptorPublication512ExpertsCaptured
         }
         graph.emplace(0, stream, "floating complete-domain descriptor publication only");
         ASSERT_TRUE(hipMoE_materialize_runtime_floating_descriptor_tables(
-            nativeRuntime, gate, up, down, experts, format, 0, stream));
+            nativeRuntime, gate, up, down, experts, format, 0, stream,
+            llaminar2::DeviceMoEProjectionSet::CompleteExpert));
         ASSERT_TRUE(graph->finishAndInstantiate());
         for (int phase = 0; phase < 4; ++phase)
         {
@@ -29628,8 +29606,6 @@ TEST(Test__ROCmMoEKernel, IQ2SOriginalSourceEquationInCapturedFusedExpert)
 }
 
 #ifdef HAVE_ROCM
-extern "C" bool hipMoE_gate_logits_single_token_fp16_weights(
-    const float *,const void *,float *,int,int,int,void *);
 extern "C" bool hipMoE_gate_logits_fp16_decode_equivalent_rows(
     const float *,const void *,float *,int,int,int,int,void *,const int *);
 #endif

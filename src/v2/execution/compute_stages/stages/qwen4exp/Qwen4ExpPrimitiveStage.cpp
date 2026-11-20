@@ -8,6 +8,7 @@
  * accepted-prefix publication remain distinct semantic stages and storage banks.
  */
 #include "Qwen4ExpPrimitiveStage.h"
+#include "kernels/common/HCBranchNormSingleQ8Publication.h"
 #include "execution/local_execution/graph/IGraphBuilder.h"
 #include "backends/BackendManager.h"
 #include "execution/local_execution/graph/RequestInputPositionAdmission.h"
@@ -16,6 +17,7 @@
 #include "../../../../kernels/qwen4exp/Qwen4ExpValidation.h"
 #include "../../../../tensors/Tensors.h"
 #include <algorithm>
+#include <bit>
 #include <cmath>
 #include <cstdint>
 #include <limits>
@@ -156,6 +158,11 @@ Qwen4ExpPrimitiveStage::Qwen4ExpPrimitiveStage(Params params)
             require(a.input_role == BranchNormInputRole::Ordinary ||
                     a.input_role == BranchNormInputRole::PredictorHidden,
                     "QFN branch norm has an unknown mathematical input role");
+            if(a.single_q8)require(device().is_gpu()&&params_.rows.capacity==1&&!params_.rows.liveRows&&
+                a.hidden%32==0&&a.single_q8->device()==device()&&a.single_q8->width()==4*a.hidden&&
+                a.diagnostic_input_publication==DiagnosticInputPublication::None&&a.input_role==BranchNormInputRole::Ordinary&&
+                a.input.byteOffset==0&&a.output.byteOffset==0,
+                "HC norm SingleQ8 requires its exact original ordinary fully-active M1 producer");
             const bool predictor = a.input_role == BranchNormInputRole::PredictorHidden;
             if (predictor)
             {
@@ -202,6 +209,23 @@ Qwen4ExpPrimitiveStage::Qwen4ExpPrimitiveStage(Params params)
             add(a.block, rows, h, Access::Input, "block");
             add(a.gateLogits, rows, 4, Access::Input, "gate_logits");
             add(a.output, rows, 4*h, Access::Output, "output");
+        },
+        [&](const ResidualWriteBranchRMSNorm &a) {
+            const auto h = width(a.hidden);
+            require(std::isfinite(a.epsilon) && a.epsilon > 0,
+                    "Qwen4Exp fused next-branch RMS epsilon must be finite and positive");
+            add(a.residual,rows,4*h,Access::Input,"residual",AliasPolicy::ExactOutputAliasAllowed);
+            add(a.block,rows,h,Access::Input,"block");
+            add(a.gateLogits,rows,4,Access::Input,"gate_logits");
+            add(a.output,rows,4*h,Access::Output,"output");
+            addWeight(a.gain,4,h,"gain");
+            add(a.normalized,rows,4*h,Access::Output,"normalized");
+            // Residual alias permission belongs only to the original write.
+            // The normalized result must retain independent physical bytes.
+            require(a.normalized.tensor != a.residual.tensor ||
+                    a.normalized.byteOffset + rows*4*h*sizeof(float) <= a.residual.byteOffset ||
+                    a.residual.byteOffset + rows*4*h*sizeof(float) <= a.normalized.byteOffset,
+                    "Qwen4Exp fused normalized output must not overwrite original residual bytes");
         },
         [&](const NgramHash &a) {
             a.policy.validate();
@@ -272,7 +296,16 @@ void Qwen4ExpPrimitiveStage::validateAliases() const
                                        input.bytes() == output.bytes();
                     const bool permitted = input.alias == AliasPolicy::ExactOutputAliasAllowed;
                     require(exact && permitted, "Qwen4Exp stage forbids overlapping output and immutable input views");
-                }    for (const auto &output : operands_)
+                }
+    for (std::size_t index = 0; index < operands_.size(); ++index)
+        if (operands_[index].access == Access::Output)
+            for (std::size_t other = index + 1; other < operands_.size(); ++other)
+                if (operands_[other].access == Access::Output &&
+                    (operands_[index].tensor == operands_[other].tensor || operands_[index].buffer == operands_[other].buffer))
+                    require(operands_[index].byteOffset + operands_[index].bytes() <= operands_[other].byteOffset ||
+                            operands_[other].byteOffset + operands_[other].bytes() <= operands_[index].byteOffset,
+                            "Qwen4Exp stage requires disjoint output publication views");
+    for (const auto &output : operands_)
         if (output.access == Access::Output)
             for (const auto &weight : weights_)
                 require(output.tensor != weight.tensor,
@@ -284,6 +317,11 @@ bool Qwen4ExpPrimitiveStage::prepareGraphLaunch(IDeviceContext* context,void* st
     if(!context || context->deviceId()!=device() || (device().is_gpu() && !stream))
         throw std::invalid_argument("QFN primitive preparation requires its exact participant and explicit GPU stream");
     if(stream)setGPUStream(stream);
+    if(const auto* norm=std::get_if<BranchRMSNorm>(&params_.operation);norm&&norm->single_q8) {
+        if(isGraphCaptureActive())throw std::logic_error("HC norm SingleQ8 preparation belongs outside capture");
+        norm->single_q8->prepare(stream);
+        norm->single_q8->requireProducer(*norm->input.tensor,*norm->gain.tensor,*norm->output.tensor,norm->hidden,norm->epsilon,stream);
+    }
     if(hash_prepared_)hash_prepared_->seal();
     return true;
 }
@@ -360,12 +398,21 @@ bool Qwen4ExpPrimitiveStage::execute(IDeviceContext *context)
                         (begin + bytes <= end || end + bytes <= begin),
                         "QFN MTP diagnostic input must retain disjoint original physical bytes");
             }
-            kernels_->branchRMSNorm({rows,a.hidden,a.epsilon,input,weightPointer(a.gain),out(a.output)},stream);
+            if(a.single_q8) {
+                a.single_q8->requireProducer(*a.input.tensor,*a.gain.tensor,*a.output.tensor,a.hidden,a.epsilon,stream);
+                kernels_->branchRMSNormSingleQ8({{rows,a.hidden,a.epsilon,input,weightPointer(a.gain),out(a.output)},
+                    a.single_q8->codes(),a.single_q8->scales()},stream);
+                a.single_q8->recordProducer();
+            } else kernels_->branchRMSNorm({rows,a.hidden,a.epsilon,input,weightPointer(a.gain),out(a.output)},stream);
         },
         [&](const ResidualExpand &a) { kernels_->residualExpand({rows,a.hidden,f(a.input),out(a.output)},stream); },
         [&](const ResidualDown &a) { kernels_->residualDown({rows,a.lowRank,f(a.input),out(a.output)},stream); },
         [&](const ResidualRead &a) { kernels_->residualRead({rows,a.hidden,f(a.normalized),f(a.gateLogits),out(a.output)},stream); },
         [&](const ResidualWrite &a) { kernels_->residualWrite({rows,a.hidden,f(a.residual),f(a.block),f(a.gateLogits),out(a.output)},stream); },
+        [&](const ResidualWriteBranchRMSNorm &a) {
+            kernels_->residualWriteBranchRMSNorm({rows,a.hidden,a.epsilon,f(a.residual),f(a.block),
+                f(a.gateLogits),out(a.output),weightPointer(a.gain),out(a.normalized)},stream);
+        },
         [&](const NgramHash &a) {
             auto* output=pointer<std::int64_t>(a.outputWords,Access::Output);
             if(a.nextWindow)kernels_->ngramHashNextWindow({rows,intInput(a.tokens),i(a.priorTokens),output,a.policy,a.nextWindow->native()},stream);
@@ -406,8 +453,39 @@ uint64_t Qwen4ExpPrimitiveStage::graphCaptureVariantSignature() const
         for(auto word:hash->policy.offsets)mix(word);
         mix(hash->policy.eosToken);return value?value:1;
     }
+    if(const auto* fused=std::get_if<ResidualWriteBranchRMSNorm>(&params_.operation))
+    {
+        std::uint64_t value=1469598103934665603ULL;
+        const auto mix=[&](std::uint64_t word){value=(value^word)*1099511628211ULL;};
+        const auto tensor=[&](const TensorBase* root){
+            mix(reinterpret_cast<std::uintptr_t>(root));mix(root->size_bytes());
+            mix(reinterpret_cast<std::uintptr_t>(device().is_gpu()?root->gpu_data_ptr():root->raw_data()));};
+        const auto binding=[&](const auto& b){tensor(b.tensor);mix(static_cast<std::uint64_t>(b.buffer));mix(b.byteOffset);};
+        mix(0x574e4f524d000001ULL);mix(static_cast<std::uint64_t>(device().type));mix(device().ordinal);
+        mix(params_.rows.capacity);mix(fused->hidden);mix(std::bit_cast<std::uint32_t>(fused->epsilon));
+        mix(params_.rows.liveRows.has_value());
+        if(params_.rows.liveRows)
+            std::visit(Overload{
+                [&](Qwen4ExpIntBinding b){mix(0);binding(b);},
+                [&](Qwen4ExpNativeIntInput b){mix(1);mix(static_cast<std::uint64_t>(b.owner.type));
+                    mix(b.owner.ordinal);mix(reinterpret_cast<std::uintptr_t>(b.data));mix(b.capacity);}
+            },params_.rows.liveRows->value);
+        binding(fused->residual);binding(fused->block);binding(fused->gateLogits);binding(fused->output);
+        tensor(fused->gain.tensor);binding(fused->normalized);
+        return value?value:1;
+    }
     const auto *norm = std::get_if<BranchRMSNorm>(&params_.operation);
     if (!norm) return 0;
+    if(norm->single_q8) {
+        norm->single_q8->validateIfPrepared(hasGPUStream()?requireGPUStream():nullptr);
+        std::uint64_t h=0x48434e4f524d5138ULL;
+        const auto mix=[&](std::uint64_t v){h^=v+0x9e3779b97f4a7c15ULL+(h<<6)+(h>>2);};
+        mix(reinterpret_cast<std::uintptr_t>(norm->single_q8.get()));mix(params_.rows.capacity);
+        mix(norm->hidden);mix(std::bit_cast<std::uint32_t>(norm->epsilon));
+        for(const auto* tensor:std::array<const TensorBase*,3>{norm->input.tensor,norm->gain.tensor,norm->output.tensor})mix(reinterpret_cast<std::uintptr_t>(tensor));
+        mix(static_cast<std::uint64_t>(norm->input.buffer));mix(static_cast<std::uint64_t>(norm->output.buffer));
+        return h?h:1;
+    }
     return (norm->diagnostic_input_publication == DiagnosticInputPublication::MTPTerminalHidden ? uint64_t{1} : 0) |
         (norm->input_role == BranchNormInputRole::PredictorHidden ? uint64_t{2} : 0);
 }
@@ -432,6 +510,7 @@ ComputeStageType Qwen4ExpPrimitiveStage::type() const
         [](const ResidualDown &) { return ComputeStageType::QWEN4EXP_RESIDUAL_DOWN; },
         [](const ResidualRead &) { return ComputeStageType::QWEN4EXP_RESIDUAL_READ; },
         [](const ResidualWrite &) { return ComputeStageType::QWEN4EXP_RESIDUAL_WRITE; },
+        [](const ResidualWriteBranchRMSNorm &) { return ComputeStageType::QWEN4EXP_RESIDUAL_WRITE; },
         [](const NgramHash &) { return ComputeStageType::QWEN4EXP_NGRAM_HASH; },
         [](const PLEGate &) { return ComputeStageType::QWEN4EXP_PLE_GATE; },
         [](const PLEConv &) { return ComputeStageType::QWEN4EXP_PLE_CONV; },
@@ -449,6 +528,7 @@ std::size_t Qwen4ExpPrimitiveStage::estimatedFlops() const
         [=](const ResidualDown &a) { return rows*a.lowRank*6; },
         [=](const ResidualRead &a) { return rows*a.hidden*4*7; },
         [=](const ResidualWrite &a) { return rows*4*(a.hidden*2+6); },
+        [=](const ResidualWriteBranchRMSNorm &a) { return rows*4*(a.hidden*7+6); },
         [=](const NgramHash &) { return std::size_t{0}; },
         [=](const PLEGate &a) { return rows*4*(a.hidden*3+8); },
         [=](const PLEConv &a) { return rows*a.channels*15; },

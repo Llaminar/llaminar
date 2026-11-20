@@ -17,7 +17,7 @@ if(HAVE_CUDA AND TARGET v2_integration_captured_transfer_channel)
     add_v2_test(V2_Integration_CUDANativeProgramStackReplay
         COMMAND $<TARGET_FILE:v2_integration_captured_transfer_channel>
             --gtest_filter=CapturedTransferNativeProgramStack.CUDAOriginalSourceReplay
-        LABELS "V2;Integration;ProductionTestPreflight;CUDA;GPU;NativeCollective;GraphCapture;Replay;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;CUDA;GPU;NativeCollective;HardwareOptional;Devices2;GraphCapture;Replay;Regression"
         MPI_PROCS 2 NO_MODELS TIMEOUT 30 RESOURCE_LOCK "cuda_gpu_0;cuda_gpu_1")
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDANativeProgramStackReplay)
 endif()

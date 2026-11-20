@@ -151,6 +151,8 @@ namespace llaminar2
         void destroyEvent(void *event) override;
         void recordEvent(void *event, void *stream) override;
         bool recordEventChecked(void *event, void *stream) override;
+        /** @copydoc IWorkerGPUContext::recordCapturedTimingEventChecked */
+        bool recordCapturedTimingEventChecked(void *event, void *stream) override;
         void waitEvent(void *event, void *stream) override;
         bool waitEventChecked(void *event, void *stream) override;
         bool queryEventChecked(void *event, bool &ready) override;

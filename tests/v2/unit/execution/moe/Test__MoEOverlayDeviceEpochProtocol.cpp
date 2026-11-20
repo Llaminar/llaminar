@@ -1,11 +1,17 @@
 /**
  * @file Test__MoEOverlayDeviceEpochProtocol.cpp
  * @brief Adversarial CPU tests for captured ExpertOverlay device epoch RCU.
+ *
+ * The production CPU implementation replays guarded multi-member admission,
+ * sparse original IDs and variable roster extents without loading a model or
+ * creating devices. Malformed tails must fail before any arrival is published;
+ * request resets preserve the model-lifetime monotonic admission sequence.
  */
 
 #include "execution/moe/MoEOverlayDeviceEpochProtocol.h"
 #include "execution/moe/MoEOverlayRuntimeReaderDeadline.h"
 #include "../../../utils/DeviceEpochArenaTestMemory.h"
+#include "../../../utils/MoEOverlayEpochTestStorage.h"
 #include "execution/moe/DeviceMoEOverlayEpochArena.h"
 #include "execution/moe/MoEOverlayDeviceControllerABI.h"
 #include "execution/moe/MoEOverlayDeviceControllerRuntimeBinding.h"
@@ -328,9 +334,7 @@ namespace llaminar2::test
          SymmetricContinuationFreezesOneEpochAfterEveryLocalGuardArrives)
     {
         constexpr std::uint32_t kSiblingParticipant = 1u;
-        constexpr std::uint32_t kPublisherParticipant = 4u;
-        constexpr std::uint32_t kMask =
-            (1u << kSiblingParticipant) | (1u << kPublisherParticipant);
+        constexpr std::uint32_t kPublisherParticipant = 40u;
 
         std::array<DeviceMoEOverlayEpochControl, 2> controls{};
         for (auto &control : controls)
@@ -342,10 +346,9 @@ namespace llaminar2::test
             ASSERT_TRUE(protocol.publishReadyCandidate(2u).valid());
         }
 
-        MoEOverlayDeviceControllerInferenceEpochRecord barrier{};
-        barrier.participant_mask = kMask;
-        barrier.publisher_participant_id = kPublisherParticipant;
-        barrier.topology_fingerprint = 0xabc123u;
+        MoEOverlayEpochTestStorage<2> barrier_storage;
+        barrier_storage.initialize({kSiblingParticipant, kPublisherParticipant}, kPublisherParticipant);
+        auto &barrier = barrier_storage.record;
         barrier.epoch = 1u;
         std::uint64_t live_admission_epoch = 1u;
 
@@ -370,6 +373,7 @@ namespace llaminar2::test
                     {
                         .record = &barrier,
                         .participant_id = kPublisherParticipant,
+                        .storage_bytes = barrier_storage.bytes(),
                     });
             });
 
@@ -380,7 +384,7 @@ namespace llaminar2::test
         {
             publisher_arrived =
                 std::atomic_ref<std::uint64_t>(
-                    barrier.arrival_sequence[kPublisherParticipant])
+                    barrier_storage.arrivals[1])
                     .load(std::memory_order_acquire) == 1u;
             if (publisher_arrived)
                 break;
@@ -401,6 +405,7 @@ namespace llaminar2::test
                     {
                         .record = &barrier,
                         .participant_id = kSiblingParticipant,
+                        .storage_bytes = barrier_storage.bytes(),
                     });
             });
         publisher.join();
@@ -417,8 +422,8 @@ namespace llaminar2::test
         EXPECT_EQ(barrier.epoch, 2u);
         EXPECT_EQ(barrier.publication_sequence, 1u);
         EXPECT_EQ(
-            barrier.arrival_sequence[kPublisherParticipant], 1u);
-        EXPECT_EQ(barrier.arrival_sequence[kSiblingParticipant], 1u);
+            barrier_storage.arrivals[1], 1u);
+        EXPECT_EQ(barrier_storage.arrivals[0], 1u);
         EXPECT_EQ(controls[0].acquisitions_in_flight, 0u);
         EXPECT_EQ(controls[1].acquisitions_in_flight, 0u);
 
@@ -445,6 +450,7 @@ namespace llaminar2::test
                     {
                         .record = &barrier,
                         .participant_id = kSiblingParticipant,
+                        .storage_bytes = barrier_storage.bytes(),
                     });
             });
         std::thread publisher_second(
@@ -459,6 +465,7 @@ namespace llaminar2::test
                     {
                         .record = &barrier,
                         .participant_id = kPublisherParticipant,
+                        .storage_bytes = barrier_storage.bytes(),
                     });
             });
         sibling_first.join();
@@ -471,12 +478,104 @@ namespace llaminar2::test
         EXPECT_EQ(barrier.epoch, 1u);
         EXPECT_EQ(barrier.publication_sequence, 2u);
         EXPECT_EQ(
-            barrier.arrival_sequence[kPublisherParticipant], 2u);
-        EXPECT_EQ(barrier.arrival_sequence[kSiblingParticipant], 2u);
+            barrier_storage.arrivals[1], 2u);
+        EXPECT_EQ(barrier_storage.arrivals[0], 2u);
         ASSERT_TRUE(kernels[0].releaseMoEOverlayEpoch(
             launch, &controls[0], &tickets[0], &statuses[0]));
         ASSERT_TRUE(kernels[1].releaseMoEOverlayEpoch(
             launch, &controls[1], &tickets[1], &statuses[1]));
+    }
+
+    TEST(Test__MoEOverlayDeviceEpochProtocol, ExtentRosterAboveThirtyTwoReplaysAcrossRequestReset)
+    {
+        constexpr std::size_t count = 35u;
+        std::array<std::uint32_t, count> ids{};
+        for (std::size_t i = 0u; i < count; ++i) ids[i] = 11u + 3u * i;
+        MoEOverlayEpochTestStorage<count> storage;
+        storage.initialize(ids, ids.back());
+        ASSERT_EQ(reinterpret_cast<const std::byte *>(storage.ids.data()) -
+            reinterpret_cast<const std::byte *>(&storage.record), storage.record.member_ids_offset);
+        ASSERT_EQ(reinterpret_cast<const std::byte *>(storage.arrivals.data()) -
+            reinterpret_cast<const std::byte *>(&storage.record), storage.record.arrival_sequences_offset);
+        std::array<DeviceMoEOverlayEpochControl, count> controls{};
+        std::array<DeviceMoEOverlayEpochTicket, count> tickets{};
+        std::array<DeviceMoEOverlayEpochStatus, count> statuses{};
+        std::array<CPUMoEKernel, count> kernels{};
+        std::array<bool, count> results{};
+        for (auto &control : controls)
+            MoEOverlayDeviceEpochProtocol::initialize(control, 1u);
+        for (std::uint64_t request = 1u; request <= 3u; ++request)
+        {
+            // Controls and roster are model-lifetime authorities. Request
+            // release clears each ticket through the production CPU kernel;
+            // subsequent placement epochs use candidate publication and RCU
+            // retirement, never a second initialization of those authorities.
+            std::uint64_t admission = request;
+            if (request > 1u)
+            {
+                for (auto &control : controls)
+                {
+                    MoEOverlayDeviceEpochProtocol protocol(control);
+                    ASSERT_TRUE(protocol.reserveCandidate(request).has_value());
+                    protocol.markCandidateReady(request);
+                    ASSERT_TRUE(protocol.publishReadyCandidate(request).valid());
+                    ASSERT_TRUE(protocol.tryRetire(request - 1u));
+                }
+            }
+            std::vector<std::thread> workers;
+            for (std::size_t i = 0u; i < count; ++i)
+                workers.emplace_back([&, i] {
+                    results[i] = kernels[i].acquireMoEOverlayEpoch({}, &controls[i], &tickets[i],
+                        &statuses[i], &admission, {.record = &storage.record,
+                            .participant_id = ids[i], .storage_bytes = storage.bytes()});
+                });
+            for (auto &worker : workers) worker.join();
+            for (std::size_t i = 0u; i < count; ++i)
+            {
+                ASSERT_TRUE(results[i]);
+                ASSERT_TRUE(statuses[i].succeeded());
+                EXPECT_EQ(tickets[i].epoch, request);
+                EXPECT_EQ(storage.arrivals[i], request);
+                ASSERT_TRUE(kernels[i].releaseMoEOverlayEpoch({}, &controls[i], &tickets[i], &statuses[i]));
+                ASSERT_TRUE(statuses[i].succeeded());
+                EXPECT_EQ(tickets[i].epoch, 0u);
+                EXPECT_EQ(tickets[i].selector, 0u);
+                EXPECT_EQ(tickets[i].parent_generation, 0u);
+                MoEOverlayDeviceEpochProtocol protocol(controls[i]);
+                EXPECT_EQ(protocol.bankReaderCount(protocol.publishedBank()), 0u);
+                EXPECT_EQ(protocol.acquisitionsInFlight(), 0u);
+            }
+            EXPECT_EQ(storage.record.publication_sequence, request);
+        }
+    }
+
+    TEST(Test__MoEOverlayDeviceEpochProtocol, ExtentRosterRejectsMalformedAndOverflowRangesBeforeArrival)
+    {
+        MoEOverlayEpochTestStorage<2> storage;
+        const auto reject = [&](auto corrupt) {
+            storage.initialize({3u, 99u}, 99u);
+            corrupt(storage.record);
+            DeviceMoEOverlayEpochControl control;
+            MoEOverlayDeviceEpochProtocol::initialize(control, 1u);
+            DeviceMoEOverlayEpochTicket ticket;
+            DeviceMoEOverlayEpochStatus status;
+            CPUMoEKernel kernel;
+            const std::uint64_t admission = 1u;
+            ASSERT_TRUE(kernel.acquireMoEOverlayEpoch({}, &control, &ticket, &status,
+                &admission, {.record = &storage.record, .participant_id = 3u,
+                    .storage_bytes = storage.bytes()}));
+            EXPECT_FALSE(status.succeeded());
+            EXPECT_EQ(control.acquisitions_in_flight, 0u);
+            EXPECT_EQ(storage.arrivals[0], 0u);
+            EXPECT_EQ(storage.arrivals[1], 0u);
+        };
+        reject([](auto &record) { record.member_ids_offset = UINT64_MAX - 3u; });
+        reject([](auto &record) { record.arrival_sequences_offset = UINT64_MAX - 7u; });
+        reject([](auto &record) { record.arrival_sequences_offset = record.member_ids_offset; });
+        reject([](auto &record) { record.member_count = UINT32_MAX; });
+        reject([](auto &record) { record.storage_bytes += 8u; });
+        reject([](auto &record) { record.publisher_participant_id = 7u; });
+        reject([&](auto &) { storage.ids[1] = storage.ids[0]; });
     }
 
     TEST(Test__MoEOverlayDeviceEpochProtocol,

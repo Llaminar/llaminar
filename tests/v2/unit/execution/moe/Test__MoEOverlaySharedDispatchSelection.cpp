@@ -19,8 +19,8 @@ struct SharedRows {
  static constexpr int capacity=65,width=7;
  std::array<float,capacity*width> input{},output{};
  std::array<float,capacity*2> ids{},weights{};
- std::array<std::int32_t, 4> routes{99, MoEOverlayRouteTarget::cpuCohort(4).word(), 31,
-                                    MoEOverlayRouteTarget::cpuCohort(4).word()};
+ std::array<std::int32_t, 4> routes{99, MoEOverlayRouteTarget::cohort(4).word(), 31,
+                                    MoEOverlayRouteTarget::cohort(4).word()};
  std::vector<MoEOverlaySharedDispatchTarget> targets;
  std::vector<MoEOverlayActivationEpochControl> controls;
  int active=capacity;
@@ -112,7 +112,7 @@ TEST(MoEOverlaySharedDispatchSelection, LiveTargetAndZeroWeightReplayNeverCopies
     for (int epoch : {41, 42, 43})
     {
         f.routes = {99, 0, 31, 0};
-        f.routes[epoch == 42 ? 0 : 1] = MoEOverlayRouteTarget::cpuCohort(4).word();
+        f.routes[epoch == 42 ? 0 : 1] = MoEOverlayRouteTarget::cohort(4).word();
         f.ids.fill(1.f);
         f.weights.fill(0.f);
         f.active = 9;

@@ -2576,6 +2576,11 @@ namespace llaminar2
             compaction_status_.state = CompactionState::Scheduled;
             compaction_changed_.notify_all();
         }
+        else if (compaction_status_.state == CompactionState::Copying ||
+                 compaction_status_.state == CompactionState::Publishing)
+        {
+            compaction_requested_during_rewrite_ = true;
+        }
         return true;
     }
 
@@ -2641,7 +2646,15 @@ namespace llaminar2
             }
             if (stop.stop_requested())
                 break;
-            compaction_status_.state = CompactionState::Idle;
+            // Only this worker's own publication proves the rewrite can make
+            // progress. A peer-owned or cancelled rewrite drops the request:
+            // the owning process compacts, and retrying would spin.
+            const bool rewrite_again =
+                outcome == CompactionOutcome::Published &&
+                compaction_requested_during_rewrite_;
+            compaction_requested_during_rewrite_ = false;
+            compaction_status_.state =
+                rewrite_again ? CompactionState::Scheduled : CompactionState::Idle;
             compaction_changed_.notify_all();
         }
         compaction_status_.state = CompactionState::Stopping;

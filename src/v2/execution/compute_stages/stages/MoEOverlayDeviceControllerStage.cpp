@@ -38,6 +38,7 @@ namespace llaminar2
             case MoEOverlayDeviceControllerAction::CompleteLLEPRestore:
             case MoEOverlayDeviceControllerAction::AuthorStaticPolicy:
             case MoEOverlayDeviceControllerAction::AuthorDynamicPolicy:
+            case MoEOverlayDeviceControllerAction::AuthorPreparedContextRestore:
                 return true;
             default:
                 return false;
@@ -112,7 +113,10 @@ namespace llaminar2
                           MoEOverlayDeviceDemandPhase::Decode
                 : params_.demand_phase ==
                       MoEOverlayDeviceDemandPhase::Invalid;
-        return valid_phase &&
+        const bool policy_author = params_.action == MoEOverlayDeviceControllerAction::AuthorDynamicPolicy ||
+            params_.action == MoEOverlayDeviceControllerAction::AuthorPreparedContextRestore;
+        return valid_phase && (!policy_author || params_.policy_workspace.valid()) &&
+               (params_.action != MoEOverlayDeviceControllerAction::CollectRuntimeSnapshot || params_.snapshot.valid()) &&
                (begin ? valid_kind
                       : params_.transaction_kind ==
                             MoEOverlayDeviceControllerTransactionKind::Invalid);
@@ -135,7 +139,8 @@ namespace llaminar2
             params_.action ==
                 MoEOverlayDeviceControllerAction::AuthorStaticPolicy ||
             params_.action ==
-                MoEOverlayDeviceControllerAction::AuthorDynamicPolicy)
+                MoEOverlayDeviceControllerAction::AuthorDynamicPolicy ||
+            params_.action == MoEOverlayDeviceControllerAction::AuthorPreparedContextRestore)
         {
             if (!workspace_)
             {
@@ -160,6 +165,8 @@ namespace llaminar2
                 .transaction_kind = params_.transaction_kind,
                 .demand_phase = params_.demand_phase,
                 .policy_result = policy_result,
+                .policy_workspace = params_.policy_workspace,
+                .snapshot = params_.snapshot,
             });
     }
 
@@ -200,7 +207,8 @@ namespace llaminar2
             params_.action ==
                 MoEOverlayDeviceControllerAction::AuthorStaticPolicy ||
             params_.action ==
-                MoEOverlayDeviceControllerAction::AuthorDynamicPolicy)
+                MoEOverlayDeviceControllerAction::AuthorDynamicPolicy ||
+            params_.action == MoEOverlayDeviceControllerAction::AuthorPreparedContextRestore)
         {
             requirements.buffers.push_back({
                 policyResultBufferName(),
@@ -239,6 +247,8 @@ namespace llaminar2
                params_.transaction_kind == other.transaction_kind &&
                params_.demand_phase == other.demand_phase &&
                params_.workspace_name == other.workspace_name &&
+               params_.policy_workspace == other.policy_workspace &&
+               params_.snapshot == other.snapshot &&
                left.device == right.device &&
                left.participant_id == right.participant_id &&
                left.group_id == right.group_id &&
@@ -251,13 +261,14 @@ namespace llaminar2
                left.layout == right.layout &&
                left.participants == right.participants &&
                left.groups == right.groups &&
+               left.logical_targets == right.logical_targets &&
                left.controller == right.controller &&
                left.inference_epoch_record == right.inference_epoch_record &&
                left.command == right.command &&
                left.command_entries == right.command_entries &&
                left.payload_bytes_per_layer ==
                    right.payload_bytes_per_layer &&
-               left.initial_owner_participants == right.initial_owner_participants &&
+               left.initial_route_targets == right.initial_route_targets &&
                left.demand_history == right.demand_history &&
                left.economy == right.economy &&
                left.economy_service_costs ==

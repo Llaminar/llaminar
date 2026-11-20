@@ -177,6 +177,14 @@ namespace llaminar2
 
         /// Frozen HC-up activation arithmetic; ordinary models never consume it.
         QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
+        bool qfn_resident_ffn_candidate=false; ///< Frozen opt-in exact participant-local resident FFN transaction.
+        bool qfn_hidden_q8_reuse_candidate=false; ///< Explicit original fully-active M1 router/routed/shared Q8 publication.
+        bool qfn_hc_down_publish_candidate=false; ///< Original down-reducer HC publication, no new numerical program.
+        bool qfn_hc_down_lookahead_candidate=false; ///< Diagnostic original HC publication producer load schedule, defaultoff.
+        bool qfn_hc_norm_q8_candidate=false; ///< Frozen ordinary M1 original branch-norm/SingleQ8 publication candidate.
+        bool qfn_hc_short_k_read_candidate=false; ///< Frozen opt-in exact producer-grid HC up/read on ordinary GPU M1.
+        bool qfn_gate_up_completion_candidate=false; ///< Explicit original ROCm ordinary-main M1 producer/fold completion.
+        bool qfn_down_completion_candidate=false; ///< Explicit original ROCm ordinary-main M1 down/weighted-route/slot completion.
         /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.
         QuantizedActivationOperandPrecision qfn_gdn_output_activation = QuantizedActivationOperandPrecision::SingleQ8;
         /// Frozen main-only QFN FA-output correction; predictor, HC and GDN remain independent.
@@ -1434,6 +1442,7 @@ namespace llaminar2
 
         /** @brief Exact persistent allocation owner carried from the frozen source plan. */
         PhysicalMemoryOwner physical_memory_owner = PhysicalMemoryOwner::Count;
+        const FrozenModelWeightSet *original_frozen_source = nullptr; ///< Same borrowed source retained by get_layer_weights; immutable metadata only.
     };
 
     /**
@@ -1607,6 +1616,7 @@ namespace llaminar2
         std::optional<DeviceId> preferred_device = std::nullopt)
     {
         ModelWeightBindings bindings;
+        bindings.original_frozen_source = &weight_set;
         bindings.physical_memory_owner = weight_set.physicalMemoryOwner();
         bindings.embedding_table = optionalGlobalBinding(weight_set, "token_embd.weight");
         bindings.final_norm = optionalGlobalBinding(weight_set, "output_norm.weight");

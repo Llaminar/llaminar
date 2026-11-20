@@ -44,7 +44,7 @@ namespace llaminar2::test
                            std::vector<RoutedExpertLayerPlacement> placements)
         {
             const auto live = authority.snapshot();
-            return authority.prepareCPUJointPlacementTransaction(live, live->epoch,
+            return authority.prepareJointPlacementTransaction(live, live->epoch,
                                                                  std::move(placements));
         }
 
@@ -59,7 +59,7 @@ namespace llaminar2::test
                 std::vector<RoutedExpertLayerPlacement> placements)
         {
             const auto live = authority.snapshot();
-            return authority.prepareCPUJointPlacementCandidate(live, live->epoch,
+            return authority.prepareJointPlacementCandidate(live, live->epoch,
                                                                std::move(placements));
         }
         /**
@@ -75,7 +75,7 @@ namespace llaminar2::test
                         const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
                         uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements)
         {
-            return authority.prepareCPUJointPlacementCandidate(expected_live, expected_epoch,
+            return authority.prepareJointPlacementCandidate(expected_live, expected_epoch,
                                                                std::move(placements));
         }
     };

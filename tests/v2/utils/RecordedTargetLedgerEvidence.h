@@ -16,8 +16,8 @@ namespace llaminar2::test {
 inline auto recordedTargetLedgerDeclaration(int sources,int destinations,ExpertWeightFormat format,int layer=7) {
     auto a=recordedMigrationTarget(sources,0,0,0),b=recordedMigrationTarget(destinations,8,1,1);
     const auto geometry=MoEOverlayMigrationMeasurementGeometry::checked({a,b},{format,format,format});
-    MoEOverlayRequiredTargetMigrationMeasurement result{{sources==1?MoEOverlayRouteTarget::whole(0):MoEOverlayRouteTarget::cpuCohort(0),
-        destinations==1?MoEOverlayRouteTarget::whole(8):MoEOverlayRouteTarget::cpuCohort(1),layer},geometry,{}};
+    MoEOverlayRequiredTargetMigrationMeasurement result{{sources==1?MoEOverlayRouteTarget::whole(0):MoEOverlayRouteTarget::cohort(0),
+        destinations==1?MoEOverlayRouteTarget::whole(8):MoEOverlayRouteTarget::cohort(1),layer},geometry,{}};
     for(std::size_t p=0;p<geometry->pieces().size();++p)result.quoted_payload_bytes.push_back(100+p);
     return result;
 }

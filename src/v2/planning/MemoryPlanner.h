@@ -12,19 +12,24 @@
  */
 
 #pragma once
+
+#include "collective/RankOrderedNativeResources.h"
 #include "planning/PlanningNativeContextEvidence.h"
 #include "loaders/NativeWeightLoadStaging.h"
 #include "backends/NativeOrderingEventBudgetProjection.h"
 #include "backends/CPUExecutionGeometry.h"
 #include "planning/MemoryPlan.h"
+#include "execution/moe/GPUExpertIntermediateTiling.h"
 #include "planning/ModelMemoryProfile.h"
 #include "planning/GraphSnapshotMemoryCapacity.h"
 #include "planning/PipelineTransferMemory.h"
 #include "backends/PeerAccessCoverage.h"
+#include "backends/PhysicalMemoryBacking.h"
 #include "planning/WeightMemoryEstimator.h"
 #include "planning/KVCacheMemoryEstimator.h"
 #include "backends/DeviceId.h"
 #include "kernels/common/QuantizedActivationOperandPrecision.h"
+#include "kernels/common/NativeTileCompletion.h"
 #include "config/CollectiveBackendType.h"
 #include "config/TensorParallelConfig.h"
 #include "execution/config/RuntimeConfig.h"
@@ -259,6 +264,41 @@ struct DevicePlanConfig
     DeviceId device;
     size_t device_total_bytes = 0;
     size_t device_free_bytes = 0;
+    /** Discovered backing; RankHostPool pools this GPU with its rank's CPU allocator. */
+    PhysicalMemoryBacking device_memory_backing = PhysicalMemoryBacking::Dedicated;
+    /** RankHostPool only: uncapped physical pool observation (see PhysicalMemoryResource). */
+    size_t device_pool_available_bytes = 0;
+
+    /**
+     * @return The complete observed allocator for @ref device. Every logical
+     *         plan line on this allocator uses this one value, so integrated
+     *         GPU backing and its pool observation cannot be dropped by one
+     *         contributor and make the physical merge disagree.
+     */
+    [[nodiscard]] PhysicalMemoryResource deviceResource() const noexcept
+    {
+        return {.world_rank = world_rank,
+                .device = device,
+                .total_bytes = device_total_bytes,
+                .admission_available_bytes = device_free_bytes,
+                .backing = device_memory_backing,
+                .pool_available_bytes = device_pool_available_bytes};
+    }
+
+    /**
+     * @brief Adopt one complete observation of @ref device's allocator.
+     * @param resource Observation of this config's rank and device.
+     * @throws std::invalid_argument When @p resource names another allocator.
+     */
+    void adoptDeviceResource(const PhysicalMemoryResource &resource)
+    {
+        if (resource.world_rank != world_rank || resource.device != device)
+            throw std::invalid_argument("Device plan cannot adopt another allocator's observation");
+        device_total_bytes = resource.total_bytes;
+        device_free_bytes = resource.admission_available_bytes;
+        device_memory_backing = resource.backing;
+        device_pool_available_bytes = resource.pool_available_bytes;
+    }
 
     /**
      * Host allocator that owns CPU-side state created by this execution graph.
@@ -337,6 +377,9 @@ struct DevicePlanConfig
                                                             ///< by execution.
     qwen4exp::QwenSparseAttentionPhaseSchedule attention_phase_schedule = qwen4exp::QwenSparseAttentionPhaseSchedule::Uniform;
 
+    MoEGateUpPublicationPolicy gate_up_publication=MoEGateUpPublicationPolicy::Staged; ///< Admitted ordinary M1 counter geometry.
+    MoEDownPublicationPolicy down_publication=MoEDownPublicationPolicy::Staged; ///< Admitted ordinary M1 route-fold geometry.
+
     /// Setup-frozen arithmetic that changes named HC-up activation scratch only.
     QuantizedActivationOperandPrecision qfn_hc_up_activation = kDefaultQwen4ExpHCUpActivation;
     /// Frozen QFN GDN-output activation arithmetic; independent of HC and alpha/beta.
@@ -356,6 +399,13 @@ struct DevicePlanConfig
 
     /** Frozen physical expert layout, shared by the activation BOM and graph schema. */
     RoutedExpertComputePolicy routed_compute_policy = RoutedExpertComputePolicy::Apportioned;
+    LocalGPUExpertKernelPolicy local_gpu_expert_kernel_policy = LocalGPUExpertKernelPolicy::Generic;
+    GPUExpertIntermediateTiling gpu_expert_intermediate_tiling = GPUExpertIntermediateTiling::Coarse128;
+
+    /** @return Whether this arena belongs to the qualified QFN MI50 TP4 domain. */
+    bool usesQFNMI50TP4() const noexcept
+    { return local_gpu_expert_kernel_policy == LocalGPUExpertKernelPolicy::QFNMI50TP4; }
+
 
     /// Immutable original per-edge routes; their canonical quote is the only projection transport BOM.
     std::shared_ptr<const DeviceCountedAllGatherTopology> projection_exchange_topology;
@@ -373,6 +423,7 @@ struct DevicePlanConfig
      * installed by LocalTP; AUTO is invalid, not an alias for absence.
      */
     std::optional<CollectiveBackendType> local_tp_backend;
+    std::optional<RankOrderedNativeResources> rank_ordered_resources; ///< Original communicator quote for this physical participant.
 
     /** Exact PP parent ownership, independent of transport leadership and TP sharding. */
     PipelineForwardOnlyGraphOwner pipeline_forward_only_graph_owner = PipelineForwardOnlyGraphOwner::None;

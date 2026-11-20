@@ -7,6 +7,7 @@
  */
 
 #include "TensorClasses.h"
+#include "../utils/OpenMPUtils.h"
 #include "VnniPackContext.h"
 #include "../kernels/KernelFactory.h"
 #include "TensorKernels.h"
@@ -283,6 +284,7 @@ namespace llaminar2
             const uint8_t *data_ptr = is_view_ ? (raw_data_ptr_ + view_byte_offset_) : raw_data_.data();
             const IQ1_MBlock *blocks = reinterpret_cast<const IQ1_MBlock *>(data_ptr);
             size_t blocks_per_row = (shape_[1] + IQ1_MBlock::BLOCK_SIZE - 1) / IQ1_MBlock::BLOCK_SIZE;
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(static) if (total_elements > 10000)
             for (size_t r = 0; r < shape_[0]; ++r)
             {
@@ -336,6 +338,7 @@ namespace llaminar2
         std::vector<float> temp_fp32(count);
         to_fp32(temp_fp32.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -350,6 +353,7 @@ namespace llaminar2
         std::vector<float> temp_fp32(count);
         to_fp32(temp_fp32.data());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t i = 0; i < count; ++i)
         {
@@ -366,6 +370,7 @@ namespace llaminar2
 
         const size_t num_blocks = (total_elements + block_size - 1) / block_size;
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for
         for (size_t block_idx = 0; block_idx < num_blocks; ++block_idx)
         {

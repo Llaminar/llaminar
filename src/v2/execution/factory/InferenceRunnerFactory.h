@@ -450,6 +450,21 @@ namespace llaminar2
         const MTPRuntimeConfig &mtp,
         const std::optional<FactoryPPStageConfig> &pp_stage = std::nullopt);
 
+    /**
+     * @brief Bind static expert ranges or the retained original fragment family before loading.
+     * @param graph_config Participant graph after dense TP and overlay configuration.
+     * @param config Original runner policy and pipeline-stage scope.
+     * @param device Actual execution device of this graph.
+     * @return True when the existing source and collective authorities agree;
+     *         false with a diagnostic for an incomplete or incompatible binding.
+     *
+     * This cold factory step performs no allocation, weight load or collective.
+     * Fragment membership comes from the original prepared map, never a newly
+     * reconstructed whole-expert range.
+     */
+    bool configureStaticMoEExpertRange(GraphConfig &graph_config,
+        const InferenceRunnerConfig &config, DeviceId device);
+
     bool applyMoEExpertOverlayConfigToGraphForTesting(
         IModelContext &model_ctx,
         const InferenceRunnerConfig &config,

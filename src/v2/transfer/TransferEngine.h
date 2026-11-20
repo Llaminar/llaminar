@@ -125,6 +125,8 @@ namespace llaminar2
             const ModelDeviceMemoryRetention &) = default;
     };
 
+    class GPUContextProvenance;
+
     /**
      * @brief Move-only proof that an exclusive model retirement has begun.
      *
@@ -149,6 +151,7 @@ namespace llaminar2
             ExclusiveModelRetirementTicket &&other) noexcept
             : retention_(other.retention_),
               intent_(other.intent_),
+              expected_context_generation_(other.expected_context_generation_),
               driver_free_bytes_before_owner_release_(
                   other.driver_free_bytes_before_owner_release_),
               canonical_allocations_before_owner_release_(
@@ -222,6 +225,7 @@ namespace llaminar2
 
         ModelDeviceMemoryRetention retention_; ///< Exact admission-owned BOM.
         DeviceMemoryReclamationIntent intent_; ///< Positive model BOM or proven empty native context.
+        std::uint64_t expected_context_generation_ = 0u; ///< Exact live worker, when provenance was supplied.
         size_t driver_free_bytes_before_owner_release_ = 0u; ///< Diagnostic.
         size_t canonical_allocations_before_owner_release_ = 0u; ///< Owners.
         size_t canonical_allocation_bytes_before_owner_release_ = 0u; ///< Bytes.
@@ -1447,6 +1451,14 @@ namespace llaminar2
          */
         [[nodiscard]] ExclusiveModelRetirementTicket
         beginExclusiveNativeContextRetirement(DeviceId device) const;
+
+        /** @brief Quote an empty-ledger reset for one exact live worker.
+         * @param original Pool provenance to authenticate under the retirement exclusion.
+         * The quote retains generation identity after the worker borrow returns.
+         * @return A single-use native retirement ticket for that generation.
+         */
+        [[nodiscard]] ExclusiveModelRetirementTicket
+        beginExclusiveNativeContextRetirement(const GPUContextProvenance &original) const;
 
         /**
          * @brief Retire the worker generation and prove a released model BOM.

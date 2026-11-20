@@ -14,12 +14,14 @@
  */
 
 #include "memory/CPUStorageRoot.h"
+#include <string_view>
 #include "planning/PhysicalMemoryAuthority.h"
 #include "../utils/Logger.h"
 #include "../utils/WeightLoadingProfiler.h"
 #include "../utils/PerfStatsCollector.h"
 #include "../utils/OpenMPUtils.h"
 #include "ModelLoader.h"
+#include "BoundedGPUExpertSource.h"
 #include "WeightIdentity.h"
 #include "../models/qwen4exp/Qwen4ExpSidecarManifest.h"
 #include "../tensors/Tensors.h"
@@ -2457,6 +2459,14 @@ namespace llaminar2
         size_t block_size = info->getBlockSize();
         size_t type_size = info->getTypeSize();
 
+        // GPU preparation selects exact logical K32 blocks from an original
+        // source-aligned cover. Only the existing bounded upload ring reads
+        // those native bytes; no host dequantization or requantization occurs.
+        if (device.is_gpu() && weight_precision == WeightPrecision::NATIVE && block_size > 32 &&
+            (col_start % block_size || col_end % block_size))
+            return BoundedGPUExpertSource::declareColumns(*this, tensor_name,
+                nativeWeightSourceGeometry(tensor_name), col_start, slice_cols, device);
+
         // For quantized tensors, validate block alignment
         if (block_size > 0)
         {
@@ -4113,6 +4123,40 @@ namespace llaminar2
         }
 
         return default_val;
+    }
+
+    uint64_t ggufFeedForwardLength(const GGUFModel &model)
+    {
+        // Same scalar lookup as ModelLoader::getUInt64: architecture-prefixed
+        // key first, then the unprefixed key, accepting only unsigned scalars.
+        const auto scalar = [&](const std::string &key) -> uint64_t
+        {
+            for (const std::string &name : {model.architecture + "." + key, key})
+            {
+                const auto it = model.metadata.find(name);
+                if (it == model.metadata.end())
+                    continue;
+                if (it->second.type == GGUFValueType::UINT64)
+                    return it->second.asUInt64();
+                if (it->second.type == GGUFValueType::UINT32)
+                    return static_cast<uint64_t>(it->second.asUInt32());
+            }
+            return 0;
+        };
+        for (const char *key : {"feed_forward_length", "expert_shared_feed_forward_length",
+                                "expert_feed_forward_length"})
+            if (const uint64_t width = scalar(key))
+                return width;
+        const auto ends_with = [](const std::string &name, std::string_view suffix)
+        {
+            return name.size() >= suffix.size() &&
+                   name.compare(name.size() - suffix.size(), suffix.size(), suffix) == 0;
+        };
+        for (const auto &tensor : model.tensors)
+            if (tensor.dimensions.size() == 2 &&
+                (ends_with(tensor.name, ".ffn_gate.weight") || ends_with(tensor.name, ".ffn_up.weight")))
+                return tensor.dimensions[0];
+        return 0;
     }
 
     uint64_t ModelLoader::getUInt64(const std::string &key, uint64_t default_val) const

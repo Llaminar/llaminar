@@ -37,6 +37,11 @@
 
 namespace llaminar2
 {
+    class MoEOverlayPhysicalResidencyFabric;
+    struct MoEOverlayDevicePhysicalMovementBatch;
+    struct MoEOverlayDevicePreparedPhysicalInventory;
+    struct MoEOverlayDevicePhysicalSlotKey;
+
     class MoEExpertOverlayPreparationPlan;
     class ModelContext;
     class WeightManager;
@@ -110,10 +115,10 @@ namespace llaminar2
         const std::optional<MoEExpertProjectionOwnership> &ownership = std::nullopt);
 
     /**
-     * @brief Closed original CPU cohort/layout carried by the existing participant bank.
+     * @brief Closed original CPU/GPU cohort/layout carried by the existing participant bank.
      * This is fixed geometry, not current expert membership or another epoch map.
      */
-    class MoEOverlayCPUFragmentFamily final
+    class MoEOverlayFragmentFamily final
     {
     public:
         /** @return Exact original model, never a caller-supplied execution permit. */
@@ -125,7 +130,7 @@ namespace llaminar2
         /** @return Original local member coordinate in that cohort. */
         size_t participantIndex() const noexcept { return member_; }
         /** @return Whether a completed fragment has this exact original family. */
-        bool accepts(const MoEOverlayPreparedCPUFragmentPayload& payload,int expert) const noexcept;
+        bool accepts(const MoEOverlayPreparedFragmentPayload& payload,int expert) const noexcept;
     private:
         friend class MoEOverlayParticipantResidencyRegistry;
         /**
@@ -135,7 +140,7 @@ namespace llaminar2
          * @param cohort Same source-authenticated immutable cohort.
          * @param member Original canonical member coordinate.
          */
-        MoEOverlayCPUFragmentFamily(ModelContextId model,
+        MoEOverlayFragmentFamily(ModelContextId model,
             std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation,
             std::shared_ptr<const MoEExpertShardCohort> cohort,size_t member)
             :model_(model),preparation_(std::move(preparation)),cohort_(std::move(cohort)),member_(member){}
@@ -150,11 +155,11 @@ namespace llaminar2
     {
         std::vector<bool> resident_mask;
         std::vector<MoEOverlayPreparedExpertPayload> experts;
-        /** Closed alternative: only fragment payloads inhabit a CPU cohort bank. */
-        std::shared_ptr<const MoEOverlayCPUFragmentFamily> cpu_fragment_family;
-        std::vector<MoEOverlayPreparedCPUFragmentPayload> cpu_fragments;
+        /** Closed alternative: only fragment payloads inhabit a CPU/GPU cohort bank. */
+        std::shared_ptr<const MoEOverlayFragmentFamily> fragment_family;
+        std::vector<MoEOverlayPreparedFragmentPayload> fragments;
         /** Sorted immutable index derived from the candidate mask, not frozen source IDs. */
-        std::vector<int> cpu_fragment_expert_ids;
+        std::vector<int> fragment_expert_ids;
         /** Immutable family inherited from the endpoint, never inferred from pointers. */
         DeviceMoEProjectionSet movable_projections = DeviceMoEProjectionSet::CompleteExpert;
 
@@ -173,7 +178,7 @@ namespace llaminar2
          * @param fragment Closed prepared destination triplet, never a whole-expert payload.
          * @throws std::invalid_argument For a foreign family, expert or engine geometry.
          */
-        void setResidentCPUFragment(int expert_id,MoEOverlayPreparedCPUFragmentPayload fragment);
+        void setResidentFragment(int expert_id,MoEOverlayPreparedFragmentPayload fragment);
 
         /**
          * @brief Remove one expert from this candidate without touching old banks.
@@ -442,8 +447,8 @@ namespace llaminar2
             DeviceMoEProjectionSet movable_projections = DeviceMoEProjectionSet::CompleteExpert;
             /** First global model layer owned by every retained epoch. */
             int first_model_layer = 0;
-            /** Original fixed CPU fragment family for each layer; empty denotes whole experts. */
-            std::vector<std::shared_ptr<const MoEOverlayCPUFragmentFamily>> cpu_fragment_families;
+            /** Original fixed Expert fragment family for each layer; empty denotes whole experts. */
+            std::vector<std::shared_ptr<const MoEOverlayFragmentFamily>> fragment_families;
         };
 
         /**
@@ -747,14 +752,14 @@ namespace llaminar2
             const std::shared_ptr<const MoEExpertOverlayPreparationPlan> &preparation,
             std::string *error = nullptr);
         /**
-         * @brief Seal original local CPU fragment sources after weight preparation, before graphs.
+         * @brief Seal original local Expert fragment sources after weight preparation, before graphs.
          * @param context Actual original ModelContext owning the completed prepared registry.
          * @param error Original identity or incomplete/retired bootstrap diagnostic.
-         * @return True after original context binding and every local CPU source publication.
+         * @return True after original context binding and every local fragment source publication.
          * @note This cold admission never reconstructs a retired initial bank. Lazy graph
          * declarations use acquireOriginalPreparedSource instead of repeating admission.
          */
-        bool admitInitialCPUJointGraphSources(const std::shared_ptr<ModelContext> &context,
+        bool admitInitialJointGraphSources(const std::shared_ptr<ModelContext> &context,
                                              std::string *error = nullptr);
         /**
          * @brief Retain only the successfully bound live original source for cold preparation.
@@ -771,9 +776,9 @@ namespace llaminar2
         }
 
         /** @brief Distinguish real joint fragments from whole-expert prepared banks. */
-        enum class InitialOwnershipKind { WholeExperts, CPUJointFragments };
+        enum class InitialOwnershipKind { WholeExperts, JointFragments };
         /** @brief Immutable source-bound fragment publication; only the original registry can construct it. */
-        class CPUJointLayer final {
+        class JointLayer final {
         public:
             /** @return Exact acquired bank epoch; a cold construction frame names the original initial epoch. */
             uint64_t epoch()const noexcept{return epoch_;}
@@ -781,8 +786,9 @@ namespace llaminar2
             int participantId()const noexcept{return participant_;}
             /** @return Original model layer. */
             int layer()const noexcept{return layer_;}
-            /** @return Immutable authenticated original selection; it owns no prepared engine bytes. */
-            const std::shared_ptr<const CPUExpertShardSourceSelection>& sourceSelection()const noexcept{return source_;}
+            /** @return Immutable authenticated original selection, including a source-proven empty
+             * selection. It owns complete family metadata and no prepared engine bytes. */
+            const std::shared_ptr<const ExpertShardSourceSelection>& sourceSelection()const noexcept{return source_;}
             /**
              * @brief Borrow actual original engines only while constructing the fixed graph.
              * @return Initial bank reader, or empty after that epoch has retired.
@@ -795,17 +801,17 @@ namespace llaminar2
              * @param epoch Packet placement epoch, never an inferred current value.
              * @return An immutable view retaining the existing RCU reader, or no value if absent/foreign.
              */
-            std::optional<CPUJointLayer> acquireEpoch(uint64_t epoch) const noexcept;
+            std::optional<JointLayer> acquireEpoch(uint64_t epoch) const noexcept;
             /** @return Exact epoch bank retained by an acquired invocation view. */
             const MoEOverlayParticipantBankLease& bankLease() const noexcept { return bank_; }
             /** @return Fixed original cohort and local projection contract. */
-            const std::shared_ptr<const MoEOverlayCPUFragmentFamily>& family() const noexcept { return family_; }
+            const std::shared_ptr<const MoEOverlayFragmentFamily>& family() const noexcept { return family_; }
         private:
             friend class MoEOverlayParticipantResidencyRegistry;
             /** @brief Publish only after exact original source registration validation. */
-            CPUJointLayer(uint64_t epoch, int participant, int layer,
-                          std::shared_ptr<const CPUExpertShardSourceSelection> source,
-                          std::shared_ptr<const MoEOverlayCPUFragmentFamily> family = {},
+            JointLayer(uint64_t epoch, int participant, int layer,
+                          std::shared_ptr<const ExpertShardSourceSelection> source,
+                          std::shared_ptr<const MoEOverlayFragmentFamily> family = {},
                           std::shared_ptr<MoEOverlayParticipantResidency> endpoint = {})
                 : epoch_(epoch), initial_epoch_(epoch), participant_(participant), layer_(layer),
                   source_(std::move(source)), family_(std::move(family)),
@@ -814,8 +820,8 @@ namespace llaminar2
             }
             uint64_t epoch_,initial_epoch_;
             int participant_,layer_;
-            std::shared_ptr<const CPUExpertShardSourceSelection> source_;
-            std::shared_ptr<const MoEOverlayCPUFragmentFamily> family_;
+            std::shared_ptr<const ExpertShardSourceSelection> source_;
+            std::shared_ptr<const MoEOverlayFragmentFamily> family_;
             std::shared_ptr<MoEOverlayParticipantResidency> endpoint_;
             MoEOverlayParticipantBankLease bank_; // Cold frames do not pin an initial RCU slot.
         };
@@ -970,16 +976,16 @@ namespace llaminar2
             std::string *error = nullptr);
 
         /**
-         * @brief Publish one complete initial CPU fragment bank before any graph borrows a layer.
+         * @brief Publish one complete initial Expert fragment bank before any graph borrows a layer.
          * @param registry Same original model-owned prepared source registry.
          * @param original_model Exact original model identity.
-         * @param participant_id Canonical local CPU cohort member.
+         * @param participant_id Canonical local cohort member.
          * @param error Precise source, completeness or retired-publication diagnostic.
          * @return True after every real layer is installed, or on authenticated live re-entry.
          * @note First entry validates all layers before one bank publication. Completed entry
          * never replays source loading, rescans every engine or resurrects a retired initial epoch.
          */
-        bool registerInitialCPUJointBank(const ExpertGemmRegistry &registry,
+        bool registerInitialJointBank(const ExpertGemmRegistry &registry,
                                          ModelContextId original_model, int participant_id,
                                          std::string *error = nullptr);
         /**
@@ -991,7 +997,7 @@ namespace llaminar2
          * @throws std::invalid_argument For a foreign participant/layer.
          * @throws std::logic_error For an original layer not yet published.
          */
-        std::shared_ptr<const CPUJointLayer> initialCPUJointLayer(int participant_id,
+        std::shared_ptr<const JointLayer> initialJointLayer(int participant_id,
                                                                   int layer_idx) const;
         /**
          * @brief Resolve a declaration or an exact later installed packet epoch.
@@ -1002,22 +1008,22 @@ namespace llaminar2
          * @throws std::invalid_argument For a foreign coordinate or epoch below the initial epoch.
          * @throws std::logic_error For an unpublished, absent or retired bank.
          */
-        std::shared_ptr<const CPUJointLayer> cpuJointLayer(int participant_id, int layer_idx,
+        std::shared_ptr<const JointLayer> jointLayer(int participant_id, int layer_idx,
                                                            uint64_t actual_epoch) const;
         /**
          * @brief Issue a fragment arrival only from this live original source and candidate cohort.
          * @param candidate Existing candidate placement epoch, retaining original fixed cohort/cuts.
-         * @param participant_id Exact local canonical CPU cohort member.
+         * @param participant_id Exact local canonical CPU/GPU cohort member.
          * @param layer_idx Original model layer.
          * @param expert_id Original logical expert assigned to that candidate member.
          * @param error Exact foreign source, cohort, scope or candidate-membership rejection.
          * @return Closed arrival retaining the original preparation; no payload is ready yet.
          */
-        std::shared_ptr<MoEOverlayPreparedExpertArrival> prepareCPUJointArrival(
+        std::shared_ptr<MoEOverlayPreparedExpertArrival> prepareJointArrival(
             const MoEOverlayResidencySnapshot& candidate,int participant_id,int layer_idx,int expert_id,
             std::string* error=nullptr) const;
         /**
-         * @brief Issue an unready CPU fragment destination for a genuine shadow calibration edge.
+         * @brief Issue an unready Expert fragment destination for a genuine shadow calibration edge.
          * @param transaction Original validated unpublishable EconomyCalibration transaction.
          * @param migration_index Exact logical edge in that original transaction.
          * @param participant_id Original local destination member, never a scalar cohort alias.
@@ -1025,7 +1031,7 @@ namespace llaminar2
          * @return Unready arrival with actual fixed geometry, or null on rejection.
          * @note This does not assign live ownership, install a bank or publish an epoch.
          */
-        std::shared_ptr<MoEOverlayPreparedExpertArrival> prepareCPUJointCalibrationArrival(
+        std::shared_ptr<MoEOverlayPreparedExpertArrival> prepareJointCalibrationArrival(
             const MoEOverlayResidencyTransaction &transaction, std::size_t migration_index,
             int participant_id, std::string *error = nullptr) const;
 
@@ -1042,11 +1048,11 @@ namespace llaminar2
          * separately authenticate its selected/current snapshot before publication. Keeping
          * one caller-owned bank borrow for the complete copy wave avoids per-expert readers.
          */
-        std::shared_ptr<MoEOverlayPreparedExpertArrival> prepareCPUJointArrivalFromInstalledBank(
+        std::shared_ptr<MoEOverlayPreparedExpertArrival> prepareJointArrivalFromInstalledBank(
             const MoEOverlayParticipantBankLease &bank, int participant_id, int layer_idx,
             int expert_id, std::string *error = nullptr) const;
-        /** @return Whether this registered endpoint is a typed CPU joint-fragment participant. */
-        bool isCPUJointParticipant(int participant_id)const noexcept;
+        /** @return Whether this registered endpoint is a typed Joint-fragment participant. */
+        bool isJointParticipant(int participant_id)const noexcept;
 
         /** @return Existing process-local RCU endpoint, or null if nonlocal; each layer retains its checked whole or fragment arm. */
         [[nodiscard]] std::shared_ptr<MoEOverlayParticipantResidency>
@@ -1161,10 +1167,52 @@ namespace llaminar2
             Completed,
         };
 
+        friend class MoEOverlayPhysicalResidencyFabric;
+        /**
+         * @brief Issue an unready fragment for an already-begun device physical wave.
+         * @param batch Exact durable batch retained by the physical ledger.
+         * @param migration_index Original logical destination edge in that batch.
+         * @param participant_id Exact local original destination member.
+         * @param error Original source, family, geometry or wave rejection.
+         * @return Original registry-issued receipt; no host bank or live ownership changes.
+         *
+         * Only the existing physical fabric may cross this infrastructure boundary.
+         * Its ledger validates every source and destination before reservation and
+         * accepts the completed receipts before the original device publication.
+         */
+        std::shared_ptr<MoEOverlayPreparedExpertArrival> prepareJointDeviceArrival(
+            const MoEOverlayDevicePhysicalMovementBatch &batch, std::size_t migration_index,
+            int participant_id, std::string *error) const;
+
+        /**
+         * @brief Issue a terminal compaction receipt from the retained physical inventory.
+         * @param inventory Exact quiescent ledger snapshot retained throughout compaction.
+         * @param key Original local source member/layer/expert coordinate.
+         * @param error Missing source, family, epoch or original-context diagnostic.
+         * @return Unready receipt bound to that physical epoch, never host RCU publication.
+         */
+        std::shared_ptr<MoEOverlayPreparedExpertArrival> prepareJointDeviceInventoryArrival(
+            const MoEOverlayDevicePreparedPhysicalInventory &inventory,
+            const MoEOverlayDevicePhysicalSlotKey &key, std::string *error) const;
+
+        /**
+         * @brief Authenticate original source metadata shared by device-wave and terminal receipts.
+         * @param cohort Same original complete target retained by batch or physical source.
+         * @param participant_id Original local GPU member.
+         * @param layer Original model-global layer.
+         * @param expert Logical expert received or compacted.
+         * @param epoch Exact checked physical epoch of that caller-owned transaction.
+         * @param error Original ownership or scope diagnostic.
+         * @return Unready fixed-family receipt; caller retains its transaction/source proof.
+         */
+        std::shared_ptr<MoEOverlayPreparedExpertArrival> prepareJointPhysicalArrival(
+            const std::shared_ptr<const MoEExpertShardCohort> &cohort,
+            int participant_id, int layer, int expert, std::uint64_t epoch, std::string *error) const;
+
         struct EndpointAssembly
         {
             /** Closed fragment arm; no ordinary MoEOverlayPreparedExpertPayload is created. */
-            std::optional<std::vector<std::shared_ptr<const CPUJointLayer>>> joint_layers;
+            std::optional<std::vector<std::shared_ptr<const JointLayer>>> joint_layers;
             std::shared_ptr<MoEOverlayParticipantResidency> endpoint;
             MoEOverlayParticipantResidencyBank initial_bank;
             std::vector<bool> registered_layers;
@@ -1210,11 +1258,11 @@ namespace llaminar2
          * @brief Construct/publish the one cold bank with the source mutex already held.
          * @param registry Authenticated original prepared registry.
          * @param model Same original model identity.
-         * @param participant Canonical local CPU cohort member.
+         * @param participant Canonical local cohort member.
          * @param error Precise incomplete or retired source diagnostic.
          * @return True only for a complete actual initial publication.
          */
-        bool registerInitialCPUJointBankImpl(const ExpertGemmRegistry &registry,
+        bool registerInitialJointBankImpl(const ExpertGemmRegistry &registry,
                                              ModelContextId model, int participant,
                                              std::string *error);
 

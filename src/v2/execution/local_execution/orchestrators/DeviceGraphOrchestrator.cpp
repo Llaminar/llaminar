@@ -21,6 +21,7 @@
  */
 
 #include "execution/qwen4exp/PooledImmutableParticipantExecutionPolicy.h"
+#include "../../../utils/OpenMPUtils.h"
 #include "execution/qwen4exp/PooledImmutableLocalHotTransportGeometry.h"
 #include "execution/local_execution/graph/RetainedHostServiceDeclarations.h"
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
@@ -15313,9 +15314,11 @@ namespace llaminar2
         // queried independently below because it is not monotonic in M.
         hints.max_seq_len = workspace_seq_len > 0 ? workspace_seq_len : default_workspace_seq_len;
         hints.graph_family_policy = graph_family_policy;
-        if (graph_family_policy ==
-            WorkspaceGraphFamilyPolicy::
-                SerialDeviceFamilyLargestParticipant)
+        // Both serial-family participant policies publish the family's
+        // largest prefill rows: an exact decode participant may create
+        // generation one (prefix-hit warmup) and must not omit them.
+        if (graph_family_policy !=
+            WorkspaceGraphFamilyPolicy::ExclusiveLifetime)
         {
             const int largest_bucket_rows =
                 state_.activation_seq_len > 0
@@ -18412,6 +18415,10 @@ namespace llaminar2
             input.sequence_lengths_device =
                 static_cast<const int32_t *>(
                     mtp_verifier_request_lengths_dev_);
+            // The admitted first transaction and its cold siblings borrow
+            // the same count row and must name the same native graph key.
+            if (use_device_resident_mtp_verifier_positions)
+                input.captured_verifier_extent = retainedMTPVerifierExtent(input.seq_len);
         }
         else if (effective_sequence_lengths_device)
         {
@@ -22245,6 +22252,17 @@ namespace llaminar2
         return mtp_verifier_graph_family_;
     }
 
+    CapturedVerifierExtent DeviceGraphOrchestrator::retainedMTPVerifierExtent(int rows) const
+    {
+        if (mtpVerifierGraphFamily() != MTPVerifierGraphFamily::ExactRows ||
+            !mtp_graph_owner_plan_.ownsControllerExecutables())
+            return {};
+
+        return CapturedVerifierExtent::exactHostedRequest(state_.device_id,
+            DeviceRowRange::deviceCounted(rows,
+                static_cast<const int32_t *>(mtp_verifier_request_lengths_dev_)));
+    }
+
     const ForwardGraphSignature &DeviceGraphOrchestrator::retainedMTPVerifierSignature(
         int rows, MTPVerifierOutcomeGraphMode outcome, SparseQueryExecutionProgram program) const
     {
@@ -22253,14 +22271,7 @@ namespace llaminar2
             throw std::logic_error("Exact verifier selection requires an admitted row/outcome family");
         const auto &signature = mtp_retained_verifier_signatures_.at(sparseQueryExecutionProgramIndex(program))
             .at(static_cast<std::size_t>(rows - 2)).at(outcome == MTPVerifierOutcomeGraphMode::Greedy ? 0u : 1u);
-        const auto expected_extent =
-            mtpVerifierGraphFamily() == MTPVerifierGraphFamily::ExactRows &&
-            mtpVerifierExecutionRole() == MTPVerifierExecutionRole::HostedCapturedTransactions &&
-            mtp_graph_owner_plan_.ownsControllerExecutables()
-                ? CapturedVerifierExtent::exactHostedRequest(state_.device_id,
-                    DeviceRowRange::deviceCounted(rows,
-                        static_cast<const int32_t *>(mtp_verifier_request_lengths_dev_)))
-                : CapturedVerifierExtent{};
+        const auto expected_extent = retainedMTPVerifierExtent(rows);
         if (!signature || signature->captured_verifier_extent != expected_extent ||
             signature->seq_len != rows || signature->batch_size != 1 ||
             signature->sparse_query_execution_program != program ||
@@ -36782,14 +36793,16 @@ namespace llaminar2
             return false;
         }
 
-        /*
-         * Shifted MTP KV row C is conditioned at absolute position C + 1.  The
-         * request transaction names the cache's authoritative device count, so
-         * compose that +1 in the backend input-normalization kernel and bind the
-         * captured sidecar to its persistent MTP_POSITION_IDS mailbox.  This
-         * keeps both dynamic inputs device-owned and gives every one-row KV-only
-         * sidecar the same physical position binding from its first capture.
-         */
+        const int shifted_position_offset =
+            mtpShiftedPrefixOffset(graph_builder_->config().mtpShiftedCacheOrigin());
+        if (shifted_position_offset < 0)
+        {
+            LOG_ERROR("[DeviceGraphOrchestrator] Device-target MTP shifted-row commit has an invalid cache origin");
+            return false;
+        }
+        // The input normalizer converts the authoritative shifted cache count
+        // into the RoPE position using the model's origin. QFN already counts
+        // its visible position-zero row, so that model uses no displacement.
         if (!executeMTPDepth0Batched(
                 /*draft_condition_tokens=*/nullptr,
                 /*token_count=*/1,
@@ -36815,7 +36828,7 @@ namespace llaminar2
                 /*draft_condition_token_stride=*/1,
                 /*draft_condition_ready_count=*/1,
                 /*draft_condition_ready_stride=*/1,
-                /*device_position_offset=*/1))
+                /*device_position_offset=*/shifted_position_offset))
         {
             return false;
         }
@@ -61846,15 +61859,29 @@ namespace llaminar2
             TensorBase *gate_exps = legacyTensor(depth.fa_block.moe_gate_exps);
             TensorBase *up_exps = legacyTensor(depth.fa_block.moe_up_exps);
             TensorBase *down_exps = legacyTensor(depth.fa_block.moe_down_exps);
-            if (!gate_exps || !up_exps || !down_exps)
+            /*
+             * CPU model population commits every routed expert (including the
+             * nextn predictor layer) as exact per-expert prepared projections
+             * in the model's ExpertGemmRegistry, consumed through the frozen
+             * static per-expert bindings; no 3D parent remains bound. The
+             * prepared-registry path authenticates that bank instead of
+             * reading a raw parent. A raw parent set is only valid complete.
+             */
+            const auto concrete_manager = std::dynamic_pointer_cast<WeightManager>(weight_manager_);
+            const bool any_raw_parent = gate_exps || up_exps || down_exps;
+            if (any_raw_parent && (!gate_exps || !up_exps || !down_exps))
             {
                 LOG_ERROR("[DGO] MTP depth " << depth.depth_index
                                              << " has partial MoE expert tensor bindings; refusing lazy raw fallback");
                 return false;
             }
-
-            const auto &shape = gate_exps->shape();
-            if (shape.size() != 3 || shape[1] == 0)
+            if (!any_raw_parent && (!concrete_manager || cfg.moe.intermediate_size <= 0))
+            {
+                LOG_ERROR("[DGO] MTP depth " << depth.depth_index
+                                             << " has no raw MoE expert parents and no prepared CPU expert registry");
+                return false;
+            }
+            if (any_raw_parent && (gate_exps->shape().size() != 3 || gate_exps->shape()[1] == 0))
             {
                 LOG_ERROR("[DGO] MTP depth " << depth.depth_index
                                              << " MoE gate expert tensor must be 3D [cols, rows, experts]");
@@ -61868,7 +61895,9 @@ namespace llaminar2
             params.d_model = cfg.d_model;
             params.expert_intermediate = cfg.moe.intermediate_size > 0
                                              ? cfg.moe.intermediate_size
-                                             : static_cast<int>(shape[1]);
+                                             : static_cast<int>(gate_exps->shape()[1]);
+            if (concrete_manager)
+                params.expert_registry = &concrete_manager->expertGemmRegistry();
             params.layer_idx = depth.source_layer_index >= 0
                                    ? depth.source_layer_index
                                    : cfg.n_layers + depth.depth_index;
@@ -62109,6 +62138,7 @@ namespace llaminar2
         std::atomic<int> applied{0};
         const int n = static_cast<int>(moe_stages.size());
 
+::llaminar::v2::noteOpenMPTeamFork();
 #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < n; ++i)
         {

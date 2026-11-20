@@ -19,6 +19,7 @@
 #include "config/OrchestrationStartupPolicy.h"
 #include "execution/runner/OrchestrationRunner.h"
 #include <algorithm>
+#include <array>
 #include "utils/DebugEnv.h"
 
 #include <gtest/gtest.h>
@@ -776,4 +777,33 @@ TEST(OrchestrationConfigDocument, ObservedRouteBindingRejectsMissingMalformedAnd
     }
     auto old=valid;old["schema_version"]=12;
     EXPECT_THROW((void)deserializeOrchestrationConfig(old.dump()),std::invalid_argument);
+}
+
+
+/** @test Documents cannot carry executable policy derived from the local GPU inventory. */
+TEST(OrchestrationConfigDocument, ObservedRouteBindingDoesNotPublishDerivedGPUKernelPolicy) {
+    auto config = example(DeviceType::ROCm);
+    const auto authored = serializeOrchestrationConfig(config);
+    auto &plan = *config.moe_routed_expert_plan;
+    plan.local_gpu_expert_kernel_policy = LocalGPUExpertKernelPolicy::QFNMI50TP4;
+    plan.gpu_expert_intermediate_tiling = GPUExpertIntermediateTiling::BalancedNativeK32;
+
+    EXPECT_EQ(serializeOrchestrationConfig(config), authored);
+    const auto restored = deserializeOrchestrationConfig(authored);
+    ASSERT_TRUE(restored.moe_routed_expert_plan);
+    EXPECT_EQ(restored.moe_routed_expert_plan->local_gpu_expert_kernel_policy,
+              LocalGPUExpertKernelPolicy::Generic);
+    EXPECT_EQ(restored.moe_routed_expert_plan->gpu_expert_intermediate_tiling,
+              GPUExpertIntermediateTiling::Coarse128);
+    EXPECT_EQ(serializeOrchestrationConfig(restored), authored);
+
+    const Json::json_pointer plan_path("/configuration/moe_routed_expert_plan");
+    const auto document = Json::parse(authored);
+    for (const auto &[field, value] : std::array{
+             std::pair{"local_gpu_expert_kernel_policy", "QFNMI50TP4"},
+             std::pair{"gpu_expert_intermediate_tiling", "BalancedNativeK32"}}) {
+        auto injected = document;
+        injected[plan_path][field] = value;
+        EXPECT_THROW((void)deserializeOrchestrationConfig(injected.dump()), std::invalid_argument) << field;
+    }
 }

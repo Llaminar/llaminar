@@ -218,8 +218,35 @@ protected:
             return nullptr;
         }
         kernel.bindWorkspace(workspace.get());
+        // Kernels launch only on an exact non-default stream; readbacks
+        // join it through syncKernelStream() before copying results.
+        kernel.setGPUStream(kernelStream());
         return workspace;
     }
+
+    /** @brief One explicit non-blocking stream shared by this test's kernel. */
+    cudaStream_t kernelStream()
+    {
+        if (!kernel_stream_)
+            EXPECT_EQ(cudaStreamCreateWithFlags(&kernel_stream_, cudaStreamNonBlocking), cudaSuccess);
+        return kernel_stream_;
+    }
+
+    /** @brief Join the kernel stream before a host readback. */
+    void syncKernelStream()
+    {
+        ASSERT_EQ(cudaStreamSynchronize(kernelStream()), cudaSuccess);
+    }
+
+    void TearDown() override
+    {
+        if (kernel_stream_)
+            EXPECT_EQ(cudaStreamDestroy(kernel_stream_), cudaSuccess);
+        kernel_stream_ = nullptr;
+        CUDATestBase::TearDown();
+    }
+
+    cudaStream_t kernel_stream_ = nullptr;
 #endif
 };
 
@@ -352,6 +379,8 @@ TEST_F(Test__CUDAFlashAttention_DecodeKVLen, DecodeMode_SeqLen1_KVLen7)
     ASSERT_TRUE(cuda_success) << "CUDA compute_decode failed";
 
     // Copy result back
+    syncKernelStream();
+
     cudaMemcpy(cuda_output.data(), d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost);
 
     // Compare
@@ -418,6 +447,8 @@ TEST_F(Test__CUDAFlashAttention_DecodeKVLen, WrongKVLen_ProducesWrongOutput)
     cuda_kernel.compute_decode(d_Q, d_K, d_V, d_output,
                                seq_len, kv_len, // kv_len = 16
                                n_heads, n_kv_heads, head_dim, false, 0);
+    syncKernelStream();
+
     cudaMemcpy(correct_output.data(), d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost);
 
     // WRONG: Use seq_len as kv_len (the bug behavior)
@@ -425,6 +456,8 @@ TEST_F(Test__CUDAFlashAttention_DecodeKVLen, WrongKVLen_ProducesWrongOutput)
     cuda_kernel.compute_decode(d_Q, d_K, d_V, d_output,
                                seq_len, seq_len, // kv_len = 1 (WRONG!)
                                n_heads, n_kv_heads, head_dim, false, 0);
+    syncKernelStream();
+
     cudaMemcpy(wrong_output.data(), d_output, out_size * sizeof(float), cudaMemcpyDeviceToHost);
 
     // The outputs should be DIFFERENT
@@ -503,6 +536,8 @@ TEST_F(Test__CUDAFlashAttention_DecodeKVLen, MultipleDecodeSteps_GrowingKVCache)
 
         // Save output
         std::vector<float> output(n_heads * head_dim);
+        syncKernelStream();
+
         cudaMemcpy(output.data(), d_output, n_heads * head_dim * sizeof(float), cudaMemcpyDeviceToHost);
         decode_outputs.push_back(output);
     }

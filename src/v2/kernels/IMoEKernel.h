@@ -30,6 +30,7 @@
 #include "../execution/moe/DeviceMoERebalanceController.h"
 #include "../tensors/TensorKernels.h"
 #include "common/DeviceRowRange.h"
+#include "common/NativeTileCompletion.h"
 #include "common/MoERouterOwnedRows.h"
 #include "common/MoEPrefillProjectionExecution.h"
 #include "common/MoERoutedTransactionScope.h"
@@ -37,11 +38,15 @@
 #include "../execution/moe/MoEGroupedPlanDemand.h"
 
 #include <cstdint>
+#include <stdexcept>
 #include <memory>
 #include <vector>
 
 namespace llaminar2
 {
+    class MoEIntermediateShardDescriptorDeclaration;
+    class OriginalM1HiddenQ8Binding;
+    class OriginalM1HiddenQ8ReadView;
 
     /**
      * @brief Routing result from MoE gate computation
@@ -60,7 +65,7 @@ namespace llaminar2
      * @brief Select the sole weight-descriptor authority for one captured MoE
      *        stage.
      *
-     * Routing ids and weights may come from device runtime state in either
+     * Routing ids and weights may come from device runtime state in each
      * mode. This value controls only expert projection descriptors and is
      * immutable graph identity: setup, decode, grouped prefill, and MTP replay
      * must all carry the same selection.
@@ -75,7 +80,48 @@ namespace llaminar2
         /// the mutable runtime placement table. Use this only when captured
         /// graph replay must observe in-place expert ownership/replica changes.
         RuntimePlacementTable = 1,
+
+        /** Original local F fragments read from their authenticated mutable placement bank. */
+        IntermediateShardRuntimePlacementTable = 2,
     };
+
+    /** @brief Immutable stage responsible for publishing selected decode descriptors. */
+    enum class MoEDecodeDescriptorPublisher : uint8_t { ExpertConsumer, Router };
+
+    /**
+     * @brief Demand authority for an explicit one-row route packet.
+     *
+     * PublishDecode preserves the original standalone consumer's publication.
+     * None consumes a packet whose original router/accepted-row transaction
+     * already owns selected/local demand; projection must not publish it again.
+     * The value is immutable launch/capture policy, never a host count mirror.
+     */
+    enum class MoEExplicitRouteDemand : uint8_t { PublishDecode = 0, None = 1 };
+    /** @param demand Exact original packet publication policy. @return Whether this is a closed policy arm. */
+    inline constexpr bool validMoEExplicitRouteDemand(MoEExplicitRouteDemand demand) noexcept
+    { return demand == MoEExplicitRouteDemand::PublishDecode || demand == MoEExplicitRouteDemand::None; }
+
+    /** @param source Captured descriptor authority. @return Whether this is one of the three closed arms. */
+    inline constexpr bool validMoEDecodeDescriptorSource(MoEDecodeDescriptorSource source) noexcept
+    {
+        return source == MoEDecodeDescriptorSource::StaticDescriptorTable ||
+            source == MoEDecodeDescriptorSource::RuntimePlacementTable ||
+            source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable;
+    }
+
+    /** @param source Captured descriptor authority. @return Whether descriptors come from an acquired runtime bank. */
+    inline constexpr bool moEDecodeUsesRuntimeDescriptors(MoEDecodeDescriptorSource source) noexcept
+    {
+        return source == MoEDecodeDescriptorSource::RuntimePlacementTable ||
+            source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable;
+    }
+
+    /** @param source Captured descriptor authority. @return The exact movable projection family. */
+    inline constexpr DeviceMoEProjectionSet moEDecodeProjectionSet(MoEDecodeDescriptorSource source) noexcept
+    {
+        return source == MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable
+            ? DeviceMoEProjectionSet::IntermediateShard : DeviceMoEProjectionSet::CompleteExpert;
+    }
 
     /**
      * @brief Arithmetic route selected for one prepared MoE routing graph.
@@ -135,6 +181,7 @@ namespace llaminar2
     {
         ProducerAndConsumer = 0,
         RequiredConsumer = 1,
+        ProducerAndConsumerWithExactK32Sums = 2, ///< Closed ROCm F160 verifier owns the original quantizer's sums.
     };
 
     /**
@@ -163,6 +210,23 @@ namespace llaminar2
         int blocks_per_row_capacity = 0;       ///< Scale blocks available per row.
         bool capture_recorded = false;         ///< Producer is recorded in the active capture.
 
+        /** Original M1 candidate seal; no payload bytes or allocation ledger are duplicated. */
+        std::shared_ptr<const OriginalM1HiddenQ8Binding> original_m1_binding;
+        /**
+         * @brief Require one original fully-active Decode row from this exact graph-local source.
+         * @param source Immutable original FP32 tensor declaration shared by both branches.
+         * @param width Original hidden width, divisible by32.
+         * @return False for conflicting source/geometry or a declaration after publication.
+         */
+        [[nodiscard]] bool requireOriginalM1Consumer(const TensorBase* source,int width) noexcept {
+            if(!source||source_rows||(required_original_m1_source_&&required_original_m1_source_!=source)||
+               !requireConsumerRows(1,width))return false;
+            required_original_m1_source_=source;return true;
+        }
+        /** @return Exact declared source, or null for all original unchanged modes. */
+        const TensorBase* requiredOriginalM1Source() const noexcept{return required_original_m1_source_;}
+        /** @return Exact declared M1 hidden width, excluding allocation capacity. */
+        int requiredOriginalM1Width() const noexcept{return required_original_m1_source_?required_width_:0;}
         /**
          * @brief Declare the exact graph-local grouped consumer before planning.
          * @param rows Immutable physical row extent, not a device live count.
@@ -211,6 +275,7 @@ namespace llaminar2
         }
 
     private:
+        const TensorBase* required_original_m1_source_=nullptr; ///< Optional immutable candidate declaration, never last-input caching.
         int required_rows_ = 0; ///< Cold graph capacity; never a live-row mirror.
         int required_width_ = 0; ///< Exact hidden width of the required consumer.
     };
@@ -562,6 +627,18 @@ namespace llaminar2
         }
 
         /**
+         * @brief Seal the declared ordinary M1 original-hidden publication after original cold resource preparation.
+         * @param hidden Exact declared resident source shared by both branches.
+         * @param rows Fully-active physical row1; counted/grouped modes are outside this candidate.
+         * @return True only after original source/workspace leases and exact stream are authenticated.
+         */
+        virtual bool prepareOriginalM1HiddenQ8Publication(const TensorBase* hidden,DeviceRowRange rows) {
+            (void)hidden;(void)rows;throw std::logic_error("Original M1 hidden Q8 publication is absent from this backend");
+        }
+        /** @brief Validate existing candidate physical bindings; return declaration-stable identity across cold preparation. */
+        virtual std::uint64_t originalM1HiddenQ8BindingSignature() const{return 0;}
+
+        /**
          * @brief Decode one row into the device-resident runtime route table.
          *
          * `absolute_position_ids_device` is the same graph-local position row
@@ -574,6 +651,11 @@ namespace llaminar2
          * alone does not specify whether one participant or every participant
          * executes a selected row. Fully replicated local routing must preserve
          * every locally resident route and must never apply LLEP assignment.
+         *
+         * @param active_row_count_device Optional immutable-address device INT32 count
+         * for this physical row. Zero publishes invalid IDs and zero weights without
+         * histogram demand; one retains the exact installed arithmetic. Any other
+         * value is fatal. The pointer is retained in captured launch identity.
          */
         virtual bool decodeRouteSelect(
             DeviceMoELayerRuntime *runtime_layer,
@@ -584,7 +666,8 @@ namespace llaminar2
             bool write_legacy_outputs,
             bool update_runtime_histogram,
             const int32_t *absolute_position_ids_device,
-            RoutedExpertRowExecutionPolicy row_execution_policy)
+            RoutedExpertRowExecutionPolicy row_execution_policy,
+            const int32_t *active_row_count_device = nullptr)
         {
             (void)runtime_layer;
             (void)hidden;
@@ -599,13 +682,16 @@ namespace llaminar2
             (void)update_runtime_histogram;
             (void)absolute_position_ids_device;
             (void)row_execution_policy;
+            (void)active_row_count_device;
             return false;
         }
 
         /// Decode-only runtime-table routing path with graph-capturable
         /// ready-wave rebalance apply piggybacked into the existing route
         /// kernel launch. Implementations must not launch a separate apply
-        /// kernel for this method.
+        /// kernel for this method. The optional device count has the same
+        /// live/empty/fatal contract as decodeRouteSelect and remains part of
+        /// the retained launch; empty rows publish no demand.
         virtual bool decodeRouteSelectWithReadyRebalanceApply(
             DeviceMoELayerRuntime *runtime_layers,
             DeviceMoELayerRuntime *runtime_layer,
@@ -626,7 +712,8 @@ namespace llaminar2
             int rebalance_target_layer,
             uint32_t rebalance_command_buffer_count,
             const int32_t *absolute_position_ids_device,
-            RoutedExpertRowExecutionPolicy row_execution_policy)
+            RoutedExpertRowExecutionPolicy row_execution_policy,
+            const int32_t *active_row_count_device = nullptr)
         {
             (void)runtime_layers;
             (void)runtime_layer;
@@ -652,6 +739,7 @@ namespace llaminar2
             (void)rebalance_command_buffer_count;
             (void)absolute_position_ids_device;
             (void)row_execution_policy;
+            (void)active_row_count_device;
             return false;
         }
 
@@ -809,6 +897,8 @@ namespace llaminar2
          * @param d_model Down-projection row count.
          * @param intermediate Down-projection reduction width.
          * @param descriptor_source Immutable graph-selected descriptor authority.
+         * @param original_family Closed original GPU fragment source; only exact Source2 tables
+         *        may use this authority to admit an all-empty initial descriptor image.
          * @return Persistent backend table id, or -1 on contract failure.
          */
         virtual int uploadGroupedExpertDownDescriptorTable(
@@ -817,13 +907,15 @@ namespace llaminar2
             int d_model,
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source =
-                MoEDecodeDescriptorSource::StaticDescriptorTable)
+                MoEDecodeDescriptorSource::StaticDescriptorTable,
+            const MoEIntermediateShardDescriptorDeclaration *original_family = nullptr)
         {
             (void)down_descs;
             (void)num_experts;
             (void)d_model;
             (void)intermediate;
             (void)descriptor_source;
+            (void)original_family;
             return -1;
         }
 
@@ -842,6 +934,8 @@ namespace llaminar2
          * @param d_model Gate/up reduction width.
          * @param intermediate Gate/up row count.
          * @param descriptor_source Immutable graph-selected descriptor authority.
+         * @param original_family Closed original GPU fragment source; only exact Source2 tables
+         *        may use this authority to admit an all-empty initial descriptor image.
          * @return Persistent backend table id, or -1 on contract failure.
          */
         virtual int uploadGroupedExpertGateUpDescriptorTables(
@@ -851,7 +945,8 @@ namespace llaminar2
             int d_model,
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source =
-                MoEDecodeDescriptorSource::StaticDescriptorTable)
+                MoEDecodeDescriptorSource::StaticDescriptorTable,
+            const MoEIntermediateShardDescriptorDeclaration *original_family = nullptr)
         {
             (void)gate_descs;
             (void)up_descs;
@@ -859,6 +954,7 @@ namespace llaminar2
             (void)d_model;
             (void)intermediate;
             (void)descriptor_source;
+            (void)original_family;
             return -1;
         }
 
@@ -869,20 +965,27 @@ namespace llaminar2
          * Every non-blank entry uses @p weight_format and exact row-major
          * geometry. The returned id occupies the same typed table namespace as
          * NativeQuantised tables so captured callers cannot accidentally combine
-         * descriptor families.
+         * descriptor families. The descriptor-source arm is complete capture
+         * identity; fragment tables require their authenticated runtime bank.
+         * @param original_family Closed original GPU source proof. Only exact Source2 tables
+         * may use it to admit an all-empty image with the declared fixed source precision.
          */
         virtual int uploadGroupedExpertFloatingDownDescriptorTable(
             const DeviceMoEFloatingMatrixDesc *down_descs,
             DeviceMoEWeightFormat weight_format,
             int num_experts,
             int d_model,
-            int intermediate)
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source = MoEDecodeDescriptorSource::StaticDescriptorTable,
+            const MoEIntermediateShardDescriptorDeclaration *original_family = nullptr)
         {
             (void)down_descs;
             (void)weight_format;
             (void)num_experts;
             (void)d_model;
             (void)intermediate;
+            (void)descriptor_source;
+            (void)original_family;
             return -1;
         }
 
@@ -890,7 +993,10 @@ namespace llaminar2
          * @brief Publish persistent contiguous-floating gate/up tables.
          *
          * Gate and up entries must be blank together or form a complete pair
-         * with the same @p weight_format and projection geometry.
+         * with the same @p weight_format and projection geometry. The captured
+         * descriptor-source arm distinguishes original local F fragments.
+         * @param original_family Closed original GPU source proof. Only exact Source2 tables
+         * may use it to admit an all-empty image with the declared fixed source precision.
          */
         virtual int uploadGroupedExpertFloatingGateUpDescriptorTables(
             const DeviceMoEFloatingMatrixDesc *gate_descs,
@@ -898,7 +1004,9 @@ namespace llaminar2
             DeviceMoEWeightFormat weight_format,
             int num_experts,
             int d_model,
-            int intermediate)
+            int intermediate,
+            MoEDecodeDescriptorSource descriptor_source = MoEDecodeDescriptorSource::StaticDescriptorTable,
+            const MoEIntermediateShardDescriptorDeclaration *original_family = nullptr)
         {
             (void)gate_descs;
             (void)up_descs;
@@ -906,6 +1014,8 @@ namespace llaminar2
             (void)num_experts;
             (void)d_model;
             (void)intermediate;
+            (void)descriptor_source;
+            (void)original_family;
             return -1;
         }
 
@@ -1201,6 +1311,8 @@ namespace llaminar2
          * @param descriptor_source Select immutable setup descriptors or the
          *        mutable runtime placement bank. Runtime placement requires a
          *        non-null @p runtime_layer and forbids a host ownership mask.
+         * @param demand Selected/local demand publication policy; None is required
+         *        when the original router or accepted-row transaction already owns it.
          * @return true after the output write has been published on the exact
          *         producer stream; false on any contract or launch failure.
          */
@@ -1218,7 +1330,8 @@ namespace llaminar2
             ITensor *canonical_route_contributions = nullptr,
             DeviceMoELayerRuntime *runtime_layer = nullptr,
             MoEDecodeDescriptorSource descriptor_source =
-                MoEDecodeDescriptorSource::StaticDescriptorTable)
+                MoEDecodeDescriptorSource::StaticDescriptorTable,
+            MoEExplicitRouteDemand demand = MoEExplicitRouteDemand::PublishDecode)
         {
             (void)input;
             (void)routing_indices;
@@ -1233,6 +1346,7 @@ namespace llaminar2
             (void)canonical_route_contributions;
             (void)runtime_layer;
             (void)descriptor_source;
+            (void)demand;
             return false;
         }
 
@@ -1293,6 +1407,83 @@ namespace llaminar2
             (void)intermediate;
             (void)descriptor_source;
             return false;
+        }
+
+        /**
+         * @brief Freeze the ordinary M1 gate/up publication policy on its original table owner.
+         * @param table Exact already-prepared gate/up descriptor table.
+         * @param top_k Fixed original route capacity, never a live count readback.
+         * @param policy Declared staged or nonblocking last-producer publication.
+         * @return Complete prepared physical signature; zero denotes explicit Staged policy.
+         * @throws std::logic_error If the selected backend/mode is unsupported or storage changed.
+         * @note Cold preparation alone may initialize counters. Captured work
+         * performs no allocation, transfer, host observation or clearing launch.
+         */
+        virtual std::uint64_t prepareGateUpPublication(int table,int top_k,MoEGateUpPublicationPolicy policy)
+        {
+            (void)table;(void)top_k;
+            if(policy!=MoEGateUpPublicationPolicy::Staged)
+                throw std::logic_error("Selected backend has no native last-producer gate/up implementation");
+            return 0;
+        }
+        /**
+         * @brief Validate original retained counter/table storage before a native replay.
+         * @param table Original prepared gate/up descriptor table.
+         * @param top_k Original immutable route capacity.
+         * @return Sealed physical signature; zero means this table is explicitly Staged.
+         * @throws std::logic_error For stale owner, stream, generation, pointer or geometry.
+         * @note Performs no device query, allocation or live counter readback.
+         */
+        virtual std::uint64_t gateUpPublicationSignature(int table,int top_k) const
+        {(void)table;(void)top_k;return 0;}
+
+        /**
+         * @brief Admit original native M1 down/weighted-route/slot-fold completion cold.
+         * @param table Original prepared down descriptor table, never a replacement descriptor family.
+         * @param top_k Fixed original selected route extent including invalid slot obligations.
+         * @param policy Explicit staged or two-level nonblocking publication.
+         * @return Complete retained physical signature; zero for Staged.
+         * @throws std::logic_error For unsupported backend/mode or changed storage.
+         * @note No hot allocation/readback/reset launch; setup metadata completes before capture.
+         */
+        virtual std::uint64_t prepareDownPublication(int table,int top_k,MoEDownPublicationPolicy policy)
+        {
+            (void)table;(void)top_k;
+            if(policy!=MoEDownPublicationPolicy::Staged)
+                throw std::logic_error("Selected backend has no native last-producer down/route implementation");
+            return 0;
+        }
+        /**
+         * @brief Validate original counter/descriptor/scratch ownership before retained submission.
+         * @param table Original prepared down table.
+         * @param top_k Original immutable route extent.
+         * @return Sealed signature, or zero for explicit Staged; no device query or live readback.
+         * @throws std::logic_error For changed owner/generation/stream/source/physical pointers.
+         */
+        virtual std::uint64_t downPublicationSignature(int table,int top_k) const
+        {(void)table;(void)top_k;return 0;}
+
+        /**
+         * @brief Select descriptor publication for an authenticated paired decode graph.
+         * @param runtime_layer Original device-owned placement/routing state.
+         * @param gateup_table Original prepared local-fragment gate/up table handle.
+         * @param down_table Original prepared local-fragment down table handle.
+         * @param top_k Exact selected-slot count retained in both graph stages.
+         * @return Backend's economical publication site, frozen before capture.
+         * @throws std::logic_error For an invalid or changed prepared binding.
+         *
+         * Only the local-fragment graph builder calls this after proving that
+         * its ordinary router and consumer share this kernel, runtime, stream
+         * and a directed dependency. Prepared-service packets and routers that
+         * apply rebalance commands retain their independent publication.
+         * CPU/CUDA currently retain their measured separate publication policy.
+         * No mutable placement, descriptor values or live counts are mirrored.
+         */
+        virtual MoEDecodeDescriptorPublisher preparePairedRouterDecodeDescriptors(
+            DeviceMoELayerRuntime *runtime_layer, int gateup_table, int down_table, int top_k)
+        {
+            (void)runtime_layer; (void)gateup_table; (void)down_table; (void)top_k;
+            return MoEDecodeDescriptorPublisher::ExpertConsumer;
         }
 
         /**

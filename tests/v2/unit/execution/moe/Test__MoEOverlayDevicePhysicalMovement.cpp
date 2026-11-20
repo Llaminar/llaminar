@@ -4,6 +4,8 @@
  *
  * Also verifies that fatal physical-progress diagnostics preserve immutable
  * endpoint identity, distinguish projection roles, and never mutate receipts.
+ * Metadata-only cohort sweeps prove whole/sharded targets and physical shadow
+ * obligations without creating artificial MPI ranks or claiming device execution.
  */
 
 #include <gtest/gtest.h>
@@ -12,6 +14,9 @@
 #include "execution/moe/MoEOverlayDevicePhysicalMovement.h"
 #include "execution/moe/MoEOverlayCycleSearch.h"
 #include "execution/moe/MoEOverlayPhysicalLaneDemand.h"
+#include "execution/moe/MoEExpertShardCohort.h"
+#include "execution/moe/MoEOverlayDevicePreparedArrivalInbox.h"
+#include "execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
 
 #include <algorithm>
 #include <array>
@@ -141,38 +146,20 @@ namespace llaminar2::test
             MoEOverlayDeviceControllerTransactionKind kind,
             std::uint64_t base_epoch,
             std::vector<MoEOverlayDeviceMovementCommand> entries,
-            std::uint64_t topology_fingerprint = kTopologyFingerprint)
+            std::uint64_t topology_fingerprint = kTopologyFingerprint,
+            const MoEOverlayDeviceControllerTopology *original = nullptr)
         {
             const bool durable_placement =
                 kind == MoEOverlayDeviceControllerTransactionKind::
                             DynamicPlacement ||
                 kind == MoEOverlayDeviceControllerTransactionKind::
                             PreparedContextRestore;
-            const auto frozen_topology = topology();
-            const auto participantPriority =
-                [&frozen_topology](std::uint32_t participant_id)
+            const auto frozen_topology = original ? *original : topology();
+            const auto participantPriority = [&frozen_topology](MoEOverlayRouteTarget target)
             {
-                const auto participant = std::find_if(
-                    frozen_topology.participants.begin(),
-                    frozen_topology.participants.end(),
-                    [participant_id](const auto &candidate)
-                    {
-                        return candidate.participant_id ==
-                               static_cast<int>(participant_id);
-                    });
-                if (participant == frozen_topology.participants.end())
-                    throw std::logic_error(
-                        "test command names an unknown participant");
-                const auto group = std::find_if(
-                    frozen_topology.groups.begin(),
-                    frozen_topology.groups.end(),
-                    [&participant](const auto &candidate)
-                    {
-                        return candidate.tier_index == participant->tier_idx;
-                    });
-                if (group == frozen_topology.groups.end())
-                    throw std::logic_error(
-                        "test participant has no immutable tier group");
+                const auto *group = frozen_topology.groupForTarget(target);
+                if (!group)
+                    throw std::logic_error("test command has no original target group");
                 return group->tier_priority;
             };
             std::uint64_t bytes = 0u;
@@ -192,9 +179,9 @@ namespace llaminar2::test
                 }
                 changed_layers.at(entry.layer) = 1u;
                 const int source_priority =
-                    participantPriority(entry.source_participant);
+                    participantPriority(entry.source_target);
                 const int destination_priority =
-                    participantPriority(entry.destination_participant);
+                    participantPriority(entry.destination_target);
                 if (destination_priority < source_priority)
                     ++promotions;
                 else if (destination_priority > source_priority)
@@ -268,7 +255,7 @@ namespace llaminar2::test
                 }
             }
             result.entries = std::move(entries);
-            result.participant_count = 4u;
+            result.participant_count = static_cast<std::uint32_t>(frozen_topology.participants.size());
             result.num_layers = layer_count;
             result.num_experts = 16u;
             return result;
@@ -289,8 +276,8 @@ namespace llaminar2::test
                 .op = static_cast<std::uint32_t>(op),
                 .layer = layer,
                 .expert = expert,
-                .source_participant = source,
-                .destination_participant = destination,
+                .source_target = MoEOverlayRouteTarget::whole(source),
+                .destination_target = MoEOverlayRouteTarget::whole(destination),
                 .flags = moeOverlayMovementFlags(axis,
                     op == MoEOverlayDeviceMovementOp::DurableMove ? 1u : 0u),
                 .payload_bytes = bytes,
@@ -308,8 +295,8 @@ namespace llaminar2::test
                     MoEOverlayDeviceMovementOp::TransientAssignment),
                 .layer = layer,
                 .expert = expert,
-                .source_participant = participant,
-                .destination_participant = participant,
+                .source_target = MoEOverlayRouteTarget::whole(participant),
+                .destination_target = MoEOverlayRouteTarget::whole(participant),
                 .payload_slot = kMoEOverlayDeviceInvalidSlot,
                 .flags = static_cast<std::uint32_t>(
                     MoEOverlayDeviceMovementAxis::ParticipantPlacement),
@@ -317,6 +304,102 @@ namespace llaminar2::test
         }
     } // namespace
 
+    namespace
+    {
+        /**
+         * @brief Build source-checked whole/cohort metadata without a live backend.
+         * @param backend Common compute type, validated by the cohort constructor.
+         * @param width Physical member extent; one denotes a whole expert.
+         * @param tier Logical target, also separating metadata-only rank identities.
+         * @param first_id First sparse canonical physical ID, never an array offset.
+         * @return Complete original source/cut target for logical expert zero.
+         */
+        MoEExpertOwner fragmentMovementTarget(DeviceType backend, int width, int tier, int first_id)
+        {
+            MoEExpertOwner result;
+            result.layer_idx = 0;
+            result.expert_id = 0;
+            result.tier_idx = tier;
+            result.tier_name = "tier_" + std::to_string(tier);
+            result.domain_name = "domain_" + std::to_string(tier);
+            const auto address = [backend](int ordinal) {
+                return backend == DeviceType::CPU ? GlobalDeviceAddress::cpu(ordinal)
+                    : backend == DeviceType::CUDA ? GlobalDeviceAddress::cuda(ordinal)
+                    : GlobalDeviceAddress::rocm(ordinal);
+            };
+            if (width == 1)
+            {
+                result.owner_participant = first_id;
+                result.device = address(0).toLocalDeviceId();
+                result.owner_world_rank = tier;
+                result.owner_world_rank_known = true;
+                result.domain_participant_index = 0;
+                return result;
+            }
+            result.device = DeviceId::invalid();
+            MoEOverlayLayerWeightManifest source;
+            source.layer_idx = 0;
+            source.projections = {
+                MoEOverlayProjectionWeightManifest{.projection = ExpertTierWeightProjection::Gate,
+                    .N = 4096, .K = 256, .format = ExpertWeightFormat::floating(TensorType::FP32)},
+                MoEOverlayProjectionWeightManifest{.projection = ExpertTierWeightProjection::Up,
+                    .N = 4096, .K = 256, .format = ExpertWeightFormat::floating(TensorType::FP32)},
+                MoEOverlayProjectionWeightManifest{.projection = ExpertTierWeightProjection::Down,
+                    .N = 256, .K = 4096, .format = ExpertWeightFormat::floating(TensorType::FP32)},
+            };
+            std::vector<MoEExpertShardCohort::Participant> members;
+            for (int member = 0; member < width; ++member)
+                members.push_back({.participant_id = first_id + 3 * member,
+                    .world_rank = backend == DeviceType::CPU ? tier * 64 + member : tier,
+                    .address = address(member)});
+            auto cuts = backend == DeviceType::CPU
+                ? MoEExpertShardCohort::balancedIntervals(source, width)
+                : MoEExpertShardCohort::gpuIntervals(source, width, 0);
+            result.shard_cohort = std::make_shared<const MoEExpertShardCohort>(backend == DeviceType::CPU
+                ? MoEExpertShardCohort::checked(source, 8, std::move(members), std::move(cuts))
+                : MoEExpertShardCohort::checkedRankLocalGPU(source, 8, std::move(members), std::move(cuts)));
+            return result;
+        }
+
+        /**
+         * @brief Retain two original logical targets in one closed swap receipt.
+         * @param source Original whole or cohort owner of expert zero.
+         * @param destination Original whole or cohort owner of expert one.
+         * @return Physical receipt with one shadow per arriving member and no fake owner.
+         * @note This tests validation of already-authenticated metadata, not the
+         * still-pending GPU controller authoring of cohort movement commands.
+         */
+        MoEOverlayDevicePhysicalMovementBatch fragmentMovementBatch(
+            MoEExpertOwner source, MoEExpertOwner destination)
+        {
+            MoEOverlayDevicePhysicalMovementBatch result;
+            result.kind = MoEOverlayDeviceControllerTransactionKind::DynamicPlacement;
+            result.topology_fingerprint = kTopologyFingerprint;
+            result.transaction_id = result.base_epoch = 1;
+            result.candidate_epoch = 2;
+            result.command_digest = 17;
+            result.command_count = 2;
+            result.participant_count = static_cast<std::uint32_t>(
+                MoEExpertPlacementTarget::fromPlacement(source)->participantCount() +
+                MoEExpertPlacementTarget::fromPlacement(destination)->participantCount());
+            result.num_layers = 1;
+            result.num_experts = 8;
+            result.execution_fingerprint = {.low = 7, .high = 9};
+            constexpr std::size_t expert_bytes = 3u * 4096u * 256u * sizeof(float);
+            result.migrations.push_back({.layer_idx = 0, .expert_id = 0,
+                .estimated_weight_bytes = expert_bytes, .source = source, .destination = destination});
+            source.expert_id = destination.expert_id = 1;
+            result.migrations.push_back({.layer_idx = 0, .expert_id = 1,
+                .estimated_weight_bytes = expert_bytes, .source = destination, .destination = source});
+            result.packed_weight_bytes = 2u * expert_bytes;
+            result.migration_cycles = buildMoEOverlayMigrationCycles(result.migrations);
+            result.shadow_requirements = buildMoEOverlayShadowRequirements(result.migrations);
+            return result;
+        }
+    }
+
+    /** @brief Typed commands retain complete targets at unequal metadata degrees without fake owners. */
+    /** @brief Empty-local ranks and original sparse members never resolve through cohort sentinels. */
     /** Both durable objectives translate every row without changing payload volume. */
     TEST(Test__MoEOverlayDevicePhysicalMovement,
          PipelineStageDurableCyclesRetainGlobalLayerIdentity)
@@ -601,8 +684,8 @@ namespace llaminar2::test
                 }
             std::sort(entries.begin(), entries.end(), [](const auto &a, const auto &b)
             {
-                return std::tie(a.destination_participant, a.layer, a.expert) <
-                       std::tie(b.destination_participant, b.layer, b.expert);
+                return std::tuple(a.destination_target.word(), a.layer, a.expert) <
+                       std::tuple(b.destination_target.word(), b.layer, b.expert);
             });
             auto command = commandBatch(
                 MoEOverlayDeviceControllerTransactionKind::DynamicPlacement, 7u, entries);
@@ -679,8 +762,8 @@ namespace llaminar2::test
                 {
                     const auto &edge = physical.migrations[index];
                     EXPECT_EQ(edge.expert_id, command.entries[index].expert);
-                    EXPECT_EQ(edge.source.owner_participant, command.entries[index].source_participant);
-                    EXPECT_EQ(edge.destination.owner_participant, command.entries[index].destination_participant);
+                    EXPECT_EQ(edge.source.owner_participant, command.entries[index].source_target.word());
+                    EXPECT_EQ(edge.destination.owner_participant, command.entries[index].destination_target.word());
                     EXPECT_EQ(edge.axis, MoEOptimizationMovementAxis::TierResidency);
                 }
             }

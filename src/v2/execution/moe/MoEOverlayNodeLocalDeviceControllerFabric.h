@@ -10,13 +10,13 @@
 
 #pragma once
 
+#include "utils/HostPageSize.h"
 #include "DeviceMoERebalancePolicyShared.h"
 #include "MoEOverlayDeviceControllerKernels.h"
 #include "MoEOverlayDeviceControllerFabricABI.h"
 #include "MoEOverlayDeviceControllerTopology.h"
 #include "backends/DeviceId.h"
 
-#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -38,8 +38,11 @@ namespace llaminar2
         std::size_t setup_header_offset = 0u;
         std::size_t leader_owned_begin = 0u;
         std::size_t leader_owned_end = 0u;
+        /** Exact immutable setup roster/publication layout, before leader pages. */
+        MoEOverlayDeviceControllerFabricSetupHeader setup;
         MoEOverlayDeviceControllerFabricLayoutHeader header;
         std::vector<MoEOverlayDeviceControllerFabricGroupLayout> groups;
+        std::vector<MoEOverlayDeviceControllerLogicalTargetMetadata> logical_targets;
 
         /** @return Whether every region is aligned, bounded, and non-overlapping. */
         [[nodiscard]] bool valid() const noexcept;
@@ -97,14 +100,19 @@ namespace llaminar2
         const MoEOverlayDeviceControllerFabricLayoutHeader *layout = nullptr;
         const MoEOverlayDeviceControllerParticipantMetadata *participants = nullptr;
         const MoEOverlayDeviceControllerFabricGroupLayout *groups = nullptr;
+        const MoEOverlayDeviceControllerLogicalTargetMetadata *logical_targets = nullptr;
         MoEOverlayDeviceControllerSharedHeader *controller = nullptr;
         MoEOverlayDeviceControllerInferenceEpochRecord *inference_epoch_record =
             nullptr;
+        /** Immutable admitted epoch record/tail extent embedded in capture. */
+        std::uint64_t inference_epoch_storage_bytes = 0u;
+        /** Exact member-local arrival alias; null for an external follower. */
+        std::uint64_t *inference_epoch_arrival = nullptr;
         MoEOverlayDeviceControllerCommandHeader *command = nullptr;
         MoEOverlayDeviceMovementCommand *command_entries = nullptr;
         const std::uint64_t *payload_bytes_per_layer = nullptr;
         /** Immutable restoration target captured from the prepared owner map. */
-        const std::uint32_t *initial_owner_participants = nullptr;
+        const MoEOverlayRouteTarget *initial_route_targets = nullptr;
         /** Leader-owned phase-separated demand retained across transactions. */
         std::uint64_t *demand_history = nullptr;
         /** Immutable measured economy published by the host evidence owner. */
@@ -166,21 +174,15 @@ namespace llaminar2
          * uses them only to decide when a bounded retained phase may be
          * submitted without leaving a cross-device wait kernel resident.
          */
-        std::array<const MoEOverlayDeviceControllerGroupRecord *,
-                   kMoEOverlayDeviceControllerFabricMaxParticipants>
-            group_records = {};
+        std::vector<const MoEOverlayDeviceControllerGroupRecord *> group_records;
         /**
          * Topology-wide participant lifecycle lanes, grouped by controller
          * cell. They let the scheduler prove a complete reader grace period
          * before submitting a bounded retirement graph. No runtime descriptor,
          * histogram, or placement payload is reachable through these aliases.
          */
-        std::array<const MoEOverlayDeviceControllerParticipantRecord *,
-                   kMoEOverlayDeviceControllerFabricMaxParticipants>
-            topology_participant_records = {};
-        std::array<std::uint32_t,
-                   kMoEOverlayDeviceControllerFabricMaxParticipants>
-            topology_participant_record_counts = {};
+        std::vector<const MoEOverlayDeviceControllerParticipantRecord *> topology_participant_records;
+        std::vector<std::uint32_t> topology_participant_record_counts;
         std::uint32_t group_record_count = 0u;
         const MoEOverlayDeviceControllerParticipantRecord *
             participant_records = nullptr;
@@ -223,7 +225,7 @@ namespace llaminar2
              * copied once into immutable mapped pages and is consumed only by
              * the device authority's terminal context-restoration policy.
              */
-            std::vector<std::uint32_t> initial_owner_participants;
+            std::vector<MoEOverlayRouteTarget> initial_route_targets;
             /** Observation floor before an epoch is economically meaningful. */
             std::uint64_t minimum_window_activations = 1u;
             /** Tunable complete-cycle budget for one asynchronous epoch wave. */
@@ -271,7 +273,7 @@ namespace llaminar2
             std::uint32_t num_layers,
             std::uint32_t num_experts,
             std::uint32_t command_capacity,
-            std::size_t page_bytes = 4096u,
+            std::size_t page_bytes = hostPageBytes(),
             const std::vector<std::uint64_t> &payload_bytes_per_layer = {},
             std::uint64_t minimum_window_activations = 1u,
             std::uint32_t maximum_cycles_per_wave = 1u,

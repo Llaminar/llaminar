@@ -14,6 +14,10 @@
 #pragma once
 
 #include "MoEExpertOwnerMap.h"
+#include "MoEOverlayDynamicPolicyWorkspace.h"
+#include "MoEOverlayRouteTarget.h"
+#include "MoEOverlayDeviceControllerFabricABI.h"
+#include <optional>
 
 #include <cstdint>
 #include <span>
@@ -22,20 +26,6 @@
 
 namespace llaminar2
 {
-    /** Device transport used to mirror one leader decision inside a group. */
-    enum class MoEOverlayDeviceControllerIntraGroupTransport : std::uint8_t
-    {
-        SingleParticipant = 0, ///< The group root is its only participant.
-        NativeCollective,      ///< One homogeneous rank-local NCCL/RCCL group.
-    };
-
-    /** Device transport joining one follower-group root to the sole leader. */
-    enum class MoEOverlayDeviceControllerInterGroupTransport : std::uint8_t
-    {
-        LeaderLocal = 0, ///< This is the group containing the authority leader.
-        NodeLocalMapped, ///< Fixed device-owned records in mapped shared pages.
-    };
-
     /**
      * @brief One native-control group beneath the topology-wide authority.
      *
@@ -59,6 +49,8 @@ namespace llaminar2
             MoEOverlayDeviceControllerIntraGroupTransport::SingleParticipant;
         MoEOverlayDeviceControllerInterGroupTransport inter_group_transport =
             MoEOverlayDeviceControllerInterGroupTransport::NodeLocalMapped;
+        /** Original complete cohort over participant_ids, or absent for whole-owner groups. */
+        MoEOverlayRouteTarget cohort_target;
 
         /** @return Whether immutable topology fields name a usable group. */
         [[nodiscard]] bool valid() const noexcept;
@@ -77,12 +69,19 @@ namespace llaminar2
      */
     struct MoEOverlayDeviceControllerTopology
     {
+        /** @brief Original immutable source geometry; expert residency is not retained here. */
+        struct CohortDeclaration
+        {
+            int tier_index = -1;
+            std::shared_ptr<const MoEExpertShardCohort> cohort;
+        };
         int leader_participant_id = -1; ///< Sole policy and epoch-CAS writer.
         int leader_group_id = -1;       ///< Group containing the leader.
         int leader_world_rank = -1;     ///< Rank owning the leader GPU.
         DeviceId leader_device = DeviceId::invalid(); ///< Exact leader GPU.
         std::vector<MoEExpertOwnerParticipant> participants; ///< Canonical owner-map order.
         std::vector<MoEOverlayDeviceControllerGroup> groups; ///< Canonical group order.
+        std::vector<CohortDeclaration> source_cohorts; ///< Original tier/layer source families only.
         std::uint64_t topology_fingerprint = 0u; ///< Non-zero frozen identity.
 
         /** @return Whether every topology invariant needed by graph wiring holds. */
@@ -92,9 +91,46 @@ namespace llaminar2
         [[nodiscard]] const MoEOverlayDeviceControllerGroup *groupForParticipant(
             int participant_id) const noexcept;
 
+        /** @param target Original whole/cohort route value.
+         * @return Its exact original group; cohort members are never scalar aliases. */
+        /**
+         * @brief Enumerate one immutable policy vertex per whole target or complete cohort.
+         * @return Original target tags with exact extents into existing group rosters.
+         * @throws std::invalid_argument For unaddressable counts or incomplete topology.
+         */
+        [[nodiscard]] std::vector<MoEOverlayDeviceControllerLogicalTargetMetadata> logicalTargets() const;
+
+        [[nodiscard]] const MoEOverlayDeviceControllerGroup *groupForTarget(
+            MoEOverlayRouteTarget target) const noexcept;
+
+        /** @param target Original complete cohort target. @param layer Model-global source layer.
+         * @return SAME retained source geometry, absent for unknown or whole targets. */
+        [[nodiscard]] std::shared_ptr<const MoEExpertShardCohort> cohortForTarget(
+            MoEOverlayRouteTarget target, int layer) const noexcept;
+
         /** @return Whether a mapped inter-group device control fabric is required. */
         [[nodiscard]] bool usesNodeLocalMappedControl() const noexcept;
     };
+
+    /** @brief Cold BOM projection of the actual sole mapped-policy allocation owner. */
+    struct MoEOverlayDynamicPolicyWorkspaceDeclaration
+    {
+        int world_rank = -1;
+        DeviceId device = DeviceId::invalid();
+        MoEOverlayDynamicPolicyShape shape;
+    };
+
+    /**
+     * @brief Quote mapped-policy scratch using the same tier grouping and leader rules as runtime.
+     * @param plan Original source declaration, before any expert quota or placement search.
+     * @param experts Original complete expert axis.
+     * @return Sole allocation owner, absent when no mapped policy graph exists.
+     * @throws std::invalid_argument For incomplete/foreign participant or geometry metadata.
+     * @note This contributes typed BOM input only; physical locality and capacity remain
+     *       inventory/PMA admission decisions. No owner rows or live ledger are created.
+     */
+    [[nodiscard]] std::optional<MoEOverlayDynamicPolicyWorkspaceDeclaration>
+    declareMoEOverlayDynamicPolicyWorkspace(const MoERoutedExpertPlacementPlan &plan, std::uint32_t experts);
 
     /** Inputs that bind declarative ranks to physical-node locality. */
     struct MoEOverlayDeviceControllerTopologyOptions

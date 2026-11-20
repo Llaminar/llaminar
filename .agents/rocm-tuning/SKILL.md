@@ -444,6 +444,11 @@ candidate. Leave them unset to profile the installed capture-time policy.
 `rocprof` tells you *which* kernel is slow; the LLVM toolchain tells you *why*. HIP
 executables can contain several target code objects. Extract the actual native
 agent's loaded object and verify its target, wave width and resource metadata.
+Pass a distinct positional host output to `llvm-objcopy --dump-section`, as
+shown below. With only an input path LLVM can rewrite the host ELF and replace
+a linker-name symlink. Use a read-only source mount or a private copy when
+inspecting a serving or comparison binary.
+
 The following extraction and resource examples are specifically gfx906.
 
 ```bash

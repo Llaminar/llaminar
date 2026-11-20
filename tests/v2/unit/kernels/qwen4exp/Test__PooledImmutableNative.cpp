@@ -18,11 +18,13 @@
 #include "kernels/qwen4exp/PooledImmutablePublicationOps.h"
 #include "kernels/common/SamplingMath.h"
 #include "../../../fixtures/qwen4exp/original_PooledImmutableSourceOwner.inc"
+#include "../../../utils/IntentionalFaultProcess.h"
 #include "loaders/ImmutableRowTable.h"
 #include "loaders/ModelLoader.h"
 #include <gtest/gtest.h>
 #include <array>
 #include <algorithm>
+#include <csignal>
 #include <cstring>
 #include <functional>
 #include <memory>
@@ -1700,7 +1702,10 @@ TEST(PooledImmutableNative, MixedLocalWrongNominalAllocationProducerRejectsBefor
     pool.args.input.local_control=n::ownerView<a::Slot64>(owner.args).frame;pool.args.input.local_allocation=&n::allocationFrame(owner.args);pool.args.input.local_header_kind=&n::progress(owner.args).header_kind;
     EXPECT_FALSE(n::coordinator<n::CoordinatorAction::ImportLocalVictimReceipt>(pool.args));
         EXPECT_EQ(std::memcmp(destination,poison.data(),poison.size()),0);
-    ASSERT_DEATH(n::submitCoordinator<n::CoordinatorAction::ImportLocalVictimReceipt>(pool.args),"");
+    ASSERT_EXIT({
+        disableIntentionalFaultCoreDump();
+        n::submitCoordinator<n::CoordinatorAction::ImportLocalVictimReceipt>(pool.args);
+    }, ::testing::KilledBySignal(SIGABRT), "");
     }
 }
 
@@ -1733,10 +1738,22 @@ TEST(PooledImmutableNative, MixedLocalResetInvalidatesOriginalHeaderKindAndExten
 TEST(PooledImmutableNative, MixedLocalEveryImportSubmissionRejectsMissingActualPublication)
 {
     Pool pool(std::array{3u,0u});
-    EXPECT_DEATH(n::submitCoordinator<n::CoordinatorAction::ImportLocalPinHeader>(pool.args),"");
-    EXPECT_DEATH(n::submitCoordinator<n::CoordinatorAction::ImportLocalAvailability>(pool.args),"");
-    EXPECT_DEATH(n::submitCoordinator<n::CoordinatorAction::ImportLocalFreeReceipt>(pool.args),"");
-    EXPECT_DEATH(n::submitCoordinator<n::CoordinatorAction::ImportLocalVictimReceipt>(pool.args),"");
+    EXPECT_EXIT({
+        disableIntentionalFaultCoreDump();
+        n::submitCoordinator<n::CoordinatorAction::ImportLocalPinHeader>(pool.args);
+    }, ::testing::KilledBySignal(SIGABRT), "");
+    EXPECT_EXIT({
+        disableIntentionalFaultCoreDump();
+        n::submitCoordinator<n::CoordinatorAction::ImportLocalAvailability>(pool.args);
+    }, ::testing::KilledBySignal(SIGABRT), "");
+    EXPECT_EXIT({
+        disableIntentionalFaultCoreDump();
+        n::submitCoordinator<n::CoordinatorAction::ImportLocalFreeReceipt>(pool.args);
+    }, ::testing::KilledBySignal(SIGABRT), "");
+    EXPECT_EXIT({
+        disableIntentionalFaultCoreDump();
+        n::submitCoordinator<n::CoordinatorAction::ImportLocalVictimReceipt>(pool.args);
+    }, ::testing::KilledBySignal(SIGABRT), "");
 }
 
 }

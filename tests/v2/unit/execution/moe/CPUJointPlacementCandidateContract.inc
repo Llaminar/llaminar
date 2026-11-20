@@ -112,7 +112,7 @@ TEST(CPUJointPlacementCandidateContract,
         MoEOverlayResidencyAuthority authority(original.config());
         const auto initial = authority.snapshot();
         ASSERT_TRUE(initial->valid());
-        const auto source = original.preparation->cpuJointOwnerMap();
+        const auto source = original.preparation->jointOwnerMap();
         ASSERT_EQ(initial->jointOwnerMap(), source);
         ASSERT_EQ(&initial->placementOwnerMap(), source.get());
         const auto cohort = source->placementFor(0, 1)->shard_cohort;
@@ -120,7 +120,7 @@ TEST(CPUJointPlacementCandidateContract,
         const auto *localMember =
             source->participantForId(cohort->participants().front().participant_id);
         ASSERT_TRUE(localMember);
-        const auto originalSelection = original.preparation->cpuShardSourceFor(0, *localMember);
+        const auto originalSelection = original.preparation->shardSourceFor(0, *localMember);
         ASSERT_TRUE(originalSelection);
         EXPECT_FALSE(originalSelection->contains(0));
         EXPECT_TRUE(originalSelection->contains(1));
@@ -279,7 +279,7 @@ TEST(CPUJointPlacementCandidateContract, CanonicalLayerRangeMatchesCohortFullSca
     for (const int members : {2, 4, 8})
     {
         JointPlacementOriginal original(members, 2, 6, 3, 32, true);
-        const auto map = original.preparation->cpuJointOwnerMap();
+        const auto map = original.preparation->jointOwnerMap();
         ASSERT_TRUE(map);
         for (int replay = 0; replay < 3; ++replay)
             for (const int layer : {31, 32, 33, 34, 35})

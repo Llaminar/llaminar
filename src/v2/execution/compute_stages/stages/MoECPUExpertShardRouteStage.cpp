@@ -7,7 +7,7 @@
  * original transport policy; no count exchange or alternate arithmetic is added.
  */
 #include "MoECPUExpertShardRouteStage.h"
-#include "../../moe/CPUExpertShardSourceSelection.h"
+#include "../../moe/ExpertShardSourceSelection.h"
 #include "../../moe/MoEOverlaySparseCollective.h"
 #include "../../moe/MoEOverlayActivationEpochProtocol.h"
 #include "../../moe/CanonicalMoERouteRecord.h"
@@ -299,7 +299,7 @@ bool MoECPUExpertShardRouteStage::executeWithBank(IDeviceContext *ctx,MoEOverlay
         {records,gathered*canonical_moe_route_record::recordWidth(p.columns)},p.source_ranges,
         {p.route_indices?p.route_indices->data():nullptr,p.route_indices?slots:0},
         {p.route_weights?p.route_weights->data():nullptr,p.route_weights?slots:0},
-        invocation_bank?std::span<const int>(invocation_bank->layerForModelLayer(p.original_source->layer()).cpu_fragment_expert_ids):p.original_source->expertIds(),
+        invocation_bank?std::span<const int>(invocation_bank->layerForModelLayer(p.original_source->layer()).fragment_expert_ids):p.original_source->expertIds(),
         p.participant_route_maps,p.required_route_weights,
         {p.combined_routes->mutable_data(),slots*static_cast<size_t>(p.columns)},
         p.original_source->ownership().geometry().experts,p.rows,p.top_k,p.columns,sparse_view};

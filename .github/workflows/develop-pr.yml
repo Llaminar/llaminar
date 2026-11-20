@@ -1,4 +1,6 @@
-name: Develop PR — Unit and host tests
+# @file develop-pr.yml
+# @brief Run protected develop PR checks and retain the failed jobs' transcripts on the PR run.
+name: Develop PR — Unit and preflight tests
 run-name: "develop PR #${{ github.event.pull_request.number }} — ${{ github.event.pull_request.head.sha }}"
 
 on:
@@ -18,3 +20,10 @@ jobs:
     name: Develop PR
     # A pinned reusable workflow lets PR merge refs use the restricted group.
     uses: Llaminar/llaminar/.github/workflows/develop-pr-tests.yml@develop
+
+  failed-job-logs:
+    needs: unit
+    if: always() && (needs.unit.result == 'failure' || needs.unit.result == 'cancelled')
+    permissions:
+      actions: read
+    uses: ./.github/workflows/failed-job-logs.yml

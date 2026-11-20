@@ -205,6 +205,16 @@ namespace llaminar2
         /**
          * @brief TP allreduce sidebands reuse buffers declared by producer stages.
          */
+        /**
+         * @brief Declare the actual canonical rank bank before a native domain exists.
+         * @param elements Exact FP32 live-bank capacity per participant.
+         * @param participants Original complete native cohort width.
+         * @return Same named requirement consumed by this stage, or empty for invalid geometry.
+         * @note This contributes storage metadata only; it admits no communicator or execution.
+         */
+        static WorkspaceRequirements canonicalRankWorkspaceRequirements(
+            size_t elements,size_t participants);
+
         WorkspaceRequirements getWorkspaceRequirements(
             int m, int n = 0, int k = 0) const override;
         void bindWorkspace(DeviceWorkspaceManager *workspace) override;

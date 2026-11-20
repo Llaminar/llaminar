@@ -141,10 +141,12 @@ namespace llaminar2::test::parity
         for (const auto &topology : {qwen36::qwen36MoECuda2ExpertOverlayTopology(),
                                     qwen36::qwen36MoERocm2ExpertOverlayTopology()})
         {
-            const auto control = expandModelParityDefinition(
-                qwen36::qwen36MoEExpertOverlayCertificationDefinition(topology, "/reference"));
-            const auto projection = expandModelParityDefinition(
-                qwen36::qwen36MoEProjectionParityDefinition(topology, "/reference"));
+            auto control_definition =
+                qwen36::qwen36MoEExpertOverlayCertificationDefinition(topology, "/reference");
+            auto projection_definition =
+                qwen36::qwen36MoEProjectionParityDefinition(topology, "/reference");
+            const auto control = expandModelParityDefinition(control_definition);
+            const auto projection = expandModelParityDefinition(projection_definition);
             ASSERT_EQ(control.size(), 24u);
             ASSERT_EQ(projection.size(), control.size());
             std::size_t checked = 0;

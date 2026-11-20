@@ -1,6 +1,6 @@
 ---
 name: llaminar-testing
-description: Run, maintain, and diagnose Llaminar's Unit/host PR checks and RC release gates, including full production preflight, frozen-history numerical panels, OpenCode stress and benchmarks. Use for test selection, canonical matrix changes and focused parity or HTTP/MPI diagnostics. Kernel tuning and cross-engine comparisons have separate skills.
+description: Run, maintain, and diagnose Llaminar's Unit/host PR checks on x86 and ARM64, AVX2 hardware-qualified production preflight and RC release gates, including full production preflight, frozen-history numerical panels, OpenCode stress and benchmarks. Use for test selection, canonical matrix changes and focused parity or HTTP/MPI diagnostics. Kernel tuning and cross-engine comparisons have separate skills.
 ---
 
 # Llaminar Testing
@@ -58,18 +58,44 @@ companion; the repository runner labeled `llaminar-avx512` builds AVX512. These
 full-backend `model-free` transactions run in parallel. Each runs complete
 device-free `Unit` and
 the production-preflight `host` lane selected by the canonical scheduler.
-CUDA, ROCm and exclusive preflight lanes do not run; no GPU devices or model
-mounts are exposed. Each job calls `run_develop_image_gate.py --cpu-isa <ISA>`
+The Unit/host container exposes no GPU devices or model mounts.
+Each job calls `run_develop_image_gate.py --cpu-isa <ISA>`
 without `--build-only` or `--publish`. CPU admission rejects unsupported
 hardware before compiling. Every discovered Unit and host test must run
 without skips. Unit uses unrestricted parallelism; host retains canonical
-serial scheduling. The `unit-and-host` receipt does not certify full preflight.
+serial scheduling. AVX2 adds `--pr-gpus CUDA+ROCm`; AVX512 selects `none`.
+The AVX2 driver then opens a separate GPU container and runs every supported
+CUDA, ROCm and exclusive test in the canonical `ProductionTestPreflight`
+inventory. The production scheduler and native hardware observation own
+selection, including mixed-backend and multi-rank cases. CUDA, ROCm and
+exclusive lanes run sequentially on this host's one CPU package. Both vendors
+are required. Missing declared geometry produces a pre-launch JUnit skip in
+`pr-tests/gpu/hardware-skips.xml` with the original observations. Failures and
+runtime skips in selected tests fail the gate. Never infer GPU counts from
+MPI width or test names. CMake `GPU_DEVICES`, or `CUDA_DEVICES` and
+`ROCM_DEVICES`, declare local physical counts. Original NUMA, native ISA and
+peer requirements retain their stricter canonical labels; unknown PCI NUMA
+location cannot establish those contracts. The maximum-context allocation
+receipt records independent production BOMs for dense/MoE and MTP off/on.
+Shared-runner qualification uses sampled free VRAM on ordinal zero. Dedicated
+preflight qualifies against total VRAM and requires the selected physical
+allocations to succeed. `pr-tests/pr-validation.json` binds Unit,
+host, accelerator and exclusive receipts to the complete qualification under
+`unit-and-hardware-preflight`. This validates only the observed hardware, not
+absent topologies or a release.
+
+Consolidate duplicate device launches at their CMake registration owner, keeping
+one explicit preflight registration for each regression contract. Representative
+matrices must preserve all backends, dispatch boundaries, formats and distinct
+lifecycle paths. Use pairwise interaction coverage only for orthogonal fixture
+axes; prove the retained pairs from generated CTest metadata. Do not remove a
+failing case or replace an all-format numerical sweep with representative codecs.
 
 The two ISA jobs target distinct custom runner labels, allowing the
 organization-scoped AVX2 host and repository-scoped AVX512 host to participate
 without changing runner-group access. The matrix permits two simultaneous jobs
 and disables fail-fast, retaining both results. Each host serializes its own
-jobs; AVX2 shares its queue with develop publication. Per-PR/ISA concurrency groups
+jobs. Per-PR/ISA concurrency groups
 cancel obsolete commits without canceling another PR. Each host preserves its
 local named `llaminar-develop` BuildKit worker's state,
 including compiler cache mounts across failed and successful jobs. Complete,
@@ -77,7 +103,21 @@ dependency-bound OCI toolchains are restored before source compilation;
 a cold build checkpoints GPU SDK layers. Source builds admit their exact
 OCI digests, inputs and ISA. PR cache entries remain scoped to that merge ref;
 registry cache access is import-only. See `docs/production-ci.md` for host
-provisioning and cache ownership. These jobs do not use GitHub cloud runners.
+provisioning and cache ownership.
+
+`develop-pr-arm64.yml` builds the same `test-runner` and `runtime` Dockerfile
+targets on GitHub's `ubuntu-24.04-arm` runner with NEON and CUDA `sm_121`.
+Use the `arm64-pr` installed inventory for this check. The driver
+`run_develop_pr_tests.py --arm64` verifies its receipt and runs only CMake's
+`ARM64PR` Unit and host preflight registrations, without GPUs or model mounts.
+A skip in any selected test fails the check. The QFN registrations replay
+production CPU components with generated weights. Full-model QFN qualification
+requires the published checkpoint. The check also smoke-tests the sibling
+Release runtime. Both ARM64 jobs restore the verified NEON OCI toolchain
+through `cache-develop-toolchain` and save a cold toolchain before compiling
+Llaminar. ARM64 PRs retain BuildKit layers under `llaminar-build-neon-pr`
+on the PR merge ref and import trusted develop layers from GHCR.
+See [production CI](../../docs/production-ci.md).
 
 Start ordinary work from current `develop` on `feat/<description>`; push and
 open a PR into `develop`. Use Conventional Commit messages and PR titles. See
@@ -85,9 +125,14 @@ open a PR into `develop`. Use Conventional Commit messages and PR titles. See
 documentation/CI-only maintenance exception. Use the current protected
 workflow definitions when working from an older feature checkout.
 
-The develop ruleset requires both `Develop PR / Unit + host (AVX2)` and
-`Develop PR / Unit + host (AVX512)`, an up-to-date merge candidate and owner
-approval. The separate owner-approval ruleset uses only
+The develop ruleset requires `Develop PR / Unit + hardware preflight (AVX2)`,
+`Develop PR / Unit + host (AVX512)` and `ARM64 build and Unit + host` on an
+up-to-date merge candidate. Keep the context names bound to their GitHub
+Actions job names. Preview the CI ruleset with
+`python3 scripts/ci/apply_master_ruleset.py --develop-only`. With repository
+admin authorization, add `--apply` after confirming the context appears
+on a ready PR.
+The separate owner-approval ruleset uses only
 `@Llaminar/repository-approvers` on `develop`, `rc/*` and `master`. Native squash
 auto-merge waits for reviews and checks. The owner's PR-only approval override
 and dedicated release-evidence deploy key retain their existing exceptions.
@@ -96,11 +141,17 @@ when the user explicitly authorizes a manual merge. Native auto-merge must still
 wait for the required checks; an overridden check is not passing evidence.
 Never grant the general GitHub Actions app a ruleset bypass.
 
-The `develop` push workflow remains on the AVX2 development host and
-`run_develop_image_gate.py --build-only --publish`. It compiles both full-backend
-AVX512 and AVX2 Release runtimes, omits Integration compilation, and publishes
-both branch and source-SHA tags only after both builds authenticate. It runs no
-tests and grants no certificate. Publication has one concurrency group and
+The `develop` push workflow gives each x86 ISA separate toolchain preparation and
+Release build jobs on standard GitHub-hosted Ubuntu 24.04 runners. Each job has
+a four-hour limit. The Release job verifies its prepared OCI cache entry, then
+runs `run_develop_image_gate.py --build-only --stage` using its GHCR BuildKit layer cache.
+The jobs compile the full-backend AVX512 and AVX2 Release runtimes. A separate
+`--publish-staged` job authenticates both staging receipts and registry manifests
+before writing the branch and source-SHA tags. The native ARM64 job imports and
+exports the `build-cache-develop-neon` GHCR cache, builds and smoke-tests the
+Release CUDA+CPU image, and publishes `develop-arm64` and `sha-<commit>-arm64`.
+Publication omits Integration compilation and grants no release certificate.
+Publication has one concurrency group and
 cancels a superseded build when a new develop merge arrives. Complete Unit and
 production preflight remain mandatory in the explicit production pipeline
 through `run_production_prerequisites.py`. Production hardware has its own queue.
@@ -193,6 +244,12 @@ not an additional routine CI regression gate.
 Choose the workflow below before loading model-specific instructions. Treat
 `tests/v2/CMakeLists.txt` plus generated CTest registration as the test inventory
 source of truth; never copy an axis table into this skill or a runner script.
+A registration whose subject exists only with a compiled GPU family declares
+`REQUIRES_BACKEND GPU|CUDA|ROCM` (or the executable's
+`V2_TEST_REQUIRED_BACKEND` property); a build without that family omits and
+counts it in the configure summary. Guard the matching GTest bodies with
+`#if defined(HAVE_CUDA) || defined(HAVE_ROCM)` rather than letting a CPU-only
+build fail on "not compiled". Never use this to hide a CPU-path defect.
 For model/generation/HTTP runs, read `tests/v2/integration/parity/README.md` and
 the applicable model definition or fixture. For image certification and remote
 infrastructure, also read `docs/production-ci.md`.

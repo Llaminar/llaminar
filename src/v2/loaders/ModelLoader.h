@@ -210,6 +210,23 @@ namespace llaminar2
         const GGUFTensorInfo *findTensor(const std::string &name) const;
     };
 
+    /**
+     * @brief Resolve the dense FFN width shared by graph construction and memory planning.
+     *
+     * This is the single authority for `d_ff`: graph configuration
+     * (`IModelLoader::feedForwardLength`) and `ModelMemoryProfile` both call it,
+     * so admitted and registered arena roots always use one width. Precedence:
+     * `<arch>.feed_forward_length`, then the MoE shared-expert width, then the
+     * routed-expert width, then the dense `blk.N.ffn_gate.weight` /
+     * `blk.N.ffn_up.weight` row count. Router (`ffn_gate_inp`), shared-expert
+     * and packed-expert tensors are deliberately not dense FFN evidence: the
+     * router's expert axis once masqueraded as `d_ff` and under-admitted the
+     * Qwen3.6-35B-A3B CPU arena.
+     * @param model Parsed GGUF metadata and tensor directory.
+     * @return Dense FFN width, or 0 when the source declares none.
+     */
+    uint64_t ggufFeedForwardLength(const GGUFModel &model);
+
     // =============================================================================
     // GGUF LOADER
     // =============================================================================
@@ -537,20 +554,7 @@ namespace llaminar2
         uint64_t headCountKV() const override { return model_.head_count_kv; }
         uint64_t vocabSize() const override { return model_.vocab_size; }
         uint64_t contextLength() const override { return model_.context_length; }
-        uint64_t feedForwardLength() const override
-        {
-            uint64_t d_ff = getUInt64("feed_forward_length", 0);
-            if (d_ff == 0)
-            {
-                // MoE models may not have feed_forward_length; fall back to shared expert or per-expert FFN
-                d_ff = getUInt64("expert_shared_feed_forward_length", 0);
-            }
-            if (d_ff == 0)
-            {
-                d_ff = getUInt64("expert_feed_forward_length", 0);
-            }
-            return d_ff;
-        }
+        uint64_t feedForwardLength() const override { return ggufFeedForwardLength(model_); }
         uint64_t keyLength() const override { return model_.key_length; }
         float ropeTheta() const override { return model_.rope_theta; }
         float rmsNormEps() const override { return model_.rms_norm_eps; }

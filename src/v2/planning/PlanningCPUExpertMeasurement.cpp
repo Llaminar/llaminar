@@ -28,11 +28,7 @@ namespace llaminar2
     {
         // Generated CPU dispatch distinguishes an AVX2-only artifact from an
         // AVX512 artifact executing its AVX2 runtime lane. Retain both identities.
-#if LLAMINAR_COMPILED_WITH_AVX512
-        constexpr ISALevel kCompiledISA = ISALevel::AVX512;
-#else
-        constexpr ISALevel kCompiledISA = ISALevel::AVX2;
-#endif
+        constexpr ISALevel kCompiledISA = compiledCPUISALevel();
         /** @brief Validated metadata/BOM terms, not a live allocation ledger. */
         struct ExpertDescription final : PlanningExpertSampleDescription
         {

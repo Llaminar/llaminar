@@ -310,7 +310,7 @@ namespace llaminar2
         }
 
         // Ensure NCCL is loaded
-        if (!nccl::isLoaded() && !nccl::load())
+        if (!nccl::load())
         {
             const char *err = nccl::getLastError();
             last_error_ = std::string("Failed to load NCCL: ") + (err ? err : "unknown error");

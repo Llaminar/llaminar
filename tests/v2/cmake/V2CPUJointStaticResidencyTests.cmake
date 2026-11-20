@@ -56,7 +56,7 @@ if(TARGET v2_integration_cross_tier_expert_arithmetic)
             add_v2_test(${name}
                 COMMAND $<TARGET_FILE:v2_integration_cross_tier_expert_arithmetic>
                     --gtest_filter=CPUJointPaddedPrefillContract.OriginalMappedTicket${backend} --gtest_brief=1
-                LABELS "V2;Integration;ProductionTestPreflight;${backend};CPU;MoE;Ownership;Regression"
+                LABELS "V2;Integration;ProductionTestPreflight;${backend};CPU;MoE;Ownership;Memory;GraphDeclaration;Lifecycle;Regression"
                 MPI_PROCS 1 NO_MODELS TIMEOUT 60)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${name})
         endif()
@@ -74,20 +74,7 @@ add_v2_test(V2_Integration_CPUJointDispatchOwnershipContract
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CPUJointDispatchOwnershipContract)
 endif()
 
-if(TARGET v2_integration_cross_tier_expert_arithmetic)
-    foreach(backend CUDA ROCm)
-        string(TOUPPER "${backend}" backend_upper)
-        if(HAVE_${backend_upper})
-            set(name "V2_Integration_${backend}_CPUJointSchedulingContextContract")
-            add_v2_test(${name}
-                COMMAND $<TARGET_FILE:v2_integration_cross_tier_expert_arithmetic>
-                    --gtest_filter=CPUJointPaddedPrefillContract.OriginalMappedTicket${backend} --gtest_brief=1
-                LABELS "V2;Integration;ProductionTestPreflight;${backend};CPU;MoE;Ownership;Regression"
-                MPI_PROCS 1 NO_MODELS TIMEOUT 60)
-            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${name})
-        endif()
-    endforeach()
-endif()
+
 
 if(TARGET v2_unit_expert_gemm_registry)
 # Actual source-plan MTP completeness, before materialization/native readiness.

@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
+## @file test_develop_image_gate.py
+#  @brief Exercise PR and image publication commands, hardware scope and failure evidence.
 """Device-free contracts for model-free develop PR and image-publication gates.
 
-The PR workflow consumes the same image driver in independent AVX512 and AVX2
-jobs without publication. Its actual matrix command is parsed and exercised
-here so ISA coverage, model exclusion and read-only cache access stay explicit.
+The x86 PR workflow consumes the shared image driver in independent ISA jobs.
+The native ARM64 PR workflow uses the same CTest execution and evidence
+contracts with its own label-scoped inventory.
 """
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import os
 from pathlib import Path
 import shlex
@@ -18,13 +21,16 @@ import tempfile
 import time
 import unittest
 from unittest.mock import patch
+import xml.etree.ElementTree as ET
 
 import yaml
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 
+import apply_master_ruleset as ruleset
 import run_develop_image_gate as gate
+import prebuilt_test_image
 import run_develop_pr_tests as pr_runner
 
 
@@ -34,17 +40,212 @@ def images(isa: str) -> dict:
             "runtime": {"id": f"runtime-{isa.lower()}"}}
 
 
-def pr_report() -> dict:
+def pr_report(scope: pr_runner.PRTestScope = pr_runner.PRTestScope.HOST) -> dict:
     """Build a scoped PR receipt; full accelerator preflight remains unproven."""
-    return {"schema": 1, "scope": "unit-and-host", "complete": True, "return_code": 0,
+    report = {"schema": 1, "scope": scope.value, "complete": True, "return_code": 0,
             "lanes": {lane: {"complete": True, "return_code": 0,
-                              "tests": [name], "test_count": 1}
-                      for lane, name in (("unit", "V2_Unit_Contract"),
-                                         ("host", "V2_Integration_HostContract"))}}
+                              "tests": [f"V2_{lane}_Contract"], "test_count": 1}
+                      for lane in scope.lanes}}
+    if scope is pr_runner.PRTestScope.GPU:
+        registered = ["V2_host_Contract", *(name for lane in report["lanes"].values() for name in lane["tests"])]
+        report["qualification"] = {"schema": 1, "registered": registered, "selected": registered,
+                                   "requirements": {}, "hardware": None, "unqualified": {}}
+    return report
+
+
+def hardware(cuda: int = 1, rocm: int = 1) -> dict:
+    """Observe physical cards with valid unknown PCI locality on a one-node host."""
+    return {"qfn_source_hardware_schema": 2, "scope": "local-host-all-ranks",
+            "devices": [{"backend": "cpu", "ordinal": 0, "numa_node": 0, "socket_id": 0},
+                        *({"backend": backend, "ordinal": index, "numa_node": -1,
+                           "uuid": f"{backend}-{index}", "native_isa": "gfx906:sramecc+:xnack-"}
+                          for backend, count in (("cuda", cuda), ("rocm", rocm))
+                          for index in range(count))], "directed_peer_access": []}
 
 
 class DevelopImageGateTests(unittest.TestCase):
     """Keep develop publishing smaller than, and incapable of replacing, certification."""
+
+    def test_hardware_preflight_covers_every_supported_lane(self):
+        """Replay physical cardinality without excluding mixed or multi-rank work."""
+        rows = tuple(pr_runner.PreflightRegistration(
+            name=f"V2_Integration_{vendor}",
+            labels=frozenset({"Integration", "ProductionTestPreflight", vendor}),
+            mpi_ranks=1, lane=lane, ctest_index=index)
+            for index, (vendor, lane) in enumerate((
+                ("CUDA", pr_runner.PreflightExecutionLane.CUDA_SOCKET),
+                ("ROCm", pr_runner.PreflightExecutionLane.ROCM_SOCKET)), start=1))
+        rows += (replace(rows[0], name="V2_Integration_MultiRank", mpi_ranks=2,
+                         lane=pr_runner.PreflightExecutionLane.EXCLUSIVE, ctest_index=3),
+                 replace(rows[0], name="V2_Integration_Mixed", mpi_ranks=2,
+                         labels=rows[0].labels | {"ROCm"},
+                         lane=pr_runner.PreflightExecutionLane.EXCLUSIVE, ctest_index=4),
+                 replace(rows[0], name="V2_Integration_TwoCUDA", ctest_index=5,
+                         labels=rows[0].labels | {"HardwareOptional", "LocalHostDevices", "Devices2"}))
+        expected = {"cuda": (rows[0].name,), "rocm": (rows[1].name,),
+                    "exclusive": (rows[3].name, rows[2].name)}
+        for _ in range(3):
+            plan, qualification = pr_runner.hardware_preflight_plan(rows, hardware())
+            self.assertEqual(plan, expected)
+            self.assertEqual(set(qualification["unqualified"]), {rows[-1].name})
+            self.assertEqual(len(qualification["registered"]), len(rows))
+        plan, qualification = pr_runner.hardware_preflight_plan(rows, hardware(cuda=2))
+        self.assertIn(rows[-1].name, plan["cuda"])
+        self.assertFalse(qualification["unqualified"])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "hardware-skips.xml"
+            pr_runner.write_hardware_skips(path, qualification)
+            self.assertEqual(ET.parse(path).getroot().get("skipped"), "0")
+        for incomplete in (hardware(cuda=0), hardware(rocm=0)):
+            with self.assertRaisesRegex(ValueError, "both CUDA and ROCm"):
+                pr_runner.hardware_preflight_plan(rows, incomplete)
+
+    def test_unknown_gpu_locality_preserves_count_tests_and_rejects_topology_claims(self):
+        """Unknown PCI locality is valid evidence, never an invented NUMA cohort."""
+        from run_qfn_source_admission import observed_native_isa_cohorts
+        observed = pr_runner.source_hardware_devices(hardware())
+        self.assertEqual(observed_native_isa_cohorts(observed, "rocm", "gfx906"), {})
+        base = pr_runner.PreflightRegistration("V2_Integration_Local", frozenset({
+            "Integration", "ProductionTestPreflight", "HardwareOptional", "CUDA", "ROCm",
+            "Devices2", "CUDADevices1", "ROCmDevices1", "LocalHostDevices"}),
+            2, pr_runner.PreflightExecutionLane.EXCLUSIVE, 1)
+        strict = replace(base, name="V2_Integration_Strict", ctest_index=2,
+                         labels=(base.labels - {"LocalHostDevices"}) | {"DistinctNUMARanks"})
+        plan, qualification = pr_runner.hardware_preflight_plan((base, strict), hardware())
+        self.assertEqual(plan["exclusive"], (base.name,))
+        self.assertEqual(set(qualification["unqualified"]), {strict.name})
+        for constraint in ("NativeISA-gfx906", "StageSizes1x1", "DirectedPeerEdge", "DistinctNUMARanks"):
+            with self.subTest(constraint=constraint), self.assertRaises(RuntimeError):
+                pr_runner.hardware_preflight_plan((replace(base, labels=base.labels | {constraint}),), hardware())
+        aliased = hardware(cuda=2)
+        aliased["devices"][2]["uuid"] = aliased["devices"][1]["uuid"]
+        with self.assertRaisesRegex(ValueError, "unique native GPU"):
+            pr_runner.hardware_preflight_plan((base,), aliased)
+        # A valid missing NUMA observation must not relax physical identity checks.
+        for mutation in ("missing-uuid", "duplicate-uuid", "invalid-numa"):
+            malformed = hardware(rocm=2)
+            if mutation == "missing-uuid":
+                malformed["devices"][-1].pop("uuid")
+            elif mutation == "duplicate-uuid":
+                malformed["devices"][-1]["uuid"] = malformed["devices"][-2]["uuid"]
+            else:
+                malformed["devices"][-1]["numa_node"] = -2
+            with self.subTest(mutation=mutation), self.assertRaises(ValueError):
+                observed_native_isa_cohorts(pr_runner.source_hardware_devices(malformed), "rocm", "gfx906")
+
+    def test_gpu_scope_executes_exact_ctest_inventory_and_rejects_skips(self):
+        """Replay native CTest indices with poisoned unselected cases and failed GPUs."""
+        for outcome in (0, 9, 77):
+            with self.subTest(outcome=outcome), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                build = root / "build"
+                build.mkdir()
+                # This device-free launcher fixture preserves explicit MPI argv
+                # while executing one Python child, with no MPI or GPU runtime.
+                launcher = root / "mpirun"
+                launcher.write_text(f'#!{sys.executable}\nimport os, sys\n'
+                                    'assert sys.argv[1:3] == ["-np", "1"]\n'
+                                    'os.execv(sys.argv[3], sys.argv[3:])\n')
+                launcher.chmod(0o755)
+                forbidden = root / "unselected-ran"
+                lines = []
+                for name, vendor, selected in (("Host", "", False), ("ROCm", "ROCm", True),
+                                                ("Mixed", "CUDA;ROCm", True),
+                                                ("Wide", "CUDA;HardwareOptional;LocalHostDevices;Devices2", False),
+                                                ("CUDA", "CUDA", True)):
+                    code = (f"raise SystemExit({outcome if vendor == 'ROCm' else 0})" if selected else
+                            f"from pathlib import Path; Path('{forbidden}').touch(); raise SystemExit(99)")
+                    labels = f"Integration;ProductionTestPreflight;{vendor}"
+                    skip = "" if "HardwareOptional" in labels else "SKIP_RETURN_CODE 77"
+                    lines += [f'add_test(V2_Integration_{name} "{launcher}" -np 1 '
+                              f'"{sys.executable}" -c "{code}")',
+                              f'set_tests_properties(V2_Integration_{name} PROPERTIES '
+                              f'LABELS "{labels}" TIMEOUT 30 {skip})']
+                (build / "CTestTestfile.cmake").write_text("\n".join(lines) + "\n")
+                output = root / "out"
+                arguments = ["--scope", "hardware-preflight", "--build-dir", str(build),
+                             "--installed-build-receipt", str(root / "receipt"), "--output", str(output)]
+                with patch.object(pr_runner, "validate"), \
+                     patch.object(pr_runner, "observe_preflight_hardware", return_value=hardware()):
+                    self.assertEqual(pr_runner.main(arguments), 0 if outcome == 0 else 8)
+                self.assertFalse(forbidden.exists())
+                report = json.loads((output / "pr-tests.json").read_text())
+                if outcome == 77:
+                    self.assertIn("without skipping", report["lanes"]["rocm"]["validation_error"])
+                self.assertEqual(report["scope"], "hardware-preflight")
+                self.assertEqual(report["complete"], outcome == 0)
+                self.assertEqual(report["lanes"]["cuda"]["tests"], ["V2_Integration_CUDA"])
+                self.assertEqual(report["lanes"]["rocm"]["tests"], ["V2_Integration_ROCm"])
+                self.assertEqual(set(report["qualification"]["unqualified"]), {"V2_Integration_Wide"})
+                suite = ET.parse(output / "hardware-skips.xml").getroot()
+                self.assertEqual((suite.get("tests"), suite.get("skipped")), ("1", "1"))
+                case, = suite.findall("testcase")
+                self.assertEqual((case.get("name"), case.get("status")), ("V2_Integration_Wide", "notrun"))
+                skip = case.find("skipped")
+                self.assertEqual(skip.get("message"), "requires 2 CUDA GPUs, runner has 1")
+                self.assertEqual(json.loads(skip.text), report["qualification"]["unqualified"][case.get("name")])
+                self.assertEqual(report["lanes"]["exclusive"]["tests"], ["V2_Integration_Mixed"])
+                self.assertTrue(report["lanes"]["exclusive"]["complete"])
+
+    def test_gpu_checks_use_separate_required_container_and_receipt(self):
+        """Keep Unit device-free and require both subsequent vendor observations."""
+        for mutation in (None, "missing-rocm", "skipped-rocm", "failed-rocm", "omit-exclusive", "forge-qualification"):
+            with self.subTest(mutation=mutation), tempfile.TemporaryDirectory() as temporary:
+                directory = Path(temporary)
+                scopes = []
+
+                def execute(command, log):
+                    scope = (pr_runner.PRTestScope.GPU if "--gpus" in command
+                             else pr_runner.PRTestScope.HOST)
+                    scopes.append(scope)
+                    self.assertEqual(command[command.index("--ulimit") + 1], "core=0:0")
+                    prefix = "pr-tests/gpu" if scope is pr_runner.PRTestScope.GPU else "pr-tests"
+                    report = pr_report(scope)
+                    if scope is pr_runner.PRTestScope.GPU:
+                        self.assertEqual(command[-2:], ["--scope", "hardware-preflight"])
+                        if mutation == "missing-rocm":
+                            report["lanes"].pop("rocm")
+                        elif mutation == "skipped-rocm":
+                            report["lanes"]["rocm"]["complete"] = False
+                        elif mutation == "failed-rocm":
+                            report["lanes"]["rocm"]["return_code"] = 8
+                        elif mutation == "omit-exclusive":
+                            report["lanes"]["exclusive"]["tests"] = []
+                            report["lanes"]["exclusive"]["test_count"] = 0
+                        elif mutation == "forge-qualification":
+                            report["qualification"]["selected"] = ["V2_host_Contract"]
+                    gate.write_json(directory / prefix / "pr-tests.json", report)
+
+                with patch.object(gate.docker_paths, "device_args",
+                                  side_effect=[[], ["--gpus", "all", "--device", "/dev/kfd"]]) as devices, \
+                     patch.object(gate.docker_paths, "mounts", return_value=[]), \
+                     patch.object(gate, "run", side_effect=execute), \
+                     patch.object(gate.subprocess, "run"):
+                    if mutation is None:
+                        report = gate.run_pr_tests(images("AVX2"), directory, gate.PRGPUCoverage.CUDA_ROCM)
+                        self.assertEqual(set(report["lanes"]), {"unit", "host", "cuda", "rocm", "exclusive"})
+                        self.assertEqual(report["scope"], "unit-and-hardware-preflight")
+                    else:
+                        with self.assertRaises(ValueError):
+                            gate.run_pr_tests(images("AVX2"), directory, gate.PRGPUCoverage.CUDA_ROCM)
+                    self.assertEqual([call.args[1] for call in devices.call_args_list], ["CPU", "CUDA+ROCm"])
+                self.assertEqual(scopes, [pr_runner.PRTestScope.HOST, pr_runner.PRTestScope.GPU])
+                self.assertEqual((directory / "pr-tests/pr-validation.json").exists(), mutation is None)
+
+    def test_completed_host_failure_still_exercises_gpus_and_keeps_pr_red(self):
+        """A completed CPU test failure preserves both the red job and GPU evidence."""
+        with patch.object(gate, "_run_pr_scope", side_effect=[
+                subprocess.CalledProcessError(8, "ctest"), pr_report(pr_runner.PRTestScope.GPU)]) as run:
+            with self.assertRaises(subprocess.CalledProcessError) as failed:
+                gate.run_pr_tests(images("AVX2"), Path("/unused"), gate.PRGPUCoverage.CUDA_ROCM)
+        self.assertEqual(failed.exception.returncode, 8)
+        self.assertEqual([call.args[2] for call in run.call_args_list],
+                         [pr_runner.PRTestScope.HOST, pr_runner.PRTestScope.GPU])
+
+    def test_gpu_requirements_cannot_be_ignored_by_build_only(self):
+        """Reject a requested GPU gate when the transaction would not execute tests."""
+        with self.assertRaises(SystemExit):
+            gate.parse_arguments(["--output", "/unused", "--build-only", "--pr-gpus", "CUDA+ROCm"])
 
     def test_pr_driver_runs_exact_unit_and_host_inventories_and_rejects_skips(self):
         """Replay real CTest selection while poison accelerator cases stay unrun."""
@@ -73,12 +274,8 @@ class DevelopImageGateTests(unittest.TestCase):
                 arguments = ["--build-dir", str(build), "--installed-build-receipt",
                              str(root / "receipt"), "--output", str(output)]
                 with patch.object(pr_runner, "validate") as validate:
-                    if 77 in (unit_outcome, host_outcome):
-                        with self.assertRaisesRegex(ValueError, "without skipping"):
-                            pr_runner.main(arguments)
-                    else:
-                        code = pr_runner.main(arguments)
-                        self.assertEqual(code == 0, unit_outcome == host_outcome == 0)
+                    code = pr_runner.main(arguments)
+                    self.assertEqual(code, 0 if unit_outcome == host_outcome == 0 else 8)
                 validate.assert_called_once_with(root / "receipt", build,
                                                  pr_runner.InstalledTestScope.PRODUCTION)
                 self.assertFalse(forbidden.exists())
@@ -88,6 +285,70 @@ class DevelopImageGateTests(unittest.TestCase):
                 self.assertEqual(report["lanes"]["unit"]["tests"], ["V2_Unit_Contract"])
                 if unit_outcome == 0:
                     self.assertEqual(report["lanes"]["host"]["tests"], ["V2_Integration_HostContract"])
+
+    def test_required_arm64_context_runs_for_ready_develop_prs(self):
+        """Keep the ARM64 job name and merge-rule context bound to each other."""
+        workflow = yaml.load((ROOT / ".github/workflows/develop-pr-arm64.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        self.assertEqual(workflow["on"]["pull_request"], {
+            "branches": ["develop"],
+            "types": ["opened", "synchronize", "reopened", "ready_for_review"]})
+        job = workflow["jobs"]["arm64"]
+        self.assertIn(job["name"], ruleset.DEVELOP_REQUIRED_CHECKS)
+        self.assertEqual(job["runs-on"], "ubuntu-24.04-arm")
+        self.assertEqual(job["if"], "${{ !github.event.pull_request.draft }}")
+
+    def test_arm64_pr_driver_runs_only_scoped_unit_and_host_tests(self):
+        """Execute real CTest with unrelated cases around the selected indices."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            build = root / "build"
+            build.mkdir()
+            registrations = []
+            for name, labels, outcome in (
+                ("V2_Unit_Unrelated", "Unit", 99),
+                ("V2_Integration_Unrelated", "Integration;ProductionTestPreflight", 99),
+                ("V2_Unit_ARM", "Unit;ARM64PR", 0),
+                ("V2_Integration_ARM", "Integration;ProductionTestPreflight;ARM64PR", 0),
+                ("V2_Integration_Model", "Integration;FullModel", 99),
+            ):
+                registrations += [
+                    f'add_test({name} "{sys.executable}" "-c" "raise SystemExit({outcome})")',
+                    f'set_tests_properties({name} PROPERTIES LABELS "{labels}" TIMEOUT 30)',
+                ]
+            (build / "CTestTestfile.cmake").write_text("\n".join(registrations) + "\n")
+            (build / "CMakeFiles").mkdir()
+            for name in ("compile_commands.json", "build.ninja", "CMakeFiles/rules.ninja"):
+                (build / name).write_text("fixture metadata")
+            mpi = root / "libmpi.so"
+            mpi.write_bytes(b"fixture MPI library")
+            (build / "CMakeCache.txt").write_text(f"MPI_mpi_LIBRARY:FILEPATH={mpi}\n")
+            receipt = root / "receipt.json"
+            scope = pr_runner.InstalledTestScope.ARM64_PR
+            prebuilt_test_image.seal(receipt, build, scope)
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                prebuilt_test_image.validate(receipt, build, pr_runner.InstalledTestScope.PRODUCTION)
+            output = root / "results"
+            with patch.object(pr_runner.platform, "system", return_value="Linux"), \
+                 patch.object(pr_runner.platform, "machine", return_value="aarch64"):
+                self.assertEqual(pr_runner.main([
+                    "--arm64", "--build-dir", str(build), "--output", str(output),
+                    "--installed-build-receipt", str(receipt),
+                ]), 0)
+            report = json.loads((output / "pr-tests.json").read_text())
+            self.assertEqual(report["scope"], "arm64-unit-and-host")
+            self.assertTrue(report["complete"])
+            self.assertEqual(report["lanes"]["unit"]["tests"], ["V2_Unit_ARM"])
+            self.assertEqual(report["lanes"]["host"]["tests"], ["V2_Integration_ARM"])
+
+            ctest_file = build / "CTestTestfile.cmake"
+            ctest_file.write_text(ctest_file.read_text() + "\n")
+            with self.assertRaisesRegex(ValueError, "does not match"):
+                prebuilt_test_image.validate(receipt, build, scope)
+            ctest_file.write_text(ctest_file.read_text().replace(
+                "Unit;ARM64PR", "Unit;ARM64PR;CUDA"))
+            with self.assertRaisesRegex(ValueError, "host-only"):
+                prebuilt_test_image.seal(receipt, build, scope)
 
     def test_pr_driver_rejects_an_empty_host_lane(self):
         """A GPU-only preflight inventory must not become a green host gate."""
@@ -213,6 +474,101 @@ class DevelopImageGateTests(unittest.TestCase):
             publish.assert_not_called()
             self.assertFalse(json.loads((output / "develop-image-gate.json").read_text())["complete"])
 
+    def test_hosted_stage_builds_and_uploads_one_runtime(self):
+        """Staging has an ISA-specific receipt and leaves the develop aliases to the publisher."""
+        source = {"revision": "a" * 40, "tree": "tree", "dirty": False}
+        base = "ghcr.io/llaminar/llaminar:develop"
+        runtime = "sha256:" + "1" * 64
+        manifest = "sha256:" + "2" * 64
+        with tempfile.TemporaryDirectory() as temporary:
+            output = Path(temporary) / "stage"
+            with patch.object(gate, "source_identity", return_value=source), \
+                 patch.object(gate, "build", return_value={"runtime": {"id": runtime}}) as build, \
+                 patch.object(gate, "require_image"), \
+                 patch.object(gate, "require_host_cpu_isa") as cpu, \
+                 patch.object(gate, "run_pr_tests") as tests, \
+                 patch.object(gate, "run") as run, \
+                 patch.object(gate, "remote_image_id", return_value=runtime) as remote, \
+                 patch.object(gate.subprocess, "check_output", return_value=json.dumps(manifest)):
+                self.assertEqual(gate.main(["--output", str(output), "--build-only", "--stage",
+                                            "--image", base, "--cpu-isa", "AVX2"]), 0)
+            self.assertEqual(build.call_args.args[0].cpu_isa, "AVX2")
+            self.assertEqual(build.call_args.kwargs["roles"], (gate.ImageRole.RUNTIME,))
+            cpu.assert_not_called()
+            tests.assert_not_called()
+            self.assertEqual([call.args[0] for call in run.call_args_list], [
+                ["docker", "tag", runtime, base + "-staging-avx2"],
+                ["docker", "push", base + "-staging-avx2"],
+            ])
+            remote.assert_called_once_with(base.rsplit(":", 1)[0] + "@" + manifest)
+            receipt = json.loads((output / "develop-image-gate.json").read_text())
+            self.assertTrue(receipt["complete"])
+            self.assertFalse(receipt["published"])
+            self.assertEqual(receipt["variants"], {"AVX2": {
+                "runtime_image": runtime, "staged_manifest": manifest}})
+
+    def test_hosted_publish_verifies_both_sources_before_copying_registry_manifests(self):
+        """A missing, stale, mislabeled or conflicting lane cannot publish either ISA."""
+        source = {"revision": "a" * 40, "tree": "tree", "dirty": False}
+        base = "ghcr.io/llaminar/llaminar:develop"
+        for defect in (None, "missing", "foreign-tree", "foreign-isa", "different-config", "pinned-conflict"):
+            with self.subTest(defect=defect), tempfile.TemporaryDirectory() as temporary:
+                root = Path(temporary)
+                registry, configs, expected = {}, {}, {}
+                for index, isa in enumerate(gate.SHIPPING_ISAS):
+                    if defect == "missing" and isa == "AVX2":
+                        continue
+                    manifest = "sha256:" + str(index + 1) * 64
+                    runtime = "sha256:" + str(index + 3) * 64
+                    ref = f"{base.rsplit(':', 1)[0]}@{manifest}"
+                    expected[isa] = runtime
+                    negative = defect if isa == "AVX2" else None
+                    registry[ref] = "sha256:" + "9" * 64 if negative == "different-config" else runtime
+                    configs[ref] = {"config": {"Labels": {
+                        "org.opencontainers.image.revision": source["revision"],
+                        "org.llaminar.source_tree": source["tree"],
+                        "org.llaminar.build_type": "Release", "org.llaminar.image_role": "runtime",
+                        "org.llaminar.cpu_isa": "AVX512" if negative == "foreign-isa" else isa,
+                        "org.llaminar.cuda": "ON", "org.llaminar.rocm": "ON",
+                    }}}
+                    if negative == "pinned-conflict":
+                        registry[gate.revision_tag(base, isa, source["revision"])] = "sha256:" + "f" * 64
+                    artifact = root / f"develop-stage-{isa}"
+                    artifact.mkdir()
+                    gate.write_json(artifact / "develop-image-gate.json", {
+                        "schema": 1, "source": {**source, "tree": "foreign"} if negative == "foreign-tree" else source,
+                        "image": base, "validation": "build-only", "complete": True, "published": False,
+                        "variants": {isa: {"runtime_image": runtime, "staged_manifest": manifest}},
+                    })
+
+                def copy(command, log):
+                    self.assertEqual(command[:5], ["docker", "buildx", "imagetools", "create", "--prefer-index=false"])
+                    registry[command[-2]] = registry[command[-1]]
+
+                output = root / "published"
+                with patch.object(gate, "source_identity", return_value=source), \
+                     patch.object(gate, "remote_image_id", side_effect=registry.get), \
+                     patch.object(gate.subprocess, "check_output", side_effect=lambda cmd, **_: json.dumps(configs[cmd[-1]])), \
+                     patch.object(gate, "run", side_effect=copy) as run, \
+                     patch.object(gate, "build") as build:
+                    args = ["--output", str(output), "--image", base, "--publish-staged", str(root)]
+                    if defect is not None:
+                        with self.assertRaises((ValueError, FileNotFoundError)):
+                            gate.main(args)
+                        run.assert_not_called()
+                    else:
+                        self.assertEqual(gate.main(args), 0)
+                        self.assertEqual([call.args[0][-2] for call in run.call_args_list], [
+                            *(gate.revision_tag(base, isa, source["revision"]) for isa in gate.SHIPPING_ISAS),
+                            *(gate.runtime_tag(base, isa) for isa in gate.SHIPPING_ISAS),
+                        ])
+                    build.assert_not_called()
+                receipt = json.loads((output / "develop-image-gate.json").read_text())
+                self.assertEqual(receipt["complete"], defect is None)
+                self.assertEqual(receipt["published"], defect is None)
+                if defect is None:
+                    self.assertEqual({isa: variant["runtime_image"] for isa, variant in receipt["variants"].items()}, expected)
+
     def test_ref_tag_is_immutable_and_published_before_mutable_branch(self):
         source = "a" * 40
         runtime = {"runtime": {"id": "sha256:" + "1" * 64}}
@@ -295,21 +651,124 @@ class DevelopImageGateTests(unittest.TestCase):
                         os.killpg(child_pid, signal.SIGKILL)
 
     def test_ci_replaces_the_step_shell_with_the_cancellable_driver(self):
+        """The selected CI steps deliver cancellation directly to the image gate."""
+        workflows = ROOT / ".github/workflows"
+        driver = "python3 scripts/ci/run_develop_image_gate.py"
+        for workflow, job in (
+            ("develop-pr-tests.yml", "unit"),
+            ("develop-image-isa.yml", "runtime"),
+            ("ci.yml", "publish"),
+        ):
+            with self.subTest(workflow=workflow, job=job):
+                policy = yaml.load((workflows / workflow).read_text(), Loader=yaml.BaseLoader)
+                commands = [
+                    step["run"]
+                    for step in policy["jobs"][job]["steps"]
+                    if driver in step.get("run", "")
+                ]
+                self.assertEqual(len(commands), 1)
+                self.assertTrue(
+                    any(line.startswith(f"exec {driver} ") for line in commands[0].splitlines()),
+                    "the image gate must replace its step shell",
+                )
+
+    def test_ci_stages_each_isa_after_its_own_toolchain_job(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", workflow)
         policy = yaml.load(workflow, Loader=yaml.BaseLoader)
-        self.assertEqual(policy["jobs"]["develop-images"]["runs-on"],
-                         {"group": "Develop CI", "labels": "llaminar-develop-avx2"})
+        job = policy["jobs"]["develop-images"]
+        self.assertEqual(job["strategy"], {"fail-fast": "false", "matrix": {"cpu_isa": list(gate.SHIPPING_ISAS)}})
+        self.assertEqual(job["uses"], "./.github/workflows/develop-image-isa.yml")
+        self.assertEqual(job["with"], {"cpu-isa": "${{ matrix.cpu_isa }}"})
         self.assertEqual(policy["concurrency"], {
             "group": "llaminar-develop-images", "cancel-in-progress": "true"})
-        self.assertIn("--build-only", workflow)
-        self.assertNotIn("prerequisites/", workflow)
-        self.assertNotIn("prune_docker_build_cache", workflow)
-        buildx = next(step for step in policy["jobs"]["develop-images"]["steps"]
-                      if step.get("uses") == "docker/setup-buildx-action@v4")
-        self.assertEqual(buildx["with"]["name"], "llaminar-develop")
-        self.assertEqual(buildx["with"]["keep-state"], "true")
-        self.assertNotIn("sudo", workflow)
+        reusable_path = ROOT / job["uses"]
+        reusable = yaml.load(reusable_path.read_text(), Loader=yaml.BaseLoader)["jobs"]
+        preparation, runtime = reusable["toolchain"], reusable["runtime"]
+        self.assertEqual(runtime["needs"], "toolchain")
+        for phase in (preparation, runtime):
+            self.assertEqual(phase["runs-on"], "ubuntu-24.04")
+            self.assertEqual(phase["timeout-minutes"], "240")
+            self.assertEqual(phase["steps"][0]["with"]["ref"], "${{ github.sha }}")
+        prepare_steps, steps = preparation["steps"], runtime["steps"]
+        buildx = next(step for step in steps if step.get("uses") == "docker/setup-buildx-action@v4")
+        self.assertEqual(buildx["with"]["driver"], "docker-container")
+        self.assertNotEqual(buildx["with"].get("keep-state"), "true")
+        cold_build, = [step for step in prepare_steps if step.get("uses") == "./.github/actions/cache-develop-toolchain"]
+        self.assertEqual(cold_build["with"], {"cpu-isa": "${{ inputs.cpu-isa }}"})
+        self.assertEqual(cold_build["if"], "steps.lookup.outputs.cache-hit != 'true'")
+        first_lookup, ready = [step for step in prepare_steps if step.get("uses") == "actions/cache/restore@v5"]
+        restore, = [step for step in steps if step.get("uses") == "actions/cache/restore@v5"]
+        handoff = {"key": "${{ steps.toolchain-cache.outputs.key }}",
+                   "path": "${{ steps.toolchain-cache.outputs.path }}"}
+        self.assertEqual(first_lookup["with"], {**handoff, "lookup-only": "true"})
+        self.assertEqual(ready["with"], {**handoff, "lookup-only": "true", "fail-on-cache-miss": "true"})
+        self.assertLess(prepare_steps.index(first_lookup), prepare_steps.index(cold_build))
+        self.assertLess(prepare_steps.index(cold_build), prepare_steps.index(ready))
+        self.assertEqual(restore["with"], {**handoff, "fail-on-cache-miss": "true"})
+        verify = next(step for step in steps if "toolchain_cache.py verify" in step.get("run", ""))
+        staging = next(step for step in steps if "--stage" in step.get("run", ""))
+        self.assertLess(steps.index(restore), steps.index(verify))
+        self.assertLess(steps.index(verify), steps.index(staging))
+        self.assertIn("LLAMINAR_DOCKER_TOOLCHAIN_ROOT", verify["run"])
+        self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", staging["run"])
+        self.assertIn("--build-only", staging["run"])
+        self.assertEqual(staging["env"]["LLAMINAR_DOCKER_BUILD_CACHE_ACCESS"], "read-write")
+        self.assertIn(':build-cache-develop"', staging["run"])
+        self.assertIn('--cpu-isa "$CPU_ISA"', staging["run"])
+        self.assertIn("kernel.core_pattern=/proc/llaminar-core-disabled", reusable_path.read_text())
+        publisher = policy["jobs"]["publish"]
+        self.assertEqual(publisher["runs-on"], "ubuntu-24.04")
+        self.assertEqual(publisher["needs"], "develop-images")
+        self.assertTrue(any("--publish-staged" in step.get("run", "") for step in publisher["steps"]))
+
+    def test_failed_job_logs_survive_a_killed_build_and_a_missing_sibling_log(self):
+        """Replay a killed build's GitHub transcript without needing a live runner or network."""
+        workflows = ROOT / ".github/workflows"
+        for caller, build in (("develop-pr.yml", "unit"), ("ci.yml", "develop-images")):
+            job = yaml.load((workflows / caller).read_text(), Loader=yaml.BaseLoader)["jobs"]["failed-job-logs"]
+            if caller == "ci.yml":
+                self.assertEqual(job["needs"], [build, "publish"])
+                self.assertEqual(job["if"], "always() && (contains(needs.*.result, 'failure') || "
+                                 "contains(needs.*.result, 'cancelled'))")
+            else:
+                self.assertEqual(job["needs"], build)
+                self.assertEqual(job["if"], f"always() && (needs.{build}.result == 'failure' || needs.{build}.result == 'cancelled')")
+            self.assertEqual(job["permissions"], {"actions": "read"})
+            self.assertEqual(job["uses"], "./.github/workflows/failed-job-logs.yml")
+        workflow = yaml.load((workflows / "failed-job-logs.yml").read_text(), Loader=yaml.BaseLoader)
+        collect, upload, summary = workflow["jobs"]["collect"]["steps"]
+        self.assertIn('.conclusion == "cancelled"', collect["run"])
+        self.assertEqual(upload["if"], "${{ always() && steps.transcripts.outputs.expected == 'true' }}")
+        self.assertIn("github.run_attempt", upload["with"]["name"])
+        self.assertIn("steps.upload.outputs.artifact-url", summary["env"]["ARTIFACT_URL"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            # The API lists two failed jobs. One has no transcript yet. The
+            # other includes both a signed cache URL and the runner's exit code.
+            gh = root / "gh"
+            gh.write_text("#!/bin/sh\nprintf '12\\tAVX2\\n13\\tAVX512\\n'\n")
+            curl = root / "curl"
+            curl.write_text("""#!/bin/sh
+while [ "$1" != --output ]; do shift; done
+case "$3" in
+  */12/logs) : > "$2" ;;
+  */13/logs) printf '%s\\n' 'https://cache.example/blob?sig=private' 'exit code 137' > "$2" ;;
+  *) exit 1 ;;
+esac
+""")
+            gh.chmod(0o755)
+            curl.chmod(0o755)
+            env = dict(os.environ, PATH=f"{root}:{os.environ['PATH']}", RUNNER_TEMP=directory,
+                       GITHUB_OUTPUT=str(root / "outputs"), GH_TOKEN="unused", GITHUB_API_URL="https://api.example", GITHUB_REPOSITORY="test/repo",
+                       GITHUB_RUN_ID="41", GITHUB_RUN_ATTEMPT="2")
+            result = subprocess.run(["bash", "-c", collect["run"]], env=env, capture_output=True, text=True)
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("job 12", result.stdout)
+            logs = root / "failed-job-logs"
+            self.assertEqual([p.name for p in logs.iterdir()], ["AVX512-13.log"])
+            self.assertEqual((logs / "AVX512-13.log").read_text(), "https://cache.example/blob?[redacted]\nexit code 137\n")
 
     def test_develop_pr_runs_both_isas_on_separate_dedicated_runners(self):
         """Exercise the real PR command, not a separately invented argument set."""
@@ -321,7 +780,7 @@ class DevelopImageGateTests(unittest.TestCase):
                          {"opened", "synchronize", "reopened", "ready_for_review"})
         self.assertEqual(workflow["permissions"], {"contents": "read"})
         self.assertNotIn("concurrency", workflow)
-        self.assertEqual(set(workflow["jobs"]), {"unit"})
+        self.assertEqual(set(workflow["jobs"]), {"unit", "failed-job-logs"})
         job = workflow["jobs"]["unit"]
         self.assertEqual(job["uses"],
                          "Llaminar/llaminar/.github/workflows/develop-pr-tests.yml@develop")
@@ -341,11 +800,13 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(job["runs-on"], "${{ matrix.runner }}")
         self.assertEqual(job["strategy"], {"fail-fast": "false", "max-parallel": "2",
             "matrix": {"cpu_isa": ["AVX2", "AVX512"], "include": [
-                {"cpu_isa": "AVX2", "runner": "llaminar-develop-avx2"},
-                {"cpu_isa": "AVX512", "runner": "llaminar-avx512"}]}})
+                {"cpu_isa": "AVX2", "runner": "llaminar-develop-avx2", "pr_gpus": "CUDA+ROCm",
+                 "check_name": "Unit + hardware preflight (AVX2)"},
+                {"cpu_isa": "AVX512", "runner": "llaminar-avx512", "pr_gpus": "none",
+                 "check_name": "Unit + host (AVX512)"}]}})
         self.assertEqual(len({row["runner"] for row in job["strategy"]["matrix"]["include"]}), 2)
         self.assertEqual(f"{caller['name']} / {job['name']}",
-                         "Develop PR / Unit + host (${{ matrix.cpu_isa }})")
+                         "Develop PR / ${{ matrix.check_name }}")
         self.assertIn("github.event_name == 'pull_request'", job["if"])
         self.assertIn("github.base_ref == 'develop'", job["if"])
         self.assertIn("github.event.pull_request.head.repo.full_name == github.repository", job["if"])
@@ -369,6 +830,7 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertNotIn("sudo", "\n".join(commands))
         build_step = next(step for step in steps if "exec python3" in step.get("run", ""))
         self.assertEqual(build_step["env"], {"CPU_ISA": "${{ matrix.cpu_isa }}",
+                                            "PR_GPUS": "${{ matrix.pr_gpus }}",
                                             "LLAMINAR_DOCKER_BUILD_CACHE_ACCESS": "import-only"})
         self.assertIn("LLAMINAR_DOCKER_BUILD_CACHE_IMAGE", commands[-1])
         artifact = next(step for step in steps if step.get("uses") == "actions/upload-artifact@v4")
@@ -379,7 +841,15 @@ class DevelopImageGateTests(unittest.TestCase):
             self.assertEqual(command[:2], ["python3", "scripts/ci/run_develop_image_gate.py"])
             arguments = command[2:]
             arguments[arguments.index("--cpu-isa") + 1] = isa
+            gpu_policy = next(row["pr_gpus"] for row in job["strategy"]["matrix"]["include"]
+                              if row["cpu_isa"] == isa)
+            arguments[arguments.index("--pr-gpus") + 1] = gpu_policy
             policy = gate.parse_arguments(arguments)
+            self.assertEqual(policy.pr_gpus.value, gpu_policy)
+            # develop's protected caller supplies only the ISA and output on
+            # the first PR introducing GPU coverage. Exercise its actual argv.
+            protected = gate.parse_arguments(["--cpu-isa", isa, "--output", "/unused"])
+            self.assertIs(protected.pr_gpus, policy.pr_gpus)
             self.assertEqual(policy.cpu_isas, [isa])
             self.assertFalse(policy.publish)
             self.assertIsNone(policy.image)
@@ -397,9 +867,14 @@ class DevelopImageGateTests(unittest.TestCase):
                     events.append(("build", args.cpu_isa))
                     return images(args.cpu_isa)
 
-                def unit_tests(built, directory):
+                def unit_tests(built, directory, gpu_coverage):
                     events.append(("unit", built["test-runner"]["id"]))
-                    return pr_report()
+                    self.assertEqual(gpu_coverage.value, gpu_policy)
+                    report = pr_report()
+                    report["scope"] = gpu_coverage.validation
+                    if gpu_coverage is gate.PRGPUCoverage.CUDA_ROCM:
+                        report["lanes"].update(pr_report(pr_runner.PRTestScope.GPU)["lanes"])
+                    return report
 
                 with patch.object(gate, "require_host_cpu_isa") as cpu_admission, \
                      patch.object(gate, "source_identity", return_value=source), \
@@ -416,7 +891,7 @@ class DevelopImageGateTests(unittest.TestCase):
                 self.assertTrue(receipt["complete"])
                 self.assertFalse(receipt["published"])
                 self.assertEqual(set(receipt["variants"]), {isa})
-                self.assertEqual(receipt["validation"], "unit-and-host")
+                self.assertEqual(receipt["validation"], policy.pr_gpus.validation)
                 self.assertEqual(receipt["variants"][isa]["unit_test_count"], 1)
                 self.assertEqual(receipt["variants"][isa]["host_test_count"], 1)
 
@@ -427,14 +902,31 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertEqual(set(workflow["on"]), {"pull_request_target"})
         self.assertEqual(workflow["on"]["pull_request_target"]["branches"], ["develop"])
         self.assertEqual(set(workflow["on"]["pull_request_target"]["types"]),
-                         {"opened", "reopened", "synchronize", "ready_for_review"})
+                         {"opened", "reopened", "synchronize", "ready_for_review", "edited"})
         self.assertEqual(workflow["permissions"],
                          {"contents": "read", "pull-requests": "read"})
-        self.assertEqual(set(workflow["jobs"]), {"arm"})
+        self.assertEqual(set(workflow["jobs"]), {"arm", "arm-owner"})
         job = workflow["jobs"]["arm"]
         self.assertIn("head.repo.full_name == github.repository", job["if"])
         self.assertIn("!github.event.pull_request.draft", job["if"])
+        self.assertIn("github.event.pull_request.user.id != 3513358", job["if"])
         self.assertEqual(len(job["steps"]), 1)
+        owner = workflow["jobs"]["arm-owner"]
+        self.assertIn("github.event.pull_request.user.id == 3513358", owner["if"])
+        self.assertIn("head.repo.full_name == github.repository", owner["if"])
+        self.assertIn("!github.event.pull_request.draft", owner["if"])
+        self.assertEqual(owner["environment"], "llaminar-bot")
+        mint, arm = owner["steps"]
+        self.assertRegex(mint["uses"], r"^actions/create-github-app-token@[0-9a-f]{40}$")
+        self.assertEqual(mint["with"], {
+            "client-id": "${{ vars.LLAMINAR_BOT_CLIENT_ID }}",
+            "private-key": "${{ secrets.LLAMINAR_BOT_PRIVATE_KEY }}",
+            "permission-contents": "write", "permission-pull-requests": "write"})
+        self.assertEqual(arm["env"]["GH_TOKEN"], "${{ steps.bot.outputs.token }}")
+        self.assertIn("--auto --squash", arm["run"])
+        self.assertIn('--match-head-commit "$PR_HEAD_SHA"', arm["run"])
+        self.assertNotIn("--admin", str(workflow))
+        self.assertNotIn("checkout", str(owner))
         step = job["steps"][0]
         self.assertEqual(step["env"]["GH_TOKEN"], "${{ secrets.DEVELOP_AUTOMERGE_TOKEN }}")
         self.assertEqual(step["env"]["PR_NUMBER"],
@@ -443,6 +935,41 @@ class DevelopImageGateTests(unittest.TestCase):
         self.assertIn('gh pr merge "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --auto --squash', step["run"])
         self.assertIn('--match-head-commit "$PR_HEAD_SHA"', step["run"])
         self.assertNotIn("checkout", str(job))
+
+    def test_owner_job_migrates_native_merge_identity_for_the_current_head(self):
+        """Execute the shipped workflow shell for new and previously armed PRs."""
+        workflow = yaml.load((ROOT / ".github/workflows/develop-auto-merge.yml").read_text(),
+                             Loader=yaml.BaseLoader)
+        command = workflow["jobs"]["arm-owner"]["steps"][-1]["run"]
+        repo = "Llaminar/llaminar"
+        sha = "a" * 40
+        arm = f"pr merge 64 --repo {repo} --auto --squash --match-head-commit {sha}"
+        disable = f"pr merge 64 --repo {repo} --disable-auto"
+        with tempfile.TemporaryDirectory() as temp:
+            directory = Path(temp)
+            gh = directory / "gh"
+            gh.write_text('#!/bin/sh\nif [ "$1" = api ]; then cat "$PR_JSON"; '
+                          'else echo "$*" >> "$MERGE_LOG"; fi\n')
+            gh.chmod(0o755)
+            fixture, log = directory / "pr.json", directory / "calls"
+            for login, action, author, source, expected in [
+                    (None, "opened", 3513358, sha, [arm]),
+                    ("dbsanfte", "edited", 3513358, sha, [disable, arm]),
+                    (None, "edited", 3513358, sha, []),
+                    ("llaminar-bot[bot]", "synchronize", 3513358, sha, []),
+                    ("dbsanfte", "edited", 42, sha, []),
+                    ("dbsanfte", "edited", 3513358, "b" * 40, [])]:
+                with self.subTest(login=login, action=action, author=author, source=source):
+                    fixture.write_text(json.dumps({"head": {"sha": source, "repo": {"full_name": repo}},
+                        "base": {"ref": "develop"}, "user": {"id": author}, "draft": False,
+                        "state": "open", "auto_merge": {"enabled_by": {"login": login}} if login else None}))
+                    log.write_text("")
+                    result = subprocess.run(["bash", "-c", command], capture_output=True, text=True,
+                        env={**os.environ, "PATH": temp + os.pathsep + os.environ["PATH"],
+                             "PR_JSON": str(fixture), "MERGE_LOG": str(log), "GITHUB_REPOSITORY": repo,
+                             "PR_NUMBER": "64", "PR_HEAD_SHA": sha, "PR_EVENT_ACTION": action})
+                    self.assertEqual(result.returncode == 0, author == 3513358 and source == sha)
+                    self.assertEqual(log.read_text().splitlines(), expected)
 
     def test_all_host_ci_jobs_share_a_serial_non_discarding_queue(self):
         """Production certification jobs cannot contend for this host's GPUs."""

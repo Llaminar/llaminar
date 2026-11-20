@@ -1053,11 +1053,15 @@ or `observe` to collect demand information without moving them. The separate
 layout. Extra cached copies of experts are controlled by `--moe-hot-expert-cache`,
 which is off by default.
 
-On one homogeneous, rank-local multi-GPU tier, the automatic compute default
-is `gate-up-owned-down-columns`. This
-keeps gate/up weights movable while splitting each expert's down-output
-columns across the GPUs. It is a separate compute layout, not a movement
-setting. CPU, heterogeneous and multi-tier layouts keep whole-expert ownership.
+On one homogeneous, rank-local multi-GPU tier, automatic compute normally
+uses `gate-up-owned-down-columns`. It keeps gate/up weights movable while
+splitting each expert's down-output columns across the GPUs. For Qwen Flash
+Next with 640 intermediate columns, four MI50s serving the complete model
+in one stationary tier (`--moe-residency-maintenance off`) automatically
+use `tensor-sharded`. Each GPU owns 160 routed and 160 shared expert
+columns. Small FP32 reductions use direct peer transfer when the driver
+confirms every directed peer link. CPU, heterogeneous and multi-tier layouts
+keep whole-expert ownership.
 To compare against whole experts on the same GPU tier, use
 `--moe-routed-expert-compute apportioned` (or add `;expert_compute=apportioned`
 to that tier). Explicit layout choices always take precedence. Projection
@@ -1411,21 +1415,25 @@ without driving maintenance.
 ### CI and branch approvals
 
 PRs into `develop` build AVX512 and AVX2 test images in parallel on separate
-16-core GitHub-hosted runners. Each runs the complete device-free Unit suite
+self-hosted runners. Each runs the complete device-free Unit suite
 and the host lane of production preflight; both checks and owner approval
-are required. CUDA, ROCm and exclusive preflight lanes remain production checks.
-After merge, the same runner size builds and publishes the AVX512 and AVX2
-Release development images without running tests. Both workflows restore complete
-toolchain images keyed by dependency inputs and ISA. They save newly built
-toolchains before source compilation, so later failures retain them. Production validation and
+are required. AVX2 also runs every hardware-supported production preflight test in
+a separate GPU container, including CUDA, ROCm, mixed-backend and exclusive
+lanes. Explicit hardware requirements record unavailable topologies as
+unqualified; missing GPUs, selected-test failures and skips block the gate.
+After merge, standard GitHub-hosted Ubuntu runners build the AVX512 and AVX2
+Release development images in parallel and publish the verified pair. Each ISA
+prepares its toolchain cache in a separate job before building the runtime.
+Both workflows cache complete toolchain images keyed by dependency inputs and
+ISA. Production validation and
 release certification remain separate. Different PRs can run concurrently; a
 new develop merge cancels any older image build. See [the CI workflow](docs/production-ci.md).
 
 ### Build from source
 
 The recommended development environment is the repository's
-[devcontainer](.devcontainer/README.md). It supplies the toolchains and the
-patched NCCL/RCCL dependencies required for capture. Open it in VS Code and run
+[devcontainer](.devcontainer/README.md). It supplies the toolchains and patched NCCL. The local build command below
+prepares RCCL from the same pinned sources and settings as the runtime image. Open it in VS Code and run
 the Build Release or Build Integration task, or follow the
 [terminal/SSH workflow](.devcontainer/SSH_CODEX.md).
 
@@ -1435,6 +1443,7 @@ For a Release build inside that environment:
 LLAMINAR_NINJA_BIN="$(command -v ninja)"
 cmake -B build_v2_release -S src/v2 -G Ninja \
   -DCMAKE_BUILD_TYPE=Release \
+  -DLLAMINAR_BUILD_RCCL_FROM_SOURCE=ON \
   -DCMAKE_MAKE_PROGRAM:FILEPATH="${LLAMINAR_NINJA_BIN}"
 cmake --build build_v2_release --parallel
 ```
@@ -1452,6 +1461,84 @@ scripts/docker/build-runtime-image.sh --cpu-isa AVX512 --tag llaminar:local
 
 Use `--cpu-isa AVX2` for an AVX2 image. A local image is not CI-certified merely
 because it built successfully.
+
+### Linux ARM64 runtime
+
+On DGX Spark, use the native ARM64 CPU and CUDA image. The runtime includes
+CUDA code for GB10 (`sm_121`) and baseline NEON CPU kernels.
+
+```bash
+docker pull ghcr.io/llaminar/llaminar:develop-arm64
+docker run --rm --gpus all ghcr.io/llaminar/llaminar:develop-arm64 --help
+```
+
+To build the same runtime locally on an ARM64 host:
+
+```bash
+scripts/docker/build-runtime-image.sh --variant cuda --cpu-isa NEON --tag llaminar:spark
+```
+
+### AArch64 portability checks
+
+The native macOS inference runtime is incomplete.
+The compiler envelope selects NEON on AArch64 without x86 flags. Native vector,
+SwiGLU, RoPE and anchored AQ8 key primitives have focused numerical tests;
+grouped prepared projections cover the quantized source catalog. Complete
+factory/arena wiring, other attention/kernel families and the Linux-specific
+memory, topology and MPI lifecycle still need porting to macOS.
+
+To build the focused device-free checks on an Apple Silicon Mac with Xcode
+Command Line Tools, CMake/CTest 4 or newer, Ninja, Python 3, GoogleTest, OpenMP,
+MPI headers/libraries and optional ccache installed (Homebrew packages:
+`cmake ninja python googletest libomp open-mpi ccache`). Test builds require
+CTest's actual timeout-owner JSON properties; runtime signal support in older
+CTest versions alone does not satisfy that evidence contract. Container tool
+pins are owned by `scripts/docker/install-system-deps.sh`.
+
+```bash
+OMP_PREFIX="$(brew --prefix libomp)"
+cmake -S tests/v2/portability -B build_arm_portability -G Ninja \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DCMAKE_MAKE_PROGRAM:FILEPATH="$(command -v ninja)" \
+  '-DOpenMP_CXX_FLAGS:STRING=-Xpreprocessor -fopenmp' \
+  -DOpenMP_CXX_INCLUDE_DIR:PATH="${OMP_PREFIX}/include" \
+  -DOpenMP_CXX_LIB_NAMES:STRING=omp \
+  -DOpenMP_omp_LIBRARY:FILEPATH="${OMP_PREFIX}/lib/libomp.dylib"
+cmake --build build_arm_portability --parallel
+ctest --test-dir build_arm_portability --output-on-failure --parallel
+```
+
+This test-only project compiles production primitive/projection/attention-key
+leaves and shares their registrations with the normal Unit/preflight gates.
+The ownership-header regression uses the real MPI SDK without initializing MPI;
+it does not qualify the production session runtime's separate ABI requirements.
+It is not a server build or the complete production gate. `LLAMINAR_CPU_ISA=NEON` names a
+compiler envelope, not a complete inference capability. A separate build with
+`-DLLAMINAR_CPU_ISA=NEON_DOTPROD` exercises signed dot-product instructions on
+hardware that advertises them, and `-DLLAMINAR_CPU_ISA=NEON_I8MM` adds the
+Int8 matrix-multiply (SMMLA) extension, for example on DGX Spark (GB10). An
+I8MM binary refuses to start without native I8MM; its arithmetic level and
+runtime spelling remain `neon-dotprod`, because SMMLA publishes the same exact
+integer sums. Incompatible architecture/ISA selections fail;
+runtime diagnostic requests (`LLAMINAR_ISA_LEVEL=neon` or `neon-dotprod`) must
+also fit the compiled envelope and native capabilities. They never downgrade
+an unsupported request to scalar. The
+[native ARM kernel plan](docs/v2/projects/2026-11/ARM_CPU_INFERENCE_KERNEL_PLAN.md)
+tracks the full numerical, runtime, exact-overlay and `Perf__` qualification scope.
+
+For isolated AQ8 codec tuning, this build also exposes the canonical `Perf__`
+target. Run timing separately from CTest/profilers; it is not full inference or
+the final ARM performance gate:
+
+```bash
+cmake --build build_arm_portability --parallel --target v2_perf_cpu_attention_key_q8
+./build_arm_portability/v2_perf_cpu_attention_key_q8 \
+  --head-dim 128 --heads 128 --iterations 1000 --workers 1 \
+  --isa neon --operation encode
+```
+
+Use `decode` for reconstruction and 64/128/256 for the physical head width.
+Explicit ISA requests must match the compiled/native instruction family.
 
 ### Projection arithmetic diagnostics
 

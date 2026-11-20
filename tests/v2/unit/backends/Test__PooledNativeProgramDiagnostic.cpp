@@ -205,24 +205,44 @@ TEST(PooledNativeProgramDiagnostic,GeneralHostBOMRejectsMissingForeignAndOverflo
     EXPECT_THROW((void)RetainedParticipantGraphExecutable::generalBOM(gpu,host),std::invalid_argument);
     const auto none=RetainedParticipantGraphExecutable::generalBOM(host,gpu,0);EXPECT_TRUE(none.resources().empty());source.reset();
 }
-/** @test A native creator failure retains attempted host/device backing through the same original physical reset. */
-TEST(PooledNativeProgramDiagnostic,GeneralAttemptedHostAndDeviceBackingSurviveOriginalReset){
-    for(const auto device:{DeviceId::cuda(219),DeviceId::rocm(219)}){
-        EXPECT_EXIT({
-            Source source(device,1,true,64u<<20,true);auto& worker=source.worker();worker.fail=1;
-            try{(void)RetainedParticipantGraphExecutable::create(*source.original,worker.defaultStream());std::_Exit(2);}catch(const std::runtime_error&){}
-            if(worker.calls!=1 || worker.capturesDestroyed)std::_Exit(3);
-            const auto host=GPUGraphMemoryContract::generalHostReservationBytesPerExecutable(device);
-            const auto gpu=GPUGraphMemoryContract::reservationBytesPerExecutable(device);
-            if(source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeGraphExecutable)!=host ||
-               source.memory->reservedBytes(device,PhysicalMemoryOwner::NativeGraphExecutable)!=gpu)std::_Exit(4);
-            source.reset();
-            if(source.memory->reservedBytes(DeviceId::cpu(),PhysicalMemoryOwner::NativeGraphExecutable)!=host ||
-               source.memory->reservedBytes(device,PhysicalMemoryOwner::NativeGraphExecutable)!=gpu)std::_Exit(5);
-            std::_Exit(0);
-        },::testing::ExitedWithCode(0),"");
-    }
+namespace {
+/** @brief Exercise a single original authority through native creator failure and physical reset. */
+[[noreturn]] void verifyAttemptedGeneralBackingSurvivesReset(DeviceId device)
+{
+    Source source(device, 1, true, 64u << 20, true);
+    auto& worker = source.worker();
+    worker.fail = 1;
+    try {
+        (void)RetainedParticipantGraphExecutable::create(*source.original, worker.defaultStream());
+        std::_Exit(2);
+    } catch (const std::runtime_error&) {}
+    if (worker.calls != 1 || worker.capturesDestroyed)
+        std::_Exit(3);
+    const auto host = GPUGraphMemoryContract::generalHostReservationBytesPerExecutable(device);
+    const auto gpu = GPUGraphMemoryContract::reservationBytesPerExecutable(device, GPUGraphExecutableClass::General);
+    if (source.memory->reservedBytes(DeviceId::cpu(), PhysicalMemoryOwner::NativeGraphExecutable) != host ||
+        source.memory->reservedBytes(device, PhysicalMemoryOwner::NativeGraphExecutable) != gpu)
+        std::_Exit(4);
+    source.reset();
+    if (source.memory->reservedBytes(DeviceId::cpu(), PhysicalMemoryOwner::NativeGraphExecutable) != host ||
+        source.memory->reservedBytes(device, PhysicalMemoryOwner::NativeGraphExecutable) != gpu)
+        std::_Exit(5);
+    std::_Exit(0);
 }
+}
+
+/** @test Native creator failure retains CUDA and host backing through the original reset. */
+TEST(PooledNativeProgramDiagnostic, GeneralAttemptedCUDAAndHostBackingSurviveOriginalReset)
+{
+    EXPECT_EXIT(verifyAttemptedGeneralBackingSurvivesReset(DeviceId::cuda(219)), ::testing::ExitedWithCode(0), "");
+}
+
+/** @test Native creator failure retains ROCm and host backing through the original reset. */
+TEST(PooledNativeProgramDiagnostic, GeneralAttemptedROCmAndHostBackingSurviveOriginalReset)
+{
+    EXPECT_EXIT(verifyAttemptedGeneralBackingSurvivesReset(DeviceId::rocm(219)), ::testing::ExitedWithCode(0), "");
+}
+
 TEST(PooledNativeProgramDiagnostic, GeneralAttemptedBackingRemainsProcessRetainedAcrossActualReset){
     EXPECT_EXIT({
         Source source(DeviceId::cuda(214),2);auto& worker=source.worker();const auto device=source.original->device();

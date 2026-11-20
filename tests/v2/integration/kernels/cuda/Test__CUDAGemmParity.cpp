@@ -34,6 +34,7 @@
  * @date January 2026
  */
 
+#include "kernels/cuda/gemm/CUDANativeQuantisedArchitecture.h"
 #include "backends/GPUDeviceProcessLifetime.h"
 #include <gtest/gtest.h>
 #include "tensors/IQQuantTables.h"
@@ -742,6 +743,8 @@ namespace
             << " cosine=" << cosineSimilarity(actual, expected, count);
     }
 
+#ifdef HAVE_CUDA
+    // CUDA launch/stream helpers; every caller is itself CUDA-only.
     /**
      * @brief Scope direct CUDA native-quantised calls into production verifier mode.
      *
@@ -773,6 +776,7 @@ namespace
     private:
         int previous_ = 0;
     };
+#endif // HAVE_CUDA
 
     /**
      * @brief Compare two logit rows as probability distributions.
@@ -822,6 +826,8 @@ namespace
         }
         return 0.5 * (actual_to_expected + expected_to_actual);
     }
+
+#ifdef HAVE_CUDA
 
     // =========================================================================
     // Helpers: multiply via tensor interface (multiply() removed from ITensorGemm)
@@ -1418,6 +1424,7 @@ namespace
 
         ASSERT_EQ(cudaStreamDestroy(stream), cudaSuccess);
     }
+#endif // HAVE_CUDA
 
     /**
      * @brief Return the Qwen3.6 MoE GGUF used by real-weight kernel regressions.
@@ -1618,6 +1625,7 @@ namespace
         return ok;
     }
 
+#ifdef HAVE_CUDA
     bool cudaFusedSwiGLUDownViaTensor(ITensorGemm *kernel,
                                       const float *gate_host,
                                       const float *up_host,
@@ -1657,6 +1665,7 @@ namespace
             std::memcpy(C_host, C_tensor->data(), (size_t)M * N * sizeof(float));
         return ok;
     }
+#endif // HAVE_CUDA
 
 } // namespace
 
@@ -2783,8 +2792,20 @@ TEST_F(Test__CUDAGemmParity, NativeQuantisedPrefillActiveRowsAllFormatsByteExact
     bool bk256_wide_seen = false;
     bool profiled_narrow_large_k_crossover_seen = false;
 
-    for (const auto &geometry :
-         nativeQuantisedPrefillAllFormatGeometryEquivalenceCases())
+    int sm_count = 0;
+    ASSERT_EQ(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+                                     gpu_device_.cuda_ordinal()), cudaSuccess);
+    ASSERT_GT(sm_count, 0);
+    auto geometries = nativeQuantisedPrefillAllFormatGeometryEquivalenceCases();
+    // Two waves of 128x128 blocks exercise the automatic 512-thread tile on
+    // both mobile and full-size GPUs. One simple codebook suffices for this
+    // grid-fill boundary; the shared geometries still cover every codebook.
+    constexpr int rows = 512;
+    constexpr int row_tiles = rows / 128;
+    const int column_tiles = (std::max(56, 2 * sm_count) + row_tiles - 1) / row_tiles;
+    const auto &wide_tile_witness = geometries.emplace_back(NativeQuantisedPrefillGeometryEquivalenceCase{
+        "two_waves_128x128", column_tiles * 128 - 1, 2304, {{rows, rows}}});
+    for (const auto &geometry : geometries)
     {
         SCOPED_TRACE(geometry.label);
         ASSERT_FALSE(geometry.row_cases.empty());
@@ -2802,6 +2823,8 @@ TEST_F(Test__CUDAGemmParity, NativeQuantisedPrefillActiveRowsAllFormatsByteExact
 
         for (const auto &format : cudaSmallMNativeFormats())
         {
+            if (&geometry == &wide_tile_witness && std::string_view(format.name) != "Q8_0")
+                continue;
             SCOPED_TRACE(format.name);
 
             cudaStream_t stream = nullptr;
@@ -2818,13 +2841,6 @@ TEST_F(Test__CUDAGemmParity, NativeQuantisedPrefillActiveRowsAllFormatsByteExact
                 << format.name << " CUDA prepared kernel";
             cuda_kernel->setGPUStream(stream);
 
-            int sm_count = 0;
-            ASSERT_EQ(
-                cudaDeviceGetAttribute(
-                    &sm_count,
-                    cudaDevAttrMultiProcessorCount,
-                    gpu_device_.cuda_ordinal()),
-                cudaSuccess);
             int uses_ordered_reducer = 0;
             int canonical_k_partitions = 0;
             ASSERT_TRUE(
@@ -4168,6 +4184,78 @@ TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_UsesSpecializedNativeQuantisedR
     PerfStatsCollector::reset();
     cleanupWorkspaceIfNeeded(cuda_kernel);
     llaminar::v2::kernels::KernelFactory::clearCacheFor(weights.get());
+}
+
+/** @test Capture the public grouped projection and replay with dirty output. */
+TEST_F(Test__CUDAGemmParity, GroupedVerifierDispatchTableNativeReplay)
+{
+    ScopedEnv enable_stats("LLAMINAR_PERF_STATS_JSON", "1");
+    constexpr int M = 4;
+    constexpr int N = 896;
+    constexpr int K = 768;
+    auto weights = TestTensorFactory::createQ4_KRandom({N, K}, 230);
+    auto *kernel = getPreparedKernel(weights.get(), gpu_device_);
+    ASSERT_NE(kernel, nullptr);
+    ASSERT_TRUE(setupWorkspaceIfNeeded(kernel, M, N, K));
+
+    const auto inputs = randomFP32(M * K);
+    std::vector<float> reference(M * N);
+    for (int row = 0; row < M; ++row)
+    {
+        ASSERT_TRUE(cudaMultiplyViaTensor(
+            kernel, inputs.data() + row * K, reference.data() + row * N,
+            1, N, K, gpu_device_, workspace_.get()));
+    }
+
+    FP32Tensor input({M, K});
+    FP32Tensor output({M, N});
+    std::memcpy(input.mutable_data(), inputs.data(), inputs.size() * sizeof(float));
+    ASSERT_EQ(cudaSetDevice(gpu_device_.ordinal), cudaSuccess);
+    auto &device = GPUDeviceContextPool::instance().getNvidiaContext(gpu_device_.ordinal);
+    ScopedGPUStream stream_owner(gpu_device_);
+    auto stream = static_cast<cudaStream_t>(stream_owner.get());
+    ASSERT_TRUE(input.ensureOnDevice(gpu_device_, stream));
+    ASSERT_TRUE(output.ensureOnDevice(gpu_device_, stream));
+    kernel->setGPUStream(stream);
+    TransferEngine::requireDeviceInput(&input, gpu_device_, stream);
+    TransferEngine::requireDeviceOutput(&output, gpu_device_, stream);
+    const std::vector<ITensorGemm::TensorProjectionDesc> projections{
+        {kernel, &output, N, nullptr, "lm_head"}};
+
+    PerfStatsCollector::reset();
+    auto graph_owner = device.createGraphCapture(stream);
+    auto &graph = dynamic_cast<CUDAGraphCapture &>(*graph_owner);
+    {
+        ScopedBackendGraphCapture recording(graph, "CUDA grouped verifier architecture replay");
+        ASSERT_TRUE(recording.begin());
+        ASSERT_TRUE(kernel->multiply_fused_verifier_rows_decode_equivalent(
+            &input, projections, M, K, nullptr, workspace_.get()));
+        recording.finish();
+    }
+    ASSERT_GT(graph.nodeCount(), 0u);
+    ASSERT_TRUE(graph.instantiate());
+
+    const auto hardware = llaminar2::cuda::nativeQuantisedHardwareForDevice(gpu_device_.ordinal);
+    const auto table = native_quantised::selectVerifierDispatchTable(hardware);
+    const auto expected = llaminar2::native_quantised::verifierDispatchTableName(table);
+    const auto records = PerfStatsCollector::snapshot({"kernel.cuda_native_quantised_gemv_dispatch"});
+    ASSERT_TRUE(std::any_of(records.begin(), records.end(), [&](const PerfStatRecord &record) {
+        return record.value > 0 && record.tags.contains("verifier_dispatch_table") &&
+               record.tags.at("verifier_dispatch_table") == expected &&
+               record.tags.at("semantic_contract") == "verifier_serial_m1_bitwise";
+    }));
+
+    std::vector<float> actual(M * N);
+    const auto bytes = actual.size() * sizeof(float);
+    for (const int dirty : {0, 0xa5, 0xff, 0x5a})
+    {
+        ASSERT_EQ(cudaMemsetAsync(output.gpu_data_ptr(), dirty, bytes, stream), cudaSuccess);
+        ASSERT_TRUE(graph.launch());
+        ASSERT_EQ(cudaMemcpyAsync(actual.data(), output.gpu_data_ptr(), bytes,
+                                 cudaMemcpyDeviceToHost, stream), cudaSuccess);
+        ASSERT_EQ(cudaStreamSynchronize(stream), cudaSuccess);
+        EXPECT_EQ(std::memcmp(actual.data(), reference.data(), bytes), 0);
+    }
 }
 
 TEST_F(Test__CUDAGemmParity, Q4_K_VerifierSmallM_M2MatchesTwoSingleRowDecodeGEMVs)

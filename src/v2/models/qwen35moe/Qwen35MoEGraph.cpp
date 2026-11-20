@@ -25,6 +25,9 @@
 #include "execution/moe/MoEOverlayHostServiceContract.h"
 #include "execution/moe/MoELocalTPMaintenanceDomain.h"
 #include "Qwen35MoEGraph.h"
+#include "execution/compute_stages/stages/MoEIntermediateShardPipeline.h"
+#include "execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
+#include "execution/moe/MoEIntermediateShardRuntimeBinding.h"
 #include "execution/moe/MoEOverlayActivationBatchInventory.h"
 #include "execution/moe/MoEOverlayPreparedGraphBank.h"
 #include "execution/moe/MoEGraphOwnerProjection.h"
@@ -52,7 +55,7 @@
 #include "../../execution/compute_stages/stages/HiddenStateRowSelectStage.h"
 #include "../../execution/compute_stages/stages/MoELocalExpertStage.h"
 #include "../../execution/compute_stages/stages/MoECPUExpertShardRouteStage.h"
-#include "../../execution/moe/CPUExpertShardSourceSelection.h"
+#include "../../execution/moe/ExpertShardSourceSelection.h"
 #include "../../execution/moe/CPUJointHostGraphEndpoint.h"
 #include <omp.h>
 #include "../../execution/compute_stages/stages/MoERankBatchSparseStages.h"
@@ -107,6 +110,8 @@ namespace llaminar2
     {
         constexpr char kMoEPrefixRuntimeMagic[8] = {'L', 'M', 'O', 'E', 'R', 'U', 'N', '1'};
         /*
+         * Version 7 preserves the exact global whole/cohort route target;
+         * a cohort must never be reconstructed from its absent scalar owner.
          * Version 6 binds each portable row to its global model layer, so equal
          * stage shapes cannot restore another stage's request state.
          * Version 5 excludes epoch-ticketed durable placement entirely. Expert
@@ -117,7 +122,7 @@ namespace llaminar2
          * selector. Rejecting it prevents a cache hit from creating two
          * placement authorities or rewinding model-wide residency.
          */
-        constexpr uint32_t kMoEPrefixRuntimeVersion = 6;
+        constexpr uint32_t kMoEPrefixRuntimeVersion = 7;
 
         /**
          * @brief Return whether graph-captured mirrored-layer diagnostics are armed.
@@ -967,7 +972,7 @@ namespace llaminar2
             for (std::size_t expert = 0; expert < overlay_route_participants.size(); ++expert)
             {
                 if (MoEOverlayRouteTarget::fromWord(overlay_route_participants[expert])
-                        .isCPUCohort() &&
+                        .isCohort() &&
                     owner_participants[expert] >= 0)
                 {
                     LOG_ERROR("[Qwen35MoEGraph] "
@@ -1824,7 +1829,8 @@ namespace llaminar2
             const auto has_logical_placement =
                 [](const DeviceMoEPortableExpertRuntimeState &expert)
             {
-                return expert.owner_participant >= 0 ||
+                return expert.overlay_route_participant != -1 ||
+                       expert.owner_participant >= 0 ||
                        expert.local_slot >= 0 ||
                        expert.flags != 0u ||
                        expert.local_compute != 0u ||
@@ -2401,7 +2407,7 @@ namespace llaminar2
             {
                 const auto &residency = config_.moe.expert_overlay_participant_residency;
                 const auto preparation = residency ? residency->projectionPreparation() : nullptr;
-                const auto original_joint_map = preparation ? preparation->cpuJointOwnerMap() : nullptr;
+                const auto original_joint_map = preparation ? preparation->jointOwnerMap() : nullptr;
                 if (original_joint_map)
                 {
                     // Source preparation already sealed the native shard cuts.
@@ -2551,6 +2557,22 @@ namespace llaminar2
 
     void Qwen35MoEGraph::bindProjectionArena()
     {
+        if (config_.moe.routed_compute_policy == RoutedExpertComputePolicy::TensorSharded && config_.default_device.is_gpu())
+        {
+            if (!model_ctx_ || !config_.tp_ctx || !config_.tp_ctx->isLocal())
+                throw std::invalid_argument("GPU F-shard arena requires its original source and native TP declaration");
+            const auto profile = ModelMemoryProfile::fromGGUF(model_ctx_->concreteLoader().getModel());
+            const auto assignment = config_.tp_config ? std::optional{config_.tp_config->forRank(config_.tp_device_idx)}
+                                                     : std::optional<DeviceShardingAssignment>{};
+            const int last = config_.pp_layer_offset + config_.n_layers - 1;
+            const int retained_last = retainsMTPGraphCapacity(config_.mtp) && last == profile.mainLayerCount() - 1
+                ? profile.totalLayerCount() - 1 : last;
+            intermediate_shard_arena_ = MoEIntermediateShardArenaGeometry::resolve(profile,
+                config_.tp_ctx->degree(), config_.tp_device_idx, assignment, config_.pp_layer_offset, retained_last,
+                config_.moe.routed_expert_plan ? config_.moe.routed_expert_plan->gpu_expert_intermediate_tiling
+                                              : GPUExpertIntermediateTiling::Coarse128);
+            return;
+        }
         if (config_.moe.routed_compute_policy != RoutedExpertComputePolicy::GateUpOwnedDownColumns) return;
         if (!model_ctx_ || !config_.tp_ctx || !config_.tp_ctx->isLocal())
             throw std::invalid_argument("Gate/up-owned MoE requires source metadata and a native local TP domain");
@@ -2560,7 +2582,7 @@ namespace llaminar2
 
     void Qwen35MoEGraph::setModelContext(std::shared_ptr<IModelContext> model_ctx)
     {
-        if (projection_arena_ && model_ctx_ != model_ctx)
+        if ((projection_arena_ || intermediate_shard_arena_) && model_ctx_ != model_ctx)
             throw std::logic_error("Cannot replace the source identity of a bound projection graph");
         Qwen35Graph::setModelContext(std::move(model_ctx));
         bindProjectionArena();
@@ -2572,6 +2594,14 @@ namespace llaminar2
         if (!projection_arena_)
             throw std::logic_error("Projection graph metadata must be bound before schema or execution resolution");
         return &*projection_arena_;
+    }
+
+    const MoEIntermediateShardArenaGeometry *Qwen35MoEGraph::intermediateShardArena() const
+    {
+        if (config_.moe.routed_compute_policy != RoutedExpertComputePolicy::TensorSharded || !config_.default_device.is_gpu()) return nullptr;
+        if (!intermediate_shard_arena_)
+            throw std::logic_error("GPU F-shard source metadata must be bound before schema or execution resolution");
+        return &*intermediate_shard_arena_;
     }
 
     void Qwen35MoEGraph::resetState(void *execution_stream)
@@ -2864,6 +2894,19 @@ namespace llaminar2
                 layer,
                 selected->participant_id,
                 config_.moe.num_experts);
+            if (intermediate_shard_arena_)
+            {
+                const auto declaration = adoptMoEOverlayJointGraphDeclaration(
+                    *config_.moe.expert_overlay_participant_residency, registry,
+                    prepared_weight_store_->modelId(), selected->participant_id, layer,
+                    config_.moe.num_experts, config_.d_model, config_.moe.intermediate_size);
+                const auto initial = declaration->acquireInitialConstruction();
+                if (!initial) throw std::logic_error("GPU F-shard runtime finalization lost original construction source");
+                publishInitialMoEIntermediateShardRuntimeLayer(*table, owner_map,
+                    initial->layerForModelLayer(layer), layer, publication_stream);
+                if (publication_missing) ++finalized_layers;
+                continue;
+            }
             if (projection_arena_)
             {
                 const auto *fixed = table->fixedDownProjectionBank(layer);
@@ -3247,10 +3290,10 @@ namespace llaminar2
             if (layers < 0 || experts < 0)
                 throw std::logic_error("invalid MoE prefix serializer geometry");
             // Match the portable serializer below: length-prefixed table name,
-            // two geometry words, seven words per layer, then seven words and
+            // two geometry words, seven words per layer, then eight words and
             // two 64-bit histogram values per expert. Mutable eligibility may
             // omit a table, but cannot make its serialized geometry larger.
-            constexpr size_t expert_bytes = 7u * sizeof(uint32_t) + 2u * sizeof(uint64_t);
+            constexpr size_t expert_bytes = 8u * sizeof(uint32_t) + 2u * sizeof(uint64_t);
             constexpr size_t layer_header = 7u * sizeof(uint32_t);
             constexpr size_t table_header = 3u * sizeof(uint32_t);
             constexpr size_t archive_header = sizeof(kMoEPrefixRuntimeMagic) + 3u * sizeof(uint32_t);
@@ -3374,6 +3417,7 @@ namespace llaminar2
                     appendU32(state, static_cast<uint32_t>(expert.local_compute));
                     appendU32(state, static_cast<uint32_t>(expert.replica_role));
                     appendU32(state, expert.resident_participant_mask);
+                    appendI32(state, expert.overlay_route_participant);
                 }
                 for (uint64_t count : layer.selected_histogram)
                     appendU64(state, count);
@@ -3541,7 +3585,8 @@ namespace llaminar2
                         !readU32(state, offset, expert.flags) ||
                         !readU32(state, offset, local_compute) ||
                         !readU32(state, offset, replica_role) ||
-                        !readU32(state, offset, expert.resident_participant_mask))
+                        !readU32(state, offset, expert.resident_participant_mask) ||
+                        !readI32(state, offset, expert.overlay_route_participant))
                     {
                         LOG_ERROR("[Qwen35MoEGraph] Malformed prefix-cache MoE portable runtime expert payload");
                         return {};
@@ -4229,9 +4274,31 @@ namespace llaminar2
             else if (source_plan->placementLayerCapacity(config_.n_layers) < requested_layers)
                 throw std::invalid_argument("Qwen35 MoE child runtime exceeds its stage placement manifest");
         }
-        return {.device_id = device, .num_layers = table_layers,
+        DeviceMoERuntimeTable::Config result{.device_id = device, .num_layers = table_layers,
             .num_experts = config_.moe.num_experts, .top_k = config_.moe.top_k,
             .mirror_to_device = true, .first_model_layer = config_.pp_layer_offset};
+        if (intermediateShardArena())
+        {
+            const auto residency = config_.moe.expert_overlay_participant_residency;
+            const auto manager = model_ctx_ ? model_ctx_->concreteWeightManager() : nullptr;
+            if (!residency || !manager || !prepared_weight_store_)
+                throw std::logic_error("GPU F-shard runtime requires its original model/registry/source family");
+            const auto &owners = residency->initialOwnerMap();
+            const auto found = std::find_if(owners.participants().begin(), owners.participants().end(), [&](const auto &member) {
+                return member.device == device && member.domain_participant_index == config_.tp_device_idx &&
+                    member.domain_name == config_.moe.routed_expert_plan->continuation_domain;
+            });
+            if (found == owners.participants().end())
+                throw std::invalid_argument("GPU F-shard runtime has no exact original graph participant");
+            for (int layer = result.first_model_layer; layer < result.first_model_layer + table_layers; ++layer)
+            {
+                const auto declaration = adoptMoEOverlayJointGraphDeclaration(*residency, manager->expertGemmRegistry(),
+                    prepared_weight_store_->modelId(), found->participant_id, layer, config_.moe.num_experts,
+                    config_.d_model, config_.moe.intermediate_size);
+                result.fragment_families.push_back(declaration->family());
+            }
+        }
+        return result;
     }
 
     IMoERuntimeTable *Qwen35MoEGraph::moeRuntimeTableForDevice(
@@ -4647,6 +4714,7 @@ namespace llaminar2
                         .record = participant.inference_epoch_record,
                         .participant_id = static_cast<std::uint32_t>(
                             participant.participant_id),
+                        .storage_bytes = participant.inference_epoch_storage_bytes,
                     };
                 }
         }
@@ -4707,6 +4775,7 @@ namespace llaminar2
         Qwen35MoESchemaFactory factory;
         GraphSchema schema = factory.createSchema();
         if (const auto *projection = projectionArena()) projection->replaceWholeExpertSchema(schema);
+        if (const auto *fragments = intermediateShardArena()) fragments->bindSchema(schema);
 
         completeHybridSchema(schema);
 
@@ -4762,6 +4831,7 @@ namespace llaminar2
         // Standard MoE role identities are shared with metadata admission by
         // BufferArena. Only projection-specific banks add resolver mappings.
         if (projection) projection->bindResolver(config);
+        if (const auto *fragments = intermediateShardArena()) fragments->bindResolver(config);
 
         LOG_DEBUG("[Qwen35MoEGraph::getResolverConfig] MoE formulas: "
                   << "moe_top_k=" << top_k
@@ -4795,6 +4865,236 @@ namespace llaminar2
         return buildFFNGraphForLayer(layer, buffers, identity, seq_len, batch_size,
             device, device_state_publication_stream, sequence_lengths_device,
             absolute_position_ids_device, nullptr);
+    }
+
+    ComputeGraph Qwen35MoEGraph::buildIntermediateShardFFNGraphForLayer(
+        const LayerWeights &layer, ActivationBuffers &buffers, const LayerGraphSourceIdentity &identity,
+        int rows, DeviceId device, void *stream, const int32_t *count, const int32_t *positions,
+        const Qwen4ExpPredictorResidualBinding *predictor, MoEOverlayServicePhaseHint phase)
+    {
+        const auto plan = config_.moe.routed_expert_plan;
+        const auto residency = config_.moe.expert_overlay_participant_residency;
+        const auto manager = model_ctx_ ? model_ctx_->concreteWeightManager() : nullptr;
+        auto *tp = dynamic_cast<ILocalTPContext *>(config_.tp_ctx);
+        const int layer_idx = identity.sourceLayer();
+        const auto prefix = identity.prefix();
+        const bool grouped = rows != 1 || phase != MoEOverlayServicePhaseHint::Decode;
+        if (!device.is_gpu() || !stream || rows <= 0 || !plan || !residency || !manager || !tp ||
+            !prepared_weight_store_ || !weight_bindings_.original_frozen_source ||
+            phase == MoEOverlayServicePhaseHint::Auto)
+            throw std::invalid_argument("GPU F-shard model FFN requires original source/store/family/native TP, explicit rows/phase/stream");
+        // Static initial-source lowering is independently diagnosable. Moving
+        // pools and remote service are admitted by their own retained policy.
+        if (config_.moe.rebalance_config.mode != MoERebalanceRuntimeMode::Off ||
+            plan->routed_tiers.size() != 1 || plan->continuation_domain != plan->routed_tiers.front().domain ||
+            plan->shared_expert_domain != plan->continuation_domain)
+            throw std::invalid_argument("GPU F-shard static model FFN requires one original homogeneous routed/shared/continuation domain and rebalance Off");
+        const auto &owners = residency->initialOwnerMap();
+        const MoEExpertOwnerParticipant *participant = nullptr;
+        for (const auto &member : owners.participants())
+            if (member.device == device && member.domain_name == plan->continuation_domain &&
+                member.domain_participant_index == config_.tp_device_idx)
+            {
+                if (participant) throw std::invalid_argument("GPU F-shard model FFN has ambiguous original participant");
+                participant = &member;
+            }
+        if (!participant) throw std::invalid_argument("GPU F-shard model FFN has no original participant for layer " + std::to_string(layer_idx));
+        const auto declaration = adoptMoEOverlayJointGraphDeclaration(*residency, manager->expertGemmRegistry(),
+            prepared_weight_store_->modelId(), participant->participant_id, layer_idx,
+            config_.moe.num_experts, config_.d_model, config_.moe.intermediate_size);
+        auto initial = declaration->acquireInitialConstruction();
+        if (!initial) throw std::logic_error("GPU F-shard model FFN original construction source already retired");
+        const auto &source = initial->layerForModelLayer(layer_idx);
+        const bool mtp = identity.workload() == GraphLayerWorkload::MTPDepth;
+        const MoERuntimeTableIdentity runtime_identity{
+            .role = mtp ? MoERuntimeTableRole::MTPDepth : MoERuntimeTableRole::MainDecodeDurablePlacement,
+            .mtp_depth = mtp ? identity.predictorDepth().value_or(-1) : -1};
+        auto *runtime = dynamic_cast<DeviceMoERuntimeTable *>(moeRuntimeTableForDevice(device, runtime_identity,
+            rows, std::max(config_.n_layers, layer_idx - config_.pp_layer_offset + 1),
+            MoERuntimeHistogramProducerRole::NotProducer, true));
+        if (!runtime) throw std::logic_error("GPU F-shard model FFN has no original mirrored runtime");
+        publishInitialMoEIntermediateShardRuntimeLayer(*runtime, owners, source, layer_idx, stream);
+
+        ComputeGraph graph;
+        std::optional<Qwen4ExpHyperconnectionBuilder::BlockRead> residual_read;
+        std::string norm;
+        if (config_.flash_next)
+        {
+            residual_read.emplace(addBranchBlockRead(graph, prefix, buffers, layer_idx, rows, device,
+                ResidualBlock::FeedForward, predictor));
+            norm = residual_read->terminal();
+        }
+        else
+        {
+            FusedResidualNormStage::Params p;
+            p.device_id = device; p.input = buffers.attn_proj; p.residual = buffers.current_hidden;
+            p.gamma = layer.ffn_norm; p.norm_output = buffers.normalized; p.eps = config_.rms_norm_eps;
+            p.seq_len = rows; p.hidden_dim = config_.d_model;
+            p.input_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            p.residual_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            p.norm_output_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+            norm = prefix + "ffn_norm";
+            graph.addNode(norm, ComputeStageFactory::createFusedResidualNorm(p), device);
+        }
+        const auto owner = std::make_shared<MoERoutedPipelineKernelOwner>();
+        const bool original_m1_hidden_q8=config_.flash_next&&config_.qfn_hidden_q8_reuse_candidate&&!mtp&&!grouped&&
+            phase==MoEOverlayServicePhaseHint::Decode;
+        if(original_m1_hidden_q8) {
+            if(rows!=1||count||config_.qfn_resident_ffn_candidate||deviceMoEWeightFormatIsFloating(
+                    MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(source.fragment_family).weightFormat())||
+               !owner->router_q8_publication->requireOriginalM1Consumer(buffers.normalized,config_.d_model))
+                throw std::invalid_argument("QFN hidden Q8 reuse requires original quantized fully-active ordinary M1 rows");
+        }
+        auto *indices = buffers.get(buffers.idFor(BufferId::MOE_EXPERT_INDICES));
+        auto *weights = buffers.get(buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS));
+        MoERoutingStage::Params route;
+        route.device_id = device; route.input = buffers.normalized; route.gate_weights = layer.moe_gate;
+        route.seq_len = rows; route.d_model = config_.d_model; route.layer_idx = layer_idx;
+        route.num_experts = config_.moe.num_experts; route.top_k = config_.moe.top_k;
+        route.norm_topk_prob = config_.moe.norm_topk_prob;
+        route.output_indices = indices; route.output_weights = weights;
+        route.moe_runtime_table = runtime; route.routed_pipeline_kernel_owner = owner;
+        route.routed_row_execution_policy = RoutedExpertRowExecutionPolicy::IntermediateShardLocal;
+        // Static rebalance-Off graphs publish no histogram. Accepted-row
+        // demand is wired only with the later moving-policy transaction.
+        route.collect_device_runtime_histogram = false;
+        route.active_row_count_device = count; route.absolute_position_ids_device = positions;
+        route.force_decode_equivalent_verifier_prefill = grouped && phase != MoEOverlayServicePhaseHint::Prefill;
+        if(!mtp && phase==MoEOverlayServicePhaseHint::GroupedVerifier)
+            route.verifier_kernel_policy=plan->local_gpu_expert_kernel_policy;
+        route.force_grouped_verifier_prefill_for_decode = grouped && rows == 1;
+        // The local-F pipeline has projection stages instead of an expert-FFN
+        // stage. Its router is the sole verifier-history boundary, including
+        // the explicit publication-free contract of this static placement.
+        route.grouped_verifier_histogram_role = selectMoEGroupedVerifierHistogramRole(
+            route.force_decode_equivalent_verifier_prefill, /*collects_history=*/false);
+        route.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+        route.output_indices_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_INDICES);
+        route.output_weights_buffer_id = buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS);
+        const auto router = prefix + "moe_routing";
+        graph.addNode(router, ComputeStageFactory::createMoERouting(route), device);
+        graph.addDependency(router, norm);
+        MoEIntermediateShardPipelineParams local;
+        local.family = declaration->family(); local.runtime = runtime; local.kernel_owner = owner;
+        local.rows = rows; local.top_k = config_.moe.top_k; local.phase = phase;
+        local.row_mode = grouped ? MoEIntermediateShardRowMode::Grouped : MoEIntermediateShardRowMode::Decode;
+        local.verifier_kernel_policy=route.verifier_kernel_policy;
+        // These independent diagnostic policies select only the original ROCm
+        // ordinary-main native M1 transaction. Grouped verification, predictor,
+        // shared/floating programs retain their declared Staged implementations.
+        const bool original_main_m1=config_.flash_next&&!mtp&&!grouped&&
+            phase==MoEOverlayServicePhaseHint::Decode;
+        if(original_main_m1&&(config_.qfn_gate_up_completion_candidate||config_.qfn_down_completion_candidate))
+        {
+            if(!device.is_rocm()||rows!=1||config_.qfn_resident_ffn_candidate||deviceMoEWeightFormatIsFloating(
+                MoEIntermediateShardDescriptorDeclaration::fromOriginalFamily(source.fragment_family).weightFormat()))
+                throw std::invalid_argument("QFN completion requires the original native ROCm ordinary-main M1 program");
+            if(config_.qfn_gate_up_completion_candidate)local.gate_up_publication=MoEGateUpPublicationPolicy::LastProducer;
+            if(config_.qfn_down_completion_candidate)local.down_publication=MoEDownPublicationPolicy::LastProducerRouteFold;
+        }
+        if (count) local.live_rows = DeviceRowRange::deviceCounted(rows, count);
+        local.prefix = prefix + "local_routed/"; local.router_node = router;
+        local.hidden = {buffers.normalized, buffers.idFor(BufferId::NORMALIZED)};
+        local.routing_indices = {indices, buffers.idFor(BufferId::MOE_EXPERT_INDICES)};
+        local.routing_weights = {weights, buffers.idFor(BufferId::MOE_EXPERT_WEIGHTS)};
+        local.route_partials = {buffers.get(buffers.idFor(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS)),
+            buffers.idFor(BufferId::MOE_CANONICAL_ROUTE_CONTRIBUTIONS)};
+        local.output = {buffers.get(buffers.idFor(BufferId::MOE_COMBINED_OUTPUT)), buffers.idFor(BufferId::MOE_COMBINED_OUTPUT)};
+        const auto routed = appendMoEIntermediateShardPipeline(graph, local, source);
+        // Descriptor export has finished. No executable graph retains this
+        // initial reader: the invocation acquires the device epoch itself.
+        initial = {};
+
+        // The selected fragment policy owns local shared F in both serial
+        // and grouped graphs. The general dense accessor may merge a full-F
+        // replicated decode/sidecar view, so bind this branch from its actual
+        // original per-device frozen source, independently of that dense view.
+        const auto &original_shared = *weight_bindings_.original_frozen_source;
+        const auto *shared_gate = original_shared.optionalLayerForDevice(layer_idx, "ffn_gate_shexp.weight", device);
+        const auto *shared_up = original_shared.optionalLayerForDevice(layer_idx, "ffn_up_shexp.weight", device);
+        const auto *shared_down = original_shared.optionalLayerForDevice(layer_idx, "ffn_down_shexp.weight", device);
+        SharedExpertFFNStage::Params shared;
+        shared.device_id = device; shared.input = buffers.normalized;
+        shared.gate_w = legacyTensor(shared_gate);
+        shared.up_w = legacyTensor(shared_up);
+        shared.down_w = legacyTensor(shared_down);
+        if (!shared.gate_w || !shared.up_w || !shared.down_w)
+            throw std::invalid_argument("GPU F-shard model FFN is missing original local shared triplet at layer " + std::to_string(layer_idx));
+        shared.output = buffers.get(buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT));
+        shared.gate_scratch = buffers.get(buffers.idFor(BufferId::MOE_GATE_SCRATCH));
+        shared.up_scratch = buffers.get(buffers.idFor(BufferId::MOE_UP_SCRATCH));
+        shared.seq_len = rows; shared.d_model = config_.d_model; shared.intermediate = static_cast<int>(shared.gate_w->rows());
+        shared.active_row_count_device = count;
+        shared.output_role = SharedExpertOutputRole::ParticipantLocalPartial; shared.phase = phase;
+        shared.force_grouped_verifier_prefill_for_decode = grouped && phase != MoEOverlayServicePhaseHint::Prefill;
+        if (shared.force_grouped_verifier_prefill_for_decode) shared.required_router_q8_publication = owner->router_q8_publication;
+        shared.prepared_store = prepared_weight_store_;
+        shared.prepared_ref_gate = preparedRefForGraphWeight(shared_gate, device);
+        shared.prepared_ref_up = preparedRefForGraphWeight(shared_up, device);
+        shared.prepared_ref_down = preparedRefForGraphWeight(shared_down, device);
+        shared.input_buffer_id = buffers.idFor(BufferId::NORMALIZED);
+        shared.output_buffer_id = buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
+        shared.gate_scratch_buffer_id = buffers.idFor(BufferId::MOE_GATE_SCRATCH);
+        shared.up_scratch_buffer_id = buffers.idFor(BufferId::MOE_UP_SCRATCH);
+        if(original_m1_hidden_q8) {
+            if(shared.input!=local.hidden.tensor||shared.input==local.route_partials.tensor||shared.input==local.output.tensor||
+               shared.input==shared.output||shared.input==shared.gate_scratch||shared.input==shared.up_scratch)
+                throw std::invalid_argument("QFN original M1 hidden publication requires one immutable shared source and distinct writable roles");
+            shared.required_router_q8_publication=owner->router_q8_publication;
+        }
+        if (shared.force_grouped_verifier_prefill_for_decode||original_m1_hidden_q8)
+        {
+            DeviceMoEExpertDescriptor descriptor;
+            if (!shared.prepared_ref_gate || !shared.prepared_ref_up || !shared.prepared_ref_down ||
+                !exportDeviceMoEExpertWeightDescriptors(prepared_weight_store_->gemmKernel(*shared.prepared_ref_gate),
+                    prepared_weight_store_->gemmKernel(*shared.prepared_ref_up), prepared_weight_store_->gemmKernel(*shared.prepared_ref_down),
+                    config_.d_model, shared.intermediate, descriptor))
+                throw std::invalid_argument("GPU F-shard model FFN has no supported original shared prepared descriptor");
+            if(original_m1_hidden_q8&&deviceMoEWeightFormatIsFloating(descriptor.weight_format))
+                throw std::invalid_argument("QFN hidden Q8 reuse has no floating shared projection quantizer to remove");
+            if (!deviceMoEWeightFormatIsFloating(descriptor.weight_format) &&
+                !shared.required_router_q8_publication->requireConsumerRows(rows, config_.d_model))
+                throw std::invalid_argument("GPU F-shard model FFN original shared/router Q8 publication geometry disagrees");
+        }
+        const auto shared_node = prefix + "shared_expert_ffn";
+        graph.addNode(shared_node, ComputeStageFactory::createSharedExpertFFN(shared), device);
+        graph.addDependency(shared_node, norm);
+        // Routed and shared stages borrow the admitted gate/up scratch in
+        // sequence; finalization adds the router-publication dependency.
+        graph.addDependency(shared_node, routed.producer);
+        MoEIntermediateShardFFNFinalization finish;
+        if(config_.flash_next && !mtp && !grouped && phase==MoEOverlayServicePhaseHint::Decode &&
+            (config_.qfn_resident_ffn_candidate || qfnRetainedM1HCFFNEnabled(
+                config_.moe.routed_expert_plan && config_.moe.routed_expert_plan->usesQFNMI50TP4())))
+            finish.execution=MoEIntermediateShardFFNExecution::ResidentCandidate;
+        finish.shared_ffn_node = shared_node; finish.shared_weights = weight_bindings_.original_frozen_source;
+        finish.shared_partition = config_.tp_config.get();
+        finish.local_combined = {buffers.attn_proj, buffers.idFor(BufferId::ATTN_PROJ)};
+        finish.prefix = prefix + "local_ffn/";
+        finish.final_sum.device_id = device; finish.final_sum.tp_ctx = tp; finish.final_sum.tensor = buffers.attn_proj;
+        finish.final_sum.count = std::size_t(rows) * config_.d_model;
+        finish.final_sum.precision = "fp32";
+        finish.final_sum.arithmetic_policy = TPAllreduceArithmeticPolicy::CanonicalRankOrder;
+        finish.final_sum.tensor_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+        finish.final_sum.sideband_device_index = config_.tp_device_idx;
+        if (local.live_rows) finish.final_sum.live_rows = NativeCollectiveRows(*local.live_rows, config_.d_model);
+        auto terminal = finalizeMoEIntermediateShardFFN(graph, routed, std::move(finish)).producer;
+        if (residual_read)
+            terminal = addBranchBlockWrite(graph, std::move(*residual_read), buffers, terminal,
+                predictor ? &predictor->ffnOutput() : nullptr);
+        else if (layer_idx >= config_.pp_layer_offset + config_.n_layers - 1)
+        {
+            ResidualAddStage::Params p;
+            p.device_id = device; p.input = buffers.attn_proj; p.residual = buffers.current_hidden; p.output = buffers.current_hidden;
+            p.num_elements = std::size_t(rows) * config_.d_model;
+            p.input_buffer_id = buffers.idFor(BufferId::ATTN_PROJ);
+            p.residual_buffer_id = p.output_buffer_id = buffers.idFor(BufferId::HIDDEN_STATE);
+            const auto residual = prefix + "ffn_residual";
+            graph.addNode(residual, ComputeStageFactory::createResidualAdd(p), device);
+            graph.addDependency(residual, terminal); terminal = residual;
+        }
+        graph.setTerminalNode(terminal);
+        return graph;
     }
 
     ComputeGraph Qwen35MoEGraph::buildFFNGraphForLayer(
@@ -4843,6 +5143,14 @@ namespace llaminar2
         const std::string prefix = identity.prefix();
         std::string ffn_terminal;
         int total_tokens = batch_size * seq_len;
+        const bool main_condition =
+            !mtp_sidecar_context && config_.live_mtp_request_batch_condition;
+        // Resident MTP condition publishes the absolute target-cache length
+        // for attention and the pipeline handoff. A scalar condition already
+        // owns exactly one FFN activation. Verifier and predictor counts still
+        // govern their captured padding, including empty replays.
+        const int32_t *const routed_live_rows = main_condition && total_tokens == 1
+            ? nullptr : sequence_lengths_device;
         /*
          * Every lowering of this routed layer—direct continuation compute,
          * retained remote GPU replay, and serial CPU service—shares one
@@ -4930,6 +5238,26 @@ namespace llaminar2
                 "Qwen35 MoE expert overlay was requested but no usable placement exists for layer " +
                 std::to_string(layer_idx) +
                 "; refusing to lower the request through the non-overlay routed path");
+        }
+
+        if (intermediateShardArena())
+        {
+            if (!use_expert_overlay || batch_size != 1)
+                throw std::invalid_argument("GPU F-shard model lowering requires its original overlay and one device-owned row prefix; request-major rows are not wired");
+            auto phase = routed_service_phase;
+            if (!mtp_sidecar_context && !config_.grouped_mtp_verifier && !config_.live_mtp_request_batch_condition)
+            {
+                if (!forward_execution_phase_)
+                    throw std::invalid_argument("GPU F-shard model lowering requires an explicit forward arithmetic phase");
+                phase = *forward_execution_phase_ == ForwardExecutionPhase::Prefill
+                    ? MoEOverlayServicePhaseHint::Prefill : MoEOverlayServicePhaseHint::Decode;
+            }
+            if (main_condition &&
+                (total_tokens != 1 || forward_execution_phase_ != ForwardExecutionPhase::Decode ||
+                 config_.grouped_mtp_verifier))
+                throw std::invalid_argument("GPU F-shard MTP condition requires one fixed main decode row");
+            return buildIntermediateShardFFNGraphForLayer(layer, buffers, identity, total_tokens, device,
+                device_state_publication_stream, routed_live_rows, absolute_position_ids_device, predictor, phase);
         }
 
         /*
@@ -7405,7 +7733,7 @@ namespace llaminar2
                     collect_runtime_histogram);
             route_params.active_row_count_device =
                 device.is_gpu() && batch_size == 1
-                    ? sequence_lengths_device
+                    ? routed_live_rows
                     : nullptr;
             route_params.output_indices = routing_indices;
             route_params.output_weights = routing_weights;
@@ -7769,7 +8097,7 @@ namespace llaminar2
                         : nullptr;
                 expert_params.active_row_count_device =
                     stage_device.is_gpu() && batch_size == 1
-                        ? sequence_lengths_device
+                        ? routed_live_rows
                         : nullptr;
                 expert_params.my_socket_id =
                     std::max(0, config_.tp_device_idx);
@@ -9707,7 +10035,7 @@ namespace llaminar2
                          */
                         ticket_params.active_row_count_device =
                             batch_size == 1 && total_tokens > 1
-                                ? sequence_lengths_device
+                                ? routed_live_rows
                                 : nullptr;
                         ticket_params.layer_idx = layer_idx;
                         ticket_params.bucket_rows = total_tokens;
@@ -10352,7 +10680,7 @@ namespace llaminar2
                     }
 
                     const bool joint_host=config_.moe.expert_overlay_participant_residency &&
-                        config_.moe.expert_overlay_participant_residency->isCPUJointParticipant(target_participant);
+                        config_.moe.expert_overlay_participant_residency->isJointParticipant(target_participant);
                     std::unique_ptr<MoECPUExpertShardRouteStage> joint_collective;
                     auto participant_mask =
                         owner_map_lifetime->expertMaskForParticipant(
@@ -11425,7 +11753,7 @@ namespace llaminar2
                         std::string local_collective_name;
                         const bool joint_local_target = target_device.is_cpu() &&
                             config_.moe.expert_overlay_participant_residency &&
-                            config_.moe.expert_overlay_participant_residency->isCPUJointParticipant(target_participant);
+                            config_.moe.expert_overlay_participant_residency->isJointParticipant(target_participant);
                         std::unique_ptr<MoECPUExpertShardRouteStage> host_joint_collective;
                         if (owns_target_participant)
                         {
@@ -11613,7 +11941,7 @@ namespace llaminar2
                                     auto residency = config_.moe.expert_overlay_participant_residency;
                                     if (!prepared_weight_store_ || !config_.moe.expert_overlay_cpu_joint_context)
                                         throw std::runtime_error("Qwen35 colocated CPU fragment has no original prepared source/context");
-                                    auto frame = adoptMoEOverlayCPUJointGraphDeclaration(*residency,registry,
+                                    auto frame = adoptMoEOverlayJointGraphDeclaration(*residency,registry,
                                         prepared_weight_store_->modelId(),target_participant,layer_idx,
                                         config_.moe.num_experts,config_.d_model,expert_intermediate);
                                     const auto arena = local_params.serial_compact_buffer_arena;
@@ -12250,7 +12578,7 @@ namespace llaminar2
                          * capacity contract after a non-empty prefill. */
                         packet_params.active_row_count_device =
                             batch_size == 1 && total_tokens > 1
-                                ? sequence_lengths_device
+                                ? routed_live_rows
                                 : nullptr;
                         packet_params.hidden_buffer_id =
                             buffers.idFor(BufferId::NORMALIZED);
@@ -12308,7 +12636,7 @@ namespace llaminar2
                              * sequence-length scalar. */
                             packet_params.active_row_count_device =
                                 batch_size == 1 && total_tokens > 1
-                                    ? sequence_lengths_device
+                                    ? routed_live_rows
                                     : nullptr;
                             packet_params.hidden_buffer_id =
                                 buffers.idFor(BufferId::NORMALIZED);
@@ -13921,7 +14249,7 @@ namespace llaminar2
             // Capture capacity is not permission to evaluate padded rows.
             shared_params.active_row_count_device =
                 shared_device.is_gpu() && batch_size == 1
-                    ? sequence_lengths_device
+                    ? routed_live_rows
                     : nullptr;
             shared_params.d_model = config_.d_model;
             shared_params.intermediate = shared_intermediate;
@@ -14130,7 +14458,7 @@ namespace llaminar2
                     canonical_publication_lowering.participant_count;
                 publish_params.active_row_count_device =
                     device.is_gpu() && batch_size == 1
-                        ? sequence_lengths_device
+                        ? routed_live_rows
                         : nullptr;
                 publish_params.shared_output_buffer_id =
                     buffers.idFor(BufferId::MOE_SHARED_EXPERT_OUTPUT);
@@ -14176,7 +14504,7 @@ namespace llaminar2
                     canonical_publication_lowering.participant_count;
                 finalize_params.active_row_count_device =
                     device.is_gpu() && batch_size == 1
-                        ? sequence_lengths_device
+                        ? routed_live_rows
                         : nullptr;
                 finalize_params.input_buffer_id =
                     buffers.idFor(BufferId::NORMALIZED);
@@ -14363,7 +14691,7 @@ namespace llaminar2
                             .reduction = native_sum->params(),
                             .producer = prefix + "shared_expert_ffn",
                             .gate = layer.shared_expert_gate_inp,
-                            .active_rows = batch_size == 1 ? sequence_lengths_device : nullptr,
+                            .active_rows = batch_size == 1 ? routed_live_rows : nullptr,
                             .combined_output = {buffers.attn_proj, buffers.idFor(BufferId::ATTN_PROJ)}});
                         shared_ffn_last = ffn_terminal;
                         moe_combined_output_ready = true;
@@ -14475,7 +14803,7 @@ namespace llaminar2
                 gate_params.d_model = config_.d_model;
                 gate_params.active_row_count_device =
                     shared_device.is_gpu() && batch_size == 1
-                        ? sequence_lengths_device
+                        ? routed_live_rows
                         : nullptr;
                 if (rooted_overlay_finalize)
                 {

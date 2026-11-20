@@ -27,7 +27,7 @@
 #include "loaders/ModelContext.h"
 #include "loaders/PreparedWeightStore.h"
 #include "loaders/ExpertGemmRegistry.h"
-#include "execution/moe/CPUExpertShardSourceSelection.h"
+#include "execution/moe/ExpertShardSourceSelection.h"
 #include "loaders/ResolvedImmutableRowTablePlacement.h"
 #include "planning/ModelMemoryProfile.h"
 #include "execution/moe/MoEOverlayCapacityResolver.h"
@@ -194,9 +194,9 @@ json authenticateQFN(const accuracy::QFNObserverRequest &request, IOrchestration
             fail(participant.world_rank_known && participant.address.device_ordinal==0 && participant.address.numa_node>=0 &&
                 accuracy::qfnAddressOwnedByRank(runner.executionPlan(),participant.address),"QFN follower original fragment endpoint differs");
             for(const auto& layer:prepared.placements) {
-                const auto lease=weights->expertGemmRegistry().acquireCPUJointLayer(store->modelId(),participant,layer.layer);
-                fail(lease && lease->cpu_joint_source,"QFN follower original prepared fragment lease missing");
-                const auto& source=*lease->cpu_joint_source;
+                const auto lease=weights->expertGemmRegistry().acquireJointLayer(store->modelId(),participant,layer.layer);
+                fail(lease && lease->joint_source,"QFN follower original prepared fragment lease missing");
+                const auto& source=*lease->joint_source;
                 fail(source.participant()==participant && source.layer()==layer.layer && source.cohort() &&
                     source.ownership().geometry().experts==profile.expert_count,"QFN follower prepared source/cohort differs");
                 std::vector<int> expected;

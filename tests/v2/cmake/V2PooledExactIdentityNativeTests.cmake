@@ -15,34 +15,46 @@ foreach(_identity_backend CUDA ROCm)
         # Actual original phases reject malformed native inputs before any ordered mutation.
         # Each case reuses its captures 20 times across two generations, then the
         # unchanged full graph proves real partial/empty success and original close.
-        foreach(_identity_role Pin Free Victim)
-            foreach(_identity_live 65 257)
-                foreach(_identity_width 32 64)
-                    set(_identity_reject "V2_Integration_${_identity_backend}_PooledImmutable_CooperativeRejection_${_identity_role}_${_identity_live}_Row${_identity_width}")
-                    add_v2_test(${_identity_reject}
-                        COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
-                            --gtest_filter=PooledImmutableProviderSourceDevice.CooperativeRejection${_identity_backend}${_identity_role}${_identity_live}Row${_identity_width}
-                        LABELS "V2;Integration;ProductionTestPreflight;${_identity_backend};Ngram;Ownership;TraceReplay;Capture;ByteExact;Regression"
-                        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "${_identity_lock}"
-                        ENVIRONMENT "${_identity_startup}")
-                    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_identity_reject})
-                endforeach()
-            endforeach()
+        # Pairwise rows retain every role/count, role/width and count/width
+        # interaction. Identity dispatch neighbors are covered independently below;
+        # row width does not change the integer identity rejection predicate.
+        foreach(_identity_case Pin_65_32 Pin_257_64 Free_65_64 Free_257_32 Victim_65_32 Victim_257_64)
+            string(REPLACE "_" ";" _identity_axes "${_identity_case}")
+            list(GET _identity_axes 0 _identity_role)
+            list(GET _identity_axes 1 _identity_live)
+            list(GET _identity_axes 2 _identity_width)
+            set(_identity_reject "V2_Integration_${_identity_backend}_PooledImmutable_CooperativeRejection_${_identity_role}_${_identity_live}_Row${_identity_width}")
+            set(_identity_suite CooperativeAllocationRejection)
+            if(_identity_role STREQUAL "Pin")
+                set(_identity_suite CooperativePinRejection)
+            endif()
+            # Each fault keeps its opaque graph reservation until process exit.
+            add_v2_test(${_identity_reject}
+                COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py
+                    $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_filter=OriginalFaults/${_identity_suite}.${_identity_backend}${_identity_role}${_identity_live}Row${_identity_width}/*
+                LABELS "V2;Integration;ProductionTestPreflight;${_identity_backend};Ngram;Ownership;TraceReplay;Capture;ByteExact;Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "${_identity_lock}"
+                ENVIRONMENT "${_identity_startup}")
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_identity_reject})
         endforeach()
-        foreach(_record_fault PinSlotBounds PinOrdinal PinCommitFlags)
-            foreach(_record_position Early Late)
-                foreach(_record_width 32 64)
-                    set(_record_test "V2_Integration_${_identity_backend}_PooledImmutable_Record_${_record_fault}_${_record_position}_Row${_record_width}")
-                    add_v2_test(${_record_test}
-                        COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
-                            --gtest_filter=PooledImmutableProviderSourceDevice.CooperativeFields${_identity_backend}${_record_fault}${_record_position}Row${_record_width}
-                        LABELS "V2;Integration;ProductionTestPreflight;${_identity_backend};Ngram;Ownership;TraceReplay;Capture;ByteExact;Regression"
-                        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "${_identity_lock}"
-                        ENVIRONMENT "${_identity_startup}")
-                    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_record_test})
-                endforeach()
-            endforeach()
+        # Pairwise field/position/width coverage preserves early and late failure
+        # publication for every field and both native row widths across the matrix.
+        foreach(_record_case PinSlotBounds_Early_32 PinSlotBounds_Late_64 PinOrdinal_Early_64 PinOrdinal_Late_32 PinCommitFlags_Early_32 PinCommitFlags_Late_64)
+            string(REPLACE "_" ";" _record_axes "${_record_case}")
+            list(GET _record_axes 0 _record_fault)
+            list(GET _record_axes 1 _record_position)
+            list(GET _record_axes 2 _record_width)
+            set(_record_test "V2_Integration_${_identity_backend}_PooledImmutable_Record_${_record_fault}_${_record_position}_Row${_record_width}")
+            add_v2_test(${_record_test}
+                COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                    --gtest_filter=PooledImmutableProviderSourceDevice.CooperativeFields${_identity_backend}${_record_fault}${_record_position}Row${_record_width}
+                LABELS "V2;Integration;ProductionTestPreflight;${_identity_backend};Ngram;Ownership;TraceReplay;Capture;ByteExact;Regression"
+                MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30 RESOURCE_LOCK "${_identity_lock}"
+                ENVIRONMENT "${_identity_startup}")
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_record_test})
         endforeach()
+        # Both state paths retain every below/at/above dispatch boundary.
         foreach(_identity_trace Pin RetainedPinsAndAllocation)
             foreach(_identity_count 63 64 65 127 128 129 255 256 257 513)
                 set(_identity_test "V2_Integration_${_identity_backend}_PooledImmutable_ExactIdentity_${_identity_trace}_${_identity_count}_Replay")

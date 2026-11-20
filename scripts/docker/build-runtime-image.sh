@@ -29,32 +29,19 @@ Options:
       --build-type TYPE    LLAMINAR_BUILD_TYPE build arg. Default: Release.
       --variant VARIANT    Backend/runtime variant: full, cpu, cuda, rocm.
                            Default: full.
-      --cpu-isa ISA        LLAMINAR_CPU_ISA build arg: AVX512 or AVX2.
+      --cpu-isa ISA        LLAMINAR_CPU_ISA build arg: AVX512, AVX2 or NEON.
+                           NEON selects linux/arm64 with the cpu or cuda variant.
+                           On ARM64 the CUDA default is 121 (NVIDIA GB10).
                            Dockerfile default if unset.
       --cpu-only           Alias for --variant cpu.
       --cuda-only          Alias for --variant cuda.
       --rocm-only          Alias for --variant rocm.
-      --cuda-archs LIST    LLAMINAR_CUDA_ARCHS build arg. Dockerfile default if unset.
-      --rccl-from-source   Build/source-package RCCL for ROCm multi-GPU.
-                           Default.
-      --no-rccl-from-source
-                           Use packaged RCCL from the ROCm apt repository.
-      --rccl-gpu-targets LIST
-                           RCCL GPU_TARGETS for source builds. Default:
-                           canonical shipping targets in rocm-release.env.
+      --cuda-archs LIST    Concrete CUDA targets for the app and NCCL
+                           (semicolon-separated). Dockerfile default if unset.
       --rocm-runtime-gpu-targets LIST
-                           Prune ROCm runtime kernel payloads to these gfx
-                           targets (comma/semicolon/space-separated). Default:
-                           same value as --rccl-gpu-targets when provided.
-      --rccl-msccl-kernel  Build RCCL's optional generated MSCCL kernels.
-      --no-rccl-msccl-kernel
-                           Disable RCCL's optional generated MSCCL kernels.
-                           Default.
-      --rccl-only-funcs PATTERN
-                           RCCL ONLY_FUNCS generator pattern for source builds.
-                           Default: Llaminar inference collectives/datatypes.
-      --full-rccl-funcs    Do not pass ONLY_FUNCS; build RCCL's full generated
-                           function matrix.
+                           Concrete ROCm GPU targets for the app and native
+                           libraries (comma/semicolon/space-separated).
+                           Default: shipping targets in rocm-release.env.
       --skip-integration-build
                            Skip Dockerfile integration build before packaging.
                            Default for this script.
@@ -62,6 +49,7 @@ Options:
                            Build integration binaries too, matching the full
                            CI builder image behavior.
       --build-arg ARG      Extra Docker build arg, KEY=VALUE. Repeatable.
+      --build-context ARG  Named BuildKit context, NAME=VALUE. Repeatable.
       --label LABEL        Extra image label, KEY=VALUE. Repeatable.
       --platform PLATFORM  Optional docker buildx platform.
       --build-network MODE Optional network mode for Dockerfile RUN steps.
@@ -79,9 +67,7 @@ Environment:
   LLAMINAR_IMAGE_LABELS    Newline-separated image labels.
   VERSION, VCS_REF, BUILD_DATE, LLAMINAR_BUILD_TYPE, LLAMINAR_IMAGE_VARIANT,
   LLAMINAR_CPU_ISA, LLAMINAR_ENABLE_CUDA, LLAMINAR_ENABLE_ROCM, LLAMINAR_CUDA_ARCHS,
-  LLAMINAR_SKIP_INTEGRATION, LLAMINAR_BUILD_RCCL_FROM_SOURCE,
-  RCCL_GPU_TARGETS, ROCM_RUNTIME_GPU_TARGETS, RCCL_ENABLE_MSCCL_KERNEL,
-  RCCL_ONLY_FUNCS, LLAMINAR_DOCKER_BUILD_NETWORK,
+  LLAMINAR_SKIP_INTEGRATION, ROCM_RUNTIME_GPU_TARGETS, LLAMINAR_DOCKER_BUILD_NETWORK,
   LLAMINAR_DOCKER_CACHE_FROM, LLAMINAR_DOCKER_CACHE_TO
                            Defaults for the matching options/build args.
                            Cache env vars are newline-separated BuildKit specs.
@@ -126,15 +112,12 @@ append_split_labels() {
 script_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd -- "${script_dir}/../.." && pwd)"
 
-# Shared with direct Docker builds. MIN/MAX must not disappear from packaged
-# runtimes merely because ordinary model allreduces most often use SUM.
-default_rccl_only_funcs="$(<"${repo_root}/scripts/docker/rccl-functions.txt")"
-
 tags=()
 labels=()
 cache_from=()
 cache_to=()
 extra_build_args=()
+build_contexts=()
 output_mode="${LLAMINAR_IMAGE_OUTPUT:-load}"
 verify_mode="auto"
 dry_run=false
@@ -151,11 +134,7 @@ enable_cuda="${LLAMINAR_ENABLE_CUDA:-}"
 enable_rocm="${LLAMINAR_ENABLE_ROCM:-}"
 cuda_archs="${LLAMINAR_CUDA_ARCHS:-}"
 skip_integration="${LLAMINAR_SKIP_INTEGRATION:-1}"
-build_rccl_from_source="${LLAMINAR_BUILD_RCCL_FROM_SOURCE:-ON}"
-rccl_gpu_targets="${RCCL_GPU_TARGETS:-}"
 rocm_runtime_gpu_targets="${ROCM_RUNTIME_GPU_TARGETS:-}"
-rccl_enable_msccl_kernel="${RCCL_ENABLE_MSCCL_KERNEL:-OFF}"
-rccl_only_funcs="${RCCL_ONLY_FUNCS:-${default_rccl_only_funcs}}"
 
 if [[ -n "${LLAMINAR_IMAGE_TAGS:-}" ]]; then
     append_split_tags "${LLAMINAR_IMAGE_TAGS}"
@@ -246,40 +225,10 @@ while (($#)); do
             cuda_archs="$2"
             shift 2
             ;;
-        --rccl-from-source)
-            build_rccl_from_source="ON"
-            shift
-            ;;
-        --no-rccl-from-source)
-            build_rccl_from_source="OFF"
-            shift
-            ;;
-        --rccl-gpu-targets)
-            [[ $# -ge 2 ]] || die "$1 requires a value"
-            rccl_gpu_targets="$2"
-            shift 2
-            ;;
         --rocm-runtime-gpu-targets)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             rocm_runtime_gpu_targets="$2"
             shift 2
-            ;;
-        --rccl-msccl-kernel)
-            rccl_enable_msccl_kernel="ON"
-            shift
-            ;;
-        --no-rccl-msccl-kernel)
-            rccl_enable_msccl_kernel="OFF"
-            shift
-            ;;
-        --rccl-only-funcs)
-            [[ $# -ge 2 ]] || die "$1 requires a value"
-            rccl_only_funcs="$2"
-            shift 2
-            ;;
-        --full-rccl-funcs)
-            rccl_only_funcs=""
-            shift
             ;;
         --skip-integration-build)
             skip_integration="1"
@@ -292,6 +241,11 @@ while (($#)); do
         --build-arg)
             [[ $# -ge 2 ]] || die "$1 requires a value"
             extra_build_args+=("$2")
+            shift 2
+            ;;
+        --build-context)
+            [[ $# -ge 2 && "$2" == ?*=* ]] || die "$1 requires NAME=VALUE"
+            build_contexts+=("$2")
             shift 2
             ;;
         --label)
@@ -346,14 +300,6 @@ case "${skip_integration}" in
     0|1) ;;
     *) die "LLAMINAR_SKIP_INTEGRATION must be 0 or 1" ;;
 esac
-case "${build_rccl_from_source}" in
-    ON|OFF|on|off|1|0|TRUE|FALSE|true|false) ;;
-    *) die "LLAMINAR_BUILD_RCCL_FROM_SOURCE must be ON or OFF" ;;
-esac
-case "${rccl_enable_msccl_kernel}" in
-    ON|OFF|on|off|1|0|TRUE|FALSE|true|false) ;;
-    *) die "RCCL_ENABLE_MSCCL_KERNEL must be ON or OFF" ;;
-esac
 case "${image_variant}" in
     full|cpu|cuda|rocm) ;;
     *) die "unsupported --variant '${image_variant}' (expected full, cpu, cuda, or rocm)" ;;
@@ -361,8 +307,8 @@ esac
 if [[ -n "${cpu_isa}" ]]; then
     cpu_isa="${cpu_isa^^}"
     case "${cpu_isa}" in
-        AVX512|AVX2) ;;
-        *) die "unsupported --cpu-isa '${cpu_isa}' (expected AVX512 or AVX2)" ;;
+        AVX512|AVX2|NEON) ;;
+        *) die "unsupported --cpu-isa '${cpu_isa}' (expected AVX512, AVX2, or NEON)" ;;
     esac
 fi
 
@@ -394,11 +340,24 @@ case "${image_variant}" in
 esac
 enable_cuda="$(normalize_bool_arg "${enable_cuda}")" || die "LLAMINAR_ENABLE_CUDA must be ON or OFF"
 enable_rocm="$(normalize_bool_arg "${enable_rocm}")" || die "LLAMINAR_ENABLE_ROCM must be ON or OFF"
+if [[ "${cpu_isa}" == "NEON" || "${platform}" == "linux/arm64" ]]; then
+    : "${platform:=linux/arm64}"
+    : "${cpu_isa:=NEON}"
+    [[ "${platform}" == "linux/arm64" && "${cpu_isa}" == "NEON" ]] ||
+        die "the NEON runtime requires --platform linux/arm64"
+    [[ "${image_variant}" == "cpu" || "${image_variant}" == "cuda" ]] ||
+        die "the ARM64 runtime requires --variant cpu or --variant cuda"
+    [[ "${enable_rocm}" == "OFF" ]] || die "the pinned ROCm SDK does not support Linux ARM64"
+    [[ "${skip_integration}" == "1" ]] || die "build the test-runner target with the arm64-pr inventory for ARM Unit and host tests"
+    if [[ "${enable_cuda}" == "ON" ]]; then
+        : "${cuda_archs:=121}"
+    fi
+fi
 if [[ "${enable_rocm}" == "OFF" ]]; then
-    build_rccl_from_source="OFF"
-    rccl_only_funcs=""
-    rccl_gpu_targets=""
     rocm_runtime_gpu_targets=""
+elif [[ -n "${rocm_runtime_gpu_targets}" ]]; then
+    rocm_runtime_gpu_targets="$(bash "${script_dir}/rocm-image-targets.sh" "${rocm_runtime_gpu_targets}")" ||
+        die "Invalid --rocm-runtime-gpu-targets"
 fi
 
 used_default_tag=false
@@ -446,8 +405,6 @@ cmd=(
     --build-arg "LLAMINAR_ENABLE_CUDA=${enable_cuda}"
     --build-arg "LLAMINAR_ENABLE_ROCM=${enable_rocm}"
     --build-arg "LLAMINAR_SKIP_INTEGRATION=${skip_integration}"
-    --build-arg "LLAMINAR_BUILD_RCCL_FROM_SOURCE=${build_rccl_from_source}"
-    --build-arg "RCCL_ENABLE_MSCCL_KERNEL=${rccl_enable_msccl_kernel}"
 )
 
 if [[ -n "${cpu_isa}" ]]; then
@@ -456,18 +413,9 @@ fi
 if [[ -n "${cuda_archs}" ]]; then
     cmd+=(--build-arg "LLAMINAR_CUDA_ARCHS=${cuda_archs}")
 fi
-if [[ -n "${rccl_gpu_targets}" ]]; then
-    cmd+=(--build-arg "RCCL_GPU_TARGETS=${rccl_gpu_targets}")
-fi
-if [[ -z "${rocm_runtime_gpu_targets}" && -n "${rccl_gpu_targets}" ]]; then
-    rocm_runtime_gpu_targets="${rccl_gpu_targets}"
-fi
 if [[ -n "${rocm_runtime_gpu_targets}" ]]; then
     cmd+=(--build-arg "ROCM_RUNTIME_GPU_TARGETS=${rocm_runtime_gpu_targets}")
 fi
-# Passing an explicit empty value preserves --full-rccl-funcs now that the
-# Dockerfile's default also selects the canonical inference support set.
-cmd+=(--build-arg "RCCL_ONLY_FUNCS=${rccl_only_funcs}")
 if [[ -n "${platform}" ]]; then
     cmd+=(--platform "${platform}")
 fi
@@ -483,6 +431,9 @@ done
 for label in "${labels[@]}"; do
     cmd+=(--label "${label}")
 done
+for context in "${build_contexts[@]}"; do
+    cmd+=(--build-context "${context}")
+done
 for cache_spec in "${cache_from[@]}"; do
     cmd+=(--cache-from "${cache_spec}")
 done
@@ -490,6 +441,11 @@ for cache_spec in "${cache_to[@]}"; do
     cmd+=(--cache-to "${cache_spec}")
 done
 for build_arg in "${extra_build_args[@]}"; do
+    case "${build_arg%%=*}" in
+        LLAMINAR_BUILD_RCCL_FROM_SOURCE|RCCL_GIT_REF|RCCL_GIT_COMMIT|RCCL_ONLY_FUNCS|RCCL_ENABLE_MSCCL_KERNEL|RCCL_GPU_TARGETS)
+            die "Unsupported collective dependency override '${build_arg%%=*}'"
+            ;;
+    esac
     cmd+=(--build-arg "${build_arg}")
 done
 case "${output_mode}" in

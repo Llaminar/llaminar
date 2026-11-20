@@ -224,17 +224,19 @@ namespace llaminar2
         MoEOverlayDeviceControllerInferenceEpochRecord *record = nullptr;
         std::uint32_t participant_id = 0xffffffffu;
         std::uint32_t reserved = 0u;
+        /** Exact admitted record/tail extent, never read from mutable device state. */
+        std::uint64_t storage_bytes = 0u;
 
         /** @return Whether stable address and participant identity are present. */
         [[nodiscard]] constexpr bool valid() const noexcept
         {
-            return record != nullptr && participant_id != 0xffffffffu;
+            return record != nullptr && participant_id != 0xffffffffu && storage_bytes != 0u;
         }
 
         /** @return Whether no transaction-wide synchronization was requested. */
         [[nodiscard]] constexpr bool empty() const noexcept
         {
-            return record == nullptr && participant_id == 0xffffffffu;
+            return record == nullptr && participant_id == 0xffffffffu && storage_bytes == 0u;
         }
     };
 

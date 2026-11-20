@@ -104,6 +104,7 @@ class NativeCodecDiscovery(unittest.TestCase):
                 Path(command[4]).parent / 'literal "quote" and \\backslash'))
             self.assertEqual(props['TIMEOUT'], 120)
             self.assertEqual(props['TIMEOUT_SIGNAL_NAME'], 'SIGTERM')
+            self.assertEqual(props['TIMEOUT_SIGNAL_GRACE_PERIOD'], 36)
             self.assertIn('ProductionTestPreflight', props['LABELS'])
             self.assertIn('ProcessOwned', props['LABELS'])
             self.assertIn('FullDeviceInventory', props['LABELS'])
@@ -156,6 +157,8 @@ class NativeCodecDiscovery(unittest.TestCase):
                 (root / 'dummy.cpp').write_text('int main() {return 0;}\n')
                 (root / 'CMakeLists.txt').write_text(
                     'cmake_minimum_required(VERSION 3.27)\nproject(NativeDiscovery CXX)\nenable_testing()\n'
+                    'set(LLAMINAR_SUPPORTED_BUILD_TYPES Debug Release Integration)\n'
+                    'set(CMAKE_CONFIGURATION_TYPES "${LLAMINAR_SUPPORTED_BUILD_TYPES}" CACHE STRING "" FORCE)\n'
                     'include(cmake/V2TestTargetSelection.cmake)\n'
                     'set(V2_PERF_TESTS_ONLY TRUE)\n'
                     + ('set(LLAMINAR_RELEASE_NATIVE_TEST_TARGETS native)\n' if selected else '')
@@ -167,9 +170,10 @@ class NativeCodecDiscovery(unittest.TestCase):
                     'TEST_PREFIX Native LABELS Integration MPI_PROCS 1 TIMEOUT 120)\n'
                     'get_property(owners GLOBAL PROPERTY V2_DISCOVERED_PREFLIGHT_GATE_TARGETS)\n'
                     'file(WRITE "${CMAKE_BINARY_DIR}/owners" "${owners}")\n')
-                result = subprocess.run([self.cmake, '-S', str(root), '-B', str(root / 'build'),
-                    '-G', 'Ninja', f'-DCMAKE_MAKE_PROGRAM={self.ninja}'], capture_output=True,
-                    text=True, timeout=20)
+                configure = [self.cmake, '-S', str(root), '-B', str(root / 'build'),
+                    '-G', 'Ninja', f'-DCMAKE_MAKE_PROGRAM={self.ninja}',
+                    '-DCMAKE_BUILD_TYPE=Integration']
+                result = subprocess.run(configure, capture_output=True, text=True, timeout=20)
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 owners = (root / 'build/owners').read_text()
                 self.assertEqual(bool(owners), selected)
@@ -182,6 +186,18 @@ class NativeCodecDiscovery(unittest.TestCase):
                     self.assertNotIn('LLAMINAR_PARITY_SOURCE_DIR',
                                      (root / 'build/build.ninja').read_text())
                     self.assertIn('_undiscovered_', (root / 'build/native_discovered_tests.cmake').read_text())
+                    # A forced configuration list must not displace the active
+                    # single-config build type: file(GENERATE) materializes only
+                    # _undiscovered_$<CONFIG>, so the unqualified CTest fallback
+                    # names Integration, not the first listed configuration.
+                    self.assertIn('_undiscovered_Integration.cmake',
+                                  (root / 'build/native_discovered_tests.cmake').read_text())
+                    self.assertTrue((root / 'build/native_undiscovered_Integration.cmake').is_file())
+                    discovery = root / 'build/native_discovered_tests.cmake'
+                    discovery.write_text(discovery.read_text().replace('_Integration.cmake', '_Debug.cmake'))
+                    result = subprocess.run(configure, capture_output=True, text=True, timeout=20)
+                    self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                    self.assertIn('_undiscovered_Integration.cmake', discovery.read_text())
                     ctest = str(Path(shutil.which(self.cmake)).with_name('ctest'))
                     unit = subprocess.run([ctest, '--test-dir', str(root / 'build'),
                         '-L', '^Unit$', '--output-on-failure'], capture_output=True,

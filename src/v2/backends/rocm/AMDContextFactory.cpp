@@ -21,14 +21,13 @@
 #include "../NativeContextRuntimePolicy.h"
 #include <dlfcn.h>
 #include "AMDDeviceContext.h"
+#include "AMDGPUModuleIdentity.h"
 #include "../NativeContextPreparation.h"
 #include <mutex>
 #include "../GPUDeviceContextPool.h"
 #include "ROCmHardwareMetadata.h"
 #include "../DeviceUUID.h"
 #include <span>
-#include <fstream>
-#include <sstream>
 #include <sys/utsname.h>
 #include "../GPUDeviceProcessLifetime.h"
 #include "../../utils/DebugEnv.h"
@@ -52,11 +51,12 @@ namespace llaminar2
         key.visibility_identity=digestIdentity(visibility+":"+NativeContextRuntimePolicy::original(DeviceType::ROCm).liveIdentity());
         int runtime=0;if(hipRuntimeGetVersion(&runtime)!=hipSuccess || runtime<=0)
             throw std::runtime_error("Selected ROCm worker lacks its actual runtime identity");
-        const auto read=[](const char* path){std::ifstream file(path);std::ostringstream text;text<<file.rdbuf();
-            if(!file || text.str().empty())throw std::runtime_error("Selected ROCm worker lacks original kernel-driver source identity");return text.str();};
-        struct utsname kernel{};if(uname(&kernel)!=0)throw std::runtime_error("Selected ROCm worker lacks kernel release identity");
-        key.runtime_version=std::to_string(runtime);key.driver_version=read("/sys/module/amdgpu/version")+":"+kernel.release;
-        key.driver_sha256=digestIdentity(key.driver_version+":"+read("/sys/module/amdgpu/srcversion"));
+        struct utsname kernel{};
+        if (uname(&kernel) != 0) throw std::runtime_error("Selected ROCm worker lacks kernel release identity");
+        const auto driver = AMDGPUModuleIdentity::observe("/sys/module/amdgpu", kernel.release);
+        key.runtime_version = std::to_string(runtime);
+        key.driver_version = driver.version;
+        key.driver_sha256 = digestIdentity(driver.version + ":" + driver.source);
         key.hsa_sha256=libraryClosureIdentity(dlsym(RTLD_DEFAULT,"hsa_init"));
         key.runtime_sha256=libraryIdentity(reinterpret_cast<const void*>(&hipRuntimeGetVersion));
         key.backend_sha256=digestIdentity(libraryIdentity(reinterpret_cast<const void*>(&hipblasCreate))+":"+

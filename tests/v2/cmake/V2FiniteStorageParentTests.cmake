@@ -17,13 +17,15 @@ if(TARGET v2_unit_gpu_expert_transfer)
         if(HAVE_${_key})
             foreach(_case Live0 Live1 Live257 Live8193 RejectsOriginalForeignDevice)
                 set(_hardware_label "${_backend}")
+                unset(_hardware_requirement)
                 if(_case STREQUAL "RejectsOriginalForeignDevice")
                     set(_hardware_label "${_backend}2")
+                    set(_hardware_requirement GPU_DEVICES 2)
                 endif()
                 add_v2_test(V2_Integration_${_backend}_FiniteStorage_${_case}
                     COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer> --gtest_filter=FiniteBodySiblingNativeIntegration.${_backend}_${_case}
                     LABELS "V2;Integration;ProductionTestPreflight;GPU;${_backend};${_hardware_label};Graph;Ownership;TraceReplay;Regression"
-                    MPI_PROCS 1 NO_MODELS TIMEOUT 30)
+                    ${_hardware_requirement} MPI_PROCS 1 NO_MODELS TIMEOUT 30)
                 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_${_backend}_FiniteStorage_${_case})
             endforeach()
         endif()

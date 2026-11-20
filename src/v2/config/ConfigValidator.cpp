@@ -7,6 +7,8 @@
  * Plan/apply intent is resolved by the typed planning-policy boundary; this
  * validator reports its errors without maintaining a second interpretation of
  * hard restrictions, preferences or automatic-versus-explicit placement.
+ * Model execution capabilities belong to typed placement and graph admission;
+ * this common validator must not reject an implemented expert policy by name.
  *
  * @author David Sanftenberg
  * @date February 2026
@@ -312,18 +314,6 @@ namespace llaminar2
                        c.device_for_this_rank->toShortString() +
                        " and --tp-devices both specified. "
                        "The primary device is determined by --tp-devices (first entry).";
-            },
-        });
-
-        v.addRule({
-            .id = "moe-routed-tensor-sharding-not-implemented",
-            .description = "Routed-expert tensor sharding is not implemented by the standard Qwen3.5 MoE path",
-            .fix_hint = "Use --moe-routed-expert-compute apportioned for the standard Qwen3.5 MoE path",
-            .applies = [](const OrchestrationConfig &c)
-            { return c.routed_expert_compute_policy == RoutedExpertComputePolicy::TensorSharded; },
-            .check = [](const OrchestrationConfig &) -> std::optional<std::string>
-            {
-                return "Routed-expert compute policy 'tensor-sharded' is not implemented for the standard Qwen3.5 MoE execution path. Use --moe-routed-expert-compute apportioned.";
             },
         });
 

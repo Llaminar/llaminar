@@ -161,6 +161,7 @@
 #include "../../backends/NativeContextPreparation.h"
 #include "../../planning/MoEOverlayPlanningInputs.h"
 #include "../../planning/MoEOverlayMemoryPlanInputs.h"
+#include "../../planning/PlanningObservedResource.h"
 #include "../../backends/DeviceAddressAdapter.h"
 #include "../../kernels/KernelFactory.h"
 #include "../../tensors/TensorFactory.h"
@@ -17920,12 +17921,15 @@ namespace llaminar2
         local_tp_ctx_ = createLocalTPContext(
             plan_.local_tp_devices,
             plan_.local_tp_weights,
-            plan_.local_tp_backend);
+            plan_.local_tp_backend,
+            config_.moe_routed_expert_plan && config_.moe_routed_expert_plan->usesQFNMI50TP4()
+                ? RankOrderedQuotePolicy::MeasuredDomain : RankOrderedQuotePolicy::ExplicitOnly);
         if (!local_tp_ctx_)
         {
             return setError("Failed to create LOCAL TP context");
         }
 
+        plan_.runtime.rank_ordered_resources = local_tp_ctx_->rankOrderedResources();
         LOG_DEBUG("LOCAL TP context created with " << plan_.local_tp_devices.size() << " devices");
         return true;
     }
@@ -19443,28 +19447,21 @@ namespace llaminar2
                                     static_cast<std::uint64_t>(bytes));
                             }
                         }
-                        const auto initial_layered_ownership =
-                            owner_map.layeredOwnership(
-                                metadata.num_layers,
-                                metadata.num_experts,
-                                metadata.first_model_layer);
-                        std::vector<std::uint32_t>
-                            initial_owner_participants;
-                        initial_owner_participants.reserve(
-                            static_cast<std::size_t>(metadata.num_layers) *
-                            static_cast<std::size_t>(metadata.num_experts));
+                        std::vector<MoEOverlayRouteTarget> initial_route_targets;
+                        initial_route_targets.reserve(static_cast<std::size_t>(metadata.num_layers) * metadata.num_experts);
                         for (int layer = 0; layer < metadata.num_layers; ++layer)
-                        {
-                            for (int expert = 0;
-                                 expert < metadata.num_experts;
-                                 ++expert)
+                            for (int expert = 0; expert < metadata.num_experts; ++expert)
                             {
-                                initial_owner_participants.push_back(
-                                    static_cast<std::uint32_t>(
-                                        initial_layered_ownership.owner(
-                                            metadata.first_model_layer + layer, expert)));
+                                const auto *placement = owner_map.placementFor(metadata.first_model_layer + layer, expert);
+                                if (!placement)
+                                    throw std::logic_error("Device controller restore declaration lost its original logical placement");
+                                const auto target = placement->shard_cohort
+                                    ? MoEOverlayRouteTarget::cohort(placement->tier_idx)
+                                    : MoEOverlayRouteTarget::whole(placement->owner_participant);
+                                if (!moe_overlay_device_controller_topology_->groupForTarget(target))
+                                    throw std::logic_error("Device controller restore declaration names a foreign original target");
+                                initial_route_targets.push_back(target);
                             }
-                        }
                         moe_overlay_device_controller_fabric_ =
                             std::make_shared<
                                 MoEOverlayNodeLocalDeviceControllerFabric>(
@@ -19491,9 +19488,9 @@ namespace llaminar2
                                         .payload_bytes_per_layer =
                                             std::move(
                                                 payload_bytes_per_layer),
-                                        .initial_owner_participants =
+                                        .initial_route_targets =
                                             std::move(
-                                                initial_owner_participants),
+                                                initial_route_targets),
                                         .minimum_window_activations =
                                             static_cast<std::uint64_t>(
                                                 std::max<std::uint64_t>(
@@ -19587,6 +19584,9 @@ namespace llaminar2
         const auto snapshot=moe_expert_overlay_residency_authority_->snapshot();
         if(!snapshot || !snapshot->jointOwnerMap())return true;
         const auto &plan=*snapshot->placement_plan;
+        // GPU joint source declarations have their own original native local
+        // context. They must never enter the CPU domain/barrier owner.
+        if (!MoEExpertOwnerMap::usesCPUJointFragments(plan)) return true;
         if(plan.authority_execution!=MoEOverlayAuthorityExecutionKind::HostResident)
             return setError("CPU expert domain requires its original declared host residency authority");
         const auto world=moe_expert_overlay_mpi_ctx_?moe_expert_overlay_mpi_ctx_:mpi_ctx_;
@@ -19836,7 +19836,7 @@ namespace llaminar2
             if(config_.moe_rebalance.mode!=MoERebalanceRuntimeMode::Off ||
                moe_expert_overlay_residency_authority_->migrationEnabled() ||
                !moe_expert_overlay_participant_residency_->projectionPreparation() ||
-               moe_expert_overlay_participant_residency_->projectionPreparation()->cpuJointOwnerMap().get()!=
+               moe_expert_overlay_participant_residency_->projectionPreparation()->jointOwnerMap().get()!=
                    initial_snapshot->jointOwnerMap().get())
                 return setError("Static CPU joint startup lost its original immutable fragment authority");
             if(!run_maintenance_phase("bindStaticJointTransferAndServingGraphs",[&] {
@@ -20248,6 +20248,7 @@ namespace llaminar2
                                 moe_overlay_device_controller_topology_,
                             .fabric =
                                 moe_overlay_device_controller_fabric_,
+                            .physical_memory_authority = physical_memory_authority_,
                             .runtime_bindings = runner_
                                 ->moeOverlayDeviceControllerRuntimeBindings(),
                             .execution_mode = dynamic
@@ -22083,8 +22084,8 @@ namespace llaminar2
                     for(const auto device:unique_gpus){
                         const auto found=std::find_if(observed.gpus.begin(),observed.gpus.end(),[&](const auto& gpu){return gpu.type==device.type && gpu.local_device_id==device.ordinal;});
                         if(found==observed.gpus.end())throw std::invalid_argument("Selected source worker is absent from original rank inventory");
-                        resources.push_back({world_rank,device,found->memory_bytes,
-                            PhysicalMemoryAuthority::admissionCapacity(found->free_memory_bytes,config_.memoryLimitBytes(device.type))});
+                        resources.push_back(withObservedBacking({world_rank,device,found->memory_bytes,
+                            PhysicalMemoryAuthority::admissionCapacity(found->free_memory_bytes,config_.memoryLimitBytes(device.type))},observed));
                     }
                     if(config_.moe_routed_expert_plan && config_.moe_routed_expert_plan->usesExpertOverlayAuthority()){
                         // The one source PMA must retain the SAME topology-wide

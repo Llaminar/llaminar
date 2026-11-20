@@ -219,7 +219,7 @@ struct FabricOriginal {
         size_t shadow_bytes=0,gpu_shadow_bytes=0;
         for(int id:local) {
             const auto* member=topology.participantForId(id);
-            const auto selected=member->domain_name=="cohort"?preparation->cpuShardSourceFor(0,*member):nullptr;
+            const auto selected=member->domain_name=="cohort"?preparation->shardSourceFor(0,*member):nullptr;
             const auto local_manifest=selected?selected->cohort()->localManifest(selected->participantIndex()):manifests.front();
             const auto footprint=MoEOverlayCapacityResolver::preparedFootprints({local_manifest}).front();
             if(member->device.is_gpu())gpu_shadow_bytes+=footprint.gpu_shadow_bytes;
@@ -270,7 +270,7 @@ struct FabricOriginal {
                 return value.domain_name=="cohort" && value.world_rank_known && value.world_rank==rank;
             });
             if(member==topology.participants().end())throw std::logic_error("Joined service lost original cohort member");
-            const auto selected=preparation->cpuShardSourceFor(0,*member);
+            const auto selected=preparation->shardSourceFor(0,*member);
             if(!selected)throw std::logic_error("Joined service lost original local cohort cuts");
             auto workspace=cpuSwiGLUWorkspaceRequirements(Service::kMaximumRows,kF/2);
             for(const auto role:{WeightRole::MoEExpertGate,WeightRole::MoEExpertUp,WeightRole::MoEExpertDown})
@@ -581,9 +581,9 @@ void expectDestination(const FabricOriginal& original,const MoEOverlayResidencyT
     std::array<std::shared_ptr<ITensorGemm>,3> engines;
     std::array<MoEExpertProjectionOwnership::Projection,3> projections;
     std::string error;
-    if(destination.arrival->isCPUJointFragment()) {
-        MoEOverlayPreparedCPUFragmentPayload payload;
-        ASSERT_TRUE(destination.arrival->completeCPUFragment(payload,&error))<<error;
+    if(destination.arrival->isJointFragment()) {
+        MoEOverlayPreparedFragmentPayload payload;
+        ASSERT_TRUE(destination.arrival->completeFragment(payload,&error))<<error;
         EXPECT_EQ(payload.model(),original.model);EXPECT_EQ(payload.preparation(),original.preparation);
         ASSERT_EQ(payload.cohort(),edge.destination.shard_cohort);
         const auto member=std::find_if(payload.cohort()->participants().begin(),payload.cohort()->participants().end(),
@@ -687,9 +687,9 @@ TEST(MoEOverlayCPUCohortFabric, RealTwoSocketReusableSealRebindsOriginalFragment
     const auto& owners=original.authority->snapshot()->placementOwnerMap();
     std::vector<std::pair<int,ExpertGemmRegistry::StaticProjectionLayer>> before;
     for(const int id:local) {
-        if(!original.registry->isCPUJointParticipant(id))continue;
+        if(!original.registry->isJointParticipant(id))continue;
         const auto* participant=owners.participantForId(id);ASSERT_TRUE(participant);
-        auto layer=engines.acquireCPUJointLayer(original.model,*participant,0);ASSERT_TRUE(layer);
+        auto layer=engines.acquireJointLayer(original.model,*participant,0);ASSERT_TRUE(layer);
         before.emplace_back(id,std::move(*layer));
     }
     ASSERT_EQ(before.size(),1u); // One actual member on each original physical socket.
@@ -703,26 +703,26 @@ TEST(MoEOverlayCPUCohortFabric, RealTwoSocketReusableSealRebindsOriginalFragment
             [id](const auto& value){return value.participant_id==id;});
         ASSERT_NE(bank,seal->local_banks.end());
         EXPECT_TRUE(bank->layerForModelLayer(0).experts.empty());
-        ASSERT_TRUE(bank->layerForModelLayer(0).cpu_fragment_family);
+        ASSERT_TRUE(bank->layerForModelLayer(0).fragment_family);
     }
     auto torn=*seal;
     auto& mask=torn.local_banks.front().layers.front().resident_mask;
     ASSERT_FALSE(mask.empty());mask.front()=!mask.front();
     EXPECT_FALSE(engines.replaceParticipantResidencyFromSeal(torn,*original.registry,&error));
     for(const auto& [id,previous]:before) {
-        const auto unchanged=engines.acquireCPUJointLayer(original.model,*owners.participantForId(id),0);
+        const auto unchanged=engines.acquireJointLayer(original.model,*owners.participantForId(id),0);
         ASSERT_TRUE(unchanged);
-        for(const int expert:previous.cpu_joint_source->expertIds())
+        for(const int expert:previous.joint_source->expertIds())
             EXPECT_EQ(unchanged->experts.at(size_t(expert)).gate,previous.experts.at(size_t(expert)).gate);
     }
     ASSERT_TRUE(engines.replaceParticipantResidencyFromSeal(*seal,*original.registry,&error))<<error;
     for(const auto& [id,previous]:before) {
         const auto* participant=owners.participantForId(id);ASSERT_TRUE(participant);
-        const auto current=engines.acquireCPUJointLayer(original.model,*participant,0);ASSERT_TRUE(current);
+        const auto current=engines.acquireJointLayer(original.model,*participant,0);ASSERT_TRUE(current);
         ASSERT_EQ(current->sources.size(),previous.sources.size());
-        EXPECT_EQ(current->cpu_joint_source,previous.cpu_joint_source);
-        EXPECT_FALSE(current->cpu_joint_source.owner_before(previous.cpu_joint_source));
-        EXPECT_FALSE(previous.cpu_joint_source.owner_before(current->cpu_joint_source));
+        EXPECT_EQ(current->joint_source,previous.joint_source);
+        EXPECT_FALSE(current->joint_source.owner_before(previous.joint_source));
+        EXPECT_FALSE(previous.joint_source.owner_before(current->joint_source));
         for(size_t index=0;index<previous.sources.size();++index) {
             const auto& a=previous.sources[index];const auto& b=current->sources[index];
             EXPECT_EQ(a.binding_id,b.binding_id);EXPECT_EQ(a.native_source,b.native_source);
@@ -734,8 +734,8 @@ TEST(MoEOverlayCPUCohortFabric, RealTwoSocketReusableSealRebindsOriginalFragment
         const auto bank=std::find_if(seal->local_banks.begin(),seal->local_banks.end(),
             [id](const auto& value){return value.participant_id==id;});
         ASSERT_NE(bank,seal->local_banks.end());
-        for(const int expert:current->cpu_joint_source->expertIds()) {
-            const auto& fragment=bank->layerForModelLayer(0).cpu_fragments.at(size_t(expert));
+        for(const int expert:current->joint_source->expertIds()) {
+            const auto& fragment=bank->layerForModelLayer(0).fragments.at(size_t(expert));
             EXPECT_EQ(current->experts.at(size_t(expert)).gate,fragment.gate());
             EXPECT_EQ(current->experts.at(size_t(expert)).up,fragment.up());
             EXPECT_EQ(current->experts.at(size_t(expert)).down,fragment.down());
@@ -747,11 +747,11 @@ TEST(MoEOverlayCPUCohortFabric, RealTwoSocketReusableSealRebindsOriginalFragment
     ASSERT_TRUE(successor->bindOriginalPreparedContext(original.context,original.preparation,&error))<<error;
     ASSERT_TRUE(successor->finalizeInitialBanksFromPreparedRegistry(engines,&error))<<error;
     for(const auto& [id,previous]:before) {
-        const auto frame=successor->initialCPUJointLayer(id,0);ASSERT_TRUE(frame);
+        const auto frame=successor->initialJointLayer(id,0);ASSERT_TRUE(frame);
         const auto lease=frame->acquireInitialConstruction();ASSERT_TRUE(lease);
-        const auto current=engines.acquireCPUJointLayer(original.model,*owners.participantForId(id),0);ASSERT_TRUE(current);
-        for(const int expert:current->cpu_joint_source->expertIds()) {
-            const auto& fragment=lease->layerForModelLayer(0).cpu_fragments.at(size_t(expert));
+        const auto current=engines.acquireJointLayer(original.model,*owners.participantForId(id),0);ASSERT_TRUE(current);
+        for(const int expert:current->joint_source->expertIds()) {
+            const auto& fragment=lease->layerForModelLayer(0).fragments.at(size_t(expert));
             ASSERT_TRUE(fragment.valid());EXPECT_EQ(fragment.model(),original.model);
             EXPECT_EQ(fragment.preparation(),original.preparation);
             EXPECT_EQ(fragment.gate(),current->experts.at(size_t(expert)).gate);
@@ -865,8 +865,8 @@ std::vector<FloatingSourceObservation> observeFloatingSources(const FabricOrigin
             std::any_of(transaction.migrations.begin(),transaction.migrations.end(),
                 [expert](const auto& migration){return migration.expert_id==expert;})) {
             std::array<std::shared_ptr<ITensorGemm>,3> engines;
-            if(layer.cpu_fragment_family) {
-                const auto& payload=layer.cpu_fragments.at(expert);
+            if(layer.fragment_family) {
+                const auto& payload=layer.fragments.at(expert);
                 engines={payload.gate(),payload.up(),payload.down()};
             } else {
                 const auto& payload=layer.experts.at(expert);
@@ -874,8 +874,8 @@ std::vector<FloatingSourceObservation> observeFloatingSources(const FabricOrigin
             }
             for(size_t role=0;role<3;++role) {
                 const auto& matrix=original.manifests.front().projections[role];
-                const auto owned=layer.cpu_fragment_family?
-                    layer.cpu_fragment_family->cohort()->ownership(layer.cpu_fragment_family->participantIndex()).projection(roles[role]):
+                const auto owned=layer.fragment_family?
+                    layer.fragment_family->cohort()->ownership(layer.fragment_family->participantIndex()).projection(roles[role]):
                     MoEExpertProjectionOwnership::Projection{MoEProjectionResidence::ExpertOwner,matrix.N,matrix.K,0,matrix.N,0,matrix.K};
                 ContiguousFloatingPointWeightDescriptor actual;
                 if(!engines[role] || !engines[role]->exportContiguousFloatingPointWeights(actual) ||

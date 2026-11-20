@@ -25,9 +25,9 @@ TEST(CPUJointAuthoritativeTargetContract, CompleteSourceTargetsRoundTripWithoutS
         ASSERT_TRUE(tx.valid());
         const auto plan = authority.exportAuthoritativeResidencyPlan(tx);
         ASSERT_TRUE(plan.valid());
-        EXPECT_TRUE(plan.entries[0].candidate_target.isCPUCohort());
+        EXPECT_TRUE(plan.entries[0].candidate_target.isCohort());
         EXPECT_TRUE(plan.entries[1].candidate_target.isWhole());
-        EXPECT_TRUE(plan.entries[2].candidate_target.isCPUCohort()); // unchanged also authenticated
+        EXPECT_TRUE(plan.entries[2].candidate_target.isCohort()); // unchanged also authenticated
         const auto proposal = makeMoEOverlayDistributedResidencyProposal(plan, tx);
         ASSERT_TRUE(proposal.valid());
         std::vector<uint8_t> wire(moeOverlayDistributedResidencyProposalWireBytes(proposal));
@@ -50,7 +50,7 @@ TEST(CPUJointAuthoritativeTargetContract, CompleteSourceTargetsRoundTripWithoutS
         EXPECT_FALSE(decodeMoEOverlayDistributedResidencyProposal(old, 1, 4, &decoded, &error));
         for (size_t index : {size_t(0), size_t(2)})
             for (const auto bad_target : {MoEOverlayRouteTarget(), MoEOverlayRouteTarget::whole(1),
-                                          MoEOverlayRouteTarget::cpuCohort(7)})
+                                          MoEOverlayRouteTarget::cohort(7)})
             {
                 auto bad = plan;
                 bad.entries[index].candidate_target = bad_target;
@@ -119,7 +119,7 @@ TEST(CPUJointAuthoritativeTargetContract, PreparedTargetsReplaySourceCodecObject
                 const auto *resident = snapshot->placementOwnerMap().placementFor(
                     entry.sample_layers[phase], row.expert_ids[phase]);
                 ASSERT_NE(resident, nullptr);
-                EXPECT_EQ(bool(resident->shard_cohort), entry.coordinate.target.isCPUCohort());
+                EXPECT_EQ(bool(resident->shard_cohort), entry.coordinate.target.isCohort());
             }
         samples.push_back(row);
     }
@@ -157,7 +157,7 @@ TEST(CPUJointAuthoritativeTargetContract, PreparedTargetsReplaySourceCodecObject
             for (int expert = 0; expert < 4; ++expert)
             {
                 const auto *owner = snapshot->placementOwnerMap().placementFor(0, expert);
-                const auto target = owner->shard_cohort ? MoEOverlayRouteTarget::cpuCohort(owner->tier_idx) :
+                const auto target = owner->shard_cohort ? MoEOverlayRouteTarget::cohort(owner->tier_idx) :
                     MoEOverlayRouteTarget::whole(owner->owner_participant);
                 if (target.word() == price.target.word()) before[expert] = int32_t(vertex);
             }
@@ -242,7 +242,7 @@ TEST(CPUJointAuthoritativeTargetContract, DynamicUsesOrdinaryAuthorityAndTypedDe
     for (const auto &coordinate : planner.requiredTargetCoordinates())
         movement->costs.push_back({coordinate, 1, 1});
     DecodeExpertHistogram histogram({.num_layers = 1, .num_experts = 4, .top_k = 2,
-        .window_size = 1, .placement_ownership = original.preparation->cpuJointOwnerMap()});
+        .window_size = 1, .placement_ownership = original.preparation->jointOwnerMap()});
     auto config = original.config();
     config.maintenance_mode = MoERebalanceRuntimeMode::Dynamic;
     config.histogram = &histogram;
@@ -299,7 +299,7 @@ TEST(CPUJointAuthoritativeTargetContract, ObserveCountsLogicalDemandWithoutPubli
     using namespace llaminar2::test;
     JointPlacementOriginal original(2);
     DecodeExpertHistogram histogram({.num_layers = 1, .num_experts = 4, .top_k = 1,
-        .window_size = 1, .placement_ownership = original.preparation->cpuJointOwnerMap()});
+        .window_size = 1, .placement_ownership = original.preparation->jointOwnerMap()});
     auto config = original.config();
     config.maintenance_mode = MoERebalanceRuntimeMode::Observe;
     config.histogram = &histogram;

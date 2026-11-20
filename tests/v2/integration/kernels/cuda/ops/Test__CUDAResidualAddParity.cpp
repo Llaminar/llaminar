@@ -213,9 +213,10 @@ namespace
         copyToGpu(d_residual, residual->data(), num_elements);
 
         llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP32> cuda_kernel;
+        cuda_kernel.setGPUStream(stream_);
         ASSERT_TRUE(cuda_kernel.apply(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        cudaDeviceSynchronize();
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
         copyFromGpu(cuda_output->mutable_data(), d_output, num_elements);
 
         // Validate
@@ -261,9 +262,10 @@ namespace
         copyToGpu(d_residual, residual->data(), num_elements);
 
         llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP32> cuda_kernel;
+        cuda_kernel.setGPUStream(stream_);
         ASSERT_TRUE(cuda_kernel.apply(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        cudaDeviceSynchronize();
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
         copyFromGpu(cuda_output->mutable_data(), d_output, num_elements);
 
         EXPECT_FALSE(hasNanOrInf(cuda_output->data(), num_elements)) << "CUDA output contains NaN/Inf";
@@ -313,9 +315,10 @@ namespace
         copyToGpu(d_residual, residual_bf16->typed_data(), num_elements);
 
         llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::BF16> cuda_kernel;
+        cuda_kernel.setGPUStream(stream_);
         ASSERT_TRUE(cuda_kernel.apply_bf16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        cudaDeviceSynchronize();
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
         copyFromGpu(cuda_output_bf16->mutable_typed_data(), d_output, num_elements);
 
         // Dequantize for comparison
@@ -367,9 +370,10 @@ namespace
         copyToGpu(d_residual, residual_bf16->typed_data(), num_elements);
 
         llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::BF16> cuda_kernel;
+        cuda_kernel.setGPUStream(stream_);
         ASSERT_TRUE(cuda_kernel.apply_bf16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        cudaDeviceSynchronize();
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
         copyFromGpu(cuda_output_bf16->mutable_typed_data(), d_output, num_elements);
 
         std::vector<float> cpu_fp32(num_elements);
@@ -424,9 +428,10 @@ namespace
         copyToGpu(d_residual, residual_fp16->typed_data(), num_elements);
 
         llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP16> cuda_kernel;
+        cuda_kernel.setGPUStream(stream_);
         ASSERT_TRUE(cuda_kernel.apply_fp16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        cudaDeviceSynchronize();
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
         copyFromGpu(cuda_output_fp16->mutable_typed_data(), d_output, num_elements);
 
         std::vector<float> cpu_fp32(num_elements);
@@ -477,9 +482,10 @@ namespace
         copyToGpu(d_residual, residual_fp16->typed_data(), num_elements);
 
         llaminar2::cuda::CUDAResidualAddKernelT<ActivationPrecision::FP16> cuda_kernel;
+        cuda_kernel.setGPUStream(stream_);
         ASSERT_TRUE(cuda_kernel.apply_fp16(d_input, d_residual, d_output, num_elements, nullptr, 0));
 
-        cudaDeviceSynchronize();
+        ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
         copyFromGpu(cuda_output_fp16->mutable_typed_data(), d_output, num_elements);
 
         std::vector<float> cpu_fp32(num_elements);

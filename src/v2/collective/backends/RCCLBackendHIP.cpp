@@ -363,7 +363,7 @@ namespace llaminar2
             }
 
             // Now load RCCL (it will see the environment variables we just set)
-            if (!rccl::isLoaded() && !rccl::load())
+            if (!rccl::load())
             {
                 LOG_ERROR("[RCCLBackend] Failed to load RCCL library: " << rccl::getLastError());
                 return false;
@@ -396,7 +396,7 @@ namespace llaminar2
         bool rcclGetUniqueIdWrapper(void *id_out)
         {
             // Ensure RCCL is loaded
-            if (!rccl::isLoaded() && !rccl::load())
+            if (!rccl::load())
             {
                 return false;
             }
@@ -412,7 +412,7 @@ namespace llaminar2
         bool rcclCommInitRankWrapper(void **comm_out, int nranks, void *unique_id, int rank, std::string &error_out)
         {
             // Ensure RCCL is loaded
-            if (!rccl::isLoaded() && !rccl::load())
+            if (!rccl::load())
             {
                 error_out = rccl::getLastError();
                 *comm_out = nullptr;
@@ -433,7 +433,7 @@ namespace llaminar2
         bool rcclCommInitAllWrapper(void **comms_out, int ndevs, const int *devlist, std::string &error_out)
         {
             // Ensure RCCL is loaded
-            if (!rccl::isLoaded() && !rccl::load())
+            if (!rccl::load())
             {
                 error_out = rccl::getLastError();
                 *comms_out = nullptr;

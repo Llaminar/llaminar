@@ -16,7 +16,7 @@ TEST(CPUJointWholeGPUOwnerTransitionContract, TierAndPeerChangesRetainSourceCoho
     JointPlacementOriginal source(2, 2, 11, 2, 3);
     std::vector<MoEOverlayLayerWeightManifest> manifest;
     for (int layer = 3; layer < 5; ++layer)
-        manifest.push_back(source.preparation->cpuJointOwnerMap()->placementFor(layer, 8)->shard_cohort->source());
+        manifest.push_back(source.preparation->jointOwnerMap()->placementFor(layer, 8)->shard_cohort->source());
     for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})
     for (const int members : {2, 4, 8})
     for (const int peers : {2, 4, 8})
@@ -94,7 +94,7 @@ TEST(CPUJointWholeGPUOwnerTransitionContract, RejectsStaleForeignCohortAndUnclos
     using namespace llaminar2::test;
     JointPlacementOriginal source(2, 2, 7, 2, 3);
     const auto &plan = source.plan;
-    const auto &original = *source.preparation->cpuJointOwnerMap();
+    const auto &original = *source.preparation->jointOwnerMap();
     const int first = original.expertsForParticipant(3, 0).front();
     const int second = original.expertsForParticipant(3, 1).front();
     const std::vector<MoELayeredExpertOwnershipChange> valid{{3, first, 0, 1}, {3, second, 1, 0}};
@@ -130,7 +130,7 @@ TEST(CPUJointWholeGPUOwnerTransitionContract, MixedWholeCPUAndGPUPeersRetainCoho
     JointPlacementOriginal source(2, 2, 15, 2, 3);
     std::vector<MoEOverlayLayerWeightManifest> manifests;
     for (int layer = 3; layer < 5; ++layer)
-        manifests.push_back(source.preparation->cpuJointOwnerMap()
+        manifests.push_back(source.preparation->jointOwnerMap()
             ->placementFor(layer, 12)->shard_cohort->source());
 
     for (const auto backend : {DeviceType::CUDA, DeviceType::ROCm})

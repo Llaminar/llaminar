@@ -10,9 +10,11 @@
  * capture setup never dereferences a GPU pointer, independently of hardware.
  */
 
+#include "utils/HostPageSize.h"
 #include "execution/moe/MoEOverlayDeviceControllerTopology.h"
 #include "execution/moe/MoEOverlayNodeLocalDeviceControllerFabric.h"
 #include "execution/moe/MoEOverlayParticipantGraphRunner.h"
+#include "execution/moe/MoEExpertShardCohort.h"
 
 #include <gtest/gtest.h>
 
@@ -418,7 +420,7 @@ namespace llaminar2::test
                 /*command_capacity=*/32u);
 
         ASSERT_TRUE(layout.valid());
-        EXPECT_EQ(layout.page_bytes, 4096u);
+        EXPECT_EQ(layout.page_bytes, hostPageBytes());
         EXPECT_EQ(layout.leader_owned_begin, layout.page_bytes);
         EXPECT_EQ(layout.leader_owned_end % layout.page_bytes, 0u);
         EXPECT_EQ(
@@ -438,10 +440,10 @@ namespace llaminar2::test
         ASSERT_EQ(layout.groups.size(), 2u);
         EXPECT_EQ(
             layout.groups[0].collected_state_words,
-            2u * kMoEOverlayDeviceControllerDemandPhaseCount * 48u * 256u);
+            (2u + 2u) * 48u * 256u);
         EXPECT_EQ(
             layout.groups[1].collected_state_words,
-            4u * kMoEOverlayDeviceControllerDemandPhaseCount * 48u * 256u);
+            4u * 48u * 256u);
         EXPECT_EQ(
             layout.groups[0].owned_page_begin,
             layout.leader_owned_end);
@@ -483,6 +485,10 @@ namespace llaminar2::test
         EXPECT_EQ(layout.groups[2].group_id, 2u);
     }
 
+    /** @brief Whole domain coordinates survive singleton control groups without becoming roster positions. */
+    /** @brief Logical roster, scratch and live snapshot wire extents remain independent of GPU cohort degree. */
+    /** @brief Empty targets retain original source blocks without becoming whole owners or loading experts. */
+    /** @brief GPU1 remains a complete-F cohort over a single-device group; CPU1 retains whole ownership. */
     TEST(Test__MoEOverlayDeviceControllerTopology,
          FabricLayoutRejectsGeometryOutsideTheSharedRuntimeABI)
     {
@@ -591,6 +597,7 @@ namespace llaminar2::test
             };
             binding.group_root = true;
             binding.mapped_bytes = bytes;
+            binding.inference_epoch_storage_bytes = 256u;
             binding.lifetime = guard;
             // Every address is deliberately inaccessible, but suitably aligned
             // and non-null. Export may copy it, never inspect its pointee.
@@ -600,9 +607,9 @@ namespace llaminar2::test
             };
             opaque_aliases(
                 binding.mapped_base_device, binding.layout, binding.participants,
-                binding.groups, binding.controller, binding.inference_epoch_record,
+                binding.groups, binding.logical_targets, binding.controller, binding.inference_epoch_record,
                 binding.command, binding.command_entries, binding.payload_bytes_per_layer,
-                binding.initial_owner_participants, binding.demand_history,
+                binding.initial_route_targets, binding.demand_history,
                 binding.economy, binding.economy_service_costs,
                 binding.economy_migration_costs, binding.economy_last_moved,
                 binding.local_group, binding.local_transport,

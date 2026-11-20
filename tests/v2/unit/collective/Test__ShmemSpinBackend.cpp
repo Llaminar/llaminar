@@ -39,18 +39,40 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#if defined(__x86_64__) || defined(__i386__)
 #include <immintrin.h>
+#endif
 #include <numeric>
 #include <sys/mman.h>
 #include <unistd.h>
 #include <vector>
 
+#include <bit>
 #include "collective/backends/ShmemSpinBackend.h"
 #include "collective/backends/UPIBackend.h"
 #include "collective/DeviceGroup.h"
 #include "collective/GlobalTPContext.h"
 #include "execution/moe/MoEOverlayJointRouteTarget.h"
 #include "execution/moe/MoEOverlaySharedDispatchSelection.h"
+
+/** @brief Hardware RNE float->half conversion used as the independent FP16 reference. */
+static inline uint16_t testFloatToHalfRNE(float value)
+{
+#if defined(__aarch64__)
+    return std::bit_cast<uint16_t>(static_cast<__fp16>(value));
+#else
+    return static_cast<uint16_t>(_cvtss_sh(value, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+#endif
+}
+/** @brief Exact half->float widening reference. */
+static inline float testHalfToFloat(uint16_t bits)
+{
+#if defined(__aarch64__)
+    return static_cast<float>(std::bit_cast<__fp16>(bits));
+#else
+    return _cvtsh_ss(bits);
+#endif
+}
 
 using namespace llaminar2;
 
@@ -179,7 +201,7 @@ namespace
 /** Public callers must not manufacture a replicated-count or transport override. */
 template<class Context>
 concept PublicReplicatedPrefillGather = requires(Context& context,
-    const CPUExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
+    const ExpertShardSourceSelection& source,const MoEOverlaySparseRows& packet,
     const std::shared_ptr<IGlobalTPContext>& owner,const float* local,float* root,
     size_t capacity,int root_index,size_t& gathered,const std::string& stage,
     std::span<RootedFloatRecordRange> ranges,CPURootedPublicationTransport& selected)
@@ -233,11 +255,11 @@ TEST(Test__ShmemSpinBackend, ReplicatedPrefillCohortSelectionIsDegreeIndependent
                 const auto lane=MoEOverlayJointRouteTarget::fromOriginalCohort(8,participant,9,4);
                 for(size_t route=0;route<live_routes+4u;++route)
                 {
-                    int word=MoEOverlayRouteTarget::cpuCohort(4).word();
+                    int word=MoEOverlayRouteTarget::cohort(4).word();
                     float weight=1.0f;
                     if(route==live_routes)weight=0.0f;
                     if(route==live_routes+1u)weight=-0.0f;
-                    if(route==live_routes+2u)word=MoEOverlayRouteTarget::cpuCohort(5).word();
+                    if(route==live_routes+2u)word=MoEOverlayRouteTarget::cohort(5).word();
                     if(route==live_routes+3u)word=MoEOverlayRouteTarget::whole(0).word();
                     int selected=-99;
                     ASSERT_TRUE(lane.resolve(3,word,&selected));
@@ -371,6 +393,26 @@ TEST(Test__ShmemSpinBackend, ReduceAVX512MatchesScalar)
     }
 }
 
+#if defined(__aarch64__) && defined(__ARM_NEON)
+TEST(Test__ShmemSpinBackend, ReduceNEONMatchesScalar)
+{
+    for (size_t count : {1u, 3u, 4u, 5u, 7u, 8u, 9u, 15u, 16u, 17u, 137u, 256u, 1024u, 8192u})
+    {
+        std::vector<float> a, b;
+        fillTestVectors(a, b, count);
+        std::vector<float> ref(count), neon_out(count);
+        ShmemSpinBackend::reduce_scalar(ref.data(), a.data(), b.data(), count);
+        ShmemSpinBackend::reduce_neon(neon_out.data(), a.data(), b.data(), count);
+        expectExactMatch(ref.data(), neon_out.data(), count,
+                         "NEON vs Scalar (count=" + std::to_string(count) + ")");
+        // In-place accumulation (out aliases a) is the production N-way use.
+        auto inplace = a;
+        ShmemSpinBackend::reduce_neon(inplace.data(), inplace.data(), b.data(), count);
+        expectExactMatch(ref.data(), inplace.data(), count, "NEON in-place");
+    }
+}
+#endif
+
 TEST(Test__ShmemSpinBackend, ReduceDispatchMatchesScalar)
 {
     // The runtime dispatcher should produce identical results to scalar
@@ -452,12 +494,12 @@ static void floatsToFP16(const std::vector<float> &src, std::vector<uint16_t> &d
     for (size_t i = 0; i < src.size(); ++i)
     {
         dst[i] = static_cast<uint16_t>(
-            _cvtss_sh(src[i], _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+            testFloatToHalfRNE(src[i]));
     }
 }
 
 // Helper: convert FP16 back to float for comparison
-static float fp16ToFloat(uint16_t h) { return _cvtsh_ss(h); }
+static float fp16ToFloat(uint16_t h) { return testHalfToFloat(h); }
 
 static void expectExactMatchU16(const uint16_t *ref, const uint16_t *test, size_t count,
                                 const std::string &label)
@@ -1628,8 +1670,7 @@ TEST_F(ShmemSpinMPITest, AllreduceFP16)
 {
     const size_t count = 2048;
     uint16_t val = static_cast<uint16_t>(
-        _cvtss_sh(static_cast<float>(rank_ + 1),
-                  _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        testFloatToHalfRNE(static_cast<float>(rank_ + 1)));
     std::vector<uint16_t> data(count, val);
 
     ASSERT_TRUE(backend_->allreduce(data.data(), count,
@@ -1640,16 +1681,15 @@ TEST_F(ShmemSpinMPITest, AllreduceFP16)
     // Start with rank 0 + rank 1, then accumulate remaining ranks
     uint16_t expected;
     {
-        uint16_t h0 = static_cast<uint16_t>(_cvtss_sh(1.0f, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-        uint16_t h1 = static_cast<uint16_t>(_cvtss_sh(2.0f, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-        float acc = _cvtsh_ss(h0) + _cvtsh_ss(h1);
-        expected = static_cast<uint16_t>(_cvtss_sh(acc, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        uint16_t h0 = static_cast<uint16_t>(testFloatToHalfRNE(1.0f));
+        uint16_t h1 = static_cast<uint16_t>(testFloatToHalfRNE(2.0f));
+        float acc = testHalfToFloat(h0) + testHalfToFloat(h1);
+        expected = static_cast<uint16_t>(testFloatToHalfRNE(acc));
         for (int r = 2; r < size_; ++r)
         {
-            uint16_t hr = static_cast<uint16_t>(_cvtss_sh(static_cast<float>(r + 1),
-                                                          _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-            acc = _cvtsh_ss(expected) + _cvtsh_ss(hr);
-            expected = static_cast<uint16_t>(_cvtss_sh(acc, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+            uint16_t hr = static_cast<uint16_t>(testFloatToHalfRNE(static_cast<float>(r + 1)));
+            acc = testHalfToFloat(expected) + testHalfToFloat(hr);
+            expected = static_cast<uint16_t>(testFloatToHalfRNE(acc));
         }
     }
 
@@ -1726,7 +1766,7 @@ TEST_F(ShmemSpinMPITest, AllreduceFP16OddCount)
     const size_t count = 137;
     float rank_val = static_cast<float>(rank_ + 1);
     uint16_t val = static_cast<uint16_t>(
-        _cvtss_sh(rank_val, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        testFloatToHalfRNE(rank_val));
     std::vector<uint16_t> data(count, val);
 
     ASSERT_TRUE(backend_->allreduce(data.data(), count,
@@ -1734,12 +1774,12 @@ TEST_F(ShmemSpinMPITest, AllreduceFP16OddCount)
                                     CollectiveOp::ALLREDUCE_SUM));
 
     // Compute expected via pairwise FP16 path
-    uint16_t expected = static_cast<uint16_t>(_cvtss_sh(1.0f, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+    uint16_t expected = static_cast<uint16_t>(testFloatToHalfRNE(1.0f));
     for (int r = 1; r < size_; ++r)
     {
-        uint16_t hr = static_cast<uint16_t>(_cvtss_sh(static_cast<float>(r + 1), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-        float acc = _cvtsh_ss(expected) + _cvtsh_ss(hr);
-        expected = static_cast<uint16_t>(_cvtss_sh(acc, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        uint16_t hr = static_cast<uint16_t>(testFloatToHalfRNE(static_cast<float>(r + 1)));
+        float acc = testHalfToFloat(expected) + testHalfToFloat(hr);
+        expected = static_cast<uint16_t>(testFloatToHalfRNE(acc));
     }
 
     for (size_t i = 0; i < count; ++i)
@@ -1802,7 +1842,7 @@ TEST_F(ShmemSpinMPITest, AllreduceFP16VaryingValues)
     {
         float val = static_cast<float>(rank_ * 100 + i) * 0.1f;
         data[i] = static_cast<uint16_t>(
-            _cvtss_sh(val, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+            testFloatToHalfRNE(val));
     }
 
     ASSERT_TRUE(backend_->allreduce(data.data(), count,
@@ -1813,17 +1853,15 @@ TEST_F(ShmemSpinMPITest, AllreduceFP16VaryingValues)
     {
         // Model exact pairwise FP16 arithmetic: FP16→FP32→add→FP16
         uint16_t h0 = static_cast<uint16_t>(
-            _cvtss_sh(static_cast<float>(i) * 0.1f,
-                      _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+            testFloatToHalfRNE(static_cast<float>(i) * 0.1f));
         uint16_t expected = h0;
         for (int r = 1; r < size_; ++r)
         {
             uint16_t hr = static_cast<uint16_t>(
-                _cvtss_sh(static_cast<float>(r * 100 + i) * 0.1f,
-                          _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
-            float sum = _cvtsh_ss(expected) + _cvtsh_ss(hr);
+                testFloatToHalfRNE(static_cast<float>(r * 100 + i) * 0.1f));
+            float sum = testHalfToFloat(expected) + testHalfToFloat(hr);
             expected = static_cast<uint16_t>(
-                _cvtss_sh(sum, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+                testFloatToHalfRNE(sum));
         }
         EXPECT_EQ(data[i], expected) << "FP16 varying mismatch at index " << i;
     }
@@ -1880,15 +1918,14 @@ TEST_F(ShmemSpinMPITest, AllreduceFP16SingleElement)
 {
     const size_t count = 1;
     uint16_t val = static_cast<uint16_t>(
-        _cvtss_sh(static_cast<float>(rank_ + 1),
-                  _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        testFloatToHalfRNE(static_cast<float>(rank_ + 1)));
     std::vector<uint16_t> data(count, val);
 
     ASSERT_TRUE(backend_->allreduce(data.data(), count,
                                     CollectiveDataType::FLOAT16,
                                     CollectiveOp::ALLREDUCE_SUM));
 
-    EXPECT_FLOAT_EQ(_cvtsh_ss(data[0]), rank_sum_);
+    EXPECT_FLOAT_EQ(testHalfToFloat(data[0]), rank_sum_);
 }
 
 TEST_F(ShmemSpinMPITest, AllreduceBF16SingleElement)
@@ -1917,8 +1954,7 @@ TEST_F(ShmemSpinMPITest, AllreduceFP16MaxCount)
     // Boundary: exactly one chunk verifies no buffer overrun.
     const size_t count = ShmemSpinArena::CHUNK_CAPACITY;
     uint16_t val = static_cast<uint16_t>(
-        _cvtss_sh(static_cast<float>(rank_ + 1),
-                  _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+        testFloatToHalfRNE(static_cast<float>(rank_ + 1)));
     std::vector<uint16_t> data(count, val);
 
     ASSERT_TRUE(backend_->allreduce(data.data(), count,
@@ -1927,9 +1963,9 @@ TEST_F(ShmemSpinMPITest, AllreduceFP16MaxCount)
 
     // rank_sum_ is exact in FP16 for small integers
     // Spot-check first, middle, last
-    EXPECT_FLOAT_EQ(_cvtsh_ss(data[0]), rank_sum_);
-    EXPECT_FLOAT_EQ(_cvtsh_ss(data[count / 2]), rank_sum_);
-    EXPECT_FLOAT_EQ(_cvtsh_ss(data[count - 1]), rank_sum_);
+    EXPECT_FLOAT_EQ(testHalfToFloat(data[0]), rank_sum_);
+    EXPECT_FLOAT_EQ(testHalfToFloat(data[count / 2]), rank_sum_);
+    EXPECT_FLOAT_EQ(testHalfToFloat(data[count - 1]), rank_sum_);
 }
 
 TEST_F(ShmemSpinMPITest, AllreduceBF16MaxCount)
@@ -1963,7 +1999,7 @@ TEST_F(ShmemSpinMPITest, AllreduceFP16Repeated)
     {
         float val = static_cast<float>(rank_ + 1);
         uint16_t fp16_val = static_cast<uint16_t>(
-            _cvtss_sh(val, _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC));
+            testFloatToHalfRNE(val));
         std::vector<uint16_t> data(count, fp16_val);
 
         ASSERT_TRUE(backend_->allreduce(data.data(), count,
@@ -1972,9 +2008,9 @@ TEST_F(ShmemSpinMPITest, AllreduceFP16Repeated)
             << "FP16 repeated failed at iteration " << iter;
 
         // rank_sum_ is exact in FP16 for small integers
-        EXPECT_FLOAT_EQ(_cvtsh_ss(data[0]), rank_sum_)
+        EXPECT_FLOAT_EQ(testHalfToFloat(data[0]), rank_sum_)
             << "FP16 repeated mismatch at iteration " << iter;
-        EXPECT_FLOAT_EQ(_cvtsh_ss(data[count - 1]), rank_sum_)
+        EXPECT_FLOAT_EQ(testHalfToFloat(data[count - 1]), rank_sum_)
             << "FP16 repeated last element at iter " << iter;
     }
 }

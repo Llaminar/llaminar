@@ -94,12 +94,7 @@ namespace llaminar2
         bool crossesWorldRank() const noexcept;
 
         /** @return Whether actual whole/cohort compute backends differ, without a representative member. */
-        bool crossesBackend() const noexcept
-        {
-            const auto from = source.shard_cohort ? DeviceType::CPU : source.device.type;
-            const auto to = destination.shard_cohort ? DeviceType::CPU : destination.device.type;
-            return from != to;
-        }
+        bool crossesBackend() const noexcept;
     };
 
     /**
@@ -206,14 +201,23 @@ namespace llaminar2
     [[nodiscard]] std::vector<MoEOverlayTierMigrationCycle> buildMoEOverlayMigrationCycles(
         std::vector<MoEOverlayTierMigration> &migrations);
 
+    /** @brief Distinguish a durable expert move from independent resident copies. */
+    enum class MoEOverlayShadowRequirementMode : uint8_t
+    {
+        DurablePlacement, ///< Each logical expert moves exactly once in the wave.
+        TransientCopy, ///< The same expert may arrive at distinct physical targets.
+    };
+
     /**
      * @brief Derive inactive physical fragment slots from the original destinations.
      * @param migrations Complete canonical movement wave.
+     * @param mode Whether expert identity is unique per wave or per physical destination.
      * @return Exact per-layer/tier/member shadow obligations, including every cohort member.
      * @throws std::logic_error For malformed physical placement targets.
      */
     [[nodiscard]] std::vector<MoEOverlayTierShadowRequirement> buildMoEOverlayShadowRequirements(
-        const std::vector<MoEOverlayTierMigration> &migrations);
+        const std::vector<MoEOverlayTierMigration> &migrations,
+        MoEOverlayShadowRequirementMode mode = MoEOverlayShadowRequirementMode::DurablePlacement);
 
     /**
      * @brief Measured cost of moving one complete expert between endpoints.
@@ -383,7 +387,7 @@ namespace llaminar2
     };
 
     /** @brief Physical ownership representation; joint fragments never have a scalar whole owner. */
-    enum class MoEOverlayResidencyOwnershipKind { WholeExperts, CPUJointFragments };
+    enum class MoEOverlayResidencyOwnershipKind { WholeExperts, JointFragments };
 
     /** @brief Immutable placement state consumed by one or more dispatch tickets. */
     struct MoEOverlayResidencySnapshot
@@ -420,14 +424,14 @@ namespace llaminar2
         friend struct MoEOverlayResidencyTransaction;
         /** @brief Sealed source and current placement; only the authority can construct this arm.
          */
-        struct CPUJointDefinition {
+        struct JointDefinition {
             std::shared_ptr<const MoERoutedExpertPlacementPlan> source_plan;
             std::shared_ptr<const MoEExpertOverlayPreparationPlan> preparation;
             uint64_t epoch;
             std::shared_ptr<const MoERoutedExpertPlacementPlan> live_plan;
             std::shared_ptr<const MoEExpertOwnerMap> live_owners;
         };
-        std::optional<CPUJointDefinition> joint_; ///< No public scalar field can manufacture fragment ownership.
+        std::optional<JointDefinition> joint_; ///< No public scalar field can manufacture fragment ownership.
     };
 
     /** @brief Typed intent separating publishable placement from calibration. */
@@ -494,7 +498,7 @@ namespace llaminar2
      * @brief One dense root-authored candidate coordinate for distributed use.
      *
      * Every model `(layer, expert)` coordinate names its candidate tier and
-     * typed whole participant or complete original fixed CPU cohort. The target
+     * typed whole participant or complete original fixed CPU/GPU cohort. The target
      * word grants no membership/readiness authority; reconstruction resolves it
      * against the retained original source on every coordinate. Changed entries retain the
      * exact execution metadata used by migration staging.  Unchanged entries
@@ -1068,7 +1072,7 @@ namespace llaminar2
              */
             MoERoutedExpertPlacementPlan initial_plan;
             MoERoutedExpertModelMetadata model_metadata;
-            /** Original closed source preparation; required for static CPU joint fragments only. */
+            /** Original closed source preparation, required for joint CPU/GPU fragments. */
             std::shared_ptr<const MoEExpertOverlayPreparationPlan> projection_preparation;
             /**
              * Durable maintenance intent, independent of epoch-one placement.
@@ -1694,7 +1698,7 @@ namespace llaminar2
          * membership/cuts.
          * @note This private producer does not enable Static maintenance or bypass physical fanout.
          */
-        std::shared_ptr<const MoEOverlayResidencySnapshot> prepareCPUJointPlacementCandidate(
+        std::shared_ptr<const MoEOverlayResidencySnapshot> prepareJointPlacementCandidate(
             const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
             uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements,
             std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes = {}) const;
@@ -1704,14 +1708,14 @@ namespace llaminar2
          * @param expected_live Exact current publication retained by the transition caller.
          * @param expected_epoch Current publication epoch, never an unpublished candidate.
          * @param placements Complete tier assignments with unchanged per-member capacities.
-         * @param whole_owner_changes Checked whole-owner corrections, never CPU cohort members.
+         * @param whole_owner_changes Checked whole-owner corrections, never cohort members.
          * @return Source-authenticated placement transaction with complete cycles and shadows.
          * @throws std::logic_error For a stale source, invalid transaction or changed capacity.
          * @throws std::invalid_argument For foreign topology, source geometry or fixed cuts.
          * @note This construction grants neither physical readiness nor runtime publication;
          * the existing maintenance and execution qualification guards remain authoritative.
          */
-        MoEOverlayResidencyTransaction prepareCPUJointPlacementTransaction(
+        MoEOverlayResidencyTransaction prepareJointPlacementTransaction(
             const std::shared_ptr<const MoEOverlayResidencySnapshot> &expected_live,
             uint64_t expected_epoch, std::vector<RoutedExpertLayerPlacement> placements,
             std::span<const MoELayeredExpertOwnershipChange> whole_owner_changes = {}) const;

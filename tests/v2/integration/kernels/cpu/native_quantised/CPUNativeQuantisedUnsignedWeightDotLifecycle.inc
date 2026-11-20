@@ -75,6 +75,8 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedCoefficientDomainContract)
         EXPECT_FALSE(metadata.usesNibbleLUT());
     }
 #endif
+#if defined(__AVX2__)
+    // addOrderedAVX2/AVX512 are x86 instruction-order helpers.
     // The original serial witness retains the earlier K payload. Exercise
     // the actual ordinary add on each selected runtime ISA, not a NaN-aware
     // oracle path. Integer bit construction never quiets a signaling input.
@@ -107,6 +109,7 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedCoefficientDomainContract)
         }
 #endif
     }
+#endif
     CPUNativeQuantisedPackedWeights packed;
     packed.encoding = CPUNativeQuantisedEncoding::ExpandedInt8;
     packed.is_asymmetric = true;
@@ -310,7 +313,18 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                 const size_t extent = size_t(max_rows) * stride + 17;
                 std::vector<Q8_1Block> input(size_t(max_rows) * packed.blocks_per_row);
                 std::array<std::vector<float>, 2> output, expected;
-                for (int bank = 0; bank < 2; ++bank)
+#if defined(__aarch64__)
+                // ARM kernels borrow only the resident publication; a deferred
+                // workspace pointer carries no bounded lease and is rejected.
+                {
+                    UnsignedDotBankScope binding(packed, workspace.data());
+                    EXPECT_THROW((void)packed.readView(), std::logic_error);
+                }
+                constexpr int bank_count = 1;
+#else
+                constexpr int bank_count = 2;
+#endif
+                for (int bank = 0; bank < bank_count; ++bank)
                 {
                     SCOPED_TRACE(bank);
                     UnsignedDotBankScope binding(packed, bank == 0 ? nullptr : workspace.data());
@@ -390,6 +404,8 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                             }
                             const auto plan = planNativeQuantisedFusedRows(
                                 descriptors, max_rows, workers, ISAPath::AUTO);
+#if !defined(__aarch64__)
+                            // x86 planner K-partition/row-tile identity; ARM tiles are full-K.
                             if (source_identity_nibble &&
                                 policy == CPUProjectionNumericalPolicy::GPUAlignedExpert && rows > 1)
                             {
@@ -397,6 +413,7 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
                                 EXPECT_EQ(plan.projections[0].effective_verifier_schedule, VerifierRowsPolicy::Pairwise);
                                 EXPECT_EQ(plan.projections[0].verifier_resolution.physical_row_tile, 2);
                             }
+#endif
                             NativeQuantisedTestPartialStorage partials(plan.sharedPartialFloats());
                             ASSERT_TRUE(gemm_native_quantised_fused_verifier_rows_preq(
                                 input.data(), descriptors.data(), partials.span(), 2,
@@ -560,7 +577,8 @@ TEST(CPUNativeQuantisedFusedCompletion, UnsignedWeightDotAllFormatByteLifecycle)
         }
     }
 }
-/** @test Exact integer half-block merging preserves original serial bytes and retained scheduler ownership. */
+#if !defined(__aarch64__)
+/** @test Exact x86 integer half-block merging preserves serial bytes and retained scheduler ownership. */
 TEST(CPUNativeQuantisedFusedCompletion, OrderedNibbleSplitDotBoundaryLifecycle)
 {
     using namespace cpu::native_quantised;
@@ -665,6 +683,7 @@ TEST(CPUNativeQuantisedFusedCompletion, OrderedNibbleSplitDotBoundaryLifecycle)
     }
     EXPECT_EQ(nibble_sources, 5); // Original canonical Q4_0/Q4_1/Q4_K/IQ4_NL/IQ4_XS factories.
 }
+#endif // !defined(__aarch64__)
 
 } // namespace
 } // namespace llaminar2::test

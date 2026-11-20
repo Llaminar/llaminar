@@ -58,10 +58,12 @@ namespace llaminar2
         Apportioned,
 
         /**
-         * Every participant owns a tensor shard of every routed expert.  All
-         * participants compute each selected expert and reduce its partial down
-         * projection.  This is routed-expert tensor parallelism, not whole-expert
-         * apportionment.
+         * Every participant owns matching intermediate-F slices: gate/up output
+         * rows and down input columns. All participants compute each selected
+         * expert, retain its intermediate locally, and reduce partial down
+         * outputs. Unequal source-aligned F intervals are legal. This physical
+         * policy is separate from combining routed/shared partials before that
+         * reduction and from selecting a native collective algorithm.
          */
         TensorSharded,
 
@@ -207,6 +209,9 @@ namespace llaminar2
 
         /** Every participant executes every selected row from its full replica. */
         FullyReplicatedLocal,
+
+        /** Every original cohort member executes its local F fragment; outputs require the declared cohort reduction. */
+        IntermediateShardLocal,
     };
 
     /**
@@ -520,6 +525,8 @@ namespace llaminar2
             return "participant-assigned";
         case RoutedExpertRowExecutionPolicy::FullyReplicatedLocal:
             return "fully-replicated-local";
+        case RoutedExpertRowExecutionPolicy::IntermediateShardLocal:
+            return "intermediate-shard-local";
         }
         return "unknown";
     }

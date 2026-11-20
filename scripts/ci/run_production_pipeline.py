@@ -137,15 +137,17 @@ def run(command: list[str], log: Path, **kwargs) -> None:
     if handle_signals:
         signal.signal(signal.SIGTERM, interrupt_for_cancellation)
     try:
-        with log.open("a") as stream:
+        # Concurrent ranks can interleave bytes within a UTF-8 character. The
+        # artifact retains original output, and only console messages need decoding.
+        with log.open("ab") as stream:
             with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                  text=True, start_new_session=True, **kwargs) as process:
+                                  start_new_session=True, **kwargs) as process:
                 try:
                     for line in process.stdout:
                         stream.write(line)
                         stream.flush()
-                        if line.startswith(("[production-", "[model-parity-")):
-                            print(line, end="", flush=True)
+                        if line.startswith((b"[production-", b"[model-parity-")):
+                            print(line.decode("utf-8", errors="replace"), end="", flush=True)
                     code = process.wait()
                     if code:
                         raise subprocess.CalledProcessError(code, command)

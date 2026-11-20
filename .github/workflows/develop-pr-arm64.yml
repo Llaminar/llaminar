@@ -1,0 +1,119 @@
+# @file develop-pr-arm64.yml
+# @brief Build native Linux ARM64 Llaminar and run its model-free PR test scope.
+name: Develop PR — ARM64
+
+on:
+  pull_request:
+    branches: [develop]
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: develop-pr-arm64-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  arm64:
+    name: ARM64 build and Unit + host
+    if: ${{ !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: false
+          lfs: false
+          persist-credentials: false
+      - uses: docker/setup-buildx-action@v4
+        with:
+          version: v0.38.1
+          driver: docker-container
+          driver-opts: |
+            image=moby/buildkit@sha256:c5f8862f52499773af85bc07695b2379ef08e8002352b0df2c4864c91d78dabe
+          cache-binary: false
+      - uses: ./.github/actions/cache-develop-toolchain
+        id: toolchain
+        with:
+          cpu-isa: NEON
+      - name: Prepare the native image build
+        id: build
+        shell: bash
+        env:
+          TOOLCHAIN_CONTEXT: ${{ steps.toolchain.outputs.neon-context }}
+        run: |
+          test "$(uname -m)" = aarch64
+          : "${TOOLCHAIN_CONTEXT:?missing admitted NEON toolchain}"
+          mkdir -p "$RUNNER_TEMP/llaminar-arm64-evidence"
+          {
+            echo 'args<<BUILD_ARGS'
+            echo "VCS_REF=$(git rev-parse HEAD)"
+            echo "LLAMINAR_SOURCE_TREE=$(git rev-parse HEAD^{tree})"
+            echo 'LLAMINAR_CPU_ISA=NEON'
+            echo 'LLAMINAR_ENABLE_CUDA=ON'
+            echo 'LLAMINAR_ENABLE_ROCM=OFF'
+            echo 'LLAMINAR_CUDA_ARCHS=121'
+            echo 'LLAMINAR_SKIP_INTEGRATION=0'
+            echo 'LLAMINAR_BUILD_MODEL_PARITY_MATRICES=OFF'
+            echo 'LLAMINAR_TEST_RUNNER_INVENTORY=arm64-pr'
+            echo "LLAMINAR_TEST_UID=$(id -u)"
+            echo "LLAMINAR_TEST_GID=$(id -g)"
+            echo BUILD_ARGS
+          } >> "$GITHUB_OUTPUT"
+      - name: Build the sealed ARM64 test-runner
+        uses: docker/build-push-action@v7
+        env:
+          DOCKER_BUILD_RECORD_UPLOAD: "false"
+        with:
+          context: .
+          platforms: linux/arm64
+          target: test-runner
+          build-args: ${{ steps.build.outputs.args }}
+          build-contexts: ${{ steps.toolchain.outputs.neon-context }}
+          tags: llaminar-arm64-test-runner:pr
+          load: true
+          cache-from: |
+            type=gha,scope=llaminar-build-neon-pr,version=2
+            type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }}
+          cache-to: type=gha,scope=llaminar-build-neon-pr,mode=max,version=2,ignore-error=true
+      - name: Export the sibling Release runtime from the same builder
+        shell: bash
+        env:
+          BUILD_ARGS: ${{ steps.build.outputs.args }}
+          TOOLCHAIN_CONTEXT: ${{ steps.toolchain.outputs.neon-context }}
+        run: |
+          args=()
+          while IFS= read -r arg; do
+            args+=(--build-arg "$arg")
+          done <<< "$BUILD_ARGS"
+          docker buildx build "${args[@]}" --build-context "${TOOLCHAIN_CONTEXT:?}" \
+            --platform linux/arm64 --progress plain --load --target runtime \
+            --tag llaminar-arm64-runtime:pr . 2>&1 \
+            | tee "$RUNNER_TEMP/llaminar-arm64-evidence/build-runtime.log"
+      - name: Smoke-test the ARM64 CUDA runtime
+        shell: bash
+        run: |
+          docker run --rm --entrypoint /usr/local/bin/llaminar2 \
+            llaminar-arm64-runtime:pr --help
+      - name: Run ARM64 Unit and host preflight
+        shell: bash
+        run: |
+          image="$(docker image inspect --format '{{.Id}}' llaminar-arm64-test-runner:pr)"
+          docker run --rm --user "$(id -u):$(id -g)" --ulimit core=0:0 \
+            --network host --ipc private --shm-size=1g \
+            --cap-add=SYS_NICE --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+            --env LLAMINAR_FORCE_CPU_ONLY_STARTUP=1 \
+            --mount "type=bind,source=$RUNNER_TEMP/llaminar-arm64-evidence,target=/evidence" \
+            "$image" python3 scripts/ci/run_develop_pr_tests.py --arm64 \
+              --build-dir build_v2_integration --installed-build-receipt /src/installed-tests.json \
+              --output /evidence/tests
+      - name: Retain ARM64 build and test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: develop-pr-arm64-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/llaminar-arm64-evidence/
+            ${{ runner.temp }}/llaminar-toolchains/neon-toolchain.json
+          retention-days: 30

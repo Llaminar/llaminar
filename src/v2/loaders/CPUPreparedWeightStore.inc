@@ -30,8 +30,8 @@ std::unique_ptr<PreparedWeightStore::CPUPreparation> PreparedWeightStore::beginC
         throw std::invalid_argument("CPU source preparation requires exact unmaterialized original model/PMA binding");
     if(original.native_source && (original.native_source->original!=source.original || original.native_source->range!=source.range || original.native_source->matrix_count!=source.matrix_count || original.native_source->assembly!=source.assembly))
         throw std::invalid_argument("CPU source preparation changed its original native projection");
-    if(original.cpu_joint_source) {
-        const auto& selection=*original.cpu_joint_source;
+    if(original.joint_source) {
+        const auto& selection=*original.joint_source;
         if(!original.projection_ownership || selection.ownership()!=*original.projection_ownership ||
            !selection.contains(original.identity.expert) || selection.layer()!=original.identity.layer ||
            node!=CPUStoragePlacement::onNode(selection.participant().address.numa_node) ||

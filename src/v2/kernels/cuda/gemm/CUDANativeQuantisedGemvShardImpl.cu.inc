@@ -42,6 +42,7 @@
 #include "kernels/common/DeviceRowRange.h"
 #include "backends/BackendManager.h"
 #include "backends/cuda/CUDAHardwareMetadata.h"
+#include "CUDANativeQuantisedArchitecture.h"
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 #include "utils/PrefillGraphBucketDefaults.h"
@@ -159,6 +160,7 @@ extern "C"
 
     /** Resolve source-codebook grouped row reuse through its policy shard. */
     bool cudaNativeQuantisedGemvTuned_resolveGroupedArithmeticPolicy(
+        const llaminar2::native_quantised::NativeQuantisedArchitecture &architecture,
         uint8_t codebook_id,
         int graph_captured,
         int m,
@@ -476,6 +478,7 @@ namespace
      */
     template <uint8_t CB>
     bool selectCachedGeneratedGroupedTuning(
+        const llaminar2::native_quantised::NativeQuantisedArchitecture &architecture,
         bool graph_captured,
         int m,
         int n,
@@ -483,17 +486,20 @@ namespace
         GeneratedGroupedTuning &tuning)
     {
         const int policy_n = serialEquivalentPolicyN(n);
-        const CUDAGeneratedDispatchCacheKey key = {
+        if (architecture != llaminar2::native_quantised::NativeQuantisedArchitecture::cuda(8, 6))
+            return false;
+        using GroupedKey = std::array<uint64_t, 8>;
+        const auto isa = architecture.scalars();
+        const GroupedKey key = {
             graph_captured ? 1ULL : 0ULL,
             static_cast<uint64_t>(static_cast<uint32_t>(m)),
             static_cast<uint64_t>(static_cast<uint32_t>(policy_n)),
             static_cast<uint64_t>(static_cast<uint32_t>(k)),
+            isa[0], isa[1], isa[2], isa[3],
         };
         using Cache = llaminar2::native_quantised::FixedDispatchCache<
-            CUDAGeneratedDispatchCacheKey,
-            GeneratedGroupedTuning,
-            64,
-            llaminar2::native_quantised::DispatchCacheArrayHasher<4>>;
+            GroupedKey, GeneratedGroupedTuning, 64,
+            llaminar2::native_quantised::DispatchCacheArrayHasher<8>>;
         static thread_local Cache cache;
 
         bool selected = false;
@@ -514,6 +520,7 @@ namespace
     /** Resolve grouped row reuse from source arithmetic identity. */
     template <uint8_t ExecutionCodebook>
     bool selectCachedGeneratedGroupedTuningForPolicy(
+        const llaminar2::native_quantised::NativeQuantisedArchitecture &architecture,
         uint8_t policy_codebook,
         bool graph_captured,
         int m,
@@ -524,7 +531,7 @@ namespace
         if (policy_codebook == trainedPolicyCodebook<ExecutionCodebook>())
         {
             return selectCachedGeneratedGroupedTuning<ExecutionCodebook>(
-                graph_captured, m, n, k, tuning);
+                architecture, graph_captured, m, n, k, tuning);
         }
 
         if constexpr (
@@ -534,7 +541,7 @@ namespace
         {
             int kernel = 0;
             if (!cudaNativeQuantisedGemvTuned_resolveGroupedArithmeticPolicy(
-                    policy_codebook,
+                    architecture, policy_codebook,
                     graph_captured ? 1 : 0,
                     m,
                     n,
@@ -558,6 +565,7 @@ namespace
 
     /** Runtime adapter for the grouped policy query exported by each shard. */
     bool queryCachedGeneratedGroupedTuning(
+        const llaminar2::native_quantised::NativeQuantisedArchitecture &architecture,
         uint8_t codebook_id,
         bool graph_captured,
         int m,
@@ -568,7 +576,7 @@ namespace
 #define LLAMINAR_QUERY_CUDA_NATIVE_QUANTISED_GROUPED_CODEBOOK(CODEBOOK)            \
         case CODEBOOK:                                                  \
             return selectCachedGeneratedGroupedTuning<CODEBOOK>(        \
-                graph_captured, m, n, k, tuning)
+                architecture, graph_captured, m, n, k, tuning)
         switch (codebook_id)
         {
             LLAMINAR_CUDA_NATIVE_QUANTISED_GEMV_FOR_EACH_CODEBOOK(
@@ -961,7 +969,8 @@ namespace
         bool verifier_serial_m1,
         CUDAGemvContext_ *gemv_ctx,
         int grouped_rows = 0,
-        int policy_graph_captured = -1)
+        int policy_graph_captured = -1,
+        const char *verifier_table = "not-applicable")
     {
         if (!llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
             return;
@@ -1002,6 +1011,7 @@ namespace
                       : policy_graph_captured != 0)
                      ? "graph_captured"
                      : "eager"},
+                {"verifier_dispatch_table", verifier_table},
                 {"semantic_contract", verifier_serial_m1
                                              ? "verifier_serial_m1_bitwise"
                                              : "fast"},
@@ -1031,7 +1041,8 @@ namespace
         int K,
         int effective_kb,
         int cuda_device_id,
-        bool graph_captured)
+        bool graph_captured,
+        const char *verifier_table)
     {
         if (!llaminar2::PerfStatsCollector::isDomainEnabled("kernel"))
             return;
@@ -1053,6 +1064,7 @@ namespace
                 {"execution_mode", graph_captured
                                        ? "graph_captured"
                                        : "eager"},
+                {"verifier_dispatch_table", verifier_table},
                 {"semantic_contract", "verifier_serial_m1_bitwise"},
                 {"effective_candidate_id",
                  "cuda.native_quantised.decode.verifier.tensor_core_mma16"},
@@ -3405,10 +3417,12 @@ namespace
         GeneratedDispatchTuning tuning{};
         int grouped_rows = 0;
         bool grouped_tensor_core = false;
+        const char *verifier_table = "not-applicable";
         const bool decode_equivalent_m1 = decodeEquivalentM1ConfigActive();
 
         if (g_sweep.active)
         {
+            if (decode_equivalent_m1) verifier_table = "diagnostic";
             /**
              * The generated-dispatch trainer drives this path for verifier
              * runtime-M buckets. Keep the sweep override local to backend
@@ -3489,50 +3503,62 @@ namespace
             if (decode_equivalent_m1)
             {
                 /*
-                 * Row reuse is a separately learned economy axis. It cannot
-                 * alter the public-M1 family, output tile, or exact K
-                 * partition selected above. A production artifact without a
-                 * total grouped policy is incomplete and must remain a hard
-                 * miss instead of silently reverting to the historical
-                 * two-row schedule.
+                 * Row reuse changes launch economy while preserving the
+                 * public-M1 family, output tile and exact K partitions
+                 * selected above. The actual GPU admits either its measured
+                 * SM86 schedule or the portable grouped schedule. A missing
+                 * entry in the selected measured table remains a hard error.
                  */
                 if (g_grouped_tensor_core_override)
                 {
+                    verifier_table = "diagnostic";
                     grouped_tensor_core = true;
                 }
                 else if (g_grouped_rows_override > 0)
                 {
                     /* Trainer-only candidate forcing; M1 arithmetic remains generated. */
+                    verifier_table = "diagnostic";
                     grouped_rows = g_grouped_rows_override;
                 }
                 else
                 {
-#if defined(LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2)
-                    GeneratedGroupedTuning grouped_tuning{};
-                    if (!selectCachedGeneratedGroupedTuningForPolicy<CB>(
-                            arithmetic_policy_codebook_id,
-                            dispatch_policy_graph_captured,
-                            M,
-                            N,
-                            K,
-                            grouped_tuning))
-                        return false;
-                    switch (grouped_tuning.kernel)
+                    using llaminar2::native_quantised::VerifierDispatchTable;
+                    const auto hardware = llaminar2::cuda::nativeQuantisedHardwareForDevice(cuda_device_id);
+                    const auto table = llaminar2::native_quantised::selectVerifierDispatchTable(hardware);
+                    verifier_table = llaminar2::native_quantised::verifierDispatchTableName(table);
+                    if (table == VerifierDispatchTable::Portable)
                     {
-                    case GeneratedGroupedKernel::Dp4aRows:
-                        grouped_rows = grouped_tuning.grouped_rows;
-                        if (grouped_rows <= 0)
-                            return false;
-                        break;
-                    case GeneratedGroupedKernel::TensorCoreMma16:
-                        grouped_tensor_core = true;
-                        break;
-                    default:
-                        return false;
+                        grouped_rows = llaminar2::cuda::portableGroupedVerifierRows;
                     }
+                    else
+                    {
+#if defined(LLAMINAR_CUDA_GROUPED_DISPATCH_POLICY_V2)
+                        GeneratedGroupedTuning grouped_tuning{};
+                        if (!selectCachedGeneratedGroupedTuningForPolicy<CB>(
+                                hardware.architecture, arithmetic_policy_codebook_id,
+                                dispatch_policy_graph_captured,
+                                M,
+                                N,
+                                K,
+                                grouped_tuning))
+                            return false;
+                        switch (grouped_tuning.kernel)
+                        {
+                        case GeneratedGroupedKernel::Dp4aRows:
+                            grouped_rows = grouped_tuning.grouped_rows;
+                            if (grouped_rows <= 0)
+                                return false;
+                            break;
+                        case GeneratedGroupedKernel::TensorCoreMma16:
+                            grouped_tensor_core = true;
+                            break;
+                        default:
+                            return false;
+                        }
 #else
-                    return false;
+                        return false;
 #endif
+                    }
                 }
             }
         }
@@ -3570,7 +3596,8 @@ namespace
                 K,
                 g_last_effective_kb,
                 cuda_device_id,
-                graph_captured);
+                graph_captured,
+                verifier_table);
             return true;
         }
         recordGemvDispatch<CB>(
@@ -3588,7 +3615,8 @@ namespace
             grouped_rows,
             decode_equivalent_m1
                 ? (kCanonicalDecodePolicyGraphCaptured ? 1 : 0)
-                : (graph_captured ? 1 : 0));
+                : (graph_captured ? 1 : 0),
+            verifier_table);
         if (shape == NativeGemvShape::WIDE || shape == NativeGemvShape::DIRECT)
         {
             if (!decode_equivalent_m1)
@@ -3964,6 +3992,7 @@ extern "C"
 
     /** Export the source policy's independently trained grouped-row choice. */
     bool cudaNativeQuantisedGemvTuned_queryGeneratedGroupedDispatch(
+        const llaminar2::native_quantised::NativeQuantisedArchitecture &architecture,
         uint8_t codebook_id,
         int graph_captured,
         int m,
@@ -3977,7 +4006,7 @@ extern "C"
             return false;
         GeneratedGroupedTuning tuning{};
         if (!queryCachedGeneratedGroupedTuning(
-                codebook_id,
+                architecture, codebook_id,
                 graph_captured != 0,
                 m,
                 n,
@@ -3990,6 +4019,7 @@ extern "C"
         *grouped_rows = tuning.grouped_rows;
         return true;
 #else
+        (void)architecture;
         (void)codebook_id;
         (void)graph_captured;
         (void)m;

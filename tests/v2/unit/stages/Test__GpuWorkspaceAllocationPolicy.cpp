@@ -100,6 +100,7 @@ namespace
             "cudaFree(",
             "cudaFreeAsync(",
             "hipMalloc(",
+            "hipExtMallocWithFlags(",
             "hipMallocAsync(",
             "hipFree(",
             "hipFreeAsync(",
@@ -121,6 +122,7 @@ namespace
             "cudaFree(",
             "cudaFreeAsync(",
             "hipMalloc(",
+            "hipExtMallocWithFlags(",
             "hipMallocAsync(",
             "hipFree(",
             "hipFreeAsync(",
@@ -394,6 +396,23 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RawGpuMallocCallsStayInSanctionedSource
         const auto source = readFile(entry.path());
         if (!hasRawGpuAllocationCall(source))
             continue;
+        if (relative == "src/v2/collective/backends/ROCmPeerPushResources.cpp")
+        {
+            // The original collective owns both admitted allocations until
+            // its captured consumers retire. Reject any other raw operation.
+            auto remaining = removeAsciiWhitespace(stripCommentsAndStringLiterals(source));
+            for (const std::string call : {
+                     "hipExtMallocWithFlags(&owner->slab_,owner->slab_lease_.bytes(),hipDeviceMallocUncached)",
+                     "hipMalloc(&owner->table_,owner->table_lease_.bytes())",
+                     "hipFree(table_)", "hipFree(slab_)"})
+            {
+                const auto position = remaining.find(call);
+                ASSERT_NE(position, std::string::npos) << call;
+                remaining.erase(position, call.size());
+            }
+            EXPECT_FALSE(hasRawGpuAllocationCall(remaining));
+            continue;
+        }
         if (sanctioned.find(relative) == sanctioned.end())
             failures.push_back(relative);
     }
@@ -1160,7 +1179,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, RuntimePrefillDescriptorsUseRetainedGra
     const auto rocm_runtime_execution = sliceBetween(
         rocm_source,
         "bool ROCmMoEKernel::executeGroupedPrefillProjectionFromPublishedRuntimePlan(",
-        "\n} // namespace llaminar2");
+        "bool ROCmMoEKernel::reduceCanonicalRouteContributions(");
 
     for (const auto &[backend, execution] : {
              std::pair{"CUDA", &cuda_runtime_execution},
@@ -1378,17 +1397,21 @@ TEST(Test__GpuWorkspaceAllocationPolicy,
             "constbooldeclaration_only=purpose==ShiftedMTPPrefillGraphBinding::Purpose::WorkspaceFamilyDeclaration;"),
         std::string::npos)
         << "Shifted-KV topology needs an explicit declaration-only lifecycle.";
+    // The shifted-KV declaration is wired through the typed transaction-binding
+    // gate: declaration_only selects a WorkspaceDeclaration submission, and
+    // requiresMTPGraphTransactionBinding admits it only when the runner retains
+    // MTP graph capacity. A retained-capacity MTPOff runner therefore still
+    // declares the same shifted-KV workspace participant as an enabled runner.
     EXPECT_NE(
         shifted_prefill_binding.find(
-            "declaration_only?ForwardGraphSubmissionIntent::WorkspaceDeclaration:"),
+            "declaration_only?ForwardGraphSubmissionIntent::WorkspaceDeclaration"),
         std::string::npos)
-        << "Workspace declaration must retain its typed submission intent independently of execution.";
+        << "A declaration-only shifted-KV binding must route through WorkspaceDeclaration.";
     EXPECT_NE(
         shifted_prefill_binding.find(
-            "requiresMTPGraphTransactionBinding(graph_builder_->config().mtp.enabled,"
-            "retainsMTPGraphCapacity(graph_builder_->config().mtp),transaction_submission)"),
+            "requiresMTPGraphTransactionBinding(graph_builder_->config().mtp.enabled,retainsMTPGraphCapacity(graph_builder_->config().mtp),transaction_submission)"),
         std::string::npos)
-        << "An MTPOff runner retaining capacity must declare the same shifted-KV workspace participant as an enabled runner.";
+        << "The shifted-KV binding must consult the typed MTP transaction-binding gate.";
 }
 
 /**
@@ -1518,8 +1541,10 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUStreamPresenceUsesTypedStageContract
         if (!entry.is_regular_file())
             continue;
         const auto extension = entry.path().extension().string();
+        // Physical-shard bodies (*.cu.inc) are CUDA translation-unit code.
         if (extension != ".cpp" && extension != ".h" &&
-            extension != ".cu" && extension != ".hip")
+            extension != ".cu" && extension != ".hip" &&
+            !entry.path().filename().string().ends_with(".cu.inc"))
         {
             continue;
         }
@@ -3117,9 +3142,11 @@ TEST(Test__GpuWorkspaceAllocationPolicy, MTPShiftedKVAsyncHandoffUsesEventBefore
                   "transaction.state->cachedTokensForDepth(/*depth=*/0)"),
               std::string::npos)
         << "Device-target shifted commits must source positions from the canonical transaction count.";
-    EXPECT_NE(device_target_body.find("/*device_position_offset=*/1"),
+    EXPECT_NE(device_target_body.find("mtpShiftedPrefixOffset(graph_builder_->config().mtpShiftedCacheOrigin())"),
+              std::string::npos);
+    EXPECT_NE(device_target_body.find("/*device_position_offset=*/shifted_position_offset"),
               std::string::npos)
-        << "The shifted-cache position transform must be composed on device.";
+        << "The device position must use the exact model's shifted-cache origin.";
     const auto host_resolved_target_publication_body = sliceBetween(
         source,
         "bool DeviceGraphOrchestrator::stageStochasticTargetTokenForDeviceSampling(",
@@ -12303,7 +12330,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, AttentionDeviceParamsCanDeriveFromDevic
     const auto cuda_source =
         readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernelT.h") +
         readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernelT.cpp") +
-        readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu");
+        readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionShardImpl.cu.inc");
     const auto rocm_source =
         readFile(repoRoot() / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.h") +
         readFile(repoRoot() / "src/v2/kernels/rocm/attention/ROCmFlashAttentionKernelT.cpp") +
@@ -13272,7 +13299,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUHybridRecurrentStateHasNoHostMirror)
 TEST(Test__GpuWorkspaceAllocationPolicy, CUDANativeQuantisedWorkspaceCriticalFilesHaveNoRawAllocations)
 {
     const std::vector<std::filesystem::path> files = {
-        "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillKernels.cu",
+        "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillShardImpl.cu.inc",
+        "src/v2/kernels/cuda/gemm/CUDANativeQuantisedPrefillDispatch.cu",
         "src/v2/kernels/cuda/gemm/CUDANativeQuantisedDecodeCommon.cuh",
     };
 
@@ -14051,7 +14079,7 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUFlashAttentionDecodeStateIsWorkspace
         << "The CUDA graph-visible attention params must remain workspace-backed.";
 
     const auto cuda_kernel_source =
-        readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu");
+        readFile(repoRoot() / "src/v2/kernels/cuda/attention/CUDAFlashAttentionShardImpl.cu.inc");
     expectNoRawGpuAllocationCalls(cuda_kernel_source, "CUDAFlashAttention kernel wrappers");
     EXPECT_NE(cuda_kernel_source.find("cuda_write_attention_params_from_geometry_kernel"),
               std::string::npos)
@@ -14850,7 +14878,8 @@ TEST(Test__GpuWorkspaceAllocationPolicy, GPUKernelsCannotOwnTensorPlacement)
             const auto extension = entry.path().extension().string();
             if (extension != ".cpp" && extension != ".cu" &&
                 extension != ".hip" && extension != ".h" &&
-                extension != ".cuh")
+                extension != ".cuh" &&
+                !entry.path().filename().string().ends_with(".cu.inc"))
             {
                 continue;
             }

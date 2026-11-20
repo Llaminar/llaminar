@@ -6,8 +6,8 @@
  * builders, compute stages and migration share one family/geometry validator.
  * Whole experts require all three projections. Projection-partitioned domains
  * publish an explicitly typed movable gate/up pair and keep fixed down slices
- * outside that placement lifecycle. Static within-expert F geometry is not a
- * complete movable pair and rejects before querying any prepared engine.
+ * outside that placement lifecycle. Intermediate shards publish an explicit
+ * partial-output contract and never pass complete-expert or gate/up readiness.
  * Rejection never partially mutates a bank.
  */
 
@@ -15,6 +15,7 @@
 
 #include "MoERuntimeTable.h"
 #include "MoEExpertProjectionOwnership.h"
+#include "MoEExpertShardCohort.h"
 #include "MoEOverlayPreparedExpertPayload.h"
 
 #include <array>
@@ -69,7 +70,7 @@ namespace llaminar2
      * @param down Complete down engine, absent only for an explicit GateUp contract.
      * @param projections Immutable projection set selected by the ownership plan.
      * @param d_model Full original model width, never a local down-slice width.
-     * @param intermediate Full expert intermediate width.
+     * @param intermediate Full expert width or the original local F-shard width.
      * @param output Publication target; placement and allocation capacity survive.
      * @return False without mutation for mixed families, missing engines or bad geometry.
      */
@@ -82,14 +83,14 @@ namespace llaminar2
         int intermediate,
         DeviceMoEExpertDescriptor &output) noexcept
     {
-        const bool complete = projections == DeviceMoEProjectionSet::CompleteExpert;
+        const bool has_down = deviceMoEProjectionSetHasDown(projections);
         if (!deviceMoEProjectionSetValid(projections) || !gate || !up ||
-            (complete ? down == nullptr : down != nullptr) ||
+            (has_down ? down == nullptr : down != nullptr) ||
             d_model <= 0 || intermediate <= 0)
             return false;
 
         const std::array<ITensorGemm *, 3> engines{gate, up, down};
-        const std::size_t count = complete ? 3u : 2u;
+        const std::size_t count = has_down ? 3u : 2u;
         std::array<DeviceNativeQuantisedMatrixDesc, 3> native{};
         std::size_t native_count = 0u;
         for (std::size_t i = 0; i < count; ++i)
@@ -184,6 +185,51 @@ namespace llaminar2
         return moe_descriptor_detail::exportMovableWeights(gate, up, nullptr,
             ownership.movableProjections(), geometry.model_columns,
             geometry.intermediate_columns, output);
+    }
+
+    /**
+     * @brief Export one original F shard under an explicit partial-output contract.
+     * @param gate Local gate rows, with the original complete model input width.
+     * @param up Local up rows from the same F interval.
+     * @param down Complete model output rows, reduced only over that F interval.
+     * @param ownership Original source partition, never inferred from engine dimensions.
+     * @param output Publication target; unchanged for an invalid or whole-owner binding.
+     * @return True for a complete native or floating fragment, never a whole expert.
+     */
+    inline bool exportDeviceMoEFragmentWeightDescriptors(
+        ITensorGemm *gate, ITensorGemm *up, ITensorGemm *down,
+        const MoEExpertProjectionOwnership &ownership, DeviceMoEExpertDescriptor &output) noexcept
+    {
+        if (ownership.hasMovableProjectionSet() || output.owner_participant != -1 ||
+            hasMoEExpertFlag(output.flags, DeviceMoEExpertFlags::Replicated) ||
+            hasMoEExpertFlag(output.flags, DeviceMoEExpertFlags::PreferredOwner))
+            return false;
+        const auto local = ownership.projection(WeightRole::MoEExpertUp);
+        return moe_descriptor_detail::exportMovableWeights(gate, up, down,
+            DeviceMoEProjectionSet::IntermediateShard, ownership.geometry().model_columns,
+            local.rows, output);
+    }
+
+    /**
+     * @brief Export an original registry-issued GPU fragment without losing its ownership arm.
+     * @param payload Closed fragment carrying original model, cohort, member and engines.
+     * @param output Device descriptor; unchanged on foreign backend or invalid family.
+     * @return True after exporting exactly the original member's local projection geometry.
+     */
+    inline bool exportDeviceMoEFragmentWeightDescriptors(
+        const MoEOverlayPreparedFragmentPayload &payload, DeviceMoEExpertDescriptor &output) noexcept
+    {
+        if (!payload.valid() || payload.participantIndex() >= payload.cohort()->participants().size() ||
+            !payload.cohort()->participants()[payload.participantIndex()].address.isGPU() ||
+            (output.logical_expert_id >= 0 && output.logical_expert_id != payload.expertId()))
+            return false;
+        auto candidate = output;
+        if (!exportDeviceMoEFragmentWeightDescriptors(payload.gate().get(), payload.up().get(),
+            payload.down().get(), payload.cohort()->ownership(payload.participantIndex()), candidate))
+            return false;
+        candidate.logical_expert_id = payload.expertId();
+        output = candidate;
+        return true;
     }
 
     /**

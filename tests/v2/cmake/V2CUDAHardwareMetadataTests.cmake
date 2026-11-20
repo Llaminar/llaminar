@@ -18,6 +18,78 @@ add_v2_test(V2_Integration_CUDAHardwareMetadataReplay
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_CUDAHardwareMetadataReplay)
 
+# Typed optional-driver admission contract, driven through the shared native
+# loader probe for genuine absence, breakage and loadability; no CUDA SDK,
+# driver or device required.
+#
+# Build-owned native loader fixtures: the proof drives the real loader
+# against dependency and import contracts this tree owns, on every
+# supported host architecture, instead of inspecting arbitrary system
+# libraries. The absent-dependency stub exists only during the fixture
+# link and is removed afterward, so the fixture's single NEEDED entry is
+# genuinely unresolvable in every installed image. All fixture names begin
+# with the runtime prefix, so the installed receipt seals them and the
+# slim test runner executes the proof without a compiler.
+add_library(llaminar_native_loader_stub SHARED
+    fixtures/native-loader/stub.c)
+set_target_properties(llaminar_native_loader_stub PROPERTIES
+    PREFIX "lib" OUTPUT_NAME "llaminar-absent-dependency.so" SUFFIX ".9")
+
+add_library(llaminar_native_loader_missing_dependency SHARED
+    fixtures/native-loader/missing_dependency_fixture.c)
+set_target_properties(llaminar_native_loader_missing_dependency PROPERTIES
+    PREFIX "lib" OUTPUT_NAME "llaminar-native-loader-missing-dependency")
+target_link_libraries(llaminar_native_loader_missing_dependency PRIVATE
+    llaminar_native_loader_stub)
+# The fixture has no undefined imports of its own, so the default
+# --as-needed link would drop the dependency record entirely; the explicit
+# no-as-needed link keeps the owned NEEDED entry that the runtime loader
+# must fail to resolve.
+target_link_options(llaminar_native_loader_missing_dependency PRIVATE
+    -Wl,--no-as-needed)
+add_custom_command(TARGET llaminar_native_loader_missing_dependency POST_BUILD
+    COMMAND "${CMAKE_COMMAND}" -E remove "$<TARGET_FILE:llaminar_native_loader_stub>"
+    COMMENT "removing the absent-dependency link stub after the fixture link")
+
+add_library(llaminar_native_loader_undefined_symbol SHARED
+    fixtures/native-loader/undefined_symbol_fixture.c)
+set_target_properties(llaminar_native_loader_undefined_symbol PROPERTIES
+    PREFIX "lib" OUTPUT_NAME "llaminar-native-loader-undefined-symbol")
+
+add_library(llaminar_native_loader_loadable SHARED
+    fixtures/native-loader/loadable_fixture.c)
+set_target_properties(llaminar_native_loader_loadable PROPERTIES
+    PREFIX "lib" OUTPUT_NAME "llaminar-native-loader-loadable")
+
+add_executable(v2_unit_cuda_discovery_admission
+    unit/backends/Test__CUDADiscoveryAdmission.cpp
+    ../../src/v2/backends/cuda/CUDADiscoveryAdmission.cpp)
+target_include_directories(v2_unit_cuda_discovery_admission PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/../../src/v2")
+target_compile_features(v2_unit_cuda_discovery_admission PRIVATE cxx_std_20)
+target_compile_definitions(v2_unit_cuda_discovery_admission PRIVATE
+    LLAMINAR_NATIVE_LOADER_MISSING_DEPENDENCY_FIXTURE="$<TARGET_FILE:llaminar_native_loader_missing_dependency>"
+    LLAMINAR_NATIVE_LOADER_UNDEFINED_SYMBOL_FIXTURE="$<TARGET_FILE:llaminar_native_loader_undefined_symbol>"
+    LLAMINAR_NATIVE_LOADER_LOADABLE_FIXTURE="$<TARGET_FILE:llaminar_native_loader_loadable>")
+target_link_libraries(v2_unit_cuda_discovery_admission PRIVATE
+    GTest::gtest_main ${CMAKE_DL_LIBS})
+# The fixtures are addressed by absolute path, not linked, so the proof
+# target needs explicit build dependencies for them to exist before it runs.
+add_dependencies(v2_unit_cuda_discovery_admission
+    llaminar_native_loader_missing_dependency
+    llaminar_native_loader_undefined_symbol
+    llaminar_native_loader_loadable)
+add_v2_test(V2_Unit_CUDADiscoveryAdmission
+    COMMAND $<TARGET_FILE:v2_unit_cuda_discovery_admission>
+    LABELS "V2;Unit;DeviceFree;CUDA;HardwareMetadata;Discovery;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS)
+add_v2_test(V2_Integration_CUDADiscoveryAdmissionContract
+    COMMAND $<TARGET_FILE:v2_unit_cuda_discovery_admission> --gtest_repeat=20
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CUDA;HardwareMetadata;Discovery;Contract;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 60)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
+    V2_Integration_CUDADiscoveryAdmissionContract)
+
 # Native authentication is deliberately separate from the device-free Unit proof.
 # The test visits every visible device and explicitly leaves absent hardware unqualified.
 if(HAVE_CUDA)
@@ -92,3 +164,10 @@ if(HAVE_CUDA)
 endif()
 
 include(${CMAKE_CURRENT_LIST_DIR}/V2NativeDeviceBindingTests.cmake)
+
+add_v2_test(V2_Integration_CUDAVerifierDispatchTableBindingReplay
+    COMMAND $<TARGET_FILE:v2_unit_cuda_hardware_metadata>
+        --gtest_filter=CUDAHardwareMetadata.VerifierDispatchUsesAdmittedNativeArchitecture
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;CUDA;HardwareMetadata;GroupedVerifierRows;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDAVerifierDispatchTableBindingReplay)

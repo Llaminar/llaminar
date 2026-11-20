@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""Replay dependency identity and OCI admission without compilers or devices.
+"""@file test_toolchain_cache.py
+@brief Replay dependency identity and OCI admission without compilers or devices.
 
 The fixture repository separates source edits from actual dependency changes.
 Real OCI descriptors exercise swapped ISAs, stale inputs, missing/corrupt blobs
@@ -18,12 +19,14 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "scripts/ci"))
 import toolchain_cache as cache
 
 
-def oci(layout: Path, admitted: dict) -> tuple[dict, Path]:
+def oci(layout: Path, admitted: dict, *, architecture: str = "amd64") -> tuple[dict, Path]:
     """Write an actual descriptor graph with small, authenticated layer bytes."""
     (layout / "blobs/sha256").mkdir(parents=True)
     def store(value, kind):
@@ -33,7 +36,7 @@ def oci(layout: Path, admitted: dict) -> tuple[dict, Path]:
         path.write_bytes(data)
         return {"mediaType": kind, "digest": "sha256:" + digest, "size": len(data)}, path
     layer, layer_path = store(b"completed-sdk-and-toolchain", "application/vnd.oci.image.layer.v1.tar")
-    config, _ = store({"os": "linux", "architecture": "amd64", "config": {"Labels": {
+    config, _ = store({"os": "linux", "architecture": architecture, "config": {"Labels": {
         cache.INPUT_LABEL: admitted["fingerprint"], cache.ISA_LABEL: admitted["cpu_isa"]}}},
         "application/vnd.oci.image.config.v1+json")
     manifest, _ = store({"schemaVersion": 2, "config": config, "layers": [layer]}, cache.MANIFEST_TYPE)
@@ -76,6 +79,57 @@ class ToolchainCacheTests(unittest.TestCase):
                  "-c", "core.hooksPath=/dev/null", "commit", "-qm", "fixture")
         return self.git("rev-parse", "HEAD^{tree}").decode().strip()
 
+    def test_split_jobs_resolve_the_existing_toolchain_cache_keys(self):
+        """Run the workflow shell steps against a committed dependency fixture for both ISAs."""
+        workflow = ROOT / ".github/workflows/develop-image-isa.yml"
+        jobs = yaml.safe_load(workflow.read_text())["jobs"]
+        commands = [next(step["run"] for step in job["steps"] if step.get("id") == "toolchain-cache")
+                    for job in jobs.values()]
+        self.assertEqual(commands[0], commands[1])
+        script = Path(cache.__file__).read_text()
+        (self.repo / "scripts/ci/toolchain_cache.py").write_text(script)
+        self.commit()
+        for isa in cache.ISAS:
+            with self.subTest(isa=isa):
+                runner = self.root / isa
+                runner.mkdir()
+                outputs = runner / "workflow-outputs"
+                env = dict(os.environ, RUNNER_TEMP=str(runner), TMPDIR=str(runner),
+                           GITHUB_OUTPUT=str(outputs), CPU_ISA=isa)
+                ran = subprocess.run(["bash", "-c", commands[0]], env=env, cwd=self.repo,
+                                     text=True, capture_output=True, timeout=10)
+                self.assertEqual(ran.returncode, 0, ran.stderr)
+                original_outputs = runner / "original-outputs"
+                cache.prepare(runner / "llaminar-toolchains", isa, original_outputs)
+                expected = dict(line.split("=", 1) for line in original_outputs.read_text().splitlines())
+                self.assertEqual(dict(line.split("=", 1) for line in outputs.read_text().splitlines()), {
+                    "key": expected[f"key_{isa.lower()}"], "path": expected[f"path_{isa.lower()}"],
+                })
+
+    def test_sdk_cache_upload_failure_is_independent_of_toolchain_build_status(self):
+        """Only publishing intermediate layers can fail independently of the build."""
+        action = yaml.safe_load((ROOT / ".github/actions/cache-develop-toolchain/action.yml").read_text())
+        steps = action["runs"]["steps"]
+        checkpoint = next(step for step in steps if step.get("with", {}).get("target") == "gpu-sdk")
+        cache_export = dict(field.split("=", 1) for field in checkpoint["with"]["cache-to"].split(","))
+        self.assertEqual(cache_export["type"], "gha")
+        self.assertEqual(cache_export.get("ignore-error"), "true")
+        for step in steps:
+            self.assertFalse(step.get("continue-on-error", False))
+
+    def test_dedicated_avx512_cache_miss_uses_the_persistent_builder(self):
+        """A warm AVX512 worker can produce a verified OCI image without a remote SDK round-trip."""
+        action = yaml.safe_load((ROOT / ".github/actions/cache-develop-toolchain/action.yml").read_text())
+        checkpoint, avx512, avx2 = [step for step in action["runs"]["steps"]
+                                    if step.get("with", {}).get("target") in {"gpu-sdk", "toolchain"}
+                                    and "NEON" not in step["if"]]
+        self.assertNotIn("inputs.cpu-isa == 'AVX512'", checkpoint["if"])
+        self.assertIn("inputs.cpu-isa == 'both'", checkpoint["if"])
+        self.assertIn("inputs.cpu-isa == 'AVX2'", checkpoint["if"])
+        self.assertEqual(avx512["with"]["cache-from"], "type=registry,ref=${{ steps.cache.outputs.image }}-avx512")
+        self.assertIn("type=oci,", avx512["with"]["outputs"])
+        self.assertIn("type=gha,", avx2["with"]["cache-from"])
+
     def test_dependency_key_survives_source_edits_and_rejects_each_dependency_change(self):
         before = cache.identity(self.tree, "AVX512")
         (self.repo / "src/source.cpp").write_text("version2\n")
@@ -96,8 +150,72 @@ class ToolchainCacheTests(unittest.TestCase):
         self.assertTrue((self.root / "prepared/inputs/scripts/docker/seed").is_file())
         self.assertFalse((self.root / "prepared/inputs/src").exists())
         values = dict(line.split("=", 1) for line in output.read_text().splitlines())
-        for isa in cache.ISAS:
+        for isa in ("AVX512", "AVX2"):
             self.assertIn(cache.identity(self.tree, isa)["fingerprint"], values["key_" + isa.lower()])
+
+    def test_neon_cache_admits_only_arm64_and_emits_the_pinned_context(self):
+        """Restore a real OCI descriptor graph and pass its exact identity to BuildKit."""
+        output = self.root / "output"
+        prepared = self.root / "prepared"
+        cache.prepare(prepared, "NEON", output)
+        values = dict(line.split("=", 1) for line in output.read_text().splitlines())
+        expected = cache.identity(self.tree, "NEON")
+        self.assertIn(expected["fingerprint"], values["key_neon"])
+        self.assertNotEqual(expected["fingerprint"], cache.identity(self.tree, "AVX2")["fingerprint"])
+        foreign = self.root / "foreign"
+        oci(foreign, expected)
+        with self.assertRaisesRegex(ValueError, "must target linux/arm64"):
+            cache.admit(foreign, expected, verify_layers=True)
+        layout = Path(values["path_neon"])
+        manifest, _ = oci(layout, expected, architecture="arm64")
+        with patch.object(sys, "argv", ["toolchain_cache.py", "verify", "--root", str(prepared),
+                                        "--cpu-isa", "NEON", "--cache-hit", "true",
+                                        "--github-output", str(output)]):
+            cache.main()
+        receipt = json.loads((prepared / "neon-toolchain.json").read_text())
+        self.assertTrue(receipt["cache_restored"])
+        self.assertEqual(receipt["manifest"], manifest["digest"])
+        context = f"toolchain=oci-layout://{layout}@{manifest['digest']}"
+        self.assertIn(f"build_context={context}", output.read_text().splitlines())
+
+    def test_arm64_pr_and_publication_share_the_neon_cache_contract(self):
+        """Require authenticated inputs and keep registry writes on trusted develop jobs."""
+        action = yaml.safe_load((ROOT / ".github/actions/cache-develop-toolchain/action.yml").read_text())
+        neon_steps = [step for step in action["runs"]["steps"] if "NEON" in step.get("if", "")]
+        restore, checkpoint, toolchain, verify, save = neon_steps
+        self.assertEqual(restore["with"], save["with"])
+        self.assertEqual(restore["uses"], "actions/cache/restore@v5")
+        self.assertEqual(save["uses"], "actions/cache/save@v5")
+        self.assertEqual(checkpoint["with"]["target"], "gpu-sdk")
+        self.assertIn("scope=llaminar-gpu-sdk-neon", checkpoint["with"]["cache-to"])
+        self.assertEqual(toolchain["with"]["target"], "toolchain")
+        for step in (checkpoint, toolchain):
+            self.assertEqual(step["with"]["platforms"], "linux/arm64")
+            self.assertIn("LLAMINAR_CUDA_ARCHS=121", step["with"]["build-args"])
+            self.assertIn("LLAMINAR_ENABLE_ROCM=OFF", step["with"]["build-args"])
+        self.assertIn("--github-output", verify["run"])
+        workflows = ROOT / ".github/workflows"
+        pr = yaml.load((workflows / "develop-pr-arm64.yml").read_text(), Loader=yaml.BaseLoader)
+        publication = yaml.load((workflows / "ci.yml").read_text(), Loader=yaml.BaseLoader)
+        pr_steps = pr["jobs"]["arm64"]["steps"]
+        publication_steps = publication["jobs"]["develop-arm64"]["steps"]
+        for steps in (pr_steps, publication_steps):
+            cache_step = next(step for step in steps if step.get("id") == "toolchain")
+            self.assertEqual(cache_step["uses"], "./.github/actions/cache-develop-toolchain")
+            self.assertEqual(cache_step["with"]["cpu-isa"], "NEON")
+        build = next(step["with"] for step in pr_steps if step.get("with", {}).get("target") == "test-runner")
+        self.assertEqual(build["build-contexts"], "${{ steps.toolchain.outputs.neon-context }}")
+        self.assertIn("type=registry,ref=${{ steps.toolchain.outputs.neon-registry-cache }}", build["cache-from"])
+        self.assertTrue(build["cache-to"].startswith("type=gha,scope=llaminar-build-neon-pr,"))
+        self.assertIn("scope=llaminar-build-neon-pr", build["cache-from"])
+        publish_build = next(step for step in publication_steps if "--cache-to" in step.get("run", ""))
+        login = next(step for step in publication_steps if step.get("uses") == "docker/login-action@v4")
+        self.assertLess(publication_steps.index(login), publication_steps.index(publish_build))
+        self.assertEqual(publish_build["env"]["REGISTRY_CACHE"],
+                         "${{ steps.toolchain.outputs.neon-registry-cache }}")
+        self.assertIn("--build-context", publish_build["run"])
+        self.assertIn("--cache-from", publish_build["run"])
+        self.assertIn('--cache-to "type=registry,ref=$REGISTRY_CACHE', publish_build["run"])
 
     def test_artifact_survives_source_failure_and_binds_a_new_source_tree_by_digest(self):
         expected = cache.identity(self.tree, "AVX512")

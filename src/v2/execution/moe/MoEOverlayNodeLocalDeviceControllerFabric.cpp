@@ -8,7 +8,9 @@
  * only writers of controller lifecycle and policy records.
  */
 
+#include "utils/HostPageSize.h"
 #include "MoEOverlayNodeLocalDeviceControllerFabric.h"
+#include "MoEOverlayPreparedTargetService.h"
 #include "MoEOverlaySharedBackingStartup.h"
 
 #include "MoEOverlayEconomyProfileComposer.h"
@@ -34,6 +36,7 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -140,12 +143,10 @@ namespace llaminar2
                 }
                 const auto tier = static_cast<std::size_t>(
                     participant.tier_idx);
-                if (tier >=
-                    kMoEOverlayDeviceControllerFabricMaxParticipants)
-                {
-                    throw std::invalid_argument(
-                        "device controller fabric tier index exceeds its fixed ABI");
-                }
+                // Every populated tier owns at least one original member.
+                // This is a structural extent check, not a hardware ceiling.
+                if (tier >= topology.participants.size())
+                    throw std::invalid_argument("device controller tier index exceeds its participant extent");
                 if (observed.size() <= tier)
                     observed.resize(tier + 1u, false);
                 observed[tier] = true;
@@ -272,12 +273,54 @@ namespace llaminar2
 
     bool MoEOverlayDeviceControllerFabricLayout::valid() const noexcept
     {
+        // Prove complete bounds before evaluating any offset+size ordering
+        // expression below. A corrupt count cannot wrap into a valid page.
+        if (!header.participant_count || !header.logical_target_count ||
+            header.logical_target_count > header.participant_count ||
+            header.logical_target_count != logical_targets.size() ||
+            header.demand_publisher_participant_id >= header.participant_count ||
+            header.demand_publisher_group_id >= header.group_count ||
+            !header.num_layers || !header.num_experts ||
+            header.num_layers > kMoEOverlayDeviceControllerFabricMaxLayers ||
+            header.num_experts > kMoEOverlayDeviceControllerFabricMaxExperts ||
+            std::uint64_t(header.participant_count) * header.participant_count >
+                UINT64_MAX / header.num_layers ||
+            !moeOverlayExtentContains<MoEOverlayDeviceControllerFabricLayoutHeader>(leader_owned_end, leader_owned_begin, 1u) ||
+            !moeOverlayExtentContains<MoEOverlayDeviceControllerParticipantMetadata>(leader_owned_end, header.participant_metadata_offset, header.participant_count) ||
+            !moeOverlayExtentContains<MoEOverlayDeviceControllerFabricGroupLayout>(leader_owned_end, header.group_layout_offset, groups.size()) ||
+            !moeOverlayExtentContains<MoEOverlayDeviceControllerLogicalTargetMetadata>(leader_owned_end,
+                header.logical_target_metadata_offset, header.logical_target_count) ||
+            !moeOverlayExtentContains<MoEOverlayDeviceControllerSharedHeader>(leader_owned_end, header.controller_header_offset, 1u) ||
+            !moeOverlayExtentContains<MoEOverlayDeviceControllerCommandHeader>(leader_owned_end, header.command_header_offset, 1u) ||
+            !moeOverlayExtentContains<MoEOverlayDeviceMovementCommand>(leader_owned_end, header.command_entries_offset, header.command_capacity) ||
+            !moeOverlayExtentContains<std::uint64_t>(leader_owned_end, header.payload_bytes_per_layer_offset, header.num_layers) ||
+            !moeOverlayExtentContains<MoEOverlayRouteTarget>(leader_owned_end, header.initial_route_targets_offset, header.initial_route_targets_words) ||
+            !moeOverlayExtentContains<std::uint64_t>(leader_owned_end, header.demand_history_offset, header.demand_history_words) ||
+            !moeOverlayExtentContains<MoEOverlayDeviceControllerEconomyHeader>(leader_owned_end, header.economy_header_offset, 1u) ||
+            !moeOverlayExtentContains<std::uint64_t>(leader_owned_end, header.economy_service_cost_offset, header.economy_service_cost_words) ||
+            !moeOverlayExtentContains<MoEOverlayDeviceControllerMigrationCost>(leader_owned_end, header.economy_migration_cost_offset, header.economy_migration_cost_entries) ||
+            !moeOverlayExtentContains<std::uint64_t>(leader_owned_end, header.economy_last_moved_offset, header.economy_last_moved_words) ||
+            header.participant_metadata_offset < leader_owned_begin + sizeof(header) ||
+            header.logical_target_metadata_offset < header.participant_metadata_offset + std::uint64_t(header.participant_count) * sizeof(MoEOverlayDeviceControllerParticipantMetadata) ||
+            header.group_layout_offset < header.logical_target_metadata_offset + std::uint64_t(header.logical_target_count) * sizeof(MoEOverlayDeviceControllerLogicalTargetMetadata) ||
+            header.command_entries_offset < header.command_header_offset + sizeof(MoEOverlayDeviceControllerCommandHeader) ||
+            header.payload_bytes_per_layer_offset < header.command_entries_offset + std::uint64_t(header.command_capacity) * sizeof(MoEOverlayDeviceMovementCommand))
+            return false;
         if (page_bytes == 0u ||
             (page_bytes & (page_bytes - 1u)) != 0u ||
             mapping_bytes == 0u || mapping_bytes % page_bytes != 0u ||
             setup_header_offset != 0u ||
-            sizeof(MoEOverlayDeviceControllerFabricSetupHeader) > page_bytes ||
-            leader_owned_begin != page_bytes ||
+            setup.storage_bytes != leader_owned_begin || setup.participating_rank_count == 0u ||
+            setup.participating_rank_count > header.participant_count ||
+            setup.participating_world_ranks_offset < sizeof(setup) ||
+            !moeOverlayExtentContains<std::int32_t>(leader_owned_begin, setup.participating_world_ranks_offset, setup.participating_rank_count) ||
+            !moeOverlayExtentContains<std::uint64_t>(leader_owned_begin, setup.first_touch_ready_offset, setup.participating_rank_count) ||
+            !moeOverlayExtentContains<std::uint64_t>(leader_owned_begin, setup.registration_ready_offset, setup.participating_rank_count) ||
+            !moeOverlayExtentContains<std::uint64_t>(leader_owned_begin, setup.demand_histogram_rebase_ready_offset, setup.participating_rank_count) ||
+            setup.first_touch_ready_offset < setup.participating_world_ranks_offset + std::uint64_t(setup.participating_rank_count) * sizeof(std::int32_t) ||
+            setup.registration_ready_offset < setup.first_touch_ready_offset + std::uint64_t(setup.participating_rank_count) * sizeof(std::uint64_t) ||
+            setup.demand_histogram_rebase_ready_offset < setup.registration_ready_offset + std::uint64_t(setup.participating_rank_count) * sizeof(std::uint64_t) ||
+            leader_owned_begin < page_bytes ||
             leader_owned_begin >= leader_owned_end ||
             leader_owned_end > mapping_bytes ||
             leader_owned_begin % page_bytes != 0u ||
@@ -294,28 +337,28 @@ namespace llaminar2
             header.routed_experts_per_token == 0u ||
             header.routed_experts_per_token > header.num_experts ||
             header.tier_count == 0u ||
-            header.tier_count > header.participant_count ||
+            header.tier_count > header.logical_target_count ||
             header.payload_bytes_per_layer_offset < leader_owned_begin ||
             header.payload_bytes_per_layer_offset +
                     header.num_layers * sizeof(std::uint64_t) >
                 leader_owned_end ||
-            header.initial_owner_participants_offset <
+            header.initial_route_targets_offset <
                 header.payload_bytes_per_layer_offset +
                     header.num_layers * sizeof(std::uint64_t) ||
-            header.initial_owner_participants_offset %
+            header.initial_route_targets_offset %
                     alignof(std::uint32_t) !=
                 0u ||
-            header.initial_owner_participants_words !=
+            header.initial_route_targets_words !=
                 static_cast<std::uint64_t>(header.num_layers) *
                     header.num_experts ||
-            header.initial_owner_participants_offset +
-                    header.initial_owner_participants_words *
+            header.initial_route_targets_offset +
+                    header.initial_route_targets_words *
                         sizeof(std::uint32_t) >
                 leader_owned_end ||
             header.demand_history_offset < leader_owned_begin ||
             header.demand_history_offset <
-                header.initial_owner_participants_offset +
-                    header.initial_owner_participants_words *
+                header.initial_route_targets_offset +
+                    header.initial_route_targets_words *
                         sizeof(std::uint32_t) ||
             header.demand_history_offset % alignof(std::uint64_t) != 0u ||
             header.demand_history_words !=
@@ -338,7 +381,7 @@ namespace llaminar2
                 header.economy_header_offset +
                     sizeof(MoEOverlayDeviceControllerEconomyHeader) ||
             header.economy_service_cost_words !=
-                static_cast<std::uint64_t>(header.tier_count) *
+                static_cast<std::uint64_t>(header.logical_target_count) *
                     header.num_layers *
                     kMoEOverlayDeviceControllerEconomyServicePhaseCount ||
             header.economy_service_cost_offset +
@@ -353,8 +396,8 @@ namespace llaminar2
                     alignof(MoEOverlayDeviceControllerMigrationCost) !=
                 0u ||
             header.economy_migration_cost_entries !=
-                static_cast<std::uint64_t>(header.participant_count) *
-                    header.participant_count * header.num_layers ||
+                static_cast<std::uint64_t>(header.logical_target_count) *
+                    header.logical_target_count * header.num_layers ||
             header.economy_migration_cost_offset +
                     header.economy_migration_cost_entries *
                         sizeof(MoEOverlayDeviceControllerMigrationCost) >
@@ -379,13 +422,10 @@ namespace llaminar2
             header.inference_epoch_record_offset <
                 header.controller_header_offset +
                     sizeof(MoEOverlayDeviceControllerSharedHeader) ||
-            header.inference_epoch_record_offset +
-                    sizeof(MoEOverlayDeviceControllerInferenceEpochRecord) >
-                leader_owned_end ||
-            header.command_header_offset <
-                header.inference_epoch_record_offset +
-                    sizeof(
-                        MoEOverlayDeviceControllerInferenceEpochRecord) ||
+            header.inference_epoch_storage_bytes < sizeof(MoEOverlayDeviceControllerInferenceEpochRecord) ||
+            !moeOverlayExtentContains<std::byte>(leader_owned_end, header.inference_epoch_record_offset,
+                header.inference_epoch_storage_bytes) ||
+            header.command_header_offset < header.inference_epoch_record_offset + header.inference_epoch_storage_bytes ||
             header.minimum_window_activations == 0u ||
             header.maximum_cycles_per_wave == 0u ||
             header.payload_geometry_fingerprint == 0u)
@@ -393,13 +433,63 @@ namespace llaminar2
             return false;
         }
 
+        std::uint64_t logical_members = 0u;
+        for (std::size_t vertex = 0; vertex < logical_targets.size(); ++vertex)
+        {
+            const auto &target = logical_targets[vertex];
+            if (target.group_id >= groups.size() || target.target.isAbsent() || target.reserved) return false;
+            const auto &group = groups[target.group_id];
+            if (target.tier_index != group.tier_index || target.tier_priority != group.tier_priority ||
+                !target.member_count || target.first_group_member >= group.participant_count ||
+                target.member_count > group.participant_count - target.first_group_member ||
+                (target.target.isCohort()
+                    ? (target.target.word() != group.cohort_target.word() || target.first_group_member || target.member_count != group.participant_count)
+                    : (!group.cohort_target.isAbsent() || target.member_count != 1u ||
+                       static_cast<std::uint32_t>(target.target.word()) >= header.participant_count))) return false;
+            for (std::size_t previous = 0; previous < vertex; ++previous)
+            {
+                const auto &other = logical_targets[previous];
+                if (other.target.word() == target.target.word() || (other.group_id == target.group_id &&
+                    other.first_group_member < target.first_group_member + target.member_count &&
+                    target.first_group_member < other.first_group_member + other.member_count)) return false;
+            }
+            logical_members += target.member_count;
+        }
+        if (logical_members != header.participant_count) return false;
         std::size_t previous_end = leader_owned_end;
+        std::uint64_t roster_frontier = header.group_layout_offset + groups.size() * sizeof(MoEOverlayDeviceControllerFabricGroupLayout);
+        std::uint64_t members = 0u;
+        std::uint32_t ranks = 0u;
         for (std::size_t index = 0; index < groups.size(); ++index)
         {
             const auto &group = groups[index];
+            if (!group.cohort_target.isAbsent() &&
+                (!group.cohort_target.isCohort() || !group.participant_count || group.tier_index < 0 ||
+                 std::int64_t(group.cohort_target.word()) != -std::int64_t(group.tier_index) - 2 ||
+                 group.intra_group_transport != static_cast<std::uint32_t>(group.participant_count == 1u
+                    ? MoEOverlayDeviceControllerIntraGroupTransport::SingleParticipant
+                    : MoEOverlayDeviceControllerIntraGroupTransport::NativeCollective)))
+                return false;
+            bool first_rank = true;
+            for (std::size_t previous = 0u; previous < index; ++previous)
+                first_rank = first_rank && groups[previous].root_world_rank != group.root_world_rank;
+            if (first_rank) ++ranks;
+            if (group.participant_ids_offset < roster_frontier ||
+                !moeOverlayExtentContains<std::uint32_t>(header.controller_header_offset, group.participant_ids_offset, group.participant_count) ||
+                !moeOverlayExtentContains<MoEOverlayDeviceControllerParticipantRecord>(group.owned_page_end, group.participant_records_offset, group.participant_record_count) ||
+                !moeOverlayExtentContains<MoEOverlayDeviceControllerGroupRecord>(group.owned_page_end, group.group_record_offset, 1u) ||
+                !moeOverlayExtentContains<MoEOverlayDeviceControllerTransportRecord>(group.owned_page_end, group.transport_record_offset, 1u) ||
+                !moeOverlayExtentContains<std::uint64_t>(group.owned_page_end, group.collected_state_offset, group.collected_state_words) ||
+                !moeOverlayExtentContains<std::byte>(group.owned_page_end, group.service_telemetry_offset, group.service_telemetry_bytes) ||
+                (group.participant_count && group.service_telemetry_stride_bytes > UINT64_MAX / group.participant_count) ||
+                group.group_record_offset < group.participant_records_offset + group.participant_record_count * sizeof(MoEOverlayDeviceControllerParticipantRecord) ||
+                group.transport_record_offset < group.group_record_offset + sizeof(MoEOverlayDeviceControllerGroupRecord) ||
+                group.collected_state_offset < group.transport_record_offset + sizeof(MoEOverlayDeviceControllerTransportRecord) ||
+                group.service_telemetry_offset < group.collected_state_offset + group.collected_state_words * sizeof(std::uint64_t))
+                return false;
+            roster_frontier = group.participant_ids_offset + std::uint64_t(group.participant_count) * sizeof(std::uint32_t);
+            members += group.participant_count;
             if (group.group_id != index || group.participant_count == 0u ||
-                group.participant_count >
-                    kMoEOverlayDeviceControllerFabricMaxParticipants ||
                 group.root_world_rank < 0 ||
                 group.owned_page_begin != previous_end ||
                 group.owned_page_begin % page_bytes != 0u ||
@@ -422,8 +512,8 @@ namespace llaminar2
                     group.owned_page_end ||
                 group.collected_state_offset < group.owned_page_begin ||
                 group.collected_state_words !=
-                    static_cast<std::uint64_t>(group.participant_count) *
-                        kMoEOverlayDeviceControllerDemandPhaseCount *
+                    (static_cast<std::uint64_t>(group.participant_count) +
+                        (group.group_id == header.demand_publisher_group_id ? 2u : 0u)) *
                         header.num_layers * header.num_experts ||
                 group.collected_state_offset +
                         group.collected_state_words * sizeof(std::uint64_t) >
@@ -443,7 +533,8 @@ namespace llaminar2
             }
             previous_end = static_cast<std::size_t>(group.owned_page_end);
         }
-        return previous_end == mapping_bytes;
+        return previous_end == mapping_bytes && members == header.participant_count &&
+               ranks == setup.participating_rank_count;
     }
 
     bool MoEOverlayDeviceControllerParticipantBinding::valid() const noexcept
@@ -452,10 +543,11 @@ namespace llaminar2
                capture_metadata.topology_fingerprint != 0u &&
                capture_metadata.group_collected_state_words != 0u &&
                mapped_base_device && mapped_bytes != 0u && layout &&
-               participants && groups && controller &&
-               inference_epoch_record && command &&
+               participants && groups && logical_targets && controller &&
+               inference_epoch_record && inference_epoch_storage_bytes != 0u &&
+               (!inference_epoch_member || inference_epoch_arrival) && command &&
                command_entries && payload_bytes_per_layer &&
-               initial_owner_participants && demand_history &&
+               initial_route_targets && demand_history &&
                economy && economy_service_costs &&
                economy_migration_costs && economy_last_moved &&
                local_group &&
@@ -483,12 +575,13 @@ namespace llaminar2
             .layout = layout,
             .participants = participants,
             .groups = groups,
+            .logical_targets = logical_targets,
             .controller = controller,
             .inference_epoch_record = inference_epoch_record,
             .command = command,
             .command_entries = command_entries,
             .payload_bytes_per_layer = payload_bytes_per_layer,
-            .initial_owner_participants = initial_owner_participants,
+            .initial_route_targets = initial_route_targets,
             .demand_history = demand_history,
             .economy = economy,
             .economy_service_costs = economy_service_costs,
@@ -531,10 +624,8 @@ namespace llaminar2
             num_experts > kMoEOverlayDeviceControllerFabricMaxExperts ||
             command_capacity == 0u || routed_experts_per_token == 0u ||
             routed_experts_per_token > num_experts ||
-            topology.participants.size() >
-                kMoEOverlayDeviceControllerFabricMaxParticipants ||
-            topology.groups.size() >
-                kMoEOverlayDeviceControllerFabricMaxParticipants ||
+            topology.participants.size() > std::numeric_limits<std::uint32_t>::max() ||
+            topology.groups.size() > std::numeric_limits<std::uint32_t>::max() ||
             (!payload_bytes_per_layer.empty() &&
              payload_bytes_per_layer.size() != num_layers) ||
             minimum_window_activations == 0u ||
@@ -548,10 +639,28 @@ namespace llaminar2
 
         MoEOverlayDeviceControllerFabricLayout result;
         const std::uint32_t tier_count = denseTierCount(topology);
+        result.logical_targets = topology.logicalTargets();
+        const auto target_count = result.logical_targets.size();
         result.page_bytes = page_bytes;
         result.setup_header_offset = 0u;
-        result.leader_owned_begin = page_bytes;
-        std::size_t cursor = result.leader_owned_begin;
+        std::set<int> rank_roster;
+        for (const auto &group : topology.groups) rank_roster.insert(group.root_world_rank);
+        const auto ranks = rank_roster.size();
+        result.setup.participating_rank_count = static_cast<std::uint32_t>(ranks);
+        std::size_t cursor = sizeof(MoEOverlayDeviceControllerFabricSetupHeader);
+        result.setup.participating_world_ranks_offset = cursor;
+        cursor = checkedAdd(cursor, checkedMultiply(ranks, sizeof(std::int32_t), "setup rank roster"), "setup rank roster");
+        const auto add_ready_lanes = [&](std::uint64_t &offset) {
+            cursor = checkedAlignUp(cursor, alignof(std::uint64_t), "setup publication lanes");
+            offset = cursor;
+            cursor = checkedAdd(cursor, checkedMultiply(ranks, sizeof(std::uint64_t), "setup publication lanes"), "setup publication lanes");
+        };
+        add_ready_lanes(result.setup.first_touch_ready_offset);
+        add_ready_lanes(result.setup.registration_ready_offset);
+        add_ready_lanes(result.setup.demand_histogram_rebase_ready_offset);
+        result.leader_owned_begin = checkedAlignUp(cursor, page_bytes, "complete setup region");
+        result.setup.storage_bytes = result.leader_owned_begin;
+        cursor = result.leader_owned_begin;
 
         const std::size_t layout_header_offset = cursor;
         cursor = checkedAdd(
@@ -567,6 +676,10 @@ namespace llaminar2
                 sizeof(MoEOverlayDeviceControllerParticipantMetadata),
                 "participant metadata bytes"),
             "participant metadata");
+        cursor = checkedAlignUp(cursor, alignof(MoEOverlayDeviceControllerLogicalTargetMetadata), "logical target metadata");
+        const std::size_t logical_target_metadata_offset = cursor;
+        cursor = checkedAdd(cursor, checkedMultiply(target_count,
+            sizeof(MoEOverlayDeviceControllerLogicalTargetMetadata), "logical target metadata bytes"), "logical target metadata");
         cursor = checkedAlignUp(cursor, 64u, "group layout");
         const std::size_t group_layout_offset = cursor;
         cursor = checkedAdd(
@@ -576,6 +689,10 @@ namespace llaminar2
                 sizeof(MoEOverlayDeviceControllerFabricGroupLayout),
                 "group layout bytes"),
             "group layout");
+        cursor = checkedAlignUp(cursor, alignof(std::uint32_t), "group member rosters");
+        const std::size_t group_member_rosters_offset = cursor;
+        cursor = checkedAdd(cursor, checkedMultiply(topology.participants.size(), sizeof(std::uint32_t),
+            "group member roster bytes"), "group member rosters");
         cursor = checkedAlignUp(cursor, 64u, "controller header");
         const std::size_t controller_header_offset = cursor;
         cursor = checkedAdd(
@@ -586,8 +703,9 @@ namespace llaminar2
         const std::size_t inference_epoch_record_offset = cursor;
         cursor = checkedAdd(
             cursor,
-            sizeof(MoEOverlayDeviceControllerInferenceEpochRecord),
-            "inference epoch record");
+            MoEOverlayDeviceControllerInferenceEpochRecord::bytesForMembers(
+                static_cast<std::uint32_t>(topology.groups.at(topology.leader_group_id).participant_ids.size())),
+            "inference epoch record and exact member tail");
         cursor = checkedAlignUp(cursor, 64u, "command header");
         const std::size_t command_header_offset = cursor;
         cursor = checkedAdd(
@@ -613,15 +731,15 @@ namespace llaminar2
                 "payload byte geometry bytes"),
             "payload byte geometry");
         cursor = checkedAlignUp(cursor, 64u, "initial prepared owner table");
-        const std::size_t initial_owner_participants_offset = cursor;
-        const std::size_t initial_owner_participants_words = checkedMultiply(
+        const std::size_t initial_route_targets_offset = cursor;
+        const std::size_t initial_route_targets_words = checkedMultiply(
             num_layers,
             num_experts,
             "initial prepared owner words");
         cursor = checkedAdd(
             cursor,
             checkedMultiply(
-                initial_owner_participants_words,
+                initial_route_targets_words,
                 sizeof(std::uint32_t),
                 "initial prepared owner bytes"),
             "initial prepared owner table");
@@ -650,7 +768,7 @@ namespace llaminar2
         cursor = checkedAlignUp(cursor, 64u, "economy service costs");
         const std::size_t economy_service_cost_offset = cursor;
         const std::size_t economy_service_cost_words = checkedMultiply(
-            tier_count,
+            target_count,
             checkedMultiply(
                 num_layers,
                 kMoEOverlayDeviceControllerEconomyServicePhaseCount,
@@ -669,9 +787,9 @@ namespace llaminar2
             "economy migration costs");
         const std::size_t economy_migration_cost_offset = cursor;
         const std::size_t economy_migration_cost_entries = checkedMultiply(
-            topology.participants.size(),
+            target_count,
             checkedMultiply(
-                topology.participants.size(),
+                target_count,
                 num_layers,
                 "economy destination/layer movement entries"),
             "economy source movement entries");
@@ -700,14 +818,13 @@ namespace llaminar2
         cursor = result.leader_owned_end;
 
         result.groups.reserve(topology.groups.size());
+        std::size_t roster_cursor = group_member_rosters_offset;
         for (const auto &topology_group : topology.groups)
         {
-            if (!topology_group.valid() ||
-                topology_group.participant_ids.size() >
-                    kMoEOverlayDeviceControllerFabricMaxParticipants)
+            if (!topology_group.valid())
             {
                 throw std::invalid_argument(
-                    "device controller fabric group exceeds the shared runtime ABI");
+                    "device controller fabric group has incomplete immutable membership");
             }
             MoEOverlayDeviceControllerFabricGroupLayout group;
             group.group_id = static_cast<std::uint32_t>(
@@ -719,16 +836,14 @@ namespace llaminar2
             group.root_world_rank = topology_group.root_world_rank;
             group.tier_index = topology_group.tier_index;
             group.tier_priority = topology_group.tier_priority;
+            group.cohort_target = topology_group.cohort_target;
             group.intra_group_transport = static_cast<std::uint32_t>(
                 topology_group.intra_group_transport);
             group.inter_group_transport = static_cast<std::uint32_t>(
                 topology_group.inter_group_transport);
-            for (std::size_t index = 0;
-                 index < topology_group.participant_ids.size(); ++index)
-            {
-                group.participant_ids[index] = static_cast<std::uint32_t>(
-                    topology_group.participant_ids[index]);
-            }
+            group.participant_ids_offset = roster_cursor;
+            roster_cursor = checkedAdd(roster_cursor, checkedMultiply(group.participant_count,
+                sizeof(std::uint32_t), "group roster bytes"), "group roster frontier");
 
             group.owned_page_begin = cursor;
             group.participant_records_offset = cursor;
@@ -754,14 +869,11 @@ namespace llaminar2
                 "transport record");
             cursor = checkedAlignUp(cursor, 64u, "collected state");
             group.collected_state_offset = cursor;
-            const std::size_t state_words = checkedMultiply(
-                topology_group.participant_ids.size(),
-                checkedMultiply(
-                    kMoEOverlayDeviceControllerDemandPhaseCount,
-                    checkedMultiply(num_layers, num_experts,
-                                    "layer/expert state words"),
-                    "phase/layer/expert state words"),
-                "group member state words");
+            std::size_t state_words = 0u;
+            for (const auto participant : topology_group.participant_ids)
+                state_words = checkedAdd(state_words, static_cast<std::size_t>(moeOverlaySnapshotMemberWords(
+                    num_layers, num_experts, static_cast<std::uint32_t>(participant),
+                    static_cast<std::uint32_t>(topology.leader_participant_id))), "live group member state words");
             group.collected_state_words = state_words;
             cursor = checkedAdd(
                 cursor,
@@ -806,14 +918,16 @@ namespace llaminar2
             .group_layout_offset = group_layout_offset,
             .controller_header_offset = controller_header_offset,
             .inference_epoch_record_offset = inference_epoch_record_offset,
+            .inference_epoch_storage_bytes = MoEOverlayDeviceControllerInferenceEpochRecord::bytesForMembers(
+                static_cast<std::uint32_t>(topology.groups.at(topology.leader_group_id).participant_ids.size())),
             .command_header_offset = command_header_offset,
             .command_entries_offset = command_entries_offset,
             .payload_bytes_per_layer_offset =
                 payload_bytes_per_layer_offset,
-            .initial_owner_participants_offset =
-                initial_owner_participants_offset,
-            .initial_owner_participants_words =
-                initial_owner_participants_words,
+            .initial_route_targets_offset =
+                initial_route_targets_offset,
+            .initial_route_targets_words =
+                initial_route_targets_words,
             .demand_history_offset = demand_history_offset,
             .demand_history_words = demand_history_words,
             .economy_header_offset = economy_header_offset,
@@ -839,6 +953,10 @@ namespace llaminar2
                 payload_bytes_per_layer, num_layers, first_model_layer),
             .routed_experts_per_token = routed_experts_per_token,
             .first_model_layer = first_model_layer,
+            .logical_target_count = static_cast<std::uint32_t>(target_count),
+            .demand_publisher_participant_id = static_cast<std::uint32_t>(topology.leader_participant_id),
+            .demand_publisher_group_id = static_cast<std::uint32_t>(topology.leader_group_id),
+            .logical_target_metadata_offset = logical_target_metadata_offset,
         };
         if (layout_header_offset != result.leader_owned_begin || !result.valid())
         {
@@ -866,10 +984,10 @@ namespace llaminar2
             (!config_.payload_bytes_per_layer.empty() &&
              config_.payload_bytes_per_layer.size() != config_.num_layers) ||
             (dynamic_geometry &&
-             config_.initial_owner_participants.size() !=
+             config_.initial_route_targets.size() !=
                  initial_owner_words) ||
-            (!config_.initial_owner_participants.empty() &&
-             config_.initial_owner_participants.size() !=
+            (!config_.initial_route_targets.empty() &&
+             config_.initial_route_targets.size() !=
                  initial_owner_words) ||
             config_.minimum_window_activations == 0u ||
             config_.maximum_cycles_per_wave == 0u)
@@ -878,14 +996,13 @@ namespace llaminar2
                 "node-local device controller fabric requires complete topology and geometry");
         }
         if (std::any_of(
-                config_.initial_owner_participants.begin(),
-                config_.initial_owner_participants.end(),
-                [participant_count = config_.topology->participants.size()](
-                    std::uint32_t participant)
-                { return participant >= participant_count; }))
+                config_.initial_route_targets.begin(),
+                config_.initial_route_targets.end(),
+                [this](MoEOverlayRouteTarget target)
+                { return !config_.topology->groupForTarget(target); }))
         {
             throw std::invalid_argument(
-                "node-local device controller fabric initial owner table names an invalid participant");
+                "node-local device controller fabric initial target table names a foreign original target");
         }
         const auto *const mpi_topology = config_.mpi_ctx->topology();
         if (!mpi_topology || mpi_topology->node_shared_memory_namespace() == 0u)
@@ -899,7 +1016,7 @@ namespace llaminar2
             config_.num_layers,
             config_.num_experts,
             config_.command_capacity,
-            4096u,
+            hostPageBytes(),
             config_.payload_bytes_per_layer,
             config_.minimum_window_activations,
             config_.maximum_cycles_per_wave,
@@ -921,8 +1038,6 @@ namespace llaminar2
                 participating_world_ranks_.end()),
             participating_world_ranks_.end());
         if (participating_world_ranks_.empty() ||
-            participating_world_ranks_.size() >
-                kMoEOverlayDeviceControllerFabricMaxParticipants ||
             !std::binary_search(
                 participating_world_ranks_.begin(),
                 participating_world_ranks_.end(),
@@ -1021,8 +1136,8 @@ namespace llaminar2
             MoEOverlayDeviceControllerFabricSetupHeader *>(base);
         if (creator_)
         {
-            std::memset(base, 0, layout_.page_bytes);
-            *setup = MoEOverlayDeviceControllerFabricSetupHeader{};
+            std::memset(base, 0, layout_.leader_owned_begin);
+            *setup = layout_.setup;
             setup->topology_fingerprint =
                 config_.topology->topology_fingerprint;
             setup->node_namespace =
@@ -1045,7 +1160,7 @@ namespace llaminar2
             for (std::size_t index = 0;
                  index < participating_world_ranks_.size(); ++index)
             {
-                setup->participating_world_ranks[index] =
+                moeOverlayExtentArray<std::int32_t>(setup, layout_.leader_owned_begin, setup->participating_world_ranks_offset, setup->participating_rank_count)[index] =
                     participating_world_ranks_[index];
             }
             storeRelease(
@@ -1088,10 +1203,15 @@ namespace llaminar2
                 participating_world_ranks_.size() ||
             setup->leader_world_rank !=
                 config_.topology->leader_world_rank ||
+            setup->storage_bytes != layout_.setup.storage_bytes ||
+            setup->participating_world_ranks_offset != layout_.setup.participating_world_ranks_offset ||
+            setup->first_touch_ready_offset != layout_.setup.first_touch_ready_offset ||
+            setup->registration_ready_offset != layout_.setup.registration_ready_offset ||
+            setup->demand_histogram_rebase_ready_offset != layout_.setup.demand_histogram_rebase_ready_offset ||
             !std::equal(
                 participating_world_ranks_.begin(),
                 participating_world_ranks_.end(),
-                setup->participating_world_ranks))
+                moeOverlayExtentArray<std::int32_t>(setup, layout_.leader_owned_begin, setup->participating_world_ranks_offset, setup->participating_rank_count)))
         {
             publishSetupError(
                 MoEOverlayDeviceControllerFabricSetupError::TopologyMismatch);
@@ -1160,7 +1280,7 @@ namespace llaminar2
                 participant_records[member] =
                     MoEOverlayDeviceControllerParticipantRecord{};
                 participant_records[member].participant_id =
-                    group.participant_ids[member];
+                    config_.topology->groups.at(group.group_id).participant_ids[member];
                 participant_records[member].group_id = group.group_id;
                 participant_records[member].topology_fingerprint =
                     config_.topology->topology_fingerprint;
@@ -1180,7 +1300,7 @@ namespace llaminar2
                 *service =
                     MoEOverlayDeviceServiceTelemetryPublicationHeader{};
                 service->participant_id = static_cast<std::int32_t>(
-                    group.participant_ids[member]);
+                    config_.topology->groups.at(group.group_id).participant_ids[member]);
                 service->layer_count = config_.num_layers;
                 service->first_model_layer = config_.first_model_layer;
             }
@@ -1198,9 +1318,9 @@ namespace llaminar2
         }
         const auto index = static_cast<std::size_t>(
             rank_position - participating_world_ranks_.begin());
-        storeRelease(setup->first_touch_ready[index], kSetupPublication);
+        storeRelease(moeOverlayExtentArray<std::uint64_t>(setup, layout_.leader_owned_begin, setup->first_touch_ready_offset, setup->participating_rank_count)[index], kSetupPublication);
         waitForRankPublications(
-            setup->first_touch_ready,
+            moeOverlayExtentArray<std::uint64_t>(setup, layout_.leader_owned_begin, setup->first_touch_ready_offset, setup->participating_rank_count),
             kSetupPublication,
             "NUMA first-touch");
         if (creator_)
@@ -1250,6 +1370,9 @@ namespace llaminar2
                 layout_.groups.begin(),
                 layout_.groups.end(),
                 group_layout);
+            std::copy(layout_.logical_targets.begin(), layout_.logical_targets.end(),
+                at<MoEOverlayDeviceControllerLogicalTargetMetadata>(base,
+                    static_cast<std::size_t>(layout_.header.logical_target_metadata_offset)));
 
             for (const auto &participant : config_.topology->participants)
             {
@@ -1296,33 +1419,25 @@ namespace llaminar2
             controller->admission_epoch = config_.initial_durable_epoch;
 
             const auto &inference_group = config_.topology->groups.at(
-                static_cast<std::size_t>(
-                    config_.topology->leader_group_id));
-            auto *const inference_epoch = at<
-                MoEOverlayDeviceControllerInferenceEpochRecord>(
-                base,
-                static_cast<std::size_t>(
-                    layout_.header.inference_epoch_record_offset));
-            *inference_epoch =
-                MoEOverlayDeviceControllerInferenceEpochRecord{};
-            inference_epoch->publisher_participant_id =
-                static_cast<std::uint32_t>(
-                    config_.topology->leader_participant_id);
-            inference_epoch->topology_fingerprint =
-                config_.topology->topology_fingerprint;
+                static_cast<std::size_t>(config_.topology->leader_group_id));
+            auto *const inference_epoch = at<MoEOverlayDeviceControllerInferenceEpochRecord>(base,
+                static_cast<std::size_t>(layout_.header.inference_epoch_record_offset));
+            *inference_epoch = MoEOverlayDeviceControllerInferenceEpochRecord{};
+            inference_epoch->bindMemberExtent(static_cast<std::uint32_t>(inference_group.participant_ids.size()));
+            inference_epoch->publisher_participant_id = static_cast<std::uint32_t>(config_.topology->leader_participant_id);
+            inference_epoch->topology_fingerprint = config_.topology->topology_fingerprint;
             inference_epoch->epoch = config_.initial_durable_epoch;
-            for (const int participant_id :
-                 inference_group.participant_ids)
+            auto *epoch_ids = moeOverlayExtentArray<std::uint32_t>(inference_epoch,
+                layout_.header.inference_epoch_storage_bytes, inference_epoch->member_ids_offset,
+                inference_epoch->member_count);
+            std::copy(inference_group.participant_ids.begin(), inference_group.participant_ids.end(), epoch_ids);
+            std::sort(epoch_ids, epoch_ids + inference_epoch->member_count);
+            for (const auto &group : layout_.groups)
             {
-                if (participant_id < 0 ||
-                    participant_id >= static_cast<int>(
-                        kMoEOverlayDeviceControllerInferenceEpochMaxParticipants))
-                {
-                    throw std::logic_error(
-                        "device controller continuation epoch member exceeds its fixed ABI");
-                }
-                inference_epoch->participant_mask |=
-                    1u << static_cast<std::uint32_t>(participant_id);
+                auto *ids = moeOverlayExtentArray<std::uint32_t>(base, layout_.mapping_bytes,
+                    group.participant_ids_offset, group.participant_count);
+                const auto &original = config_.topology->groups.at(group.group_id).participant_ids;
+                std::copy(original.begin(), original.end(), ids);
             }
 
             auto *const command = at<
@@ -1347,23 +1462,23 @@ namespace llaminar2
                         ? 0u
                         : config_.payload_bytes_per_layer[layer];
             }
-            auto *const initial_owners = at<std::uint32_t>(
+            auto *const initial_owners = at<MoEOverlayRouteTarget>(
                 base,
                 static_cast<std::size_t>(
-                    layout_.header.initial_owner_participants_offset));
-            if (config_.initial_owner_participants.empty())
+                    layout_.header.initial_route_targets_offset));
+            if (config_.initial_route_targets.empty())
             {
                 std::fill_n(
                     initial_owners,
                     static_cast<std::size_t>(
-                        layout_.header.initial_owner_participants_words),
-                    std::numeric_limits<std::uint32_t>::max());
+                        layout_.header.initial_route_targets_words),
+                    MoEOverlayRouteTarget{});
             }
             else
             {
                 std::copy(
-                    config_.initial_owner_participants.begin(),
-                    config_.initial_owner_participants.end(),
+                    config_.initial_route_targets.begin(),
+                    config_.initial_route_targets.end(),
                     initial_owners);
             }
             auto *const demand_history = at<std::uint64_t>(
@@ -1383,8 +1498,8 @@ namespace llaminar2
                     layout_.header.economy_header_offset));
             *economy = MoEOverlayDeviceControllerEconomyHeader{};
             economy->tier_count = layout_.header.tier_count;
-            economy->participant_count =
-                layout_.header.participant_count;
+            economy->logical_target_count =
+                layout_.header.logical_target_count;
             economy->layer_count = layout_.header.num_layers;
             economy->topology_fingerprint =
                 config_.topology->topology_fingerprint;
@@ -1456,26 +1571,27 @@ namespace llaminar2
             base,
             static_cast<std::size_t>(
                 layout_.header.inference_epoch_record_offset));
-        const auto *const published_initial_owners = at<std::uint32_t>(
+        const auto *const published_initial_owners = at<MoEOverlayRouteTarget>(
             base,
             static_cast<std::size_t>(
-                layout_.header.initial_owner_participants_offset));
+                layout_.header.initial_route_targets_offset));
         const bool initial_owners_match =
-            config_.initial_owner_participants.empty() ||
+            config_.initial_route_targets.empty() ||
             std::equal(
-                config_.initial_owner_participants.begin(),
-                config_.initial_owner_participants.end(),
-                published_initial_owners);
-        std::uint32_t expected_inference_mask = 0u;
-        for (const int participant_id :
-             config_.topology->groups.at(
-                 static_cast<std::size_t>(
-                     config_.topology->leader_group_id))
-                 .participant_ids)
-        {
-            expected_inference_mask |=
-                1u << static_cast<std::uint32_t>(participant_id);
-        }
+                config_.initial_route_targets.begin(),
+                config_.initial_route_targets.end(),
+                published_initial_owners, [](MoEOverlayRouteTarget a, MoEOverlayRouteTarget b) { return a.word() == b.word(); });
+        auto expected_inference_ids = config_.topology->groups.at(
+            static_cast<std::size_t>(config_.topology->leader_group_id)).participant_ids;
+        std::sort(expected_inference_ids.begin(), expected_inference_ids.end());
+        const auto *published_inference_ids = published_inference_epoch->memberIds(
+            layout_.header.inference_epoch_storage_bytes);
+        const bool inference_roster_matches = published_inference_ids &&
+            published_inference_epoch->member_count == expected_inference_ids.size() &&
+            std::equal(expected_inference_ids.begin(), expected_inference_ids.end(), published_inference_ids);
+        const bool logical_roster_matches = std::equal(layout_.logical_targets.begin(), layout_.logical_targets.end(),
+            at<MoEOverlayDeviceControllerLogicalTargetMetadata>(base,
+                static_cast<std::size_t>(layout_.header.logical_target_metadata_offset)));
         if (published_layout->magic !=
                 kMoEOverlayDeviceControllerFabricMagic ||
             published_layout->version !=
@@ -1484,13 +1600,18 @@ namespace llaminar2
             published_layout->num_layers != config_.num_layers ||
             published_layout->inference_epoch_record_offset !=
                 layout_.header.inference_epoch_record_offset ||
+            published_layout->inference_epoch_storage_bytes != layout_.header.inference_epoch_storage_bytes ||
             published_layout->payload_bytes_per_layer_offset !=
                 layout_.header.payload_bytes_per_layer_offset ||
-            published_layout->initial_owner_participants_offset !=
-                layout_.header.initial_owner_participants_offset ||
-            published_layout->initial_owner_participants_words !=
-                layout_.header.initial_owner_participants_words ||
-            !initial_owners_match ||
+            published_layout->initial_route_targets_offset !=
+                layout_.header.initial_route_targets_offset ||
+            published_layout->initial_route_targets_words !=
+                layout_.header.initial_route_targets_words ||
+            !initial_owners_match || !logical_roster_matches ||
+            published_layout->logical_target_count != layout_.header.logical_target_count ||
+            published_layout->logical_target_metadata_offset != layout_.header.logical_target_metadata_offset ||
+            published_layout->demand_publisher_participant_id != layout_.header.demand_publisher_participant_id ||
+            published_layout->demand_publisher_group_id != layout_.header.demand_publisher_group_id ||
             published_layout->minimum_window_activations !=
                 layout_.header.minimum_window_activations ||
             published_layout->maximum_cycles_per_wave !=
@@ -1520,8 +1641,7 @@ namespace llaminar2
                 kMoEOverlayDeviceControllerInferenceEpochMagic ||
             published_inference_epoch->version !=
                 kMoEOverlayDeviceControllerInferenceEpochVersion ||
-            published_inference_epoch->participant_mask !=
-                expected_inference_mask ||
+            !inference_roster_matches ||
             published_inference_epoch->publisher_participant_id !=
                 static_cast<std::uint32_t>(
                     config_.topology->leader_participant_id) ||
@@ -1570,9 +1690,9 @@ namespace llaminar2
             local_rank);
         const auto index = static_cast<std::size_t>(
             rank_position - participating_world_ranks_.begin());
-        storeRelease(setup->registration_ready[index], kSetupPublication);
+        storeRelease(moeOverlayExtentArray<std::uint64_t>(setup, layout_.leader_owned_begin, setup->registration_ready_offset, setup->participating_rank_count)[index], kSetupPublication);
         waitForRankPublications(
-            setup->registration_ready,
+            moeOverlayExtentArray<std::uint64_t>(setup, layout_.leader_owned_begin, setup->registration_ready_offset, setup->participating_rank_count),
             kSetupPublication,
             "GPU page registration");
         if (creator_)
@@ -1726,14 +1846,19 @@ namespace llaminar2
         }
         const std::size_t member_index = static_cast<std::size_t>(
             member - topology_group->participant_ids.begin());
-        const std::size_t words_per_participant = checkedMultiply(
-            kMoEOverlayDeviceControllerDemandPhaseCount,
-            checkedMultiply(config_.num_layers, config_.num_experts,
-                            "participant layer/expert words"),
-            "participant collected-state words");
+        std::uint64_t participant_word_offset = 0u;
+        std::vector<std::uint32_t> original_ids(topology_group->participant_ids.begin(), topology_group->participant_ids.end());
+        if (!moeOverlaySnapshotMemberOffset(layout_.header, group, original_ids.data(),
+                static_cast<std::uint32_t>(member_index), participant_word_offset))
+            throw std::logic_error("Device controller snapshot member extent differs from its original group");
 
         auto *const base = static_cast<std::byte *>(
             mapped_region_->deviceAlias(participant.device));
+        MoEOverlayDeviceControllerInferenceEpochRecord epoch_geometry;
+        epoch_geometry.bindMemberExtent(group.participant_count);
+        const auto epoch_member_index = static_cast<std::size_t>(std::count_if(
+            topology_group->participant_ids.begin(), topology_group->participant_ids.end(),
+            [participant_id](int id) { return id < participant_id; }));
         MoEOverlayDeviceControllerParticipantBinding binding{
             .device = participant.device,
             .participant_id = participant_id,
@@ -1764,6 +1889,8 @@ namespace llaminar2
                 base,
                 static_cast<std::size_t>(
                     layout_.header.group_layout_offset)),
+            .logical_targets = at<MoEOverlayDeviceControllerLogicalTargetMetadata>(
+                base, static_cast<std::size_t>(layout_.header.logical_target_metadata_offset)),
             .controller = at<MoEOverlayDeviceControllerSharedHeader>(
                 base,
                 static_cast<std::size_t>(
@@ -1773,6 +1900,10 @@ namespace llaminar2
                 base,
                 static_cast<std::size_t>(
                     layout_.header.inference_epoch_record_offset)),
+            .inference_epoch_storage_bytes = layout_.header.inference_epoch_storage_bytes,
+            .inference_epoch_arrival = topology_group->group_id == config_.topology->leader_group_id
+                ? at<std::uint64_t>(base, static_cast<std::size_t>(layout_.header.inference_epoch_record_offset +
+                    epoch_geometry.arrival_sequences_offset)) + epoch_member_index : nullptr,
             .command = at<MoEOverlayDeviceControllerCommandHeader>(
                 base,
                 static_cast<std::size_t>(
@@ -1785,10 +1916,10 @@ namespace llaminar2
                 base,
                 static_cast<std::size_t>(
                     layout_.header.payload_bytes_per_layer_offset)),
-            .initial_owner_participants = at<std::uint32_t>(
+            .initial_route_targets = at<MoEOverlayRouteTarget>(
                 base,
                 static_cast<std::size_t>(
-                    layout_.header.initial_owner_participants_offset)),
+                    layout_.header.initial_route_targets_offset)),
             .demand_history = at<std::uint64_t>(
                 base,
                 static_cast<std::size_t>(
@@ -1837,18 +1968,10 @@ namespace llaminar2
             .group_collected_state = at<std::uint64_t>(
                 base,
                 static_cast<std::size_t>(group.collected_state_offset)),
-            .participant_collected_state = at<std::uint64_t>(
-                base,
-                checkedAdd(
-                    static_cast<std::size_t>(group.collected_state_offset),
-                    checkedMultiply(
-                        member_index,
-                        checkedMultiply(
-                            words_per_participant,
-                            sizeof(std::uint64_t),
-                            "participant collected-state bytes"),
-                        "participant collected-state offset"),
-                    "participant collected-state address")),
+            .participant_collected_state = at<std::uint64_t>(base, checkedAdd(
+                static_cast<std::size_t>(group.collected_state_offset), checkedMultiply(
+                    static_cast<std::size_t>(participant_word_offset), sizeof(std::uint64_t),
+                    "live participant snapshot bytes"), "live participant snapshot address")),
             .service_telemetry_publication = at<
                 MoEOverlayDeviceServiceTelemetryPublicationHeader>(
                 base,
@@ -1897,7 +2020,8 @@ namespace llaminar2
             static_cast<std::size_t>(
                 layout_.header.command_header_offset));
 
-        const std::uint32_t mask = loadAcquire(record->participant_mask);
+        const auto *ids = record->memberIds(layout_.header.inference_epoch_storage_bytes);
+        auto *arrivals = record->arrivals(layout_.header.inference_epoch_storage_bytes);
         description
             << "controller_epoch_barrier{controller_state="
             << loadAcquire(controller->state)
@@ -1907,7 +2031,7 @@ namespace llaminar2
             << ",transaction=" << loadAcquire(controller->transaction_id)
             << ",magic=" << loadAcquire(record->magic)
             << ",version=" << loadAcquire(record->version)
-            << ",mask=0x" << std::hex << mask << std::dec
+            << ",members=" << record->member_count
             << ",publisher="
             << loadAcquire(record->publisher_participant_id)
             << ",frozen_epoch=" << loadAcquire(record->epoch)
@@ -1915,19 +2039,11 @@ namespace llaminar2
             << loadAcquire(record->publication_sequence)
             << ",arrivals=[";
         bool first = true;
-        for (std::uint32_t participant = 0u;
-             participant <
-                 kMoEOverlayDeviceControllerInferenceEpochMaxParticipants;
-             ++participant)
+        for (std::uint32_t member = 0u; ids && arrivals && member < record->member_count; ++member)
         {
-            if ((mask & (1u << participant)) == 0u)
-                continue;
-            if (!first)
-                description << ',';
+            if (!first) description << ',';
             first = false;
-            description << participant << ':'
-                        << loadAcquire(
-                               record->arrival_sequence[participant]);
+            description << ids[member] << ':' << loadAcquire(arrivals[member]);
         }
         description
             << "],command{transaction="
@@ -2034,8 +2150,8 @@ namespace llaminar2
             economy->version !=
                 kMoEOverlayDeviceControllerFabricVersion ||
             economy->tier_count != layout_.header.tier_count ||
-            economy->participant_count !=
-                layout_.header.participant_count ||
+            economy->logical_target_count !=
+                layout_.header.logical_target_count ||
             economy->layer_count != layout_.header.num_layers ||
             economy->service_phase_count !=
                 kMoEOverlayDeviceControllerEconomyServicePhaseCount ||
@@ -2054,8 +2170,8 @@ namespace llaminar2
             static_cast<std::size_t>(
                 layout_.header.economy_service_cost_words),
             false);
-        if (profiles.service->costs.size() !=
-            static_cast<std::size_t>(layout_.header.tier_count) *
+        if (profiles.service->target_costs.size() !=
+            static_cast<std::size_t>(layout_.header.logical_target_count) *
                 layout_.header.num_layers ||
             !profiles.service->production_topology.valid() ||
             profiles.service->production_topology.layerCount() !=
@@ -2064,7 +2180,7 @@ namespace llaminar2
                 layout_.header.first_model_layer)
         {
             throw std::invalid_argument(
-                "certified device economy service profile has incomplete tier/layer topology");
+                "certified device economy service profile has incomplete logical-target/layer topology");
         }
         const auto active_sources =
             profiles.service->production_topology.economyActiveSources();
@@ -2082,15 +2198,30 @@ namespace llaminar2
             throw std::invalid_argument(
                 "certified device economy service profile enables no production phase");
         }
-        for (const auto &row : profiles.service->costs)
+        const auto target_index = [this](MoEOverlayRouteTarget target) -> std::size_t
         {
-            if (row.tier_index < 0 || row.layer < 0 ||
-                static_cast<std::uint32_t>(row.tier_index) >=
-                    layout_.header.tier_count ||
-                !layout_.containsModelLayer(row.layer))
+            for (std::size_t index = 0; index < layout_.logical_targets.size(); ++index)
+                if (layout_.logical_targets[index].target.word() == target.word()) return index;
+            throw std::invalid_argument("Certified economy names a foreign original logical target");
+        };
+        for (const auto &row : profiles.service->target_costs)
+        {
+            const auto vertex = target_index(row.target);
+            if (row.layer < 0 || !layout_.containsModelLayer(row.layer))
             {
                 throw std::invalid_argument(
                     "certified device economy service profile contains an invalid coordinate");
+            }
+            if (row.target.isCohort())
+            {
+                const auto &plan = profiles.service->prepared_plan;
+                if (!plan || !plan->authenticates(plan))
+                    throw std::invalid_argument("Cohort economy requires its original prepared-target service owner");
+                const auto &declaration = plan->entry({row.target, row.layer});
+                const auto measured = plan->cohort(declaration);
+                const auto original = config_.topology->cohortForTarget(row.target, row.layer);
+                if (!measured || measured.get() != original.get() || measured.owner_before(original) || original.owner_before(measured))
+                    throw std::invalid_argument("Cohort economy changed the original source/cut authority");
             }
             for (std::uint32_t phase = 0u;
                  phase <
@@ -2098,7 +2229,7 @@ namespace llaminar2
                  ++phase)
             {
                 const std::size_t offset =
-                    (static_cast<std::size_t>(row.tier_index) *
+                    (vertex *
                          layout_.header.num_layers +
                      layout_.storageIndexForModelLayer(row.layer)) *
                         kMoEOverlayDeviceControllerEconomyServicePhaseCount +
@@ -2130,52 +2261,40 @@ namespace llaminar2
             base,
             static_cast<std::size_t>(
                 layout_.header.economy_migration_cost_offset));
-        const std::size_t participant_count =
-            layout_.header.participant_count;
+        const std::size_t target_count =
+            layout_.header.logical_target_count;
         const std::size_t layer_count = layout_.header.num_layers;
         std::vector<bool> migration_seen(
             static_cast<std::size_t>(
                 layout_.header.economy_migration_cost_entries),
             false);
         for (std::size_t participant = 0u;
-             participant < participant_count;
+             participant < target_count;
              ++participant)
         {
             for (std::size_t layer = 0u; layer < layer_count; ++layer)
             {
                 migration_seen[
-                    (participant * participant_count + participant) *
+                    (participant * target_count + participant) *
                         layer_count +
                     layer] = true;
             }
         }
         if (profiles.migration->costs.size() !=
-            participant_count * (participant_count - 1u) * layer_count)
+            target_count * (target_count - 1u) * layer_count)
         {
             throw std::invalid_argument(
                 "certified device economy migration profile has incomplete directed geometry");
         }
-        for (const auto &row : profiles.migration->wholeCosts())
+        for (const auto &row : profiles.migration->costs)
         {
-            if (row.source_participant < 0 ||
-                row.destination_participant < 0 || row.layer < 0 ||
-                row.source_participant == row.destination_participant ||
-                static_cast<std::size_t>(row.source_participant) >=
-                    participant_count ||
-                static_cast<std::size_t>(row.destination_participant) >=
-                    participant_count ||
-                !layout_.containsModelLayer(row.layer) ||
-                row.transfer_and_repack_ns == 0u)
-            {
-                throw std::invalid_argument(
-                    "certified device economy migration profile contains an invalid coordinate or zero transfer price");
-            }
-            const std::size_t offset =
-                (static_cast<std::size_t>(row.source_participant) *
-                     participant_count +
-                 static_cast<std::size_t>(row.destination_participant)) *
-                    layer_count +
-                layout_.storageIndexForModelLayer(row.layer);
+            const auto source = target_index(row.coordinate.source_target);
+            const auto destination = target_index(row.coordinate.destination_target);
+            if (!row.coordinate.valid() || !layout_.containsModelLayer(row.coordinate.layer) ||
+                source == destination || row.transfer_and_repack_ns == 0u)
+                throw std::invalid_argument("Certified device migration price has a foreign target/layer or zero transfer price");
+            const std::size_t offset = (source * target_count + destination) * layer_count +
+                layout_.storageIndexForModelLayer(row.coordinate.layer);
             if (migration_seen[offset])
             {
                 throw std::invalid_argument(
@@ -2281,7 +2400,7 @@ namespace llaminar2
             mapping_lifetime_->base);
         const auto index = static_cast<std::size_t>(
             position - participating_world_ranks_.begin());
-        if (loadAcquire(setup->demand_histogram_rebase_ready[index]) != 0u)
+        if (loadAcquire(moeOverlayExtentArray<std::uint64_t>(setup, layout_.leader_owned_begin, setup->demand_histogram_rebase_ready_offset, setup->participating_rank_count)[index]) != 0u)
         {
             throw std::logic_error(
                 "device controller histogram rebase may be published exactly once per rank");
@@ -2291,7 +2410,7 @@ namespace llaminar2
         // Peers therefore cannot observe the acknowledgement before both
         // process-local phase baselines are durable on every local GPU.
         storeRelease(
-            setup->demand_histogram_rebase_ready[index],
+            moeOverlayExtentArray<std::uint64_t>(setup, layout_.leader_owned_begin, setup->demand_histogram_rebase_ready_offset, setup->participating_rank_count)[index],
             kSetupPublication);
     }
 
@@ -2312,7 +2431,7 @@ namespace llaminar2
              ++index)
         {
             if (loadAcquire(
-                    setup->demand_histogram_rebase_ready[index]) !=
+                    moeOverlayExtentArray<std::uint64_t>(setup, layout_.leader_owned_begin, setup->demand_histogram_rebase_ready_offset, setup->participating_rank_count)[index]) !=
                 kSetupPublication)
             {
                 return false;
@@ -2407,11 +2526,10 @@ namespace llaminar2
                topology_fingerprint != 0u && command_capacity != 0u &&
                layout && controller && command && command_entries &&
                group_record_count > 0u &&
-               group_record_count <=
-                   kMoEOverlayDeviceControllerFabricMaxParticipants &&
+               group_records.size() == group_record_count &&
+               topology_participant_records.size() == group_record_count &&
+               topology_participant_record_counts.size() == group_record_count &&
                participant_records && participant_record_count > 0u &&
-               participant_record_count <=
-                   kMoEOverlayDeviceControllerFabricMaxParticipants &&
                transport && lifetime &&
                layout->magic == kMoEOverlayDeviceControllerFabricMagic &&
                layout->version == kMoEOverlayDeviceControllerFabricVersion &&
@@ -2433,15 +2551,13 @@ namespace llaminar2
         {
             const auto *record = group_records[index];
             const auto *participants = topology_participant_records[index];
-            const auto participant_count =
+            const auto target_count =
                 topology_participant_record_counts[index];
             if (!record || record->magic != kMoEOverlayDeviceControllerMagic ||
                 record->version != kMoEOverlayDeviceControllerVersion ||
                 record->group_id != index ||
                 record->topology_fingerprint != topology_fingerprint ||
-                !participants || participant_count == 0u ||
-                participant_count >
-                    kMoEOverlayDeviceControllerFabricMaxParticipants)
+                !participants || target_count == 0u)
             {
                 return false;
             }
@@ -2501,6 +2617,9 @@ namespace llaminar2
             .lifetime = std::static_pointer_cast<const void>(
                 mapping_lifetime_),
         };
+        binding.group_records.resize(binding.group_record_count);
+        binding.topology_participant_records.resize(binding.group_record_count);
+        binding.topology_participant_record_counts.resize(binding.group_record_count);
         for (std::uint32_t index = 0u;
              index < binding.group_record_count;
              ++index)

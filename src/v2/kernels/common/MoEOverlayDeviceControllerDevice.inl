@@ -14,6 +14,8 @@
 #include "execution/moe/DeviceMoERuntimeABI.h"
 #include "execution/moe/MoEOverlayDeviceControllerKernels.h"
 #include "execution/moe/MoEOverlayCycleSearch.h"
+#include "execution/moe/MoEOverlayLogicalTargetPolicy.h"
+#include "execution/moe/MoEOverlayRuntimeCandidateRow.h"
 #include "kernels/common/DeviceMoEFloatingMatrixDesc.h"
 #include "kernels/common/DeviceNativeQuantisedMatrixDesc.h"
 
@@ -29,80 +31,8 @@ namespace llaminar2::moe_overlay_controller_device
     /** Fixed block width used by the deterministic snapshot reduction. */
     inline constexpr std::uint32_t kControllerThreads = 256u;
 
-    /** Per-block scratch for one deterministic topology-wide policy author. */
-    struct DynamicPolicyScratch
-    {
-        /** One validated mapped snapshot plane per physical participant. */
-        const std::uint64_t *participant_state_base[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::uint64_t expert_counts[
-            kMoEOverlayDeviceControllerFabricMaxExperts];
-        /** Demand uses the exact decode/prefill/verifier service-profile order. */
-        std::uint64_t phase_expert_counts[
-            kMoEOverlayDeviceControllerDemandPhaseCount]
-            [kMoEOverlayDeviceControllerFabricMaxExperts];
-        /** Current full-layer routed load by phase and physical participant. */
-        std::uint64_t phase_participant_load[
-            kMoEOverlayDeviceControllerDemandPhaseCount]
-            [kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::uint64_t participant_load[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        /** Transaction-local device cache of immutable per-tier service cost. */
-        std::uint64_t service_cost[
-            kMoEOverlayDeviceControllerFabricMaxParticipants]
-            [kMoEOverlayDeviceControllerDemandPhaseCount];
-        /** Layer-local cache avoids repeated PCIe reads while scoring cycles. */
-        std::uint64_t migration_transfer_and_repack_ns
-            [kMoEOverlayDeviceControllerFabricMaxParticipants]
-            [kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::uint64_t migration_inference_interference_ns
-            [kMoEOverlayDeviceControllerFabricMaxParticipants]
-            [kMoEOverlayDeviceControllerFabricMaxParticipants];
-        /** Layer-local hysteresis generation for each expert. */
-        std::uint64_t last_moved[
-            kMoEOverlayDeviceControllerFabricMaxExperts];
-        std::uint64_t minimum_residency_generations;
-        std::uint64_t payoff_horizon_tokens;
-        std::uint64_t minimum_net_benefit_ns;
-        std::int32_t current_owner[
-            kMoEOverlayDeviceControllerFabricMaxExperts];
-        std::int32_t desired_owner[
-            kMoEOverlayDeviceControllerFabricMaxExperts];
-        std::int32_t candidate_owner[
-            kMoEOverlayDeviceControllerFabricMaxExperts];
-        std::int32_t participant_priority[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::int32_t participant_tier[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::int32_t priorities[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::uint32_t ordered_experts[
-            kMoEOverlayDeviceControllerFabricMaxExperts];
-        std::uint32_t quotas[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::uint32_t remaining[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::uint32_t priority_participants[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::uint32_t cycle[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::uint32_t best_cycle[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        /** Best ordinary-economy cycle when no preferred-axis cycle exists. */
-        std::uint32_t fallback_cycle[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::uint32_t dfs_source[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::uint32_t dfs_next_expert[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-        std::uint8_t excluded[
-            kMoEOverlayDeviceControllerFabricMaxExperts];
-        /** Transaction-local mask used to enumerate disjoint cycle candidates. */
-        std::uint8_t enumerated[
-            kMoEOverlayDeviceControllerFabricMaxExperts];
-        std::uint8_t visited[
-            kMoEOverlayDeviceControllerFabricMaxParticipants];
-    };
+    /** Views borrow the sole admitted device workspace; no per-block arrays exist. */
+    using DynamicPolicyScratch = MoEOverlayDynamicPolicyWorkspaceView;
 
     /** Lexicographic service objective shared with the CPU policy oracle. */
     struct DynamicPlacementScore
@@ -194,14 +124,6 @@ namespace llaminar2::moe_overlay_controller_device
     static_assert(
         offsetof(RuntimePlacementBankView, overlay_route_participant) ==
         moe_runtime_abi::kOverlayRouteParticipantOffset);
-
-    inline constexpr std::uint32_t kRuntimeExpertFlagValid = 1u << 0u;
-    inline constexpr std::uint32_t kRuntimeExpertFlagResident = 1u << 1u;
-    inline constexpr std::uint32_t kRuntimeExpertFlagPreferredOwner = 1u << 3u;
-    inline constexpr std::uint32_t kRuntimeExpertFlagLocalCompute = 1u << 4u;
-    inline constexpr std::uint32_t kRuntimeExpertFlagTransferSlot = 1u << 5u;
-    inline constexpr std::uint8_t kRuntimeReplicaRoleNone = 0u;
-    inline constexpr std::uint8_t kRuntimeReplicaRolePrimary = 1u;
 
     /** @return Raw fixed-width value for one protocol enum. */
     template <typename Enum>
@@ -357,6 +279,16 @@ namespace llaminar2::moe_overlay_controller_device
             base + moe_runtime_abi::kParticipantCountOffset);
     }
 
+    /** @return SAME immutable original fragment binding embedded in the runtime ABI. */
+    __device__ __forceinline__ const DeviceMoEIntermediateShardBinding &runtimeFragmentBinding(
+        const DeviceMoELayerRuntime *runtime_layers, std::uint32_t layer) noexcept
+    {
+        const auto *base = reinterpret_cast<const std::byte *>(runtime_layers) +
+            static_cast<std::uint64_t>(layer) * moe_runtime_abi::kLayerRuntimeBytes;
+        return *reinterpret_cast<const DeviceMoEIntermediateShardBinding *>(
+            base + moe_runtime_abi::kIntermediateShardBindingOffset);
+    }
+
     /**
      * @return Whether the layer owns its embedded durable banks.
      *
@@ -374,54 +306,6 @@ namespace llaminar2::moe_overlay_controller_device
         return *reinterpret_cast<const void *const *>(
                    base + moe_runtime_abi::kOverlayPlacementBanksOffset) ==
                nullptr;
-    }
-
-    /** @return Device-safe completeness check for one NativeQuantised matrix. */
-    __device__ __forceinline__ bool nativeMatrixReady(
-        const DeviceNativeQuantisedMatrixDesc &matrix) noexcept
-    {
-        return matrix.payload != nullptr && matrix.scales != nullptr &&
-               matrix.n > 0 && matrix.k > 0 && matrix.blocks_per_row > 0u;
-    }
-
-    /** @return Device-safe completeness check for one floating matrix. */
-    __device__ __forceinline__ bool floatingMatrixReady(
-        const DeviceMoEFloatingMatrixDesc &matrix) noexcept
-    {
-        return matrix.data != nullptr && matrix.n > 0 && matrix.k > 0;
-    }
-
-    /** @return Whether an arrival contains exactly its shape-consistent movable family. */
-    __device__ __forceinline__ bool runtimeArrivalReady(
-        const RuntimeExpertDescriptorView &descriptor,
-        std::uint32_t expert) noexcept
-    {
-        if (descriptor.logical_expert_id !=
-                static_cast<std::int32_t>(expert) ||
-            descriptor.local_slot < 0 || !deviceMoEProjectionPayloadValid(descriptor))
-        {
-            return false;
-        }
-        if (descriptor.weight_format == DeviceMoEWeightFormat::NativeQuantised)
-        {
-            return nativeMatrixReady(descriptor.gate) &&
-                   nativeMatrixReady(descriptor.up) &&
-                   descriptor.gate.n == descriptor.up.n &&
-                   descriptor.gate.k == descriptor.up.k &&
-                   (descriptor.projection_set == DeviceMoEProjectionSet::GateUp ||
-                    (nativeMatrixReady(descriptor.down) &&
-                     descriptor.down.n == descriptor.gate.k &&
-                     descriptor.down.k == descriptor.gate.n));
-        }
-        return deviceMoEWeightFormatIsFloating(descriptor.weight_format) &&
-               floatingMatrixReady(descriptor.floating_gate) &&
-               floatingMatrixReady(descriptor.floating_up) &&
-               descriptor.floating_gate.n == descriptor.floating_up.n &&
-               descriptor.floating_gate.k == descriptor.floating_up.k &&
-               (descriptor.projection_set == DeviceMoEProjectionSet::GateUp ||
-                (floatingMatrixReady(descriptor.floating_down) &&
-                 descriptor.floating_down.n == descriptor.floating_gate.k &&
-                 descriptor.floating_down.k == descriptor.floating_gate.n));
     }
 
     /**
@@ -452,7 +336,81 @@ namespace llaminar2::moe_overlay_controller_device
         {
             return nullptr;
         }
-        return binding.groups + group_id;
+        const auto *group = binding.groups + group_id;
+        return moeOverlayGroupMemberIds(binding.mapped_base, binding.mapped_bytes, *group)
+            ? group : nullptr;
+    }
+
+    /** @return Original group/member extent for a complete target; no scalar cohort representative. */
+    __device__ __forceinline__ const MoEOverlayDeviceControllerFabricGroupLayout *targetGroup(
+        const MoEOverlayDeviceControllerDeviceBinding &binding, MoEOverlayRouteTarget target) noexcept
+    {
+        if (target.isWhole())
+        {
+            if (static_cast<std::uint32_t>(target.word()) >= binding.layout->participant_count)
+                return nullptr;
+            const auto member = snapshotPeerRecord(binding.participants + target.word());
+            const auto *group = groupLayout(binding, member.group_id);
+            const auto *members = group ? moeOverlayGroupMemberIds(binding.mapped_base,
+                binding.mapped_bytes, *group) : nullptr;
+            std::uint32_t group_member = 0u;
+            return group && members && group->cohort_target.isAbsent() &&
+                member.participant_id == static_cast<std::uint32_t>(target.word()) &&
+                moeOverlayFindOriginalGroupMember(members, group->participant_count, member.participant_id, group_member)
+                    ? group : nullptr;
+        }
+        if (!target.isCohort())
+            return nullptr;
+        const MoEOverlayDeviceControllerFabricGroupLayout *found = nullptr;
+        for (std::uint32_t index = 0; index < binding.layout->group_count; ++index)
+        {
+            const auto *group = groupLayout(binding, index);
+            if (!group || group->cohort_target.word() != target.word())
+                continue;
+            if (found || group->participant_count < 2 || group->tier_index < 0 ||
+                std::int64_t(target.word()) != -std::int64_t(group->tier_index) - 2 ||
+                group->intra_group_transport != raw(MoEOverlayDeviceControllerIntraGroupTransport::NativeCollective))
+                return nullptr;
+            found = group;
+        }
+        return found;
+    }
+
+    /** @brief Validate/lower one destination against original source/member geometry before any bank mutation. */
+    __device__ __forceinline__ bool candidateRow(
+        const MoEOverlayDeviceControllerActionLaunch &launch,
+        const MoEOverlayDeviceMovementCommand &entry,
+        MoEOverlayRuntimeCandidateRow<RuntimeExpertDescriptorView> &row) noexcept
+    {
+        const auto &binding = launch.binding;
+        const auto &publication = launch.runtime_publication;
+        const auto *destination = targetGroup(binding, entry.destination_target);
+        if (!destination || entry.layer >= publication.layer_count)
+            return false;
+        const auto model_layer = std::int64_t(binding.layout->first_model_layer) + entry.layer;
+        if (model_layer < 0 || model_layer > INT32_MAX)
+            return false;
+        const auto &fragment = runtimeFragmentBinding(publication.runtime_layers, entry.layer);
+        const auto *original_group = groupLayout(binding, binding.group_id);
+        if (!original_group)
+            return false;
+        const bool local = entry.destination_target.isWhole()
+            ? entry.destination_target.word() == static_cast<std::int32_t>(binding.participant_id)
+            : destination->group_id == binding.group_id;
+        int whole_member = -1;
+        if (entry.destination_target.isWhole() && destination->group_id == binding.group_id)
+            whole_member = static_cast<int>(snapshotPeerRecord(
+                binding.participants + entry.destination_target.word()).domain_participant_index);
+        RuntimeExpertDescriptorView arrival{};
+        if (local)
+            arrival = preparedArrival(publication, entry.ordinal);
+        return buildMoEOverlayRuntimeCandidateRow(
+            {.model_layer = static_cast<int>(model_layer), .expert_count = publication.expert_count,
+             .global_participant = static_cast<int>(binding.participant_id),
+             .domain_participant = publication.domain_participant_id,
+             .domain_participants = publication.domain_participant_count,
+             .original_cohort_target = original_group->cohort_target, .fragment = fragment},
+            entry.expert, entry.destination_target, whole_member, local ? &arrival : nullptr, row);
     }
 
     /** @return Mapped group record resolved only from an immutable offset. */
@@ -539,7 +497,7 @@ namespace llaminar2::moe_overlay_controller_device
                         kMoEOverlayDeviceControllerFabricVersion ||
                     loadPeerPublished(&record->group_id) != group_id ||
                     loadPeerPublished(&record->participant_id) !=
-                        loadPeerPublished(&group->participant_ids[member]) ||
+                        loadPeerPublished(moeOverlayGroupMemberIds(binding.mapped_base, binding.mapped_bytes, *group) + member) ||
                     loadPeerPublished(&record->topology_fingerprint) !=
                         binding.topology_fingerprint ||
                     loadSystemAcquire(&record->retirement_ready_epoch) != epoch)
@@ -562,8 +520,14 @@ namespace llaminar2::moe_overlay_controller_device
                 kMoEOverlayDeviceControllerFabricVersion ||
             loadPeerPublished(&binding.layout->topology_fingerprint) !=
                 binding.topology_fingerprint ||
-            loadPeerPublished(&binding.layout->mapping_bytes) !=
-                binding.mapped_bytes ||
+            loadPeerPublished(&binding.layout->mapping_bytes) != binding.mapped_bytes ||
+            !binding.layout->logical_target_count || binding.layout->logical_target_count > binding.layout->participant_count ||
+            binding.layout->demand_publisher_participant_id >= binding.layout->participant_count ||
+            binding.layout->demand_publisher_group_id >= binding.layout->group_count ||
+            !moeOverlayExtentContains<MoEOverlayDeviceControllerLogicalTargetMetadata>(binding.mapped_bytes,
+                binding.layout->logical_target_metadata_offset, binding.layout->logical_target_count) ||
+            reinterpret_cast<const std::byte *>(binding.logical_targets) !=
+                binding.mapped_base + binding.layout->logical_target_metadata_offset ||
             loadPeerPublished(
                 &binding.layout->minimum_window_activations) == 0u ||
             loadPeerPublished(
@@ -897,7 +861,7 @@ namespace llaminar2::moe_overlay_controller_device
                 const auto *record =
                     binding.group_participant_records + member;
                 const std::uint32_t expected_participant =
-                    loadPeerPublished(&group->participant_ids[member]);
+                    loadPeerPublished(moeOverlayGroupMemberIds(binding.mapped_base, binding.mapped_bytes, *group) + member);
                 if (loadPeerPublished(&record->magic) !=
                         kMoEOverlayDeviceControllerFabricMagic ||
                     loadPeerPublished(&record->version) !=
@@ -999,26 +963,19 @@ namespace llaminar2::moe_overlay_controller_device
              member < group->participant_count;
              ++member)
         {
-            if (loadPeerPublished(&group->participant_ids[member]) ==
+            if (loadPeerPublished(moeOverlayGroupMemberIds(binding.mapped_base, binding.mapped_bytes, *group) + member) ==
                 participant)
             {
                 member_index = member;
                 break;
             }
         }
-        const std::uint64_t words_per_participant =
-            static_cast<std::uint64_t>(kMoEOverlayDeviceControllerDemandPhaseCount) *
-            binding.layout->num_layers *
-            binding.layout->num_experts;
-        if (member_index == group->participant_count ||
-            group->collected_state_words !=
-                words_per_participant * group->participant_count)
-        {
-            return false;
-        }
+        std::uint64_t member_word_offset = 0u;
+        if (!moeOverlaySnapshotMemberOffset(*binding.layout, *group,
+                moeOverlayGroupMemberIds(binding.mapped_base, binding.mapped_bytes, *group),
+                member_index, member_word_offset)) return false;
         const std::uint64_t index =
-            static_cast<std::uint64_t>(member_index) *
-                words_per_participant +
+            member_word_offset +
             static_cast<std::uint64_t>(layer) *
                 binding.layout->num_experts +
             expert;
@@ -1065,27 +1022,20 @@ namespace llaminar2::moe_overlay_controller_device
              member < group->participant_count;
              ++member)
         {
-            if (loadPeerPublished(&group->participant_ids[member]) ==
+            if (loadPeerPublished(moeOverlayGroupMemberIds(binding.mapped_base, binding.mapped_bytes, *group) + member) ==
                 participant)
             {
                 member_index = member;
                 break;
             }
         }
-        const std::uint64_t words_per_participant =
-            static_cast<std::uint64_t>(kMoEOverlayDeviceControllerDemandPhaseCount) *
-            binding.layout->num_layers *
-            binding.layout->num_experts;
-        if (member_index == group->participant_count ||
-            group->collected_state_words !=
-                words_per_participant * group->participant_count)
-        {
-            return nullptr;
-        }
-        const std::uint64_t byte_offset =
-            group->collected_state_offset +
-            static_cast<std::uint64_t>(member_index) *
-                words_per_participant * sizeof(std::uint64_t);
+        std::uint64_t member_word_offset = 0u;
+        if (!moeOverlaySnapshotMemberOffset(*binding.layout, *group,
+                moeOverlayGroupMemberIds(binding.mapped_base, binding.mapped_bytes, *group),
+                member_index, member_word_offset)) return nullptr;
+        const auto words_per_participant = moeOverlaySnapshotMemberWords(binding.layout->num_layers,
+            binding.layout->num_experts, participant, binding.layout->demand_publisher_participant_id);
+        const std::uint64_t byte_offset = group->collected_state_offset + member_word_offset * sizeof(std::uint64_t);
         if (byte_offset > binding.mapped_bytes ||
             binding.mapped_bytes - byte_offset <
                 words_per_participant * sizeof(std::uint64_t))
@@ -1096,6 +1046,223 @@ namespace llaminar2::moe_overlay_controller_device
             binding.mapped_base + byte_offset);
     }
 
+    /**
+     * @brief Read only the original global selected-route bank, never local execution counts.
+     * @param snapshot Exact canonical runtime source retained before capture.
+     * @param layer Original compact layer. @param phase Recurring source plane.
+     * @param expert Global logical expert coordinate, including external experts.
+     * @param value Receives one indivisible cumulative selected count.
+     * @return False for a partial histogram binding or a malformed writer generation.
+     */
+    __device__ __forceinline__ bool selectedDemandCount(
+        const MoEOverlayDeviceSnapshotBinding &snapshot, std::uint32_t layer,
+        std::uint32_t phase, std::uint32_t expert, std::uint64_t &value) noexcept
+    {
+        const auto *base = reinterpret_cast<const std::byte *>(snapshot.runtime_layers) +
+            std::uint64_t(layer) * moe_runtime_abi::kLayerRuntimeBytes;
+        auto *banks = *reinterpret_cast<moe_runtime_abi::DeviceMoERuntimeHistogramBank *const *>(
+            base + moe_runtime_abi::kRuntimeHistogramBanksOffset);
+        auto *active = *reinterpret_cast<std::uint32_t *const *>(
+            base + moe_runtime_abi::kRuntimeHistogramActiveBankOffset);
+        std::uint64_t *counter = nullptr;
+        if (banks || active)
+        {
+            if (!banks || !active) return false;
+            const auto state = atomicAdd(reinterpret_cast<unsigned int *>(active), 0u);
+            if (!moe_runtime_abi::validHistogramWriterState(state)) return false;
+            counter = const_cast<std::uint64_t *>(moeOverlayGlobalSelectedCounter(
+                banks[state & moe_runtime_abi::kHistogramWriterBankMask], phase, expert));
+            if (!counter) return false;
+        }
+        else
+        {
+            const auto offset = phase == 0u ? moe_runtime_abi::kDecodeSelectedHistogramOffset :
+                phase == 1u ? moe_runtime_abi::kPrefillSelectedHistogramOffset :
+                    moe_runtime_abi::kGroupedVerifierSelectedHistogramOffset;
+            counter = reinterpret_cast<std::uint64_t *>(const_cast<std::byte *>(base + offset)) + expert;
+        }
+        value = atomicAdd(reinterpret_cast<unsigned long long *>(counter), 0ULL);
+        return true;
+    }
+
+    /**
+     * @brief Pack exact live snapshot words on the existing participant maintenance stream.
+     * Global selected demand is independent of this GPU's current residency.
+     * Original member flags remain separate until complete logical-target folding.
+     */
+    __device__ __forceinline__ void collectRuntimeSnapshot(
+        const MoEOverlayDeviceControllerActionLaunch &launch) noexcept
+    {
+        const auto &binding = launch.binding;
+        const auto &snapshot = launch.snapshot;
+        const auto *group = groupLayout(binding, binding.group_id);
+        const bool producer = binding.participant_id == binding.layout->demand_publisher_participant_id;
+        const auto metadata = snapshotPeerRecord(binding.participants + binding.participant_id);
+        if (!group || snapshot.layer_count != binding.layout->num_layers ||
+            snapshot.expert_count != binding.layout->num_experts ||
+            metadata.domain_participant_index != snapshot.domain_participant_id ||
+            (group->cohort_target.isCohort() && snapshot.domain_participant_count != group->participant_count))
+        {
+            if (threadIdx.x == 0u) failParticipant(binding, MoEOverlayDeviceControllerError::InvalidTopology);
+            return;
+        }
+        const auto local_target = group->cohort_target.isCohort() ? group->cohort_target :
+            MoEOverlayRouteTarget::fromWord(static_cast<std::int32_t>(binding.participant_id));
+        const std::uint64_t plane = std::uint64_t(snapshot.layer_count) * snapshot.expert_count;
+        for (std::uint64_t row = threadIdx.x; row < plane; row += blockDim.x)
+        {
+            const auto layer = static_cast<std::uint32_t>(row / snapshot.expert_count);
+            const auto expert = static_cast<std::uint32_t>(row % snapshot.expert_count);
+            const auto *runtime = runtimeLayer(snapshot.runtime_layers, layer);
+            if (!runtimeOwnsPlacementBanks(snapshot.runtime_layers, layer) || runtime->active_bank >= kDeviceMoEOverlayEpochBankCount ||
+                runtime->expert_count != snapshot.expert_count || runtime->top_k != snapshot.top_k ||
+                runtimeParticipantId(snapshot.runtime_layers, layer) != snapshot.domain_participant_id ||
+                runtimeParticipantCount(snapshot.runtime_layers, layer) != snapshot.domain_participant_count)
+            {
+                failParticipant(binding, MoEOverlayDeviceControllerError::InvalidSnapshot);
+                return;
+            }
+            const auto &bank = runtime->banks[runtime->active_bank];
+            const auto &descriptor = bank.experts[expert];
+            const auto route = MoEOverlayRouteTarget::fromWord(bank.overlay_route_participant[expert]);
+            const auto required = toMoEExpertFlags(DeviceMoEExpertFlags::Valid | DeviceMoEExpertFlags::Resident);
+            const bool physical = (descriptor.flags & required) == required;
+            const bool authority = route.word() == local_target.word();
+            const auto &fragment = runtimeFragmentBinding(snapshot.runtime_layers, layer);
+            if (local_target.isCohort())
+            {
+                const bool geometry = fragment.enabled() && fragment.target().cohortTarget() == local_target.word() &&
+                    fragment.target().validFor(snapshot.expert_count, static_cast<std::int32_t>(binding.participant_id),
+                        binding.layout->first_model_layer + static_cast<std::int32_t>(layer));
+                if (!geometry || authority != physical || (authority &&
+                    (descriptor.owner_participant != -1 || bank.resident_participant_mask[expert] || bank.replica_role[expert] ||
+                     !bank.local_compute_mask[expert] || descriptor.logical_expert_id != static_cast<std::int32_t>(expert) ||
+                     !deviceMoEExpertProjectionReady(descriptor, DeviceMoEProjectionSet::IntermediateShard))))
+                {
+                    failParticipant(binding, MoEOverlayDeviceControllerError::InvalidSnapshot);
+                    return;
+                }
+            }
+            else if (fragment.enabled() || (authority && (!physical ||
+                descriptor.owner_participant != static_cast<std::int32_t>(snapshot.domain_participant_id))))
+            {
+                failParticipant(binding, MoEOverlayDeviceControllerError::InvalidSnapshot);
+                return;
+            }
+            const bool transfer = physical && (descriptor.flags & toMoEExpertFlags(DeviceMoEExpertFlags::TransferSlot));
+            const std::uint32_t phases = producer ? kMoEOverlayDeviceControllerDemandPhaseCount : 1u;
+            for (std::uint32_t phase = 0u; phase < phases; ++phase)
+            {
+                std::uint64_t count = 0u;
+                if (producer)
+                {
+                    std::uint64_t selected = 0u;
+                    if (!selectedDemandCount(snapshot, layer, phase, expert, selected))
+                    {
+                        failParticipant(binding, MoEOverlayDeviceControllerError::InvalidSnapshot);
+                        return;
+                    }
+                    const auto offset = std::uint64_t(phase) * plane + row;
+                    count = selected;
+                    if (snapshot.previous_selected_counts)
+                    {
+                        const auto delta = moeOverlaySelectedDemandDelta(selected, snapshot.previous_selected_counts[offset]);
+                        snapshot.previous_selected_counts[offset] = delta.next_baseline;
+                        count = delta.delta;
+                    }
+                }
+                binding.participant_collected_state[std::uint64_t(phase) * plane + row] =
+                    moe_rebalance_policy::packCollectedState(count, 0u, physical, transfer, authority);
+            }
+        }
+    }
+
+    /** @return Original typed target at one private policy vertex index. */
+    __device__ __forceinline__ MoEOverlayRouteTarget logicalPolicyTarget(
+        const MoEOverlayDeviceControllerDeviceBinding &binding, std::uint32_t vertex) noexcept
+    { return snapshotPeerRecord(binding.logical_targets + vertex).target; }
+
+    /** @return Private roster index of an original typed target, or the target count. */
+    __device__ __forceinline__ std::uint32_t logicalPolicyTargetIndex(
+        const MoEOverlayDeviceControllerDeviceBinding &binding, MoEOverlayRouteTarget target) noexcept
+    {
+        for (std::uint32_t vertex = 0; vertex < binding.layout->logical_target_count; ++vertex)
+            if (logicalPolicyTarget(binding, vertex).word() == target.word()) return vertex;
+        return binding.layout->logical_target_count;
+    }
+
+    /**
+     * @brief Bind physical snapshot sources once and cache logical policy metadata.
+     * @param binding Immutable original member/target extents. @param scratch Admitted P/V scratch.
+     * @param priorities Receives the number of distinct opaque tier priorities.
+     * @return False for foreign tags, overlapping/missing member extents or source pointers.
+     */
+    __device__ __forceinline__ bool prepareLogicalPolicyScratch(
+        const MoEOverlayDeviceControllerDeviceBinding &binding, DynamicPolicyScratch &scratch,
+        std::uint32_t &priorities) noexcept
+    {
+        priorities = 0u;
+        for (std::uint32_t member = 0u; member < binding.layout->participant_count; ++member)
+        {
+            const auto metadata = snapshotPeerRecord(binding.participants + member);
+            scratch.participant_state_base()[member] = participantStateBase(binding, member, metadata);
+            if (!scratch.participant_state_base()[member]) return false;
+        }
+        std::uint64_t covered_members = 0u;
+        for (std::uint32_t vertex = 0u; vertex < binding.layout->logical_target_count; ++vertex)
+        {
+            const auto metadata = snapshotPeerRecord(binding.logical_targets + vertex);
+            const auto *group = groupLayout(binding, metadata.group_id);
+            if (!group || metadata.target.isAbsent() || metadata.tier_index != group->tier_index ||
+                metadata.tier_priority != group->tier_priority || metadata.tier_index < 0 ||
+                static_cast<std::uint32_t>(metadata.tier_index) >= binding.layout->tier_count ||
+                metadata.member_count == 0u || metadata.first_group_member >= group->participant_count ||
+                metadata.member_count > group->participant_count - metadata.first_group_member) return false;
+            const auto *ids = moeOverlayGroupMemberIds(binding.mapped_base, binding.mapped_bytes, *group);
+            if (!ids || (metadata.target.isCohort()
+                ? (metadata.target.word() != group->cohort_target.word() || metadata.first_group_member ||
+                   metadata.member_count != group->participant_count)
+                : (!group->cohort_target.isAbsent() || metadata.member_count != 1u ||
+                   metadata.target.word() != static_cast<std::int32_t>(ids[metadata.first_group_member])))) return false;
+            for (std::uint32_t previous = 0u; previous < vertex; ++previous)
+            {
+                const auto other = snapshotPeerRecord(binding.logical_targets + previous);
+                if (other.target.word() == metadata.target.word() || (other.group_id == metadata.group_id &&
+                    other.first_group_member < metadata.first_group_member + metadata.member_count &&
+                    metadata.first_group_member < other.first_group_member + other.member_count)) return false;
+            }
+            covered_members += metadata.member_count;
+            scratch.target_priority()[vertex] = metadata.tier_priority;
+            scratch.target_tier()[vertex] = metadata.tier_index;
+            std::uint32_t position = 0u;
+            while (position < priorities && scratch.priorities()[position] < metadata.tier_priority) ++position;
+            if (position < priorities && scratch.priorities()[position] == metadata.tier_priority) continue;
+            for (std::uint32_t index = priorities; index > position; --index)
+                scratch.priorities()[index] = scratch.priorities()[index - 1u];
+            scratch.priorities()[position] = metadata.tier_priority;
+            ++priorities;
+        }
+        return covered_members == binding.layout->participant_count;
+    }
+
+    /** @return One complete original target's ownership at this published snapshot. */
+    __device__ __forceinline__ MoEOverlayLogicalTargetSnapshot logicalPolicySnapshot(
+        const MoEOverlayDeviceControllerDeviceBinding &binding, const DynamicPolicyScratch &scratch,
+        std::uint32_t vertex, std::uint32_t layer, std::uint32_t expert) noexcept
+    {
+        const auto metadata = snapshotPeerRecord(binding.logical_targets + vertex);
+        const auto *group = groupLayout(binding, metadata.group_id);
+        if (!group) return {};
+        const auto *ids = moeOverlayGroupMemberIds(binding.mapped_base, binding.mapped_bytes, *group);
+        if (!ids) return {};
+        return moeOverlayFoldLogicalTargetSnapshot(metadata.target.isCohort(), metadata.member_count,
+            [&](std::uint32_t member) {
+                const auto participant = ids[metadata.first_group_member + member];
+                return loadPeerPublished(scratch.participant_state_base()[participant] +
+                    std::uint64_t(layer) * binding.layout->num_experts + expert);
+            });
+    }
+
     /** @return Dense rank of one opaque integer priority. */
     __device__ __forceinline__ std::uint32_t dynamicPriorityRank(
         const DynamicPolicyScratch &scratch,
@@ -1104,7 +1271,7 @@ namespace llaminar2::moe_overlay_controller_device
     {
         for (std::uint32_t rank = 0u; rank < priority_count; ++rank)
         {
-            if (scratch.priorities[rank] == priority)
+            if (scratch.priorities()[rank] == priority)
                 return rank;
         }
         return priority_count;
@@ -1123,14 +1290,14 @@ namespace llaminar2::moe_overlay_controller_device
              participant < participant_count;
              ++participant)
         {
-            scratch.participant_load[participant] = 0u;
+            scratch.target_load()[participant] = 0u;
         }
         for (std::uint32_t expert = 0u; expert < expert_count; ++expert)
         {
             const auto owner = static_cast<std::uint32_t>(owners[expert]);
-            const std::uint64_t count = scratch.expert_counts[expert];
-            scratch.participant_load[owner] = saturatingAdd(
-                scratch.participant_load[owner], count);
+            const std::uint64_t count = scratch.expert_counts()[expert];
+            scratch.target_load()[owner] = saturatingAdd(
+                scratch.target_load()[owner], count);
             score.priority_cost = saturatingAdd(
                 score.priority_cost,
                 saturatingMultiply(
@@ -1138,7 +1305,7 @@ namespace llaminar2::moe_overlay_controller_device
                     dynamicPriorityRank(
                         scratch,
                         priority_count,
-                        scratch.participant_priority[owner])));
+                        scratch.target_priority()[owner])));
         }
         for (std::uint32_t priority = 0u;
              priority < priority_count;
@@ -1149,11 +1316,11 @@ namespace llaminar2::moe_overlay_controller_device
                  participant < participant_count;
                  ++participant)
             {
-                if (scratch.participant_priority[participant] ==
-                    scratch.priorities[priority])
+                if (scratch.target_priority()[participant] ==
+                    scratch.priorities()[priority])
                 {
                     const std::uint64_t load =
-                        scratch.participant_load[participant];
+                        scratch.target_load()[participant];
                     maximum = load > maximum ? load : maximum;
                 }
             }
@@ -1178,15 +1345,15 @@ namespace llaminar2::moe_overlay_controller_device
         bool selected_priority = false;
         for (std::uint32_t edge = 0u; edge < cycle_length; ++edge)
         {
-            const std::uint32_t expert = scratch.cycle[edge];
+            const std::uint32_t expert = scratch.cycle()[edge];
             const auto source = static_cast<std::uint32_t>(
-                scratch.current_owner[expert]);
+                scratch.current_owner()[expert]);
             const auto destination = static_cast<std::uint32_t>(
-                scratch.desired_owner[expert]);
+                scratch.desired_owner()[expert]);
             const std::int32_t source_priority =
-                scratch.participant_priority[source];
+                scratch.target_priority()[source];
             const std::int32_t destination_priority =
-                scratch.participant_priority[destination];
+                scratch.target_priority()[destination];
             if (source_priority != destination_priority)
                 return false;
             if (!selected_priority)
@@ -1204,19 +1371,19 @@ namespace llaminar2::moe_overlay_controller_device
              participant < participant_count;
              ++participant)
         {
-            scratch.participant_load[participant] = 0u;
+            scratch.target_load()[participant] = 0u;
         }
         for (std::uint32_t expert = 0u; expert < expert_count; ++expert)
         {
             const auto owner = static_cast<std::uint32_t>(
-                scratch.current_owner[expert]);
-            scratch.participant_load[owner] = saturatingAdd(
-                scratch.participant_load[owner],
-                scratch.expert_counts[expert]);
+                scratch.current_owner()[expert]);
+            scratch.target_load()[owner] = saturatingAdd(
+                scratch.target_load()[owner],
+                scratch.expert_counts()[expert]);
         }
         return moe_rebalance_policy::samePriorityLoadIsImbalanced(
-            scratch.participant_load,
-            scratch.participant_priority,
+            scratch.target_load(),
+            scratch.target_priority(),
             participant_count,
             cycle_priority,
             imbalance_threshold_per_mille);
@@ -1225,12 +1392,12 @@ namespace llaminar2::moe_overlay_controller_device
     /** @return Immutable tier/layer/phase service cost in profile order. */
     __device__ __forceinline__ std::uint64_t dynamicEconomyServiceCost(
         const MoEOverlayDeviceControllerDeviceBinding &binding,
-        std::uint32_t tier,
+        std::uint32_t target,
         std::uint32_t layer,
         std::uint32_t phase) noexcept
     {
         const std::uint64_t offset =
-            (static_cast<std::uint64_t>(tier) * binding.layout->num_layers +
+            (static_cast<std::uint64_t>(target) * binding.layout->num_layers +
              layer) *
                 kMoEOverlayDeviceControllerEconomyServicePhaseCount +
             phase;
@@ -1247,7 +1414,7 @@ namespace llaminar2::moe_overlay_controller_device
     {
         const std::uint64_t offset =
             (static_cast<std::uint64_t>(source) *
-                 binding.layout->participant_count +
+                 binding.layout->logical_target_count +
              destination) *
                 binding.layout->num_layers +
             layer;
@@ -1319,20 +1486,18 @@ namespace llaminar2::moe_overlay_controller_device
                  participant < participant_count;
                  ++participant)
             {
-                scratch.participant_load[participant] =
-                    scratch.phase_participant_load[phase][participant];
+                scratch.target_load()[participant] =
+                    scratch.phaseTargetRows()[phase][participant];
             }
             std::uint64_t before_critical_path = 0u;
             for (std::uint32_t participant = 0u;
                  participant < participant_count;
                  ++participant)
             {
-                const auto tier = static_cast<std::uint32_t>(
-                    scratch.participant_tier[participant]);
                 const std::uint64_t participant_service =
                     saturatingMultiply(
-                        scratch.participant_load[participant],
-                        scratch.service_cost[tier][phase]);
+                        scratch.target_load()[participant],
+                        scratch.serviceRows()[participant][phase]);
                 before_critical_path =
                     participant_service > before_critical_path
                         ? participant_service
@@ -1346,28 +1511,26 @@ namespace llaminar2::moe_overlay_controller_device
                  edge < cycle_length;
                  ++edge)
             {
-                const std::uint32_t expert = scratch.cycle[edge];
+                const std::uint32_t expert = scratch.cycle()[edge];
                 const auto source = static_cast<std::uint32_t>(
-                    scratch.current_owner[expert]);
+                    scratch.current_owner()[expert]);
                 const auto destination = static_cast<std::uint32_t>(
-                    scratch.desired_owner[expert]);
+                    scratch.desired_owner()[expert]);
                 const std::uint64_t demand =
-                    scratch.phase_expert_counts[phase][expert];
-                scratch.participant_load[source] -= demand;
-                scratch.participant_load[destination] = saturatingAdd(
-                    scratch.participant_load[destination], demand);
+                    scratch.phaseExpertRows()[phase][expert];
+                scratch.target_load()[source] -= demand;
+                scratch.target_load()[destination] = saturatingAdd(
+                    scratch.target_load()[destination], demand);
             }
             std::uint64_t after_critical_path = 0u;
             for (std::uint32_t participant = 0u;
                  participant < participant_count;
                  ++participant)
             {
-                const auto tier = static_cast<std::uint32_t>(
-                    scratch.participant_tier[participant]);
                 const std::uint64_t participant_service =
                     saturatingMultiply(
-                        scratch.participant_load[participant],
-                        scratch.service_cost[tier][phase]);
+                        scratch.target_load()[participant],
+                        scratch.serviceRows()[participant][phase]);
                 after_critical_path =
                     participant_service > after_critical_path
                         ? participant_service
@@ -1380,22 +1543,22 @@ namespace llaminar2::moe_overlay_controller_device
         }
 
         const bool reciprocal_pair = cycle_length == 2u &&
-            scratch.current_owner[scratch.cycle[0]] ==
-                scratch.desired_owner[scratch.cycle[1]] &&
-            scratch.current_owner[scratch.cycle[1]] ==
-                scratch.desired_owner[scratch.cycle[0]];
+            scratch.current_owner()[scratch.cycle()[0]] ==
+                scratch.desired_owner()[scratch.cycle()[1]] &&
+            scratch.current_owner()[scratch.cycle()[1]] ==
+                scratch.desired_owner()[scratch.cycle()[0]];
         for (std::uint32_t edge = 0u; edge < cycle_length; ++edge)
         {
-            const std::uint32_t expert = scratch.cycle[edge];
+            const std::uint32_t expert = scratch.cycle()[edge];
             const auto source = static_cast<std::uint32_t>(
-                scratch.current_owner[expert]);
+                scratch.current_owner()[expert]);
             const auto destination = static_cast<std::uint32_t>(
-                scratch.desired_owner[expert]);
+                scratch.desired_owner()[expert]);
             const std::uint64_t movement_transfer_and_repack_ns =
-                scratch.migration_transfer_and_repack_ns
+                scratch.transferRows()
                     [source][destination];
             const std::uint64_t movement_inference_interference_ns =
-                scratch.migration_inference_interference_ns
+                scratch.interferenceRows()
                     [source][destination];
             if (reciprocal_pair)
             {
@@ -1420,9 +1583,9 @@ namespace llaminar2::moe_overlay_controller_device
                     movement_inference_interference_ns);
             }
 
-            const std::uint64_t last_moved = scratch.last_moved[expert];
+            const std::uint64_t last_moved = scratch.last_moved()[expert];
             const std::uint64_t minimum_residency =
-                scratch.minimum_residency_generations;
+                scratch.minimum_residency_generations()[0];
             if (last_moved !=
                     kMoEOverlayDeviceControllerNeverMovedGeneration &&
                 (transaction < last_moved ||
@@ -1462,11 +1625,11 @@ namespace llaminar2::moe_overlay_controller_device
         for (std::uint32_t expert = 0u; expert < expert_count; ++expert)
         {
             observed_activations = saturatingAdd(
-                observed_activations, scratch.expert_counts[expert]);
+                observed_activations, scratch.expert_counts()[expert]);
         }
         score.projected_service_gain_ns = projectDynamicServiceGain(
             gain,
-            scratch.payoff_horizon_tokens,
+            scratch.payoff_horizon_tokens()[0],
             binding.layout->routed_experts_per_token,
             observed_activations);
         const std::uint64_t measured_cost = saturatingAdd(
@@ -1478,7 +1641,7 @@ namespace llaminar2::moe_overlay_controller_device
                 score.projected_service_gain_ns - measured_cost;
         }
         score.payoff_eligible = score.projected_net_benefit_ns >
-            scratch.minimum_net_benefit_ns;
+            scratch.minimum_net_benefit_ns()[0];
         return score;
     }
 
@@ -1503,9 +1666,9 @@ namespace llaminar2::moe_overlay_controller_device
         std::uint32_t expert_count) noexcept
     {
         return findMoEOverlayPlacementCycle(
-            scratch.current_owner, scratch.desired_owner, excluded,
-            participant_count, expert_count, scratch.visited,
-            scratch.dfs_source, scratch.dfs_next_expert, scratch.cycle).length;
+            scratch.current_owner(), scratch.desired_owner(), excluded,
+            participant_count, expert_count, scratch.visited(),
+            scratch.dfs_source(), scratch.dfs_next_expert(), scratch.cycle()).length;
     }
 
     /**
@@ -1592,10 +1755,8 @@ namespace llaminar2::moe_overlay_controller_device
         if (ready == 0u)
             return;
 
-        const std::uint64_t words =
-            static_cast<std::uint64_t>(kMoEOverlayDeviceControllerDemandPhaseCount) *
-            binding.layout->num_layers *
-            binding.layout->num_experts;
+        const std::uint64_t words = moeOverlaySnapshotMemberWords(binding.layout->num_layers,
+            binding.layout->num_experts, binding.participant_id, binding.layout->demand_publisher_participant_id);
         std::uint64_t digest = 0u;
         std::uint64_t count = 0u;
         for (std::uint64_t index = threadIdx.x;
@@ -1866,7 +2027,9 @@ namespace llaminar2::moe_overlay_controller_device
                     num_layers,
                     num_experts,
                     binding.controller->base_epoch,
-                    binding.controller->candidate_epoch))
+                    binding.controller->candidate_epoch) ||
+                !targetGroup(binding, entry.source_target) ||
+                !targetGroup(binding, entry.destination_target))
             {
                 ++invalid;
             }
@@ -2030,10 +2193,10 @@ namespace llaminar2::moe_overlay_controller_device
         const MoEOverlayDeviceMovementCommand &left,
         const MoEOverlayDeviceMovementCommand &right) noexcept
     {
-        if (left.destination_participant != right.destination_participant)
+        if (left.destination_target.word() != right.destination_target.word())
         {
-            return left.destination_participant <
-                   right.destination_participant;
+            return left.destination_target.word() <
+                   right.destination_target.word();
         }
         if (left.layer != right.layer)
             return left.layer < right.layer;
@@ -2152,8 +2315,8 @@ namespace llaminar2::moe_overlay_controller_device
             return;
         }
 
-        const std::uint32_t participant_count =
-            loadPeerPublished(&binding.layout->participant_count);
+        const std::uint32_t target_count =
+            loadPeerPublished(&binding.layout->logical_target_count);
         const std::uint32_t layer_count =
             loadPeerPublished(&binding.layout->num_layers);
         const std::uint32_t expert_count =
@@ -2190,16 +2353,16 @@ namespace llaminar2::moe_overlay_controller_device
             static_cast<std::uint64_t>(
                 kMoEOverlayDeviceControllerDemandPhaseCount) *
             layer_count * expert_count;
-        if (participant_count == 0u ||
-            participant_count >
-                kMoEOverlayDeviceControllerFabricMaxParticipants ||
+        // Every policy vertex is an original typed target. Physical member
+        // snapshots and logical quotas have independently admitted extents.
+        if (target_count == 0u ||
             layer_count == 0u ||
             layer_count > kMoEOverlayDeviceControllerFabricMaxLayers ||
             expert_count == 0u ||
             expert_count > kMoEOverlayDeviceControllerFabricMaxExperts ||
             binding.layout->tier_count == 0u ||
-            binding.layout->tier_count >
-                kMoEOverlayDeviceControllerFabricMaxParticipants ||
+            binding.layout->tier_count > target_count ||
+            !scratch.validFor({binding.layout->participant_count, target_count, binding.layout->tier_count, expert_count}) ||
             command_capacity == 0u || maximum_cycles == 0u ||
             minimum_observations == 0u || !binding.demand_history ||
             (launch.demand_phase != MoEOverlayDeviceDemandPhase::Prefill &&
@@ -2216,8 +2379,8 @@ namespace llaminar2::moe_overlay_controller_device
                   kMoEOverlayDeviceControllerFabricVersion ||
               loadPeerPublished(&binding.economy->tier_count) !=
                   binding.layout->tier_count ||
-              loadPeerPublished(&binding.economy->participant_count) !=
-                  participant_count ||
+              loadPeerPublished(&binding.economy->logical_target_count) !=
+                  target_count ||
               loadPeerPublished(&binding.economy->layer_count) !=
                   layer_count ||
               loadPeerPublished(&binding.economy->service_phase_count) !=
@@ -2246,55 +2409,10 @@ namespace llaminar2::moe_overlay_controller_device
         }
 
         std::uint32_t priority_count = 0u;
-        for (std::uint32_t participant = 0u;
-             participant < participant_count;
-             ++participant)
+        if (!prepareLogicalPolicyScratch(binding, scratch, priority_count))
         {
-            const auto metadata = snapshotPeerRecord(
-                binding.participants + participant);
-            if (metadata.participant_id != participant ||
-                metadata.group_id >= binding.layout->group_count ||
-                metadata.tier_index < 0 ||
-                static_cast<std::uint32_t>(metadata.tier_index) >=
-                    binding.layout->tier_count)
-            {
-                failLeader(
-                    binding,
-                    MoEOverlayDeviceControllerError::InvalidTopology);
-                return;
-            }
-            const std::int32_t value = metadata.tier_priority;
-            scratch.participant_priority[participant] = value;
-            scratch.participant_tier[participant] = metadata.tier_index;
-            scratch.participant_state_base[participant] =
-                participantStateBase(binding, participant, metadata);
-            if (!scratch.participant_state_base[participant])
-            {
-                failLeader(
-                    binding,
-                    MoEOverlayDeviceControllerError::InvalidTopology);
-                return;
-            }
-            std::uint32_t position = 0u;
-            while (position < priority_count &&
-                   scratch.priorities[position] < value)
-            {
-                ++position;
-            }
-            if (position < priority_count &&
-                scratch.priorities[position] == value)
-            {
-                continue;
-            }
-            for (std::uint32_t index = priority_count;
-                 index > position;
-                 --index)
-            {
-                scratch.priorities[index] =
-                    scratch.priorities[index - 1u];
-            }
-            scratch.priorities[position] = value;
-            ++priority_count;
+            failLeader(binding, MoEOverlayDeviceControllerError::InvalidTopology);
+            return;
         }
 
         MoEOverlayDeviceControllerPolicyResult result{};
@@ -2330,15 +2448,15 @@ namespace llaminar2::moe_overlay_controller_device
                 (layer_scan_start + layer_offset) % layer_count;
             std::uint64_t observations = 0u;
             for (std::uint32_t participant = 0u;
-                 participant < participant_count;
+                 participant < target_count;
                  ++participant)
             {
-                scratch.quotas[participant] = 0u;
+                scratch.quotas()[participant] = 0u;
                 for (std::uint32_t phase = 0u;
                      phase < kMoEOverlayDeviceControllerDemandPhaseCount;
                      ++phase)
                 {
-                    scratch.phase_participant_load[phase][participant] = 0u;
+                    scratch.phaseTargetRows()[phase][participant] = 0u;
                 }
             }
             for (std::uint32_t expert = 0u;
@@ -2348,45 +2466,22 @@ namespace llaminar2::moe_overlay_controller_device
                 std::uint64_t phase_delta[kMoEOverlayDeviceControllerDemandPhaseCount]{};
                 std::uint32_t owner_count = 0u;
                 std::int32_t owner = -1;
-                for (std::uint32_t participant = 0u;
-                     participant < participant_count;
-                     ++participant)
+                for (std::uint32_t vertex = 0u; vertex < target_count; ++vertex)
                 {
-                    const std::uint64_t word = loadPeerPublished(
-                        scratch.participant_state_base[participant] +
-                        static_cast<std::uint64_t>(layer) * expert_count +
-                        expert);
-                    // Every source has its own cumulative baseline. Snapshot
-                    // publication covers all planes at the same inference
-                    // boundary, regardless of which scheduler phase triggered it.
-                    for (std::uint32_t phase = 0u;
-                         phase < kMoEOverlayDeviceControllerDemandPhaseCount;
-                         ++phase)
+                    const auto snapshot = logicalPolicySnapshot(binding, scratch, vertex, layer, expert);
+                    if (!snapshot.valid)
                     {
-                        const auto phase_word = phase == 0u ? word :
-                            loadPeerPublished(
-                                scratch.participant_state_base[participant] +
-                                moeOverlayDeviceDemandHistoryOffset(
-                                    phase, layer, expert, layer_count, expert_count));
-                        phase_delta[phase] = saturatingAdd(
-                            phase_delta[phase],
-                            moe_rebalance_policy::collectedStateActivationCount(phase_word));
+                        failLeader(binding, MoEOverlayDeviceControllerError::InvalidSnapshot);
+                        return;
                     }
-                    if (moe_rebalance_policy::
-                            collectedStateAuthoritativeOwner(word))
-                    {
-                        if (!moe_rebalance_policy::
-                                collectedStatePhysicallyResident(word))
-                        {
-                            failLeader(
-                                binding,
-                                MoEOverlayDeviceControllerError::InvalidSnapshot);
-                            return;
-                        }
-                        owner = static_cast<std::int32_t>(participant);
-                        ++owner_count;
-                    }
+                    if (snapshot.authoritative) { owner = static_cast<std::int32_t>(vertex); ++owner_count; }
                 }
+                // The continuation-root selected bank contributes global demand,
+                // including experts for which that GPU owns no current payload.
+                for (std::uint32_t phase = 0u; phase < kMoEOverlayDeviceControllerDemandPhaseCount; ++phase)
+                    phase_delta[phase] = moe_rebalance_policy::collectedStateActivationCount(loadPeerPublished(
+                        scratch.participant_state_base()[binding.layout->demand_publisher_participant_id] +
+                        moeOverlayDeviceDemandHistoryOffset(phase, layer, expert, layer_count, expert_count)));
                 if (owner_count != 1u)
                 {
                     failLeader(
@@ -2394,7 +2489,7 @@ namespace llaminar2::moe_overlay_controller_device
                         MoEOverlayDeviceControllerError::InvalidSnapshot);
                     return;
                 }
-                scratch.expert_counts[expert] = 0u;
+                scratch.expert_counts()[expert] = 0u;
                 for (std::uint32_t phase = 0u;
                      phase < kMoEOverlayDeviceControllerDemandPhaseCount;
                      ++phase)
@@ -2403,33 +2498,33 @@ namespace llaminar2::moe_overlay_controller_device
                         phase, layer, expert, layer_count, expert_count);
                     const auto update = moeOverlayAccumulateDeviceDemandHistory(
                         loadPeerPublished(binding.demand_history + offset),
-                        scratch.expert_counts[expert], phase_delta[phase]);
+                        scratch.expert_counts()[expert], phase_delta[phase]);
                     storeSystemRelease(binding.demand_history + offset,
                                        update.updated_phase_count);
                     // Retain even catch-up history, but do not let unpriced
                     // exceptional work skew a recurring-service placement.
                     const bool priced = (active_sources & (1u << phase)) != 0u;
                     const auto recurring_history = priced ? update.updated_phase_count : 0u;
-                    scratch.phase_expert_counts[phase][expert] = recurring_history;
+                    scratch.phaseExpertRows()[phase][expert] = recurring_history;
                     if (priced)
-                        scratch.expert_counts[expert] = update.combined_count;
+                        scratch.expert_counts()[expert] = update.combined_count;
                     if (priced)
                         observations = saturatingAdd(observations, phase_delta[phase]);
                 }
-                scratch.current_owner[expert] = owner;
-                scratch.desired_owner[expert] = -1;
-                scratch.excluded[expert] = 0u;
+                scratch.current_owner()[expert] = owner;
+                scratch.desired_owner()[expert] = -1;
+                scratch.excluded()[expert] = 0u;
                 const auto owner_index = static_cast<std::uint32_t>(owner);
-                ++scratch.quotas[owner_index];
+                ++scratch.quotas()[owner_index];
                 for (std::uint32_t phase = 0u;
                      phase < kMoEOverlayDeviceControllerDemandPhaseCount;
                      ++phase)
                 {
-                    scratch.phase_participant_load[phase][owner_index] =
+                    scratch.phaseTargetRows()[phase][owner_index] =
                         saturatingAdd(
-                            scratch.phase_participant_load
+                            scratch.phaseTargetRows()
                                 [phase][owner_index],
-                            scratch.phase_expert_counts[phase][expert]);
+                            scratch.phaseExpertRows()[phase][expert]);
                 }
             }
             result.snapshot_observations = saturatingAdd(
@@ -2444,36 +2539,36 @@ namespace llaminar2::moe_overlay_controller_device
             /* The economy profile is immutable for the transaction, but its
              * publication storage is node-local mapped memory. Cache the
              * current layer once before enumerating thousands of candidate
-             * cycles; all later deterministic arithmetic stays in LDS/shared
-             * memory and cannot amplify PCIe latency. */
-            for (std::uint32_t tier = 0u;
-                 tier < binding.layout->tier_count;
-                 ++tier)
+             * cycles; all later deterministic arithmetic stays in the exact
+             * admitted device workspace and cannot amplify PCIe latency. */
+            for (std::uint32_t target = 0u;
+                 target < target_count;
+                 ++target)
             {
                 for (std::uint32_t phase_index = 0u;
                      phase_index <
                          kMoEOverlayDeviceControllerDemandPhaseCount;
                      ++phase_index)
                 {
-                    scratch.service_cost[tier][phase_index] =
+                    scratch.serviceRows()[target][phase_index] =
                         dynamicEconomyServiceCost(
-                            binding, tier, layer, phase_index);
+                            binding, target, layer, phase_index);
                 }
             }
             for (std::uint32_t source = 0u;
-                 source < participant_count;
+                 source < target_count;
                  ++source)
             {
                 for (std::uint32_t destination = 0u;
-                     destination < participant_count;
+                     destination < target_count;
                      ++destination)
                 {
                     const auto movement = dynamicEconomyMigrationCost(
                         binding, source, destination, layer);
-                    scratch.migration_transfer_and_repack_ns
+                    scratch.transferRows()
                         [source][destination] =
                             movement.transfer_and_repack_ns;
-                    scratch.migration_inference_interference_ns
+                    scratch.interferenceRows()
                         [source][destination] =
                             movement.inference_interference_ns;
                 }
@@ -2482,16 +2577,16 @@ namespace llaminar2::moe_overlay_controller_device
                  expert < expert_count;
                  ++expert)
             {
-                scratch.last_moved[expert] = loadPeerPublished(
+                scratch.last_moved()[expert] = loadPeerPublished(
                     binding.economy_last_moved +
                     static_cast<std::uint64_t>(layer) * expert_count +
                     expert);
             }
-            scratch.minimum_residency_generations = loadPeerPublished(
+            scratch.minimum_residency_generations()[0] = loadPeerPublished(
                 &binding.economy->minimum_residency_generations);
-            scratch.payoff_horizon_tokens = loadPeerPublished(
+            scratch.payoff_horizon_tokens()[0] = loadPeerPublished(
                 &binding.economy->payoff_horizon_tokens);
-            scratch.minimum_net_benefit_ns = loadPeerPublished(
+            scratch.minimum_net_benefit_ns()[0] = loadPeerPublished(
                 &binding.economy->minimum_net_benefit_ns);
 
             // Selection sort is intentionally explicit: CUDA, HIP, and the
@@ -2500,7 +2595,7 @@ namespace llaminar2::moe_overlay_controller_device
                  expert < expert_count;
                  ++expert)
             {
-                scratch.ordered_experts[expert] = expert;
+                scratch.ordered_experts()[expert] = expert;
             }
             for (std::uint32_t position = 0u;
                  position < expert_count;
@@ -2512,23 +2607,23 @@ namespace llaminar2::moe_overlay_controller_device
                      ++candidate)
                 {
                     const std::uint32_t left =
-                        scratch.ordered_experts[candidate];
+                        scratch.ordered_experts()[candidate];
                     const std::uint32_t right =
-                        scratch.ordered_experts[selected];
-                    if (scratch.expert_counts[left] >
-                            scratch.expert_counts[right] ||
-                        (scratch.expert_counts[left] ==
-                             scratch.expert_counts[right] &&
+                        scratch.ordered_experts()[selected];
+                    if (scratch.expert_counts()[left] >
+                            scratch.expert_counts()[right] ||
+                        (scratch.expert_counts()[left] ==
+                             scratch.expert_counts()[right] &&
                          left < right))
                     {
                         selected = candidate;
                     }
                 }
                 const std::uint32_t temporary =
-                    scratch.ordered_experts[position];
-                scratch.ordered_experts[position] =
-                    scratch.ordered_experts[selected];
-                scratch.ordered_experts[selected] = temporary;
+                    scratch.ordered_experts()[position];
+                scratch.ordered_experts()[position] =
+                    scratch.ordered_experts()[selected];
+                scratch.ordered_experts()[selected] = temporary;
             }
 
             std::uint32_t expert_cursor = 0u;
@@ -2539,18 +2634,18 @@ namespace llaminar2::moe_overlay_controller_device
                 std::uint32_t member_count = 0u;
                 std::uint32_t group_quota = 0u;
                 for (std::uint32_t participant = 0u;
-                     participant < participant_count;
+                     participant < target_count;
                      ++participant)
                 {
-                    if (scratch.participant_priority[participant] ==
-                        scratch.priorities[priority_index])
+                    if (scratch.target_priority()[participant] ==
+                        scratch.priorities()[priority_index])
                     {
-                        scratch.priority_participants[member_count] =
+                        scratch.priority_targets()[member_count] =
                             participant;
-                        scratch.remaining[member_count] =
-                            scratch.quotas[participant];
-                        scratch.participant_load[member_count] = 0u;
-                        group_quota += scratch.quotas[participant];
+                        scratch.remaining()[member_count] =
+                            scratch.quotas()[participant];
+                        scratch.target_load()[member_count] = 0u;
+                        group_quota += scratch.quotas()[participant];
                         ++member_count;
                     }
                 }
@@ -2566,21 +2661,21 @@ namespace llaminar2::moe_overlay_controller_device
                         return;
                     }
                     const std::uint32_t expert =
-                        scratch.ordered_experts[expert_cursor++];
+                        scratch.ordered_experts()[expert_cursor++];
                     std::uint32_t selected = member_count;
                     for (std::uint32_t member = 0u;
                          member < member_count;
                          ++member)
                     {
-                        if (scratch.remaining[member] == 0u)
+                        if (scratch.remaining()[member] == 0u)
                             continue;
                         if (selected == member_count ||
-                            scratch.participant_load[member] <
-                                scratch.participant_load[selected] ||
-                            (scratch.participant_load[member] ==
-                                 scratch.participant_load[selected] &&
-                             scratch.priority_participants[member] <
-                                 scratch.priority_participants[selected]))
+                            scratch.target_load()[member] <
+                                scratch.target_load()[selected] ||
+                            (scratch.target_load()[member] ==
+                                 scratch.target_load()[selected] &&
+                             scratch.priority_targets()[member] <
+                                 scratch.priority_targets()[selected]))
                         {
                             selected = member;
                         }
@@ -2592,13 +2687,13 @@ namespace llaminar2::moe_overlay_controller_device
                             MoEOverlayDeviceControllerError::InvalidSnapshot);
                         return;
                     }
-                    scratch.desired_owner[expert] =
+                    scratch.desired_owner()[expert] =
                         static_cast<std::int32_t>(
-                            scratch.priority_participants[selected]);
-                    --scratch.remaining[selected];
-                    scratch.participant_load[selected] = saturatingAdd(
-                        scratch.participant_load[selected],
-                        scratch.expert_counts[expert]);
+                            scratch.priority_targets()[selected]);
+                    --scratch.remaining()[selected];
+                    scratch.target_load()[selected] = saturatingAdd(
+                        scratch.target_load()[selected],
+                        scratch.expert_counts()[expert]);
                 }
             }
             if (expert_cursor != expert_count)
@@ -2611,8 +2706,8 @@ namespace llaminar2::moe_overlay_controller_device
 
             DynamicPlacementScore working_score = scoreDynamicLayer(
                 scratch,
-                scratch.current_owner,
-                participant_count,
+                scratch.current_owner(),
+                target_count,
                 expert_count,
                 priority_count);
             result.priority_cost_before = saturatingAdd(
@@ -2638,7 +2733,7 @@ namespace llaminar2::moe_overlay_controller_device
                      expert < expert_count;
                      ++expert)
                 {
-                    scratch.enumerated[expert] = scratch.excluded[expert];
+                    scratch.enumerated()[expert] = scratch.excluded()[expert];
                 }
                 std::uint32_t best_cycle_length = 0u;
                 DynamicCycleEconomyScore best_economy{};
@@ -2648,8 +2743,8 @@ namespace llaminar2::moe_overlay_controller_device
                 {
                     const std::uint32_t cycle_length = findDynamicCycle(
                         scratch,
-                        scratch.enumerated,
-                        participant_count,
+                        scratch.enumerated(),
+                        target_count,
                         expert_count);
                     if (cycle_length == 0u)
                         break;
@@ -2657,7 +2752,7 @@ namespace llaminar2::moe_overlay_controller_device
                          edge < cycle_length;
                          ++edge)
                     {
-                        scratch.enumerated[scratch.cycle[edge]] = 1u;
+                        scratch.enumerated()[scratch.cycle()[edge]] = 1u;
                     }
                     if (result.command_count + cycle_length > maximum_commands)
                         continue;
@@ -2666,22 +2761,22 @@ namespace llaminar2::moe_overlay_controller_device
                          expert < expert_count;
                          ++expert)
                     {
-                        scratch.candidate_owner[expert] =
-                            scratch.current_owner[expert];
+                        scratch.candidate_owner()[expert] =
+                            scratch.current_owner()[expert];
                     }
                     for (std::uint32_t edge = 0u;
                          edge < cycle_length;
                          ++edge)
                     {
-                        const std::uint32_t expert = scratch.cycle[edge];
-                        scratch.candidate_owner[expert] =
-                            scratch.desired_owner[expert];
+                        const std::uint32_t expert = scratch.cycle()[edge];
+                        scratch.candidate_owner()[expert] =
+                            scratch.desired_owner()[expert];
                     }
                     const DynamicPlacementScore candidate_score =
                         scoreDynamicLayer(
                             scratch,
-                            scratch.candidate_owner,
-                            participant_count,
+                            scratch.candidate_owner(),
+                            target_count,
                             expert_count,
                             priority_count);
                     const bool improves_priority =
@@ -2692,7 +2787,7 @@ namespace llaminar2::moe_overlay_controller_device
                         samePriorityDynamicCycleIsEligible(
                             scratch,
                             cycle_length,
-                            participant_count,
+                            target_count,
                             expert_count,
                             imbalance_threshold_per_mille);
                     if (!improves_priority && !targets_skew)
@@ -2702,7 +2797,7 @@ namespace llaminar2::moe_overlay_controller_device
                              edge < cycle_length;
                              ++edge)
                         {
-                            scratch.excluded[scratch.cycle[edge]] = 1u;
+                            scratch.excluded()[scratch.cycle()[edge]] = 1u;
                         }
                         continue;
                     }
@@ -2713,7 +2808,7 @@ namespace llaminar2::moe_overlay_controller_device
                             scratch,
                             cycle_length,
                             layer,
-                            participant_count,
+                            target_count,
                             expert_count,
                             transaction,
                             minimum_improvement_per_mille);
@@ -2739,7 +2834,7 @@ namespace llaminar2::moe_overlay_controller_device
                              edge < cycle_length;
                              ++edge)
                         {
-                            scratch.excluded[scratch.cycle[edge]] = 1u;
+                            scratch.excluded()[scratch.cycle()[edge]] = 1u;
                         }
                         continue;
                     }
@@ -2753,8 +2848,8 @@ namespace llaminar2::moe_overlay_controller_device
                              edge < cycle_length;
                              ++edge)
                         {
-                            scratch.fallback_cycle[edge] =
-                                scratch.cycle[edge];
+                            scratch.fallback_cycle()[edge] =
+                                scratch.cycle()[edge];
                         }
                     }
                     const bool advances_participant =
@@ -2775,7 +2870,7 @@ namespace llaminar2::moe_overlay_controller_device
                              edge < cycle_length;
                              ++edge)
                         {
-                            scratch.best_cycle[edge] = scratch.cycle[edge];
+                            scratch.best_cycle()[edge] = scratch.cycle()[edge];
                         }
                     }
                 }
@@ -2803,8 +2898,8 @@ namespace llaminar2::moe_overlay_controller_device
                          edge < fallback_cycle_length;
                          ++edge)
                     {
-                        scratch.best_cycle[edge] =
-                            scratch.fallback_cycle[edge];
+                        scratch.best_cycle()[edge] =
+                            scratch.fallback_cycle()[edge];
                     }
                 }
                 if (best_cycle_length == 0u)
@@ -2813,28 +2908,28 @@ namespace llaminar2::moe_overlay_controller_device
                      edge < best_cycle_length;
                      ++edge)
                 {
-                    scratch.cycle[edge] = scratch.best_cycle[edge];
+                    scratch.cycle()[edge] = scratch.best_cycle()[edge];
                 }
                 for (std::uint32_t expert = 0u;
                      expert < expert_count;
                      ++expert)
                 {
-                    scratch.candidate_owner[expert] =
-                        scratch.current_owner[expert];
+                    scratch.candidate_owner()[expert] =
+                        scratch.current_owner()[expert];
                 }
                 for (std::uint32_t edge = 0u;
                      edge < best_cycle_length;
                      ++edge)
                 {
-                    const std::uint32_t expert = scratch.cycle[edge];
-                    scratch.candidate_owner[expert] =
-                        scratch.desired_owner[expert];
+                    const std::uint32_t expert = scratch.cycle()[edge];
+                    scratch.candidate_owner()[expert] =
+                        scratch.desired_owner()[expert];
                 }
                 const DynamicPlacementScore candidate_score =
                     scoreDynamicLayer(
                         scratch,
-                        scratch.candidate_owner,
-                        participant_count,
+                        scratch.candidate_owner(),
+                        target_count,
                         expert_count,
                         priority_count);
                 const bool advances_priority =
@@ -2845,37 +2940,43 @@ namespace llaminar2::moe_overlay_controller_device
                     working_score.same_priority_makespan;
                 axis_progress.observe(
                     advances_priority, advances_participant);
-                const auto movement_axis =
-                    advances_priority && advances_participant
-                        ? MoEOverlayDeviceMovementAxis::Combined
-                        : (advances_priority
-                               ? MoEOverlayDeviceMovementAxis::TierResidency
-                               : MoEOverlayDeviceMovementAxis::ParticipantPlacement);
+                bool crosses_tier = false, stays_in_tier = false;
+                for (std::uint32_t edge = 0u; edge < best_cycle_length; ++edge)
+                {
+                    const auto expert = scratch.cycle()[edge];
+                    const bool same = scratch.target_tier()[scratch.current_owner()[expert]] ==
+                        scratch.target_tier()[scratch.desired_owner()[expert]];
+                    crosses_tier = crosses_tier || !same;
+                    stays_in_tier = stays_in_tier || same;
+                }
+                const auto movement_axis = crosses_tier
+                    ? (stays_in_tier ? MoEOverlayDeviceMovementAxis::Combined : MoEOverlayDeviceMovementAxis::TierResidency)
+                    : MoEOverlayDeviceMovementAxis::ParticipantPlacement;
+
                 const std::uint64_t payload_bytes = loadPeerPublished(
                     binding.payload_bytes_per_layer + layer);
                 if (payload_bytes == 0u)
                 {
-                    failLeader(
-                        binding,
-                        MoEOverlayDeviceControllerError::InvalidControl);
+                    failLeader(binding, MoEOverlayDeviceControllerError::InvalidControl);
                     return;
                 }
+
                 for (std::uint32_t edge = 0u;
                      edge < best_cycle_length;
                      ++edge)
                 {
-                    const std::uint32_t expert = scratch.cycle[edge];
+                    const std::uint32_t expert = scratch.cycle()[edge];
                     const auto source = static_cast<std::uint32_t>(
-                        scratch.current_owner[expert]);
+                        scratch.current_owner()[expert]);
                     const auto destination = static_cast<std::uint32_t>(
-                        scratch.desired_owner[expert]);
+                        scratch.desired_owner()[expert]);
                     MoEOverlayDeviceMovementCommand command{};
                     command.op = raw(
                         MoEOverlayDeviceMovementOp::DurableMove);
                     command.layer = layer;
                     command.expert = expert;
-                    command.source_participant = source;
-                    command.destination_participant = destination;
+                    command.source_target = logicalPolicyTarget(binding, source);
+                    command.destination_target = logicalPolicyTarget(binding, destination);
                     command.flags = moeOverlayMovementFlags(
                         movement_axis, result.accepted_cycles + 1u);
                     command.payload_bytes = payload_bytes;
@@ -2884,9 +2985,9 @@ namespace llaminar2::moe_overlay_controller_device
                     binding.command_entries[result.command_count++] = command;
 
                     const std::int32_t source_priority =
-                        scratch.participant_priority[source];
+                        scratch.target_priority()[source];
                     const std::int32_t destination_priority =
-                        scratch.participant_priority[destination];
+                        scratch.target_priority()[destination];
                     if (destination_priority < source_priority)
                         ++result.promotions;
                     else if (destination_priority > source_priority)
@@ -2898,12 +2999,12 @@ namespace llaminar2::moe_overlay_controller_device
                      expert < expert_count;
                      ++expert)
                 {
-                    scratch.current_owner[expert] =
-                        scratch.candidate_owner[expert];
+                    scratch.current_owner()[expert] =
+                        scratch.candidate_owner()[expert];
                     /* Economy rejection belongs to the placement that was
                      * just replaced. Removing one straggler can make a
                      * previously neutral cycle the next critical-path win. */
-                    scratch.excluded[expert] = 0u;
+                    scratch.excluded()[expert] = 0u;
                 }
                 /* Keep the layer-local critical-path cache coherent with the
                  * newly accepted owner map. Later cycle candidates in this
@@ -2914,10 +3015,10 @@ namespace llaminar2::moe_overlay_controller_device
                      ++phase)
                 {
                     for (std::uint32_t participant = 0u;
-                         participant < participant_count;
+                         participant < target_count;
                          ++participant)
                     {
-                        scratch.phase_participant_load[phase][participant] =
+                        scratch.phaseTargetRows()[phase][participant] =
                             0u;
                     }
                     for (std::uint32_t expert = 0u;
@@ -2925,11 +3026,11 @@ namespace llaminar2::moe_overlay_controller_device
                          ++expert)
                     {
                         const auto owner = static_cast<std::uint32_t>(
-                            scratch.current_owner[expert]);
-                        scratch.phase_participant_load[phase][owner] =
+                            scratch.current_owner()[expert]);
+                        scratch.phaseTargetRows()[phase][owner] =
                             saturatingAdd(
-                                scratch.phase_participant_load[phase][owner],
-                                scratch.phase_expert_counts[phase][expert]);
+                                scratch.phaseTargetRows()[phase][owner],
+                                scratch.phaseExpertRows()[phase][expert]);
                     }
                 }
                 working_score = candidate_score;
@@ -3013,8 +3114,8 @@ namespace llaminar2::moe_overlay_controller_device
             return;
         }
 
-        const std::uint32_t participant_count =
-            loadPeerPublished(&binding.layout->participant_count);
+        const std::uint32_t target_count =
+            loadPeerPublished(&binding.layout->logical_target_count);
         const std::uint32_t layer_count =
             loadPeerPublished(&binding.layout->num_layers);
         const std::uint32_t expert_count =
@@ -3032,17 +3133,18 @@ namespace llaminar2::moe_overlay_controller_device
             &binding.layout->dynamic_maximum_cycles_per_layer);
         const std::uint32_t maximum_cycles_per_layer =
             configured_layer_cycles == 0u ? 1u : configured_layer_cycles;
-        if (participant_count == 0u ||
-            participant_count >
-                kMoEOverlayDeviceControllerFabricMaxParticipants ||
+        // Every policy vertex is an original typed target. Physical member
+        // snapshots and logical quotas have independently admitted extents.
+        if (target_count == 0u ||
             layer_count == 0u ||
             layer_count > kMoEOverlayDeviceControllerFabricMaxLayers ||
             expert_count == 0u ||
             expert_count > kMoEOverlayDeviceControllerFabricMaxExperts ||
-            command_capacity < participant_count || maximum_cycles == 0u ||
-            !binding.initial_owner_participants ||
+            command_capacity < target_count || maximum_cycles == 0u ||
+            !scratch.validFor({binding.layout->participant_count, target_count, binding.layout->tier_count, expert_count}) ||
+            !binding.initial_route_targets ||
             loadPeerPublished(
-                &binding.layout->initial_owner_participants_words) !=
+                &binding.layout->initial_route_targets_words) !=
                 expected_owner_words)
         {
             failLeader(
@@ -3051,32 +3153,11 @@ namespace llaminar2::moe_overlay_controller_device
             return;
         }
 
-        for (std::uint32_t participant = 0u;
-             participant < participant_count;
-             ++participant)
+        std::uint32_t priority_count = 0u;
+        if (!prepareLogicalPolicyScratch(binding, scratch, priority_count))
         {
-            const auto metadata = snapshotPeerRecord(
-                binding.participants + participant);
-            if (metadata.participant_id != participant ||
-                metadata.group_id >= binding.layout->group_count)
-            {
-                failLeader(
-                    binding,
-                    MoEOverlayDeviceControllerError::InvalidTopology);
-                return;
-            }
-            scratch.participant_priority[participant] =
-                metadata.tier_priority;
-            scratch.participant_tier[participant] = metadata.tier_index;
-            scratch.participant_state_base[participant] =
-                participantStateBase(binding, participant, metadata);
-            if (!scratch.participant_state_base[participant])
-            {
-                failLeader(
-                    binding,
-                    MoEOverlayDeviceControllerError::InvalidTopology);
-                return;
-            }
+            failLeader(binding, MoEOverlayDeviceControllerError::InvalidTopology);
+            return;
         }
 
         MoEOverlayDeviceControllerPolicyResult result{};
@@ -3110,11 +3191,11 @@ namespace llaminar2::moe_overlay_controller_device
             const std::uint32_t layer =
                 (layer_scan_start + layer_offset) % layer_count;
             for (std::uint32_t participant = 0u;
-                 participant < participant_count;
+                 participant < target_count;
                  ++participant)
             {
-                scratch.quotas[participant] = 0u;
-                scratch.remaining[participant] = 0u;
+                scratch.quotas()[participant] = 0u;
+                scratch.remaining()[participant] = 0u;
             }
             for (std::uint32_t expert = 0u;
                  expert < expert_count;
@@ -3122,54 +3203,40 @@ namespace llaminar2::moe_overlay_controller_device
             {
                 std::uint32_t owner_count = 0u;
                 std::int32_t owner = -1;
-                for (std::uint32_t participant = 0u;
-                     participant < participant_count;
-                     ++participant)
+                for (std::uint32_t vertex = 0u; vertex < target_count; ++vertex)
                 {
-                    const std::uint64_t word = loadPeerPublished(
-                        scratch.participant_state_base[participant] +
-                        static_cast<std::uint64_t>(layer) * expert_count +
-                        expert);
-                    if (moe_rebalance_policy::
-                            collectedStateAuthoritativeOwner(word))
+                    const auto snapshot = logicalPolicySnapshot(binding, scratch, vertex, layer, expert);
+                    if (!snapshot.valid)
                     {
-                        if (!moe_rebalance_policy::
-                                collectedStatePhysicallyResident(word))
-                        {
-                            failLeader(
-                                binding,
-                                MoEOverlayDeviceControllerError::
-                                    InvalidSnapshot);
-                            return;
-                        }
-                        owner = static_cast<std::int32_t>(participant);
-                        ++owner_count;
+                        failLeader(binding, MoEOverlayDeviceControllerError::InvalidSnapshot);
+                        return;
                     }
+                    if (snapshot.authoritative) { owner = static_cast<std::int32_t>(vertex); ++owner_count; }
                 }
-                const std::uint32_t target = loadPeerPublished(
-                    binding.initial_owner_participants +
-                    static_cast<std::uint64_t>(layer) * expert_count +
-                    expert);
-                if (owner_count != 1u || target >= participant_count)
+                const auto original_target = MoEOverlayRouteTarget::fromWord(loadPeerPublished(
+                    reinterpret_cast<const std::int32_t *>(binding.initial_route_targets) +
+                    std::uint64_t(layer) * expert_count + expert));
+                const auto target = logicalPolicyTargetIndex(binding, original_target);
+                if (owner_count != 1u || target >= target_count)
                 {
                     failLeader(
                         binding,
                         MoEOverlayDeviceControllerError::InvalidSnapshot);
                     return;
                 }
-                scratch.current_owner[expert] = owner;
-                scratch.desired_owner[expert] =
+                scratch.current_owner()[expert] = owner;
+                scratch.desired_owner()[expert] =
                     static_cast<std::int32_t>(target);
-                scratch.excluded[expert] = 0u;
-                ++scratch.quotas[static_cast<std::uint32_t>(owner)];
-                ++scratch.remaining[target];
+                scratch.excluded()[expert] = 0u;
+                ++scratch.quotas()[static_cast<std::uint32_t>(owner)];
+                ++scratch.remaining()[target];
             }
             for (std::uint32_t participant = 0u;
-                 participant < participant_count;
+                 participant < target_count;
                  ++participant)
             {
-                if (scratch.quotas[participant] !=
-                    scratch.remaining[participant])
+                if (scratch.quotas()[participant] !=
+                    scratch.remaining()[participant])
                 {
                     failLeader(
                         binding,
@@ -3185,8 +3252,8 @@ namespace llaminar2::moe_overlay_controller_device
             {
                 const std::uint32_t cycle_length = findDynamicCycle(
                     scratch,
-                    scratch.excluded,
-                    participant_count,
+                    scratch.excluded(),
+                    target_count,
                     expert_count);
                 if (cycle_length == 0u)
                     break;
@@ -3208,14 +3275,14 @@ namespace llaminar2::moe_overlay_controller_device
                      edge < cycle_length;
                      ++edge)
                 {
-                    const std::uint32_t expert = scratch.cycle[edge];
+                    const std::uint32_t expert = scratch.cycle()[edge];
                     const auto source = static_cast<std::uint32_t>(
-                        scratch.current_owner[expert]);
+                        scratch.current_owner()[expert]);
                     const auto destination = static_cast<std::uint32_t>(
-                        scratch.desired_owner[expert]);
+                        scratch.desired_owner()[expert]);
                     const bool same_tier =
-                        scratch.participant_tier[source] ==
-                        scratch.participant_tier[destination];
+                        scratch.target_tier()[source] ==
+                        scratch.target_tier()[destination];
                     stays_in_tier = stays_in_tier || same_tier;
                     crosses_tier = crosses_tier || !same_tier;
                 }
@@ -3230,18 +3297,18 @@ namespace llaminar2::moe_overlay_controller_device
                      edge < cycle_length;
                      ++edge)
                 {
-                    const std::uint32_t expert = scratch.cycle[edge];
+                    const std::uint32_t expert = scratch.cycle()[edge];
                     const auto source = static_cast<std::uint32_t>(
-                        scratch.current_owner[expert]);
+                        scratch.current_owner()[expert]);
                     const auto destination = static_cast<std::uint32_t>(
-                        scratch.desired_owner[expert]);
+                        scratch.desired_owner()[expert]);
                     MoEOverlayDeviceMovementCommand command{};
                     command.op = raw(
                         MoEOverlayDeviceMovementOp::DurableMove);
                     command.layer = layer;
                     command.expert = expert;
-                    command.source_participant = source;
-                    command.destination_participant = destination;
+                    command.source_target = logicalPolicyTarget(binding, source);
+                    command.destination_target = logicalPolicyTarget(binding, destination);
                     command.flags = moeOverlayMovementFlags(
                         movement_axis, result.accepted_cycles + 1u);
                     command.payload_bytes = payload_bytes;
@@ -3250,17 +3317,17 @@ namespace llaminar2::moe_overlay_controller_device
                     binding.command_entries[result.command_count++] = command;
 
                     const std::int32_t source_priority =
-                        scratch.participant_priority[source];
+                        scratch.target_priority()[source];
                     const std::int32_t destination_priority =
-                        scratch.participant_priority[destination];
+                        scratch.target_priority()[destination];
                     if (destination_priority < source_priority)
                         ++result.promotions;
                     else if (destination_priority > source_priority)
                         ++result.demotions;
                     else
                         ++result.same_priority_moves;
-                    scratch.current_owner[expert] =
-                        scratch.desired_owner[expert];
+                    scratch.current_owner()[expert] =
+                        scratch.desired_owner()[expert];
                 }
                 ++result.accepted_cycles;
                 ++layer_cycles;
@@ -3816,8 +3883,8 @@ namespace llaminar2::moe_overlay_controller_device
         return metadata.participant_id == participant && group != nullptr &&
                metadata.domain_participant_index < group->participant_count &&
                loadPeerPublished(
-                   &group->participant_ids[
-                       metadata.domain_participant_index]) == participant;
+                   moeOverlayGroupMemberIds(binding.mapped_base, binding.mapped_bytes, *group) +
+                       metadata.domain_participant_index) == participant;
     }
 
     /**
@@ -4017,20 +4084,8 @@ namespace llaminar2::moe_overlay_controller_device
                 command.base_epoch,
                 command.candidate_epoch);
             if (entry_valid)
-            {
-                const auto source = snapshotPeerRecord(
-                    binding.participants + entry.source_participant);
-                const auto destination = snapshotPeerRecord(
-                    binding.participants + entry.destination_participant);
-                entry_valid = participantMetadataValid(
-                                  binding,
-                                  source,
-                                  entry.source_participant) &&
-                    participantMetadataValid(
-                        binding,
-                        destination,
-                        entry.destination_participant);
-            }
+                entry_valid = targetGroup(binding, entry.source_target) &&
+                    targetGroup(binding, entry.destination_target);
             if (ordinal != 0u)
             {
                 const auto previous = snapshotPeerRecord(
@@ -4045,14 +4100,13 @@ namespace llaminar2::moe_overlay_controller_device
                     publication.runtime_layers, entry.layer);
                 entry_valid = runtime->banks[published_bank]
                                   .overlay_route_participant[entry.expert] ==
-                    static_cast<std::int32_t>(entry.source_participant);
+                    entry.source_target.word();
             }
-            if (entry_valid &&
-                entry.destination_participant == binding.participant_id &&
-                !runtimeArrivalReady(
-                    preparedArrival(publication, ordinal), entry.expert))
+            if (entry_valid)
             {
-                ++missing;
+                MoEOverlayRuntimeCandidateRow<RuntimeExpertDescriptorView> prepared_row;
+                if (!candidateRow(launch, entry, prepared_row))
+                    ++missing;
             }
             if (!entry_valid)
                 ++invalid;
@@ -4214,6 +4268,7 @@ namespace llaminar2::moe_overlay_controller_device
             __syncthreads();
         }
 
+        std::uint32_t apply_invalid = 0;
         // Commands are conflict-free, so the complete movement wave can update
         // independent expert slots in parallel without atomics or serialization.
         for (std::uint32_t ordinal = threadIdx.x;
@@ -4222,59 +4277,34 @@ namespace llaminar2::moe_overlay_controller_device
         {
             const auto entry = snapshotPeerRecord(
                 binding.command_entries + ordinal);
-            const auto destination = snapshotPeerRecord(
-                binding.participants + entry.destination_participant);
-            auto *runtime = runtimeLayer(
-                publication.runtime_layers, entry.layer);
-            auto &candidate = runtime->banks[candidate_bank];
-            auto &descriptor = candidate.experts[entry.expert];
-
-            descriptor = RuntimeExpertDescriptorView{};
-            descriptor.logical_expert_id =
-                static_cast<std::int32_t>(entry.expert);
-            // Zero-initialization would make slot zero look meaningful on a
-            // non-owning participant. Keep every metadata-only or external
-            // descriptor explicitly non-executable until the exact transfer
-            // destination installs its prepared pointer-bearing triple.
-            descriptor.owner_participant = -1;
-            descriptor.local_slot = -1;
-            candidate.overlay_route_participant[entry.expert] =
-                static_cast<std::int32_t>(entry.destination_participant);
-            candidate.local_compute_mask[entry.expert] = 0u;
-            candidate.replica_role[entry.expert] = kRuntimeReplicaRoleNone;
-            candidate.resident_participant_mask[entry.expert] = 0u;
-
-            if (destination.group_id == binding.group_id)
-            {
-                const std::uint32_t local_destination =
-                    destination.domain_participant_index;
-                descriptor.owner_participant =
-                    static_cast<std::int32_t>(local_destination);
-                candidate.resident_participant_mask[entry.expert] =
-                    1u << local_destination;
-                if (entry.destination_participant == binding.participant_id)
-                {
-                    descriptor = preparedArrival(publication, ordinal);
-                    descriptor.logical_expert_id =
-                        static_cast<std::int32_t>(entry.expert);
-                    descriptor.owner_participant =
-                        static_cast<std::int32_t>(local_destination);
-                    descriptor.flags =
-                        (descriptor.flags & kRuntimeExpertFlagTransferSlot) |
-                        kRuntimeExpertFlagValid |
-                        kRuntimeExpertFlagResident |
-                        kRuntimeExpertFlagPreferredOwner |
-                        kRuntimeExpertFlagLocalCompute;
-                    candidate.local_compute_mask[entry.expert] = 1u;
-                    candidate.replica_role[entry.expert] =
-                        kRuntimeReplicaRolePrimary;
-                }
-            }
+            MoEOverlayRuntimeCandidateRow<RuntimeExpertDescriptorView> row;
+            const bool lowered = candidateRow(launch, entry, row);
+            if (!lowered)
+                ++apply_invalid;
             else
             {
-                descriptor.owner_participant = -1;
-                descriptor.local_slot = -1;
+                auto *runtime = runtimeLayer(publication.runtime_layers, entry.layer);
+                auto &candidate = runtime->banks[candidate_bank];
+                candidate.experts[entry.expert] = row.descriptor;
+                candidate.overlay_route_participant[entry.expert] = row.route;
+                candidate.local_compute_mask[entry.expert] = row.local_compute;
+                candidate.replica_role[entry.expert] = row.replica_role;
+                candidate.resident_participant_mask[entry.expert] = row.resident_mask;
             }
+        }
+        invalid_parts[threadIdx.x] = apply_invalid;
+        __syncthreads();
+        for (std::uint32_t stride = blockDim.x / 2u; stride; stride >>= 1u)
+        {
+            if (threadIdx.x < stride)
+                invalid_parts[threadIdx.x] += invalid_parts[threadIdx.x + stride];
+            __syncthreads();
+        }
+        if (invalid_parts[0])
+        {
+            if (threadIdx.x == 0)
+                failParticipant(binding, MoEOverlayDeviceControllerError::InvalidState);
+            return; // Uniform block exit: no candidate epoch can be published.
         }
         __threadfence();
         __syncthreads();
@@ -5414,7 +5444,6 @@ namespace llaminar2::moe_overlay_controller_device
         launch.action = Action;
         __shared__ std::uint32_t launch_valid;
         __shared__ std::uint32_t runtime_noop;
-        __shared__ DynamicPolicyScratch dynamic_policy_scratch;
         if (threadIdx.x == 0u)
         {
             launch_valid =
@@ -5456,6 +5485,11 @@ namespace llaminar2::moe_overlay_controller_device
                 raw(launch.action));
         }
 
+        if (launch.action == MoEOverlayDeviceControllerAction::CollectRuntimeSnapshot)
+        {
+            collectRuntimeSnapshot(launch);
+            return;
+        }
         if (launch.action ==
             MoEOverlayDeviceControllerAction::PublishParticipantSnapshot)
         {
@@ -5485,7 +5519,10 @@ namespace llaminar2::moe_overlay_controller_device
             MoEOverlayDeviceControllerAction::AuthorDynamicPolicy)
         {
             if (threadIdx.x == 0u)
-                authorDynamicPolicy(launch, dynamic_policy_scratch);
+            {
+                DynamicPolicyScratch scratch(launch.policy_workspace);
+                authorDynamicPolicy(launch, scratch);
+            }
             return;
         }
         if (launch.action == MoEOverlayDeviceControllerAction::
@@ -5493,8 +5530,8 @@ namespace llaminar2::moe_overlay_controller_device
         {
             if (threadIdx.x == 0u)
             {
-                authorPreparedContextRestore(
-                    launch, dynamic_policy_scratch);
+                DynamicPolicyScratch scratch(launch.policy_workspace);
+                authorPreparedContextRestore(launch, scratch);
             }
             return;
         }

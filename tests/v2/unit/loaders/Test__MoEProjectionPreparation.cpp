@@ -10,7 +10,12 @@
 #include "execution/moe/MoEExpertOverlayExecutionPlan.h"
 #include "execution/moe/MoEExpertOverlayPreparationPlan.h"
 #include "execution/moe/MoEExpertOwnerMap.h"
+#include "execution/moe/MoEIntermediateShardDescriptorDeclaration.h"
+#include "execution/moe/MoEOverlayDevicePreparedArrivalInbox.h"
+#include "loaders/ModelLoader.h"
+#include "utils/PlanningGGUFFixture.h"
 #include "execution/moe/MoEOverlayParticipantResidency.h"
+#include "execution/moe/MoERuntimeTable.h"
 #include "mocks/MockModelLoader.h"
 
 #include <gtest/gtest.h>
@@ -519,6 +524,94 @@ TEST(MoEProjectionPreparation, CpuSourcesRetainRankIdentityAndHostExecutionLifet
             EXPECT_EQ(source.host_policy, WeightHostPolicy::RequiredForCPUExecution);
             EXPECT_EQ(source.residency_category, WeightResidencyCategory::CpuFallbackExpert);
         }
+    }
+}
+
+/** Exercise the inbox's exact post-export predicate without materializing any device weights. */
+TEST(MoEPreparedArrivalPublication, RejectsChangedOriginalSourceAndIncompleteNativePlanes)
+{
+    constexpr int experts = 8;
+    const PlanningGGUFFixture file(true, false, GGUFTensorType::Q4_K, 1024,
+        std::nullopt, 8, PlanningGGUFFixture::Geometry::Directory, 1, experts);
+    ModelLoader loader;
+    ASSERT_TRUE(loader.loadModel(file.path()));
+    auto plan = planFor(true, 2, RoutedExpertOwnerOrder::Ordinal, experts);
+    plan->topology = RoutedExpertPlacementTopology::TieredOverlay;
+    plan->domains.front().routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+    auto receiver = plan->domains.front();
+    receiver.name = "receiver";
+    receiver.participants = {GlobalDeviceAddress::rocm(0), GlobalDeviceAddress::rocm(1)};
+    plan->domains.push_back(std::move(receiver));
+    plan->routed_tiers.push_back({.name = "receiver", .domain = "receiver", .priority = 8});
+    plan->placements.resize(1);
+    plan->authority_execution = resolveMoEOverlayAuthorityExecutionKind(*plan);
+    const auto runtime_plan = resolveMoEExpertOverlayRuntimePlan(plan);
+    const auto preparation = std::make_shared<const MoEExpertOverlayPreparationPlan>(
+        MoEExpertOverlayPreparationPlan::build(*runtime_plan, loader));
+    const auto &owners = preparation->jointOwnerMap();
+    ASSERT_NE(owners, nullptr);
+    const auto members = owners->participants();
+    const auto member = std::ranges::find_if(members,
+        [](const auto &entry) { return entry.domain_name == "receiver"; });
+    ASSERT_NE(member, members.end());
+    ASSERT_TRUE(owners->expertsForParticipant(0, member->participant_id).empty());
+    MoEOverlayParticipantResidencyRegistry residency({
+        .local_participant_ids = {member->participant_id}, .num_layers = 1,
+        .num_experts = experts, .initial_epoch = 1, .projection_preparation = preparation,
+        .original_model = ModelContextId{1}});
+    const auto family = residency.initialJointLayer(member->participant_id, 0)->family();
+    DeviceMoERuntimeTable runtime({
+        .device_id = member->device, .num_layers = 1, .num_experts = experts, .top_k = 2,
+        .mirror_to_device = false, .fragment_families = {family}});
+    const auto *source = runtime.fragmentDescriptorDeclaration(0);
+    ASSERT_NE(source, nullptr);
+    ASSERT_EQ(source->originalFamily(), family.get());
+    ASSERT_EQ(runtime.fragmentDescriptorDeclaration(0), source);
+
+    // Addresses stand in for engine export metadata. This host test never dereferences
+    // them and cannot issue a live device descriptor or assert allocation capacity.
+    const uint8_t marker = 0;
+    const auto descriptor = [&marker, source](std::size_t role, int n, int k)
+    {
+        const auto identity = source->sourceFormats()[role].native_quantised;
+        return DeviceNativeQuantisedMatrixDesc{
+            .payload = &marker, .scales = &marker, .mins = &marker,
+            .n = n, .k = k, .blocks_per_row = static_cast<uint32_t>(k / 32),
+            .codebook_id = canonicalDeviceVnniCodebookId(identity),
+            .source_codebook_id = identity.codebook_id, .source_is_superblock = 1,
+            .source_identity_present = 1};
+    };
+    const int h = static_cast<int>(source->originalBinding().modelColumns());
+    const int f = static_cast<int>(source->originalBinding().localIntermediateColumns());
+    ASSERT_NE(f, h);
+    DeviceMoEExpertDescriptor exported{};
+    exported.projection_set = DeviceMoEProjectionSet::IntermediateShard;
+    exported.weight_format = DeviceMoEWeightFormat::NativeQuantised;
+    exported.gate = descriptor(0, f, h);
+    exported.up = descriptor(1, f, h);
+    exported.down = descriptor(2, h, f);
+    const auto matches = [source](const auto &candidate) {
+        return MoEOverlayDevicePreparedArrivalInbox::matchesExportedFragment(*source, candidate);
+    };
+    ASSERT_TRUE(matches(exported));
+    using Mutation = void (*)(DeviceMoEExpertDescriptor &);
+    const std::pair<const char *, Mutation> defects[] = {
+        {"wrong gate row extent", [](auto &d) { d.gate.n -= 32; }},
+        {"wrong down K32 block count", [](auto &d) { --d.down.blocks_per_row; }},
+        {"missing source provenance", [](auto &d) { d.up.source_identity_present = 0; }},
+        {"foreign arithmetic source", [](auto &d) { d.up.source_is_superblock = 0; }},
+        {"unreachable physical execution", [](auto &d) { d.gate.codebook_id = 19; }},
+        {"missing secondary plane", [](auto &d) { d.down.mins = nullptr; }},
+        {"wrong projection set", [](auto &d) { d.projection_set = DeviceMoEProjectionSet::CompleteExpert; }},
+        {"wrong precision family", [](auto &d) { d.weight_format = DeviceMoEWeightFormat::FP16; }},
+    };
+    for (const auto &[name, mutate] : defects)
+    {
+        SCOPED_TRACE(name);
+        auto changed = exported;
+        mutate(changed);
+        EXPECT_FALSE(MoEOverlayDevicePreparedArrivalInbox::matchesExportedFragment(*source, changed));
+        EXPECT_TRUE(matches(exported));
     }
 }
 } // namespace llaminar2::test

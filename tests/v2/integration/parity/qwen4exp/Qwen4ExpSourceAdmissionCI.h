@@ -12,6 +12,10 @@
 #include "Qwen4ExpCPUJointSocketEvidence.h"
 #include "../ModelParityRuntimeExport.h"
 #include "backends/HardwareInventory.h"
+#ifdef HAVE_ROCM
+#include "backends/rocm/ROCmHardwareMetadata.h"
+#endif
+#include "../../../fixtures/planning/MaximumContextStateGeometry.h"
 #include <algorithm>
 #include <filesystem>
 #include <optional>
@@ -186,6 +190,9 @@ public:
     const ModelParityCase &modelParityCase() const { return GetParam(); }
 };
 
+/** @brief Capacity evidence requested by the caller of the original native hardware publication. */
+enum class HardwareInventoryScope { SourceAdmission, DedicatedPreflight, SharedPreflight };
+
 /**
  * @brief Write a fresh, single-process native hardware observation.
  * @param path Absolute caller-owned output, required not to exist.
@@ -194,7 +201,8 @@ public:
  * The caller performs normal context/collective retirement and MPI finalization
  * before Python admits this document. Native failure never means zero devices.
  */
-inline void exportQwen4ExpSourceHardware(const std::filesystem::path &path)
+inline void exportQwen4ExpSourceHardware(const std::filesystem::path &path,
+                                        HardwareInventoryScope scope = HardwareInventoryScope::SourceAdmission)
 {
     int ranks = 0;
     if (MPI_Comm_size(MPI_COMM_WORLD, &ranks) != MPI_SUCCESS || ranks != 1 ||
@@ -210,13 +218,38 @@ inline void exportQwen4ExpSourceHardware(const std::filesystem::path &path)
     bool first = true;
     const auto append = [&](const char *backend, int ordinal, int numa, std::size_t total = 0u,
                             std::optional<int> socket = std::nullopt,
-                            std::string_view native_isa = {}, std::string_view uuid = {}) {
+                            std::string_view native_isa = {}, std::string_view uuid = {},
+                            const ComputeDevice* physical = nullptr) {
         out << (first ? "" : ",") << "{\"backend\":" << modelParityJsonString(backend)
             << ",\"ordinal\":" << ordinal << ",\"numa_node\":" << numa;
         if (total) out << ",\"total_memory_bytes\":" << total;
         if (socket) out << ",\"socket_id\":" << *socket;
         if (!native_isa.empty()) out << ",\"native_isa\":" << modelParityJsonString(std::string(native_isa));
         if (!uuid.empty()) out << ",\"uuid\":" << modelParityJsonString(std::string(uuid));
+        // This fixture always allocates on physical ordinal zero. Price each
+        // independent model/policy with the same planner used to materialize it.
+        if (physical && ordinal == 0 && scope != HardwareInventoryScope::SourceAdmission) {
+#ifdef HAVE_ROCM
+            if (std::string_view(backend) == "rocm") {
+                const auto& original = rocmHardwareMetadata().at(ordinal);
+                out << ",\"host_native_atomics\":" << (original.host_native_atomics ? "true" : "false");
+            }
+#endif
+            const bool shared = scope == HardwareInventoryScope::SharedPreflight;
+            if (!total || physical->free_memory_bytes > total)
+                throw std::runtime_error("Invalid original maximum-context capacity observation");
+            const auto device = std::string_view(backend) == "cuda" ? DeviceId::cuda(0) : DeviceId::rocm(0);
+            out << ",\"maximum_context\":{\"basis\":\"" << (shared ? "free" : "total")
+                << "\",\"capacity_bytes\":" << (shared ? physical->free_memory_bytes : total)
+                << ",\"minimum_bytes\":{";
+            bool first_case = true;
+            for (const auto item : maximum_context::cases) {
+                out << (first_case ? "" : ",") << modelParityJsonString(std::string(item.name))
+                    << ':' << maximum_context::minimumIncrementalBytes(item, device, total);
+                first_case = false;
+            }
+            out << "}}";
+        }
         out << '}';
         first = false;
     };
@@ -231,9 +264,9 @@ inline void exportQwen4ExpSourceHardware(const std::filesystem::path &path)
         append("cpu", 0, locality,0u,qwen4ExpOriginalSocketForNUMA(hardware->cpu_sockets,locality));
     }
     for (const auto &device : hardware->cuda_devices) append("cuda", device.device_id, device.numa_node, device.total_memory_bytes,
-        std::nullopt, device.native_isa, device.uuid);
+        std::nullopt, device.native_isa, device.uuid, &device);
     for (const auto &device : hardware->rocm_devices) append("rocm", device.device_id, device.numa_node, device.total_memory_bytes,
-        std::nullopt, device.native_isa, device.uuid);
+        std::nullopt, device.native_isa, device.uuid, &device);
     out << "],\"directed_peer_access\":[";
     bool first_edge = true;
     // DeviceManager owns the frozen startup matrix. Export every directed fact

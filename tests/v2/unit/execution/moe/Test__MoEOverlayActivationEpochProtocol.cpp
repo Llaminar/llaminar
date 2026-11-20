@@ -898,12 +898,12 @@ namespace llaminar2::test
         auto config = makeConfig({7});
         config.return_role = MoEOverlayActivationReturnRole::JointRoot;
         EXPECT_FALSE(config.valid());
-        config.cohort_target = MoEOverlayRouteTarget::cpuCohort(4).word();
+        config.cohort_target = MoEOverlayRouteTarget::cohort(4).word();
         ASSERT_TRUE(config.valid());
         MoEOverlayActivationEpochControl control;
         MoEOverlayActivationEpochProtocol::initialize(control, config);
         auto foreign = config;
-        foreign.cohort_target = MoEOverlayRouteTarget::cpuCohort(5).word();
+        foreign.cohort_target = MoEOverlayRouteTarget::cohort(5).word();
         EXPECT_THROW(MoEOverlayActivationEpochProtocol(control, foreign), std::logic_error);
         EXPECT_EQ(control.channel.abi_version, 10u);
         // Size compatibility is insufficient to establish the native roster

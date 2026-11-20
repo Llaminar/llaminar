@@ -38,9 +38,12 @@ namespace llaminar2
         std::array<std::uint8_t, 16> uuid{};
         int pci_domain = 0, pci_bus = 0, pci_device = 0;
         int compute_units = 0, native_wave_width = 0, maximum_threads_per_block = 0;
+        bool can_launch_cooperative = false; ///< Native cooperative scheduling observed once at physical discovery.
         bool can_use_stream_wait_value = false; ///< SDK-reported device/runtime support for 32/64-bit stream wait-value primitives.
+        bool host_native_atomics = false; ///< Loaded HIP driver supports native PCIe atomics on mapped host memory.
         int wall_clock_rate_khz = 0; ///< Constant-frequency wall_clock64 clock, not the variable core clock.
         std::size_t lds_per_block = 0, total_memory = 0, last_level_cache = 0;
+        bool integrated = false; ///< Driver fact: an APU whose device memory is host memory.
         // Compatibility only: these preserve existing API answers and must not
         // select a native kernel, wave geometry or a future matrix implementation.
         ROCmLegacyPrecisionQueries legacy_precision;
@@ -123,6 +126,17 @@ namespace llaminar2
         if (hardware.ordinal < 0 || hardware.wall_clock_rate_khz <= 0)
             throw std::invalid_argument("Incomplete ROCm service wall-clock binding");
         return static_cast<std::uint64_t>(hardware.wall_clock_rate_khz);
+    }
+    /**
+     * @brief Admit a mapped host ready word updated by a system-scope GPU compare/exchange.
+     * @param hardware Original immutable properties of the GPU that will issue the atomic.
+     * @throws std::runtime_error Before capture if the GPU cannot send this PCIe transaction.
+     */
+    inline void requireROCmMappedHostCompareExchange(const ROCmDeviceHardware &hardware)
+    {
+        if (!hardware.host_native_atomics)
+            throw std::runtime_error("ROCm mapped host compare/exchange requires native PCIe atomics at ordinal " +
+                                     std::to_string(hardware.ordinal));
     }
     /** @brief Single publication authority; steady-state readers use one acquire load. */
     class ROCmHardwareAuthority final

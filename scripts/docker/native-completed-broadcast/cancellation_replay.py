@@ -18,9 +18,15 @@ out = root / 'replay'
 main = r'''
 #include <sys/resource.h>
 #include <csignal>
+// __builtin_trap() raises the host ISA's trap: ud2/SIGILL on x86-64, brk/SIGTRAP on AArch64.
+#if defined(__aarch64__)
+constexpr int kNativeTrapSignal=SIGTRAP;
+#else
+constexpr int kNativeTrapSignal=SIGILL;
+#endif
 template<class F> void mustTrap(F action){
  auto pid=fork();assert(pid>=0);if(!pid){action();_exit(0);}
- int status=0;assert(waitpid(pid,&status,0)==pid && WIFSIGNALED(status) && WTERMSIG(status)==SIGILL);
+ int status=0;assert(waitpid(pid,&status,0)==pid && WIFSIGNALED(status) && WTERMSIG(status)==kNativeTrapSignal);
 }
 int main(){
  rlimit noCore{0,0};assert(setrlimit(RLIMIT_CORE,&noCore)==0);

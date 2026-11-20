@@ -26,6 +26,7 @@
 #include <vector>
 
 #include "execution/compute_stages/ComputeStages.h"
+#include "../../../utils/CPURoPETestBinding.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "execution/moe/DeviceMoETransferSlotDirectory.h"
 #include "execution/moe/MoERuntimeTable.h"
@@ -1315,27 +1316,18 @@ TEST_F(ComputeStagesTest, RoPEStage_PreservesNorm)
         .theta_base = 10000.0f};
 
     RoPEStage stage(params);
+    const test::StageWorkspaceTestBinding workspace(stage, seq_len);
 
-    bool success = false;
-    try
-    {
-        success = stage.execute(ctx_.get());
-    }
-    catch (const std::exception &e)
-    {
-        GTEST_SKIP() << "RoPE execution requires device enumeration: " << e.what();
-    }
+    // A CPU context with a bound workspace must execute; any failure is a test failure.
+    ASSERT_TRUE(stage.execute(ctx_.get()));
 
-    if (success)
-    {
-        q_data = Q->data(); // Refresh after execution
-        float norm0_after = computeNorm(&q_data[0], head_dim);
-        float norm1_after = computeNorm(&q_data[head_dim], head_dim);
+    q_data = Q->data(); // Refresh after execution
+    float norm0_after = computeNorm(&q_data[0], head_dim);
+    float norm1_after = computeNorm(&q_data[head_dim], head_dim);
 
-        // Norms should be preserved (rotations don't change magnitude)
-        EXPECT_NEAR(norm0_before, norm0_after, 1e-4f);
-        EXPECT_NEAR(norm1_before, norm1_after, 1e-4f);
-    }
+    // Norms should be preserved (rotations don't change magnitude)
+    EXPECT_NEAR(norm0_before, norm0_after, 1e-4f);
+    EXPECT_NEAR(norm1_before, norm1_after, 1e-4f);
 }
 
 // =============================================================================

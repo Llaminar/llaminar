@@ -124,8 +124,15 @@ namespace llaminar2
         std::span<const Entry> entries() const & noexcept { return entries_; }
         /** @brief Retain the observation before borrowing its stage entries. */
         std::span<const Entry> entries() const && = delete;
-        /** @brief Preserve every stage coordinate when comparing immutable geometry. */
-        bool operator==(const MoEOptimizationStages &) const = default;
+        /** @brief Preserve every stage coordinate when comparing complete snapshots.
+         * @param other Complete ordered passive stage observations.
+         * @return Equality of every entry's identity and value.
+         * @details Keep the body dependent until use: snapshots contain their
+         * own stage set. Eager defaulted comparison checking instantiates Entry
+         * while that enclosing Snapshot is still incomplete on Clang/libc++.
+         */
+        bool operator==(const MoEOptimizationStages &other) const
+        { return entries_ == other.entries_; }
 
     private:
         std::vector<Entry> entries_;

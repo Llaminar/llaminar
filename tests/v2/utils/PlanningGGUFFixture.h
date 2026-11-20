@@ -4,11 +4,13 @@
  *
  * The real parser reads metadata and tensor extents. Payload holes may be used
  * by explicit source-loading tests, never as real-model numerical evidence.
+ * Optional per-role source choices preserve genuine directory encodings.
  * Each fixture owns one unique file,
  * allowing Unit groups to run concurrently without a shared temporary folder.
  */
 #pragma once
 #include "loaders/ModelLoader.h"
+#include <array>
 #include <filesystem>
 #include <fstream>
 #include <optional>
@@ -26,6 +28,12 @@ namespace llaminar2::test
     public:
         /** @brief Directory-only geometry or complete all-attention graph metadata. */
         enum class Geometry { Directory, FullAttentionGraph };
+        /** @brief Explicit original MoE directory dimensions for bounded native component shapes. */
+        struct MoEDimensions {
+            uint32_t hidden_columns; ///< Source row width and model embedding dimension.
+            uint32_t shared_columns; ///< Original shared intermediate source width.
+            uint32_t top_k; ///< Original source metadata's routed selected-slot count.
+        };
         /** @return Exact GGUF encoding for a source tensor; runtime-only formats are rejected. */
         static GGUFTensorType sourceType(TensorType type)
         {
@@ -94,20 +102,38 @@ namespace llaminar2::test
          *        and nonzero recurrent arena metadata, even for all-FA layers.
          * @param main_layers Positive source main-layer count; defaults preserve existing fixtures.
          * @param expert_count Positive original MoE expert population; defaults preserve existing fixtures.
+         * @param shared_type Independent native shared-FFN source format; gates remain FP32.
+         * @param routed_types Optional original gate/up/down source formats, preserving each directory encoding.
+         * @param dimensions Optional genuine MoE source dimensions; no prepared descriptor is relabeled.
+         * @param shared_up_type Optional original shared-up encoding.
+         * @param shared_down_type Optional original shared-down encoding. Omitted roles use shared_type.
          */
         explicit PlanningGGUFFixture(bool moe = false, bool mtp = false,
             GGUFTensorType expert_type = GGUFTensorType::F32, uint32_t expert_width = 256,
             std::optional<GGUFTensorType> gdn_projection = std::nullopt, uint32_t attention_heads = 8,
-            Geometry geometry = Geometry::Directory, uint32_t main_layers = 2,uint32_t expert_count=8)
+            Geometry geometry = Geometry::Directory, uint32_t main_layers = 2,uint32_t expert_count=8,
+            GGUFTensorType shared_type = GGUFTensorType::F32,
+            std::optional<std::array<GGUFTensorType,3>> routed_types = std::nullopt,
+            std::optional<MoEDimensions> dimensions = std::nullopt,
+            std::optional<GGUFTensorType> shared_up_type = std::nullopt,
+            std::optional<GGUFTensorType> shared_down_type = std::nullopt)
         {
-            if (GGUFTensorInfo{.type = expert_type}.getTypeSize() == 0)
+            if (GGUFTensorInfo{.type = expert_type}.getTypeSize() == 0 ||
+                GGUFTensorInfo{.type = shared_type}.getTypeSize() == 0)
                 throw std::invalid_argument("Planning fixture requires a supported GGUF format");
-            char pattern[] = "/tmp/llaminar-planning-XXXXXX.gguf";
-            const int descriptor = ::mkstemps(pattern, 5);
+            for (auto type : {shared_up_type, shared_down_type})
+                if (type && GGUFTensorInfo{.type=*type}.getTypeSize() == 0)
+                    throw std::invalid_argument("Planning fixture requires a valid original shared projection type");
+            if(routed_types)for(const auto type:*routed_types)
+                if(GGUFTensorInfo{.type=type}.getTypeSize()==0)
+                    throw std::invalid_argument("Planning fixture requires supported original routed formats");
+            // The fixture owner chooses temporary storage through the standard
+            // environment. Large generated expert weights can use a bounded tmpfs.
+            path_ = (std::filesystem::temp_directory_path() / "llaminar-planning-XXXXXX.gguf").string();
+            const int descriptor = ::mkstemps(path_.data(), 5);
             if (descriptor < 0) throw std::runtime_error("Cannot create planning GGUF fixture");
             ::close(descriptor);
-            path_ = pattern;
-            try { write(moe, mtp, expert_type, expert_width, gdn_projection, attention_heads, geometry, main_layers,expert_count); }
+            try { write(moe, mtp, expert_type, expert_width, gdn_projection, attention_heads, geometry, main_layers,expert_count,shared_type,routed_types,dimensions,shared_up_type,shared_down_type); }
             catch (...) { remove(); throw; }
         }
         /** @brief Remove only this fixture's file, including during exception unwinding. */
@@ -139,67 +165,77 @@ namespace llaminar2::test
         }
         /** @brief Publish the directory followed by sparse, unread payload extents. */
         void write(bool moe, bool mtp, GGUFTensorType expert_type, uint32_t expert_width,
-            std::optional<GGUFTensorType> gdn_projection, uint32_t attention_heads, Geometry geometry, uint32_t main_layers,uint32_t expert_count)
+            std::optional<GGUFTensorType> gdn_projection, uint32_t attention_heads, Geometry geometry, uint32_t main_layers,uint32_t expert_count,
+            GGUFTensorType shared_type, std::optional<std::array<GGUFTensorType,3>> routed_types,
+            std::optional<MoEDimensions> dimensions,std::optional<GGUFTensorType> shared_up_type,
+            std::optional<GGUFTensorType> shared_down_type)
         {
             if(expert_count==0)throw std::invalid_argument("Planning fixture requires positive original expert count");
-            if (attention_heads < 2 || 256 % attention_heads != 0)
+            const uint32_t hidden_columns=dimensions?dimensions->hidden_columns:256;
+            if(dimensions&&(!moe||!dimensions->hidden_columns||dimensions->hidden_columns%32||
+                !dimensions->shared_columns||dimensions->shared_columns%32||!dimensions->top_k||dimensions->top_k>expert_count))
+                throw std::invalid_argument("Planning fixture needs positive aligned original MoE dimensions and a valid selected-slot count");
+            if (attention_heads < 2 || hidden_columns % attention_heads != 0)
                 throw std::invalid_argument("Planning fixture needs integral attention heads and two KV heads");
-            const uint64_t head_columns = 256 / attention_heads;
+            const uint64_t head_columns = hidden_columns / attention_heads;
             const std::string arch = moe ? "qwen35moe" : "qwen35";
             if (main_layers == 0 || main_layers > 48)
                 throw std::invalid_argument("Planning fixture requires a bounded positive main-layer count");
             const int layers = static_cast<int>(main_layers) + (mtp ? 1 : 0);
             std::vector<Tensor> tensors{
-                {"token_embd.weight", {256, 320}}, {"output.weight", {256, 320}},
-                {"output_norm.weight", {256}}};
+                {"token_embd.weight", {hidden_columns, 320}}, {"output.weight", {hidden_columns, 320}},
+                {"output_norm.weight", {hidden_columns}}};
             for (int layer = 0; layer < layers; ++layer)
             {
                 const auto prefix = "blk." + std::to_string(layer) + ".";
                 for (const auto name : {"attn_norm.weight", "post_attention_norm.weight"})
-                    tensors.push_back({prefix + name, {256}});
+                    tensors.push_back({prefix + name, {hidden_columns}});
                 for (const auto name : {"attn_q_norm.weight", "attn_k_norm.weight"})
                     tensors.push_back({prefix + name, {head_columns}});
-                tensors.push_back({prefix + "attn_q.weight", {256,
-                    geometry == Geometry::FullAttentionGraph ? 512u : 256u}});
-                tensors.push_back({prefix + "attn_output.weight", {256, 256}});
+                tensors.push_back({prefix + "attn_q.weight", {hidden_columns,
+                    geometry == Geometry::FullAttentionGraph ? 2u*hidden_columns : hidden_columns}});
+                tensors.push_back({prefix + "attn_output.weight", {hidden_columns, hidden_columns}});
                 for (const auto name : {"attn_k.weight", "attn_v.weight"})
-                    tensors.push_back({prefix + name, {256, 2 * head_columns}});
+                    tensors.push_back({prefix + name, {hidden_columns, 2 * head_columns}});
                 if (gdn_projection)
                     for (const auto name : {"ssm_alpha.weight", "ssm_beta.weight"})
-                        tensors.push_back({prefix + name, {256, 256}, *gdn_projection});
+                        tensors.push_back({prefix + name, {hidden_columns, hidden_columns}, *gdn_projection});
                 if (moe)
                 {
-                    for (const auto name : {"ffn_gate_exps.weight", "ffn_up_exps.weight"})
-                        tensors.push_back({prefix + name, {256, expert_width, expert_count}, expert_type});
-                    tensors.push_back({prefix + "ffn_down_exps.weight", {expert_width, 256, expert_count}, expert_type});
-                    tensors.push_back({prefix + "ffn_gate_inp.weight", {256, expert_count}});
-                    const uint64_t shared_width = geometry == Geometry::FullAttentionGraph ? expert_width : 256;
-                    for (const auto name : {"ffn_gate_shexp.weight", "ffn_up_shexp.weight"})
-                        tensors.push_back({prefix + name, {256, shared_width}});
-                    tensors.push_back({prefix + "ffn_down_shexp.weight", {shared_width, 256}});
-                    tensors.push_back({prefix + "ffn_gate_inp_shexp.weight", {256}});
+                    const auto roles=routed_types.value_or(std::array{expert_type,expert_type,expert_type});
+                    tensors.push_back({prefix + "ffn_gate_exps.weight", {hidden_columns, expert_width, expert_count}, roles[0]});
+                    tensors.push_back({prefix + "ffn_up_exps.weight", {hidden_columns, expert_width, expert_count}, roles[1]});
+                    tensors.push_back({prefix + "ffn_down_exps.weight", {expert_width, hidden_columns, expert_count}, roles[2]});
+                    tensors.push_back({prefix + "ffn_gate_inp.weight", {hidden_columns, expert_count}});
+                    const uint64_t shared_width = dimensions?dimensions->shared_columns:
+                        geometry == Geometry::FullAttentionGraph ? expert_width : hidden_columns;
+                    tensors.push_back({prefix + "ffn_gate_shexp.weight", {hidden_columns, shared_width}, shared_type});
+                    tensors.push_back({prefix + "ffn_up_shexp.weight", {hidden_columns, shared_width},
+                        shared_up_type.value_or(shared_type)});
+                    tensors.push_back({prefix + "ffn_down_shexp.weight", {shared_width, hidden_columns}, shared_down_type.value_or(shared_type)});
+                    tensors.push_back({prefix + "ffn_gate_inp_shexp.weight", {hidden_columns}});
                 }
                 else
                 {
                     for (const auto name : {"ffn_gate.weight", "ffn_up.weight"})
-                        tensors.push_back({prefix + name, {256, 512}, expert_type});
-                    tensors.push_back({prefix + "ffn_down.weight", {512, 256}, expert_type});
+                        tensors.push_back({prefix + name, {hidden_columns, 2u*hidden_columns}, expert_type});
+                    tensors.push_back({prefix + "ffn_down.weight", {2u*hidden_columns, hidden_columns}, expert_type});
                 }
                 if (mtp && layer == static_cast<int>(main_layers))
                 {
-                    tensors.push_back({prefix + "nextn.eh_proj.weight", {512, 256}});
+                    tensors.push_back({prefix + "nextn.eh_proj.weight", {2u*hidden_columns, hidden_columns}});
                     for (const auto name : {"nextn.hnorm.weight", "nextn.enorm.weight", "nextn.shared_head_norm.weight"})
-                        tensors.push_back({prefix + name, {256}});
+                        tensors.push_back({prefix + name, {hidden_columns}});
                 }
             }
             std::vector<std::pair<std::string, uint32_t>> metadata{
                 {arch + ".block_count", static_cast<uint32_t>(layers)},
-                {arch + ".embedding_length", 256},
-                {arch + ".feed_forward_length", moe && geometry == Geometry::FullAttentionGraph ? expert_width : 512},
+                {arch + ".embedding_length", hidden_columns},
+                {arch + ".feed_forward_length", moe && geometry == Geometry::FullAttentionGraph ? expert_width : 2u*hidden_columns},
                 {arch + ".attention.head_count", attention_heads}, {arch + ".attention.head_count_kv", 2},
                 {arch + ".context_length", 1024}, {"tokenizer.ggml.token_count", 320},
                 {arch + ".expert_count", moe ? expert_count : 0u},
-                {arch + ".expert_used_count", moe ? std::min(2u,expert_count) : 0u},
+                {arch + ".expert_used_count", moe ? (dimensions?dimensions->top_k:std::min(2u,expert_count)) : 0u},
                 {arch + ".expert_feed_forward_length", moe ? expert_width : 0u},
                 {arch + ".nextn_predict_layers", mtp ? 1u : 0u}};
             if (geometry == Geometry::FullAttentionGraph)
@@ -208,7 +244,7 @@ namespace llaminar2::test
                     {arch + ".full_attention_interval", 1},
                     {arch + ".ssm.conv_kernel", 4},
                     {arch + ".ssm.state_size", static_cast<uint32_t>(head_columns)},
-                    {arch + ".ssm.inner_size", 256},
+                    {arch + ".ssm.inner_size", hidden_columns},
                     {arch + ".ssm.group_count", attention_heads},
                     {arch + ".ssm.time_step_rank", attention_heads}});
             std::ofstream stream(path_, std::ios::binary | std::ios::trunc);

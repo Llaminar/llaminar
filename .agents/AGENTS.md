@@ -345,13 +345,26 @@ branch's workflow files do not define the current release policy.
 Push the feature branch and open a PR into `develop`. Draft PRs skip PR jobs;
 marking a PR ready for review starts its required checks. Same-repository,
 non-draft feature PRs enable native squash auto-merge, which must wait for every
-required gate, owner approval and an up-to-date merge candidate. The canonical
+required gate and an up-to-date merge candidate. Only PRs authored by
+`dbsanfte` into `develop` may auto-merge without an owner review. The canonical
 PR workflow builds AVX2 and AVX512 full-backend model-free test images in
 parallel on separate self-hosted runners. Each runs complete device-free `Unit`
-plus the canonical preflight `host` lane, and both checks must pass. CUDA, ROCm and
-exclusive preflight lanes remain production gates. A successful develop merge
-builds and publishes both AVX512 and AVX2 runtime images on the AVX2 development host,
-without compiling or running test images.
+plus the canonical preflight `host` lane. AVX2 additionally requires the
+complete hardware-qualified `ProductionTestPreflight` inventory in a separate
+GPU container, including CUDA, ROCm, mixed-backend and exclusive work. Native
+hardware observation and explicit CMake requirements own eligibility; absent
+geometries remain unqualified in the receipt. Both GPUs are required, and
+failures or skips in selected tests block the gate. The AVX2, AVX512 and
+ARM64 checks are required. The native GitHub ARM64 PR check builds the same
+`test-runner` and `runtime` targets with NEON and CUDA for GB10. It verifies
+the sealed `ARM64PR` Unit
+and host preflight results and checks Release startup.
+Production certification still requires its own complete hardware qualification.
+A successful develop merge builds the AVX512 and AVX2 runtime images in
+parallel on standard GitHub-hosted Ubuntu 24.04 runners. Each ISA prepares its
+cached toolchain and compiles the Release runtime in separate jobs. A final
+job publishes the verified pair. The native ARM64 job builds and smoke-tests the
+CUDA+CPU runtime before publishing its ARM64 tags.
 These images are development artifacts; this gate does not certify a release.
 
 Only upon explicit user direction, cut a release candidate branch named
@@ -382,8 +395,8 @@ OpenCode proof and benchmark evidence, bound to the same source and images.
 A certified RC squash merge into master tags a dated GitHub release, promotes
 the exact tested image digests and attaches the test-run identity, numerical
 accuracy CSVs and complete benchmark/stress evidence. No image is rebuilt on
-master. Owner approval covers `develop`, `rc/*` and `master`; passing checks
-alone does not authorize a merge. Post-release high-water publication preserves
+master. Owner approval covers `rc/*`, `master` and other contributors’
+PRs to `develop`. Post-release high-water publication preserves
 concurrent develop work and joins the certified master commit as its second
 parent. Never open or merge a master release merely because feature checks or develop image builds passed.
 
@@ -528,6 +541,15 @@ the canonical image build, not only the locally installed GPU's target. Record
 the target set with the validation evidence. Passing native-device runtime
 tests does not prove register allocation on the other shipped targets.
 
+Spill evidence must also be reproducible. nvcc `--split-compile` partitions a
+module nondeterministically, so identical compiles can allocate registers
+differently and flip the spill verdict. It is forbidden on every project
+target. Large kernel families get compile throughput from persistent
+translation-unit shards instead, as CUDA NativeQuantised decode/prefill and
+flash attention do. `V2_Integration_DeterministicGPUCompilation` in
+`ProductionTestPreflight` checks every CMake declaration and the build's
+actual device compile commands.
+
 Parallel full-LTO RCCL builds use the builder-owned fixed linker installed by
 `scripts/docker/install-rocm-lto-linker.sh`. Its source/patch pins belong to
 `scripts/docker/rocm-release.env`; it recompiles one LLVM backend translation
@@ -609,12 +631,17 @@ production preflight: the dependency builder replays the actual selector and
 the original failing code, while installed runners authenticate the resulting
 source/DSO-bound proof without an SDK or accelerator.
 
-RCCL runtime loading uses the exact `RCCL_LIBRARY` selected by CMake, without a
-second runtime search. Select the compatible library explicitly when configuring
-a local build. Container builders and Release images install the same source-
-built RCCL at the same stable path; moving a checkout must not change the DSO.
-Its project-patched source/ABI pin is separate from the SDK release pin; compile
-it against the selected SDK and prove its native capture/storage contracts.
+The server, OpenCode, numerical tests and benchmarks use the same canonical
+RCCL and NCCL dependencies. Build RCCL with the pinned upstream commit,
+patches, function set and MSCCL setting used by the shipping image. Use
+`LLAMINAR_BUILD_RCCL_FROM_SOURCE=ON` to build it locally. CMake verifies the
+producing installation's evidence before binding either library by absolute
+path. To use extracted shipping libraries in a local checkout, provide
+`LLAMINAR_PUBLISHED_COLLECTIVE_IMAGE` with the immutable GHCR manifest
+reference. Configuration compares each selected ELF with its image and checks
+the upstream pin and patch inputs. OpenCode records the mapped libraries on
+the ranks that performed native collectives. Keep the driver and SDK versions
+independent of this dependency selection.
 Both loaders retain their exact selection until unload and withdraw resolved
 callbacks before closing a partially admitted library.
 `V2_Integration_NCCLPartialAdmission` and
@@ -694,8 +721,8 @@ container-scoped retirement even when a shared PID namespace exposes other jobs.
 Same-process SHM connections use native mapped pinned backing; cross-process
 connections retain real IPC, never an exported raw process pointer. The required
 passive storage ABI observes endpoint mappings, not unique physical bytes, and
-must never become a second admission ledger. `V2_Integration_RCCLHostTransportStorage`
-proves captured replay and both endpoint retirement orders; dependency admission
+must never become a second admission ledger. `V2_Integration_RCCLHostTransportStorage_Clique2`
+and `V2_Integration_RCCLHostTransportStorage_Clique4` each prove captured replay and both endpoint retirement orders; dependency admission
 and source-bound packaging regressions also belong to `ProductionTestPreflight`.
 
 ROCm graph execution also requires the canonical HIP runtime built by
@@ -740,7 +767,9 @@ segment still publishes a requested native completion signal, including child
 graphs and cross-stream consumers. A reserved signal without a producer is a
 fatal native lifecycle defect, not permission to add a host synchronization.
 `V2_Integration_HIPHostThreadStack` proves retained diagnostic/timeline graphs
-admit a client with large initial ELF TLS. Native pthread stack admission owns
+admit a client with large initial ELF TLS on a link with native host atomics.
+Production MoE kernels publish epoch failure status and trap on fatal routing
+contracts without requiring a hostcall listener. Native pthread stack admission owns
 that layout; never cap worker stacks below valid client TLS or add retries and
 environment overrides to hide a rejected thread. The installer backports the
 upstream stack repair when absent from its pinned release.
@@ -813,6 +842,14 @@ cmake -B build_v2_integration -S src/v2 -G Ninja \
   -DCMAKE_MAKE_PROGRAM:FILEPATH="${LLAMINAR_NINJA_BIN}"
 cmake --build build_v2_integration --parallel
 ```
+
+For ARM port work, `cmake/CPUInstructionSet.cmake` owns the architecture/ISA
+compiler envelope; `src/v2/utils/ARMCPUFeatures.h` owns native optional-instruction
+observations. The core-free `tests/v2/portability` project uses the normal CPU
+architecture regression registrations; see the README's AArch64 checks.
+The native Linux ARM64 PR gate also exercises the production CPU paths and
+checks startup of the CUDA+CPU release image. Real-checkpoint inference and
+GPU execution require their own qualifications.
 
 The supported build types are `Debug`, `Release`, and `Integration`. CUDA and
 ROCm are both enabled by default. Disable an unavailable toolchain explicitly,
@@ -1211,7 +1248,8 @@ The registered pre-commit hook builds only `v2_unit_gate` and
 E2E, broader integration selections, or benchmarks. Register the tracked hooks
 with `git config --local core.hooksPath .githooks`; see `.githooks/README.md`.
 The [branch and release workflow](#branch-and-release-workflow) owns the CI
-sequence: Unit/host checks on feature PRs, build-only develop publication, then
+sequence: Unit/host checks plus AVX2 hardware-qualified production preflight on feature PRs,
+build-only develop publication, then
 the RC gate on the Xeon runner. `.github/workflows/master-pr-certification.yml`
 uses `run_published_image_suite.py` for complete preflight, numerical panels,
 OpenCode and benchmarks. `certify_release_candidate.py` joins their evidence;

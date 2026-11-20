@@ -241,7 +241,7 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/local_execution/device/DeviceContext.cpp", "ROCmDeviceContext::copyToDevice", "backend_sync_copy", 1),
         ("src/v2/execution/local_execution/device/DeviceContext.cpp", "ROCmDeviceContext::copyToHost", "backend_sync_copy", 1),
         ("src/v2/execution/local_execution/device/DeviceContext.cpp", "ROCmDeviceContext::synchronize", "backend_device", 1),
-        ("src/v2/kernels/cuda/attention/CUDAFlashAttentionKernels.cu", "cudaFlashAttn_synchronize", "raw_device", 1),
+        ("src/v2/kernels/cuda/attention/CUDAFlashAttentionShardImpl.cu.inc", "cudaFlashAttn_synchronize", "raw_device", 1),
         ("src/v2/kernels/cuda/gdn/CUDAGatedDeltaNetKernels.cu", "cudaGDN_stream_synchronize", "raw_stream", 1),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu", "cudaQuantGemm_streamSync", "raw_device", 1),
         ("src/v2/kernels/cuda/gemm/CUDAQuantisedGemmKernel_CUTLASS.cu", "cudaQuantGemm_streamSync", "raw_stream", 1),
@@ -433,7 +433,16 @@ ALLOWANCES: tuple[Allowance, ...] = (
         ("src/v2/execution/moe/DeviceMoETransferSlotDirectory.cpp", "DeviceMoETransferSlotDirectory::createImpl", "worker_stream", 1),
         ("src/v2/execution/moe/MoEExpertWeightService.cpp", "finish", "worker_stream", 1),
         ("src/v2/execution/moe/MoEExpertWeightService.cpp", "~ScopedGpuDirectTransferStream", "worker_stream", 2),
-        ("src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp", "MoEOverlayDeviceControllerGraphService::releaseEndpoint", "worker_event", 1),
+        # Cold peer-directory publication owns host inputs until the exact
+        # stream finishes. Failed publication drains its pending cold writes
+        # before freeing PMA allocations. Ready per-token execution never waits.
+        ("src/v2/collective/backends/ROCmPeerPushResources.cpp", "ROCmPeerPushResources::publish", "raw_stream", 1),
+        ("src/v2/collective/backends/ROCmPeerPushResources.cpp", "ROCmPeerPushResources::~ROCmPeerPushResources", "raw_stream", 1),
+        # Untimed planning observations retain their terminal host destinations,
+        # including on failure from any one of the evidence plane copies.
+        ("src/v2/planning/PlanningGPUCohortServiceMeasurement.cpp", "PlanningGPUExpertMeasurement::measurePreparedCohort", "backend_sync_copy", 1),
+        # Separate teardown edges for a submitted graph and a setup-only upload.
+        ("src/v2/execution/moe/MoEOverlayDeviceControllerGraphService.cpp", "MoEOverlayDeviceControllerGraphService::releaseEndpoint", "worker_event", 2),
         ("src/v2/execution/moe/MoEOverlayDeviceServiceTelemetryPublisher.cpp", "MoEOverlayDeviceServiceTelemetryPublisher::releaseEndpoint", "worker_event", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "retireRuntimeHistogramProducerStreamsLocked", "worker_stream", 1),
         ("src/v2/execution/moe/MoERuntimeTable.cpp", "synchronizeMirror", "worker_stream", 1),

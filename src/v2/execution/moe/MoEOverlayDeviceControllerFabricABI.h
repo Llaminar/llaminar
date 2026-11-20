@@ -20,13 +20,27 @@
 
 namespace llaminar2
 {
+    /** Device transport used to mirror one leader decision inside a group. */
+    enum class MoEOverlayDeviceControllerIntraGroupTransport : std::uint8_t
+    {
+        SingleParticipant = 0, ///< The group root is its only participant.
+        NativeCollective,      ///< One homogeneous rank-local NCCL/RCCL group.
+    };
+
+    /** Device transport joining one follower-group root to the sole leader. */
+    enum class MoEOverlayDeviceControllerInterGroupTransport : std::uint8_t
+    {
+        LeaderLocal = 0, ///< This is the group containing the authority leader.
+        NodeLocalMapped, ///< Fixed device-owned records in mapped shared pages.
+    };
+
     /** Binary identity of the node-local controller fabric (`MOCF`). */
     inline constexpr std::uint32_t kMoEOverlayDeviceControllerFabricMagic =
         0x46434f4du;
 
     /** Version of every fixed-width fabric record in this header. */
     inline constexpr std::uint32_t kMoEOverlayDeviceControllerFabricVersion =
-        20u;
+        22u;
 
     /** Snapshot and durable history planes: decode, prefill, grouped verifier. */
     inline constexpr std::uint32_t
@@ -54,10 +68,10 @@ namespace llaminar2
         kMoEOverlayDeviceControllerNeverMovedGeneration =
             UINT64_MAX;
 
-    /** Current runtime ABI limit shared by CUDA and ROCm MoE descriptors. */
+    /** Legacy scalar Dynamic policy scratch extent; never a fabric storage bound. */
     inline constexpr std::uint32_t
-        kMoEOverlayDeviceControllerFabricMaxParticipants =
-            kMoEOverlayDeviceControllerInferenceEpochMaxParticipants;
+        kMoEOverlayWholeExpertPolicyMaxParticipants =
+            8u;
 
     /** Maximum routed layers addressable by fixed-width controller commands. */
     inline constexpr std::uint32_t
@@ -119,7 +133,7 @@ namespace llaminar2
         std::uint32_t state = static_cast<std::uint32_t>(
             MoEOverlayDeviceControllerEconomyState::Empty);
         std::uint32_t tier_count = 0u;
-        std::uint32_t participant_count = 0u;
+        std::uint32_t logical_target_count = 0u;
         std::uint32_t layer_count = 0u;
         std::uint32_t service_phase_count =
             kMoEOverlayDeviceControllerEconomyServicePhaseCount;
@@ -175,22 +189,14 @@ namespace llaminar2
         std::uint32_t command_capacity = 0u;
         std::uint32_t participating_rank_count = 0u;
         std::int32_t leader_world_rank = -1;
-        std::int32_t participating_world_ranks
-            [kMoEOverlayDeviceControllerFabricMaxParticipants] = {};
-        std::uint64_t first_touch_ready
-            [kMoEOverlayDeviceControllerFabricMaxParticipants] = {};
-        std::uint64_t registration_ready
-            [kMoEOverlayDeviceControllerFabricMaxParticipants] = {};
-        /**
-         * Per-rank proof that calibration-era routing demand was discarded.
-         *
-         * A rank release-publishes this lane only after every process-local
-         * participant has completed the retained histogram-rebase graph at an
-         * exact inference boundary. Dynamic placement remains closed until all
-         * participating ranks are acquire-visible here.
-         */
-        std::uint64_t demand_histogram_rebase_ready
-            [kMoEOverlayDeviceControllerFabricMaxParticipants] = {};
+        /** Root-relative immutable rank roster and exact publication lane offsets. */
+        std::uint64_t participating_world_ranks_offset = 0u;
+        std::uint64_t first_touch_ready_offset = 0u;
+        std::uint64_t registration_ready_offset = 0u;
+        /** Per-rank proof that calibration demand was discarded before Dynamic admission. */
+        std::uint64_t demand_histogram_rebase_ready_offset = 0u;
+        /** Setup region extent; leader-owned pages start after this complete region. */
+        std::uint64_t storage_bytes = 0u;
         /** Global origin authenticated before another rank joins these pages. */
         std::int32_t first_model_layer = 0;
         std::uint32_t reserved0 = 0u;
@@ -221,21 +227,23 @@ namespace llaminar2
         std::uint64_t controller_header_offset = 0u;
         /** Dedicated cache lines for symmetric continuation epoch admission. */
         std::uint64_t inference_epoch_record_offset = 0u;
+        /** Complete record and member/arrival tail, admitted before graph capture. */
+        std::uint64_t inference_epoch_storage_bytes = 0u;
         std::uint64_t command_header_offset = 0u;
         std::uint64_t command_entries_offset = 0u;
         /** Immutable exact bytes in one complete packed expert, per layer. */
         std::uint64_t payload_bytes_per_layer_offset = 0u;
-        /** Immutable loader-prepared `[layer][expert]` owner participant ids. */
-        std::uint64_t initial_owner_participants_offset = 0u;
-        /** Exact number of 32-bit words in the initial owner table. */
-        std::uint64_t initial_owner_participants_words = 0u;
+        /** Immutable loader-prepared `[layer][expert]` original typed targets. */
+        std::uint64_t initial_route_targets_offset = 0u;
+        /** Exact number of typed four-byte tags in the initial target table. */
+        std::uint64_t initial_route_targets_words = 0u;
         /** Leader-owned `[phase][layer][expert]` accumulated routed demand. */
         std::uint64_t demand_history_offset = 0u;
         /** Exact number of 64-bit words in @ref demand_history_offset. */
         std::uint64_t demand_history_words = 0u;
         /** Host-measured, device-consumed immutable economy header. */
         std::uint64_t economy_header_offset = 0u;
-        /** `[tier][layer][phase]` service nanoseconds per activation. */
+        /** `[logical target][layer][phase]` existing scalar service price. */
         std::uint64_t economy_service_cost_offset = 0u;
         std::uint64_t economy_service_cost_words = 0u;
         /** `[source][destination][layer]` directed movement prices. */
@@ -262,8 +270,42 @@ namespace llaminar2
         std::uint32_t routed_experts_per_token = 0u;
         /** Model-global identity of compact controller row zero. */
         std::int32_t first_model_layer = 0;
+        /** Exact policy vertex count; cohort members are not separate vertices. */
+        std::uint32_t logical_target_count = 0u;
+        /** Original continuation-root publisher of global selected-route demand. */
+        std::uint32_t demand_publisher_participant_id = 0u;
+        /** Original group containing that publisher; no root/member renumbering. */
+        std::uint32_t demand_publisher_group_id = 0u;
+        std::uint32_t reserved_target0 = 0u;
+        /** Immutable original-target records, each reusing its group's member roster. */
+        std::uint64_t logical_target_metadata_offset = 0u;
         std::uint64_t reserved[1] = {};
     };
+
+    /**
+     * @brief One logical policy vertex over an immutable original member extent.
+     * Whole vertices name their original participant; a cohort names its one
+     * typed tier tag and every member of its original native group. Roster
+     * positions are private algorithm indices, never participant identities.
+     */
+    struct alignas(8) MoEOverlayDeviceControllerLogicalTargetMetadata
+    {
+        MoEOverlayRouteTarget target;
+        std::uint32_t group_id = 0u;
+        std::int32_t tier_index = -1;
+        std::int32_t tier_priority = 0;
+        std::uint32_t first_group_member = 0u;
+        std::uint32_t member_count = 0u;
+        std::uint64_t reserved = 0u;
+        /** @param other Immutable original roster row. @return Exact target, member extent and policy identity. */
+        constexpr bool operator==(const MoEOverlayDeviceControllerLogicalTargetMetadata &other) const noexcept
+        {
+            return target.word() == other.target.word() && group_id == other.group_id &&
+                tier_index == other.tier_index && tier_priority == other.tier_priority &&
+                first_group_member == other.first_group_member && member_count == other.member_count && reserved == other.reserved;
+        }
+    };
+    static_assert(sizeof(MoEOverlayDeviceControllerLogicalTargetMetadata) == 32u);
 
     /** Immutable topology/policy metadata for one dense participant id. */
     struct alignas(64) MoEOverlayDeviceControllerParticipantMetadata
@@ -386,9 +428,11 @@ namespace llaminar2
     /**
      * @brief Immutable page range and membership of one controller group.
      *
-     * Collected state is member-major, then layer-major, then expert-major.
-     * Every word uses `moe_rebalance_policy::packCollectedState`, preserving
-     * histogram, physical residency, and transfer-slot occupancy in one epoch.
+     * Collected state is member-major. Each member publishes one live
+     * residency plane; only the original demand publisher appends the two
+     * remaining selected-route phase planes. Central member extent helpers own
+     * this compact layout. Words use `moe_rebalance_policy::packCollectedState`
+     * for selected demand, physical residency and durable authority flags.
      */
     struct alignas(64) MoEOverlayDeviceControllerFabricGroupLayout
     {
@@ -400,8 +444,8 @@ namespace llaminar2
         std::int32_t tier_priority = 0;
         std::uint32_t intra_group_transport = 0u;
         std::uint32_t inter_group_transport = 0u;
-        std::uint32_t participant_ids
-            [kMoEOverlayDeviceControllerFabricMaxParticipants] = {};
+        /** Mapping-relative immutable member roster; count is participant_count. */
+        std::uint64_t participant_ids_offset = 0u;
         std::uint64_t participant_records_offset = 0u;
         std::uint64_t participant_record_count = 0u;
         std::uint64_t group_record_offset = 0u;
@@ -417,7 +461,92 @@ namespace llaminar2
         std::uint64_t service_telemetry_bytes = 0u;
         std::uint64_t owned_page_begin = 0u;
         std::uint64_t owned_page_end = 0u;
+        /** Complete original cohort over participant_ids, absent for whole owners. */
+        MoEOverlayRouteTarget cohort_target;
+        std::uint32_t reserved0 = 0u;
+        std::uint64_t reserved[7] = {};
     };
+
+#if defined(__CUDACC__) || defined(__HIPCC__)
+#define LLAMINAR_MOE_FABRIC_EXTENT_HD __host__ __device__
+#else
+#define LLAMINAR_MOE_FABRIC_EXTENT_HD
+#endif
+    /**
+     * @brief Resolve the exact immutable group roster from the admitted mapping.
+     * @param base Exact host/device mapping alias. @param bytes Admitted mapping bytes.
+     * @param group Immutable group extent. @return Null for malformed/out-of-range storage.
+     */
+    LLAMINAR_MOE_FABRIC_EXTENT_HD inline const std::uint32_t *moeOverlayGroupMemberIds(
+        const void *base, std::uint64_t bytes,
+        const MoEOverlayDeviceControllerFabricGroupLayout &group) noexcept
+    {
+        return group.participant_count ? moeOverlayExtentArray<std::uint32_t>(
+            base, bytes, group.participant_ids_offset, group.participant_count) : nullptr;
+    }
+    /**
+     * @brief Resolve original membership without interpreting a model-domain coordinate as a group index.
+     * @param ids Same admitted original group roster. @param count Its exact live extent.
+     * @param participant Canonical global participant identity. @param index Receives its group-local position.
+     * @return True only for exactly one matching member; no domain coordinate is changed.
+     */
+    LLAMINAR_MOE_FABRIC_EXTENT_HD inline bool moeOverlayFindOriginalGroupMember(
+        const std::uint32_t *ids, std::uint32_t count, std::uint32_t participant,
+        std::uint32_t &index) noexcept
+    {
+        if (!ids || !count) return false;
+        bool found = false;
+        for (std::uint32_t member = 0u; member < count; ++member)
+            if (ids[member] == participant)
+            {
+                if (found) return false;
+                found = true;
+                index = member;
+            }
+        return found;
+    }
+
+    /**
+     * @brief Count only live member snapshot words.
+     * @param layers Original compact layer extent. @param experts Original expert extent.
+     * @param participant Original global member. @param publisher Original global demand producer.
+     * @return Residency/authority plane, plus two phase planes only on the producer.
+     */
+    LLAMINAR_MOE_FABRIC_EXTENT_HD constexpr std::uint64_t moeOverlaySnapshotMemberWords(
+        std::uint32_t layers, std::uint32_t experts, std::uint32_t participant,
+        std::uint32_t publisher) noexcept
+    {
+        return std::uint64_t(layers) * experts *
+            (participant == publisher ? kMoEOverlayDeviceControllerDemandPhaseCount : 1u);
+    }
+
+    /**
+     * @brief Resolve one original member's live snapshot offset in its existing group.
+     * @param layout Immutable admitted geometry. @param group Original group extent.
+     * @param ids Same group's original immutable roster. @param member Original roster index.
+     * @param offset Receives the exact word offset, never a capacity-derived stride.
+     * @return False for foreign members or a layout inconsistent with the live word count.
+     */
+    LLAMINAR_MOE_FABRIC_EXTENT_HD inline bool moeOverlaySnapshotMemberOffset(
+        const MoEOverlayDeviceControllerFabricLayoutHeader &layout,
+        const MoEOverlayDeviceControllerFabricGroupLayout &group,
+        const std::uint32_t *ids, std::uint32_t member, std::uint64_t &offset) noexcept
+    {
+        if (!ids || member >= group.participant_count || !layout.num_layers || !layout.num_experts)
+            return false;
+        std::uint64_t cursor = 0u;
+        for (std::uint32_t index = 0u; index < group.participant_count; ++index)
+        {
+            if (ids[index] >= layout.participant_count) return false;
+            if (index == member) offset = cursor;
+            const auto words = moeOverlaySnapshotMemberWords(layout.num_layers, layout.num_experts,
+                ids[index], layout.demand_publisher_participant_id);
+            if (cursor > UINT64_MAX - words) return false;
+            cursor += words;
+        }
+        return cursor == group.collected_state_words;
+    }
+#undef LLAMINAR_MOE_FABRIC_EXTENT_HD
 
     static_assert(std::is_trivially_copyable_v<
                   MoEOverlayDeviceControllerFabricSetupHeader>);

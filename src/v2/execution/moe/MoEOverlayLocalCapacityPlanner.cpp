@@ -21,8 +21,11 @@
  * execution, activation transport and model-context reuse are not impersonated.
  */
 #include "planning/PlanningMemoryQuoteReuse.h"
+#include "planning/WorkspaceMemoryEstimator.h"
+#include "planning/CollectiveMemoryEstimator.h"
 #include "execution/local_execution/graph/PreparedFollowerCaptureTerminals.h"
 
+#include "planning/PlanningObservedResource.h"
 #include "MoEOverlayLocalCapacityPlanner.h"
 #include "execution/moe/MoEOverlayNodeLocalRouteExchange.h"
 #include "MoEOverlayActivationBatchResources.h"
@@ -45,6 +48,7 @@
 #include "collective/NativeCPUCollectiveProgram.h"
 #include "collective/backends/ShmemSpinBackend.h"
 #include "MoEExpertOwnerMap.h"
+#include "MoEOverlayDeviceControllerTopology.h"
 
 #include "planning/ActivationBufferSizing.h"
 #include "planning/CapturedGraphMemoryEstimator.h"
@@ -693,6 +697,13 @@ namespace llaminar2
                     ? debugEnv().gemm.qfn_gdn_qkv_activation
                     : QuantizedActivationOperandPrecision::SingleQ8;
                 config.device_total_bytes = total_bytes;
+                {
+                    const auto observed = withObservedBacking(
+                        {.world_rank = rank_plan.rank, .device = device, .total_bytes = total_bytes,
+                         .admission_available_bytes = available_bytes}, inventory);
+                    config.device_memory_backing = observed.backing;
+                    config.device_pool_available_bytes = observed.pool_available_bytes;
+                }
                 config.device_free_bytes = usableMemory(
                     available_bytes, device, input);
                 if (device.is_gpu())
@@ -918,6 +929,8 @@ namespace llaminar2
                         if (domain.name == overlay_plan.continuation_domain)
                         {
                             config.routed_compute_policy = domain.routed_compute_policy;
+                            config.local_gpu_expert_kernel_policy = overlay_plan.local_gpu_expert_kernel_policy;
+                            config.gpu_expert_intermediate_tiling = overlay_plan.gpu_expert_intermediate_tiling;
                             if (domain.routed_compute_policy == RoutedExpertComputePolicy::GateUpOwnedDownColumns)
                             {
                                 if (domain.scope != ExecutionDomainScope::RANK_LOCAL || domain.owner_rank != inventory.rank)
@@ -1153,12 +1166,12 @@ namespace llaminar2
             // quota resolver. Native birth must never spend a post-quota slack estimate.
             for(auto& config:configs){
                 config.native_context_preparation=rank_plan.runtime.native_context_preparation;
+                config.rank_ordered_resources=rankOrderedResourcesForDevice(rank_plan.runtime.rank_ordered_resources,config.device);
                 if(!config.native_context_preparation)continue;
                 const auto& source=config.native_context_preparation;
                 if(source->memory()->worldRank()!=rank_plan.rank)throw std::logic_error("ExpertOverlay source crossed original rank authority");
                 if(config.device.is_gpu()){
-                    const auto& original=source->originalResource(config.device);
-                    config.device_total_bytes=original.total_bytes;config.device_free_bytes=original.admission_available_bytes;
+                    config.adoptDeviceResource(source->originalResource(config.device));
                 }
                 if(config.associated_host_memory)config.associated_host_memory=source->originalResource(DeviceId::cpu());
             }
@@ -1203,13 +1216,10 @@ namespace llaminar2
             for (const auto &device_plan : result.fixed_memory_plan.devices)
             {
                 resource_devices.insert(device_plan.device());
-                // Admission can reject a row before a completed physical plan
-                // exists. Keep its original per-owner contribution available at
-                // DEBUG in optimized builds: TRACE is compiled out there, which
-                // otherwise hides Auto/Apply ownership differences behind one
-                // aggregate fixed-byte count. This cold diagnostic reads the
-                // canonical BOM only; it creates no parallel accounting ledger.
-                LOG_DEBUG(
+                // Each proposed row quotes the canonical BOM. Keep per-device
+                // geometry at TRACE so rejected candidates cannot flood the
+                // definitive admission summary or its physical deficits.
+                LOG_TRACE(
                     "[MoEOverlayCapacity] fixed component BOM device="
                     << device_plan.device().toString()
                     << " weights=" << device_plan.weight_bytes()
@@ -1229,6 +1239,39 @@ namespace llaminar2
                     << device_plan.retained_workspace_bytes()
                     << " total=" << device_plan.total_bytes());
                 physical_plan_builder.add(device_plan.bom());
+            }
+
+            // A follower GPU cohort owns its original native context once,
+            // independently of serial prepared-service probes. Continuation
+            // collective ownership is already contributed by MemoryPlanner.
+            for(const auto& domain:input.overlay_plan->domains) {
+                if(domain.name==input.overlay_plan->continuation_domain ||
+                   domain.routed_compute_policy!=RoutedExpertComputePolicy::TensorSharded ||
+                   domain.participants.size()<2 || domain.owner_rank!=rank_plan.rank)
+                    continue;
+                const bool any_gpu=std::any_of(domain.participants.begin(),domain.participants.end(),
+                    [](const auto& member){return member.isGPU();});
+                if(!any_gpu)continue;
+                if(domain.scope!=ExecutionDomainScope::RANK_LOCAL ||
+                   !std::all_of(domain.participants.begin(),domain.participants.end(),
+                       [&](const auto& member){return member.isGPU() &&
+                           member.device_type==domain.participants.front().device_type;}))
+                    throw std::invalid_argument("GPU expert native context BOM lost original rank-local homogeneous membership");
+                std::vector<DeviceId> devices;
+                for(const auto& member:domain.participants)devices.push_back(member.toLocalDeviceId());
+                const auto backend=BackendSelector::resolve(domain.backend,devices);
+                if(backend!=CollectiveBackendType::NCCL && backend!=CollectiveBackendType::RCCL)
+                    throw std::invalid_argument("GPU expert native context BOM requires original NCCL/RCCL");
+                const auto collective=CollectiveMemoryEstimator::localTP(
+                    rank_plan.runtime.max_seq_len,profile.d_model,backend);
+                for(const auto device:devices) {
+                    if(!resource_devices.contains(device))
+                        throw std::invalid_argument("GPU expert native context BOM omitted an original local resource");
+                    const auto [total,available]=inventoryMemory(inventory,device);
+                    physical_plan_builder.add({.world_rank=rank_plan.rank,.device=device,
+                        .total_bytes=total,.admission_available_bytes=usableMemory(available,device,input)},
+                        PhysicalMemoryOwner::LocalCollective,collective.perDeviceBytes());
+                }
             }
 
             if(input.require_native_context_budgets && input.native_context_budgets.empty() &&
@@ -1425,10 +1468,10 @@ namespace llaminar2
                         if (!endpoint.device.is_gpu())
                             throw std::invalid_argument("Native follower terminals require original GPU endpoints");
                         const auto [total, available] = inventoryMemory(inventory, endpoint.device);
-                        const PhysicalMemoryResource gpu{
+                        const PhysicalMemoryResource gpu = withObservedBacking({
                             .world_rank = rank_plan.rank, .device = endpoint.device,
                             .total_bytes = total,
-                            .admission_available_bytes = usableMemory(available, endpoint.device, input)};
+                            .admission_available_bytes = usableMemory(available, endpoint.device, input)}, inventory);
                         for (std::size_t cache = 0; cache < cache_count; ++cache)
                         {
                             if(!terminal_holder_priced){
@@ -1467,9 +1510,59 @@ namespace llaminar2
             {
                 if (!resource_devices.contains(DeviceId::cpu()))
                     throw std::invalid_argument("Dynamic GPU service requires its original CPU authority");
+                std::set<DeviceId> joint_devices;
+                const auto declared=MoEOverlayCapacityAdmission::boundParticipants(*input.overlay_plan);
+                for(const auto& domain:input.overlay_plan->domains) {
+                    if(domain.routed_compute_policy!=RoutedExpertComputePolicy::TensorSharded ||
+                       domain.participants.empty() || !domain.participants.front().isGPU() ||
+                       domain.owner_rank!=rank_plan.rank)continue;
+                    std::vector<MoEExpertShardCohort::Participant> members;
+                    for(const auto& member:declared)
+                        if(input.overlay_plan->routed_tiers.at(size_t(member.tier_index)).domain==domain.name)
+                        members.push_back({member.participant_id,member.world_rank,
+                            domain.participants.at(size_t(member.domain_participant_index))});
+                    if(members.size()!=domain.participants.size())
+                        throw std::invalid_argument("GPU service BOM lost an original domain member");
+                    bool found_source=false;
+                    for(const auto& source:input.original_expert_manifest) {
+                        const bool main=source.layer_idx>=family.first_model_layer &&
+                            source.layer_idx<family.first_model_layer+family.main_layer_count;
+                        if(!main && std::find(family.mtp_source_layers.begin(),family.mtp_source_layers.end(),
+                            source.layer_idx)==family.mtp_source_layers.end())continue;
+                        found_source=true;
+                        // This is the same passive source factory used by
+                        // admission, never a second placement/owner map.
+                        const auto cohort=MoEExpertShardCohort::checkedRankLocalGPU(source,profile.expert_count,members,
+                            MoEExpertShardCohort::gpuIntervals(source,int(members.size()),source.layer_idx,
+                                preferredIntermediateGrain(input.overlay_plan->gpu_expert_intermediate_tiling)));
+                        size_t concurrent_host=0;
+                        for(size_t member=0;member<members.size();++member) {
+                            const auto device=members[member].address.toLocalDeviceId();
+                            if(!endpoint_devices.contains(device))
+                                throw std::invalid_argument("GPU service BOM omitted an original local resource");
+                            const auto invocation=WorkspaceMemoryEstimator::estimatePreparedExpertService(profile,
+                                {.device=device,.device_compute_units=inventoryComputeUnits(inventory,device),
+                                 .resident_graph_rows=MoEOverlayCPUServiceMeasurement::kMaximumRows,
+                                 .first_layer=source.layer_idx,.last_layer=source.layer_idx},cohort.ownership(member));
+                            const auto allocation=MoEOverlayCPUServiceMeasurement::gpuJointAllocationBytes(
+                                {.d_model=profile.d_model,.intermediate=profile.expert_feed_forward_length},
+                                profile.expert_count,device,invocation);
+                            if(allocation.host_bytes>SIZE_MAX-concurrent_host)
+                                throw std::overflow_error("Concurrent GPU cohort probe roots overflow");
+                            concurrent_host+=allocation.host_bytes;
+                            auto& bytes=gpu_service_device_bytes[device];bytes=std::max(bytes,allocation.device_bytes);
+                            joint_devices.insert(device);
+                        }
+                        // Members execute together; targets/phases execute
+                        // serially. CPU0 therefore owns the largest COMPLETE
+                        // cohort's concurrent roots, not one member's maximum.
+                        gpu_service_host_bytes=std::max(gpu_service_host_bytes,concurrent_host);
+                    }
+                    if(!found_source)throw std::invalid_argument("GPU service BOM omitted original source manifests");
+                }
                 for (const auto device : endpoint_devices)
                 {
-                    if (!device.is_gpu()) continue;
+                    if (!device.is_gpu() || joint_devices.contains(device)) continue;
                     const auto invocation = PlanningMemoryQuoteReuse::preparedExpertService(profile,
                         {.source_tensor_index = PlanningMemoryQuoteReuse::sourceIndex(profile), .device = device, .device_compute_units = inventoryComputeUnits(inventory, device),
                          .resident_graph_rows = MoEOverlayCPUServiceMeasurement::kMaximumRows,
@@ -1483,17 +1576,20 @@ namespace llaminar2
                 }
             }
 
+            const auto policy_workspace = rank_plan.runtime.moe_rebalance.mode == MoERebalanceRuntimeMode::Dynamic
+                ? declareMoEOverlayDynamicPolicyWorkspace(*input.overlay_plan, static_cast<std::uint32_t>(profile.expert_count))
+                : std::optional<MoEOverlayDynamicPolicyWorkspaceDeclaration>{};
             for (const DeviceId device : resource_devices)
             {
                 const auto [total_bytes, available_bytes] =
                     inventoryMemory(inventory, device);
-                const PhysicalMemoryResource resource{
+                const PhysicalMemoryResource resource = withObservedBacking({
                     .world_rank = rank_plan.rank,
                     .device = device,
                     .total_bytes = total_bytes,
                     .admission_available_bytes = usableMemory(
                         available_bytes, device, input),
-                };
+                }, inventory);
                 const std::size_t activation_staging_bytes =
                     result.activation_channel_plan.stagingBytesFor(
                         rank_plan.rank, device);
@@ -1547,7 +1643,7 @@ namespace llaminar2
                     if (const auto *source = rank_plan.runtime.native_context_preparation->mandatoryBOM().find(
                             {rank_plan.rank, device}))
                         source_graph_bytes = source->bytes(PhysicalMemoryOwner::NativeGraphExecutable);
-                LOG_DEBUG("[MoEOverlayCapacity] captured inventory rank=" << rank_plan.rank
+                LOG_TRACE("[MoEOverlayCapacity] captured inventory rank=" << rank_plan.rank
                     << " device=" << device.toString()
                     << " identities=" << captured_inventory.model_graph_identity_count
                     << " variants=" << captured_inventory.model_graph_topology_variant_count
@@ -1632,6 +1728,12 @@ namespace llaminar2
                         physical_plan_builder.add(contribution);
                 }
                 additions
+                    // Only the actual continuation-root mapped policy author
+                    // owns this persistent scratch. Its serial decode/prefill/
+                    // restoration graphs reuse one exact admitted allocation.
+                    .add(PhysicalMemoryOwner::ExecutionWorkspace,
+                        policy_workspace && policy_workspace->world_rank == rank_plan.rank && policy_workspace->device == device
+                            ? MoEOverlayDynamicPolicyWorkspaceHeader::bytesFor(policy_workspace->shape) : 0u)
                     .add(PhysicalMemoryOwner::ExecutionWorkspace, prepared_service_bytes)
                     .add(PhysicalMemoryOwner::ExecutionWorkspace,
                         device.is_gpu() && endpoint_devices.contains(device)

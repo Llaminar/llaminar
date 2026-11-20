@@ -13,6 +13,8 @@
  * and their original bank is borrowed solely for exact arithmetic-policy metadata.
  */
 #include "MoEOverlayCPUServiceMeasurement.h"
+#include "MoERuntimeTable.h"
+#include "MoEOverlayOriginalGPUCohortContexts.h"
 #include "planning/PlanningGPUExpertMeasurement.h"
 #include "planning/WorkspaceMemoryEstimator.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
@@ -22,7 +24,7 @@
 #include "MoEOverlayPreparedWeightSource.h"
 #include "MoEOverlayFixedDownProjectionBank.h"
 #include "MoEExpertOverlayPreparationPlan.h"
-#include "CPUExpertShardSourceSelection.h"
+#include "ExpertShardSourceSelection.h"
 #include "execution/compute_stages/stages/MoEExpertComputeStage.h"
 #include "execution/local_execution/device/DeviceContext.h"
 #include "kernels/KernelFactory.h"
@@ -52,7 +54,7 @@ namespace llaminar2
          * @param source Actual live source lease, retained by the caller through replay.
          * @param participant Original endpoint ID, not a device ordinal alias.
          * @param layer Original model layer.
-         * @return Fixed bank only for GateUp endpoints; complete experts need no extra metadata.
+         * @return Fixed bank only for GateUp endpoints; whole experts and F shards own their down.
          */
         std::shared_ptr<const MoEOverlayFixedDownProjectionBank> fixedDownServiceMetadata(
             const MoEOverlayParticipantResidencyRegistry& registry,
@@ -61,7 +63,7 @@ namespace llaminar2
         {
             const auto endpoint = registry.endpoint(participant);
             if (!endpoint) throw std::invalid_argument("Prepared service endpoint is missing");
-            if (endpoint->movableProjections() == DeviceMoEProjectionSet::CompleteExpert) return {};
+            if (endpoint->movableProjections() != DeviceMoEProjectionSet::GateUp) return {};
             const auto* physical = registry.initialOwnerMap().participantForId(participant);
             if (!physical || !source.preparation())
                 throw std::invalid_argument("Gate/up service lost original projection preparation");
@@ -368,6 +370,46 @@ namespace llaminar2
         return {layout.hostBytes(), payload + invocation};
     }
 
+    size_t MoEOverlayCPUServiceMeasurement::GPUJointStorageLayout::hostBytes() const
+    {
+        size_t bytes=common.hostBytes();
+        const auto add=[&](size_t value){
+            if(value>SIZE_MAX-bytes)throw std::overflow_error("GPU cohort service host roots overflow");bytes+=value;};
+        for(const auto* root:{&canonical_routes,&release,&expected_output,&observed_output})add(root->physicalBytes());
+        add(active_rows.physicalBytes());add(histogram_evidence.physicalBytes());return bytes;
+    }
+    size_t MoEOverlayCPUServiceMeasurement::GPUJointStorageLayout::deviceBytes() const
+    {
+        const auto extra=canonical_routes.capacity()*sizeof(float)+release.capacity()*sizeof(float)+
+            active_rows.capacity()*sizeof(int32_t);
+        if(extra>SIZE_MAX-common.deviceBytes())throw std::overflow_error("GPU cohort service device roots overflow");
+        return common.deviceBytes()+extra;
+    }
+    MoEOverlayCPUServiceMeasurement::GPUJointStorageLayout
+    MoEOverlayCPUServiceMeasurement::gpuJointStorageLayout(Geometry geometry,int experts,int rows)
+    {
+        if(experts<=0 || experts>int(kDeviceMoEMaxExperts))
+            throw std::invalid_argument("GPU cohort service requires its original complete expert count");
+        auto common=gpuStorageLayout(geometry,rows);
+        const auto root=[](size_t count){return CPUStorageRoot<float>(count,
+            PhysicalMemoryOwner::ExecutionWorkspace,DeviceId::cpu());};
+        const size_t words=size_t(rows)*geometry.d_model;
+        return {std::move(common),root(words),root(1),root(words),root(words),
+            CPUStorageRoot<int32_t>(1,PhysicalMemoryOwner::ExecutionWorkspace,DeviceId::cpu()),
+            CPUStorageRoot<uint64_t>(size_t(experts)*6u,PhysicalMemoryOwner::ExecutionWorkspace,DeviceId::cpu())};
+    }
+    MoEOverlayCPUServiceMeasurement::GPUAllocation
+    MoEOverlayCPUServiceMeasurement::gpuJointAllocationBytes(Geometry geometry,int experts,
+        DeviceId device,size_t invocation)
+    {
+        const auto roots=gpuJointStorageLayout(geometry,experts,kMaximumRows);
+        const auto runtime=DeviceMoERuntimeTable::preparedFragmentServiceStorageGeometry(device,experts,kMaximumRows);
+        if(runtime.host_bytes>SIZE_MAX-roots.hostBytes() || runtime.device_bytes>SIZE_MAX-roots.deviceBytes() ||
+           invocation>SIZE_MAX-runtime.device_bytes-roots.deviceBytes())
+            throw std::overflow_error("GPU cohort service allocation quote overflow");
+        return {roots.hostBytes()+runtime.host_bytes,roots.deviceBytes()+runtime.device_bytes+invocation};
+    }
+
     size_t MoEOverlayCPUServiceMeasurement::allocationBytes(Geometry geometry, size_t invocation_workspace_bytes)
     {
         const int rows = std::max(kPrefillRows, kVerifierRows);
@@ -426,7 +468,7 @@ namespace llaminar2
         std::string error;
         auto source_use=registry.acquireOriginalPreparedSource(&error);
         if(!source_use)throw std::invalid_argument("CPU joint prepared-compute original source: "+error);
-        const auto cold=registry.initialCPUJointLayer(participant,layer);
+        const auto cold=registry.initialJointLayer(participant,layer);
         const auto frame=cold?cold->acquireEpoch(epoch):std::nullopt;
         if(!frame || !frame->bankLease() || !frame->sourceSelection())
             throw std::invalid_argument("CPU joint prepared-compute initial source/bank is absent");
@@ -437,10 +479,10 @@ namespace llaminar2
         const auto& bank=frame->bankLease()->layerForModelLayer(layer);
         if(!placement || !sameSourceOwner(placement->shard_cohort,cohort) ||
             !source.contains(expert) || member!=static_cast<size_t>(domain->myIndex()) ||
-            expert>=static_cast<int>(bank.cpu_fragments.size()) ||
+            expert>=static_cast<int>(bank.fragments.size()) ||
             expert>=static_cast<int>(bank.resident_mask.size()) || !bank.resident_mask[expert])
             throw std::invalid_argument("CPU joint prepared-compute changed original target/member/expert");
-        const auto& payload=bank.cpu_fragments[expert];
+        const auto& payload=bank.fragments[expert];
         if(!payload.valid() || payload.model()!=registry.originalModel() ||
             payload.expertId()!=expert || payload.participantIndex()!=member ||
             !sameSourceOwner(payload.cohort(),cohort) ||
@@ -558,7 +600,7 @@ namespace llaminar2
                 throw std::runtime_error("CPU joint prepared-compute canonical output is nonfinite");
         if(!diagnostic_output.empty())
             std::copy_n(output.typed_data(),output.numel(),diagnostic_output.data());
-        return PreparedComputeObservation{.target=MoEOverlayRouteTarget::cpuCohort(placement->tier_idx),
+        return PreparedComputeObservation{.target=MoEOverlayRouteTarget::cohort(placement->tier_idx),
             .layer=layer,.expert=expert,.phase=source_phase,.logical_rows_per_invocation=static_cast<uint64_t>(rows),
             .measured_invocations=kMeasuredSamples,.total_root_wall_nanoseconds=total};
         } catch(const std::exception& failure) {
@@ -576,6 +618,52 @@ namespace llaminar2
             domain->requestAbort();
             throw;
         }
+    }
+
+    std::vector<PlanningGPUCohortServiceObservation>
+    MoEOverlayCPUServiceMeasurement::measurePreparedGPUTargets(
+        const MoEOverlayParticipantResidencyRegistry& registry,
+        const MoEOverlayPreparedTargetServicePlan& plan,
+        const MoEOverlayOriginalGPUCohortContexts& contexts,
+        const std::shared_ptr<PhysicalMemoryAuthority>& memory,
+        const ModelMemoryProfile& profile,const RankInventory& inventory)
+    {
+        if(!memory || inventory.rank!=memory->worldRank() ||
+           plan.snapshot()->epoch!=registry.initialEpoch())
+            throw std::invalid_argument("Prepared GPU target jobs require original rank/initial source/PMA");
+        std::string error;const auto source=registry.acquireOriginalPreparedSource(&error);
+        if(!source || !sameSourceOwner(source->preparation(),plan.snapshot()->originalProjectionPreparation()) ||
+           plan.snapshot()->originalOwnerMap().participants()!=registry.initialOwnerMap().participants() ||
+           plan.snapshot()->originalOwnerMap().owners()!=registry.initialOwnerMap().owners())
+            throw std::invalid_argument("Prepared GPU target jobs lost original source/placement: "+error);
+        std::map<DeviceId,std::shared_ptr<RetainedParticipantGraphExecutable>> owners;
+        std::vector<PlanningGPUCohortServiceObservation> observations;
+        for(const auto& entry:plan.entries()) {
+            const auto cohort=plan.cohort(entry);
+            if(!cohort || cohort->participants().empty() || !cohort->participants().front().address.isGPU() ||
+               entry.root_world_rank!=memory->worldRank())continue;
+            const auto native=contexts.forOriginalCohort(registry.initialOwnerMap(),*cohort,memory->worldRank());
+            std::vector<std::shared_ptr<RetainedParticipantGraphExecutable>> ordered;
+            for(const auto& member:cohort->participants()) {
+                auto& owner=owners[member.address.toLocalDeviceId()];
+                if(!owner)owner=PlanningGPUExpertMeasurement::beginPreparedCalibration(member.address.toLocalDeviceId(),memory);
+                ordered.push_back(owner);
+            }
+            for(size_t phase=0;phase<kExpertHistogramProductionSourceCount;++phase) {
+                if(entry.sample_layers[phase]!=entry.coordinate.layer)continue;
+                const auto source_phase=phase==0?ExpertHistogramSource::DecodeToken:
+                    phase==1?ExpertHistogramSource::PrefillChunk:ExpertHistogramSource::GroupedVerifier;
+                const auto expert=plan.sampleExpert(entry,phase);
+                auto observation=PlanningGPUExpertMeasurement::measurePreparedCohort(registry,registry.initialEpoch(),
+                    cohort,entry.coordinate.layer,expert,source_phase,native,memory,profile,inventory,ordered);
+                if(observation.target.word()!=entry.coordinate.target.word() ||
+                   observation.rows_per_frame!=entry.sample_rows[phase] ||
+                   observation.measured_frames!=entry.measured_invocations)
+                    throw std::logic_error("Prepared GPU target job returned another original sample coordinate");
+                observations.push_back(std::move(observation));
+            }
+        }
+        return observations;
     }
 
     std::vector<MoEOverlayPreparedTargetServiceTotals>

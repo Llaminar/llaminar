@@ -6965,7 +6965,7 @@ std::shared_ptr<MoERoutedExpertPlacementPlan> preparedJointParticipantPlan(bool 
     plan->routed_tiers[0].resolved_live_experts_per_layer={empty?512:64};
     plan->domains.push_back(expertDomain("joint_cpu",ExecutionDomainScope::NODE_LOCAL,CollectiveBackendType::MPI,
         RoutedExpertComputePolicy::TensorSharded,{GlobalDeviceAddress::cpu(0),GlobalDeviceAddress::cpu(1)},{0,1}));
-    plan->routed_tiers.push_back({.name="cpu_fragments",.domain="joint_cpu",.priority=10,
+    plan->routed_tiers.push_back({.name="fragments",.domain="joint_cpu",.priority=10,
         .max_experts_per_layer=448,.memory_budget_bytes=4096,.fallback=true,
         .resolved_live_experts_per_layer={empty?0:448}});
     plan->placements={{.layer=0,.routed_expert_tier=std::vector<int>(512,empty?0:1)}};

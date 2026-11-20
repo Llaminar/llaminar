@@ -48,6 +48,10 @@
 #endif
 
 #include "../../../utils/CPUFeatures.h"
+#include "CPUTQAttentionOperands.h"
+#if LLAMINAR_COMPILED_WITH_NEON
+#include "NEONTQAttentionPrimitives.h"
+#endif
 
 namespace llaminar2
 {
@@ -61,6 +65,9 @@ namespace llaminar2
     /// heavy transitive includes from the TQ dequant header.
     namespace tq_attn_detail
     {
+        /** @brief Expand one original high-bit plane into bounded diagnostic bytes.
+         * @param packed Exactly one original byte; @param out Exactly eight private output bytes.
+         */
         inline void unpack_bitplane_8_local(const uint8_t *packed, uint8_t *out)
         {
             const uint8_t bits = *packed;
@@ -94,7 +101,11 @@ namespace llaminar2
     // Named ISA implementations: tq8_dot_rotated_q
     // ========================================================================
 
-    /// Scalar: dot(Q_rot, centroids(TQ8)) × norm
+    /** @brief Explicit scalar diagnostic TQ8 scoring program.
+     * @param Q_rot Original query; @param tq8_block Valid immutable physical block.
+     * @param head_dim Complete diagnostic width, with valid original storage.
+     * @return Ordered diagnostic dot times the original source norm.
+     */
     inline float tq8_dot_rotated_q_scalar(
         const float *__restrict__ Q_rot,
         const uint8_t *__restrict__ tq8_block,
@@ -112,7 +123,11 @@ namespace llaminar2
     }
 
 #if defined(__AVX2__)
-    /// AVX2: dot(Q_rot, centroids(TQ8)) × norm (8-wide gather+FMA)
+    /** @brief Existing AVX2 eight-wide gather/FMA score program.
+     * @param Q_rot Checked original query; @param tq8_block Checked immutable block.
+     * @param head_dim Complete validated ABI width.
+     * @return AVX2 score times the source norm; no alternate ISA is selected here.
+     */
     inline float tq8_dot_rotated_q_avx2(
         const float *__restrict__ Q_rot,
         const uint8_t *__restrict__ tq8_block,
@@ -144,7 +159,11 @@ namespace llaminar2
 #endif
 
 #if defined(__AVX512F__)
-    /// AVX-512: dot(Q_rot, centroids(TQ8)) × norm (16-wide gather+FMA)
+    /** @brief Existing AVX-512 sixteen-wide gather/FMA score program.
+     * @param Q_rot Checked original query; @param tq8_block Checked immutable block.
+     * @param head_dim Complete validated ABI width.
+     * @return AVX-512 score times the original source norm.
+     */
     inline float tq8_dot_rotated_q_avx512(
         const float *__restrict__ Q_rot,
         const uint8_t *__restrict__ tq8_block,
@@ -175,34 +194,6 @@ namespace llaminar2
     }
 #endif
 
-// Stubs for portability when ISA unavailable at compile time
-#if !defined(__AVX2__)
-    inline float tq8_dot_rotated_q_avx2(
-        const float *__restrict__ Q_rot,
-        const uint8_t *__restrict__ tq8_block,
-        int head_dim)
-    {
-        return tq8_dot_rotated_q_scalar(Q_rot, tq8_block, head_dim);
-    }
-#endif
-#if !defined(__AVX512F__)
-    inline float tq8_dot_rotated_q_avx512(
-        const float *__restrict__ Q_rot,
-        const uint8_t *__restrict__ tq8_block,
-        int head_dim)
-    {
-        return tq8_dot_rotated_q_avx2(Q_rot, tq8_block, head_dim);
-    }
-#endif
-
-    /// Dispatch: picks best available ISA at runtime
-    inline float tq8_dot_rotated_q(
-        const float *__restrict__ Q_rot,
-        const uint8_t *__restrict__ tq8_block,
-        int head_dim)
-    {
-        return ISA_DISPATCH_RETVAL(tq8_dot_rotated_q, Q_rot, tq8_block, head_dim);
-    }
 
     // ========================================================================
     // TQ4 K dot product: score = dot(Q_rot, centroids) * source norm
@@ -256,7 +247,11 @@ namespace llaminar2
     }
 
 #if defined(__AVX2__)
-    /** @brief AVX2 native TQ4 key dot product using eight-wide gathers. */
+    /** @brief Existing AVX2 TQ4 score program with original-coordinate centroid gathers.
+     * @param Q_rot Checked original query; @param tq4_block Checked immutable physical head.
+     * @param head_dim Complete validated ABI width.
+     * @return AVX2 ordered dot times the original source norm.
+     */
     inline float tq4_dot_rotated_q_avx2(
         const float *__restrict__ Q_rot,
         const uint8_t *__restrict__ tq4_block,
@@ -302,7 +297,11 @@ namespace llaminar2
 #endif
 
 #if defined(__AVX512F__)
-    /** @brief AVX-512 native TQ4 key dot product using sixteen-wide gathers. */
+    /** @brief Existing AVX-512 TQ4 score program with original-coordinate gathers.
+     * @param Q_rot Checked original query; @param tq4_block Checked immutable physical head.
+     * @param head_dim Complete validated ABI width.
+     * @return AVX-512 ordered dot times the original source norm.
+     */
     inline float tq4_dot_rotated_q_avx512(
         const float *__restrict__ Q_rot,
         const uint8_t *__restrict__ tq4_block,
@@ -370,37 +369,6 @@ namespace llaminar2
     }
 #endif
 
-#if !defined(__AVX2__)
-    inline float tq4_dot_rotated_q_avx2(
-        const float *__restrict__ Q_rot,
-        const uint8_t *__restrict__ tq4_block,
-        int head_dim)
-    {
-        return tq4_dot_rotated_q_scalar(Q_rot, tq4_block, head_dim);
-    }
-#endif
-#if !defined(__AVX512F__)
-    inline float tq4_dot_rotated_q_avx512(
-        const float *__restrict__ Q_rot,
-        const uint8_t *__restrict__ tq4_block,
-        int head_dim)
-    {
-        return tq4_dot_rotated_q_avx2(Q_rot, tq4_block, head_dim);
-    }
-#endif
-
-    /** @brief Runtime-ISA dispatch for direct TQ4 key scoring. */
-    inline float tq4_dot_rotated_q(
-        const float *__restrict__ Q_rot,
-        const uint8_t *__restrict__ tq4_block,
-        int head_dim)
-    {
-        return ISA_DISPATCH_RETVAL(
-            tq4_dot_rotated_q,
-            Q_rot,
-            tq4_block,
-            head_dim);
-    }
 
     // ========================================================================
     // TQ8 V accumulation in rotated space
@@ -439,7 +407,10 @@ namespace llaminar2
     }
 
 #if defined(__AVX2__)
-    /** @brief AVX2 TQ8 value accumulation using eight-wide centroid gathers. */
+    /** @brief Existing AVX2 TQ8 numerator FMA program.
+     * @param accum Checked original numerator; @param tq8_block Immutable disjoint value head.
+     * @param weight Original finite softmax weight; @param head_dim Complete validated ABI width.
+     */
     inline void tq8_accum_weighted_avx2(
         float *__restrict__ accum,
         const uint8_t *__restrict__ tq8_block,
@@ -473,7 +444,10 @@ namespace llaminar2
 #endif
 
 #if defined(__AVX512F__)
-    /** @brief AVX-512 TQ8 value accumulation using sixteen-wide gathers. */
+    /** @brief Existing AVX-512 TQ8 numerator FMA program.
+     * @param accum Checked original numerator; @param tq8_block Immutable disjoint value head.
+     * @param weight Original finite weight; @param head_dim Complete validated ABI width.
+     */
     inline void tq8_accum_weighted_avx512(
         float *__restrict__ accum,
         const uint8_t *__restrict__ tq8_block,
@@ -506,36 +480,6 @@ namespace llaminar2
     }
 #endif
 
-#if !defined(__AVX2__)
-    inline void tq8_accum_weighted_avx2(
-        float *__restrict__ accum,
-        const uint8_t *__restrict__ tq8_block,
-        float weight,
-        int head_dim)
-    {
-        tq8_accum_weighted_scalar(accum, tq8_block, weight, head_dim);
-    }
-#endif
-#if !defined(__AVX512F__)
-    inline void tq8_accum_weighted_avx512(
-        float *__restrict__ accum,
-        const uint8_t *__restrict__ tq8_block,
-        float weight,
-        int head_dim)
-    {
-        tq8_accum_weighted_avx2(accum, tq8_block, weight, head_dim);
-    }
-#endif
-
-    /** @brief Runtime-ISA dispatch for native symmetric TQ8 value accumulation. */
-    inline void tq8_accum_weighted(
-        float *__restrict__ accum,
-        const uint8_t *__restrict__ tq8_block,
-        float weight,
-        int head_dim)
-    {
-        ISA_DISPATCH_VOID(tq8_accum_weighted, accum, tq8_block, weight, head_dim);
-    }
 
     // ========================================================================
     // TQ4 V accumulation in rotated space
@@ -565,7 +509,10 @@ namespace llaminar2
     // Named ISA implementations: tq4_accum_weighted
     // ========================================================================
 
-    /// Scalar: accum += weight × norm × centroids(TQ4)
+    /** @brief Explicit scalar diagnostic TQ4 numerator update using the fitted radius.
+     * @param accum Original diagnostic numerator; @param tq4_block Valid disjoint physical head.
+     * @param weight Original finite weight; @param head_dim Complete valid diagnostic width.
+     */
     inline void tq4_accum_weighted_scalar(
         float *__restrict__ accum,
         const uint8_t *__restrict__ tq4_block,
@@ -599,7 +546,10 @@ namespace llaminar2
     }
 
 #if defined(__AVX2__)
-    /// AVX2: accum += weight × norm × centroids(TQ4) (8-wide gather+FMA)
+    /** @brief Existing AVX2 TQ4 numerator update without changing the centroid/FMA program.
+     * @param accum Checked original numerator; @param tq4_block Immutable disjoint value head.
+     * @param weight Original finite weight; @param head_dim Complete validated ABI width.
+     */
     inline void tq4_accum_weighted_avx2(
         float *__restrict__ accum,
         const uint8_t *__restrict__ tq4_block,
@@ -641,7 +591,10 @@ namespace llaminar2
 #endif
 
 #if defined(__AVX512F__)
-    /// AVX-512: accum += weight × norm × centroids(TQ4) (16-wide gather+FMA)
+    /** @brief Existing AVX-512 TQ4 numerator update with unchanged fitted-radius arithmetic.
+     * @param accum Checked original numerator; @param tq4_block Immutable disjoint value head.
+     * @param weight Original finite weight; @param head_dim Complete validated ABI width.
+     */
     inline void tq4_accum_weighted_avx512(
         float *__restrict__ accum,
         const uint8_t *__restrict__ tq4_block,
@@ -684,36 +637,142 @@ namespace llaminar2
     }
 #endif
 
-// Stubs for portability when ISA unavailable at compile time
-#if !defined(__AVX2__)
-    inline void tq4_accum_weighted_avx2(
-        float *__restrict__ accum,
-        const uint8_t *__restrict__ tq4_block,
-        float weight,
-        int head_dim)
+    namespace tq_attn_detail
     {
-        tq4_accum_weighted_scalar(accum, tq4_block, weight, head_dim);
-    }
-#endif
-#if !defined(__AVX512F__)
-    inline void tq4_accum_weighted_avx512(
-        float *__restrict__ accum,
-        const uint8_t *__restrict__ tq4_block,
-        float weight,
-        int head_dim)
-    {
-        tq4_accum_weighted_avx2(accum, tq4_block, weight, head_dim);
-    }
-#endif
+        using cpu::tq_attention::Format;
 
-    /// Dispatch: picks best available ISA at runtime
-    inline void tq4_accum_weighted(
-        float *__restrict__ accum,
-        const uint8_t *__restrict__ tq4_block,
-        float weight,
-        int head_dim)
-    {
-        ISA_DISPATCH_VOID(tq4_accum_weighted, accum, tq4_block, weight, head_dim);
-    }
+        /** @brief Execute explicitly selected scalar diagnostic scoring on already checked operands.
+         * @tparam Encoding Original physical layout; @param input Original checked query/head borrows.
+         * @return Scalar diagnostic result, or positive zero for the original inactive program.
+         */
+        template <Format Encoding> inline float dot_scalar(const cpu::tq_attention::DotOperand<Encoding> &input)
+        {
+            if (!input.active()) return 0;
+            if constexpr (Encoding == Format::TQ4)
+                return tq4_dot_rotated_q_scalar(input.query(), input.head().data(), input.head().dimensions());
+            else
+                return tq8_dot_rotated_q_scalar(input.query(), input.head().data(), input.head().dimensions());
+        }
+        /** @brief Execute explicitly selected scalar diagnostic accumulation without a fallback route.
+         * @tparam Encoding Original layout; @param input Checked original numerator/head/weight.
+         */
+        template <Format Encoding> inline void accumulate_scalar(const cpu::tq_attention::AccumOperand<Encoding> &input)
+        {
+            if (!input.active()) return;
+            if constexpr (Encoding == Format::TQ4)
+                tq4_accum_weighted_scalar(input.output(), input.head().data(), input.weight(), input.head().dimensions());
+            else
+                tq8_accum_weighted_scalar(input.output(), input.head().data(), input.weight(), input.head().dimensions());
+        }
+#if defined(__AVX2__)
+        /** @brief Adapt checked original operands to the existing AVX2 score program.
+         * @tparam Encoding Original layout; @param input Checked query/head borrows.
+         * @return Original AVX2 result, with unchanged arithmetic.
+         */
+        template <Format Encoding> inline float dot_avx2(const cpu::tq_attention::DotOperand<Encoding> &input)
+        {
+            if (!input.active()) return 0;
+            if constexpr (Encoding == Format::TQ4)
+                return tq4_dot_rotated_q_avx2(input.query(), input.head().data(), input.head().dimensions());
+            else
+                return tq8_dot_rotated_q_avx2(input.query(), input.head().data(), input.head().dimensions());
+        }
+        /** @brief Adapt checked original storage to the unchanged AVX2 numerator program.
+         * @tparam Encoding Original layout; @param input Checked numerator update.
+         */
+        template <Format Encoding> inline void accumulate_avx2(const cpu::tq_attention::AccumOperand<Encoding> &input)
+        {
+            if (!input.active()) return;
+            if constexpr (Encoding == Format::TQ4)
+                tq4_accum_weighted_avx2(input.output(), input.head().data(), input.weight(), input.head().dimensions());
+            else
+                tq8_accum_weighted_avx2(input.output(), input.head().data(), input.weight(), input.head().dimensions());
+        }
+#endif
+#if defined(__AVX512F__)
+        /** @brief Adapt checked original operands to the existing AVX-512 score program.
+         * @tparam Encoding Original layout; @param input Checked query/head borrows.
+         * @return Original AVX-512 result, with unchanged arithmetic.
+         */
+        template <Format Encoding> inline float dot_avx512(const cpu::tq_attention::DotOperand<Encoding> &input)
+        {
+            if (!input.active()) return 0;
+            if constexpr (Encoding == Format::TQ4)
+                return tq4_dot_rotated_q_avx512(input.query(), input.head().data(), input.head().dimensions());
+            else
+                return tq8_dot_rotated_q_avx512(input.query(), input.head().data(), input.head().dimensions());
+        }
+        /** @brief Adapt checked original storage to the unchanged AVX-512 numerator program.
+         * @tparam Encoding Original layout; @param input Checked numerator update.
+         */
+        template <Format Encoding> inline void accumulate_avx512(const cpu::tq_attention::AccumOperand<Encoding> &input)
+        {
+            if (!input.active()) return;
+            if constexpr (Encoding == Format::TQ4)
+                tq4_accum_weighted_avx512(input.output(), input.head().data(), input.weight(), input.head().dimensions());
+            else
+                tq8_accum_weighted_avx512(input.output(), input.head().data(), input.weight(), input.head().dimensions());
+        }
+#endif
+#if LLAMINAR_COMPILED_WITH_NEON
+        /** @brief Execute native ASIMD scoring; no raw unchecked view or x86 body can enter this leaf.
+         * @tparam Encoding Original layout; @param input Checked immutable original borrows.
+         * @return Ordered native score, with one retained source-norm multiply.
+         */
+        template <Format Encoding> inline float dot_neon(const cpu::tq_attention::DotOperand<Encoding> &input)
+        { return cpu::neon_tq_attention::dot(input); }
+        /** @brief Execute the native weighted-centroid FMA program on checked disjoint storage.
+         * @tparam Encoding Original layout; @param input Checked original numerator update.
+         */
+        template <Format Encoding> inline void accumulate_neon(const cpu::tq_attention::AccumOperand<Encoding> &input)
+        { cpu::neon_tq_attention::accumulate(input); }
+#endif
+    } // namespace tq_attn_detail
 
+    /** @brief Score one TQ8 head using its original source norm and canonical native ISA.
+     * @param Q_rot Original rotated query; @param tq8_block Original complete immutable physical head.
+     * @param head_dim Existing TQ tensor ABI width (64/128/256), or explicit zero work.
+     * @return Native ordered dot times the source norm; zero for original inactive work.
+     * @throws std::invalid_argument For malformed, missing or overlapping original operands.
+     * @throws std::domain_error For invalid selected source metadata.
+     */
+    inline float tq8_dot_rotated_q(const float *Q_rot, const std::uint8_t *tq8_block, int head_dim)
+    {
+        const auto input = cpu::tq_attention::DotOperand<cpu::tq_attention::Format::TQ8>::bind(Q_rot, tq8_block, head_dim);
+        return ISA_DISPATCH_RETVAL(tq_attn_detail::dot, input);
+    }
+    /** @brief Score one TQ4 head without a decoded key/head mirror.
+     * @param Q_rot Original rotated query; @param tq4_block Original complete physical head.
+     * @param head_dim Existing ABI width (64/128/256), or explicit zero work.
+     * @return Native ordered dot times the original source norm.
+     * @throws std::invalid_argument For malformed, missing or overlapping operands.
+     * @throws std::domain_error For invalid selected source metadata.
+     */
+    inline float tq4_dot_rotated_q(const float *Q_rot, const std::uint8_t *tq4_block, int head_dim)
+    {
+        const auto input = cpu::tq_attention::DotOperand<cpu::tq_attention::Format::TQ4>::bind(Q_rot, tq4_block, head_dim);
+        return ISA_DISPATCH_RETVAL(tq_attn_detail::dot, input);
+    }
+    /** @brief Update a numerator from original compressed TQ8 values and their fitted radius.
+     * @param accum Original writable numerator; @param tq8_block Immutable physical value head.
+     * @param weight Original finite softmax weight; @param head_dim Existing ABI width or zero work.
+     * @throws std::invalid_argument For unsupported, missing or aliased storage.
+     * @throws std::domain_error For invalid selected metadata/weight or a nonfinite live product.
+     */
+    inline void tq8_accum_weighted(float *accum, const std::uint8_t *tq8_block, float weight, int head_dim)
+    {
+        const auto input = cpu::tq_attention::AccumOperand<cpu::tq_attention::Format::TQ8>::bind(accum, tq8_block, weight, head_dim);
+        ISA_DISPATCH_VOID(tq_attn_detail::accumulate, input);
+    }
+    /** @brief Update a numerator directly from original TQ4 bitplanes and exact centroid words.
+     * @param accum Original writable numerator; @param tq4_block Immutable physical value head.
+     * @param weight Original finite weight; @param head_dim Existing ABI width or zero work.
+     * @throws std::invalid_argument For unsupported, missing or aliased storage.
+     * @throws std::domain_error For invalid selected metadata/weight or a nonfinite live product.
+     */
+    inline void tq4_accum_weighted(float *accum, const std::uint8_t *tq4_block, float weight, int head_dim)
+    {
+        const auto input = cpu::tq_attention::AccumOperand<cpu::tq_attention::Format::TQ4>::bind(accum, tq4_block, weight, head_dim);
+        ISA_DISPATCH_VOID(tq_attn_detail::accumulate, input);
+    }
 } // namespace llaminar2

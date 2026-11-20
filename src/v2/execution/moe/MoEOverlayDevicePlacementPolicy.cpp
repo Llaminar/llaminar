@@ -1,6 +1,10 @@
 /**
  * @file MoEOverlayDevicePlacementPolicy.cpp
  * @brief Deterministic CPU oracle for device-owned ExpertOverlay policy.
+ *
+ * Original whole/cohort policy vertices publish the same typed movement targets as
+ * the native controller. Command encoding and stable ordering do not introduce
+ * a second participant namespace or change the policy's economy arithmetic.
  */
 
 #include "MoEOverlayDeviceControllerKernels.h"
@@ -112,7 +116,7 @@ namespace llaminar2
             std::uint32_t layer) noexcept
         {
             return (static_cast<std::size_t>(source) *
-                        input.participants.size() +
+                        input.targets.size() +
                     destination) *
                        input.num_layers +
                    layer;
@@ -166,8 +170,8 @@ namespace llaminar2
             const MoEOverlayDevicePlacementPolicyInput &input)
         {
             std::vector<std::int32_t> priorities;
-            priorities.reserve(input.participants.size());
-            for (const auto &participant : input.participants)
+            priorities.reserve(input.targets.size());
+            for (const auto &participant : input.targets)
                 priorities.push_back(participant.tier_priority);
             std::sort(priorities.begin(), priorities.end());
             priorities.erase(
@@ -197,7 +201,7 @@ namespace llaminar2
         {
             PlacementScore score;
             std::vector<std::uint64_t> participant_load(
-                input.participants.size(), 0u);
+                input.targets.size(), 0u);
             for (std::uint32_t expert = 0u;
                  expert < input.num_experts;
                  ++expert)
@@ -205,7 +209,7 @@ namespace llaminar2
                 const std::int32_t owner = owners[expert];
                 if (owner < 0 ||
                     static_cast<std::size_t>(owner) >=
-                        input.participants.size())
+                        input.targets.size())
                 {
                     throw std::logic_error(
                         "ExpertOverlay policy score received an invalid owner");
@@ -221,7 +225,7 @@ namespace llaminar2
                         count,
                         priorityRank(
                             priorities,
-                            input.participants[static_cast<std::size_t>(owner)]
+                            input.targets[static_cast<std::size_t>(owner)]
                                 .tier_priority)));
             }
 
@@ -229,10 +233,10 @@ namespace llaminar2
             {
                 std::uint64_t maximum = 0u;
                 for (std::size_t participant = 0u;
-                     participant < input.participants.size();
+                     participant < input.targets.size();
                      ++participant)
                 {
-                    if (input.participants[participant].tier_priority ==
+                    if (input.targets[participant].tier_priority ==
                         priority)
                     {
                         maximum = std::max(
@@ -264,9 +268,9 @@ namespace llaminar2
                 const auto destination =
                     static_cast<std::size_t>(desired[expert]);
                 const std::int32_t source_priority =
-                    input.participants[source].tier_priority;
+                    input.targets[source].tier_priority;
                 const std::int32_t destination_priority =
-                    input.participants[destination].tier_priority;
+                    input.targets[destination].tier_priority;
                 if (source_priority != destination_priority)
                     return false;
                 if (!selected_priority)
@@ -281,10 +285,10 @@ namespace llaminar2
             }
 
             std::vector<std::uint64_t> participant_load(
-                input.participants.size(), 0u);
+                input.targets.size(), 0u);
             std::vector<std::int32_t> participant_priority;
-            participant_priority.reserve(input.participants.size());
-            for (const auto &participant : input.participants)
+            participant_priority.reserve(input.targets.size());
+            for (const auto &participant : input.targets)
                 participant_priority.push_back(participant.tier_priority);
             for (std::uint32_t expert = 0u;
                  expert < input.num_experts;
@@ -297,7 +301,7 @@ namespace llaminar2
             return moe_rebalance_policy::samePriorityLoadIsImbalanced(
                 participant_load.data(),
                 participant_priority.data(),
-                static_cast<std::uint32_t>(input.participants.size()),
+                static_cast<std::uint32_t>(input.targets.size()),
                 cycle_priority,
                 input.dynamic_imbalance_threshold_per_mille);
         }
@@ -331,9 +335,9 @@ namespace llaminar2
                  ++phase)
             {
                 std::vector<std::uint64_t> before_load(
-                    input.participants.size(), 0u);
+                    input.targets.size(), 0u);
                 std::vector<std::uint64_t> after_load(
-                    input.participants.size(), 0u);
+                    input.targets.size(), 0u);
                 for (std::uint32_t expert = 0u;
                      expert < input.num_experts;
                      ++expert)
@@ -353,13 +357,11 @@ namespace llaminar2
                 std::uint64_t before_critical_path = 0u;
                 std::uint64_t after_critical_path = 0u;
                 for (std::size_t participant = 0u;
-                     participant < input.participants.size();
+                     participant < input.targets.size();
                      ++participant)
                 {
-                    const auto tier = static_cast<std::uint32_t>(
-                        input.participants[participant].tier_index);
                     const std::uint64_t service = economy.service_costs[
-                        serviceOffset(input, tier, layer, phase)];
+                        serviceOffset(input, static_cast<std::uint32_t>(participant), layer, phase)];
                     before_critical_path = std::max(
                         before_critical_path,
                         saturatingMultiply(before_load[participant], service));
@@ -491,7 +493,7 @@ namespace llaminar2
             const std::vector<std::int32_t> &priorities)
         {
             std::vector<std::uint32_t> quotas(
-                input.participants.size(), 0u);
+                input.targets.size(), 0u);
             for (const std::int32_t owner : current)
                 ++quotas.at(static_cast<std::size_t>(owner));
 
@@ -511,25 +513,25 @@ namespace llaminar2
             std::size_t expert_cursor = 0u;
             for (const std::int32_t priority : priorities)
             {
-                std::vector<std::uint32_t> participants;
+                std::vector<std::uint32_t> targets;
                 std::uint32_t group_quota = 0u;
                 for (std::uint32_t participant = 0u;
-                     participant < input.participants.size();
+                     participant < input.targets.size();
                      ++participant)
                 {
-                    if (input.participants[participant].tier_priority ==
+                    if (input.targets[participant].tier_priority ==
                         priority)
                     {
-                        participants.push_back(participant);
+                        targets.push_back(participant);
                         group_quota += quotas[participant];
                     }
                 }
 
                 std::vector<std::uint32_t> remaining;
                 std::vector<std::uint64_t> load;
-                remaining.reserve(participants.size());
-                load.assign(participants.size(), 0u);
-                for (const std::uint32_t participant : participants)
+                remaining.reserve(targets.size());
+                load.assign(targets.size(), 0u);
+                for (const std::uint32_t participant : targets)
                     remaining.push_back(quotas[participant]);
 
                 for (std::uint32_t slot = 0u; slot < group_quota; ++slot)
@@ -541,28 +543,28 @@ namespace llaminar2
                     }
                     const std::uint32_t expert =
                         ordered_experts[expert_cursor++];
-                    std::size_t selected = participants.size();
+                    std::size_t selected = targets.size();
                     for (std::size_t index = 0u;
-                         index < participants.size();
+                         index < targets.size();
                          ++index)
                     {
                         if (remaining[index] == 0u)
                             continue;
-                        if (selected == participants.size() ||
+                        if (selected == targets.size() ||
                             load[index] < load[selected] ||
                             (load[index] == load[selected] &&
-                             participants[index] < participants[selected]))
+                             targets[index] < targets[selected]))
                         {
                             selected = index;
                         }
                     }
-                    if (selected == participants.size())
+                    if (selected == targets.size())
                     {
                         throw std::logic_error(
                             "ExpertOverlay policy exhausted a priority quota early");
                     }
                     desired[expert] = static_cast<std::int32_t>(
-                        participants[selected]);
+                        targets[selected]);
                     --remaining[selected];
                     load[selected] = saturatingAdd(
                         load[selected], expert_counts[expert]);
@@ -603,7 +605,11 @@ namespace llaminar2
         std::uint32_t num_experts,
         std::uint32_t participant_count) const noexcept
     {
-        if (tier_count == 0u || routed_experts_per_token == 0u ||
+        if (tier_count == 0u || participant_count == 0u || tier_count > participant_count ||
+            num_layers == 0u || num_layers > kMoEOverlayDeviceControllerFabricMaxLayers ||
+            num_experts == 0u || num_experts > kMoEOverlayDeviceControllerFabricMaxExperts ||
+            participant_count > std::numeric_limits<std::size_t>::max() /
+                (static_cast<std::size_t>(participant_count) * num_layers) || routed_experts_per_token == 0u ||
             routed_experts_per_token > num_experts ||
             transaction_generation == 0u || payoff_horizon_tokens == 0u)
         {
@@ -614,7 +620,7 @@ namespace llaminar2
                 kMoEOverlayDeviceControllerDemandPhaseCount) *
             num_layers * num_experts;
         const std::size_t service_words =
-            static_cast<std::size_t>(tier_count) * num_layers *
+            static_cast<std::size_t>(participant_count) * num_layers *
             kMoEOverlayDeviceControllerEconomyServicePhaseCount;
         const std::size_t migration_entries =
             static_cast<std::size_t>(participant_count) *
@@ -628,7 +634,7 @@ namespace llaminar2
         {
             return false;
         }
-        for (std::uint32_t tier = 0u; tier < tier_count; ++tier)
+        for (std::uint32_t tier = 0u; tier < participant_count; ++tier)
         {
             for (std::uint32_t layer = 0u; layer < num_layers; ++layer)
             {
@@ -678,9 +684,10 @@ namespace llaminar2
     bool MoEOverlayDevicePlacementPolicyInput::valid() const noexcept
     {
         if (num_layers == 0u || num_experts == 0u ||
-            participants.empty() ||
-            participants.size() >
-                moe_rebalance_policy::kMaxPolicyParticipants ||
+            targets.empty() ||
+            targets.size() > static_cast<std::size_t>(INT32_MAX) ||
+            num_layers > kMoEOverlayDeviceControllerFabricMaxLayers ||
+            num_experts > kMoEOverlayDeviceControllerFabricMaxExperts ||
             base_epoch == 0u ||
             base_epoch == std::numeric_limits<std::uint64_t>::max() ||
             layer_start_cursor >= num_layers ||
@@ -690,23 +697,27 @@ namespace llaminar2
             !economy->valid(
                 num_layers,
                 num_experts,
-                static_cast<std::uint32_t>(participants.size())))
+                static_cast<std::uint32_t>(targets.size())))
         {
             return false;
         }
-        for (std::size_t index = 0u; index < participants.size(); ++index)
+        for (std::size_t index = 0u; index < targets.size(); ++index)
         {
-            if (!participants[index].validAt(index) ||
-                participants[index].tier_index < 0 ||
+            if (!targets[index].validAt(index) ||
+                targets[index].tier_index < 0 ||
                 static_cast<std::uint32_t>(
-                    participants[index].tier_index) >=
+                    targets[index].tier_index) >=
                     economy->tier_count)
                 return false;
         }
+        for (std::size_t vertex = 0u; vertex < targets.size(); ++vertex)
+            for (std::size_t previous = 0u; previous < vertex; ++previous)
+                if (targets[vertex].target.word() == targets[previous].target.word()) return false;
         const std::size_t expected =
-            participants.size() * static_cast<std::size_t>(num_layers) *
+            targets.size() * static_cast<std::size_t>(num_layers) *
             static_cast<std::size_t>(num_experts);
         return collected_state.size() == expected &&
+               selected_demand.size() == static_cast<std::size_t>(num_layers) * num_experts &&
                std::all_of(
                    payload_bytes_per_layer.begin(),
                    payload_bytes_per_layer.end(),
@@ -735,7 +746,7 @@ namespace llaminar2
         }
 
         MoEOverlayDevicePlacementPolicyPlan plan;
-        plan.candidate_owner.assign(
+        plan.candidate_vertex.assign(
             static_cast<std::size_t>(input.num_layers) * input.num_experts,
             -1);
         const auto priorities = priorityOrder(input);
@@ -757,17 +768,15 @@ namespace llaminar2
                  expert < input.num_experts;
                  ++expert)
             {
+                counts[expert] = input.selected_demand[ownerOffset(input, layer, expert)];
                 std::uint32_t owner_count = 0u;
                 for (std::uint32_t participant = 0u;
-                     participant < input.participants.size();
+                     participant < input.targets.size();
                      ++participant)
                 {
                     const std::uint64_t word = input.collected_state[
                         stateOffset(input, participant, layer, expert)];
-                    counts[expert] = saturatingAdd(
-                        counts[expert],
-                        moe_rebalance_policy::collectedStateActivationCount(
-                            word));
+
                     if (moe_rebalance_policy::
                             collectedStateAuthoritativeOwner(word))
                     {
@@ -787,7 +796,7 @@ namespace llaminar2
                         "ExpertOverlay snapshot must publish exactly one durable owner per expert");
                 }
                 observations = saturatingAdd(observations, counts[expert]);
-                plan.candidate_owner[ownerOffset(input, layer, expert)] =
+                plan.candidate_vertex[ownerOffset(input, layer, expert)] =
                     current[expert];
             }
             plan.evidence.snapshot_observations = saturatingAdd(
@@ -861,7 +870,7 @@ namespace llaminar2
                         current,
                         desired,
                         enumerated,
-                        input.participants.size());
+                        input.targets.size());
                     if (cycle.empty())
                         break;
                     for (const std::uint32_t expert : cycle)
@@ -978,12 +987,16 @@ namespace llaminar2
                     working_score.same_priority_makespan;
                 axis_progress.observe(
                     advances_priority, advances_participant);
-                const auto movement_axis =
-                    advances_priority && advances_participant
-                        ? MoEOverlayDeviceMovementAxis::Combined
-                        : (advances_priority
-                               ? MoEOverlayDeviceMovementAxis::TierResidency
-                               : MoEOverlayDeviceMovementAxis::ParticipantPlacement);
+                bool crosses_tier = false, stays_in_tier = false;
+                for (const auto expert : best_cycle)
+                {
+                    const bool same = input.targets[current[expert]].tier_index == input.targets[desired[expert]].tier_index;
+                    crosses_tier = crosses_tier || !same;
+                    stays_in_tier = stays_in_tier || same;
+                }
+                const auto movement_axis = crosses_tier
+                    ? (stays_in_tier ? MoEOverlayDeviceMovementAxis::Combined : MoEOverlayDeviceMovementAxis::TierResidency)
+                    : MoEOverlayDeviceMovementAxis::ParticipantPlacement;
 
                 for (const std::uint32_t expert : best_cycle)
                 {
@@ -996,8 +1009,8 @@ namespace llaminar2
                             MoEOverlayDeviceMovementOp::DurableMove),
                         .layer = layer,
                         .expert = expert,
-                        .source_participant = source,
-                        .destination_participant = destination,
+                        .source_target = input.targets[source].target,
+                        .destination_target = input.targets[destination].target,
                         .flags = moeOverlayMovementFlags(
                             movement_axis, plan.evidence.accepted_cycles + 1u),
                         .payload_bytes =
@@ -1006,16 +1019,16 @@ namespace llaminar2
                         .candidate_epoch = input.base_epoch + 1u,
                     });
                     const auto source_priority =
-                        input.participants[source].tier_priority;
+                        input.targets[source].tier_priority;
                     const auto destination_priority =
-                        input.participants[destination].tier_priority;
+                        input.targets[destination].tier_priority;
                     if (destination_priority < source_priority)
                         ++plan.evidence.promotions;
                     else if (destination_priority > source_priority)
                         ++plan.evidence.demotions;
                     else
                         ++plan.evidence.same_priority_moves;
-                    plan.candidate_owner[ownerOffset(input, layer, expert)] =
+                    plan.candidate_vertex[ownerOffset(input, layer, expert)] =
                         static_cast<std::int32_t>(destination);
                 }
                 current = std::move(candidate);
@@ -1065,11 +1078,11 @@ namespace llaminar2
             plan.commands.begin(), plan.commands.end(),
             [](const auto &left, const auto &right)
             {
-                if (left.destination_participant !=
-                    right.destination_participant)
+                if (left.destination_target.word() !=
+                    right.destination_target.word())
                 {
-                    return left.destination_participant <
-                           right.destination_participant;
+                    return left.destination_target.word() <
+                           right.destination_target.word();
                 }
                 if (left.layer != right.layer)
                     return left.layer < right.layer;
