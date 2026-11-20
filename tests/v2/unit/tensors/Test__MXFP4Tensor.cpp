@@ -318,6 +318,53 @@ TEST(MXFP4ScaleCarrier, StagedWordsDecodeExactlyAndFP16CallbacksAreUntouched)
     EXPECT_EQ(calls, 6);
 }
 
+/**
+ * @test The batched load-time screen reports exactly the first block a per-block scan rejects.
+ *
+ * Every exponent byte, zero and nonzero codes, every position inside and
+ * across the eight-block groups and the scalar tail, and runs with a second
+ * rejected block behind the first.
+ */
+TEST(MXFP4Format, BatchedNativeE8M0ScreenMatchesThePerBlockScan)
+{
+    constexpr std::size_t kBlock = mxfp4::kSourceBlockBytes;
+    const auto reference = [](const std::vector<uint8_t> &bytes)
+    {
+        for (std::size_t offset = 0; offset + kBlock <= bytes.size(); offset += kBlock)
+            if (!mxfp4::blockFitsNativeE8M0(bytes[offset], bytes.data() + offset + 1))
+                return offset;
+        return bytes.size() / kBlock * kBlock;
+    };
+    for (const std::size_t blocks : {std::size_t{0}, std::size_t{1}, std::size_t{7}, std::size_t{8},
+                                     std::size_t{9}, std::size_t{37}})
+        for (int exponent = 0; exponent < 256; ++exponent)
+            for (const bool zero_codes : {false, true})
+                for (std::size_t position = 0; position < std::max<std::size_t>(blocks, 1); ++position)
+                {
+                    std::vector<uint8_t> bytes(blocks * kBlock);
+                    for (std::size_t block = 0; block < blocks; ++block)
+                    {
+                        bytes[block * kBlock] = static_cast<uint8_t>(2 + (block * 37) % 251);
+                        for (std::size_t i = 1; i < kBlock; ++i)
+                            bytes[block * kBlock + i] = static_cast<uint8_t>(0x31 + block + i);
+                    }
+                    if (blocks)
+                    {
+                        bytes[position * kBlock] = static_cast<uint8_t>(exponent);
+                        for (std::size_t i = 1; i < kBlock; ++i)
+                            bytes[position * kBlock + i] = zero_codes ? (i % 2 ? 0x88 : 0x08) : 0x5a;
+                        if (position + 3 < blocks)
+                            bytes[(position + 3) * kBlock] = 255; // a later rejection must not win
+                    }
+                    ASSERT_EQ(mxfp4::firstInadmissibleNativeE8M0Block(bytes.data(), bytes.size()), reference(bytes))
+                        << "blocks=" << blocks << " e=" << exponent << " zero=" << zero_codes << " position=" << position;
+                    // A trailing partial block is never inspected.
+                    bytes.push_back(255);
+                    ASSERT_EQ(mxfp4::firstInadmissibleNativeE8M0Block(bytes.data(), bytes.size()),
+                              reference(std::vector<uint8_t>(bytes.begin(), bytes.end() - 1)));
+                }
+}
+
 TEST(MXFP4Format, CatalogAndRepackIdentity)
 {
     const auto *format = native_quantised_formats::forQuantType("MXFP4");
