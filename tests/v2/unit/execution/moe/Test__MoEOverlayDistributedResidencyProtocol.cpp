@@ -526,6 +526,70 @@ namespace llaminar2::test
         EXPECT_NE(error.find("GPU"), std::string::npos);
     }
 
+    /**
+     * @test An MXFP4 GPU blob carries one native E8M0 byte per block.
+     *
+     * The manifest, its GPU intersections and per-region wire ranges must use
+     * the canonical one-byte primary plane; a halfword plane is rejected.
+     */
+    TEST(
+        Test__MoEOverlayDistributedResidencyProtocol,
+        RemoteGpuBlobManifestCarriesTheOneBytePrimaryPlaneOfMXFP4)
+    {
+        auto fixture = makeTransaction();
+        const auto identity = remoteProjectionIdentity(
+            fixture.transaction, DeviceId::cuda(1), DeviceId::rocm(0));
+        const NativeQuantisedSourceIdentity source_identity{
+            .codebook_id = native_quantised_formats::MXFP4.codebook_id,
+            .is_superblock = native_quantised_formats::MXFP4.is_superblock,
+            .present = true,
+        };
+        std::array<std::uint8_t, 1> byte{};
+        constexpr std::size_t blocks = 32u * 3u;
+        const GpuExpertPackedDescriptor normalized{
+            .ptrs = {
+                .d_vnni = byte.data(),
+                .d_scales = byte.data(),
+            },
+            .n = 32,
+            .k = 96,
+            .blocks_per_row = 3,
+            .codebook_id = kNativeQuantisedMXFP4Codebook,
+            .payload_bytes_per_block = 16,
+            .is_asymmetric = false,
+            .has_emins = false,
+            .vnni_bytes = blocks * 16u,
+            .scales_bytes = blocks,
+        };
+        const auto manifest = makeMoEOverlayRemoteGpuProjectionManifest(
+            identity, normalized, source_identity, 256);
+        std::string error;
+        ASSERT_TRUE(manifest.valid(&error)) << error;
+        EXPECT_EQ(manifest.gpu_codebook_id, kNativeQuantisedMXFP4Codebook);
+        EXPECT_EQ(manifest.region_bytes,
+                  (std::array<std::uint64_t, 4>{blocks * 16u, blocks, 0u, 0u}));
+
+        const auto whole = manifest.source_projection;
+        auto part = whole;
+        part.first_column += 32;
+        part.columns = 64;
+        const auto selected = ExpertTierWeightProjectionIntersection::between(whole, part);
+        const auto narrowed = manifest.forGPUIntersection(selected);
+        ASSERT_TRUE(narrowed.valid(&error)) << error;
+        EXPECT_EQ(narrowed.region_bytes,
+                  (std::array<std::uint64_t, 4>{32u * 2u * 16u, 32u * 2u, 0u, 0u}));
+        for (std::size_t region : {std::size_t{0}, std::size_t{1}})
+        {
+            const auto range = narrowed.gpuRegionRange(region, 0, narrowed.region_bytes[region]);
+            ASSERT_TRUE(range.has_value()) << region;
+        }
+
+        auto halfword = manifest;
+        halfword.region_bytes[1] = blocks * sizeof(std::uint16_t);
+        halfword.manifest_hash = halfword.computedHash();
+        EXPECT_FALSE(halfword.valid(&error));
+    }
+
     TEST(
         Test__MoEOverlayDistributedResidencyProtocol,
         RemoteFloatingManifestAuthenticatesEveryEndpointPairAndRawBytes)
