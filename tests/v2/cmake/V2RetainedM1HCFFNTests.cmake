@@ -210,6 +210,17 @@ if(TARGET v2_integration_moe_intermediate_ffn_finalization)
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedM4SourceCountedReplay_ROCm)
     endif()
 
+    # MXFP4 one-byte E8M0 planes through every grouped source role.
+    add_v2_test(V2_Integration_GroupedM4MXFP4Replay_ROCm
+        COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
+            --gtest_filter=OriginalSources/GroupedM4Source.Static/MXFP4_routed_gate_up:OriginalSources/GroupedM4Source.Deferred/MXFP4_routed_down:OriginalSources/GroupedM4Source.Static/MXFP4_shared_gate_up:OriginalSources/GroupedM4Source.Deferred/MXFP4_shared_down:OriginalSources/GroupedM6Family.Static/G04_MXFP4:OriginalSources/GroupedM6Family.Deferred/G05_MXFP4_SharedQ8_0
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MoE;MXFP4;GraphCapture;Replay;ByteExact;GeneratedSource;Regression;Devices1;HardwareOptional;NativeISA-gfx906"
+        MPI_PROCS ${V2_TEST_SOCKETS} NO_MODELS TIMEOUT 120
+        ENVIRONMENT ${grouped_m4_all_formats_env})
+    if(TEST V2_Integration_GroupedM4MXFP4Replay_ROCm)
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_GroupedM4MXFP4Replay_ROCm)
+    endif()
+
     add_v2_test(V2_Integration_GroupedM6SourceCountedReplay_ROCm
         COMMAND $<TARGET_FILE:v2_integration_moe_intermediate_ffn_finalization>
             --gtest_filter=GroupedM6Source.CountedReplay

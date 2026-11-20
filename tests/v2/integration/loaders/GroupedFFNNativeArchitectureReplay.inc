@@ -34,7 +34,8 @@ const auto architectureCases=[](GroupedFFNFixtureSchedule schedule) {
     return std::array{
         GroupedFFNArchitectureCase{"Q4_Q51_F128_M4_Static","Q4_K_Q5_1_Down_F128",schedule,4,false},
         GroupedFFNArchitectureCase{"Q4_Q51_F256_M6_Deferred","Q4_K_Q5_1_Down_F256",schedule,6,true},
-        GroupedFFNArchitectureCase{"G15_M6_Deferred","G15_IQ3_XXS_wide_direct_tiles",schedule,6,true}};
+        GroupedFFNArchitectureCase{"G15_M6_Deferred","G15_IQ3_XXS_wide_direct_tiles",schedule,6,true},
+        GroupedFFNArchitectureCase{"MXFP4_G05_M4_Deferred","G05_MXFP4_SharedQ8_0",schedule,4,true}};
 };
 const auto architectureCaseName=[](const auto& info){return info.param.label;};
 

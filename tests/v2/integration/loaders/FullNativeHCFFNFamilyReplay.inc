@@ -21,13 +21,15 @@ struct FullNativeHCFFNFamilyCase {
     const char* shared_down = nullptr; ///< Independently encoded original shared down projection when it differs.
 };
 /** @return Genuine source recipes covering each compiled union without padding K. */
-std::array<FullNativeHCFFNFamilyCase, 15> fullNativeHCFFNFamilyCases() {
+std::array<FullNativeHCFFNFamilyCase, 18> fullNativeHCFFNFamilyCases() {
     return {{
         {1,"G01_Q4_K_DownQ5_1_SharedQ8_0","Q4_K","Q5_1","Q8_0"},
         {2,"G02_Q4_0","Q4_0","Q4_0","Q4_0"},
         {3,"G03_Q4_0_SharedQ8_0","Q4_0","Q4_0","Q8_0"},
         {4,"G04_IQ4_NL","IQ4_NL","IQ4_NL","IQ4_NL"},
+        {4,"G04_MXFP4","MXFP4","MXFP4","MXFP4"},
         {5,"G05_IQ4_NL_SharedQ8_0","IQ4_NL","IQ4_NL","Q8_0"},
+        {5,"G05_MXFP4_SharedQ8_0","MXFP4","MXFP4","Q8_0"},
         {6,"G06_IQ4_NL_DownQ4_0_SharedQ4_0","IQ4_NL","Q4_0","Q4_0"},
         {7,"G07_IQ4_NL_DownQ4_0_SharedQ8_0","IQ4_NL","Q4_0","Q8_0"},
         {8,"G08_IQ2_S","IQ2_S","IQ2_S","IQ2_S"},
@@ -37,6 +39,8 @@ std::array<FullNativeHCFFNFamilyCase, 15> fullNativeHCFFNFamilyCases() {
         {12,"G12_IQ3_S_DownIQ2_S_SharedIQ4_NL","IQ3_S","IQ2_S","IQ4_NL"},
         {13,"G13_IQ3_XXS_DownQ5_1_SharedIQ2_S","IQ3_XXS","Q5_1","IQ2_S"},
         {14,"G14_IQ3_S_DownQ6_K_SharedIQ2_S","IQ3_S","Q6_K","IQ2_S"},
+        // Family 14 omits MXFP4, so these groups with MXFP4 compile as the complete union.
+        {15,"G15_MXFP4_DownQ6_K_SharedIQ2_S","MXFP4","Q6_K","IQ2_S"},
         {15,"G15_IQ3_XXS_DownQ6_K_SharedIQ2_S_DownQ8_0","IQ3_XXS","Q6_K","IQ2_S","Q8_0"}
     }};
 }
