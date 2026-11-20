@@ -650,6 +650,28 @@ class DevelopImageGateTests(unittest.TestCase):
                     else:
                         os.killpg(child_pid, signal.SIGKILL)
 
+    def test_ci_replaces_the_step_shell_with_the_cancellable_driver(self):
+        """The selected CI steps deliver cancellation directly to the image gate."""
+        workflows = ROOT / ".github/workflows"
+        driver = "python3 scripts/ci/run_develop_image_gate.py"
+        for workflow, job in (
+            ("develop-pr-tests.yml", "unit"),
+            ("develop-image-isa.yml", "runtime"),
+            ("ci.yml", "publish"),
+        ):
+            with self.subTest(workflow=workflow, job=job):
+                policy = yaml.load((workflows / workflow).read_text(), Loader=yaml.BaseLoader)
+                commands = [
+                    step["run"]
+                    for step in policy["jobs"][job]["steps"]
+                    if driver in step.get("run", "")
+                ]
+                self.assertEqual(len(commands), 1)
+                self.assertTrue(
+                    any(line.startswith(f"exec {driver} ") for line in commands[0].splitlines()),
+                    "the image gate must replace its step shell",
+                )
+
     def test_ci_stages_each_isa_after_its_own_toolchain_job(self):
         workflow = (ROOT / ".github/workflows/ci.yml").read_text()
         self.assertIn("exec python3 scripts/ci/run_develop_image_gate.py", workflow)
