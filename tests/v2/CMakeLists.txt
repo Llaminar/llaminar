@@ -24240,6 +24240,20 @@ if(HAVE_CUDA OR HAVE_ROCM)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDANoPeerGPUExpertBlobTransfer)
         endif()
     endif()
+    # MXFP4 GPU roots with a one-byte primary plane pass both real remote
+    # projection endpoint admissions; a halfword-plane root is rejected.
+    foreach(_mxfp4_remote_backend CUDA ROCm)
+        if((_mxfp4_remote_backend STREQUAL "CUDA" AND HAVE_CUDA) OR (_mxfp4_remote_backend STREQUAL "ROCm" AND HAVE_ROCM))
+            add_v2_test(V2_Integration_MXFP4RemoteGpuEndpointAdmission_${_mxfp4_remote_backend}
+                COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
+                    --gtest_filter=ExpertTierGpuBlobTransferIntegration.${_mxfp4_remote_backend}AdmitsMXFP4RemoteGpuRootsWithOneBytePrimaryPlane
+                LABELS "V2;Integration;ProductionTestPreflight;HardwareOptional;Devices1;${_mxfp4_remote_backend};MoE;ExpertOverlay;MXFP4;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 60)
+            if(TEST V2_Integration_MXFP4RemoteGpuEndpointAdmission_${_mxfp4_remote_backend})
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MXFP4RemoteGpuEndpointAdmission_${_mxfp4_remote_backend})
+            endif()
+        endif()
+    endforeach()
     add_v2_test(V2_Integration_MappedTransferProgressEpoch
         COMMAND $<TARGET_FILE:v2_unit_gpu_expert_transfer>
                 --gtest_filter=MappedTransferProgressEpochIntegration.*
