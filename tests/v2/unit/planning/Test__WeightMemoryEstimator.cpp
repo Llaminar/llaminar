@@ -230,8 +230,8 @@ namespace
             {"IQ3_S", 17.0f / 32.0f},
             {"IQ1_S", 10.0f / 32.0f},
             {"IQ1_M", 10.0f / 32.0f},
-            // 16 code bytes plus the prepared FP16 block scale.
-            {"MXFP4", 18.0f / 32.0f},
+            // 16 code bytes plus the native E8M0 block scale byte.
+            {"MXFP4", 17.0f / 32.0f},
         };
         return formats;
     }
