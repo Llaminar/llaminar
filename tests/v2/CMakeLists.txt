@@ -948,9 +948,18 @@ function(discover_v2_parity_tests TARGET)
         # Selecting preflight still fails through the original guardian;
         # successful POST_BUILD discovery replaces this sentinel include.
         set(_fallback_stem "${CMAKE_CURRENT_BINARY_DIR}/${TARGET}_undiscovered")
-        set(_fallback_default "${CMAKE_BUILD_TYPE}")
-        if(CMAKE_CONFIGURATION_TYPES)
+        # file(GENERATE) materializes _undiscovered_$<CONFIG> for the active
+        # configuration only: a single-config generator writes exactly
+        # CMAKE_BUILD_TYPE, while a true multi-config generator writes every
+        # configuration. The unqualified CTest fallback below must name the
+        # file that actually exists, so a forced CMAKE_CONFIGURATION_TYPES
+        # cache entry never displaces the selected build type.
+        if(CMAKE_BUILD_TYPE)
+            set(_fallback_default "${CMAKE_BUILD_TYPE}")
+        elseif(CMAKE_CONFIGURATION_TYPES)
             list(GET CMAKE_CONFIGURATION_TYPES 0 _fallback_default)
+        else()
+            set(_fallback_default "")
         endif()
         string(SHA256 _missing_session "${TARGET}:native-discovery-required")
         set(_missing_session "${CMAKE_CURRENT_BINARY_DIR}/mpi-sessions/parity/${_missing_session}")
