@@ -1,6 +1,9 @@
 /** @file LMHeadStage.cpp
- * @brief Implementation of LMHeadStage
- * Verifier scopes borrow device counts; adapters retain physical scratch and exact stream ordering.
+ * @brief Original LM-head execution, row materialization and serial arithmetic ownership.
+ * Identity layouts borrow their explicit device counts. Compact all-position
+ * inputs are already fully written and bind fixed rows, independent of enclosing
+ * verifier prefixes. Original operation scopes retain input/prepared/output
+ * identity before backend subgrouping; no live count is read on the host.
  */
 
 #include "LMHeadStage.h"
@@ -11,6 +14,7 @@
 #include "../../../utils/GemmContext.h"
 #include "../../../utils/PerfStatsCollector.h"
 #include "../../../loaders/PreparedWeightStore.h"
+#include "kernels/common/VerifierProjectionBundle.h"
 
 #include <algorithm>
 
@@ -216,7 +220,21 @@ namespace llaminar2
 
         std::vector<ITensorGemm::TensorProjectionDesc> projections = {
             {lm_gemm, logits, params_.vocab_size, params_.bias_tensor, "lm_head"}};
-        auto verifier_rows = lm_gemm->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
+        auto original_rows = params_.verifier_row_range;
+        const bool materialized = params_.compute_all_positions &&
+            !params_.use_prefill_replay_row_offset && !original_rows;
+        // Selection writes every compact destination, including clamped indices.
+        // Inheriting the source request's count here would change that row domain.
+        if (materialized) original_rows = DeviceRowRange::fullyActive(lm_m);
+        auto verifier_rows = lm_gemm->beginVerifierDecodeEquivalentScope(original_rows);
+        std::optional<VerifierProjectionBundleBinding> operation;
+        if (materialized && params_.serial_equivalent_partition_width == 0)
+            operation = VerifierProjectionBundleBinding::bind(
+                VerifierProjectionBundleKind::MaterializedLMHead, params_.device_id,
+                hidden_states, *original_rows, params_.d_model, projections);
+        // Unmeasured heads hide any enclosing operation; they cannot acquire a
+        // parent's fused-source identity by becoming a singleton backend call.
+        const ScopedVerifierProjectionBundle original_operation(std::move(operation));
         const bool success = lm_gemm->multiply_fused_verifier_rows_decode_equivalent(
             hidden_states,
             projections,

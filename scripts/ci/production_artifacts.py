@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+## @file production_artifacts.py
+#  @brief Validate production CI evidence and observed native hardware contracts.
 """Shared, fail-closed identities for production CI artifacts.
 
 Certificates describe one immutable build and one canonical cell inventory.
@@ -91,8 +93,13 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
             or locality not in ("local-host", "original-numa-local-rank", "two-distinct-numa-local-ranks")
             or (locality == "two-distinct-numa-local-ranks" and degree != 2 and "rank_sizes" not in requirement)):
         raise ValueError("unsupported optional preflight geometry")
+    if "native_isa" in requirement:
+        isa = requirement["native_isa"]
+        syntax = r"gfx[0-9][0-9a-f]*" if backend == "rocm" else r"sm_?[0-9]+[a-z]?"
+        if not isinstance(isa, str) or re.fullmatch(syntax, isa) is None:
+            raise ValueError("invalid optional preflight native ISA")
     if "ordinal" in requirement:
-        if (set(requirement) != required | {"ordinal"} or locality != "original-numa-local-rank"
+        if (not set(requirement) <= required | {"ordinal", "native_isa"} or locality != "original-numa-local-rank"
                 or type(requirement["ordinal"]) is not int or requirement["ordinal"] != 0 or degree != 1):
             raise ValueError("invalid native bootstrap ordinal requirement")
         return
@@ -110,11 +117,6 @@ def validate_optional_native_cohort_requirement(requirement: dict) -> None:
                 or requirement["capacity_basis"] not in ("free", "total")):
             raise ValueError("invalid maximum-context physical requirement")
         return
-    if "native_isa" in requirement:
-        isa = requirement["native_isa"]
-        syntax = r"gfx[0-9][0-9a-f]*" if backend == "rocm" else r"sm_?[0-9]+[a-z]?"
-        if not isinstance(isa, str) or re.fullmatch(syntax, isa) is None:
-            raise ValueError("invalid optional preflight native ISA")
     if locality == "local-host" and not set(requirement) <= required | {"native_isa"}:
         raise ValueError("local device counts cannot replace a topology contract")
     if "peer_access" in requirement:
@@ -236,15 +238,25 @@ def optional_native_cohort_absence(requirement: dict, hardware: dict) -> dict | 
                 "unknown_locality_ordinals": {backend: sorted(ordinals) for backend, ordinals in unknown.items()}}
     backend, degree, locality = (requirement[key] for key in ("backend", "degree", "locality"))
     if "ordinal" in requirement:
-        # The command pins ordinal zero before bootstrap. Another visible
-        # card with a known locality cannot supply its missing owner.
-        device = observed.get((backend, requirement["ordinal"], -1))
+        # A fixture that pins ordinal zero requires its actual locality and ISA.
+        # A visible peer cannot supply either fact for that original address.
+        device = observed.get((backend, requirement["ordinal"], -1), {})
         cpu_nodes = {device["numa_node"] for address, device in observed.items()
                      if address[0] == "cpu" and device["numa_node"] >= 0}
-        if device and device["numa_node"] in cpu_nodes:
+        required_isa = requirement.get("native_isa")
+        observed_isa = None
+        if required_isa is not None and device:
+            native_target = device.get("native_isa")
+            if not isinstance(native_target, str) or not native_target:
+                raise ValueError("missing original ordinal native ISA observation")
+            observed_isa = native_target.partition(":")[0]
+        if device.get("numa_node") in cpu_nodes and (required_isa is None or observed_isa == required_isa):
             return None
-        return {**absence, "observed_ordinal_numa": device["numa_node"] if device else None,
-                "observed_cpu_discovery_nodes": sorted(cpu_nodes)}
+        absence.update(observed_ordinal_numa=device.get("numa_node"),
+                       observed_cpu_discovery_nodes=sorted(cpu_nodes))
+        if required_isa is not None:
+            absence["observed_ordinal_native_isa"] = observed_isa
+        return absence
     if "stage_sizes" in requirement and "native_isa" in requirement:
         # This is the same observed selector used for QFN source qualification.
         # The request has no invented addresses; runtime still binds the exact

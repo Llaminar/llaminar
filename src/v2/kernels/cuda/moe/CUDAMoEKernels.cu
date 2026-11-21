@@ -25924,8 +25924,8 @@ namespace llaminar2::cuda
         const auto native_stream = static_cast<cudaStream_t>(stream);
         if (launch.format == MoERouterPreparedFormat::BlockQ8)
         {
-            // Publish every local expert input in its original basis, including
-            // empty owners. Only this participant's logits/top-k are computed.
+            // Expert consumers borrow every live local input, even if this
+            // participant owns no logits or top-k rows.
             const dim3 quant_grid(launch.width / 32, launch.capacity);
             if (rows > 0 && launch.q8_basis == RouterQ8Basis::SignedHadamard32)
             {
@@ -25935,7 +25935,8 @@ namespace llaminar2::cuda
             else
             {
                 grouped_hidden_quantize_blockwise_rows_kernel<<<quant_grid, 32, 0, native_stream>>>(
-                    launch.hidden, launch.hidden_q8, launch.hidden_scales, launch.capacity, launch.width);
+                    launch.hidden, launch.hidden_q8, launch.hidden_scales, launch.capacity,
+                    launch.width, launch.live_rows);
                 if (!finishLaunch("cudaMoE_owned_q8_hidden")) return false;
             }
             if (rows > 0)
@@ -25950,7 +25951,8 @@ namespace llaminar2::cuda
                 if (launch.q8_basis == RouterQ8Basis::SignedHadamard32)
                 {
                     grouped_hidden_quantize_blockwise_rows_kernel<<<quant_grid, 32, 0, native_stream>>>(
-                        launch.hidden, launch.hidden_q8, launch.hidden_scales, launch.capacity, launch.width);
+                        launch.hidden, launch.hidden_q8, launch.hidden_scales, launch.capacity,
+                        launch.width, launch.live_rows);
                     if (!finishLaunch("cudaMoE_owned_q8_original_publication")) return false;
                 }
             }

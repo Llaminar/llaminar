@@ -262,6 +262,7 @@ namespace llaminar2
             ForwardExecutionRole::MainInference; ///< Mathematical owner embedded by this graph.
         ForwardStateTransaction state_transaction =
             ForwardStateTransaction::Ordinary; ///< Persistent-state topology embedded by this graph.
+        CapturedVerifierExtent captured_verifier_extent; ///< Exact hosted width is semantic graph identity, never a live count.
         bool decode = false;
         SparseQueryExecutionProgram sparse_query_execution_program = SparseQueryExecutionProgram::RankingPossible; ///< Exact captured query topology.
         bool decode_has_history = false; ///< True for decode calls that already have KV/GDN history.
@@ -322,6 +323,7 @@ namespace llaminar2
                    device == other.device &&
                    execution_role == other.execution_role &&
                    state_transaction == other.state_transaction &&
+                   captured_verifier_extent == other.captured_verifier_extent &&
                    decode == other.decode &&
                    sparse_query_execution_program == other.sparse_query_execution_program &&
                    decode_has_history == other.decode_has_history &&
@@ -617,6 +619,7 @@ namespace llaminar2
             h ^= (std::hash<uint8_t>{}(
                       static_cast<uint8_t>(sig.state_transaction)) +
                   0x9e3779b9 + (h << 6) + (h >> 2));
+            h ^= (sig.captured_verifier_extent.captureHash() + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<bool>{}(sig.decode) + 0x9e3779b9 + (h << 6) + (h >> 2));
             h ^= (std::hash<int>{}(static_cast<int>(sig.sparse_query_execution_program)) +
                   0x9e3779b9 + (h << 6) + (h >> 2));

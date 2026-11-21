@@ -1115,6 +1115,8 @@ extern "C"
         int num_experts, int max_active_experts,
         int device_idx, void *stream);
 
+    bool hipMoE_build_active_expert_list_with_offset_slots(const llaminar2::MoEGroupingPackedDirectory &binding);
+
     bool hipMoE_max_expert_count(
         const int *expert_counts, int *d_max_out,
         int num_experts,
@@ -1550,69 +1552,70 @@ namespace
         return text;
     }
 
-    /**
-     * @brief Describe the joint policy embedded in one grouped-prefill graph.
-     *
-     * This query has the complete exact-overlay key and therefore cannot report
-     * a generic role geometry while production executes a model-specific pair.
-     * Mixed descriptor tables continue to launch one generated generic policy
-     * per execution codebook and are explicitly reported as mixed. A missing
-     * uniform policy is an internal invariant violation: the launch must already
-     * have failed rather than publishing misleading telemetry.
-     */
-    MoEPrefillPairPolicyTags queryMoEPrefillPairPolicyTags(
-        uint32_t gateup_codebook_mask,
-        uint32_t down_codebook_mask,
-        int seq_len,
-        int hidden_size,
-        int expert_width,
-        int expert_count,
-        int top_k,
-        llaminar2::MoEPrefillMeasuredOperation operation)
+    /** @param engine Actual submitted policy. @return Stable capture-policy name. */
+    const char *groupedEngineTag(llaminar2::rocm::MoEGroupedPrefillEngine engine)
     {
-        if (seq_len <= 8)
-            return {{"1", "64"}, {"1", "64"}, "direct"};
-
-        const int gateup_codebook =
-            singleCodebookFromMask(gateup_codebook_mask);
-        const int down_codebook = singleCodebookFromMask(down_codebook_mask);
-        if (gateup_codebook < 0 || down_codebook < 0)
+        using enum llaminar2::rocm::MoEGroupedPrefillEngine;
+        switch (engine)
         {
-            return {
-                {"mixed", "mixed"},
-                {"mixed", "mixed"},
-                "generic_mixed_codebooks"};
+        case OrderedDot4: return "dot4";
+        case WmmaM16N32: return "wmma_n32";
+        case WmmaM16N64: return "wmma_n64";
+        case WideDot4Wmma: return "wide_dot4_wmma";
+        case PopulationAdaptive: return "device_population_v1";
+        case Automatic: break;
         }
+        throw std::logic_error("unresolved grouped engine in completed submission");
+    }
 
-        int gateup_tile_m = 0;
-        int gateup_tile_n = 0;
-        int down_tile_m = 0;
-        int down_tile_n = 0;
-        int exact_overlay = 0;
-        if (!rocmMoE_grouped_prefill_query_production_pair_config_for_operation(
-                operation,
-                static_cast<uint8_t>(gateup_codebook),
-                static_cast<uint8_t>(down_codebook),
-                seq_len,
-                hidden_size,
-                expert_width,
-                expert_count,
-                top_k,
-                &gateup_tile_m,
-                &gateup_tile_n,
-                &down_tile_m,
-                &down_tile_n,
-                &exact_overlay))
+    /** @param role Exact successfully submitted tiled geometries.
+     * @return Diagnostic roster of columns, rows, threads, ordered rows, floor and leaf count. */
+    std::string groupedTileRoster(const llaminar2::rocm::MoEGroupedPrefillRoleSubmission &role)
+    {
+        std::string result;
+        for (size_t i = 0; i < role.size; ++i)
         {
-            return {
-                {"missing", "missing"},
-                {"missing", "missing"},
-                "missing"};
+            const auto &tile = role.tiles[i];
+            if (!result.empty()) result += ';';
+            result += std::string(groupedEngineTag(tile.engine)) + ":" + std::to_string(tile.rows) + "x" +
+                std::to_string(tile.columns) + "/threads=" + std::to_string(tile.threads) +
+                "/ordered_rows=" + std::to_string(tile.ordered_rows) +
+                "/ordered_columns=" + std::to_string(tile.ordered_columns) +
+                "/floor=" + std::to_string(static_cast<int>(tile.floor)) + "/leaves=" + std::to_string(tile.count);
         }
-        return {
-            {std::to_string(gateup_tile_m), std::to_string(gateup_tile_n)},
-            {std::to_string(down_tile_m), std::to_string(down_tile_n)},
-            exact_overlay != 0 ? "exact_overlay" : "generic"};
+        return result.empty() ? "none" : result;
+    }
+
+    /** @param role Accepted tiled leaves. @param route_owned Whether the direct family was submitted.
+     * @return Retained route families; never a claim about the live replay choice. */
+    std::string groupedRouteRoster(const llaminar2::rocm::MoEGroupedPrefillRoleSubmission &role, bool route_owned)
+    {
+        if (role.size) return route_owned ? "device_route_owned_or_expert_tiled" : "expert_tiled";
+        return route_owned ? "route_owned" : "not_submitted";
+    }
+
+    /** @param submitted Completed low-level construction receipt.
+     * @return Geometry tags from actual submissions, with mixed families represented explicitly. */
+    MoEPrefillPairPolicyTags submittedMoEPrefillPairPolicyTags(
+        const llaminar2::rocm::MoEGroupedPrefillSubmission &submitted)
+    {
+        using Receipt = llaminar2::rocm::MoEGroupedPrefillSubmission;
+        if (submitted.state != Receipt::State::Complete)
+            throw std::logic_error("grouped telemetry requires a successful submission receipt");
+        const auto role_tags = [](const auto &role, bool route_owned) -> MoEPrefillPolicyTags {
+            if (role.size == 0) return {route_owned ? "route_owned" : "none",route_owned ? "route_owned" : "none"};
+            if (role.size != 1) return {"mixed","mixed"};
+            const auto &tile = role.tiles[0];
+            return {tile.ordered_rows ? std::to_string(tile.ordered_rows) + "/" + std::to_string(tile.rows)
+                                      : std::to_string(tile.rows),
+                    tile.ordered_columns ? std::to_string(tile.ordered_columns) + "/" + std::to_string(tile.columns)
+                                         : std::to_string(tile.columns)};
+        };
+        return {role_tags(submitted.gateup,submitted.gateup_route_owned),
+                role_tags(submitted.down,submitted.down_route_owned),
+                submitted.policy.engine == llaminar2::rocm::MoEGroupedPrefillEngine::OrderedDot4
+                    ? (submitted.exact_ordered_overlay ? "exact_overlay" : "generic")
+                    : groupedEngineTag(submitted.policy.engine)};
     }
 
     bool tryGroupedDecodeGateLogits(
@@ -2420,6 +2423,7 @@ namespace llaminar2
         d_prefill_gate_ = nullptr;
         d_prefill_up_ = nullptr;
         d_prefill_work_directory_ = nullptr;
+        d_grouped_population_selection_ = nullptr;
 
         max_write_heads_experts_ = 0;
         staging_capacity_ = 0;
@@ -4120,6 +4124,15 @@ namespace llaminar2
         float *d_grouped_weights)
     {
         grouped_prefill_grouping_.invalidate();
+        return enqueueExpertGrouping(d_routing_indices, d_routing_weights, seq_len, num_experts, top_k,
+            d_expert_offsets, d_expert_counts, d_grouped_token_indices, d_grouped_weights, nullptr);
+    }
+
+    bool ROCmMoEKernel::enqueueExpertGrouping(
+        const int *d_routing_indices, const float *d_routing_weights,
+        int seq_len, int num_experts, int top_k, int *d_expert_offsets, int *d_expert_counts,
+        int *d_grouped_token_indices, float *d_grouped_weights, const MoEGroupingPackedDirectory *packed)
+    {
         ROCM_KERNEL_PROFILE_SCOPE_STREAM(ROCmKernelType::MOE_ROUTE, static_cast<hipStream_t>(getStream()));
 
         if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
@@ -4176,11 +4189,11 @@ namespace llaminar2
             return false;
         }
 
-        if (d_group_active_expert_ids_ &&
-            !hipMoE_build_active_expert_list(
+        if (packed ? !hipMoE_build_active_expert_list_with_offset_slots(*packed) :
+            (d_group_active_expert_ids_ && !hipMoE_build_active_expert_list(
                 d_expert_counts, d_group_active_expert_ids_,
                 num_experts, std::min(total_slots, num_experts),
-                device_ordinal_, getStream()))
+                device_ordinal_, getStream())))
         {
             LOG_ERROR("[ROCmMoEKernel::groupTokensByExpertDevice] active expert list failed");
             return false;
@@ -11114,7 +11127,7 @@ namespace llaminar2
         int seq_len, int num_experts, int top_k)
     {
         auto grouping_publication = grouped_prefill_grouping_.beginAllRoutes();
-        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0)
+        if (seq_len <= 0 || num_experts <= 0 || top_k <= 0 || seq_len > std::numeric_limits<int>::max()/top_k)
             return false;
 
         if (!setMoEDevice(device_ordinal_, "prepareExpertGroupsAsync"))
@@ -11222,6 +11235,24 @@ namespace llaminar2
             total_slots <= 64 &&
             num_experts <= static_cast<int>(kDeviceMoEMaxExperts) &&
             top_k <= 16;
+        if (const auto *original = ScopedMoERoutedTransaction::current())
+        {
+            auto actual = *original;
+            actual.owner = this; actual.indices = routing_indices; actual.weights = routing_weights;
+            actual.rows = seq_len; actual.experts = num_experts; actual.top_k = top_k;
+            actual.stream = stream; actual.workspace = workspace_;
+            ScopedMoERoutedTransaction::requireMatching(actual);
+        }
+        const auto directory_source = rocm::selectedMoEGroupedPrefillPolicy(
+            device_ordinal_, originalRoutedPopulationKey()).directory;
+        std::optional<MoEGroupingPackedDirectory> packed_directory;
+        if (directory_source != rocm::MoEGroupedDirectorySource::RolePlanner)
+        {
+            if ((seq_len != 9 && seq_len != 16) || num_experts != 256 || top_k != 8)
+                throw std::invalid_argument("grouping offset-slot candidate requires physical M9/16, E256, top8");
+            if (!ensureGroupedPrefillWorkDirectoryCapacity(total_slots, num_experts)) return false;
+            packed_directory.emplace(groupingDirectoryBinding(seq_len, top_k, num_experts, directory_source));
+        }
         if (use_small_grouping)
         {
             const int active_expert_slots = std::min(total_slots, num_experts);
@@ -11284,11 +11315,11 @@ namespace llaminar2
         }
 
         // 4. Group tokens by expert (counts, offsets, scatter) — all on device
-        if (!groupTokensByExpertDevice(
+        if (!enqueueExpertGrouping(
                 d_group_int_indices_, d_float_weights,
                 seq_len, num_experts, top_k,
                 d_group_offsets_, d_group_counts_,
-                d_group_token_indices_, d_group_weights_))
+                d_group_token_indices_, d_group_weights_, packed_directory ? &*packed_directory : nullptr))
         {
             LOG_ERROR("[ROCmMoEKernel::prepareExpertGroupsAsync] groupTokensByExpertDevice failed");
             return false;
@@ -11327,7 +11358,7 @@ namespace llaminar2
         // NO D2H copy, NO hipStreamSynchronize — data stays on device
         // for consumption by executeGroupedPrefillPipeline()
 
-        std::move(grouping_publication).publish();
+        std::move(grouping_publication).publish(std::move(packed_directory));
         return true;
     }
 
@@ -11635,9 +11666,9 @@ namespace llaminar2
         return true;
     }
 
-    bool ROCmMoEKernel::prepareSharedExpertPrefillGroup(DeviceRowRange rows)
+    bool ROCmMoEKernel::prepareSharedExpertPrefillGroup(DeviceRowRange rows, MoESharedExpertGroupKind kind)
     {
-        grouped_prefill_grouping_.invalidate();
+        auto grouping_publication = grouped_prefill_grouping_.beginSharedExpert(kind, rows);
         const int seq_len = rows.physicalRows();
         if (seq_len <= 0)
             return false;
@@ -11734,6 +11765,7 @@ namespace llaminar2
                     {"top_k", "1"},
                     {"active_expert_slots", "1"}});
         }
+        std::move(grouping_publication).publish();
         return true;
     }
 
@@ -11820,14 +11852,57 @@ namespace llaminar2
     }
 
     /**
-     * @brief Resolve the dedicated graph-persistent adaptive work directory.
+     * @brief Borrow the current original grouping banks and exact named workspace extent.
      *
      * The directory is not interchangeable with the compact active-expert-id
-     * list: the adaptive planner publishes two live counts and two independent
-     * tile spans into it on every replay. Binding the named region here keeps
-     * that mutable lifetime explicit and prevents future grouping code from
-     * aliasing a buffer embedded in a captured projection graph.
+     * list. The combined producer retains raw IDs separately and stores packed
+     * descriptors into original exclusive intervals. Successful binding does
+     * not publish authority; only the complete grouping preparation can do so.
      */
+    MoEGroupingPackedDirectory ROCmMoEKernel::groupingDirectoryBinding(int rows, int top_k, int experts,
+        rocm::MoEGroupedDirectorySource source) const
+    {
+        if (source != rocm::MoEGroupedDirectorySource::GroupingOffsetSlots &&
+            source != rocm::MoEGroupedDirectorySource::GroupingColumnSlots)
+            throw std::invalid_argument("packed grouping binding requires a resolved packed directory producer");
+        const auto factory=source==rocm::MoEGroupedDirectorySource::GroupingColumnSlots
+            ? MoEGroupingPackedDirectory::columnFloor8 : MoEGroupingPackedDirectory::wideFloor8;
+        return factory(d_group_counts_, d_group_offsets_, d_group_active_expert_ids_,
+            d_prefill_work_directory_, workspace_ ? workspace_->getBufferSize(MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY) / sizeof(uint32_t) : 0,
+            rows, top_k, experts, DeviceId::rocm(device_ordinal_), workspace_, ExplicitGPUStream(getStream()));
+    }
+
+    rocm::MoEGroupedPopulationKey ROCmMoEKernel::originalRoutedPopulationKey() const
+    {
+        const auto *original = ScopedMoERoutedTransaction::current();
+        if (!original) return {};
+        if (original->owner != this || original->stream != getStream() || original->workspace != workspace_)
+            throw std::logic_error("original routed transaction changed kernel, stream or workspace");
+        // Unmeasured geometries keep their ordinary first-class policy. Only
+        // immutable descriptor metadata is inspected; live routes stay on device.
+        if (original->contributions || original->rows != 16 || original->hidden_width != 2048 ||
+            original->intermediate != 512 || original->experts != 256 || original->top_k != 8 ||
+            original->gateup_table >= int(grouped_gateup_desc_tables_.size()) ||
+            original->down_table >= int(grouped_down_desc_tables_.size())) return {};
+        const auto &gu = grouped_gateup_desc_tables_[original->gateup_table];
+        const auto &down = grouped_down_desc_tables_[original->down_table];
+        if (!gu.valid || !down.valid || !gu.deviceReady() || !down.deviceReady() ||
+            gu.descriptor_source != MoEDecodeDescriptorSource::StaticDescriptorTable ||
+            down.descriptor_source != MoEDecodeDescriptorSource::StaticDescriptorTable ||
+            deviceMoEWeightFormatIsFloating(gu.weight_format) || gu.weight_format != down.weight_format ||
+            gu.num_experts != 256 || down.num_experts != 256 || gu.d_model != 2048 || down.d_model != 2048 ||
+            gu.intermediate != 512 || down.intermediate != 512 ||
+            !canReuseRouterQ8Hidden(static_cast<const float *>(original->hidden->gpu_data_ptr()), 16, 2048)) return {};
+        return {.operation = MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes,
+            .input = rocm::MoEGroupedPopulationInput::OriginalTokens,
+            .preparation = rocm::MoEGroupedPopulationPreparation::PublishedQ8,
+            .rows = 16, .hidden = 2048, .intermediate = 512, .experts = 256, .top_k = 8,
+            .gateup_physical = gu.codebook_mask, .down_physical = down.codebook_mask,
+            .gateup_source = gu.policy_codebook_mask, .down_source = down.policy_codebook_mask,
+            .routed_sources = rocm::routedVerifierOriginalSources(gu.host_gate_descs, gu.host_up_descs, down.host_descs)};
+    }
+
+    /** @brief Bind the existing named adaptive directory and population banks before capture. */
     bool ROCmMoEKernel::ensureGroupedPrefillWorkDirectoryCapacity(
         int total_slots,
         int num_experts)
@@ -11842,9 +11917,13 @@ namespace llaminar2
                 reinterpret_cast<void **>(&d_prefill_work_directory_),
                 MoEWorkspaceBuffers::ROCM_PREFILL_WORK_DIRECTORY,
                 words * sizeof(uint32_t),
-                "ensureGroupedPrefillWorkDirectoryCapacity"))
+                "ensureGroupedPrefillWorkDirectoryCapacity") ||
+            !bindWorkspaceBuffer(reinterpret_cast<void **>(&d_grouped_population_selection_),
+                MoEWorkspaceBuffers::ROCM_GROUPED_POPULATION_SELECTION, sizeof(uint32_t),
+                "ensureGroupedPrefillWorkDirectoryCapacity(population)"))
         {
             d_prefill_work_directory_ = nullptr;
+            d_grouped_population_selection_ = nullptr;
             return false;
         }
         return true;
@@ -12011,6 +12090,24 @@ namespace llaminar2
             return false;
         }
 
+        if (const auto *original = ScopedMoERoutedTransaction::current())
+        {
+            auto actual = *original;
+            actual.owner = this; actual.hidden = hidden; actual.output = output;
+            actual.contributions = canonical_route_contributions;
+            actual.gateup_table = gateup_desc_table_id; actual.down_table = down_desc_table_id;
+            actual.rows = seq_len; actual.hidden_width = d_model; actual.intermediate = intermediate;
+            actual.experts = num_experts; actual.top_k = top_k;
+            actual.stream = getStream(); actual.workspace = workspace_;
+            ScopedMoERoutedTransaction::requireMatching(actual);
+            if (!execution.executesGateUp() || !execution.executesDown() ||
+                execution.firstColumn() != 0 || execution.columnCount() != d_model)
+                throw std::logic_error("original routed transaction cannot lend its identity to a projection phase");
+        }
+        const auto original_routed_key = originalRoutedPopulationKey();
+        const auto directory_source = rocm::selectedMoEGroupedPrefillPolicy(device_ordinal_, original_routed_key).directory;
+        const bool grouping_offset_slots = directory_source != rocm::MoEGroupedDirectorySource::RolePlanner;
+        if (!grouping_offset_slots) grouped_prefill_grouping_.revokeDirectory();
         const auto *owner_admission = ownerGateUpAdmissionForCall(gateup_desc_table_id, seq_len, execution,
             {.output_columns = intermediate, .reduction_columns = d_model});
         rocm::MoERouteOwnedGateUpLaunchSet owner_completed{};
@@ -12045,6 +12142,8 @@ namespace llaminar2
         rocm::validateMoERouteOwnedGateUpCodebook(gateup_table.codebook_mask, gateup_table.policy_codebook_mask, owner_admission);
         const bool floating = deviceMoEWeightFormatIsFloating(
             gateup_table.weight_format);
+        if (grouping_offset_slots && floating)
+            throw std::invalid_argument("grouping offset-slot candidate requires native quantised descriptors");
 
         if (!gateup_table.valid || !gateup_table.deviceReady() ||
             !down_table.valid || !down_table.deviceReady() ||
@@ -12216,6 +12315,25 @@ namespace llaminar2
             return false;
         }
         // Launch the fixed, fully grouped pipeline without a host synchronization.
+        // These retained descriptors are immutable preparation metadata. Runtime
+        // placement tables cannot provide a host source authority for selection.
+        rocm::MoEGroupedSourceTuple singleton_sources;
+        if (num_experts == 1 && gateup_table.descriptor_source == MoEDecodeDescriptorSource::StaticDescriptorTable &&
+            down_table.descriptor_source == MoEDecodeDescriptorSource::StaticDescriptorTable &&
+            gateup_table.host_gate_descs.size() == 1 && gateup_table.host_up_descs.size() == 1 &&
+            down_table.host_descs.size() == 1)
+        {
+            const auto source = [](const DeviceNativeQuantisedMatrixDesc &descriptor) {
+                return NativeQuantisedSourceIdentity{descriptor.source_codebook_id,
+                    descriptor.source_is_superblock != 0, descriptor.source_identity_present != 0};
+            };
+            singleton_sources = {source(gateup_table.host_gate_descs.front()),
+                source(gateup_table.host_up_descs.front()), source(down_table.host_descs.front())};
+        }
+        rocm::MoEGroupedPrefillSubmission grouped_submitted;
+        const auto grouping_directory = grouped_prefill_grouping_.borrowDirectory();
+        if (grouping_offset_slots)
+            (void)grouping_directory.requireMatching(groupingDirectoryBinding(seq_len, top_k, num_experts, directory_source));
         const bool ok = execution.overwriteOutputThenPublish(
             execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
             execution.executesDown() ? publication_output->size_bytes() : 0u,
@@ -12264,8 +12382,9 @@ namespace llaminar2
                     device_ordinal_,
                     producer_stream,
                     execution,
-                    grouped_prefill_grouping_.scope(), owner_admission,
-                    owner_admission ? &owner_completed : nullptr);
+                    grouped_prefill_grouping_.scopeForProjection(seq_len, top_k), owner_admission,
+                    owner_admission ? &owner_completed : nullptr, d_grouped_population_selection_, &grouped_submitted,
+                    singleton_sources, grouping_offset_slots ? &grouping_directory : nullptr, original_routed_key.routed_sources);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -12299,18 +12418,7 @@ namespace llaminar2
                 active_expert_slots > 0)
         {
             const MoEPrefillPairPolicyTags policy =
-                queryMoEPrefillPairPolicyTags(
-                    gateup_table.codebook_mask,
-                    down_table.codebook_mask,
-                    seq_len,
-                    d_model,
-                    intermediate,
-                    num_experts,
-                    top_k,
-                    execution.measuredOperation(
-                        canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
-                                                      : MoEPrefillOutputLayout::TokenRows,
-                        grouped_prefill_grouping_.scope()));
+                submittedMoEPrefillPairPolicyTags(grouped_submitted);
             const std::string common_row_tile =
                 policy.gateup.tile_m == policy.down.tile_m
                     ? policy.gateup.tile_m
@@ -12335,18 +12443,19 @@ namespace llaminar2
                      codebookMaskTag(gateup_table.policy_codebook_mask)},
                     {"down_policy_codebook_mask",
                      codebookMaskTag(down_table.policy_codebook_mask)},
-                    {"gateup_route",
-                     seq_len > 8
-                         ? (reuse_router_q8_hidden
-                                ? "expert_tiled_router_q8"
-                                : "expert_tiled_original_row_quant")
-                         : (reuse_router_q8_hidden
-                                ? "route_owned_router_q8"
-                                : "route_owned_original_row_quant")},
-                    {"down_route",
-                     seq_len > 8
-                         ? "expert_tiled_partials_ordered_publish"
-                         : "direct_ordered_publish"},
+                    {"gateup_route", groupedRouteRoster(grouped_submitted.gateup,grouped_submitted.gateup_route_owned)},
+                    {"down_route", groupedRouteRoster(grouped_submitted.down,grouped_submitted.down_route_owned)},
+                    {"hidden_preparation", !execution.executesGateUp() ? "not_submitted" :
+                        reuse_router_q8_hidden ? "router_q8" : "original_row_quant"},
+                    {"dot_policy", groupedEngineTag(grouped_submitted.policy.engine)},
+                    {"directory_source", grouped_submitted.policy.directory == rocm::MoEGroupedDirectorySource::GroupingOffsetSlots
+                        ? "grouping_offset_slots" : grouped_submitted.policy.directory == rocm::MoEGroupedDirectorySource::GroupingColumnSlots
+                        ? "grouping_column_slots" : "role_planner"},
+                    {"gateup_submitted_tiles", groupedTileRoster(grouped_submitted.gateup)},
+                    {"down_submitted_tiles", groupedTileRoster(grouped_submitted.down)},
+                    {"gateup_submitted_tiled_leaves", std::to_string(grouped_submitted.gateup.leaves())},
+                    {"down_submitted_tiled_leaves", std::to_string(grouped_submitted.down.leaves())},
+                    {"counter_semantics", "host_submissions"},
                     {"gateup_tile_m", policy.gateup.tile_m},
                     {"gateup_tile_n", policy.gateup.tile_n},
                     {"down_tile_m", policy.down.tile_m},
@@ -12748,6 +12857,7 @@ namespace llaminar2
                  {"program",formats?"all_formats":"fixed"},{"decoder_family",formats?std::to_string(formats->family()):"1"}});
             return true;
         }
+        rocm::MoEGroupedPrefillSubmission grouped_submitted;
         const bool ok = execution.overwriteOutputThenPublish(
             execution.executesDown() ? static_cast<float *>(publication_output->gpu_data_ptr()) : nullptr,
             execution.executesDown() ? publication_output->size_bytes() : 0u,
@@ -12793,7 +12903,7 @@ namespace llaminar2
                     producer_stream,
                     execution,
                     MoEPrefillRouteScope::SelectedRoutes, owner_admission,
-                    owner_admission ? &owner_completed : nullptr);
+                    owner_admission ? &owner_completed : nullptr, d_grouped_population_selection_, &grouped_submitted);
             },
             [&](const EnqueuedWorkspaceRead<float> &read)
             {
@@ -12826,18 +12936,7 @@ namespace llaminar2
                 active_expert_slots > 0)
         {
             const MoEPrefillPairPolicyTags policy =
-                queryMoEPrefillPairPolicyTags(
-                    gateup_table.codebook_mask,
-                    down_table.codebook_mask,
-                    seq_len,
-                    d_model,
-                    intermediate,
-                    num_experts,
-                    top_k,
-                    execution.measuredOperation(
-                        canonical_route_contributions ? MoEPrefillOutputLayout::OriginalRouteRows
-                                                      : MoEPrefillOutputLayout::TokenRows,
-                        MoEPrefillRouteScope::SelectedRoutes));
+                submittedMoEPrefillPairPolicyTags(grouped_submitted);
             const std::string common_row_tile =
                 policy.gateup.tile_m == policy.down.tile_m
                     ? policy.gateup.tile_m
@@ -12862,18 +12961,16 @@ namespace llaminar2
                      codebookMaskTag(gateup_table.policy_codebook_mask)},
                     {"down_policy_codebook_mask",
                      codebookMaskTag(down_table.policy_codebook_mask)},
-                    {"gateup_route",
-                     seq_len > 8
-                         ? (reuse_router_q8_hidden
-                                ? "expert_tiled_router_q8"
-                                : "expert_tiled_original_row_quant")
-                         : (reuse_router_q8_hidden
-                                ? "route_owned_router_q8"
-                                : "route_owned_original_row_quant")},
-                    {"down_route",
-                     seq_len > 8
-                         ? "expert_tiled_partials_ordered_publish"
-                         : "direct_ordered_publish"},
+                    {"gateup_route", groupedRouteRoster(grouped_submitted.gateup,grouped_submitted.gateup_route_owned)},
+                    {"down_route", groupedRouteRoster(grouped_submitted.down,grouped_submitted.down_route_owned)},
+                    {"hidden_preparation", !execution.executesGateUp() ? "not_submitted" :
+                        reuse_router_q8_hidden ? "router_q8" : "original_row_quant"},
+                    {"dot_policy", groupedEngineTag(grouped_submitted.policy.engine)},
+                    {"gateup_submitted_tiles", groupedTileRoster(grouped_submitted.gateup)},
+                    {"down_submitted_tiles", groupedTileRoster(grouped_submitted.down)},
+                    {"gateup_submitted_tiled_leaves", std::to_string(grouped_submitted.gateup.leaves())},
+                    {"down_submitted_tiled_leaves", std::to_string(grouped_submitted.down.leaves())},
+                    {"counter_semantics", "host_submissions"},
                     {"gateup_tile_m", policy.gateup.tile_m},
                     {"gateup_tile_n", policy.gateup.tile_n},
                     {"down_tile_m", policy.down.tile_m},

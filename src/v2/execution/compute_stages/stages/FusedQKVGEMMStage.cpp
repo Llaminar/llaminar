@@ -10,6 +10,7 @@
 
 #include "execution/diagnostics/QueryKVGeometryObservation.h"
 #include "FusedQKVGEMMStage.h"
+#include "kernels/common/VerifierProjectionBundle.h"
 #include "../ComputeStageUtils.h"
 #include "../../../utils/DebugEnv.h"
 #include "../../../tensors/Tensors.h"
@@ -459,6 +460,13 @@ namespace llaminar2
          * production stage execution must never replay verifier rows one at a time.
          */
         auto verifier_rows = anchorKernel()->beginVerifierDecodeEquivalentScope(params_.verifier_row_range);
+        // Own the complete operation before the backend forms compatible-policy
+        // subgroups. A singleton subgroup must never acquire a scalar cost key.
+        const ScopedVerifierProjectionBundle original_bundle(VerifierProjectionBundleBinding::bind(
+            includesQuery() ? VerifierProjectionBundleKind::AttentionQKV : VerifierProjectionBundleKind::AttentionKV,
+            params_.device_id, input_base,
+            params_.verifier_row_range.value_or(DeviceRowRange::fullyActive(params_.m)),
+            params_.k, cached_projections_));
         const bool success = anchorKernel()->multiply_fused_verifier_rows_decode_equivalent(
             input_base,
             cached_projections_,

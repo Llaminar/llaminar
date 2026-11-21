@@ -24,6 +24,7 @@
 #ifdef HAVE_ROCM
 #include "kernels/rocm/gdn/ROCmGatedDeltaNet.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
+#include "../../../utils/ROCmQFNReplayDevice.h"
 #include "ROCmGDNHistoricalRecurrentOracle.h"
 #include "kernels/rocm/gdn/ROCmShortConvolution.h"
 #include <hip/hip_runtime.h>
@@ -4313,12 +4314,10 @@ TEST(Test__ROCmGDNPaddedRealLength, CapturedVerifierAndDecodeShortConvPublicatio
 TEST(Test__ROCmGDNPaddedRealLength, QFNK4VerifierAcceptedPrefixIgnoresUnpublishedRows)
 {
     if (!hasROCm()) GTEST_SKIP() << "No ROCm device available";
-    initializeROCmHardwareMetadata();
-    const auto& hardware = rocmHardwareMetadata().at(0);
-    if (hardware.native_wave_width != 64 || hardware.compute_units != 60 ||
-        !(hardware.isa_target == "gfx906" || hardware.isa_target.starts_with("gfx906:")))
+    const int ordinal = llaminar2::test::findQFNMI50ReplayDevice();
+    if (ordinal < 0)
         GTEST_SKIP() << "QFN K4 opt-in requires native 60-CU gfx906 wave64";
-    checkHip(hipSetDevice(0), "bind ROCm QFN K4 replay participant");
+    checkHip(hipSetDevice(ordinal), "bind ROCm QFN K4 replay participant");
     constexpr int channels = 2560;
     constexpr int taps = 4;
     constexpr int stateSize = channels * (taps - 1);
@@ -4332,7 +4331,7 @@ TEST(Test__ROCmGDNPaddedRealLength, QFNK4VerifierAcceptedPrefixIgnoresUnpublishe
     HipFloatBuffer snapshots(maxRows * stateSize), speculative(stateSize);
     HipIntBuffer live(0), accepted(-1);
     HipStreamHandle stream;
-    ROCmShortConvolution grouped(0), serial(0);
+    ROCmShortConvolution grouped(ordinal), serial(ordinal);
     HipGDNStateOwner groupedOwner(grouped, stateSize), serialOwner(serial, stateSize);
     grouped.setGPUStream(stream.stream);
     serial.setGPUStream(stream.stream);
@@ -4437,11 +4436,10 @@ TEST(Test__ROCmGDNPaddedRealLength, QFNK4VerifierAcceptedPrefixIgnoresUnpublishe
 TEST(Test__ROCmGDNPaddedRealLength, QFNK4VerifierPreservesOptionalBindings)
 {
     if (!hasROCm()) GTEST_SKIP() << "No ROCm device available";
-    initializeROCmHardwareMetadata();
-    const auto& hardware = rocmHardwareMetadata().at(0);
-    if (hardware.native_wave_width != 64 || hardware.compute_units != 60 ||
-        !(hardware.isa_target == "gfx906" || hardware.isa_target.starts_with("gfx906:")))
+    const int ordinal = llaminar2::test::findQFNMI50ReplayDevice();
+    if (ordinal < 0)
         GTEST_SKIP() << "QFN K4 opt-in requires native 60-CU gfx906 wave64";
+    checkHip(hipSetDevice(ordinal), "bind ROCm QFN K4 replay participant");
 
     constexpr int channels = 2560;
     constexpr int taps = 4;
@@ -4471,13 +4469,13 @@ TEST(Test__ROCmGDNPaddedRealLength, QFNK4VerifierPreservesOptionalBindings)
                 return rocmGDN_short_conv1d_effective(input.ptr, weights.ptr, nullptr,
                     referenceOutput.ptr, explicitHistory, referenceTerminal.ptr, capacity,
                     channels, taps, true, count.ptr, referenceSnapshots.ptr, stride, maxRows + 1,
-                    0, stream.stream);
+                    ordinal, stream.stream);
             });
             HipCapturedGraph actual(stream.stream, [&] {
                 return rocmGDN_short_conv1d_effective(input.ptr, weights.ptr, nullptr,
                     actualOutput.ptr, nullHistory ? nullptr : explicitHistory, actualTerminal.ptr,
                     capacity, channels, taps, true, nullCount ? nullptr : count.ptr,
-                    actualSnapshots.ptr, stride, maxRows + 1, 0, stream.stream);
+                    actualSnapshots.ptr, stride, maxRows + 1, ordinal, stream.stream);
             });
             const auto verifyLeaf = [&](hipGraph_t graph, const char* expected, unsigned threads) {
                 std::size_t nodes = 1;

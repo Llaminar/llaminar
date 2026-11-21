@@ -285,11 +285,15 @@ private:
         p.force_decode_equivalent_verifier_prefill = grouped;
         const auto rows = serial || (device_.is_cpu() && grouped)
             ? DeviceRowRange::fullyActive(m) : DeviceRowRange::deviceCounted(m, countPointer());
-        if (grouped && m > 1) p.verifier_row_range = rows;
+        // The CPU model builder uses compact fully active sibling rows and
+        // retains the original host sequence-length owner for corrected QKV.
+        // Exercise that distinct identity through the real four-source stage.
+        if (grouped && m > 1 && !device_.is_cpu()) p.verifier_row_range = rows;
         if (corrected)
         {
             p.qkv_operand_precision = QuantizedActivationOperandPrecision::TwoTermQ8;
-            p.qkv_row_range = rows;
+            p.qkv_row_range = device_.is_cpu() && grouped && !serial
+                ? DeviceRowRange::deviceCounted(m,countPointer()) : rows;
         }
         auto stage = std::make_unique<GDNProjectionStage>(p);
         requirements_.merge(stage->getWorkspaceRequirements(m, 0, k_));
@@ -613,7 +617,11 @@ private:
     /** @brief Reject malformed original sources/rows before any destination or bank write. */
     void rejectMalformedBeforeWrites()
     {
-        const auto base = entry(15, true, true).stage->getParams();
+        auto base = entry(15, true, true).stage->getParams();
+        // These malformed-binding controls explicitly declare a shared count
+        // so a foreign QKV count is invalid on every backend. The real CPU
+        // execution entries above retain their distinct compact sibling policy.
+        if(device_.is_cpu())base.verifier_row_range=base.qkv_row_range;
         poison();
         std::array<std::vector<uint8_t>, 4> before;
         for (size_t i = 0; i < 4; ++i) before[i] = observe(address(*outputs_[i]), outputs_[i]->numel() * sizeof(float));

@@ -28,6 +28,7 @@
 
 #pragma once
 #include "IRetainedGraphParticipants.h"
+#include "kernels/common/CapturedVerifierExtent.h"
 #include "RetainedParentInputAuthority.h"
 #include "OriginalSlotCaptureTerminals.h"
 #include "backends/NativeOrderingEventGroup.h"
@@ -1812,6 +1813,7 @@ namespace llaminar2
             /** @brief Strongest actual collective dependency found during capture planning; no replay graph scan. */
             enum class RuntimeCollectiveCaptureRequirement:uint8_t {NotRequired,Required};
             RuntimeCollectiveCaptureRequirement runtime_collective_capture_requirement=RuntimeCollectiveCaptureRequirement::Required;
+            CapturedVerifierExtent captured_verifier_extent; ///< Frozen exact-width construction identity; reset with this executable.
             GraphReplayPlanPolicy graph_replay_plan_policy =
                 GraphReplayPlanPolicy::RequireFullGraph; ///< Exact materialization/replay authority represented by this cache.
             SteadyReplayHostPolicy steady_replay_host_policy =
@@ -1880,6 +1882,7 @@ namespace llaminar2
                   replay_gpu_timing_device_name(std::move(other.replay_gpu_timing_device_name)),
                   replay_gpu_timing_busy_samples(other.replay_gpu_timing_busy_samples),
                   runtime_collective_capture_requirement(other.runtime_collective_capture_requirement),
+                  captured_verifier_extent(std::exchange(other.captured_verifier_extent, {})),
                   graph_replay_plan_policy(other.graph_replay_plan_policy),
                   steady_replay_host_policy(other.steady_replay_host_policy),
                   retained_full_graph_replay(
@@ -1977,6 +1980,7 @@ namespace llaminar2
                     replay_gpu_timing_device_name = std::move(other.replay_gpu_timing_device_name);
                     replay_gpu_timing_busy_samples = other.replay_gpu_timing_busy_samples;
                     runtime_collective_capture_requirement=other.runtime_collective_capture_requirement;
+                    captured_verifier_extent = std::exchange(other.captured_verifier_extent, {});
                     graph_replay_plan_policy = other.graph_replay_plan_policy;
                     steady_replay_host_policy =
                         other.steady_replay_host_policy;
@@ -2088,6 +2092,7 @@ namespace llaminar2
             {
                 const bool pristine =
                     epoch != 0 && !initialized && !needs_capture &&
+                    !captured_verifier_extent.isExact() &&
                     executable_submission_state ==
                         ExecutableSubmissionState::Empty &&
                     segments.empty() && snapshot_manifest.empty() &&
@@ -2259,6 +2264,7 @@ namespace llaminar2
                     terminal_fence_observed_generation = 0;
                 }
                 runtime_collective_capture_requirement=RuntimeCollectiveCaptureRequirement::Required;
+                captured_verifier_extent = {};
                 graph_replay_plan_policy =
                     GraphReplayPlanPolicy::RequireFullGraph;
                 retained_full_graph_replay.clear();
@@ -2651,13 +2657,15 @@ namespace llaminar2
                                                       GraphInitialSubmissionPolicy::
                                                           CaptureInstantiateAndLaunch,
                                               GraphCaptureAuxiliaryBranchFactory
-                                                  auxiliary_branch_factory = {});
+                                                  auxiliary_branch_factory = {},
+                                              CapturedVerifierExtent captured_verifier_extent = {});
 
         /**
          * @brief Policy object for decode capture/replay execution mode selection
          */
         struct DecodeCapturePolicy
         {
+            CapturedVerifierExtent captured_verifier_extent; ///< Original exact hosted width admitted by ForwardInput.
             bool allow_fast_decode = true;
             bool allow_cached_graph_replay = false;
             bool heterogeneous_segmented_enabled = false;

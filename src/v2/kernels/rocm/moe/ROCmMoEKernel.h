@@ -54,6 +54,8 @@ namespace llaminar2
     namespace rocm
     {
         class HipBLASGemmKernel;
+        struct MoEGroupedPopulationKey;
+        enum class MoEGroupedDirectorySource;
         struct FullNativeHCFFNPrefixArgs;
     }
 
@@ -1094,7 +1096,8 @@ namespace llaminar2
             int num_experts) override;
 
         /** @copydoc IMoEKernel::prepareSharedExpertPrefillGroup */
-        bool prepareSharedExpertPrefillGroup(DeviceRowRange rows) override;
+        bool prepareSharedExpertPrefillGroup(DeviceRowRange rows,
+            MoESharedExpertGroupKind kind = MoESharedExpertGroupKind::Ordinary) override;
 
         /** @copydoc IMoEKernel::prepareOriginalM1HiddenQ8Publication */
         bool prepareOriginalM1HiddenQ8Publication(const TensorBase*,DeviceRowRange) override;
@@ -1833,6 +1836,7 @@ namespace llaminar2
         float *d_prefill_swiglu_scales_ = nullptr; ///< [prefill_slots_cap_, intermediate / 32]
         float *d_prefill_gate_ = nullptr;          ///< [prefill_slots_cap_, max(d_model,intermediate)]
         float *d_prefill_up_ = nullptr;            ///< [prefill_slots_cap_, intermediate]
+        uint32_t *d_grouped_population_selection_ = nullptr; ///< Arena-owned replay decision; no host mirror.
         uint32_t *d_prefill_work_directory_ = nullptr; ///< Device-authored adaptive TM12/TM16 spans.
         int prefill_slots_cap_ = 0;           ///< Current capacity (total_slots)
         int prefill_d_model_cap_ = 0;         ///< Current d_model capacity
@@ -1842,6 +1846,26 @@ namespace llaminar2
         uint64_t bound_workspace_id_ = 0;
 
         bool ensureGroupedPrefillScratchCapacity(int total_slots, int d_model, int intermediate);
+        /** @brief Enqueue original count/scan/scatter under the caller's grouping preparation.
+         * @param d_routing_indices Original route IDs. @param d_routing_weights Original probabilities.
+         * @param seq_len Physical token rows. @param num_experts Expert extent. @param top_k Route multiplicity.
+         * @param d_expert_offsets Exclusive offsets. @param d_expert_counts Counts.
+         * @param d_grouped_token_indices Grouped row map. @param d_grouped_weights Grouped probabilities.
+         * @param packed Optional unpublished original binding for combined directory publication.
+         * @return Whether every grouping launch succeeded; only the outer preparation may publish. */
+        bool enqueueExpertGrouping(const int *d_routing_indices, const float *d_routing_weights,
+            int seq_len, int num_experts, int top_k, int *d_expert_offsets, int *d_expert_counts,
+            int *d_grouped_token_indices, float *d_grouped_weights,
+            const MoEGroupingPackedDirectory *packed);
+        /** @brief Authenticate the currently bound named work bank without reading device counts.
+         * @param rows Original physical token rows. @param top_k Original route multiplicity.
+         * @param experts Original expert extent. @param source Resolved producer layout.
+         * @return Immutable current workspace binding. */
+        MoEGroupingPackedDirectory groupingDirectoryBinding(int rows, int top_k, int experts,
+            rocm::MoEGroupedDirectorySource source) const;
+        /** @return Pure original-operation key after authenticating scope, static descriptors and Q8 publication.
+         * @throws std::logic_error If an enclosing operation names another owner, stream or workspace. */
+        rocm::MoEGroupedPopulationKey originalRoutedPopulationKey() const;
         /**
          * @brief Bind and validate the persistent adaptive prefill directory.
          * @param total_slots Number of routed rows that bound directory work.

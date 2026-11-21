@@ -51,6 +51,7 @@
 #include "kernels/rocm/gemm/ROCmVNNIPrefillLaunch.h"
 #include "kernels/rocm/gemm/ROCmDenseProductionPrefillOverlay.h"
 #include "kernels/rocm/gemm/ROCmNativeQuantisedArchitecture.h"
+#include "../../utils/ROCmQFNReplayDevice.h"
 #include "utils/DebugEnv.h"
 #endif
 #include "tensors/Tensors.h"
@@ -1760,13 +1761,10 @@ TEST(Q8ResidualCorrectionDevice,DISABLED_ROCmNativeQ8N320M512K10240TileEventsQ8_
 /** @test Replay the actual prepared M4 builder and existing staged ROCm publication. */
 TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCDownReducePublishReplay)
 {
- auto* backend=getROCmBackend();
- if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
- const auto& hardware=rocmHardwareMetadata().at(0);
- if(!hardware.isa_target.starts_with("gfx906")||hardware.compute_units!=60||
-    hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
+ const int ordinal = test::findQFNMI50ReplayDevice();
+ if (ordinal < 0) GTEST_SKIP() << "Requires gfx906 wave64 and 60 CUs";
  for(bool alias:{false,true})
-  proveHC103Chain(DeviceId::rocm(0),4,2560,320,alias,HC103Path::GroupedReducer);
+  proveHC103Chain(DeviceId::rocm(ordinal),4,2560,320,alias,HC103Path::GroupedReducer);
 }
 #endif
 
@@ -1777,25 +1775,19 @@ TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCDownReducePublishDefaultReplay)
  ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH"),nullptr);
  ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_LONG_K"),nullptr);
  ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K"),nullptr);
- auto* backend=getROCmBackend();
- if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
- const auto& hardware=rocmHardwareMetadata().at(0);
- if(!hardware.isa_target.starts_with("gfx906")||hardware.compute_units!=60||
-    hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
+ const int ordinal = test::findQFNMI50ReplayDevice();
+ if (ordinal < 0) GTEST_SKIP() << "Requires gfx906 wave64 and 60 CUs";
  for(bool alias:{false,true})
-  proveHC103Chain(DeviceId::rocm(0),4,2560,320,alias,HC103Path::GroupedReducer);
+  proveHC103Chain(DeviceId::rocm(ordinal),4,2560,320,alias,HC103Path::GroupedReducer);
 }
 
 /** @test The admitted TP4 policy selects the measured HC-up without fusing branch read. */
 TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCUpQualifiedDefaultReplay)
 {
  ASSERT_EQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_UP_SHORT_K"),nullptr);
- auto* backend=getROCmBackend();
- if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
- const auto& hardware=rocmHardwareMetadata().at(0);
- if(!hardware.isa_target.starts_with("gfx906")||hardware.compute_units!=60||
-    hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
- proveHC103Chain(DeviceId::rocm(0),4,2560,320,false,HC103Path::GroupedReducer,
+ const int ordinal = test::findQFNMI50ReplayDevice();
+ if (ordinal < 0) GTEST_SKIP() << "Requires gfx906 wave64 and 60 CUs";
+ proveHC103Chain(DeviceId::rocm(ordinal),4,2560,320,false,HC103Path::GroupedReducer,
     HC103Observation::Correctness,nullptr,LocalGPUExpertKernelPolicy::QFNMI50TP4);
 }
 
@@ -1803,12 +1795,9 @@ TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCUpQualifiedDefaultReplay)
 TEST(Q8ResidualCorrectionDevice, ROCmGroupedHCDownReducePublishOffReplay)
 {
  ASSERT_STREQ(std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_REDUCE_PUBLISH"),"0");
- auto* backend=getROCmBackend();
- if(!backend||backend->deviceCount()==0)GTEST_SKIP()<<"ROCm unavailable";
- const auto& hardware=rocmHardwareMetadata().at(0);
- if(!hardware.isa_target.starts_with("gfx906")||hardware.compute_units!=60||
-    hardware.native_wave_width!=64)GTEST_SKIP()<<"Requires gfx906 wave64 and 60 CUs";
- proveHC103Chain(DeviceId::rocm(0),4,2560,320,false,HC103Path::GroupedReducerStaged);
+ const int ordinal = test::findQFNMI50ReplayDevice();
+ if (ordinal < 0) GTEST_SKIP() << "Requires gfx906 wave64 and 60 CUs";
+ proveHC103Chain(DeviceId::rocm(ordinal),4,2560,320,false,HC103Path::GroupedReducerStaged);
 }
 
 /** @test A portable gfx1100 counted M4 capture retains the staged publication. */

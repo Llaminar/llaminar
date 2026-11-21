@@ -41,6 +41,11 @@
 #include "kernels/rocm/gdn/ROCmGatedNormSingleQ8.h"
 #include "ROCmQuantisedEpilogues.h"
 #include "ROCmQuantisedGemmKernel.h"
+#include "ROCmNativeQuantisedVerifierLaunch.h"
+#include "kernels/common/VerifierProjectionBundle.h"
+#include "kernels/common/VerifierGDNBundle.h"
+#include "ROCmNativeQuantisedGDNVerifier.h"
+#include "ROCmFloatingPointGemmKernel.h"
 #include "kernels/common/HCDownProjectionInput.h"
 #include "kernels/common/HCBranchNormSingleQ8Publication.h"
 #include "kernels/common/GPUQ8ResidualNative.h"
@@ -289,15 +294,6 @@ namespace llaminar2
                 float alpha, float beta,
                 const float *d_C_existing,
                 const float *d_bias,
-                int rocm_device_id, void *stream);
-
-            bool rocmQuantGemm_applyFp32CombineEpilogue(
-                const float *d_computed,
-                float *d_output,
-                const float *d_existing,
-                const float *d_bias,
-                int M, int N,
-                float alpha, float beta,
                 int rocm_device_id, void *stream);
 
             // In-place bias addition: output[m,n] += bias[n] (common .hip)
@@ -3004,9 +3000,17 @@ namespace llaminar2
 
                 const bool supports_native_small_m =
                     impl_->has_native_quantised && (m >= 2 || countedVerifierRows(m));
-                if (supports_native_small_m &&
-                    !gemv_output_needs_copyout && beta == 0.0f)
+                if (supports_native_small_m)
                 {
+                    // Preserve the original output for beta. Mapped destinations
+                    // receive one coalesced, row-admitted combine/copy after the
+                    // grouped producer; capacity-wide DMA would overwrite dead rows.
+                    float *grouped_output = gemv_output_needs_copyout ? impl_->d_C_fp32 : d_output;
+                    if (gemv_output_needs_copyout &&
+                        (!grouped_output || grouped_output == d_output ||
+                         workspace_->getBufferSize(GemmWorkspaceBuffers::TEMP_C_FP32) <
+                             static_cast<size_t>(m) * static_cast<size_t>(n) * sizeof(float)))
+                        throw std::invalid_argument("Grouped verifier epilogue requires distinct full-capacity persistent FP32 scratch");
                     if ((k % 32) != 0)
                     {
                         LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] NativeQuantised small-M verifier requires K multiple of 32, got M="
@@ -3034,7 +3038,7 @@ namespace llaminar2
                             impl_->d_weights_native_scales,
                             impl_->d_weights_native_mins,
                             impl_->d_weights_native_emins,
-                            d_output,
+                            grouped_output,
                             impl_->d_scales_A_blockwise,
                             impl_->d_sums_A_blockwise,
                             impl_->d_scatter_partial,
@@ -3050,7 +3054,18 @@ namespace llaminar2
                         return false;
                     }
 
-                    if (alpha != 1.0f || d_bias)
+                    if (gemv_output_needs_copyout)
+                    {
+                        if (!rocmQuantGemm_applyFp32CombineEpilogue(
+                                grouped_output, d_output, beta != 0.0f ? d_output : nullptr,
+                                d_bias, m, n, alpha, beta, rocm_device_id_, gpu_stream_,
+                                VerifierKernelModeScope::rowsFor(m)))
+                        {
+                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Grouped verifier combine/copy failed");
+                            return false;
+                        }
+                    }
+                    else if (alpha != 1.0f || d_bias)
                     {
                         if (!applyFp32EpilogueScoped(
                                 d_output,
@@ -3101,132 +3116,8 @@ namespace llaminar2
                     return true;
                 }
 
-                for (int row = 0; row < m; ++row)
-                {
-                    const float *d_input_row = d_input + static_cast<size_t>(row) * k;
-                    float *d_output_row = d_output + static_cast<size_t>(row) * n;
-                    float *d_gemv_output = gemv_output_needs_copyout ? impl_->d_C_fp32 : d_output_row;
-
-                    if (!rocmQuantGemm_quantizeActivationsBlockwiseScoped(
-                            d_input_row,
-                            impl_->d_A_int8,
-                            impl_->d_scales_A_blockwise,
-                            1,
-                            k,
-                            rocm_device_id_,
-                            gpu_stream_))
-                    {
-                        LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M blockwise activation quantization failed at row "
-                                  << row);
-                        return false;
-                    }
-
-                    if (impl_->has_native_quantised)
-                    {
-                        if (!rocmGemv_native_quantised_fp32_with_policy(
-                                impl_->d_A_int8,
-                                impl_->d_weights_native_quantised,
-                                impl_->d_weights_native_scales,
-                                impl_->d_weights_native_mins,
-                                impl_->d_weights_native_emins,
-                                d_gemv_output,
-                                impl_->d_scales_A,
-                                impl_->d_scatter_partial,
-                                n, k,
-                                impl_->native_quantised_codebook_id,
-                                requireNativeQuantisedArithmeticPolicyCodebook(
-                                    impl_->native_quantised_codebook_id,
-                                    impl_->native_source_identity),
-                                rocm_device_id_, gpu_stream_,
-                                impl_->d_scales_A_blockwise))
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-quantised GEMV failed at row "
-                                      << row);
-                            return false;
-                        }
-
-                        if (beta != 0.0f)
-                        {
-                            if (!rocmQuantGemm_applyFp32CombineEpilogue(
-                                    d_gemv_output,
-                                    d_gemv_output,
-                                    d_output_row,
-                                    d_bias,
-                                    1,
-                                    n,
-                                    alpha,
-                                    beta,
-                                    rocm_device_id_,
-                                    gpu_stream_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-quantised beta epilogue failed at row "
-                                          << row);
-                                return false;
-                            }
-                        }
-                        else if (alpha != 1.0f || d_bias)
-                        {
-                            if (!rocmQuantGemm_applyFp32Epilogue(
-                                    d_gemv_output,
-                                    d_bias,
-                                    1,
-                                    n,
-                                    alpha,
-                                    rocm_device_id_,
-                                    gpu_stream_))
-                            {
-                                LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M native-quantised epilogue failed at row "
-                                          << row);
-                                return false;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        const float *d_existing = (beta != 0.0f) ? d_output_row : nullptr;
-                        bool int8_decode_ok = rocmGemv_int8_int8_fp32_vnni_blockwise_scaled(
-                            impl_->d_A_int8, d_weights_vnni, d_gemv_output,
-                            impl_->d_scales_A_blockwise, d_scales_B,
-                            n, k,
-                            alpha, beta,
-                            d_existing, d_bias,
-                            rocm_device_id_, gpu_stream_);
-
-                        if (!int8_decode_ok)
-                        {
-                            int8_decode_ok = rocmGemv_int8_scatter_vnni_blockwise(
-                                impl_->d_A_int8, d_weights_vnni, d_gemv_output, impl_->d_scales_A_blockwise, d_scales_B, d_bias,
-                                impl_->d_scatter_partial, impl_->d_selfreduce_counters,
-                                n, k, alpha, beta, d_existing,
-                                rocm_device_id_, gpu_stream_);
-                        }
-
-                        if (!int8_decode_ok)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M INT8 GEMV failed at row "
-                                      << row);
-                            return false;
-                        }
-                    }
-
-                    if (gemv_output_needs_copyout)
-                    {
-                        const hipError_t copy_err = hipMemcpyAsync(
-                            d_output_row,
-                            impl_->d_C_fp32,
-                            static_cast<size_t>(n) * sizeof(float),
-                            hipMemcpyDeviceToDevice,
-                            static_cast<hipStream_t>(gpu_stream_));
-                        if (copy_err != hipSuccess)
-                        {
-                            LOG_ERROR("[ROCmQuantisedGemmKernel::multiply_tensor] Small-M GEMV output copy failed at row "
-                                      << row << ": " << hipGetErrorString(copy_err));
-                            return false;
-                        }
-                    }
-                }
-                publishROCmTensorWrite(*C, rocm_device_id_, gpu_stream_);
-                return true;
+                throw std::invalid_argument(
+                    "Grouped ROCm verifier projection requires prepared NativeQuantised weights");
             }
 
             if (m == 1 && !countedVerifierRows(m))
@@ -5730,6 +5621,131 @@ namespace llaminar2
                 return false;
             }
             auto decode_equivalent_dispatch = beginVerifierDecodeEquivalentScope();
+            std::optional<NativeQuantisedVerifierBundleOperation> bundle_operation;
+            const auto *original_bundle = ScopedVerifierProjectionBundle::current();
+            const auto *declared_rows = VerifierKernelModeScope::rowsFor(m);
+            const auto original_rows = declared_rows ? *declared_rows : DeviceRowRange::fullyActive(m);
+            const bool materialized_head = original_bundle &&
+                original_bundle->kind() == VerifierProjectionBundleKind::MaterializedLMHead;
+            const bool admitted_extent = materialized_head
+                ? original_rows.captureIdentity() == DeviceRowRange::fullyActive(m).captureIdentity()
+                : ScopedCapturedVerifierExtent::current().matches(DeviceId::rocm(rocm_device_id_), original_rows);
+            if (original_bundle && m >= 2 && m <= 16 && workspace &&
+                original_bundle->matches(DeviceId::rocm(rocm_device_id_), input, original_rows, k, projections) &&
+                admitted_extent &&
+                (!materialized_head || (input && input->native_type() == TensorType::FP32 && !input->isMapped())) &&
+                !currentProjectionRowWork(m))
+            {
+                NativeQuantisedVerifierBundleOperation candidate{
+                    .kind = original_bundle->kind(), .device = rocm_device_id_, .k = k,
+                    .count = static_cast<int>(projections.size()), .rows = original_rows,
+                    .activations = static_cast<const int8_t *>(workspace->getBuffer(GemmWorkspaceBuffers::QUANT_A)),
+                    .activation_scales = static_cast<const float *>(workspace->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE)),
+                    .activation_sums = static_cast<const int32_t *>(workspace->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))};
+                bool valid = candidate.activations && candidate.activation_scales && candidate.activation_sums &&
+                    (materialized_head ? candidate.count == 1 : candidate.count >= 2) &&
+                    candidate.count <= static_cast<int>(candidate.members.size());
+                for (int index = 0; valid && index < candidate.count; ++index)
+                {
+                    const auto &projection = projections[index];
+                    auto *owner = dynamic_cast<ROCmQuantisedGemmKernel *>(projection.kernel);
+                    DeviceNativeQuantisedMatrixDesc descriptor;
+                    const auto &slice = projection.original_output_slice;
+                    // Inspection only: preparation/allocation belongs to the
+                    // original stage. Unknown/mixed policies retain Dot4.
+                    valid = owner && owner->rocm_device_id_ == rocm_device_id_ &&
+                        owner->inspectPreparedNativeQuantisedMatrixDesc(descriptor) &&
+                        projection.output && !projection.output->isMapped() && !projection.bias &&
+                        (!materialized_head || projection.output->native_type() == TensorType::FP32) &&
+                        descriptor.n == projection.n && descriptor.k == k && descriptor.source_identity_present &&
+                        (!slice || (slice->firstColumn() == 0 && slice->physicalColumns() == slice->policyColumns()));
+                    if (valid)
+                    {
+                        candidate.members[index] = {
+                            .weights = descriptor.payload,
+                            .scales = static_cast<const uint16_t *>(descriptor.scales),
+                            .mins = static_cast<const uint16_t *>(descriptor.mins),
+                            .emins = static_cast<const uint32_t *>(descriptor.emins),
+                            .output = static_cast<float *>(projection.output->gpu_data_ptr()),
+                            .n = projection.n,
+                            .source = {descriptor.source_codebook_id, bool(descriptor.source_is_superblock), true}};
+                        valid = candidate.members[index].output != nullptr;
+                    }
+                }
+                if (valid) bundle_operation = candidate;
+            }
+            std::optional<NativeQuantisedGDNVerifierOperation> gdn_operation;
+            const auto *gdn_subgroup = ScopedVerifierGDNSubgroup::current();
+            if (gdn_subgroup && input && input->native_type()==TensorType::FP32 && m >= 2 && m <= 16 && workspace &&
+                gdn_subgroup->matches(DeviceId::rocm(rocm_device_id_),input,original_rows,k,projections) &&
+                ScopedCapturedVerifierExtent::current().matches(DeviceId::rocm(rocm_device_id_),original_rows) &&
+                !currentProjectionRowWork(m))
+            {
+                const auto &original = gdn_subgroup->original();
+                const auto all = original.projections();
+                NativeQuantisedGDNVerifierOperation candidate{
+                    .device=rocm_device_id_,.k=k,.input=input,.rows=original_rows,
+                    .precision=original.precision(),.correction_rows=original.correctionRows(),
+                    .activations=static_cast<const int8_t *>(workspace->getBuffer(GemmWorkspaceBuffers::QUANT_A)),
+                    .activation_scales=static_cast<const float *>(workspace->getBuffer(GemmWorkspaceBuffers::SCALES_A_BLOCKWISE)),
+                    .activation_sums=static_cast<const int32_t *>(workspace->getBuffer(GemmWorkspaceBuffers::SUMS_A_BLOCKWISE))};
+                bool valid = candidate.activations && candidate.activation_scales && candidate.activation_sums;
+                const std::array native_members{&candidate.qkv,&candidate.z};
+                const std::array controls{&candidate.alpha,&candidate.beta};
+                for (int role=0;valid && role<4;++role)
+                {
+                    const auto &projection=all[role];
+                    const auto &slice=projection.original_output_slice;
+                    valid=projection.output && projection.output->native_type()==TensorType::FP32 && !projection.output->isMapped() && !projection.bias &&
+                        (!slice || (slice->firstColumn()==0 && slice->physicalColumns()==slice->policyColumns()));
+                    if(!valid)break;
+                    auto *output=static_cast<float *>(projection.output->gpu_data_ptr());
+                    if(role<2)
+                    {
+                        auto *owner=dynamic_cast<ROCmQuantisedGemmKernel *>(projection.kernel);
+                        DeviceNativeQuantisedMatrixDesc descriptor;
+                        valid=owner && owner->rocm_device_id_==rocm_device_id_ && output &&
+                            owner->inspectPreparedNativeQuantisedMatrixDesc(descriptor) &&
+                            descriptor.n==projection.n && descriptor.k==k && descriptor.source_identity_present;
+                        if(valid)*native_members[role]={.weights=descriptor.payload,
+                            .scales=static_cast<const uint16_t *>(descriptor.scales),
+                            .mins=static_cast<const uint16_t *>(descriptor.mins),
+                            .emins=static_cast<const uint32_t *>(descriptor.emins),.output=output,.n=projection.n,
+                            .source={descriptor.source_codebook_id,bool(descriptor.source_is_superblock),true}};
+                    }
+                    else
+                    {
+                        auto *owner=dynamic_cast<ROCmFloatingPointGemmKernel *>(projection.kernel);
+                        ContiguousFloatingPointWeightDescriptor descriptor;
+                        valid=owner && owner->rocm_device_id()==rocm_device_id_ && output &&
+                            owner->exportContiguousFloatingPointWeights(descriptor) && descriptor.valid() &&
+                            descriptor.n==projection.n && descriptor.k==k;
+                        if(valid)*controls[role-2]={.engine=owner,.weights=descriptor,.output=output,
+                            .precision=owner->floatingActivationOperandPrecision()};
+                    }
+                }
+                if(valid)gdn_operation=candidate;
+            }
+            // Even an unmeasured nested API hides the enclosing native bundle.
+            const ScopedNativeQuantisedVerifierBundle original_native_bundle(bundle_operation);
+            const ScopedNativeQuantisedGDNVerifier original_native_gdn(gdn_operation);
+            std::optional<NativeQuantisedVerifierOperation> operation;
+            if (projections.size() == 1)
+            {
+                const auto &projection = projections.front();
+                auto *owner = dynamic_cast<ROCmQuantisedGemmKernel *>(projection.kernel);
+                const auto &slice = projection.original_output_slice;
+                const int policy_n = rocmGemv_native_quantised_get_serial_partition_n();
+                if (owner && owner->impl_ && owner->impl_->has_native_quantised &&
+                    projection.output && !projection.output->isMapped() && !projection.bias &&
+                    owner->rocm_device_id_ == rocm_device_id_ && projection.n == static_cast<int>(owner->N_) &&
+                    k == static_cast<int>(owner->K_) && (policy_n <= 0 || policy_n == projection.n) &&
+                    (!slice || (slice->firstColumn() == 0 && slice->physicalColumns() == slice->policyColumns())))
+                    operation = NativeQuantisedVerifierOperation{NativeQuantisedVerifierOperationKind::Projection,
+                        rocm_device_id_, m, projection.n, k, owner->impl_->d_weights_native_quantised,
+                        owner->impl_->native_source_identity};
+            }
+            const ScopedNativeQuantisedVerifierOperation original_operation(operation);
             return multiply_fused_tensor(input, projections, m, k, mpi_ctx, workspace);
         }
 
@@ -6545,7 +6561,7 @@ namespace llaminar2
                 throw std::runtime_error(
                     "[ROCmQuantisedGemmKernel] Workspace missing required buffer: ACC_INT32");
             }
-            // Shared FP32 temp buffers (used by serial paths only)
+            // Persistent FP32 temporaries also own grouped verifier combine/copy.
             if (!workspace_->hasBuffer(GemmWorkspaceBuffers::TEMP_A_FP32))
             {
                 throw std::runtime_error(
@@ -6942,6 +6958,14 @@ namespace llaminar2
                 return false;
             }
             auto decode_equivalent_dispatch = beginVerifierDecodeEquivalentScope();
+            std::optional<NativeQuantisedVerifierOperation> operation;
+            const int policy_n = rocmGemv_native_quantised_get_serial_partition_n();
+            if (impl_ && impl_->has_native_quantised && output && !output->isMapped() &&
+                n == static_cast<int>(N_) && k == static_cast<int>(K_) &&
+                alpha == 1.0f && beta == 0.0f && (policy_n <= 0 || policy_n == n))
+                operation = NativeQuantisedVerifierOperation{NativeQuantisedVerifierOperationKind::SwiGLUDown,
+                    rocm_device_id_, m, n, k, impl_->d_weights_native_quantised, impl_->native_source_identity};
+            const ScopedNativeQuantisedVerifierOperation original_operation(operation);
             return multiply_tensor_with_fused_swiglu(
                 gate, up, output, m, n, k, alpha, beta, workspace);
         }

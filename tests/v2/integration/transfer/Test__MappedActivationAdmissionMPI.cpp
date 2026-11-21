@@ -9,7 +9,9 @@
  * The48-stage recipe reuses the two original physical timeline banks without
  * host stepping. This control-only proof neither fabricates payload work nor
  * claims model inference. Every native definition and mapping retires before
- * the original source and MPI session.
+ * the original source and MPI session. Independent endpoint publications join
+ * through the original rank checkpoint before either host inspects both shared
+ * timelines; completion of one local graph cannot certify its peer's write.
  */
 #include <gtest/gtest.h>
 #include "fixtures/backends/OriginalMappedNativeCohorts.h"
@@ -65,7 +67,11 @@ public:
     ~OriginalAdmissionSuite() noexcept {try{dispose();}catch(...){std::terminate();}}
     /** Admit the exact four original channel/grant/definition declarations, then capture. */
     void prepare();
-    /** Run both original source directions for one retained recipe. */
+    /**
+     * @brief Run both original source directions for one retained recipe.
+     * @param recipe Complete captured metadata sequence to replay on both endpoints.
+     * @throws std::runtime_error If native completion or either shared timeline differs.
+     */
     void run(AdmissionRecipe recipe);
 private:
     /** One original communicator owns all test checkpoints; no WORLD substitute exists. */
@@ -169,7 +175,13 @@ void OriginalAdmissionSuite::run(AdmissionRecipe recipe){
             std::string error;frame.identity=frame.protocol->arm(ticket,1,30'000'000'000ULL,&error);requireAdmission(bool(frame.identity),error.c_str());
         }});
         checkpoint([&]{if(original_)worker_->submitAndWait([&]{frame.pending=true;frame.submitted=true;requireAdmission(Graph::submit(frame.graph,1),"Original admission parent launch failed");});});
-        checkpoint([&]{if(original_){await();requireAdmission(Graph::observeTerminal(frame.graph),"Original admission parent lacks actual terminal evidence");frame.pending=false;
+        checkpoint([&]{if(original_){await();requireAdmission(Graph::observeTerminal(frame.graph),"Original admission parent lacks actual terminal evidence");frame.pending=false;}});
+        // Publication parents write independently. The preceding checkpoint
+        // joins both local terminals through the original communicator before
+        // either host asserts its peer's signal; local completion alone does
+        // not order the other GPU. The same boundary covers idle ranks and the
+        // alternating recipe without changing either captured graph.
+        checkpoint([&]{if(original_){
             std::array<std::uint64_t,kMoEOverlayActivationBufferCount> expected{};
             if(recipe==AdmissionRecipe::Publication)expected[0]=publication;
             else for(std::uint32_t stage=0;stage<retained_stages;++stage)expected[moeOverlayActivationBufferIndex(stage)]=moeOverlayActivationLeasedTimelineValue(moeOverlayActivationBufferVisit(stage));

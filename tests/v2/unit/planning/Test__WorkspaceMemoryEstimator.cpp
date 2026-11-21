@@ -987,7 +987,9 @@ TEST(Test__WorkspaceMemoryEstimator,
     // the original quantized expert codebook or the selected router precision.
     constexpr size_t retired_half_router_bank_bytes =
         128ULL * 256ULL * 2048ULL * sizeof(uint16_t);
-    EXPECT_EQ(expected, 240642048ULL)
+    // The grouped classifier adds one four-byte device publication. Both
+    // projection roles share the same 256-byte-aligned workspace region.
+    EXPECT_EQ(expected, 240642048ULL + 256ULL)
         << "The nine-row Qwen3.6-35B mapped/compact follower family must "
            "retain the exact typed ROCm MoE and NativeQuantised workspace ABI.";
     EXPECT_GE(expected, 365474564ULL - retired_half_router_bank_bytes)

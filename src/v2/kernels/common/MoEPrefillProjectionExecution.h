@@ -21,10 +21,15 @@
 #pragma once
 
 #include "WorkspaceOverwriteContract.h"
+#include "DeviceRowRange.h"
+#include "MoEGroupingPackedDirectory.h"
 
 #include <stdexcept>
 #include <cstdint>
 #include <utility>
+#include <optional>
+#include <exception>
+#include <memory>
 
 namespace llaminar2
 {
@@ -45,8 +50,12 @@ namespace llaminar2
     {
         Unspecified, ///< No successful all-route grouping producer is bound.
         AllRoutes, ///< The ordinary unmasked grouping producer owns every route.
-        SelectedRoutes ///< A mask or published runtime assignment may select routes.
+        SelectedRoutes, ///< A mask or published runtime assignment may select routes.
+        SharedVerifierCountedOriginalRows ///< Explicit verifier, original counted rows and one implicit shared route.
     };
+
+    /** @brief Shared grouping's declared execution purpose, independent of live count contents. */
+    enum class MoESharedExpertGroupKind : std::uint8_t { Ordinary, DecodeEquivalentVerifier };
 
     /**
      * @brief Own static grouping-origin publication for one kernel instance.
@@ -67,10 +76,101 @@ namespace llaminar2
         MoEPrefillGroupingProvenance &operator=(const MoEPrefillGroupingProvenance &) = delete;
 
         /** @brief Revoke provenance when grouping buffers or their owner change. */
-        void invalidate() noexcept { scope_ = MoEPrefillRouteScope::Unspecified; }
+        void invalidate() noexcept
+        {
+            scope_ = MoEPrefillRouteScope::Unspecified;
+            shared_rows_.reset();
+            revokeDirectory();
+        }
+
+        /** @brief Revoke work-bank authority before another planner overwrites it, retaining route origin. */
+        void revokeDirectory() noexcept
+        {
+            packed_directory_.reset();
+            if (++generation_ == 0) std::terminate();
+        }
+
+        /** @brief Non-owning, non-detachable directory authority for one synchronous submission. */
+        class DirectoryBorrow final
+        {
+        public:
+            DirectoryBorrow(const DirectoryBorrow &) = delete;
+            DirectoryBorrow &operator=(const DirectoryBorrow &) = delete;
+            /** @return Whether this original generation published the optional layout.
+             * @throws std::logic_error If reset or another grouping revoked the borrow. */
+            [[nodiscard]] bool present() const { validate(); return directory_.has_value(); }
+            /** @brief Authenticate all original banks and geometry before recording a consumer.
+             * @param expected Exact current consuming workspace/stream/geometry declaration.
+             * @return Original published bindings. @throws std::logic_error For absence or mismatch. */
+            [[nodiscard]] const MoEGroupingPackedDirectory &requireMatching(
+                const MoEGroupingPackedDirectory &expected) const
+            {
+                validate();
+                if (!directory_ || *directory_ != expected)
+                    throw std::logic_error("grouped packed directory consumer changed its original producer binding");
+                return *directory_;
+            }
+            /** @brief Authenticate the actual native consumer packet against this live borrow.
+             * @param counts Original count bank. @param offsets Original offset bank.
+             * @param words Packed work bank. @param rows Physical token capacity.
+             * @param top_k Original route multiplicity. @param experts Expert domain.
+             * @param device Exact owning device. @param stream Exact ordered stream.
+             * @param layout Exact work encoding expected by this consumer.
+             * @return Original published binding; no authority is transferred.
+             * @throws std::logic_error For a revoked, missing or incompatible publication. */
+            [[nodiscard]] const MoEGroupingPackedDirectory &requireProjection(
+                const int *counts, const int *offsets, const uint32_t *words,
+                int rows, int top_k, int experts, DeviceId device, void *stream,
+                MoEGroupingPackedLayout layout = MoEGroupingPackedLayout::WideFloor8) const
+            {
+                validate();
+                if (!directory_ || directory_->counts() != counts || directory_->offsets() != offsets ||
+                    directory_->words() != words || directory_->rows() != rows || directory_->topK() != top_k ||
+                    directory_->experts() != experts || directory_->device() != device || directory_->stream() != stream ||
+                    directory_->layout() != layout)
+                    throw std::logic_error("grouped packed directory does not bind the submitted projection packet");
+                return *directory_;
+            }
+        private:
+            friend class MoEPrefillGroupingProvenance;
+            /** @brief Snapshot immutable metadata while retaining its sole publication authority. */
+            explicit DirectoryBorrow(const MoEPrefillGroupingProvenance &owner)
+                : owner_(owner), lifetime_(owner.lifetime_), generation_(owner.generation_), directory_(owner.packed_directory_) {}
+            /** @brief A copied pointer set cannot resurrect revoked publication authority. */
+            void validate() const
+            {
+                if (lifetime_.expired() || owner_.preparing_ || owner_.generation_ != generation_)
+                    throw std::logic_error("grouped packed directory borrow was revoked by preparation or reset");
+            }
+            const MoEPrefillGroupingProvenance &owner_;
+            std::weak_ptr<const uint8_t> lifetime_; ///< Cold owner identity; checked before dereferencing its storage.
+            uint64_t generation_;
+            std::optional<MoEGroupingPackedDirectory> directory_;
+        };
+
+        /** @return A lexical borrow that cannot be copied or moved out as ownership.
+         * @throws std::logic_error While an incomplete grouping still owns publication. */
+        [[nodiscard]] DirectoryBorrow borrowDirectory() const
+        {
+            if (preparing_) throw std::logic_error("cannot borrow a directory from incomplete grouping");
+            return DirectoryBorrow(*this);
+        }
 
         /** @return The last successfully published static producer's origin. */
         [[nodiscard]] MoEPrefillRouteScope scope() const noexcept { return scope_; }
+
+        /** @brief Authenticate a consuming projection against its original grouping.
+         * @param rows Actual physical projection rows, not the current live count.
+         * @param top_k Original route slots per token.
+         * @return The successfully published origin for this exact consumer.
+         * @throws std::logic_error If a shared verifier reuses a different row authority's grouping. */
+        [[nodiscard]] MoEPrefillRouteScope scopeForProjection(int rows, int top_k) const
+        {
+            if (scope_ == MoEPrefillRouteScope::SharedVerifierCountedOriginalRows &&
+                (!shared_rows_ || shared_rows_->physical_rows != rows || shared_rows_->count_capacity != rows || top_k != 1))
+                throw std::logic_error("shared verifier projection changed its prepared row geometry");
+            return scope_;
+        }
 
         /** @brief One noncopyable setup publication; it never owns device work. */
         class Preparation final
@@ -84,7 +184,7 @@ namespace llaminar2
             /** @brief Failed or abandoned setup cannot retain old provenance. */
             ~Preparation()
             {
-                if (owner_)
+                if (owner_ && !lifetime_.expired())
                 {
                     owner_->invalidate();
                     owner_->preparing_ = false;
@@ -93,15 +193,23 @@ namespace llaminar2
 
             /**
              * @brief Publish only after the entire grouping producer succeeded.
+             * @param directory Optional original packed layout submitted by the
+             * combined grouping publisher; other producers must leave it absent.
              * @throws std::logic_error if a consumed preparation is reused.
              * @note Invocation success means enqueued on its existing stream;
              *       no device count is inspected and no completion wait is added.
              */
-            void publish() &&
+            void publish(std::optional<MoEGroupingPackedDirectory> directory = std::nullopt) &&
             {
-                if (!owner_)
+                if (!owner_ || lifetime_.expired())
                     throw std::logic_error("grouped MoE origin publication already consumed");
+                if (directory && owner_->generation_ != generation_)
+                    throw std::logic_error("packed directory preparation was revoked before publication");
+                if (directory && scope_ != MoEPrefillRouteScope::AllRoutes)
+                    throw std::logic_error("packed work directory requires an ordinary all-route grouping producer");
                 owner_->scope_ = scope_;
+                owner_->shared_rows_ = shared_rows_;
+                owner_->packed_directory_ = std::move(directory);
                 owner_->preparing_ = false;
                 owner_ = nullptr;
             }
@@ -112,18 +220,24 @@ namespace llaminar2
              * @brief Revoke the prior producer before any replacement can fail.
              * @param owner Kernel-instance metadata receiving this publication.
              * @param scope Fixed origin selected by the typed producer factory.
+             * @param shared_rows Original immutable verifier row identity, never a count value.
              * @throws std::logic_error before altering an already active owner.
              */
-            Preparation(MoEPrefillGroupingProvenance &owner, MoEPrefillRouteScope scope)
-                : owner_(&owner), scope_(scope)
+            Preparation(MoEPrefillGroupingProvenance &owner, MoEPrefillRouteScope scope,
+                std::optional<DeviceRowRange::CaptureIdentity> shared_rows = std::nullopt)
+                : owner_(&owner), lifetime_(owner.lifetime_), scope_(scope), shared_rows_(shared_rows)
             {
                 if (owner.preparing_)
                     throw std::logic_error("grouped MoE origin preparation overlaps an active producer");
                 owner.preparing_ = true;
                 owner.invalidate();
+                generation_ = owner.generation_;
             }
             MoEPrefillGroupingProvenance *owner_;
+            std::weak_ptr<const uint8_t> lifetime_; ///< Preparation cannot publish through a destroyed/replaced owner.
             MoEPrefillRouteScope scope_;
+            std::optional<DeviceRowRange::CaptureIdentity> shared_rows_;
+            uint64_t generation_ = 0; ///< Packed storage cannot survive an intervening invalidation.
         };
 
         /**
@@ -144,8 +258,34 @@ namespace llaminar2
             return Preparation(*this, MoEPrefillRouteScope::SelectedRoutes);
         }
 
+        /** @brief Begin an explicit shared grouping without inspecting device state.
+         * @param kind Declared ordinary or serial-equivalent verifier operation.
+         * @param rows Original capture geometry and borrowed count authority.
+         * @return Unpublished origin; only original counted verifier rows qualify.
+         * @throws std::invalid_argument For an unknown purpose, revoking old provenance.
+         * @throws std::logic_error If another preparation owns this instance. */
+        [[nodiscard]] Preparation beginSharedExpert(MoESharedExpertGroupKind kind, DeviceRowRange rows)
+        {
+            if (preparing_)
+                throw std::logic_error("shared grouping origin overlaps an active producer");
+            invalidate();
+            if (kind != MoESharedExpertGroupKind::Ordinary && kind != MoESharedExpertGroupKind::DecodeEquivalentVerifier)
+                throw std::invalid_argument("unknown shared expert grouping purpose");
+            const auto identity = rows.captureIdentity();
+            const bool counted_verifier = kind == MoESharedExpertGroupKind::DecodeEquivalentVerifier &&
+                identity.count && identity.count_capacity == identity.physical_rows &&
+                identity.first_physical_row == 0 && identity.repeats_per_row == 1;
+            return Preparation(*this, counted_verifier ? MoEPrefillRouteScope::SharedVerifierCountedOriginalRows
+                                                       : MoEPrefillRouteScope::Unspecified,
+                counted_verifier ? std::optional{identity} : std::nullopt);
+        }
+
     private:
         MoEPrefillRouteScope scope_ = MoEPrefillRouteScope::Unspecified;
+        std::optional<DeviceRowRange::CaptureIdentity> shared_rows_; ///< Capture metadata only; device owns the count value.
+        std::optional<MoEGroupingPackedDirectory> packed_directory_; ///< Original binding metadata, never live route counts.
+        const std::shared_ptr<const uint8_t> lifetime_ = std::make_shared<const uint8_t>(0); ///< Allocated only with the cold kernel owner.
+        uint64_t generation_ = 1; ///< Revokes lexical borrows on every replacement/reset.
         bool preparing_ = false; ///< Exactly one setup publication owns this instance.
     };
 
@@ -159,7 +299,8 @@ namespace llaminar2
     enum class MoEPrefillMeasuredOperation : std::uint8_t
     {
         Unmeasured,
-        CompleteFullWidthTokenRowsAllRoutes
+        CompleteFullWidthTokenRowsAllRoutes,
+        CompleteFullWidthSharedVerifierTokenRows
     };
 
     /** @brief One explicit projection transaction, without implicit replay. */
@@ -246,14 +387,17 @@ namespace llaminar2
                 throw std::invalid_argument("unknown grouped MoE measured publication layout");
             if (scope != MoEPrefillRouteScope::Unspecified &&
                 scope != MoEPrefillRouteScope::AllRoutes &&
-                scope != MoEPrefillRouteScope::SelectedRoutes)
+                scope != MoEPrefillRouteScope::SelectedRoutes &&
+                scope != MoEPrefillRouteScope::SharedVerifierCountedOriginalRows)
                 throw std::invalid_argument("unknown grouped MoE measured route scope");
-            return phase_ == Phase::Complete && first_column_ == 0 &&
-                           column_count_ == model_columns_ &&
-                           layout == MoEPrefillOutputLayout::TokenRows &&
-                           scope == MoEPrefillRouteScope::AllRoutes
-                       ? MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes
-                       : MoEPrefillMeasuredOperation::Unmeasured;
+            if (phase_ != Phase::Complete || first_column_ != 0 || column_count_ != model_columns_ ||
+                layout != MoEPrefillOutputLayout::TokenRows)
+                return MoEPrefillMeasuredOperation::Unmeasured;
+            if (scope == MoEPrefillRouteScope::AllRoutes)
+                return MoEPrefillMeasuredOperation::CompleteFullWidthTokenRowsAllRoutes;
+            if (scope == MoEPrefillRouteScope::SharedVerifierCountedOriginalRows)
+                return MoEPrefillMeasuredOperation::CompleteFullWidthSharedVerifierTokenRows;
+            return MoEPrefillMeasuredOperation::Unmeasured;
         }
 
         /**

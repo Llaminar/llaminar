@@ -3,36 +3,30 @@
 Serving frontier: 2026-10-09, hybrid PP(TP(2 ROCm), TP(2 CUDA)). Keep below 200 lines and 15,000 bytes;
 history: [October 9 archive](../2026-10/MTP_TUNING_DASHBOARD_HISTORY_20261009.md) and [project plan](MTP_VLLM_STYLE_PROJECT_PLAN.md).
 
-GDN integration, 2026-10-26: `e2c971301` pushed; full prerequisites2841pass/29skip,
-post-packaging Unit782/782 and five loader checks pass. Matched Qwen3.6 ROCm
-decode improves10–15%; CUDA is flat with683MiB less workspace. CPU counter
-batching gains5.91%. [Limits and evidence](../2026-10/GDN_FIXED_EPOCH_BACKEND_PORT_PLAN.md).
+gfx1100 MTP, 2026-11-15:171 native Release cases and five focused ROCm registrations pass.
+[WMMA work list](../2026-11/GFX1100_MTP_GROUPED_WMMA_PLAN.md): all21-source Auto sweep passes1,890 cells; all1,264 WMMA keys win1.002–2.005× (geo1.286×),626 keep Dot4.
+All168 dense profiles pass without spills. Router Auto wins85/120 keys (geo1.104×), seven focused gates and80 spill-free profiles pass. Attention all-lane arithmetic passes diagnostics; routed/shared/production attention remain open.
+
+GDN integration, 2026-10-26: `e2c971301` pushed; full prerequisites2841pass/29skip, post-packaging Unit782/782 and five loader checks pass.
+Matched Qwen3.6 ROCm decode improves10–15%; CUDA is flat with683MiB less workspace. CPU counter batching gains5.91%. [Limits and evidence](../2026-10/GDN_FIXED_EPOCH_BACKEND_PORT_PLAN.md).
 The incoming branch's 1,362 gates, 13 model cells and +1.9/+5.5/+5.9% depth-2/3/4 decode
 results compare against older develop, with changed work; they do not qualify this merge.
 Historical CPU scope and prefill cost: [GDN tuning results](../2026-10/gated-deltanet-epoch-tuning-results.md).
 
 ## Active QFN frontier — 2026-10-28
 
-The user accepted the confirmation controller as the QFN ROCm TP4 default;
-speed misses remain diagnostic. Current repetition benchmark: dynamic 101.05
-decode tok/s, fresh Off 43.40, dated Castagna 98.16; token IDs agree.
-R13 Unit/preflight passes 2,978 tests with 29 hardware skips. Post-audit Unit
-passes 786/786; nine HTTP modes pass. The ten-phase OpenCode app completes with
-128 tool calls, two errors, 65 app tests and independent acceptance passing.
-Native-token and archive-auditor repairs pass focused regressions. The original
-app aggregate remains red for an unresolved AMDGPU USERPTR workqueue warning
-and cannot retroactively certify its reclaimed archive. Full certification is open.
+The user accepted the confirmation controller as the QFN ROCm TP4 default; speed misses remain diagnostic.
+Current repetition benchmark: dynamic 101.05 decode tok/s, fresh Off 43.40, dated Castagna 98.16; token IDs agree.
+R13 Unit/preflight passes 2,978 tests with 29 hardware skips. Post-audit Unit passes 786/786; nine HTTP modes pass.
+The ten-phase OpenCode app completes with128 tool calls, two errors, 65 app tests and independent acceptance passing.
+Native-token and archive-auditor repairs pass focused regressions. The original app aggregate remains red for an unresolved AMDGPU USERPTR workqueue warning and cannot retroactively certify its reclaimed archive. Full certification is open.
 [Live plan](../2026-10/QFN_MTP_TP4_TUNING.md). Historical hybrid results do not qualify QFN.
 
 ## Completed evidence
 
-- The four homogeneous dense/MoE CUDA2/ROCm2 OpenCode app cells completed:
-  609 requests, 702 tools, seven stochastic tool errors; engine/protocol/progress
-  checks passed. Model-authored application acceptance failures remain separate.
-- r36 complete native prerequisites: 1,691 outcomes, 1,671 passed, 20 optional
-  hardware skips, zero failures. Driver diagnostics were clean.
-- r36 repaired RCCL protocol-default initialization passed native source-bound
-  positive/negative and concurrent checks plus 20 fresh four-GPU repetitions.
+- The four homogeneous dense/MoE CUDA2/ROCm2 OpenCode app cells completed: 609 requests, 702 tools, seven stochastic tool errors; engine/protocol/progress checks passed. Model-authored application acceptance failures remain separate.
+- r36 complete native prerequisites: 1,691 outcomes, 1,671 passed, 20 optional hardware skips, zero failures. Driver diagnostics were clean.
+- r36 repaired RCCL protocol-default initialization passed native source-bound positive/negative and concurrent checks plus 20 fresh four-GPU repetitions.
 - r36 dense Qwen3.8-27B hybrid Release smoke passed fresh, exact-prefix and
   extended-prefix requests with default dynamic MTP and context 262,144.
 - The dense untraced 512-prefill/256-decode benchmark measured median

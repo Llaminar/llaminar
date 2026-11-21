@@ -1,5 +1,37 @@
 # vLLM-Style MTP Project Plan
 
+## 2026-11-14: gfx1100 grouped-decode WMMA work item
+
+The user added grouped MTP decode to the active ROCm WMMA campaign. Grouped
+execution already exists: dense verifier projections use ordered dot products,
+and routed experts reuse the grouped transaction. Its installed M512 prefill
+selection does not qualify ordinary verifier capacities. CUDA has an installed INT8 tensor-core grouped verifier candidate. Add
+ROCm native producers and measured selection across dense/fused/shared
+projections, routed experts, router and attention, with explicit floating-format
+arithmetic admission. The [implementation work list](../2026-11/GFX1100_MTP_GROUPED_WMMA_PLAN.md)
+owns source findings, all-format/runtime-row byte gates, captured replay and
+profiling requirements. Broader implementation/qualification remains open;
+prefill wins do not establish MTP speedups. Component work uses the user's
+focused/feature-suite scope and does not claim full production certification.
+The standalone beta/mapped-output prerequisite now preserves grouped execution
+and original device row ownership; four replay cases pass in both optimized
+builds and the affected all-format/device-counted suite passes. See the
+[epilogue repair proof](../2026-11/GFX1100_MTP_VERIFIER_EPILOGUE.md).
+Native M16/N64 replay now passes171 Release cases and five focused ROCm
+registrations. Prior seven epilogue cases and six host checks remain green.
+Exact hosted width identity reaches the original capture worker and belongs to
+graph identity. The all21-source actual Automatic sweep passes1,890 complete
+projection/SwiGLU cells across three N/K anchors and M2–16. All1,264 selected
+native cells win1.00198–2.00465× (geometric mean1.28647×);626 keys retain Dot4.
+All168 per-source profiles pass with zero memory spills. Other geometries, multi-output/routed/shared
+operations and production grouped attention remain open. Router actual Automatic
+qualifies85/120 exact-width keys (geometric mean1.10438×), with seven focused
+registrations and80 separate counter profiles green with zero memory spills. All-lane attention diagnostics
+preserve score and final-output bytes atS1/S2; real row metadata, capture and
+economy are pending. Direct floating WMMA substitutions change existing native
+input or explicit-half reduction contracts; the three current byte gates pass.
+These are component results, not model-level MTP performance claims.
+
 ## Current branch integration and backend port
 
 The October 25 CPU results below originated on the incoming GDN harness branch

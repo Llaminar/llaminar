@@ -9,7 +9,7 @@
 #include <gtest/gtest.h>
 #include <hip/hip_runtime.h>
 
-#include "backends/rocm/ROCmHardwareMetadata.h"
+#include "../../../utils/ROCmQFNReplayDevice.h"
 #include "kernels/common/NativeQuantisedGroupedDecodePolicy.h"
 #include "kernels/common/ProjectionRowWork.h"
 #include "kernels/rocm/gemm/ROCmGroupedVerifierLaunch.h"
@@ -219,13 +219,10 @@ void matchReplay(const std::vector<float>& output, const std::vector<float>& par
 /** @test Every enabled capacity replays empty, partial, full and zero-after-full without recapture. */
 TEST(ROCmGroupedHCDownLongK, DecoderPartialsAndFinalMatchSerialWithDirtyCapacity)
 {
-    llaminar2::initializeROCmHardwareMetadata();
-    const auto &inventory = llaminar2::rocmHardwareMetadata();
-    if (inventory.size() == 0) GTEST_SKIP() << "No ROCm device";
-    const auto &hardware = inventory.at(0);
-    if (!hardware.isa_target.starts_with("gfx906") || hardware.compute_units != 60)
+    const int ordinal = llaminar2::test::findQFNMI50ReplayDevice();
+    if (ordinal < 0)
         GTEST_SKIP() << "HC-down long-K opt-in is scoped to 60-CU gfx906";
-    checked(hipSetDevice(0));
+    checked(hipSetDevice(ordinal));
     const Stream streamOwner;
     const auto stream = streamOwner.native;
     const auto *mode = std::getenv("LLAMINAR_QFN_ROCM_GROUPED_HC_DOWN_LONG_K");
@@ -255,7 +252,7 @@ TEST(ROCmGroupedHCDownLongK, DecoderPartialsAndFinalMatchSerialWithDirtyCapacity
                 return rocmGemv_native_quantised_small_m_fp32_with_sums_policy(
                     input.data, packed.data, weightScales.data, nullptr, nullptr,
                     result.data, activationScales.data, nullptr, partials.data,
-                    m, n, k, q8, q8, 0, stream, &rows);
+                    m, n, k, q8, q8, ordinal, stream, &rows);
             };
             {
                 const DecodeEquivalent policy;
@@ -287,7 +284,7 @@ TEST(ROCmGroupedHCDownLongK, DecoderPartialsAndFinalMatchSerialWithDirtyCapacity
                     ASSERT_TRUE(rocmGemv_native_quantised_fp32_with_policy(
                         input.data + row * k, packed.data, weightScales.data, nullptr, nullptr,
                         reference.data + row * n, nullptr, referencePartials.data + row * scratchPartitions * n,
-                        n, k, q8, q8, 0, stream, activationScales.data + row * groups));
+                        n, k, q8, q8, ordinal, stream, activationScales.data + row * groups));
                 const auto serialResults = reference.output(stream);
                 const auto serialPartials = referencePartials.output(stream);
                 ASSERT_TRUE(std::any_of(serialResults.begin(), serialResults.begin() + m * n,

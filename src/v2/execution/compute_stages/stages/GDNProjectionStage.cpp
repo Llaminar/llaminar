@@ -16,6 +16,7 @@
  */
 
 #include "GDNProjectionStage.h"
+#include "kernels/common/VerifierGDNBundle.h"
 #include "../ComputeStageUtils.h"
 #include "../../../loaders/PreparedWeightStore.h"
 #include "../../../tensors/Tensors.h"
@@ -632,6 +633,14 @@ namespace llaminar2
 
         const bool corrected_qkv = params_.qkv_operand_precision ==
             QuantizedActivationOperandPrecision::TwoTermQ8;
+        // Validate the complete operation before corrected QKV submits any
+        // output. Its neutral boundary also prevents scalar key borrowing.
+        const ScopedVerifierGDNBundle original_bundle(
+            params_.force_decode_equivalent_verifier_prefill && M>1
+                ? std::optional(VerifierGDNBundleBinding::bind(params_.device_id,A_base,
+                    params_.verifier_row_range.value_or(DeviceRowRange::fullyActive(M)),K,
+                    projections,params_.qkv_operand_precision,corrected_qkv?params_.qkv_row_range:std::nullopt))
+                : std::nullopt);
         if (corrected_qkv)
         {
             auto *engine = requireCorrectedQKVEngine();
@@ -684,6 +693,11 @@ namespace llaminar2
                     }
 
                     auto group = selectProjections(all_projections, group_indices);
+                    std::array<VerifierGDNRole,4> roles{};
+                    for(size_t member=0;member<group_indices.size();++member)
+                        roles[member]=static_cast<VerifierGDNRole>(group_indices[member]);
+                    const ScopedVerifierGDNSubgroup subgroup(ScopedVerifierGDNBundle::current()->subgroup(
+                        std::span(roles).first(group_indices.size()),group));
                     if (!group.front().kernel->multiply_fused_verifier_rows_decode_equivalent(
                             A_base,
                             group,
@@ -721,10 +735,14 @@ namespace llaminar2
 
             // Select the legal grouping before submission. Retrying a failed
             // homogeneous group would duplicate an unknown prefix of GPU work.
+            const auto submit_homogeneous = [&] {
+                constexpr std::array roles{VerifierGDNRole::QKV,VerifierGDNRole::Z,VerifierGDNRole::Alpha,VerifierGDNRole::Beta};
+                const ScopedVerifierGDNSubgroup subgroup(ScopedVerifierGDNBundle::current()->subgroup(roles,projections));
+                return gemm_qkv->multiply_fused_verifier_rows_decode_equivalent(
+                    A_base,projections,M,K,nullptr,bound_workspace_);
+            };
             const bool verifier_success = homogeneous_projection_group
-                ? gemm_qkv->multiply_fused_verifier_rows_decode_equivalent(
-                      A_base, projections, M, K, nullptr, bound_workspace_)
-                : try_grouped_verifier_projections(projections);
+                ? submit_homogeneous() : try_grouped_verifier_projections(projections);
             if (verifier_success)
             {
                 recordGDNProjectionRoute(

@@ -1,3 +1,5 @@
+# @file V2NativeSharedFileLifecycleTests.cmake
+# @brief Register source-bound dependency lifecycle and installer replay proofs.
 # Complete native host-file replay belongs to the dependency builder. Installed
 # Unit/preflight passively authenticates its exact source/compiler/DSO outcomes.
 # This certificate covers partial file creation, never full GPU transport setup.
@@ -17,6 +19,15 @@ foreach(V2_SHARED_FILE_SUITE Unit Integration)
         LABELS "V2;${V2_SHARED_FILE_SUITE};DeviceFree;BuildSystem;Regression" TIMEOUT 30)
 endforeach()
 set_property(TEST V2_Integration_NativeSharedFileProofPackaging APPEND PROPERTY LABELS ProductionTestPreflight)
+
+# Replay the actual installer argv through both proof parsers, including the
+# original dash-prefixed argument failure, without invoking an SDK or compiler.
+add_test(NAME V2_Integration_NCCLInstallerArchitectureArgumentReplay
+    COMMAND ${Python3_EXECUTABLE} -B
+        "${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_shared_file_lifecycle.py"
+        NativeSharedFileProofTests.test_nccl_installer_preserves_dash_prefixed_architecture_arguments)
+set_tests_properties(V2_Integration_NCCLInstallerArchitectureArgumentReplay PROPERTIES
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;BuildSystem;Replay;Regression" TIMEOUT 30)
 
 if(HAVE_CUDA AND HAVE_NCCL AND NOT V2_PERF_TESTS_ONLY)
     get_filename_component(V2_SHARED_FILE_NCCL_LIBDIR "${NCCL_LIBRARY}" DIRECTORY)
