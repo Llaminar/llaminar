@@ -2,11 +2,10 @@
  * @file missing_dependency_fixture.c
  * @brief Native loader fixture whose one dependency is owned and absent.
  *
- * The object exports a probe with no imports of its own; linking against
- * the removed stub records exactly one NEEDED entry,
- * libllaminar-absent-dependency.so.9, which no installed environment
- * provides. Loading it exercises the loader's missing-dependency path with
- * a contract this tree owns, independent of host architecture or libc.
+ * The probe has no imports of its own. Linking against the stub records
+ * libllaminar-absent-dependency.so.9 as a NEEDED entry, while the stub's actual
+ * filename differs and stays in the build tree. Loading the fixture exercises
+ * the missing-dependency path independently of host architecture or libc.
  */
 int llaminar_native_loader_missing_dependency_probe(void)
 {

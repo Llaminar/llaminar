@@ -1,3 +1,5 @@
+## @file V2CUDAHardwareMetadataTests.cmake
+#  @brief Register device-free loader and native CUDA hardware metadata tests.
 include(${CMAKE_CURRENT_LIST_DIR}/V2NativeModuleOwnership.cmake)
 # Pure physical-publication and actual attention-policy replay: no CUDA runtime.
 add_executable(v2_unit_cuda_hardware_metadata
@@ -25,20 +27,23 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
 # Build-owned native loader fixtures: the proof drives the real loader
 # against dependency and import contracts this tree owns, on every
 # supported host architecture, instead of inspecting arbitrary system
-# libraries. The absent-dependency stub exists only during the fixture
-# link and is removed afterward, so the fixture's single NEEDED entry is
-# genuinely unresolvable in every installed image. All fixture names begin
-# with the runtime prefix, so the installed receipt seals them and the
-# slim test runner executes the proof without a compiler.
+# libraries. The stub advertises a SONAME different from its on-disk filename.
+# Linking records the missing SONAME while keeping the stub's build output
+# intact for incremental builds. Test runner packaging removes CMakeFiles, so
+# the link stub stays in the build tree and the runnable fixtures stay sealed.
 add_library(llaminar_native_loader_stub SHARED
     fixtures/native-loader/stub.c)
 set_target_properties(llaminar_native_loader_stub PROPERTIES
-    PREFIX "lib" OUTPUT_NAME "llaminar-absent-dependency.so" SUFFIX ".9")
+    PREFIX "lib" OUTPUT_NAME "native-loader-link-stub" NO_SONAME TRUE
+    LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/native-loader-link-stub")
+target_link_options(llaminar_native_loader_stub PRIVATE
+    "LINKER:-soname,libllaminar-absent-dependency.so.9")
 
 add_library(llaminar_native_loader_missing_dependency SHARED
     fixtures/native-loader/missing_dependency_fixture.c)
 set_target_properties(llaminar_native_loader_missing_dependency PROPERTIES
-    PREFIX "lib" OUTPUT_NAME "llaminar-native-loader-missing-dependency")
+    PREFIX "lib" OUTPUT_NAME "llaminar-native-loader-missing-dependency"
+    SKIP_BUILD_RPATH TRUE)
 target_link_libraries(llaminar_native_loader_missing_dependency PRIVATE
     llaminar_native_loader_stub)
 # The fixture has no undefined imports of its own, so the default
@@ -47,9 +52,6 @@ target_link_libraries(llaminar_native_loader_missing_dependency PRIVATE
 # must fail to resolve.
 target_link_options(llaminar_native_loader_missing_dependency PRIVATE
     -Wl,--no-as-needed)
-add_custom_command(TARGET llaminar_native_loader_missing_dependency POST_BUILD
-    COMMAND "${CMAKE_COMMAND}" -E remove "$<TARGET_FILE:llaminar_native_loader_stub>"
-    COMMENT "removing the absent-dependency link stub after the fixture link")
 
 add_library(llaminar_native_loader_undefined_symbol SHARED
     fixtures/native-loader/undefined_symbol_fixture.c)

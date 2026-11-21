@@ -21892,7 +21892,7 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_WmmaReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_device_counted_verifier_rows>
                 --gtest_filter=AllFormats/ROCmDeviceCountedVerifierWmma.*:ROCmVerifierWmmaDispatch.*
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;MTP;GroupedVerifierRows;GraphCapture;ByteExact;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;MTP;GroupedVerifierRows;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100;NUMALocalOrdinal0"
         MPI_PROCS 1
         NO_MODELS
     )
@@ -21910,7 +21910,7 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_WmmaEpilogueReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_verifier_epilogue_replay>
                 --gtest_filter=ROCmVerifierWmmaEpilogueReplay.*
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;MTP;GroupedVerifierRows;GraphCapture;ByteExact;Regression"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;GEMM;MTP;GroupedVerifierRows;GraphCapture;ByteExact;Regression;HardwareOptional;Devices1;NativeISA-gfx1100;NUMALocalOrdinal0"
         MPI_PROCS 1
         NO_MODELS
     )
@@ -23344,7 +23344,7 @@ if(HAVE_ROCM)
     add_v2_test(V2_Integration_ROCmVerifierAttentionWmmaReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
                 --gtest_filter=ROCmVerifierAttentionWmma.DirectRingDirtyReplay:ROCmVerifierAttentionWmma.SpecialValuesDirtyReplay:ROCmVerifierAttentionWmma.HeadGroupsAndTailsDirtyReplay:Test__ROCmFlashAttentionParity.CapturedAppendThenAttention_WmmaLaneExact_FP16HD256
-        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;MTP;GroupedVerifierRows;WMMA;GraphCapture;Replay;ByteExact;NativeRing;FP16;Regression;HardwareOptional;Devices1;NativeISA-gfx1100"
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;Attention;MTP;GroupedVerifierRows;WMMA;GraphCapture;Replay;ByteExact;NativeRing;FP16;Regression;HardwareOptional;Devices1;NativeISA-gfx1100;NUMALocalOrdinal0"
         MPI_PROCS 1 NO_MODELS TIMEOUT 120 RESOURCE_LOCK rocm_gpu_0)
     add_v2_test(V2_Integration_ROCmVerifierAttentionControlAndPayloadReplay
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
@@ -23379,9 +23379,10 @@ if(HAVE_ROCM)
         NO_MODELS
         RESOURCE_LOCK rocm_gpu_0
     )
+    # The WMMA append case runs in the ordinal-qualified verifier replay above.
     add_v2_test(V2_Integration_GroupedVerifierRows_ROCm_Attention
         COMMAND $<TARGET_FILE:v2_integration_rocm_flash_attention_parity>
-                --gtest_filter=Test__ROCmFlashAttentionParity.CapturedAppendThenAttention_*
+                --gtest_filter=Test__ROCmFlashAttentionParity.CapturedAppendThenAttention_*-Test__ROCmFlashAttentionParity.CapturedAppendThenAttention_WmmaLaneExact_FP16HD256
                 --gtest_brief=1
         LABELS "V2;Integration;ROCm;MTP;GroupedVerifierRows;DecodeEquivalent;Attention;KVCache;LocalTP;FP16;Q8_1;Regression;gfx906"
         MPI_PROCS 1
@@ -31185,12 +31186,6 @@ set(V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_MTPHostedExactVerifierPublicationOwners
     V2_Integration_ROCmDensePrefillOverlayAdmission
     V2_Integration_ROCmDensePrefillMixedArchitectureReplay
-    V2_Integration_CUDADensePrefillDirtyReplay
-    V2_Integration_ROCmDensePrefillDirtyReplay
-    V2_Integration_ROCmNativePrefillProducerStats
-    V2_Integration_ROCmNativeQuantisedWmmaReplay
-    V2_Integration_ROCmNativeQuantisedPackedGeometry
-    V2_Integration_ROCmNativeQuantisedWmmaArithmeticReplay
     V2_Integration_ROCmNativeQ8GeometryEvidence
     V2_Integration_MTPDefaultSamplingPolicy
     ${V2_FP32_SUBNORMAL_PREFLIGHT_TESTS}
@@ -31426,6 +31421,7 @@ if(HAVE_CUDA)
     V2_Integration_Q8ExpertFiniteScaleContract_CUDA
     V2_Integration_Q8RouterFiniteScaleContract_CUDA
     V2_Integration_CUDA_Q8KSourceScaleRepack
+    V2_Integration_CUDADensePrefillDirtyReplay
     ${V2_CUDA_DENSE_PREFILL_INSTALLED_TESTS}
     V2_Integration_CUDAWorkspaceMemoryEstimator
     V2_Integration_PlanningExecutionMeasurement_CUDA
@@ -31532,6 +31528,11 @@ if(HAVE_ROCM)
     V2_Integration_ROCmMoERuntimeGroupResources
     V2_Integration_ROCmResidualAddTailExtents
     V2_Integration_ROCm_Q8KSourceScaleRepack
+    V2_Integration_ROCmDensePrefillDirtyReplay
+    V2_Integration_ROCmNativePrefillProducerStats
+    V2_Integration_ROCmNativeQuantisedWmmaReplay
+    V2_Integration_ROCmNativeQuantisedPackedGeometry
+    V2_Integration_ROCmNativeQuantisedWmmaArithmeticReplay
     ${V2_ROCM_DENSE_PREFILL_INSTALLED_TESTS}
     V2_Integration_PlanningExecutionMeasurement_ROCm
     V2_Integration_PlanningMPIExpertSample_ROCm
