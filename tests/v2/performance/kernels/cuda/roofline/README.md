@@ -158,3 +158,11 @@ and K=256, median latency drops from 9.088 to 8.768 µs for Q4_1, from
 9.280 to 8.896 µs for Q4_K, and from 10.784–10.880 to 8.832–8.896 µs
 for Q2_K.
 Both compiled readers use 37 registers per thread and zero local bytes.
+
+Unpacking whole weight words cuts the SM86 verifier's Q2_K loop from 132
+to 75 compiled instructions. The Q6_K reader uses aligned eight-byte loads
+and expands the high two-bit planes across packed bytes before centering.
+At the same wide geometry, Q2_K runs in 7.168–7.232 µs and Q6_K drops from
+21.120–21.248 to 14.016–14.080 µs. The readers use 38 and 37 registers per
+thread respectively, with zero local bytes. All 21 source formats retain
+byte equality with serial decode under capture.

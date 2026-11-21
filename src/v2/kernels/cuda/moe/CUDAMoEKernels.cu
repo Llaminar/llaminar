@@ -10,6 +10,7 @@
  * never expands identical hidden activations into one copy per expert route.
  * Narrow SM86 Q5_1 Down publishes exact K32 contributions using independent
  * packed integer dots for the two halves and for the activation correction.
+ * The SM86 verifier decodes Q2_K and Q6_K weight planes four bytes at a time.
  * IQ4_XS physical format 24 preserves the original half base and raw six-bit
  * coefficient in separate 16-bit planes. Its LUT payload and source4 reduction
  * schedule are unchanged; the coefficient is storage metadata, never a minimum.
@@ -18773,6 +18774,66 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     };
 
     /**
+     * @brief Form the eight packed signed-byte operands of an MoE K32 dot.
+     * @tparam CodebookId Physical payload layout admitted for the route.
+     * @tparam Order Dot schedule that owns this packet.
+     * @param payload Address of one prepared packet. Q2_K and Q6_K packets
+     *        start on eight-byte boundaries in the aligned payload plane.
+     * @param groups Decoded operands in the original DP4A order.
+     */
+    template <uint8_t CodebookId, NativeMoEDotOrder Order>
+    __device__ __forceinline__ void decode_moe_native_quantised_packet(
+        const uint8_t *payload, int32_t (&groups)[8])
+    {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+        if constexpr (Order == NativeMoEDotOrder::VerifierK32 &&
+                      CodebookId == native_formats::Q2_K.codebook_id)
+        {
+            const uint2 weights = *reinterpret_cast<const uint2 *>(payload);
+#pragma unroll
+            for (int group = 0; group < 4; ++group)
+            {
+                groups[group] = static_cast<int32_t>((weights.x >> (2 * group)) & 0x03030303u);
+                groups[group + 4] = static_cast<int32_t>((weights.y >> (2 * group)) & 0x03030303u);
+            }
+        }
+        else if constexpr (Order == NativeMoEDotOrder::VerifierK32 &&
+                           CodebookId == native_formats::Q6_K.codebook_id)
+        {
+            const auto *words = reinterpret_cast<const uint2 *>(payload);
+            const uint2 first = words[0];
+            const uint2 second = words[1];
+            const uint2 high = words[2];
+            const uint32_t low_words[4] = {first.x, first.y, second.x, second.y};
+            const auto expand_high_pairs = [](uint32_t bits) {
+                return ((bits & 0x03u) << 4) | ((bits & 0x0cu) << 10) |
+                       ((bits & 0x30u) << 16) | ((bits & 0xc0u) << 22);
+            };
+            const auto center = [](uint32_t packed) {
+                constexpr uint32_t kByteSignMask = 0x80808080u;
+                constexpr uint32_t kByteMidpoint = 0x20202020u;
+                // Add a sign-bit guard in every byte so subtracting 32
+                // from each lane cannot borrow from its neighbor.
+                return static_cast<int32_t>(
+                    ((packed ^ kByteSignMask) - kByteMidpoint) ^ kByteSignMask);
+            };
+#pragma unroll
+            for (int group = 0; group < 4; ++group)
+            {
+                const auto lo = low_words[group] & 0x0f0f0f0fu;
+                const auto hi = (low_words[group] >> 4) & 0x0f0f0f0fu;
+                groups[group] = center(lo | expand_high_pairs(high.x >> (8 * group)));
+                groups[group + 4] = center(hi | expand_high_pairs(high.y >> (8 * group)));
+            }
+        }
+        else
+#endif
+        {
+            llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(payload, groups);
+        }
+    }
+
+    /**
      * @brief Compute one 32-wide native-quantised block with the serial GEMV FP32 order.
      *
      * MTP verifier rows are allowed to execute as grouped MoE work, but each row
@@ -19660,7 +19721,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                                      linear * llaminar2::cuda_native_quantised::payload_bytes_for_codebook<CodebookId>();
 
             int32_t packed_groups[8];
-            llaminar2::cuda_native_quantised::decode_groups_vec<CodebookId>(payload, packed_groups);
+            decode_moe_native_quantised_packet<CodebookId, Order>(payload, packed_groups);
 
             const float scale_a = scales_A_blockwise[block_idx];
             const float contribution =
