@@ -236,8 +236,10 @@ TEST(ROCmVerifierBundlePolicy, GateUpSourceInventoryAndMeasuredHoles)
         const NativeQuantisedSourceIdentity source{format.source_codebook_id,format.source_is_superblock,true};
         operation.members[0].source=operation.members[1].source=source;
         const bool native=measuredNativeQuantisedVerifierBundle(operation);selected+=native;
-        if(m<2 || m>16)EXPECT_FALSE(native);
-        if(m==16)EXPECT_TRUE(native);
+        // The measured panel has no MXFP4 key, so no MXFP4 row bundles natively.
+        const bool measured=format.source_codebook_id!=kNativeQuantisedMXFP4Codebook;
+        if(m<2 || m>16 || !measured)EXPECT_FALSE(native);
+        if(m==16 && measured)EXPECT_TRUE(native);
         auto unknown=operation;unknown.k+=32;EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(unknown));
         unknown=operation;unknown.members[1].n+=64;EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(unknown));
         unknown=operation;unknown.members[0].source.present=false;EXPECT_FALSE(measuredNativeQuantisedVerifierBundle(unknown));
@@ -335,4 +337,15 @@ TEST(ROCmVerifierBundlePolicy, MaterializedHeadSingletonScopeReplay)
         EXPECT_EQ(hasNativeQuantisedMaterializedHead(),kind==VerifierProjectionBundleKind::MaterializedLMHead);
     }
     EXPECT_FALSE(hasNativeQuantisedMaterializedHead());
+}
+
+/** @test Automatic verifier WMMA qualification excludes the unmeasured MXFP4 decoder. */
+TEST(ROCmVerifierBundlePolicy, WmmaQualificationExcludesUnmeasuredMXFP4)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::rocm;
+    for (const auto &format : test::quantizedVerifierFormats())
+        EXPECT_EQ(nativeQuantisedVerifierWmmaQualified(format.device_execution_codebook_id),
+                  format.device_execution_codebook_id != kNativeQuantisedMXFP4Codebook)
+            << format.label;
 }
