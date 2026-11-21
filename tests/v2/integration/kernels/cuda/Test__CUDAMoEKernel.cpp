@@ -23903,10 +23903,10 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
     cuda_moe_config.cuda_moe_reuse_router_q8_hidden = true;
 
     // The default inventory sweeps every source format and supported verifier
-    // depth. The two wider probe shapes isolate part of that matrix at M=4.
+    // depth. The wider probes isolate M=4 and keep the same serial oracle.
     const char *requested_geometry = std::getenv("LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY");
     const std::string_view geometry = requested_geometry ? requested_geometry : "";
-    ASSERT_TRUE(geometry.empty() || geometry == "qfn" || geometry == "iq4");
+    ASSERT_TRUE(geometry.empty() || geometry == "qfn" || geometry == "iq4" || geometry == "wide");
     const bool wide_geometry = !geometry.empty();
     const int top_k = wide_geometry ? 8 : 4;
     const int num_experts = 2 * top_k;

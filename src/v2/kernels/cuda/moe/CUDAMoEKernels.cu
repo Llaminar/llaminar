@@ -18764,6 +18764,14 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                     value, scale));
     }
 
+    /** @brief Rounding and scheduling of one NativeQuantised expert dot. */
+    enum class NativeMoEDotOrder : uint8_t
+    {
+        PartitionPartial,  ///< The caller publishes a split-K partial.
+        DecodeK32,         ///< Direct serial decode publishes ordered K32 terms.
+        VerifierK32,       ///< Direct grouped verification publishes the same terms.
+    };
+
     /**
      * @brief Compute one 32-wide native-quantised block with the serial GEMV FP32 order.
      *
@@ -18778,8 +18786,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * delegates publication to the shared CUDA/cross-backend contract.
      *
      * @tparam CodebookId Canonical NativeQuantised source-policy identifier.
-     * @tparam OrderedK32 Direct Down publication uses one rounded contribution
-     *         per K32 partition in both decode and verification.
+     * @tparam Order Split-K partial, serial decode, or grouped verifier publication.
      * @param a_vals Eight packed activation groups for one 32-value K block.
      * @param packed_groups Eight decoded signed-weight groups.
      * @param payload Prepared codebook payload for IQ1_M sign extraction.
@@ -18793,7 +18800,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @pre The caller has admitted the descriptor and all of its required
      *      coefficient planes before entering the K32 traversal.
      */
-    template <uint8_t CodebookId, bool OrderedK32 = false>
+    template <uint8_t CodebookId, NativeMoEDotOrder Order = NativeMoEDotOrder::PartitionPartial>
     __device__ __forceinline__ float moe_native_quantised_block_contribution_rn(
         const int32_t *__restrict__ a_vals,
         const int32_t *__restrict__ packed_groups,
@@ -18807,8 +18814,23 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     {
         using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
 
+        const auto sum_quantised_word = [](int32_t packed) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
-        if constexpr (OrderedK32 && CodebookId == native_formats::Q5_1.codebook_id)
+            if constexpr (Order == NativeMoEDotOrder::VerifierK32 &&
+                          (CodebookId == native_formats::Q4_1.codebook_id ||
+                           CodebookId == native_formats::Q2_K.codebook_id))
+            {
+                // The signed dot against four ones is the exact byte sum.
+                return __dp4a(packed, 0x01010101, 0);
+            }
+            else
+#endif
+                return llaminar2::cuda_native_quantised::sum_packed_i8(packed);
+        };
+
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+        if constexpr (Order != NativeMoEDotOrder::PartitionPartial &&
+                      CodebookId == native_formats::Q5_1.codebook_id)
         {
             constexpr int32_t kSignedByteOnes = 0x01010101;
             int dot_lo = 0;
@@ -18859,8 +18881,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             {
                 dot_lo = __dp4a(a_vals[group], packed_groups[group], dot_lo);
                 dot_hi = __dp4a(a_vals[group + 4], packed_groups[group + 4], dot_hi);
-                sum_lo += llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[group]);
-                sum_hi += llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[group + 4]);
+                sum_lo += sum_quantised_word(a_vals[group]);
+                sum_hi += sum_quantised_word(a_vals[group + 4]);
             }
 
             uint16_t iq1m_qh = 0u;
@@ -18912,7 +18934,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             for (int group = 0; group < 8; ++group)
             {
                 dot = __dp4a(a_vals[group], packed_groups[group], dot);
-                sum_a += llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[group]);
+                sum_a += sum_quantised_word(a_vals[group]);
             }
 
             return llaminar2::cuda_native_quantised::
@@ -19577,13 +19599,13 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param b_start              First K-block (inclusive) this call reduces.
      * @param b_end                Last K-block (exclusive) this call reduces.
      * @return Partial accumulated dot product over the requested K-block range.
-     * @tparam OrderedK32 Publish every decoded block through its original one-block
-     *         partition before folding the rounded partition into the route.
+     * @tparam Order Direct Down folds each original rounded K32 partition.
+     *         A partition partial retains the original within-partition fold.
      * @pre The caller has resolved the physical codebook, validated the
      *      descriptor and 16-byte-aligned activation row, and clipped the K32
      *      interval.
      */
-    template <uint8_t CodebookId, bool OrderedK32 = false>
+    template <uint8_t CodebookId, NativeMoEDotOrder Order = NativeMoEDotOrder::PartitionPartial>
     __device__ __forceinline__ float native_quantised_dot_admitted_range(
         const DeviceNativeQuantisedMatrixDesc &desc,
         int n,
@@ -19593,6 +19615,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         int b_start,
         int b_end)
     {
+        constexpr bool OrderedK32 = Order != NativeMoEDotOrder::PartitionPartial;
         const uint8_t *payload_base = desc.payload;
         const uint16_t *scale_base = static_cast<const uint16_t *>(desc.scales);
         const uint16_t *min_base = static_cast<const uint16_t *>(desc.mins);
@@ -19641,7 +19664,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 
             const float scale_a = scales_A_blockwise[block_idx];
             const float contribution =
-                moe_native_quantised_block_contribution_rn<CodebookId, OrderedK32>(
+                moe_native_quantised_block_contribution_rn<CodebookId, Order>(
                     a4,
                     packed_groups,
                     payload,
@@ -19671,7 +19694,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param b_end Exclusive end of the requested packets.
      * @return Ordered dot partial, or zero for an inactive/incompatible input.
      */
-    template <uint8_t CodebookId, bool OrderedK32 = false>
+    template <uint8_t CodebookId, NativeMoEDotOrder Order = NativeMoEDotOrder::PartitionPartial>
     __device__ __forceinline__ float native_quantised_dot_desc_range(
         const DeviceNativeQuantisedMatrixDesc &desc,
         int n,
@@ -19694,10 +19717,10 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             // A mixed IQ4 family shares packed bytes but resolves the scale
             // program once. The physical reader does no checks inside K.
             if (desc.codebook_id == 4)
-                return native_quantised_dot_admitted_range<4, OrderedK32>(
+                return native_quantised_dot_admitted_range<4, Order>(
                     desc, n, A_int8, scales_A_blockwise, N, b_start, b_end);
         }
-        return native_quantised_dot_admitted_range<CodebookId, OrderedK32>(
+        return native_quantised_dot_admitted_range<CodebookId, Order>(
             desc, n, A_int8, scales_A_blockwise, N, b_start, b_end);
     }
 
@@ -19886,7 +19909,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             desc, n, A_int8, scales_A_blockwise, N, K, 0, K / 32);
     }
 
-    template <bool OrderedK32>
+    template <NativeMoEDotOrder Order>
     __device__ __forceinline__ float native_quantised_dot_desc_range_dynamic(
         const DeviceNativeQuantisedMatrixDesc &desc,
         int n,
@@ -19900,49 +19923,49 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         switch (desc.codebook_id)
         {
         case 0:
-            return native_quantised_dot_desc_range<0, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<0, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 4:
-            return native_quantised_dot_desc_range<4, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<4, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
-            return native_quantised_dot_desc_range<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 5:
-            return native_quantised_dot_desc_range<5, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<5, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 6:
-            return native_quantised_dot_desc_range<6, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<6, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 7:
-            return native_quantised_dot_desc_range<7, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<7, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 8:
-            return native_quantised_dot_desc_range<8, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<8, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 9:
-            return native_quantised_dot_desc_range<9, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<9, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 10:
-            return native_quantised_dot_desc_range<10, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<10, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 11:
-            return native_quantised_dot_desc_range<11, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<11, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 12:
-            return native_quantised_dot_desc_range<12, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<12, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 13:
-            return native_quantised_dot_desc_range<13, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<13, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 14:
-            return native_quantised_dot_desc_range<14, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<14, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 15:
-            return native_quantised_dot_desc_range<15, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<15, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 16:
-            return native_quantised_dot_desc_range<16, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<16, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 17:
-            return native_quantised_dot_desc_range<17, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<17, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case 19:
-            return native_quantised_dot_desc_range<19, OrderedK32>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
+            return native_quantised_dot_desc_range<19, Order>(desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         case llaminar2::kNativeQuantisedExpandedInt8MinCodebook:
             return native_quantised_dot_desc_range<
-                llaminar2::kNativeQuantisedExpandedInt8MinCodebook, OrderedK32>(
+                llaminar2::kNativeQuantisedExpandedInt8MinCodebook, Order>(
                 desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         default:
             return 0.0f;
         }
     }
 
-    template <uint8_t CodebookId, bool OrderedK32 = false>
+    template <uint8_t CodebookId, NativeMoEDotOrder Order = NativeMoEDotOrder::PartitionPartial>
     __device__ __forceinline__ float native_quantised_dot_desc_range_dispatch(
         const DeviceNativeQuantisedMatrixDesc &desc,
         int n,
@@ -19955,12 +19978,12 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     {
         if constexpr (CodebookId == kMixedCodebookSentinel)
         {
-            return native_quantised_dot_desc_range_dynamic<OrderedK32>(
+            return native_quantised_dot_desc_range_dynamic<Order>(
                 desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         }
         else
         {
-            return native_quantised_dot_desc_range<CodebookId, OrderedK32>(
+            return native_quantised_dot_desc_range<CodebookId, Order>(
                 desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         }
     }
@@ -20407,7 +20430,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         float sum = 0.0f;
         if (expert >= 0 && expert < num_experts)
         {
-            sum = native_quantised_dot_desc_range_dispatch<CodebookId, true>(
+            sum = native_quantised_dot_desc_range_dispatch<CodebookId, NativeMoEDotOrder::DecodeK32>(
                 descriptors[expert], column,
                 activation_codes + static_cast<size_t>(route) * K,
                 activation_scales + static_cast<size_t>(route) * blocks,
@@ -20614,7 +20637,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         float sum = 0.0f;
         if (expert >= 0 && expert < num_experts)
         {
-            sum = native_quantised_dot_desc_range_dispatch<CodebookId, true>(
+            sum = native_quantised_dot_desc_range_dispatch<CodebookId, NativeMoEDotOrder::VerifierK32>(
                 descriptors[expert], column,
                 activation_codes + static_cast<size_t>(grouped_slot) * K,
                 activation_scales + static_cast<size_t>(grouped_slot) * blocks,

@@ -124,6 +124,9 @@ Set `LLAMINAR_TEST_CUDA_MOE_M4_DOWN_GEOMETRY=qfn` for N=2560, K=320,
 Q5_1 and Q8_0 Down with 32 local routes. Production preflight checks this
 geometry in `V2_Integration_CUDA_MoEVerifierQFNWidthPublicationReplay`.
 The same probe accepts `iq4` for N=2560, K=256 and both IQ4 source formats.
+Use `wide` to sweep all 21 source formats at N=2560 and K=256. The
+`V2_Integration_CUDA_MoEVerifierWideNativeFormatsPublicationReplay` preflight
+test checks those captured publications against the serial row bytes.
 
 On the QFN geometry, grouping adjacent same-expert routes to share one
 weight decode cut logical requests by 28.1%. Median Down latency rose from
@@ -148,3 +151,10 @@ The compiled M4 loop shrinks from 147 to 104 instructions and uses 37
 registers per thread with zero local bytes. The M1 kernel uses 40 registers
 and zero local bytes. The model-free preflight runs the captured QFN M1
 case in `V2_Integration_CUDA_MoEDecodeQFNWidthPublicationReplay`.
+
+The SM86 grouped verifier uses packed activation sums for the Q4_1 and Q4_K
+physical reader and for the Q2_K reader. Across the two cards at N=2560
+and K=256, median latency drops from 9.088 to 8.768 µs for Q4_1, from
+9.280 to 8.896 µs for Q4_K, and from 10.784–10.880 to 8.832–8.896 µs
+for Q2_K.
+Both compiled readers use 37 registers per thread and zero local bytes.
