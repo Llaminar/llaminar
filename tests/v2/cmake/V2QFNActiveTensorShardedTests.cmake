@@ -32,5 +32,5 @@ add_v2_test(V2_Integration_QFNCUDATP2CPUTP2MovementPreservesGeneratedTokens
     RESOURCE_LOCK "cuda_gpu_0;cuda_gpu_1"
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1"
         "LLAMINAR_PERF_STATS_SUMMARY=1"
-        "LLAMINAR_PERF_STATS_FILTER=mtp.grouped_decode_equivalent_stochastic_verifier_runs,mtp.grouped_decode_equivalent_greedy_verifier_runs,moe_overlay_residency.maintenance_not_started,moe.router_selected_descriptors_enqueued")
+        "LLAMINAR_PERF_STATS_FILTER=mtp.grouped_decode_equivalent_stochastic_verifier_runs,mtp.grouped_decode_equivalent_greedy_verifier_runs,moe_overlay_residency.maintenance_not_started,kernel.cuda_moe_grouped_decode_swiglu_publication_calls")
 endif()
