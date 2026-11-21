@@ -24219,7 +24219,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 grouped_values.size(),
                 static_cast<size_t>(d_model));
             const char *probe_path = std::getenv("LLAMINAR_TEST_CUDA_MOE_VERIFIER_DOWN_PROBE_JSONL");
-            if (seq_len == 4 && (probe_path || std::string_view(format.label) == "Q8_0"))
+            if (seq_len == 4)
             {
                 ScopedCudaTestGraph graph(stream_, "M4 original-route Down publication");
                 ASSERT_TRUE(run_grouped());
@@ -24255,6 +24255,10 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                         down_params = params;
                         EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(seq_len * top_k));
                         EXPECT_EQ(params.gridDim.z, 1u);
+                        EXPECT_EQ(params.blockDim.x, 64u);
+                        cudaFuncAttributes attributes{};
+                        ASSERT_EQ(cudaFuncGetAttributes(&attributes, params.func), cudaSuccess);
+                        EXPECT_EQ(attributes.localSizeBytes, 0u);
                     }
                 }
                 ASSERT_EQ(direct_publications, 1);

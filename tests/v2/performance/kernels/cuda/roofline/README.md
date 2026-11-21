@@ -85,16 +85,22 @@ sequence, with each source and its requested byte count in the JSONL.
 
 | M1 Down source and case | Split-K stage | Direct stage | Direct requested weight |
 | --- | ---: | ---: | ---: |
-| Q5_1 main | 8.704 µs | 5.440 µs | 904 GB/s |
+| Q5_1 main | 8.704 µs | 5.248–5.312 µs | 925–937 GB/s |
 | Q8_0 main | 12.736 µs | 8.384 µs | 831 GB/s |
 | Q8_0 drafter | 13.056 µs | 8.192 µs | 850 GB/s |
 
-Both RTX 3090s returned the same median across 62 samples per arm and card.
-The Q5_1 Down weight footprint fits in 6 MiB L2 and reached 38.0–38.5%
-of the warm L2 reference. The drafter's Q8_0 Down footprint is larger than
-L2 and its requested-weight rate equals 96.6% of the streaming reference.
+Both RTX 3090s returned the same Q8_0 medians across 62 samples per arm and
+card. The final Q5_1 medians use 31 samples per card. Its Down weight
+footprint fits in 6 MiB L2 and reached 39.4% of the warm L2 reference.
+The drafter's Q8_0 Down footprint is larger than L2 and its requested-weight
+rate equals 96.6% of the streaming reference.
 Physical DRAM and L2 traffic for these dispatched kernels require hardware
 counters. The captured output matched the staged arithmetic at each shape.
+
+Sharing the original K32 activation traversal between Gate and Up saved
+1.3–2.5% at the same geometry. On both SM86 cards the paired Q4_K, Q5_K and
+Q8_0 stages measured 15.168, 17.408 and 21.504 µs respectively. Each role
+retains its separate ordered FP32 accumulator.
 
 The four-row verifier regression can also time the captured Down publication
 for each available source codebook. Its JSONL records include the physical
@@ -109,6 +115,12 @@ LLAMINAR_TEST_CUDA_MOE_VERIFIER_DOWN_PROBE_JSONL="$PWD/moe-verifier-down.jsonl" 
 The four-row sweep covered 21 source formats at N=512 and K=256, with
 31 samples per format and adapter. Requested-weight rates spanned
 98–553 GB/s, equivalent to 4.1–23.5% of the warm L2 reference. The
-Q5_1 and Q8_0 cases measured 323 GB/s and 544–553 GB/s respectively.
+Q5_1 and Q8_0 cases measured 356 GB/s and 544–553 GB/s respectively.
 Every measured Down kernel reported zero local bytes and matched the
 ordered serial output after retained replay.
+
+For the measured SM86 Down formats, loading the activation in two 16-byte
+vectors saves 5–22% at M=4. The Q5_1 case drops from 4.864 to 4.416 µs and
+Q6_K drops from 7.552–7.616 to 5.888–5.952 µs. The QFN M1 Q5_1 case drops
+from 5.440 to 5.312 µs. The vector loads preserve the original K32 packet
+order in both paths.

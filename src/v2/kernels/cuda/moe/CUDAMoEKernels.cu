@@ -23,6 +23,8 @@
  * Decode descriptor publication touches only the selected packet; grouped
  * prefill retains its complete descriptor/list publication contract.
  * Fused decode emits Q8 directly from the ordered gate/up partition reducer.
+ * SM86 reuses the original activation packet across paired Gate/Up projections
+ * and vector-loads each K32 Down activation for the measured codebooks.
  */
 
 #include "kernels/common/MoERuntimeDescriptorLaunch.h"
@@ -79,6 +81,7 @@
 
 namespace
 {
+    namespace native_formats = llaminar2::native_quantised_formats;
     using DeviceMoELLEPLayerPlanScratchView =
         llaminar2::DeviceMoELLEPLayerPlanScratch;
     using DeviceMoETransferSlotClaimIndexView =
@@ -19545,7 +19548,8 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @tparam OrderedK32 Publish every decoded block through its original one-block
      *         partition before folding the rounded partition into the route.
      * @pre The caller has resolved the physical codebook, validated the
-     *      descriptor and activation row, and clipped the K32 interval.
+     *      descriptor and 16-byte-aligned activation row, and clipped the K32
+     *      interval.
      */
     template <uint8_t CodebookId, bool OrderedK32 = false>
     __device__ __forceinline__ float native_quantised_dot_admitted_range(
@@ -19567,6 +19571,35 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         for (int block_idx = b_start; block_idx < b_end; ++block_idx)
         {
             const int32_t *a4 = reinterpret_cast<const int32_t *>(A_int8 + block_idx * 32);
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+            // Original Q8 rows and their K32 packets are 16-byte aligned.
+            // Materialize both halves in registers for the measured readers.
+            int32_t activation_words[8];
+            if constexpr (OrderedK32 &&
+                          (CodebookId == native_formats::Q5_1.codebook_id ||
+                           CodebookId == native_formats::Q6_K.codebook_id ||
+                           CodebookId == native_formats::Q3_K.codebook_id ||
+                           CodebookId == native_formats::Q2_K.codebook_id ||
+                           CodebookId == native_formats::IQ3_S.codebook_id ||
+                           CodebookId == native_formats::IQ3_XXS.codebook_id ||
+                           CodebookId == native_formats::IQ2_S.codebook_id ||
+                           CodebookId == native_formats::IQ2_XS.codebook_id ||
+                           CodebookId == native_formats::IQ1_S.codebook_id))
+            {
+                const auto *packed = reinterpret_cast<const int4 *>(a4);
+                const int4 lo = packed[0];
+                const int4 hi = packed[1];
+                activation_words[0] = lo.x;
+                activation_words[1] = lo.y;
+                activation_words[2] = lo.z;
+                activation_words[3] = lo.w;
+                activation_words[4] = hi.x;
+                activation_words[5] = hi.y;
+                activation_words[6] = hi.z;
+                activation_words[7] = hi.w;
+                a4 = activation_words;
+            }
+#endif
             const size_t linear = static_cast<size_t>(block_idx) * N + static_cast<size_t>(n);
             const uint8_t *payload = payload_base +
                                      linear * llaminar2::cuda_native_quantised::payload_bytes_for_codebook<CodebookId>();
@@ -19983,6 +20016,23 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 
         const DeviceNativeQuantisedMatrixDesc gate_desc = gate_descs[expert_id];
         const DeviceNativeQuantisedMatrixDesc up_desc = up_descs[expert_id];
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+        // Q4_K, Q5_K and Q8_0 share one activation traversal while retaining
+        // each role's independent ordered FP32 accumulation.
+        if constexpr (CodebookId == native_formats::Q4_K.codebook_id ||
+                      CodebookId == native_formats::Q5_K.codebook_id ||
+                      CodebookId == native_formats::Q8_0.codebook_id)
+        {
+            float gate = 0.0f;
+            float up = 0.0f;
+            native_quantised_dot_desc_pair_range<CodebookId>(
+                gate_desc, up_desc, n, A_int8, scales_A_blockwise, N, K,
+                b_start, b_end, gate, up);
+            gate_partials[partial_index] = gate;
+            up_partials[partial_index] = up;
+            return;
+        }
+#endif
         gate_partials[partial_index] = native_quantised_dot_desc_range_dispatch<CodebookId>(
             gate_desc, n, A_int8, scales_A_blockwise, N, K, b_start, b_end);
         up_partials[partial_index] = native_quantised_dot_desc_range_dispatch<CodebookId>(
