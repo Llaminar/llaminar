@@ -3127,6 +3127,18 @@ namespace llaminar2::cpu::native_quantised
     }
 
     /**
+     * @brief Admit a packed publication before an x86 entry reads its bytes.
+     * @param packed Owner whose resident stream the entry will read.
+     * @details O(1), as on NEON: the current byte generation must carry a
+     * metadata seal covering this owner's interpretation. Unsealed or stale
+     * bytes are fatal; the entry never reads unadmitted metadata.
+     */
+    inline void requireAdmittedNativeQuantisedWeights(const CPUNativeQuantisedPackedWeights &packed)
+    {
+        (void)packed.readView();
+    }
+
+    /**
      * @brief Add one projection bias row using the selected runtime ISA.
      *
      * Fused verifier projection bundles apply bias after every grouped GEMV
@@ -3214,20 +3226,25 @@ namespace llaminar2::cpu::native_quantised
         if (use_avx512 && packed.usesNibbleLUT())
             decode_lut_512 = build_decode_lut(packed.codebook_id);
 #endif
+        // A rejected schedule fails as such before the publication is examined;
+        // every path that reads the bytes is admitted first.
+        if (!use_avx512 && !use_avx2 &&
+            (isa_path != ISAPath::SCALAR ||
+             schedule_override != DecodeSchedulePolicy::FrozenSerialOracle))
+        {
+            throw std::runtime_error(
+                "CPU NativeQuantised production decode requires an AVX2 or "
+                "AVX512 grouped implementation; scalar execution is an "
+                "explicit frozen diagnostic oracle only");
+        }
+        requireAdmittedNativeQuantisedWeights(packed);
+
         __m256i decode_lut_256 = _mm256_setzero_si256();
         if (use_avx2 && packed.usesNibbleLUT())
             decode_lut_256 = build_decode_lut_avx2_for_codebook(packed.codebook_id);
 
         if (!use_avx512 && !use_avx2)
         {
-            if (isa_path != ISAPath::SCALAR ||
-                schedule_override != DecodeSchedulePolicy::FrozenSerialOracle)
-            {
-                throw std::runtime_error(
-                    "CPU NativeQuantised production decode requires an AVX2 or "
-                    "AVX512 grouped implementation; scalar execution is an "
-                    "explicit frozen diagnostic oracle only");
-            }
             gemv_native_quantised_scalar(packed, A_q8, C, N, K_blocks);
             return;
         }
@@ -3462,6 +3479,7 @@ namespace llaminar2::cpu::native_quantised
         std::span<float> partial_storage,
         std::span<Q8_1Block> activation_storage)
     {
+        requireAdmittedNativeQuantisedWeights(packed);
         const int K = packed.K;
         const int K_blocks = packed.blocks_per_row;
 
@@ -5205,6 +5223,7 @@ namespace llaminar2::cpu::native_quantised
         const ProjectionRowWork *work = nullptr)
     {
         requireNativeQuantisedISAPath(isa_path);
+        requireAdmittedNativeQuantisedWeights(packed);
         const CPUProjectionRowGrid row_grid(M,work);
         if(!row_grid.beginWorkshare())return;
         const int N = packed.N;
@@ -5719,6 +5738,7 @@ namespace llaminar2::cpu::native_quantised
         const ProjectionRowWork *work)
     {
         requireNativeQuantisedISAPath(isa_path);
+        requireAdmittedNativeQuantisedWeights(packed);
         const CPUProjectionRowGrid row_grid(M,work);
         if(!row_grid.beginWorkshare())return;
         const int N = packed.N;
@@ -7278,6 +7298,9 @@ namespace llaminar2::cpu::native_quantised
         FusedOutputJobOwnership job_ownership = FusedOutputJobOwnership::Auto)
     {
         requireNativeQuantisedISAPath(isa_path);
+        for (int p = 0; descs && p < num_descs; ++p)
+            if (descs[p].packed)
+                requireAdmittedNativeQuantisedWeights(*descs[p].packed);
         constexpr int kMaxFusedVerifierProjections = NativeQuantisedFusedRowsPlan::capacity;
         if (!descs || num_descs <= 0 ||
             num_descs > kMaxFusedVerifierProjections ||
@@ -9727,6 +9750,7 @@ namespace llaminar2::cpu::native_quantised
         int ldc,
         std::span<Q8_1Block> activation_storage)
     {
+        requireAdmittedNativeQuantisedWeights(packed);
         const int K = packed.K;
         const int K_blocks = packed.blocks_per_row;
 
@@ -9787,6 +9811,7 @@ namespace llaminar2::cpu::native_quantised
         std::span<float> partial_storage,
         const ProjectionRowWork *work = nullptr)
     {
+        requireAdmittedNativeQuantisedWeights(packed);
         if(work&&M!=1)throw std::invalid_argument("CPU ordinary work-selected projection requires its original M1 route");
         const CPUProjectionRowGrid row_grid(M,work);
         if(!row_grid.beginWorkshare())return;
@@ -9912,6 +9937,9 @@ namespace llaminar2::cpu::native_quantised
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
         requireNativeQuantisedISAPath(isa_path);
+        for (int p = 0; descs && p < num_descs; ++p)
+            if (descs[p].packed)
+                requireAdmittedNativeQuantisedWeights(*descs[p].packed);
         constexpr int kMaxFusedDecodeProjections = NativeQuantisedFusedRowsPlan::capacity;
         if (!A_q8 || !descs || num_descs <= 0 ||
             num_descs > kMaxFusedDecodeProjections)
@@ -9991,6 +10019,9 @@ namespace llaminar2::cpu::native_quantised
         DecodeSchedulePolicy schedule_override = DecodeSchedulePolicy::Auto)
     {
         requireNativeQuantisedISAPath(isa_path);
+        for (int p = 0; descs && p < num_descs; ++p)
+            if (descs[p].packed)
+                requireAdmittedNativeQuantisedWeights(*descs[p].packed);
         constexpr int kMaxFusedMultiInputProjections = NativeQuantisedFusedRowsPlan::capacity;
         if (!descs || num_descs <= 0 ||
             num_descs > kMaxFusedMultiInputProjections)
