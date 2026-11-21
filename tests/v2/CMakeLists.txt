@@ -27897,6 +27897,14 @@ if(HAVE_CUDA OR HAVE_ROCM)
                 LABELS "V2;Integration;ProductionTestPreflight;${_repetition_backend};Sampling;MTP;Penalty;GraphCapture;ByteExact;Replay;Regression"
                 MPI_PROCS 1 NO_MODELS TIMEOUT 120)
             list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_StochasticRawLogitPreservation_${_repetition_backend})
+            # A stale controller depth must publish the fatal outcome into the
+            # owned sample slots only, never a neighbouring request's slots.
+            add_v2_test(V2_Integration_InvalidVerifierDepthFatalOutcome_${_repetition_backend}
+                COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
+                    --gtest_filter=GPU/GPUSamplingTest.InvalidFusedVerifierDepthPublishesDeterministicFatalOutcome/${_repetition_backend}
+                LABELS "V2;Integration;ProductionTestPreflight;${_repetition_backend};Sampling;MTP;GenerationController;Contract;Regression"
+                MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_InvalidVerifierDepthFatalOutcome_${_repetition_backend})
             add_v2_test(V2_Integration_RepetitionPenalty_${_repetition_backend}
                 COMMAND $<TARGET_FILE:v2_integration_gpu_sampling_kernels>
                     --gtest_filter=*RepetitionPenalty*${_repetition_backend}:*MTPPenaltyLogitRowTransformIsSerialDecodeByteExactForAllDepths*${_repetition_backend}:*MTPBranchPenaltyProposalRowIsSerialDecodeByteExactForAllDepths*${_repetition_backend}:*OrdinaryDeviceGenerationSampling*${_repetition_backend}
