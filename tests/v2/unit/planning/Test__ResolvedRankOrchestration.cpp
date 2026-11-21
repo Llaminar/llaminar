@@ -17,6 +17,7 @@
 #include "planning/AutomaticOrchestrationCandidates.h"
 #include "execution/global/GlobalStageTPValidation.h"
 #include "execution/moe/MoEExpertProjectionOwnership.h"
+#include "execution/moe/MoEExpertShardCohort.h"
 #include "../../mocks/MockModelContext.h"
 #include "execution/runner/OrchestrationRunner.h"
 #include "execution/runner/PreparedWeightAuthorityIdentity.h"
@@ -24,6 +25,7 @@
 #include "config/OrchestrationConfigParser.h"
 #include "execution/mpi_orchestration/ExecutionPlanBuilder.h"
 #include "execution/runner/IOrchestrationRunnerFactory.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include <gtest/gtest.h>
 #include <functional>
@@ -515,6 +517,84 @@ TEST(ResolvedRankOrchestration, QFNMI50LocalTPRequiresCompleteMeasuredDomain)
         }
         EXPECT_EQ(coarse.at((layer + 3) % 4).columns, 256);
         EXPECT_EQ(first, 640);
+    }
+}
+
+/** @test Eligible CPU and GPU tiers keep the same ordered native Down cuts across movement. */
+TEST(ResolvedRankOrchestration, MixedExpertTiersShareExactNativeDownGeometry)
+{
+    for (int degree : {2, 3, 5, 8})
+    {
+        SCOPED_TRACE(degree);
+        MoERoutedExpertPlacementPlan plan;
+        plan.enabled = true;
+        plan.topology = RoutedExpertPlacementTopology::TieredOverlay;
+        plan.continuation_domain = plan.shared_expert_domain = "gpu";
+        plan.authority_execution = MoEOverlayAuthorityExecutionKind::HostResident;
+
+        RoutedExpertDomain gpu;
+        gpu.name = "gpu";
+        gpu.scope = ExecutionDomainScope::RANK_LOCAL;
+        gpu.owner_rank = 0;
+        gpu.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+        RoutedExpertDomain cpu;
+        cpu.name = "cpu";
+        cpu.scope = ExecutionDomainScope::NODE_LOCAL;
+        cpu.routed_compute_policy = RoutedExpertComputePolicy::TensorSharded;
+        for (int member = 0; member < degree; ++member)
+        {
+            gpu.participants.push_back(GlobalDeviceAddress::cuda(member, 0));
+            cpu.participants.push_back(GlobalDeviceAddress::cpu(member));
+            cpu.world_ranks.push_back(member);
+        }
+        plan.domains = {gpu, cpu};
+        plan.routed_tiers.emplace_back().domain = gpu.name;
+        plan.routed_tiers.emplace_back().domain = cpu.name;
+
+        ModelMemoryProfile model;
+        const auto width = static_cast<std::size_t>(320 * degree);
+        model.tensors = {
+            {.name = "blk.0.ffn_down_exps.weight", .quant_type = "Q5_1", .K = width, .layer_index = 0},
+            {.name = "blk.1.ffn_down_exps.weight", .quant_type = "Q8_0", .K = width, .layer_index = 1},
+        };
+        const auto tiling = selectGPUExpertIntermediateTiling(plan, model);
+        ASSERT_EQ(tiling, GPUExpertIntermediateTiling::BalancedNativeK32);
+        for (const auto& tensor : model.tensors)
+        {
+            const auto* metadata = native_quantised_formats::forQuantType(tensor.quant_type);
+            ASSERT_NE(metadata, nullptr);
+            const auto format = ExpertWeightFormat::nativeQuantised(
+                {metadata->codebook_id, metadata->is_superblock, true});
+            const auto intermediate = static_cast<int>(tensor.K);
+            constexpr int hidden = 2560;
+            const MoEOverlayLayerWeightManifest layer{
+                tensor.layer_index,
+                {{{ExpertTierWeightProjection::Gate, intermediate, hidden, format},
+                  {ExpertTierWeightProjection::Up, intermediate, hidden, format},
+                  {ExpertTierWeightProjection::Down, hidden, intermediate, format}}}};
+            const auto cpu_intervals = MoEExpertShardCohort::balancedIntervals(layer, degree);
+            const auto gpu_intervals = MoEExpertShardCohort::gpuIntervals(
+                layer, degree, tensor.layer_index, preferredIntermediateGrain(tiling));
+            EXPECT_EQ(cpu_intervals, gpu_intervals);
+            ASSERT_EQ(gpu_intervals.size(), static_cast<std::size_t>(degree));
+            for (int member = 0; member < degree; ++member)
+            {
+                EXPECT_EQ(gpu_intervals[member].first_column, member * 320);
+                EXPECT_EQ(gpu_intervals[member].columns, 320);
+            }
+            if (degree == 2)
+                EXPECT_NE(cpu_intervals, MoEExpertShardCohort::gpuIntervals(layer, degree, tensor.layer_index, 128));
+        }
+
+        // The predictor's original format must participate in the same proof.
+        // 320-channel fragments cannot retain complete Q4_K source blocks.
+        model.tensors.back().quant_type = "Q4_K";
+        const auto expected = qfnGPUExpertPreferredIntermediateGrain(128) == 32
+            ? GPUExpertIntermediateTiling::BalancedNativeK32 : GPUExpertIntermediateTiling::Coarse128;
+        EXPECT_EQ(selectGPUExpertIntermediateTiling(plan, model), expected);
+        model.tensors.back().quant_type = "Q8_0";
+        plan.domains.back().participants.pop_back();
+        EXPECT_EQ(selectGPUExpertIntermediateTiling(plan, model), expected);
     }
 }
 

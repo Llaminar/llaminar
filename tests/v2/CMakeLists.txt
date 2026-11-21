@@ -1193,10 +1193,17 @@ if(HAVE_CUDA OR HAVE_ROCM)
     # Release perf-only selection does not create this owner.
     if(HAVE_CUDA AND TARGET v2_test_qwen4exp_device_primitives)
         target_sources(v2_test_qwen4exp_device_primitives PRIVATE
+            integration/kernels/qwen4exp/CUDABranchNormOracle.cu
             integration/kernels/qwen4exp/CUDAHC103Original.cu
             integration/kernels/qwen4exp/PooledACKReadyCancellationCUDA.cu)
         set_target_properties(v2_test_qwen4exp_device_primitives PROPERTIES
             CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+        add_v2_test(V2_Integration_CUDABranchNormReplay
+            COMMAND $<TARGET_FILE:v2_test_qwen4exp_device_primitives>
+                --gtest_filter=Qwen4ExpDevicePrimitives.CUDABranchNormReplay
+            LABELS "V2;Integration;ProductionTestPreflight;CUDA;Qwen4Exp;MTP;GraphCapture;ByteExact;Replay;Regression"
+            ENVIRONMENT "LLAMINAR_SKIP_CUDA_STARTUP=0;LLAMINAR_SKIP_ROCM_STARTUP=1"
+            MPI_PROCS 1 NO_MODELS TIMEOUT 60)
     endif()
     if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
         set_source_files_properties(
@@ -12156,6 +12163,16 @@ if(TEST V2_Integration_CUDA_MoESharedRankBankPrefillReplay)
     list(APPEND V2_SHARED_RANK_BANK_PREFLIGHT_TESTS
         V2_Integration_CUDA_MoESharedRankBankPrefillReplay)
 endif()
+add_v2_test(V2_Integration_CUDA_MoERuntimeSwiGLUPublicationReplay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+        --gtest_filter=Test__CUDAMoEKernel.RuntimeGroupedDecodeSwiGLUPublicationReplay:Test__CUDAMoEKernel.RuntimeDecodeGraphReplayReadsDeviceDescriptorsWithoutTableRefresh
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
+add_v2_test(V2_Integration_CUDA_MoEVerifierK32PublicationReplay
+    COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
+        --gtest_filter=Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows
+    LABELS "V2;Integration;ProductionTestPreflight;CUDA;MoE;MTP;GraphCapture;Replay;ByteExact;Regression"
+    MPI_PROCS 1 NO_MODELS TIMEOUT 120)
 add_v2_test(V2_Perf_CUDA_MoESharedRankBankPrefill
     COMMAND $<TARGET_FILE:${V2_CUDA_GROUPING_PERF_TARGET}>
         --gtest_also_run_disabled_tests
@@ -12367,7 +12384,7 @@ if(TEST V2_Integration_CUDA_MoETransferStateMachine)
 endif()
 add_v2_test(V2_Integration_GroupedVerifierRows_CUDA_MoEExpertPaths
     COMMAND $<TARGET_FILE:v2_integration_cuda_moe_kernel>
-            --gtest_filter=Test__CUDAMoERouteScratch.SerialGraphRolesShareImmutableLargestParticipantArena:Test__CUDAMoEPrefillPolicy.UnseenMIsTotalThroughTheGenericCapturePolicy:Test__CUDAMoEKernel.Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraphBucket:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAndCaptures:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentMatchesSerialDecodeRouter:Test__CUDAMoEKernel.VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAndCapture:Test__CUDAMoEKernel.SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows:Test__CUDAMoEKernel.SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllreduce:Test__CUDAMoEKernel.CanonicalRootedRankBankPublicationIsMTotalAndSerialRowExact:Test__CUDAMoEKernel.LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerialRows:Test__CUDAMoEKernel.SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode:Test__CUDAMoEKernel.SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatchDecodeAndCapture:Test__CUDAMoEKernel.SharedExpertVerifierPrefillQwen36AllNativeFormatsRuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ3SDown_RuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedAndMaskedLocalTPVerifierPrefill_AllNativeFormats_RuntimeMMatchRowDecode:Test__CUDAMoEKernel.RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRuntimeDecodeRows:Test__CUDAMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
+            --gtest_filter=Test__CUDAMoERouteScratch.SerialGraphRolesShareImmutableLargestParticipantArena:Test__CUDAMoEPrefillPolicy.UnseenMIsTotalThroughTheGenericCapturePolicy:Test__CUDAMoEKernel.Qwen36RoutingActiveRowsAreByteExactAcrossPaddedGraphBucket:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentUsesDecodeKernelAndCaptures:Test__CUDAMoEKernel.RouteVerifierRowsDecodeEquivalentMatchesSerialDecodeRouter:Test__CUDAMoEKernel.VerifierRuntimeMPrefillBoundaryRowsMatchDecodeRowsAndCapture:Test__CUDAMoEKernel.SharedExpertGateVerifierRowsRuntimeMMatchSerialDecodeRows:Test__CUDAMoEKernel.SharedExpertGateAddLocalTP2VerifierRowsMatchSerialAllreduce:Test__CUDAMoEKernel.CanonicalRootedRankBankPublicationIsMTotalAndSerialRowExact:Test__CUDAMoEKernel.LocalTPNCCLVerifierRowAllreduceRuntimeMMatchesSerialRows:Test__CUDAMoEKernel.SharedExpertFFNStageVerifierRowsQwen36AllNativeFormatsMatchSerialGroupedDecode:Test__CUDAMoEKernel.SharedExpertVerifierRuntimeMPrefillBoundaryRowsMatchDecodeAndCapture:Test__CUDAMoEKernel.SharedExpertVerifierPrefillQwen36AllNativeFormatsRuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedOnlyVerifierPrefill_Qwen36IQ2SGateUpIQ3SDown_RuntimeMBoundariesMatchRowDecode:Test__CUDAMoEKernel.RoutedAndMaskedLocalTPVerifierPrefill_AllNativeFormats_RuntimeMMatchRowDecode:Test__CUDAMoEKernel.RuntimePrefillGroupingFiltersStaticOwnerLocalExperts
             --gtest_brief=1
     LABELS "V2;Integration;CUDA;MoE;MTP;GroupedVerifierRows;DecodeEquivalent;AllFormats;NativeQuantised;LocalTP;Regression"
     MPI_PROCS 1
@@ -14487,7 +14504,6 @@ if(ZLIB_FOUND)
                 RESOURCE_LOCK "rocm_gpu_0;rocm_gpu_1;rocm_gpu_2;rocm_gpu_3"
                 ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
         endforeach()
-        include(cmake/V2QFNActiveTensorShardedTests.cmake)
         add_v2_test(V2_Integration_Qwen4ExpTensorShardedRestoredPrefixMTP
             COMMAND $<TARGET_FILE:v2_integration_qwen4exp_mtp_admission>
                 --gtest_filter=Qwen4ExpTensorShardedROCmTP4.Fixed3Retained3RestoredPrefixPlusOneMatchesSerialState
@@ -14496,6 +14512,7 @@ if(ZLIB_FOUND)
             RESOURCE_LOCK "rocm_gpu_0;rocm_gpu_1;rocm_gpu_2;rocm_gpu_3"
             ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=0;LLAMINAR_SKIP_CUDA_STARTUP=1;LLAMINAR_SKIP_ROCM_STARTUP=0")
     endif()
+    include(cmake/V2QFNActiveTensorShardedTests.cmake)
     add_v2_test(V2_Integration_Qwen4ExpMTPAdmission_ExplicitNoMTP
         COMMAND $<TARGET_FILE:v2_integration_qwen4exp_mtp_admission>
             --gtest_filter=Qwen4ExpMTPPairedSourceControl.CPU0MmapExplicitNoMTP
@@ -17154,6 +17171,15 @@ if(TEST V2_Integration_QFNMI50ExpertIntermediateLayoutOptOut)
         ENVIRONMENT "LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES=0")
 endif()
 list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_QFNMI50ExpertIntermediateLayoutOptOut)
+add_v2_test(V2_Integration_MixedExpertTierNativeDownGeometry
+    COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
+        --gtest_filter=ResolvedRankOrchestration.MixedExpertTiersShareExactNativeDownGeometry
+    LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Planning;MoE;ExpertOverlay;Geometry;Regression"
+    MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+    ENVIRONMENT "LLAMINAR_GPU_EXPERT_BALANCE_NATIVE_TILES=0")
+if(TEST V2_Integration_MixedExpertTierNativeDownGeometry)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_MixedExpertTierNativeDownGeometry)
+endif()
 add_v2_test(V2_Integration_AutomaticProjectionOutputGeometry
     COMMAND $<TARGET_FILE:v2_test_execution_plan_builder>
         --gtest_filter=AutomaticOrchestrationCandidates.ProjectionCandidatesPreserveIntegralSourceOutputPartitions:AutomaticOrchestrationCandidates.ProjectionGeometryRejectionPreservesExplicitAndMultiTierIntent
@@ -38927,6 +38953,9 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmMoEAutomaticOw
 if(HAVE_ROCM AND TARGET v2_test_qwen4exp_device_primitives)
     list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmBranchNormHistoricalTree)
 endif()
+if(HAVE_CUDA AND TEST V2_Integration_CUDABranchNormReplay)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_CUDABranchNormReplay)
+endif()
 
 add_v2_test(V2_Integration_CapturedNativeAllocationOwnership
     COMMAND $<TARGET_FILE:v2_unit_device_workspace_manager>
@@ -44207,10 +44236,9 @@ endif()
 # Every native body owns one immutable geometry roster and one original source.
 # Same-owner mixed routes stay rank-local and are explicitly unqualified on
 # hosts whose CUDA/ROCm devices belong to different original NUMA ranks.
-if(HAVE_CUDA AND HAVE_ROCM AND TARGET v2_integration_captured_transfer_channel)
+if((HAVE_CUDA OR HAVE_ROCM) AND TARGET v2_integration_captured_transfer_channel)
     target_sources(v2_integration_captured_transfer_channel PRIVATE
-        integration/transfer/Test__MappedActivationPacketCUDAAndROCm.cpp
-        integration/transfer/Test__MoEOverlayReturnValidation.cpp)
+        integration/transfer/Test__MappedActivationPacketCUDAAndROCm.cpp)
     set(_original_component_cases
         "V2_Integration_CanonicalRouteTicketAckRace_CUDA|CPUCanonicalRouteTicketReusesSafelyOnCUDA|CUDA|1"
         "V2_Integration_CanonicalRouteTicketAckRace_ROCm|CPUCanonicalRouteTicketReusesSafelyOnROCm|ROCm|1"
@@ -44236,6 +44264,11 @@ if(HAVE_CUDA AND HAVE_ROCM AND TARGET v2_integration_captured_transfer_channel)
         list(GET _original_fields 1 _original_body)
         list(GET _original_fields 2 _original_family)
         list(GET _original_fields 3 _original_degree)
+        if((_original_family STREQUAL "CUDA" AND NOT HAVE_CUDA) OR
+           (_original_family STREQUAL "ROCm" AND NOT HAVE_ROCM) OR
+           (_original_family STREQUAL "Mixed" AND (NOT HAVE_CUDA OR NOT HAVE_ROCM)))
+            continue()
+        endif()
         if(_original_family STREQUAL "Mixed")
             set(_original_hardware "CUDA;ROCm;CUDADevices1;ROCmDevices1")
         else()
@@ -44253,6 +44286,10 @@ if(HAVE_CUDA AND HAVE_ROCM AND TARGET v2_integration_captured_transfer_channel)
             MPI_PROCS 2 NO_MODELS TIMEOUT ${_original_timeout})
         list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_original_name})
     endforeach()
+endif()
+if(HAVE_CUDA AND HAVE_ROCM AND TARGET v2_integration_captured_transfer_channel)
+    target_sources(v2_integration_captured_transfer_channel PRIVATE
+        integration/transfer/Test__MoEOverlayReturnValidation.cpp)
     foreach(_return_family CUDA ROCm)
         foreach(_return_shape Single SingleBatch Multi MultiBatch)
             set(_return_name V2_Integration_MoEOverlayReturnValidation_${_return_family}${_return_shape})

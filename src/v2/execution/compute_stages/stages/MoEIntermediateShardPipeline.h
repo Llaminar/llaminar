@@ -136,7 +136,7 @@ namespace llaminar2
         ComputeGraph &graph, MoEIntermediateShardPipelineParams params,
         const MoEOverlayParticipantLayerBank &source);
 
-    /** @brief Preweighted original route-slot partials for the tier-aware final reducer. */
+    /** @brief Raw original route-slot partials for the tier-aware reducer's single router multiply. */
     struct MoEIntermediateShardRouteSlots
     {
         std::string producer;

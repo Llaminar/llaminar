@@ -339,6 +339,10 @@ namespace
                 return requireOperation(kernel.reduceCanonicalRouteContributions(params.route_partials.tensor, params.output.tensor,
                     params.rows, params.top_k, h), "ordered local router-slot fold");
             auto *runtime = params.runtime->deviceLayerState(layer);
+            // Mixed-tier continuations retain the original router factors at
+            // the cohort root. All local participants publish raw Down rows.
+            const auto weighting = local_result == LocalResult::RouteSlots
+                ? MoEExpertRouteWeighting::CompletedCohort : MoEExpertRouteWeighting::LocalProjection;
             if (params.row_mode == MoEIntermediateShardRowMode::Decode)
             {
                 // PreparedService's closed cold token authenticates the one
@@ -352,7 +356,8 @@ namespace
                 return requireOperation(kernel.groupedExpertDecodeFromRuntime(runtime,
                     dynamic_cast<TensorBase *>(params.hidden.tensor), prepared->gate, prepared->down,
                     params.top_k, params.output.tensor, h, f,
-                    MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable, params.route_partials.tensor),
+                    MoEDecodeDescriptorSource::IntermediateShardRuntimePlacementTable, params.route_partials.tensor,
+                    weighting),
                     "runtime-published local fragment decode");
             }
             requireOperation(kernel.publishCompleteGroupedPrefillPlanFromRouter(runtime, params.routing_indices.tensor,
@@ -361,7 +366,8 @@ namespace
                 "complete local fragment grouped-plan publication");
             return requireOperation(kernel.executeGroupedPrefillProjectionFromPublishedRuntimePlan(runtime, params.runtime->hostLayerState(layer),
                 params.hidden.tensor, nullptr, prepared->gate, prepared->down, params.rows, h, f,
-                int(descriptors.size()), params.top_k, MoEPrefillProjectionExecution::intermediateShard(h), params.route_partials.tensor),
+                int(descriptors.size()), params.top_k, MoEPrefillProjectionExecution::intermediateShard(h, weighting),
+                params.route_partials.tensor),
                 "runtime-published local fragment grouped projection");
         }
 

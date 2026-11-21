@@ -8,9 +8,9 @@
  * CPU-owned immutable bindings are checked before launch, while live counts
  * and acceptance decisions are validated exclusively on device. No allocation,
  * synchronization, transfer or callback appears in this execution boundary.
- * HIP branch normalization retains the exact 256-lane arithmetic tree while
- * its wave64 register tail avoids six redundant CTA barriers. The final sum
- * is explicitly republished to every output lane; CUDA keeps its shared tree.
+ * Branch normalization retains the original 256-lane arithmetic tree and
+ * uses warp or wave shuffles for the final edges. CUDA's M1 Q8 publication
+ * consumes each normalized block directly from its producing warp.
  */
 #pragma once
 #include "Qwen4ExpKernels.h"
@@ -102,9 +102,42 @@ __global__ __launch_bounds__(kThreads, 2) void normKernel(BranchRMSNormArgs a)
     branchNormBody(a);
 
 }
+#if defined(QFN_CUDA)
+/** @brief Publish the original FP32 element and quantize it in its owning warp. */
+struct BranchNormCUDAQuantizedPublication
+{
+    float* normalized;
+    std::int8_t* codes;
+    float* scales;
+
+    /**
+     * @brief Send the same rounded value to the FP32 and Q8 destinations.
+     * @param index Original branch-major output channel.
+     * @param value Exact original normalized FP32 value.
+     * @pre The owning warp participates with one full K32 block.
+     */
+    __device__ __forceinline__ void publish(std::uint64_t index, float value) const
+    {
+        const auto lane = threadIdx.x % 32;
+        const auto block = index / 32;
+        normalized[index] = value;
+        original_single_q8::publish(value, true, codes + block * 32, scales + block, nullptr, lane);
+    }
+};
+#endif
+
 /** @brief Retain original norm producer grid and publish each branch's exact K32 blocks. */
 __global__ __launch_bounds__(kThreads,2) void normSingleQ8Kernel(BranchRMSNormSingleQ8Args args) {
  const auto a=args.norm;
+#if defined(QFN_CUDA)
+ // The prepared entry admits static M1 and complete K32 blocks. Every warp
+ // owns complete packets in the normalization output loop.
+ __shared__ float sums[kThreads];
+ const auto task=static_cast<std::size_t>(blockIdx.x);
+ branch_norm_native::taskFromInput(branch_norm_native::RetainedBranchInput{a.input + task * a.hidden},
+     a.gain, BranchNormCUDAQuantizedPublication{a.output, args.codes, args.scales},
+     a.hidden, a.epsilon, task, sums, threadIdx.x, true);
+#else
  branchNormBody(a);
  // All original normalized stores must precede the borrowed producer's reads.
  // This is one CTA-local edge; every branch is K32-aligned and independent.
@@ -116,6 +149,7 @@ __global__ __launch_bounds__(kThreads,2) void normSingleQ8Kernel(BranchRMSNormSi
   original_single_q8::publish(a.output[offset+lane],true,args.codes+offset,
       args.scales+offset/32,nullptr,lane);
  }
+#endif
 }
 /** @brief Expand ordinary embedding channels into four branch-major streams. */
 __global__ __launch_bounds__(kThreads, 2) void expandKernel(ResidualExpandArgs a)

@@ -12,6 +12,13 @@ add_executable(v2_perf_qwen_sparse_selection EXCLUDE_FROM_ALL
 target_link_libraries(v2_perf_qwen_sparse_selection PRIVATE llaminar2_core GTest::gtest_main)
 
 if(HAVE_CUDA)
+    # Same-card hardware references have no model or runtime-core dependency.
+    add_executable(v2_perf_cuda_decode_roofline EXCLUDE_FROM_ALL
+        "${_qfn_test_sources}/performance/kernels/cuda/roofline/CUDADecodeRoofline.cu")
+    set_target_properties(v2_perf_cuda_decode_roofline PROPERTIES
+        CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    target_link_libraries(v2_perf_cuda_decode_roofline PRIVATE CUDA::cudart)
+
     # Same native-event fixture and original graph metadata; no profiler attachment.
     add_executable(v2_perf_cuda_qwen_sparse_observations EXCLUDE_FROM_ALL
         "${_qfn_test_sources}/integration/kernels/cuda/Test__CUDAQwenSparseAttention.cpp")
@@ -81,6 +88,12 @@ if(HAVE_ROCM)
         "${_qfn_test_sources}/integration/kernels/qwen4exp/Test__Qwen4ExpDevicePrimitives.cpp"
         "${_qfn_test_sources}/integration/kernels/qwen4exp/ROCmOriginalBranchRMSNormOracle.hip")
     target_include_directories(v2_perf_qwen4exp_branch_norm PRIVATE "${_qfn_test_sources}")
+    if(HAVE_CUDA)
+        target_sources(v2_perf_qwen4exp_branch_norm PRIVATE
+            "${_qfn_test_sources}/integration/kernels/qwen4exp/CUDABranchNormOracle.cu")
+        set_target_properties(v2_perf_qwen4exp_branch_norm PROPERTIES
+            CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+    endif()
     target_link_libraries(v2_perf_qwen4exp_branch_norm PRIVATE
         llaminar2_core GTest::gtest_main hip::host ${CMAKE_DL_LIBS})
     set_target_properties(v2_perf_qwen4exp_branch_norm PROPERTIES

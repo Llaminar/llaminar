@@ -20,7 +20,8 @@ enum class SquareSumPublication { SharedEdge128, WaveOwnsBothRoots };
  * @return Original total for members, zero for nonmembers.
  * @pre All physical lanes call this helper; every original lane has one member.
  * @details Membership gates memory/arithmetic only, never a CTA join. Standalone
- * CUDA/HIP callers retain their original full256-member tree and operand order.
+ * CUDA uses physical lanes 0 through 31 as the final reduction warp. All
+ * callers retain the original logical256 tree and operand order.
  */
 template<SquareSumPublication Publication=SquareSumPublication::SharedEdge128>
 __device__ __forceinline__ float squareSum(float partial,float* sums,unsigned lane,bool member) {
@@ -57,12 +58,24 @@ __device__ __forceinline__ float squareSum(float partial,float* sums,unsigned la
     // all four waves. Publish lane0's result before any output lane reads it.
     __syncthreads();
 #else
-#pragma unroll
-    for (unsigned stride = 256 / 2; stride > 0; stride /= 2)
+    // Warp zero acquires all eight aligned stripes after the producer join.
+    // Combine the same left/right operands at strides 128, 64 and 32.
+    if (member && lane < 32)
     {
-        if (member && lane < stride) sums[lane] = __fadd_rn(sums[lane], sums[lane + stride]);
-        __syncthreads();
+        const float low = __fadd_rn(sums[lane], sums[lane + 128]);
+        const float lowPeer = __fadd_rn(sums[lane + 64], sums[lane + 192]);
+        const float high = __fadd_rn(sums[lane + 32], sums[lane + 160]);
+        const float highPeer = __fadd_rn(sums[lane + 96], sums[lane + 224]);
+        float sum = __fadd_rn(__fadd_rn(low, lowPeer), __fadd_rn(high, highPeer));
+#pragma unroll
+        for (unsigned stride = 16; stride > 0; stride /= 2)
+        {
+            const float partner = __shfl_down_sync(0xffffffffu, sum, stride);
+            if (lane < stride) sum = __fadd_rn(sum, partner);
+        }
+        if (lane == 0) sums[0] = sum;
     }
+    __syncthreads();
 #endif
     return member ? sums[0] : 0.0f;
 

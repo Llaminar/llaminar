@@ -17,6 +17,13 @@
 
 namespace llaminar2
 {
+    /** @brief The owner of the original router multiply for a published route. */
+    enum class MoEExpertRouteWeighting : std::uint8_t
+    {
+        LocalProjection, ///< Complete expert or original local fold applies its own factor.
+        CompletedCohort, ///< Publish raw shard rows. The joint owner applies the factor after summation.
+    };
+
     /**
      * @brief Select arithmetic for the reusable CPU projection implementation.
      *

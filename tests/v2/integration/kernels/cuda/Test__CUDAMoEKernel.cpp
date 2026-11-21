@@ -54,6 +54,7 @@
 #include "utils/DebugEnv.h"
 #include "utils/PerfStatsCollector.h"
 
+#include "../../../utils/CUDACapturedKernelProbe.h"
 #include "../../../utils/GpuPreparedGemmHarness.h"
 #include "../../../utils/MoEOverlayServiceTelemetryCoverageTest.h"
 #include "../../../utils/QuantizedVerifierFormats.h"
@@ -1206,46 +1207,6 @@ namespace
                                         << " source=" << source;
         EXPECT_GE(match->count, 1u);
         EXPECT_GE(match->value, 1.0);
-    }
-
-    void expectFusedDecodeSubkernelTimer(
-        const char *timer_name,
-        int top_k,
-        int d_model,
-        int intermediate)
-    {
-        const auto records =
-            llaminar2::PerfStatsCollector::snapshot({std::string("kernel_cuda.") + timer_name});
-        ASSERT_FALSE(records.empty()) << "missing perf timer " << timer_name;
-
-        const auto expected_top_k = std::to_string(top_k);
-        const auto expected_d_model = std::to_string(d_model);
-        const auto expected_intermediate = std::to_string(intermediate);
-        const auto match = std::find_if(
-            records.begin(),
-            records.end(),
-            [&](const llaminar2::PerfStatRecord &record)
-            {
-                auto tag_equals = [&](const char *key, const std::string &value)
-                {
-                    const auto it = record.tags.find(key);
-                    return it != record.tags.end() && it->second == value;
-                };
-                return record.name == timer_name &&
-                       record.domain == "kernel_cuda" &&
-                       tag_equals("source", "fused_runtime") &&
-                       tag_equals("stage_type", "MOE_EXPERT_FFN") &&
-                       tag_equals("top_k", expected_top_k) &&
-                       tag_equals("d_model", expected_d_model) &&
-                       tag_equals("intermediate", expected_intermediate);
-            });
-        ASSERT_NE(match, records.end()) << "missing matching perf timer " << timer_name
-                                        << "\n"
-                                        << llaminar2::PerfStatsCollector::summaryString(
-                                               {std::string("kernel_cuda.") + timer_name});
-        EXPECT_EQ(match->count, 1u)
-            << "captured graph replay must not add eager sub-kernel timing events";
-        EXPECT_GT(match->total_ns, 0u);
     }
 
     void expectPrefillSwiGLUPathRecord(
@@ -22073,7 +22034,8 @@ TEST_F(Test__CUDAMoEKernel, GroupedDecodeMatchesGroupedPrefillForSingleTokenNati
 #endif
 }
 
-TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphReplays)
+/** @test Replay recorded staged bytes through direct SwiGLU packet publication. */
+TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeSwiGLUPublicationReplay)
 {
 #ifndef HAVE_CUDA
     GTEST_SKIP() << "CUDA support not compiled";
@@ -22090,7 +22052,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
     constexpr int top_k = 8;
     constexpr int num_experts = 8;
     constexpr int d_model = 512;
-    constexpr int intermediate = 256;
+    constexpr int intermediate = 320;
     const auto device = llaminar2::DeviceId::cuda(0);
 
     std::vector<std::unique_ptr<llaminar2::TensorBase>> owned_weights;
@@ -22213,6 +22175,15 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
         up4.get(), up5.get(), up6.get(), up7.get()};
     auto two_step_output = makeZeros({d_model});
     auto fused_output = makeZeros({d_model});
+    auto route_rows = makeZeros({top_k, d_model});
+    const auto run_fused = [&]() {
+        return cuda_kernel_->groupedExpertDecodeFromRuntime(
+            runtime_layer, hidden.get(), gateup_table, down_table, top_k,
+            nullptr, d_model, intermediate, llaminar2::MoEDecodeDescriptorSource::RuntimePlacementTable,
+            route_rows.get()) &&
+            cuda_kernel_->reduceCanonicalRouteContributions(route_rows.get(),
+                fused_output.get(), seq_len, top_k, d_model);
+    };
 
     llaminar2::TransferEngine::prepareDeviceInput(hidden.get(), device, stream_);
     llaminar2::TransferEngine::prepareDeviceInput(router.get(), device, stream_);
@@ -22228,6 +22199,8 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
     llaminar2::TransferEngine::prepareDeviceOutput(
         fused_output.get(), device, stream_);
 
+    llaminar2::TransferEngine::prepareDeviceOutput(route_rows.get(), device, stream_);
+
     ASSERT_TRUE(cuda_kernel_->decodeRouteSelect(
         runtime_layer, hidden.get(), router.get(), d_model, num_experts, top_k,
         true, nullptr, nullptr, /*write_legacy_outputs=*/false, /*update_runtime_histogram=*/false,
@@ -22238,9 +22211,7 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
     ASSERT_TRUE(cuda_kernel_->groupedExpertDownDecodeFromRuntime(
         gate_outputs.data(), up_outputs.data(), runtime_layer, down_table, top_k,
         two_step_output.get(), d_model, intermediate));
-    ASSERT_TRUE(cuda_kernel_->groupedExpertDecodeFromRuntime(
-        runtime_layer, hidden.get(), gateup_table, down_table, top_k,
-        fused_output.get(), d_model, intermediate));
+    ASSERT_TRUE(run_fused());
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
 
     std::vector<float> two_step_values(
@@ -22249,43 +22220,79 @@ TEST_F(Test__CUDAMoEKernel, RuntimeGroupedDecodeFusedMatchesTwoStepAndGraphRepla
     std::vector<float> fused_values(
         fused_output->data(),
         fused_output->data() + fused_output->numel());
-    expectVectorsClose(fused_values, two_step_values,
-                       0.9999, 0.006, /*row_width=*/d_model,
-                       /*min_row_cosine=*/0.9998,
-                       /*max_row_relative_l2=*/0.008,
-                       /*max_row_kl=*/1.0e-4);
+    expectBitwiseFP32RowsEqual("direct SwiGLU versus staged output",
+        fused_values.data(), two_step_values.data(), fused_values.size(), d_model);
 
     ScopedCudaTestGraph graph(
         stream_,
         "fused runtime expert decode capture");
-    const bool captured_fused = cuda_kernel_->groupedExpertDecodeFromRuntime(
-        runtime_layer, hidden.get(), gateup_table, down_table, top_k,
-        fused_output.get(), d_model, intermediate);
+    const bool captured_fused = run_fused();
     EXPECT_TRUE(captured_fused);
     ASSERT_TRUE(graph.finishAndInstantiate());
-    ASSERT_TRUE(graph.launchAndPublishOutputs({fused_output.get()}));
-    ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+    std::size_t count = 0;
+    const auto native = graph.nativeGraphForInspection();
+    ASSERT_EQ(cudaGraphGetNodes(native, nullptr, &count), cudaSuccess);
+    std::vector<cudaGraphNode_t> nodes(count);
+    ASSERT_EQ(cudaGraphGetNodes(native, nodes.data(), &count), cudaSuccess);
+    int fused_publications = 0;
+    int direct_down_rows = 0;
+    for (auto node : nodes)
+    {
+        cudaGraphNodeType type{};
+        ASSERT_EQ(cudaGraphNodeGetType(node, &type), cudaSuccess);
+        if (type != cudaGraphNodeTypeKernel)
+            continue;
+        cudaKernelNodeParams params{};
+        ASSERT_EQ(cudaGraphKernelNodeGetParams(node, &params), cudaSuccess);
+        const char *symbol = nullptr;
+        ASSERT_EQ(cudaFuncGetName(&symbol, params.func), cudaSuccess);
+        ASSERT_NE(symbol, nullptr);
+        const std::string_view name{symbol};
+        EXPECT_EQ(name.find("grouped_swiglu_quantize_blockwise_kernel"), std::string_view::npos);
+        EXPECT_EQ(name.find("grouped_native_quantised_down_kpart_decode_route_kernel"), std::string_view::npos);
+        if (name.find("grouped_native_quantised_down_decode_publish_k32_kernel") != std::string_view::npos)
+        {
+            ++direct_down_rows;
+            EXPECT_EQ(params.gridDim.x, static_cast<unsigned>((d_model + 63) / 64));
+            EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(top_k));
+            EXPECT_EQ(params.gridDim.z, 1u);
+        }
+        if (name.find("grouped_native_quantised_gate_up_kpart_reduce_kernelILb1E") != std::string_view::npos)
+        {
+            ++fused_publications;
+            EXPECT_EQ(params.gridDim.x, static_cast<unsigned>((intermediate + 63) / 64));
+            EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(top_k));
+            EXPECT_EQ(params.blockDim.x, 64u);
+            cudaFuncAttributes attributes{};
+            ASSERT_EQ(cudaFuncGetAttributes(&attributes, params.func), cudaSuccess);
+            EXPECT_EQ(attributes.localSizeBytes, 0u);
+        }
+    }
+    EXPECT_EQ(fused_publications, 1);
+    EXPECT_EQ(direct_down_rows, 1);
+    for (int repeat = 0; repeat < 3; ++repeat)
+    {
+        ASSERT_TRUE(graph.launchAndPublishOutputs({fused_output.get()}));
+        const auto replay_values = copyCudaFP32TensorToHost(fused_output, stream_);
+        expectBitwiseFP32RowsEqual("captured direct SwiGLU versus staged output",
+            replay_values.data(), two_step_values.data(), replay_values.size(), d_model);
+    }
 
-    std::vector<float> replay_values(
-        fused_output->data(),
-        fused_output->data() + fused_output->numel());
-    expectVectorsClose(replay_values, two_step_values,
-                       0.9999, 0.006, /*row_width=*/d_model,
-                       /*min_row_cosine=*/0.9998,
-                       /*max_row_relative_l2=*/0.008,
-                       /*max_row_kl=*/1.0e-4);
+    if (const char *samples = std::getenv("LLAMINAR_TEST_CUDA_MOE_M1_PROBE_JSONL"))
+    {
+        using namespace llaminar2::test;
+        appendCUDAKernelProbeRecords(samples, probeIndependentCUDAKernels(
+            native, stream_, CUDAIndependentKernelFixture::StatelessProjection,
+            {.operation = "routed_expert_decode", .format = "IQ2_S+IQ4_NL",
+             .m = 1, .n = d_model, .k = intermediate}));
+    }
 
     expectGroupedDecodeCounter(
         "cuda_moe_grouped_decode_fused_calls", "runtime", top_k, d_model, intermediate,
         "fused_block_down");
-    expectFusedDecodeSubkernelTimer(
-        "cuda_moe_fused_decode_hidden_quantize", top_k, d_model, intermediate);
-    expectFusedDecodeSubkernelTimer(
-        "cuda_moe_fused_decode_gateup_kpart", top_k, d_model, intermediate);
-    expectFusedDecodeSubkernelTimer(
-        "cuda_moe_fused_decode_swiglu_quantize", top_k, d_model, intermediate);
-    expectFusedDecodeSubkernelTimer(
-        "cuda_moe_fused_decode_down_warp_reduce", top_k, d_model, intermediate);
+    expectGroupedDecodeCounter(
+        "cuda_moe_grouped_decode_swiglu_publication_calls", "runtime", top_k, d_model, intermediate,
+        "ordered_gate_reducer");
     llaminar2::PerfStatsCollector::reset();
 #endif
 }
@@ -23337,6 +23344,75 @@ void Test__CUDAMoEKernel::proveRuntimeDecodeGraphReplayCompleteDescriptors()
     // handles an assertion or exception before this explicit successful close.
     ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
     graph.reset();
+
+    if constexpr (num_experts == 2)
+    {
+        using namespace llaminar2;
+        using MatrixDesc = DeviceNativeQuantisedMatrixDesc;
+        CudaAllocation logits(sizeof(float) * num_experts);
+        CudaAllocation live_count(sizeof(std::int32_t));
+        CudaAllocation assignments(sizeof(std::int32_t) * top_k);
+        const MoEDecodeDescriptorPublication publication{
+            .gate = static_cast<MatrixDesc *>(workspace_->getBuffer(MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_GATE_DESC_TABLE)),
+            .up = static_cast<MatrixDesc *>(workspace_->getBuffer(MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_UP_DESC_TABLE)),
+            .down = static_cast<MatrixDesc *>(workspace_->getBuffer(MoEWorkspaceBuffers::CUDA_RUNTIME_PREFILL_DOWN_DESC_TABLE)),
+            .expert_count = num_experts,
+            .projections = DeviceMoEProjectionSet::CompleteExpert};
+        ASSERT_TRUE(publication.valid());
+
+        /** @brief Bind the recorded logits to the production paired publisher. */
+        const auto record = [&] {
+            return cudaMoE_softmax_topk_decode_selected_descriptors(
+                static_cast<float *>(logits.get()), device_runtime, nullptr, nullptr,
+                num_experts, top_k, true, false, false,
+                RoutedExpertRowExecutionPolicy::ParticipantAssigned, publication,
+                device.ordinal, stream_, static_cast<const std::int32_t *>(live_count.get()));
+        };
+        ScopedCudaTestGraph paired_graph(stream_, "selected router descriptor replay");
+        ASSERT_TRUE(record());
+        ASSERT_TRUE(paired_graph.finishAndInstantiate());
+        const auto native_graph = paired_graph.nativeGraphForInspection();
+        std::size_t nodes = 0;
+        ASSERT_EQ(cudaGraphGetNodes(native_graph, nullptr, &nodes), cudaSuccess);
+        EXPECT_EQ(nodes, 1u);
+
+        const std::array<MatrixDesc *, 3> outputs{publication.gate, publication.up, publication.down};
+        // Replay the old, empty and replaced source histories in one graph.
+        const std::array<std::int32_t, 4> live_history{1, 0, 1, 1};
+        for (std::size_t replay = 0; replay < live_history.size(); ++replay)
+        {
+            const std::int32_t live = live_history[replay];
+            const std::array<float, num_experts> input_logits{-10.0f, 10.0f};
+            replay_runtime = replay < 2 ? runtime_stale : runtime_fresh;
+            replay_runtime.route_participant_ids = static_cast<std::int32_t *>(assignments.get());
+            replay_runtime.prefill_route_capacity = top_k;
+            ASSERT_EQ(cudaMemcpyAsync(device_runtime, &replay_runtime, sizeof(replay_runtime),
+                cudaMemcpyHostToDevice, stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(logits.get(), input_logits.data(), sizeof(input_logits),
+                cudaMemcpyHostToDevice, stream_), cudaSuccess);
+            ASSERT_EQ(cudaMemcpyAsync(live_count.get(), &live, sizeof(live),
+                cudaMemcpyHostToDevice, stream_), cudaSuccess);
+            for (auto *output : outputs)
+                ASSERT_EQ(cudaMemsetAsync(output, 0, num_experts * sizeof(MatrixDesc), stream_), cudaSuccess);
+            ASSERT_TRUE(paired_graph.launch());
+
+            std::array<std::array<MatrixDesc, num_experts>, 3> actual{};
+            for (std::size_t role = 0; role < outputs.size(); ++role)
+                ASSERT_EQ(cudaMemcpyAsync(actual[role].data(), outputs[role], sizeof(actual[role]),
+                    cudaMemcpyDeviceToHost, stream_), cudaSuccess);
+            ASSERT_EQ(cudaStreamSynchronize(stream_), cudaSuccess);
+            const auto &expert = replay_runtime.banks[0].experts[1];
+            const std::array<MatrixDesc, 3> expected{expert.gate, expert.up, expert.down};
+            for (std::size_t role = 0; role < outputs.size(); ++role)
+            {
+                EXPECT_EQ(actual[role][0].payload, nullptr);
+                if (live)
+                    EXPECT_EQ(std::memcmp(&actual[role][1], &expected[role], sizeof(MatrixDesc)), 0);
+                else
+                    EXPECT_EQ(actual[role][1].payload, nullptr);
+            }
+        }
+    }
 #endif
 }
 
@@ -24025,43 +24101,44 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
             ASSERT_TRUE(
                 canonical_route_contributions->ensureOnDevice(device, stream_));
 
-            ASSERT_TRUE(moe_kernel.routeVerifierRowsDecodeEquivalent(
-                hidden.get(),
-                router_gate.get(),
-                seq_len,
-                d_model,
-                num_experts,
-                top_k,
-                /*normalize_weights=*/true,
-                routing_indices.get(),
-                routing_weights.get()))
-                << format.label << " production grouped router M=" << seq_len;
-            ASSERT_TRUE(moe_kernel.publishCompleteGroupedPrefillPlanFromRouter(
-                runtime_table.deviceLayerState(0),
-                routing_indices.get(),
-                routing_weights.get(),
-                seq_len,
-                seq_len,
-                num_experts,
-                top_k,
-                gateup_table,
-                down_table,
-                /*filter_to_local_runtime_experts=*/false))
-                << format.label << " complete runtime plan M=" << seq_len;
-            ASSERT_TRUE(moe_kernel.executeGroupedPrefillPipelineFromPublishedRuntimePlan(
-                runtime_table.deviceLayerState(0),
-                runtime_table.hostLayerState(0),
-                hidden.get(),
-                runtime_prefill_output.get(),
-                gateup_table,
-                down_table,
-                seq_len,
-                d_model,
-                intermediate,
-                num_experts,
-                top_k,
-                canonical_route_contributions.get()))
-                << format.label << " runtime grouped verifier prefill M=" << seq_len;
+            const auto run_grouped = [&]() {
+                return moe_kernel.routeVerifierRowsDecodeEquivalent(
+                    hidden.get(),
+                    router_gate.get(),
+                    seq_len,
+                    d_model,
+                    num_experts,
+                    top_k,
+                    /*normalize_weights=*/true,
+                    routing_indices.get(),
+                    routing_weights.get()) &&
+                    moe_kernel.publishCompleteGroupedPrefillPlanFromRouter(
+                    runtime_table.deviceLayerState(0),
+                    routing_indices.get(),
+                    routing_weights.get(),
+                    seq_len,
+                    seq_len,
+                    num_experts,
+                    top_k,
+                    gateup_table,
+                    down_table,
+                    /*filter_to_local_runtime_experts=*/false) &&
+                    moe_kernel.executeGroupedPrefillPipelineFromPublishedRuntimePlan(
+                    runtime_table.deviceLayerState(0),
+                    runtime_table.hostLayerState(0),
+                    hidden.get(),
+                    runtime_prefill_output.get(),
+                    gateup_table,
+                    down_table,
+                    seq_len,
+                    d_model,
+                    intermediate,
+                    num_experts,
+                    top_k,
+                    canonical_route_contributions.get());
+            };
+            ASSERT_TRUE(run_grouped())
+                << format.label << " runtime grouped publication M=" << seq_len;
             ASSERT_EQ(runtime_prefill_output->gpu_data_ptr(), nullptr)
                 << format.label << " M=" << seq_len
                 << " runtime canonical producer must leave the later reducer "
@@ -24145,6 +24222,49 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                 serial_values.data(),
                 grouped_values.size(),
                 static_cast<size_t>(d_model));
+            if (std::string_view(format.label) == "Q8_0" && seq_len == 4)
+            {
+                ScopedCudaTestGraph graph(stream_, "M4 original-route Down publication");
+                ASSERT_TRUE(run_grouped());
+                ASSERT_TRUE(moe_kernel.reduceCanonicalRouteContributions(
+                    canonical_route_contributions.get(), runtime_prefill_output.get(), seq_len, top_k, d_model));
+                ASSERT_TRUE(graph.finishAndInstantiate());
+
+                const auto native = graph.nativeGraphForInspection();
+                std::size_t count = 0;
+                ASSERT_EQ(cudaGraphGetNodes(native, nullptr, &count), cudaSuccess);
+                std::vector<cudaGraphNode_t> nodes(count);
+                ASSERT_EQ(cudaGraphGetNodes(native, nodes.data(), &count), cudaSuccess);
+                int direct_publications = 0;
+                for (auto node : nodes)
+                {
+                    cudaGraphNodeType type{};
+                    ASSERT_EQ(cudaGraphNodeGetType(node, &type), cudaSuccess);
+                    if (type != cudaGraphNodeTypeKernel)
+                        continue;
+                    cudaKernelNodeParams params{};
+                    ASSERT_EQ(cudaGraphKernelNodeGetParams(node, &params), cudaSuccess);
+                    const char *symbol = nullptr;
+                    ASSERT_EQ(cudaFuncGetName(&symbol, params.func), cudaSuccess);
+                    ASSERT_NE(symbol, nullptr);
+                    const std::string_view name{symbol};
+                    EXPECT_EQ(name.find("grouped_prefill_down_canonical_kpart_reduce_kernel"), std::string_view::npos);
+                    if (name.find("grouped_prefill_down_canonical_publish_k32_kernel") != std::string_view::npos)
+                    {
+                        ++direct_publications;
+                        EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(seq_len * top_k));
+                        EXPECT_EQ(params.gridDim.z, 1u);
+                    }
+                }
+                EXPECT_EQ(direct_publications, 1);
+                for (int repeat = 0; repeat < 3; ++repeat)
+                {
+                    ASSERT_TRUE(graph.launchAndPublishOutputs({runtime_prefill_output.get()}));
+                    const auto replay = copyCudaFP32TensorToHost(runtime_prefill_output, stream_);
+                    expectBitwiseFP32RowsEqual("captured M4 direct Down publication",
+                        replay.data(), serial_values.data(), replay.size(), d_model);
+                }
+            }
             expectPrefillSwiGLUPathRecord("fused", seq_len, top_k, num_experts, 0,
                                           "kpart_prefill",
                                           "ordered_kpart_prefill",

@@ -71,4 +71,18 @@ namespace llaminar2
             return top_k;
         }
     };
+
+    /** @brief Existing workspace planes for the fused M1 gate/up publication. */
+    struct CUDAMoESwiGLUPublication
+    {
+        std::int8_t *codes = nullptr;
+        float *scales = nullptr;
+    };
+
+    /** @brief Select the original FP32 input or the fused gate producer's Q8 output. */
+    enum class CUDAMoEDecodeDownInput : std::uint8_t
+    {
+        FloatGateUp,
+        PublishedSwiGLU,
+    };
 }

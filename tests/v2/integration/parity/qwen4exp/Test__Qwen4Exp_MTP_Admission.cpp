@@ -14,6 +14,7 @@
 #include "config/OrchestrationConfigParser.h"
 #include "utils/TestOrchestrationHelper.h"
 #include "utils/PerfStatsCollector.h"
+#include "utils/BenchmarkRunner.h"
 #include "backends/BackendManager.h"
 #include "config/OrchestrationStartupPolicy.h"
 #include "execution/moe/MoEPipelinePreparedPlan.h"
@@ -515,6 +516,8 @@ TEST(Qwen4ExpTensorShardedROCmTP4, Fixed3Retained3RestoredPrefixPlusOneMatchesSe
     const auto comparison = compareMTPRuntimeStateSnapshots(serial, restored);
     EXPECT_TRUE(comparison) << comparison.reason;
 }
+#endif
+#if defined(HAVE_CUDA) || defined(HAVE_ROCM)
 #include "Qwen4ExpDynamicTensorShardedReplay.inc"
 #include "Qwen4ExpDynamicMixedTensorShardedReplay.inc"
 #endif

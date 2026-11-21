@@ -1,0 +1,358 @@
+/**
+ * @file CUDADecodeRoofline.cu
+ * @brief Calibrate same-device read and integer compute rates for CUDA decode.
+ *
+ * The probe owns one stream and captures its timed launches before sampling.
+ * Host verification observes every output lane outside the measured interval.
+ * Counter collection selects the same graph and one physical kernel launch.
+ */
+
+#include <cuda_runtime.h>
+
+#include <algorithm>
+#include <charconv>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <string_view>
+#include <vector>
+
+namespace
+{
+    /** @brief Abort a sample on the first failed CUDA operation. */
+    void check(cudaError_t status, const char* operation)
+    {
+        if (status != cudaSuccess)
+        {
+            std::fprintf(stderr, "%s: %s\n", operation, cudaGetErrorString(status));
+            std::exit(EXIT_FAILURE);
+        }
+    }
+
+    #define CUDA_CHECK(operation) check((operation), #operation)
+
+    constexpr unsigned threadsPerBlock = 256;
+    constexpr unsigned launchesPerGraph = 16;
+    constexpr unsigned samples = 21;
+    constexpr unsigned dotIterations = 4096;
+    constexpr unsigned dotChains = 8;
+    constexpr unsigned mmaIterations = 2048;
+    constexpr unsigned mmaChains = 8;
+
+    enum class Kernel { Read, Dp4a, Imma };
+
+    /** @brief Generate distinct deterministic words for each input vector. */
+    __host__ __device__ uint4 inputAt(unsigned index)
+    {
+        uint32_t word = index + 0x9e3779b9U;
+        word = (word ^ (word >> 16)) * 0x7feb352dU;
+        word = (word ^ (word >> 15)) * 0x846ca68bU;
+        return {word, (word << 13) | (word >> 19), index ^ (word >> 5), word + index};
+    }
+
+    /** @brief Initialize the probe allocation before graph capture. */
+    __global__ void prepareReadInput(uint4* input, unsigned vectors)
+    {
+        const unsigned stride = gridDim.x * blockDim.x;
+        for (unsigned index = blockIdx.x * blockDim.x + threadIdx.x;
+             index < vectors; index += stride)
+            input[index] = inputAt(index);
+    }
+
+    /** @brief Add modulo 2^32, independently in each vector component. */
+    __host__ __device__ uint4 add(uint4 left, uint4 right)
+    {
+        return {left.x + right.x, left.y + right.y, left.z + right.z, left.w + right.w};
+    }
+
+    /**
+     * @brief Issue aligned, coalesced 16-byte reads over a cache-sized or DRAM-sized set.
+     * @param input Initialized vectors, rounded to complete stripes.
+     * @param output One checked checksum per launch thread.
+     * @param vectors Number of vectors per traversal.
+     * @param passes Number of traversals per dispatch.
+     */
+    __global__ void decodeReadCeiling(const uint4* input, uint4* output,
+                                     unsigned vectors, unsigned passes)
+    {
+        const unsigned thread = blockIdx.x * blockDim.x + threadIdx.x;
+        const unsigned stride = gridDim.x * blockDim.x;
+        uint4 sums[4]{};
+        for (unsigned pass = 0; pass < passes; ++pass)
+        {
+            for (unsigned index = thread; index < vectors; index += 4 * stride)
+            {
+                #pragma unroll
+                for (unsigned group = 0; group < 4; ++group)
+                {
+                    const auto* address = input + index + group * stride;
+                    const auto global = __cvta_generic_to_global(address);
+                    uint4 value;
+                    // Keep independent vector loads and ensure repeated L2 passes issue again.
+                    asm volatile("ld.global.cg.v4.u32 {%0,%1,%2,%3}, [%4];"
+                        : "=r"(value.x), "=r"(value.y), "=r"(value.z), "=r"(value.w)
+                        : "l"(global) : "memory");
+                    sums[group] = add(sums[group], value);
+                }
+            }
+        }
+        output[thread] = add(add(sums[0], sums[1]), add(sums[2], sums[3]));
+    }
+
+    /**
+     * @brief Drive independent signed DP4A chains using byte values 0 through 127.
+     * @param output One checked sum of the chains per launch thread.
+     */
+    __global__ void decodeDp4aCeiling(uint32_t* output)
+    {
+        const unsigned thread = blockIdx.x * blockDim.x + threadIdx.x;
+        const int left = static_cast<int>(thread & 127U) * 0x01010101;
+        uint32_t accumulators[dotChains]{};
+        #pragma unroll 1
+        for (unsigned iteration = 0; iteration < dotIterations; ++iteration)
+        {
+            #pragma unroll
+            for (unsigned chain = 0; chain < dotChains; ++chain)
+            {
+                const int right = static_cast<int>(chain + 1) * 0x01010101;
+                asm volatile("dp4a.s32.s32 %0, %1, %2, %0;"
+                    : "+r"(accumulators[chain]) : "r"(left), "r"(right));
+            }
+        }
+        uint32_t sum = 0;
+        #pragma unroll
+        for (unsigned chain = 0; chain < dotChains; ++chain)
+            sum += accumulators[chain];
+        output[thread] = sum;
+    }
+
+    /**
+     * @brief Drive independent dense SM80+ INT8 tensor-core accumulator chains.
+     * @param output Four S32 accumulator elements, summed across chains per lane.
+     *
+     * Uniform operand values within a warp give every result in the tile the
+     * same independent closed-form value despite the native fragment layout.
+     */
+    __global__ void decodeImmaCeiling(uint4* output)
+    {
+#if __CUDA_ARCH__ >= 800
+        const unsigned thread = blockIdx.x * blockDim.x + threadIdx.x;
+        const int left = static_cast<int>(thread / 32 % 127 + 1) * 0x01010101;
+        uint4 accumulators[mmaChains]{};
+        #pragma unroll 1
+        for (unsigned iteration = 0; iteration < mmaIterations; ++iteration)
+        {
+            #pragma unroll
+            for (unsigned chain = 0; chain < mmaChains; ++chain)
+            {
+                const int right = static_cast<int>(chain + 1) * 0x01010101;
+                auto& value = accumulators[chain];
+                asm volatile("mma.sync.aligned.m16n8k32.row.col.s32.s8.s8.s32 "
+                             "{%0,%1,%2,%3}, {%4,%4,%4,%4}, {%5,%5}, {%0,%1,%2,%3};"
+                    : "+r"(value.x), "+r"(value.y), "+r"(value.z), "+r"(value.w)
+                    : "r"(left), "r"(right));
+            }
+        }
+        uint4 sum{};
+        #pragma unroll
+        for (unsigned chain = 0; chain < mmaChains; ++chain)
+            sum = add(sum, accumulators[chain]);
+        output[thread] = sum;
+#else
+        // Fat binaries can also contain pre-Ampere images for the other modes.
+        (void)output;
+        __trap();
+#endif
+    }
+
+    /// @brief All geometry and useful work for a single probe.
+    struct Probe
+    {
+        std::string_view name;
+        unsigned blocks;
+        unsigned vectors;
+        unsigned passes;
+        Kernel kernel;
+
+        /** @return Requested bytes, thread DP4A operations or warp IMMA operations per launch. */
+        uint64_t count() const
+        {
+            if (kernel == Kernel::Dp4a)
+                return uint64_t(blocks) * threadsPerBlock * dotIterations * dotChains;
+            if (kernel == Kernel::Imma)
+                return uint64_t(blocks) * (threadsPerBlock / 32) * mmaIterations * mmaChains;
+            return uint64_t(vectors) * passes * sizeof(uint4);
+        }
+    };
+
+    /**
+     * @brief Capture, time and verify one probe with fixed addresses and work.
+     * @param probe Benchmark mode and geometry.
+     * @param stream The selected device's private nonblocking stream.
+     */
+    bool measure(const Probe& probe, cudaStream_t stream)
+    {
+        const unsigned threads = probe.blocks * threadsPerBlock;
+        uint4* input = nullptr;
+        uint4* output = nullptr;
+        const auto outputBytes = threads * (probe.kernel == Kernel::Dp4a ? sizeof(uint32_t) : sizeof(uint4));
+        CUDA_CHECK(cudaMalloc(&output, outputBytes));
+        if (probe.kernel == Kernel::Read)
+        {
+            CUDA_CHECK(cudaMalloc(&input, size_t(probe.vectors) * sizeof(uint4)));
+            prepareReadInput<<<probe.blocks, threadsPerBlock, 0, stream>>>(input, probe.vectors);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+        }
+
+        cudaGraph_t graph{};
+        cudaGraphExec_t executable{};
+        CUDA_CHECK(cudaStreamBeginCapture(stream, cudaStreamCaptureModeThreadLocal));
+        for (unsigned launch = 0; launch < launchesPerGraph; ++launch)
+        {
+            if (probe.kernel == Kernel::Dp4a)
+                decodeDp4aCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
+                    reinterpret_cast<uint32_t*>(output));
+            else if (probe.kernel == Kernel::Imma)
+                decodeImmaCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(output);
+            else
+                decodeReadCeiling<<<probe.blocks, threadsPerBlock, 0, stream>>>(
+                    input, output, probe.vectors, probe.passes);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        CUDA_CHECK(cudaStreamEndCapture(stream, &graph));
+        CUDA_CHECK(cudaGraphInstantiate(&executable, graph, 0));
+
+        cudaEvent_t start{}, end{};
+        CUDA_CHECK(cudaEventCreate(&start));
+        CUDA_CHECK(cudaEventCreate(&end));
+        for (unsigned warmup = 0; warmup < 5; ++warmup)
+            CUDA_CHECK(cudaGraphLaunch(executable, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        for (unsigned sample = 0; sample < samples; ++sample)
+        {
+            CUDA_CHECK(cudaEventRecord(start, stream));
+            CUDA_CHECK(cudaGraphLaunch(executable, stream));
+            CUDA_CHECK(cudaEventRecord(end, stream));
+            CUDA_CHECK(cudaEventSynchronize(end));
+            float milliseconds = 0.0f;
+            CUDA_CHECK(cudaEventElapsedTime(&milliseconds, start, end));
+            std::printf("%.*s,%u,%u,%u,%u,%u,%llu,%.6f\n",
+                        int(probe.name.size()), probe.name.data(), sample, probe.blocks, threadsPerBlock,
+                        probe.vectors, probe.passes, static_cast<unsigned long long>(probe.count()),
+                        double(milliseconds) * 1000 / launchesPerGraph);
+        }
+
+        bool valid = true;
+        if (probe.kernel == Kernel::Dp4a)
+        {
+            std::vector<uint32_t> actual(threads);
+            CUDA_CHECK(cudaMemcpyAsync(actual.data(), output, outputBytes,
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            for (unsigned thread = 0; thread < threads; ++thread)
+            {
+                constexpr unsigned sumOfCoefficients = dotChains * (dotChains + 1) / 2;
+                const uint32_t expected = (thread & 127U) * 4 * dotIterations * sumOfCoefficients;
+                valid &= actual[thread] == expected;
+            }
+        }
+        else
+        {
+            std::vector<uint4> actual(threads);
+            CUDA_CHECK(cudaMemcpyAsync(actual.data(), output, outputBytes,
+                                       cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            for (unsigned thread = 0; thread < threads; ++thread)
+            {
+                uint4 expected{};
+                if (probe.kernel == Kernel::Read)
+                {
+                    for (unsigned index = thread; index < probe.vectors; index += threads)
+                        expected = add(expected, inputAt(index));
+                }
+                else
+                {
+                    constexpr unsigned sumOfCoefficients = mmaChains * (mmaChains + 1) / 2;
+                    const uint32_t value = (thread / 32 % 127 + 1) * 32 * mmaIterations * sumOfCoefficients;
+                    expected = {value, value, value, value};
+                }
+                const auto result = actual[thread];
+                valid &= result.x == expected.x * probe.passes && result.y == expected.y * probe.passes &&
+                         result.z == expected.z * probe.passes && result.w == expected.w * probe.passes;
+            }
+        }
+        std::printf("CHECK,%s,%u\n", valid ? "pass" : "fail", threads);
+        CUDA_CHECK(cudaEventDestroy(end));
+        CUDA_CHECK(cudaEventDestroy(start));
+        CUDA_CHECK(cudaGraphExecDestroy(executable));
+        CUDA_CHECK(cudaGraphDestroy(graph));
+        if (input)
+            CUDA_CHECK(cudaFree(input));
+        CUDA_CHECK(cudaFree(output));
+        return valid;
+    }
+}
+
+/** @brief Admit one explicit device and run exactly one reference regime. */
+int main(int argc, char** argv)
+{
+    int device = -1;
+    if (argc != 3)
+    {
+        std::fprintf(stderr, "Usage: %s <cuda-device> <dram|l2|dp4a|imma>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+    const std::string_view ordinal(argv[1]);
+    const auto parsed = std::from_chars(ordinal.data(), ordinal.data() + ordinal.size(), device);
+    const std::string_view mode(argv[2]);
+    if (parsed.ec != std::errc{} || parsed.ptr != ordinal.data() + ordinal.size() ||
+        device < 0 || (mode != "dram" && mode != "l2" && mode != "dp4a" && mode != "imma"))
+        return EXIT_FAILURE;
+
+    CUDA_CHECK(cudaSetDevice(device));
+    cudaDeviceProp properties{};
+    CUDA_CHECK(cudaGetDeviceProperties(&properties, device));
+    char pciBusId[32]{};
+    CUDA_CHECK(cudaDeviceGetPCIBusId(pciBusId, sizeof(pciBusId), device));
+    std::printf("DEVICE,%s,%s,sm_%d%d,%d,%d\n", pciBusId, properties.name,
+                properties.major, properties.minor, properties.multiProcessorCount, properties.l2CacheSize);
+
+    const auto sms = static_cast<unsigned>(properties.multiProcessorCount);
+    const auto kernel = mode == "dp4a" ? Kernel::Dp4a : mode == "imma" ? Kernel::Imma : Kernel::Read;
+    if (kernel == Kernel::Imma && properties.major < 8)
+    {
+        std::fprintf(stderr, "The dense INT8 m16n8k32 reference requires SM80 or newer\n");
+        return EXIT_FAILURE;
+    }
+    Probe probe{.name = mode, .blocks = 4 * sms, .vectors = 0, .passes = 1, .kernel = kernel};
+    if (kernel == Kernel::Read)
+    {
+        const size_t l2Bytes = properties.l2CacheSize;
+        const unsigned bytesPerBlock = 4 * threadsPerBlock * sizeof(uint4);
+        const size_t minimumDramBytes = 8 * l2Bytes + probe.blocks * bytesPerBlock;
+        const size_t targetBytes = mode == "dram"
+            ? std::max(size_t{256} << 20, minimumDramBytes)
+            : l2Bytes / 2;
+        if (mode == "l2")
+        {
+            // Four interleaved loads per thread still have to fit in half L2.
+            probe.blocks = std::min<size_t>(probe.blocks, targetBytes / bytesPerBlock);
+            probe.blocks = probe.blocks / sms * sms;
+        }
+        if (!probe.blocks)
+        {
+            std::fprintf(stderr, "Device L2 cannot fit a complete launch wave\n");
+            return EXIT_FAILURE;
+        }
+        const unsigned stripe = 4 * threadsPerBlock * probe.blocks;
+        probe.vectors = targetBytes / sizeof(uint4) / stripe * stripe;
+        probe.passes = mode == "dram" ? 1 : 128;
+    }
+    std::puts("probe,sample,blocks,threads,vectors,passes,count,us_per_launch");
+    cudaStream_t stream{};
+    CUDA_CHECK(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
+    const bool valid = measure(probe, stream);
+    CUDA_CHECK(cudaStreamDestroy(stream));
+    return valid ? EXIT_SUCCESS : EXIT_FAILURE;
+}

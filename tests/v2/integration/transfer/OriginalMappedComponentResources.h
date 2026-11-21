@@ -33,6 +33,7 @@ struct OriginalMappedComponentProgram final {
     Kind kind;
     std::size_t rows, width, epochs;
     bool retained=false;
+    MoENodeLocalRouteOwnership ownership=MoENodeLocalRouteOwnership::ExclusiveParticipant;
     bool operator==(const OriginalMappedComponentProgram&)const=default;
     /** @return Actual logical GPU allocations in creator order, grouped by endpoint role. */
     std::array<std::vector<std::size_t>,2> deviceBanks()const {
@@ -40,8 +41,12 @@ struct OriginalMappedComponentProgram final {
         if(kind==Kind::Ticket)return {{{4096,bytes,32*4096},{}}};
         if(kind==Kind::TicketCompletion)return {};
         if(kind==Kind::Dense)return {{{bytes},{bytes}}};
-        return {{{bytes*8,rows*8*sizeof(std::int32_t),bytes,bytes*epochs,sizeof(std::int32_t),sizeof(MoENodeLocalRoutePeerDeviceBinding)},
-                 {bytes*8,rows*8*sizeof(std::int32_t)}}};
+        std::array<std::vector<std::size_t>,2> banks{{
+            {bytes*8,rows*8*sizeof(std::int32_t),bytes,bytes*epochs,sizeof(std::int32_t),sizeof(MoENodeLocalRoutePeerDeviceBinding)},
+            {bytes*8,rows*8*sizeof(std::int32_t)}}};
+        if(ownership==MoENodeLocalRouteOwnership::ContinuationCohort)
+            banks.front().push_back(rows*8*sizeof(float)); // Original router factor per logical slot.
+        return banks;
     }
 };
 /** @brief Actual original source/PMA, event roster and program membership; never an allocator ledger. */

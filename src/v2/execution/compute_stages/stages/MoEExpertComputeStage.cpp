@@ -12252,6 +12252,12 @@ namespace llaminar2
                         "consumer has no prepared peer descriptors/status");
                     return false;
                 }
+                const bool raw_cohort = params_.node_local_route_ownership ==
+                    MoENodeLocalRouteOwnership::ContinuationCohort;
+                const auto &weights = params_.runtime_route_weights;
+                if (raw_cohort && !weights.validFor(static_cast<std::uint32_t>(params_.seq_len),
+                                                      static_cast<std::uint32_t>(params_.top_k)))
+                    throw std::logic_error("mixed-tier cohort lost its original router weight publication");
                 MoENodeLocalRouteConsumeLaunch consumption{
                     .peers = static_cast<
                         const MoENodeLocalRoutePeerDeviceBinding *>(
@@ -12272,6 +12278,8 @@ namespace llaminar2
                     .top_k = static_cast<std::uint32_t>(params_.top_k),
                     .d_model = static_cast<std::uint32_t>(params_.d_model),
                     .ownership = params_.node_local_route_ownership,
+                    .cohort_route_weights = raw_cohort ? weights.weights : nullptr,
+                    .cohort_route_capacity = raw_cohort ? weights.capacity : 0u,
                 };
                 if (!kernel->acquireNodeLocalCanonicalRoutes(
                         launch, consumption))

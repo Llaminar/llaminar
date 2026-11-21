@@ -20,9 +20,12 @@
  * loads round RNE to half inside the fixed per-row dot, then widen for FP32
  * accumulation. Serial, grouped, prefill and owned rows share that same tree.
  * Router rounding never replaces the original expert hidden publication.
+ * An intermediate-shard router can publish all selected role descriptors
+ * into the existing arena before the fused decode projections consume them.
  */
 
 #include "../../IMoEKernel.h"
+#include "../../common/MoEDecodeDescriptorPublication.h"
 #include "../../../config/MoERouterArithmeticPolicy.h"
 #include "CUDARouterQ8Prefill.h"
 #include "../../common/DeviceResidentRouterGateCache.h"
@@ -35,6 +38,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <unordered_map>
 #include <vector>
 
@@ -771,6 +775,10 @@ namespace llaminar2
             int d_model,
             int intermediate) override;
 
+        /** @copydoc IMoEKernel::preparePairedRouterDecodeDescriptors */
+        MoEDecodeDescriptorPublisher preparePairedRouterDecodeDescriptors(
+            DeviceMoELayerRuntime *runtime, int gateup_table, int down_table, int top_k) override;
+
         /** @copydoc IMoEKernel::prepareGroupedRuntimeDecodeLaunchState */
         bool prepareGroupedRuntimeDecodeLaunchState(
             int gateup_descriptor_table_id,
@@ -805,7 +813,8 @@ namespace llaminar2
             int intermediate,
             MoEDecodeDescriptorSource descriptor_source =
                 MoEDecodeDescriptorSource::RuntimePlacementTable,
-            ITensor *canonical_route_contributions = nullptr) override;
+            ITensor *canonical_route_contributions = nullptr,
+            MoEExpertRouteWeighting weighting = MoEExpertRouteWeighting::LocalProjection) override;
 
         bool reduceCanonicalRouteContributions(
             ITensor *canonical_route_contributions,
@@ -1093,7 +1102,8 @@ namespace llaminar2
             MoEDecodeDescriptorSource descriptor_source,
             bool allow_router_q8_reuse,
             const char *counter_source,
-            ITensor *canonical_route_contributions);
+            ITensor *canonical_route_contributions,
+            MoEExpertRouteWeighting weighting = MoEExpertRouteWeighting::LocalProjection);
 
         static constexpr std::size_t kRuntimePointerArrayMaxTopK = 16;
         static constexpr std::size_t kRuntimePointerArrayTableSlots = 1024;
@@ -1291,6 +1301,30 @@ namespace llaminar2
 
         bool rebindGroupedDescriptorTablesToWorkspace(const char *context);
         void clearWorkspaceScratchBindings() noexcept;
+
+        /** @brief Original router, workspace generation and prebound publication outputs. */
+        struct PairedRouterDescriptors
+        {
+            DeviceMoELayerRuntime *runtime;
+            DeviceWorkspaceManager *workspace;
+            std::uint64_t workspace_id;
+            void *stream;
+            int gateup_table;
+            int down_table;
+            int top_k;
+            MoEDecodeDescriptorPublication outputs;
+        };
+        std::optional<PairedRouterDescriptors> paired_router_descriptors_;
+
+        /**
+         * @brief Require the exact cold publication on the live capture stream.
+         * @param runtime Original captured runtime record.
+         * @param num_experts Exact physical table extent.
+         * @param top_k Original selected packet width.
+         * @return Immutable descriptor destinations for this paired graph.
+         */
+        const PairedRouterDescriptors &requirePairedRouterDescriptors(
+            DeviceMoELayerRuntime *runtime, int num_experts, int top_k) const;
         void releaseDeviceBuffers() noexcept;
         struct RouterQ8GateCacheEntry;
         const RouterQ8GateCacheEntry *getOrCreateQ8RouterGateCache(

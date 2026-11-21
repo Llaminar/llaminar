@@ -77,6 +77,7 @@ void expectQFNGroupedGreedyMatchesOrdinary(IOrchestrationRunner& runner,
     EXPECT_GT(qfnGroupedVerifierRuns(counter), before);
 }
 
+#ifdef HAVE_ROCM
 /** @test A fully resident Dynamic TP4 cohort retains its epoch across grouped graph replay. */
 TEST(Qwen4ExpTensorShardedROCmTP4, DynamicResidencyOneCohortRetainsEpochAcrossGroupedReplay)
 {
@@ -158,3 +159,4 @@ TEST(Qwen4ExpTensorShardedROCmTP4, DynamicResidencyOneCohortRetainsEpochAcrossGr
     ASSERT_NO_THROW(lifetime.finish());
     EXPECT_EQ(lifetime.retiredDeviceCount(), 4u);
 }
+#endif
