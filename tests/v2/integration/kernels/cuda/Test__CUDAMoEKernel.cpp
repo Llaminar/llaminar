@@ -24267,6 +24267,18 @@ TEST_F(Test__CUDAMoEKernel, RuntimeVerifierSmallMPrefillAllNativeFormatsMatchRun
                         ++direct_publications;
                         down_source = node;
                         down_params = params;
+                        if (!probe_path)
+                        {
+                            const std::string_view source_format{format.label};
+                            const bool wide_grid_reader = d_model == 2560 && intermediate == 256 &&
+                                (source_format == "IQ1_S" || source_format == "IQ1_M" ||
+                                 source_format == "IQ3_XXS");
+                            // The CUDA C++ symbol encodes the captured WideGrid
+                            // template argument. Timing mode also measures older
+                            // libraries whose leaf predates that argument.
+                            EXPECT_EQ(name.find("ELb1EEE") != std::string_view::npos, wide_grid_reader)
+                                << format.label << " captured the wrong Down reader";
+                        }
                         EXPECT_EQ(params.gridDim.x, static_cast<unsigned>((d_model + 63) / 64));
                         EXPECT_EQ(params.gridDim.y, static_cast<unsigned>(seq_len * top_k));
                         EXPECT_EQ(params.gridDim.z, 1u);

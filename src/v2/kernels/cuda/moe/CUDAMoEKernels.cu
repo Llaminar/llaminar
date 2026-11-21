@@ -28,6 +28,9 @@
  * Fused decode emits Q8 directly from the ordered gate/up partition reducer.
  * SM86 reuses the original activation packet across paired Gate/Up projections
  * and vector-loads each K32 Down activation for the measured codebooks.
+ * Wide SM86 verifier tiles expand a compact IQ1 grid and use whole-word
+ * index and sign loads for IQ3_XXS. IQ2_XXS uses one aligned payload load.
+ * Serial Q5_1 resolves the measured ten-packet Down geometry before the dot.
  */
 
 #include "kernels/common/MoERuntimeDescriptorLaunch.h"
@@ -71,6 +74,7 @@
 #include "execution/moe/LeastLoadedExpertAssignment.h"
 #include "execution/moe/DeviceMoEOverlayEpochABI.h"
 #include "execution/moe/DeviceMoERuntimeABI.h"
+#include "tensors/IQQuantTables.h"
 #include "utils/DebugEnv.h"
 
 #include <algorithm>
@@ -18768,17 +18772,67 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     /** @brief Rounding and scheduling of one NativeQuantised expert dot. */
     enum class NativeMoEDotOrder : uint8_t
     {
-        PartitionPartial,  ///< The caller publishes a split-K partial.
-        DecodeK32,         ///< Direct serial decode publishes ordered K32 terms.
-        VerifierK32,       ///< Direct grouped verification publishes the same terms.
+        PartitionPartial,   ///< The caller publishes a split-K partial.
+        DecodeK32,          ///< Direct serial decode publishes ordered K32 terms.
+        VerifierK32,        ///< Direct grouped verification publishes the same terms.
+        VerifierWideGrid,  ///< Identical verifier order with the wide IQ grid readers.
     };
+
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ == 860
+    /** @brief Read-only IQ1 grid with eight two-bit symbols stored per entry. */
+    struct CompactMoEIQ1Grid
+    {
+        uint16_t words[sizeof(llaminar2::iq1s_ternary_grid) / sizeof(uint16_t)];
+    };
+
+    /**
+     * @brief Materialize the canonical ternary grid in the device image.
+     * @return The exact signed IQ1 grid encoded as 0, 1, and 3.
+     */
+    consteval CompactMoEIQ1Grid make_compact_moe_iq1_grid()
+    {
+        CompactMoEIQ1Grid grid{};
+        for (size_t index = 0; index < sizeof(grid.words) / sizeof(uint16_t); ++index)
+            grid.words[index] = llaminar2::iq1s_ternary_grid[index];
+        return grid;
+    }
+
+    /**
+     * @brief Check the compact representation against every canonical grid entry.
+     * @return Whether all symbols expand to the exact original signed bytes.
+     */
+    consteval bool compact_moe_iq1_grid_is_canonical()
+    {
+        constexpr auto grid = make_compact_moe_iq1_grid();
+        for (size_t index = 0; index < sizeof(grid.words) / sizeof(uint16_t); ++index)
+        {
+            const uint16_t word = grid.words[index];
+            uint64_t expanded = 0;
+            for (int lane = 0; lane < 8; ++lane)
+            {
+                const uint64_t symbol = (word >> (2 * lane)) & 3u;
+                if (symbol == 2u)
+                    return false;
+                expanded |= (symbol == 3 ? 0xffu : symbol) << (8 * lane);
+            }
+            if (expanded != llaminar2::iq1s_grid[index])
+                return false;
+        }
+        return true;
+    }
+
+    static_assert(compact_moe_iq1_grid_is_canonical());
+    __device__ const CompactMoEIQ1Grid compact_moe_iq1_grid = make_compact_moe_iq1_grid();
+#endif
 
     /**
      * @brief Form the eight packed signed-byte operands of an MoE K32 dot.
      * @tparam CodebookId Physical payload layout admitted for the route.
      * @tparam Order Dot schedule that owns this packet.
      * @param payload Address of one prepared packet. Q2_K and Q6_K packets
-     *        start on eight-byte boundaries. Q3_K and Q5_0 start on four-byte boundaries.
+     *        and IQ2_XXS start on eight-byte boundaries. Q3_K, Q5_0 and
+     *        IQ3_XXS start on four-byte boundaries.
+     *        IQ1 packets start on two-byte boundaries.
      * @param groups Decoded operands in the original DP4A order.
      */
     template <uint8_t CodebookId, NativeMoEDotOrder Order>
@@ -18792,8 +18846,74 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             // into another lane. The mask supplies the sign-extension bits.
             return low_bits * mask;
         };
-        if constexpr (Order == NativeMoEDotOrder::VerifierK32 &&
-                      CodebookId == native_formats::Q2_K.codebook_id)
+        using Traits = llaminar2::cuda_native_quantised::CodebookTraits<CodebookId>;
+        if constexpr (Order == NativeMoEDotOrder::VerifierWideGrid && Traits::is_iq1_grid)
+        {
+            const auto *words = reinterpret_cast<const uint16_t *>(payload);
+            const uint32_t low_indices = uint32_t{words[0]} | (uint32_t{words[1]} << 16);
+            const uint32_t high_indices = words[2];
+            const auto expand = [](uint32_t packed) {
+                // Each two-bit symbol selects one signed byte in 0xff000100.
+                const uint32_t byte = packed & 0xffu;
+                const uint32_t pairs = (byte | (byte << 4)) & 0x0f0fu;
+                const uint32_t selectors = (pairs | (pairs << 2)) & 0x3333u;
+                return static_cast<int32_t>(__byte_perm(0xff000100u, 0u, selectors));
+            };
+            // IQ1_M interleaves one delta sign bit with each three-bit index.
+            constexpr int kHighIndexStride = Traits::is_iq1_m ? 4 : 3;
+#pragma unroll
+            for (int group = 0; group < 4; ++group)
+            {
+                const uint32_t index = ((low_indices >> (8 * group)) & 0xffu) |
+                                       (((high_indices >> (kHighIndexStride * group)) & 7u) << 8);
+                const uint32_t ternary = __ldg(compact_moe_iq1_grid.words + index);
+                groups[group * 2] = expand(ternary);
+                groups[group * 2 + 1] = expand(ternary >> 8);
+            }
+        }
+        else if constexpr (Order == NativeMoEDotOrder::VerifierWideGrid &&
+                           CodebookId == native_formats::IQ3_XXS.codebook_id)
+        {
+            // Twelve-byte packets have three aligned words. The first two
+            // contain the indices and the last contains eight sign nibbles.
+            const auto *words = reinterpret_cast<const uint32_t *>(payload);
+            const uint32_t first_indices = words[0];
+            const uint32_t last_indices = words[1];
+            const uint32_t signs = words[2];
+#pragma unroll
+            for (int group = 0; group < 8; ++group)
+            {
+                const uint32_t indices = group < 4 ? first_indices : last_indices;
+                const uint32_t index = (indices >> (8 * (group & 3))) & 0xffu;
+                const uint32_t grid = __ldg(
+                    llaminar2::cuda_native_quantised::d_iq3xxs_grid + index);
+                groups[group] = static_cast<int32_t>(
+                    llaminar2::cuda_native_quantised::iq_apply_signs_4(
+                        grid, (signs >> (4 * group)) & 0x0fu));
+            }
+        }
+        else if constexpr (Order == NativeMoEDotOrder::VerifierK32 &&
+                           CodebookId == native_formats::IQ2_XXS.codebook_id)
+        {
+            // Each half of the aligned packet supplies four independent bytes.
+            const uint2 packet = *reinterpret_cast<const uint2 *>(payload);
+#pragma unroll
+            for (int group = 0; group < 4; ++group)
+            {
+                const uint32_t index = (packet.x >> (8 * group)) & 0xffu;
+                const uint32_t signs = packet.y >> (8 * group);
+                const uint64_t grid = __ldg(
+                    llaminar2::cuda_native_quantised::d_iq2xxs_grid + index);
+                groups[group * 2] = static_cast<int32_t>(
+                    llaminar2::cuda_native_quantised::iq_apply_signs_4(
+                        static_cast<uint32_t>(grid), signs & 0x0fu));
+                groups[group * 2 + 1] = static_cast<int32_t>(
+                    llaminar2::cuda_native_quantised::iq_apply_signs_4(
+                        static_cast<uint32_t>(grid >> 32), (signs >> 4) & 0x0fu));
+            }
+        }
+        else if constexpr (Order == NativeMoEDotOrder::VerifierK32 &&
+                           CodebookId == native_formats::Q2_K.codebook_id)
         {
             const uint2 weights = *reinterpret_cast<const uint2 *>(payload);
 #pragma unroll
@@ -18918,9 +19038,10 @@ __global__ void softmax_topk_decode_descriptors_kernel(
 
         const auto sum_quantised_word = [](int32_t packed) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
-            if constexpr (Order == NativeMoEDotOrder::VerifierK32 &&
-                          (CodebookId == native_formats::Q4_1.codebook_id ||
-                           CodebookId == native_formats::Q2_K.codebook_id))
+            if constexpr ((Order == NativeMoEDotOrder::VerifierWideGrid && Traits::is_iq1_grid) ||
+                          (Order == NativeMoEDotOrder::VerifierK32 &&
+                           (CodebookId == native_formats::Q4_1.codebook_id ||
+                            CodebookId == native_formats::Q2_K.codebook_id)))
             {
                 // The signed dot against four ones is the exact byte sum.
                 return __dp4a(packed, 0x01010101, 0);
@@ -18996,18 +19117,10 @@ __global__ void softmax_topk_decode_descriptors_kernel(
             {
                 iq1m_qh = static_cast<uint16_t>(payload[4]) |
                           (static_cast<uint16_t>(payload[5]) << 8u);
-                subgroup_sum0 =
-                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[0]) +
-                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[1]);
-                subgroup_sum1 =
-                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[2]) +
-                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[3]);
-                subgroup_sum2 =
-                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[4]) +
-                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[5]);
-                subgroup_sum3 =
-                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[6]) +
-                    llaminar2::cuda_native_quantised::sum_packed_i8(a_vals[7]);
+                subgroup_sum0 = sum_quantised_word(a_vals[0]) + sum_quantised_word(a_vals[1]);
+                subgroup_sum1 = sum_quantised_word(a_vals[2]) + sum_quantised_word(a_vals[3]);
+                subgroup_sum2 = sum_quantised_word(a_vals[4]) + sum_quantised_word(a_vals[5]);
+                subgroup_sum3 = sum_quantised_word(a_vals[6]) + sum_quantised_word(a_vals[7]);
             }
 
             return llaminar2::cuda_native_quantised::
@@ -19703,11 +19816,15 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @return Partial accumulated dot product over the requested K-block range.
      * @tparam Order Direct Down folds each original rounded K32 partition.
      *         A partition partial retains the original within-partition fold.
+     * @tparam FixedBlocks Full row length in K32 packets when the caller has
+     *         admitted the fixed traversal. Zero uses the supplied interval.
      * @pre The caller has resolved the physical codebook, validated the
      *      descriptor and 16-byte-aligned activation row, and clipped the K32
      *      interval.
      */
-    template <uint8_t CodebookId, NativeMoEDotOrder Order = NativeMoEDotOrder::PartitionPartial>
+    template <uint8_t CodebookId,
+              NativeMoEDotOrder Order = NativeMoEDotOrder::PartitionPartial,
+              int FixedBlocks = 0>
     __device__ __forceinline__ float native_quantised_dot_admitted_range(
         const DeviceNativeQuantisedMatrixDesc &desc,
         int n,
@@ -19724,24 +19841,26 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         const uint32_t *emin_base = static_cast<const uint32_t *>(desc.emins);
         float acc = 0.0f;
 
-#pragma unroll 1
-        for (int block_idx = b_start; block_idx < b_end; ++block_idx)
+#pragma unroll (FixedBlocks > 0 ? FixedBlocks : 1)
+        for (int block_idx = FixedBlocks > 0 ? 0 : b_start;
+             block_idx < (FixedBlocks > 0 ? FixedBlocks : b_end); ++block_idx)
         {
             const int32_t *a4 = reinterpret_cast<const int32_t *>(A_int8 + block_idx * 32);
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
             // Original Q8 rows and their K32 packets are 16-byte aligned.
             // Materialize both halves in registers for the measured readers.
             int32_t activation_words[8];
-            if constexpr (OrderedK32 &&
-                          (CodebookId == native_formats::Q5_1.codebook_id ||
-                           CodebookId == native_formats::Q6_K.codebook_id ||
-                           CodebookId == native_formats::Q3_K.codebook_id ||
-                           CodebookId == native_formats::Q2_K.codebook_id ||
-                           CodebookId == native_formats::IQ3_S.codebook_id ||
-                           CodebookId == native_formats::IQ3_XXS.codebook_id ||
-                           CodebookId == native_formats::IQ2_S.codebook_id ||
-                           CodebookId == native_formats::IQ2_XS.codebook_id ||
-                           CodebookId == native_formats::IQ1_S.codebook_id))
+            if constexpr (Order == NativeMoEDotOrder::VerifierWideGrid ||
+                          (OrderedK32 &&
+                           (CodebookId == native_formats::Q5_1.codebook_id ||
+                            CodebookId == native_formats::Q6_K.codebook_id ||
+                            CodebookId == native_formats::Q3_K.codebook_id ||
+                            CodebookId == native_formats::Q2_K.codebook_id ||
+                            CodebookId == native_formats::IQ3_S.codebook_id ||
+                            CodebookId == native_formats::IQ3_XXS.codebook_id ||
+                            CodebookId == native_formats::IQ2_S.codebook_id ||
+                            CodebookId == native_formats::IQ2_XS.codebook_id ||
+                            CodebookId == native_formats::IQ1_S.codebook_id)))
             {
                 const auto *packed = reinterpret_cast<const int4 *>(a4);
                 const int4 lo = packed[0];
@@ -19822,6 +19941,17 @@ __global__ void softmax_topk_decode_descriptors_kernel(
                 return native_quantised_dot_admitted_range<4, Order>(
                     desc, n, A_int8, scales_A_blockwise, N, b_start, b_end);
         }
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+        if constexpr (Order == NativeMoEDotOrder::DecodeK32 &&
+                      CodebookId == native_formats::Q5_1.codebook_id)
+        {
+            // The QFN route's full K32 traversal uses a fixed instruction
+            // schedule and keeps the same ordered FP32 publication.
+            if (N == 2560 && K == 320 && b_start == 0 && b_end == 10)
+                return native_quantised_dot_admitted_range<CodebookId, Order, 10>(
+                    desc, n, A_int8, scales_A_blockwise, N, b_start, b_end);
+        }
+#endif
         return native_quantised_dot_admitted_range<CodebookId, Order>(
             desc, n, A_int8, scales_A_blockwise, N, b_start, b_end);
     }
@@ -20699,6 +20829,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
     /**
      * @brief Publish one narrow grouped Down row from its exact K32 partition tree.
      * @tparam CodebookId Physical reader chosen at admission or the mixed directory.
+     * @tparam WideGrid Use the selected wide grid reader for this captured node.
      * @param activation_codes Graph-owned SwiGLU codes in compact grouped order.
      * @param activation_scales Graph-owned K32 scales in the same order.
      * @param descriptors Original published Down descriptors.
@@ -20711,7 +20842,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
      * @param K Narrow admitted reduction width, with one K32 block per partition.
      * @param num_experts Exact original descriptor count.
      */
-    template <uint8_t CodebookId>
+    template <uint8_t CodebookId, bool WideGrid>
     __global__ void grouped_prefill_down_canonical_publish_k32_kernel(
         const int8_t *__restrict__ activation_codes,
         const float *__restrict__ activation_scales,
@@ -20722,6 +20853,12 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         float *__restrict__ route_rows,
         int first_slot, int N, int K, int num_experts)
     {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860
+        constexpr auto order = WideGrid
+            ? NativeMoEDotOrder::VerifierWideGrid : NativeMoEDotOrder::VerifierK32;
+#else
+        constexpr auto order = NativeMoEDotOrder::VerifierK32;
+#endif
         constexpr int kTileN = 64;
         const int column = blockIdx.x * kTileN + threadIdx.x;
         if (column >= N)
@@ -20739,7 +20876,7 @@ __global__ void softmax_topk_decode_descriptors_kernel(
         float sum = 0.0f;
         if (expert >= 0 && expert < num_experts)
         {
-            sum = native_quantised_dot_desc_range_dispatch<CodebookId, NativeMoEDotOrder::VerifierK32>(
+            sum = native_quantised_dot_desc_range_dispatch<CodebookId, order>(
                 descriptors[expert], column,
                 activation_codes + static_cast<size_t>(grouped_slot) * K,
                 activation_scales + static_cast<size_t>(grouped_slot) * blocks,
@@ -26002,6 +26139,7 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                 llaminar2::CUDAMoEBatchInvariantPolicy::directDownWarps(top_k);
             const int N = down_columns;
             const int K = intermediate;
+            const bool wide_grid_down = N == 2560 && K == 256;
             dim3 scatter_block(kScatterTileN);
             dim3 reduce_block(kReduceTileN);
             dim3 direct_block(kDirectWarpsPerBlock * 32);
@@ -26020,15 +26158,34 @@ __attribute__((visibility("default"))) bool cudaMoE_softmax_topk_decode_selected
                     tile_route_slots);
                 dim3 direct_grid((N + 31) / 32, tile_rows);
 
+                // Resolve the immutable reader geometry before recording a
+                // node. The narrow and compact variants have separate bodies.
+                const auto launch_narrow_down = [&]<uint8_t CodebookId>() {
+                    const auto launch = [&]<bool WideGrid>() {
+                        grouped_prefill_down_canonical_publish_k32_kernel<CodebookId, WideGrid>
+                            <<<route_reduce_grid, reduce_block, 0, cuda_stream>>>(
+                                d_scratch_swiglu_int8, d_scratch_swiglu_scales,
+                                d_down_desc_table, d_original_to_grouped, d_original_expert_ids,
+                                projection_weights, d_canonical_route_contributions,
+                                original_slot_base, N, K, num_experts);
+                    };
+                    if constexpr (CodebookId == native_formats::IQ1_S.codebook_id ||
+                                  CodebookId == native_formats::IQ1_M.codebook_id ||
+                                  CodebookId == native_formats::IQ3_XXS.codebook_id)
+                    {
+                        if (wide_grid_down)
+                        {
+                            launch.template operator()<true>();
+                            return;
+                        }
+                    }
+                    launch.template operator()<false>();
+                };
+
 #define LAUNCH_GROUPED_DOWN_ORDERED_KPART(CB)                                      \
     do {                                                                             \
         if (narrow_canonical_down) {                                                  \
-            grouped_prefill_down_canonical_publish_k32_kernel<CB>                     \
-                <<<route_reduce_grid, reduce_block, 0, cuda_stream>>>(                \
-                    d_scratch_swiglu_int8, d_scratch_swiglu_scales,                   \
-                    d_down_desc_table, d_original_to_grouped, d_original_expert_ids,  \
-                    projection_weights, d_canonical_route_contributions,              \
-                    original_slot_base, N, K, num_experts);                           \
+            launch_narrow_down.template operator()<CB>();                            \
         } else if (canonical_publication) {                                           \
             grouped_prefill_down_canonical_kpart_scatter_kernel<CB>                  \
                 <<<scatter_grid, scatter_block, 0, cuda_stream>>>(                   \

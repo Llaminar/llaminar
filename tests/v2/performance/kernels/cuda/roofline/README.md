@@ -174,3 +174,24 @@ Q3_K drops from 11.328–11.392 to 7.360 µs and Q5_0 drops from 11.776 to
 11.648 µs on both cards. At N=512, Q3_K and Q5_0 measure 3.904 and
 4.032 µs. Their compiled readers use 36 and 39 registers respectively,
 with zero local bytes.
+
+The wide SM86 verifier uses the canonical 4 KiB ternary IQ1 grid and
+expands each entry into signed bytes in registers. IQ2_XXS loads the
+index and sign planes of each packet together. IQ3_XXS reads three
+aligned words at the wide geometry. The wide reader is selected during
+capture from the physical shape and codebook. Both reader variants
+retain the original K32 rounding order.
+
+| M=4, N=2560, K=256 | Control, µs | Tuned, µs | Registers per thread |
+| --- | ---: | ---: | ---: |
+| IQ1_S | 12.736 | 10.752–10.816 | 38 |
+| IQ1_M | 13.632 | 12.224 | 40 |
+| IQ2_XXS | 11.712 | 10.048 | 39 |
+| IQ3_XXS | 11.584 | 10.944–11.008 | 40 |
+
+The main QFN M1 Q5_1 Down reader fixes the ten-packet traversal for
+N=2560 and K=320. Time falls from 4.928 to 4.672 µs on both cards.
+It uses 44 registers per thread. The four grouped readers and serial
+Q5_1 use zero local bytes. Measurements use 31 samples per arm and card.
+The wide-format replay verifies both the captured reader selection and
+byte equality with serial decode.
