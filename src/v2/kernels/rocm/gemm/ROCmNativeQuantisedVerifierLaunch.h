@@ -161,6 +161,16 @@ private:
 [[nodiscard]] bool hasNativeQuantisedMaterializedHead() noexcept;
 /** @brief First-class grouped implementations; Automatic retains qualified selection. */
 enum class NativeQuantisedVerifierCandidate { Automatic, Dot4, WmmaM16N64 };
+/**
+ * @brief Whether automatic verifier selection may qualify WMMA for a decoder.
+ * @param physical_codebook Actual execution decoder identity.
+ * @return False for MXFP4, which has no gfx1100 verifier measurement; its rows
+ *         stay on the ordered dot4 producer unless explicitly selected.
+ */
+[[nodiscard]] constexpr bool nativeQuantisedVerifierWmmaQualified(std::uint8_t physical_codebook) noexcept
+{
+    return physical_codebook != kNativeQuantisedMXFP4Codebook;
+}
 /** @brief Construction-only selection bound to one authenticated device. */
 struct NativeQuantisedVerifierSelection {
     NativeQuantisedVerifierCandidate candidate; ///< Exact implementation identity.

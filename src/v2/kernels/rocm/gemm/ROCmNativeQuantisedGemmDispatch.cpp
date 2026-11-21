@@ -736,6 +736,10 @@ NativeQuantisedVerifierCandidate nativeQuantisedVerifierProducer(
             return verifier_selection->candidate;
         }
     }
+    // Bundle and GDN qualifications are keyed by geometry, not source format;
+    // a decoder without any gfx1100 measurement cannot inherit them.
+    if (!nativeQuantisedVerifierWmmaQualified(work.physical_codebook))
+        return NativeQuantisedVerifierCandidate::Dot4;
     if (const auto *bundle = ScopedNativeQuantisedVerifierBundle::current())
     {
         const bool admitted_extent = bundle->kind == VerifierProjectionBundleKind::MaterializedLMHead

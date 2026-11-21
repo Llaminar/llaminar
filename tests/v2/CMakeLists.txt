@@ -7410,6 +7410,13 @@ if(HAVE_ROCM)
         COMMAND $<TARGET_FILE:v2_test_rocm_verifier_bundle_policy>
         LABELS "V2;Unit;DeviceFree;MTP;QKV;Regression;Replay"
         MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    # Automatic verifier WMMA qualification excludes decoders unmeasured on gfx1100.
+    add_v2_test(V2_Integration_ROCmVerifierWmmaQualificationInventory
+        COMMAND $<TARGET_FILE:v2_test_rocm_verifier_bundle_policy>
+            --gtest_filter=ROCmVerifierBundlePolicy.WmmaQualificationExcludesUnmeasuredMXFP4
+        LABELS "V2;Integration;ProductionTestPreflight;ROCm;MTP;DeviceFree;Contract;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30)
+    list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS V2_Integration_ROCmVerifierWmmaQualificationInventory)
 endif()
 
 add_executable(v2_test_rocm_router_q8_policy

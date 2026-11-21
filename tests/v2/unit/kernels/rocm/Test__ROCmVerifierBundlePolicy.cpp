@@ -336,3 +336,14 @@ TEST(ROCmVerifierBundlePolicy, MaterializedHeadSingletonScopeReplay)
     }
     EXPECT_FALSE(hasNativeQuantisedMaterializedHead());
 }
+
+/** @test Automatic verifier WMMA qualification excludes the unmeasured MXFP4 decoder. */
+TEST(ROCmVerifierBundlePolicy, WmmaQualificationExcludesUnmeasuredMXFP4)
+{
+    using namespace llaminar2;
+    using namespace llaminar2::rocm;
+    for (const auto &format : test::quantizedVerifierFormats())
+        EXPECT_EQ(nativeQuantisedVerifierWmmaQualified(format.device_execution_codebook_id),
+                  format.device_execution_codebook_id != kNativeQuantisedMXFP4Codebook)
+            << format.label;
+}
