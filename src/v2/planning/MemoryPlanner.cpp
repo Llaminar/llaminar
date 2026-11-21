@@ -492,6 +492,53 @@ void requireGPUAdaptiveDomain(const ModelMemoryProfile &profile,const DevicePlan
         throw std::invalid_argument("AdaptiveVRAMRAMSSD requires full-main rank-local singleton or exact homogeneous adaptive compute provenance and one original CPU source");
 }
 /** @return Original selected storage observations, never synthetic compute configs or fresh probes. */
+/**
+ * @brief Resolve owner graph-adapter sizes for the GPUs a lookup table prices.
+ * @param groups Device configs carrying owner evidence.
+ * @param gpus Allocators whose retained graph participants may be priced.
+ * @return Per GPU, the owner's published size: its birth declaration, else
+ *         the candidate's projected owner evidence, else this process's live
+ *         native source of that rank (which proves ownership, so the compiled
+ *         adapter answers). A GPU with none is absent and pricing it is fatal,
+ *         so a remote owner is never priced with this binary's adapter.
+ */
+NativeGraphObjectGeometry ownerGraphObjects(std::span<const std::vector<DevicePlanConfig>> groups,
+    std::span<const PhysicalMemoryResource> gpus)
+{
+    NativeGraphObjectGeometry geometry;
+    for (const auto &gpu : gpus)
+    {
+        if (!gpu.device.is_gpu()) continue;
+        const PhysicalMemoryAllocatorIdentity owner{gpu.world_rank, gpu.device};
+        const DevicePlanConfig *declared = nullptr, *live = nullptr, *projected = nullptr;
+        for (const auto &group : groups)
+            for (const auto &cfg : group)
+            {
+                if (cfg.world_rank == gpu.world_rank && cfg.device == gpu.device && cfg.planning_native_context_birth)
+                    declared = &cfg;
+                if (cfg.native_context_preparation &&
+                    cfg.native_context_preparation->memory()->worldRank() == gpu.world_rank)
+                    live = &cfg;
+                if (cfg.native_graph_objects.contains(owner))
+                    projected = &cfg;
+            }
+        if (declared)
+            geometry.publish(owner, declared->planning_native_context_birth->graph_capture_object_bytes);
+        else if (projected)
+            geometry.publish(owner, projected->native_graph_objects.bytes(owner));
+        else if (live)
+            geometry.publishLocalOwner(owner);
+    }
+    return geometry;
+}
+
+/** @copydoc ownerGraphObjects */
+NativeGraphObjectGeometry ownerGraphObjects(const DevicePlanConfig &cfg, std::span<const PhysicalMemoryResource> gpus)
+{
+    const std::array<std::vector<DevicePlanConfig>, 1> groups{std::vector<DevicePlanConfig>{cfg}};
+    return ownerGraphObjects(groups, gpus);
+}
+
 std::vector<PhysicalMemoryResource> ngramGPUResources(const DevicePlanConfig &cfg)
 {
     const auto &request=cfg.ngram_table_placement && cfg.ngram_table_placement->isGPUAdaptive()?
@@ -1213,7 +1260,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                     const auto complete=owned.build();
                     remote_participant_bom=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(
                         geometry,cfg.native_context_preparation?cfg.native_context_preparation->originalResource(DeviceId::cpu()):*cfg.associated_host_memory,
-                        ngramGPUResources(cfg),cfg.native_ordering_events);
+                        ngramGPUResources(cfg),ownerGraphObjects(cfg,ngramGPUResources(cfg)),cfg.native_ordering_events);
                     PhysicalMemoryPlanBuilder ordering;
                     for(const auto &bom:complete.resources())
                         if(bom.resource().device==cfg.device || bom.resource().device==cfg.associated_host_memory->device)
@@ -1265,7 +1312,7 @@ MemoryPlan MemoryPlanner::planOwnerGroup(
                 const auto mandatory=shared.gpu_adaptive.at(key).mandatoryBOMWithOrderingProjection(ngramGPUResources(cfg),*cfg.associated_host_memory,cfg.native_ordering_events);
                 remote_participant_bom=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(shared.gpu_adaptive.at(key),
                     cfg.native_context_preparation?cfg.native_context_preparation->originalResource(DeviceId::cpu()):*cfg.associated_host_memory,
-                    ngramGPUResources(cfg),cfg.native_ordering_events);
+                    ngramGPUResources(cfg),ownerGraphObjects(cfg,ngramGPUResources(cfg)),cfg.native_ordering_events);
                 PhysicalMemoryPlanBuilder ordering;
                 for(const auto &bom:mandatory.resources())
                     if(bom.resource().device==cfg.device || bom.resource().device==cfg.associated_host_memory->device)
@@ -2830,7 +2877,8 @@ std::vector<MemoryPlan> MemoryPlanner::planGroups(
             const auto mandatory=geometry.mandatoryBOMWithOrderingProjection(devices,*original->associated_host_memory,original->native_ordering_events);
             const auto optional=geometry.cacheBOM(devices,*original->associated_host_memory);
             const auto remote=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(geometry,
-                original->native_context_preparation->originalResource(DeviceId::cpu()),devices,original->native_ordering_events);
+                original->native_context_preparation->originalResource(DeviceId::cpu()),devices,
+                ownerGraphObjects(device_groups,devices),original->native_ordering_events);
             // Retained local roots have independent optional cache/publication
             // growth; cacheBOM covers only the shared pool and RAM slots.
             const auto local_optional=geometry.localHotSlotDependentBOM(
@@ -2892,7 +2940,8 @@ std::vector<MemoryPlan> MemoryPlanner::planGroups(
                     const auto geometry=AdaptiveImmutableLookupGeometry::fromLayoutFloor(layout,ngramNativeSource(profile),policy.gpu_adaptive);
                     PhysicalMemoryPlanBuilder complete(geometry.mandatoryBOMWithOrderingProjection(input.gpuResources(),host,first.native_ordering_events));
                     const auto remote=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(geometry,
-                        first.native_context_preparation->originalResource(DeviceId::cpu()),input.gpuResources(),first.native_ordering_events);
+                        first.native_context_preparation->originalResource(DeviceId::cpu()),input.gpuResources(),
+                        input.graphObjects(),first.native_ordering_events);
                     for(const auto& line:remote.resources())complete.add(line);
                     mandatory=complete.build();
                 }
@@ -3145,7 +3194,7 @@ std::optional<ImmutableRowTablePlacementInput> MemoryPlanner::immutableRowTableP
     if(policy)input=input.withGPUCacheResources(*policy,originals);
     if (peerAccess) input = input.withGPUCachePeerAccess(*peerAccess);
     if (!readerPeerAccess.empty()) input = input.withReaderPeerAccess(readerPeerAccess);
-    return input;
+    return input.withGraphObjects(ownerGraphObjects(groups, input.gpuResources()));
 }
 std::vector<ImmutableRowTableUploadBinding> MemoryPlanner::immutableRowTableUploadBindings(
     const ModelMemoryProfile &profile,std::span<const std::vector<DevicePlanConfig>> groups)
@@ -3326,7 +3375,7 @@ std::optional<ImmutableRowTableAdmissionRequest> MemoryPlanner::immutableRowTabl
             PhysicalMemoryPlanBuilder completeMandatory(mandatory);
             const auto remote=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(geometry,
                 originalConsumer->native_context_preparation?originalConsumer->native_context_preparation->originalResource(DeviceId::cpu()):*host,
-                input.gpuResources(),originalConsumer->native_ordering_events);
+                input.gpuResources(),input.graphObjects(),originalConsumer->native_ordering_events);
             for(const auto& line:remote.resources())completeMandatory.add(line);
             mandatory=completeMandatory.build();
             }
@@ -3482,7 +3531,8 @@ std::shared_ptr<const ImmutableRowTableExecutionProvision> MemoryPlanner::restor
             PhysicalMemoryPlanBuilder completeMandatory(geometry.mandatoryBOMWithOrderingProjection(input.gpuResources(),input.host(),ordering));
             const auto* nativeHost=execution.find({input.host().world_rank,DeviceId::cpu()});
             const auto remote=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(geometry,
-                nativeHost?nativeHost->resource():input.host(),input.gpuResources(),ordering);
+                nativeHost?nativeHost->resource():input.host(),input.gpuResources(),
+                input.graphObjects(),ordering);
             for(const auto& line:remote.resources())completeMandatory.add(line);
             mandatory=completeMandatory.build();
             }

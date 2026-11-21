@@ -1522,6 +1522,7 @@ namespace llaminar2
         {
         case 0:
         case 4:
+        case kNativeQuantisedMXFP4Codebook:
             payload_bytes_per_block = 16;
             return true;
         case kNativeQuantisedIQ4XSSourceScaleCodebook:

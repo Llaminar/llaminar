@@ -134,6 +134,10 @@ namespace llaminar2
         if (quant_type == "IQ1_S")
             return 50.0f / 256.0f; // 0.195
 
+        // MXFP4: 17 bytes per 32 elements (E8M0 exponent + 16 code bytes)
+        if (quant_type == "MXFP4")
+            return 17.0f / 32.0f; // 0.531
+
         // IQ1_M: 56 bytes per 256 elements
         if (quant_type == "IQ1_M")
             return 56.0f / 256.0f; // 0.219

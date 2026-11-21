@@ -2049,8 +2049,26 @@ namespace
     /** @brief Keep every source format while bounding each registered setup transaction. */
     inline constexpr int kInstalledDensePrefillSourceGroups = 12;
 
+    /**
+     * @brief Installed-dispatch admission inventory: the trainer formats plus
+     * MXFP4, which has no tuning corpus of its own and executes IQ4_NL's
+     * installed policy through its own physical decoder (codebook 25).
+     */
+    static const std::vector<FormatSpec> &installedPrefillFormats()
+    {
+        static const std::vector<FormatSpec> formats = []
+        {
+            auto all = NATIVE_QUANTISED_FORMATS;
+            all.push_back({"MXFP4", [](size_t N, size_t K)
+                           { return TestTensorFactory::createMXFP4Random({N, K}); }});
+            return all;
+        }();
+        return formats;
+    }
+
     TEST_P(InstalledDensePrefillOverlayTest, AllSourceFormats)
     {
+        const auto &kInstalledFormats = installedPrefillFormats();
 #ifndef HAVE_ROCM
         GTEST_SKIP() << "HAVE_ROCM not defined";
 #else
@@ -2070,9 +2088,9 @@ namespace
         ASSERT_NE(selected, NATIVE_QUANTISED_VARIANTS.end());
         std::size_t cases = 0;
         for (std::size_t format_index = static_cast<std::size_t>(GetParam());
-             format_index < NATIVE_QUANTISED_FORMATS.size(); format_index += kInstalledDensePrefillSourceGroups)
+             format_index < kInstalledFormats.size(); format_index += kInstalledDensePrefillSourceGroups)
         {
-            const auto &format = NATIVE_QUANTISED_FORMATS[format_index];
+            const auto &format = kInstalledFormats[format_index];
             SCOPED_TRACE(format.name);
             for (const auto &[projection, row_buckets] : geometries)
             {
@@ -2188,7 +2206,7 @@ namespace
         EXPECT_EQ(native_wmma_cases, expected_native_wmma_cases);
         RecordProperty("unavailable_native_prepared_cases", unavailable_native_cases);
         const std::size_t source_count =
-            (NATIVE_QUANTISED_FORMATS.size() + kInstalledDensePrefillSourceGroups - 1u -
+            (kInstalledFormats.size() + kInstalledDensePrefillSourceGroups - 1u -
                 static_cast<std::size_t>(GetParam())) / kInstalledDensePrefillSourceGroups;
         EXPECT_EQ(cases, source_count * geometry_count);
 #endif

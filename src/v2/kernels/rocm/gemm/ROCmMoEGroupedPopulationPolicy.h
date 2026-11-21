@@ -102,7 +102,7 @@ struct MoEGroupedPopulationKey
  * admission still selects the dot producer for live prefixes through eight. */
 [[nodiscard]] constexpr bool sharedVerifierWmmaQualified(const MoEGroupedPopulationKey &key) noexcept
 {
-    static_assert(native_quantised_formats::kAllSourceFormats.size() == 21,
+    static_assert(native_quantised_formats::kAllSourceFormats.size() == 22,
         "Requalify shared verifier WMMA before extending the source inventory");
     if (key.operation != MoEPrefillMeasuredOperation::CompleteFullWidthSharedVerifierTokenRows ||
         key.input != MoEGroupedPopulationInput::OriginalTokens ||
@@ -111,6 +111,11 @@ struct MoEGroupedPopulationKey
         return false;
     const auto &sources = key.singleton_sources;
     if (sources.gate != sources.up) return false;
+    // The same-format qualification below comes from gfx1100 measurements;
+    // MXFP4 has none, so it stays on the ordered dot4 producer.
+    if (sources.gate.codebook_id == kNativeQuantisedMXFP4Codebook ||
+        sources.down.codebook_id == kNativeQuantisedMXFP4Codebook)
+        return false;
     const auto gu = canonicalDeviceVnniCodebookId(sources.gate);
     const auto down = canonicalDeviceVnniCodebookId(sources.down);
     if (gu >= 32 || down >= 32 || key.gateup_physical != (uint32_t{1} << gu) ||

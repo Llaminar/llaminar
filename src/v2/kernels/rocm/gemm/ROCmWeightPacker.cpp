@@ -22,6 +22,7 @@
 #include "kernels/common/NativeEmbeddingIQTables.h"
 #include "execution/local_execution/graph/GraphCaptureGuard.h"
 #include "ROCmWeightPacker.h"
+#include "kernels/common/NativeQuantisedPrimaryPlaneUpload.h"
 #include "backends/BackendManager.h"
 #include "backends/GPUDeviceContextPool.h"
 #include "ROCmQuantisedGemmKernel.h"
@@ -199,6 +200,10 @@ namespace llaminar2
             const int K = static_cast<int>(tensor->cols());
             if (N <= 0 || K <= 0 || (K % 32) != 0)
                 return false;
+            // The packed container is self-describing: its uploaders derive the
+            // exact live plane extents from this geometry.
+            out.N = N;
+            out.K = K;
 
             // The direct native entry owns a complete prepared matrix, just
             // like the source-default wrapper. Descriptor publication must not
@@ -214,7 +219,8 @@ namespace llaminar2
 
             // Allocate output buffers
             out.native_quantised_payload.resize(static_cast<size_t>(blocks_per_row) * N * payload_bytes);
-            out.native_quantised_scales.resize(static_cast<size_t>(blocks_per_row) * N);
+            out.native_quantised_scales.resize(nativeQuantisedScalePlaneStorageWords(
+                physical.codebook_id, static_cast<size_t>(blocks_per_row) * N));
             if (has_secondary)
                 out.native_quantised_mins.resize(static_cast<size_t>(blocks_per_row) * N);
             if (info->has_emins)
@@ -263,6 +269,7 @@ namespace llaminar2
             ctx.scales_array = out.native_quantised_scales.data();
             ctx.mins_array = has_secondary ? out.native_quantised_mins.data() : nullptr;
             ctx.emins_array = info->has_emins ? out.native_quantised_emins.data() : nullptr;
+            ctx.primary_layout = gpuPrimaryScaleLayout(physical.codebook_id);
 
             // Main packing loop — dispatches to per-format virtual method
 #pragma omp parallel for schedule(static)
@@ -465,6 +472,11 @@ namespace llaminar2
                 "explicit setup stream");
         }
 
+        // The single setup-stream copy primitive for every array of this batch.
+        auto copyToDevice = [&](void *dst, const void *src, size_t bytes) -> bool
+        {
+            return backend->hostToDevice(dst, src, bytes, rocm_device_id, setup_stream);
+        };
         auto uploadBuffer = [&](const void *host_data, size_t bytes, void **d_ptr) -> bool
         {
             *d_ptr = nullptr;
@@ -473,12 +485,7 @@ namespace llaminar2
             *d_ptr = backend->allocate(bytes, rocm_device_id);
             if (!*d_ptr)
                 return false;
-            if (!backend->hostToDevice(
-                    *d_ptr,
-                    host_data,
-                    bytes,
-                    rocm_device_id,
-                    setup_stream))
+            if (!copyToDevice(*d_ptr, host_data, bytes))
             {
                 backend->free(*d_ptr, rocm_device_id);
                 *d_ptr = nullptr;
@@ -487,12 +494,25 @@ namespace llaminar2
             return true;
         };
 
+        // Primary plane: the shared uploader sends each expert's exact live
+        // extent (word-aligned per-expert strides; an odd one-byte E8M0 plane
+        // never sends the unused storage byte after each expert).
+        auto uploadScales = [&](void **d_ptr) -> bool
+        {
+            return uploadNativeQuantisedPrimaryPlane(
+                       codebook_id, static_cast<size_t>(rows_per_expert) * blocks_per_row,
+                       static_cast<size_t>(num_experts), all_native_scales.data(),
+                       all_native_scales.size() * sizeof(uint16_t), d_ptr,
+                       [&](size_t bytes) { return backend->allocate(bytes, rocm_device_id); },
+                       copyToDevice) ==
+                   NativeQuantisedPrimaryPlaneUploadStatus::Uploaded;
+        };
+
         void *d_vnni = nullptr, *d_scales = nullptr, *d_mins = nullptr, *d_emins = nullptr;
 
         if (!uploadBuffer(all_native_quantised.data(),
                           all_native_quantised.size() * sizeof(uint8_t), &d_vnni) ||
-            !uploadBuffer(all_native_scales.data(),
-                          all_native_scales.size() * sizeof(uint16_t), &d_scales) ||
+            !uploadScales(&d_scales) ||
             !uploadBuffer(all_native_mins.empty() ? nullptr : all_native_mins.data(),
                           all_native_mins.size() * sizeof(uint16_t), &d_mins) ||
             !uploadBuffer(all_native_emins.empty() ? nullptr : all_native_emins.data(),
@@ -603,9 +623,12 @@ namespace llaminar2
         batch->codebook_id = physical.codebook_id;
 
         batch->vnni_bytes_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert * info->payload_bytes;
-        batch->scales_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert;
-        batch->mins_per_expert = physical.is_asymmetric ? batch->scales_per_expert : 0;
-        batch->emins_per_expert = info->has_emins ? batch->scales_per_expert : 0;
+        // Strides are in elements of each plane's storage type; the primary
+        // plane may be narrower than the per-block secondary/emin planes.
+        const size_t blocks_per_expert = static_cast<size_t>(blocks_per_row) * rows_per_expert;
+        batch->scales_per_expert = nativeQuantisedScalePlaneStorageWords(physical.codebook_id, blocks_per_expert);
+        batch->mins_per_expert = physical.is_asymmetric ? blocks_per_expert : 0;
+        batch->emins_per_expert = info->has_emins ? blocks_per_expert : 0;
 
         batch->all_native_quantised.assign(static_cast<size_t>(num_experts) * batch->vnni_bytes_per_expert, uint8_t{0});
         batch->all_native_scales.assign(static_cast<size_t>(num_experts) * batch->scales_per_expert, uint16_t{0});
@@ -637,6 +660,7 @@ namespace llaminar2
             ctx.emins_array = info->has_emins
                                   ? batch->all_native_emins.data() + e * batch->emins_per_expert
                                   : nullptr;
+            ctx.primary_layout = gpuPrimaryScaleLayout(physical.codebook_id);
 
 #pragma omp parallel for schedule(static)
             for (int n = 0; n < rows_per_expert; ++n)

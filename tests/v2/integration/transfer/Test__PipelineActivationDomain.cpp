@@ -175,7 +175,7 @@ void exerciseDomains(bool cuda_first)
             builder.add(original->resource(device), PhysicalMemoryOwner::ExecutionWorkspace, storage_bytes + count_bytes);
             builder.add(original->resource(device), PhysicalMemoryOwner::LocalCollective, native.perDeviceBytes());
             const auto graph_bom = RetainedParticipantGraphExecutable::generalBOM(
-                original->resource(DeviceId::cpu()), original->resource(device), 1);
+                original->resource(DeviceId::cpu()), original->resource(device),NativeGraphObjectGeometry::localOwner({(original->resource(device)).world_rank,(original->resource(device)).device}), 1);
             for (const auto &row : graph_bom.resources()) builder.add(row);
         }
         original->admit(builder.build()); memory = original->memory();

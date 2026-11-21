@@ -106,7 +106,7 @@ __global__ __launch_bounds__(256, 1) void native_quantised_wmma_gemm(
                 // loads ahead of decode and LDS stores hides their latency
                 // without changing source scale conversion or arithmetic.
                 load_payload<Traits::payload_bytes>(payload + index * Traits::payload_bytes, raw);
-                primary = scales[index];
+                primary = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(scales, index);
                 if constexpr (Traits::needs_aux_compute) secondary = aux[index];
                 if constexpr (Traits::is_dual_scale_asym) minimum_pair = emins[index];
             }

@@ -547,7 +547,7 @@ void NativeExactPacketFixture::prepare() {
         {&received_, &received_indices_, &received_weights_, &local_, &route_input_, &placement_[1]}}};
     for (std::size_t p = 0; p < 2; ++p) if (owns(p)) {
         for (const auto *tensor : tensors[p]) tensor->declare(plan, host, original_->resource(devices_[p]));
-        const auto graphs = RetainedParticipantGraphExecutable::generalBOM(host, original_->resource(devices_[p]), family_.size());
+        const auto graphs = RetainedParticipantGraphExecutable::generalBOM(host, original_->resource(devices_[p]),NativeGraphObjectGeometry::localOwner({(original_->resource(devices_[p])).world_rank,(original_->resource(devices_[p])).device}), family_.size());
         for (const auto &line : graphs.resources()) plan.add(line);
         plan.add(original_->resource(devices_[p]), PhysicalMemoryOwner::ActivationTransportStaging,
             channel_plan_.stagingBytesFor(MPIContextFactory::global()->rank(), devices_[p]));

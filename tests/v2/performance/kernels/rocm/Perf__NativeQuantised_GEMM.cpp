@@ -183,6 +183,8 @@ namespace
          { return TestTensorFactory::createQ4_0Random({N, K}); }},
         {"IQ4_NL", 4.5, [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_NLRandom({N, K}); }},
+        {"MXFP4", 4.25, [](size_t N, size_t K)
+         { return TestTensorFactory::createMXFP4Random({N, K}); }},
         {"Q4_1", 5.0, [](size_t N, size_t K)
          { return TestTensorFactory::createQ4_1Random({N, K}); }},
         {"Q5_0", 5.5, [](size_t N, size_t K)

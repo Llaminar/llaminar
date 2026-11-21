@@ -62,7 +62,11 @@ namespace llaminar2::cpu::native_quantised
     inline float nativeQuantisedPrimaryScale(CPUNativeQuantisedEncoding encoding,
         std::uint8_t codebook, std::uint16_t primary, std::uint16_t secondary)
     {
-        const float base = fp16_to_fp32(primary);
+        // Native MXFP4 units carry the exact BF16 word of their E8M0 power of
+        // two; it widens by placement alone (word << 16), never through FP16.
+        const float base = preparedScaleEncoding(codebook, encoding) == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
+            ? std::bit_cast<float>(std::uint32_t{primary} << 16)
+            : fp16_to_fp32(primary);
         if (encoding == CPUNativeQuantisedEncoding::IQ3SExpandedSourceScale)
         {
             if (!native_quantised_iq3s_scale::valid(secondary))
@@ -285,6 +289,12 @@ namespace llaminar2::cpu::native_quantised
         /** @return Whether a four-bit payload is retained in the stream. */
         [[nodiscard]] bool usesNibbleLUT() const noexcept
         { return encoding == CPUNativeQuantisedEncoding::NibbleLUT || usesNibbleLUTSourceScale(); }
+
+        /** @brief Interpretation of the primary scale words, derived from codebook and encoding.
+         * @return PowerOfTwoBF16 for native nibble MXFP4; FP16 otherwise (including rotated MXFP4).
+         */
+        [[nodiscard]] CPUNativeQuantisedScaleEncoding scaleEncoding() const noexcept
+        { return preparedScaleEncoding(codebook_id, encoding); }
         /** @return Whether the nibble payload retains IQ4_XS original source factors. */
         [[nodiscard]] bool usesNibbleLUTSourceScale() const noexcept
         { return encoding == CPUNativeQuantisedEncoding::NibbleLUTSourceScale; }

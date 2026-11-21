@@ -2572,7 +2572,22 @@ namespace llaminar2::sampling_math
 
     LLAMINAR_SAMPLING_HD uint64_t splitmix64(uint64_t x)
     {
+#if defined(__CUDA_ARCH__)
+        // CUDA 13.0 ptxas for sm_121 (GB10) lowers this 64-bit immediate add,
+        // once folded with a preceding `seed + position * 8`, to a 32-bit
+        // IADD3 of the low word only: the high constant and the carry vanish
+        // and every seeded MTP draw differs from the host oracle (driver PTX
+        // JIT and other architectures are unaffected). An explicit 32-bit
+        // add-with-carry chain is bit-identical to the 64-bit addition and
+        // cannot be fused into that lowering.
+        unsigned int lo = static_cast<unsigned int>(x);
+        unsigned int hi = static_cast<unsigned int>(x >> 32);
+        asm("add.cc.u32 %0, %0, 0x7F4A7C15;\n\taddc.u32 %1, %1, 0x9E3779B9;"
+            : "+r"(lo), "+r"(hi));
+        x = (static_cast<uint64_t>(hi) << 32) | lo;
+#else
         x += 0x9E3779B97F4A7C15ull;
+#endif
         x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ull;
         x = (x ^ (x >> 27)) * 0x94D049BB133111EBull;
         return x ^ (x >> 31);

@@ -1258,8 +1258,15 @@ endif()
                                 r"add_v2_test\((V2_[A-Za-z0-9_]+)(?=[\s)])",
                                 COHORT_REGISTRATION.read_text(encoding="utf-8")))
                             self.assertTrue(cohort_names)
-                            if cuda or rocm:
+                            # Opposite-source cases bind a CUDA and a ROCm source
+                            # together; they require both families.
+                            opposite = {name for name in cohort_names if "Opposite" in name}
+                            self.assertTrue(opposite)
+                            if cuda and rocm:
                                 self.assertTrue(cohort_names <= names, cohort_names - names)
+                            elif cuda or rocm:
+                                self.assertTrue(cohort_names - opposite <= names, cohort_names - opposite - names)
+                                self.assertFalse(opposite & names, opposite & names)
                             else:
                                 # The cohort executable requires a GPU family.
                                 self.assertFalse(cohort_names & names, cohort_names & names)

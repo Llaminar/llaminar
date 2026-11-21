@@ -13,6 +13,8 @@
 
 #include "CPUNativeQuantisedMultiScaleKernels.h"
 #include "CPUNativeQuantisedWeightView.h"
+#include "tensors/MXFP4Format.h"
+#include "tensors/NativeQuantisedFormatInfo.h"
 #include "utils/ARMCPUFeatures.h"
 
 #include <algorithm>
@@ -42,8 +44,18 @@ namespace llaminar2::cpu::native_quantised
         static_assert(Rows >= 1 && Rows <= 4);
         using Encoding = CPUNativeQuantisedEncoding;
         using Dot = multi_scale::NEONByteDot;
-        /** @brief Exact source nibble interpretation, selected outside K traversal. */
-        enum class NibbleMap { Centered, Unsigned, NonLinear };
+        /** @brief Exact source nibble interpretation, selected outside K traversal.
+         *
+         * MXFP4 is a distinct map (doubled OCP E2M1 magnitudes with a sign bit),
+         * never IQ4_NL's grid, although both are sixteen-entry signed tables.
+         * Its primary words are BF16 powers of two; admission guarantees that
+         * every NibbleLUT MXFP4 publication carries PowerOfTwoBF16 scales.
+         */
+        enum class NibbleMap { Centered, Unsigned, NonLinear, MXFP4 };
+        using ScaleWords = CPUNativeQuantisedScaleEncoding;
+
+        /** @brief Whether this nibble map's primary scale words are BF16 powers of two. */
+        template <NibbleMap Map> static constexpr bool kPowerOfTwoBF16Scales = Map == NibbleMap::MXFP4;
 
     public:
         /**
@@ -115,7 +127,9 @@ namespace llaminar2::cpu::native_quantised
                 implemented = true;
                 break;
             case Encoding::NibbleLUT:
-                implemented = weights.codebook_id == 0 || weights.codebook_id == 4 || weights.codebook_id == 5;
+                implemented = weights.codebook_id == 0 || weights.codebook_id == 4 || weights.codebook_id == 5 ||
+                    (weights.codebook_id == kNativeQuantisedMXFP4Codebook &&
+                     weights.scaleEncoding() == ScaleWords::PowerOfTwoBF16);
                 break;
             case Encoding::CompactMultiScale:
                 switch (weights.codebook_id)
@@ -322,6 +336,13 @@ namespace llaminar2::cpu::native_quantised
                 case 0: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Centered, false, Strips>();
                 case 4: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::NonLinear, false, Strips>();
                 case 5: return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::Unsigned, true, Strips>();
+                case kNativeQuantisedMXFP4Codebook:
+                    // The prepared identity, not the codebook alone, owns the scale
+                    // words: native nibble MXFP4 carries BF16 powers of two, while
+                    // rotated MXFP4 is ExpandedInt8 with FP16 scales (case above).
+                    if (weights_.scaleEncoding() != ScaleWords::PowerOfTwoBF16)
+                        break;
+                    return run<Ops, Policy, Encoding::NibbleLUT, NibbleMap::MXFP4, false, Strips>();
                 }
                 break;
             case Encoding::CompactMultiScale:
@@ -340,6 +361,8 @@ namespace llaminar2::cpu::native_quantised
         {
             if constexpr (Map == NibbleMap::NonLinear)
                 return vqtbl1q_s8(vld1q_s8(kvalues_iq4nl_i8), index);
+            else if constexpr (Map == NibbleMap::MXFP4)
+                return vqtbl1q_s8(vld1q_s8(mxfp4::kValues), index);
             else if constexpr (Map == NibbleMap::Centered)
                 return vsubq_s8(vreinterpretq_s8_u8(index), vdupq_n_s8(8));
             else
@@ -579,6 +602,24 @@ namespace llaminar2::cpu::native_quantised
                                     else consume<Ops>(centered, block, group, high);
                                 }
                             }
+                            else if constexpr (nibble && kPowerOfTwoBF16Scales<Map>)
+                            {
+                                // Lane-indexed dots on each row's once-loaded block: broadcasting
+                                // every row/group activation word lets GCC hoist 24 broadcasts and
+                                // spill the row accumulators. Integer dots are exact in any order.
+                                const auto blocks = activationBlocks<Ops>(block);
+                                forEachGroup<4>([&]<int Group>() __attribute__((always_inline)) {
+                                    const auto raw = vld1q_u8(unit + Group * 256 + column * 4);
+                                    const auto low_nibbles = std::bit_cast<I>(nibbles<Map>(vandq_u8(raw, vdupq_n_u8(15))));
+                                    const auto high_nibbles = std::bit_cast<I>(nibbles<Map>(vshrq_n_u8(raw, 4)));
+#pragma GCC unroll 4
+                                    for (std::size_t row = 0; row < Rows; ++row)
+                                    {
+                                        low[row] = Ops::template dotLane<Group>(low[row], low_nibbles, blocks[row]);
+                                        low[row] = Ops::template dotLane<Group + 4>(low[row], high_nibbles, blocks[row]);
+                                    }
+                                });
+                            }
                             else if constexpr (nibble)
                             {
 #pragma GCC unroll 4
@@ -596,7 +637,11 @@ namespace llaminar2::cpu::native_quantised
                                     consume<Ops>(vld1q_s8(reinterpret_cast<const std::int8_t *>(unit + group * 256 + column * 4)),
                                         block, group, low);
                             }
-                            F scale0 = Ops::half(weights_.admittedScales(chunk_, block) + column);
+                            // BF16 power-of-two words widen by placement alone (exact),
+                            // matching the x86 loaders and the scalar view.
+                            F scale0 = kPowerOfTwoBF16Scales<Map>
+                                ? Ops::bf16(weights_.admittedScales(chunk_, block) + column)
+                                : Ops::half(weights_.admittedScales(chunk_, block) + column);
                             F scale1{};
                             if constexpr (Physical == Encoding::Q6KNativeDualScale)
                             {
@@ -794,7 +839,9 @@ namespace llaminar2::cpu::native_quantised
                     for (int strip = 0; strip < S; ++strip)
                     {
                         const int column = column0 + 4 * strip;
-                        F scale0 = Ops::half(weights_.admittedScales(chunk_, block) + column);
+                        F scale0 = kPowerOfTwoBF16Scales<Map>
+                            ? Ops::bf16(weights_.admittedScales(chunk_, block) + column)
+                            : Ops::half(weights_.admittedScales(chunk_, block) + column);
                         F scale1{};
                         if constexpr (Physical == Encoding::Q6KNativeDualScale)
                         {

@@ -272,7 +272,8 @@ namespace llaminar2
                     }
                     require(readback->prepareRuntimeContextStorage(memory), "readback context storage preparation failed");
                     require(readback->nodeCount() && readback->instantiate() &&
-                        GPUGraphMemoryContract::acceptsFamilyObservation(device, readback->residentMemoryBytes(), graph_bytes),
+                        GPUGraphMemoryContract::acceptsFamilyObservation(device, graphFamilyGrowth(
+                            GPUGraphMemoryContract::observationScope(memory->backing(device)),{readback.get()}), graph_bytes),
                         "readback graph incomplete or outside admission");
                     for (auto mechanism : {PlanningHostTransferMechanism::DMA, PlanningHostTransferMechanism::MappedKernel})
                         for (auto direction : {MappedTransferDirection::HostToDevice, MappedTransferDirection::DeviceToHost})
@@ -310,7 +311,8 @@ namespace llaminar2
                                 else std::memset(output->mutableHostData(),0,payload);
                             });
                             timing.prepare(memory);
-                            require(GPUGraphMemoryContract::acceptsFamilyObservation(device,timing.residentMemoryBytes(),
+                            require(GPUGraphMemoryContract::acceptsFamilyObservation(device,GPUGraphMemoryGrowth{timing.residentMemoryBytes(),
+                                GPUGraphMemoryContract::observationScope(memory->backing(device))},
                                 PlanningExecutionMeasurement::kPreparedGraphCount*graph_bytes),
                                 "copy timer graph family exceeded admission");
                             // Publish only after every captured/instantiated graph

@@ -14,6 +14,7 @@
 #include "config/OrchestrationConfigDocument.h"
 #include "../../utils/PlanningGGUFFixture.h"
 #include <gtest/gtest.h>
+#include "fixtures/backends/NativeGraphObjectGeometryRecordedAccess.h"
 
 using namespace llaminar2;
 
@@ -75,7 +76,8 @@ namespace
     OrchestrationCandidateMemoryPolicy policy()
     {
         return {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
-            .maximum_cached_prefill_buckets = 8, .retained_host_services = test::planningHostServiceBudgets(1)};
+            .maximum_cached_prefill_buckets = 8, .retained_host_services = test::planningHostServiceBudgets(1),
+            .native_graph_objects = test::NativeGraphObjectGeometryRecordedAccess::uniform()};
     }
 }
 

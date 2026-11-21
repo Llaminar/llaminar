@@ -158,6 +158,8 @@ namespace
              { return TestTensorFactory::createQ6_KRandom(shape, seed); }},
             {"IQ4_NL", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
              { return TestTensorFactory::createIQ4_NLRandom(shape, seed); }},
+            {"MXFP4", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
+             { return TestTensorFactory::createMXFP4Random(shape, seed); }},
             {"IQ4_XS", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>
              { return TestTensorFactory::createIQ4_XSRandom(shape, seed); }},
             {"IQ3_S", [](const std::vector<size_t> &shape, uint32_t seed) -> std::unique_ptr<llaminar2::TensorBase>

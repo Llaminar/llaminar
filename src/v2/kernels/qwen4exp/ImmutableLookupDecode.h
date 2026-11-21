@@ -16,7 +16,7 @@
 #define QFN_LOOKUP_QUANT_FORMATS(M) \
     M(Q4_0) M(Q4_1) M(Q5_0) M(Q5_1) M(Q8_0) M(Q8_1) \
     M(Q2_K) M(Q3_K) M(Q4_K) M(Q5_K) M(Q6_K) M(Q8_K) \
-    M(IQ1_S) M(IQ1_M) M(IQ2_XXS) M(IQ2_XS) M(IQ2_S) M(IQ3_XXS) M(IQ3_S) M(IQ4_NL) M(IQ4_XS)
+    M(IQ1_S) M(IQ1_M) M(IQ2_XXS) M(IQ2_XS) M(IQ2_S) M(IQ3_XXS) M(IQ3_S) M(IQ4_NL) M(IQ4_XS) M(MXFP4)
 #if defined(__CUDACC__) || defined(__HIPCC__)
 #define QFN_LOOKUP_INLINE __device__ __forceinline__
 #else

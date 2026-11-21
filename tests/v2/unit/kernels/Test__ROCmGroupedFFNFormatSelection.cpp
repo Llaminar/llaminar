@@ -267,3 +267,34 @@ TEST(ROCmGroupedFFNFormatSelection, MeasuredSumAdmissionDistinguishesSourceAlias
 /** Raw runtime pointers cannot issue the receipt accepted by the numerical launcher. */
 static_assert(!std::is_constructible_v<ffn::BoundSourceFormatProgram,const ffn::Program&,
     llaminar2::DeviceMoELayerRuntime*,int>);
+
+/**
+ * @test Every compiled family covers the envelope that selects it. The
+ * linear | iq3/iq4 | iq1/iq2 family omits MXFP4 (gfx906 register budget), so
+ * MXFP4 with exactly those groups selects the complete union; MXFP4 elsewhere
+ * keeps its smallest group union.
+ */
+TEST(ROCmGroupedFFNFormatSelection, ResidentFamiliesCoverTheirEnvelopeIncludingMXFP4)
+{
+    using Program=llaminar2::rocm::ResidentMoEFFNDecoderProgram;
+    const std::uint32_t mxfp4=1u<<llaminar2::kNativeQuantisedMXFP4Codebook;
+    EXPECT_EQ(Program::familyMask<14>()&mxfp4,0u);
+    EXPECT_NE(Program::familyMask<4>()&mxfp4,0u);
+    EXPECT_NE(Program::familyMask<15>()&mxfp4,0u);
+    const std::uint32_t linear=1u<<0,iq1=1u<<13,affine=1u<<5;
+    EXPECT_EQ(Program::fromExecutionMask(mxfp4).groups(),4u);
+    EXPECT_EQ(Program::fromExecutionMask(mxfp4|iq1).groups(),12u);
+    EXPECT_EQ(Program::fromExecutionMask(mxfp4|linear|iq1).groups(),15u);
+    EXPECT_EQ(Program::fromExecutionMask(mxfp4|linear|iq1|affine).groups(),15u);
+    EXPECT_EQ(Program::fromExecutionMask((1u<<4)|linear|iq1).groups(),14u);
+    // Exhaustive over every supported decoder combination of up to three.
+    std::vector<std::uint32_t> bits;
+    for(unsigned b=0;b<32;++b)if(Program::all_decoders&(1u<<b))bits.push_back(1u<<b);
+    for(std::size_t i=0;i<bits.size();++i)for(std::size_t j=i;j<bits.size();++j)for(std::size_t k=j;k<bits.size();++k)
+    {
+        const auto required=bits[i]|bits[j]|bits[k];
+        const auto program=Program::fromExecutionMask(required);
+        EXPECT_EQ(required&~program.executionMask(),0u) << required;
+        EXPECT_EQ(program.executionMask(),Program::familyMaskFor(program.groups()));
+    }
+}

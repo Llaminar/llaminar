@@ -15,6 +15,7 @@
 #include <unistd.h>
 #include <cstdio>
 #include <type_traits>
+#include "../../utils/CompiledGPUBackends.h"
 namespace llaminar2::test {
 std::shared_ptr<RetainedParticipantGraphExecutable> NativeContextPreparationReplayAccess::resumePreparedCalibrationLookup(
     const std::shared_ptr<PreparedServiceCalibrationSlot>& slot,const PreparedGPUContextUsePermit& original,void* stream){
@@ -110,12 +111,12 @@ struct Source {
         source->freezeForPlanning();
         PhysicalMemoryPlanBuilder extra(source->mandatoryBOM());
         if(graphs){const auto& observed=source->originalResource(device);
-            if(originalGeneral){const auto general=RetainedParticipantGraphExecutable::generalBOM(source->originalResource(DeviceId::cpu()),observed,graphs);for(const auto& row:general.resources())extra.add(row);}
+            if(originalGeneral){const auto general=RetainedParticipantGraphExecutable::generalBOM(source->originalResource(DeviceId::cpu()),observed,NativeGraphObjectGeometry::localOwner({(observed).world_rank,(observed).device}),graphs);for(const auto& row:general.resources())extra.add(row);}
             else extra.add(observed,PhysicalMemoryOwner::NativeGraphExecutable,
                 graphs*GPUGraphMemoryContract::reservationBytesPerExecutable(device,GPUGraphExecutableClass::General));}
         for(std::size_t slot=0;slot<calibrationSlots;++slot){
             const auto calibration=RetainedParticipantGraphExecutable::calibrationBOM(
-                source->originalResource(DeviceId::cpu()),source->originalResource(device));
+                source->originalResource(DeviceId::cpu()),source->originalResource(device),NativeGraphObjectGeometry::localOwner({(source->originalResource(device)).world_rank,(source->originalResource(device)).device}));
             for(const auto& row:calibration.resources())extra.add(row);
         }
         certificate=std::make_shared<PhysicalMemoryPlanAdmissionCertificate>(extra.build());
@@ -165,7 +166,7 @@ TEST(PooledNativeProgramDiagnostic, InvalidPrimaryAndPreparingSourceRejectBefore
 }
 /** @test Public original General admission uses planned slots, rejects unplanned creation and preserves process retirement. */
 TEST(PooledNativeProgramDiagnostic, GeneralOriginalAllowanceEnforcesPlannedSlotsAndZeroAttemptCleanup){
-    for(const auto device:{DeviceId::cuda(213),DeviceId::rocm(213)}){
+    for(const auto device:compiledGPUDevices(213)){
         EXPECT_EXIT({
             Source source(device,1,true,64u<<20,true);auto& worker=source.worker();
             worker.failSubmit=true;
@@ -198,12 +199,12 @@ TEST(PooledNativeProgramDiagnostic,GeneralHostBOMRejectsMissingForeignAndOverflo
     EXPECT_THROW((void)RetainedParticipantGraphExecutable::create(*source.original,worker.defaultStream()),std::exception);
     EXPECT_EQ(worker.calls,0);EXPECT_EQ(source.memory->reservedBytes(DeviceId::cuda(220),PhysicalMemoryOwner::NativeGraphExecutable),0u);
     const PhysicalMemoryResource host{0,DeviceId::cpu(),4ULL<<30,4ULL<<30},gpu{0,DeviceId::cuda(220),64u<<20,64u<<20};
-    const auto one=RetainedParticipantGraphExecutable::generalBOM(host,gpu,1),two=RetainedParticipantGraphExecutable::generalBOM(host,gpu,2);
+    const auto one=RetainedParticipantGraphExecutable::generalBOM(host,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}),1),two=RetainedParticipantGraphExecutable::generalBOM(host,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}),2);
     EXPECT_EQ(two.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::NativeGraphExecutable),2*one.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::NativeGraphExecutable));
     EXPECT_EQ(two.find({0,gpu.device})->bytes(PhysicalMemoryOwner::NativeGraphExecutable),2*GPUGraphMemoryContract::reservationBytesPerExecutable(gpu.device));
-    EXPECT_THROW((void)RetainedParticipantGraphExecutable::generalBOM(host,gpu,std::numeric_limits<std::size_t>::max()),std::overflow_error);
-    EXPECT_THROW((void)RetainedParticipantGraphExecutable::generalBOM(gpu,host),std::invalid_argument);
-    const auto none=RetainedParticipantGraphExecutable::generalBOM(host,gpu,0);EXPECT_TRUE(none.resources().empty());source.reset();
+    EXPECT_THROW((void)RetainedParticipantGraphExecutable::generalBOM(host,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}),std::numeric_limits<std::size_t>::max()),std::overflow_error);
+    EXPECT_THROW((void)RetainedParticipantGraphExecutable::generalBOM(gpu,host,NativeGraphObjectGeometry::localOwner({(host).world_rank,(host).device})),std::invalid_argument);
+    const auto none=RetainedParticipantGraphExecutable::generalBOM(host,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}),0);EXPECT_TRUE(none.resources().empty());source.reset();
 }
 namespace {
 /** @brief Exercise a single original authority through native creator failure and physical reset. */
@@ -231,17 +232,21 @@ namespace {
 }
 }
 
+#if defined(HAVE_CUDA)
 /** @test Native creator failure retains CUDA and host backing through the original reset. */
 TEST(PooledNativeProgramDiagnostic, GeneralAttemptedCUDAAndHostBackingSurviveOriginalReset)
 {
     EXPECT_EXIT(verifyAttemptedGeneralBackingSurvivesReset(DeviceId::cuda(219)), ::testing::ExitedWithCode(0), "");
 }
+#endif // HAVE_CUDA
 
+#if defined(HAVE_ROCM)
 /** @test Native creator failure retains ROCm and host backing through the original reset. */
 TEST(PooledNativeProgramDiagnostic, GeneralAttemptedROCmAndHostBackingSurviveOriginalReset)
 {
     EXPECT_EXIT(verifyAttemptedGeneralBackingSurvivesReset(DeviceId::rocm(219)), ::testing::ExitedWithCode(0), "");
 }
+#endif // HAVE_ROCM
 
 TEST(PooledNativeProgramDiagnostic, GeneralAttemptedBackingRemainsProcessRetainedAcrossActualReset){
     EXPECT_EXIT({
@@ -409,11 +414,11 @@ TEST(PooledNativeProgramDiagnostic, RecordingDelegatesBoundedFlatNativeValidatio
 /** @test Fully committed serving graph capacity cannot consume the separate admitted calibration slot. */
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationBOMIsolatedFromServingReservation)
 {
-    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)}){
+    for(const auto device:compiledGPUDevices(0)){
         const PhysicalMemoryResource host{0,DeviceId::cpu(),4ULL<<30,4ULL<<30};
         const PhysicalMemoryResource gpu{0,device,256u<<20,256u<<20};
-        const auto serving=RetainedParticipantGraphExecutable::generalBOM(host,gpu);
-        const auto calibration=RetainedParticipantGraphExecutable::calibrationBOM(host,gpu);
+        const auto serving=RetainedParticipantGraphExecutable::generalBOM(host,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}));
+        const auto calibration=RetainedParticipantGraphExecutable::calibrationBOM(host,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}));
         PhysicalMemoryPlanBuilder plan;
         for(const auto& row:serving.resources())plan.add(row);
         for(const auto& row:calibration.resources())plan.add(row);
@@ -447,7 +452,7 @@ void sequentialPreparedCalibration(DeviceId device)
 {
     Source source(device,1,true,256u<<20,true,1);auto& worker=source.worker();
     const auto servingBOM=RetainedParticipantGraphExecutable::generalBOM(
-        source.source->originalResource(DeviceId::cpu()),source.source->originalResource(device));
+        source.source->originalResource(DeviceId::cpu()),source.source->originalResource(device),NativeGraphObjectGeometry::localOwner({(source.source->originalResource(device)).world_rank,(source.source->originalResource(device)).device}));
     const auto servingHost=servingBOM.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::NativeGraphExecutable);
     const auto servingGPU=servingBOM.find({0,device})->bytes(PhysicalMemoryOwner::NativeGraphExecutable);
     auto modelHost=source.memory->reserveNewAllocations(DeviceId::cpu(),PhysicalMemoryOwner::NativeGraphExecutable,servingHost);
@@ -559,15 +564,27 @@ void rejectedPreparedCalibration(DeviceId device)
     source.reset();
 }
 }
+#if defined(HAVE_CUDA)
 /** @test Same original slot across every bounded class/phase, with exact terminal proof and monotonic submit identity. */
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationCUDASequential){EXPECT_EXIT({sequentialPreparedCalibration(DeviceId::cuda(281));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
+#endif // HAVE_CUDA
+#if defined(HAVE_ROCM)
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationROCmSequential){EXPECT_EXIT({sequentialPreparedCalibration(DeviceId::rocm(281));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
+#endif // HAVE_ROCM
+#if defined(HAVE_CUDA)
 /** @test Actual event loop keeps native timing operations on the original worker and reuses its pair. */
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationCUDATimingOwner){EXPECT_EXIT({measuredPreparedCalibration(DeviceId::cuda(283));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
+#endif // HAVE_CUDA
+#if defined(HAVE_ROCM)
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationROCmTimingOwner){EXPECT_EXIT({measuredPreparedCalibration(DeviceId::rocm(283));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
+#endif // HAVE_ROCM
+#if defined(HAVE_CUDA)
 /** @test Normal graph definitions, stale provenance and failed native reset never gain a re-record capability. */
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationCUDARejectsUnproved){EXPECT_EXIT({rejectedPreparedCalibration(DeviceId::cuda(282));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
+#endif // HAVE_CUDA
+#if defined(HAVE_ROCM)
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationROCmRejectsUnproved){EXPECT_EXIT({rejectedPreparedCalibration(DeviceId::rocm(282));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");}
+#endif // HAVE_ROCM
 
 namespace {
 /** @brief Preserve precise assertion diagnostics when a death child exits without normal listeners. */
@@ -626,17 +643,21 @@ void sourceCalibrationRecreation(DeviceId device){
     source.reset();
 }
 }
+#if defined(HAVE_CUDA)
 /** @test Original source lifetime retains the same physical calibration across runner replacement. */
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceCUDARecreation){
     GTEST_FLAG_SET(death_test_style,"threadsafe");
     EXPECT_EXIT({const rlimit limit{};if(setrlimit(RLIMIT_CORE,&limit)!=0){std::fputs("cannot disable child core dumps\n",stderr);_exit(2);}
         sourceCalibrationRecreation(DeviceId::cuda(284));reportCalibrationChildFailures();std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }
+#endif // HAVE_CUDA
+#if defined(HAVE_ROCM)
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceROCmRecreation){
     GTEST_FLAG_SET(death_test_style,"threadsafe");
     EXPECT_EXIT({const rlimit limit{};if(setrlimit(RLIMIT_CORE,&limit)!=0){std::fputs("cannot disable child core dumps\n",stderr);_exit(2);}
         sourceCalibrationRecreation(DeviceId::rocm(284));reportCalibrationChildFailures();std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }
+#endif // HAVE_ROCM
 
 namespace {
 /** @brief Deterministically pause the same production lookup before its off-lock acquire. */
@@ -664,17 +685,21 @@ void sourceCalibrationLookupRetirement(DeviceId device){
     source.reset();
 }
 }
+#if defined(HAVE_CUDA)
 /** @test Off-pool holder loans fail precisely before native teardown/zero-allocation retirement. */
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceCUDAHolderRetirement){
     GTEST_FLAG_SET(death_test_style,"threadsafe");
     EXPECT_EXIT({const rlimit limit{};if(setrlimit(RLIMIT_CORE,&limit)!=0){std::fputs("cannot disable child core dumps\n",stderr);_exit(2);}
         sourceCalibrationLookupRetirement(DeviceId::cuda(285));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }
+#endif // HAVE_CUDA
+#if defined(HAVE_ROCM)
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceROCmHolderRetirement){
     GTEST_FLAG_SET(death_test_style,"threadsafe");
     EXPECT_EXIT({const rlimit limit{};if(setrlimit(RLIMIT_CORE,&limit)!=0){std::fputs("cannot disable child core dumps\n",stderr);_exit(2);}
         sourceCalibrationLookupRetirement(DeviceId::rocm(285));std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }
+#endif // HAVE_ROCM
 
 namespace {
 /** @brief Exercise the same pending completion used by both actual final-model callers. */
@@ -712,6 +737,7 @@ void sourceCalibrationModelTicketOrder(DeviceId device){
     source.reset();
 }
 }
+#if defined(HAVE_CUDA)
 /** @test Source loan preflight precedes actual pending model-ticket consumption. */
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceCUDAModelTicketOrder){
     GTEST_FLAG_SET(death_test_style,"threadsafe");
@@ -719,11 +745,14 @@ TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceCUDAModelTicketOrder
         sourceCalibrationModelTicketOrder(DeviceId::cuda(286));reportCalibrationChildFailures();
         std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }
+#endif // HAVE_CUDA
+#if defined(HAVE_ROCM)
 TEST(PooledNativeProgramDiagnostic,PreparedCalibrationSourceROCmModelTicketOrder){
     GTEST_FLAG_SET(death_test_style,"threadsafe");
     EXPECT_EXIT({const rlimit limit{};if(setrlimit(RLIMIT_CORE,&limit)!=0){std::fputs("cannot disable child core dumps\n",stderr);_exit(2);}
         sourceCalibrationModelTicketOrder(DeviceId::rocm(286));reportCalibrationChildFailures();
         std::_Exit(::testing::Test::HasFailure()?1:0);},::testing::ExitedWithCode(0),"");
 }
+#endif // HAVE_ROCM
 
 }

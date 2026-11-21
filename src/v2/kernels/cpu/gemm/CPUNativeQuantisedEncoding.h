@@ -27,6 +27,7 @@ namespace llaminar2::cpu::native_quantised
         {
         case 0: // Q4_0:  nibble - 8 → [-8, +7]
         case 4: // IQ4_NL / IQ4_XS: kvalues_iq4nl LUT
+        case kNativeQuantisedMXFP4Codebook: // MXFP4: doubled E2M1 LUT
         case 5: // Q4_1:  nibble → [0, 15]
             return true;
         default:

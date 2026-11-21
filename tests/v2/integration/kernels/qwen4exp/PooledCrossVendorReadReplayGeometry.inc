@@ -71,9 +71,9 @@ struct CrossVendorReadReplayGeometry final {
         #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
         retained.add(src,PhysicalMemoryOwner::NativeGraphExecutable,sourceExecutables);retained.add(own,PhysicalMemoryOwner::NativeGraphExecutable,ownerExecutable);
 #else
-        const auto sourceGeneral=RetainedParticipantGraphExecutable::generalBOM(host,src,3);
+        const auto sourceGeneral=RetainedParticipantGraphExecutable::generalBOM(host,src,NativeGraphObjectGeometry::localOwner({(src).world_rank,(src).device}),3);
         for(const auto& row:sourceGeneral.resources())retained.add(row);
-        const auto ownerGeneral=RetainedParticipantGraphExecutable::generalBOM(host,own,1);
+        const auto ownerGeneral=RetainedParticipantGraphExecutable::generalBOM(host,own,NativeGraphObjectGeometry::localOwner({(own).world_rank,(own).device}),1);
         for(const auto& row:ownerGeneral.resources())retained.add(row);
 #endif
         for(const auto program:{q::PooledImmutableCoordinatorNativePlan::orderingProgram(physical,policy),

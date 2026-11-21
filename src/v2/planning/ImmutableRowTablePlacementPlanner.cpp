@@ -99,6 +99,7 @@ ImmutableRowTablePlacementInput ImmutableRowTablePlacementInput::withGPUCacheRes
     const ImmutableRowTablePolicy &requested,std::span<const PhysicalMemoryResource> originals) const
 {
     requested.validate();auto result=*this;result.gpu_resources_.clear();result.gpu_placement_.reset();result.gpu_peer_access_.reset();result.reader_peer_access_.clear();
+    result.graph_objects_={}; // Evidence belongs to the replaced GPU roster.
     if(!requested.isGPUAdaptive())throw std::invalid_argument("GPU storage observations require explicit GPU adaptive policy");
     if (requested.gpu_adaptive.local_hot_cache)
     {
@@ -510,7 +511,8 @@ ImmutableRowTablePlacementSelection ImmutableRowTablePlacementPlanner::select(
             for(const auto &bom:optional.resources())plan.add(bom);
             if (!grouped) {
                 const auto remote=qwen4exp::PooledImmutableRetainedParticipantBudget::slotDependentBOM(
-                    *geometry,*remote_floor,nativeHost,input.gpuResources(),request.native_ordering_events);
+                    *geometry,*remote_floor,nativeHost,input.gpuResources(),
+                    input.graphObjects(),request.native_ordering_events);
                 for(const auto& line:remote.resources())plan.add(line);
             }
             const auto hostGeometry = grouped ? AdaptiveImmutableLookupGeometry::sharedHostGeometry(layout,requested.gpu_adaptive) : geometry->host();

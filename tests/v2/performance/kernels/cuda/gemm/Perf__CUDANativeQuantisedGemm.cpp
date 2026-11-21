@@ -155,7 +155,7 @@ namespace
     TEST(CUDANativeQuantisedGemmPerfOffline, FormatListCodebookIdsMatchTensorMetadata)
     {
         const std::set<std::string> expected_formats = {
-            "Q4_0", "IQ4_NL", "IQ4_XS", "Q4_1", "Q4_K", "Q5_0", "Q5_1",
+            "Q4_0", "IQ4_NL", "IQ4_XS", "MXFP4", "Q4_1", "Q4_K", "Q5_0", "Q5_1",
             "Q5_K", "Q6_K", "Q3_K", "Q2_K", "IQ3_S", "IQ3_XXS", "IQ2_S",
             "IQ2_XS", "IQ2_XXS", "IQ1_S", "IQ1_M", "Q8_0", "Q8_1", "Q8_K"};
         std::set<std::string> observed_formats;
@@ -1860,8 +1860,26 @@ namespace
      * resource/dispatch tuple are checked. This is a functional production
      * admission gate; its event samples are never tuning evidence.
      */
+    /**
+     * @brief Installed-dispatch admission inventory: the trainer formats plus
+     * MXFP4. MXFP4 has no tuning corpus of its own; it executes IQ4_NL's
+     * installed policy through its own physical decoder (codebook 25).
+     */
+    static const std::vector<FormatSpec> &installedPrefillFormats()
+    {
+        static const std::vector<FormatSpec> formats = []
+        {
+            auto all = kFormats;
+            all.push_back({"MXFP4", llaminar2::kNativeQuantisedMXFP4Codebook, [](size_t n, size_t k)
+                           { return TestTensorFactory::createMXFP4Random({n, k}); }});
+            return all;
+        }();
+        return formats;
+    }
+
     TEST_P(CUDAInstalledDensePrefillTest, AllSourceFormats)
     {
+        const auto &kInstalledFormats = installedPrefillFormats();
         const std::array<std::string_view, 12> names{
             "QwenDense27B_TP2_FFN_GateUp", "QwenDense27B_TP2_FFN_DownProjection", "32B_AttnOut",
             "QwenDense27B_TP2_GDN_ZProjection", "QwenDense27B_TP2_GDN_OutputProjection",
@@ -1875,9 +1893,9 @@ namespace
         ASSERT_EQ(projections.size(), names.size());
         ScopedDensePrefillOverlayBypass restore_policy;
         std::size_t cases = 0;
-        for (std::size_t index = static_cast<std::size_t>(GetParam()); index < kFormats.size(); index += 4)
+        for (std::size_t index = static_cast<std::size_t>(GetParam()); index < kInstalledFormats.size(); index += 4)
         {
-            const auto &format = kFormats[index];
+            const auto &format = kInstalledFormats[index];
             SCOPED_TRACE(format.name);
             for (const auto &[n, k] : projections)
             {
@@ -1891,7 +1909,9 @@ namespace
                     SCOPED_TRACE(::testing::Message() << "M=" << m << " N=" << n << " K=" << k);
                     llaminar2::cuda::generated::CUDADensePrefillOverlayConfig expected{};
                     ASSERT_TRUE(llaminar2::cuda::generated::selectCUDADensePrefillOverlay(
-                        format.runtimeCodebook() == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook
+                        // IQ4_XS-source and MXFP4 tuples install IQ4_NL's policy.
+                        format.runtimeCodebook() == llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook ||
+                                format.runtimeCodebook() == llaminar2::kNativeQuantisedMXFP4Codebook
                             ? uint8_t{4} : format.runtimeCodebook(), m, n, k, expected));
                     cudaNativeQuantisedPrefill_setExactOverlayEnabled(false);
                     auto requirements = consumer->getWorkspaceRequirements(m, n, k);
@@ -1919,7 +1939,7 @@ namespace
                 }
             }
         }
-        EXPECT_EQ(cases, ((kFormats.size() + 3u - GetParam()) / 4u) * projections.size() * 4u);
+        EXPECT_EQ(cases, ((kInstalledFormats.size() + 3u - GetParam()) / 4u) * projections.size() * 4u);
     }
 
     INSTANTIATE_TEST_SUITE_P(InstalledCUDADensePrefill, CUDAInstalledDensePrefillTest,

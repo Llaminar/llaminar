@@ -11,6 +11,7 @@
 #include "execution/qwen4exp/PooledImmutableRetainedParticipantBudget.h"
 #include "fixtures/planning/ImmutableRowTableAdmissionWireReplayAccess.h"
 #include "fixtures/planning/RecordedNgramOrdering.h"
+#include "fixtures/backends/NativeGraphObjectGeometryRecordedAccess.h"
 #include "planning/PlanningModelMetadata.h"
 #include "planning/ImmutableRowTableAdmissionWire.h"
 #include "loaders/AdaptiveImmutableLookupGeometry.h"
@@ -60,7 +61,9 @@ DevicePlanConfig consumer(DeviceId local,bool bounded){
     p.gpu_adaptive.placement={.mode=AdaptiveGPUCachePlacementMode::DeclaredRankLocal,
         .owners={{{0,local.type,local.ordinal},rows,bytes},{{0,remote.type,remote.ordinal},rows,bytes}},
         .coordinator=AdaptiveGPUCacheParticipant{0,local.type,local.ordinal}};
-    p.validate();c.ngram_execution_policy=std::move(p);const std::array devices{local,remote};c.native_ordering_events=NativeOrderingEventGroupReplayAccess::projectionWithRemoteGraphs(devices);test::declareRecordedNgramHostServices(c);return c;
+    p.validate();c.ngram_execution_policy=std::move(p);const std::array devices{local,remote};c.native_ordering_events=NativeOrderingEventGroupReplayAccess::projectionWithRemoteGraphs(devices);
+    // Recorded owner adapter sizes: the mocked owners need not be compiled here.
+    c.native_graph_objects=NativeGraphObjectGeometryRecordedAccess::uniform();test::declareRecordedNgramHostServices(c);return c;
 }
 /** @return Exact named PMA owner contribution; no duplicated capacity arithmetic. */
 std::size_t bytes(const PhysicalMemoryPlan& plan,PhysicalMemoryAllocatorIdentity id,PhysicalMemoryOwner owner){
@@ -143,15 +146,15 @@ TEST(GPUCacheSourceVectorPlanner, OriginalTwoWorkerSourceFeedsFinalQFNPlanAtC0An
             EXPECT_EQ(geometry.physical().owners()[i].slots,bounded?64u:0u);}
         const auto eventOnly=NativeOrderingEventGroupReplayAccess::projection(devices);
         const auto program=qwen4exp::PooledImmutableDirectedOwnerProgram::declare(geometry.physical(),geometry.coordinator(),1);
-        EXPECT_THROW(eventOnly.remoteHostBOM(program,request->input.host(),source->originalResource(remote)),std::invalid_argument);
-        const auto host=cfg.native_ordering_events.remoteHostBOM(program,request->input.host(),source->originalResource(remote));
+        EXPECT_THROW(eventOnly.remoteHostBOM(program,request->input.host(),source->originalResource(remote),NativeGraphObjectGeometry::localOwner({(source->originalResource(remote)).world_rank,(source->originalResource(remote)).device})),std::invalid_argument);
+        const auto host=cfg.native_ordering_events.remoteHostBOM(program,request->input.host(),source->originalResource(remote),NativeGraphObjectGeometry::localOwner({(source->originalResource(remote)).world_rank,(source->originalResource(remote)).device}));
         const auto complete=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(
-            geometry,request->input.host(),request->input.gpuResources(),cfg.native_ordering_events);
+            geometry,request->input.host(),request->input.gpuResources(),request->input.graphObjects(),cfg.native_ordering_events);
         const auto floorComplete=qwen4exp::PooledImmutableRetainedParticipantBudget::completeBOM(
-            zero,request->input.host(),request->input.gpuResources(),cfg.native_ordering_events);
+            zero,request->input.host(),request->input.gpuResources(),request->input.graphObjects(),cfg.native_ordering_events);
         const auto floorHost=cfg.native_ordering_events.remoteHostBOM(
             qwen4exp::PooledImmutableDirectedOwnerProgram::declare(zero.physical(),zero.coordinator(),1),
-            request->input.host(),source->originalResource(remote));
+            request->input.host(),source->originalResource(remote),NativeGraphObjectGeometry::localOwner({(source->originalResource(remote)).world_rank,(source->originalResource(remote)).device}));
         const auto holder=RetainedParticipantGraphSourceSlots::physicalBytes(geometry.physical().owners().size());
         EXPECT_EQ(bytes(complete,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeStorageGraphExecutable),
             bytes(host,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeStorageGraphExecutable)+holder);
@@ -164,7 +167,7 @@ TEST(GPUCacheSourceVectorPlanner, OriginalTwoWorkerSourceFeedsFinalQFNPlanAtC0An
         EXPECT_EQ(bytes(host,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeGraphExecutable),0u);
         EXPECT_EQ(bytes(host,{0,remote},PhysicalMemoryOwner::NativeGraphExecutable),0u);
         PhysicalMemoryPlanBuilder optionalPlan(llaminar2::test::recordedNgramOptional(geometry,request->input.gpuResources(),request->input.host()));
-        const auto remoteGrowth=qwen4exp::PooledImmutableRetainedParticipantBudget::slotDependentBOM(geometry,zero,request->input.host(),request->input.gpuResources(),cfg.native_ordering_events);
+        const auto remoteGrowth=qwen4exp::PooledImmutableRetainedParticipantBudget::slotDependentBOM(geometry,zero,request->input.host(),request->input.gpuResources(),request->input.graphObjects(),cfg.native_ordering_events);
         for(const auto& line:remoteGrowth.resources())optionalPlan.add(line);
         const auto optional=optionalPlan.build();
         for(const auto& bom:frozen.resources())for(std::size_t i=0;i<PhysicalMemoryBOM::ownerCount();++i){const auto owner=PhysicalMemoryBOM::ownerAt(i);
@@ -203,4 +206,121 @@ TEST(GPUCacheSourceVectorPlanner, UndeclaredOrUnusedOriginalSourceRejectsBeforeF
         EXPECT_THROW((void)MemoryPlanner::plan(profile,{cfg}),std::invalid_argument);
     }
 }
+
+namespace
+{
+/** @return A remote-rank ConsumerLocal QFN consumer with no live source in this process. */
+DevicePlanConfig remoteConsumer(DeviceId device)
+{
+    DevicePlanConfig c;c.world_rank=1;c.device=device;c.device_compute_units=80;
+    c.device_total_bytes=512ull<<30;c.device_free_bytes=500ull<<30;
+    c.associated_host_memory=PhysicalMemoryResource{1,DeviceId::cpu(),512ull<<30,500ull<<30};
+    c.max_seq_len=64;c.activation_seq_len=32;c.first_layer=0;c.last_layer=47;c.batch_size=1;
+    ImmutableRowTablePolicy p{.storage=ImmutableRowStoragePreference::AdaptiveVRAMRAMSSD};p.window_count=2;
+    p.validate();c.ngram_execution_policy=std::move(p);
+    return c;
 }
+/** @return Owner birth metadata carrying only a distinctive adapter size. */
+PlanningNativeContextDeclaration birth(DeviceId device,std::size_t graph_object_bytes)
+{
+    return {.device=device,.physical_uuid="remote-owner",.stack_bytes=1<<20,.guard_bytes=4096,.page_bytes=4096,
+        .object_bytes=256,.object_alignment=64,.graph_capture_object_bytes=graph_object_bytes};
+}
+}
+
+/**
+ * @test A table priced away from its owner uses the owner's published adapter
+ * size: the birth declaration, then the candidate's projected evidence. With
+ * neither, the GPU stays unpublished, so pricing it fails instead of using
+ * this binary's ABI (the remote backend need not be compiled here).
+ */
+TEST(GPUCacheSourceVectorPlanner, RemoteTableGraphObjectsComeFromOwnerEvidence)
+{
+    Qwen4ExpPlanningGGUFFixture file;PlanningModelSource original(file.path());const auto& profile=original.metadata().memoryProfile();
+    for(const auto device:{DeviceId::cuda(0),DeviceId::rocm(0)})
+    {
+        const PhysicalMemoryAllocatorIdentity owner{1,device};
+        const PhysicalMemoryResource host{1,DeviceId::cpu(),512ull<<30,500ull<<30};
+        auto declared=remoteConsumer(device);declared.planning_native_context_birth=birth(device,4099);
+        const std::vector<std::vector<DevicePlanConfig>> byBirth{{declared}};
+        const auto fromBirth=MemoryPlanner::immutableRowTablePlacementInput(profile,byBirth,host,declared.ngram_host_placement);
+        ASSERT_TRUE(fromBirth.graphObjects().contains(owner));
+        EXPECT_EQ(fromBirth.graphObjects().bytes(owner),4099u);
+
+        auto projected=remoteConsumer(device);projected.native_graph_objects.publish(owner,8209);
+        const std::vector<std::vector<DevicePlanConfig>> byProjection{{projected}};
+        EXPECT_EQ(MemoryPlanner::immutableRowTablePlacementInput(profile,byProjection,host,projected.ngram_host_placement)
+            .graphObjects().bytes(owner),8209u);
+
+        const std::vector<std::vector<DevicePlanConfig>> unpublished{{remoteConsumer(device)}};
+        const auto none=MemoryPlanner::immutableRowTablePlacementInput(profile,unpublished,host,
+            unpublished.front().front().ngram_host_placement);
+        EXPECT_FALSE(none.graphObjects().contains(owner));
+        EXPECT_THROW((void)none.graphObjects().bytes(owner),std::invalid_argument);
+    }
+}
+
+/**
+ * @test The admission wire carries the sender's adapter sizes: a receiver
+ * prices the sender's pooled participants with them, never its own ABI, and a
+ * wire without them leaves the receiver unable to price (fatal).
+ */
+TEST(GPUCacheSourceVectorPlanner, AdmissionWireCarriesOwnerGraphObjects)
+{
+    Qwen4ExpPlanningGGUFFixture file;PlanningModelSource original(file.path());const auto& profile=original.metadata().memoryProfile();
+    const auto local=DeviceId::cuda(0),remote=DeviceId::rocm(0);
+    auto cfg=consumer(local,true);
+    const std::array devices{local,remote};const auto observed=observations();
+    for(const auto device:devices)Access::seed(device,[ordinal=device.ordinal](std::shared_ptr<PreparedGPUWorkerStack> root){
+        return Access::construct<SourceVectorWorker>(std::move(root),ordinal);});
+    auto source=Access::source<SourceVectorWorker>(std::span<const DeviceId>{devices},observed);
+    SourceVectorRetirement retirement(source,devices);
+    for(const auto device:devices){const auto permit=source->acquire(device);(void)permit;}
+    source->freezeForPlanning();cfg.native_context_preparation=source;
+    const std::vector<std::vector<DevicePlanConfig>> groups{{cfg}};
+    auto request=MemoryPlanner::immutableRowTableAdmissionRequest(profile,*cfg.ngram_execution_policy,groups,{},cfg.ngram_host_placement);
+    ASSERT_TRUE(request);
+    // The candidate's owner evidence covers both GPUs.
+    for(const auto& gpu:request->input.gpuResources())
+        EXPECT_TRUE(request->input.graphObjects().contains({gpu.world_rank,gpu.device}));
+
+    // Publish sizes that no local binary has, as a different owner ABI would.
+    NativeGraphObjectGeometry sender;sender.publish({0,local},5003);sender.publish({0,remote},7011);
+    request->input=request->input.withGraphObjects(sender);
+    const auto restored=ImmutableRowTableAdmissionWireReplayAccess::parse(
+        serializeImmutableRowTableAdmissionRequests(std::array{*request}),0,&profile,cfg.native_ordering_events,request->retained_host_services);
+    ASSERT_EQ(restored.size(),1u);
+    const auto& received=restored.front().input.graphObjects();
+    // The previous schema (v20) had no owner sizes and is rejected, not reinterpreted.
+    auto previous=serializeImmutableRowTableAdmissionRequests(std::array{*request});
+    ASSERT_EQ(previous[4],21u);previous[4]=20;
+    EXPECT_THROW((void)ImmutableRowTableAdmissionWireReplayAccess::parse(
+        previous,0,&profile,cfg.native_ordering_events,request->retained_host_services),std::invalid_argument);
+    EXPECT_EQ(received.bytes({0,local}),5003u);
+    EXPECT_EQ(received.bytes({0,remote}),7011u);
+
+    // Production pricing (installed projection) charges the received size.
+    const auto maximum=request->execution_provision->maximumLiveIds();
+    const auto geometry=AdaptiveImmutableLookupGeometry::fromLayout(request->input.gpuAdaptiveLayout(*cfg.ngram_execution_policy,0,0,maximum),
+        {.rows=profile.flash_next->ple_table_rows,.row_elements=profile.flash_next->ple_row_elements,
+         .format=static_cast<GGUFTensorType>(profile.flash_next->ple_table_gguf_type)},cfg.ngram_execution_policy->gpu_adaptive);
+    const auto program=qwen4exp::PooledImmutableDirectedOwnerProgram::declare(geometry.physical(),geometry.coordinator(),1);
+    const auto gpu=source->originalResource(remote);
+    NativeGraphObjectGeometry larger;larger.publish({0,remote},7011+4096);
+    const auto installed=NativeOrderingEventBudgetProjection::installed();
+    const auto priced=installed.remoteHostBOM(program,request->input.host(),gpu,received);
+    const auto pricedLarger=installed.remoteHostBOM(program,request->input.host(),gpu,larger);
+    EXPECT_GT(bytes(pricedLarger,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeStorageGraphExecutable),
+        bytes(priced,{0,DeviceId::cpu()},PhysicalMemoryOwner::NativeStorageGraphExecutable));
+
+    // A wire without owner evidence cannot be priced on the receiver.
+    request->input=request->input.withGraphObjects({});
+    const auto bare=serializeImmutableRowTableAdmissionRequests(std::array{*request});
+    const auto unpublished=ImmutableRowTableAdmissionWireReplayAccess::parse(
+        bare,0,&profile,cfg.native_ordering_events,request->retained_host_services);
+    ASSERT_EQ(unpublished.size(),1u);
+    EXPECT_FALSE(unpublished.front().input.graphObjects().contains({0,remote}));
+    EXPECT_THROW((void)installed.remoteHostBOM(program,request->input.host(),gpu,unpublished.front().input.graphObjects()),
+        std::invalid_argument);
+}
+} // namespace llaminar2::test

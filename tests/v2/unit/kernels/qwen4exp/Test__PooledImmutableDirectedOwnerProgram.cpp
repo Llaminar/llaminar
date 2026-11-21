@@ -12,6 +12,7 @@
 #include <gtest/gtest.h>
 #include <array>
 #include <type_traits>
+#include "fixtures/backends/NativeGraphObjectGeometryRecordedAccess.h"
 namespace llaminar2::test {
 namespace {
 namespace q=qwen4exp;
@@ -77,18 +78,20 @@ TEST(PooledImmutableDirectedOwnerProgram, NativeGeneralPreservesOriginalGeometry
         EXPECT_EQ(pooledStorageOwnerGeometry(authored).owner.device,remote);
         EXPECT_NE(pooledStorageOwnerIdentity(authored),0u);
         const auto& native=std::get<PooledNativeOwnerGraphProgram>(authored);
+        // Hypothetical owner: recorded evidence prices both vendors in any build.
+        const auto recorded=test::NativeGraphObjectGeometryRecordedAccess::uniform();
         const PhysicalMemoryResource host{0,DeviceId::cpu(),1ULL<<34,1ULL<<34},gpu{0,remote,1ULL<<34,1ULL<<34};
         const auto storage=q::PooledImmutableDirectedOwnerProgram::fromOriginalStoragePlans(owner,coordinator);
         EXPECT_EQ(pooledStorageOwnerIdentity(storage),native.captureIdentity());
-        const auto bill=RetainedParticipantGraphExecutable::nativeStorageBOM(native,host,gpu);
-        const auto model=RetainedParticipantGraphExecutable::generalBOM(host,gpu);
+        const auto bill=RetainedParticipantGraphExecutable::nativeStorageBOM(native,host,gpu,recorded);
+        const auto model=RetainedParticipantGraphExecutable::generalBOM(host,gpu,recorded);
         for(const auto& row:bill.resources()){
             const auto* ordinary=model.find({row.resource().world_rank,row.resource().device});ASSERT_NE(ordinary,nullptr);
             EXPECT_EQ(row.bytes(PhysicalMemoryOwner::NativeStorageGraphExecutable),ordinary->bytes(PhysicalMemoryOwner::NativeGraphExecutable));
             EXPECT_EQ(row.bytes(PhysicalMemoryOwner::NativeGraphExecutable),0u);
         }
         auto foreign=gpu;foreign.device=DeviceId(remote.type,7);
-        EXPECT_THROW(RetainedParticipantGraphExecutable::nativeStorageBOM(native,host,foreign),std::invalid_argument);
+        EXPECT_THROW(RetainedParticipantGraphExecutable::nativeStorageBOM(native,host,foreign,recorded),std::invalid_argument);
         EXPECT_THROW(q::PooledImmutableDirectedOwnerProgram::declare(physical,policy,1),std::invalid_argument);
         EXPECT_THROW(q::PooledImmutableDirectedOwnerProgram::fromOriginalPlans(owner,coordinator),std::invalid_argument);
         const auto [unobserved,unobservedPolicy]=declare(source,remote,capacity);

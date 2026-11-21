@@ -597,8 +597,8 @@ namespace llaminar2::test
                 CPUStoragePlacement::local(),CPUStorageInitialization::Uninitialized);
             source->freezeForPlanning();
             PhysicalMemoryPlanBuilder plan(source->mandatoryBOM());
-            const auto graphs=RetainedParticipantGraphExecutable::generalBOM(observations[0],observations[1]);
-            const auto calibration=RetainedParticipantGraphExecutable::calibrationBOM(observations[0],observations[1]);
+            const auto graphs=RetainedParticipantGraphExecutable::generalBOM(observations[0],observations[1],NativeGraphObjectGeometry::localOwner({(observations[1]).world_rank,(observations[1]).device}));
+            const auto calibration=RetainedParticipantGraphExecutable::calibrationBOM(observations[0],observations[1],NativeGraphObjectGeometry::localOwner({(observations[1]).world_rank,(observations[1]).device}));
             for(const auto& row:graphs.resources())plan.add(row);
             for(const auto& row:calibration.resources())plan.add(row);
             plan.add(observations[0],PhysicalMemoryOwner::ExecutionWorkspace,

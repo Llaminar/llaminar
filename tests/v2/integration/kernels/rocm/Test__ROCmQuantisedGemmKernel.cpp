@@ -4360,6 +4360,53 @@ namespace llaminar2
             }
 
             /**
+             * @test End-to-end multiply_tensor for MXFP4 (native-quantised path) - decode (M=1)
+             *
+             * OCP MXFP4 executes through native codebook 25 with its 1-byte E8M0
+             * scale plane. The E2M1 x 2^(e-128) reference comes from the FP32
+             * tensor materialization, exactly as for IQ4_NL.
+             */
+            TEST_F(ROCmQuantisedGemmIntegrationTest, Dispatch_MXFP4_Decode_M1)
+            {
+                if (!has_rocm_device_)
+                    GTEST_SKIP() << "No ROCm device available";
+
+                const int M = 1, N = 896, K = 896;
+
+                auto weights = TestTensorFactory::createMXFP4Random({static_cast<size_t>(N), static_cast<size_t>(K)});
+                std::vector<float> W_fp32(static_cast<size_t>(N) * K);
+                weights->to_fp32(W_fp32.data());
+
+                ROCmPackedWeights packed;
+                ASSERT_TRUE(packWeightsToROCm(weights.get(), packed));
+                EXPECT_FALSE(packed.native_quantised_payload.empty());
+                EXPECT_TRUE(packed.int8_data.empty());
+
+                ROCmQuantisedGemmKernel kernel(&packed, 0);
+                ASSERT_TRUE(setupWorkspace(kernel, M, N, K));
+
+                auto input = TestTensorFactory::createFP32Random({static_cast<size_t>(M), static_cast<size_t>(K)});
+                auto output = TestTensorFactory::createFP32({static_cast<size_t>(M), static_cast<size_t>(N)});
+
+                ASSERT_TRUE(input->ensureOnDevice(DeviceId::rocm(0)));
+                ASSERT_TRUE(output->allocateOnDevice(DeviceId::rocm(0)));
+
+                ASSERT_TRUE(kernel.multiply_tensor(input.get(), output.get(), M, N, K));
+                (void)hipDeviceSynchronize();
+                TransferEngine::publishCurrentDeviceWrite(output, stream_);
+
+                const float *in_host = input->data();
+                std::vector<float> ref(static_cast<size_t>(M) * N);
+                cpuFP32GemmRef(in_host, W_fp32.data(), ref.data(), M, N, K);
+
+                float cos = cosineSim(output->data(), ref.data(), static_cast<size_t>(M) * N);
+                LOG_INFO("[Dispatch] MXFP4 decode M=1: cosine=" << cos);
+                EXPECT_GT(cos, 0.990f) << "MXFP4 decode cosine too low";
+
+                cleanupWorkspace(kernel);
+            }
+
+            /**
              * @test Cross-path consistency: same dimensions, different formats
              *
              * Verifies that Q8_0 (INT8-VNNI) and Q4_0 (native-quantised) both produce

@@ -874,7 +874,7 @@ void replay(DeviceType backend, std::vector<std::size_t> stage_sizes, int ple_st
             plan.add(resource,PhysicalMemoryOwner::LocalCollective,boundary);
             plan.add(host,controller_declaration.owner(),controller_declaration.physicalBytes());
             plan.add(resource,controller_declaration.owner(),controller_declaration.columns()*sizeof(std::int32_t));
-            const auto graphs=RetainedParticipantGraphExecutable::generalBOM(host,resource,retainedWidths(format).size());
+            const auto graphs=RetainedParticipantGraphExecutable::generalBOM(host,resource,NativeGraphObjectGeometry::localOwner({(resource).world_rank,(resource).device}),retainedWidths(format).size());
             for(const auto& row:graphs.resources())plan.add(row);
             if(owner.stage_index==ple_stage) {
                 for(const auto bytes:readerSizes(envelope,placement.assembledHeadCount(owner.consumer_index),reader_count,unequal))

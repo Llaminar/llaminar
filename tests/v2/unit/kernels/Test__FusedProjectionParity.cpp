@@ -44,7 +44,7 @@ protected:
     };
 
     /// Create a quantized weight tensor of the given type with the given shape.
-    /// Supported: "Q4_0", "Q8_0", "IQ4_NL"
+    /// Supported: "Q4_0", "Q8_0", "IQ4_NL", "MXFP4"
     static std::unique_ptr<TensorBase> createWeights(
         const std::string &type, size_t n, size_t k, uint32_t seed)
     {
@@ -55,6 +55,8 @@ protected:
             return TestTensorFactory::createQ8_0Random(shape, seed);
         if (type == "IQ4_NL")
             return TestTensorFactory::createIQ4_NLRandom(shape, seed);
+        if (type == "MXFP4")
+            return TestTensorFactory::createMXFP4Random(shape, seed);
         return nullptr;
     }
 
@@ -266,6 +268,49 @@ TEST_F(FusedProjectionParity, IQ4_NL_FusedQKV_M1_Decode)
 
     EXPECT_LT(max_diff, PARITY_TOLERANCE)
         << "IQ4_NL fused QKV (M=1) diverges from sequential";
+}
+
+// ============================================================================
+// MXFP4 fused projection parity (nibble-LUT sibling of IQ4_NL, codebook 25)
+// ============================================================================
+
+TEST_F(FusedProjectionParity, MXFP4_FusedQKV_M1_Decode)
+{
+    constexpr int K = 896;
+
+    float max_diff = runFusedVsSequentialParity(
+        "MXFP4",
+        {{896, "Q_proj"}, {128, "K_proj"}, {128, "V_proj"}},
+        1, K);
+
+    EXPECT_LT(max_diff, PARITY_TOLERANCE)
+        << "MXFP4 fused QKV (M=1) diverges from sequential";
+}
+
+TEST_F(FusedProjectionParity, MXFP4_FusedGateUp_M1_Decode)
+{
+    constexpr int K = 896;
+
+    float max_diff = runFusedVsSequentialParity(
+        "MXFP4",
+        {{4864, "gate"}, {4864, "up"}},
+        1, K);
+
+    EXPECT_LT(max_diff, PARITY_TOLERANCE)
+        << "MXFP4 fused gate/up (M=1) diverges from sequential";
+}
+
+TEST_F(FusedProjectionParity, MXFP4_FusedQKV_M64_Prefill)
+{
+    constexpr int K = 896;
+
+    float max_diff = runFusedVsSequentialParity(
+        "MXFP4",
+        {{896, "Q_proj"}, {128, "K_proj"}, {128, "V_proj"}},
+        64, K);
+
+    EXPECT_LT(max_diff, PARITY_TOLERANCE)
+        << "MXFP4 fused QKV (M=64) diverges from sequential";
 }
 
 // ============================================================================

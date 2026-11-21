@@ -869,6 +869,7 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
         FormatCase{GGUFTensorType::IQ2_S, &native_quantised_formats::IQ2_S},
         FormatCase{GGUFTensorType::IQ4_XS, &native_quantised_formats::IQ4_XS},
         FormatCase{GGUFTensorType::IQ1_M, &native_quantised_formats::IQ1_M},
+        FormatCase{GGUFTensorType::MXFP4, &native_quantised_formats::MXFP4},
     };
 
     for (const auto &format : formats)
@@ -1403,6 +1404,14 @@ TEST(Test__MoEOverlayPhysicalResidencyFabric,
             ExpertWeightFormat::nativeQuantised({
                 .codebook_id = native_quantised_formats::IQ1_M.codebook_id,
                 .is_superblock = native_quantised_formats::IQ1_M.is_superblock,
+                .present = true,
+            }),
+        },
+        FormatCase{
+            "MXFP4",
+            ExpertWeightFormat::nativeQuantised({
+                .codebook_id = native_quantised_formats::MXFP4.codebook_id,
+                .is_superblock = native_quantised_formats::MXFP4.is_superblock,
                 .present = true,
             }),
         },

@@ -30,6 +30,7 @@
 #include <map>
 #include <set>
 #include <tuple>
+#include "fixtures/backends/NativeGraphObjectGeometryRecordedAccess.h"
 
 using namespace llaminar2;
 using namespace llaminar2::test;
@@ -847,7 +848,8 @@ namespace
             if (found || candidate.membership.discoveryRanks() != std::vector<int>{0}) return;
             found = AdmittedOrchestrationCandidate::admit(std::move(candidate), source,
                 {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
-                 .maximum_cached_prefill_buckets = 8, .retained_host_services = host_services});
+                 .maximum_cached_prefill_buckets = 8, .retained_host_services = host_services,
+                 .native_graph_objects = test::NativeGraphObjectGeometryRecordedAccess::uniform()});
         });
         if (!found) throw std::logic_error("No request-cost fixture candidate");
         return std::move(*found);
@@ -1104,7 +1106,8 @@ namespace {
         visitAutomaticOrchestrationCandidates(request,source.metadata(),cluster,[&](auto proposal){
             if(selected || proposal.membership.discoveryRanks()!=std::vector<int>{discovery_rank})return;
             auto admitted=AdmittedOrchestrationCandidate::admit(std::move(proposal),source,
-                {.prefill_bucket_rows={32,64},.minimum_prefill_sequence_rows=1,.maximum_cached_prefill_buckets=8});
+                {.prefill_bucket_rows={32,64},.minimum_prefill_sequence_rows=1,.maximum_cached_prefill_buckets=8,
+                 .native_graph_objects=test::NativeGraphObjectGeometryRecordedAccess::uniform()});
             if(admitted.devicePlans().size()==1 && admitted.devicePlans()[0].device.ordinal==ordinal)selected.emplace(std::move(admitted));});
         if(!selected)throw std::logic_error("No exact median compute fixture candidate");return std::move(*selected);
     }
@@ -1256,7 +1259,8 @@ TEST(PlanningRequestCostModel, MappedOverlayDoesNotSubstituteNativePeerMeasureme
             selected.emplace(AdmittedOrchestrationCandidate::admit(std::move(proposal), source,
                 {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
                  .maximum_cached_prefill_buckets = 8,
-                 .retained_host_services = planningHostServiceBudgets(cluster.world_size)}));
+                 .retained_host_services = planningHostServiceBudgets(cluster.world_size),
+                 .native_graph_objects = test::NativeGraphObjectGeometryRecordedAccess::uniform()}));
         });
         ASSERT_TRUE(selected) << "Expected one GPU continuation plus a host-owned CPU expert tier; proposals=" << proposals;
         const auto &candidate = *selected;
@@ -1376,7 +1380,8 @@ TEST_P(PipelineRequestCost, HybridMoEUsesStageScopedEvidence)
         config.routed_expert_compute_policy = RoutedExpertComputePolicy::GateUpOwnedDownColumns;
         const auto admitted = AdmittedOrchestrationCandidate::admit(
             {OrchestrationStrategy::PipelineParallel, ExecutionRankMembership(cluster, {0}), std::move(config)}, source,
-            {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1, .maximum_cached_prefill_buckets = 8});
+            {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1, .maximum_cached_prefill_buckets = 8,
+             .native_graph_objects = test::NativeGraphObjectGeometryRecordedAccess::uniform()});
         const auto estimate = costs.evaluate(admitted, {64, 16});
         EXPECT_GT(estimate.requestSeconds(), 0);
         EXPECT_NE(estimate.evidence().find("all-expert down slices"), std::string::npos);
@@ -1432,7 +1437,7 @@ TEST(PlanningWeightServiceModel, ExpertGroupingAndReplicationPreserveAllNativeFo
     using T = GGUFTensorType;
     const std::vector formats{T::F32, T::F16, T::BF16, T::Q4_0, T::Q4_1, T::Q5_0, T::Q5_1, T::Q8_0,
         T::Q2_K, T::Q3_K, T::Q4_K, T::Q5_K, T::Q6_K, T::Q8_K, T::IQ1_S, T::IQ1_M,
-        T::IQ2_XXS, T::IQ2_XS, T::IQ2_S, T::IQ3_XXS, T::IQ3_S, T::IQ4_NL, T::IQ4_XS};
+        T::IQ2_XXS, T::IQ2_XS, T::IQ2_S, T::IQ3_XXS, T::IQ3_S, T::IQ4_NL, T::IQ4_XS, T::MXFP4};
     const auto cluster = inventory();
     for (auto format : formats)
     {
@@ -1492,7 +1497,7 @@ TEST(PlanningWeightServiceModel, ProjectionWorkChargesDownAtZeroOwnersAllNativeF
     using T = GGUFTensorType;
     const std::vector formats{T::F32, T::F16, T::BF16, T::Q4_0, T::Q4_1, T::Q5_0, T::Q5_1, T::Q8_0,
         T::Q2_K, T::Q3_K, T::Q4_K, T::Q5_K, T::Q6_K, T::Q8_K, T::IQ1_S, T::IQ1_M,
-        T::IQ2_XXS, T::IQ2_XS, T::IQ2_S, T::IQ3_XXS, T::IQ3_S, T::IQ4_NL, T::IQ4_XS};
+        T::IQ2_XXS, T::IQ2_XS, T::IQ2_S, T::IQ3_XXS, T::IQ3_S, T::IQ4_NL, T::IQ4_XS, T::MXFP4};
     const auto cluster = inventory();
     for (const auto format : formats)
     {

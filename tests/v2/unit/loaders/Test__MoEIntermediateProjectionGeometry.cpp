@@ -431,7 +431,10 @@ TEST(MoEIntermediateProjectionGeometry, PreparedPoolLayoutsMatchActualPoolPlans)
                       source.has_emins};
             WeightVRAMPool pool;
             pool.planWeight("original", n, k, physical.payload_bytes_per_block,
-                physical.has_mins, physical.has_emins, 0);
+                physical.has_mins, physical.has_emins,
+                // Live slots carry the physical codebook's own primary plane
+                // (one E8M0 byte per block for native MXFP4).
+                nativeQuantisedScalePlaneWidth(canonicalDeviceVnniCodebookId(source)), 0);
             const auto geometry = resolveExpertPreparedProjectionMemoryGeometry(
                 n, k, format, layout);
             EXPECT_EQ(geometry.gpu_live_bytes,

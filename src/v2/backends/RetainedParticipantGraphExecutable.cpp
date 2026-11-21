@@ -144,22 +144,24 @@ RetainedParticipantGraphExecutable::RetainedParticipantGraphExecutable(
     std::shared_ptr<IWorkerGPUContext> worker,std::shared_ptr<PhysicalMemoryAuthority> memory,std::uint64_t generation,DeviceId device,void* stream,NativeContextRetirementSlot retirement,
     std::unique_ptr<IContextNativeRetirementObligation> pending)
     :worker_(std::move(worker)),memory_(std::move(memory)),generation_(generation),device_(device),stream_(stream),retirement_(std::move(retirement)),pendingObligation_(std::move(pending)){}
-PhysicalMemoryPlan RetainedParticipantGraphExecutable::generalBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,std::size_t slots){
-    return definitionBOM(host,gpu,slots,DefinitionPurpose::RetainedParticipant);
+PhysicalMemoryPlan RetainedParticipantGraphExecutable::generalBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,
+    const NativeGraphObjectGeometry& graphObjects,std::size_t slots){
+    return definitionBOM(host,gpu,slots,DefinitionPurpose::RetainedParticipant,graphObjects);
 }
 PhysicalMemoryPlan RetainedParticipantGraphExecutable::nativeStorageBOM(const PooledNativeOwnerGraphProgram& program,
-    PhysicalMemoryResource host,PhysicalMemoryResource gpu){
+    PhysicalMemoryResource host,PhysicalMemoryResource gpu,const NativeGraphObjectGeometry& graphObjects){
     if(program.geometry().owner!=PhysicalMemoryAllocatorIdentity{gpu.world_rank,gpu.device} || host.world_rank!=gpu.world_rank)
         throw std::invalid_argument("Native storage General BOM changed original owner/rank resources");
-    return definitionBOM(host,gpu,1,DefinitionPurpose::NativeStorageGeneral);
+    return definitionBOM(host,gpu,1,DefinitionPurpose::NativeStorageGeneral,graphObjects);
 }
-PhysicalMemoryPlan RetainedParticipantGraphExecutable::calibrationBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu){
-    PhysicalMemoryPlanBuilder plan(definitionBOM(host,gpu,1,DefinitionPurpose::PreparedServiceCalibration));
+PhysicalMemoryPlan RetainedParticipantGraphExecutable::calibrationBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,
+    const NativeGraphObjectGeometry& graphObjects){
+    PhysicalMemoryPlanBuilder plan(definitionBOM(host,gpu,1,DefinitionPurpose::PreparedServiceCalibration,graphObjects));
     plan.add(host,PhysicalMemoryOwner::NativePreparationGraphExecutable,PreparedServiceCalibrationSlot::physicalBytes());
     return plan.build();
 }
 PhysicalMemoryPlan RetainedParticipantGraphExecutable::definitionBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,
-    std::size_t slots,DefinitionPurpose purpose){
+    std::size_t slots,DefinitionPurpose purpose,const NativeGraphObjectGeometry& graphObjects){
     const auto owner=purpose==DefinitionPurpose::PreparedServiceCalibration
         ? PhysicalMemoryOwner::NativePreparationGraphExecutable
         : purpose==DefinitionPurpose::NativeStorageGeneral ? PhysicalMemoryOwner::NativeStorageGraphExecutable
@@ -169,7 +171,8 @@ PhysicalMemoryPlan RetainedParticipantGraphExecutable::definitionBOM(PhysicalMem
     const auto hostUnit=GPUGraphMemoryContract::generalHostReservationBytesPerExecutable(gpu.device);
     const auto deviceUnit=GPUGraphMemoryContract::reservationBytesPerExecutable(gpu.device,GPUGraphExecutableClass::General);
     const auto ownerBytes=CPUStorageRoot<std::byte>(sizeof(RetainedParticipantGraphExecutable),owner,DeviceId::cpu()).physicalBytes();
-    const auto nativeBytes=nativeGraphCaptureObjectBytes(gpu.device);
+    // The owner's adapter size, not this binary's: gpu may be another rank's.
+    const auto nativeBytes=graphObjects.bytes({gpu.world_rank,gpu.device});
     if(!nativeBytes || ownerBytes>std::numeric_limits<std::size_t>::max()-nativeBytes ||
        ownerBytes+nativeBytes>std::numeric_limits<std::size_t>::max()-sizeof(RecordingCapture) ||
        hostUnit>std::numeric_limits<std::size_t>::max()-(ownerBytes+nativeBytes+sizeof(RecordingCapture)))
@@ -217,10 +220,10 @@ PhysicalMemoryPlan RetainedParticipantGraphExecutable::hostBOMWithAllowance(cons
     return plan.build();
 }
 PhysicalMemoryPlan RetainedParticipantGraphExecutable::hostBOM(const PooledRemoteGraphProgram& program,
-    PhysicalMemoryResource host,PhysicalMemoryResource gpu){
+    PhysicalMemoryResource host,PhysicalMemoryResource gpu,const NativeGraphObjectGeometry& graphObjects){
     const auto allowance=NativeAuxiliaryResourceCatalog::allowance(program.geometry().owner.device.type,
         NativeAuxiliaryResourceProgram::pooledRemoteOwner(program));
-    return hostBOMWithAllowance(program,host,gpu,allowance,nativeGraphCaptureObjectBytes(program.geometry().owner.device));
+    return hostBOMWithAllowance(program,host,gpu,allowance,graphObjects.bytes(program.geometry().owner));
 }
 std::shared_ptr<RetainedParticipantGraphExecutable> RetainedParticipantGraphExecutable::create(
     const PreparedGPUContextUsePermit& original,void* stream,const PooledRemoteGraphProgram& program){

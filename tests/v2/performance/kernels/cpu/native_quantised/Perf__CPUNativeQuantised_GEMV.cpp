@@ -430,6 +430,7 @@ namespace
         {"Q4_0"}, {"Q4_1"}, {"Q5_0"}, {"Q5_1"},
         {"Q8_0"}, {"Q8_1"}, {"Q8_K"}, {"Q2_K"}, {"Q3_K"},
         {"Q4_K"}, {"Q5_K"}, {"Q6_K"}, {"IQ4_NL"},
+        {"MXFP4"},
         {"IQ4_XS"}, {"IQ3_S"}, {"IQ3_XXS"}, {"IQ2_S"},
         {"IQ2_XS"}, {"IQ2_XXS"}, {"IQ1_S"}, {"IQ1_M"},
     };
@@ -1799,6 +1800,8 @@ namespace
             return TestTensorFactory::createQ6_KRandom({N, K});
         if (fmt_name == "IQ4_NL")
             return TestTensorFactory::createIQ4_NLRandom({N, K});
+        if (fmt_name == "MXFP4")
+            return TestTensorFactory::createMXFP4Random({N, K});
         if (fmt_name == "IQ4_XS")
             return TestTensorFactory::createIQ4_XSRandom({N, K});
         if (fmt_name == "IQ3_S")

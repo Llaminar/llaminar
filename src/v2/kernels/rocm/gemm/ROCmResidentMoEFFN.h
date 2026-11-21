@@ -83,9 +83,28 @@ public:
         (1u<<kNativeQuantisedExpandedInt8MinCodebook);
     static constexpr std::uint32_t linear_packed_and_subscale=(1u<<0)|(1u<<6)|(1u<<8)|(1u<<9)|(1u<<10);
     static constexpr std::uint32_t iq3_and_iq4_grid=(1u<<4)|(1u<<11)|(1u<<12)|
-        (1u<<kNativeQuantisedIQ4XSSourceScaleCodebook);
+        (1u<<kNativeQuantisedIQ4XSSourceScaleCodebook)|(1u<<kNativeQuantisedMXFP4Codebook);
     static constexpr std::uint32_t iq1_and_iq2_grid=(1u<<13)|(1u<<14)|(1u<<15)|(1u<<16)|(1u<<17);
     static constexpr std::uint32_t all_decoders=affine_and_byte|linear_packed_and_subscale|iq3_and_iq4_grid|iq1_and_iq2_grid;
+
+    /**
+     * The linear | iq3/iq4 | iq1/iq2 union compiles without MXFP4: its decode
+     * arm takes that union's router kernel one register over the gfx906
+     * budget. An envelope needing MXFP4 with exactly these groups is covered
+     * by the complete union instead.
+     */
+    static constexpr unsigned mxfp4_excluded_groups=2u|4u|8u;
+
+    /**
+     * @param groups Nonempty union of the four decoder-structure bits.
+     * @return Physical decoder mask compiled for that family.
+     */
+    static constexpr std::uint32_t familyMaskFor(unsigned groups) noexcept
+    {
+        const std::uint32_t mask=((groups&1)?affine_and_byte:0)|((groups&2)?linear_packed_and_subscale:0)|
+            ((groups&4)?iq3_and_iq4_grid:0)|((groups&8)?iq1_and_iq2_grid:0);
+        return groups==mxfp4_excluded_groups?mask&~(1u<<kNativeQuantisedMXFP4Codebook):mask;
+    }
 
     /**
      * @brief Compute one explicit compiled family mask at compile time.
@@ -95,8 +114,7 @@ public:
     template<unsigned Groups> static constexpr std::uint32_t familyMask() noexcept
     {
         static_assert(Groups>0&&Groups<16);
-        return ((Groups&1)?affine_and_byte:0)|((Groups&2)?linear_packed_and_subscale:0)|
-            ((Groups&4)?iq3_and_iq4_grid:0)|((Groups&8)?iq1_and_iq2_grid:0);
+        return familyMaskFor(Groups);
     }
     /**
      * @brief Select the unique smallest group union from complete immutable execution envelopes.
@@ -108,8 +126,11 @@ public:
     {
         if(!required||(required&~all_decoders))
             throw std::invalid_argument("Resident FFN decoder registry requires a complete supported execution envelope");
-        const auto groups=static_cast<std::uint8_t>((required&affine_and_byte?1:0)|
+        auto groups=static_cast<std::uint8_t>((required&affine_and_byte?1:0)|
             (required&linear_packed_and_subscale?2:0)|(required&iq3_and_iq4_grid?4:0)|(required&iq1_and_iq2_grid?8:0));
+        // Smallest compiled family covering the envelope: the group union, or
+        // the complete union where that family omits a required decoder.
+        if(required&~familyMaskFor(groups))groups=15;
         return ResidentMoEFFNDecoderProgram(required,groups);
     }
     /** @return Original exact required physical envelope, including authenticated promotions. */
@@ -117,9 +138,7 @@ public:
     /** @return Nonempty decoder-structure union selecting one of fifteen compiled families. */
     std::uint8_t groups() const noexcept {return groups_;}
     /** @return Superset compiled for this program; exact role envelopes remain independently enforced. */
-    std::uint32_t executionMask() const noexcept
-    {return ((groups_&1)?affine_and_byte:0)|((groups_&2)?linear_packed_and_subscale:0)|
-        ((groups_&4)?iq3_and_iq4_grid:0)|((groups_&8)?iq1_and_iq2_grid:0);}
+    std::uint32_t executionMask() const noexcept {return familyMaskFor(groups_);}
 private:
     /** @brief Retain only the validated immutable physical envelope and its unique group cover. */
     ResidentMoEFFNDecoderProgram(std::uint32_t required,std::uint8_t groups):required_(required),groups_(groups) {}

@@ -83,7 +83,7 @@ void planWeight(LoadOrchestrator &pool,const Request &r,DeviceId device)
     pool.addDevice(device.ordinal);
     const auto &f=native_quantised_formats::Q8_0;
     pool.planWeightForOwner(device.ordinal,r.source_tensor,r.n,r.k,f.payload_bytes,
-        canonicalDeviceVnniFormat(f).is_asymmetric,f.has_emins,std::size_t(r.n)*(r.k/32)*34,
+        canonicalDeviceVnniFormat(f).is_asymmetric,f.has_emins, NativeQuantisedScalePlaneWidth::FP16Word,std::size_t(r.n)*(r.k/32)*34,
         PhysicalMemoryOwner::PrimaryModelWeights);
 }
 /**
@@ -371,8 +371,8 @@ private:
     /** @brief Check the complete materialized graph family against its exact admitted owner. */
     void checkGraphMemory() const
     {
-        const auto bytes=oracle->residentMemoryBytes()+restore->residentMemoryBytes()+compute->residentMemoryBytes()+
-            (timed_parent?timed_parent->residentMemoryBytes():0);
+        const auto bytes=graphFamilyGrowth(GPUGraphMemoryContract::observationScope(memory->backing(d.device)),
+            {oracle.get(),restore.get(),compute.get(),timed_parent.get()});
         checked(GPUGraphMemoryContract::acceptsFamilyObservation(d.device,bytes,d.graph_bytes),"Recorded graph family exceeded original BOM");
     }
     /**

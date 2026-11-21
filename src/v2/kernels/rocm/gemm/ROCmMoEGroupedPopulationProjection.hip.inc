@@ -207,7 +207,7 @@ __device__ __forceinline__ void populationProjectionBody(const MoEGroupedWmmaArg
                     const size_t linear = static_cast<size_t>(kb)*N + col;
                     uint32_t raw[Traits::payload_dwords];
                     load_payload<Traits::payload_bytes>(desc.payload + linear*Traits::payload_bytes,raw);
-                    const uint16_t scale = static_cast<const uint16_t *>(desc.scales)[linear];
+                    const uint16_t scale = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(static_cast<const uint16_t *>(desc.scales), linear);
                     const uint16_t aux = static_cast<const uint16_t *>(desc.mins)[linear];
                     int decoded[8]; decode_block<FMT>(raw,decoded);
                     const auto weight = rocm_native_quantised_load_dual_weight_scales<FMT>(scale,aux);
@@ -280,7 +280,7 @@ __device__ __forceinline__ void populationProjectionBody(const MoEGroupedWmmaArg
                 if (owns_column)
                 {
                     load_payload<Traits::payload_bytes>(desc.payload + linear*Traits::payload_bytes,raw);
-                    scale = static_cast<const uint16_t *>(desc.scales)[linear];
+                    scale = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(static_cast<const uint16_t *>(desc.scales), linear);
                     if constexpr (Traits::needs_aux_compute) aux = static_cast<const uint16_t *>(desc.mins)[linear];
                     if constexpr (Traits::is_dual_scale_asym) minima = static_cast<const uint32_t *>(desc.emins)[linear];
                 }
@@ -395,7 +395,7 @@ __device__ __forceinline__ void populationProjectionBody(const MoEGroupedWmmaArg
                     if (n0+col < N)
                     {
                         load_payload<Traits::payload_bytes>(desc.payload + linear*Traits::payload_bytes,raw);
-                        scale = static_cast<const uint16_t *>(desc.scales)[linear];
+                        scale = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(static_cast<const uint16_t *>(desc.scales), linear);
                         if constexpr (Traits::needs_aux_compute) aux = static_cast<const uint16_t *>(desc.mins)[linear];
                         if constexpr (Traits::is_dual_scale_asym) minima = static_cast<const uint32_t *>(desc.emins)[linear];
                     }

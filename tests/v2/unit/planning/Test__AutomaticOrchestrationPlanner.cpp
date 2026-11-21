@@ -27,6 +27,7 @@
 #include <set>
 #include <omp.h>
 #include <thread>
+#include "fixtures/backends/NativeGraphObjectGeometryRecordedAccess.h"
 
 using namespace llaminar2;
 
@@ -79,7 +80,8 @@ namespace
     OrchestrationCandidateMemoryPolicy memory()
     {
         return {.prefill_bucket_rows = {32, 64}, .minimum_prefill_sequence_rows = 1,
-            .maximum_cached_prefill_buckets = 8, .retained_host_services = test::planningHostServiceBudgets(2)};
+            .maximum_cached_prefill_buckets = 8, .retained_host_services = test::planningHostServiceBudgets(2),
+            .native_graph_objects = test::NativeGraphObjectGeometryRecordedAccess::uniform()};
     }
 
     /** @return Explicit recorded declarations for synthetic hardware; never query native providers. */
@@ -90,7 +92,8 @@ namespace
         for(const auto& rank:observed.ranks){
             auto& declarations=result[rank.rank];
             for(const auto& gpu:rank.gpus)declarations.push_back({{gpu.type,gpu.local_device_id},gpu.uuid,
-                program.stackBytes(),program.guardBytes(),program.pageBytes(),64,64});
+                program.stackBytes(),program.guardBytes(),program.pageBytes(),64,64,
+                1024 /* Recorded owner's graph adapter size, independent of this build's backends. */});
         }
         return result;
     }

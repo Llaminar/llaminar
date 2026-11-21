@@ -45,6 +45,7 @@
 #include "kernels/common/MoERuntimeDescriptorLaunch.h"
 #include "kernels/common/NativeTileCompletion.cuh"
 #include "kernels/rocm/common/ROCmSignedDot4.h"
+#include "tensors/NativeQuantisedScalePlane.h"
 #include "kernels/rocm/moe/ROCmMoEWaveReduction.h"
 #include "kernels/rocm/moe/ROCmRouterQ8Prefill.h"
 #include "backends/rocm/ROCmHardwareMetadata.h"
@@ -7749,6 +7750,7 @@ namespace
         {
         case 0:
         case 4:
+        case llaminar2::kNativeQuantisedMXFP4Codebook:
             payload_bytes = 16u;
             return true;
         case llaminar2::kNativeQuantisedIQ4XSSourceScaleCodebook:
@@ -10767,11 +10769,10 @@ namespace
         if (!rebalance_projection_format(desc, payload_bytes_per_block, is_asymmetric, has_emins))
             return 0ULL;
         const unsigned long long blocks = rebalance_block_count(desc);
-        const unsigned long long scales_bytes = blocks * sizeof(uint16_t);
+        const auto planes = llaminar2::NativeQuantisedMetadataPlaneBytes::of(
+            blocks, desc.codebook_id, is_asymmetric != 0u, has_emins != 0u);
         return blocks * static_cast<unsigned long long>(payload_bytes_per_block) +
-               scales_bytes +
-               (is_asymmetric != 0u ? scales_bytes : 0ULL) +
-               (has_emins != 0u ? blocks * sizeof(uint32_t) : 0ULL);
+               planes.scales + planes.secondary + planes.emins;
     }
 
     __device__ __forceinline__ unsigned long long rebalance_expert_payload_bytes(
@@ -10804,11 +10805,12 @@ namespace
         const unsigned long long blocks = rebalance_block_count(src);
         const unsigned long long payload_bytes =
             blocks * static_cast<unsigned long long>(payload_bytes_per_block);
-        const unsigned long long scales_bytes = blocks * sizeof(uint16_t);
-        const unsigned long long mins_bytes =
-            is_asymmetric != 0u ? scales_bytes : 0ULL;
-        const unsigned long long emins_bytes =
-            has_emins != 0u ? blocks * sizeof(uint32_t) : 0ULL;
+        // Packed transfer layout uses the same plane widths as allocation.
+        const auto planes = llaminar2::NativeQuantisedMetadataPlaneBytes::of(
+            blocks, src.codebook_id, is_asymmetric != 0u, has_emins != 0u);
+        const unsigned long long scales_bytes = planes.scales;
+        const unsigned long long mins_bytes = planes.secondary;
+        const unsigned long long emins_bytes = planes.emins;
 
         unsigned long long offset = 0ULL;
         rebalance_copy_bytes(src.payload, payload + offset, payload_bytes);
@@ -10842,11 +10844,12 @@ namespace
         const unsigned long long blocks = rebalance_block_count(dst);
         const unsigned long long payload_bytes =
             blocks * static_cast<unsigned long long>(payload_bytes_per_block);
-        const unsigned long long scales_bytes = blocks * sizeof(uint16_t);
-        const unsigned long long mins_bytes =
-            is_asymmetric != 0u ? scales_bytes : 0ULL;
-        const unsigned long long emins_bytes =
-            has_emins != 0u ? blocks * sizeof(uint32_t) : 0ULL;
+        // Packed transfer layout uses the same plane widths as allocation.
+        const auto planes = llaminar2::NativeQuantisedMetadataPlaneBytes::of(
+            blocks, dst.codebook_id, is_asymmetric != 0u, has_emins != 0u);
+        const unsigned long long scales_bytes = planes.scales;
+        const unsigned long long mins_bytes = planes.secondary;
+        const unsigned long long emins_bytes = planes.emins;
 
         unsigned long long offset = 0ULL;
         rebalance_copy_bytes(payload + offset, dst.payload, payload_bytes);

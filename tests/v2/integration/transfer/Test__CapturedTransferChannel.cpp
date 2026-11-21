@@ -482,7 +482,7 @@ namespace
             if (original)
             {
                 const auto graph_bom = RetainedParticipantGraphExecutable::generalBOM(
-                    resourceFor(DeviceId::cpu()), resource, 2);
+                    resourceFor(DeviceId::cpu()), resource,NativeGraphObjectGeometry::localOwner({(resource).world_rank,(resource).device}), 2);
                 for (const auto& row : graph_bom.resources()) builder.add(row);
             }
             else
@@ -754,13 +754,15 @@ namespace
                     // Native graph pools grow in slabs. Attest the complete
                     // retained family, never attribute one slab to one slot.
                     EXPECT_TRUE(GPUGraphMemoryContract::acceptsFamilyObservation(first,
-                        first_graphs[0]->residentMemoryBytes() + first_graphs[1]->residentMemoryBytes(),
+                        graphFamilyGrowth(GPUGraphMemoryContract::observationScope(authority->backing(first)),
+                            {first_graphs[0].get(), first_graphs[1].get()}),
                         2 * GPUGraphMemoryContract::reservationBytesPerExecutable(first)))
                         << "source family observed=" << first_graphs[0]->residentMemoryBytes()
                         << "+" << first_graphs[1]->residentMemoryBytes() << " admitted="
                         << 2 * GPUGraphMemoryContract::reservationBytesPerExecutable(first);
                     EXPECT_TRUE(GPUGraphMemoryContract::acceptsFamilyObservation(second,
-                        second_graphs[0]->residentMemoryBytes() + second_graphs[1]->residentMemoryBytes(),
+                        graphFamilyGrowth(GPUGraphMemoryContract::observationScope(authority->backing(second)),
+                            {second_graphs[0].get(), second_graphs[1].get()}),
                         2 * GPUGraphMemoryContract::reservationBytesPerExecutable(second)))
                         << "peer family observed=" << second_graphs[0]->residentMemoryBytes()
                         << "+" << second_graphs[1]->residentMemoryBytes() << " admitted="
@@ -1630,7 +1632,7 @@ void pipelineActivationCompletedFanoutReplay(DeviceType family)
             plan.add(original->resource(device), PhysicalMemoryOwner::ExecutionWorkspace, storage_bytes + count_bytes);
             plan.add(original->resource(device), PhysicalMemoryOwner::LocalCollective, native_bom.perDeviceBytes());
             const auto graph_bom = RetainedParticipantGraphExecutable::generalBOM(
-                original->resource(DeviceId::cpu()), original->resource(device), 1);
+                original->resource(DeviceId::cpu()), original->resource(device),NativeGraphObjectGeometry::localOwner({(original->resource(device)).world_rank,(original->resource(device)).device}), 1);
             for (const auto &row : graph_bom.resources()) plan.add(row);
         }
         original->admit(plan.build());

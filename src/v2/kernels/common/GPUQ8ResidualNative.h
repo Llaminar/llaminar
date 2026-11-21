@@ -86,6 +86,9 @@ namespace llaminar2
         case 24:
             visitor.template operator()<24>();
             return;
+        case kNativeQuantisedMXFP4Codebook:
+            visitor.template operator()<kNativeQuantisedMXFP4Codebook>();
+            return;
         default:
             throw std::invalid_argument("TwoTerm GPU execution codebook has no compiled native projection");
         }

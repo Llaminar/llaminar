@@ -257,7 +257,7 @@ namespace llaminar2
             std::unique_ptr<PlanningNativeGPUClockBuffer> pair_clock;
             std::unique_ptr<PlanningCapturedGPUClockSampler> pair_timer;
             std::unique_ptr<IGPUGraphCapture> graph;
-            size_t graph_growth = 0;
+            GPUGraphMemoryGrowth graph_growth;
             void *stream = nullptr;
 
             /** @brief Claim the complete sample family before creating any GPU payload. */
@@ -454,10 +454,8 @@ namespace llaminar2
                     // materialization. Preparation executes no collective body.
                     onWorkers(request, collective_owner.get(), [&](size_t index, auto &) {
                         auto &owner=*participants[index];owner.collective_timing->prepare(memory);
-                        const auto growth=owner.collective_timing->residentMemoryBytes();
-                        if(growth>std::numeric_limits<size_t>::max()-owner.graph_growth)
-                            throw std::overflow_error("Planning native LocalTP graph-family extent overflow");
-                        owner.graph_growth+=growth;
+                        owner.graph_growth.add(owner.collective_timing->residentMemoryBytes(),
+                            GPUGraphMemoryContract::observationScope(memory->backing(request.devices()[index])));
                     });
                     if(gather && validation==PlanningMeasurementValidation::ObservePayloads) {
                         // Diagnostic-only late publication defeats capture-time
@@ -521,10 +519,10 @@ namespace llaminar2
                     const auto device = request.devices()[index];
                     const size_t admitted = 3 * phase_rows.size() * PlanningExecutionMeasurement::kPreparedGraphCount *
                         GPUGraphMemoryContract::reservationBytesPerExecutable(device);
-                    const size_t observed = participants[index]->graph_growth;
+                    const GPUGraphMemoryGrowth observed = participants[index]->graph_growth;
                     require(GPUGraphMemoryContract::acceptsFamilyObservation(device, observed, admitted),
                         "native graph family exceeded its physical admission: device=" + device.toString() +
-                        " observed_pool_growth_bytes=" + std::to_string(observed) +
+                        " observed_pool_growth_bytes=" + std::to_string(observed.bytes) +
                         " admitted_family_bytes=" + std::to_string(admitted) +
                         " hidden_width=" + std::to_string(request.hiddenWidth()) +
                         " prefill_rows=" + std::to_string(request.prefillRows()) +
@@ -609,7 +607,8 @@ namespace llaminar2
                                 require(graph->prepareRuntimeContextStorage(memory) && graph->instantiate(),
                                     "physical pair executable materialization failed");
                                 require(GPUGraphMemoryContract::acceptsFamilyObservation(request.devices()[index],
-                                    graph->residentMemoryBytes(),
+                                    GPUGraphMemoryGrowth{graph->residentMemoryBytes(),
+                                        GPUGraphMemoryContract::observationScope(memory->backing(request.devices()[index]))},
                                     (mode == PlanningLocalTPMeasurementMode::NativeCollective ? PlanningExecutionMeasurement::kPreparedGraphCount : 1) *
                                         GPUGraphMemoryContract::reservationBytesPerExecutable(request.devices()[index])),
                                     "physical pair executable exceeded admitted graph family");

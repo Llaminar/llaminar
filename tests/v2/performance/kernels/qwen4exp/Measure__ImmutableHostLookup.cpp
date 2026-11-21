@@ -168,7 +168,7 @@ public:
         for (const auto& contribution : {
                 serviceDeclarations->bom(ioInstance, hr),
                 NativeOrderingEventGroup::bom(NativeOrderingEventProgram::lookupSubmissionRetirement(), hr, gr),
-                RetainedParticipantGraphExecutable::generalBOM(hr, gr, 2)})
+                RetainedParticipantGraphExecutable::generalBOM(hr, gr,NativeGraphObjectGeometry::localOwner({(gr).world_rank,(gr).device}), 2)})
             for (const auto& resource : contribution.resources()) bom.add(resource);
         session.admit(bom.build());
         memory = session.memory();

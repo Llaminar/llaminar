@@ -23,6 +23,7 @@
 #include "backends/GPUDeviceContextPool.h"
 #include "backends/IBackend.h"
 #include "backends/IWorkerGPUContext.h"
+#include "tensors/NativeQuantisedScalePlane.h"
 #include "utils/Logger.h"
 #include "utils/PerfStatsCollector.h"
 
@@ -128,10 +129,12 @@ namespace llaminar2
                 manifest.gpu_is_asymmetric != descriptor.is_asymmetric || manifest.gpu_has_emins != descriptor.has_emins)
                 return false;
             const auto blocks = std::uint64_t(owned.rows) * (owned.columns / 32);
+            const auto planes = NativeQuantisedMetadataPlaneBytes::of(
+                blocks, descriptor.codebook_id, descriptor.is_asymmetric, descriptor.has_emins);
             return descriptor.vnni_bytes == blocks * descriptor.payload_bytes_per_block &&
-                descriptor.scales_bytes == blocks * sizeof(std::uint16_t) &&
-                descriptor.mins_bytes == (descriptor.is_asymmetric ? blocks * sizeof(std::uint16_t) : 0u) &&
-                descriptor.emins_bytes == (descriptor.has_emins ? blocks * sizeof(std::uint32_t) : 0u);
+                descriptor.scales_bytes == planes.scales &&
+                descriptor.mins_bytes == planes.secondary &&
+                descriptor.emins_bytes == planes.emins;
         }
 
         /** @brief Compare the complete semantic chunk header. */

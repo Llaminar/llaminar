@@ -112,7 +112,7 @@ namespace
         for (const auto size : device_bytes)
             plan.add(original->resource(parameter.device), PhysicalMemoryOwner::ActivationTransportStaging, size);
         const auto graph_bom = RetainedParticipantGraphExecutable::generalBOM(
-            original->resource(DeviceId::cpu()), original->resource(parameter.device), 1);
+            original->resource(DeviceId::cpu()), original->resource(parameter.device),NativeGraphObjectGeometry::localOwner({(original->resource(parameter.device)).world_rank,(original->resource(parameter.device)).device}), 1);
         for (const auto &line : graph_bom.resources()) plan.add(line);
         original->admit(plan.build());
         {

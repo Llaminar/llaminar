@@ -679,6 +679,7 @@ namespace llaminar2
                     inventoryMemory(inventory, device);
                 DevicePlanConfig config;
                 config.native_ordering_events=input.native_ordering_events;
+                config.native_graph_objects=input.native_graph_objects;
                 config.native_pipeline_maintenance_budget = input.native_pipeline_maintenance_budget && device.is_gpu() &&
                     role == DeviceExecutionMemoryRole::ContinuationGraph;
                 config.world_rank = rank_plan.rank;
@@ -1720,10 +1721,22 @@ namespace llaminar2
                 {
                     prepared_service_bytes = probe->second;
                     const auto [host_total, host_available] = inventoryMemory(inventory, DeviceId::cpu());
+                    // The planning root may lack this rank's backend: price its
+                    // adapter from the owner's declaration. A live native source
+                    // means this process owns the device and compiles its backend.
+                    NativeGraphObjectGeometry graph_objects;
+                    const auto declared = std::find_if(input.native_context_budgets.begin(),
+                        input.native_context_budgets.end(), [&](const auto &key) { return key.device == device; });
+                    if (declared != input.native_context_budgets.end())
+                        graph_objects.publish({rank_plan.rank, device}, declared->graph_capture_object_bytes);
+                    else if (rank_plan.runtime.native_context_preparation)
+                        graph_objects = NativeGraphObjectGeometry::localOwner({rank_plan.rank, device});
+                    else
+                        graph_objects = input.native_graph_objects;
                     const auto service_graph_bom = RetainedParticipantGraphExecutable::calibrationBOM(
                         {.world_rank = rank_plan.rank, .device = DeviceId::cpu(),
                          .total_bytes = host_total, .admission_available_bytes = usableMemory(host_available, DeviceId::cpu(), input)},
-                        resource);
+                        resource, graph_objects);
                     for (const auto& contribution : service_graph_bom.resources())
                         physical_plan_builder.add(contribution);
                 }

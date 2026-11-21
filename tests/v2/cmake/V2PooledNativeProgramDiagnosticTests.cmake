@@ -50,13 +50,24 @@ if(NOT V2_PERF_TESTS_ONLY)
         )
         foreach(_native_program_case IN LISTS _native_program_cases)
             set(_native_program_gate "V2_Integration_PooledNativeProgram_${_native_program_case}Replay")
-            add_v2_test(${_native_program_gate}
+            # Single-family cases exist only when that family is compiled; the
+            # omission is reported by add_v2_test, and the binary omits the
+            # same cases, so the registration coverage partition stays exact.
+            set(_native_program_family GPU)
+            if(_native_program_case MATCHES "CUDA")
+                set(_native_program_family CUDA)
+            elseif(_native_program_case MATCHES "ROCm")
+                set(_native_program_family ROCM)
+            endif()
+            add_v2_test(${_native_program_gate} REQUIRES_BACKEND ${_native_program_family}
                 COMMAND $<TARGET_FILE:v2_test_pooled_native_program_diagnostic>
                     --gtest_filter=PooledNativeProgramDiagnostic.${_native_program_case} --gtest_repeat=20
                 LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Ngram;Ownership;Replay;Regression"
                 MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
                 ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1" "GTEST_DEATH_TEST_STYLE=threadsafe")
-            list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_native_program_gate})
+            if(TEST ${_native_program_gate})
+                list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_native_program_gate})
+            endif()
         endforeach()
         add_v2_test(V2_Unit_PooledNativeProgramRegistrationCoverage
             COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/unit/scripts/test_native_program_registration.py" --self-test

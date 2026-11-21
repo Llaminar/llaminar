@@ -33,6 +33,7 @@
 
 #include "kernels/rocm/gemm/ROCmQuantisedGemmKernel.h"
 #include "tensors/Tensors.h"
+#include "tensors/NativeQuantisedScalePlane.h"
 #include "utils/Logger.h"
 #include "../../../utils/TestTensorFactory.h"
 
@@ -68,6 +69,9 @@ namespace
         {"IQ4_NL", 4, 16, false, false,
          [](size_t N, size_t K)
          { return TestTensorFactory::createIQ4_NLRandom({N, K}); }},
+        {"MXFP4", llaminar2::kNativeQuantisedMXFP4Codebook, 16, false, false,
+         [](size_t N, size_t K)
+         { return TestTensorFactory::createMXFP4Random({N, K}); }},
         {"Q4_1", 5, 16, true, false,
          [](size_t N, size_t K)
          { return TestTensorFactory::createQ4_1Random({N, K}); }},
@@ -206,8 +210,10 @@ namespace
             << " (expected " << expected_payload
             << ", got " << packed.native_quantised_payload.size() << ")";
 
-        // Verify scales size: blocks_per_row × N
-        EXPECT_EQ(packed.native_quantised_scales.size(), blocks_per_row * N)
+        // Verify scales size: one primary entry per block, held in 16-bit
+        // storage words. Native MXFP4's E8M0 bytes pack two per word.
+        EXPECT_EQ(packed.native_quantised_scales.size(),
+            llaminar2::nativeQuantisedScalePlaneStorageWords(fmt.expected_codebook_id, blocks_per_row * N))
             << fmt.name << ": scales size mismatch";
 
         // Verify physical secondary-plane presence using independent fixture literals.

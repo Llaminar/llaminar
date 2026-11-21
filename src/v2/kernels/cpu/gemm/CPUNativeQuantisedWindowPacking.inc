@@ -150,7 +150,8 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     .blocks_per_row=(source_k+31)/32,.payload_bytes=format.payload_bytes,
                     .payload_array=payload,.scales_array=primary,.mins_array=secondary,
                     .emins_array=out.usesCompactMultiScale()?emins:nullptr,
-                    .destination_block_origin=input_first,.destination_block_count=count};
+                    .destination_block_origin=input_first,.destination_block_count=count,
+                    .primary_layout=out.primaryScaleLayout()};
                 for(int b=0;b<count;++b) {
                     source.packVnniBlock(context,actual_row,0,input_first+b);
                     if(expanded)decode_native_block(format.codebook_id,payload+size_t(b)*format.payload_bytes,decoded+b*32);
@@ -198,6 +199,11 @@ inline void appendNativeWeightGroups(const IINT8Unpackable& source,const NativeQ
                     uint16_t scale=0,minimum=0;
                     if(out.usesNibbleLUTSourceScale() || out.usesIQ3SExpandedSourceScale()) {
                         scale=primary[b];minimum=secondary[b];
+                    } else if(nibble && format.codebook_id==kNativeQuantisedMXFP4Codebook) {
+                        // packVnniBlock already validated the block and published the unit's
+                        // exact scale word (BF16 power of two, out.primaryScaleLayout(); 0 for
+                        // ggml all-zero blocks). Re-rounding the FP32 source scale would be lossy.
+                        scale=primary[b];
                     } else if(nibble) {
                         scale=fp32_to_fp16(source.get_block_scale(actual_row,input_first+b));
                         minimum=fp32_to_fp16(source.get_block_min(actual_row,input_first+b));

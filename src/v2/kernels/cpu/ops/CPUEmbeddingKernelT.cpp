@@ -415,7 +415,23 @@ namespace llaminar2
 
             alignas(64) float row_buffer[kMaxStackEmbeddingWidth];
             auto *output_bytes = static_cast<uint8_t *>(output->raw_mutable_data());
-            const size_t row_bytes = output->size_bytes() / static_cast<size_t>(num_tokens);
+            /*
+             * Graph outputs are arena roots sized for the resident row capacity,
+             * not for this invocation's token count. The physical row pitch is
+             * therefore storage bytes divided by the tensor's row capacity;
+             * dividing by num_tokens wrote every row after the first at a
+             * capacity-dependent offset whenever M < capacity.
+             */
+            const size_t output_rows = output->rows();
+            if (output_rows < static_cast<size_t>(num_tokens) ||
+                output->cols() != static_cast<size_t>(d_model) || output->size_bytes() % output_rows != 0)
+            {
+                LOG_ERROR("[CPUEmbeddingKernelT] Floating embedding output shape "
+                          << output_rows << "x" << output->cols() << " cannot hold "
+                          << num_tokens << "x" << d_model << " rows");
+                return false;
+            }
+            const size_t row_bytes = output->size_bytes() / output_rows;
 
             for (int row = 0; row < num_tokens; ++row)
             {

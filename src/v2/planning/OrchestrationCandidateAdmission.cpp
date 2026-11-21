@@ -192,6 +192,7 @@ namespace llaminar2
                     .retained_host_services=projectPlanningHostServiceBudget(policy.retained_host_services, candidate.membership, 0),
                     .native_context_budgets=policy.native_context_budgets.contains(candidate.membership.discoveryRanks().at(0))?policy.native_context_budgets.at(candidate.membership.discoveryRanks().at(0)):std::vector<PlanningNativeContextDeclaration>{},
                     .require_native_context_budgets=policy.require_native_context_budgets,
+                    .native_graph_objects=policy.native_graph_objects.projectedOnto(candidate.membership.discoveryRanks()),
                     .source_preparation=preparation}));
             std::vector<DevicePlanConfig> devices;
             for (const auto &stage : pipeline->stages())
@@ -227,7 +228,8 @@ namespace llaminar2
                     if(keys && key!=keys->end())cfg.planning_native_context_birth=*key;
                     else if(policy.require_native_context_budgets)throw std::invalid_argument("Automatic dense admission omitted native birth evidence");
                 }
-                for(auto& cfg:local)cfg.native_ordering_events=policy.native_ordering_events;
+                const auto graph_objects=policy.native_graph_objects.projectedOnto(candidate.membership.discoveryRanks());
+                for(auto& cfg:local){cfg.native_ordering_events=policy.native_ordering_events;cfg.native_graph_objects=graph_objects;}
                 rank.runtime.retained_host_services = MemoryPlanner::declareRetainedHostServices(
                     profile, local, rank.rank, nullptr, inventory,
                     projectPlanningHostServiceBudget(policy.retained_host_services, candidate.membership, rank.rank));
@@ -313,6 +315,7 @@ namespace llaminar2
                             ? CPUStoragePlacement::onNode(ranks[index].numa_node):CPUStoragePlacement::local()},
                         candidate_rows);
                     inputs.local_capacity.require_native_context_budgets=policy.require_native_context_budgets;
+                    inputs.local_capacity.native_graph_objects=policy.native_graph_objects.projectedOnto(candidate.membership.discoveryRanks());
                     const int discovery=candidate.membership.discoveryRanks().at(index);
                     const auto birth=policy.native_context_budgets.find(discovery);
                     if(birth!=policy.native_context_budgets.end())inputs.local_capacity.native_context_budgets=birth->second;

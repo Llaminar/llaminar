@@ -58,6 +58,7 @@
 #include "../../../tensors/NativeQuantisedFormatInfo.h"
 #include "../../../utils/DebugEnv.h"
 #include "ROCmNativeQuantisedDecodeEquivalentMath.h"
+#include "ROCmNativeQuantisedNibbleLUT.h"
 #include "ROCmNativeQuantisedGemmShard.h"
 #include "ROCmDenseProductionPrefillOverlay.h"
 #include "ROCmNativeQuantisedArchitecture.h"
@@ -803,7 +804,7 @@ void native_quantised_gemm_kernel(
             {
                 const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
                 load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-                b_scale_staging = d_block_scales[linear];
+                b_scale_staging = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
                 if constexpr (Traits::needs_aux_compute)
                     b_aux_staging = d_block_mins[linear];
                 if constexpr (Traits::is_dual_scale_asym) {
@@ -906,7 +907,7 @@ void native_quantised_gemm_kernel(
             const int block_global = tile_block_base + b_load_block;
             const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
             load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-            b_scale_staging = d_block_scales[linear];
+            b_scale_staging = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
             if constexpr (Traits::needs_aux_compute)
                 b_aux_staging = d_block_mins[linear];
             if constexpr (Traits::is_dual_scale_asym) {
@@ -1127,7 +1128,7 @@ void native_quantised_gemm_kernel(
             {
                 const size_t linear = static_cast<size_t>(block_global) * N + b_load_n_global;
                 load_payload<PB>(d_payload + linear * PB, b_payload_dw);
-                b_scale_staging = d_block_scales[linear];
+                b_scale_staging = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
                 if constexpr (Traits::needs_aux_compute)
                     b_aux_staging = d_block_mins[linear];
                 if constexpr (Traits::is_dual_scale_asym) {
@@ -1657,7 +1658,7 @@ void streaming_lm_head_kernel(
         uint32_t b_payload_dw[Traits::payload_dwords];
         load_payload<PB>(d_payload + linear * PB, b_payload_dw);
 
-        uint16_t scale_bits = d_block_scales[linear];
+        uint16_t scale_bits = ::llaminar2::native_quantised_scale::loadStagedPrimary<static_cast<uint8_t>(FMT)>(d_block_scales, linear);
 
         uint16_t aux_bits = 0;
         if constexpr (Traits::needs_aux_compute)
@@ -2949,6 +2950,7 @@ bool LLAMINAR_ROCM_NATIVE_QUANTISED_SHARD_SYMBOL(
     case NATIVE_QUANTISED_GEMM_Q4_0:     LAUNCH_GEMM(NATIVE_QUANTISED_GEMM_Q4_0);
     case NATIVE_QUANTISED_GEMM_IQ4_NL:   LAUNCH_GEMM(NATIVE_QUANTISED_GEMM_IQ4_NL);
     case NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE: LAUNCH_GEMM(NATIVE_QUANTISED_GEMM_IQ4_XS_SOURCE);
+    case NATIVE_QUANTISED_GEMM_MXFP4:    LAUNCH_GEMM(NATIVE_QUANTISED_GEMM_MXFP4);
 #elif LLAMINAR_ROCM_NATIVE_QUANTISED_SHARD == 1
     case NATIVE_QUANTISED_GEMM_Q4_1:     LAUNCH_GEMM(NATIVE_QUANTISED_GEMM_Q4_1);
     case NATIVE_QUANTISED_GEMM_Q5_0:     LAUNCH_GEMM(NATIVE_QUANTISED_GEMM_Q5_0);

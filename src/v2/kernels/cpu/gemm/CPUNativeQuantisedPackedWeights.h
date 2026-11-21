@@ -13,8 +13,10 @@
 #include "CPUNativeQuantisedPublishedBytes.h"
 #include "CPUNativeQuantisedWeightView.h"
 #include "CPUNativeQuantisedPreparedFootprint.h"
+#include "kernels/common/NativeQuantisedScaleLoad.h"
 #include "tensors/AlignedVector.h"
 #include "tensors/BlockStructures.h"
+#include "tensors/VnniPackContext.h"
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
@@ -89,6 +91,20 @@ namespace llaminar2::cpu::native_quantised
 
         /// Physical prepared encoding consumed by serial and grouped kernels.
         CPUNativeQuantisedEncoding encoding = CPUNativeQuantisedEncoding::ExpandedInt8;
+
+        /// Interpretation of the primary scale words, derived from codebook and encoding.
+        [[nodiscard]] CPUNativeQuantisedScaleEncoding scaleEncoding() const noexcept
+        {
+            return preparedScaleEncoding(codebook_id, encoding);
+        }
+
+        /// Pack-context layout that writes this unit's primary scale words.
+        [[nodiscard]] VnniPrimaryScaleLayout primaryScaleLayout() const noexcept
+        {
+            return scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
+                       ? VnniPrimaryScaleLayout::PowerOfTwoBF16Words
+                       : VnniPrimaryScaleLayout::FP16Words;
+        }
 
         /**
          * Arithmetic identity selected by the owner of this prepared matrix.
@@ -337,7 +353,11 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] inline __m512 loadScales512(const uint16_t *primary) const
         {
-            const __m512 base = loadPlainFP16Scales512(primary);
+            // BF16 power-of-two words widen by placement alone (word << 16); never F16C.
+            const __m512 base = scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
+                ? _mm512_castsi512_ps(_mm512_slli_epi32(_mm512_cvtepu16_epi32(
+                      _mm256_load_si256(reinterpret_cast<const __m256i *>(primary))), 16))
+                : loadPlainFP16Scales512(primary);
             if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
             const __m512i raw = _mm512_cvtepu16_epi32(_mm256_load_si256(
                 reinterpret_cast<const __m256i *>(primary + 64)));
@@ -361,8 +381,10 @@ namespace llaminar2::cpu::native_quantised
          */
         [[nodiscard]] inline __m256 loadScales256(const uint16_t *primary) const
         {
-            const __m256 base = _mm256_cvtph_ps(_mm_load_si128(
-                reinterpret_cast<const __m128i *>(primary)));
+            const __m128i words = _mm_load_si128(reinterpret_cast<const __m128i *>(primary));
+            const __m256 base = scaleEncoding() == CPUNativeQuantisedScaleEncoding::PowerOfTwoBF16
+                ? _mm256_castsi256_ps(_mm256_slli_epi32(_mm256_cvtepu16_epi32(words), 16))
+                : _mm256_cvtph_ps(words);
             if (!usesNibbleLUTSourceScale() && !usesIQ3SExpandedSourceScale()) return base;
             const __m256i raw = _mm256_cvtepu16_epi32(_mm_load_si128(
                 reinterpret_cast<const __m128i *>(primary + 64)));
