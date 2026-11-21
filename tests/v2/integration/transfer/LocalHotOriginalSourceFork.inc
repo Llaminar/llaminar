@@ -72,7 +72,7 @@ void actualSourceFork(DeviceId device)
     for(const auto& part:{cpu.bom(host),physical.cacheBOM(0,gpu),physical.mandatoryBOM(0,gpu),policy.policyBOM(gpu),policy.mandatoryBOM(gpu),
         q::PooledImmutableOwnerNativePlan::mandatoryBOM(physical,policy,0,gpu),q::PooledImmutableCoordinatorNativePlan::mandatoryBOM(physical,policy,gpu),
         q::PooledImmutableSourceGeometry::mandatoryBOM(physical,policy,source,gpu),localGeometry.mandatoryBOM(gpu,host),localGeometry.slotDependentBOM(gpu,host),
-        compact.completeBOM(host,std::array{gpu}),io.bom(host),RetainedParticipantGraphExecutable::generalBOM(host,gpu,1)})
+        compact.completeBOM(host,std::array{gpu}),io.bom(host),RetainedParticipantGraphExecutable::generalBOM(host,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}),1)})
         for(const auto& row:part.resources())bom.add(row);
     bom.add(host,PhysicalMemoryOwner::ImmutableLookupStaging,q::ImmutableLookupService::hostBytes(channel));
     bom.add(gpu,PhysicalMemoryOwner::ActivationArena,Maximum*8+4+sampling_math::kDeviceGenerationControlCount*4+Maximum*file.columns*4);

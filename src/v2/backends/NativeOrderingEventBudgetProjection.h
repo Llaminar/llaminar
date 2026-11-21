@@ -12,6 +12,7 @@
 #include <memory>
 #include <vector>
 #include "NativeAuxiliaryResourceCatalog.h"
+#include "NativeGraphObjectGeometry.h"
 namespace llaminar2 {
 class GPUContextProvenance;
 namespace test {struct NativeOrderingEventGroupReplayAccess;}
@@ -22,8 +23,12 @@ public:
     static NativeOrderingEventBudgetProjection installed();
     /** @return Closed reviewed group contribution on original CPU/GPU observations. */
     PhysicalMemoryPlan bom(NativeOrderingEventProgram,PhysicalMemoryResource host,PhysicalMemoryResource gpu)const;
-    /** @return Same actual remote-host projection from an installed or closed recorded source; creates no native worker. */
-    PhysicalMemoryPlan remoteHostBOM(const PooledRemoteGraphProgram&,PhysicalMemoryResource host,PhysicalMemoryResource gpu)const;
+    /**
+     * @return Same actual remote-host projection from an installed or closed recorded source; creates no native worker.
+     * @param graphObjects Owner-published adapter sizes; installed projections read @p gpu's owner entry.
+     */
+    PhysicalMemoryPlan remoteHostBOM(const PooledRemoteGraphProgram&,PhysicalMemoryResource host,PhysicalMemoryResource gpu,
+        const NativeGraphObjectGeometry& graphObjects)const;
     /** @return Exact reviewed floor-to-actual bound growth for the same original program role. */
     PhysicalMemoryPlan growthBOM(NativeOrderingEventProgram floor,NativeOrderingEventProgram actual,PhysicalMemoryResource host,PhysicalMemoryResource gpu)const;
 private:

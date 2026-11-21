@@ -10,6 +10,7 @@
  * are canonical BOMs authored by their existing owners.
  */
 #pragma once
+#include "backends/NativeGraphObjectGeometry.h"
 #include "backends/NativeOrderingEventBudgetProjection.h"
 #include "loaders/ResolvedImmutableRowTablePlacement.h"
 #include "planning/ImmutableRowTableExecutionProvision.h"
@@ -76,6 +77,20 @@ public:
      */
     ImmutableRowTablePlacementInput withReaderPeerAccess(
         std::span<const ImmutableRowTableReaderPeerAccess> edges) const;
+    /**
+     * @brief Attach owner-published graph-adapter sizes for the priced GPUs.
+     * @param objects Evidence resolved from each GPU's owner; a GPU it lacks
+     *        is fatal only when its retained participant is priced.
+     * @return Same input carrying that evidence (also carried on the wire).
+     */
+    ImmutableRowTablePlacementInput withGraphObjects(NativeGraphObjectGeometry objects) const
+    {
+        auto copy = *this;
+        copy.graph_objects_ = std::move(objects);
+        return copy;
+    }
+    /** @return Owner-published adapter sizes of gpuResources(). */
+    const NativeGraphObjectGeometry &graphObjects() const noexcept { return graph_objects_; }
     /** @return Frozen reader-edge facts, never local native construction authority. */
     std::span<const ImmutableRowTableReaderPeerAccess> readerPeerAccess() const noexcept
     { return reader_peer_access_; }
@@ -143,6 +158,7 @@ private:
     std::vector<ImmutableRowTableReaderPeerAccess> reader_peer_access_;
     std::shared_ptr<const ImmutableFixedHeadPipelineProjection> fixed_head_pipeline_;
     std::vector<PhysicalMemoryResource> gpu_resources_; ///< Source participants never become graph consumers.
+    NativeGraphObjectGeometry graph_objects_; ///< Owner evidence; never this binary's ABI for a remote GPU.
 };
 /**
  * @brief Exact incremental mode costs, excluding table storage itself.

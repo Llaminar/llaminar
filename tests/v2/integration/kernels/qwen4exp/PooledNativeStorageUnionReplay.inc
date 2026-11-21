@@ -79,7 +79,7 @@ public:
         activationBytes_=Maximum*sizeof(std::uint64_t)+sizeof(int)+sampling_math::kDeviceGenerationControlCount*sizeof(int)+Maximum*file_.columns*sizeof(float)+sizeof(int);
         bom.add(gpu[0],PhysicalMemoryOwner::ActivationArena,activationBytes_);
         for(std::size_t i=0;i<devices_.size();++i){
-            add(RetainedParticipantGraphExecutable::generalBOM(session_->resource(DeviceId::cpu()),gpu[i],i?1:3));
+            add(RetainedParticipantGraphExecutable::generalBOM(session_->resource(DeviceId::cpu()),gpu[i],NativeGraphObjectGeometry::localOwner({(gpu[i]).world_rank,(gpu[i]).device}),i?1:3));
             if(i){add(physical.cacheBOM(i-1,gpu[i]));add(physical.mandatoryBOM(i-1,gpu[i]));
                 add(q::PooledImmutableOwnerNativePlan::mandatoryBOM(physical,policy,i-1,gpu[i]));
                 add(NativeOrderingEventGroup::bom(q::PooledImmutableOwnerNativePlan::orderingProgram(physical,policy,i-1),session_->resource(DeviceId::cpu()),gpu[i]));}

@@ -120,7 +120,7 @@ void nativeCompletedPairReplay(DeviceId source, DeviceId reader, NativeCompleted
         plan.add(resource, PhysicalMemoryOwner::ActivationTransportStaging,
             sizeof(NativeCompletedBank) + 2 * progress_bytes + (device == source ? source_bytes + (semantic ? 0 : guarded_bytes) : guarded_bytes));
 
-        const auto graphs = RetainedParticipantGraphExecutable::generalBOM(original->resource(DeviceId::cpu()), resource,
+        const auto graphs = RetainedParticipantGraphExecutable::generalBOM(original->resource(DeviceId::cpu()), resource,NativeGraphObjectGeometry::localOwner({(resource).world_rank,(resource).device}),
             semantic ? (device==source?(publication_cancellation?6:4):(publication_cancellation?5:3)) : 2);
         for (const auto& row : graphs.resources()) plan.add(row);
     }

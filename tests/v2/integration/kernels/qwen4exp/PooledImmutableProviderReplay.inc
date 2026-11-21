@@ -350,7 +350,7 @@ struct ProviderReplayGeometry final {
         #ifdef LLAMINAR_POOLED_NATIVE_PROGRAM_DIAGNOSTIC
         retained.add(gpu,PhysicalMemoryOwner::NativeGraphExecutable,graphCount*GPUGraphMemoryContract::reservationBytesPerExecutable(device,GPUGraphExecutableClass::General));
 #else
-        const auto general=RetainedParticipantGraphExecutable::generalBOM(host,gpu,graphCount);
+        const auto general=RetainedParticipantGraphExecutable::generalBOM(host,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}),graphCount);
         for(const auto& row:general.resources())retained.add(row);
 #endif
         for(const auto program:{q::PooledImmutableOwnerNativePlan::orderingProgram(physical,policy,0),q::PooledImmutableCoordinatorNativePlan::orderingProgram(physical,policy),

@@ -51,13 +51,23 @@ set(_cohort_original_unit_cases
     PooledImmutableCompleteCohort.PartialColdConstructionAndRecordingRetireOriginalFrontiersWithoutArm
     PooledImmutableCompleteCohort.ReplacedPublicStageRejectsBeforeAnyCachedLeafInspection
     PooledImmutableCompleteCohort.ConcurrentColdBindingPublishesOneOriginalOwnerBeforeAnyAdmission
-    PooledImmutableCompleteCohort.CallerRuleAndOppositeSourceBindingsUseRealQueuedWorkerIdentity
     PooledImmutableCompleteCohort.ExpiredWeakOwnerCannotReplaceOriginalRetirementInProgress
     PooledImmutableCompleteCohort.FinalOwnerCannotBlockItsOriginalParticipatingWorker
-    PooledImmutableCompleteCohort.QueuedOppositeSourceAdmissionsAndFailureNeverWaitForPeers
     GPUExistingContextBorrow.AbsentWrongFamilyOrdinalRetiringAndShutdownNeverCreate
     GPUExistingContextBorrow.ConcurrentOriginalBorrowExcludesRetirementUntilRelease
 )
+# Opposite-source cases bind a CUDA and a ROCm source together; they exist only
+# when both families are compiled, and add_v2_test reports the omission.
+foreach(_case IN ITEMS
+    PooledImmutableCompleteCohort.CallerRuleAndOppositeSourceBindingsUseRealQueuedWorkerIdentity
+    PooledImmutableCompleteCohort.QueuedOppositeSourceAdmissionsAndFailureNeverWaitForPeers)
+    string(REPLACE "." "_" _case_id "${_case}")
+    add_v2_test("V2_Unit_PooledOriginal_${_case_id}" REQUIRES_BACKEND CUDA ROCM
+        COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py" $<TARGET_FILE:v2_test_pooled_complete_cohort> "--gtest_filter=${_case}"
+        LABELS "V2;Unit;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
+        MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
+        ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
+endforeach()
 foreach(_case IN LISTS _cohort_original_unit_cases)
     string(REPLACE "." "_" _case_id "${_case}")
     add_v2_test("V2_Unit_PooledOriginal_${_case_id}"
@@ -396,7 +406,7 @@ add_v2_test(V2_Integration_PooledImmutableCohortConcurrentBindingReplay
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
-add_v2_test(V2_Integration_PooledImmutableCohortOppositeSourcesReplay
+add_v2_test(V2_Integration_PooledImmutableCohortOppositeSourcesReplay REQUIRES_BACKEND CUDA ROCM
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py" $<TARGET_FILE:v2_test_pooled_complete_cohort> --gtest_filter=PooledImmutableCompleteCohort.CallerRuleAndOppositeSourceBindingsUseRealQueuedWorkerIdentity --gtest_repeat=20
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
@@ -411,7 +421,7 @@ add_v2_test(V2_Integration_PooledImmutableCohortWorkerDestructionReplay
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
     ENVIRONMENT "LLAMINAR_FORCE_CPU_ONLY_STARTUP=1" "LLAMINAR_SKIP_CUDA_STARTUP=1" "LLAMINAR_SKIP_ROCM_STARTUP=1")
-add_v2_test(V2_Integration_PooledImmutableCohortOppositeAdmissionReplay
+add_v2_test(V2_Integration_PooledImmutableCohortOppositeAdmissionReplay REQUIRES_BACKEND CUDA ROCM
     COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_SOURCE_DIR}/scripts/run_cohort_original_cases.py" $<TARGET_FILE:v2_test_pooled_complete_cohort> --gtest_filter=PooledImmutableCompleteCohort.QueuedOppositeSourceAdmissionsAndFailureNeverWaitForPeers --gtest_repeat=20
     LABELS "V2;Integration;ProductionTestPreflight;DeviceFree;Ngram;Ownership;TraceReplay;Regression"
     MPI_PROCS 1 NO_MPI NO_MODELS TIMEOUT 30
@@ -488,13 +498,18 @@ list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS
     V2_Integration_PooledImmutableCohortColdFailureReplay
     V2_Integration_PooledImmutableCohortReplacedStageReplay
     V2_Integration_PooledImmutableCohortConcurrentBindingReplay
-    V2_Integration_PooledImmutableCohortOppositeSourcesReplay
     V2_Integration_PooledImmutableCohortRetirementClaimReplay
     V2_Integration_PooledImmutableCohortWorkerDestructionReplay
-    V2_Integration_PooledImmutableCohortOppositeAdmissionReplay
     V2_Integration_PooledImmutableExistingWorkerBorrowReplay
 )
 
+
+foreach(_opposite IN ITEMS V2_Integration_PooledImmutableCohortOppositeSourcesReplay
+                           V2_Integration_PooledImmutableCohortOppositeAdmissionReplay)
+    if(TEST ${_opposite})
+        list(APPEND V2_PRODUCTION_TEST_PREFLIGHT_TESTS ${_opposite})
+    endif()
+endforeach()
 
 # Exact original owner/author hardening successors; preserve all prior cases.
 foreach(_case IN ITEMS

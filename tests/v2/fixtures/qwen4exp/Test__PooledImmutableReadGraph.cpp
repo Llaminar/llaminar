@@ -8,6 +8,7 @@
  */
 #include "PooledImmutableOriginalProgramReplay.h"
 #include "execution/qwen4exp/PooledImmutableParticipantReadGraph.h"
+#include "../../utils/CompiledGPUBackends.h"
 namespace llaminar2::test {
 /** @return Original local or remote read holders, without substituting a storage/channel owner. */
 std::vector<q::PooledImmutableReadParticipant> readMembers(SourceGraphCase& c,const PooledImmutablePublicationCompletion& ready){
@@ -90,7 +91,7 @@ namespace llaminar2::test {
 /** @test Original partial source/boundary setup retains same-PMA obligations until actual handles and generation retire. */
 TEST(PooledImmutableReadGraph, RecordedOrderingPartialSourceSetupRetainsOriginalClaimsUntilReset){
     GTEST_FLAG_SET(death_test_style,"threadsafe");
-    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm})for(std::size_t prefix=1;prefix<=4;++prefix){
+    for(const auto type:compiledGPUTypes())for(std::size_t prefix=1;prefix<=4;++prefix){
         ASSERT_EXIT(([&]{
             const PooledOriginalRecipe recipe{{2u,0u},false,q::adaptive_lookup::None,false,type};PooledImmutableOriginalPrograms programs({recipe});
             auto& backends=programs.backends();auto& backend=type==DeviceType::CUDA?backends.cuda:backends.rocm;
@@ -116,7 +117,7 @@ TEST(PooledImmutableReadGraph, RecordedOrderingPartialSourceSetupRetainsOriginal
  */
 TEST(PooledImmutableReadGraph, CanonicalGenerationBorrowRetiresBeforeRunnerAddressReplacement) {
     GTEST_FLAG_SET(death_test_style,"threadsafe");
-    for(const auto type:{DeviceType::CUDA,DeviceType::ROCm}) {
+    for(const auto type:compiledGPUTypes()) {
         ASSERT_EXIT(([&]{
             const PooledOriginalRecipe recipe{{2u},false,0,false,type};
             PooledImmutableOriginalPrograms programs({recipe});auto c=programs.make(recipe);

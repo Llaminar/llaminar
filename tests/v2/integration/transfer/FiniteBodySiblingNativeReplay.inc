@@ -18,7 +18,7 @@ void replayNativeFiniteBody(DeviceId device,std::size_t liveBytes){
     ASSERT_LE(liveBytes,capacity);
     const std::array devices{device};auto session=PreparedNativeLookupFixture::prepare(devices);
     const auto& original=session->permit(device);auto worker=original.worker();auto* backend=getBackendFor(device);
-    const auto general=RetainedParticipantGraphExecutable::generalBOM(session->resource(DeviceId::cpu()),session->resource(device),3);
+    const auto general=RetainedParticipantGraphExecutable::generalBOM(session->resource(DeviceId::cpu()),session->resource(device),NativeGraphObjectGeometry::localOwner({(session->resource(device)).world_rank,(session->resource(device)).device}),3);
     const auto mappedBytes=device.is_cuda()?TransferEngine::mappedHostRegionAllocationBytes(sizeof(MappedTransferProgressCommand)+sizeof(MappedTransferProgressCompletion))+
         TransferEngine::mappedHostRegionAllocationBytes(sizeof(std::uint64_t)):0;
     const auto gpuBytes=3*stride+(device.is_cuda()?sizeof(MappedTransferServiceCursor):0);
@@ -117,7 +117,7 @@ void rejectForeignNativeFiniteBody(DeviceId device,DeviceId foreign){
     const std::array devices{device,foreign};auto session=PreparedNativeLookupFixture::prepare(devices);
     PhysicalMemoryPlanBuilder bom;
     for(const auto selected:devices){
-        const auto graph=RetainedParticipantGraphExecutable::generalBOM(session->resource(DeviceId::cpu()),session->resource(selected),1);
+        const auto graph=RetainedParticipantGraphExecutable::generalBOM(session->resource(DeviceId::cpu()),session->resource(selected),NativeGraphObjectGeometry::localOwner({(session->resource(selected)).world_rank,(session->resource(selected)).device}),1);
         for(const auto& row:graph.resources())bom.add(row);
         bom.add(session->resource(selected),PhysicalMemoryOwner::ActivationArena,sizeof(std::uint64_t));
     }

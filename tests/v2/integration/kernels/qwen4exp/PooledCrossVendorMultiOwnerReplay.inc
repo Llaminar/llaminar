@@ -52,7 +52,7 @@ public:
             bom.add(own,PhysicalMemoryOwner::NativeGraphExecutable,
                 GPUGraphMemoryContract::reservationBytesPerExecutable(devices_[i+1],GPUGraphExecutableClass::General));
 #else
-            add(RetainedParticipantGraphExecutable::generalBOM(host,own,1));
+            add(RetainedParticipantGraphExecutable::generalBOM(host,own,NativeGraphObjectGeometry::localOwner({(own).world_rank,(own).device}),1));
 #endif
         }
         const auto channel=q::ImmutableLookupLayout::createSubordinate(Unique,source.rowBytes());bom.add(host,PhysicalMemoryOwner::ImmutableLookupStaging,q::ImmutableLookupService::hostBytes(channel));
@@ -63,7 +63,7 @@ public:
         bom.add(src,PhysicalMemoryOwner::NativeGraphExecutable,
             3*GPUGraphMemoryContract::reservationBytesPerExecutable(sourceDevice,GPUGraphExecutableClass::General));
 #else
-        add(RetainedParticipantGraphExecutable::generalBOM(host,src,3));
+        add(RetainedParticipantGraphExecutable::generalBOM(host,src,NativeGraphObjectGeometry::localOwner({(src).world_rank,(src).device}),3));
 #endif
         session_.admit(bom.build());
         memory_=session_.memory();

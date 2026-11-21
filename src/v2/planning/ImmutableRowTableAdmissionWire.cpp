@@ -23,7 +23,9 @@ namespace llaminar2
 {
 namespace
 {
-    constexpr std::uint32_t Magic = 0x4e475231u, Version = 20;
+    // v21 adds per-GPU owner graph-object sizes after the GPU resources; a v20
+    // frame lacks them and is rejected rather than reinterpreted.
+    constexpr std::uint32_t Magic = 0x4e475231u, Version = 21;
     /** @brief Exact typed QFN layout words carried by this schema, without native padding. */
     constexpr std::array QfnLayoutWords{
         &Qwen4ExpMemoryGeometry::residual_width,
@@ -229,6 +231,15 @@ std::vector<std::uint8_t> serializeImmutableRowTableAdmissionRequests(
         for(const auto &consumer:request.input.consumers()) resource(out,consumer);
         append(out,count(request.input.gpuResources().size()));
         for(const auto &device:request.input.gpuResources())resource(out,device);
+        // The sender owns these rank-local GPUs and publishes its adapter
+        // sizes, so a receiver never prices them with its own binary's ABI.
+        for(const auto &device:request.input.gpuResources())
+        {
+            const PhysicalMemoryAllocatorIdentity owner{device.world_rank,device.device};
+            const bool published=device.device.is_gpu() && request.input.graphObjects().contains(owner);
+            append(out,static_cast<std::uint32_t>(published));
+            if(published)append(out,static_cast<std::uint64_t>(request.input.graphObjects().bytes(owner)));
+        }
         append(out, static_cast<std::uint32_t>(request.input.gpuCachePeerAccess().has_value()));
         if (request.input.gpuCachePeerAccess()) append(out, static_cast<std::uint32_t>(*request.input.gpuCachePeerAccess()));
         append(out, count(request.input.readerPeerAccess().size()));
@@ -443,6 +454,14 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
         if(gpu_count>in.remaining()/28u)throw std::invalid_argument("GPU storage observations exceed wire frame");
         std::vector<PhysicalMemoryResource> gpu_resources;
         for(std::uint32_t i=0;i<gpu_count;++i)gpu_resources.push_back(resource(in,expected_rank));
+        NativeGraphObjectGeometry graph_objects;
+        for(const auto &device:gpu_resources)
+        {
+            const auto published=in.read<std::uint32_t>();
+            if(published>1u || (published && !device.device.is_gpu()))
+                throw std::invalid_argument("Ngram wire graph-object arm is invalid");
+            if(published)graph_objects.publish({device.world_rank,device.device},size(in));
+        }
         if(policy.isGPUAdaptive())input=input.withGPUCacheResources(policy,gpu_resources);
         else
         {
@@ -469,6 +488,7 @@ std::vector<ImmutableRowTableAdmissionRequest> ImmutableRowTableAdmissionParser:
                 {reader.world_rank, reader.device()}, static_cast<PeerAccessCoverage>(in.read<std::uint32_t>())});
         }
         if (reader_edges) input = input.withReaderPeerAccess(reader_peer_access);
+        input = input.withGraphObjects(std::move(graph_objects));
         const auto available=in.read<std::uint32_t>();
         if(available>1u) throw std::invalid_argument("Ngram admission wire eligibility is invalid");
         std::optional<PhysicalMemoryPlan> vram;

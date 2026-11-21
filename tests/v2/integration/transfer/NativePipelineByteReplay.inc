@@ -123,7 +123,7 @@ void nativePipelineByteReplay(DeviceType family, int degree,
             // One original graph-only recording and precisely the replay parents.
             // The shared child never owns an instantiated executable.
             const auto graphs = RetainedParticipantGraphExecutable::generalBOM(original->resource(DeviceId::cpu()),
-                original->resource(devices[i]), shared ? parents + 1 : 1);
+                original->resource(devices[i]),NativeGraphObjectGeometry::localOwner({(original->resource(devices[i])).world_rank,(original->resource(devices[i])).device}), shared ? parents + 1 : 1);
             for (const auto &line : graphs.resources()) plan.add(line);
         }
         original->admit(plan.build());

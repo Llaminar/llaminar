@@ -20,9 +20,13 @@ namespace llaminar2::qwen4exp {
 /** @brief Complete per-model remote definitions shared by exclusive source variants. */
 class PooledImmutableRetainedParticipantBudget final {
 public:
-    /** @brief Project every actual nonlocal owner through its explicit mapped-flat or native-General contract. */
+    /**
+     * @brief Project every actual nonlocal owner through its explicit mapped-flat or native-General contract.
+     * @param graphObjects Owner-published native graph adapter sizes for every priced owner GPU.
+     */
     static PhysicalMemoryPlan completeBOM(const AdaptiveImmutableLookupGeometry& geometry,
         PhysicalMemoryResource originalCPU0,std::span<const PhysicalMemoryResource> originalGPUs,
+        const NativeGraphObjectGeometry& graphObjects,
         const NativeOrderingEventBudgetProjection& source=NativeOrderingEventBudgetProjection::installed()){
         PhysicalMemoryPlanBuilder result;
         const auto& physical=geometry.physical();
@@ -57,7 +61,7 @@ public:
             std::visit([&](const auto& contract){
                 using Contract=std::decay_t<decltype(contract)>;
                 if constexpr(std::is_same_v<Contract,PooledRemoteGraphProgram>){
-                    const auto host=source.remoteHostBOM(contract,originalCPU0,*gpu);
+                    const auto host=source.remoteHostBOM(contract,originalCPU0,*gpu,graphObjects);
                     for(const auto& line:host.resources())result.add(line);
                     result.add(*gpu,PhysicalMemoryOwner::NativeStorageGraphExecutable,
                         GPUGraphMemoryContract::reservationBytesPerExecutable(gpu->device));
@@ -65,7 +69,7 @@ public:
                     // Native-library graphs consume the existing full General
                     // contract under their own storage purpose. No flat class,
                     // model reservation or caller-sized allowance can replace it.
-                    const auto native=RetainedParticipantGraphExecutable::nativeStorageBOM(contract,originalCPU0,*gpu);
+                    const auto native=RetainedParticipantGraphExecutable::nativeStorageBOM(contract,originalCPU0,*gpu,graphObjects);
                     for(const auto& line:native.resources())result.add(line);
                 }
             },program);
@@ -76,9 +80,10 @@ public:
     static PhysicalMemoryPlan slotDependentBOM(const AdaptiveImmutableLookupGeometry& geometry,
         const AdaptiveImmutableLookupGeometry& floor,PhysicalMemoryResource originalCPU0,
         std::span<const PhysicalMemoryResource> originalGPUs,
+        const NativeGraphObjectGeometry& graphObjects,
         const NativeOrderingEventBudgetProjection& source=NativeOrderingEventBudgetProjection::installed()){
-        const auto actual=completeBOM(geometry,originalCPU0,originalGPUs,source);
-        const auto minimum=completeBOM(floor,originalCPU0,originalGPUs,source);
+        const auto actual=completeBOM(geometry,originalCPU0,originalGPUs,graphObjects,source);
+        const auto minimum=completeBOM(floor,originalCPU0,originalGPUs,graphObjects,source);
         PhysicalMemoryPlanBuilder result;
         for(const auto& line:actual.resources()){
             const auto* baseline=minimum.find({line.resource().world_rank,line.resource().device});

@@ -25,6 +25,7 @@
 #include "NativeContextRetirement.h"
 #include "NativeAuxiliaryResourceCatalog.h"
 #include "PooledRemoteGraphProgram.h"
+#include "NativeGraphObjectGeometry.h"
 #include "memory/CPUStorageRoot.h"
 #include "execution/local_execution/graph/IRetainedGraphParticipants.h"
 #include "execution/local_execution/graph/IGraphCaptureAuxiliaryBranch.h"
@@ -57,34 +58,40 @@ public:
      * @brief Declare original General host/device slots and exact known wrapper backing before admission.
      * @param host Original CPU0 allocator observation.
      * @param gpu Original addressed GPU observation, with the same rank.
+     * @param graphObjects Owner-published adapter sizes; must contain @p gpu's owner.
      * @param slots Number of original General definitions; graph-only definitions consume their own slot.
      * @return Same-PMA typed BOM, with conservative host/device ProcessRuntime tokens and exact known objects.
      */
-    static PhysicalMemoryPlan generalBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,std::size_t slots=1);
+    static PhysicalMemoryPlan generalBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,
+        const NativeGraphObjectGeometry& graphObjects,std::size_t slots=1);
     /** @brief Price an original native storage definition using the existing General host/device contract.
      * @param program Closed native owner semantics. @param host Actual rank CPU resource. @param gpu Exact original owner resource.
+     * @param graphObjects Owner-published adapter sizes; must contain @p gpu's owner.
      * @return Same General units isolated under NativeStorageGraphExecutable, never a model reservation.
      */
     static PhysicalMemoryPlan nativeStorageBOM(const PooledNativeOwnerGraphProgram& program,
-        PhysicalMemoryResource host,PhysicalMemoryResource gpu);
+        PhysicalMemoryResource host,PhysicalMemoryResource gpu,const NativeGraphObjectGeometry& graphObjects);
     /**
      * @brief Declare one closed startup calibration slot isolated from serving graph reservations.
      * @param host Original CPU0 allocator observation.
      * @param gpu Original addressed same-rank GPU observation.
+     * @param graphObjects Owner-published adapter sizes; must contain @p gpu's owner.
      * @return The same General limits and known wrapper backing under the preparation-only owner.
      * @note Serial cold definitions reuse this one original ProcessRuntime slot and timing pair.
      */
-    static PhysicalMemoryPlan calibrationBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu);
+    static PhysicalMemoryPlan calibrationBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,
+        const NativeGraphObjectGeometry& graphObjects);
     /**
      * @brief Price original CPU0 known graph objects/scratch and the selected opaque host program.
      * @param program Closed descriptor authored by the actual directed remote builder before admission.
      * @param host Original canonical CPU0 observation, independent of table NUMA placement.
      * @param gpu Exact original addressed remote observation; device General bytes stay separate.
+     * @param graphObjects Owner-published adapter sizes; must contain @p gpu's owner.
      * @return Host-only named BOM; no native creation, provider hashing or live admission occurs.
      * @throws std::runtime_error For a missing/incompatible installed class.
      */
     static PhysicalMemoryPlan hostBOM(const PooledRemoteGraphProgram& program,
-        PhysicalMemoryResource host,PhysicalMemoryResource gpu);
+        PhysicalMemoryResource host,PhysicalMemoryResource gpu,const NativeGraphObjectGeometry& graphObjects);
     /**
      * @brief Consume one installed original-PMA remote host program before its first native creator.
      * @param original Actual original prepared worker/PMA/generation capability.
@@ -124,10 +131,11 @@ private:
      * @param gpu Original same-rank GPU observation.
      * @param slots Actual declared definitions sharing this purpose.
      * @param purpose Closed owner selected before reservation or native creation.
+     * @param graphObjects Owner-published adapter sizes; must contain @p gpu's owner.
      * @return Same physical byte total with purpose-isolated named obligations.
      */
     static PhysicalMemoryPlan definitionBOM(PhysicalMemoryResource host,PhysicalMemoryResource gpu,
-        std::size_t slots,DefinitionPurpose purpose);
+        std::size_t slots,DefinitionPurpose purpose,const NativeGraphObjectGeometry& graphObjects);
     /**
      * @brief Retain one original General slot for serial startup calibration definitions.
      * @param original Actual prepared PMA/worker/generation capability.

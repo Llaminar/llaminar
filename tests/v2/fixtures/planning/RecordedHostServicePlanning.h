@@ -3,11 +3,13 @@
  *
  * Existing multi-rank fixtures retain their full authored ClusterInventory.
  * Legacy single-rank observations are explicitly placed together on node0;
- * no remote rank or native resource observation is invented. The actual planner
+ * no remote rank or native resource observation is invented. Graph-adapter
+ * owner sizes are recorded values, independent of the compiled backends. The actual planner
  * still validates every field and executes every production BOM/quota path.
  */
 #pragma once
 #include "../../utils/PlanningHostServiceFixture.h"
+#include "fixtures/backends/NativeGraphObjectGeometryRecordedAccess.h"
 #include "execution/moe/MoEOverlayLocalCapacityPlanner.h"
 #include "execution/mpi_orchestration/DeviceInventory.h"
 namespace llaminar2::test {
@@ -22,9 +24,10 @@ inline ClusterInventory recordedSingleRankCluster(const RankInventory& rank){
     cluster.ranks.front().node_id=0;
     cluster.nodes={{.node_id=0,.hostname="recorded-local-node",.ranks={0}}};return cluster;
 }
-/** @brief Add only recorded CPU role inputs; execute the actual capacity planner synchronously. */
+/** @brief Add only recorded CPU role and graph-adapter owner inputs; execute the actual capacity planner synchronously. */
 inline MoEOverlayLocalCapacityPlannerResult planWithRecordedHostServices(MoEOverlayLocalCapacityPlannerInput input){
     input.retained_host_services=recordedHostServiceBudget();
+    input.native_graph_objects=NativeGraphObjectGeometryRecordedAccess::uniform();
     ClusterInventory local;
     if(!input.cluster_inventory&&input.rank_inventory){local=recordedSingleRankCluster(*input.rank_inventory);input.cluster_inventory=&local;}
     return MoEOverlayLocalCapacityPlanner::plan(input);
@@ -37,6 +40,7 @@ inline std::vector<MoEOverlayLocalCapacityPlannerResult> planPipelineWithRecorde
     const auto projection=recordedHostServiceBudget();
     for(std::size_t i=0;i<stages.size();++i){
         stages[i].retained_host_services=projection;
+        stages[i].native_graph_objects=NativeGraphObjectGeometryRecordedAccess::uniform();
         if(!stages[i].cluster_inventory&&stages[i].rank_inventory){locals[i]=recordedSingleRankCluster(*stages[i].rank_inventory);stages[i].cluster_inventory=&locals[i];}
     }
     return MoEOverlayLocalCapacityPlanner::planPipeline(parent,stages);

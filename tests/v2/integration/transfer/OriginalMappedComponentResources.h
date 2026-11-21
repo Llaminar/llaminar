@@ -110,7 +110,7 @@ public:
         for(std::size_t role=0;role<devices_.size();++role) {
             for(std::size_t event=0;event<events[role];++event)add(NativeOrderingEventGroup::bom(
                 NativeOrderingEventProgram::captureSubmissionRetirement(),host,original_->resource(devices_[role])));
-            if(graphs[role])add(RetainedParticipantGraphExecutable::generalBOM(host,original_->resource(devices_[role]),graphs[role]));
+            if(graphs[role])add(RetainedParticipantGraphExecutable::generalBOM(host,original_->resource(devices_[role]),NativeGraphObjectGeometry::localOwner({(original_->resource(devices_[role])).world_rank,(original_->resource(devices_[role])).device}),graphs[role]));
         }
         if(ticket) {
             add(NativeAuxiliaryStreamOwnership::bom(host,original_->resource(devices_[0])));

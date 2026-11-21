@@ -96,7 +96,7 @@ TEST(PooledProviderOriginalProgramPlan, PayloadEnvelopeAndAdditiveNativePrograms
         const auto full=ProviderReplayPrograms::programBOM(geometries);const auto* gpu=full.find({0,device});const auto* host=full.find({0,DeviceId::cpu()});
         ASSERT_NE(gpu,nullptr);ASSERT_NE(host,nullptr);
         EXPECT_EQ(gpu->bytes(PhysicalMemoryOwner::NativeGraphExecutable),10*GPUGraphMemoryContract::reservationBytesPerExecutable(device,GPUGraphExecutableClass::General));
-        const auto general=RetainedParticipantGraphExecutable::generalBOM(session->resource(DeviceId::cpu()),session->resource(device),10);
+        const auto general=RetainedParticipantGraphExecutable::generalBOM(session->resource(DeviceId::cpu()),session->resource(device),NativeGraphObjectGeometry::localOwner({(session->resource(device)).world_rank,(session->resource(device)).device}),10);
         EXPECT_EQ(host->bytes(PhysicalMemoryOwner::NativeGraphExecutable),general.find({0,DeviceId::cpu()})->bytes(PhysicalMemoryOwner::NativeGraphExecutable));
         // Recorded closed rows: C0 is 3+3+3+1; each positive case is4+4+3+1.
         EXPECT_EQ(host->bytes(PhysicalMemoryOwner::NativeImmutableLookupOrderingEvent),38912u);

@@ -29,7 +29,7 @@ void nativeFiniteJoin(DeviceId device, bool owned, bool missingRetire)
     constexpr std::size_t GPUBytes = 6 * sizeof(std::uint64_t);
     constexpr std::size_t MappedRoots = 5;
     const auto definitionBytes = Access::NativeJoinDefinitions::Count * nativeGraphCaptureObjectBytes(device);
-    PhysicalMemoryPlanBuilder bom(RetainedParticipantGraphExecutable::generalBOM(cpu,gpu,1));
+    PhysicalMemoryPlanBuilder bom(RetainedParticipantGraphExecutable::generalBOM(cpu,gpu,NativeGraphObjectGeometry::localOwner({(gpu).world_rank,(gpu).device}),1));
     bom.add(gpu,PhysicalMemoryOwner::ActivationArena,GPUBytes);
     // Exact known graph-only wrapper objects are distinct from opaque SDK backing.
     bom.add(cpu,PhysicalMemoryOwner::NativeGraphExecutable,definitionBytes);
